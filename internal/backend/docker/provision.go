@@ -672,14 +672,10 @@ func buildStatefulVolumeBindsContext(ctx context.Context, hostPath string, image
 		// ephemeral layer and lose its data at the next replace. ErrNotExist is an
 		// error here too; MkdirAll just created this path. (ENG-795)
 		//
-		// Scope, so the next reader does not over-trust this: on PROVISION it is a hard
-		// boundary — no tenant container exists yet, so nothing can race it. On
-		// update/restart it is only a race narrowing, because doReplaceContainers calls
-		// setupVolBinds while the tenant's OLD container is still running and lets the
-		// later compose.Up stop it, so the leaf can be exchanged between this Lstat and
-		// dockerd resolving the Source. Closing that needs the writer gone before the
-		// check — mounting by fd, the way kubelet does it,
-		// is not available to us because dockerd performs the mount. See ENG-797.
+		// The complete launch workflow retains physical-volume exclusion from
+		// writer retirement through Docker Start. Its durable launch journal
+		// rejects outstanding ambiguous requests before issuing this capability,
+		// so an old tenant cannot exchange this path after validation (ENG-797).
 		info, lerr := root.Lstat(sanitized)
 		if lerr != nil {
 			return nil, fmt.Errorf("resolve volume subdir %q: %w", filepath.Join(hostPath, sanitized), lerr)
@@ -715,19 +711,24 @@ const writablePathSubdir = "_wp"
 // a managed volume subdirectory and returns a bind map for container creation.
 // Extraction failures are logged but don't fail the overall operation;
 // paths that fail are simply omitted from the bind map.
-func (b *Backend) setupWritablePathBinds(mutations *storageMutations, ctx context.Context, image imageexec.Image, writablePaths []string, hostVolumePath string, maxBytes, maxEntries int64) map[string]string {
+func (b *Backend) setupWritablePathBinds(volume launchVolume, ctx context.Context, image imageexec.Image, writablePaths []string, maxBytes, maxEntries int64) map[string]string {
 	if len(writablePaths) == 0 {
+		return nil
+	}
+	hostVolumePath, err := volume.rootPath()
+	if err != nil {
+		b.logger.Warn("writable path volume authority is unavailable", "error", err)
 		return nil
 	}
 
 	wpDir := filepath.Join(hostVolumePath, writablePathSubdir)
 	// Remove stale content from prior extractions so files deleted
 	// in a newer image don't persist.
-	if err := mutations.removePath(ctx, wpDir); err != nil {
+	if err := volume.removeWritablePaths(ctx); err != nil {
 		b.logger.Warn("failed to clean up old writable path content, extraction may contain stale files",
 			"path", wpDir, "error", err)
 	}
-	failures, authErr := mutations.extractImageContent(ctx, image, writablePaths, wpDir, maxBytes, maxEntries)
+	failures, authErr := volume.extractImageContent(ctx, image, writablePaths, maxBytes, maxEntries)
 	if authErr != nil {
 		b.logger.Warn("failed to authorize writable path extraction", "error", authErr)
 		return nil
@@ -794,7 +795,7 @@ func (b *Backend) setupWritablePathBinds(mutations *storageMutations, ctx contex
 // It returns the volume binds map, a list of newly created volume IDs, and any fatal error.
 // Non-fatal failures (writable-path-only volume creation) are logged as warnings.
 func (b *Backend) setupVolBinds(
-	mutations *storageMutations,
+	mutations *quiescedVolumes,
 	ctx context.Context,
 	leaseUUID string,
 	items []backend.LeaseItem,
@@ -802,6 +803,12 @@ func (b *Backend) setupVolBinds(
 	imageSetups map[string]*imageSetup,
 	logger *slog.Logger,
 ) (map[string]map[int]serviceVolBinds, []string, error) {
+	if err := mutations.requireActive(); err != nil {
+		return nil, nil, err
+	}
+	if leaseUUID != mutations.mutations.leaseUUID {
+		return nil, nil, errors.New("volume preparation differs from its launch subject")
+	}
 	resourcesBySKU, err := resourceSnapshotMap(items, resourceProfiles)
 	if err != nil {
 		return nil, nil, fmt.Errorf("validate volume resource profiles: %w", err)
@@ -825,7 +832,7 @@ func (b *Backend) setupVolBinds(
 				if sizeMB <= 0 {
 					sizeMB = resources.ScratchDiskMB
 				}
-				hostPath, volCreated, volErr := b.createManagedVolume(mutations, ctx, volumeID, sizeMB)
+				volume, volErr := mutations.lookup(volumeID)
 				if volErr != nil {
 					if needsStatefulVolume {
 						return nil, createdVolumeIDs, fmt.Errorf("volume creation failed (service %s, instance %d): %w", svcName, i, volErr)
@@ -833,19 +840,19 @@ func (b *Backend) setupVolBinds(
 					logger.Warn("writable path content seeding unavailable (volume creation failed)", "service", svcName, "error", volErr)
 					continue
 				}
-				if volCreated {
+				if volume.wasCreated() {
 					createdVolumeIDs = append(createdVolumeIDs, volumeID)
 				}
 				binds := serviceVolBinds{}
 				if needsStatefulVolume {
 					var buildErr error
-					binds.StatefulBinds, buildErr = mutations.prepareStatefulVolumeBinds(ctx, hostPath, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
+					binds.StatefulBinds, buildErr = volume.prepareStatefulVolumeBinds(ctx, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
 					if buildErr != nil {
 						return nil, createdVolumeIDs, fmt.Errorf("volume setup failed (service %s, instance %d): %w", svcName, i, buildErr)
 					}
 				}
 				if needsWritableVolume {
-					binds.WritableBinds = b.setupWritablePathBinds(mutations, ctx, imgSetup.Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024, inodeHardLimit(sizeMB, b.cfg.GetMinAvgFileBytes()))
+					binds.WritableBinds = b.setupWritablePathBinds(volume, ctx, imgSetup.Image, imgSetup.WritablePaths, sizeMB*1024*1024, inodeHardLimit(sizeMB, b.cfg.GetMinAvgFileBytes()))
 				}
 				if volBinds[svcName] == nil {
 					volBinds[svcName] = make(map[int]serviceVolBinds)
@@ -996,14 +1003,10 @@ func (b *Backend) doProvisionPhysical(
 			// publish a container which mounts them, so only the recovery executor's
 			// repeated exact-inventory protocol may destroy operation-owned volumes.
 			// Preserve the intent and pool authority for that recovery.
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			cleanupCtx, cleanupCancel := context.WithTimeout(b.stopCtx, 30*time.Second)
 			defer cleanupCancel()
-			remaining, tdErr := b.teardownLeaseContainersWith(mutations, cleanupCtx, req.LeaseUUID, containerIDs, 10*time.Second,
-				teardownOpProvisionCleanup, logger)
-			cleanupErr := tdErr
-			if cleanupErr == nil && len(remaining) != 0 {
-				cleanupErr = fmt.Errorf("container teardown left %d container(s)", len(remaining))
-			}
+			cleanupErr := b.cleanupFailedOperationTargets(cleanupCtx, mutations, mutations.operationSubject,
+				&physicalOperationError{callback: callbackErr, reason: failReason, cause: err})
 			errRet = errors.Join(&physicalOperationError{callback: callbackErr, reason: failReason, cause: err}, cleanupErr)
 			updateResourceMetrics(b.pool.Stats())
 			return
@@ -1079,20 +1082,13 @@ func (b *Backend) doProvisionPhysical(
 	}
 	b.provisionsMu.RUnlock()
 
-	var volBinds map[string]map[int]serviceVolBinds
-	volBinds, _, err = b.setupVolBinds(mutations, ctx, req.LeaseUUID, req.Items, resourceProfiles, imageSetups, logger)
-	if err != nil {
-		callbackErr = "volume creation failed"
-		return
-	}
-
 	// DNS-readiness gate (ENG-266): defer not-yet-resolving custom domains so
 	// provision doesn't fire a premature HTTP-01 order; the reconcile adds them
 	// once DNS is live.
 	b.deferUnreadyCustomDomains(ctx, req.Items, req.LeaseUUID, logger)
 
 	// Build Compose project and bring it up.
-	project := buildComposeProject(composeProjectParams{
+	params := composeProjectParams{
 		LeaseUUID:            req.LeaseUUID,
 		Tenant:               req.Tenant,
 		ProviderUUID:         req.ProviderUUID,
@@ -1105,13 +1101,12 @@ func (b *Backend) doProvisionPhysical(
 		Profiles:             profiles,
 		ImageSetups:          imageSetups,
 		NetworkName:          networkName,
-		VolBinds:             volBinds,
 		Cfg:                  &b.cfg,
 		Ingress:              b.cfg.Ingress,
-	})
+	}
 
-	logger.Info("compose up", "project", projectName, "services", len(project.Services))
-	if upErr := mutations.composeUp(ctx, project, composeProjectImages(project, imageSetups), composeUpOpts{}); upErr != nil {
+	logger.Info("compose up", "project", projectName, "services", len(stack.Services))
+	if upErr := b.launchCompose(ctx, mutations, params, resourceProfiles, composeUpOpts{}); upErr != nil {
 		err = fmt.Errorf("compose up failed: %w", upErr)
 		callbackErr = "container creation failed"
 		return

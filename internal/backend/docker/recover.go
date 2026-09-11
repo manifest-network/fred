@@ -744,12 +744,10 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 	}
 	releasesByLease := make(map[string]*shared.Release, len(releaseLeaseUUIDs))
-	// maintenancePolicyFailures preserves terminal policies that intentionally
-	// differ from pure substrate liveness. In particular, Update reports a
-	// pre-substrate image-pull refusal as Failed even though the untouched source
-	// cohort is still running; the exact failed maintenance Release is the
-	// durable evidence needed to reproduce that projection after a restart.
-	maintenancePolicyFailures := make(map[string]shared.Release)
+	// Keep the last replacement image failure as diagnostic context. Runtime
+	// status still comes from the exact active cohort: a failed replacement
+	// image pull does not make a healthy original source stop serving.
+	maintenanceImageFailures := make(map[string]shared.Release)
 	cohortIssues := make(map[string]error)
 	if b.releaseStore != nil {
 		for _, leaseUUID := range slices.Sorted(maps.Keys(releaseLeaseUUIDs)) {
@@ -761,7 +759,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				terminal := history[len(history)-1]
 				if terminal.Status == "failed" && terminal.MaintenanceID.Valid() &&
 					terminal.Reason == backend.ReasonImagePullFailed {
-					maintenancePolicyFailures[leaseUUID] = terminal
+					maintenanceImageFailures[leaseUUID] = terminal
 				}
 			}
 			release, releaseErr := b.releaseStore.LatestActive(leaseUUID)
@@ -1596,7 +1594,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			"error", cohortErr,
 		)
 	}
-	for leaseUUID, terminal := range maintenancePolicyFailures {
+	for leaseUUID, terminal := range maintenanceImageFailures {
 		if _, divergent := cohortIssues[leaseUUID]; divergent {
 			continue
 		}
@@ -1604,7 +1602,6 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if recovered == nil {
 			continue
 		}
-		recovered.Status = backend.ProvisionStatusFailed
 		recovered.LastError = cmp.Or(terminal.Message, backend.MsgImagePullFailed)
 		recovered.Reason = backend.ReasonImagePullFailed
 		recovered.Message = cmp.Or(terminal.Message, backend.MsgImagePullFailed)
@@ -1720,9 +1717,6 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	for uuid, rec := range building {
 		if rec.Status == backend.ProvisionStatusFailed {
 			if _, hasExisting := b.provisions[uuid]; !hasExisting {
-				if _, policyFailure := maintenancePolicyFailures[uuid]; policyFailure {
-					continue
-				}
 				if _, cohortFailure := cohortDirectFailures[uuid]; cohortFailure {
 					continue
 				}
@@ -2285,6 +2279,9 @@ func (b *Backend) reconcileLoop() {
 // durable sealed claim remains sufficient to retry exact settlement here.
 func (b *Backend) reconcileStateAndOperations(ctx context.Context) error {
 	defer b.observeUnaccountedManagedVolumes(ctx)
+	if err := b.imageInspectionRecovery(ctx); err != nil {
+		return fmt.Errorf("recover image inspection helpers: %w", err)
+	}
 	if err := b.recoverState(ctx); err != nil {
 		return err
 	}

@@ -348,6 +348,17 @@ func TestDoDeprovision_FailedInitialOperationBecomesCleanupOnlyCloseAndPermanent
 			}
 			return []ContainerInfo{late}, nil
 		},
+		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
+			require.Equal(t, late.ContainerID, containerID)
+			require.True(t, visible)
+			copy := late
+			return &copy, nil
+		},
+		StopContainerFn: func(_ context.Context, containerID string, timeout time.Duration) error {
+			require.Equal(t, late.ContainerID, containerID)
+			require.Positive(t, timeout)
+			return nil
+		},
 		RemoveContainerFn: func(_ context.Context, containerID string) error {
 			require.Equal(t, late.ContainerID, containerID)
 			removed++
@@ -356,20 +367,11 @@ func TestDoDeprovision_FailedInitialOperationBecomesCleanupOnlyCloseAndPermanent
 		},
 	}
 	b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
-	b.compose = &mockComposeExecutor{DownFn: func(
-		context.Context,
-		string,
-		time.Duration,
-	) error {
-		// Model Compose removing substrate which became visible only after the
-		// operation's exact failure was already durable.
-		visible = false
-		return nil
-	}}
 	items := []backend.LeaseItem{{
 		SKU: "docker-small", ServiceName: "app", Quantity: 1,
 	}}
 	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
+	late.CallbackURL, late.LifecycleCallbackURL = callbackURL, lifecycleCallbackURL
 	candidate, err := stores.operations.NewOperationIntentCandidate(shared.OperationIntentSpec{
 		Kind:                 shared.OperationIntentProvision,
 		LeaseUUID:            closeDeprovisionLeaseUUID,
@@ -397,6 +399,7 @@ func TestDoDeprovision_FailedInitialOperationBecomesCleanupOnlyCloseAndPermanent
 	require.NoError(t, b.doDeprovisionForTest(
 		t, context.Background(), closeDeprovisionLeaseUUID,
 	))
+	require.Equal(t, 1, removed, "close retires the exact captured interrupted cohort")
 	_, found, err := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
 	require.NoError(t, err)
 	require.False(t, found, "cleanup must consume the failed-operation head")
@@ -411,7 +414,7 @@ func TestDoDeprovision_FailedInitialOperationBecomesCleanupOnlyCloseAndPermanent
 	// by the now-archived failure witness, and is removed before projection.
 	visible = true
 	require.NoError(t, b.recoverState(context.Background()))
-	require.Equal(t, 1, removed)
+	require.Equal(t, 2, removed, "the permanent close fence also retires a later arrival")
 	b.provisionsMu.RLock()
 	_, projected := b.provisions[closeDeprovisionLeaseUUID]
 	b.provisionsMu.RUnlock()

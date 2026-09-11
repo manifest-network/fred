@@ -728,6 +728,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Managed Docker launches reserve physical volumes and retain namespace exclusion
+  through container start. Exact prior writers are retired before bind preparation;
+  unsafe cross-container mount layouts and unresolved earlier launches refuse reuse.
+  Durable launch records also fence volume path recreation after ambiguous Docker
+  responses. (ENG-797)
+- Failed replacements can compensate from durable source image identities,
+  effective runtime settings, and physical volume identities. Successful
+  compensation restores Ready while reporting maintenance failure; ambiguous
+  requests retain their recovery authority. Failed releases with verified missing
+  replicas remain repairable without acquiring partial-source replay authority.
+  (ENG-932)
+- Failed startup diagnostics are captured before exact-target removal, survive
+  restart and close, and remain available after successful compensation. Older
+  cleanup cannot overwrite a newer attempt's published failure. (ENG-939)
+- Image inspection helpers persist exact cleanup ownership before creation.
+  Cancellation, lost Create responses, removal failures, and restart preserve
+  their independently recoverable cleanup obligations. (ENG-940)
+
 - **Fleet test timeout isolation:** Healthy fleet scenarios now use the production
   HTTP request budget instead of inheriting the short hang-injection timeout.
   The slow-response regression exceeds the former 300 ms budget, and the hang

@@ -2456,6 +2456,9 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 		t.Fatal("timeout waiting for provision callback")
 	}
 
+	before := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, before, 1)
+
 	// Update with an image that doesn't exist (passes registry check, fails pull)
 	badManifest := manifest.Manifest{
 		Image:   "busybox:this-tag-does-not-exist-xyz-99999",
@@ -2480,9 +2483,13 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 		t.Fatal("timeout waiting for update failure callback")
 	}
 
-	// Status should be Failed
+	// Replacement failure preserves the positively healthy original source.
 	prov := getProvisionInfo(t, b, leaseUUID)
-	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+	after := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, after, 1)
+	assert.Equal(t, before[0].ID, after[0].ID)
+	assert.Equal(t, "running", after[0].State)
 
 	// Release history should show the failed update
 	releases, err := b.GetReleases(ctx, leaseUUID)
@@ -2494,10 +2501,157 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 	assert.Equal(t, backend.MsgImagePullFailed, releases[1].Message, "failed update should carry the curated image-pull message")
 	assert.Equal(t, "busybox:this-tag-does-not-exist-xyz-99999", releaseServiceImage(t, releases[1], manifest.DefaultServiceName))
 
-	// No leftover containers from the failed update — only the old ones remain (exited/removed)
-	// The original containers were removed during the update attempt
 	err = b.Deprovision(ctx, leaseUUID)
 	require.NoError(t, err)
+}
+
+// This crosses the real Docker launch boundary: the replacement runs, emits
+// logs, and becomes unhealthy. Compensation must recreate the frozen source
+// before publishing failure, preserving managed data when a volume is present.
+func TestIntegration_Docker_UpdateUnhealthyTargetRestoresFrozenSource(t *testing.T) {
+	t.Run("ephemeral", func(t *testing.T) {
+		testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t, "")
+	})
+	t.Run("stateful", func(t *testing.T) {
+		testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t, setupBtrfsLoopback(t))
+	})
+}
+
+func testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t *testing.T, mountPath string) {
+	callbackServer, callbackCh := startCallbackServer(t)
+	pidsLimit := int64(128)
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		cfg.ContainerReadonlyRootfs = ptrBool(true)
+		cfg.ContainerPidsLimit = &pidsLimit
+		if mountPath != "" {
+			cfg.VolumeDataPath = mountPath
+			cfg.VolumeMountPath = mountPath
+			cfg.VolumeFilesystem = "btrfs"
+		}
+	})
+	ctx := t.Context()
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
+	source := manifest.Manifest{
+		Image:   "redis:7",
+		User:    "999:999",
+		Env:     map[string]string{"PR240_POLICY": "frozen-source"},
+		Command: []string{"sh", "-c", "echo pr240-source-ready; exec redis-server --save 1 1"},
+	}
+	payload, err := json.Marshal(source)
+	require.NoError(t, err)
+	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID: leaseUUID, Tenant: "test-tenant", ProviderUUID: testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
+	}))
+	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, callbackCh, leaseUUID, 3*time.Minute).Status)
+	before := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, before, 1)
+	docker, err := NewDockerClient(ctx, "", "")
+	require.NoError(t, err)
+	defer func() { _ = docker.Close() }()
+	frozen, err := docker.client.ContainerInspect(ctx, before[0].ID)
+	require.NoError(t, err)
+	requireProvisionContainerImage(t, before[0], source.Image)
+	require.True(t, frozen.HostConfig.ReadonlyRootfs)
+	require.Equal(t, "999:999", frozen.Config.User)
+	var originalDataPath string
+	if mountPath != "" {
+		require.Contains(t, execInContainer(t, before[0].ID, []string{"redis-cli", "SET", "compensation-key", "source-persisted"}), "OK")
+		require.Contains(t, execInContainer(t, before[0].ID, []string{"redis-cli", "SAVE"}), "OK")
+		for _, bound := range frozen.Mounts {
+			if bound.Destination == "/data" {
+				originalDataPath = bound.Source
+			}
+		}
+		require.NotEmpty(t, originalDataPath, "source must use a real managed stateful bind")
+	} else {
+		for _, bound := range frozen.Mounts {
+			require.NotEqual(t, "bind", string(bound.Type), "ephemeral source must exercise an empty managed-volume launch")
+		}
+	}
+
+	target := manifest.Manifest{
+		Image:   "redis:7-alpine",
+		User:    "999:999",
+		Env:     map[string]string{"PR240_POLICY": "failed-target"},
+		Command: []string{"sh", "-c", "echo pr240-target-started-and-failed; exec sleep 3600"},
+		HealthCheck: &manifest.HealthCheckConfig{
+			Test: []string{"CMD", "false"}, Interval: manifest.Duration(time.Second),
+			Timeout: manifest.Duration(time.Second), Retries: 1,
+		},
+	}
+	badPayload, err := json.Marshal(target)
+	require.NoError(t, err)
+	maintenanceID := newTestMaintenanceID(t)
+	require.NoError(t, b.Update(ctx, backend.UpdateRequest{
+		MaintenanceID: maintenanceID, LeaseUUID: leaseUUID,
+		CallbackURL: callbacks.lifecycleURL, Payload: badPayload,
+	}))
+	failed := waitForCallback(t, callbackCh, leaseUUID, 3*time.Minute)
+	require.Equal(t, backend.CallbackStatusFailed, failed.Status)
+	require.NotEmpty(t, failed.Error)
+	require.Equal(t, backend.ProvisionStatusReady, getProvisionInfo(t, b, leaseUUID).Status)
+
+	after := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, after, 1, "failed target must be removed before source readiness is published")
+	require.NotEqual(t, before[0].ID, after[0].ID, "the healthy source must have been recreated after target dispatch")
+	require.Equal(t, "running", after[0].State)
+	requireProvisionContainerImage(t, after[0], source.Image)
+	restored, err := docker.client.ContainerInspect(ctx, after[0].ID)
+	require.NoError(t, err)
+	require.Equal(t, frozen.Image, restored.Image, "source replay must use the original immutable image")
+	require.Equal(t, frozen.Config.Image, restored.Config.Image)
+	require.Equal(t, frozen.Config.User, restored.Config.User)
+	require.Equal(t, frozen.Config.Env, restored.Config.Env)
+	require.Equal(t, frozen.Config.Entrypoint, restored.Config.Entrypoint)
+	require.Equal(t, frozen.Config.Cmd, restored.Config.Cmd)
+	require.Equal(t, frozen.Config.Healthcheck, restored.Config.Healthcheck)
+	require.Equal(t, frozen.HostConfig.ReadonlyRootfs, restored.HostConfig.ReadonlyRootfs)
+	require.Equal(t, frozen.HostConfig.Resources, restored.HostConfig.Resources)
+	require.Equal(t, frozen.HostConfig.CapDrop, restored.HostConfig.CapDrop)
+	require.Equal(t, frozen.HostConfig.SecurityOpt, restored.HostConfig.SecurityOpt)
+	require.Equal(t, frozen.Config.Labels[LabelLifecycleCallbackURL], restored.Config.Labels[LabelLifecycleCallbackURL])
+	require.Equal(t, frozen.Config.Labels[LabelMaintenanceID], restored.Config.Labels[LabelMaintenanceID])
+	if mountPath != "" {
+		var restoredDataPath string
+		for _, bound := range restored.Mounts {
+			if bound.Destination == "/data" {
+				restoredDataPath = bound.Source
+			}
+		}
+		require.Equal(t, originalDataPath, restoredDataPath)
+		require.Contains(t, execInContainer(t, after[0].ID, []string{"redis-cli", "GET", "compensation-key"}), "source-persisted")
+	}
+
+	info, err := b.GetInfo(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.Contains(t, info.Services, manifest.DefaultServiceName)
+	require.Len(t, info.Services[manifest.DefaultServiceName].Instances, 1)
+	require.Equal(t, after[0].ID[:12], info.Services[manifest.DefaultServiceName].Instances[0].ContainerID)
+	require.Len(t, info.Instances, 1)
+	require.Equal(t, after[0].ID[:12], info.Instances[0].ContainerID)
+	logs, err := b.GetLogs(ctx, leaseUUID, 100)
+	require.NoError(t, err)
+	require.Contains(t, logs[manifest.DefaultServiceName+"/0"], "pr240-source-ready")
+	require.Contains(t, logs["failed/"+manifest.DefaultServiceName+"/0"], "pr240-target-started-and-failed",
+		"real target output must survive removal alongside restored live source logs")
+	releases, err := b.GetReleases(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.Len(t, releases, 2)
+	require.Equal(t, "active", releases[0].Status)
+	require.Equal(t, "failed", releases[1].Status)
+	require.Equal(t, source.Image, releaseServiceImage(t, releases[0], manifest.DefaultServiceName))
+	require.Equal(t, target.Image, releaseServiceImage(t, releases[1], manifest.DefaultServiceName))
+	durable, err := b.releaseStore.List(leaseUUID)
+	require.NoError(t, err)
+	require.Len(t, durable, 2)
+	require.Equal(t, maintenanceID, durable[1].MaintenanceID)
+	require.NoError(t, b.Deprovision(ctx, leaseUUID))
 }
 
 func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) {

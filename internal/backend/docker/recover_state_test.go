@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	networktypes "github.com/docker/docker/api/types/network"
@@ -153,29 +154,32 @@ func TestPeriodicReconcileContextIsCanceledByBackendShutdown(t *testing.T) {
 }
 
 type mockDockerClient struct {
-	imageOnce                    sync.Once
-	images                       *imageexec.Admitter
-	PingFn                       func(ctx context.Context) error
-	DaemonInfoFn                 func(ctx context.Context) (DaemonSecurityInfo, error)
-	CloseFn                      func() error
-	PullImageFn                  func(ctx context.Context, imageName string, timeout time.Duration) error
-	InspectImageFn               func(ctx context.Context, imageName string) (*ImageInfo, error)
-	CreateContainerFn            func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
-	StartContainerFn             func(ctx context.Context, containerID string, timeout time.Duration) error
-	StopContainerFn              func(ctx context.Context, containerID string, timeout time.Duration) error
-	RenameContainerFn            func(ctx context.Context, containerID string, newName string) error
-	RemoveContainerFn            func(ctx context.Context, containerID string) error
-	InspectContainerFn           func(ctx context.Context, containerID string) (*ContainerInfo, error)
-	ContainerLogsFn              func(ctx context.Context, containerID string, tail int) (string, error)
-	ListManagedContainersFn      func(ctx context.Context) ([]ContainerInfo, error)
-	EnsureTenantNetworkFn        func(ctx context.Context, tenant string) (string, error)
-	RemoveTenantNetworkIfEmptyFn func(ctx context.Context, tenant string) error
-	ListManagedNetworksFn        func(ctx context.Context) ([]networktypes.Inspect, error)
-	ResolveImageUserFn           func(ctx context.Context, imageName string, userOverride string) (int, int, error)
-	DetectVolumeOwnerFn          func(ctx context.Context, imageName string, volumePaths []string) (int, int, error)
-	DetectWritablePathsFn        func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error)
-	ExtractImageContentFn        func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error
-	ContainerEventsFn            func(ctx context.Context) (<-chan ContainerEvent, <-chan error)
+	imageOnce                     sync.Once
+	images                        *imageexec.Admitter
+	PingFn                        func(ctx context.Context) error
+	DaemonInfoFn                  func(ctx context.Context) (DaemonSecurityInfo, error)
+	CloseFn                       func() error
+	PullImageFn                   func(ctx context.Context, imageName string, timeout time.Duration) error
+	InspectImageFn                func(ctx context.Context, imageName string) (*ImageInfo, error)
+	CreateContainerFn             func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
+	StartContainerFn              func(ctx context.Context, containerID string, timeout time.Duration) error
+	StopContainerFn               func(ctx context.Context, containerID string, timeout time.Duration) error
+	RenameContainerFn             func(ctx context.Context, containerID string, newName string) error
+	RemoveContainerFn             func(ctx context.Context, containerID string) error
+	InspectContainerFn            func(ctx context.Context, containerID string) (*ContainerInfo, error)
+	ContainerLogsFn               func(ctx context.Context, containerID string, tail int) (string, error)
+	ListManagedContainersFn       func(ctx context.Context) ([]ContainerInfo, error)
+	ListVolumeWritersFn           func(context.Context) ([]ContainerInfo, error)
+	CreateCompensationContainerFn func(context.Context, imageexec.Image, compensationContainer) (string, error)
+	ReadmitCompensationImageFn    func(context.Context, compensationContainerRecord) (imageexec.Image, error)
+	EnsureTenantNetworkFn         func(ctx context.Context, tenant string) (string, error)
+	RemoveTenantNetworkIfEmptyFn  func(ctx context.Context, tenant string) error
+	ListManagedNetworksFn         func(ctx context.Context) ([]networktypes.Inspect, error)
+	ResolveImageUserFn            func(ctx context.Context, imageName string, userOverride string) (int, int, error)
+	DetectVolumeOwnerFn           func(ctx context.Context, imageName string, volumePaths []string) (int, int, error)
+	DetectWritablePathsFn         func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error)
+	ExtractImageContentFn         func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error
+	ContainerEventsFn             func(ctx context.Context) (<-chan ContainerEvent, <-chan error)
 }
 
 func (m *mockDockerClient) Ping(ctx context.Context) error {
@@ -302,7 +306,7 @@ func (m *mockDockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenan
 	panic("unexpected call to RemoveTenantNetworkIfEmpty")
 }
 
-func (m *mockDockerClient) ResolveImageUser(ctx context.Context, imageName imageexec.Image, userOverride string) (int, int, error) {
+func (m *mockDockerClient) ResolveImageUser(ctx context.Context, imageName imageexec.Image, userOverride string, _ shared.ImageInspectionOrigin) (int, int, error) {
 	if m.ResolveImageUserFn != nil {
 		return m.ResolveImageUserFn(ctx, imageName.ID(), userOverride)
 	}
@@ -316,21 +320,21 @@ func (m *mockDockerClient) ListManagedNetworks(ctx context.Context) ([]networkty
 	panic("unexpected call to ListManagedNetworks")
 }
 
-func (m *mockDockerClient) DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string) (int, int, error) {
+func (m *mockDockerClient) DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string, _ shared.ImageInspectionOrigin) (int, int, error) {
 	if m.DetectVolumeOwnerFn != nil {
 		return m.DetectVolumeOwnerFn(ctx, imageName.ID(), volumePaths)
 	}
 	return 0, 0, nil // default: root (auto-detect path entered but produces no override)
 }
 
-func (m *mockDockerClient) DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string) ([]string, error) {
+func (m *mockDockerClient) DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string, _ shared.ImageInspectionOrigin) ([]string, error) {
 	if m.DetectWritablePathsFn != nil {
 		return m.DetectWritablePathsFn(ctx, imageName.ID(), uid, candidateParents)
 	}
 	return nil, nil // default: no writable paths detected
 }
 
-func (m *mockDockerClient) ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error {
+func (m *mockDockerClient) ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64, _ shared.ImageInspectionOrigin) map[string]error {
 	if m.ExtractImageContentFn != nil {
 		return m.ExtractImageContentFn(ctx, imageName.ID(), paths, destDir, maxBytes, maxEntries)
 	}
@@ -404,6 +408,9 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 	}}
 	installTestStorageMutationAdapters(b)
 	b.inspector = &dockerInstanceInspector{docker: b.docker}
+	// This low-level mock substrate has no prior workload requests. Complete
+	// launches require bindBackendTestPhysicalExecutors to install a real journal.
+	b.volumeLaunches = emptyVolumeLaunchCoordinatorForTest()
 	b.gatherer = &dockerDiagnosticsGatherer{backend: b}
 	b.provisionStore = &backendProvisionStore{backend: b}
 	return b
@@ -523,69 +530,82 @@ func TestRecoverState_BoundsColdStartDiagnostics(t *testing.T) {
 }
 
 func TestRecoverState_PersistedDiagnosticsShareOneAggregateBudget(t *testing.T) {
-	const (
-		leaseA = "lease-a"
-		leaseB = "lease-b"
-	)
-	started := time.Now()
-	var persistenceBudgetRemaining []time.Duration
-	mock := &mockDockerClient{
-		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{
-				{
-					ContainerID: "dead-a", LeaseUUID: leaseA, Tenant: "tenant-a",
-					ProviderUUID: "provider-a", SKU: "docker-small", ServiceName: "app",
-					Status: "exited", CreatedAt: started,
-				},
-				{
-					ContainerID: "dead-b", LeaseUUID: leaseB, Tenant: "tenant-b",
-					ProviderUUID: "provider-b", SKU: "docker-small", ServiceName: "app",
-					Status: "exited", CreatedAt: started,
-				},
-			}, nil
-		},
-		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: id, Status: "exited"}, nil
-		},
-		ContainerLogsFn: func(ctx context.Context, _ string, tail int) (string, error) {
-			if tail == diagnosticLogTail {
-				return "cold-start diagnostic", nil
+	synctest.Test(t, func(t *testing.T) {
+		leaseUUIDs := []string{
+			"11111111-1111-4111-8111-111111111111",
+			"22222222-2222-4222-8222-222222222222",
+		}
+		var containers []ContainerInfo
+		var persistenceBudgetRemaining []time.Duration
+		mock := &mockDockerClient{
+			ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+				return append([]ContainerInfo(nil), containers...), nil
+			},
+			InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+				for _, container := range containers {
+					if container.ContainerID == id {
+						copy := container
+						return &copy, nil
+					}
+				}
+				return nil, fmt.Errorf("unknown diagnostic container %q", id)
+			},
+			ContainerLogsFn: func(ctx context.Context, _ string, tail int) (string, error) {
+				if tail == diagnosticLogTail {
+					return "cold-start diagnostic", nil
+				}
+				require.Equal(t, persistedLogTail, tail)
+				deadline, ok := ctx.Deadline()
+				require.True(t, ok, "persisted-log capture must always carry a deadline")
+				remaining := time.Until(deadline)
+				persistenceBudgetRemaining = append(persistenceBudgetRemaining, remaining)
+				if remaining > time.Second {
+					return "", errors.New("persisted-log capture received a fresh per-lease budget")
+				}
+				<-ctx.Done()
+				return "", ctx.Err()
+			},
+		}
+		b := newBackendForProvisionTest(t, mock, nil)
+		items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
+		payload := validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"})
+		for index, leaseUUID := range leaseUUIDs {
+			operationID, callbackURL, lifecycleURL := newTestRestoreCallbackAuthority(t)
+			tenant := fmt.Sprintf("tenant-%d", index)
+			authority, err := shared.NewReleaseRuntimeAuthority(operationID, tenant, nominalDockerProviderUUID, callbackURL, lifecycleURL)
+			require.NoError(t, err)
+			profiles := testResourceProfiles(t, items)
+			seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
+				OperationID: operationID, RuntimeAuthority: &authority, Items: items,
+				ResourceProfiles: profiles, Manifest: payload, Image: "stack", Status: "active", CreatedAt: time.Now(),
+			})
+			spec := shared.OperationIntentSpec{
+				LeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: nominalDockerProviderUUID,
+				CallbackURL: callbackURL, LifecycleCallbackURL: lifecycleURL,
+				Items: items, ResourceProfiles: profiles, Manifest: payload,
 			}
-			require.Equal(t, persistedLogTail, tail)
-			deadline, ok := ctx.Deadline()
-			require.True(t, ok, "persisted-log capture must always carry a deadline")
-			remaining := time.Until(deadline)
-			persistenceBudgetRemaining = append(persistenceBudgetRemaining, remaining)
-			if remaining > time.Second {
-				return "", errors.New("persisted-log capture received a fresh per-lease budget")
-			}
-			<-ctx.Done()
-			return "", ctx.Err()
-		},
-	}
-	b := newBackendForTest(mock, nil)
-	b.recoveryDockerReadTimeout = 20 * time.Millisecond
-	diagnostics, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "diagnostics.db"),
+			container := dockerIntentContainer(spec, fmt.Sprintf("dead-%d", index), items[0].SKU, 0)
+			container.Status = "exited"
+			containers = append(containers, container)
+		}
+		b.recoveryDockerReadTimeout = 20 * time.Millisecond
+		started := time.Now()
+		require.NoError(t, b.recoverState(context.Background()))
+		assert.Less(t, time.Since(started), time.Second,
+			"persisting N failed leases must consume one recovery budget, not N fresh timeouts")
+		require.Len(t, persistenceBudgetRemaining, 1,
+			"once one lease exhausts the shared budget, recovery must issue no later Docker log reads")
+		assert.Equal(t, 20*time.Millisecond, persistenceBudgetRemaining[0],
+			"every lease inherits the same virtual recovery deadline")
+		for _, leaseUUID := range leaseUUIDs {
+			entry, err := b.diagnosticsStore.Get(leaseUUID)
+			require.NoError(t, err)
+			require.NotNil(t, entry, "deadline exhaustion must drop logs, not the authorized runtime diagnostic")
+			require.Positive(t, entry.RuntimeReleaseVersion)
+			require.NotEmpty(t, entry.Tenant)
+			require.Equal(t, nominalDockerProviderUUID, entry.ProviderUUID)
+		}
 	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, diagnostics.Close()) })
-	b.diagnosticsStore = diagnostics
-
-	require.NoError(t, b.recoverState(context.Background()))
-	assert.Less(t, time.Since(started), time.Second,
-		"persisting N failed leases must consume one recovery budget, not N fresh timeouts")
-	require.Len(t, persistenceBudgetRemaining, 1,
-		"once one lease exhausts the shared budget, recovery must issue no later Docker log reads")
-	for _, remaining := range persistenceBudgetRemaining {
-		assert.LessOrEqual(t, remaining, 100*time.Millisecond,
-			"each lease must inherit the one short recovery deadline")
-	}
-	for _, leaseUUID := range []string{leaseA, leaseB} {
-		entry, getErr := diagnostics.Get(leaseUUID)
-		require.NoError(t, getErr)
-		require.NotNil(t, entry, "deadline exhaustion must drop logs, not the diagnostic record")
-	}
 }
 
 func TestRecoverState_BoundsManagedNetworkCleanup(t *testing.T) {

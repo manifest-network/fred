@@ -16,7 +16,7 @@ import (
 // run goroutine has already been spawned.
 //
 // Pattern matches PR4's seam-and-closure approach for PersistDiagnosticsFn /
-// SendOperationCallbackFn / PersistDiagnosticsWithLogsFn and PR5b-1's Metrics
+// SendOperationCallbackFn and PR5b-1's Metrics
 // adapter — each substrate-private operation is reached via a closure
 // captured at construction, so the actor never holds a *Backend pointer
 // of its own.
@@ -67,9 +67,6 @@ func newLeaseActor(b *Backend, leaseUUID string) *leasesm.LeaseActor {
 		},
 		PersistDiagnosticsFn: func(entry shared.DiagnosticEntry, containerIDs []string, keys map[string]string) {
 			b.persistDiagnostics(entry, containerIDs, keys)
-		},
-		PersistDiagnosticsWithLogsFn: func(entry shared.DiagnosticEntry, logs map[string]string) {
-			b.persistDiagnosticsWithLogs(entry, logs)
 		},
 		SendOperationSuccessFn: func(
 			committed shared.OperationReleaseCommitted,

@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -77,23 +78,23 @@ func TestImageCreationBoundariesRequireAdmittedImage(t *testing.T) {
 			return err
 		},
 		"passwd helper": func(cli *DockerClient) error {
-			_, err := cli.readFileFromImage(t.Context(), imageexec.Image{}, "/etc/passwd")
+			_, err := cli.readFileFromImage(t.Context(), imageexec.Image{}, "/etc/passwd", shared.ImageInspectionOrigin{})
 			return err
 		},
 		"user resolution": func(cli *DockerClient) error {
-			_, _, err := cli.ResolveImageUser(t.Context(), imageexec.Image{}, "app")
+			_, _, err := cli.ResolveImageUser(t.Context(), imageexec.Image{}, "app", shared.ImageInspectionOrigin{})
 			return err
 		},
 		"volume owner helper": func(cli *DockerClient) error {
-			_, _, err := cli.DetectVolumeOwner(t.Context(), imageexec.Image{}, []string{"/data"})
+			_, _, err := cli.DetectVolumeOwner(t.Context(), imageexec.Image{}, []string{"/data"}, shared.ImageInspectionOrigin{})
 			return err
 		},
 		"writable path helper": func(cli *DockerClient) error {
-			_, err := cli.DetectWritablePaths(t.Context(), imageexec.Image{}, 1000, []string{"/var/lib"})
+			_, err := cli.DetectWritablePaths(t.Context(), imageexec.Image{}, 1000, []string{"/var/lib"}, shared.ImageInspectionOrigin{})
 			return err
 		},
 		"extraction helper": func(cli *DockerClient) error {
-			return cli.ExtractImageContent(t.Context(), imageexec.Image{}, []string{"/data"}, t.TempDir(), 1024, 10)["/data"]
+			return cli.ExtractImageContent(t.Context(), imageexec.Image{}, []string{"/data"}, t.TempDir(), 1024, 10, shared.ImageInspectionOrigin{})["/data"]
 		},
 	}
 	for name, action := range actions {
@@ -142,19 +143,17 @@ func TestCreateContainerPinsInspectedImageAfterTagMoves(t *testing.T) {
 }
 
 func TestImageInspectionHelperPinsInspectedImage(t *testing.T) {
-	var created container.Config
-	cli := newImageSecurityDockerClient(t, func(req *http.Request) (*http.Response, error) {
-		if strings.Contains(req.URL.Path, "/images/") {
-			return imageSecurityResponse(http.StatusOK, fmt.Sprintf(`{"Id":%q,"Os":"linux","Architecture":"amd64","Config":{}}`, testImageID)), nil
-		}
-		require.NoError(t, json.NewDecoder(req.Body).Decode(&created))
-		return imageSecurityResponse(http.StatusCreated, `{"Id":"helper"}`), nil
+	h := newInspectionHarness(t)
+	h.execute(t, func(ctx context.Context, origin shared.ImageInspectionOrigin) error {
+		session, err := h.client.openImageInspection(ctx, h.image, origin)
+		require.NoError(t, err)
+		actual := h.daemon.containers[session.containerID]
+		assert.Equal(t, testImageID, actual.Config.Image)
+		assert.Equal(t, testImageID, actual.Config.Labels[LabelImageID])
+		assert.Equal(t, h.image.Reference(), actual.Config.Labels[LabelImageReference])
+		assert.NotContains(t, actual.Config.Labels, LabelManaged)
+		return session.close()
 	})
-	admitted, err := cli.AdmitImage(t.Context(), "tenant/app:latest")
-	require.NoError(t, err)
-	_, err = cli.createImageInspectionContainer(t.Context(), admitted)
-	require.NoError(t, err)
-	assert.Equal(t, testImageID, created.Image)
 }
 
 func TestPreparedComposeProjectPreservesIntentAndPreventsRepull(t *testing.T) {

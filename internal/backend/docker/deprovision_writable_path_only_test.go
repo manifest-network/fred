@@ -633,7 +633,7 @@ func TestDeprovision_MarkerNamedStatefulDirPlusWp_Retained(t *testing.T) {
 // is image-derived and never survives a redeploy/restore. It re-pins, at the unit
 // level, the contract the repurposed grafana integration test used to assert.
 func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
-	mock := &mockDockerClient{}
+	mock := &mockDockerClient{ListVolumeWritersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 
 	volumeRoot := t.TempDir()
@@ -657,8 +657,12 @@ func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 	}
 
 	binds := runSubjectStorageMutationForTest(t, b, "550e8400-e29b-41d4-a716-446655440000", func(mutations *storageMutations) map[string]string {
-		return b.setupWritablePathBinds(mutations, context.Background(), admittedFixtureImage(t, "grafana/grafana:11.1.0"),
-			[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
+		protected := quiescedVolumeForTest(t, mutations, hostVol)
+		defer protected.release()
+		volume, err := protected.lookup(filepath.Base(hostVol))
+		require.NoError(t, err)
+		return b.setupWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "grafana/grafana:11.1.0"),
+			[]string{"/var/lib/grafana"}, 64<<20, 1<<30)
 	})
 
 	// Stale tenant content is wiped; fresh image content is reseeded.
@@ -683,7 +687,7 @@ func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 // directories today, but setupWritablePathBinds must be self-defending: it must not
 // emit a bind whose Source is a symlink.
 func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
-	mock := &mockDockerClient{}
+	mock := &mockDockerClient{ListVolumeWritersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 
 	volumeRoot := t.TempDir()
@@ -705,8 +709,12 @@ func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
 	}
 
 	binds := runSubjectStorageMutationForTest(t, b, "550e8400-e29b-41d4-a716-446655440000", func(mutations *storageMutations) map[string]string {
-		return b.setupWritablePathBinds(mutations, context.Background(), admittedFixtureImage(t, "img"),
-			[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
+		protected := quiescedVolumeForTest(t, mutations, hostVol)
+		defer protected.release()
+		volume, err := protected.lookup(filepath.Base(hostVol))
+		require.NoError(t, err)
+		return b.setupWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "img"),
+			[]string{"/var/lib/grafana"}, 64<<20, 1<<30)
 	})
 
 	assert.NotContains(t, binds, filepath.Join(wpDir, "var", "lib", "grafana"),
@@ -719,7 +727,7 @@ func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
 // for any reason OTHER than "does not exist", setupWritablePathBinds must fail closed
 // and emit no binds rather than mount unvalidated (possibly symlinked) Sources.
 func TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable(t *testing.T) {
-	mock := &mockDockerClient{}
+	mock := &mockDockerClient{ListVolumeWritersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 
 	volumeRoot := t.TempDir()
@@ -737,8 +745,12 @@ func TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable(t *testing.T) {
 	}
 
 	binds := runSubjectStorageMutationForTest(t, b, "550e8400-e29b-41d4-a716-446655440000", func(mutations *storageMutations) map[string]string {
-		return b.setupWritablePathBinds(mutations, context.Background(), admittedFixtureImage(t, "img"),
-			[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
+		protected := quiescedVolumeForTest(t, mutations, hostVol)
+		defer protected.release()
+		volume, err := protected.lookup(filepath.Base(hostVol))
+		require.NoError(t, err)
+		return b.setupWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "img"),
+			[]string{"/var/lib/grafana"}, 64<<20, 1<<30)
 	})
 
 	assert.Empty(t, binds,

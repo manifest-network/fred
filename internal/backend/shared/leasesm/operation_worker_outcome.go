@@ -26,7 +26,6 @@ type provisionWorkFailure struct {
 	callbackErr string
 	reason      backend.Reason
 	err         error
-	logs        map[string]string
 	proof       shared.OperationReleaseUncommitted
 }
 
@@ -71,7 +70,6 @@ func NewProvisionWorkFailure(
 	err error,
 	callbackErr string,
 	reason backend.Reason,
-	logs map[string]string,
 	proof shared.OperationReleaseUncommitted,
 ) (ProvisionWorkOutcome, error) {
 	if err == nil || !proof.Valid() || proof.Kind() != shared.OperationIntentProvision {
@@ -81,7 +79,6 @@ func NewProvisionWorkFailure(
 		callbackErr: callbackErr,
 		reason:      reason,
 		err:         err,
-		logs:        cloneStringMap(logs),
 		proof:       proof,
 	}, nil
 }

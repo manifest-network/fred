@@ -1313,10 +1313,17 @@ func TestDeprovision_Stack(t *testing.T) {
 
 func TestStackProvision_ComposeUpFailurePreservesRecoveryAuthority(t *testing.T) {
 	var downCalled bool
+	var removeCalled bool
 	var mu sync.Mutex
 
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return nil
+		},
+		RemoveContainerFn: func(context.Context, string) error {
+			mu.Lock()
+			removeCalled = true
+			mu.Unlock()
 			return nil
 		},
 	}
@@ -1368,10 +1375,13 @@ func TestStackProvision_ComposeUpFailurePreservesRecoveryAuthority(t *testing.T)
 	default:
 	}
 
-	// Compose Down should be called for cleanup.
+	// An uncertain launch does not authorize project-wide cleanup, and this
+	// empty inventory provides no exact failed container to capture and remove.
 	mu.Lock()
-	assert.True(t, downCalled, "compose down should be called on up failure")
+	assert.False(t, downCalled, "an uncertain launch must not authorize broad project cleanup")
+	assert.False(t, removeCalled, "cleanup requires an exact captured failed container")
 	mu.Unlock()
+	require.ErrorContains(t, b.volumeLaunches.checkNamespace(stackFixtureLeaseUUID), "unsettled Docker launch")
 
 	// Compose Up crossed an external effect boundary. Its error cannot prove
 	// that Docker published nothing, so exact recovery authority must survive.
@@ -1384,8 +1394,8 @@ func TestStackProvision_ComposeUpFailurePreservesRecoveryAuthority(t *testing.T)
 	require.Len(t, intents, 1)
 	assert.Equal(t, shared.OperationExecutionStarted, intents[0].ExecutionPhase())
 
-	// The Started operation continues to own its reserved capacity until
-	// recovery proves Ready or exact absence.
+	// The Started operation continues to own its reserved capacity while its
+	// Docker launch remains unresolved.
 	stats := b.pool.Stats()
 	assert.Equal(t, 2, stats.AllocationCount)
 }

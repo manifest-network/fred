@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -204,7 +205,7 @@ func TestResolveImageUserNumeric(t *testing.T) {
 		},
 	}
 
-	uid, gid, err := mock.ResolveImageUser(context.TODO(), admittedFixtureImage(t, "postgres:16"), "")
+	uid, gid, err := mock.ResolveImageUser(context.TODO(), admittedFixtureImage(t, "postgres:16"), "", shared.ImageInspectionOrigin{})
 	require.NoError(t, err)
 	assert.Equal(t, 999, uid)
 	assert.Equal(t, 999, gid)
@@ -217,7 +218,7 @@ func TestResolveImageUserNumericWithGroup(t *testing.T) {
 		},
 	}
 
-	uid, gid, err := mock.ResolveImageUser(context.TODO(), admittedFixtureImage(t, "test-image"), "")
+	uid, gid, err := mock.ResolveImageUser(context.TODO(), admittedFixtureImage(t, "test-image"), "", shared.ImageInspectionOrigin{})
 	require.NoError(t, err)
 	assert.Equal(t, 999, uid)
 	assert.Equal(t, 100, gid)
@@ -230,7 +231,7 @@ func TestResolveImageUserEmpty(t *testing.T) {
 		},
 	}
 
-	uid, gid, err := mock.ResolveImageUser(context.TODO(), admittedFixtureImage(t, "nginx:latest"), "")
+	uid, gid, err := mock.ResolveImageUser(context.TODO(), admittedFixtureImage(t, "nginx:latest"), "", shared.ImageInspectionOrigin{})
 	require.NoError(t, err)
 	assert.Equal(t, 0, uid)
 	assert.Equal(t, 0, gid)
@@ -245,7 +246,7 @@ func TestResolveImageUserManifestOverride(t *testing.T) {
 		},
 	}
 
-	uid, gid, err := mock.ResolveImageUser(context.TODO(), admittedFixtureImage(t, "postgres:16"), "postgres")
+	uid, gid, err := mock.ResolveImageUser(context.TODO(), admittedFixtureImage(t, "postgres:16"), "postgres", shared.ImageInspectionOrigin{})
 	require.NoError(t, err)
 	assert.Equal(t, 999, uid)
 	assert.Equal(t, 999, gid)

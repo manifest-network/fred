@@ -338,14 +338,19 @@ func TestOperationRecoveryCleanupRetainsIntentAndReservationForNextPass(t *testi
 	before := b.pool.ListAllocations()
 	blocked := true
 	mock := b.docker.(*mockDockerClient)
-	mock.RemoveContainerFn = func(context.Context, string) error { return errors.New("device busy") }
-	compose := b.compose.(*mockComposeExecutor)
-	originalDown := compose.DownFn
-	compose.DownFn = func(ctx context.Context, lease string, timeout time.Duration) error {
+	originalRemove := mock.RemoveContainerFn
+	removalAttempts := 0
+	mock.RemoveContainerFn = func(ctx context.Context, id string) error {
+		removalAttempts++
+		require.Equal(t, container.ContainerID, id)
 		if blocked {
-			return errors.New("compose unavailable")
+			return errors.New("device busy")
 		}
-		return originalDown(ctx, lease, timeout)
+		return originalRemove(ctx, id)
+	}
+	b.compose.(*mockComposeExecutor).DownFn = func(context.Context, string, time.Duration) error {
+		t.Error("failure recovery must remove only exact captured containers")
+		return errors.New("unexpected project-wide cleanup")
 	}
 	metric := operationIntentRecoveryCleanupRetriesTotal.WithLabelValues("provision")
 	metricBefore := testutil.ToFloat64(metric)
@@ -360,8 +365,10 @@ func TestOperationRecoveryCleanupRetainsIntentAndReservationForNextPass(t *testi
 	require.NoError(t, err)
 	require.Empty(t, pending)
 	require.Equal(t, metricBefore+1, testutil.ToFloat64(metric))
+	require.Equal(t, 1, removalAttempts)
 	blocked = false
 	require.NoError(t, b.recoverLiveOperationIntents(t.Context()))
+	require.Equal(t, 2, removalAttempts)
 	claims, err = b.operationSettlement.ListOperationIntents()
 	require.NoError(t, err)
 	require.Empty(t, claims)

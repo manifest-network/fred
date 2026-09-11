@@ -46,21 +46,23 @@ func TestDockerResourceProfilesPinScratchWithoutRuntimeRepricing(t *testing.T) {
 }
 
 func TestSetupVolBindsUsesPinnedScratchAfterConfigDrift(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, nil)
+	b := newBackendForTest(&mockDockerClient{ListVolumeWritersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil }}, nil)
 	b.cfg.ContainerTmpfsSizeMB = 999
 	delete(b.cfg.SKUProfiles, "diskless")
 
 	var createdID string
 	var createdSizeMB int64
 	hostRoot := t.TempDir()
-	b.volumes = &mockVolumeManager{CreateFn: func(
+	b.cfg.VolumeDataPath = hostRoot
+	b.volumes = &mockVolumeManager{defaultDir: hostRoot, CreateFn: func(
 		_ context.Context,
 		id string,
 		sizeMB int64,
 	) (string, bool, error) {
 		createdID = id
 		createdSizeMB = sizeMB
-		return filepath.Join(hostRoot, id), true, nil
+		path := filepath.Join(hostRoot, id)
+		return path, true, os.MkdirAll(path, 0o700)
 	}}
 	installTestStorageMutationAdapters(b)
 
@@ -74,9 +76,16 @@ func TestSetupVolBindsUsesPinnedScratchAfterConfigDrift(t *testing.T) {
 		err     error
 	}
 	result := runSubjectStorageMutationForTest(t, b, leaseUUID, func(mutations *storageMutations) bindResult {
+		setups := map[string]*imageSetup{"app": {WritablePaths: []string{"/var/cache/app"}}}
+		profiles, err := resourceProfileMap(items, resourceProfiles)
+		require.NoError(t, err)
+		protected, err := b.prepareLaunchVolumes(context.Background(), mutations, composeProjectParams{
+			LeaseUUID: leaseUUID, Items: items, Profiles: profiles, ImageSetups: setups,
+		}, resourceProfiles)
+		require.NoError(t, err)
+		defer protected.release()
 		_, created, err := b.setupVolBinds(
-			mutations, context.Background(), leaseUUID, items, resourceProfiles,
-			map[string]*imageSetup{"app": {WritablePaths: []string{"/var/cache/app"}}},
+			protected, context.Background(), leaseUUID, items, resourceProfiles, setups,
 			b.logger,
 		)
 		return bindResult{created: created, err: err}

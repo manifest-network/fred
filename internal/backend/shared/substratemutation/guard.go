@@ -167,17 +167,20 @@ func NewExecutor[T any, Subject comparable, Evidence any](
 // refused step: once any action is entered, every error makes the workflow
 // Ambiguous.
 type session struct {
-	mu            sync.Mutex
-	active        bool
-	effectEntered bool
-	issues        error
-	authorize     Authorize
-	complete      Complete
+	subject         any // always the Guard's comparable, opaque subject
+	mu              sync.Mutex
+	active          bool
+	effectEntered   bool
+	issues          error
+	issueGeneration uint64
+	authorize       Authorize
+	complete        Complete
 }
 
 func (s *session) addIssue(err error) {
 	if err != nil {
 		s.issues = errors.Join(s.issues, err)
+		s.issueGeneration++
 	}
 }
 
@@ -361,7 +364,7 @@ func (g *Guard[T, Subject, Evidence]) Execute(
 	if err := proof.consume(); err != nil {
 		return invalidResult[Subject, Evidence](err)
 	}
-	s := &session{active: true, authorize: g.authorize, complete: g.complete}
+	s := &session{active: true, authorize: g.authorize, complete: g.complete, subject: subject}
 	capability, buildErr := callBuild(g.build, Runner{session: s}, subject)
 	var workflowErr error
 	if buildErr == nil {
@@ -416,7 +419,7 @@ func (g *Guard[T, Subject, Evidence]) ExecuteRecovery(
 	if err := proof.consume(); err != nil {
 		return invalidResult[Subject, Evidence](err)
 	}
-	s := &session{active: true, authorize: g.authorize, complete: g.complete}
+	s := &session{active: true, authorize: g.authorize, complete: g.complete, subject: subject}
 	capability, buildErr := callBuild(g.build, Runner{session: s}, subject)
 	var workflowErr error
 	if buildErr == nil {

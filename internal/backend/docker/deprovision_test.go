@@ -96,7 +96,10 @@ func TestDoDeprovision_ReleaseDeleteFailureRemainsRetryable(t *testing.T) {
 	}}
 
 	err = b.doDeprovisionForTest(t, context.Background(), leaseUUID)
-	require.ErrorContains(t, err, "complete durable close")
+	// Closing the authoritative store also invalidates the bound diagnostic
+	// handoff, so close must stop before either terminal publication or release
+	// retirement can proceed with unavailable authority.
+	require.ErrorContains(t, err, "publish interrupted close diagnostics")
 	prov, exists := b.provisions[leaseUUID]
 	require.True(t, exists, "failed release retirement must preserve an in-memory retry owner")
 	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
@@ -118,6 +121,7 @@ func TestDoDeprovision_ReleaseDeleteFailureRemainsRetryable(t *testing.T) {
 		b.callbackStore, reopened, b.retentionStore,
 	)
 	require.NoError(t, err)
+	bindTestDiagnosticsStore(t, b, b.diagnosticsStore)
 	bindBackendTestCloseExecutor(t, b, b.closeSettlement)
 	stored, err := reopened.List(leaseUUID)
 	require.NoError(t, err)

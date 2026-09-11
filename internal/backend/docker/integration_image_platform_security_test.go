@@ -23,6 +23,8 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 // localPlatformSecurityRegistry serves only a tiny test-owned OCI index and its
@@ -142,18 +144,18 @@ func TestIntegration_Docker_MultiPlatformImageExecutesCheckedLeaf(t *testing.T) 
 	} else {
 		assert.Equal(t, raw.ID, prepared.ID(), "classic stores already expose an immutable config ID")
 	}
-	helper, err := docker.createImageInspectionContainer(ctx, prepared)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-		defer cancel()
-		_ = docker.RemoveContainer(cleanupCtx, helper.ID)
+	h := newIntegrationInspectionHarness(t, docker, imageName)
+	h.execute(t, func(work context.Context, origin shared.ImageInspectionOrigin) error {
+		helper, err := docker.openImageInspection(work, h.image, origin)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, helper.close()) }()
+		created, err := sdk.ContainerInspect(work, helper.containerID)
+		require.NoError(t, err)
+		assert.Equal(t, prepared.ID(), created.Image)
+		assert.Equal(t, prepared.ID(), created.Config.Image)
+		assert.Equal(t, "native-safe", created.Config.Labels["app.owner"])
+		assert.NotContains(t, created.Config.Labels, "traefik.enable")
+		assert.False(t, created.State.Running, "the image fixture must never be started")
+		return nil
 	})
-	created, err := sdk.ContainerInspect(ctx, helper.ID)
-	require.NoError(t, err)
-	assert.Equal(t, prepared.ID(), created.Image)
-	assert.Equal(t, prepared.ID(), created.Config.Image)
-	assert.Equal(t, "native-safe", created.Config.Labels["app.owner"])
-	assert.NotContains(t, created.Config.Labels, "traefik.enable")
-	assert.False(t, created.State.Running, "the image fixture must never be started")
 }

@@ -478,6 +478,7 @@ const (
 	maintenancePhysicalEvidenceTargetDivergent
 	maintenancePhysicalEvidenceTargetAbsent
 	maintenancePhysicalEvidenceFailedReceiptAbsent
+	maintenancePhysicalEvidenceSourceFailed
 )
 
 // MaintenancePhysicalEvidence is an opaque closed value algebra. Its private
@@ -490,6 +491,7 @@ type MaintenancePhysicalEvidence struct {
 	targetDivergent MaintenanceTargetDivergent
 	targetAbsent    MaintenanceTargetAbsent
 	failedAbsent    MaintenanceFailedReceiptAbsent
+	sourceFailed    MaintenanceSourceFailed
 }
 
 type maintenanceProjectionState struct {
@@ -501,6 +503,7 @@ type maintenanceProjectionState struct {
 
 type MaintenanceTargetReady struct{ state *maintenanceProjectionState }
 type MaintenanceSourceReady struct{ state *maintenanceProjectionState }
+type MaintenanceSourceFailed struct{ state *maintenanceProjectionState }
 type MaintenanceTargetDivergent struct{ state *maintenanceProjectionState }
 type MaintenanceTargetAbsent struct{ state *maintenanceAbsentState }
 type MaintenanceFailedReceiptAbsent struct{ state *maintenanceAbsentState }
@@ -514,6 +517,14 @@ func (e MaintenanceTargetReady) validForMaintenance(subject MaintenancePhysicalS
 	return ok && validReadyProjectionForRelease(release, e.state.containerIDs, e.state.serviceContainers)
 }
 func (e MaintenanceSourceReady) validForMaintenance(subject MaintenancePhysicalSubject) bool {
+	if !validMaintenanceProjection(e.state, subject, true) {
+		return false
+	}
+	release, ok := subject.SourceRelease()
+	return ok && validReadyProjectionForRelease(release, e.state.containerIDs, e.state.serviceContainers)
+}
+
+func (e MaintenanceSourceFailed) validForMaintenance(subject MaintenancePhysicalSubject) bool {
 	if !validMaintenanceProjection(e.state, subject, true) {
 		return false
 	}
@@ -877,6 +888,10 @@ func validateMaintenancePhysicalEvidence(
 		}
 	case maintenancePhysicalEvidenceSourceReady:
 		if evidence.sourceReady.validForMaintenance(subject) {
+			return nil
+		}
+	case maintenancePhysicalEvidenceSourceFailed:
+		if evidence.sourceFailed.validForMaintenance(subject) {
 			return nil
 		}
 	case maintenancePhysicalEvidenceTargetDivergent:

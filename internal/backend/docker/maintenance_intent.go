@@ -344,9 +344,13 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 					if selectErr != nil {
 						return selectErr
 					}
+					compensationStarted, compensationErr := b.maintenanceSettlement.CompensationStarted(intent)
+					if compensationErr != nil {
+						return compensationErr
+					}
 					cohortErr := validateRecoveredReleaseCohort(&targetRelease, targetContainers)
 					if targetRelease.Status == "deploying" &&
-						len(targetContainers) == len(leaseContainers) && cohortErr == nil {
+						!compensationStarted && len(targetContainers) == len(leaseContainers) && cohortErr == nil {
 						readiness, readinessErr := b.classifyRecoveredMaintenanceReadiness(
 							ctx, targetRelease, targetContainers,
 						)
@@ -358,7 +362,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 						}
 					}
 					if targetRelease.Status == "deploying" &&
-						len(targetContainers) == len(leaseContainers) && cohortErr == nil {
+						!compensationStarted && len(targetContainers) == len(leaseContainers) && cohortErr == nil {
 						physical, physicalErr := b.maintenanceSettlement.RecoverMaintenanceExecution(
 							ctx, recoveryScope, intent,
 						)
@@ -392,7 +396,11 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 						}
 						return nil
 					}
-					if targetRelease.Status == "deploying" &&
+					compensationPending, compensationErr := b.maintenanceSettlement.CompensationPending(intent)
+					if compensationErr != nil {
+						return compensationErr
+					}
+					if !compensationPending && targetRelease.Status == "deploying" &&
 						intent.ExecutionPhase() == shared.MaintenanceExecutionStarted &&
 						time.Now().Before(b.maintenanceRecoveryDeadline(intent.CreatedAt())) {
 						// StartMaintenanceExecution proves Compose may have accepted work.
@@ -403,9 +411,13 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 						return nil
 					}
 
-					physical, cleanupErr := b.maintenanceSettlement.CleanupRecoveredMaintenance(
-						ctx, recoveryScope, intent,
-					)
+					var physical shared.MaintenanceExecutionOutcome
+					var cleanupErr error
+					if compensationPending && targetRelease.Status == "deploying" {
+						physical, cleanupErr = b.maintenanceSettlement.RecoverMaintenanceCompensation(ctx, recoveryScope, intent)
+					} else {
+						physical, cleanupErr = b.maintenanceSettlement.CleanupRecoveredMaintenance(ctx, recoveryScope, intent)
+					}
 					if cleanupErr != nil {
 						return fmt.Errorf("clean exact maintenance target: %w", cleanupErr)
 					}
@@ -436,13 +448,6 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 						return readyErr
 					}
 					failureInfo := recoveredMaintenanceFailureInfo(intent, &targetRelease)
-					if intent.Kind() == shared.MaintenanceIntentUpdate &&
-						targetRelease.Reason == backend.ReasonImagePullFailed {
-						// Live Update deliberately lands Failed on a pre-substrate image
-						// pull refusal even though its untouched source is still healthy.
-						// Preserve that exact terminal policy across this crash boundary.
-						sourceReady = false
-					}
 					if convergeErr := b.convergeMaintenanceFailure(
 						ctx, intent, sourceRelease, sourceContainers, sourceReady, failureInfo,
 					); convergeErr != nil {

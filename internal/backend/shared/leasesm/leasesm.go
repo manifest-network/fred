@@ -346,13 +346,6 @@ type LeaseActorConfig struct {
 	// log internally and are not propagated.
 	PersistDiagnosticsFn func(entry shared.DiagnosticEntry, containerIDs []string, keys map[string]string)
 
-	// PersistDiagnosticsWithLogsFn writes a failure diagnostic to the
-	// substrate's diagnostics store using PRE-CAPTURED logs. Used by
-	// failure-path workers that captured logs BEFORE cleanup tore the
-	// containers down (re-fetching after cleanup would hit deleted
-	// containers).
-	PersistDiagnosticsWithLogsFn func(entry shared.DiagnosticEntry, logs map[string]string)
-
 	// SendOperationSuccessFn dispatches an exact Provision/Restore success only
 	// with the opaque proof returned after its active Release committed.
 	SendOperationSuccessFn func(

@@ -22,7 +22,7 @@ func newCloseStorageMutations(
 ) *storageMutations {
 	claim := subject.Intent()
 	return &storageMutations{
-		runner: runner, ops: ops, leaseUUID: subject.LeaseUUID(),
+		runner: runner, ops: ops, leaseUUID: subject.LeaseUUID(), closeSubject: subject,
 		tenant: claim.Tenant(), providerUUID: claim.ProviderUUID(),
 		callbackURL: claim.CallbackURL(), lifecycleURL: claim.LifecycleCallbackURL(),
 		allowedLease: map[string]struct{}{subject.LeaseUUID(): {}},

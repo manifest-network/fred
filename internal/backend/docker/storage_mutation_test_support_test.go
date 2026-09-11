@@ -309,20 +309,12 @@ func (p testDockerMutationProxy) PullImage(ctx context.Context, image string, ti
 	return sink.PullImage(ctx, image, timeout)
 }
 
-func (p testDockerMutationProxy) ResolveImageUser(ctx context.Context, image imageexec.Image, user string) (int, int, error) {
+func (p testDockerMutationProxy) ResolveImageUser(ctx context.Context, image imageexec.Image, user string, origin shared.ImageInspectionOrigin) (int, int, error) {
 	sink, err := p.sink()
 	if err != nil {
 		return 0, 0, err
 	}
-	return sink.ResolveImageUser(ctx, image, user)
-}
-
-func (p testDockerMutationProxy) CreateContainer(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-	sink, err := p.sink()
-	if err != nil {
-		return "", err
-	}
-	return sink.CreateContainer(ctx, params, timeout)
+	return sink.ResolveImageUser(ctx, image, user, origin)
 }
 
 func (p testDockerMutationProxy) StartContainer(ctx context.Context, id string, timeout time.Duration) error {
@@ -339,14 +331,6 @@ func (p testDockerMutationProxy) StopContainer(ctx context.Context, id string, t
 		return err
 	}
 	return sink.StopContainer(ctx, id, timeout)
-}
-
-func (p testDockerMutationProxy) RenameContainer(ctx context.Context, id, name string) error {
-	sink, err := p.sink()
-	if err != nil {
-		return err
-	}
-	return sink.RenameContainer(ctx, id, name)
 }
 
 func (p testDockerMutationProxy) RemoveContainer(ctx context.Context, id string) error {
@@ -373,20 +357,20 @@ func (p testDockerMutationProxy) RemoveTenantNetworkIfEmpty(ctx context.Context,
 	return sink.RemoveTenantNetworkIfEmpty(ctx, tenant)
 }
 
-func (p testDockerMutationProxy) DetectVolumeOwner(ctx context.Context, image imageexec.Image, paths []string) (int, int, error) {
+func (p testDockerMutationProxy) DetectVolumeOwner(ctx context.Context, image imageexec.Image, paths []string, origin shared.ImageInspectionOrigin) (int, int, error) {
 	sink, err := p.sink()
 	if err != nil {
 		return 0, 0, err
 	}
-	return sink.DetectVolumeOwner(ctx, image, paths)
+	return sink.DetectVolumeOwner(ctx, image, paths, origin)
 }
 
-func (p testDockerMutationProxy) DetectWritablePaths(ctx context.Context, image imageexec.Image, uid int, parents []string) ([]string, error) {
+func (p testDockerMutationProxy) DetectWritablePaths(ctx context.Context, image imageexec.Image, uid int, parents []string, origin shared.ImageInspectionOrigin) ([]string, error) {
 	sink, err := p.sink()
 	if err != nil {
 		return nil, err
 	}
-	return sink.DetectWritablePaths(ctx, image, uid, parents)
+	return sink.DetectWritablePaths(ctx, image, uid, parents, origin)
 }
 
 func (p testDockerMutationProxy) ExtractImageContent(
@@ -395,12 +379,13 @@ func (p testDockerMutationProxy) ExtractImageContent(
 	paths []string,
 	destination string,
 	maxBytes, maxEntries int64,
+	origin shared.ImageInspectionOrigin,
 ) map[string]error {
 	sink, err := p.sink()
 	if err != nil {
 		return map[string]error{"": err}
 	}
-	return sink.ExtractImageContent(ctx, image, paths, destination, maxBytes, maxEntries)
+	return sink.ExtractImageContent(ctx, image, paths, destination, maxBytes, maxEntries, origin)
 }
 
 type testComposeMutationProxy struct{ backend *Backend }

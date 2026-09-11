@@ -91,7 +91,7 @@ func openCloseRecoveryBackend(
 	// seed-only executor permanently, leaving later recovery unable to classify
 	// the real Docker substrate—a wiring state production cannot create.
 	require.NoError(t, bindBackendTestPhysicalExecutors(
-		b, operationSettlement, maintenanceSettlement,
+		t, b, operationSettlement, maintenanceSettlement,
 	))
 	require.NoError(t, shared.BindCloseSubstrateExecutor(
 		closeSettlement,

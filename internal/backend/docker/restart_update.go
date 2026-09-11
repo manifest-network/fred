@@ -288,17 +288,6 @@ func (b *Backend) routeReplaceRestart(
 	return nil
 }
 
-// doRestart performs an async stack restart: stops all service containers
-// and recreates them from the stored StackManifest.
-//
-// The SKU-preflight failure branch sets RecoveredIfSourceActive: it touches
-// no containers, so the lease is left exactly in its replace-start state —
-// "recovered to Ready" is correct iff its containers were running at start
-// (i.e. the lease was active). doRestart no longer knows that; the actor
-// derives it from its serial, actor-observed replaceWasActive
-// (spawnReplaceWorker), which is correct even in the death-then-restart
-// ordering where the prelude's route-time snapshot was stale.
-
 // validateReplaceSourceRelease proves that the exact active Release claimed
 // before maintenance admission contains complete rollback authority. The
 // physical executor consumes the claim itself, so retaining a second copied
@@ -360,40 +349,14 @@ func releaseRuntimeAuthoritiesForMaintenance(
 
 // replaceContainersOp describes a stack container replacement operation.
 type replaceContainersOp struct {
-	LeaseUUID        string
-	Stack            *manifest.StackManifest
-	Items            []backend.LeaseItem
-	ResourceProfiles []shared.SKUResourceSnapshot
-	Operation        string // "restart", "update", or "restore"
-	// CallbackURL/LifecycleCallbackURL are the pending maintenance route
-	// emitted into the replacement cohort. Rollback deliberately ignores them
-	// and reads the prior committed pair from ProvisionState.
-	CallbackURL          string
-	LifecycleCallbackURL string
-	Maintenance          shared.MaintenanceIntentClaim
-	TargetRelease        shared.MaintenanceReleaseClaim
-	OperationFailure     shared.OperationReleaseUncommitted
-	TargetMaintenanceID  shared.MaintenanceID
-	Logger               *slog.Logger
-
-	// NoComposeRollback disables the failure-path rollbackViaCompose. The
-	// restore op sets it: there are NO prior containers to "recover" to (the
-	// new lease was reserved at Provisioning, never Ready), and the restore
-	// caller (doRestore) owns its own compensating teardown — compose.Down +
-	// re-quarantining the adopted volumes back to the retained namespace. With
-	// this true, Restored stays false on failure, so spawnReplaceWorker
-	// dispatches replaceFailedMsg (terminal Failed) rather than
-	// replaceRecoveredMsg. Defaults false: restart/update are unaffected.
-	NoComposeRollback bool
+	LeaseUUID           string
+	Stack               *manifest.StackManifest
+	Items               []backend.LeaseItem
+	ResourceProfiles    []shared.SKUResourceSnapshot
+	Operation           string // "restart", "update", or "restore"
+	TargetMaintenanceID shared.MaintenanceID
+	Logger              *slog.Logger
 }
-
-// doReplaceContainers performs the stack container replacement lifecycle
-// using Docker Compose. Compose handles stopping old containers and starting
-// new ones via a single Up call, with rollback via Up with the previous manifest.
-//
-// Returns leasesm.ReplaceResult — see doReplaceContainers for the protocol.
-// Stack variant's OnSuccess typically sets StackManifest; this function
-// populates the leasesm.ReplaceResult's fields for the SM entry action.
 
 func exactServiceContainerCohort(
 	items []backend.LeaseItem,
@@ -544,10 +507,9 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	tenant := prov.Tenant
 	providerUUID := prov.ProviderUUID
 	resourceProfiles := shared.CloneSKUResourceSnapshot(prov.ResourceProfiles)
-	// No pre-replace status snapshot: status/callback-pair writes and gauge
-	// bookkeeping are the actor's, keyed on the actor-observed
-	// replaceWasActive (onEnterUpdating). The update preflight is
-	// unconditionally Failed regardless, so the worker needs no status hint.
+	// Runtime projection belongs to the actor and exact physical evidence;
+	// this admission snapshot cannot decide whether a failed update restored
+	// a healthy source.
 	b.provisionsMu.Unlock()
 	if len(resourceProfiles) == 0 {
 		var profileErr error

@@ -75,10 +75,7 @@ func NewDockerRuntime(ctx context.Context, source DockerSource) (*Admitter, *Doc
 // Create assigns execution identity itself; config.Image and image-binding
 // labels supplied by the caller cannot override the admitted content.
 func (c *DockerCreator) Create(ctx context.Context, image Image, config *container.Config, host *container.HostConfig, networks *network.NetworkingConfig, name string) (container.CreateResponse, error) {
-	if c == nil || c.issuer == nil || c.create == nil {
-		return container.CreateResponse{}, ErrUnavailable
-	}
-	if err := image.requireIssuer(c.issuer); err != nil {
+	if err := c.ValidateImage(image); err != nil {
 		return container.CreateResponse{}, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -97,6 +94,17 @@ func (c *DockerCreator) Create(ctx context.Context, image Image, config *contain
 	prepared.Labels[LabelImageID] = image.ID()
 	platform := image.Platform()
 	return c.create(ctx, &prepared, host, networks, &platform, name)
+}
+
+// ValidateImage checks issuer ownership without entering a mutation. Durable
+// helper admission uses this before reserving a recovery identity, so a foreign
+// image cannot consume a permanent ambiguous-Create receipt. Create repeats the
+// same check at its own side-effect boundary.
+func (c *DockerCreator) ValidateImage(image Image) error {
+	if c == nil || c.issuer == nil || c.create == nil {
+		return ErrUnavailable
+	}
+	return image.requireIssuer(c.issuer)
 }
 
 type preparedProjectRecord struct {

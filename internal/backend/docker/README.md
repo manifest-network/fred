@@ -161,6 +161,49 @@ described under
 [Durable close finalization](#durable-close-finalization). None of these causal
 intent classes is governed by `callback_max_age`.
 
+### Protected launches and failed replacements
+
+Every managed launch owns its complete volume preparation and container start
+sequence. It reserves the attested physical directories, excludes namespace
+changes, retires only the exact prior runtime's writers, and validates the
+complete mount graph before Docker starts a replacement. Bind aliases share the
+same reservation. A foreign writer or a layout where one container could replace
+another container's pending bind source refuses the launch.
+
+Before Docker receives a launch, `callbacks.db` records its exact attempt and
+physical volumes. Only successful, synchronous completion of all issued Docker
+calls and storage attestation can clear this record. A timeout or lost response
+leaves an unresolved launch across restart. Empty inventory does not clear it;
+subsequent launches and create/destroy/rename operations in that lease's
+volume namespace remain blocked. This also prevents replacing an inode to evade
+an outstanding request. Preserve the journal and directories when diagnosing
+`physical volume has an unsettled Docker launch`; deleting a row or recreating
+the volume path is not a supported repair.
+
+Before pulling a replacement image or retiring its source, maintenance captures
+the source's immutable image content/platform, effective Docker configuration,
+network settings, and physical volume identities. A failure before replacement
+dispatch can preserve an intact, healthy source without recreating it. If the
+replacement's Docker calls completed but startup verification fails, its logs
+are persisted before cleanup and the exact captured source may be recreated.
+Image-derived writable paths are reseeded from that source image while retained
+application data stays in its original volumes. Compensation neither
+resolves a mutable image tag nor rebuilds policy from current configuration. A
+verified source returns the lease to Ready while the maintenance callback still
+reports failure. An empty or positively verified incomplete source cohort permits
+repairing a Failed lease, but cannot authorize compensation. Foreign or divergent
+survivors refuse replacement. Unknown Docker effects retain pending work;
+an activated target release is never rolled back. Recreating the old application
+does not reverse database migrations or other writes it made to retained data.
+
+Image inspection helpers have their own durable ownership records in
+`callbacks.db`. Their exact random name, image identity, and attempt precede
+Create; cleanup uses the backend lifetime even when the inspection caller was
+canceled. Startup and periodic recovery retry exact helper removal, including
+a late container from a lost Create response. Those uncertain receipts do not
+expire when a workload closes. Helper cleanup never treats an unrelated
+container or a replacement daemon as the owned helper.
+
 ### Diagnostics
 
 | Field | YAML Key | Type | Default | Description |
@@ -168,7 +211,23 @@ intent classes is governed by `callback_max_age`.
 | DiagnosticsDBPath | `diagnostics_db_path` | string | `"diagnostics.db"` | Path to the recreateable bbolt failure-diagnostics database; it carries no lifecycle authority |
 | DiagnosticsMaxAge | `diagnostics_max_age` | duration | `168h` | Maximum age of persisted diagnostic entries before cleanup (7 days) |
 
-When a provision fails (during provisioning, state recovery, or partial deprovision), the backend persists full failure diagnostics and container logs to a bbolt database. `GET /provisions/{lease_uuid}` and `GET /logs/{lease_uuid}` fall back to this store when the provision is no longer in memory (e.g., after deprovision or restart), returning the persisted error and logs with a 7-day default retention.
+Failure capture is keyed by the exact provision/restore or maintenance attempt.
+Cleanup persists the original cause and bounded container logs before removing
+failed targets; a diagnostics write failure retains cleanup for retry. Close
+carries the exact interrupted attempt into that same capture path. Only current
+terminal authority publishes a capture to the lease view, so delayed cleanup of
+an older attempt cannot replace a newer failure.
+
+`GET /provisions/{lease_uuid}` and `GET /logs/{lease_uuid}` retain the persisted
+failure after container removal or backend restart. When compensation restored a Ready source, live log keys remain unchanged and
+the failed attempt is included under `failed/<service>/<instance>` keys. Those
+entries are tied to that compensated release and disappear from the active view
+after a later deployment. Logs share a 32 MiB aggregate content budget, with
+bounded marker and encoding overhead. Log capture is bounded to 32 MiB per attempt;
+unavailable or truncated capture is recorded
+explicitly. The default retention is seven days. Recreating `diagnostics.db`
+while stopped loses its existing captures; it does not manufacture lifecycle or
+cleanup authority.
 
 ### Releases
 
@@ -1254,18 +1313,13 @@ For stack provisions, instances are grouped by service name under a `"services"`
 
 ### `GET /logs/{lease_uuid}` (authenticated)
 
-Returns container stdout/stderr. For single-container provisions, logs are keyed by instance index. For stack provisions, logs use `"serviceName/instanceIndex"` keys (e.g., `"web/0"`, `"db/0"`). Works for any provision status (provisioning, ready, or failed).
+Returns container stdout/stderr using `"serviceName/instanceIndex"` keys
+(e.g., `"web/0"`, `"db/0"`). Works for any provision status (provisioning,
+ready, or failed). After successful compensation, captured replacement logs
+appear alongside live logs under `failed/<service>/<instance>` keys. Logs share
+a 32 MiB aggregate content budget, with bounded marker and encoding overhead.
 
 **Query parameters:** `tail` — number of lines (default 100, max 10000).
-
-**Response (`200`, single-container):**
-
-```json
-{
-  "0": "2025-01-15T10:00:00Z Starting server...\n...",
-  "1": "2025-01-15T10:00:00Z Worker ready\n..."
-}
-```
 
 **Response (`200`, stack):**
 

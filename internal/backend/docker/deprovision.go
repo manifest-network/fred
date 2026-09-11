@@ -2,14 +2,12 @@ package docker
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -323,6 +321,9 @@ func (b *Backend) completeCloseOutcome(
 			return fmt.Errorf("refresh retained close accounting: %w", err)
 		}
 	}
+	if err := b.failureDiagnostics.PublishCloseFailure(outcome); err != nil {
+		return fmt.Errorf("publish interrupted close diagnostics: %w", err)
+	}
 	if _, err := b.closeSettlement.CompleteClose(outcome); err != nil {
 		return fmt.Errorf("complete durable close: %w", err)
 	}
@@ -383,9 +384,7 @@ func (b *Backend) doClosePhysical(
 	// so a recorded-list fallback silently removes nothing exactly when a container
 	// leaked (ENG-647). containerIDs is still passed and unioned in.
 	var errs []error
-	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
-	failedIDs, teardownErr := b.teardownLeaseContainersWith(mutations, ctx, leaseUUID, containerIDs, stopTimeout,
-		teardownOpDeprovision, logger)
+	failedIDs, teardownErr := b.cleanupCloseContainers(ctx, mutations, subject, containerIDs)
 	if teardownErr != nil {
 		errs = append(errs, teardownErr)
 	}

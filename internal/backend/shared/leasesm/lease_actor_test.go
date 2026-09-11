@@ -1039,7 +1039,7 @@ func TestHandleProvisionRequested_AcceptsReservedLeaseExactlyOnce(t *testing.T) 
 			}
 			<-release
 			outcome, err := NewProvisionWorkFailure(
-				errors.New("stopped"), ErrMsgInternal, backend.ReasonInternal, nil, failure,
+				errors.New("stopped"), ErrMsgInternal, backend.ReasonInternal, failure,
 			)
 			require.NoError(t, err)
 			return outcome
@@ -1601,7 +1601,7 @@ func runReplaceFromFailedSucceedsTest(t *testing.T, op string) {
 func TestRestartFromFailed_Succeeds(t *testing.T) { runReplaceFromFailedSucceedsTest(t, "restart") }
 func TestUpdateFromFailed_Succeeds(t *testing.T)  { runReplaceFromFailedSucceedsTest(t, "update") }
 
-func TestMaintenanceFailureKeepsCommittedRuntimeRoute(t *testing.T) {
+func TestMaintenanceFailurePublishesExactSourceBeforeCallback(t *testing.T) {
 	for _, tt := range []struct {
 		name              string
 		op                string
@@ -1637,11 +1637,19 @@ func TestMaintenanceFailureKeepsCommittedRuntimeRoute(t *testing.T) {
 				Status:               backend.ProvisionStatusReady,
 				CallbackURL:          "old-operation",
 				LifecycleCallbackURL: "old-lifecycle",
+				ContainerIDs:         []string{"removed-source"},
+				ServiceContainers:    map[string][]string{"app": {"removed-source"}},
 			})
 			callback := make(chan string, 1)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			result := testMaintenanceFailure(t, claim, tt.err, tt.restored, tt.recoverFromSource, tt.details)
+			ready, ok := result.failure.maintenanceRelease.SourceReady()
+			require.True(t, ok)
+			source, ids, services := ready.Projection()
+			runtime, ok := source.RuntimeIdentity()
+			require.True(t, ok)
+			require.NotEqual(t, []string{"removed-source"}, ids)
 			target := testMaintenanceTarget(t, claim)
 			actor := newTestActor(t, testActorLeaseUUID, testActorOpts{
 				StopCtx:        ctx,
@@ -1651,6 +1659,12 @@ func TestMaintenanceFailureKeepsCommittedRuntimeRoute(t *testing.T) {
 				},
 				SendMaintenanceCallbackFn: func(_ shared.MaintenanceIntentClaim, status backend.CallbackStatus, _ string) {
 					assert.Equal(t, backend.CallbackStatusFailed, status)
+					visible, exists := store.Get(testActorLeaseUUID)
+					assert.True(t, exists)
+					assert.Equal(t, ids, visible.ContainerIDs, "callback cannot precede exact source ID publication")
+					assert.Equal(t, services, visible.ServiceContainers, "service log lookup must use the verified recreated cohort")
+					assert.Equal(t, runtime.CallbackURL(), visible.CallbackURL)
+					assert.Equal(t, runtime.LifecycleCallbackURL(), visible.LifecycleCallbackURL)
 					callback <- claim.LifecycleCallbackURL()
 				},
 			})
@@ -1667,10 +1681,25 @@ func TestMaintenanceFailureKeepsCommittedRuntimeRoute(t *testing.T) {
 			committed, exists := store.Get(testActorLeaseUUID)
 			require.True(t, exists)
 			assert.Equal(t, backend.ProvisionStatusReady, committed.Status)
-			assert.Equal(t, "old-operation", committed.CallbackURL)
-			assert.Equal(t, "old-lifecycle", committed.LifecycleCallbackURL)
+			assert.Equal(t, runtime.CallbackURL(), committed.CallbackURL)
+			assert.Equal(t, runtime.LifecycleCallbackURL(), committed.LifecycleCallbackURL)
+			assert.Equal(t, ids, committed.ContainerIDs)
+			assert.Equal(t, services, committed.ServiceContainers)
+			assert.Equal(t, source.Version, committed.ActiveReleaseVersion)
+			assert.Equal(t, source.Items, committed.Items)
+			assert.Equal(t, source.ResourceProfiles, committed.ResourceProfiles)
 		})
 	}
+}
+
+func TestMaintenanceRefusalCannotMintRestoredProjection(t *testing.T) {
+	claim := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentUpdate)
+	result := testMaintenanceFailure(t, claim, errors.New("refused"), false, false, ReplaceFailureDetails{Reason: backend.ReasonUpdateFailed, CallbackErr: "update refused"})
+	require.False(t, result.Restored())
+	_, ready := result.failure.maintenanceRelease.SourceReady()
+	require.False(t, ready)
+	_, err := NewMaintenanceReplaceFailure(errors.New("failed"), ReplaceFailureDetails{}, shared.MaintenanceReleaseFailure{})
+	require.Error(t, err)
 }
 
 // TestRestoreRequestedMsg_FiresEventAndSpawnsWorker pins the restore
@@ -1682,9 +1711,8 @@ func TestMaintenanceFailureKeepsCommittedRuntimeRoute(t *testing.T) {
 //     evRestartRequested fires from Ready/Failed).
 //   - The entry action (onEnterRestarting, reused) writes Status=Restarting
 //     and applies the CallbackURL before the ack (handler-publish contract).
-//   - replaceWasActive ends up false (prior Status was Provisioning, not
-//     Ready), so onEnterReadyFromReplaceCompleted Inc's activeProvisions —
-//     a restore brings a lease from absent to active.
+//   - A restore brings a lease from absent to active when its exact source
+//     projection reaches Ready.
 //
 // On a successful ReplaceResult the SM reaches Ready via evReplaceCompleted
 // and the gauge increments exactly once.
@@ -1748,8 +1776,6 @@ func TestRestoreRequestedMsg_FiresEventAndSpawnsWorker(t *testing.T) {
 		"actor must write Status=Restarting BEFORE acking (handler-publish contract)")
 	assert.Equal(t, operation.CallbackURL(), prov.CallbackURL,
 		"actor must apply the message CallbackURL before acking")
-	assert.False(t, actor.replaceWasActive,
-		"replaceWasActive must be false for a Provisioning→Restarting restore (lease was absent, not active)")
 
 	// Release the worker → evReplaceCompleted → Ready.
 	close(workerRelease)

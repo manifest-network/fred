@@ -269,6 +269,11 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 	b.provisionsMu.RLock()
 	prov, exists := b.provisions[leaseUUID]
 	if exists {
+		failed := prov.Status == backend.ProvisionStatusFailed
+		ready := prov.Status == backend.ProvisionStatusReady
+		activeVersion := prov.ActiveReleaseVersion
+		tenant, provider := prov.Tenant, prov.ProviderUUID
+		lifecycle := backend.ObserveLifecycleGeneration(prov.CallbackURL, prov.LifecycleCallbackURL)
 		containerIDs := append([]string(nil), prov.ContainerIDs...)
 		serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
 		for k, v := range prov.ServiceContainers {
@@ -283,6 +288,7 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 		// gigabytes and OOM the shared host. Once the budget is spent we skip the
 		// remaining reads entirely rather than fetch-then-discard.
 		remaining := maxTotalLogBytes
+		successfulReads := 0
 		// Iterate services in sorted order (matching GetInfo) so that, once the
 		// aggregate budget is exhausted, which services get real logs vs the
 		// truncation placeholder is deterministic across calls rather than
@@ -307,9 +313,26 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 					result[key] = "<log unavailable>"
 					continue
 				}
+				successfulReads++
 				trimmed, consumed := trimLogToBudget(logs, remaining)
 				remaining -= consumed
 				result[key] = trimmed
+			}
+		}
+		if failed && successfulReads == 0 && b.diagnosticsStore != nil {
+			entry, err := b.diagnosticsStore.Get(leaseUUID)
+			if err == nil && entry != nil && len(entry.Logs) > 0 && entry.Tenant == tenant && entry.ProviderUUID == provider &&
+				entry.LifecycleGeneration != nil && *entry.LifecycleGeneration == lifecycle {
+				return entry.Logs, nil
+			}
+		}
+		if ready && b.failureDiagnostics != nil && b.releaseStore != nil && remaining > 0 {
+			runtime, err := b.releaseStore.ProveRuntimeGeneration(leaseUUID)
+			if err == nil && runtime.Version() == activeVersion {
+				view, err := b.failureDiagnostics.PublishedForRuntime(runtime)
+				if err == nil && view.MatchesProjection(activeVersion, tenant, provider, lifecycle) {
+					appendFailedLogsWithinBudget(result, view.Logs())
+				}
 			}
 		}
 		return result, nil
@@ -328,6 +351,39 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 	}
 
 	return nil, backend.ErrNotProvisioned
+}
+
+// appendFailedLogsWithinBudget preserves the existing live entries and charges
+// every byte they already contain, including placeholders and truncation
+// markers, before adding failed-attempt output. The added namespace cannot push
+// the response beyond the existing aggregate limit.
+func appendFailedLogsWithinBudget(result, failed map[string]string) {
+	remaining := maxTotalLogBytes
+	for _, output := range result {
+		remaining -= len(output)
+	}
+	for _, key := range slices.Sorted(maps.Keys(failed)) {
+		if remaining <= 0 {
+			return
+		}
+		output := failed[key]
+		if len(output) > remaining {
+			if remaining <= len(aggregateLogLimitMessage) {
+				// The marker is ASCII and may itself be shortened when only a
+				// few bytes remain; the complete live output stays untouched.
+				output = aggregateLogLimitMessage[:remaining]
+			} else {
+				contentBudget := remaining - len(aggregateLogLimitMessage) - 1
+				if contentBudget == 0 {
+					output = aggregateLogLimitMessage
+				} else {
+					output, _ = trimLogToBudget(output, contentBudget)
+				}
+			}
+		}
+		result["failed/"+key] = output
+		remaining -= len(output)
+	}
 }
 
 // defaultReason fills ReasonUnknown for a FAILED provision with no authored

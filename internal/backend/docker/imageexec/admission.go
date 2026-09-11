@@ -8,6 +8,8 @@ import (
 	"maps"
 	"slices"
 
+	"github.com/containerd/platforms"
+
 	"github.com/distribution/reference"
 	dockerimage "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
@@ -30,6 +32,29 @@ type Source interface {
 // this admitter accept only the images and projects it minted.
 type Admitter struct {
 	issuer *issuer
+}
+
+// ReAdmit restores a persisted execution identity against this runtime. The
+// original reference is display metadata only: it is validated but never
+// resolved or pulled. Creation still consumes the newly admitted immutable ID.
+func (a *Admitter) ReAdmit(ctx context.Context, id string, platform ocispec.Platform, originalReference string) (Image, error) {
+	parsed, err := digest.Parse(id)
+	if err != nil || parsed.Algorithm() != digest.SHA256 {
+		return Image{}, fmt.Errorf("invalid persisted execution identity")
+	}
+	if _, err := reference.ParseAnyReference(originalReference); err != nil {
+		return Image{}, fmt.Errorf("invalid persisted image reference: %w", err)
+	}
+	image, err := a.Admit(ctx, id)
+	if err != nil {
+		return Image{}, err
+	}
+	if image.ID() != id || !platforms.OnlyStrict(platform).Match(image.Platform()) {
+		return Image{}, fmt.Errorf("persisted execution identity or platform is unavailable")
+	}
+	record := *image.record
+	record.reference = originalReference
+	return Image{record: &record}, nil
 }
 
 type inspectedImage struct {

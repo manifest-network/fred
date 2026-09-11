@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sync"
+	"testing"
 
 	"github.com/stretchr/testify/require"
 
@@ -171,10 +173,46 @@ func bindSeedOnlyOperationExecutor(
 }
 
 func bindBackendTestPhysicalExecutors(
+	t testing.TB,
 	b *Backend,
 	operations *shared.OperationSettlement,
 	maintenance *shared.MaintenanceSettlement,
 ) error {
+	t.Helper()
+	if b.imageInspectionRecovery == nil {
+		b.imageInspectionRecovery = func(context.Context) error { return nil }
+	}
+	if b.diagnosticsStore == nil {
+		store, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{
+			DBPath: filepath.Join(t.TempDir(), "diagnostics.db"),
+		})
+		if err != nil {
+			return err
+		}
+		b.diagnosticsStore = store
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+	}
+	diagnostics, err := shared.NewFailureDiagnostics(b.diagnosticsStore, operations, maintenance)
+	if err != nil {
+		return err
+	}
+	b.failureDiagnostics = diagnostics
+	b.volumeLaunches, err = newVolumeLaunchCoordinator(b.callbackStore)
+	if err != nil {
+		return err
+	}
+	// Rebinding an open fixture unwraps the previous lifetime; later failure
+	// injectors still decorate the single production publication boundary.
+	publisher := b.callbackPublisher
+	if wrapped, ok := publisher.(*diagnosticCallbackPublisher); ok {
+		publisher = wrapped.callbackPublicationService
+	}
+	if publisher != nil {
+		b.callbackPublisher, err = newDiagnosticCallbackPublisher(publisher, diagnostics)
+		if err != nil {
+			return err
+		}
+	}
 	ops, err := storageMutationOperationsForTest(b)
 	if err != nil {
 		return err
@@ -520,6 +558,34 @@ func runStorageMutationForTest[T any](
 	leaseUUID, tenant string,
 	workflow func(*storageMutations) T,
 ) T {
+	result, physical := executeStorageWorkflowForTest(t, b, leaseUUID, tenant, workflow)
+	if physical.Kind() == substratemutation.Invalid || physical.Kind() == substratemutation.Refused {
+		require.NoError(t, physical.Err())
+	}
+	return result
+}
+
+// Observation-only fixtures still receive a live Runner so an accidental
+// effect would be detected. They explicitly expect Guard's no-effects refusal
+// instead of inserting a synthetic mutation to obtain an attested result.
+func runSubjectStorageObservationForTest[T any](
+	t require.TestingT,
+	b *Backend,
+	leaseUUID string,
+	workflow func(*storageMutations) T,
+) T {
+	result, physical := executeStorageWorkflowForTest(t, b, leaseUUID, "tenant-a", workflow)
+	require.Equal(t, substratemutation.Refused, physical.Kind())
+	require.ErrorContains(t, physical.Err(), "physical mutation workflow performed no mutation")
+	return result
+}
+
+func executeStorageWorkflowForTest[T any](
+	t require.TestingT,
+	b *Backend,
+	leaseUUID, tenant string,
+	workflow func(*storageMutations) T,
+) (T, substratemutation.Result[string, struct{}]) {
 	var result T
 	ops, err := storageMutationOperationsForTest(b)
 	require.NoError(t, err)
@@ -548,10 +614,7 @@ func runStorageMutationForTest[T any](
 	execution, err := protocol.BeginAfter(func() (string, error) { return leaseUUID, nil })
 	require.NoError(t, err)
 	physical := guard.Execute(execution, context.Background())
-	if physical.Kind() == substratemutation.Invalid || physical.Kind() == substratemutation.Refused {
-		require.NoError(t, physical.Err())
-	}
-	return result
+	return result, physical
 }
 
 func inspectImageForSetupForTest(
@@ -610,4 +673,21 @@ func createManagedVolumeForTest(
 		},
 	)
 	return result.path, result.created, result.err
+}
+
+func bindTestDiagnosticsStore(t testing.TB, b *Backend, store *shared.DiagnosticsStore) {
+	t.Helper()
+	operations, ok := concreteOperationSettlementForTest(b.operationSettlement)
+	require.True(t, ok)
+	diagnostics, err := shared.NewFailureDiagnostics(store, operations, b.maintenanceSettlement)
+	require.NoError(t, err)
+	b.diagnosticsStore, b.failureDiagnostics = store, diagnostics
+	publisher := b.callbackPublisher
+	if wrapped, ok := publisher.(*diagnosticCallbackPublisher); ok {
+		publisher = wrapped.callbackPublicationService
+	}
+	if publisher != nil {
+		b.callbackPublisher, err = newDiagnosticCallbackPublisher(publisher, diagnostics)
+		require.NoError(t, err)
+	}
 }

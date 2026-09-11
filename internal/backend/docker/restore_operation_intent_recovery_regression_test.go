@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -28,6 +29,7 @@ type interruptedRestoreRecoveryFixture struct {
 	spec          shared.OperationIntentSpec
 	containers    []ContainerInfo
 	allocation    []string
+	addContainer  func(ContainerInfo)
 
 	eventsMu sync.Mutex
 	events   []string
@@ -46,6 +48,12 @@ func newInterruptedRestoreRecoveryFixture(
 	var substrateMu sync.Mutex
 	var inventory []ContainerInfo
 	var volumeNames []string
+	captured := make(map[string]bool)
+	fixture.addContainer = func(container ContainerInfo) {
+		substrateMu.Lock()
+		defer substrateMu.Unlock()
+		inventory = append(inventory, container)
+	}
 	mock := &mockDockerClient{
 		PingFn: func(context.Context) error { return nil },
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
@@ -63,6 +71,36 @@ func newInterruptedRestoreRecoveryFixture(
 				}
 			}
 			return nil, fmt.Errorf("unknown test container %q", containerID)
+		},
+		ContainerLogsFn: func(_ context.Context, containerID string, tail int) (string, error) {
+			substrateMu.Lock()
+			defer substrateMu.Unlock()
+			for _, container := range inventory {
+				if container.ContainerID == containerID {
+					if tail == persistedLogTail {
+						captured[containerID] = true
+					}
+					return "interrupted restore startup logs", nil
+				}
+			}
+			return "", fmt.Errorf("unknown log container %q", containerID)
+		},
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			substrateMu.Lock()
+			defer substrateMu.Unlock()
+			for index, container := range inventory {
+				if container.ContainerID != containerID {
+					continue
+				}
+				if !captured[containerID] {
+					t.Errorf("restore cleanup removed %q before capturing its logs", containerID)
+					return errors.New("restore cleanup requires captured exact-container logs")
+				}
+				inventory = slices.Delete(inventory, index, index+1)
+				fixture.record("remove:" + containerID)
+				return nil
+			}
+			return nil // Docker removal is idempotent for an already absent ID.
 		},
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
@@ -201,14 +239,8 @@ func newInterruptedRestoreRecoveryFixture(
 	b.provisionsMu.Unlock()
 
 	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
-		substrateMu.Lock()
-		hadContainers := len(inventory) != 0
-		inventory = nil
-		substrateMu.Unlock()
-		if hadContainers {
-			fixture.record("compose-down")
-		}
-		return nil
+		t.Error("interrupted restore recovery attempted broad Compose teardown")
+		return errors.New("restore recovery requires captured exact-container removal")
 	}}
 	b.volumes = &mockVolumeManager{
 		ListForProofFn: func(context.Context) ([]string, error) {
@@ -294,7 +326,7 @@ func (f *interruptedRestoreRecoveryFixture) snapshotEvents() []string {
 	return slices.Clone(f.events)
 }
 
-func assertInterruptedRestoreRolledBack(t *testing.T, f *interruptedRestoreRecoveryFixture) {
+func assertInterruptedRestoreSettled(t *testing.T, f *interruptedRestoreRecoveryFixture) {
 	t.Helper()
 
 	record, err := f.retentions.Get(f.spec.SourceLeaseUUID)
@@ -330,12 +362,22 @@ func assertInterruptedRestoreRolledBack(t *testing.T, f *interruptedRestoreRecov
 	_, exists := f.b.provisions[f.spec.LeaseUUID]
 	f.b.provisionsMu.RUnlock()
 	assert.False(t, exists)
-	assert.Equal(t, []string{
-		"compose-down",
+}
+
+func assertInterruptedRestoreRolledBack(t *testing.T, f *interruptedRestoreRecoveryFixture) {
+	t.Helper()
+	assertInterruptedRestoreSettled(t, f)
+
+	wantEvents := make([]string, 0, len(f.containers)+3)
+	for _, container := range f.containers {
+		wantEvents = append(wantEvents, "remove:"+container.ContainerID)
+	}
+	wantEvents = append(wantEvents,
 		"re-quarantine",
 		"measure-source-quota",
 		"restore-source-quota",
-	}, f.snapshotEvents(), "rollback must perform one teardown before quarantine and quota handback")
+	)
+	assert.Equal(t, wantEvents, f.snapshotEvents(), "rollback must remove each captured target before quarantine and quota handback")
 }
 
 func TestInterruptedRestoreRecovery_NonterminalExactCohortRollsBack(t *testing.T) {
@@ -380,6 +422,69 @@ func TestInterruptedRestoreRecovery_IncompleteOrFailedCohortRollsBack(t *testing
 			require.NoError(t, f.b.reconcileRestoringWithAuthority(context.Background(), *f.source))
 			assertInterruptedRestoreRolledBack(t, f)
 		})
+	}
+}
+
+func TestInterruptedRestoreRecovery_HandbackCapturesLateExactTarget(t *testing.T) {
+	f := newInterruptedRestoreRecoveryFixture(
+		t, 1, []string{"exited"}, backend.ProvisionStatusFailed, true,
+	)
+	require.NoError(t, f.b.recoverOperationIntents(t.Context()))
+	require.Equal(t, []string{"remove:restore-container-0", "re-quarantine"}, f.snapshotEvents())
+	intents, err := f.b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Empty(t, intents, "the late target arrives after durable operation settlement")
+	source, err := f.retentions.Get(f.source.OriginalLeaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, source)
+	require.Equal(t, shared.RetentionStatusRestoring, source.Status,
+		"operation cleanup renamed the volume, but source quota and accounting handback remain pending")
+
+	// An accepted Docker create can appear after operation settlement but before
+	// retention handback. The permanent exact receipt still owns that target.
+	late := f.containers[0]
+	late.ContainerID = "restore-container-late"
+	f.addContainer(late)
+
+	require.NoError(t, f.b.reconcileRestoringWithAuthority(t.Context(), *f.source))
+	assertInterruptedRestoreSettled(t, f)
+	assert.Equal(t, []string{
+		"remove:restore-container-0",
+		"re-quarantine",
+		"remove:restore-container-late",
+		"measure-source-quota",
+		"restore-source-quota",
+	}, f.snapshotEvents(), "the late exact target must be captured and removed before source quota and accounting handback")
+}
+
+func TestInterruptedRestoreRecovery_HandbackPreservesForeignCallbackGeneration(t *testing.T) {
+	f := newInterruptedRestoreRecoveryFixture(
+		t, 1, []string{"exited"}, backend.ProvisionStatusFailed, true,
+	)
+	require.NoError(t, f.b.recoverOperationIntents(t.Context()))
+	before := f.snapshotEvents()
+
+	foreign := f.containers[0]
+	foreign.ContainerID = "foreign-restore-generation"
+	foreign.CallbackURL = "https://fred.example/callbacks/provision?operation_id=6ba7b810-9dad-41d1-80b4-00c04fd430c9"
+	var err error
+	foreign.LifecycleCallbackURL, err = backend.ResolveLifecycleCallbackURL(foreign.CallbackURL, "")
+	require.NoError(t, err)
+	f.addContainer(foreign)
+
+	err = f.b.reconcileRestoringWithAuthority(t.Context(), *f.source)
+	require.ErrorContains(t, err, "still prevents source handback")
+	assert.Equal(t, before, f.snapshotEvents(), "foreign ownership must prevent both deletion and source volume handback")
+	inventory, err := f.b.docker.ListManagedContainers(t.Context())
+	require.NoError(t, err)
+	require.Len(t, inventory, 1)
+	assert.Equal(t, foreign.ContainerID, inventory[0].ContainerID)
+	source, err := f.retentions.Get(f.source.OriginalLeaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, source)
+	assert.Equal(t, shared.RetentionStatusRestoring, source.Status)
+	for _, allocationID := range f.allocation {
+		assert.NotNil(t, f.b.pool.GetAllocation(allocationID), "uncertain destination bytes retain their allocation")
 	}
 }
 

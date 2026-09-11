@@ -28,7 +28,13 @@ func buildOperationSubstrate(
 ) func(substratemutation.Runner, shared.OperationPhysicalSubject) operationSubstrate {
 	return func(runner substratemutation.Runner, subject shared.OperationPhysicalSubject) operationSubstrate {
 		mutations := newOperationStorageMutations(runner, subject, ops)
-		return func(ctx context.Context) error {
+		return func(ctx context.Context) (runErr error) {
+			defer func() {
+				_, historical := subject.FailedReceiptCleanup()
+				if runErr != nil && !historical && !subject.RecoveryCleanup() {
+					runErr = errors.Join(runErr, b.observeOperationFailure(ctx, mutations, subject, runErr))
+				}
+			}()
 			if receipt, historical := subject.FailedReceiptCleanup(); historical {
 				return b.doFailedOperationReceiptCleanup(mutations, ctx, subject, receipt)
 			}
@@ -85,7 +91,13 @@ func buildMaintenanceSubstrate(
 ) func(substratemutation.Runner, shared.MaintenancePhysicalSubject) maintenanceSubstrate {
 	return func(runner substratemutation.Runner, subject shared.MaintenancePhysicalSubject) maintenanceSubstrate {
 		mutations := newMaintenanceStorageMutations(runner, subject, ops)
-		return func(ctx context.Context) error {
+		return func(ctx context.Context) (runErr error) {
+			defer func() {
+				_, historical := subject.FailedReceiptCleanup()
+				if runErr != nil && !historical && !subject.RecoveryCleanup() {
+					runErr = errors.Join(runErr, b.observeMaintenanceFailure(ctx, mutations, subject, runErr))
+				}
+			}()
 			if receipt, historical := subject.FailedReceiptCleanup(); historical {
 				return b.doFailedMaintenanceReceiptCleanup(mutations, ctx, subject, receipt)
 			}
@@ -401,7 +413,7 @@ func (b *Backend) executeProvisionWork(
 			cause = errors.New("provision substrate is exactly absent")
 		}
 		callbackErr, reason := operationFailureDetails(cause)
-		result, err := leasesm.NewProvisionWorkFailure(cause, callbackErr, reason, nil, proof)
+		result, err := leasesm.NewProvisionWorkFailure(cause, callbackErr, reason, proof)
 		if err != nil {
 			return mustProvisionAmbiguous(err, claim)
 		}
@@ -451,29 +463,11 @@ func (b *Backend) doOperationRecoveryCleanup(
 	if mutations == nil || !intent.Valid() || !subject.RecoveryCleanup() {
 		return errors.New("started operation recovery-cleanup authority is invalid")
 	}
-	all, err := b.strictIdentityBoundOperationInventory(ctx)
-	if err != nil {
-		return fmt.Errorf("inventory recovered operation cleanup: %w", err)
+	if err := b.cleanupFailedOperationTargets(ctx, mutations, subject, nil); err != nil {
+		return err
 	}
-	ids, err := b.exactRecoveredOperationCleanupIDs(ctx, intent, all)
-	if err != nil {
-		return fmt.Errorf("derive exact recovered operation cleanup: %w", err)
-	}
-	teardownOp := teardownOpProvisionCleanup
-	if intent.Kind() == shared.OperationIntentRestore {
-		teardownOp = teardownOpRestoreReconcile
-	}
-	remaining, err := b.teardownLeaseContainersWith(
-		mutations, ctx, subject.LeaseUUID(), ids, 10*time.Second,
-		teardownOp, physicalLogger(b, subject.LeaseUUID()),
-	)
-	if err != nil || len(remaining) != 0 {
-		return fmt.Errorf("cleanup recovered operation containers: %w",
-			errors.Join(err, fmt.Errorf("%d container(s) may remain", len(remaining))))
-	}
-	// Compose Down snapshots a project inside the daemon. A Create accepted by
-	// the previous process may become visible after that snapshot, so its nil
-	// result is not exhaustive absence. Re-list under the same storage lineage
+	// A Create accepted by the previous process may become visible after the
+	// captured inventory, so removal is not exhaustive absence. Re-list under the same storage lineage
 	// and remove only identities derived from this exact opaque subject. Repeat
 	// until an empty observation follows the last removal; a continuously
 	// appearing cohort remains ambiguous and keeps the durable intent/receipt.
@@ -492,10 +486,8 @@ func (b *Backend) doOperationRecoveryCleanup(
 		if observation == 2 {
 			return fmt.Errorf("recovered operation substrate remained after two exact cleanup passes")
 		}
-		for _, containerID := range lateIDs {
-			if err := mutations.removeContainer(ctx, containerID); err != nil {
-				return fmt.Errorf("remove late recovered operation container %q: %w", containerID, err)
-			}
+		if err := b.cleanupFailedOperationTargets(ctx, mutations, subject, nil); err != nil {
+			return err
 		}
 	}
 
@@ -520,24 +512,7 @@ func (b *Backend) doFailedOperationReceiptCleanup(
 		bound.LeaseUUID() != receipt.LeaseUUID() {
 		return errors.New("failed-operation receipt cleanup authority is invalid")
 	}
-	all, err := b.strictIdentityBoundOperationInventory(ctx)
-	if err != nil {
-		return fmt.Errorf("inventory failed-operation late substrate: %w", err)
-	}
-	fence, err := newFailedOperationRecoveryFence(nil, []shared.FailedOperationReceipt{receipt})
-	if err != nil {
-		return err
-	}
-	targets, err := fence.targets(all)
-	if err != nil {
-		return err
-	}
-	for _, target := range targets {
-		if err := mutations.removeContainer(ctx, target.containerID); err != nil {
-			return fmt.Errorf("remove late failed-operation container %q: %w", target.containerID, err)
-		}
-	}
-	return nil
+	return b.cleanupFailedOperationTargets(ctx, mutations, subject, nil)
 }
 
 func (b *Backend) cleanupRecoveredProvisionVolumes(
@@ -618,27 +593,11 @@ func (b *Backend) doMaintenanceRecoveryCleanup(
 	subject shared.MaintenancePhysicalSubject,
 ) error {
 	intent := subject.Intent()
-	target, ok := subject.TargetRelease()
+	_, ok := subject.TargetRelease()
 	if mutations == nil || !subject.RecoveryCleanup() || !intent.Valid() || !ok {
 		return errors.New("started maintenance recovery-cleanup authority is invalid")
 	}
-	all, err := b.strictIdentityBoundOperationInventory(ctx)
-	if err != nil {
-		return fmt.Errorf("inventory maintenance cleanup: %w", err)
-	}
-	targets, _, err := maintenanceTargetContainers(intent, all)
-	if err != nil {
-		return err
-	}
-	for _, candidate := range targets {
-		if err := b.validateMaintenanceTargetContainer(intent, target, candidate); err != nil {
-			return fmt.Errorf("refuse ambiguous maintenance cleanup: %w", err)
-		}
-		if err := mutations.removeContainer(ctx, candidate.ContainerID); err != nil {
-			return fmt.Errorf("remove exact maintenance target %q: %w", candidate.ContainerID, err)
-		}
-	}
-	return nil
+	return b.cleanupFailedMaintenanceTargets(ctx, mutations, subject, nil)
 }
 
 func (b *Backend) doFailedMaintenanceReceiptCleanup(
@@ -668,10 +627,8 @@ func (b *Backend) doFailedMaintenanceReceiptCleanup(
 		if observation == 2 {
 			return errors.New("failed-maintenance substrate remained after two exact cleanup passes")
 		}
-		for _, target := range targets {
-			if err := mutations.removeContainer(ctx, target.ContainerID); err != nil {
-				return fmt.Errorf("remove late failed-maintenance container %q: %w", target.ContainerID, err)
-			}
+		if err := b.cleanupFailedMaintenanceTargets(ctx, mutations, subject, nil); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -745,9 +702,8 @@ func (b *Backend) doRestorePhysical(
 	return b.doReplacePhysical(ctx, mutations, replaceContainersOp{
 		LeaseUUID: subject.LeaseUUID(), Stack: record.StackManifest,
 		Items: intent.EffectiveItems(), ResourceProfiles: intent.ResourceProfiles(),
-		Operation: "restore", CallbackURL: intent.CallbackURL(),
-		LifecycleCallbackURL: intent.LifecycleCallbackURL(), NoComposeRollback: true,
-		Logger: physicalLogger(b, subject.LeaseUUID()),
+		Operation: "restore",
+		Logger:    physicalLogger(b, subject.LeaseUUID()),
 	})
 }
 
@@ -785,9 +741,8 @@ func (b *Backend) doMaintenancePhysical(
 	return b.doReplacePhysical(ctx, mutations, replaceContainersOp{
 		LeaseUUID: subject.LeaseUUID(), Stack: stack, Items: target.Items,
 		ResourceProfiles: target.ResourceProfiles, Operation: operation,
-		CallbackURL: intent.CallbackURL(), LifecycleCallbackURL: intent.LifecycleCallbackURL(),
-		Maintenance: intent, TargetMaintenanceID: subject.MaintenanceID(),
-		Logger: physicalLogger(b, subject.LeaseUUID()),
+		TargetMaintenanceID: subject.MaintenanceID(),
+		Logger:              physicalLogger(b, subject.LeaseUUID()),
 	})
 }
 
@@ -824,36 +779,24 @@ func (b *Backend) doReplacePhysical(
 		}
 		networkName = TenantNetworkName(mutations.tenant)
 	}
-	volumeSetupStartedAt := time.Now()
-	volBinds, _, err := b.setupVolBinds(
-		mutations, ctx, op.LeaseUUID, op.Items, op.ResourceProfiles,
-		imageSetups, op.Logger,
-	)
-	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseVolumeSetup).
-		Observe(time.Since(volumeSetupStartedAt).Seconds())
-	if err != nil {
-		return fmt.Errorf("prepare %s volumes: %w", op.Operation, err)
-	}
 	b.provisionsMu.RLock()
 	failCount := 0
 	if provision := b.provisions[op.LeaseUUID]; provision != nil {
 		failCount = provision.FailCount
 	}
 	b.provisionsMu.RUnlock()
-	project := buildComposeProject(composeProjectParams{
+	params := composeProjectParams{
 		LeaseUUID: op.LeaseUUID, Tenant: mutations.tenant, ProviderUUID: mutations.providerUUID,
 		CallbackURL: mutations.callbackURL, LifecycleCallbackURL: mutations.lifecycleURL,
 		MaintenanceID: op.TargetMaintenanceID, BackendName: b.cfg.Name, FailCount: failCount,
 		Stack: op.Stack, Items: op.Items, Profiles: profiles, ImageSetups: imageSetups,
-		NetworkName: networkName, VolBinds: volBinds, Cfg: &b.cfg, Ingress: b.cfg.Ingress,
-	})
-	composeUpStartedAt := time.Now()
-	composeUpErr := mutations.composeUp(ctx, project, composeProjectImages(project, imageSetups), composeUpOpts{ForceRecreate: op.Operation == "restart"})
-	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseComposeUp).
-		Observe(time.Since(composeUpStartedAt).Seconds())
+		NetworkName: networkName, Cfg: &b.cfg, Ingress: b.cfg.Ingress,
+	}
+	composeUpErr := b.launchCompose(ctx, mutations, params, op.ResourceProfiles, composeUpOpts{ForceRecreate: op.Operation == "restart"})
 	if composeUpErr != nil {
 		return fmt.Errorf("compose up for %s: %w", op.Operation, composeUpErr)
 	}
+
 	containers, err := b.compose.PS(ctx, composeProjectName(op.LeaseUUID))
 	if err != nil {
 		return fmt.Errorf("compose ps after %s: %w", op.Operation, err)
@@ -997,7 +940,7 @@ func (b *Backend) executeMaintenancePhysicalOutcome(
 		if err != nil {
 			return mustMaintenanceAmbiguous(err, intent)
 		}
-		result, err := leasesm.NewMaintenanceReplaceFailure(cause, outcome.SourceRecovered(), false,
+		result, err := leasesm.NewMaintenanceReplaceFailure(cause,
 			leasesm.ReplaceFailureDetails{Reason: reason,
 				CallbackErr: callbackErr, LastError: cause.Error()}, failed)
 		if err != nil {

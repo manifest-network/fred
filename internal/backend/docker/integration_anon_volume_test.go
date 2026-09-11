@@ -21,7 +21,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 // anonVolNameRE matches Docker's anonymous-volume naming (64 lowercase hex).
@@ -218,7 +220,7 @@ func TestIntegration_Docker_ImageIntrospection_DoesNotLeakAnonymousVolumes(t *te
 	// Pull rather than skip-if-absent: a skip here would silently turn the leak
 	// assertion into a false green on a clean CI daemon.
 	require.NoError(t, docker.PullImage(ctx, img, 120*time.Second))
-	admitted, err := docker.AdmitImage(ctx, img)
+	_, err := docker.AdmitImage(ctx, img)
 	require.NoError(t, err)
 
 	before := dockerVolumeSet(t, ctx, sdk)
@@ -228,12 +230,17 @@ func TestIntegration_Docker_ImageIntrospection_DoesNotLeakAnonymousVolumes(t *te
 	// DetectWritablePaths). Require success: if a helper failed before creating
 	// its container, the diff would be empty and the leak assertion would
 	// false-green without ever exercising the reap path.
-	_, _, err = docker.ResolveImageUser(ctx, admitted, "redis") // → readFileFromImage(/etc/passwd)
-	require.NoError(t, err)
-	_, _, err = docker.DetectVolumeOwner(ctx, admitted, []string{"/data"})
-	require.NoError(t, err)
-	_, err = docker.DetectWritablePaths(ctx, admitted, 0, []string{"/data"}) // small dir; only the temp-container create/remove path matters here
-	require.NoError(t, err)
+	h := newIntegrationInspectionHarness(t, docker, img)
+	h.execute(t, func(work context.Context, origin shared.ImageInspectionOrigin) error {
+		_, _, err = docker.ResolveImageUser(work, h.image, "redis", origin)
+		require.NoError(t, err)
+		_, _, err = docker.DetectVolumeOwner(work, h.image, []string{"/data"}, origin)
+		require.NoError(t, err)
+		_, err = docker.DetectWritablePaths(work, h.image, 0, []string{"/data"}, origin)
+		require.NoError(t, err)
+		require.Empty(t, docker.ExtractImageContent(work, h.image, []string{"/data"}, t.TempDir(), 1<<20, 100, origin))
+		return nil
+	})
 
 	after := dockerVolumeSet(t, ctx, sdk)
 
@@ -371,4 +378,28 @@ func TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFail
 	got, err := os.ReadFile(dataFile)
 	require.NoError(t, err, "teardown must never remove bind-mounted tenant data")
 	assert.Equal(t, "tenant data", string(got))
+}
+
+// newIntegrationInspectionHarness retains actual daemon and journal attestation
+// while driving only preparation through a real Started-subject executor.
+func newIntegrationInspectionHarness(t *testing.T, docker *DockerClient, reference string) *inspectionHarness {
+	t.Helper()
+	expected, err := docker.DaemonInfo(t.Context())
+	require.NoError(t, err)
+	require.NotEmpty(t, expected.SystemID)
+	h := newInspectionHarnessWithClient(t, func(*inspectionDaemon) *DockerClient { return docker }, reference)
+	h.backend.storageVerifier = testDockerRuntimeStorageVerifier{id: h.authority.storage.ID(), verify: func(ctx context.Context) error {
+		if err := h.callbacks.VerifyStorageIdentity(h.authority.storage); err != nil {
+			return err
+		}
+		actual, err := docker.DaemonInfo(ctx)
+		if err != nil {
+			return err
+		}
+		if actual.SystemID != expected.SystemID {
+			return backendidentity.ErrIdentityDrift
+		}
+		return nil
+	}}
+	return h
 }

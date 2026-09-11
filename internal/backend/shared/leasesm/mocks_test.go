@@ -458,24 +458,23 @@ func (m *mockDiagnosticsGatherer) GatherDiagnostics(ctx context.Context, instanc
 // that need specific behavior set the relevant field; everything else
 // inherits sensible defaults.
 type testActorOpts struct {
-	Logger                       *slog.Logger
-	StopCtx                      context.Context
-	WG                           *sync.WaitGroup
-	WorkerDrainTimeout           time.Duration
-	Inspector                    InstanceInspector
-	Diag                         DiagnosticsGatherer
-	ProvisionStore               LeaseProvisionStore
-	Metrics                      SMMetrics
-	ProvisionWorkFn              func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome
-	RestoreWorkFn                func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome
-	MaintenanceWorkFn            func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome
-	OnTerminated                 func(uuid string)
-	PersistDiagnosticsFn         func(entry shared.DiagnosticEntry, ids []string, keys map[string]string)
-	PersistDiagnosticsWithLogsFn func(entry shared.DiagnosticEntry, logs map[string]string)
-	SendOperationCallbackFn      func(uuid, url string, status backend.CallbackStatus, errMsg string)
-	SendLifecycleFailureFn       func(runtime shared.RuntimeGenerationProof, errMsg string)
-	SendMaintenanceCallbackFn    func(claim shared.MaintenanceIntentClaim, status backend.CallbackStatus, errMsg string)
-	DoDeprovisionFn              func(ctx context.Context, scope ActorCloseScope) error
+	Logger                    *slog.Logger
+	StopCtx                   context.Context
+	WG                        *sync.WaitGroup
+	WorkerDrainTimeout        time.Duration
+	Inspector                 InstanceInspector
+	Diag                      DiagnosticsGatherer
+	ProvisionStore            LeaseProvisionStore
+	Metrics                   SMMetrics
+	ProvisionWorkFn           func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome
+	RestoreWorkFn             func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome
+	MaintenanceWorkFn         func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome
+	OnTerminated              func(uuid string)
+	PersistDiagnosticsFn      func(entry shared.DiagnosticEntry, ids []string, keys map[string]string)
+	SendOperationCallbackFn   func(uuid, url string, status backend.CallbackStatus, errMsg string)
+	SendLifecycleFailureFn    func(runtime shared.RuntimeGenerationProof, errMsg string)
+	SendMaintenanceCallbackFn func(claim shared.MaintenanceIntentClaim, status backend.CallbackStatus, errMsg string)
+	DoDeprovisionFn           func(ctx context.Context, scope ActorCloseScope) error
 }
 
 func testRecoveryLineage(t *testing.T) shared.RecoveryLineage {
@@ -571,9 +570,6 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 	if opts.PersistDiagnosticsFn == nil {
 		opts.PersistDiagnosticsFn = func(shared.DiagnosticEntry, []string, map[string]string) {}
 	}
-	if opts.PersistDiagnosticsWithLogsFn == nil {
-		opts.PersistDiagnosticsWithLogsFn = func(shared.DiagnosticEntry, map[string]string) {}
-	}
 	if opts.SendOperationCallbackFn == nil {
 		opts.SendOperationCallbackFn = func(string, string, backend.CallbackStatus, string) {}
 	}
@@ -589,21 +585,20 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 
 	var actor *LeaseActor
 	actor, err := NewLeaseActor(LeaseActorConfig{
-		LeaseUUID:                    leaseUUID,
-		Logger:                       opts.Logger,
-		StopCtx:                      opts.StopCtx,
-		WG:                           opts.WG,
-		WorkerDrainTimeout:           opts.WorkerDrainTimeout,
-		Inspector:                    opts.Inspector,
-		Diag:                         opts.Diag,
-		ProvisionStore:               opts.ProvisionStore,
-		Metrics:                      opts.Metrics,
-		ProvisionWorkFn:              opts.ProvisionWorkFn,
-		RestoreWorkFn:                opts.RestoreWorkFn,
-		MaintenanceWorkFn:            opts.MaintenanceWorkFn,
-		OnTerminated:                 func(uuid string, _ *LeaseActor) { opts.OnTerminated(uuid) },
-		PersistDiagnosticsFn:         opts.PersistDiagnosticsFn,
-		PersistDiagnosticsWithLogsFn: opts.PersistDiagnosticsWithLogsFn,
+		LeaseUUID:            leaseUUID,
+		Logger:               opts.Logger,
+		StopCtx:              opts.StopCtx,
+		WG:                   opts.WG,
+		WorkerDrainTimeout:   opts.WorkerDrainTimeout,
+		Inspector:            opts.Inspector,
+		Diag:                 opts.Diag,
+		ProvisionStore:       opts.ProvisionStore,
+		Metrics:              opts.Metrics,
+		ProvisionWorkFn:      opts.ProvisionWorkFn,
+		RestoreWorkFn:        opts.RestoreWorkFn,
+		MaintenanceWorkFn:    opts.MaintenanceWorkFn,
+		OnTerminated:         func(uuid string, _ *LeaseActor) { opts.OnTerminated(uuid) },
+		PersistDiagnosticsFn: opts.PersistDiagnosticsFn,
 		SendOperationSuccessFn: func(shared.OperationReleaseCommitted) {
 			url := ""
 			opts.ProvisionStore.UpdateFn(leaseUUID, func(state *ProvisionState) { url = state.CallbackURL })
@@ -705,9 +700,6 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 	if opts.PersistDiagnosticsFn == nil {
 		opts.PersistDiagnosticsFn = func(shared.DiagnosticEntry, []string, map[string]string) {}
 	}
-	if opts.PersistDiagnosticsWithLogsFn == nil {
-		opts.PersistDiagnosticsWithLogsFn = func(shared.DiagnosticEntry, map[string]string) {}
-	}
 	if opts.SendOperationCallbackFn == nil {
 		opts.SendOperationCallbackFn = func(string, string, backend.CallbackStatus, string) {}
 	}
@@ -728,21 +720,20 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 		workers:             workbarrier.New(),
 	}
 	a.cfg = LeaseActorConfig{
-		LeaseUUID:                    leaseUUID,
-		Logger:                       opts.Logger,
-		StopCtx:                      opts.StopCtx,
-		WG:                           opts.WG,
-		WorkerDrainTimeout:           opts.WorkerDrainTimeout,
-		Inspector:                    opts.Inspector,
-		Diag:                         opts.Diag,
-		ProvisionStore:               opts.ProvisionStore,
-		Metrics:                      opts.Metrics,
-		ProvisionWorkFn:              opts.ProvisionWorkFn,
-		RestoreWorkFn:                opts.RestoreWorkFn,
-		MaintenanceWorkFn:            opts.MaintenanceWorkFn,
-		OnTerminated:                 func(uuid string, _ *LeaseActor) { opts.OnTerminated(uuid) },
-		PersistDiagnosticsFn:         opts.PersistDiagnosticsFn,
-		PersistDiagnosticsWithLogsFn: opts.PersistDiagnosticsWithLogsFn,
+		LeaseUUID:            leaseUUID,
+		Logger:               opts.Logger,
+		StopCtx:              opts.StopCtx,
+		WG:                   opts.WG,
+		WorkerDrainTimeout:   opts.WorkerDrainTimeout,
+		Inspector:            opts.Inspector,
+		Diag:                 opts.Diag,
+		ProvisionStore:       opts.ProvisionStore,
+		Metrics:              opts.Metrics,
+		ProvisionWorkFn:      opts.ProvisionWorkFn,
+		RestoreWorkFn:        opts.RestoreWorkFn,
+		MaintenanceWorkFn:    opts.MaintenanceWorkFn,
+		OnTerminated:         func(uuid string, _ *LeaseActor) { opts.OnTerminated(uuid) },
+		PersistDiagnosticsFn: opts.PersistDiagnosticsFn,
 		SendOperationSuccessFn: func(shared.OperationReleaseCommitted) {
 			url := ""
 			opts.ProvisionStore.UpdateFn(leaseUUID, func(state *ProvisionState) { url = state.CallbackURL })
@@ -915,11 +906,51 @@ func testMaintenanceFailure(t *testing.T, intent shared.MaintenanceIntentClaim, 
 	value, ok := maintenanceAuthorities.Load(intent.MaintenanceID())
 	require.True(t, ok, "test maintenance authority is unavailable")
 	authority := value.(testMaintenanceAuthority)
-	failure, err := authority.settlement.RefuseMaintenanceExecution(authority.target)
-	require.NoError(t, err)
+	var failure shared.MaintenanceExecutionFailure
+	var err error
+	if restored || recoverFromSource {
+		// A recovered actor fixture must carry the same complete SourceReady
+		// proof as production. A synchronous refusal cannot mint readiness.
+		authority.settlement, err = shared.NewMaintenanceSettlement(authority.callbacks, authority.releases)
+		require.NoError(t, err)
+		require.NoError(t, shared.BindMaintenanceSubstrateExecutor(authority.settlement,
+			func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil },
+			func(context.Context, string, error) error { return nil },
+			func(runner substratemutation.Runner, _ shared.MaintenancePhysicalSubject) leaseSMTestMutation {
+				return leaseSMTestMutation{runner: runner}
+			},
+			func(ctx context.Context, mutation leaseSMTestMutation, _ shared.MaintenancePhysicalSubject) error {
+				return mutation.runner.Step(ctx, "restore exact fixture source", func(context.Context) error { return nil })
+			},
+			func(_ context.Context, subject shared.MaintenancePhysicalSubject) (shared.MaintenancePhysicalEvidence, error) {
+				source, ok := subject.SourceRelease()
+				if !ok {
+					return shared.MaintenancePhysicalEvidence{}, errors.New("fixture has no source release")
+				}
+				ids, services := testProjectionForRelease(source)
+				return shared.NewMaintenanceSourceReady(subject, ids, services)
+			},
+		))
+		_, target, found, findErr := authority.settlement.FindMaintenanceRelease(intent.LeaseUUID(), intent.MaintenanceID())
+		require.NoError(t, findErr)
+		require.True(t, found)
+		authority.target, err = authority.settlement.BindMaintenanceIntentTarget(target)
+		require.NoError(t, err)
+		maintenanceAuthorities.Store(intent.MaintenanceID(), authority)
+		execution, startErr := authority.settlement.StartMaintenanceExecution(authority.target)
+		require.NoError(t, startErr)
+		outcome := authority.settlement.ExecuteMaintenance(context.Background(), execution)
+		var ok bool
+		failure, ok = outcome.(shared.MaintenanceExecutionFailure)
+		require.True(t, ok, "%T: %v", outcome, outcome)
+		require.True(t, failure.SourceRecovered())
+	} else {
+		failure, err = authority.settlement.RefuseMaintenanceExecution(authority.target)
+		require.NoError(t, err)
+	}
 	proof, err := authority.settlement.FailMaintenance(failure, details.Reason, details.CallbackErr)
 	require.NoError(t, err)
-	result, err := NewMaintenanceReplaceFailure(errValue, restored, recoverFromSource, details, proof)
+	result, err := NewMaintenanceReplaceFailure(errValue, details, proof)
 	require.NoError(t, err)
 	return result
 }

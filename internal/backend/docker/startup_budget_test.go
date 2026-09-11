@@ -3,16 +3,15 @@ package docker
 import (
 	"context"
 	"log/slog"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
@@ -333,55 +332,58 @@ func TestStart_StopContextCancelsRecoveryBudget(t *testing.T) {
 }
 
 func TestStart_OverallBudgetCapsOperationRecoveryInventory(t *testing.T) {
-	var inventoryCalls atomic.Int32
-	phaseEntered := make(chan struct{})
-	var phaseOnce sync.Once
+	synctest.Test(t, testStartOverallBudgetCapsOperationRecoveryInventory)
+}
+
+func testStartOverallBudgetCapsOperationRecoveryInventory(t *testing.T) {
 	mock := &mockDockerClient{
-		PingFn: func(context.Context) error { return nil },
-		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
-			if inventoryCalls.Add(1) <= 3 {
-				// The supported-topology preflight, recoverState's projection
-				// inventory, and its independent strict closed-substrate confirmation
-				// all precede operation recovery.
-				return nil, nil
-			}
-			phaseOnce.Do(func() { close(phaseEntered) })
-			<-ctx.Done()
-			return nil, ctx.Err()
-		},
+		PingFn:                  func(context.Context) error { return nil },
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	bindTestStorageIdentity(t, b, mock)
+	b.operationSettlement = operationSettlementServiceForCallbackTest(t, b.callbackStore)
 	b.recoveryDockerReadTimeout = time.Second
 	b.startupRecoveryTimeout = 100 * time.Millisecond
 	b.startupPhaseTimeout = 25 * time.Millisecond
 	b.cfg.ContainerStopTimeout = time.Millisecond
 	t.Cleanup(b.stopCancel)
 
-	store := b.callbackStore
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	b.callbackStore = store
-	b.operationSettlement = operationSettlementServiceForCallbackTest(t, store)
-	releaseStore, err := newBoundReleaseStoreForTest(t, shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "releases.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, releaseStore.Close()) })
-	b.releaseStore = releaseStore
-
 	spec := dockerOperationIntentSpec(t, b.storageIdentity)
-	_, err = beginDockerTestOperationIntent(t, store, spec, b.storageIdentity)
+	_, err := beginDockerTestOperationIntent(t, b.callbackStore, spec, b.storageIdentity)
 	require.NoError(t, err)
+	// BeforeEffects recovery deliberately needs no Docker observation. Model
+	// an interrupted Started operation so the test reaches the real fleet read.
+	startPendingOperationForRecoveryTest(t, b)
+
+	phaseEntered := make(chan struct{})
+	var phaseOnce sync.Once
+	var observedDeadline time.Time
+	mock.ListManagedContainersFn = func(ctx context.Context) ([]ContainerInfo, error) {
+		// Only operation recovery owns this exact pending lease's command
+		// fence. Preflight and ordinary state publication remain free to add
+		// their own inventory reads without changing this causal barrier.
+		if unlock, available := b.commandFence.TryLock(spec.LeaseUUID); available {
+			unlock()
+			return nil, nil
+		}
+		observedDeadline, _ = ctx.Deadline()
+		phaseOnce.Do(func() { close(phaseEntered) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 
 	started := time.Now()
 	err = b.Start(context.Background())
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.ErrorContains(t, err, "recover interrupted operations")
-	assert.Less(t, time.Since(started), time.Second,
-		"a stalled operation fleet inventory must inherit the finite startup budget")
 	select {
 	case <-phaseEntered:
 	default:
 		t.Fatal("startup did not reach the deliberately stalled operation inventory")
 	}
+	assert.Equal(t, started.Add(b.startupRecoveryTimeout), observedDeadline,
+		"the operation inventory must inherit the aggregate deadline, not a new per-read allowance")
+	assert.Equal(t, b.startupRecoveryTimeout, time.Since(started),
+		"the complete startup pass must end at its exact virtual-time budget")
 }

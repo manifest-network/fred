@@ -215,8 +215,17 @@ func (c CloseIntentClaim) ExecutionGeneration() CloseExecutionGeneration {
 }
 func (c CloseIntentClaim) CreatedAt() time.Time { return c.entry.CreatedAt }
 
+// Interrupted attempt identities are authored only while consuming the exact
+// previous journal head. They survive restart and never select by timestamp.
+func (c CloseIntentClaim) InterruptedOperationID() OperationID { return c.entry.InterruptedOperationID }
+func (c CloseIntentClaim) InterruptedMaintenanceID() MaintenanceID {
+	return c.entry.InterruptedMaintenanceID
+}
+
 type closeIntentEntry struct {
 	IntentID                 string                `json:"intent_id"`
+	InterruptedOperationID   OperationID           `json:"interrupted_operation_id,omitzero"`
+	InterruptedMaintenanceID MaintenanceID         `json:"interrupted_maintenance_id,omitzero"`
 	LeaseUUID                string                `json:"lease_uuid"`
 	Backend                  string                `json:"backend"`
 	BackendStorageID         string                `json:"backend_storage_id"`
@@ -366,6 +375,14 @@ func (s *CallbackStore) beginCloseIntentWithAuthorityLocked(
 		}
 		entry.IntentID = intentID.String()
 		entry.CreatedAt = time.Now()
+		switch current := head.(type) {
+		case operationLeaseMutationHead:
+			if current.claim.entry.State != operationIntentSucceeded {
+				entry.InterruptedOperationID = current.claim.OperationID()
+			}
+		case maintenanceLeaseMutationHead:
+			entry.InterruptedMaintenanceID = current.claim.MaintenanceID()
+		}
 		data, err := marshalCloseIntent(entry)
 		if err != nil {
 			return err
@@ -909,6 +926,9 @@ func validateCloseIntentSpec(spec closeIntentSpec) error {
 }
 
 func validateCloseIntentEntry(entry closeIntentEntry, leaseUUID string) error {
+	if !entry.InterruptedOperationID.IsZero() && !entry.InterruptedMaintenanceID.IsZero() {
+		return errors.New("close cannot interrupt both an operation and maintenance")
+	}
 	if _, err := parseCloseIntentID(entry.IntentID); err != nil {
 		return err
 	}

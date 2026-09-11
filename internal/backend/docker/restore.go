@@ -2,7 +2,6 @@ package docker
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -436,18 +435,10 @@ func (b *Backend) reconcileRestoringWithAuthorityUsing(
 			b.provisionsMu.RLock()
 			p, live := b.provisions[e.NewLeaseUUID]
 			var status backend.ProvisionStatus
-			var recordedIDs []string
 			var liveItems []backend.LeaseItem
 			if live {
 				status = p.Status
 				liveItems = slices.Clone(p.Items)
-				// Snapshot (not alias) under the lock, mirroring doDeprovision. Usually EMPTY
-				// here — Restore reserves the provision with no ContainerIDs and only the
-				// success paths fill them in — which is precisely why the teardown below
-				// re-discovers rather than trusting this (ENG-647). It is non-empty for a
-				// provision recoverState rebuilt from live containers, so it is still worth
-				// passing.
-				recordedIDs = slices.Clone(p.ContainerIDs)
 			}
 			b.provisionsMu.RUnlock()
 
@@ -468,7 +459,6 @@ func (b *Backend) reconcileRestoringWithAuthorityUsing(
 			if err != nil {
 				return err
 			}
-			var rollbackPlan restoreRollbackPlan
 			switch decision := plan.(type) {
 			case restoreCommitPending:
 				if err := b.commitRecoveredRestore(
@@ -489,113 +479,11 @@ func (b *Backend) reconcileRestoringWithAuthorityUsing(
 				// cannot mint rollback authority from another inventory observation.
 				return nil
 			case restoreRollbackFailed:
-				rollbackPlan = decision
-				// Continue into the single ordered destructive handler below. No other
-				// durable state can construct one of these plan types.
+				return b.handbackFailedRestore(ctx, recoveryScope, e, decision, renameVolume, ensureQuota)
 			default:
 				return fmt.Errorf("restore destination %q produced unknown recovery plan %T",
 					e.NewLeaseUUID, plan)
 			}
-
-			// Orphaned (crash/failed): tear down any orphaned project, re-quarantine the
-			// adopted volumes back to the retained namespace, then CAS the record to active.
-			//
-			// The teardown is a PRECONDITION for everything below it, not a best-effort
-			// courtesy, so a failure ends the pass (ENG-647). Two reasons, both fatal:
-			//   - The re-quarantine renames move the volume dirs back into the retained
-			//     namespace, and a surviving container holds them by INODE, so it would go on
-			//     writing into data the record then advertises as frozen.
-			//   - Reverting the record and dropping the provision would strand the containers
-			//     where no durable recovery owner can see them: processOrphan only walks
-			//     ListProvisions (which ranges b.provisions, the map we would have just
-			//     deleted from). Docker's anonymous-volume store is not a managed-volume
-			//     inventory, so their anonymous volumes would accumulate forever (ENG-372).
-			// So: no partial rollback. Leave the record restoring, keep the provision and its
-			// pool allocation, and let the next sweep/boot retry — the same shape as the
-			// re-quarantine failure below, and the same finalizer contract the Ready arm above
-			// honors via finalizeRestoredLease (ENG-523). The wait is safe: a restoring record
-			// is not reapable (ListExpired/BeginExpiredReaping both require Active), and its
-			// exact restoring record claims the adopted canonical names. It is NOT time-bounded, though —
-			// that same expiry exemption means the tenant cannot re-request the restore
-			// (RestoreSettlement.ClaimForRestore refuses a Restoring record) until a sweep gets a clean teardown,
-			// so a sustained failure here is an operator signal, not a self-healing state.
-			stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
-			if _, derr := b.teardownLeaseContainersUsing(teardown, ctx, e.NewLeaseUUID, recordedIDs, stopTimeout,
-				teardownOpRestoreReconcile, b.logger.With("lease_uuid", e.NewLeaseUUID)); derr != nil {
-				b.logger.Warn("reconcile: teardown failed; leaving record restoring for the next sweep",
-					"lease_uuid", e.OriginalLeaseUUID, "new_lease_uuid", e.NewLeaseUUID, "error", derr)
-				return fmt.Errorf("reconcile restoring retention %q teardown: %w", e.OriginalLeaseUUID, derr)
-			}
-			// Re-quarantine each adopted volume. A REAL rename failure (not a benign
-			// no-op) means the volume may still be canonical-named: we must NOT advance
-			// the record to active or drop the provision: doing either would discard the
-			// exact recovery/finalizer authority for still-live data. Leave the record
-			// restoring so the next sweep retries, and keep the provision projection.
-			failed := false
-			for _, retained := range e.RetainedVolumeNames {
-				newCanonical := retainedToNewCanonical(retained, e.OriginalLeaseUUID, e.NewLeaseUUID)
-				if rerr := b.renameIfPresentUsing(ctx, renameVolume, newCanonical, retained); rerr != nil {
-					failed = true
-				}
-			}
-			if failed {
-				b.logger.Warn("reconcile: re-quarantine rename failed; leaving record restoring for next startup",
-					"lease_uuid", e.OriginalLeaseUUID, "new_lease_uuid", e.NewLeaseUUID)
-				return fmt.Errorf("reconcile restoring retention %q: re-quarantine remains incomplete",
-					e.OriginalLeaseUUID)
-			}
-			// Restore's Create path applies the destination tier's quota to each adopted
-			// volume. A failed promotion therefore leaves a larger physical quota than
-			// the immutable source record accounts for. Restore the exact source quota
-			// before handing authority back to that record; if usage no longer fits, or
-			// either measurement/application is uncertain, keep both the restoring
-			// finalizer and the live reservation. That is over-counted but cannot admit
-			// unaccounted bytes.
-			resourceProfiles, err := b.restoreRetainedVolumeQuotasUsing(ctx, &e, ensureQuota)
-			if err != nil {
-				b.logger.Error("reconcile: unable to restore source volume quotas; leaving record restoring",
-					"lease_uuid", e.OriginalLeaseUUID,
-					"new_lease_uuid", e.NewLeaseUUID,
-					"error", err,
-				)
-				return fmt.Errorf("reconcile restoring retention %q quotas: %w", e.OriginalLeaseUUID, err)
-			}
-			// Once teardown, re-quarantine, and source-quota proof are complete, this
-			// destination can no longer succeed. Settle its exact failed operation before
-			// handing the durable row back to Active. A callback-store failure therefore
-			// leaves Restoring + the live reservation as a level-triggered retry vehicle.
-			// If the subsequent handback CAS fails, the durable OperationFailed state
-			// makes the next pass select the same rollback plan without consulting stale
-			// projection state.
-			//
-			// Keep operation settlement, Restoring→Active handback, pool release, and
-			// projection removal indivisible from recovery publication. Physical teardown
-			// and re-quarantine above need no snapshot lock because the Restoring row is
-			// still durable authority throughout them.
-			b.recoverySnapshotMu.RLock()
-			defer b.recoverySnapshotMu.RUnlock()
-			if err := b.settleRolledBackRestoreOperation(e, rollbackPlan); err != nil {
-				return fmt.Errorf("settle rolled-back restore intent for %q: %w", e.NewLeaseUUID, err)
-			}
-			// Derive the destination allocation ids using the same
-			// {newLease}-{svc}-{idx} scheme Restore used for TryAllocateAdoptAll.
-			var liveIDs []string
-			for _, item := range e.Items {
-				for i := range item.Quantity {
-					liveIDs = append(liveIDs, fmt.Sprintf("%s-%s-%d", e.NewLeaseUUID, item.ServiceName, i))
-				}
-			}
-			ok, err := b.revertRestoreSourceWithAccounting(&e, e.NewLeaseUUID, resourceProfiles, liveIDs)
-			if err != nil {
-				b.logger.Error("reconcile: revert restoring->active failed", "lease_uuid", e.OriginalLeaseUUID, "error", err)
-				return fmt.Errorf("reconcile restoring retention %q finalizer: %w", e.OriginalLeaseUUID, err)
-			}
-			if !ok {
-				return fmt.Errorf("reconcile restoring retention %q lost generation %d authority",
-					e.OriginalLeaseUUID, e.Generation)
-			}
-			b.removeProvision(e.NewLeaseUUID)
-			return nil
 		},
 	)
 	if recoveryErr != nil {
@@ -604,6 +492,143 @@ func (b *Backend) reconcileRestoringWithAuthorityUsing(
 	if !acquired {
 		return nil
 	}
+	return nil
+}
+
+// handbackFailedRestore owns the complete failed-attempt cleanup and source
+// handback under the destination recovery fence. Its store-issued receipt binds
+// capture, exact removal, and absence classification to that attempt. Only this
+// workflow proceeds from destination vacancy to volume renames, quota restoration,
+// and the source/accounting CAS; it exports no intermediate cleanup permission.
+func (b *Backend) handbackFailedRestore(
+	ctx context.Context,
+	scope shared.LeaseRecoveryScope,
+	e shared.RetentionEntry,
+	plan restoreRollbackFailed,
+	renameVolume backgroundVolumeRename,
+	ensureQuota backgroundVolumeQuota,
+) error {
+	if plan.outcome == nil {
+		return errors.New("restore cleanup requires a failed operation")
+	}
+	outcome := plan.outcome
+	if err := b.validateRestoreOperationAuthority(outcome, e); err != nil {
+		return fmt.Errorf("bind failed restore source handback: %w", err)
+	}
+	receipts, err := b.operationSettlement.ListFailedOperationReceipts()
+	if err != nil {
+		return fmt.Errorf("read exact failed restore receipt: %w", err)
+	}
+	index := slices.IndexFunc(receipts, func(receipt shared.FailedOperationReceipt) bool {
+		return receipt.OperationID() == outcome.OperationID() && receipt.LeaseUUID() == outcome.LeaseUUID()
+	})
+	if index < 0 {
+		return errors.New("failed restore cleanup has no exact durable receipt")
+	}
+	receipt := receipts[index]
+	if receipt.Kind() != shared.OperationIntentRestore || receipt.LeaseUUID() != outcome.LeaseUUID() ||
+		receipt.CallbackURL() != outcome.CallbackURL() || receipt.LifecycleCallbackURL() != outcome.LifecycleCallbackURL() ||
+		receipt.Backend() != outcome.Backend() || receipt.BackendStorageID() != outcome.BackendStorageID() ||
+		receipt.Tenant() != outcome.Tenant() || receipt.ProviderUUID() != outcome.ProviderUUID() {
+		return errors.New("failed restore receipt differs from exact rollback authority")
+	}
+	cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cleanupErr := func() error {
+		if err := b.operationSettlement.CleanupFailedOperationReceipt(cleanupCtx, scope, receipt); err != nil {
+			return fmt.Errorf("retire exact failed restore targets: %w", err)
+		}
+		// A different callback generation is not ours to remove. It still blocks
+		// handback: moving mounted volumes would expose retained source data to
+		// a container whose ownership this failed receipt cannot prove.
+		containers, err := b.strictIdentityBoundOperationInventory(cleanupCtx)
+		if err != nil {
+			return fmt.Errorf("verify restore destination is empty before handback: %w", err)
+		}
+		for _, container := range containers {
+			if container.LeaseUUID == outcome.LeaseUUID() {
+				return fmt.Errorf("restore destination container %q still prevents source handback", container.ContainerID)
+			}
+		}
+		return nil
+	}()
+	cleanupOutcome := teardownOutcomeRecovered
+	if cleanupErr != nil {
+		cleanupOutcome = teardownOutcomeFailed
+	}
+	teardownFallbackTotal.WithLabelValues(teardownOpRestoreReconcile, cleanupOutcome).Inc()
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+	// Re-quarantine each adopted volume. A REAL rename failure (not a benign
+	// no-op) means the volume may still be canonical-named: we must NOT advance
+	// the record to active or drop the provision: doing either would discard the
+	// exact recovery/finalizer authority for still-live data. Leave the record
+	// restoring so the next sweep retries, and keep the provision projection.
+	failed := false
+	for _, retained := range e.RetainedVolumeNames {
+		newCanonical := retainedToNewCanonical(retained, e.OriginalLeaseUUID, e.NewLeaseUUID)
+		if rerr := b.renameIfPresentUsing(ctx, renameVolume, newCanonical, retained); rerr != nil {
+			failed = true
+		}
+	}
+	if failed {
+		b.logger.Warn("reconcile: re-quarantine rename failed; leaving record restoring for next startup",
+			"lease_uuid", e.OriginalLeaseUUID, "new_lease_uuid", e.NewLeaseUUID)
+		return fmt.Errorf("reconcile restoring retention %q: re-quarantine remains incomplete",
+			e.OriginalLeaseUUID)
+	}
+	// Restore's Create path applies the destination tier's quota to each adopted
+	// volume. A failed promotion therefore leaves a larger physical quota than
+	// the immutable source record accounts for. Restore the exact source quota
+	// before handing authority back to that record; if usage no longer fits, or
+	// either measurement/application is uncertain, keep both the restoring
+	// finalizer and the live reservation. That is over-counted but cannot admit
+	// unaccounted bytes.
+	resourceProfiles, err := b.restoreRetainedVolumeQuotasUsing(ctx, &e, ensureQuota)
+	if err != nil {
+		b.logger.Error("reconcile: unable to restore source volume quotas; leaving record restoring",
+			"lease_uuid", e.OriginalLeaseUUID,
+			"new_lease_uuid", e.NewLeaseUUID,
+			"error", err,
+		)
+		return fmt.Errorf("reconcile restoring retention %q quotas: %w", e.OriginalLeaseUUID, err)
+	}
+	// Once teardown, re-quarantine, and source-quota proof are complete, this
+	// destination can no longer succeed. Settle its exact failed operation before
+	// handing the durable row back to Active. A callback-store failure therefore
+	// leaves Restoring + the live reservation as a level-triggered retry vehicle.
+	// If the subsequent handback CAS fails, the durable OperationFailed state
+	// makes the next pass select the same rollback plan without consulting stale
+	// projection state.
+	//
+	// Keep operation settlement, Restoring→Active handback, pool release, and
+	// projection removal indivisible from recovery publication. Physical teardown
+	// and re-quarantine above need no snapshot lock because the Restoring row is
+	// still durable authority throughout them.
+	b.recoverySnapshotMu.RLock()
+	defer b.recoverySnapshotMu.RUnlock()
+	if err := b.settleRolledBackRestoreOperation(e, plan); err != nil {
+		return fmt.Errorf("settle rolled-back restore intent for %q: %w", e.NewLeaseUUID, err)
+	}
+	// Derive the destination allocation ids using the same
+	// {newLease}-{svc}-{idx} scheme Restore used for TryAllocateAdoptAll.
+	var liveIDs []string
+	for _, item := range e.Items {
+		for i := range item.Quantity {
+			liveIDs = append(liveIDs, fmt.Sprintf("%s-%s-%d", e.NewLeaseUUID, item.ServiceName, i))
+		}
+	}
+	ok, err := b.revertRestoreSourceWithAccounting(&e, e.NewLeaseUUID, resourceProfiles, liveIDs)
+	if err != nil {
+		b.logger.Error("reconcile: revert restoring->active failed", "lease_uuid", e.OriginalLeaseUUID, "error", err)
+		return fmt.Errorf("reconcile restoring retention %q finalizer: %w", e.OriginalLeaseUUID, err)
+	}
+	if !ok {
+		return fmt.Errorf("reconcile restoring retention %q lost generation %d authority",
+			e.OriginalLeaseUUID, e.Generation)
+	}
+	b.removeProvision(e.NewLeaseUUID)
 	return nil
 }
 

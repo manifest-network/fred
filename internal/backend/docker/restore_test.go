@@ -17,6 +17,7 @@ import (
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
+	"github.com/containerd/errdefs"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -36,6 +37,98 @@ func attachRetentionStore(t *testing.T, b *Backend) *shared.RetentionStore {
 	attachBoundOperationHandoffStores(t, b)
 	require.NotNil(t, b.retentionStore)
 	return b.retentionStore
+}
+
+// bindExactRestoreCleanupFixture gives the legacy inventory fixtures the exact
+// labels of their already-settled restore. It preserves each test's listing and
+// removal failures, requires capture before removal, and models successful
+// removal in subsequent strict inventories. No fixture can use broad Down.
+func bindExactRestoreCleanupFixture(t *testing.T, b *Backend, entry shared.RetentionEntry) func() []string {
+	t.Helper()
+	mock, ok := b.docker.(*mockDockerClient)
+	require.True(t, ok)
+	list, remove := mock.ListManagedContainersFn, mock.RemoveContainerFn
+	var mu sync.Mutex
+	removed := make(map[string]bool)
+	captured := make(map[string]bool)
+	var attempts []string
+	read := func(ctx context.Context) ([]ContainerInfo, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if list == nil {
+			return nil, nil
+		}
+		containers, err := list(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var current []ContainerInfo
+		for _, container := range containers {
+			if removed[container.ContainerID] {
+				continue
+			}
+			if container.LeaseUUID != entry.NewLeaseUUID {
+				return nil, errors.New("restore cleanup fixture contains an unrelated lease")
+			}
+			container.BackendName = b.Name()
+			container.Tenant, container.ProviderUUID = entry.Tenant, entry.ProviderUUID
+			container.CallbackURL = entry.DestinationCallbackURL
+			container.LifecycleCallbackURL = entry.DestinationLifecycleCallbackURL
+			container.ServiceName = entry.DestinationItems[0].ServiceName
+			container.Status = "exited"
+			current = append(current, container)
+		}
+		return current, nil
+	}
+	mock.ListManagedContainersFn = read
+	mock.InspectContainerFn = func(ctx context.Context, id string) (*ContainerInfo, error) {
+		containers, err := read(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, container := range containers {
+			if container.ContainerID == id {
+				return &container, nil
+			}
+		}
+		return nil, errdefs.ErrNotFound
+	}
+	mock.ContainerLogsFn = func(ctx context.Context, id string, tail int) (string, error) {
+		if _, err := mock.InspectContainerFn(ctx, id); err != nil {
+			return "", err
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if tail != persistedLogTail {
+			t.Errorf("unexpected restore log capture tail %d", tail)
+			return "", errors.New("restore cleanup requires the durable capture tail")
+		}
+		captured[id] = true
+		return "failed restore startup logs", nil
+	}
+	mock.RemoveContainerFn = func(ctx context.Context, id string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if remove == nil || !captured[id] || removed[id] {
+			t.Errorf("unexpected or uncaptured exact restore removal %q", id)
+			return errors.New("fixture requires a captured exact target before removal")
+		}
+		attempts = append(attempts, id)
+		if err := remove(ctx, id); err != nil {
+			return err
+		}
+		removed[id] = true
+		return nil
+	}
+	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
+		t.Error("restore receipt cleanup must not invoke broad Compose Down")
+		return errors.New("broad restore teardown is forbidden")
+	}}
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(attempts)
+	}
 }
 
 // startRestoreCallbackReplay gives focused Restore tests the same durable
@@ -910,8 +1003,8 @@ func TestReconcileRetentions_RequarantinesActive(t *testing.T) {
 }
 
 // TestReconcileRestoring_RollsBackOrphan verifies that a restoring record with
-// no live provision (crashed restore) is fully rolled back: compose Down is called
-// for the new lease's project, volumes are re-quarantined to the retained namespace,
+// no live provision (crashed restore) is fully rolled back: exact destination
+// absence is proved, volumes are re-quarantined to the retained namespace,
 // the record reverts to active (Generation bumped, NewLeaseUUID cleared), and the
 // orphaned provision is removed from b.provisions.
 func TestReconcileRestoring_RollsBackOrphan(t *testing.T) {
@@ -920,18 +1013,9 @@ func TestReconcileRestoring_RollsBackOrphan(t *testing.T) {
 	rs := attachRetentionStore(t, b)
 
 	var mu sync.Mutex
-	var downProjects []string
 	type renameCall struct{ old, new string }
 	var renames []renameCall
 
-	b.compose = &mockComposeExecutor{
-		DownFn: func(_ context.Context, projectName string, _ time.Duration) error {
-			mu.Lock()
-			downProjects = append(downProjects, projectName)
-			mu.Unlock()
-			return nil
-		},
-	}
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(old, new string) error {
 			mu.Lock()
@@ -953,17 +1037,13 @@ func TestReconcileRestoring_RollsBackOrphan(t *testing.T) {
 	}
 	e = *putRestoringRetention(t, rs, e)
 	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.NoError(t, b.reconcileRestoring(context.Background(), e))
 
 	mu.Lock()
-	gotDown := append([]string(nil), downProjects...)
 	gotRenames := append([]renameCall(nil), renames...)
 	mu.Unlock()
-
-	// Compose Down must be called for the new lease's project.
-	assert.Contains(t, gotDown, composeProjectName("22222222-2222-4222-8222-222222222222"),
-		"compose Down must be called for the new lease's project")
 
 	// Volume must be re-quarantined from new canonical → original retained name.
 	assert.Contains(t, gotRenames, renameCall{
@@ -1635,18 +1715,9 @@ func TestRunRetentionSweep_ReconcilesRestoring(t *testing.T) {
 	b.cfg.RetentionMaxAge = 90 * 24 * time.Hour
 
 	var mu sync.Mutex
-	var downProjects []string
 	type renameCall struct{ old, new string }
 	var renames []renameCall
 
-	b.compose = &mockComposeExecutor{
-		DownFn: func(_ context.Context, projectName string, _ time.Duration) error {
-			mu.Lock()
-			downProjects = append(downProjects, projectName)
-			mu.Unlock()
-			return nil
-		},
-	}
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(old, new string) error {
 			mu.Lock()
@@ -1670,18 +1741,14 @@ func TestRunRetentionSweep_ReconcilesRestoring(t *testing.T) {
 	}
 	e = *putRestoringRetention(t, rs, e)
 	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	bindExactRestoreCleanupFixture(t, b, e)
 
 	err := b.runRetentionSweep(context.Background())
 	require.NoError(t, err)
 
 	mu.Lock()
-	gotDown := append([]string(nil), downProjects...)
 	gotRenames := append([]renameCall(nil), renames...)
 	mu.Unlock()
-
-	// reconcileRestoring must have been invoked: compose Down for 22222222-2222-4222-8222-222222222222's project.
-	assert.Contains(t, gotDown, composeProjectName("22222222-2222-4222-8222-222222222222"),
-		"compose Down must be called for the orphaned restore's new lease")
 
 	// Volume must be re-quarantined.
 	assert.Contains(t, gotRenames, renameCall{
@@ -3462,16 +3529,7 @@ func TestReconcileRestoring_MixedLease_RollsBackWithoutWedging(t *testing.T) {
 	retainedSet := map[string]bool{retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", "db", 0)): true}
 
 	var mu sync.Mutex
-	var downProjects []string
 	var renames []restoreRenameCall
-	b.compose = &mockComposeExecutor{
-		DownFn: func(_ context.Context, projectName string, _ time.Duration) error {
-			mu.Lock()
-			downProjects = append(downProjects, projectName)
-			mu.Unlock()
-			return nil
-		},
-	}
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(old, new string) error {
 			mu.Lock()
@@ -3499,16 +3557,13 @@ func TestReconcileRestoring_MixedLease_RollsBackWithoutWedging(t *testing.T) {
 	}
 	e = *putRestoringRetention(t, rs, e)
 	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.NoError(t, b.reconcileRestoring(context.Background(), e))
 
 	mu.Lock()
-	gotDown := append([]string(nil), downProjects...)
 	gotRenames := append([]restoreRenameCall(nil), renames...)
 	mu.Unlock()
-
-	// Compose Down ran for the new lease's project.
-	assert.Contains(t, gotDown, composeProjectName("22222222-2222-4222-8222-222222222222"), "compose Down must run for the orphaned restore")
 
 	// Exactly ONE re-quarantine: db canonical(22222222-2222-4222-8222-222222222222) → retained(11111111-1111-4111-8111-111111111111). No web phantom.
 	require.Len(t, gotRenames, 1, "exactly one re-quarantine (db) must happen; web has no volume")
@@ -4166,10 +4221,9 @@ func failedRestoreProvision() map[string]*provision {
 	}
 }
 
-// TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback: when compose Down
-// fails but the per-container fallback finishes the job, the rollback proceeds exactly
-// as if Down had worked. The containers are found by fred label, which is the only way
-// to find them at all here — the provision names none.
+// TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback preserves the
+// historical fallback contract through exact captured cleanup. Containers are
+// discovered by the failed receipt's labels; the provision names none.
 func TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback(t *testing.T) {
 	var removed []string
 	mock := &mockDockerClient{
@@ -4184,7 +4238,6 @@ func TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback(t *testin
 	b := newBackendForTest(mock, failedRestoreProvision())
 	rs := attachRetentionStore(t, b)
 	bindRetentionOrphanPrunerForTest(t, b)
-	b.compose = failingDown()
 
 	var renames [][2]string
 	b.volumes = &mockVolumeManager{
@@ -4198,11 +4251,13 @@ func TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback(t *testin
 	e := restoringEntryFixture()
 	e = *putRestoringRetention(t, rs, e)
 	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	attempts := bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.NoError(t, b.reconcileRestoring(context.Background(), e))
+	assert.Equal(t, []string{"c-restore-0"}, attempts())
 
 	assert.Equal(t, []string{"c-restore-0"}, removed,
-		"the fallback must reap the crashed restore's containers, which the provision does not name")
+		"exact captured cleanup must reap the crashed restore's containers, which the provision does not name")
 	assert.Equal(t, [][2]string{{
 		canonicalVolumeName("22222222-2222-4222-8222-222222222222", manifest.DefaultServiceName, 0),
 		retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0)),
@@ -4238,7 +4293,6 @@ func TestReconcileRestoring_TeardownFails_LeavesRecordRestoring(t *testing.T) {
 	}
 	b := newBackendForTest(mock, failedRestoreProvision())
 	rs := attachRetentionStore(t, b)
-	b.compose = failingDown()
 
 	// The restore's live allocation, which the rollback would normally hand back.
 	require.NoError(t, b.pool.TryAllocate("22222222-2222-4222-8222-222222222222-"+manifest.DefaultServiceName+"-0", "docker-small", "tenant-a"))
@@ -4247,8 +4301,10 @@ func TestReconcileRestoring_TeardownFails_LeavesRecordRestoring(t *testing.T) {
 	e := restoringEntryFixture()
 	e = *putRestoringRetention(t, rs, e)
 	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	attempts := bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.ErrorContains(t, b.reconcileRestoring(context.Background(), e), "device or resource busy")
+	assert.Equal(t, []string{"c-stuck"}, attempts(), "the exact removal failure must cause the retained source and allocation")
 
 	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
@@ -4288,7 +4344,6 @@ func TestReconcileRestoring_TeardownFails_DoesNotRequarantine(t *testing.T) {
 	b := newBackendForTest(mock, failedRestoreProvision())
 	rs := attachRetentionStore(t, b)
 	bindRetentionOrphanPrunerForTest(t, b)
-	b.compose = failingDown()
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(old, new string) error {
 			t.Errorf("must not re-quarantine while a container may still hold the volume: %q -> %q", old, new)
@@ -4299,14 +4354,15 @@ func TestReconcileRestoring_TeardownFails_DoesNotRequarantine(t *testing.T) {
 	e := restoringEntryFixture()
 	e = *putRestoringRetention(t, rs, e)
 	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	attempts := bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.ErrorContains(t, b.reconcileRestoring(context.Background(), e), "device or resource busy")
+	assert.Equal(t, []string{"c-stuck"}, attempts(), "the exact removal failure must cause the retained source and allocation")
 }
 
 // TestReconcileRestoring_TeardownDiscoveryFails_LeavesRecordRestoring: an unreadable
 // daemon is not evidence of a clean host, so it must be treated exactly like a stuck
-// container. RemoveContainerFn is left nil so the mock panics if anything is removed
-// off a listing that could not be read.
+// container. The fixture forbids removal from an inventory that could not be read.
 func TestReconcileRestoring_TeardownDiscoveryFails_LeavesRecordRestoring(t *testing.T) {
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
@@ -4315,13 +4371,14 @@ func TestReconcileRestoring_TeardownDiscoveryFails_LeavesRecordRestoring(t *test
 	}
 	b := newBackendForTest(mock, failedRestoreProvision())
 	rs := attachRetentionStore(t, b)
-	b.compose = failingDown()
 
 	e := restoringEntryFixture()
 	e = *putRestoringRetention(t, rs, e)
 	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	attempts := bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.ErrorContains(t, b.reconcileRestoring(context.Background(), e), "daemon unreachable")
+	assert.Empty(t, attempts(), "an unreadable inventory cannot authorize removal")
 
 	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
@@ -4346,9 +4403,6 @@ func TestReconcileRestoring_TeardownFails_ThenSucceeds_RestoreStaysClaimable(t *
 	removalWorks := false
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
-			if removalWorks {
-				return nil, nil // compose's own teardown finally took effect
-			}
 			return []ContainerInfo{managedContainer("c-stuck", "22222222-2222-4222-8222-222222222222")}, nil
 		},
 		RemoveContainerFn: func(_ context.Context, _ string) error {
@@ -4361,7 +4415,6 @@ func TestReconcileRestoring_TeardownFails_ThenSucceeds_RestoreStaysClaimable(t *
 	b := newBackendForTest(mock, failedRestoreProvision())
 	rs := attachRetentionStore(t, b)
 	bindRetentionOrphanPrunerForTest(t, b)
-	b.compose = failingDown()
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(_, _ string) error { return nil },
 		UsageFn:        func(context.Context, string) (int64, error) { return 0, nil },
@@ -4370,9 +4423,11 @@ func TestReconcileRestoring_TeardownFails_ThenSucceeds_RestoreStaysClaimable(t *
 	e := restoringEntryFixture()
 	e = *putRestoringRetention(t, rs, e)
 	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	attempts := bindExactRestoreCleanupFixture(t, b, e)
 
 	// Sweep 1: daemon is broken. The rollback must not half-complete.
-	require.Error(t, b.runRetentionSweep(context.Background()))
+	require.ErrorContains(t, b.runRetentionSweep(context.Background()), "device or resource busy")
+	assert.Equal(t, []string{"c-stuck"}, attempts())
 	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry, "the record must survive — it is the only pointer to the data")
@@ -4387,6 +4442,7 @@ func TestReconcileRestoring_TeardownFails_ThenSucceeds_RestoreStaysClaimable(t *
 	// Sweep 2: daemon recovered. The retry finishes the rollback it deferred.
 	removalWorks = true
 	require.NoError(t, b.runRetentionSweep(context.Background()))
+	assert.Equal(t, []string{"c-stuck", "c-stuck"}, attempts(), "the retry must actually remove the previously busy exact target")
 
 	entry, err = rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
@@ -4420,7 +4476,6 @@ func TestReconcileRestoring_TeardownFails_RecordNotReapable(t *testing.T) {
 	}
 	b := newBackendForTest(mock, failedRestoreProvision())
 	rs := attachRetentionStore(t, b)
-	b.compose = failingDown()
 	b.cfg.RetentionMaxAge = time.Nanosecond // everything is expired
 	b.volumes = &mockVolumeManager{
 		DestroyFn: func(_ context.Context, id string) error {
@@ -4433,8 +4488,10 @@ func TestReconcileRestoring_TeardownFails_RecordNotReapable(t *testing.T) {
 	e.CreatedAt = time.Now().Add(-100 * 24 * time.Hour)
 	e = *putRestoringRetention(t, rs, e)
 	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	attempts := bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.ErrorContains(t, b.reconcileRestoring(context.Background(), e), "busy")
+	assert.Equal(t, []string{"c-stuck"}, attempts(), "the exact removal failure must cause the retained source and allocation")
 
 	n, err := b.reapExpiredRetentions(context.Background())
 	require.NoError(t, err)

@@ -73,6 +73,7 @@ type DaemonSecurityInfo struct {
 
 // ContainerInfo holds information about a managed container.
 type ContainerInfo struct {
+	execution            *compensationContainerRecord
 	ContainerID          string
 	LeaseUUID            string
 	Tenant               string
@@ -118,9 +119,10 @@ type ContainerInfo struct {
 // surface it as a free-form string and copying that semantics here keeps
 // callers from caring about which API shape they're consuming.
 type ContainerMount struct {
-	Source string
-	Target string
-	Type   string // "bind" | "volume" | "tmpfs"
+	Source   string
+	Target   string
+	Type     string // "bind" | "volume" | "tmpfs"
+	ReadOnly bool
 }
 
 // PortBinding represents a port mapping.
@@ -134,6 +136,7 @@ type DockerClient struct {
 	client      dockerSDKView
 	images      *imageexec.Admitter
 	creator     *imageexec.DockerCreator
+	inspections *imageInspectionCoordinator
 	backendName string
 }
 
@@ -215,7 +218,7 @@ func (d *DockerClient) AdmitImage(ctx context.Context, reference string) (imagee
 // Numeric UID/GID values are parsed directly. Non-numeric usernames are
 // resolved by reading /etc/passwd (and optionally /etc/group) from a
 // temporary container created from the image.
-func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName imageexec.Image, userOverride string) (uid, gid int, err error) {
+func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName imageexec.Image, userOverride string, origin shared.ImageInspectionOrigin) (uid, gid int, err error) {
 	userStr := userOverride
 	if userStr == "" {
 		userStr = imageName.User()
@@ -238,7 +241,7 @@ func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName imageexec
 			return numUID, numGID, nil
 		}
 		// Group is a name — need to read /etc/group from the image.
-		gidResolved, err := d.resolveGroupFromImage(ctx, imageName, group)
+		gidResolved, err := d.resolveGroupFromImage(ctx, imageName, group, origin)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -246,7 +249,7 @@ func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName imageexec
 	}
 
 	// Username is non-numeric — read /etc/passwd from the image.
-	passwdUID, passwdGID, err := d.resolveUserFromImage(ctx, imageName, user)
+	passwdUID, passwdGID, err := d.resolveUserFromImage(ctx, imageName, user, origin)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -260,7 +263,7 @@ func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName imageexec
 	if gidErr == nil {
 		return passwdUID, numGID, nil
 	}
-	gidResolved, err := d.resolveGroupFromImage(ctx, imageName, group)
+	gidResolved, err := d.resolveGroupFromImage(ctx, imageName, group, origin)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -269,8 +272,8 @@ func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName imageexec
 
 // resolveUserFromImage reads /etc/passwd from a temporary container to resolve
 // a username to UID/GID.
-func (d *DockerClient) resolveUserFromImage(ctx context.Context, imageName imageexec.Image, username string) (uid, gid int, err error) {
-	data, err := d.readFileFromImage(ctx, imageName, "/etc/passwd")
+func (d *DockerClient) resolveUserFromImage(ctx context.Context, imageName imageexec.Image, username string, origin shared.ImageInspectionOrigin) (uid, gid int, err error) {
+	data, err := d.readFileFromImage(ctx, imageName, "/etc/passwd", origin)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to read /etc/passwd from image %s: %w", imageName.Reference(), err)
 	}
@@ -279,37 +282,23 @@ func (d *DockerClient) resolveUserFromImage(ctx context.Context, imageName image
 
 // resolveGroupFromImage reads /etc/group from a temporary container to resolve
 // a group name to GID.
-func (d *DockerClient) resolveGroupFromImage(ctx context.Context, imageName imageexec.Image, groupName string) (int, error) {
-	data, err := d.readFileFromImage(ctx, imageName, "/etc/group")
+func (d *DockerClient) resolveGroupFromImage(ctx context.Context, imageName imageexec.Image, groupName string, origin shared.ImageInspectionOrigin) (int, error) {
+	data, err := d.readFileFromImage(ctx, imageName, "/etc/group", origin)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read /etc/group from image %s: %w", imageName.Reference(), err)
 	}
 	return parseGroupForName(strings.NewReader(string(data)), groupName)
 }
 
-// createImageInspectionContainer consumes the same admitted image as the workload.
-func (d *DockerClient) createImageInspectionContainer(ctx context.Context, image imageexec.Image) (container.CreateResponse, error) {
-	return d.creator.Create(ctx, image, &container.Config{}, nil, nil, "")
-}
-
-// readFileFromImage creates a temporary container (never started), extracts a
-// file via CopyFromContainer, and removes the container.
-func (d *DockerClient) readFileFromImage(ctx context.Context, imageName imageexec.Image, path string) ([]byte, error) {
-	resp, err := d.createImageInspectionContainer(ctx, imageName)
+// readFileFromImage creates an owned, never-started inspection session. Its
+// cleanup budget is independent of this work context and survives via the journal.
+func (d *DockerClient) readFileFromImage(ctx context.Context, imageName imageexec.Image, path string, origin shared.ImageInspectionOrigin) (data []byte, err error) {
+	session, err := d.openImageInspection(ctx, imageName, origin)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temp container: %w", err)
+		return nil, fmt.Errorf("open image inspection: %w", err)
 	}
-	defer func() {
-		// Keep cleanup under the authorized mutation lifetime. A canceled backend
-		// must never issue a late removal against a replacement daemon. Cleanup
-		// is best-effort: helpers need durable ownership before startup recovery
-		// can safely reclaim those left by a timeout or process exit.
-		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true})
-	}()
-
-	return readFileFromContainer(ctx, d.client, resp.ID, path)
+	defer func() { err = errors.Join(err, session.close()) }()
+	return session.readFile(ctx, path)
 }
 
 // DetectVolumeOwner inspects the ownership of VOLUME directories inside an
@@ -317,24 +306,20 @@ func (d *DockerClient) readFileFromImage(ctx context.Context, imageName imageexe
 // headers from CopyFromContainer. If all volume paths share the same non-root
 // UID:GID, those values are returned. If the paths have mixed ownership, are
 // owned by root, or a path doesn't exist, (0, 0, nil) is returned.
-func (d *DockerClient) DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string) (uid, gid int, err error) {
+func (d *DockerClient) DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string, origin shared.ImageInspectionOrigin) (uid, gid int, err error) {
 	if len(volumePaths) == 0 {
 		return 0, 0, nil
 	}
 
-	resp, err := d.createImageInspectionContainer(ctx, imageName)
+	session, err := d.openImageInspection(ctx, imageName, origin)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to create temp container for volume owner detection: %w", err)
 	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true}) // reap image VOLUME anon volumes (ENG-372)
-	}()
+	defer func() { err = errors.Join(err, session.close()) }()
 
 	firstUID, firstGID := -1, -1
 	for _, volPath := range volumePaths {
-		rc, _, copyErr := d.client.CopyFromContainer(ctx, resp.ID, volPath)
+		rc, _, copyErr := session.copy(ctx, volPath)
 		if copyErr != nil {
 			if errdefs.IsNotFound(copyErr) {
 				// Path genuinely doesn't exist in image.
@@ -387,28 +372,23 @@ const maxTarEntriesPerParent = 500
 // depth-1 subdirectories owned by uid. When uid is 0 (root image), it matches
 // directories owned by any non-root user — this handles images like neo4j that
 // run as root but chown directories to a service user during build.
-func (d *DockerClient) DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string) ([]string, error) {
+func (d *DockerClient) DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string, origin shared.ImageInspectionOrigin) (paths []string, err error) {
 	if len(candidateParents) == 0 {
 		return nil, nil
 	}
 
-	resp, err := d.createImageInspectionContainer(ctx, imageName)
+	session, err := d.openImageInspection(ctx, imageName, origin)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp container for writable path detection: %w", err)
 	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true}) // reap image VOLUME anon volumes (ENG-372)
-	}()
+	defer func() { err = errors.Join(err, session.close()) }()
 
-	var paths []string
 	for _, parent := range candidateParents {
 		if len(paths) >= maxDetectedWritablePaths {
 			break
 		}
 
-		rc, _, copyErr := d.client.CopyFromContainer(ctx, resp.ID, parent)
+		rc, _, copyErr := session.copy(ctx, parent)
 		if copyErr != nil {
 			if !errdefs.IsNotFound(copyErr) {
 				// Non-"not found" errors (daemon unreachable, context canceled, etc.)
@@ -500,13 +480,13 @@ func writablePathExtractDirContext(ctx context.Context, destDir, sanitized strin
 //
 // Returns nil on full success, or a map of path → error for failures.
 // Callers should log failures but not fail the provision (graceful degradation).
-func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error {
+func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64, origin shared.ImageInspectionOrigin) (failures map[string]error) {
 	if len(paths) == 0 {
 		return nil
 	}
 
 	// Create a temp container from the image to read original content.
-	resp, err := d.createImageInspectionContainer(ctx, imageName)
+	session, err := d.openImageInspection(ctx, imageName, origin)
 	if err != nil {
 		// All paths fail with the same error.
 		failures := make(map[string]error, len(paths))
@@ -516,15 +496,19 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName imagee
 		return failures
 	}
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true}) // reap image VOLUME anon volumes (ENG-372)
+		if cleanupErr := session.close(); cleanupErr != nil {
+			if failures == nil {
+				failures = make(map[string]error)
+			}
+			for _, path := range paths {
+				failures[path] = errors.Join(failures[path], cleanupErr)
+			}
+		}
 	}()
 
-	var failures map[string]error
 	remainingBytes := maxBytes
 	for _, path := range paths {
-		rc, _, copyErr := d.client.CopyFromContainer(ctx, resp.ID, path)
+		rc, _, copyErr := session.copy(ctx, path)
 		if copyErr != nil {
 			if errdefs.IsNotFound(copyErr) {
 				continue // Path doesn't exist in image — skip
@@ -1669,11 +1653,14 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 	// volumes that need renaming).
 	for _, m := range resp.Mounts {
 		info.Mounts = append(info.Mounts, ContainerMount{
-			Source: m.Source,
-			Target: m.Destination,
-			Type:   string(m.Type),
+			Source:   m.Source,
+			Target:   m.Destination,
+			Type:     string(m.Type),
+			ReadOnly: !m.RW,
 		})
 	}
+
+	info.execution = snapshotCompensationContainer(resp, info.Mounts)
 
 	// Extract port bindings
 	for port, bindings := range resp.NetworkSettings.Ports {
@@ -1794,9 +1781,10 @@ func (d *DockerClient) listManagedContainers(
 		// MountPoint inline, no extra Inspect round-trip needed at startup).
 		for _, m := range c.Mounts {
 			info.Mounts = append(info.Mounts, ContainerMount{
-				Source: m.Source,
-				Target: m.Destination,
-				Type:   string(m.Type),
+				Source:   m.Source,
+				Target:   m.Destination,
+				Type:     string(m.Type),
+				ReadOnly: !m.RW,
 			})
 		}
 

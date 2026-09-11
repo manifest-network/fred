@@ -930,6 +930,14 @@ func applyLeaseMutationTx(
 	if err := applyLeaseMutationTransitionEffectsTx(tx, transition); err != nil {
 		return nil, err
 	}
+	if previous, ok := current.(maintenanceLeaseMutationHead); ok {
+		successor, stillMaintenance := next.(maintenanceLeaseMutationHead)
+		if !stillMaintenance || successor.claim.MaintenanceID() != previous.claim.MaintenanceID() {
+			if err := deleteCompensationTx(tx, previous.claim); err != nil {
+				return nil, err
+			}
+		}
+	}
 	// A successful close permanently rejects every future mutation for this
 	// UUID and leaves its own cleanup receipt below. Historical operation IDs no
 	// longer need individual replay fences: the closed head is the stronger

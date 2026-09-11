@@ -42,6 +42,7 @@ type dockerReadClient interface {
 	ContainerLogs(ctx context.Context, containerID string, tail int) (string, error)
 	ListManagedContainers(ctx context.Context) ([]ContainerInfo, error)
 	ListManagedContainersStrict(ctx context.Context) ([]ContainerInfo, error)
+	ListVolumeWriters(context.Context) ([]ContainerInfo, error)
 	ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error)
 	ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error)
 }
@@ -52,17 +53,17 @@ type dockerReadClient interface {
 type dockerMutationSink interface {
 	AdmitImage(context.Context, string) (imageexec.Image, error)
 	PullImage(ctx context.Context, imageName string, timeout time.Duration) error
-	ResolveImageUser(ctx context.Context, imageName imageexec.Image, userOverride string) (uid, gid int, err error)
-	CreateContainer(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
+	ResolveImageUser(ctx context.Context, imageName imageexec.Image, userOverride string, origin shared.ImageInspectionOrigin) (uid, gid int, err error)
 	StartContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	StopContainer(ctx context.Context, containerID string, timeout time.Duration) error
-	RenameContainer(ctx context.Context, containerID string, newName string) error
 	RemoveContainer(ctx context.Context, containerID string) error
 	EnsureTenantNetwork(ctx context.Context, tenant string) (string, error)
 	RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error
-	DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string) (uid, gid int, err error)
-	DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string) ([]string, error)
-	ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error
+	DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string, origin shared.ImageInspectionOrigin) (uid, gid int, err error)
+	DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string, origin shared.ImageInspectionOrigin) ([]string, error)
+	ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64, origin shared.ImageInspectionOrigin) map[string]error
+	createCompensationContainer(context.Context, imageexec.Image, compensationContainer) (string, error)
+	readmitCompensationImage(context.Context, compensationContainerRecord) (imageexec.Image, error)
 }
 
 // dockerClient is the construction boundary implemented by DockerClient and
@@ -229,6 +230,7 @@ type Backend struct {
 	// tenant-network rule above. Neither holder takes provisionsMu on entry,
 	// and a volume stripe is never held across a tenant-network acquisition.
 	volumeNameStripes [volumeNameStripeCount]sync.Mutex
+	volumeAccess      volumeAccessCoordinator
 
 	// recoverMu serializes recoverState calls. The reconcile loop and
 	// external RefreshState (called by Fred's reconciler) both invoke
@@ -260,7 +262,10 @@ type Backend struct {
 	commandFence shared.CommandFence
 
 	// diagnosticsStore persists failure diagnostics in bbolt
-	diagnosticsStore *shared.DiagnosticsStore
+	diagnosticsStore        *shared.DiagnosticsStore
+	failureDiagnostics      *shared.FailureDiagnostics
+	imageInspectionRecovery func(context.Context) error
+	volumeLaunches          *volumeLaunchCoordinator
 
 	// releaseStore persists release history in bbolt
 	releaseStore          *shared.ReleaseStore
@@ -534,7 +539,7 @@ func (b *Backend) persistDiagnosticsContext(
 	containerIDs []string,
 	containerKeys ...map[string]string,
 ) {
-	if b.diagnosticsStore == nil {
+	if b.failureDiagnostics == nil {
 		return
 	}
 	// Guard against zero-value entries reaching the store: callers that
@@ -555,28 +560,7 @@ func (b *Backend) persistDiagnosticsContext(
 	if logs := b.captureContainerLogsContext(ctx, containerIDs, keys); logs != nil {
 		entry.Logs = logs
 	}
-	if err := b.diagnosticsStore.Store(entry); err != nil {
-		b.logger.Warn("failed to persist failure diagnostics",
-			"lease_uuid", entry.LeaseUUID, "error", err)
-	}
-}
-
-// persistDiagnosticsWithLogs saves pre-captured logs to the diagnostics
-// store. Used by failure-path workers that capture logs before cleanup
-// (when the containers are about to be removed). The entry's Logs field
-// is set from the supplied map, bypassing the re-fetch path.
-func (b *Backend) persistDiagnosticsWithLogs(entry shared.DiagnosticEntry, logs map[string]string) {
-	if b.diagnosticsStore == nil {
-		return
-	}
-	// See persistDiagnostics for rationale — skip zero-value entries.
-	if entry.LeaseUUID == "" {
-		return
-	}
-	if len(logs) > 0 {
-		entry.Logs = logs
-	}
-	if err := b.diagnosticsStore.Store(entry); err != nil {
+	if err := b.failureDiagnostics.StoreRuntime(entry); err != nil {
 		b.logger.Warn("failed to persist failure diagnostics",
 			"lease_uuid", entry.LeaseUUID, "error", err)
 	}
@@ -2269,6 +2253,19 @@ func newBackend(
 		// the zero value is ready to use (N unlocked sync.Mutexes).
 	}
 
+	// Once every resource exists, constructor failure has a single cleanup
+	// owner. Adding another required binding cannot leak journals or the client.
+	defer func() {
+		if !constructionComplete {
+			stopCancel()
+			_ = cbStore.Close()
+			_ = diagStore.Close()
+			_ = releaseStore.Close()
+			_ = retentionStore.Close()
+			_ = docker.Close()
+		}
+	}()
+
 	// Pre-initialize the orphan-skip counter series to 0 (ENG-370): the reason
 	// set is closed and known, so alert queries see 0 instead of no-data before
 	// the first skip event.
@@ -2277,23 +2274,30 @@ func newBackend(
 	}
 
 	b.storageVerifier = productionDockerStorageIdentityVerifier{backend: b, authority: storage}
+	b.failureDiagnostics, err = shared.NewFailureDiagnostics(diagStore, operationSettlement, maintenanceSettlement)
+	if err != nil {
+		return nil, fmt.Errorf("bind failed-attempt diagnostics: %w", err)
+	}
+	inspectionOwner, err := newImageInspectionCoordinator(docker, cbStore, stopCtx,
+		b.authorizeStorageMutation, b.completeStorageMutation, b.resolveBackgroundStorageStep, b.terminalStorageAuthorityError)
+	if err != nil {
+		return nil, fmt.Errorf("bind image inspection ownership: %w", err)
+	}
+	b.imageInspectionRecovery = func(ctx context.Context) error { return inspectionOwner.RecoverAndReport(ctx, b.logger) }
+	b.volumeLaunches, err = newVolumeLaunchCoordinator(cbStore)
+	if err != nil {
+		return nil, fmt.Errorf("bind physical volume launch journal: %w", err)
+	}
 	b.orphanPruner, err = newRetentionOrphanPruner(b)
 	if err != nil {
-		_ = cbStore.Close()
-		_ = diagStore.Close()
-		_ = releaseStore.Close()
-		_ = retentionStore.Close()
-		_ = docker.Close()
 		return nil, fmt.Errorf("bind retention orphan pruner: %w", err)
 	}
 	mutationOperations := newStorageMutationOperations(b, docker, composeSvc, volumes)
+	if err := bindDockerMaintenanceCompensation(b, mutationOperations); err != nil {
+		return nil, fmt.Errorf("bind maintenance compensation: %w", err)
+	}
 	b.backgroundMaintenance, err = newBackgroundMaintenanceCoordinator(b, mutationOperations)
 	if err != nil {
-		_ = cbStore.Close()
-		_ = diagStore.Close()
-		_ = releaseStore.Close()
-		_ = retentionStore.Close()
-		_ = docker.Close()
 		return nil, fmt.Errorf("bind background substrate maintenance: %w", err)
 	}
 	err = shared.BindOperationSubstrateExecutor(
@@ -2305,11 +2309,6 @@ func newBackend(
 		b.classifyOperationPhysical,
 	)
 	if err != nil {
-		_ = cbStore.Close()
-		_ = diagStore.Close()
-		_ = releaseStore.Close()
-		_ = retentionStore.Close()
-		_ = docker.Close()
 		return nil, fmt.Errorf("bind operation substrate mutation authority: %w", err)
 	}
 	err = shared.BindMaintenanceSubstrateExecutor(
@@ -2321,11 +2320,6 @@ func newBackend(
 		b.classifyMaintenancePhysical,
 	)
 	if err != nil {
-		_ = cbStore.Close()
-		_ = diagStore.Close()
-		_ = releaseStore.Close()
-		_ = retentionStore.Close()
-		_ = docker.Close()
 		return nil, fmt.Errorf("bind maintenance substrate mutation authority: %w", err)
 	}
 	err = shared.BindCloseSubstrateExecutor(
@@ -2337,11 +2331,6 @@ func newBackend(
 		b.classifyClosePhysical,
 	)
 	if err != nil {
-		_ = cbStore.Close()
-		_ = diagStore.Close()
-		_ = releaseStore.Close()
-		_ = retentionStore.Close()
-		_ = docker.Close()
 		return nil, fmt.Errorf("bind close substrate mutation authority: %w", err)
 	}
 	b.recoveryCoordinator, err = shared.NewRecoveryCoordinator(shared.RecoveryCoordinatorConfig{
@@ -2350,11 +2339,6 @@ func newBackend(
 		ValidateActorClose: b.validateActorCloseScope,
 	})
 	if err != nil {
-		_ = cbStore.Close()
-		_ = diagStore.Close()
-		_ = releaseStore.Close()
-		_ = retentionStore.Close()
-		_ = docker.Close()
 		return nil, fmt.Errorf("bind lease recovery authority: %w", err)
 	}
 	callbackStorageAttestor, err := shared.NewCallbackStorageAttestor(
@@ -2363,11 +2347,6 @@ func newBackend(
 		b.stopCtx,
 	)
 	if err != nil {
-		_ = cbStore.Close()
-		_ = diagStore.Close()
-		_ = releaseStore.Close()
-		_ = retentionStore.Close()
-		_ = docker.Close()
 		return nil, fmt.Errorf("bind callback storage attestor: %w", err)
 	}
 
@@ -2389,11 +2368,6 @@ func newBackend(
 		},
 	})
 	if err != nil {
-		_ = cbStore.Close()
-		_ = diagStore.Close()
-		_ = releaseStore.Close()
-		_ = retentionStore.Close()
-		_ = docker.Close()
 		return nil, fmt.Errorf("configure durable callback sender: %w", err)
 	}
 	b.callbackSender = callbackSender
@@ -2407,14 +2381,12 @@ func newBackend(
 		},
 	})
 	if err != nil {
-		_ = cbStore.Close()
-		_ = diagStore.Close()
-		_ = releaseStore.Close()
-		_ = retentionStore.Close()
-		_ = docker.Close()
 		return nil, fmt.Errorf("configure callback publisher: %w", err)
 	}
-	b.callbackPublisher = callbackPublisher
+	b.callbackPublisher, err = newDiagnosticCallbackPublisher(callbackPublisher, b.failureDiagnostics)
+	if err != nil {
+		return nil, fmt.Errorf("bind failure diagnostic publication: %w", err)
+	}
 
 	// Wire the substrate-agnostic seams the lease state machine consumes.
 	// Each adapter is a thin pass-through to the existing Docker-specific
@@ -2484,6 +2456,9 @@ func (b *Backend) Start(ctx context.Context) error {
 	// legitimately take longer. stopCtx cancellation still ends the whole pass.
 	startupCtx, cancelStartup := b.startupRecoveryContext()
 	defer cancelStartup()
+	if err := b.imageInspectionRecovery(startupCtx); err != nil {
+		return fmt.Errorf("recover image inspection helpers: %w", err)
+	}
 
 	// Manager-private mutation evidence is structurally safe to inspect but is
 	// not a bind-ready tenant volume. New() has already opened the identity-bound

@@ -12,6 +12,7 @@ package docker
 // capabilities directly.
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -20,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	composetypes "github.com/compose-spec/compose-go/v2/types"
+	"github.com/containerd/errdefs"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -89,6 +90,11 @@ func newBackgroundMaintenanceCoordinator(
 		)
 		return backend.resolveBackgroundStorageStep(operation, result)
 	}
+	performVolume := func(ctx context.Context, names []string, operation string, action func(context.Context) error) error {
+		return backend.mutateManagedVolumeNamespace(ctx, names, func(ctx context.Context) error {
+			return perform(ctx, operation, action)
+		})
+	}
 
 	removeContainer := backgroundContainerRemove(func(ctx context.Context, id string) error {
 		return perform(ctx, "background remove container", func(ctx context.Context) error {
@@ -96,18 +102,18 @@ func newBackgroundMaintenanceCoordinator(
 		})
 	})
 	renameVolume := backgroundVolumeRename(func(ctx context.Context, oldName, newName string) error {
-		return perform(ctx, "background rename volume", func(ctx context.Context) error {
+		return performVolume(ctx, []string{oldName, newName}, "background rename volume", func(ctx context.Context) error {
 			return ops.volumes.RenameVolume(ctx, oldName, newName)
 		})
 	})
 	ensureVolumeQuota := backgroundVolumeQuota(func(ctx context.Context, id string, sizeMB int64) error {
-		return perform(ctx, "background ensure volume quota", func(ctx context.Context) error {
+		return performVolume(ctx, nil, "background ensure volume quota", func(ctx context.Context) error {
 			return ops.volumes.EnsureQuota(ctx, id, sizeMB)
 		})
 	})
 	destroyVolumes := backgroundVolumeDestroyCapability{
 		destroyFn: func(ctx context.Context, id string) error {
-			return perform(ctx, "background destroy volume", func(ctx context.Context) error {
+			return performVolume(ctx, []string{id}, "background destroy volume", func(ctx context.Context) error {
 				return ops.volumes.Destroy(ctx, id)
 			})
 		},
@@ -128,7 +134,7 @@ func newBackgroundMaintenanceCoordinator(
 
 	return &backgroundMaintenanceCoordinator{
 		recoverInterruptedVolumesFn: func(ctx context.Context) error {
-			return perform(ctx, "recover interrupted volume mutations", func(ctx context.Context) error {
+			return performVolume(ctx, nil, "recover interrupted volume mutations", func(ctx context.Context) error {
 				return ops.volumes.RecoverInterruptedVolumeMutations(ctx)
 			})
 		},
@@ -168,16 +174,21 @@ func newStorageMutationOperations(
 // the opaque Started subject; callers can choose an operation but cannot
 // substitute another lease, tenant, project, or canonical volume namespace.
 type storageMutations struct {
-	runner       substratemutation.Runner
-	ops          storageMutationOperations
-	leaseUUID    string
-	tenant       string
-	providerUUID string
-	callbackURL  string
-	lifecycleURL string
-	allowedLease map[string]struct{}
-	predecessor  *shared.Release
-	cleanupOnly  bool
+	compensationSubject shared.MaintenanceCompensationSubject
+	runner              substratemutation.Runner
+	ops                 storageMutationOperations
+	leaseUUID           string
+	tenant              string
+	providerUUID        string
+	callbackURL         string
+	lifecycleURL        string
+	allowedLease        map[string]struct{}
+	predecessor         *shared.Release
+	cleanupOnly         bool
+	inspectionOrigin    shared.ImageInspectionOrigin
+	operationSubject    shared.OperationPhysicalSubject
+	closeSubject        shared.ClosePhysicalSubject
+	maintenanceSubject  shared.MaintenancePhysicalSubject
 }
 
 // exactOperationTeardown is the only raw container-teardown projection of a
@@ -248,6 +259,8 @@ func newOperationStorageMutations(
 		runner: runner, ops: ops, leaseUUID: subject.LeaseUUID(), tenant: tenant,
 		providerUUID: providerUUID, callbackURL: callbackURL,
 		lifecycleURL: lifecycleURL, allowedLease: allowed, predecessor: predecessor,
+		inspectionOrigin: shared.ImageInspectionForOperation(subject),
+		operationSubject: subject,
 	}
 }
 
@@ -274,11 +287,18 @@ func newMaintenanceStorageMutations(
 			}
 		}
 	}
+	var predecessor *shared.Release
+	if source, ok := subject.SourceRelease(); ok {
+		predecessor = &source
+	}
 	return &storageMutations{
 		runner: runner, ops: ops, leaseUUID: subject.LeaseUUID(), tenant: tenant,
 		providerUUID: providerUUID, callbackURL: callbackURL,
-		lifecycleURL: lifecycleURL,
-		allowedLease: map[string]struct{}{subject.LeaseUUID(): {}},
+		lifecycleURL:       lifecycleURL,
+		allowedLease:       map[string]struct{}{subject.LeaseUUID(): {}},
+		predecessor:        predecessor,
+		inspectionOrigin:   shared.ImageInspectionForMaintenance(subject),
+		maintenanceSubject: subject,
 	}
 }
 
@@ -315,7 +335,7 @@ func (m *storageMutations) admitImage(ctx context.Context, reference string) (ad
 
 func (m *storageMutations) resolveImageUser(ctx context.Context, image imageexec.Image, user string) (uid, gid int, err error) {
 	err = m.runner.Step(ctx, "inspect image user", func(ctx context.Context) error {
-		uid, gid, err = m.ops.docker.ResolveImageUser(ctx, image, user)
+		uid, gid, err = m.ops.docker.ResolveImageUser(ctx, image, user, m.inspectionOrigin)
 		return err
 	})
 	return uid, gid, err
@@ -323,7 +343,7 @@ func (m *storageMutations) resolveImageUser(ctx context.Context, image imageexec
 
 func (m *storageMutations) detectVolumeOwner(ctx context.Context, image imageexec.Image, paths []string) (uid, gid int, err error) {
 	err = m.runner.Step(ctx, "inspect image volume owner", func(ctx context.Context) error {
-		uid, gid, err = m.ops.docker.DetectVolumeOwner(ctx, image, paths)
+		uid, gid, err = m.ops.docker.DetectVolumeOwner(ctx, image, paths, m.inspectionOrigin)
 		return err
 	})
 	return uid, gid, err
@@ -331,7 +351,7 @@ func (m *storageMutations) detectVolumeOwner(ctx context.Context, image imageexe
 
 func (m *storageMutations) detectWritablePaths(ctx context.Context, detection writablePathDetection) (paths []string, err error) {
 	err = m.runner.Step(ctx, "inspect image writable paths", func(ctx context.Context) error {
-		paths, err = m.ops.docker.DetectWritablePaths(ctx, detection.image, detection.uid, candidateWritableParents)
+		paths, err = m.ops.docker.DetectWritablePaths(ctx, detection.image, detection.uid, candidateWritableParents, m.inspectionOrigin)
 		return err
 	})
 	return paths, err
@@ -339,19 +359,6 @@ func (m *storageMutations) detectWritablePaths(ctx context.Context, detection wr
 
 func (m *storageMutations) effectEntered() bool {
 	return m != nil && m.runner.EffectEntered()
-}
-
-func (m *storageMutations) composeUp(ctx context.Context, project *composetypes.Project, images map[string]imageexec.Image, opts composeUpOpts) error {
-	if project == nil || project.Name != composeProjectName(m.leaseUUID) {
-		return fmt.Errorf("compose up project differs from Started lease %q", m.leaseUUID)
-	}
-	prepared, err := m.ops.compose.PrepareProject(project, images)
-	if err != nil {
-		return err
-	}
-	return m.runner.Step(ctx, "compose up", func(ctx context.Context) error {
-		return m.ops.compose.Up(ctx, prepared, opts)
-	})
 }
 
 func (m *storageMutations) composeDown(ctx context.Context, leaseUUID string, timeout time.Duration) error {
@@ -420,9 +427,11 @@ func (m *storageMutations) createVolume(ctx context.Context, id string, sizeMB i
 	if parseErr != nil || !m.volumeNameInScope(name) {
 		return "", false, fmt.Errorf("create volume target %q differs from Started subject", id)
 	}
-	err = m.runner.Step(ctx, "create volume", func(ctx context.Context) error {
-		path, created, err = m.ops.volumes.Create(ctx, id, sizeMB)
-		return err
+	err = m.ops.backend.mutateManagedVolumeNamespace(ctx, []string{id}, func(ctx context.Context) error {
+		return m.runner.Step(ctx, "create volume", func(ctx context.Context) error {
+			path, created, err = m.ops.volumes.Create(ctx, id, sizeMB)
+			return err
+		})
 	})
 	return path, created, err
 }
@@ -440,8 +449,10 @@ func (m *storageMutations) destroyVolume(ctx context.Context, id string) error {
 	if err != nil || !m.volumeNameInScope(name) {
 		return fmt.Errorf("destroy volume target %q differs from Started subject", id)
 	}
-	return m.runner.Step(ctx, "destroy volume", func(ctx context.Context) error {
-		return m.ops.volumes.Destroy(ctx, id)
+	return m.ops.backend.mutateManagedVolumeNamespace(ctx, []string{id}, func(ctx context.Context) error {
+		return m.runner.Step(ctx, "destroy volume", func(ctx context.Context) error {
+			return m.ops.volumes.Destroy(ctx, id)
+		})
 	})
 }
 
@@ -453,47 +464,325 @@ func (m *storageMutations) renameVolume(ctx context.Context, oldName, newName st
 	if oldErr != nil || newErr != nil || !m.volumeNameInScope(oldParsed) || !m.volumeNameInScope(newParsed) {
 		return fmt.Errorf("volume rename %q -> %q differs from Started subject", oldName, newName)
 	}
-	return m.runner.Step(ctx, "rename volume", func(ctx context.Context) error {
-		return m.ops.volumes.RenameVolume(ctx, oldName, newName)
+	return m.ops.backend.mutateManagedVolumeNamespace(ctx, []string{oldName, newName}, func(ctx context.Context) error {
+		return m.runner.Step(ctx, "rename volume", func(ctx context.Context) error {
+			return m.ops.volumes.RenameVolume(ctx, oldName, newName)
+		})
 	})
 }
 
-func (m *storageMutations) removePath(ctx context.Context, path string) error {
-	volume, err := writablePathVolumeComponent(m.ops.backend.cfg.VolumeDataPath, path)
-	if err != nil || !m.volumeNameInScope(volume) {
-		return fmt.Errorf("writable path target differs from Started subject: %w", err)
+func (v launchVolume) removeWritablePaths(ctx context.Context) error {
+	if err := v.requireActive(); err != nil {
+		return err
 	}
+	m := v.state.owner.mutations
 	return m.runner.Step(ctx, "remove managed writable path", func(ctx context.Context) error {
+		if err := v.requireActive(); err != nil {
+			return err
+		}
 		wp, err := parseStoragePathComponent(writablePathSubdir)
 		if err != nil {
 			return err
 		}
-		return removeManagedVolumeSubtree(m.ops.backend.cfg.VolumeDataPath, volume, wp)
+		return removeManagedVolumeSubtree(filepath.Dir(v.state.directory.Path()), v.state.name, wp)
 	})
 }
 
-func (m *storageMutations) extractImageContent(ctx context.Context, image imageexec.Image, paths []string, destination string, maxBytes, maxEntries int64) (failures map[string]error, err error) {
-	volume, scopeErr := writablePathVolumeComponent(m.ops.backend.cfg.VolumeDataPath, destination)
-	if scopeErr != nil || !m.volumeNameInScope(volume) {
-		return nil, fmt.Errorf("image extraction target differs from Started subject: %w", scopeErr)
+func (v launchVolume) extractImageContent(ctx context.Context, image imageexec.Image, paths []string, maxBytes, maxEntries int64) (failures map[string]error, err error) {
+	if err := v.requireActive(); err != nil {
+		return nil, err
 	}
+	m := v.state.owner.mutations
 	err = m.runner.Step(ctx, "extract image content", func(ctx context.Context) error {
-		failures = m.ops.docker.ExtractImageContent(ctx, image, paths, destination, maxBytes, maxEntries)
+		if err := v.requireActive(); err != nil {
+			return err
+		}
+		destination := filepath.Join(v.state.directory.Path(), writablePathSubdir)
+		failures = m.ops.docker.ExtractImageContent(ctx, image, paths, destination, maxBytes, maxEntries, m.inspectionOrigin)
 		return nil
 	})
 	return failures, err
 }
 
-func (m *storageMutations) prepareStatefulVolumeBinds(ctx context.Context, hostPath string, volumes []string, uid, gid int) (binds map[string]string, err error) {
-	name, parseErr := writablePathVolumeComponent(m.ops.backend.cfg.VolumeDataPath, filepath.Join(hostPath, writablePathSubdir))
-	if parseErr != nil || !m.volumeNameInScope(name) {
-		return nil, fmt.Errorf("stateful volume path differs from Started subject: %w", parseErr)
+func (v launchVolume) prepareStatefulVolumeBinds(ctx context.Context, volumes []string, uid, gid int) (binds map[string]string, err error) {
+	if err := v.requireActive(); err != nil {
+		return nil, err
 	}
+	m := v.state.owner.mutations
 	err = m.runner.Step(ctx, "prepare stateful volume binds", func(ctx context.Context) error {
-		binds, err = buildStatefulVolumeBindsContext(ctx, hostPath, volumes, uid, gid)
+		if err := v.requireActive(); err != nil {
+			return err
+		}
+		binds, err = buildStatefulVolumeBindsContext(ctx, v.state.directory.Path(), volumes, uid, gid)
 		return err
 	})
 	return binds, err
+}
+
+func (captured capturedCloseCohort) remove(ctx context.Context) ([]string, error) {
+	if captured.mutations == nil || !captured.mutations.closeSubject.Valid() || !captured.capture.Valid() {
+		return nil, errors.New("interrupted close removal requires durable captured evidence")
+	}
+	var remaining []string
+	err := captured.capture.RetainDuring(func() error {
+		// This closure exists only while the successful durable capture is
+		// retained. Close owns the entire lease namespace, including targets
+		// whose callback pair differs from the surviving source generation.
+		mutations := captured.mutations
+		retire := func(expected ContainerInfo) error {
+			return mutations.runner.Step(ctx, "retire captured close container", func(mutationCtx context.Context) error {
+				if expected.ContainerID == "" || expected.LeaseUUID != mutations.closeSubject.LeaseUUID() ||
+					expected.BackendName != mutations.ops.backend.Name() {
+					return errors.New("captured close container differs from the bound close subject")
+				}
+				current, err := mutations.ops.backend.docker.InspectContainer(mutationCtx, expected.ContainerID)
+				if err != nil {
+					return fmt.Errorf("reattest captured close container: %w", err)
+				}
+				if current == nil || current.ContainerID != expected.ContainerID || current.LeaseUUID != expected.LeaseUUID ||
+					current.BackendName != expected.BackendName || current.Tenant != expected.Tenant ||
+					current.ProviderUUID != expected.ProviderUUID || current.CallbackURL != expected.CallbackURL ||
+					current.LifecycleCallbackURL != expected.LifecycleCallbackURL || current.MaintenanceID != expected.MaintenanceID {
+					return errors.New("captured close container authority changed before retirement")
+				}
+				stopTimeout := cmp.Or(mutations.ops.backend.cfg.ContainerStopTimeout, 30*time.Second)
+				stopCtx, cancel := context.WithTimeout(mutationCtx, stopTimeout)
+				stopErr := mutations.ops.docker.StopContainer(stopCtx, expected.ContainerID, stopTimeout)
+				cancel()
+				if err := mutationCtx.Err(); err != nil {
+					return errors.Join(stopErr, err)
+				}
+				// A failed graceful stop still permits forced removal of this exact
+				// captured container, as the existing Compose teardown fallback does.
+				// Keep both inside one guarded step so a successful fallback converges.
+				if stopErr != nil {
+					mutations.ops.backend.logger.Warn("graceful captured close stop failed; removing container",
+						"lease_uuid", expected.LeaseUUID, "container_id", expected.ContainerID, "error", stopErr)
+				}
+				return mutations.ops.docker.RemoveContainer(mutationCtx, expected.ContainerID)
+			})
+		}
+		var errs []error
+		for _, container := range captured.containers {
+			if err := retire(container); err != nil {
+				remaining = append(remaining, container.ContainerID)
+				errs = append(errs, err)
+			}
+		}
+		return errors.Join(errs...)
+	})
+	return remaining, err
+}
+
+// launchCompensation consumes the complete frozen source plan through the
+// same volume exclusion boundary as Compose. Neither raw frozen bind strings
+// nor an admitted image alone provide an independent create/start API.
+func (m *storageMutations) launchCompensation(ctx context.Context, plan compensationLaunchPlan) error {
+	if m == nil || !plan.Subject.Valid() || m.compensationSubject != plan.Subject || len(plan.Containers) == 0 {
+		return errors.New("source launch requires exact compensation authority")
+	}
+	b := m.ops.backend
+	schedule, err := orderCompensationContainers(plan)
+	if err != nil {
+		return err
+	}
+	paths := make(map[string]string, len(plan.VolumeRoots))
+	expected := make(map[string]fsidentity.Identity, len(plan.VolumeRoots))
+	for _, volume := range plan.VolumeRoots {
+		if _, duplicate := expected[volume.Name]; duplicate || !volume.Identity.Valid() {
+			return errors.New("source plan contains invalid or duplicate volume authority")
+		}
+		paths[volume.Name] = b.volumes.HostPath(volume.Name)
+		expected[volume.Name] = volume.Identity
+	}
+	q, err := b.quiesceLaunchVolumes(ctx, m, paths, nil, expected)
+	if err != nil {
+		return err
+	}
+	defer q.release()
+	project, err := compensationMountProject(plan.Containers)
+	if err != nil {
+		return err
+	}
+	if err := q.prepareCompensationBinds(ctx, plan); err != nil {
+		return err
+	}
+	if err := q.validateProject(project); err != nil {
+		return err
+	}
+	if err := b.retireCompensationSource(ctx, m, plan.Subject); err != nil {
+		return err
+	}
+	var completion volumeLaunchCompletion
+	var completed substratemutation.CompletedStep
+	created := make(map[string][]string)
+	byName := make(map[string]string)
+	for index, snapshot := range schedule.containers {
+		var id string
+		if index == 0 {
+			id, completion, completed, err = b.volumeLaunches.sourceFirst(ctx, q, snapshot)
+		} else {
+			completed, err = m.runner.StepCompleted(ctx, shared.MaintenanceSourceLaunchStep, func(ctx context.Context) error {
+				if err := q.requireActive(); err != nil {
+					return err
+				}
+				var err error
+				id, err = m.ops.docker.createCompensationContainer(ctx, snapshot.Image, snapshot)
+				return err
+			})
+		}
+		if err != nil {
+			return err
+		}
+		if id == "" {
+			return errors.New("source create returned no exact container identity")
+		}
+		created[snapshot.Config.Labels[LabelServiceName]] = append(created[snapshot.Config.Labels[LabelServiceName]], id)
+		byName[snapshot.Name] = id
+	}
+	var dependencyFailure error
+	checked := make(map[string]bool)
+	for _, snapshot := range schedule.containers {
+		service := snapshot.Config.Labels[LabelServiceName]
+		if !checked[service] {
+			if err := b.waitForCompensationDependencies(ctx, schedule, service, created, m.leaseUUID); err != nil {
+				dependencyFailure = err
+				break
+			}
+			checked[service] = true
+		}
+		id := byName[snapshot.Name]
+		completed, err = m.runner.StepCompleted(ctx, shared.MaintenanceSourceLaunchStep, func(ctx context.Context) error {
+			if err := q.requireActive(); err != nil {
+				return err
+			}
+			if err := m.requireContainer(ctx, id); err != nil {
+				return err
+			}
+			return m.ops.docker.StartContainer(ctx, id, b.cfg.ContainerStartTimeout)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	// Every issued Create/Start returned successfully. A local health gate
+	// may prevent later Starts; it does not leave an outstanding daemon call.
+	// The complete created cohort remains available to classify source failure.
+	// Keep the last successful causal receipt rather than requesting a new
+	// Docker/storage action after a local health deadline canceled ctx. Any
+	// intervening SDK failure already returned above without consuming it.
+	if err := q.requireActive(); err != nil {
+		return err
+	}
+
+	if err := completion.complete(completed); err != nil {
+		return err
+	}
+	return dependencyFailure
+}
+
+func (writer priorVolumeWriter) retire(ctx context.Context) error {
+	m := writer.mutations
+	if m == nil {
+		return errors.New("prior volume writer authority is unavailable")
+	}
+	if err := m.runner.Step(ctx, "stop exact prior volume writer", func(ctx context.Context) error {
+		if _, err := writer.inspect(ctx); err != nil {
+			return err
+		}
+		return m.ops.docker.StopContainer(ctx, writer.id, m.ops.backend.cfg.ContainerStopTimeout)
+	}); err != nil {
+		return err
+	}
+	info, err := writer.inspect(ctx)
+	if errdefs.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Status != "exited" && info.Status != "dead" && info.Status != "created" {
+		return errors.New("prior volume writer did not positively stop")
+	}
+	// Removal fences an already accepted Start request for this fixed ID. The
+	// source must still match inside the owned mutation, not only at inventory.
+	if err := m.runner.Step(ctx, "retire exact prior volume writer", func(ctx context.Context) error {
+		if _, err := writer.inspect(ctx); err != nil {
+			return err
+		}
+		return m.ops.docker.RemoveContainer(ctx, writer.id)
+	}); err != nil {
+		return err
+	}
+	if _, err := m.ops.backend.docker.InspectContainer(ctx, writer.id); !errdefs.IsNotFound(err) {
+		return errors.Join(errors.New("retired prior volume writer absence is unproven"), err)
+	}
+	return nil
+}
+
+func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchCoordinator, error) {
+	journal, err := shared.NewVolumeLaunchJournal(callbacks)
+	if err != nil {
+		return nil, err
+	}
+	// This common bracket is a lexical construction detail. Backend receives
+	// only the two finite launch workflows below, never an action-injection
+	// facade or a journal writer. Allocation happens after dispatch admission,
+	// so a refused/canceled Runner cannot leave false permanent launch debt.
+	dispatch := func(ctx context.Context, q *quiescedVolumes, operation string, action func(context.Context) error) (volumeLaunchCompletion, substratemutation.CompletedStep, error) {
+		if q == nil || q.mutations == nil {
+			return volumeLaunchCompletion{}, substratemutation.CompletedStep{}, errors.New("volume launch requires its protected volume set")
+		}
+		var debt shared.VolumeLaunchDebt
+		completed, err := q.mutations.runner.StepCompleted(ctx, operation, func(ctx context.Context) error {
+			if err := q.requireActive(); err != nil {
+				return err
+			}
+			var err error
+			debt, err = journal.Begin(q.mutations.volumeLaunchOrigin(), q.reserved.ids)
+			if err != nil {
+				return err
+			}
+			return action(ctx)
+		})
+		if err != nil {
+			// Once Begin succeeds, an interrupted SDK call retains debt. No
+			// later error classification or inventory can mint its completion.
+			return volumeLaunchCompletion{}, substratemutation.CompletedStep{}, err
+		}
+		return volumeLaunchCompletion{finish: func(step substratemutation.CompletedStep) error { return journal.Complete(debt, step) }}, completed, nil
+	}
+	return &volumeLaunchCoordinator{
+		check:          journal.Check,
+		checkNamespace: journal.CheckNamespace,
+		compose: func(ctx context.Context, q *quiescedVolumes, prepared imageexec.PreparedProject, opts composeUpOpts) error {
+			if q == nil || q.mutations == nil || q.mutations.compensationSubject.Valid() {
+				return errors.New("compose launch requires an operation or maintenance target")
+			}
+			completion, step, err := dispatch(ctx, q, shared.MaintenanceTargetLaunchStep, func(ctx context.Context) error {
+				return q.mutations.ops.compose.Up(ctx, prepared, opts)
+			})
+			if err != nil {
+				return err
+			}
+			return completion.complete(step)
+		},
+		sourceFirst: func(ctx context.Context, q *quiescedVolumes, snapshot compensationContainer) (string, volumeLaunchCompletion, substratemutation.CompletedStep, error) {
+			if q == nil || q.mutations == nil || !q.mutations.compensationSubject.Valid() {
+				return "", volumeLaunchCompletion{}, substratemutation.CompletedStep{}, errors.New("source launch requires exact compensation authority")
+			}
+			var id string
+			completion, step, err := dispatch(ctx, q, shared.MaintenanceSourceLaunchStep, func(ctx context.Context) error {
+				var err error
+				id, err = q.mutations.ops.docker.createCompensationContainer(ctx, snapshot.Image, snapshot)
+				if err == nil && id == "" {
+					err = errors.New("source create returned no exact container identity")
+				}
+				return err
+			})
+			return id, completion, step, err
+		},
+	}, nil
 }
 
 // newBackendStorageAuthorityLifetime binds terminal storage withdrawal to both

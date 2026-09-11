@@ -33,10 +33,8 @@ const (
 	// Provisioning → Restarting: a restore's NEW lease is reserved at
 	// Status=Provisioning (it was never running), whereas a restart/update
 	// fire from Ready/Failed. Entering Restarting via evRestoreRequested
-	// reuses onEnterRestarting, whose applyReplaceEntry reads the prior
-	// Status (Provisioning, not Ready) and therefore yields
-	// replaceWasActive=false — so the replace-completed entry action Inc's
-	// activeProvisions, correctly bringing the lease from absent to active.
+	// reuses onEnterRestarting; the provision store derives active counts
+	// directly from the resulting status transitions.
 	evRestoreRequested
 	evProvisionRequested
 	evProvisionCompleted
@@ -306,9 +304,8 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 		OnEntryFrom(evRestartRequested, lsm.onEnterRestarting).
 		// Restore (ENG-325) enters Restarting from Provisioning and reuses the
 		// SAME entry action: applyReplaceEntry writes Status=Restarting + the
-		// callback URL pair and captures replaceWasActive from the prior Status. For
-		// the restore source (Provisioning) that read is false, which is exactly
-		// what the replace-completed entry action needs to Inc activeProvisions.
+		// callback URL pair. The provision store derives readiness accounting
+		// directly from the resulting status transitions.
 		OnEntryFrom(evRestoreRequested, lsm.onEnterRestarting).
 		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
 		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
@@ -686,9 +683,8 @@ func (lsm *leaseSM) onEnterProvisioning(_ context.Context, _ ...any) error {
 // onEnterRestarting is ALSO the entry action for the RESTORE path:
 // evRestoreRequested (Provisioning → Restarting, fired by
 // handleRestoreRequested) reuses it (ENG-325). For that source the prior
-// Status is Provisioning (not Ready), so applyReplaceEntry captures
-// replaceWasActive=false (absent→active) and the lease is counted active
-// on completion.
+// Status is Provisioning; the provision store counts the lease as active
+// only after the completion transition to Ready.
 func (lsm *leaseSM) onEnterRestarting(ctx context.Context, args ...any) error {
 	return lsm.applyReplaceEntry(args, backend.ProvisionStatusRestarting)
 }
@@ -714,15 +710,7 @@ func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus
 	lifecycleCallbackURL := entry.LifecycleCallbackURL
 	callbackKind := entry.CallbackKind
 	maintenance := entry.Maintenance
-	// Capture whether the lease was active (Status==Ready) BEFORE overwriting
-	// it — this is the actor-authoritative gauge key the replace-outcome
-	// entry actions use (see LeaseActor.replaceWasActive). Read inside the
-	// closure (under the store lock) so it's consistent with the overwrite;
-	// the actor-field assignment happens after the closure (no side effect
-	// inside UpdateFn, per the idempotence contract).
-	var wasActive bool
 	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
-		wasActive = p.Status == backend.ProvisionStatusReady
 		p.Status = status
 		if callbackKind == replaceCallbackOperation && callbackURL != "" {
 			p.CallbackURL = callbackURL
@@ -731,7 +719,6 @@ func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus
 			p.LifecycleCallbackURL = lifecycleCallbackURL
 		}
 	})
-	lsm.actor.replaceWasActive = wasActive
 	lsm.actor.replaceCallbackKind = callbackKind
 	lsm.actor.pendingReplaceCallbackURL = callbackURL
 	lsm.actor.pendingReplaceLifecycleCallbackURL = lifecycleCallbackURL
@@ -1056,8 +1043,14 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
-	var diagSnap shared.DiagnosticEntry
 	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+		if source := info.recoveredSource; source != nil {
+			applyReplaceReleaseAuthority(p, *source)
+			p.ContainerIDs = slices.Clone(source.containerIDs)
+			p.ServiceContainers = cloneServiceContainers(source.serviceContainers)
+			p.CallbackURL = source.recoveredCallbackURL
+			p.LifecycleCallbackURL = source.recoveredLifecycleCallbackURL
+		}
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
@@ -1071,14 +1064,7 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 			p.Reason = ""
 			p.Message = ""
 		}
-		diagSnap = DiagnosticSnapshot(p)
 	})
-	if diagSnap.LeaseUUID != "" {
-		// Use logs captured by doReplace*'s defer BEFORE rollback tore
-		// the failed containers down — post-cleanup log fetches would
-		// hit already-deleted containers and record an empty entry.
-		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.logs)
-	}
 
 	if !info.preserveMaintenance {
 		lsm.sendReplaceFailureCallback(
@@ -1096,21 +1082,13 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
-	var diagSnap shared.DiagnosticEntry
 	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
 		p.FailCount++
 		p.Status = backend.ProvisionStatusFailed
-		diagSnap = DiagnosticSnapshot(p)
 	})
-	if diagSnap.LeaseUUID != "" {
-		// Use logs captured by doReplace*'s defer BEFORE rollback tore
-		// the failed containers down — post-cleanup log fetches would
-		// hit already-deleted containers and record an empty entry.
-		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.logs)
-	}
 
 	if !info.preserveMaintenance {
 		lsm.sendReplaceFailureCallback(
@@ -1122,32 +1100,21 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 }
 
 // onEnterFailedFromProvision fires when doProvision signals a failure.
-// Owns Status flip, FailCount++, LastError update, persistDiagnostics,
-// and the Failed callback. Cleanup (container/volume removal) still
-// runs in the goroutine's defer — it's I/O that shouldn't block the
-// actor.
+// Owns Status, FailCount and LastError projection updates and the Failed
+// callback. The substrate boundary has already captured durable diagnostics;
+// callback publication requires that capture before settling the journal.
 func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any) error {
 	info := args[0].(provisionErrorInfo)
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
-	var diagSnap shared.DiagnosticEntry
 	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.Status = backend.ProvisionStatusFailed
 		p.FailCount++
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
-		diagSnap = DiagnosticSnapshot(p)
 	})
-
-	if diagSnap.LeaseUUID != "" {
-		// Use the logs captured by doProvision's cleanup defer (before the
-		// failed containers were removed). If the worker didn't capture
-		// any (e.g., failure before any containers were created), the
-		// entry is persisted without logs.
-		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.logs)
-	}
 
 	// ORDERING CONTRACT: SendOperationFailureFn MUST remain the last statement of
 	// this entry action. The docker provision tests synchronize on the
@@ -1419,20 +1386,12 @@ func cloneServiceContainers(in map[string][]string) map[string][]string {
 	return out
 }
 
-// provisionErrorInfo carries doProvision failure data into
-// Failed.OnEntryFrom(evProvisionErrored). callbackErr is the on-chain-safe
-// hardcoded message; lastError is the full diagnostic string stashed in
-// provision.LastError for authenticated API access. logs is the
-// pre-captured log map (fetched by doProvision BEFORE its cleanup defer
-// removed the failed containers). If nil (e.g., failure before any
-// containers were created), onEnterFailedFromProvision persists the
-// diagnostic entry without container logs — it does not re-fetch, since
-// the containers are gone by the time the SM entry action runs.
+// provisionErrorInfo carries exact terminal authority and its in-memory
+// projection. Durable attempt diagnostics belong to the substrate publisher.
 type provisionErrorInfo struct {
 	callbackErr      string
 	reason           backend.Reason // ENG-508
 	lastError        string
-	logs             map[string]string
 	operationFailure shared.OperationReleaseUncommitted
 }
 
@@ -1517,8 +1476,7 @@ func newReplaceSuccessProjection(projection ReplaceSuccessProjection) ReplaceSuc
 // ReplaceFailureInfo carries doReplace* failure data. Used by both
 // onEnterReadyFromReplaceRecovered (Status ends up Ready) and
 // onEnterFailedFromReplace (Status ends up Failed). The entry actions
-// set LastError, increment FailCount, persist diagnostics, and adjust
-// the activeProvisions gauge via the actor-observed replaceWasActive. Its
+// set LastError, increment FailCount, and atomically update readiness. Its
 // fields are opaque; substrate workers obtain validated variants from typed
 // constructors.
 type ReplaceFailureInfo struct {
@@ -1527,12 +1485,6 @@ type ReplaceFailureInfo struct {
 	callbackErr string
 	reason      backend.Reason // ENG-508: category code; message is CallbackErr
 	lastError   string
-	// Logs is the pre-captured container-log map from the NEW (failed)
-	// containers. Populated by doReplace*'s defer BEFORE rollback tears
-	// those containers down — persistDiagnostics would otherwise find
-	// them gone and record an empty entry. For stacks, keys are
-	// "serviceName/instanceIndex"; for single-container, raw indices.
-	logs map[string]string
 	// PreserveMaintenance suppresses callback settlement when the exact
 	// release terminal write was ambiguous. Periodic recovery owns resolution.
 	preserveMaintenance bool
@@ -1541,6 +1493,9 @@ type ReplaceFailureInfo struct {
 	// proof; ambiguous terminal writes deliberately leave it invalid and keep
 	// PreserveMaintenance true for recovery.
 	maintenanceRelease shared.MaintenanceReleaseFailure
+	// recoveredSource exists only when the failed release carries exact
+	// SourceReady evidence. It supplies both runtime identity and cohort IDs.
+	recoveredSource *ReplaceSuccessResult
 	// OperationRelease is present only for a failed Restore and binds the
 	// callback to the exact operation generation accepted before substrate work.
 	operationRelease shared.OperationReleaseUncommitted
@@ -1553,7 +1508,6 @@ type ReplaceFailureDetails struct {
 	CallbackErr string
 	Reason      backend.Reason
 	LastError   string
-	Logs        map[string]string
 }
 
 func NewMaintenanceRecoveryFailureInfo(
@@ -1570,7 +1524,7 @@ func NewMaintenanceRecoveryFailureInfo(
 	return ReplaceFailureInfo{
 		operation: string(kind), oldStopped: details.OldStopped,
 		callbackErr: details.CallbackErr, reason: details.Reason,
-		lastError: details.LastError, logs: cloneStringMap(details.Logs),
+		lastError:     details.LastError,
 		authorityKind: replaceAuthorityRecovery, maintenance: intent,
 	}, nil
 }
@@ -1584,18 +1538,7 @@ func (i ReplaceFailureInfo) CallbackError() string  { return i.callbackErr }
 func (i ReplaceFailureInfo) LastError() string      { return i.lastError }
 func (i ReplaceFailureInfo) Reason() backend.Reason { return i.reason }
 
-func cloneStringMap(in map[string]string) map[string]string {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func NewMaintenanceReplaceFailure(err error, restored, recoverFromSource bool, details ReplaceFailureDetails, proof shared.MaintenanceReleaseFailure) (ReplaceResult, error) {
+func NewMaintenanceReplaceFailure(err error, details ReplaceFailureDetails, proof shared.MaintenanceReleaseFailure) (ReplaceResult, error) {
 	if err == nil || !proof.Valid() {
 		return ReplaceResult{}, errors.New("maintenance failure requires an error and exact failed release proof")
 	}
@@ -1606,21 +1549,23 @@ func NewMaintenanceReplaceFailure(err error, restored, recoverFromSource bool, d
 	info.authorityKind = replaceAuthorityMaintenance
 	info.maintenanceRelease = proof
 	info.maintenance = proof.Intent()
-	return ReplaceResult{err: err, restored: restored, recoveredIfSourceActive: recoverFromSource, failure: info}, nil
-}
-
-func NewAmbiguousMaintenanceReplaceFailure(err error, restored, recoverFromSource bool, details ReplaceFailureDetails, intent shared.MaintenanceIntentClaim) (ReplaceResult, error) {
-	if err == nil || !intent.Valid() {
-		return ReplaceResult{}, errors.New("ambiguous maintenance failure requires an error and exact intent")
+	if ready, ok := proof.SourceReady(); ok {
+		release, ids, services := ready.Projection()
+		stack, projectionErr := validateCompleteReleaseProjection(release, ids, services)
+		if projectionErr != nil {
+			return ReplaceResult{}, fmt.Errorf("restored maintenance source: %w", projectionErr)
+		}
+		authority, ok := release.RuntimeIdentity()
+		if !ok {
+			return ReplaceResult{}, errors.New("restored source has no runtime identity")
+		}
+		projection := newReplaceSuccessProjection(ReplaceSuccessProjection{ContainerIDs: ids, ServiceContainers: services})
+		projection.release, projection.stackManifest = &release, stack
+		projection.recoveredCallbackURL = authority.CallbackURL()
+		projection.recoveredLifecycleCallbackURL = authority.LifecycleCallbackURL()
+		info.recoveredSource = &projection
 	}
-	info, infoErr := NewMaintenanceRecoveryFailureInfo(intent, details)
-	if infoErr != nil {
-		return ReplaceResult{}, infoErr
-	}
-	info.authorityKind = replaceAuthorityMaintenance
-	info.preserveMaintenance = true
-	info.maintenance = intent
-	return ReplaceResult{err: err, restored: restored, recoveredIfSourceActive: recoverFromSource, failure: info}, nil
+	return ReplaceResult{err: err, failure: info}, nil
 }
 
 func NewRestoreReplaceFailure(err error, details ReplaceFailureDetails, proof shared.OperationReleaseUncommitted) (ReplaceResult, error) {
@@ -1630,7 +1575,7 @@ func NewRestoreReplaceFailure(err error, details ReplaceFailureDetails, proof sh
 	info := ReplaceFailureInfo{
 		operation: "restore", oldStopped: details.OldStopped,
 		callbackErr: details.CallbackErr, reason: details.Reason,
-		lastError: details.LastError, logs: cloneStringMap(details.Logs),
+		lastError: details.LastError,
 	}
 	info.authorityKind = replaceAuthorityRestoreCommitted
 	info.operationRelease = proof
@@ -1639,8 +1584,8 @@ func NewRestoreReplaceFailure(err error, details ReplaceFailureDetails, proof sh
 
 // ReplaceResult is doReplace*'s return value bundling everything the
 // goroutine wrapper needs to fire the right SM event. The callback path
-// depends on (Err, recovered) where recovered = RecoveredIfSourceActive ?
-// LeaseActor.replaceWasActive : Restored (computed by spawnReplaceWorker):
+// depends on (Err, recovered), where recovery requires exact SourceReady
+// evidence in the failed maintenance release:
 //
 //	Err == nil             → fire evReplaceCompleted with .Success
 //	Err != nil, recovered  → fire evReplaceRecovered with .Failure
@@ -1649,20 +1594,9 @@ func NewRestoreReplaceFailure(err error, details ReplaceFailureDetails, proof sh
 // Its fields are opaque. Substrate workers can return only constructor-minted
 // success and failure variants, while the actor alone dispatches on them.
 type ReplaceResult struct {
-	err      error
-	restored bool
-	success  ReplaceSuccessResult
-	failure  ReplaceFailureInfo
-	// RecoveredIfSourceActive, when true, tells the actor to derive the
-	// recovered-vs-failed outcome from LeaseActor.replaceWasActive (the
-	// actor-observed SM source) INSTEAD of Restored. Set ONLY by doRestart's
-	// preflight-failure branch: no container was touched, so "recovered to
-	// Ready" is correct iff the lease was Ready/running at replace-start —
-	// which the prelude's route-time status snapshot got wrong under the
-	// death-before-queued-restart ordering (ENG-230 PR#93 finding). Every
-	// other failure leaves this false: update-preflight stays Restored=false
-	// (intentional), post-replace keeps Restored=rollback result.
-	recoveredIfSourceActive bool
+	err     error
+	success ReplaceSuccessResult
+	failure ReplaceFailureInfo
 }
 
 func (r ReplaceResult) Err() error { return r.err }
@@ -1670,7 +1604,7 @@ func (r ReplaceResult) Err() error { return r.err }
 // Restored reports whether the failed substrate operation restored its source
 // cohort. It is observation only; callers cannot use it to construct another
 // terminal outcome.
-func (r ReplaceResult) Restored() bool { return r.restored }
+func (r ReplaceResult) Restored() bool { return r.failure.recoveredSource != nil }
 
 // FailureInfo exposes the sealed failure's read-only diagnostic surface.
 func (r ReplaceResult) FailureInfo() ReplaceFailureInfo { return r.failure }
@@ -1861,8 +1795,8 @@ func ShortID(id string) string {
 
 // DiagnosticSnapshot captures the ProvisionState fields needed for
 // diagnostics persistence. Built inside an UpdateFn closure (under the
-// store's mutex) so the snapshot is consistent; PersistDiagnosticsFn /
-// PersistDiagnosticsWithLogsFn write it out after the closure returns.
+// store's mutex) so the snapshot is consistent; PersistDiagnosticsFn writes
+// it after the closure returns.
 // Use only for diagnostics-store writes; not a general ProvisionState
 // projection helper.
 //
@@ -1879,15 +1813,16 @@ func DiagnosticSnapshot(prov *ProvisionState) shared.DiagnosticEntry {
 		prov.CallbackURL, prov.LifecycleCallbackURL,
 	)
 	return shared.DiagnosticEntry{
-		LeaseUUID:           prov.LeaseUUID,
-		ProviderUUID:        prov.ProviderUUID,
-		Tenant:              prov.Tenant,
-		Error:               prov.LastError,
-		Reason:              prov.Reason,
-		Message:             prov.Message,
-		FailCount:           prov.FailCount,
-		LifecycleGeneration: &lifecycleGeneration,
-		CreatedAt:           time.Now(),
+		LeaseUUID:             prov.LeaseUUID,
+		ProviderUUID:          prov.ProviderUUID,
+		Tenant:                prov.Tenant,
+		Error:                 prov.LastError,
+		Reason:                prov.Reason,
+		Message:               prov.Message,
+		FailCount:             prov.FailCount,
+		RuntimeReleaseVersion: prov.ActiveReleaseVersion,
+		LifecycleGeneration:   &lifecycleGeneration,
+		CreatedAt:             time.Now(),
 	}
 }
 

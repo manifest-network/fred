@@ -107,10 +107,10 @@ var (
 	destroyRefusedReasons = []string{destroyRefusedClaimed, destroyRefusedUnreadable, destroyRefusedNoDestroyer}
 )
 
-// Operation and outcome labels for teardownFallbackTotal — which teardown path had
-// to compensate for a failed compose Down, and whether the compensation finished the
-// job (ENG-647). Kept as constants so the call sites, the pre-init, and the tests
-// cannot drift on a typo.
+// Operation and outcome labels for teardownFallbackTotal identify per-container
+// teardown recovery, including exact failed-restore cleanup, and whether absence
+// was proved (ENG-647). Kept as constants so call sites, pre-init, and tests cannot
+// drift on a typo.
 //
 // All current paths retain exact authority and accounting on failed cleanup.
 // Ordinary durable recovery retries in-process. An ambiguous live provision
@@ -121,13 +121,13 @@ const (
 	teardownOpDeprovision      = "deprovision"       // doDeprovision's close-path teardown
 	teardownOpProvisionCleanup = "provision_cleanup" // failed provision retains its WAL and accounting for recovery
 
-	teardownOutcomeRecovered = "recovered" // fallback removed every container it found
+	teardownOutcomeRecovered = "recovered" // recovery proved destination containers absent
 	teardownOutcomeFailed    = "failed"    // a container may still be running (removal or discovery failed)
 )
 
 // teardownOperations / teardownOutcomes are the closed label sets, pre-initialized to
 // 0 so a "compensation is failing" alert reads 0 rather than no-data before the first
-// Down failure — which, on a healthy provider, may be never.
+// teardown recovery attempt — which, on a healthy provider, may be never.
 var (
 	teardownOperations = []string{
 		teardownOpRestoreReconcile, teardownOpDeprovision, teardownOpProvisionCleanup,
@@ -903,14 +903,12 @@ var (
 		Help:      "Managed-volume destroys refused by the ownership check, by call site and reason (per volume) — see ENG-658",
 	}, []string{"site", "reason"})
 
-	// teardownFallbackTotal counts the per-container compensation that runs when compose
-	// Down fails, by teardown path and result (ENG-647). Down is the only call that reaps
-	// a container's anonymous volumes, so a Down failure with no compensation leaks them
-	// silently and cumulatively (the ENG-372 class) — compose v5 made this likelier by
-	// running its removals on the errgroup's derived context, so the first failure cancels
-	// its siblings mid-flight.
+	// teardownFallbackTotal counts per-container teardown recovery by path and
+	// result (ENG-647). It includes fallback after a failed Compose Down and
+	// receipt-owned failed-restore cleanup, which directly removes the exact
+	// captured cohort. Both paths remove associated anonymous volumes.
 	//
-	// outcome="recovered" means fallback removed every container it found.
+	// outcome="recovered" means destination container absence was proved.
 	// outcome="failed" means absence could not be proved. Every current path
 	// preserves exact authority and accounting. Durable recovery retries ordinary
 	// failures; a live worker with ambiguous effects may still fail-stop before
@@ -919,7 +917,7 @@ var (
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "teardown_fallback_total",
-		Help:      "Per-container teardown fallbacks after a failed compose Down, by operation and outcome (ENG-647)",
+		Help:      "Per-container teardown recovery, including exact failed-restore cleanup, by operation and outcome (ENG-647)",
 	}, []string{"operation", "outcome"})
 
 	// restoreFinalizerPendingTotal counts restore finalizations kept pending: a restore

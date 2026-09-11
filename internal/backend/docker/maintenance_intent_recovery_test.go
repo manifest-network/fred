@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/uuid"
@@ -209,7 +210,7 @@ func newMaintenanceRecoveryHarnessForAuthorityAtCallbackOptions(
 	b.storeAuthorityGate = gate
 	b.storageVerifier = testDockerRuntimeStorageVerifier{id: storage.ID()}
 	require.NoError(t, bindBackendTestPhysicalExecutors(
-		b, operations, b.maintenanceSettlement,
+		t, b, operations, b.maintenanceSettlement,
 	))
 	bindBackendRecoveryCoordinatorForTest(t, b)
 	rebuildCallbackSender(b, testCallbackClient)
@@ -393,7 +394,7 @@ func (h *maintenanceRecoveryHarness) reopen() {
 	h.b.storageAuthority = storage
 	h.b.storageVerifier = testDockerRuntimeStorageVerifier{id: storage.ID()}
 	require.NoError(h.t, bindBackendTestPhysicalExecutors(
-		h.b, h.operations, h.b.maintenanceSettlement,
+		h.t, h.b, h.operations, h.b.maintenanceSettlement,
 	))
 	bindBackendRecoveryCoordinatorForTest(h.t, h.b)
 	rebuildCallbackSender(h.b, testCallbackClient)
@@ -665,12 +666,12 @@ func mustDockerReleaseRuntimeIdentity(
 	return authority
 }
 
-func TestRecoverMaintenancePreservesUpdateImagePullFailurePolicy(t *testing.T) {
+func TestRecoverMaintenanceImagePullFailureRetainsHealthySource(t *testing.T) {
 	h := newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate)
 	h.appendTarget(true)
 	_, err := failMaintenanceForTest(
 		t, h.b.maintenanceSettlement, h.target,
-		backend.ReasonImagePullFailed, backend.MsgImagePullFailed, false,
+		backend.ReasonImagePullFailed, backend.MsgImagePullFailed, true,
 	)
 
 	require.NoError(t, err)
@@ -687,7 +688,7 @@ func TestRecoverMaintenancePreservesUpdateImagePullFailurePolicy(t *testing.T) {
 	projected, found := h.b.provisions[h.leaseUUID]
 	h.b.provisionsMu.RUnlock()
 	require.True(t, found)
-	assert.Equal(t, backend.ProvisionStatusFailed, projected.Status)
+	assert.Equal(t, backend.ProvisionStatusReady, projected.Status)
 	assert.Equal(t, backend.ReasonImagePullFailed, projected.Reason)
 	assert.Equal(t, backend.MsgImagePullFailed, projected.Message)
 	assert.Equal(t, h.source.Items, projected.Items)
@@ -979,8 +980,13 @@ func TestRecoverMaintenanceFailsClosedOnUnreadableOrDivergentTarget(t *testing.T
 }
 
 func TestRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testing.T) {
+	synctest.Test(t, testRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement)
+}
+
+func testRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testing.T) {
 	h := newMaintenanceRecoveryHarness(t)
 	h.appendTarget(true)
+	h.b.cfg.ProvisionTimeout = time.Second
 	h.inventory.containers = append(
 		h.containersFor(h.source, 2, "running", HealthStatusNone),
 		h.containersFor(h.targetRelease, 1, "running", HealthStatusNone)...,
@@ -1015,6 +1021,7 @@ func TestRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testin
 		t.Fatal("construction-bound maintenance worker did not start")
 	}
 	require.True(t, h.b.actorOwnsMaintenance(h.leaseUUID, h.intent.MaintenanceID()))
+	liveActor := h.b.actorFor(h.leaseUUID)
 
 	require.NoError(t, h.b.RefreshState(t.Context()))
 	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
@@ -1022,16 +1029,36 @@ func TestRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testin
 	require.Len(t, intents, 1)
 	assert.Empty(t, h.inventory.removed)
 
-	// The worker finishes but its terminal callback deliberately preserves the
-	// WAL. Exact ownership clears only after the terminal event is applied; the
-	// next sweep cleans only the target-ID remnant, proves the full source cohort,
-	// corrects the actor Failed->Ready, then resolves the intent.
+	// The ambiguous worker preserves the WAL. Wait for its terminal handoff,
+	// then prove actor quiescence without advancing the virtual clock through a
+	// polling interval: quiescence alone does not expire the durable visibility
+	// window for a Started maintenance attempt.
 	close(workerRelease)
-	// Clearing the observational worker ID precedes the terminal handler's
-	// activity release. Recovery needs the actual quiescence capability.
-	awaitProvisionWorkerQuiescence(t, h.b, h.leaseUUID)
+	synctest.Wait()
+	actorClaim := liveActor.TryClaimQuiescence()
+	require.NotNil(t, actorClaim, "worker terminal handoff must release actor activity")
+	actorClaim.Release()
 	require.False(t, h.b.actorOwnsMaintenance(h.leaseUUID, h.intent.MaintenanceID()))
-	h.b.cfg.ProvisionTimeout = time.Nanosecond
+	intent, found, err := h.b.maintenanceSettlement.GetMaintenanceIntent(h.leaseUUID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, shared.MaintenanceExecutionStarted, intent.ExecutionPhase())
+	deadline := h.b.maintenanceRecoveryDeadline(intent.CreatedAt())
+	require.True(t, time.Now().Before(deadline))
+	require.NoError(t, h.b.RefreshState(t.Context()))
+	intents, err = h.b.maintenanceSettlement.ListMaintenanceIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1, "quiescent partial work remains pending before its durable deadline")
+	pending, err := h.callbacks.ListPending()
+	require.NoError(t, err)
+	require.Empty(t, pending)
+	require.Empty(t, h.inventory.removed)
+
+	// Cross the exact deadline derived from the persisted intent. The retry can
+	// now clean the target-ID remnant, prove the complete source, publish Ready,
+	// and atomically resolve the intent into its failed maintenance callback.
+	<-time.NewTimer(time.Until(deadline)).C
+	require.False(t, time.Now().Before(deadline))
 	require.NoError(t, h.b.RefreshState(t.Context()))
 	h.assertSettled(backend.CallbackStatusFailed)
 	require.Equal(t, backend.ProvisionStatusReady, h.b.actorFor(h.leaseUUID).State())
@@ -1044,7 +1071,7 @@ func TestRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testin
 	// The actor is no longer stale-busy, but the exact completion deliberately
 	// remains the subscriber-ordering fence until synchronous delivery precisely
 	// removes it. Model that successful delivery before the subsequent command.
-	pending, err := h.callbacks.ListPending()
+	pending, err = h.callbacks.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
 	acknowledgePendingCallbacksForTest(t, h.callbacks)
@@ -1076,6 +1103,7 @@ func TestRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testin
 	require.NoError(t, err)
 	require.NoError(t, h.b.routeToLeaseBlocking(t.Context(), h.leaseUUID, command))
 	require.NoError(t, <-reply.Result())
+	synctest.Wait()
 }
 
 func (h *maintenanceRecoveryHarness) targetReleaseStack() *manifest.StackManifest {

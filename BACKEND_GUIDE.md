@@ -519,13 +519,18 @@ Get container logs for a specific lease. Used by fred to serve `GET /v1/leases/{
 **Response:** `200 OK`
 ```json
 {
-  "0": "2024-01-15 10:30:00 Starting nginx...\nListening on port 80\n",
-  "1": "2024-01-15 10:30:00 Redis ready\n"
+  "web/0": "2024-01-15 10:30:00 Starting nginx...\nListening on port 80\n",
+  "db/0": "2024-01-15 10:30:00 Redis ready\n"
 }
 ```
 
 **Fields:**
-- Keys are container instance indices (`"0"`, `"1"`, ...), values are log output strings
+- Docker keys identify service and instance (`"web/0"`, `"db/0"`); values are log output strings.
+- After successful compensation, live keys remain available alongside captured
+  replacement logs under `failed/<service>/<instance>`. The failed entries are
+  tied to the restored release and disappear from the active view after a later
+  deployment. Logs share a 32 MiB aggregate content budget, with bounded marker
+  and encoding overhead.
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned (or logs expired)
@@ -572,10 +577,17 @@ as immediate retries. See [the tenant retry contract](README.md#restart-lease).
    insufficient_resources`, so it cannot create an ambiguous command.
 1. Validate the lease exists and is in a restartable state (`ready` or `failed`)
 2. Return 202 immediately
-3. Stop and rename existing containers (kept for rollback) in a background goroutine
-4. Recreate containers with the same manifest and configuration
+3. In the background, durably capture the exact source image, effective runtime
+   configuration, and physical volume identities before retiring source containers
+4. Recreate containers with the same manifest and configuration through the protected launch workflow
 5. Run startup verification (health checks or startup delay)
-6. On success: remove old containers and POST success callback. On failure: rollback to old containers, restore `ready` status, and POST failure callback
+6. On success: activate the target and POST success callback. On a settled failure:
+   capture failed-target logs before cleanup and compensate from the recorded
+   source. A verified source returns to `ready` with a failure callback; a source
+   that cannot become ready becomes `failed`. An empty or positively verified
+   incomplete source permits restarting a Failed lease but provides no
+   compensation target. Foreign or divergent survivors refuse replacement.
+   Ambiguous Docker calls remain pending and cannot authorize another launch.
 
 **Error Responses:**
 - `400 Bad Request` - Invalid maintenance request or validation failure; curated
@@ -588,7 +600,10 @@ as immediate retries. See [the tenant retry contract](README.md#restart-lease).
 
 ### POST /update
 
-Deploy a new manifest for a lease, replacing containers with a new image/configuration. Pulls the new image, stops old containers (kept for rollback), creates new ones, and sends a callback on completion. On failure, rolls back to the previous containers. Volumes are preserved.
+Deploy a new manifest for a lease, replacing containers with a new image/configuration.
+The Docker backend captures the exact source before replacement and can compensate
+after a settled failure. Volumes are preserved; application and database writes
+are not reversed by recreating the source.
 
 **Request:**
 ```json
@@ -613,11 +628,17 @@ Deploy a new manifest for a lease, replacing containers with a new image/configu
 1. Validate the lease exists and is in an updatable state (`ready` or `failed`)
 2. Parse and validate the new manifest
 3. Return 202 immediately
-4. Pull the new image in a background goroutine
-5. Stop and rename old containers (kept for rollback)
+4. Durably capture the source's immutable image identity, effective configuration,
+   and physical volume identities, then pull the new image in a background goroutine
+5. Retire the exact source containers under protected volume ownership
 6. Create and start new containers from the updated manifest
 7. Run startup verification
-8. On success: remove old containers and POST success callback. On failure: rollback to old containers, mark status as `failed` (the desired update was not achieved even though old containers may be restored), and POST failure callback
+8. On success: activate the target and POST success callback. Failure uses the
+   same compensation rules as restart: preserve an intact healthy source when
+   dispatch never occurred, or recreate the recorded source after a settled
+   launch failure. Successful compensation reports `ready` for the lease and
+   `failed` for the maintenance request. Unknown Docker effects stay pending;
+   an activated target cannot be compensated.
 
 **Error Responses:**
 - `400 Bad Request` - Invalid manifest or validation error

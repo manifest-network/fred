@@ -44,7 +44,7 @@ func seedUpgradedV013ReleaseForBackendTest(
 	operations, ok := concreteOperationSettlementForTest(b.operationSettlement)
 	require.True(t, ok)
 	require.NoError(t, bindBackendTestPhysicalExecutors(
-		b, operations, b.maintenanceSettlement,
+		t, b, operations, b.maintenanceSettlement,
 	))
 	backfiller, err := shared.NewReleaseBackfiller(b.callbackStore, fixture.Store)
 	require.NoError(t, err)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -33,6 +34,7 @@ type MaintenanceSettlement struct {
 	recovery            *substratemutation.RecoveryAttestor[MaintenancePhysicalSubject, MaintenancePhysicalEvidence]
 	execute             func(context.Context, substratemutation.LiveExecution[MaintenancePhysicalSubject]) substratemutation.Result[MaintenancePhysicalSubject, MaintenancePhysicalEvidence]
 	executeRecovery     func(context.Context, substratemutation.RecoveryExecution[MaintenancePhysicalSubject]) substratemutation.Result[MaintenancePhysicalSubject, MaintenancePhysicalEvidence]
+	compensation        *maintenanceCompensationBinding
 }
 
 type MaintenanceExecutionClaim struct {
@@ -40,6 +42,7 @@ type MaintenanceExecutionClaim struct {
 	target     MaintenanceReleaseClaim
 	subject    MaintenancePhysicalSubject
 	started    substratemutation.LiveExecution[MaintenancePhysicalSubject]
+	invoked    *atomic.Bool
 }
 
 // MaintenanceExecutionSuccess and MaintenanceExecutionFailure are the two
@@ -407,6 +410,8 @@ func (proof MaintenanceReleaseFailure) PhysicalEvidence() (MaintenancePhysicalEv
 	switch proof.evidence.kind {
 	case maintenancePhysicalEvidenceSourceReady:
 		return proof.evidence, proof.evidence.sourceReady.Valid() && proof.evidence.sourceReady.MaintenanceID() == proof.MaintenanceID()
+	case maintenancePhysicalEvidenceSourceFailed:
+		return proof.evidence, proof.evidence.sourceFailed.validForMaintenance(proof.evidence.sourceFailed.state.subject)
 	case maintenancePhysicalEvidenceTargetDivergent:
 		return proof.evidence, proof.evidence.targetDivergent.Valid() && proof.evidence.targetDivergent.MaintenanceID() == proof.MaintenanceID()
 	case maintenancePhysicalEvidenceTargetAbsent:
@@ -414,6 +419,20 @@ func (proof MaintenanceReleaseFailure) PhysicalEvidence() (MaintenancePhysicalEv
 	default:
 		return MaintenancePhysicalEvidence{}, false
 	}
+}
+
+// SourceReady exposes only the complete source cohort attested by this exact
+// failed maintenance. Refusal and callback-only proofs cannot supply a runtime
+// projection or claim that a recreated source is ready.
+func (proof MaintenanceReleaseFailure) SourceReady() (MaintenanceSourceReady, bool) {
+	if !proof.Valid() || proof.evidence.kind != maintenancePhysicalEvidenceSourceReady {
+		return MaintenanceSourceReady{}, false
+	}
+	ready := proof.evidence.sourceReady
+	if !ready.Valid() || ready.LeaseUUID() != proof.LeaseUUID() || ready.MaintenanceID() != proof.MaintenanceID() {
+		return MaintenanceSourceReady{}, false
+	}
+	return ready, true
 }
 
 // ReleaseClaim is an opaque compare-and-swap capability for one exact durable
@@ -747,7 +766,7 @@ func (s *MaintenanceSettlement) StartMaintenanceExecution(
 		return MaintenanceExecutionClaim{}, err
 	}
 	return MaintenanceExecutionClaim{
-		settlement: s, target: refreshedTarget, subject: subject, started: started,
+		settlement: s, target: refreshedTarget, subject: subject, started: started, invoked: new(atomic.Bool),
 	}, nil
 }
 
@@ -804,6 +823,12 @@ func (s *MaintenanceSettlement) ExecuteMaintenance(
 			}
 		}
 	}()
+	if execution.invoked == nil || !execution.invoked.CompareAndSwap(false, true) {
+		return MaintenanceExecutionAmbiguous{settlement: s, execution: execution, cause: errors.New("maintenance execution was already consumed")}
+	}
+	if err := s.prepareCompensation(ctx, execution); err != nil {
+		return MaintenanceExecutionFailure{settlement: s, authority: execution.target, refused: true, cause: err}
+	}
 	physical := s.execute(ctx, execution.started)
 	if err := substratemutation.ValidateLiveResult(s.mutation, execution.started, physical); err != nil {
 		return MaintenanceExecutionAmbiguous{settlement: s, execution: execution, cause: err}
@@ -834,6 +859,19 @@ func (s *MaintenanceSettlement) ExecuteMaintenance(
 				cause: errors.New("unknown maintenance evidence")}
 		}
 	case substratemutation.Refused:
+		// An auxiliary failure (for example, pulling the replacement image)
+		// does not establish that the prior source stopped serving. A captured
+		// source must pass through its fixed executor and strict classifier so
+		// its actual readiness is preserved in the terminal proof.
+		if s.compensation != nil {
+			pending, err := s.CompensationPending(execution.target.Intent())
+			if err != nil {
+				return MaintenanceExecutionAmbiguous{settlement: s, execution: execution, cause: errors.Join(physical.Err(), err)}
+			}
+			if pending {
+				return s.compensateLive(ctx, execution, physical.Err())
+			}
+		}
 		return MaintenanceExecutionFailure{
 			settlement: s, authority: execution.target, refused: true,
 			cause: physical.Err(),
@@ -843,7 +881,7 @@ func (s *MaintenanceSettlement) ExecuteMaintenance(
 		if cause == nil {
 			cause = errors.New("maintenance mutation outcome is ambiguous")
 		}
-		return MaintenanceExecutionAmbiguous{settlement: s, execution: execution, cause: cause}
+		return s.compensateLive(ctx, execution, cause)
 	default:
 		return MaintenanceExecutionAmbiguous{
 			settlement: s, execution: execution,
@@ -1158,6 +1196,9 @@ func (s *MaintenanceSettlement) ActivateMaintenance(
 	if err != nil {
 		return MaintenanceReleaseActive{}, err
 	}
+	if err := s.requireCompensationTerminal(intent, true, false, false); err != nil {
+		return MaintenanceReleaseActive{}, err
+	}
 	if err := s.releases.transitionMaintenance(target, "active", "", ""); err != nil {
 		return MaintenanceReleaseActive{}, err
 	}
@@ -1199,6 +1240,9 @@ func (s *MaintenanceSettlement) FailMaintenance(
 	defer unlock()
 	intent, err := s.currentIntentForTargetLocked(target)
 	if err != nil {
+		return MaintenanceReleaseFailure{}, err
+	}
+	if err := s.requireCompensationTerminal(intent, false, outcome.SourceRecovered(), outcome.refused); err != nil {
 		return MaintenanceReleaseFailure{}, err
 	}
 	if err := s.releases.transitionMaintenance(target, "failed", reason, message); err != nil {

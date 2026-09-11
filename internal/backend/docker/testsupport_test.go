@@ -491,7 +491,7 @@ func bindBackendToOperationIntentTestStore(
 	// swapping Backend fields would leave the opaque executors and recovery
 	// coordinator bound to the previous stores—a state production construction
 	// cannot create and the capability checks correctly reject.
-	require.NoError(t, bindBackendTestPhysicalExecutors(b, operations, maintenance))
+	require.NoError(t, bindBackendTestPhysicalExecutors(t, b, operations, maintenance))
 	bindBackendTestCloseExecutor(t, b, closeSettlement)
 	rebuildCallbackSender(b, testCallbackClient)
 	registerExistingOperationTestAuthority(
@@ -796,7 +796,7 @@ func bindBackendToRetentionFixtureStore(
 	b.storeAuthorityGate = authority.gate
 	b.storageVerifier = testDockerRuntimeStorageVerifier{id: authority.storage.ID()}
 	require.NoError(t, bindBackendTestPhysicalExecutors(
-		b, authority.operations, maintenance,
+		t, b, authority.operations, maintenance,
 	))
 	bindBackendTestCloseExecutor(t, b, authority.close)
 	registerExistingOperationTestAuthority(
@@ -1537,7 +1537,7 @@ func attachBoundOperationHandoffStores(t *testing.T, b *Backend) {
 			operations, ok := concreteOperationSettlementForTest(b.operationSettlement)
 			require.True(t, ok)
 			require.NoError(t, bindBackendTestPhysicalExecutors(
-				b, operations, b.maintenanceSettlement,
+				t, b, operations, b.maintenanceSettlement,
 			))
 		}
 		if b.closeSettlement == nil {
@@ -1623,7 +1623,7 @@ func attachBoundOperationHandoffStores(t *testing.T, b *Backend) {
 	b.storeAuthorityGate = gate
 	b.storageVerifier = testDockerRuntimeStorageVerifier{id: storage.ID()}
 	require.NoError(t, bindBackendTestPhysicalExecutors(
-		b, settlement, maintenanceSettlement,
+		t, b, settlement, maintenanceSettlement,
 	))
 	bindBackendTestCloseExecutor(t, b, closeSettlement)
 	registerExistingOperationTestAuthority(
@@ -2139,7 +2139,7 @@ func bindTestStorageIdentity(t *testing.T, b *Backend, dockerClient *mockDockerC
 	b.maintenanceSettlement = maintenance
 	b.closeSettlement = closeSettlement
 	b.releaseCapacityPlanner = operations
-	require.NoError(t, bindBackendTestPhysicalExecutors(b, operations, maintenance))
+	require.NoError(t, bindBackendTestPhysicalExecutors(t, b, operations, maintenance))
 	bindBackendTestCloseExecutor(t, b, closeSettlement)
 	retentionFixtureAuthorities.Store(retentions, &retentionFixtureAuthority{
 		backend: b, callbacks: callbacks, releases: releases, operations: operations,

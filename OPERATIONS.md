@@ -191,7 +191,9 @@ If `lease_actor_stuck_seconds` exceeds your alert threshold, one specific lease'
 
 **Symptom:** `fred_docker_backend_teardown_fallback_total{outcome="failed"}` is rising.
 
-**What it means:** `compose down` failed for a lease, and the per-container fallback could not finish the job either.
+**What it means:** per-container teardown recovery could not prove absence. For
+`restore_reconcile`, this is exact failed-attempt cleanup before source handback;
+other paths use per-container fallback after `compose down` fails.
 
 **Read the `operation` label first — it decides what fred did next, and therefore what you must do.**
 
@@ -996,8 +998,8 @@ Fred uses bbolt (an embedded key-value store) for several persistent structures:
 | `token_tracker_db_path` | Replay protection for tenant tokens | Brief replay window after restart; tokens are 30s anyway |
 | `payload_store_db_path` | Tenant deployment payloads awaiting provisioning | Tenants must re-upload pending payloads |
 | `placement_store_db_path` | Provider-bound durable confirmed and attempted lease→backend ownership, ordinary and rejected-positive (`untrusted_positive`) quarantine, immutable name→storage UUID history, and the topology-bound inventory baseline | Critical, non-derivable, and not hot-swappable. Normal startup refuses an absent, empty, unprepared, or differently provider-bound file and performs no creation or migration. Restore the exact database only while stopped; fresh initialization is only for a genuinely new provider with zero total chain lease history, never recovery after loss |
-| `<docker>/callbacks.db` | Durable provision/restore operation rows (Pending/Succeeded/Failed) with exact resource profiles (including Docker's pinned diskless scratch), exact restart/update/custom-domain maintenance intents, non-expiring Docker close intents, and the pending callback FIFO. A terminal operation row remains after callback delivery until an authorized successor atomically retires it. Causal/close rows and exact operation/maintenance completions do not age out; typed lifecycle observations age out at `callback_max_age`. Pre-identity v0.13 callback rows are a stopped-upgrade condition, never runtime queue entries | Accepted and terminal operation decisions, replacement and destructive-cleanup authority, immutable sizing, and queued callback evidence are not recreated. Loss can hide a substrate mutation, erase the exact outcome required to finish a restore handback, make a partial replacement or close indistinguishable from unexplained cohort loss, or strand a provider-side placement attempt; restore it with the matching release/retention stores and backend substrate |
-| `<docker>/diagnostics.db` | Failure diagnostics (last_error, logs) | Older `failed` leases lose diagnostics; new failures still record after a stopped recreation. Open/create requires an unsymlinked, single-link regular file with exact mode `0600`, but diagnostics is not storage-identity authority and is not continuously re-attested |
+| `<docker>/callbacks.db` | Durable provision/restore operation rows (Pending/Succeeded/Failed) with exact resource profiles (including Docker's pinned diskless scratch), exact restart/update/custom-domain maintenance intents, non-expiring Docker close intents, the pending callback FIFO, immutable maintenance source plans, unresolved physical-volume launches, and exact image-inspection cleanup obligations. A terminal operation row remains after callback delivery until an authorized successor atomically retires it. Causal/close rows and exact operation/maintenance completions do not age out; typed lifecycle observations age out at `callback_max_age`. Pre-identity v0.13 callback rows are a stopped-upgrade condition, never runtime queue entries | Accepted and terminal operation decisions, replacement and destructive-cleanup authority, immutable sizing, and queued callback evidence are not recreated. Loss can hide a substrate mutation, erase the exact outcome required to finish a restore handback, make a partial replacement or close indistinguishable from unexplained cohort loss, or strand a provider-side placement attempt; restore it with the matching release/retention stores and backend substrate |
+| `<docker>/diagnostics.db` | Exact-attempt captures and published lease failure diagnostics (last_error, bounded logs) | Existing captures are lost after stopped recreation; new failures can record again. Capture write failures retain failed containers and pending failure publication for retry. Open/create requires an unsymlinked, single-link regular file with exact mode `0600`, but diagnostics is not storage-identity authority and is not continuously re-attested |
 | `<docker>/releases.db` | Per-lease immutable deployment topology/resource authority, tenant/provider identity, and current callback route: either typed operation lineage plus matching runtime authority, or a separately typed tokenless `LegacyRuntimeAuthority` frozen from a complete callback-bearing v0.13 cohort. An active callbackless pre-label cohort is rejected by stopped adoption because provider callback authority cannot be minted safely; only historical cleanup/close evidence remains readable, without zero-survivor or maintenance authority. The store also holds the exact generation checked when a present history is retired by close finalization. Encoded history is capped at 32 MiB per lease | Active release authority is not reconstructed from container survivors. Loss can erase the only identity and callback authority for a committed generation with zero survivors. A pending close remains resumable because its non-expiring callback-store row contains the complete cleanup snapshot and blocks newer operations; an absent release key is already retired. Treat the database and every backup as sensitive causal evidence |
 | `<docker>/retention.db` | Retained-volume ownership, restore CAS generation, destination operation ID/callback pair/manifest/items, and immutable resource profiles | Losing or mismatching this file can orphan retained data or erase restore/finalizer lifecycle authority. Restore it with the matching callbacks/releases databases and substrate |
 
@@ -1442,7 +1444,7 @@ Never run two `providerd` or `docker-backend` instances against the same bbolt f
 
 ## Restart and update operations
 
-`POST /v1/leases/{uuid}/restart` and `POST /v1/leases/{uuid}/update` are tenant-initiated, asynchronous. Each follows a stop-rename → recreate → verify pattern with rollback on failure.
+`POST /v1/leases/{uuid}/restart` and `POST /v1/leases/{uuid}/update` are tenant-initiated, asynchronous. Each captures its source, creates a replacement under volume exclusion, and verifies startup before activating the new release.
 
 Both endpoints require exactly one canonical UUIDv4 `Idempotency-Key`. Fred
 writes the authenticated tenant, lease-scoped key, command kind, update payload
@@ -1492,17 +1494,39 @@ that lease rather than deleting receipt authority by hand.
 
 **On success**: a `success` callback is sent and the lease's status returns to `ready`. For update, provider settlement occurs only after the accepted payload is durably persisted; an idempotent backend replay repeats payload persistence before Fred records acceptance.
 
-**On failure**: rollback restores the previous containers. Two outcomes:
-- **`ReplaceRecovered`**: rollback succeeded, lease back to `ready` (with a `failed` callback indicating the operation failed but service is restored).
-- **`ReplaceFailed`**: both the operation and rollback failed, lease is `failed`. This is rare and indicates a deeper problem (Docker daemon issue, disk full).
+**On failure:** the result depends on durable execution evidence.
+
+- A failure before replacement dispatch, such as an image pull failure, can
+  preserve the intact source after verifying it is healthy. The lease remains
+  `ready` and the maintenance callback reports `failed`.
+- When replacement Docker calls completed and startup failed, Fred captures the
+  failed attempt's logs before cleanup and can recreate source containers from
+  the captured image and runtime configuration using the existing volumes.
+  A verified source returns to `ready` with a `failed` maintenance callback.
+- If source recreation also completes but cannot become ready, the lease becomes
+  `failed`. A Failed lease with no source containers can still be restarted;
+  there is no source to compensate in that case.
+- A timed-out or response-lost Create/Start remains unresolved. Recovery never
+  substitutes an empty inventory or elapsed timeout for completion evidence.
+  `callbacks.db` retains the launch record; subsequent launches and volume
+  namespace changes for that lease refuse with
+  `physical volume has an unsettled Docker launch`. Preserve the databases and
+  directories and investigate the original Docker request. Removing journal
+  rows, recreating paths, or retrying with a different key cannot safely resolve
+  that ambiguity.
+
+Compensation uses the source's captured immutable image and effective settings,
+including its resource limits and callback route. It does not pull a mutable tag
+or undo application/database writes made by the failed replacement. An already
+activated target release cannot be compensated.
 
 **To diagnose a failed update:**
-1. `GET /v1/leases/{uuid}/releases` — the failed release will have `status: "failed"` and an `error` field.
-2. `GET /v1/leases/{uuid}/logs` — old containers' logs are gone after rollback; the diagnostics store retains the failure logs for 7 days.
+1. `GET /v1/leases/{uuid}/releases` — the failed release has `status: "failed"` and curated `reason` and `message` fields.
+2. `GET /v1/leases/{uuid}/logs` — the diagnostics store retains the failed attempt's captured logs for the configured retention (7 days by default), including under `failed/<service>/<instance>` keys alongside live logs when the restored source is Ready. An unavailable diagnostics store delays failed-target removal and terminal failure publication.
 
 ### Restore operations
 
-`POST /v1/leases/{lease_uuid}/restore` (on providerd; `POST /restore` on the docker-backend) re-deploys a lease onto its **retained** (soft-deleted) volumes — the v0.5.0 headline feature. It runs through the same replace machinery as restart/update, so the rollback semantics above apply, with one extra synchronous *adopt prelude* up front that renames the `fred-retained-*` volumes back to their canonical names before the worker spawns.
+`POST /v1/leases/{lease_uuid}/restore` (on providerd; `POST /restore` on the docker-backend) re-deploys a lease onto its **retained** (soft-deleted) volumes — the v0.5.0 headline feature. Restore has its own durable operation and retention-finalizer protocol. Its adoption phase renames the exact `fred-retained-*` volumes to the destination namespace; failed restoration returns them only through the exact failed-operation handback described below.
 
 **Provider-side admission and recovery.** Before contacting a backend, providerd
 acquires ordered lifecycle claims for both source and target, re-reads the target

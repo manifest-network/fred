@@ -17,6 +17,7 @@ type dockerReadView struct {
 	containerLogs        func(context.Context, string, int) (string, error)
 	listContainers       func(context.Context) ([]ContainerInfo, error)
 	listContainersStrict func(context.Context) ([]ContainerInfo, error)
+	listVolumeWriters    func(context.Context) ([]ContainerInfo, error)
 	listNetworks         func(context.Context) ([]networktypes.Inspect, error)
 	containerEvents      func(context.Context) (<-chan ContainerEvent, <-chan error)
 }
@@ -27,6 +28,7 @@ func projectDockerRead(client dockerReadClient) dockerReadClient {
 		inspectContainer: client.InspectContainer,
 		containerLogs:    client.ContainerLogs, listContainers: client.ListManagedContainers,
 		listContainersStrict: client.ListManagedContainersStrict,
+		listVolumeWriters:    client.ListVolumeWriters,
 		listNetworks:         client.ListManagedNetworks, containerEvents: client.ContainerEvents,
 	}
 }
@@ -48,6 +50,9 @@ func (v dockerReadView) ListManagedContainers(ctx context.Context) ([]ContainerI
 }
 func (v dockerReadView) ListManagedContainersStrict(ctx context.Context) ([]ContainerInfo, error) {
 	return v.listContainersStrict(ctx)
+}
+func (v dockerReadView) ListVolumeWriters(ctx context.Context) ([]ContainerInfo, error) {
+	return v.listVolumeWriters(ctx)
 }
 func (v dockerReadView) ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error) {
 	return v.listNetworks(ctx)

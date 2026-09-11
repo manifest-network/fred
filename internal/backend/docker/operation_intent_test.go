@@ -14,6 +14,7 @@ import (
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
+	"github.com/containerd/errdefs"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -308,7 +309,19 @@ func newOperationIntentRecoveryBackend(
 					return &copy, nil
 				}
 			}
-			return nil, assert.AnError
+			return nil, errdefs.ErrNotFound
+		},
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			for index, container := range inventory {
+				if container.ContainerID == containerID {
+					inventory = slices.Delete(inventory, index, index+1)
+					return nil
+				}
+			}
+			return errdefs.ErrNotFound
+		},
+		ContainerLogsFn: func(context.Context, string, int) (string, error) {
+			return "captured recovery fixture logs", nil
 		},
 	}
 	b := newBackendForTest(mock, provisions)
@@ -335,7 +348,7 @@ func newOperationIntentRecoveryBackend(
 	b.releaseCapacityPlanner = settlement
 	b.maintenanceSettlement = newTestMaintenanceSettlement(t, store, releaseStore)
 	require.NoError(t, bindBackendTestPhysicalExecutors(
-		b, b.operationSettlement.(*shared.OperationSettlement), b.maintenanceSettlement,
+		t, b, b.operationSettlement.(*shared.OperationSettlement), b.maintenanceSettlement,
 	))
 	bindBackendTestCloseExecutor(t, b, closeSettlement)
 	// Every fixture container carrying the pending operation callback represents
@@ -372,8 +385,28 @@ func newOperationIntentRecoveryBackend(
 	b.storeAuthorityGate = authority.gate
 	b.storageVerifier = testDockerRuntimeStorageVerifier{id: authority.storage.ID()}
 	b.callbackPublisher = callbackPublisherForCallbackTest(t, store)
+	bindTestDiagnosticsStore(t, b, b.diagnosticsStore)
 	bindBackendRecoveryCoordinatorForTest(t, b)
 	return b
+}
+
+// forbidOperationRecoveryTeardown makes preservation scenarios fail at either
+// destructive Docker boundary, including later recovery passes in the same
+// test. Tests which expect cleanup use their own explicit removal counters.
+func forbidOperationRecoveryTeardown(t *testing.T, b *Backend) {
+	t.Helper()
+	docker, ok := b.docker.(*mockDockerClient)
+	require.True(t, ok, "preservation fixture requires an explicit Docker mock")
+	compose, ok := b.compose.(*mockComposeExecutor)
+	require.True(t, ok, "preservation fixture requires an explicit Compose mock")
+	docker.RemoveContainerFn = func(_ context.Context, id string) error {
+		t.Errorf("preserved recovery scenario attempted to remove container %q", id)
+		return errors.New("unexpected exact-container teardown in preservation scenario")
+	}
+	compose.DownFn = func(_ context.Context, project string, _ time.Duration) error {
+		t.Errorf("preserved recovery scenario attempted Compose Down for %q", project)
+		return errors.New("unexpected Compose teardown in preservation scenario")
+	}
 }
 
 // startPendingOperationForRecoveryTest models a crash after the durable
@@ -466,6 +499,7 @@ func TestRecoverOperationIntent_RestartAfterSubstrateSuccessBeforeCallback(t *te
 	// changes can retain identical payload bytes while changing the exact
 	// container cohort. Recovery must supersede this stale topology.
 
+	forbidOperationRecoveryTeardown(t, b)
 	require.NoError(t, b.recoverOperationIntents(context.Background()))
 	intents, err := listOperationIntentsForCallbackTest(t, store)
 	require.NoError(t, err)
@@ -509,6 +543,7 @@ func TestRecoverOperationIntent_BoundsContainerInspection(t *testing.T) {
 		},
 	}
 
+	forbidOperationRecoveryTeardown(t, b)
 	started := time.Now()
 	err = b.recoverOperationIntents(context.Background())
 	require.ErrorIs(t, err, context.DeadlineExceeded)
@@ -554,6 +589,7 @@ func TestRecoverOperationIntent_FinalVisibilityReadTimeoutPreservesIntentForRetr
 		return nil
 	}}
 
+	forbidOperationRecoveryTeardown(t, b)
 	require.NoError(t, b.recoverOperationIntents(context.Background()),
 		"startup must defer a young Started operation after one empty observation")
 	b.cfg.ProvisionTimeout = time.Nanosecond
@@ -613,6 +649,7 @@ func TestRecoverOperationIntent_WaitsInProcessForProvisionHealth(t *testing.T) {
 		return &observed, nil
 	}
 
+	forbidOperationRecoveryTeardown(t, b)
 	startedAt := time.Now()
 	err = b.recoverOperationIntents(context.Background())
 	require.NoError(t, err)
@@ -696,6 +733,7 @@ func TestRecoverOperationIntent_ReobservesEmptyInventoryBeforeSettlement(t *test
 				return &copy, nil
 			}
 
+			forbidOperationRecoveryTeardown(t, b)
 			require.NoError(t, b.recoverOperationIntents(context.Background()))
 			intents, listErr := listOperationIntentsForCallbackTest(t, store)
 			require.NoError(t, listErr)
@@ -742,6 +780,7 @@ func TestRecoverOperationIntent_RetriesTransientSettlementOnNextPass(t *testing.
 	}
 	b.callbackPublisher = journal
 
+	forbidOperationRecoveryTeardown(t, b)
 	err = b.recoverOperationIntents(context.Background())
 	require.ErrorContains(t, err, "transient operation settlement failure")
 	intents, listErr := listOperationIntentsForCallbackTest(t, store)
@@ -825,6 +864,7 @@ func TestRecoverLiveOperationIntent_DefersLeaseWithActiveCommand(t *testing.T) {
 		return nil, nil
 	}}
 
+	forbidOperationRecoveryTeardown(t, b)
 	unlock := b.commandFence.Lock(spec.LeaseUUID)
 	started := time.Now()
 	require.NoError(t, b.recoverLiveOperationIntents(context.Background()))
@@ -837,7 +877,7 @@ func TestRecoverLiveOperationIntent_DefersLeaseWithActiveCommand(t *testing.T) {
 	assert.Len(t, intents, 1)
 }
 
-func TestRecoverOperationIntent_TearsDownCreateThatAppearsAfterFirstDown(t *testing.T) {
+func TestRecoverOperationIntent_TearsDownCreatesAfterInitialEmptyObservation(t *testing.T) {
 	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 	require.NoError(t, err)
 	store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{
@@ -853,8 +893,11 @@ func TestRecoverOperationIntent_TearsDownCreateThatAppearsAfterFirstDown(t *test
 	b.cfg.ContainerStartTimeout = 20 * time.Millisecond
 	b.cfg.ProvisionTimeout = time.Hour
 	late := []ContainerInfo{
-		dockerIntentContainer(spec, "late-after-down", spec.Items[0].SKU, 0),
+		dockerIntentContainer(spec, "late-after-empty-observation", spec.Items[0].SKU, 0),
 		dockerIntentContainer(spec, "later-after-targeted-remove", spec.Items[0].SKU, 0),
+	}
+	for index := range late {
+		late[index].Status = "created"
 	}
 	lists := 0
 	lateVisible := false
@@ -883,18 +926,17 @@ func TestRecoverOperationIntent_TearsDownCreateThatAppearsAfterFirstDown(t *test
 	downCalls := 0
 	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
 		downCalls++
-		lateVisible = true
 		return nil
 	}}
 
 	require.NoError(t, b.recoverOperationIntents(context.Background()))
 	assert.Zero(t, downCalls, "startup must defer an empty Started generation")
 	b.cfg.ProvisionTimeout = time.Nanosecond
+	lateVisible = true
 	require.NoError(t, b.recoverLiveOperationIntents(context.Background()))
-	assert.Equal(t, 1, downCalls,
-		"positive survivor evidence must not be delegated back to the disproved Compose sweep")
+	assert.Zero(t, downCalls, "capture must precede each exact removal; no label sweep may erase unseen logs")
 	assert.Equal(t, []string{late[0].ContainerID, late[1].ContainerID}, removed,
-		"each cohort published after Down or a targeted removal must be removed by exact container identity")
+		"each cohort published after an empty observation or targeted removal must be captured and removed by exact identity")
 	assert.GreaterOrEqual(t, lists, 5)
 	intents, listErr := listOperationIntentsForCallbackTest(t, store)
 	require.NoError(t, listErr)
@@ -952,6 +994,7 @@ func TestTeardownRecoveredOperationRejectsLateContradictoryAuthority(t *testing.
 					if visible {
 						return []ContainerInfo{foreign}, nil
 					}
+					visible = true
 					return nil, nil
 				},
 				InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
@@ -963,10 +1006,6 @@ func TestTeardownRecoveredOperationRejectsLateContradictoryAuthority(t *testing.
 					return nil
 				},
 			}
-			b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
-				visible = true
-				return nil
-			}}
 
 			bindBackendRecoveryCoordinatorForTest(t, b)
 			acquired, scopeErr := b.recoveryCoordinator.WithLease(
@@ -1228,12 +1267,12 @@ func TestRecoverOperationIntent_CreatedProvisionCannotWedgeStartup(t *testing.T)
 	)
 	b.cfg.ContainerStartTimeout = 20 * time.Millisecond
 	b.cfg.ProvisionTimeout = time.Hour
-	compose := b.compose.(*mockComposeExecutor)
-	originalDown := compose.DownFn
+	remover := b.docker.(*mockDockerClient)
+	originalRemove := remover.RemoveContainerFn
 	teardownCalls := 0
-	compose.DownFn = func(ctx context.Context, leaseUUID string, timeout time.Duration) error {
+	remover.RemoveContainerFn = func(ctx context.Context, containerID string) error {
 		teardownCalls++
-		return originalDown(ctx, leaseUUID, timeout)
+		return originalRemove(ctx, containerID)
 	}
 
 	startedAt := time.Now()
@@ -1281,12 +1320,12 @@ func TestRecoverOperationIntent_PausedProvisionWithoutHealthCheckCannotWedgeStar
 	)
 	b.cfg.ContainerStartTimeout = 20 * time.Millisecond
 	b.cfg.ProvisionTimeout = time.Hour
-	compose := b.compose.(*mockComposeExecutor)
-	originalDown := compose.DownFn
+	remover := b.docker.(*mockDockerClient)
+	originalRemove := remover.RemoveContainerFn
 	teardownCalls := 0
-	compose.DownFn = func(ctx context.Context, leaseUUID string, timeout time.Duration) error {
+	remover.RemoveContainerFn = func(ctx context.Context, containerID string) error {
 		teardownCalls++
-		return originalDown(ctx, leaseUUID, timeout)
+		return originalRemove(ctx, containerID)
 	}
 
 	startedAt := time.Now()
@@ -1346,11 +1385,11 @@ func TestRecoverOperationIntent_NonterminalCandidateFreezesLegacyPredecessorBefo
 	)
 	b.cfg.ContainerStartTimeout = time.Minute
 	b.cfg.ProvisionTimeout = time.Nanosecond
-	compose := b.compose.(*mockComposeExecutor)
-	originalDown := compose.DownFn
+	remover := b.docker.(*mockDockerClient)
+	originalRemove := remover.RemoveContainerFn
 	teardownCalls := 0
 	predecessorFrozenAtTeardown := false
-	compose.DownFn = func(ctx context.Context, leaseUUID string, timeout time.Duration) error {
+	remover.RemoveContainerFn = func(ctx context.Context, containerID string) error {
 		teardownCalls++
 		active, readErr := b.releaseStore.LatestActive(candidate.LeaseUUID)
 		if readErr != nil {
@@ -1360,14 +1399,14 @@ func TestRecoverOperationIntent_NonterminalCandidateFreezesLegacyPredecessorBefo
 		if !predecessorFrozenAtTeardown {
 			return errors.New("legacy predecessor authority was not frozen before teardown")
 		}
-		return originalDown(ctx, leaseUUID, timeout)
+		return originalRemove(ctx, containerID)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	require.NoError(t, b.recoverOperationIntents(ctx),
 		"a validated predecessor makes the interrupted replacement terminal without waiting out the candidate timeout")
-	assert.Equal(t, 1, teardownCalls)
+	assert.Equal(t, 2, teardownCalls)
 	assert.True(t, predecessorFrozenAtTeardown)
 	active, readErr := b.releaseStore.LatestActive(candidate.LeaseUUID)
 	require.NoError(t, readErr)
@@ -1422,6 +1461,7 @@ func TestRecoverOperationIntent_NonterminalCandidateRejectsContradictoryPredeces
 		teardownCalls++
 		return nil
 	}}
+	forbidOperationRecoveryTeardown(t, b)
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
@@ -1463,7 +1503,19 @@ func TestStart_CreatedProvisionIntentConvergesInsteadOfRestartLoop(t *testing.T)
 					return &copy, nil
 				}
 			}
-			return nil, fmt.Errorf("container %s is absent", containerID)
+			return nil, errdefs.ErrNotFound
+		},
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			inventoryMu.Lock()
+			defer inventoryMu.Unlock()
+			for index, current := range inventory {
+				if current.ContainerID == containerID {
+					teardown++
+					inventory = slices.Delete(inventory, index, index+1)
+					return nil
+				}
+			}
+			return errdefs.ErrNotFound
 		},
 		CloseFn: func() error { return nil },
 	}
@@ -1471,13 +1523,6 @@ func TestStart_CreatedProvisionIntentConvergesInsteadOfRestartLoop(t *testing.T)
 	bindTestStorageIdentity(t, b, mock)
 	b.cfg.ContainerStartTimeout = 20 * time.Millisecond
 	b.volumes = &mockVolumeManager{}
-	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
-		inventoryMu.Lock()
-		defer inventoryMu.Unlock()
-		teardown++
-		inventory = nil
-		return nil
-	}}
 
 	store := b.callbackStore
 	b.callbackStore = store
@@ -1573,6 +1618,7 @@ func TestStart_PromotesProvisionThatBecomesReadyDuringBoundedRecovery(t *testing
 	restarting = dockerIntentContainer(spec, "restarting-container", spec.Items[0].SKU, 0)
 	restarting.Status = "restarting"
 
+	forbidOperationRecoveryTeardown(t, b)
 	started := time.Now()
 	require.NoError(t, b.Start(context.Background()))
 	assert.Less(t, time.Since(started), time.Second,
@@ -1703,6 +1749,7 @@ func TestStart_PendingRestoreOwnsEmptyInventoryUntilLateExactCohort(t *testing.T
 	require.NoError(t, err)
 	startPendingOperationForRecoveryTest(t, b)
 
+	forbidOperationRecoveryTeardown(t, b)
 	started := time.Now()
 	require.NoError(t, b.Start(context.Background()))
 	assert.Less(t, time.Since(started), time.Second,
@@ -1781,12 +1828,12 @@ func TestRecoverOperationIntent_ProvisionHealthDeadlineIsTerminal(t *testing.T) 
 		observed := container
 		return &observed, nil
 	}
-	compose := b.compose.(*mockComposeExecutor)
-	originalDown := compose.DownFn
+	remover := b.docker.(*mockDockerClient)
+	originalRemove := remover.RemoveContainerFn
 	teardownCalls := 0
-	compose.DownFn = func(ctx context.Context, leaseUUID string, timeout time.Duration) error {
+	remover.RemoveContainerFn = func(ctx context.Context, containerID string) error {
 		teardownCalls++
-		return originalDown(ctx, leaseUUID, timeout)
+		return originalRemove(ctx, containerID)
 	}
 
 	started := time.Now()
@@ -1836,19 +1883,19 @@ func TestRecoverOperationIntent_FailedSiblingMakesProvisionTerminal(t *testing.T
 		readyIntentProjection(spec, failed.ContainerID, starting.ContainerID),
 	)
 	b.cfg.ProvisionTimeout = time.Minute
-	compose := b.compose.(*mockComposeExecutor)
-	originalDown := compose.DownFn
+	remover := b.docker.(*mockDockerClient)
+	originalRemove := remover.RemoveContainerFn
 	teardownCalls := 0
-	compose.DownFn = func(ctx context.Context, leaseUUID string, timeout time.Duration) error {
+	remover.RemoveContainerFn = func(ctx context.Context, containerID string) error {
 		teardownCalls++
-		return originalDown(ctx, leaseUUID, timeout)
+		return originalRemove(ctx, containerID)
 	}
 
 	started := time.Now()
 	require.NoError(t, b.recoverOperationIntents(context.Background()))
 	assert.Less(t, time.Since(started), time.Second,
 		"a failed sibling makes success impossible; recovery must not wait out the health deadline")
-	assert.Equal(t, 1, teardownCalls)
+	assert.Equal(t, 2, teardownCalls, "every failed-cohort container is captured before exact removal")
 	pending, listErr := store.ListPending()
 	require.NoError(t, listErr)
 	require.Len(t, pending, 1)
@@ -1878,6 +1925,7 @@ func TestRecoverOperationIntent_CancellationPreservesNonterminalProvision(t *tes
 		teardownCalls++
 		return nil
 	}}
+	forbidOperationRecoveryTeardown(t, b)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -1955,7 +2003,7 @@ func TestProvisionReleaseAppendFailureRetainsIntentUntilRestartRecovery(t *testi
 	b.storageVerifier = testDockerRuntimeStorageVerifier{id: storageID}
 	installTestStorageMutationAdapters(b)
 	require.NoError(t, bindBackendTestPhysicalExecutors(
-		b, settlement, b.maintenanceSettlement,
+		t, b, settlement, b.maintenanceSettlement,
 	))
 	b.cfg.StartupVerifyDuration = time.Millisecond
 	claim := createdDockerOperationClaim(t, admission)
@@ -1963,6 +2011,7 @@ func TestProvisionReleaseAppendFailureRetainsIntentUntilRestartRecovery(t *testi
 	require.NoError(t, err)
 	execution, err := settlement.StartOperationExecution(candidate)
 	require.NoError(t, err)
+	forbidOperationRecoveryTeardown(t, b)
 	physical := settlement.ExecuteOperation(context.Background(), execution)
 	success, ok := physical.(shared.OperationExecutionSuccess)
 	require.True(t, ok, "physical result = %T, want exact target ready", physical)
@@ -1991,6 +2040,7 @@ func TestProvisionReleaseAppendFailureRetainsIntentUntilRestartRecovery(t *testi
 	)
 	recoveredReleaseStore := recovered.releaseStore
 
+	forbidOperationRecoveryTeardown(t, recovered)
 	require.NoError(t, recovered.recoverOperationIntents(context.Background()))
 	intents, err = listOperationIntentsForCallbackTest(t, callbackStore)
 	require.NoError(t, err)
@@ -2269,6 +2319,7 @@ func TestProvisionRejectsPredecessorPrincipalMismatchBeforeTeardown(t *testing.T
 		return nil
 	}}
 
+	forbidOperationRecoveryTeardown(t, b)
 	req := backend.ProvisionRequest{
 		LeaseUUID:    oldSpec.LeaseUUID,
 		Tenant:       "tenant-a",
@@ -3039,8 +3090,15 @@ func TestRecoverOperationIntent_PartialProvisionCohortIsTornDownBeforeFailureSet
 	require.NoError(t, listErr)
 	require.Len(t, pending, 1)
 	assert.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
-	_, getErr := b.GetProvision(context.Background(), spec.LeaseUUID)
-	assert.ErrorIs(t, getErr, backend.ErrNotProvisioned)
+	info, getErr := b.GetProvision(context.Background(), spec.LeaseUUID)
+	require.NoError(t, getErr)
+	assert.Equal(t, backend.ProvisionStatusFailed, info.Status, "the removed failed cohort remains diagnosable")
+	logs, getErr := b.GetLogs(context.Background(), spec.LeaseUUID, 100)
+	require.NoError(t, getErr)
+	assert.Equal(t, "captured recovery fixture logs", logs[spec.Items[0].ServiceName+"/0"])
+	live, listErr := b.ListProvisions(context.Background())
+	require.NoError(t, listErr)
+	assert.Empty(t, live, "diagnostics cannot recreate live substrate inventory")
 	assert.Nil(t, b.pool.GetAllocation(spec.LeaseUUID+"-app-0"))
 	assert.Nil(t, b.pool.GetAllocation(spec.LeaseUUID+"-app-1"))
 
@@ -3393,6 +3451,7 @@ func TestRecoverOperationIntentRejectsAmbiguousLegacyPredecessor(t *testing.T) {
 				downCalls++
 				return nil
 			}}
+			forbidOperationRecoveryTeardown(t, b)
 			err = b.recoverOperationIntents(context.Background())
 			require.ErrorContains(t, err, tc.want)
 			assert.Zero(t, downCalls)
@@ -3666,6 +3725,7 @@ func TestRecoverOperationIntent_ExactContainersRebuildProjectionWithoutCurrentSK
 				t, store, storageID, []ContainerInfo{container}, tt.projection(spec, container.ContainerID),
 			)
 
+			forbidOperationRecoveryTeardown(t, b)
 			err = b.recoverOperationIntents(context.Background())
 			if tt.wantOK {
 				require.NoError(t, err)
@@ -3766,6 +3826,7 @@ func TestRecoverOperationIntent_RequiresExactManifestImageAndEffectiveDomain(t *
 				t, store, storageID, containers, readyIntentProjection(spec, ids...),
 			)
 
+			forbidOperationRecoveryTeardown(t, b)
 			err = b.recoverOperationIntents(context.Background())
 			if tt.wantOK {
 				require.NoError(t, err)

@@ -1,8 +1,11 @@
 package docker
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -14,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 func platformSecurityJSON(id, mediaType string) string {
@@ -22,37 +26,45 @@ func platformSecurityJSON(id, mediaType string) string {
 
 func TestImageInspectionHelperMaterializesExactPlatformBeforeCreate(t *testing.T) {
 	pulled, created := false, false
-	cli := newImageSecurityDockerClient(t, func(req *http.Request) (*http.Response, error) {
-		switch {
-		case strings.HasSuffix(req.URL.Path, "/images/create"):
-			assert.Contains(t, req.URL.RawQuery, "sha256", "pull must name the immutable selected manifest")
-			assert.Contains(t, req.URL.Query().Encode(), strings.TrimPrefix(otherTestImageID, "sha256:"))
-			pulled = true
-			return imageSecurityResponse(http.StatusOK, `{}`), nil
-		case strings.HasSuffix(req.URL.Path, "/containers/create"):
-			require.True(t, pulled)
-			var config container.Config
-			require.NoError(t, json.NewDecoder(req.Body).Decode(&config))
-			assert.Equal(t, otherTestImageID, config.Image)
-			assert.Equal(t, "linux/amd64", req.URL.Query().Get("platform"))
-			created = true
-			return imageSecurityResponse(http.StatusCreated, `{"Id":"helper"}`), nil
-		case strings.Contains(req.URL.Path, otherTestImageID):
-			if !pulled {
-				return imageSecurityResponse(http.StatusNotFound, `{"message":"no standalone leaf record"}`), nil
+	h := newInspectionHarnessWithClient(t, func(daemon *inspectionDaemon) *DockerClient {
+		return newImageSecurityDockerClient(t, func(req *http.Request) (*http.Response, error) {
+			switch {
+			case strings.HasSuffix(req.URL.Path, "/images/create"):
+				assert.Contains(t, req.URL.RawQuery, "sha256", "pull must name the immutable selected manifest")
+				assert.Contains(t, req.URL.Query().Encode(), strings.TrimPrefix(otherTestImageID, "sha256:"))
+				pulled = true
+				return imageSecurityResponse(http.StatusOK, `{}`), nil
+			case strings.HasSuffix(req.URL.Path, "/containers/create"):
+				require.True(t, pulled)
+				body, err := io.ReadAll(req.Body)
+				require.NoError(t, err)
+				req.Body = io.NopCloser(bytes.NewReader(body))
+				var config container.Config
+				require.NoError(t, json.Unmarshal(body, &config))
+				assert.Equal(t, otherTestImageID, config.Image)
+				assert.Equal(t, "linux/amd64", req.URL.Query().Get("platform"))
+				created = true
+				return daemon.request(t, req)
+			case strings.Contains(req.URL.Path, "/containers/"):
+				return daemon.request(t, req)
+			case strings.Contains(req.URL.Path, otherTestImageID):
+				if !pulled {
+					return imageSecurityResponse(http.StatusNotFound, `{"message":"no standalone leaf record"}`), nil
+				}
+				return imageSecurityResponse(http.StatusOK, platformSecurityJSON(otherTestImageID, ocispec.MediaTypeImageManifest)), nil
+			case req.URL.Query().Get("platform") != "":
+				assert.Contains(t, req.URL.Path, testImageID)
+				return imageSecurityResponse(http.StatusOK, platformSecurityJSON(otherTestImageID, ocispec.MediaTypeImageManifest)), nil
+			default:
+				return imageSecurityResponse(http.StatusOK, platformSecurityJSON(testImageID, ocispec.MediaTypeImageIndex)), nil
 			}
-			return imageSecurityResponse(http.StatusOK, platformSecurityJSON(otherTestImageID, ocispec.MediaTypeImageManifest)), nil
-		case req.URL.Query().Get("platform") != "":
-			assert.Contains(t, req.URL.Path, testImageID)
-			return imageSecurityResponse(http.StatusOK, platformSecurityJSON(otherTestImageID, ocispec.MediaTypeImageManifest)), nil
-		default:
-			return imageSecurityResponse(http.StatusOK, platformSecurityJSON(testImageID, ocispec.MediaTypeImageIndex)), nil
-		}
+		})
 	})
-	admitted, err := cli.AdmitImage(t.Context(), "tenant/app:latest")
-	require.NoError(t, err)
-	_, err = cli.createImageInspectionContainer(t.Context(), admitted)
-	require.NoError(t, err)
+	h.execute(t, func(ctx context.Context, origin shared.ImageInspectionOrigin) error {
+		session, err := h.client.openImageInspection(ctx, h.image, origin)
+		require.NoError(t, err)
+		return session.close()
+	})
 	assert.True(t, created)
 }
 

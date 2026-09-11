@@ -740,7 +740,12 @@ GET /v1/leases/{lease_uuid}/logs?tail=100
 Authorization: Bearer <token>
 ```
 
-Returns container logs for a lease. Works for both active and non-active leases, falling back to persisted logs when the provision is no longer in memory.
+Returns live container logs under `<service>/<instance>` keys, falling back to
+persisted failure logs after removal. When compensation restores the previous
+Ready deployment after a failed update or restart, its live keys remain unchanged
+and the failed attempt appears under `failed/<service>/<instance>` keys. A later
+deployment removes those older failure entries from the active view. Logs share
+a 32 MiB aggregate content budget, with bounded marker and encoding overhead.
 
 **Query Parameters:**
 - `tail` - Number of log lines to return per container (default: 100, max: 10000)
@@ -752,14 +757,14 @@ Returns container logs for a lease. Works for both active and non-active leases,
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "logs": {
-    "0": "2024-01-15 Starting nginx...\nListening on port 80\n",
-    "1": "2024-01-15 Redis ready\n"
+    "web/0": "2024-01-15 Starting nginx...\nListening on port 80\n",
+    "db/0": "2024-01-15 Redis ready\n"
   }
 }
 ```
 
 **Fields:**
-- `logs` - Map of container instance index to log output
+- `logs` - Map of service/instance keys to log output; `failed/` keys identify the compensated attempt
 
 **Response Codes:**
 - `200 OK` - Logs found
@@ -1359,7 +1364,8 @@ Get provision diagnostics for a specific lease.
 
 ### GET /logs/{lease_uuid}
 
-Get container logs for a specific lease.
+Get logs for a specific lease. Live entries use `<service>/<instance>` keys;
+failed replacement logs use `failed/<service>/<instance>` after compensation.
 
 **Query Parameters:**
 - `tail` - Number of log lines per container (default: 100)
@@ -1367,8 +1373,8 @@ Get container logs for a specific lease.
 **Response:** `200 OK`
 ```json
 {
-  "0": "2024-01-15 Starting nginx...\nListening on port 80\n",
-  "1": "2024-01-15 Redis ready\n"
+  "web/0": "2024-01-15 Starting nginx...\nListening on port 80\n",
+  "db/0": "2024-01-15 Redis ready\n"
 }
 ```
 

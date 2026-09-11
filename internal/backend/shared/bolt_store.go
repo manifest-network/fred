@@ -3,7 +3,6 @@ package shared
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1173,44 +1172,6 @@ func runInitialCleanupSafely(
 	if err := cleanup(); err != nil {
 		slog.Warn("initial "+label+" cleanup failed", "error", err)
 	}
-}
-
-// removeOlderThan is a generic cleanup helper for bbolt stores that store
-// JSON-encoded entries with a timestamp field. It iterates all entries in the
-// bucket, unmarshals each as T, extracts the timestamp using getTime, and
-// deletes entries older than maxAge. Malformed entries are also removed.
-func removeOlderThan[T any](db *bolt.DB, bucket []byte, maxAge time.Duration, getTime func(*T) time.Time) (int, error) {
-	cutoff := time.Now().Add(-maxAge)
-	removed := 0
-
-	err := db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucket)
-		if b == nil {
-			return fmt.Errorf("bucket %q not found", string(bucket))
-		}
-		c := b.Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var entry T
-			if err := json.Unmarshal(v, &entry); err != nil {
-				slog.Warn("removing malformed entry",
-					"bucket", string(bucket), "key", string(k), "error", err)
-				if delErr := c.Delete(); delErr != nil {
-					return delErr
-				}
-				removed++
-				continue
-			}
-			if getTime(&entry).Before(cutoff) {
-				if delErr := c.Delete(); delErr != nil {
-					return delErr
-				}
-				removed++
-			}
-		}
-		return nil
-	})
-
-	return removed, err
 }
 
 // Healthy checks that the bbolt database is accessible and the bucket exists.

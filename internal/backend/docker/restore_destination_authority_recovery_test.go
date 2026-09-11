@@ -610,13 +610,20 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 	b.cfg.StartupVerifyDuration = time.Millisecond
 	// Admission and the real actor worker must not race the recovery deadline
 	// this test will exercise later. Stage the expired recovery policy only
-	// after proving the failed Compose call and exclusive actor quiescence.
+	// after proving the completed launch, local discovery failure, and exclusive
+	// actor quiescence.
 	b.cfg.ProvisionTimeout = time.Minute
-	composeUpReached := make(chan error, 1)
+	startupDiscoveryReached := make(chan error, 1)
 	b.compose = &mockComposeExecutor{
-		UpFn: func(ctx context.Context, _ *composetypes.Project, _ composeUpOpts) error {
-			composeUpReached <- ctx.Err()
-			return errors.New("compose up boom")
+		UpFn: func(context.Context, *composetypes.Project, composeUpOpts) error {
+			return nil
+		},
+		PSFn: func(ctx context.Context, _ string) ([]composeContainerSummary, error) {
+			// Launch completion must be durable before a read-only discovery
+			// failure permits recovery to hand the source volume back. A lost
+			// Up reply would instead retain its canonical namespace indefinitely.
+			startupDiscoveryReached <- errors.Join(ctx.Err(), b.volumeLaunches.checkNamespace(destinationLease))
+			return nil, errors.New("compose ps boom after completed launch")
 		},
 		DownFn: func(context.Context, string, time.Duration) error {
 			return nil
@@ -715,12 +722,12 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusReady, stable.Status)
 	assert.NotNil(t, b.pool.GetAllocation(stableLease+"-app-0"))
 
-	// Drive the accepted operation through its real actor handoff. A failed
-	// Compose call is ambiguous until the live operation-recovery lane obtains
-	// actor quiescence and performs a second strict absence observation; ordinary
-	// state recovery cannot mint that causal proof.
-	require.NoError(t, waitForAsyncTestResult(t, composeUpReached, "restore Compose.Up entry"),
-		"the intended post-effect failure must occur before the worker deadline")
+	// Drive the accepted operation through its real actor handoff. The launch
+	// completed, but failed startup discovery leaves the operation pending until
+	// live recovery obtains actor quiescence and strictly observes its cohort;
+	// ordinary state recovery cannot mint that causal proof.
+	require.NoError(t, waitForAsyncTestResult(t, startupDiscoveryReached, "restore startup discovery"),
+		"the launch must be durably settled before the read-only failure and worker deadline")
 	var actorClaim *leaseActorRecoveryClaim
 	require.Eventually(t, func() bool {
 		actorClaim = b.tryClaimLeaseActorQuiescence(destinationLease)
@@ -729,7 +736,7 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 	defer actorClaim.Release()
 	claims, err := b.operationSettlement.ListOperationIntents()
 	require.NoError(t, err)
-	require.Len(t, claims, 1, "ambiguous Compose failure must preserve the exact pending operation")
+	require.Len(t, claims, 1, "failed startup discovery must preserve the exact pending operation")
 	require.Equal(t, destinationLease, claims[0].LeaseUUID())
 	require.Equal(t, shared.OperationIntentRestore, claims[0].Kind())
 	require.Equal(t, shared.OperationExecutionStarted, claims[0].ExecutionPhase(),
@@ -738,7 +745,7 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 	volumeNames, err := volumeState.list()
 	require.NoError(t, err)
 	require.Equal(t, []string{canonicalVolumeName(destinationLease, manifest.DefaultServiceName, 0)}, volumeNames,
-		"the ambiguous post-adoption failure must preserve the destination footprint for exact recovery")
+		"the post-launch discovery failure must preserve the destination footprint for exact recovery")
 	// The durable timestamp has already aged and the exclusive actor claim
 	// excludes every worker/config reader. Recovery can now observe an expired
 	// visibility window without using a tiny live-worker timeout as a scheduler.

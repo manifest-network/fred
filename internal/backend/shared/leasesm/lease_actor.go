@@ -578,19 +578,13 @@ func (provisionCompletedMsg) isleaseMessage()          {}
 func (provisionCompletedMsg) onPanic(error)            {} // no caller to unblock
 func (provisionCompletedMsg) isWorkerTerminalMessage() {}
 
-// provisionErroredMsg is sent by the doProvision goroutine on failure.
-// callbackErr is the hardcoded on-chain-safe message; lastError is the
-// full diagnostic string (from err.Error()) that the Failed entry
-// action writes into provision.LastError. logs is the pre-captured
-// container-log map (fetched BEFORE the cleanup defer removed the
-// failed containers) so persistDiagnostics doesn't attempt to re-fetch
-// from already-deleted containers — see doProvision's captureContainerLogs
-// call.
+// provisionErroredMsg carries the exact terminal proof and projection data.
+// Attempt logs remain in the durable diagnostics store; semantic callback
+// publication consumes that proof before exposing the captured failure.
 type provisionErroredMsg struct {
 	callbackErr      string
 	reason           backend.Reason // ENG-508
 	lastError        string
-	logs             map[string]string
 	operationFailure shared.OperationReleaseUncommitted
 }
 
@@ -856,17 +850,6 @@ type LeaseActor struct {
 	// handleUpdateRequested, and called by Provisioning/Restarting/
 	// Updating.OnExit on DeprovisionRequested preemption.
 	workCancel context.CancelFunc
-	// replaceWasActive records whether the lease was counted in
-	// activeProvisions (i.e. Status == Ready) at the instant a restart/update
-	// transition began — captured by onEnterRestarting/onEnterUpdating reading
-	// prov.Status BEFORE overwriting it. The replace-outcome entry actions key
-	// the activeProvisions gauge on THIS actor-observed (serial) value instead
-	// of a prelude-captured route-time status snapshot, which is stale when an
-	// intervening Ready→Failing already Dec'd the gauge (the death-before-queued-restart
-	// ordering, ENG-230 / PR#93 finding #2). Single-field handoff is safe: the
-	// SM permits at most one in-flight replace at a time and the actor is
-	// serial — same discipline as pendingDeathInfo.
-	replaceWasActive bool
 	// replaceCallbackKind distinguishes provision/restore operation completion
 	// from restart/update lifecycle observation. It is set by the serial actor
 	// with the replace entry transition and consumed by the terminal entry
@@ -1015,7 +998,7 @@ func validateLeaseActorConfig(cfg LeaseActorConfig) error {
 	case nilActorCapability(cfg.Metrics):
 		return errors.New("lease actor requires metrics")
 	case cfg.OnTerminated == nil || cfg.PersistDiagnosticsFn == nil ||
-		cfg.PersistDiagnosticsWithLogsFn == nil || cfg.SendOperationSuccessFn == nil ||
+		cfg.SendOperationSuccessFn == nil ||
 		cfg.SendOperationFailureFn == nil || cfg.SendLifecycleFailureFn == nil ||
 		cfg.SendMaintenanceSuccessFn == nil || cfg.SendMaintenanceFailureFn == nil ||
 		cfg.ProvisionWorkFn == nil || cfg.RestoreWorkFn == nil ||
@@ -1245,7 +1228,7 @@ func (a *LeaseActor) handle(msg leaseMessage) {
 		a.handleProvisionCompleted(m.result)
 	case provisionErroredMsg:
 		a.handleProvisionErrored(
-			m.callbackErr, m.reason, m.lastError, m.logs, m.operationFailure,
+			m.callbackErr, m.reason, m.lastError, m.operationFailure,
 		)
 	case operationAmbiguousMsg:
 		a.handleOperationAmbiguous(m)
@@ -1546,7 +1529,6 @@ func (a *LeaseActor) spawnProvisionWorker(
 				callbackErr:      typed.callbackErr,
 				reason:           typed.reason,
 				lastError:        typed.err.Error(),
-				logs:             typed.logs,
 				operationFailure: typed.proof,
 			}
 			event = "provision_errored"
@@ -1567,14 +1549,12 @@ func (a *LeaseActor) handleProvisionErrored(
 	callbackErr string,
 	reason backend.Reason,
 	lastError string,
-	logs map[string]string,
 	operationFailure shared.OperationReleaseUncommitted,
 ) {
 	_ = a.sm.provisionErrored(a.cfg.StopCtx, provisionErrorInfo{
 		callbackErr:      callbackErr,
 		reason:           reason,
 		lastError:        lastError,
-		logs:             logs,
 		operationFailure: operationFailure,
 	})
 }
@@ -1620,9 +1600,8 @@ func (a *LeaseActor) handleRestartRequested(msg restartRequestedMsg) {
 // onEnterRestarting (reused via OnEntryFrom(evRestoreRequested)) writes
 // Status=Restarting + the callback pair before the ack, and spawnReplaceWorker
 // + the evReplace{Completed,Recovered,Failed} terminal events behave
-// identically. Because the prior Status was Provisioning (not Ready),
-// applyReplaceEntry sets replaceWasActive=false, so a successful restore
-// Inc's activeProvisions — bringing the lease from absent to active.
+// identically. The provision store derives readiness accounting directly
+// from the status transition when restore completes.
 func (a *LeaseActor) handleRestoreRequested(msg restoreRequestedMsg) {
 	if a.terminated {
 		msg.Ack <- errActorTerminated
@@ -1704,13 +1683,6 @@ func (a *LeaseActor) validateMaintenanceRequest(
 // dispatches the correct terminal SM event based on (err, recovered).
 // Pre-publishes new ContainerIDs / ServiceContainers on success so a
 // preempting Deprovision reading prov observes the new set under lock.
-//
-// wasActive (whether the lease was Status==Ready at replace-start) is read
-// HERE, on the actor goroutine, before spawning the worker — never inside
-// the worker closure. It is used only when the worker's result sets
-// RecoveredIfSourceActive (the doRestart preflight branch): there the
-// recovered-vs-failed decision keys on wasActive (the actor-observed source)
-// instead of result.restored, fixing the stale-route-time-snapshot edge.
 func (a *LeaseActor) spawnMaintenanceWorker(
 	ctx context.Context,
 	target shared.MaintenanceReleaseClaim,
@@ -1730,7 +1702,6 @@ func (a *LeaseActor) spawnReplaceWorker(
 	target shared.MaintenanceReleaseClaim,
 	operation shared.OperationIntentClaim,
 ) {
-	wasActive := a.replaceWasActive
 	maintenance := a.pendingMaintenance
 	hasMaintenanceAuthority := maintenance.Valid()
 	maintenanceID := maintenance.MaintenanceID()
@@ -1835,21 +1806,11 @@ func (a *LeaseActor) spawnReplaceWorker(
 				}
 			})
 		}
-		// recovered-vs-failed: normally result.restored, but a doRestart
-		// preflight failure (no container touched) sets RecoveredIfSourceActive
-		// so the decision keys on the actor-observed pre-replace activeness
-		// (wasActive, captured above on the actor goroutine) — recovered iff
-		// the lease was Ready/running at replace-start. Every other path
-		// leaves the flag false → recovered == result.restored (unchanged).
-		recovered := result.restored
-		if result.recoveredIfSourceActive {
-			recovered = wasActive
-		}
 		switch {
 		case result.err == nil:
 			terminalMsg = replaceCompletedMsg{result: result.success, maintenanceID: maintenanceID}
 			event = "replace_completed"
-		case recovered:
+		case result.Restored():
 			terminalMsg = replaceRecoveredMsg{info: result.failure, maintenanceID: maintenanceID}
 			event = "replace_recovered"
 		default:

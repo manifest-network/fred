@@ -2,6 +2,8 @@ package docker
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,8 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 // Once a restoring sweep has classified a destination Failed and begun its
@@ -20,55 +20,59 @@ import (
 // after its initial Ready check; Restart could then win while stale rollback
 // moved the newly-live volume back to the source namespace.
 func TestReconcileRestoring_FailedRollbackExcludesRestartAdmission(t *testing.T) {
-	const sourceLease = "0192f1a0-1111-4abc-8def-000000000701"
-	const destinationLease = "0192f1a0-2222-4abc-8def-000000000702"
-	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
-	stack := restoreStackManifest()
-	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
-		destinationLease: {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: destinationLease, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
-			Status: backend.ProvisionStatusFailed, Quantity: 1, Items: items, StackManifest: stack,
-		}},
-	})
-	// This test isolates command-fence exclusion, so model the successful XFS
-	// quota proof that must precede restoring->active handback. The noop volume
-	// backend cannot measure usage and now correctly leaves the finalizer intact.
-	b.volumes = &mockVolumeManager{
-		UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
-	}
-	retentions := attachRetentionStore(t, b)
-	profiles, err := shared.BuildSKUResourceSnapshot(items, b.cfg.GetSKUProfile)
-	require.NoError(t, err)
-	record := shared.RetentionEntry{
-		OriginalLeaseUUID: sourceLease, NewLeaseUUID: destinationLease,
-		Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
-		Items: items, ResourceProfiles: profiles, StackManifest: stack,
-		Status: shared.RetentionStatusRestoring, Generation: 3, CreatedAt: time.Now(),
-	}
-	record = *putRestoringRetention(t, retentions, record)
-	recordRestoreOperationOutcome(t, b, record, backend.CallbackStatusFailed)
+	f := newInterruptedRestoreRecoveryFixture(t, 1, []string{"exited"}, backend.ProvisionStatusFailed, true)
+	b := f.b
+	destinationLease := f.spec.LeaseUUID
+	require.NoError(t, b.recoverOperationIntents(t.Context()))
+	require.Equal(t, []string{"remove:restore-container-0", "re-quarantine"}, f.snapshotEvents())
+
+	// A late exact target remains owned by the durable Failed receipt while
+	// source handback is pending. Reuse the fixture's strict inventory and
+	// capture-before-removal checks; broad Compose Down is explicitly forbidden.
+	late := f.containers[0]
+	late.ContainerID = "restore-container-late"
+	f.addContainer(late)
 
 	teardownEntered := make(chan struct{})
 	allowTeardown := make(chan struct{})
-	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
-		close(teardownEntered)
-		<-allowTeardown
-		return nil
-	}}
+	var signalTeardown, releaseTeardown sync.Once
+	t.Cleanup(func() { releaseTeardown.Do(func() { close(allowTeardown) }) })
+	mock, ok := b.docker.(*mockDockerClient)
+	require.True(t, ok)
+	removeCaptured := mock.RemoveContainerFn
+	mock.RemoveContainerFn = func(ctx context.Context, id string) error {
+		if id != late.ContainerID {
+			return fmt.Errorf("unexpected rollback removal target %q", id)
+		}
+		signalTeardown.Do(func() { close(teardownEntered) })
+		select {
+		case <-allowTeardown:
+			return removeCaptured(ctx, id)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	reconcileDone := make(chan error, 1)
-	go func() { reconcileDone <- b.reconcileRestoring(context.Background(), record) }()
+	go func() { reconcileDone <- b.reconcileRestoring(t.Context(), *f.source) }()
 	select {
 	case <-teardownEntered:
-	case <-time.After(time.Second):
-		t.Fatal("restoring rollback did not enter teardown")
+	case reconcileErr := <-reconcileDone:
+		t.Fatalf("restoring rollback returned before exact removal: %v", reconcileErr)
+	case <-time.After(3 * time.Second):
+		t.Fatal("restoring rollback did not enter captured exact-container removal")
+	}
+	if unlock, available := b.commandFence.TryLock(destinationLease); available {
+		unlock()
+		t.Fatal("exact removal did not retain the destination command fence")
 	}
 
 	restartStarted := make(chan struct{})
 	restartDone := make(chan error, 1)
+	maintenanceID := newTestMaintenanceID(t)
 	go func() {
 		close(restartStarted)
-		restartDone <- b.Restart(context.Background(), backend.RestartRequest{
-			MaintenanceID: newTestMaintenanceID(t), LeaseUUID: destinationLease,
+		restartDone <- b.Restart(t.Context(), backend.RestartRequest{
+			MaintenanceID: maintenanceID, LeaseUUID: destinationLease,
 			CallbackURL: testMaintenanceLifecycleCallbackURL,
 		})
 	}()
@@ -79,17 +83,14 @@ func TestReconcileRestoring_FailedRollbackExcludesRestartAdmission(t *testing.T)
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	close(allowTeardown)
-	require.NoError(t, <-reconcileDone)
-	require.ErrorIs(t, <-restartDone, backend.ErrNotProvisioned,
+	releaseTeardown.Do(func() { close(allowTeardown) })
+	require.NoError(t, waitForAsyncTestResult(t, reconcileDone, "failed restore source handback"))
+	require.ErrorIs(t, waitForAsyncTestResult(t, restartDone, "Restart after failed restore handback"), backend.ErrNotProvisioned,
 		"Restart may re-evaluate only after rollback removes the failed destination")
 
-	current, err := retentions.Get(sourceLease)
-	require.NoError(t, err)
-	require.NotNil(t, current)
-	assert.Equal(t, shared.RetentionStatusActive, current.Status)
-	b.provisionsMu.RLock()
-	_, destinationExists := b.provisions[destinationLease]
-	b.provisionsMu.RUnlock()
-	assert.False(t, destinationExists)
+	assertInterruptedRestoreSettled(t, f)
+	assert.Equal(t, []string{
+		"remove:restore-container-0", "re-quarantine", "remove:restore-container-late",
+		"measure-source-quota", "restore-source-quota",
+	}, f.snapshotEvents(), "exact target retirement must precede complete source handback")
 }

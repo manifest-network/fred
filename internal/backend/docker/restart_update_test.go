@@ -1313,19 +1313,10 @@ func TestUpdate_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
 		"routing failure must leave LifecycleCallbackURL unchanged (no speculative write)")
 }
 
-// --- ENG-230 / PR #93: restart-preflight recovered-vs-failed is derived by
-// the ACTOR from its serial replaceWasActive (via the RecoveredIfSourceActive
-// flag that doRestart sets), NOT a stale prelude status snapshot ---
-//
-// A restart that fails SKU-profile preflight touches NO containers, so the
-// lease is left exactly in its replace-start state. "Recovered to Ready" is
-// correct iff its containers were running at replace-start — i.e. iff the SM
-// source was Ready (== wasActive). Cases (1)–(4) pin the actor MAPPING (a
-// stub Work returning a preflight ReplaceResult, routed directly to the
-// actor); case (5) pins doRestart SETTING the flag. (1)+(5) together cover
-// both halves.
+// These historical actor-ordering scenarios exercise terminal event mapping
+// under concurrent death and restart. Production source recovery now requires
+// exact SourceReady evidence; a route-time status snapshot grants no readiness.
 
-// preflightCallbackServer returns a 200-OK callback server (cleaned up via t).
 func preflightCallbackServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1515,13 +1506,18 @@ func TestContainerDiedThenRestartPreflight_EndsFailed(t *testing.T) {
 // ReasonImagePullFailed on the ReplaceFailureInfo — not the generic
 // ReasonUpdateFailed — so tenants see the precise failure category (ENG-508).
 func TestDoUpdate_PreflightFailure_ReasonIsImagePullFailed(t *testing.T) {
+	pulled := make(chan string, 1)
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			pulled <- imageName
 			return fmt.Errorf("manifest unknown: no such image %s", imageName)
 		},
+		// Failure diagnostics must observe a real, explicitly empty cohort;
+		// an unstubbed inventory panic would replace the typed pull failure.
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
 	}
 	b := newBackendForTest(mock, nil)
-	defer b.stopCancel()
+	defer func() { b.stopCancel(); b.wg.Wait() }()
 	b.cfg.Name = "docker-a"
 
 	stack := &manifest.StackManifest{
@@ -1588,6 +1584,13 @@ func TestDoUpdate_PreflightFailure_ReasonIsImagePullFailed(t *testing.T) {
 		defer b.provisionsMu.RUnlock()
 		return b.provisions[leaseUUID].Status == backend.ProvisionStatusFailed
 	}, 2*time.Second, time.Millisecond)
+	awaitProvisionWorkerQuiescence(t, b, leaseUUID)
+	select {
+	case image := <-pulled:
+		require.Equal(t, "nginx:latest", image)
+	default:
+		t.Fatal("update failed before reaching the image-pull fixture")
+	}
 	b.provisionsMu.RLock()
 	result := b.provisions[leaseUUID].ProvisionState
 	b.provisionsMu.RUnlock()

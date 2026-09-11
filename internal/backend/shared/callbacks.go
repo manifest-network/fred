@@ -289,6 +289,35 @@ func inspectCallbackStoreReadOnlyFile(
 		if err := validateCallbackRootBuckets(tx); err != nil {
 			return err
 		}
+		if err := visitImageInspectionsTx(tx, func(r imageInspectionRecord) error {
+			encoded, err := encodeImageInspection(r)
+			if err != nil {
+				return err
+			}
+			if err := budget.observe([]byte(r.ID), encoded); err != nil {
+				return err
+			}
+			inspection.Pending++
+			return nil
+		}); err != nil {
+			return err
+		}
+		if err := validateMaintenanceCompensationsTx(tx); err != nil {
+			return err
+		}
+		if err := visitVolumeLaunchDebtsTx(tx, func(r volumeLaunchDebtRecord) error {
+			encoded, err := json.Marshal(r)
+			if err != nil {
+				return err
+			}
+			if err := budget.observe([]byte(volumeLaunchKey(r)), encoded); err != nil {
+				return err
+			}
+			inspection.Pending++
+			return nil
+		}); err != nil {
+			return err
+		}
 		present := countCallbackSchemaBuckets(tx)
 		if present == 0 {
 			// A stopped v0.13 backend has none of the current buckets. Its
@@ -525,6 +554,16 @@ func PrepareBoundCallbackStoreStorage(
 }
 
 func validateCallbackStoreBeforeBinding(tx *bolt.Tx) error {
+	if err := visitVolumeLaunchDebtsTx(tx, func(volumeLaunchDebtRecord) error {
+		return errors.New("volume launch debt must be settled before storage adoption")
+	}); err != nil {
+		return err
+	}
+	if err := visitImageInspectionsTx(tx, func(imageInspectionRecord) error {
+		return errors.New("image inspection recovery receipts must be drained before storage adoption")
+	}); err != nil {
+		return err
+	}
 	legacy := tx.Bucket(callbackBucketName)
 	if legacy == nil {
 		return errors.New("callback bucket is missing")
@@ -606,8 +645,11 @@ func validateCallbackRootBuckets(tx *bolt.Tx) error {
 		return err
 	}
 	allowed := map[string]struct{}{
-		string(callbackBucketName):      {},
-		string(storeIdentityBucketName): {},
+		string(callbackBucketName):            {},
+		string(storeIdentityBucketName):       {},
+		string(imageInspectionsBucketName):    {},
+		string(volumeLaunchDebtBucketName):    {},
+		string(maintenanceCompensationBucket): {},
 	}
 	for _, bucketName := range callbackCurrentSchemaBuckets() {
 		allowed[string(bucketName)] = struct{}{}
@@ -1407,6 +1449,21 @@ func (s *CallbackStore) notifyReplaySubscribers(wake callbackReplayWake) {
 func (s *CallbackStore) Healthy() error {
 	return s.view(func(tx *bolt.Tx) error {
 		if err := requireCompleteCallbackSchema(tx); err != nil {
+			return err
+		}
+		if err := visitImageInspectionsTx(tx, func(r imageInspectionRecord) error {
+			name, storage := s.journalBackendIdentity("")
+			if r.Backend != name || r.StorageID != storage.String() {
+				return errors.New("image inspection receipt belongs to another storage lineage")
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if err := validateMaintenanceCompensationsTx(tx); err != nil {
+			return err
+		}
+		if err := (&VolumeLaunchJournal{store: s}).validateTx(tx); err != nil {
 			return err
 		}
 		heads := tx.Bucket(callbackLeaseMutationHeadBucketName)

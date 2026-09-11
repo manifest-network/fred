@@ -345,6 +345,12 @@ func rebuildCallbackSender(b *Backend, hc *http.Client) {
 		panic(err)
 	}
 	b.callbackPublisher = publisher
+	if b.failureDiagnostics != nil {
+		b.callbackPublisher, err = newDiagnosticCallbackPublisher(publisher, b.failureDiagnostics)
+		if err != nil {
+			panic(err)
+		}
+	}
 }
 
 func startCallbackReplayForTest(b *Backend) {
@@ -2000,7 +2006,7 @@ func TestGetProvision_LegacyDiagEntry_NoVerboseLeak(t *testing.T) {
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = diagStore.Close() })
-	b.diagnosticsStore = diagStore
+	bindTestDiagnosticsStore(t, b, diagStore)
 
 	// Legacy entry: verbose operator Error only, no curated Reason/Message.
 	require.NoError(t, diagStore.Store(shared.DiagnosticEntry{
@@ -2032,7 +2038,7 @@ func TestGetProvision_DiagnosticsFallbackPreservesTypedLifecycleGeneration(t *te
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = diagStore.Close() })
-	b.diagnosticsStore = diagStore
+	bindTestDiagnosticsStore(t, b, diagStore)
 
 	entry := leasesm.DiagnosticSnapshot(&leasesm.ProvisionState{
 		LeaseUUID:            leaseUUID,
@@ -3251,7 +3257,7 @@ func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, nil)
-	b.diagnosticsStore = diagStore
+	bindTestDiagnosticsStore(t, b, diagStore)
 	rebuildCallbackSender(b, callbackServer.Client())
 	startCallbackReplayForTest(b)
 	t.Cleanup(func() {
@@ -3452,7 +3458,7 @@ func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
 			}}, nil
 		},
 	}
-	b.diagnosticsStore = diagStore
+	bindTestDiagnosticsStore(t, b, diagStore)
 	_ = b.pool.TryAllocate(leaseUUID+"-app-0", "docker-small", "tenant-a")
 	prepareFailedProvisionReplacement(t, b, mock, leaseUUID, "tenant-a", "docker-small", payload)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
@@ -3913,6 +3919,15 @@ func TestInspectImageForSetup_WritablePathsBinds(t *testing.T) {
 		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
 			return []string{"/var/lib/grafana"}, nil
 		},
+		ExtractImageContentFn: func(_ context.Context, _ string, paths []string, destination string, _, _ int64) map[string]error {
+			failures := make(map[string]error)
+			for _, path := range paths {
+				if err := os.MkdirAll(filepath.Join(destination, sanitizeVolumePath(path)), 0o700); err != nil {
+					failures[path] = err
+				}
+			}
+			return failures
+		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
 		},
@@ -3963,7 +3978,11 @@ func TestInspectImageForSetup_WritablePathsBinds(t *testing.T) {
 	err := b.Provision(context.Background(), req)
 	require.NoError(t, err)
 
-	<-callbackReceived
+	select {
+	case <-callbackReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writable-path provision did not publish its callback")
+	}
 
 	// Detected writable paths must surface as bind-mount Volumes on the
 	// compose ServiceConfig. The expected host path is
@@ -4447,7 +4466,13 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 			return []string{"/var/lib/app"}, nil
 		},
 		ExtractImageContentFn: func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error {
-			return nil
+			failures := make(map[string]error)
+			for _, path := range paths {
+				if err := os.MkdirAll(filepath.Join(destDir, sanitizeVolumePath(path)), 0o700); err != nil {
+					failures[path] = err
+				}
+			}
+			return failures
 		},
 		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
 			return "container-1", nil
