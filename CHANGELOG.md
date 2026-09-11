@@ -728,6 +728,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Fleet test timeout isolation:** Healthy fleet scenarios now use the production
+  HTTP request budget instead of inheriting the short hang-injection timeout.
+  The slow-response regression exceeds the former 300 ms budget, and the hang
+  scenario explicitly verifies deadline expiry while retaining its shorter budget.
+  (ENG-734)
+
 - Accepted updates now record a distinct durable local-finalization phase.
   Recovery retries only the exact payload commit, and a blocked backend retry
   cannot erase an earlier uncertain delivery. (ENG-931)

@@ -14,10 +14,9 @@ package provisioner
 // contract, each behind a real backend.HTTPClient inside a real backend.Router,
 // and lets a test fault any single server mid-run. It deliberately carries no
 // build tag: it needs no Docker, no root and no network beyond loopback, so it
-// belongs in the ordinary `go test -short ./...` job, where the whole suite
-// runs in well under a second on every PR. Behind the `integration` tag it
-// would instead ride the privileged root+btrfs+Docker workflow — tens of
-// minutes, and gated on an environment none of these tests need.
+// belongs in the ordinary `go test -short ./...` job on every PR. Behind the
+// `integration` tag it would instead ride the privileged root+btrfs+Docker
+// workflow — tens of minutes, and gated on an environment none of these tests need.
 
 import (
 	"bytes"
@@ -120,7 +119,6 @@ type fakeBackendServer struct {
 
 	mu                sync.Mutex
 	fault             faultKind
-	hangFor           time.Duration
 	killed            bool
 	listCalls         int
 	retentionCalls    int
@@ -144,7 +142,6 @@ func newFakeBackendServer(t testing.TB, name string) *fakeBackendServer {
 		name:              name,
 		mock:              backend.NewMockBackend(backend.MockBackendConfig{Name: name}),
 		fault:             faultNone,
-		hangFor:           2 * time.Second,
 		provisionCalls:    make(map[string]int),
 		provisionRequests: make(map[string]backend.ProvisionRequest),
 		lifecycleByLease:  make(map[string]backend.LifecycleGenerationObservation),
@@ -227,10 +224,10 @@ func (f *fakeBackendServer) kill() {
 	f.srv.Close()
 }
 
-func (f *fakeBackendServer) currentFault() (faultKind, time.Duration) {
+func (f *fakeBackendServer) currentFault() faultKind {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.fault, f.hangFor
+	return f.fault
 }
 
 // applyFault runs the configured fault for a list endpoint. It reports true
@@ -239,7 +236,7 @@ func (f *fakeBackendServer) currentFault() (faultKind, time.Duration) {
 // other fault applies to both list endpoints, because a backend that cannot
 // answer one generally cannot answer the other.
 func (f *fakeBackendServer) applyFault(w http.ResponseWriter, r *http.Request, isRetentions bool) bool {
-	kind, hangFor := f.currentFault()
+	kind := f.currentFault()
 
 	if kind == faultRetentionsOnly {
 		if !isRetentions {
@@ -254,8 +251,10 @@ func (f *fakeBackendServer) applyFault(w http.ResponseWriter, r *http.Request, i
 		return false
 
 	case faultSlowOK:
+		// Deliberately exceed the old 300 ms fault-injection budget. A
+		// healthy request must retain the ordinary production request budget.
 		select {
-		case <-time.After(20 * time.Millisecond):
+		case <-time.After(400 * time.Millisecond):
 		case <-r.Context().Done():
 		}
 		return false
@@ -275,12 +274,9 @@ func (f *fakeBackendServer) applyFault(w http.ResponseWriter, r *http.Request, i
 		return true
 
 	case faultHang:
-		// Honour the request context so the server goroutine unwinds as soon as
-		// the client gives up, instead of outliving the test.
-		select {
-		case <-time.After(hangFor):
-		case <-r.Context().Done():
-		}
+		// A hung backend never answers. Only client cancellation releases it;
+		// a fallback response would exercise a parse error instead of a timeout.
+		<-r.Context().Done()
 		return true
 
 	case faultHTTP500:
@@ -713,8 +709,9 @@ type fleetOptions struct {
 	// pageLimit sets the client's requested page size for both list endpoints.
 	// Set it to 1 to force multi-page walks (needed by faultPage2).
 	pageLimit int
-	// clientTimeout bounds every backend request. Kept short so faultHang costs
-	// milliseconds rather than the production 30s.
+	// clientTimeout overrides the production request budget only for tests
+	// that deliberately exercise client timeouts. Zero keeps the production
+	// default so healthy fleet tests tolerate contention in parallel suites.
 	clientTimeout time.Duration
 	// maxProvisionsBytes caps the /provisions response so faultOversize is
 	// cheap to trigger.
@@ -784,9 +781,6 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 	}
 	if opts.pageLimit == 0 {
 		opts.pageLimit = 1000
-	}
-	if opts.clientTimeout == 0 {
-		opts.clientTimeout = 300 * time.Millisecond
 	}
 	if opts.maxProvisionsBytes == 0 {
 		opts.maxProvisionsBytes = 32 * 1024

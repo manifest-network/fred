@@ -298,7 +298,11 @@ func TestFleet_ActiveLeaseOnFaultedBackend_IsNeverReprovisioned(t *testing.T) {
 	for _, fault := range allFaults {
 		t.Run(string(fault), func(t *testing.T) {
 			t.Parallel()
-			f := newFleet(t, fleetOptions{})
+			opts := fleetOptions{}
+			if fault == faultHang {
+				opts.clientTimeout = 300 * time.Millisecond
+			}
+			f := newFleet(t, opts)
 
 			// The lease is ACTIVE on chain and lives on backend-2.
 			f.addLease("lease-pinned", billingtypes.LEASE_STATE_ACTIVE)
@@ -310,6 +314,11 @@ func TestFleet_ActiveLeaseOnFaultedBackend_IsNeverReprovisioned(t *testing.T) {
 
 			// Now backend-2 goes quiet.
 			f.backendAt(2).setFault(fault)
+			if fault == faultHang {
+				_, err := f.router.GetBackendByName("backend-2").ListProvisions(t.Context())
+				require.ErrorIs(t, err, context.DeadlineExceeded,
+					"the hang fixture must exercise a client timeout")
+			}
 
 			before := f.captureState([]string{"lease-pinned"})
 			_ = f.sweepN(2)
