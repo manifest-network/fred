@@ -146,7 +146,7 @@ func newApplicationOrchestrator(
 	reader := provisionLeaseReaderFunc(getLease)
 	chain := testReconciliationChain{ProvisionLeaseReader: reader}
 	bindTestReconciliationCoordinator(t, store, execution, chain, nil, nil)
-	coordinator, err := execution.ProvisionCoordinator(nil)
+	coordinator, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	orchestrator, err := NewProvisionOrchestrator(coordinator)
 	require.NoError(t, err)

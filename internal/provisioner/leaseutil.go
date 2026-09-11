@@ -1,7 +1,6 @@
 package provisioner
 
 import (
-	"errors"
 	"unicode/utf8"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
@@ -27,32 +26,6 @@ func truncateRejectReason(reason string) string {
 		limit--
 	}
 	return reason[:limit] + "..."
-}
-
-// Deterministic rejection reasons for on-chain lease rejection.
-// These hardcoded strings prevent dynamic data (SKU names, image registries,
-// file paths, JSON bodies) from leaking on-chain.
-const (
-	rejectReasonInvalidSKU       = "invalid SKU"
-	rejectReasonInvalidManifest  = "invalid manifest"
-	rejectReasonImageNotAllowed  = "image not allowed"
-	rejectReasonValidationError  = "validation error"
-	rejectReasonPayloadCorrupted = "payload corrupted"
-)
-
-// validationErrorToRejectReason maps a validation error to a hardcoded
-// rejection reason safe for on-chain surfacing.
-func validationErrorToRejectReason(err error) string {
-	switch {
-	case errors.Is(err, backend.ErrUnknownSKU):
-		return rejectReasonInvalidSKU
-	case errors.Is(err, backend.ErrInvalidManifest):
-		return rejectReasonInvalidManifest
-	case errors.Is(err, backend.ErrImageNotAllowed):
-		return rejectReasonImageNotAllowed
-	default:
-		return rejectReasonValidationError
-	}
 }
 
 // ExtractRoutingSKU returns a SKU UUID from the lease for backend routing.

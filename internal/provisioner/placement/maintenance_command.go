@@ -98,6 +98,8 @@ const (
 	MaintenanceOutcomeLeaseEnded
 	MaintenanceOutcomeAuthorityRevoked
 	MaintenanceOutcomeCapacityRefused
+	// MaintenanceOutcomeBackendUnavailable remains readable for legacy terminal
+	// receipts. A per-call NotDispatched outcome cannot produce one now.
 	MaintenanceOutcomeBackendUnavailable
 )
 

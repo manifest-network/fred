@@ -225,7 +225,7 @@ func bindAndReplayTestOperations(
 		run()
 	}
 
-	provision, err := execution.ProvisionCoordinator(nil)
+	provision, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	callbacks, err := execution.AuthenticatedCallbackCoordinator(callbackTestProofConsumer)
 	require.NoError(t, err)
@@ -2985,7 +2985,7 @@ func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
 	defer mu.Unlock()
 	require.Len(t, rejectedLeases, 1)
 	assert.Equal(t, "lease-1", rejectedLeases[0])
-	assert.Equal(t, rejectReasonInvalidSKU, rejectedReason)
+	assert.Equal(t, "invalid SKU", rejectedReason)
 }
 
 func TestReconciler_ReconcileAll_AmbiguousLegacyValidationNeverTerminatesChain(t *testing.T) {
@@ -3212,7 +3212,7 @@ func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *te
 	defer mu.Unlock()
 	require.Len(t, rejectedLeases, 1)
 	assert.Equal(t, "lease-1", rejectedLeases[0])
-	assert.Equal(t, rejectReasonInvalidManifest, rejectedReason)
+	assert.Equal(t, "invalid manifest", rejectedReason)
 }
 
 func TestReconciler_ReconcileAll_ActiveNotProvisionedValidationError_Closes(t *testing.T) {
@@ -3258,7 +3258,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisionedValidationError_Closes(t *t
 	defer mu.Unlock()
 	require.Len(t, closedLeases, 1)
 	assert.Equal(t, "lease-1", closedLeases[0])
-	assert.Equal(t, rejectReasonImageNotAllowed, closedReason)
+	assert.Equal(t, "image not allowed", closedReason)
 }
 
 func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T) {
@@ -3309,7 +3309,7 @@ func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T
 	defer mu.Unlock()
 	require.Len(t, closedLeases, 1)
 	assert.Equal(t, leaseUUID, closedLeases[0])
-	assert.Equal(t, rejectReasonInvalidSKU, closedReason)
+	assert.Equal(t, "invalid SKU", closedReason)
 }
 
 // --- Placement store integration tests ---
@@ -4326,7 +4326,7 @@ func TestReconciler_ContradictoryPositiveQuarantinesConfirmedOwnerAcrossRecovery
 	reconciliation := bindTestReconciliationCoordinator(
 		t, store, execution, chainClient, nil, nil,
 	)
-	provision, err := execution.ProvisionCoordinator(nil)
+	provision, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	event, err := placement.NewProvisionEventRequest(leaseUUID, chainLease.Tenant)
 	require.NoError(t, err)

@@ -455,7 +455,7 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 	projectAPIPlacementInventory(t, seedReconciliation, []string{backendName},
 		map[string]backendidentity.ID{backendName: callbackStorageID},
 		placement.ReconciliationProjection{})
-	seedProvision, err := seedExecution.ProvisionCoordinator(nil)
+	seedProvision, err := seedExecution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	request, err := placement.NewProvisionEventRequest(leaseUUID, "tenant-1")
 	require.NoError(t, err)
@@ -708,7 +708,7 @@ func TestCallbackOutboxReplay_SettlesDurableAttemptAcrossBothProcessRestarts(t *
 	projectAPIPlacementInventory(t, seedReconciliation, backendNames,
 		map[string]backendidentity.ID{backendA: storageIDA, backendB: storageIDB},
 		placement.ReconciliationProjection{})
-	seedProvision, err := seedExecution.ProvisionCoordinator(nil)
+	seedProvision, err := seedExecution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	for _, leaseUUID := range []string{leaseA, leaseB} {
 		request, requestErr := placement.NewProvisionEventRequest(leaseUUID, "tenant-1")

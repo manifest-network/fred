@@ -10,6 +10,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestWritablePathCache_DetachesStoredAndLoadedPaths(t *testing.T) {
+	detection := newWritablePathDetection(admittedFixtureImage(t, "tenant/app:latest"), 1000)
+	var cache writablePathCache
+	detected := []string{"/var/lib/app", "/opt/app"}
+	cache.store(detection, detected)
+
+	// The detector owns this buffer and may reuse it after returning. A cache
+	// hit must retain the result that was stored before that reuse.
+	detected[0] = "/detector-reused-buffer"
+	cached, found := cache.load(detection)
+	require.True(t, found)
+	require.Equal(t, []string{"/var/lib/app", "/opt/app"}, cached)
+
+	// A setup receiving a cache hit owns its result too. Its filtering must
+	// not change the result observed by a later setup.
+	cached[1] = "/caller-mutated-result"
+	next, found := cache.load(detection)
+	require.True(t, found)
+	assert.Equal(t, []string{"/var/lib/app", "/opt/app"}, next)
+}
+
 func TestInspectImageForSetup_WritablePathCacheUsesCompleteDetectionSubject(t *testing.T) {
 	imageID := fixtureImageID("multiple-runtime-users")
 	expected := map[int][]string{

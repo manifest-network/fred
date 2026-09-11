@@ -35,7 +35,7 @@ func TestFleet_DuplicateResponseCannotAuthorizeUninstalledLifecycleGeneration(t 
 		)
 
 		setTestProviderControlPlane(t, f.execution, f.chain, nil)
-		provision, err := f.execution.ProvisionCoordinator(nil)
+		provision, err := f.execution.ProvisionCoordinatorWithPayloads(nil, nil)
 		require.NoError(t, err)
 		orchestrator, err := NewProvisionOrchestrator(provision)
 		require.NoError(t, err)

@@ -90,7 +90,7 @@ func persistAmbiguousProvisionOnStore(
 	backendClient.provisionErr = errors.New("connection reset after provision dispatch")
 	backendClient.mu.Unlock()
 	if target.State == billingtypes.LEASE_STATE_PENDING {
-		provision, bindErr := execution.ProvisionCoordinator(nil)
+		provision, bindErr := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 		require.NoError(t, bindErr)
 		var request placement.ProvisionEventRequest
 		if payloadBytes == nil {
@@ -174,7 +174,7 @@ func persistAmbiguousProvisionOnHTTPStore(
 	execution := bindTestBackendRuntime(t, coordinator, router)
 	chain := redeliveryChain([]billingtypes.Lease{target}, nil)
 	bindTestReconciliationCoordinator(t, store, execution, chain, nil, nil)
-	provision, err := execution.ProvisionCoordinator(nil)
+	provision, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	request, err := placement.NewProvisionEventRequest(target.Uuid, target.Tenant)
 	require.NoError(t, err)

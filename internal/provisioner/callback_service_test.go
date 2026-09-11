@@ -242,7 +242,7 @@ func prepareCallbackOperationWithBackendForTest(
 	reconciliation := bindTestReconciliationCoordinator(
 		t, store, execution, chain, nil, nil,
 	)
-	provision, err := execution.ProvisionCoordinator(nil)
+	provision, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	callbackProvisionChains.Store(provision, chain)
 	event, err := placement.NewProvisionEventRequest(token.leaseUUID, "tenant-test")
@@ -290,7 +290,7 @@ func bindCallbackProvisionCoordinator(
 	}
 	execution := bindTestBackendRuntime(t, coordinator, router)
 	chain := &callbackChainStub{}
-	provision, err := execution.ProvisionCoordinator(nil)
+	provision, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	reconciliation := bindTestReconciliationCoordinator(
 		t, store, execution, chain, nil, nil,

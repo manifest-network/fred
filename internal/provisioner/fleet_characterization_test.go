@@ -182,7 +182,7 @@ func induceFleetAmbiguousProvision(
 	})
 	defer target.setProvisionHook(nil)
 	setTestProviderControlPlane(t, f.execution, f.chain, nil)
-	provision, err := f.execution.ProvisionCoordinator(nil)
+	provision, err := f.execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	event, err := placement.NewProvisionEventRequest(
 		fleetLeaseUUID(leaseName), "tenant-1",

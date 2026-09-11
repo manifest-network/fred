@@ -90,11 +90,10 @@ func (request ProvisionEventRequest) valid() bool {
 // ProvisionEventResult is an opaque, nil-free result algebra. Lease-derived
 // data is exposed only through behavior-specific accessors.
 type ProvisionEventResult struct {
-	disposition     ProvisionEventDisposition
-	lease           billingtypes.Lease
-	hasLease        bool
-	err             error
-	rejectionReason string
+	disposition ProvisionEventDisposition
+	lease       billingtypes.Lease
+	hasLease    bool
+	err         error
 }
 
 func (result ProvisionEventResult) Disposition() ProvisionEventDisposition {
@@ -104,12 +103,13 @@ func (result ProvisionEventResult) Disposition() ProvisionEventDisposition {
 func (result ProvisionEventResult) Err() error { return result.err }
 
 // RejectionReason is an observational result, never permission to reject or
-// remove payloads. Both mutations have already completed under the lease claim.
+// remove payloads. Rejection is positively observed under the lease claim;
+// Err still reports a retryable payload cleanup failure independently.
 func (result ProvisionEventResult) RejectionReason() string {
 	if result.disposition != ProvisionEventRejected {
 		return ""
 	}
-	return result.rejectionReason
+	return result.lease.RejectionReason
 }
 
 func (result ProvisionEventResult) LeaseState() (billingtypes.LeaseState, bool) {
@@ -170,12 +170,6 @@ func (observer DeprovisionCompletionObserver) ObserveCallbackDeprovisioned(
 		return
 	}
 	observer.coordinator.forget(leaseUUID, backendName)
-}
-
-func (execution *ExecutionCoordinator) ProvisionCoordinator(
-	observe ProvisionStartObserver,
-) (*ProvisionCoordinator, error) {
-	return execution.ProvisionCoordinatorWithPayloads(observe, nil)
 }
 
 // ProvisionCoordinatorWithPayloads binds payload cleanup to the same authority

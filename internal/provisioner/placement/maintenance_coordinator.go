@@ -259,8 +259,16 @@ func (authority *MaintenanceCoordinator) reauthorizeMaintenanceCommand(
 	var delivery maintenanceDelivery
 	switch work := work.(type) {
 	case acceptedMaintenanceUpdate:
-		// Acceptance has already crossed the durable boundary. Completing its
-		// local payload write neither contacts nor reauthorizes the backend.
+		if ended := authority.observeEndedMaintenanceUpdate(ctx, work); ended.valid() {
+			if err := authority.coordinator.store.endAcceptedMaintenanceUpdate(ended); err != nil {
+				return MaintenanceReauthorization{issuer: authority.marker, err: err}
+			}
+			return MaintenanceReauthorization{issuer: authority.marker, outcome: MaintenanceOutcomeLeaseEnded}
+		}
+		// Only positive exact terminal evidence makes the accepted payload
+		// unnecessary. Active, absent, foreign, unknown and failed observations
+		// do not grant that authority: local persistence can still complete
+		// without reauthorizing or contacting the backend.
 		return MaintenanceReauthorization{issuer: authority.marker, payload: work}
 	case maintenanceDelivery:
 		delivery = work
@@ -437,6 +445,13 @@ func classifyMaintenanceCall(observed backend.MaintenanceCallOutcome) (maintenan
 	switch {
 	case observed.Accepted():
 		return maintenanceSettlement{outcome: MaintenanceOutcomeAccepted}, true
+	case observed.NotDispatched():
+		// This proves only that this physical invocation was not sent. The
+		// durable command may already have an earlier ambiguous delivery;
+		// delivery_outstanding intentionally cannot prove "never dispatched".
+		// Even a first attempt against an already-open breaker stays Pending:
+		// recovery may execute it later, and a different key remains fenced.
+		return maintenanceSettlement{outcome: MaintenanceOutcomePending}, false
 	case observed.Refused():
 		switch observed.Refusal() {
 		case backend.MaintenanceRefusalNotProvisioned:

@@ -514,7 +514,7 @@ func (b *Backend) detectWritablePathsCached(mutations *storageMutations, ctx con
 	paths, err := mutations.detectWritablePaths(ctx, detection)
 	if err != nil {
 		b.logger.Warn("failed to detect writable paths, skipping (not cached)",
-			"image", detection.image.Reference(), "uid", detection.uid, "error", err)
+			"image", detection.image.Reference(), "error", err)
 		return nil
 	}
 

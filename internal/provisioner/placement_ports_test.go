@@ -70,7 +70,7 @@ func TestOperationCoordinatorDoesNotExposeCallerSelectedDispatchOutcomes(t *test
 			"operation coordinator exposes raw authority method %s", method)
 	}
 	for _, method := range []string{
-		"ProvisionCoordinator", "RestoreCoordinator", "ReconciliationCoordinator",
+		"ProvisionCoordinator", "ProvisionCoordinatorWithPayloads", "RestoreCoordinator", "ReconciliationCoordinator",
 		"MaintenanceCoordinator",
 	} {
 		_, exposed := coordinator.MethodByName(method)
@@ -89,8 +89,10 @@ func TestOperationCoordinatorDoesNotExposeCallerSelectedDispatchOutcomes(t *test
 		"operation coordinator must expose its one backend-runtime binding transition")
 
 	execution := reflect.TypeOf((*placement.ExecutionCoordinator)(nil))
+	_, exposesLegacyProvisionAlias := execution.MethodByName("ProvisionCoordinator")
+	assert.False(t, exposesLegacyProvisionAlias, "execution coordinator exposes a test-only provision alias")
 	for _, method := range []string{
-		"ProvisionCoordinator", "RestoreCoordinator", "ReconciliationCoordinator",
+		"ProvisionCoordinatorWithPayloads", "RestoreCoordinator", "ReconciliationCoordinator",
 		"MaintenanceCoordinator",
 	} {
 		_, exposed := execution.MethodByName(method)

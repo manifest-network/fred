@@ -3,9 +3,13 @@ package provisioner
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -13,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
@@ -173,18 +178,21 @@ func TestRejectedPayloadCleanupFailureRecoversAfterStoreReopen(t *testing.T) {
 	lease := rejectionTestLease(data)
 	ps, path := rejectionTestPayloadStore(t)
 	require.True(t, ps.Store(lease.Uuid, data))
-	_, client := provisionResponseBackendForTest(t, "test-backend", http.StatusBadRequest, `{"error":"invalid manifest"}`)
+	_, client := provisionResponseBackendForTest(t, "test-backend", http.StatusBadRequest, `{"error":"invalid manifest","validation_code":"invalid_manifest"}`)
 	chain := &chaintest.MockClient{
 		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) { return lease, nil },
 		RejectLeasesFunc: func(context.Context, []string, string) (uint64, []string, error) {
 			lease.State = billingtypes.LEASE_STATE_REJECTED
+			lease.RejectionReason = "invalid manifest"
 			require.NoError(t, ps.Close())
 			return 1, nil, nil
 		},
 	}
-	hs, _ := newTestHandlerSetWithBackend(t, chain, client, nil, ps)
+	publisher := newMockPublisher()
+	hs, _ := newTestHandlerSetWithBackend(t, chain, client, nil, ps, publisher)
 	event := payload.Event{LeaseUUID: lease.Uuid, Tenant: lease.Tenant}
-	require.ErrorContains(t, hs.HandlePayloadReceived(newPayloadEventMsg(t, event)), "clean rejected lease payload")
+	require.ErrorContains(t, hs.HandlePayloadReceived(newPayloadEventMsg(t, event)), "clean terminal lease payload")
+	assertPublishedRejection(t, publisher, lease.Uuid, "invalid manifest")
 
 	reopened, err := payload.NewStore(payload.StoreConfig{DBPath: path})
 	require.NoError(t, err)
@@ -192,9 +200,84 @@ func TestRejectedPayloadCleanupFailureRecoversAfterStoreReopen(t *testing.T) {
 	preserved, err := reopened.Get(lease.Uuid)
 	require.NoError(t, err)
 	require.Equal(t, data, preserved)
-	recovered, _ := newTestHandlerSetWithBackend(t, chain, client, nil, reopened)
+	replayPublisher := newMockPublisher()
+	recovered, _ := newTestHandlerSetWithBackend(t, chain, client, nil, reopened, replayPublisher)
 	require.NoError(t, recovered.HandlePayloadReceived(newPayloadEventMsg(t, event)))
+	assert.Empty(t, replayPublisher.published[TopicLeaseEvent], "terminal cleanup does not replay an old notification")
 	exists, err := reopened.Has(lease.Uuid)
 	require.NoError(t, err)
 	assert.False(t, exists, "positive terminal state repairs interrupted cleanup after restart")
+}
+
+func assertPublishedRejection(t *testing.T, publisher *mockPublisher, leaseUUID, reason string) {
+	t.Helper()
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	var failed []backend.LeaseStatusEvent
+	for _, msg := range publisher.published[TopicLeaseEvent] {
+		var event backend.LeaseStatusEvent
+		require.NoError(t, json.Unmarshal(msg.Payload, &event))
+		if event.Status == backend.ProvisionStatusFailed {
+			failed = append(failed, event)
+		}
+	}
+	require.Len(t, failed, 1, "confirmed chain rejection must remain observable independently of cleanup")
+	assert.Equal(t, leaseUUID, failed[0].LeaseUUID)
+	assert.Equal(t, reason, failed[0].Error)
+}
+
+func TestProvisionRejectionLogsDiagnosticBeforeChainMutation(t *testing.T) {
+	for _, corrupted := range []bool{false, true} {
+		name := "backend validation"
+		if corrupted {
+			name = "payload hash mismatch"
+		}
+		t.Run(name, func(t *testing.T) {
+			logPath := filepath.Join(t.TempDir(), "provider.log")
+			logs, err := os.Create(logPath)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, logs.Close()) })
+			original := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(original) })
+			data := []byte("exact payload")
+			lease := rejectionTestLease(data)
+			wantReason := "image not allowed"
+			wantDetail := "services.web.image: registry blocked by operator policy"
+			if corrupted {
+				data = append(data, '\n')
+				wantReason = "payload corrupted"
+				wantDetail = "hash mismatch"
+			}
+			ps, _ := rejectionTestPayloadStore(t)
+			require.True(t, ps.Store(lease.Uuid, data))
+			_, client := provisionResponseBackendForTest(t, "test-backend", http.StatusBadRequest,
+				`{"error":"services.web.image: registry blocked by operator policy","validation_code":"image_not_allowed"}`)
+			chain := &chaintest.MockClient{
+				GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) { return lease, nil },
+				RejectLeasesFunc: func(_ context.Context, _ []string, reason string) (uint64, []string, error) {
+					assert.Equal(t, wantReason, reason, "only the fixed category reaches the chain")
+					content, readErr := os.ReadFile(logPath)
+					require.NoError(t, readErr)
+					var refusal map[string]any
+					for line := range strings.SplitSeq(strings.TrimSpace(string(content)), "\n") {
+						var entry map[string]any
+						require.NoError(t, json.Unmarshal([]byte(line), &entry))
+						if entry["msg"] == "provision validation failed, rejecting lease" {
+							refusal = entry
+						}
+					}
+					require.NotNil(t, refusal, "diagnostics must be logged before the chain mutation")
+					assert.Equal(t, lease.Uuid, refusal["lease_uuid"])
+					assert.Equal(t, lease.Tenant, refusal["tenant"])
+					assert.Equal(t, wantReason, refusal["reason"])
+					assert.Contains(t, refusal["error"], wantDetail)
+					return 0, nil, errors.New("chain unavailable")
+				},
+			}
+			hs, _ := newTestHandlerSetWithBackend(t, chain, client, nil, ps)
+			require.ErrorContains(t, hs.HandlePayloadReceived(newPayloadEventMsg(t,
+				payload.Event{LeaseUUID: lease.Uuid, Tenant: lease.Tenant})), "chain unavailable")
+		})
+	}
 }

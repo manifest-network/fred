@@ -800,9 +800,10 @@ Idempotency-Key: <canonical UUIDv4>
 
 Restart containers for a lease without changing the manifest. Containers are stopped, removed, and recreated with the same configuration. Volumes are preserved. Allowed from `ready` or `failed` state.
 
-The idempotency key is scoped to this lease. Retrying the exact same key and
-command returns the same durable result without starting another replacement;
-reusing the key for a different command or update payload returns `409`. A
+The idempotency key is scoped to this lease. Once a command is definitively
+settled, retrying the exact same key and command returns its durable result
+without starting another replacement; reusing the key for a different command
+or update payload returns `409`. A
 different key also returns `409` while an earlier command is unresolved. Fred
 keeps terminal provider receipts for the lifetime of the lease's placement or
 lifecycle authority, and pending commands until they are definitively settled.
@@ -814,6 +815,15 @@ retry cannot restart work or move the provider's desired payload backward.
 Clients must generate a fresh UUIDv4 for each new logical command and reuse it
 only for retries. A live lease that reaches the 1,024-receipt safety ceiling is
 refused before dispatch rather than forgetting an identity.
+
+For both restart and update, a `503` response can leave a durably admitted
+command pending. Even when an open backend circuit blocks its first attempt,
+the command remains pending. Fred retries work at startup and every `reconciliation_interval`
+(default `5m`), so the operation can execute later without another tenant request.
+A different key receives `409` while the command is pending. Retrying the same
+key and exact command safely joins recovery and may continue returning `503`
+while progress is blocked. After the lease closes, a positive chain observation
+allows recovery to settle the pending command without starting a replacement.
 
 Fred derives tenant, provider, backend/storage, and callback authority from its
 prepared placement store; the request supplies none of those routing facts.
@@ -830,15 +840,19 @@ Once established, an unrelated backend outage does not revoke it.
 
 **Response Codes:**
 - `202 Accepted` - Restart initiated
-- `400 Bad Request` - Missing, repeated, or non-canonical UUIDv4 `Idempotency-Key`
+- `400 Bad Request` - Missing, repeated, or non-canonical UUIDv4 `Idempotency-Key`,
+  or a backend validation refusal with a curated diagnostic preserved for exact
+  retries
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - The key conflicts with a prior command, another command is
   pending, or the lease is in a state that cannot be restarted
-- `503 Service Unavailable` - The backend request was not sent (for example an
-  open circuit), authentication/routing authority is temporarily unavailable,
-  or a bounded idempotency journal refused admission before side effects
+- `503 Service Unavailable` - Backend dispatch is blocked (for example by an
+  open circuit) or its outcome is uncertain, authentication/routing authority
+  is temporarily unavailable, or a bounded idempotency journal refused admission
+  before side effects.
+  An admitted command can remain pending for automatic recovery as described above
 
 ### Update Lease
 
@@ -855,7 +869,16 @@ Content-Type: application/json
 
 Deploy a new manifest for a lease, replacing containers with a new image/configuration. The old containers are stopped, new ones are created from the updated manifest, and old containers are cleaned up after verification. On failure, the operation rolls back to the previous containers. Volumes are preserved.
 
-A successful update is also **persisted** to the payload store, replacing the manifest the lease was created with. This is what makes an update survive a reprovision: the reconciler replays whatever is stored, so an update applied only to the running containers would be silently undone by the next reboot, crash-restart or host failure (ENG-619). The payload is written *after* the backend accepts it, so a rejected update never enters the store; if that write fails the endpoint answers `500` rather than `202`, because a `202` would promise a durability fred does not have. Fred retains the pending command and automatically retries the exact typed backend request and payload persistence; a tenant retry with the same `Idempotency-Key` joins that recovery.
+A successful update is also **persisted** to the payload store, replacing the manifest the lease was created with. This is what makes an update survive a reprovision: the reconciler replays whatever is stored, so an update applied only to the running containers would be silently undone by the next reboot, crash-restart or host failure (ENG-619). The payload is written *after* the backend accepts it, so a rejected update never enters the store; if that write fails the endpoint answers `500` rather than `202`, because a `202` would promise a durability fred does not have. Fred retains the pending command. Recovery replays the exact typed backend request until acceptance is durably recorded, then retries only local payload persistence; a tenant retry with the same `Idempotency-Key` joins that recovery.
+
+If an exact chain observation confirms that the lease has since ended, recovery
+can settle the accepted command without writing its payload. This lets teardown
+proceed despite a payload-store failure; the settlement must still be committed
+to placement storage.
+
+The [restart retry contract](#restart-lease) also applies to updates: an admitted
+command returning `503` may execute during automatic recovery, and a different
+key receives `409` until the pending command settles.
 
 Because the on-chain `meta_hash` is set once at lease creation and cannot currently be updated, an updated payload no longer matches it. Fred records each stored payload's own SHA-256 and verifies against that on reprovision; `meta_hash` is still used for payloads stored before this behavior existed. See ENG-643 for the on-chain update handshake that restores `meta_hash` as the authoritative reference.
 
@@ -868,7 +891,8 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
 
 **Response Codes:**
 - `202 Accepted` - Update initiated and persisted
-- `400 Bad Request` - Missing/invalid `Idempotency-Key`, payload, or manifest
+- `400 Bad Request` - Missing/invalid `Idempotency-Key`, payload, or manifest;
+  curated backend validation diagnostics are preserved for exact retries
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Lease not provisioned
@@ -876,10 +900,11 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
   pending, or the lease is in a state that cannot be updated
 - `500 Internal Server Error` - An accepted update could not yet be persisted
   to the provider payload store; the durable pending command remains recoverable
-- `503 Service Unavailable` - The backend request was not sent (for example an
-  open circuit), no payload store is configured, routing/authority is
-  temporarily unavailable, or the bounded provider/backend idempotency journal
-  refused admission before side effects
+- `503 Service Unavailable` - Backend dispatch is blocked (for example by an
+  open circuit) or its outcome is uncertain, no payload store is configured,
+  routing/authority is temporarily unavailable, or the bounded provider/backend
+  idempotency journal refused admission before side effects. An admitted command
+  can remain pending for automatic recovery
 
 ### Restore Lease
 

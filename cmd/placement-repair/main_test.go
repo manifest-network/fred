@@ -1636,7 +1636,7 @@ func seedRepairAttempt(
 	execution *placement.ExecutionCoordinator,
 ) operation.OperationID {
 	t.Helper()
-	provision, err := execution.ProvisionCoordinator(nil)
+	provision, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	request, err := placement.NewProvisionEventRequest(repairCommandLease, "tenant-a")
 	require.NoError(t, err)

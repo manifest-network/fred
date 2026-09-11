@@ -54,7 +54,7 @@ func TestProvisionExecuteInvokesBackendOnceAcrossCopiedConcurrentDispatch(t *tes
 	execution := bindExecutionForTest(
 		t, fixture.coordinator, newExecutionTestRuntime(client),
 	)
-	authority, err := execution.ProvisionCoordinator(nil)
+	authority, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 
 	results := make(chan DispatchResult, 2)
@@ -89,7 +89,7 @@ func TestProvisionExecutePanicIsAmbiguousAndPreservesDurableAttempt(t *testing.T
 	execution := bindExecutionForTest(
 		t, fixture.coordinator, newExecutionTestRuntime(client),
 	)
-	authority, err := execution.ProvisionCoordinator(nil)
+	authority, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 
 	result := executeProvision(
@@ -171,7 +171,7 @@ func TestProvisionExecuteInlineCallbackWinsOverSynchronousRefusal(t *testing.T) 
 	execution := bindExecutionForTest(
 		t, fixture.coordinator, newExecutionTestRuntime(client),
 	)
-	authority, err := execution.ProvisionCoordinator(nil)
+	authority, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 
 	result := executeProvision(
@@ -197,7 +197,7 @@ func TestProvisionExecuteRejectsWrongNamedBackendBeforeCall(t *testing.T) {
 		resolved:             wrong,
 	}
 	execution := bindExecutionForTest(t, fixture.coordinator, runtime)
-	authority, err := execution.ProvisionCoordinator(nil)
+	authority, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 
 	result := executeProvision(
@@ -213,7 +213,7 @@ func TestProvisionRouteCannotAuthorizeAnotherLease(t *testing.T) {
 	execution := bindExecutionForTest(
 		t, fixture.coordinator, executionRuntime("backend-a"),
 	)
-	authority, err := execution.ProvisionCoordinator(nil)
+	authority, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	route, err := authority.routeProvision(
 		t.Context(), "lease-route-source", "sku-test", nil, nil,
@@ -264,7 +264,7 @@ func TestProvisionApplicationOwnsAuthorizationRoutesCallAndSettlement(t *testing
 		}, nil
 	})
 	setProviderControlPlaneForTest(t, execution, reader)
-	authority, err := execution.ProvisionCoordinator(nil)
+	authority, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	request, err := NewProvisionEventRequest(leaseUUID, "tenant-test")
 	require.NoError(t, err)
@@ -302,7 +302,7 @@ func TestDeprovisionOwnsClaimsTargetsInvocationAndSettlement(t *testing.T) {
 	execution := bindExecutionForTest(
 		t, fixture.coordinator, newExecutionTestRuntime(client),
 	)
-	authority, err := execution.ProvisionCoordinator(nil)
+	authority, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 
 	require.NoError(t, authority.Deprovision(t.Context(), "lease-deprovision-closed-boundary"))
@@ -332,7 +332,7 @@ func TestDeprovisionConcurrentCopyCannotInvokeTwice(t *testing.T) {
 	execution := bindExecutionForTest(
 		t, fixture.coordinator, newExecutionTestRuntime(client),
 	)
-	authority, err := execution.ProvisionCoordinator(nil)
+	authority, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 
 	results := make(chan error, 2)

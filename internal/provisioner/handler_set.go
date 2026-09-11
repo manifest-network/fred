@@ -118,7 +118,7 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 		return nil
 	case placement.ProvisionEventRejected:
 		h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusFailed, result.RejectionReason())
-		return nil
+		return result.Err()
 	default:
 		if result.Err() != nil {
 			return result.Err()
@@ -279,7 +279,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		return result.Err()
 	case placement.ProvisionEventRejected:
 		h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusFailed, result.RejectionReason())
-		return nil
+		return result.Err()
 	default:
 		if result.Err() != nil {
 			return result.Err()

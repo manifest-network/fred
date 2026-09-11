@@ -293,7 +293,7 @@ or publish a terminal-refusal event merely by wrapping `ErrValidation` or
 another public error. Production `providerd` backends use the identity-bound
 HTTP client and therefore retain the full typed protocol behavior.
 
-**The `error` field MAY BE TENANT-VISIBLE.** For recognized `/restore` refusal categories and `/update` validation refusals, fred relays curated details to the tenant in its own 4xx response body. Maintenance validation details are retained with the exact durable refusal receipt, so an idempotent retry or provider restart preserves the diagnostic. Other update refusals and unknown or ambiguous categories receive generic messages. Backend authors must still treat the field as public because a later fred version may expose another recognized category's details. It **MUST NOT** contain host paths, raw command output, or storage internals — those stay in your backend's own logs. This is the same obligation the `message` field carries on `/provisions`. Author it for the tenant and keep the diagnosis in your logs.
+**The `error` field MAY BE TENANT-VISIBLE.** For recognized `/restore` refusal categories and validation refusals from `/restart` or `/update`, fred relays curated details to the tenant in its own 4xx response body. Maintenance validation details are retained with the exact durable refusal receipt, so an idempotent retry or provider restart preserves the diagnostic. Other restart/update refusals and unknown or ambiguous categories receive generic messages. Backend authors must still treat the field as public because a later fred version may expose another recognized category's details. It **MUST NOT** contain host paths, raw command output, or storage internals — those stay in your backend's own logs. This is the same obligation the `message` field carries on `/provisions`. Author it for the tenant and keep the diagnosis in your logs.
 
 Do include what lets a tenant *fix* the request — the offending manifest field, the rejected image reference, the registry allowlist, the byte counts of a tier that does not fit. Those are the tenant's own input and your published policy, and suppressing them only makes the error unactionable.
 
@@ -534,6 +534,14 @@ Get container logs for a specific lease. Used by fred to serve `GET /v1/leases/{
 
 Restart containers for a lease without changing the manifest. Stops existing containers, recreates them with the same configuration, and sends a callback on completion. Volumes are preserved across restarts.
 
+Fred retains an admitted restart or update as a pending command when a transport
+attempt cannot be dispatched, even if an open circuit blocks its first attempt.
+The tenant receives `503`, but Fred may deliver the exact command later during
+automatic recovery. A different tenant idempotency key receives `409` while
+that command is pending; an exact retry joins recovery. Backends must therefore
+apply the durable `maintenance_id` replay rule below to delayed delivery as well
+as immediate retries. See [the tenant retry contract](README.md#restart-lease).
+
 **Request:**
 ```json
 {
@@ -570,6 +578,8 @@ Restart containers for a lease without changing the manifest. Stops existing con
 6. On success: remove old containers and POST success callback. On failure: rollback to old containers, restore `ready` status, and POST failure callback
 
 **Error Responses:**
+- `400 Bad Request` - Invalid maintenance request or validation failure; curated
+  validation details are relayed to the tenant and retained for exact replay
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for restart (e.g., already restarting, updating, or provisioning)
 - `503 Service Unavailable` with `code: "insufficient_resources"` - The

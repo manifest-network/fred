@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
@@ -807,211 +808,223 @@ func TestRestart_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
 }
 
 func TestRestart_RotatesCallbackBaseWithoutRotatingTypedAuthority(t *testing.T) {
-	callbackRequests := make(chan string, 4)
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		select {
-		case callbackRequests <- r.URL.RequestURI():
-		default:
-		}
-	}))
-	defer callbackServer.Close()
-	const lifecycleID = "550e8400-e29b-41d4-a716-446655440000"
-	const leaseUUID = durableCallbackTestLeaseUUID2
-	oldOperationURL := callbackServer.URL + "/old/callbacks/provision?operation_id=" + lifecycleID
-	oldLifecycleURL := callbackServer.URL + "/old/callbacks/provision?lifecycle_id=" + lifecycleID
-	newOperationURL := callbackServer.URL + "/new/callbacks/provision?operation_id=" + lifecycleID
-	newLifecycleURL := callbackServer.URL + "/new/callbacks/provision?lifecycle_id=" + lifecycleID
-	items := []backend.LeaseItem{{
-		SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName,
-	}}
-	stack := &manifest.StackManifest{Services: map[string]*manifest.Manifest{
-		manifest.DefaultServiceName: {Image: "docker.io/library/nginx:latest"},
-	}}
-	resourceProfiles := testResourceProfiles(t, items)
-	const providerUUID = "22222222-2222-4222-8222-222222222222"
-	var replacementMaintenanceID shared.MaintenanceID
+	synctest.Test(t, func(t *testing.T) {
+		callbackRequests := make(chan string, 4)
+		// Keep callback delivery inside the bubble. Socket I/O is not a synctest
+		// synchronization event and would retain the CI load-dependent deadline.
+		callbackClient := &http.Client{Transport: callbackAckRoundTripper(func(r *http.Request) (*http.Response, error) {
+			select {
+			case callbackRequests <- r.URL.RequestURI():
+			default:
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: r}, nil
+		})}
+		const callbackBase = "https://fred.example"
+		const lifecycleID = "550e8400-e29b-41d4-a716-446655440000"
+		const leaseUUID = durableCallbackTestLeaseUUID2
+		oldOperationURL := callbackBase + "/old/callbacks/provision?operation_id=" + lifecycleID
+		oldLifecycleURL := callbackBase + "/old/callbacks/provision?lifecycle_id=" + lifecycleID
+		newOperationURL := callbackBase + "/new/callbacks/provision?operation_id=" + lifecycleID
+		newLifecycleURL := callbackBase + "/new/callbacks/provision?lifecycle_id=" + lifecycleID
+		items := []backend.LeaseItem{{
+			SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName,
+		}}
+		stack := &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+			manifest.DefaultServiceName: {Image: "docker.io/library/nginx:latest"},
+		}}
+		resourceProfiles := testResourceProfiles(t, items)
+		const providerUUID = "22222222-2222-4222-8222-222222222222"
+		var replacementMaintenanceID shared.MaintenanceID
 
-	provisions := map[string]*provision{
-		leaseUUID: {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:            leaseUUID,
-			Tenant:               "tenant-a",
-			ProviderUUID:         providerUUID,
-			Status:               backend.ProvisionStatusReady,
-			CallbackURL:          oldOperationURL,
-			LifecycleCallbackURL: oldLifecycleURL,
-			Items:                items,
-			ResourceProfiles:     resourceProfiles,
-			ContainerIDs:         []string{"old-container"},
-			StackManifest:        stack,
-		}},
-	}
-	dockerMock := &mockDockerClient{
-		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{{
-				ContainerID:          "new-container",
+		provisions := map[string]*provision{
+			leaseUUID: {ProvisionState: leasesm.ProvisionState{
 				LeaseUUID:            leaseUUID,
 				Tenant:               "tenant-a",
 				ProviderUUID:         providerUUID,
-				BackendName:          "docker",
-				SKU:                  "docker-small",
-				ServiceName:          manifest.DefaultServiceName,
-				InstanceIndex:        0,
-				CallbackURL:          newOperationURL,
-				LifecycleCallbackURL: newLifecycleURL,
-				MaintenanceID:        replacementMaintenanceID,
-				Image:                "docker.io/library/nginx:latest",
-				Status:               "running",
-				CreatedAt:            time.Now().Add(-time.Minute),
-			}}, nil
-		},
-	}
-	b := newBackendForTest(dockerMock, provisions)
-	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	attachBoundOperationHandoffStores(t, b)
-	releaseStore := b.releaseStore
-	callbackStore := b.callbackStore
-	defer func() {
-		b.stopCancel()
-		b.wg.Wait()
-	}()
-	b.releaseStore = releaseStore
-	b.callbackStore = callbackStore
-	rebuildCallbackSender(b, callbackServer.Client())
-	b.wg.Go(b.callbackSender.RunReplayLoop)
-	manifestBytes, err := json.Marshal(stack)
-	require.NoError(t, err)
-	oldAuthority, err := shared.NewReleaseRuntimeAuthority(
-		mustDockerOperationID(lifecycleID),
-		"tenant-a",
-		providerUUID,
-		oldOperationURL,
-		oldLifecycleURL,
-	)
-	require.NoError(t, err)
-	seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
-		Manifest:         manifestBytes,
-		Image:            "stack",
-		OperationID:      mustDockerOperationID(lifecycleID),
-		Items:            items,
-		ResourceProfiles: resourceProfiles,
-		RuntimeAuthority: &oldAuthority,
-		Status:           "active",
-		CreatedAt:        time.Now(),
-	})
-
-	projectReady := make(chan *composetypes.Project, 1)
-	releaseWorker := make(chan struct{})
-	b.compose = &mockComposeExecutor{
-		UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
-			replacementMaintenanceID = mustParseMaintenanceID(
-				t, project.Services[manifest.DefaultServiceName].Labels[LabelMaintenanceID],
-			)
-			projectReady <- project
-			<-releaseWorker
-			return nil
-		},
-		PSFn: func(context.Context, string) ([]composeContainerSummary, error) {
-			return []composeContainerSummary{{
-				ID: "new-container", Service: manifest.DefaultServiceName, State: "running",
-			}}, nil
-		},
-	}
-
-	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
-		LeaseUUID:   leaseUUID,
-		CallbackURL: newLifecycleURL,
-	}))
-
-	b.provisionsMu.RLock()
-	assert.Equal(t, oldOperationURL, b.provisions[leaseUUID].CallbackURL)
-	assert.Equal(t, oldLifecycleURL, b.provisions[leaseUUID].LifecycleCallbackURL,
-		"accepted restart must keep the runtime route pending until replacement commits")
-	b.provisionsMu.RUnlock()
-
-	var project *composetypes.Project
-	select {
-	case project = <-projectReady:
-	case <-time.After(2 * time.Second):
-		t.Fatal("restart worker did not build the replacement project")
-	}
-	require.Contains(t, project.Services, manifest.DefaultServiceName)
-	labels := project.Services[manifest.DefaultServiceName].Labels
-	assert.Equal(t, newOperationURL, labels[LabelCallbackURL])
-	assert.Equal(t, newLifecycleURL, labels[LabelLifecycleCallbackURL],
-		"recreated containers must persist the same authority at the current callback base")
-
-	close(releaseWorker)
-	require.Eventually(t, func() bool {
-		b.provisionsMu.RLock()
-		defer b.provisionsMu.RUnlock()
-		return b.provisions[leaseUUID].Status == backend.ProvisionStatusReady &&
-			b.provisions[leaseUUID].CallbackURL == newOperationURL &&
-			b.provisions[leaseUUID].LifecycleCallbackURL == newLifecycleURL
-	}, 2*time.Second, 5*time.Millisecond)
-	wantCallbackRequestURI := "/new/callbacks/provision?lifecycle_id=" + lifecycleID
-	callbackDeadline := time.NewTimer(2 * time.Second)
-	defer callbackDeadline.Stop()
-	callbackDelivered := false
-	for !callbackDelivered {
-		select {
-		case callbackRequestURI := <-callbackRequests:
-			if callbackRequestURI == wantCallbackRequestURI {
-				callbackDelivered = true
-			}
-		case <-callbackDeadline.C:
-			t.Fatal("restart completion callback was not delivered")
+				Status:               backend.ProvisionStatusReady,
+				CallbackURL:          oldOperationURL,
+				LifecycleCallbackURL: oldLifecycleURL,
+				Items:                items,
+				ResourceProfiles:     resourceProfiles,
+				ContainerIDs:         []string{"old-container"},
+				StackManifest:        stack,
+			}},
 		}
-	}
+		dockerMock := &mockDockerClient{
+			InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
+				return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+			},
+			ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{{
+					ContainerID:          "new-container",
+					LeaseUUID:            leaseUUID,
+					Tenant:               "tenant-a",
+					ProviderUUID:         providerUUID,
+					BackendName:          "docker",
+					SKU:                  "docker-small",
+					ServiceName:          manifest.DefaultServiceName,
+					InstanceIndex:        0,
+					CallbackURL:          newOperationURL,
+					LifecycleCallbackURL: newLifecycleURL,
+					MaintenanceID:        replacementMaintenanceID,
+					Image:                "docker.io/library/nginx:latest",
+					Status:               "running",
+					CreatedAt:            time.Now().Add(-time.Minute),
+				}}, nil
+			},
+		}
+		b := newBackendForTest(dockerMock, provisions)
+		b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+		attachBoundOperationHandoffStores(t, b)
+		releaseStore := b.releaseStore
+		callbackStore := b.callbackStore
+		defer func() {
+			b.stopCancel()
+			b.wg.Wait()
+		}()
+		b.releaseStore = releaseStore
+		b.callbackStore = callbackStore
+		rebuildCallbackSender(b, callbackClient)
+		b.wg.Go(b.callbackSender.RunReplayLoop)
+		manifestBytes, err := json.Marshal(stack)
+		require.NoError(t, err)
+		oldAuthority, err := shared.NewReleaseRuntimeAuthority(
+			mustDockerOperationID(lifecycleID),
+			"tenant-a",
+			providerUUID,
+			oldOperationURL,
+			oldLifecycleURL,
+		)
+		require.NoError(t, err)
+		seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
+			Manifest:         manifestBytes,
+			Image:            "stack",
+			OperationID:      mustDockerOperationID(lifecycleID),
+			Items:            items,
+			ResourceProfiles: resourceProfiles,
+			RuntimeAuthority: &oldAuthority,
+			Status:           "active",
+			CreatedAt:        time.Now(),
+		})
 
-	active, err := releaseStore.LatestActive(leaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, active)
-	require.NotNil(t, active.RuntimeAuthority)
-	assert.Equal(t, newOperationURL, active.RuntimeAuthority.CallbackURL())
-	assert.Equal(t, newLifecycleURL, active.RuntimeAuthority.LifecycleCallbackURL())
+		projectReady := make(chan *composetypes.Project, 1)
+		releaseWorker := make(chan struct{})
+		b.compose = &mockComposeExecutor{
+			UpFn: func(ctx context.Context, project *composetypes.Project, _ composeUpOpts) error {
+				replacementMaintenanceID = mustParseMaintenanceID(
+					t, project.Services[manifest.DefaultServiceName].Labels[LabelMaintenanceID],
+				)
+				projectReady <- project
+				select {
+				case <-releaseWorker:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+			PSFn: func(context.Context, string) ([]composeContainerSummary, error) {
+				return []composeContainerSummary{{
+					ID: "new-container", Service: manifest.DefaultServiceName, State: "running",
+				}}, nil
+			},
+		}
 
-	// Cold recovery must read the same route from the active Release and the
-	// replacement labels; a successful base move cannot make the cohort appear
-	// split-brained on the next process start.
-	coldContainer := ContainerInfo{
-		ContainerID:          "new-container",
-		LeaseUUID:            leaseUUID,
-		Tenant:               "tenant-a",
-		ProviderUUID:         providerUUID,
-		SKU:                  "docker-small",
-		ServiceName:          manifest.DefaultServiceName,
-		InstanceIndex:        0,
-		CallbackURL:          newOperationURL,
-		LifecycleCallbackURL: newLifecycleURL,
-		MaintenanceID:        replacementMaintenanceID,
-		Image:                "docker.io/library/nginx:latest",
-		Status:               "running",
-		CreatedAt:            time.Now().Add(-time.Minute),
-	}
-	cold := newBackendForTest(&mockDockerClient{
-		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{coldContainer}, nil
-		},
-		InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
-			copy := coldContainer
-			return &copy, nil
-		},
-	}, nil)
-	defer cold.stopCancel()
-	cold.releaseStore = releaseStore
-	require.NoError(t, cold.recoverState(context.Background()))
-	cold.provisionsMu.RLock()
-	recovered := cold.provisions[leaseUUID]
-	cold.provisionsMu.RUnlock()
-	require.NotNil(t, recovered)
-	assert.Equal(t, backend.ProvisionStatusReady, recovered.Status,
-		"cold recovery must accept the exact maintenance generation")
-	assert.Equal(t, newOperationURL, recovered.CallbackURL)
-	assert.Equal(t, newLifecycleURL, recovered.LifecycleCallbackURL)
+		require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
+			LeaseUUID:   leaseUUID,
+			CallbackURL: newLifecycleURL,
+		}))
+
+		b.provisionsMu.RLock()
+		assert.Equal(t, oldOperationURL, b.provisions[leaseUUID].CallbackURL)
+		assert.Equal(t, oldLifecycleURL, b.provisions[leaseUUID].LifecycleCallbackURL,
+			"accepted restart must keep the runtime route pending until replacement commits")
+		b.provisionsMu.RUnlock()
+
+		var project *composetypes.Project
+		select {
+		case project = <-projectReady:
+		case <-time.After(2 * time.Second):
+			t.Fatal("restart worker did not build the replacement project")
+		}
+		require.Contains(t, project.Services, manifest.DefaultServiceName)
+		labels := project.Services[manifest.DefaultServiceName].Labels
+		assert.Equal(t, newOperationURL, labels[LabelCallbackURL])
+		assert.Equal(t, newLifecycleURL, labels[LabelLifecycleCallbackURL],
+			"recreated containers must persist the same authority at the current callback base")
+
+		close(releaseWorker)
+		wantCallbackRequestURI := "/new/callbacks/provision?lifecycle_id=" + lifecycleID
+		callbackDeadline := time.NewTimer(2 * time.Second)
+		defer callbackDeadline.Stop()
+		callbackDelivered := false
+		for !callbackDelivered {
+			select {
+			case callbackRequestURI := <-callbackRequests:
+				if callbackRequestURI == wantCallbackRequestURI {
+					callbackDelivered = true
+				}
+			case <-callbackDeadline.C:
+				t.Fatal("restart completion callback was not delivered")
+			}
+		}
+		// The transport observation precedes durable acknowledgment. Wait for the
+		// sender and actor to finish before checking the committed projection.
+		synctest.Wait()
+		pending, err := callbackStore.ListPending()
+		require.NoError(t, err)
+		require.Empty(t, pending, "the observed callback must be durably acknowledged")
+		b.provisionsMu.RLock()
+		assert.Equal(t, backend.ProvisionStatusReady, b.provisions[leaseUUID].Status)
+		assert.Equal(t, newOperationURL, b.provisions[leaseUUID].CallbackURL)
+		assert.Equal(t, newLifecycleURL, b.provisions[leaseUUID].LifecycleCallbackURL)
+		b.provisionsMu.RUnlock()
+
+		active, err := releaseStore.LatestActive(leaseUUID)
+		require.NoError(t, err)
+		require.NotNil(t, active)
+		require.NotNil(t, active.RuntimeAuthority)
+		assert.Equal(t, newOperationURL, active.RuntimeAuthority.CallbackURL())
+		assert.Equal(t, newLifecycleURL, active.RuntimeAuthority.LifecycleCallbackURL())
+
+		// Cold recovery must read the same route from the active Release and the
+		// replacement labels; a successful base move cannot make the cohort appear
+		// split-brained on the next process start.
+		coldContainer := ContainerInfo{
+			ContainerID:          "new-container",
+			LeaseUUID:            leaseUUID,
+			Tenant:               "tenant-a",
+			ProviderUUID:         providerUUID,
+			SKU:                  "docker-small",
+			ServiceName:          manifest.DefaultServiceName,
+			InstanceIndex:        0,
+			CallbackURL:          newOperationURL,
+			LifecycleCallbackURL: newLifecycleURL,
+			MaintenanceID:        replacementMaintenanceID,
+			Image:                "docker.io/library/nginx:latest",
+			Status:               "running",
+			CreatedAt:            time.Now().Add(-time.Minute),
+		}
+		cold := newBackendForTest(&mockDockerClient{
+			ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+				return []ContainerInfo{coldContainer}, nil
+			},
+			InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
+				copy := coldContainer
+				return &copy, nil
+			},
+		}, nil)
+		defer cold.stopCancel()
+		cold.releaseStore = releaseStore
+		require.NoError(t, cold.recoverState(context.Background()))
+		cold.provisionsMu.RLock()
+		recovered := cold.provisions[leaseUUID]
+		cold.provisionsMu.RUnlock()
+		require.NotNil(t, recovered)
+		assert.Equal(t, backend.ProvisionStatusReady, recovered.Status,
+			"cold recovery must accept the exact maintenance generation")
+		assert.Equal(t, newOperationURL, recovered.CallbackURL)
+		assert.Equal(t, newLifecycleURL, recovered.LifecycleCallbackURL)
+	})
 }
 
 func TestRestart_RejectsLifecycleAuthorityMismatchWithoutMutation(t *testing.T) {

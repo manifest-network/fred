@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
@@ -71,6 +72,10 @@ func (authority *ProvisionCoordinator) rejectInvalidProvision(
 		return uncertain(err)
 	}
 	reason := provisionRejectionReason(invalid)
+	slog.WarnContext(ctx, "provision validation failed, rejecting lease",
+		"lease_uuid", lease.Uuid, "tenant", lease.Tenant,
+		"reason", reason, "error", invalid.Err(),
+	)
 	rejected, _, err := authority.controlPlane.rejectLease(ctx, lease.Uuid, reason)
 	if err != nil || rejected != 1 {
 		// An RPC error can follow a committed rejection. Only a fresh exact
@@ -90,27 +95,25 @@ func (authority *ProvisionCoordinator) rejectInvalidProvision(
 	// RejectLeases acknowledged the sole submitted lease. The exact live claim
 	// remains held through the durable payload removal.
 	lease.State = billingtypes.LEASE_STATE_REJECTED
-	cleanup, err := authority.terminalPayload(lease, claim)
-	if err != nil {
-		return uncertain(err)
-	}
-	if err := cleanup.commit(); err != nil {
-		return uncertain(fmt.Errorf("clean rejected lease payload: %w", err))
-	}
-	result := newProvisionEventResult(ProvisionEventRejected, &lease, nil)
-	result.rejectionReason = reason
-	return result
+	lease.RejectionReason = reason
+	completion := authority.finishTerminalProvision(lease, claim)
+	// The chain has acknowledged this rejection even when local cleanup
+	// fails. Report the committed observation and the retryable cleanup error
+	// independently, so failure notification does not depend on deleting bytes.
+	return newProvisionEventResult(ProvisionEventRejected, &lease, completion.Err())
 }
 
 func (authority *ProvisionCoordinator) finishTerminalProvision(
 	lease billingtypes.Lease, claim operation.LeaseClaim,
 ) ProvisionEventResult {
 	cleanup, err := authority.terminalPayload(lease, claim)
-	if err == nil {
-		err = cleanup.commit()
-	}
 	if err != nil {
 		return newProvisionEventResult(ProvisionEventUncertain, &lease, err)
+	}
+	err = cleanup.commit()
+	if err != nil {
+		return newProvisionEventResult(ProvisionEventUncertain, &lease,
+			fmt.Errorf("clean terminal lease payload: %w", err))
 	}
 	return newProvisionEventResult(ProvisionEventLeaseTerminal, &lease, nil)
 }
@@ -120,12 +123,20 @@ func provisionRejectionReason(result ProvisionEventResult) string {
 	if result.disposition == ProvisionEventPayloadInvalid {
 		return "payload corrupted"
 	}
+	return ValidationRejectionReason(result.err)
+}
+
+// ValidationRejectionReason projects a validation error to a fixed public
+// category. It never includes dynamic diagnostics and grants no permission to
+// reject a lease; callers must already own an authoritative validation refusal.
+// Event-driven provisioning and reconciliation use this same vocabulary.
+func ValidationRejectionReason(err error) string {
 	switch {
-	case errors.Is(result.err, backend.ErrUnknownSKU):
+	case errors.Is(err, backend.ErrUnknownSKU):
 		return "invalid SKU"
-	case errors.Is(result.err, backend.ErrInvalidManifest):
+	case errors.Is(err, backend.ErrInvalidManifest):
 		return "invalid manifest"
-	case errors.Is(result.err, backend.ErrImageNotAllowed):
+	case errors.Is(err, backend.ErrImageNotAllowed):
 		return "image not allowed"
 	default:
 		return "validation error"

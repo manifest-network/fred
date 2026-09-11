@@ -302,7 +302,7 @@ func provisionCoordinatorWithReaderForTest(
 ) (*ProvisionCoordinator, error) {
 	t.Helper()
 	setProviderControlPlaneForTest(t, execution, reader)
-	return execution.ProvisionCoordinator(nil)
+	return execution.ProvisionCoordinatorWithPayloads(nil, nil)
 }
 
 func maintenanceCoordinatorWithReaderForTest(

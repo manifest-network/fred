@@ -52,7 +52,7 @@ func TestLegacyValidationErrorCannotAuthorizeProvisionEventRejection(t *testing.
 	execution := bindExecutionForTest(
 		t, coordinator, newExecutionTestRuntime(client),
 	)
-	authority, err := execution.ProvisionCoordinator(nil)
+	authority, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	request, err := NewProvisionEventRequest(leaseUUID, "tenant-test")
 	require.NoError(t, err)

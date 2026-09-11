@@ -1,10 +1,12 @@
 package placement
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync/atomic"
 
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -67,14 +69,58 @@ func (work maintenanceDelivery) valid() bool {
 	return work.claim.Valid() && work.claim.command.phase == maintenanceDeliveryOutstanding
 }
 
-// Accepted update work can only finish local payload persistence. In
-// particular it cannot be converted to a backend dispatch capability.
+// Accepted update work can only finish local payload persistence or retire
+// after exact terminal chain evidence. It cannot become backend dispatch work.
 type acceptedMaintenanceUpdate struct{ claim MaintenanceCommandClaim }
 
 func (acceptedMaintenanceUpdate) maintenanceWork() {}
 func (work acceptedMaintenanceUpdate) valid() bool {
 	return work.claim.Valid() && work.claim.command.phase == maintenancePayloadOutstanding &&
 		work.claim.command.kind == MaintenanceCommandUpdate
+}
+
+// endedMaintenanceUpdate proves that the exact accepted command's lease is
+// terminal on the construction-bound control plane. It permits only the
+// payload-outstanding -> LeaseEnded transition, never backend dispatch or an
+// arbitrary caller-selected settlement. A decoded command alone cannot mint it.
+type endedMaintenanceUpdate struct {
+	issuer   *MaintenanceCoordinator
+	accepted acceptedMaintenanceUpdate
+	consumed *atomic.Bool
+}
+
+func (ended endedMaintenanceUpdate) valid() bool {
+	return ended.issuer != nil && ended.issuer.Valid() && ended.accepted.valid() &&
+		ended.accepted.claim.issuer == ended.issuer.coordinator.store && ended.consumed != nil
+}
+
+func (authority *MaintenanceCoordinator) observeEndedMaintenanceUpdate(
+	ctx context.Context, accepted acceptedMaintenanceUpdate,
+) endedMaintenanceUpdate {
+	if !authority.Valid() || !accepted.valid() || accepted.claim.issuer != authority.coordinator.store {
+		return endedMaintenanceUpdate{}
+	}
+	command := accepted.claim.command
+	readCtx, cancel := context.WithTimeout(ctx, maintenanceChainReadTimeout)
+	defer cancel()
+	exact, ok := authority.controlPlane.observeLease(readCtx, command.LeaseUUID(), command.Tenant()).(observedExactLease)
+	if !ok {
+		return endedMaintenanceUpdate{}
+	}
+	switch exact.lease.State {
+	case billingtypes.LEASE_STATE_CLOSED, billingtypes.LEASE_STATE_REJECTED, billingtypes.LEASE_STATE_EXPIRED:
+		return endedMaintenanceUpdate{issuer: authority, accepted: accepted, consumed: &atomic.Bool{}}
+	default:
+		return endedMaintenanceUpdate{}
+	}
+}
+
+func (s *Store) endAcceptedMaintenanceUpdate(ended endedMaintenanceUpdate) error {
+	if !ended.valid() || ended.accepted.claim.issuer != s || !ended.consumed.CompareAndSwap(false, true) {
+		return ErrInvalidMaintenanceCommand
+	}
+	return s.settleMaintenancePhase(ended.accepted.claim,
+		maintenanceSettlement{outcome: MaintenanceOutcomeLeaseEnded}, maintenancePayloadOutstanding)
 }
 
 func (s *Store) maintenanceWork(claim MaintenanceCommandClaim) (maintenanceWork, error) {

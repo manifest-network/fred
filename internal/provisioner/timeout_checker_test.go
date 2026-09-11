@@ -147,7 +147,7 @@ func newTimeoutTestHarness(t *testing.T) *timeoutTestHarness {
 	reader := &timeoutLeaseReader{leases: make(map[string]*billingtypes.Lease)}
 	chain := &callbackChainStub{getLease: reader.GetLease}
 	bindTestReconciliationCoordinator(t, store, execution, chain, nil, nil)
-	provision, err := execution.ProvisionCoordinator(nil)
+	provision, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
 	require.NoError(t, err)
 	return &timeoutTestHarness{
 		coordinator: coordinator,

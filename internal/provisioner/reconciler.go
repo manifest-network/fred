@@ -1797,7 +1797,7 @@ func (r *Reconciler) handleProvisionResult(
 		*hadError = true
 		return
 	}
-	reason := validationErrorToRejectReason(err)
+	reason := placement.ValidationRejectionReason(err)
 
 	// Permanent error — terminate the lease
 	isPending := lease.State == billingtypes.LEASE_STATE_PENDING
