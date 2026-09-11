@@ -130,7 +130,7 @@ func decodeCompensationSourceSnapshot(encoded []byte) (compensationSourcePlan, e
 		// creation boundary clones mutable members for the one instance being
 		// dispatched, avoiding replica-sized allocations while decoding.
 		config.Hostname = instance.Hostname
-		config.Labels = make(map[string]string, len(stored.CommonLabels)+len(instance.Labels)+len(instance.LabelRefs))
+		config.Labels = make(map[string]string)
 		maps.Copy(config.Labels, stored.CommonLabels)
 		for label, value := range instance.Labels {
 			if _, duplicate := config.Labels[label]; duplicate {
