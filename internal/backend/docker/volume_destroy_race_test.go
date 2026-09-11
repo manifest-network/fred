@@ -3,6 +3,7 @@ package docker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
@@ -25,9 +26,88 @@ import (
 // after the table is resolved. That is a real seam, not a production hook.
 //
 // Note the lease UUIDs: liveClaim walks a volume name back to its lease with
-// leaseUUIDFromVolumeName, which requires the canonical 36-char form (the same dependency
-// cleanupOrphanedVolumes' release probe already has). Tests using placeholder IDs like
-// "u1" exercise the cached table only.
+// leaseUUIDFromVolumeName, which requires the canonical 36-char form. Tests using
+// placeholder IDs like "u1" exercise the cached table only.
+
+// stagedRecoveryOperationIntentJournal provides deterministic barriers around
+// recoverState's optimistic intent snapshots without adding a production test
+// hook. The first barrier is after read #1 captured its result; the second is
+// before read #2 captures its result while recovery owns provisionsMu.
+type stagedRecoveryOperationIntentJournal struct {
+	operationSettlementService
+	delegate operationSettlementService
+
+	mu                      sync.Mutex
+	listCalls               int
+	afterFirstSnapshot      chan struct{}
+	releaseFirstSnapshot    chan struct{}
+	beforeSecondSnapshot    chan struct{}
+	releaseSecondSnapshot   chan struct{}
+	operationAdmitted       chan struct{}
+	operationAdmittedSignal sync.Once
+}
+
+func (j *stagedRecoveryOperationIntentJournal) wrappedOperationSettlementForTest() operationSettlementService {
+	return j.delegate
+}
+
+func (j *stagedRecoveryOperationIntentJournal) NewOperationIntentProbe(
+	leaseUUID, callbackURL string,
+) (shared.OperationIntentProbe, error) {
+	return j.delegate.NewOperationIntentProbe(leaseUUID, callbackURL)
+}
+
+func (j *stagedRecoveryOperationIntentJournal) NewOperationIntentCandidate(
+	spec shared.OperationIntentSpec,
+) (shared.OperationIntentCandidate, error) {
+	return j.delegate.NewOperationIntentCandidate(spec)
+}
+
+func (j *stagedRecoveryOperationIntentJournal) ProbeOperationIntent(
+	probe shared.OperationIntentProbe,
+) (shared.OperationIntentAdmissionDisposition, error) {
+	return j.delegate.ProbeOperationIntent(probe)
+}
+
+func (j *stagedRecoveryOperationIntentJournal) BeginOperationIntent(
+	candidate shared.OperationIntentCandidate,
+) (shared.OperationIntentAdmission, error) {
+	admission, err := j.delegate.BeginOperationIntent(candidate)
+	if err == nil && j.operationAdmitted != nil {
+		j.operationAdmittedSignal.Do(func() { close(j.operationAdmitted) })
+	}
+	return admission, err
+}
+
+func (j *stagedRecoveryOperationIntentJournal) ListOperationIntents() (
+	[]shared.OperationIntentClaim,
+	error,
+) {
+	j.mu.Lock()
+	j.listCalls++
+	call := j.listCalls
+	j.mu.Unlock()
+
+	if call == 1 {
+		claims, err := j.delegate.ListOperationIntents()
+		if j.afterFirstSnapshot != nil {
+			close(j.afterFirstSnapshot)
+		}
+		if j.releaseFirstSnapshot != nil {
+			<-j.releaseFirstSnapshot
+		}
+		return claims, err
+	}
+	if call == 2 {
+		if j.beforeSecondSnapshot != nil {
+			close(j.beforeSecondSnapshot)
+		}
+		if j.releaseSecondSnapshot != nil {
+			<-j.releaseSecondSnapshot
+		}
+	}
+	return j.delegate.ListOperationIntents()
+}
 
 // destroyBarrier parks the first Destroy call and releases it on demand. The ctx arm keeps
 // a wedged test failing rather than hanging.
@@ -83,7 +163,7 @@ func TestDestroyReapingVolumes_RefusesANameClaimedAfterTheSnapshot(t *testing.T)
 
 	b := newBackendForTest(&mockDockerClient{}, nil)
 	rs := attachRetentionStore(t, b)
-	require.NoError(t, rs.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
 		OriginalLeaseUUID:   lease,
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusReaping,
@@ -107,7 +187,7 @@ func TestDestroyReapingVolumes_RefusesANameClaimedAfterTheSnapshot(t *testing.T)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		reaped = b.destroyReapingVolumes(ctx, b.newManagedVolumeIndex(), lease)
+		reaped = b.destroyReapingVolumes(ctx, b.newManagedVolumeIndex(), reapingProofForTest(t, b.retentionStore, lease))
 	}()
 
 	<-bar.reached
@@ -145,6 +225,13 @@ func TestDestroyReapingVolumes_UnreadableClaims_IgnoresALateClaim(t *testing.T) 
 
 	b := newBackendForTest(&mockDockerClient{}, nil)
 	rs := attachRetentionStore(t, b)
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
+		OriginalLeaseUUID: lease,
+		Tenant:            "tenant-a",
+		Status:            shared.RetentionStatusReaping,
+		Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+	}))
+	proof := reapingProofForTest(t, rs, lease)
 	require.NoError(t, rs.Close())
 
 	b.volumes = &mockVolumeManager{
@@ -155,9 +242,10 @@ func TestDestroyReapingVolumes_UnreadableClaims_IgnoresALateClaim(t *testing.T) 
 			return nil
 		},
 	}
+	installTestStorageMutationAdapters(b)
 	unreadableBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable))
 
-	assert.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease))
+	assert.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), proof))
 	assert.Equal(t, unreadableBefore+1, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable)))
 }
 
@@ -197,15 +285,16 @@ func TestCreateManagedVolume_SerializesAgainstAnInFlightDestroy(t *testing.T) {
 	destroyDone := make(chan struct{})
 	go func() {
 		defer close(destroyDone)
-		// Nothing claims the name, so the collector is entitled to it.
-		b.volumeOp("", b.logger).destroy(ctx, destroySiteOrphanGC, name)
+		// Exact operation authority serializes destruction with recreation of the
+		// same lease-owned name.
+		destroyVolumesForTest(b, lease, ctx, destroySiteProvisionCleanup, name)
 	}()
 	<-bar.reached
 
 	createDone := make(chan struct{})
 	go func() {
 		defer close(createDone)
-		_, _, err := b.createManagedVolume(ctx, name, 512)
+		_, _, err := createManagedVolumeForTest(t, b, ctx, lease, name, 512)
 		assert.NoError(t, err)
 	}()
 
@@ -226,27 +315,53 @@ func TestCreateManagedVolume_SerializesAgainstAnInFlightDestroy(t *testing.T) {
 }
 
 // TestProvision_ReservationPublishesTheOwnershipClaim pins that a lease's claim exists for
-// the WHOLE of Provision, not just its tail.
-//
-// snapshotVolumeClaims derives live claims from prov.Items, so a reservation that left
-// Items unset claimed nothing until enrichReserved ran — and on the re-provision arm
-// exercised here it did worse than that: the previous, claim-bearing entry is deleted and
-// replaced in the same critical section, so a live claim was RETRACTED across container
-// removal, SKU validation, manifest parsing and pool allocation. The volumes it protects
-// are deliberately kept across a re-provision, so anything collecting in that window was
-// collecting live tenant data (ENG-681).
-//
-// Parking in RemoveContainer puts the assertion inside that window by construction: it is
-// the re-provision cleanup, which runs after the reservation and before enrichReserved.
+// the WHOLE of Provision, not just its tail. A safe re-provision keeps the predecessor
+// projection authoritative until its exact cohort is proven absent, then atomically
+// publishes the candidate projection and pool generation. Both projections claim the
+// same canonical volume names, so the handoff cannot expose reusable tenant data to an
+// orphan collector (ENG-681).
 func TestProvision_ReservationPublishesTheOwnershipClaim(t *testing.T) {
-	lease := "0192f1a0-4444-7abc-8def-000000000104"
+	const lease = "0192f1a0-4444-7abc-8def-000000000104"
+	candidateOperationID := mustDockerOperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
 	svc := manifest.DefaultServiceName
+	oldItems := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: svc}}
+	oldProfiles := testResourceProfiles(t, oldItems)
+	oldOperationID := mustDockerOperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
+	oldCallbackURL := "https://old.example/callbacks/provision?operation_id=" + oldOperationID.String()
+	oldLifecycleURL, err := backend.ResolveLifecycleCallbackURL(oldCallbackURL, "")
+	require.NoError(t, err)
+	oldAuthority, err := shared.NewReleaseRuntimeAuthority(
+		oldOperationID, "tenant-a", nominalDockerProviderUUID, oldCallbackURL, oldLifecycleURL,
+	)
+	require.NoError(t, err)
+	oldManifest := validManifestJSON("nginx:latest")
+	oldContainer := ContainerInfo{
+		ContainerID: "container-1", Name: "fred-" + lease + "-app-0", LeaseUUID: lease,
+		Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+		BackendName: "docker", SKU: "docker-micro", ServiceName: svc, InstanceIndex: 0,
+		Image: "nginx:latest", CallbackURL: oldCallbackURL,
+		LifecycleCallbackURL: oldLifecycleURL, Status: "exited",
+	}
 
 	reached := make(chan struct{})
+	var reachedOnce sync.Once
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseTeardown := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseTeardown)
 	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
-			close(reached)
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{oldContainer}, nil
+		},
+		PullImageFn: func(context.Context, string, time.Duration) error {
+			return errors.New("stop after reservation handoff")
+		},
+		InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
+			copy := oldContainer
+			return &copy, nil
+		},
+		RemoveContainerFn: func(ctx context.Context, _ string) error {
+			reachedOnce.Do(func() { close(reached) })
 			select {
 			case <-release:
 			case <-ctx.Done():
@@ -254,48 +369,202 @@ func TestProvision_ReservationPublishesTheOwnershipClaim(t *testing.T) {
 			return nil
 		},
 	}
-	// The lease is Failed, so Provision takes the re-provision arm: it deletes this
-	// entry and re-reserves. Its volumes stay on disk by design.
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		lease: {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusFailed, Quantity: 1,
-			ContainerIDs: []string{"container-1"},
-			Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: svc}},
-		}},
-	})
+	oldProjection := &provision{
+		ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+			Status: backend.ProvisionStatusFailed, Quantity: 1,
+			ContainerIDs: []string{oldContainer.ContainerID}, Items: oldItems,
+			ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
+			CallbackURL:      oldCallbackURL, LifecycleCallbackURL: oldLifecycleURL,
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{lease: oldProjection})
 	withMicroSKU(b, 512)
+	seedProvisionReleaseForBackendTest(t, b, lease, shared.Release{
+		Manifest: oldManifest, Image: "stack", OperationID: oldOperationID,
+		Items: oldItems, ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
+		RuntimeAuthority: &oldAuthority, Status: "active", CreatedAt: time.Now().Add(-time.Hour),
+	})
+	compose := newNominalProvisionComposeExecutor()
+	compose.DownFn = func(context.Context, string, time.Duration) error {
+		return errors.New("force strict predecessor fallback")
+	}
+	b.compose = compose
 
-	// An unknown SKU fails validation just after the window, so the test needs no
-	// compose/callback scaffolding to reach and leave the reservation.
-	req := newProvisionRequest(lease, "tenant-a", "docker-nope", 1, validManifestJSON("nginx:latest"))
+	req := newProvisionRequest(lease, "tenant-a", "docker-micro", 1, oldManifest)
+	req.CallbackURL = "https://new.example/callbacks/provision?operation_id=" + candidateOperationID.String()
 	provisionErr := make(chan error, 1)
 	go func() { provisionErr <- b.Provision(context.Background(), req) }()
-
-	<-reached
+	select {
+	case <-reached:
+	case <-time.After(3 * time.Second):
+		releaseTeardown()
+		t.Fatal("re-provision did not enter predecessor teardown")
+	}
+	pending, err := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "predecessor teardown must retain exact durable operation authority")
 	claims, err := b.snapshotVolumeClaims()
 	require.NoError(t, err)
 	claim, claimed := claims.owner(canonicalVolumeName(lease, svc, 0))
-	assert.True(t, claimed, "the reservation must claim this lease's canonical volumes for the whole of Provision")
+	assert.True(t, claimed)
 	assert.Equal(t, volumeClaim{kind: claimLive, owner: lease}, claim)
-
 	b.provisionsMu.RLock()
 	prov := b.provisions[lease]
-	require.NotNil(t, prov)
-	require.Len(t, prov.Items, 1)
-	aliased := &prov.Items[0] == &req.Items[0]
 	b.provisionsMu.RUnlock()
-	assert.False(t, aliased,
-		"the published Items must be a copy: NormalizeProvisionRequest mutates the caller's slice in place")
+	assert.Same(t, oldProjection, prov,
+		"the predecessor projection remains authoritative until teardown is proven complete")
 
-	close(release)
-	require.ErrorIs(t, <-provisionErr, backend.ErrValidation)
+	// A periodic inventory refresh can overlap this synchronous teardown. The
+	// durable operation intent is the in-flight marker during the narrow window
+	// before Provision publishes its candidate projection, so recovery must keep
+	// the exact predecessor pointer that the post-teardown CAS will consume.
+	require.NoError(t, b.recoverState(context.Background()))
+	b.provisionsMu.RLock()
+	prov = b.provisions[lease]
+	b.provisionsMu.RUnlock()
+	assert.Same(t, oldProjection, prov,
+		"recovery must preserve the predecessor projection while its replacement intent is pending")
 
-	// And the claim goes away with the rolled-back reservation, so a failed admission
-	// does not leave a phantom owner protecting a genuinely orphaned volume.
+	releaseTeardown()
+	require.NoError(t, waitForAsyncTestResult(t, provisionErr, "re-provision reservation handoff"))
 	claims, err = b.snapshotVolumeClaims()
 	require.NoError(t, err)
-	_, claimed = claims.owner(canonicalVolumeName(lease, svc, 0))
-	assert.False(t, claimed, "removeProvision must retract the claim it published")
+	claim, claimed = claims.owner(canonicalVolumeName(lease, svc, 0))
+	assert.True(t, claimed, "the candidate must take over the volume claim without a gap")
+	assert.Equal(t, volumeClaim{kind: claimLive, owner: lease}, claim)
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
+// An already-admitted operation can complete between recovery's initial intent
+// snapshot and final publication while the Docker snapshot still predates its
+// new generation. New admission cannot cross the recoverySnapshotMu writer, but
+// an accepted worker owns no side of that gate and must remain free to settle.
+// This both proves the lock order is acyclic and ensures the optimistic
+// provision baseline preserves rather than erases the completed lease and its
+// resource reservation.
+func TestRecoverState_PreservesProvisionCompletedBetweenIntentReads(t *testing.T) {
+	const lease = "0192f1a0-4444-7abc-8def-000000000106"
+	operationID := mustDockerOperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
+	const stableLease = "0192f1a0-4444-7abc-8def-000000000107"
+	stableOperationID := mustDockerOperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
+	stableItems := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: manifest.DefaultServiceName}}
+	stableManifest := validManifestJSON("nginx:latest")
+	stableCallbackURL := "https://stable.example/callbacks/provision?operation_id=" + stableOperationID.String()
+	stableLifecycleURL, err := backend.ResolveLifecycleCallbackURL(stableCallbackURL, "")
+	require.NoError(t, err)
+	stableAuthority, err := shared.NewReleaseRuntimeAuthority(
+		stableOperationID, "tenant-b", nominalDockerProviderUUID, stableCallbackURL, stableLifecycleURL,
+	)
+	require.NoError(t, err)
+	stableContainer := ContainerInfo{
+		ContainerID: "stable-container", Name: "fred-" + stableLease + "-app-0", LeaseUUID: stableLease,
+		Tenant: "tenant-b", ProviderUUID: nominalDockerProviderUUID,
+		BackendName: "docker", SKU: "docker-micro", ServiceName: manifest.DefaultServiceName, InstanceIndex: 0,
+		Image: "nginx:latest", CallbackURL: stableCallbackURL, LifecycleCallbackURL: stableLifecycleURL,
+		Status: "running", CreatedAt: time.Now().Add(-time.Hour),
+	}
+
+	provisionWorkerEntered := make(chan struct{})
+	releaseProvisionWorker := make(chan struct{})
+	var releaseProvisionWorkerOnce sync.Once
+	t.Cleanup(func() {
+		releaseProvisionWorkerOnce.Do(func() { close(releaseProvisionWorker) })
+	})
+	var provisionWorkerEnteredOnce sync.Once
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{stableContainer}, nil
+		},
+		PullImageFn: func(ctx context.Context, _ string, _ time.Duration) error {
+			provisionWorkerEnteredOnce.Do(func() { close(provisionWorkerEntered) })
+			select {
+			case <-releaseProvisionWorker:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+		InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
+			return &ContainerInfo{Status: "running"}, nil
+		},
+	}
+	compose := newNominalProvisionComposeExecutor()
+	installStackStrictCohortInventory(t, mock, compose)
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.compose = compose
+	withMicroSKU(b, 512)
+	b.cfg.StartupVerifyDuration = time.Millisecond
+	stableProfiles := testResourceProfiles(t, stableItems)
+	seedProvisionReleaseForBackendTest(t, b, stableLease, shared.Release{
+		Manifest: stableManifest, Image: "stack", OperationID: stableOperationID,
+		Items: stableItems, ResourceProfiles: stableProfiles, RuntimeAuthority: &stableAuthority,
+		Status: "active", CreatedAt: stableContainer.CreatedAt,
+	})
+	nominalSettlement := b.operationSettlement
+
+	firstSnapshotCaptured := make(chan struct{})
+	releaseFirstSnapshot := make(chan struct{})
+	var releaseSnapshot sync.Once
+	defer releaseSnapshot.Do(func() { close(releaseFirstSnapshot) })
+	b.operationSettlement = &stagedRecoveryOperationIntentJournal{
+		operationSettlementService: nominalSettlement,
+		delegate:                   nominalSettlement,
+		afterFirstSnapshot:         firstSnapshotCaptured,
+		releaseFirstSnapshot:       releaseFirstSnapshot,
+	}
+	rebuildCallbackSender(b, testCallbackClient)
+	req := newProvisionRequest(lease, "tenant-a", "docker-micro", 1, validManifestJSON("nginx:latest"))
+	req.CallbackURL = "https://new.example/callbacks/provision?operation_id=" + operationID.String()
+	require.NoError(t, b.Provision(context.Background(), req))
+	waitForTestSignal(t, provisionWorkerEntered, "accepted provision worker")
+	claims, err := nominalSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, claims, 1, "the worker must remain durably Pending before recovery starts")
+	b.provisionsMu.RLock()
+	admitted := b.provisions[lease]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, admitted)
+	require.Equal(t, backend.ProvisionStatusProvisioning, admitted.Status)
+
+	recoverErr := make(chan error, 1)
+	go func() { recoverErr <- b.recoverState(context.Background()) }()
+	select {
+	case <-firstSnapshotCaptured:
+	case <-time.After(3 * time.Second):
+		t.Fatal("recovery did not capture its initial empty intent snapshot")
+	}
+
+	releaseProvisionWorkerOnce.Do(func() { close(releaseProvisionWorker) })
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		provision := b.provisions[lease]
+		ready := provision != nil && provision.Status == backend.ProvisionStatusReady
+		b.provisionsMu.RUnlock()
+		claims, err := nominalSettlement.ListOperationIntents()
+		return err == nil && ready && len(claims) == 0
+	}, 5*time.Second, 10*time.Millisecond, "provision must fully settle while recovery holds its stale snapshot")
+	b.provisionsMu.RLock()
+	completed := b.provisions[lease]
+	b.provisionsMu.RUnlock()
+
+	releaseSnapshot.Do(func() { close(releaseFirstSnapshot) })
+	require.NoError(t, waitForAsyncTestResult(t, recoverErr, "stale recovery publication"))
+	b.provisionsMu.RLock()
+	current := b.provisions[lease]
+	b.provisionsMu.RUnlock()
+	assert.Same(t, completed, current, "stale recovery must not replace a generation completed mid-sweep")
+	assert.NotNil(t, b.pool.GetAllocation(lease+"-"+manifest.DefaultServiceName+"-0"),
+		"stale recovery must not drop the completed generation's allocation")
+	b.provisionsMu.RLock()
+	stable := b.provisions[stableLease]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, stable, "one hot lease must not defer recovery for an unrelated lease")
+	assert.Equal(t, backend.ProvisionStatusReady, stable.Status)
+	assert.NotNil(t, b.pool.GetAllocation(stableLease+"-"+manifest.DefaultServiceName+"-0"),
+		"unrelated recovered allocation must still publish in the same pass")
 
 	b.stopCancel()
 	b.wg.Wait()
@@ -336,55 +605,33 @@ func TestLiveClaim(t *testing.T) {
 	}
 }
 
-// The kept-record WARN is operator triage, and the two holds resolve differently: a
-// restore-held name clears when that restore rolls back, an owner-held one only when the
-// owning lease is next closed. ENG-658 split the metric for exactly that reason; the log
-// line kept saying "the restore's rollback resolves it" either way, which is the sentence
-// that sends someone to reclaim a running tenant's volume by hand.
-func TestDestroyReapingVolumes_KeptRecordLogNamesTheRightHold(t *testing.T) {
-	t.Run("held by a live provision", func(t *testing.T) {
-		lease := "0192f1a0-4444-7abc-8def-000000000108"
-		live := canonicalVolumeName(lease, "app", 0)
+// A tombstone may overlap a newly re-provisioned live lease after the chain reports that
+// lease ACTIVE again. The kept-record warning must tell operators that the live provision
+// owns the bytes and explicitly forbid manual reclamation.
+func TestDestroyReapingVolumes_KeptRecordLogNamesLiveOwner(t *testing.T) {
+	lease := "0192f1a0-4444-7abc-8def-000000000108"
+	live := canonicalVolumeName(lease, "app", 0)
 
-		b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-			lease: {ProvisionState: leasesm.ProvisionState{
-				LeaseUUID: lease, Status: backend.ProvisionStatusReady, Quantity: 1,
-				Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
-			}},
-		})
-		rs := attachRetentionStore(t, b)
-		require.NoError(t, rs.Put(shared.RetentionEntry{
-			OriginalLeaseUUID: lease, Tenant: "tenant-a", Status: shared.RetentionStatusReaping,
-			RetainedVolumeNames: []string{live},
-		}))
-		b.volumes = &mockVolumeManager{ListFn: func() ([]string, error) { return []string{live}, nil }}
-
-		var buf bytes.Buffer
-		b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		require.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease))
-
-		out := buf.String()
-		assert.Contains(t, out, "do NOT reclaim by hand")
-		assert.NotContains(t, out, "the restore's rollback resolves it",
-			"there is no restore here; naming one sends the runbook after something that does not exist")
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Status: backend.ProvisionStatusReady, Quantity: 1,
+			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		}},
 	})
+	rs := attachRetentionStore(t, b)
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
+		OriginalLeaseUUID: lease, Tenant: "tenant-a", Status: shared.RetentionStatusReaping,
+		RetainedVolumeNames: []string{live},
+	}))
+	b.volumes = &mockVolumeManager{ListFn: func() ([]string, error) { return []string{live}, nil }}
 
-	t.Run("held by an in-flight restore", func(t *testing.T) {
-		orig := "0192f1a0-1111-7abc-8def-000000000109"
-		newLease := "0192f1a0-2222-7abc-8def-000000000110"
+	var buf bytes.Buffer
+	b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), reapingProofForTest(t, b.retentionStore, lease)))
 
-		b := newBackendForTest(&mockDockerClient{}, nil)
-		rs := attachRetentionStore(t, b)
-		adopted, ownLeak := seedClaimedTombstone(t, rs, orig, newLease)
-		b.volumes = &mockVolumeManager{ListFn: func() ([]string, error) { return []string{adopted, ownLeak}, nil }}
-
-		var buf bytes.Buffer
-		b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		require.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), newLease))
-
-		assert.Contains(t, buf.String(), "the restore's rollback resolves it",
-			"this hold really does clear on rollback, and the operator must be told to wait")
-	})
+	out := buf.String()
+	assert.Contains(t, out, "do NOT reclaim by hand")
+	assert.Contains(t, out, "held by a live provision")
 }
 
 // A lease destroying its OWN volumes must sail through the re-check — the close path runs
@@ -405,8 +652,11 @@ func TestVolumeOp_Destroy_ReCheckPermitsTheOwningLease(t *testing.T) {
 		destroyed = append(destroyed, id)
 		return nil
 	}}
+	installTestStorageMutationAdapters(b)
 
-	rep := b.volumeOp(lease, b.logger).destroy(context.Background(), destroySiteDeprovisionDestroy, name)
+	rep := destroyVolumesForTest(
+		b, lease, context.Background(), destroySiteDeprovisionDestroy, name,
+	)
 	assert.Equal(t, []string{name}, destroyed)
 	assert.Zero(t, rep.refused())
 	assert.False(t, rep.leftOnDisk())

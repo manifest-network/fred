@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +14,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
@@ -32,7 +32,17 @@ const (
 // It fails the test if creation fails.
 func newTestCallbackAuthenticator(t *testing.T, secret string) *CallbackAuthenticator {
 	t.Helper()
-	auth, err := NewCallbackAuthenticator(secret)
+	verifier, _ := hmacauth.NewCallbackProofBoundary()
+	return newTestCallbackAuthenticatorWithVerifier(t, secret, verifier)
+}
+
+func newTestCallbackAuthenticatorWithVerifier(
+	t *testing.T,
+	secret string,
+	verifier hmacauth.CallbackProofVerifier,
+) *CallbackAuthenticator {
+	t.Helper()
+	auth, err := NewCallbackAuthenticator(secret, verifier)
 	require.NoError(t, err)
 	return auth
 }
@@ -85,7 +95,8 @@ func TestNewCallbackAuthenticator_SecretValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			auth, err := NewCallbackAuthenticator(tt.secret)
+			verifier, _ := hmacauth.NewCallbackProofBoundary()
+			auth, err := NewCallbackAuthenticator(tt.secret, verifier)
 			if tt.wantError {
 				assert.Error(t, err)
 				assert.Nil(t, auth)
@@ -95,6 +106,12 @@ func TestNewCallbackAuthenticator_SecretValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewCallbackAuthenticatorRequiresProofVerifier(t *testing.T) {
+	auth, err := NewCallbackAuthenticator(testCallbackSecret, hmacauth.CallbackProofVerifier{})
+	require.ErrorContains(t, err, "proof verifier is required")
+	assert.Nil(t, auth)
 }
 
 func TestCallbackAuthenticator_ComputeSignature(t *testing.T) {
@@ -475,10 +492,9 @@ func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 }
 
 // TestHandleProvisionCallback_AlwaysPublished verifies that all valid callbacks
-// are published to Watermill regardless of in-flight status. Restart/update
-// operations don't register in-flight, so their completion callbacks must not
-// be short-circuited. The Watermill handler (HandleBackendCallback) handles
-// both in-flight and non-in-flight callbacks correctly.
+// reach the synchronous application boundary regardless of in-flight status.
+// Restart/update operations don't register in-flight, so their completion
+// callbacks must not be short-circuited.
 func TestHandleProvisionCallback_AlwaysPublished(t *testing.T) {
 	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
 	publishedCallback := &mockCallbackPublisher{}
@@ -633,7 +649,7 @@ type mockCallbackPublisher struct {
 	called bool
 }
 
-func (m *mockCallbackPublisher) PublishCallback(callback backend.CallbackPayload) error {
+func (m *mockCallbackPublisher) PublishCallback(_ context.Context, _ hmacauth.VerifiedRequest) error {
 	m.called = true
 	return nil
 }
@@ -677,7 +693,7 @@ func TestCallbackAuthenticator_RejectsCrossEndpointReplay(t *testing.T) {
 
 		_, err := auth.VerifyRequest(replayReq)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "mismatch",
+		assert.ErrorContains(t, err, "callback method must be POST",
 			"signature for POST /callbacks/provision must not verify when replayed as PUT /callbacks/provision")
 	})
 }
@@ -764,7 +780,8 @@ func TestCallbackAuthenticator_VerifyRequest_CanonicalPathPrefix(t *testing.T) {
 
 // Example showing the signature format
 func ExampleCallbackAuthenticator_ComputeSignature() {
-	auth, err := NewCallbackAuthenticator("my-secret-key-at-least-32-characters")
+	verifier, _ := hmacauth.NewCallbackProofBoundary()
+	auth, err := NewCallbackAuthenticator("my-secret-key-at-least-32-characters", verifier)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return

@@ -92,6 +92,32 @@ func TestCORS_PreflightAllowsAuthorizationHeader(t *testing.T) {
 		"Authorization must appear in Access-Control-Allow-Headers")
 }
 
+func TestCORS_PreflightAllowsMaintenanceIdempotencyKey(t *testing.T) {
+	const allowedOrigin = "https://admin.example.com"
+	addr := freePort(t)
+	s := newCORSTestServer(t, addr, []string{allowedOrigin})
+	client := startAndWaitForServer(t, s, addr)
+	defer s.Shutdown(context.Background())
+
+	req, err := http.NewRequest(http.MethodOptions,
+		fmt.Sprintf("http://%s/v1/leases/lease-1/restart", addr), nil)
+	require.NoError(t, err)
+	req.Header.Set("Origin", allowedOrigin)
+	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	// Browsers serialize the preflight header-name list in lowercase, and
+	// rs/cors intentionally compares that wire form strictly.
+	req.Header.Set("Access-Control-Request-Headers", strings.ToLower(idempotencyKeyHeader))
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Contains(t,
+		strings.ToLower(resp.Header.Get("Access-Control-Allow-Headers")),
+		strings.ToLower(idempotencyKeyHeader),
+	)
+}
+
 func TestCORS_WildcardPreflightAllowed(t *testing.T) {
 	addr := freePort(t)
 	s := newCORSTestServer(t, addr, []string{"*"})

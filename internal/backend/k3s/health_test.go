@@ -28,8 +28,12 @@ func newBackendForHealth(t *testing.T, kubeconfigPath string) *Backend {
 	cfg.ReleasesDBPath = filepath.Join(dir, "releases.db")
 	cfg.KubeconfigPath = kubeconfigPath
 
-	b, err := New(cfg, slog.Default())
+	b, err := newBackendWithTestIdentity(cfg, slog.Default())
 	require.NoError(t, err)
+	// Health verifies the durable substrate identity before probing the API
+	// discovery endpoint. Keep that production invariant strict while giving
+	// these discovery-focused tests an explicit, stable cluster identity.
+	bindK3sTestStorageIdentity(t, b)
 	t.Cleanup(func() { _ = b.Stop() })
 	return b
 }
@@ -89,6 +93,25 @@ func TestHealth_Success(t *testing.T) {
 	b := newBackendForHealth(t, kubeconfig)
 
 	require.NoError(t, b.Health(context.Background()))
+}
+
+func TestHealth_CallbackStoreFailure(t *testing.T) {
+	server := fakeAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/version" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintln(w, `{"major":"1","minor":"36","gitVersion":"v1.36.0+k3s1","platform":"linux/amd64"}`)
+			return
+		}
+		http.NotFound(w, r)
+	})
+
+	b := newBackendForHealth(t, writeFakeKubeconfig(t, server.URL))
+	require.NoError(t, b.callbackStore.Close())
+
+	err := b.Health(context.Background())
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "backend storage identity unhealthy")
+	assert.ErrorContains(t, err, "callback store identity")
 }
 
 func TestHealth_KubeconfigNotFound(t *testing.T) {

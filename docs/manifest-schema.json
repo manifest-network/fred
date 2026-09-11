@@ -68,10 +68,10 @@
         },
         "labels": {
           "type": "object",
-          "description": "Custom labels added to the container. Keys must not start with \"fred.\" or \"traefik.\" (reserved namespaces; traefik.* is blocked to prevent cross-tenant ingress route hijack — ENG-497).",
+          "description": "Custom container labels. Keys must not start with fred., traefik., or com.docker.compose. (case-insensitive reserved namespaces). The same restriction applies to labels baked into container images.",
           "propertyNames": {
             "type": "string",
-            "not": { "pattern": "^(fred|traefik)\\." }
+            "not": { "pattern": "^([fF][rR][eE][dD]|[tT][rR][aA][eE][fF][iI][kKK]|[cC][oO][mM]\\.[dD][oO][cC][kKK][eE][rR]\\.[cC][oO][mM][pP][oO][sSſ][eE])\\." }
           },
           "additionalProperties": {
             "type": "string"

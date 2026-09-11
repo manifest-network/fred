@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -19,22 +18,33 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
-const testCallbackSecret = "integration-test-secret-at-least-32-chars!"
+const (
+	testCallbackSecret = "integration-test-secret-at-least-32-chars!"
+	testProviderUUID   = "11111111-1111-4111-8111-111111111111"
+)
+
+func newIntegrationLeaseUUID() string {
+	return uuid.NewString()
+}
 
 // testBackendWithRealDocker creates a Backend connected to the real Docker daemon.
 // The backend is stopped and all test containers/networks are cleaned up via t.Cleanup.
 func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	t.Helper()
 
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -62,6 +72,7 @@ func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
 	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
 	cfg.ReleasesDBPath = filepath.Join(tmpDir, "releases.db")
+	cfg.RetentionDBPath = filepath.Join(tmpDir, "retention.db")
 
 	if cfgFn != nil {
 		cfgFn(&cfg)
@@ -77,6 +88,7 @@ func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	}
 
 	logger := slog.Default()
+	initializeFreshIntegrationStorageIdentity(t, ctx, cfg, logger)
 	b, err := New(cfg, logger)
 	require.NoError(t, err)
 
@@ -90,6 +102,23 @@ func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	})
 
 	return b
+}
+
+// initializeFreshIntegrationStorageIdentity makes the test's fresh-substrate
+// claim explicit. Production startup is deliberately verify-only, so an
+// integration fixture backed by a new temp directory must cross the same
+// one-shot initialization boundary as an operator provisioning a new backend.
+func initializeFreshIntegrationStorageIdentity(
+	t *testing.T,
+	ctx context.Context,
+	cfg Config,
+	logger *slog.Logger,
+) {
+	t.Helper()
+	_, err := InitializeStorageIdentityForConfig(
+		ctx, cfg, logger, StorageIdentityInitializeNew,
+	)
+	require.NoError(t, err)
 }
 
 // cleanupTestContainers removes all containers managed by the test backend.
@@ -149,11 +178,24 @@ func cleanupTestNetworks(t *testing.T, docker *DockerClient, backendName string)
 	}
 }
 
-// startCallbackServer creates an httptest server that receives HMAC-signed callbacks
-// and sends them to the returned channel.
-func startCallbackServer(t *testing.T) (*httptest.Server, <-chan backend.CallbackPayload) {
+// integrationCallbackDelivery keeps a callback's decoded observation coupled
+// to the exact authenticated wire identity that delivered it. Embedding the
+// payload preserves ergonomic read-only assertions without allowing tests to
+// reconstruct a different route or signature for settlement.
+type integrationCallbackDelivery struct {
+	backend.CallbackPayload
+	method     string
+	requestURI string
+	body       []byte
+	signature  string
+}
+
+func startProjectedCallbackServer[T any](
+	t *testing.T,
+	project func(integrationCallbackDelivery) T,
+) (*httptest.Server, <-chan T) {
 	t.Helper()
-	ch := make(chan backend.CallbackPayload, 10)
+	ch := make(chan T, 10)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -183,12 +225,61 @@ func startCallbackServer(t *testing.T) (*httptest.Server, <-chan backend.Callbac
 			return
 		}
 
-		ch <- payload
+		ch <- project(integrationCallbackDelivery{
+			CallbackPayload: payload,
+			method:          r.Method,
+			requestURI:      r.URL.RequestURI(),
+			body:            append([]byte(nil), body...),
+			signature:       sig,
+		})
 		w.WriteHeader(http.StatusOK)
 	}))
-
 	t.Cleanup(server.Close)
 	return server, ch
+}
+
+// startCallbackServer creates an httptest server that receives HMAC-signed
+// callbacks and exposes their decoded observation.
+func startCallbackServer(t *testing.T) (*httptest.Server, <-chan backend.CallbackPayload) {
+	t.Helper()
+	return startProjectedCallbackServer(t, func(delivery integrationCallbackDelivery) backend.CallbackPayload {
+		return delivery.CallbackPayload
+	})
+}
+
+// startCallbackDeliveryServer additionally preserves the actual signed wire
+// request for tests that apply the callback to providerd's typed coordinator.
+func startCallbackDeliveryServer(t *testing.T) (*httptest.Server, <-chan integrationCallbackDelivery) {
+	t.Helper()
+	return startProjectedCallbackServer(t, func(delivery integrationCallbackDelivery) integrationCallbackDelivery {
+		return delivery
+	})
+}
+
+// integrationCallbackAuthority gives a provision request the same exact,
+// typed callback pair that providerd supplies in production. Maintenance
+// requests carry the lifecycle URL so they retain the provisioned release's
+// immutable generation while allowing the callback endpoint itself to move.
+type integrationCallbackAuthority struct {
+	operationURL string
+	lifecycleURL string
+}
+
+func newIntegrationCallbackAuthority(
+	t *testing.T,
+	callbackBaseURL string,
+) integrationCallbackAuthority {
+	t.Helper()
+	routes, err := placement.NewCallbackRouteFactory(callbackBaseURL)
+	require.NoError(t, err)
+	operationID, err := operation.ParseID(uuid.NewString())
+	require.NoError(t, err)
+	pair, err := routes.ForOperation(operationID)
+	require.NoError(t, err)
+	return integrationCallbackAuthority{
+		operationURL: pair.OperationURL(),
+		lifecycleURL: pair.LifecycleURL(),
+	}
 }
 
 // waitForCallback reads from the callback channel until it finds a callback
@@ -210,6 +301,79 @@ func waitForCallback(t *testing.T, ch <-chan backend.CallbackPayload, leaseUUID 
 	}
 }
 
+// claimLeaseActorRecoveryQuiescence returns the same opaque registry and actor
+// capability used by production recovery. Unlike a snapshot of the actor map,
+// it also reserves an absent key, so a concurrent recovery pass cannot retire
+// the actor between the quiescence observation and the caller's assertions.
+func claimLeaseActorRecoveryQuiescence(
+	t *testing.T,
+	b *Backend,
+	leaseUUID string,
+	timeout time.Duration,
+) *leaseActorRecoveryClaim {
+	t.Helper()
+	var claim *leaseActorRecoveryClaim
+	require.Eventually(t, func() bool {
+		claim = b.tryClaimLeaseActorQuiescence(leaseUUID)
+		return claim != nil
+	}, timeout, 5*time.Millisecond, "lease actor did not become recovery-quiescent")
+	return claim
+}
+
+// recoverStartedProvisionFailure proves the operation-scoped ambiguity
+// contract before waiting for the production periodic recovery lane. The
+// command fence and actor recovery claim are the causal barrier: a missing
+// callback and durable Started intent cannot be observed ahead of the worker's
+// terminal handoff or consumed concurrently by the scheduler.
+func recoverStartedProvisionFailure(
+	t *testing.T,
+	b *Backend,
+	callbackCh <-chan backend.CallbackPayload,
+	leaseUUID string,
+	callbackURL string,
+) backend.CallbackPayload {
+	t.Helper()
+	// Provision has returned after admission, while the mutation worker remains
+	// asynchronous. Reserve this exact lease from periodic recovery before
+	// waiting for that worker's terminal handoff.
+	unlockCommand := b.commandFence.Lock(leaseUUID)
+	defer unlockCommand()
+	quiescence := claimLeaseActorRecoveryQuiescence(t, b, leaseUUID, provisionFlowTimeout)
+	defer quiescence.Release()
+
+	intents, err := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1, "the ambiguous operation must retain exact recovery evidence")
+	intent := intents[0]
+	require.Equal(t, leaseUUID, intent.LeaseUUID())
+	require.Equal(t, callbackURL, intent.CallbackURL())
+	require.Equal(t, shared.OperationExecutionStarted, intent.ExecutionPhase())
+	require.NoError(t, b.terminalStorageAuthorityError(),
+		"operation-local ambiguity must not withdraw the whole backend")
+	select {
+	case callback := <-callbackCh:
+		t.Fatalf("unexpected callback before exact recovery: %+v", callback)
+	default:
+	}
+
+	// Release both capabilities and let the backend's ordinary scheduler observe
+	// the durable operation. The computed visibility deadline bounds how long
+	// that production lane may conservatively defer an ambiguous Started intent;
+	// unit coverage pins the precise before/after-deadline classification.
+	deadline := provisionIntentRecoveryDeadline(intent.CreatedAt(), time.Now(), b.cfg.ProvisionTimeout)
+	wait := time.Until(deadline) + 2*b.cfg.ReconcileInterval + 30*time.Second
+	if wait < 30*time.Second {
+		wait = 30 * time.Second
+	}
+	quiescence.Release()
+	unlockCommand()
+	callback := waitForCallback(t, callbackCh, leaseUUID, wait)
+	intents, err = b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Empty(t, intents, "exact recovery must settle the durable operation intent")
+	return callback
+}
+
 func TestIntegration_Docker_ProvisionLifecycle(t *testing.T) {
 	callbackServer, callbackCh := startCallbackServer(t)
 
@@ -218,7 +382,7 @@ func TestIntegration_Docker_ProvisionLifecycle(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("lifecycle-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -226,15 +390,17 @@ func TestIntegration_Docker_ProvisionLifecycle(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	// Provision
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -286,8 +452,8 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	ctx := context.Background()
 	tenant1 := fmt.Sprintf("tenant-a-%d", time.Now().UnixNano())
 	tenant2 := fmt.Sprintf("tenant-b-%d", time.Now().UnixNano())
-	leaseUUID1 := fmt.Sprintf("net-iso-1-%d", time.Now().UnixNano())
-	leaseUUID2 := fmt.Sprintf("net-iso-2-%d", time.Now().UnixNano())
+	leaseUUID1 := newIntegrationLeaseUUID()
+	leaseUUID2 := newIntegrationLeaseUUID()
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -297,24 +463,28 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Provision for tenant 1
+	callbacks1 := newIntegrationCallbackAuthority(t, callbackServer.URL)
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID1,
-		Tenant:       tenant1,
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID1,
+		Tenant:               tenant1,
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks1.operationURL,
+		LifecycleCallbackURL: callbacks1.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
 	// Provision for tenant 2
+	callbacks2 := newIntegrationCallbackAuthority(t, callbackServer.URL)
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID2,
-		Tenant:       tenant2,
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID2,
+		Tenant:               tenant2,
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks2.operationURL,
+		LifecycleCallbackURL: callbacks2.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -331,7 +501,7 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	}
 
 	// Verify separate tenant networks were created
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -384,7 +554,7 @@ func TestIntegration_Docker_ContainerHardening(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("hardening-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -392,14 +562,16 @@ func TestIntegration_Docker_ContainerHardening(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -412,7 +584,7 @@ func TestIntegration_Docker_ContainerHardening(t *testing.T) {
 	}
 
 	// Inspect container via Docker API
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -463,7 +635,7 @@ func TestIntegration_Docker_DeprovisionIdempotent(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("idempotent-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -471,14 +643,16 @@ func TestIntegration_Docker_DeprovisionIdempotent(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -509,7 +683,7 @@ func TestIntegration_Docker_DeprovisionIdempotent(t *testing.T) {
 // time to transition to exited. This helper ensures the transition is complete.
 func waitForContainerExited(t *testing.T, containerID string) {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -528,14 +702,12 @@ func waitForContainerExited(t *testing.T, containerID string) {
 // The container remains visible to Docker (and recoverState) unlike ContainerRemove.
 func killContainer(t *testing.T, containerID string) {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
-	require.NoError(t, err)
-	defer func() { _ = docker.Close() }()
+	sdk := newImageSecurityFixtureClient(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err = docker.client.ContainerKill(ctx, containerID, "KILL")
+	err := sdk.ContainerKill(ctx, containerID, "KILL")
 	require.NoError(t, err, "failed to kill container %s", containerID)
 }
 
@@ -559,7 +731,7 @@ func waitForProvisionStatus(t *testing.T, b *Backend, leaseUUID string, expected
 // inspectProvisionContainers lists containers for a lease by label.
 func inspectProvisionContainers(t *testing.T, leaseUUID string) []container.Summary {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -575,6 +747,35 @@ func inspectProvisionContainers(t *testing.T, leaseUUID string) []container.Summ
 	})
 	require.NoError(t, err)
 	return containers
+}
+
+// requireProvisionContainerImage checks both sides of the image contract:
+// Docker executes an immutable ID, while labels and backend inventory preserve
+// the exact manifest reference used for release comparisons and recovery.
+func requireProvisionContainerImage(t *testing.T, summary container.Summary, reference string) {
+	t.Helper()
+	docker, err := NewDockerClient(t.Context(), "", "")
+	require.NoError(t, err)
+	defer func() { _ = docker.Close() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	raw, err := docker.client.ContainerInspect(ctx, summary.ID)
+	require.NoError(t, err)
+	require.NotNil(t, raw.ContainerJSONBase)
+	require.NotNil(t, raw.Config)
+	require.Regexp(t, `^sha256:[0-9a-f]{64}$`, raw.Image, "container must execute an immutable image ID")
+	require.Equal(t, raw.Image, raw.Config.Image, "configured image must equal Docker's actual execution ID")
+	require.Equal(t, raw.Image, raw.Config.Labels[LabelImageID], "reference binding must identify the executed image")
+	require.Equal(t, reference, raw.Config.Labels[LabelImageReference], "container must preserve the exact manifest reference")
+	require.Equal(t, raw.Image, summary.ImageID, "list and inspect must agree on the executed image")
+	require.Equal(t, raw.Config.Image, summary.Image, "list must expose the immutable configured image")
+	require.Equal(t, reference, summary.Labels[LabelImageReference])
+	require.Equal(t, raw.Image, summary.Labels[LabelImageID])
+
+	projected, err := docker.InspectContainer(ctx, summary.ID)
+	require.NoError(t, err)
+	require.Equal(t, reference, projected.Image, "backend inventory must retain the original release reference")
 }
 
 // getProvisionInfo returns the ProvisionInfo for a specific lease, or fails.
@@ -601,7 +802,7 @@ func TestIntegration_Docker_MultiContainerProvision(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("multi-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -609,15 +810,17 @@ func TestIntegration_Docker_MultiContainerProvision(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	// Provision with Quantity: 2
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -661,7 +864,7 @@ func TestIntegration_Docker_ContainerKilled_Detected(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("killed-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -669,14 +872,16 @@ func TestIntegration_Docker_ContainerKilled_Detected(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -717,7 +922,8 @@ func TestIntegration_Docker_MultiContainer_PartialKill(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("partial-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -728,12 +934,13 @@ func TestIntegration_Docker_MultiContainer_PartialKill(t *testing.T) {
 
 	// Provision with Quantity: 2
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -770,10 +977,15 @@ func TestIntegration_Docker_ImmediateExit(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.ContainerReadonlyRootfs = ptrBool(false) // busybox "false" needs no tmpfs
+		// A startup failure after Compose has run is deliberately ambiguous until
+		// the operation visibility horizon expires. Keep that production policy
+		// bounded in this integration fixture.
+		cfg.ProvisionTimeout = 5 * time.Second
+		cfg.ReconcileInterval = time.Second
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("exit-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// Command ["false"] exits immediately with code 1
 	appManifest := manifest.Manifest{
@@ -782,26 +994,25 @@ func TestIntegration_Docker_ImmediateExit(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
-	// Wait for failure callback (doProvision startup verify detects exit)
-	select {
-	case cb := <-callbackCh:
-		assert.Equal(t, leaseUUID, cb.LeaseUUID)
-		assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
-		assert.Contains(t, cb.Error, "exited", "error should mention container exited")
-	case <-time.After(2 * time.Minute):
-		t.Fatal("timeout waiting for failure callback")
-	}
+	// The worker detects the exit and cleans up, then exact recovery proves
+	// exact absence after the visibility horizon and publishes the failure.
+	cb := recoverStartedProvisionFailure(t, b, callbackCh, leaseUUID, callbacks.operationURL)
+	assert.Equal(t, leaseUUID, cb.LeaseUUID)
+	assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
+	assert.NotEmpty(t, cb.Error)
 }
 
 func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
@@ -810,10 +1021,11 @@ func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.ProvisionTimeout = 15 * time.Second // short, to avoid slow test
+		cfg.ReconcileInterval = time.Second
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("health-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// Health check ["CMD", "false"] always fails
 	appManifest := manifest.Manifest{
@@ -828,29 +1040,23 @@ func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
-	// Wait for failure callback
-	select {
-	case cb := <-callbackCh:
-		assert.Equal(t, leaseUUID, cb.LeaseUUID)
-		assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
-		assert.True(t,
-			strings.Contains(cb.Error, "unhealthy") || strings.Contains(cb.Error, "healthy"),
-			"error should mention health: %s", cb.Error,
-		)
-	case <-time.After(2 * time.Minute):
-		t.Fatal("timeout waiting for failure callback")
-	}
+	cb := recoverStartedProvisionFailure(t, b, callbackCh, leaseUUID, callbacks.operationURL)
+	assert.Equal(t, leaseUUID, cb.LeaseUUID)
+	assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
+	assert.NotEmpty(t, cb.Error)
 }
 
 func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
@@ -868,21 +1074,24 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
 	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
+	cfg.ReleasesDBPath = filepath.Join(tmpDir, "releases.db")
+	cfg.RetentionDBPath = filepath.Join(tmpDir, "retention.db")
 	for name, p := range cfg.SKUProfiles {
 		p.DiskMB = 0
 		cfg.SKUProfiles[name] = p
 	}
 
 	logger := slog.Default()
+	ctx := context.Background()
+	initializeFreshIntegrationStorageIdentity(t, ctx, cfg, logger)
 	b, err := New(cfg, logger)
 	require.NoError(t, err)
 
-	ctx := context.Background()
 	err = b.Start(ctx)
 	require.NoError(t, err)
 
 	// Track Docker client for cleanup
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupTestContainers(t, docker, cfg.Name)
@@ -890,7 +1099,8 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 		_ = docker.Close()
 	})
 
-	leaseUUID := fmt.Sprintf("cold-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -900,12 +1110,13 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -959,20 +1170,23 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
 	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
+	cfg.ReleasesDBPath = filepath.Join(tmpDir, "releases.db")
+	cfg.RetentionDBPath = filepath.Join(tmpDir, "retention.db")
 	for name, p := range cfg.SKUProfiles {
 		p.DiskMB = 0
 		cfg.SKUProfiles[name] = p
 	}
 
 	logger := slog.Default()
+	ctx := context.Background()
+	initializeFreshIntegrationStorageIdentity(t, ctx, cfg, logger)
 	b, err := New(cfg, logger)
 	require.NoError(t, err)
 
-	ctx := context.Background()
 	err = b.Start(ctx)
 	require.NoError(t, err)
 
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupTestContainers(t, docker, cfg.Name)
@@ -980,7 +1194,8 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 		_ = docker.Close()
 	})
 
-	leaseUUID := fmt.Sprintf("cold-dead-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer1.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -990,12 +1205,13 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer1.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -1046,7 +1262,7 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 // concurrent calls to EnsureTenantNetwork for the same tenant both succeed,
 // even when the second call races with the first's NetworkCreate.
 func TestIntegration_EnsureTenantNetwork_ConcurrentRace(t *testing.T) {
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -1107,7 +1323,7 @@ func TestIntegration_Docker_UnknownSKU_Rejected(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("bad-sku-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -1115,14 +1331,16 @@ func TestIntegration_Docker_UnknownSKU_Rejected(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, "http://localhost:9999")
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "nonexistent-sku-xyz", Quantity: 1}},
-		CallbackURL:  "http://localhost:9999/callback",
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "nonexistent-sku-xyz", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 
 	// Should fail synchronously with a validation error
@@ -1152,7 +1370,7 @@ func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("empty_manifest", func(t *testing.T) {
-		leaseUUID := fmt.Sprintf("bad-manifest-%d", time.Now().UnixNano())
+		leaseUUID := newIntegrationLeaseUUID()
 
 		// Manifest with empty image
 		appManifest := manifest.Manifest{
@@ -1161,14 +1379,16 @@ func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
 		}
 		payload, err := json.Marshal(appManifest)
 		require.NoError(t, err)
+		callbacks := newIntegrationCallbackAuthority(t, "http://localhost:9999")
 
 		err = b.Provision(ctx, backend.ProvisionRequest{
-			LeaseUUID:    leaseUUID,
-			Tenant:       "test-tenant",
-			ProviderUUID: "test-provider",
-			Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-			CallbackURL:  "http://localhost:9999/callback",
-			Payload:      payload,
+			LeaseUUID:            leaseUUID,
+			Tenant:               "test-tenant",
+			ProviderUUID:         testProviderUUID,
+			Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+			CallbackURL:          callbacks.operationURL,
+			LifecycleCallbackURL: callbacks.lifecycleURL,
+			Payload:              payload,
 		})
 
 		require.Error(t, err)
@@ -1179,7 +1399,7 @@ func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
 	})
 
 	t.Run("disallowed_registry", func(t *testing.T) {
-		leaseUUID := fmt.Sprintf("bad-registry-%d", time.Now().UnixNano())
+		leaseUUID := newIntegrationLeaseUUID()
 
 		// Use an image from a registry not in AllowedRegistries
 		appManifest := manifest.Manifest{
@@ -1188,14 +1408,16 @@ func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
 		}
 		payload, err := json.Marshal(appManifest)
 		require.NoError(t, err)
+		callbacks := newIntegrationCallbackAuthority(t, "http://localhost:9999")
 
 		err = b.Provision(ctx, backend.ProvisionRequest{
-			LeaseUUID:    leaseUUID,
-			Tenant:       "test-tenant",
-			ProviderUUID: "test-provider",
-			Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-			CallbackURL:  "http://localhost:9999/callback",
-			Payload:      payload,
+			LeaseUUID:            leaseUUID,
+			Tenant:               "test-tenant",
+			ProviderUUID:         testProviderUUID,
+			Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+			CallbackURL:          callbacks.operationURL,
+			LifecycleCallbackURL: callbacks.lifecycleURL,
+			Payload:              payload,
 		})
 
 		require.Error(t, err)
@@ -1206,15 +1428,17 @@ func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
 	})
 
 	t.Run("garbage_payload", func(t *testing.T) {
-		leaseUUID := fmt.Sprintf("garbage-%d", time.Now().UnixNano())
+		leaseUUID := newIntegrationLeaseUUID()
+		callbacks := newIntegrationCallbackAuthority(t, "http://localhost:9999")
 
 		err := b.Provision(ctx, backend.ProvisionRequest{
-			LeaseUUID:    leaseUUID,
-			Tenant:       "test-tenant",
-			ProviderUUID: "test-provider",
-			Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-			CallbackURL:  "http://localhost:9999/callback",
-			Payload:      []byte("not valid json"),
+			LeaseUUID:            leaseUUID,
+			Tenant:               "test-tenant",
+			ProviderUUID:         testProviderUUID,
+			Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+			CallbackURL:          callbacks.operationURL,
+			LifecycleCallbackURL: callbacks.lifecycleURL,
+			Payload:              []byte("not valid json"),
 		})
 
 		require.Error(t, err)
@@ -1233,7 +1457,7 @@ func TestIntegration_Docker_DuplicateProvision_Rejected(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("dup-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -1241,14 +1465,16 @@ func TestIntegration_Docker_DuplicateProvision_Rejected(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	req := backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	}
 
 	// First provision should succeed
@@ -1262,9 +1488,40 @@ func TestIntegration_Docker_DuplicateProvision_Rejected(t *testing.T) {
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for first provision callback")
 	}
+	// The callback server publishes before writing HTTP 200. Wait until the
+	// sender has consumed that response and removed the exact durable outbox row
+	// before taking the replay baseline.
+	require.Eventually(t, func() bool {
+		pending, listErr := b.callbackStore.ListPending()
+		return listErr == nil && len(pending) == 0
+	}, 10*time.Second, 10*time.Millisecond, "initial callback outbox row was not acknowledged")
 
-	// Second provision with same lease UUID should be rejected
-	err = b.Provision(ctx, req)
+	// An exact replay of req is idempotent: once the original actor is quiescent,
+	// it must neither append a release nor create another durable callback.
+	awaitProvisionWorkerQuiescence(t, b, leaseUUID)
+	releasesBeforeReplay, err := b.releaseStore.List(leaseUUID)
+	require.NoError(t, err)
+	require.NoError(t, b.Provision(ctx, req))
+	awaitProvisionWorkerQuiescence(t, b, leaseUUID)
+	releasesAfterReplay, err := b.releaseStore.List(leaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, releasesBeforeReplay, releasesAfterReplay)
+	pendingAfterReplay, err := b.callbackStore.ListPending()
+	require.NoError(t, err)
+	require.Empty(t, pendingAfterReplay, "exact operation replay must not append an outbox row")
+	select {
+	case callback := <-callbackCh:
+		t.Fatalf("exact operation replay emitted another callback: %+v", callback)
+	default:
+	}
+
+	// A distinct operation authority for the same live lease is the conflicting
+	// duplicate that must be rejected.
+	duplicateCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
+	duplicateReq := req
+	duplicateReq.CallbackURL = duplicateCallbacks.operationURL
+	duplicateReq.LifecycleCallbackURL = duplicateCallbacks.lifecycleURL
+	err = b.Provision(ctx, duplicateReq)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrAlreadyProvisioned,
 		"duplicate provision should return ErrAlreadyProvisioned")
@@ -1301,14 +1558,16 @@ func TestIntegration_Docker_ResourceExhaustion_Rejected(t *testing.T) {
 	require.NoError(t, err)
 
 	// First provision should succeed (uses all resources)
-	leaseUUID1 := fmt.Sprintf("exhaust-1-%d", time.Now().UnixNano())
+	leaseUUID1 := newIntegrationLeaseUUID()
+	lease1Callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID1,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID1,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          lease1Callbacks.operationURL,
+		LifecycleCallbackURL: lease1Callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -1316,19 +1575,27 @@ func TestIntegration_Docker_ResourceExhaustion_Rejected(t *testing.T) {
 	require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
 
 	// Second provision should fail — pool is exhausted
-	leaseUUID2 := fmt.Sprintf("exhaust-2-%d", time.Now().UnixNano())
+	leaseUUID2 := newIntegrationLeaseUUID()
+	rejectedCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID2,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID2,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          rejectedCallbacks.operationURL,
+		LifecycleCallbackURL: rejectedCallbacks.lifecycleURL,
+		Payload:              payload,
 	})
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrInsufficientResources,
 		"exhausted pool should return ErrInsufficientResources")
+
+	// The accepted operation is durably refused before Provision returns. Drain
+	// that exact generation's failure before retrying the lease with a fresh
+	// operation token, otherwise the old callback can be mistaken for the retry.
+	cb = waitForCallback(t, callbackCh, leaseUUID2, 2*time.Minute)
+	require.Equal(t, backend.CallbackStatusFailed, cb.Status)
 
 	// No containers should have been created for the second lease
 	containers := inspectProvisionContainers(t, leaseUUID2)
@@ -1347,13 +1614,15 @@ func TestIntegration_Docker_ResourceExhaustion_Rejected(t *testing.T) {
 	err = b.Deprovision(ctx, leaseUUID1)
 	require.NoError(t, err)
 
+	retryCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID2,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID2,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          retryCallbacks.operationURL,
+		LifecycleCallbackURL: retryCallbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -1374,9 +1643,9 @@ func TestIntegration_Docker_SameTenantNetwork_Shared(t *testing.T) {
 	ctx := context.Background()
 	tenant := fmt.Sprintf("shared-net-%d", time.Now().UnixNano())
 	otherTenant := fmt.Sprintf("other-net-%d", time.Now().UnixNano())
-	leaseUUID1 := fmt.Sprintf("same-net-1-%d", time.Now().UnixNano())
-	leaseUUID2 := fmt.Sprintf("same-net-2-%d", time.Now().UnixNano())
-	leaseUUID3 := fmt.Sprintf("other-net-%d", time.Now().UnixNano())
+	leaseUUID1 := newIntegrationLeaseUUID()
+	leaseUUID2 := newIntegrationLeaseUUID()
+	leaseUUID3 := newIntegrationLeaseUUID()
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -1387,25 +1656,29 @@ func TestIntegration_Docker_SameTenantNetwork_Shared(t *testing.T) {
 
 	// Provision two leases for the same tenant
 	for _, uuid := range []string{leaseUUID1, leaseUUID2} {
+		callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 		err = b.Provision(ctx, backend.ProvisionRequest{
-			LeaseUUID:    uuid,
-			Tenant:       tenant,
-			ProviderUUID: "test-provider",
-			Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-			CallbackURL:  callbackServer.URL,
-			Payload:      payload,
+			LeaseUUID:            uuid,
+			Tenant:               tenant,
+			ProviderUUID:         testProviderUUID,
+			Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+			CallbackURL:          callbacks.operationURL,
+			LifecycleCallbackURL: callbacks.lifecycleURL,
+			Payload:              payload,
 		})
 		require.NoError(t, err)
 	}
 
 	// Provision one lease for a different tenant
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID3,
-		Tenant:       otherTenant,
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID3,
+		Tenant:               otherTenant,
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -1422,7 +1695,7 @@ func TestIntegration_Docker_SameTenantNetwork_Shared(t *testing.T) {
 	}
 
 	// Inspect container networks via Docker API
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -1466,7 +1739,8 @@ func TestIntegration_Docker_RestartLifecycle(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("restart-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -1477,12 +1751,13 @@ func TestIntegration_Docker_RestartLifecycle(t *testing.T) {
 
 	// Provision
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -1500,9 +1775,9 @@ func TestIntegration_Docker_RestartLifecycle(t *testing.T) {
 	oldContainerID := containersBefore[0].ID
 
 	// Restart
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 	})
 	require.NoError(t, err)
 
@@ -1548,7 +1823,8 @@ func TestIntegration_Docker_UpdateLifecycle(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("update-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	// Provision with busybox
 	appManifest := manifest.Manifest{
@@ -1559,12 +1835,13 @@ func TestIntegration_Docker_UpdateLifecycle(t *testing.T) {
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -1588,9 +1865,9 @@ func TestIntegration_Docker_UpdateLifecycle(t *testing.T) {
 	newPayload, err := json.Marshal(newManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
 	})
 	require.NoError(t, err)
@@ -1609,7 +1886,7 @@ func TestIntegration_Docker_UpdateLifecycle(t *testing.T) {
 	require.Len(t, containersAfter, 1)
 	assert.NotEqual(t, oldContainerID, containersAfter[0].ID, "update should create a new container")
 	assert.Equal(t, "running", containersAfter[0].State)
-	assert.Contains(t, containersAfter[0].Image, "alpine", "container should be running alpine image")
+	requireProvisionContainerImage(t, containersAfter[0], newManifest.Image)
 
 	// GetInfo still works
 	info, err := b.GetInfo(ctx, leaseUUID)
@@ -1646,7 +1923,8 @@ func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("releases-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	// Provision with busybox
 	appManifest := manifest.Manifest{
@@ -1657,12 +1935,13 @@ func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -1681,9 +1960,9 @@ func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 	newPayload, err := json.Marshal(newManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
 	})
 	require.NoError(t, err)
@@ -1700,7 +1979,7 @@ func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, releases, 2, "expected 2 releases after provision + update")
 
-	// Release 1: version=1, busybox, superseded (ActivateLatest marks previous as superseded)
+	// Release 1: version=1, busybox, superseded (typed maintenance activation marks it superseded)
 	assert.Equal(t, 1, releases[0].Version)
 	assert.Equal(t, "busybox:latest", releaseServiceImage(t, releases[0], manifest.DefaultServiceName))
 	assert.Equal(t, "superseded", releases[0].Status)
@@ -1724,7 +2003,8 @@ func TestIntegration_Docker_UpdateFromFailed(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("update-failed-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -1735,12 +2015,13 @@ func TestIntegration_Docker_UpdateFromFailed(t *testing.T) {
 
 	// Provision
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -1776,9 +2057,9 @@ func TestIntegration_Docker_UpdateFromFailed(t *testing.T) {
 	newPayload, err := json.Marshal(newManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
 	})
 	require.NoError(t, err)
@@ -1796,7 +2077,7 @@ func TestIntegration_Docker_UpdateFromFailed(t *testing.T) {
 	containersAfter := inspectProvisionContainers(t, leaseUUID)
 	require.Len(t, containersAfter, 1)
 	assert.Equal(t, "running", containersAfter[0].State)
-	assert.Contains(t, containersAfter[0].Image, "alpine")
+	requireProvisionContainerImage(t, containersAfter[0], newManifest.Image)
 
 	// Status is Ready (recovered from Failed)
 	prov = getProvisionInfo(t, b, leaseUUID)
@@ -1816,7 +2097,8 @@ func TestIntegration_Docker_RestartFromFailed(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("restart-invalid-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -1827,12 +2109,13 @@ func TestIntegration_Docker_RestartFromFailed(t *testing.T) {
 
 	// Provision
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -1861,9 +2144,9 @@ func TestIntegration_Docker_RestartFromFailed(t *testing.T) {
 	require.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 
 	// Restart from Failed state → should now succeed (QoL improvement)
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 	})
 	require.NoError(t, err, "restart from Failed should be allowed")
 
@@ -1892,7 +2175,8 @@ func TestIntegration_Docker_FullLifecycle(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("full-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	// 1. Provision with busybox
 	appManifest := manifest.Manifest{
@@ -1903,12 +2187,13 @@ func TestIntegration_Docker_FullLifecycle(t *testing.T) {
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -1927,9 +2212,9 @@ func TestIntegration_Docker_FullLifecycle(t *testing.T) {
 	newPayload, err := json.Marshal(newManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
 	})
 	require.NoError(t, err)
@@ -1942,9 +2227,9 @@ func TestIntegration_Docker_FullLifecycle(t *testing.T) {
 	}
 
 	// 3. Restart
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 	})
 	require.NoError(t, err)
 
@@ -1985,7 +2270,8 @@ func TestIntegration_Docker_MultiContainerRestart(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("multi-restart-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -1996,12 +2282,13 @@ func TestIntegration_Docker_MultiContainerRestart(t *testing.T) {
 
 	// Provision with Quantity=2
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2021,9 +2308,9 @@ func TestIntegration_Docker_MultiContainerRestart(t *testing.T) {
 	}
 
 	// Restart
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 	})
 	require.NoError(t, err)
 
@@ -2057,7 +2344,8 @@ func TestIntegration_Docker_MultiContainerUpdate(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("multi-update-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -2068,12 +2356,13 @@ func TestIntegration_Docker_MultiContainerUpdate(t *testing.T) {
 
 	// Provision with Quantity=2
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2099,9 +2388,9 @@ func TestIntegration_Docker_MultiContainerUpdate(t *testing.T) {
 	newPayload, err := json.Marshal(newManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
 	})
 	require.NoError(t, err)
@@ -2119,7 +2408,7 @@ func TestIntegration_Docker_MultiContainerUpdate(t *testing.T) {
 	for _, c := range containersAfter {
 		assert.False(t, oldIDs[c.ID], "container %s should be new after update", c.ID[:12])
 		assert.Equal(t, "running", c.State)
-		assert.Contains(t, c.Image, "alpine", "container should be running alpine")
+		requireProvisionContainerImage(t, c, newManifest.Image)
 	}
 
 	prov := getProvisionInfo(t, b, leaseUUID)
@@ -2138,7 +2427,8 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("bad-update-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -2149,12 +2439,13 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 
 	// Provision
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2165,6 +2456,9 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 		t.Fatal("timeout waiting for provision callback")
 	}
 
+	before := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, before, 1)
+
 	// Update with an image that doesn't exist (passes registry check, fails pull)
 	badManifest := manifest.Manifest{
 		Image:   "busybox:this-tag-does-not-exist-xyz-99999",
@@ -2173,9 +2467,9 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 	badPayload, err := json.Marshal(badManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 		Payload:     badPayload,
 	})
 	require.NoError(t, err) // Update accepted synchronously (async failure)
@@ -2189,9 +2483,13 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 		t.Fatal("timeout waiting for update failure callback")
 	}
 
-	// Status should be Failed
+	// Replacement failure preserves the positively healthy original source.
 	prov := getProvisionInfo(t, b, leaseUUID)
-	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
+	after := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, after, 1)
+	assert.Equal(t, before[0].ID, after[0].ID)
+	assert.Equal(t, "running", after[0].State)
 
 	// Release history should show the failed update
 	releases, err := b.GetReleases(ctx, leaseUUID)
@@ -2203,10 +2501,157 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 	assert.Equal(t, backend.MsgImagePullFailed, releases[1].Message, "failed update should carry the curated image-pull message")
 	assert.Equal(t, "busybox:this-tag-does-not-exist-xyz-99999", releaseServiceImage(t, releases[1], manifest.DefaultServiceName))
 
-	// No leftover containers from the failed update — only the old ones remain (exited/removed)
-	// The original containers were removed during the update attempt
 	err = b.Deprovision(ctx, leaseUUID)
 	require.NoError(t, err)
+}
+
+// This crosses the real Docker launch boundary: the replacement runs, emits
+// logs, and becomes unhealthy. Compensation must recreate the frozen source
+// before publishing failure, preserving managed data when a volume is present.
+func TestIntegration_Docker_UpdateUnhealthyTargetRestoresFrozenSource(t *testing.T) {
+	t.Run("ephemeral", func(t *testing.T) {
+		testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t, "")
+	})
+	t.Run("stateful", func(t *testing.T) {
+		testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t, setupBtrfsLoopback(t))
+	})
+}
+
+func testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t *testing.T, mountPath string) {
+	callbackServer, callbackCh := startCallbackServer(t)
+	pidsLimit := int64(128)
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		cfg.ContainerReadonlyRootfs = ptrBool(true)
+		cfg.ContainerPidsLimit = &pidsLimit
+		if mountPath != "" {
+			cfg.VolumeDataPath = mountPath
+			cfg.VolumeMountPath = mountPath
+			cfg.VolumeFilesystem = "btrfs"
+		}
+	})
+	ctx := t.Context()
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
+	source := manifest.Manifest{
+		Image:   "redis:7",
+		User:    "999:999",
+		Env:     map[string]string{"PR240_POLICY": "frozen-source"},
+		Command: []string{"sh", "-c", "echo pr240-source-ready; exec redis-server --save 1 1"},
+	}
+	payload, err := json.Marshal(source)
+	require.NoError(t, err)
+	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID: leaseUUID, Tenant: "test-tenant", ProviderUUID: testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
+	}))
+	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, callbackCh, leaseUUID, 3*time.Minute).Status)
+	before := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, before, 1)
+	docker, err := NewDockerClient(ctx, "", "")
+	require.NoError(t, err)
+	defer func() { _ = docker.Close() }()
+	frozen, err := docker.client.ContainerInspect(ctx, before[0].ID)
+	require.NoError(t, err)
+	requireProvisionContainerImage(t, before[0], source.Image)
+	require.True(t, frozen.HostConfig.ReadonlyRootfs)
+	require.Equal(t, "999:999", frozen.Config.User)
+	var originalDataPath string
+	if mountPath != "" {
+		require.Contains(t, execInContainer(t, before[0].ID, []string{"redis-cli", "SET", "compensation-key", "source-persisted"}), "OK")
+		require.Contains(t, execInContainer(t, before[0].ID, []string{"redis-cli", "SAVE"}), "OK")
+		for _, bound := range frozen.Mounts {
+			if bound.Destination == "/data" {
+				originalDataPath = bound.Source
+			}
+		}
+		require.NotEmpty(t, originalDataPath, "source must use a real managed stateful bind")
+	} else {
+		for _, bound := range frozen.Mounts {
+			require.NotEqual(t, "bind", string(bound.Type), "ephemeral source must exercise an empty managed-volume launch")
+		}
+	}
+
+	target := manifest.Manifest{
+		Image:   "redis:7-alpine",
+		User:    "999:999",
+		Env:     map[string]string{"PR240_POLICY": "failed-target"},
+		Command: []string{"sh", "-c", "echo pr240-target-started-and-failed; exec sleep 3600"},
+		HealthCheck: &manifest.HealthCheckConfig{
+			Test: []string{"CMD", "false"}, Interval: manifest.Duration(time.Second),
+			Timeout: manifest.Duration(time.Second), Retries: 1,
+		},
+	}
+	badPayload, err := json.Marshal(target)
+	require.NoError(t, err)
+	maintenanceID := newTestMaintenanceID(t)
+	require.NoError(t, b.Update(ctx, backend.UpdateRequest{
+		MaintenanceID: maintenanceID, LeaseUUID: leaseUUID,
+		CallbackURL: callbacks.lifecycleURL, Payload: badPayload,
+	}))
+	failed := waitForCallback(t, callbackCh, leaseUUID, 3*time.Minute)
+	require.Equal(t, backend.CallbackStatusFailed, failed.Status)
+	require.NotEmpty(t, failed.Error)
+	require.Equal(t, backend.ProvisionStatusReady, getProvisionInfo(t, b, leaseUUID).Status)
+
+	after := inspectProvisionContainers(t, leaseUUID)
+	require.Len(t, after, 1, "failed target must be removed before source readiness is published")
+	require.NotEqual(t, before[0].ID, after[0].ID, "the healthy source must have been recreated after target dispatch")
+	require.Equal(t, "running", after[0].State)
+	requireProvisionContainerImage(t, after[0], source.Image)
+	restored, err := docker.client.ContainerInspect(ctx, after[0].ID)
+	require.NoError(t, err)
+	require.Equal(t, frozen.Image, restored.Image, "source replay must use the original immutable image")
+	require.Equal(t, frozen.Config.Image, restored.Config.Image)
+	require.Equal(t, frozen.Config.User, restored.Config.User)
+	require.Equal(t, frozen.Config.Env, restored.Config.Env)
+	require.Equal(t, frozen.Config.Entrypoint, restored.Config.Entrypoint)
+	require.Equal(t, frozen.Config.Cmd, restored.Config.Cmd)
+	require.Equal(t, frozen.Config.Healthcheck, restored.Config.Healthcheck)
+	require.Equal(t, frozen.HostConfig.ReadonlyRootfs, restored.HostConfig.ReadonlyRootfs)
+	require.Equal(t, frozen.HostConfig.Resources, restored.HostConfig.Resources)
+	require.Equal(t, frozen.HostConfig.CapDrop, restored.HostConfig.CapDrop)
+	require.Equal(t, frozen.HostConfig.SecurityOpt, restored.HostConfig.SecurityOpt)
+	require.Equal(t, frozen.Config.Labels[LabelLifecycleCallbackURL], restored.Config.Labels[LabelLifecycleCallbackURL])
+	require.Equal(t, frozen.Config.Labels[LabelMaintenanceID], restored.Config.Labels[LabelMaintenanceID])
+	if mountPath != "" {
+		var restoredDataPath string
+		for _, bound := range restored.Mounts {
+			if bound.Destination == "/data" {
+				restoredDataPath = bound.Source
+			}
+		}
+		require.Equal(t, originalDataPath, restoredDataPath)
+		require.Contains(t, execInContainer(t, after[0].ID, []string{"redis-cli", "GET", "compensation-key"}), "source-persisted")
+	}
+
+	info, err := b.GetInfo(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.Contains(t, info.Services, manifest.DefaultServiceName)
+	require.Len(t, info.Services[manifest.DefaultServiceName].Instances, 1)
+	require.Equal(t, after[0].ID[:12], info.Services[manifest.DefaultServiceName].Instances[0].ContainerID)
+	require.Len(t, info.Instances, 1)
+	require.Equal(t, after[0].ID[:12], info.Instances[0].ContainerID)
+	logs, err := b.GetLogs(ctx, leaseUUID, 100)
+	require.NoError(t, err)
+	require.Contains(t, logs[manifest.DefaultServiceName+"/0"], "pr240-source-ready")
+	require.Contains(t, logs["failed/"+manifest.DefaultServiceName+"/0"], "pr240-target-started-and-failed",
+		"real target output must survive removal alongside restored live source logs")
+	releases, err := b.GetReleases(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.Len(t, releases, 2)
+	require.Equal(t, "active", releases[0].Status)
+	require.Equal(t, "failed", releases[1].Status)
+	require.Equal(t, source.Image, releaseServiceImage(t, releases[0], manifest.DefaultServiceName))
+	require.Equal(t, target.Image, releaseServiceImage(t, releases[1], manifest.DefaultServiceName))
+	durable, err := b.releaseStore.List(leaseUUID)
+	require.NoError(t, err)
+	require.Len(t, durable, 2)
+	require.Equal(t, maintenanceID, durable[1].MaintenanceID)
+	require.NoError(t, b.Deprovision(ctx, leaseUUID))
 }
 
 func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) {
@@ -2217,7 +2662,8 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("seq-update-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	// 1. Provision with busybox
 	appManifest := manifest.Manifest{
@@ -2228,12 +2674,13 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2252,9 +2699,9 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	alpinePayload, err := json.Marshal(alpineManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 		Payload:     alpinePayload,
 	})
 	require.NoError(t, err)
@@ -2267,9 +2714,9 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	}
 
 	// 3. Update back to busybox
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 		Payload:     payload, // original busybox manifest
 	})
 	require.NoError(t, err)
@@ -2300,7 +2747,7 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	containers := inspectProvisionContainers(t, leaseUUID)
 	require.Len(t, containers, 1)
 	assert.Equal(t, "running", containers[0].State)
-	assert.Contains(t, containers[0].Image, "busybox")
+	requireProvisionContainerImage(t, containers[0], appManifest.Image)
 
 	prov := getProvisionInfo(t, b, leaseUUID)
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
@@ -2316,11 +2763,12 @@ func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("restart-vol-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// redis:7 declares VOLUME /data
 	appManifest := manifest.Manifest{
@@ -2329,15 +2777,17 @@ func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	// Provision with stateful SKU (docker-small has DiskMB > 0)
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2354,9 +2804,9 @@ func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
 	execInContainer(t, containerID, []string{"redis-cli", "SAVE"})
 
 	// Restart
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 	})
 	require.NoError(t, err)
 
@@ -2388,11 +2838,12 @@ func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("update-vol-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// redis:7 declares VOLUME /data
 	appManifest := manifest.Manifest{
@@ -2401,15 +2852,17 @@ func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	// Provision with stateful SKU (docker-small has DiskMB > 0)
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2433,9 +2886,9 @@ func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
 	newPayload, err := json.Marshal(newManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
 	})
 	require.NoError(t, err)
@@ -2454,7 +2907,7 @@ func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
 	// Verify the new container is running the updated image
 	containersAfter := inspectProvisionContainers(t, leaseUUID)
 	require.Len(t, containersAfter, 1)
-	assert.Contains(t, containersAfter[0].Image, "redis:7-alpine", "container should be running redis:7-alpine after update")
+	requireProvisionContainerImage(t, containersAfter[0], newManifest.Image)
 
 	// Read data back from redis — volume should have persisted the data across update
 	result := execInContainer(t, newContainerID, []string{"redis-cli", "GET", "update_key"})
@@ -2476,7 +2929,7 @@ func TestIntegration_Stack_ProvisionLifecycle(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("stack-lifecycle-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	stack := manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
@@ -2486,17 +2939,19 @@ func TestIntegration_Stack_ProvisionLifecycle(t *testing.T) {
 	}
 	payload, err := json.Marshal(stack)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items: []backend.LeaseItem{
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
 		},
-		CallbackURL: callbackServer.URL,
-		Payload:     payload,
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2545,7 +3000,7 @@ func TestIntegration_Stack_HealthCheck(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("stack-health-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	stack := manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
@@ -2564,17 +3019,19 @@ func TestIntegration_Stack_HealthCheck(t *testing.T) {
 	}
 	payload, err := json.Marshal(stack)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items: []backend.LeaseItem{
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
 		},
-		CallbackURL: callbackServer.URL,
-		Payload:     payload,
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2598,10 +3055,11 @@ func TestIntegration_Stack_HealthCheckFailure(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.ProvisionTimeout = 15 * time.Second
+		cfg.ReconcileInterval = time.Second
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("stack-health-fail-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	stack := manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
@@ -2620,21 +3078,23 @@ func TestIntegration_Stack_HealthCheckFailure(t *testing.T) {
 	}
 	payload, err := json.Marshal(stack)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items: []backend.LeaseItem{
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
 		},
-		CallbackURL: callbackServer.URL,
-		Payload:     payload,
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
-	cb := waitForCallback(t, callbackCh, leaseUUID, 30*time.Second)
+	cb := recoverStartedProvisionFailure(t, b, callbackCh, leaseUUID, callbacks.operationURL)
 	assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
 }
 
@@ -2646,7 +3106,7 @@ func TestIntegration_Stack_DependsOn(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("stack-depends-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	stack := manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
@@ -2662,17 +3122,19 @@ func TestIntegration_Stack_DependsOn(t *testing.T) {
 	}
 	payload, err := json.Marshal(stack)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items: []backend.LeaseItem{
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
 		},
-		CallbackURL: callbackServer.URL,
-		Payload:     payload,
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2698,7 +3160,7 @@ func TestIntegration_Stack_DependsOnHealthy(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("stack-depends-healthy-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	stack := manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
@@ -2723,17 +3185,19 @@ func TestIntegration_Stack_DependsOnHealthy(t *testing.T) {
 	}
 	payload, err := json.Marshal(stack)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items: []backend.LeaseItem{
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
 		},
-		CallbackURL: callbackServer.URL,
-		Payload:     payload,
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2758,7 +3222,7 @@ func TestIntegration_Stack_NetworkIsolation(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("stack-net-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	tenant := fmt.Sprintf("stack-tenant-%d", time.Now().UnixNano())
 
 	// web resolves db by DNS name — if resolution works, the services share a network.
@@ -2775,17 +3239,19 @@ func TestIntegration_Stack_NetworkIsolation(t *testing.T) {
 	}
 	payload, err := json.Marshal(stack)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       tenant,
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items: []backend.LeaseItem{
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
 		},
-		CallbackURL: callbackServer.URL,
-		Payload:     payload,
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2797,7 +3263,7 @@ func TestIntegration_Stack_NetworkIsolation(t *testing.T) {
 	assert.Len(t, containers, 2, "expected 2 containers")
 
 	// Verify tenant network was created
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -2826,7 +3292,7 @@ func TestIntegration_Stack_Restart(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("stack-restart-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	stack := manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
@@ -2836,17 +3302,19 @@ func TestIntegration_Stack_Restart(t *testing.T) {
 	}
 	payload, err := json.Marshal(stack)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items: []backend.LeaseItem{
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
 		},
-		CallbackURL: callbackServer.URL,
-		Payload:     payload,
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2862,9 +3330,9 @@ func TestIntegration_Stack_Restart(t *testing.T) {
 	}
 
 	// Restart
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 	})
 	require.NoError(t, err)
 
@@ -2894,7 +3362,8 @@ func TestIntegration_Stack_Update(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("stack-update-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	stack := manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
@@ -2908,13 +3377,14 @@ func TestIntegration_Stack_Update(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items: []backend.LeaseItem{
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
 		},
-		CallbackURL: callbackServer.URL,
-		Payload:     payload,
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2931,9 +3401,9 @@ func TestIntegration_Stack_Update(t *testing.T) {
 	updatedPayload, err := json.Marshal(updatedStack)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 		Payload:     updatedPayload,
 	})
 	require.NoError(t, err)
@@ -2945,7 +3415,7 @@ func TestIntegration_Stack_Update(t *testing.T) {
 	containers := inspectProvisionContainers(t, leaseUUID)
 	require.Len(t, containers, 2)
 	for _, c := range containers {
-		assert.Contains(t, c.Image, "alpine", "container should be running alpine after update, got %s", c.Image)
+		requireProvisionContainerImage(t, c, "alpine:latest")
 	}
 
 	// Verify status is Ready
@@ -2964,7 +3434,7 @@ func TestIntegration_Stack_Deprovision(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("stack-deprov-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	stack := manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
@@ -2974,17 +3444,19 @@ func TestIntegration_Stack_Deprovision(t *testing.T) {
 	}
 	payload, err := json.Marshal(stack)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items: []backend.LeaseItem{
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
 		},
-		CallbackURL: callbackServer.URL,
-		Payload:     payload,
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -3012,7 +3484,7 @@ func TestIntegration_Stack_MultiQuantity(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("stack-multi-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	stack := manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
@@ -3022,17 +3494,19 @@ func TestIntegration_Stack_MultiQuantity(t *testing.T) {
 	}
 	payload, err := json.Marshal(stack)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items: []backend.LeaseItem{
 			{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
 		},
-		CallbackURL: callbackServer.URL,
-		Payload:     payload,
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -3066,7 +3540,8 @@ func TestIntegration_Stack_FullLifecycle(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("stack-full-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	stack := manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
@@ -3081,13 +3556,14 @@ func TestIntegration_Stack_FullLifecycle(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items: []backend.LeaseItem{
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
 			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
 		},
-		CallbackURL: callbackServer.URL,
-		Payload:     payload,
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -3098,9 +3574,9 @@ func TestIntegration_Stack_FullLifecycle(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
 
 	// Step 2: Restart
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 	})
 	require.NoError(t, err)
 
@@ -3120,9 +3596,9 @@ func TestIntegration_Stack_FullLifecycle(t *testing.T) {
 	updatedPayload, err := json.Marshal(updatedStack)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 		Payload:     updatedPayload,
 	})
 	require.NoError(t, err)
@@ -3137,7 +3613,7 @@ func TestIntegration_Stack_FullLifecycle(t *testing.T) {
 	containers := inspectProvisionContainers(t, leaseUUID)
 	require.Len(t, containers, 2)
 	for _, c := range containers {
-		assert.Contains(t, c.Image, "alpine", "expected alpine image after update, got %s", c.Image)
+		requireProvisionContainerImage(t, c, "alpine:latest")
 	}
 
 	// Step 4: Deprovision

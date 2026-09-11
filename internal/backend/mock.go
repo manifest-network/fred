@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 // MockBackend is an in-memory backend for testing.
@@ -36,6 +38,7 @@ type MockBackend struct {
 	// Without it the mock cannot fail at all, which makes any "one backend did
 	// not answer" scenario unconstructible.
 	loadStatsErr error
+	storageID    backendidentity.ID
 }
 
 type mockProvision struct {
@@ -63,10 +66,19 @@ func NewMockBackend(cfg MockBackendConfig) *MockBackend {
 		name = "mock"
 	}
 
+	digest := sha256.Sum256([]byte("fred-mock-backend-storage:" + name))
+	digest[6] = (digest[6] & 0x0f) | 0x40
+	digest[8] = (digest[8] & 0x3f) | 0x80
+	storageID, err := backendidentity.Parse(fmt.Sprintf("%x-%x-%x-%x-%x",
+		digest[0:4], digest[4:6], digest[6:8], digest[8:10], digest[10:16]))
+	if err != nil {
+		panic("derive mock backend storage identity: " + err.Error())
+	}
 	return &MockBackend{
 		name:           name,
 		provisionDelay: cfg.ProvisionDelay,
 		provisions:     make(map[string]*mockProvision),
+		storageID:      storageID,
 	}
 }
 
@@ -130,6 +142,13 @@ func (m *MockBackend) ListRetentions(_ context.Context) ([]RetainedLease, error)
 	out := make([]RetainedLease, len(m.retentions))
 	copy(out, m.retentions)
 	return out, nil
+}
+
+func (m *MockBackend) ListRetentionsWithIdentity(
+	ctx context.Context,
+) ([]RetainedLease, backendidentity.ID, error) {
+	retentions, err := m.ListRetentions(ctx)
+	return retentions, m.storageID, err
 }
 
 // Name returns the backend's name.
@@ -244,6 +263,7 @@ func provisionInfoFrom(p *mockProvision) ProvisionInfo {
 	return ProvisionInfo{
 		LeaseUUID:    p.LeaseUUID,
 		ProviderUUID: p.ProviderUUID,
+		Tenant:       p.Tenant,
 		Status:       p.Status,
 		CreatedAt:    p.CreatedAt,
 		SKU:          p.SKU,
@@ -262,6 +282,13 @@ func (m *MockBackend) ListProvisions(ctx context.Context) ([]ProvisionInfo, erro
 	}
 
 	return result, nil
+}
+
+func (m *MockBackend) ListProvisionsWithIdentity(
+	ctx context.Context,
+) ([]ProvisionInfo, backendidentity.ID, error) {
+	provisions, err := m.ListProvisions(ctx)
+	return provisions, m.storageID, err
 }
 
 // LookupProvisions returns provision info for the requested lease UUIDs.
@@ -304,6 +331,7 @@ func (m *MockBackend) GetProvision(ctx context.Context, leaseUUID string) (*Prov
 	return &ProvisionInfo{
 		LeaseUUID:    p.LeaseUUID,
 		ProviderUUID: p.ProviderUUID,
+		Tenant:       p.Tenant,
 		Status:       p.Status,
 		CreatedAt:    p.CreatedAt,
 	}, nil

@@ -47,7 +47,8 @@
 //   - compose.go, compose_project.go: Compose-based stack provisioning
 //   - reconcile_custom_domain.go: Traefik label sync for tenant custom domains
 //   - volume.go (+ volume_btrfs.go, volume_xfs.go, volume_zfs.go):
-//     filesystem-specific quota enforcement for stateful SKUs
+//     filesystem-specific quota enforcement for durable SKU volumes and
+//     optional diskless writable-path scratch
 //   - ingress.go: Traefik label generation for routable ports
 //   - metrics.go: Prometheus metrics under fred_docker_backend_*
 //

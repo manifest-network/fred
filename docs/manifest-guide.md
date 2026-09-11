@@ -7,7 +7,13 @@
 > When Fred receives a flat manifest:
 >
 > - **At provision time:** the manifest is silently auto-wrapped into a 1-service stack under the synthetic service name `app`. The submitting tenant sees no behavioural difference except a `manifest deprecation: tenant submitted flat single-service manifest; auto-wrapped as 1-service stack` warning in operator logs.
-> - **At fred startup:** any pre-existing containers from leases provisioned under the legacy single-service execution path (Fred releases before this migration) are migrated in-place to the stack-shape naming convention. Migration is per-lease atomic and crash-resumable across most boundaries; see the CHANGELOG's *Migration → Troubleshooting* section (the *Stuck `-prev` containers …* subsection) for the one narrow non-resumable window and the operator remediation.
+> - **At fred startup:** Fred does not infer or rewrite a pre-stack container
+>   cohort. The supported v0.13 upgrade input is already in complete stack form,
+>   including stable service names and volume ownership. Service-name-less
+>   cohorts, `-prev` remnants, partial generations, or otherwise ambiguous
+>   runtime identity fail startup before mutation. Resolve those discrepancies
+>   during the stopped preflight described in [DEPLOYMENT.md](../DEPLOYMENT.md);
+>   do not rely on startup to migrate them in place.
 >
 > The flat format will be removed in a future major release. Until then, both formats remain valid wire input.
 
@@ -106,7 +112,7 @@ A JSON object with a top-level `services` key containing a map of service names 
 | `env` | object | No | `{}` | Environment variables (string→string map). |
 | `command` | string[] | No | `[]` | Overrides the container entrypoint. |
 | `args` | string[] | No | `[]` | Arguments passed to the command. |
-| `labels` | object | No | `{}` | Custom container labels (string→string map). Keys may not start with `fred.` or `traefik.` (reserved). |
+| `labels` | object | No | `{}` | Custom container labels (string→string map). Keys may not start with `fred.`, `traefik.`, or `com.docker.compose.` (case-insensitive reserved namespaces). |
 | `health_check` | object | No | `null` | Health check configuration. See [Health Check](#health-check). |
 | `tmpfs` | string[] | No | `[]` | Additional tmpfs mount paths. See [Tmpfs Mounts](#tmpfs-mounts). |
 | `user` | string | No | `""` | Container runtime user (`"uid"`, `"uid:gid"`, `"name"`, `"name:group"`). |
@@ -203,14 +209,17 @@ Env var names are validated for security:
 
 ### Labels
 
-- Keys must **not** start with `fred.` or `traefik.` — both are reserved: `fred.` for backend-managed labels, and `traefik.` for shared ingress routing (a tenant-set `traefik.*` label could otherwise hijack another tenant's router — ENG-497). Configure ingress via the manifest's `ingress`/port settings, not raw Traefik labels.
 - If you front many of your own end-customers behind one on-chain tenant, your provider may read a per-customer retention-partition key from a label (or env var) you declare — see [Retention partitioning (aggregator platforms)](#retention-partitioning-aggregator-platforms).
+- Keys must **not** start with `fred.`, `traefik.`, or `com.docker.compose.` (case-insensitive). These namespaces control backend ownership, shared ingress routing, and Compose container lifecycle. Configure ingress through the manifest's `ingress`/port settings.
+
+The same restriction applies to **labels baked into the image**, including base-image labels. Fred rejects these images after pulling, before creating a workload or inspection helper. Compose-built images may contain automatic `com.docker.compose.*` labels; rebuild them without orchestration metadata (for example, with `docker build`) before deploying. Application labels such as `org.opencontainers.image.*` remain allowed. Fred admits each service image once and carries the resulting immutable image identity through setup, helpers, and container creation; on the containerd image store this is a single platform manifest, not a multi-platform index. Preparing a previously unmaterialized platform manifest may require a registry request for that exact digest. The original tag or digest reference remains in the manifest and release history. Providers need Docker Engine 28.1+ (API 1.49+) for this admission check.
 
 ```json
 // Valid
 { "labels": { "app": "myapp", "version": "1.0" } }
 
 // Invalid — reserved prefixes
+{ "labels": { "com.docker.compose.project": "other-project" } }
 { "labels": { "fred.lease": "abc-123" } }
 { "labels": { "traefik.http.routers.x.rule": "Host(`evil.example`)" } }
 ```
@@ -535,6 +544,9 @@ Submits a new manifest for an already-provisioned lease. The body is a JSON obje
 **Requirements:**
 - Lease must be in `ACTIVE` state.
 - Bearer token authentication with replay protection.
+- Exactly one canonical UUIDv4 `Idempotency-Key` header. Reuse the same value
+  only when retrying this exact payload; use a fresh UUID for a new logical
+  update.
 - Returns `202 Accepted` on success.
 
 ## Duration Format
@@ -671,6 +683,7 @@ Requires a stateful SKU with `disk_mb > 0`. The backend auto-detects the volume 
 | `NONE` health check with `service_healthy` | Same as above | Use `CMD` or `CMD-SHELL` instead |
 | Setting `PATH` env var | `variable "PATH" is not allowed` | Use a different variable name or set PATH in the Dockerfile |
 | Using `fred.*` label prefix | `labels cannot use reserved prefix 'fred.'` | Choose a different prefix |
+| Using `com.docker.compose.*` label prefix | `labels cannot use reserved prefix 'com.docker.compose.'` | Remove Compose orchestration metadata from the manifest and image |
 | Using `traefik.*` label prefix | `labels cannot use reserved prefix 'traefik.'` | Remove it — configure ingress via the manifest `ingress`/port settings, not raw Traefik labels (ENG-497) |
 | More than 4 tmpfs mounts | `too many mounts (N), maximum is 4` | Consolidate mount points |
 | Tmpfs on `/tmp` or `/run` | `path "/tmp" is managed by the backend` | These are auto-mounted; use sub-paths if needed |

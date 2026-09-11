@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/k3s"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
@@ -42,23 +43,28 @@ func TestIntegration_BinaryProvisionsAndCallsBack(t *testing.T) {
 
 	binPath := buildBinary(t)
 	port := freePort(t)
-	kubeconfigPath := writeBogusKubeconfig(t)
+	kubeAPI := startIntegrationKubeAPI(t)
+	kubeconfigPath := writeIntegrationKubeconfig(t, kubeAPI.URL)
 	fred, callbacks := startIntegrationFred(t, secret)
 	cfgPath := writeBackendConfig(t, port, secret, kubeconfigPath)
 
+	initializeStorageIdentity(t, binPath, cfgPath)
 	startBinary(t, binPath, cfgPath)
 	waitForListening(t, port)
 
 	// POST /provision with HMAC-signed body.
-	leaseUUID := "00000000-0000-0000-0000-deadbeef0001"
+	leaseUUID := "00000000-0000-4000-8000-deadbeef0001"
+	operationID := "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
 	provisionReq := backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "manifest1test",
-		ProviderUUID: "prov-1",
+		LeaseUUID:            leaseUUID,
+		Tenant:               "manifest1test",
+		ProviderUUID:         "11111111-1111-4111-8111-111111111111",
+		Payload:              []byte(`{"image":"docker.io/library/alpine:3.22"}`),
+		CallbackURL:          fred.URL + "/callbacks/provision?operation_id=" + operationID,
+		LifecycleCallbackURL: fred.URL + "/callbacks/provision?lifecycle_id=" + operationID,
 		Items: []backend.LeaseItem{
 			{SKU: "00000000-0000-0000-0000-000000000001", Quantity: 1},
 		},
-		CallbackURL: fred.URL + "/callbacks/provision",
 	}
 	bodyBytes, err := json.Marshal(provisionReq)
 	require.NoError(t, err)
@@ -128,20 +134,37 @@ func freePort(t *testing.T) int {
 	return port
 }
 
-// writeBogusKubeconfig writes a syntactically valid kubeconfig pointing at
-// an unreachable server. The integration test never invokes /health, so
-// the kubeconfig's unreachability is fine; it satisfies any path-existence
-// expectation without requiring a real cluster.
-func writeBogusKubeconfig(t *testing.T) string {
+// startIntegrationKubeAPI exposes the one read-only Kubernetes API operation
+// needed to seal and then attest a K3s backend's storage identity. Keeping the
+// namespace UID stable across both process invocations proves the binary can
+// initialize and reload the same cluster lineage without requiring a cluster.
+func startIntegrationKubeAPI(t *testing.T) *httptest.Server {
 	t.Helper()
-	const kubeconfig = `apiVersion: v1
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/namespaces/kube-system" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, err := io.WriteString(w, `{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"kube-system","uid":"integration-cluster-uid"}}`)
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// writeIntegrationKubeconfig writes a kubeconfig for the authenticated fake
+// API above. HTTP is intentional and remains confined to the loopback test
+// server; production kubeconfigs retain their own TLS policy.
+func writeIntegrationKubeconfig(t *testing.T, serverURL string) string {
+	t.Helper()
+	kubeconfig := fmt.Sprintf(`apiVersion: v1
 kind: Config
 current-context: ctx
 clusters:
 - name: cluster
   cluster:
-    server: https://127.0.0.1:1
-    insecure-skip-tls-verify: true
+    server: %q
 contexts:
 - name: ctx
   context:
@@ -150,10 +173,25 @@ contexts:
 users:
 - name: user
   user: {}
-`
+`, serverURL)
 	path := filepath.Join(t.TempDir(), "kubeconfig.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(kubeconfig), 0o600))
 	return path
+}
+
+// initializeStorageIdentity exercises the operator-facing one-shot command
+// before normal startup. A successful exit proves the test uses the same
+// fail-closed marker contract as a deployed backend rather than manufacturing
+// private marker state in the fixture.
+func initializeStorageIdentity(t *testing.T, binPath, cfgPath string) {
+	t.Helper()
+	cmd := exec.Command(
+		binPath,
+		"-config", cfgPath,
+		"-initialize-storage-identity", string(k3s.StorageIdentityInitializeNew),
+	)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "initialize storage identity:\n%s", out)
 }
 
 // startIntegrationFred returns an httptest.Server that plays Fred for the
@@ -196,12 +234,9 @@ func startIntegrationFred(t *testing.T, secret string) (*httptest.Server, <-chan
 func writeBackendConfig(t *testing.T, port int, secret, kubeconfigPath string) string {
 	t.Helper()
 	dir := t.TempDir()
-	// SKUMapping intentionally omitted: yaml.v3 merges maps with
-	// DefaultConfig, so providing one mapping would trigger the reverse
-	// unreachability check against the 4 default profiles. The stub
-	// provisioner doesn't dereference SKUs (no GetSKUProfile call path),
-	// so leaving SKUMapping empty gates off the check without affecting
-	// the Provision flow under test.
+	// yaml.v3 merges maps with DefaultConfig, so the fixture maps every default
+	// profile. Provision snapshots resource authority before asynchronous
+	// dispatch even though the K3s implementation remains a failure stub.
 	yaml := fmt.Sprintf(`name: k3s
 listen_addr: ":%d"
 kubeconfig_path: %q
@@ -215,6 +250,11 @@ callback_db_path: %q
 diagnostics_db_path: %q
 releases_db_path: %q
 reconcile_interval: 5m
+sku_mapping:
+  "00000000-0000-0000-0000-000000000001": "k3s-micro"
+  "00000000-0000-0000-0000-000000000002": "k3s-small"
+  "00000000-0000-0000-0000-000000000003": "k3s-medium"
+  "00000000-0000-0000-0000-000000000004": "k3s-large"
 `,
 		port,
 		kubeconfigPath,

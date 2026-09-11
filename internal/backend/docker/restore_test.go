@@ -8,13 +8,16 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
+	"github.com/containerd/errdefs"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,21 +28,144 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
+const retentionCloseProviderUUID = "22222222-2222-4222-8222-222222222222"
+
 // attachRetentionStore wires a real RetentionStore (backed by a temp bbolt DB)
 // into the Backend and registers a cleanup to close it.
 func attachRetentionStore(t *testing.T, b *Backend) *shared.RetentionStore {
 	t.Helper()
-	s, err := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: filepath.Join(t.TempDir(), "retention.db")})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
-	b.retentionStore = s
-	return s
+	attachBoundOperationHandoffStores(t, b)
+	require.NotNil(t, b.retentionStore)
+	return b.retentionStore
+}
+
+// bindExactRestoreCleanupFixture gives the legacy inventory fixtures the exact
+// labels of their already-settled restore. It preserves each test's listing and
+// removal failures, requires capture before removal, and models successful
+// removal in subsequent strict inventories. No fixture can use broad Down.
+func bindExactRestoreCleanupFixture(t *testing.T, b *Backend, entry shared.RetentionEntry) func() []string {
+	t.Helper()
+	mock, ok := b.docker.(*mockDockerClient)
+	require.True(t, ok)
+	list, remove := mock.ListManagedContainersFn, mock.RemoveContainerFn
+	var mu sync.Mutex
+	removed := make(map[string]bool)
+	captured := make(map[string]bool)
+	var attempts []string
+	read := func(ctx context.Context) ([]ContainerInfo, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if list == nil {
+			return nil, nil
+		}
+		containers, err := list(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var current []ContainerInfo
+		for _, container := range containers {
+			if removed[container.ContainerID] {
+				continue
+			}
+			if container.LeaseUUID != entry.NewLeaseUUID {
+				return nil, errors.New("restore cleanup fixture contains an unrelated lease")
+			}
+			container.BackendName = b.Name()
+			container.Tenant, container.ProviderUUID = entry.Tenant, entry.ProviderUUID
+			container.CallbackURL = entry.DestinationCallbackURL
+			container.LifecycleCallbackURL = entry.DestinationLifecycleCallbackURL
+			container.ServiceName = entry.DestinationItems[0].ServiceName
+			container.Status = "exited"
+			current = append(current, container)
+		}
+		return current, nil
+	}
+	mock.ListManagedContainersFn = read
+	mock.InspectContainerFn = func(ctx context.Context, id string) (*ContainerInfo, error) {
+		containers, err := read(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, container := range containers {
+			if container.ContainerID == id {
+				return &container, nil
+			}
+		}
+		return nil, errdefs.ErrNotFound
+	}
+	mock.ContainerLogsFn = func(ctx context.Context, id string, tail int) (string, error) {
+		if _, err := mock.InspectContainerFn(ctx, id); err != nil {
+			return "", err
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if tail != persistedLogTail {
+			t.Errorf("unexpected restore log capture tail %d", tail)
+			return "", errors.New("restore cleanup requires the durable capture tail")
+		}
+		captured[id] = true
+		return "failed restore startup logs", nil
+	}
+	mock.RemoveContainerFn = func(ctx context.Context, id string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if remove == nil || !captured[id] || removed[id] {
+			t.Errorf("unexpected or uncaptured exact restore removal %q", id)
+			return errors.New("fixture requires a captured exact target before removal")
+		}
+		attempts = append(attempts, id)
+		if err := remove(ctx, id); err != nil {
+			return err
+		}
+		removed[id] = true
+		return nil
+	}
+	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
+		t.Error("restore receipt cleanup must not invoke broad Compose Down")
+		return errors.New("broad restore teardown is forbidden")
+	}}
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(attempts)
+	}
+}
+
+// startRestoreCallbackReplay gives focused Restore tests the same durable
+// callback owner that Backend.Start installs in production. attachRetentionStore
+// deliberately constructs the real callback journal and sender, so merely
+// receiving from an HTTP test server is not enough: durable senders only append
+// and wake this tracked replay loop.
+func startRestoreCallbackReplay(t *testing.T, b *Backend) func() {
+	t.Helper()
+	require.NotNil(t, b.callbackSender)
+	require.NotNil(t, b.callbackStore)
+
+	b.wg.Go(b.callbackSender.RunReplayLoop)
+	var stopOnce sync.Once
+	return func() {
+		stopOnce.Do(func() {
+			b.stopCancel()
+			b.wg.Wait()
+		})
+	}
+}
+
+func awaitRestoreCallback(t *testing.T, callback <-chan struct{}) {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-callback:
+	case <-timer.C:
+		t.Fatal("restore callback was not delivered")
+	}
 }
 
 // TestDeprovision_RetainRenamesExactlyExistingVolumes verifies that with
 // RetainOnClose=true the deprovision path:
 //   - lists actual on-disk volumes,
-//   - renames exactly this lease's canonical volumes (fred-u1-*) to the
+//   - renames exactly this lease's canonical volumes (fred-11111111-1111-4111-8111-111111111111-*) to the
 //     retained namespace,
 //   - does NOT rename or destroy volumes belonging to other leases or already-retained
 //     volumes, and
@@ -49,36 +175,40 @@ func TestDeprovision_RetainRenamesExactlyExistingVolumes(t *testing.T) {
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"u1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u1",
-			Tenant:    "tenant-a",
-			Status:    backend.ProvisionStatusReady,
-			Quantity:  2,
-			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}},
+		"11111111-1111-4111-8111-111111111111": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "11111111-1111-4111-8111-111111111111",
+			Tenant:        "tenant-a",
+			ProviderUUID:  retentionCloseProviderUUID,
+			Status:        backend.ProvisionStatusReady,
+			Quantity:      2,
+			Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}},
+			StackManifest: restoreStackManifest(),
 		}},
 	})
 
 	b.cfg.RetainOnClose = true
 	rs := attachRetentionStore(t, b)
+	seedProvisionReleaseFromProjectionForBackendTest(
+		t, b, "11111111-1111-4111-8111-111111111111",
+	)
 
 	type renameCall struct{ old, new string }
 	var mu sync.Mutex
 	var renames []renameCall
 
+	inventory := newVolumeSet(
+		"fred-11111111-1111-4111-8111-111111111111-app-0",
+		"fred-11111111-1111-4111-8111-111111111111-app-1",
+		"fred-OTHER-app-0",
+		"fred-retained-zzz-app-0",
+	)
 	b.volumes = &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			return []string{
-				"fred-u1-app-0",
-				"fred-u1-app-1",
-				"fred-OTHER-app-0",
-				"fred-retained-zzz-app-0",
-			}, nil
-		},
+		ListFn: inventory.list,
 		RenameVolumeFn: func(old, new string) error {
 			mu.Lock()
 			renames = append(renames, renameCall{old, new})
 			mu.Unlock()
-			return nil
+			return inventory.rename(old, new)
 		},
 		DestroyFn: func(_ context.Context, id string) error {
 			t.Fatalf("Destroy must NOT be called in RetainOnClose=true path, got %q", id)
@@ -86,34 +216,34 @@ func TestDeprovision_RetainRenamesExactlyExistingVolumes(t *testing.T) {
 		},
 	}
 
-	err := b.Deprovision(context.Background(), "u1")
+	err := b.Deprovision(context.Background(), "11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 
 	// Poll for the retention record (Deprovision is async through the lease actor).
 	var entry *shared.RetentionEntry
 	require.Eventually(t, func() bool {
-		e, err := rs.Get("u1")
+		e, err := rs.Get("11111111-1111-4111-8111-111111111111")
 		if err != nil || e == nil {
 			return false
 		}
 		entry = e
 		return true
-	}, 5*time.Second, 20*time.Millisecond, "retention record for u1 must appear")
+	}, 5*time.Second, 20*time.Millisecond, "retention record for 11111111-1111-4111-8111-111111111111 must appear")
 
-	// Verify rename calls: exactly u1's two canonical volumes.
+	// Verify rename calls: exactly 11111111-1111-4111-8111-111111111111's two canonical volumes.
 	mu.Lock()
 	gotRenames := append([]renameCall(nil), renames...)
 	mu.Unlock()
 
-	require.Len(t, gotRenames, 2, "exactly two renames for u1's two volumes")
-	assert.Contains(t, gotRenames, renameCall{"fred-u1-app-0", "fred-retained-u1-app-0"})
-	assert.Contains(t, gotRenames, renameCall{"fred-u1-app-1", "fred-retained-u1-app-1"})
+	require.Len(t, gotRenames, 2, "exactly two renames for 11111111-1111-4111-8111-111111111111's two volumes")
+	assert.Contains(t, gotRenames, renameCall{"fred-11111111-1111-4111-8111-111111111111-app-0", "fred-retained-11111111-1111-4111-8111-111111111111-app-0"})
+	assert.Contains(t, gotRenames, renameCall{"fred-11111111-1111-4111-8111-111111111111-app-1", "fred-retained-11111111-1111-4111-8111-111111111111-app-1"})
 
 	// Verify the retention record.
-	assert.Equal(t, "u1", entry.OriginalLeaseUUID)
+	assert.Equal(t, "11111111-1111-4111-8111-111111111111", entry.OriginalLeaseUUID)
 	assert.Equal(t, "tenant-a", entry.Tenant)
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
-	assert.ElementsMatch(t, []string{"fred-retained-u1-app-0", "fred-retained-u1-app-1"}, entry.RetainedVolumeNames)
+	assert.ElementsMatch(t, []string{"fred-retained-11111111-1111-4111-8111-111111111111-app-0", "fred-retained-11111111-1111-4111-8111-111111111111-app-1"}, entry.RetainedVolumeNames)
 }
 
 // TestDeprovision_RetainRecordWrittenBeforeRename verifies record-first
@@ -124,21 +254,26 @@ func TestDeprovision_RetainRecordWrittenBeforeRename(t *testing.T) {
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"u1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u1",
-			Tenant:    "tenant-a",
-			Status:    backend.ProvisionStatusReady,
-			Quantity:  1,
-			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		"11111111-1111-4111-8111-111111111111": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "11111111-1111-4111-8111-111111111111",
+			Tenant:        "tenant-a",
+			ProviderUUID:  retentionCloseProviderUUID,
+			Status:        backend.ProvisionStatusReady,
+			Quantity:      1,
+			Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+			StackManifest: restoreStackManifest(),
 		}},
 	})
 
 	b.cfg.RetainOnClose = true
 	rs := attachRetentionStore(t, b)
+	seedProvisionReleaseFromProjectionForBackendTest(
+		t, b, "11111111-1111-4111-8111-111111111111",
+	)
 
 	b.volumes = &mockVolumeManager{
 		ListFn: func() ([]string, error) {
-			return []string{"fred-u1-app-0"}, nil
+			return []string{"fred-11111111-1111-4111-8111-111111111111-app-0"}, nil
 		},
 		RenameVolumeFn: func(old, new string) error {
 			// Simulate rename failure.
@@ -148,16 +283,16 @@ func TestDeprovision_RetainRecordWrittenBeforeRename(t *testing.T) {
 
 	// Deprovision must fail because the rename fails (flows through volumeErrs),
 	// pinning the rename-error-propagation invariant.
-	err := b.Deprovision(context.Background(), "u1")
+	err := b.Deprovision(context.Background(), "11111111-1111-4111-8111-111111111111")
 	require.Error(t, err, "deprovision must fail when rename fails")
 
 	// The retention record MUST have been written before the rename was attempted.
 	require.Eventually(t, func() bool {
-		e, err := rs.Get("u1")
+		e, err := rs.Get("11111111-1111-4111-8111-111111111111")
 		return err == nil && e != nil
 	}, 5*time.Second, 20*time.Millisecond, "retention record must exist even when rename fails (record-first)")
 
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
@@ -165,52 +300,72 @@ func TestDeprovision_RetainRecordWrittenBeforeRename(t *testing.T) {
 
 // TestDeprovision_PerTenantCapEvictsOwnOldest verifies that when
 // MaxRetainedLeasesPerTenant=1, closing a new lease for a tenant evicts that
-// tenant's oldest active record (and destroys its volumes) while leaving
-// another tenant's record untouched.
-func TestDeprovision_PerTenantCapEvictsOwnOldest(t *testing.T) {
+// tenant's oldest active record to the reaper while leaving every other
+// lease's physical substrate untouched by this close execution.
+func TestDeprovision_PerTenantCapHandsOldestToReaperWithoutCrossLeaseMutation(t *testing.T) {
+	const (
+		closingLease = "44444444-4444-4444-8444-444444444444"
+		oldLease     = "44444444-4444-4444-8444-444444444445"
+		otherLease   = "44444444-4444-4444-8444-444444444446"
+	)
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"new-lease": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "new-lease",
-			Tenant:    "tenant-a",
-			Status:    backend.ProvisionStatusReady,
-			Quantity:  1,
-			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		closingLease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     closingLease,
+			Tenant:        "tenant-a",
+			ProviderUUID:  retentionCloseProviderUUID,
+			Status:        backend.ProvisionStatusReady,
+			Quantity:      1,
+			Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+			StackManifest: restoreStackManifest(),
 		}},
 	})
 
 	b.cfg.RetainOnClose = true
 	b.cfg.MaxRetainedLeasesPerTenant = 1
 	rs := attachRetentionStore(t, b)
+	seedProvisionReleaseFromProjectionForBackendTest(t, b, closingLease)
+	retainedItems := []backend.LeaseItem{{
+		SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName,
+	}}
+	retainedProfiles := testResourceProfiles(t, retainedItems)
 
 	// Pre-seed: tenant-a has an existing active record (the "old" one to be evicted).
 	oldEntry := shared.RetentionEntry{
-		OriginalLeaseUUID:   "old-lease",
+		OriginalLeaseUUID:   oldLease,
 		Tenant:              "tenant-a",
+		ProviderUUID:        retentionCloseProviderUUID,
+		Items:               slices.Clone(retainedItems),
+		ResourceProfiles:    shared.CloneSKUResourceSnapshot(retainedProfiles),
+		StackManifest:       restoreStackManifest(),
 		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-old-lease-app-0"},
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(oldLease, "app", 0))},
 		CreatedAt:           time.Now().Add(-time.Hour), // older
 	}
-	require.NoError(t, rs.Put(oldEntry))
+	require.NoError(t, putRetentionForTest(t, rs, oldEntry))
 
 	// Pre-seed: tenant-b has an active record (must NOT be evicted).
 	otherEntry := shared.RetentionEntry{
-		OriginalLeaseUUID:   "other-tenant-lease",
+		OriginalLeaseUUID:   otherLease,
 		Tenant:              "tenant-b",
+		ProviderUUID:        retentionCloseProviderUUID,
+		Items:               slices.Clone(retainedItems),
+		ResourceProfiles:    shared.CloneSKUResourceSnapshot(retainedProfiles),
+		StackManifest:       restoreStackManifest(),
 		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-other-tenant-lease-app-0"},
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(otherLease, "app", 0))},
 		CreatedAt:           time.Now().Add(-2 * time.Hour),
 	}
-	require.NoError(t, rs.Put(otherEntry))
+	require.NoError(t, putRetentionForTest(t, rs, otherEntry))
 
 	var mu sync.Mutex
 	destroyed := make(map[string]bool)
 	onDisk := newVolumeSet(
-		"fred-new-lease-app-0",
-		"fred-retained-old-lease-app-0",
-		"fred-retained-other-tenant-lease-app-0",
+		canonicalVolumeName(closingLease, manifest.DefaultServiceName, 0),
+		retainedName(canonicalVolumeName(oldLease, "app", 0)),
+		retainedName(canonicalVolumeName(otherLease, "app", 0)),
 	)
 
 	b.volumes = &mockVolumeManager{
@@ -219,7 +374,7 @@ func TestDeprovision_PerTenantCapEvictsOwnOldest(t *testing.T) {
 		// tenant-b's volume being present is what makes "must NOT be evicted" meaningful
 		// rather than vacuous.
 		ListFn:         onDisk.list,
-		RenameVolumeFn: func(old, new string) error { return nil },
+		RenameVolumeFn: onDisk.rename,
 		DestroyFn: func(ctx context.Context, id string) error {
 			mu.Lock()
 			destroyed[id] = true
@@ -228,12 +383,12 @@ func TestDeprovision_PerTenantCapEvictsOwnOldest(t *testing.T) {
 		},
 	}
 
-	err := b.Deprovision(context.Background(), "new-lease")
+	err := b.Deprovision(context.Background(), closingLease)
 	require.NoError(t, err)
 
 	// Wait for the new record to appear (signals the eviction + rename path ran).
 	require.Eventually(t, func() bool {
-		e, err := rs.Get("new-lease")
+		e, err := rs.Get(closingLease)
 		return err == nil && e != nil
 	}, 5*time.Second, 20*time.Millisecond, "new-lease retention record must appear")
 
@@ -245,20 +400,24 @@ func TestDeprovision_PerTenantCapEvictsOwnOldest(t *testing.T) {
 	}
 	mu.Unlock()
 
-	assert.True(t, gotDestroyed["fred-retained-old-lease-app-0"],
-		"tenant-a's old retained volume must be destroyed (evicted)")
+	assert.False(t, gotDestroyed[retainedName(canonicalVolumeName(oldLease, "app", 0))],
+		"close of one lease must not receive authority to destroy an older lease's substrate")
 
 	// tenant-b's record must NOT have been evicted.
-	assert.False(t, gotDestroyed["fred-retained-other-tenant-lease-app-0"],
+	assert.False(t, gotDestroyed[retainedName(canonicalVolumeName(otherLease, "app", 0))],
 		"tenant-b's retained volume must NOT be destroyed")
 
-	// old-lease record must be deleted from the store.
-	evicted, err := rs.Get("old-lease")
+	// The old lease is durably handed to the separately fenced periodic reaper.
+	evicted, err := rs.Get(oldLease)
 	require.NoError(t, err)
-	assert.Nil(t, evicted, "old-lease retention record must be deleted after eviction")
+	require.NotNil(t, evicted)
+	assert.Equal(t, shared.RetentionStatusReaping, evicted.Status)
+	remainingVolumes, err := onDisk.list()
+	require.NoError(t, err)
+	assert.Contains(t, remainingVolumes, retainedName(canonicalVolumeName(oldLease, "app", 0)))
 
 	// other-tenant record must still exist.
-	other, err := rs.Get("other-tenant-lease")
+	other, err := rs.Get(otherLease)
 	require.NoError(t, err)
 	assert.NotNil(t, other, "other-tenant-lease retention record must remain")
 }
@@ -275,6 +434,7 @@ func readyProvisionForClose(leaseUUID, tenant string, items []backend.LeaseItem,
 	return &provision{ProvisionState: leasesm.ProvisionState{
 		LeaseUUID:     leaseUUID,
 		Tenant:        tenant,
+		ProviderUUID:  retentionCloseProviderUUID,
 		Status:        backend.ProvisionStatusReady,
 		Quantity:      qty,
 		Items:         items,
@@ -292,35 +452,54 @@ func readyProvisionForClose(leaseUUID, tenant string, items []backend.LeaseItem,
 func newCloseHarness(t *testing.T, tenant string, payload []byte) (*Backend, *shared.RetentionStore, string) {
 	t.Helper()
 	const leaseUUID = "eeeeeeee-0000-0000-0000-00000000c105"
-	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}
 	var stack *manifest.StackManifest
 	if payload != nil {
 		var err error
 		stack, err = manifest.ParsePayload(payload)
 		require.NoError(t, err)
+	} else {
+		stack = restoreStackManifest()
+	}
+	services := make([]string, 0, len(stack.Services))
+	for service := range stack.Services {
+		services = append(services, service)
+	}
+	slices.Sort(services)
+	items := make([]backend.LeaseItem, 0, len(services))
+	volumeNames := make([]string, 0, len(services))
+	for _, service := range services {
+		items = append(items, backend.LeaseItem{
+			SKU: "docker-micro", Quantity: 1, ServiceName: service,
+		})
+		volumeNames = append(volumeNames, canonicalVolumeName(leaseUUID, service, 0))
 	}
 	prov := readyProvisionForClose(leaseUUID, tenant, items, stack)
-	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{leaseUUID: prov})
-	rs := attachRetentionStore(t, b)
-	withMicroSKU(b, 1024) // every lease = 1024 MB retained footprint
-	b.cfg.RetainOnClose = true
-	b.volumes = &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			return []string{canonicalVolumeName(leaseUUID, "app", 0)}, nil
+	b := newBackendForProvisionTest(t, &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return nil, nil
 		},
-	}
+	}, map[string]*provision{leaseUUID: prov})
+	rs := attachRetentionStore(t, b)
+	withMicroSKU(b, 512) // every lease = 512 MB retained footprint
+	b.provisionsMu.Lock()
+	b.provisions[leaseUUID].ResourceProfiles = []shared.SKUResourceSnapshot{{
+		SKU: "docker-micro", CPUCores: 1, MemoryMB: 256, DiskMB: 512,
+	}}
+	b.provisionsMu.Unlock()
+	seedProvisionReleaseFromProjectionForBackendTest(t, b, leaseUUID)
+	b.cfg.RetainOnClose = true
+	b.volumes = newVolumeSet(volumeNames...).manager()
 	return b, rs, leaseUUID
 }
 
-// TestDeprovision_EvictsBeforeDiskRefusal_WindowRolls: tenant at its count cap
-// with the global disk cap sized so the incoming close only fits AFTER the count
-// eviction runs. Pre-fix: refusal fires first (switch case-guard) and the
-// incoming's volumes are destroyed while the window never rolls. Post-fix: the
-// oldest record is evicted, the incoming is retained.
-func TestDeprovision_EvictsBeforeDiskRefusal_WindowRolls(t *testing.T) {
+// TestDeprovision_CapHandoffRollsActiveWindowWithoutCrossLeaseMutation verifies
+// that count eviction transfers the old record to the periodic reaper without
+// touching its substrate, while the ACTIVE-only retention-policy window admits
+// the incoming close. Global resource accounting still counts both footprints.
+func TestDeprovision_CapHandoffRollsActiveWindowWithoutCrossLeaseMutation(t *testing.T) {
 	b, rs, leaseUUID := newCloseHarness(t, "tenant-a", nil)
 	b.cfg.MaxRetainedLeasesPerTenant = 1
-	b.cfg.MaxRetainedDiskMB = 1536 // holds ONE 1024MB lease + slack, never two
+	b.cfg.MaxRetainedDiskMB = 768 // holds one 512MB close snapshot + slack, never two
 
 	// One pre-existing retained record fills the window and most of the disk cap.
 	putActiveAt(t, rs, "cccccccc-0000-0000-0000-000000000001", "tenant-a", time.Now().Add(-time.Hour))
@@ -330,11 +509,15 @@ func TestDeprovision_EvictsBeforeDiskRefusal_WindowRolls(t *testing.T) {
 	require.Eventually(t, func() bool {
 		rec, err := rs.Get(leaseUUID)
 		return err == nil && rec != nil && rec.Status == shared.RetentionStatusActive
-	}, 5*time.Second, 50*time.Millisecond, "incoming close must be RETAINED (eviction made room)")
+	}, 5*time.Second, 50*time.Millisecond, "incoming close must enter the rolled active-retention window")
 
 	old, err := rs.Get("cccccccc-0000-0000-0000-000000000001")
 	require.NoError(t, err)
-	require.Nil(t, old, "oldest must have been evicted (and, volume-less, deleted) to roll the window")
+	require.NotNil(t, old)
+	require.Equal(t, shared.RetentionStatusReaping, old.Status,
+		"oldest must be handed to the periodic reaper without cross-lease physical work")
+	require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB,
+		"resource admission must count both the reaping and active physical footprints")
 }
 
 // TestDeprovision_BothCapsBreached_EvictsThenRefuses: post-eviction the incoming
@@ -343,7 +526,7 @@ func TestDeprovision_EvictsBeforeDiskRefusal_WindowRolls(t *testing.T) {
 func TestDeprovision_BothCapsBreached_EvictsThenRefuses(t *testing.T) {
 	b, rs, leaseUUID := newCloseHarness(t, "tenant-a", nil)
 	b.cfg.MaxRetainedLeasesPerTenant = 2
-	b.cfg.MaxRetainedDiskMB = 1024 // exactly one footprint: after evicting to 1 record, 1024+1024 > 1024 still breaches
+	b.cfg.MaxRetainedDiskMB = 512 // exactly one footprint: after evicting to 1 record, 512+512 > 512 still breaches
 
 	putActiveAt(t, rs, "dddddddd-0000-0000-0000-000000000001", "tenant-a", time.Now().Add(-2*time.Hour))
 	putActiveAt(t, rs, "dddddddd-0000-0000-0000-000000000002", "tenant-a", time.Now().Add(-time.Hour))
@@ -357,7 +540,9 @@ func TestDeprovision_BothCapsBreached_EvictsThenRefuses(t *testing.T) {
 
 	oldest, err := rs.Get("dddddddd-0000-0000-0000-000000000001")
 	require.NoError(t, err)
-	require.Nil(t, oldest, "count-owed eviction must have run first (volume-less record deleted)")
+	require.NotNil(t, oldest)
+	require.Equal(t, shared.RetentionStatusReaping, oldest.Status,
+		"count-owed eviction must only hand the record to the periodic reaper")
 	// Eviction stops at cap-1: the second-oldest survives, still ACTIVE (never over-evicted).
 	survivor, err := rs.Get("dddddddd-0000-0000-0000-000000000002")
 	require.NoError(t, err)
@@ -372,117 +557,116 @@ func TestDeprovision_BothCapsBreached_EvictsThenRefuses(t *testing.T) {
 // soft-delete path (after a partial rename on attempt 1) MERGES the existing
 // record's RetainedVolumeNames with the still-canonical volumes instead of
 // overwriting them. Without the merge, b.volumes.List on the retry no longer
-// returns the already-renamed fred-retained-u1-app-0, so Put would shrink the
+// returns the already-renamed fred-retained-11111111-1111-4111-8111-111111111111-app-0, so Put would shrink the
 // record to only the still-canonical one (leaking the already-retained volume).
 func TestDeprovision_Retain_MergesPriorRecordOnRetry(t *testing.T) {
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"u1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u1",
-			Tenant:    "tenant-a",
-			Status:    backend.ProvisionStatusReady,
-			Quantity:  2,
-			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}},
+		"11111111-1111-4111-8111-111111111111": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "11111111-1111-4111-8111-111111111111",
+			Tenant:        "tenant-a",
+			ProviderUUID:  retentionCloseProviderUUID,
+			Status:        backend.ProvisionStatusReady,
+			Quantity:      2,
+			Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}},
+			StackManifest: restoreStackManifest(),
 		}},
 	})
 
 	b.cfg.RetainOnClose = true
 	rs := attachRetentionStore(t, b)
+	seedProvisionReleaseFromProjectionForBackendTest(
+		t, b, "11111111-1111-4111-8111-111111111111",
+	)
 
-	// Simulate attempt 1: instance 0 was already renamed into the retained
-	// namespace and recorded; instance 1's rename failed and was retried.
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
-		Tenant:              "tenant-a",
-		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
-		CreatedAt:           time.Now().Add(-time.Minute),
-	}))
-
+	// The first real close generation records app-0 before its rename fails.
 	b.volumes = &mockVolumeManager{
-		// On the RETRY, List no longer returns fred-u1-app-0 (already retained);
-		// only the still-canonical fred-u1-app-1 remains.
 		ListFn: func() ([]string, error) {
-			return []string{"fred-u1-app-1"}, nil
+			return []string{"fred-11111111-1111-4111-8111-111111111111-app-0"}, nil
 		},
-		RenameVolumeFn: func(old, new string) error { return nil },
-		DestroyFn: func(_ context.Context, id string) error {
-			t.Fatalf("Destroy must NOT be called in RetainOnClose=true path, got %q", id)
-			return nil
-		},
+		RenameVolumeFn: func(string, string) error { return assert.AnError },
 	}
+	require.Error(t, b.Deprovision(
+		context.Background(), "11111111-1111-4111-8111-111111111111",
+	))
 
-	err := b.Deprovision(context.Background(), "u1")
-	require.NoError(t, err)
+	// Between retries app-0 reached its retained name and app-1 became visible.
+	// The retry must merge the old finalizer with this newly observed footprint.
+	b.volumes = newVolumeSet(
+		"fred-retained-11111111-1111-4111-8111-111111111111-app-0",
+		"fred-11111111-1111-4111-8111-111111111111-app-1",
+	).manager()
+	require.NoError(t, b.Deprovision(
+		context.Background(), "11111111-1111-4111-8111-111111111111",
+	))
 
 	// Wait for the merged record: both names must be present.
 	var entry *shared.RetentionEntry
 	require.Eventually(t, func() bool {
-		e, err := rs.Get("u1")
+		e, err := rs.Get("11111111-1111-4111-8111-111111111111")
 		if err != nil || e == nil {
 			return false
 		}
 		entry = e
 		return len(e.RetainedVolumeNames) == 2
-	}, 5*time.Second, 20*time.Millisecond, "merged retention record for u1 must contain both volumes")
+	}, 5*time.Second, 20*time.Millisecond, "merged retention record for 11111111-1111-4111-8111-111111111111 must contain both volumes")
 
 	assert.ElementsMatch(t,
-		[]string{"fred-retained-u1-app-0", "fred-retained-u1-app-1"},
+		[]string{"fred-retained-11111111-1111-4111-8111-111111111111-app-0", "fred-retained-11111111-1111-4111-8111-111111111111-app-1"},
 		entry.RetainedVolumeNames,
 		"retry must MERGE the prior record's retained names with the still-canonical one, not overwrite")
 }
 
 // TestDeprovision_Retain_PreservesCreatedAtAndGenerationOnRetry verifies that a
-// soft-delete RETRY does NOT slide the 90d grace clock forward (CreatedAt) and
-// does NOT clobber a CAS-bumped Generation (zero-value would). The retry merges
-// the still-canonical volume into the prior ACTIVE record while preserving its
-// CreatedAt and Generation.
+// soft-delete RETRY does NOT slide the grace clock forward (CreatedAt) or
+// rewrite the store-issued Generation. The retry merges the still-canonical
+// volume into the prior ACTIVE record while preserving both fields.
 func TestDeprovision_Retain_PreservesCreatedAtAndGenerationOnRetry(t *testing.T) {
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"u1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u1",
-			Tenant:    "tenant-a",
-			Status:    backend.ProvisionStatusReady,
-			Quantity:  2,
-			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}},
+		"11111111-1111-4111-8111-111111111111": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "11111111-1111-4111-8111-111111111111",
+			Tenant:        "tenant-a",
+			ProviderUUID:  retentionCloseProviderUUID,
+			Status:        backend.ProvisionStatusReady,
+			Quantity:      2,
+			Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}},
+			StackManifest: restoreStackManifest(),
 		}},
 	})
 
 	b.cfg.RetainOnClose = true
 	rs := attachRetentionStore(t, b)
-
-	// Pre-seed an ACTIVE record from a prior attempt with a FIXED past CreatedAt
-	// and a non-zero Generation (simulating a CAS bump that must be preserved).
-	fixedCreatedAt := time.Now().Add(-30 * 24 * time.Hour).Round(time.Millisecond)
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
-		Tenant:              "tenant-a",
-		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
-		Generation:          2,
-		CreatedAt:           fixedCreatedAt,
-	}))
+	seedProvisionReleaseFromProjectionForBackendTest(
+		t, b, "11111111-1111-4111-8111-111111111111",
+	)
 
 	b.volumes = &mockVolumeManager{
-		// On retry, instance 0 is already retained; only fred-u1-app-1 is canonical.
-		ListFn:         func() ([]string, error) { return []string{"fred-u1-app-1"}, nil },
-		RenameVolumeFn: func(old, new string) error { return nil },
-		DestroyFn: func(_ context.Context, id string) error {
-			t.Fatalf("Destroy must NOT be called in RetainOnClose=true path, got %q", id)
-			return nil
-		},
+		ListFn:         func() ([]string, error) { return []string{"fred-11111111-1111-4111-8111-111111111111-app-0"}, nil },
+		RenameVolumeFn: func(string, string) error { return assert.AnError },
 	}
+	require.Error(t, b.Deprovision(
+		context.Background(), "11111111-1111-4111-8111-111111111111",
+	))
+	before, err := rs.Get("11111111-1111-4111-8111-111111111111")
+	require.NoError(t, err)
+	require.NotNil(t, before)
 
-	require.NoError(t, b.Deprovision(context.Background(), "u1"))
+	b.volumes = newVolumeSet(
+		"fred-retained-11111111-1111-4111-8111-111111111111-app-0",
+		"fred-11111111-1111-4111-8111-111111111111-app-1",
+	).manager()
+	require.NoError(t, b.Deprovision(
+		context.Background(), "11111111-1111-4111-8111-111111111111",
+	))
 
 	var entry *shared.RetentionEntry
 	require.Eventually(t, func() bool {
-		e, err := rs.Get("u1")
+		e, err := rs.Get("11111111-1111-4111-8111-111111111111")
 		if err != nil || e == nil {
 			return false
 		}
@@ -491,53 +675,79 @@ func TestDeprovision_Retain_PreservesCreatedAtAndGenerationOnRetry(t *testing.T)
 	}, 5*time.Second, 20*time.Millisecond, "merged record with both volumes must appear")
 
 	// Grace clock unchanged (NOT reset to time.Now()) and Generation preserved.
-	assert.True(t, entry.CreatedAt.Equal(fixedCreatedAt),
-		"CreatedAt must be preserved across retry (grace clock not slid forward); got %v want %v", entry.CreatedAt, fixedCreatedAt)
-	assert.Equal(t, 2, entry.Generation, "Generation must be preserved (not clobbered to zero) across retry")
+	assert.True(t, entry.CreatedAt.Equal(before.CreatedAt),
+		"CreatedAt must be preserved across retry (grace clock not slid forward); got %v want %v", entry.CreatedAt, before.CreatedAt)
+	assert.Equal(t, before.Generation, entry.Generation,
+		"Generation must remain the exact store-issued generation across retry")
 	assert.ElementsMatch(t,
-		[]string{"fred-retained-u1-app-0", "fred-retained-u1-app-1"},
+		[]string{"fred-retained-11111111-1111-4111-8111-111111111111-app-0", "fred-retained-11111111-1111-4111-8111-111111111111-app-1"},
 		entry.RetainedVolumeNames, "both retained names must be merged")
 }
 
-// TestDeprovision_Retain_DoesNotClobberRestoringRecord verifies that a soft-delete
-// retry whose record was concurrently CLAIMED for restore (Status=restoring) does
-// NOT blindly Put (which would revert it to active, reset Generation, drop
-// NewLeaseUUID, and break the restore rollback CAS) and does NOT rename the
-// canonical volume. The retry surfaces an error so the lease stays Failed and
-// re-attempts after the restore resolves.
+// TestDeprovision_Retain_DoesNotClobberRestoringRecord verifies that a close
+// retry cannot overwrite a retention finalizer claimed after the prior physical
+// close attempt failed. The setup drives both owners through their public typed
+// transitions instead of manufacturing the overlapping state.
 func TestDeprovision_Retain_DoesNotClobberRestoringRecord(t *testing.T) {
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"u1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u1",
-			Tenant:    "tenant-a",
-			Status:    backend.ProvisionStatusReady,
-			Quantity:  1,
-			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		"11111111-1111-4111-8111-111111111111": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "11111111-1111-4111-8111-111111111111",
+			Tenant:        "tenant-a",
+			ProviderUUID:  retentionCloseProviderUUID,
+			Status:        backend.ProvisionStatusReady,
+			Quantity:      1,
+			Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+			StackManifest: restoreStackManifest(),
 		}},
 	})
 
 	b.cfg.RetainOnClose = true
 	rs := attachRetentionStore(t, b)
+	seedProvisionReleaseFromProjectionForBackendTest(
+		t, b, "11111111-1111-4111-8111-111111111111",
+	)
 
-	// A concurrent restore claimed this lease's record: restoring, gen=5, new lease.
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
-		Tenant:              "tenant-a",
-		Status:              shared.RetentionStatusRestoring,
-		NewLeaseUUID:        "new-lease",
-		Generation:          5,
-		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
-		CreatedAt:           time.Now().Add(-time.Hour),
-	}))
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			return []string{"fred-11111111-1111-4111-8111-111111111111-app-0"}, nil
+		},
+		RenameVolumeFn: func(string, string) error { return assert.AnError },
+	}
+
+	// The failed physical rename leaves an exact pending close and its active
+	// retention finalizer. Both are reached through the production close path.
+	require.Error(t, b.Deprovision(
+		context.Background(), "11111111-1111-4111-8111-111111111111",
+	))
+	before, err := rs.Get("11111111-1111-4111-8111-111111111111")
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.Equal(t, shared.RetentionStatusActive, before.Status)
+
+	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
+	claimed, err := claimRetentionForTest(
+		t, rs,
+		"11111111-1111-4111-8111-111111111111",
+		"55555555-5555-4555-8555-555555555555",
+		0,
+		before.Items,
+		before.ResourceProfiles,
+		operationID,
+		callbackURL,
+		lifecycleCallbackURL,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
 
 	var mu sync.Mutex
 	var renames []string
 	b.volumes = &mockVolumeManager{
-		// The canonical volume is still on disk (the prior soft-delete didn't finish).
-		ListFn: func() ([]string, error) { return []string{"fred-u1-app-1"}, nil },
+		ListFn: func() ([]string, error) {
+			return []string{"fred-11111111-1111-4111-8111-111111111111-app-1"}, nil
+		},
 		RenameVolumeFn: func(old, _ string) error {
 			mu.Lock()
 			renames = append(renames, old)
@@ -549,33 +759,30 @@ func TestDeprovision_Retain_DoesNotClobberRestoringRecord(t *testing.T) {
 			return nil
 		},
 	}
+	require.Error(t, b.Deprovision(
+		context.Background(), "11111111-1111-4111-8111-111111111111",
+	), "close retry must defer while restore owns the finalizer")
 
-	// Deprovision must surface an error (volume cleanup failed → lease stays Failed).
-	err := b.Deprovision(context.Background(), "u1")
-	require.Error(t, err, "deprovision must fail while the record is being restored")
-
-	// The restoring record must be untouched.
-	got, err := rs.Get("u1")
+	got, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, got)
-	assert.Equal(t, shared.RetentionStatusRestoring, got.Status, "record must still be restoring (not reverted to active)")
-	assert.Equal(t, 5, got.Generation, "Generation must be untouched")
-	assert.Equal(t, "new-lease", got.NewLeaseUUID, "NewLeaseUUID must be untouched")
+	assert.Equal(t, shared.RetentionStatusRestoring, got.Status)
+	assert.Equal(t, claimed.Generation, got.Generation)
+	assert.Equal(t, "55555555-5555-4555-8555-555555555555", got.NewLeaseUUID)
 
-	// The canonical volume must NOT have been renamed (re-quarantine skipped).
 	mu.Lock()
 	gotRenames := append([]string(nil), renames...)
 	mu.Unlock()
-	assert.NotContains(t, gotRenames, "fred-u1-app-1",
-		"the canonical volume must NOT be renamed while a restore owns the record")
+	assert.NotContains(t, gotRenames, "fred-11111111-1111-4111-8111-111111111111-app-1",
+		"close retry must not rename a volume while restore owns the finalizer")
 
-	// The lease must be left Failed (not deprovisioned away).
-	require.Eventually(t, func() bool {
-		b.provisionsMu.RLock()
-		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u1"]
-		return ok && p.Status == backend.ProvisionStatusFailed
-	}, 5*time.Second, 20*time.Millisecond, "u1 must be left Failed for the volume-cleanup retry")
+	// The actor records the cleanup failure so a later close retry can converge
+	// after the restore releases its finalizer.
+	b.provisionsMu.RLock()
+	p, ok := b.provisions["11111111-1111-4111-8111-111111111111"]
+	b.provisionsMu.RUnlock()
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, p.Status)
 }
 
 // TestEvictRetentionsToCap_ExcludesClosingLease verifies that the cap eviction
@@ -583,16 +790,17 @@ func TestDeprovision_Retain_DoesNotClobberRestoringRecord(t *testing.T) {
 // a prior soft-delete attempt). With cap=1 and the closing lease's own record as
 // the only active record, evict with excludeLease set must be a no-op.
 func TestEvictRetentionsToCap_ExcludesClosingLease(t *testing.T) {
+	closingLease := canonicalRetentionFixtureUUID("closing")
 	mock := &mockDockerClient{}
 	b := newBackendForTest(mock, nil)
 	rs := attachRetentionStore(t, b)
 
 	// The closing lease's OWN active record from a prior attempt.
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "closing",
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
+		OriginalLeaseUUID:   closingLease,
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-closing-app-0"},
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(closingLease, "app", 0))},
 		CreatedAt:           time.Now().Add(-time.Hour),
 	}))
 
@@ -604,19 +812,19 @@ func TestEvictRetentionsToCap_ExcludesClosingLease(t *testing.T) {
 	}
 
 	// cap=1: without the exclusion this lone record would be (wrongly) evicted.
-	err := b.evictRetentionsToCap(context.Background(), "tenant-a", retentionBudget{CountCap: 1}, "", retentionTenantSnapshot(t, rs, "tenant-a"), "closing")
+	err := b.evictRetentionsToCap(context.Background(), "tenant-a", retentionBudget{CountCap: 1}, "", retentionTenantSnapshot(t, rs, "tenant-a"), closingLease)
 	require.NoError(t, err)
 
 	// The closing lease's record must still be present.
-	got, err := rs.Get("closing")
+	got, err := rs.Get(closingLease)
 	require.NoError(t, err)
 	require.NotNil(t, got, "closing lease's own retention record must NOT be evicted")
 }
 
-// TestEvict_DestroyFail_LeavesReapingCounted verifies cap-eviction marks the
-// evicted record reaping (removing it from the active cap set), and a destroy
-// failure leaves it reaping + counted in the pool, never under-counting. ENG-376.
-func TestEvict_DestroyFail_LeavesReapingCounted(t *testing.T) {
+// TestEvict_HandsOffToReaperWithoutPhysicalMutation verifies cap eviction only
+// performs the durable Active→Reaping transition. Physical destruction belongs
+// exclusively to the periodic reaper and the footprint remains counted.
+func TestEvict_HandsOffToReaperWithoutPhysicalMutation(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 	withMicroSKU(b, 1024)
@@ -624,29 +832,34 @@ func TestEvict_DestroyFail_LeavesReapingCounted(t *testing.T) {
 	rs := attachRetentionStore(t, b)
 
 	// Two active records for the same tenant → evicting to cap (1) removes the oldest.
-	old := retentionEntryFixture("lease-old", "t1", time.Now().Add(-2*time.Hour))
-	old.RetainedVolumeNames = []string{"fred-retained-lease-old-app-0"}
-	require.NoError(t, rs.Put(old))
-	newer := retentionEntryFixture("lease-new", "t1", time.Now())
-	newer.RetainedVolumeNames = []string{"fred-retained-lease-new-app-0"} // UUID-derived; avoid the fixture's fixed default colliding with lease-old
-	require.NoError(t, rs.Put(newer))
+	oldLease := canonicalRetentionFixtureUUID("lease-old")
+	newLease := canonicalRetentionFixtureUUID("lease-new")
+	old := retentionEntryFixture(oldLease, "t1", time.Now().Add(-2*time.Hour))
+	old.RetainedVolumeNames = []string{retainedName(canonicalVolumeName(oldLease, "web", 0))}
+	require.NoError(t, putRetentionForTest(t, rs, old))
+	newer := retentionEntryFixture(newLease, "t1", time.Now())
+	newer.RetainedVolumeNames = []string{retainedName(canonicalVolumeName(newLease, "web", 0))}
+	require.NoError(t, putRetentionForTest(t, rs, newer))
 
 	b.volumes = &mockVolumeManager{
 		ListFn: func() ([]string, error) {
-			return []string{"fred-retained-lease-old-app-0", "fred-retained-lease-new-app-0"}, nil
+			return []string{old.RetainedVolumeNames[0], newer.RetainedVolumeNames[0]}, nil
 		},
-		DestroyFn: func(_ context.Context, _ string) error { return errors.New("EBUSY") },
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Fatalf("cap eviction must not destroy another lease's volume %q", id)
+			return nil
+		},
 	}
 
-	err := b.evictRetentionsToCap(context.Background(), "t1", retentionBudget{CountCap: 1}, "", retentionTenantSnapshot(t, rs, "t1"), "lease-new")
+	err := b.evictRetentionsToCap(context.Background(), "t1", retentionBudget{CountCap: 1}, "", retentionTenantSnapshot(t, rs, "t1"), newLease)
 	require.NoError(t, err)
 
-	got, err := rs.Get("lease-old")
+	got, err := rs.Get(oldLease)
 	require.NoError(t, err)
-	require.NotNil(t, got, "evicted record kept as reaping tombstone on destroy fail")
+	require.NotNil(t, got, "evicted record remains as the reaper's durable work owner")
 	assert.Equal(t, shared.RetentionStatusReaping, got.Status)
 	// Pool still counts both footprints (active lease-new + reaping lease-old).
-	assert.Equal(t, int64(2*2048), b.pool.Stats().RetainedDiskMB)
+	assert.Equal(t, int64(4*1024), b.pool.Stats().RetainedDiskMB)
 }
 
 // TestEvict_IncrementsEvictedCounterPerRecord verifies cap eviction bumps
@@ -667,14 +880,17 @@ func TestEvict_IncrementsEvictedCounterPerRecord(t *testing.T) {
 	// destroys don't collide.
 	a := retentionEntryFixture("lease-a", "t1", time.Now().Add(-2*time.Hour))
 	a.RetainedVolumeNames = []string{"fred-retained-lease-a-app-0"}
-	require.NoError(t, rs.Put(a))
+	require.NoError(t, putRetentionForTest(t, rs, a))
 	c := retentionEntryFixture("lease-c", "t1", time.Now().Add(-time.Hour))
 	c.RetainedVolumeNames = []string{"fred-retained-lease-c-app-0"}
-	require.NoError(t, rs.Put(c))
+	require.NoError(t, putRetentionForTest(t, rs, c))
 
-	// Destroys succeed → each evicted record is fully reaped, but the counter
-	// fires on the active→reaping eviction regardless of destroy outcome.
-	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error { return nil }}
+	// No physical destroy belongs to cap eviction. The counter fires on the
+	// Active→Reaping handoff.
+	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, id string) error {
+		t.Fatalf("cap eviction must not destroy %q", id)
+		return nil
+	}}
 
 	before := testutil.ToFloat64(retentionEvictedTotal)
 	require.NoError(t, b.evictRetentionsToCap(context.Background(), "t1", retentionBudget{CountCap: 1}, "", retentionTenantSnapshot(t, rs, "t1"), "lease-new"))
@@ -684,45 +900,15 @@ func TestEvict_IncrementsEvictedCounterPerRecord(t *testing.T) {
 
 // TestCleanupOrphanedVolumes_FailsSafeOnRetentionReadError verifies the
 // fail-safe: when the retention store cannot be read (so the protected-canonical
-// set cannot be built), orphan destruction is skipped entirely — nothing is
-// destroyed — rather than failing open and risking a retained canonical.
-func TestCleanupOrphanedVolumes_FailsSafeOnRetentionReadError(t *testing.T) {
-	mock := &mockDockerClient{}
-	b := newBackendForTest(mock, nil)
-	attachRetentionStore(t, b)
-	// Close the store so List() returns an error (bolt.ErrDatabaseNotOpen).
-	// attachRetentionStore's Cleanup also closes it; Close is idempotent.
-	require.Error(t, func() error {
-		_ = b.retentionStore.Close()
-		_, err := b.retentionStore.List()
-		return err
-	}(), "closed store List must error (precondition for the fail-safe)")
-
-	b.volumes = &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			// A volume that would otherwise be an orphan (no live provision).
-			return []string{"fred-stale-app-0"}, nil
-		},
-		DestroyFn: func(_ context.Context, id string) error {
-			t.Fatalf("Destroy must NOT be called when the retention store is unreadable; got %q", id)
-			return nil
-		},
-	}
-
-	// Must NOT error (so Start doesn't crash) and must NOT destroy anything.
-	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
-}
-
-// TestDeprovision_RetainOff_DestroysAsBefore verifies that when
-// RetainOnClose=false the existing volume-destroy behaviour is unchanged:
-// Destroy is called for the lease's volumes and RenameVolume is never called.
+// set cannot be built), orphan destruction is skipped entirely and the error is
+// surfaced so startup cannot report readiness with unresolved ownership.
 func TestDeprovision_RetainOff_DestroysAsBefore(t *testing.T) {
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"u1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u1",
+		"11111111-1111-4111-8111-111111111111": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "11111111-1111-4111-8111-111111111111",
 			Tenant:    "tenant-a",
 			Status:    backend.ProvisionStatusReady,
 			Quantity:  1,
@@ -732,6 +918,9 @@ func TestDeprovision_RetainOff_DestroysAsBefore(t *testing.T) {
 
 	// RetainOnClose defaults false; be explicit.
 	b.cfg.RetainOnClose = false
+	seedProvisionReleaseFromProjectionForBackendTest(
+		t, b, "11111111-1111-4111-8111-111111111111",
+	)
 
 	var mu sync.Mutex
 	var destroyedIDs []string
@@ -749,7 +938,7 @@ func TestDeprovision_RetainOff_DestroysAsBefore(t *testing.T) {
 		},
 	}
 
-	err := b.Deprovision(context.Background(), "u1")
+	err := b.Deprovision(context.Background(), "11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 
 	// Allow async path time to complete.
@@ -763,8 +952,8 @@ func TestDeprovision_RetainOff_DestroysAsBefore(t *testing.T) {
 	got := append([]string(nil), destroyedIDs...)
 	mu.Unlock()
 
-	// Expect the canonical volume name for u1's single instance.
-	assert.Contains(t, got, canonicalVolumeName("u1", manifest.DefaultServiceName, 0))
+	// Expect the canonical volume name for 11111111-1111-4111-8111-111111111111's single instance.
+	assert.Contains(t, got, canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -774,52 +963,6 @@ func TestDeprovision_RetainOff_DestroysAsBefore(t *testing.T) {
 // TestCleanupOrphanedVolumes_SkipsRetained verifies that fred-retained- volumes
 // are never destroyed by the orphan reaper, regardless of whether they appear
 // in the expected set.
-func TestCleanupOrphanedVolumes_SkipsRetained(t *testing.T) {
-	mock := &mockDockerClient{}
-	b := newBackendForTest(mock, map[string]*provision{
-		"live": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "live",
-			Tenant:    "tenant-a",
-			Status:    backend.ProvisionStatusReady,
-			Quantity:  1,
-			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		}},
-	})
-
-	var mu sync.Mutex
-	var destroyedIDs []string
-
-	b.volumes = &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			return []string{
-				"fred-live-app-0",
-				"fred-retained-u1-app-0",
-				"fred-stale-app-0",
-			}, nil
-		},
-		DestroyFn: func(_ context.Context, id string) error {
-			mu.Lock()
-			destroyedIDs = append(destroyedIDs, id)
-			mu.Unlock()
-			return nil
-		},
-	}
-
-	err := b.cleanupOrphanedVolumes(context.Background())
-	require.NoError(t, err)
-
-	mu.Lock()
-	got := append([]string(nil), destroyedIDs...)
-	mu.Unlock()
-
-	assert.NotContains(t, got, "fred-retained-u1-app-0", "retained volume must never be destroyed by orphan reaper")
-	assert.NotContains(t, got, "fred-live-app-0", "expected live volume must not be destroyed")
-	assert.Contains(t, got, "fred-stale-app-0", "orphaned stale volume must be destroyed")
-}
-
-// TestReconcileRetentions_RequarantinesActive verifies that an active retention
-// record whose canonical volume is still present on disk (crashed mid-soft-delete)
-// gets the canonical volume renamed back to the retained namespace.
 func TestReconcileRetentions_RequarantinesActive(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForTest(mock, nil)
@@ -836,13 +979,15 @@ func TestReconcileRetentions_RequarantinesActive(t *testing.T) {
 			mu.Unlock()
 			return nil
 		},
+		UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
 	}
+	bindRetentionOrphanPrunerForTest(t, b)
 
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
+		OriginalLeaseUUID:   "11111111-1111-4111-8111-111111111111",
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+		RetainedVolumeNames: []string{"fred-retained-11111111-1111-4111-8111-111111111111-app-0"},
 		Generation:          1,
 	}))
 
@@ -853,13 +998,13 @@ func TestReconcileRetentions_RequarantinesActive(t *testing.T) {
 	got := append([]renameCall(nil), renames...)
 	mu.Unlock()
 
-	assert.Contains(t, got, renameCall{"fred-u1-app-0", "fred-retained-u1-app-0"},
+	assert.Contains(t, got, renameCall{"fred-11111111-1111-4111-8111-111111111111-app-0", "fred-retained-11111111-1111-4111-8111-111111111111-app-0"},
 		"canonical volume must be renamed back to retained namespace")
 }
 
 // TestReconcileRestoring_RollsBackOrphan verifies that a restoring record with
-// no live provision (crashed restore) is fully rolled back: compose Down is called
-// for the new lease's project, volumes are re-quarantined to the retained namespace,
+// no live provision (crashed restore) is fully rolled back: exact destination
+// absence is proved, volumes are re-quarantined to the retained namespace,
 // the record reverts to active (Generation bumped, NewLeaseUUID cleared), and the
 // orphaned provision is removed from b.provisions.
 func TestReconcileRestoring_RollsBackOrphan(t *testing.T) {
@@ -868,18 +1013,9 @@ func TestReconcileRestoring_RollsBackOrphan(t *testing.T) {
 	rs := attachRetentionStore(t, b)
 
 	var mu sync.Mutex
-	var downProjects []string
 	type renameCall struct{ old, new string }
 	var renames []renameCall
 
-	b.compose = &mockComposeExecutor{
-		DownFn: func(_ context.Context, projectName string, _ time.Duration) error {
-			mu.Lock()
-			downProjects = append(downProjects, projectName)
-			mu.Unlock()
-			return nil
-		},
-	}
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(old, new string) error {
 			mu.Lock()
@@ -887,68 +1023,66 @@ func TestReconcileRestoring_RollsBackOrphan(t *testing.T) {
 			mu.Unlock()
 			return nil
 		},
+		UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
 	}
 
 	e := shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
-		NewLeaseUUID:        "u2",
+		OriginalLeaseUUID:   "11111111-1111-4111-8111-111111111111",
+		NewLeaseUUID:        "22222222-2222-4222-8222-222222222222",
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusRestoring,
 		Generation:          3,
 		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+		RetainedVolumeNames: []string{"fred-retained-11111111-1111-4111-8111-111111111111-app-0"},
 	}
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.NoError(t, b.reconcileRestoring(context.Background(), e))
 
 	mu.Lock()
-	gotDown := append([]string(nil), downProjects...)
 	gotRenames := append([]renameCall(nil), renames...)
 	mu.Unlock()
 
-	// Compose Down must be called for the new lease's project.
-	assert.Contains(t, gotDown, composeProjectName("u2"),
-		"compose Down must be called for the new lease's project")
-
 	// Volume must be re-quarantined from new canonical → original retained name.
 	assert.Contains(t, gotRenames, renameCall{
-		old: canonicalVolumeName("u2", manifest.DefaultServiceName, 0),
-		new: retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0)),
+		old: canonicalVolumeName("22222222-2222-4222-8222-222222222222", manifest.DefaultServiceName, 0),
+		new: retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0)),
 	}, "volume must be renamed from new canonical to original retained name")
 
 	// The record must have reverted to active with Generation bumped and NewLeaseUUID cleared.
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
-	require.NotNil(t, entry, "retention record for u1 must still exist after rollback")
+	require.NotNil(t, entry, "retention record for 11111111-1111-4111-8111-111111111111 must still exist after rollback")
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
-	assert.Equal(t, 4, entry.Generation, "generation must be bumped by RevertToActive")
+	assert.Equal(t, e.Generation+1, entry.Generation, "generation must be bumped by RevertToActiveWithResourceProfiles")
 	assert.Empty(t, entry.NewLeaseUUID, "NewLeaseUUID must be cleared after rollback")
 
-	// The orphaned provision for u2 must be removed.
+	// The orphaned provision for 22222222-2222-4222-8222-222222222222 must be removed.
 	b.provisionsMu.RLock()
-	_, hasU2 := b.provisions["u2"]
+	_, hasU2 := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
-	assert.False(t, hasU2, "orphaned provision for u2 must be removed")
+	assert.False(t, hasU2, "orphaned provision for 22222222-2222-4222-8222-222222222222 must be removed")
 }
 
 // TestReconcileRestoring_RenameFailureLeavesRestoring is the data-safety arm: an
 // orphaned restoring record whose re-quarantine rename FAILS must NOT advance.
 // Because a real rename failure means the volume may still carry the new canonical
-// name, advancing the record (RevertToActive) or dropping the provision would let
-// cleanupOrphanedVolumes destroy still-live data. The reconcile must leave the
-// record restoring (Generation unchanged = RevertToActive's CAS bump did NOT fire)
+// name, advancing the record (RevertToActiveWithResourceProfiles) or dropping the provision would discard
+// the exact authority that identifies still-live data. The reconcile must leave the
+// record restoring (Generation unchanged = RevertToActiveWithResourceProfiles' CAS bump did NOT fire)
 // and keep the provision (removeProvision skipped) so the next startup retries.
 func TestReconcileRestoring_RenameFailureLeavesRestoring(t *testing.T) {
 	mock := &mockDockerClient{}
-	// Seed an ORPHANED provision for u2 in a genuinely-orphaned live state (Failed
+	// Seed an ORPHANED provision for 22222222-2222-4222-8222-222222222222 in a genuinely-orphaned live state (Failed
 	// — the status a crashed restore's recovered-from-containers provision lands at)
 	// so the orphaned arm is taken AND the "provision must NOT be removed" assertion
 	// is meaningful. (Provisioning/Restarting now defer as in-flight, so they would
 	// NOT reach the orphaned arm.)
 	b := newBackendForTest(mock, map[string]*provision{
-		"u2": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u2",
+		"22222222-2222-4222-8222-222222222222": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "22222222-2222-4222-8222-222222222222",
 			Status:    backend.ProvisionStatusFailed,
 		}},
 	})
@@ -963,45 +1097,45 @@ func TestReconcileRestoring_RenameFailureLeavesRestoring(t *testing.T) {
 	}
 
 	e := shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
-		NewLeaseUUID:        "u2",
+		OriginalLeaseUUID:   "11111111-1111-4111-8111-111111111111",
+		NewLeaseUUID:        "22222222-2222-4222-8222-222222222222",
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusRestoring,
 		Generation:          3,
 		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+		RetainedVolumeNames: []string{"fred-retained-11111111-1111-4111-8111-111111111111-app-0"},
 	}
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
 
 	b.reconcileRestoring(context.Background(), e)
 
 	// The record must STILL be restoring with Generation UNCHANGED: a successful
-	// RevertToActive would have flipped it to active and bumped Generation to 4.
-	entry, err := rs.Get("u1")
+	// RevertToActiveWithResourceProfiles would have flipped it to active and bumped Generation to 4.
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry, "record must still exist")
 	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status,
 		"a failed re-quarantine must leave the record restoring")
-	assert.Equal(t, 3, entry.Generation,
-		"generation must be unchanged (RevertToActive's CAS bump must NOT have fired)")
-	assert.Equal(t, "u2", entry.NewLeaseUUID, "NewLeaseUUID must be retained for the retry")
+	assert.Equal(t, e.Generation, entry.Generation,
+		"generation must be unchanged (RevertToActiveWithResourceProfiles' CAS bump must NOT have fired)")
+	assert.Equal(t, "22222222-2222-4222-8222-222222222222", entry.NewLeaseUUID, "NewLeaseUUID must be retained for the retry")
 
 	// The provision must STILL be present (removeProvision was skipped) so its
 	// expected-set entry keeps protecting the data until the next attempt.
 	b.provisionsMu.RLock()
-	_, hasU2 := b.provisions["u2"]
+	_, hasU2 := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
-	assert.True(t, hasU2, "provision for u2 must NOT be removed when re-quarantine failed")
+	assert.True(t, hasU2, "provision for 22222222-2222-4222-8222-222222222222 must NOT be removed when re-quarantine failed")
 }
 
-// TestReconcileRestoring_DefersToInFlight verifies that when b.provisions["u2"]
+// TestReconcileRestoring_DefersToInFlight verifies that when b.provisions["22222222-2222-4222-8222-222222222222"]
 // has status Restarting (restore is in flight), reconcileRestoring is a no-op:
 // no compose Down, no rename, store record remains restoring.
 func TestReconcileRestoring_DefersToInFlight(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForTest(mock, map[string]*provision{
-		"u2": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u2",
+		"22222222-2222-4222-8222-222222222222": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "22222222-2222-4222-8222-222222222222",
 			Status:    backend.ProvisionStatusRestarting,
 		}},
 	})
@@ -1023,22 +1157,21 @@ func TestReconcileRestoring_DefersToInFlight(t *testing.T) {
 	}
 
 	e := shared.RetentionEntry{
-		OriginalLeaseUUID: "u1",
-		NewLeaseUUID:      "u2",
+		OriginalLeaseUUID: "11111111-1111-4111-8111-111111111111",
+		NewLeaseUUID:      "22222222-2222-4222-8222-222222222222",
 		Tenant:            "tenant-a",
 		Status:            shared.RetentionStatusRestoring,
 		Generation:        3,
 		Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
 	}
-	require.NoError(t, rs.Put(e))
-
+	e = *putRestoringRetention(t, rs, e)
 	b.reconcileRestoring(context.Background(), e)
 
 	assert.False(t, downCalled, "compose Down must NOT be called for an in-flight restore")
 	assert.False(t, renameCalled, "RenameVolume must NOT be called for an in-flight restore")
 
 	// Record must still be in restoring state.
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status,
@@ -1047,15 +1180,15 @@ func TestReconcileRestoring_DefersToInFlight(t *testing.T) {
 
 // TestReconcileRestoring_DefersToInFlightProvisioning verifies the Provisioning
 // window is treated as in-flight (NOT orphaned). During a live Restore() the new-
-// lease provision sits at Provisioning (reserved at step b) from ClaimForRestore
+// lease provision sits at Provisioning (reserved at step b) from ClaimForRestoreWithAuthority
 // (record -> restoring, step d) until the actor fires evRestoreRequested (-> Restarting).
 // A PERIODIC sweep landing in that window must DEFER — re-quarantining the just-
 // adopted volumes and reverting the record would spuriously fail the in-flight restore.
 func TestReconcileRestoring_DefersToInFlightProvisioning(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForTest(mock, map[string]*provision{
-		"u2": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u2",
+		"22222222-2222-4222-8222-222222222222": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "22222222-2222-4222-8222-222222222222",
 			Status:    backend.ProvisionStatusProvisioning,
 		}},
 	})
@@ -1077,348 +1210,87 @@ func TestReconcileRestoring_DefersToInFlightProvisioning(t *testing.T) {
 	}
 
 	e := shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
-		NewLeaseUUID:        "u2",
+		OriginalLeaseUUID:   "11111111-1111-4111-8111-111111111111",
+		NewLeaseUUID:        "22222222-2222-4222-8222-222222222222",
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusRestoring,
 		Generation:          3,
 		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+		RetainedVolumeNames: []string{"fred-retained-11111111-1111-4111-8111-111111111111-app-0"},
 	}
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
 
 	b.reconcileRestoring(context.Background(), e)
 
 	assert.False(t, downCalled, "compose Down must NOT be called for an in-flight (Provisioning) restore")
 	assert.False(t, renameCalled, "RenameVolume must NOT be called for an in-flight (Provisioning) restore")
 
-	// Record must remain restoring with Generation unchanged (orphaned arm / RevertToActive must NOT fire).
-	entry, err := rs.Get("u1")
+	// Record must remain restoring with Generation unchanged (orphaned arm / RevertToActiveWithResourceProfiles must NOT fire).
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status,
 		"record must remain restoring during the Provisioning window")
-	assert.Equal(t, 3, entry.Generation, "Generation must be unchanged (orphaned arm must NOT fire)")
-	assert.Equal(t, "u2", entry.NewLeaseUUID, "NewLeaseUUID must be retained")
+	assert.Equal(t, e.Generation, entry.Generation, "Generation must be unchanged (orphaned arm must NOT fire)")
+	assert.Equal(t, "22222222-2222-4222-8222-222222222222", entry.NewLeaseUUID, "NewLeaseUUID must be retained")
 
 	// The in-flight provision must NOT be removed.
 	b.provisionsMu.RLock()
-	_, hasU2 := b.provisions["u2"]
+	_, hasU2 := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
-	assert.True(t, hasU2, "in-flight provision for u2 must NOT be removed")
+	assert.True(t, hasU2, "in-flight provision for 22222222-2222-4222-8222-222222222222 must NOT be removed")
 }
 
-// TestReconcileRestoring_DeletesOnReady verifies that when b.provisions["u2"]
+// TestReconcileRestoring_DeletesOnReady verifies that when b.provisions["22222222-2222-4222-8222-222222222222"]
 // has status Ready (restore completed successfully), the retention record for
 // the original lease is deleted from the store.
 func TestReconcileRestoring_DeletesOnReady(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForTest(mock, map[string]*provision{
-		"u2": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u2",
-			Status:    backend.ProvisionStatusReady,
+		"22222222-2222-4222-8222-222222222222": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "22222222-2222-4222-8222-222222222222", Tenant: "tenant-a",
+			Status: backend.ProvisionStatusReady,
 		}},
 	})
 	rs := attachRetentionStore(t, b)
-	// The restore succeeded (u2 Ready) and recorded its active release; only the
+	// The restore succeeded (22222222-2222-4222-8222-222222222222 Ready) and recorded its active release; only the
 	// terminal record Delete lingered. reconcileRestoring finalizes it via the durable
 	// release without re-appending a duplicate (ENG-523 finalizer gate).
-	relStore := attachReleaseStore(t, b)
-	require.NoError(t, relStore.Append("u2", shared.Release{
-		Manifest: []byte(`{"services":{}}`), Image: "stack", Status: "active", CreatedAt: time.Now(),
-	}))
+	attachReleaseStore(t, b)
 
 	e := shared.RetentionEntry{
-		OriginalLeaseUUID: "u1",
-		NewLeaseUUID:      "u2",
+		OriginalLeaseUUID: "11111111-1111-4111-8111-111111111111",
+		NewLeaseUUID:      "22222222-2222-4222-8222-222222222222",
 		Tenant:            "tenant-a",
+		ProviderUUID:      "22222222-2222-4222-8222-222222222222",
 		Status:            shared.RetentionStatusRestoring,
 		Generation:        2,
 		Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		StackManifest:     restoreStackManifest(),
 	}
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	b.provisions["22222222-2222-4222-8222-222222222222"].ProviderUUID = e.ProviderUUID
+	b.provisions["22222222-2222-4222-8222-222222222222"].CallbackURL = e.DestinationCallbackURL
+	b.provisions["22222222-2222-4222-8222-222222222222"].LifecycleCallbackURL = e.DestinationLifecycleCallbackURL
+	b.provisions["22222222-2222-4222-8222-222222222222"].Items = slices.Clone(e.DestinationItems)
+	b.provisions["22222222-2222-4222-8222-222222222222"].StackManifest = e.StackManifest
+	b.provisions["22222222-2222-4222-8222-222222222222"].ResourceProfiles = shared.CloneSKUResourceSnapshot(e.DestinationResourceProfiles)
+	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusSuccess)
 
 	b.reconcileRestoring(context.Background(), e)
 
 	// Record must be deleted (restore finished, leftover record cleaned up).
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	assert.Nil(t, entry, "retention record must be deleted when restore is already done (Ready provision)")
 }
 
-// TestStart_ReconcilesBeforeOrphanReap pins the invariant that
-// reconcileRetentions runs BEFORE cleanupOrphanedVolumes. A canonical volume
-// (fred-u1-app-0) that survived a crash mid-soft-delete would be destroyed by
-// the orphan reaper unless reconcileRetentions first renames it to the retained
-// namespace. This test drives the two functions in Start's order and asserts
-// the canonical volume is never destroyed.
-func TestStart_ReconcilesBeforeOrphanReap(t *testing.T) {
-	// Start's ordering guarantee (Part C): reconcileRetentions THEN cleanupOrphanedVolumes.
-	// If the order is reversed, the canonical volume gets destroyed before it can be
-	// re-quarantined. This test calls them in Start's order to pin the invariant.
-
-	mock := &mockDockerClient{}
-	b := newBackendForTest(mock, nil)
-	rs := attachRetentionStore(t, b)
-
-	// active record: crash happened after Put, before canonical→retained rename.
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
-		Tenant:              "tenant-a",
-		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
-		Generation:          1,
-	}))
-
-	// Simulate the canonical volume being present on disk (crash mid-rename).
-	// The ListFn is called by cleanupOrphanedVolumes; after reconcile renames it,
-	// the retained volume is no longer an orphan candidate.
-	var mu sync.Mutex
-	volumes := []string{"fred-u1-app-0"}
-	var destroyedIDs []string
-
-	b.volumes = &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			return append([]string(nil), volumes...), nil
-		},
-		RenameVolumeFn: func(old, new string) error {
-			mu.Lock()
-			// Update the volume list to reflect the rename.
-			for i, v := range volumes {
-				if v == old {
-					volumes[i] = new
-					break
-				}
-			}
-			mu.Unlock()
-			return nil
-		},
-		DestroyFn: func(_ context.Context, id string) error {
-			mu.Lock()
-			destroyedIDs = append(destroyedIDs, id)
-			mu.Unlock()
-			return nil
-		},
-	}
-
-	ctx := context.Background()
-
-	// Drive reconcileRetentions THEN cleanupOrphanedVolumes — the same order Start uses.
-	// (Part C guarantees this order in production; this test pins it for regression.)
-	err := b.reconcileRetentions(ctx)
-	require.NoError(t, err)
-
-	err = b.cleanupOrphanedVolumes(ctx)
-	require.NoError(t, err)
-
-	mu.Lock()
-	got := append([]string(nil), destroyedIDs...)
-	mu.Unlock()
-
-	assert.NotContains(t, got, "fred-u1-app-0",
-		"canonical volume must not be destroyed: reconcile must have renamed it to retained before orphan reap")
-	assert.NotContains(t, got, "fred-retained-u1-app-0",
-		"retained volume must never be destroyed by orphan reaper (Part A exclusion)")
-}
-
-// TestCleanupOrphanedVolumes_ProtectsRetentionCanonical verifies that
-// cleanupOrphanedVolumes does NOT destroy a retention record's canonical volume
-// even when it is still canonical-named on disk (a reconcile rename failed or
-// crashed). Without the retention-aware protection in cleanupOrphanedVolumes,
-// this canonical (not fred-retained-, not in any live provision) would be
-// destroyed = permanent data loss. Covers both the active and restoring arms.
-func TestCleanupOrphanedVolumes_ProtectsRetentionCanonical(t *testing.T) {
-	t.Run("active record canonical", func(t *testing.T) {
-		mock := &mockDockerClient{}
-		b := newBackendForTest(mock, nil)
-		rs := attachRetentionStore(t, b)
-
-		// Active record whose canonical (fred-u1-app-0) is still on disk because
-		// the reconcile rename failed/crashed.
-		require.NoError(t, rs.Put(shared.RetentionEntry{
-			OriginalLeaseUUID:   "u1",
-			Tenant:              "tenant-a",
-			Status:              shared.RetentionStatusActive,
-			RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
-			Generation:          1,
-		}))
-
-		var mu sync.Mutex
-		var destroyedIDs []string
-		b.volumes = &mockVolumeManager{
-			ListFn: func() ([]string, error) {
-				return []string{"fred-u1-app-0"}, nil // canonical still on disk
-			},
-			DestroyFn: func(_ context.Context, id string) error {
-				mu.Lock()
-				destroyedIDs = append(destroyedIDs, id)
-				mu.Unlock()
-				return nil
-			},
-		}
-
-		require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
-
-		mu.Lock()
-		got := append([]string(nil), destroyedIDs...)
-		mu.Unlock()
-		assert.NotContains(t, got, "fred-u1-app-0",
-			"active retention record's canonical must be protected from the orphan reaper")
-	})
-
-	t.Run("restoring record new-lease canonical", func(t *testing.T) {
-		mock := &mockDockerClient{}
-		b := newBackendForTest(mock, nil)
-		rs := attachRetentionStore(t, b)
-
-		// Restoring record: the new lease's canonical (fred-u2-app-0) holds the
-		// adopted/in-flight data and must not be reaped. The restoring arm protects
-		// via the AUTHORITATIVE RetainedVolumeNames (FIX C), so the record carries
-		// fred-retained-u1-app-0, which maps to fred-u2-app-0 under the new lease.
-		require.NoError(t, rs.Put(shared.RetentionEntry{
-			OriginalLeaseUUID:   "u1",
-			NewLeaseUUID:        "u2",
-			Tenant:              "tenant-a",
-			Status:              shared.RetentionStatusRestoring,
-			Generation:          2,
-			RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
-			Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		}))
-
-		var mu sync.Mutex
-		var destroyedIDs []string
-		b.volumes = &mockVolumeManager{
-			ListFn: func() ([]string, error) {
-				return []string{"fred-u2-app-0"}, nil // adopted data still on disk
-			},
-			DestroyFn: func(_ context.Context, id string) error {
-				mu.Lock()
-				destroyedIDs = append(destroyedIDs, id)
-				mu.Unlock()
-				return nil
-			},
-		}
-
-		require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
-
-		mu.Lock()
-		got := append([]string(nil), destroyedIDs...)
-		mu.Unlock()
-		assert.NotContains(t, got, "fred-u2-app-0",
-			"restoring record's new-lease canonical (adopted data) must be protected from the orphan reaper")
-	})
-}
-
-// TestCleanupOrphanedVolumes_ProtectsRestoringFromRetainedNames verifies that the
-// restoring arm protects the adopted canonical via the AUTHORITATIVE
-// RetainedVolumeNames (matching adoptRetainedVolumes), not an Items×Quantity
-// re-derivation. If service_name normalization diverged between the two, the
-// derived name would miss the adopted volume and the reaper would destroy live
-// restore data. Here the retained name carries a service token ("app") that a
-// naive Items×Quantity derivation off NewLeaseUUID would still produce — so we
-// drive the divergence through the on-disk name actually adopted.
-func TestCleanupOrphanedVolumes_ProtectsRestoringFromRetainedNames(t *testing.T) {
-	mock := &mockDockerClient{}
-	b := newBackendForTest(mock, nil)
-	rs := attachRetentionStore(t, b)
-
-	// Restoring record driven off RetainedVolumeNames (authoritative). The adopted
-	// canonical is retainedToNewCanonical("fred-retained-orig-app-0", "orig", "new")
-	// = "fred-new-app-0".
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "orig",
-		NewLeaseUUID:        "new",
-		Tenant:              "tenant-a",
-		Status:              shared.RetentionStatusRestoring,
-		Generation:          2,
-		RetainedVolumeNames: []string{"fred-retained-orig-app-0"},
-		// Intentionally NO Items: the old Items×Quantity arm would protect nothing
-		// here, so this also guards against regressing to that derivation.
-	}))
-
-	var mu sync.Mutex
-	var destroyedIDs []string
-	b.volumes = &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			return []string{"fred-new-app-0"}, nil // the adopted canonical on disk
-		},
-		DestroyFn: func(_ context.Context, id string) error {
-			mu.Lock()
-			destroyedIDs = append(destroyedIDs, id)
-			mu.Unlock()
-			return nil
-		},
-	}
-
-	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
-
-	mu.Lock()
-	got := append([]string(nil), destroyedIDs...)
-	mu.Unlock()
-	assert.NotContains(t, got, "fred-new-app-0",
-		"restoring arm must protect the adopted canonical via RetainedVolumeNames")
-}
-
-// TestCleanupOrphanedVolumes_RestoringProtectsOriginalCanonical verifies HOLE 2:
-// while a record is restoring, an ORIGINAL-lease canonical volume that still
-// exists on disk (e.g. a partial soft-delete left it un-retained before the
-// record was claimed for restore) must be protected. Previously the restoring
-// arm only protected the new-lease adopted canonical, so the original canonical
-// — neither fred-retained- nor in any live provision — would be destroyed = data
-// loss. The restoring arm must protect BOTH placements.
-func TestCleanupOrphanedVolumes_RestoringProtectsOriginalCanonical(t *testing.T) {
-	mock := &mockDockerClient{}
-	b := newBackendForTest(mock, nil)
-	rs := attachRetentionStore(t, b)
-
-	// Restoring record; the ORIGINAL canonical (fred-orig-app-0) is still on disk,
-	// NOT yet adopted to the new lease (a partial soft-delete left it un-retained).
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "orig",
-		NewLeaseUUID:        "new",
-		Tenant:              "tenant-a",
-		Status:              shared.RetentionStatusRestoring,
-		Generation:          2,
-		RetainedVolumeNames: []string{"fred-retained-orig-app-0"},
-	}))
-
-	var mu sync.Mutex
-	var destroyedIDs []string
-	b.volumes = &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			return []string{"fred-orig-app-0"}, nil // original canonical, NOT yet adopted
-		},
-		DestroyFn: func(_ context.Context, id string) error {
-			mu.Lock()
-			destroyedIDs = append(destroyedIDs, id)
-			mu.Unlock()
-			return nil
-		},
-	}
-
-	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
-
-	mu.Lock()
-	got := append([]string(nil), destroyedIDs...)
-	mu.Unlock()
-	assert.NotContains(t, got, "fred-orig-app-0",
-		"restoring arm must also protect the un-adopted ORIGINAL-lease canonical from the orphan reaper")
-}
-
-// TestRollbackRestoreAdoption_RenameFailureLeavesRecordRestoring verifies FIX F:
-// when a re-quarantine rename FAILS, rollbackRestoreAdoption must NOT revert the
-// record to active and must NOT remove the provision — leaving the record
-// restoring for the reconcile sweep (the provision's expected-set entry protects
-// the canonical meanwhile). A success-case sibling subtest confirms the normal
-// path still reverts + drops the provision.
 func TestRollbackRestoreAdoption_RenameFailureLeavesRecordRestoring(t *testing.T) {
 	t.Run("rename failure leaves record restoring", func(t *testing.T) {
 		mock := &mockDockerClient{}
 		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"u2": {ProvisionState: leasesm.ProvisionState{
-				LeaseUUID: "u2",
+			"22222222-2222-4222-8222-222222222222": {ProvisionState: leasesm.ProvisionState{
+				LeaseUUID: "22222222-2222-4222-8222-222222222222",
 				Tenant:    "tenant-a",
 				Status:    backend.ProvisionStatusProvisioning,
 				Quantity:  1,
@@ -1428,14 +1300,15 @@ func TestRollbackRestoreAdoption_RenameFailureLeavesRecordRestoring(t *testing.T
 		rs := attachRetentionStore(t, b)
 
 		rec := shared.RetentionEntry{
-			OriginalLeaseUUID:   "u1",
-			NewLeaseUUID:        "u2",
+			OriginalLeaseUUID:   "11111111-1111-4111-8111-111111111111",
+			NewLeaseUUID:        "22222222-2222-4222-8222-222222222222",
 			Tenant:              "tenant-a",
 			Status:              shared.RetentionStatusRestoring,
 			Generation:          7,
-			RetainedVolumeNames: []string{retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0))},
+			Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+			RetainedVolumeNames: []string{retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0))},
 		}
-		require.NoError(t, rs.Put(rec))
+		rec = *putRestoringRetention(t, rs, rec)
 
 		b.compose = &mockComposeExecutor{
 			DownFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
@@ -1444,27 +1317,98 @@ func TestRollbackRestoreAdoption_RenameFailureLeavesRecordRestoring(t *testing.T
 			RenameVolumeFn: func(_, _ string) error { return assert.AnError }, // re-quarantine fails
 		}
 
-		b.rollbackRestoreAdoption(context.Background(), "u2", nil, &rec, true, slog.Default())
+		b.rollbackRestoreAdoption(context.Background(), "22222222-2222-4222-8222-222222222222", nil, &rec, false, slog.Default())
 
-		// Record must STILL be restoring (RevertToActive NOT applied).
-		got, err := rs.Get("u1")
+		// Record must STILL be restoring (RevertToActiveWithResourceProfiles NOT applied).
+		got, err := rs.Get("11111111-1111-4111-8111-111111111111")
 		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, shared.RetentionStatusRestoring, got.Status, "record must remain restoring after rename failure")
-		assert.Equal(t, 7, got.Generation, "Generation must be unchanged (no RevertToActive bump)")
+		assert.Equal(t, rec.Generation, got.Generation,
+			"Generation must be unchanged (no restoring rollback bump)")
 
 		// Provision must NOT be removed despite dropProvision=true.
 		b.provisionsMu.RLock()
-		_, present := b.provisions["u2"]
+		_, present := b.provisions["22222222-2222-4222-8222-222222222222"]
 		b.provisionsMu.RUnlock()
 		assert.True(t, present, "provision must be kept so its expected-set entry protects the canonical")
+	})
+
+	t.Run("post-mutation identity drift preserves the restoring finalizer", func(t *testing.T) {
+		const daemonID = "daemon-a"
+		mock := &mockDockerClient{DaemonInfoFn: func(context.Context) (DaemonSecurityInfo, error) {
+			return DaemonSecurityInfo{SystemID: daemonID}, nil
+		}}
+		b := newBackendForProvisionTest(t, mock, map[string]*provision{
+			"22222222-2222-4222-8222-222222222222": {ProvisionState: leasesm.ProvisionState{
+				LeaseUUID: "22222222-2222-4222-8222-222222222222",
+				Tenant:    "tenant-a",
+				Status:    backend.ProvisionStatusProvisioning,
+				Quantity:  1,
+				Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+			}},
+		})
+		rs := attachRetentionStore(t, b)
+
+		dir := t.TempDir()
+		b.cfg.CallbackDBPath = filepath.Join(dir, "callbacks.db")
+		b.cfg.VolumeDataPath = ""
+		b.cfg.VolumeMountPath = ""
+		for name, profile := range b.cfg.SKUProfiles {
+			profile.DiskMB = 0
+			b.cfg.SKUProfiles[name] = profile
+		}
+		markerPath := b.cfg.CallbackDBPath + ".storage-identity.json"
+		anchorPath := b.cfg.CallbackDBPath + ".storage-identity-anchor.json"
+		storageID, err := initializeTestMarkerPair(
+			markerPath, anchorPath, b.cfg.Name, daemonID,
+		)
+		require.NoError(t, err)
+		b.storageIdentity = storageID
+
+		rec := shared.RetentionEntry{
+			OriginalLeaseUUID:   "11111111-1111-4111-8111-111111111111",
+			NewLeaseUUID:        "22222222-2222-4222-8222-222222222222",
+			Tenant:              "tenant-a",
+			Status:              shared.RetentionStatusRestoring,
+			Generation:          7,
+			RetainedVolumeNames: []string{retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0))},
+		}
+		rec = *putRestoringRetention(t, rs, rec)
+		b.compose = &mockComposeExecutor{
+			DownFn: func(context.Context, string, time.Duration) error { return nil },
+		}
+		var removeErr error
+		b.volumes = &mockVolumeManager{
+			RenameVolumeFn: func(_, _ string) error {
+				removeErr = os.Remove(markerPath)
+				return nil
+			},
+		}
+
+		ok := b.rollbackRestoreAdoption(context.Background(), "22222222-2222-4222-8222-222222222222", nil, &rec, false, slog.Default())
+		require.NoError(t, removeErr)
+		assert.False(t, ok, "a post-mutation identity contradiction is an ambiguous rollback")
+
+		got, err := rs.Get("11111111-1111-4111-8111-111111111111")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, shared.RetentionStatusRestoring, got.Status,
+			"the durable finalizer must survive an ambiguous re-quarantine")
+		assert.Equal(t, rec.Generation, got.Generation,
+			"ambiguous rollback must not advance retention state")
+
+		b.provisionsMu.RLock()
+		_, present := b.provisions["22222222-2222-4222-8222-222222222222"]
+		b.provisionsMu.RUnlock()
+		assert.True(t, present, "the ownership projection must survive while the finalizer is unresolved")
 	})
 
 	t.Run("rename ok reverts record and drops provision", func(t *testing.T) {
 		mock := &mockDockerClient{}
 		b := newBackendForProvisionTest(t, mock, map[string]*provision{
-			"u2": {ProvisionState: leasesm.ProvisionState{
-				LeaseUUID: "u2",
+			"22222222-2222-4222-8222-222222222222": {ProvisionState: leasesm.ProvisionState{
+				LeaseUUID: "22222222-2222-4222-8222-222222222222",
 				Tenant:    "tenant-a",
 				Status:    backend.ProvisionStatusProvisioning,
 				Quantity:  1,
@@ -1474,54 +1418,57 @@ func TestRollbackRestoreAdoption_RenameFailureLeavesRecordRestoring(t *testing.T
 		rs := attachRetentionStore(t, b)
 
 		rec := shared.RetentionEntry{
-			OriginalLeaseUUID:   "u1",
-			NewLeaseUUID:        "u2",
+			OriginalLeaseUUID:   "11111111-1111-4111-8111-111111111111",
+			NewLeaseUUID:        "22222222-2222-4222-8222-222222222222",
 			Tenant:              "tenant-a",
 			Status:              shared.RetentionStatusRestoring,
 			Generation:          7,
-			RetainedVolumeNames: []string{retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0))},
+			Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+			RetainedVolumeNames: []string{retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0))},
 		}
-		require.NoError(t, rs.Put(rec))
+		rec = *putRestoringRetention(t, rs, rec)
 
 		b.compose = &mockComposeExecutor{
 			DownFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
 		}
 		b.volumes = &mockVolumeManager{
 			RenameVolumeFn: func(_, _ string) error { return nil }, // re-quarantine succeeds
+			UsageFn:        func(context.Context, string) (int64, error) { return 0, nil },
 		}
 
-		b.rollbackRestoreAdoption(context.Background(), "u2", nil, &rec, true, slog.Default())
+		b.rollbackRestoreAdoption(context.Background(), "22222222-2222-4222-8222-222222222222", nil, &rec, true, slog.Default())
 
-		// Record reverts to active, Generation bumped (CAS 7→8).
-		got, err := rs.Get("u1")
+		// Record reverts to active and the typed rollback CAS bumps Generation.
+		got, err := rs.Get("11111111-1111-4111-8111-111111111111")
 		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, shared.RetentionStatusActive, got.Status, "record must revert to active on clean rollback")
-		assert.Equal(t, 8, got.Generation, "RevertToActive bumps Generation 7→8")
+		assert.Equal(t, rec.Generation+1, got.Generation,
+			"the restoring rollback CAS must bump Generation exactly once")
 
 		// Provision removed (dropProvision=true).
 		b.provisionsMu.RLock()
-		_, present := b.provisions["u2"]
+		_, present := b.provisions["22222222-2222-4222-8222-222222222222"]
 		b.provisionsMu.RUnlock()
 		assert.False(t, present, "provision must be dropped on a clean synchronous rollback")
 	})
 }
 
 func TestVolumeNameHelpers(t *testing.T) {
-	if got := canonicalVolumeName("u1", "app", 0); got != "fred-u1-app-0" {
-		t.Errorf("canonicalVolumeName: got %q, want %q", got, "fred-u1-app-0")
+	if got := canonicalVolumeName("11111111-1111-4111-8111-111111111111", "app", 0); got != "fred-11111111-1111-4111-8111-111111111111-app-0" {
+		t.Errorf("canonicalVolumeName: got %q, want %q", got, "fred-11111111-1111-4111-8111-111111111111-app-0")
 	}
-	if got := retainedName("fred-u1-app-0"); got != "fred-retained-u1-app-0" {
-		t.Errorf("retainedName: got %q, want %q", got, "fred-retained-u1-app-0")
+	if got := retainedName("fred-11111111-1111-4111-8111-111111111111-app-0"); got != "fred-retained-11111111-1111-4111-8111-111111111111-app-0" {
+		t.Errorf("retainedName: got %q, want %q", got, "fred-retained-11111111-1111-4111-8111-111111111111-app-0")
 	}
-	if got := isRetainedVolume("fred-retained-u1-app-0"); !got {
+	if got := isRetainedVolume("fred-retained-11111111-1111-4111-8111-111111111111-app-0"); !got {
 		t.Errorf("isRetainedVolume(retained): got false, want true")
 	}
-	if got := isRetainedVolume("fred-u1-app-0"); got {
+	if got := isRetainedVolume("fred-11111111-1111-4111-8111-111111111111-app-0"); got {
 		t.Errorf("isRetainedVolume(canonical): got true, want false")
 	}
-	if got := leaseVolumePrefix("u1"); got != "fred-u1-" {
-		t.Errorf("leaseVolumePrefix: got %q, want %q", got, "fred-u1-")
+	if got := leaseVolumePrefix("11111111-1111-4111-8111-111111111111"); got != "fred-11111111-1111-4111-8111-111111111111-" {
+		t.Errorf("leaseVolumePrefix: got %q, want %q", got, "fred-11111111-1111-4111-8111-111111111111-")
 	}
 }
 
@@ -1538,47 +1485,57 @@ func TestReapExpiredRetentions(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForTest(mock, nil)
 	rs := attachRetentionStore(t, b)
-	b.cfg.RetentionMaxAge = 90 * 24 * time.Hour // 90 days
 
 	// Volume names are built from the lease UUID via the same helpers production uses.
 	// That correspondence is load-bearing now that the finalizer DERIVES a record's
 	// footprint from the lease's namespace on disk rather than replaying stored names
 	// (ENG-676) — a fixture naming a volume that its own lease UUID could not produce
 	// describes a state the backend cannot reach.
-	oldActiveVol := retainedName(canonicalVolumeName("old-active", "app", 0))
-	freshActiveVol := retainedName(canonicalVolumeName("fresh-active", "app", 0))
-	oldRestoringVol := retainedName(canonicalVolumeName("old-restoring", "app", 0))
+	oldActiveLease := canonicalRetentionFixtureUUID("old-active")
+	freshActiveLease := canonicalRetentionFixtureUUID("fresh-active")
+	oldRestoringLease := canonicalRetentionFixtureUUID("old-restoring")
+	oldActiveVol := retainedName(canonicalVolumeName(oldActiveLease, "app", 0))
+	freshActiveVol := retainedName(canonicalVolumeName(freshActiveLease, "app", 0))
+	oldRestoringVol := retainedName(canonicalVolumeName(oldRestoringLease, "app", 0))
 
 	// (a) expired ACTIVE entry — should be reaped.
 	expiredActive := shared.RetentionEntry{
-		OriginalLeaseUUID:   "old-active",
+		OriginalLeaseUUID:   oldActiveLease,
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusActive,
 		RetainedVolumeNames: []string{oldActiveVol},
 		CreatedAt:           time.Now().Add(-100 * 24 * time.Hour),
 	}
-	require.NoError(t, rs.Put(expiredActive))
+	require.NoError(t, putRetentionForTest(t, rs, expiredActive))
 
 	// (b) fresh ACTIVE entry — should NOT be reaped.
 	freshActive := shared.RetentionEntry{
-		OriginalLeaseUUID:   "fresh-active",
+		OriginalLeaseUUID:   freshActiveLease,
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusActive,
 		RetainedVolumeNames: []string{freshActiveVol},
 		CreatedAt:           time.Now(),
 	}
-	require.NoError(t, rs.Put(freshActive))
+	require.NoError(t, putRetentionForTest(t, rs, freshActive))
 
 	// (c) expired RESTORING entry — should NOT be reaped (only active entries are eligible).
 	expiredRestoring := shared.RetentionEntry{
-		OriginalLeaseUUID:   "old-restoring",
+		OriginalLeaseUUID:   oldRestoringLease,
 		Tenant:              "tenant-a",
-		NewLeaseUUID:        "u2",
+		NewLeaseUUID:        "22222222-2222-4222-8222-222222222222",
 		Status:              shared.RetentionStatusRestoring,
 		RetainedVolumeNames: []string{oldRestoringVol},
 		CreatedAt:           time.Now().Add(-100 * 24 * time.Hour),
 	}
-	require.NoError(t, rs.Put(expiredRestoring))
+	putRestoringRetention(t, rs, expiredRestoring)
+	expiredStored, err := rs.Get(oldActiveLease)
+	require.NoError(t, err)
+	require.NotNil(t, expiredStored)
+	freshStored, err := rs.Get(freshActiveLease)
+	require.NoError(t, err)
+	require.NotNil(t, freshStored)
+	now := time.Now()
+	b.cfg.RetentionMaxAge = (now.Sub(expiredStored.CreatedAt) + now.Sub(freshStored.CreatedAt)) / 2
 
 	// All three volumes are on disk; the finalizer derives which of them belong to the
 	// record it is reaping, so what gets destroyed is decided here plus the owner table, not
@@ -1599,17 +1556,17 @@ func TestReapExpiredRetentions(t *testing.T) {
 	assert.NotContains(t, gotDestroyed, oldRestoringVol, "restoring volume must NOT be destroyed")
 
 	// The expired active record must be gone from the store.
-	entry, err := rs.Get("old-active")
+	entry, err := rs.Get(oldActiveLease)
 	require.NoError(t, err)
 	assert.Nil(t, entry, "expired active record must be removed from store")
 
 	// The fresh active record must remain.
-	fresh, err := rs.Get("fresh-active")
+	fresh, err := rs.Get(freshActiveLease)
 	require.NoError(t, err)
 	assert.NotNil(t, fresh, "fresh active record must remain in store")
 
 	// The restoring record must remain.
-	restoring, err := rs.Get("old-restoring")
+	restoring, err := rs.Get(oldRestoringLease)
 	require.NoError(t, err)
 	assert.NotNil(t, restoring, "restoring record must remain in store")
 }
@@ -1623,7 +1580,7 @@ func TestReapExpiredRetentions_DisabledWhenMaxAgeZero(t *testing.T) {
 	b.cfg.RetentionMaxAge = 0 // disabled
 
 	// Seed an old record that would normally be reaped.
-	require.NoError(t, rs.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
 		OriginalLeaseUUID:   "old-lease",
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusActive,
@@ -1654,15 +1611,15 @@ func TestReap_DestroyFail_LeavesReapingCounted(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 	withMicroSKU(b, 1024)
-	b.cfg.RetentionMaxAge = time.Hour
 	rs := attachRetentionStore(t, b)
 
 	exp := retentionEntryFixture("lease-exp", "t1", time.Now().Add(-2*time.Hour)) // expired, qty 2
-	exp.RetainedVolumeNames = []string{"fred-retained-lease-exp-app-0"}
-	require.NoError(t, rs.Put(exp))
+	exp.RetainedVolumeNames = []string{retainedName(canonicalVolumeName(exp.OriginalLeaseUUID, "web", 0))}
+	require.NoError(t, putRetentionForTest(t, rs, exp))
+	b.cfg.RetentionMaxAge = time.Nanosecond
 
 	b.volumes = &mockVolumeManager{
-		ListFn:    func() ([]string, error) { return []string{"fred-retained-lease-exp-app-0"}, nil },
+		ListFn:    func() ([]string, error) { return slices.Clone(exp.RetainedVolumeNames), nil },
 		DestroyFn: func(_ context.Context, _ string) error { return errors.New("EBUSY") },
 	}
 
@@ -1670,7 +1627,7 @@ func TestReap_DestroyFail_LeavesReapingCounted(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, n, "destroy failed → not counted as reaped")
 
-	got, err := rs.Get("lease-exp")
+	got, err := rs.Get(exp.OriginalLeaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, got, "record must NOT be deleted on destroy failure")
 	assert.Equal(t, shared.RetentionStatusReaping, got.Status)
@@ -1686,21 +1643,21 @@ func TestReap_DestroySuccess_DeletesRecord(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 	withMicroSKU(b, 1024)
-	b.cfg.RetentionMaxAge = time.Hour
 	rs := attachRetentionStore(t, b)
 
 	exp := retentionEntryFixture("lease-exp", "t1", time.Now().Add(-2*time.Hour))
-	exp.RetainedVolumeNames = []string{"fred-retained-lease-exp-app-0"}
-	require.NoError(t, rs.Put(exp))
+	exp.RetainedVolumeNames = []string{retainedName(canonicalVolumeName(exp.OriginalLeaseUUID, "web", 0))}
+	require.NoError(t, putRetentionForTest(t, rs, exp))
+	b.cfg.RetentionMaxAge = time.Nanosecond
 
 	// The volume IS on disk, so the record is deleted because the destroy succeeded — not
 	// because the footprint looked empty. Without this the test would pass vacuously.
-	b.volumes = newVolumeSet("fred-retained-lease-exp-app-0").manager()
+	b.volumes = newVolumeSet(exp.RetainedVolumeNames...).manager()
 
 	n, err := b.reapExpiredRetentions(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
-	got, err := rs.Get("lease-exp")
+	got, err := rs.Get(exp.OriginalLeaseUUID)
 	require.NoError(t, err)
 	assert.Nil(t, got, "record deleted after confirmed destroy")
 	assert.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB)
@@ -1716,14 +1673,14 @@ func TestRetryReapingRecords_ReclaimsWhenDestroyRecovers(t *testing.T) {
 
 	reaping := retentionEntryFixture("lease-r", "t1", time.Now())
 	reaping.Status = shared.RetentionStatusReaping
-	reaping.RetainedVolumeNames = []string{"fred-retained-lease-r-app-0"}
-	require.NoError(t, rs.Put(reaping))
+	reaping.RetainedVolumeNames = []string{retainedName(canonicalVolumeName(reaping.OriginalLeaseUUID, "web", 0))}
+	require.NoError(t, putRetentionForTest(t, rs, reaping))
 
 	var fail atomic.Bool
 	fail.Store(true)
 	// On disk for the first sweep and destroyed by the second, so the record is deleted
 	// because the destroy finally succeeded — not because the footprint had vanished.
-	vs := newVolumeSet("fred-retained-lease-r-app-0")
+	vs := newVolumeSet(reaping.RetainedVolumeNames...)
 	vs.destroyFn = func(string) error {
 		if fail.Load() {
 			return errors.New("EBUSY")
@@ -1734,7 +1691,7 @@ func TestRetryReapingRecords_ReclaimsWhenDestroyRecovers(t *testing.T) {
 
 	// First sweep: destroy fails → record stays reaping.
 	require.NoError(t, b.retryReapingRecords(context.Background()))
-	got, err := rs.Get("lease-r")
+	got, err := rs.Get(reaping.OriginalLeaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, shared.RetentionStatusReaping, got.Status)
@@ -1742,7 +1699,7 @@ func TestRetryReapingRecords_ReclaimsWhenDestroyRecovers(t *testing.T) {
 	// Destroy recovers; next sweep reclaims + deletes.
 	fail.Store(false)
 	require.NoError(t, b.retryReapingRecords(context.Background()))
-	got, err = rs.Get("lease-r")
+	got, err = rs.Get(reaping.OriginalLeaseUUID)
 	require.NoError(t, err)
 	assert.Nil(t, got, "reaping record deleted after destroy recovers")
 }
@@ -1758,18 +1715,9 @@ func TestRunRetentionSweep_ReconcilesRestoring(t *testing.T) {
 	b.cfg.RetentionMaxAge = 90 * 24 * time.Hour
 
 	var mu sync.Mutex
-	var downProjects []string
 	type renameCall struct{ old, new string }
 	var renames []renameCall
 
-	b.compose = &mockComposeExecutor{
-		DownFn: func(_ context.Context, projectName string, _ time.Duration) error {
-			mu.Lock()
-			downProjects = append(downProjects, projectName)
-			mu.Unlock()
-			return nil
-		},
-	}
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(old, new string) error {
 			mu.Lock()
@@ -1777,44 +1725,43 @@ func TestRunRetentionSweep_ReconcilesRestoring(t *testing.T) {
 			mu.Unlock()
 			return nil
 		},
+		UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
 	}
+	bindRetentionOrphanPrunerForTest(t, b)
 
-	// Seed a restoring record with no live provision for u2 (orphaned).
+	// Seed a restoring record with no live provision for 22222222-2222-4222-8222-222222222222 (orphaned).
 	e := shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
-		NewLeaseUUID:        "u2",
+		OriginalLeaseUUID:   "11111111-1111-4111-8111-111111111111",
+		NewLeaseUUID:        "22222222-2222-4222-8222-222222222222",
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusRestoring,
 		Generation:          3,
 		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
+		RetainedVolumeNames: []string{"fred-retained-11111111-1111-4111-8111-111111111111-app-0"},
 	}
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	bindExactRestoreCleanupFixture(t, b, e)
 
 	err := b.runRetentionSweep(context.Background())
 	require.NoError(t, err)
 
 	mu.Lock()
-	gotDown := append([]string(nil), downProjects...)
 	gotRenames := append([]renameCall(nil), renames...)
 	mu.Unlock()
 
-	// reconcileRestoring must have been invoked: compose Down for u2's project.
-	assert.Contains(t, gotDown, composeProjectName("u2"),
-		"compose Down must be called for the orphaned restore's new lease")
-
 	// Volume must be re-quarantined.
 	assert.Contains(t, gotRenames, renameCall{
-		old: canonicalVolumeName("u2", manifest.DefaultServiceName, 0),
-		new: retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0)),
+		old: canonicalVolumeName("22222222-2222-4222-8222-222222222222", manifest.DefaultServiceName, 0),
+		new: retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0)),
 	}, "volume must be renamed from new canonical to original retained name")
 
 	// Record must have reverted to active.
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
-	assert.Equal(t, 4, entry.Generation, "generation must be bumped")
+	assert.Equal(t, e.Generation+1, entry.Generation, "generation must be bumped")
 	assert.Empty(t, entry.NewLeaseUUID)
 }
 
@@ -1910,20 +1857,25 @@ func restoreStackManifest() *manifest.StackManifest {
 // (tenant-a, 1×docker-small/"app") and returns it.
 func seedActiveRetained(t *testing.T, rs *shared.RetentionStore, orig string) shared.RetentionEntry {
 	t.Helper()
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}}
 	e := shared.RetentionEntry{
 		OriginalLeaseUUID:   orig,
 		Tenant:              "tenant-a",
-		ProviderUUID:        "prov-1",
-		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		ProviderUUID:        "22222222-2222-4222-8222-222222222222",
+		Items:               items,
+		ResourceProfiles:    testResourceProfiles(t, items),
 		StackManifest:       restoreStackManifest(),
-		CallbackURL:         "http://localhost/callback",
+		CallbackURL:         "http://localhost/callbacks/provision",
 		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(orig, manifest.DefaultServiceName, 0))},
 		Status:              shared.RetentionStatusActive,
 		Generation:          1,
 		CreatedAt:           time.Now(),
 	}
-	require.NoError(t, rs.Put(e))
-	return e
+	require.NoError(t, putRetentionForTest(t, rs, e))
+	stored, err := rs.Get(canonicalRetentionFixtureUUID(orig))
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	return *stored
 }
 
 // restoreRequest builds a RestoreRequest matching seedActiveRetained's shape.
@@ -1932,27 +1884,97 @@ func restoreRequest(newLease, fromLease, callbackURL string) backend.RestoreRequ
 		LeaseUUID:     newLease,
 		FromLeaseUUID: fromLease,
 		Tenant:        "tenant-a",
-		ProviderUUID:  "prov-1",
+		ProviderUUID:  "22222222-2222-4222-8222-222222222222",
 		Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		CallbackURL:   callbackURL,
+		CallbackURL:   testOperationCallbackURL(callbackURL),
 	}
+}
+
+func finalizeRestoreRetentionForTest(
+	t *testing.T,
+	b *Backend,
+	store *shared.RetentionStore,
+	sourceLease string,
+) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		entry, err := store.Get(sourceLease)
+		if err != nil {
+			return false
+		}
+		if entry == nil {
+			return true
+		}
+		if err := b.reconcileRestoring(context.Background(), *entry); err != nil {
+			return false
+		}
+		entry, err = store.Get(sourceLease)
+		return err == nil && entry == nil
+	}, 5*time.Second, 20*time.Millisecond,
+		"restore source finalizer must converge after exact completion settlement")
+}
+
+func rollbackRestoreRetentionForTest(
+	t *testing.T,
+	b *Backend,
+	store *shared.RetentionStore,
+	sourceLease string,
+) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		entry, err := store.Get(sourceLease)
+		if err != nil || entry == nil {
+			return false
+		}
+		if entry.Status == shared.RetentionStatusActive {
+			return true
+		}
+		if err := b.reconcileRestoring(context.Background(), *entry); err != nil {
+			return false
+		}
+		entry, err = store.Get(sourceLease)
+		return err == nil && entry != nil && entry.Status == shared.RetentionStatusActive
+	}, 5*time.Second, 20*time.Millisecond,
+		"restore source authority must converge back to active after failure settlement")
 }
 
 // renameCall captures a RenameVolume(old, new) invocation.
 type restoreRenameCall struct{ old, new string }
 
 // happyComposeMock returns a compose executor that brings the project Up and
-// reports one running container for service "app". upErr (if non-nil) makes Up
-// fail to drive the restore-failure path. Down is recorded into downProjects.
-func happyComposeMock(mu *sync.Mutex, downProjects *[]string, upErr error) *mockComposeExecutor {
-	return &mockComposeExecutor{
-		UpFn: func(_ context.Context, _ *composetypes.Project, _ composeUpOpts) error {
+// reports the exact running service cohort emitted by buildComposeProject.
+// upErr (if non-nil) makes Up fail to drive the restore-failure path. Down is
+// recorded into downProjects.
+func happyComposeMock(
+	t *testing.T,
+	dockerMock *mockDockerClient,
+	mu *sync.Mutex,
+	downProjects *[]string,
+	upErr error,
+) *mockComposeExecutor {
+	t.Helper()
+	var containers []composeContainerSummary
+	composeMock := &mockComposeExecutor{
+		UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
+			if upErr != nil {
+				return upErr
+			}
+			mu.Lock()
+			containers = containers[:0]
+			for serviceName := range project.Services {
+				containers = append(containers, composeContainerSummary{
+					ID:      fmt.Sprintf("container-%d", len(containers)+1),
+					Service: serviceName,
+					State:   "running",
+				})
+			}
+			mu.Unlock()
 			return upErr
 		},
 		PSFn: func(_ context.Context, _ string) ([]composeContainerSummary, error) {
-			return []composeContainerSummary{
-				{ID: "container-1", Service: manifest.DefaultServiceName, State: "running"},
-			}, nil
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]composeContainerSummary(nil), containers...), nil
 		},
 		DownFn: func(_ context.Context, projectName string, _ time.Duration) error {
 			mu.Lock()
@@ -1961,6 +1983,8 @@ func happyComposeMock(mu *sync.Mutex, downProjects *[]string, upErr error) *mock
 			return nil
 		},
 	}
+	installStackStrictCohortInventory(t, dockerMock, composeMock)
+	return composeMock
 }
 
 // TestRestore_PreludeRejectsWhenNotRetained: an empty store yields ErrNotRetained
@@ -1970,43 +1994,43 @@ func TestRestore_PreludeRejectsWhenNotRetained(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, nil)
 	attachRetentionStore(t, b)
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://localhost/cb"))
+	err := b.Restore(context.Background(), restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", "http://localhost/callbacks/provision"))
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrNotRetained)
 
 	b.provisionsMu.RLock()
-	_, has := b.provisions["u2"]
+	_, has := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
 	assert.False(t, has, "no provision entry must be created on a not-retained restore")
 }
 
-// TestRestore_PreludeRejectsConcurrentLiveProvision: pre-putting b.provisions[u2]
+// TestRestore_PreludeRejectsConcurrentLiveProvision: pre-putting b.provisions[22222222-2222-4222-8222-222222222222]
 // makes the reservation fail with ErrAlreadyProvisioned; the retained record is
 // untouched (still active) and no rename happens.
 func TestRestore_PreludeRejectsConcurrentLiveProvision(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"u2": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "u2", Status: backend.ProvisionStatusReady}},
+		"22222222-2222-4222-8222-222222222222": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "22222222-2222-4222-8222-222222222222", Status: backend.ProvisionStatusReady}},
 	})
 	rs := attachRetentionStore(t, b)
-	seedActiveRetained(t, rs, "u1")
+	before := seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111")
 
 	renameCalled := false
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(_, _ string) error { renameCalled = true; return nil },
 	}
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://localhost/cb"))
+	err := b.Restore(context.Background(), restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", "http://localhost/callbacks/provision"))
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrAlreadyProvisioned)
 
 	assert.False(t, renameCalled, "no volume rename must occur when the new lease is already provisioned")
 
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status, "retained record must remain active")
-	assert.Equal(t, 1, entry.Generation, "retained record generation must be unchanged")
+	assert.Equal(t, before.Generation, entry.Generation, "retained record generation must be unchanged")
 }
 
 // TestRestore_ItemsMismatch_Validation: a new-lease item set whose shape differs
@@ -2016,14 +2040,14 @@ func TestRestore_ItemsMismatch_Validation(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
-	seedActiveRetained(t, rs, "u1")
+	before := seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111")
 
 	renameCalled := false
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(_, _ string) error { renameCalled = true; return nil },
 	}
 
-	req := restoreRequest("u2", "u1", "http://localhost/cb")
+	req := restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", "http://localhost/callbacks/provision")
 	req.Items = []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}} // qty differs
 
 	err := b.Restore(context.Background(), req)
@@ -2033,15 +2057,15 @@ func TestRestore_ItemsMismatch_Validation(t *testing.T) {
 	assert.False(t, renameCalled, "no volume rename must occur on a validation rejection")
 
 	b.provisionsMu.RLock()
-	_, has := b.provisions["u2"]
+	_, has := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
 	assert.False(t, has, "no provision entry must be created on a validation rejection")
 
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
-	assert.Equal(t, 1, entry.Generation)
+	assert.Equal(t, before.Generation, entry.Generation)
 }
 
 // TestRestore_ProviderMismatch_Validation: a request whose ProviderUUID differs
@@ -2051,14 +2075,14 @@ func TestRestore_ProviderMismatch_Validation(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
-	seedActiveRetained(t, rs, "u1") // ProviderUUID: "prov-1"
+	before := seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111") // ProviderUUID: "prov-1"
 
 	renameCalled := false
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(_, _ string) error { renameCalled = true; return nil },
 	}
 
-	req := restoreRequest("u2", "u1", "http://localhost/cb")
+	req := restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", "http://localhost/callbacks/provision")
 	req.ProviderUUID = "prov-OTHER" // differs from the retained record's "prov-1"
 
 	err := b.Restore(context.Background(), req)
@@ -2068,66 +2092,46 @@ func TestRestore_ProviderMismatch_Validation(t *testing.T) {
 	assert.False(t, renameCalled, "no volume rename must occur on a provider-mismatch rejection")
 
 	b.provisionsMu.RLock()
-	_, has := b.provisions["u2"]
+	_, has := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
 	assert.False(t, has, "no provision entry must be created on a provider-mismatch rejection")
 
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
-	assert.Equal(t, 1, entry.Generation)
+	assert.Equal(t, before.Generation, entry.Generation)
 }
 
-// TestRestore_NilServiceEntry_RejectedNotPanic: a corrupt retained record whose
-// StackManifest.Services carries a nil service entry (the shape a tampered/legacy
-// `{"services":{"app":null}}` payload deserializes to) must be rejected with
-// ErrValidation, NOT crash the backend. Restore() runs synchronously with no panic
-// recovery before the service loop, so an unguarded nil-deref on m.Image would take
-// down the backend goroutine. Only reachable via store corruption — provision and
-// recovery both run ParsePayload->Validate — so this is defense-in-depth that
-// completes the existing "reject rather than nil-deref" corruption guard.
-func TestRestore_NilServiceEntry_RejectedNotPanic(t *testing.T) {
+// TestRetentionPublication_NilServiceEntryRejectedNotPanic proves the corrupt
+// manifest shape is rejected before either operation or retained authority can
+// be minted. Restore therefore cannot receive this state through the typed
+// runtime path; no defensive raw-row fixture is needed downstream.
+func TestRetentionPublication_NilServiceEntryRejectedNotPanic(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
-
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID: "u1",
-		Tenant:            "tenant-a",
-		ProviderUUID:      "prov-1",
-		Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		StackManifest: &manifest.StackManifest{
-			Services: map[string]*manifest.Manifest{manifest.DefaultServiceName: nil}, // corrupt: nil entry
-		},
-		CallbackURL:         "http://localhost/callback",
-		RetainedVolumeNames: []string{retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0))},
-		Status:              shared.RetentionStatusActive,
-		Generation:          1,
-		CreatedAt:           time.Now(),
-	}))
-
-	renameCalled := false
-	b.volumes = &mockVolumeManager{
-		RenameVolumeFn: func(_, _ string) error { renameCalled = true; return nil },
-	}
-
-	// Must reject cleanly, not panic.
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://localhost/cb"))
-	require.Error(t, err)
-	assert.ErrorIs(t, err, backend.ErrValidation)
-
-	assert.False(t, renameCalled, "no volume rename must occur on a corrupt-record rejection")
-
-	b.provisionsMu.RLock()
-	_, has := b.provisions["u2"]
-	b.provisionsMu.RUnlock()
-	assert.False(t, has, "no provision entry must be created on a corrupt-record rejection")
-
-	entry, err := rs.Get("u1")
+	items := []backend.LeaseItem{{
+		SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName,
+	}}
+	payload, err := json.Marshal(&manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{manifest.DefaultServiceName: nil},
+	})
 	require.NoError(t, err)
-	require.NotNil(t, entry)
-	assert.Equal(t, shared.RetentionStatusActive, entry.Status, "retained record must remain active")
+	_, callbackURL, lifecycleURL := newTestRestoreCallbackAuthority(t)
+	_, err = b.operationSettlement.NewOperationIntentCandidate(shared.OperationIntentSpec{
+		Kind:        shared.OperationIntentProvision,
+		LeaseUUID:   "11111111-1111-4111-8111-111111111111",
+		CallbackURL: callbackURL, LifecycleCallbackURL: lifecycleURL,
+		Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+		Items: items, EffectiveItems: items,
+		ResourceProfiles: testResourceProfiles(t, items), Manifest: payload,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil manifest")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
+	require.NoError(t, err)
+	assert.Nil(t, entry)
 }
 
 // TestRestore_TenantMismatch_CollapsesToNotRetained: a request whose Tenant does
@@ -2139,14 +2143,14 @@ func TestRestore_TenantMismatch_CollapsesToNotRetained(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
-	seedActiveRetained(t, rs, "u1") // Tenant: "tenant-a"
+	before := seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111") // Tenant: "tenant-a"
 
 	renameCalled := false
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(_, _ string) error { renameCalled = true; return nil },
 	}
 
-	req := restoreRequest("u2", "u1", "http://localhost/cb")
+	req := restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", "http://localhost/callbacks/provision")
 	req.Tenant = "tenant-b" // differs from the retained record's "tenant-a"
 
 	err := b.Restore(context.Background(), req)
@@ -2158,20 +2162,21 @@ func TestRestore_TenantMismatch_CollapsesToNotRetained(t *testing.T) {
 	assert.False(t, renameCalled, "no volume rename must occur on a tenant-mismatch rejection")
 
 	b.provisionsMu.RLock()
-	_, has := b.provisions["u2"]
+	_, has := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
 	assert.False(t, has, "no provision entry must be created on a tenant-mismatch rejection")
 
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
-	assert.Equal(t, 1, entry.Generation, "generation must be unchanged (no claim happened)")
+	assert.Equal(t, before.Generation, entry.Generation, "generation must be unchanged (no claim happened)")
 }
 
 // TestRestore_Success_DeletesRecord drives a restore all the way to Ready and
-// asserts: the retained record for u1 is DELETED, the volume was renamed
-// retained→canonical(u2), and u2's provision reaches Ready.
+// asserts: the retained record for 11111111-1111-4111-8111-111111111111 is DELETED,
+// the volume was renamed retained→canonical(22222222-2222-4222-8222-222222222222),
+// and 22222222-2222-4222-8222-222222222222's provision reaches Ready.
 func TestRestore_Success_DeletesRecord(t *testing.T) {
 	mock := &mockDockerClient{
 		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
@@ -2183,12 +2188,12 @@ func TestRestore_Success_DeletesRecord(t *testing.T) {
 	rs := attachRetentionStore(t, b)
 	attachReleaseStore(t, b) // prod always configures a release store (ENG-523 finalizer)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111")
 
 	var mu sync.Mutex
 	var downProjects []string
 	var renames []restoreRenameCall
-	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.compose = happyComposeMock(t, mock, &mu, &downProjects, nil)
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(old, new string) error {
 			mu.Lock()
@@ -2208,37 +2213,151 @@ func TestRestore_Success_DeletesRecord(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	stopReplay := startRestoreCallbackReplay(t, b)
+	defer stopReplay()
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", server.URL))
+	err := b.Restore(context.Background(), restoreRequest(
+		"22222222-2222-4222-8222-222222222222",
+		"11111111-1111-4111-8111-111111111111",
+		server.URL+"/callbacks/provision",
+	))
 	require.NoError(t, err)
 
-	<-callbackReceived
+	awaitRestoreCallback(t, callbackReceived)
 
-	// u2 must reach Ready.
+	// 22222222-2222-4222-8222-222222222222 must reach Ready.
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
+		p, ok := b.provisions["22222222-2222-4222-8222-222222222222"]
 		return ok && p.Status == backend.ProvisionStatusReady
-	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready")
+	}, 5*time.Second, 20*time.Millisecond, "22222222-2222-4222-8222-222222222222 must reach Ready")
 
-	// The retained record for u1 must be deleted.
-	require.Eventually(t, func() bool {
-		e, gerr := rs.Get("u1")
-		return gerr == nil && e == nil
-	}, 5*time.Second, 20*time.Millisecond, "retained record for u1 must be deleted on successful restore")
+	finalizeRestoreRetentionForTest(t, b, rs, "11111111-1111-4111-8111-111111111111")
 
-	// The adopt rename retained(u1)→canonical(u2) must have happened.
+	// The retained record for 11111111-1111-4111-8111-111111111111 must be deleted.
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
+	require.NoError(t, err)
+	assert.Nil(t, entry)
+
+	// The adopt rename retained(11111111-1111-4111-8111-111111111111)→canonical(22222222-2222-4222-8222-222222222222) must have happened.
 	mu.Lock()
 	gotRenames := append([]restoreRenameCall(nil), renames...)
 	mu.Unlock()
 	assert.Contains(t, gotRenames, restoreRenameCall{
-		old: retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0)),
-		new: canonicalVolumeName("u2", manifest.DefaultServiceName, 0),
-	}, "adopt must rename retained(u1) → canonical(u2)")
+		old: retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0)),
+		new: canonicalVolumeName("22222222-2222-4222-8222-222222222222", manifest.DefaultServiceName, 0),
+	}, "adopt must rename retained(11111111-1111-4111-8111-111111111111) → canonical(22222222-2222-4222-8222-222222222222)")
 
-	b.stopCancel()
-	b.wg.Wait()
+}
+
+func TestRestore_SeparatesExactCompletionFromLifecycleCallbacks(t *testing.T) {
+	const operationID = "550e8400-e29b-41d4-a716-446655440000"
+	type observedCallback struct {
+		query   string
+		payload backend.CallbackPayload
+	}
+	callbacks := make(chan observedCallback, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload backend.CallbackPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode callback: %v", err)
+			http.Error(w, "bad callback", http.StatusBadRequest)
+			return
+		}
+		callbacks <- observedCallback{query: r.URL.RawQuery, payload: payload}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+		// Bind the strict inventory to the custom executor below, rather than
+		// the nominal executor installed by newBackendForProvisionTest.
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+	attachReleaseStore(t, b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111")
+	stopReplay := startRestoreCallbackReplay(t, b)
+	defer stopReplay()
+	b.volumes = &mockVolumeManager{RenameVolumeFn: func(_, _ string) error { return nil }}
+
+	projectReady := make(chan *composetypes.Project, 1)
+	compose := &mockComposeExecutor{
+		UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
+			projectReady <- project
+			return nil
+		},
+		PSFn: func(_ context.Context, _ string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{{
+				ID: "container-1", Service: manifest.DefaultServiceName, State: "running",
+			}}, nil
+		},
+		DownFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+	}
+	installStackStrictCohortInventory(t, mock, compose)
+	b.compose = compose
+
+	callbackBaseURL := server.URL + "/callbacks/provision"
+	lifecycleURL := callbackBaseURL + "?" + backend.CallbackLifecycleIDQueryParameter + "=" + operationID
+	exactURL := callbackBaseURL + "?" + backend.CallbackOperationIDQueryParameter + "=" + operationID
+	req := restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", exactURL)
+	req.LifecycleCallbackURL = lifecycleURL
+	require.NoError(t, b.Restore(context.Background(), req))
+
+	var completion observedCallback
+	select {
+	case completion = <-callbacks:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restore completion callback was not delivered")
+	}
+	assert.Equal(t, backend.CallbackOperationIDQueryParameter+"="+operationID, completion.query,
+		"restore settlement must use the exact operation-scoped route")
+	assert.Equal(t, backend.CallbackStatusSuccess, completion.payload.Status)
+
+	b.provisionsMu.RLock()
+	restored, restoredExists := b.provisions["22222222-2222-4222-8222-222222222222"]
+	var restoredCallbackURL, restoredLifecycleCallbackURL string
+	if restoredExists {
+		restoredCallbackURL = restored.CallbackURL
+		restoredLifecycleCallbackURL = restored.LifecycleCallbackURL
+	}
+	b.provisionsMu.RUnlock()
+	require.True(t, restoredExists)
+	assert.Equal(t, exactURL, restoredCallbackURL)
+	assert.Equal(t, lifecycleURL, restoredLifecycleCallbackURL)
+
+	var project *composetypes.Project
+	select {
+	case project = <-projectReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restore did not build a Compose project")
+	}
+	require.Contains(t, project.Services, manifest.DefaultServiceName)
+	labels := project.Services[manifest.DefaultServiceName].Labels
+	assert.Equal(t, exactURL, labels[LabelCallbackURL])
+	assert.Equal(t, lifecycleURL, labels[LabelLifecycleCallbackURL])
+
+	finalizeRestoreRetentionForTest(t, b, rs, "11111111-1111-4111-8111-111111111111")
+	require.NoError(t, b.Deprovision(context.Background(), "22222222-2222-4222-8222-222222222222"))
+	// Wake the tracked durable replay loop after close settlement commits the
+	// lifecycle event; transport, not the test, owns precise outbox removal.
+	b.callbackSender.NotifyPendingCallbacks()
+	var lifecycle observedCallback
+	select {
+	case lifecycle = <-callbacks:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deprovision lifecycle callback was not delivered")
+	}
+	assert.Equal(t, backend.CallbackLifecycleIDQueryParameter+"="+operationID, lifecycle.query,
+		"post-restore lifecycle callbacks must carry typed observation authority")
+	assert.Equal(t, backend.CallbackStatusDeprovisioned, lifecycle.payload.Status)
 }
 
 // TestRestore_PartitionSurvivesLineage: restore a partition-labeled retained
@@ -2248,7 +2367,7 @@ func TestRestore_Success_DeletesRecord(t *testing.T) {
 // re-derived from the same source at the next close — "restore lineage for free".
 func TestRestore_PartitionSurvivesLineage(t *testing.T) {
 	const srcKey = "com.example.customer"
-	const orig = "u1"
+	const orig = "11111111-1111-4111-8111-111111111111"
 	newLease := "ffffffff-0000-0000-0000-000000000001"
 
 	mock := &mockDockerClient{
@@ -2263,16 +2382,19 @@ func TestRestore_PartitionSurvivesLineage(t *testing.T) {
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	b.cfg.RetainOnClose = true
 
-	// Seed the retained record, then overwrite its manifest with a partition-labeled
-	// one and stamp the partition (exactly the state the original close produced).
-	seedActiveRetained(t, rs, orig)
+	// Publish the partition-labeled manifest through the same exact close
+	// settlement that creates retained authority in production.
 	stack, err := manifest.ParsePayload(deployManifestWithLabel(srcKey, "cust-a"))
 	require.NoError(t, err)
-	rec, err := rs.Get(orig)
-	require.NoError(t, err)
-	rec.StackManifest = stack
-	rec.Partition = "cust-a"
-	require.NoError(t, rs.Put(*rec))
+	items := []backend.LeaseItem{{
+		SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName,
+	}}
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
+		OriginalLeaseUUID: orig, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+		Items: items, ResourceProfiles: testResourceProfiles(t, items), StackManifest: stack,
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(orig, manifest.DefaultServiceName, 0))},
+		Status:              shared.RetentionStatusActive, Partition: "cust-a",
+	}))
 
 	b.cfg.RetentionPartitionSource = "manifest.label:" + srcKey
 	b.cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
@@ -2283,23 +2405,21 @@ func TestRestore_PartitionSurvivesLineage(t *testing.T) {
 
 	var mu sync.Mutex
 	var downProjects []string
-	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.compose = happyComposeMock(t, mock, &mu, &downProjects, nil)
 	// Adaptation vs the success-path scaffolding (which only needs RenameVolumeFn):
 	// the close after restore must SEE the new lease's canonical volume so it has
 	// something to retain — adopt renamed retained(orig) → canonical(newLease).
-	b.volumes = &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			return []string{canonicalVolumeName(newLease, manifest.DefaultServiceName, 0)}, nil
-		},
-		RenameVolumeFn: func(_, _ string) error { return nil },
-	}
+	volumeState := newVolumeSet(retainedName(canonicalVolumeName(
+		orig, manifest.DefaultServiceName, 0,
+	)))
+	b.volumes = volumeState.manager()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
-	require.NoError(t, b.Restore(context.Background(), restoreRequest(newLease, orig, server.URL)))
+	require.NoError(t, b.Restore(context.Background(), restoreRequest(newLease, orig, server.URL+"/callbacks/provision")))
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
@@ -2309,6 +2429,7 @@ func TestRestore_PartitionSurvivesLineage(t *testing.T) {
 
 	// The orig record is gone (deleted on successful restore); the partition is NOT
 	// carried in any record — it survives only because the manifest carries the label.
+	finalizeRestoreRetentionForTest(t, b, rs, orig)
 	require.NoError(t, b.Deprovision(context.Background(), newLease))
 	require.Eventually(t, func() bool {
 		newRec, gerr := rs.Get(newLease)
@@ -2325,9 +2446,8 @@ func TestRestore_PartitionSurvivesLineage(t *testing.T) {
 // (docker-small, DiskMB 1024). It proves the new SKU is honored end-to-end: the
 // volume Create that applies the disk cap is called with the NEW tier's DiskMB
 // (2048), not the retained 1024, and the reserved ProvisionState carries the new
-// SKU. A clear promote must skip the demote gate's measurement entirely, so the
-// volume mock's Usage is intentionally left unset — any stray call would error and
-// fail the restore. (ENG-438, Task 8 sinks: profiles + ProvisionState + doRestore op.)
+// SKU. A clear promote must skip the demote gate's measurement entirely.
+// (ENG-438, Task 8 sinks: profiles + ProvisionState + doRestore op.)
 func TestRestore_HonorsNewSKU_Promote(t *testing.T) {
 	mock := &mockDockerClient{
 		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
@@ -2337,28 +2457,34 @@ func TestRestore_HonorsNewSKU_Promote(t *testing.T) {
 		// A non-empty VOLUME makes setupVolBinds create a stateful volume, so the
 		// new SKU's DiskMB flows into the (capacity-setting) Create call we observe.
 		InspectImageFn: func(_ context.Context, _ string) (*ImageInfo, error) {
-			return &ImageInfo{ID: "img-1", Volumes: map[string]struct{}{"/data": {}}}, nil
+			return &ImageInfo{ID: fixtureImageID("img-1"), Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1") // retained at docker-small (DiskMB 1024)
+	seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111") // retained at docker-small (DiskMB 1024)
 
 	var mu sync.Mutex
 	var downProjects []string
 	var createSizes []int64
-	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.compose = happyComposeMock(t, mock, &mu, &downProjects, nil)
+	volumeRoot := t.TempDir()
+	b.cfg.VolumeDataPath = volumeRoot
 	b.volumes = &mockVolumeManager{
-		defaultDir: t.TempDir(),
-		CreateFn: func(_ context.Context, _ string, sizeMB int64) (string, bool, error) {
+		defaultDir: volumeRoot,
+		CreateFn: func(_ context.Context, name string, sizeMB int64) (string, bool, error) {
 			mu.Lock()
 			createSizes = append(createSizes, sizeMB)
 			mu.Unlock()
-			return t.TempDir(), true, nil
+			path := filepath.Join(volumeRoot, name)
+			return path, true, os.MkdirAll(path, 0o755)
 		},
 		RenameVolumeFn: func(_, _ string) error { return nil },
-		// UsageFn deliberately unset: a clear promote must NOT measure.
+		UsageFn: func(context.Context, string) (int64, error) {
+			t.Fatal("a clear promote must not measure retained volume usage")
+			return 0, nil
+		},
 	}
 
 	callbackReceived := make(chan struct{})
@@ -2371,20 +2497,22 @@ func TestRestore_HonorsNewSKU_Promote(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	stopReplay := startRestoreCallbackReplay(t, b)
+	defer stopReplay()
 
 	// Promote: request docker-medium (2048) over the retained docker-small (1024).
-	req := restoreRequest("u2", "u1", server.URL)
+	req := restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", server.URL+"/callbacks/provision")
 	req.Items = []backend.LeaseItem{{SKU: "docker-medium", Quantity: 1, ServiceName: manifest.DefaultServiceName}}
 
 	require.NoError(t, b.Restore(context.Background(), req))
-	<-callbackReceived
+	awaitRestoreCallback(t, callbackReceived)
 
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
+		p, ok := b.provisions["22222222-2222-4222-8222-222222222222"]
 		return ok && p.Status == backend.ProvisionStatusReady
-	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready")
+	}, 5*time.Second, 20*time.Millisecond, "22222222-2222-4222-8222-222222222222 must reach Ready")
 
 	// The NEW SKU's disk cap (docker-medium = 2048 MiB) reached the volume Create —
 	// not the retained docker-small's 1024. This is the load-bearing "honor the new
@@ -2400,7 +2528,7 @@ func TestRestore_HonorsNewSKU_Promote(t *testing.T) {
 
 	// The reserved provision reflects the new SKU end-to-end (ProvisionState sink).
 	b.provisionsMu.RLock()
-	p := b.provisions["u2"]
+	p := b.provisions["22222222-2222-4222-8222-222222222222"]
 	gotSKU := p.SKU
 	gotItems := append([]backend.LeaseItem(nil), p.Items...)
 	b.provisionsMu.RUnlock()
@@ -2408,8 +2536,6 @@ func TestRestore_HonorsNewSKU_Promote(t *testing.T) {
 	require.Len(t, gotItems, 1)
 	assert.Equal(t, "docker-medium", gotItems[0].SKU, "ProvisionState.Items must carry the new SKU")
 
-	b.stopCancel()
-	b.wg.Wait()
 }
 
 // TestRestore_DemoteOverflow_RefusesNoMutation drives the real Restore entry point
@@ -2425,18 +2551,21 @@ func TestRestore_DemoteOverflow_RefusesNoMutation(t *testing.T) {
 	rs := attachRetentionStore(t, b)
 
 	// Retained at docker-large (DiskMB 4096); request docker-medium (2048) = demote.
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
+		OriginalLeaseUUID:   "11111111-1111-4111-8111-111111111111",
 		Tenant:              "tenant-a",
-		ProviderUUID:        "prov-1",
+		ProviderUUID:        nominalDockerProviderUUID,
 		Items:               []backend.LeaseItem{{SKU: "docker-large", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
 		StackManifest:       restoreStackManifest(),
-		CallbackURL:         "http://localhost/callback",
-		RetainedVolumeNames: []string{retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0))},
+		CallbackURL:         "http://localhost/callbacks/provision",
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0))},
 		Status:              shared.RetentionStatusActive,
 		Generation:          1,
 		CreatedAt:           time.Now(),
 	}))
+	before, err := rs.Get("11111111-1111-4111-8111-111111111111")
+	require.NoError(t, err)
+	require.NotNil(t, before)
 
 	var mu sync.Mutex
 	var renames []restoreRenameCall
@@ -2458,10 +2587,10 @@ func TestRestore_DemoteOverflow_RefusesNoMutation(t *testing.T) {
 
 	beforeAlloc := b.pool.Stats().AllocatedDiskMB
 
-	req := restoreRequest("u2", "u1", "http://localhost/cb")
+	req := restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", "http://localhost/callbacks/provision")
 	req.Items = []backend.LeaseItem{{SKU: "docker-medium", Quantity: 1, ServiceName: manifest.DefaultServiceName}}
 
-	err := b.Restore(context.Background(), req)
+	err = b.Restore(context.Background(), req)
 
 	// Refusal: the dedicated sentinel (maps to 422 across the boundary).
 	require.Error(t, err)
@@ -2475,11 +2604,11 @@ func TestRestore_DemoteOverflow_RefusesNoMutation(t *testing.T) {
 
 	// NO MUTATION — the gate runs in the read-only prelude BEFORE reserve/pool/claim/adopt.
 	// (1) retained record untouched: still active, generation unchanged, not bound to a new lease.
-	got, gerr := rs.Get("u1")
+	got, gerr := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, gerr)
 	require.NotNil(t, got)
 	assert.Equal(t, shared.RetentionStatusActive, got.Status, "record must stay active (not claimed→restoring)")
-	assert.Equal(t, 1, got.Generation, "record generation must be unchanged (no ClaimForRestore)")
+	assert.Equal(t, before.Generation, got.Generation, "record generation must be unchanged (no restore claim)")
 	assert.Empty(t, got.NewLeaseUUID, "record must not be bound to a new lease")
 
 	// (2) no adopt rename.
@@ -2487,7 +2616,7 @@ func TestRestore_DemoteOverflow_RefusesNoMutation(t *testing.T) {
 
 	// (3) no new-lease provision reserved.
 	b.provisionsMu.RLock()
-	_, hasU2 := b.provisions["u2"]
+	_, hasU2 := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
 	assert.False(t, hasU2, "no provision may be reserved on a refused demote")
 
@@ -2519,11 +2648,11 @@ func TestRestore_PersistsReleaseSoLeaseStaysRestartableAfterRestart(t *testing.T
 	rs := attachRetentionStore(t, b)
 	rel := attachReleaseStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111")
 
 	var mu sync.Mutex
 	var downProjects []string
-	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.compose = happyComposeMock(t, mock, &mu, &downProjects, nil)
 	b.volumes = &mockVolumeManager{RenameVolumeFn: func(_, _ string) error { return nil }}
 
 	callbackReceived := make(chan struct{})
@@ -2536,40 +2665,54 @@ func TestRestore_PersistsReleaseSoLeaseStaysRestartableAfterRestart(t *testing.T
 		}
 	}))
 	defer server.Close()
+	stopReplay := startRestoreCallbackReplay(t, b)
+	defer stopReplay()
 
-	require.NoError(t, b.Restore(context.Background(), restoreRequest("u2", "u1", server.URL)))
-	<-callbackReceived
+	require.NoError(t, b.Restore(context.Background(), restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", server.URL+"/callbacks/provision")))
+	awaitRestoreCallback(t, callbackReceived)
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
+		p, ok := b.provisions["22222222-2222-4222-8222-222222222222"]
 		return ok && p.Status == backend.ProvisionStatusReady
-	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready")
+	}, 5*time.Second, 20*time.Millisecond, "22222222-2222-4222-8222-222222222222 must reach Ready")
 
 	// (1) Mechanism: the restore must have persisted an active release (with manifest
 	// bytes) for the NEW lease — the exact record recoverState reads (recover.go's
 	// LatestActive). This is the isolated, fast signal if the Append regresses.
 	require.Eventually(t, func() bool {
-		r, gerr := rel.LatestActive("u2")
+		r, gerr := rel.LatestActive("22222222-2222-4222-8222-222222222222")
 		return gerr == nil && r != nil && len(r.Manifest) > 0
 	}, 5*time.Second, 20*time.Millisecond,
-		"restore must persist an active release record (with manifest) for the new lease u2")
+		"restore must persist an active release record (with manifest) for the new lease 22222222-2222-4222-8222-222222222222")
 
 	// (2) Simulate a docker-backend restart: the live container survives (live-restore),
-	// so recoverState rebuilds u2 from it — but the in-memory StackManifest set by
+	// so recoverState rebuilds 22222222-2222-4222-8222-222222222222 from it — but the in-memory StackManifest set by
 	// doRestore's OnSuccess is gone, forcing rehydration from the release store.
+	b.provisionsMu.RLock()
+	liveBeforeRestart := b.provisions["22222222-2222-4222-8222-222222222222"]
+	var recoveredCallbackURL, recoveredLifecycleURL string
+	if liveBeforeRestart != nil {
+		recoveredCallbackURL = liveBeforeRestart.CallbackURL
+		recoveredLifecycleURL = liveBeforeRestart.LifecycleCallbackURL
+	}
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, liveBeforeRestart)
 	mock.ListManagedContainersFn = func(_ context.Context) ([]ContainerInfo, error) {
 		return []ContainerInfo{{
-			ContainerID:   "c-u2-app-0",
-			LeaseUUID:     "u2",
-			Tenant:        "tenant-a",
-			ProviderUUID:  "prov-1",
-			SKU:           "docker-small",
-			ServiceName:   manifest.DefaultServiceName,
-			InstanceIndex: 0,
-			Status:        "running",
-			Name:          "fred-u2-app-0",
-			CreatedAt:     time.Now(),
+			ContainerID:          "c-22222222-2222-4222-8222-222222222222-app-0",
+			LeaseUUID:            "22222222-2222-4222-8222-222222222222",
+			Tenant:               "tenant-a",
+			ProviderUUID:         "prov-1",
+			SKU:                  "docker-small",
+			ServiceName:          manifest.DefaultServiceName,
+			InstanceIndex:        0,
+			CallbackURL:          recoveredCallbackURL,
+			LifecycleCallbackURL: recoveredLifecycleURL,
+			Image:                "nginx:latest",
+			Status:               "running",
+			Name:                 "fred-22222222-2222-4222-8222-222222222222-app-0",
+			CreatedAt:            time.Now(),
 		}}, nil
 	}
 	b.provisionsMu.Lock()
@@ -2580,14 +2723,18 @@ func TestRestore_PersistsReleaseSoLeaseStaysRestartableAfterRestart(t *testing.T
 	// (3) Precondition restored: the manifest is rehydrated from the release record via
 	// the real json.Marshal → ParsePayload round-trip (the retained image must survive).
 	b.provisionsMu.RLock()
-	p, ok := b.provisions["u2"]
+	p, ok := b.provisions["22222222-2222-4222-8222-222222222222"]
 	var stack *manifest.StackManifest
+	var restartLifecycleURL string
 	if ok {
 		stack = p.StackManifest
+		restartLifecycleURL = p.LifecycleCallbackURL
 	}
 	b.provisionsMu.RUnlock()
-	require.True(t, ok, "u2 must be rebuilt from its live container after the restart")
+	require.True(t, ok, "22222222-2222-4222-8222-222222222222 must be rebuilt from its live container after the restart")
 	require.NotNil(t, stack, "recoverState must rehydrate the restored lease's manifest from the release record")
+	require.NotEmpty(t, restartLifecycleURL,
+		"recoverState must preserve the lifecycle callback authority for maintenance")
 	svc, ok := stack.Services[manifest.DefaultServiceName]
 	require.True(t, ok, "rehydrated manifest must contain the app service")
 	assert.Equal(t, "nginx:latest", svc.Image, "rehydrated manifest must round-trip the retained image")
@@ -2597,11 +2744,9 @@ func TestRestore_PersistsReleaseSoLeaseStaysRestartableAfterRestart(t *testing.T
 	// that error synchronously to the caller), so a non-error return proves the restored
 	// lease is Restartable again — the exact harm ENG-433 fixes.
 	require.NoError(t,
-		b.Restart(context.Background(), backend.RestartRequest{LeaseUUID: "u2", CallbackURL: server.URL}),
+		b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t), LeaseUUID: "22222222-2222-4222-8222-222222222222", CallbackURL: restartLifecycleURL}),
 		"restored lease must be Restartable after a cold start (no ErrInvalidState)")
 
-	b.stopCancel()
-	b.wg.Wait()
 }
 
 // TestRestore_NormalizesLegacyUnnamedItem_Succeeds: a legacy single-service lease
@@ -2621,12 +2766,12 @@ func TestRestore_NormalizesLegacyUnnamedItem_Succeeds(t *testing.T) {
 	rs := attachRetentionStore(t, b)
 	attachReleaseStore(t, b) // prod always configures a release store (ENG-523 finalizer)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1") // retained record has ServiceName="app"
+	seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111") // retained record has ServiceName="app"
 
 	var mu sync.Mutex
 	var downProjects []string
 	var renames []restoreRenameCall
-	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.compose = happyComposeMock(t, mock, &mu, &downProjects, nil)
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(old, new string) error {
 			mu.Lock()
@@ -2646,62 +2791,56 @@ func TestRestore_NormalizesLegacyUnnamedItem_Succeeds(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	stopReplay := startRestoreCallbackReplay(t, b)
+	defer stopReplay()
 
 	// Legacy chain shape: a single item with an EMPTY ServiceName.
-	req := restoreRequest("u2", "u1", server.URL)
+	req := restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", server.URL+"/callbacks/provision")
 	req.Items = []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: ""}}
 
 	err := b.Restore(context.Background(), req)
 	require.NoError(t, err, "legacy unnamed-item restore must normalize to \"app\" and pass the shape check")
 
-	<-callbackReceived
+	awaitRestoreCallback(t, callbackReceived)
 
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
+		p, ok := b.provisions["22222222-2222-4222-8222-222222222222"]
 		return ok && p.Status == backend.ProvisionStatusReady
-	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready")
+	}, 5*time.Second, 20*time.Millisecond, "22222222-2222-4222-8222-222222222222 must reach Ready")
 
-	require.Eventually(t, func() bool {
-		e, gerr := rs.Get("u1")
-		return gerr == nil && e == nil
-	}, 5*time.Second, 20*time.Millisecond, "retained record for u1 must be deleted on successful restore")
+	finalizeRestoreRetentionForTest(t, b, rs, "11111111-1111-4111-8111-111111111111")
 
 	// The normalized "app" service name must flow into the adopt rename.
 	mu.Lock()
 	gotRenames := append([]restoreRenameCall(nil), renames...)
 	mu.Unlock()
 	assert.Contains(t, gotRenames, restoreRenameCall{
-		old: retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0)),
-		new: canonicalVolumeName("u2", manifest.DefaultServiceName, 0),
-	}, "adopt must rename retained(u1) → canonical(u2) using the normalized service name")
+		old: retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0)),
+		new: canonicalVolumeName("22222222-2222-4222-8222-222222222222", manifest.DefaultServiceName, 0),
+	}, "adopt must rename retained(11111111-1111-4111-8111-111111111111) → canonical(22222222-2222-4222-8222-222222222222) using the normalized service name")
 
-	b.stopCancel()
-	b.wg.Wait()
 }
 
-// TestRestore_Failure_RollsBackInline makes the downstream compose Up FAIL and
-// asserts the C2+N1 behavior: the lease ends Failed (NOT recovered) — proven by
-// the FAILED callback firing — compose.Down(fred-u2) was called, the volume was
-// renamed BACK to retained, the retention record is active again (Generation
-// bumped), and the pool is released. A restore that fails terminates Failed
-// because NoComposeRollback keeps Restored=false (no false "recovered"); the
-// provision settles as a Failed entry (the actor's onEnterFailedFromReplace owns
-// the Status flip + callback, reading CallbackURL from the still-present record).
-func TestRestore_Failure_RollsBackInline(t *testing.T) {
+// TestRestore_PostStartedErrorPreservesAuthorityForRecovery makes Compose Up
+// return an error after the durable Started boundary. A raw backend error cannot
+// prove whether Docker accepted the request, so the live process must preserve
+// the exact intent and adopted-data finalizer without publishing a terminal
+// callback or running an unproven rollback.
+func TestRestore_PostStartedErrorPreservesAuthorityForRecovery(t *testing.T) {
 	mock := &mockDockerClient{
 		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111")
 
 	var mu sync.Mutex
 	var downProjects []string
 	var renames []restoreRenameCall
-	b.compose = happyComposeMock(&mu, &downProjects, errors.New("compose up boom"))
+	b.compose = happyComposeMock(t, mock, &mu, &downProjects, errors.New("compose up boom"))
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(old, new string) error {
 			mu.Lock()
@@ -2709,92 +2848,74 @@ func TestRestore_Failure_RollsBackInline(t *testing.T) {
 			mu.Unlock()
 			return nil
 		},
+		UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
 	}
 
-	// Capture the callback STATUS so we can prove the lease ended Failed (not a
-	// success/recovered callback).
-	var gotStatus atomic.Value
-	callbackReceived := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload backend.CallbackPayload
-		_ = json.NewDecoder(r.Body).Decode(&payload)
-		gotStatus.Store(string(payload.Status))
+	callbackReceived := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		select {
-		case <-callbackReceived:
+		case callbackReceived <- struct{}{}:
 		default:
-			close(callbackReceived)
 		}
 	}))
 	defer server.Close()
+	stopReplay := startRestoreCallbackReplay(t, b)
+	defer stopReplay()
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", server.URL))
+	err := b.Restore(context.Background(), restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", server.URL+"/callbacks/provision"))
 	require.NoError(t, err) // route+ack succeed; the failure is asynchronous
+	awaitProvisionWorkerQuiescence(t, b, "22222222-2222-4222-8222-222222222222")
 
-	<-callbackReceived
+	select {
+	case <-callbackReceived:
+		t.Fatal("ambiguous post-Started error published a terminal callback")
+	case <-time.After(50 * time.Millisecond):
+	}
 
-	// Terminal-Failed proof: the callback status is "failed", NOT "success".
-	assert.Equal(t, string(backend.CallbackStatusFailed), gotStatus.Load(),
-		"a failed restore must emit a FAILED callback (terminal Failed, not recovered)")
+	intents, err := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1)
+	assert.Equal(t, shared.OperationExecutionStarted, intents[0].ExecutionPhase())
 
-	// The lease must settle Failed (NOT recovered/Ready).
-	require.Eventually(t, func() bool {
-		b.provisionsMu.RLock()
-		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
-		return ok && p.Status == backend.ProvisionStatusFailed
-	}, 5*time.Second, 20*time.Millisecond, "u2 must settle Failed (no false recovered)")
-
-	// The retained record must revert to ACTIVE (NOT deleted), Generation bumped.
-	require.Eventually(t, func() bool {
-		e, gerr := rs.Get("u1")
-		return gerr == nil && e != nil && e.Status == shared.RetentionStatusActive
-	}, 5*time.Second, 20*time.Millisecond, "retained record must revert to active on restore failure")
-
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
-	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
-	assert.Equal(t, 3, entry.Generation, "ClaimForRestore bumped 1→2, RevertToActive bumped 2→3")
-	assert.Empty(t, entry.NewLeaseUUID, "NewLeaseUUID must be cleared after revert")
+	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status)
+	assert.Equal(t, "22222222-2222-4222-8222-222222222222", entry.NewLeaseUUID)
+
+	b.provisionsMu.RLock()
+	destination := b.provisions["22222222-2222-4222-8222-222222222222"]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, destination)
+	assert.Equal(t, backend.ProvisionStatusRestarting, destination.Status)
 
 	mu.Lock()
 	gotDown := append([]string(nil), downProjects...)
 	gotRenames := append([]restoreRenameCall(nil), renames...)
 	mu.Unlock()
 
-	// compose.Down for the new lease's project must have run (N1: before re-quarantine).
-	assert.Contains(t, gotDown, composeProjectName("u2"), "compose Down(fred-u2) must be called during rollback")
+	assert.Empty(t, gotDown, "an ambiguous error must not start compensating teardown")
 
-	// The volume must be renamed BACK: canonical(u2) → retained(u1).
-	assert.Contains(t, gotRenames, restoreRenameCall{
-		old: canonicalVolumeName("u2", manifest.DefaultServiceName, 0),
-		new: retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0)),
-	}, "rollback must re-quarantine canonical(u2) → retained(u1)")
-
-	// Pool must be released: re-allocating u2's slot must succeed.
-	allocErr := b.pool.TryAllocate("u2-"+manifest.DefaultServiceName+"-0", "docker-small", "tenant-a")
-	assert.NoError(t, allocErr, "pool slot must be free after rollback release")
-	b.pool.Release("u2-" + manifest.DefaultServiceName + "-0")
-
-	b.stopCancel()
-	b.wg.Wait()
+	assert.NotContains(t, gotRenames, restoreRenameCall{
+		old: canonicalVolumeName("22222222-2222-4222-8222-222222222222", manifest.DefaultServiceName, 0),
+		new: retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0)),
+	}, "ambiguous outcome must not re-quarantine data before recovery proves absence")
 }
 
-// TestRestore_WorkerPanic_RollsBackAndKeepsRecord induces a panic in the work
-// path (compose Up panics) and asserts the record is reverted to active (NOT
-// deleted) and the volume is re-quarantined. doRestore's panic-recovery defer
-// converts the panic into an errored ReplaceResult (Restored=false) and runs the
-// compensating rollback; the actor then drives the lease to Failed. A panic must
-// NEVER be mistaken for success (which would delete the retained record).
-func TestRestore_WorkerPanic_RollsBackAndKeepsRecord(t *testing.T) {
+// TestRestore_WorkerPanic_PreservesAdoptedDataForRecovery induces a panic at
+// the post-effect Compose Up boundary. The backend cannot know whether Docker
+// accepted the request, so it must preserve both the adopted data and its exact
+// Started/Restoring authority. Eager rollback here could race a late target
+// publication and either destroy or overwrite tenant data.
+func TestRestore_WorkerPanic_PreservesAdoptedDataForRecovery(t *testing.T) {
 	mock := &mockDockerClient{
 		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111")
 
 	var mu sync.Mutex
 	var renames []restoreRenameCall
@@ -2811,62 +2932,66 @@ func TestRestore_WorkerPanic_RollsBackAndKeepsRecord(t *testing.T) {
 			mu.Unlock()
 			return nil
 		},
+		UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
 	}
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://127.0.0.1:0/cb"))
+	err := b.Restore(context.Background(), restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", "http://127.0.0.1:1/callbacks/provision"))
 	require.NoError(t, err) // route+ack succeed; the panic is asynchronous
+	awaitProvisionWorkerQuiescence(t, b, "22222222-2222-4222-8222-222222222222")
 
-	// The record must revert to active (NOT deleted) — the panic must not be
-	// mistaken for success.
-	require.Eventually(t, func() bool {
-		e, gerr := rs.Get("u1")
-		return gerr == nil && e != nil && e.Status == shared.RetentionStatusActive
-	}, 5*time.Second, 20*time.Millisecond, "record must revert to active after a restore worker panic")
-
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry, "record must NOT be deleted on panic")
-	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
+	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status)
+	assert.Equal(t, "22222222-2222-4222-8222-222222222222", entry.NewLeaseUUID)
 
-	// The lease must settle Failed (actor fires evReplaceFailed on the errored
-	// panic result; doRestore keeps the provision so the Status flip can run).
-	require.Eventually(t, func() bool {
-		b.provisionsMu.RLock()
-		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
-		return ok && p.Status == backend.ProvisionStatusFailed
-	}, 5*time.Second, 20*time.Millisecond, "u2 must settle Failed after panic rollback")
+	b.provisionsMu.RLock()
+	destination := b.provisions["22222222-2222-4222-8222-222222222222"]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, destination)
+	assert.Equal(t, backend.ProvisionStatusRestarting, destination.Status)
+	intents, listErr := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, listErr)
+	require.Len(t, intents, 1)
+	assert.Equal(t, shared.OperationExecutionStarted, intents[0].ExecutionPhase())
 
-	// The volume must be re-quarantined back to the retained namespace.
+	// The forward adoption happened, but no unproven compensation ran. A later
+	// recovery pass derives either completion or rollback from fresh inventory.
 	mu.Lock()
 	gotRenames := append([]restoreRenameCall(nil), renames...)
 	mu.Unlock()
 	assert.Contains(t, gotRenames, restoreRenameCall{
-		old: canonicalVolumeName("u2", manifest.DefaultServiceName, 0),
-		new: retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0)),
-	}, "panic rollback must re-quarantine canonical(u2) → retained(u1)")
+		old: retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0)),
+		new: canonicalVolumeName("22222222-2222-4222-8222-222222222222", manifest.DefaultServiceName, 0),
+	})
+	assert.NotContains(t, gotRenames, restoreRenameCall{
+		old: canonicalVolumeName("22222222-2222-4222-8222-222222222222", manifest.DefaultServiceName, 0),
+		new: retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0)),
+	}, "post-effect ambiguity must not run an unproven rollback")
 
 	b.stopCancel()
 	b.wg.Wait()
 }
 
-// TestRestore_WorkerPanic_PopulatesFailureCallback verifies FIX E: doRestore's
-// panic defer populates ReplaceResult.Failure.{CallbackErr,LastError} (and the
-// top-level CallbackErr), so the actor's evReplaceFailed fires a NON-empty tenant
-// callback. The panic is induced through the real DI seam (compose.UpFn panics);
-// the callback's Error field is the user-visible symptom that was empty before
-// the fix. info.CallbackErr flows verbatim into the callback Error (lease_sm.go).
-func TestRestore_WorkerPanic_PopulatesFailureCallback(t *testing.T) {
+// TestRestore_PostEffectWorkerPanicPreservesStartedIntentWithoutCallback pins
+// the write-ahead boundary for a panic inside Compose Up. Up is an external
+// effect: a panic may happen before or after Docker accepts the request, so the
+// live process cannot honestly publish either success or failure. The exact
+// Started intent and Restoring source remain the sole replay authority and no
+// terminal callback is emitted until recovery classifies a fresh inventory.
+func TestRestore_PostEffectWorkerPanicPreservesStartedIntentWithoutCallback(t *testing.T) {
 	mock := &mockDockerClient{
 		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111")
 
+	panicReached := make(chan struct{})
 	b.compose = &mockComposeExecutor{
 		UpFn: func(_ context.Context, _ *composetypes.Project, _ composeUpOpts) error {
+			close(panicReached)
 			panic("induced restore worker panic")
 		},
 		DownFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
@@ -2875,60 +3000,77 @@ func TestRestore_WorkerPanic_PopulatesFailureCallback(t *testing.T) {
 		RenameVolumeFn: func(_, _ string) error { return nil },
 	}
 
-	var gotError atomic.Value
-	var gotStatus atomic.Value
-	callbackReceived := make(chan struct{})
+	callbackReceived := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload backend.CallbackPayload
-		_ = json.NewDecoder(r.Body).Decode(&payload)
-		gotError.Store(payload.Error)
-		gotStatus.Store(string(payload.Status))
 		w.WriteHeader(http.StatusOK)
 		select {
-		case <-callbackReceived:
+		case callbackReceived <- struct{}{}:
 		default:
-			close(callbackReceived)
 		}
 	}))
 	defer server.Close()
+	stopReplay := startRestoreCallbackReplay(t, b)
+	defer stopReplay()
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", server.URL))
+	req := restoreRequest(
+		"22222222-2222-4222-8222-222222222222",
+		"11111111-1111-4111-8111-111111111111",
+		server.URL+"/callbacks/provision",
+	)
+	err := b.Restore(context.Background(), req)
 	require.NoError(t, err) // route+ack succeed; the panic is asynchronous
 
-	<-callbackReceived
+	select {
+	case <-panicReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restore worker did not reach Compose Up")
+	}
+	awaitProvisionWorkerQuiescence(t, b, req.LeaseUUID)
 
-	// The failure callback must carry a NON-EMPTY error (FIX E: pre-fix this was
-	// empty because the panic defer left Failure.CallbackErr unset).
-	assert.Equal(t, string(backend.CallbackStatusFailed), gotStatus.Load(), "panic must yield a FAILED callback")
-	assert.Equal(t, leasesm.ErrMsgInternal, gotError.Load(),
-		"panic callback Error must be the canonical internal-error message, not empty")
-
-	// The provision's LastError (set from info.LastError) must be non-empty and
-	// name the panic.
-	require.Eventually(t, func() bool {
-		b.provisionsMu.RLock()
-		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
-		return ok && p.Status == backend.ProvisionStatusFailed && p.LastError != ""
-	}, 5*time.Second, 20*time.Millisecond, "u2 must settle Failed with a non-empty LastError")
+	intents, listErr := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, listErr)
+	require.Len(t, intents, 1)
+	assert.Equal(t, req.LeaseUUID, intents[0].LeaseUUID())
+	assert.Equal(t, shared.OperationIntentRestore, intents[0].Kind())
+	assert.Equal(t, shared.OperationExecutionStarted, intents[0].ExecutionPhase(),
+		"only a Started intent can authorize restart recovery after an ambiguous effect")
 
 	b.provisionsMu.RLock()
-	lastErr := b.provisions["u2"].LastError
+	destination := b.provisions[req.LeaseUUID]
 	b.provisionsMu.RUnlock()
-	assert.Contains(t, lastErr, "restore panic", "LastError must come from the panic defer's Failure.LastError")
+	require.NotNil(t, destination)
+	assert.Equal(t, backend.ProvisionStatusRestarting, destination.Status,
+		"an ambiguous effect must not manufacture a terminal Failed projection")
 
-	b.stopCancel()
-	b.wg.Wait()
+	source, sourceErr := rs.Get(req.FromLeaseUUID)
+	require.NoError(t, sourceErr)
+	require.NotNil(t, source)
+	assert.Equal(t, shared.RetentionStatusRestoring, source.Status,
+		"the source finalizer must remain until exact recovery resolves the target generation")
+	assert.Equal(t, req.LeaseUUID, source.NewLeaseUUID)
+
+	pending, pendingErr := b.callbackStore.ListPending()
+	require.NoError(t, pendingErr)
+	for _, callback := range pending {
+		assert.NotEqual(t, req.CallbackURL, callback.CallbackURL,
+			"ambiguous restore must not enqueue a terminal operation callback")
+	}
+	select {
+	case <-callbackReceived:
+		t.Fatal("post-effect panic published a terminal restore callback")
+	case <-time.After(50 * time.Millisecond):
+	}
 }
 
-// TestRestore_RouteFailure_RollsBackSynchronously cancels b.stopCtx so
-// routeToLeaseBlocking fails; the synchronous rollback must run (record active,
-// provision gone, volume re-quarantined) WITHOUT a worker ever executing.
-func TestRestore_RouteFailure_RollsBackSynchronously(t *testing.T) {
+// TestRestore_StoppedBackendRefusesBeforeAdoption cancels b.stopCtx before the
+// request. Admission must fail before the retention claim or first volume
+// rename: once shutdown begins, a compensating rename is no safer than the
+// forward mutation it would undo.
+func TestRestore_StoppedBackendRefusesBeforeAdoption(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111")
 
 	var mu sync.Mutex
 	var renames []restoreRenameCall
@@ -2949,40 +3091,37 @@ func TestRestore_RouteFailure_RollsBackSynchronously(t *testing.T) {
 		},
 	}
 
-	// Cancel the backend so routeToLeaseBlocking returns "backend shutting down".
+	// Cancel the backend before request admission.
 	b.stopCancel()
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://localhost/cb"))
+	err := b.Restore(context.Background(), restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", "http://localhost/callbacks/provision"))
 	require.Error(t, err, "Restore must fail synchronously when the backend is shutting down")
 
 	assert.False(t, upCalled, "no worker must run on a route failure")
 
-	// Record reverted to active synchronously.
-	entry, err := rs.Get("u1")
+	// The active record was never claimed.
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
-	assert.Equal(t, shared.RetentionStatusActive, entry.Status, "record must be reverted to active on synchronous rollback")
+	assert.Equal(t, shared.RetentionStatusActive, entry.Status, "stopped backend must not claim the record")
 	assert.Empty(t, entry.NewLeaseUUID)
 
 	// Provision removed.
 	b.provisionsMu.RLock()
-	_, has := b.provisions["u2"]
+	_, has := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
-	assert.False(t, has, "provision for u2 must be removed on synchronous rollback")
+	assert.False(t, has, "provision for 22222222-2222-4222-8222-222222222222 must be removed on synchronous rollback")
 
-	// Volume re-quarantined: adopt rename happened then was reversed.
+	// No forward or compensating substrate mutation is legal after stop.
 	mu.Lock()
 	gotRenames := append([]restoreRenameCall(nil), renames...)
 	mu.Unlock()
-	assert.Contains(t, gotRenames, restoreRenameCall{
-		old: canonicalVolumeName("u2", manifest.DefaultServiceName, 0),
-		new: retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0)),
-	}, "synchronous rollback must re-quarantine canonical(u2) → retained(u1)")
+	assert.Empty(t, gotRenames, "stopped backend must refuse before volume adoption")
 }
 
-// TestRestore_RaceWithProvision interleaves Restore(u2 from u1) with a concurrent
-// Provision(u2). Exactly one must win the reservation; the loser must get
-// ErrAlreadyProvisioned. The retention record is never lost (either deleted on a
+// TestRestore_RaceWithProvision interleaves Restore(22222222-2222-4222-8222-222222222222 from 11111111-1111-4111-8111-111111111111) with a concurrent
+// Provision(22222222-2222-4222-8222-222222222222). Exactly one must win admission; the loser observes either
+// the live projection or the earlier durable operation intent. The retention record is never lost (either deleted on a
 // winning restore-to-Ready, or left active if restore lost). Run under -race.
 func TestRestore_RaceWithProvision(t *testing.T) {
 	mock := &mockDockerClient{
@@ -2995,11 +3134,11 @@ func TestRestore_RaceWithProvision(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111")
 
 	var mu sync.Mutex
 	var downProjects []string
-	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.compose = happyComposeMock(t, mock, &mu, &downProjects, nil)
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(_, _ string) error { return nil },
 	}
@@ -3017,15 +3156,15 @@ func TestRestore_RaceWithProvision(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		if err := b.Restore(context.Background(), restoreRequest("u2", "u1", server.URL)); err != nil {
+		if err := b.Restore(context.Background(), restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", server.URL+"/callbacks/provision")); err != nil {
 			restoreErr.Store(err)
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		<-start
-		req := newProvisionRequest("u2", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-		req.CallbackURL = server.URL
+		req := newProvisionRequest("22222222-2222-4222-8222-222222222222", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+		req.CallbackURL = testOperationCallbackURL(server.URL + "/callbacks/provision")
 		if err := b.Provision(context.Background(), req); err != nil {
 			provisionErr.Store(err)
 		}
@@ -3033,31 +3172,36 @@ func TestRestore_RaceWithProvision(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	// Exactly one of the two reservations must have failed with ErrAlreadyProvisioned.
+	// Exactly one request wins. The durable intent is written before the volatile
+	// reservation, so the loser may observe either fence depending on interleaving.
 	rErr, _ := restoreErr.Load().(error)
 	pErr, _ := provisionErr.Load().(error)
 	bothSucceeded := rErr == nil && pErr == nil
-	assert.False(t, bothSucceeded, "Restore and Provision must not both win the u2 reservation")
+	assert.False(t, bothSucceeded, "Restore and Provision must not both win the 22222222-2222-4222-8222-222222222222 reservation")
 	if rErr != nil {
-		assert.ErrorIs(t, rErr, backend.ErrAlreadyProvisioned, "the losing Restore must report ErrAlreadyProvisioned")
+		assert.True(t,
+			errors.Is(rErr, backend.ErrAlreadyProvisioned) || errors.Is(rErr, shared.ErrOperationIntentConflict),
+			"the losing Restore must report a live or durable admission conflict: %v", rErr)
 	}
 	if pErr != nil {
-		assert.ErrorIs(t, pErr, backend.ErrAlreadyProvisioned, "the losing Provision must report ErrAlreadyProvisioned")
+		assert.True(t,
+			errors.Is(pErr, backend.ErrAlreadyProvisioned) || errors.Is(pErr, shared.ErrOperationIntentConflict),
+			"the losing Provision must report a live or durable admission conflict: %v", pErr)
 	}
 
 	// The retention record must never be lost: it is either still present
 	// (restore lost, or in-flight) or deleted (restore won and reached Ready).
-	// Give the winner a moment to settle, then assert: if u1 is gone, u2 must be
-	// a Ready restore; if u1 is present, it must be active.
+	// Give the winner a moment to settle, then assert: if 11111111-1111-4111-8111-111111111111 is gone, 22222222-2222-4222-8222-222222222222 must be
+	// a Ready restore; if 11111111-1111-4111-8111-111111111111 is present, it must be active.
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
-		p, ok := b.provisions["u2"]
+		p, ok := b.provisions["22222222-2222-4222-8222-222222222222"]
 		settled := ok && (p.Status == backend.ProvisionStatusReady || p.Status == backend.ProvisionStatusFailed)
 		b.provisionsMu.RUnlock()
 		return settled
-	}, 5*time.Second, 20*time.Millisecond, "u2 must settle")
+	}, 5*time.Second, 20*time.Millisecond, "22222222-2222-4222-8222-222222222222 must settle")
 
-	e, gerr := rs.Get("u1")
+	e, gerr := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, gerr)
 	if e != nil {
 		assert.Contains(t, []string{shared.RetentionStatusActive, shared.RetentionStatusRestoring}, e.Status,
@@ -3066,6 +3210,134 @@ func TestRestore_RaceWithProvision(t *testing.T) {
 
 	b.stopCancel()
 	b.wg.Wait()
+}
+
+// TestRestore_ConcurrentTargetsClaimSourceAtMostOnce pins the backend contract
+// behind provider-side ambiguous-result handling: two requests may both pass the
+// read-only prelude, but the retained source's atomic active->restoring CAS lets
+// at most one target receive acceptance. The winning worker is deliberately
+// delayed after acceptance so caller retry cannot mistake a slow response for an
+// available source.
+func TestRestore_ConcurrentTargetsClaimSourceAtMostOnce(t *testing.T) {
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111")
+	stopReplay := startRestoreCallbackReplay(t, b)
+
+	workerStarted := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	var workerStartedOnce sync.Once
+	var releaseWorkerOnce sync.Once
+	release := func() {
+		releaseWorkerOnce.Do(func() { close(releaseWorker) })
+	}
+	t.Cleanup(func() {
+		release()
+		stopReplay()
+	})
+
+	b.compose = &mockComposeExecutor{
+		UpFn: func(_ context.Context, _ *composetypes.Project, _ composeUpOpts) error {
+			workerStartedOnce.Do(func() { close(workerStarted) })
+			<-releaseWorker
+			return nil
+		},
+		PSFn: func(_ context.Context, _ string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{{
+				ID: "container-1", Service: manifest.DefaultServiceName, State: "running",
+			}}, nil
+		},
+		DownFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+	}
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { return nil },
+	}
+
+	callbackSeen := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case callbackSeen <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	type restoreResult struct {
+		target string
+		err    error
+	}
+	results := make(chan restoreResult, 2)
+	start := make(chan struct{})
+	for _, target := range []string{"22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"} {
+		go func() {
+			<-start
+			results <- restoreResult{
+				target: target,
+				err:    b.Restore(context.Background(), restoreRequest(target, "11111111-1111-4111-8111-111111111111", server.URL+"/callbacks/provision")),
+			}
+		}()
+	}
+	close(start)
+
+	got := make([]restoreResult, 0, 2)
+	for range 2 {
+		select {
+		case result := <-results:
+			got = append(got, result)
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent restore calls did not return while the winning worker was delayed")
+		}
+	}
+
+	accepted := make([]string, 0, 1)
+	for _, result := range got {
+		if result.err == nil {
+			accepted = append(accepted, result.target)
+			continue
+		}
+		assert.ErrorIs(t, result.err, backend.ErrInvalidState,
+			"the losing target must observe the source's exclusive restoring claim")
+	}
+	require.Len(t, accepted, 1, "one and only one target may receive restore acceptance")
+
+	select {
+	case <-workerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("accepted restore worker did not start")
+	}
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status)
+	assert.Equal(t, accepted[0], entry.NewLeaseUUID,
+		"the durable source claim must name exactly the accepted target")
+
+	loser := "22222222-2222-4222-8222-222222222222"
+	if accepted[0] == loser {
+		loser = "33333333-3333-4333-8333-333333333333"
+	}
+	b.provisionsMu.RLock()
+	_, winnerTracked := b.provisions[accepted[0]]
+	_, loserTracked := b.provisions[loser]
+	b.provisionsMu.RUnlock()
+	assert.True(t, winnerTracked)
+	assert.False(t, loserTracked, "a failed source claim must roll back the losing target reservation")
+
+	release()
+	select {
+	case <-callbackSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("accepted restore worker did not finish after release")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3100,19 +3372,21 @@ func mixedItems() []backend.LeaseItem {
 // derivation (it would invent a non-existent fred-retained-<orig>-web-0).
 func seedMixedRetained(t *testing.T, rs *shared.RetentionStore, orig string) shared.RetentionEntry {
 	t.Helper()
+	items := mixedItems()
 	e := shared.RetentionEntry{
 		OriginalLeaseUUID:   orig,
 		Tenant:              "tenant-a",
-		ProviderUUID:        "prov-1",
-		Items:               mixedItems(),
+		ProviderUUID:        "22222222-2222-4222-8222-222222222222",
+		Items:               items,
+		ResourceProfiles:    testResourceProfiles(t, items),
 		StackManifest:       mixedStackManifest(),
-		CallbackURL:         "http://localhost/callback",
+		CallbackURL:         "http://localhost/callbacks/provision",
 		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(orig, "db", 0))}, // only db has a volume
 		Status:              shared.RetentionStatusActive,
 		Generation:          1,
 		CreatedAt:           time.Now(),
 	}
-	require.NoError(t, rs.Put(e))
+	require.NoError(t, putRetentionForTest(t, rs, e))
 	return e
 }
 
@@ -3122,9 +3396,9 @@ func mixedRestoreRequest(newLease, fromLease, callbackURL string) backend.Restor
 		LeaseUUID:     newLease,
 		FromLeaseUUID: fromLease,
 		Tenant:        "tenant-a",
-		ProviderUUID:  "prov-1",
+		ProviderUUID:  "22222222-2222-4222-8222-222222222222",
 		Items:         mixedItems(),
-		CallbackURL:   callbackURL,
+		CallbackURL:   testOperationCallbackURL(callbackURL),
 	}
 }
 
@@ -3157,7 +3431,7 @@ func happyMixedComposeMock(mu *sync.Mutex, downProjects *[]string, upErr error) 
 // phantom rename of a non-existent web volume is ever attempted. The
 // RenameVolumeFn ERRORS for any name not in RetainedVolumeNames to prove the
 // phantom is never requested (an Items×Quantity derivation would request
-// fred-retained-u1-web-0 → hard error → whole restore fails).
+// fred-retained-11111111-1111-4111-8111-111111111111-web-0 → hard error → whole restore fails).
 func TestRestore_MixedStatefulStatelessLease(t *testing.T) {
 	mock := &mockDockerClient{
 		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
@@ -3169,14 +3443,15 @@ func TestRestore_MixedStatefulStatelessLease(t *testing.T) {
 	rs := attachRetentionStore(t, b)
 	attachReleaseStore(t, b) // prod always configures a release store (ENG-523 finalizer)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedMixedRetained(t, rs, "u1")
+	seedMixedRetained(t, rs, "11111111-1111-4111-8111-111111111111")
 
-	retainedSet := map[string]bool{retainedName(canonicalVolumeName("u1", "db", 0)): true}
+	retainedSet := map[string]bool{retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", "db", 0)): true}
 
 	var mu sync.Mutex
 	var downProjects []string
 	var renames []restoreRenameCall
 	b.compose = happyMixedComposeMock(&mu, &downProjects, nil)
+	installStackStrictCohortInventory(t, mock, b.compose.(*mockComposeExecutor))
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(old, new string) error {
 			mu.Lock()
@@ -3189,6 +3464,7 @@ func TestRestore_MixedStatefulStatelessLease(t *testing.T) {
 			}
 			return nil
 		},
+		UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
 	}
 
 	callbackReceived := make(chan struct{})
@@ -3201,36 +3477,34 @@ func TestRestore_MixedStatefulStatelessLease(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	stopReplay := startRestoreCallbackReplay(t, b)
+	defer stopReplay()
 
-	err := b.Restore(context.Background(), mixedRestoreRequest("u2", "u1", server.URL))
+	err := b.Restore(context.Background(), mixedRestoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", server.URL+"/callbacks/provision"))
 	require.NoError(t, err)
 
-	<-callbackReceived
+	awaitRestoreCallback(t, callbackReceived)
 
-	// u2 must reach Ready (the restore SUCCEEDED despite the stateless service).
+	// 22222222-2222-4222-8222-222222222222 must reach Ready (the restore SUCCEEDED despite the stateless service).
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
+		p, ok := b.provisions["22222222-2222-4222-8222-222222222222"]
 		return ok && p.Status == backend.ProvisionStatusReady
 	}, 5*time.Second, 20*time.Millisecond, "mixed-lease restore must reach Ready")
 
-	// The retained record for u1 must be deleted on success.
-	require.Eventually(t, func() bool {
-		e, gerr := rs.Get("u1")
-		return gerr == nil && e == nil
-	}, 5*time.Second, 20*time.Millisecond, "retained record for u1 must be deleted on successful mixed restore")
+	finalizeRestoreRetentionForTest(t, b, rs, "11111111-1111-4111-8111-111111111111")
 
 	mu.Lock()
 	gotRenames := append([]restoreRenameCall(nil), renames...)
 	mu.Unlock()
 
-	// Exactly ONE rename happened: the db volume retained(u1) → canonical(u2).
+	// Exactly ONE rename happened: the db volume retained(11111111-1111-4111-8111-111111111111) → canonical(22222222-2222-4222-8222-222222222222).
 	require.Len(t, gotRenames, 1, "exactly one rename (db) must happen; the stateless web service has no volume")
 	assert.Equal(t, restoreRenameCall{
-		old: retainedName(canonicalVolumeName("u1", "db", 0)),
-		new: canonicalVolumeName("u2", "db", 0),
-	}, gotRenames[0], "the sole rename must adopt the db volume retained(u1) → canonical(u2)")
+		old: retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", "db", 0)),
+		new: canonicalVolumeName("22222222-2222-4222-8222-222222222222", "db", 0),
+	}, gotRenames[0], "the sole rename must adopt the db volume retained(11111111-1111-4111-8111-111111111111) → canonical(22222222-2222-4222-8222-222222222222)")
 
 	// No rename for the web service was ever attempted (no phantom source/target).
 	for _, r := range gotRenames {
@@ -3238,8 +3512,6 @@ func TestRestore_MixedStatefulStatelessLease(t *testing.T) {
 		assert.NotContains(t, r.new, "-web-", "no rename targeting a web-service canonical must be attempted")
 	}
 
-	b.stopCancel()
-	b.wg.Wait()
 }
 
 // TestReconcileRestoring_MixedLease_RollsBackWithoutWedging proves the
@@ -3248,25 +3520,16 @@ func TestRestore_MixedStatefulStatelessLease(t *testing.T) {
 // new lease must re-quarantine ONLY the db volume (driven off RetainedVolumeNames)
 // and successfully revert to active — NOT get stuck in restoring forever. Before
 // the fix, the Items×Quantity derivation tried to rename a non-existent
-// fred-u2-web-0, RenameVolume erred, failed=true, and the record stayed restoring.
+// fred-22222222-2222-4222-8222-222222222222-web-0, RenameVolume erred, failed=true, and the record stayed restoring.
 func TestReconcileRestoring_MixedLease_RollsBackWithoutWedging(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForTest(mock, nil)
 	rs := attachRetentionStore(t, b)
 
-	retainedSet := map[string]bool{retainedName(canonicalVolumeName("u1", "db", 0)): true}
+	retainedSet := map[string]bool{retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", "db", 0)): true}
 
 	var mu sync.Mutex
-	var downProjects []string
 	var renames []restoreRenameCall
-	b.compose = &mockComposeExecutor{
-		DownFn: func(_ context.Context, projectName string, _ time.Duration) error {
-			mu.Lock()
-			downProjects = append(downProjects, projectName)
-			mu.Unlock()
-			return nil
-		},
-	}
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(old, new string) error {
 			mu.Lock()
@@ -3279,43 +3542,43 @@ func TestReconcileRestoring_MixedLease_RollsBackWithoutWedging(t *testing.T) {
 			}
 			return nil
 		},
+		UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
 	}
 
 	e := shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
-		NewLeaseUUID:        "u2",
+		OriginalLeaseUUID:   "11111111-1111-4111-8111-111111111111",
+		NewLeaseUUID:        "22222222-2222-4222-8222-222222222222",
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusRestoring,
 		Generation:          3,
 		Items:               mixedItems(),
-		RetainedVolumeNames: []string{retainedName(canonicalVolumeName("u1", "db", 0))}, // only db
+		StackManifest:       mixedStackManifest(),
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", "db", 0))}, // only db
 	}
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.NoError(t, b.reconcileRestoring(context.Background(), e))
 
 	mu.Lock()
-	gotDown := append([]string(nil), downProjects...)
 	gotRenames := append([]restoreRenameCall(nil), renames...)
 	mu.Unlock()
 
-	// Compose Down ran for the new lease's project.
-	assert.Contains(t, gotDown, composeProjectName("u2"), "compose Down must run for the orphaned restore")
-
-	// Exactly ONE re-quarantine: db canonical(u2) → retained(u1). No web phantom.
+	// Exactly ONE re-quarantine: db canonical(22222222-2222-4222-8222-222222222222) → retained(11111111-1111-4111-8111-111111111111). No web phantom.
 	require.Len(t, gotRenames, 1, "exactly one re-quarantine (db) must happen; web has no volume")
 	assert.Equal(t, restoreRenameCall{
-		old: canonicalVolumeName("u2", "db", 0),
-		new: retainedName(canonicalVolumeName("u1", "db", 0)),
-	}, gotRenames[0], "the sole re-quarantine must move db canonical(u2) → retained(u1)")
+		old: canonicalVolumeName("22222222-2222-4222-8222-222222222222", "db", 0),
+		new: retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", "db", 0)),
+	}, gotRenames[0], "the sole re-quarantine must move db canonical(22222222-2222-4222-8222-222222222222) → retained(11111111-1111-4111-8111-111111111111)")
 
 	// The record must have reverted to active (NOT wedged in restoring), with
 	// Generation bumped and NewLeaseUUID cleared.
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
-	require.NotNil(t, entry, "retention record for u1 must still exist after rollback")
+	require.NotNil(t, entry, "retention record for 11111111-1111-4111-8111-111111111111 must still exist after rollback")
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status, "record must revert to active, NOT stay wedged in restoring")
-	assert.Equal(t, 4, entry.Generation, "generation must be bumped by RevertToActive")
+	assert.Equal(t, e.Generation+1, entry.Generation, "generation must be bumped by RevertToActiveWithResourceProfiles")
 	assert.Empty(t, entry.NewLeaseUUID, "NewLeaseUUID must be cleared after rollback")
 }
 
@@ -3323,11 +3586,9 @@ func TestReconcileRestoring_MixedLease_RollsBackWithoutWedging(t *testing.T) {
 // the Backend and registers a cleanup to close it.
 func attachReleaseStore(t *testing.T, b *Backend) *shared.ReleaseStore {
 	t.Helper()
-	s, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: filepath.Join(t.TempDir(), "releases.db")})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
-	b.releaseStore = s
-	return s
+	attachBoundOperationHandoffStores(t, b)
+	require.NotNil(t, b.releaseStore)
+	return b.releaseStore
 }
 
 // TestRestore_Success_RefreshesResourceMetrics drives a restore to Ready (mirroring
@@ -3346,11 +3607,11 @@ func TestRestore_Success_RefreshesResourceMetrics(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111")
 
 	var mu sync.Mutex
 	var downProjects []string
-	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.compose = happyComposeMock(t, mock, &mu, &downProjects, nil)
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(_, _ string) error { return nil },
 	}
@@ -3372,8 +3633,10 @@ func TestRestore_Success_RefreshesResourceMetrics(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	stopReplay := startRestoreCallbackReplay(t, b)
+	defer stopReplay()
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", server.URL))
+	err := b.Restore(context.Background(), restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", server.URL+"/callbacks/provision"))
 	require.NoError(t, err)
 
 	// The success-path refresh runs synchronously inside Restore (right after the
@@ -3382,133 +3645,111 @@ func TestRestore_Success_RefreshesResourceMetrics(t *testing.T) {
 	assert.InDelta(t, expectedCPURatio, testutil.ToFloat64(resourceCPUAllocatedRatio), 0.0001,
 		"resource gauge must be refreshed on the restore success path (moved off the %v sentinel)", sentinel)
 
-	<-callbackReceived
+	awaitRestoreCallback(t, callbackReceived)
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
+		p, ok := b.provisions["22222222-2222-4222-8222-222222222222"]
 		return ok && p.Status == backend.ProvisionStatusReady
-	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready")
+	}, 5*time.Second, 20*time.Millisecond, "22222222-2222-4222-8222-222222222222 must reach Ready")
 
-	b.stopCancel()
-	b.wg.Wait()
 }
 
-// TestDeprovision_Retain_HydratesNilManifestFromReleaseStore verifies that when a
-// recovered provision carries a nil StackManifest (cold-start recover left it nil),
-// the soft-delete path hydrates it from the release store's latest ACTIVE release
-// before writing the retention record — so the retained data stays API-restorable
-// (Restore rejects nil-manifest records as corrupt).
-func TestDeprovision_Retain_HydratesNilManifestFromReleaseStore(t *testing.T) {
+// TestDeprovision_Retain_PreservesRecoveredManifest verifies that close copies
+// the live projection's already-recovered manifest into durable retention
+// authority. New projections are never admitted without this manifest.
+func TestDeprovision_Retain_PreservesRecoveredManifest(t *testing.T) {
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
 	}
+	stack, err := manifest.ParsePayload([]byte(`{"image":"nginx:1.27"}`))
+	require.NoError(t, err)
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"u1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:     "u1",
+		"11111111-1111-4111-8111-111111111111": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "11111111-1111-4111-8111-111111111111",
 			Tenant:        "tenant-a",
+			ProviderUUID:  nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			Quantity:      1,
 			Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-			StackManifest: nil, // recovered provision: manifest not restored from labels
+			StackManifest: stack,
 		}},
 	})
 
 	b.cfg.RetainOnClose = true
 	rs := attachRetentionStore(t, b)
-	relStore := attachReleaseStore(t, b)
+	seedProvisionReleaseFromProjectionForBackendTest(
+		t, b, "11111111-1111-4111-8111-111111111111",
+	)
 
-	// Seed the latest ACTIVE release whose Manifest parses to a stack. ParsePayload
-	// wraps a legacy flat payload under DefaultServiceName, matching recover.go.
-	require.NoError(t, relStore.Append("u1", shared.Release{
-		Manifest:  []byte(`{"image":"nginx:1.27"}`),
-		Image:     "nginx:1.27",
-		Status:    "active",
-		CreatedAt: time.Now(),
-	}))
+	b.volumes = newVolumeSet(
+		"fred-11111111-1111-4111-8111-111111111111-app-0",
+	).manager()
 
-	b.volumes = &mockVolumeManager{
-		ListFn:         func() ([]string, error) { return []string{"fred-u1-app-0"}, nil },
-		RenameVolumeFn: func(_, _ string) error { return nil },
-		DestroyFn: func(_ context.Context, id string) error {
-			t.Fatalf("Destroy must NOT be called in RetainOnClose=true path, got %q", id)
-			return nil
-		},
-	}
-
-	err := b.Deprovision(context.Background(), "u1")
+	err = b.Deprovision(context.Background(), "11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 
 	var entry *shared.RetentionEntry
 	require.Eventually(t, func() bool {
-		e, gerr := rs.Get("u1")
+		e, gerr := rs.Get("11111111-1111-4111-8111-111111111111")
 		if gerr != nil || e == nil {
 			return false
 		}
 		entry = e
 		return true
-	}, 5*time.Second, 20*time.Millisecond, "retention record for u1 must appear")
+	}, 5*time.Second, 20*time.Millisecond, "retention record for 11111111-1111-4111-8111-111111111111 must appear")
 
-	// The record's manifest must be HYDRATED (non-nil) from the release store.
-	require.NotNil(t, entry.StackManifest, "StackManifest must be hydrated from the release store")
+	// The record's manifest remains complete without consulting a weaker source.
+	require.NotNil(t, entry.StackManifest, "StackManifest must remain durable across close")
 	require.Contains(t, entry.StackManifest.Services, manifest.DefaultServiceName,
-		"hydrated manifest must carry the default service")
+		"retained manifest must carry the default service")
 	assert.Equal(t, "nginx:1.27", entry.StackManifest.Services[manifest.DefaultServiceName].Image,
-		"hydrated manifest must reflect the latest active release image")
+		"retained manifest must preserve the recovered projection image")
 }
 
-// TestDeprovision_Retain_NilManifestNoRelease_StillRetains verifies that when the
-// recovered provision's StackManifest is nil AND there is no release to hydrate
-// from, the soft-delete path STILL writes the retention record (preserving the
-// data for manual recovery) with a nil manifest and without panicking — the warn
-// path. The data must never be destroyed just because it is un-restorable.
-func TestDeprovision_Retain_NilManifestNoRelease_StillRetains(t *testing.T) {
+// TestDeprovision_Retain_RejectsProjectionWithoutDurableCloseAuthority verifies
+// that an intentionally corrupt projection cannot create an unrestorable
+// retention row or mutate its volume. A Ready map entry is only a projection;
+// without a store-issued active Release or cleanup receipt, no close capability
+// can be constructed at all.
+func TestDeprovision_Retain_RejectsProjectionWithoutDurableCloseAuthority(t *testing.T) {
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"u1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:     "u1",
+		"11111111-1111-4111-8111-111111111111": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     "11111111-1111-4111-8111-111111111111",
 			Tenant:        "tenant-a",
+			ProviderUUID:  "prov-1",
 			Status:        backend.ProvisionStatusReady,
 			Quantity:      1,
 			Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-			StackManifest: nil,
+			StackManifest: nil, // Intentional corruption fixture.
 		}},
 	})
 
 	b.cfg.RetainOnClose = true
 	rs := attachRetentionStore(t, b)
-	attachReleaseStore(t, b) // empty: no release to hydrate from
 
+	var renamed bool
 	b.volumes = &mockVolumeManager{
-		ListFn:         func() ([]string, error) { return []string{"fred-u1-app-0"}, nil },
-		RenameVolumeFn: func(_, _ string) error { return nil },
+		ListFn: func() ([]string, error) { return []string{"fred-11111111-1111-4111-8111-111111111111-app-0"}, nil },
+		RenameVolumeFn: func(_, _ string) error {
+			renamed = true
+			return nil
+		},
 		DestroyFn: func(_ context.Context, id string) error {
-			t.Fatalf("Destroy must NOT be called in RetainOnClose=true path, got %q", id)
+			t.Fatalf("Destroy must not run before close authority is durable, got %q", id)
 			return nil
 		},
 	}
 
-	err := b.Deprovision(context.Background(), "u1")
-	require.NoError(t, err)
-
-	var entry *shared.RetentionEntry
-	require.Eventually(t, func() bool {
-		e, gerr := rs.Get("u1")
-		if gerr != nil || e == nil {
-			return false
-		}
-		entry = e
-		return true
-	}, 5*time.Second, 20*time.Millisecond, "retention record for u1 must STILL be written (data preserved)")
-
-	// Data preserved: the record exists with the retained volume tracked.
-	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
-	assert.ElementsMatch(t, []string{"fred-retained-u1-app-0"}, entry.RetainedVolumeNames,
-		"the volume must be retained even though the manifest is nil")
-	// Manifest stays nil (no release to hydrate from) — the warn path, no panic.
-	assert.Nil(t, entry.StackManifest, "manifest stays nil when no release exists to hydrate from")
+	err := b.Deprovision(context.Background(), "11111111-1111-4111-8111-111111111111")
+	require.ErrorIs(t, err, shared.ErrCloseAuthorityMissing)
+	assert.False(t, renamed, "volume must not be renamed before close authority is durable")
+	entry, getErr := rs.Get("11111111-1111-4111-8111-111111111111")
+	require.NoError(t, getErr)
+	assert.Nil(t, entry, "an invalid retention row must not be published")
 }
 
 // TestRestore_AdoptInsufficientResources_RollsBack (G3) verifies that when
@@ -3524,7 +3765,7 @@ func TestRestore_AdoptInsufficientResources_RollsBack(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
-	seedActiveRetained(t, rs, "u1") // docker-small qty=1 → 0.5 CPU, 512 MB, 1024 MB disk
+	retainedBefore := seedActiveRetained(t, rs, "11111111-1111-4111-8111-111111111111") // docker-small qty=1 → 0.5 CPU, 512 MB, 1024 MB disk
 
 	// Rebuild the pool with insufficient CPU headroom (0.1 < 0.5 required by
 	// docker-small). DiskMB is generous (TryAllocateAdopt skips that gate anyway).
@@ -3536,7 +3777,7 @@ func TestRestore_AdoptInsufficientResources_RollsBack(t *testing.T) {
 		RenameVolumeFn: func(_, _ string) error { renameCalled = true; return nil },
 	}
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://localhost/cb"))
+	err := b.Restore(context.Background(), restoreRequest("22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111", "http://localhost/callbacks/provision"))
 
 	// Must surface ErrInsufficientResources.
 	require.Error(t, err)
@@ -3552,20 +3793,20 @@ func TestRestore_AdoptInsufficientResources_RollsBack(t *testing.T) {
 
 	// Provision entry must have been removed by the rollback.
 	b.provisionsMu.RLock()
-	_, has := b.provisions["u2"]
+	_, has := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
 	assert.False(t, has, "provision entry must be removed after TryAllocateAdopt failure rollback")
 
 	// No rename must have happened — adopt only runs after TryAllocateAdopt succeeds.
 	assert.False(t, renameCalled, "no volume rename must occur before TryAllocateAdopt fails")
 
-	// The retained record for u1 must remain active (no claim happened).
-	entry, rerr := rs.Get("u1")
+	// The retained record for 11111111-1111-4111-8111-111111111111 must remain active (no claim happened).
+	entry, rerr := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, rerr)
 	require.NotNil(t, entry, "retained record must remain after TryAllocateAdopt failure")
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status,
-		"retained record must stay active (no ClaimForRestore was attempted)")
-	assert.Equal(t, 1, entry.Generation, "generation must be unchanged (no claim)")
+		"retained record must stay active (no ClaimForRestoreWithAuthority was attempted)")
+	assert.Equal(t, retainedBefore.Generation, entry.Generation, "generation must be unchanged (no claim)")
 }
 
 // TestRestore_MultiVolumePromoteThatFits_Admitted is the ENG-545 / PR #184 review
@@ -3573,7 +3814,7 @@ func TestRestore_AdoptInsufficientResources_RollsBack(t *testing.T) {
 // service into a larger tier must be admitted when the post-restore committed disk
 // fits the pool. The disk gate is on the AGGREGATE promote delta above the retained
 // footprint, not per adopted volume — a per-volume gate double-counted the retained
-// bytes (still in retainedDisk until ClaimForRestore) against the freshly-added
+// bytes (still in retainedDisk until ClaimForRestoreWithAuthority) against the freshly-added
 // allocatedDisk and wrongly rejected a fitting restore for Quantity>1.
 func TestRestore_MultiVolumePromoteThatFits_Admitted(t *testing.T) {
 	mock := &mockDockerClient{
@@ -3582,7 +3823,7 @@ func TestRestore_MultiVolumePromoteThatFits_Admitted(t *testing.T) {
 			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
 		},
 		InspectImageFn: func(_ context.Context, _ string) (*ImageInfo, error) {
-			return &ImageInfo{ID: "img-1", Volumes: map[string]struct{}{"/data": {}}}, nil
+			return &ImageInfo{ID: fixtureImageID("img-1"), Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
@@ -3594,14 +3835,14 @@ func TestRestore_MultiVolumePromoteThatFits_Admitted(t *testing.T) {
 	// disk = 4096 = totalDisk → fits exactly (retainedDisk drops to 0 on claim).
 	b.pool = shared.NewResourcePool(8, 8192, 4096, b.cfg.GetSKUProfile, nil)
 
-	orig := "u1"
+	orig := "11111111-1111-4111-8111-111111111111"
 	rec := shared.RetentionEntry{
 		OriginalLeaseUUID: orig,
 		Tenant:            "tenant-a",
-		ProviderUUID:      "prov-1",
+		ProviderUUID:      nominalDockerProviderUUID,
 		Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}},
 		StackManifest:     restoreStackManifest(),
-		CallbackURL:       "http://localhost/callback",
+		CallbackURL:       "http://localhost/callbacks/provision",
 		RetainedVolumeNames: []string{
 			retainedName(canonicalVolumeName(orig, manifest.DefaultServiceName, 0)),
 			retainedName(canonicalVolumeName(orig, manifest.DefaultServiceName, 1)),
@@ -3610,7 +3851,7 @@ func TestRestore_MultiVolumePromoteThatFits_Admitted(t *testing.T) {
 		Generation: 1,
 		CreatedAt:  time.Now(),
 	}
-	require.NoError(t, rs.Put(rec))
+	require.NoError(t, putRetentionForTest(t, rs, rec))
 	// The retained lease's own footprint (2048) is in the projection at gate time,
 	// exactly as in production — this is what a per-volume gate double-counts.
 	b.refreshRetentionAccounting()
@@ -3618,10 +3859,15 @@ func TestRestore_MultiVolumePromoteThatFits_Admitted(t *testing.T) {
 
 	var mu sync.Mutex
 	var downProjects []string
-	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.compose = happyComposeMock(t, mock, &mu, &downProjects, nil)
+	volumeRoot := t.TempDir()
+	b.cfg.VolumeDataPath = volumeRoot
 	b.volumes = &mockVolumeManager{
-		defaultDir:     t.TempDir(),
-		CreateFn:       func(_ context.Context, _ string, _ int64) (string, bool, error) { return t.TempDir(), true, nil },
+		defaultDir: volumeRoot,
+		CreateFn: func(_ context.Context, name string, _ int64) (string, bool, error) {
+			path := filepath.Join(volumeRoot, name)
+			return path, true, os.MkdirAll(path, 0o755)
+		},
 		RenameVolumeFn: func(_, _ string) error { return nil },
 	}
 
@@ -3635,8 +3881,10 @@ func TestRestore_MultiVolumePromoteThatFits_Admitted(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	stopReplay := startRestoreCallbackReplay(t, b)
+	defer stopReplay()
 
-	req := restoreRequest("u2", orig, server.URL)
+	req := restoreRequest("22222222-2222-4222-8222-222222222222", orig, server.URL+"/callbacks/provision")
 	req.Items = []backend.LeaseItem{{SKU: "docker-medium", Quantity: 2, ServiceName: manifest.DefaultServiceName}}
 
 	// Admission is synchronous; before the aggregate-delta fix this returned
@@ -3649,17 +3897,17 @@ func TestRestore_MultiVolumePromoteThatFits_Admitted(t *testing.T) {
 	// The async worker adopts both retained volumes and brings the stack up; it
 	// must reach Ready — proving the fix both admits the promote AND lets the
 	// multi-volume restore complete end-to-end.
-	<-callbackReceived
+	awaitRestoreCallback(t, callbackReceived)
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
+		p, ok := b.provisions["22222222-2222-4222-8222-222222222222"]
 		return ok && p.Status == backend.ProvisionStatusReady
-	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready after admission")
+	}, 5*time.Second, 20*time.Millisecond, "22222222-2222-4222-8222-222222222222 must reach Ready after admission")
 }
 
 // TestRollback_RevertStoreError_KeepsLiveCounted verifies make-before-break: when
-// RevertToActive returns a STORE ERROR during rollback, the live allocation is NOT
+// RevertToActiveWithResourceProfiles returns a STORE ERROR during rollback, the live allocation is NOT
 // released (F stays counted as live, no under-count), the leak counter increments,
 // and reconcileRestoring later releases it after a successful revert. ENG-376 site 4.
 func TestRollback_RevertStoreError_KeepsLiveCounted(t *testing.T) {
@@ -3668,30 +3916,38 @@ func TestRollback_RevertStoreError_KeepsLiveCounted(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 	withMicroSKU(b, 1024)
 	rs := attachRetentionStore(t, b)
+	originalLease := canonicalRetentionFixtureUUID("orig")
+	destinationLease := canonicalRetentionFixtureUUID("new")
 
 	// A restoring record + a live allocation for the new lease (qty 1 → 1024 MB).
-	rec := retentionEntryFixture("orig", "t1", time.Now())
+	rec := retentionEntryFixture(originalLease, "t1", time.Now())
 	rec.Items = []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}
+	rec.StackManifest = retentionFixtureStackManifest(rec.Items)
+	rec.RetainedVolumeNames = []string{retainedName(canonicalVolumeName(originalLease, "app", 0))}
 	rec.Status = shared.RetentionStatusRestoring
-	rec.NewLeaseUUID = "new"
+	rec.NewLeaseUUID = destinationLease
 	rec.Generation = 2
-	require.NoError(t, rs.Put(rec))
+	rec = *putRestoringRetention(t, rs, rec)
 	// oldRetained from b.cfg (withMicroSKU set docker-micro=1024); the pool computes
 	// new from its own resolver, so delta <= 0 and the adopt is admitted.
-	require.NoError(t, b.pool.TryAllocateAdoptAll([]shared.AdoptInstance{{ID: "new-app-0", SKU: "docker-micro"}}, "t1", 1024))
+	allocationID := destinationLease + "-app-0"
+	require.NoError(t, b.pool.TryAllocateAdoptAll([]shared.AdoptInstance{{ID: allocationID, SKU: "docker-micro"}}, "t1", 1024))
 
-	b.volumes = &mockVolumeManager{RenameVolumeFn: func(_, _ string) error { return nil }} // re-quarantine succeeds
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { return nil }, // re-quarantine succeeds
+		UsageFn:        func(context.Context, string) (int64, error) { return 0, nil },
+	}
 
 	// Capture the live footprint AFTER allocation but BEFORE forcing the revert error.
 	// (Assert against this delta, not a literal MB — the pool sizes the live allocation
 	// from its own SKU profiles, which differ from b.cfg.GetSKUProfile's withMicroSKU view.)
 	allocBefore := b.pool.Stats().AllocatedDiskMB
 	require.Greater(t, allocBefore, int64(0), "sanity: live allocation is counted")
-	require.NoError(t, rs.Close()) // force RevertToActive to ERROR
+	require.NoError(t, rs.Close()) // force RevertToActiveWithResourceProfiles to ERROR
 
-	allocated := []string{"new-app-0"}
+	allocated := []string{allocationID}
 	recCopy := rec
-	b.rollbackRestoreAdoption(context.Background(), "new", allocated, &recCopy, true, b.logger)
+	b.rollbackRestoreAdoption(context.Background(), destinationLease, allocated, &recCopy, true, b.logger)
 
 	// Live allocation NOT released on a revert store-error → still counted (no under-count).
 	assert.Equal(t, allocBefore, b.pool.Stats().AllocatedDiskMB, "live stays counted on revert store-error")
@@ -3700,31 +3956,6 @@ func TestRollback_RevertStoreError_KeepsLiveCounted(t *testing.T) {
 
 // TestStatusAudit_Cleanup_DoesNotProtectReapingCanonical ensures a reaping record's
 // canonical volume is NOT added to the orphan-cleanup protected set (it must be reaped).
-func TestStatusAudit_Cleanup_DoesNotProtectReapingCanonical(t *testing.T) {
-	mock := &mockDockerClient{}
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
-	rs := attachRetentionStore(t, b)
-
-	reaping := retentionEntryFixture("lease-r", "t1", time.Now())
-	reaping.Status = shared.RetentionStatusReaping
-	reaping.RetainedVolumeNames = []string{"fred-retained-lease-r-app-0"}
-	require.NoError(t, rs.Put(reaping))
-
-	var destroyed []string
-	b.volumes = &mockVolumeManager{
-		ListFn:    func() ([]string, error) { return []string{"fred-lease-r-app-0"}, nil }, // a stray CANONICAL
-		DestroyFn: func(_ context.Context, id string) error { destroyed = append(destroyed, id); return nil },
-	}
-
-	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
-	assert.Contains(t, destroyed, "fred-lease-r-app-0", "reaping canonical must NOT be protected from orphan cleanup")
-}
-
-// putActiveAt writes a minimal ACTIVE retention record with a controlled
-// CreatedAt, for eviction-order tests. RetainedVolumeNames is empty, so a
-// successful eviction deletes the record outright (assert Get → nil).
-// putActiveAt seeds a default-bucket (partition "") active retained record.
-// Delegates to putActivePart so the two helpers cannot drift.
 func putActiveAt(t *testing.T, rs *shared.RetentionStore, uuid, tenant string, createdAt time.Time) {
 	t.Helper()
 	putActivePart(t, rs, uuid, tenant, "", createdAt)
@@ -3733,11 +3964,14 @@ func putActiveAt(t *testing.T, rs *shared.RetentionStore, uuid, tenant string, c
 // putActivePart seeds an active retained record carrying the given partition.
 func putActivePart(t *testing.T, rs *shared.RetentionStore, uuid, tenant, partition string, createdAt time.Time) {
 	t.Helper()
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   uuid,
-		Tenant:              tenant,
-		ProviderUUID:        "prov-1",
-		Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
+		OriginalLeaseUUID: uuid,
+		Tenant:            tenant,
+		ProviderUUID:      "prov-1",
+		Items:             []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+		ResourceProfiles: []shared.SKUResourceSnapshot{{
+			SKU: "docker-micro", CPUCores: 1, MemoryMB: 256, DiskMB: 512,
+		}},
 		StackManifest:       restoreStackManifest(),
 		RetainedVolumeNames: []string{},
 		Status:              shared.RetentionStatusActive,
@@ -3746,37 +3980,40 @@ func putActivePart(t *testing.T, rs *shared.RetentionStore, uuid, tenant, partit
 	}))
 }
 
-// putRestoringPart stores a RESTORING record — same as putActivePart but with
-// the restoring status, for pinning gauges/bounds whose scope is ACTIVE+RESTORING.
+// putRestoringPart claims a RESTORING record through the production transition
+// for pinning gauges/bounds whose scope is ACTIVE+RESTORING.
 func putRestoringPart(t *testing.T, rs *shared.RetentionStore, uuid, tenant, partition string, createdAt time.Time) {
 	t.Helper()
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   uuid,
-		Tenant:              tenant,
-		ProviderUUID:        "prov-1",
-		Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+	putRestoringRetention(t, rs, shared.RetentionEntry{
+		OriginalLeaseUUID: uuid,
+		Tenant:            tenant,
+		ProviderUUID:      "prov-1",
+		Items:             []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+		ResourceProfiles: []shared.SKUResourceSnapshot{{
+			SKU: "docker-micro", CPUCores: 1, MemoryMB: 256, DiskMB: 1024,
+		}},
 		StackManifest:       restoreStackManifest(),
 		RetainedVolumeNames: []string{},
 		Status:              shared.RetentionStatusRestoring,
 		Partition:           partition,
 		CreatedAt:           createdAt,
-	}))
+	})
 }
 
 // statusOf returns the stored status of a retention record, failing if absent.
 func statusOf(t *testing.T, rs *shared.RetentionStore, uuid string) string {
 	t.Helper()
-	rec, err := rs.Get(uuid)
+	rec, err := rs.Get(canonicalRetentionFixtureUUID(uuid))
 	require.NoError(t, err)
 	require.NotNil(t, rec)
 	return rec.Status
 }
 
-// retentionTenantSnapshot is the caller-supplied ListByTenant snapshot the
+// retentionTenantSnapshot is the caller-supplied exact Active snapshot the
 // two-level evictRetentionsToCap consumes (it no longer re-reads the store).
-func retentionTenantSnapshot(t *testing.T, rs *shared.RetentionStore, tenant string) []shared.RetentionEntry {
+func retentionTenantSnapshot(t *testing.T, rs *shared.RetentionStore, tenant string) []shared.ActiveRetentionCandidate {
 	t.Helper()
-	snap, err := rs.ListByTenant(tenant)
+	snap, err := rs.ListActiveCandidatesByTenant(tenant)
 	require.NoError(t, err)
 	return snap
 }
@@ -3797,7 +4034,8 @@ func TestEvictRetentionsToCap_OldestFirstMultiCandidate(t *testing.T) {
 	for _, gone := range []string{"aaaaaaaa-0000-0000-0000-000000000001", "aaaaaaaa-0000-0000-0000-000000000002"} {
 		rec, err := rs.Get(gone)
 		require.NoError(t, err)
-		require.Nil(t, rec, "%s should be evicted+deleted (oldest-first)", gone)
+		require.NotNil(t, rec)
+		require.Equal(t, shared.RetentionStatusReaping, rec.Status, "%s should be handed to the reaper (oldest-first)", gone)
 	}
 	newest, err := rs.Get("aaaaaaaa-0000-0000-0000-000000000003")
 	require.NoError(t, err)
@@ -3805,43 +4043,15 @@ func TestEvictRetentionsToCap_OldestFirstMultiCandidate(t *testing.T) {
 	require.Equal(t, shared.RetentionStatusActive, newest.Status, "newest must survive")
 }
 
-// TestEvictRetentionsToCap_EqualCreatedAtUUIDTiebreak pins the total order:
-// equal CreatedAt breaks ties by ascending OriginalLeaseUUID. Five equal-age
-// records with maxPerTenant=2 evict 5-2+1 = 4 (lowest UUIDs ...001..004), so
-// only the highest UUID ...005 survives. This guard is probabilistic against an
-// unstable-sort regression by nature (map order is random) — five candidates
-// drop a CreatedAt-only regression's escape probability to ~1/5 per run, and
-// any wrong survivor fails loudly.
-func TestEvictRetentionsToCap_EqualCreatedAtUUIDTiebreak(t *testing.T) {
-	b, rs := newBackendWithRetention(t)
-	same := time.Now().Add(-time.Hour).Truncate(time.Second)
-	// Insert in shuffled order so a pass cannot rely on insertion order.
-	for _, suffix := range []string{"000000000003", "000000000001", "000000000005", "000000000002", "000000000004"} {
-		putActiveAt(t, rs, "bbbbbbbb-0000-0000-0000-"+suffix, "tenant-a", same)
-	}
-
-	require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", retentionBudget{CountCap: 2}, "", retentionTenantSnapshot(t, rs, "tenant-a"), ""))
-
-	for _, suffix := range []string{"000000000001", "000000000002", "000000000003", "000000000004"} {
-		uuid := "bbbbbbbb-0000-0000-0000-" + suffix
-		rec, err := rs.Get(uuid)
-		require.NoError(t, err)
-		require.Nil(t, rec, "%s should be evicted+deleted (lower UUID, equal age)", uuid)
-	}
-	high, err := rs.Get("bbbbbbbb-0000-0000-0000-000000000005")
-	require.NoError(t, err)
-	require.NotNil(t, high, "highest UUID must survive")
-	require.Equal(t, shared.RetentionStatusActive, high.Status)
-}
-
 // TestEvictRetentionsToCap_TwoLevel exercises the L2 (per-partition) then L1
 // (per-tenant aggregate) passes and the between-pass snapshot prune.
 func TestEvictRetentionsToCap_TwoLevel(t *testing.T) {
-	requireGone := func(t *testing.T, rs *shared.RetentionStore, uuid string) {
+	requireReaping := func(t *testing.T, rs *shared.RetentionStore, uuid string) {
 		t.Helper()
-		rec, err := rs.Get(uuid)
+		rec, err := rs.Get(canonicalRetentionFixtureUUID(uuid))
 		require.NoError(t, err)
-		require.Nil(t, rec, "%s must be evicted+deleted", uuid)
+		require.NotNil(t, rec)
+		require.Equal(t, shared.RetentionStatusReaping, rec.Status, "%s must be handed to the reaper", uuid)
 	}
 
 	t.Run("(c) partition at sub-cap evicts inside the partition only", func(t *testing.T) {
@@ -3855,7 +4065,7 @@ func TestEvictRetentionsToCap_TwoLevel(t *testing.T) {
 		budget := retentionBudget{CountCap: 200, DiskCapMB: 500000, MaxPartitions: 64, PerPartCount: 2}
 		require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", budget, "P", retentionTenantSnapshot(t, rs, "tenant-a"), ""))
 
-		requireGone(t, rs, "p-old")
+		requireReaping(t, rs, "p-old")
 		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "p-new"))
 		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "q-old"),
 			"other partitions untouched despite being globally oldest")
@@ -3873,7 +4083,7 @@ func TestEvictRetentionsToCap_TwoLevel(t *testing.T) {
 		budget := retentionBudget{CountCap: 3, DiskCapMB: 500000, MaxPartitions: 64, PerPartCount: 5}
 		require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", budget, "P4", retentionTenantSnapshot(t, rs, "tenant-a"), ""))
 
-		requireGone(t, rs, "x-1")
+		requireReaping(t, rs, "x-1")
 		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "x-2"))
 		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "x-3"),
 			"a new partition never mints aggregate room (I1)")
@@ -3890,8 +4100,8 @@ func TestEvictRetentionsToCap_TwoLevel(t *testing.T) {
 		budget := retentionBudget{CountCap: 3, DiskCapMB: 500000, MaxPartitions: 64, PerPartCount: 2}
 		require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", budget, "P", retentionTenantSnapshot(t, rs, "tenant-a"), ""))
 
-		requireGone(t, rs, "y-1") // L2 victim (partition P, keep 1)
-		requireGone(t, rs, "y-3") // L1 victim (globally oldest of the pruned set)
+		requireReaping(t, rs, "y-1") // L2 victim (partition P, keep 1)
+		requireReaping(t, rs, "y-3") // L1 victim (globally oldest of the pruned set)
 		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "y-4"),
 			"y-4 surviving proves the between-pass prune — without it L1's toEvict would be 2 and y-4 would die")
 		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "y-2"))
@@ -3979,22 +4189,22 @@ func TestPartitionMetricSplit(t *testing.T) {
 // The orphaned arm's compose Down used to be advisory — its error was logged and
 // execution continued, so fred re-quarantined the volumes, reverted the record and
 // DROPPED the provision while the containers were possibly still running. From that
-// point nothing could reach them: processOrphan only walks ListProvisions (which
-// ranges b.provisions, the map just deleted from) and cleanupOrphanedVolumes
-// enumerates fred's bind-mount tree, never Docker's anonymous-volume store.
+// point no durable recovery owner could reach them: processOrphan only walks
+// ListProvisions (which ranges b.provisions, the map just deleted from), while
+// Docker's anonymous-volume store is outside the managed bind-mount inventory.
 // ---------------------------------------------------------------------------
 
-// restoringEntryFixture is the shape every test below reconciles: original lease u1
-// soft-deleted, its data adopted into new lease u2 by a restore that then crashed.
+// restoringEntryFixture is the shape every test below reconciles: original lease 11111111-1111-4111-8111-111111111111
+// soft-deleted, its data adopted into new lease 22222222-2222-4222-8222-222222222222 by a restore that then crashed.
 func restoringEntryFixture() shared.RetentionEntry {
 	return shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
-		NewLeaseUUID:        "u2",
+		OriginalLeaseUUID:   "11111111-1111-4111-8111-111111111111",
+		NewLeaseUUID:        "22222222-2222-4222-8222-222222222222",
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusRestoring,
 		Generation:          3,
 		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		RetainedVolumeNames: []string{retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0))},
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0))},
 	}
 }
 
@@ -4003,23 +4213,22 @@ func restoringEntryFixture() shared.RetentionEntry {
 // in. That emptiness is the whole reason the teardown re-discovers by label.
 func failedRestoreProvision() map[string]*provision {
 	return map[string]*provision{
-		"u2": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u2",
+		"22222222-2222-4222-8222-222222222222": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "22222222-2222-4222-8222-222222222222",
 			Status:    backend.ProvisionStatusFailed,
 			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
 		}},
 	}
 }
 
-// TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback: when compose Down
-// fails but the per-container fallback finishes the job, the rollback proceeds exactly
-// as if Down had worked. The containers are found by fred label, which is the only way
-// to find them at all here — the provision names none.
+// TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback preserves the
+// historical fallback contract through exact captured cleanup. Containers are
+// discovered by the failed receipt's labels; the provision names none.
 func TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback(t *testing.T) {
 	var removed []string
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{managedContainer("c-restore-0", "u2")}, nil
+			return []ContainerInfo{managedContainer("c-restore-0", "22222222-2222-4222-8222-222222222222")}, nil
 		},
 		RemoveContainerFn: func(_ context.Context, id string) error {
 			removed = append(removed, id)
@@ -4028,7 +4237,7 @@ func TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback(t *testin
 	}
 	b := newBackendForTest(mock, failedRestoreProvision())
 	rs := attachRetentionStore(t, b)
-	b.compose = failingDown()
+	bindRetentionOrphanPrunerForTest(t, b)
 
 	var renames [][2]string
 	b.volumes = &mockVolumeManager{
@@ -4036,28 +4245,32 @@ func TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback(t *testin
 			renames = append(renames, [2]string{old, new})
 			return nil
 		},
+		UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
 	}
 
 	e := restoringEntryFixture()
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	attempts := bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.NoError(t, b.reconcileRestoring(context.Background(), e))
+	assert.Equal(t, []string{"c-restore-0"}, attempts())
 
 	assert.Equal(t, []string{"c-restore-0"}, removed,
-		"the fallback must reap the crashed restore's containers, which the provision does not name")
+		"exact captured cleanup must reap the crashed restore's containers, which the provision does not name")
 	assert.Equal(t, [][2]string{{
-		canonicalVolumeName("u2", manifest.DefaultServiceName, 0),
-		retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0)),
+		canonicalVolumeName("22222222-2222-4222-8222-222222222222", manifest.DefaultServiceName, 0),
+		retainedName(canonicalVolumeName("11111111-1111-4111-8111-111111111111", manifest.DefaultServiceName, 0)),
 	}}, renames, "re-quarantine proceeds once the containers are confirmed gone")
 
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status, "the rollback completed")
-	assert.Equal(t, 4, entry.Generation)
+	assert.Equal(t, e.Generation+1, entry.Generation)
 
 	b.provisionsMu.RLock()
-	_, hasU2 := b.provisions["u2"]
+	_, hasU2 := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
 	assert.False(t, hasU2, "the provision is dropped only because teardown actually succeeded")
 }
@@ -4072,7 +4285,7 @@ func TestReconcileRestoring_TeardownFails_LeavesRecordRestoring(t *testing.T) {
 
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{managedContainer("c-stuck", "u2")}, nil
+			return []ContainerInfo{managedContainer("c-stuck", "22222222-2222-4222-8222-222222222222")}, nil
 		},
 		RemoveContainerFn: func(_ context.Context, _ string) error {
 			return errors.New("device or resource busy")
@@ -4080,26 +4293,28 @@ func TestReconcileRestoring_TeardownFails_LeavesRecordRestoring(t *testing.T) {
 	}
 	b := newBackendForTest(mock, failedRestoreProvision())
 	rs := attachRetentionStore(t, b)
-	b.compose = failingDown()
 
 	// The restore's live allocation, which the rollback would normally hand back.
-	require.NoError(t, b.pool.TryAllocate("u2-"+manifest.DefaultServiceName+"-0", "docker-small", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate("22222222-2222-4222-8222-222222222222-"+manifest.DefaultServiceName+"-0", "docker-small", "tenant-a"))
 	allocBefore := b.pool.Stats().AllocationCount
 
 	e := restoringEntryFixture()
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	attempts := bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.ErrorContains(t, b.reconcileRestoring(context.Background(), e), "device or resource busy")
+	assert.Equal(t, []string{"c-stuck"}, attempts(), "the exact removal failure must cause the retained source and allocation")
 
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status,
 		"the record must stay restoring so a later sweep retries the rollback")
-	assert.Equal(t, 3, entry.Generation, "RevertToActive's CAS bump must NOT have fired")
+	assert.Equal(t, e.Generation, entry.Generation, "RevertToActiveWithResourceProfiles' CAS bump must NOT have fired")
 
 	b.provisionsMu.RLock()
-	_, hasU2 := b.provisions["u2"]
+	_, hasU2 := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
 	assert.True(t, hasU2,
 		"the provision must stay tracked — dropping it puts the surviving containers beyond "+
@@ -4120,7 +4335,7 @@ func TestReconcileRestoring_TeardownFails_LeavesRecordRestoring(t *testing.T) {
 func TestReconcileRestoring_TeardownFails_DoesNotRequarantine(t *testing.T) {
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{managedContainer("c-stuck", "u2")}, nil
+			return []ContainerInfo{managedContainer("c-stuck", "22222222-2222-4222-8222-222222222222")}, nil
 		},
 		RemoveContainerFn: func(_ context.Context, _ string) error {
 			return errors.New("device or resource busy")
@@ -4128,7 +4343,7 @@ func TestReconcileRestoring_TeardownFails_DoesNotRequarantine(t *testing.T) {
 	}
 	b := newBackendForTest(mock, failedRestoreProvision())
 	rs := attachRetentionStore(t, b)
-	b.compose = failingDown()
+	bindRetentionOrphanPrunerForTest(t, b)
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(old, new string) error {
 			t.Errorf("must not re-quarantine while a container may still hold the volume: %q -> %q", old, new)
@@ -4137,15 +4352,17 @@ func TestReconcileRestoring_TeardownFails_DoesNotRequarantine(t *testing.T) {
 	}
 
 	e := restoringEntryFixture()
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	attempts := bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.ErrorContains(t, b.reconcileRestoring(context.Background(), e), "device or resource busy")
+	assert.Equal(t, []string{"c-stuck"}, attempts(), "the exact removal failure must cause the retained source and allocation")
 }
 
 // TestReconcileRestoring_TeardownDiscoveryFails_LeavesRecordRestoring: an unreadable
 // daemon is not evidence of a clean host, so it must be treated exactly like a stuck
-// container. RemoveContainerFn is left nil so the mock panics if anything is removed
-// off a listing that could not be read.
+// container. The fixture forbids removal from an inventory that could not be read.
 func TestReconcileRestoring_TeardownDiscoveryFails_LeavesRecordRestoring(t *testing.T) {
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
@@ -4154,21 +4371,23 @@ func TestReconcileRestoring_TeardownDiscoveryFails_LeavesRecordRestoring(t *test
 	}
 	b := newBackendForTest(mock, failedRestoreProvision())
 	rs := attachRetentionStore(t, b)
-	b.compose = failingDown()
 
 	e := restoringEntryFixture()
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	attempts := bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.ErrorContains(t, b.reconcileRestoring(context.Background(), e), "daemon unreachable")
+	assert.Empty(t, attempts(), "an unreadable inventory cannot authorize removal")
 
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status)
-	assert.Equal(t, 3, entry.Generation)
+	assert.Equal(t, e.Generation, entry.Generation)
 
 	b.provisionsMu.RLock()
-	_, hasU2 := b.provisions["u2"]
+	_, hasU2 := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
 	assert.True(t, hasU2, "an unprovable host state must keep the lease tracked")
 }
@@ -4176,7 +4395,7 @@ func TestReconcileRestoring_TeardownDiscoveryFails_LeavesRecordRestoring(t *test
 // TestReconcileRestoring_TeardownFails_ThenSucceeds_RestoreStaysClaimable is the
 // retryability pin: parking the data must be a DELAY, never a loss.
 //
-// Leaving the record restoring blocks ClaimForRestore (ErrNotRestorable), so the
+// Leaving the record restoring blocks ClaimForRestoreWithAuthority (ErrNotRestorable), so the
 // tenant cannot retry until the rollback completes. This drives the real retry loop —
 // runRetentionSweep, the same body the periodic reaper runs — across a broken daemon
 // and a recovered one, and ends by proving the restore is claimable again.
@@ -4184,10 +4403,7 @@ func TestReconcileRestoring_TeardownFails_ThenSucceeds_RestoreStaysClaimable(t *
 	removalWorks := false
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
-			if removalWorks {
-				return nil, nil // compose's own teardown finally took effect
-			}
-			return []ContainerInfo{managedContainer("c-stuck", "u2")}, nil
+			return []ContainerInfo{managedContainer("c-stuck", "22222222-2222-4222-8222-222222222222")}, nil
 		},
 		RemoveContainerFn: func(_ context.Context, _ string) error {
 			if removalWorks {
@@ -4198,37 +4414,52 @@ func TestReconcileRestoring_TeardownFails_ThenSucceeds_RestoreStaysClaimable(t *
 	}
 	b := newBackendForTest(mock, failedRestoreProvision())
 	rs := attachRetentionStore(t, b)
-	b.compose = failingDown()
-	b.volumes = &mockVolumeManager{RenameVolumeFn: func(_, _ string) error { return nil }}
+	bindRetentionOrphanPrunerForTest(t, b)
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { return nil },
+		UsageFn:        func(context.Context, string) (int64, error) { return 0, nil },
+	}
 
 	e := restoringEntryFixture()
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	attempts := bindExactRestoreCleanupFixture(t, b, e)
 
 	// Sweep 1: daemon is broken. The rollback must not half-complete.
-	require.NoError(t, b.runRetentionSweep(context.Background()))
-	entry, err := rs.Get("u1")
+	require.ErrorContains(t, b.runRetentionSweep(context.Background()), "device or resource busy")
+	assert.Equal(t, []string{"c-stuck"}, attempts())
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry, "the record must survive — it is the only pointer to the data")
 	require.Equal(t, shared.RetentionStatusRestoring, entry.Status)
-	_, claimErr := rs.ClaimForRestore("u1", "u3", 0)
-	require.ErrorIs(t, claimErr, shared.ErrNotRestorable,
-		"while parked the restore is blocked — this is the cost the posture accepts")
+	activeCandidates, err := rs.ListActiveCandidates()
+	require.NoError(t, err)
+	for _, candidate := range activeCandidates {
+		require.NotEqual(t, e.OriginalLeaseUUID, candidate.Entry().OriginalLeaseUUID,
+			"a restoring finalizer must not expose source authority to restore admission")
+	}
 
 	// Sweep 2: daemon recovered. The retry finishes the rollback it deferred.
 	removalWorks = true
 	require.NoError(t, b.runRetentionSweep(context.Background()))
+	assert.Equal(t, []string{"c-stuck", "c-stuck"}, attempts(), "the retry must actually remove the previously busy exact target")
 
-	entry, err = rs.Get("u1")
+	entry, err = rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	require.Equal(t, shared.RetentionStatusActive, entry.Status, "the deferred rollback completed on retry")
-	assert.Equal(t, 4, entry.Generation)
+	assert.Equal(t, e.Generation+1, entry.Generation)
 
 	// The point of all of it: the data is restorable again.
-	claimed, err := rs.ClaimForRestore("u1", "u3", 0)
+	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
+	claimed, err := claimRetentionForTest(t, rs,
+		"11111111-1111-4111-8111-111111111111", "33333333-3333-4333-8333-333333333333", 0,
+		e.Items, testResourceProfiles(t, e.Items),
+		operationID, callbackURL, lifecycleCallbackURL,
+	)
 	require.NoError(t, err, "a crashed restore must never cost the tenant the ability to restore")
 	require.NotNil(t, claimed)
-	assert.Equal(t, "u3", claimed.NewLeaseUUID)
+	assert.Equal(t, "33333333-3333-4333-8333-333333333333", claimed.NewLeaseUUID)
 }
 
 // TestReconcileRestoring_TeardownFails_RecordNotReapable pins what makes the wait
@@ -4239,13 +4470,12 @@ func TestReconcileRestoring_TeardownFails_ThenSucceeds_RestoreStaysClaimable(t *
 func TestReconcileRestoring_TeardownFails_RecordNotReapable(t *testing.T) {
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{managedContainer("c-stuck", "u2")}, nil
+			return []ContainerInfo{managedContainer("c-stuck", "22222222-2222-4222-8222-222222222222")}, nil
 		},
 		RemoveContainerFn: func(_ context.Context, _ string) error { return errors.New("busy") },
 	}
 	b := newBackendForTest(mock, failedRestoreProvision())
 	rs := attachRetentionStore(t, b)
-	b.compose = failingDown()
 	b.cfg.RetentionMaxAge = time.Nanosecond // everything is expired
 	b.volumes = &mockVolumeManager{
 		DestroyFn: func(_ context.Context, id string) error {
@@ -4256,15 +4486,18 @@ func TestReconcileRestoring_TeardownFails_RecordNotReapable(t *testing.T) {
 
 	e := restoringEntryFixture()
 	e.CreatedAt = time.Now().Add(-100 * 24 * time.Hour)
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	recordRestoreOperationOutcome(t, b, e, backend.CallbackStatusFailed)
+	attempts := bindExactRestoreCleanupFixture(t, b, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	require.ErrorContains(t, b.reconcileRestoring(context.Background(), e), "busy")
+	assert.Equal(t, []string{"c-stuck"}, attempts(), "the exact removal failure must cause the retained source and allocation")
 
 	n, err := b.reapExpiredRetentions(context.Background())
 	require.NoError(t, err)
 	assert.Zero(t, n, "a restoring record is not an expiry candidate")
 
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry, "the record — and the data it names — must survive the reaper")
 	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status)
@@ -4280,7 +4513,7 @@ func TestRollbackRestoreAdoption_TeardownFails_LeavesRecordRestoring(t *testing.
 
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{managedContainer("c-stuck", "u2")}, nil
+			return []ContainerInfo{managedContainer("c-stuck", "22222222-2222-4222-8222-222222222222")}, nil
 		},
 		RemoveContainerFn: func(_ context.Context, _ string) error { return errors.New("busy") },
 	}
@@ -4294,26 +4527,26 @@ func TestRollbackRestoreAdoption_TeardownFails_LeavesRecordRestoring(t *testing.
 		},
 	}
 
-	allocID := "u2-" + manifest.DefaultServiceName + "-0"
+	allocID := "22222222-2222-4222-8222-222222222222-" + manifest.DefaultServiceName + "-0"
 	require.NoError(t, b.pool.TryAllocate(allocID, "docker-small", "tenant-a"))
 
 	e := restoringEntryFixture()
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
 
-	b.rollbackRestoreAdoption(context.Background(), "u2", []string{allocID}, &e, false, b.logger)
+	b.rollbackRestoreAdoption(context.Background(), "22222222-2222-4222-8222-222222222222", []string{allocID}, &e, false, b.logger)
 
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status,
 		"the reconcile sweep must retry this rollback rather than inherit a half-done one")
-	assert.Equal(t, 3, entry.Generation)
+	assert.Equal(t, e.Generation, entry.Generation)
 
 	assert.Equal(t, 1, b.pool.Stats().AllocationCount,
 		"live capacity stays counted while the containers holding it may still be running")
 
 	b.provisionsMu.RLock()
-	_, hasU2 := b.provisions["u2"]
+	_, hasU2 := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
 	assert.True(t, hasU2, "the provision stays so the actor can still author the failure callback")
 
@@ -4345,32 +4578,35 @@ func TestRollbackRestoreAdoption_PreludeFailure_TeardownErrorDoesNotWedge(t *tes
 		},
 	}
 	b := newBackendForTest(mock, map[string]*provision{
-		"u2": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u2",
+		"22222222-2222-4222-8222-222222222222": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "22222222-2222-4222-8222-222222222222",
 			Status:    backend.ProvisionStatusProvisioning, // the prelude's reservation
 		}},
 	})
 	rs := attachRetentionStore(t, b)
 	b.compose = failingDown()
-	b.volumes = &mockVolumeManager{RenameVolumeFn: func(_, _ string) error { return nil }}
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { return nil },
+		UsageFn:        func(context.Context, string) (int64, error) { return 0, nil },
+	}
 
-	allocID := "u2-" + manifest.DefaultServiceName + "-0"
+	allocID := "22222222-2222-4222-8222-222222222222-" + manifest.DefaultServiceName + "-0"
 	require.NoError(t, b.pool.TryAllocate(allocID, "docker-small", "tenant-a"))
 
 	e := restoringEntryFixture()
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
 
-	b.rollbackRestoreAdoption(context.Background(), "u2", []string{allocID}, &e, true, b.logger)
+	b.rollbackRestoreAdoption(context.Background(), "22222222-2222-4222-8222-222222222222", []string{allocID}, &e, true, b.logger)
 
-	entry, err := rs.Get("u1")
+	entry, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusActive, entry.Status,
 		"a prelude rollback must complete even when the daemon is unreachable — no compose Up ran")
-	assert.Equal(t, 4, entry.Generation)
+	assert.Equal(t, e.Generation+1, entry.Generation)
 
 	b.provisionsMu.RLock()
-	_, hasU2 := b.provisions["u2"]
+	_, hasU2 := b.provisions["22222222-2222-4222-8222-222222222222"]
 	b.provisionsMu.RUnlock()
 	assert.False(t, hasU2,
 		"the reservation must be dropped, or reconcileRestoring's in-flight guard defers on it forever")

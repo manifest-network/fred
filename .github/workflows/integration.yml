@@ -11,22 +11,10 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
-      - "internal/backend/docker/**"
-      - "internal/backend/shared/**"
-      # integration_reconciler_test.go drives a real provisioner.Reconciler
-      # against a real Docker backend, so a reconciler change can break this
-      # suite while touching nothing under internal/backend/. Without this
-      # entry those tests only ran nightly — i.e. never on the PR that broke
-      # them, which is the ENG-330 rot mode this workflow exists to prevent.
-      - "internal/provisioner/**"
-      # cmd/k3s-backend/integration_test.go execs the real k3s-backend
-      # binary, which is built from internal/backend/k3s — so a change
-      # confined to that package can break this suite while matching no
-      # other entry here. Same ENG-330 rot mode as the reconciler note
-      # above (found while removing that package's test-only hooks,
-      # ENG-765).
-      - "internal/backend/k3s/**"
-      - "cmd/k3s-backend/**"
+      # Test runtime dependencies structurally: moving a helper into a new
+      # package must not make dependency-only changes skip integration.
+      - "internal/**"
+      - "cmd/**"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -38,22 +26,10 @@ on:
   push:
     branches: [main]
     paths:
-      - "internal/backend/docker/**"
-      - "internal/backend/shared/**"
-      # integration_reconciler_test.go drives a real provisioner.Reconciler
-      # against a real Docker backend, so a reconciler change can break this
-      # suite while touching nothing under internal/backend/. Without this
-      # entry those tests only ran nightly — i.e. never on the PR that broke
-      # them, which is the ENG-330 rot mode this workflow exists to prevent.
-      - "internal/provisioner/**"
-      # cmd/k3s-backend/integration_test.go execs the real k3s-backend
-      # binary, which is built from internal/backend/k3s — so a change
-      # confined to that package can break this suite while matching no
-      # other entry here. Same ENG-330 rot mode as the reconciler note
-      # above (found while removing that package's test-only hooks,
-      # ENG-765).
-      - "internal/backend/k3s/**"
-      - "cmd/k3s-backend/**"
+      # Test runtime dependencies structurally: moving a helper into a new
+      # package must not make dependency-only changes skip integration.
+      - "internal/**"
+      - "cmd/**"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -63,7 +39,7 @@ on:
       # touching any non-.md file still matches a positive pattern and runs.
       - "!**/*.md"
   # Nightly safety net: catches rot from changes outside the path filter
-  # (dependency bumps, shared code) and from GitHub runner-image drift.
+  # and from GitHub runner-image drift.
   schedule:
     - cron: "17 7 * * *"
   workflow_dispatch:
@@ -84,9 +60,11 @@ jobs:
     # MUST be the full ubuntu image (not ubuntu-slim): we need passwordless
     # sudo→root, loop devices, and low-level mount — ubuntu-slim's job container
     # is unprivileged and cannot do any of that.
-    runs-on: ubuntu-latest
+    # Keep the distribution aligned with the pinned Docker APT package below.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
+      DOCKER_ENGINE_VERSION: "29.7.2"
       # Optional Docker Hub auth to dodge anonymous pull rate limits (ubuntu-24.04
       # ships zero preloaded images, so every workload image is pulled fresh).
       # Absent secrets evaluate to "" and the login step is skipped — anonymous
@@ -101,6 +79,34 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+
+      - name: Install supported Docker Engine
+        # The stock runner can ship Docker 28.0/API 1.48. Admission needs API
+        # 1.49+, and the containerd image store must be exercised explicitly.
+        # Upgrade the system service: SDK fixtures use /var/run/docker.sock,
+        # so a separate Docker context/DOCKER_HOST would test another daemon.
+        # Ubuntu's runner removes the Docker APT source after image creation.
+        run: |
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable' | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+          sudo apt-get update
+          docker_package_version="5:${DOCKER_ENGINE_VERSION}-1~ubuntu.24.04~noble"
+          sudo apt-get install -y --allow-downgrades --no-install-recommends \
+            "docker-ce=$docker_package_version" "docker-ce-cli=$docker_package_version" containerd.io
+          sudo python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path("/etc/docker/daemon.json")
+          config = json.loads(path.read_text()) if path.exists() else {}
+          config.setdefault("features", {})["containerd-snapshotter"] = True
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(json.dumps(config) + "\n")
+          PY
+          sudo systemctl restart docker
+          docker --host unix:///var/run/docker.sock version
+          test "$(docker --host unix:///var/run/docker.sock version --format '{{.Server.Version}}')" = "$DOCKER_ENGINE_VERSION"
 
       - name: Install btrfs-progs
         # mkfs.btrfs / btrfs are NOT preinstalled on ubuntu-latest; util-linux
@@ -130,6 +136,13 @@ jobs:
           set -uo pipefail
           fail=0
           docker info >/dev/null 2>&1 || { echo "::error::Docker daemon not reachable"; fail=1; }
+          docker_api="$(docker --host unix:///var/run/docker.sock version --format '{{.Server.APIVersion}}')" || fail=1
+          if ! dpkg --compare-versions "$docker_api" ge 1.49; then
+            echo "::error::Docker API 1.49+ is required for image admission (got $docker_api)"; fail=1
+          fi
+          if ! docker --host unix:///var/run/docker.sock info --format '{{json .DriverStatus}}' | jq -e 'any(.[]; .[0] == "driver-type" and .[1] == "io.containerd.snapshotter.v1")' >/dev/null; then
+            echo "::error::The containerd image store is required to exercise platform-manifest admission"; fail=1
+          fi
           command -v mkfs.btrfs >/dev/null 2>&1 || { echo "::error::mkfs.btrfs not installed"; fail=1; }
           command -v btrfs >/dev/null 2>&1 || { echo "::error::btrfs CLI not installed"; fail=1; }
           work="$(mktemp -d)"
@@ -200,7 +213,8 @@ jobs:
 
       - name: Run docker + btrfs integration suite (as root)
         # `-run Integration` covers the ENTIRE docker package: core lifecycle,
-        # stack, restart/update, reconciler, idempotency, volume/quota, and the
+        # stack, restart/update, reconciler, idempotency, image admission and
+        # immutable platform binding, volume/quota, and the
         # ENG-325 retain/restore tests. 30m timeout: the restore tests are slow
         # (multi-minute provision waits) and the default 15m predates them.
         # `sudo -E env PATH=$PATH` preserves the actions/setup-go toolchain that

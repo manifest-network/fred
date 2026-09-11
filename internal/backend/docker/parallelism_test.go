@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
@@ -27,7 +27,9 @@ import (
 //
 // If this test ever fails the parallelism assertion, something in the
 // architecture has regressed toward serialization. The failure output
-// includes elapsed time so the actual serialization factor is visible.
+// includes elapsed time so the actual serialization factor is visible. The
+// assertion is relative to the serial baseline because callback transport and
+// loaded CI hosts add fixed overhead unrelated to actor serialization.
 func TestCrossLeaseParallelism(t *testing.T) {
 	if testing.Short() {
 		t.Skip("parallelism load test — not run under -short")
@@ -37,7 +39,7 @@ func TestCrossLeaseParallelism(t *testing.T) {
 	const diagDelay = 200 * time.Millisecond
 
 	var callbacksReceived atomic.Int32
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callbacksReceived.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -62,8 +64,8 @@ func TestCrossLeaseParallelism(t *testing.T) {
 
 	provisions := make(map[string]*provision, numLeases)
 	for i := 0; i < numLeases; i++ {
-		uuid := fmt.Sprintf("lease-%d", i)
-		provisions[uuid] = &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: uuid,
+		leaseUUID := fmt.Sprintf("0192f1a0-1111-4abc-8def-%012d", i+1)
+		provisions[leaseUUID] = &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{fmt.Sprintf("c-%d", i)},
 			Status:       backend.ProvisionStatusReady,
@@ -71,8 +73,17 @@ func TestCrossLeaseParallelism(t *testing.T) {
 		}
 	}
 	b := newBackendForTest(mock, provisions)
+	runtimeByContainer := make(map[string]shared.RuntimeGenerationProof, numLeases)
+	for i := 0; i < numLeases; i++ {
+		leaseUUID := fmt.Sprintf("0192f1a0-1111-4abc-8def-%012d", i+1)
+		runtimeByContainer[fmt.Sprintf("c-%d", i)] = installReadyRuntimeProofForTest(t, b, leaseUUID)
+	}
 	rebuildCallbackSender(b, callbackServer.Client())
-	defer b.stopCancel()
+	startCallbackReplayForTest(b)
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
 
 	// Fire all container-death events as fast as possible from a single
 	// goroutine — matches how the production event loop delivers them.
@@ -81,9 +92,7 @@ func TestCrossLeaseParallelism(t *testing.T) {
 		cid := fmt.Sprintf("c-%d", i)
 		// Use the fire-and-forget actor dispatch path (what the production
 		// event loop uses), not the synchronous shim.
-		if leaseUUID, found := b.findLeaseByContainerID(cid); found {
-			b.actorFor(leaseUUID).TryEnqueue(leasesm.ContainerDiedMsg{ContainerID: cid})
-		}
+		b.routeActorObservation(mustContainerDiedObservation(t, cid, runtimeByContainer[cid]))
 	}
 	dispatchElapsed := time.Since(start)
 
@@ -103,10 +112,10 @@ func TestCrossLeaseParallelism(t *testing.T) {
 	assert.Less(t, dispatchElapsed, 100*time.Millisecond,
 		"event loop dispatch should not block on processing")
 
-	// Total time should be O(diagDelay), not O(N*diagDelay). Allow 5x
-	// headroom for goroutine scheduling overhead, Docker SDK contention,
-	// callback HTTP roundtrip latency, etc.
-	maxExpected := 5 * diagDelay
+	// Require a material parallel speedup over the serial baseline. A relative
+	// bound detects architectural serialization without treating local callback
+	// HTTP scheduling on a loaded CI host as part of the 200ms diagnostic delay.
+	maxExpected := serialExpected / 4
 	assert.Less(t, elapsed, maxExpected,
 		"N simultaneous deaths should process in ~diagDelay, not N*diagDelay")
 }
@@ -144,8 +153,9 @@ func TestCrossLeaseInboxBackpressure(t *testing.T) {
 	for i := range containerIDs {
 		containerIDs[i] = fmt.Sprintf("c-%d", i)
 	}
+	const leaseUUID = "0192f1a0-1111-4abc-8def-000000000151"
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
 			Tenant:       "tenant-a",
 			ContainerIDs: containerIDs,
 			Status:       backend.ProvisionStatusReady},
@@ -153,6 +163,7 @@ func TestCrossLeaseInboxBackpressure(t *testing.T) {
 	}
 	b := newBackendForTest(mock, provisions)
 	defer b.stopCancel()
+	runtime := installReadyRuntimeProofForTest(t, b, leaseUUID)
 
 	// Send all 50 msgs. The first one will enter Failing and trigger the
 	// goroutine (blocked on logsProceed). Subsequent msgs land in the
@@ -161,7 +172,7 @@ func TestCrossLeaseInboxBackpressure(t *testing.T) {
 	go func() {
 		defer close(dispatchDone)
 		for _, cid := range containerIDs {
-			b.actorFor("lease-1").TryEnqueue(leasesm.ContainerDiedMsg{ContainerID: cid})
+			b.routeActorObservation(mustContainerDiedObservation(t, cid, runtime))
 		}
 	}()
 

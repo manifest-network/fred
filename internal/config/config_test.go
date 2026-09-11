@@ -183,9 +183,36 @@ func TestConfig_Validate_Valid(t *testing.T) {
 		Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 		CallbackBaseURL:           "http://localhost:8080",
 		CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+		PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 	}
 
 	assert.NoError(t, cfg.Validate())
+}
+
+func TestConfig_Validate_PlacementStoreDBPath(t *testing.T) {
+	t.Run("missing path is rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.PlacementStoreDBPath = ""
+
+		require.ErrorContains(t, cfg.Validate(), "placement_store_db_path is required")
+	})
+
+	t.Run("configured path is accepted", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.PlacementStoreDBPath = "/var/lib/fred/placements.db"
+
+		require.NoError(t, cfg.Validate())
+	})
+
+	for _, path := range []string{"placements.db", "/var/lib/fred/../fred/placements.db"} {
+		t.Run("relative or non-clean path is rejected: "+path, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.PlacementStoreDBPath = path
+
+			require.ErrorContains(t, cfg.Validate(),
+				"placement_store_db_path must be an absolute, clean path")
+		})
+	}
 }
 
 func TestConfig_Validate_NoBackends(t *testing.T) {
@@ -226,6 +253,24 @@ func TestConfig_Validate_NoBackends(t *testing.T) {
 	assert.Contains(t, err.Error(), "at least one backend must be configured")
 }
 
+func TestConfig_Validate_RejectsAmbiguousBackendNames(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		want string
+	}{
+		{name: " backend-a", want: "leading or trailing whitespace"},
+		{name: "backend-a\nPASS: forged", want: "non-printable character U+000A"},
+		{name: "backend-a\u200B", want: "non-printable character U+200B"},
+	} {
+		t.Run(test.want, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Backends[0].Name = test.name
+
+			require.ErrorContains(t, cfg.Validate(), test.want)
+		})
+	}
+}
+
 func TestConfig_Validate_CallbackSecret(t *testing.T) {
 	baseConfig := func() Config {
 		return Config{
@@ -259,6 +304,7 @@ func TestConfig_Validate_CallbackSecret(t *testing.T) {
 			ShutdownTimeout:           30 * time.Second,
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -275,7 +321,7 @@ func TestConfig_Validate_CallbackSecret(t *testing.T) {
 		{
 			name:           "callback_secret too short",
 			callbackSecret: "short",
-			wantErr:        "callback_secret must be at least 32 characters",
+			wantErr:        "callback_secret must be at least 32 bytes",
 		},
 		{
 			name:           "callback_secret exactly 32 chars",
@@ -302,6 +348,93 @@ func TestConfig_Validate_CallbackSecret(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
+}
+
+func TestConfig_Validate_PerBackendHMACSecrets(t *testing.T) {
+	const (
+		secretA = "backend-a-secret-0123456789abcdef"
+		secretB = "backend-b-secret-0123456789abcdef"
+	)
+	base := func() Config {
+		cfg := validConfig()
+		cfg.CallbackSecret = ""
+		cfg.Backends = []BackendConfig{
+			{Name: "backend-a", URL: "http://backend-a:9000", IsDefault: true, HMACSecret: secretA},
+			{Name: "backend-b", URL: "http://backend-b:9000", HMACSecret: secretB},
+		}
+		return cfg
+	}
+
+	t.Run("complete unique fleet", func(t *testing.T) {
+		cfg := base()
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("mixed global and per-backend modes", func(t *testing.T) {
+		cfg := base()
+		cfg.CallbackSecret = "legacy-shared-secret-0123456789ab"
+		require.ErrorContains(t, cfg.Validate(), "cannot be combined")
+	})
+
+	t.Run("partial per-backend mode", func(t *testing.T) {
+		cfg := base()
+		cfg.Backends[1].HMACSecret = ""
+		require.ErrorContains(t, cfg.Validate(), "must be configured on every backend")
+	})
+
+	t.Run("short per-backend key", func(t *testing.T) {
+		cfg := base()
+		cfg.Backends[0].HMACSecret = "short"
+		require.ErrorContains(t, cfg.Validate(), "backends[0].hmac_secret must be at least")
+	})
+
+	t.Run("duplicate per-backend key", func(t *testing.T) {
+		cfg := base()
+		cfg.Backends[1].HMACSecret = cfg.Backends[0].HMACSecret
+		require.ErrorContains(t, cfg.Validate(), "duplicates backends[0].hmac_secret")
+	})
+
+	t.Run("production rejects legacy fleet key", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.ProductionMode = true
+		cfg.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+		cfg.CallbackBaseURL = "https://callback.example.com"
+		cfg.Backends[0].URL = "https://backend.example.com"
+		require.ErrorContains(t, cfg.Validate(), "production_mode: callback_secret is a fleet-wide legacy key")
+	})
+
+	t.Run("production accepts unique backend keys", func(t *testing.T) {
+		cfg := base()
+		cfg.ProductionMode = true
+		cfg.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+		cfg.CallbackBaseURL = "https://callback.example.com"
+		cfg.Backends[0].URL = "https://backend-a.example.com"
+		cfg.Backends[1].URL = "https://backend-b.example.com"
+		require.NoError(t, cfg.Validate())
+	})
+}
+
+func TestConfig_ResolveBackendHMACSecret(t *testing.T) {
+	perBackend := &Config{Backends: []BackendConfig{{
+		Name: "backend-a", HMACSecret: "backend-a-secret-0123456789abcdef",
+	}}}
+	secret, err := perBackend.ResolveBackendHMACSecret("backend-a")
+	require.NoError(t, err)
+	assert.Equal(t, Secret("backend-a-secret-0123456789abcdef"), secret)
+
+	legacy := &Config{
+		CallbackSecret: "legacy-shared-secret-0123456789ab",
+		Backends:       []BackendConfig{{Name: "backend-a"}},
+	}
+	secret, err = legacy.ResolveBackendHMACSecret("backend-a")
+	require.NoError(t, err)
+	assert.Equal(t, legacy.CallbackSecret, secret)
+
+	legacy.ProductionMode = true
+	_, err = legacy.ResolveBackendHMACSecret("backend-a")
+	require.ErrorContains(t, err, "has no HMAC secret")
+	_, err = perBackend.ResolveBackendHMACSecret("missing")
+	require.ErrorContains(t, err, "is not configured")
 }
 
 func TestConfig_Validate_WithdrawLimit(t *testing.T) {
@@ -338,6 +471,7 @@ func TestConfig_Validate_WithdrawLimit(t *testing.T) {
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -405,53 +539,92 @@ func TestConfig_Validate_CallbackCanonicalPathPrefix(t *testing.T) {
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
 	tests := []struct {
-		name    string
-		prefix  string
-		wantErr string
+		name               string
+		callbackBaseURL    string
+		prefix             string
+		wantNormalizedBase string
+		wantErr            string
 	}{
 		{
-			name:    "empty (default) is valid",
-			prefix:  "",
-			wantErr: "",
+			name:               "empty direct-call prefix is valid",
+			callbackBaseURL:    "http://localhost:8080",
+			wantNormalizedBase: "http://localhost:8080",
 		},
 		{
-			name:    "single-segment prefix is valid",
-			prefix:  "/api",
-			wantErr: "",
+			name:               "single-segment stripped prefix matches callback path",
+			callbackBaseURL:    "http://localhost:8080/api",
+			prefix:             "/api",
+			wantNormalizedBase: "http://localhost:8080/api",
 		},
 		{
-			name:    "multi-segment prefix is valid",
-			prefix:  "/api/fred",
-			wantErr: "",
+			name:               "multi-segment stripped prefix matches callback path",
+			callbackBaseURL:    "http://localhost:8080/api/fred///",
+			prefix:             "/api/fred",
+			wantNormalizedBase: "http://localhost:8080/api/fred",
 		},
 		{
-			name:    "missing leading slash is rejected",
-			prefix:  "api/fred",
-			wantErr: "callback_canonical_path_prefix must start with \"/\"",
+			name:               "escaped prefix matches canonical Unicode path bytes",
+			callbackBaseURL:    "http://localhost:8080/%c3%a5",
+			prefix:             "/%C3%A5",
+			wantNormalizedBase: "http://localhost:8080/%C3%A5",
 		},
 		{
-			name:    "trailing slash is rejected",
-			prefix:  "/api/fred/",
-			wantErr: "callback_canonical_path_prefix must not end with \"/\"",
+			name:            "decoded Unicode prefix is not the signed wire path",
+			callbackBaseURL: "http://localhost:8080/å",
+			prefix:          "/å",
+			wantErr:         "must exactly match callback_base_url path",
 		},
 		{
-			name:    "single slash is rejected (ends with slash)",
-			prefix:  "/",
-			wantErr: "callback_canonical_path_prefix must not end with \"/\"",
+			name:            "nonempty callback path requires verifier prefix",
+			callbackBaseURL: "http://localhost:8080/api/fred",
+			wantErr:         "must exactly match callback_base_url path",
+		},
+		{
+			name:            "prefix without callback path cannot verify",
+			callbackBaseURL: "http://localhost:8080",
+			prefix:          "/api/fred",
+			wantErr:         "must exactly match callback_base_url path",
+		},
+		{
+			name:            "different canonical prefixes cannot verify",
+			callbackBaseURL: "http://localhost:8080/api/fred",
+			prefix:          "/api",
+			wantErr:         "must exactly match callback_base_url path",
+		},
+		{
+			name:            "missing leading slash is rejected",
+			callbackBaseURL: "http://localhost:8080/api/fred",
+			prefix:          "api/fred",
+			wantErr:         "callback_canonical_path_prefix must start with \"/\"",
+		},
+		{
+			name:            "trailing slash is rejected",
+			callbackBaseURL: "http://localhost:8080/api/fred",
+			prefix:          "/api/fred/",
+			wantErr:         "callback_canonical_path_prefix must not end with \"/\"",
+		},
+		{
+			name:            "single slash is rejected (ends with slash)",
+			callbackBaseURL: "http://localhost:8080",
+			prefix:          "/",
+			wantErr:         "callback_canonical_path_prefix must not end with \"/\"",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := baseConfig()
+			cfg.CallbackBaseURL = tt.callbackBaseURL
 			cfg.CallbackCanonicalPathPrefix = tt.prefix
 			err := cfg.Validate()
 			if tt.wantErr == "" {
-				assert.NoError(t, err)
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantNormalizedBase, cfg.CallbackBaseURL)
 				return
 			}
 			require.Error(t, err, "Validate() = nil, want error containing %q", tt.wantErr)
@@ -494,6 +667,7 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -683,6 +857,7 @@ func TestConfig_Validate_URLFields(t *testing.T) {
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -777,6 +952,7 @@ func TestConfig_Validate_TLSPair(t *testing.T) {
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -878,6 +1054,7 @@ key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 backends:
   - name: "mock"
     url: "http://localhost:9000"
@@ -916,6 +1093,7 @@ chain_id: "test-chain-1"
 rate_limit_rps: 50
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 backends:
   - name: "mock"
     url: "http://localhost:9000"
@@ -942,6 +1120,7 @@ key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 cors_origins:
   - "https://admin.example.com"
 backends:
@@ -963,6 +1142,7 @@ key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 cors_origins: []
 backends:
   - name: "mock"
@@ -1008,6 +1188,7 @@ func TestConfig_Validate_BackendURLs(t *testing.T) {
 			ReconciliationInterval:    5 * time.Minute,
 			ShutdownTimeout:           30 * time.Second,
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -1031,6 +1212,30 @@ func TestConfig_Validate_BackendURLs(t *testing.T) {
 				c.CallbackBaseURL = "https://fred.example.com:8080"
 			},
 			wantErr: "",
+		},
+		{
+			name: "negative backend timeout",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://backend.example.com", Timeout: -time.Second, IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com"
+			},
+			wantErr: "backends[0].timeout must not be negative",
+		},
+		{
+			name: "backend URL with empty query marker",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://backend.example.com?", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com"
+			},
+			wantErr: "backend URL must be an origin",
+		},
+		{
+			name: "backend URL with empty fragment marker",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://backend.example.com#", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com"
+			},
+			wantErr: "backend URL must be an origin",
 		},
 		{
 			name: "relative backend URL",
@@ -1065,6 +1270,38 @@ func TestConfig_Validate_BackendURLs(t *testing.T) {
 			wantErr: "backends[0].url: URL must have a host",
 		},
 		{
+			name: "backend URL with port-only host",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://:443", IsDefault: true}}
+				c.CallbackBaseURL = "http://localhost:8080"
+			},
+			wantErr: "backends[0].url: URL must have a non-empty, non-dot hostname",
+		},
+		{
+			name: "backend URL with dot-only host",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://.", IsDefault: true}}
+				c.CallbackBaseURL = "http://localhost:8080"
+			},
+			wantErr: "backends[0].url: URL must have a non-empty, non-dot hostname",
+		},
+		{
+			name: "backend URL with zero port",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://backend.example:0", IsDefault: true}}
+				c.CallbackBaseURL = "http://localhost:8080"
+			},
+			wantErr: "backends[0].url: URL explicit port must be between 1 and 65535",
+		},
+		{
+			name: "backend URL with oversized port",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://backend.example:65536", IsDefault: true}}
+				c.CallbackBaseURL = "http://localhost:8080"
+			},
+			wantErr: "backends[0].url: URL explicit port must be between 1 and 65535",
+		},
+		{
 			name: "relative callback URL",
 			modify: func(c *Config) {
 				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
@@ -1079,6 +1316,102 @@ func TestConfig_Validate_BackendURLs(t *testing.T) {
 				c.CallbackBaseURL = "localhost:8080"
 			},
 			wantErr: "callback_base_url: URL must use http:// or https:// scheme",
+		},
+		{
+			name: "callback URL with user info",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://operator:secret@fred.example.com"
+			},
+			wantErr: "callback_base_url: URL must not contain user info",
+		},
+		{
+			name: "callback URL with fragment",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com/callback#not-sent"
+			},
+			wantErr: "callback_base_url: URL must not contain a fragment",
+		},
+		{
+			name: "callback URL with empty fragment marker",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com#"
+			},
+			wantErr: "callback_base_url: URL must not contain a fragment",
+		},
+		{
+			name: "callback URL with port-only host",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://:443"
+			},
+			wantErr: "callback_base_url: URL must have a non-empty, non-dot hostname",
+		},
+		{
+			name: "callback URL with invalid port",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com:65536"
+			},
+			wantErr: "callback_base_url: URL explicit port must be between 1 and 65535",
+		},
+		{
+			name: "callback URL with malformed query",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com/callback?trace=%"
+			},
+			wantErr: "callback_base_url: URL query is malformed",
+		},
+		{
+			name: "callback URL with dot segment",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com/api/../callback"
+			},
+			wantErr: "callback_base_url: URL path must not contain empty, dot, or parent segments",
+		},
+		{
+			name: "callback URL with internal empty segment",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com/api//callback"
+			},
+			wantErr: "callback_base_url: URL path must not contain empty, dot, or parent segments",
+		},
+		{
+			name: "callback URL with encoded slash",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com/api%2Fcallback"
+			},
+			wantErr: "callback_base_url: URL path must not contain percent-encoded path separators",
+		},
+		{
+			name: "callback URL with encoded control character",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com/api%00callback"
+			},
+			wantErr: "callback_base_url: URL path contains non-printable character U+0000",
+		},
+		{
+			name: "callback URL preloads operation capability",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com/callback?operation%5Fid=shadowed"
+			},
+			wantErr: `callback_base_url: URL must not contain reserved query parameter "operation_id"`,
+		},
+		{
+			name: "callback URL preloads lifecycle capability",
+			modify: func(c *Config) {
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example.com/callback?lifecycle_id="
+			},
+			wantErr: `callback_base_url: URL must not contain reserved query parameter "lifecycle_id"`,
 		},
 	}
 
@@ -1129,13 +1462,15 @@ func TestConfig_Validate_CallbackURLNormalization(t *testing.T) {
 			ReconciliationInterval:    5 * time.Minute,
 			ShutdownTimeout:           30 * time.Second,
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
 	tests := []struct {
-		name     string
-		input    string
-		expected string
+		name          string
+		input         string
+		expected      string
+		canonicalPath string
 	}{
 		{
 			name:     "no trailing slash",
@@ -1153,9 +1488,22 @@ func TestConfig_Validate_CallbackURLNormalization(t *testing.T) {
 			expected: "http://localhost:8080",
 		},
 		{
-			name:     "with path and trailing slash",
-			input:    "http://localhost:8080/api/",
-			expected: "http://localhost:8080/api",
+			name:          "with path and trailing slash",
+			input:         "http://localhost:8080/api/",
+			expected:      "http://localhost:8080/api",
+			canonicalPath: "/api",
+		},
+		{
+			name:          "empty query marker",
+			input:         "http://localhost:8080/api?",
+			expected:      "http://localhost:8080/api",
+			canonicalPath: "/api",
+		},
+		{
+			name:          "path slash removed without changing query value",
+			input:         "http://localhost:8080/api/?return=/",
+			expected:      "http://localhost:8080/api?return=/",
+			canonicalPath: "/api",
 		},
 	}
 
@@ -1164,6 +1512,7 @@ func TestConfig_Validate_CallbackURLNormalization(t *testing.T) {
 			cfg := baseConfig()
 			cfg.Backends = []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}}
 			cfg.CallbackBaseURL = tt.input
+			cfg.CallbackCanonicalPathPrefix = tt.canonicalPath
 
 			require.NoError(t, cfg.Validate())
 			assert.Equal(t, tt.expected, cfg.CallbackBaseURL)
@@ -1203,8 +1552,9 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 			ReconciliationInterval:    5 * time.Minute,
 			ShutdownTimeout:           30 * time.Second,
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://10.0.0.1:9000", IsDefault: true}},
-			CallbackBaseURL:           "http://10.0.0.1:8080",
+			CallbackBaseURL:           "https://10.0.0.1:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -1238,8 +1588,28 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 				c.GRPCTLSEnabled = true
 				c.GRPCTLSSkipVerify = false
 				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://10.0.0.1:9000", IsDefault: true}}
 			},
 			wantErr: "",
+		},
+		{
+			name: "production mode rejects backend port-only authority before TLS use",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://:443", IsDefault: true}}
+			},
+			wantErr: "backends[0].url: URL must have a non-empty, non-dot hostname",
+		},
+		{
+			name: "production mode rejects callback port outside TCP range",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://10.0.0.1:9000", IsDefault: true}}
+				c.CallbackBaseURL = "https://fred.example:65536"
+			},
+			wantErr: "callback_base_url: URL explicit port must be between 1 and 65535",
 		},
 		{
 			name: "production mode allows skip verify when tls is disabled",
@@ -1248,8 +1618,28 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 				c.GRPCTLSEnabled = false
 				c.GRPCTLSSkipVerify = true
 				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://10.0.0.1:9000", IsDefault: true}}
 			},
 			wantErr: "", // skip_verify is meaningless when TLS is disabled
+		},
+		{
+			name: "production mode rejects plaintext backend transport",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.Backends = []BackendConfig{{Name: "mock", URL: "http://10.0.0.1:9000", IsDefault: true}}
+			},
+			wantErr: "production_mode: backends[0].url must use https:// with certificate verification",
+		},
+		{
+			name: "production mode rejects plaintext callback transport",
+			modify: func(c *Config) {
+				c.ProductionMode = true
+				c.TokenTrackerDBPath = "/var/lib/fred/tokens.db"
+				c.CallbackBaseURL = "http://10.0.0.1:8080"
+				c.Backends = []BackendConfig{{Name: "mock", URL: "https://10.0.0.1:9000", IsDefault: true}}
+			},
+			wantErr: "production_mode: callback_base_url must use https://",
 		},
 		{
 			name: "non-production mode allows tls skip verify",
@@ -1401,6 +1791,14 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := baseConfig()
 			tt.modify(&cfg)
+			if cfg.ProductionMode {
+				cfg.CallbackSecret = ""
+				for i := range cfg.Backends {
+					cfg.Backends[i].HMACSecret = Secret(
+						"0123456789abcdef0123456789abcdef:" + cfg.Backends[i].Name,
+					)
+				}
+			}
 			err := cfg.Validate()
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
@@ -1421,20 +1819,23 @@ provider_address: "manifest1abc"
 key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 callback_base_url: "http://localhost:8080"
-callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 backends:
   - name: "docker-1"
     url: "http://10.0.0.1:9000"
+    hmac_secret: "docker-1-secret-0123456789abcdef"
     skus:
       - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
       - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
     default: true
   - name: "docker-2"
     url: "http://10.0.0.2:9000"
+    hmac_secret: "docker-2-secret-0123456789abcdef"
     skus:
       - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
   - name: "docker-3"
     url: "http://10.0.0.3:9000"
+    hmac_secret: "docker-3-secret-0123456789abcdef"
 `
 	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644))
 
@@ -1442,6 +1843,9 @@ backends:
 	require.NoError(t, err)
 
 	require.Len(t, cfg.Backends, 3)
+	assert.Equal(t, Secret("docker-1-secret-0123456789abcdef"), cfg.Backends[0].HMACSecret)
+	assert.Equal(t, Secret("docker-2-secret-0123456789abcdef"), cfg.Backends[1].HMACSecret)
+	assert.Equal(t, Secret("docker-3-secret-0123456789abcdef"), cfg.Backends[2].HMACSecret)
 
 	// Backend with skus
 	assert.Equal(t, []string{
@@ -1467,6 +1871,7 @@ key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 backends:
   - name: "gpu"
     url: "http://10.0.0.1:9000"
@@ -1496,6 +1901,7 @@ bech32_prefix: "manifest"
 rate_limit_rps: 100
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 backends:
   - name: "mock"
     url: "http://localhost:9000"
@@ -1548,6 +1954,7 @@ func validConfig() Config {
 		Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 		CallbackBaseURL:           "http://localhost:8080",
 		CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+		PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 	}
 }
 

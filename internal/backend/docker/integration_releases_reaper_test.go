@@ -62,17 +62,19 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
 	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
 	cfg.ReleasesDBPath = filepath.Join(tmpDir, "releases.db") // shared by b and b2
-	for name, p := range cfg.SKUProfiles {                    // no volume FS -> drop DiskMB
+	cfg.RetentionDBPath = filepath.Join(tmpDir, "retention.db")
+	for name, p := range cfg.SKUProfiles { // no volume FS -> drop DiskMB
 		p.DiskMB = 0
 		cfg.SKUProfiles[name] = p
 	}
 
 	// --- Backend #1: provision a real lease (writes the provision-time release). ---
+	initializeFreshIntegrationStorageIdentity(t, ctx, cfg, logger)
 	b, err := New(cfg, logger)
 	require.NoError(t, err)
 	require.NoError(t, b.Start(ctx))
 
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupTestContainers(t, docker, cfg.Name)
@@ -80,7 +82,8 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 		_ = docker.Close()
 	})
 
-	leaseUUID := fmt.Sprintf("eng440-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
@@ -89,12 +92,13 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	}))
 	cb := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
 	require.Equal(t, backend.CallbackStatusSuccess, cb.Status, "provision must succeed")
@@ -129,9 +133,9 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 	// THE ENG-440 ASSERTION: a real Restart must succeed. Pre-fix this returned
 	// ErrInvalidState "no stored manifest" synchronously, because the reaped record
 	// left the recovered StackManifest nil.
-	require.NoError(t, b2.Restart(ctx, backend.RestartRequest{
+	require.NoError(t, b2.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 	}), "Restart must not fail with 'no stored manifest' after the reap")
 	cb = waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
 	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status, "restart redeploy must succeed")
@@ -168,18 +172,27 @@ func backdateReleaseRecords(t *testing.T, dbPath, leaseUUID string, age time.Dur
 		if data == nil {
 			return fmt.Errorf("no release record for lease %s (provision should have written one)", leaseUUID)
 		}
-		var releases []shared.Release
-		if err := json.Unmarshal(data, &releases); err != nil {
+		// Authoritative release histories are schema-framed. Preserve that frame
+		// while changing only the timestamps under test; decoding the row as the
+		// pre-v0.14 bare array would silently manufacture a legacy journal.
+		var history struct {
+			SchemaVersion uint8            `json:"schema_version"`
+			Releases      []shared.Release `json:"releases"`
+		}
+		if err := json.Unmarshal(data, &history); err != nil {
 			return err
 		}
-		if len(releases) == 0 {
+		if history.SchemaVersion == 0 {
+			return fmt.Errorf("release history for lease %s has no schema version", leaseUUID)
+		}
+		if len(history.Releases) == 0 {
 			return fmt.Errorf("empty release history for lease %s", leaseUUID)
 		}
 		backdated := time.Now().Add(-age)
-		for i := range releases {
-			releases[i].CreatedAt = backdated
+		for i := range history.Releases {
+			history.Releases[i].CreatedAt = backdated
 		}
-		encoded, err := json.Marshal(releases)
+		encoded, err := json.Marshal(history)
 		if err != nil {
 			return err
 		}

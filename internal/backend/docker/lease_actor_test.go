@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
@@ -25,8 +26,9 @@ import (
 // bugs (missed channel sends, dropped messages) that the shim would hide by
 // blocking on a done channel.
 func TestLeaseActor_DirectDispatch(t *testing.T) {
+	const leaseUUID = "0192f1a0-1111-4abc-8def-000000000101"
 	var callbackHit atomic.Bool
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callbackHit.Store(true)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -42,22 +44,24 @@ func TestLeaseActor_DirectDispatch(t *testing.T) {
 	}
 
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{"c1"},
 			Status:       backend.ProvisionStatusReady,
 			CallbackURL:  callbackServer.URL},
 		},
 	})
+	runtime := installReadyRuntimeProofForTest(t, b, leaseUUID)
 	rebuildCallbackSender(b, callbackServer.Client())
+	startCallbackReplayForTest(b)
 	defer b.stopCancel()
 
-	require.True(t, b.actorFor("lease-1").TryEnqueue(leasesm.ContainerDiedMsg{ContainerID: "c1"}))
+	require.True(t, b.routeActorObservation(mustContainerDiedObservation(t, "c1", runtime)))
 
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		prov := b.provisions["lease-1"]
+		prov := b.provisions[leaseUUID]
 		return prov != nil && prov.Status == backend.ProvisionStatusFailed
 	}, 2*time.Second, 10*time.Millisecond, "actor must transition Ready→Failed asynchronously")
 
@@ -79,11 +83,12 @@ func TestLeaseActor_DirectDispatch(t *testing.T) {
 // callback is emitted. Defense-in-depth: if the goroutine races past the
 // cancel signal and fires DiagGathered, Deprovisioning.Ignore drops it.
 func TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback(t *testing.T) {
+	const leaseUUID = "0192f1a0-1111-4abc-8def-000000000102"
 	var callbackCount atomic.Int32
 	var failedSeen atomic.Bool
 	var deprovisionedSeen atomic.Bool
 
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var payload backend.CallbackPayload
 		_ = json.NewDecoder(r.Body).Decode(&payload)
 		callbackCount.Add(1)
@@ -114,17 +119,24 @@ func TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback(t *testing.T)
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
 			return nil
 		},
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			// The close classifier observes Docker after RemoveContainer has
+			// completed. This fixture models that exact, empty post-effect view.
+			return nil, nil
+		},
 	}
 
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{"c1"},
 			Status:       backend.ProvisionStatusReady,
 			CallbackURL:  callbackServer.URL},
 		},
 	})
+	installReadyRuntimeProofForTest(t, b, leaseUUID)
 	rebuildCallbackSender(b, callbackServer.Client())
+	startCallbackReplayForTest(b)
 	defer b.stopCancel()
 
 	g1Done := make(chan struct{})
@@ -140,7 +152,7 @@ func TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback(t *testing.T)
 	g2Done := make(chan struct{})
 	go func() {
 		defer close(g2Done)
-		if err := b.Deprovision(context.Background(), "lease-1"); err != nil {
+		if err := b.Deprovision(context.Background(), leaseUUID); err != nil {
 			t.Errorf("Deprovision returned unexpected error: %v", err)
 		}
 	}()
@@ -152,7 +164,7 @@ func TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback(t *testing.T)
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		_, exists := b.provisions["lease-1"]
+		_, exists := b.provisions[leaseUUID]
 		return !exists
 	}, 2*time.Second, 10*time.Millisecond, "Deprovision must complete (provision entry deleted)")
 
@@ -223,11 +235,11 @@ func TestDebugActors(t *testing.T) {
 // publication synchronous with the actor's exposure via b.actors.
 func TestLeaseActor_EagerSMInit(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: durableCallbackTestLeaseUUID, Status: backend.ProvisionStatusReady}},
 	})
 	defer b.stopCancel()
 
-	actor := b.actorFor("lease-1")
+	actor := b.actorFor(durableCallbackTestLeaseUUID)
 	require.NotNil(t, actor,
 		"sm must be initialized in newLeaseActor; lazy init races with DebugActors")
 	require.Equal(t, backend.ProvisionStatusReady, actor.State(),
@@ -247,17 +259,18 @@ func TestLeaseActor_RegistryClearedAfterDeprovision(t *testing.T) {
 			return nil
 		},
 	}
-	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: durableCallbackTestLeaseUUID,
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{"c1"},
 			Status:       backend.ProvisionStatusReady},
 		},
 	})
 	defer b.stopCancel()
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 
-	first := b.actorFor("lease-1")
-	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+	first := b.actorFor(durableCallbackTestLeaseUUID)
+	require.NoError(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID))
 
 	// Actor deletes itself from b.actors and closes done on exit.
 	select {
@@ -266,14 +279,14 @@ func TestLeaseActor_RegistryClearedAfterDeprovision(t *testing.T) {
 		t.Fatal("actor did not exit after successful deprovision")
 	}
 	b.actorsMu.Lock()
-	_, exists := b.actors["lease-1"]
+	_, exists := b.actors[durableCallbackTestLeaseUUID]
 	b.actorsMu.Unlock()
 	assert.False(t, exists,
 		"b.actors must not retain a reference to a deprovisioned lease")
 
 	// A subsequent actorFor with the same UUID returns a *fresh* actor —
 	// not the terminated one — whose SM can accept evProvisionRequested.
-	second := b.actorFor("lease-1")
+	second := b.actorFor(durableCallbackTestLeaseUUID)
 	require.NotSame(t, first, second,
 		"UUID reuse after Deprovision must produce a fresh actor")
 	require.Equal(t, backend.ProvisionStatusProvisioning, second.State(),
@@ -317,7 +330,7 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 	}
 
 	var callbackReceived atomic.Int32
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callbackReceived.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -350,14 +363,16 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 			return nil
 		},
 	}
+	installStackStrictCohortInventory(t, mock, composeMock)
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.compose = composeMock
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	rebuildCallbackSender(b, callbackServer.Client())
+	startCallbackReplayForTest(b)
 	defer b.stopCancel()
 
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	req.CallbackURL = callbackServer.URL
+	req := newProvisionRequest(durableCallbackTestLeaseUUID, "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	req.CallbackURL = testOperationCallbackURL(callbackServer.URL)
 
 	// (1) Provision: the synchronous section writes Status=Provisioning
 	// and creates the actor; the actor's SM starts in Provisioning
@@ -370,7 +385,7 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 
 	// (2) After success: SM has transitioned to Ready; onEnterReadyFromProvision
 	// wrote Status=Ready. Contract: match.
-	assertStatusMatchesSM(t, b, "lease-1", "after successful provision")
+	assertStatusMatchesSM(t, b, durableCallbackTestLeaseUUID, "after successful provision")
 
 	// (3) Container-death → Failing → Failed (via the synchronous test
 	// shim that waits for the diag goroutine's DiagGathered to process).
@@ -383,18 +398,18 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 	require.Eventually(t, func() bool { return callbackReceived.Load() >= 2 },
 		3*time.Second, 20*time.Millisecond)
 	b.provisionsMu.RLock()
-	require.Equal(t, backend.ProvisionStatusFailed, b.provisions["lease-1"].Status)
+	require.Equal(t, backend.ProvisionStatusFailed, b.provisions[durableCallbackTestLeaseUUID].Status)
 	b.provisionsMu.RUnlock()
-	assertStatusMatchesSM(t, b, "lease-1", "after container death → Failed")
+	assertStatusMatchesSM(t, b, durableCallbackTestLeaseUUID, "after container death → Failed")
 
 	// (4) Deprovision the failed lease → actor exits; registry drops it;
 	// no contract to enforce post-exit (assertStatusMatchesSM handles).
-	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+	require.NoError(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID))
 	b.provisionsMu.RLock()
-	_, stillExists := b.provisions["lease-1"]
+	_, stillExists := b.provisions[durableCallbackTestLeaseUUID]
 	b.provisionsMu.RUnlock()
 	require.False(t, stillExists, "provision entry must be gone after Deprovision")
-	assertStatusMatchesSM(t, b, "lease-1", "after deprovision")
+	assertStatusMatchesSM(t, b, durableCallbackTestLeaseUUID, "after deprovision")
 }
 
 // TestLeaseActor_FailingWedgeRecovery pins the Failing-retry invariant
@@ -411,28 +426,25 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 // instead of returning an unhandled-trigger error. Lease is no longer
 // wedged.
 func TestLeaseActor_FailingWedgeRecovery(t *testing.T) {
+	leaseUUID := durableCallbackTestLeaseUUID
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailing}},
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID, Status: backend.ProvisionStatusFailing}},
 	})
 	defer b.stopCancel()
 
 	// Warm the actor so its SM is in Failing.
-	actor := b.actorFor("lease-1")
+	actor := b.actorFor(leaseUUID)
 	require.Equal(t, backend.ProvisionStatusFailing, actor.State())
 
 	// Route a provisionRequestedMsg — the Failing→Provisioning Permit
 	// should accept it.
-	ack := make(chan error, 1)
-	ok := b.routeToLease("lease-1", leasesm.ProvisionRequestedMsg{
-		Cancel: func() {},
-		Work: func() (string, backend.Reason, leasesm.ProvisionSuccessResult, map[string]string, error) {
-			return "", "", leasesm.ProvisionSuccessResult{}, nil, nil
-		},
-		Ack: ack,
-	})
+	claim := actorOperationClaimForTest(t, leaseUUID)
+	command, ack, err := leasesm.NewProvisionCommand(context.Background(), claim)
+	require.NoError(t, err)
+	ok := b.routeToLease(leaseUUID, command)
 	require.True(t, ok)
 	select {
-	case err := <-ack:
+	case err := <-ack.Result():
 		require.NoError(t, err, "Failing must Permit evProvisionRequested so stuck leases can recover")
 	case <-time.After(2 * time.Second):
 		t.Fatal("ack never arrived")
@@ -443,17 +455,47 @@ func TestLeaseActor_FailingWedgeRecovery(t *testing.T) {
 // contract of routeToLease. When an actor's inbox is saturated, the
 // non-blocking send in routeToLease returns false — the registry mutex
 // is never held across a slow channel send, so a wedged actor cannot
-// stall the event loop or other routing callers. Combined with the
-// dieEventDroppedTotal metric wiring, this turns "one wedged actor
-// stalls all lease event delivery" into "one wedged actor loses its
-// own die events (reconciler re-detects)".
+// stall other routing callers.
 //
 // Wedges the actor's run loop via a hung Inspector.InspectInstance in the
 // SM ContainerDied guard. This is the real production wedge mechanism;
 // the previous install-without-run pattern was a synthetic state that
 // can't occur in production (NewLeaseActor unconditionally spawns the
 // run loop). See ENG-148 PR5b-2 deviation E-1.
+func actorBackpressureCommand(t *testing.T, claim shared.ProvisionAdmission) leasesm.ActorCommand {
+	t.Helper()
+	command, _, err := leasesm.NewProvisionCommand(context.Background(), claim)
+	require.NoError(t, err)
+	return command
+}
+
+func TestRouteActorObservation_RejectsStaleGenerationWithoutCreatingActor(t *testing.T) {
+	const leaseUUID = "0192f1a0-1111-4abc-8def-000000000103"
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		leaseUUID: {
+			ProvisionState: leasesm.ProvisionState{
+				LeaseUUID:    leaseUUID,
+				Status:       backend.ProvisionStatusReady,
+				ContainerIDs: []string{"old"},
+			},
+		},
+	})
+	defer b.stopCancel()
+
+	runtime := installReadyRuntimeProofForTest(t, b, leaseUUID)
+	b.provisionsMu.Lock()
+	b.provisions[leaseUUID].ActiveReleaseVersion++
+	b.provisionsMu.Unlock()
+
+	assert.False(t, b.routeActorObservation(mustContainerDiedObservation(t, "old", runtime)))
+	b.actorsMu.Lock()
+	_, created := b.actors[leaseUUID]
+	b.actorsMu.Unlock()
+	assert.False(t, created, "a stale substrate observation must not materialize an actor")
+}
+
 func TestRouteToLease_DropsOnFullInbox(t *testing.T) {
+	const leaseUUID = "0192f1a0-1111-4abc-8def-000000000104"
 	firstInspected := make(chan struct{})
 	var inspectCount atomic.Int32
 	mock := &mockDockerClient{
@@ -468,21 +510,23 @@ func TestRouteToLease_DropsOnFullInbox(t *testing.T) {
 		},
 	}
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID, Status: backend.ProvisionStatusReady, ContainerIDs: []string{"c1"}}},
 	})
 	defer b.stopCancel()
+	runtime := installReadyRuntimeProofForTest(t, b, leaseUUID)
 
-	// First message: routeToLease creates the actor (spawning its run
+	// First observation creates the actor (spawning its run
 	// loop via NewLeaseActor) and enqueues. The actor consumes it,
 	// invokes handle() → handleContainerDied → sm.Fire → guard →
 	// Inspector.InspectInstance, which wedges on the hung mock above.
-	require.True(t, b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "c1"}))
+	require.True(t, b.routeActorObservation(mustContainerDiedObservation(t, "c1", runtime)))
 	<-firstInspected
+	claim := actorOperationClaimForTest(t, leaseUUID)
 
 	// Actor is now blocked in the SM guard. Fill the remaining 16 inbox
 	// slots — none of these get consumed because the actor is wedged.
 	for i := 0; i < 16; i++ {
-		require.True(t, b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "cN"}),
+		require.True(t, b.routeToLease(leaseUUID, actorBackpressureCommand(t, claim)),
 			"message %d should enqueue while actor is wedged", i)
 	}
 
@@ -490,7 +534,7 @@ func TestRouteToLease_DropsOnFullInbox(t *testing.T) {
 	// blocking.
 	done := make(chan bool, 1)
 	go func() {
-		done <- b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "overflow"})
+		done <- b.routeToLease(leaseUUID, actorBackpressureCommand(t, claim))
 	}()
 	select {
 	case ok := <-done:
@@ -512,6 +556,7 @@ func TestRouteToLease_DropsOnFullInbox(t *testing.T) {
 // can't occur in production (NewLeaseActor unconditionally spawns the
 // run loop). See ENG-148 PR5b-2 deviation E-1.
 func TestRouteToLeaseBlocking_RetriesOnFullInbox(t *testing.T) {
+	const leaseUUID = "0192f1a0-1111-4abc-8def-000000000105"
 	firstInspected := make(chan struct{})
 	unblockFirst := make(chan struct{})
 	var inspectCount atomic.Int32
@@ -538,16 +583,18 @@ func TestRouteToLeaseBlocking_RetriesOnFullInbox(t *testing.T) {
 		},
 	}
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID, Status: backend.ProvisionStatusReady, ContainerIDs: []string{"c0"}}},
 	})
 	defer b.stopCancel()
+	runtime := installReadyRuntimeProofForTest(t, b, leaseUUID)
 
 	// Fill inbox: first message wedges the actor in the SM guard;
 	// next 16 queue.
-	require.True(t, b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "c0"}))
+	require.True(t, b.routeActorObservation(mustContainerDiedObservation(t, "c0", runtime)))
 	<-firstInspected
+	claim := actorOperationClaimForTest(t, leaseUUID)
 	for i := 0; i < 16; i++ {
-		require.True(t, b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "cN"}))
+		require.True(t, b.routeToLease(leaseUUID, actorBackpressureCommand(t, claim)))
 	}
 
 	// routeToLeaseBlocking should not return false immediately — it
@@ -560,7 +607,7 @@ func TestRouteToLeaseBlocking_RetriesOnFullInbox(t *testing.T) {
 		close(unblockFirst)
 	}()
 
-	err := b.routeToLeaseBlocking(context.Background(), "lease-1", leasesm.ContainerDiedMsg{ContainerID: "c-retry"})
+	err := b.routeToLeaseBlocking(context.Background(), leaseUUID, actorBackpressureCommand(t, claim))
 	require.NoError(t, err, "routeToLeaseBlocking must succeed once slot frees")
 	assert.GreaterOrEqual(t, time.Since(start), 30*time.Millisecond,
 		"should have waited for inbox space rather than returning immediately")
@@ -576,6 +623,7 @@ func TestRouteToLeaseBlocking_RetriesOnFullInbox(t *testing.T) {
 // can't occur in production (NewLeaseActor unconditionally spawns the
 // run loop). See ENG-148 PR5b-2 deviation E-1.
 func TestRouteToLeaseBlocking_ReturnsCtxErr(t *testing.T) {
+	const leaseUUID = "0192f1a0-1111-4abc-8def-000000000106"
 	firstInspected := make(chan struct{})
 	var inspectCount atomic.Int32
 	mock := &mockDockerClient{
@@ -588,20 +636,22 @@ func TestRouteToLeaseBlocking_ReturnsCtxErr(t *testing.T) {
 		},
 	}
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID, Status: backend.ProvisionStatusReady, ContainerIDs: []string{"c0"}}},
 	})
 	defer b.stopCancel()
+	runtime := installReadyRuntimeProofForTest(t, b, leaseUUID)
 
 	// Saturate: first message wedges actor; next 16 queue.
-	require.True(t, b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "c0"}))
+	require.True(t, b.routeActorObservation(mustContainerDiedObservation(t, "c0", runtime)))
 	<-firstInspected
+	claim := actorOperationClaimForTest(t, leaseUUID)
 	for i := 0; i < 16; i++ {
-		require.True(t, b.routeToLease("lease-1", leasesm.ContainerDiedMsg{ContainerID: "cN"}))
+		require.True(t, b.routeToLease(leaseUUID, actorBackpressureCommand(t, claim)))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	err := b.routeToLeaseBlocking(ctx, "lease-1", leasesm.ContainerDiedMsg{ContainerID: "c-timeout"})
+	err := b.routeToLeaseBlocking(ctx, leaseUUID, actorBackpressureCommand(t, claim))
 	assert.ErrorIs(t, err, context.DeadlineExceeded,
 		"routeToLeaseBlocking must surface ctx.Err() when caller's ctx expires while inbox is wedged")
 }
@@ -614,28 +664,24 @@ func TestRouteToLeaseBlocking_ReturnsCtxErr(t *testing.T) {
 // guarantee that Backend.Provision never spawns work behind a rejected
 // SM transition.
 func TestLeaseActor_ProvisionRequestedSMRejection(t *testing.T) {
+	leaseUUID := durableCallbackTestLeaseUUID
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
 		// Ready state does NOT Permit evProvisionRequested — SM rejects.
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID, Status: backend.ProvisionStatusReady}},
 	})
 	defer b.stopCancel()
 
 	// Warm the actor so its SM is in Ready.
-	require.Equal(t, backend.ProvisionStatusReady, b.actorFor("lease-1").State())
+	require.Equal(t, backend.ProvisionStatusReady, b.actorFor(leaseUUID).State())
 
-	ack := make(chan error, 1)
-	ok := b.routeToLease("lease-1", leasesm.ProvisionRequestedMsg{
-		Cancel: func() {},
-		Work: func() (string, backend.Reason, leasesm.ProvisionSuccessResult, map[string]string, error) {
-			t.Fatal("work closure must not run when SM rejects the transition")
-			return "", "", leasesm.ProvisionSuccessResult{}, nil, nil
-		},
-		Ack: ack,
-	})
+	claim := actorOperationClaimForTest(t, leaseUUID)
+	command, ack, err := leasesm.NewProvisionCommand(context.Background(), claim)
+	require.NoError(t, err)
+	ok := b.routeToLease(leaseUUID, command)
 	require.True(t, ok, "routeToLease itself must succeed; rejection is at SM-fire time")
 
 	select {
-	case err := <-ack:
+	case err := <-ack.Result():
 		require.Error(t, err, "SM rejection must surface as a non-nil ack error")
 	case <-time.After(2 * time.Second):
 		t.Fatal("ack never arrived from rejected provisionRequestedMsg")
@@ -656,22 +702,23 @@ func TestLeaseActor_RegistryDeletedBeforeDoneClose(t *testing.T) {
 			return nil
 		},
 	}
-	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: durableCallbackTestLeaseUUID,
 			Tenant:       "tenant-a",
 			ContainerIDs: []string{"c1"},
 			Status:       backend.ProvisionStatusReady},
 		},
 	})
 	defer b.stopCancel()
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 
-	first := b.actorFor("lease-1")
-	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+	first := b.actorFor(durableCallbackTestLeaseUUID)
+	require.NoError(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID))
 	<-first.Done()
 
 	// By the time done is closed, Delete must have already run — so
 	// actorFor returns a fresh actor, not the exiting one.
-	second := b.actorFor("lease-1")
+	second := b.actorFor(durableCallbackTestLeaseUUID)
 	require.NotSame(t, first, second,
 		"fresh actorFor after Deprovision+done must not return the exiting actor — Delete must fire before close(done)")
 }
@@ -743,34 +790,6 @@ func TestBackend_ShutdownDrainsAllActors(t *testing.T) {
 	assert.Equal(t, 0, remaining, "b.actors must be empty after full shutdown drain")
 }
 
-// TestHandleContainerDeath_ShutdownDoesNotHang guards the sync shim's
-// stopCtx branch: once the backend is shutting down, the shim must return
-// promptly instead of blocking on a done channel the actor will never close.
-func TestHandleContainerDeath_ShutdownDoesNotHang(t *testing.T) {
-	mock := &mockDockerClient{}
-
-	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			ContainerIDs: []string{"c1"},
-			Status:       backend.ProvisionStatusReady},
-		},
-	})
-
-	b.stopCancel()
-
-	returned := make(chan struct{})
-	go func() {
-		b.handleContainerDeath("c1")
-		close(returned)
-	}()
-
-	select {
-	case <-returned:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("handleContainerDeath did not return within 500ms after shutdown")
-	}
-}
-
 // TestHandlerPanic_UnblocksReplyChannel pins the invariant that a panic
 // inside the actor's message-handler dispatch does NOT leave the caller
 // blocked on their reply/ack channel forever. Before the onPanic hook
@@ -783,68 +802,6 @@ func TestHandleContainerDeath_ShutdownDoesNotHang(t *testing.T) {
 // for evContainerDied — but that has no reply). The cleanest proof is
 // to synthesize a deprovisionMsg directly and drive the actor, making
 // the handler panic and asserting the reply channel receives an error.
-
-// TestAckOrAbort_HonorsAckEvenWhenCtxCanceled pins the ctx-vs-ack race
-// fix. Go's select picks pseudo-randomly when multiple arms are ready,
-// so a naive select on {ack, ctx.Done, stopCtx.Done} can take the
-// cancellation arm even though the actor has acked — leading the caller
-// to roll back while the actor proceeds.
-//
-// We can't deterministically schedule the race in a unit test, but we
-// can verify the post-cancel non-blocking ack read: pre-cancel the ctx
-// AND pre-ack, then call ackOrAbort and assert it returns (true, nil)
-// instead of ctx.Err.
-func TestAckOrAbort_HonorsAckEvenWhenCtxCanceled(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, nil)
-	defer b.stopCancel()
-
-	t.Run("ack_success_beats_ctx_cancel", func(t *testing.T) {
-		ack := make(chan error, 1)
-		ack <- nil // actor "acked" success
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel() // caller "gave up"
-
-		accepted, err := b.ackOrAbort(ctx, ack)
-		assert.True(t, accepted, "ackOrAbort must honor pre-queued ack even when ctx is already canceled")
-		assert.NoError(t, err)
-	})
-
-	t.Run("ack_error_beats_ctx_cancel", func(t *testing.T) {
-		ack := make(chan error, 1)
-		synthErr := fmt.Errorf("synthetic ack error")
-		ack <- synthErr
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		accepted, err := b.ackOrAbort(ctx, ack)
-		assert.False(t, accepted)
-		assert.ErrorIs(t, err, synthErr,
-			"ackOrAbort must surface actor-rejected error, not ctx.Err")
-	})
-
-	t.Run("no_ack_ctx_canceled", func(t *testing.T) {
-		ack := make(chan error, 1)
-		// no pre-ack
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		accepted, err := b.ackOrAbort(ctx, ack)
-		assert.False(t, accepted)
-		assert.ErrorIs(t, err, context.Canceled,
-			"with no ack and canceled ctx, ackOrAbort must return ctx.Err")
-	})
-
-	t.Run("no_ack_stop_ctx", func(t *testing.T) {
-		ack := make(chan error, 1)
-		ctx := context.Background() // caller ctx fine
-		b.stopCancel()              // backend shutting down
-
-		accepted, err := b.ackOrAbort(ctx, ack)
-		assert.False(t, accepted)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "backend shutting down")
-	})
-}
 
 // TestConcurrentProvisionDeprovision_Stress is an adversarial concurrency
 // test that hammers Backend.Provision and Backend.Deprovision on a small
@@ -978,8 +935,8 @@ func TestConcurrentProvisionDeprovision_Stress(t *testing.T) {
 // TestDeprovision_HonorsLateReplyAfterCtxCancel pins bug_003: when the
 // actor acks success at the same instant as the caller's ctx cancels,
 // Go's select can take the cancellation arm and return ctx.Err() even
-// though doDeprovision already fully committed. Mirroring ackOrAbort's
-// pattern, the shim now does a non-blocking re-read of reply after
+// though doDeprovision already fully committed. The shim therefore does a
+// non-blocking re-read of reply after
 // cancellation so the actor's authoritative outcome wins.
 func TestDeprovision_HonorsLateReplyAfterCtxCancel(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, nil)
@@ -1020,8 +977,8 @@ func TestDeprovision_HonorsLateReplyAfterCtxCancel(t *testing.T) {
 
 // TestProvision_ReleasesPoolOnRouteFailure pins bug_001: when
 // Backend.Provision's handoff to the actor fails (routeToLeaseBlocking
-// errors out OR ackOrAbort rejects), the pool allocations made during
-// the preamble must be released, or they leak with no owning provision
+// errors out or durable admission is explicitly rejected), the pool allocations
+// made during the preamble must be released, or they leak with no owning provision
 // entry. A retry on the same lease would then fail TryAllocate with
 // "already allocated" and the lease becomes unrecoverable until
 // backend restart.
@@ -1038,7 +995,7 @@ func TestProvision_ReleasesPoolOnRouteFailure(t *testing.T) {
 	// so the leak path is reachable.
 	b.stopCancel()
 
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1,
+	req := newProvisionRequest(durableCallbackTestLeaseUUID, "tenant-a", "docker-small", 1,
 		validManifestJSON("nginx:latest"))
 	err := b.Provision(context.Background(), req)
 	require.Error(t, err, "Provision must fail when backend is shut down")

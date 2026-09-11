@@ -9,7 +9,9 @@ import (
 	"github.com/manifest-network/fred/internal/metrics"
 )
 
-// recordWatermillMetrics records the outcome of a Watermill message handler.
+// recordWatermillMetrics records the outcome under the established internal
+// message-topic metric labels. Callback ingress uses the same label even though
+// Manager invokes that adapter synchronously rather than through Watermill.
 func recordWatermillMetrics(topic string, err error) {
 	outcome := metrics.OutcomeSuccess
 	if err != nil {

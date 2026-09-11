@@ -2,8 +2,9 @@ package backend
 
 import "errors"
 
-// detailedError pairs a fred sentinel with the detail a backend authored inside
-// a VALIDATED error envelope.
+// detailedError pairs a fred sentinel with endpoint-provided detail from a
+// VALIDATED error envelope. The envelope proves protocol conformance, not
+// cryptographic authorship; transport trust is a deployment concern.
 //
 // Error() renders only the detail. The sentinel identity travels through
 // Unwrap() — for errors.Is — and never through string concatenation, because
@@ -26,7 +27,7 @@ type detailedError struct {
 	detail   string
 }
 
-// withDetail attaches a backend-authored detail to a sentinel. detail must come
+// withDetail attaches declared-envelope detail to a sentinel. detail must come
 // from a declared field of an envelope this package has already parsed — never
 // from a raw response body (see errMalformedErrorBody).
 func withDetail(sentinel error, detail string) error {
@@ -43,7 +44,7 @@ func (e *detailedError) Error() string { return e.detail }
 // hold.
 func (e *detailedError) Unwrap() error { return e.sentinel }
 
-// Detail returns the backend-authored detail of err, if it carries one. Reports
+// Detail returns the declared-envelope detail of err, if it carries one. Reports
 // false for any other error, including a bare sentinel.
 func Detail(err error) (string, bool) {
 	var de *detailedError

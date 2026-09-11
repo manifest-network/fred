@@ -1,13 +1,68 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDevInitDockerConfigTemplateIsValid(t *testing.T) {
+	script, err := os.ReadFile(filepath.Join("..", "..", "scripts", "dev-init.sh"))
+	require.NoError(t, err)
+
+	const heredocStart = `cat >| "$DOCKER_BACKEND_TMP" <<YAML`
+	start := strings.Index(string(script), heredocStart)
+	require.NotEqual(t, -1, start, "docker config template not found")
+	template := string(script)[start+len(heredocStart):]
+	end := strings.Index(template, "\nYAML\n")
+	require.NotEqual(t, -1, end, "docker config template terminator not found")
+	template = template[:end]
+
+	callbackSecret := strings.Repeat("a", 32) + `"\suffix`
+	callbackSecretJSON, err := json.Marshal(callbackSecret)
+	require.NoError(t, err)
+	values := map[string]string{
+		"CALLBACK_DB_PATH_JSON":           `"/work/fred/callbacks.db"`,
+		"CALLBACK_SECRET_JSON":            string(callbackSecretJSON),
+		"DIAGNOSTICS_DB_PATH_JSON":        `"/work/fred/diagnostics.db"`,
+		"DOCKER_BACKEND_LISTEN_ADDR_JSON": `":9001"`,
+		"RELEASES_DB_PATH_JSON":           `"/work/fred/releases.db"`,
+		"RETENTION_DB_PATH_JSON":          `"/work/fred/retention.db"`,
+		"SKU_DOCKER_LARGE_JSON":           `"550e8400-e29b-41d4-a716-446655440004"`,
+		"SKU_DOCKER_MEDIUM_JSON":          `"550e8400-e29b-41d4-a716-446655440003"`,
+		"SKU_DOCKER_MICRO_JSON":           `"550e8400-e29b-41d4-a716-446655440001"`,
+		"SKU_DOCKER_SMALL_JSON":           `"550e8400-e29b-41d4-a716-446655440002"`,
+		"VOLUME_DATA_PATH_JSON":           `"/home/fred/fred-volumes"`,
+		"VOLUME_MOUNT_PATH_JSON":          `"/"`,
+	}
+	var unknown []string
+	generated := os.Expand(template, func(name string) string {
+		value, ok := values[name]
+		if !ok {
+			unknown = append(unknown, name)
+		}
+		return value
+	})
+	require.Empty(t, unknown, "test fixture must expand every template variable")
+
+	configPath := filepath.Join(t.TempDir(), "docker-backend.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte(generated), 0o600))
+	cfg, err := loadConfig(configPath)
+	require.NoError(t, err)
+	require.NoError(t, cfg.Validate(), "dev-init must generate a config accepted by docker-backend")
+	require.Equal(t, "/", cfg.VolumeMountPath)
+	require.Equal(t, "/work/fred/callbacks.db", cfg.CallbackDBPath)
+	require.Equal(t, "/work/fred/releases.db", cfg.ReleasesDBPath)
+	require.Equal(t, "/work/fred/retention.db", cfg.RetentionDBPath)
+	require.Equal(t, "/work/fred/diagnostics.db", cfg.DiagnosticsDBPath)
+	require.Equal(t, callbackSecret, string(cfg.CallbackSecret),
+		"JSON-compatible YAML quoting must preserve arbitrary HMAC secret bytes")
+}
 
 // TestLoadConfig_PartialSKUProfiles_DoesNotMergeDefaults is the ENG-238
 // regression test. A YAML config that declares a single sku_profiles entry
@@ -32,6 +87,7 @@ sku_profiles:
     memory_mb: 2048
     disk_mb: 4096
 volume_data_path: "/var/lib/fred/volumes"
+volume_mount_path: "/var/lib/fred/volumes"
 volume_filesystem: "btrfs"
 `
 	dir := t.TempDir()

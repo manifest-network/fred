@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -89,6 +90,14 @@ func TestParseManifest(t *testing.T) {
 		_, err := manifest.ParseManifest([]byte(data))
 		assert.Error(t, err)
 	})
+}
+
+func TestBackendConstructionRejectsMissingDependencies(t *testing.T) {
+	_, err := newBackend(context.Background(), Config{}, nil, testDockerStorageIdentity{})
+	require.ErrorContains(t, err, "logger")
+
+	_, err = newBackend(context.Background(), Config{}, slog.Default(), nil)
+	require.ErrorContains(t, err, "identity resolver")
 }
 
 func TestParseManifest_Env(t *testing.T) {
@@ -185,6 +194,7 @@ func TestConfigValidation(t *testing.T) {
 		cfg.CallbackSecret = "this-is-a-32-character-secret!!x" // 33 chars
 		cfg.HostAddress = "192.168.1.100"
 		cfg.VolumeDataPath = "/var/lib/fred/volumes"
+		cfg.VolumeMountPath = "/var/lib/fred"
 		cfg.VolumeFilesystem = "btrfs"
 		return cfg
 	}
@@ -551,6 +561,7 @@ func TestConfigHardeningValidation(t *testing.T) {
 		cfg.CallbackSecret = "this-is-a-32-character-secret!!x"
 		cfg.HostAddress = "192.168.1.100"
 		cfg.VolumeDataPath = "/var/lib/fred/volumes"
+		cfg.VolumeMountPath = "/var/lib/fred"
 		cfg.VolumeFilesystem = "btrfs"
 		return cfg
 	}

@@ -28,6 +28,9 @@ import (
 // directly. The probe's effective timeout is set on rest.Config at
 // build time (see kubeclient.go).
 func (b *Backend) Health(ctx context.Context) error {
+	if err := b.requireStorageIdentity(ctx); err != nil {
+		return fmt.Errorf("backend storage identity unhealthy: %w", err)
+	}
 	// TODO(ENG-134+): wire ctx through once provisioner methods consume
 	// ctx-aware client-go APIs. The current ServerVersion() reachability
 	// probe does not accept ctx; its effective bound is rest.Config.Timeout
@@ -59,6 +62,12 @@ func (b *Backend) Health(ctx context.Context) error {
 	}
 	if _, err := cs.Discovery().ServerVersion(); err != nil {
 		return fmt.Errorf("k3s API unreachable: %w", err)
+	}
+	if b.callbackStore == nil {
+		return fmt.Errorf("callback store unhealthy: not configured")
+	}
+	if err := b.callbackStore.Healthy(); err != nil {
+		return fmt.Errorf("callback store unhealthy: %w", err)
 	}
 	return nil
 }

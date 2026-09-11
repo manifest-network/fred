@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/util"
 )
@@ -131,8 +132,8 @@ func TestTokenTracker_Cleanup(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "tokens.db")
 	tracker, err := NewTokenTracker(TokenTrackerConfig{
 		DBPath:          dbPath,
-		MaxAge:          50 * time.Millisecond, // Very short for testing
-		CleanupInterval: 1 * time.Hour,         // Don't auto-cleanup
+		MaxAge:          1 * time.Minute,
+		CleanupInterval: 1 * time.Hour, // Don't auto-cleanup
 	})
 	require.NoError(t, err)
 	defer tracker.Close()
@@ -145,8 +146,18 @@ func TestTokenTracker_Cleanup(t *testing.T) {
 	err = tracker.TryUse("token-1")
 	require.Equal(t, ErrTokenAlreadyUsed, err, "TryUse() before expiry should return ErrTokenAlreadyUsed")
 
-	// Wait for expiry
-	time.Sleep(60 * time.Millisecond)
+	// Expire both records deterministically. A sub-100ms wall-clock window makes
+	// the pre-expiry assertion flaky when the full repository suite is under CPU
+	// contention, and this test is about cleanup semantics rather than timers.
+	err = tracker.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		expired := util.TimeToBytes(time.Now().Add(-time.Second))
+		if err := b.Put([]byte("token-1"), expired); err != nil {
+			return err
+		}
+		return b.Put([]byte("token-2"), expired)
+	})
+	require.NoError(t, err)
 
 	// Manual cleanup
 	err = tracker.cleanup()

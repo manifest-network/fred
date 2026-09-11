@@ -21,6 +21,26 @@ builds:
     ldflags:
       - -s -w -X main.version={{.Version}}
 
+  - id: placement-preflight
+    main: ./cmd/placement-preflight
+    binary: placement-preflight
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+  - id: placement-repair
+    main: ./cmd/placement-repair
+    binary: placement-repair
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
 # NOTE: k3s-backend is intentionally NOT released as an artifact. It is an
 # experimental, non-functional scaffold (ENG-133) whose provisioner returns
 # "not implemented"; shipping it as a release binary/archive would imply it is
@@ -33,9 +53,15 @@ archives:
   - id: docker-backend
     ids: [docker-backend]
     name_template: "docker-backend_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: placement-preflight
+    ids: [placement-preflight]
+    name_template: "placement-preflight_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: placement-repair
+    ids: [placement-repair]
+    name_template: "placement-repair_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 dockers:
-  - ids: [providerd]
+  - ids: [providerd, placement-preflight, placement-repair]
     dockerfile: Dockerfile.goreleaser
     use: buildx
     image_templates:

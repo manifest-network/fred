@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 )
@@ -106,9 +107,8 @@ func runManagerStressTest(t *testing.T, numEvents, numGoroutines int) {
 		},
 	}
 
-	mgr, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-uuid",
-		CallbackBaseURL: "http://localhost:8080",
+	mgr, err := newTestManager(t, ManagerConfig{
+		ProviderUUID: "provider-uuid",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -239,9 +239,8 @@ func TestManager_SustainedLoad(t *testing.T) {
 		},
 	}
 
-	mgr, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-uuid",
-		CallbackBaseURL: "http://localhost:8080",
+	mgr, err := newTestManager(t, ManagerConfig{
+		ProviderUUID: "provider-uuid",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -385,9 +384,8 @@ func TestManager_WithBackendLatency(t *testing.T) {
 				},
 			}
 
-			mgr, err := NewManager(ManagerConfig{
-				ProviderUUID:    "provider-uuid",
-				CallbackBaseURL: "http://localhost:8080",
+			mgr, err := newTestManager(t, ManagerConfig{
+				ProviderUUID: "provider-uuid",
 			}, router, mockChain)
 			require.NoError(t, err)
 
@@ -472,6 +470,12 @@ func (m *mockLatencyBackend) Deprovision(ctx context.Context, leaseUUID string) 
 func (m *mockLatencyBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
 	return nil, nil
 }
+func (m *mockLatencyBackend) ListProvisionsWithIdentity(
+	ctx context.Context,
+) ([]backend.ProvisionInfo, backendidentity.ID, error) {
+	rows, err := m.ListProvisions(ctx)
+	return rows, testBackendStorageID(m.name), err
+}
 func (m *mockLatencyBackend) LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error) {
 	return nil, nil
 }
@@ -506,6 +510,12 @@ func (m *mockLatencyBackend) GetLoadStats(_ context.Context) (*backend.LoadStats
 func (m *mockLatencyBackend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
 	return nil, nil
 }
+func (m *mockLatencyBackend) ListRetentionsWithIdentity(
+	ctx context.Context,
+) ([]backend.RetainedLease, backendidentity.ID, error) {
+	rows, err := m.ListRetentions(ctx)
+	return rows, testBackendStorageID(m.name), err
+}
 
 // TestManager_HighConcurrencySustained tests sustained high concurrency.
 func TestManager_HighConcurrencySustained(t *testing.T) {
@@ -532,9 +542,8 @@ func TestManager_HighConcurrencySustained(t *testing.T) {
 		},
 	}
 
-	mgr, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-uuid",
-		CallbackBaseURL: "http://localhost:8080",
+	mgr, err := newTestManager(t, ManagerConfig{
+		ProviderUUID: "provider-uuid",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -680,9 +689,8 @@ func BenchmarkManager_EndToEnd(b *testing.B) {
 		},
 	}
 
-	mgr, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-uuid",
-		CallbackBaseURL: "http://localhost:8080",
+	mgr, err := newTestManager(b, ManagerConfig{
+		ProviderUUID: "provider-uuid",
 	}, router, mockChain)
 	if err != nil {
 		b.Fatal(err)

@@ -2,15 +2,187 @@ package leasesm
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 	"github.com/manifest-network/fred/internal/backend/shared/workbarrier"
+	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/maintenanceid"
+	"github.com/manifest-network/fred/internal/operationid"
 )
+
+func createdMaintenanceDispatch(
+	t *testing.T,
+	admission shared.MaintenanceIntentAdmission,
+) shared.MaintenanceIntentDispatch {
+	t.Helper()
+	dispatch, ok := admission.CreatedDispatch()
+	require.True(t, ok, "maintenance admission must carry first-dispatch authority")
+	return dispatch
+}
+
+func mustLeaseSMOperationID(text string) shared.OperationID {
+	id, err := operationid.Parse(text)
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
+func newBoundLeaseSMCallbackStore(
+	t testing.TB,
+	dbPath, backendName string,
+) *shared.CallbackStore {
+	t.Helper()
+	boundPath, err := shared.BindAuthoritativeStorePath(dbPath)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, boundPath.Close()) }()
+	pair, err := backendidentity.BindMarkerPair(
+		dbPath+".storage-identity.json",
+		dbPath+".storage-identity-anchor.json",
+	)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, pair.Close()) }()
+	storage, err := pair.InitializeWithStores(
+		backendName,
+		"leasesm-test-substrate",
+		backendidentity.MarkerPairStoreHooks{
+			Profile: backendidentity.InitializationProfileFresh,
+			Prepare: func(
+				pending backendidentity.PendingStorage,
+				profile backendidentity.InitializationProfile,
+			) error {
+				return shared.PrepareBoundCallbackStoreStorage(boundPath, pending, profile)
+			},
+			Check: func(pending backendidentity.PendingStorage) error {
+				return shared.CheckBoundCallbackStoreStorage(boundPath, pending)
+			},
+			Verify: func(verified backendidentity.VerifiedStorage) error {
+				return shared.VerifyBoundCallbackStoreStorage(boundPath, verified)
+			},
+		},
+	)
+	require.NoError(t, err)
+	gate, err := backendidentity.NewStorageAuthorityGate(func(error) {})
+	require.NoError(t, err)
+	store, err := shared.OpenIdentityBoundCallbackStore(
+		shared.CallbackStoreConfig{DBPath: dbPath}, storage, gate,
+	)
+	require.NoError(t, err)
+	return store
+}
+
+func newBoundLeaseSMReleaseStore(
+	t testing.TB,
+	dbPath, backendName string,
+) *shared.ReleaseStore {
+	t.Helper()
+	boundPath, err := shared.BindAuthoritativeStorePath(dbPath)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, boundPath.Close()) }()
+	pair, err := backendidentity.BindMarkerPair(
+		dbPath+".storage-identity.json",
+		dbPath+".storage-identity-anchor.json",
+	)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, pair.Close()) }()
+	storage, err := pair.InitializeWithStores(
+		backendName,
+		"leasesm-test-substrate",
+		backendidentity.MarkerPairStoreHooks{
+			Profile: backendidentity.InitializationProfileFresh,
+			Prepare: func(pending backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
+				return shared.PrepareBoundReleaseStoreStorage(boundPath, pending, profile)
+			},
+			Check: func(pending backendidentity.PendingStorage) error {
+				return shared.CheckBoundReleaseStoreStorage(boundPath, pending)
+			},
+			Verify: func(verified backendidentity.VerifiedStorage) error {
+				return shared.VerifyBoundReleaseStoreStorage(boundPath, verified)
+			},
+		},
+	)
+	require.NoError(t, err)
+	gate, err := backendidentity.NewStorageAuthorityGate(func(error) {})
+	require.NoError(t, err)
+	store, err := shared.OpenIdentityBoundReleaseStore(
+		shared.ReleaseStoreConfig{DBPath: dbPath}, storage, gate,
+	)
+	require.NoError(t, err)
+	return store
+}
+
+func newBoundLeaseSMMaintenanceStores(
+	t testing.TB,
+	dir, backendName string,
+) (*shared.CallbackStore, *shared.ReleaseStore, backendidentity.VerifiedStorage, *backendidentity.StorageAuthorityGate) {
+	t.Helper()
+	callbackPath := filepath.Join(dir, "callbacks.db")
+	releasePath := filepath.Join(dir, "releases.db")
+	callbackBound, err := shared.BindAuthoritativeStorePath(callbackPath)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, callbackBound.Close()) }()
+	releaseBound, err := shared.BindAuthoritativeStorePath(releasePath)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, releaseBound.Close()) }()
+	pair, err := backendidentity.BindMarkerPair(
+		filepath.Join(dir, "storage-identity.json"),
+		filepath.Join(dir, "storage-identity-anchor.json"),
+	)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, pair.Close()) }()
+	storage, err := pair.InitializeWithStores(
+		backendName,
+		"leasesm-test-substrate",
+		backendidentity.MarkerPairStoreHooks{
+			Profile: backendidentity.InitializationProfileFresh,
+			Prepare: func(
+				pending backendidentity.PendingStorage,
+				profile backendidentity.InitializationProfile,
+			) error {
+				if err := shared.PrepareBoundCallbackStoreStorage(callbackBound, pending, profile); err != nil {
+					return err
+				}
+				return shared.PrepareBoundReleaseStoreStorage(releaseBound, pending, profile)
+			},
+			Check: func(pending backendidentity.PendingStorage) error {
+				if err := shared.CheckBoundCallbackStoreStorage(callbackBound, pending); err != nil {
+					return err
+				}
+				return shared.CheckBoundReleaseStoreStorage(releaseBound, pending)
+			},
+			Verify: func(verified backendidentity.VerifiedStorage) error {
+				if err := shared.VerifyBoundCallbackStoreStorage(callbackBound, verified); err != nil {
+					return err
+				}
+				return shared.VerifyBoundReleaseStoreStorage(releaseBound, verified)
+			},
+		},
+	)
+	require.NoError(t, err)
+	gate, err := backendidentity.NewStorageAuthorityGate(func(error) {})
+	require.NoError(t, err)
+	callbacks, err := shared.OpenIdentityBoundCallbackStore(
+		shared.CallbackStoreConfig{DBPath: callbackPath}, storage, gate,
+	)
+	require.NoError(t, err)
+	releases, err := shared.OpenIdentityBoundReleaseStore(
+		shared.ReleaseStoreConfig{DBPath: releasePath}, storage, gate,
+	)
+	require.NoError(t, err)
+	return callbacks, releases, storage, gate
+}
 
 // mockProvisionStore is a real concurrent in-memory implementation of
 // LeaseProvisionStore. The closure passed to UpdateFn runs UNDER the
@@ -28,6 +200,90 @@ type mockProvisionStore struct {
 	mu     sync.Mutex
 	states map[string]*ProvisionState
 }
+
+// leaseSMTestMutation is the narrow no-op physical capability used by actor
+// fixtures. It still crosses Runner.Step, so the real construction-bound
+// settlement protocol—not a raw release-store escape hatch—mints success.
+type leaseSMTestMutation struct{ runner substratemutation.Runner }
+
+func testProjectionForRelease(release shared.Release) ([]string, map[string][]string) {
+	var ids []string
+	services := make(map[string][]string, len(release.Items))
+	for _, item := range release.Items {
+		for i := range item.Quantity {
+			id := item.ServiceName + "-container-" + string(rune('a'+i))
+			ids = append(ids, id)
+			services[item.ServiceName] = append(services[item.ServiceName], id)
+		}
+	}
+	return ids, services
+}
+
+func bindLeaseSMMaintenanceExecutor(
+	t testing.TB,
+	settlement *shared.MaintenanceSettlement,
+) {
+	t.Helper()
+	err := shared.BindMaintenanceSubstrateExecutor(
+		settlement,
+		func(ctx context.Context, _ string) (context.Context, func(), error) {
+			return ctx, func() {}, nil
+		},
+		func(context.Context, string, error) error { return nil },
+		func(runner substratemutation.Runner, _ shared.MaintenancePhysicalSubject) leaseSMTestMutation {
+			return leaseSMTestMutation{runner: runner}
+		},
+		func(ctx context.Context, mutation leaseSMTestMutation, _ shared.MaintenancePhysicalSubject) error {
+			return mutation.runner.Step(ctx, "leasesm maintenance fixture", func(context.Context) error { return nil })
+		},
+		func(_ context.Context, subject shared.MaintenancePhysicalSubject) (shared.MaintenancePhysicalEvidence, error) {
+			release, ok := subject.TargetRelease()
+			if !ok {
+				return shared.MaintenancePhysicalEvidence{}, errors.New("maintenance fixture has no target release")
+			}
+			ids, services := testProjectionForRelease(release)
+			return shared.NewMaintenanceTargetReady(subject, ids, services)
+		},
+	)
+	require.NoError(t, err)
+}
+
+func bindLeaseSMOperationExecutor(
+	t testing.TB,
+	settlement *shared.OperationSettlement,
+	projection ...ReplaceSuccessProjection,
+) {
+	t.Helper()
+	err := shared.BindOperationSubstrateExecutor(
+		settlement,
+		func(ctx context.Context, _ string) (context.Context, func(), error) {
+			return ctx, func() {}, nil
+		},
+		func(context.Context, string, error) error { return nil },
+		func(runner substratemutation.Runner, _ shared.OperationPhysicalSubject) leaseSMTestMutation {
+			return leaseSMTestMutation{runner: runner}
+		},
+		func(ctx context.Context, mutation leaseSMTestMutation, _ shared.OperationPhysicalSubject) error {
+			return mutation.runner.Step(ctx, "leasesm operation fixture", func(context.Context) error { return nil })
+		},
+		func(_ context.Context, subject shared.OperationPhysicalSubject) (shared.OperationPhysicalEvidence, error) {
+			if len(projection) != 0 {
+				return shared.NewOperationTargetReady(
+					subject, projection[0].ContainerIDs, projection[0].ServiceContainers,
+				)
+			}
+			release, ok := subject.ExpectedRelease()
+			if !ok {
+				return shared.OperationPhysicalEvidence{}, errors.New("operation fixture has no expected release")
+			}
+			ids, services := testProjectionForRelease(release)
+			return shared.NewOperationTargetReady(subject, ids, services)
+		},
+	)
+	require.NoError(t, err)
+}
+
+const testActorLeaseUUID = "11111111-1111-4111-8111-111111111111"
 
 func newMockProvisionStore() *mockProvisionStore {
 	return &mockProvisionStore{states: make(map[string]*ProvisionState)}
@@ -65,6 +321,73 @@ func (m *mockProvisionStore) Get(uuid string) (*ProvisionState, bool) {
 	return &snap, true
 }
 
+func (m *mockProvisionStore) LookupStatus(uuid string) (backend.ProvisionStatus, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.states[uuid]
+	if !ok {
+		return backend.ProvisionStatusUnknown, false
+	}
+	return p.Status, true
+}
+
+func (m *mockProvisionStore) Exists(uuid string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.states[uuid]
+	return ok
+}
+
+func classifyMockReadyProjection(
+	state *ProvisionState,
+	proof shared.RuntimeGenerationProof,
+	instanceID string,
+) ObservationGenerationState {
+	if state == nil {
+		return ObservationGenerationAbsent
+	}
+	if !proof.Valid() || state.LeaseUUID != proof.LeaseUUID() ||
+		state.ActiveReleaseVersion <= 0 || state.ActiveReleaseVersion != proof.Version() {
+		return ObservationGenerationSuperseded
+	}
+	switch proof.AuthorityClass() {
+	case shared.ReleaseAuthorityTyped:
+		if !state.ActiveOperationID.Valid() || state.ActiveOperationID != proof.OperationID() {
+			return ObservationGenerationSuperseded
+		}
+	case shared.ReleaseAuthorityLegacy:
+		if !state.ActiveOperationID.IsZero() || !proof.OperationID().IsZero() {
+			return ObservationGenerationSuperseded
+		}
+	default:
+		return ObservationGenerationSuperseded
+	}
+	if state.Status != backend.ProvisionStatusReady {
+		return ObservationGenerationAdvanced
+	}
+	if instanceID != "" && !slices.Contains(state.ContainerIDs, instanceID) {
+		return ObservationGenerationAdvanced
+	}
+	return ObservationGenerationCurrent
+}
+
+func (m *mockProvisionStore) ClassifyReadyRuntime(
+	proof shared.RuntimeGenerationProof,
+) ObservationGenerationState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return classifyMockReadyProjection(m.states[proof.LeaseUUID()], proof, "")
+}
+
+func (m *mockProvisionStore) ClassifyReadyInstance(
+	proof shared.RuntimeGenerationProof,
+	instanceID string,
+) ObservationGenerationState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return classifyMockReadyProjection(m.states[proof.LeaseUUID()], proof, instanceID)
+}
+
 // UpdateFn runs fn UNDER the lock, mirroring backendProvisionStore. The
 // closure idempotence requirement is the caller's responsibility (see
 // LeaseProvisionStore docstring in leasesm.go).
@@ -100,8 +423,6 @@ func (mockSMMetrics) ActorCreated()                 {}
 func (mockSMMetrics) WorkerPanic(_ string)          {}
 func (mockSMMetrics) ActorPanic()                   {}
 func (mockSMMetrics) TerminalEventDropped(_ string) {}
-func (mockSMMetrics) ActiveProvisionsInc()          {}
-func (mockSMMetrics) ActiveProvisionsDec()          {}
 
 // mockInstanceInspector implements InstanceInspector with a function-
 // field stub. Tests set InspectInstanceFn to control the inspect
@@ -137,19 +458,40 @@ func (m *mockDiagnosticsGatherer) GatherDiagnostics(ctx context.Context, instanc
 // that need specific behavior set the relevant field; everything else
 // inherits sensible defaults.
 type testActorOpts struct {
-	Logger                       *slog.Logger
-	StopCtx                      context.Context
-	WG                           *sync.WaitGroup
-	Inspector                    InstanceInspector
-	Diag                         DiagnosticsGatherer
-	CallbackSender               *shared.CallbackSender
-	ProvisionStore               LeaseProvisionStore
-	Metrics                      SMMetrics
-	OnTerminated                 func(uuid string)
-	PersistDiagnosticsFn         func(entry shared.DiagnosticEntry, ids []string, keys map[string]string)
-	PersistDiagnosticsWithLogsFn func(entry shared.DiagnosticEntry, logs map[string]string)
-	SendCallbackFn               func(uuid, url string, status backend.CallbackStatus, errMsg string)
-	DoDeprovisionFn              func(ctx context.Context, leaseUUID string) error
+	Logger                    *slog.Logger
+	StopCtx                   context.Context
+	WG                        *sync.WaitGroup
+	WorkerDrainTimeout        time.Duration
+	Inspector                 InstanceInspector
+	Diag                      DiagnosticsGatherer
+	ProvisionStore            LeaseProvisionStore
+	Metrics                   SMMetrics
+	ProvisionWorkFn           func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome
+	RestoreWorkFn             func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome
+	MaintenanceWorkFn         func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome
+	OnTerminated              func(uuid string)
+	PersistDiagnosticsFn      func(entry shared.DiagnosticEntry, ids []string, keys map[string]string)
+	SendOperationCallbackFn   func(uuid, url string, status backend.CallbackStatus, errMsg string)
+	SendLifecycleFailureFn    func(runtime shared.RuntimeGenerationProof, errMsg string)
+	SendMaintenanceCallbackFn func(claim shared.MaintenanceIntentClaim, status backend.CallbackStatus, errMsg string)
+	DoDeprovisionFn           func(ctx context.Context, scope ActorCloseScope) error
+}
+
+func testRecoveryLineage(t *testing.T) shared.RecoveryLineage {
+	t.Helper()
+	return mustTestRecoveryLineage()
+}
+
+func mustTestRecoveryLineage() shared.RecoveryLineage {
+	coordinator, err := shared.NewRecoveryCoordinator(shared.RecoveryCoordinatorConfig{
+		ExcludeLease: func(_ context.Context, _ string, run func() error) (bool, error) {
+			return true, run()
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return coordinator.Lineage()
 }
 
 // newTestActor constructs a LeaseActor wired to the supplied test
@@ -202,40 +544,94 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 	if opts.Metrics == nil {
 		opts.Metrics = mockSMMetrics{}
 	}
+	if opts.ProvisionWorkFn == nil {
+		opts.ProvisionWorkFn = func(_ context.Context, execution shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+			outcome, _ := NewProvisionWorkAmbiguous(errors.New("test provision work not configured"), execution.Operation())
+			return outcome
+		}
+	}
+	if opts.RestoreWorkFn == nil {
+		opts.RestoreWorkFn = func(_ context.Context, claim shared.OperationIntentClaim) ReplaceWorkOutcome {
+			outcome, _ := NewAmbiguousRestoreWork(errors.New("test restore work not configured"), claim)
+			return outcome
+		}
+	}
+	if opts.MaintenanceWorkFn == nil {
+		opts.MaintenanceWorkFn = func(_ context.Context, target shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+			outcome, _ := NewAmbiguousMaintenanceWork(
+				errors.New("test maintenance work not configured"), target.Intent(),
+			)
+			return outcome
+		}
+	}
 	if opts.OnTerminated == nil {
 		opts.OnTerminated = func(string) {}
 	}
 	if opts.PersistDiagnosticsFn == nil {
 		opts.PersistDiagnosticsFn = func(shared.DiagnosticEntry, []string, map[string]string) {}
 	}
-	if opts.PersistDiagnosticsWithLogsFn == nil {
-		opts.PersistDiagnosticsWithLogsFn = func(shared.DiagnosticEntry, map[string]string) {}
+	if opts.SendOperationCallbackFn == nil {
+		opts.SendOperationCallbackFn = func(string, string, backend.CallbackStatus, string) {}
 	}
-	if opts.SendCallbackFn == nil {
-		opts.SendCallbackFn = func(string, string, backend.CallbackStatus, string) {}
+	if opts.SendLifecycleFailureFn == nil {
+		opts.SendLifecycleFailureFn = func(shared.RuntimeGenerationProof, string) {}
+	}
+	if opts.SendMaintenanceCallbackFn == nil {
+		opts.SendMaintenanceCallbackFn = func(shared.MaintenanceIntentClaim, backend.CallbackStatus, string) {}
 	}
 	if opts.DoDeprovisionFn == nil {
-		opts.DoDeprovisionFn = func(context.Context, string) error { return nil }
+		opts.DoDeprovisionFn = func(context.Context, ActorCloseScope) error { return nil }
 	}
 
-	return NewLeaseActor(func(a *LeaseActor) LeaseActorConfig {
-		return LeaseActorConfig{
-			LeaseUUID:                    leaseUUID,
-			Logger:                       opts.Logger,
-			StopCtx:                      opts.StopCtx,
-			WG:                           opts.WG,
-			Inspector:                    opts.Inspector,
-			Diag:                         opts.Diag,
-			CallbackSender:               opts.CallbackSender,
-			ProvisionStore:               opts.ProvisionStore,
-			Metrics:                      opts.Metrics,
-			OnTerminated:                 opts.OnTerminated,
-			PersistDiagnosticsFn:         opts.PersistDiagnosticsFn,
-			PersistDiagnosticsWithLogsFn: opts.PersistDiagnosticsWithLogsFn,
-			SendCallbackFn:               opts.SendCallbackFn,
-			DoDeprovisionFn:              opts.DoDeprovisionFn,
-		}
-	})
+	var actor *LeaseActor
+	actor, err := NewLeaseActor(LeaseActorConfig{
+		LeaseUUID:            leaseUUID,
+		Logger:               opts.Logger,
+		StopCtx:              opts.StopCtx,
+		WG:                   opts.WG,
+		WorkerDrainTimeout:   opts.WorkerDrainTimeout,
+		Inspector:            opts.Inspector,
+		Diag:                 opts.Diag,
+		ProvisionStore:       opts.ProvisionStore,
+		Metrics:              opts.Metrics,
+		ProvisionWorkFn:      opts.ProvisionWorkFn,
+		RestoreWorkFn:        opts.RestoreWorkFn,
+		MaintenanceWorkFn:    opts.MaintenanceWorkFn,
+		OnTerminated:         func(uuid string, _ *LeaseActor) { opts.OnTerminated(uuid) },
+		PersistDiagnosticsFn: opts.PersistDiagnosticsFn,
+		SendOperationSuccessFn: func(shared.OperationReleaseCommitted) {
+			url := ""
+			opts.ProvisionStore.UpdateFn(leaseUUID, func(state *ProvisionState) { url = state.CallbackURL })
+			opts.SendOperationCallbackFn(leaseUUID, url, backend.CallbackStatusSuccess, "")
+		},
+		SendOperationFailureFn: func(_ shared.OperationReleaseUncommitted, errMsg string) {
+			url := ""
+			opts.ProvisionStore.UpdateFn(leaseUUID, func(state *ProvisionState) { url = state.CallbackURL })
+			opts.SendOperationCallbackFn(leaseUUID, url, backend.CallbackStatusFailed, errMsg)
+		},
+		SendLifecycleFailureFn: opts.SendLifecycleFailureFn,
+		SendMaintenanceSuccessFn: func(active shared.MaintenanceReleaseActive) {
+			claim := active.Intent()
+			if !claim.Valid() {
+				// Older state-transition tests deliberately use a zero worker proof;
+				// retain their callback-routing assertion without weakening the
+				// production proof-only function type.
+				claim = actor.pendingMaintenance
+			}
+			opts.SendMaintenanceCallbackFn(claim, backend.CallbackStatusSuccess, "")
+		},
+		SendMaintenanceFailureFn: func(failed shared.MaintenanceReleaseFailure, errMsg string) {
+			claim := failed.Intent()
+			if !claim.Valid() {
+				claim = actor.pendingMaintenance
+			}
+			opts.SendMaintenanceCallbackFn(claim, backend.CallbackStatusFailed, errMsg)
+		},
+		RecoveryLineage: testRecoveryLineage(t),
+		DoDeprovisionFn: opts.DoDeprovisionFn,
+	}, func(*LeaseActor) {})
+	require.NoError(t, err)
+	return actor
 }
 
 // newTestActorNoSpawn constructs a LeaseActor without spawning its
@@ -278,43 +674,93 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 	if opts.Metrics == nil {
 		opts.Metrics = mockSMMetrics{}
 	}
+	if opts.ProvisionWorkFn == nil {
+		opts.ProvisionWorkFn = func(_ context.Context, execution shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+			outcome, _ := NewProvisionWorkAmbiguous(errors.New("test provision work not configured"), execution.Operation())
+			return outcome
+		}
+	}
+	if opts.RestoreWorkFn == nil {
+		opts.RestoreWorkFn = func(_ context.Context, claim shared.OperationIntentClaim) ReplaceWorkOutcome {
+			outcome, _ := NewAmbiguousRestoreWork(errors.New("test restore work not configured"), claim)
+			return outcome
+		}
+	}
+	if opts.MaintenanceWorkFn == nil {
+		opts.MaintenanceWorkFn = func(_ context.Context, target shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+			outcome, _ := NewAmbiguousMaintenanceWork(
+				errors.New("test maintenance work not configured"), target.Intent(),
+			)
+			return outcome
+		}
+	}
 	if opts.OnTerminated == nil {
 		opts.OnTerminated = func(string) {}
 	}
 	if opts.PersistDiagnosticsFn == nil {
 		opts.PersistDiagnosticsFn = func(shared.DiagnosticEntry, []string, map[string]string) {}
 	}
-	if opts.PersistDiagnosticsWithLogsFn == nil {
-		opts.PersistDiagnosticsWithLogsFn = func(shared.DiagnosticEntry, map[string]string) {}
+	if opts.SendOperationCallbackFn == nil {
+		opts.SendOperationCallbackFn = func(string, string, backend.CallbackStatus, string) {}
 	}
-	if opts.SendCallbackFn == nil {
-		opts.SendCallbackFn = func(string, string, backend.CallbackStatus, string) {}
+	if opts.SendLifecycleFailureFn == nil {
+		opts.SendLifecycleFailureFn = func(shared.RuntimeGenerationProof, string) {}
+	}
+	if opts.SendMaintenanceCallbackFn == nil {
+		opts.SendMaintenanceCallbackFn = func(shared.MaintenanceIntentClaim, backend.CallbackStatus, string) {}
 	}
 	if opts.DoDeprovisionFn == nil {
-		opts.DoDeprovisionFn = func(context.Context, string) error { return nil }
+		opts.DoDeprovisionFn = func(context.Context, ActorCloseScope) error { return nil }
 	}
 
 	a := &LeaseActor{
-		inbox:   make(chan LeaseMessage, leaseActorInboxSize),
-		done:    make(chan struct{}),
-		exiting: make(chan struct{}),
-		workers: workbarrier.New(),
+		inbox:               make(chan leaseMessage, leaseActorInboxSize),
+		done:                make(chan struct{}),
+		retirementRequested: make(chan struct{}),
+		workers:             workbarrier.New(),
 	}
 	a.cfg = LeaseActorConfig{
-		LeaseUUID:                    leaseUUID,
-		Logger:                       opts.Logger,
-		StopCtx:                      opts.StopCtx,
-		WG:                           opts.WG,
-		Inspector:                    opts.Inspector,
-		Diag:                         opts.Diag,
-		CallbackSender:               opts.CallbackSender,
-		ProvisionStore:               opts.ProvisionStore,
-		Metrics:                      opts.Metrics,
-		OnTerminated:                 opts.OnTerminated,
-		PersistDiagnosticsFn:         opts.PersistDiagnosticsFn,
-		PersistDiagnosticsWithLogsFn: opts.PersistDiagnosticsWithLogsFn,
-		SendCallbackFn:               opts.SendCallbackFn,
-		DoDeprovisionFn:              opts.DoDeprovisionFn,
+		LeaseUUID:            leaseUUID,
+		Logger:               opts.Logger,
+		StopCtx:              opts.StopCtx,
+		WG:                   opts.WG,
+		WorkerDrainTimeout:   opts.WorkerDrainTimeout,
+		Inspector:            opts.Inspector,
+		Diag:                 opts.Diag,
+		ProvisionStore:       opts.ProvisionStore,
+		Metrics:              opts.Metrics,
+		ProvisionWorkFn:      opts.ProvisionWorkFn,
+		RestoreWorkFn:        opts.RestoreWorkFn,
+		MaintenanceWorkFn:    opts.MaintenanceWorkFn,
+		OnTerminated:         func(uuid string, _ *LeaseActor) { opts.OnTerminated(uuid) },
+		PersistDiagnosticsFn: opts.PersistDiagnosticsFn,
+		SendOperationSuccessFn: func(shared.OperationReleaseCommitted) {
+			url := ""
+			opts.ProvisionStore.UpdateFn(leaseUUID, func(state *ProvisionState) { url = state.CallbackURL })
+			opts.SendOperationCallbackFn(leaseUUID, url, backend.CallbackStatusSuccess, "")
+		},
+		SendOperationFailureFn: func(_ shared.OperationReleaseUncommitted, errMsg string) {
+			url := ""
+			opts.ProvisionStore.UpdateFn(leaseUUID, func(state *ProvisionState) { url = state.CallbackURL })
+			opts.SendOperationCallbackFn(leaseUUID, url, backend.CallbackStatusFailed, errMsg)
+		},
+		SendLifecycleFailureFn: opts.SendLifecycleFailureFn,
+		SendMaintenanceSuccessFn: func(active shared.MaintenanceReleaseActive) {
+			claim := active.Intent()
+			if !claim.Valid() {
+				claim = a.pendingMaintenance
+			}
+			opts.SendMaintenanceCallbackFn(claim, backend.CallbackStatusSuccess, "")
+		},
+		SendMaintenanceFailureFn: func(failed shared.MaintenanceReleaseFailure, errMsg string) {
+			claim := failed.Intent()
+			if !claim.Valid() {
+				claim = a.pendingMaintenance
+			}
+			opts.SendMaintenanceCallbackFn(claim, backend.CallbackStatusFailed, errMsg)
+		},
+		RecoveryLineage: testRecoveryLineage(t),
+		DoDeprovisionFn: opts.DoDeprovisionFn,
 	}
 	a.leaseUUID = a.cfg.LeaseUUID
 	a.sm = newLeaseSM(a)
@@ -324,6 +770,416 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 	// manually (e.g., by calling gatherDiagAsync directly on the test
 	// goroutine, or by inspecting the inbox without a draining run loop).
 	return a
+}
+
+func newTestMaintenanceClaim(
+	t *testing.T,
+	leaseUUID string,
+	kind shared.MaintenanceIntentKind,
+) shared.MaintenanceIntentClaim {
+	t.Helper()
+	maintenanceID, err := maintenanceid.New()
+	require.NoError(t, err)
+	return newTestMaintenanceClaimWithID(t, leaseUUID, kind, maintenanceID)
+}
+
+func newTestMaintenanceClaimWithID(
+	t *testing.T,
+	leaseUUID string,
+	kind shared.MaintenanceIntentKind,
+	maintenanceID shared.MaintenanceID,
+) shared.MaintenanceIntentClaim {
+	t.Helper()
+	dir := t.TempDir()
+	callbacks, releases, storage, gate := newBoundLeaseSMMaintenanceStores(t, dir, "docker-a")
+	t.Cleanup(func() {
+		require.NoError(t, callbacks.Close())
+		require.NoError(t, releases.Close())
+	})
+
+	operationID := mustLeaseSMOperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
+	callbackURL := "https://fred.example/callbacks/provision?operation_id=" + operationID.String()
+	lifecycleURL := "https://fred.example/callbacks/provision?lifecycle_id=" + operationID.String()
+	authority, err := shared.NewReleaseRuntimeAuthority(
+		operationID,
+		"tenant-a",
+		"22222222-2222-4222-8222-222222222222",
+		callbackURL,
+		lifecycleURL,
+	)
+	require.NoError(t, err)
+	items := []backend.LeaseItem{{SKU: "sku-a", ServiceName: "app", Quantity: 1}}
+	source := shared.Release{
+		Manifest:         []byte(`{"services":{"app":{"image":"nginx:1.27"}}}`),
+		Image:            "stack",
+		OperationID:      operationID,
+		Items:            items,
+		ResourceProfiles: []shared.SKUResourceSnapshot{{SKU: "sku-a", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
+		RuntimeAuthority: &authority,
+		Status:           "active",
+		CreatedAt:        time.Now(),
+	}
+	appendActiveOperationReleaseForTest(t, callbacks, releases, storage, gate, leaseUUID, source)
+	settlement, err := shared.NewMaintenanceSettlement(callbacks, releases)
+	require.NoError(t, err)
+	bindLeaseSMMaintenanceExecutor(t, settlement)
+	active, sourceClaim, err := settlement.ClaimLatestActive(leaseUUID)
+	require.NoError(t, err)
+	active.Version = 0
+	active.Status = "deploying"
+	active.CreatedAt = time.Now()
+	payload := []byte(nil)
+	if kind != shared.MaintenanceIntentRestart {
+		payload = active.Manifest
+	}
+	request, err := settlement.NewMaintenanceRequestAuthority(
+		maintenanceID, kind, leaseUUID, lifecycleURL, payload,
+	)
+	require.NoError(t, err)
+	candidate, err := settlement.NewMaintenanceIntentCandidate(request, sourceClaim, active)
+	require.NoError(t, err)
+	admission, err := settlement.BeginMaintenanceIntent(candidate)
+	require.NoError(t, err)
+	appendClaim, err := settlement.StartMaintenanceAppend(
+		createdMaintenanceDispatch(t, admission),
+	)
+	require.NoError(t, err)
+	targetClaim, err := settlement.AppendMaintenance(appendClaim)
+	require.NoError(t, err)
+	targetClaim, err = settlement.BindMaintenanceIntentTarget(targetClaim)
+	require.NoError(t, err)
+	intent := targetClaim.Intent()
+	maintenanceAuthorities.Store(intent.MaintenanceID(), testMaintenanceAuthority{
+		settlement: settlement,
+		callbacks:  callbacks,
+		target:     targetClaim,
+		releases:   releases,
+	})
+	t.Cleanup(func() { maintenanceAuthorities.Delete(intent.MaintenanceID()) })
+	return intent
+}
+
+type testMaintenanceAuthority struct {
+	settlement *shared.MaintenanceSettlement
+	callbacks  *shared.CallbackStore
+	target     shared.MaintenanceReleaseClaim
+	releases   *shared.ReleaseStore
+}
+
+var maintenanceAuthorities sync.Map
+
+func testMaintenanceTarget(t *testing.T, intent shared.MaintenanceIntentClaim) shared.MaintenanceReleaseClaim {
+	t.Helper()
+	value, ok := maintenanceAuthorities.Load(intent.MaintenanceID())
+	require.True(t, ok, "test maintenance authority is unavailable")
+	return value.(testMaintenanceAuthority).target
+}
+
+func testMaintenanceSuccess(t *testing.T, intent shared.MaintenanceIntentClaim, projection ReplaceSuccessProjection) ReplaceResult {
+	t.Helper()
+	projection = completeTestReplaceProjection(projection)
+	value, ok := maintenanceAuthorities.Load(intent.MaintenanceID())
+	require.True(t, ok, "test maintenance authority is unavailable")
+	authority := value.(testMaintenanceAuthority)
+	execution, err := authority.settlement.StartMaintenanceExecution(authority.target)
+	require.NoError(t, err)
+	physical := authority.settlement.ExecuteMaintenance(context.Background(), execution)
+	success, ok := physical.(shared.MaintenanceExecutionSuccess)
+	require.True(t, ok)
+	proof, err := authority.settlement.ActivateMaintenance(success)
+	require.NoError(t, err)
+	target, ok := proof.TargetRelease()
+	require.True(t, ok)
+	stack, err := validateCompleteReleaseProjection(target, projection.ContainerIDs, projection.ServiceContainers)
+	require.NoError(t, err)
+	result := newReplaceSuccessProjection(projection)
+	result.authorityKind = replaceAuthorityMaintenance
+	result.maintenanceRelease = proof
+	result.maintenance = proof.Intent()
+	result.release = &target
+	result.stackManifest = stack
+	return ReplaceResult{success: result}
+}
+
+func testMaintenanceFailure(t *testing.T, intent shared.MaintenanceIntentClaim, errValue error, restored, recoverFromSource bool, details ReplaceFailureDetails) ReplaceResult {
+	t.Helper()
+	value, ok := maintenanceAuthorities.Load(intent.MaintenanceID())
+	require.True(t, ok, "test maintenance authority is unavailable")
+	authority := value.(testMaintenanceAuthority)
+	var failure shared.MaintenanceExecutionFailure
+	var err error
+	if restored || recoverFromSource {
+		// A recovered actor fixture must carry the same complete SourceReady
+		// proof as production. A synchronous refusal cannot mint readiness.
+		authority.settlement, err = shared.NewMaintenanceSettlement(authority.callbacks, authority.releases)
+		require.NoError(t, err)
+		require.NoError(t, shared.BindMaintenanceSubstrateExecutor(authority.settlement,
+			func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil },
+			func(context.Context, string, error) error { return nil },
+			func(runner substratemutation.Runner, _ shared.MaintenancePhysicalSubject) leaseSMTestMutation {
+				return leaseSMTestMutation{runner: runner}
+			},
+			func(ctx context.Context, mutation leaseSMTestMutation, _ shared.MaintenancePhysicalSubject) error {
+				return mutation.runner.Step(ctx, "restore exact fixture source", func(context.Context) error { return nil })
+			},
+			func(_ context.Context, subject shared.MaintenancePhysicalSubject) (shared.MaintenancePhysicalEvidence, error) {
+				source, ok := subject.SourceRelease()
+				if !ok {
+					return shared.MaintenancePhysicalEvidence{}, errors.New("fixture has no source release")
+				}
+				ids, services := testProjectionForRelease(source)
+				return shared.NewMaintenanceSourceReady(subject, ids, services)
+			},
+		))
+		_, target, found, findErr := authority.settlement.FindMaintenanceRelease(intent.LeaseUUID(), intent.MaintenanceID())
+		require.NoError(t, findErr)
+		require.True(t, found)
+		authority.target, err = authority.settlement.BindMaintenanceIntentTarget(target)
+		require.NoError(t, err)
+		maintenanceAuthorities.Store(intent.MaintenanceID(), authority)
+		execution, startErr := authority.settlement.StartMaintenanceExecution(authority.target)
+		require.NoError(t, startErr)
+		outcome := authority.settlement.ExecuteMaintenance(context.Background(), execution)
+		var ok bool
+		failure, ok = outcome.(shared.MaintenanceExecutionFailure)
+		require.True(t, ok, "%T: %v", outcome, outcome)
+		require.True(t, failure.SourceRecovered())
+	} else {
+		failure, err = authority.settlement.RefuseMaintenanceExecution(authority.target)
+		require.NoError(t, err)
+	}
+	proof, err := authority.settlement.FailMaintenance(failure, details.Reason, details.CallbackErr)
+	require.NoError(t, err)
+	result, err := NewMaintenanceReplaceFailure(errValue, details, proof)
+	require.NoError(t, err)
+	return result
+}
+
+// appendActiveOperationReleaseForTest seeds an active typed generation through
+// the same write-ahead and release-handoff protocol used by production. Actor
+// tests must not regain a raw ReleaseStore mutation seam merely to prepare a
+// projection fixture.
+func appendActiveOperationReleaseForTest(
+	t *testing.T,
+	callbacks *shared.CallbackStore,
+	releases *shared.ReleaseStore,
+	storage backendidentity.VerifiedStorage,
+	gate *backendidentity.StorageAuthorityGate,
+	leaseUUID string,
+	release shared.Release,
+) {
+	t.Helper()
+	authority, ok := release.RuntimeIdentity()
+	require.True(t, ok)
+	settlement, err := shared.NewOperationSettlement(callbacks, releases)
+	require.NoError(t, err)
+	candidate, err := settlement.NewOperationIntentCandidate(shared.OperationIntentSpec{
+		Kind:                 shared.OperationIntentProvision,
+		LeaseUUID:            leaseUUID,
+		CallbackURL:          authority.CallbackURL(),
+		LifecycleCallbackURL: authority.LifecycleCallbackURL(),
+		Tenant:               authority.Tenant(),
+		ProviderUUID:         authority.ProviderUUID(),
+		Items:                release.Items,
+		ResourceProfiles:     release.ResourceProfiles,
+		EffectiveItems:       release.Items,
+		Manifest:             release.Manifest,
+	})
+	require.NoError(t, err)
+	admission, err := settlement.BeginOperationIntent(candidate)
+	require.NoError(t, err)
+	claim, ok := admission.CreatedClaim()
+	require.True(t, ok)
+	releaseCandidate, err := settlement.PrepareOperationRelease(claim)
+	require.NoError(t, err)
+	bindLeaseSMOperationExecutor(t, settlement)
+	execution, err := settlement.StartOperationExecution(releaseCandidate)
+	require.NoError(t, err)
+	physical := settlement.ExecuteOperation(context.Background(), execution)
+	success, ok := physical.(shared.OperationExecutionSuccess)
+	require.True(t, ok)
+	committed, err := settlement.CommitOperationSuccess(success)
+	require.NoError(t, err)
+	maintenance, err := shared.NewMaintenanceSettlement(callbacks, releases)
+	require.NoError(t, err)
+	attestor, err := shared.NewCallbackStorageAttestor(
+		callbacks,
+		leaseSMCallbackStorageVerifier{storage: storage, gate: gate},
+		context.Background(),
+	)
+	require.NoError(t, err)
+	publisher, err := shared.NewCallbackPublisher(shared.CallbackPublisherConfig{
+		OperationSettlement: settlement, MaintenanceSettlement: maintenance,
+		StorageAttestor: attestor, Logger: slog.Default(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, publisher.PublishOperationSuccessContext(context.Background(), committed))
+}
+
+type leaseSMCallbackStorageVerifier struct {
+	storage backendidentity.VerifiedStorage
+	gate    *backendidentity.StorageAuthorityGate
+}
+
+func (v leaseSMCallbackStorageVerifier) StorageIdentity() backendidentity.ID { return v.storage.ID() }
+
+func (v leaseSMCallbackStorageVerifier) StorageAuthorityGate() *backendidentity.StorageAuthorityGate {
+	return v.gate
+}
+
+func (v leaseSMCallbackStorageVerifier) Verify(context.Context) error { return nil }
+
+type testOperationFixture struct {
+	claim      shared.OperationIntentClaim
+	admission  shared.ProvisionAdmission
+	candidate  shared.OperationReleaseCandidate
+	settlement *shared.OperationSettlement
+	releases   *shared.ReleaseStore
+}
+
+func newTestOperationFixture(
+	t *testing.T,
+	leaseUUID string,
+	kind shared.OperationIntentKind,
+) testOperationFixture {
+	t.Helper()
+	dir := t.TempDir()
+	callbacks, releases, _, _ := newBoundLeaseSMMaintenanceStores(t, dir, "docker-a")
+	t.Cleanup(func() {
+		require.NoError(t, callbacks.Close())
+		require.NoError(t, releases.Close())
+	})
+	operationID := mustLeaseSMOperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
+	callbackURL := "https://fred.example/callbacks/provision?operation_id=" + operationID.String()
+	lifecycleURL := "https://fred.example/callbacks/provision?lifecycle_id=" + operationID.String()
+	spec := shared.OperationIntentSpec{
+		Kind: kind, LeaseUUID: leaseUUID, CallbackURL: callbackURL, LifecycleCallbackURL: lifecycleURL,
+		Tenant: "tenant-a", ProviderUUID: "22222222-2222-4222-8222-222222222222",
+		Items:            []backend.LeaseItem{{SKU: "sku-a", ServiceName: "app", Quantity: 1}},
+		ResourceProfiles: []shared.SKUResourceSnapshot{{SKU: "sku-a", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
+		Manifest:         []byte(`{"services":{"app":{"image":"nginx:1.27"}}}`),
+	}
+	if kind == shared.OperationIntentRestore {
+		spec.SourceLeaseUUID = "33333333-3333-4333-8333-333333333333"
+		spec.SourceGeneration = 1
+	}
+	settlement, err := shared.NewOperationSettlement(callbacks, releases)
+	require.NoError(t, err)
+	candidate, err := settlement.NewOperationIntentCandidate(spec)
+	require.NoError(t, err)
+	admission, err := settlement.BeginOperationIntent(candidate)
+	require.NoError(t, err)
+	claim, ok := admission.CreatedClaim()
+	require.True(t, ok)
+	var provisionAdmission shared.ProvisionAdmission
+	if kind == shared.OperationIntentProvision {
+		pool := shared.NewResourcePool(8, 8192, 16384, func(string) (shared.SKUProfile, error) {
+			return shared.SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
+		}, nil)
+		provisionAdmission, err = settlement.ReserveProvisionResources(pool, claim)
+		require.NoError(t, err)
+	}
+	releaseCandidate, err := settlement.PrepareOperationRelease(claim)
+	require.NoError(t, err)
+	return testOperationFixture{
+		claim: claim, admission: provisionAdmission, candidate: releaseCandidate,
+		settlement: settlement, releases: releases,
+	}
+}
+
+func newTestOperationSuccess(
+	t *testing.T,
+	leaseUUID string,
+	kind shared.OperationIntentKind,
+) (shared.OperationIntentClaim, shared.OperationReleaseCommitted, *shared.ReleaseStore) {
+	t.Helper()
+	fixture := newTestOperationFixture(t, leaseUUID, kind)
+	committed := commitTestOperationSuccess(t, fixture)
+	return fixture.claim, committed, fixture.releases
+}
+
+func commitTestOperationSuccess(t *testing.T, fixture testOperationFixture) shared.OperationReleaseCommitted {
+	t.Helper()
+	settlement := fixture.settlement
+	bindLeaseSMOperationExecutor(t, settlement)
+	execution, err := settlement.StartOperationExecution(fixture.candidate)
+	require.NoError(t, err)
+	physical := settlement.ExecuteOperation(context.Background(), execution)
+	success, ok := physical.(shared.OperationExecutionSuccess)
+	require.True(t, ok)
+	committed, err := settlement.CommitOperationSuccess(success)
+	require.NoError(t, err)
+	return committed
+}
+
+func newTestProvisionFailure(
+	t *testing.T,
+	leaseUUID string,
+) (shared.ProvisionAdmission, shared.OperationReleaseUncommitted) {
+	t.Helper()
+	fixture := newTestOperationFixture(t, leaseUUID, shared.OperationIntentProvision)
+	refused, err := fixture.settlement.RefuseOperationExecution(fixture.candidate)
+	require.NoError(t, err)
+	failure, err := fixture.settlement.CommitOperationFailure(refused)
+	require.NoError(t, err)
+	return fixture.admission, failure
+}
+
+func newTestRuntimeGenerationProof(
+	t *testing.T,
+	leaseUUID string,
+) shared.RuntimeGenerationProof {
+	t.Helper()
+	_, _, releases := newTestOperationSuccess(
+		t, leaseUUID, shared.OperationIntentProvision,
+	)
+	proof, err := releases.ProveRuntimeGeneration(leaseUUID)
+	require.NoError(t, err)
+	return proof
+}
+
+func testProvisionSuccess(t *testing.T, leaseUUID string, projection ProvisionSuccessProjection) (shared.ProvisionAdmission, ProvisionSuccessResult) {
+	t.Helper()
+	if len(projection.ContainerIDs) == 0 {
+		projection.ContainerIDs = []string{"container-a"}
+	}
+	if projection.ServiceContainers == nil {
+		projection.ServiceContainers = map[string][]string{"app": append([]string(nil), projection.ContainerIDs...)}
+	}
+	fixture := newTestOperationFixture(t, leaseUUID, shared.OperationIntentProvision)
+	committed := commitTestOperationSuccess(t, fixture)
+	result, err := NewProvisionSuccessResult(projection, committed)
+	require.NoError(t, err)
+	return fixture.admission, result
+}
+
+func testRestoreSuccess(t *testing.T, leaseUUID string, projection ReplaceSuccessProjection) (shared.OperationIntentClaim, ReplaceResult) {
+	t.Helper()
+	projection = completeTestReplaceProjection(projection)
+	fixture := newTestOperationFixture(t, leaseUUID, shared.OperationIntentRestore)
+	bindLeaseSMOperationExecutor(t, fixture.settlement, projection)
+	execution, err := fixture.settlement.StartOperationExecution(fixture.candidate)
+	require.NoError(t, err)
+	physical := fixture.settlement.ExecuteOperation(context.Background(), execution)
+	success, ok := physical.(shared.OperationExecutionSuccess)
+	require.True(t, ok)
+	committed, err := fixture.settlement.CommitOperationSuccess(success)
+	require.NoError(t, err)
+	outcome, err := NewRestoreWorkSuccess(committed)
+	require.NoError(t, err)
+	terminal, ok := outcome.(replaceWorkTerminal)
+	require.True(t, ok)
+	return fixture.claim, terminal.result
+}
+
+func completeTestReplaceProjection(projection ReplaceSuccessProjection) ReplaceSuccessProjection {
+	if len(projection.ContainerIDs) == 0 {
+		projection.ContainerIDs = []string{"container-a"}
+	}
+	if projection.ServiceContainers == nil {
+		projection.ServiceContainers = map[string][]string{"app": append([]string(nil), projection.ContainerIDs...)}
+	}
+	return projection
 }
 
 // TestMockProvisionStore_ConcurrentUpdate validates that the mock's

@@ -28,36 +28,30 @@ const (
 // Skip reasons for retentionOrphanSkipsTotal (ENG-370). Kept as
 // constants so the reconcile, the pre-init, and the tests cannot drift on a typo.
 const (
-	orphanSkipListError        = "list_error"        // volumes.List() failed (uncertain → fail-safe skip)
-	orphanSkipRootUnverifiable = "root_unverifiable" // volume data root absent OR unreadable (fail-safe skip; the specific cause is in the warn log's error field)
-	orphanSkipRaced            = "raced"             // record no longer ACTIVE-and-present at delete time: concurrently restore-claimed (active→restoring) OR already removed (e.g. cap-eviction) — benign, another path owns it
-	orphanSkipDisabled         = "disabled"          // retention_orphan_confirmations == 0 (kill-switch)
-	orphanSkipStoreError       = "store_error"       // retentionStore.List() failed (fail-safe skip)
+	orphanSkipListError  = "list_error"  // complete ListForProof failed, including uncertain root identity (fail-safe skip)
+	orphanSkipRaced      = "raced"       // record no longer ACTIVE-and-present at delete time: concurrently restore-claimed (active→restoring) OR already removed (e.g. cap-eviction) — benign, another path owns it
+	orphanSkipDisabled   = "disabled"    // retention_orphan_confirmations == 0 (kill-switch)
+	orphanSkipStoreError = "store_error" // retentionStore.List() failed (fail-safe skip)
 )
 
 // orphanSkipReasons is the closed reason set, used to pre-initialize the
 // CounterVec series to 0 so absence/ratio alert queries return 0, not no-data.
-var orphanSkipReasons = []string{orphanSkipListError, orphanSkipRootUnverifiable, orphanSkipRaced, orphanSkipDisabled, orphanSkipStoreError}
+var orphanSkipReasons = []string{orphanSkipListError, orphanSkipRaced, orphanSkipDisabled, orphanSkipStoreError}
 
 // Skip reasons for retentionReapSkipsTotal (ENG-659) — the reaping finalizer's
 // destroy-time ownership re-check. Kept as constants so the reap path, the pre-init,
 // and the tests cannot drift on a typo.
 const (
-	reapSkipRestoreClaimed  = "restore_claimed"  // a tombstoned name is a volume an in-flight restore adopted — deliberate, self-healing, NOT a leak
 	reapSkipClaimUnreadable = "claim_unreadable" // retentionStore.List() failed → ownership unprovable → destroy nothing this pass (fail-safe)
-	// reapSkipOwnerClaimed: a tombstoned name belongs to a LIVE provision or another
-	// lease's retention record (ENG-658). Kept distinct from restore_claimed because the
-	// two resolve differently and an operator acts on that difference: a restore-held
-	// name clears when that restore's rollback re-quarantines it, whereas this one clears
-	// only when the owning lease is next closed cleanly — there is no restore to unblock,
-	// and the deployed BackendRetentionVolumeStuckReaping annotation triages on the
-	// reason label.
+	// reapSkipOwnerClaimed means a tombstoned namespace belongs to a live provision
+	// (ENG-658). It clears only when the owning lease is next closed cleanly; there is no
+	// restore to unblock.
 	reapSkipOwnerClaimed = "owner_claimed"
 )
 
 // reapSkipReasons is the closed reason set, pre-initialized to 0 so a healthy
 // provider — which should never skip — exports 0 rather than no-data.
-var reapSkipReasons = []string{reapSkipRestoreClaimed, reapSkipClaimUnreadable, reapSkipOwnerClaimed}
+var reapSkipReasons = []string{reapSkipClaimUnreadable, reapSkipOwnerClaimed}
 
 // Outcomes for retentionSweepTotal (ENG-680). Exactly one of these is recorded per
 // periodic sweep pass, which is what makes the sum across them a liveness heartbeat.
@@ -76,8 +70,8 @@ const (
 // from a stalled sweep.
 var sweepOutcomes = []string{sweepOutcomeSuccess, sweepOutcomeError}
 
-// Site labels for volumeDestroyRefusedTotal — which destroy path the ownership
-// choke point turned away (ENG-658). One constant per caller of volumeOp.destroy.
+// Site labels for volumeDestroyRefusedTotal — which exact-authority destroy path the
+// ownership choke point turned away (ENG-658). One constant per caller of volumeOp.destroy.
 // The set is closed by convention, not by the compiler (destroy takes a string), but
 // destroySites below is what pre-initializes the series: a new site that skips these
 // constants exports no zero series, so its absence reads as no-data rather than as
@@ -86,8 +80,6 @@ const (
 	destroySiteDeprovisionDestroy = "deprovision_destroy" // doDeprovision's non-retain arm
 	destroySiteDeprovisionReclaim = "deprovision_reclaim" // doDeprovision's writable-path-only reclaim (ENG-406)
 	destroySiteRetentionRefused   = "retention_refused"   // destroyOnRefuseToRetain, a breached retained-disk cap
-	destroySiteProvisionCleanup   = "provision_cleanup"   // doProvision's failure defer
-	destroySiteOrphanGC           = "orphan_gc"           // cleanupOrphanedVolumes, the startup sweep
 	destroySiteReaping            = "reaping"             // destroyReapingVolumes, the retention finalizer
 )
 
@@ -110,43 +102,35 @@ const (
 var (
 	destroySites = []string{
 		destroySiteDeprovisionDestroy, destroySiteDeprovisionReclaim, destroySiteRetentionRefused,
-		destroySiteProvisionCleanup, destroySiteOrphanGC, destroySiteReaping,
+		destroySiteReaping,
 	}
 	destroyRefusedReasons = []string{destroyRefusedClaimed, destroyRefusedUnreadable, destroyRefusedNoDestroyer}
 )
 
-// Operation and outcome labels for teardownFallbackTotal — which teardown path had
-// to compensate for a failed compose Down, and whether the compensation finished the
-// job (ENG-647). Kept as constants so the call sites, the pre-init, and the tests
-// cannot drift on a typo.
+// Operation and outcome labels for teardownFallbackTotal identify per-container
+// teardown recovery, including exact failed-restore cleanup, and whether absence
+// was proved (ENG-647). Kept as constants so call sites, pre-init, and tests cannot
+// drift on a typo.
 //
-// The operations split into two kinds, and the distinction is what an alert must key
-// on. BLOCKING operations treat a failed teardown as fatal: the lease stays tracked,
-// its capacity stays reserved, and the teardown is retried, so outcome="failed" there
-// means containers are pinned and fred is holding state open for them. ADVISORY
-// operations discard the error and let state advance anyway, so outcome="failed"
-// there means "a possible leak, or merely an unreachable daemon" — never "fred is
-// waiting". Mixing the two under one label would make the wedge case unqueryable.
+// All current paths retain exact authority and accounting on failed cleanup.
+// Ordinary durable recovery retries in-process. An ambiguous live provision
+// worker can still fail-stop; its next process resumes from the retained intent.
 const (
 	// Blocking.
 	teardownOpRestoreReconcile = "restore_reconcile" // reconcileRestoring's orphaned arm (boot + retention sweep)
-	teardownOpRestoreRollback  = "restore_rollback"  // rollbackRestoreAdoption, worker arm: teardown blocks the rollback
 	teardownOpDeprovision      = "deprovision"       // doDeprovision's close-path teardown
-	// Advisory.
-	teardownOpRestorePrelude   = "restore_prelude"   // rollbackRestoreAdoption, dropProvision arm: the rollback completes regardless
-	teardownOpProvisionCleanup = "provision_cleanup" // the stack-provision failure defer, best-effort by design
+	teardownOpProvisionCleanup = "provision_cleanup" // failed provision retains its WAL and accounting for recovery
 
-	teardownOutcomeRecovered = "recovered" // fallback removed every container it found
+	teardownOutcomeRecovered = "recovered" // recovery proved destination containers absent
 	teardownOutcomeFailed    = "failed"    // a container may still be running (removal or discovery failed)
 )
 
 // teardownOperations / teardownOutcomes are the closed label sets, pre-initialized to
 // 0 so a "compensation is failing" alert reads 0 rather than no-data before the first
-// Down failure — which, on a healthy provider, may be never.
+// teardown recovery attempt — which, on a healthy provider, may be never.
 var (
 	teardownOperations = []string{
-		teardownOpRestoreReconcile, teardownOpRestoreRollback, teardownOpDeprovision,
-		teardownOpRestorePrelude, teardownOpProvisionCleanup,
+		teardownOpRestoreReconcile, teardownOpDeprovision, teardownOpProvisionCleanup,
 	}
 	teardownOutcomes = []string{teardownOutcomeRecovered, teardownOutcomeFailed}
 )
@@ -177,6 +161,14 @@ const (
 // CounterVec series to 0 so absence/ratio alert queries return 0, not no-data.
 var refuseScopes = []string{refuseScopeGlobal, refuseScopeTenant, refuseScopePartition}
 var capChecks = []string{capCheckEvict, capCheckBreach, capCheckBound, capCheckRefuseGet}
+
+const (
+	operationRecoveryTimeoutProvision = "provision_timeout"
+)
+
+var operationRecoveryTimeoutReasons = []string{
+	operationRecoveryTimeoutProvision,
+}
 
 var (
 	// provisionsTotal tracks the total number of provision attempts by outcome.
@@ -244,12 +236,104 @@ var (
 		Help:      "Total number of callback delivery attempts by outcome",
 	}, []string{"outcome"})
 
-	// callbackStoreErrorsTotal tracks bbolt persistence failures for callbacks.
+	// callbackStoreErrorsTotal tracks failures reading or writing durable
+	// callback evidence, including fail-closed interrupted-operation recovery.
 	callbackStoreErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "callback_store_errors_total",
-		Help:      "Total number of callback persistence failures (bbolt store errors)",
+		Help:      "Total failures accessing durable callback evidence, including interrupted-operation recovery.",
+	})
+
+	// operationIntentRecoveryTimeoutExhaustionsTotal distinguishes a bounded cold-
+	// recovery decision from an ordinary live worker failure. The failed callback
+	// and teardown remain the outcome authority; this counter records the timeout
+	// even when cleanup fails and a later startup must retry it.
+	operationIntentRecoveryTimeoutExhaustionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "operation_intent_recovery_timeout_exhaustions_total",
+		Help:      "Bounded cold-recovery timeouts exhausted by interrupted exact provision intents, by timeout; retries are counted again",
+	}, []string{"reason"})
+
+	// Started operation intents retain their full recovery and resource authority
+	// while idempotent cleanup awaits a later pass.
+	operationIntentRecoveryCleanupRetriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "operation_intent_recovery_cleanup_retries_total",
+		Help:      "Interrupted operation cleanup passes deferred with their exact durable intent and resource reservation retained",
+	}, []string{"kind"})
+
+	// Terminal receipts retain cleanup authority after their resource snapshots
+	// are retired. These metrics expose the associated capacity exclusions.
+	terminalSubstratePendingContainers = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "terminal_substrate_pending_containers",
+		Help:      "Last observed late containers excluded by permanent terminal receipts; nonzero withholds unaccounted resource capacity until a strict absence observation",
+	}, []string{"receipt"})
+
+	terminalSubstrateCleanupRetriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "terminal_substrate_cleanup_retries_total",
+		Help:      "Terminal-receipt cleanup passes deferred for periodic retry, by receipt authority",
+	}, []string{"receipt"})
+
+	// pendingCloseIntents is the aggregate number of non-expiring destructive
+	// close finalizers in callbacks.db. It intentionally carries no lease label:
+	// operators use the matching oldest-age gauge to alert, then the recovery log
+	// or an offline store inspection to identify the affected lease.
+	pendingCloseIntents = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "pending_close_intents",
+		Help:      "Current number of non-expiring durable close intents awaiting finalization",
+	})
+
+	// oldestCloseIntentAgeSeconds distinguishes ordinary short-lived close
+	// finalizers from one whose retry dependency has remained unavailable. It is
+	// sampled from durable CreatedAt timestamps and resets to zero when none are
+	// pending.
+	oldestCloseIntentAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "oldest_close_intent_age_seconds",
+		Help:      "Age in seconds of the oldest pending durable close intent; 0 when none are pending",
+	})
+
+	// leaseMutationUUIDSlots is the monotonically increasing number of lease
+	// identities whose callback aggregate has reserved permanent replay/close
+	// authority. It never falls when a lease closes; operators compare it with
+	// the static limit gauge and expand the reviewed bound before admission is
+	// definitively refused.
+	leaseMutationUUIDSlots = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_mutation_uuid_slots",
+		Help:      "Permanent callback-journal lease UUID slots reserved by this backend storage lineage",
+	})
+
+	leaseMutationUUIDSlotLimit = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_mutation_uuid_slot_limit",
+		Help:      "Hard admission limit for permanent callback-journal lease UUID slots",
+	})
+
+	callbackReceiptReservations = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "callback_receipt_reservations",
+		Help:      "Durable operation and maintenance callback receipt reservations in this backend storage lineage",
+	})
+
+	callbackReceiptReservationLimit = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "callback_receipt_reservation_limit",
+		Help:      "Hard admission limit for operation and maintenance callback receipt reservations",
 	})
 
 	// imagePullDurationSeconds tracks image pull duration.
@@ -298,12 +382,12 @@ var (
 		Buckets:   prometheus.ExponentialBuckets(0.05, 2, 16), // 50ms to ~27min
 	}, []string{"operation", "phase"})
 
-	// restoresTotal counts restore re-deploy WORKER outcomes by result. Unlike
-	// restoreDurationSeconds (success-only), it increments on BOTH the success and
-	// failure branches of doRestore's terminal defer (the rollbackRestoreAdoption
-	// path, panics included), so a docker-backend-side restore success rate is
-	// computable from the worker's own metrics — mirroring provisionsTotal, which
-	// likewise counts only doProvision's worker outcome (ENG-408).
+	// restoresTotal counts exact terminal restore outcomes. Unlike
+	// restoreDurationSeconds (success-only), it increments on both the success and
+	// definitive-failure branches after physical classification and durable
+	// release settlement. Post-effect errors and panics remain ambiguous until
+	// recovery, so they increment neither outcome rather than being mislabeled as
+	// failures. This mirrors provisionsTotal's terminal-outcome semantics.
 	//
 	// Worker-scoped like restore_duration_seconds: a restore that fails in the
 	// SYNCHRONOUS adopt prelude (claim/rename/route/ack) before the worker spawns
@@ -321,6 +405,20 @@ var (
 		Help:      "Total number of restore re-deploy worker attempts by outcome",
 	}, []string{"outcome"})
 
+	unaccountedManagedVolumes = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "unaccounted_managed_volumes",
+		Help:      "Last observed managed volumes absent from provision, admitted-operation, and retention footprints; diagnostic only",
+	})
+
+	unaccountedManagedVolumeObservationFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "unaccounted_managed_volume_observation_failures_total",
+		Help:      "Failed read-only volume accounting observations; the last volume count is preserved",
+	})
+
 	// volumeQuotaBackfillTotal counts per-volume quota re-application attempts by
 	// the startup reconcile (reconcileVolumeQuotas), which re-tags + re-limits
 	// existing volumes so leases provisioned before the daemon held CAP_SYS_ADMIN
@@ -333,18 +431,18 @@ var (
 		Help:      "Startup quota-backfill per-volume re-application attempts by outcome",
 	}, []string{"outcome"})
 
-	// volumeQuotaClearFailedTotal counts XFS project-quota clear failures during
-	// volume Destroy (ENG-459). Destroy resets a project's bhard limit to 0 so its
-	// quota-table entry drops out of xfs_quota's scans once the directory is gone;
-	// the clear is best-effort (it must not wedge teardown — a leaked limit entry
-	// holds no disk), so a failure is logged and counted here rather than propagated.
-	// The observable backstop, mirroring retentionLeakedTotal: a rising rate means
-	// the project-quota table is regrowing and needs operator cleanup.
+	// volumeQuotaClearFailedTotal counts failed XFS quota-clear commands during
+	// interrupted-create compensation and typed deletion (ENG-459/ENG-632). It
+	// does not count the preceding block/inode usage proofs. Current typed
+	// failures are propagated and retain their durable mutation authority, which
+	// fail-stops this backend process until a fresh Start recovers it. Only an
+	// already-absent historical volume without typed authority can require the
+	// classified manual cleanup described in OPERATIONS.md.
 	volumeQuotaClearFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "volume_quota_clear_failed_total",
-		Help:      "XFS project-quota clear failures on volume destroy (leaked table entry needs operator cleanup) — see ENG-459",
+		Help:      "Failed XFS quota-clear commands during create compensation or deletion; typed authority is retained for restart recovery — see ENG-459/ENG-632",
 	})
 
 	// volumeBindSymlinkRejectedTotal counts stateful-volume bind sources refused
@@ -539,18 +637,17 @@ var (
 		Help:      "Terminal SM events sendTerminal refused to deliver (actor exited, mid-exit, or inbox wedged via send timeout)",
 	}, []string{"event"})
 
-	// dieEventDroppedTotal counts container-death signals routeToLease refused
-	// to deliver to the lease actor. Refusal happens when stopCtx has been
-	// canceled (backend shutting down) or the inbox is full and the
-	// non-blocking send gives up. The reconciler re-detects missed deaths on
-	// its next cycle (default 5m), so drops degrade the realtime event path
-	// but do not cause data loss; the counter lets operators spot when that
-	// path is degraded.
+	// dieEventDroppedTotal counts container-death observations that
+	// routeActorObservation refused. Refusal means the backend is stopping,
+	// the actor inbox is full, recovery owns the actor key, or the exact
+	// provision generation that produced the event is no longer current. The
+	// reconciler re-detects a missed current-generation death on its next cycle
+	// (default 5m); stale-generation observations are intentionally discarded.
 	dieEventDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "die_event_dropped_total",
-		Help:      "Container-death signals routeToLease could not deliver (stopCtx canceled or inbox full); reconciler re-detects on next cycle",
+		Help:      "Container-death observations refused because the backend stopped, the actor was busy or recovery-owned, or the provision generation was stale",
 	}, []string{"source"})
 
 	// leaseWorkerPanicsTotal counts panics recovered in lease worker
@@ -698,15 +795,14 @@ var (
 		Help:      "Per-provider retained-volume cap (max_retained_disk_mb) in bytes; 0 when unset",
 	})
 
-	// retentionLeakedTotal counts leak events: a reap/evict/sweep that left a volume
-	// on disk after a failed destroy, a deprovision give-up that abandoned a footprint,
-	// or a restore-rollback whose revert did not commit. Always incremented even when
-	// the store is too broken to take the tombstone write — the observable backstop.
+	// retentionLeakedTotal counts a reaping destroy which left bytes on disk or a
+	// restore rollback whose durable handback did not commit. Close no longer has
+	// an attempt-count give-up: its non-expiring intent remains the recovery owner.
 	retentionLeakedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "retention_leaked_total",
-		Help:      "Retained-volume leak events (failed destroy / give-up / uncommitted revert) — see ENG-376",
+		Help:      "Retained-volume leak events (failed destroy or uncommitted restore revert) — see ENG-376",
 	})
 
 	// retentionSweepTotal counts periodic retention-sweep passes by outcome, exactly ONCE
@@ -768,17 +864,9 @@ var (
 	//
 	// Deliberately NOT retentionLeakedTotal: nothing is abandoned. The record stays
 	// reaping, so retention_reaping_bytes/_leases keep the footprint in the admission
-	// pool, and the skip resolves as soon as the restore rolls back (the name is renamed
-	// away and the next sweep's destroy is an idempotent no-op that drops the record).
-	// Counting it as a leak would arm the deployed BackendRetentionLeaked alert — whose
-	// reaping_leases == 0 suppressor stops suppressing the moment the tombstone clears —
-	// on a healthy self-heal.
-	//
-	// restore_claimed is benign at a low rate (it needs a restore in flight against a
-	// lease that also carries a tombstone); sustained, it means a restore is not
-	// converging — pair it with restore_finalizer_pending_total and
-	// retention_reaping_leases. claim_unreadable is the ticketing signal, exactly as
-	// retention_orphan_skips_total{reason="store_error"} is for the orphan pruner.
+	// pool. owner_claimed is a live-lease hold; claim_unreadable is the ticketing signal,
+	// exactly as retention_orphan_skips_total{reason="store_error"} is for the orphan
+	// pruner.
 	// reason ∈ reapSkipReasons.
 	retentionReapSkipsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
@@ -815,47 +903,34 @@ var (
 		Help:      "Managed-volume destroys refused by the ownership check, by call site and reason (per volume) — see ENG-658",
 	}, []string{"site", "reason"})
 
-	// teardownFallbackTotal counts the per-container compensation that runs when compose
-	// Down fails, by teardown path and result (ENG-647). Down is the only call that reaps
-	// a container's anonymous volumes, so a Down failure with no compensation leaks them
-	// silently and cumulatively (the ENG-372 class) — compose v5 made this likelier by
-	// running its removals on the errgroup's derived context, so the first failure cancels
-	// its siblings mid-flight.
+	// teardownFallbackTotal counts per-container teardown recovery by path and
+	// result (ENG-647). It includes fallback after a failed Compose Down and
+	// receipt-owned failed-restore cleanup, which directly removes the exact
+	// captured cohort. Both paths remove associated anonymous volumes.
 	//
-	// outcome="recovered" means the fallback removed everything it found. On an ADVISORY
-	// operation that can be vacuous — the prelude arm has no containers to find, so a
-	// failed Down whose discovery succeeds records "recovered" after removing nothing.
-	//
-	// outcome="failed" means at least one container may STILL be running, but what fred
-	// does about it depends on the operation, so read the two together:
-	//   - BLOCKING (restore_reconcile, restore_rollback, deprovision): fred keeps the
-	//     lease tracked and retries rather than advancing state over it. A sustained rate
-	//     is not data loss — it is capacity and anonymous volumes pinned on the host, and
-	//     a daemon that needs a look.
-	//   - ADVISORY (restore_prelude, provision_cleanup): the caller discards the error and
-	//     state advances anyway, so nothing is being held open and nothing will retry. A
-	//     rate here means a possible leak to reap by hand, or — for restore_prelude, whose
-	//     callers are entered on caller-context cancellation and then pass that same dead
-	//     context to the teardown — merely a canceled restore request with nothing on the
-	//     host at all.
+	// outcome="recovered" means destination container absence was proved.
+	// outcome="failed" means absence could not be proved. Every current path
+	// preserves exact authority and accounting. Durable recovery retries ordinary
+	// failures; a live worker with ambiguous effects may still fail-stop before
+	// its next process resumes that same intent.
 	teardownFallbackTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "teardown_fallback_total",
-		Help:      "Per-container teardown fallbacks after a failed compose Down, by operation and outcome (ENG-647)",
+		Help:      "Per-container teardown recovery, including exact failed-restore cleanup, by operation and outcome (ENG-647)",
 	}, []string{"operation", "outcome"})
 
 	// restoreFinalizerPendingTotal counts restore finalizations kept pending: a restore
 	// succeeded (new lease Ready) but its active-release write failed, so the retention
 	// record is LEFT restoring to keep protecting the adopted volume as its finalizer
-	// (ENG-523). Reconcile sweeps retry, so a lingering record re-increments this each
-	// sweep — a sustained rate means the release store is failing (mirrors the
-	// observable-backstop role of retentionLeakedTotal).
+	// (ENG-523). The initial failed finalization increments once; reconcile sweeps retry
+	// without incrementing. Alert on increases and use the retained row plus WARN log
+	// to follow convergence rather than treating the counter value as a pending gauge.
 	restoreFinalizerPendingTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "restore_finalizer_pending_total",
-		Help:      "Restore-finalizer kept-pending events: a successful restore whose active-release write failed, so the retention record stays restoring to keep protecting the adopted volume (ENG-523). A sustained rate means the release store is failing.",
+		Help:      "Restore-finalizer kept-pending events: increments when a successful restore cannot durably commit or verify its active Release, so the retention record stays restoring to protect adopted data; reconciliation retries without incrementing (ENG-523).",
 	})
 
 	// retentionReapingBytes is the reserved disk footprint (SKU quota) of records in
@@ -904,6 +979,16 @@ var restoreOutcomes = []string{"success", "failure"}
 var quotaBackfillOutcomes = []string{"applied", "failed"}
 
 func init() {
+	for _, receipt := range []terminalReceiptKind{terminalReceiptClosed, terminalReceiptFailed} {
+		terminalSubstratePendingContainers.WithLabelValues(string(receipt)).Set(0)
+		terminalSubstrateCleanupRetriesTotal.WithLabelValues(string(receipt)).Add(0)
+	}
+	for _, kind := range []shared.OperationIntentKind{shared.OperationIntentProvision, shared.OperationIntentRestore} {
+		operationIntentRecoveryCleanupRetriesTotal.WithLabelValues(string(kind)).Add(0)
+	}
+	for _, reason := range operationRecoveryTimeoutReasons {
+		operationIntentRecoveryTimeoutExhaustionsTotal.WithLabelValues(reason).Add(0)
+	}
 	// Pre-init both reindex-trigger series to 0, mirroring the orphan-skip pre-init.
 	for _, tr := range reindexTriggers {
 		retentionIndexReindexTotal.WithLabelValues(tr).Add(0)

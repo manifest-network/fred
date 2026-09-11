@@ -34,6 +34,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/manifest-network/fred/internal/api"
+	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
 func main() {
@@ -78,7 +79,8 @@ func main() {
 	var callbackAuth *api.CallbackAuthenticator
 	if *callbackSecret != "" {
 		var err error
-		callbackAuth, err = api.NewCallbackAuthenticator(*callbackSecret)
+		proofVerifier, _ := hmacauth.NewCallbackProofBoundary()
+		callbackAuth, err = api.NewCallbackAuthenticator(*callbackSecret, proofVerifier)
 		if err != nil {
 			slog.Error("invalid callback secret", "error", err)
 			os.Exit(1)

@@ -2,6 +2,7 @@ package leasesm
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 // Tests in this file exercise the LeaseActor's internal semantics
@@ -25,40 +27,44 @@ import (
 // b.Deprovision, etc.) stay in docker/lease_actor_test.go where they
 // exercise the substrate's actor registry + HTTP callback machinery.
 
-// TestLeaseActor_SendTerminalRefusesAfterActorExit guards the
-// sendTerminal contract: once the actor has fully exited (a.done
-// closed), sendTerminal must return false rather than block forever on
-// a channel nobody will drain. This lets call sites count + log the
-// dropped event instead of wedging the goroutine.
-func TestLeaseActor_SendTerminalRefusesAfterActorExit(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	actor := newTestActor(t, "lease-gone", testActorOpts{StopCtx: ctx})
+// TestLeaseSM_ProjectionAbsenceRefusesBeforeTransition pins the ordering
+// required by qmuntal/stateless: the library changes its internal state before
+// invoking OnEntry and does not roll that change back when OnEntry returns an
+// error. Every entry reduction therefore proves its actor-owned projection
+// exists before Fire. If recovery has removed the projection, the transition
+// is refused while the FSM remains at its source state.
+func TestLeaseSM_ProjectionAbsenceRefusesBeforeTransition(t *testing.T) {
+	runtime := newTestRuntimeGenerationProof(t, testActorLeaseUUID)
+	store := newMockProvisionStore()
+	store.put(testActorLeaseUUID, &ProvisionState{
+		LeaseUUID: testActorLeaseUUID,
+		Status:    backend.ProvisionStatusReady,
+	})
+	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+		ProvisionStore: store,
+	})
+	store.remove(testActorLeaseUUID)
 
-	cancel()
-	<-actor.Done()
-
-	ok := actor.sendTerminal(provisionCompletedMsg{})
-	assert.False(t, ok, "sendTerminal must refuse once the actor has exited")
+	err := actor.sm.cohortDiverged(context.Background(), runtime)
+	require.Error(t, err)
+	assert.Equal(t, backend.ProvisionStatusReady, actor.sm.State())
 }
 
 // TestSendTerminal_RejectsAfterExitingClosed pins the fix for the
 // narrow window where a late-worker sendTerminal could queue into an
 // inbox no one would drain.
 //
-// Sequence: the actor's exit-defer order is
+// Sequence: the actor's retirement order is
 //
-//	waitForWorkers → removeFromRegistry → closeExiting → drainInbox → close(done)
+//	stopAdmission → initial drain → waitForWorkers → closeTerminalAdmission → final drain → removeFromRegistry → close(done)
 //
-// Between closeExiting and close(done), the inbox is no longer
-// monitored. A worker calling sendTerminal in that window would land in
-// a slot that gets dropped silently. The fix: sendTerminal checks
-// isExiting() and refuses there, so the drop is counted via
-// leaseTerminalEventDroppedTotal rather than rotting.
+// Once closeTerminalAdmission runs, a late worker must not enqueue after the
+// final drain. The same mutex orders closing against the send, so the message
+// is either visible to the final drain or definitively refused.
 //
-// Test drives the contract: close exiting, then call sendTerminal,
-// assert false. closeExiting is idempotent (sync.Once) so the
-// production exit defer running later via stopCtx cancellation won't
-// double-close.
+// Test drives the contract: close terminal admission, then call sendTerminal,
+// assert false. Closing is idempotent, so the production exit defer may repeat
+// it safely.
 func TestSendTerminal_RejectsAfterExitingClosed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -69,9 +75,9 @@ func TestSendTerminal_RejectsAfterExitingClosed(t *testing.T) {
 	require.True(t, actor.sendTerminal(provisionCompletedMsg{}),
 		"baseline: sendTerminal should succeed on a live actor")
 
-	// Simulate the exit-sequence defer that closes this channel just
-	// before drainInbox runs. After this, sendTerminal must reject.
-	actor.closeExiting()
+	// Simulate the retirement step that closes this channel just before the final
+	// drain. After this, sendTerminal must reject.
+	actor.closeTerminalAdmission()
 
 	rejected := !actor.sendTerminal(provisionCompletedMsg{})
 	assert.True(t, rejected,
@@ -86,13 +92,17 @@ func TestSendTerminal_RejectsAfterExitingClosed(t *testing.T) {
 func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
 	var inspectCalls atomic.Int32
 	var actorPanicsBefore int64
+	leaseUUID := testActorLeaseUUID
+	runtime := newTestRuntimeGenerationProof(t, leaseUUID)
 
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID:    "lease-1",
-		Tenant:       "tenant-a",
-		ContainerIDs: []string{"c1"},
-		Status:       backend.ProvisionStatusReady,
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID:            leaseUUID,
+		Tenant:               "tenant-a",
+		ContainerIDs:         []string{"c1"},
+		Status:               backend.ProvisionStatusReady,
+		ActiveReleaseVersion: runtime.Version(),
+		ActiveOperationID:    runtime.OperationID(),
 	})
 
 	inspector := &mockInstanceInspector{
@@ -112,7 +122,7 @@ func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	actor := newTestActor(t, "lease-1", testActorOpts{
+	actor := newTestActor(t, leaseUUID, testActorOpts{
 		StopCtx:        ctx,
 		Inspector:      inspector,
 		ProvisionStore: store,
@@ -120,20 +130,20 @@ func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
 	})
 
 	// First send: panics inside the SM guard.
-	require.True(t, actor.TryEnqueue(ContainerDiedMsg{ContainerID: "c1"}))
+	first, err := NewContainerDiedObservation("c1", runtime)
+	require.NoError(t, err)
+	require.True(t, actor.TryEnqueueObservation(first))
 	require.Eventually(t, func() bool {
 		return metrics.actorPanic.Load() > actorPanicsBefore
 	}, 2*time.Second, 10*time.Millisecond,
 		"ActorPanic must be invoked when a handler panics")
 
 	// Second send: must be processed — the actor survived the panic.
-	done := make(chan struct{})
-	require.True(t, actor.TryEnqueue(ContainerDiedMsg{ContainerID: "c1", Done: done}))
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("actor did not process a message after recovering from panic")
-	}
+	second, err := NewContainerDiedObservation("c1", runtime)
+	require.NoError(t, err)
+	require.True(t, actor.TryEnqueueObservation(second))
+	require.Eventually(t, func() bool { return inspectCalls.Load() == 2 },
+		2*time.Second, time.Millisecond, "actor did not process a message after recovering from panic")
 }
 
 // TestLeaseActor_DrainsTerminalEventsOnShutdown pins the structural
@@ -144,19 +154,22 @@ func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
 // Without the drain, the event would be dropped at the send-check
 // because the actor had already exited on stopCtx.
 func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
+	leaseUUID := testActorLeaseUUID
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID:    "lease-1",
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID:    leaseUUID,
 		Tenant:       "tenant-a",
 		Status:       backend.ProvisionStatusProvisioning,
 		ContainerIDs: nil,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	actor := newTestActor(t, "lease-1", testActorOpts{
+	actor := newTestActor(t, leaseUUID, testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
 	})
+	require.NoError(t, actor.sm.requestProvision(context.Background()),
+		"test must model an admitted worker-owning Provisioning state, not a reservation")
 	require.Equal(t, backend.ProvisionStatusProvisioning, actor.State())
 
 	// Simulate an in-flight worker via workers.Add. The actor's exit-path
@@ -170,11 +183,12 @@ func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
 	// Simulate the worker: send terminal event, then Done(). The actor
 	// should then drain the inbox (via handle()) and process the event,
 	// flipping Status to Ready.
+	_, result := testProvisionSuccess(t, leaseUUID, ProvisionSuccessProjection{
+		ContainerIDs: []string{"c1"}, ServiceContainers: map[string][]string{"app": {"c1"}},
+	})
 	go func() {
 		ok := actor.sendTerminal(provisionCompletedMsg{
-			result: ProvisionSuccessResult{
-				ContainerIDs: []string{"c1"},
-			},
+			result: result,
 		})
 		require.True(t, ok, "sendTerminal must not refuse during shutdown drain")
 		actor.workers.Done()
@@ -187,7 +201,7 @@ func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
 		t.Fatal("actor did not exit after shutdown drain")
 	}
 
-	prov, ok := store.Get("lease-1")
+	prov, ok := store.Get(leaseUUID)
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status,
 		"terminal provisionCompletedMsg sent during shutdown must have been drained and processed")
@@ -199,7 +213,7 @@ func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
 // shutdown-drain race: the actor's exit-path waitForWorkers defer must
 // block until every worker goroutine (provision/restart/update/diag)
 // has returned. Without it, a worker's sendTerminal could land after
-// the actor's drainInbox had already run, dropping the terminal event.
+// the actor's retirement drain had already run, dropping the terminal event.
 //
 // Installs a synthetic worker via workers.Add, fires shutdown, verifies
 // the actor does not exit until the worker Done()s.
@@ -235,6 +249,76 @@ func TestLeaseActor_ExitWaitsForWorkers(t *testing.T) {
 	}
 }
 
+func TestLeaseActor_QuiescenceClaimSpansWorkerTerminalHandoff(t *testing.T) {
+	leaseUUID := testActorLeaseUUID
+	store := newMockProvisionStore()
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID: leaseUUID,
+		Tenant:    "tenant-a",
+		Status:    backend.ProvisionStatusFailed,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	workerStarted := make(chan struct{})
+	workerRelease := make(chan struct{})
+	ack := make(chan error, 1)
+	operation, provisionSuccess := testProvisionSuccess(t, leaseUUID, ProvisionSuccessProjection{ContainerIDs: []string{"c1"}})
+	require.True(t, provisionSuccess.operationRelease.MatchesIntent(operation.Operation()),
+		"test fixture must preserve exact operation lineage")
+	actor := newTestActor(t, leaseUUID, testActorOpts{
+		StopCtx:        ctx,
+		ProvisionStore: store,
+		ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+			close(workerStarted)
+			<-workerRelease
+			return provisionWorkSuccess{result: provisionSuccess}
+		},
+	})
+	require.True(t, actor.tryEnqueue(provisionRequestedMsg{
+		Ctx: context.Background(), Ack: ack, Admission: operation,
+	}))
+	require.NoError(t, <-ack)
+	<-workerStarted
+	assert.Nil(t, actor.TryClaimQuiescence(),
+		"a running worker must prevent a recovery quiescence claim")
+
+	close(workerRelease)
+	var claim *QuiescenceClaim
+	require.Eventually(t, func() bool {
+		claim = actor.TryClaimQuiescence()
+		return claim != nil
+	}, time.Second, time.Millisecond,
+		"quiescence becomes claimable only after the terminal message is handled")
+	claim.Release()
+	claim.Release()
+	provision, exists := store.Get(leaseUUID)
+	require.True(t, exists)
+	assert.Equal(t, backend.ProvisionStatusReady, provision.Status)
+}
+
+func TestLeaseActor_QuiescenceClaimPinsAdmissionAndRetirement(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	actor := newTestActor(t, "lease-1", testActorOpts{StopCtx: ctx})
+	claim := actor.TryClaimQuiescence()
+	require.NotNil(t, claim)
+	assert.False(t, actor.tryEnqueue(containerDiedMsg{ContainerID: "c1"}),
+		"routing must remain non-blocking and refuse while recovery owns the actor")
+
+	cancel()
+	select {
+	case <-actor.Done():
+		t.Fatal("the actor retired while its admission gate was pinned")
+	case <-time.After(50 * time.Millisecond):
+	}
+	claim.Release()
+	claim.Release()
+	select {
+	case <-actor.Done():
+	case <-time.After(time.Second):
+		t.Fatal("the actor did not retire after quiescence was released")
+	}
+}
+
 // TestGatherDiagAsync_SendsOnDeadlineExceeded pins bug_002: before the
 // fix, gatherDiagAsync suppressed the terminal send on ANY ctx.Err(),
 // including the 30s diagnosticsGatherTimeout elapsing. The SM stayed
@@ -250,7 +334,7 @@ func TestGatherDiagAsync_SendsOnDeadlineExceeded(t *testing.T) {
 			return ""
 		},
 	}
-	actor := newTestActorNoSpawn(t, "lease-1", testActorOpts{Diag: diag})
+	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{Diag: diag})
 	exitCode := 1
 	info := &InstanceState{Phase: PhaseExited, ExitCode: &exitCode}
 
@@ -262,7 +346,7 @@ func TestGatherDiagAsync_SendsOnDeadlineExceeded(t *testing.T) {
 	require.ErrorIs(t, diagCtx.Err(), context.DeadlineExceeded,
 		"test precondition: diagCtx must be DeadlineExceeded, not Canceled")
 
-	actor.gatherDiagAsync(diagCtx, "c1", info)
+	actor.gatherDiagAsync(diagCtx, "c1", info, newTestRuntimeGenerationProof(t, testActorLeaseUUID))
 
 	select {
 	case msg := <-actor.inbox:
@@ -285,7 +369,7 @@ func TestGatherDiagAsync_SuppressesOnCanceled(t *testing.T) {
 			return ""
 		},
 	}
-	actor := newTestActorNoSpawn(t, "lease-1", testActorOpts{Diag: diag})
+	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{Diag: diag})
 	exitCode := 1
 	info := &InstanceState{Phase: PhaseExited, ExitCode: &exitCode}
 
@@ -294,7 +378,7 @@ func TestGatherDiagAsync_SuppressesOnCanceled(t *testing.T) {
 	require.ErrorIs(t, diagCtx.Err(), context.Canceled,
 		"test precondition: diagCtx must be Canceled")
 
-	actor.gatherDiagAsync(diagCtx, "c1", info)
+	actor.gatherDiagAsync(diagCtx, "c1", info, newTestRuntimeGenerationProof(t, testActorLeaseUUID))
 
 	select {
 	case msg := <-actor.inbox:
@@ -325,7 +409,8 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 	var deprovDoneIDs []string
 	var deprovMu sync.Mutex
 	deprovRan := make(chan struct{})
-	doDeprovision := func(ctx context.Context, leaseUUID string) error {
+	doDeprovision := func(ctx context.Context, scope ActorCloseScope) error {
+		leaseUUID := scope.LeaseUUID()
 		// At the point doDeprovision runs, the worker has Done() and
 		// pre-published "new-container". Capture what we see.
 		state, _ := store.Get(leaseUUID)
@@ -371,7 +456,7 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 	// (cancels worker, waits on workers.Zero) → handleDeprovision body
 	// runs (calls DoDeprovisionFn).
 	reply := make(chan error, 1)
-	require.True(t, actor.TryEnqueue(DeprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
 		"OnExit must call workCancel before waiting for the worker (Restart path)")
@@ -401,12 +486,83 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 		"doDeprovision must see the new containerIDs published by the replace worker")
 }
 
+// Restore uses the same replace worker but performs its durable source
+// finalization/rollback in Work's defer. A preempting Deprovision holds the
+// backend command fence while the actor's Restarting.OnExit waits for workers;
+// it must not enter substrate close until that terminal defer is fully done.
+// This transitive ordering is why the restore worker must not try to re-lock the
+// command fence itself (doing so would deadlock against Deprovision's wait).
+func TestLeaseActor_RestoreDeprovisionWaitsForTerminalDefer(t *testing.T) {
+	leaseUUID := testActorLeaseUUID
+	store := newMockProvisionStore()
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID: leaseUUID,
+		Tenant:    "tenant-a",
+		Status:    backend.ProvisionStatusProvisioning,
+	})
+
+	terminalDeferEntered := make(chan struct{})
+	allowTerminalDefer := make(chan struct{})
+	deprovisionRan := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	restoreWorkMayReturn := make(chan struct{})
+	operation, restoreSuccess := testRestoreSuccess(t, leaseUUID, ReplaceSuccessProjection{ContainerIDs: []string{"restored-container"}})
+	actor := newTestActor(t, leaseUUID, testActorOpts{
+		StopCtx:        ctx,
+		ProvisionStore: store,
+		RestoreWorkFn: func(context.Context, shared.OperationIntentClaim) (outcome ReplaceWorkOutcome) {
+			defer func() {
+				close(terminalDeferEntered)
+				<-allowTerminalDefer
+			}()
+			<-restoreWorkMayReturn
+			return replaceWorkTerminal{result: restoreSuccess}
+		},
+		DoDeprovisionFn: func(context.Context, ActorCloseScope) error {
+			store.remove(leaseUUID)
+			close(deprovisionRan)
+			return nil
+		},
+	})
+
+	restoreAck := make(chan error, 1)
+	require.True(t, actor.tryEnqueue(restoreRequestedMsg{
+		Ctx: context.Background(), Ack: restoreAck, Operation: operation,
+	}))
+	require.NoError(t, <-restoreAck)
+
+	deprovisionReply := make(chan error, 1)
+	require.True(t, actor.tryEnqueue(deprovisionMsg{
+		Ctx: context.Background(), Reply: deprovisionReply,
+	}))
+	close(restoreWorkMayReturn)
+	select {
+	case <-terminalDeferEntered:
+	case <-time.After(time.Second):
+		t.Fatal("restore worker did not enter its terminal defer")
+	}
+	select {
+	case <-deprovisionRan:
+		t.Fatal("deprovision entered substrate cleanup before restore terminal settlement finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(allowTerminalDefer)
+	select {
+	case err := <-deprovisionReply:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("deprovision did not resume after restore terminal settlement")
+	}
+}
+
 // TestLeaseActor_DiagGathered_ShutdownDrain exercises the
 // drain-on-shutdown path for a lease in the Failing state: stopCtx
 // fires with a diagGatheredMsg freshly queued in the inbox, and the
 // actor must process it (transitioning Failing→Failed) before
 // exiting. Pre-fix: the actor would exit on stopCtx.Done and the diag
-// message would be discarded by drainInbox without handling, leaving
+// message would be discarded by retirement without handling, leaving
 // Status stuck at Failing.
 //
 // Asserts on the SM-observable outcome (Status flip) rather than HTTP
@@ -415,21 +571,30 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 func TestLeaseActor_DiagGathered_ShutdownDrain(t *testing.T) {
 	store := newMockProvisionStore()
 	store.put("lease-1", &ProvisionState{
-		LeaseUUID:    "lease-1",
-		Tenant:       "tenant-a",
-		ContainerIDs: []string{"c1"},
-		Status:       backend.ProvisionStatusFailing,
+		LeaseUUID:            "lease-1",
+		Tenant:               "tenant-a",
+		ContainerIDs:         []string{"c1"},
+		Status:               backend.ProvisionStatusFailing,
+		CallbackURL:          "https://fred.example/callbacks/provision?operation_id=exact",
+		LifecycleCallbackURL: "https://fred.example/callbacks/provision",
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
+	var lifecycleFailure bool
 	actor := newTestActor(t, "lease-1", testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
+		SendOperationCallbackFn: func(string, string, backend.CallbackStatus, string) {
+			t.Fatal("container death must not reuse the operation settlement callback path")
+		},
+		SendLifecycleFailureFn: func(shared.RuntimeGenerationProof, string) {
+			lifecycleFailure = true
+		},
 	})
 	require.Equal(t, backend.ProvisionStatusFailing, actor.State())
 
 	// Queue a diagGatheredMsg, then fire shutdown. Whatever the inbox
-	// select picks next (msg or stopCtx.Done), drainInbox must process
+	// select picks next (msg or stopCtx.Done), the retirement drain must process
 	// the queued message before the actor exits.
 	exitCode := 1
 	ok := actor.sendTerminal(diagGatheredMsg{
@@ -452,103 +617,188 @@ func TestLeaseActor_DiagGathered_ShutdownDrain(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status,
 		"drained diagGatheredMsg must transition SM Failing→Failed")
+	assert.True(t, lifecycleFailure, "autonomous failure must be published")
+}
+
+func TestProvisionAdmission_AbandonedWaiterDoesNotOwnRejectedCapacity(t *testing.T) {
+	for _, retiring := range []bool{false, true} {
+		name := "state-machine rejection"
+		if retiring {
+			name = "retirement drain"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := newTestOperationFixture(t, testActorLeaseUUID, shared.OperationIntentProvision)
+			store := newMockProvisionStore()
+			store.put(testActorLeaseUUID, &ProvisionState{
+				LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusReady,
+			})
+			var workerCalls int
+			actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+				ProvisionStore: store,
+				ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+					workerCalls++
+					return nil
+				},
+			})
+			command, reply, err := NewProvisionCommand(t.Context(), fixture.admission)
+			require.NoError(t, err)
+			require.True(t, actor.TryEnqueueCommand(command))
+			waitCtx, abandonWait := context.WithCancel(t.Context())
+			abandonWait()
+			require.ErrorIs(t, reply.Wait(waitCtx), context.Canceled)
+			require.True(t, fixture.admission.Valid(), "unknown acceptance cannot authorize caller rollback")
+
+			// The original caller has returned and will never observe this late
+			// rejection. The queued command owns its own unconsumed rollback.
+			if retiring {
+				actor.retire()
+			} else {
+				actor.handleAcceptedMessage(<-actor.inbox)
+			}
+			require.Zero(t, workerCalls)
+			require.False(t, fixture.admission.Valid(), "command-owned rejection must relinquish its live pool pin")
+			_, err = fixture.admission.Begin()
+			require.Error(t, err, "a rejected command cannot regain execution authority")
+			claims, err := fixture.settlement.ListOperationIntents()
+			require.NoError(t, err)
+			require.Len(t, claims, 1, "durable recovery retains the exact pre-effect intent")
+			assert.Equal(t, fixture.claim.OperationID(), claims[0].OperationID())
+			assert.Equal(t, shared.OperationExecutionBeforeEffects, claims[0].ExecutionPhase())
+		})
+	}
+}
+
+func TestSpawnProvisionWorker_HandsBackCapacityBeforeQuiescence(t *testing.T) {
+	fixture := newTestOperationFixture(t, testActorLeaseUUID, shared.OperationIntentProvision)
+	execution, err := fixture.admission.Begin()
+	require.NoError(t, err)
+	started, finish := make(chan struct{}), make(chan struct{})
+	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+		ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+			close(started)
+			<-finish
+			panic("interrupted mutation has no terminal proof")
+		},
+	})
+	// A retiring actor may already have closed terminal admission. Keeping its
+	// activity lock held below isolates the barrier release from the final
+	// activity decrement, making the ownership ordering deterministic.
+	actor.closeTerminalAdmission()
+	actor.spawnProvisionWorker(context.Background(), execution)
+	<-started
+	func() {
+		actor.activityMu.Lock()
+		defer actor.activityMu.Unlock()
+		close(finish)
+		select {
+		case <-actor.workers.Zero():
+			require.False(t, execution.Valid(),
+				"close/recovery must never observe quiescence while a live pin can suppress capacity release")
+		case <-time.After(3 * time.Second):
+			t.Fatal("provision worker did not release its lifetime barrier")
+		}
+	}()
+	actor.cfg.WG.Wait()
 }
 
 // TestSpawnProvisionWorker_PanicRecovery pins the invariant that a
 // panic in the provision worker does NOT crash fred: the recover logs
-// the panic with stack, bumps WorkerPanic("provision"), drives the SM
-// to Failed, and lets the actor keep serving other messages. Without
+// the panic with stack, bumps WorkerPanic("provision"), preserves the
+// nonterminal Started operation for recovery, and lets the actor keep serving
+// other messages. Without
 // this recovery an unrecovered panic would take down the entire fred
 // binary (Go's panic semantics).
 func TestSpawnProvisionWorker_PanicRecovery(t *testing.T) {
+	leaseUUID := testActorLeaseUUID
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID: "lease-1",
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID: leaseUUID,
 		Tenant:    "tenant-a",
 		Status:    backend.ProvisionStatusProvisioning,
 	})
 
 	metrics := &countingMetrics{}
+	admission := newTestOperationFixture(t, leaseUUID, shared.OperationIntentProvision).admission
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	actor := newTestActor(t, "lease-1", testActorOpts{
+	actor := newTestActor(t, leaseUUID, testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
 		Metrics:        metrics,
+		ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+			panic("synthetic provision panic")
+		},
 	})
 
 	panicsBefore := metrics.workerPanic.Load()
 
 	// Inject a worker that panics instead of doing real work. The
-	// recover must catch the panic, bump the metric, and fire a
-	// provisionErrored terminal so the SM transitions to Failed.
-	actor.spawnProvisionWorker(func() (string, backend.Reason, ProvisionSuccessResult, map[string]string, error) {
-		panic("synthetic provision panic")
-	})
+	// Recovery must catch the panic and publish only an explicit ambiguous
+	// handoff. A panic cannot prove substrate absence, so Failed is forbidden.
+	execution, err := admission.Begin()
+	require.NoError(t, err)
+	actor.spawnProvisionWorker(context.Background(), execution)
 
-	// SM must reach Failed within a short window — proves the recover
-	// fired the terminal event and the actor processed it.
+	// The worker drains, but the Started operation remains nonterminal.
 	require.Eventually(t, func() bool {
-		return actor.State() == backend.ProvisionStatusFailed
+		return metrics.workerPanic.Load() == panicsBefore+1
 	}, 2*time.Second, 10*time.Millisecond,
-		"SM must transition to Failed after worker panic recovery")
+		"worker panic must be observed")
+	assert.Equal(t, backend.ProvisionStatusProvisioning, actor.State())
 
 	panicsAfter := metrics.workerPanic.Load()
 	assert.Equal(t, panicsBefore+1, panicsAfter,
 		"WorkerPanic metric must increment by 1 after provision worker panic")
 
-	// Actor is still alive and responsive — send a container-death
-	// event and verify it gets handled (the run loop didn't die).
-	done := make(chan struct{})
-	require.True(t, actor.TryEnqueue(ContainerDiedMsg{ContainerID: "nonexistent", Done: done}))
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("actor stopped processing after worker panic — fred would have crashed")
-	}
+	// Actor is still alive and responsive — a caller command is acknowledged.
+	command, reply, err := NewDeprovisionCommand(context.Background())
+	require.NoError(t, err)
+	require.True(t, actor.TryEnqueueCommand(command))
+	require.NoError(t, reply.Wait(context.Background()))
 }
 
 // TestSpawnReplaceWorker_PanicRecovery: same invariant for the
 // restart/update worker path.
 func TestSpawnReplaceWorker_PanicRecovery(t *testing.T) {
+	leaseUUID := testActorLeaseUUID
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID: "lease-1",
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID: leaseUUID,
 		Tenant:    "tenant-a",
 		Status:    backend.ProvisionStatusRestarting,
 	})
 
 	metrics := &countingMetrics{}
+	operation := newTestOperationFixture(t, leaseUUID, shared.OperationIntentRestore).claim
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	actor := newTestActor(t, "lease-1", testActorOpts{
+	actor := newTestActor(t, leaseUUID, testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
 		Metrics:        metrics,
+		RestoreWorkFn: func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome {
+			panic("synthetic replace panic")
+		},
 	})
 
 	panicsBefore := metrics.workerPanic.Load()
 
-	actor.spawnReplaceWorker(func() ReplaceResult {
-		panic("synthetic replace panic")
-	})
+	actor.spawnReplaceWorker(context.Background(), shared.MaintenanceReleaseClaim{}, operation)
 
 	require.Eventually(t, func() bool {
-		return actor.State() == backend.ProvisionStatusFailed
+		return metrics.workerPanic.Load() == panicsBefore+1
 	}, 2*time.Second, 10*time.Millisecond,
-		"SM must transition to Failed after replace worker panic recovery")
+		"replace panic must be observed")
+	assert.Equal(t, backend.ProvisionStatusRestarting, actor.State())
 
 	panicsAfter := metrics.workerPanic.Load()
 	assert.Equal(t, panicsBefore+1, panicsAfter,
 		"WorkerPanic metric must increment by 1 after replace worker panic")
 
-	done := make(chan struct{})
-	require.True(t, actor.TryEnqueue(ContainerDiedMsg{ContainerID: "nonexistent", Done: done}))
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("actor stopped processing after replace worker panic")
-	}
+	command, reply, err := NewDeprovisionCommand(context.Background())
+	require.NoError(t, err)
+	require.True(t, actor.TryEnqueueCommand(command))
+	require.NoError(t, reply.Wait(context.Background()))
 }
 
 // TestGatherDiagAsync_PanicRecovery: the diag worker (spawned from
@@ -556,12 +806,16 @@ func TestSpawnReplaceWorker_PanicRecovery(t *testing.T) {
 // used to crash fred; now it bumps the metric and drives Failing→Failed
 // with empty diag so the lease isn't wedged in Failing.
 func TestGatherDiagAsync_PanicRecovery(t *testing.T) {
+	leaseUUID := testActorLeaseUUID
+	runtime := newTestRuntimeGenerationProof(t, leaseUUID)
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID:    "lease-1",
-		Tenant:       "tenant-a",
-		Status:       backend.ProvisionStatusFailing,
-		ContainerIDs: []string{"c1"},
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID:            leaseUUID,
+		Tenant:               "tenant-a",
+		Status:               backend.ProvisionStatusFailing,
+		ContainerIDs:         []string{"c1"},
+		ActiveReleaseVersion: runtime.Version(),
+		ActiveOperationID:    runtime.OperationID(),
 	})
 
 	diag := &mockDiagnosticsGatherer{
@@ -573,7 +827,7 @@ func TestGatherDiagAsync_PanicRecovery(t *testing.T) {
 	metrics := &countingMetrics{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	actor := newTestActor(t, "lease-1", testActorOpts{
+	actor := newTestActor(t, leaseUUID, testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
 		Diag:           diag,
@@ -590,7 +844,10 @@ func TestGatherDiagAsync_PanicRecovery(t *testing.T) {
 	go func() {
 		defer actor.workers.Done()
 		exitCode := 1
-		actor.gatherDiagAsync(gatherCtx, "c1", &InstanceState{Phase: PhaseExited, ExitCode: &exitCode})
+		actor.gatherDiagAsync(
+			gatherCtx, "c1", &InstanceState{Phase: PhaseExited, ExitCode: &exitCode},
+			runtime,
+		)
 	}()
 
 	// SM must reach Failed once the panic recovery fires diagGatheredMsg.
@@ -635,17 +892,24 @@ func TestTerminatedActor_RejectsCallerFacingRequests(t *testing.T) {
 	// in the actor's own goroutine after handleDeprovision has set
 	// terminated=true and the main loop is draining via the run-exit
 	// defers.
-	actor := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+	var provisionWorkerSpawned atomic.Bool
+	var maintenanceWorkerSpawned atomic.Bool
+	actor := newTestActorNoSpawn(t, "lease-1", testActorOpts{
+		ProvisionStore: store,
+		ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+			provisionWorkerSpawned.Store(true)
+			return nil
+		},
+		MaintenanceWorkFn: func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+			maintenanceWorkerSpawned.Store(true)
+			return nil
+		},
+	})
 	actor.terminated = true // simulate post-handleDeprovision state
 
 	t.Run("Provision", func(t *testing.T) {
-		var workerSpawned atomic.Bool
-		msg := ProvisionRequestedMsg{
-			Cancel: func() {},
-			Work: func() (string, backend.Reason, ProvisionSuccessResult, map[string]string, error) {
-				workerSpawned.Store(true)
-				return "", "", ProvisionSuccessResult{}, nil, nil
-			},
+		msg := provisionRequestedMsg{
+			Ctx: context.Background(),
 			Ack: make(chan error, 1),
 		}
 		actor.handleProvisionRequested(msg)
@@ -659,18 +923,13 @@ func TestTerminatedActor_RejectsCallerFacingRequests(t *testing.T) {
 		}
 		// Give any stray goroutine time to fire before we assert.
 		time.Sleep(20 * time.Millisecond)
-		assert.False(t, workerSpawned.Load(),
+		assert.False(t, provisionWorkerSpawned.Load(),
 			"terminated actor must NOT spawn a provision worker")
 	})
 
 	t.Run("Restart", func(t *testing.T) {
-		var workerSpawned atomic.Bool
-		msg := RestartRequestedMsg{
-			Cancel: func() {},
-			Work: func() ReplaceResult {
-				workerSpawned.Store(true)
-				return ReplaceResult{}
-			},
+		msg := restartRequestedMsg{
+			Ctx: context.Background(),
 			Ack: make(chan error, 1),
 		}
 		actor.handleRestartRequested(msg)
@@ -683,18 +942,13 @@ func TestTerminatedActor_RejectsCallerFacingRequests(t *testing.T) {
 			t.Fatal("ack channel never received a value")
 		}
 		time.Sleep(20 * time.Millisecond)
-		assert.False(t, workerSpawned.Load(),
+		assert.False(t, maintenanceWorkerSpawned.Load(),
 			"terminated actor must NOT spawn a replace worker for Restart")
 	})
 
 	t.Run("Update", func(t *testing.T) {
-		var workerSpawned atomic.Bool
-		msg := UpdateRequestedMsg{
-			Cancel: func() {},
-			Work: func() ReplaceResult {
-				workerSpawned.Store(true)
-				return ReplaceResult{}
-			},
+		msg := updateRequestedMsg{
+			Ctx: context.Background(),
 			Ack: make(chan error, 1),
 		}
 		actor.handleUpdateRequested(msg)
@@ -707,7 +961,7 @@ func TestTerminatedActor_RejectsCallerFacingRequests(t *testing.T) {
 			t.Fatal("ack channel never received a value")
 		}
 		time.Sleep(20 * time.Millisecond)
-		assert.False(t, workerSpawned.Load(),
+		assert.False(t, maintenanceWorkerSpawned.Load(),
 			"terminated actor must NOT spawn a replace worker for Update")
 	})
 }
@@ -723,9 +977,10 @@ func TestTerminatedActor_RejectsCallerFacingRequests(t *testing.T) {
 // The fix verifies sm.State() == Provisioning after Fire and rejects
 // otherwise.
 func TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning(t *testing.T) {
+	leaseUUID := testActorLeaseUUID
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID:    "lease-1",
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID:    leaseUUID,
 		Tenant:       "tenant-a",
 		Status:       backend.ProvisionStatusDeprovisioning,
 		ContainerIDs: []string{"c1"},
@@ -734,7 +989,8 @@ func TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning(t *testing.T) {
 	// No-spawn so we drive handleProvisionRequested synchronously
 	// without racing the run loop's draining of the message we're
 	// about to construct.
-	actor := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+	admission := newTestOperationFixture(t, leaseUUID, shared.OperationIntentProvision).admission
+	actor := newTestActorNoSpawn(t, leaseUUID, testActorOpts{ProvisionStore: store})
 	// newLeaseSM initializes the SM from prov.Status, so SM is in
 	// Deprovisioning. terminated stays false because handleDeprovision
 	// was never run (simulating a partial-deprov scenario where the
@@ -742,13 +998,11 @@ func TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning(t *testing.T) {
 	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.State(),
 		"test precondition: SM must be in Deprovisioning")
 
+	var previousCancelCalled, rejectedCancelCalled atomic.Bool
+	actor.workCancel = func() { previousCancelCalled.Store(true) }
 	ack := make(chan error, 1)
-	msg := ProvisionRequestedMsg{
-		Cancel: func() {},
-		Work: func() (string, backend.Reason, ProvisionSuccessResult, map[string]string, error) {
-			return "", "", ProvisionSuccessResult{}, nil, nil
-		},
-		Ack: ack,
+	msg := provisionRequestedMsg{
+		Ctx: context.Background(), Ack: ack, Admission: admission,
 	}
 	actor.handleProvisionRequested(msg)
 
@@ -759,6 +1013,88 @@ func TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning(t *testing.T) {
 	default:
 		t.Fatal("handler did not send on ack channel")
 	}
+	require.NotNil(t, actor.workCancel)
+	actor.workCancel()
+	assert.True(t, previousCancelCalled.Load(),
+		"a rejected provision must preserve the existing worker's cancel capability")
+	assert.False(t, rejectedCancelCalled.Load(),
+		"a rejected provision must not install its own cancel capability")
+}
+
+func TestHandleProvisionRequested_AcceptsReservedLeaseExactlyOnce(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put(testActorLeaseUUID, &ProvisionState{
+		LeaseUUID: testActorLeaseUUID,
+		Status:    backend.ProvisionStatusProvisioning,
+	})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int64
+	admission, failure := newTestProvisionFailure(t, testActorLeaseUUID)
+	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+		ProvisionStore: store,
+		ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+			if calls.Add(1) == 1 {
+				close(started)
+			}
+			<-release
+			outcome, err := NewProvisionWorkFailure(
+				errors.New("stopped"), ErrMsgInternal, backend.ReasonInternal, failure,
+			)
+			require.NoError(t, err)
+			return outcome
+		},
+	})
+	firstAck := make(chan error, 1)
+	actor.handleProvisionRequested(provisionRequestedMsg{
+		Ctx: context.Background(), Ack: firstAck, Admission: admission,
+	})
+	require.NoError(t, <-firstAck)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("accepted provision worker did not start")
+	}
+
+	secondAck := make(chan error, 1)
+	actor.handleProvisionRequested(provisionRequestedMsg{
+		Ctx: context.Background(), Ack: secondAck, Admission: admission,
+	})
+	require.Error(t, <-secondAck)
+	assert.Equal(t, int64(1), calls.Load(), "running Provisioning must not accept a duplicate worker")
+	close(release)
+}
+
+func TestRestartRedeliveryFromDurableStartedStateCannotSpawnSecondWorker(t *testing.T) {
+	const leaseUUID = "76767676-7676-4676-8676-767676767676"
+	store := newMockProvisionStore()
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID: leaseUUID,
+		Status:    backend.ProvisionStatusRestarting,
+	})
+	stopCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	var workerCalls atomic.Int32
+	actor := newTestActor(t, leaseUUID, testActorOpts{
+		StopCtx:        stopCtx,
+		ProvisionStore: store,
+		MaintenanceWorkFn: func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+			workerCalls.Add(1)
+			return nil
+		},
+	})
+
+	claim := newTestMaintenanceClaim(t, leaseUUID, shared.MaintenanceIntentRestart)
+	target := testMaintenanceTarget(t, claim)
+	command, reply, err := NewRestartCommand(
+		t.Context(),
+		target,
+	)
+	require.NoError(t, err)
+	require.True(t, actor.TryEnqueueCommand(command))
+	require.ErrorIs(t, reply.Wait(t.Context()), backend.ErrInvalidState)
+	assert.Equal(t, int32(0), workerCalls.Load(),
+		"redelivery after durable Started must not duplicate physical restart work")
 }
 
 // TestProvision_DeprovisionWaitsForInFlightGoroutine guards the
@@ -785,7 +1121,8 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 	var deprovDoneIDs []string
 	var deprovMu sync.Mutex
 	deprovRan := make(chan struct{})
-	doDeprovision := func(ctx context.Context, leaseUUID string) error {
+	doDeprovision := func(ctx context.Context, scope ActorCloseScope) error {
+		leaseUUID := scope.LeaseUUID()
 		state, _ := store.Get(leaseUUID)
 		deprovMu.Lock()
 		deprovDoneIDs = append(deprovDoneIDs, state.ContainerIDs...)
@@ -802,6 +1139,8 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 		ProvisionStore:  store,
 		DoDeprovisionFn: doDeprovision,
 	})
+	require.NoError(t, actor.sm.requestProvision(context.Background()),
+		"test must model an admitted worker-owning Provisioning state, not a reservation")
 	require.Equal(t, backend.ProvisionStatusProvisioning, actor.State())
 
 	// Simulate an in-flight provision worker via workers + workCancel.
@@ -826,7 +1165,7 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 	// evDeprovisionRequested → Provisioning.OnExit (workCancel +
 	// waitForWorkers) → handleDeprovision body runs DoDeprovisionFn.
 	reply := make(chan error, 1)
-	require.True(t, actor.TryEnqueue(DeprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
 		"OnExit must call workCancel before waitForWorkers")
@@ -857,39 +1196,45 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 
 // TestRestartRequested_WritesStatusBeforeAck pins the ENG-230
 // handler-publish contract: the actor must write prov.Status=Restarting
-// (and apply the request's CallbackURL) BEFORE acking the
-// RestartRequestedMsg, so api/handlers.go can publish a "restarting"
+// and apply the caller's prevalidated callback pair BEFORE acking the
+// restartRequestedMsg, so api/handlers.go can publish a "restarting"
 // event after Restart() returns and have it reflect already-committed
 // state. The Status/CallbackURL writes now live in onEnterRestarting
 // (the actor goroutine), not the HTTP prelude.
 func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
+	claim := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentRestart)
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID:   "lease-1",
-		Tenant:      "tenant-a",
-		Status:      backend.ProvisionStatusReady,
-		CallbackURL: "old-cb",
+	store.put(testActorLeaseUUID, &ProvisionState{
+		LeaseUUID:            testActorLeaseUUID,
+		Tenant:               "tenant-a",
+		Status:               backend.ProvisionStatusReady,
+		CallbackURL:          "https://old.example/callbacks/provision?operation_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+		LifecycleCallbackURL: "https://old.example/callbacks/provision?lifecycle_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8",
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	actor := newTestActor(t, "lease-1", testActorOpts{
+	workerRelease := make(chan struct{})
+	success := testMaintenanceSuccess(t, claim, ReplaceSuccessProjection{})
+	actor := newTestActor(t, testActorLeaseUUID, testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
+		MaintenanceWorkFn: func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+			<-workerRelease
+			return replaceWorkTerminal{result: success}
+		},
 	})
 
 	// Block the worker so the lease stays in Restarting while we assert —
 	// otherwise the replace worker could flip it to Ready before we read.
-	workerRelease := make(chan struct{})
 	ack := make(chan error, 1)
-	require.True(t, actor.TryEnqueue(RestartRequestedMsg{
-		Cancel:      func() {},
-		CallbackURL: "new-cb",
-		Work: func() ReplaceResult {
-			<-workerRelease
-			return ReplaceResult{Success: ReplaceSuccessResult{}}
-		},
-		Ack: ack,
+	require.True(t, actor.tryEnqueue(restartRequestedMsg{
+		Ctx:                  context.Background(),
+		CallbackURL:          claim.CallbackURL(),
+		LifecycleCallbackURL: claim.LifecycleCallbackURL(),
+		Maintenance:          claim,
+		Target:               testMaintenanceTarget(t, claim),
+		Ack:                  ack,
 	}))
 
 	select {
@@ -899,44 +1244,60 @@ func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
 		t.Fatal("no ack received from handleRestartRequested")
 	}
 
-	prov, ok := store.Get("lease-1")
+	prov, ok := store.Get(testActorLeaseUUID)
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusRestarting, prov.Status,
 		"actor must write Status=Restarting BEFORE acking (handler-publish contract)")
-	assert.Equal(t, "new-cb", prov.CallbackURL,
-		"actor must apply the message CallbackURL before acking")
+	assert.Equal(t, "https://old.example/callbacks/provision?operation_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8", prov.CallbackURL,
+		"accepted maintenance must not replace committed runtime authority before success")
+	assert.Equal(t, "https://old.example/callbacks/provision?lifecycle_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8", prov.LifecycleCallbackURL,
+		"accepted maintenance must keep the committed lifecycle route pending")
+	assert.Equal(t, claim.CallbackURL(), actor.pendingReplaceCallbackURL)
+	assert.Equal(t, claim.LifecycleCallbackURL(), actor.pendingReplaceLifecycleCallbackURL)
 
 	close(workerRelease) // let the worker finish so the actor can quiesce
+	require.Eventually(t, func() bool {
+		committed, exists := store.Get(testActorLeaseUUID)
+		return exists && committed.Status == backend.ProvisionStatusReady &&
+			committed.CallbackURL == claim.CallbackURL() &&
+			committed.LifecycleCallbackURL == claim.LifecycleCallbackURL()
+	}, time.Second, 5*time.Millisecond)
 }
 
 // TestUpdateRequested_WritesStatusBeforeAck is the Update mirror of
 // TestRestartRequested_WritesStatusBeforeAck.
 func TestUpdateRequested_WritesStatusBeforeAck(t *testing.T) {
+	claim := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentUpdate)
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID:   "lease-1",
-		Tenant:      "tenant-a",
-		Status:      backend.ProvisionStatusReady,
-		CallbackURL: "old-cb",
+	store.put(testActorLeaseUUID, &ProvisionState{
+		LeaseUUID:            testActorLeaseUUID,
+		Tenant:               "tenant-a",
+		Status:               backend.ProvisionStatusReady,
+		CallbackURL:          "https://old.example/callbacks/provision?operation_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+		LifecycleCallbackURL: "https://old.example/callbacks/provision?lifecycle_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8",
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	actor := newTestActor(t, "lease-1", testActorOpts{
+	workerRelease := make(chan struct{})
+	success := testMaintenanceSuccess(t, claim, ReplaceSuccessProjection{})
+	actor := newTestActor(t, testActorLeaseUUID, testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
+		MaintenanceWorkFn: func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+			<-workerRelease
+			return replaceWorkTerminal{result: success}
+		},
 	})
 
-	workerRelease := make(chan struct{})
 	ack := make(chan error, 1)
-	require.True(t, actor.TryEnqueue(UpdateRequestedMsg{
-		Cancel:      func() {},
-		CallbackURL: "new-cb",
-		Work: func() ReplaceResult {
-			<-workerRelease
-			return ReplaceResult{Success: ReplaceSuccessResult{}}
-		},
-		Ack: ack,
+	require.True(t, actor.tryEnqueue(updateRequestedMsg{
+		Ctx:                  context.Background(),
+		CallbackURL:          claim.CallbackURL(),
+		LifecycleCallbackURL: claim.LifecycleCallbackURL(),
+		Maintenance:          claim,
+		Target:               testMaintenanceTarget(t, claim),
+		Ack:                  ack,
 	}))
 
 	select {
@@ -946,24 +1307,54 @@ func TestUpdateRequested_WritesStatusBeforeAck(t *testing.T) {
 		t.Fatal("no ack received from handleUpdateRequested")
 	}
 
-	prov, ok := store.Get("lease-1")
+	prov, ok := store.Get(testActorLeaseUUID)
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusUpdating, prov.Status,
 		"actor must write Status=Updating BEFORE acking (handler-publish contract)")
-	assert.Equal(t, "new-cb", prov.CallbackURL,
-		"actor must apply the message CallbackURL before acking")
+	assert.Equal(t, "https://old.example/callbacks/provision?operation_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8", prov.CallbackURL,
+		"accepted maintenance must not replace committed runtime authority before success")
+	assert.Equal(t, "https://old.example/callbacks/provision?lifecycle_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8", prov.LifecycleCallbackURL,
+		"accepted maintenance must keep the committed lifecycle route pending")
+	assert.Equal(t, claim.CallbackURL(), actor.pendingReplaceCallbackURL)
+	assert.Equal(t, claim.LifecycleCallbackURL(), actor.pendingReplaceLifecycleCallbackURL)
 
 	close(workerRelease)
+	require.Eventually(t, func() bool {
+		committed, exists := store.Get(testActorLeaseUUID)
+		return exists && committed.Status == backend.ProvisionStatusReady &&
+			committed.CallbackURL == claim.CallbackURL() &&
+			committed.LifecycleCallbackURL == claim.LifecycleCallbackURL()
+	}, time.Second, 5*time.Millisecond)
 }
 
 // routeReplace enqueues the op-appropriate replace request ("restart" or
 // "update") onto the actor's inbox. Shared by the ENG-230 §6.3 matrix tests
 // so the restart and update paths are exercised by identical logic.
-func routeReplace(actor *LeaseActor, op, callbackURL string, cancelFn func(), work func() ReplaceResult, ack chan error) bool {
+func routeReplace(
+	actor *LeaseActor,
+	op string,
+	target shared.MaintenanceReleaseClaim,
+	ack chan error,
+) bool {
+	claim := target.Intent()
 	if op == "update" {
-		return actor.TryEnqueue(UpdateRequestedMsg{Cancel: cancelFn, CallbackURL: callbackURL, Work: work, Ack: ack})
+		return actor.tryEnqueue(updateRequestedMsg{
+			Ctx:                  context.Background(),
+			CallbackURL:          claim.CallbackURL(),
+			LifecycleCallbackURL: claim.LifecycleCallbackURL(),
+			Maintenance:          claim,
+			Target:               target,
+			Ack:                  ack,
+		})
 	}
-	return actor.TryEnqueue(RestartRequestedMsg{Cancel: cancelFn, CallbackURL: callbackURL, Work: work, Ack: ack})
+	return actor.tryEnqueue(restartRequestedMsg{
+		Ctx:                  context.Background(),
+		CallbackURL:          claim.CallbackURL(),
+		LifecycleCallbackURL: claim.LifecycleCallbackURL(),
+		Maintenance:          claim,
+		Target:               target,
+		Ack:                  ack,
+	})
 }
 
 // busyStateFor maps a replace op to the busy SM state its entry action sets.
@@ -984,37 +1375,48 @@ func busyStateFor(op string) backend.ProvisionStatus {
 // prove identity via distinct side-effecting markers, not pointer equality).
 func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 	t.Helper()
+	kind := shared.MaintenanceIntentRestart
+	if op == "update" {
+		kind = shared.MaintenanceIntentUpdate
+	}
+	firstClaim := newTestMaintenanceClaim(t, testActorLeaseUUID, kind)
+	secondClaim := newTestMaintenanceClaim(t, testActorLeaseUUID, kind)
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady})
+	store.put(testActorLeaseUUID, &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusReady})
 
-	doDeprovision := func(ctx context.Context, leaseUUID string) error {
+	doDeprovision := func(ctx context.Context, scope ActorCloseScope) error {
+		leaseUUID := scope.LeaseUUID()
 		store.remove(leaseUUID)
 		return nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	actor := newTestActor(t, "lease-1", testActorOpts{
+	var workerCount atomic.Int64
+	var firstCancelObserved, secondWorkerRan atomic.Bool
+	worker1Release := make(chan struct{})
+	firstSuccess := testMaintenanceSuccess(t, firstClaim, ReplaceSuccessProjection{})
+	firstTarget := testMaintenanceTarget(t, firstClaim)
+	secondTarget := testMaintenanceTarget(t, secondClaim)
+	actor := newTestActor(t, testActorLeaseUUID, testActorOpts{
 		StopCtx:         ctx,
 		ProvisionStore:  store,
 		DoDeprovisionFn: doDeprovision,
+		MaintenanceWorkFn: func(workerCtx context.Context, target shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+			workerCount.Add(1)
+			if target.MaintenanceID() == secondTarget.MaintenanceID() {
+				secondWorkerRan.Store(true)
+			}
+			<-workerCtx.Done()
+			firstCancelObserved.Store(true)
+			<-worker1Release
+			return replaceWorkTerminal{result: firstSuccess}
+		},
 	})
-
-	var workerCount atomic.Int64
-	var firstCancelCalled, secondCancelCalled atomic.Bool
-	worker1Release := make(chan struct{})
 
 	// Request #1 wins: SM → busy, worker #1 spawned and blocks.
 	ack1 := make(chan error, 1)
-	require.True(t, routeReplace(actor, op, "",
-		func() { firstCancelCalled.Store(true) },
-		func() ReplaceResult {
-			workerCount.Add(1)
-			<-worker1Release
-			return ReplaceResult{Success: ReplaceSuccessResult{}}
-		},
-		ack1,
-	))
+	require.True(t, routeReplace(actor, op, firstTarget, ack1))
 	select {
 	case err := <-ack1:
 		require.NoError(t, err, "first %s must be accepted", op)
@@ -1025,14 +1427,7 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 
 	// Request #2 loses the race: SM already busy → rejected with 409.
 	ack2 := make(chan error, 1)
-	require.True(t, routeReplace(actor, op, "",
-		func() { secondCancelCalled.Store(true) },
-		func() ReplaceResult {
-			workerCount.Add(1)
-			return ReplaceResult{Success: ReplaceSuccessResult{}}
-		},
-		ack2,
-	))
+	require.True(t, routeReplace(actor, op, secondTarget, ack2))
 	select {
 	case err := <-ack2:
 		require.ErrorIs(t, err, backend.ErrInvalidState,
@@ -1044,12 +1439,12 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 	// Deprovision preempts: onExitProvisioning cancels the in-flight worker
 	// (whose workCancel must still be request #1's) then waits for it.
 	reply := make(chan error, 1)
-	require.True(t, actor.TryEnqueue(DeprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
 
-	require.Eventually(t, firstCancelCalled.Load, 1*time.Second, 5*time.Millisecond,
+	require.Eventually(t, firstCancelObserved.Load, 1*time.Second, 5*time.Millisecond,
 		"onExitProvisioning must cancel the FIRST (in-flight) %s worker", op)
-	assert.False(t, secondCancelCalled.Load(),
-		"the rejected second %s must NOT have clobbered workCancel", op)
+	assert.False(t, secondWorkerRan.Load(),
+		"the rejected second %s must not run", op)
 
 	// Release worker #1 so waitForWorkers unblocks and the deprovision completes.
 	close(worker1Release)
@@ -1076,25 +1471,42 @@ func TestSecondConcurrentUpdateRejected(t *testing.T) { runConcurrentReplaceReje
 // across busy states, not duplicate-only.
 func runReplaceLosesToDeprovisionTest(t *testing.T, op string) {
 	t.Helper()
+	kind := shared.MaintenanceIntentRestart
+	if op == "update" {
+		kind = shared.MaintenanceIntentUpdate
+	}
+	claim := newTestMaintenanceClaim(t, testActorLeaseUUID, kind)
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady})
+	store.put(testActorLeaseUUID, &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusReady})
 
 	// No-spawn: drive the handlers synchronously. The default DoDeprovisionFn
 	// is a no-op that leaves the provision in place, so the SM stays in
 	// Deprovisioning with terminated=false (the partial-deprovision actor).
-	actor := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+	var workerCount atomic.Int64
+	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+		ProvisionStore: store,
+		MaintenanceWorkFn: func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+			workerCount.Add(1)
+			return nil
+		},
+	})
 
 	require.NoError(t, actor.handleDeprovision(context.Background()))
 	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.State(),
 		"test precondition: SM must be Deprovisioning")
 
-	var workerCount atomic.Int64
 	ack := make(chan error, 1)
-	work := func() ReplaceResult { workerCount.Add(1); return ReplaceResult{} }
+	target := testMaintenanceTarget(t, claim)
 	if op == "update" {
-		actor.handleUpdateRequested(UpdateRequestedMsg{Cancel: func() {}, Work: work, Ack: ack})
+		actor.handleUpdateRequested(updateRequestedMsg{
+			Ctx: context.Background(), Target: target, Ack: ack,
+			CallbackURL: claim.CallbackURL(), LifecycleCallbackURL: claim.LifecycleCallbackURL(), Maintenance: claim,
+		})
 	} else {
-		actor.handleRestartRequested(RestartRequestedMsg{Cancel: func() {}, Work: work, Ack: ack})
+		actor.handleRestartRequested(restartRequestedMsg{
+			Ctx: context.Background(), Target: target, Ack: ack,
+			CallbackURL: claim.CallbackURL(), LifecycleCallbackURL: claim.LifecycleCallbackURL(), Maintenance: claim,
+		})
 	}
 
 	select {
@@ -1115,32 +1527,53 @@ func TestUpdateLosesToDeprovision(t *testing.T)  { runReplaceLosesToDeprovisionT
 // fresh-actor-init-in-Failed path that this change unmasks (the old off-actor
 // pre-write hid it by initializing the SM in Restarting). A replace from
 // Status=Failed must SUCCEED: SM → Restarting/Updating via the Failed Permits
-// (lease_sm.go:236-240), Status (+CallbackURL) written before the ack, exactly
-// one worker spawned.
+// (lease_sm.go:236-240), Status and the prevalidated callback pair written
+// before the ack, exactly one worker spawned.
 func runReplaceFromFailedSucceedsTest(t *testing.T, op string) {
 	t.Helper()
+	kind := shared.MaintenanceIntentRestart
+	if op == "update" {
+		kind = shared.MaintenanceIntentUpdate
+	}
+	claim := newTestMaintenanceClaim(t, testActorLeaseUUID, kind)
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID:   "lease-1",
-		Status:      backend.ProvisionStatusFailed,
-		CallbackURL: "old-cb",
+	store.put(testActorLeaseUUID, &ProvisionState{
+		LeaseUUID:            testActorLeaseUUID,
+		Status:               backend.ProvisionStatusFailed,
+		CallbackURL:          "old-cb",
+		LifecycleCallbackURL: "old-lifecycle-cb",
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	actor := newTestActor(t, "lease-1", testActorOpts{StopCtx: ctx, ProvisionStore: store})
-
+	var operationCallbacks atomic.Int64
+	var lifecycleCallbacks atomic.Int64
+	var maintenanceCallbacks atomic.Int64
 	var workerCount atomic.Int64
 	workerRelease := make(chan struct{})
-	ack := make(chan error, 1)
-	require.True(t, routeReplace(actor, op, "new-cb",
-		func() {},
-		func() ReplaceResult {
+	success := testMaintenanceSuccess(t, claim, ReplaceSuccessProjection{})
+	target := testMaintenanceTarget(t, claim)
+	actor := newTestActor(t, testActorLeaseUUID, testActorOpts{
+		StopCtx:        ctx,
+		ProvisionStore: store,
+		MaintenanceWorkFn: func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
 			workerCount.Add(1)
 			<-workerRelease
-			return ReplaceResult{Success: ReplaceSuccessResult{}}
+			return replaceWorkTerminal{result: success}
 		},
-		ack,
-	))
+		SendOperationCallbackFn: func(string, string, backend.CallbackStatus, string) {
+			operationCallbacks.Add(1)
+		},
+		SendLifecycleFailureFn: func(shared.RuntimeGenerationProof, string) {
+			lifecycleCallbacks.Add(1)
+		},
+		SendMaintenanceCallbackFn: func(got shared.MaintenanceIntentClaim, _ backend.CallbackStatus, _ string) {
+			assert.Equal(t, claim.MaintenanceID(), got.MaintenanceID())
+			maintenanceCallbacks.Add(1)
+		},
+	})
+
+	ack := make(chan error, 1)
+	require.True(t, routeReplace(actor, op, target, ack))
 	select {
 	case err := <-ack:
 		require.NoError(t, err, "%s from Failed must be accepted (fresh-actor-init-in-Failed path)", op)
@@ -1148,21 +1581,129 @@ func runReplaceFromFailedSucceedsTest(t *testing.T, op string) {
 		t.Fatalf("no ack from %s-from-Failed", op)
 	}
 
-	prov, ok := store.Get("lease-1")
+	prov, ok := store.Get(testActorLeaseUUID)
 	require.True(t, ok)
 	assert.Equal(t, busyStateFor(op), prov.Status, "Status must be written before the ack")
-	assert.Equal(t, "new-cb", prov.CallbackURL, "CallbackURL must be applied by the entry action")
+	assert.Equal(t, "old-cb", prov.CallbackURL, "committed operation route must remain until success")
+	assert.Equal(t, "old-lifecycle-cb", prov.LifecycleCallbackURL, "committed lifecycle route must remain until success")
 
 	close(workerRelease) // let the worker finish so the actor can quiesce
-	require.Eventually(t, func() bool { return workerCount.Load() == 1 }, time.Second, 5*time.Millisecond,
-		"exactly one %s worker must be spawned", op)
+	require.Eventually(t, func() bool {
+		committed, exists := store.Get(testActorLeaseUUID)
+		return workerCount.Load() == 1 && maintenanceCallbacks.Load() == 1 && exists &&
+			committed.CallbackURL == claim.CallbackURL() &&
+			committed.LifecycleCallbackURL == claim.LifecycleCallbackURL()
+	}, time.Second, 5*time.Millisecond, "exactly one %s worker and maintenance completion must run", op)
+	assert.Zero(t, operationCallbacks.Load(), "%s completion must not enter the operation outbox", op)
+	assert.Zero(t, lifecycleCallbacks.Load(), "%s exact completion must not use observational delivery", op)
 }
 
 func TestRestartFromFailed_Succeeds(t *testing.T) { runReplaceFromFailedSucceedsTest(t, "restart") }
 func TestUpdateFromFailed_Succeeds(t *testing.T)  { runReplaceFromFailedSucceedsTest(t, "update") }
 
+func TestMaintenanceFailurePublishesExactSourceBeforeCallback(t *testing.T) {
+	for _, tt := range []struct {
+		name              string
+		op                string
+		err               error
+		restored          bool
+		recoverFromSource bool
+		details           ReplaceFailureDetails
+	}{
+		{
+			name:              "restart preflight before mutation",
+			op:                "restart",
+			err:               errors.New("preflight failed"),
+			recoverFromSource: true,
+			details:           ReplaceFailureDetails{CallbackErr: "restart failed", LastError: "preflight failed", Reason: backend.ReasonRestartFailed},
+		},
+		{
+			name:     "update rollback restored old runtime",
+			op:       "update",
+			err:      errors.New("replacement failed"),
+			restored: true,
+			details:  ReplaceFailureDetails{CallbackErr: "update failed; rolled back", LastError: "replacement failed", Reason: backend.ReasonUpdateFailed},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			kind := shared.MaintenanceIntentRestart
+			if tt.op == "update" {
+				kind = shared.MaintenanceIntentUpdate
+			}
+			claim := newTestMaintenanceClaim(t, testActorLeaseUUID, kind)
+			store := newMockProvisionStore()
+			store.put(testActorLeaseUUID, &ProvisionState{
+				LeaseUUID:            testActorLeaseUUID,
+				Status:               backend.ProvisionStatusReady,
+				CallbackURL:          "old-operation",
+				LifecycleCallbackURL: "old-lifecycle",
+				ContainerIDs:         []string{"removed-source"},
+				ServiceContainers:    map[string][]string{"app": {"removed-source"}},
+			})
+			callback := make(chan string, 1)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			result := testMaintenanceFailure(t, claim, tt.err, tt.restored, tt.recoverFromSource, tt.details)
+			ready, ok := result.failure.maintenanceRelease.SourceReady()
+			require.True(t, ok)
+			source, ids, services := ready.Projection()
+			runtime, ok := source.RuntimeIdentity()
+			require.True(t, ok)
+			require.NotEqual(t, []string{"removed-source"}, ids)
+			target := testMaintenanceTarget(t, claim)
+			actor := newTestActor(t, testActorLeaseUUID, testActorOpts{
+				StopCtx:        ctx,
+				ProvisionStore: store,
+				MaintenanceWorkFn: func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+					return replaceWorkTerminal{result: result}
+				},
+				SendMaintenanceCallbackFn: func(_ shared.MaintenanceIntentClaim, status backend.CallbackStatus, _ string) {
+					assert.Equal(t, backend.CallbackStatusFailed, status)
+					visible, exists := store.Get(testActorLeaseUUID)
+					assert.True(t, exists)
+					assert.Equal(t, ids, visible.ContainerIDs, "callback cannot precede exact source ID publication")
+					assert.Equal(t, services, visible.ServiceContainers, "service log lookup must use the verified recreated cohort")
+					assert.Equal(t, runtime.CallbackURL(), visible.CallbackURL)
+					assert.Equal(t, runtime.LifecycleCallbackURL(), visible.LifecycleCallbackURL)
+					callback <- claim.LifecycleCallbackURL()
+				},
+			})
+			ack := make(chan error, 1)
+			require.True(t, routeReplace(actor, tt.op, target, ack))
+			require.NoError(t, <-ack)
+			select {
+			case callbackURL := <-callback:
+				assert.Equal(t, claim.LifecycleCallbackURL(), callbackURL,
+					"completion belongs to the accepted maintenance request")
+			case <-time.After(time.Second):
+				t.Fatal("maintenance failure callback was not sent")
+			}
+			committed, exists := store.Get(testActorLeaseUUID)
+			require.True(t, exists)
+			assert.Equal(t, backend.ProvisionStatusReady, committed.Status)
+			assert.Equal(t, runtime.CallbackURL(), committed.CallbackURL)
+			assert.Equal(t, runtime.LifecycleCallbackURL(), committed.LifecycleCallbackURL)
+			assert.Equal(t, ids, committed.ContainerIDs)
+			assert.Equal(t, services, committed.ServiceContainers)
+			assert.Equal(t, source.Version, committed.ActiveReleaseVersion)
+			assert.Equal(t, source.Items, committed.Items)
+			assert.Equal(t, source.ResourceProfiles, committed.ResourceProfiles)
+		})
+	}
+}
+
+func TestMaintenanceRefusalCannotMintRestoredProjection(t *testing.T) {
+	claim := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentUpdate)
+	result := testMaintenanceFailure(t, claim, errors.New("refused"), false, false, ReplaceFailureDetails{Reason: backend.ReasonUpdateFailed, CallbackErr: "update refused"})
+	require.False(t, result.Restored())
+	_, ready := result.failure.maintenanceRelease.SourceReady()
+	require.False(t, ready)
+	_, err := NewMaintenanceReplaceFailure(errors.New("failed"), ReplaceFailureDetails{}, shared.MaintenanceReleaseFailure{})
+	require.Error(t, err)
+}
+
 // TestRestoreRequestedMsg_FiresEventAndSpawnsWorker pins the restore
-// plumbing (ENG-325 Task 7a): a RestoreRequestedMsg rides the existing
+// plumbing (ENG-325 Task 7a): a restoreRequestedMsg rides the existing
 // replace machinery from the Provisioning state. The new restore lease
 // was reserved at Status=Provisioning (it was never running), so:
 //
@@ -1170,44 +1711,56 @@ func TestUpdateFromFailed_Succeeds(t *testing.T)  { runReplaceFromFailedSucceeds
 //     evRestartRequested fires from Ready/Failed).
 //   - The entry action (onEnterRestarting, reused) writes Status=Restarting
 //     and applies the CallbackURL before the ack (handler-publish contract).
-//   - replaceWasActive ends up false (prior Status was Provisioning, not
-//     Ready), so onEnterReadyFromReplaceCompleted Inc's activeProvisions —
-//     a restore brings a lease from absent to active.
+//   - A restore brings a lease from absent to active when its exact source
+//     projection reaches Ready.
 //
 // On a successful ReplaceResult the SM reaches Ready via evReplaceCompleted
 // and the gauge increments exactly once.
 func TestRestoreRequestedMsg_FiresEventAndSpawnsWorker(t *testing.T) {
+	leaseUUID := testActorLeaseUUID
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID:   "lease-1",
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID:   leaseUUID,
 		Tenant:      "tenant-a",
 		Status:      backend.ProvisionStatusProvisioning,
 		CallbackURL: "old-cb",
 	})
 
 	metrics := &countingMetrics{}
+	var operationCallbacks atomic.Int64
+	var lifecycleCallbacks atomic.Int64
+	workerRelease := make(chan struct{})
+	operation, restoreSuccess := testRestoreSuccess(t, leaseUUID, ReplaceSuccessProjection{ContainerIDs: []string{"c1"}})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	actor := newTestActor(t, "lease-1", testActorOpts{
+	actor := newTestActor(t, leaseUUID, testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
 		Metrics:        metrics,
+		RestoreWorkFn: func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome {
+			<-workerRelease
+			return replaceWorkTerminal{result: restoreSuccess}
+		},
+		SendOperationCallbackFn: func(_ string, callbackURL string, _ backend.CallbackStatus, _ string) {
+			assert.Equal(t, operation.CallbackURL(), callbackURL)
+			operationCallbacks.Add(1)
+		},
+		SendLifecycleFailureFn: func(shared.RuntimeGenerationProof, string) {
+			lifecycleCallbacks.Add(1)
+		},
 	})
 	require.Equal(t, backend.ProvisionStatusProvisioning, actor.State(),
 		"test precondition: SM must start in Provisioning (restore reserves the new lease there)")
 
 	// Block the worker so we can observe Restarting + CallbackURL before it
 	// flips the lease to Ready.
-	workerRelease := make(chan struct{})
 	ack := make(chan error, 1)
-	require.True(t, actor.TryEnqueue(RestoreRequestedMsg{
-		Cancel:      func() {},
-		CallbackURL: "new-cb",
-		Work: func() ReplaceResult {
-			<-workerRelease
-			return ReplaceResult{Success: ReplaceSuccessResult{ContainerIDs: []string{"c1"}}}
-		},
-		Ack: ack,
+	require.True(t, actor.tryEnqueue(restoreRequestedMsg{
+		Ctx:                  context.Background(),
+		CallbackURL:          operation.CallbackURL(),
+		LifecycleCallbackURL: operation.LifecycleCallbackURL(),
+		Ack:                  ack,
+		Operation:            operation,
 	}))
 
 	select {
@@ -1217,30 +1770,26 @@ func TestRestoreRequestedMsg_FiresEventAndSpawnsWorker(t *testing.T) {
 		t.Fatal("no ack received from handleRestoreRequested")
 	}
 
-	prov, ok := store.Get("lease-1")
+	prov, ok := store.Get(leaseUUID)
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusRestarting, prov.Status,
 		"actor must write Status=Restarting BEFORE acking (handler-publish contract)")
-	assert.Equal(t, "new-cb", prov.CallbackURL,
+	assert.Equal(t, operation.CallbackURL(), prov.CallbackURL,
 		"actor must apply the message CallbackURL before acking")
-	assert.False(t, actor.replaceWasActive,
-		"replaceWasActive must be false for a Provisioning→Restarting restore (lease was absent, not active)")
 
-	// Release the worker → evReplaceCompleted → Ready, gauge Inc once.
+	// Release the worker → evReplaceCompleted → Ready.
 	close(workerRelease)
 	require.Eventually(t, func() bool {
 		return actor.State() == backend.ProvisionStatusReady
 	}, 2*time.Second, 10*time.Millisecond,
 		"SM must reach Ready via replaceCompleted after the restore worker succeeds")
 
-	final, ok := store.Get("lease-1")
+	final, ok := store.Get(leaseUUID)
 	require.True(t, ok)
 	assert.Equal(t, []string{"c1"}, final.ContainerIDs,
 		"ContainerIDs must reflect the restore worker's success result")
-	assert.Equal(t, int64(1), metrics.activeProvisionsInc.Load(),
-		"a restore that brings a lease from absent to active must Inc activeProvisions exactly once")
-	assert.Equal(t, int64(0), metrics.activeProvisionsDec.Load(),
-		"a successful restore must not Dec activeProvisions")
+	require.Eventually(t, func() bool { return operationCallbacks.Load() == 1 }, time.Second, 5*time.Millisecond)
+	assert.Zero(t, lifecycleCallbacks.Load(), "restore completion must use the exact operation outbox")
 }
 
 // TestRestoreRequested_RejectedFromBadState mirrors the restart
@@ -1249,28 +1798,33 @@ func TestRestoreRequestedMsg_FiresEventAndSpawnsWorker(t *testing.T) {
 // rejected via classifyReplaceReject (ErrInvalidState → 409) and spawn
 // no worker. (Restore is only permitted from Provisioning.)
 func TestRestoreRequested_RejectedFromBadState(t *testing.T) {
+	const leaseUUID = "11111111-1111-4111-8111-111111111111"
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady})
+	store.put(leaseUUID, &ProvisionState{LeaseUUID: leaseUUID, Status: backend.ProvisionStatusReady})
 
 	// No-spawn: drive the handlers synchronously. The default DoDeprovisionFn
 	// is a no-op that leaves the provision in place, so the SM stays in
 	// Deprovisioning with terminated=false (the partial-deprovision actor).
-	actor := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+	var workerCount atomic.Int64
+	actor := newTestActorNoSpawn(t, leaseUUID, testActorOpts{
+		ProvisionStore: store,
+		RestoreWorkFn: func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome {
+			workerCount.Add(1)
+			return nil
+		},
+	})
 
 	require.NoError(t, actor.handleDeprovision(context.Background()))
 	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.State(),
 		"test precondition: SM must be Deprovisioning")
 
-	var workerCount atomic.Int64
-	ack := make(chan error, 1)
-	actor.handleRestoreRequested(RestoreRequestedMsg{
-		Cancel: func() {},
-		Work:   func() ReplaceResult { workerCount.Add(1); return ReplaceResult{} },
-		Ack:    ack,
-	})
+	operation := newTestOperationFixture(t, leaseUUID, shared.OperationIntentRestore).claim
+	command, reply, err := NewRestoreCommand(context.Background(), operation)
+	require.NoError(t, err)
+	actor.handleRestoreRequested(command.envelope.message.(restoreRequestedMsg))
 
 	select {
-	case err := <-ack:
+	case err := <-reply.Result():
 		require.ErrorIs(t, err, backend.ErrInvalidState,
 			"restore against a deprovisioning lease must be rejected with ErrInvalidState (→409)")
 	default:
@@ -1285,27 +1839,29 @@ func TestRestoreRequested_RejectedFromBadState(t *testing.T) {
 // to a terminated actor (post-handleDeprovision, pre-registry-removal)
 // must reject with errActorTerminated and spawn no worker.
 func TestRestoreRequestedMsg_RejectsWhenTerminated(t *testing.T) {
+	const leaseUUID = "22222222-2222-4222-8222-222222222222"
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID: "lease-1",
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID: leaseUUID,
 		Status:    backend.ProvisionStatusDeprovisioning,
 	})
-	actor := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+	var workerSpawned atomic.Bool
+	actor := newTestActorNoSpawn(t, leaseUUID, testActorOpts{
+		ProvisionStore: store,
+		RestoreWorkFn: func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome {
+			workerSpawned.Store(true)
+			return nil
+		},
+	})
 	actor.terminated = true
 
-	var workerSpawned atomic.Bool
-	msg := RestoreRequestedMsg{
-		Cancel: func() {},
-		Work: func() ReplaceResult {
-			workerSpawned.Store(true)
-			return ReplaceResult{}
-		},
-		Ack: make(chan error, 1),
-	}
-	actor.handleRestoreRequested(msg)
+	operation := newTestOperationFixture(t, leaseUUID, shared.OperationIntentRestore).claim
+	command, reply, err := NewRestoreCommand(context.Background(), operation)
+	require.NoError(t, err)
+	actor.handleRestoreRequested(command.envelope.message.(restoreRequestedMsg))
 
 	select {
-	case err := <-msg.Ack:
+	case err := <-reply.Result():
 		assert.ErrorIs(t, err, errActorTerminated,
 			"terminated actor must reject Restore with errActorTerminated")
 	case <-time.After(time.Second):
@@ -1317,15 +1873,16 @@ func TestRestoreRequestedMsg_RejectsWhenTerminated(t *testing.T) {
 }
 
 // TestSpawnReplaceWorker_RestorePanicRecovery exercises a panic in the
-// restore Work closure end-to-end through handleRestoreRequested: the
-// replace worker's recover must drive the SM to Failed (via
-// evReplaceFailed) and ack the restore without crashing fred. The
+// construction-bound restore handler end-to-end through handleRestoreRequested:
+// the worker's recover must preserve the nonterminal state because a panic is
+// ambiguous physical evidence, and ack the restore without crashing fred. The
 // restore reuses spawnReplaceWorker, so this is the restore-shaped
 // mirror of TestSpawnReplaceWorker_PanicRecovery.
 func TestSpawnReplaceWorker_RestorePanicRecovery(t *testing.T) {
+	const leaseUUID = "44444444-4444-4444-8444-444444444444"
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID: "lease-1",
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID: leaseUUID,
 		Tenant:    "tenant-a",
 		Status:    backend.ProvisionStatusProvisioning,
 	})
@@ -1333,34 +1890,35 @@ func TestSpawnReplaceWorker_RestorePanicRecovery(t *testing.T) {
 	metrics := &countingMetrics{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	actor := newTestActor(t, "lease-1", testActorOpts{
+	actor := newTestActor(t, leaseUUID, testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
 		Metrics:        metrics,
+		RestoreWorkFn: func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome {
+			panic("synthetic restore panic")
+		},
 	})
 
 	panicsBefore := metrics.workerPanic.Load()
 
-	ack := make(chan error, 1)
-	require.True(t, actor.TryEnqueue(RestoreRequestedMsg{
-		Cancel: func() {},
-		Work: func() ReplaceResult {
-			panic("synthetic restore panic")
-		},
-		Ack: ack,
-	}))
+	operation := newTestOperationFixture(t, leaseUUID, shared.OperationIntentRestore).claim
+	command, reply, err := NewRestoreCommand(context.Background(), operation)
+	require.NoError(t, err)
+	require.True(t, actor.TryEnqueueCommand(command))
 
 	select {
-	case err := <-ack:
+	case err := <-reply.Result():
 		require.NoError(t, err, "restore from Provisioning must be accepted before the worker runs")
 	case <-time.After(2 * time.Second):
 		t.Fatal("no ack received from handleRestoreRequested")
 	}
 
 	require.Eventually(t, func() bool {
-		return actor.State() == backend.ProvisionStatusFailed
+		return metrics.workerPanic.Load() == panicsBefore+1
 	}, 2*time.Second, 10*time.Millisecond,
-		"SM must transition to Failed after restore worker panic recovery")
+		"restore worker panic must be observed")
+	assert.Equal(t, backend.ProvisionStatusRestarting, actor.State(),
+		"ambiguous worker failure must not manufacture definitive failure evidence")
 
 	assert.Equal(t, panicsBefore+1, metrics.workerPanic.Load(),
 		"WorkerPanic metric must increment by 1 after restore worker panic")
@@ -1378,8 +1936,6 @@ type countingMetrics struct {
 	workerPanic          atomic.Int64
 	actorPanic           atomic.Int64
 	terminalEventDropped atomic.Int64
-	activeProvisionsInc  atomic.Int64
-	activeProvisionsDec  atomic.Int64
 }
 
 func (m *countingMetrics) SMTransition(_, _, _ string)   { m.smTransition.Add(1) }
@@ -1387,8 +1943,6 @@ func (m *countingMetrics) ActorCreated()                 { m.actorCreated.Add(1)
 func (m *countingMetrics) WorkerPanic(_ string)          { m.workerPanic.Add(1) }
 func (m *countingMetrics) ActorPanic()                   { m.actorPanic.Add(1) }
 func (m *countingMetrics) TerminalEventDropped(_ string) { m.terminalEventDropped.Add(1) }
-func (m *countingMetrics) ActiveProvisionsInc()          { m.activeProvisionsInc.Add(1) }
-func (m *countingMetrics) ActiveProvisionsDec()          { m.activeProvisionsDec.Add(1) }
 
 var _ SMMetrics = (*countingMetrics)(nil)
 
@@ -1412,15 +1966,20 @@ var _ = sync.Mutex{}
 // supplied; Message is the on-chain-safe CallbackErr; LastError is the
 // operator-only verbose diagnostic — the three must be independent.
 func TestProvisionErrored_AuthorsReasonMessage(t *testing.T) {
-	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{})
-	require.NoError(t, a.sm.Fire(context.Background(), evProvisionRequested))
-	require.NoError(t, a.sm.Fire(context.Background(), evProvisionErrored, provisionErrorInfo{
-		callbackErr: "image pull failed",
-		reason:      backend.ReasonImagePullFailed,
-		lastError:   "pull /data/fred/... exit 1",
+	leaseUUID := testActorLeaseUUID
+	store := newMockProvisionStore()
+	store.put(leaseUUID, &ProvisionState{LeaseUUID: leaseUUID, Status: backend.ProvisionStatusProvisioning})
+	a := newTestActorNoSpawn(t, leaseUUID, testActorOpts{ProvisionStore: store})
+	require.NoError(t, a.sm.requestProvision(context.Background()))
+	_, failure := newTestProvisionFailure(t, leaseUUID)
+	require.NoError(t, a.sm.provisionErrored(context.Background(), provisionErrorInfo{
+		callbackErr:      "image pull failed",
+		reason:           backend.ReasonImagePullFailed,
+		lastError:        "pull /data/fred/... exit 1",
+		operationFailure: failure,
 	}))
 
-	got, ok := a.cfg.ProvisionStore.Get("lease-1")
+	got, ok := store.Get(leaseUUID)
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusFailed, got.Status)
 	assert.Equal(t, backend.ReasonImagePullFailed, got.Reason,
@@ -1446,10 +2005,10 @@ func TestReplaceFailed_AuthorsReasonMessage(t *testing.T) {
 	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
 
 	a.handleReplaceFailed(ReplaceFailureInfo{
-		Operation:   "restart",
-		Reason:      backend.ReasonRestartFailed,
-		CallbackErr: "restart failed; rolled back to previous version",
-		LastError:   "compose up exit 1: /data/fred/... permission denied",
+		operation:   "restart",
+		reason:      backend.ReasonRestartFailed,
+		callbackErr: "restart failed; rolled back to previous version",
+		lastError:   "compose up exit 1: /data/fred/... permission denied",
 	})
 
 	got, ok := store.Get("lease-1")
@@ -1476,19 +2035,21 @@ func TestReplaceFailed_AuthorsReasonMessage(t *testing.T) {
 // there) carrying the stale Reason/Message, then handleReplaceCompleted
 // fires evReplaceCompleted → Ready.
 func TestReplaceCompleted_ClearsStaleReasonMessage(t *testing.T) {
+	leaseUUID := testActorLeaseUUID
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID: "lease-1",
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID: leaseUUID,
 		Status:    backend.ProvisionStatusRestarting,
 		Reason:    backend.ReasonContainerExited,
 		Message:   "container exited unexpectedly",
 		LastError: "compose ps: container 'app' exited with code 137",
 	})
-	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+	a := newTestActorNoSpawn(t, leaseUUID, testActorOpts{ProvisionStore: store})
+	_, success := testRestoreSuccess(t, leaseUUID, ReplaceSuccessProjection{ContainerIDs: []string{"c1"}})
 
-	a.handleReplaceCompleted(ReplaceSuccessResult{ContainerIDs: []string{"c1"}})
+	a.handleReplaceCompleted(success.success)
 
-	got, ok := store.Get("lease-1")
+	got, ok := store.Get(leaseUUID)
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusReady, got.Status,
 		"a successful replace must land the lease in Ready")
@@ -1504,21 +2065,22 @@ func TestReplaceCompleted_ClearsStaleReasonMessage(t *testing.T) {
 // must not carry its prior failure Reason/Message into the healthy Ready
 // record (ENG-508). Drives Provisioning→Ready by firing the SM directly (in-package).
 func TestProvisionCompleted_ClearsStaleReasonMessage(t *testing.T) {
+	leaseUUID := testActorLeaseUUID
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID: "lease-1",
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID: leaseUUID,
 		Status:    backend.ProvisionStatusFailed,
 		Reason:    backend.ReasonImagePullFailed,
 		Message:   "image pull failed",
 		LastError: "pull /data/fred/... exit 1",
 	})
-	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+	a := newTestActorNoSpawn(t, leaseUUID, testActorOpts{ProvisionStore: store})
 
-	require.NoError(t, a.sm.Fire(context.Background(), evProvisionRequested))
-	require.NoError(t, a.sm.Fire(context.Background(), evProvisionCompleted,
-		ProvisionSuccessResult{ContainerIDs: []string{"c1"}}))
+	require.NoError(t, a.sm.requestProvision(context.Background()))
+	_, success := testProvisionSuccess(t, leaseUUID, ProvisionSuccessProjection{ContainerIDs: []string{"c1"}})
+	require.NoError(t, a.sm.provisionCompleted(context.Background(), success))
 
-	got, ok := store.Get("lease-1")
+	got, ok := store.Get(leaseUUID)
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusReady, got.Status,
 		"a successful provision must land the lease in Ready")

@@ -156,7 +156,7 @@ func BenchmarkHTTPClient_Provision(b *testing.B) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test",
 		BaseURL: server.URL,
 		Timeout: 10 * time.Second,
@@ -195,7 +195,7 @@ func BenchmarkHTTPClient_Provision_Parallel(b *testing.B) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test",
 		BaseURL: server.URL,
 		Timeout: 10 * time.Second,
@@ -230,7 +230,7 @@ func BenchmarkHTTPClient_GetInfo(b *testing.B) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test",
 		BaseURL: server.URL,
 		Timeout: 10 * time.Second,
@@ -257,7 +257,7 @@ func BenchmarkHTTPClient_GetInfo_Parallel(b *testing.B) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test",
 		BaseURL: server.URL,
 		Timeout: 10 * time.Second,
@@ -292,7 +292,7 @@ func TestHTTPClient_HighThroughput(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:                "test",
 		BaseURL:             server.URL,
 		Timeout:             10 * time.Second,

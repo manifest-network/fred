@@ -5,7 +5,6 @@ import (
 	"cmp"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -19,8 +18,11 @@ import (
 	"github.com/rs/cors"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/callbackwire"
 )
 
 const (
@@ -31,15 +33,33 @@ const (
 	// This is separate from HTTP server timeouts and applies to handler logic.
 	defaultRequestTimeout = 30 * time.Second
 
+	// callbackWriteDeadlineGrace leaves enough time for http.TimeoutHandler to
+	// serialize its retryable 503 after canceling callback application. The
+	// bundled backend's fresh first attempt normally has a larger delivery
+	// window. A retry may have less of its shared delivery budget remaining and
+	// cancel the request first.
+	callbackWriteDeadlineGrace = 5 * time.Second
+
 	// readHeaderTimeout caps how long the server waits for request headers.
 	// Set independently of ReadTimeout to prevent Slowloris attacks even if
 	// ReadTimeout is tuned to 0 for streaming endpoints.
 	readHeaderTimeout = 5 * time.Second
 )
 
-// CallbackPublisher publishes backend callbacks to the provisioner.
+// CallbackPublisher applies authenticated backend callbacks through the
+// provisioner. Implementations return only after the callback has reached a
+// terminal application result, so a backend can preserve per-lease ordering by
+// waiting for the HTTP response before sending the next durable delivery.
 type CallbackPublisher interface {
-	PublishCallback(callback backend.CallbackPayload) error
+	PublishCallback(ctx context.Context, request hmacauth.VerifiedRequest) error
+}
+
+// callbackRequestAuthenticator returns opaque evidence for the exact request
+// envelope it authenticated. The per-storage-lineage implementation may decode
+// the bounded body only to select a key; callback semantics are derived again
+// from the proof's immutable bytes inside the application authority.
+type callbackRequestAuthenticator interface {
+	VerifyCallbackEvidence(*http.Request) (hmacauth.VerifiedRequest, error)
 }
 
 // StatusChecker provides status information about provisioning.
@@ -65,7 +85,7 @@ type Server struct {
 	rateLimiter           *RateLimiter
 	tenantRateLimiter     *TenantRateLimiter
 	callbackPublisher     CallbackPublisher
-	callbackAuthenticator *CallbackAuthenticator
+	callbackAuthenticator callbackRequestAuthenticator
 	statusChecker         StatusChecker
 }
 
@@ -86,33 +106,40 @@ type ServerConfig struct {
 	WriteTimeout                time.Duration
 	IdleTimeout                 time.Duration
 	RequestTimeout              time.Duration // Timeout for individual request processing (default: 30s)
+	CallbackApplicationTimeout  time.Duration // Timeout for terminal callback application (default: backend.DefaultCallbackApplicationTimeout)
 	ShutdownTimeout             time.Duration // Timeout for graceful shutdown (default: 30s)
 	MaxRequestBodySize          int64
-	CallbackSecret              string // HMAC secret for callback authentication
-	CallbackCanonicalPathPrefix string // Path prefix prepended to inbound URIs before HMAC verification (proxy stripPrefix compensation)
-	TokenTrackerDBPath          string // Path to token tracker database (enables replay protection)
-	CallbackBaseURL             string // Base URL for backend callbacks (used by restart/update)
+	CallbackSecret              string                        // Non-production legacy single HMAC secret for isolated embeddings.
+	CallbackHMACSecrets         map[backendidentity.ID]string // Production callback keys indexed by immutable backend storage identity.
+	CallbackCanonicalPathPrefix string                        // Path prefix prepended to inbound URIs before HMAC verification (proxy stripPrefix compensation)
+	TokenTrackerDBPath          string                        // Path to token tracker database (enables replay protection)
+	CallbackBaseURL             string                        // Base URL for backend callbacks (used by restart/update)
 }
 
 // ServerDeps holds the runtime dependencies for the API server.
 // These are the collaborators injected into the server at startup.
 type ServerDeps struct {
-	ChainClient        ChainClient
-	BackendRouter      *backend.Router
-	CallbackPublisher  CallbackPublisher
-	PayloadPublisher   PayloadPublisher
-	PayloadPersister   PayloadPersister   // Required — /update returns 500 without it (ENG-619).
-	PayloadStoreHealth PayloadStoreHealth // Optional — health probe for the payload store's bbolt DB.
-	StatusChecker      StatusChecker
-	PlacementLookup    PlacementLookup          // Optional — if nil, placement routing is disabled.
-	RestoreRecorder    RestorePlacementRecorder // Optional — restore placement bookkeeping (ENG-333).
-	RestoreTracker     RestoreInFlightTracker   // Optional — inline-ack restore in-flight tracking (ENG-358).
-	EventBroker        *EventBroker             // Optional — if nil, the events endpoint returns 501.
+	ChainClient           ChainClient
+	BackendRouter         *backend.Router
+	CallbackPublisher     CallbackPublisher
+	PayloadPublisher      PayloadPublisher
+	PayloadStoreHealth    PayloadStoreHealth // Optional — health probe for the payload store's bbolt DB.
+	StatusChecker         StatusChecker
+	PlacementLookup       PlacementLookup                // Required by providerd; nil is supported only by isolated/test API embeddings.
+	MaintenanceService    MaintenanceService             // Required by providerd for durable restart/update execution.
+	RestoreService        RestoreService                 // Required by /restore; missing service returns 503.
+	EventBroker           *EventBroker                   // Optional — if nil, the events endpoint returns 501.
+	CallbackProofVerifier hmacauth.CallbackProofVerifier // Required whenever callback authentication is configured.
 }
 
 // NewServer creates a new API server.
 // Returns an error if token tracker initialization fails.
 func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
+	callbackApplicationTimeout, err := resolveCallbackApplicationTimeout(cfg.CallbackApplicationTimeout)
+	if err != nil {
+		return nil, err
+	}
+
 	client := deps.ChainClient
 	backendRouter := deps.BackendRouter
 	callbackPublisher := deps.CallbackPublisher
@@ -148,14 +175,12 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		TokenTracker:       tracker,
 		StatusChecker:      statusChecker,
 		PlacementLookup:    placementLookup,
-		RestoreRecorder:    deps.RestoreRecorder,
-		RestoreTracker:     deps.RestoreTracker,
-		PayloadPersister:   deps.PayloadPersister,
+		MaintenanceService: deps.MaintenanceService,
+		RestoreService:     deps.RestoreService,
 		PayloadStoreHealth: deps.PayloadStoreHealth,
 		EventBroker:        eventBroker,
 		ProviderUUID:       cfg.ProviderUUID,
 		Bech32Prefix:       cfg.Bech32Prefix,
-		CallbackBaseURL:    cfg.CallbackBaseURL,
 	})
 
 	// Parse trusted proxies for secure X-Forwarded-For handling
@@ -181,15 +206,30 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	requestTimeout := cmp.Or(max(cfg.RequestTimeout, 0), defaultRequestTimeout)
 	shutdownTimeout := cmp.Or(max(cfg.ShutdownTimeout, 0), defaultShutdownTimeout)
 
-	// Create callback authenticator if secret is provided
-	var callbackAuth *CallbackAuthenticator
-	if cfg.CallbackSecret != "" {
+	// Production uses a storage-lineage keyring. The single-key constructor stays
+	// available for isolated non-production embeddings, but accepting both would
+	// create an ambiguous authentication policy.
+	var callbackAuth callbackRequestAuthenticator
+	if cfg.CallbackSecret != "" && len(cfg.CallbackHMACSecrets) != 0 {
+		return nil, fmt.Errorf("callback HMAC keyring cannot be combined with legacy callback secret")
+	}
+	if len(cfg.CallbackHMACSecrets) != 0 {
+		keyring, err := NewCallbackKeyringAuthenticator(
+			cfg.CallbackHMACSecrets, deps.CallbackProofVerifier,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create callback HMAC keyring: %w", err)
+		}
+		callbackAuth = keyring.WithCanonicalPathPrefix(cfg.CallbackCanonicalPathPrefix)
+	} else if cfg.CallbackSecret != "" {
 		var err error
-		callbackAuth, err = NewCallbackAuthenticator(cfg.CallbackSecret)
+		legacyAuth, err := NewCallbackAuthenticator(
+			cfg.CallbackSecret, deps.CallbackProofVerifier,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("create callback authenticator: %w", err)
 		}
-		callbackAuth = callbackAuth.WithCanonicalPathPrefix(cfg.CallbackCanonicalPathPrefix)
+		callbackAuth = legacyAuth.WithCanonicalPathPrefix(cfg.CallbackCanonicalPathPrefix)
 	}
 
 	// Create payload handler if publisher is provided
@@ -221,6 +261,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	// streaming endpoints (WebSocket) can opt out. Routes without withTimeout
 	// still have connection-level safety via http.Server.ReadTimeout/WriteTimeout.
 	withTimeout := requestTimeoutMiddleware(requestTimeout)
+	withCallbackTimeout := callbackTimeoutMiddleware(callbackApplicationTimeout)
 
 	// Unauthenticated routes
 	mux.Handle("GET /health", withTimeout(http.HandlerFunc(handlers.HealthCheck)))
@@ -229,7 +270,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	mux.Handle("GET /readyz", withTimeout(http.HandlerFunc(handlers.Readyz)))
 	mux.Handle("GET /metrics", withTimeout(promhttp.Handler()))
 	mux.Handle("GET /workloads", withTimeout(http.HandlerFunc(handlers.GetWorkloads)))
-	mux.Handle("POST /callbacks/provision", withTimeout(http.HandlerFunc(s.handleProvisionCallback)))
+	mux.Handle("POST /callbacks/provision", withCallbackTimeout(http.HandlerFunc(s.handleProvisionCallback)))
 
 	// Authenticated routes with optional tenant rate limiting.
 	// AuthMiddleware validates AuthTokens; PayloadAuthMiddleware validates PayloadAuthTokens.
@@ -283,9 +324,10 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 			// Authorization is required for the /v1/leases/* routes (Bearer tokens
 			// extracted by handlers.go:extractBearerToken). Content-Type is required
 			// for any POST with a JSON body (application/json is not a CORS-simple
-			// type). /workloads itself is unauthenticated, but the CORS middleware
-			// applies globally so we list every header any route may need.
-			AllowedHeaders:   []string{"Authorization", "Content-Type"},
+			// type), and restart/update require Idempotency-Key. /workloads itself is
+			// unauthenticated, but the CORS middleware applies globally so we list
+			// every header any route may need.
+			AllowedHeaders:   []string{"Authorization", "Content-Type", idempotencyKeyHeader},
 			AllowCredentials: false,
 		}).Handler(handler)
 	} else {
@@ -304,6 +346,22 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	return s, nil
 }
 
+func resolveCallbackApplicationTimeout(configured time.Duration) (time.Duration, error) {
+	timeout := cmp.Or(max(configured, 0), backend.DefaultCallbackApplicationTimeout)
+	// The bundled sender's delivery deadline is a protocol constant, not a
+	// paired runtime setting. Permit shorter application budgets for tests and
+	// constrained deployments, but never let an embedding consume the fixed
+	// response grace by stretching Fred's side past the protocol default.
+	if timeout > backend.DefaultCallbackApplicationTimeout {
+		return 0, fmt.Errorf(
+			"callback application timeout %s must not exceed protocol default %s",
+			timeout,
+			backend.DefaultCallbackApplicationTimeout,
+		)
+	}
+	return timeout, nil
+}
+
 // handleProvisionCallback handles POST /callbacks/provision from backends.
 func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request) {
 	if s.callbackPublisher == nil {
@@ -319,8 +377,16 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	body, err := s.callbackAuthenticator.VerifyRequest(r)
+	request, err := s.callbackAuthenticator.VerifyCallbackEvidence(r)
 	if err != nil {
+		if errors.Is(err, errInvalidCallbackPayload) {
+			slog.Warn("invalid callback payload",
+				"error", err,
+				"remote_addr", r.RemoteAddr,
+			)
+			writeError(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
 		slog.Warn("callback authentication failed",
 			"error", err,
 			"remote_addr", r.RemoteAddr,
@@ -328,47 +394,33 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
-
-	var callback backend.CallbackPayload
-	if err := json.Unmarshal(body, &callback); err != nil {
-		slog.Warn("invalid callback payload", "error", err)
+	callback, err := callbackwire.DecodeVerified(request)
+	if err != nil {
+		slog.Warn("invalid callback payload or route",
+			"error", err,
+			"remote_addr", r.RemoteAddr,
+		)
 		writeError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	if callback.LeaseUUID == "" {
-		writeError(w, "lease_uuid is required", http.StatusBadRequest)
-		return
-	}
-
-	if !config.IsValidUUID(callback.LeaseUUID) {
-		writeError(w, "lease_uuid must be a valid UUID", http.StatusBadRequest)
-		return
-	}
-
-	switch callback.Status {
-	case backend.CallbackStatusSuccess, backend.CallbackStatusFailed, backend.CallbackStatusDeprovisioned:
-		// ok
-	default:
-		writeError(w, "status must be 'success', 'failed', or 'deprovisioned'", http.StatusBadRequest)
-		return
-	}
-
-	// Note: we intentionally do NOT short-circuit non-in-flight callbacks here.
-	// Restart/update operations don't register in the in-flight tracker (the lease
-	// is already ACTIVE), so their completion callbacks arrive with IsInFlight==false.
-	// The Watermill handler (HandleBackendCallback) handles both cases correctly:
-	// in-flight callbacks trigger chain acknowledgement, while non-in-flight callbacks
-	// publish the status event for WebSocket clients.
+	// Do not short-circuit callbacks that have no active operation-registry entry.
+	// Restart and update use lifecycle authority for an already-active lease, so
+	// their completion callbacks legitimately have no provision/restore operation.
+	// The synchronous callback application selects settlement from the typed
+	// callback authority instead of treating registry membership as authority.
 
 	slog.Info("received provision callback",
-		"lease_uuid", callback.LeaseUUID,
-		"status", callback.Status,
+		"lease_uuid", callback.LeaseUUID(),
+		"status", callback.Status(),
 	)
 
-	if err := s.callbackPublisher.PublishCallback(callback); err != nil {
-		slog.Error("failed to publish callback", "error", err)
-		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+	if err := s.callbackPublisher.PublishCallback(r.Context(), request); err != nil {
+		// Callback delivery is owned by the backend's durable outbox. Any
+		// application failure is retryable, including the brief startup and
+		// shutdown windows where the provisioner is not accepting work.
+		slog.Error("failed to apply callback", "error", err)
+		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 
@@ -550,6 +602,13 @@ type responseWriter struct {
 	statusCode int
 }
 
+// Unwrap lets http.ResponseController reach the underlying net/http writer.
+// The callback route uses it to extend the connection write deadline beyond
+// the generic server default while a chain settlement is in progress.
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
@@ -577,6 +636,33 @@ func requestTimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Han
 	return func(next http.Handler) http.Handler {
 		th := http.TimeoutHandler(next, timeout, `{"error":"request timeout","code":503}`)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			th.ServeHTTP(w, r)
+		})
+	}
+}
+
+// callbackTimeoutMiddleware gives callback settlement its protocol-level
+// budget rather than the generic request budget. Callback application may
+// wait for a chain transaction, while the backend retains the durable outbox
+// head until this handler returns 2xx. The connection write deadline must
+// therefore outlive application cancellation long enough to return a 503;
+// otherwise http.Server.WriteTimeout can silently win first and obscure the
+// retry verdict from the backend.
+func callbackTimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		th := http.TimeoutHandler(next, timeout, `{"error":"callback application timeout","code":503}`)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			controller := http.NewResponseController(w)
+			if err := controller.SetWriteDeadline(time.Now().Add(timeout + callbackWriteDeadlineGrace)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+				slog.Warn("failed to extend callback response write deadline", "error", err)
+			}
+			defer func() {
+				if err := controller.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+					slog.Warn("failed to clear callback response write deadline", "error", err)
+				}
+			}()
+
 			w.Header().Set("Content-Type", "application/json")
 			th.ServeHTTP(w, r)
 		})

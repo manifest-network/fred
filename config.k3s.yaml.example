@@ -12,6 +12,10 @@
 #      that has no mapping entry as "unreachable from on-chain SKUs",
 #      so partial customization will fail at startup. See the YAML-merge
 #      caveat below the sku_profiles block before editing.
+#   5. Before the first normal start, seal the empty cluster/storage lineage once:
+#        k3s-backend -config config.k3s.yaml -initialize-storage-identity new
+#      Normal startup is verification-only and will not create or repair the
+#      marker pair or authoritative callback/release journals.
 
 # Log verbosity. Valid values: debug, info, warn, error. Default: info.
 # log_level: "info"
@@ -168,7 +172,7 @@ allowed_registries:
 # HMAC secret for signing callbacks to Fred (minimum 32 characters).
 # REQUIRED — k3s-backend refuses to start with an empty value.
 # Generate with: openssl rand -hex 32
-# Must match callback_secret configured on the Fred side.
+# Must match this backend's own providerd backends[].hmac_secret.
 callback_secret: ""
 
 # Production mode: tighten startup checks. When true, the backend refuses to
@@ -182,16 +186,23 @@ callback_secret: ""
 # Rejected at startup when production_mode is true.
 # callback_insecure_skip_verify: false
 
-# Path to bbolt database for persisting pending callbacks.
+# Every bbolt path below is opened without following the final path component
+# and must name a regular file with exactly one hard link and mode 0600. Fresh
+# files are created with 0600. The callback and release stores are identity-bound
+# authority and are re-attested while running; diagnostics is recreatable and
+# has only the open-time filesystem checks.
+
+# Path to bbolt database for persisting accepted operation intents and pending
+# callbacks. Preserve it with the matching cluster/storage lineage.
 # Callbacks are stored before delivery to survive restarts.
 # Default: k3s-callbacks.db (prefixed so the file doesn't collide with
 # docker-backend's "callbacks.db" when both run from the same directory).
 callback_db_path: "k3s-callbacks.db"
 
-# Maximum age of persisted callback entries. Entries older than this are
-# removed when the callback store opens (one synchronous sweep inside
-# shared.NewCallbackStore at backend startup) AND by a periodic background
-# loop while the backend runs. Default: 24h.
+# Maximum age of legacy callbacks and typed lifecycle observations. Exact
+# operation completions never expire because they may be the only evidence
+# that settles Fred's durable placement attempt. Cleanup runs at startup and
+# periodically. Must be positive. Default: 24h.
 callback_max_age: 24h
 
 # =============================================================================
@@ -222,7 +233,8 @@ diagnostics_max_age: 168h
 # below are honored today; the operator-visible read endpoint is
 # scaffold-disabled.
 
-# Path to bbolt database for persisting release history.
+# Path to the identity-bound authoritative release database. Normal startup
+# requires the sealed file and never recreates a missing one.
 # Default: k3s-releases.db (k3s-prefixed to avoid collision with
 # docker-backend's releases.db).
 releases_db_path: "k3s-releases.db"

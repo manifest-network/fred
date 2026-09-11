@@ -2,14 +2,17 @@
 # dev-init.sh — Register provider & SKUs on-chain, generate dev config files.
 #
 # Adapted from manifest-deploy/roles/chain-bootstrap/tasks/main.yml.
-# Requires a running local chain and the manifestd binary.
+# Requires a running local chain plus manifestd, jq, curl, openssl, and findmnt.
 #
 # Usage:
 #   bash scripts/dev-init.sh
 #
-# All settings are configurable via environment variables (see defaults below).
+# Documented settings below may be overridden with environment variables.
 
 set -euo pipefail
+# Generated YAML contains callback HMAC authority and the TLS private key may be
+# created below. Make every new file private regardless of the caller's umask.
+umask 077
 
 # ---------------------------------------------------------------------------
 # Configuration (override via environment)
@@ -20,13 +23,29 @@ CHAIN_ID="${CHAIN_ID:-manifest-ledger-beta}"
 KEYRING_BACKEND="${KEYRING_BACKEND:-test}"
 KEY_NAME="${KEY_NAME:-acc0}"
 NODE="${NODE:-http://localhost:26657}"
+GRPC_ENDPOINT="${GRPC_ENDPOINT:-localhost:9090}"
+WEBSOCKET_URL="${WEBSOCKET_URL:-ws://localhost:26657/websocket}"
 GAS_PRICES="${GAS_PRICES:-0.025umfx}"
 PWR_DENOM="${PWR_DENOM:-factory/manifest1afk9zr2hn2jsac63h4hm60vl9z3e5u69gndzf7c99cqge3vzwjzsfmy9qj/upwr}"
 API_URL="${API_URL:-https://localhost:8080}"
+CALLBACK_BASE_URL="${CALLBACK_BASE_URL:-https://localhost:8080}"
+DOCKER_BACKEND_LISTEN_ADDR="${DOCKER_BACKEND_LISTEN_ADDR:-:9001}"
+DOCKER_BACKEND_URL="${DOCKER_BACKEND_URL:-http://localhost:9001}"
 CALLBACK_SECRET="${CALLBACK_SECRET:-}"  # random default resolved after helpers (needs openssl)
 
-# Repo root (script lives in scripts/)
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Physical repo root (script lives in scripts/). Fresh placement confirmation
+# canonicalizes the existing parent directory, so keep the printed path on the
+# same physical-path basis even when the checkout was reached through a symlink.
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+DOCKER_BACKEND_FILE="$REPO_ROOT/docker-backend.yaml"
+CONFIG_DOCKER_FILE="$REPO_ROOT/config.docker.yaml"
+PLACEMENT_DB_PATH="$REPO_ROOT/placements.db"
+TOKEN_DB_PATH="$REPO_ROOT/tokens.db"
+PAYLOAD_DB_PATH="$REPO_ROOT/payloads.db"
+CALLBACK_DB_PATH="$REPO_ROOT/callbacks.db"
+RELEASES_DB_PATH="$REPO_ROOT/releases.db"
+RETENTION_DB_PATH="$REPO_ROOT/retention.db"
+DIAGNOSTICS_DB_PATH="$REPO_ROOT/diagnostics.db"
 
 # Volume data path. Fred writes managed volume subdirs under this path.
 # Must be on a filesystem supported by fred's quota backends (btrfs, xfs
@@ -34,6 +53,10 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # setups don't need sudo; for production-shaped layouts override with
 # e.g. VOLUME_DATA_PATH=/var/lib/fred/volumes.
 VOLUME_DATA_PATH="${VOLUME_DATA_PATH:-$HOME/fred-volumes}"
+# Optional explicit active mount containing VOLUME_DATA_PATH. When omitted,
+# the script derives the mount boundary with findmnt after creating the data
+# directory. docker-backend verifies this mount remains present at runtime.
+VOLUME_MOUNT_PATH="${VOLUME_MOUNT_PATH:-}"
 
 # TLS cert/key paths used by providerd. The script generates a self-signed
 # cert only when neither exists (and errors if exactly one is present).
@@ -72,6 +95,73 @@ ok()    { printf '\033[1;32m OK\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33mWARN\033[0m %s\n' "$*"; }
 die()   { printf '\033[1;31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
 
+CERT_TMP=""
+KEY_TMP=""
+DOCKER_BACKEND_TMP=""
+CONFIG_DOCKER_TMP=""
+cleanup_dev_init_temps() {
+  for temporary_path in "$CERT_TMP" "$KEY_TMP" "$DOCKER_BACKEND_TMP" "$CONFIG_DOCKER_TMP"; do
+    if [[ -n "$temporary_path" ]]; then
+      rm -f -- "$temporary_path"
+    fi
+  done
+}
+trap cleanup_dev_init_temps EXIT
+
+private_temp_for() {
+  local target="$1"
+  local parent base
+  parent="$(dirname -- "$target")"
+  base="$(basename -- "$target")"
+  mktemp "$parent/.${base}.dev-init.XXXXXX"
+}
+
+# Publish by hard-linking a private same-directory temporary file. link(2)
+# atomically refuses every existing destination, including a dangling symlink;
+# unlike a checked-then-cat sequence, there is no overwrite race.
+publish_private_no_replace() {
+  local source="$1"
+  local target="$2"
+  chmod 600 -- "$source" || die "Failed to make generated file private: $source"
+  ln -- "$source" "$target" \
+    || die "Refusing to overwrite path created during initialization: $target"
+  rm -f -- "$source" || die "Failed to remove publication temporary file: $source"
+}
+
+json_quote() {
+  jq -cn --arg value "$1" '$value'
+}
+
+# Keep this byte-oriented to match hmacauth.MinSecretLength. Bash's ordinary
+# ${#value} is locale-sensitive and can count Unicode characters instead.
+validate_callback_secret() {
+  local byte_length
+  byte_length="$(printf '%s' "$CALLBACK_SECRET" | wc -c)"
+  if (( byte_length < 32 )); then
+    die "CALLBACK_SECRET must be at least 32 bytes (got $byte_length)"
+  fi
+}
+
+# This script creates a fresh local authority; it is deliberately not a
+# credential-rotation or recovery command. Refuse to overwrite prior generated
+# configuration or authoritative state, including remnants of a partial run.
+for existing_path in \
+  "$DOCKER_BACKEND_FILE" \
+  "$CONFIG_DOCKER_FILE" \
+  "$PLACEMENT_DB_PATH" \
+  "$TOKEN_DB_PATH" \
+  "$PAYLOAD_DB_PATH" \
+  "$CALLBACK_DB_PATH" \
+  "$RELEASES_DB_PATH" \
+  "$RETENTION_DB_PATH" \
+  "$DIAGNOSTICS_DB_PATH" \
+  "$CALLBACK_DB_PATH.storage-identity-anchor.json" \
+  "$VOLUME_DATA_PATH/.fred-backend-storage-identity.json"; do
+  if [[ -e "$existing_path" || -L "$existing_path" ]]; then
+    die "fresh dev initialization refused: $existing_path already exists. Use the existing environment's normal startup path; do not rotate or recreate its authority with dev-init.sh"
+  fi
+done
+
 # Default CALLBACK_SECRET to a random value. openssl is also required later to
 # generate the dev TLS cert; resolve it here (after die is defined) so a missing
 # openssl gives a clear message instead of an opaque set -e abort at the top.
@@ -79,6 +169,7 @@ if [[ -z "$CALLBACK_SECRET" ]]; then
   command -v openssl >/dev/null || die "openssl not found — install it, or set CALLBACK_SECRET (and pre-create CERT_FILE/KEY_FILE to skip cert generation)"
   CALLBACK_SECRET="$(openssl rand -hex 32)"
 fi
+validate_callback_secret
 
 # Run a manifestd tx command and validate the response code is 0.
 run_tx() {
@@ -255,40 +346,104 @@ fi
 [[ -w "$VOLUME_DATA_PATH" && -x "$VOLUME_DATA_PATH" ]] \
   || die "$VOLUME_DATA_PATH is not writable/searchable by $(id -un) — fix its permissions or set VOLUME_DATA_PATH= to a writable location"
 
+# Canonicalize the data root after it exists, then bind it to the active mount
+# that contains it. A plain parent directory is not sufficient evidence: the
+# backend refuses startup if the declared mount later disappears.
+VOLUME_DATA_PATH="$(cd "$VOLUME_DATA_PATH" && pwd -P)" \
+  || die "Failed to resolve the physical VOLUME_DATA_PATH"
+command -v findmnt >/dev/null \
+  || die "findmnt not found — install util-linux to prove the active mount containing VOLUME_DATA_PATH"
+DETECTED_VOLUME_MOUNT_PATH="$(findmnt -n -o TARGET -T "$VOLUME_DATA_PATH")" \
+  || die "Failed to determine the active mount containing $VOLUME_DATA_PATH"
+DETECTED_VOLUME_MOUNT_PATH="$(cd "$DETECTED_VOLUME_MOUNT_PATH" && pwd -P)" \
+  || die "Failed to resolve detected active mount '$DETECTED_VOLUME_MOUNT_PATH'"
+if [[ -n "$VOLUME_MOUNT_PATH" ]]; then
+  VOLUME_MOUNT_PATH="$(cd "$VOLUME_MOUNT_PATH" && pwd -P)" \
+    || die "VOLUME_MOUNT_PATH must name an existing active mount (got: '$VOLUME_MOUNT_PATH')"
+  if [[ "$VOLUME_MOUNT_PATH" != "$DETECTED_VOLUME_MOUNT_PATH" ]]; then
+    die "VOLUME_MOUNT_PATH must equal the active mount containing VOLUME_DATA_PATH (configured: '$VOLUME_MOUNT_PATH', detected: '$DETECTED_VOLUME_MOUNT_PATH')"
+  fi
+else
+  VOLUME_MOUNT_PATH="$DETECTED_VOLUME_MOUNT_PATH"
+fi
+if [[ "$VOLUME_MOUNT_PATH" == *[[:space:]]* ]]; then
+  die "VOLUME_MOUNT_PATH must not contain whitespace (got: '$VOLUME_MOUNT_PATH') — docker-backend rejects whitespace mount paths"
+fi
+ok "Volume mount path: $VOLUME_MOUNT_PATH"
+
 # ---------------------------------------------------------------------------
 # 9. Ensure TLS cert + key exist
 # ---------------------------------------------------------------------------
 info "Ensuring TLS cert exists: $CERT_FILE"
-if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+cert_present=false
+key_present=false
+[[ -e "$CERT_FILE" || -L "$CERT_FILE" ]] && cert_present=true
+[[ -e "$KEY_FILE" || -L "$KEY_FILE" ]] && key_present=true
+if [[ "$cert_present" == "true" && "$key_present" == "true" ]]; then
+  [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]] \
+    || die "CERT_FILE and KEY_FILE must resolve to regular files; dangling or non-file paths are refused"
   ok "Cert and key already present"
-elif [[ -f "$CERT_FILE" || -f "$KEY_FILE" ]]; then
+elif [[ "$cert_present" == "true" || "$key_present" == "true" ]]; then
   die "One of $CERT_FILE / $KEY_FILE exists but the other is missing — remove the stray file and re-run, or set CERT_FILE/KEY_FILE to a fresh pair"
 else
   command -v openssl >/dev/null || die "openssl not found; install it or pre-create $CERT_FILE and $KEY_FILE"
+  CERT_TMP="$(private_temp_for "$CERT_FILE")" \
+    || die "Failed to create a private certificate temporary beside $CERT_FILE"
+  KEY_TMP="$(private_temp_for "$KEY_FILE")" \
+    || die "Failed to create a private key temporary beside $KEY_FILE"
   if ! ssl_err=$(openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-    -keyout "$KEY_FILE" -out "$CERT_FILE" \
+    -keyout "$KEY_TMP" -out "$CERT_TMP" \
     -subj /CN=localhost \
     -addext "subjectAltName=$CERT_SAN" 2>&1); then
     die "openssl cert generation failed: $ssl_err"
   fi
-  chmod 600 -- "$KEY_FILE"
+  publish_private_no_replace "$CERT_TMP" "$CERT_FILE"
+  CERT_TMP=""
+  publish_private_no_replace "$KEY_TMP" "$KEY_FILE"
+  KEY_TMP=""
   ok "Generated $CERT_FILE (SAN: $CERT_SAN)"
 fi
 
 # ---------------------------------------------------------------------------
 # 10. Generate docker-backend.yaml
 # ---------------------------------------------------------------------------
-DOCKER_BACKEND_FILE="$REPO_ROOT/docker-backend.yaml"
 info "Writing $DOCKER_BACKEND_FILE"
 
-cat > "$DOCKER_BACKEND_FILE" <<YAML
+DOCKER_BACKEND_LISTEN_ADDR_JSON="$(json_quote "$DOCKER_BACKEND_LISTEN_ADDR")" \
+  || die "Failed to encode DOCKER_BACKEND_LISTEN_ADDR"
+CALLBACK_SECRET_JSON="$(json_quote "$CALLBACK_SECRET")" \
+  || die "Failed to encode CALLBACK_SECRET"
+VOLUME_DATA_PATH_JSON="$(json_quote "$VOLUME_DATA_PATH")" \
+  || die "Failed to encode VOLUME_DATA_PATH"
+VOLUME_MOUNT_PATH_JSON="$(json_quote "$VOLUME_MOUNT_PATH")" \
+  || die "Failed to encode VOLUME_MOUNT_PATH"
+CALLBACK_DB_PATH_JSON="$(json_quote "$CALLBACK_DB_PATH")" \
+  || die "Failed to encode callback database path"
+RELEASES_DB_PATH_JSON="$(json_quote "$RELEASES_DB_PATH")" \
+  || die "Failed to encode release database path"
+RETENTION_DB_PATH_JSON="$(json_quote "$RETENTION_DB_PATH")" \
+  || die "Failed to encode retention database path"
+DIAGNOSTICS_DB_PATH_JSON="$(json_quote "$DIAGNOSTICS_DB_PATH")" \
+  || die "Failed to encode diagnostics database path"
+SKU_DOCKER_MICRO_JSON="$(json_quote "${SKU_UUID_BY_NAME[docker-micro]}")" \
+  || die "Failed to encode docker-micro SKU UUID"
+SKU_DOCKER_SMALL_JSON="$(json_quote "${SKU_UUID_BY_NAME[docker-small]}")" \
+  || die "Failed to encode docker-small SKU UUID"
+SKU_DOCKER_MEDIUM_JSON="$(json_quote "${SKU_UUID_BY_NAME[docker-medium]}")" \
+  || die "Failed to encode docker-medium SKU UUID"
+SKU_DOCKER_LARGE_JSON="$(json_quote "${SKU_UUID_BY_NAME[docker-large]}")" \
+  || die "Failed to encode docker-large SKU UUID"
+DOCKER_BACKEND_TMP="$(private_temp_for "$DOCKER_BACKEND_FILE")" \
+  || die "Failed to create a private Docker config temporary"
+
+cat >| "$DOCKER_BACKEND_TMP" <<YAML
 # Docker Backend Configuration
 #
 # Generated by scripts/dev-init.sh — do not commit.
 # See docker-backend.example.yaml for all available options.
 
 name: docker
-listen_addr: ":9001"
+listen_addr: $DOCKER_BACKEND_LISTEN_ADDR_JSON
 docker_host: "unix:///var/run/docker.sock"
 
 # Resource pool
@@ -298,10 +453,10 @@ total_disk_mb: 102400
 
 # SKU Mapping - map on-chain SKU UUIDs to local profiles
 sku_mapping:
-  "${SKU_UUID_BY_NAME[docker-micro]}": "docker-micro"
-  "${SKU_UUID_BY_NAME[docker-small]}": "docker-small"
-  "${SKU_UUID_BY_NAME[docker-medium]}": "docker-medium"
-  "${SKU_UUID_BY_NAME[docker-large]}": "docker-large"
+  $SKU_DOCKER_MICRO_JSON: "docker-micro"
+  $SKU_DOCKER_SMALL_JSON: "docker-small"
+  $SKU_DOCKER_MEDIUM_JSON: "docker-medium"
+  $SKU_DOCKER_LARGE_JSON: "docker-large"
 
 # SKU profiles
 sku_profiles:
@@ -326,28 +481,32 @@ allowed_registries:
   - "ghcr.io"
 
 # Callback configuration
-callback_secret: "$CALLBACK_SECRET"
+callback_secret: $CALLBACK_SECRET_JSON
 # Local dev only: production_mode stays false, which permits the insecure
 # skip-verify below. Setting production_mode: true makes the backend reject it
 # at startup (ENG-321). Never ship a production config with skip-verify enabled.
 production_mode: false
 callback_insecure_skip_verify: true
-callback_db_path: "callbacks.db"
+callback_db_path: $CALLBACK_DB_PATH_JSON
 callback_max_age: 24h
 
 # Failure diagnostics persistence
-diagnostics_db_path: "diagnostics.db"
+diagnostics_db_path: $DIAGNOSTICS_DB_PATH_JSON
 diagnostics_max_age: 168h
 
 # Release history persistence
-releases_db_path: "releases.db"
+releases_db_path: $RELEASES_DB_PATH_JSON
 releases_max_age: 2160h  # 90 days
+
+# Retained-data authority (required even when retention is disabled)
+retention_db_path: $RETENTION_DB_PATH_JSON
 
 # External address for container port mappings
 host_address: "127.0.0.1"
 
 # Volume management
-volume_data_path: "$VOLUME_DATA_PATH"
+volume_data_path: $VOLUME_DATA_PATH_JSON
+volume_mount_path: $VOLUME_MOUNT_PATH_JSON
 
 # Timeouts
 provision_timeout: 10m
@@ -359,15 +518,37 @@ startup_verify_duration: 5s
 reconcile_interval: 5m
 YAML
 
+publish_private_no_replace "$DOCKER_BACKEND_TMP" "$DOCKER_BACKEND_FILE"
+DOCKER_BACKEND_TMP=""
 ok "Wrote $DOCKER_BACKEND_FILE"
 
 # ---------------------------------------------------------------------------
 # 11. Generate config.docker.yaml
 # ---------------------------------------------------------------------------
-CONFIG_DOCKER_FILE="$REPO_ROOT/config.docker.yaml"
 info "Writing $CONFIG_DOCKER_FILE"
 
-cat > "$CONFIG_DOCKER_FILE" <<YAML
+CHAIN_ID_JSON="$(json_quote "$CHAIN_ID")" || die "Failed to encode CHAIN_ID"
+GRPC_ENDPOINT_JSON="$(json_quote "$GRPC_ENDPOINT")" || die "Failed to encode GRPC_ENDPOINT"
+WEBSOCKET_URL_JSON="$(json_quote "$WEBSOCKET_URL")" || die "Failed to encode WEBSOCKET_URL"
+PROVIDER_UUID_JSON="$(json_quote "$PROVIDER_UUID")" || die "Failed to encode provider UUID"
+PROVIDER_ADDRESS_JSON="$(json_quote "$PROVIDER_ADDRESS")" || die "Failed to encode provider address"
+KEYRING_BACKEND_JSON="$(json_quote "$KEYRING_BACKEND")" || die "Failed to encode KEYRING_BACKEND"
+KEYRING_DIR_JSON="$(json_quote "$CHAIN_HOME/")" || die "Failed to encode keyring directory"
+KEY_NAME_JSON="$(json_quote "$KEY_NAME")" || die "Failed to encode KEY_NAME"
+CERT_FILE_JSON="$(json_quote "$CERT_FILE")" || die "Failed to encode CERT_FILE"
+KEY_FILE_JSON="$(json_quote "$KEY_FILE")" || die "Failed to encode KEY_FILE"
+DOCKER_BACKEND_URL_JSON="$(json_quote "$DOCKER_BACKEND_URL")" \
+  || die "Failed to encode DOCKER_BACKEND_URL"
+CALLBACK_BASE_URL_JSON="$(json_quote "$CALLBACK_BASE_URL")" \
+  || die "Failed to encode CALLBACK_BASE_URL"
+TOKEN_DB_PATH_JSON="$(json_quote "$TOKEN_DB_PATH")" || die "Failed to encode token database path"
+PAYLOAD_DB_PATH_JSON="$(json_quote "$PAYLOAD_DB_PATH")" || die "Failed to encode payload database path"
+PLACEMENT_DB_PATH_JSON="$(json_quote "$PLACEMENT_DB_PATH")" \
+  || die "Failed to encode placement database path"
+CONFIG_DOCKER_TMP="$(private_temp_for "$CONFIG_DOCKER_FILE")" \
+  || die "Failed to create a private providerd config temporary"
+
+cat >| "$CONFIG_DOCKER_TMP" <<YAML
 # Manifest Provider Daemon Configuration
 #
 # Generated by scripts/dev-init.sh — do not commit.
@@ -376,18 +557,18 @@ production_mode: false
 log_level: "info"
 
 # Chain configuration
-chain_id: "$CHAIN_ID"
-grpc_endpoint: "localhost:9090"
-websocket_url: "ws://localhost:26657/websocket"
+chain_id: $CHAIN_ID_JSON
+grpc_endpoint: $GRPC_ENDPOINT_JSON
+websocket_url: $WEBSOCKET_URL_JSON
 
 # Provider identification
-provider_uuid: "$PROVIDER_UUID"
-provider_address: "$PROVIDER_ADDRESS"
+provider_uuid: $PROVIDER_UUID_JSON
+provider_address: $PROVIDER_ADDRESS_JSON
 
 # Keyring configuration
-keyring_backend: "$KEYRING_BACKEND"
-keyring_dir: "$CHAIN_HOME/"
-key_name: "$KEY_NAME"
+keyring_backend: $KEYRING_BACKEND_JSON
+keyring_dir: $KEYRING_DIR_JSON
+key_name: $KEY_NAME_JSON
 
 # API server
 api_listen_addr: ":8080"
@@ -404,28 +585,31 @@ api_listen_addr: ":8080"
 #   - "http://localhost:5173"
 
 # TLS (self-signed for dev)
-tls_cert_file: "$CERT_FILE"
-tls_key_file: "$KEY_FILE"
+tls_cert_file: $CERT_FILE_JSON
+tls_key_file: $KEY_FILE_JSON
 
 # Backend
 backends:
   - name: docker
-    url: "http://localhost:9001"
+    url: $DOCKER_BACKEND_URL_JSON
     timeout: 30s
     default: true
+    hmac_secret: $CALLBACK_SECRET_JSON
 
 # Callbacks
-callback_base_url: "https://localhost:8080"
-callback_secret: "$CALLBACK_SECRET"
+callback_base_url: $CALLBACK_BASE_URL_JSON
 
 # Reconciliation
 reconciliation_interval: "5m"
 
 # Token replay protection
-token_tracker_db_path: "$REPO_ROOT/tokens.db"
+token_tracker_db_path: $TOKEN_DB_PATH_JSON
 
 # Payload store
-payload_store_db_path: "$REPO_ROOT/payloads.db"
+payload_store_db_path: $PAYLOAD_DB_PATH_JSON
+
+# Durable lease-to-backend placement authority
+placement_store_db_path: $PLACEMENT_DB_PATH_JSON
 
 # Transaction configuration
 gas_limit: 1500000
@@ -436,6 +620,8 @@ fee_denom: "umfx"
 shutdown_timeout: "30s"
 YAML
 
+publish_private_no_replace "$CONFIG_DOCKER_TMP" "$CONFIG_DOCKER_FILE"
+CONFIG_DOCKER_TMP=""
 ok "Wrote $CONFIG_DOCKER_FILE"
 
 # ---------------------------------------------------------------------------
@@ -447,6 +633,7 @@ echo ""
 echo "  Provider address : $PROVIDER_ADDRESS"
 echo "  Provider UUID    : $PROVIDER_UUID"
 echo "  Volume data path : $VOLUME_DATA_PATH"
+echo "  Volume mount path: $VOLUME_MOUNT_PATH"
 echo "  TLS cert         : $CERT_FILE"
 echo "  TLS key          : $KEY_FILE"
 echo "  SKU mapping:"
@@ -458,7 +645,21 @@ echo "  Generated files:"
 echo "    $DOCKER_BACKEND_FILE"
 echo "    $CONFIG_DOCKER_FILE"
 echo ""
-echo "  Start the backend and providerd:"
-echo "    ./docker-backend --config docker-backend.yaml"
-echo "    ./providerd --config config.docker.yaml"
+printf '  In each terminal, first run: cd %q\n' "$REPO_ROOT"
+echo ""
+echo "  Complete the fresh, offline authority bootstrap (keep tenant ingress stopped):"
+echo "    ./build/docker-backend -config docker-backend.yaml -initialize-storage-identity new"
+echo ""
+echo "  Then keep the normal backend running in terminal A:"
+echo "    ./build/docker-backend -config docker-backend.yaml"
+echo ""
+echo "  With terminal A running and the backend still empty, initialize placement in terminal B:"
+echo "    fresh_confirmation=\"\$(./build/placement-preflight -config config.docker.yaml -print-fresh-confirmation -expected-backends '[\"docker\"]')\""
+echo "    ./build/placement-preflight -config config.docker.yaml -initialize-fresh \\"
+echo "      -expected-backends '[\"docker\"]' \\"
+echo "      -confirm-insecure-chain 'I ACCEPT UNAUTHENTICATED CHAIN EVIDENCE FOR LOCAL DEVELOPMENT' \\"
+echo '      -confirm-quiesced "$fresh_confirmation"'
+echo ""
+echo "  Only after placement-preflight ends with INITIALIZED_FOR_CUTOVER, start providerd:"
+echo "    ./build/providerd --config config.docker.yaml"
 echo ""

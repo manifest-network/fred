@@ -61,13 +61,33 @@ backends:
       - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
       - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
 
-# Required when multiple backends share SKUs — tracks which backend serves each lease
+# Required in every deployment — provider-bound durable authority for attempted
+# and confirmed ownership, routing, reconciliation, restore, and restart safety.
+# Normal startup opens an existing prepared file; it never creates or migrates it.
 placement_store_db_path: "/var/lib/fred/placements.db"
 ```
 
 Fred does NOT interpret the SKU — it only uses exact UUID matching to decide which backend receives the request.
 
-**Load-balanced placement:** Multiple backends can share the same `skus` list. When this happens, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. Fred records a placement (lease->backend) so that subsequent read operations (connection details, logs, diagnostics) reach the correct machine. This requires `placement_store_db_path` to be configured.
+The `http://` URLs above are development examples. Production mode requires
+peer-verified `https://` for every backend; the trust anchor may be a configured
+private CA rather than a public CA.
+
+Backend names are case-sensitive durable placement identities. They must be
+non-blank and exactly unique, and they must remain stable for as long as any
+placement or retained data refers to them. Renaming a backend is equivalent to
+removing its owner identity; it does not migrate its leases, and providerd
+rejects the change while durable placement still refers to that identity. After
+a name is safely drained, its latest complete raw `/provisions` and
+`/retentions` inventories must both prove it empty before removal. Silence is
+not a drain proof. The same storage may later return under that original
+identity; every topology membership change requires an identity-bearing probe
+of the complete proposed fleet and a fresh full-fleet inventory baseline before
+new work is admitted. An unchanged topology retains its established baseline
+through a transient node outage. Never bind replacement storage to a historical
+name—give every replacement a new unique name.
+
+**Load-balanced placement:** Multiple backends can share the same `skus` list. When this happens, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. Fred records a placement (lease->backend) so that subsequent read operations (connection details, logs, diagnostics) reach the correct machine. `providerd` requires `placement_store_db_path` in every mode, including single-backend development, because ambiguous responses and restart recovery still require durable ownership evidence.
 
 ### Level 2: Backend Interprets Full SKU
 
@@ -89,7 +109,9 @@ Your backend receives the full SKU and decides what to do with it. This is entir
 
 **Your backend MUST verify Fred's signature on every inbound contract request.** Fred signs every request it sends to a backend with the same `X-Fred-Signature` HMAC scheme used for callbacks (see Callback Protocol → HMAC Signature). A backend that does not verify inbound signatures accepts unauthenticated provision/deprovision/update commands from anyone who can reach it.
 
-Both reference backends (`internal/backend/docker`, `cmd/k3s-backend`) wrap **all** contract routes in HMAC verification middleware and respond `401 Unauthorized` to any request with a missing or invalid `X-Fred-Signature`.
+The bundled Docker, k3s, and mock HTTP servers wrap **all** contract routes in
+HMAC verification middleware and respond `401 Unauthorized` to any request with
+a missing or invalid `X-Fred-Signature`.
 
 The verifier uses the **same canonical string** documented for callbacks, computed over the request's method, request-URI, and body:
 
@@ -100,6 +122,130 @@ The verifier uses the **same canonical string** documented for callbacks, comput
 Read the body, then verify before dispatching to the handler. Backends inside this repository can call `hmacauth.VerifyRequest(secret, r, body, sig, 5*time.Minute)`; external backends should re-derive the canonical string using the standalone sample in the Callback Protocol section (the computation is symmetric — sender and verifier hash identical bytes).
 
 **Unauthenticated endpoints:** only the operational endpoints `GET /health`, `GET /stats`, and `GET /metrics` are exempt. Every other (contract) endpoint below must be authenticated.
+
+## Durable Backend Storage Identity
+
+A configured backend name is a routing label; it is not proof that the same
+disk, Docker daemon, or Kubernetes cluster is still behind that label. Every
+backend implementation must therefore seal one canonical lowercase UUIDv4 to
+its durable storage lineage and keep it stable across process restarts. A
+replacement storage substrate must receive a new backend name. Never generate
+the UUID from a hostname, URL, filesystem path, or current inventory, and never
+regenerate it merely because the backend is empty.
+
+The HTTP contract is:
+
+- Every identity-bearing contract response, including application errors and
+  inventory pages, carries exactly one
+  `X-Fred-Backend-Storage-ID: <canonical-uuidv4>` header. A response produced
+  after lineage re-attestation fails must omit the header and fail with `503`;
+  it must not assert a cached identity for a known-unverified substrate. The
+  outer protocol wrapper may include the process's sealed ID on cheap
+  pre-dispatch failures such as bad HMAC/query/path; such a non-success header
+  identifies the process only and is never positive inventory or effect
+  evidence.
+- `GET /provisions` and `GET /retentions` carry the same identity on every
+  page. The identity must remain stable across both complete endpoint walks.
+  Missing, malformed, duplicate, changing, or cross-endpoint-different values
+  make that backend unanswered; they never establish absence authority.
+- When Fred has a durable pin, it sends exactly one
+  `backend_storage_id=<canonical-uuidv4>` query parameter on reads and
+  inventories. Parse `RawQuery` fail-closed: malformed escaping, a duplicate
+  key, a noncanonical UUID, or a present mismatch is a protocol error. This
+  query is part of `RequestURI` and therefore covered by request HMAC.
+- Side effects use only the upgraded namespace
+  `/_fred/storage/{storage-id}/{operation}`. The current operations are
+  `provision`, `deprovision`, `restart`, `update`, `restore`, and
+  `reconcile_custom_domain`. Validate the exact canonical path UUID before
+  reading the body or invoking backend code, then authenticate HMAC, re-attest
+  the substrate, and dispatch. A wrong identity returns `404` with zero side
+  effect.
+- Re-attest storage lineage immediately before **and after** every raw
+  side effect, including compensating cleanup. If the postcheck cannot prove
+  the same lineage—even because its context timed out—the mutation outcome is
+  ambiguous: latch the backend for the rest of that process, suppress callback
+  settlement and further destructive cleanup, and retain the durable operation
+  intent/finalizer for strict restart recovery. Preserve both the raw mutation
+  error and the postcheck error (for example with `errors.Join`). A failed
+  precheck alone is a refusal because the raw mutator never ran.
+- Keep any legacy side-effect paths isolated from the identity-bound namespace;
+  they are not a supported mixed-version rollout route. The documented v0.13
+  cutover stops the old provider and every backend, drains pending work, rotates
+  to unique per-backend keys, seals storage identity, starts the upgraded
+  backends, and only then starts the upgraded provider. A new provider never
+  chooses the old paths. Do not configure a proxy to rewrite or fan out the
+  upgraded namespace to a legacy mutation path. Fred also refuses HTTP
+  redirects rather than replaying a signed request body at another URI or host.
+  A later release can remove the compatibility paths once no supported upgrade
+  starts from v0.13.
+
+The response header is an assertion, not a response signature. Fred's request
+HMAC authenticates Fred to the backend but cannot authenticate the backend's
+header or response body. Production safety therefore requires the documented
+peer-verified HTTPS boundary (a private CA and, preferably, mTLS are valid), or
+an equivalently authenticated private transport. The identity fence prevents
+accidental same-name replacement and downgrade; it does not defend against an
+active intermediary that can forge authenticated backend responses.
+
+Callbacks bind the reverse direction. Persist `backend_storage_id` in every
+new durable callback-outbox row at enqueue time and send it in the JSON body on
+every delivery and replay. Never restamp an existing row with the identity that
+happens to be current at replay time. The callback body is HMAC-covered, and
+Fred compares the value with the durable pin for the exact operation or
+lifecycle owner before settlement. A v0.13 provider ignores this additive JSON
+field; an upgraded provider requires it. The stopped v0.13 cutover must drain
+the pre-identity legacy outbox before sealing storage identity. A current
+callback store refuses startup and reports unhealthy while that old bucket is
+nonempty. If a legacy row is introduced into an already-open store, the runtime
+never decodes it into a deliverable callback and leaves it untouched rather than
+manufacturing lineage from the currently mounted substrate. Health fails, and a
+subsequent open refuses the journal. This is why the stopped-and-drained cutover
+is mandatory.
+
+The bundled Docker backend additionally binds the marker to its configured
+backend name, Docker daemon `SystemID`, and the existing configured data mount;
+the k3s scaffold binds it to the Kubernetes cluster UID. Verify the binding
+before startup recovery, every inventory/side-effect boundary, asynchronous
+cleanup, and callback enqueue/delivery. A confirmed mismatch is permanent for
+that process: fail-stop rather than relearning the replacement. Restoring a
+complete marker plus substrate snapshot intentionally restores the same
+lineage; fence the old node/cluster before starting such a clone.
+
+Persistent authority must be part of that same seal. The bundled Docker backend
+binds its callback/intent, release, and retention databases to both the storage
+UUID and distinct store-kind tags; all three files are required even when
+retention policy is disabled. The k3s scaffold binds its callback/intent and
+release databases. A diagnostics database is intentionally excluded because it
+does not authorize a mutation, callback, restore, or release and can be
+recreated after loss. A third-party backend should make the same classification
+explicit: any file whose absence could change a lifecycle or destructive
+decision is authoritative, while observability-only caches are not.
+
+Create or adopt the complete authoritative set only through an explicit,
+offline initializer. It must persist a pending anchor before touching stores,
+bind/validate every required store, recheck substrate and cross-store evidence,
+then publish and commit the marker pair. Persist whether the input was wholly
+fresh or a complete existing lineage so a crash retry cannot reinterpret its
+own partial output as legacy state. Existing adoption requires a stopped
+backend, a drained pre-identity callback outbox, and a semantic cross-check of
+all release/retention authority against the substrate. Never infer, create, or
+repair one missing member during normal startup.
+
+Pass normal constructors an unforgeable verified-storage capability produced by
+loading the committed marker pair, then open every authoritative database
+without file-creation or lineage-binding flags before recovery begins. Retain
+and re-attest the opened unsymlinked, single-link regular-file inode, exact
+`0600` mode, configured path, and store-kind
+binding before each authority write and background cleanup; re-attest the marker
+and substrate at every request or raw-substrate boundary. A delete, rename,
+replacement, symlink/hard-link alias, foreign UUID, or cross-kind copy must
+fail-stop rather than become a new empty authority. Make the bbolt transaction
+boundary explicit as well: a rejected mutation that rolls back before `Commit`
+is definitely uncommitted, while any `Commit` error has an unknown outcome and
+must permanently withdraw that process's store authority. Reopen and re-verify
+the exact database instead of retrying from an assumed rollback. These checks do
+not detect a complete matching stopped snapshot: fence the original and restore
+all markers, authoritative stores, and substrate from one point in time.
 
 ## HTTP API Specification
 
@@ -113,23 +259,53 @@ Every non-2xx response **MUST** be JSON in this envelope:
 {
   "error": "human-readable description of what went wrong",
   "validation_code": "unknown_sku | invalid_manifest | image_not_allowed",
-  "code": "already_provisioned | demote_exceeds_tier"
+  "code": "already_provisioned | demote_exceeds_tier | insufficient_resources"
 }
 ```
 
 - `error` **(required)** — a human-readable description. See the curation rule below.
 - `validation_code` (omitempty) — on a `400`, the sub-category of the validation failure. Fred parses it to reconstruct a precise sentinel error, which is what gives the on-chain rejection reason its precision; omit it and fred falls back to a generic validation failure.
-- `code` (omitempty) — a discriminator for the status codes fred overloads. Today: `already_provisioned` on `/restore`'s `409`, and `demote_exceeds_tier` on `/restore`'s `422`. See those endpoints.
+- `code` (omitempty) — a machine-readable discriminator. Today: `already_provisioned` on `/restore`'s `409`, `demote_exceeds_tier` on `/restore`'s `422`, and `insufficient_resources` on a capacity-refused `/provision` or `/restore` `503`. See those endpoints.
 
-The one exception fred tolerates is an **empty** body: a backend that answers a `409`/`422` with nothing at all is read as the plain meaning of that status. (Note that *bare*, everywhere else in this guide and in README/ARCHITECTURE/OPERATIONS, means a response carrying **no `code` discriminator** — a different thing, and one that still owes an `error` body.) Anything that is not empty must be the envelope with a non-empty `error`: an unparseable body, and a body that is valid JSON but omits `error` (`{}`, `null`, `{"message": "..."}`, or even `{"code": "..."}`), are contract violations. A discriminator alone does not substitute for `error` — send both.
+These response fields establish **protocol conformance, not cryptographic
+authorship**. Fred HMAC-signs requests to the backend, but the backend does not
+sign its response body. A coded refusal is therefore trusted under the
+deployment's configured transport boundary. Use TLS or an equivalently trusted
+network if an on-path response forger is in scope; `production_mode: true`
+enforces peer-verified HTTPS using a configured private CA or system roots. The discriminator primarily
+separates bundled/backend-contract responses from ordinary proxy HTML, foreign
+JSON, legacy code-less envelopes, and unknown codes.
 
-The `code` set is **open and add-only**. If fred receives a `code` it does not recognize for that status — including one that is valid for a *different* status — it does not guess: it relays your `error` message to the tenant at the status you sent and states no verdict of its own. That is not treated as a malformed body and does not count against the circuit breaker, so a new discriminator degrades safely against an older `providerd`. The practical consequence for backend authors: the precise mapping (and any tenant-facing status remap, e.g. a code-less `422` → `404`) only appears once `providerd` learns the code, so ship the fred side first if the mapping matters.
+The one exception fred tolerates is an **empty** body: a backend that answers a `409`/`422` with nothing at all is read as the plain meaning of that status. An empty or code-less v0.13 `503` still produces the `ErrInsufficientResources` diagnostic sentinel for API compatibility, but its typed causal outcome is **ambiguous**, not refused; fred therefore retains the write-ahead attempt. (Note that *bare*, everywhere else in this guide and in README/ARCHITECTURE/OPERATIONS, means a response carrying **no `code` discriminator** — a different thing, and one that still owes an `error` body.) Anything that is not empty must be the envelope with a non-empty `error`: an unparseable body, and a body that is valid JSON but omits `error` (`{}`, `null`, `{"message": "..."}`, or even `{"code": "..."}`), are contract violations. A discriminator alone does not substitute for `error` — send both.
 
-**The `error` field is TENANT-VISIBLE.** For `/restore` and `/update`, fred relays it to the tenant in its own 4xx response body. So it **MUST NOT** contain host paths, raw command output, or storage internals — those stay in your backend's own logs. This is the same obligation the `message` field carries on `/provisions`, and it exists because the tenant is untrusted: your `error` string is the one place a filesystem path can walk out of the provider. Author it for the tenant and keep the diagnosis in your logs.
+The `code` set is **open and add-only**. If fred receives a `code` it does not recognize for that status — including one that is valid for a *different* status — it does not guess. It preserves the exact write-ahead attempt, keeps the declared `error` only for operator diagnostics, and returns a generic failure rather than asserting a tenant-visible backend or lease-state fact. That is not treated as a malformed body and does not count against the circuit breaker, so a new discriminator degrades safely against an older `providerd`. The precise mapping (and any tenant-facing status remap, e.g. a code-less `422` → `404`) appears only once `providerd` learns the code, so ship the fred side first if the mapping matters.
+
+Settlement is type-enforced after this parse. Package-owned `backend.Invoke*`
+functions grant causal classification only to the exact identity-bound HTTP
+client type, which mints a zero-invalid call outcome at the transport branch
+that observed acceptance, a contract refusal, a proven pre-dispatch stop, or
+ambiguity. A decorator cannot acquire that authority through method embedding.
+Placement consumes the outcome and never reconstructs authority by searching
+an arbitrary error tree for a sentinel. A backend wired directly to
+the legacy Go `backend.Backend` interface remains compatible, but every non-nil
+return is deliberately ambiguous; it cannot reject a lease, clear an attempt,
+or publish a terminal-refusal event merely by wrapping `ErrValidation` or
+another public error. Production `providerd` backends use the identity-bound
+HTTP client and therefore retain the full typed protocol behavior.
+
+**The `error` field MAY BE TENANT-VISIBLE.** For recognized `/restore` refusal categories and validation refusals from `/restart` or `/update`, fred relays curated details to the tenant in its own 4xx response body. Maintenance validation details are retained with the exact durable refusal receipt, so an idempotent retry or provider restart preserves the diagnostic. Other restart/update refusals and unknown or ambiguous categories receive generic messages. Backend authors must still treat the field as public because a later fred version may expose another recognized category's details. It **MUST NOT** contain host paths, raw command output, or storage internals — those stay in your backend's own logs. This is the same obligation the `message` field carries on `/provisions`. Author it for the tenant and keep the diagnosis in your logs.
 
 Do include what lets a tenant *fix* the request — the offending manifest field, the rejected image reference, the registry allowlist, the byte counts of a tier that does not fit. Those are the tenant's own input and your published policy, and suppressing them only makes the error unactionable.
 
 **A non-envelope body is a contract violation.** If a 4xx body does not parse as the JSON above — including a body that is valid JSON but omits the required `error` field, such as `{}` or a proxy's own `{"message": "..."}` — fred does **not** forward it: it answers the tenant with a generic message, records the raw body in its own logs, and counts it in `fred_backend_malformed_error_body_total{backend,operation}`. It also declines to treat that response as a permanent tenant-side failure — an unparseable `400` could have come from an intermediary rather than from your backend, and fred will not reject or close a lease on-chain on that basis. Emit the envelope and you keep both the tenant's diagnostic and the permanent classification.
+
+The endpoint headings below use the short operation names to keep the payload
+contract readable. On the current protocol, `providerd` sends every mutating
+`POST` to `/_fred/storage/{storage-id}/{operation}`: `provision`, `deprovision`,
+`restart`, `update`, `restore`, and `reconcile_custom_domain`. The unbound
+`/{operation}` forms are v0.13 compatibility routes only; a current `providerd`
+never calls them. Read endpoints keep their unbound paths and receive the pinned
+identity as the HMAC-covered `backend_storage_id` query parameter.
 
 ### POST /provision
 
@@ -145,7 +321,8 @@ Start provisioning a resource asynchronously.
     {"sku": "docker-nginx", "quantity": 1, "service_name": "web", "custom_domain": "app.example.com"},
     {"sku": "docker-redis", "quantity": 2, "service_name": "cache"}
   ],
-  "callback_url": "http://fred:8080/callbacks/provision",
+  "callback_url": "http://fred:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+  "lifecycle_callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
   "payload": "base64-encoded-bytes",
   "payload_hash": "sha256-hex-string"
 }
@@ -165,16 +342,26 @@ Start provisioning a resource asynchronously.
 ```
 
 **Behavior:**
-1. Validate the request
-2. Store the `callback_url` for this `lease_uuid`
+1. Validate the request, including exactly one canonical UUIDv4 `operation_id`
+   in `callback_url`. Reject tokenless new provision requests with `400` before
+   persisting an operation intent or mutating the substrate. An omitted
+   `lifecycle_callback_url` may be derived from the typed operation URL as
+   described in Callback Protocol; an explicit field must match that pair
+2. Store both callback URLs for this `lease_uuid` byte-for-byte. The complete
+   `callback_url`, including its query, settles only this provision operation;
+   `lifecycle_callback_url` carries a separate typed lifecycle capability and
+   reports later maintenance, autonomous failure, or teardown observations
+   without reusing expired operation authority
 3. Return 202 immediately (do NOT block on provisioning)
 4. Start provisioning in a background goroutine
-5. When complete, POST to the `callback_url` (see Callback Protocol below)
+5. When complete, POST to `callback_url`. For later runtime failure or
+   deprovision observations, POST to `lifecycle_callback_url` (see Callback
+   Protocol below)
 
 **Error Responses:**
 - `400 Bad Request` - Invalid request body
 - `409 Conflict` - Lease already provisioned
-- `503 Service Unavailable` - Insufficient resources
+- `503 Service Unavailable` - Insufficient resources. A backend that synchronously refuses before starting work MUST return `{"error":"...","code":"insufficient_resources"}`. Under the configured transport's trust boundary, Fred can then clear only that request's exact write-ahead attempt and may route a retry to another backend. A code-less, malformed, or unknown-code 503 remains ambiguous and blocks substitution because an intermediary could have emitted it after backend acceptance.
 
 ### GET /info/{lease_uuid}
 
@@ -259,6 +446,7 @@ List currently provisioned resources. Used by Fred for reconciliation. Keyset-pa
       "fail_count": 0,
       "reason": "",
       "message": "",
+      "lifecycle_generation": {"kind": "typed", "id": "550e8400-e29b-41d4-a716-446655440001"},
       "image": "nginx:latest",
       "sku": "docker-nginx",
       "quantity": 1,
@@ -278,6 +466,7 @@ List currently provisioned resources. Used by Fred for reconciliation. Keyset-pa
 - `fail_count` - Number of provision failures for this lease
 - `reason` (omitempty) - Stable machine-readable failure category (CamelCase, e.g. `ContainerExited`, `ImagePullFailed`, `Internal`, `Unknown`). Open/add-only set; consumers must tolerate unknown values.
 - `message` (omitempty) - Curated human-readable failure message. MUST NOT contain host paths or raw command output (those stay in the backend's own logs).
+- `lifecycle_generation` (optional) - Non-secret internal observation of the callback pair actually persisted for this live provision: `unknown`, `legacy`, `typed` (with one canonical UUIDv4 `id`), or `unusable`. Never return either callback URL here. Omission is backward-compatible and is treated as `unknown`; retained-only records should omit it, and diagnostic-only records MUST NOT appear in list/lookup inventory. Fred uses an exact typed match from a complete, identity-bearing inventory to settle a durable attempt, verify lifecycle authority, and pair the row's `tenant`/`provider_uuid` with an existing prepared placement as its runtime maintenance principal. It never treats these fields as permission to bootstrap an absent authority file, and partial inventory cannot establish or change the principal. A singular `GET /provisions/{lease_uuid}` diagnostics fallback may repeat its historically captured observation for read-model continuity, but that expiring/recreateable diagnostic is not settlement or repair authority.
 - `image` / `sku` (omitempty) - Image and SKU for non-stack (single-service) leases
 - `quantity` - Total expected container count across all items
 - `items` (omitempty) - Per-service items for stack leases
@@ -315,6 +504,7 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
 - `fail_count` - Number of provision failures
 - `reason` (omitempty) - Stable machine-readable failure category (CamelCase, e.g. `ContainerExited`, `ImagePullFailed`, `Internal`, `Unknown`). Open/add-only set; consumers must tolerate unknown values.
 - `message` (omitempty) - Curated human-readable failure message. MUST NOT contain host paths or raw command output (those stay in the backend's own logs).
+- `lifecycle_generation` (optional) - A live record reports the same non-secret observation described for `GET /provisions`. A persisted diagnostics fallback may repeat the historical observation captured with the failure so point reads do not change shape after teardown. It remains observability only: diagnostic rows are excluded from list/lookup inventory and MUST NOT authorize settlement, repair, or mutation.
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned (or diagnostics expired)
@@ -329,13 +519,18 @@ Get container logs for a specific lease. Used by fred to serve `GET /v1/leases/{
 **Response:** `200 OK`
 ```json
 {
-  "0": "2024-01-15 10:30:00 Starting nginx...\nListening on port 80\n",
-  "1": "2024-01-15 10:30:00 Redis ready\n"
+  "web/0": "2024-01-15 10:30:00 Starting nginx...\nListening on port 80\n",
+  "db/0": "2024-01-15 10:30:00 Redis ready\n"
 }
 ```
 
 **Fields:**
-- Keys are container instance indices (`"0"`, `"1"`, ...), values are log output strings
+- Docker keys identify service and instance (`"web/0"`, `"db/0"`); values are log output strings.
+- After successful compensation, live keys remain available alongside captured
+  replacement logs under `failed/<service>/<instance>`. The failed entries are
+  tied to the restored release and disappear from the active view after a later
+  deployment. Logs share a 32 MiB aggregate content budget, with bounded marker
+  and encoding overhead.
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned (or logs expired)
@@ -344,11 +539,20 @@ Get container logs for a specific lease. Used by fred to serve `GET /v1/leases/{
 
 Restart containers for a lease without changing the manifest. Stops existing containers, recreates them with the same configuration, and sends a callback on completion. Volumes are preserved across restarts.
 
+Fred retains an admitted restart or update as a pending command when a transport
+attempt cannot be dispatched, even if an open circuit blocks its first attempt.
+The tenant receives `503`, but Fred may deliver the exact command later during
+automatic recovery. A different tenant idempotency key receives `409` while
+that command is pending; an exact retry joins recovery. Backends must therefore
+apply the durable `maintenance_id` replay rule below to delayed delivery as well
+as immediate retries. See [the tenant retry contract](README.md#restart-lease).
+
 **Request:**
 ```json
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
-  "callback_url": "http://fred:8080/callbacks/provision"
+  "maintenance_id": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
+  "callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
@@ -360,28 +564,54 @@ Restart containers for a lease without changing the manifest. Stops existing con
 ```
 
 **Behavior:**
+0. Validate the canonical UUIDv4 `maintenance_id` and durably admit that exact
+   ID, kind, source authority, and request fingerprint before any mutation.
+   Exact replay returns the stored disposition without repeating replacement;
+   divergent reuse returns `409`. Provider and backend both retain a compact
+   receipt for the lifetime of the live lease; the provider reclaims it only
+   after placement and lifecycle authority are gone, while the backend removes
+   it only through successful close. A store-assigned completion sequence makes
+   an older recovered update return `409` once a newer update exists, preventing
+   stale desired-payload persistence. At most 1,024 receipts are admitted per
+   live lease; exhaustion is refused before mutation as coded `503
+   insufficient_resources`, so it cannot create an ambiguous command.
 1. Validate the lease exists and is in a restartable state (`ready` or `failed`)
 2. Return 202 immediately
-3. Stop and rename existing containers (kept for rollback) in a background goroutine
-4. Recreate containers with the same manifest and configuration
+3. In the background, durably capture the exact source image, effective runtime
+   configuration, and physical volume identities before retiring source containers
+4. Recreate containers with the same manifest and configuration through the protected launch workflow
 5. Run startup verification (health checks or startup delay)
-6. On success: remove old containers and POST success callback. On failure: rollback to old containers, restore `ready` status, and POST failure callback
+6. On success: activate the target and POST success callback. On a settled failure:
+   capture failed-target logs before cleanup and compensate from the recorded
+   source. A verified source returns to `ready` with a failure callback; a source
+   that cannot become ready becomes `failed`. An empty or positively verified
+   incomplete source permits restarting a Failed lease but provides no
+   compensation target. Foreign or divergent survivors refuse replacement.
+   Ambiguous Docker calls remain pending and cannot authorize another launch.
 
 **Error Responses:**
+- `400 Bad Request` - Invalid maintenance request or validation failure; curated
+  validation details are relayed to the tenant and retained for exact replay
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for restart (e.g., already restarting, updating, or provisioning)
+- `503 Service Unavailable` with `code: "insufficient_resources"` - The
+  backend refused admission before side effects because its durable live-lease
+  maintenance receipt capacity is exhausted
 
 ### POST /update
 
-Deploy a new manifest for a lease, replacing containers with a new image/configuration. Pulls the new image, stops old containers (kept for rollback), creates new ones, and sends a callback on completion. On failure, rolls back to the previous containers. Volumes are preserved.
+Deploy a new manifest for a lease, replacing containers with a new image/configuration.
+The Docker backend captures the exact source before replacement and can compensate
+after a settled failure. Volumes are preserved; application and database writes
+are not reversed by recreating the source.
 
 **Request:**
 ```json
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
-  "callback_url": "http://fred:8080/callbacks/provision",
-  "payload": "base64-encoded-manifest",
-  "payload_hash": "sha256-hex-string"
+  "maintenance_id": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
+  "callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
+  "payload": "base64-encoded-manifest"
 }
 ```
 
@@ -393,19 +623,30 @@ Deploy a new manifest for a lease, replacing containers with a new image/configu
 ```
 
 **Behavior:**
+0. Apply the same durable `maintenance_id` admission/replay rule as `/restart`,
+   including the exact payload hash in the immutable request fingerprint.
 1. Validate the lease exists and is in an updatable state (`ready` or `failed`)
 2. Parse and validate the new manifest
 3. Return 202 immediately
-4. Pull the new image in a background goroutine
-5. Stop and rename old containers (kept for rollback)
+4. Durably capture the source's immutable image identity, effective configuration,
+   and physical volume identities, then pull the new image in a background goroutine
+5. Retire the exact source containers under protected volume ownership
 6. Create and start new containers from the updated manifest
 7. Run startup verification
-8. On success: remove old containers and POST success callback. On failure: rollback to old containers, mark status as `failed` (the desired update was not achieved even though old containers may be restored), and POST failure callback
+8. On success: activate the target and POST success callback. Failure uses the
+   same compensation rules as restart: preserve an intact healthy source when
+   dispatch never occurred, or recreate the recorded source after a settled
+   launch failure. Successful compensation reports `ready` for the lease and
+   `failed` for the maintenance request. Unknown Docker effects stay pending;
+   an activated target cannot be compensated.
 
 **Error Responses:**
 - `400 Bad Request` - Invalid manifest or validation error
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for update (e.g., currently restarting or provisioning)
+- `503 Service Unavailable` with `code: "insufficient_resources"` - The
+  backend refused admission before side effects because its durable live-lease
+  maintenance receipt capacity is exhausted
 
 ### POST /restore (optional — retention support)
 
@@ -419,11 +660,53 @@ Restore a soft-deleted lease's retained data into a **new** lease (async, callba
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
-  "callback_url": "http://fred:8080/callbacks/provision"
+  "callback_url": "http://fred:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+  "lifecycle_callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
 `lease_uuid` is the new lease; `from_lease_uuid` is the original retained lease. `items` must shape-match (service name → summed quantity) the retained set. The new lease's `items` MAY specify a **different SKU disk tier** than the source — only the item *shape* (service names + summed quantities) must match, not the resource/disk tier. A **promote** (same-or-larger disk tier) is always allowed and applies the new `disk_mb` cap. A **demote** (smaller disk tier) is allowed only if the retained volume's measured data fits the new tier's `disk_mb` cap; the backend runs a demote-fit check before adopting and otherwise refuses with `422` `code=demote_exceeds_tier` (see below).
+
+Like provision, every new restore requires a `callback_url` with exactly one
+canonical UUIDv4 `operation_id`, even when its retained source came from a
+v0.13 workload. Reject tokenless requests with `400` before operation admission,
+source reservation, or substrate mutation. An omitted lifecycle URL may be
+derived from the typed operation URL; an explicit URL must match exactly.
+
+**Exclusive source reservation is mandatory.** Before accepting the restore or
+performing an irreversible volume adoption, a backend **MUST** durably and
+atomically compare-and-transition the retained source from its restorable state
+to an exclusive restoring claim bound to this target and a claim/version token.
+A separate read followed by an unconditional write is not sufficient. Only one
+target may own a source claim at a time, and terminal commit or rollback
+**MUST** use compare-and-set against the same claim so an older worker cannot
+delete or re-activate a newer incarnation. Persist the target's typed operation
+ID and exact operation/lifecycle callback pair with the same claim so commit
+matching, zero-survivor recovery, and direct close retain causal and observation
+authority after the operation row reaches its durable terminal state.
+
+The source claim is also a destination-authority fence. Until it is finalized or
+rolled back, the backend **MUST** reject every new Provision or Restore generation
+for the target. Before commit, it must also reject maintenance. After a commit
+marker proves destination ownership and no Pending or contradictory Failed
+restore operation remains (Succeeded history may be atomically retired by an
+authorized successor), a
+backend may admit an identity-preserving repair, but topology-changing Update or
+custom-domain work must remain fenced unless the finalizer is atomically updated
+to describe that generation. The bundled Docker backend admits only a plain
+Restart and consumes the lingering source identity after that generation reaches
+Ready. Checking only a volatile target provision is insufficient: a crash or
+pre-actor failure may remove that projection while the durable source still owns
+adopted names and capacity.
+
+A request whose response is delayed, lost, or otherwise ambiguous may still be
+active after the caller retries. While its source claim remains unresolved, a
+backend **MUST NOT** accept another restore from that source; it returns the
+invalid-state `409` instead. Caller cancellation, timeout, duplicate delivery,
+or a read showing no finished target is not proof that the first request did not
+start. The claim must survive backend restart and remain exclusive until the
+original operation commits or a safe exact-claim rollback completes. Two target
+leases must never both receive acceptance for the same retained source.
 
 **Response:** `202 Accepted`
 ```json
@@ -434,14 +717,28 @@ Restore a soft-deleted lease's retained data into a **new** lease (async, callba
 
 **Behavior:**
 1. Validate the retained record exists and is owned by `tenant`; re-deploy strictly from the **retained manifest** captured at close time (the request carries no manifest)
-2. Adopt the retained volumes into the new lease's namespace, then bring up the stack and POST a callback
-3. On failure, re-quarantine the volumes (data preserved) and POST a failure callback
+2. Atomically acquire the durable, exclusive source claim described above
+3. Adopt the retained volumes into the new lease's namespace, then bring up the stack and POST a callback
+4. On a pre-commit failure, re-quarantine the volumes, restore their immutable
+   source quota, durably settle the exact failed operation, then return the exact
+   claim to restorable state with CAS and release target accounting. If an
+   asynchronous actor owns callback settlement, park the claim until that
+   terminal result is durable instead of handing source ownership back early
+5. Persist an exact destination commit marker before consuming the source claim.
+   Once that marker matches the typed operation ID, source generation, manifest,
+   items, and resource
+   authority, it wins over a later Failed/absent volatile projection: retain the
+   destination authority and classify missing resources as post-commit runtime
+   failure—not restore rollback. With zero survivors, recover Failed target state
+   and its exact allocation while retaining the source claim as durable identity;
+   an identity-preserving repair may consume it, while close must persist complete
+   cleanup authority before deleting it
 
 **Error Responses:**
-- `400 Bad Request` - Missing required fields or items/manifest validation error
+- `400 Bad Request` - Missing required fields, equal source and target UUIDs, or items/manifest validation error
 - `409 Conflict` - Invalid state for restore, or already provisioned. Both return a JSON `{"error": "..."}` body; the already-provisioned case additionally sets `code: "already_provisioned"` (the invalid-state case omits `code`), so the two are distinguished by that discriminator
 - `422 Unprocessable Entity` - Overloaded across two cases, distinguished by a `code` discriminator like the `409` above. Both return a JSON `{"error": "..."}` body; a **bare** `422` (no `code`) means no retained data for `from_lease_uuid` (also the correct response for backends without retention support), while a `422` with `code: "demote_exceeds_tier"` means the restore requested a **smaller** SKU disk tier whose `disk_mb` cap is below the retained volume's measured footprint (a refused demote)
-- `503 Service Unavailable` - Insufficient resources
+- `503 Service Unavailable` - Insufficient resources. A synchronous capacity refusal MUST carry `{"error":"...","code":"insufficient_resources"}`; under the configured transport's trust boundary this authorizes clearing the exact target attempt. A legacy/code-less, unknown-code, or malformed 503 remains ambiguous and keeps the target attempt until its exact callback, an upgraded inventory report carrying the same paired typed generation, or operator repair.
 
 ### GET /retentions (optional — retention support)
 
@@ -562,11 +859,84 @@ Return resource capacity and usage statistics. Useful for UI display and monitor
 }
 ```
 
-This endpoint is optional but recommended for production backends. The Docker backend implements it; the mock backend intentionally omits it to stay minimal.
+This endpoint is optional but recommended for production backends. Disk fields
+describe physical admission accounting, not necessarily only durable tenant
+storage. If a substrate reserves ephemeral scratch, include it in
+`allocated_disk_mb`/`available_disk_mb` and tenant disk gates, freeze it with the
+operation's resource authority, and document whether the reservation is
+conservative. The Docker backend implements this (durable `disk_mb` or its
+mutually exclusive pinned diskless scratch). The mock backend returns its
+configured in-memory snapshot, or a zero-valued snapshot when none is set.
 
 ## Callback Protocol
 
-When provisioning completes (success or failure), POST to the `callback_url` from the provision request.
+When provisioning or restoration completes (success or failure), POST to the
+complete `callback_url` from that request. Provision and restore URLs carry an
+`operation_id=<uuid>` query parameter whose value is one lowercase, hyphenated,
+canonical RFC-4122 UUIDv4. Treat the URL as opaque:
+preserve its path and query byte-for-byte rather than rebuilding or normalizing
+it. A complete callback destination is an absolute HTTP(S) URL with a usable
+ASCII hostname (punycode for an internationalized name) and port, a canonical
+path ending in `/callbacks/provision`, no user
+info/fragment/dot segments/encoded separators, and a wire-stable raw query.
+Reject raw spaces, non-ASCII bytes, malformed escapes, and empty `?` markers;
+their percent-encoded forms are byte-preserving. Fred and the bundled backends
+enforce this before acceptance, persistence, and replay. Fred uses that typed operation ID to prevent a stale callback from settling
+a newer operation. The callback is authoritative while the exact operation is
+current or while its matching durable placement Attempt/confirmed generation
+remains recoverable after provider restart. Once that evidence is consumed or
+replaced, Fred returns 200 and ignores the callback completely, including status
+publication.
+
+The operation identity is required for every new provision and restore, not
+only requests from the bundled provider. Validate the typed operation/lifecycle
+pair before durable admission. Here, **tokenless** means missing callback
+operation/lifecycle identity, not unauthenticated: request and callback HMAC
+requirements apply to both typed commands and supported legacy observations.
+
+Provision and restore requests also carry a typed
+`lifecycle_callback_url` with `lifecycle_id=<uuid>`. Store it separately and use
+it for subsequent restart/update completion, autonomous container failure, and
+deprovision observations. Fred persists the current lifecycle capability with
+the lease's authoritative backend; a newer successful exact operation rotates
+it, and terminal deprovision atomically retires it. After Fred deletes the
+placement, the retained capability is teardown-only: success/failure is a 200
+no-op and only the exact `deprovisioned` observation can retire it and publish a
+retained notice. That consume is durable before the best-effort notice is
+published, so a process crash can lose the push but cannot resurrect its
+authority; the queryable retention status remains the backstop. A lifecycle
+callback never settles an operation or mutates placement/chain state: it may
+publish only `ready`, `failed`, or `retained` status. Never use it for the
+original provision/restore result, which must go to the operation-scoped
+`callback_url`.
+
+At request entry, `lifecycle_callback_url` may be omitted when the completion
+URL carries its required operation identity. The bundled Docker backend derives
+the paired route by replacing exactly one `operation_id` with `lifecycle_id`
+and preserving every unrelated raw query component; a supplied lifecycle URL
+must equal that derived URL byte-for-byte. Persist the resolved pair with the
+admitted operation. Missing lifecycle labels may also be recovered from an existing
+migrated v0.13 workload. Its operationless URL remains tokenless and is
+authorized only for a lease whose durable placement was migrated as legacy;
+this recovery compatibility never authorizes a new tokenless provision or
+restore. External backends should use the shared boundary parser or consume
+the explicit pair, not reconstruct URLs independently.
+
+During the stopped cutover, install and start the upgraded backends before the
+upgraded provider, but never run an old provider against them: its tokenless new
+provision/restore requests are rejected. A new backend can recover the
+operationless route already embedded by v0.13.0 and continue using
+it after Fred migrates that owner as legacy. Starting a new provider against an
+old backend is not lifecycle-compatible: a v0.13.0 backend ignores
+`lifecycle_callback_url` and later reuses the expired operation-scoped URL,
+whose `operation_id` a new Fred intentionally treats as a 200 no-op.
+
+Fred repeats the current lifecycle route as `callback_url` on `/restart` and
+`/update`. A backend with persisted state must require the same authority class
+and lifecycle UUID before accepting a replacement base/path; it must reject a
+typed-to-tokenless downgrade, a different UUID, or a malformed/mixed route.
+Reconciler-driven maintenance that carries no fresh URL reuses the persisted
+route. This lets `callback_base_url` change without minting or losing authority.
 
 ### Request Format
 
@@ -579,7 +949,8 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "status": "success",
   "error": "",
-  "backend": "my-backend"
+  "backend": "my-backend",
+  "backend_storage_id": "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
 }
 ```
 
@@ -588,15 +959,65 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 **Fields:**
 - `status`: One of `"success"`, `"failed"`, or `"deprovisioned"`. Use `"deprovisioned"` when the backend has autonomously torn down a lease (e.g. after a failed provision rollback) so Fred records the lease as deprovisioned without firing failure-callback side effects.
 - `error`: Error message if status is `"failed"`, empty otherwise
-- `backend` (omitempty): The backend's configured name. Lets Fred label metrics per-backend without a placement lookup. Empty from pre-upgrade senders.
+- `backend` (omitempty): Optional legacy sender metadata used only for bounded metrics when no current operation exists. It may be empty or differ from Fred's configured router name. It never authorizes or redirects a typed callback; the HMAC-covered callback URL plus Fred's current exact-operation or durable lifecycle record select the authoritative backend.
+- `backend_storage_id`: Canonical UUIDv4 captured with the durable callback row
+  when the backend effect occurred. It is HMAC-covered and must be preserved on
+  replay rather than replaced with the current process identity. An upgraded
+  Fred rejects a missing/mismatched value before settlement. The additive wire
+  field does not make a mixed-version rollout safe; use the stopped cutover.
+- `operation_id` in the JSON body, if supplied, is untrusted metadata and is overwritten at Fred's ingress. Only the HMAC-authenticated URL query grants exact-operation authority.
+- `lifecycle_id` in the JSON body is likewise overwritten. Only the authenticated URL query and Fred's current durable per-lease capability authorize a lifecycle observation.
 
-### HMAC Signature with Replay Protection
+### Fred Response Contract
 
-Fred verifies callbacks using HMAC-SHA256 with timestamp-based replay protection. Callbacks older than 5 minutes are rejected.
+- `200 OK` — synchronously applied to a terminal application result, or
+  terminally ignored as a duplicate/stale exact-operation callback. A backend
+  may advance that lease's durable callback queue only after this response.
+- `400 Bad Request` — malformed JSON, lease UUID, status, or callback capability query. `operation_id` and `lifecycle_id` are mutually exclusive; a present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected.
+- `401 Unauthorized` — missing or invalid HMAC signature.
+- `429 Too Many Requests` — callback ingress rate limit exceeded; retry with backoff.
+- `503 Service Unavailable` — callback application is unavailable, has not
+  started, is shutting down, or failed/timed out; keep the callback durable and
+  retry with backoff.
+
+Fred's callback application budget is two minutes; it may wait for terminal
+chain settlement. Give the complete delivery retry chain a deadline strictly
+longer than that budget (the bundled backends use two minutes fifteen seconds),
+and do not layer a shorter `http.Client.Timeout` over the request context. On a
+fresh first attempt, that normally leaves time for Fred to return its retryable
+503 after its application timer expires. The chain deadline is not renewed for
+retries: after an earlier connection or HTTP failure and backoff consume part of
+it, a later attempt may be canceled by the sender's remaining deadline before
+Fred's per-request timer. Remove a durable entry only after 2xx. A 503, client
+timeout, disconnect, or lost response leaves the same entry at the head of that
+lease's FIFO; the bundled sender gives it back to the 30-second durable replay
+loop when the shared budget expires.
+
+In the bundled backends, semantic callback publication and wire transport are
+separate construction-bound capabilities. The publisher owns the exact
+operation/maintenance settlement services and callback journal; its
+fixed-purpose methods derive status, route, backend, and storage identity from
+store-issued proofs and atomically commit settlement plus outbox rows. Runtime
+failure publication additionally consumes an exact active-release generation
+proof, so a delayed observation cannot target a replacement generation. The
+sender has no settlement or arbitrary-publication API: it only drains already
+durable rows, signs HTTP requests, retries, and precisely removes a row after a
+2xx response. Command and recovery paths therefore only commit an outbox row
+and notify the tracked replay loop; they never perform callback HTTP inline.
+The replay loop preserves per-lease FIFO order without extending an actor, API
+handler, or startup-recovery critical section.
+
+### HMAC Signature with a Bounded Replay Window
+
+Fred verifies callbacks using HMAC-SHA256. Callbacks older than 5 minutes are
+rejected, which bounds replay of an identical signed request to that freshness
+window; it does not make a callback one-time-use. There is no callback nonce
+cache because durable delivery must retry the exact request after an ambiguous
+network outcome.
 
 **Signature format:** `t=<unix-timestamp>,sha256=<hex-encoded-hmac>`
 
-The HMAC is computed over a four-field canonical string that binds the timestamp, HTTP method, request URI, and a hash of the body:
+The HMAC is computed over a four-field canonical string that binds the timestamp, HTTP method, complete request URI (path plus query), and a hash of the body:
 
 ```
 <timestamp>\n<METHOD>\n<canonical-URI>\n<hex(sha256(body))>
@@ -640,12 +1061,18 @@ sig := computeSignature(os.Getenv("CALLBACK_SECRET"), req.Method, req.URL.Reques
 req.Header.Set("X-Fred-Signature", sig)
 ```
 
-The `CALLBACK_SECRET` must match Fred's `callback_secret` configuration. Backends that live inside this repository can import `internal/hmacauth` and call `hmacauth.SignRequest(secret, req, body)` instead of computing the canonical string by hand; Go's `internal/` rule makes that helper unavailable to external backends, which should use the standalone sample above.
+The `CALLBACK_SECRET` for one backend must match that backend's
+`backends[].hmac_secret` in providerd—not a fleet-wide provider key. Production
+requires every backend key to be at least 32 bytes and pairwise unique. Backends
+that live inside this repository can import `internal/hmacauth` and call
+`hmacauth.SignRequest(secret, req, body)` instead of computing the canonical
+string by hand; Go's `internal/` rule makes that helper unavailable to external
+backends, which should use the standalone sample above.
 
 ### Security Notes
 
-- **Replay protection**: Callbacks older than 5 minutes are rejected
-- **Cross-endpoint binding**: Signature is bound to HTTP method + request URI; a captured signature cannot be replayed against a different endpoint
+- **Bounded same-endpoint replay**: Callbacks older than 5 minutes are rejected; an identical request can be replayed inside that window
+- **Cross-endpoint and operation binding**: Signature is bound to HTTP method + complete request URI, including `operation_id`; a captured signature cannot be replayed against another endpoint or operation
 - **Clock skew tolerance**: Timestamps up to 1 minute in the future are accepted
 - **Binary-safe body**: Body is hashed (SHA-256), so the canonical string is unaffected by embedded `\n`, NUL, or non-UTF-8 bytes
 
@@ -662,28 +1089,203 @@ type MyBackend struct {
 }
 
 type provision struct {
-    LeaseUUID    string
-    Status       string    // "provisioning", "ready", "failed"
-    CreatedAt    time.Time
+    LeaseUUID            string
+    Status               string    // "provisioning", "ready", "failed"
+    CreatedAt            time.Time
+    CallbackURL          string    // exact operation completion
+    LifecycleCallbackURL string    // typed later observations
     // ... your resource-specific fields
 }
 ```
 
 ### Callback URL Storage
 
-Store callback URLs per lease to handle concurrent provisions:
+Store callback URLs per lease to handle concurrent provisions. Keep the exact
+completion URL and typed lifecycle URL as distinct values. Preserve both
+opaque values byte-for-byte: stripping or rebuilding the completion query makes
+the HMAC or operation identity fail verification, while retaining it for later
+lifecycle events causes valid observations to be discarded after that operation
+expires. The operation/lifecycle UUID query value is a bearer capability: never
+write either full URL to application logs, including inside `net/http`
+transport errors. Log only the lease, status, a capability-free error class,
+and—when cross-component correlation is required—a domain-separated,
+non-reversible operation or lifecycle fingerprint. Never label a fingerprint as
+the raw ID. The bundled typed IDs enforce this for generic Go formatting and
+`slog`; a raw callback URL is still a string and must be kept out of diagnostics.
+
+Production backends also need a durable per-lease callback outbox. Classify each
+delivery explicitly as an exact operation completion (provision/restore), an
+exact maintenance completion (restart/update/custom-domain, delivered over its
+lifecycle route), or a typed lifecycle observation (autonomous runtime failure
+or deprovision). Allocate a monotonic sequence in the same transaction that
+enqueues the payload. In bbolt, use one nested bucket per lease and keep its
+deliveries inside it; this makes same-lease append, coalescing, list, and drain
+proportional to that lease's queue rather than the entire backend fleet. Drain
+each lease in FIFO order and wait for Fred's HTTP result before advancing. Never
+let a lifecycle observation pass an older exact completion. A newer typed
+lifecycle observation may atomically replace older typed lifecycle observations
+for that lease because only the latest observed lifecycle state is useful;
+never coalesce exact operation or maintenance entries. Pre-identity v0.13
+outbox rows are a stopped-upgrade condition: drain them with the old backend,
+and never decode, replay, or coalesce them in the current runtime. Replay pending deliveries at
+startup and periodically, while allowing an unavailable or corrupt identifiable
+lease to remain blocked without blocking other leases. Preserve malformed rows
+for repair and keep health red; isolation must not turn corruption into silent
+deletion.
+
+Treat persisted outbox rows as protocol records, not merely valid JSON. Validate
+current-format rows before storing and after decoding: reject duplicate field
+names; require a canonical, non-nil lowercase UUID lease identity; require a
+UUIDv4 delivery identity and positive sequence; reject a callback URL whose
+authority, canonical callback path, or raw query is unsafe, or whose query
+carries mixed, malformed, duplicate, or opposite-class authority; accept
+only the status/success/retained combinations defined by that kind; and reject
+missing, pre-epoch, or more than five-minutes-in-the-future creation times. A
+tokenless URL remains valid in an identity-bearing current row only when it was
+inherited from a migrated v0.13 workload: its delivery kind records the
+backend's causal ordering intent even though old Fred supplied no typed
+selector. Keep a separate compatibility decoder for offline inspection,
+explicit cleanup, and quarantine of rows written by v0.13 itself; current
+startup requires that legacy bucket to be empty. Unknown fields may remain
+accepted for forward-compatible additions, but known authority fields must have
+exactly one value.
+
+A queued terminal `deprovisioned` lifecycle observation is sticky: never let a
+later nonterminal runtime observation replace or overtake it. Age cleanup must
+take and release one lease lock and one lease transaction at a time, continue
+with unrelated leases on error, and delete only an expired contiguous FIFO
+prefix. Exact operation completions never expire because they may be the only
+evidence capable of clearing Fred's write-ahead placement attempt; exact
+maintenance completions likewise may be the only causal result for a replacement
+already committed on the substrate. Both are permanent FIFO barriers until
+delivered or explicitly repaired. Typed lifecycle observations may expire at
+`callback_max_age`. Pre-identity v0.13 rows never enter the current runtime
+queue: the stopped upgrade inspection requires that legacy bucket to be empty.
+
+The outbox alone is not enough for an asynchronous backend: persist an immutable
+per-lease **operation intent** in the same database before the first external
+side effect of provision or restore. It must contain everything needed to
+classify that exact request after restart—the opaque callback pair, backend
+storage identity, provider and tenant, complete items/health requirements,
+manifest, immutable CPU/memory/physical-disk authority (including any ephemeral
+scratch separately from retainable disk), and any restore source generation. An exact retry may reuse the
+existing operation row; a different request for that lease must conflict while
+the row is Pending. Once terminal state is proven, atomically transition that
+exact row to Succeeded or Failed and enqueue its operation callback in the same
+transaction. Callback delivery removes only the FIFO delivery: the terminal row
+remains as exact idempotency and crash-recovery authority until an authorized
+successor atomically supersedes or retires it. In particular, a
+restore handback must be driven by its exact Failed row; absence is invalid, not
+evidence of failure. Expose recovery as a closed typed sum: only Pending carries
+a settlement capability, while Succeeded and Failed are non-resolvable outcomes.
+Callers must exhaustively select from those states rather than infer one from
+nil/absence. Cancel the Pending row only when the actor explicitly
+rejects the work before mutation; timeout, cancellation, or a lost acceptance
+response is ambiguous and must retain it.
+
+Replacement commands need a separate typed **maintenance intent** rather than a
+generic lifecycle enqueue. Commit it before appending the target generation or
+mutating substrate; allocate one canonical UUIDv4 and persist it on the intent,
+exact target Release, and every target resource. Fence the exact active source
+and store-assigned target version plus immutable digests, preserving tenant,
+provider, and operation/lifecycle identity. Keep that identity and request
+snapshot immutable, but model progress explicitly: a cancel-only pre-append
+capability must become stale when a separately typed append-started capability
+commits, and exact target binding advances that same journal rather than
+manufacturing a new identity. Record the exact target terminal
+state before atomically replacing the intent with its non-coalescible maintenance
+completion. If one settlement emits an ordered operation result plus a
+maintenance-derived runtime result, classify both as exact barriers until each
+is precisely delivered; removing only the FIFO head must not admit a newer
+generation. A trusted request may move the callback base while preserving its
+typed identity; rollback keeps the old active route. Do not rerun an uncertain
+replacement after restart: classify only exact target journal and substrate
+evidence, and preserve the intent on partial, divergent, unreadable, or
+outcome-unknown state. If maintenance callbacks use a stable per-lease lifecycle
+route rather than carrying the maintenance generation on the wire, refuse the
+next replacement for that lease while any exact maintenance completion remains
+queued. Release admission only after synchronous successful delivery precisely
+removes that row. This lease-local fence trades availability for causal
+freshness without pausing unrelated leases.
+
+Destructive close needs a third typed finalizer committed before its first side
+effect. Freeze its lease/storage identity, cleanup topology, resource profiles,
+release fence, and immutable substrate IDs, but persist bounded retry/progress
+fields separately in the same claimed row. “Immutable” describes the cleanup
+authority, not a write-once record: progress may advance only through an exact
+digest-bearing claim. Remove the finalizer only in the transaction that durably
+enqueues its terminal observation, after the fenced release is retired.
+
+Startup recovery must inspect authoritative substrate evidence before cleanup.
+Decode and structurally validate the complete journal for the intent class being
+recovered before processing its rows, but classify and settle substrate outcomes
+under an exact per-resource fence; unrelated resources do not need one
+fleet-wide point-in-time snapshot. If a per-resource actor can still mutate the
+same substrate, recovery must acquire one exclusive typed capability that spans
+accepted/queued messages, handler execution, workers, terminal handoff, and
+actor replacement. Combining independent worker, inbox, or handler snapshots is
+not a quiescence proof; inability to acquire the capability defers that resource.
+Replacement intent
+recovery must run before ordinary projection can mistake a mixed source/target
+cohort for current state. Close authority must then exclude intentionally
+disappearing resources from ordinary cohort validation. Provision/restore intent
+settlement may depend on the resulting ordinary and retention projections, but
+must still finish before orphan or destructive cleanup. Resolve success only
+from an exact identity, callback, item, and terminal-state match; resolve failure
+only when authoritative evidence proves the operation left no surviving effect
+or supplies exact cleanup authority for every surviving candidate. An incomplete
+but identity-exact cohort can therefore converge through fenced cleanup; partial
+or mixed identity, topology, or unreadable evidence is neither failure nor
+permission to retry, so preserve the Pending row and fail that recovery boundary
+closed. Restore rollback additionally requires its exact source finalizer. A
+Pending claim carries the one-shot capability that records Failed before source
+handback; a later retry must observe that exact Failed outcome. Absence is
+invalid. A close that preempts an accepted
+provision/restore or maintenance command must first atomically turn its intent
+into an exact terminal failure row and callback so lifecycle teardown cannot
+suppress the earlier result. If an exact maintenance target already committed,
+settle success before close instead of rewriting it as preemption failure. Make
+operation, maintenance, and close rows mutually exclusive. Terminal operation
+history is not active mutation authority, so an authorized successor may retire
+it atomically with admission. Do not age operation rows or active intents out. Treat the callback
+database, its delivery queues, release evidence, and intent journals as one
+backup and rollback unit.
+
+Restore recovery needs one further distinction. A durable source claim without
+an exact destination commit marker remains rollback authority; never make its
+target restartable while that claim owns the namespace. An exact matching commit
+marker instead proves success even when zero resources survive. Settle a matching
+intent as success and recover conservative Failed target state plus its exact
+allocation. An exact Succeeded outcome plus that immutable source claim likewise
+reconstructs a missing commit marker; a Failed outcome beside a matching marker
+is contradictory authority and must fail closed. Keep the source claim as
+durable tenant/provider identity across restarts. Permit only repair work whose
+identity/topology remains represented by that claim, and consume it only after
+the repair reaches durable Ready ownership;
+the bundled Docker backend uses a plain Restart for this. Close must first persist
+a complete destructive intent, then hand off/delete the source claim, so repair
+or teardown operates on destination authority rather than resurrecting the
+source.
 
 ```go
 type BackendServer struct {
-    backend        *MyBackend
-    callbackURLs   map[string]string  // lease_uuid -> callback_url
-    callbackURLsMu sync.Mutex
+    backend               *MyBackend
+    callbackURLs          map[string]string // lease_uuid -> exact callback_url
+    lifecycleCallbackURLs map[string]string // lease_uuid -> observational URL
+    callbackURLsMu        sync.Mutex
 }
 ```
 
 ### State Recovery on Startup
 
-For production use, recover state from your actual resources:
+For production use, recover state from your actual resources. The example below
+is only the ordinary resource-projection phase. First classify any replacement
+intent whose source/target generations could otherwise look like one mixed
+cohort, one resource at a time under its exact fence. During projection, load
+close authority before ordinary cohort validation so intentionally disappearing
+resources are not treated as corruption. Then classify provision/restore intents
+against the reconstructed ordinary/retention authority before orphan or
+destructive cleanup:
 
 ```go
 func (b *DockerBackend) recoverState(ctx context.Context) error {
@@ -694,15 +1296,36 @@ func (b *DockerBackend) recoverState(ctx context.Context) error {
 
     // Rebuild in-memory state from container labels
     for _, c := range containers {
+        callbackURL := c.Labels["fred.callback_url"]
+        lifecycleCallbackURL := c.Labels["fred.lifecycle_callback_url"]
+        if lifecycleCallbackURL == "" {
+            // One-time migration for resources created by an older backend:
+            // replace only operation_id with lifecycle_id and preserve every
+            // unrelated raw query component. An operationless legacy URL stays
+            // tokenless.
+            lifecycleCallbackURL, err = backend.ResolveLifecycleCallbackURL(callbackURL, "")
+            if err != nil {
+                return fmt.Errorf("derive lifecycle callback URL: %w", err)
+            }
+        }
         b.provisions[c.Labels["fred.lease_uuid"]] = &provision{
-            LeaseUUID: c.Labels["fred.lease_uuid"],
-            Status:    "ready",
+            LeaseUUID:            c.Labels["fred.lease_uuid"],
+            Status:               "ready",
+            CallbackURL:          callbackURL,
+            LifecycleCallbackURL: lifecycleCallbackURL,
             // ...
         }
     }
     return nil
 }
 ```
+
+For an adopted v0.13 multi-instance cohort, validate this pair on every sibling
+before publishing recovered state. Preserve `CallbackURL` byte-for-byte. An
+explicit `LifecycleCallbackURL` must equal the exact derived route; when it is
+absent, derive only the `operation_id` → `lifecycle_id` field while retaining
+all unrelated raw query components and their order. Refuse inconsistent sibling
+routes rather than selecting whichever resource the substrate listed first.
 
 ## Reconciliation Support
 
@@ -714,21 +1337,30 @@ Fred periodically calls `GET /provisions` to detect:
 Your `ListProvisions` must return ALL resources you're managing, so Fred can reconcile correctly.
 
 **What a failed `GET /provisions` costs.** Returning a non-200 (or timing out) is
-not fatal to the provider: Fred marks your backend unanswered for that sweep and
-reconciles every other backend normally. But it is not free either — Fred cannot
-tell "this lease is gone" from "this backend did not tell me about it", so every
-lease it believes lives on your backend is **deferred**: not acknowledged, not
-re-provisioned, not deprovisioned, until you answer again. Fred will not move
-those leases elsewhere, and will not tear them down on the strength of a reply it
-did not get.
+not fatal to the provider: existing workloads keep serving, and Fred continues
+exact callbacks plus reconciliation actions backed by sufficient positive or
+terminal evidence. Before the first baseline for a new or changed topology, one
+failed provision or retention inventory blocks bootstrap. After that complete
+baseline has been persisted, a partial sweep does not revoke it: the reconciler
+may place genuinely new recordless `PENDING` work only on its typed set of nodes
+that answered **both** inventories. Recordless `ACTIVE` recovery and work tied
+to your backend, an attempt, or a conflict remain deferred. Fred neither moves
+them elsewhere nor clears evidence on the strength of a reply it did not get.
+
+That answering-node set is specifically a reconciler sweep witness. The tenant
+event path has no such witness: it requires the durable topology baseline,
+live-routes by backend stats within the configured topology, and writes the
+exact attempted backend durably before dispatch. An ambiguous result remains
+pinned regardless of a later empty inventory response.
 
 Two practical consequences:
 
 - **Prefer a slow complete answer to a fast partial one.** Fred treats a
   successful response as authoritative for your backend, so omitting a resource
-  you still hold is far worse than taking longer to list it — an omitted lease
-  looks unprovisioned and may be re-provisioned. If you cannot enumerate
-  everything, fail the request instead.
+  you still hold is far worse than taking longer to list it — a confirmed lease
+  may enter exact-owner recovery, while attempts/conflicts remain quarantined
+  rather than being cleared. If you cannot enumerate everything, fail the
+  request instead.
 - **Pagination is complete-or-error.** Fred walks `continue` tokens and discards
   the whole walk if any page fails, precisely so a mid-walk failure cannot look
   like a short list.
@@ -745,36 +1377,49 @@ import (
 )
 
 type Backend struct {
-    provisions   map[string]*provision
-    callbackURLs map[string]string
-    mu           sync.RWMutex
+    provisions               map[string]*provision
+    callbackURLs             map[string]string
+    lifecycleCallbackURLs    map[string]string
+    mu                       sync.RWMutex
 }
 
 func main() {
+    // Loaded from the backend's explicitly initialized, durable storage-lineage
+    // marker; never derive this value from a hostname, path, or inventory.
+    storageID := mustLoadStorageIdentity()
     b := &Backend{
-        provisions:   make(map[string]*provision),
-        callbackURLs: make(map[string]string),
+        provisions:            make(map[string]*provision),
+        callbackURLs:          make(map[string]string),
+        lifecycleCallbackURLs: make(map[string]string),
     }
 
     mux := http.NewServeMux()
 
-    // Contract routes — all wrapped in inbound HMAC verification.
+    // Contract routes — all wrapped in inbound HMAC verification. The response
+    // middleware also checks an optional backend_storage_id query on reads.
     auth := hmacAuthMiddleware(callbackSecret) // 401s missing/invalid X-Fred-Signature
-    mux.Handle("POST /provision", auth(http.HandlerFunc(b.handleProvision)))
-    mux.Handle("POST /deprovision", auth(http.HandlerFunc(b.handleDeprovision)))
+    bind := func(handler http.Handler) http.Handler {
+        return requireBoundStorageIdentityPath(storageID, auth(handler))
+    }
+    prefix := "/_fred/storage/{storage_id}"
+    mux.Handle("POST "+prefix+"/provision", bind(http.HandlerFunc(b.handleProvision)))
+    mux.Handle("POST "+prefix+"/deprovision", bind(http.HandlerFunc(b.handleDeprovision)))
     mux.Handle("GET /info/{lease_uuid}", auth(http.HandlerFunc(b.handleGetInfo)))
     mux.Handle("GET /logs/{lease_uuid}", auth(http.HandlerFunc(b.handleGetLogs)))
     mux.Handle("GET /provisions/{lease_uuid}", auth(http.HandlerFunc(b.handleGetProvision)))
     mux.Handle("GET /provisions", auth(http.HandlerFunc(b.handleListProvisions)))
-    mux.Handle("POST /restart", auth(http.HandlerFunc(b.handleRestart)))
-    mux.Handle("POST /update", auth(http.HandlerFunc(b.handleUpdate)))
-    mux.Handle("POST /reconcile_custom_domain", auth(http.HandlerFunc(b.handleReconcileCustomDomain)))
+    mux.Handle("POST "+prefix+"/restart", bind(http.HandlerFunc(b.handleRestart)))
+    mux.Handle("POST "+prefix+"/update", bind(http.HandlerFunc(b.handleUpdate)))
+    mux.Handle("POST "+prefix+"/restore", bind(http.HandlerFunc(b.handleRestore)))
+    mux.Handle("GET /retentions", auth(http.HandlerFunc(b.handleListRetentions)))
+    mux.Handle("POST "+prefix+"/reconcile_custom_domain", bind(http.HandlerFunc(b.handleReconcileCustomDomain)))
     mux.Handle("GET /releases/{lease_uuid}", auth(http.HandlerFunc(b.handleGetReleases)))
 
     // Operational routes — no auth (monitoring, health checks).
     mux.HandleFunc("GET /health", b.handleHealth)
 
-    http.ListenAndServe(":9001", mux)
+    identified := storageIdentityResponseMiddleware(storageID, mux)
+    http.ListenAndServe(":9001", identified)
 }
 
 func (b *Backend) handleProvision(w http.ResponseWriter, r *http.Request) {
@@ -782,8 +1427,9 @@ func (b *Backend) handleProvision(w http.ResponseWriter, r *http.Request) {
     json.NewDecoder(r.Body).Decode(&req)
 
     b.mu.Lock()
-    // Store callback URL
+    // Store operation completion and later lifecycle URLs separately.
     b.callbackURLs[req.LeaseUUID] = req.CallbackURL
+    b.lifecycleCallbackURLs[req.LeaseUUID] = req.LifecycleCallbackURL
     // Create provision record
     b.provisions[req.LeaseUUID] = &provision{
         LeaseUUID: req.LeaseUUID,
@@ -803,11 +1449,21 @@ func (b *Backend) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 **For a full-contract reference, read the Docker backend at `internal/backend/docker` (with `cmd/docker-backend`).** It implements all 12 contract routes plus `/health`, verifies inbound HMAC signatures, supports TLS/mTLS, and exercises the complete lifecycle (provision, info, logs, restart, update, restore, retentions, releases, custom-domain reconciliation, deprovision, reconciliation).
 
-`cmd/mock-backend/main.go` is a **minimal, callback-only example**: it implements 6 of the 12 contract routes (provision, info, deprovision, provisions, provisions/{lease_uuid}, logs) plus `/health` — it lacks restart, update, restore, retentions, reconcile_custom_domain, and releases — **does NOT verify inbound authentication**, and ignores the SKU. It is useful for seeing the in-memory state pattern and callback-sending mechanics, but is **not** a complete contract reference — do not model a production backend on it. Key sections:
+`cmd/mock-backend/main.go` is a **minimal, in-memory development backend**: it
+implements only the development routes documented in its source and ignores the
+SKU. It verifies the shared HMAC envelope on every contract route while leaving
+`GET /health` and `GET /stats` public. It also implements the storage-lineage
+wire contract: a persisted `MOCK_BACKEND_STORAGE_ID`, identity response headers
+and queries, upgraded identity-bound mutation paths, and HMAC-covered callback
+identity. It defaults to the loopback-only `127.0.0.1:9000`; explicitly binding
+another interface exposes it to that network. Its resources and callback queue
+remain process-local, so it is **not** a complete contract reference and must
+not be used as a production backend. Key sections:
 
 | Function | Description |
 |----------|-------------|
 | `MockBackendServer` struct | Server setup with callback URL tracking |
+| `authenticate` | Inbound method/URI/body-bound HMAC verification and body cap |
 | `handleProvision` | Provision handler with async goroutine |
 | `handleGetInfo` | GetInfo handler |
 | `handleDeprovision` | Deprovision handler (idempotent) |
@@ -816,20 +1472,39 @@ func (b *Backend) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 ## Configuration
 
-The production backends (docker-backend, k3s-backend) are configured via a YAML file (the Docker backend reads `docker-backend.yaml`; see `internal/backend/docker/config.go`); the mock backend is the exception — it is configured via `MOCK_BACKEND_*` environment variables, not YAML. A backend needs at minimum a listen address, an HMAC `callback_secret` that matches Fred's `callback_secret`, and a name/host for logging and connection info:
+The bundled Docker backend and experimental k3s scaffold are configured via a
+YAML file (the Docker backend reads `docker-backend.yaml`; see
+`internal/backend/docker/config.go`); the mock backend is the exception — it is
+configured via `MOCK_BACKEND_*` environment variables, not YAML.
+`MOCK_BACKEND_CALLBACK_SECRET` authenticates inbound provider requests and signs
+outbound callbacks; it must match the mock backend entry's `hmac_secret` in
+providerd. A backend needs at minimum a listen address, an HMAC
+`callback_secret` that matches the same backend entry's `hmac_secret` in
+providerd, and a name/host for logging and connection info:
 
 ```yaml
 listen_addr: ":9001"             # Listen address
-callback_secret: "32-char-min"   # HMAC secret (must match Fred's config)
+callback_secret: "0123456789abcdef0123456789abcdef" # Must match providerd backends[name=my-backend].hmac_secret; gitleaks:allow (example only)
+callback_max_age: 24h            # Retention for lifecycle observations
 name: "my-backend"               # For logging/metrics
 host_address: "192.168.1.100"    # For connection info
 ```
+
+The bundled Docker backend and experimental k3s scaffold configurations reject
+a zero or negative `callback_max_age`. The setting bounds typed lifecycle
+observations; `24h` is the bundled default. Exact operation and
+maintenance completions never expire because discarding one can strand Fred's
+durable causal state, and strict per-lease FIFO does not allow a suffix to
+overtake that exact head. Size
+the lifecycle/legacy window above expected provider outages, alert on unhealthy
+or persistently non-empty outboxes, and repair an undeliverable exact head rather
+than deleting `callbacks.db`.
 
 The Docker backend takes a `--config` flag (path to the YAML file, default `docker-backend.yaml`) and a `--version` flag that prints the build-injected version and exits 0 without loading config or connecting to Docker.
 
 ### TLS / mTLS on the providerd → backend transport (ENG-103)
 
-TLS on the providerd → backend HTTP transport is **optional**; the transport defaults to **plaintext** when unconfigured. When enabled, TLS 1.3 is pinned as the minimum version. TLS is configured on both sides:
+TLS on both backend HTTP hops is optional only for development. `providerd` production mode requires every backend URL and `callback_base_url` to use HTTPS and verifies backend peers against the configured private CA or system roots; bundled-backend production mode forbids disabling callback peer verification. Enable both: request HMAC does not authenticate the backend's response identity, inventory, or refusal verdict, and callback HMAC does not provide token confidentiality. A self-signed private CA remains a verified trust anchor; it need not be publicly issued. Fred's native providerd-to-backend client and bundled-backend listener pin TLS 1.3 as the minimum version. The reverse callback client uses Go's verified default HTTPS transport, and its server-side protocol floor belongs to the reverse proxy or other callback TLS terminator. TLS for the direct backend hop is configured on both sides:
 
 **Server side** (the backend's YAML, e.g. `docker-backend.yaml`):
 
@@ -859,7 +1534,14 @@ The client config is built via `tlsconfig.ClientConfig`. Client-identity pinning
 
 ## Testing Your Backend
 
-**Note:** `/health` is unauthenticated, so the health check below works as-is. The contract endpoints (`/provision`, `/provisions`, `/info`, `/deprovision`, ...) require a valid `X-Fred-Signature` header (see Inbound Authentication) and will return `401` to the plain `curl` commands below. To exercise them against an auth-enforcing backend, sign the request with the canonical string (or temporarily run the backend with auth disabled in a dev-only build).
+**Note:** `/health` is unauthenticated, so the health check below works as-is.
+The contract endpoints require a valid `X-Fred-Signature` header (see Inbound
+Authentication) and return `401` to the plain `curl` commands below. Mutating
+examples deliberately use the current storage-identity-bound paths; substitute
+the canonical UUID from the backend's initialization output. To exercise them
+against an auth-enforcing backend, sign the exact method, RequestURI (including
+the storage UUID and query), timestamp, and body, or temporarily run the backend
+with authentication disabled in a dev-only build.
 
 ### 1. Health Check
 ```bash
@@ -868,30 +1550,32 @@ curl http://localhost:9001/health
 
 ### 2. Provision
 ```bash
-curl -X POST http://localhost:9001/provision \
+storage_id=550e8400-e29b-41d4-a716-446655440000
+curl -X POST "http://localhost:9001/_fred/storage/${storage_id}/provision" \
   -H "Content-Type: application/json" \
   -d '{
     "lease_uuid": "test-lease-1",
     "tenant": "manifest1test",
     "provider_uuid": "test-provider",
     "items": [{"sku": "docker-nginx", "quantity": 1}],
-    "callback_url": "http://localhost:8080/callbacks/provision"
+    "callback_url": "http://localhost:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+    "lifecycle_callback_url": "http://localhost:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
   }'
 ```
 
 ### 3. Check Provisions
 ```bash
-curl http://localhost:9001/provisions
+curl "http://localhost:9001/provisions?backend_storage_id=${storage_id}"
 ```
 
 ### 4. Get Info
 ```bash
-curl http://localhost:9001/info/test-lease-1
+curl "http://localhost:9001/info/test-lease-1?backend_storage_id=${storage_id}"
 ```
 
 ### 5. Deprovision
 ```bash
-curl -X POST http://localhost:9001/deprovision \
+curl -X POST "http://localhost:9001/_fred/storage/${storage_id}/deprovision" \
   -H "Content-Type: application/json" \
   -d '{"lease_uuid": "test-lease-1"}'
 ```
@@ -900,20 +1584,52 @@ curl -X POST http://localhost:9001/deprovision \
 
 Before deploying your backend:
 
-- [ ] All 12 contract HTTP endpoints implemented (`/provision`, `/deprovision`, `/info/{lease_uuid}`, `/logs/{lease_uuid}`, `/provisions/{lease_uuid}`, `/provisions`, `/restart`, `/update`, `/restore`, `/retentions`, `/reconcile_custom_domain`, `/releases/{lease_uuid}`) plus `/health`
+- [ ] All 12 logical contract operations implemented: current mutation routes
+      `/_fred/storage/{storage-id}/{provision|deprovision|restart|update|restore|reconcile_custom_domain}`;
+      read routes `/info/{lease_uuid}`, `/logs/{lease_uuid}`,
+      `/provisions/{lease_uuid}`, `/provisions`, `/retentions`, and
+      `/releases/{lease_uuid}`; plus `/health`. Unbound mutation paths, if kept
+      for v0.13 upgrade compatibility, are isolated and never selected by a
+      current provider
 - [ ] **Inbound `X-Fred-Signature` verified on all contract endpoints** (401 on missing/invalid; only `/health`, `/stats`, `/metrics` are exempt)
 - [ ] Provision returns 202 and works asynchronously
-- [ ] Callbacks signed with HMAC-SHA256 with timestamp
+- [ ] New provision/restore admission requires a canonical UUIDv4 operation
+      callback identity and its matching resolved lifecycle pair before any
+      operation journal write or substrate mutation; legacy callback recovery
+      cannot bypass this requirement
+- [ ] Exact `callback_url` and typed `lifecycle_callback_url` stored separately per lease; provision/restore completion uses the exact URL, exact maintenance completion uses the lifecycle route without becoming coalescible, and autonomous observations use only the lifecycle URL
+- [ ] Provision/restore resource intent freezes all physical admission inputs,
+      including substrate scratch separately from retainable disk
+- [ ] Restart/update/custom-domain mutation is preceded by an exact typed
+      maintenance intent whose UUIDv4 also labels the target release/resources;
+      recovery never reruns an ambiguous replacement
+- [ ] Restore source claim fences Provision/Restore on its target; repair waits
+      for exact commit and intent settlement, topology-changing maintenance stays
+      fenced until claim consumption, and terminal settlement precedes pre-commit
+      source handback
+- [ ] Exact destination restore commit evidence wins over Failed/absent volatile
+      state; zero-survivor recovery preserves source identity and target
+      accounting until an identity-preserving repair or close handoff
+- [ ] Complete selected callback URL (including unrelated query fields) preserved byte-for-byte and signed with HMAC-SHA256 with timestamp
 - [ ] Deprovision is idempotent
 - [ ] ListProvisions returns all managed resources
 - [ ] `/reconcile_custom_domain` is idempotent and returns 204 on no-change (never 404 just because custom domains are unsupported — that pollutes Fred's reconciler every tick)
 - [ ] State protected with mutex for concurrent access
-- [ ] Callback URLs stored per-lease (not globally)
 - [ ] Health endpoint returns 200 when operational
 - [ ] Graceful shutdown (finish in-flight provisions)
 - [ ] (Optional) `/stats` endpoint for resource monitoring
 
-**Note:** `/restart`, `/update`, `/reconcile_custom_domain`, and `/releases/{lease_uuid}` are all part of the contract, not optional add-ons. `/reconcile_custom_domain` is called on **every reconcile tick** for each active lease (`internal/provisioner/reconciler.go`), so it must be cheap and idempotent — a backend with no work should return success, not 404 (e.g. the k3s scaffold returns `nil` from `ReconcileCustomDomain`). `/restart`, `/update`, and `/releases/{lease_uuid}` are invoked **on demand** when a tenant calls the corresponding API operation (`RestartLease`/`UpdateLease`/`GetLeaseReleases` in `internal/api/handlers.go`); they must still be implemented, but returning 404 when a lease isn't provisioned is correct for these.
+**Note:** `restart`, `update`, `reconcile_custom_domain`, and
+`/releases/{lease_uuid}` are all part of the contract, not optional add-ons.
+`reconcile_custom_domain` is called through its storage-bound mutation route on
+**every reconcile tick** for each active lease
+(`internal/provisioner/reconciler.go`), so it must be cheap and idempotent — a
+backend with no work should return success, not 404 (e.g. the k3s scaffold
+returns `nil` from `ReconcileCustomDomain`). `restart`, `update`, and
+`/releases/{lease_uuid}` are invoked **on demand** when a tenant calls the
+corresponding API operation (`RestartLease`/`UpdateLease`/`GetLeaseReleases` in
+`internal/api/handlers.go`); they must still be implemented, but returning 404
+when a lease isn't provisioned is correct for these.
 
 ## Further reading
 

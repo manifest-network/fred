@@ -60,6 +60,13 @@ func (m *mockAckChainClient) GetPendingLeases(ctx context.Context, providerUUID 
 	return leases, nil
 }
 
+func (*mockAckChainClient) GetActiveLeasesByProvider(
+	context.Context,
+	string,
+) ([]billingtypes.Lease, error) {
+	return nil, nil
+}
+
 func (m *mockAckChainClient) RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 	return 0, nil, nil
 }

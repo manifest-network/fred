@@ -27,7 +27,10 @@
 //   - URLs must be absolute http/https URLs
 //   - Durations must be positive
 //   - Backend names must be unique
-//   - Callback secret must be at least 32 characters
+//   - HMAC authentication is either complete per-backend configuration or the
+//     non-production fleet-wide compatibility key; partial/mixed modes fail
+//   - Every configured HMAC secret is at least 32 characters, and per-backend
+//     keys are pairwise unique
 //   - TLS cert and key must both be specified or neither
 //   - gas_adjustment must be in [1.0, 3.0]; max_gas_limit, if set, must be ≥ gas_limit
 //
@@ -40,6 +43,10 @@
 //   - token_tracker_db_path must be configured (replay protection cannot be
 //     silently disabled)
 //   - grpc_tls_skip_verify must be false when grpc_tls_enabled is true
+//   - callback_base_url must use HTTPS; backend URLs must use HTTPS with
+//     certificate verification
+//   - every backend has a distinct hmac_secret; the top-level callback_secret
+//     compatibility mode is rejected
 //   - callback_base_url and backend URLs are run through an SSRF check that
 //     rejects IP literals for loopback, link-local, and unspecified addresses
 //     as well as the hostname "localhost"
@@ -67,6 +74,7 @@
 //	backends:
 //	  - name: docker-1
 //	    url: "http://docker-backend:9000"
+//	    hmac_secret: "unique-key-matching-this-backend-callback-secret"
 //	    timeout: 30s
 //	    skus:
 //	      - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"

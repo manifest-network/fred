@@ -13,10 +13,9 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
-// The ENG-680 pins: a degraded retention store must reach every stage of the sweep, and
-// must be visible in a metric rather than only in one log line per tick.
+// The ENG-680 pins: a degraded retention store must reach every stage of the sweep.
 
-// TestRunRetentionSweep_StoreError_ReachesEveryStage is the headline.
+// TestRunRetentionSweep_ClosedStore_ReachesEveryStage is the headline.
 //
 // runRetentionSweep used to bare-return on the first store error. List, ListExpired,
 // ListReaping and ListRestoring are all one filter() over one bucket, so they fail on
@@ -26,12 +25,15 @@ import (
 // retention_reap_skips_total's own doc pointed at it as "the ticketing signal" for the
 // orphan pruner.
 //
-// The assertion that matters is that orphan_skips{store_error} MOVES. The rest pins that
-// the sweep reports the failure once, as a whole.
-func TestRunRetentionSweep_StoreError_ReachesEveryStage(t *testing.T) {
+// A deliberately closed store invalidates the construction-bound orphan pruner
+// before it can classify a store read, so it must not mint a store_error skip
+// observation. The joined sweep error remains the honest signal that every stage
+// was attempted and unavailable.
+func TestRunRetentionSweep_ClosedStore_ReachesEveryStage(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	b.cfg.RetentionMaxAge = time.Hour
 	b.cfg.RetainOnClose = true
+	b.cfg.RetentionOrphanConfirmations = 1
 	b.cfg.VolumeDataPath = t.TempDir() // a configured, readable root: the orphan pass gets past G2
 	b.volumes = &mockVolumeManager{
 		ListFn: func() ([]string, error) { return nil, nil },
@@ -40,6 +42,7 @@ func TestRunRetentionSweep_StoreError_ReachesEveryStage(t *testing.T) {
 			return nil
 		},
 	}
+	bindRetentionOrphanPrunerForTest(t, b)
 	require.NoError(t, rs.Close()) // every enumeration now fails
 
 	orphanBefore := testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipStoreError))
@@ -49,10 +52,9 @@ func TestRunRetentionSweep_StoreError_ReachesEveryStage(t *testing.T) {
 	err := b.runRetentionSweep(context.Background())
 
 	require.Error(t, err)
-	assert.Equal(t, orphanBefore+1,
+	assert.Equal(t, orphanBefore,
 		testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipStoreError)),
-		"ENG-680: the orphan pass must be REACHED under a broken store — this counter was "+
-			"unreachable under exactly the condition it exists to report")
+		"an invalidated pruner has no authority to classify a store read")
 	assert.Equal(t, errBefore+1, testutil.ToFloat64(retentionSweepTotal.WithLabelValues(sweepOutcomeError)),
 		"one increment per pass, whatever the outcome")
 	assert.Equal(t, acctBefore+1, testutil.ToFloat64(retentionAccountingRefreshFailedTotal),
@@ -73,8 +75,9 @@ func TestRunRetentionSweep_HealthyPass_CountsSuccess(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	b.cfg.RetentionMaxAge = time.Hour
 	b.volumes = &mockVolumeManager{ListFn: func() ([]string, error) { return nil, nil }}
+	bindRetentionOrphanPrunerForTest(t, b)
 
-	require.NoError(t, rs.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
 		OriginalLeaseUUID: "u1", Tenant: "t1",
 		Status: shared.RetentionStatusActive, CreatedAt: time.Now(),
 	}))
@@ -113,9 +116,12 @@ func TestRefreshRetentionAccounting_StoreError_KeepsLastValueAndCounts(t *testin
 	b, rs := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)
 
-	require.NoError(t, rs.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
 		OriginalLeaseUUID: "u1", Tenant: "t1",
-		Items:  []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+		Items: []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+		ResourceProfiles: []shared.SKUResourceSnapshot{{
+			SKU: "docker-micro", CPUCores: 1, MemoryMB: 256, DiskMB: 1024,
+		}},
 		Status: shared.RetentionStatusActive, CreatedAt: time.Now(),
 	}))
 	b.refreshRetentionAccounting()

@@ -3,13 +3,10 @@ package provisioner
 import (
 	"context"
 	"errors"
-	"fmt"
-	"log/slog"
-
-	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 // ProvisionOpts contains optional parameters for provisioning.
@@ -18,294 +15,104 @@ type ProvisionOpts struct {
 	PayloadHash string // Optional hex-encoded SHA-256 hash of payload
 }
 
-// ProvisionOrchestrator coordinates the provisioning flow.
-// It routes to the appropriate backend, tracks the provision in-flight,
-// and initiates the async provisioning call.
+func capacityVerdictLabel(refusal backend.ProvisionRefusal) string {
+	if refusal == backend.ProvisionRefusalCapacity {
+		return metrics.CapacityVerdictCodedRefusal
+	}
+	return metrics.CapacityVerdictAmbiguous
+}
+
+// ProvisionOrchestrator is a narrow adapter around the construction-bound
+// placement application. Routing, write-ahead admission, backend invocation,
+// and settlement remain inside ProvisionCoordinator and cannot be sequenced
+// independently by handlers.
 type ProvisionOrchestrator struct {
-	providerUUID    string
-	callbackBaseURL string
-	router          BackendRouter
-	tracker         InFlightTracker
-	placementStore  PlacementStore
+	coordinator *placement.ProvisionCoordinator
+	marker      *provisionOrchestratorMarker
 }
 
-// NewProvisionOrchestrator creates a new ProvisionOrchestrator.
-func NewProvisionOrchestrator(providerUUID, callbackBaseURL string, router BackendRouter, tracker InFlightTracker, placementStore PlacementStore) *ProvisionOrchestrator {
-	return &ProvisionOrchestrator{
-		providerUUID:    providerUUID,
-		callbackBaseURL: callbackBaseURL,
-		router:          router,
-		tracker:         tracker,
-		placementStore:  placementStore,
-	}
+type provisionOrchestratorMarker struct{ _ byte }
+
+// HandlerEventCoordinator is the single construction-bound capability used by
+// lease and payload handlers. It keeps process-local exclusion and the exact
+// provision/deprovision implementation inseparable.
+type HandlerEventCoordinator struct {
+	orchestrator *ProvisionOrchestrator
+	issuer       *provisionOrchestratorMarker
 }
 
-// StartProvisioning handles the common provisioning flow for both lease creation
-// and payload-triggered provisioning. It routes to the appropriate backend,
-// tracks the provision in-flight, and initiates the async provisioning call.
-//
-// Returns nil if provisioning was started successfully or the lease is already in-flight.
-// Returns an error if routing fails or the backend call fails.
-func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *billingtypes.Lease, opts ProvisionOpts) error {
-	// Extract lease items and primary SKU for routing
-	items := ExtractLeaseItems(lease)
-	sku := ExtractRoutingSKU(lease)
-	totalQuantity := TotalLeaseQuantity(lease)
-
-	// Route to appropriate backend, honoring existing placement for restored/placed leases (ENG-333)
-	backendClient, err := routeForProvisionHonoringPlacement(ctx, o.router, o.placementStore, lease.Uuid, sku, o.tracker.InFlightCountsByBackend())
-	if err != nil {
-		// A placement naming an unknown backend is refused, never re-routed
-		// (ENG-635). Logged at ERROR because it needs operator action — the
-		// recorded backend is missing from config — and because the alternative
-		// (silently provisioning elsewhere) destroys tenant data.
-		slog.Error("refusing to provision: lease is placed on a backend the router does not know",
-			"lease_uuid", lease.Uuid,
-			"sku", sku,
-			"error", err,
-		)
-		return err
-	}
-	if backendClient == nil {
-		slog.Error("no backend available for provisioning",
-			"lease_uuid", lease.Uuid,
-			"sku", sku,
-		)
-		return fmt.Errorf("%w: lease %s", ErrNoBackendAvailable, lease.Uuid)
-	}
-
-	// Atomically track in-flight BEFORE calling Provision to prevent:
-	// 1. Race with reconciler (TOCTOU between IsInFlight check and TrackInFlight)
-	// 2. Race with fast backend response (callback arriving before tracking)
-	if !o.tracker.TryTrackInFlight(lease.Uuid, lease.Tenant, items, backendClient.Name()) {
-		slog.Debug("lease already in-flight, skipping",
-			"lease_uuid", lease.Uuid,
-		)
+func (o *ProvisionOrchestrator) HandlerEvents() *HandlerEventCoordinator {
+	if o == nil || o.coordinator == nil || !o.coordinator.Valid() || o.marker == nil {
 		return nil
 	}
-
-	// Build provision request
-	req := backend.ProvisionRequest{
-		LeaseUUID:    lease.Uuid,
-		Tenant:       lease.Tenant,
-		ProviderUUID: o.providerUUID,
-		Items:        items,
-		CallbackURL:  BuildCallbackURL(o.callbackBaseURL),
-		Payload:      opts.Payload,
-	}
-	// Only include PayloadHash when we have the actual payload
-	if opts.Payload != nil && opts.PayloadHash != "" {
-		req.PayloadHash = opts.PayloadHash
-	}
-
-	// Start provisioning (async - backend will call back)
-	if err := backendClient.Provision(ctx, req); err != nil {
-		if errors.Is(err, backend.ErrInsufficientResources) {
-			metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendClient.Name()).Inc()
-		}
-		// Clean up in-flight tracking on failure
-		o.tracker.UntrackInFlight(lease.Uuid)
-
-		slog.Error("failed to start provisioning",
-			"lease_uuid", lease.Uuid,
-			"sku", sku,
-			"total_quantity", totalQuantity,
-			"backend", backendClient.Name(),
-			"error", err,
-		)
-		return fmt.Errorf("%w: %w", ErrProvisioningFailed, err)
-	}
-
-	// Record placement so read operations can find this lease's backend
-	if o.placementStore != nil {
-		if err := o.placementStore.Set(lease.Uuid, backendClient.Name()); err != nil {
-			slog.Warn("failed to record placement",
-				"lease_uuid", lease.Uuid,
-				"backend", backendClient.Name(),
-				"error", err,
-			)
-		}
-	}
-
-	// Log success with appropriate detail level
-	if opts.Payload != nil {
-		slog.Info("provisioning started with payload",
-			"lease_uuid", lease.Uuid,
-			"tenant", lease.Tenant,
-			"sku", sku,
-			"total_quantity", totalQuantity,
-			"backend", backendClient.Name(),
-			"payload_size", len(opts.Payload),
-		)
-	} else {
-		slog.Info("provisioning started",
-			"lease_uuid", lease.Uuid,
-			"tenant", lease.Tenant,
-			"sku", sku,
-			"total_quantity", totalQuantity,
-			"backend", backendClient.Name(),
-		)
-	}
-
-	return nil
+	return &HandlerEventCoordinator{orchestrator: o, issuer: o.marker}
 }
 
-// routeForProvisionHonoringPlacement returns the backend that already holds the
-// lease's data (from placement) when one is recorded, keeping a restored or
-// already-placed lease pinned to the backend with its volumes (ENG-333).
-//
-// A lease with NO placement record routes freely by least-loaded selection —
-// unchanged behavior, and the path every new lease takes.
-//
-// A lease WHOSE RECORD DOES NOT RESOLVE returns ErrPlacementUnresolvable rather
-// than routing somewhere else (ENG-635). fred never substitutes a backend: the
-// recorded machine holds the lease's data, so provisioning on a peer creates a
-// brand-new empty volume while the real data sits untouched on the machine that
-// is merely absent from the router — which is what happens when a backend is
-// removed, renamed or paused. That failure fires on a timer, for every affected
-// lease at once, and reports success to its caller. Refusing is the safe
-// direction: the lease stops making progress until an operator restores the
-// backend, and nothing is destroyed meanwhile.
-func routeForProvisionHonoringPlacement(
+func (events *HandlerEventCoordinator) Valid() bool {
+	return events != nil && events.orchestrator != nil && events.issuer != nil &&
+		events.orchestrator.marker == events.issuer &&
+		events.orchestrator.coordinator != nil && events.orchestrator.coordinator.Valid()
+}
+
+func (events *HandlerEventCoordinator) startFromCurrentLease(
 	ctx context.Context,
-	router BackendRouter,
-	placementStore PlacementStore,
-	leaseUUID, sku string,
-	inFlightByBackend map[string]int,
-) (backend.Backend, error) {
-	if placementStore != nil {
-		if name := placementStore.Get(leaseUUID); name != "" {
-			b := router.GetBackendByName(name)
-			if b == nil {
-				return nil, fmt.Errorf("%w: lease %s is placed on %q",
-					ErrPlacementUnresolvable, leaseUUID, name)
-			}
-			return b, nil
-		}
+	request placement.ProvisionEventRequest,
+) placement.ProvisionEventResult {
+	if !events.Valid() {
+		return placement.ProvisionEventResult{}
 	}
-	return router.RouteForProvision(ctx, sku, inFlightByBackend), nil
+	return events.orchestrator.coordinator.ExecuteCurrentLease(ctx, request)
 }
 
-// DeletePlacement removes the placement record for a lease. Called when a
-// lease reaches a terminal state (e.g., rejected after a failure callback)
-// without going through the full Deprovision flow.
-func (o *ProvisionOrchestrator) DeletePlacement(leaseUUID string) {
-	if o.placementStore != nil {
-		o.placementStore.Delete(leaseUUID)
+func (events *HandlerEventCoordinator) Deprovision(ctx context.Context, leaseUUID string) error {
+	if !events.Valid() {
+		return errors.New("handler event coordinator is invalid")
 	}
-}
-
-// RecordRestorePlacement optimistically records the NEW lease's placement after
-// a successful restore (the new lease now lives on the backend that held the
-// source's retained data). No-op when no placement store is configured (nil
-// interface). It deliberately does NOT delete the source placement: restore is
-// asynchronous (202 + adopt), so deleting source state before the adopt confirms
-// is a saga anti-pattern, and source-placement
-// cleanup is owned solely by the reconciler (which prunes it once the retention
-// disappears from /retentions). This just closes the post-restore reconcile
-// window for the new lease (ENG-333).
-func (o *ProvisionOrchestrator) RecordRestorePlacement(newLeaseUUID, backendName string) {
-	if o.placementStore == nil {
-		return
-	}
-	if err := o.placementStore.Set(newLeaseUUID, backendName); err != nil {
-		slog.Warn("failed to record restore placement",
-			"lease_uuid", newLeaseUUID, "backend", backendName, "error", err)
-	}
-}
-
-// Deprovision tears down a lease's backend resources. The backend is resolved
-// POSITIVELY — from the placement record, then the in-flight tracker. It never
-// guesses a default backend from the SKU: in a multi-backend pool a SKU is not
-// pinned to one backend, so a guessed deprovision is a phantom no-op that
-// reports success while stranding the real volume on another backend (ENG-335).
-// When the backend cannot be positively resolved, all backends are swept;
-// deprovision is idempotent, so the real holder is torn down and the rest are
-// harmless no-ops.
-//
-// Returns nil on success or if the lease was not provisioned anywhere.
-// Returns an error only if every attempted deprovision failed.
-func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID string) error {
-	provision, wasInFlight := o.tracker.PopInFlight(leaseUUID)
-
-	var backendClient backend.Backend
-
-	// Case 0: placement store (most reliable for completed provisions).
-	if o.placementStore != nil {
-		if placedBackend := o.placementStore.Get(leaseUUID); placedBackend != "" {
-			backendClient = o.router.GetBackendByName(placedBackend)
-			if backendClient != nil {
-				slog.Debug("routing deprovision by placement",
-					"lease_uuid", leaseUUID, "backend", placedBackend)
-			} else {
-				slog.Warn("placement backend not found, will sweep all backends",
-					"lease_uuid", leaseUUID, "backend_name", placedBackend)
-			}
-		}
-	}
-
-	// Case 1: in-flight tracked backend.
-	if backendClient == nil && wasInFlight && provision.Backend != "" {
-		backendClient = o.router.GetBackendByName(provision.Backend)
-		if backendClient == nil {
-			slog.Warn("in-flight backend not found, will sweep all backends",
-				"lease_uuid", leaseUUID, "backend_name", provision.Backend)
-		}
-	}
-
-	if backendClient != nil {
-		if err := backendClient.Deprovision(ctx, leaseUUID); err != nil {
-			slog.Error("failed to deprovision",
-				"lease_uuid", leaseUUID, "backend", backendClient.Name(), "error", err)
-			return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, err)
-		}
-		// Placement is intentionally NOT deleted here (ENG-333). It is a derived
-		// index of where the lease's data lives; if the backend retained the
-		// volumes, the placement must survive close so a restore can route to it.
-		// The reconciler is the sole pruner (cleanupOrphanedPlacements).
-		slog.Info("deprovisioned successfully",
-			"lease_uuid", leaseUUID, "backend", backendClient.Name())
+	err := events.orchestrator.coordinator.Deprovision(ctx, leaseUUID)
+	if err == nil {
 		return nil
 	}
+	result := errors.Join(ErrDeprovisionFailed, err)
+	if errors.Is(err, placement.ErrDeprovisionAuthorityUnresolvable) {
+		result = errors.Join(result, ErrPlacementUnresolvable)
+	}
+	return result
+}
 
-	// Fallback: backend could not be positively resolved → sweep all backends.
-	// Idempotent, so the holder is torn down and the rest no-op. We deliberately
-	// do NOT emit a per-backend "deprovisioned successfully" here — that
-	// phantom-success line (against a backend that never held the lease) is what
-	// made ENG-335 hard to diagnose. One summary line names the outcome instead.
-	backends := o.router.Backends()
-	var lastErr error
-	swept := make([]string, 0, len(backends))
-	failed := make([]string, 0)
-	for _, b := range backends {
-		if err := b.Deprovision(ctx, leaseUUID); err != nil {
-			lastErr = err
-			failed = append(failed, b.Name())
-		} else {
-			swept = append(swept, b.Name())
-		}
+// ErrPlacementStoreUnavailable means a placement-dependent write path was
+// invoked without durable placement storage. Such paths must fail closed before
+// contacting a backend.
+var ErrPlacementStoreUnavailable = errors.New("placement store is unavailable")
+
+// NewProvisionOrchestrator creates a capability-safe ProvisionOrchestrator.
+// The supplied coordinator already binds durable placement, lifecycle
+// exclusion, chain authorization, callback issuance, and one backend runtime.
+func NewProvisionOrchestrator(
+	coordinator *placement.ProvisionCoordinator,
+) (*ProvisionOrchestrator, error) {
+	if coordinator == nil || !coordinator.Valid() {
+		return nil, errors.New("joined provision dispatch authority is required")
 	}
-	// Log level depends on whether an unresolved placement is expected. With the
-	// placement store disabled, the sweep is the normal resolution path for any
-	// not-in-flight close, so it is not anomalous — reserve WARN for actual
-	// backend failures and for the ENG-335 case where placement IS enabled but
-	// could not resolve the backend.
-	logArgs := []any{
-		"lease_uuid", leaseUUID,
-		"swept_ok_or_noop", swept,
-		"failed", failed,
+	return &ProvisionOrchestrator{
+		coordinator: coordinator,
+		marker:      &provisionOrchestratorMarker{},
+	}, nil
+}
+
+// Deprovision executes the construction-bound teardown transaction. Backend
+// candidates, exact claims, retry memory, physical calls, and settlement all
+// remain inside placement.ProvisionCoordinator.
+func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID string) error {
+	if o == nil || o.coordinator == nil || !o.coordinator.Valid() {
+		return ErrDeprovisionFailed
 	}
-	switch {
-	case len(failed) > 0:
-		slog.Warn("deprovision swept all backends with failures", logArgs...)
-	case o.placementStore == nil:
-		slog.Info("deprovision swept all backends (placement store disabled)", logArgs...)
-	default:
-		slog.Warn("deprovision swept all backends (placement unresolved, ENG-335)", logArgs...)
+	err := o.coordinator.Deprovision(ctx, leaseUUID)
+	if err == nil {
+		return nil
 	}
-	// Placement is intentionally NOT deleted here (ENG-333); see resolved path.
-	if len(swept) == 0 && lastErr != nil {
-		return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, lastErr)
+	result := errors.Join(ErrDeprovisionFailed, err)
+	if errors.Is(err, placement.ErrDeprovisionAuthorityUnresolvable) {
+		result = errors.Join(result, ErrPlacementUnresolvable)
 	}
-	return nil
+	return result
 }

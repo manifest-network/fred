@@ -33,29 +33,37 @@ import (
 	"github.com/docker/go-connections/nat"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/maintenanceid"
 )
 
 // Labels used for tracking managed containers.
 const (
-	LabelManaged       = "fred.managed"
-	LabelLeaseUUID     = "fred.lease_uuid"
-	LabelTenant        = "fred.tenant"
-	LabelProviderUUID  = "fred.provider_uuid"
-	LabelSKU           = "fred.sku"
-	LabelCreatedAt     = "fred.created_at"
-	LabelInstanceIndex = "fred.instance_index"
-	LabelFailCount     = "fred.fail_count"
-	LabelCallbackURL   = "fred.callback_url"
-	LabelBackendName   = "fred.backend_name"
-	LabelServiceName   = "fred.service_name"
-	LabelFQDN          = "fred.fqdn"
-	LabelCustomDomain  = "fred.custom_domain"
+	LabelManaged              = "fred.managed"
+	LabelLeaseUUID            = "fred.lease_uuid"
+	LabelTenant               = "fred.tenant"
+	LabelProviderUUID         = "fred.provider_uuid"
+	LabelSKU                  = "fred.sku"
+	LabelCreatedAt            = "fred.created_at"
+	LabelInstanceIndex        = "fred.instance_index"
+	LabelFailCount            = "fred.fail_count"
+	LabelCallbackURL          = "fred.callback_url"
+	LabelLifecycleCallbackURL = "fred.lifecycle_callback_url"
+	LabelMaintenanceID        = "fred.maintenance_id"
+	LabelBackendName          = "fred.backend_name"
+	LabelServiceName          = "fred.service_name"
+	LabelFQDN                 = "fred.fqdn"
+	LabelCustomDomain         = "fred.custom_domain"
+	LabelImageReference       = imageexec.LabelImageReference
+	LabelImageID              = imageexec.LabelImageID
 )
 
 // DaemonSecurityInfo contains Docker daemon capabilities relevant to
 // container hardening validation.
 type DaemonSecurityInfo struct {
+	SystemID          string
 	StorageDriver     string
 	BackingFilesystem string
 	SecurityOptions   []string
@@ -65,24 +73,28 @@ type DaemonSecurityInfo struct {
 
 // ContainerInfo holds information about a managed container.
 type ContainerInfo struct {
-	ContainerID   string
-	LeaseUUID     string
-	Tenant        string
-	ProviderUUID  string
-	SKU           string
-	ServiceName   string // Stack service name (empty for single-container leases)
-	InstanceIndex int
-	FailCount     int
-	CallbackURL   string
-	Image         string
-	Status        string
-	Health        HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
-	ExitCode      int          // Process exit code (meaningful when Status is "exited"/"dead")
-	OOMKilled     bool         // True if container was killed by the OOM killer
-	CreatedAt     time.Time
-	Ports         map[string]PortBinding
-	FQDN          string
-	CustomDomain  string // Tenant-supplied custom FQDN (empty when not set)
+	execution            *compensationContainerRecord
+	ContainerID          string
+	LeaseUUID            string
+	Tenant               string
+	ProviderUUID         string
+	BackendName          string
+	SKU                  string
+	ServiceName          string // Stack service name (empty for single-container leases)
+	InstanceIndex        int
+	FailCount            int
+	CallbackURL          string
+	LifecycleCallbackURL string
+	MaintenanceID        shared.MaintenanceID
+	Image                string
+	Status               string
+	Health               HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
+	ExitCode             int          // Process exit code (meaningful when Status is "exited"/"dead")
+	OOMKilled            bool         // True if container was killed by the OOM killer
+	CreatedAt            time.Time
+	Ports                map[string]PortBinding
+	FQDN                 string
+	CustomDomain         string // Tenant-supplied custom FQDN (empty when not set)
 
 	// Name is the human-readable container name (without the leading "/"
 	// the Docker API prepends). Populated by both InspectContainer and
@@ -107,9 +119,10 @@ type ContainerInfo struct {
 // surface it as a free-form string and copying that semantics here keeps
 // callers from caring about which API shape they're consuming.
 type ContainerMount struct {
-	Source string
-	Target string
-	Type   string // "bind" | "volume" | "tmpfs"
+	Source   string
+	Target   string
+	Type     string // "bind" | "volume" | "tmpfs"
+	ReadOnly bool
 }
 
 // PortBinding represents a port mapping.
@@ -120,14 +133,19 @@ type PortBinding struct {
 
 // DockerClient wraps the Docker client for container lifecycle operations.
 type DockerClient struct {
-	client      *client.Client
+	client      dockerSDKView
+	images      *imageexec.Admitter
+	creator     *imageexec.DockerCreator
+	inspections *imageInspectionCoordinator
 	backendName string
 }
 
-// NewDockerClient creates a new Docker client. The backendName parameter scopes
+// NewDockerClient connects to Docker and requires the image execution API
+// prerequisite before returning an executable client. The context is used only
+// during construction. The backendName parameter scopes
 // all list/filter/event operations so that multiple backend instances sharing
 // the same Docker daemon do not interfere with each other.
-func NewDockerClient(host string, backendName string) (*DockerClient, error) {
+func NewDockerClient(ctx context.Context, host string, backendName string) (*DockerClient, error) {
 	opts := []client.Opt{
 		client.WithAPIVersionNegotiation(),
 	}
@@ -141,7 +159,12 @@ func NewDockerClient(host string, backendName string) (*DockerClient, error) {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}
 
-	return &DockerClient{client: cli, backendName: backendName}, nil
+	images, creator, err := imageexec.NewDockerRuntime(ctx, cli)
+	if err != nil {
+		_ = cli.Close()
+		return nil, err
+	}
+	return &DockerClient{client: newDockerSDKView(cli), images: images, creator: creator, backendName: backendName}, nil
 }
 
 // Close closes the Docker client.
@@ -171,6 +194,7 @@ func (d *DockerClient) DaemonInfo(ctx context.Context) (DaemonSecurityInfo, erro
 	}
 
 	return DaemonSecurityInfo{
+		SystemID:          info.ID,
 		StorageDriver:     info.Driver,
 		BackingFilesystem: backingFS,
 		SecurityOptions:   info.SecurityOptions,
@@ -179,34 +203,10 @@ func (d *DockerClient) DaemonInfo(ctx context.Context) (DaemonSecurityInfo, erro
 	}, nil
 }
 
-// ImageInfo holds metadata from a container image inspection.
-type ImageInfo struct {
-	// ID is the content-addressable image ID (e.g., "sha256:...").
-	// Immutable for a given image build, suitable as a cache key.
-	ID string
-	// Volumes are the VOLUME declarations from the Dockerfile.
-	Volumes map[string]struct{}
-	// User is the USER directive from the Dockerfile (may be name, uid, uid:gid, or name:group).
-	User string
-}
-
-// InspectImage inspects a pulled image and returns its metadata.
-func (d *DockerClient) InspectImage(ctx context.Context, imageName string) (*ImageInfo, error) {
-	inspect, _, err := d.client.ImageInspectWithRaw(ctx, imageName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect image %s: %w", imageName, err)
-	}
-	volumes := make(map[string]struct{})
-	if inspect.Config != nil {
-		for v := range inspect.Config.Volumes {
-			volumes[v] = struct{}{}
-		}
-	}
-	info := &ImageInfo{ID: inspect.ID, Volumes: volumes}
-	if inspect.Config != nil {
-		info.User = inspect.Config.User
-	}
-	return info, nil
+// AdmitImage is image preparation: it validates image metadata and resolves an
+// independently executable immutable image before any helper can be created.
+func (d *DockerClient) AdmitImage(ctx context.Context, reference string) (imageexec.Image, error) {
+	return d.images.Admit(ctx, reference)
 }
 
 // ResolveImageUser resolves a container user specification to numeric UID/GID.
@@ -218,16 +218,10 @@ func (d *DockerClient) InspectImage(ctx context.Context, imageName string) (*Ima
 // Numeric UID/GID values are parsed directly. Non-numeric usernames are
 // resolved by reading /etc/passwd (and optionally /etc/group) from a
 // temporary container created from the image.
-func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName string, userOverride string) (uid, gid int, err error) {
+func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName imageexec.Image, userOverride string, origin shared.ImageInspectionOrigin) (uid, gid int, err error) {
 	userStr := userOverride
 	if userStr == "" {
-		inspect, _, inspectErr := d.client.ImageInspectWithRaw(ctx, imageName)
-		if inspectErr != nil {
-			return 0, 0, fmt.Errorf("failed to inspect image %s: %w", imageName, inspectErr)
-		}
-		if inspect.Config != nil {
-			userStr = inspect.Config.User
-		}
+		userStr = imageName.User()
 	}
 	if userStr == "" {
 		return 0, 0, nil
@@ -247,7 +241,7 @@ func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName string, u
 			return numUID, numGID, nil
 		}
 		// Group is a name — need to read /etc/group from the image.
-		gidResolved, err := d.resolveGroupFromImage(ctx, imageName, group)
+		gidResolved, err := d.resolveGroupFromImage(ctx, imageName, group, origin)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -255,7 +249,7 @@ func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName string, u
 	}
 
 	// Username is non-numeric — read /etc/passwd from the image.
-	passwdUID, passwdGID, err := d.resolveUserFromImage(ctx, imageName, user)
+	passwdUID, passwdGID, err := d.resolveUserFromImage(ctx, imageName, user, origin)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -269,7 +263,7 @@ func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName string, u
 	if gidErr == nil {
 		return passwdUID, numGID, nil
 	}
-	gidResolved, err := d.resolveGroupFromImage(ctx, imageName, group)
+	gidResolved, err := d.resolveGroupFromImage(ctx, imageName, group, origin)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -278,44 +272,33 @@ func (d *DockerClient) ResolveImageUser(ctx context.Context, imageName string, u
 
 // resolveUserFromImage reads /etc/passwd from a temporary container to resolve
 // a username to UID/GID.
-func (d *DockerClient) resolveUserFromImage(ctx context.Context, imageName, username string) (uid, gid int, err error) {
-	data, err := d.readFileFromImage(ctx, imageName, "/etc/passwd")
+func (d *DockerClient) resolveUserFromImage(ctx context.Context, imageName imageexec.Image, username string, origin shared.ImageInspectionOrigin) (uid, gid int, err error) {
+	data, err := d.readFileFromImage(ctx, imageName, "/etc/passwd", origin)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to read /etc/passwd from image %s: %w", imageName, err)
+		return 0, 0, fmt.Errorf("failed to read /etc/passwd from image %s: %w", imageName.Reference(), err)
 	}
 	return parsePasswdForUser(strings.NewReader(string(data)), username)
 }
 
 // resolveGroupFromImage reads /etc/group from a temporary container to resolve
 // a group name to GID.
-func (d *DockerClient) resolveGroupFromImage(ctx context.Context, imageName, groupName string) (int, error) {
-	data, err := d.readFileFromImage(ctx, imageName, "/etc/group")
+func (d *DockerClient) resolveGroupFromImage(ctx context.Context, imageName imageexec.Image, groupName string, origin shared.ImageInspectionOrigin) (int, error) {
+	data, err := d.readFileFromImage(ctx, imageName, "/etc/group", origin)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read /etc/group from image %s: %w", imageName, err)
+		return 0, fmt.Errorf("failed to read /etc/group from image %s: %w", imageName.Reference(), err)
 	}
 	return parseGroupForName(strings.NewReader(string(data)), groupName)
 }
 
-// readFileFromImage creates a temporary container (never started), extracts a
-// file via CopyFromContainer, and removes the container.
-func (d *DockerClient) readFileFromImage(ctx context.Context, imageName, path string) ([]byte, error) {
-	resp, err := d.client.ContainerCreate(ctx, &container.Config{
-		Image: imageName,
-	}, nil, nil, nil, "")
+// readFileFromImage creates an owned, never-started inspection session. Its
+// cleanup budget is independent of this work context and survives via the journal.
+func (d *DockerClient) readFileFromImage(ctx context.Context, imageName imageexec.Image, path string, origin shared.ImageInspectionOrigin) (data []byte, err error) {
+	session, err := d.openImageInspection(ctx, imageName, origin)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temp container: %w", err)
+		return nil, fmt.Errorf("open image inspection: %w", err)
 	}
-	defer func() {
-		// Use a fresh timeout, not the caller ctx: if the caller's ctx is
-		// canceled/timed-out by the time this runs, the removal would no-op and
-		// leak the temp container + its anonymous volume — the exact failure this
-		// reap targets. Matches the other image-introspection helpers (ENG-372).
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true})
-	}()
-
-	return readFileFromContainer(ctx, d.client, resp.ID, path)
+	defer func() { err = errors.Join(err, session.close()) }()
+	return session.readFile(ctx, path)
 }
 
 // DetectVolumeOwner inspects the ownership of VOLUME directories inside an
@@ -323,26 +306,20 @@ func (d *DockerClient) readFileFromImage(ctx context.Context, imageName, path st
 // headers from CopyFromContainer. If all volume paths share the same non-root
 // UID:GID, those values are returned. If the paths have mixed ownership, are
 // owned by root, or a path doesn't exist, (0, 0, nil) is returned.
-func (d *DockerClient) DetectVolumeOwner(ctx context.Context, imageName string, volumePaths []string) (uid, gid int, err error) {
+func (d *DockerClient) DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string, origin shared.ImageInspectionOrigin) (uid, gid int, err error) {
 	if len(volumePaths) == 0 {
 		return 0, 0, nil
 	}
 
-	resp, err := d.client.ContainerCreate(ctx, &container.Config{
-		Image: imageName,
-	}, nil, nil, nil, "")
+	session, err := d.openImageInspection(ctx, imageName, origin)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to create temp container for volume owner detection: %w", err)
 	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true}) // reap image VOLUME anon volumes (ENG-372)
-	}()
+	defer func() { err = errors.Join(err, session.close()) }()
 
 	firstUID, firstGID := -1, -1
 	for _, volPath := range volumePaths {
-		rc, _, copyErr := d.client.CopyFromContainer(ctx, resp.ID, volPath)
+		rc, _, copyErr := session.copy(ctx, volPath)
 		if copyErr != nil {
 			if errdefs.IsNotFound(copyErr) {
 				// Path genuinely doesn't exist in image.
@@ -395,30 +372,23 @@ const maxTarEntriesPerParent = 500
 // depth-1 subdirectories owned by uid. When uid is 0 (root image), it matches
 // directories owned by any non-root user — this handles images like neo4j that
 // run as root but chown directories to a service user during build.
-func (d *DockerClient) DetectWritablePaths(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+func (d *DockerClient) DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string, origin shared.ImageInspectionOrigin) (paths []string, err error) {
 	if len(candidateParents) == 0 {
 		return nil, nil
 	}
 
-	resp, err := d.client.ContainerCreate(ctx, &container.Config{
-		Image: imageName,
-	}, nil, nil, nil, "")
+	session, err := d.openImageInspection(ctx, imageName, origin)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp container for writable path detection: %w", err)
 	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true}) // reap image VOLUME anon volumes (ENG-372)
-	}()
+	defer func() { err = errors.Join(err, session.close()) }()
 
-	var paths []string
 	for _, parent := range candidateParents {
 		if len(paths) >= maxDetectedWritablePaths {
 			break
 		}
 
-		rc, _, copyErr := d.client.CopyFromContainer(ctx, resp.ID, parent)
+		rc, _, copyErr := session.copy(ctx, parent)
 		if copyErr != nil {
 			if !errdefs.IsNotFound(copyErr) {
 				// Non-"not found" errors (daemon unreachable, context canceled, etc.)
@@ -477,6 +447,13 @@ func (d *DockerClient) DetectWritablePaths(ctx context.Context, imageName string
 // MkdirAll outside destDir (os.Root refuses to traverse a symlinked component that
 // escapes the root). See ENG-543.
 func writablePathExtractDir(destDir, sanitized string) (string, error) {
+	return writablePathExtractDirContext(context.Background(), destDir, sanitized)
+}
+
+func writablePathExtractDirContext(ctx context.Context, destDir, sanitized string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(destDir, 0o700); err != nil {
 		return "", err
 	}
@@ -503,15 +480,13 @@ func writablePathExtractDir(destDir, sanitized string) (string, error) {
 //
 // Returns nil on full success, or a map of path → error for failures.
 // Callers should log failures but not fail the provision (graceful degradation).
-func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error {
+func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64, origin shared.ImageInspectionOrigin) (failures map[string]error) {
 	if len(paths) == 0 {
 		return nil
 	}
 
 	// Create a temp container from the image to read original content.
-	resp, err := d.client.ContainerCreate(ctx, &container.Config{
-		Image: imageName,
-	}, nil, nil, nil, "")
+	session, err := d.openImageInspection(ctx, imageName, origin)
 	if err != nil {
 		// All paths fail with the same error.
 		failures := make(map[string]error, len(paths))
@@ -521,15 +496,19 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 		return failures
 	}
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true}) // reap image VOLUME anon volumes (ENG-372)
+		if cleanupErr := session.close(); cleanupErr != nil {
+			if failures == nil {
+				failures = make(map[string]error)
+			}
+			for _, path := range paths {
+				failures[path] = errors.Join(failures[path], cleanupErr)
+			}
+		}
 	}()
 
-	var failures map[string]error
 	remainingBytes := maxBytes
 	for _, path := range paths {
-		rc, _, copyErr := d.client.CopyFromContainer(ctx, resp.ID, path)
+		rc, _, copyErr := session.copy(ctx, path)
 		if copyErr != nil {
 			if errdefs.IsNotFound(copyErr) {
 				continue // Path doesn't exist in image — skip
@@ -545,7 +524,7 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 		// "neo4j/conf/neo4j.conf". Extract to destDir/var/lib/ so content
 		// ends up at destDir/var/lib/neo4j/conf/neo4j.conf.
 		sanitized := sanitizeVolumePath(path)
-		extractDir, mkErr := writablePathExtractDir(destDir, sanitized)
+		extractDir, mkErr := writablePathExtractDirContext(ctx, destDir, sanitized)
 		if mkErr != nil {
 			_ = rc.Close()
 			if failures == nil {
@@ -560,7 +539,7 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 		// volume-wide inode gate is the caller's XFS ihard quota. On a filesystem without
 		// an inode quota (btrfs/zfs) this backstop therefore bounds entries at
 		// maxDetectedWritablePaths x maxEntries, not maxEntries alone. See ENG-548.
-		written, skippedSymlinks, extractErr := sanitizeAndExtractTar(rc, extractDir, remainingBytes, maxEntries)
+		written, skippedSymlinks, extractErr := sanitizeAndExtractTarContext(ctx, rc, extractDir, remainingBytes, maxEntries)
 		_ = rc.Close()
 		if extractErr != nil {
 			if failures == nil {
@@ -601,6 +580,13 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 // descriptions of such out-of-scope symlinks (e.g., "name -> target") for
 // caller-side debug logging. See ENG-430.
 func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes, maxEntries int64) (int64, []string, error) {
+	return sanitizeAndExtractTarContext(context.Background(), src, destDir, maxBytes, maxEntries)
+}
+
+func sanitizeAndExtractTarContext(ctx context.Context, src io.Reader, destDir string, maxBytes, maxEntries int64) (int64, []string, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, nil, err
+	}
 	// destDir must already exist — the caller (ExtractImageContent) creates it
 	// before calling. os.OpenRoot opens it as a confinement root for every
 	// extraction op below; it returns a clear error if destDir is missing.
@@ -616,6 +602,9 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes, maxEntries i
 	var outOfScope []string
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return totalBytes, outOfScope, err
+		}
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
@@ -686,7 +675,7 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes, maxEntries i
 			if fErr != nil {
 				return totalBytes, outOfScope, fmt.Errorf("create %s: %w", name, fErr)
 			}
-			n, copyErr := io.Copy(f, tr)
+			n, copyErr := io.Copy(f, contextReader{ctx: ctx, reader: tr})
 			closeErr := f.Close()
 			if copyErr != nil {
 				return totalBytes, outOfScope, fmt.Errorf("write %s: %w", name, copyErr)
@@ -729,6 +718,18 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes, maxEntries i
 	return totalBytes, outOfScope, nil
 }
 
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
 // symlinkTargetEscapes reports whether a symlink at name (relative to the
 // extraction root) pointing at linkname resolves outside the root — an absolute
 // target, or a relative target with enough ".." to climb above the root. Such
@@ -744,7 +745,7 @@ func symlinkTargetEscapes(name, linkname string) bool {
 
 // readFileFromContainer extracts a single file from a container using
 // CopyFromContainer and returns its contents.
-func readFileFromContainer(ctx context.Context, cli *client.Client, containerID, path string) ([]byte, error) {
+func readFileFromContainer(ctx context.Context, cli containerFileReader, containerID, path string) ([]byte, error) {
 	rc, _, err := cli.CopyFromContainer(ctx, containerID, path)
 	if err != nil {
 		return nil, fmt.Errorf("CopyFromContainer %s: %w", path, err)
@@ -850,6 +851,10 @@ func (d *DockerClient) PullImage(ctx context.Context, imageName string, timeout 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	return d.pullImage(ctx, imageName)
+}
+
+func (d *DockerClient) pullImage(ctx context.Context, imageName string) error {
 	reader, err := d.client.ImagePull(ctx, imageName, image.PullOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to pull image: %w", err)
@@ -899,6 +904,7 @@ type jsonPullError struct {
 
 // CreateContainerParams holds parameters for creating a container.
 type CreateContainerParams struct {
+	Image         imageexec.Image // admitted content required by the physical creation sink
 	LeaseUUID     string
 	Tenant        string
 	ProviderUUID  string
@@ -914,6 +920,16 @@ type CreateContainerParams struct {
 	// CallbackURL is persisted as a label so failure callbacks can be
 	// sent after a docker-backend restart (when in-memory state is lost).
 	CallbackURL string
+
+	// LifecycleCallbackURL is the typed observational endpoint used only
+	// after provisioning/restoration, for autonomous failure and teardown
+	// events. It is persisted separately so restart recovery cannot resurrect
+	// an expired operation capability as the lifecycle route.
+	LifecycleCallbackURL string
+
+	// MaintenanceID is empty for provision/restore and identifies the exact
+	// restart/update generation for replacement containers.
+	MaintenanceID shared.MaintenanceID
 
 	// Hardening parameters
 	HostBindIP     string
@@ -1003,22 +1019,24 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 	defer cancel()
 	// Build labels
 	labels := map[string]string{
-		LabelManaged:       "true",
-		LabelLeaseUUID:     params.LeaseUUID,
-		LabelTenant:        params.Tenant,
-		LabelProviderUUID:  params.ProviderUUID,
-		LabelSKU:           params.SKU,
-		LabelCreatedAt:     time.Now().Format(time.RFC3339),
-		LabelInstanceIndex: strconv.Itoa(params.InstanceIndex),
-		LabelFailCount:     strconv.Itoa(params.FailCount),
-		LabelCallbackURL:   params.CallbackURL,
-		LabelBackendName:   params.BackendName,
+		LabelManaged:              "true",
+		LabelLeaseUUID:            params.LeaseUUID,
+		LabelTenant:               params.Tenant,
+		LabelProviderUUID:         params.ProviderUUID,
+		LabelSKU:                  params.SKU,
+		LabelCreatedAt:            time.Now().Format(time.RFC3339),
+		LabelInstanceIndex:        strconv.Itoa(params.InstanceIndex),
+		LabelFailCount:            strconv.Itoa(params.FailCount),
+		LabelCallbackURL:          params.CallbackURL,
+		LabelLifecycleCallbackURL: params.LifecycleCallbackURL,
+		LabelMaintenanceID:        params.MaintenanceID.String(),
+		LabelBackendName:          params.BackendName,
 	}
 	if params.ServiceName != "" {
 		labels[LabelServiceName] = params.ServiceName
 	}
 
-	// Add user labels (already validated to not conflict with fred.*)
+	// Add user labels (already validated against the reserved namespace policy)
 	for k, v := range params.Manifest.Labels {
 		labels[k] = v
 	}
@@ -1192,7 +1210,7 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 	ephemeral := hasEphemeralPorts(params.Manifest.Ports)
 	var lastErr error
 	for attempt := range portBindRetries {
-		resp, err := d.client.ContainerCreate(ctx, config, hostConfig, networkConfig, nil, containerName)
+		resp, err := d.creator.Create(ctx, params.Image, config, hostConfig, networkConfig, containerName)
 		if err == nil {
 			return resp.ID, nil
 		}
@@ -1207,7 +1225,7 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 			if inspectErr != nil {
 				return "", fmt.Errorf("create container failed (name %q in use); inspect to check ownership: %w", containerName, inspectErr)
 			}
-			id, adoptErr := validateAdoption(existing, params, containerName)
+			id, adoptErr := validateAdoption(existing, params, containerName, params.Image.ID())
 			if adoptErr != nil {
 				return "", adoptErr
 			}
@@ -1429,9 +1447,13 @@ func isNameInUse(err error) bool {
 // (e.g. a payload mutated between attempts, or the container is already
 // on its way out), so adopting would either silently run stale
 // configuration or hand back an ID that's about to vanish.
-func validateAdoption(existing container.InspectResponse, params CreateContainerParams, containerName string) (string, error) {
-	if existing.Config == nil {
+func validateAdoption(existing container.InspectResponse, params CreateContainerParams, containerName, imageID string) (string, error) {
+	if existing.Config == nil || existing.ContainerJSONBase == nil {
 		return "", fmt.Errorf("create container failed: name %q in use and inspect returned no config", containerName)
+	}
+	reference, err := containerImageReference(existing.Config.Image, existing.Image, existing.Config.Labels)
+	if err != nil {
+		return "", fmt.Errorf("create container failed: name %q: %w", containerName, err)
 	}
 	existingFailCount := existing.Config.Labels[LabelFailCount]
 	wantFailCount := strconv.Itoa(params.FailCount)
@@ -1442,8 +1464,10 @@ func validateAdoption(existing container.InspectResponse, params CreateContainer
 		return "", fmt.Errorf("create container failed: name %q in use by container from backend %q, want %q", containerName, existing.Config.Labels[LabelBackendName], params.BackendName)
 	case existing.Config.Labels[LabelLeaseUUID] != params.LeaseUUID:
 		return "", fmt.Errorf("create container failed: name %q in use by container not owned by lease %s", containerName, params.LeaseUUID)
-	case existing.Config.Image != params.Manifest.Image:
-		return "", fmt.Errorf("create container failed: name %q in use by container with image %q, want %q", containerName, existing.Config.Image, params.Manifest.Image)
+	case reference != params.Manifest.Image:
+		return "", fmt.Errorf("create container failed: name %q in use by container with image %q, want %q", containerName, reference, params.Manifest.Image)
+	case existing.Image != imageID:
+		return "", fmt.Errorf("create container failed: name %q in use by container with image ID %q, want %q", containerName, existing.Image, imageID)
 	case existingFailCount != wantFailCount:
 		return "", fmt.Errorf("create container failed: name %q in use by container at fail_count=%s, want %s", containerName, existingFailCount, wantFailCount)
 	}
@@ -1581,6 +1605,11 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		return nil, fmt.Errorf("failed to inspect container: %w", err)
 	}
 
+	imageReference, err := containerImageReference(resp.Config.Image, resp.Image, resp.Config.Labels)
+	if err != nil {
+		return nil, fmt.Errorf("container %s: %w", resp.ID, err)
+	}
+
 	meta, err := parseLabelMeta(resp.Config.Labels)
 	if err != nil {
 		return nil, fmt.Errorf("container %s: %w", resp.ID, err)
@@ -1590,38 +1619,48 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 	if resp.State.Health != nil {
 		health = HealthStatus(resp.State.Health.Status)
 	}
+	maintenanceID, err := parseContainerMaintenanceID(resp.Config.Labels[LabelMaintenanceID])
+	if err != nil {
+		return nil, fmt.Errorf("container %s: %w", resp.ID, err)
+	}
 
 	info := &ContainerInfo{
-		ContainerID:   resp.ID,
-		LeaseUUID:     resp.Config.Labels[LabelLeaseUUID],
-		Tenant:        resp.Config.Labels[LabelTenant],
-		ProviderUUID:  resp.Config.Labels[LabelProviderUUID],
-		SKU:           resp.Config.Labels[LabelSKU],
-		ServiceName:   resp.Config.Labels[LabelServiceName],
-		CallbackURL:   resp.Config.Labels[LabelCallbackURL],
-		Image:         resp.Config.Image,
-		Status:        resp.State.Status,
-		Health:        health,
-		ExitCode:      resp.State.ExitCode,
-		OOMKilled:     resp.State.OOMKilled,
-		InstanceIndex: meta.InstanceIndex,
-		FailCount:     meta.FailCount,
-		CreatedAt:     meta.CreatedAt,
-		Ports:         make(map[string]PortBinding),
-		FQDN:          resp.Config.Labels[LabelFQDN],
-		CustomDomain:  resp.Config.Labels[LabelCustomDomain],
-		Name:          strings.TrimPrefix(resp.Name, "/"),
+		ContainerID:          resp.ID,
+		LeaseUUID:            resp.Config.Labels[LabelLeaseUUID],
+		Tenant:               resp.Config.Labels[LabelTenant],
+		ProviderUUID:         resp.Config.Labels[LabelProviderUUID],
+		BackendName:          resp.Config.Labels[LabelBackendName],
+		SKU:                  resp.Config.Labels[LabelSKU],
+		ServiceName:          resp.Config.Labels[LabelServiceName],
+		CallbackURL:          resp.Config.Labels[LabelCallbackURL],
+		LifecycleCallbackURL: resp.Config.Labels[LabelLifecycleCallbackURL],
+		MaintenanceID:        maintenanceID,
+		Image:                imageReference,
+		Status:               resp.State.Status,
+		Health:               health,
+		ExitCode:             resp.State.ExitCode,
+		OOMKilled:            resp.State.OOMKilled,
+		InstanceIndex:        meta.InstanceIndex,
+		FailCount:            meta.FailCount,
+		CreatedAt:            meta.CreatedAt,
+		Ports:                make(map[string]PortBinding),
+		FQDN:                 resp.Config.Labels[LabelFQDN],
+		CustomDomain:         resp.Config.Labels[LabelCustomDomain],
+		Name:                 strings.TrimPrefix(resp.Name, "/"),
 	}
 
 	// Extract mounts (used by recover-time migration to locate managed
 	// volumes that need renaming).
 	for _, m := range resp.Mounts {
 		info.Mounts = append(info.Mounts, ContainerMount{
-			Source: m.Source,
-			Target: m.Destination,
-			Type:   string(m.Type),
+			Source:   m.Source,
+			Target:   m.Destination,
+			Type:     string(m.Type),
+			ReadOnly: !m.RW,
 		})
 	}
+
+	info.execution = snapshotCompensationContainer(resp, info.Mounts)
 
 	// Extract port bindings
 	for port, bindings := range resp.NetworkSettings.Ports {
@@ -1639,10 +1678,30 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 // ListManagedContainers returns all containers managed by Fred.
 // When backendName is set, only containers belonging to this backend are returned.
 func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerInfo, error) {
+	return d.listManagedContainers(ctx, false)
+}
+
+// ListManagedContainersStrict is the identity-initialization variant. It
+// refuses a managed container with malformed Fred labels rather than silently
+// dropping it from the storage-lineage proof.
+func (d *DockerClient) ListManagedContainersStrict(ctx context.Context) ([]ContainerInfo, error) {
+	return d.listManagedContainers(ctx, true)
+}
+
+func (d *DockerClient) listManagedContainers(
+	ctx context.Context,
+	strict bool,
+) ([]ContainerInfo, error) {
 	f := filters.NewArgs(
 		filters.Arg("label", LabelManaged+"=true"),
 	)
-	if d.backendName != "" {
+	// Ordinary recovery may scope the daemon-side query to this configured
+	// backend. Identity initialization must not: it is proving exclusive
+	// ownership of the physical daemon/root lineage, so every Fred-managed
+	// container must be observed and then classified locally. Filtering here
+	// would let an absent, malformed, or foreign backend_name label disappear
+	// from a supposedly empty/new substrate proof.
+	if d.backendName != "" && !strict {
 		f.Add("label", LabelBackendName+"="+d.backendName)
 	}
 	containers, err := d.client.ContainerList(ctx, container.ListOptions{
@@ -1655,11 +1714,35 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 
 	var result []ContainerInfo
 	for _, c := range containers {
+		imageReference, err := containerImageReference(c.Image, c.ImageID, c.Labels)
+		if err != nil {
+			return nil, fmt.Errorf("managed container %s: %w", c.ID, err)
+		}
+		if strict {
+			if err := validateStrictManagedContainerLabels(c.ID, d.backendName, c.Labels); err != nil {
+				return nil, err
+			}
+		}
 		meta, err := parseLabelMeta(c.Labels)
 		if err != nil {
+			if strict {
+				return nil, fmt.Errorf("managed container %s has malformed Fred labels: %w", c.ID, err)
+			}
 			// Skip containers with malformed Fred labels — these can't be
 			// reliably tracked for resource accounting.
 			slog.Warn("skipping managed container with malformed labels",
+				"container_id", c.ID[:12],
+				"lease_uuid", c.Labels[LabelLeaseUUID],
+				"error", err,
+			)
+			continue
+		}
+		maintenanceID, err := parseContainerMaintenanceID(c.Labels[LabelMaintenanceID])
+		if err != nil {
+			if strict {
+				return nil, fmt.Errorf("managed container %s has malformed Fred labels: %w", c.ID, err)
+			}
+			slog.Warn("skipping managed container with malformed maintenance identity",
 				"container_id", c.ID[:12],
 				"lease_uuid", c.Labels[LabelLeaseUUID],
 				"error", err,
@@ -1673,31 +1756,35 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 		}
 
 		info := ContainerInfo{
-			ContainerID:   c.ID,
-			LeaseUUID:     c.Labels[LabelLeaseUUID],
-			Tenant:        c.Labels[LabelTenant],
-			ProviderUUID:  c.Labels[LabelProviderUUID],
-			SKU:           c.Labels[LabelSKU],
-			ServiceName:   c.Labels[LabelServiceName],
-			CallbackURL:   c.Labels[LabelCallbackURL],
-			Image:         c.Image,
-			Status:        c.State,
-			InstanceIndex: meta.InstanceIndex,
-			FailCount:     meta.FailCount,
-			CreatedAt:     meta.CreatedAt,
-			Ports:         make(map[string]PortBinding),
-			FQDN:          c.Labels[LabelFQDN],
-			CustomDomain:  c.Labels[LabelCustomDomain],
-			Name:          name,
+			ContainerID:          c.ID,
+			LeaseUUID:            c.Labels[LabelLeaseUUID],
+			Tenant:               c.Labels[LabelTenant],
+			ProviderUUID:         c.Labels[LabelProviderUUID],
+			BackendName:          c.Labels[LabelBackendName],
+			SKU:                  c.Labels[LabelSKU],
+			ServiceName:          c.Labels[LabelServiceName],
+			CallbackURL:          c.Labels[LabelCallbackURL],
+			LifecycleCallbackURL: c.Labels[LabelLifecycleCallbackURL],
+			MaintenanceID:        maintenanceID,
+			Image:                imageReference,
+			Status:               c.State,
+			InstanceIndex:        meta.InstanceIndex,
+			FailCount:            meta.FailCount,
+			CreatedAt:            meta.CreatedAt,
+			Ports:                make(map[string]PortBinding),
+			FQDN:                 c.Labels[LabelFQDN],
+			CustomDomain:         c.Labels[LabelCustomDomain],
+			Name:                 name,
 		}
 
 		// Extract mounts from the list-containers payload (the API includes
 		// MountPoint inline, no extra Inspect round-trip needed at startup).
 		for _, m := range c.Mounts {
 			info.Mounts = append(info.Mounts, ContainerMount{
-				Source: m.Source,
-				Target: m.Destination,
-				Type:   string(m.Type),
+				Source:   m.Source,
+				Target:   m.Destination,
+				Type:     string(m.Type),
+				ReadOnly: !m.RW,
 			})
 		}
 
@@ -1714,6 +1801,72 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 	}
 
 	return result, nil
+}
+
+func validateStrictManagedContainerLabels(containerID, backendName string, labels map[string]string) error {
+	if backendName == "" {
+		return errors.New("strict managed-container inventory requires a configured backend name")
+	}
+	if labels[LabelManaged] != "true" {
+		return fmt.Errorf("managed container %s is missing the exact managed label", containerID)
+	}
+	if got := labels[LabelBackendName]; got != backendName {
+		return fmt.Errorf(
+			"managed container %s belongs to backend %q, expected exact backend %q",
+			containerID, got, backendName,
+		)
+	}
+	if leaseUUID := labels[LabelLeaseUUID]; !backend.IsCanonicalLeaseUUID(leaseUUID) {
+		return fmt.Errorf("managed container %s has invalid lease identity %q", containerID, leaseUUID)
+	}
+	if labels[LabelServiceName] == "" {
+		return fmt.Errorf(
+			"%w: managed container %s has no %s label; use the documented stopped-upgrade preflight and remove or migrate this workload with the prior release",
+			ErrPreStackWorkloadUnsupported,
+			containerID,
+			LabelServiceName,
+		)
+	}
+	for _, required := range []struct {
+		label       string
+		description string
+	}{
+		{LabelTenant, "tenant"},
+		{LabelSKU, "SKU"},
+		{LabelInstanceIndex, "instance index"},
+	} {
+		if labels[required.label] == "" {
+			return fmt.Errorf("managed container %s has an empty %s label", containerID, required.description)
+		}
+	}
+	for _, required := range []struct {
+		label       string
+		description string
+	}{
+		{LabelProviderUUID, "provider"},
+		{LabelCallbackURL, "operation callback"},
+	} {
+		if labels[required.label] == "" {
+			return fmt.Errorf("managed container %s has an empty %s label", containerID, required.description)
+		}
+	}
+	if _, err := backend.ResolveLifecycleCallbackURL(
+		labels[LabelCallbackURL], labels[LabelLifecycleCallbackURL],
+	); err != nil {
+		return fmt.Errorf("managed container %s has invalid callback identity: %w", containerID, err)
+	}
+	if _, err := parseContainerMaintenanceID(labels[LabelMaintenanceID]); err != nil {
+		return fmt.Errorf("managed container %s has invalid maintenance ID %q: %w",
+			containerID, labels[LabelMaintenanceID], err)
+	}
+	return nil
+}
+
+func parseContainerMaintenanceID(raw string) (shared.MaintenanceID, error) {
+	if raw == "" {
+		return shared.MaintenanceID{}, nil
+	}
+	return maintenanceid.Parse(raw)
 }
 
 // TenantNetworkName returns a deterministic network name for a tenant address.
@@ -1857,21 +2010,26 @@ func (b *Backend) tenantNetworkMu(tenant string) *sync.Mutex {
 	return &b.tenantNetworkStripes[h.Sum32()%tenantNetworkStripeCount]
 }
 
-// ensureTenantNetwork wraps DockerClient.EnsureTenantNetwork with the
-// per-tenant mutex so the returned network ID cannot be removed by a
-// concurrent deprovision before the caller attaches a container to it.
-func (b *Backend) ensureTenantNetwork(ctx context.Context, tenant string) (string, error) {
+func (b *Backend) ensureTenantNetworkWith(mutations *storageMutations, ctx context.Context, tenant string) error {
 	mu := b.tenantNetworkMu(tenant)
 	mu.Lock()
 	defer mu.Unlock()
-	return b.docker.EnsureTenantNetwork(ctx, tenant)
+	_, err := mutations.ensureTenantNetwork(ctx, tenant)
+	return err
 }
 
-// releaseTenantNetwork removes the tenant network iff no other lease in
-// b.provisions still references the tenant. The caller MUST have already
-// removed its own provision entry from b.provisions before calling this —
-// otherwise its own entry would veto removal.
-func (b *Backend) releaseTenantNetwork(ctx context.Context, tenant string) error {
+// removeOrphanedTenantNetworkUsing consumes a tenant selected by the fixed
+// managed-network sweep and revalidates it under the same stripe used by
+// EnsureTenantNetwork. No caller-retained service can invoke removeNetwork or
+// select an arbitrary tenant.
+func (b *Backend) removeOrphanedTenantNetworkUsing(
+	ctx context.Context,
+	tenant string,
+	removeNetwork backgroundTenantNetworkRemove,
+) error {
+	if removeNetwork == nil {
+		return errBackgroundMaintenanceUnavailable
+	}
 	mu := b.tenantNetworkMu(tenant)
 	mu.Lock()
 	defer mu.Unlock()
@@ -1885,7 +2043,7 @@ func (b *Backend) releaseTenantNetwork(ctx context.Context, tenant string) error
 	}
 	b.provisionsMu.RUnlock()
 
-	return b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
+	return removeNetwork(ctx, tenant)
 }
 
 // HealthStatus represents the health check status of a Docker container.

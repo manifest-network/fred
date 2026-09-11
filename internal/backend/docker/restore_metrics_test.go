@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -17,7 +18,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+)
+
+const (
+	restoreMetricsSourceLease = "11111111-1111-4111-8111-111111111111"
+	restoreMetricsTargetLease = "22222222-2222-4222-8222-222222222222"
 )
 
 // observerSampleCount reads the number of observations recorded by a prometheus
@@ -39,9 +46,19 @@ func observerSampleCount(t *testing.T, o prometheus.Observer) uint64 {
 // internal phases (image_setup, volume_setup, compose_up, verify_startup),
 // labeled by the operation it was invoked for ("restart" here).
 func TestReplaceContainers_RecordsPhaseDurationsByOperation(t *testing.T) {
+	var strictContainers []ContainerInfo
 	mock := &mockDockerClient{
 		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+			for _, container := range strictContainers {
+				if container.ContainerID == id {
+					observed := container
+					return &observed, nil
+				}
+			}
+			return nil, errors.New("container is absent")
+		},
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return append([]ContainerInfo(nil), strictContainers...), nil
 		},
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
@@ -56,17 +73,75 @@ func TestReplaceContainers_RecordsPhaseDurationsByOperation(t *testing.T) {
 	}
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	profile, err := b.cfg.GetSKUProfile("docker-small")
+	const (
+		leaseUUID    = "11111111-1111-4111-8111-111111111113"
+		providerUUID = "22222222-2222-4222-8222-222222222223"
+	)
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}}
+	profiles := testResourceProfiles(t, items)
+	stack := restoreStackManifest()
+	manifestBytes, err := json.Marshal(stack)
 	require.NoError(t, err)
+	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
+	runtimeAuthority := mustTestReleaseRuntimeAuthority(
+		t, operationID, "tenant-a", providerUUID, callbackURL, lifecycleCallbackURL,
+	)
 
-	op := replaceContainersOp{
-		LeaseUUID: "lease-1",
-		Stack:     restoreStackManifest(),
-		Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		Profiles:  map[string]SKUProfile{"docker-small": profile},
-		Operation: "restart",
-		Logger:    b.logger,
+	attachBoundOperationHandoffStores(t, b)
+	seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
+		Manifest:         manifestBytes,
+		Image:            "stack",
+		OperationID:      operationID,
+		Items:            items,
+		ResourceProfiles: profiles,
+		RuntimeAuthority: runtimeAuthority,
+		Status:           "active",
+		CreatedAt:        time.Now(),
+	})
+	settlement := b.maintenanceSettlement
+	active, sourceClaim, err := settlement.ClaimLatestActive(leaseUUID)
+	require.NoError(t, err)
+	_ = active
+	targetTemplate := shared.Release{
+		Manifest:         manifestBytes,
+		Image:            "stack",
+		OperationID:      operationID,
+		Items:            items,
+		ResourceProfiles: profiles,
+		RuntimeAuthority: runtimeAuthority,
+		Status:           "deploying",
+		CreatedAt:        time.Now(),
 	}
+	admission, err := settlement.BeginMaintenanceIntent(newTestMaintenanceIntentSpec(
+		t, settlement, newTestMaintenanceID(t), shared.MaintenanceIntentRestart,
+		sourceClaim, targetTemplate,
+	))
+	require.NoError(t, err)
+	appendClaim, err := settlement.StartMaintenanceAppend(
+		createdTestMaintenanceDispatch(t, admission),
+	)
+	require.NoError(t, err)
+	targetRelease, err := settlement.AppendMaintenance(appendClaim)
+	require.NoError(t, err)
+	targetRelease, err = settlement.BindMaintenanceIntentTarget(targetRelease)
+	require.NoError(t, err)
+	maintenance := targetRelease.Intent()
+	strictContainers = []ContainerInfo{{
+		ContainerID:          "c1",
+		BackendName:          b.cfg.Name,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "tenant-a",
+		ProviderUUID:         providerUUID,
+		SKU:                  "docker-small",
+		ServiceName:          manifest.DefaultServiceName,
+		InstanceIndex:        0,
+		CallbackURL:          callbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
+		MaintenanceID:        maintenance.MaintenanceID(),
+		Image:                "nginx:latest",
+		Status:               "running",
+		CreatedAt:            time.Now().Add(-time.Minute),
+	}}
 
 	phases := []string{phaseImageSetup, phaseVolumeSetup, phaseComposeUp, phaseVerifyStartup}
 	before := make(map[string]uint64, len(phases))
@@ -74,8 +149,27 @@ func TestReplaceContainers_RecordsPhaseDurationsByOperation(t *testing.T) {
 		before[p] = observerSampleCount(t, replacePhaseDurationSeconds.WithLabelValues("restart", p))
 	}
 
-	res := b.doReplaceContainers(context.Background(), op)
-	require.NoError(t, res.Err, "replace must succeed")
+	execution, err := settlement.StartMaintenanceExecution(targetRelease)
+	require.NoError(t, err)
+	physical := settlement.ExecuteMaintenance(context.Background(), execution)
+	success, ok := physical.(shared.MaintenanceExecutionSuccess)
+	if !ok {
+		var cause error
+		switch outcome := physical.(type) {
+		case shared.MaintenanceExecutionFailure:
+			cause = outcome.Cause()
+		case shared.MaintenanceExecutionAmbiguous:
+			cause = outcome.Cause()
+		}
+		t.Fatalf("construction-bound replacement did not produce exact success (%T): %v", physical, cause)
+	}
+	_, err = settlement.ActivateMaintenance(success)
+	require.NoError(t, err)
+	current, found, err := settlement.GetMaintenanceIntent(leaseUUID)
+	require.NoError(t, err)
+	require.True(t, found)
+	_, err = settlement.ProveMaintenanceActive(current)
+	require.NoError(t, err, "construction-bound replacement must activate its exact target")
 
 	for _, p := range phases {
 		after := observerSampleCount(t, replacePhaseDurationSeconds.WithLabelValues("restart", p))
@@ -98,6 +192,7 @@ func TestRestore_RecordsRestoreDurationAndPhases(t *testing.T) {
 		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
 		},
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	// Defer teardown so the backend's goroutines (lease actor, restore worker,
@@ -105,11 +200,12 @@ func TestRestore_RecordsRestoreDurationAndPhases(t *testing.T) {
 	defer func() { b.stopCancel(); b.wg.Wait() }()
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, restoreMetricsSourceLease)
 
 	var mu sync.Mutex
 	var downProjects []string
-	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	compose := happyComposeMock(t, mock, &mu, &downProjects, nil)
+	b.compose = compose
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(_, _ string) error { return nil },
 	}
@@ -125,7 +221,11 @@ func TestRestore_RecordsRestoreDurationAndPhases(t *testing.T) {
 	succBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("success"))
 	failBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("failure"))
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", server.URL))
+	err := b.Restore(context.Background(), restoreRequest(
+		restoreMetricsTargetLease,
+		restoreMetricsSourceLease,
+		server.URL+"/callbacks/provision",
+	))
 	require.NoError(t, err)
 
 	// The restore worker records restore_duration_seconds in its terminal defer,
@@ -134,9 +234,9 @@ func TestRestore_RecordsRestoreDurationAndPhases(t *testing.T) {
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
+		p, ok := b.provisions[restoreMetricsTargetLease]
 		return ok && p.Status == backend.ProvisionStatusReady
-	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready")
+	}, 5*time.Second, 20*time.Millisecond, "restore target must reach Ready")
 
 	assert.Equal(t, durBefore+1, observerSampleCount(t, restoreDurationSeconds),
 		"restore_duration_seconds must record exactly one observation on a successful restore")
@@ -152,13 +252,10 @@ func TestRestore_RecordsRestoreDurationAndPhases(t *testing.T) {
 		"a successful restore must not increment restore_total{outcome=\"failure\"}")
 }
 
-// TestRestore_FailedWorker_IncrementsRestoreTotalFailure drives a restore whose
-// re-deploy worker FAILS (compose Up errors) and asserts the worker's terminal
-// defer increments restore_total{outcome="failure"} exactly once — the gap ENG-408
-// closes (a failed restore previously incremented nothing on the docker-backend
-// side). It also pins the success-only invariant of restore_duration_seconds: that
-// histogram must NOT move on a failure.
-func TestRestore_FailedWorker_IncrementsRestoreTotalFailure(t *testing.T) {
+// TestRestore_PostEffectErrorDoesNotManufactureTerminalMetric drives a Compose
+// Up error. The request may already have reached Docker, so this is not a
+// definitive failure until durable recovery classifies a fresh inventory.
+func TestRestore_PostEffectErrorDoesNotManufactureTerminalMetric(t *testing.T) {
 	mock := &mockDockerClient{
 		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
 	}
@@ -166,11 +263,11 @@ func TestRestore_FailedWorker_IncrementsRestoreTotalFailure(t *testing.T) {
 	defer func() { b.stopCancel(); b.wg.Wait() }()
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, restoreMetricsSourceLease)
 
 	var mu sync.Mutex
 	var downProjects []string
-	b.compose = happyComposeMock(&mu, &downProjects, errors.New("compose up boom"))
+	b.compose = happyComposeMock(t, mock, &mu, &downProjects, errors.New("compose up boom"))
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(_, _ string) error { return nil },
 	}
@@ -179,31 +276,27 @@ func TestRestore_FailedWorker_IncrementsRestoreTotalFailure(t *testing.T) {
 	failBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("failure"))
 	durBefore := observerSampleCount(t, restoreDurationSeconds)
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://127.0.0.1:0/cb"))
+	err := b.Restore(context.Background(), restoreRequest(
+		restoreMetricsTargetLease,
+		restoreMetricsSourceLease,
+		"http://127.0.0.1:1/callbacks/provision",
+	))
 	require.NoError(t, err) // route+ack succeed; the failure is asynchronous
 
-	// The worker's terminal defer (which increments restore_total) runs before the
-	// actor flips Status=Failed, so waiting for Failed is a sufficient gate.
-	require.Eventually(t, func() bool {
-		b.provisionsMu.RLock()
-		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
-		return ok && p.Status == backend.ProvisionStatusFailed
-	}, 5*time.Second, 20*time.Millisecond, "u2 must settle Failed")
+	awaitProvisionWorkerQuiescence(t, b, restoreMetricsTargetLease)
 
-	assert.Equal(t, failBefore+1, testutil.ToFloat64(restoresTotal.WithLabelValues("failure")),
-		"a failed restore worker must increment restore_total{outcome=\"failure\"}")
+	assert.Equal(t, failBefore, testutil.ToFloat64(restoresTotal.WithLabelValues("failure")),
+		"an ambiguous Compose result must not be mislabeled as failure")
 	assert.Equal(t, succBefore, testutil.ToFloat64(restoresTotal.WithLabelValues("success")),
-		"a failed restore must not increment restore_total{outcome=\"success\"}")
+		"an ambiguous Compose result must not be mislabeled as success")
 	assert.Equal(t, durBefore, observerSampleCount(t, restoreDurationSeconds),
-		"restore_duration_seconds is success-only and must not move on a failed restore")
+		"restore_duration_seconds is success-only and must not move on ambiguity")
 }
 
-// TestRestore_WorkerPanic_IncrementsRestoreTotalFailure drives a restore whose
-// worker PANICS (compose Up panics) and asserts the panic-recovery branch of the
-// terminal defer counts the panic as a failure: restore_total{outcome="failure"}
-// increments, and a panic is never mistaken for success.
-func TestRestore_WorkerPanic_IncrementsRestoreTotalFailure(t *testing.T) {
+// TestRestore_WorkerPanic_DoesNotManufactureTerminalMetric drives a panic at
+// the post-effect Compose Up boundary. Because the result is ambiguous until a
+// fresh inventory classifies it, neither terminal metric may move.
+func TestRestore_WorkerPanic_DoesNotManufactureTerminalMetric(t *testing.T) {
 	mock := &mockDockerClient{
 		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
 	}
@@ -211,7 +304,7 @@ func TestRestore_WorkerPanic_IncrementsRestoreTotalFailure(t *testing.T) {
 	defer func() { b.stopCancel(); b.wg.Wait() }()
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, restoreMetricsSourceLease)
 
 	b.compose = &mockComposeExecutor{
 		UpFn: func(_ context.Context, _ *composetypes.Project, _ composeUpOpts) error {
@@ -226,31 +319,26 @@ func TestRestore_WorkerPanic_IncrementsRestoreTotalFailure(t *testing.T) {
 	succBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("success"))
 	failBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("failure"))
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://127.0.0.1:0/cb"))
+	err := b.Restore(context.Background(), restoreRequest(
+		restoreMetricsTargetLease,
+		restoreMetricsSourceLease,
+		"http://127.0.0.1:1/callbacks/provision",
+	))
 	require.NoError(t, err) // route+ack succeed; the panic is asynchronous
+	awaitProvisionWorkerQuiescence(t, b, restoreMetricsTargetLease)
 
-	require.Eventually(t, func() bool {
-		b.provisionsMu.RLock()
-		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
-		return ok && p.Status == backend.ProvisionStatusFailed
-	}, 5*time.Second, 20*time.Millisecond, "u2 must settle Failed after panic")
-
-	assert.Equal(t, failBefore+1, testutil.ToFloat64(restoresTotal.WithLabelValues("failure")),
-		"a restore worker panic must increment restore_total{outcome=\"failure\"}")
+	assert.Equal(t, failBefore, testutil.ToFloat64(restoresTotal.WithLabelValues("failure")),
+		"an ambiguous restore must not be mislabeled as a definitive failure")
 	assert.Equal(t, succBefore, testutil.ToFloat64(restoresTotal.WithLabelValues("success")),
-		"a panicked restore must not increment restore_total{outcome=\"success\"}")
+		"an ambiguous restore must not be mislabeled as success")
 }
 
-// TestRestore_SyncAdoptFailure_DoesNotIncrementRestoreTotal pins the WORKER-ONLY
-// scope of restore_total: a restore that fails in the synchronous adopt prelude
-// (the retained→canonical rename) BEFORE the async worker spawns returns a
-// synchronous error to the caller and must increment NEITHER outcome — mirroring
-// provisionsTotal, which counts only doProvision's worker outcome. This locks an
-// intentional boundary: such synchronous failures surface to the tenant as the
-// Restore() error and are deliberately excluded from this worker success-rate
-// counter (and are likewise not counted by providerd's ProvisioningTotal).
-func TestRestore_SyncAdoptFailure_DoesNotIncrementRestoreTotal(t *testing.T) {
+// TestRestore_AdoptFailureDoesNotManufactureTerminalMetric pins the durable
+// worker boundary of restore_total. Adoption is now an effect of the Started
+// operation subject, after actor acceptance, so Restore returns successfully
+// while a rename error remains ambiguous for exact recovery. Neither terminal
+// outcome may be recorded from that transport/storage error alone.
+func TestRestore_AdoptFailureDoesNotManufactureTerminalMetric(t *testing.T) {
 	mock := &mockDockerClient{
 		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
 	}
@@ -258,10 +346,10 @@ func TestRestore_SyncAdoptFailure_DoesNotIncrementRestoreTotal(t *testing.T) {
 	defer func() { b.stopCancel(); b.wg.Wait() }()
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, restoreMetricsSourceLease)
 
-	// Fail the synchronous adopt rename (retained→canonical): Restore() returns an
-	// error before doRestore spawns, so neither outcome series moves.
+	// Fail the Started adopt rename (retained→canonical). The actor owns the
+	// accepted operation, and exact recovery—not the raw error—decides its outcome.
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(_, _ string) error { return assert.AnError },
 	}
@@ -269,11 +357,16 @@ func TestRestore_SyncAdoptFailure_DoesNotIncrementRestoreTotal(t *testing.T) {
 	succBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("success"))
 	failBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("failure"))
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://127.0.0.1:0/cb"))
-	require.Error(t, err, "a synchronous adopt-rename failure must return an error from Restore()")
+	err := b.Restore(context.Background(), restoreRequest(
+		restoreMetricsTargetLease,
+		restoreMetricsSourceLease,
+		"http://127.0.0.1:1/callbacks/provision",
+	))
+	require.NoError(t, err, "actor acceptance must not be confused with the later physical outcome")
+	awaitProvisionWorkerQuiescence(t, b, restoreMetricsTargetLease)
 
 	assert.Equal(t, succBefore, testutil.ToFloat64(restoresTotal.WithLabelValues("success")),
-		"a synchronous (pre-worker) restore failure must not increment restore_total{outcome=\"success\"}")
+		"an ambiguous adopt failure must not increment restore_total{outcome=\"success\"}")
 	assert.Equal(t, failBefore, testutil.ToFloat64(restoresTotal.WithLabelValues("failure")),
-		"restore_total is worker-scoped: a synchronous adopt failure (worker never spawns) must not increment it")
+		"an ambiguous adopt failure must not be manufactured into a terminal failure")
 }

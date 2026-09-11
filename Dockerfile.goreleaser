@@ -1,5 +1,7 @@
 FROM gcr.io/distroless/static-debian12
 COPY providerd /providerd
+COPY placement-preflight /placement-preflight
+COPY placement-repair /placement-repair
 USER nonroot:nonroot
 EXPOSE 8080
 ENTRYPOINT ["/providerd"]

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -12,13 +13,17 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/provisioner/callbackwire"
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // errCallbackPublisher is a CallbackPublisher that always returns an error.
 type errCallbackPublisher struct{ err error }
 
-func (p *errCallbackPublisher) PublishCallback(backend.CallbackPayload) error { return p.err }
+func (p *errCallbackPublisher) PublishCallback(context.Context, hmacauth.VerifiedRequest) error {
+	return p.err
+}
 
 // capturingCallbackPublisher records the last published callback.
 type capturingCallbackPublisher struct {
@@ -26,9 +31,10 @@ type capturingCallbackPublisher struct {
 	callback backend.CallbackPayload
 }
 
-func (p *capturingCallbackPublisher) PublishCallback(cb backend.CallbackPayload) error {
+func (p *capturingCallbackPublisher) PublishCallback(_ context.Context, proof hmacauth.VerifiedRequest) error {
 	p.called = true
-	p.callback = cb
+	observation, _ := callbackwire.DecodeVerified(proof)
+	p.callback = observation.Payload()
 	return nil
 }
 
@@ -47,7 +53,8 @@ func TestHandleProvisionCallback_Success(t *testing.T) {
 	pub := &capturingCallbackPublisher{}
 	srv := &Server{callbackPublisher: pub, callbackAuthenticator: auth}
 
-	body := `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"success"}`
+	body := `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"success",` +
+		`"operation_id":"d9428888-122b-41e1-b85c-61c67afba0c6"}`
 	rr := httptest.NewRecorder()
 	srv.handleProvisionCallback(rr, signedRequest(t, auth, body))
 
@@ -55,6 +62,58 @@ func TestHandleProvisionCallback_Success(t *testing.T) {
 	require.True(t, pub.called)
 	assert.Equal(t, testutil.ValidUUID1, pub.callback.LeaseUUID)
 	assert.Equal(t, backend.CallbackStatusSuccess, pub.callback.Status)
+	assert.Empty(t, pub.callback.OperationID, "JSON metadata cannot manufacture callback authority")
+}
+
+func TestHandleProvisionCallback_PropagatesAuthenticatedOperationID(t *testing.T) {
+	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
+	pub := &capturingCallbackPublisher{}
+	srv := &Server{callbackPublisher: pub, callbackAuthenticator: auth}
+	body := `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"success",` +
+		`"operation_id":"d9428888-122b-41e1-b85c-61c67afba0c6"}`
+	req := httptest.NewRequest(http.MethodPost,
+		"/callbacks/provision?operation_id=123e4567-e89b-42d3-a456-426614174000", strings.NewReader(body))
+	req.Header.Set(CallbackSignatureHeader,
+		auth.ComputeSignature(req.Method, req.URL.RequestURI(), []byte(body)))
+
+	rr := httptest.NewRecorder()
+	srv.handleProvisionCallback(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	require.True(t, pub.called)
+	assert.Equal(t, "123e4567-e89b-42d3-a456-426614174000", pub.callback.OperationID)
+}
+
+func TestHandleProvisionCallback_RejectsInvalidAuthenticatedOperationID(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "empty", query: "operation_id="},
+		{name: "malformed", query: "operation_id=not-a-uuid"},
+		{name: "uppercase non-canonical", query: "operation_id=123E4567-E89B-42D3-A456-426614174000"},
+		{name: "non-v4", query: "operation_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{name: "duplicate", query: "operation_id=123e4567-e89b-42d3-a456-426614174000&operation_id=d9428888-122b-41e1-b85c-61c67afba0c6"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			auth := newTestCallbackAuthenticator(t, testCallbackSecret)
+			pub := &capturingCallbackPublisher{}
+			srv := &Server{callbackPublisher: pub, callbackAuthenticator: auth}
+			body := `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"success"}`
+			req := httptest.NewRequest(http.MethodPost,
+				"/callbacks/provision?"+tt.query, strings.NewReader(body))
+			req.Header.Set(CallbackSignatureHeader,
+				auth.ComputeSignature(req.Method, req.URL.RequestURI(), []byte(body)))
+
+			rr := httptest.NewRecorder()
+			srv.handleProvisionCallback(rr, req)
+
+			assert.Equal(t, http.StatusBadRequest, rr.Code)
+			assertErrorBody(t, rr, "invalid request body")
+			assert.False(t, pub.called, "an invalid operation ID must fail before publication")
+		})
+	}
 }
 
 func TestHandleProvisionCallback_SuccessFailedStatus(t *testing.T) {
@@ -141,7 +200,7 @@ func TestHandleProvisionCallback_MissingLeaseUUID(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 	assert.False(t, pub.called)
-	assertErrorBody(t, rr, "lease_uuid is required")
+	assertErrorBody(t, rr, "invalid request body")
 }
 
 func TestHandleProvisionCallback_InvalidUUIDFormat(t *testing.T) {
@@ -155,7 +214,7 @@ func TestHandleProvisionCallback_InvalidUUIDFormat(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 	assert.False(t, pub.called)
-	assertErrorBody(t, rr, "lease_uuid must be a valid UUID")
+	assertErrorBody(t, rr, "invalid request body")
 }
 
 func TestHandleProvisionCallback_InvalidStatus(t *testing.T) {
@@ -169,12 +228,12 @@ func TestHandleProvisionCallback_InvalidStatus(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 	assert.False(t, pub.called)
-	assertErrorBody(t, rr, "status must be 'success', 'failed', or 'deprovisioned'")
+	assertErrorBody(t, rr, "invalid request body")
 }
 
 // TestHandleProvisionCallback_AcceptsDeprovisioned verifies that the HTTP
-// validator lets the new CallbackStatusDeprovisioned reach the Watermill
-// publisher rather than returning 400. Without this, every deprovisioned
+// validator lets the new CallbackStatusDeprovisioned reach the callback
+// application rather than returning 400. Without this, every deprovisioned
 // callback fails at the API boundary.
 func TestHandleProvisionCallback_AcceptsDeprovisioned(t *testing.T) {
 	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
@@ -198,8 +257,8 @@ func TestHandleProvisionCallback_PublishError(t *testing.T) {
 	rr := httptest.NewRecorder()
 	srv.handleProvisionCallback(rr, signedRequest(t, auth, body))
 
-	assert.Equal(t, http.StatusInternalServerError, rr.Code)
-	assertErrorBody(t, rr, errMsgInternalServerError)
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	assertErrorBody(t, rr, errMsgServiceUnavailable)
 }
 
 func TestHandleProvisionCallback_WithErrorField(t *testing.T) {

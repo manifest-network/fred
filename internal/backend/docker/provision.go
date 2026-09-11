@@ -8,15 +8,14 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"maps"
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
@@ -44,7 +43,38 @@ func isFlatPayload(data []byte) bool {
 // (make([]string, 0, totalQuantity)) to ~16 GB — an OOM reachable before any admission
 // control. Real leases are a handful of containers; 1024 is far above any single node's
 // real capacity (such a lease would fail admission anyway). (ENG-503)
-const maxLeaseQuantity = 1024
+const maxLeaseQuantity = backend.MaxOperationQuantity
+
+func resolvedProvisionAllocations(
+	leaseUUID string,
+	items []backend.LeaseItem,
+	resourceProfiles []shared.SKUResourceSnapshot,
+) ([]string, []shared.ResolvedAdoptInstance, error) {
+	resourcesBySKU, err := resourceSnapshotMap(items, resourceProfiles)
+	if err != nil {
+		return nil, nil, err
+	}
+	total, err := backend.ValidateOperationQuantities(items)
+	if err != nil {
+		return nil, nil, err
+	}
+	ids := make([]string, 0, total)
+	allocations := make([]shared.ResolvedAdoptInstance, 0, total)
+	for _, item := range items {
+		if item.ServiceName == "" {
+			return nil, nil, errors.New("resolved provision allocation requires a service name")
+		}
+		for index := range item.Quantity {
+			id := fmt.Sprintf("%s-%s-%d", leaseUUID, item.ServiceName, index)
+			ids = append(ids, id)
+			allocations = append(allocations, shared.ResolvedAdoptInstance{
+				ID:        id,
+				Resources: resourcesBySKU[item.SKU],
+			})
+		}
+	}
+	return ids, allocations, nil
+}
 
 // Provision starts async provisioning of containers.
 // For multi-unit leases (quantity > 1), multiple containers are created.
@@ -54,24 +84,36 @@ const maxLeaseQuantity = 1024
 // insufficient resources) are returned synchronously so the caller can respond
 // with an appropriate HTTP status. Only truly asynchronous failures (image pull,
 // container create/start) are communicated via callback.
-func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) error {
-	totalQuantity := req.TotalQuantity()
-
+func (b *Backend) Provision(ctx context.Context, request backend.ProvisionRequest) error {
+	req := newProvisionOperationInput(request)
+	if err := b.requireMutationAdmission(ctx, "provision"); err != nil {
+		return fmt.Errorf("backend storage identity verification failed: %w", err)
+	}
+	unlockCommand := b.commandFence.Lock(req.LeaseUUID)
+	defer unlockCommand()
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(
+		req.CallbackURL, req.LifecycleCallbackURL,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
+	}
+	req.LifecycleCallbackURL = lifecycleCallbackURL
+	if exactRetry, err := b.probeOperationIntent(req.LeaseUUID, req.CallbackURL); err != nil {
+		return err
+	} else if exactRetry {
+		return nil
+	}
+	if err := b.ensureRestoreDestinationUnowned(req.LeaseUUID); err != nil {
+		return err
+	}
 	// Bound the chain-supplied quantity BEFORE the reservation's ContainerIDs allocation
 	// below. item.Quantity is a uint64→int cast at ingest, so a negative value signals an
 	// overflowed cast; a total above maxLeaseQuantity would drive an unbounded pre-admission
 	// allocation (~16 GB at the chain's 1e9 billing cap) or, if negative, panic the make().
 	// Rejected synchronously as a validation error, before any state is reserved. (ENG-503)
-	for i, item := range req.Items {
-		if item.Quantity < 0 || item.Quantity > maxLeaseQuantity {
-			// Name the offending item (index/SKU/service — all tenant-supplied, so safe to
-			// echo) so a multi-item lease rejection is actionable client-side.
-			return fmt.Errorf("%w: item %d (SKU %q, service %q) quantity %d out of range [0, %d]",
-				backend.ErrValidation, i, item.SKU, item.ServiceName, item.Quantity, maxLeaseQuantity)
-		}
-	}
-	if totalQuantity < 0 || totalQuantity > maxLeaseQuantity {
-		return fmt.Errorf("%w: total quantity %d out of range [0, %d]", backend.ErrValidation, totalQuantity, maxLeaseQuantity)
+	totalQuantity, err := backend.ValidateOperationQuantities(req.Items)
+	if err != nil {
+		return err
 	}
 
 	// Boundary normalization: auto-tag a single unnamed item with the default
@@ -84,7 +126,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// item.ServiceName (canonicalVolumeName, restore.go). Reserving with
 	// un-normalized items would claim fred-{lease}--0 while the provision goes on
 	// to create fred-{lease}-app-0 — a claim that protects nothing (ENG-681).
-	if err := backend.NormalizeProvisionRequest(&req); err != nil {
+	if err := req.normalizeItems(); err != nil {
 		return err
 	}
 
@@ -95,167 +137,304 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		"total_quantity", totalQuantity,
 	)
 
-	// Atomically check-and-reserve the provision slot (fixes TOCTOU race).
-	// Allow re-provisioning if the existing provision has failed (e.g., container
-	// crashed and reconciler is retrying). Deprovisioning, Provisioning,
-	// Restarting, Updating, and Ready are all in-flight or live states that
-	// must not be re-provisioned until they reach Failed or are removed.
-	//
-	// The reservation is also this lease's OWNERSHIP CLAIM on its canonical volume
-	// names — snapshotVolumeClaims (volume_destroy.go) derives them from
-	// prov.Items, so an entry whose Items are unset claims nothing. It therefore
-	// carries Items from the start, exactly as Restore's reservation does. Setting
-	// them later would make the re-provision arm below RETRACT a live claim: it
-	// deletes the previous, claim-bearing entry, and the volumes it deliberately
-	// keeps (see "keep volumes" below) would be collectable by any concurrent
-	// destroy until the claim was re-established (ENG-681).
-	var prevFailCount int
-	var oldContainerIDs []string
-	var oldQuantity int
-	var oldItems []backend.LeaseItem // non-nil for stacks, needed for service-aware release
-	b.provisionsMu.Lock()
-	if existing, exists := b.provisions[req.LeaseUUID]; exists {
-		if existing.Status != backend.ProvisionStatusFailed {
-			b.provisionsMu.Unlock()
-			return fmt.Errorf("%w: %s", backend.ErrAlreadyProvisioned, req.LeaseUUID)
-		}
-		// Capture data needed for cleanup, then release lock before Docker API calls.
-		prevFailCount = existing.FailCount
-		oldContainerIDs = existing.ContainerIDs
-		oldQuantity = existing.Quantity
-		oldItems = existing.Items
-		delete(b.provisions, req.LeaseUUID)
-	}
-	b.provisions[req.LeaseUUID] = recoveredProvision{ //exhaustruct:enforce
-		ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
-			LeaseUUID:    req.LeaseUUID,
-			Tenant:       req.Tenant,
-			ProviderUUID: req.ProviderUUID,
-			SKU:          "", // set by enrichReserved after validation
-			Status:       backend.ProvisionStatusProvisioning,
-			Quantity:     totalQuantity,
-			CreatedAt:    time.Now(),
-			FailCount:    prevFailCount,
-			LastError:    "",
-			Reason:       "", // fresh reservation, no failure
-			Message:      "",
-			CallbackURL:  req.CallbackURL, // MUST be set at reservation: a failure/Deprovision
-			// racing this provision in the validation window resolves CallbackURL from the map.
-			Items:             slices.Clone(req.Items), // the ownership claim; see above
-			ContainerIDs:      make([]string, 0, totalQuantity),
-			StackManifest:     nil, // set by enrichReserved
-			ServiceContainers: nil,
-		},
-		// VolumeCleanupAttempts: 0 by struct-zero — structural reset of the
-		// per-lease counter is the whole point of the wrapper.
-		volumeCleanupAttempts: 0,
-	}.materialize()
-	b.provisionsMu.Unlock()
-
-	// Clean up old failed provision resources outside the lock.
-	if oldQuantity > 0 {
-		if len(oldItems) > 0 {
-			// Stack: release service-aware allocation IDs.
-			for _, item := range oldItems {
-				for i := range item.Quantity {
-					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
-				}
-			}
-		} else {
-			// Non-stack: release index-based allocation IDs.
-			for i := range oldQuantity {
-				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
-			}
-		}
-		// Remove old containers but keep volumes — stateful data persists
-		// across re-provisions. Volumes are reused via idempotent Create in
-		// doProvision, and only destroyed on explicit deprovision.
-		for _, cid := range oldContainerIDs {
-			if err := b.docker.RemoveContainer(ctx, cid); err != nil {
-				logger.Warn("failed to remove old container during re-provision",
-					"container_id", leasesm.ShortID(cid), "error", err)
-			}
-		}
-		logger.Info("replacing failed provision",
-			"fail_count", prevFailCount,
-		)
-	}
-
-	// Validate all SKUs upfront and build profile map.
-	// On failure, remove the reservation and return error synchronously.
+	// Complete every pure validation before creating the durable acceptance
+	// record. The intent is still committed before reservation cleanup, pool
+	// allocation, Docker, volume, or actor side effects.
 	profiles := make(map[string]SKUProfile)
 	for _, item := range req.Items {
 		if _, ok := profiles[item.SKU]; ok {
-			continue // Already validated
+			continue
 		}
 		profile, err := b.cfg.GetSKUProfile(item.SKU)
 		if err != nil {
-			b.removeProvision(req.LeaseUUID)
 			return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 		}
 		profiles[item.SKU] = profile
 	}
-
-	// Parse payload. ParsePayload always returns a *StackManifest;
-	// legacy flat payloads are auto-wrapped under DefaultServiceName.
+	resourceProfiles, err := b.snapshotResourceProfiles(req.Items, profiles)
+	if err != nil {
+		return fmt.Errorf("%w: snapshot resource profiles: %w", backend.ErrValidation, err)
+	}
+	_, err = resourceSnapshotMap(req.Items, resourceProfiles)
+	if err != nil {
+		return fmt.Errorf("%w: validate resource profiles: %w", backend.ErrValidation, err)
+	}
 	stackManifest, err := manifest.ParsePayload(req.Payload)
 	if err != nil {
-		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
 	}
 	if isFlatPayload(req.Payload) {
 		logger.Warn("manifest deprecation: tenant submitted flat single-service manifest; auto-wrapped as 1-service stack",
 			"lease_uuid", req.LeaseUUID)
 	}
-
-	// Validate the manifest against the (now-normalized) lease items and
-	// every service's image against the registry allowlist. After Task 3
-	// these run unconditionally — there is no legacy single-service arm.
 	if err := manifest.ValidateStackAgainstItems(stackManifest, req.Items); err != nil {
-		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
 	}
-	// Reject tenant-pinned fixed host ports (ENG-605): forcing dynamic
-	// assignment removes host-port squatting and cross-lease collision DoS.
-	// Admission-only — never runs on recover, so stored manifests stay valid.
+	if err := validateComposeServiceNames(req.Items); err != nil {
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
+	}
 	if err := manifest.ValidateNoFixedHostPorts(stackManifest); err != nil {
-		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
 	}
+	var healthCheckServices []string
 	for svcName, svc := range stackManifest.Services {
 		if err := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); err != nil {
-			b.removeProvision(req.LeaseUUID)
 			return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svcName, err)
 		}
+		if svc.HasActiveHealthCheck() {
+			healthCheckServices = append(healthCheckServices, svcName)
+		}
+	}
+	slices.Sort(healthCheckServices)
+	// Decide the exact label-level custom domains before the write-ahead
+	// acceptance barrier. Desired items remain immutable operation input, while
+	// effective items record DNS-deferred empty domains for exact crash recovery.
+	desiredItems := slices.Clone(req.Items)
+	b.deferUnreadyCustomDomains(ctx, req.Items, req.LeaseUUID, logger)
+	effectiveItems := slices.Clone(req.Items)
+
+	// Bridge the durable acceptance row to a volatile projection while excluding
+	// recoverState's inventory/publication snapshot. Without this short read-side
+	// claim, recovery could observe a Pending intent, a synchronous capacity
+	// refusal could settle it before any projection exists, and recovery could
+	// then publish a synthetic Provisioning lease from authority that is already
+	// terminal. The claim ends as soon as either the fresh candidate is visible or
+	// an existing failed predecessor has been snapshotted; slow teardown and
+	// worker execution remain outside the recovery gate.
+	b.recoverySnapshotMu.RLock()
+	recoveryBridgeHeld := true
+	defer func() {
+		if recoveryBridgeHeld {
+			b.recoverySnapshotMu.RUnlock()
+		}
+	}()
+	intent, proceed, err := b.beginOperationIntent(
+		shared.OperationIntentProvision,
+		req.LeaseUUID,
+		req.CallbackURL,
+		req.LifecycleCallbackURL,
+		req.Tenant,
+		req.ProviderUUID,
+		desiredItems,
+		resourceProfiles,
+		effectiveItems,
+		healthCheckServices,
+		req.Payload,
+		"",
+		0,
+	)
+	if err != nil {
+		return err
+	}
+	if !proceed {
+		// An exact request retry was already durably accepted or its completion
+		// is pending delivery. Returning success is idempotent; starting another
+		// worker would duplicate the substrate mutation.
+		return nil
+	}
+	err = b.checkOperationReleaseCapacity(intent)
+	if err != nil {
+		return b.refuseOperationIntent(intent, fmt.Errorf(
+			"%w: reserve provision success release: %w",
+			backend.ErrInsufficientResources,
+			err,
+		))
 	}
 
-	// Allocation IDs are always service-aware now:
-	// {leaseUUID}-{serviceName}-{instanceIndex}. The legacy {leaseUUID}-{idx}
-	// scheme is gone from the live path; Task 9's recover-time migration
-	// converts on-disk artifacts that still carry it.
-	var allocatedIDs []string
-	for _, item := range req.Items {
-		for i := range item.Quantity {
-			instanceID := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
-			if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
-				for _, id := range allocatedIDs {
-					b.pool.Release(id)
-				}
-				b.removeProvision(req.LeaseUUID)
-				return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err)
-			}
-			allocatedIDs = append(allocatedIDs, instanceID)
+	// A fresh reservation publishes the canonical-volume ownership claim with
+	// its complete topology and sizing. A failed predecessor remains intact until
+	// its actor accepts the command and the Started executor replaces it.
+	var oldProvision *provision
+	var oldSnapshot recoveredProvision
+	b.provisionsMu.Lock()
+	if existing, exists := b.provisions[req.LeaseUUID]; exists {
+		if existing.Status != backend.ProvisionStatusFailed {
+			b.provisionsMu.Unlock()
+			return b.refuseOperationIntent(intent,
+				fmt.Errorf("%w: %s", backend.ErrAlreadyProvisioned, req.LeaseUUID))
 		}
+		// Keep the pointer solely as a generation/CAS token. Every value used
+		// after dropping provisionsMu comes from this deep snapshot: actors and
+		// cleanup paths intentionally mutate published provisions in place.
+		oldSnapshot = recoveredFromProvision(existing)
+		oldProvision = existing
+	}
+	if oldProvision == nil {
+		candidate := recoveredProvision{ //exhaustruct:enforce
+			ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
+				LeaseUUID:    req.LeaseUUID,
+				Tenant:       req.Tenant,
+				ProviderUUID: req.ProviderUUID,
+				SKU:          "", // set by enrichReserved after validation
+				Status:       backend.ProvisionStatusProvisioning,
+				Quantity:     totalQuantity,
+				CreatedAt:    time.Now(),
+				FailCount:    0,
+				LastError:    "",
+				Reason:       "", // fresh reservation, no failure
+				Message:      "",
+				// Both routes are stored at reservation time so any failure or
+				// deprovision racing the validation window resolves the correct
+				// exact or observational capability from the map.
+				CallbackURL:          req.CallbackURL,
+				LifecycleCallbackURL: req.LifecycleCallbackURL,
+				ActiveReleaseVersion: 0,
+				ActiveOperationID:    shared.OperationID{},
+				Items:                slices.Clone(req.Items), // the ownership claim; see above
+				ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
+				ContainerIDs:         make([]string, 0, totalQuantity),
+				StackManifest:        nil, // set by enrichReserved
+				ServiceContainers:    nil,
+			},
+		}.materialize()
+		b.provisions[req.LeaseUUID] = candidate
+	}
+	b.provisionsMu.Unlock()
+	b.recoverySnapshotMu.RUnlock()
+	recoveryBridgeHeld = false
+
+	if oldProvision != nil {
+		predecessorUnchanged := func() bool {
+			b.provisionsMu.RLock()
+			defer b.provisionsMu.RUnlock()
+			return b.provisions[req.LeaseUUID] == oldProvision &&
+				provisionMatchesRecovered(oldProvision, oldSnapshot)
+		}
+		if oldSnapshot.Tenant != req.Tenant || oldSnapshot.ProviderUUID != req.ProviderUUID {
+			return b.refuseOperationIntent(intent, fmt.Errorf(
+				"failed provision predecessor belongs to a different tenant or provider",
+			))
+		}
+		_, _, predecessorErr := resolvedProvisionAllocations(
+			req.LeaseUUID, oldSnapshot.Items, oldSnapshot.ResourceProfiles,
+		)
+		if predecessorErr != nil {
+			return b.refuseOperationIntent(intent, fmt.Errorf(
+				"rebuild failed provision predecessor allocation: %w", predecessorErr,
+			))
+		}
+		// The predecessor projection and pool reservation remain authoritative while
+		// its exact cohort is torn down. The candidate intent is already durable, so
+		// any incomplete teardown becomes an outcome ambiguity: stop this backend and
+		// let cold recovery validate the surviving subset against the predecessor
+		// active Release before retrying. Volumes are deliberately kept for reuse.
+		inventoryCtx, cancelInventory := b.recoveryDockerReadContext(context.WithoutCancel(ctx))
+		containers, inventoryErr := b.listManagedContainersStrictForRecovery(inventoryCtx)
+		if inventoryErr != nil {
+			cancelInventory()
+			return b.refuseOperationIntent(intent, fmt.Errorf("inspect failed provision predecessor: %w", inventoryErr))
+		}
+		var active *shared.Release
+		if b.releaseStore != nil {
+			var releaseErr error
+			active, releaseErr = b.releaseStore.LatestActive(req.LeaseUUID)
+			if releaseErr != nil {
+				cancelInventory()
+				return b.refuseOperationIntent(intent, fmt.Errorf("read failed provision predecessor release: %w", releaseErr))
+			}
+		}
+		if activeIdentity, hasActiveIdentity := runtimeIdentityForRelease(active); hasActiveIdentity {
+			oldLifecycleURL := oldSnapshot.LifecycleCallbackURL
+			if activeIdentity.Class() == shared.ReleaseAuthorityLegacy {
+				oldLifecycleURL, err = backend.ResolveLifecycleCallbackURL(
+					oldSnapshot.CallbackURL, oldSnapshot.LifecycleCallbackURL,
+				)
+				if err != nil {
+					cancelInventory()
+					return b.refuseOperationIntent(intent, fmt.Errorf(
+						"validate failed provision predecessor callback pair: %w", err,
+					))
+				}
+			}
+			if activeIdentity.Tenant() != req.Tenant ||
+				activeIdentity.ProviderUUID() != req.ProviderUUID ||
+				oldSnapshot.Tenant != activeIdentity.Tenant() ||
+				oldSnapshot.ProviderUUID != activeIdentity.ProviderUUID() ||
+				oldSnapshot.CallbackURL != activeIdentity.CallbackURL() ||
+				oldLifecycleURL != activeIdentity.LifecycleCallbackURL() {
+				cancelInventory()
+				return b.refuseOperationIntent(intent, fmt.Errorf(
+					"active provision predecessor identity differs from the live projection",
+				))
+			}
+		}
+		classification, classifyErr := b.classifyProvisionIntentSubstrate(
+			inventoryCtx, intent, active, containers,
+		)
+		cancelInventory()
+		if classifyErr != nil {
+			return b.refuseOperationIntent(intent, fmt.Errorf("validate failed provision predecessor: %w", classifyErr))
+		}
+		if classification.hasCurrent {
+			return b.latchAmbiguousOperationOutcome(
+				"validate replacement provision predecessor",
+				errors.New("candidate provision substrate exists before worker admission"),
+			)
+		}
+		if !predecessorUnchanged() {
+			return b.refuseOperationIntent(intent, errors.New(
+				"failed provision predecessor changed during read-only validation",
+			))
+		}
+		if classification.legacyAuthority != nil {
+			if classification.legacyPredecessor == nil || b.releaseStore == nil {
+				return b.latchAmbiguousOperationOutcome(
+					"persist replacement provision predecessor authority",
+					errors.New("legacy predecessor classification has no durable release store fence"),
+				)
+			}
+			if persistErr := b.releaseBackfiller.BackfillLegacyRuntimeAuthorityContext(
+				ctx, req.LeaseUUID,
+				*classification.legacyPredecessor,
+				*classification.legacyAuthority,
+			); persistErr != nil {
+				return b.refuseOperationIntent(intent, fmt.Errorf(
+					"persist failed provision predecessor runtime authority: %w", persistErr,
+				))
+			}
+		}
+		if !predecessorUnchanged() {
+			return b.refuseOperationIntent(intent, errors.New(
+				"failed provision predecessor changed before teardown",
+			))
+		}
+
+	}
+	// One atomic, claim-bound reservation covers both fresh and replacement
+	// work. Its conservative envelope retains predecessor capacity until exact
+	// terminal settlement; a hold or capacity refusal happens before any teardown.
+	admission, err := b.operationSettlement.ReserveProvisionResources(b.pool, intent)
+	if err != nil {
+		if oldProvision == nil {
+			b.removeProvision(req.LeaseUUID)
+		}
+		return b.refuseOperationIntent(intent, fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err))
+	}
+
+	rollbackUnacceptedProvision := func(cause error) error {
+		if abortErr := admission.Abort(); abortErr != nil {
+			return errors.Join(cause, abortErr)
+		}
+		if oldProvision == nil {
+			b.removeProvision(req.LeaseUUID)
+			return b.refuseOperationIntent(intent, cause)
+		}
+
+		// A rejected actor command has not crossed Started, so the failed
+		// predecessor and its pool reservation are still untouched.
+		return b.refuseOperationIntent(intent, cause)
 	}
 
 	// Update the reservation with full details now that validation passed. Items
 	// are NOT set here — the reservation already published them as this lease's
 	// ownership claim (ENG-681).
-	b.provisionsMu.Lock()
-	if prov, ok := b.provisions[req.LeaseUUID]; ok {
-		prov.enrichReserved(req.RoutingSKU(), stackManifest)
+	if oldProvision == nil {
+		b.provisionsMu.Lock()
+		if prov, ok := b.provisions[req.LeaseUUID]; ok {
+			prov.enrichReserved(req.routingSKU(), stackManifest)
+		}
+		b.provisionsMu.Unlock()
 	}
-	b.provisionsMu.Unlock()
 
 	// Hand off to the lease actor. The actor fires the SM transition,
 	// acks accept/reject, and spawns the worker goroutine internally
@@ -265,47 +444,35 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// worker is left as a zombie and recoverState reconciles on next
 	// start.
 	provCtx, provCancel := b.shutdownAwareContext()
-	work := func() (string, backend.Reason, leasesm.ProvisionSuccessResult, map[string]string, error) {
-		return b.doProvision(provCtx, req, stackManifest, profiles, logger)
-	}
-	ack := make(chan error, 1)
-	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.ProvisionRequestedMsg{
-		Cancel: provCancel,
-		Work:   work,
-		Ack:    ack,
-	}); routeErr != nil {
+	command, ack, commandErr := leasesm.NewProvisionCommand(provCtx, admission)
+	if commandErr != nil {
 		provCancel()
-		for _, id := range allocatedIDs {
-			b.pool.Release(id)
-		}
-		b.removeProvision(req.LeaseUUID)
-		return routeErr
+		return rollbackUnacceptedProvision(commandErr)
 	}
-	// Wait for the actor to fire evProvisionRequested on its SM. If the
-	// SM rejects (shouldn't happen given the synchronous validation
-	// above, but defensive), roll back the provision entry and surface.
-	// ackOrAbort handles the race where ctx/stopCtx cancel at the same
-	// instant as the actor's ack — it checks ack one more time before
-	// giving up, so we don't roll back while the actor is already
-	// committing (which would otherwise leave worker-created containers
-	// orphaned with no provision entry).
+	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, command); routeErr != nil {
+		provCancel()
+		return rollbackUnacceptedProvision(routeErr)
+	}
+	// Wait for the actor to fire evProvisionRequested on its SM. Only an
+	// explicit rejection proves no worker exists and authorizes rollback. Once
+	// enqueued, cancellation is an unknown outcome: preserve the intent,
+	// reservation, and allocation for worker completion or startup recovery.
 	//
-	// Pool allocations MUST be released on rollback (mirroring the
-	// mid-allocation failure paths above). doProvision's failure defer
-	// only runs if the worker actually runs; if the actor never accepts
-	// the message (route/ack failure), the worker is never spawned and
-	// these allocations would otherwise leak — a subsequent retry would
-	// then find the per-instance IDs still allocated in the pool and
-	// fail TryAllocate with "already allocated", wedging the lease.
-	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
+	// An explicitly rejected fresh command releases its reservation. A rejected
+	// replacement command has not crossed Started, so its failed predecessor and
+	// allocation remain unchanged.
+	acceptance, err := b.awaitAsyncAcceptance(ctx, ack.Result())
+	switch acceptance {
+	case asyncAcceptanceAccepted:
+		return nil
+	case asyncAcceptanceUnknown:
+		return fmt.Errorf("provision acceptance is unknown; durable recovery retained: %s", err.Error())
+	case asyncAcceptanceRejected:
 		provCancel()
-		for _, id := range allocatedIDs {
-			b.pool.Release(id)
-		}
-		b.removeProvision(req.LeaseUUID)
-		return err
+		return rollbackUnacceptedProvision(err)
+	default:
+		return fmt.Errorf("invalid provision acceptance state %d", acceptance)
 	}
-	return nil
 }
 
 // volumeOwnerEntry caches the detected UID/GID for an image's VOLUME directories.
@@ -319,70 +486,65 @@ type volumeOwnerEntry struct {
 // (0, 0) without caching so the next call retries (transient errors
 // self-heal). Successful results are cached permanently since image IDs
 // are immutable content-addressable digests.
-func (b *Backend) detectVolumeOwnerCached(ctx context.Context, imageID, imageName string, volumePaths []string) (uid, gid int) {
-	if v, ok := b.volumeOwnerCache.Load(imageID); ok {
+func (b *Backend) detectVolumeOwnerCached(mutations *storageMutations, ctx context.Context, imageName imageexec.Image, volumePaths []string) (uid, gid int) {
+	if v, ok := b.volumeOwnerCache.Load(imageName.ID()); ok {
 		if entry, ok := v.(volumeOwnerEntry); ok {
 			return entry.UID, entry.GID
 		}
 	}
 
-	detectedUID, detectedGID, err := b.docker.DetectVolumeOwner(ctx, imageName, volumePaths)
+	detectedUID, detectedGID, err := mutations.detectVolumeOwner(ctx, imageName, volumePaths)
 	if err != nil {
 		b.logger.Warn("failed to detect volume owner, defaulting to root (not cached)",
-			"image", imageName, "error", err)
+			"image", imageName.Reference(), "error", err)
 		return 0, 0
 	}
 
-	b.volumeOwnerCache.Store(imageID, volumeOwnerEntry{UID: detectedUID, GID: detectedGID})
+	b.volumeOwnerCache.Store(imageName.ID(), volumeOwnerEntry{UID: detectedUID, GID: detectedGID})
 	return detectedUID, detectedGID
 }
 
-// detectWritablePathsCached returns auto-detected writable paths for an image,
-// using the cache keyed by image ID. On error, logs a warning and returns nil
-// without caching so the next call retries. Successful results (including
-// empty slices) are cached permanently since image IDs are immutable.
-func (b *Backend) detectWritablePathsCached(ctx context.Context, imageID, imageName string, uid int) []string {
-	if v, ok := b.writablePathCache.Load(imageID); ok {
-		if paths, ok := v.([]string); ok {
-			return paths
-		}
+// detectWritablePathsCached reuses detection only for the same immutable image
+// and runtime UID. Errors remain uncached so the next setup can retry.
+func (b *Backend) detectWritablePathsCached(mutations *storageMutations, ctx context.Context, detection writablePathDetection) []string {
+	if paths, found := b.writablePathCache.load(detection); found {
+		return paths
 	}
 
-	paths, err := b.docker.DetectWritablePaths(ctx, imageName, uid, candidateWritableParents)
+	paths, err := mutations.detectWritablePaths(ctx, detection)
 	if err != nil {
 		b.logger.Warn("failed to detect writable paths, skipping (not cached)",
-			"image", imageName, "error", err)
+			"image", detection.image.Reference(), "error", err)
 		return nil
 	}
 
-	b.writablePathCache.Store(imageID, paths)
+	b.writablePathCache.store(detection, paths)
 	return paths
 }
 
 // imageSetup holds the results of image inspection needed for container creation.
 type imageSetup struct {
-	Volumes       []string // sorted VOLUME paths declared by the image
-	ContainerUser string   // numeric "uid:gid" or "" for root
-	VolumeUID     int      // UID for volume ownership
-	VolumeGID     int      // GID for volume ownership
-	WritablePaths []string // auto-detected writable paths for non-root images
+	Image         imageexec.Image // admitted image shared by helpers and workload execution
+	Volumes       []string        // sorted VOLUME paths declared by the image
+	ContainerUser string          // numeric "uid:gid" or "" for root
+	VolumeUID     int             // UID for volume ownership
+	VolumeGID     int             // GID for volume ownership
+	WritablePaths []string        // auto-detected writable paths for non-root images
 }
 
 // inspectImageForSetup inspects an image and resolves its VOLUME declarations
 // and container user. This combines the image inspect, volume discovery, and
 // user resolution steps that are common to doProvision, doRestart, and doUpdate.
-func (b *Backend) inspectImageForSetup(ctx context.Context, image string, manifestUser string) (*imageSetup, error) {
-	imageInfo, err := b.docker.InspectImage(ctx, image)
+func (b *Backend) inspectImageForSetup(mutations *storageMutations, ctx context.Context, image string, manifestUser string) (*imageSetup, error) {
+	admitted, err := mutations.admitImage(ctx, image)
 	if err != nil {
-		return nil, fmt.Errorf("image inspect failed: %w", err)
+		return nil, fmt.Errorf("image admission failed: %w", err)
 	}
+	volumes := admitted.Volumes()
+	result := &imageSetup{Image: admitted, Volumes: volumes}
 
-	volumes := slices.Sorted(maps.Keys(imageInfo.Volumes))
-
-	result := &imageSetup{Volumes: volumes}
-
-	if manifestUser != "" || imageInfo.User != "" {
-		uid, gid, resolveErr := b.docker.ResolveImageUser(ctx, image, manifestUser)
+	if manifestUser != "" || admitted.User() != "" {
+		uid, gid, resolveErr := mutations.resolveImageUser(ctx, admitted, manifestUser)
 		if resolveErr != nil {
 			return nil, fmt.Errorf("image user resolution failed: %w", resolveErr)
 		}
@@ -397,7 +559,7 @@ func (b *Backend) inspectImageForSetup(ctx context.Context, image string, manife
 		// detecting the owner lets us pre-chown host volumes and run as that
 		// user, bypassing the entrypoint's chown+gosu (which requires
 		// CAP_CHOWN that we drop).
-		uid, gid := b.detectVolumeOwnerCached(ctx, imageInfo.ID, image, volumes)
+		uid, gid := b.detectVolumeOwnerCached(mutations, ctx, admitted, volumes)
 		if uid != 0 || gid != 0 {
 			result.VolumeUID = uid
 			result.VolumeGID = gid
@@ -413,7 +575,8 @@ func (b *Backend) inspectImageForSetup(ctx context.Context, image string, manife
 	// Skipped when ReadonlyRootfs is disabled since the detection creates a temp
 	// container and the results are only used for writable path mounting.
 	if b.cfg.IsReadonlyRootfs() {
-		result.WritablePaths = b.detectWritablePathsCached(ctx, imageInfo.ID, image, result.VolumeUID)
+		detection := newWritablePathDetection(admitted, result.VolumeUID)
+		result.WritablePaths = b.detectWritablePathsCached(mutations, ctx, detection)
 		result.WritablePaths = filterSubpaths(result.WritablePaths, result.Volumes)
 	}
 
@@ -446,7 +609,7 @@ func filterSubpaths(candidates, parents []string) []string {
 // buildStatefulVolumeBinds creates subdirectories for each image VOLUME path
 // under hostPath and returns bind mount mappings. Returns an error if any
 // VOLUME path cannot be sanitized (unsupported path format).
-func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid int) (map[string]string, error) {
+func buildStatefulVolumeBindsContext(ctx context.Context, hostPath string, imageVolumes []string, uid, gid int) (map[string]string, error) {
 	binds := make(map[string]string, len(imageVolumes))
 	if len(imageVolumes) == 0 {
 		return binds, nil
@@ -472,6 +635,9 @@ func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid i
 	defer func() { _ = root.Close() }()
 
 	for _, volPath := range imageVolumes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		sanitized := sanitizeVolumePath(volPath)
 		if sanitized == "" {
 			return nil, fmt.Errorf("image declares unsupported VOLUME path %q", volPath)
@@ -499,21 +665,17 @@ func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid i
 		// lives (volume_xfs.go reads it back unvalidated on Destroy/EnsureQuota) and
 		// whose unwritability isWritablePathOnly's close-time classification assumes.
 		//
-		// Fail closed, mirroring resolveMigratedBindSource (migrate.go). Unlike the
-		// writable-path equivalent in setupWritablePathBinds — which SKIPS, because a
+		// Fail closed at the bind-construction boundary. Unlike the writable-path
+		// equivalent in setupWritablePathBinds — which SKIPS, because a
 		// _wp path may legitimately go unseeded — a stateful VOLUME has no safe
 		// fallback: omitting the bind would run the workload on the container's
 		// ephemeral layer and lose its data at the next replace. ErrNotExist is an
 		// error here too; MkdirAll just created this path. (ENG-795)
 		//
-		// Scope, so the next reader does not over-trust this: on PROVISION it is a hard
-		// boundary — no tenant container exists yet, so nothing can race it. On
-		// update/restart it is only a race narrowing, because doReplaceContainers calls
-		// setupVolBinds while the tenant's OLD container is still running and lets the
-		// later compose.Up stop it, so the leaf can be exchanged between this Lstat and
-		// dockerd resolving the Source. Closing that needs the writer gone before the
-		// check (what migrate.go relies on) — mounting by fd, the way kubelet does it,
-		// is not available to us because dockerd performs the mount. See ENG-797.
+		// The complete launch workflow retains physical-volume exclusion from
+		// writer retirement through Docker Start. Its durable launch journal
+		// rejects outstanding ambiguous requests before issuing this capability,
+		// so an old tenant cannot exchange this path after validation (ENG-797).
 		info, lerr := root.Lstat(sanitized)
 		if lerr != nil {
 			return nil, fmt.Errorf("resolve volume subdir %q: %w", filepath.Join(hostPath, sanitized), lerr)
@@ -549,19 +711,28 @@ const writablePathSubdir = "_wp"
 // a managed volume subdirectory and returns a bind map for container creation.
 // Extraction failures are logged but don't fail the overall operation;
 // paths that fail are simply omitted from the bind map.
-func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writablePaths []string, hostVolumePath string, maxBytes, maxEntries int64) map[string]string {
+func (b *Backend) setupWritablePathBinds(volume launchVolume, ctx context.Context, image imageexec.Image, writablePaths []string, maxBytes, maxEntries int64) map[string]string {
 	if len(writablePaths) == 0 {
+		return nil
+	}
+	hostVolumePath, err := volume.rootPath()
+	if err != nil {
+		b.logger.Warn("writable path volume authority is unavailable", "error", err)
 		return nil
 	}
 
 	wpDir := filepath.Join(hostVolumePath, writablePathSubdir)
 	// Remove stale content from prior extractions so files deleted
 	// in a newer image don't persist.
-	if err := os.RemoveAll(wpDir); err != nil {
+	if err := volume.removeWritablePaths(ctx); err != nil {
 		b.logger.Warn("failed to clean up old writable path content, extraction may contain stale files",
 			"path", wpDir, "error", err)
 	}
-	failures := b.docker.ExtractImageContent(ctx, image, writablePaths, wpDir, maxBytes, maxEntries)
+	failures, authErr := volume.extractImageContent(ctx, image, writablePaths, maxBytes, maxEntries)
+	if authErr != nil {
+		b.logger.Warn("failed to authorize writable path extraction", "error", authErr)
+		return nil
+	}
 
 	// The bind Source below is mounted read-write into the container and Docker
 	// resolves it host-side. Docker's CopyFromContainer does NOT follow a
@@ -576,7 +747,7 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 		// rather than mount an unvalidated (possibly symlinked) Source. ErrNotExist
 		// is safe — nothing was extracted, so no Source exists to be a symlink.
 		b.logger.Warn("cannot open writable-path root for confinement checks; skipping all writable-path binds",
-			"path", wpDir, "image", image, "error", rootErr)
+			"path", wpDir, "image", image.Reference(), "error", rootErr)
 		return nil
 	}
 	if wpRoot != nil {
@@ -588,13 +759,13 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 		if failures != nil {
 			if pathErr, ok := failures[wp]; ok {
 				b.logger.Warn("failed to extract writable path content",
-					"path", wp, "image", image, "error", pathErr)
+					"path", wp, "image", image.Reference(), "error", pathErr)
 				continue
 			}
 		}
 		sanitized := sanitizeVolumePath(wp)
 		if sanitized == "" {
-			b.logger.Warn("writable path rejected by sanitization", "path", wp, "image", image)
+			b.logger.Warn("writable path rejected by sanitization", "path", wp, "image", image.Reference())
 			continue
 		}
 		if wpRoot != nil {
@@ -606,11 +777,11 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 			switch info, lerr := wpRoot.Lstat(sanitized); {
 			case lerr == nil && info.Mode()&fs.ModeSymlink != 0:
 				b.logger.Warn("writable-path bind source is a symlink; skipping to prevent host escape",
-					"path", wp, "image", image)
+					"path", wp, "image", image.Reference())
 				continue
 			case lerr != nil && !errors.Is(lerr, fs.ErrNotExist):
 				b.logger.Warn("writable-path bind source failed confinement check; skipping",
-					"path", wp, "image", image, "error", lerr)
+					"path", wp, "image", image.Reference(), "error", lerr)
 				continue
 			}
 		}
@@ -624,20 +795,31 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 // It returns the volume binds map, a list of newly created volume IDs, and any fatal error.
 // Non-fatal failures (writable-path-only volume creation) are logged as warnings.
 func (b *Backend) setupVolBinds(
+	mutations *quiescedVolumes,
 	ctx context.Context,
 	leaseUUID string,
 	items []backend.LeaseItem,
-	profiles map[string]SKUProfile,
+	resourceProfiles []shared.SKUResourceSnapshot,
 	imageSetups map[string]*imageSetup,
-	services map[string]*manifest.Manifest,
 	logger *slog.Logger,
 ) (map[string]map[int]serviceVolBinds, []string, error) {
+	if err := mutations.requireActive(); err != nil {
+		return nil, nil, err
+	}
+	if leaseUUID != mutations.mutations.leaseUUID {
+		return nil, nil, errors.New("volume preparation differs from its launch subject")
+	}
+	resourcesBySKU, err := resourceSnapshotMap(items, resourceProfiles)
+	if err != nil {
+		return nil, nil, fmt.Errorf("validate volume resource profiles: %w", err)
+	}
 	volBinds := make(map[string]map[int]serviceVolBinds)
 	var createdVolumeIDs []string
 
 	for _, item := range items {
 		svcName := item.ServiceName
-		profile := profiles[item.SKU]
+		resources := resourcesBySKU[item.SKU]
+		profile := resources.Profile()
 		imgSetup := imageSetups[svcName]
 
 		for i := range item.Quantity {
@@ -648,9 +830,9 @@ func (b *Backend) setupVolBinds(
 				volumeID := canonicalVolumeName(leaseUUID, svcName, i)
 				sizeMB := profile.DiskMB
 				if sizeMB <= 0 {
-					sizeMB = int64(b.cfg.GetTmpfsSizeMB())
+					sizeMB = resources.ScratchDiskMB
 				}
-				hostPath, volCreated, volErr := b.createManagedVolume(ctx, volumeID, sizeMB)
+				volume, volErr := mutations.lookup(volumeID)
 				if volErr != nil {
 					if needsStatefulVolume {
 						return nil, createdVolumeIDs, fmt.Errorf("volume creation failed (service %s, instance %d): %w", svcName, i, volErr)
@@ -658,19 +840,19 @@ func (b *Backend) setupVolBinds(
 					logger.Warn("writable path content seeding unavailable (volume creation failed)", "service", svcName, "error", volErr)
 					continue
 				}
-				if volCreated {
+				if volume.wasCreated() {
 					createdVolumeIDs = append(createdVolumeIDs, volumeID)
 				}
 				binds := serviceVolBinds{}
 				if needsStatefulVolume {
 					var buildErr error
-					binds.StatefulBinds, buildErr = buildStatefulVolumeBinds(hostPath, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
+					binds.StatefulBinds, buildErr = volume.prepareStatefulVolumeBinds(ctx, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
 					if buildErr != nil {
 						return nil, createdVolumeIDs, fmt.Errorf("volume setup failed (service %s, instance %d): %w", svcName, i, buildErr)
 					}
 				}
 				if needsWritableVolume {
-					binds.WritableBinds = b.setupWritablePathBinds(ctx, services[svcName].Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024, inodeHardLimit(sizeMB, b.cfg.GetMinAvgFileBytes()))
+					binds.WritableBinds = b.setupWritablePathBinds(volume, ctx, imgSetup.Image, imgSetup.WritablePaths, sizeMB*1024*1024, inodeHardLimit(sizeMB, b.cfg.GetMinAvgFileBytes()))
 				}
 				if volBinds[svcName] == nil {
 					volBinds[svcName] = make(map[int]serviceVolBinds)
@@ -761,15 +943,41 @@ func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend
 	b.provisionsMu.Unlock()
 }
 
-// doProvision performs container creation for a stack (multi-service) lease
-// using Docker Compose. Compose handles container creation, start ordering, and
-// network attachment atomically via a single Up call.
-//
-// Returns the (callbackErr, result, logs, err) contract; stack-specific result
-// fields are stackManifest + serviceContainers.
-func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, reasonRet backend.Reason, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
+// physicalOperationError keeps callback-safe diagnostics attached to a typed
+// Refused result without granting any terminal settlement authority.
+type physicalOperationError struct {
+	callback string
+	reason   backend.Reason
+	cause    error
+}
+
+func (e *physicalOperationError) Error() string { return e.cause.Error() }
+func (e *physicalOperationError) Unwrap() error { return e.cause }
+
+// doProvisionPhysical is the construction-bound physical handler used by the
+// operation settlement. It never writes release/callback state; the exhaustive
+// classifier mints evidence and the actor-facing handler consumes that evidence
+// through CommitOperationSuccess/Failure after this function returns.
+func (b *Backend) doProvisionPhysical(
+	mutations *storageMutations,
+	ctx context.Context,
+	req backend.ProvisionRequest,
+	stack *manifest.StackManifest,
+	resourceProfiles []shared.SKUResourceSnapshot,
+	logger *slog.Logger,
+) (errRet error) {
+	if mutations == nil {
+		return errors.New("started provision mutation capability is required")
+	}
+	if err := b.prepareProvisionProjection(mutations, ctx, req, stack, resourceProfiles, logger); err != nil {
+		return err
+	}
+	profiles, profileErr := resourceProfileMap(req.Items, resourceProfiles)
+	if profileErr != nil {
+		return &physicalOperationError{callback: "validate resource profiles", reason: backend.ReasonInternal,
+			cause: fmt.Errorf("validate provision resource profiles: %w", profileErr)}
+	}
 	var containerIDs []string
-	var createdVolumeIDs []string
 	var err error
 	var callbackErr string
 	// failReason is the curated failure-category code, authored at the failure
@@ -777,76 +985,33 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	// startup-verify failure); specific sites override it (e.g. image pull).
 	failReason := backend.ReasonContainerExited
 	provisionStart := time.Now()
-	serviceContainers := make(map[string][]string)
+	var serviceContainers map[string][]string
 	projectName := composeProjectName(req.LeaseUUID)
-
 	defer func() {
 		provisionDurationSeconds.Observe(time.Since(provisionStart).Seconds())
 		if err != nil {
 			logger.Error("stack provision failed", "lease_uuid", req.LeaseUUID, "error", err)
 			provisionsTotal.WithLabelValues("failure").Inc()
-
-			// Release all service-aware allocation IDs.
-			for _, item := range req.Items {
-				for i := range item.Quantity {
-					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
-				}
+			if !mutations.effectEntered() {
+				errRet = &physicalOperationError{callback: callbackErr, reason: failReason, cause: err}
+				updateResourceMetrics(b.pool.Stats())
+				return
 			}
-
-			// Capture logs from the failed containers BEFORE removal —
-			// see doProvision's equivalent comment. For stacks we also
-			// pass the service-name map so the persisted keys are
-			// "web/0"-style rather than raw indices.
-			logsRet = b.captureContainerLogs(containerIDs, stackContainerLogKeys(serviceContainers))
-
-			// Clean up via Compose Down (removes all project containers), falling back to
-			// per-container removal on failure. The fallback re-discovers by label rather
-			// than walking containerIDs, which is still nil whenever Up itself failed —
-			// it is only assigned from compose PS AFTER a successful Up, so the recorded
-			// list is empty for exactly the failures that leave containers behind
-			// (ENG-647). Best-effort as before: the provision has already failed and its
-			// pool allocation is released above, and there is no retained data behind a
-			// fresh provision, so a leftover is a resource leak to alert on rather than a
-			// reason to hold the lease.
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			// Once any tenant Step was entered, a same-turn cleanup cannot prove a
+			// remote call will not land late. Container cleanup is best effort only;
+			// volumes are deliberately untouched. A late Compose/Create may still
+			// publish a container which mounts them, so only the recovery executor's
+			// repeated exact-inventory protocol may destroy operation-owned volumes.
+			// Preserve the intent and pool authority for that recovery.
+			cleanupCtx, cleanupCancel := context.WithTimeout(b.stopCtx, 30*time.Second)
 			defer cleanupCancel()
-			if _, tdErr := b.teardownLeaseContainers(cleanupCtx, req.LeaseUUID, containerIDs, 10*time.Second,
-				teardownOpProvisionCleanup, logger); tdErr != nil {
-				logger.Warn("failed to cleanup containers after provision error", "error", tdErr)
-			}
-			// createdVolumeIDs holds only the volumes THIS call brought into existence
-			// (Create reports created=false for a pre-existing directory), so it cannot
-			// name an adopted one — but the ownership check is not optional here either,
-			// because "cannot name" is a property of a caller, and this site had no
-			// check of its own at all (ENG-658). Best-effort as before: the provision has
-			// already failed and its pool allocation is released above, so a refusal or a
-			// failure is a leak to alert on, which cleanupOrphanedVolumes then collects.
-			if rep := b.volumeOp(req.LeaseUUID, logger).destroy(cleanupCtx, destroySiteProvisionCleanup, createdVolumeIDs...); rep.leftOnDisk() {
-				logger.Warn("failed to cleanup volume(s) after error",
-					"destroyed", len(rep.Destroyed), "refused", rep.refused(), "error", rep.err())
-			}
-			callbackErrRet = callbackErr
-			// Reason is authored at the failure site (failReason); ENG-508.
-			// Defaults to ReasonContainerExited (startup-verify), overridden by
-			// specific sites (e.g. image pull → ImagePullFailed) so (reason,
-			// message) stay consistent. The success path leaves reasonRet "".
-			reasonRet = failReason
-			errRet = err
+			cleanupErr := b.cleanupFailedOperationTargets(cleanupCtx, mutations, mutations.operationSubject,
+				&physicalOperationError{callback: callbackErr, reason: failReason, cause: err})
+			errRet = errors.Join(&physicalOperationError{callback: callbackErr, reason: failReason, cause: err}, cleanupErr)
+			updateResourceMetrics(b.pool.Stats())
 			return
 		}
-
 		provisionsTotal.WithLabelValues("success").Inc()
-
-		if b.releaseStore != nil {
-			if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
-				Manifest:  req.Payload,
-				Image:     "stack",
-				Status:    "active",
-				CreatedAt: time.Now(),
-			}); relErr != nil {
-				b.logger.Warn("failed to record initial release", "lease", req.LeaseUUID, "error", relErr)
-			}
-		}
 
 		if b.diagnosticsStore != nil {
 			if delErr := b.diagnosticsStore.Delete(req.LeaseUUID); delErr != nil {
@@ -855,12 +1020,6 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		}
 
 		updateResourceMetrics(b.pool.Stats())
-
-		resultRet = leasesm.ProvisionSuccessResult{
-			ContainerIDs:      containerIDs,
-			StackManifest:     stack,
-			ServiceContainers: serviceContainers,
-		}
 	}()
 
 	if ctx.Err() != nil {
@@ -878,7 +1037,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		}
 		logger.Info("pulling image", "service", svcName, "image", svc.Image)
 		pullStart := time.Now()
-		if err = b.docker.PullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); err != nil {
+		if err = mutations.pullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); err != nil {
 			logger.Error("failed to pull image", "service", svcName, "error", err)
 			err = fmt.Errorf("image pull failed for service %s: %w", svcName, err)
 			callbackErr = backend.MsgImagePullFailed
@@ -892,7 +1051,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	// Per-service image setup (inspect, user resolution, writable paths).
 	imageSetups := make(map[string]*imageSetup)
 	for svcName, svc := range stack.Services {
-		imgSetup, setupErr := b.inspectImageForSetup(ctx, svc.Image, svc.User)
+		imgSetup, setupErr := b.inspectImageForSetup(mutations, ctx, svc.Image, svc.User)
 		if setupErr != nil {
 			logger.Error("image setup failed", "service", svcName, "error", setupErr)
 			err = setupErr
@@ -905,7 +1064,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	// Resolve tenant network name (not Docker network ID — Compose needs the name).
 	var networkName string
 	if b.cfg.IsNetworkIsolation() {
-		_, netErr := b.ensureTenantNetwork(ctx, req.Tenant)
+		netErr := b.ensureTenantNetworkWith(mutations, ctx, req.Tenant)
 		if netErr != nil {
 			logger.Error("failed to create tenant network", "error", netErr)
 			err = netErr
@@ -923,38 +1082,31 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	}
 	b.provisionsMu.RUnlock()
 
-	var volBinds map[string]map[int]serviceVolBinds
-	volBinds, createdVolumeIDs, err = b.setupVolBinds(ctx, req.LeaseUUID, req.Items, profiles, imageSetups, stack.Services, logger)
-	if err != nil {
-		callbackErr = "volume creation failed"
-		return
-	}
-
 	// DNS-readiness gate (ENG-266): defer not-yet-resolving custom domains so
 	// provision doesn't fire a premature HTTP-01 order; the reconcile adds them
 	// once DNS is live.
 	b.deferUnreadyCustomDomains(ctx, req.Items, req.LeaseUUID, logger)
 
 	// Build Compose project and bring it up.
-	project := buildComposeProject(composeProjectParams{
-		LeaseUUID:    req.LeaseUUID,
-		Tenant:       req.Tenant,
-		ProviderUUID: req.ProviderUUID,
-		CallbackURL:  req.CallbackURL,
-		BackendName:  b.cfg.Name,
-		FailCount:    failCount,
-		Stack:        stack,
-		Items:        req.Items,
-		Profiles:     profiles,
-		ImageSetups:  imageSetups,
-		NetworkName:  networkName,
-		VolBinds:     volBinds,
-		Cfg:          &b.cfg,
-		Ingress:      b.cfg.Ingress,
-	})
+	params := composeProjectParams{
+		LeaseUUID:            req.LeaseUUID,
+		Tenant:               req.Tenant,
+		ProviderUUID:         req.ProviderUUID,
+		CallbackURL:          req.CallbackURL,
+		LifecycleCallbackURL: req.LifecycleCallbackURL,
+		BackendName:          b.cfg.Name,
+		FailCount:            failCount,
+		Stack:                stack,
+		Items:                req.Items,
+		Profiles:             profiles,
+		ImageSetups:          imageSetups,
+		NetworkName:          networkName,
+		Cfg:                  &b.cfg,
+		Ingress:              b.cfg.Ingress,
+	}
 
-	logger.Info("compose up", "project", projectName, "services", len(project.Services))
-	if upErr := b.compose.Up(ctx, project, composeUpOpts{}); upErr != nil {
+	logger.Info("compose up", "project", projectName, "services", len(stack.Services))
+	if upErr := b.launchCompose(ctx, mutations, params, resourceProfiles, composeUpOpts{}); upErr != nil {
 		err = fmt.Errorf("compose up failed: %w", upErr)
 		callbackErr = "container creation failed"
 		return
@@ -968,7 +1120,18 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		return
 	}
 
-	containerIDs, serviceContainers = mapComposeContainers(containers, req.Items)
+	var mapErr error
+	containerIDs, serviceContainers, mapErr = mapComposeContainers(containers, req.Items)
+	if mapErr != nil {
+		err = fmt.Errorf("map compose ps cohort: %w", mapErr)
+		callbackErr = "container creation failed"
+		return
+	}
+	if !exactServiceContainerCohort(req.Items, containerIDs, serviceContainers) {
+		err = errors.New("compose ps returned an incomplete or duplicate provision cohort")
+		callbackErr = "container creation failed"
+		return
+	}
 
 	// Verify startup per-service so each service uses its own health check config.
 	for svcName, svcCIDs := range serviceContainers {
@@ -983,14 +1146,62 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	return
 }
 
-// mapComposeContainers maps Compose PS output to containerIDs and serviceContainers.
-// For fanned-out services (web-0, web-1), it strips the instance suffix to recover
-// the original service name.
-func mapComposeContainers(containers []composeContainerSummary, items []backend.LeaseItem) ([]string, map[string][]string) {
-	// Build a set of base service names for fan-out detection.
-	svcQuantities := make(map[string]int, len(items))
-	for _, item := range items {
-		svcQuantities[item.ServiceName] = item.Quantity
+func (b *Backend) prepareProvisionProjection(
+	mutations *storageMutations,
+	ctx context.Context,
+	req backend.ProvisionRequest,
+	stack *manifest.StackManifest,
+	profiles []shared.SKUResourceSnapshot,
+	logger *slog.Logger,
+) error {
+	if mutations.predecessor == nil {
+		return nil
+	}
+	b.provisionsMu.RLock()
+	current := b.provisions[req.LeaseUUID]
+	if current == nil || current.Tenant != req.Tenant || current.ProviderUUID != req.ProviderUUID {
+		b.provisionsMu.RUnlock()
+		return errors.New("failed provision predecessor projection changed before Started execution")
+	}
+	previous := recoveredFromProvision(current)
+	recorded := slices.Clone(current.ContainerIDs)
+	b.provisionsMu.RUnlock()
+	remaining, err := b.teardownLeaseContainersWith(
+		mutations, ctx, req.LeaseUUID, recorded, 10*time.Second,
+		teardownOpProvisionCleanup, logger,
+	)
+	if err != nil || len(remaining) != 0 {
+		return fmt.Errorf("teardown failed provision predecessor: %w",
+			errors.Join(err, fmt.Errorf("%d container(s) may remain", len(remaining))))
+	}
+	b.provisionsMu.Lock()
+	defer b.provisionsMu.Unlock()
+	current = b.provisions[req.LeaseUUID]
+	if current == nil || current.Tenant != previous.Tenant || current.ProviderUUID != previous.ProviderUUID {
+		return errors.New("failed predecessor projection changed during Started teardown")
+	}
+	current.SKU = req.Items[0].SKU
+	if quantity, quantityErr := backend.ValidateOperationQuantities(req.Items); quantityErr == nil {
+		current.Quantity = quantity
+	}
+	current.Items = slices.Clone(req.Items)
+	current.ResourceProfiles = shared.CloneSKUResourceSnapshot(profiles)
+	current.StackManifest = stack
+	current.CallbackURL = req.CallbackURL
+	current.LifecycleCallbackURL = req.LifecycleCallbackURL
+	current.ContainerIDs = nil
+	current.ServiceContainers = nil
+	return nil
+}
+
+// mapComposeContainers maps Compose PS output to containerIDs and logical
+// service names using the exact keys produced by composeServiceName. Prefix
+// parsing is deliberately forbidden: a valid service named "web-01" is not an
+// instance of a scaled "web" service.
+func mapComposeContainers(containers []composeContainerSummary, items []backend.LeaseItem) ([]string, map[string][]string, error) {
+	logicalNames, err := composeServiceLogicalNames(items)
+	if err != nil {
+		return nil, nil, fmt.Errorf("derive Compose service keys: %w", err)
 	}
 
 	var containerIDs []string
@@ -998,23 +1209,16 @@ func mapComposeContainers(containers []composeContainerSummary, items []backend.
 
 	for _, c := range containers {
 		containerIDs = append(containerIDs, c.ID)
-		// Recover original service name from Compose service name.
-		// Fan-out: "web-0" → "web", single: "web" → "web".
-		// We verify the suffix is a valid integer to avoid prefix collisions
-		// (e.g., "web-extra" must not match "web" with qty>1).
-		baseName := c.Service
-		for svcName, qty := range svcQuantities {
-			if qty > 1 && strings.HasPrefix(c.Service, svcName+"-") {
-				suffix := strings.TrimPrefix(c.Service, svcName+"-")
-				if _, parseErr := strconv.Atoi(suffix); parseErr == nil {
-					baseName = svcName
-					break
-				}
-			}
+		logicalName, exists := logicalNames[c.Service]
+		if !exists {
+			return containerIDs, serviceContainers, fmt.Errorf(
+				"compose ps returned unknown service key %q",
+				c.Service,
+			)
 		}
-		serviceContainers[baseName] = append(serviceContainers[baseName], c.ID)
+		serviceContainers[logicalName] = append(serviceContainers[logicalName], c.ID)
 	}
-	return containerIDs, serviceContainers
+	return containerIDs, serviceContainers, nil
 }
 
 // healthPollInterval is the interval between health check polls during startup verification.
