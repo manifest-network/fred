@@ -119,3 +119,18 @@ func TestExternalURLScopedIPv6(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadNeverFallsBackToDefaultsAfterExplicitFileFailure(t *testing.T) {
+	for _, extension := range []string{"yaml", "json", "toml"} {
+		t.Run(extension, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config."+extension)
+			cfg, err := Load(path)
+			require.ErrorContains(t, err, "failed to read config file")
+			require.Nil(t, cfg)
+			require.NoError(t, os.Mkdir(path, 0o700))
+			cfg, err = Load(path)
+			require.ErrorContains(t, err, "failed to read config file")
+			require.Nil(t, cfg, "an unreadable explicit configuration must not produce a usable default configuration")
+		})
+	}
+}

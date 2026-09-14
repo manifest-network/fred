@@ -14,7 +14,7 @@ import (
 )
 
 func TestImageAdmissionBoundsMetadataBeforeMinting(t *testing.T) {
-	for _, scenario := range []string{"volume count", "volume path bytes", "volume aggregate bytes", "label count", "label bytes"} {
+	for _, scenario := range []string{"volume count", "volume path bytes", "volume aggregate bytes", "label count", "label bytes", "label key bytes"} {
 		t.Run(scenario, func(t *testing.T) {
 			response := classicImage()
 			switch scenario {
@@ -37,6 +37,8 @@ func TestImageAdmissionBoundsMetadataBeforeMinting(t *testing.T) {
 				}
 			case "label bytes":
 				response.Config.Labels = map[string]string{"label": strings.Repeat("v", 64<<10)}
+			case "label key bytes":
+				response.Config.Labels = map[string]string{strings.Repeat("k", imageexec.MaxImageLabelBytes+1): ""}
 			}
 			source := &fakeSource{version: "1.51", inspect: func(context.Context, string, ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
 				return response, nil
