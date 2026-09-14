@@ -72,9 +72,10 @@ type volumeReader interface {
 	// manager indexes from on-disk volumes. Called at startup.
 	Validate() error
 
-	// PinNamespaceRoot retains the exact existing directory before a namespace
-	// mutation waits on physical exclusion. A nil root positively means absent
-	// or a manager with no physical namespace; every unreadable root is an error.
+	// PinNamespaceRoot opens the exact existing directory for a short identity
+	// probe. Its caller closes it before waiting on physical exclusion. A nil
+	// root positively means absent or a manager with no physical namespace;
+	// every unreadable root is an error.
 	PinNamespaceRoot(managedVolumeName) (*fsidentity.Directory, error)
 
 	// HostPath returns the conventional absolute mount path for a managed name.

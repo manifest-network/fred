@@ -210,7 +210,11 @@ only after externally fencing all old Docker and container-runtime requests.
 Ordinary launches and namespace mutations on unrelated leases can proceed
 independently. Same-lease mutations retain fair ordering, while aliases of the
 same physical directory share exclusion. Only startup recovery of interrupted
-volume-manager work takes global layout exclusion. The writer inventory resolves
+volume-manager work takes global layout exclusion. Directory identity probes
+close before reservation waits and namespace mutations; launches reopen their
+exact roots only after acquiring physical exclusion and close them before
+releasing it. This lets XFS deletion prove zero project usage without a waiting
+or deleting workflow itself holding the final inode open. The writer inventory resolves
 named-volume sources and symlink aliases; unrelated sockets, FIFOs and devices
 do not themselves conflict with a managed directory.
 

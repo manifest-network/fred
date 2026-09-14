@@ -738,6 +738,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Managed-volume namespace mutations and waiting launches close directory probes
+  before physical-reservation waits. Launches reopen exact roots only after
+  acquiring exclusion and close them before unlocking; XFS deletion can therefore
+  reclaim its final inode without weakening quota checks or alias exclusion.
+  Roots and positive absence are revalidated after each wait. (ENG-950)
 - Docker adapters now distinguish completed daemon failures from requests whose
   effects remain unknown. A completed failure can settle its launch receipt
   while preserving the workflow failure; timeouts and lost responses retain

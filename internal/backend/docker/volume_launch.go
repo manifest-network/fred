@@ -115,10 +115,16 @@ func (q *quiescedVolumes) release() {
 	if q == nil || q.active == nil || !q.active.Swap(false) {
 		return
 	}
-	q.reserved.release()
+	q.releaseResources()
+}
+
+// releaseResources also handles partially constructed launches. No waiter may
+// acquire physical exclusion while this owner still pins a retiring inode.
+func (q *quiescedVolumes) releaseResources() {
 	for _, volume := range q.volumes {
 		_ = volume.root.Close()
 	}
+	q.reserved.release()
 	q.releaseNamespace()
 }
 
@@ -237,13 +243,13 @@ func (b *Backend) quiesceLaunchVolumes(ctx context.Context, mutations *storageMu
 		if complete {
 			return
 		}
-		q.reserved.release()
-		for _, volume := range q.volumes {
-			_ = volume.root.Close()
-		}
-		releaseNamespace()
+		q.releaseResources()
 	}()
-	ids := make([]fsidentity.Identity, 0, len(paths))
+	owned, err := b.reserveManagedNamespaceRoots(ctx, names)
+	if err != nil {
+		return nil, err
+	}
+	q.reserved = owned.reservation
 	for name, path := range paths {
 		parsed, err := parseManagedVolumeName(name)
 		if err != nil || !mutations.volumeNameInScope(parsed) {
@@ -252,7 +258,7 @@ func (b *Backend) quiesceLaunchVolumes(ctx context.Context, mutations *storageMu
 		if err := b.volumes.AttestManagedVolume(ctx, parsed); err != nil {
 			return nil, fmt.Errorf("attest launch volume %q: %w", name, err)
 		}
-		root, err := fsidentity.OpenDirectory(path)
+		root, err := owned.openRoot(parsed, path)
 		if err != nil {
 			return nil, fmt.Errorf("pin launch volume %q: %w", name, err)
 		}
@@ -260,14 +266,8 @@ func (b *Backend) quiesceLaunchVolumes(ctx context.Context, mutations *storageMu
 		if expected != nil && !root.Identity().Equal(expected[name]) {
 			return nil, fmt.Errorf("source volume %q physical identity changed", name)
 		}
-		ids = append(ids, root.Identity())
 	}
-	reserved, err := b.volumeAccess.reserve(ctx, ids)
-	if err != nil {
-		return nil, err
-	}
-	q.reserved = reserved
-	if err := b.volumeLaunches.check(mutations.volumeLaunchOrigin(), reserved.ids); err != nil {
+	if err := b.volumeLaunches.check(mutations.volumeLaunchOrigin(), q.reserved.ids); err != nil {
 		return nil, err
 	}
 	if len(paths) != 0 {

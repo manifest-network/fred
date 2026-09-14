@@ -55,6 +55,7 @@ func newWriterRetirementHarness(t *testing.T) *writerRetirementHarness {
 	}
 	h.inventory.containers = slices.Clone(f.sources)
 	h.b.volumes = &mockVolumeManager{
+		defaultDir: root,
 		CreateFn: func(_ context.Context, name string, sizeMB int64) (string, bool, error) {
 			path, ok := paths[name]
 			require.True(t, ok, "launch can only reuse the exact source volume set")
