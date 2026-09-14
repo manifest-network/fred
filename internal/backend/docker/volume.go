@@ -12,6 +12,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/manifest-network/fred/internal/fsidentity"
 )
 
 const volumeCleanupTimeout = 10 * time.Second
@@ -69,6 +71,11 @@ type volumeReader interface {
 	// Validate checks filesystem support and permissions, and rebuilds local
 	// manager indexes from on-disk volumes. Called at startup.
 	Validate() error
+
+	// PinNamespaceRoot retains the exact existing directory before a namespace
+	// mutation waits on physical exclusion. A nil root positively means absent
+	// or a manager with no physical namespace; every unreadable root is an error.
+	PinNamespaceRoot(managedVolumeName) (*fsidentity.Directory, error)
 
 	// HostPath returns the conventional absolute mount path for a managed name.
 	HostPath(name string) string

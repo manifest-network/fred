@@ -435,6 +435,32 @@ func (proof MaintenanceReleaseFailure) SourceReady() (MaintenanceSourceReady, bo
 	return ready, true
 }
 
+// SourceProjection exposes the exact observed source cohort after failed
+// maintenance, including an unhealthy or incomplete compensated source. It is
+// a runtime observation, not readiness authority; only SourceReady supplies
+// that proof. Refusal and callback-only proofs cannot supply a projection.
+func (proof MaintenanceReleaseFailure) SourceProjection() (Release, []string, map[string][]string, bool) {
+	evidence, ok := proof.PhysicalEvidence()
+	if !ok {
+		return Release{}, nil, nil, false
+	}
+	var state *maintenanceProjectionState
+	switch evidence.kind {
+	case maintenancePhysicalEvidenceSourceReady:
+		state = evidence.sourceReady.state
+	case maintenancePhysicalEvidenceSourceFailed:
+		state = evidence.sourceFailed.state
+	default:
+		return Release{}, nil, nil, false
+	}
+	release, ok := state.subject.SourceRelease()
+	if !ok {
+		return Release{}, nil, nil, false
+	}
+	release, ids, services := maintenanceProjection(release, state)
+	return release, ids, services, true
+}
+
 // ReleaseClaim is an opaque compare-and-swap capability for one exact durable
 // release row. It is intentionally not constructible outside this package.
 type ReleaseClaim struct {
@@ -827,7 +853,7 @@ func (s *MaintenanceSettlement) ExecuteMaintenance(
 		return MaintenanceExecutionAmbiguous{settlement: s, execution: execution, cause: errors.New("maintenance execution was already consumed")}
 	}
 	if err := s.prepareCompensation(ctx, execution); err != nil {
-		return MaintenanceExecutionFailure{settlement: s, authority: execution.target, refused: true, cause: err}
+		return s.classifyMaintenancePreparationFailure(ctx, execution, err)
 	}
 	physical := s.execute(ctx, execution.started)
 	if err := substratemutation.ValidateLiveResult(s.mutation, execution.started, physical); err != nil {
@@ -888,6 +914,46 @@ func (s *MaintenanceSettlement) ExecuteMaintenance(
 			cause: fmt.Errorf("invalid maintenance mutation outcome %s", physical.Kind()),
 		}
 	}
+}
+
+// Source capture is read-only and precedes the target executor. Its failure
+// cannot establish that the active source failed. Observe that exact source
+// through the construction-bound attestor; an unreadable cohort remains
+// pending, while a ready source supplies the normal source-ready terminal proof.
+func (s *MaintenanceSettlement) classifyMaintenancePreparationFailure(ctx context.Context, execution MaintenanceExecutionClaim, cause error) MaintenanceExecutionOutcome {
+	ambiguous := func(err error) MaintenanceExecutionOutcome {
+		return MaintenanceExecutionAmbiguous{settlement: s, execution: execution, cause: errors.Join(cause, err)}
+	}
+	recovered, err := s.mutation.RecoverAfter(func() (MaintenancePhysicalSubject, error) {
+		unlock := s.lockLease(execution.target.LeaseUUID())
+		defer unlock()
+		intent, err := s.currentIntentForTargetLocked(execution.target)
+		if err != nil {
+			return MaintenancePhysicalSubject{}, err
+		}
+		if _, err := s.snapshotMaintenanceSourceLocked(intent); err != nil {
+			return MaintenancePhysicalSubject{}, err
+		}
+		return execution.subject, nil
+	})
+	if err != nil {
+		return ambiguous(err)
+	}
+	result := s.recovery.Inspect(recovered, ctx)
+	if err := substratemutation.ValidateRecoveryResult(s.mutation, recovered, result); err != nil {
+		return ambiguous(err)
+	}
+	evidence, ok := result.Evidence()
+	if result.Kind() != substratemutation.Attested || !ok {
+		return ambiguous(result.Err())
+	}
+	if err := validateMaintenancePhysicalEvidence(execution.subject, evidence); err != nil {
+		return ambiguous(err)
+	}
+	if evidence.kind != maintenancePhysicalEvidenceSourceReady {
+		return ambiguous(errors.New("source capture failure has no independently ready source"))
+	}
+	return MaintenanceExecutionFailure{settlement: s, authority: execution.target, subject: execution.subject, evidence: evidence, cause: cause}
 }
 
 func (s *MaintenanceSettlement) recoveryMaintenanceTarget(

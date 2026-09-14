@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/uuid"
@@ -109,7 +110,11 @@ func commitK3sOperationRefusal(
 // read would be test scaffolding in a production struct (ENG-765).
 func rebuildCallbackSender(t *testing.T, b *Backend) {
 	t.Helper()
-	httpClient := &http.Client{}
+	rebuildCallbackSenderWithClient(t, b, &http.Client{})
+}
+
+func rebuildCallbackSenderWithClient(t *testing.T, b *Backend, httpClient *http.Client) {
+	t.Helper()
 	attestor := shared.MustNewCallbackStorageAttestor(
 		b.callbackStore,
 		k3sCallbackStorageVerifier{verifier: b.storageVerifier, gate: b.storeAuthorityGate},
@@ -1210,18 +1215,14 @@ func TestListProvisions_PopulatesFailCount(t *testing.T) {
 	// Post-fix: ListProvisions populates FailCount from p.FailCount
 	// alongside the other fields, agreeing with GetProvision on the
 	// wire shape.
-	fred, ch := startFakeFred(t)
-	b := newBackendForTest(t, fred.URL)
-	startK3sCallbackReplayForTest(b)
-
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
-	_ = awaitCallback(t, ch)
-
-	list, err := b.ListProvisions(context.Background())
-	require.NoError(t, err)
-	require.Len(t, list, 1)
-	assert.Equal(t, 1, list[0].FailCount,
-		"ListProvisions must populate FailCount from the in-memory record")
+	synctest.Test(t, func(t *testing.T) {
+		b := provisionFailedStubWithInMemoryCallback(t)
+		list, err := b.ListProvisions(t.Context())
+		require.NoError(t, err)
+		require.Len(t, list, 1)
+		assert.Equal(t, 1, list[0].FailCount,
+			"ListProvisions must populate FailCount from the in-memory record")
+	})
 }
 
 func TestLookupProvisions_PopulatesFailCount(t *testing.T) {
@@ -1229,16 +1230,47 @@ func TestLookupProvisions_PopulatesFailCount(t *testing.T) {
 	// Same shape as TestListProvisions_PopulatesFailCount: pre-fix
 	// LookupProvisions omitted FailCount in its struct literal;
 	// post-fix it carries FailCount: p.FailCount.
-	fred, ch := startFakeFred(t)
-	b := newBackendForTest(t, fred.URL)
+	synctest.Test(t, func(t *testing.T) {
+		b := provisionFailedStubWithInMemoryCallback(t)
+		list, err := b.LookupProvisions(t.Context(), []string{"550e8400-e29b-41d4-a716-446655440000"})
+		require.NoError(t, err)
+		require.Len(t, list, 1)
+		assert.Equal(t, 1, list[0].FailCount,
+			"LookupProvisions must populate FailCount from the in-memory record")
+	})
+}
+
+// provisionFailedStubWithInMemoryCallback runs inside a synctest bubble: neither
+// socket availability nor host scheduling determines whether the projection
+// tests observe the stub's real failure and durable callback acknowledgement.
+func provisionFailedStubWithInMemoryCallback(t *testing.T) *Backend {
+	t.Helper()
+	const callbackBase = "https://fred.example"
+	b := newBackendForTest(t, callbackBase)
+	callbacks := make(chan backend.CallbackPayload, 1)
+	client := &http.Client{Transport: k3sReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		if err := hmacauth.Verify(testCallbackSecret, req.Method, req.URL.RequestURI(), body,
+			req.Header.Get(hmacauth.SignatureHeader), 5*time.Minute); err != nil {
+			return nil, err
+		}
+		var payload backend.CallbackPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return nil, err
+		}
+		callbacks <- payload
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+	})}
+	rebuildCallbackSenderWithClient(t, b, client)
 	startK3sCallbackReplayForTest(b)
-
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
-	_ = awaitCallback(t, ch)
-
-	list, err := b.LookupProvisions(context.Background(), []string{"550e8400-e29b-41d4-a716-446655440000"})
+	require.NoError(t, b.Provision(t.Context(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", callbackBase)))
+	require.Equal(t, backend.CallbackStatusFailed, awaitCallback(t, callbacks).Status)
+	synctest.Wait()
+	pending, err := b.callbackStore.ListPending()
 	require.NoError(t, err)
-	require.Len(t, list, 1)
-	assert.Equal(t, 1, list[0].FailCount,
-		"LookupProvisions must populate FailCount from the in-memory record")
+	require.Empty(t, pending, "projection assertions follow the actual durable callback acknowledgement")
+	return b
 }

@@ -39,8 +39,8 @@ import (
 
 var version = "dev"
 
-// Storage-identity preflight and initialization attest every managed volume
-// sequentially. Keep the default finite, but large enough for a real fleet;
+// Offline storage-identity and Docker-effects commands inspect durable storage
+// and may attest every managed volume. Keep the default finite for a real fleet;
 // operators with unusually large or slow substrates can override it on the
 // one-shot command line.
 const defaultStorageIdentityOperationTimeout = 10 * time.Minute
@@ -52,7 +52,9 @@ func main() {
 		os.Exit(0)
 	}
 	if err != nil {
-		// flag.ContinueOnError already wrote the error and usage to stderr.
+		// FlagSet prints syntax failures; validation of conflicting modes or
+		// missing repair arguments must also be visible before exiting.
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 	if startup.showVersion {
@@ -62,8 +64,8 @@ func main() {
 
 	// Bootstrap logger for startup messages (before config is loaded).
 	logOutput := io.Writer(os.Stdout)
-	if startup.preflightStorageIdentityAdoption {
-		// Keep the one-shot preflight's stdout machine-readable. Diagnostics,
+	if startup.preflightStorageIdentityAdoption || startup.dockerEffects.mode != dockerEffectsNone {
+		// Keep one-shot reports on stdout machine-readable. Diagnostics,
 		// including configuration and proof failures, remain visible on stderr.
 		logOutput = os.Stderr
 	}
@@ -97,6 +99,16 @@ func main() {
 	// Log SKU mappings for visibility
 	for uuid, profile := range cfg.SKUMapping {
 		logger.Info("SKU mapping", "uuid", uuid, "profile", profile)
+	}
+	if startup.dockerEffects.mode != dockerEffectsNone {
+		operationCtx, operationCancel := context.WithTimeout(context.Background(), startup.storageIdentityOperationTimeout)
+		operationErr := startup.dockerEffects.run(operationCtx, cfg, logger, os.Stdout)
+		operationCancel()
+		if operationErr != nil {
+			logger.Error("offline Docker-effects operation failed", "error", operationErr)
+			os.Exit(1)
+		}
+		return
 	}
 	if startup.preflightStorageIdentityAdoption {
 		preflightCtx, preflightCancel := context.WithTimeout(
@@ -339,6 +351,7 @@ type startupFlags struct {
 	initializeStorageIdentity        string
 	preflightStorageIdentityAdoption bool
 	storageIdentityOperationTimeout  time.Duration
+	dockerEffects                    dockerEffectsCommand
 }
 
 func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
@@ -355,18 +368,40 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	)
 	identityOperationTimeout := fs.Duration(
 		"storage-identity-operation-timeout", defaultStorageIdentityOperationTimeout,
-		"cooperative deadline for context-aware one-shot storage-identity proof work",
+		"cooperative deadline for one-shot storage-identity or Docker-effects operations",
 	)
+	inspectEffects := fs.Bool("inspect-unsettled-docker-effects", false,
+		"one-shot read-only: inspect unresolved Docker effects and print the exact repair acknowledgement")
+	repairEffects := fs.Bool("repair-unsettled-docker-effects", false,
+		"one-shot: repair unresolved Docker effects after external fencing; requires acknowledgement and backup")
+	effectsAcknowledgement := fs.String("docker-effects-acknowledgement", "", "exact acknowledgement from inspection; only valid with repair")
+	effectsBackup := fs.String("docker-effects-backup", "", "new backup path required for Docker-effects repair; only valid with repair")
 	if err := fs.Parse(args); err != nil {
 		return startupFlags{}, err
 	}
 	if *identityOperationTimeout <= 0 {
 		return startupFlags{}, errors.New("-storage-identity-operation-timeout must be positive")
 	}
-	if *preflightAdoption && *initializeIdentity != "" {
+	oneShotModes := 0
+	for _, requested := range []bool{*preflightAdoption, *initializeIdentity != "", *inspectEffects, *repairEffects} {
+		if requested {
+			oneShotModes++
+		}
+	}
+	if oneShotModes > 1 {
 		return startupFlags{}, errors.New(
-			"-preflight-storage-identity-adoption and -initialize-storage-identity are mutually exclusive",
+			"storage-identity preflight, initialization, Docker-effects inspection and repair are mutually exclusive",
 		)
+	}
+	repairArgumentsSupplied := false
+	fs.Visit(func(option *flag.Flag) {
+		if option.Name == "docker-effects-acknowledgement" || option.Name == "docker-effects-backup" {
+			repairArgumentsSupplied = true
+		}
+	})
+	effects, err := parseDockerEffectsCommand(*inspectEffects, *repairEffects, *effectsAcknowledgement, *effectsBackup, repairArgumentsSupplied)
+	if err != nil {
+		return startupFlags{}, err
 	}
 	if *showVer {
 		fmt.Fprintf(out, "docker-backend version %s\n", version)
@@ -377,6 +412,7 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		initializeStorageIdentity:        *initializeIdentity,
 		preflightStorageIdentityAdoption: *preflightAdoption,
 		storageIdentityOperationTimeout:  *identityOperationTimeout,
+		dockerEffects:                    effects,
 	}, nil
 }
 

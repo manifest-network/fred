@@ -4,6 +4,8 @@ import (
 	"context"
 
 	networktypes "github.com/docker/docker/api/types/network"
+
+	"github.com/manifest-network/fred/internal/fsidentity"
 )
 
 // dockerReadView is a closure projection, not an interface narrowing cast. Its
@@ -79,6 +81,7 @@ type volumeReadView struct {
 	requireNoInterrupted func(context.Context) error
 	validate             func() error
 	hostPath             func(string) string
+	pinNamespaceRoot     func(managedVolumeName) (*fsidentity.Directory, error)
 	usage                func(context.Context, string) (int64, error)
 	kind                 func() string
 }
@@ -95,7 +98,8 @@ func projectVolumeRead(volumes volumeReader) volumeReader {
 		attest:               volumes.AttestManagedVolume,
 		requireNoInterrupted: volumes.RequireNoInterruptedVolumeMutations,
 		validate:             volumes.Validate, hostPath: volumes.HostPath,
-		usage: volumes.Usage, kind: volumes.Kind,
+		pinNamespaceRoot: volumes.PinNamespaceRoot,
+		usage:            volumes.Usage, kind: volumes.Kind,
 	}
 	if pinner, ok := volumes.(identityRootPinner); ok {
 		return pinnedVolumeReadView{volumeReadView: view, pin: pinner.PinIdentityRoot, verify: pinner.VerifyIdentityRoot}
@@ -118,3 +122,7 @@ func (v volumeReadView) Usage(ctx context.Context, id string) (int64, error) { r
 func (v volumeReadView) Kind() string                                        { return v.kind() }
 func (v pinnedVolumeReadView) PinIdentityRoot() error                        { return v.pin() }
 func (v pinnedVolumeReadView) VerifyIdentityRoot() error                     { return v.verify() }
+
+func (v volumeReadView) PinNamespaceRoot(name managedVolumeName) (*fsidentity.Directory, error) {
+	return v.pinNamespaceRoot(name)
+}

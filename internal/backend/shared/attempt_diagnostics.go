@@ -23,10 +23,10 @@ var (
 const (
 	// Diagnostic logs retain the same aggregate budget as the Docker log API.
 	// The independent encoded budget also bounds JSON escaping and metadata.
-	MaxFailureDiagnosticLogBytes      = 32 << 20
+	MaxFailureDiagnosticLogBytes      = backend.MaxLogContentBytes
 	MaxFailureDiagnosticEncodedBytes  = 40 << 20
 	maxFailureDiagnosticMetadataBytes = 256 << 10
-	maxFailureDiagnosticContainers    = 4096
+	maxFailureDiagnosticContainers    = backend.MaxFailureDiagnosticEntries
 )
 
 // DiagnosticCaptureStatus describes an observation, never cleanup authority.
@@ -264,6 +264,7 @@ func (store *DiagnosticsStore) captureAttempt(identity diagnosticAttemptIdentity
 		if len(data) > MaxFailureDiagnosticEncodedBytes {
 			return errors.New("attempt diagnostic exceeds its encoded byte budget")
 		}
+		store.keepAttemptTx(tx, []byte(identity.key()))
 		return bucket.Put([]byte(identity.key()), data)
 	})
 	if err != nil {
@@ -362,7 +363,7 @@ func normalizeAttemptDiagnosticPrioritizing(record *attemptDiagnosticRecord, ret
 		}
 	}
 	for _, key := range keys {
-		if len(logs) >= maxFailureDiagnosticContainers || len(key) > 256 || !utf8.ValidString(key) {
+		if len(logs) >= maxFailureDiagnosticContainers || len(key) > backend.MaxFailureDiagnosticKeyBytes || !utf8.ValidString(key) {
 			record.Status = DiagnosticCaptureTruncated
 			continue
 		}
@@ -434,7 +435,7 @@ func decodeAttemptDiagnostic(data []byte) (attemptDiagnosticRecord, error) {
 	rawBytes := 0
 	for key, value := range record.Entry.Logs {
 		rawBytes += len(value)
-		if len(key) > 256 || !utf8.ValidString(key) || !utf8.ValidString(value) || rawBytes > MaxFailureDiagnosticLogBytes {
+		if len(key) > backend.MaxFailureDiagnosticKeyBytes || !utf8.ValidString(key) || !utf8.ValidString(value) || rawBytes > MaxFailureDiagnosticLogBytes {
 			return record, errors.New("stored attempt diagnostic logs exceed their budget")
 		}
 	}
@@ -463,26 +464,18 @@ func (store *DiagnosticsStore) readAttempt(identity diagnosticAttemptIdentity) (
 }
 
 // RetainDuring keeps the already-durable record readable until the caller's
-// bounded action ends. The read transaction prevents expiry or store closure
-// from deleting the only saved copy between persistence and physical removal.
+// bounded action ends. A store-owned pin prevents expiry or store closure from
+// deleting the only saved copy between persistence and physical removal. No
+// database transaction remains open during the action.
 // This grants no cleanup authority; substrate adapters must separately own the
 // exact captured cohort and its opaque physical subject.
-func (capture FailureDiagnosticCapture) RetainDuring(action func() error) error {
+func (capture FailureDiagnosticCapture) RetainDuring(action func() error) (err error) {
 	if !capture.Valid() || action == nil {
 		return errors.New("durable diagnostic retention is invalid")
 	}
-	return capture.store.view(func(tx *bolt.Tx) error {
-		data := tx.Bucket(attemptDiagnosticsBucketName).Get([]byte(capture.identity.key()))
-		if data == nil {
-			return errors.New("diagnostic capture expired before its owned action")
-		}
-		record, err := decodeAttemptDiagnostic(data)
-		if err != nil {
-			return err
-		}
-		if !sameDiagnosticAttempt(record.Identity, capture.identity) {
-			return errors.New("retained diagnostic differs from the captured attempt")
-		}
-		return action()
-	})
+	if err := capture.store.retainAttempt(capture.identity); err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, capture.store.releaseAttempt(capture.identity)) }()
+	return action()
 }

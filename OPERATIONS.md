@@ -76,6 +76,7 @@ The dependency signal did not disappear, it moved: the per-check map is still in
 |---|---|---|
 | `fred_backend_circuit_breaker_state{backend="X"} == 2` (open) | Backend X has been unhealthy long enough to trip the breaker | `curl backendX/health`, check backend logs |
 | `fred_backend_healthy{backend="X"} == 0` for >1 min | Backend health probe failing | Same as above. Note this no longer affects the tenant API's availability — the provider reports `degraded` and keeps serving |
+| `fred_docker_backend_volume_launches_pending > 0` beyond the expected launch window | Outstanding Docker launch receipts; a transient nonzero value is normal while launches run | Confirm recent successful backend health sampling, then correlate pending requests with backend logs. The gauge holds its last sample when health fails and does not count image-helper receipts. Follow [Unsettled Docker effects](#unsettled-docker-effects) for persistent unknown requests; never delete a receipt to clear the gauge |
 | Backend X reports `callback store unhealthy` | `callbacks.db` is missing a delivery/intent bucket, contains malformed durable evidence, or gives one lease simultaneous operation, maintenance, or close rows. A terminal Succeeded/Failed operation row is history rather than active mutation authority; authorized successor admission retires it atomically instead of leaving simultaneous rows. Current deliveries live below a lease-identifying nested bucket. Operation identity/snapshot fields are immutable; maintenance advances through typed pre-append and append-started phases and then binds one exact target fence; close preserves its immutable snapshot while durably advancing a monotonic execution generation immediately before physical work. Every change uses an exact digest-bearing claim. Replay/TTL never silently deletes poison data, terminal operation rows remain after delivery until an authorized successor, and causal intents, close intents, and exact completions never age out | Stop that backend, take a copy of `callbacks.db` with the matching release store, storage markers, containers, and volumes. Inspect or restore the named lease offline (or the complete file when a root bucket is missing). Prefer exact repair/restore over deleting the database; wholesale deletion can lose accepted work, terminal decisions, replacement identity, destructive-cleanup authority, and pending completions. Keep the node out of new placement until `/health` is clean |
 | Backend latches after `post-mutation storage verification`, refuses startup with `recover interrupted operations`, or `fred_*_backend_callback_store_errors_total` increases | A raw mutation returned without a usable postcheck, callback persistence/store access failed on an instrumented path, operation-intent startup recovery failed, or another authoritative journal/substrate proof reached a terminal identity or outcome-unknown failure. The first cause is sticky for the backend lifetime: callback, release, and retention journals (where present), substrate mutation admission, and callback delivery all refuse through the same latch. A running docker-backend publishes that first cause to its main loop, closes the listener, drains workers, and exits status 1 so the supervisor must launch a fresh `Start`; a persistent fault therefore crash-loops closed instead of serving. A valid but semantically indeterminate maintenance row is different: it need not make `/health` fail or increment this counter; use the Docker reconciliation signal below. A close intent already owns destruction, so recovery resumes it from its immutable snapshot before ordinary exact-cohort validation and reports retry errors in the lease-scoped close log below | Fence mutation ingress and preserve `callbacks.db`, `releases.db`, `retention.db` where present, the storage-identity marker pair, and the substrate as one evidence set. Do not treat one still-readable sibling journal or a queued callback as permission to continue; the shared latch intentionally withdrew the entire lineage. Let the supervised restart retry only after repairing the Docker/retention/SKU/store inconsistency or restoring the matching stopped-process snapshot. Restart only against that same set. Never delete an intent, finalizer, release fence, retained data, or callback evidence merely to make readiness green |
 | `fred_docker_backend_oldest_close_intent_age_seconds` remains above the normal close window, `fred_docker_backend_pending_close_intents` remains non-zero, or `durable close recovery remains pending` repeats for one lease | Docker admitted deprovision before teardown, then a transient container/volume/release/accounting/outbox failure prevented finalization. The aggregate gauges deliberately omit lease labels; the log's lease UUID and durable `execution_generation` identify the exact attempted run and survive restart. A full close keeps a conservative projection and capacity reservation; a cleanup-only close may have no tenant-visible projection but remains the sole non-expiring retry owner | Correlate the recovery log's lease UUID with nearby teardown, retention, release-store, and callback-store errors. Restore the failed dependency and let the next docker-backend recovery tick independently classify the Started generation before authorizing another run. If offline inspection is required, stop the backend and inspect that lease's close-tagged head in `callback_lease_mutation_heads` together with the exact `releases.db` history and substrate; callback URLs contain causal identifiers, so do not paste raw row contents into tickets. Never delete the row merely because Docker reports zero containers |
@@ -396,6 +397,120 @@ use; preserve the evidence and restore the matching stopped snapshot. For an
 unmounted ZFS child, verify the exact child and configured mountpoint, then
 remount it or restore the matching pool snapshot before rerunning the same
 one-shot mode. Never interpret a failed one-shot command as cleanup authority.
+
+---
+
+## Unsettled Docker effects
+
+A launch or image-helper request whose completion is unknown remains durable in
+`callbacks.db`. A timeout, a restarted daemon, or empty container inventory
+cannot prove that an earlier Docker or container-runtime request will never
+execute. Launch records block reuse of their exact physical volumes and lease
+namespace across restart. Ordinary work on unrelated leases remains independent.
+
+The configured `docker_host` must reach a direct, trusted Docker endpoint. Fred
+disables environment HTTP proxies for its Docker SDK transport so gateway errors
+cannot masquerade as daemon completion. A recognized terminal Docker failure can
+settle a finished request while the workflow still fails; cancellation, lost
+responses and unrecognized outcomes retain the unresolved record. Neither request
+completion nor repair invents a Ready workload.
+
+Image helpers use the same completion protocol as managed launches. Their durable
+reservation follows dispatch admission and precedes Create; refusal before
+dispatch admission does not leave an unknown helper record. Known completed helper failures settle
+normally, while unknown effects remain subject to the fencing procedure below.
+
+Use the following exceptional offline procedure only when normal recovery cannot
+settle an unknown request. The commands inspect or repair journal evidence; they
+do not stop Docker, fence its runtime, or delete containers for you.
+
+1. Stop the affected backend and **all old Fred clients and admission** that can
+   reach it. Prevent supervisors, schedulers and old processes from resuming.
+   Preserve the matching journals, storage markers and substrate. Do not delete
+   launch/helper rows or recreate volume paths.
+2. Externally fence and drain **both Docker and its container runtime** on that
+   host, including earlier queued requests. One concrete option is a host reboot
+   after disabling automatic restart of the backend and every old client, with
+   admission still closed. Restarting only the Docker daemon, especially with
+   runtime tasks surviving it, or observing zero containers is insufficient.
+3. Restore access to the **same** daemon/storage lineage and mounted volumes;
+   keep the backend and old clients stopped. Use the service's unchanged config
+   and working directory when paths are relative. Do not initialize or adopt a
+   replacement storage identity. Inspect without starting the backend:
+
+   ```bash
+   umask 077
+   docker-backend -config docker-backend.yaml \
+     -inspect-unsettled-docker-effects > docker-effects-inspection.json && \
+     jq -e '.verdict == "DOCKER_EFFECTS_INSPECTED"' docker-effects-inspection.json && \
+     jq . docker-effects-inspection.json
+   ```
+
+   Require exit status zero and `verdict: "DOCKER_EFFECTS_INSPECTED"`. Review the
+   backend, storage ID, database path, snapshot SHA-256, launch/helper counts and
+   affected leases. Read `acknowledgement` and verify every stated fencing fact
+   before accepting it. It binds this exact snapshot; an old acknowledgement
+   cannot authorize a changed journal. If both counts are zero, there is nothing
+   for repair to settle; with the external fence maintained, proceed to step 6.
+4. Choose a **new, absent backup path** in a trusted directory. Repair creates
+   the mandatory backup with mode `0600`, verifies its exact bytes and refuses
+   to overwrite an existing file. Only after the preceding review, run:
+
+   ```bash
+   docker_effects_ack=$(jq -r '.acknowledgement' docker-effects-inspection.json)
+   docker-backend -config docker-backend.yaml \
+     -repair-unsettled-docker-effects \
+     -docker-effects-acknowledgement "$docker_effects_ack" \
+     -docker-effects-backup /var/backups/fred/docker-effects-before-repair.db \
+     > docker-effects-repair.json
+   docker_effects_status=$?
+   cat docker-effects-repair.json
+   test "$docker_effects_status" -eq 0 && \
+     jq -e '.verdict == "DOCKER_EFFECTS_FENCED"' docker-effects-repair.json
+   ```
+
+   Require **both exit status zero and `DOCKER_EFFECTS_FENCED`**. An error or
+   `REPAIR_NOT_CONFIRMED`/`REPAIR_COMMITTED` means preserve any created backup and
+   reconcile the outcome with a new read-only inspection before retrying. Even a
+   complete-looking JSON response is insufficient if the command failed during
+   output or final verification.
+5. If repair returned an error, **keep the external fence and all clients
+   stopped**. Retain the original inspection, repair report and backup. Inspect
+   the same backend/storage/database again into a separate file:
+
+   ```bash
+   docker-backend -config docker-backend.yaml \
+     -inspect-unsettled-docker-effects > docker-effects-after-repair.json && \
+     jq -e --slurpfile original docker-effects-inspection.json '
+       select(.verdict == "DOCKER_EFFECTS_INSPECTED"
+         and .backend == $original[0].backend
+         and .storage_id == $original[0].storage_id
+         and .database == $original[0].database
+         and .launches == 0 and .unknown_helpers == 0)
+     ' docker-effects-after-repair.json
+   ```
+
+   A successful inspection with matching identity and **both durable counts
+   zero** confirms that no unresolved Docker effects remain and permits normal
+   recovery under the maintained external fence. This verifies the durable
+   journal; it does not infer completion from empty container inventory. Do not
+   rerun repair to obtain a success token: repair deliberately refuses when no
+   work remains. Any identity mismatch, nonzero count or inspection error keeps
+   the backend stopped. Remaining effects require a fresh acknowledgement and
+   new backup path before another repair attempt.
+6. After either confirmed repair or that successful zero-count inspection, start
+   normal backend recovery against the same lineage, verify health and exact
+   workload outcomes, then reopen admission.
+   Recovery still requires exact container, release and volume ownership; repair
+   does not bypass a foreign cohort, repair application data, or mark a lease
+   Ready.
+
+Inspection and repair are mutually exclusive with each other and with storage
+initialization/adoption preflight. Both use
+`-storage-identity-operation-timeout` (default `10m`) as a cooperative deadline.
+Blocking filesystem calls may still require process supervision; elapsed time
+never supplies the external fencing fact. Keep diagnostics on stderr and retain
+the JSON reports and backup with the incident evidence.
 
 ---
 
@@ -1513,7 +1628,8 @@ that lease rather than deleting receipt authority by hand.
   `physical volume has an unsettled Docker launch`. Preserve the databases and
   directories and investigate the original Docker request. Removing journal
   rows, recreating paths, or retrying with a different key cannot safely resolve
-  that ambiguity.
+  that ambiguity. Use the [offline fencing and repair procedure](#unsettled-docker-effects)
+  when normal recovery cannot obtain completion evidence.
 
 Compensation uses the source's captured immutable image and effective settings,
 including its resource limits and callback route. It does not pull a mutable tag
@@ -1523,6 +1639,12 @@ activated target release cannot be compensated.
 **To diagnose a failed update:**
 1. `GET /v1/leases/{uuid}/releases` — the failed release has `status: "failed"` and curated `reason` and `message` fields.
 2. `GET /v1/leases/{uuid}/logs` — the diagnostics store retains the failed attempt's captured logs for the configured retention (7 days by default), including under `failed/<service>/<instance>` keys alongside live logs when the restored source is Ready. An unavailable diagnostics store delays failed-target removal and terminal failure publication.
+
+**Phase timing:** `fred_docker_backend_replace_phase_duration_seconds{operation,phase}`
+now charges root materialization, reservation waits, writer drain/stop and bind
+preparation/chown to `volume_setup`. `compose_up` covers protected create/start
+and launch-receipt settlement. Source compensation is outside this histogram,
+so its samples alone do not describe a failed replacement's complete duration.
 
 ### Restore operations
 
@@ -1597,6 +1719,13 @@ quota-application, callback-store, CAS, or accounting uncertainty keeps the row
 `unable to restore source volume quotas` and the retention-sweep error, repair
 the storage/store dependency, and let reconciliation retry; never delete the
 source finalizer.
+
+If the failed destination wrote more data than the immutable source quota can
+hold, this is an intentional reservation hold, not an accounting leak. The
+`restoring` row and destination allocation remain until a safe handback can be
+proved. Repeated retries cannot shrink the data: preserve it, inspect the logged
+usage/source cap and plan explicit operator recovery. Do not delete the finalizer,
+free the allocation or edit the source quota to make reconciliation pass.
 
 The periodic sweep takes the destination command fence and an exclusive typed
 lease-actor quiescence claim before reading recovery inputs. That capability

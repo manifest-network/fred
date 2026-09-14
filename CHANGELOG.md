@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Docker now provides offline `-inspect-unsettled-docker-effects` and
+  `-repair-unsettled-docker-effects` commands for unknown launch/helper requests.
+  Repair requires external Docker/runtime fencing, an exact snapshot-bound
+  acknowledgement and a new verified `0600` backup. Normal recovery retains its
+  existing ownership checks; repair does not assert workload readiness. After an
+  indeterminate repair, matching read-only journal inspection can verify that no
+  unresolved effects remain without rerunning a no-work repair.
+- `fred_docker_backend_volume_launches_pending` exposes outstanding launch
+  receipts at the last successful backend health inspection. The operations
+  runbook covers sustained unresolved requests and exceptional offline repair.
 - Docker storage adoption now has a dedicated read-only command,
   `docker-backend -config <path> -preflight-storage-identity-adoption`, whose
   only success output is
@@ -728,11 +738,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Docker adapters now distinguish completed daemon failures from requests whose
+  effects remain unknown. A completed failure can settle its launch receipt
+  while preserving the workflow failure; timeouts and lost responses retain
+  durable fencing. Docker SDK connections bypass environment HTTP proxies so
+  intermediary errors cannot supply completion evidence.
+- Image helpers and managed launches share the daemon-completion observer and
+  one `StepCompleted`/`CommitCompletedStep` protocol. Helper preparation acquires
+  its durable reservation only after dispatch admission; known completed helper
+  failures settle normally without nested mutation boundaries.
 - Managed Docker launches reserve physical volumes and retain namespace exclusion
   through container start. Exact prior writers are retired before bind preparation;
   unsafe cross-container mount layouts and unresolved earlier launches refuse reuse.
   Durable launch records also fence volume path recreation after ambiguous Docker
-  responses. (ENG-797)
+  responses. Ordinary exclusion is scoped to the affected leases and physical
+  directories, preserving unrelated-lease progress. Writer inventory resolves
+  named volumes and aliases without rejecting unrelated non-directory mounts;
+  complete mount-graph checks avoid pairwise rescanning. (ENG-797)
+- Replacement phase timings now include reservation waits, writer drain/stop and
+  bind preparation in `volume_setup`, and protected create/start plus receipt
+  settlement in `compose_up`. Source compensation remains outside the histogram.
 - Failed replacements can compensate from durable source image identities,
   effective runtime settings, and physical volume identities. Successful
   compensation restores Ready while reporting maintenance failure; ambiguous
@@ -741,10 +766,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (ENG-932)
 - Failed startup diagnostics are captured before exact-target removal, survive
   restart and close, and remain available after successful compensation. Older
-  cleanup cannot overwrite a newer attempt's published failure. (ENG-939)
+  cleanup cannot overwrite a newer attempt's published failure. Captures remain
+  pinned during cleanup without holding bbolt read transactions across Docker
+  calls; malformed diagnostic rows no longer block unrelated expiry. The
+  provider log-response limit now accommodates the existing 32 MiB content
+  budget and bounded JSON expansion. (ENG-939)
 - Image inspection helpers persist exact cleanup ownership before creation.
   Cancellation, lost Create responses, removal failures, and restart preserve
   their independently recoverable cleanup obligations. (ENG-940)
+- Callback timing regressions use virtual time and in-memory delivery, and cache
+  tests explicitly cover mutation of both detector buffers and returned hits.
+  Removed unused contextless diagnostic helpers and the redundant numeric UID
+  field from writable-path detection warnings.
 
 - **Fleet test timeout isolation:** Healthy fleet scenarios now use the production
   HTTP request budget instead of inheriting the short hang-injection timeout.

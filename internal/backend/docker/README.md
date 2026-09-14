@@ -25,6 +25,29 @@ project accessor. Both executors accept only values from their own admitter.
 The retained SDK views expose neither raw `ContainerCreate` nor generic Compose
 `Up`; the constructors capture those methods inside the typed executors.
 
+Lifecycle workflows own sequencing and compensation. Docker adapters report
+whether an issued request completed; the identity-bound journal owns permission
+to advance or retry that exact attempt. Diagnostics are observations tied to
+those proofs, never an alternative source of lifecycle authority. The backend
+constructor binds these components once. Docker journal extensions remain in
+`shared` to preserve their transaction and storage-identity guards; reorganizing
+that package is a separate follow-up.
+
+Managed launches and image helpers share the daemon-completion observer and
+the `StepCompleted`/`CommitCompletedStep` protocol. Helper creation uses one
+completion bracket, without nesting another `RunStep` to recover dispatch or
+panic evidence. The parent workflow retains its existing effect classification;
+the helper protocol cannot mint the parent's physical outcome. A typed helper
+preparation becomes a durable reservation only after dispatch admission, before
+Docker can receive Create. Refusal before dispatch therefore creates no unknown
+helper obligation.
+
+Configure a direct, trusted Docker endpoint. The SDK transport deliberately
+disables environment HTTP proxies (`HTTP_PROXY`, `HTTPS_PROXY` and their
+lowercase equivalents): a gateway-generated error cannot prove that Docker
+finished an issued request. Do not put a response-generating intermediary in
+front of `docker_host`.
+
 ## Configuration Reference
 
 All fields are set in the backend's YAML config block. Defaults come from `DefaultConfig()`.
@@ -164,21 +187,32 @@ intent classes is governed by `callback_max_age`.
 ### Protected launches and failed replacements
 
 Every managed launch owns its complete volume preparation and container start
-sequence. It reserves the attested physical directories, excludes namespace
-changes, retires only the exact prior runtime's writers, and validates the
-complete mount graph before Docker starts a replacement. Bind aliases share the
+sequence. It reserves the attested physical directories, excludes changes to
+that lease's namespace, retires only the exact prior runtime's writers, and
+validates the complete mount graph before Docker starts a replacement. Bind aliases share the
 same reservation. A foreign writer or a layout where one container could replace
 another container's pending bind source refuses the launch.
 
 Before Docker receives a launch, `callbacks.db` records its exact attempt and
-physical volumes. Only successful, synchronous completion of all issued Docker
-calls and storage attestation can clear this record. A timeout or lost response
-leaves an unresolved launch across restart. Empty inventory does not clear it;
+physical volumes. Completion evidence from the adapter for all issued Docker
+calls and storage attestation can clear this record. A recognized terminal Docker error
+settles that request but still fails the workflow; it never implies Ready.
+A timeout, lost response, or unrecognized result leaves an unresolved launch
+across restart. Empty inventory does not clear it;
 subsequent launches and create/destroy/rename operations in that lease's
 volume namespace remain blocked. This also prevents replacing an inode to evade
 an outstanding request. Preserve the journal and directories when diagnosing
 `physical volume has an unsettled Docker launch`; deleting a row or recreating
-the volume path is not a supported repair.
+the volume path is not a supported repair. Use the
+[offline Docker-effects runbook](../../../OPERATIONS.md#unsettled-docker-effects)
+only after externally fencing all old Docker and container-runtime requests.
+
+Ordinary launches and namespace mutations on unrelated leases can proceed
+independently. Same-lease mutations retain fair ordering, while aliases of the
+same physical directory share exclusion. Only startup recovery of interrupted
+volume-manager work takes global layout exclusion. The writer inventory resolves
+named-volume sources and symlink aliases; unrelated sockets, FIFOs and devices
+do not themselves conflict with a managed directory.
 
 Before pulling a replacement image or retiring its source, maintenance captures
 the source's immutable image content/platform, effective Docker configuration,
@@ -199,7 +233,10 @@ does not reverse database migrations or other writes it made to retained data.
 Image inspection helpers have their own durable ownership records in
 `callbacks.db`. Their exact random name, image identity, and attempt precede
 Create; cleanup uses the backend lifetime even when the inspection caller was
-canceled. Startup and periodic recovery retry exact helper removal, including
+canceled. A known completed helper failure settles through the same completion
+protocol as a managed launch while retaining its failure outcome. Unknown
+Create/Start effects still require completion evidence or the external fencing
+procedure. Startup and periodic recovery retry exact helper removal, including
 a late container from a lost Create response. Those uncertain receipts do not
 expire when a workload closes. Helper cleanup never treats an unrelated
 container or a replacement daemon as the owned helper.
@@ -218,14 +255,22 @@ carries the exact interrupted attempt into that same capture path. Only current
 terminal authority publishes a capture to the lease view, so delayed cleanup of
 an older attempt cannot replace a newer failure.
 
+Store-owned pins retain captures through physical cleanup without keeping a
+bbolt read transaction open across Docker calls. Deletion of a pinned capture
+waits for its final user; unrelated diagnostic writes can continue. Malformed
+observational rows are preserved for inspection without preventing unrelated
+records from expiring.
+
 `GET /provisions/{lease_uuid}` and `GET /logs/{lease_uuid}` retain the persisted
 failure after container removal or backend restart. When compensation restored a Ready source, live log keys remain unchanged and
 the failed attempt is included under `failed/<service>/<instance>` keys. Those
 entries are tied to that compensated release and disappear from the active view
 after a later deployment. Logs share a 32 MiB aggregate content budget, with
-bounded marker and encoding overhead. Log capture is bounded to 32 MiB per attempt;
-unavailable or truncated capture is recorded
-explicitly. The default retention is seven days. Recreating `diagnostics.db`
+bounded marker and encoding overhead. The provider's encoded response limit
+includes JSON expansion and bounded keys, so it can carry that content budget.
+Explicit smaller client limits still apply. Log capture is bounded to 32 MiB per
+attempt; unavailable or truncated capture is recorded explicitly. The default
+retention is seven days. Recreating `diagnostics.db`
 while stopped loses its existing captures; it does not manufacture lifecycle or
 cleanup authority.
 
@@ -573,7 +618,7 @@ Restore-specific re-deploy behavior worth knowing:
 
 ### Failure handling & crash recovery
 
-Restore is crash-safe and self-healing. A retention record carries one of three persisted statuses — `active` (awaiting restore or reap), `restoring` (a restore is in flight), and `reaping` (volumes are pending physical destruction). Adoption renames volumes and applies the destination filesystem quota; rollback must reverse both mutations safely:
+Restore uses durable finalizers for crash recovery. A retention record carries one of three persisted statuses — `active` (awaiting restore or reap), `restoring` (a restore is in flight), and `reaping` (volumes are pending physical destruction). Adoption renames volumes and applies the destination filesystem quota; rollback must reverse both mutations safely:
 
 The `reaping` status is a finalizer tombstone (ENG-376): when a retained record
 is grace-expired or cap-evicted, the record is **not** deleted at the
@@ -609,6 +654,11 @@ record stays `reaping`.
   callback; the periodic sweep completes the handback from that terminal row.
   Successful callback delivery does not remove it, and absence fails closed.
   Any uncertainty remains `restoring` and live-counted.
+  If the destination wrote more data than the immutable source quota permits,
+  handback deliberately keeps the destination reservation and `restoring` row;
+  repeated retries cannot make those bytes fit. Preserve the data and use an
+  explicit operator recovery plan instead of freeing the reservation or raising
+  the source's recorded quota by hand.
 - **Committed restore followed by failure:** an exact active destination Release
   is the durable commit marker. It is retained even if the destination is now
   Failed or absent; a matching Pending operation is transitioned to Succeeded.
@@ -854,6 +904,20 @@ The edges above are the complete set of allowed transitions; any event not liste
   leases.
 
 ### Observability
+
+`fred_docker_backend_volume_launches_pending` samples outstanding launch receipts
+at each successful backend health inspection. A transient nonzero value is
+normal during a launch. Alert on a sustained value beyond the expected launch
+window, check that health sampling is current, and correlate the exact lease in
+backend logs before using the [recovery runbook](../../../OPERATIONS.md#unsettled-docker-effects).
+The gauge does not count image-helper receipts; offline inspection reports those
+separately.
+
+For `fred_docker_backend_replace_phase_duration_seconds{operation,phase}`,
+`volume_setup` includes root materialization, reservation waits, writer drain/stop
+and bind preparation/chown. `compose_up` covers protected container create/start
+and launch-receipt settlement. Source compensation is outside this histogram;
+these phases do not measure the full wall time of a failed replacement.
 
 - `fred_docker_backend_lease_sm_transitions_total{from,to,event}` — every transition.
 - `fred_docker_backend_lease_actors_created_total` — cumulative actor count; should track distinct leases (recycled UUIDs after Deprovision produce a fresh actor, so this counter grows faster than the live-actor count).

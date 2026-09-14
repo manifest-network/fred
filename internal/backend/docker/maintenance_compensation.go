@@ -249,15 +249,17 @@ func decodeCompensationSourcePlan(subject shared.MaintenancePhysicalSubject, enc
 // createCompensationContainer is the raw, construction-only source creation
 // operation. The whole-plan volume sink is its sole production caller. Image
 // execution remains bound to this DockerClient's admitter/creator lineage.
-func (d *DockerClient) createCompensationContainer(ctx context.Context, image imageexec.Image, snapshot compensationContainer) (string, error) {
-	config := cloneCompensationConfig(*snapshot.Config)
-	config.Labels = maps.Clone(config.Labels)
-	config.Labels[LabelCreatedAt] = time.Now().Format(time.RFC3339)
-	created, err := d.creator.Create(ctx, image, &config, snapshot.Host, snapshot.Networks, snapshot.Name)
-	if err != nil {
-		return "", err
-	}
-	return created.ID, nil
+func (d *DockerClient) createCompensationContainer(ctx context.Context, image imageexec.Image, snapshot compensationContainer) (string, daemonLaunchOutcome) {
+	var created container.CreateResponse
+	outcome := d.launchObserver.run(ctx, func(ctx context.Context) error {
+		config := cloneCompensationConfig(*snapshot.Config)
+		config.Labels = maps.Clone(config.Labels)
+		config.Labels[LabelCreatedAt] = time.Now().Format(time.RFC3339)
+		var err error
+		created, err = d.creator.Create(ctx, image, &config, snapshot.Host, snapshot.Networks, snapshot.Name)
+		return err
+	})
+	return created.ID, outcome
 }
 
 func (d *DockerClient) readmitCompensationImage(ctx context.Context, snapshot compensationContainerRecord) (imageexec.Image, error) {
@@ -443,9 +445,14 @@ func (b *Backend) classifyMaintenanceCompensation(ctx context.Context, subject s
 	if err != nil {
 		return shared.MaintenancePhysicalEvidence{}, err
 	}
-	wanted := make(map[string]compensationContainerRecord, len(plan.Containers))
+	wanted := make(map[recoveredInstanceKey]compensationContainerRecord, len(plan.Containers))
 	for _, snapshot := range plan.Containers {
-		wanted[snapshot.Name] = snapshot
+		meta, err := parseLabelMeta(snapshot.Config.Labels)
+		if err != nil {
+			return shared.MaintenancePhysicalEvidence{}, err
+		}
+		key := recoveredInstanceKey{service: snapshot.Config.Labels[LabelServiceName], sku: snapshot.Config.Labels[LabelSKU], index: meta.InstanceIndex}
+		wanted[key] = snapshot
 	}
 	all, err := b.strictIdentityBoundOperationInventory(ctx)
 	if err != nil {
@@ -460,15 +467,27 @@ func (b *Backend) classifyMaintenanceCompensation(ctx context.Context, subject s
 		if err != nil {
 			return shared.MaintenancePhysicalEvidence{}, err
 		}
-		snapshot, ok := wanted[info.Name]
-		if !ok || inspected == nil || inspected.execution == nil || inspected.execution.ImageID != snapshot.ImageID {
+		if inspected == nil || inspected.ContainerID != info.ContainerID {
+			return shared.MaintenancePhysicalEvidence{}, errors.New("source compensation inspection identity changed")
+		}
+		key := recoveredInstanceKey{service: inspected.ServiceName, sku: inspected.SKU, index: inspected.InstanceIndex}
+		snapshot, ok := wanted[key]
+		if !ok || inspected.Name != snapshot.Name || inspected.execution == nil || inspected.execution.ImageID != snapshot.ImageID {
 			return shared.MaintenancePhysicalEvidence{}, errors.New("source compensation image or instance differs from frozen execution")
 		}
-		delete(wanted, info.Name)
+		if err := validateMaintenanceGenerationContainer(subject.Intent().LeaseUUID(), source.MaintenanceID, subject.Intent().Backend(), source, *inspected); err != nil {
+			return shared.MaintenancePhysicalEvidence{}, fmt.Errorf("source compensation contains an unowned instance: %w", err)
+		}
+		delete(wanted, key)
 		cohort = append(cohort, *inspected)
 	}
+	ids, services := physicalProjection(cohort)
 	if len(wanted) != 0 {
-		return shared.MaintenancePhysicalEvidence{}, errors.New("source compensation cohort is incomplete")
+		// A settled source launch can finish with only a verified subset (or
+		// no containers). It is a failed runtime projection, never readiness or
+		// permission to replay the frozen plan. Unknown launch debt still makes
+		// this constructor refuse terminal authority.
+		return shared.NewMaintenanceCompensationSourceFailed(subject, ids, services)
 	}
 	if err := validateRecoveredReleaseCohort(&source, cohort); err != nil {
 		return shared.MaintenancePhysicalEvidence{}, err
@@ -477,7 +496,6 @@ func (b *Backend) classifyMaintenanceCompensation(ctx context.Context, subject s
 	if err != nil {
 		return shared.MaintenancePhysicalEvidence{}, err
 	}
-	ids, services := physicalProjection(cohort)
 	if readiness == maintenanceReadinessUnready {
 		return shared.NewMaintenanceCompensationSourceFailed(subject, ids, services)
 	}

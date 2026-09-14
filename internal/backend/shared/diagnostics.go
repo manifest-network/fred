@@ -3,6 +3,7 @@ package shared
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -42,6 +43,10 @@ type DiagnosticEntry struct {
 // container removal and backend restarts.
 type DiagnosticsStore struct {
 	*boltStore
+	retentionMu sync.Mutex
+	retained    map[string]*retainedDiagnostic
+	actions     sync.WaitGroup
+	closing     bool
 }
 
 // DiagnosticsStoreConfig configures the diagnostics store.
@@ -66,7 +71,7 @@ func NewDiagnosticsStore(cfg DiagnosticsStoreConfig) (*DiagnosticsStore, error) 
 		return nil, err
 	}
 
-	s := &DiagnosticsStore{boltStore: base}
+	s := &DiagnosticsStore{boltStore: base, retained: make(map[string]*retainedDiagnostic)}
 	if err := base.update(func(tx *bolt.Tx) error {
 		for _, name := range [][]byte{attemptDiagnosticsBucketName, diagnosticPublicationsBucketName} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
@@ -144,7 +149,7 @@ func (s *DiagnosticsStore) Delete(leaseUUID string) error {
 	return s.update(func(tx *bolt.Tx) error {
 		if published := tx.Bucket(diagnosticPublicationsBucketName); published != nil {
 			if previous := published.Get([]byte(leaseUUID)); previous != nil {
-				if err := tx.Bucket(attemptDiagnosticsBucketName).Delete(previous); err != nil {
+				if err := s.deleteAttemptTx(tx, previous); err != nil {
 					return err
 				}
 			}
@@ -168,8 +173,10 @@ func (s *DiagnosticsStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 		cursor := visible.Cursor()
 		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
 			var entry DiagnosticEntry
+			// Diagnostics are observational: preserve a malformed row for
+			// inspection, but do not let it prevent unrelated expiry forever.
 			if err := json.Unmarshal(value, &entry); err != nil {
-				return fmt.Errorf("decode expiring diagnostic: %w", err)
+				continue
 			}
 			if entry.CreatedAt.Before(cutoff) {
 				if err := publications.Delete(key); err != nil {
@@ -186,10 +193,10 @@ func (s *DiagnosticsStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
 			record, err := decodeAttemptDiagnostic(value)
 			if err != nil {
-				return err
+				continue
 			}
 			if record.Entry.CreatedAt.Before(cutoff) {
-				if err := cursor.Delete(); err != nil {
+				if err := s.deleteAttemptTx(tx, key); err != nil {
 					return err
 				}
 			}

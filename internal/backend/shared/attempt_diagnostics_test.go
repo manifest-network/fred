@@ -68,9 +68,9 @@ func TestFailureDiagnosticsCaptureSurvivesReopenAndEmptyRecovery(t *testing.T) {
 	require.True(t, ok)
 	proof, err := fixture.settlement.FailMaintenance(outcome, backend.ReasonRestartFailed, "recovered interruption")
 	require.NoError(t, err)
-	publication, err := diagnostics.MaintenanceFailure(proof, FailureDiagnosticObservation{Error: "generic recovery error", Status: DiagnosticCaptureUnavailable})
+	publication, err := diagnostics.MaintenanceFailureContext(t.Context(), proof, FailureDiagnosticObservation{Error: "generic recovery error", Status: DiagnosticCaptureUnavailable})
 	require.NoError(t, err)
-	require.NoError(t, publication.Publish(1))
+	require.NoError(t, publication.PublishContext(t.Context(), 1))
 	entry, err = reopened.Get(fixture.intent.LeaseUUID())
 	require.NoError(t, err)
 	require.Equal(t, "original physical failure", entry.Error)
@@ -91,7 +91,7 @@ func TestFailureDiagnosticsCaptureSurvivesReopenAndEmptyRecovery(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "late same-attempt output", entry.Logs["late/0"], "an already-authorized selector may gain exact same-attempt evidence")
 	// Once the exact head is terminal, a retained publication copy cannot write.
-	require.Error(t, publication.Publish(99))
+	require.Error(t, publication.PublishContext(t.Context(), 99))
 }
 
 func TestFailureDiagnosticsBoundRawAndEscapedLogs(t *testing.T) {
@@ -129,14 +129,14 @@ func TestFailureDiagnosticsRejectForeignAndZeroAuthority(t *testing.T) {
 	require.Error(t, err)
 	_, err = diagnostics.CaptureMaintenance(MaintenancePhysicalSubject{}, observation)
 	require.Error(t, err)
-	_, err = diagnostics.MaintenanceFailure(MaintenanceReleaseFailure{}, observation)
+	_, err = diagnostics.MaintenanceFailureContext(t.Context(), MaintenanceReleaseFailure{}, observation)
 	require.Error(t, err)
 	capture, err := diagnostics.CaptureMaintenance(execution.subject, observation)
 	require.NoError(t, err)
 	sameStore, err := NewFailureDiagnostics(diagnostics.store, foreign.operations, foreign.maintenance)
 	require.NoError(t, err)
 	require.Error(t, sameStore.RetireHistoricalCapture(capture), "a shared diagnostics file does not bind unrelated journal pairs")
-	require.Error(t, (FailureDiagnosticPublication{}).Publish(0))
+	require.Error(t, (FailureDiagnosticPublication{}).PublishContext(t.Context(), 0))
 	_, _, err = (FailureDiagnosticCapture{}).Snapshot()
 	require.Error(t, err)
 }
@@ -151,9 +151,9 @@ func TestFailureDiagnosticsOlderCaptureCannotReplaceNewerSameLifecycleFailure(t 
 	require.True(t, ok)
 	proof, err := fixture.settlement.FailMaintenance(failed, backend.ReasonRestartFailed, "old failed")
 	require.NoError(t, err)
-	oldPublication, err := diagnostics.MaintenanceFailure(proof, FailureDiagnosticObservation{Status: DiagnosticCaptureUnavailable})
+	oldPublication, err := diagnostics.MaintenanceFailureContext(t.Context(), proof, FailureDiagnosticObservation{Status: DiagnosticCaptureUnavailable})
 	require.NoError(t, err)
-	require.NoError(t, oldPublication.Publish(1))
+	require.NoError(t, oldPublication.PublishContext(t.Context(), 1))
 	completion, err := resolveMaintenanceFailureForTest(fixture.settlement, proof, "old failed")
 	require.NoError(t, err)
 	require.NoError(t, fixture.stores.callbacks.removeEntry(completion))
@@ -175,7 +175,7 @@ func TestFailureDiagnosticsOlderCaptureCannotReplaceNewerSameLifecycleFailure(t 
 	require.NoError(t, err)
 	newer, err := fixture.settlement.FailMaintenance(refused, backend.ReasonRestartFailed, "newer failed")
 	require.NoError(t, err)
-	publication, err := diagnostics.MaintenanceFailure(newer, FailureDiagnosticObservation{
+	publication, err := diagnostics.MaintenanceFailureContext(t.Context(), newer, FailureDiagnosticObservation{
 		Error: "new failure", Message: "new startup failed", Logs: map[string]string{"web/0": "new startup output"}, Status: DiagnosticCaptureComplete,
 	})
 	require.NoError(t, err)
@@ -184,20 +184,20 @@ func TestFailureDiagnosticsOlderCaptureCannotReplaceNewerSameLifecycleFailure(t 
 	newSnapshot, _, err := publication.Snapshot()
 	require.NoError(t, err)
 	require.Equal(t, oldSnapshot.LifecycleGeneration, newSnapshot.LifecycleGeneration, "maintenance shares the originating runtime generation")
-	require.NoError(t, publication.Publish(1))
+	require.NoError(t, publication.PublishContext(t.Context(), 1))
 	// A late old target may add privately retained evidence. It cannot regain
 	// publication authority even when the two attempts share lifecycle labels.
 	_, err = diagnostics.CaptureMaintenance(execution.subject, FailureDiagnosticObservation{
 		Logs: map[string]string{"late/0": "late old target"}, Status: DiagnosticCaptureComplete,
 	})
 	require.NoError(t, err)
-	require.Error(t, oldPublication.Publish(99))
+	require.Error(t, oldPublication.PublishContext(t.Context(), 99))
 	entry, err := diagnostics.store.Get(fixture.intent.LeaseUUID())
 	require.NoError(t, err)
 	require.Equal(t, "new startup output", entry.Logs["web/0"])
 	require.NotContains(t, entry.Logs, "late/0")
 	require.Equal(t, 2, entry.FailCount)
-	require.NoError(t, publication.Publish(1))
+	require.NoError(t, publication.PublishContext(t.Context(), 1))
 	replay, err := diagnostics.store.Get(fixture.intent.LeaseUUID())
 	require.NoError(t, err)
 	require.Equal(t, 2, replay.FailCount, "publication retry cannot count a new failure")

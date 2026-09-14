@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/opencontainers/go-digest"
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
@@ -71,14 +73,34 @@ type imageInspectionRecord struct {
 	ImageID        string `json:"image_id"`
 	ImageReference string `json:"image_reference"`
 	ContainerID    string `json:"container_id,omitempty"`
+	CreationFence  string `json:"creation_fence,omitempty"`
 }
 
-// ImageInspectionReceipt binds one helper identity to its issuing open journal.
-// A receipt with no ContainerID retains uncertain Create authority indefinitely;
-// an empty inventory cannot prove that a canceled daemon call will not appear.
-type ImageInspectionReceipt struct {
+func (r imageInspectionRecord) creationSettled() bool {
+	return r.ContainerID != "" || r.CreationFence == "operator" || r.CreationFence == "response"
+}
+
+// PreparedImageInspection binds a fresh helper identity to an exact live
+// Started origin. It grants no cleanup authority until Reserve persists it
+// inside the helper's admitted creation step.
+type PreparedImageInspection struct {
 	journal *ImageInspectionJournal
 	record  imageInspectionRecord
+	origin  ImageInspectionOrigin
+	use     *imageInspectionPreparationUse
+}
+
+type imageInspectionPreparationUse struct{ reserved atomic.Bool }
+
+const ImageInspectionCreationStep = "create image inspection helper"
+
+// ImageInspectionReceipt binds one helper identity to its issuing open journal.
+// A receipt without a response or offline fence retains uncertain Create authority;
+// an empty inventory cannot prove that a canceled daemon call will not appear.
+type ImageInspectionReceipt struct {
+	journal  *ImageInspectionJournal
+	record   imageInspectionRecord
+	prepared PreparedImageInspection
 }
 
 func (r ImageInspectionReceipt) ID() string      { return r.record.ID }
@@ -94,6 +116,10 @@ func (r ImageInspectionReceipt) LeaseUUID() string      { return r.record.LeaseU
 func (r ImageInspectionReceipt) ImageID() string        { return r.record.ImageID }
 func (r ImageInspectionReceipt) ImageReference() string { return r.record.ImageReference }
 func (r ImageInspectionReceipt) ContainerID() string    { return r.record.ContainerID }
+
+// CreationSettled reports a completed response or explicit offline daemon fence.
+// It does not prove helper absence; cleanup must still inspect exact ownership.
+func (r ImageInspectionReceipt) CreationSettled() bool { return r.record.creationSettled() }
 
 func NewImageInspectionJournal(store *CallbackStore) (*ImageInspectionJournal, error) {
 	if store == nil || store.boltStore == nil || store.binding == nil {
@@ -115,48 +141,79 @@ func NewImageInspectionJournal(store *CallbackStore) (*ImageInspectionJournal, e
 	return j, nil
 }
 
-// Reserve persists the random name and exact immutable image before Create can
-// run. Origin and record allocation share one transaction with the current-head
-// check; a close or successor cannot lend an older subject fresh create rights.
-func (j *ImageInspectionJournal) Reserve(origin ImageInspectionOrigin, imageID, reference string) (ImageInspectionReceipt, error) {
+// Prepare creates an immutable identity after rereading the exact Started head.
+// It does not allocate durable cleanup debt before mutation admission.
+func (j *ImageInspectionJournal) Prepare(origin ImageInspectionOrigin, imageID, reference string) (PreparedImageInspection, error) {
 	if j == nil || j.store == nil {
-		return ImageInspectionReceipt{}, errors.New("image inspection journal unavailable")
+		return PreparedImageInspection{}, errors.New("image inspection journal unavailable")
 	}
 	r := imageInspectionRecord{Schema: 1, ID: uuid.NewString(), ImageID: imageID, ImageReference: reference}
 	backendName, storage := j.store.journalBackendIdentity("")
 	r.Backend, r.StorageID = backendName, storage.String()
-	var check func(*bolt.Tx) error
 	switch {
 	case origin.operation.Valid():
 		s := origin.operation
 		if s.state.mode != operationPhysicalExecution || s.state.settlement.callbacks != j.store {
-			return ImageInspectionReceipt{}, errors.New("image inspection operation belongs to another journal")
+			return PreparedImageInspection{}, errors.New("image inspection operation belongs to another journal")
 		}
 		r.Kind, r.SubjectID, r.LeaseUUID = "operation", s.OperationID().String(), s.LeaseUUID()
-		check = func(tx *bolt.Tx) error { return verifyOperationIntentTx(tx, s.Intent()) }
 	case origin.maintenance.Valid():
 		s := origin.maintenance
 		if s.state.mode != maintenancePhysicalExecution || s.state.settlement.callbacks != j.store {
-			return ImageInspectionReceipt{}, errors.New("image inspection maintenance belongs to another journal")
+			return PreparedImageInspection{}, errors.New("image inspection maintenance belongs to another journal")
 		}
 		r.Kind, r.SubjectID, r.LeaseUUID = "maintenance", s.MaintenanceID().String(), s.LeaseUUID()
-		check = func(tx *bolt.Tx) error { return verifyMaintenanceIntentTx(tx, s.Intent()) }
 	case origin.compensation.Valid():
 		s := origin.compensation
 		if !s.SourceLaunchRequired() || s.state.settlement.callbacks != j.store {
-			return ImageInspectionReceipt{}, errors.New("image inspection compensation belongs to another journal or launch phase")
+			return PreparedImageInspection{}, errors.New("image inspection compensation belongs to another journal or launch phase")
 		}
 		r.Kind, r.SubjectID, r.LeaseUUID = "compensation", s.Intent().MaintenanceID().String(), s.Intent().LeaseUUID()
-		check = func(tx *bolt.Tx) error { return verifyCompensationSourcePreparationTx(tx, s) }
 	default:
-		return ImageInspectionReceipt{}, errors.New("image inspection requires a live Started subject")
+		return PreparedImageInspection{}, errors.New("image inspection requires a live Started subject")
 	}
+	if _, err := encodeImageInspection(r); err != nil {
+		return PreparedImageInspection{}, err
+	}
+	p := PreparedImageInspection{journal: j, record: r, origin: origin, use: new(imageInspectionPreparationUse)}
+	if err := j.store.view(p.verifyOrigin); err != nil {
+		return PreparedImageInspection{}, err
+	}
+	return p, nil
+}
+
+func (p PreparedImageInspection) verifyOrigin(tx *bolt.Tx) error {
+	switch {
+	case p.origin.operation.Valid():
+		return verifyOperationIntentTx(tx, p.origin.operation.Intent())
+	case p.origin.maintenance.Valid():
+		return verifyMaintenanceIntentTx(tx, p.origin.maintenance.Intent())
+	case p.origin.compensation.Valid():
+		return verifyCompensationSourcePreparationTx(tx, p.origin.compensation)
+	default:
+		return errors.New("image inspection requires a live Started subject")
+	}
+}
+
+// Reserve persists an exact prepared identity immediately before Create. The
+// write rechecks its origin so a close or successor cannot lend stale rights.
+func (j *ImageInspectionJournal) Reserve(p PreparedImageInspection) (ImageInspectionReceipt, error) {
+	if j == nil || j.store == nil || p.journal != j || p.use == nil {
+		return ImageInspectionReceipt{}, errors.New("prepared image inspection belongs to another journal")
+	}
+	// A copied preparation cannot recreate the same helper after cleanup has
+	// removed its row. Failed allocation also spends this attempt; a fresh
+	// preparation must reread the live origin and choose a new random identity.
+	if !p.use.reserved.CompareAndSwap(false, true) {
+		return ImageInspectionReceipt{}, errors.New("prepared image inspection was already reserved")
+	}
+	r := p.record
 	data, err := encodeImageInspection(r)
 	if err != nil {
 		return ImageInspectionReceipt{}, err
 	}
 	err = j.store.update(func(tx *bolt.Tx) error {
-		if err := check(tx); err != nil {
+		if err := p.verifyOrigin(tx); err != nil {
 			return err
 		}
 		bucket := tx.Bucket(imageInspectionsBucketName)
@@ -174,38 +231,44 @@ func (j *ImageInspectionJournal) Reserve(origin ImageInspectionOrigin, imageID, 
 	if err != nil {
 		return ImageInspectionReceipt{}, err
 	}
-	return ImageInspectionReceipt{journal: j, record: r}, nil
+	return ImageInspectionReceipt{journal: j, record: r, prepared: p}, nil
 }
 
-// RecordCreated records the synchronous Create response. Recovery of an
-// uncertain Create deliberately does not call this: finding one late container
-// is not evidence that the original daemon request has finished.
-func (j *ImageInspectionJournal) RecordCreated(receipt ImageInspectionReceipt, id string) (ImageInspectionReceipt, error) {
-	if receipt.record.ContainerID != "" {
+// RecordCreationSettled records a daemon response only after the exact creation
+// bracket passed its storage postcheck. An error response may have no ID;
+// cleanup still requires exact owned-helper absence before forgetting the row.
+func (j *ImageInspectionJournal) RecordCreationSettled(receipt ImageInspectionReceipt, id string, completed substratemutation.CompletedStep) (ImageInspectionReceipt, error) {
+	if j == nil || j.store == nil || receipt.journal != j || receipt.prepared.journal != j {
+		return ImageInspectionReceipt{}, errors.New("image inspection creation belongs to another journal")
+	}
+	if receipt.record.creationSettled() {
 		return ImageInspectionReceipt{}, errors.New("image inspection Create already recorded")
+	}
+	if receipt.record != receipt.prepared.record {
+		return ImageInspectionReceipt{}, errors.New("image inspection creation differs from its preparation")
 	}
 	r := receipt.record
 	r.ContainerID = id
+	r.CreationFence = "response"
 	data, err := encodeImageInspection(r)
 	if err != nil {
 		return ImageInspectionReceipt{}, err
 	}
-	if id == "" {
-		return ImageInspectionReceipt{}, errors.New("image inspection Create returned an empty container ID")
-	}
-	err = j.change(receipt, func(bucket *bolt.Bucket) error { return bucket.Put([]byte(r.ID), data) })
+	err = substratemutation.CommitCompletedStep(completed, receipt.prepared, ImageInspectionCreationStep, func() error {
+		return j.change(receipt, func(bucket *bolt.Bucket) error { return bucket.Put([]byte(r.ID), data) })
+	})
 	if err != nil {
 		return ImageInspectionReceipt{}, err
 	}
-	return ImageInspectionReceipt{journal: j, record: r}, nil
+	return ImageInspectionReceipt{journal: j, record: r, prepared: receipt.prepared}, nil
 }
 
-// ForgetRemoved consumes only a response-complete receipt after its owner has
-// established exact absence. Response-loss receipts can never take this path;
-// they remain available to remove later appearances even after workload close.
+// ForgetRemoved consumes a response-complete or explicitly fenced receipt after
+// its owner established exact absence. Unfenced response-loss receipts remain
+// available to remove later appearances even after workload close.
 func (j *ImageInspectionJournal) ForgetRemoved(receipt ImageInspectionReceipt) error {
-	if receipt.record.ContainerID == "" {
-		return errors.New("uncertain image inspection Create requires a permanent recovery receipt")
+	if !receipt.record.creationSettled() {
+		return errors.New("uncertain image inspection Create requires completion or an offline daemon fence")
 	}
 	return j.change(receipt, func(bucket *bolt.Bucket) error { return bucket.Delete([]byte(receipt.ID())) })
 }
@@ -310,6 +373,9 @@ func decodeImageInspection(key, value []byte) (imageInspectionRecord, error) {
 	}
 	if r.ContainerID != "" && (len(r.ContainerID) != 64 || strings.Trim(r.ContainerID, "0123456789abcdef") != "") {
 		return r, errors.New("invalid image inspection container ID")
+	}
+	if r.CreationFence != "" && r.CreationFence != "operator" && r.CreationFence != "response" {
+		return r, errors.New("invalid image inspection creation fence")
 	}
 	return r, nil
 }

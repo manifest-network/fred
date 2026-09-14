@@ -107,8 +107,10 @@ func newBackgroundMaintenanceCoordinator(
 		})
 	})
 	ensureVolumeQuota := backgroundVolumeQuota(func(ctx context.Context, id string, sizeMB int64) error {
-		return performVolume(ctx, nil, "background ensure volume quota", func(ctx context.Context) error {
-			return ops.volumes.EnsureQuota(ctx, id, sizeMB)
+		return backend.withManagedVolumeQuota(ctx, id, func(ctx context.Context) error {
+			return perform(ctx, "background ensure volume quota", func(ctx context.Context) error {
+				return ops.volumes.EnsureQuota(ctx, id, sizeMB)
+			})
 		})
 	})
 	destroyVolumes := backgroundVolumeDestroyCapability{
@@ -134,8 +136,10 @@ func newBackgroundMaintenanceCoordinator(
 
 	return &backgroundMaintenanceCoordinator{
 		recoverInterruptedVolumesFn: func(ctx context.Context) error {
-			return performVolume(ctx, nil, "recover interrupted volume mutations", func(ctx context.Context) error {
-				return ops.volumes.RecoverInterruptedVolumeMutations(ctx)
+			return backend.volumeAccess.recoverNamespace(ctx, func(ctx context.Context) error {
+				return perform(ctx, "recover interrupted volume mutations", func(ctx context.Context) error {
+					return ops.volumes.RecoverInterruptedVolumeMutations(ctx)
+				})
 			})
 		},
 		recoverClosedLeasesFn: func(ctx context.Context) (map[string]struct{}, error) {
@@ -613,72 +617,7 @@ func (m *storageMutations) launchCompensation(ctx context.Context, plan compensa
 	if err := b.retireCompensationSource(ctx, m, plan.Subject); err != nil {
 		return err
 	}
-	var completion volumeLaunchCompletion
-	var completed substratemutation.CompletedStep
-	created := make(map[string][]string)
-	byName := make(map[string]string)
-	for index, snapshot := range schedule.containers {
-		var id string
-		if index == 0 {
-			id, completion, completed, err = b.volumeLaunches.sourceFirst(ctx, q, snapshot)
-		} else {
-			completed, err = m.runner.StepCompleted(ctx, shared.MaintenanceSourceLaunchStep, func(ctx context.Context) error {
-				if err := q.requireActive(); err != nil {
-					return err
-				}
-				var err error
-				id, err = m.ops.docker.createCompensationContainer(ctx, snapshot.Image, snapshot)
-				return err
-			})
-		}
-		if err != nil {
-			return err
-		}
-		if id == "" {
-			return errors.New("source create returned no exact container identity")
-		}
-		created[snapshot.Config.Labels[LabelServiceName]] = append(created[snapshot.Config.Labels[LabelServiceName]], id)
-		byName[snapshot.Name] = id
-	}
-	var dependencyFailure error
-	checked := make(map[string]bool)
-	for _, snapshot := range schedule.containers {
-		service := snapshot.Config.Labels[LabelServiceName]
-		if !checked[service] {
-			if err := b.waitForCompensationDependencies(ctx, schedule, service, created, m.leaseUUID); err != nil {
-				dependencyFailure = err
-				break
-			}
-			checked[service] = true
-		}
-		id := byName[snapshot.Name]
-		completed, err = m.runner.StepCompleted(ctx, shared.MaintenanceSourceLaunchStep, func(ctx context.Context) error {
-			if err := q.requireActive(); err != nil {
-				return err
-			}
-			if err := m.requireContainer(ctx, id); err != nil {
-				return err
-			}
-			return m.ops.docker.StartContainer(ctx, id, b.cfg.ContainerStartTimeout)
-		})
-		if err != nil {
-			return err
-		}
-	}
-	// Every issued Create/Start returned successfully. A local health gate
-	// may prevent later Starts; it does not leave an outstanding daemon call.
-	// The complete created cohort remains available to classify source failure.
-	// Keep the last successful causal receipt rather than requesting a new
-	// Docker/storage action after a local health deadline canceled ctx. Any
-	// intervening SDK failure already returned above without consuming it.
-	if err := q.requireActive(); err != nil {
-		return err
-	}
-
-	if err := completion.complete(completed); err != nil {
-		return err
-	}
-	return dependencyFailure
+	return b.volumeLaunches.source(ctx, q, schedule)
 }
 
 func (writer priorVolumeWriter) retire(ctx context.Context) error {
@@ -729,12 +668,13 @@ func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchC
 	// only the two finite launch workflows below, never an action-injection
 	// facade or a journal writer. Allocation happens after dispatch admission,
 	// so a refused/canceled Runner cannot leave false permanent launch debt.
-	dispatch := func(ctx context.Context, q *quiescedVolumes, operation string, action func(context.Context) error) (volumeLaunchCompletion, substratemutation.CompletedStep, error) {
+	dispatch := func(ctx context.Context, q *quiescedVolumes, operation string, action func(context.Context) daemonLaunchOutcome) error {
 		if q == nil || q.mutations == nil {
-			return volumeLaunchCompletion{}, substratemutation.CompletedStep{}, errors.New("volume launch requires its protected volume set")
+			return errors.New("volume launch requires its protected volume set")
 		}
 		var debt shared.VolumeLaunchDebt
-		completed, err := q.mutations.runner.StepCompleted(ctx, operation, func(ctx context.Context) error {
+		var outcome daemonLaunchOutcome
+		completed, stepResult := q.mutations.runner.StepCompleted(ctx, operation, func(ctx context.Context) error {
 			if err := q.requireActive(); err != nil {
 				return err
 			}
@@ -743,44 +683,81 @@ func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchC
 			if err != nil {
 				return err
 			}
-			return action(ctx)
+			outcome = action(ctx)
+			// A concrete daemon rejection can complete the exchange while the
+			// requested workflow still fails. Only this exchange proof and the
+			// storage post-attestation may settle debt; preserve the business
+			// error until after the exact receipt commits below.
+			return outcome.completionError()
 		})
-		if err != nil {
-			// Once Begin succeeds, an interrupted SDK call retains debt. No
-			// later error classification or inventory can mint its completion.
-			return volumeLaunchCompletion{}, substratemutation.CompletedStep{}, err
+		if err := stepResult.Err(); err != nil {
+			return errors.Join(outcome.err, err)
 		}
-		return volumeLaunchCompletion{finish: func(step substratemutation.CompletedStep) error { return journal.Complete(debt, step) }}, completed, nil
+		if err := journal.Complete(debt, completed); err != nil {
+			return errors.Join(outcome.err, err)
+		}
+		return outcome.err
 	}
 	return &volumeLaunchCoordinator{
 		check:          journal.Check,
 		checkNamespace: journal.CheckNamespace,
+		pendingCount:   journal.PendingCount,
 		compose: func(ctx context.Context, q *quiescedVolumes, prepared imageexec.PreparedProject, opts composeUpOpts) error {
 			if q == nil || q.mutations == nil || q.mutations.compensationSubject.Valid() {
 				return errors.New("compose launch requires an operation or maintenance target")
 			}
-			completion, step, err := dispatch(ctx, q, shared.MaintenanceTargetLaunchStep, func(ctx context.Context) error {
-				return q.mutations.ops.compose.Up(ctx, prepared, opts)
+			return dispatch(ctx, q, shared.MaintenanceTargetLaunchStep, func(ctx context.Context) daemonLaunchOutcome {
+				return q.mutations.ops.compose.launch(ctx, prepared, opts)
 			})
-			if err != nil {
-				return err
-			}
-			return completion.complete(step)
 		},
-		sourceFirst: func(ctx context.Context, q *quiescedVolumes, snapshot compensationContainer) (string, volumeLaunchCompletion, substratemutation.CompletedStep, error) {
-			if q == nil || q.mutations == nil || !q.mutations.compensationSubject.Valid() {
-				return "", volumeLaunchCompletion{}, substratemutation.CompletedStep{}, errors.New("source launch requires exact compensation authority")
+		source: func(ctx context.Context, q *quiescedVolumes, schedule compensationStartup) error {
+			if q == nil || q.mutations == nil || !q.mutations.compensationSubject.Valid() || len(schedule.containers) == 0 {
+				return errors.New("source launch requires exact compensation authority")
 			}
-			var id string
-			completion, step, err := dispatch(ctx, q, shared.MaintenanceSourceLaunchStep, func(ctx context.Context) error {
-				var err error
-				id, err = q.mutations.ops.docker.createCompensationContainer(ctx, snapshot.Image, snapshot)
-				if err == nil && id == "" {
-					err = errors.New("source create returned no exact container identity")
+			// The complete source sequence and its final receipt are lexical to
+			// one workflow. There is no first-create capability or reusable last
+			// successful step which could hide a later failed/unknown request.
+			return dispatch(ctx, q, shared.MaintenanceSourceLaunchStep, func(ctx context.Context) daemonLaunchOutcome {
+				m := q.mutations
+				created := make(map[string][]string)
+				byName := make(map[string]string)
+				for _, snapshot := range schedule.containers {
+					if err := q.requireActive(); err != nil {
+						return daemonLaunchOutcome{settled: true, err: err}
+					}
+					id, outcome := m.ops.docker.createCompensationContainer(ctx, snapshot.Image, snapshot)
+					if !outcome.settled || outcome.err != nil {
+						return outcome
+					}
+					if id == "" {
+						return daemonLaunchOutcome{settled: true, err: errors.New("source create returned no exact container identity")}
+					}
+					created[snapshot.Config.Labels[LabelServiceName]] = append(created[snapshot.Config.Labels[LabelServiceName]], id)
+					byName[snapshot.Name] = id
 				}
-				return err
+				checked := make(map[string]bool)
+				for _, snapshot := range schedule.containers {
+					service := snapshot.Config.Labels[LabelServiceName]
+					if !checked[service] {
+						if err := m.ops.backend.waitForCompensationDependencies(ctx, schedule, service, created, m.leaseUUID); err != nil {
+							return daemonLaunchOutcome{settled: true, err: err}
+						}
+						checked[service] = true
+					}
+					if err := q.requireActive(); err != nil {
+						return daemonLaunchOutcome{settled: true, err: err}
+					}
+					id := byName[snapshot.Name]
+					if err := m.requireContainer(ctx, id); err != nil {
+						return daemonLaunchOutcome{settled: true, err: err}
+					}
+					outcome := m.ops.docker.startCompensationContainer(ctx, id, m.ops.backend.cfg.ContainerStartTimeout)
+					if !outcome.settled || outcome.err != nil {
+						return outcome
+					}
+				}
+				return daemonLaunchOutcome{settled: true}
 			})
-			return id, completion, step, err
 		},
 	}, nil
 }

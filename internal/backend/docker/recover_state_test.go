@@ -171,6 +171,8 @@ type mockDockerClient struct {
 	ListManagedContainersFn       func(ctx context.Context) ([]ContainerInfo, error)
 	ListVolumeWritersFn           func(context.Context) ([]ContainerInfo, error)
 	CreateCompensationContainerFn func(context.Context, imageexec.Image, compensationContainer) (string, error)
+	CreateCompensationOutcomeFn   func(context.Context, imageexec.Image, compensationContainer) (string, daemonLaunchOutcome)
+	StartCompensationOutcomeFn    func(context.Context, string, time.Duration) daemonLaunchOutcome
 	ReadmitCompensationImageFn    func(context.Context, compensationContainerRecord) (imageexec.Image, error)
 	EnsureTenantNetworkFn         func(ctx context.Context, tenant string) (string, error)
 	RemoveTenantNetworkIfEmptyFn  func(ctx context.Context, tenant string) error

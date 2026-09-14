@@ -27,6 +27,7 @@ const imageInspectionRecoveryTimeout = 10 * time.Second
 type imageInspectionCoordinator struct {
 	journal   *shared.ImageInspectionJournal
 	creator   *imageexec.DockerCreator
+	observer  *daemonLaunchObserver
 	sdk       dockerSDKView
 	lifetime  context.Context
 	authorize substratemutation.Authorize
@@ -46,7 +47,7 @@ func newImageInspectionCoordinator(
 	resolve func(string, substratemutation.StepResult) error,
 	authority func() error,
 ) (*imageInspectionCoordinator, error) {
-	if client == nil || client.creator == nil || lifetime == nil || authorize == nil || complete == nil || resolve == nil || authority == nil {
+	if client == nil || client.creator == nil || client.launchObserver == nil || lifetime == nil || authorize == nil || complete == nil || resolve == nil || authority == nil {
 		return nil, errors.New("image inspection requires a client, journal and backend mutation lifetime")
 	}
 	if client.inspections != nil {
@@ -60,7 +61,7 @@ func newImageInspectionCoordinator(
 		return nil, err
 	}
 	c := &imageInspectionCoordinator{
-		journal: journal, creator: client.creator, sdk: client.client,
+		journal: journal, creator: client.creator, observer: client.launchObserver, sdk: client.client,
 		lifetime: lifetime, authorize: authorize, complete: complete, resolve: resolve, authority: authority,
 		active: make(map[string]struct{}),
 	}
@@ -95,49 +96,82 @@ func (c *imageInspectionCoordinator) open(ctx context.Context, image imageexec.I
 	if err := c.lifetime.Err(); err != nil {
 		return nil, err
 	}
-	// Serialize allocation with recovery's active check. No recovery can observe
-	// the write-ahead row without also observing its live session reservation.
-	c.mu.Lock()
-	receipt, err := c.journal.Reserve(origin, image.ID(), image.Reference())
-	if err == nil {
-		c.active[receipt.ID()] = struct{}{}
-	}
-	c.mu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	s := &imageInspectionSession{owner: c, receipt: receipt}
+	s := &imageInspectionSession{owner: c}
 	ready := false
 	defer func() {
-		if !ready {
+		if !ready && s.receipt.ID() != "" {
 			err = errors.Join(err, s.close())
 		}
 	}()
-	result := substratemutation.RunStep(ctx, "create image inspection helper", c.authorize, c.complete, func(ctx context.Context) error {
-		response, createErr := c.creator.Create(ctx, image, &container.Config{Labels: inspectionLabels(receipt)}, nil, nil, receipt.Name())
-		if createErr != nil {
-			return createErr
-		}
-		// A successful SDK response is the only transition out of uncertain
-		// Create. Persist failure keeps the original receipt, including if the
-		// daemon side effect succeeded but the process loses its journal authority.
-		created, recordErr := c.journal.RecordCreated(receipt, response.ID)
-		if recordErr != nil {
-			return recordErr
-		}
-		s.receipt = created
-		return nil
-	})
-	if err := c.resolve("create image inspection helper", result); err != nil {
-		return nil, err
-	}
-	// A response ID is not by itself ownership evidence. Every copy and cleanup
-	// starts from the receipt's exact immutable identity and a fresh inspection.
-	id, absent, err := c.inspect(ctx, s.receipt)
+	// This local protocol owns only helper effects. It never receives the
+	// parent's Runner or adds effects to the caller's chosen Step/Prepare scope.
+	protocol := substratemutation.NewProtocol[shared.PreparedImageInspection]()
+	binding, err := protocol.NewGuardBinding()
 	if err != nil {
 		return nil, err
 	}
-	if absent {
+	guard, _, err := substratemutation.NewExecutor(binding, c.authorize, c.complete,
+		func(runner substratemutation.Runner, prepared shared.PreparedImageInspection) func(context.Context) error {
+			return func(ctx context.Context) error {
+				var response container.CreateResponse
+				var outcome daemonLaunchOutcome
+				completed, step := runner.StepCompleted(ctx, shared.ImageInspectionCreationStep, func(ctx context.Context) error {
+					// Reserve only after dispatch admission. Recovery sees the row
+					// and active reservation together, before any SDK request.
+					c.mu.Lock()
+					receipt, reserveErr := c.journal.Reserve(prepared)
+					if reserveErr == nil {
+						c.active[receipt.ID()] = struct{}{}
+						s.receipt = receipt
+					}
+					c.mu.Unlock()
+					if reserveErr != nil {
+						return reserveErr
+					}
+					outcome = c.observer.run(ctx, func(ctx context.Context) error {
+						var createErr error
+						response, createErr = c.creator.Create(ctx, image, &container.Config{Labels: inspectionLabels(receipt)}, nil, nil, receipt.Name())
+						return createErr
+					})
+					return outcome.completionError()
+				})
+				if err := c.resolve(shared.ImageInspectionCreationStep, step); err != nil {
+					return errors.Join(outcome.err, err)
+				}
+				settled, err := c.journal.RecordCreationSettled(s.receipt, response.ID, completed)
+				if err != nil {
+					return errors.Join(outcome.err, err)
+				}
+				s.receipt = settled
+				return outcome.err
+			}
+		},
+		func(ctx context.Context, create func(context.Context) error, _ shared.PreparedImageInspection) error {
+			return create(ctx)
+		},
+		func(ctx context.Context, _ shared.PreparedImageInspection) (string, error) {
+			if !s.receipt.CreationSettled() {
+				return "", errors.New("image inspection Create completion is unknown")
+			}
+			id, _, err := c.inspect(ctx, s.receipt)
+			return id, err
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	execution, err := protocol.BeginAfter(func() (shared.PreparedImageInspection, error) {
+		return c.journal.Prepare(origin, image.ID(), image.Reference())
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := guard.Execute(execution, ctx)
+	if err := result.Err(); err != nil {
+		return nil, err
+	}
+	id, observed := result.Evidence()
+	if !observed || id == "" {
 		return nil, errors.New("created image inspection helper is absent")
 	}
 	s.containerID = id
@@ -317,7 +351,7 @@ func (c *imageInspectionCoordinator) Recover(ctx context.Context) (inspectionRec
 		}
 		if err != nil {
 			report.pending = append(report.pending, inspectionRecoveryPending{id: receipt.ID(), cause: err})
-		} else if receipt.ContainerID() == "" {
+		} else if !receipt.CreationSettled() {
 			report.pending = append(report.pending, inspectionRecoveryPending{id: receipt.ID(), cause: errors.New("Create response was not durably recorded; retained for possible late appearance")})
 		}
 	}
@@ -352,13 +386,13 @@ func (c *imageInspectionCoordinator) cleanup(receipt shared.ImageInspectionRecei
 	if err := c.resolve("remove image inspection helper", result); err != nil {
 		return err
 	}
-	if receipt.ContainerID() != "" {
+	if receipt.CreationSettled() {
 		if err := c.journal.ForgetRemoved(receipt); err != nil {
 			return &inspectionJournalFailure{cause: err}
 		}
 	}
-	// Empty inventory for an uncertain Create remains a permanent recovery
-	// receipt. A future sweep can discover a response-lost, late daemon effect.
+	// Empty inventory cannot settle an unfenced Create. A future sweep can
+	// discover a late effect; explicit offline fencing supplies an escape path.
 	return nil
 }
 

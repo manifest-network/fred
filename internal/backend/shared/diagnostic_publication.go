@@ -35,13 +35,9 @@ func (publication FailureDiagnosticPublication) Snapshot() (DiagnosticEntry, Dia
 	return publication.capture.Snapshot()
 }
 
-// OperationFailure prepares an opaque diagnostic handoff. A pre-effect refusal
+// OperationFailureContext prepares an opaque diagnostic handoff. A pre-effect refusal
 // may have no containers to capture; it still gets an explicit unavailable
 // observation. Existing captures retain their original cause and logs.
-func (diagnostics *FailureDiagnostics) OperationFailure(proof OperationReleaseUncommitted, observation FailureDiagnosticObservation) (FailureDiagnosticPublication, error) {
-	return diagnostics.OperationFailureContext(context.Background(), proof, observation)
-}
-
 func (diagnostics *FailureDiagnostics) OperationFailureContext(ctx context.Context, proof OperationReleaseUncommitted, observation FailureDiagnosticObservation) (FailureDiagnosticPublication, error) {
 	if ctx == nil {
 		return FailureDiagnosticPublication{}, errors.New("diagnostic publication requires an ownership context")
@@ -70,10 +66,6 @@ func (diagnostics *FailureDiagnostics) OperationFailureContext(ctx context.Conte
 		return FailureDiagnosticPublication{}, err
 	}
 	return FailureDiagnosticPublication{owner: diagnostics, capture: capture, operation: proof}, nil
-}
-
-func (diagnostics *FailureDiagnostics) MaintenanceFailure(proof MaintenanceReleaseFailure, observation FailureDiagnosticObservation) (FailureDiagnosticPublication, error) {
-	return diagnostics.MaintenanceFailureContext(context.Background(), proof, observation)
 }
 
 func (diagnostics *FailureDiagnostics) MaintenanceFailureContext(ctx context.Context, proof MaintenanceReleaseFailure, observation FailureDiagnosticObservation) (FailureDiagnosticPublication, error) {
@@ -138,13 +130,9 @@ func (diagnostics *FailureDiagnostics) TryPublishMaintenanceFailure(proof Mainte
 	return entry, true, err
 }
 
-// Publish is intentionally the only effect exposed by the handoff. Its argument
+// PublishContext is intentionally the only effect exposed by the handoff. Its argument
 // is an observational counter; callers cannot substitute identity, logs,
 // category, callback message, or attempt ordering.
-func (publication FailureDiagnosticPublication) Publish(failCount int) error {
-	return publication.PublishContext(context.Background(), failCount)
-}
-
 func (publication FailureDiagnosticPublication) PublishContext(ctx context.Context, failCount int) error {
 	if ctx == nil {
 		return errors.New("diagnostic publication requires an ownership context")
@@ -232,10 +220,11 @@ func (store *DiagnosticsStore) publishAttempt(capture FailureDiagnosticCapture, 
 		}
 		publications := tx.Bucket(diagnosticPublicationsBucketName)
 		if previous := publications.Get([]byte(record.Identity.LeaseUUID)); previous != nil && string(previous) != record.Identity.key() {
-			if err := attempts.Delete(previous); err != nil {
+			if err := store.deleteAttemptTx(tx, previous); err != nil {
 				return err
 			}
 		}
+		store.keepAttemptTx(tx, []byte(record.Identity.key()))
 		return publications.Put([]byte(record.Identity.LeaseUUID), []byte(record.Identity.key()))
 	})
 }
@@ -292,7 +281,7 @@ func (diagnostics *FailureDiagnostics) StoreRuntime(entry DiagnosticEntry) error
 	}
 	return diagnostics.store.update(func(tx *bolt.Tx) error {
 		if previous := tx.Bucket(diagnosticPublicationsBucketName).Get([]byte(entry.LeaseUUID)); previous != nil {
-			if err := tx.Bucket(attemptDiagnosticsBucketName).Delete(previous); err != nil {
+			if err := diagnostics.store.deleteAttemptTx(tx, previous); err != nil {
 				return err
 			}
 		}

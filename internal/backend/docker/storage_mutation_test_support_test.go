@@ -75,9 +75,11 @@ func fullStorageClientsForTest(b *Backend) (dockerClient, volumeManager) {
 		panic(err)
 	}
 	return testFullDockerClient{
-			dockerReadClient: b.docker, dockerMutationSink: ops.docker,
+			dockerReadClient:   b.docker,
+			dockerMutationSink: ops.docker,
 		}, testFullVolumeManager{
-			volumeReader: b.volumes, volumeMutationSink: ops.volumes,
+			volumeReader:       b.volumes,
+			volumeMutationSink: ops.volumes,
 		}
 }
 
@@ -132,7 +134,7 @@ func (m *testStorageMutationAdapter) composeUp(
 		if err != nil {
 			return err
 		}
-		return m.ops.compose.Up(ctx, prepared, opts)
+		return m.ops.compose.launch(ctx, prepared, opts).err
 	})
 }
 
@@ -414,12 +416,12 @@ func (p testComposeMutationProxy) PrepareProject(project *composetypes.Project, 
 	return sink.PrepareProject(project, images)
 }
 
-func (p testComposeMutationProxy) Up(ctx context.Context, project imageexec.PreparedProject, opts composeUpOpts) error {
+func (p testComposeMutationProxy) launch(ctx context.Context, project imageexec.PreparedProject, opts composeUpOpts) daemonLaunchOutcome {
 	sink, err := p.sink()
 	if err != nil {
-		return err
+		return daemonLaunchOutcome{settled: true, err: err}
 	}
-	return sink.Up(ctx, project, opts)
+	return sink.launch(ctx, project, opts)
 }
 
 func (p testComposeMutationProxy) Down(ctx context.Context, project string, timeout time.Duration) error {

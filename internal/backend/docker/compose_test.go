@@ -16,7 +16,7 @@ import (
 type mockComposeExecutor struct {
 	imageMu  sync.Mutex
 	images   *imageexec.Admitter
-	executor *imageexec.ComposeExecutor
+	LaunchFn func(context.Context, *composetypes.Project, composeUpOpts) daemonLaunchOutcome
 	UpFn     func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error
 	DownFn   func(ctx context.Context, projectName string, timeout time.Duration) error
 	PSFn     func(ctx context.Context, projectName string) ([]composeContainerSummary, error)
@@ -29,16 +29,7 @@ func (m *mockComposeExecutor) bindImages(images *imageexec.Admitter) {
 		return
 	}
 	m.images = images
-	executor, err := images.NewComposeExecutor(func(ctx context.Context, project *composetypes.Project, opts composeapi.UpOptions) error {
-		if m.UpFn != nil {
-			return m.UpFn(ctx, project, composeUpOpts{ForceRecreate: opts.Create.Recreate == composeapi.RecreateForce})
-		}
-		return nil
-	})
-	if err != nil {
-		panic(err)
-	}
-	m.executor = executor
+
 }
 
 func (m *mockComposeExecutor) PrepareProject(project *composetypes.Project, images map[string]imageexec.Image) (imageexec.PreparedProject, error) {
@@ -47,11 +38,34 @@ func (m *mockComposeExecutor) PrepareProject(project *composetypes.Project, imag
 	return m.images.Compile(project, images)
 }
 
-func (m *mockComposeExecutor) Up(ctx context.Context, project imageexec.PreparedProject, opts composeUpOpts) error {
+func (m *mockComposeExecutor) launch(ctx context.Context, project imageexec.PreparedProject, opts composeUpOpts) daemonLaunchOutcome {
 	m.imageMu.Lock()
-	executor := m.executor
+	images := m.images
 	m.imageMu.Unlock()
-	return executor.Up(ctx, project, opts.ForceRecreate)
+	var outcome daemonLaunchOutcome
+	called := false
+	executor, err := images.NewComposeExecutor(func(ctx context.Context, project *composetypes.Project, options composeapi.UpOptions) error {
+		called = true
+		opts := composeUpOpts{ForceRecreate: options.Create.Recreate == composeapi.RecreateForce}
+		if m.LaunchFn != nil {
+			outcome = m.LaunchFn(ctx, project, opts)
+		} else {
+			var err error
+			if m.UpFn != nil {
+				err = m.UpFn(ctx, project, opts)
+			}
+			outcome = daemonLaunchOutcome{settled: err == nil, err: err}
+		}
+		return outcome.err
+	})
+	if err != nil {
+		return daemonLaunchOutcome{settled: true, err: err}
+	}
+	err = executor.Up(ctx, project, opts.ForceRecreate)
+	if !called {
+		return daemonLaunchOutcome{settled: true, err: err}
+	}
+	return outcome
 }
 
 func (m *mockComposeExecutor) Down(ctx context.Context, projectName string, timeout time.Duration) error {

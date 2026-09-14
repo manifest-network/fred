@@ -1044,13 +1044,7 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 	leaseUUID := lsm.actor.leaseUUID
 
 	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
-		if source := info.recoveredSource; source != nil {
-			applyReplaceReleaseAuthority(p, *source)
-			p.ContainerIDs = slices.Clone(source.containerIDs)
-			p.ServiceContainers = cloneServiceContainers(source.serviceContainers)
-			p.CallbackURL = source.recoveredCallbackURL
-			p.LifecycleCallbackURL = source.recoveredLifecycleCallbackURL
-		}
+		applyFailedReplaceSource(p, info)
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
@@ -1083,6 +1077,7 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 	leaseUUID := lsm.actor.leaseUUID
 
 	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+		applyFailedReplaceSource(p, info)
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
@@ -1097,6 +1092,16 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 		lsm.clearPendingReplaceRoute()
 	}
 	return nil
+}
+
+func applyFailedReplaceSource(p *ProvisionState, info ReplaceFailureInfo) {
+	if source := info.sourceProjection; source != nil {
+		applyReplaceReleaseAuthority(p, *source)
+		p.ContainerIDs = slices.Clone(source.containerIDs)
+		p.ServiceContainers = cloneServiceContainers(source.serviceContainers)
+		p.CallbackURL = source.recoveredCallbackURL
+		p.LifecycleCallbackURL = source.recoveredLifecycleCallbackURL
+	}
 }
 
 // onEnterFailedFromProvision fires when doProvision signals a failure.
@@ -1493,9 +1498,10 @@ type ReplaceFailureInfo struct {
 	// proof; ambiguous terminal writes deliberately leave it invalid and keep
 	// PreserveMaintenance true for recovery.
 	maintenanceRelease shared.MaintenanceReleaseFailure
-	// recoveredSource exists only when the failed release carries exact
-	// SourceReady evidence. It supplies both runtime identity and cohort IDs.
-	recoveredSource *ReplaceSuccessResult
+	// sourceProjection carries exact source runtime identity and observed IDs
+	// independently of readiness. A failed compensation can leave an unhealthy
+	// or incomplete cohort which must replace the removed source IDs too.
+	sourceProjection *ReplaceSuccessResult
 	// OperationRelease is present only for a failed Restore and binds the
 	// callback to the exact operation generation accepted before substrate work.
 	operationRelease shared.OperationReleaseUncommitted
@@ -1549,9 +1555,8 @@ func NewMaintenanceReplaceFailure(err error, details ReplaceFailureDetails, proo
 	info.authorityKind = replaceAuthorityMaintenance
 	info.maintenanceRelease = proof
 	info.maintenance = proof.Intent()
-	if ready, ok := proof.SourceReady(); ok {
-		release, ids, services := ready.Projection()
-		stack, projectionErr := validateCompleteReleaseProjection(release, ids, services)
+	if release, ids, services, ok := proof.SourceProjection(); ok {
+		stack, projectionErr := manifest.ParsePayload(release.Manifest)
 		if projectionErr != nil {
 			return ReplaceResult{}, fmt.Errorf("restored maintenance source: %w", projectionErr)
 		}
@@ -1563,7 +1568,7 @@ func NewMaintenanceReplaceFailure(err error, details ReplaceFailureDetails, proo
 		projection.release, projection.stackManifest = &release, stack
 		projection.recoveredCallbackURL = authority.CallbackURL()
 		projection.recoveredLifecycleCallbackURL = authority.LifecycleCallbackURL()
-		info.recoveredSource = &projection
+		info.sourceProjection = &projection
 	}
 	return ReplaceResult{err: err, failure: info}, nil
 }
@@ -1604,7 +1609,10 @@ func (r ReplaceResult) Err() error { return r.err }
 // Restored reports whether the failed substrate operation restored its source
 // cohort. It is observation only; callers cannot use it to construct another
 // terminal outcome.
-func (r ReplaceResult) Restored() bool { return r.failure.recoveredSource != nil }
+func (r ReplaceResult) Restored() bool {
+	_, ready := r.failure.maintenanceRelease.SourceReady()
+	return ready
+}
 
 // FailureInfo exposes the sealed failure's read-only diagnostic surface.
 func (r ReplaceResult) FailureInfo() ReplaceFailureInfo { return r.failure }

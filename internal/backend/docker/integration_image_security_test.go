@@ -172,7 +172,7 @@ func TestIntegration_Docker_ImmutableImageBindingSurvivesTagMovement(t *testing.
 	})
 	// Exercise the sealed production executor. Creation succeeds, then Start
 	// fails because this fixture contains no executable. No tenant code runs.
-	require.Error(t, compose.Up(ctx, project, composeUpOpts{}))
+	require.Error(t, compose.launch(ctx, project, composeUpOpts{}).err)
 	containers, err := compose.PS(ctx, project.Name())
 	require.NoError(t, err)
 	require.Len(t, containers, 1)

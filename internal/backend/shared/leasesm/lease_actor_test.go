@@ -3,6 +3,7 @@ package leasesm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1700,6 +1701,54 @@ func TestMaintenanceRefusalCannotMintRestoredProjection(t *testing.T) {
 	require.False(t, ready)
 	_, err := NewMaintenanceReplaceFailure(errors.New("failed"), ReplaceFailureDetails{}, shared.MaintenanceReleaseFailure{})
 	require.Error(t, err)
+}
+
+func TestFailedCompensationPublishesSourceProjectionBeforeCallback(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprint(missing), func(t *testing.T) {
+			claim := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentUpdate)
+			result := testFailedCompensation(t, claim, missing)
+			require.False(t, result.Restored(), "an observed failed source cannot mint readiness")
+			source, ids, services, observed := result.failure.maintenanceRelease.SourceProjection()
+			require.True(t, observed)
+			runtime, ok := source.RuntimeIdentity()
+			require.True(t, ok)
+			store := newMockProvisionStore()
+			store.put(testActorLeaseUUID, &ProvisionState{
+				LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusReady,
+				CallbackURL: "removed-route", LifecycleCallbackURL: "removed-lifecycle-route",
+				ContainerIDs: []string{"removed-source"}, ServiceContainers: map[string][]string{"app": {"removed-source"}},
+			})
+			callback := make(chan *ProvisionState, 1)
+			actor := newTestActor(t, testActorLeaseUUID, testActorOpts{
+				StopCtx: t.Context(), ProvisionStore: store,
+				MaintenanceWorkFn: func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+					return replaceWorkTerminal{result: result}
+				},
+				SendMaintenanceCallbackFn: func(_ shared.MaintenanceIntentClaim, status backend.CallbackStatus, _ string) {
+					assert.Equal(t, backend.CallbackStatusFailed, status)
+					visible, exists := store.Get(testActorLeaseUUID)
+					assert.True(t, exists)
+					callback <- visible
+				},
+			})
+			ack := make(chan error, 1)
+			require.True(t, routeReplace(actor, "update", testMaintenanceTarget(t, claim), ack))
+			require.NoError(t, <-ack)
+			select {
+			case visible := <-callback:
+				require.Equal(t, backend.ProvisionStatusFailed, visible.Status)
+				require.Equal(t, ids, visible.ContainerIDs, "failed source IDs must precede callback publication")
+				require.Equal(t, services, visible.ServiceContainers)
+				require.Equal(t, runtime.CallbackURL(), visible.CallbackURL)
+				require.Equal(t, runtime.LifecycleCallbackURL(), visible.LifecycleCallbackURL)
+				require.Equal(t, source.Version, visible.ActiveReleaseVersion)
+				require.Equal(t, source.ResourceProfiles, visible.ResourceProfiles)
+			case <-time.After(time.Second):
+				t.Fatal("failed compensation callback was not sent")
+			}
+		})
+	}
 }
 
 // TestRestoreRequestedMsg_FiresEventAndSpawnsWorker pins the restore

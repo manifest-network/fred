@@ -3,6 +3,7 @@ package shared
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -16,17 +17,20 @@ import (
 )
 
 type compensationTestState struct {
-	targetErr       error
-	beforeTargetErr error
-	auxiliaryErr    error
-	beforeSourceErr error
-	sourceErr       error
-	sourceReady     bool
-	sourceUnready   bool
-	launches        int
-	sourceSubject   MaintenanceCompensationSubject
-	journal         *VolumeLaunchJournal
-	targetReturned  func()
+	captureErr        error
+	classificationErr error
+	sourceMissing     bool
+	targetErr         error
+	beforeTargetErr   error
+	auxiliaryErr      error
+	beforeSourceErr   error
+	sourceErr         error
+	sourceReady       bool
+	sourceUnready     bool
+	launches          int
+	sourceSubject     MaintenanceCompensationSubject
+	journal           *VolumeLaunchJournal
+	targetReturned    func()
 }
 
 func bindCompensationTest(t *testing.T, s *MaintenanceSettlement, state *compensationTestState) {
@@ -38,6 +42,9 @@ func bindCompensationTest(t *testing.T, s *MaintenanceSettlement, state *compens
 	complete := func(context.Context, string, error) error { return nil }
 	require.NoError(t, BindMaintenanceCompensationExecutor(s, t.Context(), authorize, complete,
 		func(context.Context, MaintenancePhysicalSubject) (MaintenanceSourceCapture, error) {
+			if state.captureErr != nil {
+				return MaintenanceSourceCapture{}, state.captureErr
+			}
 			return CapturedMaintenanceSource([]byte(`{"version":1,"image":"immutable-source"}`))
 		},
 		func(_ MaintenancePhysicalSubject, plan []byte) error {
@@ -60,8 +67,8 @@ func bindCompensationTest(t *testing.T, s *MaintenanceSettlement, state *compens
 					return err
 				}
 				assertCompensationJournalPhase(t, s, subject.Intent(), compensationSourceDispatching, 1)
-				receipt, err := runner.StepCompleted(ctx, MaintenanceSourceLaunchStep, func(context.Context) error { state.launches++; return state.sourceErr })
-				if err != nil {
+				receipt, stepResult := runner.StepCompleted(ctx, MaintenanceSourceLaunchStep, func(context.Context) error { state.launches++; return state.sourceErr })
+				if err := stepResult.Err(); err != nil {
 					return err
 				}
 				if err := journal.Complete(debt, receipt); err != nil {
@@ -81,6 +88,9 @@ func bindCompensationTest(t *testing.T, s *MaintenanceSettlement, state *compens
 				if state.sourceUnready {
 					source, _ := subject.SourceRelease()
 					ids, services := testPhysicalProjection(source)
+					if state.sourceMissing {
+						ids, services = nil, nil
+					}
 					return NewMaintenanceCompensationSourceFailed(subject, ids, services)
 				}
 				return MaintenancePhysicalEvidence{}, errors.New("source not ready")
@@ -103,8 +113,8 @@ func bindCompensationTest(t *testing.T, s *MaintenanceSettlement, state *compens
 				if err != nil {
 					return err
 				}
-				receipt, err := runner.StepCompleted(ctx, MaintenanceTargetLaunchStep, func(context.Context) error { return state.targetErr })
-				if err != nil {
+				receipt, stepResult := runner.StepCompleted(ctx, MaintenanceTargetLaunchStep, func(context.Context) error { return state.targetErr })
+				if err := stepResult.Err(); err != nil {
 					return err
 				}
 				if err := journal.Complete(debt, receipt); err != nil {
@@ -121,9 +131,48 @@ func bindCompensationTest(t *testing.T, s *MaintenanceSettlement, state *compens
 			return run(ctx)
 		},
 		func(_ context.Context, subject MaintenancePhysicalSubject) (MaintenancePhysicalEvidence, error) {
+			if state.classificationErr != nil {
+				return MaintenancePhysicalEvidence{}, state.classificationErr
+			}
+			if state.captureErr != nil && state.sourceReady {
+				source, _ := subject.SourceRelease()
+				ids, services := testPhysicalProjection(source)
+				return NewMaintenanceSourceReady(subject, ids, services)
+			}
 			return NewMaintenanceTargetAbsent(subject)
 		},
 	))
+}
+
+func TestMaintenanceSourceCaptureFailureRequiresIndependentSourceObservation(t *testing.T) {
+	for _, sourceReadable := range []bool{true, false} {
+		t.Run(fmt.Sprint(sourceReadable), func(t *testing.T) {
+			f := beginBoundMaintenance(t, "source-capture-error")
+			target := f.appendAndBind(t)
+			cause := errors.New("source image inspection failed")
+			state := &compensationTestState{captureErr: cause, sourceReady: true}
+			if !sourceReadable {
+				state.classificationErr = errors.New("source inventory unavailable")
+			}
+			bindCompensationTest(t, f.settlement, state)
+			execution, err := f.settlement.StartMaintenanceExecution(target)
+			require.NoError(t, err)
+			outcome := f.settlement.ExecuteMaintenance(t.Context(), execution)
+			require.Zero(t, state.launches)
+			if !sourceReadable {
+				require.IsType(t, MaintenanceExecutionAmbiguous{}, outcome)
+				return
+			}
+			failed, ok := outcome.(MaintenanceExecutionFailure)
+			require.True(t, ok, "%T", outcome)
+			require.True(t, failed.SourceRecovered())
+			require.ErrorIs(t, failed.Cause(), cause)
+			proof, err := f.settlement.FailMaintenance(failed, backend.ReasonInternal, "source capture failed; source remains ready")
+			require.NoError(t, err)
+			_, ready := proof.SourceReady()
+			require.True(t, ready)
+		})
+	}
 }
 
 func TestMaintenanceCompensationClassifiesSourceAfterAuxiliaryTargetRefusal(t *testing.T) {
@@ -272,8 +321,8 @@ func TestMaintenanceCompensationCapacityFailurePrecedesTargetEffects(t *testing.
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
 	outcome := f.settlement.ExecuteMaintenance(t.Context(), execution)
-	require.IsType(t, MaintenanceExecutionFailure{}, outcome)
-	require.ErrorContains(t, outcome.(MaintenanceExecutionFailure).Cause(), "capacity")
+	require.IsType(t, MaintenanceExecutionAmbiguous{}, outcome, "capacity refusal does not prove the source remains ready")
+	require.ErrorContains(t, outcome.(MaintenanceExecutionAmbiguous).Cause(), "capacity")
 	require.Zero(t, state.launches)
 	pending, err := f.settlement.CompensationPending(execution.subject.Intent())
 	require.NoError(t, err)
@@ -370,20 +419,36 @@ func reopenCompensationSettlement(t *testing.T, f boundMaintenanceFixture) *Main
 }
 
 func TestMaintenanceCompensationSourceEffectsSettleBeforeUnhealthyTerminal(t *testing.T) {
-	f := beginBoundMaintenance(t, "compensation-unhealthy")
-	target := f.appendAndBind(t)
-	state := &compensationTestState{sourceUnready: true}
-	bindCompensationTest(t, f.settlement, state)
-	execution, err := f.settlement.StartMaintenanceExecution(target)
-	require.NoError(t, err)
-	outcome := f.settlement.ExecuteMaintenance(t.Context(), execution)
-	failed, ok := outcome.(MaintenanceExecutionFailure)
-	require.True(t, ok, "%T: %v", outcome, outcome)
-	require.False(t, failed.SourceRecovered())
-	assertCompensationJournalPhase(t, f.settlement, execution.subject.Intent(), compensationSourceFailed, 0)
-	proof, err := f.settlement.FailMaintenance(failed, backend.ReasonInternal, "source launch settled but source unhealthy")
-	require.NoError(t, err)
-	require.True(t, proof.Valid())
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprint(missing), func(t *testing.T) {
+			f := beginBoundMaintenance(t, "compensation-unhealthy")
+			target := f.appendAndBind(t)
+			state := &compensationTestState{sourceUnready: true, sourceMissing: missing}
+			bindCompensationTest(t, f.settlement, state)
+			execution, err := f.settlement.StartMaintenanceExecution(target)
+			require.NoError(t, err)
+			outcome := f.settlement.ExecuteMaintenance(t.Context(), execution)
+			failed, ok := outcome.(MaintenanceExecutionFailure)
+			require.True(t, ok, "%T: %v", outcome, outcome)
+			require.False(t, failed.SourceRecovered())
+			assertCompensationJournalPhase(t, f.settlement, execution.subject.Intent(), compensationSourceFailed, 0)
+			proof, err := f.settlement.FailMaintenance(failed, backend.ReasonInternal, "source launch settled but source unhealthy")
+			require.NoError(t, err)
+			require.True(t, proof.Valid())
+			_, ready := proof.SourceReady()
+			require.False(t, ready)
+			release, ids, services, observed := proof.SourceProjection()
+			require.True(t, observed, "failed source still carries exact runtime projection")
+			if missing {
+				require.Empty(t, ids)
+				require.Empty(t, services)
+			} else {
+				wantIDs, wantServices := testPhysicalProjection(release)
+				require.Equal(t, wantIDs, ids)
+				require.Equal(t, wantServices, services)
+			}
+		})
+	}
 }
 
 func TestMaintenanceCompensationAmbiguousSourceDebtSurvivesReopen(t *testing.T) {

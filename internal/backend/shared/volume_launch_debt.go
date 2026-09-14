@@ -96,6 +96,22 @@ func NewVolumeLaunchJournal(store *CallbackStore) (*VolumeLaunchJournal, error) 
 	return j, nil
 }
 
+// PendingCount reports outstanding launch requests for operator monitoring.
+// It grants no authority to clear them or infer workload readiness.
+func (j *VolumeLaunchJournal) PendingCount() (int, error) {
+	if j == nil || j.store == nil {
+		return 0, errors.New("volume launch journal unavailable")
+	}
+	count := 0
+	err := j.store.view(func(tx *bolt.Tx) error {
+		if err := j.validateTx(tx); err != nil {
+			return err
+		}
+		return visitVolumeLaunchDebtsTx(tx, func(volumeLaunchDebtRecord) error { count++; return nil })
+	})
+	return count, err
+}
+
 // Check runs under the caller's physical-directory reservations, before any
 // bind preparation or writer retirement. Begin repeats it in the durable write
 // immediately before launch, while those same reservations remain held.
@@ -178,55 +194,54 @@ func (j *VolumeLaunchJournal) Begin(origin VolumeLaunchOrigin, volumes []fsident
 	return VolumeLaunchDebt{journal: j, origin: origin, record: r}, nil
 }
 
-// Complete is the only debt-removal path. The receipt is non-forgeable, bound
+// Complete is the runtime debt-removal path. The receipt is non-forgeable, bound
 // to the exact live subject/effect, single-use, and minted only after the full
 // effect plus post-attestation succeeded. Any commit failure preserves debt.
+// Unknown requests instead require the separate stopped operator-fence repair.
 func (j *VolumeLaunchJournal) Complete(debt VolumeLaunchDebt, completed substratemutation.CompletedStep) error {
 	if j == nil || debt.journal != j || j.store == nil {
 		return errors.New("volume launch debt belongs to another journal")
 	}
-	var consumeErr error
+	commit := func() error {
+		return j.store.update(func(tx *bolt.Tx) error {
+			if err := j.verifyOriginTx(tx, debt.origin); err != nil {
+				return err
+			}
+			bucket := tx.Bucket(volumeLaunchDebtBucketName)
+			if bucket == nil {
+				return errors.New("volume launch debt bucket missing")
+			}
+			key := []byte(volumeLaunchKey(debt.record))
+			current, err := decodeVolumeLaunchDebt(key, bucket.Get(key))
+			if err != nil {
+				return err
+			}
+			if !equalVolumeLaunchDebt(current, debt.record) {
+				return errors.New("volume launch debt changed")
+			}
+			if debt.origin.maintenance.Valid() {
+				if err := recordMaintenanceTargetEffectsTx(tx, debt.origin.maintenance); err != nil {
+					return err
+				}
+			}
+			if debt.origin.compensation.Valid() {
+				if err := completeCompensationSourceLaunchTx(tx, debt.origin.compensation); err != nil {
+					return err
+				}
+			}
+			return bucket.Delete(key)
+		})
+	}
 	switch {
 	case debt.origin.operation.Valid():
-		consumeErr = substratemutation.ConsumeCompletedStep(completed, debt.origin.operation, MaintenanceTargetLaunchStep)
+		return substratemutation.CommitCompletedStep(completed, debt.origin.operation, MaintenanceTargetLaunchStep, commit)
 	case debt.origin.maintenance.Valid():
-		consumeErr = substratemutation.ConsumeCompletedStep(completed, debt.origin.maintenance, MaintenanceTargetLaunchStep)
+		return substratemutation.CommitCompletedStep(completed, debt.origin.maintenance, MaintenanceTargetLaunchStep, commit)
 	case debt.origin.compensation.Valid():
-		consumeErr = substratemutation.ConsumeCompletedStep(completed, debt.origin.compensation, MaintenanceSourceLaunchStep)
+		return substratemutation.CommitCompletedStep(completed, debt.origin.compensation, MaintenanceSourceLaunchStep, commit)
 	default:
 		return errors.New("volume launch debt has no live subject")
 	}
-	if consumeErr != nil {
-		return consumeErr
-	}
-	return j.store.update(func(tx *bolt.Tx) error {
-		if err := j.verifyOriginTx(tx, debt.origin); err != nil {
-			return err
-		}
-		bucket := tx.Bucket(volumeLaunchDebtBucketName)
-		if bucket == nil {
-			return errors.New("volume launch debt bucket missing")
-		}
-		key := []byte(volumeLaunchKey(debt.record))
-		current, err := decodeVolumeLaunchDebt(key, bucket.Get(key))
-		if err != nil {
-			return err
-		}
-		if !equalVolumeLaunchDebt(current, debt.record) {
-			return errors.New("volume launch debt changed")
-		}
-		if debt.origin.maintenance.Valid() {
-			if err := recordMaintenanceTargetEffectsTx(tx, debt.origin.maintenance); err != nil {
-				return err
-			}
-		}
-		if debt.origin.compensation.Valid() {
-			if err := completeCompensationSourceLaunchTx(tx, debt.origin.compensation); err != nil {
-				return err
-			}
-		}
-		return bucket.Delete(key)
-	})
 }
 
 func (j *VolumeLaunchJournal) record(origin VolumeLaunchOrigin, volumes []fsidentity.Identity) (volumeLaunchDebtRecord, error) {

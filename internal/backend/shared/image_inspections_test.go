@@ -16,6 +16,41 @@ import (
 
 const inspectionJournalTestImage = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
+func reserveInspectionForTest(journal *ImageInspectionJournal, origin ImageInspectionOrigin, image, reference string) (ImageInspectionReceipt, error) {
+	prepared, err := journal.Prepare(origin, image, reference)
+	if err != nil {
+		return ImageInspectionReceipt{}, err
+	}
+	return journal.Reserve(prepared)
+}
+
+func withInspectionCompletionForTest(t *testing.T, prepared PreparedImageInspection, operation string, consume func(substratemutation.CompletedStep)) {
+	t.Helper()
+	protocol := substratemutation.NewProtocol[PreparedImageInspection]()
+	binding, err := protocol.NewGuardBinding()
+	require.NoError(t, err)
+	guard, _, err := substratemutation.NewExecutor(binding,
+		func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil },
+		func(context.Context, string, error) error { return nil },
+		func(runner substratemutation.Runner, _ PreparedImageInspection) func(context.Context) error {
+			return func(ctx context.Context) error {
+				completed, step := runner.StepCompleted(ctx, operation, func(context.Context) error { return nil })
+				require.NoError(t, step.Err())
+				consume(completed)
+				return nil
+			}
+		},
+		func(ctx context.Context, run func(context.Context) error, _ PreparedImageInspection) error {
+			return run(ctx)
+		},
+		func(context.Context, PreparedImageInspection) (struct{}, error) { return struct{}{}, nil },
+	)
+	require.NoError(t, err)
+	execution, err := protocol.BeginAfter(func() (PreparedImageInspection, error) { return prepared, nil })
+	require.NoError(t, err)
+	require.NoError(t, guard.Execute(execution, t.Context()).Err())
+}
+
 func TestImageInspectionJournalCompensationOriginRequiresUndispatchedSource(t *testing.T) {
 	f := beginBoundMaintenance(t, "inspection-source-preparation")
 	target := f.appendAndBind(t)
@@ -27,21 +62,25 @@ func TestImageInspectionJournalCompensationOriginRequiresUndispatchedSource(t *t
 	origin := ImageInspectionForCompensation(state.sourceSubject)
 	journal, err := NewImageInspectionJournal(f.settlement.callbacks)
 	require.NoError(t, err)
-	_, err = journal.Reserve(ImageInspectionForCompensation(MaintenanceCompensationSubject{}), inspectionJournalTestImage, "source:captured")
+	_, err = reserveInspectionForTest(journal, ImageInspectionForCompensation(MaintenanceCompensationSubject{}), inspectionJournalTestImage, "source:captured")
 	require.Error(t, err)
 	foreign := openOperationHandoffStores(t, "foreign-inspection-source")
 	foreignJournal, err := NewImageInspectionJournal(foreign.callbacks)
 	require.NoError(t, err)
-	_, err = foreignJournal.Reserve(origin, inspectionJournalTestImage, "source:captured")
+	_, err = reserveInspectionForTest(foreignJournal, origin, inspectionJournalTestImage, "source:captured")
 	require.ErrorContains(t, err, "another journal")
-	receipt, err := journal.Reserve(origin, inspectionJournalTestImage, "source:captured")
+	receipt, err := reserveInspectionForTest(journal, origin, inspectionJournalTestImage, "source:captured")
 	require.NoError(t, err)
 	require.Equal(t, "compensation", receipt.Kind())
 	require.Equal(t, target.LeaseUUID(), receipt.LeaseUUID())
 	require.Equal(t, target.MaintenanceID().String(), receipt.SubjectID())
+	prepared, err := journal.Prepare(origin, inspectionJournalTestImage, "source:captured")
+	require.NoError(t, err)
 	_, err = state.journal.Begin(VolumeLaunchForCompensation(state.sourceSubject), nil)
 	require.NoError(t, err)
-	_, err = journal.Reserve(origin, inspectionJournalTestImage, "source:captured")
+	_, err = journal.Reserve(prepared)
+	require.Error(t, err, "preparation cannot survive compensation source dispatch")
+	_, err = reserveInspectionForTest(journal, origin, inspectionJournalTestImage, "source:captured")
 	require.Error(t, err, "copied preparation origin cannot create helpers after source dispatch")
 	receipts, err := journal.List()
 	require.NoError(t, err)
@@ -82,27 +121,31 @@ func TestImageInspectionJournalRequiresExactStartedSubjectAndOpenStore(t *testin
 	origin := startedInspectionOrigin(t, stores)
 	journal, err := NewImageInspectionJournal(stores.callbacks)
 	require.NoError(t, err)
-	_, err = journal.Reserve(ImageInspectionOrigin{}, inspectionJournalTestImage, "fixture:latest")
+	_, err = reserveInspectionForTest(journal, ImageInspectionOrigin{}, inspectionJournalTestImage, "fixture:latest")
 	require.ErrorContains(t, err, "live Started")
 	var decoded ImageInspectionOrigin
 	require.NoError(t, json.Unmarshal([]byte(`{"operation":"copied-fields","lease_uuid":"ignored"}`), &decoded)) //nolint:staticcheck // SA9005: verify JSON cannot mint authority.
-	_, err = journal.Reserve(decoded, inspectionJournalTestImage, "fixture:latest")
+	_, err = reserveInspectionForTest(journal, decoded, inspectionJournalTestImage, "fixture:latest")
 	require.ErrorContains(t, err, "live Started")
 	foreign := openOperationHandoffStores(t, "docker-inspection")
 	foreignJournal, err := NewImageInspectionJournal(foreign.callbacks)
 	require.NoError(t, err)
-	_, err = foreignJournal.Reserve(origin, inspectionJournalTestImage, "fixture:latest")
+	_, err = reserveInspectionForTest(foreignJournal, origin, inspectionJournalTestImage, "fixture:latest")
 	require.ErrorContains(t, err, "another journal")
-	receipt, err := journal.Reserve(origin, inspectionJournalTestImage, "fixture:latest")
+	receipt, err := reserveInspectionForTest(journal, origin, inspectionJournalTestImage, "fixture:latest")
 	require.NoError(t, err)
 	assert.Equal(t, origin.operation.LeaseUUID(), receipt.LeaseUUID())
 	assert.Equal(t, origin.operation.OperationID().String(), receipt.SubjectID())
 	assert.Equal(t, stores.storage.ID(), receipt.StorageID())
-	_, err = foreignJournal.RecordCreated(receipt, strings.Repeat("a", 64))
+	_, err = foreignJournal.RecordCreationSettled(receipt, strings.Repeat("a", 64), substratemutation.CompletedStep{})
 	require.ErrorContains(t, err, "another journal")
+	prepared, err := journal.Prepare(origin, inspectionJournalTestImage, "fixture:latest")
+	require.NoError(t, err)
 	closeSettlement := newCloseSettlementForTest(t, stores)
 	_ = admitSettlementClose(t, closeSettlement, receipt.LeaseUUID(), false)
-	_, err = journal.Reserve(origin, inspectionJournalTestImage, "fixture:latest")
+	_, err = journal.Reserve(prepared)
+	require.ErrorContains(t, err, "replaced", "reservation rechecks the prepared claim after close")
+	_, err = reserveInspectionForTest(journal, origin, inspectionJournalTestImage, "fixture:latest")
 	require.ErrorContains(t, err, "replaced")
 	receipts, err := journal.List()
 	require.NoError(t, err)
@@ -114,9 +157,9 @@ func TestImageInspectionJournalUnknownCreateSurvivesCloseAndReopen(t *testing.T)
 	origin := startedInspectionOrigin(t, stores)
 	journal, err := NewImageInspectionJournal(stores.callbacks)
 	require.NoError(t, err)
-	receipt, err := journal.Reserve(origin, inspectionJournalTestImage, "fixture:latest")
+	receipt, err := reserveInspectionForTest(journal, origin, inspectionJournalTestImage, "fixture:latest")
 	require.NoError(t, err)
-	require.ErrorContains(t, journal.ForgetRemoved(receipt), "permanent recovery receipt")
+	require.ErrorContains(t, journal.ForgetRemoved(receipt), "completion or an offline daemon fence")
 	closeSettlement := newCloseSettlementForTest(t, stores)
 	_ = admitSettlementClose(t, closeSettlement, receipt.LeaseUUID(), false)
 	require.NoError(t, stores.callbacks.Close())
@@ -130,9 +173,9 @@ func TestImageInspectionJournalUnknownCreateSurvivesCloseAndReopen(t *testing.T)
 	require.Len(t, receipts, 1)
 	assert.Equal(t, receipt.ID(), receipts[0].ID())
 	assert.Empty(t, receipts[0].ContainerID())
-	_, err = newJournal.RecordCreated(receipt, strings.Repeat("a", 64))
+	_, err = newJournal.RecordCreationSettled(receipt, strings.Repeat("a", 64), substratemutation.CompletedStep{})
 	require.ErrorContains(t, err, "another journal", "old process receipt cannot commit through fresh owner")
-	_, err = newJournal.Reserve(origin, inspectionJournalTestImage, "fixture:latest")
+	_, err = reserveInspectionForTest(newJournal, origin, inspectionJournalTestImage, "fixture:latest")
 	require.ErrorContains(t, err, "another journal")
 }
 
@@ -141,18 +184,60 @@ func TestImageInspectionJournalCreateResponseTransitionInvalidatesPriorReceipt(t
 	origin := startedInspectionOrigin(t, stores)
 	journal, err := NewImageInspectionJournal(stores.callbacks)
 	require.NoError(t, err)
-	pending, err := journal.Reserve(origin, inspectionJournalTestImage, "fixture:latest")
+	pending, err := reserveInspectionForTest(journal, origin, inspectionJournalTestImage, "fixture:latest")
 	require.NoError(t, err)
-	created, err := journal.RecordCreated(pending, strings.Repeat("a", 64))
-	require.NoError(t, err)
-	_, err = journal.RecordCreated(pending, strings.Repeat("b", 64))
-	require.ErrorContains(t, err, "changed")
-	_, err = journal.RecordCreated(created, strings.Repeat("b", 64))
+	var created ImageInspectionReceipt
+	withInspectionCompletionForTest(t, pending.prepared, ImageInspectionCreationStep, func(completed substratemutation.CompletedStep) {
+		created, err = journal.RecordCreationSettled(pending, strings.Repeat("a", 64), completed)
+		require.NoError(t, err)
+		_, err = journal.RecordCreationSettled(pending, strings.Repeat("b", 64), completed)
+		require.ErrorContains(t, err, "consumed")
+	})
+	_, err = journal.RecordCreationSettled(created, strings.Repeat("b", 64), substratemutation.CompletedStep{})
 	require.ErrorContains(t, err, "already recorded")
 	require.NoError(t, journal.ForgetRemoved(created))
+	_, err = journal.Reserve(pending.prepared)
+	require.ErrorContains(t, err, "already reserved", "copied preparation cannot recreate a cleaned-up helper")
 	receipts, err := journal.List()
 	require.NoError(t, err)
 	assert.Empty(t, receipts, "known completed Create does not accrue permanent receipts")
+}
+
+func TestImageInspectionCreationCompletionRequiresExactLivePreparation(t *testing.T) {
+	stores := openOperationHandoffStores(t, "docker-inspection-completion")
+	origin := startedInspectionOrigin(t, stores)
+	journal, err := NewImageInspectionJournal(stores.callbacks)
+	require.NoError(t, err)
+	pending, err := reserveInspectionForTest(journal, origin, inspectionJournalTestImage, "fixture:latest")
+	require.NoError(t, err)
+	other, err := reserveInspectionForTest(journal, origin, inspectionJournalTestImage, "fixture:latest")
+	require.NoError(t, err)
+	_, err = journal.RecordCreationSettled(pending, "", substratemutation.CompletedStep{})
+	require.Error(t, err, "zero receipt supplies no completion authority")
+	withInspectionCompletionForTest(t, other.prepared, ImageInspectionCreationStep, func(completed substratemutation.CompletedStep) {
+		_, err := journal.RecordCreationSettled(pending, "", completed)
+		require.Error(t, err, "another helper's completed Create cannot settle this receipt")
+	})
+	withInspectionCompletionForTest(t, pending.prepared, "another operation", func(completed substratemutation.CompletedStep) {
+		_, err := journal.RecordCreationSettled(pending, "", completed)
+		require.Error(t, err, "a different completed operation cannot settle Create")
+	})
+	var escaped substratemutation.CompletedStep
+	withInspectionCompletionForTest(t, pending.prepared, ImageInspectionCreationStep, func(completed substratemutation.CompletedStep) { escaped = completed })
+	_, err = journal.RecordCreationSettled(pending, "", escaped)
+	require.Error(t, err, "completion cannot escape its live helper workflow")
+	recovered, err := journal.List()
+	require.NoError(t, err)
+	withInspectionCompletionForTest(t, pending.prepared, ImageInspectionCreationStep, func(completed substratemutation.CompletedStep) {
+		for _, receipt := range recovered {
+			_, err := journal.RecordCreationSettled(receipt, "", completed)
+			require.Error(t, err, "recovery receipts carry cleanup authority only")
+		}
+		settled, err := journal.RecordCreationSettled(pending, "", completed)
+		require.NoError(t, err)
+		require.True(t, settled.CreationSettled(), "terminal rejection can complete without a response ID")
+		require.NoError(t, journal.ForgetRemoved(settled))
+	})
 }
 
 func TestImageInspectionJournalRejectsCorruptAndForeignDurableRecords(t *testing.T) {
@@ -162,7 +247,7 @@ func TestImageInspectionJournalRejectsCorruptAndForeignDurableRecords(t *testing
 			origin := startedInspectionOrigin(t, stores)
 			journal, err := NewImageInspectionJournal(stores.callbacks)
 			require.NoError(t, err)
-			receipt, err := journal.Reserve(origin, inspectionJournalTestImage, "fixture:latest")
+			receipt, err := reserveInspectionForTest(journal, origin, inspectionJournalTestImage, "fixture:latest")
 			require.NoError(t, err)
 			data, err := json.Marshal(receipt.record)
 			require.NoError(t, err)
@@ -205,7 +290,7 @@ func TestImageInspectionJournalMaintenanceOriginOwnsExactTarget(t *testing.T) {
 	var subject MaintenancePhysicalSubject
 	bindTestMaintenanceMutation(t, f.settlement, func(current MaintenancePhysicalSubject) (MaintenancePhysicalEvidence, error) {
 		subject = current
-		receipt, err := journal.Reserve(ImageInspectionForMaintenance(current), inspectionJournalTestImage, "fixture:latest")
+		receipt, err := reserveInspectionForTest(journal, ImageInspectionForMaintenance(current), inspectionJournalTestImage, "fixture:latest")
 		require.NoError(t, err)
 		assert.Equal(t, "maintenance", receipt.Kind())
 		assert.Equal(t, current.MaintenanceID().String(), receipt.SubjectID())
@@ -217,7 +302,7 @@ func TestImageInspectionJournalMaintenanceOriginOwnsExactTarget(t *testing.T) {
 	require.True(t, subject.Valid())
 	closeSettlement := newCloseSettlementForTest(t, f.stores)
 	_ = admitSettlementClose(t, closeSettlement, subject.LeaseUUID(), false)
-	_, err = journal.Reserve(ImageInspectionForMaintenance(subject), inspectionJournalTestImage, "fixture:latest")
+	_, err = reserveInspectionForTest(journal, ImageInspectionForMaintenance(subject), inspectionJournalTestImage, "fixture:latest")
 	require.Error(t, err, "stale maintenance target cannot allocate another helper")
 	receipts, err := journal.List()
 	require.NoError(t, err)

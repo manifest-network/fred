@@ -1172,11 +1172,11 @@ const MaxLookupUUIDs = 100
 
 // Default response body size limits (defense-in-depth against buggy/misrouted backends).
 const (
-	DefaultMaxInfoBytes             int64 = 1 << 20  // 1 MiB — single lease info
-	DefaultMaxProvisionBytes        int64 = 1 << 20  // 1 MiB — single provision record
-	DefaultMaxProvisionsBytes       int64 = 8 << 20  // 8 MiB — list of all provisions
-	DefaultMaxLookupProvisionsBytes int64 = 8 << 20  // 8 MiB — filtered provisions lookup; matches MaxProvisionsBytes because stack leases carry unbounded ServiceImages
-	DefaultMaxLogsBytes             int64 = 16 << 20 // 16 MiB — container logs can be large
+	DefaultMaxInfoBytes             int64 = 1 << 20 // 1 MiB — single lease info
+	DefaultMaxProvisionBytes        int64 = 1 << 20 // 1 MiB — single provision record
+	DefaultMaxProvisionsBytes       int64 = 8 << 20 // 8 MiB — list of all provisions
+	DefaultMaxLookupProvisionsBytes int64 = 8 << 20 // 8 MiB — filtered provisions lookup; matches MaxProvisionsBytes because stack leases carry unbounded ServiceImages
+	DefaultMaxLogsBytes             int64 = int64(MaxProjectedLogsResponseBytes)
 	// MaxStoredReleaseHistoryBytes is the encoded per-lease history contract
 	// enforced by the authoritative release journal. Keep this in the parent
 	// backend package so both the HTTP boundary and the shared store use one

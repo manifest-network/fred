@@ -45,9 +45,13 @@ func newImageSecurityDockerClient(t *testing.T, handler func(*http.Request) (*ht
 
 func imageSecurityClientFromSDK(t *testing.T, cli *client.Client) *DockerClient {
 	t.Helper()
+	httpClient := cli.HTTPClient()
+	observer := new(daemonLaunchObserver)
+	httpClient.Transport = daemonContextTransport{next: httpClient.Transport, observer: observer}
+	require.NoError(t, client.WithHTTPClient(httpClient)(cli))
 	images, creator, err := imageexec.NewDockerRuntime(t.Context(), cli)
 	require.NoError(t, err)
-	return &DockerClient{client: newDockerSDKView(cli), images: images, creator: creator, backendName: "image-security"}
+	return &DockerClient{client: newDockerSDKView(cli), images: images, creator: creator, launchObserver: observer, backendName: "image-security"}
 }
 
 func imageSecurityResponse(status int, body string) *http.Response {
@@ -175,7 +179,7 @@ func TestPreparedComposeProjectPreservesIntentAndPreventsRepull(t *testing.T) {
 	compose.bindImages(mock.imageAdmitter())
 	prepared, err := compose.PrepareProject(project, composeProjectImages(project, params.ImageSetups))
 	require.NoError(t, err)
-	require.NoError(t, compose.Up(t.Context(), prepared, composeUpOpts{}))
+	require.NoError(t, compose.launch(t.Context(), prepared, composeUpOpts{}).err)
 	after, err := json.Marshal(project)
 	require.NoError(t, err)
 	assert.JSONEq(t, string(before), string(after))

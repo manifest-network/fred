@@ -320,8 +320,9 @@ func startMaintenanceTargetLaunchTx(tx *bolt.Tx, subject MaintenancePhysicalSubj
 }
 
 // Called only by the volume launch journal's atomic receipt settlement.
-// The complete target launch and storage attestation have returned successfully;
-// a transport error cannot cross this durable transition.
+// Every issued target Create/Start received a terminal daemon response and the
+// storage attestation succeeded. The launch may still have a business failure;
+// an unknown transport result cannot cross this durable transition.
 func recordMaintenanceTargetEffectsTx(tx *bolt.Tx, subject MaintenancePhysicalSubject) error {
 	if !subject.Valid() || subject.RecoveryCleanup() {
 		return errors.New("target receipt has invalid maintenance subject")
@@ -595,13 +596,13 @@ func NewMaintenanceCompensationSourceFailed(subject MaintenanceCompensationSubje
 	if err != nil {
 		return MaintenancePhysicalEvidence{}, err
 	}
-	state, err := newMaintenanceProjection(subject.FailedTarget(), ids, services, true)
-	if err != nil {
-		return MaintenancePhysicalEvidence{}, err
+	if !validObservedPhysicalProjection(ids, services) {
+		return MaintenancePhysicalEvidence{}, errors.New("failed source projection is invalid")
 	}
+	state := &maintenanceProjectionState{subject: subject.FailedTarget(), containerIDs: slices.Clone(ids), serviceContainers: clonePhysicalProjection(services)}
 	evidence := MaintenanceSourceFailed{state: state}
 	if !evidence.validForMaintenance(subject.FailedTarget()) {
-		return MaintenancePhysicalEvidence{}, errors.New("failed source projection is incomplete")
+		return MaintenancePhysicalEvidence{}, errors.New("failed source projection differs from exact source topology")
 	}
 	return MaintenancePhysicalEvidence{kind: maintenancePhysicalEvidenceSourceFailed, sourceFailed: evidence}, nil
 }

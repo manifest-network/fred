@@ -12,6 +12,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -133,11 +134,12 @@ type PortBinding struct {
 
 // DockerClient wraps the Docker client for container lifecycle operations.
 type DockerClient struct {
-	client      dockerSDKView
-	images      *imageexec.Admitter
-	creator     *imageexec.DockerCreator
-	inspections *imageInspectionCoordinator
-	backendName string
+	client         dockerSDKView
+	images         *imageexec.Admitter
+	creator        *imageexec.DockerCreator
+	launchObserver *daemonLaunchObserver
+	inspections    *imageInspectionCoordinator
+	backendName    string
 }
 
 // NewDockerClient connects to Docker and requires the image execution API
@@ -153,10 +155,27 @@ func NewDockerClient(ctx context.Context, host string, backendName string) (*Doc
 	if host != "" {
 		opts = append(opts, client.WithHost(host))
 	}
+	// The configured host is the daemon authority. Environment HTTP proxies
+	// must not replace its terminal responses with gateway-generated replies.
+	opts = append(opts, func(cli *client.Client) error {
+		transport, ok := cli.HTTPClient().Transport.(*http.Transport)
+		if !ok {
+			return errors.New("docker SDK has no direct HTTP transport")
+		}
+		transport.Proxy = nil
+		return nil
+	})
 
 	cli, err := client.NewClientWithOpts(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
+	}
+	httpClient := cli.HTTPClient()
+	observer := new(daemonLaunchObserver)
+	httpClient.Transport = daemonContextTransport{next: httpClient.Transport, observer: observer}
+	if err := client.WithHTTPClient(httpClient)(cli); err != nil {
+		_ = cli.Close()
+		return nil, err
 	}
 
 	images, creator, err := imageexec.NewDockerRuntime(ctx, cli)
@@ -164,7 +183,7 @@ func NewDockerClient(ctx context.Context, host string, backendName string) (*Doc
 		_ = cli.Close()
 		return nil, err
 	}
-	return &DockerClient{client: newDockerSDKView(cli), images: images, creator: creator, backendName: backendName}, nil
+	return &DockerClient{client: newDockerSDKView(cli), images: images, creator: creator, launchObserver: observer, backendName: backendName}, nil
 }
 
 // Close closes the Docker client.
@@ -1263,6 +1282,12 @@ func (d *DockerClient) StartContainer(ctx context.Context, containerID string, t
 	return nil
 }
 
+func (d *DockerClient) startCompensationContainer(ctx context.Context, id string, timeout time.Duration) daemonLaunchOutcome {
+	return d.launchObserver.run(ctx, func(ctx context.Context) error {
+		return d.StartContainer(ctx, id, timeout)
+	})
+}
+
 // StopContainer gracefully stops a running container with a timeout.
 // After the timeout, the container is forcefully killed.
 func (d *DockerClient) StopContainer(ctx context.Context, containerID string, timeout time.Duration) error {
@@ -1322,13 +1347,13 @@ const maxContainerLogBytes = 5 << 20 // 5 MiB
 // materialize gigabytes and OOM the shared docker backend host — cross-tenant
 // denial of service (ENG-590). It is the same host-exhaustion concern as
 // maxContainerLogBytes, one level up (per-lease rather than per-container).
-const maxTotalLogBytes = 32 << 20 // 32 MiB
+const maxTotalLogBytes = backend.MaxLogContentBytes
 
 // aggregateLogLimitMessage marks output cut short because a GetLogs /
 // captureContainerLogs call reached its per-call aggregate budget
 // (maxTotalLogBytes). Used both as an appended truncation marker and as the
 // standalone placeholder for containers skipped once the budget is spent.
-const aggregateLogLimitMessage = "[log truncated: aggregate log size limit reached]"
+const aggregateLogLimitMessage = backend.AggregateLogLimitMessage
 
 // trimLogToBudget trims a single container's (already per-container-capped) log
 // output to the aggregate byte budget remaining for a GetLogs /

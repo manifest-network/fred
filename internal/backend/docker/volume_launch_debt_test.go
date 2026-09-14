@@ -8,26 +8,31 @@ import (
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 type volumeDispatchHarness struct {
-	backend    *Backend
-	compose    *mockComposeExecutor
-	prepared   imageexec.PreparedProject
-	settlement *shared.OperationSettlement
-	execution  shared.OperationExecutionClaim
-	q          *quiescedVolumes
-	refusal    error
-	run        func(context.Context, *quiescedVolumes) error
+	backend      *Backend
+	compose      *mockComposeExecutor
+	prepared     imageexec.PreparedProject
+	settlement   *shared.OperationSettlement
+	execution    shared.OperationExecutionClaim
+	q            *quiescedVolumes
+	refusal      error
+	run          func(context.Context, *quiescedVolumes) error
+	callbacks    *shared.CallbackStore
+	callbackPath string
 }
 
 func newVolumeDispatchHarness(t *testing.T) *volumeDispatchHarness {
 	t.Helper()
-	callbacks, err := newBoundCallbackStoreForTest(t, shared.CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "callbacks.db")})
+	callbackPath := filepath.Join(t.TempDir(), "callbacks.db")
+	callbacks, err := newBoundCallbackStoreForTest(t, shared.CallbackStoreConfig{DBPath: callbackPath})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = callbacks.Close() })
 	_, settlement := operationSettlementForCallbackTest(t, callbacks)
@@ -47,7 +52,7 @@ func newVolumeDispatchHarness(t *testing.T) *volumeDispatchHarness {
 		"app": {Image: image.Reference()},
 	}}, map[string]imageexec.Image{"app": image})
 	require.NoError(t, err)
-	h := &volumeDispatchHarness{backend: b, compose: compose, prepared: prepared, settlement: settlement}
+	h := &volumeDispatchHarness{backend: b, compose: compose, prepared: prepared, settlement: settlement, callbacks: callbacks, callbackPath: callbackPath}
 	// Inject a refusal through the bound authority seam, not through a caller
 	// flag that purports to prove whether a launch was dispatched.
 	authorize := func(ctx context.Context, operation string) (context.Context, func(), error) {
@@ -167,4 +172,30 @@ func TestVolumeLaunchDebtDispatchOwnsWriteAheadAndExactCompletion(t *testing.T) 
 				"settling launch debt does not erase the outer workflow's evidence requirements or issues")
 		})
 	}
+}
+
+func TestVolumeLaunchCompletedDaemonFailureCannotBypassStoragePostAttestation(t *testing.T) {
+	h := newVolumeDispatchHarness(t)
+	cause := errors.New("daemon completed with rejection")
+	h.compose.LaunchFn = func(context.Context, *composetypes.Project, composeUpOpts) daemonLaunchOutcome {
+		h.backend.storageVerifier = testDockerRuntimeStorageVerifier{id: h.backend.storageIdentity, verify: func(context.Context) error { return backendidentity.ErrIdentityDrift }}
+		return daemonLaunchOutcome{settled: true, err: cause}
+	}
+	outcome := h.execute(t, func(ctx context.Context, q *quiescedVolumes) error {
+		err := h.backend.volumeLaunches.compose(ctx, q, h.prepared, composeUpOpts{})
+		require.ErrorIs(t, err, cause)
+		require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+		return err
+	})
+	require.IsType(t, shared.OperationExecutionAmbiguous{}, outcome)
+	require.NoError(t, h.callbacks.Close())
+	db, err := bolt.Open(h.callbackPath, 0o600, &bolt.Options{ReadOnly: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	require.NoError(t, db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("docker_volume_launch_debt_v1"))
+		require.NotNil(t, bucket)
+		require.Equal(t, 1, bucket.Stats().KeyN, "known response cannot clear debt after storage authority withdrew")
+		return nil
+	}))
 }

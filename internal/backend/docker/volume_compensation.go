@@ -19,12 +19,7 @@ import (
 // permission. Replay must reserve and re-attest this same directory before any
 // source writer can be launched.
 func (b *Backend) captureCompensationVolumeRoots(ctx context.Context, snapshots []compensationContainerRecord) ([]compensationVolumeRoot, error) {
-	release, err := b.volumeAccess.retainNamespace(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-	roots := make(map[string]fsidentity.Identity)
+	names := make([]managedVolumeName, 0, len(snapshots))
 	for _, snapshot := range snapshots {
 		if snapshot.Config == nil {
 			return nil, errors.New("source volume capture requires runtime identity")
@@ -37,6 +32,16 @@ func (b *Backend) captureCompensationVolumeRoots(ctx context.Context, snapshots 
 		if err != nil {
 			return nil, err
 		}
+		names = append(names, name)
+	}
+	release, err := b.volumeAccess.retainNamespace(ctx, names)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	roots := make(map[string]fsidentity.Identity)
+	for index, snapshot := range snapshots {
+		name := names[index]
 		for _, observed := range snapshot.Mounts {
 			if observed.Type != "bind" {
 				continue
@@ -57,9 +62,9 @@ func (b *Backend) captureCompensationVolumeRoots(ctx context.Context, snapshots 
 			roots[name.value()] = identity
 		}
 	}
-	names := slices.Sorted(maps.Keys(roots))
-	result := make([]compensationVolumeRoot, 0, len(names))
-	for _, name := range names {
+	sortedNames := slices.Sorted(maps.Keys(roots))
+	result := make([]compensationVolumeRoot, 0, len(sortedNames))
+	for _, name := range sortedNames {
 		result = append(result, compensationVolumeRoot{Name: name, Identity: roots[name]})
 	}
 	return result, nil

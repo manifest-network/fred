@@ -5,24 +5,25 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 	"github.com/manifest-network/fred/internal/fsidentity"
 )
 
 func emptyVolumeLaunchCoordinatorForTest() *volumeLaunchCoordinator {
 	return &volumeLaunchCoordinator{
 		checkNamespace: func(string) error { return nil },
+		pendingCount:   func() (int, error) { return 0, nil },
 		check:          func(shared.VolumeLaunchOrigin, []fsidentity.Identity) error { return nil },
 		compose: func(context.Context, *quiescedVolumes, imageexec.PreparedProject, composeUpOpts) error {
 			return errors.New("full launch requires a real fixture journal")
 		},
-		sourceFirst: func(context.Context, *quiescedVolumes, compensationContainer) (string, volumeLaunchCompletion, substratemutation.CompletedStep, error) {
-			return "", volumeLaunchCompletion{}, substratemutation.CompletedStep{}, errors.New("full source launch requires a real fixture journal")
+		source: func(context.Context, *quiescedVolumes, compensationStartup) error {
+			return errors.New("full source launch requires a real fixture journal")
 		},
 	}
 }
@@ -69,11 +70,23 @@ func (m *mockDockerClient) ListVolumeWriters(ctx context.Context) ([]ContainerIn
 	return m.ListManagedContainersStrict(ctx)
 }
 
-func (m *mockDockerClient) createCompensationContainer(ctx context.Context, image imageexec.Image, snapshot compensationContainer) (string, error) {
-	if m.CreateCompensationContainerFn != nil {
-		return m.CreateCompensationContainerFn(ctx, image, snapshot)
+func (m *mockDockerClient) createCompensationContainer(ctx context.Context, image imageexec.Image, snapshot compensationContainer) (string, daemonLaunchOutcome) {
+	if m.CreateCompensationOutcomeFn != nil {
+		return m.CreateCompensationOutcomeFn(ctx, image, snapshot)
 	}
-	return "", errors.New("source compensation creation is not configured in this fixture")
+	if m.CreateCompensationContainerFn != nil {
+		id, err := m.CreateCompensationContainerFn(ctx, image, snapshot)
+		return id, daemonLaunchOutcome{settled: err == nil, err: err}
+	}
+	return "", daemonLaunchOutcome{err: errors.New("source compensation creation is not configured in this fixture")}
+}
+
+func (m *mockDockerClient) startCompensationContainer(ctx context.Context, id string, timeout time.Duration) daemonLaunchOutcome {
+	if m.StartCompensationOutcomeFn != nil {
+		return m.StartCompensationOutcomeFn(ctx, id, timeout)
+	}
+	err := m.StartContainer(ctx, id, timeout)
+	return daemonLaunchOutcome{settled: err == nil, err: err}
 }
 
 func (m *mockDockerClient) readmitCompensationImage(ctx context.Context, snapshot compensationContainerRecord) (imageexec.Image, error) {
@@ -83,12 +96,20 @@ func (m *mockDockerClient) readmitCompensationImage(ctx context.Context, snapsho
 	return m.AdmitImage(ctx, snapshot.ImageID)
 }
 
-func (p testDockerMutationProxy) createCompensationContainer(ctx context.Context, image imageexec.Image, snapshot compensationContainer) (string, error) {
+func (p testDockerMutationProxy) createCompensationContainer(ctx context.Context, image imageexec.Image, snapshot compensationContainer) (string, daemonLaunchOutcome) {
 	sink, err := p.sink()
 	if err != nil {
-		return "", err
+		return "", daemonLaunchOutcome{settled: true, err: err}
 	}
 	return sink.createCompensationContainer(ctx, image, snapshot)
+}
+
+func (p testDockerMutationProxy) startCompensationContainer(ctx context.Context, id string, timeout time.Duration) daemonLaunchOutcome {
+	sink, err := p.sink()
+	if err != nil {
+		return daemonLaunchOutcome{settled: true, err: err}
+	}
+	return sink.startCompensationContainer(ctx, id, timeout)
 }
 
 func (p testDockerMutationProxy) readmitCompensationImage(ctx context.Context, snapshot compensationContainerRecord) (imageexec.Image, error) {

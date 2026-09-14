@@ -955,6 +955,90 @@ func testMaintenanceFailure(t *testing.T, intent shared.MaintenanceIntentClaim, 
 	return result
 }
 
+func testFailedCompensation(t *testing.T, intent shared.MaintenanceIntentClaim, missing bool) ReplaceResult {
+	t.Helper()
+	value, ok := maintenanceAuthorities.Load(intent.MaintenanceID())
+	require.True(t, ok)
+	authority := value.(testMaintenanceAuthority)
+	s, err := shared.NewMaintenanceSettlement(authority.callbacks, authority.releases)
+	require.NoError(t, err)
+	journal, err := shared.NewVolumeLaunchJournal(authority.callbacks)
+	require.NoError(t, err)
+	authorize := func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil }
+	complete := func(context.Context, string, error) error { return nil }
+	run := func(ctx context.Context, work func(context.Context) error, _ shared.MaintenancePhysicalSubject) error {
+		return work(ctx)
+	}
+	require.NoError(t, shared.BindMaintenanceSubstrateExecutor(s, authorize, complete,
+		func(runner substratemutation.Runner, subject shared.MaintenancePhysicalSubject) func(context.Context) error {
+			return func(ctx context.Context) error {
+				debt, err := journal.Begin(shared.VolumeLaunchForMaintenance(subject), nil)
+				if err != nil {
+					return err
+				}
+				receipt, stepResult := runner.StepCompleted(ctx, shared.MaintenanceTargetLaunchStep, func(context.Context) error { return nil })
+				if err := stepResult.Err(); err != nil {
+					return err
+				}
+				if err := journal.Complete(debt, receipt); err != nil {
+					return err
+				}
+				return errors.New("target startup failed")
+			}
+		}, run,
+		func(_ context.Context, subject shared.MaintenancePhysicalSubject) (shared.MaintenancePhysicalEvidence, error) {
+			return shared.NewMaintenanceTargetAbsent(subject)
+		},
+	))
+	require.NoError(t, shared.BindMaintenanceCompensationExecutor(s, t.Context(), authorize, complete,
+		func(context.Context, shared.MaintenancePhysicalSubject) (shared.MaintenanceSourceCapture, error) {
+			return shared.CapturedMaintenanceSource([]byte(`{"version":1}`))
+		},
+		func(shared.MaintenancePhysicalSubject, []byte) error { return nil },
+		func(runner substratemutation.Runner, subject shared.MaintenanceCompensationSubject) func(context.Context) error {
+			return func(ctx context.Context) error {
+				debt, err := journal.Begin(shared.VolumeLaunchForCompensation(subject), nil)
+				if err != nil {
+					return err
+				}
+				receipt, stepResult := runner.StepCompleted(ctx, shared.MaintenanceSourceLaunchStep, func(context.Context) error { return nil })
+				if err := stepResult.Err(); err != nil {
+					return err
+				}
+				return journal.Complete(debt, receipt)
+			}
+		},
+		func(ctx context.Context, work func(context.Context) error, _ shared.MaintenanceCompensationSubject) error {
+			return work(ctx)
+		},
+		func(_ context.Context, subject shared.MaintenanceCompensationSubject) (shared.MaintenancePhysicalEvidence, error) {
+			source, _ := subject.SourceRelease()
+			ids, services := testProjectionForRelease(source)
+			if missing {
+				ids, services = nil, nil
+			}
+			return shared.NewMaintenanceCompensationSourceFailed(subject, ids, services)
+		},
+	))
+	_, target, found, err := s.FindMaintenanceRelease(intent.LeaseUUID(), intent.MaintenanceID())
+	require.NoError(t, err)
+	require.True(t, found)
+	authority.target, err = s.BindMaintenanceIntentTarget(target)
+	require.NoError(t, err)
+	authority.settlement = s
+	maintenanceAuthorities.Store(intent.MaintenanceID(), authority)
+	execution, err := s.StartMaintenanceExecution(authority.target)
+	require.NoError(t, err)
+	outcome := s.ExecuteMaintenance(t.Context(), execution)
+	failure, ok := outcome.(shared.MaintenanceExecutionFailure)
+	require.True(t, ok, "%T", outcome)
+	proof, err := s.FailMaintenance(failure, backend.ReasonUpdateFailed, "source compensation failed")
+	require.NoError(t, err)
+	result, err := NewMaintenanceReplaceFailure(errors.New("source compensation failed"), ReplaceFailureDetails{Reason: backend.ReasonUpdateFailed, CallbackErr: "source compensation failed"}, proof)
+	require.NoError(t, err)
+	return result
+}
+
 // appendActiveOperationReleaseForTest seeds an active typed generation through
 // the same write-ahead and release-handoff protocol used by production. Actor
 // tests must not regain a raw ReleaseStore mutation seam merely to prepare a

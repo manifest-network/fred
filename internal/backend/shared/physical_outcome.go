@@ -525,11 +525,23 @@ func (e MaintenanceSourceReady) validForMaintenance(subject MaintenancePhysicalS
 }
 
 func (e MaintenanceSourceFailed) validForMaintenance(subject MaintenancePhysicalSubject) bool {
-	if !validMaintenanceProjection(e.state, subject, true) {
+	if !validMaintenanceProjection(e.state, subject, false) {
 		return false
 	}
 	release, ok := subject.SourceRelease()
-	return ok && validReadyProjectionForRelease(release, e.state.containerIDs, e.state.serviceContainers)
+	if !ok {
+		return false
+	}
+	remaining := make(map[string]int, len(release.Items))
+	for _, item := range release.Items {
+		remaining[item.ServiceName] = item.Quantity
+	}
+	for service, ids := range e.state.serviceContainers {
+		if len(ids) > remaining[service] {
+			return false
+		}
+	}
+	return true
 }
 func (e MaintenanceTargetDivergent) validForMaintenance(subject MaintenancePhysicalSubject) bool {
 	if !validMaintenanceProjection(e.state, subject, false) {

@@ -10,6 +10,7 @@ import (
 	"github.com/docker/docker/api/types/image"
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/system"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 )
 
@@ -24,6 +25,7 @@ type dockerSDKView struct {
 	copyFromContainer func(context.Context, string, string) (io.ReadCloser, container.PathStat, error)
 	containerInspect  func(context.Context, string) (container.InspectResponse, error)
 	containerList     func(context.Context, container.ListOptions) ([]container.Summary, error)
+	volumeInspect     func(context.Context, string) (volume.Volume, error)
 	containerLogs     func(context.Context, string, container.LogsOptions) (io.ReadCloser, error)
 	containerRemove   func(context.Context, string, container.RemoveOptions) error
 	containerRename   func(context.Context, string, string) error
@@ -45,6 +47,7 @@ func newDockerSDKView(cli *client.Client) dockerSDKView {
 		copyFromContainer: cli.CopyFromContainer,
 		containerInspect:  cli.ContainerInspect,
 		containerList:     cli.ContainerList,
+		volumeInspect:     cli.VolumeInspect,
 		containerLogs:     cli.ContainerLogs,
 		containerRemove:   cli.ContainerRemove,
 		containerRename:   cli.ContainerRename,
@@ -78,6 +81,10 @@ func (v dockerSDKView) ContainerInspect(ctx context.Context, id string) (contain
 
 func (v dockerSDKView) ContainerList(ctx context.Context, opts container.ListOptions) ([]container.Summary, error) {
 	return v.containerList(ctx, opts)
+}
+
+func (v dockerSDKView) VolumeInspect(ctx context.Context, name string) (volume.Volume, error) {
+	return v.volumeInspect(ctx, name)
 }
 
 func (v dockerSDKView) ContainerLogs(ctx context.Context, id string, opts container.LogsOptions) (io.ReadCloser, error) {

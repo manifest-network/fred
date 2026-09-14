@@ -219,7 +219,15 @@ func (b *Backend) prepareLaunchVolumes(ctx context.Context, mutations *storageMu
 }
 
 func (b *Backend) quiesceLaunchVolumes(ctx context.Context, mutations *storageMutations, paths map[string]string, created map[string]bool, expected map[string]fsidentity.Identity) (*quiescedVolumes, error) {
-	releaseNamespace, err := b.volumeAccess.retainNamespace(ctx)
+	names := make([]managedVolumeName, 0, len(paths))
+	for raw := range paths {
+		name, err := parseManagedVolumeName(raw)
+		if err != nil || !mutations.volumeNameInScope(name) {
+			return nil, fmt.Errorf("launch volume %q is outside its subject", raw)
+		}
+		names = append(names, name)
+	}
+	releaseNamespace, err := b.volumeAccess.retainNamespace(ctx, names)
 	if err != nil {
 		return nil, err
 	}
@@ -290,6 +298,20 @@ func (q *quiescedVolumes) affects(source string) (bool, error) {
 			return true, nil
 		}
 	}
+	// Docker accepts links and non-directory leaves as bind sources. Resolve a
+	// link before classifying it: skipping it could hide a writer inside a
+	// protected root. Missing leaves are checked through their existing parents.
+	resolved, err := filepath.EvalSymlinks(source)
+	if err == nil {
+		source = resolved
+		for _, volume := range q.volumes {
+			if pathContains(volume.root.Path(), source) || pathContains(source, volume.root.Path()) {
+				return true, nil
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
 	sourceIdentity, sourceErr := fsidentity.InspectDirectory(source)
 	if sourceErr == nil {
 		// A bind alias of a parent directory can replace descendants too. Only
@@ -313,21 +335,30 @@ func (q *quiescedVolumes) affects(source string) (bool, error) {
 	// Aliases outside the conventional namespace still share a physical
 	// ancestor. Retain uncertainty if an existing source cannot be inspected.
 	for path := filepath.Clean(source); ; path = filepath.Dir(path) {
-		identity, err := fsidentity.InspectDirectory(path)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			// Docker also permits file bind mounts. Their parent, rather than
-			// the file itself, is the relevant directory ancestor.
-			info, statErr := os.Lstat(path)
-			if statErr == nil && info.Mode().IsRegular() {
-				continue
-			}
+		resolved, err := filepath.EvalSymlinks(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
 			return false, err
 		}
-		if err == nil {
-			for _, volume := range q.volumes {
-				if identity.Equal(volume.root.Identity()) {
-					return true, nil
-				}
+		info, err := os.Lstat(resolved)
+		if err != nil {
+			return false, err
+		}
+		if !info.IsDir() {
+			// A socket, FIFO, device, or ordinary file cannot contain a managed
+			// directory. Do not open the leaf; its parent may still be an alias
+			// of a protected root and must be checked.
+			continue
+		}
+		identity, err := fsidentity.InspectDirectory(resolved)
+		if err != nil {
+			return false, err
+		}
+		for _, volume := range q.volumes {
+			if identity.Equal(volume.root.Identity()) {
+				return true, nil
 			}
 		}
 		if path == filepath.Dir(path) {
@@ -381,46 +412,124 @@ func (q *quiescedVolumes) validateProject(project *composetypes.Project) error {
 	if err := q.requireActive(); err != nil {
 		return err
 	}
-	type mountSite struct {
-		service string
-		root    fsidentity.Identity
-		path    string
-		write   bool
+	// Index canonical roots and the path components below each physical root.
+	// Work scales with the input's total path length, not the square of its bind
+	// count. Repeated sources share symlink resolution within this validation.
+	roots := make(map[string]fsidentity.Identity, len(q.volumes))
+	for _, volume := range q.volumes {
+		roots[volume.root.Path()] = volume.root.Identity()
 	}
-	var sites []mountSite
+	graphs := make(map[fsidentity.Identity]*launchMountNode)
+	resolvedSources := make(map[string]string)
 	for service, spec := range project.Services {
 		for _, mount := range spec.Volumes {
 			if mount.Type != composetypes.VolumeTypeBind {
 				continue
 			}
-			resolved, err := filepath.EvalSymlinks(mount.Source)
-			if err != nil {
-				return fmt.Errorf("resolve prepared mount: %w", err)
-			}
-			matched := false
-			for _, volume := range q.volumes {
-				if !pathContains(volume.root.Path(), resolved) {
-					continue
-				}
-				rel, err := filepath.Rel(volume.root.Path(), resolved)
+			resolved, ok := resolvedSources[mount.Source]
+			if !ok {
+				var err error
+				resolved, err = filepath.EvalSymlinks(mount.Source)
 				if err != nil {
-					return err
+					return fmt.Errorf("resolve prepared mount: %w", err)
 				}
-				sites = append(sites, mountSite{service: service, root: volume.root.Identity(), path: rel, write: !mount.ReadOnly})
-				matched = true
-				break
+				resolvedSources[mount.Source] = resolved
 			}
-			if !matched {
-				return errors.New("prepared bind escaped its reserved volume")
+			rootPath := resolved
+			for {
+				if _, ok := roots[rootPath]; ok {
+					break
+				}
+				parent := filepath.Dir(rootPath)
+				if parent == rootPath {
+					return errors.New("prepared bind escaped its reserved volume")
+				}
+				rootPath = parent
+			}
+			identity := roots[rootPath]
+			graph := graphs[identity]
+			if graph == nil {
+				graph = &launchMountNode{}
+				graphs[identity] = graph
+			}
+			rel, err := filepath.Rel(rootPath, resolved)
+			if err != nil {
+				return err
+			}
+			graph.add(rel, service, !mount.ReadOnly)
+		}
+	}
+	for _, graph := range graphs {
+		if err := graph.validate(launchMountWriters{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Equal mount sources are allowed. Only a writable strict ancestor belonging
+// to another service can exchange a bind source that is still being mounted.
+type launchMountNode struct {
+	children map[string]*launchMountNode
+	services map[string]bool
+}
+
+func (n *launchMountNode) add(path, service string, write bool) {
+	if path != "." {
+		for part := range strings.SplitSeq(path, string(filepath.Separator)) {
+			if n.children == nil {
+				n.children = make(map[string]*launchMountNode)
+			}
+			child := n.children[part]
+			if child == nil {
+				child = &launchMountNode{}
+				n.children[part] = child
+			}
+			n = child
+		}
+	}
+	if n.services == nil {
+		n.services = make(map[string]bool)
+	}
+	n.services[service] = n.services[service] || write
+}
+
+// Two distinct ancestors suffice: every descendant service differs from at
+// least one of them. Keeping their names avoids copying a growing ancestor set.
+type launchMountWriters struct {
+	services [2]string
+	count    int
+}
+
+func (w launchMountWriters) with(service string) launchMountWriters {
+	for _, existing := range w.services[:w.count] {
+		if existing == service {
+			return w
+		}
+	}
+	if w.count < len(w.services) {
+		w.services[w.count] = service
+		w.count++
+	}
+	return w
+}
+
+func (n *launchMountNode) validate(ancestors launchMountWriters) error {
+	for service := range n.services {
+		for _, writer := range ancestors.services[:ancestors.count] {
+			if writer != service {
+				return errors.New("launch mount graph lets one target replace another target's pending bind source")
 			}
 		}
 	}
-	for _, writer := range sites {
-		for _, pending := range sites {
-			if writer.service != pending.service && writer.write && writer.root.Equal(pending.root) &&
-				writer.path != pending.path && pathContains(writer.path, pending.path) {
-				return errors.New("launch mount graph lets one target replace another target's pending bind source")
-			}
+	for service, write := range n.services {
+		if write {
+			ancestors = ancestors.with(service)
+		}
+	}
+	for _, child := range n.children {
+		if err := child.validate(ancestors); err != nil {
+			return err
 		}
 	}
 	return nil

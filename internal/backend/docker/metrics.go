@@ -20,8 +20,8 @@ const (
 const (
 	phaseAdopt         = "adopt"          // restore-only: rename retained → canonical volumes
 	phaseImageSetup    = "image_setup"    // inspect image VOLUMEs / user / writable paths
-	phaseVolumeSetup   = "volume_setup"   // create volume binds + VOLUME-subdir chown
-	phaseComposeUp     = "compose_up"     // compose Up (stop old + create/start new)
+	phaseVolumeSetup   = "volume_setup"   // materialize roots, reserve/drain writers, prepare/chown binds
+	phaseComposeUp     = "compose_up"     // protected Compose create/start and launch receipt settlement
 	phaseVerifyStartup = "verify_startup" // health-wait / fixed startup verification
 )
 
@@ -381,6 +381,13 @@ var (
 		Help:      "Per-phase duration of the shared replace machinery (restart/update/restore) in seconds",
 		Buckets:   prometheus.ExponentialBuckets(0.05, 2, 16), // 50ms to ~27min
 	}, []string{"operation", "phase"})
+
+	volumeLaunchesPending = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_launches_pending",
+		Help:      "Outstanding Docker launch receipts at the last successful backend health inspection",
+	})
 
 	// restoresTotal counts exact terminal restore outcomes. Unlike
 	// restoreDurationSeconds (success-only), it increments on both the success and

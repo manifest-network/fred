@@ -42,14 +42,17 @@ func frozenCompensationFixture(info ContainerInfo, imageID string) *compensation
 
 func TestMaintenanceCompensationDockerRestoresFrozenImageAndPolicyAfterTargetFailure(t *testing.T) {
 	t.Run("current authority", func(t *testing.T) {
-		testFrozenDockerCompensation(t, newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate))
+		testFrozenDockerCompensation(t, newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate), false)
 	})
 	t.Run("v0.13 moved callback base", func(t *testing.T) {
-		testFrozenDockerCompensation(t, newLegacyMaintenanceRecoveryHarnessForKindAtCallback(t, shared.MaintenanceIntentUpdate, "https://new-provider.example/callbacks/provision"))
+		testFrozenDockerCompensation(t, newLegacyMaintenanceRecoveryHarnessForKindAtCallback(t, shared.MaintenanceIntentUpdate, "https://new-provider.example/callbacks/provision"), false)
+	})
+	t.Run("completed Compose rejection", func(t *testing.T) {
+		testFrozenDockerCompensation(t, newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate), true)
 	})
 }
 
-func testFrozenDockerCompensation(t *testing.T, h *maintenanceRecoveryHarness) {
+func testFrozenDockerCompensation(t *testing.T, h *maintenanceRecoveryHarness, composeRejects bool) {
 	h.appendTarget(true)
 	mock := h.b.docker.(*mockDockerClient)
 	sourceID, targetID := fixtureImageID("source immutable"), fixtureImageID("moved mutable tag")
@@ -86,13 +89,16 @@ func testFrozenDockerCompensation(t *testing.T, h *maintenanceRecoveryHarness) {
 	failedTargets := h.containersFor(h.targetRelease, 2, "exited", "")
 	composeCalls := 0
 	h.b.compose = &mockComposeExecutor{
-		UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
+		LaunchFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) daemonLaunchOutcome {
 			composeCalls++
 			for _, service := range project.Services {
 				require.Equal(t, targetID, service.Image)
 			}
 			h.inventory.containers = slices.Clone(failedTargets)
-			return nil
+			if composeRejects {
+				return daemonLaunchOutcome{settled: true, err: errors.New("daemon rejected target startup")}
+			}
+			return daemonLaunchOutcome{settled: true}
 		},
 		PSFn: func(context.Context, string) ([]composeContainerSummary, error) {
 			return []composeContainerSummary{{ID: failedTargets[0].ContainerID, Service: "web-0", State: "exited"}, {ID: failedTargets[1].ContainerID, Service: "web-1", State: "exited"}}, nil
@@ -252,6 +258,215 @@ func TestMaintenanceCompensationPrelaunchImageFailureKeepsExactHealthySource(t *
 	require.True(t, proof.Valid())
 }
 
+func TestMaintenanceCompensationCaptureFailurePreservesObservedHealthySource(t *testing.T) {
+	h := newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate)
+	h.appendTarget(true)
+	mock := h.b.docker.(*mockDockerClient)
+	sourceID := fixtureImageID("source capture unavailable")
+	sources := h.containersFor(h.source, 2, "running", "")
+	for index := range sources {
+		sources[index].execution = frozenCompensationFixture(sources[index], sourceID)
+	}
+	h.inventory.containers = sources
+	mock.InspectImageFn = func(context.Context, string) (*ImageInfo, error) {
+		return nil, errors.New("daemon source image metadata unavailable")
+	}
+	mock.PullImageFn = func(context.Context, string, time.Duration) error {
+		t.Fatal("capture failure cannot dispatch target preparation")
+		return nil
+	}
+	mock.CreateCompensationContainerFn = func(context.Context, imageexec.Image, compensationContainer) (string, error) {
+		t.Fatal("capture failure cannot grant source replay authority")
+		return "", nil
+	}
+	ops, err := storageMutationOperationsForTest(h.b)
+	require.NoError(t, err)
+	require.NoError(t, bindDockerMaintenanceCompensation(h.b, ops))
+	execution, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+	require.NoError(t, err)
+	outcome := h.b.maintenanceSettlement.ExecuteMaintenance(t.Context(), execution)
+	failed, ok := outcome.(shared.MaintenanceExecutionFailure)
+	require.True(t, ok, "%T: %v", outcome, outcome)
+	require.True(t, failed.SourceRecovered())
+	require.Empty(t, h.inventory.removed)
+	proof, err := h.b.maintenanceSettlement.FailMaintenance(failed, backend.ReasonInternal, "source capture failed; original source ready")
+	require.NoError(t, err)
+	_, ids, services, observed := proof.SourceProjection()
+	require.True(t, observed)
+	wantIDs, wantServices := physicalProjection(sources)
+	require.Equal(t, wantIDs, ids)
+	require.Equal(t, wantServices, services)
+}
+
+func TestMaintenanceCompensationSettledIncompleteSourceFailsWithoutReplay(t *testing.T) {
+	for _, surviving := range []int{0, 1, 2} {
+		t.Run(strconv.Itoa(surviving), func(t *testing.T) {
+			h := newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate)
+			h.appendTarget(true)
+			mock := h.b.docker.(*mockDockerClient)
+			imageID := fixtureImageID("settled failed source")
+			sources := h.containersFor(h.source, 2, "running", "")
+			for index := range sources {
+				sources[index].execution = frozenCompensationFixture(sources[index], imageID)
+			}
+			h.inventory.containers = slices.Clone(sources)
+			mock.InspectImageFn = func(context.Context, string) (*ImageInfo, error) { return &ImageInfo{ID: imageID}, nil }
+			mock.PullImageFn = func(context.Context, string, time.Duration) error { return nil }
+			mock.ContainerLogsFn = func(context.Context, string, int) (string, error) { return "failed target", nil }
+			targets := h.containersFor(h.targetRelease, 2, "exited", "")
+			h.b.compose = &mockComposeExecutor{
+				UpFn: func(context.Context, *composetypes.Project, composeUpOpts) error {
+					h.inventory.containers = slices.Clone(targets)
+					return nil
+				},
+				PSFn: func(context.Context, string) ([]composeContainerSummary, error) {
+					return []composeContainerSummary{{ID: targets[0].ContainerID, Service: "web-0", State: "exited"}, {ID: targets[1].ContainerID, Service: "web-1", State: "exited"}}, nil
+				},
+			}
+			creates, starts := 0, 0
+			mock.CreateCompensationContainerFn = func(_ context.Context, _ imageexec.Image, snapshot compensationContainer) (string, error) {
+				index, err := strconv.Atoi(snapshot.Config.Labels[LabelInstanceIndex])
+				require.NoError(t, err)
+				info := sources[index]
+				info.ContainerID = fmt.Sprintf("failed-source-%d", index)
+				info.Status = "created"
+				info.execution = frozenCompensationFixture(info, imageID)
+				h.inventory.containers = append(h.inventory.containers, info)
+				creates++
+				return info.ContainerID, nil
+			}
+			mock.StartContainerFn = func(context.Context, string, time.Duration) error {
+				starts++
+				if starts == 2 {
+					// Every Create/Start returned. Some source instances then die
+					// or disappear before the complete runtime observation.
+					h.inventory.containers = h.inventory.containers[:surviving]
+					for index := range h.inventory.containers {
+						h.inventory.containers[index].Status = "exited"
+					}
+				}
+				return nil
+			}
+			ops, err := storageMutationOperationsForTest(h.b)
+			require.NoError(t, err)
+			require.NoError(t, bindDockerMaintenanceCompensation(h.b, ops))
+			execution, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+			require.NoError(t, err)
+			require.IsType(t, shared.MaintenanceExecutionAmbiguous{}, h.b.maintenanceSettlement.ExecuteMaintenance(t.Context(), execution))
+			intent, found, err := h.b.maintenanceSettlement.GetMaintenanceIntent(h.leaseUUID)
+			require.NoError(t, err)
+			require.True(t, found)
+			acquired, err := h.b.recoveryCoordinator.WithLease(t.Context(), h.leaseUUID, func(scope shared.LeaseRecoveryScope) error {
+				outcome, err := h.b.maintenanceSettlement.RecoverMaintenanceCompensation(t.Context(), scope, intent)
+				require.NoError(t, err)
+				failed, ok := outcome.(shared.MaintenanceExecutionFailure)
+				require.True(t, ok, "%T: %v", outcome, outcome)
+				require.False(t, failed.SourceRecovered())
+				proof, err := h.b.maintenanceSettlement.FailMaintenance(failed, backend.ReasonUpdateFailed, "source compensation failed")
+				require.NoError(t, err)
+				_, ids, services, observed := proof.SourceProjection()
+				require.True(t, observed)
+				require.Len(t, ids, surviving)
+				require.Len(t, services["web"], surviving)
+				return nil
+			})
+			require.NoError(t, err)
+			require.True(t, acquired)
+			require.Equal(t, 2, creates, "settled failed source must never be replayed")
+			require.Equal(t, 2, starts)
+		})
+	}
+}
+
+func TestMaintenanceCompensationSourceRejectionSettlesOnlyCompletedRequests(t *testing.T) {
+	for _, stage := range []string{"create", "start"} {
+		for _, known := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/completed=%t", stage, known), func(t *testing.T) {
+				h := newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate)
+				h.appendTarget(true)
+				mock := h.b.docker.(*mockDockerClient)
+				imageID := fixtureImageID("source terminal rejection")
+				sources := h.containersFor(h.source, 2, "running", "")
+				for index := range sources {
+					sources[index].execution = frozenCompensationFixture(sources[index], imageID)
+				}
+				h.inventory.containers = slices.Clone(sources)
+				mock.InspectImageFn = func(context.Context, string) (*ImageInfo, error) { return &ImageInfo{ID: imageID}, nil }
+				mock.PullImageFn = func(context.Context, string, time.Duration) error { return nil }
+				mock.ContainerLogsFn = func(context.Context, string, int) (string, error) { return "failed target", nil }
+				targets := h.containersFor(h.targetRelease, 2, "exited", "")
+				h.b.compose = &mockComposeExecutor{
+					UpFn: func(context.Context, *composetypes.Project, composeUpOpts) error {
+						h.inventory.containers = slices.Clone(targets)
+						return nil
+					},
+					PSFn: func(context.Context, string) ([]composeContainerSummary, error) {
+						return []composeContainerSummary{{ID: targets[0].ContainerID, Service: "web-0", State: "exited"}, {ID: targets[1].ContainerID, Service: "web-1", State: "exited"}}, nil
+					},
+				}
+				creates, starts := 0, 0
+				cause := errors.New("daemon source request rejected")
+				mock.CreateCompensationOutcomeFn = func(_ context.Context, _ imageexec.Image, snapshot compensationContainer) (string, daemonLaunchOutcome) {
+					creates++
+					if stage == "create" && creates == 2 {
+						return "", daemonLaunchOutcome{settled: known, err: cause}
+					}
+					index, err := strconv.Atoi(snapshot.Config.Labels[LabelInstanceIndex])
+					require.NoError(t, err)
+					info := sources[index]
+					info.ContainerID = fmt.Sprintf("rejected-source-%d", index)
+					info.Status = "created"
+					info.execution = frozenCompensationFixture(info, imageID)
+					h.inventory.containers = append(h.inventory.containers, info)
+					return info.ContainerID, daemonLaunchOutcome{settled: true}
+				}
+				mock.StartCompensationOutcomeFn = func(context.Context, string, time.Duration) daemonLaunchOutcome {
+					starts++
+					return daemonLaunchOutcome{settled: known, err: cause}
+				}
+				ops, err := storageMutationOperationsForTest(h.b)
+				require.NoError(t, err)
+				require.NoError(t, bindDockerMaintenanceCompensation(h.b, ops))
+				execution, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+				require.NoError(t, err)
+				require.IsType(t, shared.MaintenanceExecutionAmbiguous{}, h.b.maintenanceSettlement.ExecuteMaintenance(t.Context(), execution))
+				intent, found, err := h.b.maintenanceSettlement.GetMaintenanceIntent(h.leaseUUID)
+				require.NoError(t, err)
+				require.True(t, found)
+				acquired, err := h.b.recoveryCoordinator.WithLease(t.Context(), h.leaseUUID, func(scope shared.LeaseRecoveryScope) error {
+					outcome, err := h.b.maintenanceSettlement.RecoverMaintenanceCompensation(t.Context(), scope, intent)
+					require.NoError(t, err)
+					if !known {
+						require.IsType(t, shared.MaintenanceExecutionAmbiguous{}, outcome)
+						return nil
+					}
+					failed, ok := outcome.(shared.MaintenanceExecutionFailure)
+					require.True(t, ok, "%T: %v", outcome, outcome)
+					require.False(t, failed.SourceRecovered())
+					proof, err := h.b.maintenanceSettlement.FailMaintenance(failed, backend.ReasonUpdateFailed, "source compensation failed")
+					require.NoError(t, err)
+					_, ids, _, observed := proof.SourceProjection()
+					require.True(t, observed)
+					want := 2
+					if stage == "create" {
+						want = 1
+					}
+					require.Len(t, ids, want)
+					return nil
+				})
+				require.NoError(t, err)
+				require.True(t, acquired)
+				require.Equal(t, 2, creates, "known failure and unknown transport both exclude replay")
+				if stage == "create" {
+					require.Zero(t, starts)
+				} else {
+					require.Equal(t, 1, starts)
+				}
+			})
+		}
+	}
+}
+
 func TestMaintenanceCompensationRepairsExactPartialSource(t *testing.T) {
 	for _, kind := range []shared.MaintenanceIntentKind{shared.MaintenanceIntentRestart, shared.MaintenanceIntentUpdate} {
 		for _, targetStatus := range []string{"running", "exited"} {
@@ -351,10 +566,9 @@ func TestMaintenanceSourceCaptureRefusesUncertainSubset(t *testing.T) {
 			execution, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
 			require.NoError(t, err)
 			outcome := h.b.maintenanceSettlement.ExecuteMaintenance(t.Context(), execution)
-			failure, ok := outcome.(shared.MaintenanceExecutionFailure)
+			pending, ok := outcome.(shared.MaintenanceExecutionAmbiguous)
 			require.True(t, ok, "%T: %v", outcome, outcome)
-			require.False(t, failure.SourceRecovered())
-			require.ErrorContains(t, failure.Cause(), "capture maintenance source")
+			require.ErrorContains(t, pending.Cause(), "capture maintenance source")
 			require.Empty(t, h.inventory.removed)
 		})
 	}

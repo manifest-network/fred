@@ -54,11 +54,13 @@ func TestVolumeAccessReservationSurvivesAliasRename(t *testing.T) {
 func TestVolumeAccessNamespaceMutationWaitsForLaunch(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var access volumeAccessCoordinator
-		release, err := access.retainNamespace(context.Background())
+		name, err := parseManagedVolumeName(canonicalVolumeName(durableCallbackTestLeaseUUID, "app", 0))
+		require.NoError(t, err)
+		release, err := access.retainNamespace(context.Background(), []managedVolumeName{name})
 		require.NoError(t, err)
 		completed := make(chan error, 1)
 		go func() {
-			completed <- access.mutateNamespace(context.Background(), func(context.Context) error { return nil })
+			completed <- access.mutateNamespace(context.Background(), []managedVolumeName{name}, func(context.Context) error { return nil })
 		}()
 		synctest.Wait()
 		select {

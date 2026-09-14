@@ -62,7 +62,8 @@ type dockerMutationSink interface {
 	DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string, origin shared.ImageInspectionOrigin) (uid, gid int, err error)
 	DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string, origin shared.ImageInspectionOrigin) ([]string, error)
 	ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64, origin shared.ImageInspectionOrigin) map[string]error
-	createCompensationContainer(context.Context, imageexec.Image, compensationContainer) (string, error)
+	createCompensationContainer(context.Context, imageexec.Image, compensationContainer) (string, daemonLaunchOutcome)
+	startCompensationContainer(context.Context, string, time.Duration) daemonLaunchOutcome
 	readmitCompensationImage(context.Context, compensationContainerRecord) (imageexec.Image, error)
 }
 
@@ -2893,50 +2894,11 @@ func (b *Backend) verifyStorageIdentity(
 	if b.identityDriftErr != nil {
 		return b.latchTerminalStorageAuthority(b.identityDriftErr)
 	}
-	if err := verifyConfiguredVolumeMount(b.cfg); err != nil {
-		wrapped := fmt.Errorf("verify Docker storage mount: %w", err)
+	if err := b.verifyStorageSubstrate(ctx); err != nil {
 		if errors.Is(err, backendidentity.ErrIdentityDrift) {
-			return b.latchIdentityVerificationFailureLocked(wrapped)
-		}
-		return wrapped
-	}
-	if pinner, ok := b.volumes.(identityRootPinner); ok {
-		if err := pinner.VerifyIdentityRoot(); err != nil {
-			wrapped := fmt.Errorf("verify Docker volume root identity: %w", err)
-			if errors.Is(err, errVolumeRootIdentityDrift) {
-				wrapped = fmt.Errorf("%w: %w", backendidentity.ErrIdentityDrift, wrapped)
-				return b.latchIdentityVerificationFailureLocked(wrapped)
-			}
-			return wrapped
-		}
-	}
-	info, err := b.docker.DaemonInfo(ctx)
-	if err != nil {
-		return fmt.Errorf("revalidate Docker daemon identity: %w", err)
-	}
-	if strings.TrimSpace(info.SystemID) == "" {
-		return errors.New("docker daemon returned an empty system ID")
-	}
-	markerPath, err := b.storageIdentityMarkerPath()
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return b.latchIdentityVerificationFailureLocked(fmt.Errorf(
-				"%w: Docker storage identity root disappeared: %w",
-				backendidentity.ErrIdentityDrift, err,
-			))
+			return b.latchIdentityVerificationFailureLocked(err)
 		}
 		return err
-	}
-	if err := backendidentity.VerifyMarkerPair(
-		markerPath, b.storageIdentityAnchorPath(), b.cfg.Name, info.SystemID, b.storageIdentity,
-	); err != nil {
-		wrapped := fmt.Errorf("verify Docker backend storage identity: %w", err)
-		if errors.Is(err, backendidentity.ErrMarkerBindingMismatch) ||
-			errors.Is(err, backendidentity.ErrInvalidMarker) {
-			wrapped = fmt.Errorf("%w: %w", backendidentity.ErrIdentityDrift, wrapped)
-			return b.latchIdentityVerificationFailureLocked(wrapped)
-		}
-		return wrapped
 	}
 	for name, verify := range map[string]func() error{
 		"callback": func() error {
@@ -2964,6 +2926,57 @@ func (b *Backend) verifyStorageIdentity(
 			_ = b.latchIdentityVerificationFailureLocked(wrapped)
 			return wrapped
 		}
+	}
+	return nil
+}
+
+// verifyStorageSubstrate checks physical storage and daemon identity.
+// Runtime verification holds identityVerifyMu and additionally verifies all
+// opened journals. Offline inspection uses the same substrate proof without
+// constructing runtime stores or weakening their required presence. This read
+// does not latch runtime withdrawal; its caller owns that lifecycle decision.
+func (b *Backend) verifyStorageSubstrate(ctx context.Context) error {
+	if err := verifyConfiguredVolumeMount(b.cfg); err != nil {
+		wrapped := fmt.Errorf("verify Docker storage mount: %w", err)
+		return wrapped
+	}
+	if pinner, ok := b.volumes.(identityRootPinner); ok {
+		if err := pinner.VerifyIdentityRoot(); err != nil {
+			wrapped := fmt.Errorf("verify Docker volume root identity: %w", err)
+			if errors.Is(err, errVolumeRootIdentityDrift) {
+				wrapped = fmt.Errorf("%w: %w", backendidentity.ErrIdentityDrift, wrapped)
+				return wrapped
+			}
+			return wrapped
+		}
+	}
+	info, err := b.docker.DaemonInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("revalidate Docker daemon identity: %w", err)
+	}
+	if strings.TrimSpace(info.SystemID) == "" {
+		return errors.New("docker daemon returned an empty system ID")
+	}
+	markerPath, err := b.storageIdentityMarkerPath()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf(
+				"%w: Docker storage identity root disappeared: %w",
+				backendidentity.ErrIdentityDrift, err,
+			)
+		}
+		return err
+	}
+	if err := backendidentity.VerifyMarkerPair(
+		markerPath, b.storageIdentityAnchorPath(), b.cfg.Name, info.SystemID, b.storageIdentity,
+	); err != nil {
+		wrapped := fmt.Errorf("verify Docker backend storage identity: %w", err)
+		if errors.Is(err, backendidentity.ErrMarkerBindingMismatch) ||
+			errors.Is(err, backendidentity.ErrInvalidMarker) {
+			wrapped = fmt.Errorf("%w: %w", backendidentity.ErrIdentityDrift, wrapped)
+			return wrapped
+		}
+		return wrapped
 	}
 	return nil
 }
@@ -3053,6 +3066,13 @@ func (b *Backend) Health(ctx context.Context) error {
 		if err := b.retentionStore.Healthy(); err != nil {
 			return fmt.Errorf("retention store unhealthy: %w", err)
 		}
+	}
+	if b.volumeLaunches != nil {
+		count, err := b.volumeLaunches.pendingCount()
+		if err != nil {
+			return fmt.Errorf("docker launch journal unhealthy: %w", err)
+		}
+		volumeLaunchesPending.Set(float64(count))
 	}
 	return nil
 }

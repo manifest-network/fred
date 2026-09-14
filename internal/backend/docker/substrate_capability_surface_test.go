@@ -168,8 +168,58 @@ func TestProductionSubstrateMutationSurface(t *testing.T) {
 				return true
 			}
 			base := filepath.Base(position.Filename)
-			if base != "storage_mutation_guard.go" && base != "compose.go" {
+			if base != "storage_mutation_guard.go" && base != "compose.go" &&
+				(base != "lifecycle.go" || !directSDKStartDelegation(file, selector)) {
 				t.Errorf("%s: raw substrate method %s is outside the bound facade", position, selector.Sel.Name)
+			}
+			return true
+		})
+	}
+}
+
+// The completion-aware SDK adapter delegates its Start call to the existing
+// concrete SDK method. This permits that exact receiver/method pair, without
+// granting lifecycle orchestration access to raw writers throughout the file.
+func directSDKStartDelegation(file *ast.File, call *ast.SelectorExpr) bool {
+	if call.Sel.Name != "StartContainer" {
+		return false
+	}
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "startCompensationContainer" || function.Recv == nil ||
+			len(function.Recv.List) != 1 || function.Body == nil || call.Pos() < function.Body.Pos() || call.End() > function.Body.End() {
+			continue
+		}
+		receiver := function.Recv.List[0]
+		pointer, ok := receiver.Type.(*ast.StarExpr)
+		if !ok || len(receiver.Names) != 1 {
+			return false
+		}
+		typeName, ok := pointer.X.(*ast.Ident)
+		instance, direct := call.X.(*ast.Ident)
+		return ok && typeName.Name == "DockerClient" && direct && instance.Name == receiver.Names[0].Name
+	}
+	return false
+}
+
+func TestDirectSDKStartDelegationDoesNotOpenOrchestrationSurface(t *testing.T) {
+	for _, tc := range []struct {
+		source string
+		allow  bool
+	}{
+		{"func (d *DockerClient) startCompensationContainer() { d.StartContainer() }", true},
+		{"func (b *Backend) startCompensationContainer() { b.StartContainer() }", false},
+		{"func (d *DockerClient) workflow() { d.StartContainer() }", false},
+		{"func (d *DockerClient) startCompensationContainer() { other.StartContainer() }", false},
+		{"func (d *DockerClient) startCompensationContainer() { d.RemoveContainer() }", false},
+	} {
+		file, err := parser.ParseFile(token.NewFileSet(), "adapter.go", "package docker\n"+tc.source, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			if call, ok := node.(*ast.SelectorExpr); ok && directSDKStartDelegation(file, call) != tc.allow {
+				t.Errorf("unexpected adapter delegation for %s", tc.source)
 			}
 			return true
 		})
@@ -192,6 +242,7 @@ func rawVolumeMutation(selector *ast.SelectorExpr) bool {
 func rawSubstrateMethod(name string) bool {
 	switch name {
 	case "PullImage", "AdmitImage", "ResolveImageUser", "CreateContainer", "StartContainer",
+		"createCompensationContainer", "startCompensationContainer", "launch",
 		"StopContainer", "RenameContainer", "RemoveContainer", "EnsureTenantNetwork",
 		"RemoveTenantNetworkIfEmpty", "DetectVolumeOwner", "DetectWritablePaths",
 		"ExtractImageContent", "EnsureQuota", "RenameVolume", "Up", "Down":

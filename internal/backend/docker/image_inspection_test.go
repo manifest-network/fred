@@ -179,7 +179,9 @@ func newInspectionHarnessWithClient(t *testing.T, build func(*inspectionDaemon) 
 			h.origin = shared.ImageInspectionForOperation(subject)
 			h.runner, h.subject = runner, subject
 			return func(ctx context.Context) error {
-				return runner.Step(ctx, "inspect fixture image", func(ctx context.Context) error { return h.run(ctx, h.origin) })
+				err := runner.Prepare(ctx, "inspect fixture image", func(ctx context.Context) error { return h.run(ctx, h.origin) })
+				assert.False(t, runner.EffectEntered(), "local helper guard cannot enter the fixture's parent Runner")
+				return err
 			}
 		},
 		func(ctx context.Context, run func(context.Context) error, _ shared.OperationPhysicalSubject) error {

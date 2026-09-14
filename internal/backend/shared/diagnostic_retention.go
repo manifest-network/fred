@@ -80,7 +80,7 @@ func (diagnostics *FailureDiagnostics) pruneAttemptCapturesLocked(candidate diag
 			if !present && !diagnosticHasCompletedReceipt(record.Identity, completedOperations, completedMaintenance) {
 				continue
 			}
-			if err := cursor.Delete(); err != nil {
+			if err := diagnostics.store.deleteAttemptTx(tx, key); err != nil {
 				return err
 			}
 		}

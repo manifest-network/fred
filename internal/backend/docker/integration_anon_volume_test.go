@@ -118,7 +118,7 @@ func TestIntegration_Docker_ComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 
 	prepared, err := composeSvc.PrepareProject(project, map[string]imageexec.Image{"web": admitted})
 	require.NoError(t, err)
-	require.NoError(t, composeSvc.Up(ctx, prepared, composeUpOpts{}))
+	require.NoError(t, composeSvc.launch(ctx, prepared, composeUpOpts{}).err)
 
 	// Discover the anonymous volume Docker attached to the container.
 	inspected, err := docker.client.ContainerInspect(ctx, containerName)
@@ -329,7 +329,7 @@ func TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFail
 
 	prepared, err := composeSvc.PrepareProject(project, map[string]imageexec.Image{"web": admitted})
 	require.NoError(t, err)
-	require.NoError(t, composeSvc.Up(ctx, prepared, composeUpOpts{}))
+	require.NoError(t, composeSvc.launch(ctx, prepared, composeUpOpts{}).err)
 
 	inspected, err := docker.client.ContainerInspect(ctx, containerName)
 	require.NoError(t, err)
