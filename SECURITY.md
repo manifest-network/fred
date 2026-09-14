@@ -28,7 +28,7 @@ Tenants authenticate to Fred's API using signed bearer tokens. Each token is a b
 **Validation steps:**
 1. Decode base64 token, parse JSON fields
 2. Validate required fields (lease_uuid, tenant, pub_key, signature)
-3. Check timestamp is within window (max 30s old, max 10s in future)
+3. Check timestamp is within window (expires at signed timestamp + 30s, max 10s in future)
 4. Verify ADR-036 secp256k1 signature over the signed message
 5. Derive bech32 address from public key, confirm it matches the `tenant` field
 6. Normalize signature to low-S canonical form (prevents malleability)
@@ -117,18 +117,24 @@ Fred authenticates requests to backends using the same HMAC-SHA256 scheme. The d
 
 ### Token Replay (Tenant API)
 
-Used tokens are tracked in a persistent bbolt database keyed by the normalized signature. This prevents an attacker from intercepting and replaying a valid token.
+Used tokens are tracked in a persistent bbolt database keyed by the normalized signature. Successful cryptographic validation creates an opaque replay claim binding that signature to its signed expiry; handlers cannot supply a different key or shorten the tracking lifetime. The tracker atomically consumes that claim and rechecks expiry inside the write transaction.
 
 | Property | Detail |
 |----------|--------|
 | Storage | bbolt (persistent across restarts) |
 | Key | Base64-encoded normalized signature |
-| TTL | 30 seconds (matches token max age) |
-| Cleanup | Background goroutine removes expired entries |
+| Signed expiry | Signed timestamp + 30 seconds; a timestamp up to 10 seconds ahead may remain valid for up to 40 seconds after first acceptance |
+| Cleanup | Default interval 30 seconds; entries remain until at least stored expiry + 10 seconds, then eligible expired entries are removed |
 | Failure mode | **Fail-closed** — DB errors return 503, not pass-through |
 | Concurrency | bbolt transaction serialization prevents race conditions |
 
 **Signature malleability:** ECDSA signatures have two valid forms (high-S and low-S). Before storing and checking, all signatures are normalized to low-S canonical form. This prevents an attacker from flipping the S value to bypass deduplication.
+
+The cleanup grace preserves older cache rows that recorded first-use time + 30
+seconds, including across an upgrade or restart. It does not extend a token's
+signed validity: validation and consumption both reject at or after signed
+expiry. A normal restart retains consumed tokens; losing the cache can reopen
+replay until those tokens expire.
 
 **Which endpoints check replay:**
 
@@ -151,7 +157,7 @@ reuses the same idempotency key for retries of one exact command. Fred and the
 backend persist that command identity so a transport retry cannot repeat an
 already-admitted container replacement; divergent reuse is rejected.
 
-**Configuration:** Requires `token_tracker_db_path`. Mandatory when `production_mode: true`. When not configured (non-production), replay protection is disabled entirely — tokens can be replayed within their 30-second validity window. This is acceptable for development but **must not be used in production**.
+**Configuration:** Requires `token_tracker_db_path`. Mandatory when `production_mode: true`. When not configured (non-production), replay protection is disabled entirely — tokens can be replayed until signed timestamp + 30 seconds, including the accepted future-clock-skew window. This is acceptable for development but **must not be used in production**.
 
 **Implementation:** `internal/api/token_tracker.go`
 

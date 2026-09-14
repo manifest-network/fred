@@ -161,7 +161,7 @@ func newSwitchableInventoryServer(
 	if retentions == nil {
 		retentions = []backend.RetainedLease{}
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newVerifiedInventoryServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.NotEmpty(t, r.Header.Get(hmacauth.SignatureHeader))
 		if down != nil && down.Load() {
 			http.Error(w, "transient backend outage", http.StatusServiceUnavailable)
@@ -203,10 +203,12 @@ placement_store_db_path: %q
 backends:
   - name: "backend-a"
     url: %q
+    tls_ca_file: %q
     default: true
   - name: "backend-b"
     url: %q
-`, t.TempDir(), dbPath, backendAURL, backendBURL)
+    tls_ca_file: %q
+`, t.TempDir(), dbPath, backendAURL, verifiedInventoryCAFile(backendAURL), backendBURL, verifiedInventoryCAFile(backendBURL))
 	require.NoError(t, os.WriteFile(configPath, []byte(contents), 0o600))
 	return configPath
 }

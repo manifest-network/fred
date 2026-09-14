@@ -43,7 +43,7 @@ type ChainClient interface {
 // TokenTrackerInterface defines the interface for token replay protection.
 // This interface allows for testing with mock implementations.
 type TokenTrackerInterface interface {
-	TryUse(signature string) error
+	TryUse(claim TokenReplayClaim) error
 	Healthy() error
 	Close() error
 }
@@ -227,8 +227,8 @@ func (h *Handlers) authenticateLeaseToken(r *http.Request, leaseUUID string, che
 
 	// Check for token replay attack (if tracker is configured and checkReplay is true)
 	if checkReplay && h.tokenTracker != nil {
-		if err := h.tokenTracker.TryUse(token.Signature); err != nil {
-			if errors.Is(err, ErrTokenAlreadyUsed) {
+		if err := h.tokenTracker.TryUse(token.replay); err != nil {
+			if errors.Is(err, ErrTokenAlreadyUsed) || errors.Is(err, ErrInvalidReplayClaim) {
 				slog.Warn("token replay detected",
 					"lease_uuid", leaseUUID,
 					"tenant", token.Tenant,

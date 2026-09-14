@@ -462,6 +462,8 @@ List currently provisioned resources. Used by Fred for reconciliation. Keyset-pa
 
 **Pagination:** `GET /provisions` is keyset-paginated. Query params: `limit` (max page size) and `continue` (a lease UUID — the `continue` cursor returned by the previous page). The JSON response carries a top-level `continue` field set to the last record's lease UUID, omitted once the list is exhausted. An invalid `limit` or a non-UUID `continue` returns 400, as does a `continue` cursor supplied without a positive `limit`. A `limit` above the server maximum (5000) is coerced down to it rather than rejected. With no params it returns the full list unpaginated (back-compat). One or more `lease_uuid` query params return just those records. (ENG-380)
 
+**Complete-inventory limits:** Fred accepts at most 100,000 items and 128 MiB of cumulative response-body bytes (including whitespace) for each complete `/provisions` or `/retentions` inventory, independently of page size. The configured backend HTTP timeout also bounds the entire walk, including every page and body read. Exceeding a count, byte or time limit fails the whole walk; no partial result is usable as ownership, settlement or repair evidence.
+
 **Fields:**
 - `fail_count` - Number of provision failures for this lease
 - `reason` (omitempty) - Stable machine-readable failure category (CamelCase, e.g. `ContainerExited`, `ImagePullFailed`, `Internal`, `Unknown`). Open/add-only set; consumers must tolerate unknown values.
@@ -741,6 +743,8 @@ leases must never both receive acceptance for the same retained source.
 - `503 Service Unavailable` - Insufficient resources. A synchronous capacity refusal MUST carry `{"error":"...","code":"insufficient_resources"}`; under the configured transport's trust boundary this authorizes clearing the exact target attempt. A legacy/code-less, unknown-code, or malformed 503 remains ambiguous and keeps the target attempt until its exact callback, an upgraded inventory report carrying the same paired typed generation, or operator repair.
 
 ### GET /retentions (optional — retention support)
+
+The [complete-inventory limits](#get-provisions) apply across all retention pages as well.
 
 List the leases whose data this backend currently retains. Fred's reconciler polls this on every backend each tick to keep restore routing affinity (route a restore to the backend holding the source data). Backends without retention return an empty list. Keyset-paginated (see **Pagination** below).
 
@@ -1062,7 +1066,7 @@ req.Header.Set("X-Fred-Signature", sig)
 ```
 
 The `CALLBACK_SECRET` for one backend must match that backend's
-`backends[].hmac_secret` in providerd—not a fleet-wide provider key. Production
+`backends[].hmac_secret` in providerd. Whenever per-backend authentication is selected, Fred
 requires every backend key to be at least 32 bytes and pairwise unique. Backends
 that live inside this repository can import `internal/hmacauth` and call
 `hmacauth.SignRequest(secret, req, body)` instead of computing the canonical
@@ -1504,6 +1508,8 @@ The Docker backend takes a `--config` flag (path to the YAML file, default `dock
 
 ### TLS / mTLS on the providerd → backend transport (ENG-103)
 
+Offline placement mutation modes require certificate-verified backend HTTPS even in development; plaintext and skip-verification clients provide observational inventories only. Provider configuration supplies the same private CA/system roots and optional client credentials to runtime and offline clients. See [placement mutation transport requirements](README.md#backend-configuration).
+
 TLS on both backend HTTP hops is optional only for development. `providerd` production mode requires every backend URL and `callback_base_url` to use HTTPS and verifies backend peers against the configured private CA or system roots; bundled-backend production mode forbids disabling callback peer verification. Enable both: request HMAC does not authenticate the backend's response identity, inventory, or refusal verdict, and callback HMAC does not provide token confidentiality. A self-signed private CA remains a verified trust anchor; it need not be publicly issued. Fred's native providerd-to-backend client and bundled-backend listener pin TLS 1.3 as the minimum version. The reverse callback client uses Go's verified default HTTPS transport, and its server-side protocol floor belongs to the reverse proxy or other callback TLS terminator. TLS for the direct backend hop is configured on both sides:
 
 **Server side** (the backend's YAML, e.g. `docker-backend.yaml`):
@@ -1549,15 +1555,20 @@ curl http://localhost:9001/health
 ```
 
 ### 2. Provision
+
+Replace the sample tenant, provider and SKU with your configured chain values.
+The payload below encodes `{"services":{"app":{"image":"nginx:alpine"}}}`.
+
 ```bash
 storage_id=550e8400-e29b-41d4-a716-446655440000
 curl -X POST "http://localhost:9001/_fred/storage/${storage_id}/provision" \
   -H "Content-Type: application/json" \
   -d '{
-    "lease_uuid": "test-lease-1",
+    "lease_uuid": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
     "tenant": "manifest1test",
-    "provider_uuid": "test-provider",
-    "items": [{"sku": "docker-nginx", "quantity": 1}],
+    "provider_uuid": "7b1b8908-3e56-481a-917e-4e9586642323",
+    "items": [{"sku": "550e8400-e29b-41d4-a716-446655440001", "quantity": 1, "service_name": "app"}],
+    "payload": "eyJzZXJ2aWNlcyI6eyJhcHAiOnsiaW1hZ2UiOiJuZ2lueDphbHBpbmUifX19",
     "callback_url": "http://localhost:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
     "lifecycle_callback_url": "http://localhost:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
   }'
@@ -1570,14 +1581,14 @@ curl "http://localhost:9001/provisions?backend_storage_id=${storage_id}"
 
 ### 4. Get Info
 ```bash
-curl "http://localhost:9001/info/test-lease-1?backend_storage_id=${storage_id}"
+curl "http://localhost:9001/info/6ba7b811-9dad-41d1-80b4-00c04fd430c8?backend_storage_id=${storage_id}"
 ```
 
 ### 5. Deprovision
 ```bash
 curl -X POST "http://localhost:9001/_fred/storage/${storage_id}/deprovision" \
   -H "Content-Type: application/json" \
-  -d '{"lease_uuid": "test-lease-1"}'
+  -d '{"lease_uuid": "6ba7b811-9dad-41d1-80b4-00c04fd430c8"}'
 ```
 
 ## Checklist

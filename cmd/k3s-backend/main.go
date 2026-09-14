@@ -25,10 +25,9 @@ import (
 	"syscall"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/manifest-network/fred/internal/backend/k3s"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/configyaml"
 )
 
 var version = "dev"
@@ -247,7 +246,7 @@ func loadConfig(path string) (k3s.Config, error) {
 		return cfg, fmt.Errorf("failed to read config: %w", err)
 	}
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := configyaml.Decode(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("failed to parse config: %w", err)
 	}
 

@@ -475,11 +475,15 @@ bech32_prefix: "manifest"
 # =============================================================================
 # TOKEN REPLAY PROTECTION (recommended)
 # =============================================================================
-# Prevents replay attacks on authenticated endpoints.
+# Prevents replay attacks on replay-protected tenant endpoints (see SECURITY.md).
 
 # Path to bbolt database file for tracking used authentication tokens.
-# Each token can only be used once; subsequent uses are rejected.
-# Tokens are tracked for their lifetime (30 seconds) then automatically cleaned.
+# Each token can only be consumed once on those endpoints.
+# Expiry is the signed timestamp + 30 seconds, not first use + 30 seconds.
+# An accepted timestamp up to 10 seconds ahead can remain valid for up to 40 seconds.
+# Cleanup runs every 30 seconds by default and retains rows for an additional
+# 10 seconds after stored expiry to preserve older cache rows across upgrades.
+# This cleanup grace never extends a token's signed validity.
 #
 # If not set, replay protection is DISABLED and a warning is logged.
 # SECURITY: Always enable in production to prevent token replay attacks.
@@ -584,8 +588,14 @@ websocket_reconnect_max: "60s"
 # Lower values = faster confirmation detection but more RPC calls.
 tx_poll_interval: "500ms"
 
-# Maximum time to wait for a transaction to be confirmed.
-# If exceeded, the transaction is considered failed (may still confirm later).
+# One deadline for the complete public chain write: signer permit acquisition,
+# account lookup, simulation, broadcast, every sub-batch/retry, confirmation,
+# and withdrawal response lookup. Also bounds each acknowledgement flush,
+# including its initial pending-lease query and fallback attempts.
+# For public writes, a caller's earlier deadline still wins. A shared acknowledgement
+# flush uses its owner deadline; canceling one caller does not cancel the batch.
+# Already committed sub-batches remain committed when a later step times out;
+# an issued transaction may confirm later.
 tx_timeout: "30s"
 
 # Simulate-failure fallback gas ceiling. Since ENG-431 every transaction is

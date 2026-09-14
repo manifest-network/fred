@@ -629,9 +629,11 @@ func inspectImageForSetupForTest(
 	}
 	result := runSubjectStorageMutationForTest(t, b, durableCallbackTestLeaseUUID,
 		func(mutations *storageMutations) inspection {
-			setup, err := b.inspectImageForSetup(
-				mutations, ctx, imageName, userOverride,
-			)
+			admitted, err := mutations.admitImage(ctx, imageName)
+			if err != nil {
+				return inspection{err: err}
+			}
+			setup, err := b.setupAdmittedImage(mutations, ctx, admittedImageSetup{image: admitted, user: userOverride})
 			return inspection{setup: setup, err: err}
 		},
 	)

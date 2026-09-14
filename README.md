@@ -174,7 +174,7 @@ cp config.example.yaml config.yaml
 
 ### Required Configuration
 
-All required fields are validated at startup. The daemon will fail to start with a clear error message if any required configuration is missing or invalid.
+All required fields are validated at startup. The daemon will fail to start with a clear error message if any required configuration is missing or invalid. Provider, Docker and K3s YAML configuration files must contain exactly one document; unknown keys, including nested keys, are rejected. Provider YAML and JSON configuration also reject case-insensitive key collisions, so aliases cannot silently override a security setting.
 
 | Option | Description |
 |--------|-------------|
@@ -231,7 +231,7 @@ placement_store_db_path: "/var/lib/fred/placements.db"
 |-------|-------------|---------|
 | `name` | Stable, case-sensitive durable backend identity; must be non-blank and unique | (required) |
 | `url` | Absolute `http://` or `https://` origin with a usable ASCII hostname (punycode for IDNs); an explicit port must be 1–65535 | (required) |
-| `hmac_secret` | Bidirectional HMAC key for this backend; set the backend process's `callback_secret` to the same value. Production requires at least 32 bytes and pairwise uniqueness. | (required in production) |
+| `hmac_secret` | Bidirectional HMAC key for this backend; set the backend process's `callback_secret` to the same value. Selecting per-backend authentication requires at least 32 bytes per key and pairwise uniqueness in every mode. | (required in production; all backends or none in development) |
 | `skus` | Exact list of on-chain SKU UUIDs this backend serves | `[]` |
 | `default` | Use as fallback when no SKU match | `false` |
 | `timeout` | HTTP request timeout for calls to this backend | `30s` |
@@ -343,7 +343,7 @@ These options have sensible defaults but can be tuned for specific environments:
 | `websocket_reconnect_initial` | Initial WebSocket reconnect delay | `1s` |
 | `websocket_reconnect_max` | Maximum WebSocket reconnect delay | `60s` |
 | `tx_poll_interval` | Transaction confirmation poll interval | `500ms` |
-| `tx_timeout` | Transaction confirmation timeout | `30s` |
+| `tx_timeout` | Deadline for the entire public chain write: signer permit queue, all sub-batches/retries, confirmation, and withdrawal response lookup. Also bounds each acknowledgement flush, including its initial query and fallback attempts | `30s` |
 | `query_page_limit` | Page size for chain queries | `100` |
 | `max_withdraw_iterations` | Max pages per provider-wide withdrawal cycle (cursor pagination) | `100` |
 | `withdraw_limit` | Leases settled per provider-wide withdrawal tx (`MsgWithdraw.Limit`); trades tx count vs per-tx gas. Must be 1..the chain's max batch size (currently 100) | `100` |
@@ -495,6 +495,8 @@ initialization is never recovery for a lost placement database. The printed
 operator acknowledgement includes the target parent's physical device/inode;
 the initializer rejects a rename/recreation between print and initialize and
 publishes descriptor-relatively with `renameat2(RENAME_NOREPLACE)`.
+
+Mutation modes (`placement-preflight --prepare` / `--initialize-fresh`, and `placement-repair --apply`, including conflict repair) require certificate-verified HTTPS for every configured backend, independently of `production_mode`. Use `tls_ca_file` for a private CA or system roots; existing mTLS credentials remain supported. HTTP and `tls_skip_verify` cannot authorize durable changes because request HMAC does not authenticate inventory responses. Read-only inspection and repair dry-runs may observe development HTTP endpoints; there is no insecure-backend-evidence override.
 
 It is also bound at runtime to the exact regular-file inode opened at
 `placement_store_db_path`. Never copy over, unlink, rename, rotate, or restore
@@ -1428,8 +1430,10 @@ Restart containers for a lease without changing the manifest (async).
 ```
 
 **Error Responses:**
+- `400 Bad Request` - Invalid request or validation refusal (`validation_code` identifies a validation refusal; `error` carries its detail)
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for restart (e.g., already restarting or updating)
+- `503 Service Unavailable` - Capacity refusal (`code: "insufficient_resources"`); an uncoded 503 is an availability failure and does not prove refusal
 
 ### POST /update
 
@@ -1453,9 +1457,10 @@ Deploy a new manifest for a lease, replacing containers (async).
 ```
 
 **Error Responses:**
-- `400 Bad Request` - Invalid manifest or validation error
+- `400 Bad Request` - Invalid request/manifest or validation refusal (`validation_code` identifies a validation refusal; `error` carries its detail)
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for update
+- `503 Service Unavailable` - Capacity refusal (`code: "insufficient_resources"`); an uncoded 503 does not prove refusal
 
 ### POST /restore
 
@@ -1552,6 +1557,17 @@ mock_storage_id_file="$PWD/.fred-dev/mock-storage-id"
 if [[ ! -e "$mock_storage_id_file" ]]; then
   (umask 077; set -o noclobber; uuidgen --random | tr '[:upper:]' '[:lower:]' > "$mock_storage_id_file")
 fi
+# Generate the private development trust anchor once, then reuse the same pair.
+# If only one file exists, restore the pair before proceeding.
+if [[ ! -e .fred-dev/mock-tls.crt && ! -e .fred-dev/mock-tls.key ]]; then
+  (umask 077; openssl req -x509 -newkey rsa:3072 -nodes -days 365 \
+    -keyout .fred-dev/mock-tls.key -out .fred-dev/mock-tls.crt \
+    -subj '/CN=localhost' \
+    -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+    -addext 'basicConstraints=critical,CA:TRUE')
+fi
+export MOCK_BACKEND_TLS_CERT_FILE="$PWD/.fred-dev/mock-tls.crt"
+export MOCK_BACKEND_TLS_KEY_FILE="$PWD/.fred-dev/mock-tls.key"
 MOCK_BACKEND_STORAGE_ID="$(<"$mock_storage_id_file")" \
 MOCK_BACKEND_NAME=mock \
 MOCK_BACKEND_CALLBACK_SECRET="test-secret-at-least-32-characters-long" \
@@ -1575,7 +1591,9 @@ MOCK_BACKEND_CALLBACK_SECRET="test-secret-at-least-32-characters-long" \
 | `MOCK_BACKEND_NAME` | Backend name (in responses) | `mock-backend` |
 | `MOCK_BACKEND_STORAGE_ID` | Persisted canonical UUIDv4 identifying this mock deployment's in-memory storage lineage | (required) |
 | `MOCK_BACKEND_DELAY` | Simulated provisioning delay | `0s` |
-| `MOCK_BACKEND_TLS_SKIP_VERIFY` | Skip TLS verification for callbacks (use `true` for self-signed certs) | `false` |
+| `MOCK_BACKEND_TLS_SKIP_VERIFY` | Development-only callback TLS verification bypass; independent of inbound backend HTTPS | `false` |
+| `MOCK_BACKEND_TLS_CERT_FILE` | Inbound HTTPS certificate; set with the matching key for authenticated offline inventories | (optional; requires key) |
+| `MOCK_BACKEND_TLS_KEY_FILE` | Inbound HTTPS private key | (optional; requires certificate) |
 | `MOCK_BACKEND_CALLBACK_SECRET` | Per-backend HMAC secret for authenticating inbound provider requests and signing callbacks; must match the providerd backend entry (required, min 32 bytes) | (required) |
 | `MOCK_BACKEND_CLIENT_TIMEOUT` | HTTP client timeout for outbound callbacks | `10s` |
 | `MOCK_BACKEND_READ_TIMEOUT` | HTTP server read timeout | `15s` |
@@ -1615,7 +1633,8 @@ api_listen_addr: ":8080"
 
 backends:
   - name: mock
-    url: "http://localhost:9000"
+    url: "https://localhost:9000"
+    tls_ca_file: "/absolute/path/to/fred/.fred-dev/mock-tls.crt"
     timeout: 30s
     default: true
     hmac_secret: "test-secret-at-least-32-characters-long"
@@ -1678,6 +1697,28 @@ to the mock and will settle it from the signed callback. Do not simulate this
 by posting directly to `/provision`; that creates foreign inventory outside
 Fred's authority. The repository's integration harnesses are the repeatable
 automated E2E path.
+
+## Load Testing
+
+Build with `go build -o build/loadtest ./cmd/loadtest`. Authenticated traffic requires a JSON fixture file naming existing leases owned by the supplied tenant key. The tool neither creates leases nor invents successful backend outcomes. For connection reads:
+
+```json
+{"leases":[{"lease_uuid":"6ba7b811-9dad-41d1-80b4-00c04fd430c8"}]}
+```
+
+```bash
+./build/loadtest -target https://fred.example.com \
+  -traffic authenticated -scenario connection -fixtures fixtures.json \
+  -tenant-key-file /private/test-tenant.hex -duration 30s -concurrency 10
+```
+
+The key file contains exactly 64 hexadecimal digits for the existing tenant's secp256k1 private key; protect it with mode `0600`. `-bech32-prefix` defaults to `manifest`. Tokens use Fred's shared ADR-036 and endpoint-specific signing formats. Connection requests are paced to at most one per lease per second because replay-protected tokens carry second-resolution timestamps; provide a lease pool for greater throughput.
+
+For `-scenario payload`, include a base64 `payload` with each selected lease. The decoded bytes must be the exact valid manifest whose SHA-256 is the pending lease's on-chain `meta_hash`. Repeated delivery measures idempotency/conflict handling; after provisioning changes lease state, further uploads can be refused. `mixed` requires payload and lease fixtures and uses a 40% upload / 60% connection mix unless callback fixtures are present (then 40% / 50% / 10%).
+
+For `-scenario callback`, supply `callbacks` entries containing `request_uri` and `body`: use the exact origin-relative callback URI and base64-encode the exact JSON body bytes recorded for the test backend, including its backend name, storage UUID and operation/lifecycle route. Supply that backend's matching `-callback-secret` (at least 32 bytes). The tool validates the current typed callback format and signs the preserved URI/body; it never substitutes random IDs. Recorded callbacks must still describe real state in the target test deployment. Replaying a settled callback exercises acknowledgement/idempotency, not a new deployment.
+
+Use `-traffic rejection` without fixtures or credentials to stress deliberately unauthenticated requests; `-payload-size` applies only to that mode. Results count actual 2xx responses as successes and retain refusal/rate-limit status counts. Redirects are not followed, so credentials and recorded callback facts stay at the selected origin.
 
 ## Project Structure
 
@@ -1929,7 +1970,7 @@ See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks, stress test result
 
 ## Dependencies
 
-- Go 1.26.6+ (per the `go 1.26.6` directive in `go.mod`; also uses `sync.WaitGroup.Go()`, `testing.B.Loop()`, `range` over integers)
+- Go 1.26.8+ (per the `go 1.26.8` directive in `go.mod`; also uses `sync.WaitGroup.Go()`, `testing.B.Loop()`, `range` over integers)
 - Watermill (event routing)
 - Cosmos SDK v0.50.14
 - CometBFT v0.38.x

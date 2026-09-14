@@ -24,6 +24,8 @@
 //	MOCK_BACKEND_DELAY            - Simulated provisioning delay (default: "0s")
 //	MOCK_BACKEND_CALLBACK_SECRET  - HMAC secret for inbound requests and callbacks (required, min 32 bytes)
 //	MOCK_BACKEND_TLS_SKIP_VERIFY  - Skip TLS verification for callbacks (default: "false")
+//	MOCK_BACKEND_TLS_CERT_FILE    - Optional inbound HTTPS certificate (requires key)
+//	MOCK_BACKEND_TLS_KEY_FILE     - Optional inbound HTTPS key (requires certificate)
 //	MOCK_BACKEND_CLIENT_TIMEOUT   - HTTP client timeout for callbacks (default: "10s")
 //	MOCK_BACKEND_READ_TIMEOUT     - HTTP server read timeout (default: "15s")
 //	MOCK_BACKEND_WRITE_TIMEOUT    - HTTP server write timeout (default: "15s")
@@ -56,6 +58,7 @@ import (
 	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/tlsconfig"
 )
 
 const (
@@ -107,6 +110,11 @@ func main() {
 	readTimeout := parseDurationEnv("MOCK_BACKEND_READ_TIMEOUT", 15*time.Second)
 	writeTimeout := parseDurationEnv("MOCK_BACKEND_WRITE_TIMEOUT", 15*time.Second)
 	idleTimeout := parseDurationEnv("MOCK_BACKEND_IDLE_TIMEOUT", 60*time.Second)
+	serverTLS, err := mockServerTLS(os.Getenv("MOCK_BACKEND_TLS_CERT_FILE"), os.Getenv("MOCK_BACKEND_TLS_KEY_FILE"))
+	if err != nil {
+		slog.Error("invalid mock backend HTTPS configuration", "error", err)
+		os.Exit(1)
+	}
 
 	// Create mock backend
 	mockBackend := backend.NewMockBackend(backend.MockBackendConfig{
@@ -164,6 +172,7 @@ func main() {
 		ReadTimeout:  readTimeout,
 		WriteTimeout: writeTimeout,
 		IdleTimeout:  idleTimeout,
+		TLSConfig:    serverTLS,
 	}
 
 	// Start server
@@ -174,8 +183,14 @@ func main() {
 			"name", name,
 			"delay", delay,
 		)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverErr <- err
+		var serveErr error
+		if serverTLS != nil {
+			serveErr = httpServer.ListenAndServeTLS("", "")
+		} else {
+			serveErr = httpServer.ListenAndServe()
+		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			serverErr <- serveErr
 		}
 	}()
 
@@ -196,6 +211,16 @@ func main() {
 	}
 
 	slog.Info("mock backend stopped")
+}
+
+func mockServerTLS(certFile, keyFile string) (*tls.Config, error) {
+	if (certFile == "") != (keyFile == "") {
+		return nil, errors.New("MOCK_BACKEND_TLS_CERT_FILE and MOCK_BACKEND_TLS_KEY_FILE must both be set or both empty")
+	}
+	if certFile == "" {
+		return nil, nil
+	}
+	return tlsconfig.ServerConfig(certFile, keyFile, "", nil)
 }
 
 // MockBackendServer wraps the mock backend with HTTP handlers.

@@ -192,6 +192,9 @@ func decodeCompensationSourcePlan(subject shared.MaintenancePhysicalSubject, enc
 	if !ok || plan.Version != 1 || len(plan.Containers) == 0 {
 		return plan, errors.New("invalid maintenance source execution plan")
 	}
+	if err := admitCompensationMountBudget(plan); err != nil {
+		return plan, err
+	}
 	expected := make(map[string]struct{})
 	for _, item := range source.Items {
 		for i := range item.Quantity {

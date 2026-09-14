@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/netip"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -276,8 +277,7 @@ func Load(configPath string) (*Config, error) {
 
 	// Config file
 	if configPath != "" {
-		v.SetConfigFile(configPath)
-		if err := v.ReadInConfig(); err != nil {
+		if err := readConfigFile(v, configPath); err != nil {
 			return nil, fmt.Errorf("failed to read config file: %w", err)
 		}
 	}
@@ -298,7 +298,7 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	var cfg Config
-	if err := v.Unmarshal(&cfg); err != nil {
+	if err := v.UnmarshalExact(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
@@ -708,11 +708,14 @@ func validateExternalURL(rawURL string) error {
 	}
 
 	// Parse as IP literal; non-IP hostnames pass through
-	ip := net.ParseIP(hostname)
-	if ip == nil {
-		return nil
+	ip, err := netip.ParseAddr(hostname)
+	if err != nil {
+		return nil //nolint:nilerr // DNS names are accepted; only IP literals need address classification.
 	}
 
+	// The zone selects an interface, not a different network address. Strip it
+	// before equality-based classifications such as IPv6 unspecified.
+	ip = ip.WithZone("").Unmap()
 	if ip.IsLoopback() {
 		return fmt.Errorf("URL must not use a loopback address")
 	}

@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"gopkg.in/yaml.v3"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/docker"
@@ -32,6 +31,7 @@ import (
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/configyaml"
 	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/tlsconfig"
 	"github.com/manifest-network/fred/internal/util"
@@ -435,7 +435,7 @@ func loadConfig(path string) (docker.Config, error) {
 		return cfg, fmt.Errorf("failed to read config: %w", err)
 	}
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := configyaml.Decode(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("failed to parse config: %w", err)
 	}
 

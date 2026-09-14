@@ -8,6 +8,7 @@ name: Integration Tests
 # green) if the privileged environment is missing and the tests would `t.Skip`.
 
 on:
+  workflow_call:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:

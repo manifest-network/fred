@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2/expirable"
@@ -64,12 +65,12 @@ func (c *TrustedProxyConfig) IsTrusted(ipStr string) bool {
 const (
 	// maxVisitors limits the number of tracked IPs to prevent memory exhaustion
 	maxVisitors = 10000
-	// visitorTTL is how long a visitor entry stays in the cache without access
+	// visitorTTL bounds a visitor entry from insertion; access does not renew it.
 	visitorTTL = 3 * time.Minute
 
 	// maxTenants limits the number of tracked tenants to prevent memory exhaustion
 	maxTenants = 10000
-	// tenantTTL is how long a tenant entry stays in the cache without access
+	// tenantTTL bounds a tenant entry from insertion; access does not renew it.
 	tenantTTL = 5 * time.Minute
 )
 
@@ -97,11 +98,34 @@ func calcRetryAfterSeconds(r rate.Limit) string {
 	return strconv.Itoa(int(seconds))
 }
 
+// limiterCache owns creation and retention together so concurrent first requests
+// always consume the same bucket. The expirable LRU bounds both keys and lifetime;
+// its individually synchronized Get/Add methods alone cannot make creation atomic.
+type limiterCache struct {
+	mu      sync.Mutex
+	entries *lru.LRU[string, *rate.Limiter]
+	rate    rate.Limit
+	burst   int
+}
+
+func newLimiterCache(size int, ttl time.Duration, rps float64, burst int) *limiterCache {
+	return &limiterCache{entries: lru.NewLRU[string, *rate.Limiter](size, nil, ttl), rate: rate.Limit(rps), burst: burst}
+}
+
+func (c *limiterCache) get(key string) *rate.Limiter {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if limiter, ok := c.entries.Get(key); ok {
+		return limiter
+	}
+	limiter := rate.NewLimiter(c.rate, c.burst)
+	c.entries.Add(key, limiter)
+	return limiter
+}
+
 // RateLimiter implements per-IP rate limiting using a token bucket algorithm.
 type RateLimiter struct {
-	visitors       *lru.LRU[string, *rate.Limiter]
-	rate           rate.Limit // requests per second
-	burst          int        // max burst size
+	visitors       *limiterCache
 	trustedProxies *TrustedProxyConfig
 }
 
@@ -111,34 +135,24 @@ type RateLimiter struct {
 func NewRateLimiter(rps float64, burst int, trustedProxies *TrustedProxyConfig) *RateLimiter {
 	// expirable.LRU handles both LRU eviction (when maxVisitors reached)
 	// and TTL-based expiration (cleanup of stale entries)
-	cache := lru.NewLRU[string, *rate.Limiter](maxVisitors, nil, visitorTTL)
+	cache := newLimiterCache(maxVisitors, visitorTTL, rps, burst)
 
 	return &RateLimiter{
 		visitors:       cache,
-		rate:           rate.Limit(rps),
-		burst:          burst,
 		trustedProxies: trustedProxies,
 	}
 }
 
 // getVisitor retrieves or creates a rate limiter for the given IP.
 func (rl *RateLimiter) getVisitor(ip string) *rate.Limiter {
-	// Try to get existing limiter (also refreshes TTL)
-	if limiter, ok := rl.visitors.Get(ip); ok {
-		return limiter
-	}
-
-	// Create new limiter - LRU will automatically evict oldest if at capacity
-	limiter := rate.NewLimiter(rl.rate, rl.burst)
-	rl.visitors.Add(ip, limiter)
-	return limiter
+	return rl.visitors.get(ip)
 }
 
 // retryAfterSeconds returns the Retry-After header value in seconds.
 // This is the per-token refill interval, a conservative estimate of when
 // the client may retry.
 func (rl *RateLimiter) retryAfterSeconds() string {
-	return calcRetryAfterSeconds(rl.rate)
+	return calcRetryAfterSeconds(rl.visitors.rate)
 }
 
 // Middleware returns an HTTP middleware that enforces rate limiting.
@@ -220,9 +234,7 @@ func extractDirectIP(remoteAddr string) string {
 // Tokens are cryptographically validated before consuming from the bucket to prevent
 // attackers from burning a victim's quota with forged tokens.
 type TenantRateLimiter struct {
-	tenants      *lru.LRU[string, *rate.Limiter]
-	rate         rate.Limit // requests per second
-	burst        int        // max burst size
+	tenants      *limiterCache
 	bech32Prefix string
 }
 
@@ -230,25 +242,17 @@ type TenantRateLimiter struct {
 // rps is requests per second, burst is the maximum burst size per tenant.
 // bech32Prefix is used for cryptographic token validation before bucket consumption.
 func NewTenantRateLimiter(rps float64, burst int, bech32Prefix string) *TenantRateLimiter {
-	cache := lru.NewLRU[string, *rate.Limiter](maxTenants, nil, tenantTTL)
+	cache := newLimiterCache(maxTenants, tenantTTL, rps, burst)
 
 	return &TenantRateLimiter{
 		tenants:      cache,
-		rate:         rate.Limit(rps),
-		burst:        burst,
 		bech32Prefix: bech32Prefix,
 	}
 }
 
 // getLimiter retrieves or creates a rate limiter for the given tenant.
 func (tl *TenantRateLimiter) getLimiter(tenant string) *rate.Limiter {
-	if limiter, ok := tl.tenants.Get(tenant); ok {
-		return limiter
-	}
-
-	limiter := rate.NewLimiter(tl.rate, tl.burst)
-	tl.tenants.Add(tenant, limiter)
-	return limiter
+	return tl.tenants.get(tenant)
 }
 
 // Allow checks if a request from the tenant is allowed.
@@ -260,7 +264,7 @@ func (tl *TenantRateLimiter) Allow(tenant string) bool {
 // This is the per-token refill interval, a conservative estimate of when
 // the client may retry.
 func (tl *TenantRateLimiter) retryAfterSeconds() string {
-	return calcRetryAfterSeconds(tl.rate)
+	return calcRetryAfterSeconds(tl.tenants.rate)
 }
 
 // authTokenKey is the context key for storing a validated *AuthToken.

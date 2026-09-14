@@ -532,14 +532,10 @@ type imageSetup struct {
 	WritablePaths []string        // auto-detected writable paths for non-root images
 }
 
-// inspectImageForSetup inspects an image and resolves its VOLUME declarations
-// and container user. This combines the image inspect, volume discovery, and
-// user resolution steps that are common to doProvision, doRestart, and doUpdate.
-func (b *Backend) inspectImageForSetup(mutations *storageMutations, ctx context.Context, image string, manifestUser string) (*imageSetup, error) {
-	admitted, err := mutations.admitImage(ctx, image)
-	if err != nil {
-		return nil, fmt.Errorf("image admission failed: %w", err)
-	}
+// setupAdmittedImage resolves users and writable paths only after the complete
+// lease image/mount plan has passed its resource budget.
+func (b *Backend) setupAdmittedImage(mutations *storageMutations, ctx context.Context, preparation admittedImageSetup) (*imageSetup, error) {
+	admitted, manifestUser := preparation.image, preparation.user
 	volumes := admitted.Volumes()
 	result := &imageSetup{Image: admitted, Volumes: volumes}
 
@@ -1049,16 +1045,12 @@ func (b *Backend) doProvisionPhysical(
 	}
 
 	// Per-service image setup (inspect, user resolution, writable paths).
-	imageSetups := make(map[string]*imageSetup)
-	for svcName, svc := range stack.Services {
-		imgSetup, setupErr := b.inspectImageForSetup(mutations, ctx, svc.Image, svc.User)
-		if setupErr != nil {
-			logger.Error("image setup failed", "service", svcName, "error", setupErr)
-			err = setupErr
-			callbackErr = "image inspect failed"
-			return
-		}
-		imageSetups[svcName] = imgSetup
+	imageSetups, setupErr := b.inspectImagesForSetup(mutations, ctx, stack, req.Items)
+	if setupErr != nil {
+		logger.Error("image setup failed", "error", setupErr)
+		err = setupErr
+		callbackErr = "image inspect failed"
+		return
 	}
 
 	// Resolve tenant network name (not Docker network ID — Compose needs the name).

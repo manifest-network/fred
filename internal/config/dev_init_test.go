@@ -2,6 +2,8 @@ package config
 
 import (
 	"encoding/json"
+	"encoding/pem"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 func TestDevInitProviderConfigTemplateIsValid(t *testing.T) {
@@ -34,12 +38,18 @@ func TestDevInitProviderConfigTemplateIsValid(t *testing.T) {
 	callbackSecret := strings.Repeat("a", 32) + `"\suffix`
 	callbackSecretJSON, err := json.Marshal(callbackSecret)
 	require.NoError(t, err)
+	server := httptest.NewTLSServer(nil)
+	defer server.Close()
+	certPath := filepath.Join(t.TempDir(), "dev-cert.pem")
+	require.NoError(t, os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600))
+	certJSON, err := json.Marshal(certPath)
+	require.NoError(t, err)
 	values := map[string]string{
 		"CALLBACK_BASE_URL_JSON":  `"https://localhost:8080"`,
 		"CALLBACK_SECRET_JSON":    string(callbackSecretJSON),
-		"CERT_FILE_JSON":          `"/work/fred-cert.pem"`,
+		"CERT_FILE_JSON":          string(certJSON),
 		"CHAIN_ID_JSON":           `"manifest-dev"`,
-		"DOCKER_BACKEND_URL_JSON": `"http://localhost:9001"`,
+		"DOCKER_BACKEND_URL_JSON": `"https://localhost:9001"`,
 		"GRPC_ENDPOINT_JSON":      `"localhost:9090"`,
 		"KEYRING_BACKEND_JSON":    `"test"`,
 		"KEYRING_DIR_JSON":        `"/work/manifest/"`,
@@ -72,6 +82,10 @@ func TestDevInitProviderConfigTemplateIsValid(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, callbackSecret, string(secret),
 		"JSON-compatible YAML quoting must preserve arbitrary HMAC secret bytes")
+	policy, err := cfg.BackendConnectionPolicy("docker")
+	require.NoError(t, err)
+	_, err = backend.NewAuthenticatedEvidencePolicy(policy)
+	require.NoError(t, err, "generated dev config must authorize verified offline backend evidence")
 }
 
 func TestDevInitPrintsSafeFreshPlacementBootstrapOrder(t *testing.T) {

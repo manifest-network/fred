@@ -66,9 +66,9 @@ dockers:
     use: buildx
     image_templates:
       - "ghcr.io/manifest-network/fred:{{ .Version }}"
-      - "ghcr.io/manifest-network/fred:{{ if not .Prerelease }}latest{{ end }}"
-      - "ghcr.io/manifest-network/fred:{{ if not .Prerelease }}{{ .Major }}.{{ .Minor }}{{ end }}"
-      - "ghcr.io/manifest-network/fred:{{ if not .Prerelease }}{{ .Major }}{{ end }}"
+      - "{{ if not .Prerelease }}ghcr.io/manifest-network/fred:latest{{ end }}"
+      - "{{ if not .Prerelease }}ghcr.io/manifest-network/fred:{{ .Major }}.{{ .Minor }}{{ end }}"
+      - "{{ if not .Prerelease }}ghcr.io/manifest-network/fred:{{ .Major }}{{ end }}"
     build_flag_templates:
       - "--platform=linux/amd64"
       - "--label=org.opencontainers.image.title=providerd"

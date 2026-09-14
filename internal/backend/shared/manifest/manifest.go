@@ -385,10 +385,13 @@ func (m *flatManifest) validate(inStack bool) error {
 // resolution against the container image's /etc/passwd, which is also
 // substrate-side.
 func validateUserSpec(user string) error {
-	if strings.ContainsAny(user, " \t\n\r") {
+	if strings.ContainsAny(user, " \t\n\r\f\v") {
 		return fmt.Errorf("user: must not contain whitespace: %q", user)
 	}
 	parts := strings.SplitN(user, ":", 2)
+	if len(parts) == 2 && strings.Contains(parts[1], ":") {
+		return fmt.Errorf("user: must contain at most one colon: %q", user)
+	}
 	if parts[0] == "" {
 		return fmt.Errorf("user: user part cannot be empty: %q", user)
 	}

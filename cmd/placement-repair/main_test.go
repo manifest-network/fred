@@ -343,7 +343,7 @@ func TestRun_ClassifyEmitsMachineReadableSchemaNeutralVerdict(t *testing.T) {
 	before, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
 	configPath := writeRepairConfig(
-		t, dbPath, "http://127.0.0.1:1", repairCommandBackend,
+		t, dbPath, "https://127.0.0.1:1", repairCommandBackend,
 	)
 
 	var stdout bytes.Buffer
@@ -367,7 +367,7 @@ func TestRun_ClassifyEmitsMachineReadableSchemaNeutralVerdict(t *testing.T) {
 func TestRun_ClassifyExposesPersistedUntrustedPositiveQuarantine(t *testing.T) {
 	dbPath := createUntrustedPositiveRepairCommandDatabase(t)
 	configPath := writeRepairConfig(
-		t, dbPath, "http://127.0.0.1:1", repairCommandBackend,
+		t, dbPath, "https://127.0.0.1:1", repairCommandBackend,
 	)
 
 	var stdout bytes.Buffer
@@ -393,7 +393,7 @@ func TestRun_ClassifyUnsafeAuthorityStillEmitsJSONAndFails(t *testing.T) {
 	}))
 	require.NoError(t, db.Close())
 	configPath := writeRepairConfig(
-		t, dbPath, "http://127.0.0.1:1", repairCommandBackend,
+		t, dbPath, "https://127.0.0.1:1", repairCommandBackend,
 	)
 
 	var stdout bytes.Buffer
@@ -434,7 +434,7 @@ func TestRun_ClassifyPreparedCurrentAuthoritiesIsDeterministicAndByteExact(t *te
 			before, err := os.ReadFile(dbPath)
 			require.NoError(t, err)
 			configPath := writeRepairConfig(
-				t, dbPath, "http://127.0.0.1:1", repairCommandBackend,
+				t, dbPath, "https://127.0.0.1:1", repairCommandBackend,
 			)
 
 			var first, second bytes.Buffer
@@ -465,7 +465,7 @@ func TestRun_ClassifyPreparedCurrentAuthoritiesIsDeterministicAndByteExact(t *te
 func TestRun_ClassifyCancellationCannotEmitSafeSuccess(t *testing.T) {
 	dbPath := writeRepairLegacyAuthorityDB(t)
 	configPath := writeRepairConfig(
-		t, dbPath, "http://127.0.0.1:1", repairCommandBackend,
+		t, dbPath, "https://127.0.0.1:1", repairCommandBackend,
 	)
 	ctx, cancel := context.WithCancel(t.Context())
 	dependencies := defaultCommandDependencies()
@@ -513,7 +513,7 @@ func TestRunAuthorityClassificationRejectsShortReportWrite(t *testing.T) {
 func TestRun_ClassifyIsMutuallyExclusiveAndRejectsRecordSelectors(t *testing.T) {
 	dbPath := writeRepairLegacyAuthorityDB(t)
 	configPath := writeRepairConfig(
-		t, dbPath, "http://127.0.0.1:1", repairCommandBackend,
+		t, dbPath, "https://127.0.0.1:1", repairCommandBackend,
 	)
 
 	t.Run("other mode", func(t *testing.T) {
@@ -661,7 +661,7 @@ func TestRun_DryRunClosesWithoutChangingDatabaseBytes(t *testing.T) {
 
 func TestRun_ApplyRequiresExactConfirmationAndDrainAttestation(t *testing.T) {
 	dbPath := createRepairCommandDatabase(t, false)
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	server := newVerifiedInventoryServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("invalid operator confirmation must fail before any backend probe")
 	}))
 	defer server.Close()
@@ -713,7 +713,7 @@ func TestRun_ApplyRequiresNewExactBackupBeforeMutation(t *testing.T) {
 		dbPath := createRepairCommandDatabase(t, false)
 		before, err := os.ReadFile(dbPath)
 		require.NoError(t, err)
-		server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		server := newVerifiedInventoryServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 			t.Fatal("missing mandatory backup must fail before any backend probe")
 		}))
 		defer server.Close()
@@ -890,7 +890,7 @@ func TestRun_RequiresExactConfiguredAndDurableBackendTopology(t *testing.T) {
 	dbPath := createRepairCommandDatabase(t, false)
 	before, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	server := newVerifiedInventoryServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("topology mismatch must fail before any backend probe")
 	}))
 	defer server.Close()
@@ -910,7 +910,7 @@ func TestRun_RequiresConfiguredProviderToMatchDurableAuthorityBeforeProbe(t *tes
 	dbPath := createRepairCommandDatabase(t, false)
 	before, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	server := newVerifiedInventoryServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("provider mismatch must fail before any backend probe")
 	}))
 	defer server.Close()
@@ -946,7 +946,7 @@ func TestRun_RejectsInvalidConfiguredProviderBeforeOpeningRepair(t *testing.T) {
 	before, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
 	configPath := writeRepairConfigForProvider(
-		t, "not-a-uuid", dbPath, "http://127.0.0.1:1", repairCommandBackend,
+		t, "not-a-uuid", dbPath, "https://127.0.0.1:1", repairCommandBackend,
 	)
 
 	var stdout bytes.Buffer
@@ -968,7 +968,7 @@ func TestRun_RejectsNonCanonicalConfiguredProviderBeforeOpeningRepair(t *testing
 			before, err := os.ReadFile(dbPath)
 			require.NoError(t, err)
 			configPath := writeRepairConfigForProvider(
-				t, providerUUID, dbPath, "http://127.0.0.1:1", repairCommandBackend,
+				t, providerUUID, dbPath, "https://127.0.0.1:1", repairCommandBackend,
 			)
 
 			var stdout bytes.Buffer
@@ -1091,7 +1091,7 @@ func TestRun_ApplyRefusesPositiveOrIncompleteInventory(t *testing.T) {
 			dbPath := createRepairCommandDatabase(t, test.confirmed)
 			before, err := os.ReadFile(dbPath)
 			require.NoError(t, err)
-			server := httptest.NewServer(test.handler)
+			server := newVerifiedInventoryServer(t, test.handler)
 			defer server.Close()
 			configPath := writeRepairConfig(t, dbPath, server.URL, repairCommandBackend)
 			backupPath := filepath.Join(t.TempDir(), "placements.pre-repair.bak")
@@ -1241,7 +1241,7 @@ func TestRun_FinalProbeFailureAfterBackupIsCategoricallyUncommitted(t *testing.T
 	before, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
 	var provisionsCalls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newVerifiedInventoryServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(
 			backendidentity.ResponseHeader,
 			repairBackendStorageID(t, repairCommandBackend).String(),
@@ -1353,7 +1353,7 @@ func TestRun_HoldsExclusiveLockThroughFreshInventoryCollection(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var startedOnce sync.Once
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newVerifiedInventoryServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(backendidentity.ResponseHeader, repairBackendStorageID(t, repairCommandBackend).String())
 		switch r.URL.Path {
 		case "/provisions":
@@ -1397,7 +1397,7 @@ func TestRun_ListAndInspectAreReadOnlyAndExposeExactRepairFacts(t *testing.T) {
 	dbPath := createRepairCommandDatabase(t, false)
 	before, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
-	configPath := writeRepairConfig(t, dbPath, "http://127.0.0.1:1", repairCommandBackend)
+	configPath := writeRepairConfig(t, dbPath, "https://127.0.0.1:1", repairCommandBackend)
 
 	var listOutput bytes.Buffer
 	err = run(t.Context(), []string{"-config", configPath, "-list"}, &listOutput, &bytes.Buffer{})
@@ -1439,7 +1439,7 @@ func TestRun_ListAndInspectAreReadOnlyAndExposeExactRepairFacts(t *testing.T) {
 func TestRun_ListAndInspectExposePersistedUntrustedPositiveQuarantine(t *testing.T) {
 	dbPath := createUntrustedPositiveRepairCommandDatabase(t)
 	configPath := writeRepairConfig(
-		t, dbPath, "http://127.0.0.1:1", repairCommandBackend,
+		t, dbPath, "https://127.0.0.1:1", repairCommandBackend,
 	)
 
 	var listOutput bytes.Buffer
@@ -1916,7 +1916,7 @@ func newRepairInventoryServer(
 	if len(backendNames) != 0 {
 		backendName = backendNames[0]
 	}
-	return httptest.NewServer(repairInventoryHandlerForBackend(
+	return newVerifiedInventoryServer(t, repairInventoryHandlerForBackend(
 		t, backendName, provisions, retentions,
 	))
 }
@@ -1975,8 +1975,8 @@ func writeRepairConfigForProvider(
 	configPath := filepath.Join(t.TempDir(), "provider.yaml")
 	var backends bytes.Buffer
 	for index, backendName := range backendNames {
-		_, err := fmt.Fprintf(&backends, "  - name: %q\n    url: %q\n    default: %t\n",
-			backendName, backendURL, index == 0)
+		_, err := fmt.Fprintf(&backends, "  - name: %q\n    url: %q\n    default: %t\n    tls_ca_file: %q\n",
+			backendName, backendURL, index == 0, verifiedInventoryCAFile(backendURL))
 		require.NoError(t, err)
 	}
 	contents := fmt.Sprintf(`provider_uuid: %q
@@ -2006,8 +2006,8 @@ func writeRepairConfigURLs(
 	configPath := filepath.Join(t.TempDir(), "provider.yaml")
 	var backends bytes.Buffer
 	for index, backendName := range names {
-		_, err := fmt.Fprintf(&backends, "  - name: %q\n    url: %q\n    default: %t\n",
-			backendName, backendURLs[backendName], index == 0)
+		_, err := fmt.Fprintf(&backends, "  - name: %q\n    url: %q\n    default: %t\n    tls_ca_file: %q\n",
+			backendName, backendURLs[backendName], index == 0, verifiedInventoryCAFile(backendURLs[backendName]))
 		require.NoError(t, err)
 	}
 	contents := fmt.Sprintf(`provider_uuid: %q

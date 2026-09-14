@@ -27,6 +27,7 @@
         },
         "ports": {
           "type": "object",
+          "maxProperties": 64,
           "description": "Port mappings. Keys are \"port/protocol\" strings; values configure optional host port binding.",
           "propertyNames": {
             "$ref": "#/$defs/PortSpec"
@@ -37,6 +38,7 @@
         },
         "env": {
           "type": "object",
+          "maxProperties": 256,
           "description": "Environment variables passed to the container. Certain names and prefixes are blocked for security.",
           "propertyNames": {
             "type": "string",
@@ -68,6 +70,7 @@
         },
         "labels": {
           "type": "object",
+          "maxProperties": 128,
           "description": "Custom container labels. Keys must not start with fred., traefik., or com.docker.compose. (case-insensitive reserved namespaces). The same restriction applies to labels baked into container images.",
           "propertyNames": {
             "type": "string",
@@ -103,8 +106,8 @@
         },
         "user": {
           "type": "string",
-          "description": "Container runtime user. Formats: \"uid\", \"uid:gid\", \"username\", \"username:group\". No whitespace; both user and group parts must be non-empty.",
-          "pattern": "^[^\\s:]+(:([^\\s:]+))?$"
+          "description": "Container runtime user. Formats: \"uid\", \"uid:gid\", \"username\", \"username:group\". An empty string uses the image default. Otherwise no ASCII whitespace; both user and group parts must be non-empty.",
+          "pattern": "^([^\\x20\\t\\n\\r\\f\\v:]+(:([^\\x20\\t\\n\\r\\f\\v:]+))?)?$"
         },
         "depends_on": {
           "type": "object",
@@ -124,6 +127,7 @@
         },
         "expose": {
           "type": "array",
+          "maxItems": 64,
           "description": "Inter-service ports documented without creating host bindings. Port numbers as strings, 1-65535, no duplicates.",
           "uniqueItems": true,
           "items": {

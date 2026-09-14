@@ -8,7 +8,7 @@ For an overview of what Fred does and how it's structured, start with [README.md
 
 ## Prerequisites
 
-- **Go 1.26.6** (per `go.mod`) — the `go 1.26.6` directive sets the toolchain floor. Fred also uses `sync.WaitGroup.Go()` (Go 1.25) and `testing.B.Loop()` (Go 1.24).
+- **Go 1.26.8** (per `go.mod`) — the `go 1.26.8` directive sets the toolchain floor. Fred also uses `sync.WaitGroup.Go()` (Go 1.25) and `testing.B.Loop()` (Go 1.24).
 - **Docker Engine 28.1+ (API 1.49+)** with iptables enabled — required for `make test-integration` and the docker-backend's immutable image admission.
 - **(Optional) `manifestd`** — only needed if you want to run end-to-end against a local chain via `scripts/dev-init.sh`.
 - **`golangci-lint`**, at the version pinned in `.golangci-lint-version` — required by `make lint`, which now fails rather than skipping when it's absent or mismatched. See [Linting](#linting) for the install command.
@@ -88,6 +88,10 @@ go test ./internal/api/         # specific package
 go test -run TestAuthToken ./...  # specific test by name
 ```
 
+CI also runs the short suite with `-coverprofile=coverage.out`, reports aggregate and per-package statement coverage, and checks the measured 76.0% regression floor in `.coverage-threshold`. Reproduce the report with `python3 scripts/check-coverage.py coverage.out`; do not exclude packages or lower the floor to hide a regression. Schema/runtime boundary tests run with the Go suite and require no separate Python dependencies.
+
+PR CI checks GoReleaser configuration and builds snapshot binaries, archives and the container image without publishing or signing. Tagged releases must point to a commit in `main` history, then pass the same full CI and integration workflows on that exact commit before publishing. Repository tag-creation and release permissions must remain restricted to trusted maintainers.
+
 ### Race detector
 
 **Run the full unit suite under `-race -short` regularly.** Stress tests OOM under `-race` because they allocate large fixtures; they self-skip via `testing.Short()`.
@@ -162,7 +166,7 @@ make test-coverage          # generates coverage.html (open it manually); runs w
 sudo make test-coverage-all # includes volume tests
 ```
 
-There is no enforced coverage threshold, but PRs that add code should add tests. Ratchet up coverage when touching a poorly-covered area.
+CI enforces the measured 76.0% aggregate statement-coverage floor in `.coverage-threshold`. PRs that add code should add tests. Ratchet up coverage when touching a poorly-covered area.
 
 ### Benchmarks
 

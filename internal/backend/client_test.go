@@ -745,7 +745,7 @@ func TestHTTPClientRestore_UnreadableBodyIsNotBareStatus(t *testing.T) {
 		wantSame bool // true = the documented bare-status mapping must be preserved
 	}{
 		{"empty 422 stays ErrNotRetained", http.StatusUnprocessableEntity, "", ErrNotRetained, true},
-		{"whitespace 422 stays ErrNotRetained", http.StatusUnprocessableEntity, "  \n", ErrNotRetained, true},
+		{"whitespace 422 is malformed", http.StatusUnprocessableEntity, "  \n", ErrMalformedErrorBody, false},
 		{"valid envelope, no code, stays ErrNotRetained", http.StatusUnprocessableEntity, `{"error":"nope"}`, ErrNotRetained, true},
 		{"valid coded envelope still classifies", http.StatusUnprocessableEntity, `{"error":"too big","code":"demote_exceeds_tier"}`, ErrDemoteDataExceedsTier, true},
 		{"valid coded 409 still classifies", http.StatusConflict, `{"error":"dup","code":"already_provisioned"}`, ErrAlreadyProvisioned, true},
@@ -2228,8 +2228,8 @@ func TestBackendResponseDrainsAreBounded(t *testing.T) {
 	t.Run("error envelope", func(t *testing.T) {
 		body := &endlessCountingBody{}
 		got := readErrorBodyBytes(&http.Response{Body: body})
-		assert.Len(t, got, 4096)
-		assert.Equal(t, int64(4096)+maxResponseDrainBytes, body.read)
+		assert.Len(t, got, maxBackendErrorBytes+1)
+		assert.Equal(t, int64(maxBackendErrorBytes+1)+maxResponseDrainBytes, body.read)
 	})
 
 	t.Run("oversized JSON", func(t *testing.T) {

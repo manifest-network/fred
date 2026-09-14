@@ -762,13 +762,9 @@ func (b *Backend) doReplacePhysical(
 		return fmt.Errorf("validate %s resource profiles: %w", op.Operation, err)
 	}
 	imageSetupStartedAt := time.Now()
-	imageSetups := make(map[string]*imageSetup, len(op.Stack.Services))
-	for service, spec := range op.Stack.Services {
-		setup, err := b.inspectImageForSetup(mutations, ctx, spec.Image, spec.User)
-		if err != nil {
-			return fmt.Errorf("inspect %s image for service %q: %w", op.Operation, service, err)
-		}
-		imageSetups[service] = setup
+	imageSetups, err := b.inspectImagesForSetup(mutations, ctx, op.Stack, op.Items)
+	if err != nil {
+		return fmt.Errorf("inspect %s images: %w", op.Operation, err)
 	}
 	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseImageSetup).
 		Observe(time.Since(imageSetupStartedAt).Seconds())

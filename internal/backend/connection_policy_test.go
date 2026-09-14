@@ -90,3 +90,31 @@ func TestConnectionPolicyRedactsCredentials(t *testing.T) {
 	slog.New(slog.NewJSONHandler(&output, nil)).Info("connection", "policy", policy)
 	assert.NotContains(t, output.String(), testIdentityClientKey)
 }
+
+func TestAuthenticatedEvidencePolicyCannotUseUnverifiedConnection(t *testing.T) {
+	for _, settings := range []ConnectionConfig{
+		{Name: "plain", BaseURL: "http://backend.invalid", Secret: testIdentityClientKey},
+		{Name: "unverified", BaseURL: "https://backend.invalid", TLSSkipVerify: true, Secret: testIdentityClientKey},
+	} {
+		connection, err := NewConnectionPolicy(settings)
+		require.NoError(t, err, "development observations remain supported")
+		policy, err := NewAuthenticatedEvidencePolicy(connection)
+		require.ErrorContains(t, err, "certificate-verified HTTPS")
+		require.Equal(t, AuthenticatedEvidencePolicy{}, policy)
+	}
+	_, err := NewAuthenticatedEvidencePolicy(ConnectionPolicy{})
+	require.Error(t, err)
+	_, err = (AuthenticatedEvidencePolicy{}).NewInventoryClient()
+	require.Error(t, err)
+	_, err = (AuthenticatedEvidencePolicy{}).NewIdentityBoundInventoryClient(&testStorageIdentityResolver{})
+	require.Error(t, err)
+
+	connection, err := NewConnectionPolicy(ConnectionConfig{Name: "verified", BaseURL: "https://backend.invalid", Secret: testIdentityClientKey})
+	require.NoError(t, err)
+	policy, err := NewAuthenticatedEvidencePolicy(connection)
+	require.NoError(t, err)
+	client, err := policy.NewInventoryClient()
+	require.NoError(t, err)
+	_, mutationCapable := client.(Backend)
+	require.False(t, mutationCapable, "authenticated observations do not expose workload mutation methods")
+}

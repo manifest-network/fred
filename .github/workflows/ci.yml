@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -38,7 +39,47 @@ jobs:
         # testing.Short()): the 100K-event stress test is timing-flaky in CI and
         # the race-stress tests OOM the runner. They still run locally / on demand.
         # Race instrumentation runs separately in bounded shards below.
-        run: go test -short -v ./...
+        run: go test -short -v -coverprofile=coverage.out ./...
+
+      - name: Report coverage and enforce regression floor
+        run: python3 scripts/check-coverage.py coverage.out
+
+      - name: Preserve coverage profile
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: statement-coverage
+          path: coverage.out
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Test delivery checks
+        run: python3 -m unittest discover -s scripts -p '*_test.py'
+
+  release-snapshot:
+    name: release configuration + snapshot
+    runs-on: ubuntu-latest
+    env:
+      GOMAXPROCS: 2
+      GOFLAGS: -p=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Check GoReleaser configuration
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "~> v2"
+          args: check
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build release archives and image without publishing
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean --parallelism 1 --skip=publish,sign,sbom
 
   race:
     name: race (${{ matrix.name }})
@@ -125,16 +166,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Every `uses:` must be pinned to a 40-char commit SHA
+      - name: External actions must be pinned; local workflows use the current commit
         run: |
           unpinned="$(grep -rnE '^[[:space:]]*(- )?uses:' .github/workflows/ \
-            | grep -vE 'uses: [^@]+@[0-9a-f]{40}([[:space:]]+#.*)?$' || true)"
+            | grep -vE 'uses: ([^@]+@[0-9a-f]{40}|\./\.github/workflows/[A-Za-z0-9_-]+\.ya?ml)([[:space:]]+#.*)?$' || true)"
           if [ -n "$unpinned" ]; then
             echo "::error::unpinned GitHub Action(s) — pin to a 40-char commit SHA with a '# vX.Y.Z' comment:"
             echo "$unpinned"
             exit 1
           fi
-          echo "all $(grep -rcE '^[[:space:]]*(- )?uses:' .github/workflows/ | awk -F: '{n+=$2} END{print n}') action references are SHA-pinned"
+          echo "all $(grep -rcE '^[[:space:]]*(- )?uses:' .github/workflows/ | awk -F: '{n+=$2} END{print n}') action references are SHA-pinned or local to this commit"
 
   vulncheck:
     runs-on: ubuntu-latest

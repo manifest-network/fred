@@ -347,17 +347,6 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		)
 	}
 
-	// Snapshot of leases whose data lives on some backend (active or retained).
-	// Built BEFORE allProvisions is mutated by orphan detection below — the pruner
-	// needs the full pre-mutation set.
-	backendLeases := make(map[string]struct{}, len(allProvisions)+len(allRetentions))
-	for leaseUUID := range allProvisions {
-		backendLeases[leaseUUID] = struct{}{}
-	}
-	for leaseUUID := range allRetentions {
-		backendLeases[leaseUUID] = struct{}{}
-	}
-
 	// Check for cancellation before reconciliation loop
 	if err := ctx.Err(); err != nil {
 		return err

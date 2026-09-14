@@ -2,24 +2,17 @@
 //
 // Usage:
 //
-//	loadtest -target http://localhost:8080 -duration 30s -concurrency 50 -scenario mixed
+//	loadtest -fixtures fixtures.json -tenant-key-file tenant.hex -scenario connection
 //
 // Scenarios:
-//   - payload: Test payload upload endpoint
-//   - connection: Test connection info retrieval
-//   - callback: Test backend callback processing
-//   - mixed: Realistic mix of all operations
+//   - payload: Upload supplied payloads for existing leases
+//   - connection: Retrieve connection information for supplied leases
+//   - callback: Replay exact recorded callback requests
+//   - mixed: Mix payload and connection fixtures, optionally recorded callbacks
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -30,122 +23,59 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
-
-	"github.com/manifest-network/fred/internal/api"
-	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
 func main() {
-	var (
-		target         = flag.String("target", "http://localhost:8080", "Target fred URL")
-		duration       = flag.Duration("duration", 30*time.Second, "Test duration")
-		concurrency    = flag.Int("concurrency", 50, "Number of concurrent workers")
-		scenario       = flag.String("scenario", "mixed", "Test scenario: payload, connection, callback, mixed")
-		payloadSize    = flag.Int("payload-size", 1024, "Payload size in bytes")
-		rampUp         = flag.Duration("ramp-up", 5*time.Second, "Ramp-up time to reach full concurrency")
-		callbackSecret = flag.String("callback-secret", "", "HMAC secret for callback signing (min 32 bytes, required for callback scenario)")
-		verbose        = flag.Bool("verbose", false, "Verbose output")
-	)
+	target := flag.String("target", "http://localhost:8080", "Target Fred origin")
+	duration := flag.Duration("duration", 30*time.Second, "Test duration")
+	concurrency := flag.Int("concurrency", 50, "Number of concurrent workers")
+	scenario := flag.String("scenario", "mixed", "Scenario: payload, connection, callback, mixed")
+	traffic := flag.String("traffic", "authenticated", "Traffic: authenticated (requires fixtures) or rejection")
+	fixtures := flag.String("fixtures", "", "JSON file containing existing leases/payloads and exact recorded callback requests")
+	keyFile := flag.String("tenant-key-file", "", "File containing the tenant secp256k1 private key as 64 hex digits; never printed")
+	prefix := flag.String("bech32-prefix", "manifest", "Tenant address prefix")
+	payloadSize := flag.Int("payload-size", 1024, "Random payload size for rejection traffic only")
+	rampUp := flag.Duration("ramp-up", 5*time.Second, "Ramp-up time to reach full concurrency")
+	callbackSecret := flag.String("callback-secret", "", "HMAC key for the recorded backend callback fixtures (min 32 bytes)")
+	verbose := flag.Bool("verbose", false, "Verbose output")
 	flag.Parse()
-
-	// Configure logging
-	logLevel := slog.LevelInfo
+	level := slog.LevelInfo
 	if *verbose {
-		logLevel = slog.LevelDebug
+		level = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: logLevel,
-	}))
-	slog.SetDefault(logger)
-
-	// Validate
-	if *scenario == "callback" && *callbackSecret == "" {
-		slog.Error("callback-secret is required for callback scenario")
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	if *duration <= 0 || *concurrency <= 0 || *concurrency > 10000 || *rampUp < 0 {
+		slog.Error("duration and concurrency must be positive, concurrency at most 10000, and ramp-up nonnegative")
 		os.Exit(1)
 	}
-
-	slog.Info("starting load test",
-		"target", *target,
-		"duration", *duration,
-		"concurrency", *concurrency,
-		"scenario", *scenario,
-		"payload_size", *payloadSize,
-		"ramp_up", *rampUp,
-	)
-
-	// Create load tester
-	var callbackAuth *api.CallbackAuthenticator
-	if *callbackSecret != "" {
-		var err error
-		proofVerifier, _ := hmacauth.NewCallbackProofBoundary()
-		callbackAuth, err = api.NewCallbackAuthenticator(*callbackSecret, proofVerifier)
-		if err != nil {
-			slog.Error("invalid callback secret", "error", err)
-			os.Exit(1)
-		}
-	}
-
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	work, err := loadWorkload(workloadConfig{
+		target: *target, scenario: *scenario, traffic: *traffic, fixtures: *fixtures,
+		keyFile: *keyFile, prefix: *prefix, callbackSecret: *callbackSecret, payloadSize: *payloadSize,
+	})
 	if err != nil {
-		slog.Error("failed to generate key pair", "error", err)
+		slog.Error("invalid load-test configuration", "error", err)
 		os.Exit(1)
 	}
-
-	lt := &LoadTester{
-		target:       *target,
-		duration:     *duration,
-		concurrency:  *concurrency,
-		payloadSize:  *payloadSize,
-		rampUp:       *rampUp,
-		callbackAuth: callbackAuth,
-		pub:          pub,
-		priv:         priv,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        *concurrency * 2,
-				MaxIdleConnsPerHost: *concurrency * 2,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = *concurrency * 2
+	transport.MaxIdleConnsPerHost = *concurrency * 2
+	client := &http.Client{Timeout: 30 * time.Second, Transport: transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
 	}
-
-	// Run scenario
-	var results *Results
-	switch *scenario {
-	case "payload":
-		results = lt.RunPayloadTest()
-	case "connection":
-		results = lt.RunConnectionTest()
-	case "callback":
-		results = lt.RunCallbackTest()
-	case "mixed":
-		results = lt.RunMixedTest()
-	default:
-		slog.Error("unknown scenario", "scenario", *scenario)
-		os.Exit(1)
-	}
-
-	// Print results
-	results.Print()
+	defer client.CloseIdleConnections()
+	slog.Info("starting load test", "target", *target, "traffic", *traffic, "scenario", *scenario,
+		"duration", *duration, "concurrency", *concurrency)
+	lt := &LoadTester{duration: *duration, concurrency: *concurrency, rampUp: *rampUp, client: client, work: work}
+	lt.Run().Print()
 }
 
-// LoadTester performs load testing against fred.
+// LoadTester executes a constructed workload with bounded worker concurrency.
 type LoadTester struct {
-	target       string
-	duration     time.Duration
-	concurrency  int
-	payloadSize  int
-	rampUp       time.Duration
-	callbackAuth *api.CallbackAuthenticator
-	client       *http.Client
-
-	// Pre-generated key pair reused across all requests to avoid the cost
-	// of ed25519.GenerateKey on every iteration.
-	pub  ed25519.PublicKey
-	priv ed25519.PrivateKey
+	duration    time.Duration
+	concurrency int
+	rampUp      time.Duration
+	client      *http.Client
+	work        workload
 }
 
 // Results holds load test results.
@@ -271,312 +201,62 @@ func (r *Results) Print() {
 	fmt.Println("\n" + "============================================================")
 }
 
-// RunPayloadTest tests the payload upload endpoint.
-func (lt *LoadTester) RunPayloadTest() *Results {
-	slog.Info("running payload upload test")
+// Run executes the prepared request mix until its context deadline.
+func (lt *LoadTester) Run() *Results {
 	results := NewResults()
-
 	ctx, cancel := context.WithTimeout(context.Background(), lt.duration)
 	defer cancel()
-
-	var wg sync.WaitGroup
-	startTime := time.Now()
-
-	// Ramp up workers gradually
-	workerDelay := lt.rampUp / time.Duration(lt.concurrency)
-
-	for i := range lt.concurrency {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			// Stagger start
-			time.Sleep(workerDelay * time.Duration(workerID))
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					lt.doPayloadRequest(ctx, results)
-				}
-			}
-		}(i)
-	}
-
-	wg.Wait()
-	results.Duration = time.Since(startTime)
-	return results
-}
-
-func (lt *LoadTester) doPayloadRequest(ctx context.Context, results *Results) {
-	// Generate test data
-	leaseUUID := uuid.New().String()
-	payload := make([]byte, lt.payloadSize)
-	rand.Read(payload)
-	hash := sha256.Sum256(payload)
-	hashStr := hex.EncodeToString(hash[:])
-
-	// Generate auth token (simplified - real implementation would need proper signing)
-	token := lt.generateAuthToken(leaseUUID, hashStr)
-
-	url := fmt.Sprintf("%s/v1/leases/%s/data", lt.target, leaseUUID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		results.Record(0, 0, err, 0, 0)
-		return
-	}
-
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Authorization", "Bearer "+token)
-
 	start := time.Now()
-	resp, err := lt.client.Do(req)
-	latency := time.Since(start)
-
-	if err != nil {
-		results.Record(latency, 0, err, int64(lt.payloadSize), 0)
-		return
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		results.Record(latency, resp.StatusCode, fmt.Errorf("read body: %w", err), int64(lt.payloadSize), int64(len(body)))
-		return
-	}
-	results.Record(latency, resp.StatusCode, nil, int64(lt.payloadSize), int64(len(body)))
-}
-
-// RunConnectionTest tests the connection info endpoint.
-func (lt *LoadTester) RunConnectionTest() *Results {
-	slog.Info("running connection info test")
-	results := NewResults()
-
-	ctx, cancel := context.WithTimeout(context.Background(), lt.duration)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	startTime := time.Now()
-
-	workerDelay := lt.rampUp / time.Duration(lt.concurrency)
-
+	var workers sync.WaitGroup
+	var next atomic.Uint64
+	delay := lt.rampUp / time.Duration(lt.concurrency)
 	for i := range lt.concurrency {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			time.Sleep(workerDelay * time.Duration(workerID))
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					lt.doConnectionRequest(ctx, results)
-				}
+		workers.Go(func() {
+			if err := waitFor(ctx, delay*time.Duration(i)); err != nil {
+				return
 			}
-		}(i)
-	}
-
-	wg.Wait()
-	results.Duration = time.Since(startTime)
-	return results
-}
-
-func (lt *LoadTester) doConnectionRequest(ctx context.Context, results *Results) {
-	leaseUUID := uuid.New().String()
-	token := lt.generateAuthToken(leaseUUID, "")
-
-	url := fmt.Sprintf("%s/v1/leases/%s/connection", lt.target, leaseUUID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		results.Record(0, 0, err, 0, 0)
-		return
-	}
-
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	start := time.Now()
-	resp, err := lt.client.Do(req)
-	latency := time.Since(start)
-
-	if err != nil {
-		results.Record(latency, 0, err, 0, 0)
-		return
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		results.Record(latency, resp.StatusCode, fmt.Errorf("read body: %w", err), 0, int64(len(body)))
-		return
-	}
-	results.Record(latency, resp.StatusCode, nil, 0, int64(len(body)))
-}
-
-// RunCallbackTest tests the callback endpoint.
-func (lt *LoadTester) RunCallbackTest() *Results {
-	slog.Info("running callback test")
-	results := NewResults()
-
-	ctx, cancel := context.WithTimeout(context.Background(), lt.duration)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	startTime := time.Now()
-
-	workerDelay := lt.rampUp / time.Duration(lt.concurrency)
-
-	for i := range lt.concurrency {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			time.Sleep(workerDelay * time.Duration(workerID))
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					lt.doCallbackRequest(ctx, results)
-				}
-			}
-		}(i)
-	}
-
-	wg.Wait()
-	results.Duration = time.Since(startTime)
-	return results
-}
-
-func (lt *LoadTester) doCallbackRequest(ctx context.Context, results *Results) {
-	leaseUUID := uuid.New().String()
-
-	// Create callback payload
-	callback := map[string]interface{}{
-		"lease_uuid": leaseUUID,
-		"status":     "success",
-		"connection": map[string]interface{}{
-			"host":     "10.0.0.1",
-			"port":     8080,
-			"protocol": "https",
-		},
-	}
-
-	body, _ := json.Marshal(callback)
-
-	url := fmt.Sprintf("%s/callbacks/provision", lt.target)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		results.Record(0, 0, err, 0, 0)
-		return
-	}
-
-	// Sign the callback after the request is built so the signed canonical
-	// string includes the same method + URI the verifier will see.
-	signature := lt.signCallback(req.Method, req.URL.RequestURI(), body)
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Fred-Signature", signature)
-
-	start := time.Now()
-	resp, err := lt.client.Do(req)
-	latency := time.Since(start)
-
-	if err != nil {
-		results.Record(latency, 0, err, int64(len(body)), 0)
-		return
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		results.Record(latency, resp.StatusCode, fmt.Errorf("read body: %w", err), int64(len(body)), int64(len(respBody)))
-		return
-	}
-	results.Record(latency, resp.StatusCode, nil, int64(len(body)), int64(len(respBody)))
-}
-
-// RunMixedTest runs a realistic mix of operations.
-func (lt *LoadTester) RunMixedTest() *Results {
-	slog.Info("running mixed workload test")
-	results := NewResults()
-
-	ctx, cancel := context.WithTimeout(context.Background(), lt.duration)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	var opCounter atomic.Int64
-	startTime := time.Now()
-
-	workerDelay := lt.rampUp / time.Duration(lt.concurrency)
-
-	for i := range lt.concurrency {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			time.Sleep(workerDelay * time.Duration(workerID))
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					op := opCounter.Add(1)
-					switch op % 10 {
-					case 0, 1, 2, 3: // 40% payload uploads
-						lt.doPayloadRequest(ctx, results)
-					case 4, 5, 6, 7, 8: // 50% connection checks
-						lt.doConnectionRequest(ctx, results)
-					case 9: // 10% callbacks (if secret provided)
-						if lt.callbackAuth != nil {
-							lt.doCallbackRequest(ctx, results)
-						} else {
-							lt.doConnectionRequest(ctx, results)
-						}
+			for ctx.Err() == nil {
+				factory := lt.work.requests[(next.Add(1)-1)%uint64(len(lt.work.requests))]
+				req, err := factory(ctx)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
 					}
+					results.Record(0, 0, err, 0, 0)
+					continue
 				}
+				lt.execute(req, results)
 			}
-		}(i)
+		})
 	}
-
-	wg.Wait()
-	results.Duration = time.Since(startTime)
+	workers.Wait()
+	results.Duration = time.Since(start)
 	return results
 }
 
-// generateAuthToken creates a test auth token using the pre-generated key pair.
-// Note: these tokens will be rejected by fred. Three reasons: (1) the public
-// key is not a real on-chain identity; (2) the signed message uses the payload
-// endpoint's sign-data format ("manifest lease data %s %s %d") — the
-// connection endpoint expects a different format (see auth/format.go), so
-// even substituting real keys would still fail signature verification on
-// connection tests without also changing the message construction; and (3)
-// the signature is ed25519, but fred's tokenValidator only accepts secp256k1
-// ADR-036 signatures (token_validator.go), so the loadtest would also need
-// to swap signing curves.
-func (lt *LoadTester) generateAuthToken(leaseUUID, metaHash string) string {
-	timestamp := time.Now().Unix()
-	tenant := "manifest1loadtest" + leaseUUID[:8]
-
-	msg := fmt.Sprintf("manifest lease data %s %s %d", leaseUUID, metaHash, timestamp)
-	signature := ed25519.Sign(lt.priv, []byte(msg))
-
-	token := map[string]interface{}{
-		"tenant":     tenant,
-		"lease_uuid": leaseUUID,
-		"meta_hash":  metaHash,
-		"timestamp":  timestamp,
-		"pub_key":    base64.StdEncoding.EncodeToString(lt.pub),
-		"signature":  base64.StdEncoding.EncodeToString(signature),
+func (lt *LoadTester) execute(req *http.Request, results *Results) {
+	start := time.Now()
+	resp, err := lt.client.Do(req)
+	if err != nil {
+		results.Record(time.Since(start), 0, err, req.ContentLength, 0)
+		return
 	}
-
-	tokenBytes, _ := json.Marshal(token)
-	return base64.StdEncoding.EncodeToString(tokenBytes)
+	defer resp.Body.Close()
+	const maxResponseBytes = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if len(body) > maxResponseBytes {
+		err = fmt.Errorf("response exceeds %d bytes", maxResponseBytes)
+	}
+	results.Record(time.Since(start), resp.StatusCode, err, req.ContentLength, int64(len(body)))
 }
 
-// signCallback signs a callback payload using the CallbackAuthenticator.
-// method and uri must match what the verifier will see on the wire.
-func (lt *LoadTester) signCallback(method, uri string, payload []byte) string {
-	return lt.callbackAuth.ComputeSignature(method, uri, payload)
+func waitFor(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

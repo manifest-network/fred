@@ -20,6 +20,8 @@ const (
 
 // AuthToken represents the bearer token for tenant authentication.
 type AuthToken struct {
+	replay TokenReplayClaim
+
 	Tenant    string `json:"tenant"`
 	LeaseUUID string `json:"lease_uuid"`
 	Timestamp int64  `json:"timestamp"`
@@ -37,6 +39,7 @@ func ParseAuthToken(encoded string) (*AuthToken, error) {
 // On success, t.Signature is updated to the low-S canonical form to ensure
 // consistent replay tracking regardless of which signature variant was submitted.
 func (t *AuthToken) Validate(bech32Prefix string) error {
+	t.replay = TokenReplayClaim{}
 	// Validate required fields
 	if t.LeaseUUID == "" {
 		return fmt.Errorf("lease_uuid is required")
@@ -50,12 +53,14 @@ func (t *AuthToken) Validate(bech32Prefix string) error {
 		signature: t.Signature,
 	}
 
-	if err := v.validateCommon(t.createSignData(), bech32Prefix); err != nil {
+	claim, err := v.validateCommon(t.createSignData(), bech32Prefix)
+	if err != nil {
 		return err
 	}
 
 	// Copy back the normalized signature for consistent replay tracking
 	t.Signature = v.signature
+	t.replay = claim
 	return nil
 }
 

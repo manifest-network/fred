@@ -90,29 +90,41 @@ func NewIdentityBoundClients(
 	if cfg == nil {
 		return nil, fmt.Errorf("provider config is required")
 	}
+	names := make([]string, 0, len(cfg.Backends))
+	for _, entry := range cfg.Backends {
+		names = append(names, entry.Name)
+	}
+	pins, err := pinIdentities(names, resolver)
+	if err != nil {
+		return nil, err
+	}
+	return newClients(cfg, pins)
+}
+
+func pinIdentities(names []string, resolver backend.BackendStorageIdentityResolver) (fixedIdentityResolver, error) {
 	if util.IsNilInterface(resolver) {
 		return nil, fmt.Errorf("backend storage identity resolver is required")
 	}
-	owners := make(map[backendidentity.ID]string, len(cfg.Backends))
-	pins := make(fixedIdentityResolver, len(cfg.Backends))
-	for _, backendConfig := range cfg.Backends {
-		id, bound := resolver.ExpectedBackendStorageIdentity(backendConfig.Name)
+	owners := make(map[backendidentity.ID]string, len(names))
+	pins := make(fixedIdentityResolver, len(names))
+	for _, name := range names {
+		id, bound := resolver.ExpectedBackendStorageIdentity(name)
 		if !bound || !id.Valid() {
 			return nil, fmt.Errorf(
 				"%w: backend %q has no durable storage identity; run a complete upgraded-fleet reconciliation before repair",
-				ErrIncompleteInventory, backendConfig.Name,
+				ErrIncompleteInventory, name,
 			)
 		}
-		if owner, duplicate := owners[id]; duplicate && owner != backendConfig.Name {
+		if owner, duplicate := owners[id]; duplicate && owner != name {
 			return nil, fmt.Errorf(
 				"%w: backends %q and %q share storage identity %s",
-				ErrIncompleteInventory, owner, backendConfig.Name, id,
+				ErrIncompleteInventory, owner, name, id,
 			)
 		}
-		owners[id] = backendConfig.Name
-		pins[backendConfig.Name] = id
+		owners[id] = name
+		pins[name] = id
 	}
-	return newClients(cfg, pins)
+	return pins, nil
 }
 
 // fixedIdentityResolver detaches the stopped database's exact active pins at

@@ -812,7 +812,7 @@ func TestRun_InitializeFreshRequiresExactQuiescenceConfirmation(t *testing.T) {
 		t.Run(fmt.Sprintf("confirmation=%q", confirmation), func(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "placements.db")
 			configPath := writePreflightConfig(
-				t, dbPath, "http://127.0.0.1:1", "backend-a",
+				t, dbPath, "https://127.0.0.1:1", "backend-a",
 			)
 			args := []string{
 				"-config", configPath,
@@ -832,7 +832,7 @@ func TestRun_PrintFreshConfirmationUsesCanonicalGoEncoding(t *testing.T) {
 	require.NoError(t, os.Mkdir(parent, 0o700))
 	dbPath := filepath.Join(parent, "placements.db")
 	configPath := writePreflightConfig(
-		t, dbPath, "http://127.0.0.1:1", "backend-a",
+		t, dbPath, "https://127.0.0.1:1", "backend-a",
 	)
 	target, err := placement.NewFreshInitializationTarget(
 		dbPath,
@@ -905,7 +905,7 @@ func TestParseExpectedBackendRosterRejectsAmbiguousInput(t *testing.T) {
 func TestRun_RejectsInvalidConfiguredProviderBeforePlacementOpenOrProbe(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	configPath := writePreflightConfigForProvider(
-		t, "not-a-uuid", dbPath, "http://127.0.0.1:1", "backend-a",
+		t, "not-a-uuid", dbPath, "https://127.0.0.1:1", "backend-a",
 	)
 
 	var stdout bytes.Buffer
@@ -999,7 +999,7 @@ func TestRun_RefusesUnauthenticatedChainBeforePlacementOpenOrBackendProbe(t *tes
 	before, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
 	configPath := writePreflightConfig(
-		t, dbPath, "http://127.0.0.1:1", "backend-a",
+		t, dbPath, "https://127.0.0.1:1", "backend-a",
 	)
 	configBytes, err := os.ReadFile(configPath)
 	require.NoError(t, err)
@@ -1063,7 +1063,7 @@ func TestRun_RejectsNonCanonicalConfiguredProviderBeforePlacementOpenOrProbe(t *
 		t.Run(providerUUID, func(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "must-not-be-opened.db")
 			configPath := writePreflightConfigForProvider(
-				t, providerUUID, dbPath, "http://127.0.0.1:1", "backend-a",
+				t, providerUUID, dbPath, "https://127.0.0.1:1", "backend-a",
 			)
 
 			var stdout bytes.Buffer
@@ -1082,7 +1082,7 @@ func TestRun_InitializeFreshRefusesExistingTargetBeforeBackendProbe(t *testing.T
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	const existing = "operator-owned existing target"
 	require.NoError(t, os.WriteFile(dbPath, []byte(existing), 0o600))
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	server := newVerifiedInventoryServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("existing placement target must fail before any backend probe")
 	}))
 	defer server.Close()
@@ -1200,7 +1200,7 @@ func TestRun_PrepareRejectsEmptyOrTruncatedSourceWithoutMutation(t *testing.T) {
 			before, err := os.ReadFile(dbPath)
 			require.NoError(t, err)
 			configPath := writePreflightConfig(
-				t, dbPath, "http://127.0.0.1:1", "backend-a",
+				t, dbPath, "https://127.0.0.1:1", "backend-a",
 			)
 			dependencies := defaultCommandDependencies()
 			dependencies.newInventoryClients = func(*config.Config) ([]inventoryClient, error) {
@@ -1265,7 +1265,7 @@ func TestRun_ProvisionProviderMismatchIsNotDiscardedByInventoryAdapter(t *testin
 func TestRun_IncompleteBackendInventoryFailsBeforeDatabaseVerdict(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	writeLegacyPlacementDB(t, dbPath, map[string][]byte{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newVerifiedInventoryServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(backendidentity.ResponseHeader, "c0a8012e-b4ee-4f4d-9c31-7e6623928311")
 		if r.URL.Path == "/provisions" {
 			_ = json.NewEncoder(w).Encode(backend.ListProvisionsResponse{
@@ -1400,7 +1400,7 @@ func newInventoryServer(
 	retentionCopy := make([]backend.RetainedLease, len(retentions))
 	copy(retentionCopy, retentions)
 	retentions = retentionCopy
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return newVerifiedInventoryServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.NotEmpty(t, r.Header.Get(hmacauth.SignatureHeader), "inventory requests must use the configured HMAC client")
 		w.Header().Set(backendidentity.ResponseHeader, "c0a8012e-b4ee-4f4d-9c31-7e6623928311")
 		w.Header().Set("Content-Type", "application/json")
@@ -1483,8 +1483,9 @@ placement_store_db_path: %q
 backends:
   - name: %q
     url: %q
+    tls_ca_file: %q
     default: true
-`, providerUUID, t.TempDir(), dbPath, backendName, backendURL)
+`, providerUUID, t.TempDir(), dbPath, backendName, backendURL, verifiedInventoryCAFile(backendURL))
 	require.NoError(t, os.WriteFile(configPath, []byte(contents), 0o600))
 	return configPath
 }

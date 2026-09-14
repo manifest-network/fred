@@ -4573,9 +4573,9 @@ func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.
 	// retention for this lease, so the placement should eventually be pruned.
 	//
 	// ENG-333: processOrphan no longer eagerly deletes placement. The gated pruner
-	// (cleanupOrphanedPlacements) is the sole owner. However, backendLeases is built
-	// from the pre-sweep snapshot (allProvisions ∪ allRetentions), so the orphan's
-	// lease UUID is present in backendLeases even after it is deprovisioned this
+	// (cleanupOrphanedPlacements) is the sole owner. The typed sweep captures
+	// the pre-sweep inventory (allProvisions ∪ allRetentions), so the orphan's
+	// lease UUID is present in that evidence even after it is deprovisioned this
 	// sweep. The pruner therefore keeps the placement this sweep (gate b: "still on
 	// backend" = true in snapshot). It will be pruned on the NEXT sweep, when the
 	// backend no longer reports the provision and there is no retention.
@@ -4602,7 +4602,7 @@ func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// ENG-333: placement is NOT eagerly deleted by processOrphan anymore. It
-	// survives this sweep because the pre-sweep backendLeases snapshot still
+	// survives this sweep because the pre-sweep backend inventory snapshot still
 	// contains orphan-1 (it was in allProvisions at the start of RunOnce).
 	// The gated pruner will remove it on the next sweep once the backend no
 	// longer reports the provision and there is no retention.
@@ -4614,7 +4614,7 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 	//
 	// ENG-333: cleanupTerminalLease (called by closeLease) no longer eagerly
 	// deletes placement. The gated pruner is the sole owner. In this sweep:
-	//   - backendLeases snapshot contains lease-1 (it was in allProvisions)
+	//   - backend inventory snapshot contains lease-1 (it was in allProvisions)
 	//   - chainLeases snapshot contains lease-1 as ACTIVE
 	// So the pruner keeps placement this sweep (both gate a and the chain-terminal
 	// gate protect it). It will be pruned on the NEXT sweep, once the chain
@@ -4656,7 +4656,7 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// ENG-333: placement is NOT eagerly deleted by cleanupTerminalLease anymore.
-	// It survives this sweep because the pre-sweep snapshots (backendLeases from
+	// It survives this sweep because the pre-sweep snapshots (backend inventory from
 	// allProvisions, chainLeases from chain) still contain lease-1. The gated
 	// pruner will remove it on the next sweep once the chain reports it as
 	// terminal and the backend no longer lists it (and no retention exists).
@@ -4671,7 +4671,7 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 //
 // lease-ret is an orphan (provisioned, absent from chain) that the backend
 // ALSO retains. After the fix, processOrphan no longer eager-deletes its
-// placement, so the gated pruner sees it: it is in backendLeases (here via
+// placement, so the gated pruner sees it: it is in backend inventory (here via
 // BOTH allProvisions and allRetentions, since the mock's Deprovision is a
 // no-op that does not remove the entry from m.provisions), so gate (b) keeps
 // it. Pre-fix, processOrphan deleted the placement before the pruner ran and
@@ -7730,7 +7730,7 @@ func TestReconciler_DoesNotPruneOnIncompleteRetentions(t *testing.T) {
 //   - (c) inflight-lease is in the in-flight tracker → kept
 //
 // active-lease is also kept, but by gate (b): it is provisioned on the backend,
-// so it lands in allProvisions → backendLeases and is kept before gate (d) is
+// so it lands in allProvisions → backend inventory and is kept before gate (d) is
 // ever evaluated. Gate (d) (chain-terminal) is NOT exercised by this test — it
 // is covered directly by TestCleanupOrphanedPlacements_GateD. active-lease is
 // included here only to confirm a healthy provisioned+ACTIVE lease survives.

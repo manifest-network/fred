@@ -140,13 +140,16 @@ func run(cmd *cobra.Command, args []string) error {
 	// every startup phase completes. Runtime components use a separate context so
 	// graceful shutdown can keep callback ingress alive while draining operations.
 	startupCtx, stopStartupSignals := signal.NotifyContext(
-		context.Background(), syscall.SIGINT, syscall.SIGTERM,
+		cmd.Context(), syscall.SIGINT, syscall.SIGTERM,
 	)
 	defer stopStartupSignals()
 
-	// Create the independently controlled runtime context.
-	ctx, cancel := context.WithCancel(context.Background())
+	// Callback settlement survives cancellation of startup and ordinary work.
+	// Cancel this context only after callback ingress has drained.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(cmd.Context()))
 	defer cancel()
+	workCtx, cancelWork := context.WithCancel(startupCtx)
+	defer cancelWork()
 
 	// Validate the local placement authority and exact backend storage topology
 	// before signer construction can derive keys or any startup path can query or
@@ -255,7 +258,7 @@ func run(cmd *cobra.Command, args []string) error {
 	authzQ := authz.NewQueryClient(chainClient.Conn())
 
 	if signerPool.HasSubSigners() {
-		setupCtx, setupCancel := context.WithTimeout(ctx, 60*time.Second)
+		setupCtx, setupCancel := context.WithTimeout(workCtx, 60*time.Second)
 		if err := chain.EnsureGrantsWithRetry(setupCtx, authzQ, chainClient, signerPool); err != nil {
 			if demoteOnGrantSetupError(err) {
 				// The queries succeeded and told us grants are missing, and we
@@ -281,7 +284,7 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	if signerPool.HasSubSigners() {
-		setupCtx, setupCancel := context.WithTimeout(ctx, 60*time.Second)
+		setupCtx, setupCancel := context.WithTimeout(workCtx, 60*time.Second)
 		bankQ := banktypes.NewQueryClient(chainClient.Conn())
 		if err := chain.EnsureFunding(setupCtx, bankQ, chainClient, signerPool, subSignerMinBalance, subSignerTopUpAmount); err != nil {
 			slog.Warn("initial sub-signer funding failed, sub-signers may be underfunded",
@@ -290,6 +293,11 @@ func run(cmd *cobra.Command, args []string) error {
 			)
 		}
 		setupCancel()
+	}
+
+	if workCtx.Err() != nil {
+		slog.Info("provider startup canceled")
+		return nil
 	}
 
 	// Register the per-signer balance collector. It samples each signer's
@@ -357,6 +365,7 @@ func run(cmd *cobra.Command, args []string) error {
 		PlacementStore:        placementStore,
 		LeaseEventSink:        eventBroker,
 		AckLaneCount:          signerPool.LaneCount(),
+		AckFlushTimeout:       cfg.TxTimeout,
 		CallbackProofConsumer: callbackProofConsumer,
 	}, backendRouter, chainClient)
 	if err != nil {
@@ -538,122 +547,120 @@ func run(cmd *cobra.Command, args []string) error {
 		return provisionMgr.Start(ctx)
 	})
 
-	// Wait for the provisioner runtime to be running before proceeding. Callback
-	// admission opens just before Watermill starts its chain/payload handlers.
-	select {
-	case <-provisionMgr.Running():
-		slog.Info("provision manager handlers ready")
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(10 * time.Second):
-		return fmt.Errorf("timeout waiting for provision manager to start")
-	}
+	// Every exit after the API starts joins the same shutdown path.
+	startupErr := func() error {
+		// Wait for the provisioner runtime to be running before proceeding. Callback
+		// admission opens just before Watermill starts its chain/payload handlers.
+		select {
+		case <-provisionMgr.Running():
+			slog.Info("provision manager handlers ready")
+		case <-workCtx.Done():
+			return workCtx.Err()
+		case <-time.After(10 * time.Second):
+			return fmt.Errorf("timeout waiting for provision manager to start")
+		}
 
-	// Durable maintenance claims were rehydrated during construction, before
-	// any public or reconciliation work became reachable. Resume their backend
-	// commands in the background so a down pinned node delays only its own lease.
-	safeGo(&wg, errChan, "maintenance recovery", func() error {
-		return maintenanceService.Start(ctx, cfg.ReconciliationInterval)
-	})
-
-	// Perform startup operations sequentially to avoid same-block transaction conflicts
-	// WithdrawOnce waits for block inclusion before returning, ensuring the next tx is in a different block
-	slog.Info("performing initial withdrawal")
-	if err := withdrawScheduler.WithdrawOnce(ctx); err != nil {
-		slog.Error("initial withdrawal failed", "error", err)
-		// Continue — periodic scheduler will retry
-	}
-
-	// Run startup reconciliation to recover from any crash
-	// This compares chain state vs backend state and fixes inconsistencies
-	// The API server is listening and callback application is admitted here.
-	slog.Info("performing startup reconciliation")
-	if err := reconciler.RunOnce(ctx); err != nil {
-		slog.Error("startup reconciliation failed", "error", err)
-		// Continue anyway - periodic reconciliation will retry
-	}
-
-	// Start event subscriber (single reader, multiple consumers via Subscribe())
-	safeGo(&wg, errChan, "event subscriber", func() error {
-		return eventSub.Start(ctx)
-	})
-
-	// Start event bridge (subscribes to eventSub, forwards to Watermill)
-	safeGo(&wg, errChan, "event bridge", func() error {
-		return eventBridge.Start(ctx)
-	})
-
-	// Start watcher for cross-provider events (subscribes to eventSub)
-	safeGo(&wg, errChan, "watcher", func() error {
-		return leaseWatcher.Start(ctx)
-	})
-
-	// Start withdrawal scheduler
-	safeGo(&wg, errChan, "scheduler", func() error {
-		return withdrawScheduler.Start(ctx)
-	})
-
-	// Start periodic reconciliation
-	safeGo(&wg, errChan, "reconciler", func() error {
-		return reconciler.Start(ctx)
-	})
-
-	// Start periodic sub-signer maintenance (if multi-signer). Both halves are
-	// level-triggered: EnsureGrants and EnsureFunding each compare the desired
-	// state against the chain and converge, so neither depends on the startup
-	// pass having succeeded. That is what makes a boot whose grant queries timed
-	// out recover on its own instead of staying degraded until someone restarts
-	// providerd (ENG-688).
-	if signerPool.HasSubSigners() {
-		bankQ := banktypes.NewQueryClient(chainClient.Conn())
-		safeGo(&wg, errChan, "sub-signer maintenance", func() error {
-			ticker := time.NewTicker(cfg.SubSignerFundCheckInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-ticker.C:
-					// Each half gets its own budget: a slow grant sweep must not
-					// eat the funding sweep's, or a chain that is merely sluggish
-					// would starve the top-ups.
-					grantCtx, grantCancel := context.WithTimeout(ctx, 60*time.Second)
-					// Plain EnsureGrants, not the retry wrapper: the loop is the retry.
-					outcome := metrics.OutcomeSuccess
-					if err := chain.EnsureGrants(grantCtx, authzQ, chainClient, signerPool); err != nil {
-						slog.Warn("sub-signer grant check failed", "error", err)
-						outcome = metrics.OutcomeError
-					}
-					metrics.SignerGrantCheckTotal.WithLabelValues(outcome).Inc()
-					grantCancel()
-
-					fundCtx, fundCancel := context.WithTimeout(ctx, 60*time.Second)
-					if err := chain.EnsureFunding(fundCtx, bankQ, chainClient, signerPool, subSignerMinBalance, subSignerTopUpAmount); err != nil {
-						slog.Warn("sub-signer funding check failed", "error", err)
-					}
-					fundCancel()
-				}
-			}
+		// Durable maintenance claims were rehydrated during construction, before
+		// any public or reconciliation work became reachable. Resume their backend
+		// commands in the background so a down pinned node delays only its own lease.
+		safeGo(&wg, errChan, "maintenance recovery", func() error {
+			return maintenanceService.Start(workCtx, cfg.ReconciliationInterval)
 		})
-	}
 
-	slog.Info("providerd started successfully",
-		"api_addr", cfg.APIListenAddr,
-		"withdraw_interval", cfg.WithdrawInterval,
-		"reconciliation_interval", cfg.ReconciliationInterval,
-		"rate_limit_rps", cfg.RateLimitRPS,
-		"rate_limit_burst", cfg.RateLimitBurst,
-		"tenant_rate_limit_rps", cfg.TenantRateLimitRPS,
-		"tenant_rate_limit_burst", cfg.TenantRateLimitBurst,
-		"backends", len(cfg.Backends),
-	)
+		// Keep the one-time chain writes sequential; cancellation ends the
+		// startup sequence and joins the callback-preserving shutdown below.
+		if err := runInitialProviderWork(workCtx, withdrawScheduler.WithdrawOnce, reconciler.RunOnce); err != nil {
+			return err
+		}
 
-	// Wait for shutdown signal or error
-	select {
-	case <-startupCtx.Done():
-		slog.Info("received shutdown signal")
-	case err := <-errChan:
-		slog.Error("component error", "error", err)
+		// Start event subscriber (single reader, multiple consumers via Subscribe())
+		safeGo(&wg, errChan, "event subscriber", func() error {
+			return eventSub.Start(workCtx)
+		})
+
+		// Start event bridge (subscribes to eventSub, forwards to Watermill)
+		safeGo(&wg, errChan, "event bridge", func() error {
+			return eventBridge.Start(workCtx)
+		})
+
+		// Start watcher for cross-provider events (subscribes to eventSub)
+		safeGo(&wg, errChan, "watcher", func() error {
+			return leaseWatcher.Start(workCtx)
+		})
+
+		// Start withdrawal scheduler
+		safeGo(&wg, errChan, "scheduler", func() error {
+			return withdrawScheduler.Start(workCtx)
+		})
+
+		// Start periodic reconciliation
+		safeGo(&wg, errChan, "reconciler", func() error {
+			return reconciler.Start(workCtx)
+		})
+
+		// Start periodic sub-signer maintenance (if multi-signer). Both halves are
+		// level-triggered: EnsureGrants and EnsureFunding each compare the desired
+		// state against the chain and converge, so neither depends on the startup
+		// pass having succeeded. That is what makes a boot whose grant queries timed
+		// out recover on its own instead of staying degraded until someone restarts
+		// providerd (ENG-688).
+		if signerPool.HasSubSigners() {
+			bankQ := banktypes.NewQueryClient(chainClient.Conn())
+			safeGo(&wg, errChan, "sub-signer maintenance", func() error {
+				ticker := time.NewTicker(cfg.SubSignerFundCheckInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-workCtx.Done():
+						return nil
+					case <-ticker.C:
+						// Each half gets its own budget: a slow grant sweep must not
+						// eat the funding sweep's, or a chain that is merely sluggish
+						// would starve the top-ups.
+						grantCtx, grantCancel := context.WithTimeout(workCtx, 60*time.Second)
+						// Plain EnsureGrants, not the retry wrapper: the loop is the retry.
+						outcome := metrics.OutcomeSuccess
+						if err := chain.EnsureGrants(grantCtx, authzQ, chainClient, signerPool); err != nil {
+							slog.Warn("sub-signer grant check failed", "error", err)
+							outcome = metrics.OutcomeError
+						}
+						metrics.SignerGrantCheckTotal.WithLabelValues(outcome).Inc()
+						grantCancel()
+
+						fundCtx, fundCancel := context.WithTimeout(workCtx, 60*time.Second)
+						if err := chain.EnsureFunding(fundCtx, bankQ, chainClient, signerPool, subSignerMinBalance, subSignerTopUpAmount); err != nil {
+							slog.Warn("sub-signer funding check failed", "error", err)
+						}
+						fundCancel()
+					}
+				}
+			})
+		}
+
+		slog.Info("providerd started successfully",
+			"api_addr", cfg.APIListenAddr,
+			"withdraw_interval", cfg.WithdrawInterval,
+			"reconciliation_interval", cfg.ReconciliationInterval,
+			"rate_limit_rps", cfg.RateLimitRPS,
+			"rate_limit_burst", cfg.RateLimitBurst,
+			"tenant_rate_limit_rps", cfg.TenantRateLimitRPS,
+			"tenant_rate_limit_burst", cfg.TenantRateLimitBurst,
+			"backends", len(cfg.Backends),
+		)
+
+		// Wait for shutdown signal or error
+		select {
+		case <-workCtx.Done():
+			slog.Info("received shutdown signal")
+		case err := <-errChan:
+			slog.Error("component error", "error", err)
+		}
+
+		return nil
+	}()
+	cancelWork()
+	if startupErr != nil && !errors.Is(startupErr, context.Canceled) {
+		slog.Error("provider startup failed", "error", startupErr)
 	}
 
 	// Graceful shutdown
@@ -688,12 +695,11 @@ func run(cmd *cobra.Command, args []string) error {
 	// Close event broker to send clean close frames to all WebSocket clients.
 	eventBroker.Close()
 
-	// Signal all components to stop via context cancellation.
-	// This triggers ctx.Done() in all component loops.
+	// Stop the callback settlement runtime after ingress has drained.
 	cancel()
 
 	// Stop withdrawal scheduler and wait for any in-flight withdrawal to complete.
-	// This ensures we don't interrupt a withdrawal transaction mid-flight.
+	// Its chain work was already canceled with the ordinary work context.
 	withdrawScheduler.Stop()
 
 	// Close event subscriber to unblock any components waiting on events.
@@ -738,5 +744,29 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	slog.Info("providerd stopped")
-	return nil
+	if errors.Is(startupErr, context.Canceled) {
+		return nil
+	}
+	return startupErr
+}
+
+// runInitialProviderWork owns the finite startup sequence. Transient errors are
+// retried by the periodic workers, but cancellation prevents the next phase.
+func runInitialProviderWork(ctx context.Context, withdraw, reconcile func(context.Context) error) error {
+	for _, step := range []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{"initial withdrawal", withdraw},
+		{"startup reconciliation", reconcile},
+	} {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		slog.Info("performing " + step.name)
+		if err := step.run(ctx); err != nil {
+			slog.Error(step.name+" failed", "error", err)
+		}
+	}
+	return ctx.Err()
 }

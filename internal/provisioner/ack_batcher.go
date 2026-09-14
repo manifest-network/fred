@@ -38,6 +38,10 @@ const (
 	// DefaultAckBatchSize is the maximum number of acks to batch before flushing.
 	// With authz sub-signers, each lane can handle a large batch per block.
 	DefaultAckBatchSize = 50
+
+	// DefaultAckFlushTimeout bounds one owner-controlled query/broadcast/fallback
+	// cycle. Individual callers may leave a shared batch without canceling peers.
+	DefaultAckFlushTimeout = 60 * time.Second
 )
 
 // AckBatcherConfig configures the acknowledgment batcher.
@@ -56,6 +60,10 @@ type AckBatcherConfig struct {
 	// LaneCount is the number of parallel lanes. Defaults to 1 (single signer).
 	// With N sub-signers, set to N.
 	LaneCount int
+
+	// FlushTimeout bounds the complete flush, including its initial chain query.
+	// Defaults to DefaultAckFlushTimeout.
+	FlushTimeout time.Duration
 }
 
 // errAckLaneUnavailable is returned by Acknowledge when the selected lane has
@@ -97,6 +105,7 @@ type ackLane struct {
 	providerUUID  string
 	batchInterval time.Duration
 	batchSize     int
+	flushTimeout  time.Duration
 	requests      chan ackRequest
 
 	// doneMu guards done, which is closed when the current batchLoop
@@ -166,6 +175,7 @@ func NewAckBatcher(chainClient ChainClient, cfg AckBatcherConfig) *AckBatcher {
 			providerUUID:  cfg.ProviderUUID,
 			batchInterval: interval,
 			batchSize:     size,
+			flushTimeout:  cmp.Or(max(cfg.FlushTimeout, 0), DefaultAckFlushTimeout),
 			requests:      make(chan ackRequest, size*2),
 			done:          make(chan struct{}),
 		}
@@ -367,10 +377,22 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 		if len(pending) == 0 {
 			return
 		}
+		ctx, cancel := context.WithTimeout(ctx, l.flushTimeout)
+		defer cancel()
 
 		slog.Debug("flushing ack batch", "lane", laneIdx, "count", len(pending))
 
 		chainPendingLeases, err := l.chainClient.GetPendingLeases(ctx, l.providerUUID)
+		if ctx.Err() != nil {
+			for _, req := range pending {
+				select {
+				case req.resultCh <- ackResult{err: ctx.Err()}:
+				default:
+				}
+			}
+			pending = pending[:0]
+			return
+		}
 
 		// nil map = query failed, attempt all; non-nil = filter by pending
 		var pendingOnChain map[string]struct{}

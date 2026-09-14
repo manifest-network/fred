@@ -1726,7 +1726,6 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		dbPath := t.TempDir() + "/tokens.db"
 		tokenTracker, err := NewTokenTracker(TokenTrackerConfig{
 			DBPath: dbPath,
-			MaxAge: 1 * time.Minute,
 		})
 		require.NoError(t, err)
 		defer tokenTracker.Close()
@@ -1800,7 +1799,6 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		dbPath := t.TempDir() + "/tokens.db"
 		tokenTracker, err := NewTokenTracker(TokenTrackerConfig{
 			DBPath: dbPath,
-			MaxAge: 1 * time.Minute,
 		})
 		require.NoError(t, err)
 		defer tokenTracker.Close()
@@ -2606,13 +2604,13 @@ func TestGetLeaseStatus(t *testing.T) {
 
 // mockTokenTracker implements a mock TokenTracker for testing.
 type mockTokenTracker struct {
-	tryUseFunc  func(signature string) error
+	tryUseFunc  func(claim TokenReplayClaim) error
 	healthyFunc func() error
 }
 
-func (m *mockTokenTracker) TryUse(signature string) error {
+func (m *mockTokenTracker) TryUse(claim TokenReplayClaim) error {
 	if m.tryUseFunc != nil {
-		return m.tryUseFunc(signature)
+		return m.tryUseFunc(claim)
 	}
 	return nil
 }
@@ -2679,7 +2677,7 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 	t.Run("database_error_returns_503", func(t *testing.T) {
 		// Create a mock token tracker that returns a database error
 		mockTracker := &mockTokenTracker{
-			tryUseFunc: func(signature string) error {
+			tryUseFunc: func(claim TokenReplayClaim) error {
 				return fmt.Errorf("bbolt: database not open")
 			},
 		}
@@ -2711,7 +2709,7 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 	t.Run("replay_detected_returns_401", func(t *testing.T) {
 		// Ensure replay detection still returns 401, not 503
 		mockTracker := &mockTokenTracker{
-			tryUseFunc: func(signature string) error {
+			tryUseFunc: func(claim TokenReplayClaim) error {
 				return ErrTokenAlreadyUsed
 			},
 		}
@@ -2743,7 +2741,7 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 	t.Run("success_returns_200", func(t *testing.T) {
 		// Ensure successful token use still works
 		mockTracker := &mockTokenTracker{
-			tryUseFunc: func(signature string) error {
+			tryUseFunc: func(claim TokenReplayClaim) error {
 				return nil // Success
 			},
 		}
@@ -2779,7 +2777,7 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 		for _, dbErr := range dbErrors {
 			t.Run(dbErr.Error(), func(t *testing.T) {
 				mockTracker := &mockTokenTracker{
-					tryUseFunc: func(signature string) error {
+					tryUseFunc: func(claim TokenReplayClaim) error {
 						return dbErr
 					},
 				}

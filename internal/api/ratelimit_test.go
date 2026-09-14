@@ -317,12 +317,12 @@ func TestRateLimiter_MaxVisitors(t *testing.T) {
 		rl.getVisitor(string(rune('a'+i%26)) + string(rune(i)))
 	}
 
-	assert.Equal(t, maxVisitors, rl.visitors.Len())
+	assert.Equal(t, maxVisitors, rl.visitors.entries.Len())
 
 	// Adding one more should trigger eviction (LRU handles this automatically)
 	rl.getVisitor("new-visitor")
 
-	assert.Equal(t, maxVisitors, rl.visitors.Len())
+	assert.Equal(t, maxVisitors, rl.visitors.entries.Len())
 }
 
 func TestRateLimiter_GetVisitorReturnsExisting(t *testing.T) {

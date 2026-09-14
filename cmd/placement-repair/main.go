@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/placementprobe"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
@@ -286,6 +287,16 @@ func runWithDependencies(
 	if err := requireCanonicalProviderUUID(cfg.ProviderUUID); err != nil {
 		return err
 	}
+	newRepairClients := func(resolver backend.BackendStorageIdentityResolver) ([]placementprobe.Client, error) {
+		return placementprobe.NewIdentityBoundClients(cfg, resolver)
+	}
+	if *apply {
+		fleet, err := placementprobe.NewAuthenticatedFleet(cfg)
+		if err != nil {
+			return err
+		}
+		newRepairClients = fleet.NewIdentityBoundClients
+	}
 	var boundBackupTarget *placement.ExactBackupTarget
 	if *apply {
 		boundBackupTarget, err = dependencies.bindExactBackupTarget(*backupPath)
@@ -405,7 +416,7 @@ func runWithDependencies(
 		if matchErr != nil {
 			return matchErr
 		}
-		clients, clientsErr := placementprobe.NewIdentityBoundClients(cfg, repair)
+		clients, clientsErr := newRepairClients(repair)
 		if clientsErr != nil {
 			return clientsErr
 		}
@@ -552,7 +563,7 @@ func runWithDependencies(
 		}
 	}
 
-	clients, err := placementprobe.NewIdentityBoundClients(cfg, repair)
+	clients, err := newRepairClients(repair)
 	if err != nil {
 		return err
 	}

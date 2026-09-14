@@ -25,6 +25,25 @@ project accessor. Both executors accept only values from their own admitter.
 The retained SDK views expose neither raw `ContainerCreate` nor generic Compose
 `Up`; the constructors capture those methods inside the typed executors.
 
+Image admission also bounds metadata before it can authorize an inspection
+helper or workload. The direct SDK transport caps each image-inspection response
+at 2 MiB before JSON decoding. An image may declare at most 16 `VOLUME` targets
+(4,096 bytes per path, 16 KiB combined) and 128 labels (64 KiB of combined keys
+and values). Targets must be canonical absolute paths, cannot overlap each other,
+and cannot mask `/`, `/tmp`, `/run`, the `/proc`, `/sys`, `/dev` trees, or Fred's
+reserved `/_wp` tree. Tenant tmpfs targets cannot overlap image volumes.
+
+Preparation admits the complete lease before running its first image helper.
+Its mount budget accounts for instance quantities, with a maximum of 16,384
+mounts and 32 MiB of target-path bytes across the lease. Read-only-rootfs plans
+reserve the two fixed tmpfs mounts and the worst case of four detected writable
+paths per instance before discovery. Frozen maintenance-source plans pass the
+same aggregate budget using their captured mount configuration before a target
+can be replaced. These are explicit compatibility limits: images or old captured
+layouts exceeding them are refused, including on restore or maintenance replay.
+Repository fixtures cover ordinary single-volume and volume-free images; this
+does not constitute an inventory of every deployed image.
+
 Lifecycle workflows own sequencing and compensation. Docker adapters report
 whether an issued request completed; the identity-bound journal owns permission
 to advance or retry that exact attempt. Diagnostics are observations tied to
@@ -47,6 +66,10 @@ disables environment HTTP proxies (`HTTP_PROXY`, `HTTPS_PROXY` and their
 lowercase equivalents): a gateway-generated error cannot prove that Docker
 finished an issued request. Do not put a response-generating intermediary in
 front of `docker_host`.
+With `production_mode: true`, `docker_host` must be a canonical absolute local
+Unix socket URL, such as `unix:///var/run/docker.sock` or a rootless daemon's
+`unix:///run/user/1000/docker.sock`. Remote TCP/HTTP Docker endpoints are limited
+to development mode; the backend does not supply a remote Docker TLS policy.
 
 ## Configuration Reference
 
@@ -58,12 +81,19 @@ All fields are set in the backend's YAML config block. Defaults come from `Defau
 |---|---|---|---|---|
 | Name | `name` | string | `"docker"` | Backend identifier |
 | ListenAddr | `listen_addr` | string | `":9001"` | HTTP server listen address |
-| DockerHost | `docker_host` | string | `"unix:///var/run/docker.sock"` | Docker daemon socket path or URL |
+| DockerHost | `docker_host` | string | `"unix:///var/run/docker.sock"` | Docker daemon socket path or URL; production requires a canonical absolute local Unix socket URL |
 | HostAddress | `host_address` | string | *(required)* | External IP/hostname for port mappings. Must be a valid IP or hostname, not a URL |
 | HostBindIP | `host_bind_ip` | string | `"0.0.0.0"` | IP address to bind container ports to |
 | LogLevel | `log_level` | string | `"info"` | Log verbosity: `debug`, `info`, `warn`, `error`. Not set in `DefaultConfig()`; defaults to `"info"` at startup via `cmp.Or` |
-| ProductionMode | `production_mode` | bool | `false` | Tightens startup checks beyond basic validation. When true, `Validate` rejects dev-only insecure toggles — currently `callback_insecure_skip_verify`. Mirrors providerd's `production_mode` |
+| ProductionMode | `production_mode` | bool | `false` | Requires a local Unix Docker socket and rejects `callback_insecure_skip_verify`. Mirrors providerd's `production_mode` |
 | MaxRequestBodySize | `max_request_body_size` | int64 | `2097152` (2 MiB) | Caps inbound HTTP request body size (bytes). Falls back to `DefaultMaxRequestBodySize` (2 MiB) when unset or non-positive. Also settable via env `DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE` (ENG-448) |
+
+Deployment logging follows the host's Docker and systemd/journald configuration;
+retention and storage capacity are owned by Ops. Fred preserves that behavior
+and does not change the daemon's logging driver or attest live host log budgets.
+SKU volume quotas and API log-response limits do not bound daemon log storage.
+Other deployments using `json-file` without rotation need their own host logging
+policy; that configuration differs from the deployed systemd-managed setup.
 
 ### TLS & mTLS (ENG-103)
 

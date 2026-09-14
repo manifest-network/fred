@@ -27,6 +27,8 @@ func TestDevInitDockerConfigTemplateIsValid(t *testing.T) {
 	callbackSecretJSON, err := json.Marshal(callbackSecret)
 	require.NoError(t, err)
 	values := map[string]string{
+		"CERT_FILE_JSON":                  `"/work/fred/cert.pem"`,
+		"KEY_FILE_JSON":                   `"/work/fred/key.pem"`,
 		"CALLBACK_DB_PATH_JSON":           `"/work/fred/callbacks.db"`,
 		"CALLBACK_SECRET_JSON":            string(callbackSecretJSON),
 		"DIAGNOSTICS_DB_PATH_JSON":        `"/work/fred/diagnostics.db"`,
@@ -55,6 +57,8 @@ func TestDevInitDockerConfigTemplateIsValid(t *testing.T) {
 	cfg, err := loadConfig(configPath)
 	require.NoError(t, err)
 	require.NoError(t, cfg.Validate(), "dev-init must generate a config accepted by docker-backend")
+	require.Equal(t, "/work/fred/cert.pem", cfg.TLSCertFile)
+	require.Equal(t, "/work/fred/key.pem", cfg.TLSKeyFile)
 	require.Equal(t, "/", cfg.VolumeMountPath)
 	require.Equal(t, "/work/fred/callbacks.db", cfg.CallbackDBPath)
 	require.Equal(t, "/work/fred/releases.db", cfg.ReleasesDBPath)

@@ -70,6 +70,20 @@ func TestConfig_Validate(t *testing.T) {
 }
 
 func TestConfig_Validate_ProductionMode(t *testing.T) {
+	for _, host := range []string{"tcp://daemon:2375", "tcp://127.0.0.1:2375", "https://daemon:2376", "unix://remote/socket", "unix:relative", "unix:///run/../run/docker.sock", "unix:///run/docker.sock?host=other", "unix:///run/docker.sock#other"} {
+		t.Run("rejects daemon transport "+host, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.ProductionMode = true
+			cfg.DockerHost = host
+			require.ErrorContains(t, cfg.Validate(), "local Unix socket")
+		})
+	}
+	t.Run("rootless Unix socket remains supported", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.ProductionMode = true
+		cfg.DockerHost = "unix:///run/user/1000/docker.sock"
+		require.NoError(t, cfg.Validate())
+	})
 	t.Run("rejects callback_insecure_skip_verify", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.ProductionMode = true

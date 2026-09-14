@@ -57,6 +57,8 @@ listen_addr: ":9001"
 # (hot-reload is tracked in ENG-294).
 
 # Docker daemon socket or URL
+# Production mode requires a canonical absolute local Unix socket URL.
+# Remote TCP/HTTP Docker endpoints are supported only in development mode.
 docker_host: "unix:///var/run/docker.sock"
 
 # =============================================================================
@@ -171,7 +173,8 @@ callback_secret: ""
 
 # Production mode: tighten startup checks. When true, the backend refuses to
 # start if any dev-only insecure toggle is set (currently
-# callback_insecure_skip_verify below). Mirrors providerd's production_mode.
+# callback_insecure_skip_verify below), and requires a local Unix Docker socket.
+# Mirrors providerd's production_mode.
 # Default: false
 # production_mode: true
 

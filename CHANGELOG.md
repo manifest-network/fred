@@ -204,6 +204,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Load testing distinguishes authenticated fixture traffic from deliberate
+  rejection traffic. Real tenant signatures use ADR-036/secp256k1, connection
+  requests respect the token replay window, and callbacks replay supplied exact
+  operation/lifecycle evidence. The tool no longer presents fabricated tokens
+  or callbacks as successful lifecycle traffic. (ENG-632)
+- Provider, Docker and K3s configuration loading rejects unknown keys and
+  trailing YAML documents. Public manifest schema limits now match runtime
+  validation, including image-default `user: ""` behavior. (ENG-632)
+- `tx_timeout` now bounds a complete chain write, including signer acquisition,
+  account lookup, simulation, all sub-batches and retries, inclusion, and
+  withdrawal response lookup. Acknowledgment flushes use the same configured
+  budget while preserving results already committed by earlier sub-batches.
+  (ENG-632)
+- Release publication requires the tagged commit to be in `main` history and
+  reruns CI and integration for that tag. Pull requests validate release
+  configuration and build a non-publishing snapshot. CI reports statement
+  coverage and enforces a 76% regression floor. Repository release-tag and
+  publication permissions remain a separate administrative requirement.
+  (ENG-951)
 - Deployment documentation now identifies native systemd with XFS project quotas
   as the supported stateful production setup; the local Docker backend image is
   documented for stateless development only.
@@ -738,6 +757,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Chain writers share a cancellable per-signer permit, including provider-key
+  writes and single-signer fallback. Event fan-out and channel closure now share
+  one lock instead of racing a shutdown counter or recovering send panics.
+  Startup and ordinary workers observe shutdown cancellation while authenticated
+  callbacks retain their existing drain period. (ENG-632)
+- IP and tenant rate limiting share atomic bucket creation, preventing
+  simultaneous first requests from obtaining independent bursts. (ENG-632)
+- Prerelease image builds omit release-only aliases instead of rendering empty
+  container tags. Maintenance API, HMAC and backend smoke-test documentation now
+  reflects the implemented contracts. (ENG-632)
 - Managed-volume namespace mutations and waiting launches close directory probes
   before physical-reservation waits. Launches reopen exact roots only after
   acquiring exclusion and close them before unlocking; XFS deletion can therefore
@@ -1198,6 +1227,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- Offline placement preparation, fresh initialization and repair application
+  require a frozen fleet policy with certificate-verified backend HTTPS,
+  independently of `production_mode`. Request HMAC alone cannot authenticate
+  replies used as mutation evidence. Local development generation and the
+  optional mock-backend HTTPS listener preserve fresh bootstrap with an explicit
+  certificate trust anchor; read-only inspection remains observational.
+  (ENG-632)
+- Backend refusals require a complete, exact JSON error envelope of at most
+  4096 bytes. Oversized, duplicate, aliased, unknown or trailing fields cannot
+  settle a durable attempt as refused. Each complete backend inventory is also
+  bounded to 100,000 entries, 128 MiB of cumulative response bytes and one
+  configured backend timeout for the entire walk; exceeding a budget returns
+  no partial inventory or storage identity. (ENG-632)
+- Replay tracking consumes an opaque, cryptographically validated claim whose
+  expiry derives from the signed timestamp. Future-dated tokens remain consumed
+  throughout their accepted lifetime, including after restart; one atomic bbolt
+  transaction replaces ineffective database retries. (ENG-632)
+- Docker production configuration requires a canonical local Unix socket.
+  Image inspection is bounded before SDK decoding, metadata admission caps
+  labels and declared volumes, and a shared lease mount budget accounts for
+  quantity before helper creation or frozen compensation effects. Existing
+  deployment logging remains systemd/journald with retention owned by Ops.
+  (ENG-949)
+- Update the supported Go toolchain to 1.26.8 and `golang.org/x/crypto` to
+  v0.57.0, with required transitive updates. Zoned IPv6 URLs can no longer bypass
+  link-local address rejection. Existing documented vulnerability exceptions
+  still require their upstream fixes. (ENG-632)
 - Runtime, placement preflight, and placement repair now construct backend
   clients from the same validated connection policy. System-root HTTPS requires
   TLS 1.3 just like custom-CA HTTPS, and downstream client options cannot replace

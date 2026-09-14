@@ -23,6 +23,7 @@ import (
 	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/maintenanceid"
+	"github.com/manifest-network/fred/internal/strictjson"
 	"github.com/manifest-network/fred/internal/util"
 	"github.com/manifest-network/fred/internal/uuidv4"
 )
@@ -1209,6 +1210,14 @@ const (
 // real fleet.
 const maxListPages = 100_000
 
+// Inventory safety budgets apply to each complete endpoint walk, independently
+// of backend page size. Exceeding either fails the whole observation; callers
+// must never interpret a truncated inventory as evidence of absence.
+const (
+	MaxInventoryItems       = 100_000
+	MaxInventoryBytes int64 = 128 << 20
+)
+
 // HTTPClientOptions tunes resource limits, circuit breaking, and telemetry.
 // Connection authority is supplied separately as an opaque ConnectionPolicy.
 type HTTPClientOptions struct {
@@ -1590,12 +1599,14 @@ func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error)
 	}
 }
 
-// readErrorBodyBytes reads up to 4 KiB from an HTTP response body for
-// inclusion in error messages. A bounded remainder is drained for connection
-// reuse without trusting the backend to terminate the stream. If reading
-// fails, a placeholder message is returned.
+const maxBackendErrorBytes = 4 << 10
+
+// readErrorBodyBytes preserves one overflow byte so an oversized stream cannot
+// become a valid refusal after truncation. The common envelope decoder rejects
+// overflow before interpreting any field. A bounded remainder is drained for
+// connection reuse; a read failure remains an unparseable diagnostic.
 func readErrorBodyBytes(resp *http.Response) []byte {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBackendErrorBytes+1))
 	drainResponseBody(resp.Body)
 	if err != nil {
 		return []byte(fmt.Sprintf("<body read error: %v>", err))
@@ -1612,19 +1623,26 @@ func readErrorBody(resp *http.Response) string {
 // Returns ErrResponseTooLarge if the body exceeds limit. A bounded remainder
 // is drained for connection reuse without trusting the backend to reach EOF.
 func decodeJSONLimited(r io.ReadCloser, limit int64, dst any) error {
+	_, err := decodeJSONMeasured(r, limit, dst)
+	return err
+}
+
+// decodeJSONMeasured retains the complete wire size, including JSON whitespace,
+// so pagination cannot discard each page's contribution to the total budget.
+func decodeJSONMeasured(r io.ReadCloser, limit int64, dst any) (int64, error) {
 	lr := io.LimitReader(r, limit+1)
 	body, err := io.ReadAll(lr)
 	drainResponseBody(r)
 	if err != nil {
-		return fmt.Errorf("read response body: %w", err)
+		return 0, fmt.Errorf("read response body: %w", err)
 	}
 	if int64(len(body)) > limit {
-		return fmt.Errorf("%w: %d bytes exceeds %d byte limit", ErrResponseTooLarge, len(body), limit)
+		return 0, fmt.Errorf("%w: %d bytes exceeds %d byte limit", ErrResponseTooLarge, len(body), limit)
 	}
 	if err := json.Unmarshal(body, dst); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+		return 0, fmt.Errorf("decode response: %w", err)
 	}
-	return nil
+	return int64(len(body)), nil
 }
 
 // parseValidationError parses a 400 response body and returns an error
@@ -1640,15 +1658,9 @@ func decodeJSONLimited(r io.ReadCloser, limit int64, dst any) error {
 // wrote it, and bytes fred could not parse carry no such duty. The unparsed
 // body is recorded on the operator channel by noteMalformedErrorBody.
 func (c *HTTPClient) parseValidationError(body []byte, operation string) error {
-	var resp struct {
-		Error          string         `json:"error"`
-		ValidationCode ValidationCode `json:"validation_code"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		// Unparseable: fred cannot even tell whether the BACKEND produced this
-		// 400. An intermediary emitting its own (oversized header, h2 quirk,
-		// WAF rule) is exactly the case that must not be filed as permanent.
-		return c.noteMalformedErrorBody(body, operation, "body is not the JSON error envelope")
+	resp, err := c.decodeErrorEnvelope(body, operation)
+	if err != nil {
+		return err
 	}
 	if resp.Error == "" {
 		// Parsing is NOT the test — carrying the required field is.
@@ -1703,20 +1715,34 @@ func (c *HTTPClient) parseValidationError(body []byte, operation string) error {
 // msg is returned only when it came out of the envelope's declared "error"
 // field; the raw bytes never leave this function.
 func (c *HTTPClient) parseErrorCode(body []byte, operation string) (code, msg string, err error) {
-	if len(bytes.TrimSpace(body)) == 0 {
-		return "", "", nil // bare status: the one documented no-body case
-	}
-	var resp struct {
-		Error string `json:"error"`
-		Code  string `json:"code"`
-	}
-	if jsonErr := json.Unmarshal(body, &resp); jsonErr != nil {
-		return "", "", c.noteMalformedErrorBody(body, operation, "body is not the JSON error envelope")
-	}
-	if resp.Error == "" {
-		return "", "", c.noteMalformedErrorBody(body, operation, `envelope is missing the required "error" field`)
+	resp, err := c.decodeErrorEnvelope(body, operation)
+	if err != nil {
+		return "", "", err
 	}
 	return resp.Code, resp.Error, nil
+}
+
+// backendErrorEnvelope is decoded once at the transport boundary. Only an
+// exact, bounded envelope may select a refusal classification; an actually
+// empty body retains the documented bare-status compatibility.
+type backendErrorEnvelope struct {
+	Error          string         `json:"error"`
+	Code           string         `json:"code,omitempty"`
+	ValidationCode ValidationCode `json:"validation_code,omitempty"`
+}
+
+func (c *HTTPClient) decodeErrorEnvelope(body []byte, operation string) (backendErrorEnvelope, error) {
+	if len(body) == 0 {
+		return backendErrorEnvelope{}, nil
+	}
+	var envelope backendErrorEnvelope
+	if err := strictjson.DecodeObject(body, maxBackendErrorBytes, &envelope); err != nil {
+		return backendErrorEnvelope{}, c.noteMalformedErrorBody(body, operation, "body is not one bounded, exact JSON error envelope")
+	}
+	if envelope.Error == "" {
+		return backendErrorEnvelope{}, c.noteMalformedErrorBody(body, operation, `envelope is missing the required "error" field`)
+	}
+	return envelope, nil
 }
 
 // parseCapacityError distinguishes a contract-conforming refusal from an
@@ -1983,38 +2009,65 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 	return cbErr
 }
 
-// walkKeysetPages drives a complete-or-error keyset walk over a paginated
-// backend list endpoint, reassembling every page into one slice. fetchPage
-// returns one page's items and the next continue token ("" once the set is
-// exhausted). Shared by ListProvisions and ListRetentions so their fail-closed
-// defenses — the maxListPages backstop, the strict-increase continue-token
-// guard, inter-page ctx cancellation, and the non-nil accumulator — live in one
-// place and cannot drift between the two endpoints. op names the operation for
-// error messages (e.g. "list provisions").
-func walkKeysetPages[T any](ctx context.Context, op string, fetchPage func(ctx context.Context, continueToken string) (items []T, next string, err error)) ([]T, error) {
-	acc := []T{} // non-nil so an empty backend returns [] (not nil)
+// inventoryPage carries the actual decoded response size alongside its data.
+// Only the bounded HTTP decoder constructs pages used by production walks.
+type inventoryPage[T any] struct {
+	items     []T
+	next      string
+	identity  backendidentity.ID
+	bodyBytes int64
+}
+
+// walkKeysetPages owns completeness, storage identity and resource budgets for
+// both inventory endpoints. The configured request timeout bounds the whole
+// walk, so successful slow pages cannot indefinitely stall fleet reconciliation.
+// No prefix or identity escapes a failed walk.
+func walkKeysetPages[T any](ctx context.Context, op string, requireIdentity bool, timeout time.Duration, fetchPage func(context.Context, string) (inventoryPage[T], error)) ([]T, backendidentity.ID, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	acc := []T{}
+	var observed backendidentity.ID
+	var totalBytes int64
 	cont := ""
 	for page := 0; ; page++ {
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("%s: %w", op, err) // responsive inter-page cancellation
+			return nil, backendidentity.ID{}, fmt.Errorf("%s: %w", op, err)
 		}
 		if page >= maxListPages {
-			return nil, fmt.Errorf("%s: exceeded %d pages (last continue=%q); backend not converging", op, maxListPages, cont)
+			return nil, backendidentity.ID{}, fmt.Errorf("%s: exceeded %d pages; backend not converging", op, maxListPages)
 		}
-		items, next, err := fetchPage(ctx, cont)
+		current, err := fetchPage(ctx, cont)
 		if err != nil {
-			return nil, err
+			return nil, backendidentity.ID{}, err
 		}
-		acc = append(acc, items...)
-		if next == "" {
-			break // exhausted — the complete set
+		if err := ctx.Err(); err != nil {
+			return nil, backendidentity.ID{}, fmt.Errorf("%s: %w", op, err)
 		}
-		if next <= cont {
-			return nil, fmt.Errorf("%s: backend returned non-advancing continue token %q (sent %q)", op, next, cont)
+		if current.items == nil {
+			return nil, backendidentity.ID{}, fmt.Errorf("%s response must contain a non-null %s array", op, strings.TrimPrefix(op, "list "))
 		}
-		cont = next
+		if current.bodyBytes <= 0 || current.bodyBytes > MaxInventoryBytes-totalBytes || len(current.items) > MaxInventoryItems-len(acc) {
+			return nil, backendidentity.ID{}, fmt.Errorf("%s: %w: complete inventory exceeds %d items or %d response bytes", op, ErrResponseTooLarge, MaxInventoryItems, MaxInventoryBytes)
+		}
+		if requireIdentity && !current.identity.Valid() {
+			return nil, backendidentity.ID{}, ErrBackendStorageIdentityMissing
+		}
+		if current.identity.Valid() {
+			if observed.Valid() && observed != current.identity {
+				return nil, backendidentity.ID{}, fmt.Errorf("%w: %s pages changed from %s to %s", ErrBackendStorageIdentityMismatch, op, observed, current.identity)
+			}
+			observed = current.identity
+		}
+		if current.next != "" && current.next <= cont {
+			return nil, backendidentity.ID{}, fmt.Errorf("%s: backend returned non-advancing continue token %q (sent %q)", op, current.next, cont)
+		}
+		totalBytes += current.bodyBytes
+		acc = append(acc, current.items...)
+		if current.next == "" {
+			return acc, observed, nil
+		}
+		cont = current.next
 	}
-	return acc, nil
 }
 
 // ListProvisions returns all provisioned resources from this backend. It walks
@@ -2041,24 +2094,8 @@ func (c *HTTPClient) listProvisionsWithIdentity(
 	start := time.Now()
 	defer func() { c.recordMetrics("list_provisions", start, err) }()
 
-	provisions, err := walkKeysetPages(ctx, "list provisions", func(ctx context.Context, cont string) ([]ProvisionInfo, string, error) {
-		resp, pageID, ferr := c.fetchProvisionsPage(ctx, cont, requireIdentity)
-		if ferr != nil {
-			return nil, "", ferr
-		}
-		if pageID.Valid() {
-			if observed.Valid() && observed != pageID {
-				return nil, "", fmt.Errorf(
-					"%w: provisions pages changed from %s to %s",
-					ErrBackendStorageIdentityMismatch, observed, pageID,
-				)
-			}
-			observed = pageID
-		}
-		if resp.Provisions == nil {
-			return nil, "", errors.New("list provisions response must contain a non-null provisions array")
-		}
-		return resp.Provisions, resp.Continue, nil
+	provisions, observed, err := walkKeysetPages(ctx, "list provisions", requireIdentity, c.httpClient.Timeout, func(ctx context.Context, cont string) (inventoryPage[ProvisionInfo], error) {
+		return c.fetchProvisionsPage(ctx, cont, requireIdentity)
 	})
 	if err != nil {
 		return nil, backendidentity.ID{}, err
@@ -2068,15 +2105,7 @@ func (c *HTTPClient) listProvisionsWithIdentity(
 	}); err != nil {
 		return nil, backendidentity.ID{}, err
 	}
-	if requireIdentity && !observed.Valid() {
-		return nil, backendidentity.ID{}, ErrBackendStorageIdentityMissing
-	}
 	return provisions, observed, nil
-}
-
-type provisionInventoryPage struct {
-	response ListProvisionsResponse
-	identity backendidentity.ID
 }
 
 // fetchProvisionsPage fetches one keyset page. continueToken == "" requests the
@@ -2085,7 +2114,7 @@ func (c *HTTPClient) fetchProvisionsPage(
 	ctx context.Context,
 	continueToken string,
 	requireIdentity bool,
-) (ListProvisionsResponse, backendidentity.ID, error) {
+) (inventoryPage[ProvisionInfo], error) {
 	q := url.Values{}
 	q.Set("limit", strconv.Itoa(c.provisionsPageLimit))
 	if continueToken != "" {
@@ -2120,23 +2149,24 @@ func (c *HTTPClient) fetchProvisionsPage(
 		}
 
 		var provResult ListProvisionsResponse
-		if err := decodeJSONLimited(resp.Body, c.maxProvisionsBytes, &provResult); err != nil {
+		bodyBytes, err := decodeJSONMeasured(resp.Body, c.maxProvisionsBytes, &provResult)
+		if err != nil {
 			return nil, fmt.Errorf("decode provisions response: %w", err)
 		}
-		return provisionInventoryPage{response: provResult, identity: storageID}, nil
+		return inventoryPage[ProvisionInfo]{items: provResult.Provisions, next: provResult.Continue, identity: storageID, bodyBytes: bodyBytes}, nil
 	})
 
 	if isCircuitBreakerError(cbErr) {
-		return ListProvisionsResponse{}, backendidentity.ID{}, ErrCircuitOpen
+		return inventoryPage[ProvisionInfo]{}, ErrCircuitOpen
 	}
 	if cbErr != nil {
-		return ListProvisionsResponse{}, backendidentity.ID{}, cbErr
+		return inventoryPage[ProvisionInfo]{}, cbErr
 	}
-	page, ok := result.(provisionInventoryPage)
+	page, ok := result.(inventoryPage[ProvisionInfo])
 	if !ok {
-		return ListProvisionsResponse{}, backendidentity.ID{}, fmt.Errorf("list provisions: unexpected result type %T", result)
+		return inventoryPage[ProvisionInfo]{}, fmt.Errorf("list provisions: unexpected result type %T", result)
 	}
-	return page.response, page.identity, nil
+	return page, nil
 }
 
 // GetProvision retrieves status information for a single provision.
@@ -2547,24 +2577,8 @@ func (c *HTTPClient) listRetentionsWithIdentity(
 	start := time.Now()
 	defer func() { c.recordMetrics("list_retentions", start, err) }()
 
-	retentions, err := walkKeysetPages(ctx, "list retentions", func(ctx context.Context, cont string) ([]RetainedLease, string, error) {
-		resp, pageID, ferr := c.fetchRetentionsPage(ctx, cont, requireIdentity)
-		if ferr != nil {
-			return nil, "", ferr
-		}
-		if pageID.Valid() {
-			if observed.Valid() && observed != pageID {
-				return nil, "", fmt.Errorf(
-					"%w: retention pages changed from %s to %s",
-					ErrBackendStorageIdentityMismatch, observed, pageID,
-				)
-			}
-			observed = pageID
-		}
-		if resp.Retentions == nil {
-			return nil, "", errors.New("list retentions response must contain a non-null retentions array")
-		}
-		return resp.Retentions, resp.Continue, nil
+	retentions, observed, err := walkKeysetPages(ctx, "list retentions", requireIdentity, c.httpClient.Timeout, func(ctx context.Context, cont string) (inventoryPage[RetainedLease], error) {
+		return c.fetchRetentionsPage(ctx, cont, requireIdentity)
 	})
 	if err != nil {
 		return nil, backendidentity.ID{}, err
@@ -2574,15 +2588,7 @@ func (c *HTTPClient) listRetentionsWithIdentity(
 	}); err != nil {
 		return nil, backendidentity.ID{}, err
 	}
-	if requireIdentity && !observed.Valid() {
-		return nil, backendidentity.ID{}, ErrBackendStorageIdentityMissing
-	}
 	return retentions, observed, nil
-}
-
-type retentionInventoryPage struct {
-	response ListRetentionsResponse
-	identity backendidentity.ID
 }
 
 // validateInventoryLeaseUUIDs validates the fully reassembled endpoint rather
@@ -2617,7 +2623,7 @@ func (c *HTTPClient) fetchRetentionsPage(
 	ctx context.Context,
 	continueToken string,
 	requireIdentity bool,
-) (ListRetentionsResponse, backendidentity.ID, error) {
+) (inventoryPage[RetainedLease], error) {
 	q := url.Values{}
 	q.Set("limit", strconv.Itoa(c.retentionsPageLimit))
 	if continueToken != "" {
@@ -2652,23 +2658,24 @@ func (c *HTTPClient) fetchRetentionsPage(
 		}
 
 		var retResult ListRetentionsResponse
-		if err := decodeJSONLimited(resp.Body, c.maxRetentionsBytes, &retResult); err != nil {
+		bodyBytes, err := decodeJSONMeasured(resp.Body, c.maxRetentionsBytes, &retResult)
+		if err != nil {
 			return nil, fmt.Errorf("decode retentions response: %w", err)
 		}
-		return retentionInventoryPage{response: retResult, identity: storageID}, nil
+		return inventoryPage[RetainedLease]{items: retResult.Retentions, next: retResult.Continue, identity: storageID, bodyBytes: bodyBytes}, nil
 	})
 
 	if isCircuitBreakerError(cbErr) {
-		return ListRetentionsResponse{}, backendidentity.ID{}, ErrCircuitOpen
+		return inventoryPage[RetainedLease]{}, ErrCircuitOpen
 	}
 	if cbErr != nil {
-		return ListRetentionsResponse{}, backendidentity.ID{}, cbErr
+		return inventoryPage[RetainedLease]{}, cbErr
 	}
-	page, ok := result.(retentionInventoryPage)
+	page, ok := result.(inventoryPage[RetainedLease])
 	if !ok {
-		return ListRetentionsResponse{}, backendidentity.ID{}, fmt.Errorf("list retentions: unexpected result type %T", result)
+		return inventoryPage[RetainedLease]{}, fmt.Errorf("list retentions: unexpected result type %T", result)
 	}
-	return page.response, page.identity, nil
+	return page, nil
 }
 
 // Health checks if the backend is reachable and healthy.

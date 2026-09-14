@@ -5,19 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"maps"
 	"slices"
 
 	"github.com/containerd/platforms"
-
 	"github.com/distribution/reference"
 	dockerimage "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // Source is the image-store capability captured by an Admitter. It cannot
@@ -146,10 +142,9 @@ func (a *Admitter) inspect(ctx context.Context, imageReference string, platform 
 	if err != nil || parsed.Algorithm() != digest.SHA256 {
 		return inspectedImage{}, fmt.Errorf("image inspection returned an invalid immutable image ID %q", response.ID)
 	}
-	for _, key := range slices.Sorted(maps.Keys(response.Config.Labels)) {
-		if manifest.IsReservedLabelKey(key) {
-			return inspectedImage{}, fmt.Errorf("image contains reserved label %q", key)
-		}
+	metadata, err := admitImageMetadata(response.Config.Labels, response.Config.Volumes)
+	if err != nil {
+		return inspectedImage{}, err
 	}
 	// Classic stores return a config ID without a descriptor; multi-platform
 	// stores include their target descriptor. Runtime construction rules out
@@ -167,7 +162,7 @@ func (a *Admitter) inspect(ctx context.Context, imageReference string, platform 
 		id: response.ID, descriptor: response.Descriptor, repoDigests: slices.Clone(response.RepoDigests),
 		platform: ocispec.Platform{OS: response.Os, Architecture: response.Architecture,
 			Variant: response.Variant, OSVersion: response.OsVersion},
-		user: response.Config.User, volumes: slices.Sorted(maps.Keys(response.Config.Volumes)),
+		user: response.Config.User, volumes: metadata.volumes,
 	}, nil
 }
 

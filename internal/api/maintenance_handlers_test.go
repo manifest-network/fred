@@ -112,7 +112,7 @@ func TestMaintenanceHandlersValidateIdempotencyKeyBeforeConsumingBearerToken(t *
 	leaseUUID := testutil.ValidUUID1
 	trackerCalls := 0
 	handlers := NewHandlers(HandlersConfig{
-		TokenTracker: &mockTokenTracker{tryUseFunc: func(string) error {
+		TokenTracker: &mockTokenTracker{tryUseFunc: func(TokenReplayClaim) error {
 			trackerCalls++
 			return nil
 		}},

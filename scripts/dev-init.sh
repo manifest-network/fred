@@ -30,7 +30,7 @@ PWR_DENOM="${PWR_DENOM:-factory/manifest1afk9zr2hn2jsac63h4hm60vl9z3e5u69gndzf7c
 API_URL="${API_URL:-https://localhost:8080}"
 CALLBACK_BASE_URL="${CALLBACK_BASE_URL:-https://localhost:8080}"
 DOCKER_BACKEND_LISTEN_ADDR="${DOCKER_BACKEND_LISTEN_ADDR:-:9001}"
-DOCKER_BACKEND_URL="${DOCKER_BACKEND_URL:-http://localhost:9001}"
+DOCKER_BACKEND_URL="${DOCKER_BACKEND_URL:-https://localhost:9001}"
 CALLBACK_SECRET="${CALLBACK_SECRET:-}"  # random default resolved after helpers (needs openssl)
 
 # Physical repo root (script lives in scripts/). Fresh placement confirmation
@@ -58,7 +58,8 @@ VOLUME_DATA_PATH="${VOLUME_DATA_PATH:-$HOME/fred-volumes}"
 # directory. docker-backend verifies this mount remains present at runtime.
 VOLUME_MOUNT_PATH="${VOLUME_MOUNT_PATH:-}"
 
-# TLS cert/key paths used by providerd. The script generates a self-signed
+# TLS cert/key paths used by providerd and the local Docker backend. The
+# certificate is also the explicit local backend trust anchor. The script generates a self-signed
 # cert only when neither exists (and errors if exactly one is present).
 CERT_FILE="${CERT_FILE:-$REPO_ROOT/cert.pem}"
 KEY_FILE="${KEY_FILE:-$REPO_ROOT/key.pem}"
@@ -94,6 +95,9 @@ info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()    { printf '\033[1;32m OK\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33mWARN\033[0m %s\n' "$*"; }
 die()   { printf '\033[1;31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
+
+[[ "$DOCKER_BACKEND_URL" == https://* ]] \
+  || die "DOCKER_BACKEND_URL must use HTTPS: fresh placement initialization requires authenticated backend evidence"
 
 CERT_TMP=""
 KEY_TMP=""
@@ -411,6 +415,8 @@ info "Writing $DOCKER_BACKEND_FILE"
 
 DOCKER_BACKEND_LISTEN_ADDR_JSON="$(json_quote "$DOCKER_BACKEND_LISTEN_ADDR")" \
   || die "Failed to encode DOCKER_BACKEND_LISTEN_ADDR"
+CERT_FILE_JSON="$(json_quote "$CERT_FILE")" || die "Failed to encode CERT_FILE"
+KEY_FILE_JSON="$(json_quote "$KEY_FILE")" || die "Failed to encode KEY_FILE"
 CALLBACK_SECRET_JSON="$(json_quote "$CALLBACK_SECRET")" \
   || die "Failed to encode CALLBACK_SECRET"
 VOLUME_DATA_PATH_JSON="$(json_quote "$VOLUME_DATA_PATH")" \
@@ -445,6 +451,8 @@ cat >| "$DOCKER_BACKEND_TMP" <<YAML
 name: docker
 listen_addr: $DOCKER_BACKEND_LISTEN_ADDR_JSON
 docker_host: "unix:///var/run/docker.sock"
+tls_cert_file: $CERT_FILE_JSON
+tls_key_file: $KEY_FILE_JSON
 
 # Resource pool
 total_cpu_cores: 8.0
@@ -535,8 +543,6 @@ PROVIDER_ADDRESS_JSON="$(json_quote "$PROVIDER_ADDRESS")" || die "Failed to enco
 KEYRING_BACKEND_JSON="$(json_quote "$KEYRING_BACKEND")" || die "Failed to encode KEYRING_BACKEND"
 KEYRING_DIR_JSON="$(json_quote "$CHAIN_HOME/")" || die "Failed to encode keyring directory"
 KEY_NAME_JSON="$(json_quote "$KEY_NAME")" || die "Failed to encode KEY_NAME"
-CERT_FILE_JSON="$(json_quote "$CERT_FILE")" || die "Failed to encode CERT_FILE"
-KEY_FILE_JSON="$(json_quote "$KEY_FILE")" || die "Failed to encode KEY_FILE"
 DOCKER_BACKEND_URL_JSON="$(json_quote "$DOCKER_BACKEND_URL")" \
   || die "Failed to encode DOCKER_BACKEND_URL"
 CALLBACK_BASE_URL_JSON="$(json_quote "$CALLBACK_BASE_URL")" \
@@ -592,6 +598,7 @@ tls_key_file: $KEY_FILE_JSON
 backends:
   - name: docker
     url: $DOCKER_BACKEND_URL_JSON
+    tls_ca_file: $CERT_FILE_JSON
     timeout: 30s
     default: true
     hmac_secret: $CALLBACK_SECRET_JSON

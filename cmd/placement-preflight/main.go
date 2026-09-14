@@ -372,6 +372,13 @@ func runWithDependencies(
 	if err := requireCanonicalProviderUUID(cfg.ProviderUUID); err != nil {
 		return err
 	}
+	var mutationFleet placementprobe.AuthenticatedFleet
+	if *prepare || *initializeFresh {
+		mutationFleet, err = placementprobe.NewAuthenticatedFleet(cfg)
+		if err != nil {
+			return err
+		}
+	}
 	var boundBackupTarget *placement.ExactBackupTarget
 	if *prepare {
 		boundBackupTarget, err = dependencies.bindExactBackupTarget(*backupPath)
@@ -424,7 +431,7 @@ func runWithDependencies(
 			return err
 		}
 		return runFreshInitialization(
-			ctx, *proofTimeout, cfg, target, quiescenceProof, stdout, dependencies,
+			ctx, *proofTimeout, cfg, mutationFleet, target, quiescenceProof, stdout, dependencies,
 		)
 	}
 	var closePlacement func() error
@@ -475,7 +482,12 @@ func runWithDependencies(
 		}
 	}()
 
-	clients, err := dependencies.newInventoryClients(cfg)
+	var clients []inventoryClient
+	if *prepare {
+		clients, err = mutationFleet.NewClients()
+	} else {
+		clients, err = dependencies.newInventoryClients(cfg)
+	}
 	if err != nil {
 		return err
 	}
@@ -609,6 +621,10 @@ func runWithDependencies(
 			"WARNING: old-binary rollback now requires restoring the backup; never restore it after upgraded side effects begin."); err != nil {
 			return fmt.Errorf("write preparation warning: %w", err)
 		}
+	} else {
+		if _, err := fmt.Fprintln(&output, "OBSERVATION ONLY: mutation modes independently require certificate-verified HTTPS for every backend."); err != nil {
+			return fmt.Errorf("write observation scope: %w", err)
+		}
 	}
 	if _, err := fmt.Fprintf(&output,
 		"%s: v0.13 placement preflight verified %d rows against %d leases on %d backends; %s\n",
@@ -694,6 +710,7 @@ func runFreshInitialization(
 	ctx context.Context,
 	proofTimeout time.Duration,
 	cfg *config.Config,
+	fleet placementprobe.AuthenticatedFleet,
 	target placement.FreshInitializationTarget,
 	quiescenceProof placement.FreshQuiescenceProof,
 	stdout io.Writer,
@@ -705,7 +722,7 @@ func runFreshInitialization(
 
 	freshCtx, cancel := context.WithTimeout(ctx, proofTimeout)
 	defer cancel()
-	clients, err := dependencies.newInventoryClients(cfg)
+	clients, err := fleet.NewClients()
 	if err != nil {
 		return err
 	}

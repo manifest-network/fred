@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/manifest-network/fred/internal/hmacauth"
@@ -78,4 +79,34 @@ func (policy ConnectionPolicy) Format(state fmt.State, _ rune) {
 
 func (policy ConnectionPolicy) LogValue() slog.Value {
 	return slog.StringValue("backend.ConnectionPolicy{redacted}")
+}
+
+// AuthenticatedEvidencePolicy is the authority to collect backend replies for
+// an offline placement mutation. HMAC authenticates requests only; the reply
+// and its storage-identity header require certificate-verified HTTPS. This
+// capability captures the existing policy and cannot downgrade its transport.
+type AuthenticatedEvidencePolicy struct{ connection ConnectionPolicy }
+
+func NewAuthenticatedEvidencePolicy(policy ConnectionPolicy) (AuthenticatedEvidencePolicy, error) {
+	if !policy.valid() || !strings.HasPrefix(policy.state.baseURL, "https://") ||
+		policy.state.tlsConfig == nil || policy.state.tlsConfig.InsecureSkipVerify {
+		return AuthenticatedEvidencePolicy{}, errors.New("authenticated backend evidence requires certificate-verified HTTPS")
+	}
+	return AuthenticatedEvidencePolicy{connection: policy}, nil
+}
+
+// NewInventoryClient exposes observations only; possession of authenticated
+// evidence never provides backend provision/deprovision authority.
+func (policy AuthenticatedEvidencePolicy) NewInventoryClient() (BootstrapInventoryClient, error) {
+	return NewBootstrapInventoryClient(policy.connection, HTTPClientOptions{})
+}
+
+// NewIdentityBoundInventoryClient additionally checks the stopped database's
+// exact backend identity pin on every response.
+func (policy AuthenticatedEvidencePolicy) NewIdentityBoundInventoryClient(resolver BackendStorageIdentityResolver) (BootstrapInventoryClient, error) {
+	client, err := NewIdentityBoundHTTPClient(policy.connection, HTTPClientOptions{}, resolver)
+	if err != nil {
+		return nil, err
+	}
+	return bootstrapInventoryClient{client: client}, nil
 }

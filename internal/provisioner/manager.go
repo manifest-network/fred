@@ -178,6 +178,7 @@ type ManagerConfig struct {
 	AckBatchInterval      time.Duration                  // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
 	AckBatchSize          int                            // Maximum acks to batch before flushing (default: DefaultAckBatchSize)
 	AckLaneCount          int                            // Number of parallel ack lanes (default: 1)
+	AckFlushTimeout       time.Duration                  // Complete chain query/broadcast/fallback budget per ack flush
 	CallbackProofConsumer hmacauth.CallbackProofConsumer // Exact API verifier boundary accepted for settlement.
 }
 
@@ -256,6 +257,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ManagerCh
 		BatchInterval: cfg.AckBatchInterval,
 		BatchSize:     cfg.AckBatchSize,
 		LaneCount:     cfg.AckLaneCount,
+		FlushTimeout:  cfg.AckFlushTimeout,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("bind provider control plane: %w", err)

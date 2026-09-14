@@ -88,7 +88,6 @@ func newTestSignerPool(t *testing.T, subCount int) *SignerPool {
 		require.NoError(t, err)
 		pool.subSigners = append(pool.subSigners, sub)
 	}
-	pool.signerMu = make([]sync.Mutex, len(pool.subSigners))
 	return pool
 }
 
@@ -98,7 +97,7 @@ func TestSignerPool_Acquire_RoundRobin(t *testing.T) {
 	// 9 calls should cycle sub1→sub2→sub3 three times
 	seen := make([]string, 9)
 	for i := range 9 {
-		signer, isSub, release := pool.Acquire()
+		signer, isSub, release := acquireSignerForTest(t, pool)
 		assert.True(t, isSub, "Acquire should return sub-signer")
 		seen[i] = signer.Address()
 		release()
@@ -126,7 +125,7 @@ func TestSignerPool_Acquire_SingleSigner_ReturnsPrimary(t *testing.T) {
 	pool := newTestSignerPool(t, 0)
 
 	for range 5 {
-		signer, isSub, release := pool.Acquire()
+		signer, isSub, release := acquireSignerForTest(t, pool)
 		assert.False(t, isSub)
 		assert.Equal(t, pool.ProviderAddress(), signer.Address())
 		release()
@@ -141,7 +140,7 @@ func TestSignerPool_Acquire_ConcurrentSafety(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			signer, isSub, release := pool.Acquire()
+			signer, isSub, release := acquireSignerForTest(t, pool)
 			defer release()
 			assert.True(t, isSub)
 			assert.NotEmpty(t, signer.Address())
@@ -155,12 +154,12 @@ func TestSignerPool_Primary_AlwaysReturnsPrimary(t *testing.T) {
 
 	// Acquire some sub-signers to advance the counter
 	for range 5 {
-		_, _, release := pool.Acquire()
+		_, _, release := acquireSignerForTest(t, pool)
 		release()
 	}
 
 	// Primary should be unaffected
-	assert.Equal(t, pool.ProviderAddress(), pool.Primary().Address())
+	assert.Equal(t, pool.ProviderAddress(), pool.primary.Address())
 }
 
 func TestSignerPool_ProviderAddress_Invariant(t *testing.T) {
@@ -172,7 +171,7 @@ func TestSignerPool_ProviderAddress_Invariant(t *testing.T) {
 
 	// Even after acquiring sub-signers
 	for range 10 {
-		_, _, release := pool.Acquire()
+		_, _, release := acquireSignerForTest(t, pool)
 		release()
 	}
 	assert.Equal(t, expected, pool.ProviderAddress())
@@ -230,7 +229,7 @@ func TestSignerPool_DemoteToSingleSigner(t *testing.T) {
 	assert.Empty(t, pool.SubSignerAddresses())
 
 	// Acquire should now return primary
-	signer, isSub, release := pool.Acquire()
+	signer, isSub, release := acquireSignerForTest(t, pool)
 	assert.False(t, isSub)
 	assert.Equal(t, pool.ProviderAddress(), signer.Address())
 	release()
@@ -246,7 +245,7 @@ func TestSignerPool_DemoteToSingleSigner_ConcurrentRead(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			signer, _, release := pool.Acquire()
+			signer, _, release := acquireSignerForTest(t, pool)
 			defer release()
 			assert.NotEmpty(t, signer.Address())
 		}()
@@ -262,7 +261,7 @@ func TestSignerPool_DemoteToSingleSigner_ConcurrentRead(t *testing.T) {
 	wg.Wait()
 
 	// After demotion, should be single signer
-	signer, isSub, release := pool.Acquire()
+	signer, isSub, release := acquireSignerForTest(t, pool)
 	assert.False(t, isSub)
 	assert.Equal(t, pool.ProviderAddress(), signer.Address())
 	release()
@@ -290,7 +289,7 @@ func TestSignerPool_Acquire_ExclusiveAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 20 {
-				signer, _, release := pool.Acquire()
+				signer, _, release := acquireSignerForTest(t, pool)
 				addr := signer.Address()
 
 				mu.Lock()
@@ -318,15 +317,13 @@ func TestSignerPool_Acquire_ExclusiveAccess(t *testing.T) {
 
 // TestSignerPool_Acquire_DemoteDuringHold verifies that a goroutine holding a
 // sub-signer via Acquire can safely release it after DemoteToSingleSigner runs.
-// This exercises the snapshot consistency of Acquire: both subSigners and
-// signerMu must be captured in the same RLock section, otherwise the release
-// closure could reference a nil'd signerMu slice (panic) or an inconsistent
-// index.
+// The acquired signer owns its permit independently of the pool's current
+// membership, so demotion cannot invalidate a live transaction's release.
 func TestSignerPool_Acquire_DemoteDuringHold(t *testing.T) {
 	pool := newTestSignerPool(t, 3)
 
 	// Acquire a sub-signer and hold it.
-	signer, isSub, release := pool.Acquire()
+	signer, isSub, release := acquireSignerForTest(t, pool)
 	require.True(t, isSub, "expected sub-signer before demotion")
 	require.NotEqual(t, pool.ProviderAddress(), signer.Address())
 
@@ -335,7 +332,7 @@ func TestSignerPool_Acquire_DemoteDuringHold(t *testing.T) {
 	pool.DemoteToSingleSigner()
 
 	// Post-demotion, Acquire must return primary.
-	primary, isSub2, release2 := pool.Acquire()
+	primary, isSub2, release2 := acquireSignerForTest(t, pool)
 	assert.False(t, isSub2, "post-demotion Acquire should return primary (isSub=false)")
 	assert.Equal(t, pool.ProviderAddress(), primary.Address())
 	release2()

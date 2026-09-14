@@ -47,6 +47,15 @@
 // TopicBackendCallback remains only for the legacy message-shaped adapter;
 // production callbacks are not published through Watermill.
 //
+// # Acknowledgment Batching
+//
+// The manager owns acknowledgment lane lifetimes independently of individual
+// request contexts: one canceled caller cannot cancel a shared batch. Each flush
+// has a finite AckFlushTimeout covering the pending-lease query, broadcasts, and
+// any individual fallback. Provider composition uses the configured tx_timeout.
+// A timed-out flush returns errors to pending callers and releases its lane for
+// the next batch; committed partial results remain available for settlement.
+//
 // # Reconciler
 //
 // Reconciliation is a level-triggered evidence join, not a distributed FSM. It

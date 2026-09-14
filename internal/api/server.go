@@ -153,7 +153,6 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		var err error
 		tokenTracker, err = NewTokenTracker(TokenTrackerConfig{
 			DBPath: cfg.TokenTrackerDBPath,
-			MaxAge: MaxTokenAge,
 		})
 		if err != nil {
 			return nil, err

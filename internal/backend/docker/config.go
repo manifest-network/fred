@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -58,8 +59,8 @@ type Config struct {
 	MaxRequestBodySize int64 `yaml:"max_request_body_size"`
 
 	// ProductionMode tightens startup checks beyond basic validation. When true,
-	// Validate rejects dev-only insecure toggles — currently
-	// callback_insecure_skip_verify, which disables TLS verification on the
+	// Validate requires a local Unix Docker socket and rejects dev-only insecure
+	// toggles such as callback_insecure_skip_verify, which disables TLS verification on the
 	// backend → Fred callback hop. Mirrors providerd's production_mode (which
 	// gates the reverse providerd → backend tls_skip_verify). Defaults to false.
 	ProductionMode bool `yaml:"production_mode"`
@@ -498,6 +499,14 @@ func (c *Config) Validate() error {
 
 	if c.DockerHost == "" {
 		return fmt.Errorf("docker_host is required")
+	}
+	if c.ProductionMode {
+		host, err := url.Parse(c.DockerHost)
+		if err != nil || host.Scheme != "unix" || host.Host != "" || host.User != nil ||
+			host.RawQuery != "" || host.Fragment != "" || !filepath.IsAbs(host.Path) ||
+			filepath.Clean(host.Path) != host.Path || c.DockerHost != "unix://"+host.Path {
+			return fmt.Errorf("production_mode: docker_host must be a canonical absolute local Unix socket URL")
+		}
 	}
 
 	if math.IsNaN(c.TotalCPUCores) || math.IsInf(c.TotalCPUCores, 0) {

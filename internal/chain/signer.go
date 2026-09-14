@@ -6,6 +6,7 @@ import (
 	"io"
 	stdmath "math"
 	"strconv"
+	"sync"
 
 	"cosmossdk.io/math"
 	"github.com/cosmos/cosmos-sdk/client"
@@ -20,6 +21,7 @@ import (
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	"github.com/cosmos/cosmos-sdk/x/authz"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	"golang.org/x/sync/semaphore"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 )
@@ -33,17 +35,26 @@ const (
 
 // Signer handles transaction signing using a Cosmos keyring.
 type Signer struct {
-	keyring       keyring.Keyring
-	keyName       string
-	address       string
-	chainID       string
-	txConfig      client.TxConfig
-	cdc           codec.Codec
-	gasLimit      uint64
-	maxGasLimit   uint64         // 0 = no cap; if set, caps the gas limit during out-of-gas retries
-	gasAdjustment math.LegacyDec // multiplier applied to gasLimit at sign time; zero/nil or <=1 disables
-	gasPrice      int64
-	feeDenom      string
+	transactionOnce sync.Once
+	transactionGate *semaphore.Weighted
+	keyring         keyring.Keyring
+	keyName         string
+	address         string
+	chainID         string
+	txConfig        client.TxConfig
+	cdc             codec.Codec
+	gasLimit        uint64
+	maxGasLimit     uint64         // 0 = no cap; if set, caps the gas limit during out-of-gas retries
+	gasAdjustment   math.LegacyDec // multiplier applied to gasLimit at sign time; zero/nil or <=1 disables
+	gasPrice        int64
+	feeDenom        string
+}
+
+// transactionPermit belongs to the signer itself, so primary-only fallback
+// and any pool sharing that signer serialize the same account sequence.
+func (s *Signer) transactionPermit() *semaphore.Weighted {
+	s.transactionOnce.Do(func() { s.transactionGate = semaphore.NewWeighted(1) })
+	return s.transactionGate
 }
 
 // SignerConfig holds configuration for the transaction signer.
