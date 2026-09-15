@@ -2,7 +2,7 @@ package api
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -29,7 +29,7 @@ func (b *apiLogAdmissionBackend) GetLogs(ctx context.Context, lease string, tail
 	return b.getLogs(ctx, lease, tail)
 }
 
-func newLogAdmissionAPI(t *testing.T, timeout time.Duration, client *apiLogAdmissionBackend) (http.Handler, func() [2]*http.Request) {
+func newLogAdmissionAPI(t *testing.T, timeout time.Duration, tenantRate float64, client *apiLogAdmissionBackend) (http.Handler, func() [2]*http.Request) {
 	t.Helper()
 	keys := [2]*testutil.TestKeyPair{testutil.NewTestKeyPair("logs-first"), testutil.NewTestKeyPair("logs-second")}
 	leaseIDs := [2]string{testutil.ValidUUID1, testutil.ValidUUID3}
@@ -46,7 +46,8 @@ func newLogAdmissionAPI(t *testing.T, timeout time.Duration, client *apiLogAdmis
 	require.NoError(t, err)
 	server, err := NewServer(ServerConfig{
 		ProviderUUID: testutil.ValidUUID2, Bech32Prefix: "manifest", RequestTimeout: timeout,
-		RateLimitRPS: 100, RateLimitBurst: 100, TenantRateLimitRPS: 100, TenantRateLimitBurst: 100,
+		WriteTimeout: 7 * time.Second,
+		RateLimitRPS: 100, RateLimitBurst: 100, TenantRateLimitRPS: tenantRate, TenantRateLimitBurst: 100,
 	}, ServerDeps{
 		BackendRouter: router,
 		ChainClient: &mockChainClient{getLeaseFunc: func(_ context.Context, leaseID string) (*billingtypes.Lease, error) {
@@ -79,30 +80,38 @@ func (w *apiHeldLogWriter) Write(p []byte) (int, error) {
 
 func assertLogAdmissionRefusal(t *testing.T, handler http.Handler, request *http.Request) {
 	t.Helper()
-	unauthorized := request.Clone(t.Context())
-	unauthorized.Header.Set("Authorization", "Bearer invalid-signature")
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, unauthorized)
-	require.Equal(t, http.StatusUnauthorized, w.Code, "authentication remains outside the shared log gate")
+	for _, authorization := range []string{"", "Bearer invalid-signature"} {
+		unauthorized := request.Clone(t.Context())
+		unauthorized.Header.Set("Authorization", authorization)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, unauthorized)
+		require.Equal(t, http.StatusUnauthorized, w.Code, "authentication remains outside the shared log gate")
+	}
 
-	w = httptest.NewRecorder()
-	handler.ServeHTTP(w, request.Clone(t.Context()))
+	w := httptest.NewRecorder()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // A canceled waiter cannot hold the bounded admission queue.
+	handler.ServeHTTP(w, request.Clone(ctx))
 	require.Equal(t, http.StatusServiceUnavailable, w.Code)
 	require.Equal(t, "1", w.Header().Get("Retry-After"))
 	require.JSONEq(t, `{"error":"log response capacity exhausted","code":503}`, w.Body.String())
 }
 
 func TestLogsRouteAdmissionSharedAcrossTenantsThroughResponseWrite(t *testing.T) {
-	for _, holdBackend := range []bool{true, false} {
+	for _, scenario := range []struct {
+		holdBackend bool
+		tenantRate  float64
+	}{{true, 0}, {false, 0}, {true, 100}, {false, 100}} {
+		holdBackend := scenario.holdBackend
 		name := "final_client_write"
 		if holdBackend {
 			name = "backend_read"
 		}
-		t.Run(name, func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s/tenant_rate=%g", name, scenario.tenantRate), func(t *testing.T) {
 			// Server-owned LRU cleanup goroutines outlive requests. Construct the
 			// server outside fake time; only request lifetimes belong to the bubble.
 			client := new(apiLogAdmissionBackend)
-			handler, newRequests := newLogAdmissionAPI(t, time.Second, client)
+			handler, newRequests := newLogAdmissionAPI(t, time.Second, scenario.tenantRate, client)
 			synctest.Test(t, func(t *testing.T) {
 				requests := newRequests()
 				release := make(chan struct{})
@@ -151,10 +160,9 @@ func TestLogsRouteAdmissionSharedAcrossTenantsThroughResponseWrite(t *testing.T)
 				handler.ServeHTTP(second, requests[1].Clone(t.Context()))
 				require.Equal(t, http.StatusOK, second.Code, "idempotent read token remains usable after admission refusal")
 				require.EqualValues(t, 2, calls.Load())
-				var response LeaseLogsResponse
-				require.NoError(t, json.Unmarshal(second.Body.Bytes(), &response))
-				require.Equal(t, testutil.ValidUUID3, response.LeaseUUID)
-				require.Equal(t, map[string]string{"web/0": "live\n", "failed/web/0": "previous failure\n"}, response.Logs)
+				tenant := testutil.NewTestKeyPair("logs-second").Address
+				require.JSONEq(t, fmt.Sprintf(`{"lease_uuid":%q,"tenant":%q,"provider_uuid":%q,"logs":{"web/0":"live\n","failed/web/0":"previous failure\n"}}`,
+					testutil.ValidUUID3, tenant, testutil.ValidUUID2), second.Body.String())
 			})
 		})
 	}
@@ -163,7 +171,7 @@ func TestLogsRouteAdmissionSharedAcrossTenantsThroughResponseWrite(t *testing.T)
 func TestLogsRouteConfiguredTimeoutRetainsAdmissionUntilBackendExits(t *testing.T) {
 	const timeout = 37 * time.Millisecond
 	client := new(apiLogAdmissionBackend)
-	handler, newRequests := newLogAdmissionAPI(t, timeout, client)
+	handler, newRequests := newLogAdmissionAPI(t, timeout, 0, client)
 	synctest.Test(t, func(t *testing.T) {
 		requests := newRequests()
 		release := make(chan struct{})
@@ -196,5 +204,121 @@ func TestLogsRouteConfiguredTimeoutRetainsAdmissionUntilBackendExits(t *testing.
 		handler.ServeHTTP(second, requests[1].Clone(t.Context()))
 		require.Equal(t, http.StatusOK, second.Code)
 		require.EqualValues(t, 2, calls.Load())
+	})
+}
+
+func TestLogsRouteUnauthenticatedResponseDoesNotOwnAdmission(t *testing.T) {
+	for _, tenantRate := range []float64{0, 100} {
+		t.Run(fmt.Sprintf("tenant_rate=%g", tenantRate), func(t *testing.T) {
+			var calls atomic.Int32
+			client := &apiLogAdmissionBackend{getLogs: func(context.Context, string, int) (map[string]string, error) {
+				calls.Add(1)
+				return map[string]string{"web/0": "ready"}, nil
+			}}
+			handler, newRequests := newLogAdmissionAPI(t, time.Second, tenantRate, client)
+			synctest.Test(t, func(t *testing.T) {
+				requests := newRequests()
+				requests[0].Header.Del("Authorization")
+				release := make(chan struct{})
+				finish := sync.OnceFunc(func() { close(release) })
+				defer finish()
+				writer := &apiHeldLogWriter{ResponseRecorder: httptest.NewRecorder(), writeStarted: make(chan struct{}), release: release}
+				done := make(chan struct{})
+				go func() { defer close(done); handler.ServeHTTP(writer, requests[0]) }()
+				synctest.Wait()
+				select {
+				case <-writer.writeStarted:
+				default:
+					t.Fatal("unauthenticated response did not reach the client writer")
+				}
+				require.Zero(t, calls.Load(), "unauthenticated request must not query backend logs")
+				second := httptest.NewRecorder()
+				handler.ServeHTTP(second, requests[1])
+				require.Equal(t, http.StatusOK, second.Code, "a held unauthorized response must not consume log admission")
+				require.EqualValues(t, 1, calls.Load())
+				finish()
+				<-done
+				require.Equal(t, http.StatusUnauthorized, writer.Code)
+			})
+		})
+	}
+}
+
+func TestLogsRouteQueuedTenantPrecedesRepeatingCurrentTenant(t *testing.T) {
+	client := new(apiLogAdmissionBackend)
+	handler, newRequests := newLogAdmissionAPI(t, time.Second, 0, client)
+	synctest.Test(t, func(t *testing.T) {
+		requests := newRequests()
+		firstRelease, secondRelease := make(chan struct{}), make(chan struct{})
+		finishFirst := sync.OnceFunc(func() { close(firstRelease) })
+		finishSecond := sync.OnceFunc(func() { close(secondRelease) })
+		defer finishFirst()
+		defer finishSecond()
+		entered := make(chan string, 3)
+		var calls atomic.Int32
+		client.getLogs = func(_ context.Context, lease string, _ int) (map[string]string, error) {
+			call := calls.Add(1)
+			entered <- lease
+			switch call {
+			case 1:
+				<-firstRelease
+			case 2:
+				<-secondRelease
+			}
+			return map[string]string{"web/0": "ready"}, nil
+		}
+		responses := make(chan *httptest.ResponseRecorder, 3)
+		request := func(r *http.Request) {
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, r.Clone(t.Context()))
+			responses <- w
+		}
+		go request(requests[0])
+		synctest.Wait()
+		require.EqualValues(t, 1, calls.Load())
+		require.Equal(t, testutil.ValidUUID1, <-entered)
+		go request(requests[1])
+		synctest.Wait() // The other tenant has reached admission before a repeat.
+		go request(requests[0])
+		synctest.Wait()
+		require.EqualValues(t, 1, calls.Load(), "queued requests must not materialize more log maps")
+		require.Empty(t, responses, "requests wait in the bounded queue while their deadlines permit")
+		finishFirst()
+		synctest.Wait()
+		require.EqualValues(t, 2, calls.Load())
+		require.Equal(t, testutil.ValidUUID3, <-entered, "the waiting tenant must precede a repeat by the current tenant")
+		finishSecond()
+		synctest.Wait()
+		require.EqualValues(t, 3, calls.Load())
+		require.Equal(t, testutil.ValidUUID1, <-entered)
+		for range 3 {
+			require.Equal(t, http.StatusOK, (<-responses).Code)
+		}
+	})
+}
+
+type apiLogDeadlineWriter struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+}
+
+func (w *apiLogDeadlineWriter) SetWriteDeadline(deadline time.Time) error {
+	w.deadlines = append(w.deadlines, deadline)
+	return nil
+}
+
+func TestLogsRoutePreservesConfiguredWriteBudget(t *testing.T) {
+	client := &apiLogAdmissionBackend{getLogs: func(context.Context, string, int) (map[string]string, error) {
+		return map[string]string{"web/0": "ready"}, nil
+	}}
+	handler, newRequests := newLogAdmissionAPI(t, time.Second, 0, client)
+	synctest.Test(t, func(t *testing.T) {
+		requests := newRequests()
+		writer := &apiLogDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
+		start := time.Now()
+		handler.ServeHTTP(writer, requests[0])
+		require.Equal(t, http.StatusOK, writer.Code)
+		require.Equal(t, []time.Time{start.Add(8 * time.Second), start.Add(7 * time.Second)}, writer.deadlines,
+			"allow request processing before tightening the final response write to its configured budget")
 	})
 }

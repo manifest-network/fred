@@ -3488,13 +3488,8 @@ func TestGetLeaseLogs(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
 
-		var response LeaseLogsResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
-		assert.Equal(t, leaseUUID, response.LeaseUUID)
-		assert.Equal(t, kp.Address, response.Tenant)
-		assert.Equal(t, providerUUID, response.ProviderUUID)
-		require.Len(t, response.Logs, 1)
-		assert.Contains(t, response.Logs["0"], "Listening on :8080")
+		require.JSONEq(t, fmt.Sprintf(`{"lease_uuid":%q,"tenant":%q,"provider_uuid":%q,"logs":{"0":"Starting server...\nListening on :8080\n"}}`,
+			leaseUUID, kp.Address, providerUUID), rec.Body.String())
 	})
 
 	t.Run("happy_path_multiple_containers", func(t *testing.T) {
@@ -3534,11 +3529,8 @@ func TestGetLeaseLogs(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
 
-		var response LeaseLogsResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
-		require.Len(t, response.Logs, 2)
-		assert.Equal(t, "web server logs\n", response.Logs["0"])
-		assert.Equal(t, "worker logs\n", response.Logs["1"])
+		require.JSONEq(t, fmt.Sprintf(`{"lease_uuid":%q,"tenant":%q,"provider_uuid":%q,"logs":{"0":"web server logs\n","1":"worker logs\n"}}`,
+			leaseUUID, kp.Address, providerUUID), rec.Body.String())
 	})
 
 	t.Run("tail_parameter_forwarded", func(t *testing.T) {

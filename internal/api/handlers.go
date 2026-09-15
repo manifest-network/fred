@@ -212,7 +212,7 @@ func (h *Handlers) authenticateLeaseToken(r *http.Request, leaseUUID string, che
 	}
 
 	// Use pre-validated token from middleware context if available (avoids redundant
-	// ECDSA verification). Falls back to self-validate when rate limiting is disabled.
+	// ECDSA verification). Direct handler embeddings validate their own tokens.
 	token := AuthTokenFromContext(r.Context())
 	if token == nil {
 		var err error
@@ -874,14 +874,6 @@ type LeaseProvisionResponse struct {
 	Items         []backend.LeaseItem `json:"items,omitempty"`
 	RestoreHint   string              `json:"restore_hint,omitempty"`
 	Partition     string              `json:"partition,omitempty"`
-}
-
-// LeaseLogsResponse represents the response for container logs.
-type LeaseLogsResponse struct {
-	LeaseUUID    string            `json:"lease_uuid"`
-	Tenant       string            `json:"tenant"`
-	ProviderUUID string            `json:"provider_uuid"`
-	Logs         map[string]string `json:"logs"`
 }
 
 // GetLeaseProvision handles GET /v1/leases/{lease_uuid}/provision

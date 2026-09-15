@@ -24,7 +24,7 @@ func TestGetLeaseLogsBackendCapacityPreservesTenantRetryAndSharedCircuit(t *test
 	logsHandler := backend.NewLogsHandler(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
 		<-finish // The worker retains its allocation after its request times out.
-	}), 20*time.Millisecond)
+	}), 20*time.Millisecond, 20*time.Millisecond)
 	first := httptest.NewRecorder()
 	logsHandler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/logs/first-tenant", nil))
 	require.Equal(t, http.StatusServiceUnavailable, first.Code)
@@ -55,7 +55,7 @@ func TestGetLeaseLogsBackendCapacityPreservesTenantRetryAndSharedCircuit(t *test
 		}},
 		backendRouter: router, providerUUID: providerUUID, bech32Prefix: "manifest",
 	}
-	route := backend.NewTenantLogsHandler(http.HandlerFunc(h.GetLeaseLogs), 10*time.Second)
+	route := backend.NewTenantLogsHandler(http.HandlerFunc(h.GetLeaseLogs), 10*time.Second, 10*time.Second)
 	for range 3 {
 		req := httptest.NewRequest(http.MethodGet, "/v1/leases/"+leaseUUID+"/logs", nil)
 		req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))

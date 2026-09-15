@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -23,7 +24,7 @@ func TestLogsHandlerTimeoutRetainsAdmissionUntilWorkerExits(t *testing.T) {
 			defer close(exited)
 		}
 		_, _ = io.WriteString(w, `{}`)
-	}), 20*time.Millisecond)
+	}), 20*time.Millisecond, time.Second)
 	first := httptest.NewRecorder()
 	h.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/logs/tenant-one", nil))
 	<-entered
@@ -43,7 +44,9 @@ func TestLogsHandlerTimeoutRetainsAdmissionUntilWorkerExits(t *testing.T) {
 func assertLogCapacityExhausted(t *testing.T, h http.Handler) {
 	t.Helper()
 	r := httptest.NewRecorder()
-	h.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/logs/another-tenant", nil))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	h.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/logs/another-tenant", nil).WithContext(ctx))
 	require.Equal(t, http.StatusServiceUnavailable, r.Code)
 	require.Contains(t, r.Body.String(), "capacity exhausted")
 	require.Equal(t, "1", r.Header().Get("Retry-After"))
@@ -66,7 +69,7 @@ func TestLogsHandlerRetainsAdmissionThroughFinalClientWrite(t *testing.T) {
 	h := NewLogsHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		_, _ = io.WriteString(w, `{"live/0":"done"}`)
-	}), time.Second)
+	}), time.Second, time.Second)
 	w := &blockedLogResponseWriter{httptest.NewRecorder(), make(chan struct{}), make(chan struct{})}
 	done := make(chan struct{})
 	go func() {
@@ -91,7 +94,7 @@ func TestLogsHandlerReleasesAdmissionAfterPanic(t *testing.T) {
 			panic("backend panic")
 		}
 		_, _ = io.WriteString(w, `{}`)
-	}), time.Second)
+	}), time.Second, time.Second)
 	require.Panics(t, func() { h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/logs/one", nil)) })
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/logs/two", nil))
@@ -106,7 +109,7 @@ func TestLogsHandlerCarriesFullEscapedBudgetAndBothNamespaces(t *testing.T) {
 	require.NoError(t, err)
 	h := NewLogsHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = response.WriteJSON(w)
-	}), 10*time.Second)
+	}), 10*time.Second, 10*time.Second)
 	server := httptest.NewServer(h)
 	defer server.Close()
 	client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "bounded-logs", BaseURL: server.URL, Timeout: 10 * time.Second})

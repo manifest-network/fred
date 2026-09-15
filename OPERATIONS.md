@@ -420,6 +420,12 @@ reservation follows dispatch admission and precedes Create; refusal before
 dispatch admission does not leave an unknown helper record. Known completed helper failures settle
 normally, while unknown effects remain subject to the fencing procedure below.
 
+Even when Docker completion was observed, a journal commit failure (for example,
+momentary `ENOSPC`) can leave the launch or helper record durably unresolved.
+The in-memory completion receipt does not survive the failed workflow or a
+restart; freeing disk space alone cannot prove completion to recovery. This
+case still requires the offline operator fencing and repair procedure below.
+
 Use the following exceptional offline procedure only when normal recovery cannot
 settle an unknown request. The commands inspect or repair journal evidence; they
 do not stop Docker, fence its runtime, or delete containers for you.

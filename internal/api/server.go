@@ -271,14 +271,14 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	mux.Handle("GET /workloads", withTimeout(http.HandlerFunc(handlers.GetWorkloads)))
 	mux.Handle("POST /callbacks/provision", withCallbackTimeout(http.HandlerFunc(s.handleProvisionCallback)))
 
-	// Authenticated routes with optional tenant rate limiting.
-	// AuthMiddleware validates AuthTokens; PayloadAuthMiddleware validates PayloadAuthTokens.
-	// Both validate tokens cryptographically BEFORE consuming from the rate-limit bucket.
+	// Authenticated routes validate tokens before downstream admission regardless
+	// of tenant rate-limit configuration. Optional buckets consume only validated
+	// identities; payload tokens use their separate signature format.
 	withAuthRL := func(h http.HandlerFunc) http.Handler {
 		if tenantRateLimiter != nil {
 			return tenantRateLimiter.AuthMiddleware()(h)
 		}
-		return h
+		return authTokenMiddleware(cfg.Bech32Prefix, nil)(h)
 	}
 	withPayloadRL := func(h http.HandlerFunc) http.Handler {
 		if tenantRateLimiter != nil {
@@ -289,7 +289,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	mux.Handle("GET /v1/leases/{lease_uuid}/connection", withTimeout(withAuthRL(handlers.GetLeaseConnection)))
 	mux.Handle("GET /v1/leases/{lease_uuid}/status", withTimeout(withAuthRL(handlers.GetLeaseStatus)))
 	mux.Handle("GET /v1/leases/{lease_uuid}/provision", withTimeout(withAuthRL(handlers.GetLeaseProvision)))
-	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withAuthRL(backend.NewTenantLogsHandler(http.HandlerFunc(handlers.GetLeaseLogs), requestTimeout).ServeHTTP))
+	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withAuthRL(backend.NewTenantLogsHandler(http.HandlerFunc(handlers.GetLeaseLogs), requestTimeout, cfg.WriteTimeout).ServeHTTP))
 	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTimeout(withPayloadRL(s.handlePayloadUpload)))
 	mux.Handle("POST /v1/leases/{lease_uuid}/restart", withTimeout(withAuthRL(handlers.RestartLease)))
 	mux.Handle("POST /v1/leases/{lease_uuid}/restore", withTimeout(withAuthRL(handlers.RestoreLease)))

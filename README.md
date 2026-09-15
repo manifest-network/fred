@@ -749,9 +749,17 @@ and the failed attempt appears under `failed/<service>/<instance>` keys. A later
 deployment removes those older failure entries from the active view. Logs share
 a 32 MiB aggregate content budget, with bounded marker and encoding overhead.
 Each daemon admits one log response at a time across tenants and backends.
-Concurrent requests receive `503 Service Unavailable` with `Retry-After: 1`.
+Up to eight additional requests wait in FIFO order. Queueing and retrieval share
+the configured request deadline; a full queue or expired admission wait returns
+`503 Service Unavailable` with `Retry-After: 1`.
 Admission remains held until both retrieval and the final response write finish,
 including timeout cleanup; retrying a read does not consume a replay token.
+The final response transfer has a separate deadline using the daemon's configured
+HTTP write timeout, falling back to the request timeout when no positive write
+timeout is configured. A client that does not read, or reads too slowly, can
+receive an incomplete response; retry with a smaller `tail`. The 32 MiB content
+budget is unchanged, but it does not guarantee delivery of a fully escaped
+response over an arbitrarily slow link.
 
 **Query Parameters:**
 - `tail` - Number of log lines to return per container (default: 100, max: 10000)
@@ -778,7 +786,9 @@ including timeout cleanup; retrying a read does not consume a replay token.
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Provision not found (never provisioned or logs expired)
-- `503 Service Unavailable` - Backend routing is unavailable, or durable placement is unusable or unresolved
+- `503 Service Unavailable` - The log queue is full, the admission wait expires,
+  or read capacity is exhausted (`Retry-After: 1`); backend routing is unavailable,
+  or durable placement is unusable or unresolved
 
 ### Upload Payload
 

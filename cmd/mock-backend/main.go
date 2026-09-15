@@ -160,6 +160,7 @@ func main() {
 		callbackSecret: callbackSecret,
 		name:           name,
 		storageID:      storageID,
+		writeTimeout:   writeTimeout,
 		callbackURLs:   make(map[string]string),
 	}
 
@@ -230,6 +231,7 @@ type MockBackendServer struct {
 	callbackSecret string // HMAC secret for verifying requests and signing callbacks
 	name           string // backend name, set on callback payloads for per-backend metrics
 	storageID      backendidentity.ID
+	writeTimeout   time.Duration
 
 	// Per-lease callback URLs to avoid race conditions with concurrent provisions
 	callbackURLs   map[string]string
@@ -255,7 +257,7 @@ func (s *MockBackendServer) Handler() http.Handler {
 	mux.Handle("GET /provisions", protected(http.HandlerFunc(s.handleListProvisions)))
 	mux.Handle("GET /provisions/{lease_uuid}", protected(http.HandlerFunc(s.handleGetProvision)))
 	mux.Handle("GET /retentions", protected(http.HandlerFunc(s.handleListRetentions)))
-	mux.Handle("GET /logs/{lease_uuid}", protected(backend.NewLogsHandler(http.HandlerFunc(s.handleGetLogs), 30*time.Second)))
+	mux.Handle("GET /logs/{lease_uuid}", protected(backend.NewLogsHandler(http.HandlerFunc(s.handleGetLogs), 30*time.Second, s.writeTimeout)))
 
 	// Operational endpoints remain public so local health and load probes do
 	// not need the backend's authority-bearing HMAC key.

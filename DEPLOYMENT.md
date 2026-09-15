@@ -854,6 +854,14 @@ documents. Old `manifest-deploy` templates emitted provider
 reject them. Remove these keys from the producer templates and existing files.
 Keep Docker `ingress.wildcard_domain`, which still controls tenant ingress;
 the removed port-range keys never constrained Docker's host-port allocation.
+Removing those keys does not complete the authentication migration. In
+`manifest-deploy`, select `fred_config_profile: typed-authority` and provision
+the complete per-backend key map as described under
+[configuration profiles](https://github.com/manifest-network/manifest-deploy/blob/b4cd4819beca094578422333ac0a59cd77c26411/docs/fred-stopped-cutover.md#configuration-profiles).
+The `legacy-v0.13` profile still emits the provider's fleet-wide
+`callback_secret`, which upgraded production validation rejects. The target
+provider must instead use a unique `backends[].hmac_secret` for each backend,
+matching only that backend's `callback_secret`.
 Compare the complete rendered configurations with the target revision's
 examples and run that revision's real loaders, including every backend.
 [The deployment compatibility gate](https://github.com/manifest-network/manifest-deploy/pull/185)

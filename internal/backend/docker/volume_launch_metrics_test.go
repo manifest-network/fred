@@ -55,6 +55,27 @@ func TestHealthSamplesDurableVolumeLaunchDebt(t *testing.T) {
 				require.NoError(t, h.callbacks.Close())
 				require.Error(t, h.backend.Health(t.Context()))
 				requireVolumeLaunchGauge(t, 1, "an unreadable store must not report a false zero")
+
+				// Restore the same identity-bound callback file while retaining the
+				// coordinator's original, closed handle. This isolates the sampler
+				// failure after every ordinary store health check has succeeded,
+				// without replacing PendingCount with a synthetic error callback.
+				reopened, err := shared.OpenIdentityBoundCallbackStore(
+					shared.CallbackStoreConfig{DBPath: h.callbackPath}, authority.storage, authority.gate)
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+				h.backend.callbackStore = reopened
+				require.NoError(t, reopened.Healthy())
+				err = h.backend.Health(t.Context())
+				require.ErrorContains(t, err, "docker launch journal unhealthy:")
+				requireVolumeLaunchGauge(t, 1, "a failed journal sample must retain the last successful gauge")
+
+				// A coordinator constructed from the reopened authority sees the
+				// preserved durable debt and resumes successful health sampling.
+				h.backend.volumeLaunches, err = newVolumeLaunchCoordinator(reopened)
+				require.NoError(t, err)
+				require.NoError(t, h.backend.Health(t.Context()))
+				requireVolumeLaunchGauge(t, 1)
 			} else {
 				requireVolumeLaunchGauge(t, 0, "completed launch settlement must clear the next sample")
 			}

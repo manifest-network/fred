@@ -780,8 +780,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   while preserving the workflow failure; timeouts and lost responses retain
   durable fencing. Direct-daemon authorization-plugin `403` replies also prove
   completion, including response authorization after an action already ran;
-  exact cleanup and storage attestation remain required. Docker SDK connections bypass environment HTTP proxies so
-  intermediary errors cannot supply completion evidence.
+  exact cleanup and storage attestation remain required. Docker SDK connections
+  bypass environment HTTP proxies so intermediary errors cannot supply completion
+  evidence.
 - Image helpers and managed launches share the daemon-completion observer and
   one `StepCompleted`/`CommitCompletedStep` protocol. Helper preparation acquires
   its durable reservation only after dispatch admission; known completed helper

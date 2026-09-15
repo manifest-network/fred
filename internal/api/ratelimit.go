@@ -274,7 +274,7 @@ type authTokenKey struct{}
 type payloadAuthTokenKey struct{}
 
 // AuthTokenFromContext retrieves the pre-validated AuthToken from request context.
-// Returns nil if no token was stored (e.g. rate limiting disabled).
+// Returns nil when called outside the authenticated router middleware.
 func AuthTokenFromContext(ctx context.Context) *AuthToken {
 	token, _ := ctx.Value(authTokenKey{}).(*AuthToken)
 	return token
@@ -292,6 +292,13 @@ func PayloadAuthTokenFromContext(ctx context.Context) *PayloadAuthToken {
 // bucket, preventing attackers from burning a victim's quota with forged tokens.
 // The validated token is stored in request context so handlers skip re-validation.
 func (tl *TenantRateLimiter) AuthMiddleware() func(http.Handler) http.Handler {
+	return authTokenMiddleware(tl.bech32Prefix, tl)
+}
+
+// authTokenMiddleware authenticates before downstream admission even when tenant
+// rate limiting is disabled. Only this boundary attaches a validated token; the
+// optional limiter consumes its quota after validation and before dispatch.
+func authTokenMiddleware(bech32Prefix string, limiter *TenantRateLimiter) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tokenStr, err := extractBearerToken(r)
@@ -306,18 +313,18 @@ func (tl *TenantRateLimiter) AuthMiddleware() func(http.Handler) http.Handler {
 				return
 			}
 
-			if err := token.Validate(tl.bech32Prefix); err != nil {
+			if err := token.Validate(bech32Prefix); err != nil {
 				writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 				return
 			}
 
-			if !tl.Allow(token.Tenant) {
+			if limiter != nil && !limiter.Allow(token.Tenant) {
 				slog.Warn("tenant rate limit exceeded",
 					"tenant", token.Tenant,
 					"path", r.URL.Path,
 				)
 				metrics.RateLimitRejectionsTotal.WithLabelValues("tenant").Inc()
-				w.Header().Set("Retry-After", tl.retryAfterSeconds())
+				w.Header().Set("Retry-After", limiter.retryAfterSeconds())
 				writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return
 			}

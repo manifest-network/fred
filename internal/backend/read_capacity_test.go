@@ -64,7 +64,7 @@ func TestReadCapacityTimeoutAndPanicRemainHealthFailures(t *testing.T) {
 			defer close(finish)
 			h := NewLogsHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				tc.handler(w, r, finish)
-			}), 20*time.Millisecond)
+			}), 20*time.Millisecond, time.Second)
 			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set(backendidentity.ResponseHeader, testBackendStorageIDA)
 				h.ServeHTTP(w, r)
