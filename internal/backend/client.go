@@ -1029,6 +1029,23 @@ var ErrInsufficientResources = errors.New("insufficient resources")
 // configured backend transport's trust boundary.
 var ErrCapacityRefused = fmt.Errorf("%w: backend refused the request", ErrInsufficientResources)
 
+// readCapacityError is a transport observation about a read response. It does
+// not unwrap to a mutation refusal and cannot settle a durable operation.
+type readCapacityError struct {
+	detail string
+}
+
+func (e *readCapacityError) Error() string {
+	return "backend read response capacity exhausted: " + e.detail
+}
+
+// IsReadCapacity reports a complete, bounded backend read-capacity response.
+// This observation only supports retry guidance; it grants no mutation authority.
+func IsReadCapacity(err error) bool {
+	var capacity *readCapacityError
+	return errors.As(err, &capacity)
+}
+
 // ErrInvalidState is returned when an operation is not valid for the current lease state.
 var ErrInvalidState = errors.New("invalid state for operation")
 
@@ -1236,7 +1253,7 @@ type HTTPClientOptions struct {
 	MaxProvisionBytes        int64 // GetProvision response limit (default: 1 MiB)
 	MaxProvisionsBytes       int64 // ListProvisions response limit (default: 8 MiB)
 	MaxLookupProvisionsBytes int64 // LookupProvisions response limit (default: 8 MiB)
-	MaxLogsBytes             int64 // GetLogs response limit (default: 16 MiB)
+	MaxLogsBytes             int64 // GetLogs encoded response limit (default: MaxProjectedLogsResponseBytes)
 	MaxReleasesBytes         int64 // GetReleases response limit (default: 48 MiB projected response)
 	MaxStatsBytes            int64 // GetLoadStats response limit (default: 1 MiB)
 	MaxRetentionsBytes       int64 // /retentions per-page response limit (default: 1 MiB)
@@ -1308,6 +1325,8 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 			//   - ErrNotProvisioned: 404 from GetInfo/GetProvision/GetLogs (valid "not found")
 			//   - ErrValidation: 400 from Provision/Update (permanent client error)
 			//   - ErrInsufficientResources: 503 from Provision (backend at capacity, not unhealthy)
+			//   - readCapacityError: exact read-capacity envelope; retry pressure does
+			//     not make the backend unhealthy or grant mutation refusal authority.
 			//   - ErrAlreadyProvisioned: 409 from Provision (breaker-exempt conflict;
 			//     not ownership proof until authoritative inventory validates it)
 			//   - ErrInvalidState: 409 from Restart/Update (wrong lease state for operation)
@@ -1331,6 +1350,7 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 				errors.Is(err, ErrNotProvisioned) ||
 				errors.Is(err, ErrValidation) ||
 				errors.Is(err, ErrInsufficientResources) ||
+				IsReadCapacity(err) ||
 				errors.Is(err, ErrAlreadyProvisioned) ||
 				errors.Is(err, ErrInvalidState) ||
 				errors.Is(err, ErrNotRetained) ||
@@ -1382,7 +1402,7 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 		maxProvisionBytes:        positiveOr(cfg.MaxProvisionBytes, DefaultMaxProvisionBytes),
 		maxProvisionsBytes:       positiveOr(cfg.MaxProvisionsBytes, DefaultMaxProvisionsBytes),
 		maxLookupProvisionsBytes: positiveOr(cfg.MaxLookupProvisionsBytes, DefaultMaxLookupProvisionsBytes),
-		maxLogsBytes:             positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes),
+		maxLogsBytes:             min(positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes), DefaultMaxLogsBytes),
 		maxReleasesBytes:         positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
 		maxStatsBytes:            positiveOr(cfg.MaxStatsBytes, DefaultMaxStatsBytes),
 		maxRetentionsBytes:       positiveOr(cfg.MaxRetentionsBytes, DefaultMaxRetentionsBytes),
@@ -1821,6 +1841,16 @@ func (c *HTTPClient) signRequest(req *http.Request, body []byte) {
 // JSON response as T. It handles 404→ErrNotProvisioned and enforces a
 // response size limit.
 func doGet[T any](c *HTTPClient, ctx context.Context, metric, url string, maxBytes int64) (_ *T, err error) {
+	return doGetDecoded(c, ctx, metric, url, maxBytes, func(r io.ReadCloser, limit int64) (*T, error) {
+		var v T
+		if err := decodeJSONLimited(r, limit, &v); err != nil {
+			return nil, err
+		}
+		return &v, nil
+	})
+}
+
+func doGetDecoded[T any](c *HTTPClient, ctx context.Context, metric, url string, maxBytes int64, decode func(io.ReadCloser, int64) (*T, error)) (_ *T, err error) {
 	start := time.Now()
 	defer func() { c.recordMetrics(metric, start, err) }()
 
@@ -1842,15 +1872,25 @@ func doGet[T any](c *HTTPClient, ctx context.Context, metric, url string, maxByt
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, ErrNotProvisioned
 		}
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			envelope, err := c.decodeErrorEnvelope(readErrorBodyBytes(resp), metric)
+			if err != nil {
+				return nil, err
+			}
+			if envelope.Code == CodeInsufficientResources {
+				return nil, &readCapacityError{detail: envelope.Error}
+			}
+			return nil, fmt.Errorf("%s failed with status %d: %s", metric, resp.StatusCode, envelope.Error)
+		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("%s failed with status %d: %s", metric, resp.StatusCode, readErrorBody(resp))
 		}
 
-		var v T
-		if err := decodeJSONLimited(resp.Body, maxBytes, &v); err != nil {
+		v, err := decode(resp.Body, maxBytes)
+		if err != nil {
 			return nil, fmt.Errorf("decode %s response: %w", metric, err)
 		}
-		return &v, nil
+		return v, nil
 	})
 
 	if isCircuitBreakerError(cbErr) {
@@ -2211,7 +2251,7 @@ func (c *HTTPClient) LookupProvisions(ctx context.Context, uuids []string) ([]Pr
 
 // GetLogs retrieves container logs for a provisioned lease.
 func (c *HTTPClient) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
-	result, err := doGet[map[string]string](c, ctx, "get_logs", fmt.Sprintf("%s/logs/%s?tail=%d", c.baseURL, leaseUUID, tail), c.maxLogsBytes)
+	result, err := doGetDecoded(c, ctx, "get_logs", fmt.Sprintf("%s/logs/%s?tail=%d", c.baseURL, leaseUUID, tail), c.maxLogsBytes, decodeLogResponse)
 	if err != nil {
 		return nil, err
 	}

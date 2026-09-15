@@ -289,7 +289,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	mux.Handle("GET /v1/leases/{lease_uuid}/connection", withTimeout(withAuthRL(handlers.GetLeaseConnection)))
 	mux.Handle("GET /v1/leases/{lease_uuid}/status", withTimeout(withAuthRL(handlers.GetLeaseStatus)))
 	mux.Handle("GET /v1/leases/{lease_uuid}/provision", withTimeout(withAuthRL(handlers.GetLeaseProvision)))
-	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withTimeout(withAuthRL(handlers.GetLeaseLogs)))
+	mux.Handle("GET /v1/leases/{lease_uuid}/logs", withAuthRL(backend.NewTenantLogsHandler(http.HandlerFunc(handlers.GetLeaseLogs), requestTimeout).ServeHTTP))
 	mux.Handle("POST /v1/leases/{lease_uuid}/data", withTimeout(withPayloadRL(s.handlePayloadUpload)))
 	mux.Handle("POST /v1/leases/{lease_uuid}/restart", withTimeout(withAuthRL(handlers.RestartLease)))
 	mux.Handle("POST /v1/leases/{lease_uuid}/restore", withTimeout(withAuthRL(handlers.RestoreLease)))

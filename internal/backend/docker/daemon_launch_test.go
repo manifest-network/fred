@@ -11,6 +11,7 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 
@@ -18,7 +19,7 @@ import (
 )
 
 func TestDaemonLaunchResponsesSeparateBusinessFailureFromCompletion(t *testing.T) {
-	for _, status := range []int{http.StatusCreated, http.StatusConflict, http.StatusInternalServerError} {
+	for _, status := range []int{http.StatusCreated, http.StatusConflict, http.StatusForbidden, http.StatusInternalServerError} {
 		scope := new(daemonLaunchScope)
 		transport := daemonLaunchTransport{scope: scope, next: dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) {
 			return imageSecurityResponse(status, `{}`), nil
@@ -34,6 +35,26 @@ func TestDaemonLaunchResponsesSeparateBusinessFailureFromCompletion(t *testing.T
 		require.ErrorIs(t, outcome.err, businessErr)
 		require.NoError(t, outcome.completionError())
 	}
+}
+
+func TestCompensationSDKAuthorizationDenialRetainsFailureAndCompletesRequest(t *testing.T) {
+	observer := new(daemonLaunchObserver)
+	requests := 0
+	transport := daemonContextTransport{observer: observer, next: dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		require.Equal(t, http.MethodPost, req.Method)
+		require.True(t, strings.HasSuffix(req.URL.Path, "/containers/source/start"))
+		return imageSecurityResponse(http.StatusForbidden, `{"message":"authorization denied by plugin policy: start forbidden"}`), nil
+	})}
+	sdk, err := client.NewClientWithOpts(client.WithHost("http://docker.invalid"), client.WithVersion("1.51"), client.WithHTTPClient(&http.Client{Transport: transport}))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sdk.Close() })
+	docker := &DockerClient{client: newDockerSDKView(sdk), launchObserver: observer}
+	outcome := docker.startCompensationContainer(t.Context(), "source", time.Second)
+	require.True(t, outcome.settled, "a trusted daemon's authorization response ends this request")
+	require.True(t, errdefs.IsForbidden(outcome.err), "request completion must preserve the denied business outcome")
+	require.NoError(t, outcome.completionError())
+	require.Equal(t, 1, requests, "completion classification must not replay the denied Start")
 }
 
 func TestDaemonLaunchUnknownTransportNeverSuppliesCompletion(t *testing.T) {

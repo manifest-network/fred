@@ -133,7 +133,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /provision", protected(http.HandlerFunc(s.handleProvision)))
 	mux.Handle("POST /deprovision", protected(http.HandlerFunc(s.handleDeprovision)))
 	mux.Handle("GET /info/{lease_uuid}", protected(http.HandlerFunc(s.handleGetInfo)))
-	mux.Handle("GET /logs/{lease_uuid}", protected(http.HandlerFunc(s.handleGetLogs)))
+	mux.Handle("GET /logs/{lease_uuid}", protected(backend.NewLogsHandler(http.HandlerFunc(s.handleGetLogs), 30*time.Second)))
 	mux.Handle("GET /provisions/{lease_uuid}", protected(http.HandlerFunc(s.handleGetProvision)))
 	mux.Handle("GET /provisions", protected(http.HandlerFunc(s.handleListProvisions)))
 	mux.Handle("POST /restart", protected(http.HandlerFunc(s.handleRestart)))
@@ -294,7 +294,15 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, logs)
+	response, err := backend.NewLogResponse(logs)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "invalid log response")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := response.WriteJSON(w); err != nil {
+		s.logger.Warn("log response write failed", "error", err)
+	}
 }
 
 // DeprovisionRequest is the request body for /deprovision.

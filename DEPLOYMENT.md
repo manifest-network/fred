@@ -846,6 +846,22 @@ starts.
 
 ### Upgrading from v0.13.0
 
+**Regenerate and validate configuration before installing the new binaries.**
+The provider and backend loaders now reject unknown keys and additional YAML
+documents. Old `manifest-deploy` templates emitted provider
+`backends[].wildcard_domain` and Docker root-level `docker_port_range_start` /
+`docker_port_range_end`; none was consumed by v0.13, and the upgraded loaders
+reject them. Remove these keys from the producer templates and existing files.
+Keep Docker `ingress.wildcard_domain`, which still controls tenant ingress;
+the removed port-range keys never constrained Docker's host-port allocation.
+Compare the complete rendered configurations with the target revision's
+examples and run that revision's real loaders, including every backend.
+[The deployment compatibility gate](https://github.com/manifest-network/manifest-deploy/pull/185)
+provides validation of the exact rendered files without starting services.
+Complete this check while the old fleet remains available, then use the stopped
+cutover below. Do not deploy the stricter binaries with the old rendered files
+or bypass validation by adding ignored fields to Fred's config types.
+
 **Live-fleet scope for this cutover.** The read-only deployment and manifest
 inventory verified on 2026-09-02 for ENG-632 found the serving production tenant
 fleet on `docker-backend` with XFS, matching

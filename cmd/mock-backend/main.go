@@ -255,7 +255,7 @@ func (s *MockBackendServer) Handler() http.Handler {
 	mux.Handle("GET /provisions", protected(http.HandlerFunc(s.handleListProvisions)))
 	mux.Handle("GET /provisions/{lease_uuid}", protected(http.HandlerFunc(s.handleGetProvision)))
 	mux.Handle("GET /retentions", protected(http.HandlerFunc(s.handleListRetentions)))
-	mux.Handle("GET /logs/{lease_uuid}", protected(http.HandlerFunc(s.handleGetLogs)))
+	mux.Handle("GET /logs/{lease_uuid}", protected(backend.NewLogsHandler(http.HandlerFunc(s.handleGetLogs), 30*time.Second)))
 
 	// Operational endpoints remain public so local health and load probes do
 	// not need the backend's authority-bearing HMAC key.
@@ -645,8 +645,13 @@ func (s *MockBackendServer) handleGetLogs(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	response, err := backend.NewLogResponse(logs)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "invalid log response")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(logs); err != nil {
+	if err := response.WriteJSON(w); err != nil {
 		slog.Error("failed to encode logs response", "error", err)
 	}
 }

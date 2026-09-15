@@ -43,10 +43,12 @@ func (r Runner) StepCompleted(ctx context.Context, operation string, action func
 }
 
 // CommitCompletedStep holds the exact live receipt while committing its durable
-// consequence. Only a successful commit consumes it, so a failed transaction
-// can be retried within the same workflow without repeating the physical effect.
-// commit must not reenter this execution's Runner. A storage implementation must
-// independently withdraw its authority if its commit result is ambiguous.
+// consequence. Only a successful commit consumes it. Retention permits a retry
+// within the same workflow without repeating the physical effect only when the
+// storage implementation establishes that the failed write did not commit and
+// retains valid authority. The receipt does not classify an error as retryable.
+// commit must not reenter this execution's Runner. Storage must independently
+// withdraw its authority if its commit result is ambiguous.
 func CommitCompletedStep[Subject comparable](receipt CompletedStep, subject Subject, operation string, commit func() error) error {
 	if receipt.state == nil || receipt.state.session == nil || commit == nil {
 		return errors.New("completed mutation receipt is unavailable")

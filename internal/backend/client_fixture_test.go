@@ -27,7 +27,7 @@ type HTTPClientConfig struct {
 	MaxProvisionBytes        int64 // GetProvision response limit (default: 1 MiB)
 	MaxProvisionsBytes       int64 // ListProvisions response limit (default: 8 MiB)
 	MaxLookupProvisionsBytes int64 // LookupProvisions response limit (default: 8 MiB)
-	MaxLogsBytes             int64 // GetLogs response limit (default: 16 MiB)
+	MaxLogsBytes             int64 // GetLogs encoded response limit (default: backend.MaxProjectedLogsResponseBytes)
 	MaxReleasesBytes         int64 // GetReleases response limit (default: 48 MiB projected response)
 	MaxStatsBytes            int64 // GetLoadStats response limit (default: 1 MiB)
 	MaxRetentionsBytes       int64 // /retentions per-page response limit (default: 1 MiB)

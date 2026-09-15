@@ -15,7 +15,7 @@ import (
 )
 
 func TestImageInspectionCreateCompletionSeparatesDaemonFailureFromUnknown(t *testing.T) {
-	for _, status := range []int{http.StatusConflict, http.StatusInternalServerError, http.StatusBadGateway, 0} {
+	for _, status := range []int{http.StatusConflict, http.StatusForbidden, http.StatusInternalServerError, http.StatusBadGateway, 0} {
 		for _, materialized := range []bool{false, true} {
 			t.Run(fmt.Sprintf("status=%d/materialized=%v", status, materialized), func(t *testing.T) {
 				h := newInspectionHarnessWithClient(t, func(daemon *inspectionDaemon) *DockerClient {
@@ -41,7 +41,7 @@ func TestImageInspectionCreateCompletionSeparatesDaemonFailureFromUnknown(t *tes
 				})
 				receipts, err := h.owner.journal.List()
 				require.NoError(t, err)
-				if status == http.StatusConflict || status == http.StatusInternalServerError {
+				if status == http.StatusConflict || status == http.StatusForbidden || status == http.StatusInternalServerError {
 					require.Empty(t, receipts, "completed failure plus exact absence retires its receipt")
 				} else {
 					require.Len(t, receipts, 1, "current absence cannot settle a lost or gateway response")
@@ -50,6 +50,7 @@ func TestImageInspectionCreateCompletionSeparatesDaemonFailureFromUnknown(t *tes
 				require.Empty(t, h.daemon.containers)
 				if materialized {
 					require.Equal(t, 1, h.daemon.removes, "response completion never replaces exact owned-helper cleanup")
+					require.Equal(t, 1, h.daemon.creates, "response authorization can deny after creation; never replay Create")
 				}
 			})
 		}
@@ -101,30 +102,43 @@ func TestImageInspectionCreatePanicRetainsDebtAndWithdrawsAuthority(t *testing.T
 }
 
 func TestImageInspectionCreateCompletionRequiresStoragePostcheck(t *testing.T) {
-	h := newInspectionHarness(t)
-	h.daemon.afterCreate = func() {
-		h.backend.storageVerifier = testDockerRuntimeStorageVerifier{id: h.authority.storage.ID(), verify: func(context.Context) error {
-			return backendidentity.ErrIdentityDrift
-		}}
+	for _, status := range []int{http.StatusCreated, http.StatusForbidden} {
+		t.Run(fmt.Sprintf("status=%d", status), func(t *testing.T) {
+			h := newInspectionHarnessWithClient(t, func(daemon *inspectionDaemon) *DockerClient {
+				return newImageSecurityDockerClient(t, func(req *http.Request) (*http.Response, error) {
+					response, err := daemon.request(t, req)
+					if err != nil || !strings.HasSuffix(req.URL.Path, "/containers/create") || status == http.StatusCreated {
+						return response, err
+					}
+					require.NoError(t, response.Body.Close())
+					return imageSecurityResponse(status, `{"message":"response authorization denied"}`), nil
+				})
+			})
+			h.daemon.afterCreate = func() {
+				h.backend.storageVerifier = testDockerRuntimeStorageVerifier{id: h.authority.storage.ID(), verify: func(context.Context) error {
+					return backendidentity.ErrIdentityDrift
+				}}
+			}
+			h.execute(t, func(ctx context.Context, origin shared.ImageInspectionOrigin) error {
+				_, err := h.client.openImageInspection(ctx, h.image, origin)
+				require.ErrorIs(t, err, backendidentity.ErrIdentityDrift)
+				return err
+			})
+			require.Zero(t, h.daemon.removes)
+			h.reopen(t)
+			receipts, err := h.owner.journal.List()
+			require.NoError(t, err)
+			require.Len(t, receipts, 1)
+			require.False(t, receipts[0].CreationSettled(), "known HTTP response alone cannot commit completion after identity withdrawal")
+			require.Empty(t, receipts[0].ContainerID())
+			_, err = h.owner.Recover(t.Context())
+			require.NoError(t, err)
+			require.Empty(t, h.daemon.containers)
+			receipts, err = h.owner.journal.List()
+			require.NoError(t, err)
+			require.Len(t, receipts, 1, "failed postcheck retains the offline fence obligation")
+		})
 	}
-	h.execute(t, func(ctx context.Context, origin shared.ImageInspectionOrigin) error {
-		_, err := h.client.openImageInspection(ctx, h.image, origin)
-		require.ErrorIs(t, err, backendidentity.ErrIdentityDrift)
-		return err
-	})
-	require.Zero(t, h.daemon.removes)
-	h.reopen(t)
-	receipts, err := h.owner.journal.List()
-	require.NoError(t, err)
-	require.Len(t, receipts, 1)
-	require.False(t, receipts[0].CreationSettled(), "known HTTP response alone cannot commit completion after identity withdrawal")
-	require.Empty(t, receipts[0].ContainerID())
-	_, err = h.owner.Recover(t.Context())
-	require.NoError(t, err)
-	require.Empty(t, h.daemon.containers)
-	receipts, err = h.owner.journal.List()
-	require.NoError(t, err)
-	require.Len(t, receipts, 1, "failed postcheck retains the offline fence obligation")
 }
 
 func TestImageInspectionRefusedCreationDoesNotReserveHelperDebt(t *testing.T) {

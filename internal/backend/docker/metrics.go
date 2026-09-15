@@ -13,8 +13,8 @@ const (
 )
 
 // Phase labels for replacePhaseDurationSeconds. They name the timed sub-steps
-// of the shared replace machinery (doReplaceContainers) plus the restore-only
-// volume adoption that runs in Restore's synchronous prelude. Kept as
+// of maintenance physical execution plus restore-only volume adoption.
+// Source compensation is outside this histogram. Kept as
 // constants so the production instrumentation and the dashboard/tests cannot
 // drift on a string typo.
 const (

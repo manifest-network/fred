@@ -772,10 +772,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   acquiring exclusion and close them before unlocking; XFS deletion can therefore
   reclaim its final inode without weakening quota checks or alias exclusion.
   Roots and positive absence are revalidated after each wait. (ENG-950)
+- Per-volume launch preparation validates only its named reserved directory;
+  complete launch boundaries still validate the whole set. Preparing many
+  volumes no longer reopens every root for each individual filesystem action.
 - Docker adapters now distinguish completed daemon failures from requests whose
   effects remain unknown. A completed failure can settle its launch receipt
   while preserving the workflow failure; timeouts and lost responses retain
-  durable fencing. Docker SDK connections bypass environment HTTP proxies so
+  durable fencing. Direct-daemon authorization-plugin `403` replies also prove
+  completion, including response authorization after an action already ran;
+  exact cleanup and storage attestation remain required. Docker SDK connections bypass environment HTTP proxies so
   intermediary errors cannot supply completion evidence.
 - Image helpers and managed launches share the daemon-completion observer and
   one `StepCompleted`/`CommitCompletedStep` protocol. Helper preparation acquires
@@ -798,6 +803,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   requests retain their recovery authority. Failed releases with verified missing
   replicas remain repairable without acquiring partial-source replay authority.
   (ENG-932)
+- Restart/update source-capture failures before replacement now preserve Ready
+  only when independent inspection proves the original source is still serving;
+  uncertain observations retain the maintenance intent for recovery. Failed
+  replacements also project the proven source release, container identities and
+  callback routes before reporting failure, so later inspection and repair use
+  the actual source state. (ENG-932)
 - Failed startup diagnostics are captured before exact-target removal, survive
   restart and close, and remain available after successful compensation. Older
   cleanup cannot overwrite a newer attempt's published failure. Captures remain
@@ -1227,6 +1238,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- Log retrieval now admits one materialized response per daemon, holding its
+  slot through backend cleanup and the final client write even after a timeout.
+  Saturation returns `503` with `Retry-After: 1`. A shared bounded log snapshot,
+  member decoder and fragment encoder avoid extra full escaped-document copies
+  while preserving the 32 MiB capture allowance and live/failed-attempt keys.
+  Exact backend read-capacity replies retain tenant retry guidance without
+  opening the shared provisioning circuit or granting mutation-refusal authority.
 - Offline placement preparation, fresh initialization and repair application
   require a frozen fleet policy with certificate-verified backend HTTPS,
   independently of `production_mode`. Request HMAC alone cannot authenticate

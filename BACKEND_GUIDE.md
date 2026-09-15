@@ -265,7 +265,7 @@ Every non-2xx response **MUST** be JSON in this envelope:
 
 - `error` **(required)** — a human-readable description. See the curation rule below.
 - `validation_code` (omitempty) — on a `400`, the sub-category of the validation failure. Fred parses it to reconstruct a precise sentinel error, which is what gives the on-chain rejection reason its precision; omit it and fred falls back to a generic validation failure.
-- `code` (omitempty) — a machine-readable discriminator. Today: `already_provisioned` on `/restore`'s `409`, `demote_exceeds_tier` on `/restore`'s `422`, and `insufficient_resources` on a capacity-refused `/provision` or `/restore` `503`. See those endpoints.
+- `code` (omitempty) — a machine-readable discriminator. Today: `already_provisioned` on `/restore`'s `409`, `demote_exceeds_tier` on `/restore`'s `422`, and `insufficient_resources` on capacity-refused mutation requests or busy log reads (`503`). See those endpoints. A read-capacity response supplies retry guidance only; it cannot settle a durable mutation attempt.
 
 These response fields establish **protocol conformance, not cryptographic
 authorship**. Fred HMAC-signs requests to the backend, but the backend does not
@@ -534,8 +534,23 @@ Get container logs for a specific lease. Used by fred to serve `GET /v1/leases/{
   deployment. Logs share a 32 MiB aggregate content budget, with bounded marker
   and encoding overhead.
 
+The provider accepts at most 5,120 projected entries with keys up to 263 bytes.
+Its encoded wire ceiling includes worst-case JSON expansion (about 201 MiB);
+configured smaller client limits still apply. The shared response codec decodes
+one member at a time and encodes strings in small fragments using Go's JSON
+escaper. The decoder can still buffer a large member, and the HTTP timeout
+handler buffers the final response. Each daemon therefore admits only one log
+response at a time across tenants/backends, holding admission through both
+retrieval and final client writing, even when the request times out.
+
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned (or logs expired)
+- `503 Service Unavailable` with `code: "insufficient_resources"` and
+  `Retry-After: 1` - Another log response still
+  owns the daemon's admission slot; retry this read later.
+  Fred keeps this exact read-capacity response exempt from its shared circuit
+  breaker and returns the tenant API's numeric `code: 503` envelope. Bare,
+  malformed or unknown-coded `503` responses and timeouts remain backend errors.
 
 ### POST /restart
 

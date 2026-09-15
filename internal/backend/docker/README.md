@@ -303,7 +303,11 @@ after a later deployment. Logs share a 32 MiB aggregate content budget, with
 bounded marker and encoding overhead. The provider's encoded response limit
 includes JSON expansion and bounded keys, so it can carry that content budget.
 Explicit smaller client limits still apply. Log capture is bounded to 32 MiB per
-attempt; unavailable or truncated capture is recorded explicitly. The default
+attempt. Each daemon admits one log response at a time and returns `503` with
+`Retry-After: 1` while it is occupied. Admission covers retrieval, timeout cleanup
+and the final client write. The shared codec avoids whole-document JSON copies;
+the largest decoded member and the timeout response buffer still consume memory.
+Unavailable or truncated capture is recorded explicitly. The default
 retention is seven days. Recreating `diagnostics.db`
 while stopped loses its existing captures; it does not manufacture lifecycle or
 cleanup authority.

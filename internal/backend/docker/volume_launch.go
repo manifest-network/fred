@@ -46,15 +46,43 @@ type quiescedVolumes struct {
 	active           *atomic.Bool
 }
 
-func (q *quiescedVolumes) requireActive() error {
+func (q *quiescedVolumes) requireReservation() error {
 	if q == nil || q.active == nil || !q.active.Load() || q.reserved == nil ||
 		q.reserved.lifetime == nil || q.reserved.lifetime.released.Load() {
 		return errors.New("volume launch authority is unavailable")
 	}
+	return nil
+}
+
+// Complete launch boundaries re-attest the whole set. Per-volume filesystem
+// capabilities use requireVolume instead, so preparing V directories does not
+// reopen all V roots for every individual filesystem operation.
+func (q *quiescedVolumes) requireActive() error {
+	if err := q.requireReservation(); err != nil {
+		return err
+	}
 	for _, volume := range q.volumes {
-		if err := volume.root.VerifyPath(); err != nil {
-			return fmt.Errorf("reserved volume identity: %w", err)
+		if err := verifyReservedVolumeRoot(volume.root); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func (q *quiescedVolumes) requireVolume(name managedVolumeName, directory *fsidentity.Directory) error {
+	if err := q.requireReservation(); err != nil {
+		return err
+	}
+	volume, ok := q.volumes[name.value()]
+	if !ok || volume.root != directory {
+		return errors.New("volume differs from the reserved launch directory")
+	}
+	return verifyReservedVolumeRoot(directory)
+}
+
+func verifyReservedVolumeRoot(directory *fsidentity.Directory) error {
+	if err := directory.VerifyPath(); err != nil {
+		return fmt.Errorf("reserved volume identity: %w", err)
 	}
 	return nil
 }
@@ -72,7 +100,7 @@ type launchVolumeState struct {
 }
 
 func (q *quiescedVolumes) lookup(name string) (launchVolume, error) {
-	if err := q.requireActive(); err != nil {
+	if err := q.requireReservation(); err != nil {
 		return launchVolume{}, err
 	}
 	volume, ok := q.volumes[name]
@@ -83,6 +111,9 @@ func (q *quiescedVolumes) lookup(name string) (launchVolume, error) {
 	if err != nil {
 		return launchVolume{}, err
 	}
+	if err := q.requireVolume(parsed, volume.root); err != nil {
+		return launchVolume{}, err
+	}
 	return launchVolume{state: &launchVolumeState{owner: q, name: parsed, directory: volume.root, created: volume.created}}, nil
 }
 
@@ -90,14 +121,7 @@ func (v launchVolume) requireActive() error {
 	if v.state == nil {
 		return errors.New("reserved volume authority is unavailable")
 	}
-	if err := v.state.owner.requireActive(); err != nil {
-		return err
-	}
-	volume, ok := v.state.owner.volumes[v.state.name.value()]
-	if !ok || volume.root != v.state.directory {
-		return errors.New("volume differs from the reserved launch directory")
-	}
-	return nil
+	return v.state.owner.requireVolume(v.state.name, v.state.directory)
 }
 
 func (v launchVolume) rootPath() (string, error) {

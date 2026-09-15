@@ -111,6 +111,12 @@ func daemonCompletedLaunchResponse(req *http.Request, response *http.Response) b
 	switch response.StatusCode {
 	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusInternalServerError:
 		return true
+	case http.StatusForbidden:
+		// Docker authorization plugins may deny the request before the handler
+		// or its response after the handler has finished. Both end this exchange;
+		// neither proves the absence of an effect. Keep the business error and
+		// require the same storage postcheck and exact cleanup as other failures.
+		return true
 	case http.StatusCreated:
 		return strings.HasSuffix(req.URL.Path, "/containers/create")
 	case http.StatusNoContent, http.StatusNotModified:

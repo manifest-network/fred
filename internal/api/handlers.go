@@ -1003,6 +1003,11 @@ func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
 
 	logs, err := backendClient.GetLogs(r.Context(), leaseUUID, tail)
 	if err != nil {
+		if backend.IsReadCapacity(err) {
+			w.Header().Set("Retry-After", "1")
+			writeError(w, "log response capacity exhausted", http.StatusServiceUnavailable)
+			return
+		}
 		if errors.Is(err, backend.ErrNotProvisioned) {
 			writeError(w, "logs not found", http.StatusNotFound)
 			return
@@ -1012,11 +1017,11 @@ func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := LeaseLogsResponse{
-		LeaseUUID:    leaseUUID,
-		Tenant:       auth.Token.Tenant,
-		ProviderUUID: h.providerUUID,
-		Logs:         logs,
+	response, err := backend.NewLogResponse(logs)
+	if err != nil {
+		slog.Error("invalid backend log response", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
 	}
 
 	slog.Info("lease logs served",
@@ -1025,7 +1030,12 @@ func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
 		"backend", backendClient.Name(),
 	)
 
-	writeJSON(w, response, http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	if err := response.WriteEnvelopeJSON(w, map[string]string{
+		"lease_uuid": leaseUUID, "tenant": auth.Token.Tenant, "provider_uuid": h.providerUUID,
+	}); err != nil {
+		slog.Warn("log response write failed", "error", err, "lease_uuid", leaseUUID)
+	}
 }
 
 // LeaseReleasesResponse represents the response for release history.

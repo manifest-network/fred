@@ -748,6 +748,10 @@ Ready deployment after a failed update or restart, its live keys remain unchange
 and the failed attempt appears under `failed/<service>/<instance>` keys. A later
 deployment removes those older failure entries from the active view. Logs share
 a 32 MiB aggregate content budget, with bounded marker and encoding overhead.
+Each daemon admits one log response at a time across tenants and backends.
+Concurrent requests receive `503 Service Unavailable` with `Retry-After: 1`.
+Admission remains held until both retrieval and the final response write finish,
+including timeout cleanup; retrying a read does not consume a replay token.
 
 **Query Parameters:**
 - `tail` - Number of log lines to return per container (default: 100, max: 10000)
