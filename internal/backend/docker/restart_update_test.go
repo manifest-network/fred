@@ -885,7 +885,6 @@ func TestRestart_RotatesCallbackBaseWithoutRotatingTypedAuthority(t *testing.T) 
 		b.releaseStore = releaseStore
 		b.callbackStore = callbackStore
 		rebuildCallbackSender(b, callbackClient)
-		b.wg.Go(b.callbackSender.RunReplayLoop)
 		manifestBytes, err := json.Marshal(stack)
 		require.NoError(t, err)
 		oldAuthority, err := shared.NewReleaseRuntimeAuthority(
@@ -906,6 +905,10 @@ func TestRestart_RotatesCallbackBaseWithoutRotatingTypedAuthority(t *testing.T) 
 			Status:           "active",
 			CreatedAt:        time.Now(),
 		})
+		// Seeding finishes the previous lifetime with its own acknowledgment
+		// sender. Join that temporary owner before starting runtime replay: two
+		// concurrent senders can leave the loser dormant until periodic retry.
+		b.wg.Go(b.callbackSender.RunReplayLoop)
 
 		projectReady := make(chan *composetypes.Project, 1)
 		releaseWorker := make(chan struct{})
