@@ -52,22 +52,18 @@ linters:
             - pkg: github.com/manifest-network/fred/internal/metrics$
               desc: "providerd-owned; a backend binary that links it exports providerd's whole metric set at 0 (ENG-712). Use internal/metrics/background for collectors every binary writes, declare backend-local ones in that backend's metrics.go, or take the collector by injection like backend.RouterConfig.RoutingFallback."
     forbidigo:
-      # Destroy is an irreversible RemoveAll on tenant data. It is already off the
-      # volumeManager interface (volume.go), so `b.volumes.Destroy(...)` does not
-      # compile — but Go has no file-level visibility, so any file in package docker
-      # could re-obtain the capability by asserting to volumeDestroyer. This rule
-      # closes that half: destruction is reachable only from the one file that asks who
-      # owns the bytes first (ENG-658). Excluded there, and in tests, which drive real
-      # filesystem managers directly for fixture teardown via volDestroyer.
-      #
-      # Create is the other half of the same story: it ADOPTS a pre-existing directory,
-      # so a call that skips the volume-name stripe can adopt one an in-flight destroy is
-      # midway through removing. Pinned to the one file that takes the lock (ENG-681).
+      # Managed-volume Create can adopt an existing directory, and Destroy is
+      # irreversible. Raw access belongs only at the constructor-owned substrate
+      # boundary, where a short-lived Runner brackets the operation and the
+      # caller's durable subject determines its scope. Backend retains only read
+      # projections and fixed workflow services. The compiler prevents
+      # b.volumes.Destroy; this lint rule also prevents a same-package type
+      # assertion or a newly retained raw sink from bypassing the boundary.
       forbid:
         - pattern: '\.Destroy$'
-          msg: "managed-volume destruction must go through volumeOp.destroy (internal/backend/docker/volume_destroy.go): it is the only site that establishes ownership before an irreversible delete (ENG-658)"
+          msg: "managed-volume destruction must use the construction-bound substrate mutation executor"
         - pattern: 'volumes\.Create$'
-          msg: "managed-volume creation must go through Backend.createManagedVolume (internal/backend/docker/volume_lock.go): it holds the volume-name stripe that serializes create-or-reuse against an in-flight destroy (ENG-681)"
+          msg: "managed-volume creation must use the construction-bound substrate mutation executor"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -94,14 +90,10 @@ linters:
         - G104
   exclusions:
     rules:
-      # The one file allowed to reach the destroy capability (ENG-658). Everything else
-      # in the repo, production or not, must route through volumeOp.destroy.
-      - path: ^internal/backend/docker/volume_destroy\.go$
-        linters:
-          - forbidigo
-      # The one file allowed to create a managed volume (ENG-681): it is where the
-      # volume-name stripe is taken.
-      - path: ^internal/backend/docker/volume_lock\.go$
+      # The only production file allowed to invoke the raw volume writer. It
+      # captures that writer during composition and exposes only subject-bound
+      # or fixed background workflows; no request handler receives the sink.
+      - path: ^internal/backend/docker/storage_mutation_guard\.go$
         linters:
           - forbidigo
       # Exclude test files from strict linters

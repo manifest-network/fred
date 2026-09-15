@@ -62,7 +62,7 @@ const (
 	// txPollBackoffFactor is the multiplier for exponential backoff.
 	txPollBackoffFactor = 1.5
 
-	// defaultTxTimeout is the default timeout for waiting for tx inclusion.
+	// defaultTxTimeout is the default budget for a complete chain write, including signer acquisition.
 	defaultTxTimeout = 60 * time.Second
 
 	// simBreakerThreshold is the number of consecutive Simulate failures before
@@ -156,7 +156,7 @@ type ClientConfig struct {
 	TLSCAFile      string        // Path to CA certificate file (optional, uses system CAs if empty)
 	TLSSkipVerify  bool          // Skip certificate verification (for testing only)
 	TxPollInterval time.Duration // Interval for polling tx status (default: 500ms)
-	TxTimeout      time.Duration // Timeout for waiting for tx inclusion (default: 60s)
+	TxTimeout      time.Duration // Complete write budget: signer acquisition through inclusion (default: 60s)
 	QueryPageLimit int           // Page limit for paginated queries (default: 100)
 	WithdrawLimit  int           // Leases settled per provider-wide MsgWithdraw page (default: 100; the chain rejects > MaxBatchLeaseSize)
 }
@@ -167,31 +167,9 @@ func NewClient(cfg ClientConfig, pool *SignerPool) (*Client, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("signer pool is required")
 	}
-	dialOpts := []grpc.DialOption{
-		// Keepalive must respect the server's enforcement policy.
-		// Cosmos SDK / gRPC defaults: MinTime=5m, PermitWithoutStream=false.
-		// Pinging more aggressively triggers GOAWAY ENHANCE_YOUR_CALM.
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                5 * time.Minute,
-			Timeout:             10 * time.Second,
-			PermitWithoutStream: false,
-		}),
-	}
-
-	if cfg.TLSEnabled {
-		tlsConfig, err := buildTLSConfig(cfg.TLSCAFile, cfg.TLSSkipVerify)
-		if err != nil {
-			return nil, fmt.Errorf("failed to build TLS config: %w", err)
-		}
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
-		slog.Info("gRPC TLS enabled", "ca_file", cfg.TLSCAFile, "skip_verify", cfg.TLSSkipVerify)
-	} else {
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	}
-
-	conn, err := grpc.NewClient(cfg.Endpoint, dialOpts...)
+	conn, err := dialGRPC(cfg.Endpoint, cfg.TLSEnabled, cfg.TLSCAFile, cfg.TLSSkipVerify)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to gRPC endpoint: %w", err)
+		return nil, err
 	}
 
 	// Apply defaults using cmp.Or (returns first non-zero value)
@@ -214,6 +192,40 @@ func NewClient(cfg ClientConfig, pool *SignerPool) (*Client, error) {
 		withdrawLimit:   uint64(withdrawLimit),
 		now:             time.Now,
 	}, nil
+}
+
+// dialGRPC is the shared transport constructor for transactional and
+// query-only chain clients. Keeping signer construction out of this boundary
+// lets offline safety tools inspect chain state without opening a keyring or
+// exposing any transaction capability.
+func dialGRPC(endpoint string, tlsEnabled bool, tlsCAFile string, tlsSkipVerify bool) (*grpc.ClientConn, error) {
+	dialOpts := []grpc.DialOption{
+		// Keepalive must respect the server's enforcement policy.
+		// Cosmos SDK / gRPC defaults: MinTime=5m, PermitWithoutStream=false.
+		// Pinging more aggressively triggers GOAWAY ENHANCE_YOUR_CALM.
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                5 * time.Minute,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: false,
+		}),
+	}
+
+	if tlsEnabled {
+		tlsConfig, err := buildTLSConfig(tlsCAFile, tlsSkipVerify)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build TLS config: %w", err)
+		}
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+		slog.Info("gRPC TLS enabled", "ca_file", tlsCAFile, "skip_verify", tlsSkipVerify)
+	} else {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	conn, err := grpc.NewClient(endpoint, dialOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to gRPC endpoint: %w", err)
+	}
+	return conn, nil
 }
 
 // buildTLSConfig creates a TLS configuration for gRPC.
@@ -259,7 +271,7 @@ func (c *Client) broadcastMultiMsgTx(ctx context.Context, msgs []sdktypes.Msg) (
 	if len(msgs) == 0 {
 		return "", nil
 	}
-	return c.broadcastTxWithSigner(ctx, c.signerPool.Primary(), msgs, broadcastOpts{maxRetries: 1})
+	return c.broadcastPrimary(ctx, msgs, broadcastOpts{maxRetries: 1})
 }
 
 // simulateGas estimates gas for msgs via the Simulate RPC, applies
@@ -432,52 +444,52 @@ func (c *Client) broadcastBatchedMsgs(
 		return 0, nil, nil
 	}
 
-	// Acquire signer once for all sub-batches — fixed for the entire call.
-	// The signer stays the same across sub-batches and retries to avoid
-	// sequence mismatches.
-	signer, isSub, release := c.signerPool.Acquire()
-	defer release()
-
-	var granteeAddr sdktypes.AccAddress
-	if isSub {
-		var err error
-		granteeAddr, err = sdktypes.AccAddressFromBech32(signer.Address())
-		if err != nil {
-			return 0, nil, fmt.Errorf("invalid sub-signer address: %w", err)
-		}
-	}
-
+	// One owner and one budget span selection, every sub-batch, and retries.
+	// Partial committed results survive a later deadline failure.
+	ctx, cancel := context.WithTimeout(ctx, cmp.Or(c.txTimeout, defaultTxTimeout))
+	defer cancel()
 	var totalProcessed uint64
 	var txHashes []string
-
-	for batch := range slices.Chunk(leaseUUIDs, maxLeasesPerBatch) {
-		innerMsg := msgFactory(batch)
-
-		var msg sdktypes.Msg
-		if isSub {
-			execMsg := authz.NewMsgExec(granteeAddr, []sdktypes.Msg{innerMsg})
-			msg = &execMsg
-		} else {
-			msg = innerMsg
+	err := c.signerPool.withSigner(ctx, false, func(held heldSigner) error {
+		var granteeAddr sdktypes.AccAddress
+		if held.isSub {
+			var err error
+			granteeAddr, err = sdktypes.AccAddressFromBech32(held.signer.Address())
+			if err != nil {
+				return fmt.Errorf("invalid sub-signer address: %w", err)
+			}
 		}
 
-		txHash, err := c.broadcastTxWithSigner(ctx, signer, []sdktypes.Msg{msg}, defaultBroadcastOpts())
-		recordTxMetrics(metricType, err)
-		if err != nil {
-			return totalProcessed, txHashes, fmt.Errorf("failed to %s leases: %w", metricType, err)
+		for batch := range slices.Chunk(leaseUUIDs, maxLeasesPerBatch) {
+			innerMsg := msgFactory(batch)
+
+			var msg sdktypes.Msg
+			if held.isSub {
+				execMsg := authz.NewMsgExec(granteeAddr, []sdktypes.Msg{innerMsg})
+				msg = &execMsg
+			} else {
+				msg = innerMsg
+			}
+
+			txHash, err := c.broadcastTxWithSigner(ctx, held, []sdktypes.Msg{msg}, defaultBroadcastOpts())
+			recordTxMetrics(metricType, err)
+			if err != nil {
+				return fmt.Errorf("failed to %s leases: %w", metricType, err)
+			}
+
+			// Build log attributes: operation, count, extra attrs, tx_hash
+			attrs := []any{"operation", opName, "count", len(batch)}
+			attrs = append(attrs, extraLogAttrs...)
+			attrs = append(attrs, "tx_hash", txHash)
+			slog.Info("lease batch processed", attrs...)
+
+			txHashes = append(txHashes, txHash)
+			totalProcessed += uint64(len(batch))
 		}
 
-		// Build log attributes: operation, count, extra attrs, tx_hash
-		attrs := []any{"operation", opName, "count", len(batch)}
-		attrs = append(attrs, extraLogAttrs...)
-		attrs = append(attrs, "tx_hash", txHash)
-		slog.Info("lease batch processed", attrs...)
-
-		txHashes = append(txHashes, txHash)
-		totalProcessed += uint64(len(batch))
-	}
-
-	return totalProcessed, txHashes, nil
+		return nil
+	})
+	return totalProcessed, txHashes, err
 }
 
 // AcknowledgeLeases acknowledges the given leases. Returns the number of leases acknowledged and tx hashes.
@@ -505,6 +517,8 @@ func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (ui
 // Limit is the configured withdrawLimit (leases settled per page); the scheduler
 // pages via the cursor, so this only trades settlement-tx count against per-tx gas.
 func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, cmp.Or(c.txTimeout, defaultTxTimeout))
+	defer cancel()
 	msg := &billingtypes.MsgWithdraw{
 		Sender:       c.providerAddress,
 		ProviderUuid: providerUUID,
@@ -588,14 +602,27 @@ func decodeWithdrawResponse(dataHex string) (*billingtypes.MsgWithdrawResponse, 
 // broadcastTx signs and broadcasts a transaction using the primary signer.
 // Used for operations that must use the provider key (withdrawals, grants, funding).
 func (c *Client) broadcastTx(ctx context.Context, msg sdktypes.Msg) (string, error) {
-	return c.broadcastTxWithSigner(ctx, c.signerPool.Primary(), []sdktypes.Msg{msg}, defaultBroadcastOpts())
+	return c.broadcastPrimary(ctx, []sdktypes.Msg{msg}, defaultBroadcastOpts())
+}
+
+// broadcastPrimary owns the provider key and the entire write deadline.
+func (c *Client) broadcastPrimary(ctx context.Context, msgs []sdktypes.Msg, opts broadcastOpts) (hash string, err error) {
+	ctx, cancel := context.WithTimeout(ctx, cmp.Or(c.txTimeout, defaultTxTimeout))
+	defer cancel()
+	err = c.signerPool.withSigner(ctx, true, func(held heldSigner) error {
+		var err error
+		hash, err = c.broadcastTxWithSigner(ctx, held, msgs, opts)
+		return err
+	})
+	return hash, err
 }
 
 // broadcastTxWithSigner signs and broadcasts a transaction using the given signer.
 // The signer is fixed for the entire retry cycle (signer affinity). A single
 // Simulate call pre-seeds the gas before the backoff loop; the OOG ladder then
 // climbs from that value if execution fails.
-func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msgs []sdktypes.Msg, opts broadcastOpts) (string, error) {
+func (c *Client) broadcastTxWithSigner(ctx context.Context, held heldSigner, msgs []sdktypes.Msg, opts broadcastOpts) (string, error) {
+	signer := held.signer
 	var txHash string
 	var seqOverride *uint64 // sequence override from a previous sequence-mismatch error
 
@@ -614,6 +641,8 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msgs
 			// Count it as a success so a cap-reject doesn't trip the breaker.
 			c.simBreaker.recordSuccess()
 			return "", simErr
+		case ctx.Err() != nil:
+			return "", ctx.Err()
 		case simErr != nil:
 			c.simBreaker.recordFailure(c.now())
 			simGas = fallbackGasOrRaw(signer)
@@ -649,8 +678,11 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, signer *Signer, msgs
 
 	firstAccount := preAccount
 	operation := func() error {
+		if err := ctx.Err(); err != nil {
+			return backoff.Permanent(err)
+		}
 		var err error
-		txHash, err = c.doBroadcastTxWithSigner(ctx, signer, msgs, seqOverride, gasLimitOverride, firstAccount)
+		txHash, err = c.doBroadcastTxWithSigner(ctx, held, msgs, seqOverride, gasLimitOverride, firstAccount)
 		firstAccount = nil // retries re-query for a fresh sequence
 		if err == nil {
 			return nil
@@ -790,7 +822,8 @@ func (c *Client) isRetryableGRPCCode(code codes.Code) bool {
 // (e.g. after an out-of-gas error triggered a retry with increased gas).
 // If preAccount is non-nil, it is used directly (reusing the account queried by
 // simulateGas on the first attempt, avoiding a duplicate query).
-func (c *Client) doBroadcastTxWithSigner(ctx context.Context, signer *Signer, msgs []sdktypes.Msg, seqOverride *uint64, gasLimitOverride *uint64, preAccount *codectypes.Any) (string, error) {
+func (c *Client) doBroadcastTxWithSigner(ctx context.Context, held heldSigner, msgs []sdktypes.Msg, seqOverride *uint64, gasLimitOverride *uint64, preAccount *codectypes.Any) (string, error) {
+	signer := held.signer
 	// Get account info for the signer's sequence/account number. Reuse the
 	// account from simulateGas when preAccount is set (first attempt only);
 	// retries pass nil and re-query for a fresh sequence.

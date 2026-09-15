@@ -1,21 +1,15 @@
 // Package leasesm owns the per-lease state machine and actor, plus the
 // substrate-agnostic seams they consume. The state machine + actor
 // implementations live in lease_sm.go and lease_actor.go in this
-// package; substrate-specific concerns are injected via the interfaces
-// declared here (InstanceInspector, DiagnosticsGatherer,
-// LeaseProvisionStore, SMMetrics) and the closure-bridge fields on
-// LeaseActorConfig (PersistDiagnosticsFn, SendCallbackFn,
-// DoDeprovisionFn, OnTerminated). The Docker backend implements those
-// against its DockerClient + provision-record map; future substrates
-// (K3s, etc.) implement them against their own primitives.
+// package; substrate-specific concerns are injected via the narrow interfaces
+// and construction-bound handlers declared here. The Docker backend implements
+// those against its Docker client, durable settlement coordinators, and
+// provision projection; future substrates provide their own implementations.
 //
-// This package exports NO test scaffolding. Substrate tests that need to
-// drive a lease through the SM route a message through the actor's inbox
-// exactly as production does — ProvisionRequestedMsg and friends are
-// exported for that purpose (see LeaseActor.TryEnqueue) — and synchronize
-// on the flow's terminal observable, which for the provision flow is the
-// callback emitted by the entry action. Helpers private to leasesm itself
-// live in this package's *_test.go files.
+// This package exports no test scaffolding. Substrate code and tests obtain
+// sealed actor messages only from validating constructors, route them through
+// LeaseActor.TryEnqueue, and synchronize through receive-only reply handles or
+// terminal observables. Helpers private to leasesm itself live in *_test.go.
 package leasesm
 
 import (
@@ -108,41 +102,44 @@ type DiagnosticsGatherer interface {
 // these fields exclusively; substrate-specific state is kept
 // substrate-side and never reaches this struct.
 //
-// Substrate implementations typically embed ProvisionState in a
-// wrapper struct alongside any substrate-private fields they need to
-// keep per-lease. The Docker backend uses
-//
-//	type provision struct {
-//	    leasesm.ProvisionState
-//	    VolumeCleanupAttempts int
-//	}
-//
-// so the per-lease counter rides on the same allocation as the
-// ProvisionState and gets cleared structurally on each new provision.
-// The LeaseProvisionStore adapter passes &p.ProvisionState through the
-// Get / UpdateFn seams; substrate-private wrapper fields are NOT
-// reachable through the interface — the SM has no business reading
-// them.
+// Substrate implementations may embed ProvisionState in a private wrapper, but
+// the LeaseProvisionStore exposes only ProvisionState. Substrate-private data
+// is therefore not reachable by the state machine.
 //
 // Manifest and StackManifest are substrate-shared schema (lifted to
 // internal/backend/shared/manifest in PR2) — they live here even
 // though substrates translate them to substrate-specific shapes
 // (Docker compose-spec, K8s pod spec) at provision time.
 type ProvisionState struct {
-	LeaseUUID    string
-	Tenant       string
-	ProviderUUID string
-	SKU          string
-	Status       backend.ProvisionStatus
-	Quantity     int
-	CreatedAt    time.Time
-	FailCount    int
-	LastError    string
-	Reason       backend.Reason // curated failure-category code (ENG-508), authored at source
-	Message      string         // curated human message (== on-chain CallbackErr)
-	CallbackURL  string
-	Items        []backend.LeaseItem
-	ContainerIDs []string
+	LeaseUUID            string
+	Tenant               string
+	ProviderUUID         string
+	SKU                  string
+	Status               backend.ProvisionStatus
+	Quantity             int
+	CreatedAt            time.Time
+	FailCount            int
+	LastError            string
+	Reason               backend.Reason // curated failure-category code (ENG-508), authored at source
+	Message              string         // curated human message (== on-chain CallbackErr)
+	CallbackURL          string
+	LifecycleCallbackURL string
+	// ActiveReleaseVersion is the exact durable Release generation represented
+	// by this projection. It is set only from a committed or recovered Release;
+	// zero means no active runtime exists yet. Maintenance preserves the
+	// originating OperationID, so observations must compare this version too.
+	ActiveReleaseVersion int
+	// ActiveOperationID is the typed generation which owns the current runtime.
+	// Autonomous observations must return this exact identity to the callback
+	// publisher; zero deliberately cannot authorize lifecycle publication.
+	ActiveOperationID shared.OperationID
+	Items             []backend.LeaseItem
+	// ResourceProfiles is the immutable capacity authority paired with Items.
+	// It belongs in the actor-owned projection so a recovered maintenance
+	// target cannot publish new topology while retaining source-generation
+	// resource accounting.
+	ResourceProfiles []shared.SKUResourceSnapshot
+	ContainerIDs     []string
 	// Manifest field deleted in Task 15 — all leases are stack-shaped
 	// post-migration; per-service refs go through StackManifest.Services.
 	StackManifest     *manifest.StackManifest
@@ -168,7 +165,7 @@ type ProvisionState struct {
 //
 //   - block on any external resource (network, disk I/O, channel
 //     send/receive) — it runs under the mutex and will starve other
-//     UpdateFn / Get callers
+//     UpdateFn / LookupStatus / Exists callers
 //   - call any other method on the same LeaseProvisionStore (deadlock
 //     under typical mutex implementations)
 //   - retain the *ProvisionState pointer beyond closure return — the
@@ -189,7 +186,7 @@ type ProvisionState struct {
 //	    callbackURL = p.CallbackURL // capture for post-Unlock use
 //	})
 //	// post-Unlock work uses the captured callbackURL
-//	cfg.SendCallbackFn(uuid, callbackURL, backend.CallbackStatusSuccess, "")
+//	cfg.SendOperationSuccessFn(uuid, callbackURL, committedRelease)
 //
 // Pick outer-capture for ALL UpdateFn call sites — mixing capture-style
 // and a hypothetical "UpdateFn returns values" extension is a
@@ -218,10 +215,11 @@ type ProvisionState struct {
 // behind captured flags. PR5 sets that pattern; future contributors
 // must preserve it.
 //
-// # Actor-sole-writer invariant (ENG-229)
+// # Actor projection-writer invariant (ENG-229)
 //
-// All live ProvisionState mutations occur on the lease actor goroutine via
-// UpdateFn/Delete, with exactly TWO documented exceptions:
+// Live ProvisionState transitions occur on the lease actor goroutine via
+// UpdateFn/Delete. A worker may publish the exact terminal projection before
+// handing its sealed result back to the actor:
 //
 //  1. The success-path pre-publish of ContainerIDs/ServiceContainers in
 //     spawnProvisionWorker/spawnReplaceWorker runs on the WORKER goroutine
@@ -235,38 +233,45 @@ type ProvisionState struct {
 //     Routing this through an actor message is PROHIBITED: the actor is blocked
 //     in waitForWorkers() and cannot dequeue the publish message the worker must
 //     send to release the barrier (actor self-deadlock). Bounded escape: a worker
-//     exceeding workExitWaitTimeout (75s; diagnosticsGatherTimeout 30s is the
-//     inner budget) degrades to a recoverState-reconciled zombie, never to state
-//     corruption.
-//  2. The deprovision volume-retry block (docker backend) keeps ONLY the
-//     docker-private VolumeCleanupAttempts increment in a short direct
-//     provisionsMu span — that counter is not a ProvisionState field, so it
-//     cannot route through UpdateFn. The ProvisionState writes that follow
-//     (ContainerIDs/Status/LastError) DO route through UpdateFn, and the
-//     give-up branch deletes via Delete (ENG-285). The split across two
-//     critical sections is safe because recoverState's Deprovisioning
-//     preserve-case keeps the in-flight entry by pointer across its map swap,
-//     so the same *provision (and its counter) is seen by both sections. A
-//     hung volume.Destroy still blocks the actor for that lease until
-//     ctx/timeout.
+//     exceeding WorkerDrainTimeout (75s by default;
+//     diagnosticsGatherTimeout 30s is the inner budget) refuses the state
+//     transition and therefore cannot authorize conflicting teardown.
+//
+// Destructive close progress is not projected through this store. It belongs
+// to the durable close journal and its typed execution-generation protocol, so
+// a process restart cannot reset progress or turn a retry count into authority.
 type LeaseProvisionStore interface {
-	// Get returns a SHALLOW value-copy snapshot of the provision state
-	// and ok=true when the lease exists. Callers receive the copy by
-	// value — they do NOT hold any lock after Get returns. Slices
-	// and maps inside ProvisionState are shared with the underlying
-	// record (no deep copy); callers must NOT mutate them. Use
-	// UpdateFn for any mutation.
-	Get(leaseUUID string) (state *ProvisionState, ok bool)
+	// LookupStatus returns only the scalar actor projection needed to seed and
+	// guard the FSM. Reference-bearing provision fields never escape the store
+	// lock through this seam.
+	LookupStatus(leaseUUID string) (backend.ProvisionStatus, bool)
+
+	// Exists performs the two deprovision existence checks without manufacturing
+	// a broad mutable snapshot.
+	Exists(leaseUUID string) bool
+
+	// ClassifyReadyRuntime compares an exact durable runtime generation with the
+	// current actor projection. It must return Current only when the projection
+	// is Ready and carries the same positive release version plus either the
+	// same typed operation ID or the explicit legacy class with a zero operation
+	// ID.
+	ClassifyReadyRuntime(shared.RuntimeGenerationProof) ObservationGenerationState
+
+	// ClassifyReadyInstance additionally requires instanceID to belong to that
+	// exact Ready projection.
+	ClassifyReadyInstance(shared.RuntimeGenerationProof, string) ObservationGenerationState
 
 	// UpdateFn applies fn to the provision record under one critical
 	// section. Returns true if the lease existed and fn was applied,
 	// false otherwise. Implementations MUST hold the same mutex that
 	// guards direct accesses for the duration of fn — the closure
-	// runs inside the lock.
+	// runs inside the lock. Substrate observability derived from a status
+	// transition (for example, Ready population) MUST be committed before that
+	// same critical section is released; callers do not emit a second delta.
 	UpdateFn(leaseUUID string, fn func(*ProvisionState)) bool
 
 	// Delete removes the lease's live record. Returns true if an entry was
-	// present. Takes the same mutex as Get/UpdateFn, so a concurrent Get
+	// present. Takes the same mutex as LookupStatus/Exists/UpdateFn, so a concurrent scalar read
 	// observes the removal. Like UpdateFn, MUST NOT be called from inside an
 	// UpdateFn closure (re-entrant lock → deadlock).
 	Delete(leaseUUID string) bool
@@ -293,8 +298,6 @@ type SMMetrics interface {
 	WorkerPanic(workerType string)
 	ActorPanic()
 	TerminalEventDropped(event string)
-	ActiveProvisionsInc()
-	ActiveProvisionsDec()
 }
 
 // LeaseActorConfig groups the dependencies a lease actor receives at
@@ -308,16 +311,32 @@ type SMMetrics interface {
 // preserve their existing "only delete if I'm still the registered
 // actor" semantics by closing over the actor pointer.
 type LeaseActorConfig struct {
-	LeaseUUID      string
-	Logger         *slog.Logger
-	StopCtx        context.Context
-	WG             *sync.WaitGroup
-	Inspector      InstanceInspector
-	Diag           DiagnosticsGatherer
-	CallbackSender *shared.CallbackSender
-	ProvisionStore LeaseProvisionStore
-	OnTerminated   func(leaseUUID string)
-	Metrics        SMMetrics
+	LeaseUUID string
+	Logger    *slog.Logger
+	StopCtx   context.Context
+	WG        *sync.WaitGroup
+	// WorkerDrainTimeout bounds transitions that must cancel and join an
+	// in-flight mutation worker before the destination state is safe to enter.
+	// Zero selects the package default. Tests and future substrates may use a
+	// shorter positive value; production callers should normally leave it zero.
+	WorkerDrainTimeout time.Duration
+	Inspector          InstanceInspector
+	Diag               DiagnosticsGatherer
+	ProvisionStore     LeaseProvisionStore
+	OnTerminated       func(leaseUUID string, actor *LeaseActor)
+	Metrics            SMMetrics
+
+	// Mutation handlers are fixed once, at actor construction. Commands carry
+	// only their exact journal-issued authority; they cannot splice authority
+	// from one operation together with a caller-selected closure that mutates a
+	// different substrate target before outcome validation. The maintenance
+	// handler dispatches restart/update from target.Intent().Kind().
+	ProvisionWorkFn   func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome
+	RestoreWorkFn     func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome
+	MaintenanceWorkFn func(
+		context.Context,
+		shared.MaintenanceReleaseClaim,
+	) ReplaceWorkOutcome
 
 	// PersistDiagnosticsFn writes a failure diagnostic to the
 	// substrate's diagnostics store, including a fresh fetch of
@@ -327,28 +346,46 @@ type LeaseActorConfig struct {
 	// log internally and are not propagated.
 	PersistDiagnosticsFn func(entry shared.DiagnosticEntry, containerIDs []string, keys map[string]string)
 
-	// PersistDiagnosticsWithLogsFn writes a failure diagnostic to the
-	// substrate's diagnostics store using PRE-CAPTURED logs. Used by
-	// failure-path workers that captured logs BEFORE cleanup tore the
-	// containers down (re-fetching after cleanup would hit deleted
-	// containers).
-	PersistDiagnosticsWithLogsFn func(entry shared.DiagnosticEntry, logs map[string]string)
+	// SendOperationSuccessFn dispatches an exact Provision/Restore success only
+	// with the opaque proof returned after its active Release committed.
+	SendOperationSuccessFn func(
+		committed shared.OperationReleaseCommitted,
+	)
+	// SendOperationFailureFn dispatches a definitive Provision/Restore failure.
+	// Separate function types prevent a caller-selected status from bypassing
+	// the committed-release proof required by success.
+	SendOperationFailureFn func(shared.OperationReleaseUncommitted, string)
 
-	// SendCallbackFn dispatches a callback (success or failure) for
-	// the given lease/URL pair. The substrate adapter handles error
-	// truncation, HMAC signing, retry, and store persistence; the SM
-	// only supplies the inputs.
-	SendCallbackFn func(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string)
+	// SendLifecycleFailureFn is the sole callback surface for autonomous
+	// substrate observations. Success is not representable here; successful
+	// maintenance and operation completions require their exact terminal proof.
+	SendLifecycleFailureFn func(shared.RuntimeGenerationProof, string)
 
-	// DoDeprovisionFn dispatches the substrate-specific deprovision
-	// flow for the given lease. Called from handleDeprovision after
-	// the SM's evDeprovisionRequested fires.
+	// Maintenance completion is split by terminal proof type. The actor cannot
+	// select a status independently of the exact ReleaseStore fact committed by
+	// its worker, and close cannot coalesce either exact completion.
+	SendMaintenanceSuccessFn func(
+		active shared.MaintenanceReleaseActive,
+	)
+	SendMaintenanceFailureFn func(
+		failed shared.MaintenanceReleaseFailure,
+		errMsg string,
+	)
+
+	// RecoveryLineage binds this actor to its backend's exact recovery
+	// coordinator. It cannot mint authority by itself; handleDeprovision combines
+	// it with the exact actor identity after the transition drains workers.
+	RecoveryLineage shared.RecoveryLineage
+
+	// DoDeprovisionFn dispatches substrate-specific deprovision with the
+	// callback-lifetime authority minted by the exact actor only after its
+	// deprovision transition has drained mutation workers.
 	//
 	// The ctx threaded in MUST be the actor-owned ctx delivered with
-	// the inbound DeprovisionMsg (which itself carries the caller's
+	// the inbound deprovision command (which itself carries the caller's
 	// ctx from Backend.Deprovision). Substrate implementers MUST NOT
 	// substitute a caller-imported ctx or a fresh ctx here — the
 	// actor's serial processing of inbound messages depends on each
 	// handler honoring the inbound ctx for cancellation semantics.
-	DoDeprovisionFn func(ctx context.Context, leaseUUID string) error
+	DoDeprovisionFn func(ctx context.Context, scope ActorCloseScope) error
 }

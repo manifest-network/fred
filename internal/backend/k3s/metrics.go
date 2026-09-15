@@ -44,13 +44,14 @@ var (
 		[]string{"outcome"},
 	)
 
-	// callbackStoreErrorsTotal counts bbolt errors persisting pending
-	// callbacks. Any non-zero value indicates the disk-backed durability
-	// guarantee is degraded.
+	// callbackStoreErrorsTotal counts failures reading or writing durable
+	// callback evidence, including fail-closed interrupted-operation recovery.
+	// Any non-zero value indicates the disk-backed durability guarantee is
+	// degraded.
 	callbackStoreErrorsTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "fred_k3s_backend_callback_store_errors_total",
-			Help: "Total bbolt errors persisting pending callbacks in the k3s backend.",
+			Help: "Total failures accessing durable callback evidence in the k3s backend, including interrupted-operation recovery.",
 		},
 	)
 )

@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"maps"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,10 +79,6 @@ type EventSubscriber struct {
 	// closed is set to 1 when Close() is called to prevent races between
 	// broadcast() and Close(). Using atomic to avoid lock contention.
 	closed atomic.Bool
-
-	// broadcastWg tracks in-flight broadcasts so Close() can wait for them
-	// to complete before closing channels. This prevents sending to closed channels.
-	broadcastWg sync.WaitGroup
 
 	// Track invalid messages for escalated logging
 	invalidMsgCount    int
@@ -177,61 +171,27 @@ func (s *EventSubscriber) Unsubscribe(ch chan LeaseEvent) {
 // broadcast sends an event to all subscribers. Non-blocking: if a subscriber's
 // channel is full, the event is dropped for that subscriber with a warning.
 func (s *EventSubscriber) broadcast(event LeaseEvent) {
-	// CRITICAL: Add to WaitGroup FIRST, before any closed check.
-	// This ensures Close().Wait() will block until we're done.
-	// The sequence must be:
-	//   1. broadcast() calls Add(1)
-	//   2. Close() sets closed=1
-	//   3. Close() calls Wait() - blocks because counter > 0
-	//   4. broadcast() checks closed, sees 1, returns (defer calls Done())
-	//   5. Wait() unblocks
-	// If we checked closed first, there's a race where Close() could finish
-	// before we call Add(), and we'd send to closed channels.
-	s.broadcastWg.Add(1)
-	defer s.broadcastWg.Done()
-
-	// Check if closed - if so, return early (Done() is deferred)
+	// Sends are nonblocking, so the existing subscriber lock can own their
+	// entire lifetime. Unsubscribe and Close take its write side before closing
+	// channels; no separate admission counter or panic recovery is needed.
+	s.subscribersMu.RLock()
 	if s.closed.Load() {
+		s.subscribersMu.RUnlock()
 		return
 	}
-
-	// Collect subscriber channels under lock, then release lock before sending.
-	// This prevents deadlock if a subscriber's handler calls Unsubscribe(),
-	// and ensures we don't hold the lock during potentially slow operations.
-	s.subscribersMu.RLock()
-	channels := slices.Collect(maps.Keys(s.subscribers))
-	s.subscribersMu.RUnlock()
-
-	// Send to all channels without holding the lock.
-	// Close() waits on broadcastWg before closing channels, so that path is safe.
-	// Unsubscribe() may close a channel concurrently; trySend() recovers from
-	// the resulting panic (the event is for a departing subscriber anyway).
-	for _, ch := range channels {
-		s.trySend(ch, event)
-	}
-}
-
-// trySend attempts to send an event to a subscriber channel.
-// Non-blocking and panic-safe (handles closed channels gracefully).
-func (s *EventSubscriber) trySend(ch chan LeaseEvent, event LeaseEvent) {
-	// Recover from panic if channel was closed (defensive programming)
-	defer func() {
-		if r := recover(); r != nil {
-			slog.Warn("recovered from send on closed channel",
-				"event_type", event.Type,
-				"lease_uuid", event.LeaseUUID,
-			)
+	var dropped int
+	for ch := range s.subscribers {
+		select {
+		case ch <- event:
+		default:
+			dropped++
 		}
-	}()
-
-	select {
-	case ch <- event:
-	default:
-		metrics.EventsDroppedTotal.WithLabelValues(string(event.Type)).Inc()
-		slog.Warn("subscriber channel full, dropping event",
-			"event_type", event.Type,
-			"lease_uuid", event.LeaseUUID,
-		)
+	}
+	s.subscribersMu.RUnlock()
+	if dropped != 0 {
+		metrics.EventsDroppedTotal.WithLabelValues(string(event.Type)).Add(float64(dropped))
+		slog.Warn("subscriber channels full, dropping event",
+			"event_type", event.Type, "lease_uuid", event.LeaseUUID, "subscribers", dropped)
 	}
 }
 
@@ -680,15 +640,9 @@ func (s *EventSubscriber) Close() {
 	}
 	s.mu.Unlock()
 
-	// Wait for any in-flight broadcasts to complete before closing channels.
-	// This prevents sending to closed channels and eliminates the need for
-	// panic recovery in trySend(). The closed flag ensures no NEW broadcasts
-	// will call Add() after this Wait() starts.
-	s.broadcastWg.Wait()
-
-	// Now safe to close all subscriber channels - no broadcasts are in flight.
+	// The write lock waits for nonblocking fan-out and excludes Unsubscribe.
 	s.subscribersMu.Lock()
-	for _, ch := range slices.Collect(maps.Keys(s.subscribers)) {
+	for ch := range s.subscribers {
 		close(ch)
 	}
 	clear(s.subscribers)

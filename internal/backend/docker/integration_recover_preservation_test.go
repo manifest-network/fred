@@ -5,7 +5,6 @@ package docker
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -49,7 +48,7 @@ import (
 // this test locks in against the real pool + real Docker daemon.
 func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *testing.T) {
 	mountPath := setupBtrfsLoopback(t)
-	leaseUUID := fmt.Sprintf("recover-preserve-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	const sku = "docker-small" // stateful: DiskMB=1024 (defaultTestSKUProfiles)
 
@@ -58,6 +57,7 @@ func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
 		// Manual recoverState control only — no background reconcile loop and
@@ -73,15 +73,17 @@ func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *
 	appManifest := manifest.Manifest{Image: "redis:7", Command: []string{"sleep", "3600"}}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	// 1. Provision the real stateful lease.
 	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       tenant,
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: sku, Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               tenant,
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: sku, Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	}))
 	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, callbackCh, leaseUUID, 3*time.Minute).Status)
 
@@ -119,12 +121,17 @@ func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *
 	failedInfo := getProvisionInfo(t, b, leaseUUID)
 	require.Equal(t, backend.ProvisionStatusFailed, failedInfo.Status)
 
-	// 4. Remove the exited container out-of-band via the backend's own Docker
-	// client — NOT via Deprovision — so the tracked Failed lease now has no
-	// container left anywhere. This is the pre-ENG-567 danger zone: the
-	// allowlist saw Failed + VolumeCleanupAttempts==0 (no Deprovision ever
-	// ran) and dropped the pool key here.
-	require.NoError(t, b.docker.RemoveContainer(ctx, containerID))
+	// 4. Remove the exited container out-of-band through an independent Docker
+	// client — NOT via the backend or Deprovision — so the tracked Failed lease
+	// now has no container left anywhere. Keeping this mutation outside Backend
+	// also preserves its construction-time split between read authority and
+	// mutation capabilities. This is the pre-ENG-567 danger zone: the allowlist
+	// saw Failed + VolumeCleanupAttempts==0 (no Deprovision ever ran) and dropped
+	// the pool key here.
+	externalDocker, err := NewDockerClient(t.Context(), "", "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = externalDocker.Close() })
+	require.NoError(t, externalDocker.RemoveContainer(ctx, containerID))
 
 	// 5. Run recoverState again with the container gone.
 	require.NoError(t, b.RefreshState(ctx))

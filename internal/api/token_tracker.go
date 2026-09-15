@@ -8,33 +8,35 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
 )
 
-// Retry configuration for bbolt operations under contention.
-const (
-	bboltMaxRetries     = 3
-	bboltInitialBackoff = 10 * time.Millisecond
-	bboltMaxBackoff     = 100 * time.Millisecond
-)
-
 var (
 	// ErrTokenAlreadyUsed indicates the token has already been used.
 	ErrTokenAlreadyUsed = errors.New("token already used")
+
+	// ErrInvalidReplayClaim indicates absent validation or an expired token.
+	ErrInvalidReplayClaim = errors.New("invalid or expired replay claim")
 
 	// bucketName is the bbolt bucket for storing used tokens.
 	bucketName = []byte("used_tokens")
 )
 
+// TokenReplayClaim binds the canonical signature to its signed validity window.
+// Only successful cryptographic validation creates a usable claim; callers cannot
+// choose a different cache key or shorten the replay lifetime.
+type TokenReplayClaim struct {
+	signature string
+	expiresAt time.Time
+}
+
 // TokenTracker tracks used authentication tokens to prevent replay attacks.
 // It uses bbolt for persistence across restarts.
 type TokenTracker struct {
 	db              *bolt.DB
-	maxAge          time.Duration
 	cleanupInterval time.Duration
 
 	// For graceful shutdown
@@ -47,7 +49,6 @@ type TokenTracker struct {
 // TokenTrackerConfig configures the token tracker.
 type TokenTrackerConfig struct {
 	DBPath          string        // Path to bbolt database file
-	MaxAge          time.Duration // How long to track tokens (should match MaxTokenAge)
 	CleanupInterval time.Duration // How often to clean up expired entries
 }
 
@@ -58,8 +59,7 @@ func NewTokenTracker(cfg TokenTrackerConfig) (*TokenTracker, error) {
 	}
 
 	// Apply defaults using cmp.Or (returns first non-zero value)
-	maxAge := cmp.Or(cfg.MaxAge, MaxTokenAge)
-	cleanupInterval := cmp.Or(cfg.CleanupInterval, maxAge) // Default: clean up as often as tokens expire
+	cleanupInterval := cmp.Or(cfg.CleanupInterval, MaxTokenAge)
 
 	db, err := bolt.Open(cfg.DBPath, 0600, &bolt.Options{
 		Timeout: 5 * time.Second,
@@ -81,7 +81,6 @@ func NewTokenTracker(cfg TokenTrackerConfig) (*TokenTracker, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &TokenTracker{
 		db:              db,
-		maxAge:          maxAge,
 		cleanupInterval: cleanupInterval,
 		cancel:          cancel,
 		wg:              &sync.WaitGroup{},
@@ -99,67 +98,20 @@ func NewTokenTracker(cfg TokenTrackerConfig) (*TokenTracker, error) {
 	return t, nil
 }
 
-// TryUse attempts to mark a token as used.
-// Returns nil if the token was successfully marked (first use).
-// Returns ErrTokenAlreadyUsed if the token has already been used.
-// The key should be the token's signature (unique per token).
-func (t *TokenTracker) TryUse(key string) error {
-	keyBytes := []byte(key)
-	now := time.Now()
-	expiresAt := now.Add(t.maxAge)
-
-	// Configure exponential backoff for database contention
-	bo := backoff.NewExponentialBackOff()
-	bo.InitialInterval = bboltInitialBackoff
-	bo.MaxInterval = bboltMaxBackoff
-	bo.MaxElapsedTime = 0 // We control max retries via WithMaxRetries
-
-	// Wrap with max retries
-	boWithRetries := backoff.WithMaxRetries(bo, bboltMaxRetries-1) // -1 because first attempt doesn't count
-
-	operation := func() error {
-		err := t.db.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket(bucketName)
-
-			// Check if token already exists
-			existing := b.Get(keyBytes)
-			if existing != nil {
-				// Token exists - check if it's still valid (not expired)
-				storedExpiry := util.BytesToTime(existing)
-				if now.Before(storedExpiry) {
-					return ErrTokenAlreadyUsed
-				}
-				// Token expired, allow reuse (will be overwritten)
-			}
-
-			// Store token with expiry time
-			return b.Put(keyBytes, util.TimeToBytes(expiresAt))
-		})
-
-		// Don't retry for application-level errors (token already used)
-		if err == nil || errors.Is(err, ErrTokenAlreadyUsed) {
-			return backoff.Permanent(err)
+// TryUse atomically consumes a validated token for its entire signed lifetime.
+// bbolt serializes write transactions; retrying a closed database cannot repair it.
+func (t *TokenTracker) TryUse(claim TokenReplayClaim) error {
+	return t.db.Update(func(tx *bolt.Tx) error {
+		if claim.signature == "" || !time.Now().Before(claim.expiresAt) {
+			return ErrInvalidReplayClaim
 		}
-
-		// Only retry on timeout errors (database locked)
-		if errors.Is(err, bolt.ErrTimeout) || errors.Is(err, bolt.ErrDatabaseNotOpen) {
-			slog.Debug("bbolt timeout, will retry", "error", err)
-			return err
+		b := tx.Bucket(bucketName)
+		key := []byte(claim.signature)
+		if b.Get(key) != nil {
+			return ErrTokenAlreadyUsed
 		}
-
-		// Other errors are not retryable
-		return backoff.Permanent(err)
-	}
-
-	err := backoff.Retry(operation, boWithRetries)
-
-	// Unwrap permanent errors to return the original error
-	var permanentErr *backoff.PermanentError
-	if errors.As(err, &permanentErr) {
-		return permanentErr.Unwrap()
-	}
-
-	return err
+		return b.Put(key, util.TimeToBytes(claim.expiresAt))
+	})
 }
 
 // Healthy checks if the bbolt database is accessible and the token bucket exists.
@@ -209,7 +161,11 @@ func (t *TokenTracker) cleanup() error {
 		var toDelete [][]byte
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			expiresAt := util.BytesToTime(v)
-			if now.After(expiresAt) {
+			// Previous releases stored first-use time + MaxTokenAge. Keep
+			// those rows through the maximum accepted future skew as well,
+			// including across an immediate upgrade/restart. The extra retention
+			// is harmless for new claims, which reject their own expiry.
+			if !expiresAt.IsZero() && !now.Before(expiresAt.Add(MaxFutureClockSkew)) {
 				// Make a copy of the key since cursor reuses the slice
 				keyCopy := make([]byte, len(k))
 				copy(keyCopy, k)

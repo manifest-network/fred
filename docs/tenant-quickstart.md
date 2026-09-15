@@ -290,7 +290,9 @@ Three operations are available on a `ready` (or `failed`) lease:
 ### Restart — same manifest, fresh containers
 
 ```bash
+MAINTENANCE_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
 curl -X POST -H "Authorization: Bearer $(fresh_token)" \
+  -H "Idempotency-Key: $MAINTENANCE_ID" \
   https://fred.example-provider.com:8080/v1/leases/$LEASE_UUID/restart
 ```
 
@@ -300,7 +302,9 @@ Volumes are preserved. Useful when a container is stuck or you want to re-run st
 
 ```bash
 NEW_MANIFEST_B64=$(base64 < new-manifest.json | tr -d '\n')   # portable across GNU and BSD/macOS
+MAINTENANCE_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
 curl -X POST -H "Authorization: Bearer $(fresh_token)" \
+  -H "Idempotency-Key: $MAINTENANCE_ID" \
   -H "Content-Type: application/json" \
   -d "{\"payload\": \"$NEW_MANIFEST_B64\"}" \
   https://fred.example-provider.com:8080/v1/leases/$LEASE_UUID/update
@@ -325,7 +329,13 @@ curl -X POST -H "Authorization: Bearer $(fresh_token)" \
 
 The new lease must be `PENDING` (a fresh lease that hasn't been provisioned) and must match the source lease's item shape — the same service names and quantities — because restore replays the manifest into it exactly like provisioning. The SKU (disk tier) MAY differ from the source's: **promoting** to a same-or-larger tier always succeeds and applies the new `disk_mb` cap, while **demoting** to a smaller tier succeeds only when the retained volume's measured data still fits the smaller tier's `disk_mb` cap. A non-PENDING target returns `409 Conflict`; if no retained data remains for `from_lease_uuid` (the grace window lapsed or the source's backend is gone) you get `404 Not Found`. A restore that **demotes** to a disk tier too small for the retained data is refused with `422 Unprocessable Entity`; the response `error` message begins `retained data exceeds the requested smaller tier` — restore into the original or a larger tier instead. Use [`GET /v1/leases/{uuid}/status`](#step-2-check-lease-status) on the source lease to confirm it is still retained and to read its restore shape before you create the target lease.
 
-Both `/restart` and `/update` (and `/restore`) enforce **replay protection** since they're mutating. Each retry needs a fresh token (hence `$(fresh_token)` rather than a stored `$TOKEN` variable).
+All three mutations require a fresh bearer token for every HTTP attempt (hence
+`$(fresh_token)` rather than a stored `$TOKEN` variable). Restart and update
+also require exactly one canonical UUIDv4 `Idempotency-Key`: create it once for
+one logical command and reuse that same value for every retry. A new logical
+restart/update needs a new UUID. Reusing one UUID for a different kind or
+payload is rejected; a retry of the exact command is recovered without
+repeating an already-admitted container replacement.
 
 To see what's been deployed:
 

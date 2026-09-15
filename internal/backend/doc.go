@@ -43,7 +43,17 @@
 //
 // # Callback Protocol
 //
-// After async provisioning completes, backends call fred's callback URL:
+// ProvisionRequest and RestoreRequest carry two distinct callback URLs. The
+// callback_url is scoped to that exact operation and is used only for its
+// asynchronous success or failure result. Backends preserve the complete URL,
+// including its operation_id query, byte-for-byte. The separate
+// lifecycle_callback_url carries a distinct typed lifecycle_id and is used for
+// later restart/update completion, autonomous failure, or deprovision
+// observations. Those lifecycle callbacks publish status only; they cannot
+// settle an operation or mutate placement or chain state.
+//
+// After async provisioning or restoration completes, backends call the exact
+// operation callback URL:
 //
 //	POST {callback_url}
 //	X-Fred-Signature: t=<unix-timestamp>,sha256=<hmac-sha256-hex>
@@ -51,11 +61,15 @@
 //
 //	{"lease_uuid": "...", "status": "success"|"failed", "error": "..."}
 //
+// Subsequent lifecycle observations use the same request format but are sent
+// to lifecycle_callback_url instead.
+//
 // The HMAC is computed over the four-field canonical string
 // "<timestamp>\n<METHOD>\n<canonical-URI>\n<hex(sha256(body))>" — binding
 // the method and URI prevents cross-endpoint replay, and hashing the body
 // makes the canonical string binary-safe. Callbacks older than 5 minutes
-// are rejected (replay protection); timestamps up to 1 minute in the
-// future are accepted (clock skew tolerance). See internal/hmacauth for
-// the reference implementation.
+// are rejected, bounding same-endpoint replay to that freshness window;
+// there is no nonce cache. Timestamps up to 1 minute in the future are
+// accepted (clock skew tolerance). See internal/hmacauth for the reference
+// implementation.
 package backend

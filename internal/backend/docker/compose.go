@@ -1,9 +1,11 @@
 package docker
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
@@ -11,22 +13,29 @@ import (
 	cliflags "github.com/docker/cli/cli/flags"
 	composeapi "github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/compose/v5/pkg/compose"
+	"github.com/docker/go-connections/sockets"
 	mobyclient "github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
+
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 )
 
-// composeExecutor wraps Docker Compose operations for stack deployments.
-type composeExecutor interface {
-	// Up creates and starts services from the project.
-	// Compose diffs current vs desired state: creates missing containers,
-	// recreates changed ones, starts stopped ones.
-	Up(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error
+// composeReader is the only Compose surface retained by Backend.
+type composeReader interface {
+	// PS lists containers belonging to the project.
+	PS(ctx context.Context, projectName string) ([]composeContainerSummary, error)
+}
+
+// composeMutationSink is captured only by settlement-bound Guards.
+type composeMutationSink interface {
+	// PrepareProject compiles the desired project with its complete admitted images.
+	PrepareProject(*composetypes.Project, map[string]imageexec.Image) (imageexec.PreparedProject, error)
+	// launch creates and starts only services in the prepared project, preserving
+	// the distinction between a daemon rejection and unknown request completion.
+	launch(ctx context.Context, project imageexec.PreparedProject, opts composeUpOpts) daemonLaunchOutcome
 
 	// Down stops and removes all containers for the project.
 	Down(ctx context.Context, projectName string, timeout time.Duration) error
-
-	// PS lists containers belonging to the project.
-	PS(ctx context.Context, projectName string) ([]composeContainerSummary, error)
 }
 
 // composeUpOpts configures a Compose Up operation.
@@ -63,18 +72,75 @@ func composeProjectName(leaseUUID string) string {
 // docker/docker advisories is unmeasured, since buildx still reaches that
 // module via pkg/namesgenerator.
 type composeService struct {
-	backend composeapi.Compose
+	compile func(*composetypes.Project, map[string]imageexec.Image) (imageexec.PreparedProject, error)
+	up      func(context.Context, imageexec.PreparedProject, composeUpOpts) daemonLaunchOutcome
+	down    func(context.Context, string, composeapi.DownOptions) error
+	ps      func(context.Context, string, composeapi.PsOptions) ([]composeapi.ContainerSummary, error)
 }
 
 // newComposeService creates a composeService that uses the Docker daemon at
 // the given host for Compose operations.
-func newComposeService(dockerHost string) (*composeService, error) {
+func newComposeService(dockerHost string, images *imageexec.Admitter) (*composeService, error) {
 	// Silence the Compose library's logrus logger. Compose emits noisy
 	// warnings (e.g., "No resource found to remove") via its own global
 	// logrus instance. Operational information is already logged by the
 	// backend's structured logger.
 	logrus.SetOutput(io.Discard)
+	transport, err := newComposeHTTPTransport(dockerHost)
+	if err != nil {
+		return nil, err
+	}
+	backend, err := newComposeEngine(dockerHost, &http.Client{Transport: transport, CheckRedirect: mobyclient.CheckRedirect})
+	if err != nil {
+		transport.CloseIdleConnections()
+		return nil, err
+	}
+	// Validate the image issuer at construction, before retaining either the
+	// read engine or the factory for invocation-bound launch executors.
+	if _, err := images.NewComposeExecutor(backend.Up); err != nil {
+		transport.CloseIdleConnections()
+		return nil, err
+	}
+	return &composeService{
+		compile: images.Compile, down: backend.Down, ps: backend.Ps,
+		up: func(ctx context.Context, project imageexec.PreparedProject, opts composeUpOpts) daemonLaunchOutcome {
+			scope := new(daemonLaunchScope)
+			defer scope.close()
+			transport, err := newComposeHTTPTransport(dockerHost)
+			if err != nil {
+				return scope.finish(err)
+			}
+			defer transport.CloseIdleConnections()
+			// This client belongs exclusively to this invocation. Even Compose
+			// work which detaches its context still crosses the same closed scope.
+			httpClient := &http.Client{Transport: daemonLaunchTransport{next: transport, scope: scope}, CheckRedirect: mobyclient.CheckRedirect}
+			engine, err := newComposeEngine(dockerHost, httpClient)
+			if err != nil {
+				return scope.finish(err)
+			}
+			executor, err := images.NewComposeExecutor(engine.Up)
+			if err != nil {
+				return scope.finish(err)
+			}
+			return scope.finish(executor.Up(ctx, project, opts.ForceRecreate))
+		},
+	}, nil
+}
 
+func newComposeHTTPTransport(dockerHost string) (*http.Transport, error) {
+	host, err := mobyclient.ParseHostURL(cmp.Or(dockerHost, mobyclient.DefaultDockerHost))
+	if err != nil {
+		return nil, err
+	}
+	transport := &http.Transport{MaxIdleConns: 6, IdleConnTimeout: 30 * time.Second}
+	if err := sockets.ConfigureTransport(transport, host.Scheme, host.Host); err != nil {
+		return nil, err
+	}
+	transport.Proxy = nil
+	return transport, nil
+}
+
+func newComposeEngine(dockerHost string, httpClient *http.Client) (composeapi.Compose, error) {
 	dockerCli, err := command.NewDockerCli(
 		command.WithCombinedStreams(io.Discard),
 	)
@@ -91,7 +157,8 @@ func newComposeService(dockerHost string) (*composeService, error) {
 			if dockerHost != "" {
 				opts = append(opts, mobyclient.WithHost(dockerHost))
 			}
-			return mobyclient.NewClientWithOpts(opts...)
+			opts = append(opts, mobyclient.WithHTTPClient(httpClient))
+			return mobyclient.New(opts...)
 		}),
 	); err != nil {
 		return nil, fmt.Errorf("initialize docker cli: %w", err)
@@ -102,28 +169,19 @@ func newComposeService(dockerHost string) (*composeService, error) {
 		return nil, fmt.Errorf("create compose service: %w", err)
 	}
 
-	return &composeService{
-		backend: backend,
-	}, nil
+	return backend, nil
 }
 
-func (s *composeService) Up(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
-	recreate := composeapi.RecreateDiverged
-	if opts.ForceRecreate {
-		recreate = composeapi.RecreateForce
-	}
-	return s.backend.Up(ctx, project, composeapi.UpOptions{
-		Create: composeapi.CreateOptions{
-			Recreate:      recreate,
-			QuietPull:     true,
-			RemoveOrphans: true,
-		},
-		Start: composeapi.StartOptions{},
-	})
+func (s *composeService) PrepareProject(project *composetypes.Project, images map[string]imageexec.Image) (imageexec.PreparedProject, error) {
+	return s.compile(project, images)
+}
+
+func (s *composeService) launch(ctx context.Context, project imageexec.PreparedProject, opts composeUpOpts) daemonLaunchOutcome {
+	return s.up(ctx, project, opts)
 }
 
 func (s *composeService) Down(ctx context.Context, projectName string, timeout time.Duration) error {
-	return s.backend.Down(ctx, projectName, composeapi.DownOptions{
+	return s.down(ctx, projectName, composeapi.DownOptions{
 		Timeout:       &timeout,
 		RemoveOrphans: true,
 		// Reap anonymous volumes attached to the project's containers (ENG-372).
@@ -137,7 +195,7 @@ func (s *composeService) Down(ctx context.Context, projectName string, timeout t
 }
 
 func (s *composeService) PS(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
-	containers, err := s.backend.Ps(ctx, projectName, composeapi.PsOptions{
+	containers, err := s.ps(ctx, projectName, composeapi.PsOptions{
 		All: true,
 	})
 	if err != nil {

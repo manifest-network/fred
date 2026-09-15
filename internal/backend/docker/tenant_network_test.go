@@ -109,7 +109,10 @@ func TestTenantNetwork_SerializesEnsureAndRelease(t *testing.T) {
 	ctx := context.Background()
 	for range 20 {
 		wg.Go(func() {
-			_, _ = b.ensureTenantNetwork(ctx, "tenant-x")
+			_ = runTenantStorageMutationForTest(t, b, stackFixtureLeaseUUID, "tenant-x",
+				func(mutations *storageMutations) error {
+					return b.ensureTenantNetworkWith(mutations, ctx, "tenant-x")
+				})
 		})
 		wg.Go(func() {
 			_ = b.releaseTenantNetwork(ctx, "tenant-x")
@@ -149,7 +152,10 @@ func TestTenantNetwork_DifferentTenantsRunInParallel(t *testing.T) {
 	for i := range 10 {
 		tenant := string(rune('a'+i)) + "-tenant"
 		wg.Go(func() {
-			_, _ = b.ensureTenantNetwork(ctx, tenant)
+			_ = runTenantStorageMutationForTest(t, b, stackFixtureLeaseUUID, tenant,
+				func(mutations *storageMutations) error {
+					return b.ensureTenantNetworkWith(mutations, ctx, tenant)
+				})
 		})
 	}
 	wg.Wait()
@@ -189,9 +195,11 @@ func TestTenantNetwork_RaceScenario(t *testing.T) {
 
 	// Lease B's doProvision-style ensure call.
 	wg.Go(func() {
-		netID, err := b.ensureTenantNetwork(ctx, "tenant-x")
+		err := runTenantStorageMutationForTest(t, b, stackFixtureLeaseUUID, "tenant-x",
+			func(mutations *storageMutations) error {
+				return b.ensureTenantNetworkWith(mutations, ctx, "tenant-x")
+			})
 		require.NoError(t, err)
-		assert.Equal(t, "net-id", netID)
 	})
 
 	// Lease A's deprovision has already removed its own entry and now

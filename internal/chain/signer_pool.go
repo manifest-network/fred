@@ -1,6 +1,7 @@
 package chain
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,17 +17,12 @@ import (
 
 const cosmosHDCoinType = 118
 
-// nopRelease is the release function returned when Acquire hands back the
-// primary signer (no per-signer mutex to unlock).
-func nopRelease() {}
-
 // SignerPool manages a primary signer and optional sub-signers for parallel
 // transaction broadcasting via CosmosSDK authz.
 type SignerPool struct {
 	primary    *Signer
-	mu         sync.RWMutex // protects subSigners, signerMu, and their correspondence invariant
+	mu         sync.RWMutex // protects the selectable sub-signer set
 	subSigners []*Signer
-	signerMu   []sync.Mutex // per-signer mutex for exclusive access
 	next       atomic.Uint64
 }
 
@@ -295,25 +291,42 @@ func NewSignerPool(cfg SignerPoolConfig) (*SignerPool, error) {
 			"found", len(pool.subSigners), "requested", cfg.SubSignerCount)
 	}
 
-	pool.signerMu = make([]sync.Mutex, len(pool.subSigners))
-
 	return pool, nil
 }
 
-// Acquire returns the next available sub-signer with exclusive access.
-// If no sub-signers exist, returns the primary signer (no locking needed).
-// The caller MUST call the returned release function when done;
-// failing to do so will deadlock the pool.
-func (p *SignerPool) Acquire() (*Signer, bool, func()) {
-	// Snapshot both slices under the same lock so they stay consistent
-	// even if DemoteToSingleSigner runs concurrently.
+// heldSigner is available only inside withSigner's lexical transaction scope.
+// Dispatch accepts this capability instead of an independently selected key.
+type heldSigner struct {
+	signer *Signer
+	isSub  bool
+}
+
+// withSigner owns exclusive account-sequence access through the complete
+// callback, including retries and block inclusion. Primary operations and
+// primary-only fallback share the signer's same context-aware permit.
+func (p *SignerPool) withSigner(ctx context.Context, primaryOnly bool, send func(heldSigner) error) error {
+	signer, isSub, release, err := p.acquire(ctx, primaryOnly)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return send(heldSigner{signer: signer, isSub: isSub})
+}
+
+func (p *SignerPool) acquire(ctx context.Context, primaryOnly bool) (*Signer, bool, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, nil, err
+	}
 	p.mu.RLock()
 	subs := p.subSigners
-	mus := p.signerMu
 	p.mu.RUnlock()
 
-	if len(subs) == 0 {
-		return p.primary, false, nopRelease
+	if primaryOnly || len(subs) == 0 {
+		permit := p.primary.transactionPermit()
+		if err := permit.Acquire(ctx, 1); err != nil {
+			return nil, false, nil, err
+		}
+		return p.primary, false, sync.OnceFunc(func() { permit.Release(1) }), nil
 	}
 
 	n := uint64(len(subs))
@@ -322,21 +335,23 @@ func (p *SignerPool) Acquire() (*Signer, bool, func()) {
 	// Try each signer starting from round-robin target, prefer unlocked.
 	for i := uint64(0); i < n; i++ {
 		idx := (startIdx + i) % n
-		if mus[idx].TryLock() {
-			return subs[idx], true, func() { mus[idx].Unlock() }
+		permit := subs[idx].transactionPermit()
+		if permit.TryAcquire(1) {
+			if err := ctx.Err(); err != nil {
+				permit.Release(1)
+				return nil, false, nil, err
+			}
+			return subs[idx], true, sync.OnceFunc(func() { permit.Release(1) }), nil
 		}
 	}
 
 	// All signers busy — block on the round-robin target.
 	idx := startIdx % n
-	mus[idx].Lock()
-	return subs[idx], true, func() { mus[idx].Unlock() }
-}
-
-// Primary returns the primary signer. Used for operations that must use the
-// provider key (withdrawals, grants, funding).
-func (p *SignerPool) Primary() *Signer {
-	return p.primary
+	permit := subs[idx].transactionPermit()
+	if err := permit.Acquire(ctx, 1); err != nil {
+		return nil, false, nil, err
+	}
+	return subs[idx], true, sync.OnceFunc(func() { permit.Release(1) }), nil
 }
 
 // ProviderAddress returns the primary signer's address.
@@ -388,5 +403,4 @@ func (p *SignerPool) DemoteToSingleSigner() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.subSigners = nil
-	p.signerMu = nil
 }

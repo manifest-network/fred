@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,14 +19,17 @@ import (
 
 	"github.com/manifest-network/fred/internal/api"
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner"
+	maintenanceapp "github.com/manifest-network/fred/internal/provisioner/maintenance"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	restoreapp "github.com/manifest-network/fred/internal/provisioner/restore"
 	"github.com/manifest-network/fred/internal/scheduler"
-	"github.com/manifest-network/fred/internal/tlsconfig"
 	"github.com/manifest-network/fred/internal/watcher"
 )
 
@@ -132,13 +134,52 @@ func run(cmd *cobra.Command, args []string) error {
 		"log_level", cfg.LogLevel,
 	)
 
-	// Create context with cancellation
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Install signal cancellation before any backend I/O. The placement topology
+	// probe may legitimately wait on a down node for its bounded startup budget;
+	// SIGINT/SIGTERM must interrupt that wait instead of being observed only after
+	// every startup phase completes. Runtime components use a separate context so
+	// graceful shutdown can keep callback ingress alive while draining operations.
+	startupCtx, stopStartupSignals := signal.NotifyContext(
+		cmd.Context(), syscall.SIGINT, syscall.SIGTERM,
+	)
+	defer stopStartupSignals()
 
-	// Set up signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	// Callback settlement survives cancellation of startup and ordinary work.
+	// Cancel this context only after callback ingress has drained.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(cmd.Context()))
+	defer cancel()
+	workCtx, cancelWork := context.WithCancel(startupCtx)
+	defer cancelWork()
+
+	// Validate the local placement authority and exact backend storage topology
+	// before signer construction can derive keys or any startup path can query or
+	// write the chain. The returned clients remain identity-bound at every later
+	// read and side-effect boundary.
+	placementStore, backendEntries, err := preparePlacementBackends(startupCtx, cfg)
+	if err != nil {
+		if startupCtx.Err() != nil {
+			slog.Info("provider startup canceled by shutdown signal")
+			return nil
+		}
+		return err
+	}
+	defer placementStore.Close()
+	var (
+		callbackKeyring      map[backendidentity.ID]string
+		legacyCallbackSecret string
+	)
+	if cfg.CallbackSecret != "" {
+		// Config validation permits this compatibility mode only outside
+		// production. Production providerd always constructs the identity-keyed
+		// verifier below.
+		legacyCallbackSecret = string(cfg.CallbackSecret)
+	} else {
+		callbackKeyring, err = callbackHMACSecrets(cfg, placementStore)
+		if err != nil {
+			return fmt.Errorf("build backend callback HMAC keyring: %w", err)
+		}
+	}
+	callbackProofVerifier, callbackProofConsumer := hmacauth.NewCallbackProofBoundary()
 
 	// Initialize signer pool (derives sub-keys on first boot if mnemonic available)
 	signerPool, err := chain.NewSignerPool(chain.SignerPoolConfig{
@@ -217,7 +258,7 @@ func run(cmd *cobra.Command, args []string) error {
 	authzQ := authz.NewQueryClient(chainClient.Conn())
 
 	if signerPool.HasSubSigners() {
-		setupCtx, setupCancel := context.WithTimeout(ctx, 60*time.Second)
+		setupCtx, setupCancel := context.WithTimeout(workCtx, 60*time.Second)
 		if err := chain.EnsureGrantsWithRetry(setupCtx, authzQ, chainClient, signerPool); err != nil {
 			if demoteOnGrantSetupError(err) {
 				// The queries succeeded and told us grants are missing, and we
@@ -243,7 +284,7 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	if signerPool.HasSubSigners() {
-		setupCtx, setupCancel := context.WithTimeout(ctx, 60*time.Second)
+		setupCtx, setupCancel := context.WithTimeout(workCtx, 60*time.Second)
 		bankQ := banktypes.NewQueryClient(chainClient.Conn())
 		if err := chain.EnsureFunding(setupCtx, bankQ, chainClient, signerPool, subSignerMinBalance, subSignerTopUpAmount); err != nil {
 			slog.Warn("initial sub-signer funding failed, sub-signers may be underfunded",
@@ -252,6 +293,11 @@ func run(cmd *cobra.Command, args []string) error {
 			)
 		}
 		setupCancel()
+	}
+
+	if workCtx.Err() != nil {
+		slog.Info("provider startup canceled")
+		return nil
 	}
 
 	// Register the per-signer balance collector. It samples each signer's
@@ -284,51 +330,6 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	slog.Info("event subscriber initialized", "url", cfg.WebSocketURL)
 
-	// Initialize backends
-	slog.Info("initializing provisioner with backends", "count", len(cfg.Backends))
-
-	var backendEntries []backend.BackendEntry
-	for _, bcfg := range cfg.Backends {
-		// Build the per-backend TLS config at the composition root so file-I/O
-		// errors fail startup here (config.Validate has already checked field
-		// pairing and the production_mode skip-verify rule). Left nil when no
-		// TLS fields are set, so plaintext http:// backends are unaffected.
-		var tlsClientConfig *tls.Config
-		if bcfg.TLSCAFile != "" || bcfg.TLSClientCertFile != "" || bcfg.TLSClientKeyFile != "" || bcfg.TLSSkipVerify {
-			tlsClientConfig, err = tlsconfig.ClientConfig(bcfg.TLSCAFile, bcfg.TLSSkipVerify, bcfg.TLSClientCertFile, bcfg.TLSClientKeyFile)
-			if err != nil {
-				return fmt.Errorf("backend %q: build TLS client config: %w", bcfg.Name, err)
-			}
-		}
-
-		client := backend.NewHTTPClient(backend.HTTPClientConfig{
-			Name:                    bcfg.Name,
-			BaseURL:                 bcfg.URL,
-			Timeout:                 bcfg.Timeout,
-			Secret:                  string(cfg.CallbackSecret),
-			TLSClientConfig:         tlsClientConfig,
-			RequestDuration:         metrics.BackendRequestDuration,
-			RequestsTotal:           metrics.BackendRequestsTotal,
-			CircuitBreakerState:     metrics.BackendCircuitBreakerState,
-			MalformedErrorBodyTotal: metrics.BackendMalformedErrorBodyTotal,
-		})
-
-		backendEntries = append(backendEntries, backend.BackendEntry{
-			Backend: client,
-			Match: backend.MatchCriteria{
-				SKUs: bcfg.SKUs,
-			},
-			IsDefault: bcfg.IsDefault,
-		})
-
-		slog.Info("configured backend",
-			"name", bcfg.Name,
-			"url", bcfg.URL,
-			"skus", bcfg.SKUs,
-			"default", bcfg.IsDefault,
-		)
-	}
-
 	// Create backend router
 	backendRouter, err := backend.NewRouter(backend.RouterConfig{
 		Backends:          backendEntries,
@@ -354,56 +355,44 @@ func run(cmd *cobra.Command, args []string) error {
 		slog.Warn("payload store disabled (no payload_store_db_path configured)")
 	}
 
-	// Create placement store if database path is configured (enables round-robin routing).
-	// Use the interface type so that an unset store remains a true nil interface
-	// (a typed nil *placement.Store would pass != nil checks and panic).
-	var placementStore provisioner.PlacementStore
-	if cfg.PlacementStoreDBPath != "" {
-		ps, err := placement.NewStore(cfg.PlacementStoreDBPath)
-		if err != nil {
-			return fmt.Errorf("failed to create placement store: %w", err)
-		}
-		defer ps.Close()
-		placementStore = ps
-		slog.Info("placement store enabled", "db_path", cfg.PlacementStoreDBPath)
-	} else {
-		slog.Warn("placement store disabled (no placement_store_db_path configured)")
-	}
-
-	// Warn if multiple backends share the same SKU without a placement store.
-	// Round-robin will still distribute provisions, but read operations (connection,
-	// logs, provision diagnostics) may route to the wrong backend.
-	if placementStore == nil {
-		matchCount := make(map[string]int)
-		for _, bcfg := range cfg.Backends {
-			for _, sku := range bcfg.SKUs {
-				matchCount["sku:"+sku]++
-			}
-		}
-		for key, count := range matchCount {
-			if count > 1 {
-				slog.Warn("multiple backends share the same SKU match criteria without a placement store; read operations may route incorrectly",
-					"match_key", key,
-					"backend_count", count,
-				)
-			}
-		}
-	}
-
 	// Create event broker for real-time lease event delivery
 	eventBroker := api.NewEventBroker()
 
 	// Create provision manager
 	provisionMgr, err := provisioner.NewManager(provisioner.ManagerConfig{
-		ProviderUUID:    cfg.ProviderUUID,
-		CallbackBaseURL: cfg.CallbackBaseURL,
-		PayloadStore:    payloadStore,
-		PlacementStore:  placementStore,
-		LeaseEventSink:  eventBroker,
-		AckLaneCount:    signerPool.LaneCount(),
+		ProviderUUID:          cfg.ProviderUUID,
+		PayloadStore:          payloadStore,
+		PlacementStore:        placementStore,
+		LeaseEventSink:        eventBroker,
+		AckLaneCount:          signerPool.LaneCount(),
+		AckFlushTimeout:       cfg.TxTimeout,
+		CallbackProofConsumer: callbackProofConsumer,
 	}, backendRouter, chainClient)
 	if err != nil {
 		return fmt.Errorf("failed to create provision manager: %w", err)
+	}
+
+	// Restore is one application workflow with one typed capability graph. The
+	// same operation ID is held by the registry, persisted in the placement
+	// attempt, and carried on the backend callback URL.
+	restoreCoordinator, err := provisionMgr.RestoreCoordinator(
+		placement.RestoreStartObserver(func(leaseUUID, _ string) {
+			eventBroker.Publish(backend.LeaseStatusEvent{
+				LeaseUUID: leaseUUID,
+				Status:    backend.ProvisionStatusRestarting,
+				Timestamp: time.Now(),
+			})
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to bind restore execution coordinator: %w", err)
+	}
+	restoreService, err := restoreapp.NewService(restoreapp.Config{
+		Coordinator: restoreCoordinator,
+		Events:      eventBroker,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create restore service: %w", err)
 	}
 
 	// Create event bridge to forward chain events to Watermill
@@ -411,7 +400,6 @@ func run(cmd *cobra.Command, args []string) error {
 
 	slog.Info("provisioner initialized",
 		"backends", len(cfg.Backends),
-		"callback_url", cfg.CallbackBaseURL,
 	)
 
 	// Initialize watcher for cross-provider events only
@@ -424,15 +412,27 @@ func run(cmd *cobra.Command, args []string) error {
 	// that will merely fail later moves the refusal to *after* the backend has
 	// already applied the update, leaving the lease running a manifest fred has
 	// no durable record of — the ENG-619 outcome the guard exists to prevent.
-	// Same typed-nil gotcha as placementStore above.
-	var payloadPersister api.PayloadPersister
+	// Keep an absent payload store as a true nil interface; a typed nil
+	// *payload.Store would pass != nil checks and panic.
+	var maintenancePayloads placement.MaintenancePayloadPersister
 	if payloadStore != nil {
-		payloadPersister = provisionMgr
+		maintenancePayloads = provisionMgr
+	}
+	maintenanceCoordinator, err := provisionMgr.MaintenanceCoordinator(maintenancePayloads)
+	if err != nil {
+		return fmt.Errorf("failed to create maintenance coordinator: %w", err)
+	}
+	maintenanceService, err := maintenanceapp.NewService(maintenanceapp.Config{
+		Coordinator: maintenanceCoordinator,
+		Events:      eventBroker,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create maintenance service: %w", err)
 	}
 
 	// The health probe goes straight to the store rather than through the
 	// Manager: it asks whether payloads.db is readable, which is a property of
-	// the store alone. Same typed-nil gotcha as placementStore — a nil
+	// the store alone. A nil
 	// *payload.Store assigned to an interface is not a nil interface, and the
 	// health handler would call Healthy() on it.
 	var payloadStoreHealth api.PayloadStoreHealth
@@ -457,22 +457,23 @@ func run(cmd *cobra.Command, args []string) error {
 		IdleTimeout:                 cfg.HTTPIdleTimeout,
 		ShutdownTimeout:             cfg.ShutdownTimeout,
 		MaxRequestBodySize:          cfg.MaxRequestBodySize,
-		CallbackSecret:              string(cfg.CallbackSecret),
+		CallbackSecret:              legacyCallbackSecret,
+		CallbackHMACSecrets:         callbackKeyring,
 		CallbackCanonicalPathPrefix: cfg.CallbackCanonicalPathPrefix,
 		TokenTrackerDBPath:          cfg.TokenTrackerDBPath,
 		CallbackBaseURL:             cfg.CallbackBaseURL,
 	}, api.ServerDeps{
-		ChainClient:        chainClient,
-		BackendRouter:      backendRouter,
-		CallbackPublisher:  provisionMgr,
-		PayloadPublisher:   provisionMgr,
-		PayloadPersister:   payloadPersister,
-		PayloadStoreHealth: payloadStoreHealth,
-		StatusChecker:      provisionMgr,
-		PlacementLookup:    placementStore,
-		RestoreRecorder:    provisionMgr,
-		RestoreTracker:     provisionMgr,
-		EventBroker:        eventBroker,
+		ChainClient:           chainClient,
+		BackendRouter:         backendRouter,
+		CallbackPublisher:     provisionMgr,
+		PayloadPublisher:      provisionMgr,
+		PayloadStoreHealth:    payloadStoreHealth,
+		StatusChecker:         provisionMgr,
+		PlacementLookup:       placementStore,
+		MaintenanceService:    maintenanceService,
+		RestoreService:        restoreService,
+		EventBroker:           eventBroker,
+		CallbackProofVerifier: callbackProofVerifier,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create API server: %w", err)
@@ -490,11 +491,22 @@ func run(cmd *cobra.Command, args []string) error {
 	})
 
 	// Create reconciler for level-triggered state reconciliation
+	reconciliationCoordinator, err := provisionMgr.ReconciliationCoordinator(
+		placement.ProvisionStartObserver(func(leaseUUID, _ string) {
+			eventBroker.Publish(backend.LeaseStatusEvent{
+				LeaseUUID: leaseUUID,
+				Status:    backend.ProvisionStatusProvisioning,
+				Timestamp: time.Now(),
+			})
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to bind reconciliation coordinator: %w", err)
+	}
 	reconciler, err := provisioner.NewReconciler(provisioner.ReconcilerConfig{
-		ProviderUUID:    cfg.ProviderUUID,
-		CallbackBaseURL: cfg.CallbackBaseURL,
-		Interval:        cfg.ReconciliationInterval,
-	}, chainClient, provisionMgr.AckBatcher(), backendRouter, provisionMgr, placementStore)
+		Interval:    cfg.ReconciliationInterval,
+		Coordinator: reconciliationCoordinator,
+	}, provisionMgr)
 	if err != nil {
 		return fmt.Errorf("failed to create reconciler: %w", err)
 	}
@@ -508,7 +520,11 @@ func run(cmd *cobra.Command, args []string) error {
 	// Each component is wrapped with panic recovery via safeGo() to prevent
 	// silent crashes and convert panics to errors.
 	var wg sync.WaitGroup
-	errChan := make(chan error, 8)
+	// Every long-lived component can report at most one terminal error. Keep
+	// room for all nine (including optional sub-signer maintenance) because the
+	// first error starts shutdown and no goroutine may block its WaitGroup.Done
+	// while trying to report another concurrent failure.
+	errChan := make(chan error, 9)
 
 	// Start API server FIRST and wait for it to be listening.
 	// This is critical because startup reconciliation may trigger backend callbacks
@@ -524,122 +540,127 @@ func run(cmd *cobra.Command, args []string) error {
 		return <-apiErrChan
 	})
 
-	// Start provisioner BEFORE reconciliation so Watermill handlers are subscribed
-	// before any callbacks can arrive. Without this, callbacks from backends
-	// triggered by reconciliation would fail with "No subscribers to send message".
+	// Start provisioner BEFORE reconciliation so its callback admission gate,
+	// acknowledgment lanes, and Watermill chain/payload handlers are live before
+	// reconciliation can trigger backend work.
 	safeGo(&wg, errChan, "provision manager", func() error {
 		return provisionMgr.Start(ctx)
 	})
 
-	// Wait for Watermill router to be running before proceeding.
-	// This ensures handlers are subscribed and ready to receive callbacks.
-	select {
-	case <-provisionMgr.Running():
-		slog.Info("provision manager handlers ready")
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(10 * time.Second):
-		return fmt.Errorf("timeout waiting for provision manager to start")
-	}
+	// Every exit after the API starts joins the same shutdown path.
+	startupErr := func() error {
+		// Wait for the provisioner runtime to be running before proceeding. Callback
+		// admission opens just before Watermill starts its chain/payload handlers.
+		select {
+		case <-provisionMgr.Running():
+			slog.Info("provision manager handlers ready")
+		case <-workCtx.Done():
+			return workCtx.Err()
+		case <-time.After(10 * time.Second):
+			return fmt.Errorf("timeout waiting for provision manager to start")
+		}
 
-	// Perform startup operations sequentially to avoid same-block transaction conflicts
-	// WithdrawOnce waits for block inclusion before returning, ensuring the next tx is in a different block
-	slog.Info("performing initial withdrawal")
-	if err := withdrawScheduler.WithdrawOnce(ctx); err != nil {
-		slog.Error("initial withdrawal failed", "error", err)
-		// Continue — periodic scheduler will retry
-	}
-
-	// Run startup reconciliation to recover from any crash
-	// This compares chain state vs backend state and fixes inconsistencies
-	// Note: API server is already listening and handlers are subscribed, so callbacks can be received
-	slog.Info("performing startup reconciliation")
-	if err := reconciler.RunOnce(ctx); err != nil {
-		slog.Error("startup reconciliation failed", "error", err)
-		// Continue anyway - periodic reconciliation will retry
-	}
-
-	// Start event subscriber (single reader, multiple consumers via Subscribe())
-	safeGo(&wg, errChan, "event subscriber", func() error {
-		return eventSub.Start(ctx)
-	})
-
-	// Start event bridge (subscribes to eventSub, forwards to Watermill)
-	safeGo(&wg, errChan, "event bridge", func() error {
-		return eventBridge.Start(ctx)
-	})
-
-	// Start watcher for cross-provider events (subscribes to eventSub)
-	safeGo(&wg, errChan, "watcher", func() error {
-		return leaseWatcher.Start(ctx)
-	})
-
-	// Start withdrawal scheduler
-	safeGo(&wg, errChan, "scheduler", func() error {
-		return withdrawScheduler.Start(ctx)
-	})
-
-	// Start periodic reconciliation
-	safeGo(&wg, errChan, "reconciler", func() error {
-		return reconciler.Start(ctx)
-	})
-
-	// Start periodic sub-signer maintenance (if multi-signer). Both halves are
-	// level-triggered: EnsureGrants and EnsureFunding each compare the desired
-	// state against the chain and converge, so neither depends on the startup
-	// pass having succeeded. That is what makes a boot whose grant queries timed
-	// out recover on its own instead of staying degraded until someone restarts
-	// providerd (ENG-688).
-	if signerPool.HasSubSigners() {
-		bankQ := banktypes.NewQueryClient(chainClient.Conn())
-		safeGo(&wg, errChan, "sub-signer maintenance", func() error {
-			ticker := time.NewTicker(cfg.SubSignerFundCheckInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-ticker.C:
-					// Each half gets its own budget: a slow grant sweep must not
-					// eat the funding sweep's, or a chain that is merely sluggish
-					// would starve the top-ups.
-					grantCtx, grantCancel := context.WithTimeout(ctx, 60*time.Second)
-					// Plain EnsureGrants, not the retry wrapper: the loop is the retry.
-					outcome := metrics.OutcomeSuccess
-					if err := chain.EnsureGrants(grantCtx, authzQ, chainClient, signerPool); err != nil {
-						slog.Warn("sub-signer grant check failed", "error", err)
-						outcome = metrics.OutcomeError
-					}
-					metrics.SignerGrantCheckTotal.WithLabelValues(outcome).Inc()
-					grantCancel()
-
-					fundCtx, fundCancel := context.WithTimeout(ctx, 60*time.Second)
-					if err := chain.EnsureFunding(fundCtx, bankQ, chainClient, signerPool, subSignerMinBalance, subSignerTopUpAmount); err != nil {
-						slog.Warn("sub-signer funding check failed", "error", err)
-					}
-					fundCancel()
-				}
-			}
+		// Durable maintenance claims were rehydrated during construction, before
+		// any public or reconciliation work became reachable. Resume their backend
+		// commands in the background so a down pinned node delays only its own lease.
+		safeGo(&wg, errChan, "maintenance recovery", func() error {
+			return maintenanceService.Start(workCtx, cfg.ReconciliationInterval)
 		})
-	}
 
-	slog.Info("providerd started successfully",
-		"api_addr", cfg.APIListenAddr,
-		"withdraw_interval", cfg.WithdrawInterval,
-		"reconciliation_interval", cfg.ReconciliationInterval,
-		"rate_limit_rps", cfg.RateLimitRPS,
-		"rate_limit_burst", cfg.RateLimitBurst,
-		"tenant_rate_limit_rps", cfg.TenantRateLimitRPS,
-		"tenant_rate_limit_burst", cfg.TenantRateLimitBurst,
-		"backends", len(cfg.Backends),
-	)
+		// Keep the one-time chain writes sequential; cancellation ends the
+		// startup sequence and joins the callback-preserving shutdown below.
+		if err := runInitialProviderWork(workCtx, withdrawScheduler.WithdrawOnce, reconciler.RunOnce); err != nil {
+			return err
+		}
 
-	// Wait for shutdown signal or error
-	select {
-	case sig := <-sigChan:
-		slog.Info("received shutdown signal", "signal", sig)
-	case err := <-errChan:
-		slog.Error("component error", "error", err)
+		// Start event subscriber (single reader, multiple consumers via Subscribe())
+		safeGo(&wg, errChan, "event subscriber", func() error {
+			return eventSub.Start(workCtx)
+		})
+
+		// Start event bridge (subscribes to eventSub, forwards to Watermill)
+		safeGo(&wg, errChan, "event bridge", func() error {
+			return eventBridge.Start(workCtx)
+		})
+
+		// Start watcher for cross-provider events (subscribes to eventSub)
+		safeGo(&wg, errChan, "watcher", func() error {
+			return leaseWatcher.Start(workCtx)
+		})
+
+		// Start withdrawal scheduler
+		safeGo(&wg, errChan, "scheduler", func() error {
+			return withdrawScheduler.Start(workCtx)
+		})
+
+		// Start periodic reconciliation
+		safeGo(&wg, errChan, "reconciler", func() error {
+			return reconciler.Start(workCtx)
+		})
+
+		// Start periodic sub-signer maintenance (if multi-signer). Both halves are
+		// level-triggered: EnsureGrants and EnsureFunding each compare the desired
+		// state against the chain and converge, so neither depends on the startup
+		// pass having succeeded. That is what makes a boot whose grant queries timed
+		// out recover on its own instead of staying degraded until someone restarts
+		// providerd (ENG-688).
+		if signerPool.HasSubSigners() {
+			bankQ := banktypes.NewQueryClient(chainClient.Conn())
+			safeGo(&wg, errChan, "sub-signer maintenance", func() error {
+				ticker := time.NewTicker(cfg.SubSignerFundCheckInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-workCtx.Done():
+						return nil
+					case <-ticker.C:
+						// Each half gets its own budget: a slow grant sweep must not
+						// eat the funding sweep's, or a chain that is merely sluggish
+						// would starve the top-ups.
+						grantCtx, grantCancel := context.WithTimeout(workCtx, 60*time.Second)
+						// Plain EnsureGrants, not the retry wrapper: the loop is the retry.
+						outcome := metrics.OutcomeSuccess
+						if err := chain.EnsureGrants(grantCtx, authzQ, chainClient, signerPool); err != nil {
+							slog.Warn("sub-signer grant check failed", "error", err)
+							outcome = metrics.OutcomeError
+						}
+						metrics.SignerGrantCheckTotal.WithLabelValues(outcome).Inc()
+						grantCancel()
+
+						fundCtx, fundCancel := context.WithTimeout(workCtx, 60*time.Second)
+						if err := chain.EnsureFunding(fundCtx, bankQ, chainClient, signerPool, subSignerMinBalance, subSignerTopUpAmount); err != nil {
+							slog.Warn("sub-signer funding check failed", "error", err)
+						}
+						fundCancel()
+					}
+				}
+			})
+		}
+
+		slog.Info("providerd started successfully",
+			"api_addr", cfg.APIListenAddr,
+			"withdraw_interval", cfg.WithdrawInterval,
+			"reconciliation_interval", cfg.ReconciliationInterval,
+			"rate_limit_rps", cfg.RateLimitRPS,
+			"rate_limit_burst", cfg.RateLimitBurst,
+			"tenant_rate_limit_rps", cfg.TenantRateLimitRPS,
+			"tenant_rate_limit_burst", cfg.TenantRateLimitBurst,
+			"backends", len(cfg.Backends),
+		)
+
+		// Wait for shutdown signal or error
+		select {
+		case <-workCtx.Done():
+			slog.Info("received shutdown signal")
+		case err := <-errChan:
+			slog.Error("component error", "error", err)
+		}
+
+		return nil
+	}()
+	cancelWork()
+	if startupErr != nil && !errors.Is(startupErr, context.Canceled) {
+		slog.Error("provider startup failed", "error", startupErr)
 	}
 
 	// Graceful shutdown
@@ -651,7 +672,12 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Wait for in-flight provisions to drain BEFORE shutting down the API server.
 	// Backends send completion callbacks via HTTP, so the API server must remain
-	// running to receive them during the drain period.
+	// running to receive them during the drain period. Close ordinary lifecycle
+	// admission first so a tenant request, chain event, or reconciliation action
+	// cannot start new backend work after the drain observes zero. Authenticated
+	// callbacks retain their dedicated settlement/recovery path until HTTP
+	// shutdown closes the ingress boundary.
+	provisionMgr.BeginDrain()
 	drainTimeout := cfg.ShutdownTimeout / 2
 	remaining := provisionMgr.WaitForDrain(shutdownCtx, drainTimeout)
 	if remaining > 0 {
@@ -669,12 +695,11 @@ func run(cmd *cobra.Command, args []string) error {
 	// Close event broker to send clean close frames to all WebSocket clients.
 	eventBroker.Close()
 
-	// Signal all components to stop via context cancellation.
-	// This triggers ctx.Done() in all component loops.
+	// Stop the callback settlement runtime after ingress has drained.
 	cancel()
 
 	// Stop withdrawal scheduler and wait for any in-flight withdrawal to complete.
-	// This ensures we don't interrupt a withdrawal transaction mid-flight.
+	// Its chain work was already canceled with the ordinary work context.
 	withdrawScheduler.Stop()
 
 	// Close event subscriber to unblock any components waiting on events.
@@ -719,5 +744,29 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	slog.Info("providerd stopped")
-	return nil
+	if errors.Is(startupErr, context.Canceled) {
+		return nil
+	}
+	return startupErr
+}
+
+// runInitialProviderWork owns the finite startup sequence. Transient errors are
+// retried by the periodic workers, but cancellation prevents the next phase.
+func runInitialProviderWork(ctx context.Context, withdraw, reconcile func(context.Context) error) error {
+	for _, step := range []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{"initial withdrawal", withdraw},
+		{"startup reconciliation", reconcile},
+	} {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		slog.Info("performing " + step.name)
+		if err := step.run(ctx); err != nil {
+			slog.Error(step.name+" failed", "error", err)
+		}
+	}
+	return ctx.Err()
 }

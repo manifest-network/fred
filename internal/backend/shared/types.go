@@ -23,7 +23,10 @@
 // HMAC types but typically maintain their own registry.
 package shared
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // SKUProfile defines resource limits for a SKU.
 type SKUProfile struct {
@@ -34,6 +37,9 @@ type SKUProfile struct {
 
 // Validate checks that the profile's resource values are valid.
 func (p SKUProfile) Validate() error {
+	if math.IsNaN(p.CPUCores) || math.IsInf(p.CPUCores, 0) {
+		return fmt.Errorf("cpu_cores must be finite")
+	}
 	if p.CPUCores <= 0 {
 		return fmt.Errorf("cpu_cores must be positive")
 	}
@@ -46,8 +52,9 @@ func (p SKUProfile) Validate() error {
 	return nil
 }
 
-// TenantQuotaConfig configures per-tenant resource limits.
-// When set, each tenant's aggregate resource usage is capped.
+// TenantQuotaConfig configures per-tenant resource limits. When set, each
+// tenant's aggregate resource usage is capped; MaxDiskMB is physical admission
+// disk and may include substrate-specific ephemeral scratch.
 type TenantQuotaConfig struct {
 	MaxCPUCores float64 `yaml:"max_cpu_cores"`
 	MaxMemoryMB int64   `yaml:"max_memory_mb"`
@@ -56,6 +63,9 @@ type TenantQuotaConfig struct {
 
 // Validate checks that all quota values are positive.
 func (q TenantQuotaConfig) Validate() error {
+	if math.IsNaN(q.MaxCPUCores) || math.IsInf(q.MaxCPUCores, 0) {
+		return fmt.Errorf("max_cpu_cores must be finite")
+	}
 	if q.MaxCPUCores <= 0 {
 		return fmt.Errorf("max_cpu_cores must be positive")
 	}

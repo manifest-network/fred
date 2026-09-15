@@ -9,39 +9,30 @@ permissions:
   contents: read
 
 jobs:
-  # Green-CI gate: re-run the core checks against the exact tagged commit so we
-  # never publish (and sign) artifacts from code that doesn't build/test/lint
-  # clean. The integration + govulncheck gates already ran when the commit
-  # merged to main; this is the fast, release-blocking subset.
-  verify:
+  provenance:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
-      - name: Build
-        run: go build ./...
-      - name: Test
-        run: go test -short ./...
-      # Fail closed on a missing/empty pin — an empty `version` input makes
-      # golangci-lint-action install "latest", silently unpinning the release gate.
-      - name: Read pinned golangci-lint version
-        id: golangci
+          fetch-depth: 0
+      - name: Require tagged commit in main history
         run: |
-          version="$(cat .golangci-lint-version)"
-          if [ -z "$version" ]; then
-            echo "::error::.golangci-lint-version is empty; refusing to lint with an unpinned golangci-lint."
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Lint
-        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
-        with:
-          version: ${{ steps.golangci.outputs.version }}
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          bash scripts/check-release-source.sh
+
+  # Reuse the complete gates on the exact tagged commit. A prior main/PR run
+  # does not establish that this tag passed integration, race or vulnerability checks.
+  verify:
+    needs: provenance
+    uses: ./.github/workflows/ci.yml
+
+  integration:
+    needs: provenance
+    uses: ./.github/workflows/integration.yml
+    secrets: inherit
 
   release:
-    needs: verify
+    needs: [verify, integration]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub release + upload artifacts

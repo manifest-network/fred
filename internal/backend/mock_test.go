@@ -146,8 +146,10 @@ func TestMockBackend_ListProvisions(t *testing.T) {
 func TestMockBackend_ListProvisions_PopulatesWorkloadFields(t *testing.T) {
 	mock := NewMockBackend(MockBackendConfig{Name: "test"})
 	require.NoError(t, mock.Provision(context.Background(), ProvisionRequest{
-		LeaseUUID: "lease-1",
-		Items:     []LeaseItem{{SKU: "docker-large", Quantity: 3}},
+		LeaseUUID:    "lease-1",
+		ProviderUUID: "provider-a",
+		Tenant:       "tenant-a",
+		Items:        []LeaseItem{{SKU: "docker-large", Quantity: 3}},
 	}))
 
 	provisions, err := mock.ListProvisions(context.Background())
@@ -155,6 +157,8 @@ func TestMockBackend_ListProvisions_PopulatesWorkloadFields(t *testing.T) {
 	require.Len(t, provisions, 1)
 	assert.Equal(t, "docker-large", provisions[0].SKU)
 	assert.Equal(t, 3, provisions[0].Quantity)
+	assert.Equal(t, "provider-a", provisions[0].ProviderUUID)
+	assert.Equal(t, "tenant-a", provisions[0].Tenant)
 }
 
 func TestMockBackend_LookupProvisions(t *testing.T) {

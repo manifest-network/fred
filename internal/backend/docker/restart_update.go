@@ -3,8 +3,10 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -25,7 +27,7 @@ func replaceOpReason(op string) backend.Reason {
 		return backend.ReasonUpdateFailed
 	case "restore":
 		return backend.ReasonRestoreFailed
-	case "restart":
+	case "restart", "custom_domain":
 		return backend.ReasonRestartFailed
 	default:
 		return backend.ReasonInternal
@@ -36,12 +38,9 @@ func replaceOpReason(op string) backend.Reason {
 // given items slice, keyed by ServiceName so it is robust to a recoverState
 // rebuild that reorders Items. No-op when overrides is empty.
 //
-// Two call sites (ENG-231), with opposite intent about WHICH slice to pass:
-//   - routeReplaceRestart passes the off-actor worker-snapshot COPY. It must NOT
-//     pass prov.Items here — that would be an off-actor mutation of live state.
-//   - customDomainOnSuccess passes prov.Items itself, to COMMIT the values. That
-//     is safe (and intended) because it runs on the serial actor goroutine inside
-//     onEnterReadyFromReplaceCompleted's UpdateFn, the sole writer of prov.Items.
+// routeReplaceRestart applies this to the detached target-release copy. The
+// actor later projects that exact durable release; no caller-authored mutation
+// hook crosses the worker boundary.
 func applyCustomDomainOverrides(items []backend.LeaseItem, overrides map[string]string) {
 	if len(overrides) == 0 {
 		return
@@ -53,31 +52,14 @@ func applyCustomDomainOverrides(items []backend.LeaseItem, overrides map[string]
 	}
 }
 
-// customDomainOnSuccess returns an OnSuccess hook that commits the override
-// values into prov.Items. It runs inside onEnterReadyFromReplaceCompleted on the
-// serial actor goroutine, under the same UpdateFn critical section as the
-// Status->Ready flip, and ONLY on a successful redeploy — so the actor commits
-// nothing to prov.Items on a failed redeploy. Returns nil when there are no
-// overrides, preserving the plain-restart behavior. (ENG-231)
-func customDomainOnSuccess(overrides map[string]string) func(*leasesm.ProvisionState) {
-	if len(overrides) == 0 {
-		return nil
-	}
-	// Reuse the worker-snapshot match/assign so the committed prov.Items value
-	// and the rendered container label cannot diverge from a one-sided edit.
-	return func(p *leasesm.ProvisionState) {
-		applyCustomDomainOverrides(p.Items, overrides)
-	}
-}
-
 // Restart restarts containers for a lease without changing the manifest.
 // State machine: Ready|Failed → Restarting → Ready|Failed
 //
 // SEAM CLOSED (ENG-230). This prelude is read-only: it fast-fails on
 // ErrNotProvisioned / ErrInvalidState under provisionsMu, snapshots the
 // fields the worker needs, then does pure work (manifest marshal +
-// release-store Append). It performs NO write to prov.Status /
-// prov.CallbackURL — the lease actor's onEnterRestarting entry action is
+// release-store Append). It performs NO write to prov.Status or either
+// callback URL — the lease actor's onEnterRestarting entry action is
 // the sole writer of those fields, firing inside handleRestartRequested
 // BEFORE the ack. Because Restart() returns only after observing that
 // ack, the "Restart() returns => prov.Status == Restarting" invariant
@@ -100,7 +82,25 @@ func customDomainOnSuccess(overrides map[string]string) func(*leasesm.ProvisionS
 // "deploying" record left behind on routing/ack failure is cosmetic —
 // recover.go skips non-active releases and deprovision deletes them).
 func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error {
-	return b.routeReplaceRestart(ctx, req.LeaseUUID, req.CallbackURL, nil)
+	request, err := b.maintenanceSettlement.NewMaintenanceRequestAuthority(
+		req.MaintenanceID, shared.MaintenanceIntentRestart, req.LeaseUUID,
+		req.CallbackURL, nil,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: invalid restart request authority: %w", backend.ErrValidation, err)
+	}
+	return b.routeReplaceRestart(ctx, request, nil)
+}
+
+// resolveMaintenanceCallbackURLs validates a trusted maintenance route against
+// the authority already persisted with a lease. The callback base may move, but
+// typed identity can never rotate or downgrade; legacy routes remain tokenless.
+func resolveMaintenanceCallbackURLs(
+	callbackURL, lifecycleCallbackURL, requestedLifecycleURL string,
+) (string, string, error) {
+	return backend.ResolveMaintenanceCallbackURLs(
+		callbackURL, lifecycleCallbackURL, requestedLifecycleURL,
+	)
 }
 
 // routeReplaceRestart is the shared restart routing used by the public Restart
@@ -115,8 +115,56 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 // Restart prelude is that custom-domain overrides are applied to the worker's
 // item snapshot (a copy) and committed into prov.Items by the actor's success
 // entry action via OnSuccess (ENG-231).
-func (b *Backend) routeReplaceRestart(ctx context.Context, leaseUUID, callbackURL string, overrides map[string]string) error {
-	logger := b.logger.With("lease_uuid", leaseUUID)
+func (b *Backend) routeReplaceRestart(
+	ctx context.Context,
+	request shared.MaintenanceRequestAuthority,
+	overrides map[string]string,
+) error {
+	if !request.Valid() {
+		return fmt.Errorf("%w: restart requires exact maintenance request authority", backend.ErrValidation)
+	}
+	expectedKind := shared.MaintenanceIntentRestart
+	if len(overrides) != 0 {
+		expectedKind = shared.MaintenanceIntentCustomDomain
+	}
+	if request.Kind() != expectedKind {
+		return fmt.Errorf("%w: restart maintenance kind does not match route", backend.ErrValidation)
+	}
+	leaseUUID := request.LeaseUUID()
+	callbackURL := request.CallbackURL()
+	if err := b.requireMutationAdmission(ctx, "restart"); err != nil {
+		return fmt.Errorf("backend storage identity verification failed: %w", err)
+	}
+	// Serialize the complete release prelude through actor acceptance. Release
+	// history is keyed by lease and its settlement is intentionally
+	// latest-generation based, so two callers must not both append a deploying
+	// row before the actor chooses which worker owns the lease. Holding this
+	// fence until the ack also publishes Restarting before a restore-finalizer
+	// sweep can take its own snapshot under the same fence.
+	unlockCommand := b.commandFence.Lock(leaseUUID)
+	defer unlockCommand()
+	if b.callbackStore != nil && b.releaseStore != nil {
+		disposition, err := b.maintenanceSettlement.ProbeMaintenanceIntent(request)
+		if err != nil {
+			if errors.Is(err, shared.ErrMaintenanceIntentConflict) {
+				return fmt.Errorf("%w: maintenance id conflicts with stored restart authority", backend.ErrInvalidState)
+			}
+			return fmt.Errorf("probe restart maintenance replay: %w", err)
+		}
+		if replayed, replayErr := maintenanceReplayResult(disposition); replayed {
+			return replayErr
+		}
+	}
+	if err := b.settleCommittedOperationBeforeMaintenance(leaseUUID); err != nil {
+		return err
+	}
+	if len(overrides) == 0 {
+		if err := b.ensureRestoreDestinationRestartAvailable(leaseUUID); err != nil {
+			return err
+		}
+	} else if err := b.ensureRestoreDestinationUnowned(leaseUUID); err != nil {
+		return err
+	}
 
 	b.provisionsMu.Lock()
 	prov, exists := b.provisions[leaseUUID]
@@ -133,430 +181,209 @@ func (b *Backend) routeReplaceRestart(ctx context.Context, leaseUUID, callbackUR
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: no stored manifest for restart (pre-migration legacy lease?)", backend.ErrInvalidState)
 	}
-	stackManifest := prov.StackManifest
-	containerIDs := append([]string(nil), prov.ContainerIDs...)
-	serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
-	for k, v := range prov.ServiceContainers {
-		serviceContainers[k] = append([]string(nil), v...)
+	callbackURL, lifecycleCallbackURL, callbackErr := resolveMaintenanceCallbackURLs(
+		prov.CallbackURL, prov.LifecycleCallbackURL, callbackURL,
+	)
+	if callbackErr != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: maintenance lifecycle callback: %w", backend.ErrValidation, callbackErr)
 	}
+	stackManifest := prov.StackManifest
 	items := append([]backend.LeaseItem(nil), prov.Items...)
+	tenant := prov.Tenant
+	providerUUID := prov.ProviderUUID
+	authorityItems := slices.Clone(items)
+	resourceProfiles := shared.CloneSKUResourceSnapshot(prov.ResourceProfiles)
 	// Apply custom-domain overrides to the worker's snapshot COPY (never
 	// prov.Items). Keyed by ServiceName, so even if recoverState swapped the
 	// struct between the reconciler's diff and here, the desired domain is
 	// re-applied onto the current items. (ENG-231/ENG-278)
 	applyCustomDomainOverrides(items, overrides)
 	b.provisionsMu.Unlock()
-
-	// Record restart release as deploying. Abort if this fails — without a
-	// release record, ActivateLatest after success is a no-op, and a cold
-	// restart would recover the previous manifest (silently rolling back).
-	if b.releaseStore != nil {
-		manifestBytes, marshalErr := json.Marshal(stackManifest)
-		if marshalErr != nil {
-			return fmt.Errorf("failed to marshal manifest for release: %w", marshalErr)
-		}
-		if relErr := b.releaseStore.Append(leaseUUID, shared.Release{
-			Manifest:  manifestBytes,
-			Image:     "stack",
-			Status:    "deploying",
-			CreatedAt: time.Now(),
-		}); relErr != nil {
-			return fmt.Errorf("failed to record release: %w", relErr)
+	if err := validateComposeServiceNames(items); err != nil {
+		return fmt.Errorf("%w: stored topology cannot form an injective Compose project: %w", backend.ErrInvalidState, err)
+	}
+	if len(resourceProfiles) == 0 {
+		var profileErr error
+		resourceProfiles, profileErr = b.activeResourceProfiles(ctx, leaseUUID, authorityItems)
+		if profileErr != nil {
+			return fmt.Errorf("resolve restart resource profiles: %w", profileErr)
 		}
 	}
+	if _, profileErr := resourceProfileMap(authorityItems, resourceProfiles); profileErr != nil {
+		return fmt.Errorf("validate restart resource profiles: %w", profileErr)
+	}
+	if b.releaseStore == nil || b.callbackStore == nil {
+		return errors.New("durable release and callback stores are required for restart")
+	}
+
+	active, sourceClaim, activeErr := b.maintenanceSettlement.ClaimLatestActive(leaseUUID)
+	if activeErr != nil {
+		return fmt.Errorf("claim active release lineage: %w", activeErr)
+	}
+	sourceErr := validateReplaceSourceRelease(active)
+	if sourceErr != nil {
+		return fmt.Errorf("construct restart source authority: %w", sourceErr)
+	}
+	runtimeAuthority, legacyRuntimeAuthority, authorityErr := releaseRuntimeAuthoritiesForMaintenance(
+		active, tenant, providerUUID, callbackURL, lifecycleCallbackURL,
+	)
+	if authorityErr != nil {
+		return fmt.Errorf("construct restart release runtime authority: %w", authorityErr)
+	}
+	manifestBytes, marshalErr := json.Marshal(stackManifest)
+	if marshalErr != nil {
+		return fmt.Errorf("failed to marshal manifest for release: %w", marshalErr)
+	}
+	admission, admitErr := b.admitMaintenance(request, sourceClaim, shared.Release{
+		Manifest:               manifestBytes,
+		Image:                  "stack",
+		OperationID:            active.OperationID,
+		Items:                  slices.Clone(items),
+		ResourceProfiles:       resourceProfiles,
+		RuntimeAuthority:       runtimeAuthority,
+		LegacyRuntimeAuthority: legacyRuntimeAuthority,
+		Status:                 "deploying",
+		CreatedAt:              time.Now(),
+	})
+	if admitErr != nil {
+		return admitErr
+	}
+	if !admission.created() {
+		return nil
+	}
+	maintenance, targetRelease := admission.intent, admission.target
 
 	// Hand off to the lease actor. The actor's onEnterRestarting writes
-	// Status=Restarting (+ CallbackURL) BEFORE acking, then spawns the replace
-	// worker. On success, onEnterReadyFromReplaceCompleted runs onSuccess (the
-	// prov.Items custom_domain commit) under UpdateFn, atomic with Status->Ready.
+	// Status=Restarting and, when requested, moves the callback pair to a new base
+	// without changing its validated identity before acking. On success the
+	// actor projects the exact durable target release atomically with Ready.
 	opCtx, opCancel := b.shutdownAwareContext()
-	onSuccess := customDomainOnSuccess(overrides)
-	work := func() leasesm.ReplaceResult {
-		return b.doRestart(opCtx, leaseUUID, stackManifest, containerIDs, serviceContainers, items, onSuccess, logger)
+	var command leasesm.ActorCommand
+	var ack leasesm.ActorReply
+	var commandErr error
+	if request.Kind() == shared.MaintenanceIntentCustomDomain {
+		command, ack, commandErr = leasesm.NewCustomDomainCommand(opCtx, targetRelease)
+	} else {
+		command, ack, commandErr = leasesm.NewRestartCommand(opCtx, targetRelease)
 	}
-	ack := make(chan error, 1)
-	if routeErr := b.routeToLeaseBlocking(ctx, leaseUUID, leasesm.RestartRequestedMsg{Cancel: opCancel, Work: work, Ack: ack, CallbackURL: callbackURL}); routeErr != nil {
+	if commandErr != nil {
 		opCancel()
-		return routeErr
+		return b.failUnacceptedMaintenance(maintenance, targetRelease, commandErr)
 	}
-	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
+	if routeErr := b.routeToLeaseBlocking(ctx, leaseUUID, command); routeErr != nil {
 		opCancel()
-		return err
+		return b.failUnacceptedMaintenance(maintenance, targetRelease, routeErr)
+	}
+	// Once routing succeeds, wait for the actor's definitive decision even if
+	// the caller cancels. Returning on cancellation would release commandFence
+	// while this message remained queued: a retry could append a newer release,
+	// then this worker could accept and settle that retry's row as its own. The
+	// caller context already bounded routing; an enqueued command must reach its
+	// actor linearization point before the release fence can open.
+	if err := <-ack.Result(); err != nil {
+		opCancel()
+		return b.failUnacceptedMaintenance(maintenance, targetRelease, err)
 	}
 	return nil
 }
 
-// doRestart performs an async stack restart: stops all service containers
-// and recreates them from the stored StackManifest.
-//
-// The SKU-preflight failure branch sets RecoveredIfSourceActive: it touches
-// no containers, so the lease is left exactly in its replace-start state —
-// "recovered to Ready" is correct iff its containers were running at start
-// (i.e. the lease was active). doRestart no longer knows that; the actor
-// derives it from its serial, actor-observed replaceWasActive
-// (spawnReplaceWorker), which is correct even in the death-then-restart
-// ordering where the prelude's route-time snapshot was stale.
-func (b *Backend) doRestart(ctx context.Context, leaseUUID string, stack *manifest.StackManifest, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, onSuccess func(*leasesm.ProvisionState), logger *slog.Logger) leasesm.ReplaceResult {
-	profiles := make(map[string]SKUProfile, len(items))
-	for _, item := range items {
-		if _, ok := profiles[item.SKU]; ok {
-			continue
-		}
-		profile, profErr := b.cfg.GetSKUProfile(item.SKU)
-		if profErr != nil {
-			err := fmt.Errorf("SKU profile lookup failed for %s: %w", item.SKU, profErr)
-			b.recordPreflightFailure(leaseUUID, backend.ReasonRestartFailed, backend.MsgRestartFailed, err, logger)
-			return leasesm.ReplaceResult{
-				CallbackErr:             backend.MsgRestartFailed,
-				Err:                     err,
-				RecoveredIfSourceActive: true,
-				Failure: leasesm.ReplaceFailureInfo{
-					Operation:   "restart",
-					Reason:      backend.ReasonRestartFailed,
-					CallbackErr: backend.MsgRestartFailed,
-					LastError:   err.Error(),
-				},
-			}
-		}
-		profiles[item.SKU] = profile
+// validateReplaceSourceRelease proves that the exact active Release claimed
+// before maintenance admission contains complete rollback authority. The
+// physical executor consumes the claim itself, so retaining a second copied
+// snapshot would only create a divergent representation of the same authority.
+func validateReplaceSourceRelease(release shared.Release) error {
+	if release.Status != "active" {
+		return errors.New("source release lacks active runtime authority")
 	}
+	if _, ok := runtimeIdentityForRelease(&release); !ok {
+		return errors.New("source release lacks active runtime authority")
+	}
+	stack, err := manifest.ParsePayload(release.Manifest)
+	if err != nil {
+		return fmt.Errorf("parse source manifest: %w", err)
+	}
+	if err := manifest.ValidateStackAgainstItems(stack, release.Items); err != nil {
+		return fmt.Errorf("validate source topology: %w", err)
+	}
+	if _, err := resourceProfileMap(release.Items, release.ResourceProfiles); err != nil {
+		return fmt.Errorf("validate source resource profiles: %w", err)
+	}
+	return nil
+}
 
-	return b.doReplaceContainers(ctx, replaceContainersOp{
-		LeaseUUID:         leaseUUID,
-		Stack:             stack,
-		Items:             items,
-		Profiles:          profiles,
-		OldContainerIDs:   oldContainerIDs,
-		ServiceContainers: serviceContainers,
-		Operation:         "restart",
-		Logger:            logger,
-		OnSuccess:         onSuccess,
-	})
+// releaseRuntimeAuthoritiesForMaintenance preserves the active release's
+// authority class. Current generations retain their operation-scoped typed
+// authority; v0.13 generations retain a separately typed tokenless authority.
+// MaintenanceID remains the exact UUIDv4 identity of the replacement WAL in
+// both cases, so supporting a legacy source does not manufacture a provision
+// operation capability that never existed.
+func releaseRuntimeAuthoritiesForMaintenance(
+	active shared.Release,
+	tenant, providerUUID, callbackURL, lifecycleCallbackURL string,
+) (*shared.ReleaseRuntimeAuthority, *shared.LegacyRuntimeAuthority, error) {
+	authority, ok := runtimeIdentityForRelease(&active)
+	if !ok {
+		return nil, nil, errors.New("active release has no durable runtime authority")
+	}
+	if authority.Class() == shared.ReleaseAuthorityLegacy {
+		legacy, err := shared.NewLegacyRuntimeAuthority(
+			tenant, providerUUID, callbackURL, lifecycleCallbackURL,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, &legacy, nil
+	}
+	typed, err := releaseRuntimeAuthorityForOperation(
+		active.OperationID, tenant, providerUUID, callbackURL, lifecycleCallbackURL,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	if typed == nil {
+		return nil, nil, errors.New("typed active release has no operation lineage")
+	}
+	return typed, nil, nil
 }
 
 // replaceContainersOp describes a stack container replacement operation.
 type replaceContainersOp struct {
-	LeaseUUID         string
-	Stack             *manifest.StackManifest
-	Items             []backend.LeaseItem
-	Profiles          map[string]SKUProfile
-	OldContainerIDs   []string
-	ServiceContainers map[string][]string // old service → container IDs mapping
-	Operation         string              // "restart", "update", or "restore"
-	Logger            *slog.Logger
-
-	// NoComposeRollback disables the failure-path rollbackViaCompose. The
-	// restore op sets it: there are NO prior containers to "recover" to (the
-	// new lease was reserved at Provisioning, never Ready), and the restore
-	// caller (doRestore) owns its own compensating teardown — compose.Down +
-	// re-quarantining the adopted volumes back to the retained namespace. With
-	// this true, Restored stays false on failure, so spawnReplaceWorker
-	// dispatches replaceFailedMsg (terminal Failed) rather than
-	// replaceRecoveredMsg. Defaults false: restart/update are unaffected.
-	NoComposeRollback bool
-
-	// OnSuccess is called under provisionsMu lock after successful replacement.
-	OnSuccess func(prov *leasesm.ProvisionState)
+	LeaseUUID           string
+	Stack               *manifest.StackManifest
+	Items               []backend.LeaseItem
+	ResourceProfiles    []shared.SKUResourceSnapshot
+	Operation           string // "restart", "update", or "restore"
+	TargetMaintenanceID shared.MaintenanceID
+	Logger              *slog.Logger
 }
 
-// doReplaceContainers performs the stack container replacement lifecycle
-// using Docker Compose. Compose handles stopping old containers and starting
-// new ones via a single Up call, with rollback via Up with the previous manifest.
-//
-// Returns leasesm.ReplaceResult — see doReplaceContainers for the protocol.
-// Stack variant's OnSuccess typically sets StackManifest; this function
-// populates the leasesm.ReplaceResult's fields for the SM entry action.
-func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersOp) (resultRet leasesm.ReplaceResult) {
-	var err error
-	var callbackErr string
-	var newContainerIDs []string
-	var imageSetups map[string]*imageSetup
-	newServiceContainers := make(map[string][]string)
-	projectName := composeProjectName(op.LeaseUUID)
-
-	defer func() {
-		if err != nil {
-			op.Logger.Error(op.Operation+" failed (stack)", "error", err)
-
-			if b.releaseStore != nil {
-				// Message == the CallbackErr base (op + " failed") by construction,
-				// so restart/update/restore never diverge or mislabel.
-				rReason, rMsg := replaceOpReason(op.Operation), op.Operation+" failed"
-				if relErr := b.releaseStore.UpdateLatestStatus(op.LeaseUUID, "failed", rReason, rMsg); relErr != nil {
-					op.Logger.Warn("failed to update release status", "error", relErr)
-				}
-			}
-
-			// Capture logs from the FAILED new containers BEFORE the
-			// rollback tears them down. Without this, the persisted
-			// diagnostic entry would record empty logs because the
-			// containers are gone by the time the SM entry action runs
-			// persistDiagnostics.
-			failureLogs := b.captureContainerLogs(newContainerIDs, stackContainerLogKeys(newServiceContainers))
-
-			// Rollback: rebuild the Project from the previous StackManifest and
-			// Compose Up to restore the old containers. Skipped for the restore
-			// op (NoComposeRollback): a failed restore has no prior containers to
-			// recover to — doRestore's terminal defer does the compensating
-			// teardown — and leaving Restored=false makes spawnReplaceWorker fire
-			// replaceFailedMsg (terminal Failed) instead of replaceRecoveredMsg.
-			restored := false
-			if !op.NoComposeRollback {
-				restored = b.rollbackViaCompose(op)
-			}
-			if restored {
-				op.Logger.Info("rolled back to previous containers via compose (stack)")
-				callbackErr += "; rolled back to previous version"
-			} else {
-				callbackErr += "; rollback failed"
-			}
-
-			// Stack rollback: oldStopped is effectively true — compose.Up
-			// with ForceRecreate replaces every container in the project, so
-			// the LastError-clear-on-restart rule matches the single-manifest
-			// doReplaceContainers semantics.
-			resultRet = leasesm.ReplaceResult{
-				CallbackErr: callbackErr,
-				Err:         err,
-				Restored:    restored,
-				Failure: leasesm.ReplaceFailureInfo{
-					Operation:   op.Operation,
-					Reason:      replaceOpReason(op.Operation),
-					OldStopped:  true,
-					CallbackErr: callbackErr,
-					LastError:   err.Error(),
-					Logs:        failureLogs,
-				},
-			}
-			return
-		}
-
-		if b.releaseStore != nil {
-			if relErr := b.releaseStore.ActivateLatest(op.LeaseUUID); relErr != nil {
-				op.Logger.Warn("failed to update release status", "error", relErr)
-			}
-		}
-
-		resultRet = leasesm.ReplaceResult{
-			Success: leasesm.ReplaceSuccessResult{
-				ContainerIDs:      newContainerIDs,
-				ServiceContainers: newServiceContainers,
-				OnSuccess:         op.OnSuccess,
-			},
-		}
-	}()
-
-	// Per-service image setup.
-	imgStart := time.Now()
-	imageSetups = make(map[string]*imageSetup)
-	for svcName, svc := range op.Stack.Services {
-		imgSetup, setupErr := b.inspectImageForSetup(ctx, svc.Image, svc.User)
-		if setupErr != nil {
-			err = setupErr
-			callbackErr = op.Operation + " failed"
-			return
-		}
-		imageSetups[svcName] = imgSetup
-	}
-	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseImageSetup).Observe(time.Since(imgStart).Seconds())
-
-	// Read provision metadata.
-	b.provisionsMu.RLock()
-	failCount := 0
-	tenant := ""
-	providerUUID := ""
-	callbackURL := ""
-	if prov, ok := b.provisions[op.LeaseUUID]; ok {
-		failCount = prov.FailCount
-		tenant = prov.Tenant
-		providerUUID = prov.ProviderUUID
-		callbackURL = prov.CallbackURL
-	}
-	b.provisionsMu.RUnlock()
-
-	// Resolve tenant network name.
-	var networkName string
-	if b.cfg.IsNetworkIsolation() {
-		if _, netErr := b.ensureTenantNetwork(ctx, tenant); netErr != nil {
-			err = netErr
-			callbackErr = op.Operation + " failed"
-			return
-		}
-		networkName = TenantNetworkName(tenant)
-	}
-
-	// Ensure volumes exist for all services/instances.
-	volStart := time.Now()
-	volBinds, _, volErr := b.setupVolBinds(ctx, op.LeaseUUID, op.Items, op.Profiles, imageSetups, op.Stack.Services, op.Logger)
-	if volErr != nil {
-		err = volErr
-		callbackErr = op.Operation + " failed"
-		return
-	}
-	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseVolumeSetup).Observe(time.Since(volStart).Seconds())
-
-	// Build Compose project and bring it up.
-	// ForceRecreate is used for restarts (config unchanged but containers need replacing).
-	project := buildComposeProject(composeProjectParams{
-		LeaseUUID:    op.LeaseUUID,
-		Tenant:       tenant,
-		ProviderUUID: providerUUID,
-		CallbackURL:  callbackURL,
-		BackendName:  b.cfg.Name,
-		FailCount:    failCount,
-		Stack:        op.Stack,
-		Items:        op.Items,
-		Profiles:     op.Profiles,
-		ImageSetups:  imageSetups,
-		NetworkName:  networkName,
-		VolBinds:     volBinds,
-		Cfg:          &b.cfg,
-		Ingress:      b.cfg.Ingress,
-	})
-
-	op.Logger.Info("compose up for "+op.Operation, "project", projectName, "services", len(project.Services))
-	forceRecreate := op.Operation == "restart"
-	upStart := time.Now()
-	if upErr := b.compose.Up(ctx, project, composeUpOpts{ForceRecreate: forceRecreate}); upErr != nil {
-		err = fmt.Errorf("compose up failed: %w", upErr)
-		callbackErr = op.Operation + " failed"
-		return
-	}
-	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseComposeUp).Observe(time.Since(upStart).Seconds())
-
-	// Discover new container IDs via Compose PS.
-	containers, psErr := b.compose.PS(ctx, projectName)
-	if psErr != nil {
-		err = fmt.Errorf("compose ps failed: %w", psErr)
-		callbackErr = op.Operation + " failed"
-		return
-	}
-
-	newContainerIDs, newServiceContainers = mapComposeContainers(containers, op.Items)
-
-	// Verify startup per-service so each service uses its own health check config.
-	verifyStart := time.Now()
-	for svcName, svcCIDs := range newServiceContainers {
-		svc := op.Stack.Services[svcName]
-		if err = b.verifyStartup(ctx, svc, svcCIDs, op.Logger.With("service", svcName)); err != nil {
-			callbackErr = startupErrorToCallbackMsg(err)
-			return
-		}
-	}
-	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseVerifyStartup).Observe(time.Since(verifyStart).Seconds())
-
-	op.Logger.Info(op.Operation+" completed (stack)", "containers", len(newContainerIDs))
-	return
-}
-
-// rollbackViaCompose restores the previous stack state by rebuilding a
-// Compose project from the previous StackManifest (still in the provision,
-// since OnSuccess hasn't run) and calling Compose Up. Returns true on success.
-func (b *Backend) rollbackViaCompose(op replaceContainersOp) bool {
-	rollbackCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	// Read previous manifest from provision (OnSuccess hasn't run, so
-	// prov.StackManifest is still the old manifest).
-	b.provisionsMu.RLock()
-	prov, ok := b.provisions[op.LeaseUUID]
-	if !ok {
-		b.provisionsMu.RUnlock()
-		op.Logger.Error("rollback: provision not found")
+func exactServiceContainerCohort(
+	items []backend.LeaseItem,
+	containerIDs []string,
+	serviceContainers map[string][]string,
+) bool {
+	expected, err := backend.ValidateOperationQuantities(items)
+	if err != nil || len(containerIDs) != expected || len(serviceContainers) != len(items) {
 		return false
 	}
-	prevStack := prov.StackManifest
-	tenant := prov.Tenant
-	providerUUID := prov.ProviderUUID
-	callbackURL := prov.CallbackURL
-	failCount := prov.FailCount
-	b.provisionsMu.RUnlock()
-
-	if prevStack == nil {
-		op.Logger.Error("rollback: no previous stack manifest available")
-		return false
-	}
-
-	// Inspect images for the previous manifest.
-	prevImageSetups := make(map[string]*imageSetup)
-	for svcName, svc := range prevStack.Services {
-		imgSetup, setupErr := b.inspectImageForSetup(rollbackCtx, svc.Image, svc.User)
-		if setupErr != nil {
-			op.Logger.Error("rollback: image inspection failed", "service", svcName, "error", setupErr)
+	seen := make(map[string]struct{}, len(containerIDs))
+	for _, item := range items {
+		ids, ok := serviceContainers[item.ServiceName]
+		if !ok || len(ids) != item.Quantity {
 			return false
 		}
-		prevImageSetups[svcName] = imgSetup
-	}
-
-	// Resolve network name.
-	var networkName string
-	if b.cfg.IsNetworkIsolation() {
-		networkName = TenantNetworkName(tenant)
-	}
-
-	// Re-use existing volumes (already created during original provision).
-	volBinds, _, volErr := b.setupVolBinds(rollbackCtx, op.LeaseUUID, op.Items, op.Profiles, prevImageSetups, prevStack.Services, op.Logger)
-	if volErr != nil {
-		op.Logger.Error("rollback: volume setup failed", "error", volErr)
-		return false
-	}
-
-	// Build project from previous manifest.
-	project := buildComposeProject(composeProjectParams{
-		LeaseUUID:    op.LeaseUUID,
-		Tenant:       tenant,
-		ProviderUUID: providerUUID,
-		CallbackURL:  callbackURL,
-		BackendName:  b.cfg.Name,
-		FailCount:    failCount,
-		Stack:        prevStack,
-		Items:        op.Items,
-		Profiles:     op.Profiles,
-		ImageSetups:  prevImageSetups,
-		NetworkName:  networkName,
-		VolBinds:     volBinds,
-		Cfg:          &b.cfg,
-		Ingress:      b.cfg.Ingress,
-	})
-
-	// Compose Up with ForceRecreate to restore previous containers.
-	if upErr := b.compose.Up(rollbackCtx, project, composeUpOpts{ForceRecreate: true}); upErr != nil {
-		op.Logger.Error("rollback: compose up failed", "error", upErr)
-		return false
-	}
-
-	// Discover restored container IDs and update provision.
-	containers, psErr := b.compose.PS(rollbackCtx, composeProjectName(op.LeaseUUID))
-	if psErr != nil {
-		op.Logger.Error("rollback: compose ps failed", "error", psErr)
-		return false
-	}
-
-	containerIDs, serviceContainers := mapComposeContainers(containers, op.Items)
-	b.provisionsMu.Lock()
-	if p, ok := b.provisions[op.LeaseUUID]; ok {
-		p.ContainerIDs = containerIDs
-		p.ServiceContainers = serviceContainers
-	}
-	b.provisionsMu.Unlock()
-
-	return true
-}
-
-// recordPreflightFailure logs the preflight error (e.g., profile lookup,
-// image pull) and marks the latest release as failed. Provision-state
-// mutations (LastError, FailCount, Status, persistDiagnostics) are
-// handled by the SM entry action that fires when the caller returns its
-// leasesm.ReplaceResult — see the preflight branches of doRestart /
-// doUpdate (post-Task-14, the unified stack-shaped versions).
-func (b *Backend) recordPreflightFailure(leaseUUID string, reason backend.Reason, message string, err error, logger *slog.Logger) {
-	logger.Error("preflight failed", "error", err)
-
-	if b.releaseStore != nil {
-		if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", reason, message); relErr != nil {
-			logger.Warn("failed to update release status", "error", relErr)
+		for _, id := range ids {
+			if id == "" {
+				return false
+			}
+			if _, duplicate := seen[id]; duplicate {
+				return false
+			}
+			seen[id] = struct{}{}
 		}
 	}
+	return len(seen) == expected
 }
 
 // Update deploys a new manifest for a lease, replacing containers.
@@ -565,16 +392,49 @@ func (b *Backend) recordPreflightFailure(leaseUUID string, reason backend.Reason
 // SEAM CLOSED (ENG-230) — see the extended comment on Backend.Restart.
 // Like Restart, the prelude is read-only: it fast-fails / validates
 // under provisionsMu, snapshots fields, then records the release. It
-// performs NO write to prov.Status / prov.CallbackURL — the actor's
-// onEnterUpdating entry action is the sole writer, firing inside
+// performs NO write to prov.Status or either callback URL — the actor's
+// onEnterUpdating entry action is the sole status writer, firing inside
 // handleUpdateRequested BEFORE the ack, so the "Update() returns =>
 // Status is Updating" contract holds without an off-actor write. No
 // rollback is needed on any failure path (nothing on prov was mutated).
 func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
+	request, err := b.maintenanceSettlement.NewMaintenanceRequestAuthority(
+		req.MaintenanceID, shared.MaintenanceIntentUpdate, req.LeaseUUID,
+		req.CallbackURL, req.Payload,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: invalid update request authority: %w", backend.ErrValidation, err)
+	}
+	if err := b.requireMutationAdmission(ctx, "update"); err != nil {
+		return fmt.Errorf("backend storage identity verification failed: %w", err)
+	}
+	// See routeReplaceRestart: the release Append and the actor's authoritative
+	// Updating transition are one admission critical section. A losing caller
+	// observes Updating before it can append a second, unowned release row.
+	unlockCommand := b.commandFence.Lock(req.LeaseUUID)
+	defer unlockCommand()
+	if b.callbackStore != nil && b.releaseStore != nil {
+		disposition, err := b.maintenanceSettlement.ProbeMaintenanceIntent(request)
+		if err != nil {
+			if errors.Is(err, shared.ErrMaintenanceIntentConflict) {
+				return fmt.Errorf("%w: maintenance id conflicts with stored update authority", backend.ErrInvalidState)
+			}
+			return fmt.Errorf("probe update maintenance replay: %w", err)
+		}
+		if replayed, replayErr := maintenanceReplayResult(disposition); replayed {
+			return replayErr
+		}
+	}
 	logger := b.logger.With("lease_uuid", req.LeaseUUID)
+	if err := b.settleCommittedOperationBeforeMaintenance(req.LeaseUUID); err != nil {
+		return err
+	}
+	if err := b.ensureRestoreDestinationUnowned(req.LeaseUUID); err != nil {
+		return err
+	}
 
 	// Synchronous phase: read-only validation + field snapshot (no
-	// prov.Status / prov.CallbackURL write — ENG-230).
+	// prov.Status or callback URL writes — ENG-230).
 	b.provisionsMu.Lock()
 	prov, exists := b.provisions[req.LeaseUUID]
 	if !exists {
@@ -585,6 +445,13 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		status := prov.Status
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: cannot update from status %s", backend.ErrInvalidState, status)
+	}
+	callbackURL, lifecycleCallbackURL, callbackErr := resolveMaintenanceCallbackURLs(
+		prov.CallbackURL, prov.LifecycleCallbackURL, req.CallbackURL,
+	)
+	if callbackErr != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: maintenance lifecycle callback: %w", backend.ErrValidation, callbackErr)
 	}
 
 	// Boundary normalization: prov.Items must be populated (it is set at
@@ -619,6 +486,10 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, valErr)
 	}
+	if nameErr := validateComposeServiceNames(prov.Items); nameErr != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, nameErr)
+	}
 	// Reject tenant-pinned fixed host ports on update too (ENG-605); mirrors
 	// provision.go so a tenant cannot introduce a squatted port via update.
 	if hpErr := manifest.ValidateNoFixedHostPorts(stackManifest); hpErr != nil {
@@ -632,63 +503,83 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svcName, imgErr)
 		}
 	}
-	// Validate all SKU profiles.
-	profiles := make(map[string]SKUProfile, len(prov.Items))
-	for _, item := range prov.Items {
-		if _, ok := profiles[item.SKU]; ok {
-			continue
-		}
-		profile, profErr := b.cfg.GetSKUProfile(item.SKU)
-		if profErr != nil {
-			b.provisionsMu.Unlock()
-			return fmt.Errorf("%w: %w", backend.ErrValidation, profErr)
-		}
-		profiles[item.SKU] = profile
-	}
-
-	oldContainerIDs := append([]string(nil), prov.ContainerIDs...)
-	serviceContainers := make(map[string][]string, len(prov.ServiceContainers))
-	for k, v := range prov.ServiceContainers {
-		serviceContainers[k] = append([]string(nil), v...)
-	}
 	items := append([]backend.LeaseItem(nil), prov.Items...)
-	// No pre-replace status snapshot: Status/CallbackURL writes and gauge
-	// bookkeeping are the actor's, keyed on the actor-observed
-	// replaceWasActive (onEnterUpdating). The update preflight is
-	// unconditionally Failed regardless, so the worker needs no status hint.
+	tenant := prov.Tenant
+	providerUUID := prov.ProviderUUID
+	resourceProfiles := shared.CloneSKUResourceSnapshot(prov.ResourceProfiles)
+	// Runtime projection belongs to the actor and exact physical evidence;
+	// this admission snapshot cannot decide whether a failed update restored
+	// a healthy source.
 	b.provisionsMu.Unlock()
-
-	// Record release. Image:"stack" is the existing stack-path sentinel
-	// (pre-Task-2 behavior for multi-service leases); after Task 6 it
-	// also covers auto-wrapped 1-service leases. GetReleases tenants
-	// already see this sentinel for stack-shaped leases.
-	if b.releaseStore != nil {
-		if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
-			Manifest:  req.Payload,
-			Image:     "stack",
-			Status:    "deploying",
-			CreatedAt: time.Now(),
-		}); relErr != nil {
-			return fmt.Errorf("failed to record release: %w", relErr)
+	if len(resourceProfiles) == 0 {
+		var profileErr error
+		resourceProfiles, profileErr = b.activeResourceProfiles(ctx, req.LeaseUUID, items)
+		if profileErr != nil {
+			return fmt.Errorf("%w: resolve update resource profiles: %w", backend.ErrInvalidState, profileErr)
 		}
 	}
+	if _, profileErr := resourceProfileMap(items, resourceProfiles); profileErr != nil {
+		return fmt.Errorf("%w: validate update resource profiles: %w", backend.ErrInvalidState, profileErr)
+	}
+	if b.releaseStore == nil || b.callbackStore == nil {
+		return errors.New("durable release and callback stores are required for update")
+	}
 
-	// Hand off to the actor. The actor's onEnterUpdating writes
-	// Status=Updating (+ CallbackURL) BEFORE acking. See
+	active, sourceClaim, activeErr := b.maintenanceSettlement.ClaimLatestActive(req.LeaseUUID)
+	if activeErr != nil {
+		return fmt.Errorf("claim active release lineage: %w", activeErr)
+	}
+	sourceErr := validateReplaceSourceRelease(active)
+	if sourceErr != nil {
+		return fmt.Errorf("construct update source authority: %w", sourceErr)
+	}
+	runtimeAuthority, legacyRuntimeAuthority, authorityErr := releaseRuntimeAuthoritiesForMaintenance(
+		active, tenant, providerUUID, callbackURL, lifecycleCallbackURL,
+	)
+	if authorityErr != nil {
+		return fmt.Errorf("construct update release runtime authority: %w", authorityErr)
+	}
+	admission, admitErr := b.admitMaintenance(
+		request,
+		sourceClaim,
+		shared.Release{
+			Manifest:               req.Payload,
+			Image:                  "stack",
+			OperationID:            active.OperationID,
+			Items:                  slices.Clone(items),
+			ResourceProfiles:       resourceProfiles,
+			RuntimeAuthority:       runtimeAuthority,
+			LegacyRuntimeAuthority: legacyRuntimeAuthority,
+			Status:                 "deploying",
+			CreatedAt:              time.Now(),
+		},
+	)
+	if admitErr != nil {
+		return admitErr
+	}
+	if !admission.created() {
+		return nil
+	}
+	maintenance, targetRelease := admission.intent, admission.target
+
+	// Hand off to the actor. The actor's onEnterUpdating writes Status=Updating
+	// and the prevalidated same-authority callback pair BEFORE acking. See
 	// handleUpdateRequested / spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
-	work := func() leasesm.ReplaceResult {
-		return b.doUpdate(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, logger)
-	}
-	ack := make(chan error, 1)
-	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.UpdateRequestedMsg{Cancel: opCancel, Work: work, Ack: ack, CallbackURL: req.CallbackURL}); routeErr != nil {
+	command, ack, commandErr := leasesm.NewUpdateCommand(opCtx, targetRelease)
+	if commandErr != nil {
 		opCancel()
-		return routeErr
+		return b.failUnacceptedMaintenance(maintenance, targetRelease, commandErr)
 	}
-	// See ackOrAbort's comment for the ctx-vs-ack race rationale.
-	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
+	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, command); routeErr != nil {
 		opCancel()
-		return err
+		return b.failUnacceptedMaintenance(maintenance, targetRelease, routeErr)
+	}
+	// See routeReplaceRestart: after enqueue, commandFence stays closed until
+	// the actor has definitively accepted or rejected this exact release.
+	if err := <-ack.Result(); err != nil {
+		opCancel()
+		return b.failUnacceptedMaintenance(maintenance, targetRelease, err)
 	}
 	return nil
 }
@@ -699,45 +590,3 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 // failure (image pull) is unconditionally Failed — a missed image pull never
 // achieved the desired new-image state, so the lease is Failed even from a
 // Ready source. This asymmetry is intentional; do not key it on wasActive.
-func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, stack *manifest.StackManifest, profiles map[string]SKUProfile, oldContainerIDs []string, serviceContainers map[string][]string, items []backend.LeaseItem, logger *slog.Logger) leasesm.ReplaceResult {
-	// Pull each unique image (deduplicated).
-	pulledImages := make(map[string]bool)
-	for svcName, svc := range stack.Services {
-		if pulledImages[svc.Image] {
-			continue
-		}
-		logger.Info("pulling image for update", "service", svcName, "image", svc.Image)
-		if pullErr := b.docker.PullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); pullErr != nil {
-			err := fmt.Errorf("image pull failed for service %s: %w", svcName, pullErr)
-			b.recordPreflightFailure(leaseUUID, backend.ReasonImagePullFailed, backend.MsgImagePullFailed, err, logger)
-			// Force Status=Failed unconditionally (Restored:false) since the
-			// user's desired state (the new image set) was not achieved.
-			return leasesm.ReplaceResult{
-				CallbackErr: backend.MsgImagePullFailed,
-				Err:         err,
-				Restored:    false,
-				Failure: leasesm.ReplaceFailureInfo{
-					Operation:   "update",
-					Reason:      backend.ReasonImagePullFailed,
-					CallbackErr: backend.MsgImagePullFailed,
-					LastError:   err.Error(),
-				},
-			}
-		}
-		pulledImages[svc.Image] = true
-	}
-
-	return b.doReplaceContainers(ctx, replaceContainersOp{
-		LeaseUUID:         leaseUUID,
-		Stack:             stack,
-		Items:             items,
-		Profiles:          profiles,
-		OldContainerIDs:   oldContainerIDs,
-		ServiceContainers: serviceContainers,
-		Operation:         "update",
-		Logger:            logger,
-		OnSuccess: func(prov *leasesm.ProvisionState) {
-			prov.StackManifest = stack
-		},
-	})
-}

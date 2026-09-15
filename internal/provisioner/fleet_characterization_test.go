@@ -18,8 +18,10 @@ package provisioner
 // updating.
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"testing"
 	"time"
 
@@ -31,6 +33,8 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 // allFaults is every way a backend can fail to answer a sweep. Each reaches the
@@ -62,6 +66,158 @@ func TestFleet_HealthyFleet_ProvisionsPendingLease(t *testing.T) {
 	f.assertProvisionedExactlyOnce("lease-new")
 }
 
+func TestFleet_V013UpgradeBackfillsExistingWorkloadsWithoutMovingThem(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	// Model the first current-version startup over a v0.13 environment: the
+	// process-local registry and the newly configured placement DB are empty,
+	// while multiple backends already own live and retained tenant data.
+	f.addLease("lease-pending-ready", billingtypes.LEASE_STATE_PENDING)
+	f.addLease("lease-active", billingtypes.LEASE_STATE_ACTIVE)
+	f.backendAt(2).seedProvision(
+		t, "lease-pending-ready", f.providerUUID, backend.ProvisionStatusReady,
+	)
+	f.backendAt(3).seedProvision(
+		t, "lease-active", f.providerUUID, backend.ProvisionStatusReady,
+	)
+	f.backendAt(1).seedRetention("lease-retained")
+	require.Zero(t, f.coordinator.RuntimeController().Count())
+	require.Empty(t, f.placement.List())
+
+	require.NoError(t, f.sweep())
+
+	for _, srv := range f.servers {
+		require.Zero(t, srv.totalProvisionCalls(),
+			"startup discovery must not restart or move an existing workload through %s", srv.name)
+		require.Zero(t, srv.deprovisionCount("lease-pending-ready"))
+		require.Zero(t, srv.deprovisionCount("lease-active"))
+		require.Zero(t, srv.deprovisionCount("lease-retained"))
+	}
+	f.assertPlacementPinned("lease-pending-ready", "backend-2")
+	f.assertPlacementPinned("lease-active", "backend-3")
+	f.assertPlacementPinned("lease-retained", "backend-1")
+	acked, _, _ := f.chainCalls()
+	require.Contains(t, acked, fleetLeaseUUID("lease-pending-ready"),
+		"a ready v0.13 workload still pending on chain must be acknowledged, not reprovisioned")
+}
+
+func TestFleet_ProvisionCarriesExactTypedOperationAcrossHTTP(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	f.addLease("lease-typed", billingtypes.LEASE_STATE_PENDING)
+	require.NoError(t, f.sweep())
+
+	req, ok := f.backendAt(1).provisionRequest("lease-typed")
+	require.True(t, ok, "real HTTP backend should receive the provision request")
+	callbackURL, err := url.Parse(req.CallbackURL)
+	require.NoError(t, err)
+	callbackID, present, err := operation.ParseQuery(callbackURL.Query())
+	require.NoError(t, err)
+	require.True(t, present)
+	require.True(t, callbackID.Valid())
+
+	require.True(t, f.coordinator.RuntimeController().Contains(fleetLeaseUUID("lease-typed")),
+		"the callback capability crossing HTTP must retain the exact live operation")
+
+	p := f.placement.Lookup(fleetLeaseUUID("lease-typed"))
+	require.Equal(t, placement.StateConfirmed, p.State())
+	require.Equal(t, "backend-1", p.Backend)
+	require.Empty(t, p.Attempt)
+}
+
+func TestFleet_CompleteInventoryRecoversAmbiguousAttemptByExactRedelivery(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{backendSKUs: map[int][]string{
+		2: {"sku-ambiguous"},
+	}})
+	require.NoError(t, f.sweep(), "arm startup placement authority")
+	induceFleetAmbiguousProvision(t, f, "lease-ambiguous", "sku-ambiguous", 2)
+	require.Equal(t, placement.StateAttempting,
+		f.placement.Lookup(fleetLeaseUUID("lease-ambiguous")).State())
+
+	require.NoError(t, f.sweep())
+
+	recovered := f.placement.Lookup(fleetLeaseUUID("lease-ambiguous"))
+	require.Equal(t, placement.StateConfirmed, recovered.State(),
+		"inventory silence cannot clear the attempt; exact idempotent redelivery must resolve it")
+	require.Equal(t, "backend-2", recovered.Backend)
+	require.Equal(t, 2, f.backendAt(2).provisionCount("lease-ambiguous"),
+		"the ambiguous first dispatch and exact idempotent redelivery are both observable")
+}
+
+func TestFleet_IncompleteInventoryStillRecoversExactAttempt(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{backendSKUs: map[int][]string{
+		2: {"sku-unknown"},
+	}})
+	require.NoError(t, f.sweep(), "arm startup placement authority")
+	induceFleetAmbiguousProvision(t, f, "lease-unknown", "sku-unknown", 2)
+	f.backendAt(2).setFault(faultRetentionsOnly)
+
+	require.NoError(t, f.sweep())
+
+	p := f.placement.Lookup(fleetLeaseUUID("lease-unknown"))
+	require.Equal(t, placement.StateConfirmed, p.State())
+	require.Equal(t, "backend-2", p.Backend,
+		"a missing inventory endpoint cannot erase affinity or block exact idempotent redelivery")
+	require.Equal(t, 2, f.backendAt(2).provisionCount("lease-unknown"),
+		"recovery must redeliver the same durable operation despite partial inventory")
+}
+
+func induceFleetAmbiguousProvision(
+	t *testing.T,
+	f *fleet,
+	leaseName, sku string,
+	backendIndex int,
+) {
+	t.Helper()
+	f.addLease(leaseName, billingtypes.LEASE_STATE_PENDING, sku)
+	require.True(t, f.placement.CurrentAdmissionBaseline().Valid(),
+		"fleet fixture must retain its projected admission baseline")
+	target := f.backendAt(backendIndex)
+	target.setProvisionHook(func(context.Context, backend.ProvisionRequest) error {
+		return errors.New("ambiguous provision transport outcome")
+	})
+	defer target.setProvisionHook(nil)
+	setTestProviderControlPlane(t, f.execution, f.chain, nil)
+	provision, err := f.execution.ProvisionCoordinatorWithPayloads(nil, nil)
+	require.NoError(t, err)
+	event, err := placement.NewProvisionEventRequest(
+		fleetLeaseUUID(leaseName), "tenant-1",
+	)
+	require.NoError(t, err)
+	result := provision.ExecuteCurrentLease(t.Context(), event)
+	require.Equal(t, placement.ProvisionEventUncertain, result.Disposition())
+	require.Error(t, result.Err())
+	require.False(t, f.coordinator.RuntimeController().Contains(fleetLeaseUUID(leaseName)),
+		"an ambiguous synchronous result leaves only durable write-ahead evidence")
+	require.Equal(t, target.name, f.placement.Lookup(fleetLeaseUUID(leaseName)).Attempt,
+		"ambiguous result: %v", result.Err())
+}
+
+func TestFleet_IncompleteRetentionInventoryDoesNotBlockHealthyProvision(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+	f.addLease("lease-no-authority", billingtypes.LEASE_STATE_PENDING)
+	f.backendAt(3).setFault(faultRetentionsOnly)
+
+	require.NoError(t, f.sweep())
+
+	total := 0
+	for _, srv := range f.servers {
+		total += srv.provisionCount("lease-no-authority")
+	}
+	require.Equal(t, 1, total,
+		"one unavailable backend must not globally pause provisioning on healthy topology")
+	require.Zero(t, f.backendAt(3).provisionCount("lease-no-authority"),
+		"the backend with incomplete inventory cannot receive new placement")
+	require.True(t, f.coordinator.RuntimeController().Contains(fleetLeaseUUID("lease-no-authority")))
+	require.Equal(t, placement.StateConfirmed,
+		f.placement.Lookup(fleetLeaseUUID("lease-no-authority")).State())
+}
+
 func TestFleet_HealthyFleet_AcknowledgesReadyLease(t *testing.T) {
 	t.Parallel()
 	f := newFleet(t, fleetOptions{})
@@ -72,7 +228,7 @@ func TestFleet_HealthyFleet_AcknowledgesReadyLease(t *testing.T) {
 	require.NoError(t, f.sweep())
 
 	acked, _, _ := f.chainCalls()
-	require.Contains(t, acked, "lease-ready")
+	require.Contains(t, acked, fleetLeaseUUID("lease-ready"))
 }
 
 func TestFleet_HealthyFleet_DeprovisionsOrphan(t *testing.T) {
@@ -126,7 +282,7 @@ func TestFleet_SlowButSuccessfulBackend_IsNotAFailure(t *testing.T) {
 	require.NoError(t, f.sweep(), "a slow but successful backend must not fail the sweep")
 
 	acked, _, _ := f.chainCalls()
-	require.Contains(t, acked, "lease-slow")
+	require.Contains(t, acked, fleetLeaseUUID("lease-slow"))
 }
 
 // --------------------------------------------------------------------------
@@ -142,7 +298,11 @@ func TestFleet_ActiveLeaseOnFaultedBackend_IsNeverReprovisioned(t *testing.T) {
 	for _, fault := range allFaults {
 		t.Run(string(fault), func(t *testing.T) {
 			t.Parallel()
-			f := newFleet(t, fleetOptions{})
+			opts := fleetOptions{}
+			if fault == faultHang {
+				opts.clientTimeout = 300 * time.Millisecond
+			}
+			f := newFleet(t, opts)
 
 			// The lease is ACTIVE on chain and lives on backend-2.
 			f.addLease("lease-pinned", billingtypes.LEASE_STATE_ACTIVE)
@@ -154,6 +314,11 @@ func TestFleet_ActiveLeaseOnFaultedBackend_IsNeverReprovisioned(t *testing.T) {
 
 			// Now backend-2 goes quiet.
 			f.backendAt(2).setFault(fault)
+			if fault == faultHang {
+				_, err := f.router.GetBackendByName("backend-2").ListProvisions(t.Context())
+				require.ErrorIs(t, err, context.DeadlineExceeded,
+					"the hang fixture must exercise a client timeout")
+			}
 
 			before := f.captureState([]string{"lease-pinned"})
 			_ = f.sweepN(2)
@@ -163,19 +328,14 @@ func TestFleet_ActiveLeaseOnFaultedBackend_IsNeverReprovisioned(t *testing.T) {
 	}
 }
 
-// The production data-loss shape, stated exactly. With no placement record to
-// pin it, a lease whose backend went quiet looks unprovisioned, and the
-// ACTIVE && !isProvisioned row hands it to least-loaded routing — which picks a
-// DIFFERENT machine and lays a brand-new empty volume over live tenant data.
-// Nothing about that is visible to the caller: the provision succeeds.
-//
-// The previous test pins the same rule with a placement record present (where
-// the pin happens to route it back to its real owner). This one removes the
-// pin, so a regression lands the provision on a peer — which is the failure
-// that actually destroys data.
+// The production data-loss shape, stated exactly. Before any complete fleet
+// projection establishes a durable absence baseline, a recordless lease whose
+// backend went quiet must not be treated as genuinely new. Otherwise the
+// ACTIVE && !isProvisioned row could hand it to a healthy peer and lay a new
+// empty volume over live tenant data.
 func TestFleet_UnplacedLeaseOnFaultedBackend_IsNotProvisionedOnAPeer(t *testing.T) {
 	t.Parallel()
-	f := newFleet(t, fleetOptions{noPlacement: true})
+	f := newFleet(t, fleetOptions{})
 
 	f.addLease("lease-unplaced", billingtypes.LEASE_STATE_ACTIVE)
 	f.backendAt(2).seedProvision(t, "lease-unplaced", f.providerUUID, backend.ProvisionStatusReady)
@@ -189,6 +349,93 @@ func TestFleet_UnplacedLeaseOnFaultedBackend_IsNotProvisionedOnAPeer(t *testing.
 		require.Zerof(t, srv.totalProvisionCalls(),
 			"no lease may be provisioned anywhere while the fleet is incomplete (%s)", srv.name)
 	}
+}
+
+// A complete inventory durably establishes that recordless means never placed
+// under this backend topology. A later outage therefore narrows new admission
+// to the backends that answered both endpoints instead of pausing the fleet.
+func TestFleet_PriorCompleteSweepAllowsNewPendingLeaseOnHealthyBackend(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	// Empty is intentional: a successful no-op projection establishes the
+	// durable topology-bound baseline used by later degraded sweeps.
+	require.NoError(t, f.sweep())
+	require.True(t, f.reconciler.placementSweepSeen.Load())
+
+	f.backendAt(3).setFault(faultConnReset)
+	f.addLease("lease-after-trust", billingtypes.LEASE_STATE_PENDING)
+	require.NoError(t, f.sweep())
+	require.Zero(t, f.backendAt(3).provisionCount("lease-after-trust"),
+		"routing must never escape the set of backends that answered both inventories")
+	f.assertProvisionedExactlyOnce("lease-after-trust")
+	require.Equal(t, placement.StateConfirmed,
+		f.placement.Lookup(fleetLeaseUUID("lease-after-trust")).State())
+
+	// Recovery must not duplicate the already admitted operation.
+	f.backendAt(3).setFault(faultNone)
+	require.NoError(t, f.sweep())
+	f.assertProvisionedExactlyOnce("lease-after-trust")
+}
+
+func TestFleet_DurableBaselineSurvivesRestartAndBackendOutage(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+	require.NoError(t, f.sweep(), "establish durable topology baseline")
+	require.True(t, f.placement.CurrentAdmissionBaseline().Valid())
+
+	f.restartReconciler()
+	require.True(t, f.placement.CurrentAdmissionBaseline().Valid(),
+		"the admission baseline must survive reopening the placement database")
+
+	f.backendAt(3).setFault(faultConnReset)
+	f.addLease("lease-after-restart", billingtypes.LEASE_STATE_PENDING)
+	require.NoError(t, f.sweep())
+
+	require.Zero(t, f.backendAt(3).provisionCount("lease-after-restart"))
+	f.assertProvisionedExactlyOnce("lease-after-restart")
+
+	f.backendAt(3).setFault(faultNone)
+	require.NoError(t, f.sweep())
+	f.assertProvisionedExactlyOnce("lease-after-restart")
+}
+
+func TestFleet_DegradedAdmissionIsPendingOnlyAndRequiresBothInventories(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{backendSKUs: map[int][]string{
+		2: {"sku-preferred-but-ineligible"},
+	}})
+	require.NoError(t, f.sweep(), "establish durable topology baseline")
+
+	// This ACTIVE lease may already have been placed after the baseline was
+	// recorded (for example by a v0.13 process). With its actual owner silent,
+	// recordlessness is not enough to authorize a move.
+	f.addLease("lease-active-unknown", billingtypes.LEASE_STATE_ACTIVE)
+	f.backendAt(3).seedProvision(
+		t, "lease-active-unknown", f.providerUUID, backend.ProvisionStatusReady,
+	)
+	f.backendAt(3).setFault(faultConnReset)
+
+	// backend-2 answers /provisions but not /retentions. Only backend-1 is an
+	// eligible destination for a genuinely new PENDING lease.
+	f.backendAt(2).setFault(faultRetentionsOnly)
+	f.addLease(
+		"lease-new-degraded", billingtypes.LEASE_STATE_PENDING,
+		"sku-preferred-but-ineligible",
+	)
+
+	require.NoError(t, f.sweep())
+
+	require.Equal(t, 1, f.backendAt(1).provisionCount("lease-new-degraded"))
+	require.Zero(t, f.backendAt(2).provisionCount("lease-new-degraded"))
+	require.Zero(t, f.backendAt(3).provisionCount("lease-new-degraded"))
+	f.assertProvisionedExactlyOnce("lease-new-degraded")
+	for _, srv := range f.servers {
+		require.Zero(t, srv.provisionCount("lease-active-unknown"),
+			"an ACTIVE recordless lease must not move during an outage via %s", srv.name)
+	}
+	require.Equal(t, placement.StateAbsent,
+		f.placement.Lookup(fleetLeaseUUID("lease-active-unknown")).State())
 }
 
 // A backend that dies partway through a paginated listing is the subtlest
@@ -293,16 +540,17 @@ func TestFleet_OrphanOnFaultedBackend_IsNotDeprovisioned(t *testing.T) {
 }
 
 // The payload store is the input to re-provisioning an ACTIVE lease. Deleting a
-// live lease's payload during a degraded sweep would make the NEXT sweep see
-// errPayloadNotAvailable, classify it as permanent, and close a healthy ACTIVE
-// lease on chain. This guards the chainLeases-filtering trap directly.
+// live lease's payload during a degraded sweep would make the next sweep lose
+// the only bytes authorized by the durable payload fingerprint. Missing bytes
+// now preserve and retry the exact attempt, but cannot reconstruct the request;
+// this guards that irreversible authority loss directly.
 func TestFleet_PayloadForLiveLease_SurvivesDegradedSweep(t *testing.T) {
 	t.Parallel()
 	f := newFleet(t, fleetOptions{})
 
 	f.addLease("lease-payload", billingtypes.LEASE_STATE_ACTIVE)
 	f.backendAt(2).seedProvision(t, "lease-payload", f.providerUUID, backend.ProvisionStatusReady)
-	require.True(t, f.payloads.Store("lease-payload", []byte("manifest-bytes")))
+	require.True(t, f.payloads.Store(fleetLeaseUUID("lease-payload"), []byte("manifest-bytes")))
 
 	require.NoError(t, f.sweep())
 	f.backendAt(2).setFault(faultHTTP500)
@@ -311,7 +559,7 @@ func TestFleet_PayloadForLiveLease_SurvivesDegradedSweep(t *testing.T) {
 	_ = f.sweepN(2)
 	f.assertNothingDestroyed(before, []string{"lease-payload"})
 
-	has, err := f.payloads.Has("lease-payload")
+	has, err := f.payloads.Has(fleetLeaseUUID("lease-payload"))
 	require.NoError(t, err)
 	require.True(t, has, "a live lease's payload must survive a sweep that could not see the fleet")
 }
@@ -366,11 +614,11 @@ func TestFleet_TerminalLease_PlacementIsPruned(t *testing.T) {
 	f.assertPlacementPinned("lease-x", "backend-2")
 
 	// Lease closes on chain and its resources are gone from the backend.
-	f.removeLease("lease-x")
+	f.closeLease("lease-x")
 	f.backendAt(2).mock.Clear()
 
 	require.NoError(t, f.sweep())
-	require.Empty(t, f.placement.Get("lease-x"),
+	require.Empty(t, f.placement.Lookup(fleetLeaseUUID("lease-x")).Backend,
 		"a chain-terminal lease absent from every backend should be pruned on a complete sweep")
 }
 
@@ -387,7 +635,7 @@ func TestFleet_RetentionsFailureAlone_DoesNotPrunePlacement(t *testing.T) {
 	f.assertPlacementPinned("lease-x", "backend-2")
 
 	// Exactly the shape the control prunes on — except /retentions is failing.
-	f.removeLease("lease-x")
+	f.closeLease("lease-x")
 	f.backendAt(2).mock.Clear()
 	f.backendAt(2).setFault(faultRetentionsOnly)
 
@@ -407,7 +655,7 @@ func TestFleet_BackendUnreachable_DoesNotPrunePlacement(t *testing.T) {
 	require.NoError(t, f.sweep())
 	f.assertPlacementPinned("lease-x", "backend-2")
 
-	f.removeLease("lease-x")
+	f.closeLease("lease-x")
 	f.backendAt(2).setFault(faultConnReset)
 
 	_ = f.sweepN(2)
@@ -482,7 +730,7 @@ func TestFleet_ChainWithNoRecordOfAnyLease_DestroysNothing(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		f.backendAt(i).seedProvision(t, fmt.Sprintf("lease-%d", i), f.providerUUID, backend.ProvisionStatusReady)
 	}
-	require.True(t, f.payloads.Store("lease-1", []byte("manifest-bytes")))
+	require.True(t, f.payloads.Store(fleetLeaseUUID("lease-1"), []byte("manifest-bytes")))
 
 	leases := []string{"lease-1", "lease-2", "lease-3"}
 
@@ -498,7 +746,7 @@ func TestFleet_ChainWithNoRecordOfAnyLease_DestroysNothing(t *testing.T) {
 		require.Zero(t, f.backendAt(i).deprovisionCount(fmt.Sprintf("lease-%d", i)),
 			"an empty chain is not an authorisation to empty the fleet")
 	}
-	has, err := f.payloads.Has("lease-1")
+	has, err := f.payloads.Has(fleetLeaseUUID("lease-1"))
 	require.NoError(t, err)
 	require.True(t, has)
 }
@@ -512,30 +760,31 @@ func TestFleet_DegradedSweep_StillCleansOrphanedPayload(t *testing.T) {
 	// A payload whose lease has closed — the shape the cleaner deletes.
 	f.addLease("lease-gone", billingtypes.LEASE_STATE_ACTIVE)
 	f.closeLease("lease-gone")
-	require.True(t, f.payloads.Store("lease-gone", []byte("manifest-bytes")))
+	require.True(t, f.payloads.Store(fleetLeaseUUID("lease-gone"), []byte("manifest-bytes")))
 	f.backendAt(2).setFault(faultConnReset)
 
 	require.NoError(t, f.sweep())
 
-	has, err := f.payloads.Has("lease-gone")
+	has, err := f.payloads.Has(fleetLeaseUUID("lease-gone"))
 	require.NoError(t, err)
 	require.False(t, has, "a backend outage must not hold up a pass that never reads a backend")
 }
 
 // The payload pass's other half: a chain fred cannot reach must not be read as
-// "the lease is gone". Deleting a live lease's payload makes the NEXT sweep see
-// errPayloadNotAvailable, classify it permanent, and close a healthy ACTIVE
-// lease on chain.
+// "the lease is gone". Deleting a live lease's payload makes the next sweep
+// unable to reproduce the bytes authorized by its durable fingerprint. That
+// condition is retriable and never closes the lease, but it still strands the
+// exact request until the payload is restored.
 func TestFleet_UnreachableChain_KeepsPayload(t *testing.T) {
 	t.Parallel()
 	f := newFleet(t, fleetOptions{})
 
-	require.True(t, f.payloads.Store("lease-unknown", []byte("manifest-bytes")))
+	require.True(t, f.payloads.Store(fleetLeaseUUID("lease-unknown"), []byte("manifest-bytes")))
 	f.setGetLeaseErr(errors.New("chain unreachable"))
 
 	require.NoError(t, f.sweepN(2))
 
-	has, err := f.payloads.Has("lease-unknown")
+	has, err := f.payloads.Has(fleetLeaseUUID("lease-unknown"))
 	require.NoError(t, err)
 	require.True(t, has, "a failed chain read is not evidence the lease finished")
 }
@@ -565,7 +814,7 @@ func TestFleet_DegradedSweep_PrunesOnlyAnsweringBackendsPlacements(t *testing.T)
 
 	require.NoError(t, f.sweep())
 
-	require.Empty(t, f.placement.Get("lease-on-2"),
+	require.Empty(t, f.placement.Lookup(fleetLeaseUUID("lease-on-2")).Backend,
 		"backend-2 answered, so absence from its report is evidence: prune")
 	f.assertPlacementPinned("lease-on-3", "backend-3")
 }
@@ -589,7 +838,7 @@ func TestFleet_RetentionsFailureOnOnePeer_StillPrunesElsewhere(t *testing.T) {
 
 	require.NoError(t, f.sweep())
 
-	require.Empty(t, f.placement.Get("lease-on-2"),
+	require.Empty(t, f.placement.Lookup(fleetLeaseUUID("lease-on-2")).Backend,
 		"a peer's retention outage says nothing about backend-2's records")
 }
 
@@ -613,7 +862,10 @@ func TestFleet_FleetSnapshot_ExcludesNonAnsweringBackendAndStampsOwner(t *testin
 
 	f.backendAt(2).setFault(faultConnReset)
 
-	snap := f.reconciler.fetchFleetSnapshot(t.Context())
+	sweep, err := f.reconciler.coordinator.BeginSweep()
+	require.NoError(t, err)
+	defer sweep.End()
+	snap := f.reconciler.fetchFleetSnapshot(t.Context(), sweep)
 
 	require.False(t, snap.complete, "one backend did not answer")
 	require.Equal(t, answeredSet{
@@ -624,12 +876,12 @@ func TestFleet_FleetSnapshot_ExcludesNonAnsweringBackendAndStampsOwner(t *testin
 	require.Equal(t, []string{"backend-2"}, snap.unansweredBackends())
 
 	// The silent backend's lease must be absent — not present-with-stale-data.
-	require.NotContains(t, snap.provisions, "lease-b",
+	require.NotContains(t, snap.provisions, fleetLeaseUUID("lease-b"),
 		"a backend that did not answer must contribute nothing")
 
 	// Answering backends' leases are present and attributed to them.
-	require.Equal(t, "backend-1", snap.provisions["lease-a"].BackendName)
-	require.Equal(t, "backend-3", snap.provisions["lease-c"].BackendName)
+	require.Equal(t, "backend-1", snap.provisions[fleetLeaseUUID("lease-a")].BackendName)
+	require.Equal(t, "backend-3", snap.provisions[fleetLeaseUUID("lease-c")].BackendName)
 }
 
 // The placement sync runs BEFORE the per-lease guard and is read back by it in
@@ -656,7 +908,7 @@ func TestFleet_DegradedSweep_DoesNotManufacturePlacementFromRetention(t *testing
 
 	require.NoError(t, f.sweepN(2))
 
-	require.Empty(t, f.placement.Get("lease-r"),
+	require.Empty(t, f.placement.Lookup(fleetLeaseUUID("lease-r")).Backend,
 		"a degraded sweep must not write a placement derived from retention data")
 
 	// And the guard must still be deferring — otherwise the assertion above
@@ -678,7 +930,7 @@ func TestFleet_CompleteSweep_StillBackfillsPlacementFromRetention(t *testing.T) 
 
 	require.NoError(t, f.sweep())
 
-	require.Equal(t, "backend-1", f.placement.Get("lease-r"),
+	require.Equal(t, "backend-1", f.placement.Lookup(fleetLeaseUUID("lease-r")).Backend,
 		"a complete sweep must still backfill placement from retention data")
 }
 
@@ -731,7 +983,7 @@ func TestFleet_DegradedSweep_ReconcilesLeasesOnHealthyBackends(t *testing.T) {
 		"a single unreachable backend must no longer fail the sweep")
 
 	acked, _, _ := f.chainCalls()
-	require.Contains(t, acked, "lease-on-healthy",
+	require.Contains(t, acked, fleetLeaseUUID("lease-on-healthy"),
 		"a lease on a healthy backend must be reconciled despite another backend's outage")
 }
 
@@ -761,7 +1013,8 @@ func TestFleet_DegradedSweep_ActsOnHealthyAndDefersSilentInOneSweep(t *testing.T
 	require.NoError(t, f.sweep())
 
 	acked, _, _ := f.chainCalls()
-	require.Contains(t, acked, "lease-healthy", "the healthy backend's lease is reconciled")
+	require.Contains(t, acked, fleetLeaseUUID("lease-healthy"),
+		"the healthy backend's lease is reconciled")
 
 	f.assertNothingDestroyed(before, []string{"lease-silent"})
 	f.assertPlacementPinned("lease-silent", "backend-3")

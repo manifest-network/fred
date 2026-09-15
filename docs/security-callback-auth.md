@@ -15,17 +15,57 @@ Fred ↔ backends is a **bidirectional HMAC channel**, not a one-way webhook fan
 
 The signer's view of the URI and the verifier's view of the URI agree on the outbound leg (no rewriter sits between them) but **diverge on the inbound leg** (Traefik strips the path before fred sees it). Any signature-binding change that includes the URI in its canonical string surfaces this asymmetry. ENG-191 was such a change, and ENG-198 was the compensation.
 
-## 2. TLS posture asymmetry (per the companion `manifest-deploy` repo's `CLAUDE.md`, `### Security` section)
+## 2. TLS and proxy posture
 
-In this deployment topology, the fred ↔ backend channel is **plain HTTP (no TLS)** by design — the lines cited are in the `manifest-deploy` repo's `CLAUDE.md`, not this repo's. HMAC is therefore the *only* authenticity mechanism on the wire between fred and backends. An in-zone observer can read every byte. That elevates the impact of any signature-binding weakness from theoretical to materially exploitable, which is the load-bearing reason ENG-191 had to bind method + URI into the canonical string in the first place. Do not reason about this system as if it were TLS-protected.
-
-> **Note (ENG-103).** TLS/mTLS is now *optionally* available on this hop (see [SECURITY.md § TLS (providerd → backend, ENG-103)](../SECURITY.md#tls-providerd--backend-eng-103)); it is a per-deployment choice, not a system constraint, and the production deploy above still runs plaintext. The HMAC scheme must remain robust independent of TLS — see the rejected alternative on switching to TLS in §5.
+Production deployments use certificate-verified TLS/mTLS on the fred ↔
+backend channel, and `providerd` now rejects an `http://` backend URL when
+`production_mode: true` (see [SECURITY.md § TLS (providerd → backend,
+ENG-103)](../SECURITY.md#tls-providerd--backend-eng-103)). This is required
+because request HMAC does not authenticate the backend's response headers or
+body. Development mode still permits plaintext, so the HMAC scheme must remain
+robust independent of TLS: an observer of such a network can read every byte,
+which is why ENG-191 must bind method + URI into the canonical string.
 
 ## 3. ENG-191's role on the call leg
 
-ENG-191 binds HTTP method and request URI into the canonical string to prevent **cross-endpoint replay**: a captured `POST /provision` signature must not verify when replayed against `POST /deprovision`, `POST /restart`, `POST /update`, or any other endpoint. All of the backend's contract endpoints share one HMAC secret (`callback_secret`). Without method/URI binding, an in-zone observer can flip lease state by replaying a captured legitimate signature against a different endpoint — exploitable, given the plain-HTTP posture in (2).
+ENG-191 binds HTTP method and request URI into the canonical string to prevent **cross-endpoint replay**: a captured `POST /provision` signature must not verify when replayed against `POST /deprovision`, `POST /restart`, `POST /update`, or any other endpoint. All contract endpoints on one backend use that backend's `callback_secret`. Without method/URI binding, anyone who obtains a legitimate signed request could replay it against a different endpoint on that backend. Production TLS limits passive capture, but it does not make weakening the application-layer signature contract safe, and development deployments may still use plaintext.
 
 ENG-191 is doing real work. Do not propose reverting it as a "simpler" fix for the ENG-198 symptom; the cost of reverting is reopening a materially exploitable cross-endpoint replay.
+
+Production gives every backend a distinct bidirectional key. Configure it as
+`providerd`'s `backends[].hmac_secret` and as that backend process's existing
+`callback_secret`. Provider startup binds each configured backend name to its
+prepared immutable storage UUID. Inbound callback JSON carries that UUID in the
+HMAC-covered `backend_storage_id`; Fred treats it only as a key selector until
+the signature verifies, then checks the same signed identity against durable
+operation/lifecycle authority. Missing, malformed, unknown, duplicate, or
+case-ambiguous selectors fail closed. A key for backend A cannot authenticate a
+callback selecting backend B or a provider command sent to B.
+
+The key is intentionally bidirectional within one backend trust boundary. A
+process that has compromised backend A can forge the provider side of A's own
+channel, but it already controls A's substrate. Direction-separated keys would
+only add protection if the sender and receiver inside that one node must be
+separate compromise domains; they do not improve cross-backend isolation.
+Provider-level `callback_secret` is retained only as an explicit
+non-production compatibility mode. Mixed and partial configurations are always
+rejected; production also rejects the global mode.
+
+The timestamp is a freshness bound, not a nonce. An identical signed request
+can be replayed against the same method and URI for up to five minutes; method
+and URI binding prevent moving it to a different endpoint or operation. Durable
+callback retry requires this behavior, while typed settlement and idempotent
+application handle duplicate delivery.
+
+### Stopped key migration
+
+There is no safe rolling interval between a fleet-wide key and per-backend
+keys. Stop providerd and all backends, configure each upgraded backend with its
+unique `callback_secret=K_i`, then start the backends while providerd remains
+stopped. Configure the matching providerd entry as
+`backends[].hmac_secret=K_i` and remove the top-level key. With the backends
+available, run the stopped placement classifier/preflight, then start
+providerd. See DEPLOYMENT.md for the complete cutover checklist.
 
 ## 4. Deploy uses a path-stripping reverse proxy
 
@@ -47,19 +87,40 @@ Fred grows a `callback_canonical_path_prefix` config field. The verifier prepend
 Validation rules:
 - Empty is legal (default — no prepend).
 - Non-empty: must start with `/`, must not end with `/`. Keeps the join `prefix + r.URL.RequestURI()` simple — exactly one slash at the seam.
+- The value must equal the normalized `EscapedPath` of `callback_base_url`
+  byte-for-byte. For example, a Unicode base path is compared in its canonical
+  percent-encoded wire form, not as decoded text. A root callback URL requires
+  an empty prefix.
 
-**Single source of truth.** The deploy is configured so that fred's `callback_canonical_path_prefix` and Traefik's `stripPrefix` middleware definition are both rendered from the *same Ansible variable* (see manifest-deploy). Drift between the two is mechanically impossible because there is only one input. This is the invariant the next engineer must preserve.
+Callback URL construction and replay preserve an accepted `RawQuery` exactly
+because those bytes are HMAC-covered. Raw spaces, non-ASCII bytes, malformed
+percent escapes, and other request-target-unstable bytes are rejected; their
+percent-encoded forms remain valid. Complete destinations must use a canonical
+path ending in `/callbacks/provision`, with no dot segments, encoded separators,
+userinfo, fragment, empty query marker, or unusable authority/port.
+
+**Single source of truth.** The deploy is configured so that the path in
+fred's `callback_base_url`, `callback_canonical_path_prefix`, and Traefik's
+`stripPrefix` middleware definition are rendered from the *same Ansible
+variable* (see manifest-deploy). Fred also rejects startup unless the first two
+normalize to the same escaped bytes. This is the invariant the next engineer
+must preserve.
 
 ### Rejected alternatives (do not relitigate)
 
 - **Read `X-Forwarded-Prefix` from a trusted proxy.** Three failure modes (header present + trusted, header present + untrusted, header missing + `production_mode` gating) vs. one (config right or wrong). Header trust requires a list of trusted-proxy CIDRs maintained alongside `trusted_proxies` and a non-trivial verification path. Static config is strictly simpler and Ansible already knows the value.
 - **Normalize URIs on both sides** (e.g., always strip a known prefix at the signer, or always work in "bare" path space). Couples backend code to the deployment-specific proxy topology and breaks direct-call deploys (loadtest, dev). The signer should sign what it actually sends; the verifier compensates for what the proxy did.
 - **Revert ENG-191 / drop URI binding.** Reopens cross-endpoint replay, which is materially exploitable per (2) and (3) above. Not on the table.
-- **Switch to TLS between fred and backends to eliminate the in-zone-observer threat.** Out of scope for this fix — would also require changes in the companion `manifest-deploy` repo (`CLAUDE.md`, `### Security` section). The HMAC channel must remain robust regardless.
+- **Rely on TLS and weaken HMAC URI binding.** Production TLS protects the
+  transport, but development deployments may use plaintext and application
+  authentication remains a separate defense. The HMAC channel must remain
+  robust regardless.
 
 ## Invariants the next reader must preserve
 
-1. `callback_canonical_path_prefix` and the upstream proxy's strip rule are sourced from one variable. Do not template them independently.
+1. `callback_base_url` path, `callback_canonical_path_prefix`, and the upstream
+   proxy's strip rule are sourced from one variable. Startup enforces equality
+   between the first two; do not template the proxy rule independently.
 2. Empty prefix is a no-op (default). Do not require non-empty in `production_mode` — direct-call deploys are legitimate.
 3. The prefix is config, not header-derived. Do not "improve" it by reading `X-Forwarded-Prefix` without first re-reading section (2) above.
 4. ENG-191's method + URI binding stays. Any change that drops either field must first address cross-endpoint replay over plain HTTP.
