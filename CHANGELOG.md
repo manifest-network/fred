@@ -1241,9 +1241,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Log retrieval now admits one materialized response per daemon, holding its
   slot through backend cleanup and the final client write even after a timeout.
-  Saturation returns `503` with `Retry-After: 1`. A shared bounded log snapshot,
-  member decoder and fragment encoder avoid extra full escaped-document copies
-  while preserving the 32 MiB capture allowance and live/failed-attempt keys.
+  Up to eight requests wait in FIFO order; queueing and retrieval share the
+  request deadline. A full queue or expired admission wait returns `503` with
+  `Retry-After: 1`. The final transfer has a separate deadline using the
+  configured HTTP write timeout, falling back to the request timeout when no
+  positive write timeout is configured. A slow reader can receive truncated
+  JSON after `200 OK`; require a complete body and valid JSON, and retry with
+  a smaller `tail` if needed. Token validation precedes admission even when
+  tenant rate limiting is disabled.
+  A shared bounded log snapshot, member decoder and fragment encoder avoid extra
+  full escaped-document copies while preserving the 32 MiB capture allowance and
+  live/failed-attempt keys.
   Exact backend read-capacity replies retain tenant retry guidance without
   opening the shared provisioning circuit or granting mutation-refusal authority.
 - Offline placement preparation, fresh initialization and repair application

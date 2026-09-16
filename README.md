@@ -757,9 +757,11 @@ including timeout cleanup; retrying a read does not consume a replay token.
 The final response transfer has a separate deadline using the daemon's configured
 HTTP write timeout, falling back to the request timeout when no positive write
 timeout is configured. A client that does not read, or reads too slowly, can
-receive an incomplete response; retry with a smaller `tail`. The 32 MiB content
-budget is unchanged, but it does not guarantee delivery of a fully escaped
-response over an arbitrarily slow link.
+receive an incomplete response even after `200 OK`. Treat the response as
+complete only after reading the entire HTTP body without a transport error and
+parsing it as the expected JSON response below; otherwise, retry with a smaller
+`tail`. The 32 MiB content budget is unchanged, but it does not guarantee
+delivery of a fully escaped response over an arbitrarily slow link.
 
 **Query Parameters:**
 - `tail` - Number of log lines to return per container (default: 100, max: 10000)
