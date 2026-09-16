@@ -5314,6 +5314,7 @@ func TestRestoreLease_RejectsNonPendingLease(t *testing.T) {
 			h.RestoreLease(rec, req)
 
 			assert.Equal(t, http.StatusConflict, rec.Code, "body: %s", rec.Body.String())
+			assert.JSONEq(t, `{"error":"lease is not pending; only a fresh lease can be restored into","code":409,"reason":"target_not_pending"}`, rec.Body.String())
 		})
 	}
 }
@@ -5378,6 +5379,7 @@ func TestRestoreLease_RereadRejectsTargetThatBecameTerminal(t *testing.T) {
 	handlers.RestoreLease(response, request)
 
 	assert.Equal(t, http.StatusConflict, response.Code, "body: %s", response.Body.String())
+	assert.JSONEq(t, `{"error":"lease is not pending; only a fresh lease can be restored into","code":409,"reason":"target_not_pending"}`, response.Body.String())
 	assert.Equal(t, int32(2), reads.Load(),
 		"restore must re-read after HTTP authentication while lifecycle claims are held")
 	assert.Zero(t, backendCalls.Load(), "a target that closed in the delay must never dispatch")

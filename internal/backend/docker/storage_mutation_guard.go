@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/errdefs"
@@ -133,6 +134,7 @@ func newBackgroundMaintenanceCoordinator(
 			return ops.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
 		})
 	})
+	var networkCleanupMu sync.Mutex
 
 	return &backgroundMaintenanceCoordinator{
 		recoverInterruptedVolumesFn: func(ctx context.Context) error {
@@ -152,6 +154,12 @@ func newBackgroundMaintenanceCoordinator(
 			return backend.reconcileVolumeQuotasUsing(ctx, ensureVolumeQuota)
 		},
 		cleanupOrphanedNetworksFn: func(ctx context.Context) {
+			// Coalesce overlapping fleet sweeps instead of queuing another full
+			// inventory. The next periodic pass revisits newly orphaned networks.
+			if ctx.Err() != nil || !networkCleanupMu.TryLock() {
+				return
+			}
+			defer networkCleanupMu.Unlock()
 			backend.cleanupOrphanedNetworksUsing(ctx, removeTenantNetwork)
 		},
 		reapExpiredRetentionsFn: func(ctx context.Context) (int, error) {

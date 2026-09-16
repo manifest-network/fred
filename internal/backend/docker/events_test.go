@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -78,6 +79,7 @@ func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
 	}()
 
 	// Send a die event.
+	droppedBefore := testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues("event_loop"))
 	eventCh <- ContainerEvent{ContainerID: "c1", Action: "die"}
 
 	// Wait for the transition to be processed.
@@ -107,6 +109,7 @@ func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
 	b.stopCancel()
 	<-done
 	b.wg.Wait()
+	assert.Equal(t, droppedBefore, testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues("event_loop")))
 }
 
 func TestContainerEventLoop_IgnoresNonReadyLease(t *testing.T) {

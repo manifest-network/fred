@@ -29,7 +29,8 @@ const (
 	RestoreApplicationTargetNotPending
 	RestoreApplicationSourceNotFound
 	RestoreApplicationSourceUnavailable
-	RestoreApplicationAlreadyInProgress
+	RestoreApplicationSourceBusy
+	RestoreApplicationTargetBusy
 	RestoreApplicationServiceUnavailable
 	RestoreApplicationNotRetained
 	RestoreApplicationBackendRejected
@@ -201,14 +202,14 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 	}
 	first := authority.coordinator.operations.TryClaimLeaseNow(firstUUID)
 	if !first.Acquired() {
-		return restoreClaimApplicationFailure(first.Outcome())
+		return restoreClaimApplicationFailure(first.Outcome(), firstIsSource)
 	}
 	second := authority.coordinator.operations.TryClaimLeaseNow(secondUUID)
 	if !second.Acquired() {
 		if !authority.coordinator.operations.ReleaseLease(first.Claim()) {
 			slog.Error("failed to release partial restore lease claim", "lease_uuid", firstUUID)
 		}
-		return restoreClaimApplicationFailure(second.Outcome())
+		return restoreClaimApplicationFailure(second.Outcome(), !firstIsSource)
 	}
 	var sourceClaim, targetClaim operation.LeaseClaim
 	if firstIsSource {
@@ -265,7 +266,7 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 	)
 	if !initiated.Started() {
 		if initiated.Outcome() == operation.TrackBusy {
-			return RestoreApplicationResult{disposition: RestoreApplicationAlreadyInProgress}
+			return RestoreApplicationResult{disposition: RestoreApplicationTargetBusy}
 		}
 		return RestoreApplicationResult{
 			disposition: RestoreApplicationServiceUnavailable,
@@ -326,9 +327,12 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 	}
 }
 
-func restoreClaimApplicationFailure(outcome operation.LeaseClaimOutcome) RestoreApplicationResult {
+func restoreClaimApplicationFailure(outcome operation.LeaseClaimOutcome, isSource bool) RestoreApplicationResult {
 	if outcome == operation.LeaseClaimBusy {
-		return RestoreApplicationResult{disposition: RestoreApplicationAlreadyInProgress}
+		if isSource {
+			return RestoreApplicationResult{disposition: RestoreApplicationSourceBusy}
+		}
+		return RestoreApplicationResult{disposition: RestoreApplicationTargetBusy}
 	}
 	return RestoreApplicationResult{
 		disposition: RestoreApplicationServiceUnavailable,
@@ -341,10 +345,12 @@ func restoreAdmissionApplicationFailure(err error) RestoreApplicationResult {
 	switch {
 	case errors.Is(err, ErrRestoreSourceNotFound):
 		disposition = RestoreApplicationSourceNotFound
-	case errors.Is(err, ErrRestoreSourceClaimed),
+	case errors.Is(err, ErrRestoreSourceClaimed):
+		disposition = RestoreApplicationSourceBusy
+	case errors.Is(err, ErrRestoreTargetClaimed),
 		errors.Is(err, ErrRestoreTargetUnavailable),
 		errors.Is(err, ErrAttemptConflict):
-		disposition = RestoreApplicationAlreadyInProgress
+		disposition = RestoreApplicationTargetBusy
 	case errors.Is(err, ErrRestoreSourceUnavailable):
 		disposition = RestoreApplicationSourceUnavailable
 	}

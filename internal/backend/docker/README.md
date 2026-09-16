@@ -874,7 +874,8 @@ When a provision has `status=failed` (e.g., a container crashed and was detected
   cannot stall the event loop. Observation refusal—including generation drift,
   a recovery reservation, shutdown, or a full inbox—is retried from current
   state by reconciliation. Container-death refusal increments
-  `die_event_dropped_total`; cohort-divergence refusal is logged.
+  `die_event_dropped_total`, except deaths positively owned by the registered
+  actor's active close callback; cohort-divergence refusal is logged.
 
 Every lease is owned by a per-lease actor goroutine with a bounded inbox (16 messages). All transitions flow through a state machine, one per actor, which serializes transitions and owns the side effects (callback emission, diagnostics persistence, gauge updates). The SM's initial state is the lease's current `Status` at actor creation — new leases start in `Provisioning`, recovered leases start in whatever state they were in.
 
@@ -936,7 +937,9 @@ The edges above are the complete set of allowed transitions; any event not liste
   them. Admission atomically rejects an already-stale claim, and the bound actor
   message discards one that becomes stale while queued, instead of creating or
   targeting the wrong actor.
-  Container-death refusal is counted in `die_event_dropped_total`,
+  Container-death refusal is counted in `die_event_dropped_total`, except when
+  the current runtime's death is already owned by an active actor-close scope.
+  A deprovisioning status alone does not suppress the drop signal;
   cohort-divergence refusal is logged, and the reconciler re-detects both from
   current state. One wedged actor cannot stall die-event delivery for other
   leases.
@@ -966,7 +969,8 @@ these phases do not measure the full wall time of a failed replacement.
 - `fred_docker_backend_die_event_dropped_total{source}` — container-death
   observations refused because their exact generation was stale, recovery held
   the actor key, the backend was shutting down, or the current actor's inbox was
-  unavailable. `source` is `event_loop` or `reconcile`. The reconciler
+  unavailable. Deaths positively owned by the current actor's active close
+  callback are excluded. `source` is `event_loop` or `reconcile`. The reconciler
   re-detects current failures; sustained growth flags churn, recovery contention,
   a wedged actor, or chronic burst.
 - `fred_docker_backend_pending_close_intents` and `fred_docker_backend_oldest_close_intent_age_seconds` — unlabeled aggregate count and oldest age for the non-expiring destructive-close journal. A brief non-zero value is normal while a close runs; sustained age means a finalizer dependency is unavailable. Use the lease-scoped recovery log to identify the row without introducing an unbounded lease label.
@@ -989,6 +993,13 @@ backend client's `RefreshState` is intentionally a no-op: a providerd reconcile
 sweep reads the last backend projection and does not force an extra Docker
 recovery pass. Runtime WAL retry cadence is therefore the docker-backend's own
 `reconcile_interval` (default `5m`), not providerd's sweep interval.
+
+Orphaned tenant networks are cleaned up by these state-recovery passes, with at
+most one network sweep per backend at a time. A successful close does not run a
+fleet-wide sweep or wait for unrelated network cleanup. An unused network can
+therefore remain until the next successful pass, including across failed
+recovery attempts. Size Docker's address pools for active tenants and tenant
+churn between passes; close completion does not imply immediate subnet reuse.
 
 The bounds are nested and aggregate where cardinality matters:
 

@@ -2201,11 +2201,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if observationErr != nil {
 			return fmt.Errorf("construct container death observation: %w", observationErr)
 		}
-		if !b.routeActorObservation(observation) {
-			dieEventDroppedTotal.WithLabelValues("reconcile").Inc()
-			b.logger.Warn("die event dropped during reconcile dispatch; reconciler will re-detect",
-				"lease_uuid", generation.LeaseUUID(), "container_id", leasesm.ShortID(containerID))
-		}
+		b.dispatchContainerDeathObservation(observation, containerID, "reconcile")
 	}
 
 	stats := b.pool.Stats()
@@ -2364,11 +2360,7 @@ func (b *Backend) containerEventLoop() {
 							b.logger.Error("invalid container event ignored", "error", observationErr)
 							continue
 						}
-						if !b.routeActorObservation(observation) {
-							dieEventDroppedTotal.WithLabelValues("event_loop").Inc()
-							b.logger.Warn("die event dropped at event loop dispatch; reconciler will re-detect",
-								"lease_uuid", leaseUUID, "container_id", leasesm.ShortID(event.ContainerID))
-						}
+						b.dispatchContainerDeathObservation(observation, event.ContainerID, "event_loop")
 					}
 				}
 			case err, ok := <-errCh:

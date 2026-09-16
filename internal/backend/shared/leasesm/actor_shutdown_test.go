@@ -92,10 +92,18 @@ func TestNewLeaseActorRejectsTypedNilCapabilityBeforeInstallation(t *testing.T) 
 }
 
 func TestActorCloseScopeIsExactAndCallbackLifetime(t *testing.T) {
+	_, _, releases := newTestOperationSuccess(t, testActorLeaseUUID, shared.OperationIntentProvision)
+	runtime, err := releases.ProveRuntimeGeneration(testActorLeaseUUID)
+	require.NoError(t, err)
+	observation, err := NewContainerDiedObservation("closing-container", runtime)
+	require.NoError(t, err)
 	store := newMockProvisionStore()
 	store.put(testActorLeaseUUID, &ProvisionState{
-		LeaseUUID: testActorLeaseUUID,
-		Status:    backend.ProvisionStatusReady,
+		LeaseUUID:            testActorLeaseUUID,
+		Status:               backend.ProvisionStatusReady,
+		ActiveReleaseVersion: runtime.Version(),
+		ActiveOperationID:    runtime.OperationID(),
+		ContainerIDs:         []string{"closing-container"},
 	})
 	var actor *LeaseActor
 	var escaped ActorCloseScope
@@ -103,6 +111,14 @@ func TestActorCloseScopeIsExactAndCallbackLifetime(t *testing.T) {
 		ProvisionStore: store,
 		DoDeprovisionFn: func(_ context.Context, scope ActorCloseScope) error {
 			escaped = scope
+			assert.Same(t, scope.state, actor.activeClose.Load())
+			assert.True(t, actor.CloseOwnsObservation(observation))
+			assert.False(t, actor.CloseOwnsObservation(ActorObservation{}))
+			store.UpdateFn(testActorLeaseUUID, func(p *ProvisionState) { p.ActiveReleaseVersion++ })
+			assert.False(t, actor.CloseOwnsObservation(observation), "close cannot suppress another runtime generation")
+			store.UpdateFn(testActorLeaseUUID, func(p *ProvisionState) { p.ActiveReleaseVersion-- })
+			require.NoError(t, releases.Close())
+			assert.False(t, actor.CloseOwnsObservation(observation), "close cannot suppress unreadable runtime authority")
 			assert.True(t, scope.Matches(actor, actor.cfg.RecoveryLineage))
 			assert.False(t, scope.Matches(actor, mustTestRecoveryLineage()),
 				"an actor-close scope must not cross coordinator lineages")
@@ -114,6 +130,8 @@ func TestActorCloseScopeIsExactAndCallbackLifetime(t *testing.T) {
 	})
 
 	require.NoError(t, actor.handleDeprovision(context.Background()))
+	assert.Nil(t, actor.activeClose.Load(), "completed close must clear its observational scope")
+	assert.False(t, actor.CloseOwnsObservation(observation))
 	assert.Empty(t, escaped.LeaseUUID())
 	assert.False(t, escaped.Matches(actor, actor.cfg.RecoveryLineage),
 		"a copied actor-close scope must be revoked after its callback returns")
@@ -131,6 +149,7 @@ func TestActorCloseScopeIsRevokedWhenCallbackPanics(t *testing.T) {
 		ProvisionStore: store,
 		DoDeprovisionFn: func(_ context.Context, scope ActorCloseScope) error {
 			escaped = scope
+			assert.Same(t, scope.state, actor.activeClose.Load())
 			panic("boom")
 		},
 	})
@@ -139,6 +158,7 @@ func TestActorCloseScopeIsRevokedWhenCallbackPanics(t *testing.T) {
 		defer func() { require.Equal(t, "boom", recover()) }()
 		_ = actor.handleDeprovision(context.Background())
 	}()
+	assert.Nil(t, actor.activeClose.Load(), "panicking close must clear its observational scope")
 	assert.Empty(t, escaped.LeaseUUID())
 	assert.False(t, escaped.Matches(actor, actor.cfg.RecoveryLineage),
 		"panic must not leak actor-close authority")

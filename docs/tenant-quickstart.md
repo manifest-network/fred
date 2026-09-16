@@ -336,6 +336,16 @@ Choosing the same or a larger disk tier satisfies the tier-size check; choosing 
 
 `202 Accepted` means restore has started; monitor the target's status or events until it reaches `ready` or `failed`. A non-`PENDING` or already-busy target returns `409 Conflict`. Missing retained data returns `404 Not Found`; unavailable source routing, an unavailable backend, or insufficient capacity can return `503 Service Unavailable`. A timeout or other ambiguous backend result can leave the target pending recovery, so an immediate retry may return `409`; check its status before trying again. See the [restore API reference](../README.md#restore-lease) for the complete response descriptions.
 
+For `409` responses, the numeric `code` remains `409`; an optional `reason`
+identifies conflicts known to the provider:
+
+- `source_busy`: the source is still owned by lifecycle work, such as close. Keep the fresh target and retry later with a fresh token.
+- `target_busy`: the target already has work or durable placement evidence. Preserve it and inspect its status; allow pending recovery to finish before deciding whether to retry.
+- `target_not_pending`: the target's chain state is no longer `PENDING`, so restore cannot use it.
+
+A missing or unfamiliar `reason` does not justify automatically cancelling the
+target. Keep its UUID and check its status before taking another action.
+
 All three mutations require a fresh bearer token for every HTTP attempt (hence
 `$(fresh_token)` rather than a stored `$TOKEN` variable). Restart and update
 also require exactly one canonical UUIDv4 `Idempotency-Key`: create it once for

@@ -757,6 +757,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Docker closes no longer perform a fleet-wide orphan-network sweep before
+  returning. Recovery owns network cleanup, and overlapping sweeps coalesce
+  without queuing additional Docker inventories. (ENG-981)
+- Container deaths positively owned by an active close no longer emit dropped
+  crash-observation warnings or increment the dropped-event counter. Actual
+  delivery refusals remain observable. (ENG-977)
+- Restore conflicts include an optional `reason` identifying a busy source,
+  busy target, or non-pending target while preserving the numeric HTTP `code`.
+  Unclassified backend conflicts do not claim a target-specific cause. (ENG-979)
 - Maintenance recovery measures uncertain container startup ages with a bounded
   monotonic clock and defers expected readiness waits per lease, so clock
   rollback does not prevent backend startup. Cold recovery reports pending

@@ -1522,6 +1522,8 @@ func TestDeprovision_WithNetworkIsolation(t *testing.T) {
 
 	err := b.Deprovision(context.Background(), durableCallbackTestLeaseUUID)
 	require.NoError(t, err)
+	assert.False(t, networkCleanupCalled, "close completion must not run fleet network cleanup")
+	require.NoError(t, b.recoverState(context.Background()))
 	assert.True(t, networkCleanupCalled)
 }
 

@@ -73,19 +73,40 @@ func (b *Backend) routeToLease(leaseUUID string, msg leasesm.ActorCommand) bool 
 func (b *Backend) routeActorObservation(
 	observation leasesm.ActorObservation,
 ) bool {
+	return b.routeActorObservationDisposition(observation) == observationDelivered
+}
+
+type observationRoutingDisposition uint8
+
+const (
+	observationRefused observationRoutingDisposition = iota
+	observationDelivered
+	observationOwnedByClose
+)
+
+// routeActorObservationDisposition distinguishes a lost crash signal from one
+// already owned by this registered actor's active close callback. Status alone
+// never suppresses a refusal; shutdown, recovery exclusion, stale/unreadable
+// runtime authority and unavailable inboxes keep their existing drop signal.
+func (b *Backend) routeActorObservationDisposition(
+	observation leasesm.ActorObservation,
+) observationRoutingDisposition {
 	leaseUUID := observation.LeaseUUID()
 	if leaseUUID == "" {
-		return false
+		return observationRefused
 	}
 	b.actorsMu.Lock()
 	defer b.actorsMu.Unlock()
 	if b.stopCtx.Err() != nil || b.actorRecoveryClaims[leaseUUID] != nil {
-		return false
-	}
-	if !observation.Current(b.provisionStore) {
-		return false
+		return observationRefused
 	}
 	actor := b.actors[leaseUUID]
+	if actor != nil && actor.CloseOwnsObservation(observation) {
+		return observationOwnedByClose
+	}
+	if !observation.Current(b.provisionStore) {
+		return observationRefused
+	}
 	created := false
 	if actor == nil {
 		actor = b.actorForLocked(leaseUUID)
@@ -99,9 +120,21 @@ func (b *Backend) routeActorObservation(
 		}
 	}
 	if !valid {
-		return false
+		return observationRefused
 	}
-	return true
+	return observationDelivered
+}
+
+func (b *Backend) dispatchContainerDeathObservation(
+	observation leasesm.ActorObservation, containerID, source string,
+) {
+	if b.routeActorObservationDisposition(observation) != observationRefused {
+		return
+	}
+	dieEventDroppedTotal.WithLabelValues(source).Inc()
+	b.logger.Warn("die event dropped at dispatch; reconciler will re-detect",
+		"source", source, "lease_uuid", observation.LeaseUUID(),
+		"container_id", leasesm.ShortID(containerID))
 }
 
 // captureRuntimeGenerationProofs snapshots observational authority before a

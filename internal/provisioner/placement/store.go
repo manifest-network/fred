@@ -121,6 +121,9 @@ var (
 	// ErrRestoreSourceClaimed means another synchronous restore dispatch already
 	// holds the exclusive process-local claim for this source.
 	ErrRestoreSourceClaimed = errors.New("restore source placement is claimed")
+	// ErrRestoreTargetClaimed means the requested target is reserved as the
+	// source of another synchronous restore dispatch.
+	ErrRestoreTargetClaimed = errors.New("restore target placement is claimed")
 	// ErrRestoreTargetUnavailable means the target already has durable placement
 	// evidence. Restore admission requires a truly absent target and never
 	// adopts, retries, or overwrites an existing placement.
@@ -2397,7 +2400,7 @@ func (s *Store) beginRestoreWithSourceRevision(
 	// target. This is the restore counterpart to the typed attempt-admission
 	// fence and keeps the source immutable for the holder of the first claim.
 	if s.restoreSourceClaimedLocked(targetLeaseUUID) {
-		return RestoreClaim{}, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, targetLeaseUUID)
+		return RestoreClaim{}, fmt.Errorf("%w: lease %q", ErrRestoreTargetClaimed, targetLeaseUUID)
 	}
 	if err := s.unprojectedPositiveErrorLocked(sourceLeaseUUID); err != nil {
 		return RestoreClaim{}, err

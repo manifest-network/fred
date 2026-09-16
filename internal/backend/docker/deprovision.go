@@ -278,13 +278,10 @@ func (b *Backend) doDeprovisionScoped(
 		outcome = b.closeSettlement.ExecuteClose(ctx, execution)
 	}
 
-	var terminalOutcome shared.CloseTerminalOutcome
 	switch terminal := outcome.(type) {
 	case shared.CloseExecutionDestroyed:
-		terminalOutcome = terminal
 		err = b.completeCloseOutcome(terminal)
 	case shared.CloseExecutionRetained:
-		terminalOutcome = terminal
 		err = b.completeCloseOutcome(terminal)
 	case shared.CloseExecutionPending:
 		err = terminal.Cause()
@@ -301,11 +298,8 @@ func (b *Backend) doDeprovisionScoped(
 		return err
 	}
 
-	if b.cfg.IsNetworkIsolation() && terminalOutcome.Tenant() != "" {
-		// The coordinator owns selection as well as mutation. A close caller can
-		// request a convergence pass, but cannot target a tenant network directly.
-		b.cleanupOrphanedNetworks(ctx)
-	}
+	// Tenant networks converge in the periodic fleet sweep. A completed close
+	// must not wait for unrelated network inventory or tenant network mutations.
 	deprovisionsTotal.Inc()
 	logger.Info("deprovisioned")
 	return nil

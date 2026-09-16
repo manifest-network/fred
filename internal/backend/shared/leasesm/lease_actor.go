@@ -890,6 +890,9 @@ type LeaseActor struct {
 	// the stuck-actor sampler to detect hung handlers. Written by the
 	// actor's goroutine, read atomically by the sampler goroutine.
 	currentMessageStart atomic.Int64
+	// activeClose publishes the existing callback-lifetime close scope for
+	// observational routing. It cannot authorize mutation or outlive that scope.
+	activeClose atomic.Pointer[actorCloseScopeState]
 	// terminated is set by handleDeprovision once the provision entry has
 	// been fully removed. The run loop checks it after every handle() and
 	// exits, allowing the actor's slot in the registry to be reused by a

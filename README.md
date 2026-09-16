@@ -1016,6 +1016,25 @@ off to a complete durable close intent before teardown.
 - `502 Bad Gateway` - The backend rejected the restore with an unusable or off-contract error response
 - `503 Service Unavailable` - Insufficient resources, an open backend circuit, an unavailable source lease observation, unavailable placement routing/recording/tracking, or a source placement that is unusable, unresolved, or names a backend Fred no longer knows
 
+Restore admission conflicts add an optional `reason` while preserving the public
+API's numeric HTTP-status `code` and human-readable `error`:
+
+```json
+{"error":"lease is already being provisioned or restored","code":409,"reason":"source_busy"}
+```
+
+| `reason` | Meaning | Client action |
+|---|---|---|
+| `source_busy` | The source is owned by lifecycle work, such as close, or another restore dispatch | Keep the target lease and retry later with a fresh bearer token |
+| `target_busy` | The target has lifecycle work, a tracked operation, or existing durable placement/attempt evidence | Preserve the target and inspect its status; pending recovery may need to finish before another restore can be admitted |
+| `target_not_pending` | An authoritative target chain read found a state other than `PENDING` | Do not retry restore into this target; restore requires a fresh `PENDING` lease |
+
+A generic backend `409` still omits `reason`: its refusal does not identify
+whether the source or target state caused the conflict. Missing or unrecognized
+reasons are not evidence that it is safe to cancel the target. Preserve its UUID
+and inspect its status. Backend protocol string codes, including
+`demote_exceeds_tier`, are separate from the public API's numeric `code` field.
+
 ### Get Release History
 
 ```

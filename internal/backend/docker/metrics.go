@@ -650,11 +650,13 @@ var (
 	// provision generation that produced the event is no longer current. The
 	// reconciler re-detects a missed current-generation death on its next cycle
 	// (default 5m); stale-generation observations are intentionally discarded.
+	// Deaths positively owned by an active actor-close scope are excluded: they
+	// no longer require ordinary runtime-failure delivery.
 	dieEventDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "die_event_dropped_total",
-		Help:      "Container-death observations refused because the backend stopped, the actor was busy or recovery-owned, or the provision generation was stale",
+		Help:      "Container-death observations refused because the backend stopped, the actor was busy or recovery-owned, or the provision generation was stale; excludes deaths owned by an active actor close",
 	}, []string{"source"})
 
 	// leaseWorkerPanicsTotal counts panics recovered in lease worker

@@ -396,7 +396,7 @@ func TestRestoreApplicationInvokesBackendOnceAcrossConcurrentCopies(t *testing.T
 	<-entered
 	go func() { results <- authority.ExecuteApplication(t.Context(), request) }()
 	second := <-results
-	assert.Equal(t, RestoreApplicationAlreadyInProgress, second.Disposition())
+	assert.Equal(t, RestoreApplicationSourceBusy, second.Disposition())
 	close(release)
 	first := <-results
 	assert.Equal(t, RestoreApplicationAccepted, first.Disposition(), first.Err())

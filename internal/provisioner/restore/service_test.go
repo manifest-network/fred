@@ -952,11 +952,92 @@ func TestServiceTwoConcurrentTargetsOneSourceDispatchesOnce(t *testing.T) {
 	secondCommand := validCommand()
 	secondCommand.TargetLeaseUUID = secondTarget
 	second := fixture.service.Execute(t.Context(), secondCommand)
-	assert.Equal(t, OutcomeAlreadyInProgress, second.Outcome)
+	assert.Equal(t, OutcomeSourceBusy, second.Outcome)
 	assert.Equal(t, 1, fixture.backend.callCount())
 	assert.Equal(t, placement.StateAbsent, fixture.store.Lookup(secondTarget).State())
 	close(release)
 	assert.Equal(t, OutcomeAccepted, (<-firstResult).Outcome)
+}
+
+func TestServiceBusyConflictIdentifiesLeaseAcrossClaimOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		source  string
+		target  string
+		outcome Outcome
+	}{
+		{name: "source claimed first", source: testSource, target: "z-target", outcome: OutcomeSourceBusy},
+		{name: "source claimed second", source: testSource, target: "a-target", outcome: OutcomeSourceBusy},
+		{name: "target claimed first", source: "z-source", target: testTarget, outcome: OutcomeTargetBusy},
+		{name: "target claimed second", source: "a-source", target: testTarget, outcome: OutcomeTargetBusy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newFixture(t, true)
+			fixture.targets.leases[tc.source] = sourceLease(tc.source)
+			fixture.targets.leases[tc.target] = pendingLease(tc.target)
+			projectRestoreTestPlacements(t, fixture.reconciliation, false, map[string]string{
+				tc.source: testBackend,
+			})
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			fixture.backend.setRestore(func(ctx context.Context, _ backend.RestoreRequest) error {
+				if fixture.backend.callCount() != 1 {
+					return errors.New("conflicting restore reached the backend")
+				}
+				close(entered)
+				select {
+				case <-release:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+			firstResult := make(chan Result, 1)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				firstResult <- fixture.service.Execute(t.Context(), validCommand())
+			}()
+			t.Cleanup(func() {
+				releaseOnce.Do(func() { close(release) })
+				<-done
+			})
+			select {
+			case <-entered:
+			case result := <-firstResult:
+				t.Fatalf("first restore did not reach backend: outcome %v, error %v", result.Outcome, result.Cause())
+			}
+
+			result := fixture.service.Execute(t.Context(), Command{
+				SourceLeaseUUID: tc.source, TargetLeaseUUID: tc.target, Tenant: testTenant,
+			})
+			assert.Equal(t, tc.outcome, result.Outcome)
+			assert.Equal(t, 1, fixture.backend.callCount())
+			assert.ElementsMatch(t, []string{testSource, testTarget}, fixture.runtime.PendingLeaseUUIDs(),
+				"a failed second claim releases only the claim acquired for this request")
+			releaseOnce.Do(func() { close(release) })
+			assert.Equal(t, OutcomeAccepted, (<-firstResult).Outcome)
+		})
+	}
+}
+
+func TestServiceUnresolvedTargetAttemptReturnsTargetBusy(t *testing.T) {
+	fixture := newFixture(t, true)
+	fixture.backend.err = context.DeadlineExceeded
+	first := fixture.service.Execute(t.Context(), validCommand())
+	require.Equal(t, OutcomeInternalFailure, first.Outcome)
+	pending := fixture.store.Lookup(testTarget)
+	require.Equal(t, placement.StateAttempting, pending.State())
+	require.False(t, fixture.runtime.Contains(testTarget), "the durable attempt must fence after the live operation exits")
+
+	fixture.backend.err = nil
+	second := fixture.service.Execute(t.Context(), validCommand())
+	assert.Equal(t, OutcomeTargetBusy, second.Outcome)
+	assert.ErrorIs(t, second.Cause(), placement.ErrRestoreTargetUnavailable)
+	assert.Equal(t, pending, fixture.store.Lookup(testTarget), "retry must preserve the exact unresolved attempt")
+	assert.Equal(t, 1, fixture.backend.callCount(), "retry must not issue another restore")
+	requireLeaseClaimsReleased(t, fixture.runtime, testSource, testTarget)
 }
 
 func TestServiceClaimsAndProjectionFenceSynchronousRestore(t *testing.T) {
@@ -995,7 +1076,7 @@ func TestServiceTargetPlacementAdmissionFailsBeforeDispatch(t *testing.T) {
 
 	result := fixture.service.Execute(t.Context(), validCommand())
 
-	assert.Equal(t, OutcomeAlreadyInProgress, result.Outcome)
+	assert.Equal(t, OutcomeTargetBusy, result.Outcome)
 	assert.ErrorIs(t, result.Cause(), placement.ErrRestoreTargetUnavailable)
 	assert.Zero(t, fixture.backend.callCount())
 	assert.Equal(t, before, fixture.store.Lookup(testTarget))
@@ -1122,6 +1203,8 @@ func TestServiceSynchronousSettlementModes(t *testing.T) {
 		{name: "legacy already-provisioned sentinel is ambiguous", err: backend.ErrAlreadyProvisioned, outcome: OutcomeInternalFailure, wantState: placement.StateAttempting, wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting}},
 		{name: "legacy backend-refused sentinel is ambiguous", err: backend.ErrRestoreRefused, outcome: OutcomeInternalFailure, wantState: placement.StateAttempting, wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting}},
 		{name: "definitive refusal", status: http.StatusBadRequest, body: `{"error":"invalid request"}`, outcome: OutcomeInvalidRequest, wantState: placement.StateAbsent, wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting, backend.ProvisionStatusFailed}},
+		{name: "generic backend conflict cannot identify source or target", status: http.StatusConflict, body: `{"error":"retained source status is restoring"}`, outcome: OutcomeBackendInvalidState, wantState: placement.StateAbsent, wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting, backend.ProvisionStatusFailed}},
+		{name: "coded already provisioned remains ambiguous", status: http.StatusConflict, body: `{"error":"already provisioned","code":"already_provisioned"}`, outcome: OutcomeInternalFailure, wantState: placement.StateAttempting, wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting}},
 		{name: "coded capacity refusal", status: http.StatusServiceUnavailable, body: `{"error":"full","code":"insufficient_resources"}`, outcome: OutcomeInsufficientResources, wantState: placement.StateAbsent, wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting, backend.ProvisionStatusFailed}, verdict: metrics.CapacityVerdictCodedRefusal},
 		{name: "ambiguous capacity response", err: backend.ErrInsufficientResources, outcome: OutcomeInsufficientResources, wantState: placement.StateAttempting, wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting}, verdict: metrics.CapacityVerdictAmbiguous},
 		{name: "legacy validation sentinel", err: errors.Join(backend.ErrValidation, context.DeadlineExceeded), outcome: OutcomeInternalFailure, wantState: placement.StateAttempting, wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting}},

@@ -30,7 +30,8 @@ const (
 	OutcomeTargetNotPending
 	OutcomeSourceNotFound
 	OutcomeSourceUnavailable
-	OutcomeAlreadyInProgress
+	OutcomeSourceBusy
+	OutcomeTargetBusy
 	OutcomeServiceUnavailable
 	OutcomeNotRetained
 	OutcomeBackendInvalidState
@@ -149,8 +150,10 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 		result.Outcome = OutcomeSourceNotFound
 	case placement.RestoreApplicationSourceUnavailable:
 		result.Outcome = OutcomeSourceUnavailable
-	case placement.RestoreApplicationAlreadyInProgress:
-		result.Outcome = OutcomeAlreadyInProgress
+	case placement.RestoreApplicationSourceBusy:
+		result.Outcome = OutcomeSourceBusy
+	case placement.RestoreApplicationTargetBusy:
+		result.Outcome = OutcomeTargetBusy
 	case placement.RestoreApplicationNotRetained:
 		result.Outcome = OutcomeNotRetained
 	case placement.RestoreApplicationBackendRejected:

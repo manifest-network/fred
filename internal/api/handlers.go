@@ -555,8 +555,9 @@ type PortMapping struct {
 
 // ErrorResponse represents an error response.
 type ErrorResponse struct {
-	Error string `json:"error"`
-	Code  int    `json:"code"`
+	Error  string `json:"error"`
+	Code   int    `json:"code"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // CallbackResponse represents the response for backend callbacks.
@@ -1074,7 +1075,7 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 	// state is rejected before the body is considered. The service repeats this
 	// invariant so non-HTTP callers cannot bypass it.
 	if auth.Lease.State != billingtypes.LEASE_STATE_PENDING {
-		writeError(w, "lease is not pending; only a fresh lease can be restored into", http.StatusConflict)
+		writeRestoreConflict(w, "lease is not pending; only a fresh lease can be restored into", "target_not_pending")
 		return
 	}
 
@@ -1123,13 +1124,15 @@ func (h *Handlers) writeRestoreResult(
 		// actor and event stream use the internal Restarting state.
 		writeJSON(w, map[string]string{"status": "provisioning"}, http.StatusAccepted)
 	case restoreapp.OutcomeTargetNotPending:
-		writeError(w, "lease is not pending; only a fresh lease can be restored into", http.StatusConflict)
+		writeRestoreConflict(w, "lease is not pending; only a fresh lease can be restored into", "target_not_pending")
 	case restoreapp.OutcomeSourceNotFound, restoreapp.OutcomeNotRetained:
 		writeError(w, "no retained data found for that lease", http.StatusNotFound)
 	case restoreapp.OutcomeSourceUnavailable:
 		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
-	case restoreapp.OutcomeAlreadyInProgress:
-		writeError(w, "lease is already being provisioned or restored", http.StatusConflict)
+	case restoreapp.OutcomeSourceBusy:
+		writeRestoreConflict(w, "lease is already being provisioned or restored", "source_busy")
+	case restoreapp.OutcomeTargetBusy:
+		writeRestoreConflict(w, "lease is already being provisioned or restored", "target_busy")
 	case restoreapp.OutcomeServiceUnavailable:
 		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
 	case restoreapp.OutcomeBackendInvalidState:
@@ -1157,6 +1160,14 @@ func (h *Handlers) writeRestoreResult(
 			"outcome", result.Outcome, "lease_uuid", leaseUUID, "from_lease", sourceLeaseUUID)
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 	}
+}
+
+// writeRestoreConflict adds a cause authored by the exact restore admission
+// branch while preserving the public error envelope's numeric HTTP status code.
+func writeRestoreConflict(w http.ResponseWriter, message, reason string) {
+	writeJSON(w, ErrorResponse{
+		Error: message, Code: http.StatusConflict, Reason: reason,
+	}, http.StatusConflict)
 }
 
 // UpdateLease handles POST /v1/leases/{lease_uuid}/update

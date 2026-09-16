@@ -441,6 +441,7 @@ func TestStore_BeginRestoreExclusivelyClaimsSourceConcurrently(t *testing.T) {
 			continue
 		}
 		require.ErrorIs(t, result.err, ErrRestoreSourceClaimed)
+		assert.Equal(t, RestoreApplicationSourceBusy, restoreAdmissionApplicationFailure(result.err).Disposition())
 		assert.False(t, result.claim.Valid())
 	}
 	require.True(t, winner.Valid())
@@ -652,7 +653,8 @@ func TestStore_BeginRestoreRefusesLeaseAlreadyClaimedAsAnotherSource(t *testing.
 	second, err := beginTestRestore(
 		t, s, s.CurrentAdmissionBaseline(), "source-b", "source-a", secondID,
 	)
-	require.ErrorIs(t, err, ErrRestoreSourceClaimed)
+	require.ErrorIs(t, err, ErrRestoreTargetClaimed)
+	assert.Equal(t, RestoreApplicationTargetBusy, restoreAdmissionApplicationFailure(err).Disposition())
 	assert.False(t, second.Valid())
 	assert.Equal(t, StateConfirmed, s.Lookup("source-a").State())
 	assert.Len(t, s.restoreClaims, 1)
