@@ -1294,8 +1294,7 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, info)
 	assert.Equal(t, backend.ProvisionStatusRetained, info.Status, "auto-closed + retained lease must report retained via GetProvision")
-	assert.False(t, info.RetainedUntil.IsZero(), "retained provision must carry a RetainedUntil deadline")
-	assert.Equal(t, rec0.CreatedAt.Add(env.backend.cfg.RetentionMaxAge), info.RetainedUntil, "RetainedUntil = CreatedAt + RetentionMaxAge")
+	assert.True(t, info.RetainedUntil.IsZero(), "disabled age-based reaping must not advertise an expiry")
 	assert.Equal(t, tenant, info.Tenant, "Tenant must be populated for the closed-lease authz fallback")
 	require.NotEmpty(t, info.Items, "retained provision must carry the restore-shape Items")
 

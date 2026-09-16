@@ -134,9 +134,10 @@ func (b *Backend) RefreshState(ctx context.Context) error {
 //
 // When the lease is not in the in-memory map (e.g., after close/expire), the
 // retention store is consulted BEFORE the diagnostics fallback so a
-// soft-deleted lease surfaces as Status=retained (with RetainedUntil + Items
-// for the restore shape) for the offline tenant to self-serve within the grace
-// window — and never regresses to a stale Status=failed diagnostics entry.
+// soft-deleted lease surfaces as Status=retained with Items for the restore
+// shape and RetainedUntil when age-based reaping is enabled, so an offline tenant
+// can self-serve while data remains retained. It never regresses to a stale
+// Status=failed diagnostics entry.
 // Falls back to the diagnostics store otherwise. Returns ErrNotProvisioned only
 // if all sources miss.
 func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.ProvisionInfo, error) {
@@ -169,17 +170,20 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 			return nil, fmt.Errorf("retention lookup for %s: %w", leaseUUID, retErr)
 		}
 		if rec != nil && (rec.Status == shared.RetentionStatusActive || rec.Status == shared.RetentionStatusRestoring) {
-			return &backend.ProvisionInfo{
-				LeaseUUID:     rec.OriginalLeaseUUID,
-				ProviderUUID:  rec.ProviderUUID,
-				Status:        backend.ProvisionStatusRetained,
-				CreatedAt:     rec.CreatedAt,
-				RetainedUntil: rec.CreatedAt.Add(b.cfg.RetentionMaxAge),
-				Items:         append([]backend.LeaseItem(nil), rec.Items...),
-				Tenant:        rec.Tenant,
-				Partition:     rec.Partition,
-				BackendName:   b.cfg.Name,
-			}, nil
+			retained := &backend.ProvisionInfo{
+				LeaseUUID:    rec.OriginalLeaseUUID,
+				ProviderUUID: rec.ProviderUUID,
+				Status:       backend.ProvisionStatusRetained,
+				CreatedAt:    rec.CreatedAt,
+				Items:        append([]backend.LeaseItem(nil), rec.Items...),
+				Tenant:       rec.Tenant,
+				Partition:    rec.Partition,
+				BackendName:  b.cfg.Name,
+			}
+			if b.cfg.RetentionMaxAge > 0 {
+				retained.RetainedUntil = rec.CreatedAt.Add(b.cfg.RetentionMaxAge)
+			}
+			return retained, nil
 		}
 	}
 

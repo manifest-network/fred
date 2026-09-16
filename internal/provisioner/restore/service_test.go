@@ -704,8 +704,20 @@ func TestServiceAuthorizesSourceBeforeTakingLeaseClaims(t *testing.T) {
 		{name: "source belongs to another provider", prepare: func(f *fixture) {
 			f.targets.leases[testSource].ProviderUuid = "provider-2"
 		}, outcome: OutcomeSourceNotFound},
-		{name: "source is not positively closed", prepare: func(f *fixture) {
+		{name: "source is active", prepare: func(f *fixture) {
 			f.targets.leases[testSource].State = billingtypes.LEASE_STATE_ACTIVE
+		}, outcome: OutcomeNotRetained},
+		{name: "source is pending", prepare: func(f *fixture) {
+			f.targets.leases[testSource].State = billingtypes.LEASE_STATE_PENDING
+		}, outcome: OutcomeNotRetained},
+		{name: "source is rejected", prepare: func(f *fixture) {
+			f.targets.leases[testSource].State = billingtypes.LEASE_STATE_REJECTED
+		}, outcome: OutcomeNotRetained},
+		{name: "source state is unspecified", prepare: func(f *fixture) {
+			f.targets.leases[testSource].State = billingtypes.LEASE_STATE_UNSPECIFIED
+		}, outcome: OutcomeNotRetained},
+		{name: "source state is unknown", prepare: func(f *fixture) {
+			f.targets.leases[testSource].State = billingtypes.LeaseState(99)
 		}, outcome: OutcomeNotRetained},
 	}
 	for _, test := range tests {
@@ -723,6 +735,67 @@ func TestServiceAuthorizesSourceBeforeTakingLeaseClaims(t *testing.T) {
 
 			assert.Equal(t, test.outcome, result.Outcome)
 			assert.Zero(t, fixture.backend.callCount())
+			assert.Equal(t, placement.StateAbsent, fixture.store.Lookup(testTarget).State())
+			assert.False(t, fixture.runtime.Contains(testTarget))
+			requireLeaseClaimsReleased(t, fixture.runtime, testSource, testTarget)
+		})
+	}
+}
+
+func TestServiceExpiredSourcePreservesRestoreAdmission(t *testing.T) {
+	tests := []struct {
+		name       string
+		prepare    func(*testing.T, *fixture)
+		outcome    Outcome
+		dispatched bool
+	}{
+		{name: "retained source", outcome: OutcomeAccepted, dispatched: true},
+		{name: "source belongs to another tenant", prepare: func(_ *testing.T, f *fixture) {
+			f.targets.leases[testSource].Tenant = "tenant-2"
+		}, outcome: OutcomeSourceNotFound},
+		{name: "source belongs to another provider", prepare: func(_ *testing.T, f *fixture) {
+			f.targets.leases[testSource].ProviderUuid = "provider-2"
+		}, outcome: OutcomeSourceNotFound},
+		{name: "target is active", prepare: func(_ *testing.T, f *fixture) {
+			f.targets.leases[testTarget].State = billingtypes.LEASE_STATE_ACTIVE
+		}, outcome: OutcomeTargetNotPending},
+		{name: "target is expired", prepare: func(_ *testing.T, f *fixture) {
+			f.targets.leases[testTarget].State = billingtypes.LEASE_STATE_EXPIRED
+		}, outcome: OutcomeTargetNotPending},
+		{name: "backend has no retained data", prepare: func(t *testing.T, f *fixture) {
+			f.useCausalRestoreResponse(t, http.StatusUnprocessableEntity, `{"error":"not retained"}`)
+		}, outcome: OutcomeNotRetained, dispatched: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newFixture(t, true)
+			fixture.targets.leases[testSource].State = billingtypes.LEASE_STATE_EXPIRED
+			if test.prepare != nil {
+				test.prepare(t, fixture)
+			}
+
+			result := fixture.service.Execute(t.Context(), validCommand())
+
+			require.Equal(t, test.outcome, result.Outcome)
+			assert.Equal(t, testBackend, fixture.store.Lookup(testSource).Backend)
+			assert.Equal(t, test.dispatched, len(fixture.events.snapshot()) > 0,
+				"only authorized sources and pending targets may reach the backend")
+			if test.outcome == OutcomeAccepted {
+				assert.Equal(t, 1, fixture.backend.callCount())
+				request := fixture.backend.lastRequest()
+				assert.Equal(t, testSource, request.FromLeaseUUID)
+				assert.Equal(t, testTarget, request.LeaseUUID)
+				assert.Equal(t, testTenant, request.Tenant)
+				assert.Equal(t, testProvider, request.ProviderUUID)
+				assert.Equal(t, placement.StateConfirmed, fixture.store.Lookup(testTarget).State())
+				assert.True(t, fixture.runtime.Contains(testTarget))
+				requireLeaseClaimsReleased(t, fixture.runtime, testSource)
+				return
+			}
+			if test.outcome == OutcomeNotRetained {
+				assert.ErrorIs(t, result.Cause(), backend.ErrNotRetained,
+					"chain expiry cannot substitute for the backend's retention decision")
+			}
 			assert.Equal(t, placement.StateAbsent, fixture.store.Lookup(testTarget).State())
 			assert.False(t, fixture.runtime.Contains(testTarget))
 			requireLeaseClaimsReleased(t, fixture.runtime, testSource, testTarget)

@@ -241,10 +241,13 @@ back.
 After a wall-clock rollback, an admission timestamp may appear to be in the
 future. Provision, restore, and maintenance recovery then retain one monotonic
 `provision_timeout` window per exact attempt for the life of the backend process;
-periodic sweeps do not renew it. Restarting can conservatively grant another
-bounded window while the timestamp remains in the future, so repeated restarts
-can delay recovery. Expiry still requires the normal cleanup and settlement
-evidence before durable fences or reservations are released.
+periodic sweeps do not renew it. A process restart can conservatively grant
+another bounded window while the timestamp remains in the future, so repeated
+process restarts can delay recovery. Expiry still requires the normal cleanup
+and settlement evidence before durable fences or reservations are released.
+The first observation of a future admission logs a warning with the lease UUID,
+attempt fingerprint, `admitted_at`, and `deadline`; repeated sweeps reuse the
+window without repeating the warning.
 
 `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}`
 counts expired provision/restore classifications and may increase again on

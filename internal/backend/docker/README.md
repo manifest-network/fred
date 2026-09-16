@@ -1079,6 +1079,17 @@ while the persisted admission timestamp remains in the future; timeout alone
 does not establish physical cleanup or settlement authority.
 There is no second `container_start_timeout` recovery algorithm.
 
+Maintenance also preserves `startup_verify_duration` for containers without an
+active healthcheck. A missing or future creation timestamp starts one monotonic
+verification window for that exact attempt and container; ordinary young
+containers spend only their remaining startup interval. Recovery defers expected
+age or healthcheck waits per lease while continuing startup and sibling work.
+After a cold start, pending maintenance remains `restarting` or `updating`
+and retains its complete durable resource reservation until it settles.
+An uncommitted target still obeys its `provision_timeout` recovery horizon;
+expiry enters exact cleanup rather than renewing a readiness wait. A committed
+Release is never rolled back merely because readiness remains uncertain.
+
 A terminal sibling or exhausted horizon enters exact failed-operation cleanup.
 An inspection error, pre-effect cancellation, or ordinary removal failure
 preserves the intent, reservation, and substrate for retry. An interrupted

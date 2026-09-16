@@ -281,8 +281,9 @@ type Backend struct {
 	recoveryCoordinator *shared.RecoveryCoordinator
 	// Visibility windows retain their monotonic bound across recovery sweeps
 	// and physical absence checks for the exact durable attempt.
-	operationRecoveryDeadlines   recoveryDeadlines[operationIntentKey]
-	maintenanceRecoveryDeadlines recoveryDeadlines[maintenanceIntentKey]
+	operationRecoveryDeadlines    recoveryDeadlines[operationIntentKey]
+	maintenanceRecoveryDeadlines  recoveryDeadlines[maintenanceIntentKey]
+	maintenanceReadinessDeadlines recoveryDeadlines[maintenanceReadinessKey]
 	// releaseCapacityPlanner is explicitly wired to releaseStore in production.
 	// Tests may provide the narrower capability to pin definitive refusal before
 	// any Docker/volume mutation without changing the production 32 MiB contract.

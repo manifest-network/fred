@@ -370,8 +370,9 @@ const (
 // is insufficient: O1 settling while O2 is admitted for the same lease is a
 // generation change and must invalidate every product derived from O1.
 type recoveryIntentGeneration struct {
-	class recoveryIntentClass
-	id    string
+	class           recoveryIntentClass
+	id              string
+	maintenanceKind shared.MaintenanceIntentKind
 }
 
 func changedRecoveryIntentGenerations(
@@ -465,8 +466,9 @@ func (b *Backend) listRecoveryPendingIntents(
 		}
 		pending[claim.LeaseUUID()] = struct{}{}
 		generations[claim.LeaseUUID()] = recoveryIntentGeneration{
-			class: recoveryMaintenanceIntent,
-			id:    claim.MaintenanceID().String(),
+			class:           recoveryMaintenanceIntent,
+			id:              claim.MaintenanceID().String(),
+			maintenanceKind: claim.Kind(),
 		}
 	}
 	return pending, operations, generations, nil
@@ -1647,6 +1649,29 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		delete(firstExitedByLease, leaseUUID)
 		b.logger.Debug("provision changed while recovery collected inventory; preserving its live generation",
 			"lease_uuid", leaseUUID, "reason", reason)
+	}
+	// A cold-start maintenance projection has no live actor-owned state to
+	// preserve. Its exact pending journal, rather than running containers or a
+	// temporarily absent source cohort, owns the transition until recovery proves
+	// the outcome. Keep the durable resource reservation reconstructed above while
+	// withholding both Ready and ordinary runtime-failure observations.
+	for leaseUUID, generation := range intentGenerations {
+		if generation.class != recoveryMaintenanceIntent || b.provisions[leaseUUID] != nil {
+			continue
+		}
+		recovered := building[leaseUUID]
+		if recovered == nil {
+			continue
+		}
+		recovered.Status = backend.ProvisionStatusRestarting
+		if generation.maintenanceKind == shared.MaintenanceIntentUpdate {
+			recovered.Status = backend.ProvisionStatusUpdating
+		}
+		recovered.LastError = ""
+		recovered.Reason = ""
+		recovered.Message = ""
+		delete(cohortIssues, leaseUUID)
+		delete(firstExitedByLease, leaseUUID)
 	}
 
 	const incompleteCohortMessage = leasesm.ErrMsgCohortDiverged

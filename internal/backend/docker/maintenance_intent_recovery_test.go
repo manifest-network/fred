@@ -101,7 +101,7 @@ func newMaintenanceRecoveryHarnessWithPriorLifecycleCallback(
 	t *testing.T,
 ) *maintenanceRecoveryHarness {
 	return newMaintenanceRecoveryHarnessForAuthorityAtCallbackOptions(
-		t, shared.MaintenanceIntentRestart, false, "", true,
+		t, shared.MaintenanceIntentRestart, false, "", true, nil,
 	)
 }
 
@@ -144,7 +144,7 @@ func newMaintenanceRecoveryHarnessForAuthorityAtCallback(
 	targetCallbackURL string,
 ) *maintenanceRecoveryHarness {
 	return newMaintenanceRecoveryHarnessForAuthorityAtCallbackOptions(
-		t, kind, legacy, targetCallbackURL, false,
+		t, kind, legacy, targetCallbackURL, false, nil,
 	)
 }
 
@@ -154,6 +154,7 @@ func newMaintenanceRecoveryHarnessForAuthorityAtCallbackOptions(
 	legacy bool,
 	targetCallbackURL string,
 	queuePriorLifecycle bool,
+	stack *manifest.StackManifest,
 ) *maintenanceRecoveryHarness {
 	t.Helper()
 	dir := t.TempDir()
@@ -218,9 +219,11 @@ func newMaintenanceRecoveryHarnessForAuthorityAtCallbackOptions(
 	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
 	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "web"}}
 	profiles := testResourceProfiles(t, items)
-	stack := &manifest.StackManifest{Services: map[string]*manifest.Manifest{
-		"web": {Image: "docker.io/library/nginx:1.27"},
-	}}
+	if stack == nil {
+		stack = &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+			"web": {Image: "docker.io/library/nginx:1.27"},
+		}}
+	}
 	manifestBytes, err := json.Marshal(stack)
 	require.NoError(t, err)
 	source := shared.Release{

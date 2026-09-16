@@ -333,7 +333,7 @@ func (b *Backend) classifyMaintenancePhysical(
 	ids, services := physicalProjection(leaseContainers)
 	if allGeneration(subject.MaintenanceID()) &&
 		validateRecoveredReleaseCohort(&target, leaseContainers) == nil {
-		readiness, readyErr := b.classifyRecoveredMaintenanceReadiness(ctx, target, leaseContainers)
+		readiness, readyErr := b.classifyRecoveredMaintenanceReadiness(ctx, subject.Intent(), target, leaseContainers)
 		if readyErr != nil {
 			return shared.MaintenancePhysicalEvidence{}, readyErr
 		}
@@ -346,7 +346,7 @@ func (b *Backend) classifyMaintenancePhysical(
 	}
 	if allGeneration(source.MaintenanceID) &&
 		validateRecoveredReleaseCohort(&source, leaseContainers) == nil {
-		readiness, readyErr := b.classifyRecoveredMaintenanceReadiness(ctx, source, leaseContainers)
+		readiness, readyErr := b.classifyRecoveredMaintenanceReadiness(ctx, subject.Intent(), source, leaseContainers)
 		if readyErr != nil {
 			return shared.MaintenancePhysicalEvidence{}, readyErr
 		}

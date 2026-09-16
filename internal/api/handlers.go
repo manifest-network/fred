@@ -351,7 +351,7 @@ func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 
 // restoreHint is the short, human-readable next-step surfaced alongside a
 // retained provision so a returning tenant knows how to recover their data.
-const restoreHint = "to restore before retained_until: create a fresh PENDING lease of matching shape (the items above), then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID"
+const restoreHint = "to restore while data remains retained (before retained_until, when present): create a fresh PENDING lease of matching shape (the items above), then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID"
 
 // findProvisionAcrossBackends performs the bounded fan-out (ENG-329 #4): the
 // fallback used when a confirmed placement candidate did not hold the lease, or

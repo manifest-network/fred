@@ -495,7 +495,7 @@ func (b *Backend) classifyMaintenanceCompensation(ctx context.Context, subject s
 	if err := validateRecoveredReleaseCohort(&source, cohort); err != nil {
 		return shared.MaintenancePhysicalEvidence{}, err
 	}
-	readiness, err := b.classifyRecoveredMaintenanceReadiness(ctx, source, cohort)
+	readiness, err := b.classifyRecoveredMaintenanceReadiness(ctx, subject.Intent(), source, cohort)
 	if err != nil {
 		return shared.MaintenancePhysicalEvidence{}, err
 	}

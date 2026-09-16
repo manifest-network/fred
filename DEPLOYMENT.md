@@ -70,10 +70,20 @@ image.
 | Requirement | Recommendation |
 |---|---|
 | OS | Linux. cgroup v2 strongly recommended — under cgroup v2, tmpfs memory is counted against the container's memory limit; under v1 it is not, which makes the per-container memory budget less precise |
-| Docker | Engine **28.1+ (API 1.49+)** is required for image admission to bind inspected metadata to a single immutable platform image. iptables must be enabled (the default). `--iptables=false` disables cross-tenant network isolation; the docker-backend logs a daemon-warning at startup if it detects this |
+| Docker | Engine **28.1+ (API 1.49+)** is the image-admission compatibility floor for binding inspected metadata to a single immutable platform image. Production also requires a currently security-patched Engine (see below). iptables must be enabled (the default). `--iptables=false` disables cross-tenant network isolation; the docker-backend logs a daemon-warning at startup if it detects this |
 | CPU / RAM | Sized for the SKU pool you advertise; budget 10–20% overhead for the daemon |
 | Disk | Image cache + per-tenant volumes (see [Stateful workloads](#stateful-workloads-disk_mb--0-skus)) |
 | Network | Reachable from `providerd`; outbound reachability to image registries |
+
+The Docker daemon is installed and patched independently of Fred's Go dependencies.
+Engine **29.3.1** fixes the AuthZ plugin bypass
+([GHSA-x744-4wpc-v9h2](https://github.com/moby/moby/security/advisories/GHSA-x744-4wpc-v9h2))
+and plugin privilege-validation flaw
+([GHSA-pxq6-2prw-chj9](https://github.com/moby/moby/security/advisories/GHSA-pxq6-2prw-chj9));
+continue applying subsequent security updates. As of 2026-09-16, the committed
+[manifest-deploy package policy](https://github.com/manifest-network/manifest-deploy/blob/eaedbf62d9e139e4d849043c34b4948c7c6f3d63/inventory/base/group_vars/all/main.yml#L240)
+pins Engine **29.7.2**. Verify the running daemon's version during deployment;
+Fred's dependency vulnerability scan does not check the host installation.
 
 ---
 
@@ -807,6 +817,8 @@ forward-fix; never point v0.13 at it or discard it in favor of a fresh file.
 Image admission requires Docker Engine **28.1+ (API 1.49+)**. The backend probes
 the daemon and verifies the negotiated API during construction, before storage
 initialization or recovery; an unsupported API or failed probe prevents startup.
+This compatibility probe does not enforce Engine security patch levels; follow
+the [Docker host requirements](#docker-backend-host) when updating the daemon.
 Before upgrading,
 check image labels against the reserved namespaces in the
 [manifest guide](docs/manifest-guide.md). Existing containers are not rewritten.

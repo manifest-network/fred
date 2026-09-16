@@ -661,8 +661,8 @@ func (application *MaintenanceApplication) RecoverPending(ctx context.Context) e
 					break
 				}
 				result.lastKey = maintenanceRecoveryKey(entry.claim)
-				// An API retry may have acquired the command after selection. Its
-				// dispatch remains exclusive; recovery can revisit it next pass.
+				// A live request may own the command after selection. Its dispatch
+				// remains exclusive; a later recovery batch can revisit it.
 				if !entry.held.dispatchMu.TryLock() {
 					continue
 				}

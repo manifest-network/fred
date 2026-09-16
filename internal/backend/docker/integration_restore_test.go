@@ -133,15 +133,13 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 	// ── STEP 4d: GetProvision surfaces the queryable retention status ─────
 	//
 	// ENG-329 Part A on REAL retained state: with the provision gone from the
-	// in-memory map, GetProvision must report Status=retained with a non-zero
-	// RetainedUntil (CreatedAt + RetentionMaxAge) and the restore-shape Items —
-	// the offline-tenant self-serve path.
+	// in-memory map, GetProvision must report Status=retained with the
+	// restore-shape Items and no expiry because age-based reaping is disabled.
 	info, err := b.GetProvision(ctx, origLease)
 	require.NoError(t, err)
 	require.NotNil(t, info)
 	assert.Equal(t, backend.ProvisionStatusRetained, info.Status, "GetProvision must report retained for soft-deleted state")
-	assert.False(t, info.RetainedUntil.IsZero(), "retained provision must carry a RetainedUntil deadline")
-	assert.Equal(t, rec.CreatedAt.Add(b.cfg.RetentionMaxAge), info.RetainedUntil, "RetainedUntil = CreatedAt + RetentionMaxAge")
+	assert.True(t, info.RetainedUntil.IsZero(), "disabled age-based reaping must not advertise an expiry")
 	assert.Equal(t, "test-tenant", info.Tenant, "Tenant must be populated for the closed-lease authz fallback")
 	require.NotEmpty(t, info.Items, "retained provision must carry the restore-shape Items")
 

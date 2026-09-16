@@ -757,10 +757,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Maintenance recovery measures uncertain container startup ages with a bounded
+  monotonic clock and defers expected readiness waits per lease, so clock
+  rollback does not prevent backend startup. Cold recovery reports pending
+  maintenance as restarting or updating until it settles. Physical-absence
+  deadline and future-timestamp preconditions now have direct regression
+  coverage. (ENG-978)
+- Restore accepts retained sources from either `CLOSED` or `EXPIRED` chain
+  leases while preserving ownership, pending-target, and backend retention
+  checks. Retained status omits `retained_until` when age-based expiry is
+  disabled, and its restore hint treats that deadline as optional. (ENG-978)
+- Maintenance shutdown no longer logs expected context cancellation as a failed
+  recovery pass. Docker deployment guidance distinguishes the API compatibility
+  floor from host security patch requirements; coverage is checked before the
+  bounded replay benchmark smoke step. (ENG-978)
 - Docker recovery keeps a per-attempt visibility deadline across sweeps, so a
   persisted timestamp in the future after clock rollback cannot continually
-  renew the recovery window. Restart conservatively begins another bounded
-  window; timeout alone never proves uncertain physical effects settled.
+  renew the recovery window. A process restart conservatively begins another
+  bounded window; timeout alone never proves uncertain physical effects settled.
   (ENG-969)
 - Maintenance recovery skips commands owned by a live request, allowing other
   backends to recover without waiting for that request's independent deadline.
@@ -980,8 +994,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   durably frozen) before lease-wide teardown and atomic failed-callback
   settlement; cancellation or Docker uncertainty keeps the intent and
   substrate. A persisted future admission timestamp after clock rollback is
-  independently capped to one live observation window. Timeout exhaustion is
-  observable via
+  bounded to one monotonic window per exact attempt in each backend process.
+  Timeout exhaustion is observable via
   `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}`;
   there is no separate container-start recovery timer.
   (ENG-632)

@@ -235,6 +235,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 		return err
 	}
 	checkpoint := b.maintenanceRecoveryDeadlines.checkpoint()
+	readinessCheckpoint := b.maintenanceReadinessDeadlines.checkpoint()
 	intents, err := b.maintenanceSettlement.ListMaintenanceIntents()
 	if err != nil {
 		return fmt.Errorf("list maintenance intents: %w", err)
@@ -244,6 +245,10 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 		pending[keyForMaintenanceIntent(intent)] = struct{}{}
 	}
 	b.maintenanceRecoveryDeadlines.retainPending(checkpoint, pending)
+	b.maintenanceReadinessDeadlines.retainMatching(readinessCheckpoint, func(key maintenanceReadinessKey) bool {
+		_, exists := pending[key.intent]
+		return exists
+	})
 	for _, snapshot := range intents {
 		if snapshot.Backend() != b.Name() || snapshot.BackendStorageID() != b.storageIdentity {
 			return fmt.Errorf(
@@ -300,7 +305,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 					runtimeDiverged := !cohortHealthy
 					if cohortHealthy {
 						readiness, readinessErr := b.classifyRecoveredMaintenanceReadiness(
-							ctx, targetRelease, targetContainers,
+							ctx, intent, targetRelease, targetContainers,
 						)
 						if readinessErr != nil {
 							// The Release proves substrate commit, but not current runtime
@@ -358,12 +363,14 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 					if targetRelease.Status == "deploying" &&
 						!compensationStarted && len(targetContainers) == len(leaseContainers) && cohortErr == nil {
 						readiness, readinessErr := b.classifyRecoveredMaintenanceReadiness(
-							ctx, targetRelease, targetContainers,
+							ctx, intent, targetRelease, targetContainers,
 						)
-						if readinessErr != nil {
+						switch {
+						case errors.Is(readinessErr, errMaintenanceReadinessPending):
+							cohortErr = readinessErr
+						case readinessErr != nil:
 							return fmt.Errorf("maintenance target readiness is indeterminate: %w", readinessErr)
-						}
-						if readiness != maintenanceReadinessReady {
+						case readiness != maintenanceReadinessReady:
 							cohortErr = errors.New("maintenance target is definitively unready")
 						}
 					}
@@ -376,31 +383,33 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 							return fmt.Errorf("classify recovered maintenance target: %w", physicalErr)
 						}
 						ready, ok := physical.(shared.MaintenanceExecutionSuccess)
-						if !ok {
-							if failed, failedOK := physical.(shared.MaintenanceExecutionFailure); failedOK {
-								return fmt.Errorf(
-									"recovered maintenance target is not exactly Ready (%T, source_recovered=%t)",
-									physical, failed.SourceRecovered(),
-								)
+						if ambiguous, isAmbiguous := physical.(shared.MaintenanceExecutionAmbiguous); isAmbiguous {
+							if !errors.Is(ambiguous.Cause(), errMaintenanceReadinessPending) {
+								return fmt.Errorf("maintenance target classification remains ambiguous: %w", ambiguous.Cause())
 							}
+							// A second observation can see a new container or a healthcheck
+							// that resumed starting. Spend the same bounded target window.
+						} else if !ok {
 							return fmt.Errorf("recovered maintenance target is not exactly Ready (%T)", physical)
 						}
-						active, activateErr := b.maintenanceSettlement.ActivateMaintenance(ready)
-						if activateErr != nil {
-							return fmt.Errorf("activate recovered maintenance target: %w", activateErr)
+						if ok {
+							active, activateErr := b.maintenanceSettlement.ActivateMaintenance(ready)
+							if activateErr != nil {
+								return fmt.Errorf("activate recovered maintenance target: %w", activateErr)
+							}
+							if _, convergeErr := b.convergeMaintenanceSuccess(
+								ctx, active, targetRelease, targetContainers,
+							); convergeErr != nil {
+								return convergeErr
+							}
+							resolveErr := b.tryResolveMaintenanceSuccess(ctx, active)
+							if resolveErr != nil {
+								// Activation is irrevocably committed. Preserve the intent and let
+								// the next periodic recovery retry only exact callback settlement.
+								return fmt.Errorf("maintenance active but success settlement remains pending: %w", resolveErr)
+							}
+							return nil
 						}
-						if _, convergeErr := b.convergeMaintenanceSuccess(
-							ctx, active, targetRelease, targetContainers,
-						); convergeErr != nil {
-							return convergeErr
-						}
-						resolveErr := b.tryResolveMaintenanceSuccess(ctx, active)
-						if resolveErr != nil {
-							// Activation is irrevocably committed. Preserve the intent and let
-							// the next periodic recovery retry only exact callback settlement.
-							return fmt.Errorf("maintenance active but success settlement remains pending: %w", resolveErr)
-						}
-						return nil
 					}
 					compensationPending, compensationErr := b.maintenanceSettlement.CompensationPending(intent)
 					if compensationErr != nil {
@@ -506,6 +515,11 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 				}
 			},
 		)
+		if errors.Is(recoveryErr, errMaintenanceReadinessPending) {
+			// An expected startup wait grants no settlement or cleanup authority.
+			// Preserve this exact intent, but let startup and sibling leases proceed.
+			continue
+		}
 		if recoveryErr != nil {
 			return fmt.Errorf("recover maintenance for lease %q: %w", snapshot.LeaseUUID(), recoveryErr)
 		}
@@ -737,13 +751,13 @@ func (b *Backend) maintenanceSourceState(
 		}
 	}
 	// A cohort mismatch is terminal substrate evidence, not an indeterminate
-	// inspection. Project the source as failed; only bounded read errors preserve
-	// the intent for a later recovery sweep.
+	// inspection. Project the source as failed; an indeterminate inspection or
+	// pending startup verification preserves the intent for a later sweep.
 	cohortValid := validateRecoveredReleaseCohort(&source, leaseContainers) == nil
 	if !cohortValid {
 		return source, leaseContainers, false, nil
 	}
-	readiness, err := b.classifyRecoveredMaintenanceReadiness(ctx, source, leaseContainers)
+	readiness, err := b.classifyRecoveredMaintenanceReadiness(ctx, intent, source, leaseContainers)
 	if err != nil {
 		return shared.Release{}, nil, false, fmt.Errorf("maintenance source readiness is indeterminate: %w", err)
 	}
@@ -751,6 +765,8 @@ func (b *Backend) maintenanceSourceState(
 }
 
 type maintenanceReadiness uint8
+
+var errMaintenanceReadinessPending = errors.New("maintenance startup verification is pending")
 
 const (
 	maintenanceReadinessReady maintenanceReadiness = iota + 1
@@ -764,6 +780,7 @@ const (
 // is still starting is retried on the next sweep rather than destroyed.
 func (b *Backend) classifyRecoveredMaintenanceReadiness(
 	ctx context.Context,
+	intent shared.MaintenanceIntentClaim,
 	target shared.Release,
 	containers []ContainerInfo,
 ) (maintenanceReadiness, error) {
@@ -771,6 +788,7 @@ func (b *Backend) classifyRecoveredMaintenanceReadiness(
 	if err != nil {
 		return 0, fmt.Errorf("parse recovered maintenance manifest: %w", err)
 	}
+	startupPending := false
 	for _, container := range containers {
 		if container.Status != "running" {
 			return maintenanceReadinessUnready, nil
@@ -783,12 +801,10 @@ func (b *Backend) classifyRecoveredMaintenanceReadiness(
 			return 0, fmt.Errorf("maintenance target service %q is absent from manifest", container.ServiceName)
 		}
 		if !service.HasActiveHealthCheck() {
-			minimumAge := b.cfg.StartupVerifyDuration
-			if minimumAge <= 0 {
-				minimumAge = 5 * time.Second
-			}
-			if container.CreatedAt.IsZero() || time.Since(container.CreatedAt) < minimumAge {
-				return 0, fmt.Errorf("maintenance target %q has not reached its startup verification age", container.ContainerID)
+			if !b.maintenanceContainerAgeReached(intent, container) {
+				// Observe every member on this pass so startup windows run in
+				// parallel. Fresh inspection remains mandatory on later passes.
+				startupPending = true
 			}
 		}
 
@@ -808,9 +824,12 @@ func (b *Backend) classifyRecoveredMaintenanceReadiness(
 			case HealthStatusUnhealthy:
 				return maintenanceReadinessUnready, nil
 			default:
-				return 0, fmt.Errorf("maintenance target %q health check is not terminal", container.ContainerID)
+				startupPending = true
 			}
 		}
+	}
+	if startupPending {
+		return 0, errMaintenanceReadinessPending
 	}
 	return maintenanceReadinessReady, nil
 }

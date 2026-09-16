@@ -34,6 +34,10 @@ func retainedProvisionServer(t *testing.T, matchLease, tenant string, retainedUn
 // the partition flows through to the owner-only retained API responses.
 func retainedProvisionServerWithPartition(t *testing.T, matchLease, tenant, partition string, retainedUntil time.Time) *httptest.Server {
 	t.Helper()
+	createdAt := retainedUntil.Add(-90 * 24 * time.Hour)
+	if retainedUntil.IsZero() {
+		createdAt = time.Now().Add(-90 * 24 * time.Hour)
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/provisions/"+matchLease {
 			w.WriteHeader(http.StatusNotFound)
@@ -44,7 +48,7 @@ func retainedProvisionServerWithPartition(t *testing.T, matchLease, tenant, part
 			LeaseUUID:     matchLease,
 			ProviderUUID:  testutil.ValidUUID2,
 			Status:        backend.ProvisionStatusRetained,
-			CreatedAt:     retainedUntil.Add(-90 * 24 * time.Hour),
+			CreatedAt:     createdAt,
 			RetainedUntil: retainedUntil,
 			Tenant:        tenant,
 			Partition:     partition,
@@ -174,6 +178,51 @@ func TestGetLeaseProvision_Retained_WithinGraceWindow(t *testing.T) {
 	assert.Equal(t, retainedUntil.Format(time.RFC3339), resp.RetainedUntil)
 	assert.NotEmpty(t, resp.RestoreHint)
 	require.Len(t, resp.Items, 1)
+}
+
+func TestRetainedResponses_WithoutExpiry(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{Uuid: leaseUUID, Tenant: kp.Address, ProviderUuid: providerUUID, State: billingtypes.LEASE_STATE_CLOSED}, nil
+			}
+			return nil, nil
+		},
+	}
+	srv := retainedProvisionServer(t, leaseUUID, kp.Address, time.Time{})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: httpBackend(t, "b1", srv.URL), IsDefault: true}},
+	})
+	require.NoError(t, err)
+	h := &Handlers{client: chainClient, backendRouter: router, providerUUID: providerUUID, bech32Prefix: "manifest"}
+
+	for _, tc := range []struct {
+		endpoint    string
+		statusField string
+		handler     http.HandlerFunc
+	}{
+		{endpoint: "status", statusField: "provision_status", handler: h.GetLeaseStatus},
+		{endpoint: "provision", statusField: "status", handler: h.GetLeaseProvision},
+	} {
+		t.Run(tc.endpoint, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/"+tc.endpoint, nil)
+			req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+			req.SetPathValue("lease_uuid", leaseUUID)
+			rec := httptest.NewRecorder()
+			tc.handler(rec, req)
+
+			require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+			var response map[string]json.RawMessage
+			require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+			assert.NotContains(t, response, "retained_until", "no scheduled expiry must be omitted from the public response")
+			assert.JSONEq(t, `"retained"`, string(response[tc.statusField]))
+			assert.Contains(t, response, "items")
+			assert.Contains(t, response, "restore_hint")
+		})
+	}
 }
 
 // TestRetainedResponses_Partition proves the retention partition flows to the

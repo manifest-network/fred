@@ -163,7 +163,7 @@ func (service *Service) Start(ctx context.Context, interval time.Duration) error
 	if interval <= 0 {
 		return errors.New("maintenance recovery interval must be positive")
 	}
-	if err := service.RecoverPending(ctx); err != nil {
+	if err := service.RecoverPending(ctx); err != nil && ctx.Err() == nil {
 		slog.Warn("pending maintenance recovery pass incomplete", "error", err)
 	}
 	ticker := time.NewTicker(interval)
@@ -173,7 +173,7 @@ func (service *Service) Start(ctx context.Context, interval time.Duration) error
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := service.RecoverPending(ctx); err != nil {
+			if err := service.RecoverPending(ctx); err != nil && ctx.Err() == nil {
 				slog.Warn("pending maintenance recovery pass incomplete", "error", err)
 			}
 		}

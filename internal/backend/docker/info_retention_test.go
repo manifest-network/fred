@@ -88,6 +88,37 @@ func TestGetProvision_Retained_Active(t *testing.T) {
 	assert.Equal(t, 2, info.Items[0].Quantity)
 }
 
+func TestGetProvision_RetainedExpiry(t *testing.T) {
+	for _, status := range []string{shared.RetentionStatusActive, shared.RetentionStatusRestoring} {
+		for _, maxAge := range []time.Duration{0, 90 * 24 * time.Hour} {
+			t.Run(status+"/"+maxAge.String(), func(t *testing.T) {
+				b, rs := newBackendWithRetention(t)
+				b.cfg.RetentionMaxAge = maxAge
+				entry := retentionEntryFixture(infoRetentionLeaseUUID, "tenant-a", time.Now().Add(-24*time.Hour))
+				entry.Status = status
+				if status == shared.RetentionStatusRestoring {
+					putRestoringRetention(t, rs, entry)
+				} else {
+					require.NoError(t, putRetentionForTest(t, rs, entry))
+				}
+				persisted, err := rs.Get(infoRetentionLeaseUUID)
+				require.NoError(t, err)
+				require.NotNil(t, persisted)
+
+				info, err := b.GetProvision(context.Background(), infoRetentionLeaseUUID)
+				require.NoError(t, err)
+				assert.Equal(t, backend.ProvisionStatusRetained, info.Status)
+				assert.Equal(t, persisted.Items, info.Items)
+				if maxAge == 0 {
+					assert.True(t, info.RetainedUntil.IsZero(), "disabled age-based reaping must not advertise an expiry")
+				} else {
+					assert.Equal(t, persisted.CreatedAt.Add(maxAge), info.RetainedUntil)
+				}
+			})
+		}
+	}
+}
+
 // TestGetProvision_Retained_Restoring asserts that a record in the restoring
 // state (a tenant polling during their own restore) still resolves to retained,
 // not a 404.
