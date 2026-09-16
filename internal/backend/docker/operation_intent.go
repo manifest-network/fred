@@ -480,7 +480,7 @@ func (b *Backend) recoverOperationIntents(ctx context.Context) error {
 	if b.operationSettlement == nil || b.recoveryCoordinator == nil {
 		return nil
 	}
-	claims, err := b.operationSettlement.ListOperationIntents()
+	claims, err := b.pendingOperationIntentsForRecovery()
 	if err != nil {
 		return fmt.Errorf("list callback operation intents: %w", err)
 	}
@@ -574,7 +574,7 @@ func (b *Backend) recoverLiveOperationIntents(ctx context.Context) error {
 	if b.operationSettlement == nil || b.recoveryCoordinator == nil {
 		return nil
 	}
-	snapshot, err := b.operationSettlement.ListOperationIntents()
+	snapshot, err := b.pendingOperationIntentsForRecovery()
 	if err != nil {
 		return fmt.Errorf("list live callback operation intents: %w", err)
 	}
@@ -725,12 +725,8 @@ func (b *Backend) recoverOperationIntentClaims(
 		// identities so cleanup can preserve a predecessor and reject a
 		// contradictory generation. The bound cleanup executor performs its own
 		// exhaustive post-Down observation.
-		timeout := b.cfg.ProvisionTimeout
-		if timeout <= 0 {
-			timeout = 10 * time.Minute
-		}
 		now := time.Now()
-		deadline := provisionIntentRecoveryDeadline(claim.CreatedAt(), now, timeout)
+		deadline := b.operationRecoveryDeadline(claim, now)
 		if awaitRecovery {
 			if now.Before(deadline) {
 				entry.deferred = true

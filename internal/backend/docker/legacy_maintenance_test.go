@@ -329,7 +329,7 @@ func TestV013LegacyReleaseSubsequentMaintenanceRollbackPreservesSourceAuthority(
 		// Advance to the persisted intent's actual visibility deadline only
 		// after the worker has handed off; changing the configured duration alone
 		// does not advance virtual time.
-		deadline := b.maintenanceRecoveryDeadline(intent.CreatedAt())
+		deadline := b.maintenanceRecoveryDeadline(intent, time.Now())
 		require.True(t, time.Now().Before(deadline))
 		time.Sleep(time.Until(deadline))
 		synctest.Wait()

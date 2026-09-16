@@ -238,6 +238,14 @@ but its rollback additionally requires exact source/destination authority and
 an actor-quiescence capability; a committed destination Release cannot be rolled
 back.
 
+After a wall-clock rollback, an admission timestamp may appear to be in the
+future. Provision, restore, and maintenance recovery then retain one monotonic
+`provision_timeout` window per exact attempt for the life of the backend process;
+periodic sweeps do not renew it. Restarting can conservatively grant another
+bounded window while the timestamp remains in the future, so repeated restarts
+can delay recovery. Expiry still requires the normal cleanup and settlement
+evidence before durable fences or reservations are released.
+
 `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}`
 counts expired provision/restore classifications and may increase again on
 later sweeps while cleanup remains pending.

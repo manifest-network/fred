@@ -537,7 +537,11 @@ func (application *MaintenanceApplication) releaseSettled() error {
 	application.heldMu.Unlock()
 	var errs []error
 	for leaseUUID, held := range entries {
-		held.dispatchMu.Lock()
+		// A live request owns its own settlement and release. Waiting here would
+		// hold every backend's recovery behind that request's independent context.
+		if !held.dispatchMu.TryLock() {
+			continue
+		}
 		command := held.journalClaim.Command()
 		id := held.id
 		if command.Valid() {
@@ -608,6 +612,9 @@ func (application *MaintenanceApplication) RecoverPending(ctx context.Context) e
 	if !application.Valid() {
 		return ErrInvalidMaintenanceCoordinator
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !application.recoveryMu.TryLock() {
 		return nil
 	}
@@ -654,7 +661,11 @@ func (application *MaintenanceApplication) RecoverPending(ctx context.Context) e
 					break
 				}
 				result.lastKey = maintenanceRecoveryKey(entry.claim)
-				entry.held.dispatchMu.Lock()
+				// An API retry may have acquired the command after selection. Its
+				// dispatch remains exclusive; recovery can revisit it next pass.
+				if !entry.held.dispatchMu.TryLock() {
+					continue
+				}
 				command := entry.claim.Command()
 				record, found, recoverErr := application.coordinator.lookupMaintenanceCommand(command.LeaseUUID(), command.ID())
 				switch {

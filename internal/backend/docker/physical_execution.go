@@ -187,12 +187,8 @@ func (b *Backend) operationAbsenceObservationIsTerminal(
 	if !claim.Valid() {
 		return false
 	}
-	timeout := b.cfg.ProvisionTimeout
-	if timeout <= 0 {
-		timeout = 10 * time.Minute
-	}
 	now := time.Now()
-	return !now.Before(provisionIntentRecoveryDeadline(claim.CreatedAt(), now, timeout))
+	return !now.Before(b.operationRecoveryDeadline(claim, now))
 }
 
 // operationStorageExactlyAbsent extends container absence to the managed

@@ -757,6 +757,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Docker recovery keeps a per-attempt visibility deadline across sweeps, so a
+  persisted timestamp in the future after clock rollback cannot continually
+  renew the recovery window. Restart conservatively begins another bounded
+  window; timeout alone never proves uncertain physical effects settled.
+  (ENG-969)
+- Maintenance recovery skips commands owned by a live request, allowing other
+  backends to recover without waiting for that request's independent deadline.
+  (ENG-969)
+- Callback replay benchmarks supply the required live storage attestor at
+  construction and run once in CI to catch fixture regressions. The tenant
+  quickstart now describes secp256k1/ADR-036 signing and optional, policy-limited
+  retention instead of promising retained data or successful restore. (ENG-969)
 - Chain writers share a cancellable per-signer permit, including provider-key
   writes and single-signer fallback. Event fan-out and channel closure now share
   one lock instead of racing a shutdown counter or recovering send panics.

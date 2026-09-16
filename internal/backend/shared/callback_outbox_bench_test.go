@@ -1,7 +1,6 @@
 package shared
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -80,17 +79,17 @@ func BenchmarkCallbackOutboxReplayBacklog(b *testing.B) {
 				b.Fatal(err)
 			}
 			sender, err := newCallbackSender(CallbackSenderConfig{
-				Store:      store,
-				HTTPClient: client,
-				Secret:     "callback-benchmark-secret-value!",
-				Logger:     slog.New(slog.DiscardHandler),
+				Store:           store,
+				HTTPClient:      client,
+				Secret:          "callback-benchmark-secret-value!",
+				Logger:          slog.New(slog.DiscardHandler),
+				StorageAttestor: newSyntheticCallbackStorageAttestorForTest(b, b.Context(), storageID),
 
 				Backoff: &noBackoff,
 			}, storageID)
 			if err != nil {
 				b.Fatal(err)
 			}
-			sender.attestor = newSyntheticCallbackStorageAttestorForTest(b, context.Background())
 
 			iterations := int64(0)
 			b.ReportAllocs()

@@ -1071,7 +1071,12 @@ cleanup. Provision and restore intents share one absolute recovery horizon deriv
 from durable admission time and the configured `provision_timeout`. Exact-empty
 or transitional cohorts before that deadline remain Pending and are observed
 again by the periodic sweep; they do not block startup. A future admission
-timestamp after clock rollback is capped to one fresh observation window.
+timestamp after clock rollback gets at most one full `provision_timeout` window
+per exact attempt in a backend process. Later sweeps and physical-absence checks
+share its monotonic deadline and cannot renew it. Maintenance recovery uses the
+same bound. A process restart may conservatively grant another bounded window
+while the persisted admission timestamp remains in the future; timeout alone
+does not establish physical cleanup or settlement authority.
 There is no second `container_start_timeout` recovery algorithm.
 
 A terminal sibling or exhausted horizon enters exact failed-operation cleanup.

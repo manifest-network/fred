@@ -4,7 +4,7 @@ This guide walks through the tenant-side flow against a Fred provider: creating 
 
 For the canonical API reference, see [README.md](../README.md#api-endpoints). For manifest format details, see [manifest-guide.md](manifest-guide.md). For the security model, see [SECURITY.md](../SECURITY.md).
 
-> **Note**: This document describes the protocol. Fred does not ship a full tenant-side SDK, but it does ship `cmd/lease-token`, a dedicated CLI that mints the ADR-036 bearer token this guide uses (see [Step 1](#step-1-build-a-bearer-token)). For the signing internals, the reference implementations live at `internal/testutil/fixtures.go` (concise token-creation helpers) and `cmd/loadtest/main.go` (load tester). When integrating in a non-Go stack, port these patterns to your wallet's signing primitives.
+> **Note**: This document describes the protocol. Fred does not ship a full tenant-side SDK, but it does ship `cmd/lease-token`, a dedicated CLI that mints the ADR-036 bearer token this guide uses (see [Step 1](#step-1-build-a-bearer-token)). For the signing internals, the reference implementations live at `internal/testutil/fixtures.go` (concise token-creation helpers) and `cmd/loadtest/workload.go` (load tester). When integrating in a non-Go stack, port these patterns to your wallet's signing primitives.
 
 ---
 
@@ -80,7 +80,7 @@ Flags: `-tenant` (your bech32 `manifest1...` address), `-lease-uuid` (the lease 
 
 ### Reference implementation
 
-To port the signing into a non-Go stack, `internal/testutil/fixtures.go::CreateTestToken` is the most concise reference (~25 lines). The signing uses `internal/auth.FormatSignData` for the message and `internal/adr036.CreateSignBytes` for the ADR-036 wrapper. `cmd/loadtest/main.go` uses ed25519 for its internal mock; **do not use that as a signing reference** for real ADR-036 tokens.
+To port the signing into a non-Go stack, `internal/testutil/fixtures.go::CreateTestToken` is a concise reference. The signing uses `internal/auth.FormatSignData` for the message and `internal/adr036.CreateSignBytes` for the ADR-036 wrapper. The authenticated load tester uses the same secp256k1/ADR-036 signing in `cmd/loadtest/workload.go::tenantSigner.token`, including the separate payload-upload message format.
 
 ---
 
@@ -111,6 +111,7 @@ What to look at:
 - **`state`** — `PENDING` (waiting for provisioning), `ACTIVE` (running), `CLOSED`, `EXPIRED`.
 - **`requires_payload`** — if `true` and `payload_received` is `false`, you need to upload a manifest before provisioning can start.
 - **`provision_status`** — present once provisioning has started (`provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, `retained`).
+- **`retained_until`**, **`items`**, and **`restore_hint`** — returned for retained data; `items` describes the source lease's shape, and `retained_until`, when present, gives its scheduled expiry. Retention depends on the provider's policy and available capacity; see [Restore](#restore--recover-a-soft-deleted-leases-data).
 - **`fail_count`** + **`reason`** + **`message`** — present after failures; `reason` is a stable machine
   code (e.g. `ContainerExited`), `message` a short human summary. See [Step 6](#step-6-debug-failures)
   for the full `reason` enum and how to handle unrecognized values.
@@ -285,7 +286,7 @@ curl -H "Authorization: Bearer $(fresh_token)" \
 
 ## Step 7: Restart, update, or restore
 
-Three operations are available on a `ready` (or `failed`) lease:
+Restart and update operate on an `ACTIVE` lease whose provision is `ready` or `failed`. Restore adopts retained data from a closed or expired source into a fresh `PENDING` lease.
 
 ### Restart — same manifest, fresh containers
 
@@ -316,7 +317,11 @@ The body shape is different from `/data` — the manifest is base64-encoded insi
 
 ### Restore — recover a soft-deleted lease's data
 
-When a lease is closed, its volumes are not destroyed immediately; they are soft-deleted (retained) for a grace window so the data can be recovered. `POST /v1/leases/{lease_uuid}/restore` restores a soft-deleted (retained) lease's data into a fresh lease. Request body: `{"from_lease_uuid": "<source lease UUID>"}`. The target lease must be freshly PENDING and share the source's item shape — the same service names and quantities, though the SKU (disk tier) MAY differ; the call is authenticated with an ADR-036 bearer token and is replay-protected. Restore is pinned to the source lease's backend (node affinity).
+Retention is optional: the Docker backend's `retain_on_close` setting defaults to **false**, so closing or expiring a lease normally destroys its managed volumes. When the provider enables retention, eligible volumes may be kept for later restore, subject to its retention policy and capacity limits. Confirm that policy before closing a lease and keep an independent backup of data you need to preserve.
+
+Before creating a restore target, query [`GET /v1/leases/{uuid}/status`](#step-2-check-lease-status) for the source using a token for that source lease. Confirm `provision_status: "retained"`, read `items` for the required service names and quantities, and check `retained_until` when present. Restore before that scheduled expiry; the status response is a current observation, not a reservation or a guarantee that data will remain available until then.
+
+`POST /v1/leases/{lease_uuid}/restore` adopts the retained data into a fresh `PENDING` lease belonging to the same tenant and provider. Request body: `{"from_lease_uuid": "<source lease UUID>"}`. The target must match the source's service names and quantities, though its SKU (disk tier) may differ. The call uses a fresh ADR-036 bearer token for the target lease and is replay-protected. Restore runs on the backend that holds the source data.
 
 ```bash
 # $LEASE_UUID is the NEW, freshly PENDING lease (also the token's -lease-uuid).
@@ -327,7 +332,9 @@ curl -X POST -H "Authorization: Bearer $(fresh_token)" \
   https://fred.example-provider.com:8080/v1/leases/$LEASE_UUID/restore
 ```
 
-The new lease must be `PENDING` (a fresh lease that hasn't been provisioned) and must match the source lease's item shape — the same service names and quantities — because restore replays the manifest into it exactly like provisioning. The SKU (disk tier) MAY differ from the source's: **promoting** to a same-or-larger tier always succeeds and applies the new `disk_mb` cap, while **demoting** to a smaller tier succeeds only when the retained volume's measured data still fits the smaller tier's `disk_mb` cap. A non-PENDING target returns `409 Conflict`; if no retained data remains for `from_lease_uuid` (the grace window lapsed or the source's backend is gone) you get `404 Not Found`. A restore that **demotes** to a disk tier too small for the retained data is refused with `422 Unprocessable Entity`; the response `error` message begins `retained data exceeds the requested smaller tier` — restore into the original or a larger tier instead. Use [`GET /v1/leases/{uuid}/status`](#step-2-check-lease-status) on the source lease to confirm it is still retained and to read its restore shape before you create the target lease.
+Choosing the same or a larger disk tier satisfies the tier-size check; choosing a smaller tier requires the backend to verify that the retained data fits the new `disk_mb` cap. Neither choice guarantees admission or successful provisioning: source availability, backend capacity, concurrent work, and deployment failures still matter. A refused tier reduction returns `422 Unprocessable Entity`; use the response's bounded `error` detail to select a suitable tier.
+
+`202 Accepted` means restore has started; monitor the target's status or events until it reaches `ready` or `failed`. A non-`PENDING` or already-busy target returns `409 Conflict`. Missing retained data returns `404 Not Found`; unavailable source routing, an unavailable backend, or insufficient capacity can return `503 Service Unavailable`. A timeout or other ambiguous backend result can leave the target pending recovery, so an immediate retry may return `409`; check its status before trying again. See the [restore API reference](../README.md#restore-lease) for the full response table.
 
 All three mutations require a fresh bearer token for every HTTP attempt (hence
 `$(fresh_token)` rather than a stored `$TOKEN` variable). Restart and update

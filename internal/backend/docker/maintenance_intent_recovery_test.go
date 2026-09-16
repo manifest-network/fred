@@ -1043,7 +1043,7 @@ func testRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testin
 	require.NoError(t, err)
 	require.True(t, found)
 	require.Equal(t, shared.MaintenanceExecutionStarted, intent.ExecutionPhase())
-	deadline := h.b.maintenanceRecoveryDeadline(intent.CreatedAt())
+	deadline := h.b.maintenanceRecoveryDeadline(intent, time.Now())
 	require.True(t, time.Now().Before(deadline))
 	require.NoError(t, h.b.RefreshState(t.Context()))
 	intents, err = h.b.maintenanceSettlement.ListMaintenanceIntents()

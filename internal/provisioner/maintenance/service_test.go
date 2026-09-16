@@ -1377,6 +1377,99 @@ func TestRecoveryTimeoutBoundsContextAwareBackendAndRetainsPendingFence(t *testi
 	assertMaintenanceLaneHeld(t, runtime, testLeaseA)
 }
 
+func TestRecoverySkipsLiveDispatchAndRecoversHealthyBackend(t *testing.T) {
+	store, _ := newPlacementAuthorityForTopology(t, map[string]string{
+		testLeaseA: "backend-a", testLeaseB: "backend-b",
+	})
+	blocked := &contextBlockingBackend{name: "backend-a", entered: make(chan struct{})}
+	var healthyCalls atomic.Int32
+	healthy := &fakeBackend{name: "backend-b", restart: func(backend.RestartRequest) error {
+		if healthyCalls.Add(1) == 1 {
+			return errors.New("initial ambiguous backend-b result")
+		}
+		return nil
+	}}
+	coordinator, runtime := maintenanceCoordinatorWithRuntimeForTest(
+		t, store, testChain(testLeaseA, testLeaseB),
+		fakeRouter{backends: map[string]backend.Backend{
+			"backend-a": blocked, "backend-b": healthy,
+		}}, nil,
+	)
+	service, err := NewService(Config{Coordinator: coordinator})
+	require.NoError(t, err)
+	idA, idB := requestID(t, testRequestA), requestID(t, testRequestB)
+	require.Equal(t, OutcomeServiceUnavailable, service.Execute(t.Context(), Command{
+		ID: idB, LeaseUUID: testLeaseB, Tenant: testTenant, Kind: KindRestart,
+	}).Outcome())
+
+	// Keep A's request context independent of recovery's context, as it is for
+	// an API call overlapping the background worker. The backend honors it.
+	liveCtx, cancelLive := context.WithCancel(t.Context())
+	liveDone := make(chan struct{})
+	var liveResult Result
+	go func() {
+		defer close(liveDone)
+		liveResult = service.Execute(liveCtx, Command{
+			ID: idA, LeaseUUID: testLeaseA, Tenant: testTenant, Kind: KindRestart,
+		})
+	}()
+	t.Cleanup(func() {
+		cancelLive()
+		<-liveDone
+	})
+	select {
+	case <-blocked.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("live command did not reach backend-a")
+	}
+
+	recoverWhileLive := func(ctx context.Context) error {
+		t.Helper()
+		runCtx, cancelRun := context.WithCancel(ctx)
+		defer cancelRun()
+		done := make(chan error, 1)
+		go func() { done <- service.RecoverPending(runCtx) }()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(5 * time.Second):
+			// Unblock both workers before failing so store cleanup cannot race
+			// an abandoned recovery pass.
+			cancelRun()
+			cancelLive()
+			<-done
+			t.Fatal("maintenance recovery waited for an independently running live command")
+			return nil
+		}
+	}
+	canceledCtx, cancelRecovery := context.WithCancel(t.Context())
+	cancelRecovery()
+	require.ErrorIs(t, recoverWhileLive(canceledCtx), context.Canceled)
+	require.Equal(t, int32(1), healthyCalls.Load(), "canceled recovery must not dispatch")
+
+	require.NoError(t, recoverWhileLive(t.Context()),
+		"both preliminary settlement cleanup and backend lanes must skip the busy command")
+	assert.Equal(t, int32(2), healthyCalls.Load(), "healthy backend must recover while A remains busy")
+	assert.Equal(t, 1, blocked.restartCount(), "recovery must not duplicate the live dispatch")
+	assertMaintenanceLaneHeld(t, runtime, testLeaseA)
+	for leaseUUID, expected := range map[string]struct {
+		id      maintenanceid.ID
+		outcome placement.MaintenanceCommandOutcome
+	}{
+		testLeaseA: {id: idA, outcome: placement.MaintenanceOutcomePending},
+		testLeaseB: {id: idB, outcome: placement.MaintenanceOutcomeAccepted},
+	} {
+		record, found, lookupErr := store.LookupMaintenanceCommand(leaseUUID, expected.id)
+		require.NoError(t, lookupErr)
+		require.True(t, found)
+		assert.Equal(t, expected.outcome, record.Outcome())
+	}
+	cancelLive()
+	<-liveDone
+	assert.Equal(t, OutcomeServiceUnavailable, liveResult.Outcome())
+	assertMaintenanceLaneHeld(t, runtime, testLeaseA)
+}
+
 func TestPendingRecoveryGivesEachBackendAnIndependentLane(t *testing.T) {
 	const unavailableCount = 8
 	leaseBackends := make(map[string]string, unavailableCount+1)

@@ -41,6 +41,11 @@ jobs:
         # Race instrumentation runs separately in bounded shards below.
         run: go test -short -v -coverprofile=coverage.out ./...
 
+      - name: Smoke-test callback replay benchmark
+        # Benchmarks do not run in the test step. One iteration validates the
+        # replay fixture and its durable backlog/request-count assertions.
+        run: go test -run '^$' -bench '^BenchmarkCallbackOutboxReplayBacklog$' -benchtime=1x ./internal/backend/shared
+
       - name: Report coverage and enforce regression floor
         run: python3 scripts/check-coverage.py coverage.out
 

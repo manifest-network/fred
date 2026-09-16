@@ -234,10 +234,16 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 	if err := b.recoverFailedMaintenanceReceipts(ctx); err != nil {
 		return err
 	}
+	checkpoint := b.maintenanceRecoveryDeadlines.checkpoint()
 	intents, err := b.maintenanceSettlement.ListMaintenanceIntents()
 	if err != nil {
 		return fmt.Errorf("list maintenance intents: %w", err)
 	}
+	pending := make(map[maintenanceIntentKey]struct{}, len(intents))
+	for _, intent := range intents {
+		pending[keyForMaintenanceIntent(intent)] = struct{}{}
+	}
+	b.maintenanceRecoveryDeadlines.retainPending(checkpoint, pending)
 	for _, snapshot := range intents {
 		if snapshot.Backend() != b.Name() || snapshot.BackendStorageID() != b.storageIdentity {
 			return fmt.Errorf(
@@ -400,9 +406,10 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 					if compensationErr != nil {
 						return compensationErr
 					}
+					now := time.Now()
 					if !compensationPending && targetRelease.Status == "deploying" &&
 						intent.ExecutionPhase() == shared.MaintenanceExecutionStarted &&
-						time.Now().Before(b.maintenanceRecoveryDeadline(intent.CreatedAt())) {
+						now.Before(b.maintenanceRecoveryDeadline(intent, now)) {
 						// StartMaintenanceExecution proves Compose may have accepted work.
 						// Empty, source-only, partial, and merely-starting inventories are
 						// therefore observations to retry, not failure authority. Startup
@@ -504,17 +511,6 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-func (b *Backend) maintenanceRecoveryDeadline(createdAt time.Time) time.Time {
-	timeout := b.cfg.ProvisionTimeout
-	if timeout <= 0 {
-		timeout = 10 * time.Minute
-	}
-	if createdAt.IsZero() {
-		return time.Time{}
-	}
-	return createdAt.Add(timeout)
 }
 
 func (b *Backend) recoverFailedMaintenanceReceipts(ctx context.Context) error {
