@@ -1646,8 +1646,8 @@ When `network_isolation` is enabled (default), each tenant's containers are plac
 
 - **Naming**: `fred-tenant-<hex(sha256(tenant)[:8])>` -- first 8 bytes of the SHA-256 hash, hex-encoded to 16 characters. Deterministic, derived from the tenant address.
 - **Creation**: `EnsureTenantNetwork` creates the network on first use, or returns the existing one.
-- **Removal**: `RemoveTenantNetworkIfEmpty` removes the network when no containers are connected. Called during deprovision.
-- **Orphan cleanup**: during state recovery, managed networks with no active provisions and no connected containers are removed.
+- **Removal**: state recovery calls `RemoveTenantNetworkIfEmpty` after rechecking that the tenant has no active provisions; Docker must also confirm that no containers are connected.
+- **Orphan cleanup**: successful close leaves network reclamation to the next successful state-recovery pass. Overlapping sweeps coalesce; close completion does not imply immediate subnet reuse.
 - Networks carry `fred.managed=true` and `fred.tenant` labels.
 
 ## Container Labels

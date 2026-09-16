@@ -530,9 +530,19 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	err = b.Deprovision(ctx, leaseUUID2)
 	require.NoError(t, err)
 
-	// Networks should be cleaned up (eventually, after deprovision removes containers)
-	// Give Docker a moment to process network disconnections
-	time.Sleep(500 * time.Millisecond)
+	// Close leaves shared tenant networks for periodic recovery rather than
+	// scanning the fleet in each close request. The fixture disables that
+	// cadence, so drive its state-recovery pass explicitly after both replies.
+	networks, err = docker.ListManagedNetworks(ctx)
+	require.NoError(t, err)
+	remainingNetworks := make([]string, 0, len(networks))
+	for _, n := range networks {
+		remainingNetworks = append(remainingNetworks, n.Name)
+	}
+	assert.Contains(t, remainingNetworks, net1Name, "tenant 1 network awaits periodic recovery")
+	assert.Contains(t, remainingNetworks, net2Name, "tenant 2 network awaits periodic recovery")
+
+	require.NoError(t, b.recoverState(ctx))
 
 	networks, err = docker.ListManagedNetworks(ctx)
 	require.NoError(t, err)

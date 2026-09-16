@@ -195,12 +195,11 @@ type Backend struct {
 
 	// tenantNetworkStripes serializes EnsureTenantNetwork and
 	// RemoveTenantNetworkIfEmpty per tenant. Tenant networks are shared
-	// across every lease for that tenant, so a concurrent provision of
-	// lease B and deprovision of lease A on the same tenant can otherwise
-	// race: A's removal lands between B's ensure and B's ContainerCreate,
-	// and B fails with "network not found". Per-tenant serialization plus
-	// scanning b.provisions before removing keeps the decision and Docker
-	// call atomic per tenant.
+	// across every lease for that tenant, so provisioning and background
+	// reclamation can otherwise race: removal lands between the provision's
+	// ensure and ContainerCreate, causing "network not found". Per-tenant
+	// serialization plus scanning b.provisions before removing keeps the
+	// decision and Docker call atomic per tenant.
 	//
 	// Striped lock (fixed-size array, tenant → hash-modulo slot) rather
 	// than a map[tenant]*Mutex to keep memory bounded — tenants are
@@ -208,7 +207,7 @@ type Backend struct {
 	// map would grow without bound. With tenantNetworkStripeCount slots,
 	// two tenants share a stripe with probability 1/N; the only effect
 	// of a collision is minor serialization between unrelated tenants'
-	// network ops, which are infrequent (once per provision / deprovision).
+	// network ops during provisioning and background network reclamation.
 	//
 	// Lock ordering: stripe mutex -> provisionsMu (RLock).
 	tenantNetworkStripes [tenantNetworkStripeCount]sync.Mutex
