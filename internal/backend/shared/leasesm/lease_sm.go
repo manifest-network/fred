@@ -578,7 +578,7 @@ func (lsm *leaseSM) guardContainerActuallyDied(ctx context.Context, args ...any)
 		return false
 	}
 
-	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	// Inspect via the substrate-agnostic InstanceInspector. ServiceName
 	// rides along on InstanceState (populated by the docker adapter from
@@ -594,13 +594,21 @@ func (lsm *leaseSM) guardContainerActuallyDied(ctx context.Context, args ...any)
 		)
 		return false
 	}
-	// "Terminally gone?" check: PhaseExited and PhaseFailed cover the
-	// Docker statuses {"exited", "removing", "dead"} that previously
-	// mapped to ProvisionStatusFailed. PhaseRunning and PhaseUnknown
-	// (which subsumes "created", "restarting", and unrecognized) are
-	// not terminal — same as the prior containerStatusToProvisionStatus
-	// behavior.
-	if state == nil || (state.Phase != PhaseExited && state.Phase != PhaseFailed) {
+	// Absence is a successful substrate observation, never an inference from
+	// an inspection error. Running and unknown phases are not terminal.
+	if state == nil || (state.Phase != PhaseExited && state.Phase != PhaseFailed && state.Phase != PhaseAbsent) {
+		return false
+	}
+	// Inspection can block while the durable generation changes. Repeat the
+	// same exact runtime/instance proof used by routing and serial admission
+	// before this physical observation can change the Ready projection.
+	if len(args) < 2 {
+		return false
+	}
+	runtime, ok := args[1].(shared.RuntimeGenerationProof)
+	if !ok || reqCtx.Err() != nil || classifyActorObservation(cfg.ProvisionStore, containerDiedMsg{
+		ContainerID: containerID, Runtime: runtime,
+	}) != ObservationGenerationCurrent {
 		return false
 	}
 	lsm.actor.pendingDeathInfo = state
@@ -1174,6 +1182,13 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 	// briefly blocks other messages for this lease, but matches the
 	// "actor owns all state" invariant. Bbolt writes are ~ms.
 	if diagSnap.LeaseUUID != "" {
+		if result.info != nil && result.info.Phase == PhaseAbsent {
+			// Other cohort members may still have useful diagnostics, but a
+			// positive absence observation cannot yield logs for this instance.
+			diagContainerIDs = slices.DeleteFunc(diagContainerIDs, func(id string) bool {
+				return id == result.containerID
+			})
+		}
 		cfg.PersistDiagnosticsFn(diagSnap, diagContainerIDs, diagKeys)
 	}
 
@@ -1714,7 +1729,10 @@ func (a *LeaseActor) gatherDiagAsync(
 			suppress = false
 		}
 	}()
-	diag := a.cfg.Diag.GatherDiagnostics(ctx, containerID, info)
+	var diag string
+	if info == nil || info.Phase != PhaseAbsent {
+		diag = a.cfg.Diag.GatherDiagnostics(ctx, containerID, info)
+	}
 	// Distinguish the two cancellation causes:
 	//   - context.Canceled: diagCancel() fired from Failing.OnExit (preempt
 	//     by Deprovision/Restart/Update). SM has left Failing; any

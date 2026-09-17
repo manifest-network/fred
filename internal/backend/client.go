@@ -310,8 +310,9 @@ type ProvisionInfo struct {
 	BackendName string `json:"-"` // Set by the backend or reconciler; excluded from JSON serialization
 
 	// RetainedUntil is the grace-window deadline (CreatedAt + RetentionMaxAge)
-	// for a soft-deleted (Status=retained) lease. Zero for live provisions.
-	RetainedUntil time.Time `json:"retained_until,omitempty"`
+	// for a soft-deleted (Status=retained) lease. Zero, and omitted on the wire,
+	// for live provisions or when age-based retention expiry is disabled.
+	RetainedUntil time.Time `json:"retained_until,omitzero"`
 	// Tenant is the owning tenant. It crosses the backend→providerd hop (an
 	// HMAC-signed, trusted internal hop, like RestoreRequest.Tenant) so a complete
 	// identity-bearing inventory can bind a live placement's runtime maintenance

@@ -502,7 +502,8 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
 ```
 
 **Fields:**
-- `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, or `deprovisioning`. A backend that implements soft-delete/retention (see `/restore` below) also returns `retained` for a closed lease whose data is retained, alongside `retained_until` (RFC3339) and `items` (the restore shape)
+- `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, or `deprovisioning`. A backend that implements soft-delete/retention (see `/restore` below) also returns `retained` for a closed or expired lease whose data is retained, alongside `items` (the restore shape).
+- `retained_until` (optional) - RFC3339 retention deadline for retained data with a configured age limit. Omit it when age-based expiry is disabled; do not encode a zero timestamp as a deadline. Other retention policy and capacity limits still apply.
 - `fail_count` - Number of provision failures
 - `reason` (omitempty) - Stable machine-readable failure category (CamelCase, e.g. `ContainerExited`, `ImagePullFailed`, `Internal`, `Unknown`). Open/add-only set; consumers must tolerate unknown values.
 - `message` (omitempty) - Curated human-readable failure message. MUST NOT contain host paths or raw command output (those stay in the backend's own logs).

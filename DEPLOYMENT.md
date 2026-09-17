@@ -363,9 +363,11 @@ container stop grace. The three ordinary phases
 operation recovery gets the larger of that ordinary phase budget and its
 configured provision/read/cleanup sum; the final identity proof gets one Docker
 read budget. Recovery Docker list/inspect calls are capped at 30 seconds, and
-cold-start diagnostic collection plus orphan-network cleanup each share one
-such aggregate budget rather than receiving a fresh timeout per
-container/network.
+cold-start diagnostic collection shares one such aggregate budget rather than
+receiving a fresh timeout per container. Orphan-network reclamation runs in a
+separate lifecycle worker after successful startup, with its own 30-second
+budget per pass at the backend reconcile cadence. A large backlog may take
+multiple passes; it cannot consume the state/operation-recovery budget.
 
 Startup intentionally remains fail-closed if a retained v0.13 row lacks immutable
 resource profiles and its SKU has been removed from configuration: Fred cannot

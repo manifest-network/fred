@@ -5,6 +5,7 @@ import (
 
 	networktypes "github.com/docker/docker/api/types/network"
 
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/fsidentity"
 )
 
@@ -16,6 +17,7 @@ type dockerReadView struct {
 	daemonInfo           func(context.Context) (DaemonSecurityInfo, error)
 	close                func() error
 	inspectContainer     func(context.Context, string) (*ContainerInfo, error)
+	inspectInstance      func(context.Context, string) (*leasesm.InstanceState, error)
 	containerLogs        func(context.Context, string, int) (string, error)
 	listContainers       func(context.Context) ([]ContainerInfo, error)
 	listContainersStrict func(context.Context) ([]ContainerInfo, error)
@@ -28,6 +30,7 @@ func projectDockerRead(client dockerReadClient) dockerReadClient {
 	return dockerReadView{
 		ping: client.Ping, daemonInfo: client.DaemonInfo, close: client.Close,
 		inspectContainer: client.InspectContainer,
+		inspectInstance:  concreteInstanceInspection(client),
 		containerLogs:    client.ContainerLogs, listContainers: client.ListManagedContainers,
 		listContainersStrict: client.ListManagedContainersStrict,
 		listVolumeWriters:    client.ListVolumeWriters,

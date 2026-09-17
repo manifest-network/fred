@@ -19,7 +19,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/containerd/errdefs"
@@ -129,12 +128,15 @@ func newBackgroundMaintenanceCoordinator(
 		},
 		removeFn: removeContainer,
 	}
-	removeTenantNetwork := backgroundTenantNetworkRemove(func(ctx context.Context, tenant string) error {
-		return perform(ctx, "background remove tenant network", func(ctx context.Context) error {
-			return ops.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
+	removeTenantNetwork := backgroundTenantNetworkRemove(func(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
+		var outcome tenantNetworkRemoval
+		err := perform(ctx, "background remove tenant network", func(ctx context.Context) error {
+			var err error
+			outcome, err = ops.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
+			return err
 		})
+		return outcome, err
 	})
-	var networkCleanupMu sync.Mutex
 
 	return &backgroundMaintenanceCoordinator{
 		recoverInterruptedVolumesFn: func(ctx context.Context) error {
@@ -154,12 +156,10 @@ func newBackgroundMaintenanceCoordinator(
 			return backend.reconcileVolumeQuotasUsing(ctx, ensureVolumeQuota)
 		},
 		cleanupOrphanedNetworksFn: func(ctx context.Context) {
-			// Coalesce overlapping fleet sweeps instead of queuing another full
-			// inventory. The next periodic pass revisits newly orphaned networks.
-			if ctx.Err() != nil || !networkCleanupMu.TryLock() {
+			// The single lifetime-owned network loop serializes fleet sweeps.
+			if ctx.Err() != nil {
 				return
 			}
-			defer networkCleanupMu.Unlock()
 			backend.cleanupOrphanedNetworksUsing(ctx, removeTenantNetwork)
 		},
 		reapExpiredRetentionsFn: func(ctx context.Context) (int, error) {

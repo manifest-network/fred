@@ -2696,8 +2696,8 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 			// ID without error.
 			return "net-id-" + tenant, nil
 		},
-		// recoverState's cleanupOrphanedNetworks sweep runs when isolation
-		// is enabled. Default to a clean network list so migration tests
+		// The independent network sweep runs when isolation is enabled.
+		// Default to a clean network list so migration tests
 		// that enable isolation don't crash; tests that need a non-empty
 		// list can override on the mock directly.
 		ListManagedNetworksFn: func(_ context.Context) ([]networktypes.Inspect, error) {

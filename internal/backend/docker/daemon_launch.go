@@ -147,6 +147,9 @@ type daemonContextTransport struct {
 
 func (t daemonContextTransport) RoundTrip(req *http.Request) (response *http.Response, err error) {
 	defer func() { response, err = boundImageInspectResponse(req, response, err) }()
+	if scope, ok := req.Context().Value(instanceInspectionContextKey{}).(*instanceInspectionScope); ok {
+		defer func() { scope.observe(t.observer, req, response, err) }()
+	}
 	if scope, ok := req.Context().Value(daemonLaunchContextKey{}).(*daemonLaunchScope); ok {
 		if t.observer == nil || scope.observer != t.observer {
 			return nil, errors.New("docker launch observer belongs to another client")

@@ -53,6 +53,12 @@ const (
 	// K8s containerStatuses.state.terminated with non-zero exit code
 	// or reasons like "OOMKilled", "Error", "ContainerCannotRun".
 	PhaseFailed
+
+	// PhaseAbsent means the substrate positively observed that this exact
+	// instance no longer exists. Inspection errors, including timeouts and
+	// permission failures, must not be converted into absence. No exit status
+	// or logs remain available for this phase.
+	PhaseAbsent
 )
 
 // InstanceState is a substrate-agnostic snapshot of a workload

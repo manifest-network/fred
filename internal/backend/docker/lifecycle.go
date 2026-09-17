@@ -1961,30 +1961,43 @@ func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (
 	return resp.ID, nil
 }
 
-// RemoveTenantNetworkIfEmpty removes the tenant's network if no containers are connected.
-func (d *DockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error {
+// tenantNetworkRemoval is a diagnostic result, never mutation authority.
+type tenantNetworkRemoval uint8
+
+const (
+	tenantNetworkRemovalUnknown tenantNetworkRemoval = iota
+	tenantNetworkRemoved
+	tenantNetworkAbsent
+	tenantNetworkInUse
+	tenantNetworkOwned
+	tenantNetworkBusy
+)
+
+// RemoveTenantNetworkIfEmpty removes the tenant's network if no containers are
+// connected, distinguishing an actual deletion from idempotent absence or use.
+func (d *DockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
 	name := TenantNetworkName(tenant)
 
 	// Inspect to check connected containers
 	resp, err := d.client.NetworkInspect(ctx, name, networktypes.InspectOptions{})
 	if err != nil {
 		if client.IsErrNotFound(err) {
-			return nil // Already removed
+			return tenantNetworkAbsent, nil
 		}
-		return fmt.Errorf("failed to inspect network: %w", err)
+		return tenantNetworkRemovalUnknown, fmt.Errorf("failed to inspect network: %w", err)
 	}
 
 	if len(resp.Containers) > 0 {
-		return nil // Still in use
+		return tenantNetworkInUse, nil
 	}
 
 	if err := d.client.NetworkRemove(ctx, resp.ID); err != nil {
 		if client.IsErrNotFound(err) {
-			return nil
+			return tenantNetworkAbsent, nil
 		}
-		return fmt.Errorf("failed to remove network: %w", err)
+		return tenantNetworkRemovalUnknown, fmt.Errorf("failed to remove network: %w", err)
 	}
-	return nil
+	return tenantNetworkRemoved, nil
 }
 
 // ListManagedNetworks returns all networks created by Fred, with full details.
@@ -2005,8 +2018,14 @@ func (d *DockerClient) ListManagedNetworks(ctx context.Context) ([]networktypes.
 
 	var result []networktypes.Inspect
 	for _, s := range summaries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		inspected, err := d.client.NetworkInspect(ctx, s.ID, networktypes.InspectOptions{})
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			if !client.IsErrNotFound(err) {
 				slog.Warn("failed to inspect network during list; network excluded from results", "network_id", s.ID, "error", err)
 			}
@@ -2051,19 +2070,27 @@ func (b *Backend) removeOrphanedTenantNetworkUsing(
 	ctx context.Context,
 	tenant string,
 	removeNetwork backgroundTenantNetworkRemove,
-) error {
+) (tenantNetworkRemoval, error) {
 	if removeNetwork == nil {
-		return errBackgroundMaintenanceUnavailable
+		return tenantNetworkRemovalUnknown, errBackgroundMaintenanceUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return tenantNetworkRemovalUnknown, err
 	}
 	mu := b.tenantNetworkMu(tenant)
-	mu.Lock()
+	// Reclamation is best-effort. Never wait behind foreground network work:
+	// a contended stripe is retried by the next bounded network pass, keeping
+	// shutdown responsive even while another tenant sharing the stripe is busy.
+	if !mu.TryLock() {
+		return tenantNetworkBusy, nil
+	}
 	defer mu.Unlock()
 
 	b.provisionsMu.RLock()
 	for _, p := range b.provisions {
 		if p.Tenant == tenant {
 			b.provisionsMu.RUnlock()
-			return nil
+			return tenantNetworkOwned, nil
 		}
 	}
 	b.provisionsMu.RUnlock()

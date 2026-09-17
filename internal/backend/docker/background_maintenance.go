@@ -86,7 +86,7 @@ func (c *backgroundMaintenanceCoordinator) runRetentionSweep(ctx context.Context
 type backgroundVolumeRename func(context.Context, string, string) error
 type backgroundVolumeQuota func(context.Context, string, int64) error
 type backgroundContainerRemove func(context.Context, string) error
-type backgroundTenantNetworkRemove func(context.Context, string) error
+type backgroundTenantNetworkRemove func(context.Context, string) (tenantNetworkRemoval, error)
 
 // backgroundTeardownCapability is captured privately by the retention
 // reconciliation closure. It satisfies teardownMutationCapability without

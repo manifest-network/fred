@@ -1495,10 +1495,10 @@ func TestDeprovision_WithNetworkIsolation(t *testing.T) {
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
 			return nil
 		},
-		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) error {
+		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
 			networkCleanupCalled = true
 			assert.Equal(t, "tenant-a", tenant)
-			return nil
+			return tenantNetworkRemoved, nil
 		},
 		ListManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
 			return []networktypes.Inspect{{

@@ -1,8 +1,6 @@
 package docker
 
 import (
-	"crypto/sha256"
-	"fmt"
 	"sync"
 	"time"
 
@@ -23,11 +21,6 @@ type recoveryDeadlines[K comparable] struct {
 type recoveryDeadline struct {
 	deadline   time.Time
 	generation uint64
-}
-
-func (d *recoveryDeadlines[K]) observe(key K, admittedAt, now time.Time, timeout time.Duration) time.Time {
-	deadline, _ := d.observeFirst(key, admittedAt, now, timeout)
-	return deadline
 }
 
 // observeFirst reports whether this observation opened the runtime window so
@@ -120,6 +113,22 @@ type maintenanceReadinessKey struct {
 	containerID string
 }
 
+type maintenanceReadinessObservationKey struct {
+	intent maintenanceIntentKey
+	branch string
+}
+
+func (b *Backend) observeMaintenanceReadinessPending(intent shared.MaintenanceIntentClaim, branch string) {
+	maintenanceReadinessPendingTotal.WithLabelValues(branch).Inc()
+	_, first := b.maintenanceReadinessWarnings.observeDeadline(
+		maintenanceReadinessObservationKey{intent: keyForMaintenanceIntent(intent), branch: branch}, time.Time{}, false,
+	)
+	if first {
+		b.logger.Warn("maintenance recovery is waiting for readiness evidence",
+			"lease_uuid", intent.LeaseUUID(), "maintenance_id", intent.MaintenanceID().String(), "branch", branch)
+	}
+}
+
 func (b *Backend) maintenanceContainerAgeReached(
 	intent shared.MaintenanceIntentClaim, container ContainerInfo,
 ) bool {
@@ -153,9 +162,8 @@ func (b *Backend) maintenanceRecoveryDeadline(claim shared.MaintenanceIntentClai
 		keyForMaintenanceIntent(claim), claim.CreatedAt(), now, b.intentRecoveryTimeout(),
 	)
 	if first && claim.CreatedAt().After(now) {
-		fingerprint := sha256.Sum256([]byte(claim.MaintenanceID().String()))
 		b.logger.Warn("future maintenance admission opened a bounded recovery window",
-			"lease_uuid", claim.LeaseUUID(), "maintenance_fingerprint", fmt.Sprintf("maintenance_%x", fingerprint[:12]),
+			"lease_uuid", claim.LeaseUUID(), "maintenance_id", claim.MaintenanceID().String(),
 			"admitted_at", claim.CreatedAt(), "deadline", deadline)
 	}
 	return deadline

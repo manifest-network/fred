@@ -877,6 +877,14 @@ When a provision has `status=failed` (e.g., a container crashed and was detected
   `die_event_dropped_total`, except deaths positively owned by the registered
   actor's active close callback; cohort-divergence refusal is logged.
 
+If a force-removal destroys the container before the event's inspection, the
+concrete Docker adapter can report confirmed absence from the exact daemon
+inspection response. The actor rechecks current runtime ownership after the
+inspection and emits the normal Failed callback without trying to collect logs
+from the missing container. A transport error, permission denial or arbitrary
+not-found error does not prove absence. Periodic reconciliation remains the
+fallback for missed events.
+
 Every lease is owned by a per-lease actor goroutine with a bounded inbox (16 messages). All transitions flow through a state machine, one per actor, which serializes transitions and owns the side effects (callback emission, diagnostics persistence, gauge updates). The SM's initial state is the lease's current `Status` at actor creation — new leases start in `Provisioning`, recovered leases start in whatever state they were in.
 
 ```mermaid
@@ -980,9 +988,12 @@ these phases do not measure the full wall time of a failed replacement.
 - `fred_docker_backend_terminal_substrate_cleanup_retries_total` — Transient late-container cleanup retries; daemon stays alive and exact terminal receipts remain.
 - `fred_docker_backend_unaccounted_managed_volumes` — Attested managed volumes absent from current live, admitted-operation, and all retention projections; diagnostic only, never deletion or admission authority.
 - `fred_docker_backend_unaccounted_managed_volume_observation_failures_total` — Failed diagnostic inventory/footprint observations; last unaccounted-volume gauge is retained, not reset to zero.
-- `fred_docker_backend_reconciliation_total{outcome}` and `fred_docker_backend_reconciliation_last_success_timestamp_seconds` — the runtime signal for `recoverState`, including maintenance-WAL convergence. A valid but semantically indeterminate maintenance row can make a pass report `outcome="error"` and leave last-success stale while `/health` remains green and `callback_store_errors_total` remains unchanged; those latter signals validate structural store access, not every substrate classification. During startup the equivalent failure exits before the periodic loop starts and appears as `failed to recover state` with the lease-scoped nested error.
+- `fred_docker_backend_reconciliation_total{outcome}` and `fred_docker_backend_reconciliation_last_success_timestamp_seconds` — the runtime signal for state and live-operation recovery, including maintenance-WAL convergence. Global storage, journal, transport or unclassified observation failures can report `outcome="error"` and leave last-success stale while `/health` remains green; health does not validate every substrate classification. Explicit lease-local maintenance deferrals use their own counter and preserve sibling progress. Network reclamation has an independent budget and outcome counter. During startup, unresolved failures at a global recovery boundary still exit before periodic recovery starts.
 - `fred_docker_backend_retention_sweep_total{outcome}` — one increment per periodic retention-sweep pass, `success` or `error`. The sum across outcomes is a liveness heartbeat (it advances every tick regardless of result); `{outcome="error"}` means a sweep stage failed — usually an unenumerable retention store, but the orphan stage reports a failed volume-root enumeration here too, so the joined stage error is what identifies the actual failing dependency. Every stage runs on every pass and the stage errors are joined, so the log line names all of them rather than only the first.
 - `fred_docker_backend_retention_accounting_refresh_failed_total` — the retained-disk projection could not be recomputed and the previous value was kept. Safe (a zeroed projection would over-admit) but it means the five retention gauges and the pool's retained input are stale while this rises.
+- `fred_docker_backend_maintenance_readiness_pending_total{branch}` — readiness deferrals, including retries, for `committed_target`, `deploying_target`, `cleanup_source`, or `source_only`. The matching warning is emitted once per exact pending intent and branch in a backend lifetime. A committed target can remain pending indefinitely while its healthcheck is starting; inspect that workload rather than treating the metric as permission to roll it back.
+- `fred_docker_backend_maintenance_recovery_deferred_total` — explicitly lease-local observation conflicts deferred with their exact intent and reservation retained. Sibling recovery continues; storage/journal authority failures and global transport/cancellation errors still fail the recovery boundary.
+- `fred_docker_backend_network_reclamation_total{outcome}` — network candidates classified as `removed`, `absent`, `in_use`, `tenant_active`, or `tenant_busy`, plus candidate `error`, pass `list_error`, and pass `budget_exhausted` outcomes. Only `removed` counts a successful Docker removal. A bounded pass can leave a backlog for later passes without failing state or operation recovery; shutdown cancellation does not count as an operational error.
 
 ## State Recovery
 
@@ -994,12 +1005,15 @@ sweep reads the last backend projection and does not force an extra Docker
 recovery pass. Runtime WAL retry cadence is therefore the docker-backend's own
 `reconcile_interval` (default `5m`), not providerd's sweep interval.
 
-Orphaned tenant networks are cleaned up by these state-recovery passes, with at
-most one network sweep per backend at a time. A successful close does not run a
-fleet-wide sweep or wait for unrelated network cleanup. An unused network can
-therefore remain until the next successful pass, including across failed
-recovery attempts. Size Docker's address pools for active tenants and tenant
-churn between passes; close completion does not imply immediate subnet reuse.
+Orphaned tenant networks are cleaned up by one separate lifecycle worker. It
+starts an asynchronous pass after successful backend startup, then runs at
+`reconcile_interval` (default `5m`). Each serial pass has its own 30-second
+budget, independent of state and operation recovery. A successful close does
+not run a fleet-wide sweep or wait for network cleanup. A backlog may need
+several passes to drain; cancellation or budget exhaustion leaves the remaining
+networks for a later pass. Size Docker's address pools for active tenants and
+tenant churn between passes; close completion does not imply immediate subnet
+reuse. Backend shutdown cancels and waits for the worker.
 
 The bounds are nested and aggregate where cardinality matters:
 
@@ -1027,8 +1041,10 @@ The bounds are nested and aggregate where cardinality matters:
   one Docker read budget. A longer configured stop grace is therefore honored
   for one container without multiplying that grace per lease.
 - Ordinary recovery Docker list/inspect boundaries are capped at 30 seconds.
-  Cold-start diagnostics share one 30-second context across every failed lease,
-  and orphan-network cleanup shares one across the whole network set.
+  Cold-start diagnostics share one 30-second context across every failed lease.
+  The separate network worker shares its own 30-second context across a complete
+  network pass, so exhaustion cannot starve operation recovery or turn an
+  otherwise successful state-recovery tick into an error.
 - Post-mutation storage verification receives its own bounded 30-second read
   context, even after effect cancellation or shutdown. This prevents an expired
   effect context from manufacturing a failed identity proof. The original
@@ -1069,7 +1085,11 @@ select these production defaults.
 10. **Preserve in-flight provisions** -- Pending operation state and its resource reservation survive an inventory rebuild. A Pending provision remains excluded from ordinary inference and is settled by the later startup operation phase. Succeeded/Failed operation rows are durable decisions, not in-flight work.
 11. **Reset resource accounting** -- allocations are rebuilt atomically from operation-intent, active-release, restore-finalizer, and close snapshots while reservations for every still-tracked lease are preserved. Docker uses durable `disk_mb` or its mutually exclusive pinned scratch allowance; mutable configuration is used only while explicitly upgrading supported v0.13 evidence.
 12. **Resume admitted closes** -- after conservative projections and reservations are visible and the recovery guard is released, retry every close under its per-lease command fence after re-reading the durable journal. Transient failures retain the journal and durable execution generation for the next level-triggered pass.
-13. **Orphaned network cleanup** -- if `NetworkIsolation` is enabled, removes any managed networks whose tenant has no active provisions and no connected containers.
+
+When `NetworkIsolation` is enabled, the separate network worker reclaims managed
+networks only after rechecking that the tenant has no active provisions and Docker
+reports no connected containers. A busy tenant stripe is deferred rather than
+blocking provisioning or shutdown.
 
 During `Start`, the next phase lets Pending provision and restore operations
 exclusively classify and settle their exact substrate; only afterward may
@@ -1100,6 +1120,12 @@ and retains its complete durable resource reservation until it settles.
 An uncommitted target still obeys its `provision_timeout` recovery horizon;
 expiry enters exact cleanup rather than renewing a readiness wait. A committed
 Release is never rolled back merely because readiness remains uncertain.
+After the horizon, an exact complete source cohort that is observably stopped or
+unhealthy settles maintenance as failed without claiming source recovery. The
+failure retains its maintenance-authored reason through the inventory merge.
+Expected readiness waits and explicitly lease-local observation conflicts retain
+the exact intent and reservation while sibling leases progress. Store access,
+storage identity and unclassified transport failures remain fail-closed.
 
 A terminal sibling or exhausted horizon enters exact failed-operation cleanup.
 An inspection error, pre-effect cancellation, or ordinary removal failure
@@ -1646,8 +1672,8 @@ When `network_isolation` is enabled (default), each tenant's containers are plac
 
 - **Naming**: `fred-tenant-<hex(sha256(tenant)[:8])>` -- first 8 bytes of the SHA-256 hash, hex-encoded to 16 characters. Deterministic, derived from the tenant address.
 - **Creation**: `EnsureTenantNetwork` creates the network on first use, or returns the existing one.
-- **Removal**: state recovery calls `RemoveTenantNetworkIfEmpty` after rechecking that the tenant has no active provisions; Docker must also confirm that no containers are connected.
-- **Orphan cleanup**: successful close leaves network reclamation to the next successful state-recovery pass. Overlapping sweeps coalesce; close completion does not imply immediate subnet reuse.
+- **Removal**: the network worker calls `RemoveTenantNetworkIfEmpty` after rechecking that the tenant has no active provisions; Docker must also confirm that no containers are connected. A busy tenant stripe defers that candidate.
+- **Orphan cleanup**: successful close leaves reclamation to the independent worker. Passes run serially with a finite budget; a backlog may require multiple passes. Close completion does not imply immediate subnet reuse.
 - Networks carry `fred.managed=true` and `fred.tenant` labels.
 
 ## Container Labels

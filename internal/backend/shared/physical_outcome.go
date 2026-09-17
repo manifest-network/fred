@@ -724,6 +724,32 @@ func NewMaintenanceSourceReady(
 		kind: maintenancePhysicalEvidenceSourceReady, sourceReady: evidence,
 	}, nil
 }
+
+// NewMaintenanceCleanupSourceFailed attests a complete, exactly identified
+// source cohort whose runtime is definitively unready after target cleanup.
+// Ordinary inspection and live execution cannot use this constructor to bypass
+// compensation or convert uncertain readiness into terminal failure.
+func NewMaintenanceCleanupSourceFailed(
+	subject MaintenancePhysicalSubject,
+	containerIDs []string,
+	serviceContainers map[string][]string,
+) (MaintenancePhysicalEvidence, error) {
+	if !subject.RecoveryCleanup() {
+		return MaintenancePhysicalEvidence{}, errors.New("source failure requires maintenance cleanup authority")
+	}
+	source, ok := subject.SourceRelease()
+	if !ok || !validReadyProjectionForRelease(source, containerIDs, serviceContainers) {
+		return MaintenancePhysicalEvidence{}, errors.New("failed source projection differs from complete source topology")
+	}
+	state, err := newMaintenanceProjection(subject, containerIDs, serviceContainers, true)
+	if err != nil {
+		return MaintenancePhysicalEvidence{}, err
+	}
+	return MaintenancePhysicalEvidence{
+		kind: maintenancePhysicalEvidenceSourceFailed, sourceFailed: MaintenanceSourceFailed{state: state},
+	}, nil
+}
+
 func NewMaintenanceTargetDivergent(
 	subject MaintenancePhysicalSubject,
 	containerIDs []string,

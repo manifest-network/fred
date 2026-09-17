@@ -1144,7 +1144,7 @@ func (s *MaintenanceSettlement) CleanupRecoveredMaintenance(
 			return MaintenanceExecutionSuccess{
 				settlement: s, execution: claimResult, ready: evidence.targetReady,
 			}, nil
-		case maintenancePhysicalEvidenceSourceReady, maintenancePhysicalEvidenceTargetDivergent,
+		case maintenancePhysicalEvidenceSourceReady, maintenancePhysicalEvidenceSourceFailed, maintenancePhysicalEvidenceTargetDivergent,
 			maintenancePhysicalEvidenceTargetAbsent:
 			return MaintenanceExecutionFailure{
 				settlement: s, authority: currentTarget, subject: subject, evidence: evidence,

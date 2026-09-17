@@ -248,6 +248,42 @@ func TestProvisionInfoLifecycleGenerationBackwardWireCompatibility(t *testing.T)
 	assert.Equal(t, want, roundTrip.LifecycleGeneration)
 }
 
+func TestProvisionInfoRetentionDeadlineWireCompatibility(t *testing.T) {
+	deadline := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		status   ProvisionStatus
+		deadline time.Time
+	}{
+		{name: "live lease", status: ProvisionStatusReady},
+		{name: "retained without age expiry", status: ProvisionStatusRetained},
+		{name: "retained with age expiry", status: ProvisionStatusRetained, deadline: deadline},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := json.Marshal(ProvisionInfo{
+				LeaseUUID: "lease-1", Status: tc.status, RetainedUntil: tc.deadline,
+			})
+			require.NoError(t, err)
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(encoded, &fields))
+			if tc.deadline.IsZero() {
+				assert.NotContains(t, fields, "retained_until", "no deadline must not advertise a year-1 expiry")
+			} else {
+				assert.JSONEq(t, `"2026-09-18T12:00:00Z"`, string(fields["retained_until"]))
+			}
+			var decoded ProvisionInfo
+			require.NoError(t, json.Unmarshal(encoded, &decoded))
+			assert.Equal(t, tc.status, decoded.Status)
+			assert.Equal(t, tc.deadline, decoded.RetainedUntil)
+		})
+	}
+	// The provider must still accept the zero timestamp emitted by older
+	// backends when decoding historical or older backend responses.
+	var legacy ProvisionInfo
+	require.NoError(t, json.Unmarshal([]byte(`{"status":"retained","retained_until":"0001-01-01T00:00:00Z"}`), &legacy))
+	assert.True(t, legacy.RetainedUntil.IsZero())
+}
+
 func TestResolveMaintenanceCallbackURLs(t *testing.T) {
 	const (
 		currentID = "550e8400-e29b-41d4-a716-446655440000"

@@ -757,9 +757,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Maintenance recovery can settle an exact stopped source cohort as failed
+  instead of wedging startup. Proven lease-local observation conflicts defer
+  without blocking sibling recovery; readiness waits now have bounded-label
+  metrics and one warning per pending attempt and branch. (ENG-989)
+- Tenant-network reclamation has its own bounded lifecycle worker, so a large
+  orphan backlog cannot consume the operation-recovery budget. Reclamation
+  metrics distinguish actual removal from already absent or in-use networks.
+  (ENG-989)
+- Container-death events can recognize an exact daemon-confirmed missing
+  container and fail its current runtime promptly, without waiting for the
+  periodic reconcile. Uncertain inspection errors remain nonterminal. (ENG-988)
+- Backend provision responses omit an unset retention deadline, including when
+  age-based retention expiry is disabled, while accepting older zero-timestamp
+  responses. (ENG-989)
 - Docker closes no longer perform a fleet-wide orphan-network sweep before
-  returning. Recovery owns network cleanup, and overlapping sweeps coalesce
-  without queuing additional Docker inventories. (ENG-981)
+  returning. A single background worker owns network cleanup without queuing
+  additional per-close Docker inventories. (ENG-981, ENG-989)
 - Container deaths positively owned by an active close no longer emit dropped
   crash-observation warnings or increment the dropped-event counter. Actual
   delivery refusals remain observable. (ENG-977)

@@ -28,21 +28,24 @@ func TestRecoveryDeadlinesBoundRepeatedFutureObservations(t *testing.T) {
 		first := time.Now()
 		admitted := first.Add(24 * time.Hour)
 		timeout := 10 * time.Minute
-		deadline := deadlines.observe("attempt-a", admitted, first, timeout)
+		deadline, _ := deadlines.observeFirst("attempt-a", admitted, first, timeout)
 		require.Equal(t, first.Add(timeout), deadline)
 		for range 3 {
 			time.Sleep(timeout / 2)
 			now := time.Now()
-			require.Equal(t, deadline, deadlines.observe("attempt-a", admitted, now, timeout))
+			observed1, _ := deadlines.observeFirst("attempt-a", admitted, now, timeout)
+			require.Equal(t, deadline, observed1)
 		}
 		require.False(t, time.Now().Before(deadline), "periodic observations must spend the original runtime window")
 
 		// Neither a different attempt nor a process restart inherits an older
 		// attempt's already-expired window. Future wall time remains uncertain.
 		now := time.Now()
-		require.Equal(t, now.Add(timeout), deadlines.observe("attempt-b", admitted, now, timeout))
+		observed2, _ := deadlines.observeFirst("attempt-b", admitted, now, timeout)
+		require.Equal(t, now.Add(timeout), observed2)
 		var restarted recoveryDeadlines[string]
-		require.Equal(t, now.Add(timeout), restarted.observe("attempt-a", admitted, now, timeout))
+		observed3, _ := restarted.observeFirst("attempt-a", admitted, now, timeout)
+		require.Equal(t, now.Add(timeout), observed3)
 	})
 }
 
@@ -50,25 +53,29 @@ func TestRecoveryDeadlinesPreserveElapsedBudgetAndOnlyShorten(t *testing.T) {
 	var deadlines recoveryDeadlines[string]
 	now := time.Now()
 	admitted := now.Add(-4 * time.Minute)
-	deadline := deadlines.observe("attempt", admitted, now, 10*time.Minute)
+	deadline, _ := deadlines.observeFirst("attempt", admitted, now, 10*time.Minute)
 	require.Equal(t, now.Add(6*time.Minute), deadline)
-	require.Equal(t, deadline, deadlines.observe("attempt", admitted, now.Add(time.Minute), time.Hour))
-	require.Equal(t, now.Add(time.Minute), deadlines.observe("attempt", admitted, now.Add(time.Minute), time.Minute))
+	observed4, _ := deadlines.observeFirst("attempt", admitted, now.Add(time.Minute), time.Hour)
+	require.Equal(t, deadline, observed4)
+	observed5, _ := deadlines.observeFirst("attempt", admitted, now.Add(time.Minute), time.Minute)
+	require.Equal(t, now.Add(time.Minute), observed5)
 }
 
 func TestRecoveryDeadlinesPruneOnlyCompletedSnapshotEntries(t *testing.T) {
 	var deadlines recoveryDeadlines[string]
 	now := time.Now()
 	admitted := now.Add(time.Hour)
-	deadline := deadlines.observe("pending", admitted, now, time.Minute)
-	deadlines.observe("completed", admitted, now, time.Minute)
+	deadline, _ := deadlines.observeFirst("pending", admitted, now, time.Minute)
+	deadlines.observeFirst("completed", admitted, now, time.Minute)
 	checkpoint := deadlines.checkpoint()
-	concurrent := deadlines.observe("concurrent", admitted, now, time.Minute)
+	concurrent, _ := deadlines.observeFirst("concurrent", admitted, now, time.Minute)
 	deadlines.retainPending(checkpoint, map[string]struct{}{"pending": {}})
 
 	require.Len(t, deadlines.entries, 2)
-	require.Equal(t, deadline, deadlines.observe("pending", admitted, now.Add(time.Minute), time.Minute))
-	require.Equal(t, concurrent, deadlines.observe("concurrent", admitted, now.Add(time.Minute), time.Minute),
+	observed6, _ := deadlines.observeFirst("pending", admitted, now.Add(time.Minute), time.Minute)
+	require.Equal(t, deadline, observed6)
+	observed7, _ := deadlines.observeFirst("concurrent", admitted, now.Add(time.Minute), time.Minute)
+	require.Equal(t, concurrent, observed7,
 		"an older journal snapshot must not reset a concurrently observed attempt")
 	deadlines.retainPending(deadlines.checkpoint(), nil)
 	require.Empty(t, deadlines.entries)
@@ -82,17 +89,19 @@ func TestMaintenanceReadinessDeadlinesIsolateAttemptsAndContainers(t *testing.T)
 		initialKey := maintenanceReadinessKey{intent: first, containerID: "source"}
 		now := time.Now()
 		createdAt := now.Add(time.Hour)
-		deadline := deadlines.observe(initialKey, createdAt, now, 5*time.Second)
+		deadline, _ := deadlines.observeFirst(initialKey, createdAt, now, 5*time.Second)
 		time.Sleep(5 * time.Second)
-		require.False(t, time.Now().Before(deadlines.observe(initialKey, createdAt, time.Now(), 5*time.Second)))
+		observed8, _ := deadlines.observeFirst(initialKey, createdAt, time.Now(), 5*time.Second)
+		require.False(t, time.Now().Before(observed8))
 		replacementKey := maintenanceReadinessKey{intent: first, containerID: "replacement"}
 		successorKey := maintenanceReadinessKey{intent: next, containerID: "source"}
 		for _, key := range []maintenanceReadinessKey{replacementKey, successorKey} {
-			require.Equal(t, deadline.Add(5*time.Second), deadlines.observe(key, createdAt, time.Now(), 5*time.Second))
+			observed9, _ := deadlines.observeFirst(key, createdAt, time.Now(), 5*time.Second)
+			require.Equal(t, deadline.Add(5*time.Second), observed9)
 		}
 		checkpoint := deadlines.checkpoint()
 		concurrentKey := maintenanceReadinessKey{intent: next, containerID: "concurrent"}
-		deadlines.observe(concurrentKey, createdAt, time.Now(), 5*time.Second)
+		deadlines.observeFirst(concurrentKey, createdAt, time.Now(), 5*time.Second)
 		deadlines.retainMatching(checkpoint, func(key maintenanceReadinessKey) bool { return key.intent == first })
 		require.Len(t, deadlines.entries, 3)
 		require.Contains(t, deadlines.entries, initialKey)
@@ -209,8 +218,7 @@ func TestRecoverMaintenanceBoundsClockRollbackAcrossSweeps(t *testing.T) {
 		require.NoError(t, h.b.recoverMaintenanceIntents(context.Background()))
 		require.Empty(t, h.b.maintenanceRecoveryDeadlines.entries)
 		require.Equal(t, 1, strings.Count(warnings.String(), "future maintenance admission opened a bounded recovery window"))
-		require.Contains(t, warnings.String(), "maintenance_fingerprint=")
-		require.NotContains(t, warnings.String(), reopened.MaintenanceID().String())
+		require.Contains(t, warnings.String(), "maintenance_id="+reopened.MaintenanceID().String())
 	})
 }
 

@@ -530,19 +530,13 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	err = b.Deprovision(ctx, leaseUUID2)
 	require.NoError(t, err)
 
-	// Close leaves shared tenant networks for periodic recovery rather than
+	// Close leaves shared tenant networks for the network cleanup worker rather than
 	// scanning the fleet in each close request. The fixture disables that
-	// cadence, so drive its state-recovery pass explicitly after both replies.
-	networks, err = docker.ListManagedNetworks(ctx)
-	require.NoError(t, err)
-	remainingNetworks := make([]string, 0, len(networks))
-	for _, n := range networks {
-		remainingNetworks = append(remainingNetworks, n.Name)
-	}
-	assert.Contains(t, remainingNetworks, net1Name, "tenant 1 network awaits periodic recovery")
-	assert.Contains(t, remainingNetworks, net2Name, "tenant 2 network awaits periodic recovery")
-
-	require.NoError(t, b.recoverState(ctx))
+	// cadence, so drive its network pass explicitly after both replies. Its
+	// asynchronous initial pass may already have removed either network.
+	cleanupCtx, cancelCleanup := b.recoveryDockerReadContext(ctx)
+	defer cancelCleanup()
+	b.cleanupOrphanedNetworks(cleanupCtx)
 
 	networks, err = docker.ListManagedNetworks(ctx)
 	require.NoError(t, err)
@@ -1285,7 +1279,7 @@ func TestIntegration_EnsureTenantNetwork_ConcurrentRace(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := docker.RemoveTenantNetworkIfEmpty(cleanupCtx, tenant); err != nil {
+		if _, err := docker.RemoveTenantNetworkIfEmpty(cleanupCtx, tenant); err != nil {
 			t.Logf("cleanup: failed to remove test network for tenant %s: %v", tenant, err)
 		}
 	})

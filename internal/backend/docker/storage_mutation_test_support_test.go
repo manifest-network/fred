@@ -191,10 +191,14 @@ func (m *testStorageMutationAdapter) removeContainer(ctx context.Context, id str
 	})
 }
 
-func (m *testStorageMutationAdapter) removeTenantNetwork(ctx context.Context, tenant string) error {
-	return m.perform(ctx, "test remove tenant network", func(ctx context.Context) error {
-		return m.ops.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
+func (m *testStorageMutationAdapter) removeTenantNetwork(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
+	var outcome tenantNetworkRemoval
+	err := m.perform(ctx, "test remove tenant network", func(ctx context.Context) error {
+		var err error
+		outcome, err = m.ops.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
+		return err
 	})
+	return outcome, err
 }
 
 type testVolumeDestroyCapability struct{ adapter *testStorageMutationAdapter }
@@ -280,9 +284,10 @@ func (b *Backend) teardownLeaseContainers(
 }
 
 func (b *Backend) releaseTenantNetwork(ctx context.Context, tenant string) error {
-	return b.removeOrphanedTenantNetworkUsing(
+	_, err := b.removeOrphanedTenantNetworkUsing(
 		ctx, tenant, backgroundTenantNetworkRemove(b.mutationAdapter().removeTenantNetwork),
 	)
+	return err
 }
 
 type testDockerMutationProxy struct{ backend *Backend }
@@ -351,10 +356,10 @@ func (p testDockerMutationProxy) EnsureTenantNetwork(ctx context.Context, tenant
 	return sink.EnsureTenantNetwork(ctx, tenant)
 }
 
-func (p testDockerMutationProxy) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error {
+func (p testDockerMutationProxy) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
 	sink, err := p.sink()
 	if err != nil {
-		return err
+		return tenantNetworkRemovalUnknown, err
 	}
 	return sink.RemoveTenantNetworkIfEmpty(ctx, tenant)
 }

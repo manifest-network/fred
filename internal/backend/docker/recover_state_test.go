@@ -175,7 +175,7 @@ type mockDockerClient struct {
 	StartCompensationOutcomeFn    func(context.Context, string, time.Duration) daemonLaunchOutcome
 	ReadmitCompensationImageFn    func(context.Context, compensationContainerRecord) (imageexec.Image, error)
 	EnsureTenantNetworkFn         func(ctx context.Context, tenant string) (string, error)
-	RemoveTenantNetworkIfEmptyFn  func(ctx context.Context, tenant string) error
+	RemoveTenantNetworkIfEmptyFn  func(ctx context.Context, tenant string) (tenantNetworkRemoval, error)
 	ListManagedNetworksFn         func(ctx context.Context) ([]networktypes.Inspect, error)
 	ResolveImageUserFn            func(ctx context.Context, imageName string, userOverride string) (int, int, error)
 	DetectVolumeOwnerFn           func(ctx context.Context, imageName string, volumePaths []string) (int, int, error)
@@ -301,7 +301,7 @@ func (m *mockDockerClient) EnsureTenantNetwork(ctx context.Context, tenant strin
 	panic("unexpected call to EnsureTenantNetwork")
 }
 
-func (m *mockDockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error {
+func (m *mockDockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
 	if m.RemoveTenantNetworkIfEmptyFn != nil {
 		return m.RemoveTenantNetworkIfEmptyFn(ctx, tenant)
 	}
@@ -610,7 +610,7 @@ func TestRecoverState_PersistedDiagnosticsShareOneAggregateBudget(t *testing.T) 
 	})
 }
 
-func TestRecoverState_BoundsManagedNetworkCleanup(t *testing.T) {
+func TestNetworkCleanup_BoundsManagedNetworkInventory(t *testing.T) {
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
 			return nil, nil
@@ -625,12 +625,14 @@ func TestRecoverState_BoundsManagedNetworkCleanup(t *testing.T) {
 	b.recoveryDockerReadTimeout = 10 * time.Millisecond
 
 	started := time.Now()
-	require.NoError(t, b.recoverState(context.Background()))
+	ctx, cancel := b.recoveryDockerReadContext(b.stopCtx)
+	defer cancel()
+	b.cleanupOrphanedNetworks(ctx)
 	assert.Less(t, time.Since(started), time.Second,
 		"a stalled Docker network inventory must not wedge recovery")
 }
 
-func TestRecoverState_ManagedNetworkCleanupUsesOneAggregateBudget(t *testing.T) {
+func TestNetworkCleanup_UsesOneAggregateBudget(t *testing.T) {
 	var removals atomic.Int32
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
@@ -642,10 +644,10 @@ func TestRecoverState_ManagedNetworkCleanupUsesOneAggregateBudget(t *testing.T) 
 				{Name: "fred-tenant-b", Labels: map[string]string{LabelTenant: "tenant-b"}},
 			}, nil
 		},
-		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, _ string) error {
+		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, _ string) (tenantNetworkRemoval, error) {
 			removals.Add(1)
 			<-ctx.Done()
-			return ctx.Err()
+			return tenantNetworkRemovalUnknown, ctx.Err()
 		},
 	}
 	b := newBackendForTest(mock, nil)
@@ -653,7 +655,9 @@ func TestRecoverState_ManagedNetworkCleanupUsesOneAggregateBudget(t *testing.T) 
 	b.recoveryDockerReadTimeout = 10 * time.Millisecond
 
 	started := time.Now()
-	require.NoError(t, b.recoverState(context.Background()))
+	ctx, cancel := b.recoveryDockerReadContext(b.stopCtx)
+	defer cancel()
+	b.cleanupOrphanedNetworks(ctx)
 	assert.Less(t, time.Since(started), time.Second)
 	assert.Equal(t, int32(1), removals.Load(),
 		"one wedged removal must exhaust the phase budget instead of granting every network a fresh timeout")

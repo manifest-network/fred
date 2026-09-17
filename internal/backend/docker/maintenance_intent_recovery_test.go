@@ -967,7 +967,12 @@ func TestRecoverMaintenanceFailsClosedOnUnreadableOrDivergentTarget(t *testing.T
 			h.inventory.containers = h.containersFor(h.targetRelease, count, "running", HealthStatusNone)
 			test.mutate(h)
 			h.reopen()
-			require.Error(t, h.b.recoverMaintenanceIntents(t.Context()))
+			if test.name == "runtime identity divergent" {
+				require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()),
+					"lease-local identity ambiguity preserves this WAL without blocking sibling recovery")
+			} else {
+				require.Error(t, h.b.recoverMaintenanceIntents(t.Context()))
+			}
 			intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
 			require.NoError(t, err)
 			require.Len(t, intents, 1)

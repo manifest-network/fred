@@ -7,10 +7,13 @@ import (
 	"slices"
 	"time"
 
+	"github.com/docker/docker/errdefs"
+
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 const interruptedMaintenanceFailure = "backend interrupted maintenance before completion"
@@ -236,6 +239,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 	}
 	checkpoint := b.maintenanceRecoveryDeadlines.checkpoint()
 	readinessCheckpoint := b.maintenanceReadinessDeadlines.checkpoint()
+	warningCheckpoint := b.maintenanceReadinessWarnings.checkpoint()
 	intents, err := b.maintenanceSettlement.ListMaintenanceIntents()
 	if err != nil {
 		return fmt.Errorf("list maintenance intents: %w", err)
@@ -249,6 +253,10 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 		_, exists := pending[key.intent]
 		return exists
 	})
+	b.maintenanceReadinessWarnings.retainMatching(warningCheckpoint, func(key maintenanceReadinessObservationKey) bool {
+		_, exists := pending[key.intent]
+		return exists
+	})
 	for _, snapshot := range intents {
 		if snapshot.Backend() != b.Name() || snapshot.BackendStorageID() != b.storageIdentity {
 			return fmt.Errorf(
@@ -257,6 +265,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 			)
 		}
 
+		readinessBranch := "source_only"
 		_, recoveryErr := b.recoveryCoordinator.WithLease(
 			ctx, snapshot.LeaseUUID(),
 			func(recoveryScope shared.LeaseRecoveryScope) error {
@@ -288,6 +297,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 
 				switch {
 				case targetFound && targetRelease.Status == "active":
+					readinessBranch = "committed_target"
 					active, proofErr := b.maintenanceSettlement.ProveMaintenanceActive(intent)
 					if proofErr != nil {
 						return fmt.Errorf("prove committed maintenance target: %w", proofErr)
@@ -344,6 +354,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 					return nil
 
 				case targetFound && (targetRelease.Status == "deploying" || targetRelease.Status == "failed"):
+					readinessBranch = "deploying_target"
 					if verifyErr := b.verifyMaintenanceSourceActive(intent); verifyErr != nil {
 						return verifyErr
 					}
@@ -366,7 +377,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 							ctx, intent, targetRelease, targetContainers,
 						)
 						switch {
-						case errors.Is(readinessErr, errMaintenanceReadinessPending):
+						case maintenanceReadinessIsPending(readinessErr):
 							cohortErr = readinessErr
 						case readinessErr != nil:
 							return fmt.Errorf("maintenance target readiness is indeterminate: %w", readinessErr)
@@ -384,11 +395,12 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 						}
 						ready, ok := physical.(shared.MaintenanceExecutionSuccess)
 						if ambiguous, isAmbiguous := physical.(shared.MaintenanceExecutionAmbiguous); isAmbiguous {
-							if !errors.Is(ambiguous.Cause(), errMaintenanceReadinessPending) {
+							if !maintenanceReadinessIsPending(ambiguous.Cause()) {
 								return fmt.Errorf("maintenance target classification remains ambiguous: %w", ambiguous.Cause())
 							}
 							// A second observation can see a new container or a healthcheck
 							// that resumed starting. Spend the same bounded target window.
+							cohortErr = ambiguous.Cause()
 						} else if !ok {
 							return fmt.Errorf("recovered maintenance target is not exactly Ready (%T)", physical)
 						}
@@ -424,9 +436,13 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 						// therefore observations to retry, not failure authority. Startup
 						// remains bounded because we defer this lease to the level-triggered
 						// recovery loop instead of sleeping out the visibility window.
+						if maintenanceReadinessIsPending(cohortErr) {
+							b.observeMaintenanceReadinessPending(intent, readinessBranch)
+						}
 						return nil
 					}
 
+					readinessBranch = "cleanup_source"
 					var physical shared.MaintenanceExecutionOutcome
 					var cleanupErr error
 					if compensationPending && targetRelease.Status == "deploying" {
@@ -515,12 +531,21 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 				}
 			},
 		)
-		if errors.Is(recoveryErr, errMaintenanceReadinessPending) {
+		readinessPending, deferred := maintenanceRecoveryRetry(recoveryErr)
+		if readinessPending && ctx.Err() == nil {
 			// An expected startup wait grants no settlement or cleanup authority.
 			// Preserve this exact intent, but let startup and sibling leases proceed.
+			b.observeMaintenanceReadinessPending(snapshot, readinessBranch)
 			continue
 		}
 		if recoveryErr != nil {
+			if deferred && ctx.Err() == nil {
+				maintenanceRecoveryDeferredTotal.Inc()
+				b.logger.Warn("maintenance recovery deferred for lease-local observation",
+					"lease_uuid", snapshot.LeaseUUID(), "maintenance_id", snapshot.MaintenanceID().String(),
+					"error", recoveryErr)
+				continue
+			}
 			return fmt.Errorf("recover maintenance for lease %q: %w", snapshot.LeaseUUID(), recoveryErr)
 		}
 	}
@@ -650,8 +675,8 @@ func (b *Backend) convergeMaintenanceFailureWithInfo(
 // window without constructing an actor. Holding actorsMu while updating the
 // provision map follows actor creation's lock order (actorsMu -> provisionsMu)
 // and proves no serial owner can appear between the absence check and the
-// projection rewrite. Cold recovery has no projection and simply returns;
-// ordinary inventory recovery then builds it from the same terminal Release.
+// projection rewrite. Cold recovery publishes the same release-bound projection
+// so ordinary inventory cannot erase the maintenance-authored failure cause.
 func (b *Backend) applyMaintenanceProjectionWithoutActor(
 	intent shared.MaintenanceIntentClaim,
 	release shared.Release,
@@ -682,6 +707,10 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 	if err != nil {
 		return false, fmt.Errorf("parse maintenance projection manifest: %w", err)
 	}
+	quantity, err := backend.ValidateOperationQuantities(release.Items)
+	if err != nil {
+		return false, fmt.Errorf("validate maintenance projection quantities: %w", err)
+	}
 	containerIDs := make([]string, 0, len(containers))
 	serviceContainers := make(map[string][]string)
 	for _, container := range containers {
@@ -704,7 +733,25 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 	defer b.provisionsMu.Unlock()
 	provision := b.provisions[intent.LeaseUUID()]
 	if provision == nil {
-		return false, nil
+		failCount := 0
+		for _, container := range containers {
+			failCount = max(failCount, container.FailCount)
+		}
+		if status == backend.ProvisionStatusFailed {
+			failCount++
+		}
+		recovered := recoveredProvision{ //exhaustruct:enforce
+			ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
+				LeaseUUID: intent.LeaseUUID(), Tenant: authority.Tenant(), ProviderUUID: authority.ProviderUUID(),
+				SKU: release.Items[0].SKU, Quantity: quantity, CreatedAt: release.CreatedAt,
+				Status: status, FailCount: failCount, LastError: "", Reason: "", Message: "",
+				CallbackURL: authority.CallbackURL(), LifecycleCallbackURL: authority.LifecycleCallbackURL(),
+				ActiveReleaseVersion: release.Version, ActiveOperationID: authority.OperationID(),
+				Items: nil, ResourceProfiles: nil, ContainerIDs: nil, StackManifest: nil, ServiceContainers: nil,
+			},
+		}
+		provision = recovered.materialize()
+		b.provisions[intent.LeaseUUID()] = provision
 	}
 	provision.Tenant = authority.Tenant()
 	provision.ProviderUUID = authority.ProviderUUID()
@@ -768,6 +815,67 @@ type maintenanceReadiness uint8
 
 var errMaintenanceReadinessPending = errors.New("maintenance startup verification is pending")
 
+// maintenanceObservationDeferred grants only a lease-local retry. It carries no
+// success, failure, or cleanup authority. Only known observation conflicts may
+// construct it; journal, storage identity, and transport errors remain fatal to
+// the recovery pass instead of being mistaken for one unhealthy workload.
+type maintenanceObservationDeferred struct{ cause error }
+
+func (e *maintenanceObservationDeferred) Error() string { return e.cause.Error() }
+func (e *maintenanceObservationDeferred) Unwrap() error { return e.cause }
+
+func maintenanceReadinessIsPending(err error) bool {
+	pending, _ := maintenanceRecoveryRetry(err)
+	return pending
+}
+
+func missingMaintenanceContainerObservation(err error) bool {
+	if !errdefs.IsNotFound(err) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, backendidentity.ErrIdentityDrift) {
+		return false
+	}
+	// Docker's single NotFound verdict is lease-local. A joined error tree may
+	// also report a transport or authority failure, including under a NotFound
+	// wrapper; preserve that uncertainty as a fatal pass error.
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		if _, joined := current.(interface{ Unwrap() []error }); joined {
+			return false
+		}
+	}
+	return true
+}
+
+// A joined storage/transport error must remain fatal even if another branch
+// contains an expected retry. Wrappers preserve provenance; joins require every
+// constituent to be a known, lease-local observation.
+func maintenanceRecoveryRetry(err error) (readinessPending, deferred bool) {
+	if err == errMaintenanceReadinessPending {
+		return true, true
+	}
+	switch cause := err.(type) { //nolint:errorlint // Inspect each node before recursive unwrap; errors.As would hide fatal siblings in joined errors.
+	case *maintenanceObservationDeferred:
+		return false, true
+	case interface{ Unwrap() []error }:
+		children := cause.Unwrap()
+		if len(children) == 0 {
+			return false, false
+		}
+		pending := true
+		for _, child := range children {
+			childPending, childDeferred := maintenanceRecoveryRetry(child)
+			if !childDeferred {
+				return false, false
+			}
+			pending = pending && childPending
+		}
+		return pending, true
+	case interface{ Unwrap() error }:
+		return maintenanceRecoveryRetry(cause.Unwrap())
+	default:
+		return false, false
+	}
+}
+
 const (
 	maintenanceReadinessReady maintenanceReadiness = iota + 1
 	maintenanceReadinessUnready
@@ -810,6 +918,9 @@ func (b *Backend) classifyRecoveredMaintenanceReadiness(
 
 		inspected, err := b.inspectContainerForRecovery(ctx, container.ContainerID)
 		if err != nil {
+			if missingMaintenanceContainerObservation(err) {
+				return 0, &maintenanceObservationDeferred{cause: fmt.Errorf("maintenance container %q disappeared during readiness inspection: %w", container.ContainerID, err)}
+			}
 			return 0, fmt.Errorf("inspect recovered maintenance target %q: %w", container.ContainerID, err)
 		}
 		if inspected.Status != "running" {
@@ -861,10 +972,10 @@ func maintenanceTargetContainers(
 	lease := make([]ContainerInfo, 0)
 	for _, container := range containers {
 		if container.MaintenanceID == intent.MaintenanceID() && container.LeaseUUID != intent.LeaseUUID() {
-			return nil, nil, fmt.Errorf(
+			return nil, nil, &maintenanceObservationDeferred{cause: fmt.Errorf(
 				"maintenance ID %s is attached to foreign lease %q",
 				intent.MaintenanceID(), container.LeaseUUID,
-			)
+			)}
 		}
 		if container.LeaseUUID != intent.LeaseUUID() {
 			continue
@@ -907,15 +1018,17 @@ func validateMaintenanceGenerationContainer(
 ) error {
 	if container.ContainerID == "" || container.LeaseUUID != leaseUUID ||
 		container.MaintenanceID != maintenanceID || container.BackendName != backendName {
-		return fmt.Errorf("container %q lacks exact maintenance identity", container.ContainerID)
+		return &maintenanceObservationDeferred{cause: fmt.Errorf("container %q lacks exact maintenance identity", container.ContainerID)}
 	}
 	authority, ok := runtimeIdentityForRelease(&target)
-	if !ok ||
-		container.Tenant != authority.Tenant() ||
+	if !ok {
+		return errors.New("maintenance target release has no runtime authority")
+	}
+	if container.Tenant != authority.Tenant() ||
 		container.ProviderUUID != authority.ProviderUUID() ||
 		container.CallbackURL != authority.CallbackURL() ||
 		container.LifecycleCallbackURL != authority.LifecycleCallbackURL() {
-		return fmt.Errorf("container %q diverges from target runtime authority", container.ContainerID)
+		return &maintenanceObservationDeferred{cause: fmt.Errorf("container %q diverges from target runtime authority", container.ContainerID)}
 	}
 	stack, err := manifest.ParsePayload(target.Manifest)
 	if err != nil {
@@ -927,10 +1040,13 @@ func validateMaintenanceGenerationContainer(
 			continue
 		}
 		service := stack.Services[item.ServiceName]
-		if item.CustomDomain != container.CustomDomain || service == nil || service.Image != container.Image {
-			return fmt.Errorf("container %q diverges from target instance authority", container.ContainerID)
+		if service == nil {
+			return fmt.Errorf("maintenance target release service %q is absent from its manifest", item.ServiceName)
+		}
+		if item.CustomDomain != container.CustomDomain || service.Image != container.Image {
+			return &maintenanceObservationDeferred{cause: fmt.Errorf("container %q diverges from target instance authority", container.ContainerID)}
 		}
 		return nil
 	}
-	return fmt.Errorf("container %q is outside the target instance set", container.ContainerID)
+	return &maintenanceObservationDeferred{cause: fmt.Errorf("container %q is outside the target instance set", container.ContainerID)}
 }

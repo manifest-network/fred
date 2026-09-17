@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -58,6 +59,13 @@ func TestContainerEventLoopCloseDeathIsNotDropped(t *testing.T) {
 		},
 	}
 	b, _, logs := newEventDispatchFixture(t, mock)
+	var inspections atomic.Int32
+	daemon := newInstanceInspectionTestDocker(t, func(w http.ResponseWriter, _ *http.Request) {
+		inspections.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"No such container"}`))
+	})
+	b.inspector = &dockerInstanceInspector{docker: projectDockerRead(daemon)}
 	b.compose.(*mockComposeExecutor).DownFn = func(ctx context.Context, _ string, _ time.Duration) error {
 		close(removing)
 		select {
@@ -117,6 +125,7 @@ func TestContainerEventLoopCloseDeathIsNotDropped(t *testing.T) {
 	b.stopCancel()
 	<-loopDone
 	b.wg.Wait()
+	assert.Zero(t, inspections.Load(), "the close-owned death must not inspect or fail the runtime it is removing")
 	assert.NotContains(t, logs.String(), "die event dropped")
 	callbacks, err := b.callbackStore.ListPending()
 	require.NoError(t, err)

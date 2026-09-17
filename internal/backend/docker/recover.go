@@ -1653,8 +1653,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// A cold-start maintenance projection has no live actor-owned state to
 	// preserve. Its exact pending journal, rather than running containers or a
 	// temporarily absent source cohort, owns the transition until recovery proves
-	// the outcome. Keep the durable resource reservation reconstructed above while
-	// withholding both Ready and ordinary runtime-failure observations.
+	// the outcome. Keep the durable resource reservation reconstructed above and
+	// expose the pending maintenance transition instead of a premature Ready.
 	for leaseUUID, generation := range intentGenerations {
 		if generation.class != recoveryMaintenanceIntent || b.provisions[leaseUUID] != nil {
 			continue
@@ -1671,7 +1671,53 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		recovered.Reason = ""
 		recovered.Message = ""
 		delete(cohortIssues, leaseUUID)
-		delete(firstExitedByLease, leaseUUID)
+	}
+
+	// Exact maintenance recovery authored these failure details from its typed
+	// terminal outcome. Keep that cause while this same runtime remains unready;
+	// a healthy complete cohort may still recover to Ready under ENG-414.
+	unreadyMaintenanceLeases := make(map[string]bool)
+	for _, container := range containers {
+		healthPending := false
+		if recovered := building[container.LeaseUUID]; recovered != nil && recovered.StackManifest != nil {
+			if service := recovered.StackManifest.Services[container.ServiceName]; service != nil && service.HasActiveHealthCheck() {
+				healthPending = container.Health != HealthStatusHealthy
+			}
+		}
+		if container.Status != "running" || container.Health == HealthStatusUnhealthy || healthPending {
+			unreadyMaintenanceLeases[container.LeaseUUID] = true
+		}
+	}
+	for leaseUUID, existing := range b.provisions {
+		if existing.Reason != backend.ReasonRestartFailed && existing.Reason != backend.ReasonUpdateFailed {
+			continue
+		}
+		recovered := building[leaseUUID]
+		if recovered == nil || recovered.ActiveReleaseVersion != existing.ActiveReleaseVersion ||
+			recovered.ActiveOperationID != existing.ActiveOperationID {
+			continue
+		}
+		_, divergent := cohortIssues[leaseUUID]
+		if existing.Status == backend.ProvisionStatusReady && recovered.Status == backend.ProvisionStatusReady &&
+			!divergent && !unreadyMaintenanceLeases[leaseUUID] {
+			// A failed replacement may leave the exact source healthy. Its Ready
+			// status does not erase the maintenance failure reported to the tenant.
+			recovered.LastError = existing.LastError
+			recovered.Reason = existing.Reason
+			recovered.Message = existing.Message
+			continue
+		}
+		if existing.Status != backend.ProvisionStatusFailed {
+			continue
+		}
+		if recovered.Status == backend.ProvisionStatusReady && !divergent && !unreadyMaintenanceLeases[leaseUUID] {
+			continue
+		}
+		recovered.Status = backend.ProvisionStatusFailed
+		recovered.LastError = existing.LastError
+		recovered.Reason = existing.Reason
+		recovered.Message = existing.Message
+		delete(cohortIssues, leaseUUID)
 	}
 
 	const incompleteCohortMessage = leasesm.ErrMsgCohortDiverged
@@ -2216,12 +2262,29 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	}
 	b.logger.Info("state recovered", logAttrs...)
 
-	// Clean up orphaned tenant networks if network isolation is enabled
-	if b.cfg.IsNetworkIsolation() {
-		b.cleanupOrphanedNetworks(ctx)
-	}
-
 	return nil
+}
+
+// networkCleanupLoop owns one serial fleet sweep independently of state and
+// operation recovery. It starts after successful startup recovery and gives
+// each pass a fresh, bounded backend-lifetime context. A slow orphan backlog
+// therefore cannot consume the periodic reconciler's operation recovery budget.
+func (b *Backend) networkCleanupLoop() {
+	ticker := time.NewTicker(b.cfg.ReconcileInterval)
+	defer ticker.Stop()
+
+	for b.stopCtx.Err() == nil {
+		func() {
+			ctx, cancel := b.recoveryDockerReadContext(b.stopCtx)
+			defer cancel()
+			b.cleanupOrphanedNetworks(ctx)
+		}()
+		select {
+		case <-b.stopCtx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // cleanupOrphanedNetworksUsing removes managed networks whose tenant has no
@@ -2232,31 +2295,67 @@ func (b *Backend) cleanupOrphanedNetworksUsing(
 	ctx context.Context,
 	removeNetwork backgroundTenantNetworkRemove,
 ) {
-	if removeNetwork == nil {
+	if removeNetwork == nil || ctx.Err() != nil {
 		return
 	}
-	phaseCtx, cancelPhase := b.recoveryDockerReadContext(ctx)
-	defer cancelPhase()
-	networks, err := b.docker.ListManagedNetworks(phaseCtx)
+	// The caller owns this pass's budget; never borrow the recovery tick's
+	// context or renew a deadline for individual candidates.
+	networks, err := b.docker.ListManagedNetworks(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			b.observeNetworkCleanupInterruption(ctx)
+			return
+		}
+		networkReclamationTotal.WithLabelValues("list_error").Inc()
 		b.logger.Warn("failed to list managed networks for cleanup", "error", err)
+		return
+	}
+	if ctx.Err() != nil {
+		b.observeNetworkCleanupInterruption(ctx)
 		return
 	}
 
 	for _, n := range networks {
-		if phaseCtx.Err() != nil {
-			b.logger.Warn("managed network cleanup budget exhausted", "error", phaseCtx.Err())
+		if ctx.Err() != nil {
+			b.observeNetworkCleanupInterruption(ctx)
 			return
 		}
 		tenant := n.Labels[LabelTenant]
 		if tenant != "" && len(n.Containers) == 0 {
-			err := b.removeOrphanedTenantNetworkUsing(phaseCtx, tenant, removeNetwork)
+			outcome, err := b.removeOrphanedTenantNetworkUsing(ctx, tenant, removeNetwork)
 			if err != nil {
+				if ctx.Err() != nil {
+					b.observeNetworkCleanupInterruption(ctx)
+					return
+				}
+				networkReclamationTotal.WithLabelValues("error").Inc()
 				b.logger.Warn("failed to remove orphaned network", "network", n.Name, "error", err)
-			} else {
+				continue
+			}
+			switch outcome {
+			case tenantNetworkRemoved:
+				networkReclamationTotal.WithLabelValues("removed").Inc()
 				b.logger.Info("removed orphaned tenant network", "network", n.Name, "tenant", tenant)
+			case tenantNetworkAbsent:
+				networkReclamationTotal.WithLabelValues("absent").Inc()
+			case tenantNetworkInUse:
+				networkReclamationTotal.WithLabelValues("in_use").Inc()
+			case tenantNetworkOwned:
+				networkReclamationTotal.WithLabelValues("tenant_active").Inc()
+			case tenantNetworkBusy:
+				networkReclamationTotal.WithLabelValues("tenant_busy").Inc()
+			default:
+				networkReclamationTotal.WithLabelValues("error").Inc()
+				b.logger.Warn("unknown tenant network removal outcome", "network", n.Name)
 			}
 		}
+	}
+}
+
+func (b *Backend) observeNetworkCleanupInterruption(ctx context.Context) {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) && b.stopCtx.Err() == nil {
+		networkReclamationTotal.WithLabelValues("budget_exhausted").Inc()
+		b.logger.Warn("managed network cleanup budget exhausted", "error", ctx.Err())
 	}
 }
 

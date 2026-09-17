@@ -58,7 +58,7 @@ type dockerMutationSink interface {
 	StopContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	RemoveContainer(ctx context.Context, containerID string) error
 	EnsureTenantNetwork(ctx context.Context, tenant string) (string, error)
-	RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error
+	RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (tenantNetworkRemoval, error)
 	DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string, origin shared.ImageInspectionOrigin) (uid, gid int, err error)
 	DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string, origin shared.ImageInspectionOrigin) ([]string, error)
 	ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64, origin shared.ImageInspectionOrigin) map[string]error
@@ -283,6 +283,7 @@ type Backend struct {
 	operationRecoveryDeadlines    recoveryDeadlines[operationIntentKey]
 	maintenanceRecoveryDeadlines  recoveryDeadlines[maintenanceIntentKey]
 	maintenanceReadinessDeadlines recoveryDeadlines[maintenanceReadinessKey]
+	maintenanceReadinessWarnings  recoveryDeadlines[maintenanceReadinessObservationKey]
 	// releaseCapacityPlanner is explicitly wired to releaseStore in production.
 	// Tests may provide the narrower capability to pin definitive refusal before
 	// any Docker/volume mutation without changing the production 32 MiB contract.
@@ -2604,6 +2605,9 @@ func (b *Backend) Start(ctx context.Context) error {
 
 	// Start periodic reconciliation (using WaitGroup.Go for Go 1.25+)
 	b.wg.Go(b.reconcileLoop)
+	if b.cfg.IsNetworkIsolation() {
+		b.wg.Go(b.networkCleanupLoop)
+	}
 
 	// Start real-time container event listener for instant crash detection.
 	// reconcileLoop stays as safety net for missed events.

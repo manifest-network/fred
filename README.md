@@ -700,7 +700,8 @@ Returns provision diagnostics for a lease, including status, failure reason, and
 - `fail_count` - Number of provision attempts that failed
 - `reason` - Stable, machine-readable failure category, always present when `status` is `failed` (defaults to `Unknown` if no specific cause was recorded); see [Failure Reason Codes](#failure-reason-codes)
 - `message` - Curated, human-readable failure summary; may be empty
-- `retained_until`, `items`, `restore_hint` - Present only when `status` is `retained` (grace-window deadline, restore shape, and next-step hint); see [Get Lease Status](#get-lease-status)
+- `items`, `restore_hint` - Present only when `status` is `retained` (restore shape and next-step hint); see [Get Lease Status](#get-lease-status)
+- `retained_until` - RFC3339 retention deadline for retained data with a configured age limit. Omitted when age-based expiry is disabled; other retention policy and capacity limits still apply.
 
 **Response Codes:**
 - `200 OK` - Provision found

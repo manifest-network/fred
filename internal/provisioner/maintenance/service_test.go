@@ -1,18 +1,22 @@
 package maintenance
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
@@ -1699,6 +1703,56 @@ func TestStartRecoversImmediatelyAndKeepsBackendOutageNonfatal(t *testing.T) {
 	}
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestStartCancellationDoesNotWarnAboutIncompleteRecovery(t *testing.T) {
+	store, _ := newPlacementAuthority(t, testLeaseA)
+	var calls atomic.Int32
+	service := newTestService(t, store, &fakeBackend{restart: func(backend.RestartRequest) error {
+		calls.Add(1)
+		return errors.New("backend reply unavailable")
+	}}, nil, testLeaseA)
+	require.Equal(t, OutcomeServiceUnavailable, service.Execute(t.Context(), Command{
+		ID: requestID(t, testRequestA), LeaseUUID: testLeaseA, Tenant: testTenant, Kind: KindRestart,
+	}).Outcome())
+
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, service.Start(ctx, time.Hour), context.Canceled)
+	assert.Equal(t, int32(1), calls.Load(), "canceled recovery cannot replay the retained command")
+	assert.NotContains(t, logs.String(), "pending maintenance recovery pass incomplete")
+}
+
+func TestStartPeriodicCancellationDoesNotWarnAboutIncompleteRecovery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store, _ := newPlacementAuthority(t, testLeaseA)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var calls atomic.Int32
+		service := newTestService(t, store, &fakeBackend{restart: func(backend.RestartRequest) error {
+			if calls.Add(1) == 3 {
+				cancel()
+				return context.Canceled
+			}
+			return errors.New("backend reply unavailable")
+		}}, nil, testLeaseA)
+		require.Equal(t, OutcomeServiceUnavailable, service.Execute(t.Context(), Command{
+			ID: requestID(t, testRequestA), LeaseUUID: testLeaseA, Tenant: testTenant, Kind: KindRestart,
+		}).Outcome())
+
+		var logs bytes.Buffer
+		previous := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+		defer slog.SetDefault(previous)
+		require.ErrorIs(t, service.Start(ctx, time.Second), context.Canceled)
+		assert.Equal(t, int32(3), calls.Load(), "the initial pass and first tick each retry once")
+		assert.Equal(t, 1, strings.Count(logs.String(), "pending maintenance recovery pass incomplete"),
+			"only the initial live-context backend outage should warn; cancellation during the tick should not")
+	})
 }
 
 func TestFirstDispatchRepeatsChainAuthorizationAfterDurableAdmission(t *testing.T) {

@@ -245,6 +245,27 @@ var (
 		Help:      "Total failures accessing durable callback evidence, including interrupted-operation recovery.",
 	})
 
+	// These are attempts, not distinct leases; labels describe a closed set of
+	// recovery branches or reclamation results rather than tenant identities.
+	maintenanceRecoveryDeferredTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "maintenance_recovery_deferred_total",
+		Help:      "Maintenance recovery attempts deferred by lease-local observation conflicts while retaining exact intent authority",
+	})
+	maintenanceReadinessPendingTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "maintenance_readiness_pending_total",
+		Help:      "Maintenance recovery readiness deferrals by bounded recovery branch; retries are counted again",
+	}, []string{"branch"})
+	networkReclamationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "network_reclamation_total",
+		Help:      "Tenant-network reclamation outcomes: removed, absent, in_use, tenant_active, tenant_busy, error, list_error, or budget_exhausted",
+	}, []string{"outcome"})
+
 	// operationIntentRecoveryTimeoutExhaustionsTotal distinguishes a bounded cold-
 	// recovery decision from an ordinary live worker failure. The failed callback
 	// and teardown remain the outcome authority; this counter records the timeout
@@ -988,6 +1009,12 @@ var restoreOutcomes = []string{"success", "failure"}
 var quotaBackfillOutcomes = []string{"applied", "failed"}
 
 func init() {
+	for _, branch := range []string{"committed_target", "deploying_target", "cleanup_source", "source_only"} {
+		maintenanceReadinessPendingTotal.WithLabelValues(branch).Add(0)
+	}
+	for _, outcome := range []string{"removed", "absent", "in_use", "tenant_active", "tenant_busy", "error", "list_error", "budget_exhausted"} {
+		networkReclamationTotal.WithLabelValues(outcome).Add(0)
+	}
 	for _, receipt := range []terminalReceiptKind{terminalReceiptClosed, terminalReceiptFailed} {
 		terminalSubstratePendingContainers.WithLabelValues(string(receipt)).Set(0)
 		terminalSubstrateCleanupRetriesTotal.WithLabelValues(string(receipt)).Add(0)

@@ -68,6 +68,9 @@ type dockerInstanceInspector struct {
 
 // InspectInstance implements leasesm.InstanceInspector.
 func (a *dockerInstanceInspector) InspectInstance(ctx context.Context, instanceID string) (*leasesm.InstanceState, error) {
+	if inspect := concreteInstanceInspection(a.docker); inspect != nil {
+		return inspect(ctx, instanceID)
+	}
 	info, err := a.docker.InspectContainer(ctx, instanceID)
 	if err != nil {
 		return nil, err

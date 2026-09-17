@@ -353,6 +353,9 @@ func (b *Backend) classifyMaintenancePhysical(
 		if readiness == maintenanceReadinessReady {
 			return shared.NewMaintenanceSourceReady(subject, ids, services)
 		}
+		if subject.RecoveryCleanup() {
+			return shared.NewMaintenanceCleanupSourceFailed(subject, ids, services)
+		}
 		return shared.MaintenancePhysicalEvidence{}, errors.New("maintenance source cohort is not ready")
 	}
 	return shared.NewMaintenanceTargetDivergent(subject, ids, services)

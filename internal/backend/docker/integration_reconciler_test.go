@@ -1512,6 +1512,11 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 			}
 			return lostResponseBackend
 		},
+		func(cfg *Config) {
+			// This scenario must observe forced removal through Docker events.
+			// Periodic recovery cannot rescue a lost die→inspect race.
+			cfg.ReconcileInterval = time.Hour
+		},
 	)
 	ctx := context.Background()
 
@@ -1658,15 +1663,21 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 	require.NotEmpty(t, containers)
 	requireProvisionContainerImage(t, containers[0], updatedImage)
 
-	// --- the reboot: lose the container, let the reconciler bring it back ---
-	killContainer(t, containers[0].ID)
+	// Lose the updated container entirely, then let the reconciler bring it
+	// back. The independent Docker client performs the equivalent of rm -f;
+	// the die event may reach inspection only after the container is gone.
+	externalDocker, err := NewDockerClient(t.Context(), "", "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = externalDocker.Close() })
+	require.NoError(t, externalDocker.RemoveContainer(ctx, containers[0].ID))
 	waitForProvisionStatus(t, env.backend, leaseUUID, backend.ProvisionStatusFailed, 30*time.Second)
 
 	select {
 	case cb := <-env.callbackCh:
+		assert.Equal(t, leaseUUID, cb.LeaseUUID)
 		assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
 	case <-time.After(10 * time.Second):
-		// recoverState may have already fired it; continue
+		t.Fatal("forced removal must publish the event-driven failure before reconciliation")
 	}
 
 	require.NoError(t, env.reconciler.RunOnce(ctx))
