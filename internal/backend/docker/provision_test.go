@@ -1524,6 +1524,11 @@ func TestDeprovision_WithNetworkIsolation(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, networkCleanupCalled, "close completion must not run fleet network cleanup")
 	require.NoError(t, b.recoverState(context.Background()))
+	assert.False(t, networkCleanupCalled, "state recovery must not run fleet network cleanup")
+
+	ctx, cancel := b.recoveryDockerReadContext(t.Context())
+	defer cancel()
+	b.cleanupOrphanedNetworks(ctx)
 	assert.True(t, networkCleanupCalled)
 }
 
