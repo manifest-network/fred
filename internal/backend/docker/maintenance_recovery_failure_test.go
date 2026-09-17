@@ -215,6 +215,7 @@ func TestMaintenanceReadinessBranchDeferrals(t *testing.T) {
 				var logs bytes.Buffer
 				h.b.logger = slog.New(slog.NewTextHandler(&logs, nil))
 				before := testutil.ToFloat64(maintenanceReadinessPendingTotal.WithLabelValues(branch))
+				beforeDeferred := testutil.ToFloat64(maintenanceRecoveryDeferredTotal)
 				for range 2 {
 					require.NoError(t, h.b.recoverState(t.Context()))
 					pending, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
@@ -226,6 +227,8 @@ func TestMaintenanceReadinessBranchDeferrals(t *testing.T) {
 					require.Empty(t, h.inventory.removed)
 				}
 				assert.Equal(t, before+2, testutil.ToFloat64(maintenanceReadinessPendingTotal.WithLabelValues(branch)))
+				assert.Equal(t, beforeDeferred, testutil.ToFloat64(maintenanceRecoveryDeferredTotal),
+					"expected readiness waits must not fall through to observation-conflict handling")
 				assert.Equal(t, 1, strings.Count(logs.String(), "maintenance recovery is waiting for readiness evidence"))
 				assert.Contains(t, logs.String(), "branch="+branch)
 				time.Sleep(5 * time.Second)
