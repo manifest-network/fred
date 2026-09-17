@@ -279,7 +279,7 @@ func configureEmptyPlacement(
 	require.NoError(t, err)
 	disposition, err := sweep.RecordBackendInventory(provisionReceipt, retentionReceipt)
 	require.NoError(t, err)
-	require.Equal(t, placement.BackendInventoryAuthoritative, disposition)
+	require.Equal(t, placement.BackendInventoryAuthoritative, disposition.Disposition())
 	require.NoError(t, sweep.SealInventory())
 	_, err = sweep.Project(placement.ReconciliationProjection{})
 	require.NoError(t, err)

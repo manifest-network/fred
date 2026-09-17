@@ -382,7 +382,7 @@ func projectMaintenanceSeed(
 			provisionReceipt, retentionReceipt,
 		)
 		require.NoError(t, collectErr)
-		require.Equal(t, placement.BackendInventoryAuthoritative, disposition)
+		require.Equal(t, placement.BackendInventoryAuthoritative, disposition.Disposition())
 	}
 	require.NoError(t, sweep.SealInventory())
 	_, err = sweep.Project(placement.ReconciliationProjection{Placements: placements})

@@ -1750,7 +1750,7 @@ func projectRepairInventoryWithRows(
 			provisionReceipt, retentionReceipt,
 		)
 		require.NoError(t, collectErr)
-		require.Equal(t, wantDisposition, disposition)
+		require.Equal(t, wantDisposition, disposition.Disposition())
 	}
 	require.NoError(t, sweep.SealInventory())
 	result, err := sweep.Project(placement.ReconciliationProjection{

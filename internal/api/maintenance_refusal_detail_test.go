@@ -139,7 +139,7 @@ func TestMaintenanceLeaseReturnsCuratedBackendRefusalDetailAndReplaysReceipt(t *
 			require.NoError(t, err)
 			disposition, err := sweep.RecordBackendInventory(provisions, retentions)
 			require.NoError(t, err)
-			require.Equal(t, placement.BackendInventoryAuthoritative, disposition)
+			require.Equal(t, placement.BackendInventoryAuthoritative, disposition.Disposition())
 			require.NoError(t, sweep.SealInventory())
 			_, err = sweep.Project(placement.ReconciliationProjection{Placements: map[string]string{leaseUUID: backendName}})
 			require.NoError(t, err)

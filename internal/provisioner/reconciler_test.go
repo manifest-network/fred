@@ -7331,7 +7331,7 @@ func cleanupPruneEvidence(
 				provisionReceipt, retentionReceipt,
 			)
 			require.NoError(t, collectErr)
-			require.Equal(t, placement.BackendInventoryAuthoritative, disposition)
+			require.Equal(t, placement.BackendInventoryAuthoritative, disposition.Disposition())
 		} else if provisionAnswered {
 			receipt, collectErr := sweep.CollectProvisionInventory(t.Context(), backendName)
 			require.NoError(t, collectErr)
