@@ -180,8 +180,10 @@ func (b *Backend) tryResolveMaintenanceFailure(
 }
 
 // settleMaintenanceBeforeClose prevents BeginCloseIntent from classifying an
-// already-committed target as preempted failure. The command fence serializes
-// this cross-store classification with new maintenance admission.
+// already-committed target as preempted failure. The command fence and drained
+// actor serialize this classification with maintenance execution. Uncommitted
+// work, including Started work with uncertain physical effects, belongs to the
+// exact close handoff rather than to pre-effect maintenance refusal.
 func (b *Backend) settleMaintenanceBeforeClose(leaseUUID string) error {
 	if b.callbackStore == nil || b.releaseStore == nil {
 		return nil
@@ -209,20 +211,12 @@ func (b *Backend) settleMaintenanceBeforeClose(leaseUUID string) error {
 			}
 			return b.resolveMaintenanceSuccess(active)
 		}
-		if release.Status == "deploying" {
-			refused, refuseErr := b.maintenanceSettlement.RefuseMaintenanceExecution(target)
-			if refuseErr != nil {
-				return fmt.Errorf("preempted maintenance has crossed its physical boundary: %w", refuseErr)
-			}
-			if _, err := b.maintenanceSettlement.FailMaintenance(
-				refused, replaceOpReason(string(intent.Kind())), string(intent.Kind())+" failed",
-			); err != nil {
-				return fmt.Errorf("fail preempted maintenance release: %w", err)
-			}
-		}
 	}
-	// Failed or never-appended work is converted atomically by BeginCloseIntent,
-	// preserving its FIFO position ahead of deprovision completion.
+	// BeginClose atomically replaces unresolved maintenance with a source-fenced
+	// close intent and its exact failed maintenance receipt. Physical uncertainty
+	// remains owned by that close intent until the close executor proves cleanup;
+	// only then is the source history, including any deploying target, retired.
+	// The maintenance callback keeps its FIFO position ahead of close completion.
 	return nil
 }
 

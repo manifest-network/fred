@@ -45,6 +45,18 @@
 // positive confirms its attempted owner only when an active upgraded backend
 // reports the same paired typed lifecycle generation. Older/unknown generations
 // preserve the attempt; retention-only evidence carries no lifecycle authority.
+// A lease reported by both sequential endpoints is sealed exclusively as
+// untrusted positive membership. It cannot issue lifecycle or absence evidence,
+// while validated sibling rows keep their authority. Such a sweep is incomplete
+// and cannot establish a new AdmissionBaseline; excluded ambiguous membership
+// retains its durable pending marker until safely represented or resolved.
+// A later sole-reporter proof may resolve only a single known-candidate
+// untrusted quarantine. It accounts for that exact lease across all paired,
+// identity-valid backend endpoints, independently of other leases' ambiguity;
+// it grants no attempt settlement or historical multi-owner conflict repair.
+// A separate paired-topology proof can discharge inherited pending-sweep
+// fencing after every positive is durably represented. It requires all existing
+// storage pins and grants no new baseline, storage identity, or drain evidence.
 // A contradictory positive is unioned with all owners and attempts into durable
 // conflict quarantine. Inventory
 // silence, complete or partial, never clears an attempt or conflict because an

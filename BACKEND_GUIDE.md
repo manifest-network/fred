@@ -1271,6 +1271,11 @@ it atomically with admission. Do not age operation rows or active intents out. T
 database, its delivery queues, release evidence, and intent journals as one
 backup and rollback unit.
 
+A replacement that has already started physical execution may hand off to the
+durable close transaction after its worker is canceled and drained. It does not
+need a pre-effect refusal. Keep its exact interrupted identity, cleanup authority,
+callback order, and any unresolved physical-effect fences through that handoff.
+
 Restore recovery needs one further distinction. A durable source claim without
 an exact destination commit marker remains rollback authority; never make its
 target restartable while that claim owns the namespace. An exact matching commit

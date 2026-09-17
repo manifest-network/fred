@@ -145,7 +145,10 @@ func (r *Reconciler) projectPlacementInventory(
 			return false
 		}
 		if p.Conflict {
-			if inventoryComplete && p.CanResolveUntrustedPositive(backendName) {
+			if p.CanResolveUntrustedPositive(backendName) {
+				// Submit the fresh same-candidate observation even when a peer
+				// failed. Store alone decides whether its sealed evidence can
+				// resolve the quarantine or must preserve it unchanged.
 				return true
 			}
 			// Positive evidence can enlarge or reaffirm a conflict, but inventory
@@ -179,7 +182,7 @@ func (r *Reconciler) projectPlacementInventory(
 			placements[leaseUUID] = provision.BackendName
 		}
 	}
-	// Retained leases pin their backend too — but only on a COMPLETE sweep.
+	// Retained leases establish new backend affinity only on a COMPLETE sweep.
 	//
 	// A retention proves a past deprovision on that backend, not present
 	// ownership. This map is persisted before the per-lease loop reads it back,
@@ -191,20 +194,26 @@ func (r *Reconciler) projectPlacementInventory(
 	// snapshot. The Store reaffirms an existing confirmed owner on the same
 	// backend, while new or contradictory affinity becomes a lease-local durable
 	// quarantine. The reconciler cannot omit that fact or promote a new owner.
-	if inventoryComplete {
-		// Active provisions take precedence if a stale retention races a fresh
-		// provision.
-		for leaseUUID, backendName := range allRetentions {
-			if _, ambiguous := projectionConflicts[leaseUUID]; ambiguous {
+	// A partial global sweep can additionally restore an already-known sole
+	// retention owner if Store can derive complete evidence for this lease.
+	// Otherwise the observation only preserves the existing quarantine. This
+	// does not establish new retention affinity or grant lifecycle evidence.
+	for leaseUUID, backendName := range allRetentions {
+		if _, ambiguous := projectionConflicts[leaseUUID]; ambiguous {
+			continue
+		}
+		if _, isActive := placements[leaseUUID]; isActive {
+			continue
+		}
+		if !inventoryComplete {
+			existing := input.sweep.InitialRecord(leaseUUID)
+			if existing.Backend != backendName ||
+				!existing.CanResolveUntrustedPositive(backendName) {
 				continue
 			}
-			if _, isActive := placements[leaseUUID]; isActive {
-				continue
-			}
-			if acceptObservation(leaseUUID, backendName,
-				retentionsAnswered.heard(backendName)) {
-				placements[leaseUUID] = backendName
-			}
+		}
+		if acceptObservation(leaseUUID, backendName, retentionsAnswered.heard(backendName)) {
+			placements[leaseUUID] = backendName
 		}
 	}
 

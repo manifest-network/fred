@@ -398,8 +398,10 @@ Reconciler interplay (level-triggered backstop):
   Rejected inventory payloads do not become ownership authority, but neither may
   their positive membership disappear into apparent absence. Fred persists those
   candidates as `untrusted_positive` quarantine across restart. Only a sole
-  candidate observed again on the same backend by a later complete,
-  identity-valid projection can self-resolve; every other quarantine requires
+  candidate observed again on the same backend can self-resolve through a
+  collector-issued proof covering that exact lease across every identity-valid
+  paired backend response. Unrelated leases may remain ambiguous; a missing peer
+  or ambiguity about this lease prevents the proof. Other quarantines require
   causal operator proof and offline repair.
   The placement Store privately creates a Registry and consumes its one-shot
   settlement authority into one exact `OperationCoordinator`; production never
@@ -427,16 +429,21 @@ Reconciler interplay (level-triggered backstop):
   returned only as an opaque, exact-sweep, one-shot receipt after its positive
   lease observations have installed Store-owned barriers. Provision and
   retention receipts for one backend are consumed together; identity,
-  refresh, and cross-endpoint checks decide the closed authoritative/untrusted
-  variant inside the sweep. An unmatched receipt can only be rejected as
+  refresh, and cross-endpoint checks decide the closed authoritative, partial,
+  or untrusted variant inside the sweep. Overlapping leases in a partial result
+  retain only untrusted membership; sibling rows keep their validated evidence.
+  An unmatched receipt can only be rejected as
   untrusted, and outstanding receipts make sealing impossible. A successful
   semantic projection clears the exact marker atomically; an orderly, sealed,
   zero-positive `End` may also clear it. If a
   restart inherits the marker, a lost positive might name a different owner, a
-  retained copy, or unusable identity evidence. Partial inventory then remains
-  observational but cannot mint fresh provision, restore, maintenance,
-  chain-write, prune, or backend-cleanup authority until a complete fleet
-  projection resolves the uncertainty. Exact durable callback, attempt, and
+  retained copy, or unusable identity evidence. Missing or rejected endpoint
+  coverage then prevents fresh provision, restore, maintenance, chain-write,
+  prune, or backend-cleanup authority. A sealed full-topology pair matching every
+  existing storage pin can clear inherited fencing after the projection durably
+  represents every positive, including quarantines. That narrower coverage proof
+  does not establish a new baseline, adopt storage identities, or prove a backend
+  empty. Exact durable callback, attempt, and
   maintenance-command recovery remains available because it replays recorded
   authority rather than inferring new authority from absence.
   Projected actions are also bound to the Store inventory epoch. Beginning a
@@ -1582,13 +1589,17 @@ Tracks which backend serves each lease (bbolt + in-memory cache):
   report confirms attempted ownership only with the exact paired typed
   lifecycle generation; contradictory positives are
   unioned with every prior owner/attempt into durable conflict quarantine.
-  A response rejected for contradictory provision/retention membership,
-  missing or inconsistent endpoint storage identity, or conflict with a durable
-  storage-identity pin still contributes its raw positive membership to a
-  distinct `untrusted_positive` quarantine. A sole candidate of that exact kind
-  may self-resolve only from a later complete, identity-valid matching positive
-  from the same backend. Partial inventory, silence, a different or second
-  reporter, unknown ownership, and ordinary conflicts cannot resolve it.
+  Overlap between sequential provision/retention reads rejects only that lease;
+  malformed responses, missing or inconsistent endpoint storage identity, and
+  conflicts with a durable storage-identity pin reject the backend response.
+  Raw positive membership survives as distinct `untrusted_positive` quarantine.
+  A sole candidate of that exact kind may self-resolve from a later sealed
+  full-topology observation for that lease: identity-valid paired endpoints on
+  every backend, the same sole trusted reporter, and peer absence. Other leases'
+  ambiguity does not revoke that proof. Missing peers, ambiguity for this lease,
+  silence, a different or second reporter, unknown ownership, and ordinary
+  conflicts cannot resolve it. Global completeness still gates a new admission
+  baseline and empty-backend evidence.
   Inventory absence never clears an attempt or operator-only quarantine, even
   after every backend answers
 - Stores the immutable backend-identity history and the topology-bound admission

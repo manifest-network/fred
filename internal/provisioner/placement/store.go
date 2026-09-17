@@ -929,8 +929,8 @@ func (p Placement) State() State {
 
 // CanResolveUntrustedPositive reports whether a later authoritative positive
 // from backendName is the sole fact needed to replace a rejected-observation
-// quarantine. The caller must additionally prove that its inventory is complete
-// and identity-valid; this value alone grants no mutation authority.
+// quarantine. The caller must additionally prove complete, identity-valid
+// evidence for this lease; this value alone grants no mutation authority.
 func (p Placement) CanResolveUntrustedPositive(backendName string) bool {
 	return backendName != "" && p.Conflict && p.untrustedPositive &&
 		!p.ConflictOwnersUnknown && len(p.ConflictBackends) == 1 &&
@@ -2923,6 +2923,11 @@ func (s *Store) projectInventory(
 	mutations := make(map[string]projectionMutation, len(keys))
 	lifecycleMutations := make(map[string]projectionLifecycleMutation, len(keys))
 	for _, leaseUUID := range keys {
+		if _, excluded := projection.causalExclusions[leaseUUID]; excluded &&
+			projection.Placements[leaseUUID] != "" {
+			result.markFenced(leaseUUID)
+			continue
+		}
 		if _, pending := pendingMaintenance[leaseUUID]; pending {
 			result.markFenced(leaseUUID)
 			continue
@@ -2962,11 +2967,18 @@ func (s *Store) projectInventory(
 		case projection.Placements[leaseUUID] != "":
 			backendName := projection.Placements[leaseUUID]
 			if exists && existing.Conflict &&
-				(!projection.complete || !existing.CanResolveUntrustedPositive(backendName)) {
+				!s.canResolveInventoryQuarantineLocked(projection, leaseUUID, existing, backendName) {
 				// Inventory is not an operator conflict-resolution capability. Preserve
 				// and enlarge an ordinary or multi-candidate quarantine rather than
 				// allowing one later positive to erase historical evidence.
-				candidate = projectConflict(existing, exists, []string{backendName}, now)
+				if existing.CanResolveUntrustedPositive(backendName) {
+					// The fresh reporter is already represented by this exact
+					// quarantine, but coverage may be insufficient to resolve it.
+					// Preserve its provenance for a later complete observation.
+					candidate = existing
+				} else {
+					candidate = projectConflict(existing, exists, []string{backendName}, now)
+				}
 			} else {
 				candidate = projectPositivePlacement(existing, exists, backendName, now)
 				acceptedPositive = true
@@ -3113,11 +3125,14 @@ func (s *Store) projectInventory(
 		nextMetadata.InventoryTopologyID = s.topologyID
 		nextMetadata.EmptyInventoryBackends = slices.Clone(projection.emptyBackends)
 	}
-	if (!s.inventoryRecoveryRequired || projection.complete) && !unresolvedPositive {
+	recoveryCovered := projection.complete || (!unresolvedPositive &&
+		s.pairedTopologyObservationLocked(projection.AbsenceEvidence).ValidFor(s.inventoryEvidence))
+	if (!s.inventoryRecoveryRequired || recoveryCovered) && !unresolvedPositive {
 		// Clear only this exact live sweep. When an earlier sweep was abandoned,
-		// an incomplete view cannot prove that its unreported backends do not hold
-		// an unrepresented positive. Routine exact-generation fencing is already
-		// discharged above and does not penalize unrelated leases.
+		// missing or mismatched endpoints cannot account for lost observations.
+		// Paired topology coverage can recover the marker despite lease-local
+		// ambiguity only after every current positive is durably represented.
+		// This does not establish a baseline or grant drain/absence authority.
 		nextMetadata.PendingInventorySweepID = 0
 	}
 	if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
@@ -3172,7 +3187,7 @@ func (s *Store) projectInventory(
 	}
 	s.inventoryRecoveryRequired = nextMetadata.PendingInventorySweepID != 0
 	s.clearInventoryPositiveBarriersLocked(
-		fence.sweepID, projection.complete, unresolvedPositives,
+		fence.sweepID, recoveryCovered, unresolvedPositives,
 	)
 	s.currentInventoryProjection = &inventoryProjectionMarker{}
 	s.mintPruneAbsenceProofsLocked(&result, fence, projection, pendingMaintenance)
@@ -3379,21 +3394,22 @@ func (s *Store) trustedProvisionDurablyRepresentedLocked(
 }
 
 // clearInventoryPositiveBarriersLocked retires only lease/backend facts that
-// the Store can now prove durable. A complete successful projection may also
-// retire older facts that every backend now authoritatively reports absent.
+// the Store can now prove durable. A successful projection with attested
+// whole-topology coverage may also retire older facts, after all observed
+// positives are durably represented.
 // Semantically unresolved exclusions remain installed; redundant accepted
 // observations do not penalize unrelated leases.
 // Caller holds s.mu and invokes this only after the corresponding metadata
 // transaction commits.
 func (s *Store) clearInventoryPositiveBarriersLocked(
 	sweepID uint64,
-	complete bool,
+	coversPriorSweeps bool,
 	unresolved map[string]struct{},
 ) {
 	for leaseUUID, boundaries := range s.unprojectedPositives {
 		_, leaseUnresolved := unresolved[leaseUUID]
 		for boundaryID := range boundaries {
-			if boundaryID != sweepID && !complete {
+			if boundaryID != sweepID && !coversPriorSweeps {
 				continue
 			}
 			if !leaseUnresolved {
@@ -3703,6 +3719,52 @@ func projectConflict(
 		attemptRequestSnapshot:        existing.attemptRequestSnapshot,
 		attemptCallbackPair:           existing.attemptCallbackPair,
 	}
+}
+
+// pairedTopologyObservationLocked binds full endpoint coverage to every
+// existing physical storage identity. Partial sweeps cannot adopt an unbound
+// identity, even when the endpoint headers agree with each other.
+// Caller holds s.mu.
+func (s *Store) pairedTopologyObservationLocked(snapshot inventory.Snapshot) inventory.PairedTopologyObservation {
+	identities := snapshot.StorageIdentities(s.inventoryEvidence)
+	for _, backendName := range s.backendTopology {
+		expected, bound := s.backendStorageIDs[backendName]
+		if !bound || !expected.Valid() || identities[backendName] != expected {
+			return inventory.PairedTopologyObservation{}
+		}
+	}
+	return snapshot.PairedTopology(s.inventoryEvidence)
+}
+
+func (s *Store) singleReporterObservationLocked(
+	snapshot inventory.Snapshot,
+	leaseUUID string,
+) inventory.SingleReporterObservation {
+	return s.pairedTopologyObservationLocked(snapshot).SingleReporter(leaseUUID)
+}
+
+// canResolveInventoryQuarantineLocked consumes only a historical sole-reporter
+// rejected-observation quarantine. New partial evidence cannot erase a genuine
+// multi-owner conflict or create previously unknown retained-data affinity.
+// Caller holds s.mu; projectInventory has already enforced revision and claims.
+func (s *Store) canResolveInventoryQuarantineLocked(
+	projection inventoryProjection,
+	leaseUUID string,
+	existing Placement,
+	backendName string,
+) bool {
+	if !existing.CanResolveUntrustedPositive(backendName) {
+		return false
+	}
+	if projection.complete {
+		return true
+	}
+	observation := s.singleReporterObservationLocked(projection.AbsenceEvidence, leaseUUID)
+	if !observation.Matches(s.inventoryEvidence, leaseUUID, backendName) {
+		return false
+	}
+	_, provisioned := projection.AbsenceEvidence.Provision(s.inventoryEvidence, backendName, leaseUUID)
+	return provisioned || existing.Backend == backendName
 }
 
 func projectUntrustedPositive(

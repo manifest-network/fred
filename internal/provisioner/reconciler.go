@@ -341,7 +341,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// post-sync view. A worker refreshes only after its own successful attempt CAS,
 	// because that mutation necessarily invalidates this snapshot for that lease.
 	for leaseUUID, owners := range ambiguousOwners {
-		slog.Error("reconcile: lease reported by multiple backends; preserving placement and deferring chain actions",
+		slog.Error("reconcile: backend ownership is quarantined; preserving placement and deferring chain actions",
 			"lease_uuid", leaseUUID,
 			"backends", owners,
 		)
@@ -375,7 +375,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		if owners, ambiguous := ambiguousOwners[leaseUUID]; ambiguous {
 			deferred.Add(1)
 			metrics.ReconcilerDeferredLeasesTotal.Inc()
-			slog.Warn("reconcile: deferring lease with multiple positive backend owners",
+			slog.Warn("reconcile: deferring lease with quarantined backend ownership",
 				"lease_uuid", leaseUUID,
 				"backends", owners,
 			)

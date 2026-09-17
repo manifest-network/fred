@@ -757,6 +757,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Closing a lease during a started restart or update uses the existing durable
+  close handoff after draining the replacement worker. It no longer requires an
+  impossible pre-effect refusal or a backend restart to unblock cleanup. (ENG-997)
+- A lease moving from provisioned to retained between inventory reads no longer
+  quarantines healthy sibling leases. Collection preserves the overlapping lease
+  only as untrusted membership and keeps its mutation fence until a later sweep
+  resolves it. A sealed observation covering that lease across all backends can
+  resolve its sole-reporter quarantine even while other leases transition; global
+  admission-baseline and empty-backend requirements remain unchanged. (ENG-997)
 - Maintenance recovery can settle an exact stopped source cohort as failed
   instead of wedging startup. Proven lease-local observation conflicts defer
   without blocking sibling recovery; readiness waits now have bounded-label

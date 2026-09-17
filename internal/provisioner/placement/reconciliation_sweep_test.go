@@ -478,10 +478,10 @@ func TestCollectedInventoryReceiptsAreExactOneShotAndMandatory(t *testing.T) {
 
 		disposition, err := sweep.RecordBackendInventory(provisions, retentions)
 		require.NoError(t, err)
-		require.Equal(t, BackendInventoryAuthoritative, disposition)
+		require.Equal(t, BackendInventoryAuthoritative, disposition.Disposition())
 		disposition, err = sweep.RecordBackendInventory(copyOfProvisions, retentions)
 		require.ErrorIs(t, err, inventory.ErrInvalidSession)
-		require.Equal(t, BackendInventoryInvalid, disposition)
+		require.Equal(t, BackendInventoryInvalid, disposition.Disposition())
 		require.NoError(t, sweep.SealInventory())
 	})
 
@@ -497,7 +497,7 @@ func TestCollectedInventoryReceiptsAreExactOneShotAndMandatory(t *testing.T) {
 		defer second.End()
 		disposition, err := second.RecordBackendInventory(provisions, retentions)
 		require.ErrorIs(t, err, inventory.ErrInvalidSession)
-		require.Equal(t, BackendInventoryInvalid, disposition)
+		require.Equal(t, BackendInventoryInvalid, disposition.Disposition())
 	})
 
 	t.Run("same-sweep cross-backend receipts cannot be spliced", func(t *testing.T) {
@@ -532,7 +532,7 @@ func TestCollectedInventoryReceiptsAreExactOneShotAndMandatory(t *testing.T) {
 		require.NoError(t, err)
 		disposition, err := sweep.RecordBackendInventory(provisionsA, retentionsB)
 		require.ErrorIs(t, err, inventory.ErrInvalidSession)
-		require.Equal(t, BackendInventoryInvalid, disposition)
+		require.Equal(t, BackendInventoryInvalid, disposition.Disposition())
 		// A failed splice consumes nothing. Each exact receipt still has to be
 		// disposed through its typed rejected-half transition before sealing.
 		require.NoError(t, sweep.RejectProvisionInventory(provisionsA))
@@ -579,7 +579,7 @@ func TestCollectedInventoryReceiptsAreExactOneShotAndMandatory(t *testing.T) {
 		})
 	}
 
-	t.Run("cross-endpoint contradiction can only become quarantine", func(t *testing.T) {
+	t.Run("cross-endpoint overlap can only become quarantine", func(t *testing.T) {
 		store, _, sweep := newCollectedInventorySweep(
 			t,
 			[]backend.ProvisionInfo{provision},
@@ -592,7 +592,7 @@ func TestCollectedInventoryReceiptsAreExactOneShotAndMandatory(t *testing.T) {
 		require.NoError(t, err)
 		disposition, err := sweep.RecordBackendInventory(provisions, retentions)
 		require.NoError(t, err)
-		require.Equal(t, BackendInventoryUntrusted, disposition)
+		require.Equal(t, BackendInventoryPartial, disposition.Disposition())
 		require.NoError(t, sweep.SealInventory())
 		_, err = sweep.Project(ReconciliationProjection{
 			UntrustedPositives: map[string][]string{leaseUUID: {"backend-a"}},

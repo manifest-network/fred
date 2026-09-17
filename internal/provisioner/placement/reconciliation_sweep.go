@@ -237,7 +237,27 @@ const (
 	BackendInventoryInvalid BackendInventoryDisposition = iota
 	BackendInventoryAuthoritative
 	BackendInventoryUntrusted
+	BackendInventoryPartial
 )
+
+// BackendInventoryResult is the closed result of disposing one exact pair of
+// collected responses. Partial results retain paired backend identity while
+// their ambiguous leases remain exclusively conservative positive membership.
+// The zero value is invalid and carries no accepted observations.
+type BackendInventoryResult struct {
+	disposition BackendInventoryDisposition
+	observation inventory.BackendObservation
+}
+
+func (result BackendInventoryResult) Disposition() BackendInventoryDisposition {
+	return result.disposition
+}
+
+// UntrustedLeaseUUIDs describes only the partition made by the collector; the
+// reconciler cannot independently promote these rows by choosing a payload.
+func (result BackendInventoryResult) UntrustedLeaseUUIDs() []string {
+	return result.observation.UntrustedLeaseUUIDs()
+}
 
 // RecordBackendInventory consumes provision and retention receipts from this
 // exact sweep as one transition. Identity, refresh, and cross-endpoint checks
@@ -245,9 +265,9 @@ const (
 func (sweep *ReconciliationSweep) RecordBackendInventory(
 	provisionResponse BackendProvisionInventory,
 	retentionResponse BackendRetentionInventory,
-) (BackendInventoryDisposition, error) {
+) (BackendInventoryResult, error) {
 	if sweep == nil {
-		return BackendInventoryInvalid, inventory.ErrInvalidSession
+		return BackendInventoryResult{}, inventory.ErrInvalidSession
 	}
 	sweep.mu.Lock()
 	defer sweep.mu.Unlock()
@@ -256,13 +276,13 @@ func (sweep *ReconciliationSweep) RecordBackendInventory(
 		provisionResponse.sweepID != sweep.fence.sweepID || provisionResponse.receipt == nil ||
 		retentionResponse.sweep != sweep || retentionResponse.marker != sweep.marker ||
 		retentionResponse.sweepID != sweep.fence.sweepID || retentionResponse.receipt == nil {
-		return BackendInventoryInvalid, inventory.ErrInvalidSession
+		return BackendInventoryResult{}, inventory.ErrInvalidSession
 	}
 	provision, provisionPending := sweep.pendingProvisions[provisionResponse.receipt]
 	retention, retentionPending := sweep.pendingRetentions[retentionResponse.receipt]
 	if !provisionPending || !retentionPending ||
 		provision.backendName != retention.backendName {
-		return BackendInventoryInvalid, inventory.ErrInvalidSession
+		return BackendInventoryResult{}, inventory.ErrInvalidSession
 	}
 
 	authoritative := provision.refreshErr == nil && provision.storageID.Valid() &&
@@ -291,22 +311,25 @@ func (sweep *ReconciliationSweep) RecordBackendInventory(
 		if _, duplicate := seenRetentions[leaseUUID]; duplicate {
 			authoritative = false
 		}
-		if _, duplicate := provisioned[leaseUUID]; duplicate {
-			authoritative = false
-		}
 		seenRetentions[leaseUUID] = struct{}{}
 	}
 
-	var err error
+	var (
+		err         error
+		observation inventory.BackendObservation
+	)
 	disposition := BackendInventoryUntrusted
 	if authoritative {
-		err = sweep.collection.RecordBackend(
+		observation, err = sweep.collection.RecordBackend(
 			provision.backendName,
 			provision.storageID,
 			provision.provisions,
 			retained,
 		)
 		disposition = BackendInventoryAuthoritative
+		if len(observation.UntrustedLeaseUUIDs()) != 0 {
+			disposition = BackendInventoryPartial
+		}
 	} else {
 		leaseUUIDs := make([]string, 0, len(provisioned)+len(seenRetentions))
 		for leaseUUID := range provisioned {
@@ -320,11 +343,11 @@ func (sweep *ReconciliationSweep) RecordBackendInventory(
 		err = sweep.collection.RecordUntrusted(provision.backendName, leaseUUIDs)
 	}
 	if err != nil {
-		return BackendInventoryInvalid, err
+		return BackendInventoryResult{}, err
 	}
 	delete(sweep.pendingProvisions, provisionResponse.receipt)
 	delete(sweep.pendingRetentions, retentionResponse.receipt)
-	return disposition, nil
+	return BackendInventoryResult{disposition: disposition, observation: observation}, nil
 }
 
 // RejectProvisionInventory consumes a provision response without granting it

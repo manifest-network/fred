@@ -685,7 +685,7 @@ func collectTestBackendInventory(
 	}
 	disposition, err := sweep.RecordBackendInventory(provisionReceipt, retentionReceipt)
 	require.NoError(t, err)
-	return disposition
+	return disposition.Disposition()
 }
 
 func (sink *testProvisionStartSink) setPublisher(publisher message.Publisher) {
@@ -1907,7 +1907,7 @@ func (a *testPlacementAuthorityAdapter) projectConfirmed(leaseUUID, backendName 
 			provisionReceipt, retentionReceipt,
 		); collectErr != nil {
 			return collectErr
-		} else if disposition != placement.BackendInventoryAuthoritative {
+		} else if disposition.Disposition() != placement.BackendInventoryAuthoritative {
 			return fmt.Errorf("test reconciliation backend %q inventory was not authoritative", name)
 		}
 	}

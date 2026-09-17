@@ -1855,6 +1855,22 @@ cannot be sealed or projected. A newer sweep invalidates older unclaimed action
 capabilities, while an action already holding its lease claim is captured as
 in-flight by the newer causal boundary.
 
+The two backend endpoints are read sequentially. A lease can therefore appear
+in both when it closes between reads. After validating the paired storage
+identity and each endpoint's shape, the collector records that lease only as
+untrusted positive membership: it cannot issue provision, retention, lifecycle,
+or absence authority for it. Unchanged sibling leases keep their own validated
+evidence. The ambiguous lease remains fenced until it is durably quarantined or
+resolved by a later sweep; this partial inventory cannot establish a new
+admission baseline or prove an empty backend. Identity, refresh, or malformed
+endpoint failures still reject the backend's entire response.
+
+After an interrupted sweep or process restart, fresh paired responses matching
+every configured storage pin can retire inherited inventory fencing once the
+projection durably accounts for every positive, including quarantined leases.
+This endpoint-coverage proof does not establish a new admission baseline or
+prove a backend empty.
+
 ```
 Chain state       Backend inventory       Durable placement/attempts
      │                    │                            │
@@ -1934,15 +1950,18 @@ absence never clears an attempt or conflict. Incomplete sweeps report
 `fred_reconciler_runs_total{outcome="degraded"}`; that gauge is an observation,
 not a global write-authority switch.
 
-If Fred rejects an endpoint because provision/retention membership contradicts,
-its two inventory identities are missing or inconsistent, or its identity
-conflicts with a durable storage pin, the payload cannot establish an owner.
-Its raw positive lease membership is nevertheless persisted across restart as
-`untrusted_positive` quarantine. A sole candidate of that exact kind can
-self-resolve only when a later complete, identity-valid inventory reports the
-same lease from the same backend. Partial inventory, silence, a different or
-second reporter, unknown ownership, and ordinary conflicts remain quarantined
-for explicit operator repair.
+Overlapping provision/retention membership rejects only that lease's payload.
+Missing or inconsistent endpoint identities, malformed responses, and conflicts
+with a durable storage pin reject the backend response. In either case, raw
+positive membership survives restart as `untrusted_positive` quarantine.
+A sole candidate of that exact kind can self-resolve when a later sealed
+observation accounts for that lease across the complete configured topology:
+every backend supplies identity-valid paired endpoints, the same backend is its
+only trusted reporter, and every peer proves its absence. Ambiguity about other
+leases does not prevent this proof. Missing peers, continued ambiguity for this
+lease, a different or second reporter, unknown ownership, and ordinary conflicts
+cannot self-resolve. Retention evidence cannot settle an unresolved operation
+attempt or issue lifecycle authority.
 
 The three passes that **delete durable state** — orphan deprovision, payload
 cleanup, placement pruning — keep running on a degraded sweep, scoped to what

@@ -1187,6 +1187,14 @@ intent admission checks the close journal, while the deprovisioning actor (or an
 absent cleanup-only projection) rejects maintenance. A later worker therefore
 cannot start for the same lease while teardown owns it.
 
+After the actor cancels and drains a replacement worker, an uncommitted
+maintenance target transfers to the same close transaction even if physical
+execution already started. That transaction preserves the interrupted
+maintenance identity and queues its failed completion ahead of close completion;
+the close executor owns exact source and target cleanup. An already-active target
+settles maintenance success first. Unknown physical effects still prevent close
+finalization until the existing effect fences can be resolved.
+
 The normal completion order is mandatory:
 
 1. Advance the durable execution generation, then run the construction-bound

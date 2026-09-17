@@ -262,49 +262,63 @@ func (session *Session) RecordRetention(
 	return session.record(session.retention, backendName, storageID, leaseUUIDs)
 }
 
+// BackendObservation describes the construction-attested partition of one
+// paired backend response. It carries no mutation authority. Its conservative
+// members have no provision, retention, lifecycle, or absence evidence.
+type BackendObservation struct {
+	untrustedLeaseUUIDs []string
+}
+
+// UntrustedLeaseUUIDs returns a detached list of the ambiguous members.
+func (observation BackendObservation) UntrustedLeaseUUIDs() []string {
+	return slices.Clone(observation.untrustedLeaseUUIDs)
+}
+
 // RecordBackend atomically records the two independently fetched endpoint
 // responses for one backend. It is the construction boundary used after the
 // placement sweep has verified their shared physical identity. Neither half
-// becomes negative evidence if validation of the other half fails.
+// becomes negative evidence if validation of the other half fails. Leases in
+// both responses are exclusively conservative membership: independent reads
+// can straddle a close, so that ambiguity must not invalidate unrelated rows.
 func (session *Session) RecordBackend(
 	backendName string,
 	storageID backendidentity.ID,
 	provisions []backend.ProvisionInfo,
 	retentionLeaseUUIDs []string,
-) error {
+) (BackendObservation, error) {
 	if session == nil {
-		return ErrInvalidSession
+		return BackendObservation{}, ErrInvalidSession
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.sealed || session.collector == nil || session.issuer == nil ||
 		!storageID.Valid() {
-		return ErrInvalidSession
+		return BackendObservation{}, ErrInvalidSession
 	}
 	if _, configured := session.collector.known[backendName]; !configured {
-		return fmt.Errorf("%w: backend %q is outside collector topology", ErrInvalidSession, backendName)
+		return BackendObservation{}, fmt.Errorf("%w: backend %q is outside collector topology", ErrInvalidSession, backendName)
 	}
 	if _, duplicate := session.provision[backendName]; duplicate {
-		return fmt.Errorf("%w: backend %q provision endpoint was recorded twice", ErrInvalidSession, backendName)
+		return BackendObservation{}, fmt.Errorf("%w: backend %q provision endpoint was recorded twice", ErrInvalidSession, backendName)
 	}
 	if _, duplicate := session.retention[backendName]; duplicate {
-		return fmt.Errorf("%w: backend %q retention endpoint was recorded twice", ErrInvalidSession, backendName)
+		return BackendObservation{}, fmt.Errorf("%w: backend %q retention endpoint was recorded twice", ErrInvalidSession, backendName)
 	}
 
 	provisionPresent := make(map[string]struct{}, len(provisions))
 	provisionObservations := make(map[string]ProvisionObservation, len(provisions))
 	for _, provision := range provisions {
 		if strings.TrimSpace(provision.LeaseUUID) == "" {
-			return fmt.Errorf("%w: blank lease identity", ErrInvalidSession)
+			return BackendObservation{}, fmt.Errorf("%w: blank lease identity", ErrInvalidSession)
 		}
 		if provision.BackendName != backendName {
-			return fmt.Errorf(
+			return BackendObservation{}, fmt.Errorf(
 				"%w: provision %q names backend %q, expected %q",
 				ErrInvalidSession, provision.LeaseUUID, provision.BackendName, backendName,
 			)
 		}
 		if _, duplicate := provisionPresent[provision.LeaseUUID]; duplicate {
-			return fmt.Errorf(
+			return BackendObservation{}, fmt.Errorf(
 				"%w: duplicate provision %q from backend %q",
 				ErrInvalidSession, provision.LeaseUUID, backendName,
 			)
@@ -315,17 +329,11 @@ func (session *Session) RecordBackend(
 	retentionPresent := make(map[string]struct{}, len(retentionLeaseUUIDs))
 	for _, leaseUUID := range retentionLeaseUUIDs {
 		if strings.TrimSpace(leaseUUID) == "" {
-			return fmt.Errorf("%w: blank lease identity", ErrInvalidSession)
+			return BackendObservation{}, fmt.Errorf("%w: blank lease identity", ErrInvalidSession)
 		}
 		if _, duplicate := retentionPresent[leaseUUID]; duplicate {
-			return fmt.Errorf(
+			return BackendObservation{}, fmt.Errorf(
 				"%w: duplicate retention %q from backend %q",
-				ErrInvalidSession, leaseUUID, backendName,
-			)
-		}
-		if _, provisioned := provisionPresent[leaseUUID]; provisioned {
-			return fmt.Errorf(
-				"%w: lease %q is both provisioned and retained on backend %q",
 				ErrInvalidSession, leaseUUID, backendName,
 			)
 		}
@@ -338,7 +346,35 @@ func (session *Session) RecordBackend(
 	session.retention[backendName] = endpointObservation{
 		storageID: storageID, present: retentionPresent,
 	}
-	return nil
+	return session.partitionBackend(backendName), nil
+}
+
+// partitionBackend is the single construction rule for paired and split
+// endpoint collection. Move overlap out of both trusted arms before any sealed
+// snapshot can expose it; getters never have to reinterpret contradictory rows.
+// The caller holds session.mu.
+func (session *Session) partitionBackend(backendName string) BackendObservation {
+	provision := session.provision[backendName]
+	retention := session.retention[backendName]
+	for leaseUUID := range retention.present {
+		if _, overlap := provision.present[leaseUUID]; !overlap {
+			continue
+		}
+		if session.untrusted[backendName] == nil {
+			session.untrusted[backendName] = make(map[string]struct{})
+		}
+		session.untrusted[backendName][leaseUUID] = struct{}{}
+	}
+	// Explicitly rejected observations use the same exclusive arm regardless
+	// of whether rejection was recorded before or after an endpoint response.
+	for leaseUUID := range session.untrusted[backendName] {
+		delete(provision.present, leaseUUID)
+		delete(provision.provisions, leaseUUID)
+		delete(retention.present, leaseUUID)
+	}
+	return BackendObservation{
+		untrustedLeaseUUIDs: slices.Sorted(maps.Keys(session.untrusted[backendName])),
+	}
 }
 
 // RecordUntrusted records conservative positive membership whose endpoint
@@ -445,6 +481,9 @@ func (session *Session) Seal() (Snapshot, error) {
 	session.collector.mu.RUnlock()
 	if !current {
 		return Snapshot{}, ErrInvalidSession
+	}
+	for _, backendName := range session.collector.topology {
+		session.partitionBackend(backendName)
 	}
 	session.sealed = true
 	return Snapshot{

@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
@@ -80,10 +82,10 @@ func (r *Reconciler) collectInventory(
 	for _, backendName := range configuredBackends {
 		provisionResponse, provisionAnswered := inventory.fleet.collectedByBackend[backendName]
 		retentionResponse, retentionAnswered := inventory.retentionCollected[backendName]
-		var disposition placement.BackendInventoryDisposition
+		var result placement.BackendInventoryResult
 		switch {
 		case provisionAnswered && retentionAnswered:
-			disposition, err = sweep.RecordBackendInventory(
+			result, err = sweep.RecordBackendInventory(
 				provisionResponse, retentionResponse,
 			)
 		case provisionAnswered:
@@ -96,8 +98,12 @@ func (r *Reconciler) collectInventory(
 				"dispose backend inventory evidence for %q: %w", backendName, err,
 			)
 		}
-		if disposition == placement.BackendInventoryAuthoritative {
+		switch result.Disposition() {
+		case placement.BackendInventoryAuthoritative, placement.BackendInventoryPartial:
 			inventory.backendStorageIdentities[backendName] = provisionResponse.StorageID()
+			for _, leaseUUID := range result.UntrustedLeaseUUIDs() {
+				inventory.rejectLease(backendName, leaseUUID)
+			}
 			continue
 		}
 		inventory.rejectBackend(backendName)
@@ -108,44 +114,48 @@ func (r *Reconciler) collectInventory(
 	return inventory, nil
 }
 
-func (inventory *reconcileInventory) rejectBackend(backendName string) {
+// rejectLease applies the collector's exclusive conservative-membership arm.
+// Raw reporter membership survives, so peer collisions cannot disappear when
+// the selected payload is removed from the union.
+func (inventory *reconcileInventory) rejectLease(backendName, leaseUUID string) {
+	if leaseUUID == "" {
+		return
+	}
 	if inventory.untrustedPositiveObservations == nil {
 		inventory.untrustedPositiveObservations = make(map[string]map[string]struct{})
 	}
-	recordUntrusted := func(leaseUUID string) {
-		if leaseUUID == "" {
-			return
-		}
-		backends := inventory.untrustedPositiveObservations[leaseUUID]
-		if backends == nil {
-			backends = make(map[string]struct{})
-			inventory.untrustedPositiveObservations[leaseUUID] = backends
-		}
-		backends[backendName] = struct{}{}
+	backends := inventory.untrustedPositiveObservations[leaseUUID]
+	if backends == nil {
+		backends = make(map[string]struct{})
+		inventory.untrustedPositiveObservations[leaseUUID] = backends
 	}
+	backends[backendName] = struct{}{}
+	if rows, exists := inventory.fleet.provisionsByBackend[backendName]; exists {
+		inventory.fleet.provisionsByBackend[backendName] = slices.DeleteFunc(rows, func(row backend.ProvisionInfo) bool {
+			return row.LeaseUUID == leaseUUID
+		})
+	}
+	if inventory.fleet.provisions[leaseUUID].BackendName == backendName {
+		delete(inventory.fleet.provisions, leaseUUID)
+	}
+	if inventory.retentions[leaseUUID] == backendName {
+		delete(inventory.retentions, leaseUUID)
+	}
+}
+
+func (inventory *reconcileInventory) rejectBackend(backendName string) {
 	for leaseUUID := range inventory.fleet.reportedByBackend[backendName] {
-		recordUntrusted(leaseUUID)
+		inventory.rejectLease(backendName, leaseUUID)
 	}
 	for leaseUUID := range inventory.retentionsReportedByBackend[backendName] {
-		recordUntrusted(leaseUUID)
+		inventory.rejectLease(backendName, leaseUUID)
 	}
-
 	inventory.fleet.markUnanswered(backendName)
 	inventory.retentionsAnswered[backendName] = false
 	delete(inventory.fleet.storageIdentities, backendName)
 	delete(inventory.fleet.provisionsByBackend, backendName)
 	delete(inventory.retentionStorageIdentities, backendName)
 	delete(inventory.backendStorageIdentities, backendName)
-	for leaseUUID, provision := range inventory.fleet.provisions {
-		if provision.BackendName == backendName {
-			delete(inventory.fleet.provisions, leaseUUID)
-		}
-	}
-	for leaseUUID, owner := range inventory.retentions {
-		if owner == backendName {
-			delete(inventory.retentions, leaseUUID)
-		}
-	}
 }
 
 // collectChainLeaseInventory bounds each complete paginated state inventory
