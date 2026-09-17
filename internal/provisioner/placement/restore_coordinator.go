@@ -191,7 +191,8 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 		source.Attempt != "" || !source.RecordRevision().Valid() {
 		return RestoreApplicationResult{
 			disposition: RestoreApplicationSourceUnavailable,
-			err:         ErrRestoreSourceUnavailable,
+			err: fmt.Errorf("%w: placement state=%s, unresolved_attempt=%t",
+				ErrRestoreSourceUnavailable, source.State(), source.Attempt != ""),
 		}
 	}
 	firstUUID, secondUUID := request.sourceLeaseUUID, request.targetLeaseUUID

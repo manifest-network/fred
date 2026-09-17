@@ -70,6 +70,7 @@ var labelledMetricNames = []string{
 	"fred_chain_transactions_total",
 	"fred_events_dropped_total",
 	"fred_health_check_healthy",
+	"fred_health_check_duration_seconds",
 	"fred_messages_malformed_total",
 	"fred_payload_persist_failures_total",
 	"fred_payload_uploads_total",
@@ -142,6 +143,7 @@ func allCollectors() []prometheus.Collector {
 		APIRequestDuration,
 		APIRequestsTotal,
 		HealthCheckHealthy,
+		HealthCheckDuration,
 		// Chain
 		ChainTxTotal,
 		ChainQueryDuration,

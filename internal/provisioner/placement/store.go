@@ -2949,9 +2949,13 @@ func (s *Store) projectInventory(
 			candidate = projectConflict(existing, exists, projection.Conflicts[leaseUUID], now)
 
 		case projection.UntrustedPositives[leaseUUID] != nil:
-			candidate = projectUntrustedPositive(
-				existing, exists, projectionQuarantineBackends(projection, leaseUUID), now,
-			)
+			if s.pairedOverlapPreservesOwnerLocked(projection.AbsenceEvidence, leaseUUID) {
+				candidate = existing
+			} else {
+				candidate = projectUntrustedPositive(
+					existing, exists, projectionQuarantineBackends(projection, leaseUUID), now,
+				)
+			}
 
 		case projection.retentionPositives[leaseUUID] != nil:
 			reporters := projection.retentionPositives[leaseUUID]
@@ -3254,6 +3258,9 @@ func (s *Store) excludedPositiveDurablyRepresentedLocked(
 		return false
 	}
 	record, exists := s.cache[leaseUUID]
+	if s.pairedOverlapPreservesOwnerLocked(snapshot, leaseUUID) {
+		return true
+	}
 	if exists && record.State() == StateUnusable {
 		candidates := placementCandidateBackends(record)
 		represented := true
@@ -3391,6 +3398,40 @@ func (s *Store) trustedProvisionDurablyRepresentedLocked(
 		tenant: tenant, providerUUID: providerUUID,
 	}
 	return !expectedPrincipal.valid() || expectedPrincipal == observedPrincipal
+}
+
+// pairedOverlapPreservesOwnerLocked consumes constructor-issued overlap solely
+// as redundant evidence for the exact current (possibly retired) generation and
+// principal. Unknown lineage and historical attempt IDs are not equivalent.
+// Caller holds s.mu. Mutation callers also enforce the sweep's revision fence.
+func (s *Store) pairedOverlapPreservesOwnerLocked(snapshot inventory.Snapshot, leaseUUID string) bool {
+	record := s.cache[leaseUUID]
+	if record.State() != StateConfirmed || record.Attempt != "" {
+		return false
+	}
+	observation, present := snapshot.PairedOverlap(
+		s.inventoryEvidence, record.Backend, leaseUUID, s.backendStorageIDs[record.Backend],
+	)
+	if !present {
+		return false
+	}
+	capability, exists := s.lifecycleCache[leaseUUID]
+	if !exists || capability.unusable || capability.backend != record.Backend || !capability.principal.valid() {
+		return false
+	}
+	row := observation.Provision()
+	if (runtimePrincipal{tenant: row.Tenant(), providerUUID: row.ProviderUUID()}) != capability.principal {
+		return false
+	}
+	generation := sealedLifecycleObservation(row.LifecycleGeneration())
+	switch generation.Kind {
+	case LifecycleObservationTyped:
+		return generation.ID == capability.id
+	case LifecycleObservationLegacy:
+		return !capability.id.Valid()
+	default:
+		return false
+	}
 }
 
 // clearInventoryPositiveBarriersLocked retires only lease/backend facts that

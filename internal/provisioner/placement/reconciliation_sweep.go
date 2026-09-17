@@ -801,7 +801,8 @@ type ObservedReconciliationAction struct {
 func (action ObservedReconciliationAction) validFor(
 	authority *ReconciliationCoordinator,
 ) bool {
-	return action.ownedBy(authority) && action.projected.Valid()
+	return action.ownedBy(authority) && action.projected.Valid() &&
+		authority.coordinator.operations.HoldsLeaseClaim(action.claim, action.lease.Uuid)
 }
 
 func (action ObservedReconciliationAction) ownedBy(
@@ -836,7 +837,9 @@ func (action ObservedReconciliationAction) Placement() Placement {
 // ObserveLiveAction performs the final exact chain read while holding the
 // Registry claim derived from this sweep's private operation boundary. Any
 // Store change, operation crossing, foreign provider, nil lease, or terminal
-// state returns no capability and releases the claim.
+// state returns no capability and releases the claim. Untrusted membership
+// cannot mint an action even when it preserves an already represented owner:
+// restore affinity is not evidence of the lease's current runtime lifecycle.
 func (projected *ProjectedReconciliationSweep) ObserveLiveAction(
 	ctx context.Context,
 	leaseUUID string,
@@ -849,6 +852,12 @@ func (projected *ProjectedReconciliationSweep) ObserveLiveAction(
 		return ObservedReconciliationAction{}, ReconciliationObservationStale, nil
 	}
 	authority := projected.sweep.coordinator
+	binding := authority.projector.collector.Binding()
+	for _, reporter := range projected.sweep.sealed.LeaseReporters(binding, leaseUUID) {
+		if projected.sweep.sealed.UntrustedReporter(binding, reporter, leaseUUID) {
+			return ObservedReconciliationAction{}, ReconciliationObservationStale, nil
+		}
+	}
 	if err := authority.coordinator.store.leaseSideEffectError(leaseUUID); err != nil {
 		return ObservedReconciliationAction{}, ReconciliationObservationStale, nil
 	}
@@ -937,8 +946,7 @@ func (authority *ReconciliationCoordinator) Provision(
 	invalid := func(err error) ReconciliationProvisionResult {
 		return ReconciliationProvisionResult{err: err}
 	}
-	if !authority.Valid() || ctx == nil || !action.validFor(authority) ||
-		!authority.coordinator.operations.HoldsLeaseClaim(action.claim, action.lease.Uuid) {
+	if !authority.Valid() || ctx == nil || !action.validFor(authority) {
 		return invalid(ErrReconciliationBoundaryStale)
 	}
 	if fingerprint.Valid() {
@@ -1060,7 +1068,6 @@ func (authority *ReconciliationCoordinator) ReconcileObservedCustomDomain(
 	action ObservedReconciliationAction,
 ) error {
 	if !authority.Valid() || ctx == nil || !action.validFor(authority) ||
-		!authority.coordinator.operations.HoldsLeaseClaim(action.claim, action.lease.Uuid) ||
 		action.record.State() != StateConfirmed {
 		return errors.New("invalid observed custom-domain reconciliation action")
 	}
@@ -1079,7 +1086,6 @@ func (authority *ReconciliationCoordinator) DeprovisionObserved(
 	action ObservedReconciliationAction,
 ) error {
 	if !authority.Valid() || ctx == nil || !action.validFor(authority) ||
-		!authority.coordinator.operations.HoldsLeaseClaim(action.claim, action.lease.Uuid) ||
 		action.record.State() != StateConfirmed {
 		return errors.New("invalid observed deprovision action")
 	}

@@ -522,11 +522,12 @@ takes down the tenant API *and* the callback path that lets a recovering backend
 report what it finished (ENG-522). Point load balancers here. Alert on
 `fred_health_check_healthy` and `fred_backend_healthy`, not on the status code.
 
-Slowness cannot get around that: the whole dependency sweep is bounded (3s) and
-backends are probed concurrently, so a backend that accepts a connection and never
-answers cannot outlast the prober's own timeout, the server's write timeout, or the
-request timeout — the last of which would otherwise answer 503 from
-`http.TimeoutHandler` with no verdict involved.
+Chain and backend probes start together within a shared three-second remote
+budget, so a slow chain cannot consume the backends' opportunity to answer.
+Local store validation remains synchronous: the remote deadline cannot interrupt
+filesystem or database-lock waits. Health stage histograms distinguish these
+costs; investigate latency separately from the dependency verdict before
+changing probe timeouts. See the [health runbook](OPERATIONS.md#why-health-never-503s).
 
 Being unauthenticated, both endpoints do still sit behind the global IP rate limiter
 and can return `429`; the default budget is far above any sane probe interval.
@@ -1861,7 +1862,11 @@ identity and each endpoint's shape, the collector records that lease only as
 untrusted positive membership: it cannot issue provision, retention, lifecycle,
 or absence authority for it. Unchanged sibling leases keep their own validated
 evidence. The ambiguous lease remains fenced until it is durably quarantined or
-resolved by a later sweep; this partial inventory cannot establish a new
+represented by its unchanged confirmed owner: constructor-issued paired overlap
+can preserve that sole owner only when the pinned storage identity, generation
+and principal already account for the row, with no unresolved attempt. Explicit
+rejection cannot issue this observation. Other quarantines need a later valid
+sweep or operator repair. This partial inventory cannot establish a new
 admission baseline or prove an empty backend. Identity, refresh, or malformed
 endpoint failures still reject the backend's entire response.
 

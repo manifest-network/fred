@@ -481,6 +481,41 @@ const (
 	asyncAcceptanceUnknown
 )
 
+// handoffProvisionAdmission owns the transition from durable capacity admission
+// to the lease actor. The accepted operation and command identity come only from
+// admission; the request context owns the response waiter, never the enqueue or
+// worker lifetime. A disconnected provider may redeliver the exact operation
+// while this backend continues its one admitted worker.
+//
+// Both enqueue and acknowledgment wait are bounded by the backend's provision
+// deadline and shutdown. Only a source-observed no-enqueue or explicit actor
+// rejection returns Rejected; a lost acknowledgment remains Unknown.
+func (b *Backend) handoffProvisionAdmission(
+	callerCtx context.Context,
+	admission shared.ProvisionAdmission,
+) (asyncAcceptance, error) {
+	operationCtx, operationCancel := b.shutdownAwareContext()
+	command, ack, err := leasesm.NewProvisionCommand(operationCtx, admission)
+	if err != nil {
+		operationCancel()
+		return asyncAcceptanceRejected, err
+	}
+	if err := b.routeToLeaseBlocking(operationCtx, admission.Operation().LeaseUUID(), command); err != nil {
+		operationCancel()
+		return asyncAcceptanceRejected, fmt.Errorf("enqueue admitted provision: %w", err)
+	}
+
+	waitCtx, cancelWait := context.WithCancel(callerCtx)
+	stopDeadlineWait := context.AfterFunc(operationCtx, cancelWait)
+	defer cancelWait()
+	defer stopDeadlineWait()
+	acceptance, err := b.awaitAsyncAcceptance(waitCtx, ack.Result())
+	if acceptance == asyncAcceptanceRejected {
+		operationCancel()
+	}
+	return acceptance, err
+}
+
 // awaitAsyncAcceptance classifies actor admission for a durable asynchronous
 // operation. Once a message is enqueued, caller cancellation cannot prove that
 // the actor did not accept and spawn its worker immediately after our final

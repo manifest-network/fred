@@ -375,7 +375,13 @@ type BackendHealth struct {
 	Name    string `json:"name"`
 	Healthy bool   `json:"healthy"`
 	Error   string `json:"error,omitempty"`
+
+	probeDuration time.Duration
 }
+
+// ProbeDuration is the elapsed time of this exact client probe, including
+// failed or canceled calls. It is diagnostic only, not a health verdict.
+func (health BackendHealth) ProbeDuration() time.Duration { return health.probeDuration }
 
 // HealthCheck checks the health of all configured backends.
 // Returns a slice of health statuses and an overall healthy flag.
@@ -424,6 +430,8 @@ func (r *Router) HealthCheck(ctx context.Context) ([]BackendHealth, bool) {
 // down. A panicking probe counts as unhealthy rather than as a silent pass.
 func (r *Router) probeBackend(ctx context.Context, b Backend) (health BackendHealth) {
 	health = BackendHealth{Name: b.Name(), Healthy: true}
+	started := time.Now()
+	defer func() { health.probeDuration = time.Since(started) }()
 
 	defer func() {
 		if rec := recover(); rec != nil {

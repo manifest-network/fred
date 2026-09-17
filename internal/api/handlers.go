@@ -1128,6 +1128,9 @@ func (h *Handlers) writeRestoreResult(
 	case restoreapp.OutcomeSourceNotFound, restoreapp.OutcomeNotRetained:
 		writeError(w, "no retained data found for that lease", http.StatusNotFound)
 	case restoreapp.OutcomeSourceUnavailable:
+		slog.Warn("restore source authority unavailable",
+			"lease_uuid", leaseUUID, "from_lease", sourceLeaseUUID,
+			"cause", fmt.Sprintf("%.1024s", fmt.Sprint(result.Cause())))
 		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
 	case restoreapp.OutcomeSourceBusy:
 		writeRestoreConflict(w, "lease is already being provisioned or restored", "source_busy")
@@ -1367,7 +1370,7 @@ const (
 	checkStatusUnhealthy = "unhealthy"
 )
 
-// healthProbeBudget caps how long the whole dependency sweep may take.
+// healthProbeBudget caps the shared remote dependency probe window.
 //
 // Without it the liveness contract is a lie. A backend that REFUSES connections
 // fails in milliseconds, which is why both real incidents stayed inside any
@@ -1385,8 +1388,9 @@ const (
 //     body is a 503 — the exact status code this endpoint exists never to send.
 //
 // So the budget is set under the SMALLEST of those, not merely under fred's own
-// timeouts. It holds only because Router.HealthCheck probes concurrently:
-// serially, N hung backends would still need N × 30s.
+// timeouts. Chain Ping and Router.HealthCheck start concurrently, and the router
+// fans out to all backends: no dependency spends another's probe window.
+// Synchronous local store checks additionally contribute their own wall time.
 //
 // Note this is shorter than the chain client's own 5s Ping cap, which it
 // therefore dominates — a chain round-trip slower than this budget reports
@@ -1422,8 +1426,8 @@ type CheckResult struct {
 // placement store and placement-inventory bootstrap checks; token-tracker and
 // payload-store checks may be absent when those optional stores are omitted.
 func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
-	// Bound the whole sweep so a slow dependency can never reach the status
-	// code — see healthProbeBudget. Derived from the request context, so a
+	// Bound the concurrent remote probes — see healthProbeBudget. Local store
+	// checks are synchronous and measured separately. Derived from the request context, so a
 	// client that disconnects still cancels the work: Router.HealthCheck
 	// distinguishes that cancellation from a genuine deadline and declines to
 	// record health for it.
@@ -1444,7 +1448,9 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 	// logMsg is passed through verbatim rather than unified into one structured
 	// line: "health check: chain unhealthy" is quoted in ENG-522's incident
 	// timeline and is what operators grep for.
-	record := func(name string, local bool, logMsg, clientMsg string, err error) {
+	record := func(name string, local bool, logMsg, clientMsg string, probe healthProbeResult) {
+		metrics.HealthCheckDuration.WithLabelValues(name, "").Observe(probe.duration.Seconds())
+		err := probe.err
 		if err != nil {
 			slog.Warn(logMsg, "error", err)
 			// Same rule as the per-backend gauge in Router.HealthCheck: a probe
@@ -1472,11 +1478,11 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 		checks[name] = &CheckResult{Status: checkStatusHealthy}
 	}
 
-	// Check chain connectivity
+	// Start chain connectivity concurrently with backend fanout. Waiting for
+	// Ping first would consume the backends' deadline without probing them.
+	var chainResult <-chan healthProbeResult
 	if h.client != nil {
-		record("chain", false,
-			"health check: chain unhealthy", "chain connectivity failed",
-			h.client.Ping(ctx))
+		chainResult = h.startChainHealthProbe(ctx)
 	}
 
 	// Check all backends.
@@ -1493,6 +1499,7 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 	if h.backendRouter != nil {
 		backendResults, backendsHealthy := h.backendRouter.HealthCheck(ctx)
 		for _, result := range backendResults {
+			metrics.HealthCheckDuration.WithLabelValues(healthCheckBackend, result.Name).Observe(result.ProbeDuration().Seconds())
 			checkKey := "backend:" + result.Name
 			if result.Healthy {
 				checks[checkKey] = &CheckResult{
@@ -1510,35 +1517,41 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 			remoteImpaired = true
 		}
 	}
+	if chainResult != nil {
+		record(healthCheckChain, false,
+			"health check: chain unhealthy", "chain connectivity failed", <-chainResult)
+	}
 
 	// Check token tracker (bbolt database)
 	if h.tokenTracker != nil {
-		record("token_tracker", true,
+		record(healthCheckToken, true,
 			"health check: token tracker unhealthy", "token tracker unavailable",
-			h.tokenTracker.Healthy())
+			measureHealthProbe(h.tokenTracker.Healthy))
 	}
 
 	// Check placement store (bbolt database)
 	if h.placementLookup != nil {
-		record("placement_store", true,
+		record(healthCheckPlacement, true,
 			"health check: placement store unhealthy", "placement store unavailable",
-			h.placementLookup.Healthy())
+			measureHealthProbe(h.placementLookup.Healthy))
 	}
 	if h.placementBootstrap != nil {
-		var err error
-		if !h.placementBootstrap.InventoryBootstrapped() {
-			err = errors.New("authoritative placement inventory has not completed")
-		}
-		record("placement_inventory", true,
+		probe := measureHealthProbe(func() error {
+			if !h.placementBootstrap.InventoryBootstrapped() {
+				return errors.New("authoritative placement inventory has not completed")
+			}
+			return nil
+		})
+		record(healthCheckInventory, true,
 			"health check: placement inventory not bootstrapped",
-			"placement inventory not ready", err)
+			"placement inventory not ready", probe)
 	}
 
 	// Check payload store (bbolt database)
 	if h.payloadStoreHealth != nil {
-		record("payload_store", true,
+		record(healthCheckPayload, true,
 			"health check: payload store unhealthy", "payload store unavailable",
-			h.payloadStoreHealth.Healthy())
+			measureHealthProbe(h.payloadStoreHealth.Healthy))
 	}
 
 	status := healthStatusHealthy

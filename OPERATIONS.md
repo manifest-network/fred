@@ -17,7 +17,7 @@ Both `providerd` and `docker-backend` expose `GET /health`. **`providerd /health
 
 | Endpoint | Probes | 503 when |
 |---|---|---|
-| `providerd /health` | Chain gRPC, every backend, mandatory placement-store readability and placement-inventory bootstrap, plus token-tracker and payload-store DB readability when those optional stores are configured. The whole sweep is bounded (3s) and backends are probed concurrently, so no dependency can make this endpoint slow enough for a prober to give up on it | Never |
+| `providerd /health` | Chain gRPC and all backends start concurrently under one three-second remote budget. Mandatory placement-store and inventory checks, plus optional token/payload-store validation, remain synchronous; their filesystem/lock waits can exceed that budget. Stage histograms distinguish these costs | Never from a health verdict; the outer request timeout can still fail a stalled request |
 | `providerd /readyz` | Same probes, same budget | A configured bbolt store is unreadable, or no durable inventory baseline matches the configured backend topology (verdict `unhealthy`) |
 | `docker-backend /health` | Docker daemon reachable, plus the callback, diagnostics, release, and retention bbolt stores open and carry their expected buckets. Callback health validates delivery rows, durable operation and maintenance intents, non-expiring close intents, and that no lease simultaneously owns incompatible intent classes | Any of them is unhealthy |
 
@@ -66,7 +66,33 @@ It used to, on any failing probe, and that is the direct cause of two outages. `
 
 The dependency signal did not disappear, it moved: the per-check map is still in the body, and every probe now has a metric (`fred_health_check_healthy` and `fred_backend_healthy`). **Alert on those, not on the status code.** A broken bbolt store is fixed by restarting the process, which a supervisor can do and a load balancer cannot — that is why even `unhealthy` keeps `/health` at 200.
 
-**Slowness is bounded too, and that is a separate guarantee from the verdict.** A backend that *refuses* connections fails in milliseconds; one that accepts the connection and never answers would otherwise burn its full client timeout (30s by default), and three independent deadlines each turn that into the same outage: Traefik gives up at 5s and marks the server DOWN, `http_write_timeout` severs the response at 15s, and the request-timeout middleware answers 503 at 30s from `http.TimeoutHandler` — with no verdict involved at all. So the whole sweep is capped at 3s, under the smallest of the three, and backends are probed concurrently rather than serially so that cap does not starve the backends probed last. If you shorten Traefik's `healthCheck.timeout` below 3s, shorten the budget with it.
+**The remote probe budget and total response latency differ.** Chain Ping and
+all backend probes start together under the same three-second deadline. A slow
+chain therefore cannot consume the backends' entire opportunity to answer.
+Local filesystem and bbolt validation is synchronous; that deadline cannot
+interrupt a database lock or disk wait. The default five-second proxy health
+timeout leaves room for local work, but is not a guarantee against stalled
+storage. Diagnose the stage before changing a timeout or readiness threshold.
+
+`fred_health_check_duration_seconds{check,backend}` separates `chain`, each
+configured `backend`, `token_tracker`, `placement_store`, `placement_inventory`
+and `payload_store`. The `backend` label is empty for local and chain checks.
+On Docker, `fred_docker_backend_health_check_duration_seconds{check}` separates
+`storage_identity`, `docker_ping`, `resource_accounting`, `callback_store`,
+`diagnostics_store`, `release_store`, `retention_store` and `launch_journal`.
+An early failure prevents later stages from running, so missing samples do not
+mean those checks succeeded.
+
+`fred_docker_backend_storage_identity_check_duration_seconds{check}` measures
+production identity-verifier invocations, including HTTP admission and callback
+delivery. Outer prevalidation or terminal rejection can finish before invoking
+the verifier and contributes no sample. Its stages are `total`, `lock_wait`,
+`substrate`, `daemon_info` and `stores`. These timings
+overlap: `total` includes the other stages, `substrate` includes `daemon_info`,
+and the health `storage_identity` check includes its own identity verification.
+Do not sum them. Compare an idle baseline with the failing window and correlate
+backend roundtrip time with these stages. A backend deadline alone does not
+identify chain delay, transport latency, lock contention or retained-row cost.
 
 ---
 
@@ -741,7 +767,7 @@ remain unresolved and fail closed.
 | With a confirmed owner | Pinned to that exact backend. If it did not answer, the lease is deferred rather than routed elsewhere |
 | With an unresolved placement attempt | Redelivered with the same operation ID and request only to the attempted backend. Acceptance/idempotent recognition promotes it, a contract-conforming refusal clears it, and ambiguity retains it. A positive report confirms it only with the exact paired typed generation; silence can never prove rejection |
 | With a placement conflict | Quarantined with every durable candidate. A positive report from another backend expands that union; another candidate going silent never resolves it |
-| Positively reported by an inventory endpoint Fred rejected | The raw membership fact is persisted as an unusable `untrusted_positive` quarantine, even though its payload cannot establish ownership. An overlap between sequential provision/retention reads rejects only that lease. Malformed responses, missing or inconsistent endpoint storage identities, and a storage identity conflicting with the durable backend pin reject the whole backend response |
+| Positively reported by an inventory endpoint Fred rejected | The raw membership fact is persisted as an unusable `untrusted_positive` quarantine, even though its payload cannot establish ownership. A validated same-storage provision/retention overlap can preserve its existing confirmed sole owner when generation and principal already agree; it grants no new ownership or lifecycle authority. Other ambiguity rejects only that lease. Malformed responses, missing or inconsistent endpoint storage identities, and a storage identity conflicting with the durable backend pin reject the whole backend response |
 | Orphans on the backends that answered | Deprovisioned normally. A silent backend reports no provisions, so it contributes no orphan candidates of its own and cannot mask anyone else's |
 | Orphaned payloads | Cleaned normally — that pass compares the payload store against the chain and reads no backend state at all |
 | Placements of leases on the unreachable backend | Not pruned: only that backend's own report can turn "absent from the backend data" into evidence about its records |

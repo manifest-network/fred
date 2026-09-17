@@ -2888,13 +2888,17 @@ func (b *Backend) verifyStorageIdentity(
 	ctx context.Context,
 	storage backendidentity.VerifiedStorage,
 ) error {
+	started := time.Now()
+	defer func() { observeStorageIdentityStage(identityStageTotal, started) }()
 	if b == nil || !storage.Valid() || storage.ID() != b.storageIdentity {
 		return errors.New("docker backend verified storage authority is invalid")
 	}
 	if err := b.terminalStorageAuthorityError(); err != nil {
 		return err
 	}
+	lockStarted := time.Now()
 	b.identityVerifyMu.Lock()
+	observeStorageIdentityStage(identityStageLock, lockStarted)
 	defer b.identityVerifyMu.Unlock()
 	if err := b.terminalStorageAuthorityError(); err != nil {
 		return err
@@ -2902,12 +2906,17 @@ func (b *Backend) verifyStorageIdentity(
 	if b.identityDriftErr != nil {
 		return b.latchTerminalStorageAuthority(b.identityDriftErr)
 	}
-	if err := b.verifyStorageSubstrate(ctx); err != nil {
+	substrateStarted := time.Now()
+	substrateErr := b.verifyStorageSubstrate(ctx)
+	observeStorageIdentityStage(identityStageSubstrate, substrateStarted)
+	if err := substrateErr; err != nil {
 		if errors.Is(err, backendidentity.ErrIdentityDrift) {
 			return b.latchIdentityVerificationFailureLocked(err)
 		}
 		return err
 	}
+	storesStarted := time.Now()
+	defer func() { observeStorageIdentityStage(identityStageStores, storesStarted) }()
 	for name, verify := range map[string]func() error{
 		"callback": func() error {
 			if b.callbackStore == nil {
@@ -2958,7 +2967,9 @@ func (b *Backend) verifyStorageSubstrate(ctx context.Context) error {
 			return wrapped
 		}
 	}
+	daemonStarted := time.Now()
 	info, err := b.docker.DaemonInfo(ctx)
+	observeStorageIdentityStage(identityStageDaemon, daemonStarted)
 	if err != nil {
 		return fmt.Errorf("revalidate Docker daemon identity: %w", err)
 	}
@@ -3046,37 +3057,47 @@ func (b *Backend) TerminalStorageAuthorityFailure() <-chan error {
 // fail — the most data-loss-sensitive subsystem must not be the unmonitored
 // one. (ENG-448 / F31)
 func (b *Backend) Health(ctx context.Context) error {
-	if err := b.requireStorageIdentity(ctx); err != nil {
+	if err := measureBackendHealth(healthStageIdentity, func() error { return b.requireStorageIdentity(ctx) }); err != nil {
 		return fmt.Errorf("backend storage identity unhealthy: %w", err)
 	}
-	if err := b.docker.Ping(ctx); err != nil {
+	if err := measureBackendHealth(healthStageDocker, func() error { return b.docker.Ping(ctx) }); err != nil {
 		return err
 	}
-	if b.pool != nil && b.pool.Stats().AccountingHeld {
-		return shared.ErrResourceAccountingIncomplete
+	if err := measureBackendHealth(healthStageAccounting, func() error {
+		if b.pool != nil && b.pool.Stats().AccountingHeld {
+			return shared.ErrResourceAccountingIncomplete
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if b.callbackStore != nil {
-		if err := b.callbackStore.Healthy(); err != nil {
+		if err := measureBackendHealth(healthStageCallbacks, b.callbackStore.Healthy); err != nil {
 			return fmt.Errorf("callback store unhealthy: %w", err)
 		}
 	}
 	if b.diagnosticsStore != nil {
-		if err := b.diagnosticsStore.Healthy(); err != nil {
+		if err := measureBackendHealth(healthStageDiagnostics, b.diagnosticsStore.Healthy); err != nil {
 			return fmt.Errorf("diagnostics store unhealthy: %w", err)
 		}
 	}
 	if b.releaseStore != nil {
-		if err := b.releaseStore.Healthy(); err != nil {
+		if err := measureBackendHealth(healthStageReleases, b.releaseStore.Healthy); err != nil {
 			return fmt.Errorf("release store unhealthy: %w", err)
 		}
 	}
 	if b.retentionStore != nil {
-		if err := b.retentionStore.Healthy(); err != nil {
+		if err := measureBackendHealth(healthStageRetentions, b.retentionStore.Healthy); err != nil {
 			return fmt.Errorf("retention store unhealthy: %w", err)
 		}
 	}
 	if b.volumeLaunches != nil {
-		count, err := b.volumeLaunches.pendingCount()
+		var count int
+		err := measureBackendHealth(healthStageLaunches, func() error {
+			var countErr error
+			count, countErr = b.volumeLaunches.pendingCount()
+			return countErr
+		})
 		if err != nil {
 			return fmt.Errorf("docker launch journal unhealthy: %w", err)
 		}

@@ -757,15 +757,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Durable Docker provision actor handoff now belongs to the backend lifecycle.
+  A provider disconnect cannot cancel that admitted actor enqueue and
+  turn that admitted operation into a terminal refusal; exact replay keeps the
+  same identity. Refusal logs retain the original bounded cause. (ENG-1001)
+- A vanished volume from an unrelated snapshot-listed container no longer
+  blocks launch when Docker proves that exact container is absent. Unknown or
+  still-present writers remain fenced, including unmanaged writers. The normal
+  operation-recovery pass also reconciles durable restore finalizers after
+  releasing operation claims, so verified source handback does not wait for
+  the hourly retention sweep. Failed handbacks retry on later passes, including
+  after restart; unknown launches remain pending. (ENG-1002)
+- Provider chain and backend health probes start together within the existing
+  three-second remote budget. Stage timings distinguish dependency latency,
+  local validation and backend storage-identity work. Process liveness remains
+  independent of dependency health. (ENG-1006)
 - Closing a lease during a started restart or update uses the existing durable
   close handoff after draining the replacement worker. It no longer requires an
   impossible pre-effect refusal or a backend restart to unblock cleanup. (ENG-997)
 - A lease moving from provisioned to retained between inventory reads no longer
-  quarantines healthy sibling leases. Collection preserves the overlapping lease
-  only as untrusted membership and keeps its mutation fence until a later sweep
-  resolves it. A sealed observation covering that lease across all backends can
+  quarantines healthy siblings or revokes its already confirmed restore owner.
+  Constructor-issued paired overlap may preserve only an existing owner whose
+  storage identity, generation and principal already represent the observation;
+  it grants no new ownership, lifecycle or absence authority. The reconciliation
+  action constructor withholds all lifecycle actions for untrusted membership,
+  even when that lease retains its restore owner. Other rejected
+  membership remains quarantined. A sealed observation across all backends can
   resolve its sole-reporter quarantine even while other leases transition; global
   admission-baseline and empty-backend requirements remain unchanged. (ENG-997)
+- Releasing a reconciliation action invalidates its shared effect authority.
+  Chain acknowledgement, rejection and closure require the same currently held
+  lease claim as backend effects, including when a newer operation has acquired
+  the lease. (ENG-1013)
 - Maintenance recovery can settle an exact stopped source cohort as failed
   instead of wedging startup. Proven lease-local observation conflicts defer
   without blocking sibling recovery; readiness waits now have bounded-label

@@ -2405,10 +2405,23 @@ func (b *Backend) reconcileStateAndOperations(ctx context.Context) error {
 	if err := b.recoverState(ctx); err != nil {
 		return err
 	}
-	if err := b.recoverLiveOperationIntents(ctx); err != nil {
-		return fmt.Errorf("recover interrupted operations: %w", err)
+	operationErr := b.recoverLiveOperationIntents(ctx)
+	if operationErr != nil {
+		operationErr = fmt.Errorf("recover interrupted operations: %w", operationErr)
 	}
-	return nil
+	// Operation recovery releases its exact actor/command scopes before the
+	// restoring finalizers reclaim them. A newly Failed restore can now return
+	// its verified bytes and quota to the source in this same pass; a failed
+	// handback remains durable work on later passes even without a pending
+	// operation. Pending or unknown launches retain their existing owner.
+	// This independent stage re-attests storage and each exact finalizer. An
+	// unrelated operation failure must not unschedule a previously settled
+	// restore; a withdrawn global authority still refuses every mutation here.
+	finalizerErr := b.backgroundMaintenance.reconcileRestoringRecords(ctx)
+	if finalizerErr != nil {
+		finalizerErr = fmt.Errorf("reconcile restoring operations: %w", finalizerErr)
+	}
+	return errors.Join(operationErr, finalizerErr)
 }
 
 // containerEventLoop subscribes to Docker container "die" events and triggers

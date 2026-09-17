@@ -19,6 +19,7 @@ type backgroundMaintenanceCoordinator struct {
 	recoverInterruptedVolumesFn func(context.Context) error
 	recoverClosedLeasesFn       func(context.Context) (map[string]struct{}, error)
 	reconcileRetentionsFn       func(context.Context) error
+	reconcileRestoringRecordsFn func(context.Context) error
 	reconcileVolumeQuotasFn     func(context.Context) error
 	cleanupOrphanedNetworksFn   func(context.Context)
 	reapExpiredRetentionsFn     func(context.Context) (int, error)
@@ -48,6 +49,13 @@ func (c *backgroundMaintenanceCoordinator) reconcileRetentions(ctx context.Conte
 		return errBackgroundMaintenanceUnavailable
 	}
 	return c.reconcileRetentionsFn(ctx)
+}
+
+func (c *backgroundMaintenanceCoordinator) reconcileRestoringRecords(ctx context.Context) error {
+	if c == nil || c.reconcileRestoringRecordsFn == nil {
+		return errBackgroundMaintenanceUnavailable
+	}
+	return c.reconcileRestoringRecordsFn(ctx)
 }
 
 func (c *backgroundMaintenanceCoordinator) reconcileVolumeQuotas(ctx context.Context) error {

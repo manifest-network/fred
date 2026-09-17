@@ -1153,8 +1153,9 @@ func (s *Store) deriveInventoryAuthorityLocked(projection *inventoryProjection) 
 // that backend with equivalent generation and principal semantics. Such a
 // redundant fact may discharge the marker; every non-equivalent exclusion
 // keeps it set. Untrusted reporters are never omittable because their semantic
-// class requires durable quarantine even when the backend name already appears
-// on the current row.
+// class must be submitted for Store interpretation. Explicitly rejected evidence
+// requires quarantine; constructor-issued paired overlap may instead preserve an
+// already represented confirmed owner without granting new authority.
 // Caller holds s.mu.
 func (s *Store) validateProjectionAggregateLocked(
 	projection inventoryProjection,

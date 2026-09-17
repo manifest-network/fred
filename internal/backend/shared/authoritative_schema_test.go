@@ -101,7 +101,7 @@ func retentionSchemaHooks(
 	}
 }
 
-func initializeBoundRetentionStore(t *testing.T) (string, backendidentity.VerifiedStorage) {
+func initializeBoundRetentionStore(t testing.TB) (string, backendidentity.VerifiedStorage) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "retention.db")
@@ -265,8 +265,10 @@ func TestIdentityBoundReleaseAndRetentionOpenRejectUnknownRoot(t *testing.T) {
 			},
 		},
 		{
-			name:       "retention",
-			initialize: initializeBoundRetentionStore,
+			name: "retention",
+			initialize: func(t *testing.T) (string, backendidentity.VerifiedStorage) {
+				return initializeBoundRetentionStore(t)
+			},
 			open: func(path string, storage backendidentity.VerifiedStorage) error {
 				_, err := OpenIdentityBoundRetentionStore(
 					RetentionStoreConfig{DBPath: path}, storage, newTestStorageAuthorityGate(t),

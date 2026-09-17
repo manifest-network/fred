@@ -2,10 +2,13 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 
 	"github.com/docker/docker/api/types/container"
+
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 // ListVolumeWriters deliberately has no Fred label filter. An unmanaged or
@@ -19,6 +22,7 @@ func (d *DockerClient) ListVolumeWriters(ctx context.Context) ([]ContainerInfo, 
 	}
 	result := make([]ContainerInfo, 0, len(all))
 	volumeSources := make(map[[2]string]string)
+containers:
 	for _, current := range all {
 		info := ContainerInfo{ContainerID: current.ID, Status: current.State}
 		for _, mount := range current.Mounts {
@@ -34,7 +38,16 @@ func (d *DockerClient) ListVolumeWriters(ctx context.Context) ([]ContainerInfo, 
 					}
 					volume, err := d.client.VolumeInspect(ctx, mount.Name)
 					if err != nil {
-						return nil, fmt.Errorf("inspect writable volume %q: %w", mount.Name, err)
+						// The independent list and volume read may straddle another
+						// lease's close. Only the configured daemon's exact immutable
+						// container observation can retire this stale writer candidate;
+						// a volume error alone says nothing about its access to storage.
+						observed, inspectErr := d.inspectInstance(ctx, current.ID)
+						if inspectErr == nil && observed != nil && observed.Phase == leasesm.PhaseAbsent {
+							continue containers
+						}
+						return nil, fmt.Errorf("container %q writable volume %q remains unresolved: %w",
+							current.ID, mount.Name, errors.Join(err, inspectErr, ctx.Err()))
 					}
 					if volume.Name != mount.Name || volume.Driver != mount.Driver || !filepath.IsAbs(volume.Mountpoint) {
 						return nil, fmt.Errorf("writable volume %q has no verified host mountpoint", mount.Name)

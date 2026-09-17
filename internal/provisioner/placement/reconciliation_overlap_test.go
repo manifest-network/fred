@@ -131,8 +131,8 @@ func TestCollectedInventoryCloseTransitionPreservesSiblingAuthority(t *testing.T
 				"represented lease-local ambiguity must preserve the established baseline")
 			assert.False(t, store.inventoryRecoveryRequired)
 
-			assert.Equal(t, StateUnusable, store.Lookup(closingLease).State(),
-				"the overlapping lease must retain conservative positive membership")
+			assert.Equal(t, StateConfirmed, store.Lookup(closingLease).State(),
+				"same-owner overlap cannot revoke the already represented source generation")
 			assert.Equal(t, StateConfirmed, store.Lookup(healthyLease).State(),
 				"a normal close on one lease must not quarantine the whole backend")
 			claim, claimed, err := store.claimAttempt(healthyLease, healthyID)

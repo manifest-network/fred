@@ -1412,23 +1412,8 @@ func (b *Backend) runRetentionSweepUsing(
 		if err := b.retryReapingRecordsUsing(ctx, destroyVolumes); err != nil {
 			errs = append(errs, fmt.Errorf("retry reaping: %w", err))
 		}
-		if recs, err := b.retentionStore.ListRestoring(); err != nil {
-			errs = append(errs, fmt.Errorf("list restoring: %w", err))
-		} else {
-			for _, e := range recs {
-				// A per-record failure deliberately parks the finalizer for the
-				// next sweep, but it is still part of this sweep's outcome. Keep
-				// reconciling independent records and join every exact failure so
-				// monitoring cannot report success while a restore is wedged.
-				if err := b.reconcileRestoringWithAuthorityUsing(
-					ctx, e, renameVolume, teardown, destroyVolumes, ensureQuota,
-				); err != nil {
-					errs = append(errs, fmt.Errorf(
-						"reconcile restoring source %q destination %q: %w",
-						e.OriginalLeaseUUID, e.NewLeaseUUID, err,
-					))
-				}
-			}
+		if err := b.reconcileRestoringRecordsUsing(ctx, renameVolume, teardown, destroyVolumes, ensureQuota); err != nil {
+			errs = append(errs, err)
 		}
 		// ENG-370: prune orphaned records BEFORE ENG-360's accounting refresh so the
 		// retained-disk projection reflects this sweep's prunes. The refresh runs even
@@ -1453,10 +1438,50 @@ func (b *Backend) runRetentionSweepUsing(
 	return nil
 }
 
+// reconcileRestoringRecordsUsing is the shared finalizer stage for the state
+// recovery cadence and the retention sweep. It selects work only from durable
+// Restoring rows; each row must reclaim a fresh destination scope and a sealed
+// operation outcome before it can mutate substrate or return source authority.
+func (b *Backend) reconcileRestoringRecordsUsing(
+	ctx context.Context,
+	renameVolume backgroundVolumeRename,
+	teardown teardownMutationCapability,
+	destroyVolumes volumeDestroyMutationCapability,
+	ensureQuota backgroundVolumeQuota,
+) error {
+	if renameVolume == nil || teardown == nil || destroyVolumes == nil || ensureQuota == nil {
+		return errBackgroundMaintenanceUnavailable
+	}
+	if b.retentionStore == nil {
+		return nil
+	}
+	if err := b.requireStorageIdentity(ctx); err != nil {
+		return fmt.Errorf("backend storage identity verification failed: %w", err)
+	}
+	records, err := b.retentionStore.ListRestoring()
+	if err != nil {
+		return fmt.Errorf("list restoring: %w", err)
+	}
+	var errs []error
+	for _, entry := range records {
+		// Keep independent finalizers progressing, while retaining each failed
+		// row and reporting its failure for the next level-triggered pass.
+		if err := b.reconcileRestoringWithAuthorityUsing(
+			ctx, entry, renameVolume, teardown, destroyVolumes, ensureQuota,
+		); err != nil {
+			errs = append(errs, fmt.Errorf(
+				"reconcile restoring source %q destination %q: %w",
+				entry.OriginalLeaseUUID, entry.NewLeaseUUID, err,
+			))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // retentionSweepInterval is the pure gating decision for the periodic sweep.
 // Returns (interval, enabled). The sweep runs when reaping is enabled OR
-// retention is in use (RetainOnClose), so a failed restore rollback's
-// restoring-record reconcile happens at runtime — not only at process restart.
+// retention is in use (RetainOnClose). Restoring finalizers also converge on
+// the ordinary state/operation cadence, independently of this reaper's gate.
 // reapExpiredRetentions itself no-ops when RetentionMaxAge<=0, so in the
 // retain-only mode the sweep just performs the restoring-reconcile.
 func (b *Backend) retentionSweepInterval() (time.Duration, bool) {
@@ -1464,7 +1489,7 @@ func (b *Backend) retentionSweepInterval() (time.Duration, bool) {
 		return 0, false
 	}
 	if b.cfg.RetentionMaxAge <= 0 && !b.cfg.RetainOnClose {
-		return 0, false // nothing to reap, nothing to reconcile
+		return 0, false // restoring finalizers retain their state-recovery owner
 	}
 	interval := b.cfg.RetentionReapInterval
 	if interval <= 0 {

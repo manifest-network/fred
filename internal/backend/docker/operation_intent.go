@@ -347,6 +347,15 @@ func (b *Backend) refuseOperationIntent(claim shared.OperationIntentClaim, cause
 		// keep its write-ahead attempt for startup recovery.
 		return fmt.Errorf("operation refused but durable intent settlement failed: %s: %w", cause.Error(), err)
 	}
+	// Keep the wire callback curated while recording the actual local cause.
+	// No request or callback fields are attached. The cause is local diagnostic
+	// text, bounded to prevent unusually large dependency errors flooding logs.
+	b.logger.Warn("operation refused before asynchronous acceptance",
+		"lease_uuid", claim.LeaseUUID(),
+		"operation", claim.Kind(),
+		"operation_fingerprint", claim.OperationID().Fingerprint(),
+		"cause", fmt.Sprintf("%.1024s", fmt.Sprint(cause)),
+	)
 	return cause
 }
 

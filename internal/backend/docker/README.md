@@ -247,6 +247,13 @@ releasing it. This lets XFS deletion prove zero project usage without a waiting
 or deleting workflow itself holding the final inode open. The writer inventory resolves
 named-volume sources and symlink aliases; unrelated sockets, FIFOs and devices
 do not themselves conflict with a managed directory.
+The inventory includes unmanaged writers. If a volume disappears between the
+container list and volume inspection, the concrete Docker transport re-observes
+that exact immutable container. Only attested container absence retires the stale
+writer candidate. A missing volume alone, a present container, or an uncertain
+inspection keeps launch fenced. A preparation failure may already own created
+or adopted volume state; its exact durable operation retains cleanup and restore
+rollback responsibility rather than being reclassified as a pre-effect refusal.
 
 Before pulling a replacement image or retiring its source, maintenance captures
 the source's immutable image content/platform, effective Docker configuration,
@@ -1098,7 +1105,14 @@ and retention reaping. Unattributed managed volumes are preserved for explicit
 operator attribution; there is no inference-driven cleanup phase or separate preflight
 owner that can consume an operation's empty destination. Periodic `recoverState`
 retries operations, maintenance, close convergence, and exact late-container
-cleanup. Provision and restore intents share one absolute recovery horizon derived
+cleanup. After operation scopes are released, the same pass reconciles durable
+`Restoring` finalizers through their existing exact Failed/Committed/Pending
+decisions. Verified failed destinations can return source ownership in that
+pass; a failed handback remains scheduled on later recovery passes even after
+the operation journal has settled. An unrelated operation error does not skip
+this independently attested finalizer stage. Unknown launches remain pending,
+and the retention sweep remains a separate retry path.
+Provision and restore intents share one absolute recovery horizon derived
 from durable admission time and the configured `provision_timeout`. Exact-empty
 or transitional cohorts before that deadline remain Pending and are observed
 again by the periodic sweep; they do not block startup. A future admission

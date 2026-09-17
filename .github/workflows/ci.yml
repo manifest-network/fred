@@ -49,6 +49,11 @@ jobs:
         # replay fixture and worker fan-out without seeding the largest backlog.
         run: go test -run '^$' -bench '^BenchmarkCallbackOutboxReplayBacklog$/^leases=(1|128)$' -benchtime=1x ./internal/backend/shared
 
+      - name: Smoke-test retention health benchmark
+        # Keep the identity-bound fixture executable as journal schemas evolve.
+        # Timing under CI is diagnostic, not a deployment latency assertion.
+        run: go test -run '^$' -bench '^BenchmarkRetentionHealth$/^rows=(0|871)$' -benchtime=1x ./internal/backend/shared
+
       - name: Preserve coverage profile
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

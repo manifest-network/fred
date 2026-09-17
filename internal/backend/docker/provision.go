@@ -443,16 +443,6 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 	// down. The wait is bounded by workExitWaitTimeout; a truly wedged
 	// worker is left as a zombie and recoverState reconciles on next
 	// start.
-	provCtx, provCancel := b.shutdownAwareContext()
-	command, ack, commandErr := leasesm.NewProvisionCommand(provCtx, admission)
-	if commandErr != nil {
-		provCancel()
-		return rollbackUnacceptedProvision(commandErr)
-	}
-	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, command); routeErr != nil {
-		provCancel()
-		return rollbackUnacceptedProvision(routeErr)
-	}
 	// Wait for the actor to fire evProvisionRequested on its SM. Only an
 	// explicit rejection proves no worker exists and authorizes rollback. Once
 	// enqueued, cancellation is an unknown outcome: preserve the intent,
@@ -461,14 +451,13 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 	// An explicitly rejected fresh command releases its reservation. A rejected
 	// replacement command has not crossed Started, so its failed predecessor and
 	// allocation remain unchanged.
-	acceptance, err := b.awaitAsyncAcceptance(ctx, ack.Result())
+	acceptance, err := b.handoffProvisionAdmission(ctx, admission)
 	switch acceptance {
 	case asyncAcceptanceAccepted:
 		return nil
 	case asyncAcceptanceUnknown:
 		return fmt.Errorf("provision acceptance is unknown; durable recovery retained: %s", err.Error())
 	case asyncAcceptanceRejected:
-		provCancel()
 		return rollbackUnacceptedProvision(err)
 	default:
 		return fmt.Errorf("invalid provision acceptance state %d", acceptance)

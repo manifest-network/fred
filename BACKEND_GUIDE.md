@@ -311,6 +311,13 @@ identity as the HMAC-covered `backend_storage_id` query parameter.
 
 Start provisioning a resource asynchronously.
 
+After durable operation and resource admission, the bundled Docker backend owns
+actor enqueue and worker lifetime under its shutdown-aware provision deadline.
+The HTTP request context owns only the acknowledgment wait. A provider disconnect
+cannot turn this admitted operation into a pre-effect refusal; a lost response
+retains the exact intent for idempotent replay. Only a source-observed failure to
+enqueue or explicit actor rejection can authorize the existing refusal path.
+
 **Request:**
 ```json
 {

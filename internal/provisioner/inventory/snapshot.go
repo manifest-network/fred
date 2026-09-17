@@ -99,6 +99,7 @@ type Session struct {
 	provision map[string]endpointObservation
 	retention map[string]endpointObservation
 	untrusted map[string]map[string]struct{}
+	overlaps  map[string]map[string]ProvisionObservation
 }
 
 type endpointObservation struct {
@@ -167,6 +168,7 @@ func (collector *Collector) Begin() *Session {
 		provision: make(map[string]endpointObservation, len(collector.topology)),
 		retention: make(map[string]endpointObservation, len(collector.topology)),
 		untrusted: make(map[string]map[string]struct{}),
+		overlaps:  make(map[string]map[string]ProvisionObservation),
 	}
 }
 
@@ -363,6 +365,13 @@ func (session *Session) partitionBackend(backendName string) BackendObservation 
 		if session.untrusted[backendName] == nil {
 			session.untrusted[backendName] = make(map[string]struct{})
 		}
+		if _, rejected := session.untrusted[backendName][leaseUUID]; !rejected &&
+			provision.storageID.Valid() && provision.storageID == retention.storageID {
+			if session.overlaps[backendName] == nil {
+				session.overlaps[backendName] = make(map[string]ProvisionObservation)
+			}
+			session.overlaps[backendName][leaseUUID] = provision.provisions[leaseUUID]
+		}
 		session.untrusted[backendName][leaseUUID] = struct{}{}
 	}
 	// Explicitly rejected observations use the same exclusive arm regardless
@@ -402,6 +411,7 @@ func (session *Session) RecordUntrusted(backendName string, leaseUUIDs []string)
 			return fmt.Errorf("%w: blank lease identity", ErrInvalidSession)
 		}
 		present[leaseUUID] = struct{}{}
+		delete(session.overlaps[backendName], leaseUUID)
 	}
 	return nil
 }
@@ -416,6 +426,7 @@ type Snapshot struct {
 	provision map[string]endpointObservation
 	retention map[string]endpointObservation
 	untrusted map[string]map[string]struct{}
+	overlaps  map[string]map[string]ProvisionObservation
 }
 
 // Present distinguishes an issued Snapshot from its invalid zero value without
@@ -486,11 +497,16 @@ func (session *Session) Seal() (Snapshot, error) {
 		session.partitionBackend(backendName)
 	}
 	session.sealed = true
+	overlaps := make(map[string]map[string]ProvisionObservation, len(session.overlaps))
+	for name, rows := range session.overlaps {
+		overlaps[name] = maps.Clone(rows)
+	}
 	return Snapshot{
 		collector: session.collector, issuer: session.issuer, epoch: session.epoch,
 		provision: cloneObservations(session.provision),
 		retention: cloneObservations(session.retention),
 		untrusted: cloneMembership(session.untrusted),
+		overlaps:  overlaps,
 	}, nil
 }
 

@@ -201,3 +201,63 @@ func drainOverlapCalls(calls <-chan string) []string {
 		}
 	}
 }
+
+func TestReconcilerPairedOverlapPreservesOwnerWithoutLifecycleActions(t *testing.T) {
+	const source = "00000000-0000-4000-8000-000000000291"
+	const sibling = "00000000-0000-4000-8000-000000000292"
+	var leases []billingtypes.Lease
+	acknowledged := make(chan string, 8)
+	rejected := make(chan string, 8)
+	chain := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) { return leases, nil },
+		RejectLeasesFunc: func(_ context.Context, ids []string, _ string) (uint64, []string, error) {
+			for _, id := range ids {
+				rejected <- id
+			}
+			return 1, []string{"tx"}, nil
+		},
+	}
+	ack := &mockAcknowledger{acknowledgeFn: func(_ context.Context, id string) (bool, string, error) {
+		acknowledged <- id
+		return true, "tx", nil
+	}}
+	owner := &mockReconcilerBackend{name: "backend-a"}
+	peer := &mockReconcilerBackend{name: "backend-b"}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+		{Backend: owner, IsDefault: true}, {Backend: peer},
+	}})
+	require.NoError(t, err)
+	store, err := placementstore.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	r, err := newTestReconciler(t, ReconcilerConfig{}, chain, ack, router, nil, store)
+	require.NoError(t, err)
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	leases = overlapPendingLeases(source, sibling)
+	owner.provisions = []backend.ProvisionInfo{
+		{
+			LeaseUUID: source, Status: backend.ProvisionStatusReady,
+			Tenant: "tenant-overlap", ProviderUUID: placementstore.ProviderUUID,
+			LifecycleGeneration: &backend.LifecycleGenerationObservation{
+				Kind: backend.LifecycleGenerationTyped, ID: "123e4567-e89b-42d3-a456-426614174000",
+			},
+		},
+		{LeaseUUID: sibling, Status: backend.ProvisionStatusReady},
+	}
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	require.ElementsMatch(t, []string{source, sibling}, drainOverlapCalls(acknowledged))
+	before := store.Lookup(source)
+	owner.provisions[0].Status = backend.ProvisionStatusFailed
+	owner.provisions[0].FailCount = 100
+	owner.retentions = []backend.RetainedLease{{LeaseUUID: source}}
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	assert.Equal(t, before, store.Lookup(source), "lifecycle overlap must preserve established owner affinity")
+	assert.Equal(t, []string{sibling}, drainOverlapCalls(acknowledged))
+	assert.Empty(t, drainOverlapCalls(rejected), "overlap cannot expose the stale Failed row")
+	for _, client := range []*mockReconcilerBackend{owner, peer} {
+		client.mu.Lock()
+		assert.Empty(t, client.provisionCalls)
+		assert.Empty(t, client.deprovisionCalls)
+		client.mu.Unlock()
+	}
+}

@@ -50,6 +50,11 @@
 // while validated sibling rows keep their authority. Such a sweep is incomplete
 // and cannot establish a new AdmissionBaseline; excluded ambiguous membership
 // retains its durable pending marker until safely represented or resolved.
+// Constructor-issued, identity-valid overlap may preserve an existing confirmed
+// sole owner with no attempt when its current lifecycle and principal already
+// represent the row. This redundant observation grants no new authority and
+// does not revoke retained-source restore affinity. Explicit rejection cannot
+// issue that observation; contradictions still require quarantine.
 // A later sole-reporter proof may resolve only a single known-candidate
 // untrusted quarantine. It accounts for that exact lease across all paired,
 // identity-valid backend endpoints, independently of other leases' ambiguity;

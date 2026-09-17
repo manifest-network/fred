@@ -152,6 +152,9 @@ func newBackgroundMaintenanceCoordinator(
 		reconcileRetentionsFn: func(ctx context.Context) error {
 			return backend.reconcileRetentionsUsing(ctx, renameVolume, teardown, destroyVolumes, ensureVolumeQuota)
 		},
+		reconcileRestoringRecordsFn: func(ctx context.Context) error {
+			return backend.reconcileRestoringRecordsUsing(ctx, renameVolume, teardown, destroyVolumes, ensureVolumeQuota)
+		},
 		reconcileVolumeQuotasFn: func(ctx context.Context) error {
 			return backend.reconcileVolumeQuotasUsing(ctx, ensureVolumeQuota)
 		},

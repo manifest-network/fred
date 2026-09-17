@@ -397,7 +397,12 @@ Reconciler interplay (level-triggered backstop):
   repair.
   Rejected inventory payloads do not become ownership authority, but neither may
   their positive membership disappear into apparent absence. Fred persists those
-  candidates as `untrusted_positive` quarantine across restart. Only a sole
+  candidates as `untrusted_positive` quarantine across restart. A validated
+  same-storage endpoint overlap has a separate constructor-issued observation:
+  Store may preserve an existing confirmed sole owner with no attempt when its
+  generation and principal already account for the row. It changes no placement
+  or lifecycle authority and cannot establish a baseline or absence. Explicit
+  rejection cannot issue this observation. Only a sole
   candidate observed again on the same backend can self-resolve through a
   collector-issued proof covering that exact lease across every identity-valid
   paired backend response. Unrelated leases may remain ambiguous; a missing peer
@@ -431,7 +436,11 @@ Reconciler interplay (level-triggered backstop):
   retention receipts for one backend are consumed together; identity,
   refresh, and cross-endpoint checks decide the closed authoritative, partial,
   or untrusted variant inside the sweep. Overlapping leases in a partial result
-  retain only untrusted membership; sibling rows keep their validated evidence.
+  retain no positive lifecycle payload; sibling rows keep their validated evidence.
+  A paired-overlap observation can preserve an already represented owner without
+  promoting rejected membership or clearing an unresolved attempt.
+  The action constructor still refuses untrusted lease membership from that
+  sealed sweep; preserved restore affinity cannot become reconciliation work.
   An unmatched receipt can only be rejected as
   untrusted, and outstanding receipts make sealing impossible. A successful
   semantic projection clears the exact marker atomically; an orderly, sealed,
@@ -1589,7 +1598,10 @@ Tracks which backend serves each lease (bbolt + in-memory cache):
   report confirms attempted ownership only with the exact paired typed
   lifecycle generation; contradictory positives are
   unioned with every prior owner/attempt into durable conflict quarantine.
-  Overlap between sequential provision/retention reads rejects only that lease;
+  Overlap between sequential provision/retention reads withholds lifecycle
+  evidence only for that lease. A constructor-issued same-storage overlap can
+  preserve its already represented confirmed sole owner without granting new
+  authority. Other rejected membership is quarantined;
   malformed responses, missing or inconsistent endpoint storage identity, and
   conflicts with a durable storage-identity pin reject the backend response.
   Raw positive membership survives as distinct `untrusted_positive` quarantine.
@@ -1712,6 +1724,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_backend_request_duration_seconds` | histogram | `backend, operation, status` | Backend request latency |
 | `fred_backend_circuit_breaker_state` | gauge | `backend` | Circuit breaker state (0=closed, 1=half-open, 2=open) |
 | `fred_backend_healthy` | gauge | `backend` | Backend health (1=healthy, 0=unhealthy). Written **only** from inside the `/health` and `/readyz` handlers, so it is exactly as fresh as whatever polls them; with no prober it latches at its last value rather than going absent |
+| `fred_health_check_duration_seconds` | histogram | `check`, `backend` | Duration of each completed chain, backend or local health check, including failures. `check` is `chain`, `backend`, `token_tracker`, `placement_store`, `placement_inventory` or `payload_store`; `backend` is empty except for a configured backend probe. Chain and backends start together within the three-second remote budget; local filesystem/lock waits remain synchronous |
 | `fred_health_check_healthy` | gauge | `check` | Health of a non-backend dependency as observed by the health handler — `chain`, `token_tracker`, `placement_store`, `placement_inventory`, `payload_store` (1=healthy, 0=unhealthy). `placement_store=0` also covers sticky runtime path/inode withdrawal or an outcome-unknown commit; `placement_inventory` is the topology-bound admission baseline and is always present. Backends are excluded because `fred_backend_healthy` already carries a per-backend label this one cannot express. Same freshness caveat |
 | `fred_backend_insufficient_resources_total` | counter | `backend`, `verdict` | Capacity 503s split into `coded_refusal` (contract-conforming; exact attempt is clearable) and `ambiguous` (legacy/code-less/unknown-code; attempt retained) |
 | `fred_backend_malformed_error_body_total` | counter | `backend`, `operation` | Client-error responses whose body was not the declared JSON error envelope |
@@ -1805,6 +1818,8 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_restore_total` | counter | `outcome` | Restore re-deploy worker attempts by `outcome` ∈ `success`/`failure`. Unlike the success-only `restore_duration_seconds`, it also counts the failure path (`rollbackRestoreAdoption`, panics included), so a docker-backend restore success rate is computable. Worker-scoped like `restore_duration_seconds` and `provisions_total`: a restore that fails in the synchronous adopt prelude (claim/rename/route/ack) before the worker spawns surfaces as the synchronous `Restore()` error and is counted by neither outcome here |
 | `fred_docker_backend_replace_phase_duration_seconds` | histogram | `operation, phase` | Target replacement phase duration. `operation` ∈ `restart`/`update`/`restore`; `phase` ∈ `adopt` (restore-only volume rename), `image_setup`, `volume_setup` (materialize roots, reserve/drain prior writers, prepare/chown binds), `compose_up` (protected create/start and launch-receipt settlement), `verify_startup`. Source compensation is outside these phase timings |
 | `fred_docker_backend_volume_launches_pending` | gauge | — | Outstanding Docker launch receipts at the last successful backend health inspection. Transient entries are normal during launch; sustained entries require inspection and, for unknown requests, the stopped operator-fence workflow in `OPERATIONS.md` |
+| `fred_docker_backend_health_check_duration_seconds` | histogram | `check` | Completed health stages: `storage_identity`, `docker_ping`, `resource_accounting`, `callback_store`, `diagnostics_store`, `release_store`, `retention_store`, `launch_journal`. Failed stages prevent later samples |
+| `fred_docker_backend_storage_identity_check_duration_seconds` | histogram | `check` | Production identity-verifier invocations, including callbacks: `total`, `lock_wait`, `substrate`, `daemon_info`, `stores`. Rejections before verifier invocation contribute no sample. Timings overlap: total includes all stages, substrate includes daemon info, and health identity timing includes its own verification. Includes failure and synchronous waits; see the health runbook |
 | `fred_docker_backend_resource_cpu_allocated_ratio` | gauge | — | Allocated/total CPU |
 | `fred_docker_backend_resource_memory_allocated_ratio` | gauge | — | Allocated/total memory |
 | `fred_docker_backend_resource_disk_allocated_ratio` | gauge | — | Allocated/total physical disk. Docker includes durable `disk_mb` plus the pinned scratch allowance for every live diskless instance, even if no managed scratch directory was ultimately needed |

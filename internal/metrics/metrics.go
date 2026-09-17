@@ -525,6 +525,17 @@ var (
 		Name:      "check_healthy",
 		Help:      "Health of an individual providerd dependency as observed by the health handler (1 = healthy, 0 = unhealthy). Backends are covered by fred_backend_healthy instead. Only as fresh as the last /health or /readyz request; latches rather than going absent if nothing polls.",
 	}, []string{"check"})
+
+	// HealthCheckDuration measures each completed probe, including failures and
+	// caller cancellations. Check is a fixed stage; backend is empty except for
+	// configured backend probes. Local store timings include synchronous waits.
+	HealthCheckDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: "health",
+		Name:      "check_duration_seconds",
+		Help:      "Elapsed time of each completed providerd health dependency probe, including failures and cancellations. Backend names come from configuration; local store probes include synchronous waits.",
+		Buckets:   prometheus.DefBuckets,
+	}, []string{"check", "backend"})
 )
 
 // Chain metrics
