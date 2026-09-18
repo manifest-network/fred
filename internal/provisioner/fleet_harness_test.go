@@ -685,15 +685,6 @@ func (f *fakeBackendServer) totalProvisionCalls() int {
 	return n
 }
 
-// listCallCount is how many times fred actually dialed /provisions. It goes to
-// zero-growth once the circuit breaker opens, which is the only externally
-// visible difference between "failing" and "short-circuited".
-func (f *fakeBackendServer) listCallCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.listCalls
-}
-
 // ---------------------------------------------------------------------------
 // The fleet
 // ---------------------------------------------------------------------------

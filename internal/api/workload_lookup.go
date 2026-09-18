@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -31,7 +32,7 @@ func (batch workloadLookupBatch) lookup(ctx context.Context) ([]backend.Provisio
 	}
 	for _, row := range rows {
 		if _, ok := requested[row.LeaseUUID]; !ok {
-			return nil, fmt.Errorf("workload lookup returned unrequested lease %q", row.LeaseUUID)
+			return nil, errors.New("workload lookup returned an unrequested lease UUID")
 		}
 	}
 	return rows, nil

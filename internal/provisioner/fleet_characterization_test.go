@@ -1059,24 +1059,68 @@ func TestFleet_DegradedSweep_EmitsDegradedOutcomeAndWithholdsSuccess(t *testing.
 		"sweep_complete must report 0 while the fleet view is incomplete")
 }
 
-// The circuit breaker is part of the transport, so an unreachable backend stops
-// being contacted at all once it trips. That matters for ENG-356: a tripped
-// breaker must mark the backend unanswered without a retry, and this pins the
-// observable — the client stops issuing HTTP requests entirely.
-func TestFleet_RepeatedFailures_OpenCircuitStopsHTTPRequests(t *testing.T) {
+// Tenant failures must stop tenant requests without suppressing the inventory
+// needed to observe recovery. A successful recovery sweep is not permission to
+// reset the independent tenant breaker or dispatch a tenant request through it.
+func TestFleet_OpenTenantCircuitPreservesInventoryRecovery(t *testing.T) {
 	t.Parallel()
 	f := newFleet(t, fleetOptions{})
-
 	f.addLease("lease-cb", billingtypes.LEASE_STATE_ACTIVE)
-	f.backendAt(2).setFault(faultHTTP500)
+	server := f.backendAt(2)
+	server.seedProvision(t, "lease-cb", f.providerUUID, backend.ProvisionStatusReady)
+	require.NoError(t, f.sweep())
+	f.assertPlacementPinned("lease-cb", server.name)
+	client := f.router.GetBackendByName(server.name)
+	require.NotNil(t, client)
+	counts := func() [2]int {
+		server.mu.Lock()
+		defer server.mu.Unlock()
+		return [2]int{server.listCalls, server.retentionCalls}
+	}
 
-	// Default CBFailureThresh is 5 consecutive failures.
-	_ = f.sweepN(5)
-	callsAtTrip := f.backendAt(2).listCallCount()
+	server.setFault(faultHTTP500)
+	beforeTrip := counts()
+	// Only actual tenant calls open the tenant circuit. Inventory failures no
+	// longer count toward its default threshold of five consecutive failures.
+	for range 5 {
+		_, err := client.LookupProvisions(t.Context(), []string{fleetLeaseUUID("lease-cb")})
+		require.Error(t, err)
+		require.NotErrorIs(t, err, backend.ErrCircuitOpen)
+	}
+	require.Equal(t, [2]int{beforeTrip[0] + 5, beforeTrip[1]}, counts())
+	assertTenantBlocked := func() {
+		before := counts()
+		_, err := client.LookupProvisions(t.Context(), []string{fleetLeaseUUID("lease-cb")})
+		require.ErrorIs(t, err, backend.ErrCircuitOpen)
+		require.Equal(t, before, counts(), "a tenant request must not dial while its circuit is open")
+	}
+	assertTenantBlocked()
+	for range 2 {
+		before := counts()
+		require.NoError(t, f.sweep())
+		require.Equal(t, [2]int{before[0] + 1, before[1] + 1}, counts(),
+			"each degraded sweep still attempts both complete inventory endpoints")
+		f.assertPlacementPinned("lease-cb", server.name)
+		assertTenantBlocked()
+	}
 
-	_ = f.sweepN(2)
-	callsAfter := f.backendAt(2).listCallCount()
-
-	require.Equal(t, callsAtTrip, callsAfter,
-		"once the breaker is open the client must short-circuit instead of dialing the backend")
+	server.setFault(faultNone)
+	f.addLease("lease-cb-recovered", billingtypes.LEASE_STATE_PENDING)
+	server.seedProvision(t, "lease-cb-recovered", f.providerUUID, backend.ProvisionStatusReady)
+	server.seedRetention("lease-cb-retained")
+	beforeRecovery := counts()
+	require.NoError(t, f.sweep())
+	require.Equal(t, [2]int{beforeRecovery[0] + 1, beforeRecovery[1] + 1}, counts())
+	f.assertPlacementPinned("lease-cb-recovered", server.name)
+	f.assertPlacementPinned("lease-cb-retained", server.name)
+	acked, _, _ := f.chainCalls()
+	require.Contains(t, acked, fleetLeaseUUID("lease-cb-recovered"),
+		"fresh Ready inventory must permit reconciliation before the tenant breaker probes again")
+	assertTenantBlocked()
+	for _, srv := range f.servers {
+		require.Zero(t, srv.provisionCount("lease-cb"))
+		require.Zero(t, srv.provisionCount("lease-cb-recovered"))
+		require.Zero(t, srv.deprovisionCount("lease-cb"))
+		require.Zero(t, srv.deprovisionCount("lease-cb-recovered"))
+	}
 }
