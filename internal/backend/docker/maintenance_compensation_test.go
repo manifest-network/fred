@@ -42,17 +42,27 @@ func frozenCompensationFixture(info ContainerInfo, imageID string) *compensation
 
 func TestMaintenanceCompensationDockerRestoresFrozenImageAndPolicyAfterTargetFailure(t *testing.T) {
 	t.Run("current authority", func(t *testing.T) {
-		testFrozenDockerCompensation(t, newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate), false)
+		testFrozenDockerCompensation(t, newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate), false, false)
 	})
 	t.Run("v0.13 moved callback base", func(t *testing.T) {
-		testFrozenDockerCompensation(t, newLegacyMaintenanceRecoveryHarnessForKindAtCallback(t, shared.MaintenanceIntentUpdate, "https://new-provider.example/callbacks/provision"), false)
+		testFrozenDockerCompensation(t, newLegacyMaintenanceRecoveryHarnessForKindAtCallback(t, shared.MaintenanceIntentUpdate, "https://new-provider.example/callbacks/provision"), false, false)
 	})
 	t.Run("completed Compose rejection", func(t *testing.T) {
-		testFrozenDockerCompensation(t, newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate), true)
+		testFrozenDockerCompensation(t, newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate), true, false)
 	})
 }
 
-func testFrozenDockerCompensation(t *testing.T, h *maintenanceRecoveryHarness, composeRejects bool) {
+func TestMaintenanceCompensationStartupWaitSurvivesJournalReopen(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate)
+		// Source compensation has a two-minute execution budget. A longer
+		// stabilization window leaves a durable, fully launched source pending.
+		h.b.cfg.StartupVerifyDuration = 3 * time.Minute
+		testFrozenDockerCompensation(t, h, true, true)
+	})
+}
+
+func testFrozenDockerCompensation(t *testing.T, h *maintenanceRecoveryHarness, composeRejects, pendingAge bool) {
 	h.appendTarget(true)
 	mock := h.b.docker.(*mockDockerClient)
 	sourceID, targetID := fixtureImageID("source immutable"), fixtureImageID("moved mutable tag")
@@ -140,6 +150,28 @@ func testFrozenDockerCompensation(t *testing.T, h *maintenanceRecoveryHarness, c
 	execution, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
 	require.NoError(t, err)
 	outcome := h.b.maintenanceSettlement.ExecuteMaintenance(t.Context(), execution)
+	if pendingAge {
+		require.IsType(t, shared.MaintenanceExecutionAmbiguous{}, outcome)
+		require.Equal(t, 2, starts, "both source effects completed before readiness timeout")
+		h.reopen()
+		ops, err = storageMutationOperationsForTest(h.b)
+		require.NoError(t, err)
+		require.NoError(t, bindDockerMaintenanceCompensation(h.b, ops))
+		h.b.cfg.ProvisionTimeout = time.Nanosecond
+		require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()), "historical target failure must not turn a current readiness wait into a fatal pass error")
+		intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
+		require.NoError(t, err)
+		require.Len(t, intents, 1)
+		pending, err := h.callbacks.ListPending()
+		require.NoError(t, err)
+		require.Empty(t, pending)
+		time.Sleep(3 * time.Minute)
+		require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
+		h.assertSettled(backend.CallbackStatusFailed)
+		require.Equal(t, 1, composeCalls, "recovery cannot replay the failed target")
+		require.Equal(t, 2, starts, "recovery only observes the already launched source")
+		return
+	}
 	failed, ok := outcome.(shared.MaintenanceExecutionFailure)
 	require.True(t, ok, "outcome = %T (%+v)", outcome, outcome)
 	require.True(t, failed.SourceRecovered(), "source restoration must yield the original active release")

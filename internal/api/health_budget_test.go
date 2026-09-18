@@ -135,6 +135,7 @@ func TestHealthCheckConcurrentProbesJoinOnCallerCancellation(t *testing.T) {
 }
 
 func TestHealthCheckChainProbePanicIsContained(t *testing.T) {
+	before := testutil.ToFloat64(metrics.ChainHealthProbePanicsTotal)
 	h := &Handlers{client: &chaintest.MockClient{PingFunc: func(context.Context) error {
 		panic("broken chain client")
 	}}}
@@ -142,4 +143,5 @@ func TestHealthCheckChainProbePanicIsContained(t *testing.T) {
 	assert.Equal(t, healthStatusDegraded, response.Status)
 	assert.Equal(t, checkStatusUnhealthy, response.Checks["chain"].Status)
 	assert.Equal(t, "chain connectivity failed", response.Checks["chain"].Message)
+	assert.Equal(t, before+1, testutil.ToFloat64(metrics.ChainHealthProbePanicsTotal))
 }

@@ -556,18 +556,13 @@ func inspectRetentionBucket(tx *bolt.Tx, collect func(RetentionEntry)) error {
 		}
 		var entry RetentionEntry
 		var err error
-		var fields map[string]json.RawMessage
-		if uniqueErr := validateUniqueJSONObject(value, maxAuthoritativeRecordBytes); uniqueErr != nil {
-			return fmt.Errorf("decode retention record with key length %d: %w", len(key), uniqueErr)
-		}
-		if decodeErr := json.Unmarshal(value, &fields); decodeErr != nil {
-			return fmt.Errorf("decode retention record with key length %d: %w", len(key), decodeErr)
-		}
-		_, versioned := fields["schema_version"]
-		if identityBound || versioned {
+		if identityBound {
+			// Binding commits the current wire schema. Its strict decoder already
+			// checks framing, size, recursive uniqueness and exact field names;
+			// probing for the legacy shape would repeat validation of every row.
 			entry, err = decodeRetentionEntry(value)
 		} else {
-			entry, err = decodeLegacyRetentionEntry(value)
+			entry, err = decodeUnboundRetentionEntry(value)
 		}
 		if err != nil {
 			return fmt.Errorf("decode retention record with key length %d: %w", len(key), err)
@@ -602,6 +597,22 @@ func inspectRetentionBucket(tx *bolt.Tx, collect func(RetentionEntry)) error {
 		}
 		return nil
 	})
+}
+
+// decodeUnboundRetentionEntry is the stopped-journal compatibility boundary.
+// Runtime identity-bound reads never infer a schema from row contents.
+func decodeUnboundRetentionEntry(value []byte) (RetentionEntry, error) {
+	if err := validateUniqueJSONObject(value, maxAuthoritativeRecordBytes); err != nil {
+		return RetentionEntry{}, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(value, &fields); err != nil {
+		return RetentionEntry{}, err
+	}
+	if _, versioned := fields["schema_version"]; versioned {
+		return decodeRetentionEntry(value)
+	}
+	return decodeLegacyRetentionEntry(value)
 }
 
 // isLegacyRestoringRetentionEntry recognizes only fields that v0.13's
@@ -1701,10 +1712,18 @@ func (s *RestoreSettlement) ClaimForRestore(
 		return RestoringRetentionProof{}, err
 	}
 	authority := candidate.authority
-	unlock := s.operations.lockLease(authority.LeaseUUID())
+	unlock := s.operations.lockRestoreLeases(authority.SourceLeaseUUID(), authority.LeaseUUID())
 	defer unlock()
 	if err := s.operations.callbacks.requireCurrentOperationAuthority(authority); err != nil {
 		return RestoringRetentionProof{}, err
+	}
+	// An Active row is written before close renames and terminal settlement.
+	// Its status alone cannot transfer source ownership. The source gate is
+	// shared with BeginClose/CompleteClose and remains held through the CAS.
+	if _, pending, err := s.operations.callbacks.getCloseIntentLocked(authority.SourceLeaseUUID()); err != nil {
+		return RestoringRetentionProof{}, err
+	} else if pending {
+		return RestoringRetentionProof{}, fmt.Errorf("%w: source close is still pending", ErrNotRestorable)
 	}
 	return s.retentions.claimForRestoreWithAuthority(
 		authority.SourceLeaseUUID(),

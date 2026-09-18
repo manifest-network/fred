@@ -34,7 +34,7 @@ func projectDockerRead(client dockerReadClient) dockerReadClient {
 		containerLogs:    client.ContainerLogs, listContainers: client.ListManagedContainers,
 		listContainersStrict: client.ListManagedContainersStrict,
 		listVolumeWriters:    client.ListVolumeWriters,
-		listNetworks:         client.ListManagedNetworks, containerEvents: client.ContainerEvents,
+		listNetworks:         client.ListIdleManagedNetworks, containerEvents: client.ContainerEvents,
 	}
 }
 
@@ -59,7 +59,7 @@ func (v dockerReadView) ListManagedContainersStrict(ctx context.Context) ([]Cont
 func (v dockerReadView) ListVolumeWriters(ctx context.Context) ([]ContainerInfo, error) {
 	return v.listVolumeWriters(ctx)
 }
-func (v dockerReadView) ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error) {
+func (v dockerReadView) ListIdleManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error) {
 	return v.listNetworks(ctx)
 }
 func (v dockerReadView) ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error) {

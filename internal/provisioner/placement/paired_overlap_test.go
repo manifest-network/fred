@@ -14,6 +14,7 @@ func TestPairedOverlapPreservesOnlyRepresentedOwner(t *testing.T) {
 		"same owner", "retired owner", "retired during sweep", "captured claim ended", "missing peer", "unknown owner",
 		"unresolved attempt", "different generation", "different tenant", "partial principal",
 		"unknown generation", "missing principal", "explicit rejection", "another reporter", "historical conflict",
+		"unusable lifecycle", "lifecycle backend mismatch", "principal unbound on both sides", "legacy row on typed owner",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			fixture := newFencedAvailabilityFixture(t)
@@ -31,6 +32,19 @@ func TestPairedOverlapPreservesOnlyRepresentedOwner(t *testing.T) {
 				retired, retireErr := fixture.store.retireLifecycle(leaseUUID, fixture.lifecycleID)
 				require.NoError(t, retireErr)
 				require.True(t, retired.RetiredNow())
+			}
+			switch scenario {
+			case "unusable lifecycle", "lifecycle backend mismatch", "principal unbound on both sides":
+				capability := fixture.store.lifecycleCache[leaseUUID]
+				switch scenario {
+				case "unusable lifecycle":
+					capability.unusable = true
+				case "lifecycle backend mismatch":
+					capability.backend = "backend-b"
+				case "principal unbound on both sides":
+					capability.principal = runtimePrincipal{}
+				}
+				fixture.store.lifecycleCache[leaseUUID] = capability
 			}
 			before := fixture.store.Lookup(leaseUUID)
 			lifecycleBefore := fixture.store.CurrentLifecycle(leaseUUID)
@@ -71,8 +85,10 @@ func TestPairedOverlapPreservesOnlyRepresentedOwner(t *testing.T) {
 				row.Tenant = ""
 			case "unknown generation":
 				row.LifecycleGeneration = nil
-			case "missing principal":
+			case "missing principal", "principal unbound on both sides":
 				row.Tenant, row.ProviderUUID = "", ""
+			case "legacy row on typed owner":
+				row.LifecycleGeneration = &backend.LifecycleGenerationObservation{Kind: backend.LifecycleGenerationLegacy}
 			}
 			projection := ReconciliationProjection{UntrustedPositives: map[string][]string{leaseUUID: {"backend-a"}}}
 			for _, name := range []string{"backend-a", "backend-b", "backend-c"} {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"time"
 
@@ -24,7 +25,6 @@ const interruptedMaintenanceFailure = "backend interrupted maintenance before co
 // release append, actor routing, or Compose by accidentally using zero claims.
 type maintenanceAdmission struct {
 	disposition shared.MaintenanceIntentAdmissionDisposition
-	intent      shared.MaintenanceIntentClaim
 	target      shared.MaintenanceReleaseClaim
 }
 
@@ -109,7 +109,7 @@ func (b *Backend) admitMaintenance(
 	}
 	return maintenanceAdmission{
 		disposition: shared.MaintenanceIntentAdmissionCreated,
-		intent:      boundTarget.Intent(), target: boundTarget,
+		target:      boundTarget,
 	}, nil
 }
 
@@ -300,10 +300,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 					if listErr != nil {
 						return fmt.Errorf("strict committed maintenance inventory: %w", listErr)
 					}
-					targetContainers, leaseContainers, selectErr := maintenanceTargetContainers(intent, containers)
-					if selectErr != nil {
-						return selectErr
-					}
+					targetContainers, leaseContainers := maintenanceTargetContainers(intent, containers)
 					cohortHealthy := len(targetContainers) == len(leaseContainers) &&
 						validateRecoveredReleaseCohort(&targetRelease, targetContainers) == nil
 					runtimeDiverged := !cohortHealthy
@@ -356,10 +353,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 					if listErr != nil {
 						return fmt.Errorf("strict maintenance inventory: %w", listErr)
 					}
-					targetContainers, leaseContainers, selectErr := maintenanceTargetContainers(intent, containers)
-					if selectErr != nil {
-						return selectErr
-					}
+					targetContainers, leaseContainers := maintenanceTargetContainers(intent, containers)
 					compensationStarted, compensationErr := b.maintenanceSettlement.CompensationStarted(intent)
 					if compensationErr != nil {
 						return compensationErr
@@ -494,7 +488,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 						return fmt.Errorf("strict maintenance inventory: %w", listErr)
 					}
 					for _, container := range containers {
-						if container.MaintenanceID == intent.MaintenanceID() {
+						if container.LeaseUUID == intent.LeaseUUID() && container.MaintenanceID == intent.MaintenanceID() {
 							return fmt.Errorf(
 								"maintenance target %s has substrate but no durable target release",
 								intent.MaintenanceID(),
@@ -535,7 +529,11 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 		if recoveryErr != nil {
 			if deferred && ctx.Err() == nil {
 				maintenanceRecoveryDeferredTotal.Inc()
-				b.logger.Warn("maintenance recovery deferred for lease-local observation",
+				level := slog.LevelWarn
+				if !time.Now().Before(b.maintenanceRecoveryDeadline(snapshot, time.Now())) {
+					level = slog.LevelError
+				}
+				b.logger.Log(ctx, level, "maintenance recovery deferred for lease-local observation",
 					"lease_uuid", snapshot.LeaseUUID(), "maintenance_id", snapshot.MaintenanceID().String(),
 					"error", recoveryErr)
 				continue
@@ -567,6 +565,13 @@ func (b *Backend) recoverFailedMaintenanceReceipts(ctx context.Context) error {
 			},
 		)
 		if cleanupErr != nil {
+			if _, deferred := maintenanceRecoveryRetry(cleanupErr); deferred && ctx.Err() == nil {
+				maintenanceRecoveryDeferredTotal.Inc()
+				b.logger.Error("failed-maintenance receipt cleanup deferred for lease-local observation",
+					"lease_uuid", receipt.LeaseUUID(), "maintenance_id", receipt.MaintenanceID().String(),
+					"error", cleanupErr)
+				continue
+			}
 			return fmt.Errorf("clean late failed maintenance for lease %q: %w",
 				receipt.LeaseUUID(), cleanupErr)
 		}
@@ -961,16 +966,12 @@ func (b *Backend) verifyMaintenanceSourceActive(intent shared.MaintenanceIntentC
 func maintenanceTargetContainers(
 	intent shared.MaintenanceIntentClaim,
 	containers []ContainerInfo,
-) ([]ContainerInfo, []ContainerInfo, error) {
+) ([]ContainerInfo, []ContainerInfo) {
 	target := make([]ContainerInfo, 0)
 	lease := make([]ContainerInfo, 0)
 	for _, container := range containers {
-		if container.MaintenanceID == intent.MaintenanceID() && container.LeaseUUID != intent.LeaseUUID() {
-			return nil, nil, &maintenanceObservationDeferred{cause: fmt.Errorf(
-				"maintenance ID %s is attached to foreign lease %q",
-				intent.MaintenanceID(), container.LeaseUUID,
-			)}
-		}
+		// Maintenance idempotency keys are scoped to one lease. Only the
+		// claim's compound identity selects a cohort; other leases may reuse it.
 		if container.LeaseUUID != intent.LeaseUUID() {
 			continue
 		}
@@ -980,7 +981,7 @@ func maintenanceTargetContainers(
 		}
 	}
 	slices.SortFunc(target, compareContainerIdentity)
-	return target, lease, nil
+	return target, lease
 }
 
 func compareContainerIdentity(left, right ContainerInfo) int {

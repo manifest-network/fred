@@ -158,7 +158,7 @@ func TestMaintenanceReleasePreludeSerializedThroughActorAcceptance(t *testing.T)
 	}
 }
 
-func TestMaintenanceReleaseFenceWaitsForAckAfterCallerCancellation(t *testing.T) {
+func TestMaintenanceReleaseRemainsAuthoritativeAfterCallerCancellation(t *testing.T) {
 	stack, err := manifest.ParsePayload(validManifestJSON("docker.io/library/nginx:1.26"))
 	require.NoError(t, err)
 	workerStarted := make(chan struct{})
@@ -199,9 +199,10 @@ func TestMaintenanceReleaseFenceWaitsForAckAfterCallerCancellation(t *testing.T)
 	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	maintenanceID := newTestMaintenanceID(t)
 	updateDone := make(chan error, 1)
 	go func() {
-		updateDone <- b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
+		updateDone <- b.Update(ctx, backend.UpdateRequest{MaintenanceID: maintenanceID,
 			LeaseUUID:   maintenanceSerializationLeaseUUID,
 			CallbackURL: maintenanceSerializationCallbackURL(b),
 			Payload:     validManifestJSON("docker.io/library/nginx:1.27"),
@@ -215,8 +216,8 @@ func TestMaintenanceReleaseFenceWaitsForAckAfterCallerCancellation(t *testing.T)
 	// Once actorsMu opens the request can enqueue, but the actor cannot publish
 	// Updating (and therefore cannot ack) until provisionsMu opens. Observe the
 	// actor inside handle before introducing cancellation: release history alone
-	// proves only that the durable prelude completed, not that the caller passed
-	// routeToLeaseBlocking's initial context check.
+	// proves only that the durable prelude completed, not that the command was
+	// enqueued under its backend-owned admission lifetime.
 	b.provisionsMu.Lock()
 	provisionsLocked := true
 	defer func() {
@@ -231,25 +232,45 @@ func TestMaintenanceReleaseFenceWaitsForAckAfterCallerCancellation(t *testing.T)
 	}, time.Second, time.Millisecond,
 		"update request did not reach the actor admission transition")
 	cancel()
-	require.Never(t, func() bool {
-		select {
-		case <-updateDone:
-			return true
-		default:
-			return false
-		}
-	}, 100*time.Millisecond, time.Millisecond,
-		"caller cancellation released the release fence before actor admission")
+	select {
+	case err := <-updateDone:
+		require.ErrorContains(t, err, "maintenance acceptance is unknown")
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("caller cancellation did not end the acknowledgment wait")
+	}
+	intent, found, err := b.maintenanceSettlement.GetMaintenanceIntent(maintenanceSerializationLeaseUUID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, maintenanceID, intent.MaintenanceID())
+	require.Equal(t, shared.MaintenanceExecutionBeforeEffects, intent.ExecutionPhase())
+	targetRelease, target, found, err := b.maintenanceSettlement.FindMaintenanceRelease(maintenanceSerializationLeaseUUID, maintenanceID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, intent.MatchesIntent(target.Intent()))
+	require.Equal(t, "deploying", targetRelease.Status)
+	pending, err := b.callbackStore.ListPending()
+	require.NoError(t, err)
+	require.Empty(t, pending, "an unknown acknowledgment cannot publish a failed attempt")
 
 	b.provisionsMu.Unlock()
 	provisionsLocked = false
-	require.NoError(t, <-updateDone,
-		"an accepted operation remains authoritative when caller cancellation races its ack")
 	select {
 	case <-workerStarted:
 	case <-time.After(time.Second):
 		t.Fatal("accepted Update worker did not start")
 	}
+	started, found, err := b.maintenanceSettlement.GetMaintenanceIntent(maintenanceSerializationLeaseUUID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, intent.MatchesIntent(started), "the resumed actor must execute the same durable generation")
+	require.Equal(t, shared.MaintenanceExecutionStarted, started.ExecutionPhase())
+	currentRelease, currentTarget, found, err := b.maintenanceSettlement.FindMaintenanceRelease(maintenanceSerializationLeaseUUID, maintenanceID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, target.Version(), currentTarget.Version())
+	require.Equal(t, target.Digest(), currentTarget.Digest())
+	require.Equal(t, targetRelease, currentRelease, "caller cancellation must not retire or replace the admitted target")
 }
 
 func maintenanceSerializationCallbackURL(b *Backend) string {

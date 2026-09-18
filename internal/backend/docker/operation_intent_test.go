@@ -2965,7 +2965,14 @@ func TestProvisionIntentToReservationWindowIsFencedAgainstDeprovision(t *testing
 }
 
 func TestRestoreIntentToReservationWindowIsFencedAgainstDeprovision(t *testing.T) {
-	mock := &mockDockerClient{}
+	inspecting := make(chan struct{})
+	mock := &mockDockerClient{
+		InspectImageFn: func(ctx context.Context, _ string) (*ImageInfo, error) {
+			close(inspecting)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	bindTestStorageIdentity(t, b, mock)
 	statefulProfile := b.cfg.SKUProfiles["docker-small"]
@@ -3009,6 +3016,7 @@ func TestRestoreIntentToReservationWindowIsFencedAgainstDeprovision(t *testing.T
 	)
 
 	restoreCtx, cancelRestore := context.WithCancel(context.Background())
+	defer cancelRestore()
 	restoreDone := make(chan error, 1)
 	go func() { restoreDone <- b.Restore(restoreCtx, req) }()
 	select {
@@ -3027,21 +3035,37 @@ func TestRestoreIntentToReservationWindowIsFencedAgainstDeprovision(t *testing.T
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	// Once the journal barrier opens, force an explicit pre-worker rejection.
-	// The fence must remain held through rollback and exact intent settlement.
+	// Disconnecting the caller cannot revoke durable admission. Once the
+	// journal barrier opens, the backend owns the queued restore and the source
+	// finalizer continues to fence close until exact ownership settles.
 	cancelRestore()
 	close(journal.release)
-	require.Error(t, <-restoreDone)
+	if err := <-restoreDone; err != nil {
+		require.ErrorContains(t, err, "restore acceptance is unknown")
+	}
 	select {
 	case err := <-deprovisionDone:
-		require.NoError(t, err)
+		require.ErrorIs(t, err, backend.ErrInvalidState)
 	case <-time.After(3 * time.Second):
-		t.Fatal("deprovision did not complete after restore settled its reservation")
+		t.Fatal("deprovision did not observe the retained restore owner")
 	}
-	b.provisionsMu.RLock()
-	_, exists := b.provisions[req.LeaseUUID]
-	b.provisionsMu.RUnlock()
-	assert.False(t, exists)
+	waitForOperationWorker(t, inspecting)
+	intents, err := operations.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1)
+	assert.Equal(t, req.LeaseUUID, intents[0].LeaseUUID())
+	assert.Equal(t, req.CallbackURL, intents[0].CallbackURL())
+	assert.Equal(t, shared.OperationExecutionStarted, intents[0].ExecutionPhase())
+	source, err := retentions.Get(sourceLeaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, source)
+	assert.Equal(t, shared.RetentionStatusRestoring, source.Status)
+	assert.Equal(t, req.LeaseUUID, source.NewLeaseUUID)
+	assert.Equal(t, intents[0].OperationID(), source.DestinationOperationID)
+	assert.Positive(t, b.pool.Stats().AllocationCount)
+	callbacks, err := store.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, callbacks, "neither caller cancellation nor close can author a terminal restore result")
 }
 
 func TestRecoverOperationIntent_PartialProvisionCohortIsTornDownBeforeFailureSettlement(t *testing.T) {

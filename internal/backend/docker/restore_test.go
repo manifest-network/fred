@@ -686,8 +686,9 @@ func TestDeprovision_Retain_PreservesCreatedAtAndGenerationOnRetry(t *testing.T)
 
 // TestDeprovision_Retain_DoesNotClobberRestoringRecord verifies that a close
 // retry cannot overwrite a retention finalizer claimed after the prior physical
-// close attempt failed. The setup drives both owners through their public typed
-// transitions instead of manufacturing the overlapping state.
+// close attempt failed in an older version. Fresh admission excludes this
+// overlap; preserve the real close head offline around the typed source claim
+// so the historical no-clobber counterexample remains covered after reopen.
 func TestDeprovision_Retain_DoesNotClobberRestoringRecord(t *testing.T) {
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
@@ -727,6 +728,10 @@ func TestDeprovision_Retain_DoesNotClobberRestoringRecord(t *testing.T) {
 	require.NotNil(t, before)
 	require.Equal(t, shared.RetentionStatusActive, before.Status)
 
+	f := &volumeWriterLaunchFixture{b: b, source: before.OriginalLeaseUUID}
+	closeHead := editHistoricalSourceClose(t, f, nil)
+	require.NotEmpty(t, closeHead)
+	b, rs = f.b, f.b.retentionStore
 	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
 	claimed, err := claimRetentionForTest(
 		t, rs,
@@ -741,6 +746,8 @@ func TestDeprovision_Retain_DoesNotClobberRestoringRecord(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
+	editHistoricalSourceClose(t, f, closeHead)
+	b, rs = f.b, f.b.retentionStore
 
 	var mu sync.Mutex
 	var renames []string
@@ -759,6 +766,10 @@ func TestDeprovision_Retain_DoesNotClobberRestoringRecord(t *testing.T) {
 			return nil
 		},
 	}
+	// A new backend reconstructs its volatile close projection from the exact
+	// durable head before serving retries. This also exercises cold recovery's
+	// refusal to overwrite the historical restoring finalizer.
+	require.NoError(t, b.recoverState(t.Context()))
 	require.Error(t, b.Deprovision(
 		context.Background(), "11111111-1111-4111-8111-111111111111",
 	), "close retry must defer while restore owns the finalizer")
@@ -766,6 +777,7 @@ func TestDeprovision_Retain_DoesNotClobberRestoringRecord(t *testing.T) {
 	got, err := rs.Get("11111111-1111-4111-8111-111111111111")
 	require.NoError(t, err)
 	require.NotNil(t, got)
+	assert.Equal(t, claimed, got, "the exact historical finalizer must survive close retry unchanged")
 	assert.Equal(t, shared.RetentionStatusRestoring, got.Status)
 	assert.Equal(t, claimed.Generation, got.Generation)
 	assert.Equal(t, "55555555-5555-4555-8555-555555555555", got.NewLeaseUUID)

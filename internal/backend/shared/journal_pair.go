@@ -56,6 +56,20 @@ func (pair journalPair) lockLease(leaseUUID string) func() {
 	return pair.callbacks.lockDeliveryLease(leaseUUID)
 }
 
+// lockRestoreLeases joins the source close transition and destination operation
+// transition without introducing an inverse lock order for crossed restores.
+func (pair journalPair) lockRestoreLeases(source, destination string) func() {
+	if destination < source {
+		source, destination = destination, source
+	}
+	first := pair.lockLease(source)
+	second := pair.lockLease(destination)
+	return func() {
+		second()
+		first()
+	}
+}
+
 func (pair journalPair) lockLeaseContext(ctx context.Context, leaseUUID string) (func(), error) {
 	return pair.callbacks.lockDeliveryLeaseContext(ctx, leaseUUID)
 }

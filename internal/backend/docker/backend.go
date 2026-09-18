@@ -43,7 +43,7 @@ type dockerReadClient interface {
 	ListManagedContainers(ctx context.Context) ([]ContainerInfo, error)
 	ListManagedContainersStrict(ctx context.Context) ([]ContainerInfo, error)
 	ListVolumeWriters(context.Context) ([]ContainerInfo, error)
-	ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error)
+	ListIdleManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error)
 	ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error)
 }
 

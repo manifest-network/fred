@@ -176,7 +176,7 @@ type mockDockerClient struct {
 	ReadmitCompensationImageFn    func(context.Context, compensationContainerRecord) (imageexec.Image, error)
 	EnsureTenantNetworkFn         func(ctx context.Context, tenant string) (string, error)
 	RemoveTenantNetworkIfEmptyFn  func(ctx context.Context, tenant string) (tenantNetworkRemoval, error)
-	ListManagedNetworksFn         func(ctx context.Context) ([]networktypes.Inspect, error)
+	ListIdleManagedNetworksFn     func(ctx context.Context) ([]networktypes.Inspect, error)
 	ResolveImageUserFn            func(ctx context.Context, imageName string, userOverride string) (int, int, error)
 	DetectVolumeOwnerFn           func(ctx context.Context, imageName string, volumePaths []string) (int, int, error)
 	DetectWritablePathsFn         func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error)
@@ -315,11 +315,11 @@ func (m *mockDockerClient) ResolveImageUser(ctx context.Context, imageName image
 	return 0, 0, nil // default: root
 }
 
-func (m *mockDockerClient) ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error) {
-	if m.ListManagedNetworksFn != nil {
-		return m.ListManagedNetworksFn(ctx)
+func (m *mockDockerClient) ListIdleManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error) {
+	if m.ListIdleManagedNetworksFn != nil {
+		return m.ListIdleManagedNetworksFn(ctx)
 	}
-	panic("unexpected call to ListManagedNetworks")
+	panic("unexpected call to ListIdleManagedNetworks")
 }
 
 func (m *mockDockerClient) DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string, _ shared.ImageInspectionOrigin) (int, int, error) {
@@ -615,7 +615,7 @@ func TestNetworkCleanup_BoundsManagedNetworkInventory(t *testing.T) {
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
 			return nil, nil
 		},
-		ListManagedNetworksFn: func(ctx context.Context) ([]networktypes.Inspect, error) {
+		ListIdleManagedNetworksFn: func(ctx context.Context) ([]networktypes.Inspect, error) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		},
@@ -638,7 +638,7 @@ func TestNetworkCleanup_UsesOneAggregateBudget(t *testing.T) {
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
 			return nil, nil
 		},
-		ListManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
+		ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
 			return []networktypes.Inspect{
 				{Name: "fred-tenant-a", Labels: map[string]string{LabelTenant: "tenant-a"}},
 				{Name: "fred-tenant-b", Labels: map[string]string{LabelTenant: "tenant-b"}},

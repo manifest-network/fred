@@ -509,20 +509,12 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	net2Name := TenantNetworkName(tenant2)
 	assert.NotEqual(t, net1Name, net2Name, "tenants should have different network names")
 
-	networks, err := docker.ListManagedNetworks(ctx)
-	require.NoError(t, err)
-
-	foundNet1, foundNet2 := false, false
-	for _, n := range networks {
-		if n.Name == net1Name {
-			foundNet1 = true
-		}
-		if n.Name == net2Name {
-			foundNet2 = true
-		}
+	for _, name := range []string{net1Name, net2Name} {
+		network, inspectErr := docker.client.NetworkInspect(ctx, name, networktypes.InspectOptions{})
+		require.NoError(t, inspectErr)
+		assert.Equal(t, name, network.Name)
+		assert.NotEmpty(t, network.Containers, "running tenant workloads must remain attached")
 	}
-	assert.True(t, foundNet1, "tenant 1 network should exist")
-	assert.True(t, foundNet2, "tenant 2 network should exist")
 
 	// Deprovision both
 	err = b.Deprovision(ctx, leaseUUID1)
@@ -537,13 +529,9 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	defer cancelCleanup()
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		b.cleanupOrphanedNetworks(cleanupCtx)
-		networks, listErr := docker.ListManagedNetworks(cleanupCtx)
-		if !assert.NoError(collect, listErr) {
-			return
-		}
-		for _, n := range networks {
-			assert.NotEqual(collect, net1Name, n.Name, "tenant 1 network should be removed")
-			assert.NotEqual(collect, net2Name, n.Name, "tenant 2 network should be removed")
+		for _, name := range []string{net1Name, net2Name} {
+			_, inspectErr := docker.client.NetworkInspect(cleanupCtx, name, networktypes.InspectOptions{})
+			assert.True(collect, client.IsErrNotFound(inspectErr), "tenant network %s must actually be absent: %v", name, inspectErr)
 		}
 	}, 30*time.Second, 100*time.Millisecond)
 }
@@ -3273,17 +3261,10 @@ func TestIntegration_Stack_NetworkIsolation(t *testing.T) {
 	defer func() { _ = docker.Close() }()
 
 	netName := TenantNetworkName(tenant)
-	networks, err := docker.ListManagedNetworks(ctx)
+	network, err := docker.client.NetworkInspect(ctx, netName, networktypes.InspectOptions{})
 	require.NoError(t, err)
-
-	found := false
-	for _, n := range networks {
-		if n.Name == netName {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "tenant network %s should exist", netName)
+	assert.Equal(t, netName, network.Name)
+	assert.Len(t, network.Containers, 2, "both tenant services must remain attached")
 
 	err = b.Deprovision(ctx, leaseUUID)
 	require.NoError(t, err)

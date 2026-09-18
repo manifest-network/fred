@@ -16,6 +16,8 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/metrics/background"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 type recoveredCallbackPair struct {
@@ -1609,6 +1611,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		recovered.Message = cmp.Or(terminal.Message, backend.MsgImagePullFailed)
 	}
 
+	maintenanceReadiness := b.inspectMaintenanceFailureReadiness(ctx, provisionBaseline, building, containers)
+
 	// Merge with existing state and detect status transitions.
 	b.provisionsMu.Lock()
 	// Close the intent-snapshot/publication TOCTOU without globally serializing
@@ -1673,23 +1677,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		delete(cohortIssues, leaseUUID)
 	}
 
-	// Exact maintenance recovery authored these failure details from its typed
-	// terminal outcome. Keep that cause while this same runtime remains unready;
-	// a healthy complete cohort may still recover to Ready under ENG-414.
-	unreadyMaintenanceLeases := make(map[string]bool)
-	for _, container := range containers {
-		healthPending := false
-		if recovered := building[container.LeaseUUID]; recovered != nil && recovered.StackManifest != nil {
-			if service := recovered.StackManifest.Services[container.ServiceName]; service != nil && service.HasActiveHealthCheck() {
-				healthPending = container.Health != HealthStatusHealthy
-			}
-		}
-		if container.Status != "running" || container.Health == HealthStatusUnhealthy || healthPending {
-			unreadyMaintenanceLeases[container.LeaseUUID] = true
-		}
-	}
+	// An unchanged Ready runtime retains its last failed attempt's cause, even
+	// when that cause is more specific than RestartFailed/UpdateFailed. Failed
+	// maintenance may recover to Ready under ENG-414 only after fresh inspection.
 	for leaseUUID, existing := range b.provisions {
-		if existing.Reason != backend.ReasonRestartFailed && existing.Reason != backend.ReasonUpdateFailed {
+		if existing.Reason == "" {
 			continue
 		}
 		recovered := building[leaseUUID]
@@ -1699,7 +1691,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 		_, divergent := cohortIssues[leaseUUID]
 		if existing.Status == backend.ProvisionStatusReady && recovered.Status == backend.ProvisionStatusReady &&
-			!divergent && !unreadyMaintenanceLeases[leaseUUID] {
+			!divergent {
 			// A failed replacement may leave the exact source healthy. Its Ready
 			// status does not erase the maintenance failure reported to the tenant.
 			recovered.LastError = existing.LastError
@@ -1707,10 +1699,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			recovered.Message = existing.Message
 			continue
 		}
-		if existing.Status != backend.ProvisionStatusFailed {
+		if existing.Status != backend.ProvisionStatusFailed ||
+			(existing.Reason != backend.ReasonRestartFailed && existing.Reason != backend.ReasonUpdateFailed) {
 			continue
 		}
-		if recovered.Status == backend.ProvisionStatusReady && !divergent && !unreadyMaintenanceLeases[leaseUUID] {
+		if recovered.Status == backend.ProvisionStatusReady && !divergent && maintenanceReadiness[leaseUUID] {
 			continue
 		}
 		recovered.Status = backend.ProvisionStatusFailed
@@ -1819,6 +1812,16 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		default:
 			if existing.FailCount > rec.FailCount {
 				rec.FailCount = existing.FailCount
+			}
+			// Re-observing the same failed runtime does not replace its original
+			// actor-authored cause with a generic cohort diagnosis. A different
+			// release/operation or an actual transition to Ready is independent.
+			if existing.Status == backend.ProvisionStatusFailed && rec.Status == backend.ProvisionStatusFailed &&
+				existing.Reason != "" && rec.ActiveReleaseVersion == existing.ActiveReleaseVersion &&
+				rec.ActiveOperationID == existing.ActiveOperationID {
+				rec.LastError = existing.LastError
+				rec.Reason = existing.Reason
+				rec.Message = existing.Message
 			}
 		}
 	}
@@ -2274,11 +2277,14 @@ func (b *Backend) networkCleanupLoop() {
 	defer ticker.Stop()
 
 	for b.stopCtx.Err() == nil {
-		func() {
+		util.RunCleanupIteration(func() error {
 			ctx, cancel := b.recoveryDockerReadContext(b.stopCtx)
 			defer cancel()
 			b.cleanupOrphanedNetworks(ctx)
-		}()
+			return nil
+		}, "docker_network_reclamation", func(any) {
+			background.CleanupPanicsTotal.WithLabelValues("docker_network_reclamation").Inc()
+		})
 		select {
 		case <-b.stopCtx.Done():
 			return
@@ -2300,7 +2306,7 @@ func (b *Backend) cleanupOrphanedNetworksUsing(
 	}
 	// The caller owns this pass's budget; never borrow the recovery tick's
 	// context or renew a deadline for individual candidates.
-	networks, err := b.docker.ListManagedNetworks(ctx)
+	networks, err := b.docker.ListIdleManagedNetworks(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			b.observeNetworkCleanupInterruption(ctx)
@@ -2368,27 +2374,21 @@ func (b *Backend) periodicReconcileContext() (context.Context, context.CancelFun
 }
 
 func (b *Backend) reconcileLoop() {
-	ticker := time.NewTicker(b.cfg.ReconcileInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-b.stopCtx.Done():
-			return
-		case <-ticker.C:
-			func() {
-				ctx, cancel := b.periodicReconcileContext()
-				defer cancel()
-				if err := b.reconcileStateAndOperations(ctx); err != nil {
-					b.logger.Error("reconciliation failed", "error", err)
-					reconciliationTotal.WithLabelValues("error").Inc()
-				} else {
-					reconciliationTotal.WithLabelValues("success").Inc()
-					reconcilerLastSuccessTimestamp.SetToCurrentTime()
-				}
-			}()
+	util.StartCleanupLoop(b.stopCtx, b.cfg.ReconcileInterval, func() error {
+		ctx, cancel := b.periodicReconcileContext()
+		defer cancel()
+		if err := b.reconcileStateAndOperations(ctx); err != nil {
+			b.logger.Error("reconciliation failed", "error", err)
+			reconciliationTotal.WithLabelValues("error").Inc()
+			return nil // logged with the backend's structured logger above
 		}
-	}
+		reconciliationTotal.WithLabelValues("success").Inc()
+		reconcilerLastSuccessTimestamp.SetToCurrentTime()
+		return nil
+	}, "docker_reconciliation", func(any) {
+		reconciliationTotal.WithLabelValues("error").Inc()
+		background.CleanupPanicsTotal.WithLabelValues("docker_reconciliation").Inc()
+	})
 }
 
 // reconcileStateAndOperations is the level-triggered convergence unit for the

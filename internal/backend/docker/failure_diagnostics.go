@@ -156,10 +156,7 @@ func (cleanup *failureCleanup) targets(ctx context.Context) ([]ContainerInfo, er
 	if !ok {
 		return nil, errors.New("maintenance failure cleanup has no target release")
 	}
-	targets, _, err := maintenanceTargetContainers(intent, all)
-	if err != nil {
-		return nil, err
-	}
+	targets, _ := maintenanceTargetContainers(intent, all)
 	for _, container := range targets {
 		if err := cleanup.backend.validateMaintenanceTargetContainer(intent, target, container); err != nil {
 			return nil, err

@@ -511,6 +511,15 @@ func (s *CloseSettlement) begin(
 			claim: existing, disposition: CloseIntentAdmissionExisting,
 		}), nil
 	}
+	// A claimed source belongs to the restore until its exact finalizer returns
+	// it or consumes it. Together with ClaimForRestore's source gate this makes
+	// new close admission and source transfer mutually exclusive. Existing close
+	// heads above remain retryable, including interrupted states from older code.
+	if source, err := s.retentions.Get(leaseUUID); err != nil {
+		return CloseIntentAdmission{}, err
+	} else if source != nil && source.Status == RetentionStatusRestoring {
+		return CloseIntentAdmission{}, fmt.Errorf("%w: lease %q is a restoring source", ErrCloseIntentConflict, leaseUUID)
+	}
 
 	derivation, err := s.deriveCloseSpecLocked(
 		leaseUUID, retainOnClose, cleanupOnly,

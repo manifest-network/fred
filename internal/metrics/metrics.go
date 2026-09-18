@@ -536,6 +536,15 @@ var (
 		Help:      "Elapsed time of each completed providerd health dependency probe, including failures and cancellations. Backend names come from configuration; local store probes include synchronous waits.",
 		Buckets:   prometheus.DefBuckets,
 	}, []string{"check", "backend"})
+
+	// ChainHealthProbePanicsTotal counts bugs contained at the foreign chain
+	// client's probe goroutine boundary. The response still reports unhealth.
+	ChainHealthProbePanicsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "chain",
+		Name:      "health_probe_panics_total",
+		Help:      "Panics recovered inside a chain health probe goroutine (always a bug)",
+	})
 )
 
 // Chain metrics

@@ -1,6 +1,7 @@
 package restore
 
 import (
+	"net/http"
 	"path/filepath"
 	"testing"
 
@@ -77,6 +78,17 @@ func TestServiceCloseBetweenInventoryReadsPreservesRestoreSource(t *testing.T) {
 	require.NoError(t, err)
 	sweep.End()
 	assert.Equal(t, before, fixture.store.Lookup(sourceUUID), "redundant owner evidence must not revoke restore affinity")
+	// Affinity alone does not prove a completed close. The backend's atomic
+	// restore admission is definitive, including for legacy retained sources or
+	// old source callbacks that were already acknowledged without retirement.
+	fixture.useCausalRestoreResponse(t, http.StatusConflict, `{"error":"retained source close is pending"}`)
+	refused := fixture.service.Execute(t.Context(), Command{
+		TargetLeaseUUID: targetUUID, Tenant: testTenant, SourceLeaseUUID: sourceUUID,
+	})
+	require.Equal(t, OutcomeBackendInvalidState, refused.Outcome)
+	require.Equal(t, placement.StateAbsent, fixture.store.Lookup(targetUUID).State())
+	require.Equal(t, before, fixture.store.Lookup(sourceUUID))
+	fixture.backends[testBackend] = fixture.backend
 	result := fixture.service.Execute(t.Context(), Command{
 		TargetLeaseUUID: targetUUID, Tenant: testTenant, SourceLeaseUUID: sourceUUID,
 	})

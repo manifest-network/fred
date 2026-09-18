@@ -2700,7 +2700,7 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 		// Default to a clean network list so migration tests
 		// that enable isolation don't crash; tests that need a non-empty
 		// list can override on the mock directly.
-		ListManagedNetworksFn: func(_ context.Context) ([]networktypes.Inspect, error) {
+		ListIdleManagedNetworksFn: func(_ context.Context) ([]networktypes.Inspect, error) {
 			return nil, nil
 		},
 		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {

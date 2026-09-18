@@ -2000,40 +2000,26 @@ func (d *DockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant st
 	return tenantNetworkRemoved, nil
 }
 
-// ListManagedNetworks returns all networks created by Fred, with full details.
-// When backendName is set, only networks belonging to this backend are returned.
-func (d *DockerClient) ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error) {
+// ListIdleManagedNetworks selects managed network cleanup candidates in one
+// daemon query. A list result never grants removal authority: the tenant stripe,
+// current provision ownership and exact network inspect are rechecked by
+// RemoveTenantNetworkIfEmpty immediately before removal.
+func (d *DockerClient) ListIdleManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error) {
 	f := filters.NewArgs(
 		filters.Arg("label", LabelManaged+"=true"),
+		filters.Arg("dangling", "true"),
 	)
 	if d.backendName != "" {
 		f.Add("label", LabelBackendName+"="+d.backendName)
 	}
-	summaries, err := d.client.NetworkList(ctx, networktypes.ListOptions{
-		Filters: f,
-	})
+	summaries, err := d.client.NetworkList(ctx, networktypes.ListOptions{Filters: f})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list managed networks: %w", err)
+		return nil, fmt.Errorf("failed to list idle managed networks: %w", err)
 	}
-
-	var result []networktypes.Inspect
-	for _, s := range summaries {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		inspected, err := d.client.NetworkInspect(ctx, s.ID, networktypes.InspectOptions{})
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			if !client.IsErrNotFound(err) {
-				slog.Warn("failed to inspect network during list; network excluded from results", "network_id", s.ID, "error", err)
-			}
-			continue
-		}
-		result = append(result, inspected)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return result, nil
+	return summaries, nil
 }
 
 // tenantNetworkStripeCount is the number of per-tenant stripe mutexes.

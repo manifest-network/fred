@@ -1220,10 +1220,6 @@ func (a answeredSet) unanswered() []string {
 type fleetSnapshot struct {
 	// provisions is the union over answering backends, keyed by lease UUID.
 	provisions map[string]backend.ProvisionInfo
-	// provisionsByBackend retains each endpoint response before the union loses
-	// duplicate identities. It is the exact row set sealed into inventory
-	// evidence, including lifecycle generations and runtime principals.
-	provisionsByBackend map[string][]backend.ProvisionInfo
 	// collectedByBackend retains the opaque, exact-sweep response consumed by
 	// the typed inventory session after cross-endpoint validation.
 	collectedByBackend map[string]placement.BackendProvisionInventory
@@ -1271,13 +1267,12 @@ func (r *Reconciler) fetchFleetSnapshot(
 	if namesErr != nil {
 		slog.Error("reconciler cannot enumerate bound backends", "error", namesErr)
 		return fleetSnapshot{
-			provisions:          make(map[string]backend.ProvisionInfo),
-			provisionsByBackend: make(map[string][]backend.ProvisionInfo),
-			collectedByBackend:  make(map[string]placement.BackendProvisionInventory),
-			reportedByBackend:   make(map[string]map[string]struct{}),
-			storageIdentities:   make(map[string]backendidentity.ID),
-			answered:            make(answeredSet),
-			complete:            false,
+			provisions:         make(map[string]backend.ProvisionInfo),
+			collectedByBackend: make(map[string]placement.BackendProvisionInventory),
+			reportedByBackend:  make(map[string]map[string]struct{}),
+			storageIdentities:  make(map[string]backendidentity.ID),
+			answered:           make(answeredSet),
+			complete:           false,
 		}
 	}
 
@@ -1288,13 +1283,12 @@ func (r *Reconciler) fetchFleetSnapshot(
 
 	var mu sync.Mutex
 	snap := fleetSnapshot{
-		provisions:          make(map[string]backend.ProvisionInfo),
-		provisionsByBackend: make(map[string][]backend.ProvisionInfo, len(backendNames)),
-		collectedByBackend:  make(map[string]placement.BackendProvisionInventory, len(backendNames)),
-		reportedByBackend:   make(map[string]map[string]struct{}, len(backendNames)),
-		storageIdentities:   make(map[string]backendidentity.ID, len(backendNames)),
-		answered:            make(answeredSet, len(backendNames)),
-		complete:            true,
+		provisions:         make(map[string]backend.ProvisionInfo),
+		collectedByBackend: make(map[string]placement.BackendProvisionInventory, len(backendNames)),
+		reportedByBackend:  make(map[string]map[string]struct{}, len(backendNames)),
+		storageIdentities:  make(map[string]backendidentity.ID, len(backendNames)),
+		answered:           make(answeredSet, len(backendNames)),
+		complete:           true,
 	}
 
 	for _, backendName := range backendNames {
@@ -1339,7 +1333,6 @@ func (r *Reconciler) fetchFleetSnapshot(
 				snap.provisions[p.LeaseUUID] = p
 				reported[p.LeaseUUID] = struct{}{}
 			}
-			snap.provisionsByBackend[backendName] = provisions
 			snap.collectedByBackend[backendName] = inventory
 			snap.reportedByBackend[backendName] = reported
 			mu.Unlock()

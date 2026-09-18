@@ -54,6 +54,9 @@ jobs:
         # Timing under CI is diagnostic, not a deployment latency assertion.
         run: go test -run '^$' -bench '^BenchmarkRetentionHealth$/^rows=(0|871)$' -benchtime=1x ./internal/backend/shared
 
+      - name: Callback health benchmark smoke
+        run: go test -run '^$' -bench '^BenchmarkCallbackHealth$/^closed=(0|1024)$' -benchtime=1x ./internal/backend/shared
+
       - name: Preserve coverage profile
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

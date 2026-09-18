@@ -481,38 +481,98 @@ const (
 	asyncAcceptanceUnknown
 )
 
-// handoffProvisionAdmission owns the transition from durable capacity admission
-// to the lease actor. The accepted operation and command identity come only from
-// admission; the request context owns the response waiter, never the enqueue or
-// worker lifetime. A disconnected provider may redeliver the exact operation
-// while this backend continues its one admitted worker.
-//
-// Both enqueue and acknowledgment wait are bounded by the backend's provision
-// deadline and shutdown. Only a source-observed no-enqueue or explicit actor
-// rejection returns Rejected; a lost acknowledgment remains Unknown.
+// durableActorHandoff is constructed only alongside a typed actor command. Its
+// lease, reply, and worker context stay together across the enqueue boundary;
+// callers cannot reinterpret a lost reply as a no-dispatch observation.
+type durableActorHandoff struct {
+	leaseUUID string
+	command   leasesm.ActorCommand
+	reply     leasesm.ActorReply
+	operation context.Context
+	cancel    context.CancelFunc
+}
+
+// actorAdmissionTimeout bounds backpressure and actor entry separately from a
+// potentially long deployment. Two normal 75-second worker-exit windows fit in
+// this budget. An earlier operation deadline or backend shutdown still wins.
+const actorAdmissionTimeout = 150 * time.Second
+
+// handoffProvisionAdmission derives dispatch identity and worker lifetime from
+// durable capacity admission. The HTTP context owns only the response waiter.
 func (b *Backend) handoffProvisionAdmission(
 	callerCtx context.Context,
 	admission shared.ProvisionAdmission,
 ) (asyncAcceptance, error) {
-	operationCtx, operationCancel := b.shutdownAwareContext()
-	command, ack, err := leasesm.NewProvisionCommand(operationCtx, admission)
-	if err != nil {
-		operationCancel()
-		return asyncAcceptanceRejected, err
+	opCtx, cancel := b.shutdownAwareContext()
+	command, reply, err := leasesm.NewProvisionCommand(opCtx, admission)
+	return b.handoffDurableActorCommand(callerCtx, durableActorHandoff{
+		leaseUUID: admission.Operation().LeaseUUID(), command: command, reply: reply,
+		operation: opCtx, cancel: cancel,
+	}, err)
+}
+
+func (b *Backend) handoffMaintenanceAdmission(
+	callerCtx context.Context,
+	target shared.MaintenanceReleaseClaim,
+) (asyncAcceptance, error) {
+	opCtx, cancel := b.shutdownAwareContext()
+	var command leasesm.ActorCommand
+	var reply leasesm.ActorReply
+	var err error
+	switch target.Intent().Kind() {
+	case shared.MaintenanceIntentRestart:
+		command, reply, err = leasesm.NewRestartCommand(opCtx, target)
+	case shared.MaintenanceIntentUpdate:
+		command, reply, err = leasesm.NewUpdateCommand(opCtx, target)
+	case shared.MaintenanceIntentCustomDomain:
+		command, reply, err = leasesm.NewCustomDomainCommand(opCtx, target)
+	default:
+		err = fmt.Errorf("unsupported durable maintenance kind %q", target.Intent().Kind())
 	}
-	if err := b.routeToLeaseBlocking(operationCtx, admission.Operation().LeaseUUID(), command); err != nil {
-		operationCancel()
-		return asyncAcceptanceRejected, fmt.Errorf("enqueue admitted provision: %w", err)
+	return b.handoffDurableActorCommand(callerCtx, durableActorHandoff{
+		leaseUUID: target.LeaseUUID(), command: command, reply: reply,
+		operation: opCtx, cancel: cancel,
+	}, err)
+}
+
+func (b *Backend) handoffRestoreAdmission(
+	callerCtx context.Context,
+	intent shared.OperationIntentClaim,
+) (asyncAcceptance, error) {
+	opCtx, cancel := b.shutdownAwareContext()
+	command, reply, err := leasesm.NewRestoreCommand(opCtx, intent)
+	return b.handoffDurableActorCommand(callerCtx, durableActorHandoff{
+		leaseUUID: intent.LeaseUUID(), command: command, reply: reply,
+		operation: opCtx, cancel: cancel,
+	}, err)
+}
+
+func (b *Backend) handoffDurableActorCommand(
+	callerCtx context.Context,
+	handoff durableActorHandoff,
+	constructionErr error,
+) (asyncAcceptance, error) {
+	if constructionErr != nil {
+		handoff.cancel()
+		return asyncAcceptanceRejected, constructionErr
+	}
+	admissionCtx, cancelAdmission := context.WithTimeout(handoff.operation, actorAdmissionTimeout)
+	defer cancelAdmission()
+	if err := b.routeToLeaseBlocking(admissionCtx, handoff.leaseUUID, handoff.command); err != nil {
+		handoff.cancel()
+		return asyncAcceptanceRejected, fmt.Errorf("enqueue durable actor command: %w", err)
 	}
 
 	waitCtx, cancelWait := context.WithCancel(callerCtx)
-	stopDeadlineWait := context.AfterFunc(operationCtx, cancelWait)
+	stopDeadlineWait := context.AfterFunc(admissionCtx, cancelWait)
 	defer cancelWait()
 	defer stopDeadlineWait()
-	acceptance, err := b.awaitAsyncAcceptance(waitCtx, ack.Result())
+	acceptance, err := b.awaitAsyncAcceptance(waitCtx, handoff.reply.Result())
 	if acceptance == asyncAcceptanceRejected {
-		operationCancel()
+		handoff.cancel()
 	}
+	// Accepted and unknown commands retain the backend-owned worker context.
+	// The durable head fences successors even after the response/fence is gone.
 	return acceptance, err
 }
 

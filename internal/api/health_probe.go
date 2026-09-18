@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log/slog"
 	"time"
+
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // These are the fixed provider health timing labels. Backend names, when
@@ -19,14 +21,17 @@ const (
 )
 
 type healthProbeResult struct {
-	err      error
-	duration time.Duration
+	err            error
+	duration       time.Duration
+	callerCanceled bool
 }
 
-func measureHealthProbe(probe func() error) healthProbeResult {
+func measureHealthProbe(ctx context.Context, probe func() error) healthProbeResult {
 	start := time.Now()
 	err := probe()
-	return healthProbeResult{err: err, duration: time.Since(start)}
+	return healthProbeResult{
+		err: err, duration: time.Since(start), callerCanceled: errors.Is(ctx.Err(), context.Canceled),
+	}
 }
 
 // startChainHealthProbe overlaps the independent chain and backend probes under
@@ -35,12 +40,13 @@ func measureHealthProbe(probe func() error) healthProbeResult {
 func (h *Handlers) startChainHealthProbe(ctx context.Context) <-chan healthProbeResult {
 	results := make(chan healthProbeResult, 1)
 	go func() {
-		results <- measureHealthProbe(func() (err error) {
+		results <- measureHealthProbe(ctx, func() (err error) {
 			// This is the foreign-client goroutine boundary: a client panic must
 			// become an unhealthy observation rather than terminate providerd.
 			defer func() {
 				if recovered := recover(); recovered != nil {
 					slog.Error("chain health probe panicked", "panic", recovered)
+					metrics.ChainHealthProbePanicsTotal.Inc()
 					err = errors.New("chain health probe panicked")
 				}
 			}()

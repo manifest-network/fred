@@ -1466,16 +1466,6 @@ func (s *CallbackStore) Healthy() error {
 		if err := (&VolumeLaunchJournal{store: s}).validateTx(tx); err != nil {
 			return err
 		}
-		heads := tx.Bucket(callbackLeaseMutationHeadBucketName)
-		if err := heads.ForEach(func(key, value []byte) error {
-			if value == nil {
-				return fmt.Errorf("callback lease mutation head %q is a nested bucket", key)
-			}
-			_, err := decodeLeaseMutationHead(key, value)
-			return err
-		}); err != nil {
-			return err
-		}
 		if err := validateLeaseMutationUUIDSlotsTx(tx); err != nil {
 			return err
 		}

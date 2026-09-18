@@ -313,6 +313,9 @@ Start provisioning a resource asynchronously.
 
 After durable operation and resource admission, the bundled Docker backend owns
 actor enqueue and worker lifetime under its shutdown-aware provision deadline.
+The same typed handoff serves restore, restart and update. Admission has a
+separate 150-second enqueue/acknowledgment budget (or the earlier operation
+deadline); expiry after enqueue preserves the durable operation as uncertain.
 The HTTP request context owns only the acknowledgment wait. A provider disconnect
 cannot turn this admitted operation into a pre-effect refusal; a lost response
 retains the exact intent for idempotent replay. Only a source-observed failure to
@@ -1282,6 +1285,16 @@ A replacement that has already started physical execution may hand off to the
 durable close transaction after its worker is canceled and drained. It does not
 need a pre-effect refusal. Keep its exact interrupted identity, cleanup authority,
 callback order, and any unresolved physical-effect fences through that handoff.
+Failed maintenance history cannot independently acquire cleanup authority while
+that lease has a live close head; the close is the sole owner until settlement.
+
+A retained row alone is not source-transfer authority: close can persist it
+before moving the source data. Acquire the source and destination lease gates
+in one fixed order, then check the source close head and transfer its retention
+claim under that exclusion. A new source close likewise cannot acquire a lease
+already claimed by restore. The Docker backend's early source check avoids a
+known-doomed destination admission; the shared claim transition enforces the
+invariant when close and restore race.
 
 Restore recovery needs one further distinction. A durable source claim without
 an exact destination commit marker remains rollback authority; never make its

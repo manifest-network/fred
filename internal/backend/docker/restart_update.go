@@ -11,7 +11,6 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -76,11 +75,9 @@ func applyCustomDomainOverrides(items []backend.LeaseItem, overrides map[string]
 // for the busy SM, which this function forwards and api/handlers.go maps
 // to a clean 409.
 //
-// Since no off-actor Status write remains, there is nothing to roll back
-// on a marshal / Append / routing / ack failure: the error paths just
-// return (the release-store Append is on a separate bbolt store; a
-// "deploying" record left behind on routing/ack failure is cosmetic —
-// recover.go skips non-active releases and deprovision deletes them).
+// Durable admission owns the target before actor dispatch. Only a proven
+// no-enqueue or explicit actor rejection can settle pre-effect refusal. A lost
+// reply preserves that exact head for replay and bounded recovery.
 func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error {
 	request, err := b.maintenanceSettlement.NewMaintenanceRequestAuthority(
 		req.MaintenanceID, shared.MaintenanceIntentRestart, req.LeaseUUID,
@@ -135,12 +132,9 @@ func (b *Backend) routeReplaceRestart(
 	if err := b.requireMutationAdmission(ctx, "restart"); err != nil {
 		return fmt.Errorf("backend storage identity verification failed: %w", err)
 	}
-	// Serialize the complete release prelude through actor acceptance. Release
-	// history is keyed by lease and its settlement is intentionally
-	// latest-generation based, so two callers must not both append a deploying
-	// row before the actor chooses which worker owns the lease. Holding this
-	// fence until the ack also publishes Restarting before a restore-finalizer
-	// sweep can take its own snapshot under the same fence.
+	// Serialize creation of the durable maintenance head and its handoff. If
+	// the bounded response wait loses the acknowledgment, the exact journal
+	// head continues to exclude successors after this response fence opens.
 	unlockCommand := b.commandFence.Lock(leaseUUID)
 	defer unlockCommand()
 	if b.callbackStore != nil && b.releaseStore != nil {
@@ -252,40 +246,13 @@ func (b *Backend) routeReplaceRestart(
 	if !admission.created() {
 		return nil
 	}
-	maintenance, targetRelease := admission.intent, admission.target
+	targetRelease := admission.target
 
 	// Hand off to the lease actor. The actor's onEnterRestarting writes
 	// Status=Restarting and, when requested, moves the callback pair to a new base
 	// without changing its validated identity before acking. On success the
 	// actor projects the exact durable target release atomically with Ready.
-	opCtx, opCancel := b.shutdownAwareContext()
-	var command leasesm.ActorCommand
-	var ack leasesm.ActorReply
-	var commandErr error
-	if request.Kind() == shared.MaintenanceIntentCustomDomain {
-		command, ack, commandErr = leasesm.NewCustomDomainCommand(opCtx, targetRelease)
-	} else {
-		command, ack, commandErr = leasesm.NewRestartCommand(opCtx, targetRelease)
-	}
-	if commandErr != nil {
-		opCancel()
-		return b.failUnacceptedMaintenance(maintenance, targetRelease, commandErr)
-	}
-	if routeErr := b.routeToLeaseBlocking(ctx, leaseUUID, command); routeErr != nil {
-		opCancel()
-		return b.failUnacceptedMaintenance(maintenance, targetRelease, routeErr)
-	}
-	// Once routing succeeds, wait for the actor's definitive decision even if
-	// the caller cancels. Returning on cancellation would release commandFence
-	// while this message remained queued: a retry could append a newer release,
-	// then this worker could accept and settle that retry's row as its own. The
-	// caller context already bounded routing; an enqueued command must reach its
-	// actor linearization point before the release fence can open.
-	if err := <-ack.Result(); err != nil {
-		opCancel()
-		return b.failUnacceptedMaintenance(maintenance, targetRelease, err)
-	}
-	return nil
+	return b.handoffMaintenanceResult(ctx, targetRelease)
 }
 
 // validateReplaceSourceRelease proves that the exact active Release claimed
@@ -560,33 +527,27 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	if !admission.created() {
 		return nil
 	}
-	maintenance, targetRelease := admission.intent, admission.target
+	targetRelease := admission.target
 
 	// Hand off to the actor. The actor's onEnterUpdating writes Status=Updating
 	// and the prevalidated same-authority callback pair BEFORE acking. See
 	// handleUpdateRequested / spawnReplaceWorker.
-	opCtx, opCancel := b.shutdownAwareContext()
-	command, ack, commandErr := leasesm.NewUpdateCommand(opCtx, targetRelease)
-	if commandErr != nil {
-		opCancel()
-		return b.failUnacceptedMaintenance(maintenance, targetRelease, commandErr)
-	}
-	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, command); routeErr != nil {
-		opCancel()
-		return b.failUnacceptedMaintenance(maintenance, targetRelease, routeErr)
-	}
-	// See routeReplaceRestart: after enqueue, commandFence stays closed until
-	// the actor has definitively accepted or rejected this exact release.
-	if err := <-ack.Result(); err != nil {
-		opCancel()
-		return b.failUnacceptedMaintenance(maintenance, targetRelease, err)
-	}
-	return nil
+	return b.handoffMaintenanceResult(ctx, targetRelease)
 }
 
-// doUpdate performs the actual stack container update asynchronously.
-//
-// Unlike doRestart, doUpdate takes no wasActive flag: an update preflight
-// failure (image pull) is unconditionally Failed — a missed image pull never
-// achieved the desired new-image state, so the lease is Failed even from a
-// Ready source. This asymmetry is intentional; do not key it on wasActive.
+// handoffMaintenanceResult releases the response fence on a lost reply without
+// settling the durable maintenance head. Exact replay observes that same head;
+// a different maintenance key cannot admit a successor while it is unresolved.
+func (b *Backend) handoffMaintenanceResult(ctx context.Context, target shared.MaintenanceReleaseClaim) error {
+	acceptance, err := b.handoffMaintenanceAdmission(ctx, target)
+	switch acceptance {
+	case asyncAcceptanceAccepted:
+		return nil
+	case asyncAcceptanceUnknown:
+		return fmt.Errorf("maintenance acceptance is unknown; durable recovery retained: %w", err)
+	case asyncAcceptanceRejected:
+		return b.failUnacceptedMaintenance(target.Intent(), target, err)
+	default:
+		return fmt.Errorf("invalid maintenance acceptance state %d", acceptance)
+	}
+}

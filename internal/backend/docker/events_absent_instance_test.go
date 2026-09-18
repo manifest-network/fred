@@ -110,6 +110,16 @@ func TestContainerEventLoopDaemonAbsentInstancePublishesFailure(t *testing.T) {
 	assert.Equal(t, int32(1), inspections.Load())
 	assert.Zero(t, logRequests.Load(), "absence must not fetch unavailable container logs")
 	assert.Equal(t, droppedBefore, testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues("event_loop")))
+	awaitProvisionWorkerQuiescence(t, b, leaseUUID)
+	mock.ListManagedContainersFn = func(context.Context) ([]ContainerInfo, error) { return nil, nil }
+	for range 2 {
+		require.NoError(t, b.recoverState(t.Context()))
+		current, err := b.GetProvision(t.Context(), leaseUUID)
+		require.NoError(t, err)
+		require.Equal(t, backend.ProvisionStatusFailed, current.Status)
+		require.Equal(t, backend.ReasonContainerExited, current.Reason,
+			"same-generation inventory divergence must preserve the actor's exact event diagnosis")
+	}
 }
 
 func TestContainerEventLoopAbsenceStillRequiresCurrentRuntime(t *testing.T) {

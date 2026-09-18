@@ -17,10 +17,11 @@ import (
 // why it is spelled out here rather than derived (ENG-712).
 //
 // These are Gather() family names; the three histograms each expand into
-// _bucket/_sum/_count in the text exposition, so 24 collectors here are 30
-// metric names on the wire.
+// _bucket/_sum/_count in the text exposition, so collectors can expose
+// multiple metric names on the wire.
 var unlabelledMetricNames = []string{
 	"fred_backend_health_probe_panics_total",
+	"fred_chain_health_probe_panics_total",
 	"fred_backend_routing_fallback_total",
 	"fred_chain_gas_simulated",
 	"fred_payload_leases_awaiting",
@@ -143,6 +144,7 @@ func allCollectors() []prometheus.Collector {
 		APIRequestDuration,
 		APIRequestsTotal,
 		HealthCheckHealthy,
+		ChainHealthProbePanicsTotal,
 		HealthCheckDuration,
 		// Chain
 		ChainTxTotal,

@@ -160,10 +160,15 @@ func TestDeprovisionStartedMaintenanceKeepsUnknownCleanupPending(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, releases, 2, "release history remains fenced until actual cleanup")
 
+	// The exact close head now exclusively owns this Started generation. Its
+	// failure callback is history, not another physical cleanup capability.
+	receipts, err := h.b.maintenanceSettlement.ListFailedMaintenanceReceipts()
+	require.NoError(t, err)
+	require.Empty(t, receipts)
 	h.inventory.mu.Lock()
 	h.inventory.inspectErr = nil
 	h.inventory.mu.Unlock()
-	require.NoError(t, h.b.Deprovision(ctx, h.leaseUUID), "level-triggered retry must finish without restarting the backend")
+	require.NoError(t, h.b.recoverState(ctx), "normal recovery must reach the close finalizer before any receipt cleanup")
 	require.Empty(t, h.inventory.containers)
 	require.Zero(t, h.b.pool.Stats().AllocationCount)
 	releases, err = h.releases.List(h.leaseUUID)

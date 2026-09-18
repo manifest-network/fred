@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -1171,4 +1172,205 @@ func (b *Backend) completeStorageMutation(ctx context.Context, operation string,
 		mutationErr = b.latchAmbiguousOperationOutcome(operation, mutationErr)
 	}
 	return errors.Join(mutationErr, postcheckErr)
+}
+
+type restoreVolumeReturn struct {
+	canonical string
+	retained  string
+}
+
+// recoverRestoreNamespaces completes the parts of failed-restore rollback
+// which cannot be inferred from adopted source names: target-created volumes
+// and a record-first close's original canonical bytes. It accepts no target
+// names: the bound Started subject and exact source record construct distinct
+// source-return and destination-discard sets inside this workflow. Original
+// source bytes can only be returned to retention, never destroyed.
+func (m *storageMutations) recoverRestoreNamespaces(ctx context.Context) error {
+	subject := m.operationSubject
+	if !subject.RecoveryCleanup() || subject.Intent().Kind() != shared.OperationIntentRestore {
+		return errors.New("restore namespace recovery requires exact Started cleanup authority")
+	}
+	b := m.ops.backend
+	intent := subject.Intent()
+	record, err := b.retentionStore.Get(intent.SourceLeaseUUID())
+	if err != nil {
+		return fmt.Errorf("read recovered restore source: %w", err)
+	}
+	if record == nil || record.Status != shared.RetentionStatusRestoring ||
+		record.NewLeaseUUID != subject.LeaseUUID() ||
+		record.Generation != intent.SourceGeneration() {
+		return errors.New("recovered restore source authority changed before cleanup")
+	}
+	if err := b.validateRestoreOperationAuthority(intent, *record); err != nil {
+		return err
+	}
+	retention, err := b.retentionStore.ProveRestoringSnapshot(*record)
+	if err != nil {
+		return fmt.Errorf("prove recovered restore source: %w", err)
+	}
+	volumes, err := b.volumes.ListForProof(ctx)
+	if err != nil {
+		return fmt.Errorf("list recovered restore volumes: %w", err)
+	}
+	present := make(map[string]struct{}, len(volumes))
+	for _, name := range volumes {
+		present[name] = struct{}{}
+	}
+	// Destination-created scratch volumes are absent from the retained source
+	// list, but still belong to this immutable attempt. Derive their exact names
+	// from its topology; an unexpected name must keep exact absence ambiguous.
+	targets := make(map[string]struct{})
+	for _, item := range intent.EffectiveItems() {
+		for i := range item.Quantity {
+			targets[canonicalVolumeName(subject.LeaseUUID(), item.ServiceName, i)] = struct{}{}
+		}
+	}
+	var adopted, original []restoreVolumeReturn
+	for _, retained := range record.RetainedVolumeNames {
+		canonical := retainedToNewCanonical(retained, record.OriginalLeaseUUID, subject.LeaseUUID())
+		if _, owned := targets[canonical]; !owned || retained != retainedVolumePrefix+record.OriginalLeaseUUID+"-"+strings.TrimPrefix(canonical, leaseVolumePrefix(subject.LeaseUUID())) {
+			return fmt.Errorf("restore retained volume %q differs from immutable destination topology", retained)
+		}
+		delete(targets, canonical)
+		sourceCanonical := canonicalFromRetained(retained)
+		_, hasRetained := present[retained]
+		_, hasCanonical := present[canonical]
+		_, hasSource := present[sourceCanonical]
+		switch {
+		case (hasRetained && hasCanonical) || (hasSource && (hasRetained || hasCanonical)):
+			return fmt.Errorf("restore volume exists in conflicting namespaces: %q", retained)
+		case hasCanonical:
+			adopted = append(adopted, restoreVolumeReturn{canonical: canonical, retained: retained})
+		case hasSource:
+			original = append(original, restoreVolumeReturn{canonical: sourceCanonical, retained: retained})
+		case !hasRetained:
+			return fmt.Errorf("restore volume is absent from all source and destination namespaces: %q", retained)
+		}
+	}
+	var created []string
+	for name := range targets {
+		if _, exists := present[name]; exists {
+			created = append(created, name)
+		}
+	}
+	slices.Sort(created)
+	var source shared.InterruptedRestoreSource
+	if len(original) > 0 {
+		source, err = b.restoreSettlement.ProveInterruptedSourceClose(subject)
+		if err != nil {
+			return fmt.Errorf("prove interrupted source close: %w", err)
+		}
+	}
+	for _, volume := range adopted {
+		if err := m.renameVolume(ctx, volume.canonical, volume.retained); err != nil {
+			return fmt.Errorf("re-quarantine recovered restore volume %q: %w", volume.canonical, err)
+		}
+	}
+	if len(original) == 0 && len(created) == 0 {
+		return nil
+	}
+	names := slices.Clone(created)
+	for _, volume := range original {
+		if !slices.Contains(source.RetainedVolumeNames(), volume.retained) ||
+			volume.canonical != canonicalFromRetained(volume.retained) {
+			return errors.New("source namespace repair differs from interrupted close proof")
+		}
+		names = append(names, volume.canonical, volume.retained,
+			retainedToNewCanonical(volume.retained, subject.Intent().SourceLeaseUUID(), subject.LeaseUUID()))
+	}
+	for _, raw := range names {
+		name, err := parseManagedVolumeName(raw)
+		if err != nil || !m.volumeNameInScope(name) {
+			return fmt.Errorf("restore namespace recovery target %q differs from Started subject", raw)
+		}
+	}
+	return b.mutateManagedVolumeNamespace(ctx, names, func(ctx context.Context) error {
+		return m.runner.Step(ctx, "recover exact restore volume namespaces", func(ctx context.Context) error {
+			if _, err := b.retentionStore.ProveRestoringSnapshot(retention.Entry()); err != nil {
+				return fmt.Errorf("re-attest restore source before namespace recovery: %w", err)
+			}
+			if len(original) > 0 {
+				if err := source.ReattestFor(subject); err != nil {
+					return err
+				}
+				containers, err := b.strictIdentityBoundOperationInventory(ctx)
+				if err != nil {
+					return fmt.Errorf("verify interrupted source container absence: %w", err)
+				}
+				for _, container := range containers {
+					if container.LeaseUUID == subject.Intent().SourceLeaseUUID() {
+						return fmt.Errorf("source container %q still prevents namespace repair", container.ContainerID)
+					}
+				}
+			}
+			// A same-name directory, ancestor mount or physical alias may still
+			// have an unmanaged writer. Hold namespace/physical exclusion while
+			// checking the unfiltered daemon inventory; uncertainty grants no
+			// deletion or rename, and this workflow never retires foreign writers.
+			roots := make(map[string]protectedVolume, len(names))
+			defer func() {
+				for _, volume := range roots {
+					_ = volume.root.Close()
+				}
+			}()
+			for _, raw := range names {
+				if _, exists := roots[raw]; exists {
+					continue
+				}
+				name, err := parseManagedVolumeName(raw)
+				if err != nil {
+					return err
+				}
+				root, err := b.volumes.PinNamespaceRoot(name)
+				if err != nil {
+					return err
+				}
+				if root != nil {
+					roots[raw] = protectedVolume{name: raw, root: root}
+				}
+			}
+			writers, err := b.docker.ListVolumeWriters(ctx)
+			if err != nil {
+				return fmt.Errorf("verify restore namespace writers: %w", err)
+			}
+			for _, writer := range writers {
+				for _, mount := range writer.Mounts {
+					if mount.ReadOnly || (mount.Type != "bind" && mount.Type != "volume") {
+						continue
+					}
+					affected, err := protectedVolumesAffectSource(roots, mount.Source)
+					if err != nil {
+						return fmt.Errorf("classify restore namespace writer %q: %w", writer.ContainerID, err)
+					}
+					if affected {
+						return fmt.Errorf("container %q still writes a restore recovery volume", writer.ContainerID)
+					}
+				}
+			}
+			if len(original) > 0 {
+				if err := source.ReattestFor(subject); err != nil {
+					return err
+				}
+			}
+			for _, volume := range original {
+				if err := m.ops.volumes.RenameVolume(ctx, volume.canonical, volume.retained); err != nil {
+					return fmt.Errorf("return interrupted source volume %q: %w", volume.canonical, err)
+				}
+			}
+			// Close root descriptors before Destroy: holding an unlinked XFS
+			// project inode open can prevent the manager's quota-release proof.
+			for name, volume := range roots {
+				if err := volume.root.Close(); err != nil {
+					return err
+				}
+				delete(roots, name)
+			}
+			for _, name := range created {
+				if err := m.ops.volumes.Destroy(ctx, name); err != nil {
+					return fmt.Errorf("destroy restore-created volume %q: %w", name, err)
+				}
+			}
+			return nil
+		})
+	})
 }

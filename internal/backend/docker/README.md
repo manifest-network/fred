@@ -646,7 +646,18 @@ To restore data from a closed lease into a new lease:
 
 1. Open a **fresh lease on the same provider** by requesting the **same service names and quantities** as the original closed lease. The new lease UUID (`new_lease_uuid`) will be in `PENDING` state.
 2. Call `POST /v1/leases/{new_lease_uuid}/restore` with body `{"from_lease_uuid": "<original_closed_lease_uuid>"}`. Fred validates the request and delegates to the backend.
-3. The backend renames the retained volumes into the new lease's namespace (the synchronous **adopt** phase) and re-deploys the **retained manifest** (the exact deployment that was running at close time) onto them. The new lease becomes active with the same data. To change the image or configuration after restore, use the normal update path once the lease is active.
+3. After durable admission, the lease actor renames the retained volumes into the new lease's namespace and re-deploys the **retained manifest** (the exact deployment that was running at close time) onto them. The new lease becomes active with the same data. To change the image or configuration after restore, use the normal update path once the lease is active.
+
+The source close must finish before a new restore can claim its data. A close
+writes its `active` retention record before renaming volumes, so that status
+alone does not establish readiness for restore. The shared restore settlement
+checks the pending source close during admission preflight and again while
+holding both source and destination journal gates through the `active` →
+`restoring` transition. A known pending close is refused before creating a
+destination intent; if close wins the later race, the transfer is refused
+without volume effects. Conversely, a claimed restoring source excludes new
+close admission. Request disconnection after durable admission leaves the
+backend-owned actor handoff and its bounded recovery owner intact.
 
 Restore-specific re-deploy behavior worth knowing:
 
@@ -699,6 +710,19 @@ record stays `reaping`.
   callback; the periodic sweep completes the handback from that terminal row.
   Successful callback delivery does not remove it, and absence fails closed.
   Any uncertainty remains `restoring` and live-counted.
+  Cleanup derives the entire destination volume set from the exact Started
+  operation's immutable items. Adopted volumes return to their original
+  retained names; destination-created writable-path-only volumes, which are
+  absent from the source's retained list, are also removed before strict
+  destination absence can settle failure. Unexpected names grant no deletion
+  authority. For historical close/restore overlaps, original source-canonical
+  bytes can return to retention only with a current proof joining that exact
+  restore, source generation, and pending retained close. The guarded workflow
+  verifies source-container absence, excludes unmanaged writers and aliases,
+  and re-attests the journal proof under namespace exclusion. Source bytes are
+  never placed in the destination discard set. Conflicting namespaces,
+  unresolved Docker launch effects, storage drift, or uncertain observations
+  preserve the operation and source finalizer for retry.
   If the destination wrote more data than the immutable source quota permits,
   handback deliberately keeps the destination reservation and `restoring` row;
   repeated retries cannot make those bytes fit. Preserve the data and use an
@@ -995,7 +1019,7 @@ these phases do not measure the full wall time of a failed replacement.
 - `fred_docker_backend_terminal_substrate_cleanup_retries_total` — Transient late-container cleanup retries; daemon stays alive and exact terminal receipts remain.
 - `fred_docker_backend_unaccounted_managed_volumes` — Attested managed volumes absent from current live, admitted-operation, and all retention projections; diagnostic only, never deletion or admission authority.
 - `fred_docker_backend_unaccounted_managed_volume_observation_failures_total` — Failed diagnostic inventory/footprint observations; last unaccounted-volume gauge is retained, not reset to zero.
-- `fred_docker_backend_reconciliation_total{outcome}` and `fred_docker_backend_reconciliation_last_success_timestamp_seconds` — the runtime signal for state and live-operation recovery, including maintenance-WAL convergence. Global storage, journal, transport or unclassified observation failures can report `outcome="error"` and leave last-success stale while `/health` remains green; health does not validate every substrate classification. Explicit lease-local maintenance deferrals use their own counter and preserve sibling progress. Network reclamation has an independent budget and outcome counter. During startup, unresolved failures at a global recovery boundary still exit before periodic recovery starts.
+- `fred_docker_backend_reconciliation_total{outcome}` and `fred_docker_backend_reconciliation_last_success_timestamp_seconds` — the runtime signal for state and live-operation recovery, including maintenance-WAL convergence. Global storage, journal, transport or unclassified observation failures can report `outcome="error"` and leave last-success stale while `/health` remains green; health does not validate every substrate classification. Explicit lease-local maintenance deferrals use their own counter and preserve sibling progress. Durable restore-finalizer failures, including a lease-local source quota handback failure, intentionally count as pass errors and freeze last-success until settled. The `reconcile restoring operations:` prefix identifies this debt; independent finalizers still progress. This escalation can trigger reconciliation alerts even though recovery continues. Network reclamation has an independent budget and outcome counter. During startup, unresolved failures at a global recovery boundary still exit before periodic recovery starts.
 - `fred_docker_backend_retention_sweep_total{outcome}` — one increment per periodic retention-sweep pass, `success` or `error`. The sum across outcomes is a liveness heartbeat (it advances every tick regardless of result); `{outcome="error"}` means a sweep stage failed — usually an unenumerable retention store, but the orphan stage reports a failed volume-root enumeration here too, so the joined stage error is what identifies the actual failing dependency. Every stage runs on every pass and the stage errors are joined, so the log line names all of them rather than only the first.
 - `fred_docker_backend_retention_accounting_refresh_failed_total` — the retained-disk projection could not be recomputed and the previous value was kept. Safe (a zeroed projection would over-admit) but it means the five retention gauges and the pool's retained input are stale while this rises.
 - `fred_docker_backend_maintenance_readiness_pending_total{branch}` — readiness deferrals, including retries, for `committed_target`, `deploying_target`, `cleanup_source`, or `source_only`. The matching warning is emitted once per exact pending intent and branch in a backend lifetime. A committed target can remain pending indefinitely while its healthcheck is starting; inspect that workload rather than treating the metric as permission to roll it back.
@@ -1021,6 +1045,13 @@ several passes to drain; cancellation or budget exhaustion leaves the remaining
 networks for a later pass. Size Docker's address pools for active tenants and
 tenant churn between passes; close completion does not imply immediate subnet
 reuse. Backend shutdown cancels and waits for the worker.
+
+Candidate collection uses one Docker list with managed/backend labels and
+`dangling=true`; it does not inspect every active network. Each selected tenant
+still reacquires its network stripe, checks current workload ownership and
+inspects the exact network immediately before removal. State and network worker
+iterations contain panics, increment the corresponding
+`fred_background_cleanup_panics_total` component, and retry on the next tick.
 
 The bounds are nested and aggregate where cardinality matters:
 
@@ -1512,6 +1543,15 @@ If log retrieval fails for a specific instance, its value is the placeholder `<l
 ### `GET /provisions/{lease_uuid}` (authenticated)
 
 Returns a single provision record. This is the primary endpoint for retrieving full failure diagnostics after a sanitized callback.
+
+An unchanged `ready` runtime retains the reason and message of its last failed
+maintenance attempt, including a specific cause such as `ImagePullFailed`.
+Transient healthcheck observations do not erase that cause. A `failed` runtime
+also retains its original cause across same-generation recovery passes, so an
+event-authored `ContainerExited` does not become a generic cohort error. Clearing
+`RestartFailed` or `UpdateFailed` through recovery requires a complete cohort
+whose fresh bounded container inspections establish readiness; list results
+alone do not contain Docker healthcheck state.
 
 For newly persisted failure diagnostics, `lifecycle_generation` remains the
 same non-secret observation before and after this endpoint falls back to

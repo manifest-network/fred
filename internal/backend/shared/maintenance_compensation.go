@@ -440,7 +440,11 @@ func (s *MaintenanceSettlement) beginCompensation(target MaintenanceReleaseClaim
 func (s *MaintenanceSettlement) finishCompensation(subject MaintenanceCompensationSubject, result substratemutation.Result[MaintenanceCompensationSubject, MaintenancePhysicalEvidence], cause error) MaintenanceExecutionOutcome {
 	execution := MaintenanceExecutionClaim{settlement: s, target: subject.state.physical.state.target, subject: subject.state.physical}
 	failed := func(err error) MaintenanceExecutionOutcome {
-		return MaintenanceExecutionAmbiguous{settlement: s, execution: execution, cause: errors.Join(cause, err)}
+		// The target failure is historical context. The current compensation
+		// observation alone determines whether recovery must retry or abort;
+		// joining a diagnostic label would erase that distinction.
+		return MaintenanceExecutionAmbiguous{settlement: s, execution: execution,
+			cause: fmt.Errorf("source compensation after %v: %w", cause, err)}
 	}
 	if result.Kind() != substratemutation.Attested {
 		return failed(result.Err())

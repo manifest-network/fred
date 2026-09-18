@@ -557,8 +557,11 @@ rebuild retains its 30-minute cap; operation recovery receives the larger of the
 ordinary phase budget and its configured provision/read/cleanup sum; the final
 identity proof receives one Docker read budget. Each recovery list/inspect
 Docker call receives its own 30-second child budget, while the complete
-cold-start diagnostic scan and complete orphan-network scan each share one
-separate 30-second aggregate budget. Per-call recovery bounds can therefore
+cold-start diagnostic scan shares one separate 30-second aggregate budget.
+Orphan-network reclamation starts after successful startup recovery in its own
+worker, with a separate 30-second budget per pass. It consumes neither the
+startup convergence budget nor the periodic operation-recovery budget.
+Per-call recovery bounds can therefore
 accumulate with fleet size, but the finite `Start` parent remains the hard
 aggregate ceiling. Its sum reserves the shared operation-classification and
 cleanup phase even when every preceding phase consumes its cap. Transitional
@@ -1725,6 +1728,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_backend_circuit_breaker_state` | gauge | `backend` | Circuit breaker state (0=closed, 1=half-open, 2=open) |
 | `fred_backend_healthy` | gauge | `backend` | Backend health (1=healthy, 0=unhealthy). Written **only** from inside the `/health` and `/readyz` handlers, so it is exactly as fresh as whatever polls them; with no prober it latches at its last value rather than going absent |
 | `fred_health_check_duration_seconds` | histogram | `check`, `backend` | Duration of each completed chain, backend or local health check, including failures. `check` is `chain`, `backend`, `token_tracker`, `placement_store`, `placement_inventory` or `payload_store`; `backend` is empty except for a configured backend probe. Chain and backends start together within the three-second remote budget; local filesystem/lock waits remain synchronous |
+| `fred_chain_health_probe_panics_total` | counter | — | Contained chain health probe panics; every increment indicates a bug |
 | `fred_health_check_healthy` | gauge | `check` | Health of a non-backend dependency as observed by the health handler — `chain`, `token_tracker`, `placement_store`, `placement_inventory`, `payload_store` (1=healthy, 0=unhealthy). `placement_store=0` also covers sticky runtime path/inode withdrawal or an outcome-unknown commit; `placement_inventory` is the topology-bound admission baseline and is always present. Backends are excluded because `fred_backend_healthy` already carries a per-backend label this one cannot express. Same freshness caveat |
 | `fred_backend_insufficient_resources_total` | counter | `backend`, `verdict` | Capacity 503s split into `coded_refusal` (contract-conforming; exact attempt is clearable) and `ambiguous` (legacy/code-less/unknown-code; attempt retained) |
 | `fred_backend_malformed_error_body_total` | counter | `backend`, `operation` | Client-error responses whose body was not the declared JSON error envelope |
@@ -1809,6 +1813,9 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_provision_duration_seconds` | histogram | — | End-to-end provision time |
 | `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total` | counter | `reason` | Exact provision/restore intents classified past their durable admission deadline (`reason="provision_timeout"`, shared by both kinds). Cleanup uncertainty retains the intent and reservation for periodic retry; there is no separate container-start recovery timer |
 | `fred_docker_backend_operation_intent_recovery_cleanup_retries_total` | counter | kind | Deferred exact operation cleanup (`provision`/`restore`); intent and reservation remain for periodic retry |
+| `fred_docker_backend_maintenance_readiness_pending_total` | counter | `branch` | Exact maintenance readiness deferrals by recovery branch; each retry counts, while the warning is emitted once per intent and branch. Readiness uncertainty does not grant rollback authority |
+| `fred_docker_backend_maintenance_recovery_deferred_total` | counter | — | Lease-local maintenance observation conflicts deferred while sibling recovery continues; preserves the exact intent and reservation |
+| `fred_docker_backend_network_reclamation_total` | counter | `outcome` | Independent bounded network reclamation: `removed`, `absent`, `in_use`, `tenant_active`, `tenant_busy`, `error`, `list_error`, `budget_exhausted`. Only `removed` represents deletion |
 | `fred_docker_backend_terminal_substrate_pending_containers` | gauge | receipt | Last late-container count for permanent `closed`/`failed_operation` receipts; nonzero withholds this backend’s pool capacity/readiness until strict absence |
 | `fred_docker_backend_terminal_substrate_cleanup_retries_total` | counter | receipt | Transient late-container cleanup retries; daemon stays alive and exact terminal receipts remain |
 | `fred_docker_backend_unaccounted_managed_volumes` | gauge | — | Attested managed volumes absent from current live, admitted-operation, and all retention projections; diagnostic only, never deletion or admission authority |

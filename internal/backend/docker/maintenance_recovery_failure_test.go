@@ -186,7 +186,7 @@ func TestMaintenanceRecoveryKeepsGlobalFailuresFatal(t *testing.T) {
 }
 
 func TestMaintenanceReadinessBranchDeferrals(t *testing.T) {
-	for _, branch := range []string{"committed_target", "source_only", "cleanup_source"} {
+	for _, branch := range []string{"committed_target", "deploying_target", "source_only", "cleanup_source"} {
 		t.Run(branch, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				h := newMaintenanceRecoveryHarness(t)
@@ -202,6 +202,10 @@ func TestMaintenanceReadinessBranchDeferrals(t *testing.T) {
 					} else {
 						_, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
 						require.NoError(t, err)
+						if branch == "deploying_target" {
+							release = h.targetRelease
+							h.b.cfg.ProvisionTimeout = time.Hour
+						}
 					}
 				}
 				h.inventory.containers = h.containersFor(release, 2, "running", HealthStatusNone)
@@ -234,7 +238,7 @@ func TestMaintenanceReadinessBranchDeferrals(t *testing.T) {
 				time.Sleep(5 * time.Second)
 				require.NoError(t, h.b.recoverState(t.Context()))
 				status := backend.CallbackStatusFailed
-				if branch == "committed_target" {
+				if branch == "committed_target" || branch == "deploying_target" {
 					status = backend.CallbackStatusSuccess
 				}
 				h.assertSettled(status)
@@ -282,6 +286,14 @@ func TestFailedMaintenanceSourceNeedsHealthyCohortBeforeClearingReason(t *testin
 	}}
 	h := newMaintenanceRecoveryHarnessForAuthorityAtCallbackOptions(t, shared.MaintenanceIntentRestart, false, "", false, stack)
 	h.appendTarget(true)
+	// The real list adapter omits Health; only InspectContainer carries it.
+	h.b.docker.(*mockDockerClient).ListManagedContainersFn = func(ctx context.Context) ([]ContainerInfo, error) {
+		listed, err := h.inventory.list(ctx)
+		for index := range listed {
+			listed[index].Health = HealthStatusNone
+		}
+		return listed, err
+	}
 	_, err := failMaintenanceForTest(t, h.b.maintenanceSettlement, h.target, backend.ReasonRestartFailed, "restart failed", false)
 	require.NoError(t, err)
 	for _, health := range []HealthStatus{HealthStatusUnhealthy, HealthStatusStarting, HealthStatusNone} {

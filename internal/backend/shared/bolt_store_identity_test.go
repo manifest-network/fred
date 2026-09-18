@@ -242,7 +242,7 @@ func TestAuthorityPublicationReadCannotDeadlockBboltRemap(t *testing.T) {
 	require.NoError(t, <-writeDone)
 }
 
-func initializeBoundCallbackStore(t *testing.T) (string, backendidentity.VerifiedStorage) {
+func initializeBoundCallbackStore(t testing.TB) (string, backendidentity.VerifiedStorage) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "callbacks.db")

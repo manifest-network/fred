@@ -314,10 +314,14 @@ func pathContains(parent, child string) bool {
 }
 
 func (q *quiescedVolumes) affects(source string) (bool, error) {
+	return protectedVolumesAffectSource(q.volumes, source)
+}
+
+func protectedVolumesAffectSource(volumes map[string]protectedVolume, source string) (bool, error) {
 	if source == "" || !filepath.IsAbs(source) {
 		return false, errors.New("container bind source is not an absolute path")
 	}
-	for _, volume := range q.volumes {
+	for _, volume := range volumes {
 		if pathContains(volume.root.Path(), source) || pathContains(source, volume.root.Path()) {
 			return true, nil
 		}
@@ -328,7 +332,7 @@ func (q *quiescedVolumes) affects(source string) (bool, error) {
 	resolved, err := filepath.EvalSymlinks(source)
 	if err == nil {
 		source = resolved
-		for _, volume := range q.volumes {
+		for _, volume := range volumes {
 			if pathContains(volume.root.Path(), source) || pathContains(source, volume.root.Path()) {
 				return true, nil
 			}
@@ -341,7 +345,7 @@ func (q *quiescedVolumes) affects(source string) (bool, error) {
 		// A bind alias of a parent directory can replace descendants too. Only
 		// the source itself is compared with root ancestors: comparing both
 		// ancestor chains would classify every path sharing / as a writer.
-		for _, volume := range q.volumes {
+		for _, volume := range volumes {
 			for parent := filepath.Dir(volume.root.Path()); ; parent = filepath.Dir(parent) {
 				identity, err := fsidentity.InspectDirectory(parent)
 				if err != nil {
@@ -380,7 +384,7 @@ func (q *quiescedVolumes) affects(source string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		for _, volume := range q.volumes {
+		for _, volume := range volumes {
 			if identity.Equal(volume.root.Identity()) {
 				return true, nil
 			}

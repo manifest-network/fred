@@ -1742,8 +1742,14 @@ func (b *Backend) Restore(ctx context.Context, request backend.RestoreRequest) e
 
 	// (a) Validate against the retained record (read-only; the authoritative
 	// claim is atomic, step d).
-	rec, err := b.retentionStore.Get(req.FromLeaseUUID)
+	rec, err := b.restoreSettlement.ReadRestorableSource(req.FromLeaseUUID, req.Tenant)
 	if err != nil {
+		if errors.Is(err, shared.ErrNoRetention) {
+			return backend.ErrNotRetained
+		}
+		if errors.Is(err, shared.ErrNotRestorable) {
+			return fmt.Errorf("%w: %w", backend.ErrInvalidState, err)
+		}
 		return fmt.Errorf("read retention store: %w", err)
 	}
 	if rec == nil || rec.Tenant != req.Tenant { // collapse not-found + cross-tenant into one
@@ -2012,30 +2018,13 @@ func (b *Backend) Restore(ctx context.Context, request backend.RestoreRequest) e
 	// handler first durably advances the exact operation to Started, then derives
 	// every rename from that opaque subject. An actor rejection therefore has no
 	// physical side effect to unwind.
-	opCtx, opCancel := b.shutdownAwareContext()
-	command, ack, commandErr := leasesm.NewRestoreCommand(opCtx, intent)
-	if commandErr != nil {
-		opCancel()
-		return b.rollbackUnacceptedRestoreAdoption(
-			req.LeaseUUID, allocatedIDs, &claimed, intent, commandErr, logger,
-		)
-	}
-	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, command); routeErr != nil {
-		opCancel()
-		// Worker never ran; no actor transition will flip Status — drop the
-		// reservation (dropProvision=true).
-		return b.rollbackUnacceptedRestoreAdoption(
-			req.LeaseUUID, allocatedIDs, &claimed, intent, routeErr, logger,
-		)
-	}
-	acceptance, err := b.awaitAsyncAcceptance(ctx, ack.Result())
+	acceptance, err := b.handoffRestoreAdmission(ctx, intent)
 	switch acceptance {
 	case asyncAcceptanceAccepted:
 		return nil
 	case asyncAcceptanceUnknown:
 		return fmt.Errorf("restore acceptance is unknown; durable recovery retained: %s", err.Error())
 	case asyncAcceptanceRejected:
-		opCancel()
 		// An explicit actor rejection proves it never fired evRestoreRequested,
 		// so no terminal transition owns the reservation.
 		return b.rollbackUnacceptedRestoreAdoption(

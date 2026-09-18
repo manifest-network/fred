@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -68,26 +69,48 @@ func TestRemoveTenantNetworkReportsActualDockerOutcome(t *testing.T) {
 	}
 }
 
-func TestListManagedNetworksStopsInspectionAfterCancellation(t *testing.T) {
+func TestListIdleManagedNetworksUsesOneFilteredCandidateQuery(t *testing.T) {
+	requests := 0
+	transport := dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		require.Equal(t, "/v1.51/networks", req.URL.Path,
+			"candidate inventory must not inspect each network before selecting cleanup work")
+		var filters map[string]map[string]bool
+		require.NoError(t, json.Unmarshal([]byte(req.URL.Query().Get("filters")), &filters))
+		require.True(t, filters["dangling"]["true"])
+		require.True(t, filters["label"][LabelManaged+"=true"])
+		require.True(t, filters["label"][LabelBackendName+"=backend-a"])
+		return imageSecurityResponse(http.StatusOK, `[{"Id":"first","Labels":{"fred.tenant":"tenant-a"}}]`), nil
+	})
+	sdk, err := client.NewClientWithOpts(client.WithHost("http://docker.invalid"), client.WithVersion("1.51"), client.WithHTTPClient(&http.Client{Transport: transport}))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sdk.Close()) })
+	docker := &DockerClient{client: newDockerSDKView(sdk), backendName: "backend-a"}
+	networks, err := docker.ListIdleManagedNetworks(t.Context())
+	require.NoError(t, err)
+	require.Len(t, networks, 1)
+	require.Equal(t, "first", networks[0].ID)
+	require.Equal(t, 1, requests)
+}
+
+func TestListIdleManagedNetworksRejectsCanceledInventory(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	inspections := 0
+	requests := 0
 	transport := dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.Path == "/v1.51/networks" {
-			return imageSecurityResponse(http.StatusOK, `[{"Id":"first"},{"Id":"second"},{"Id":"third"}]`), nil
-		}
-		inspections++
+		requests++
+		require.Equal(t, "/v1.51/networks", req.URL.Path)
 		cancel()
-		return nil, ctx.Err()
+		return imageSecurityResponse(http.StatusOK, `[{"Id":"first"}]`), nil
 	})
 	sdk, err := client.NewClientWithOpts(client.WithHost("http://docker.invalid"), client.WithVersion("1.51"), client.WithHTTPClient(&http.Client{Transport: transport}))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, sdk.Close()) })
 	docker := &DockerClient{client: newDockerSDKView(sdk)}
-	networks, err := docker.ListManagedNetworks(ctx)
+	networks, err := docker.ListIdleManagedNetworks(ctx)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Nil(t, networks, "an interrupted inventory must not be reported as a successful empty sweep")
-	require.Equal(t, 1, inspections, "shutdown must stop iterating a large fleet once its context is canceled")
+	require.Equal(t, 1, requests)
 }
 
 // TestReleaseTenantNetwork_SkipsWhenOtherLeaseActive covers the race that

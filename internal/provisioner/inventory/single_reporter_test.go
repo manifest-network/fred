@@ -43,6 +43,8 @@ func TestSingleReporterObservationRequiresCompleteLeaseEvidence(t *testing.T) {
 			proof := snapshot.PairedTopology(binding).SingleReporter("target")
 			if scenario != "unrelated overlap" {
 				assert.False(t, proof.Matches(binding, "target", "backend-a"))
+				assert.False(t, proof.Matches(binding, "target", "backend-b"),
+					"a conflicting second reporter cannot become sole authority by iteration order")
 				return
 			}
 			assert.False(t, snapshot.Complete(binding))

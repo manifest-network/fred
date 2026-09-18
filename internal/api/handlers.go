@@ -1460,7 +1460,7 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 			// /health and aborting mid-probe, since the endpoint needs no auth.
 			// A blown DEADLINE is excluded from the exclusion: that one is
 			// genuine, and is the case the budget above deliberately produces.
-			if !errors.Is(ctx.Err(), context.Canceled) {
+			if !probe.callerCanceled {
 				metrics.HealthCheckHealthy.WithLabelValues(name).Set(0)
 			}
 			checks[name] = &CheckResult{
@@ -1526,17 +1526,17 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 	if h.tokenTracker != nil {
 		record(healthCheckToken, true,
 			"health check: token tracker unhealthy", "token tracker unavailable",
-			measureHealthProbe(h.tokenTracker.Healthy))
+			measureHealthProbe(ctx, h.tokenTracker.Healthy))
 	}
 
 	// Check placement store (bbolt database)
 	if h.placementLookup != nil {
 		record(healthCheckPlacement, true,
 			"health check: placement store unhealthy", "placement store unavailable",
-			measureHealthProbe(h.placementLookup.Healthy))
+			measureHealthProbe(ctx, h.placementLookup.Healthy))
 	}
 	if h.placementBootstrap != nil {
-		probe := measureHealthProbe(func() error {
+		probe := measureHealthProbe(ctx, func() error {
 			if !h.placementBootstrap.InventoryBootstrapped() {
 				return errors.New("authoritative placement inventory has not completed")
 			}
@@ -1551,7 +1551,7 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 	if h.payloadStoreHealth != nil {
 		record(healthCheckPayload, true,
 			"health check: payload store unhealthy", "payload store unavailable",
-			measureHealthProbe(h.payloadStoreHealth.Healthy))
+			measureHealthProbe(ctx, h.payloadStoreHealth.Healthy))
 	}
 
 	status := healthStatusHealthy

@@ -3508,7 +3508,12 @@ func (s *Store) mintPruneAbsenceProofsLocked(
 		owners := make(map[string]struct{}, len(record.ConflictBackends)+1)
 		switch {
 		case record.Conflict:
-			if record.ConflictOwnersUnknown || len(record.ConflictBackends) < 2 {
+			// An explicitly rejected positive can have one known candidate.
+			// Its later exact dual-endpoint absence is just as authoritative as
+			// absence from every candidate of a multi-owner conflict. Legacy
+			// conflicts with an incomplete candidate set remain fenced.
+			if record.ConflictOwnersUnknown || len(record.ConflictBackends) == 0 ||
+				(len(record.ConflictBackends) < 2 && !record.untrustedPositive) {
 				continue
 			}
 			for _, backendName := range record.ConflictBackends {

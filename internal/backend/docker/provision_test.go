@@ -1500,7 +1500,7 @@ func TestDeprovision_WithNetworkIsolation(t *testing.T) {
 			assert.Equal(t, "tenant-a", tenant)
 			return tenantNetworkRemoved, nil
 		},
-		ListManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
+		ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
 			return []networktypes.Inspect{{
 				Name:       TenantNetworkName("tenant-a"),
 				Labels:     map[string]string{LabelTenant: "tenant-a"},

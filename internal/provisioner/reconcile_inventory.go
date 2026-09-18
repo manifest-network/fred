@@ -4,11 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
@@ -130,11 +128,6 @@ func (inventory *reconcileInventory) rejectLease(backendName, leaseUUID string) 
 		inventory.untrustedPositiveObservations[leaseUUID] = backends
 	}
 	backends[backendName] = struct{}{}
-	if rows, exists := inventory.fleet.provisionsByBackend[backendName]; exists {
-		inventory.fleet.provisionsByBackend[backendName] = slices.DeleteFunc(rows, func(row backend.ProvisionInfo) bool {
-			return row.LeaseUUID == leaseUUID
-		})
-	}
 	if inventory.fleet.provisions[leaseUUID].BackendName == backendName {
 		delete(inventory.fleet.provisions, leaseUUID)
 	}
@@ -153,7 +146,6 @@ func (inventory *reconcileInventory) rejectBackend(backendName string) {
 	inventory.fleet.markUnanswered(backendName)
 	inventory.retentionsAnswered[backendName] = false
 	delete(inventory.fleet.storageIdentities, backendName)
-	delete(inventory.fleet.provisionsByBackend, backendName)
 	delete(inventory.retentionStorageIdentities, backendName)
 	delete(inventory.backendStorageIdentities, backendName)
 }

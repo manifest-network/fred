@@ -27,10 +27,22 @@ func TestReconcilerEndpointOverlapQuarantinesOnlyAmbiguousLease(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				const ambiguousLease = "00000000-0000-4000-8000-000000000271"
 				const healthyLease = "00000000-0000-4000-8000-000000000272"
+				const closedLease = "00000000-0000-4000-8000-000000000273"
 				var leases []billingtypes.Lease
 				acknowledged := make(chan string, 8)
 				rejected := make(chan string, 8)
 				chain := &chaintest.MockClient{
+					GetLeaseFunc: func(_ context.Context, id string) (*billingtypes.Lease, error) {
+						if id == closedLease {
+							return &billingtypes.Lease{Uuid: id, Tenant: "tenant-overlap", ProviderUuid: placementstore.ProviderUUID, State: billingtypes.LEASE_STATE_CLOSED}, nil
+						}
+						for _, lease := range leases {
+							if lease.Uuid == id {
+								return &lease, nil
+							}
+						}
+						return nil, nil
+					},
 					GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
 						return leases, nil
 					},
@@ -62,6 +74,7 @@ func TestReconcilerEndpointOverlapQuarantinesOnlyAmbiguousLease(t *testing.T) {
 				owner.provisions = []backend.ProvisionInfo{
 					{LeaseUUID: ambiguousLease, Status: status, FailCount: 100},
 					{LeaseUUID: healthyLease, Status: backend.ProvisionStatusReady},
+					{LeaseUUID: closedLease, Status: backend.ProvisionStatusReady},
 				}
 				owner.retentions = []backend.RetainedLease{{LeaseUUID: ambiguousLease}}
 				if peerReports {
@@ -86,7 +99,12 @@ func TestReconcilerEndpointOverlapQuarantinesOnlyAmbiguousLease(t *testing.T) {
 				for _, client := range []*mockReconcilerBackend{owner, peer} {
 					client.mu.Lock()
 					assert.Empty(t, client.provisionCalls, "neither overlap nor healthy presence authorizes a new launch")
-					assert.Empty(t, client.deprovisionCalls, "both leases remain live on chain")
+					if client == owner {
+						assert.Equal(t, []string{closedLease}, client.deprovisionCalls,
+							"overlap filtering must preserve terminal sibling orphan cleanup")
+					} else {
+						assert.Empty(t, client.deprovisionCalls)
+					}
 					client.mu.Unlock()
 				}
 			})

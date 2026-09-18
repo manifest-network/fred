@@ -467,7 +467,8 @@ func (s *CallbackStore) listFailedMaintenanceCompletionRecords() (
 // prove the exact maintenance generation crossed the effect boundary. Each
 // result is joined to its immutable target release under the journal pair's
 // lease lock; a missing or divergent target fails closed instead of turning a
-// receipt into caller-selected cleanup authority.
+// receipt into caller-selected cleanup authority. A live close head exclusively
+// owns the lease's physical cleanup, so it cannot issue a competing receipt.
 func (s *MaintenanceSettlement) ListFailedMaintenanceReceipts() (
 	[]FailedMaintenanceReceipt,
 	error,
@@ -488,7 +489,13 @@ func (s *MaintenanceSettlement) ListFailedMaintenanceReceipts() (
 			release Release
 		)
 		err = s.callbacks.view(func(tx *bolt.Tx) error {
-			var readErr error
+			head, _, readErr := getLeaseMutationHeadTx(tx, snapshot.LeaseUUID)
+			if readErr != nil {
+				return readErr
+			}
+			if _, closing := head.(closeLeaseMutationHead); closing {
+				return nil
+			}
 			current, found, readErr = findMaintenanceReceiptTx(
 				tx, snapshot.LeaseUUID, snapshot.MaintenanceID,
 			)
@@ -791,89 +798,4 @@ func releaseClosedLeaseMaintenanceReceiptsTx(tx *bolt.Tx, leaseUUID string) erro
 		return nil
 	}
 	return root.DeleteBucket(key)
-}
-
-func validateMaintenanceHistoryTx(tx *bolt.Tx) (uint64, error) {
-	root := tx.Bucket(callbackMaintenanceHistoryBucketName)
-	if root == nil {
-		return 0, errors.New("completed maintenance history bucket missing")
-	}
-	var completedCount uint64
-	if err := root.ForEach(func(leaseKey, value []byte) error {
-		if value != nil {
-			return fmt.Errorf("completed maintenance history %q is not a nested bucket", leaseKey)
-		}
-		if err := validateCanonicalLeaseUUID(string(leaseKey)); err != nil {
-			return err
-		}
-		records, err := listMaintenanceReceiptsTx(tx, string(leaseKey))
-		if err != nil {
-			return err
-		}
-		if len(records) > maxMaintenanceReceiptsPerLease {
-			return fmt.Errorf("maintenance receipt capacity exceeded for lease %q", leaseKey)
-		}
-		completedCount += uint64(len(records))
-		sequences := make(map[uint64]struct{}, len(records))
-		for index := range records {
-			if _, duplicate := sequences[records[index].CompletionSequence]; duplicate {
-				return fmt.Errorf(
-					"maintenance history for lease %q repeats completion sequence %d",
-					leaseKey, records[index].CompletionSequence,
-				)
-			}
-			sequences[records[index].CompletionSequence] = struct{}{}
-			if index > 0 &&
-				(records[index].Backend != records[0].Backend ||
-					records[index].BackendStorageID != records[0].BackendStorageID ||
-					records[index].Tenant != records[0].Tenant ||
-					records[index].ProviderUUID != records[0].ProviderUUID) {
-				return fmt.Errorf(
-					"maintenance history for lease %q crosses backend storage or principal authority",
-					leaseKey,
-				)
-			}
-		}
-		return nil
-	}); err != nil {
-		return 0, err
-	}
-	heads := tx.Bucket(callbackLeaseMutationHeadBucketName)
-	if heads == nil {
-		return 0, errors.New("callback lease mutation head bucket missing")
-	}
-	var pendingReservations uint64
-	if err := heads.ForEach(func(leaseKey, value []byte) error {
-		if value == nil {
-			return fmt.Errorf("callback lease mutation head %q is a nested bucket", leaseKey)
-		}
-		head, err := decodeLeaseMutationHead(leaseKey, value)
-		if err != nil {
-			return err
-		}
-		maintenance, ok := head.(maintenanceLeaseMutationHead)
-		if !ok {
-			return nil
-		}
-		pendingReservations++
-		records, err := listMaintenanceReceiptsTx(tx, string(leaseKey))
-		if err != nil {
-			return err
-		}
-		if len(records) >= maxMaintenanceReceiptsPerLease {
-			return fmt.Errorf("maintenance head for lease %q has no reserved receipt capacity", leaseKey)
-		}
-		for _, record := range records {
-			if !maintenanceReceiptMatchesEntryAuthority(record, maintenance.claim.entry) {
-				return fmt.Errorf(
-					"maintenance head for lease %q crosses completed-history authority",
-					leaseKey,
-				)
-			}
-		}
-		return nil
-	}); err != nil {
-		return 0, err
-	}
-	return completedCount + pendingReservations, nil
 }

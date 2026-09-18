@@ -58,14 +58,17 @@
 // A later sole-reporter proof may resolve only a single known-candidate
 // untrusted quarantine. It accounts for that exact lease across all paired,
 // identity-valid backend endpoints, independently of other leases' ambiguity;
-// it grants no attempt settlement or historical multi-owner conflict repair.
+// It does not repair historical multi-owner conflicts. Any attempt settlement
+// still requires the positive row's exact typed lifecycle generation.
 // A separate paired-topology proof can discharge inherited pending-sweep
 // fencing after every positive is durably represented. It requires all existing
 // storage pins and grants no new baseline, storage identity, or drain evidence.
 // A contradictory positive is unioned with all owners and attempts into durable
 // conflict quarantine. Inventory
-// silence, complete or partial, never clears an attempt or conflict because an
-// old request may commit after the list response.
+// silence, complete or partial, never clears an attempt because an old request
+// may commit after the list response. A known-candidate quarantine with no
+// attempt may be pruned only by exact dual-endpoint absence from every candidate,
+// an independent terminal chain read and a current exclusive lease claim.
 // A trusted retention in a partial sweep may reaffirm an already confirmed
 // same-backend owner, so an unrelated outage cannot revoke restore affinity;
 // it cannot create an owner or clear an unresolved attempt or conflict.

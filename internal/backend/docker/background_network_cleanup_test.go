@@ -30,7 +30,7 @@ func TestConcurrentDeprovisionsDoNotWaitForFleetNetworkInventory(t *testing.T) {
 		releaseInventory := sync.OnceFunc(func() { close(inventoryRelease) })
 		mock := &mockDockerClient{
 			RemoveContainerFn: func(context.Context, string) error { return nil },
-			ListManagedNetworksFn: func(ctx context.Context) ([]networktypes.Inspect, error) {
+			ListIdleManagedNetworksFn: func(ctx context.Context) ([]networktypes.Inspect, error) {
 				inventories.Add(1)
 				select {
 				case <-inventoryRelease:
@@ -99,7 +99,7 @@ func TestNetworkCleanupWorkerBoundsPassesAndStopsWithBackend(t *testing.T) {
 		budgetBefore := testutil.ToFloat64(networkReclamationTotal.WithLabelValues("budget_exhausted"))
 		listErrorsBefore := testutil.ToFloat64(networkReclamationTotal.WithLabelValues("list_error"))
 		mock := &mockDockerClient{
-			ListManagedNetworksFn: func(ctx context.Context) ([]networktypes.Inspect, error) {
+			ListIdleManagedNetworksFn: func(ctx context.Context) ([]networktypes.Inspect, error) {
 				inventories.Add(1)
 				<-ctx.Done()
 				return nil, ctx.Err()
@@ -149,7 +149,7 @@ func TestNetworkBacklogDoesNotStarvePendingOperationRecovery(t *testing.T) {
 		defer func() { b.stopCancel(); b.wg.Wait() }()
 		var attempts, removals atomic.Int32
 		mock := b.docker.(*mockDockerClient)
-		mock.ListManagedNetworksFn = func(context.Context) ([]networktypes.Inspect, error) {
+		mock.ListIdleManagedNetworksFn = func(context.Context) ([]networktypes.Inspect, error) {
 			networks := make([]networktypes.Inspect, 1000)
 			for index := range networks {
 				tenant := fmt.Sprintf("idle-tenant-%d", index)
@@ -192,7 +192,7 @@ func TestNetworkCleanupRechecksTenantAfterFleetInventory(t *testing.T) {
 		releaseInventory := sync.OnceFunc(func() { close(inventoryRelease) })
 		defer releaseInventory()
 		mock := &mockDockerClient{
-			ListManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
+			ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
 				<-inventoryRelease
 				return []networktypes.Inspect{{
 					Name: TenantNetworkName("tenant-a"), Labels: map[string]string{LabelTenant: "tenant-a"},
@@ -239,7 +239,7 @@ func TestNetworkCleanupCountsReclamationOutcomes(t *testing.T) {
 		networks = append(networks, networktypes.Inspect{Name: TenantNetworkName(label), Labels: map[string]string{LabelTenant: label}})
 	}
 	mock := &mockDockerClient{
-		ListManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) { return networks, nil },
+		ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) { return networks, nil },
 		RemoveTenantNetworkIfEmptyFn: func(_ context.Context, tenant string) (tenantNetworkRemoval, error) {
 			if tenant == "error" {
 				return tenantNetworkRemovalUnknown, errors.New("daemon removal refused")
@@ -258,7 +258,7 @@ func TestNetworkCleanupCountsReclamationOutcomes(t *testing.T) {
 		require.Equal(t, count+1, testutil.ToFloat64(networkReclamationTotal.WithLabelValues(label)), label)
 	}
 	listErrorsBefore := testutil.ToFloat64(networkReclamationTotal.WithLabelValues("list_error"))
-	mock.ListManagedNetworksFn = func(context.Context) ([]networktypes.Inspect, error) {
+	mock.ListIdleManagedNetworksFn = func(context.Context) ([]networktypes.Inspect, error) {
 		return nil, errors.New("daemon inventory unavailable")
 	}
 	b.cleanupOrphanedNetworks(t.Context())
@@ -269,7 +269,7 @@ func TestNetworkCleanupBusyTenantDoesNotBlockShutdownAndRetries(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var removals atomic.Int32
 		mock := &mockDockerClient{
-			ListManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
+			ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
 				return []networktypes.Inspect{{Name: TenantNetworkName("tenant-a"), Labels: map[string]string{LabelTenant: "tenant-a"}}}, nil
 			},
 			RemoveTenantNetworkIfEmptyFn: func(context.Context, string) (tenantNetworkRemoval, error) {

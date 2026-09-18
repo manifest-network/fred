@@ -758,32 +758,11 @@ func releaseCallbackReceiptReservationsTx(tx *bolt.Tx, released uint64) error {
 }
 
 func validateCallbackReceiptStateTx(tx *bolt.Tx) error {
-	operationReservations, err := validateOperationHistoryTx(tx)
+	validation, err := newCallbackReceiptValidation(tx)
 	if err != nil {
 		return err
 	}
-	maintenanceReservations, err := validateMaintenanceHistoryTx(tx)
-	if err != nil {
-		return err
-	}
-	stored, err := callbackReceiptReservationCountTx(tx)
-	if err != nil {
-		return err
-	}
-	want := operationReservations + maintenanceReservations
-	if stored != want {
-		return fmt.Errorf(
-			"callback receipt reservation count mismatch: stored=%d operation=%d maintenance=%d",
-			stored, operationReservations, maintenanceReservations,
-		)
-	}
-	if stored > maxCallbackReceiptReservationsGlobal {
-		return fmt.Errorf(
-			"global callback receipt capacity exceeded: %d > %d",
-			stored, maxCallbackReceiptReservationsGlobal,
-		)
-	}
-	return nil
+	return validation.validate()
 }
 
 func reserveLeaseMutationUUIDSlotTx(tx *bolt.Tx, leaseUUID string) error {

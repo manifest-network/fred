@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `fred_health_check_duration_seconds{check,backend}`,
+  `fred_docker_backend_health_check_duration_seconds{check}` and
+  `fred_docker_backend_storage_identity_check_duration_seconds{check}` expose
+  completed health and identity verification timings, including failures.
+  `fred_chain_health_probe_panics_total` counts contained chain probe panics.
+  (ENG-1006, ENG-1025)
 - Docker now provides offline `-inspect-unsettled-docker-effects` and
   `-repair-unsettled-docker-effects` commands for unknown launch/helper requests.
   Repair requires external Docker/runtime fencing, an exact snapshot-bound
@@ -769,9 +775,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   the hourly retention sweep. Failed handbacks retry on later passes, including
   after restart; unknown launches remain pending. (ENG-1002)
 - Provider chain and backend health probes start together within the existing
-  three-second remote budget. Stage timings distinguish dependency latency,
-  local validation and backend storage-identity work. Process liveness remains
-  independent of dependency health. (ENG-1006)
+  three-second remote budget. Process liveness remains independent of dependency
+  health. A later caller cancellation cannot erase a chain failure that was
+  already observed. (ENG-1006, ENG-1025)
+- Callback receipt validation traverses each mutation head and its histories
+  once within the health read transaction, discarding decoded data after each
+  lease. Compensation, effect-debt and delivery-queue validation remain separate.
+  Identity-bound retention health skips legacy schema discrimination and uses
+  the existing strict current decoder directly. Both still perform full
+  integrity validation on every probe. (ENG-1006, ENG-1015)
+- Restore admission and retained close now share source ownership exclusion.
+  Recovery preserves retained source bytes while reclaiming destination-only
+  writable-path volumes through exact durable operation authority. (ENG-1002,
+  ENG-1025)
+- Durable actor handoff uses the same backend-owned lifetime for provision,
+  restore, restart and update. Enqueue and acknowledgment have a separate
+  bounded admission budget; caller disconnect cannot cancel admitted work.
+  (ENG-1001, ENG-1025)
+- Maintenance recovery scopes idempotency keys by lease, preserves readiness
+  deferral through compensation, and excludes failed receipts whose lease is
+  already owned by close. Readiness recovery uses exact container inspection,
+  since list inventory does not carry health status. (ENG-1025)
+- A sole known-candidate placement quarantine can be pruned after exact
+  dual-endpoint absence and terminal chain confirmation, using the existing
+  exclusive lease claim and revision fences. Unknown owners remain quarantined.
+  (ENG-1025)
+- Network cleanup selects idle managed candidates in one filtered Docker query;
+  removal still rechecks current tenant ownership and network endpoints. Network
+  and state recovery workers contain and count iteration panics, then retry on
+  the next cadence. (ENG-1025)
 - Closing a lease during a started restart or update uses the existing durable
   close handoff after draining the replacement worker. It no longer requires an
   impossible pre-effect refusal or a backend restart to unblock cleanup. (ENG-997)

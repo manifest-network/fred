@@ -547,40 +547,10 @@ func (b *Backend) rollbackRecoveredRestoreVolumes(
 	ctx context.Context,
 	subject shared.OperationPhysicalSubject,
 ) error {
-	intent := subject.Intent()
-	record, err := b.retentionStore.Get(intent.SourceLeaseUUID())
-	if err != nil {
-		return fmt.Errorf("read recovered restore source: %w", err)
+	if mutations == nil || mutations.operationSubject != subject {
+		return errors.New("restore volume recovery belongs to another physical subject")
 	}
-	if record == nil || record.Status != shared.RetentionStatusRestoring ||
-		record.NewLeaseUUID != subject.LeaseUUID() ||
-		record.Generation != intent.SourceGeneration() {
-		return errors.New("recovered restore source authority changed before cleanup")
-	}
-	volumes, err := b.volumes.ListForProof(ctx)
-	if err != nil {
-		return fmt.Errorf("list recovered restore volumes: %w", err)
-	}
-	present := make(map[string]struct{}, len(volumes))
-	for _, name := range volumes {
-		present[name] = struct{}{}
-	}
-	for _, retained := range record.RetainedVolumeNames {
-		canonical := retainedToNewCanonical(retained, record.OriginalLeaseUUID, subject.LeaseUUID())
-		_, hasRetained := present[retained]
-		_, hasCanonical := present[canonical]
-		switch {
-		case hasRetained && hasCanonical:
-			return fmt.Errorf("restore volume exists in both retained and canonical namespaces: %q", retained)
-		case hasCanonical:
-			if err := mutations.renameVolume(ctx, canonical, retained); err != nil {
-				return fmt.Errorf("re-quarantine recovered restore volume %q: %w", canonical, err)
-			}
-		case !hasRetained:
-			return fmt.Errorf("restore volume is absent from both namespaces: %q", retained)
-		}
-	}
-	return nil
+	return mutations.recoverRestoreNamespaces(ctx)
 }
 
 // doMaintenanceRecoveryCleanup removes only the exact target generation
@@ -647,11 +617,6 @@ func (b *Backend) failedMaintenanceReceiptTargets(
 	}
 	targets := make([]ContainerInfo, 0)
 	for _, container := range containers {
-		if container.MaintenanceID == receipt.MaintenanceID() &&
-			container.LeaseUUID != receipt.LeaseUUID() {
-			return nil, fmt.Errorf("failed maintenance ID %s is attached to foreign lease %q",
-				receipt.MaintenanceID(), container.LeaseUUID)
-		}
 		if container.LeaseUUID != receipt.LeaseUUID() ||
 			container.MaintenanceID != receipt.MaintenanceID() {
 			continue

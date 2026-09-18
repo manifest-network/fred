@@ -719,6 +719,13 @@ a generic failure and fall back to displaying the human-readable `message` — n
 `reason` with an exhaustive switch that errors on the default case. Adding a new `reason` is
 considered a backward-compatible change.
 
+A `ready` lease can retain `reason` and `message` from a failed maintenance
+attempt while its original runtime remains available. Periodic Docker recovery
+preserves that cause while the same release and operation remain `ready`,
+including transient healthcheck observations. An actual recovery from `failed`
+to `ready`, or a successful replacement, can clear the previous cause. Use
+`status` to determine the current runtime state.
+
 The set defined today:
 
 | Reason | Meaning |
