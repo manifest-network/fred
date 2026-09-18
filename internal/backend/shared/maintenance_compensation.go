@@ -444,7 +444,7 @@ func (s *MaintenanceSettlement) finishCompensation(subject MaintenanceCompensati
 		// observation alone determines whether recovery must retry or abort;
 		// joining a diagnostic label would erase that distinction.
 		return MaintenanceExecutionAmbiguous{settlement: s, execution: execution,
-			cause: fmt.Errorf("source compensation after %v: %w", cause, err)}
+			cause: fmt.Errorf("source compensation after %s: %w", fmt.Sprint(cause), err)}
 	}
 	if result.Kind() != substratemutation.Attested {
 		return failed(result.Err())

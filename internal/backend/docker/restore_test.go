@@ -731,7 +731,7 @@ func TestDeprovision_Retain_DoesNotClobberRestoringRecord(t *testing.T) {
 	f := &volumeWriterLaunchFixture{b: b, source: before.OriginalLeaseUUID}
 	closeHead := editHistoricalSourceClose(t, f, nil)
 	require.NotEmpty(t, closeHead)
-	b, rs = f.b, f.b.retentionStore
+	rs = f.b.retentionStore
 	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
 	claimed, err := claimRetentionForTest(
 		t, rs,
