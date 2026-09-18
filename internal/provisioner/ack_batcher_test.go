@@ -40,7 +40,7 @@ func (m *mockAckChainClient) GetLease(ctx context.Context, leaseUUID string) (*b
 	}
 	// Default: return a PENDING lease so acknowledgment proceeds
 	return &billingtypes.Lease{
-		Uuid:  leaseUUID,
+		Uuid: leaseUUID, ProviderUuid: testProviderUUID,
 		State: billingtypes.LEASE_STATE_PENDING,
 	}, nil
 }
@@ -468,6 +468,9 @@ func TestAckBatcher_SkipsAlreadyAcknowledgedLeases(t *testing.T) {
 	var ackCalls [][]string
 
 	client := &mockAckChainClient{
+		getLeaseFunc: func(_ context.Context, id string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{Uuid: id, ProviderUuid: testProviderUUID, State: billingtypes.LEASE_STATE_ACTIVE}, nil
+		},
 		// Only lease-b is pending; lease-a and lease-c are already acknowledged
 		getPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
@@ -543,10 +546,11 @@ func TestAckBatcher_SkipsAlreadyAcknowledgedLeases(t *testing.T) {
 	}
 }
 
-func TestAckBatcher_SkipsNotFoundLeases(t *testing.T) {
+func TestAckBatcher_DoesNotAcknowledgeNotFoundLeases(t *testing.T) {
 	var ackCalled atomic.Bool
 
 	client := &mockAckChainClient{
+		getLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) { return nil, nil },
 		// Return empty list - no pending leases exist
 		getPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{}, nil
@@ -572,9 +576,9 @@ func TestAckBatcher_SkipsNotFoundLeases(t *testing.T) {
 	// Try to acknowledge a non-existent lease
 	acked, _, err := batcher.Acknowledge(ctx, "non-existent-lease")
 
-	// Should report success (lease doesn't exist, nothing to do)
-	assert.NoError(t, err, "Acknowledge()")
-	assert.True(t, acked, "Acknowledge() acked should be true")
+	// Missing inventory is not evidence that an acknowledgment committed.
+	assert.Error(t, err, "Acknowledge()")
+	assert.False(t, acked, "Acknowledge() must preserve the unresolved owner")
 
 	// AcknowledgeLeases should NOT have been called
 	assert.False(t, ackCalled.Load(), "AcknowledgeLeases was called for non-existent lease")

@@ -239,7 +239,12 @@ func (s *OperationSettlement) ReserveProvisionResources(
 	if cpu-p.allocatedCPU > p.availableCPULocked() ||
 		memory-p.allocatedMemory > p.availableMemoryLocked() ||
 		disk-p.allocatedDisk > p.availableDiskLocked() {
-		return ProvisionAdmission{}, errors.New("insufficient resources for provision reservation")
+		// Capture incremental demand and headroom under the same pool lock as
+		// admission. Later routing snapshots cannot explain which limit refused
+		// this exact conservative envelope; this diagnostic grants no authority.
+		return ProvisionAdmission{}, fmt.Errorf("insufficient resources for provision reservation: incremental cpu=%g memory_mb=%d disk_mb=%d; available cpu=%g memory_mb=%d disk_mb=%d",
+			cpu-p.allocatedCPU, memory-p.allocatedMemory, disk-p.allocatedDisk,
+			p.availableCPULocked(), p.availableMemoryLocked(), p.availableDiskLocked())
 	}
 	if quota := p.tenantQuota; quota != nil {
 		old, next := p.tenantUsage[durable.Tenant()], tenants[durable.Tenant()]

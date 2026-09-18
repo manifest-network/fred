@@ -974,9 +974,31 @@ func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 
 // GetLeaseLogs handles GET /v1/leases/{lease_uuid}/logs
 func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
+	if read := h.prepareLeaseLogs(w, r); read != nil {
+		read.ServeHTTP(w, r)
+	}
+}
+
+// preparedLeaseLogs binds authentication, the placement-selected backend and
+// validated read parameters before the response owner permits materialization.
+// No chain lookup or routing decision runs while holding the large-response slot.
+type leaseLogsReader interface {
+	Name() string
+	GetLogs(context.Context, string, int) (map[string]string, error)
+}
+
+type preparedLeaseLogs struct {
+	leaseUUID    string
+	tenant       string
+	providerUUID string
+	client       leaseLogsReader
+	tail         int
+}
+
+func (h *Handlers) prepareLeaseLogs(w http.ResponseWriter, r *http.Request) http.Handler {
 	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, false, false)
 	if !ok {
-		return
+		return nil
 	}
 
 	// Parse tail parameter
@@ -985,18 +1007,26 @@ func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
 		n, parseErr := strconv.Atoi(v)
 		if parseErr != nil || n < 1 {
 			writeError(w, "tail must be a positive integer", http.StatusBadRequest)
-			return
+			return nil
 		}
 		if n > 10000 {
 			writeError(w, "tail must not exceed 10000", http.StatusBadRequest)
-			return
+			return nil
 		}
 		tail = n
 	}
+	return preparedLeaseLogs{
+		leaseUUID: leaseUUID, tenant: auth.Token.Tenant, providerUUID: h.providerUUID,
+		client: backendClient, tail: tail,
+	}
+}
 
-	logs, err := backendClient.GetLogs(r.Context(), leaseUUID, tail)
+func (read preparedLeaseLogs) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	leaseUUID, backendClient := read.leaseUUID, read.client
+	logs, err := backendClient.GetLogs(r.Context(), leaseUUID, read.tail)
 	if err != nil {
 		if backend.IsReadCapacity(err) {
+			slog.Warn("tenant log response admission deferred", "reason", "backend_read_capacity", "backend", backendClient.Name(), "lease_uuid", leaseUUID)
 			w.Header().Set("Retry-After", "1")
 			writeError(w, "log response capacity exhausted", http.StatusServiceUnavailable)
 			return
@@ -1019,13 +1049,13 @@ func (h *Handlers) GetLeaseLogs(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("lease logs served",
 		"lease_uuid", leaseUUID,
-		"tenant", auth.Token.Tenant,
+		"tenant", read.tenant,
 		"backend", backendClient.Name(),
 	)
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := response.WriteEnvelopeJSON(w, map[string]string{
-		"lease_uuid": leaseUUID, "tenant": auth.Token.Tenant, "provider_uuid": h.providerUUID,
+		"lease_uuid": leaseUUID, "tenant": read.tenant, "provider_uuid": read.providerUUID,
 	}); err != nil {
 		slog.Warn("log response write failed", "error", err, "lease_uuid", leaseUUID)
 	}
@@ -1719,15 +1749,15 @@ func (h *Handlers) GetWorkloads(w http.ResponseWriter, r *http.Request) {
 	// Initialize with non-nil zero values so JSON serialization is `{}` and `[]`
 	// rather than `null` even when no backend returns anything.
 	merged := make(map[string]WorkloadEntry)
-	warnings := []string{}
+	batches, warnings := h.planWorkloadLookup(uuids)
 	var mu sync.Mutex
 
 	if h.backendRouter != nil {
-		backends := h.backendRouter.Backends()
 		g, gctx := errgroup.WithContext(r.Context())
-		for _, b := range backends {
+		for _, batch := range batches {
 			g.Go(func() error {
-				provisions, err := b.LookupProvisions(gctx, uuids)
+				b := batch.client
+				provisions, err := batch.lookup(gctx)
 				if err != nil {
 					// If the parent context was canceled (client went away), gctx.Err()
 					// is non-nil and the error is the propagation of that cancel.

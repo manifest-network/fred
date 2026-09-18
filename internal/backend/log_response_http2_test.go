@@ -18,6 +18,7 @@ func TestLogsHandlerHTTP2ExtendsDeadlineBeforeRetrieval(t *testing.T) {
 	}{
 		{name: "backend", new: NewLogsHandler},
 		{name: "tenant", new: NewTenantLogsHandler},
+		{name: "prepared_tenant", new: preparedLogsTestHandler},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const serverWriteTimeout = 200 * time.Millisecond

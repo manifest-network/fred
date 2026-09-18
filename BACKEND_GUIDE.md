@@ -370,7 +370,11 @@ enqueue or explicit actor rejection can authorize the existing refusal path.
 
 **Error Responses:**
 - `400 Bad Request` - Invalid request body
-- `409 Conflict` - Lease already provisioned
+- `409 Conflict` - Lease already provisioned, or `code: "operation_completion_pending"`
+  when an earlier operation completion still occupies this lease's durable
+  callback FIFO. The latter is an expected availability condition, but the
+  current provision remains ambiguous: Fred preserves its exact attempt and
+  cannot infer acceptance, refusal or permission to substitute another backend.
 - `503 Service Unavailable` - Insufficient resources. A backend that synchronously refuses before starting work MUST return `{"error":"...","code":"insufficient_resources"}`. Under the configured transport's trust boundary, Fred can then clear only that request's exact write-ahead attempt and may route a retry to another backend. A code-less, malformed, or unknown-code 503 remains ambiguous and blocks substitution because an intermediary could have emitted it after backend acceptance.
 
 ### GET /info/{lease_uuid}
@@ -472,7 +476,13 @@ List currently provisioned resources. Used by Fred for reconciliation. Keyset-pa
 
 **Pagination:** `GET /provisions` is keyset-paginated. Query params: `limit` (max page size) and `continue` (a lease UUID — the `continue` cursor returned by the previous page). The JSON response carries a top-level `continue` field set to the last record's lease UUID, omitted once the list is exhausted. An invalid `limit` or a non-UUID `continue` returns 400, as does a `continue` cursor supplied without a positive `limit`. A `limit` above the server maximum (5000) is coerced down to it rather than rejected. With no params it returns the full list unpaginated (back-compat). One or more `lease_uuid` query params return just those records. (ENG-380)
 
-**Complete-inventory limits:** Fred accepts at most 100,000 items and 128 MiB of cumulative response-body bytes (including whitespace) for each complete `/provisions` or `/retentions` inventory, independently of page size. The configured backend HTTP timeout also bounds the entire walk, including every page and body read. Exceeding a count, byte or time limit fails the whole walk; no partial result is usable as ownership, settlement or repair evidence.
+**Filtered workload lookup:** Fred groups confirmed leases without an unresolved
+attempt by recorded owner; uncertain placement still uses fleet discovery. Each
+response must contain only UUIDs assigned to that backend's request. An
+unsolicited row rejects the whole batch with a warning, so discovery cannot
+replace a confirmed owner's result. These reads grant no placement authority.
+
+**Complete-inventory limits:** Fred accepts at most 100,000 items and 128 MiB of cumulative response-body bytes (including whitespace) for each complete `/provisions` or `/retentions` inventory, independently of page size. Complete `/provisions` and `/retentions` walks share one per-client recovery slot, independent of the tenant circuit breaker. The configured backend HTTP timeout bounds queueing and the entire walk, including every page and body read. Inventory neither trips nor resets the tenant breaker; filtered workload lookups and other tenant calls still use it. Exceeding a count, byte or time limit fails the whole walk; no partial result is usable as ownership, settlement or repair evidence.
 
 **Fields:**
 - `fail_count` - Number of provision failures for this lease
@@ -552,7 +562,11 @@ one member at a time and encodes strings in small fragments using Go's JSON
 escaper. The decoder can still buffer a large member, and the HTTP timeout
 handler buffers the final response. Each daemon therefore admits only one log
 response at a time across tenants/backends, holding admission through both
-retrieval and final client writing, even when the request times out.
+retrieval and final client writing, even when the request times out. Up to eight
+additional requests wait within the original deadline. Provider tenant requests
+can perform bounded authorization/routing preparation before joining the single
+materialization queue; preparation, waiting and retrieval use one deadline and
+at most nine request slots. A timed-out worker retains its slot until it exits.
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned (or logs expired)
@@ -764,7 +778,7 @@ leases must never both receive acceptance for the same retained source.
 
 **Error Responses:**
 - `400 Bad Request` - Missing required fields, equal source and target UUIDs, or items/manifest validation error
-- `409 Conflict` - Invalid state for restore, or already provisioned. Both return a JSON `{"error": "..."}` body; the already-provisioned case additionally sets `code: "already_provisioned"` (the invalid-state case omits `code`), so the two are distinguished by that discriminator
+- `409 Conflict` - Invalid state for restore, or already provisioned. Both return a JSON `{"error": "..."}` body; the already-provisioned case additionally sets `code: "already_provisioned"` (the invalid-state case omits `code`), so the two are distinguished by that discriminator. An exact earlier completion occupying the durable callback FIFO instead returns `code: "operation_completion_pending"`; Fred treats that as ambiguous and preserves the attempt without counting an availability failure. Only a validated matching backend/storage FIFO produces this diagnostic. Corrupt or foreign journal evidence remains an error
 - `422 Unprocessable Entity` - Overloaded across two cases, distinguished by a `code` discriminator like the `409` above. Both return a JSON `{"error": "..."}` body; a **bare** `422` (no `code`) means no retained data for `from_lease_uuid` (also the correct response for backends without retention support), while a `422` with `code: "demote_exceeds_tier"` means the restore requested a **smaller** SKU disk tier whose `disk_mb` cap is below the retained volume's measured footprint (a refused demote)
 - `503 Service Unavailable` - Insufficient resources. A synchronous capacity refusal MUST carry `{"error":"...","code":"insufficient_resources"}`; under the configured transport's trust boundary this authorizes clearing the exact target attempt. A legacy/code-less, unknown-code, or malformed 503 remains ambiguous and keeps the target attempt until its exact callback, an upgraded inventory report carrying the same paired typed generation, or operator repair.
 

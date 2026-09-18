@@ -6,6 +6,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/provisioner/inventory"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
 
 // RecordProvision, RecordRetention, and RecordUntrusted deliberately exist
@@ -97,6 +98,45 @@ type InventoryProjection = inventoryProjection
 type ProjectionResult = projectionResult
 
 var ErrInventoryProjectorConflict = errInventoryProjectorConflict
+
+// Store-focused tests compose the production source-reservation stages without
+// exporting the application coordinator's authenticated chain boundary.
+func (s *Store) beginRestore(
+	baseline AdmissionBaseline,
+	sourceLeaseUUID, targetLeaseUUID string,
+	operationID operation.OperationID,
+	request BackendRequestSnapshot,
+	callbacks CallbackPair,
+) (RestoreClaim, error) {
+	source, err := s.reserveRestoreSource(sourceLeaseUUID)
+	if err != nil {
+		return RestoreClaim{}, err
+	}
+	defer s.releaseRestoreSource(source)
+	return s.beginReservedRestore(baseline, source, targetLeaseUUID, operationID, request, callbacks)
+}
+
+func (s *Store) beginAuthorizedRestore(
+	baseline AdmissionBaseline,
+	revision RecordRevision,
+	targetLeaseUUID string,
+	operationID operation.OperationID,
+	request BackendRequestSnapshot,
+	callbacks CallbackPair,
+) (RestoreClaim, error) {
+	if !revision.Valid() || revision.issuer != s.recordIssuer {
+		return RestoreClaim{}, ErrInvalidRecordRevision
+	}
+	source, err := s.reserveRestoreSource(revision.leaseUUID)
+	if err != nil {
+		return RestoreClaim{}, err
+	}
+	defer s.releaseRestoreSource(source)
+	if source.revision != revision {
+		return RestoreClaim{}, ErrRestoreSourceUnavailable
+	}
+	return s.beginReservedRestore(baseline, source, targetLeaseUUID, operationID, request, callbacks)
+}
 
 func (fence inventoryFence) Valid() bool { return fence.valid() }
 

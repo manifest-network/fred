@@ -763,6 +763,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- ACK batch recovery now observes the exact lease UUID and configured provider
+  before an individual retry and after an ambiguous broadcast. Only a verified
+  `ACTIVE` lease establishes completion from an observation alone; omission from a pending
+  list, terminal states and billing error text do not. (ENG-1001, ENG-1025)
+- Restore reserves its confirmed source in the placement store before target
+  chain authorization, then transfers that same opaque reservation into durable
+  target admission. Already-captured inventory cannot invalidate the source
+  between authorization and dispatch. (ENG-997, ENG-1025)
+- Full backend inventory has a serialized recovery lane independent of the
+  tenant circuit, within the existing queue-plus-walk timeout. Exact pending
+  callback completions now return a typed ambiguous diagnostic without opening
+  the tenant circuit; foreign or corrupt evidence remains an error. (ENG-1025)
+- Bulk workload metadata queries group confirmed leases without an unresolved
+  attempt by recorded owner;
+  unrelated failed backends no longer invalidate those reads. Unresolved leases
+  retain conservative fleet discovery. (ENG-997, ENG-1025)
+- Tenant logs prepare bounded authorization and routing before acquiring the
+  single materialized-response slot. The nine-request bound, content limit and
+  original deadline remain unchanged; worker and socket completion jointly own
+  capacity. Refusal logs distinguish request admission, waiting and backend
+  capacity, and resource admission reports all three headroom dimensions.
+  (ENG-997, ENG-1025)
 - Durable Docker provision actor handoff now belongs to the backend lifecycle.
   A provider disconnect cannot cancel that admitted actor enqueue and
   turn that admitted operation into a terminal refusal; exact replay keeps the

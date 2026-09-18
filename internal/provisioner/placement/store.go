@@ -1073,10 +1073,11 @@ type Store struct {
 	// observation-to-projection window. A crash loses this map but not the durable
 	// pending marker.
 	unprojectedPositives map[string]map[uint64]map[inventoryPositiveObservation]struct{}
-	// restoreClaims are process-local source reservations held only across a
-	// synchronous backend Restore call. The durable target attempt is the
-	// authority after dispatch returns or this process restarts.
-	restoreClaims map[string]RestoreClaim
+	// restoreClaims holds one closed reservation stage per source: authorization
+	// reserves its exact record before target chain I/O; durable admission then
+	// replaces that stage with the full synchronous dispatch claim. The durable
+	// target attempt is the authority after dispatch returns or process restart.
+	restoreClaims map[string]restoreSourceReservationStage
 	restoreNonce  uint64
 	// attemptClaims are process-local reservations issued only when an
 	// authenticated callback names an exact unresolved attempt or confirmed
@@ -1367,7 +1368,7 @@ func loadStoreWithExpectedAuthority(
 			}
 			return set
 		}(),
-		restoreClaims:        make(map[string]RestoreClaim),
+		restoreClaims:        make(map[string]restoreSourceReservationStage),
 		attemptClaims:        make(map[string]AttemptClaim),
 		recordIssuer:         recordIssuer,
 		runtimeAuthorityPath: authorityPath,
@@ -2319,53 +2320,21 @@ func (s *Store) attemptClaimedLocked(leaseUUID string) bool {
 	return claimed
 }
 
-// beginRestore is the package-private unchecked source-revision variant used
-// by placement tests. Production restore admission must use
-// BeginAuthorizedRestore so tenant authorization remains bound to the exact
-// source owner and revision that is claimed.
-func (s *Store) beginRestore(
+// beginReservedRestore consumes a live source authorization and atomically
+// replaces it with the source/target dispatch claim. No detached placement
+// snapshot can redirect the request or race target chain authorization.
+func (s *Store) beginReservedRestore(
 	baseline AdmissionBaseline,
-	sourceLeaseUUID, targetLeaseUUID string,
-	operationID operation.OperationID,
-	requestSnapshot BackendRequestSnapshot,
-	callbackPair CallbackPair,
-) (RestoreClaim, error) {
-	return s.beginRestoreWithSourceRevision(
-		baseline, RecordRevision{}, sourceLeaseUUID, targetLeaseUUID, operationID,
-		requestSnapshot, callbackPair,
-	)
-}
-
-// BeginAuthorizedRestore atomically claims one previously authorized source
-// revision for synchronous restore dispatch and durably records the target
-// attempt on that same source backend. Restore authorization presents this
-// opaque revision so a concurrent placement owner change cannot redirect the
-// authorized command to a different backend.
-func (s *Store) beginAuthorizedRestore(
-	baseline AdmissionBaseline,
-	sourceRevision RecordRevision,
+	reserved *restoreSourceReservation,
 	targetLeaseUUID string,
 	operationID operation.OperationID,
 	requestSnapshot BackendRequestSnapshot,
 	callbackPair CallbackPair,
 ) (RestoreClaim, error) {
-	if !sourceRevision.Valid() || sourceRevision.issuer != s.recordIssuer {
-		return RestoreClaim{}, ErrInvalidRecordRevision
+	if !reserved.validFor(s) {
+		return RestoreClaim{}, ErrInvalidRestoreClaim
 	}
-	return s.beginRestoreWithSourceRevision(
-		baseline, sourceRevision, sourceRevision.leaseUUID, targetLeaseUUID, operationID,
-		requestSnapshot, callbackPair,
-	)
-}
-
-func (s *Store) beginRestoreWithSourceRevision(
-	baseline AdmissionBaseline,
-	expectedSource RecordRevision,
-	sourceLeaseUUID, targetLeaseUUID string,
-	operationID operation.OperationID,
-	requestSnapshot BackendRequestSnapshot,
-	callbackPair CallbackPair,
-) (RestoreClaim, error) {
+	sourceLeaseUUID := reserved.revision.leaseUUID
 	if sourceLeaseUUID == "" {
 		return RestoreClaim{}, fmt.Errorf("%w: source lease UUID is required", ErrInvalidPlacement)
 	}
@@ -2393,8 +2362,8 @@ func (s *Store) beginRestoreWithSourceRevision(
 	if err := s.validateAdmissionBaselineLocked(baseline); err != nil {
 		return RestoreClaim{}, err
 	}
-	if s.restoreSourceClaimedLocked(sourceLeaseUUID) {
-		return RestoreClaim{}, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, sourceLeaseUUID)
+	if s.restoreClaims[sourceLeaseUUID] != reserved {
+		return RestoreClaim{}, ErrInvalidRestoreClaim
 	}
 	// A source-reserved lease cannot simultaneously become another restore's
 	// target. This is the restore counterpart to the typed attempt-admission
@@ -2418,7 +2387,9 @@ func (s *Store) beginRestoreWithSourceRevision(
 		!sourceRevision.Valid() {
 		return RestoreClaim{}, fmt.Errorf("%w: lease %q", ErrRestoreSourceUnavailable, sourceLeaseUUID)
 	}
-	if expectedSource.Valid() && expectedSource != sourceRevision {
+	if reserved.revision != sourceRevision || reserved.backendName != source.Backend ||
+		reserved.storageID != s.backendStorageIDs[source.Backend] ||
+		reserved.principal != s.lifecycleCache[sourceLeaseUUID].principal {
 		return RestoreClaim{}, fmt.Errorf(
 			"%w: lease %q changed after authorization",
 			ErrRestoreSourceUnavailable, sourceLeaseUUID,

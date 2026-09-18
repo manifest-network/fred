@@ -969,6 +969,24 @@ const CodeDemoteExceedsTier = "demote_exceeds_tier"
 // misclassification.
 const CodeAlreadyProvisioned = "already_provisioned"
 
+// CodeOperationCompletionPending reports a valid earlier callback completion
+// occupying the lease FIFO. It is an availability-success diagnostic only:
+// callers must preserve the exact unresolved attempt, never settle a refusal.
+const CodeOperationCompletionPending = "operation_completion_pending"
+
+// operationCompletionPendingResponse is minted only by the exact transport
+// response branch. It deliberately unwraps to no lifecycle/refusal sentinel.
+type operationCompletionPendingResponse struct{}
+
+func (*operationCompletionPendingResponse) Error() string {
+	return "an earlier operation completion is pending"
+}
+
+func isOperationCompletionPendingResponse(err error) bool {
+	var pending *operationCompletionPendingResponse
+	return errors.As(err, &pending)
+}
+
 // CodeInsufficientResources is the contract discriminator for a capacity
 // refusal before asynchronous work starts. It establishes response-envelope
 // conformance, not cryptographic authorship: backend responses are not HMAC
@@ -1148,6 +1166,10 @@ type HTTPClient struct {
 	httpClient *http.Client
 	cb         *gobreaker.CircuitBreaker
 	identity   BackendStorageIdentityResolver
+
+	// One complete inventory walk may run independently of the tenant breaker.
+	// The constructor owns the slot; callers cannot select a bypass mode.
+	inventorySlot chan struct{}
 
 	// Response body size limits
 	maxInfoBytes             int64
@@ -1352,6 +1374,7 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 				errors.Is(err, ErrValidation) ||
 				errors.Is(err, ErrInsufficientResources) ||
 				IsReadCapacity(err) ||
+				isOperationCompletionPendingResponse(err) ||
 				errors.Is(err, ErrAlreadyProvisioned) ||
 				errors.Is(err, ErrInvalidState) ||
 				errors.Is(err, ErrNotRetained) ||
@@ -1399,6 +1422,7 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 			},
 		},
 		cb:                       cb,
+		inventorySlot:            make(chan struct{}, 1),
 		maxInfoBytes:             positiveOr(cfg.MaxInfoBytes, DefaultMaxInfoBytes),
 		maxProvisionBytes:        positiveOr(cfg.MaxProvisionBytes, DefaultMaxProvisionBytes),
 		maxProvisionsBytes:       positiveOr(cfg.MaxProvisionsBytes, DefaultMaxProvisionsBytes),
@@ -1970,7 +1994,15 @@ func (c *HTTPClient) provisionCall(
 			case http.StatusConflict:
 				// 409: the backend reports a conflict. Callers must validate it
 				// against authoritative inventory before treating it as ownership.
-				callErr := fmt.Errorf("%w: %s", ErrAlreadyProvisioned, readErrorBody(resp))
+				code, msg, parseErr := c.parseErrorCode(readErrorBodyBytes(resp), "provision")
+				if parseErr != nil {
+					observed = ambiguousProvisionCall(parseErr)
+					return nil, parseErr
+				}
+				callErr := detailOr(ErrAlreadyProvisioned, msg)
+				if code == CodeOperationCompletionPending {
+					callErr = &operationCompletionPendingResponse{}
+				}
 				observed = ambiguousProvisionCall(callErr)
 				return nil, callErr
 			case http.StatusServiceUnavailable:
@@ -2111,6 +2143,29 @@ func walkKeysetPages[T any](ctx context.Context, op string, requireIdentity bool
 	}
 }
 
+// beginInventoryWalk bounds queueing and the entire paginated read with one
+// deadline. Inventory is a recovery observation, so tenant transport failures
+// must not suppress it. This lane neither trips nor resets the tenant breaker;
+// all page authentication, identity, size, and completeness checks still apply.
+func (c *HTTPClient) beginInventoryWalk(ctx context.Context) (context.Context, func(), error) {
+	ctx, cancel := context.WithTimeout(ctx, c.httpClient.Timeout)
+	select {
+	case c.inventorySlot <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-c.inventorySlot
+			cancel()
+			return nil, nil, err
+		}
+		return ctx, func() {
+			<-c.inventorySlot
+			cancel()
+		}, nil
+	case <-ctx.Done():
+		cancel()
+		return nil, nil, ctx.Err()
+	}
+}
+
 // ListProvisions returns all provisioned resources from this backend. It walks
 // the keyset-paginated /provisions endpoint, reassembling the complete set; it
 // returns an error rather than a partial set (complete-or-error) so the
@@ -2134,6 +2189,12 @@ func (c *HTTPClient) listProvisionsWithIdentity(
 ) (_ []ProvisionInfo, observed backendidentity.ID, err error) {
 	start := time.Now()
 	defer func() { c.recordMetrics("list_provisions", start, err) }()
+
+	ctx, release, err := c.beginInventoryWalk(ctx)
+	if err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	defer release()
 
 	provisions, observed, err := walkKeysetPages(ctx, "list provisions", requireIdentity, c.httpClient.Timeout, func(ctx context.Context, cont string) (inventoryPage[ProvisionInfo], error) {
 		return c.fetchProvisionsPage(ctx, cont, requireIdentity)
@@ -2163,51 +2224,37 @@ func (c *HTTPClient) fetchProvisionsPage(
 	}
 	target := c.baseURL + "/provisions?" + q.Encode()
 
-	result, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-		if err := c.prepareRequest(httpReq, nil, requestIdentityBootstrap); err != nil {
-			return nil, err
-		}
-
-		resp, err := c.do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("list provisions request failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("list provisions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
-		}
-		var storageID backendidentity.ID
-		if requireIdentity {
-			storageID, err = responseStorageIdentity(resp)
-			if err != nil {
-				return nil, fmt.Errorf("list provisions response identity: %w", err)
-			}
-		}
-
-		var provResult ListProvisionsResponse
-		bodyBytes, err := decodeJSONMeasured(resp.Body, c.maxProvisionsBytes, &provResult)
-		if err != nil {
-			return nil, fmt.Errorf("decode provisions response: %w", err)
-		}
-		return inventoryPage[ProvisionInfo]{items: provResult.Provisions, next: provResult.Continue, identity: storageID, bodyBytes: bodyBytes}, nil
-	})
-
-	if isCircuitBreakerError(cbErr) {
-		return inventoryPage[ProvisionInfo]{}, ErrCircuitOpen
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return inventoryPage[ProvisionInfo]{}, fmt.Errorf("create request: %w", err)
 	}
-	if cbErr != nil {
-		return inventoryPage[ProvisionInfo]{}, cbErr
+	if err := c.prepareRequest(httpReq, nil, requestIdentityBootstrap); err != nil {
+		return inventoryPage[ProvisionInfo]{}, err
 	}
-	page, ok := result.(inventoryPage[ProvisionInfo])
-	if !ok {
-		return inventoryPage[ProvisionInfo]{}, fmt.Errorf("list provisions: unexpected result type %T", result)
+
+	resp, err := c.do(httpReq)
+	if err != nil {
+		return inventoryPage[ProvisionInfo]{}, fmt.Errorf("list provisions request failed: %w", err)
 	}
-	return page, nil
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return inventoryPage[ProvisionInfo]{}, fmt.Errorf("list provisions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+	}
+	var storageID backendidentity.ID
+	if requireIdentity {
+		storageID, err = responseStorageIdentity(resp)
+		if err != nil {
+			return inventoryPage[ProvisionInfo]{}, fmt.Errorf("list provisions response identity: %w", err)
+		}
+	}
+
+	var provResult ListProvisionsResponse
+	bodyBytes, err := decodeJSONMeasured(resp.Body, c.maxProvisionsBytes, &provResult)
+	if err != nil {
+		return inventoryPage[ProvisionInfo]{}, fmt.Errorf("decode provisions response: %w", err)
+	}
+	return inventoryPage[ProvisionInfo]{items: provResult.Provisions, next: provResult.Continue, identity: storageID, bodyBytes: bodyBytes}, nil
 }
 
 // GetProvision retrieves status information for a single provision.
@@ -2463,6 +2510,11 @@ func (c *HTTPClient) restoreCall(
 				observed = ambiguousRestoreCall(perr)
 				return nil, perr
 			}
+			if code == CodeOperationCompletionPending {
+				callErr := &operationCompletionPendingResponse{}
+				observed = ambiguousRestoreCall(callErr)
+				return nil, callErr
+			}
 			if code == CodeAlreadyProvisioned {
 				callErr := detailOr(ErrAlreadyProvisioned, msg)
 				observed = ambiguousRestoreCall(callErr)
@@ -2618,6 +2670,12 @@ func (c *HTTPClient) listRetentionsWithIdentity(
 	start := time.Now()
 	defer func() { c.recordMetrics("list_retentions", start, err) }()
 
+	ctx, release, err := c.beginInventoryWalk(ctx)
+	if err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	defer release()
+
 	retentions, observed, err := walkKeysetPages(ctx, "list retentions", requireIdentity, c.httpClient.Timeout, func(ctx context.Context, cont string) (inventoryPage[RetainedLease], error) {
 		return c.fetchRetentionsPage(ctx, cont, requireIdentity)
 	})
@@ -2672,51 +2730,37 @@ func (c *HTTPClient) fetchRetentionsPage(
 	}
 	target := c.baseURL + "/retentions?" + q.Encode()
 
-	result, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-		if err := c.prepareRequest(httpReq, nil, requestIdentityBootstrap); err != nil {
-			return nil, err
-		}
-
-		resp, err := c.do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("list retentions request failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("list retentions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
-		}
-		var storageID backendidentity.ID
-		if requireIdentity {
-			storageID, err = responseStorageIdentity(resp)
-			if err != nil {
-				return nil, fmt.Errorf("list retentions response identity: %w", err)
-			}
-		}
-
-		var retResult ListRetentionsResponse
-		bodyBytes, err := decodeJSONMeasured(resp.Body, c.maxRetentionsBytes, &retResult)
-		if err != nil {
-			return nil, fmt.Errorf("decode retentions response: %w", err)
-		}
-		return inventoryPage[RetainedLease]{items: retResult.Retentions, next: retResult.Continue, identity: storageID, bodyBytes: bodyBytes}, nil
-	})
-
-	if isCircuitBreakerError(cbErr) {
-		return inventoryPage[RetainedLease]{}, ErrCircuitOpen
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return inventoryPage[RetainedLease]{}, fmt.Errorf("create request: %w", err)
 	}
-	if cbErr != nil {
-		return inventoryPage[RetainedLease]{}, cbErr
+	if err := c.prepareRequest(httpReq, nil, requestIdentityBootstrap); err != nil {
+		return inventoryPage[RetainedLease]{}, err
 	}
-	page, ok := result.(inventoryPage[RetainedLease])
-	if !ok {
-		return inventoryPage[RetainedLease]{}, fmt.Errorf("list retentions: unexpected result type %T", result)
+
+	resp, err := c.do(httpReq)
+	if err != nil {
+		return inventoryPage[RetainedLease]{}, fmt.Errorf("list retentions request failed: %w", err)
 	}
-	return page, nil
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return inventoryPage[RetainedLease]{}, fmt.Errorf("list retentions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+	}
+	var storageID backendidentity.ID
+	if requireIdentity {
+		storageID, err = responseStorageIdentity(resp)
+		if err != nil {
+			return inventoryPage[RetainedLease]{}, fmt.Errorf("list retentions response identity: %w", err)
+		}
+	}
+
+	var retResult ListRetentionsResponse
+	bodyBytes, err := decodeJSONMeasured(resp.Body, c.maxRetentionsBytes, &retResult)
+	if err != nil {
+		return inventoryPage[RetainedLease]{}, fmt.Errorf("decode retentions response: %w", err)
+	}
+	return inventoryPage[RetainedLease]{items: retResult.Retentions, next: retResult.Continue, identity: storageID, bodyBytes: bodyBytes}, nil
 }
 
 // Health checks if the backend is reachable and healthy.

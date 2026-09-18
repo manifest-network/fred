@@ -1405,7 +1405,7 @@ func (dispatch RestoreDispatch) Metadata() operation.SettlementMetadata {
 func (coordinator *OperationCoordinator) admitRestoreDispatch(
 	initiation operation.Initiation,
 	baseline AdmissionBaseline,
-	sourceRevision RecordRevision,
+	source *restoreSourceReservation,
 	targetLeaseUUID string,
 	request BackendRequestSnapshot,
 	callbacks CallbackPair,
@@ -1413,8 +1413,8 @@ func (coordinator *OperationCoordinator) admitRestoreDispatch(
 	if !coordinator.Valid() || !initiation.Valid() || !initiation.ID().Valid() {
 		return RestoreDispatch{}, "", errors.New("valid restore admission authority is required")
 	}
-	claim, err := coordinator.store.beginAuthorizedRestore(
-		baseline, sourceRevision, targetLeaseUUID, initiation.ID(), request, callbacks,
+	claim, err := coordinator.store.beginReservedRestore(
+		baseline, source, targetLeaseUUID, initiation.ID(), request, callbacks,
 	)
 	if err != nil {
 		completion := coordinator.operations.AbortInitiation(initiation)

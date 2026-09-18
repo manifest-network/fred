@@ -728,17 +728,48 @@ tenant-declared tmpfs remain memory-backed and are not additional disk charges.
 
 ---
 
+## Load-test failure attribution
+
+`operation_completion_pending` is a validated earlier callback completion in a
+lease's FIFO. It preserves the current durable attempt and does not count as a
+backend availability failure. Inspect callback delivery and the exact operation
+before treating a repeated pending completion as corruption. Other intent
+conflicts, foreign storage evidence and malformed responses remain failures.
+
+Tenant log admission warnings include a bounded `reason`: `request_queue_full`,
+`request_canceled`, `response_wait_expired`, or `backend_read_capacity`. The last
+also names the backend and lease. Correlate these with timeout responses and
+circuit transitions; an HTTP 503 alone does not identify which budget refused
+the read. These warnings do not cover every timeout phase.
+
+Global provision reservation refusals include incremental CPU, memory and disk
+demand beside the headroom observed under the reservation lock. The same atomic
+capacity check still owns admission. Sampled CPU utilization alone cannot
+identify a refusal caused by memory, disk or concurrent reservations.
+
 ## Backend unreachable during reconciliation
 
 A backend that is configured but not answering `GET /provisions` or
-`GET /retentions` — down, wedged, partitioned, or with its circuit breaker open
-— no longer aborts the whole reconciliation sweep. Fred marks the inventory
+`GET /retentions` — down, wedged, or partitioned — no longer aborts the whole
+reconciliation sweep. Fred marks the inventory
 incomplete and retries on the next cycle. Existing workloads continue serving;
 exact callbacks and safely evidenced status/cleanup work can continue. Once a
 complete inventory has established the durable baseline for this topology, a
 partial sweep can also admit genuinely new recordless `PENDING` work on the
 typed set of nodes that answered **both** inventories. It never treats a silent
 node as evidence about the leases it may hold.
+
+Full inventory uses a separate bounded recovery lane: one complete provision or
+retention walk at a time per HTTP client, with queueing and all pages covered by
+the configured backend timeout. An open tenant circuit cannot suppress that
+observation. Successful inventory does not reset the circuit or authorize tenant
+calls; failed inventory does not trip it. An unavailable backend therefore still
+makes the sweep incomplete, and identity, completeness and placement projection
+checks remain mandatory. Filtered `/workloads` reads still use the tenant circuit,
+but confirmed leases without an unresolved attempt query only their recorded
+owner; an unrelated silent node
+cannot add a warning to an otherwise complete owner-specific result.
+
 
 That availability rule assumes the preceding inventory sweep ended cleanly. If
 providerd restarts with an interrupted-sweep marker in `placements.db`, a lost
@@ -763,9 +794,10 @@ remain unresolved and fail closed.
 
 **Symptoms**
 
-- `fred_reconciler_backend_fetch_total{backend="X",outcome!="ok"}` rising, with
-  `outcome` distinguishing `error` (contacted and failed), `circuit_open` (fred
-  short-circuited without dialing)
+- `fred_reconciler_backend_fetch_total{backend="X",outcome!="ok"}` rising.
+  Bundled HTTP inventory reports `error` for failed or timed-out walks, including
+  queue expiry. The compatibility `circuit_open` outcome can still describe
+  custom clients; bundled full inventory no longer short-circuits on that state
 - `fred_reconciler_sweep_complete` at 0
 - `fred_provisioner_reconciler_deferred_leases_total` rising
 - `fred_reconciler_runs_total{outcome="degraded"}` incrementing each cycle
@@ -1719,9 +1751,13 @@ so its samples alone do not describe a failed replacement's complete duration.
 `POST /v1/leases/{lease_uuid}/restore` (on providerd; `POST /restore` on the docker-backend) re-deploys a lease onto its **retained** (soft-deleted) volumes — the v0.5.0 headline feature. Restore has its own durable operation and retention-finalizer protocol. Its adoption phase renames the exact `fred-retained-*` volumes to the destination namespace; failed restoration returns them only through the exact failed-operation handback described below.
 
 **Provider-side admission and recovery.** Before contacting a backend, providerd
-acquires ordered lifecycle claims for both source and target, re-reads the target
-as tenant/provider-owned `PENDING`, and atomically reserves the exact confirmed
-source while writing an operation-scoped durable attempt for the absent target.
+acquires ordered lifecycle claims for both source and target, then reserves the
+exact confirmed source in the placement store before re-reading the target as
+tenant/provider-owned `PENDING`. The reservation fences inventory that was already
+captured. Admission transfers that same opaque reservation to the full restore
+claim while atomically writing the absent target's durable operation attempt.
+Failure before transfer releases only the early reservation; an older deferred
+release cannot revoke a transferred or replacement claim.
 Concurrent lifecycle work sharing either lease returns 409 before dispatch. The
 source reservation is process-local and lasts only through the synchronous call;
 the target attempt survives restart.

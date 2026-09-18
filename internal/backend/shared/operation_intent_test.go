@@ -545,8 +545,10 @@ func TestOperationIntentTerminalSuccessorWaitsForCallbackDelivery(t *testing.T) 
 
 	_, err = store.ProbeOperationIntent(successorProbe)
 	require.ErrorIs(t, err, ErrOperationIntentConflict)
+	require.True(t, IsOperationCompletionPending(err))
 	_, err = beginTestOperationIntent(t, store, successor)
 	require.ErrorIs(t, err, ErrOperationIntentConflict)
+	require.True(t, IsOperationCompletionPending(err))
 
 	require.NoError(t, store.removeEntry(completion))
 	disposition, err := store.ProbeOperationIntent(successorProbe)
@@ -581,8 +583,10 @@ func TestOperationIntentTerminalSuccessorRequiresSameDurableAuthority(t *testing
 	}
 	_, err = store.ProbeOperationIntent(testOperationIntentProbe(t, store, differentStorage, foreignIdentity))
 	require.ErrorIs(t, err, ErrOperationIntentConflict)
+	require.False(t, IsOperationCompletionPending(err), "authority divergence is not ordinary FIFO contention")
 	_, err = beginTestOperationIntent(t, store, differentStorage, foreignIdentity)
 	require.ErrorIs(t, err, ErrOperationIntentConflict)
+	require.False(t, IsOperationCompletionPending(err), "authority divergence is not ordinary FIFO contention")
 
 	differentPrincipal := predecessor
 	differentPrincipal.CallbackURL = "https://fred.example/callbacks/provision?operation_id=" + uuid.NewString()
@@ -591,6 +595,7 @@ func TestOperationIntentTerminalSuccessorRequiresSameDurableAuthority(t *testing
 	differentPrincipal.Tenant = "tenant-b"
 	_, err = beginTestOperationIntent(t, store, differentPrincipal)
 	require.ErrorIs(t, err, ErrOperationIntentConflict)
+	require.False(t, IsOperationCompletionPending(err), "authority divergence is not ordinary FIFO contention")
 }
 
 func TestOperationCompletionHistoryPreservesAThroughBRestartAndClose(t *testing.T) {

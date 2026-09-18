@@ -733,11 +733,13 @@ func (s *CallbackStore) probeOperationIntent(
 			if callback.DeliveryKind == CallbackDeliveryKindLifecycle {
 				continue
 			}
-			if callback.CallbackURL != probe.callbackURL ||
-				callback.Backend != probe.backend ||
+			if callback.Backend != probe.backend ||
 				callback.BackendStorageID != probe.storageID.String() {
-				return fmt.Errorf("%w for lease %q: an earlier operation completion is pending",
+				return fmt.Errorf("%w for lease %q: pending completion has different storage authority",
 					ErrOperationIntentConflict, probe.leaseUUID)
+			}
+			if callback.CallbackURL != probe.callbackURL {
+				return &operationCompletionPendingError{leaseUUID: probe.leaseUUID}
 			}
 			disposition = OperationIntentAdmissionCompleted
 		}
@@ -893,14 +895,15 @@ func (s *CallbackStore) beginOperationIntent(
 			if callback.DeliveryKind == CallbackDeliveryKindLifecycle {
 				continue
 			}
-			if callback.CallbackURL == entry.CallbackURL &&
-				callback.Backend == entry.Backend &&
-				callback.BackendStorageID == entry.BackendStorageID {
+			if callback.Backend != entry.Backend || callback.BackendStorageID != entry.BackendStorageID {
+				return fmt.Errorf("%w for lease %q: pending completion has different storage authority",
+					ErrOperationIntentConflict, entry.LeaseUUID)
+			}
+			if callback.CallbackURL == entry.CallbackURL {
 				exactCompletion = true
 				continue
 			}
-			return fmt.Errorf("%w for lease %q: an earlier operation completion is pending",
-				ErrOperationIntentConflict, entry.LeaseUUID)
+			return &operationCompletionPendingError{leaseUUID: entry.LeaseUUID}
 		}
 		if exactCompletion {
 			admission = OperationIntentAdmission{disposition: OperationIntentAdmissionCompleted}

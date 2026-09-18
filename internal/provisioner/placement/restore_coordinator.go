@@ -183,18 +183,6 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 		}
 	}
 
-	source := authority.coordinator.store.Lookup(request.sourceLeaseUUID)
-	if source.State() == StateAbsent {
-		return RestoreApplicationResult{disposition: RestoreApplicationSourceNotFound}
-	}
-	if source.State() != StateConfirmed || source.Backend == "" ||
-		source.Attempt != "" || !source.RecordRevision().Valid() {
-		return RestoreApplicationResult{
-			disposition: RestoreApplicationSourceUnavailable,
-			err: fmt.Errorf("%w: placement state=%s, unresolved_attempt=%t",
-				ErrRestoreSourceUnavailable, source.State(), source.Attempt != ""),
-		}
-	}
 	firstUUID, secondUUID := request.sourceLeaseUUID, request.targetLeaseUUID
 	firstIsSource := true
 	if secondUUID < firstUUID {
@@ -226,6 +214,15 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 			slog.Error("failed to release restore source lease claim", "lease_uuid", request.sourceLeaseUUID)
 		}
 	}()
+
+	// Select and reserve the exact source before the target chain read. A
+	// Registry claim excludes lifecycle commands, while the Store reservation
+	// also fences inventory captured before those Registry claims existed.
+	source, err := authority.coordinator.store.reserveRestoreSource(request.sourceLeaseUUID)
+	if err != nil {
+		return restoreAdmissionApplicationFailure(err)
+	}
+	defer authority.coordinator.store.releaseRestoreSource(source)
 
 	targetObservation := authority.readLease(
 		ctx, request.targetLeaseUUID, request.tenant,
@@ -297,7 +294,7 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 	}
 	dispatch, backendName, err := authority.coordinator.admitRestoreDispatch(
 		initiation,
-		authority.coordinator.store.CurrentAdmissionBaseline(), source.RecordRevision(),
+		authority.coordinator.store.CurrentAdmissionBaseline(), source,
 		request.targetLeaseUUID, requestSnapshot, callbackPair,
 	)
 	if err != nil {

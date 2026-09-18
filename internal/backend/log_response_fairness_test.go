@@ -106,12 +106,25 @@ func (w *observedSocketLogWriter) Write(p []byte) (int, error) {
 }
 
 func TestLogsHandlerStalledSocketReleasesToWaitingReader(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		new  func(http.Handler, time.Duration, time.Duration) http.Handler
+	}{
+		{name: "backend", new: NewLogsHandler},
+		{name: "prepared_tenant", new: preparedLogsTestHandler},
+	} {
+		t.Run(tc.name, func(t *testing.T) { testLogsStalledSocket(t, tc.new) })
+	}
+}
+
+func testLogsStalledSocket(t *testing.T, constructor func(http.Handler, time.Duration, time.Duration) http.Handler) {
+	t.Helper()
 	// Real TCP flow control, not a fake writer: the first client never reads,
 	// and its receive window is smaller than the materialized response.
 	writeStarted := make(chan struct{})
 	firstDone := make(chan struct{})
 	var calls atomic.Int32
-	h := NewLogsHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := constructor(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		if r.URL.Path == "/stalled" {
 			_, _ = io.WriteString(w, strings.Repeat("x", 8<<20))

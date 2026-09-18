@@ -323,12 +323,14 @@ Restore adopts a soft-deleted lease's retained data into a new lease (see the [d
 2. Tenant POSTs /v1/leases/{new}/restore with from_lease_uuid = {closed}
 3. `restore.Service` submits only authenticated source/target/tenant identity to
    `RestoreCoordinator.ExecuteApplication`:
-   a. The coordinator verifies source ownership before acquiring ordered source
-      and target lifecycle claims, then re-reads the target as a
-      tenant/provider-owned PENDING lease
-   b. It initiates a typed restore operation, atomically reserves the source's
-      exact confirmed placement, and durably writes the absent target's attempt
-      on that same backend (restore is same-backend, ENG-333)
+   a. The coordinator verifies source chain ownership, acquires ordered source
+      and target lifecycle claims, then obtains a store-issued exact source
+      reservation before re-reading the target as tenant/provider-owned PENDING
+   b. It initiates a typed restore operation and atomically transfers that same
+      opaque reservation to the full restore claim while durably writing the
+      absent target's attempt on that backend (restore is same-backend, ENG-333).
+      The early reservation also fences previously captured inventory; failure
+      before transfer releases only that reservation
    c. It derives the exact backend and HMAC-covered callback pair internally
    d. It calls backend POST /restore and owns settlement: exact positive evidence
       confirms, a transport-trusted contract refusal clears, and every ambiguous

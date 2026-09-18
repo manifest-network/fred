@@ -653,6 +653,11 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	err := s.backend.Provision(r.Context(), req)
 	if err != nil {
+		if shared.IsOperationCompletionPending(err) {
+			s.errorResponseWithCode(w, http.StatusConflict,
+				"an earlier operation completion is pending", backend.CodeOperationCompletionPending)
+			return
+		}
 		if errors.Is(err, backend.ErrAlreadyProvisioned) {
 			s.errorResponse(w, http.StatusConflict, "lease already provisioned")
 			return
@@ -845,6 +850,11 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 
 	err := s.backend.Restore(r.Context(), req)
 	if err != nil {
+		if shared.IsOperationCompletionPending(err) {
+			s.errorResponseWithCode(w, http.StatusConflict,
+				"an earlier operation completion is pending", backend.CodeOperationCompletionPending)
+			return
+		}
 		if errors.Is(err, backend.ErrNotRetained) {
 			s.errorResponse(w, http.StatusUnprocessableEntity, "no retained data for lease")
 			return

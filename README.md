@@ -439,7 +439,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 | `GET` | `/health` | None | Liveness. Probes chain, backends and DBs, but **no verdict ever makes it 503** — poll this from a load balancer |
 | `GET` | `/readyz` | None | Deep readiness. Same body; 503 when local bbolt authority is unreadable/withdrawn or no durable inventory baseline matches the configured backend topology. **Not** for load balancers |
 | `GET` | `/metrics` | None | Prometheus metrics |
-| `GET` | `/workloads?lease_uuid=<u1>&lease_uuid=<u2>...` | None | Bulk workload metadata lookup by lease UUID (1..MaxLookupUUIDs). Used by the manifest-admin SPA. |
+| `GET` | `/workloads?lease_uuid=<u1>&lease_uuid=<u2>...` | None | Bulk workload metadata lookup by lease UUID (1..MaxLookupUUIDs). Confirmed leases without an unresolved attempt query only their recorded owner; unresolved leases use fleet discovery. Unavailable relevant backends produce warnings. Used by the manifest-admin SPA. |
 | `POST` | `/callbacks/provision` | HMAC-SHA256 | Backend → Fred callback (5-min replay window) |
 
 See [SECURITY.md](SECURITY.md) for replay protection rationale per endpoint.
@@ -757,11 +757,18 @@ Ready deployment after a failed update or restart, its live keys remain unchange
 and the failed attempt appears under `failed/<service>/<instance>` keys. A later
 deployment removes those older failure entries from the active view. Logs share
 a 32 MiB aggregate content budget, with bounded marker and encoding overhead.
-Each daemon admits one log response at a time across tenants and backends.
-Up to eight additional requests wait in FIFO order. Queueing and retrieval share
-the configured request deadline; a full queue or expired admission wait returns
-`503 Service Unavailable` with `Retry-After: 1`.
-Admission remains held until both retrieval and the final response write finish,
+Each daemon admits one materialized log response at a time across tenants and
+backends, with at most nine admitted requests total. The provider prepares small
+authorization and routing results concurrently within those nine slots, then
+queues authorized reads in FIFO order for the single response slot. A slow chain
+lookup therefore does not hold response memory needed by another authorized read.
+Preparation, queueing and retrieval share the original configured request
+deadline. A full request queue returns `503 Service Unavailable` with
+`Retry-After: 1`; expiry while waiting for the provider response slot returns the
+numeric `503` request timeout envelope without a retry header. Requests already
+canceled at entry receive the capacity envelope. Backend admission expiry retains its
+capacity envelope and retry header.
+Admission remains held until both the worker and the final response write finish,
 including timeout cleanup; retrying a read does not consume a replay token.
 The final response transfer has a separate deadline using the daemon's configured
 HTTP write timeout, falling back to the request timeout when no positive write
@@ -953,9 +960,12 @@ Content-Type: application/json
 Restore a soft-deleted lease's retained data into a **new** lease. The path `lease_uuid` is the new, fresh `PENDING` lease the data is adopted into; `from_lease_uuid` in the body names the original closed/expired lease whose volumes were retained (see [retention](internal/backend/docker/README.md#soft-delete--restore)). Fred resolves the backend that holds the source lease's retained data (restore is same-backend, ENG-333), then re-deploys the retained manifest onto the adopted volumes. Only the item **shape** must match: the new lease's requested service names and quantities must equal the original's, but its SKU/disk tier MAY differ. A promote (same-or-larger disk tier) satisfies the tier-size check but still requires sufficient backend capacity and the other admission checks; on success, the new `disk_mb` cap is applied; a demote (smaller disk tier) is allowed only if the retained volume's measured data still fits the new tier's `disk_mb` cap (the backend runs `checkDemoteFit` before adopting). A refused demote returns `422 Unprocessable Entity`; the JSON body's `error` message begins `retained data exceeds the requested smaller tier` (the body's `code` field is the numeric HTTP status, not a string discriminator).
 
 Admission is safe by construction. Fred acquires ordered lifecycle claims for the
-source and target, re-reads the target while those claims are held, and atomically
-reserves the exact confirmed source placement while durably writing the absent
-target's operation-scoped attempt before it contacts the backend. Concurrent
+source and target, then obtains a store-issued reservation of the exact confirmed
+source before re-reading and authorizing the target. That reservation fences even
+inventory captured before the lifecycle claims. Durable target admission
+atomically transfers the same reservation into the full restore claim while
+writing the absent target's operation-scoped attempt, before contacting the
+backend. Failure before transfer releases only the early reservation. Concurrent
 lifecycle work sharing either lease is rejected before dispatch. The source
 reservation is process-local and lasts only through the synchronous backend call;
 the target attempt is durable and is later settled only by its exact operation ID.

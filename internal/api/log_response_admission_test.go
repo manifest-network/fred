@@ -30,6 +30,10 @@ func (b *apiLogAdmissionBackend) GetLogs(ctx context.Context, lease string, tail
 }
 
 func newLogAdmissionAPI(t *testing.T, timeout time.Duration, tenantRate float64, client *apiLogAdmissionBackend) (http.Handler, func() [2]*http.Request) {
+	return newLogAdmissionAPIWithChain(t, timeout, tenantRate, client, nil)
+}
+
+func newLogAdmissionAPIWithChain(t *testing.T, timeout time.Duration, tenantRate float64, client *apiLogAdmissionBackend, beforeLookup func(context.Context, string)) (http.Handler, func() [2]*http.Request) {
 	t.Helper()
 	keys := [2]*testutil.TestKeyPair{testutil.NewTestKeyPair("logs-first"), testutil.NewTestKeyPair("logs-second")}
 	leaseIDs := [2]string{testutil.ValidUUID1, testutil.ValidUUID3}
@@ -50,7 +54,10 @@ func newLogAdmissionAPI(t *testing.T, timeout time.Duration, tenantRate float64,
 		RateLimitRPS: 100, RateLimitBurst: 100, TenantRateLimitRPS: tenantRate, TenantRateLimitBurst: 100,
 	}, ServerDeps{
 		BackendRouter: router,
-		ChainClient: &mockChainClient{getLeaseFunc: func(_ context.Context, leaseID string) (*billingtypes.Lease, error) {
+		ChainClient: &mockChainClient{getLeaseFunc: func(ctx context.Context, leaseID string) (*billingtypes.Lease, error) {
+			if beforeLookup != nil {
+				beforeLookup(ctx, leaseID)
+			}
 			return leases[leaseID], nil
 		}},
 	})

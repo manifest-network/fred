@@ -418,11 +418,20 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 			if _, isPending := pendingOnChain[req.leaseUUID]; isPending {
 				pendingLeases = append(pendingLeases, req)
 			} else {
-				slog.Debug("lease not pending, skipping acknowledgment",
-					"lease_uuid", req.leaseUUID, "lane", laneIdx,
-				)
+				var result ackResult
+				switch observed := l.observeAcknowledgment(ctx, req.leaseUUID).(type) {
+				case ackLeasePending:
+					pendingLeases = append(pendingLeases, req)
+					continue
+				case ackLeaseActive:
+					result.acknowledged = true
+				case ackLeaseUnresolved:
+					result.err = observed.err
+				default:
+					result.err = errors.New("acknowledgment observation is invalid")
+				}
 				select {
-				case req.resultCh <- ackResult{acknowledged: true, txHash: ""}:
+				case req.resultCh <- result:
 				default:
 				}
 			}
@@ -457,7 +466,7 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 		pending = pending[:0]
 
 		if len(pendingLeases) == 0 {
-			slog.Debug("all leases already acknowledged, no tx needed", "lane", laneIdx)
+			slog.Debug("no pending leases remain in acknowledgment batch", "lane", laneIdx)
 			return
 		}
 
@@ -524,7 +533,7 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 			slog.Warn("batch acknowledgment failed, falling back to individual acks",
 				"lane", laneIdx, "count", len(leaseUUIDs), "error", err,
 			)
-			l.acknowledgeIndividually(ctx, pendingLeases, pendingOnChain, dupChans, laneIdx)
+			l.acknowledgeIndividually(ctx, pendingLeases, dupChans, laneIdx)
 		}
 	}
 
@@ -566,58 +575,13 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 }
 
 // acknowledgeIndividually processes each request one at a time.
-// Reuses the pendingOnChain map from the caller's flush to avoid a redundant RPC.
+// Each retry obtains a fresh exact observation: the pre-broadcast PENDING
+// inventory can be stale after the batch fails, or while earlier retries run.
 // dupChans holds extra resultCh channels from deduped requests that must receive
 // the same result as their primary (may be nil when there are no duplicates).
-func (l *ackLane) acknowledgeIndividually(ctx context.Context, requests []ackRequest, pendingOnChain map[string]struct{}, dupChans map[string][]chan<- ackResult, laneIdx int) {
+func (l *ackLane) acknowledgeIndividually(ctx context.Context, requests []ackRequest, dupChans map[string][]chan<- ackResult, laneIdx int) {
 	for _, req := range requests {
-		if ctx.Err() != nil {
-			result := ackResult{err: ctx.Err()}
-			select {
-			case req.resultCh <- result:
-			default:
-			}
-			for _, ch := range dupChans[req.leaseUUID] {
-				select {
-				case ch <- result:
-				default:
-				}
-			}
-			continue
-		}
-
-		if pendingOnChain != nil {
-			if _, isPending := pendingOnChain[req.leaseUUID]; !isPending {
-				slog.Debug("lease not pending during individual ack, skipping",
-					"lease_uuid", req.leaseUUID, "lane", laneIdx,
-				)
-				result := ackResult{acknowledged: true, txHash: ""}
-				select {
-				case req.resultCh <- result:
-				default:
-				}
-				for _, ch := range dupChans[req.leaseUUID] {
-					select {
-					case ch <- result:
-					default:
-					}
-				}
-				continue
-			}
-		}
-
-		acknowledged, txHashes, ackErr := l.chainClient.AcknowledgeLeases(ctx, []string{req.leaseUUID})
-
-		var txHash string
-		if len(txHashes) > 0 {
-			txHash = txHashes[0]
-		}
-
-		result := ackResult{
-			acknowledged: ackErr == nil && acknowledged > 0,
-			txHash:       txHash,
-			err:          ackErr,
-		}
+		result := l.acknowledgeCurrent(ctx, req.leaseUUID)
 
 		select {
 		case req.resultCh <- result:
@@ -630,13 +594,13 @@ func (l *ackLane) acknowledgeIndividually(ctx context.Context, requests []ackReq
 			}
 		}
 
-		if ackErr != nil {
+		if result.err != nil {
 			slog.Error("individual acknowledgment failed",
-				"lease_uuid", req.leaseUUID, "lane", laneIdx, "error", ackErr,
+				"lease_uuid", req.leaseUUID, "lane", laneIdx, "error", result.err,
 			)
 		} else {
 			slog.Debug("individual acknowledgment succeeded",
-				"lease_uuid", req.leaseUUID, "lane", laneIdx, "tx_hash", txHash,
+				"lease_uuid", req.leaseUUID, "lane", laneIdx, "tx_hash", result.txHash,
 			)
 		}
 	}
