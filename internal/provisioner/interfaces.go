@@ -2,15 +2,15 @@ package provisioner
 
 import (
 	"context"
-	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
-// BackendRouter defines the interface for routing requests to backends.
-// This abstracts the backend.Router for testability.
-type BackendRouter interface {
+// backendRouter is the trusted composition port used while constructing the
+// purpose-specific placement facets. It is deliberately private because its
+// methods return broad mutation-capable backend clients.
+type backendRouter interface {
 	// Route returns the appropriate backend for the given SKU.
 	Route(sku string) backend.Backend
 
@@ -20,32 +20,33 @@ type BackendRouter interface {
 	// used to spread concurrent provisions; it may be nil.
 	RouteForProvision(ctx context.Context, sku string, inFlightByBackend map[string]int) backend.Backend
 
+	// RouteForProvisionAmong applies the same provision routing policy while
+	// treating eligibleNames as a hard boundary. It returns nil when neither an
+	// eligible SKU match nor the eligible default backend exists.
+	RouteForProvisionAmong(ctx context.Context, sku string, eligibleNames map[string]struct{}, inFlightByBackend map[string]int) backend.Backend
+
 	// GetBackendByName returns a backend by its name. Returns nil if not found.
 	GetBackendByName(name string) backend.Backend
+
+	// HasBackend reports topology membership without exposing a backend client.
+	HasBackend(name string) bool
 
 	// Backends returns all unique backends for operations like reconciliation.
 	Backends() []backend.Backend
 }
 
-// Compile-time check that backend.Router implements BackendRouter.
-var _ BackendRouter = (*backend.Router)(nil)
+// Compile-time check that backend.Router implements backendRouter.
+var _ backendRouter = (*backend.Router)(nil)
 
-// PlacementStore records which backend is serving each lease so that
-// read operations reach the correct backend after provision routing.
-type PlacementStore interface {
-	Get(leaseUUID string) string
-	SetAt(leaseUUID string) (time.Time, bool)
-	Set(leaseUUID, backendName string) error
-	Delete(leaseUUID string)
-	SetBatch(placements map[string]string) error
-	Count() int
-	List() []string
-	Healthy() error
-	Close() error
+// PlacementView is the read-only placement projection shared by routing and
+// lifecycle consumers. Holding a view never authorizes a placement mutation.
+type PlacementView interface {
+	Lookup(leaseUUID string) placement.Placement
+	List() map[string]placement.Placement
 }
 
-// Compile-time check that placement.Store implements PlacementStore.
-var _ PlacementStore = (*placement.Store)(nil)
+// Compile-time check for the concrete durable store.
+var _ PlacementView = (*placement.Store)(nil)
 
 // LeaseRejecter defines the interface for rejecting leases on chain.
 // This is used by the TimeoutChecker to reject timed-out leases.

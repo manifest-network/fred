@@ -166,3 +166,49 @@ func TestDemoteOnGrantSetupError(t *testing.T) {
 		})
 	}
 }
+
+func TestInitialProviderWork_SignalCancellationStopsSequence(t *testing.T) {
+	signalCtx, signalCancel := context.WithCancel(t.Context())
+	defer signalCancel()
+	entered := make(chan struct{})
+	done := make(chan error, 1)
+	reconciled := false
+	go func() {
+		done <- runInitialProviderWork(signalCtx, func(ctx context.Context) error {
+			close(entered)
+			<-ctx.Done()
+			return ctx.Err()
+		}, func(context.Context) error { reconciled = true; return nil })
+	}()
+	<-entered
+	signalCancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("startup did not observe signal cancellation")
+	}
+	require.False(t, reconciled, "canceled startup must not issue a later reconciliation")
+}
+
+func TestInitialProviderWork_CanceledBeforeStartIssuesNoOperations(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	calls := 0
+	operation := func(context.Context) error { calls++; return nil }
+	require.ErrorIs(t, runInitialProviderWork(ctx, operation, operation), context.Canceled)
+	require.Zero(t, calls)
+}
+
+func TestInitialProviderWork_TransientFailureStillReconciles(t *testing.T) {
+	var calls []string
+	err := runInitialProviderWork(t.Context(), func(context.Context) error {
+		calls = append(calls, "withdraw")
+		return errors.New("chain temporarily unavailable")
+	}, func(context.Context) error {
+		calls = append(calls, "reconcile")
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"withdraw", "reconcile"}, calls)
+}

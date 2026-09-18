@@ -16,42 +16,60 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"gopkg.in/yaml.v3"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/docker"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/configyaml"
 	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/tlsconfig"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 var version = "dev"
 
+// Offline storage-identity and Docker-effects commands inspect durable storage
+// and may attest every managed volume. Keep the default finite for a real fleet;
+// operators with unusually large or slow substrates can override it on the
+// one-shot command line.
+const defaultStorageIdentityOperationTimeout = 10 * time.Minute
+
 func main() {
-	configPath, showVersion, err := parseFlags(os.Args[1:], os.Stdout)
+	startup, err := parseStartupFlags(os.Args[1:], os.Stdout)
 	if errors.Is(err, flag.ErrHelp) {
 		// -h/-help: usage already written to stderr; this is a clean exit.
 		os.Exit(0)
 	}
 	if err != nil {
-		// flag.ContinueOnError already wrote the error and usage to stderr.
+		// FlagSet prints syntax failures; validation of conflicting modes or
+		// missing repair arguments must also be visible before exiting.
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	if showVersion {
+	if startup.showVersion {
 		os.Exit(0)
 	}
+	configPath := startup.configPath
 
 	// Bootstrap logger for startup messages (before config is loaded).
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+	logOutput := io.Writer(os.Stdout)
+	if startup.preflightStorageIdentityAdoption || startup.dockerEffects.mode != dockerEffectsNone {
+		// Keep one-shot reports on stdout machine-readable. Diagnostics,
+		// including configuration and proof failures, remain visible on stderr.
+		logOutput = os.Stderr
+	}
+	logger := slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
@@ -72,7 +90,7 @@ func main() {
 		logger.Error("invalid log_level in config", "error", err)
 		os.Exit(1)
 	}
-	logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+	logger = slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{
 		Level: logLevel,
 	}))
 	slog.SetDefault(logger)
@@ -82,15 +100,60 @@ func main() {
 	for uuid, profile := range cfg.SKUMapping {
 		logger.Info("SKU mapping", "uuid", uuid, "profile", profile)
 	}
+	if startup.dockerEffects.mode != dockerEffectsNone {
+		operationCtx, operationCancel := context.WithTimeout(context.Background(), startup.storageIdentityOperationTimeout)
+		operationErr := startup.dockerEffects.run(operationCtx, cfg, logger, os.Stdout)
+		operationCancel()
+		if operationErr != nil {
+			logger.Error("offline Docker-effects operation failed", "error", operationErr)
+			os.Exit(1)
+		}
+		return
+	}
+	if startup.preflightStorageIdentityAdoption {
+		preflightCtx, preflightCancel := context.WithTimeout(
+			context.Background(), startup.storageIdentityOperationTimeout,
+		)
+		verdict, preflightErr := docker.PreflightStorageIdentityAdoptionForConfig(
+			preflightCtx, cfg, logger,
+		)
+		preflightCancel()
+		if preflightErr != nil {
+			logger.Error("backend storage identity adoption preflight failed", "error", preflightErr)
+			os.Exit(1)
+		}
+		if verdictErr := writeStorageIdentityAdoptionVerdict(os.Stdout, verdict); verdictErr != nil {
+			logger.Error("write backend storage identity adoption verdict", "error", verdictErr)
+			os.Exit(1)
+		}
+		return
+	}
+	if startup.initializeStorageIdentity != "" {
+		identityCtx, identityCancel := context.WithTimeout(
+			context.Background(), startup.storageIdentityOperationTimeout,
+		)
+		identity, initializeErr := docker.InitializeStorageIdentityForConfig(
+			identityCtx, cfg, logger,
+			docker.StorageIdentityInitializationMode(startup.initializeStorageIdentity),
+		)
+		identityCancel()
+		if initializeErr != nil {
+			logger.Error("failed to initialize backend storage identity", "error", initializeErr)
+			os.Exit(1)
+		}
+		logger.Info("backend storage identity initialized", "storage_identity", identity)
+		return
+	}
 
-	// Create backend
+	// Attest the physical substrate before any durable backend store is opened
+	// or any cleanup goroutine can start.
 	b, err := docker.New(cfg, logger)
 	if err != nil {
 		logger.Error("failed to create backend", "error", err)
 		os.Exit(1)
 	}
 
-	// Start backend
+	// Start backend only after the marker and Docker substrate match.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	if err := b.Start(ctx); err != nil {
 		cancel()
@@ -100,7 +163,13 @@ func main() {
 	cancel()
 
 	// Create server
-	server := NewServer(b, string(cfg.CallbackSecret), logger, cfg.MaxRequestBodySize)
+	server, err := NewIdentityBoundServer(
+		b, string(cfg.CallbackSecret), logger, cfg.MaxRequestBodySize, b.StorageIdentity(),
+	)
+	if err != nil {
+		logger.Error("failed to create identity-bound server", "error", err)
+		os.Exit(1)
+	}
 
 	// Build the listener TLS config up front so a bad cert fails fast before we
 	// announce readiness. Config.Validate (run in docker.New) already enforces
@@ -143,20 +212,28 @@ func main() {
 		}
 	}()
 
-	// Wait for shutdown signal or server error
+	// Wait for an operator signal, listener failure, or a terminal storage
+	// authority withdrawal. The last case must return a non-zero process status:
+	// its typed on-disk recovery evidence is consumed only by a fresh Start.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	// startupErr captures a ListenAndServe failure (port in use, bind refused,
 	// etc.) so the process can exit non-zero after the graceful-shutdown path
 	// runs. Without this, supervisors / k8s liveness probes / CI would see the
 	// "binary that never bound" as a successful run.
-	var startupErr error
-	select {
-	case <-sigCh:
+	trigger := waitForShutdownTrigger(sigCh, serverErr, b.TerminalStorageAuthorityFailure())
+	var (
+		startupErr          = trigger.serverErr
+		storageAuthorityErr = trigger.storageAuthorityErr
+	)
+	switch {
+	case trigger.signaled:
 		logger.Info("shutting down...")
-	case err := <-serverErr:
-		logger.Error("HTTP server error, shutting down", "error", err)
-		startupErr = err
+	case startupErr != nil:
+		logger.Error("HTTP server error, shutting down", "error", startupErr)
+	case storageAuthorityErr != nil:
+		logger.Error("terminal backend storage authority failure; shutting down for recovery",
+			"error", storageAuthorityErr)
 	}
 
 	// Graceful shutdown
@@ -167,19 +244,96 @@ func main() {
 		logger.Error("HTTP shutdown error", "error", err)
 	}
 
+	var backendShutdownErr error
 	if err := b.Stop(); err != nil {
+		backendShutdownErr = err
 		logger.Error("backend shutdown error", "error", err)
+	}
+	// If an operator/listener event won the initial select concurrently with a
+	// storage latch, observe the buffered first cause after all backend workers
+	// have drained. A successful Stop proves no later worker can publish one.
+	storageAuthorityErr = takePendingStorageAuthorityFailure(
+		storageAuthorityErr,
+		b.TerminalStorageAuthorityFailure(),
+	)
+
+	// A backend drain timeout deliberately leaves stores and the Docker client
+	// open because a canceled worker may still be using them. Returning from
+	// main is the forced-exit boundary that kills such a worker; report it as a
+	// failure so the supervisor restarts and recovery re-attests substrate state.
+	if exitCode := shutdownExitCode(startupErr, backendShutdownErr, storageAuthorityErr); exitCode != 0 {
+		logger.Error("backend terminated with a failure; forcing non-zero process exit",
+			"startup_error", startupErr,
+			"backend_error", backendShutdownErr,
+			"storage_authority_error", storageAuthorityErr,
+		)
+		os.Exit(exitCode)
 	}
 
 	logger.Info("shutdown complete")
+}
 
-	// Propagate ListenAndServe failure as a non-zero exit. The graceful-
-	// shutdown path above still runs (so the bbolt stores close cleanly) but
-	// we MUST NOT report success when the binary never accepted a single
-	// request — k8s liveness, systemd, and CI all key off exit code.
-	if startupErr != nil {
-		os.Exit(1)
+type shutdownTrigger struct {
+	signaled            bool
+	serverErr           error
+	storageAuthorityErr error
+}
+
+func waitForShutdownTrigger(
+	signals <-chan os.Signal,
+	serverFailures <-chan error,
+	storageAuthorityFailures <-chan error,
+) shutdownTrigger {
+	select {
+	case <-signals:
+		return shutdownTrigger{signaled: true}
+	case err := <-serverFailures:
+		return shutdownTrigger{serverErr: err}
+	case err := <-storageAuthorityFailures:
+		return shutdownTrigger{storageAuthorityErr: err}
 	}
+}
+
+func takePendingStorageAuthorityFailure(current error, failures <-chan error) error {
+	if current != nil {
+		return current
+	}
+	select {
+	case err, ok := <-failures:
+		if ok {
+			return err
+		}
+	default:
+	}
+	return nil
+}
+
+func shutdownExitCode(startupErr, backendShutdownErr, storageAuthorityErr error) int {
+	if startupErr != nil || backendShutdownErr != nil || storageAuthorityErr != nil {
+		return 1
+	}
+	return 0
+}
+
+func writeStorageIdentityAdoptionVerdict(
+	out io.Writer,
+	verdict docker.StorageIdentityAdoptionVerdict,
+) error {
+	if out == nil {
+		return errors.New("storage identity adoption verdict output is required")
+	}
+	if verdict != docker.StorageIdentityAdoptionReady {
+		return fmt.Errorf("invalid storage identity adoption verdict %q", verdict)
+	}
+	line := string(verdict) + "\n"
+	written, err := io.WriteString(out, line)
+	if err != nil {
+		return fmt.Errorf("write storage identity adoption verdict: %w", err)
+	}
+	if written != len(line) {
+		return fmt.Errorf("write storage identity adoption verdict: %w", io.ErrShortWrite)
+	}
+	return nil
 }
 
 // parseFlags parses docker-backend's command-line arguments using a private
@@ -191,18 +345,83 @@ func main() {
 //
 // Usage and parse errors go to the FlagSet's default output (stderr); -h/-help
 // surfaces as flag.ErrHelp so the caller can exit 0.
-func parseFlags(args []string, out io.Writer) (configPath string, showVersion bool, err error) {
+type startupFlags struct {
+	configPath                       string
+	showVersion                      bool
+	initializeStorageIdentity        string
+	preflightStorageIdentityAdoption bool
+	storageIdentityOperationTimeout  time.Duration
+	dockerEffects                    dockerEffectsCommand
+}
+
+func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	fs := flag.NewFlagSet("docker-backend", flag.ContinueOnError)
 	cfgPath := fs.String("config", "docker-backend.yaml", "Path to configuration file")
 	showVer := fs.Bool("version", false, "print version information and exit")
+	initializeIdentity := fs.String(
+		"initialize-storage-identity", "",
+		"one-shot: seal lineage and exit; value must be new or adopt",
+	)
+	preflightAdoption := fs.Bool(
+		"preflight-storage-identity-adoption", false,
+		"one-shot read-only: verify a stopped v0.13 lineage is adoptable and exit",
+	)
+	identityOperationTimeout := fs.Duration(
+		"storage-identity-operation-timeout", defaultStorageIdentityOperationTimeout,
+		"cooperative deadline for one-shot storage-identity or Docker-effects operations",
+	)
+	inspectEffects := fs.Bool("inspect-unsettled-docker-effects", false,
+		"one-shot read-only: inspect unresolved Docker effects and print the exact repair acknowledgement")
+	repairEffects := fs.Bool("repair-unsettled-docker-effects", false,
+		"one-shot: repair unresolved Docker effects after external fencing; requires acknowledgement and backup")
+	effectsAcknowledgement := fs.String("docker-effects-acknowledgement", "", "exact acknowledgement from inspection; only valid with repair")
+	effectsBackup := fs.String("docker-effects-backup", "", "new backup path required for Docker-effects repair; only valid with repair")
 	if err := fs.Parse(args); err != nil {
-		return "", false, err
+		return startupFlags{}, err
+	}
+	if *identityOperationTimeout <= 0 {
+		return startupFlags{}, errors.New("-storage-identity-operation-timeout must be positive")
+	}
+	oneShotModes := 0
+	for _, requested := range []bool{*preflightAdoption, *initializeIdentity != "", *inspectEffects, *repairEffects} {
+		if requested {
+			oneShotModes++
+		}
+	}
+	if oneShotModes > 1 {
+		return startupFlags{}, errors.New(
+			"storage-identity preflight, initialization, Docker-effects inspection and repair are mutually exclusive",
+		)
+	}
+	repairArgumentsSupplied := false
+	fs.Visit(func(option *flag.Flag) {
+		if option.Name == "docker-effects-acknowledgement" || option.Name == "docker-effects-backup" {
+			repairArgumentsSupplied = true
+		}
+	})
+	effects, err := parseDockerEffectsCommand(*inspectEffects, *repairEffects, *effectsAcknowledgement, *effectsBackup, repairArgumentsSupplied)
+	if err != nil {
+		return startupFlags{}, err
 	}
 	if *showVer {
 		fmt.Fprintf(out, "docker-backend version %s\n", version)
-		return "", true, nil
 	}
-	return *cfgPath, false, nil
+	return startupFlags{
+		configPath:                       *cfgPath,
+		showVersion:                      *showVer,
+		initializeStorageIdentity:        *initializeIdentity,
+		preflightStorageIdentityAdoption: *preflightAdoption,
+		storageIdentityOperationTimeout:  *identityOperationTimeout,
+		dockerEffects:                    effects,
+	}, nil
+}
+
+// parseFlags retains the small version/config parsing seam used by existing
+// tests and tooling. Startup uses parseStartupFlags so the one-shot identity
+// initializer cannot be mistaken for a normal server mode.
+func parseFlags(args []string, out io.Writer) (configPath string, showVersion bool, err error) {
+	startup, err := parseStartupFlags(args, out)
+	return startup.configPath, startup.showVersion, err
 }
 
 func loadConfig(path string) (docker.Config, error) {
@@ -216,7 +435,7 @@ func loadConfig(path string) (docker.Config, error) {
 		return cfg, fmt.Errorf("failed to read config: %w", err)
 	}
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := configyaml.Decode(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("failed to parse config: %w", err)
 	}
 
@@ -271,6 +490,43 @@ type Server struct {
 	callbackSecret     string
 	logger             *slog.Logger
 	maxRequestBodySize int64
+	storageIdentity    backendidentity.ID
+	identityVerifier   interface{ VerifyStorageIdentity(context.Context) error }
+}
+
+// NewIdentityBoundServer creates the production server that exposes and
+// validates one immutable physical-storage identity.
+func NewIdentityBoundServer(
+	b backendService,
+	callbackSecret string,
+	logger *slog.Logger,
+	maxRequestBodySize int64,
+	storageID backendidentity.ID,
+) (*Server, error) {
+	if util.IsNilInterface(b) {
+		return nil, errors.New("backend is required")
+	}
+	if !storageID.Valid() {
+		return nil, backendidentity.ErrInvalidID
+	}
+	verifier, ok := b.(interface{ VerifyStorageIdentity(context.Context) error })
+	if !ok {
+		return nil, errors.New("backend does not support runtime storage identity verification")
+	}
+	server := NewServer(b, callbackSecret, logger, maxRequestBodySize)
+	server.storageIdentity = storageID
+	server.identityVerifier = verifier
+	return server, nil
+}
+
+func validateMutatingLeaseUUID(field, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	if !backend.IsCanonicalLeaseUUID(value) {
+		return fmt.Errorf("%s must be a canonical non-nil UUID", field)
+	}
+	return nil
 }
 
 // NewServer creates a new HTTP server for the Docker backend. maxRequestBodySize
@@ -293,25 +549,76 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	authMw := hmacAuthMiddleware(s.callbackSecret, s.logger, s.maxRequestBodySize)
-	mux.Handle("POST /provision", authMw(http.HandlerFunc(s.handleProvision)))
-	mux.Handle("POST /deprovision", authMw(http.HandlerFunc(s.handleDeprovision)))
-	mux.Handle("GET /info/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetInfo)))
-	mux.Handle("GET /logs/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetLogs)))
-	mux.Handle("GET /provisions/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetProvision)))
-	mux.Handle("GET /provisions", authMw(http.HandlerFunc(s.handleListProvisions)))
-	mux.Handle("POST /restart", authMw(http.HandlerFunc(s.handleRestart)))
-	mux.Handle("POST /update", authMw(http.HandlerFunc(s.handleUpdate)))
-	mux.Handle("POST /restore", authMw(http.HandlerFunc(s.handleRestore)))
-	mux.Handle("GET /retentions", authMw(http.HandlerFunc(s.handleListRetentions)))
-	mux.Handle("POST /reconcile_custom_domain", authMw(http.HandlerFunc(s.handleReconcileCustomDomain)))
-	mux.Handle("GET /releases/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetReleases)))
+	protected := func(handler http.Handler) http.Handler {
+		if !s.storageIdentity.Valid() {
+			return authMw(handler)
+		}
+		return authMw(s.verifyStorageIdentity(handler))
+	}
+	mux.Handle("POST /provision", protected(http.HandlerFunc(s.handleProvision)))
+	mux.Handle("POST /deprovision", protected(http.HandlerFunc(s.handleDeprovision)))
+	mux.Handle("GET /info/{lease_uuid}", protected(http.HandlerFunc(s.handleGetInfo)))
+	mux.Handle("GET /logs/{lease_uuid}", protected(backend.NewLogsHandler(http.HandlerFunc(s.handleGetLogs), 30*time.Second, 30*time.Second)))
+	mux.Handle("GET /provisions/{lease_uuid}", protected(http.HandlerFunc(s.handleGetProvision)))
+	mux.Handle("GET /provisions", protected(http.HandlerFunc(s.handleListProvisions)))
+	mux.Handle("POST /restart", protected(http.HandlerFunc(s.handleRestart)))
+	mux.Handle("POST /update", protected(http.HandlerFunc(s.handleUpdate)))
+	mux.Handle("POST /restore", protected(http.HandlerFunc(s.handleRestore)))
+	mux.Handle("GET /retentions", protected(http.HandlerFunc(s.handleListRetentions)))
+	mux.Handle("POST /reconcile_custom_domain", protected(http.HandlerFunc(s.handleReconcileCustomDomain)))
+	mux.Handle("GET /releases/{lease_uuid}", protected(http.HandlerFunc(s.handleGetReleases)))
 
 	// Operational endpoints — no auth required (monitoring, health checks).
-	mux.HandleFunc("GET /health", s.handleHealth)
-	mux.HandleFunc("GET /stats", s.handleStats)
+	if s.storageIdentity.Valid() {
+		mux.Handle("GET /health", s.verifyStorageIdentity(http.HandlerFunc(s.handleHealth)))
+		mux.Handle("GET /stats", s.verifyStorageIdentity(http.HandlerFunc(s.handleStats)))
+	} else {
+		mux.HandleFunc("GET /health", s.handleHealth)
+		mux.HandleFunc("GET /stats", s.handleStats)
+	}
 	mux.Handle("GET /metrics", promhttp.Handler())
 
+	if s.storageIdentity.Valid() {
+		bind := func(handler http.Handler) http.Handler {
+			bound, err := backendidentity.RequireBoundPath(s.storageIdentity, protected(handler))
+			if err != nil {
+				return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					http.Error(w, "backend storage identity unavailable", http.StatusServiceUnavailable)
+				})
+			}
+			return bound
+		}
+		prefix := backendidentity.BoundPathPrefix + "{storage_id}"
+		mux.Handle("POST "+prefix+"/provision", bind(http.HandlerFunc(s.handleProvision)))
+		mux.Handle("POST "+prefix+"/deprovision", bind(http.HandlerFunc(s.handleDeprovision)))
+		mux.Handle("POST "+prefix+"/restart", bind(http.HandlerFunc(s.handleRestart)))
+		mux.Handle("POST "+prefix+"/update", bind(http.HandlerFunc(s.handleUpdate)))
+		mux.Handle("POST "+prefix+"/restore", bind(http.HandlerFunc(s.handleRestore)))
+		mux.Handle("POST "+prefix+"/reconcile_custom_domain", bind(http.HandlerFunc(s.handleReconcileCustomDomain)))
+		identityHandler, err := backendidentity.ResponseMiddleware(s.storageIdentity, mux)
+		if err == nil {
+			return identityHandler
+		}
+	}
+
 	return mux
+}
+
+func (s *Server) verifyStorageIdentity(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.identityVerifier == nil {
+			w.Header().Del(backendidentity.ResponseHeader)
+			http.Error(w, "backend storage identity verifier unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if err := s.identityVerifier.VerifyStorageIdentity(r.Context()); err != nil {
+			s.logger.Error("backend storage identity verification failed", "error", err)
+			w.Header().Del(backendidentity.ResponseHeader)
+			http.Error(w, "backend storage identity verification failed", http.StatusServiceUnavailable)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
@@ -321,8 +628,8 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.LeaseUUID == "" {
-		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+	if err := validateMutatingLeaseUUID("lease_uuid", req.LeaseUUID); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if req.CallbackURL == "" {
@@ -333,6 +640,12 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid callback_url: %s", err))
 		return
 	}
+	if req.LifecycleCallbackURL != "" {
+		if err := validateCallbackURL(req.LifecycleCallbackURL); err != nil {
+			s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid lifecycle_callback_url: %s", err))
+			return
+		}
+	}
 	if len(req.Items) == 0 {
 		s.errorResponse(w, http.StatusBadRequest, "items is required")
 		return
@@ -340,6 +653,11 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	err := s.backend.Provision(r.Context(), req)
 	if err != nil {
+		if shared.IsOperationCompletionPending(err) {
+			s.errorResponseWithCode(w, http.StatusConflict,
+				"an earlier operation completion is pending", backend.CodeOperationCompletionPending)
+			return
+		}
 		if errors.Is(err, backend.ErrAlreadyProvisioned) {
 			s.errorResponse(w, http.StatusConflict, "lease already provisioned")
 			return
@@ -349,7 +667,9 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, backend.ErrInsufficientResources) {
-			s.errorResponse(w, http.StatusServiceUnavailable, err.Error())
+			s.errorResponseWithCode(
+				w, http.StatusServiceUnavailable, err.Error(), backend.CodeInsufficientResources,
+			)
 			return
 		}
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())
@@ -412,7 +732,15 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, logs)
+	response, err := backend.NewLogResponse(logs)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "invalid log response")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := response.WriteJSON(w); err != nil {
+		s.logger.Warn("log response write failed", "error", err)
+	}
 }
 
 // DeprovisionRequest is the request body for /deprovision.
@@ -427,11 +755,10 @@ func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.LeaseUUID == "" {
-		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+	if err := validateMutatingLeaseUUID("lease_uuid", req.LeaseUUID); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	if err := s.backend.Deprovision(r.Context(), req.LeaseUUID); err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -447,8 +774,12 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.LeaseUUID == "" {
-		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+	if err := validateMutatingLeaseUUID("lease_uuid", req.LeaseUUID); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !req.MaintenanceID.Valid() {
+		s.errorResponse(w, http.StatusBadRequest, "maintenance_id must be a canonical UUIDv4")
 		return
 	}
 	if req.CallbackURL == "" {
@@ -459,7 +790,6 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid callback_url: %s", err))
 		return
 	}
-
 	err := s.backend.Restart(r.Context(), req)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotProvisioned) {
@@ -468,6 +798,16 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, backend.ErrInvalidState) {
 			s.errorResponse(w, http.StatusConflict, "invalid state for restart")
+			return
+		}
+		if errors.Is(err, backend.ErrValidation) {
+			s.validationErrorResponse(w, err)
+			return
+		}
+		if errors.Is(err, backend.ErrInsufficientResources) {
+			s.errorResponseWithCode(
+				w, http.StatusServiceUnavailable, err.Error(), backend.CodeInsufficientResources,
+			)
 			return
 		}
 		s.logger.Error("restart failed", "lease_uuid", req.LeaseUUID, "error", err)
@@ -485,12 +825,12 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.LeaseUUID == "" {
-		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+	if err := validateMutatingLeaseUUID("lease_uuid", req.LeaseUUID); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.FromLeaseUUID == "" {
-		s.errorResponse(w, http.StatusBadRequest, "from_lease_uuid is required")
+	if err := validateMutatingLeaseUUID("from_lease_uuid", req.FromLeaseUUID); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if req.CallbackURL == "" {
@@ -501,9 +841,20 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid callback_url: %s", err))
 		return
 	}
+	if req.LifecycleCallbackURL != "" {
+		if err := validateCallbackURL(req.LifecycleCallbackURL); err != nil {
+			s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid lifecycle_callback_url: %s", err))
+			return
+		}
+	}
 
 	err := s.backend.Restore(r.Context(), req)
 	if err != nil {
+		if shared.IsOperationCompletionPending(err) {
+			s.errorResponseWithCode(w, http.StatusConflict,
+				"an earlier operation completion is pending", backend.CodeOperationCompletionPending)
+			return
+		}
 		if errors.Is(err, backend.ErrNotRetained) {
 			s.errorResponse(w, http.StatusUnprocessableEntity, "no retained data for lease")
 			return
@@ -531,8 +882,12 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, backend.ErrInsufficientResources) {
 			// 503 Service Unavailable, matching handleProvision: the backend is at
-			// capacity, not a permanent client error.
-			s.errorResponse(w, http.StatusServiceUnavailable, "insufficient resources for restore")
+			// capacity, not a permanent client error. The code proves that this
+			// backend refused before starting asynchronous restore work.
+			s.errorResponseWithCode(
+				w, http.StatusServiceUnavailable, "insufficient resources for restore",
+				backend.CodeInsufficientResources,
+			)
 			return
 		}
 		s.logger.Error("restore failed", "lease_uuid", req.LeaseUUID, "from_lease_uuid", req.FromLeaseUUID, "error", err)
@@ -571,8 +926,8 @@ func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Requ
 		s.errorResponse(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.LeaseUUID == "" {
-		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+	if err := validateMutatingLeaseUUID("lease_uuid", req.LeaseUUID); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -607,8 +962,12 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.LeaseUUID == "" {
-		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+	if err := validateMutatingLeaseUUID("lease_uuid", req.LeaseUUID); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !req.MaintenanceID.Valid() {
+		s.errorResponse(w, http.StatusBadRequest, "maintenance_id must be a canonical UUIDv4")
 		return
 	}
 	if req.CallbackURL == "" {
@@ -636,6 +995,12 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, backend.ErrValidation) {
 			s.validationErrorResponse(w, err)
+			return
+		}
+		if errors.Is(err, backend.ErrInsufficientResources) {
+			s.errorResponseWithCode(
+				w, http.StatusServiceUnavailable, err.Error(), backend.CodeInsufficientResources,
+			)
 			return
 		}
 		s.logger.Error("update failed", "lease_uuid", req.LeaseUUID, "error", err)
@@ -772,18 +1137,23 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := s.backend.Stats()
+	load, err := stats.RoutingLoadStats()
+	if err != nil {
+		s.errorResponse(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 
 	s.writeJSON(w, http.StatusOK, StatsResponse{
-		TotalCPUCores:     stats.TotalCPU,
+		TotalCPUCores:     load.TotalCPUCores,
 		TotalMemoryMB:     stats.TotalMemoryMB,
 		TotalDiskMB:       stats.TotalDiskMB,
-		AllocatedCPUCores: stats.AllocatedCPU,
+		AllocatedCPUCores: load.AllocatedCPUCores,
 		AllocatedMemoryMB: stats.AllocatedMemoryMB,
 		AllocatedDiskMB:   stats.AllocatedDiskMB,
 		AvailableCPUCores: stats.AvailableCPU(),
 		AvailableMemoryMB: stats.AvailableMemoryMB(),
 		AvailableDiskMB:   stats.AvailableDiskMB(),
-		ActiveContainers:  stats.AllocationCount,
+		ActiveContainers:  load.ActiveContainers,
 	})
 }
 
@@ -857,21 +1227,19 @@ const maxTailLines = 10000 // Upper bound for log tail requests
 // callback_base_url configuration. We allow localhost and private IPs here
 // since backends commonly run on private networks alongside Fred.
 func validateCallbackURL(rawURL string) error {
-	parsed, err := url.Parse(rawURL)
+	endpoint, err := callbackurl.ParseEndpoint(rawURL)
 	if err != nil {
-		return fmt.Errorf("malformed URL")
+		return fmt.Errorf("invalid callback endpoint: %w", err)
 	}
 
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("scheme must be http or https")
+	// Normalize a trailing FQDN dot and an RFC 6874 IPv6 zone suffix before
+	// classifying literal addresses. Go's dialer accepts both, while net.ParseIP
+	// does not; failing to normalize would bypass the link-local guard.
+	hostname := endpoint.Hostname()
+	hostname = strings.TrimSuffix(hostname, ".")
+	if index := strings.IndexByte(hostname, '%'); index >= 0 {
+		hostname = hostname[:index]
 	}
-
-	if parsed.Host == "" {
-		return fmt.Errorf("host is required")
-	}
-
-	// Extract hostname (without port)
-	hostname := parsed.Hostname()
 
 	// Check if hostname is an IP address
 	ip := net.ParseIP(hostname)
@@ -880,6 +1248,9 @@ func validateCallbackURL(rawURL string) error {
 		// include cloud metadata endpoints like 169.254.169.254.
 		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 			return fmt.Errorf("link-local addresses are not allowed")
+		}
+		if ip.IsUnspecified() {
+			return fmt.Errorf("unspecified addresses are not allowed")
 		}
 	}
 

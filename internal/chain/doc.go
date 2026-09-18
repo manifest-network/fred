@@ -12,6 +12,14 @@
 //   - Ping for health checks
 //
 // All query operations support context cancellation and include Prometheus metrics.
+// Each chain write has one TxTimeout budget spanning signer acquisition, account
+// lookup, simulation, broadcast, retries, and inclusion. Batched writes share that
+// budget across sub-batches and retain partial committed results on failure.
+// Withdrawal cursor lookup uses the same write budget.
+//
+// The signer pool owns cancellable account-sequence permits. Every primary and
+// sub-signer transaction holds its signer through inclusion; primary grant and
+// funding writes share that ownership with single-signer fallback batches.
 //
 // # EventSubscriber
 //

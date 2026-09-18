@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -51,6 +52,108 @@ func newTestStore(t *testing.T) *Store {
 	require.NoError(t, err, "NewStore() error")
 	t.Cleanup(func() { store.Close() })
 	return store
+}
+
+func TestNewStoreCreatesPrivateSingleLinkDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "payloads.db")
+	store, err := NewStore(StoreConfig{DBPath: path})
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	info, err := os.Lstat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode())
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	require.True(t, ok)
+	assert.Equal(t, uint64(1), stat.Nlink)
+}
+
+func TestNewStoreRejectsInsecureExistingDatabase(t *testing.T) {
+	tests := map[string]struct {
+		mutate func(*testing.T, string)
+		want   string
+	}{
+		"group-readable": {
+			mutate: func(t *testing.T, path string) { require.NoError(t, os.Chmod(path, 0o640)) },
+			want:   "exact mode 0600",
+		},
+		"world-readable": {
+			mutate: func(t *testing.T, path string) { require.NoError(t, os.Chmod(path, 0o644)) },
+			want:   "exact mode 0600",
+		},
+		"hard-linked": {
+			mutate: func(t *testing.T, path string) {
+				require.NoError(t, os.Link(path, filepath.Join(filepath.Dir(path), "payload-alias.db")))
+			},
+			want: "exactly one hard link",
+		},
+		"symlink": {
+			mutate: func(t *testing.T, path string) {
+				target := filepath.Join(filepath.Dir(path), "payload-target.db")
+				require.NoError(t, os.Rename(path, target))
+				require.NoError(t, os.Symlink(filepath.Base(target), path))
+			},
+			want: "not a regular file",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "payloads.db")
+			store, err := NewStore(StoreConfig{DBPath: path})
+			require.NoError(t, err)
+			require.NoError(t, store.Close())
+			test.mutate(t, path)
+
+			reopened, err := NewStore(StoreConfig{DBPath: path})
+			if reopened != nil {
+				_ = reopened.Close()
+			}
+			require.Error(t, err)
+			assert.ErrorContains(t, err, test.want)
+		})
+	}
+}
+
+func TestStoreRuntimeAuthorityRejectsPermissionLinkAndSymlinkDrift(t *testing.T) {
+	tests := map[string]func(*testing.T, string){
+		"mode": func(t *testing.T, path string) {
+			require.NoError(t, os.Chmod(path, 0o644))
+		},
+		"hard-link": func(t *testing.T, path string) {
+			require.NoError(t, os.Link(path, filepath.Join(filepath.Dir(path), "payload-alias.db")))
+		},
+		"symlink": func(t *testing.T, path string) {
+			target := filepath.Join(filepath.Dir(path), "payload-target.db")
+			require.NoError(t, os.Rename(path, target))
+			require.NoError(t, os.Symlink(filepath.Base(target), path))
+		},
+	}
+
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "payloads.db")
+			store, err := NewStore(StoreConfig{DBPath: path})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = store.Close() })
+			require.True(t, store.Store(testutil.ValidUUID1, []byte("tenant manifest")))
+
+			mutate(t, path)
+			healthErr := store.Healthy()
+			require.ErrorIs(t, healthErr, ErrStoreAuthorityUnavailable)
+			require.ErrorIs(t, healthErr, ErrStoreAuthorityPathChanged)
+			_, readErr := store.Get(testutil.ValidUUID1)
+			require.ErrorIs(t, readErr, ErrStoreAuthorityUnavailable)
+			writeErr := store.Put(testutil.ValidUUID2, []byte("must not persist"))
+			require.ErrorIs(t, writeErr, ErrStoreAuthorityUnavailable)
+			require.NoError(t, store.db.View(func(tx *bolt.Tx) error {
+				assert.Nil(t, tx.Bucket(payloadBucketName).Get([]byte(testutil.ValidUUID2)))
+				return nil
+			}))
+			assert.ErrorIs(t, store.Healthy(), ErrStoreAuthorityUnavailable,
+				"authority drift must remain sticky for the process lifetime")
+		})
+	}
 }
 
 func TestStore_Store_Success(t *testing.T) {

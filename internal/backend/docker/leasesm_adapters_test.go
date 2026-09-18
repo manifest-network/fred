@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -137,42 +138,44 @@ func TestDockerDiagnosticsGatherer_GatherDiagnostics(t *testing.T) {
 	assert.Contains(t, got, "boom")
 }
 
-// TestBackendProvisionStore_Get covers the snapshot read path.
-func TestBackendProvisionStore_Get(t *testing.T) {
+func TestBackendProvisionStoreScalarReads(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
 	})
 	s := &backendProvisionStore{backend: b}
 
-	t.Run("known lease returns snapshot + ok", func(t *testing.T) {
-		state, ok := s.Get("lease-1")
+	t.Run("known lease returns status + ok", func(t *testing.T) {
+		status, ok := s.LookupStatus("lease-1")
 		assert.True(t, ok)
-		require.NotNil(t, state)
-		assert.Equal(t, backend.ProvisionStatusReady, state.Status)
-		assert.Equal(t, "lease-1", state.LeaseUUID)
+		assert.Equal(t, backend.ProvisionStatusReady, status)
+		assert.True(t, s.Exists("lease-1"))
 	})
 
-	t.Run("unknown lease returns nil + ok=false", func(t *testing.T) {
-		state, ok := s.Get("nope")
+	t.Run("unknown lease returns ok=false", func(t *testing.T) {
+		_, ok := s.LookupStatus("nope")
 		assert.False(t, ok)
-		assert.Nil(t, state)
+		assert.False(t, s.Exists("nope"))
 	})
 }
 
-// TestBackendProvisionStore_Delete verifies that Delete removes the entry
-// and returns the presence bool correctly.
+// TestBackendProvisionStore_Delete verifies that Delete removes the entry,
+// returns the presence bool, and commits Ready-count observability with the
+// projection mutation.
 func TestBackendProvisionStore_Delete(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusReady}},
 	})
 
 	t.Run("present returns true and entry is removed", func(t *testing.T) {
+		before := testutil.ToFloat64(activeProvisions)
 		assert.True(t, b.provisionStore.Delete("lease-1"))
-		_, ok := b.provisionStore.Get("lease-1")
-		assert.False(t, ok, "entry must be gone after Delete")
+		assert.False(t, b.provisionStore.Exists("lease-1"), "entry must be gone after Delete")
+		assert.Equal(t, before-1, testutil.ToFloat64(activeProvisions))
 	})
 	t.Run("absent returns false (idempotent)", func(t *testing.T) {
+		before := testutil.ToFloat64(activeProvisions)
 		assert.False(t, b.provisionStore.Delete("lease-1"))
+		assert.Equal(t, before, testutil.ToFloat64(activeProvisions))
 	})
 }
 
@@ -186,6 +189,7 @@ func TestBackendProvisionStore_UpdateFn(t *testing.T) {
 	s := &backendProvisionStore{backend: b}
 
 	t.Run("compound update applies all writes atomically", func(t *testing.T) {
+		before := testutil.ToFloat64(activeProvisions)
 		applied := s.UpdateFn("lease-1", func(p *leasesm.ProvisionState) {
 			p.Status = backend.ProvisionStatusFailed
 			p.LastError = "container exited"
@@ -200,6 +204,16 @@ func TestBackendProvisionStore_UpdateFn(t *testing.T) {
 		assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 		assert.Equal(t, "container exited", prov.LastError)
 		assert.Equal(t, 3, prov.FailCount)
+		assert.Equal(t, before-1, testutil.ToFloat64(activeProvisions),
+			"Ready status and its gauge delta are one store mutation")
+	})
+
+	t.Run("returning to Ready increments once", func(t *testing.T) {
+		before := testutil.ToFloat64(activeProvisions)
+		assert.True(t, s.UpdateFn("lease-1", func(p *leasesm.ProvisionState) {
+			p.Status = backend.ProvisionStatusReady
+		}))
+		assert.Equal(t, before+1, testutil.ToFloat64(activeProvisions))
 	})
 
 	t.Run("unknown lease returns false; closure not invoked", func(t *testing.T) {

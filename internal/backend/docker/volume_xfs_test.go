@@ -91,7 +91,7 @@ func TestXfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
 		activeIDs:  make(map[uint32]string),
 		volumeToID: make(map[string]uint32),
 	}
-	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-does-not-exist-app-0", 100),
+	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100),
 		"EnsureQuota on a missing volume must be a no-op")
 }
 
@@ -100,7 +100,7 @@ func TestXfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
 // (root-free — the missing-path branch returns before any exec).
 func TestBtrfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
 	mgr := &btrfsVolumeManager{dataPath: t.TempDir(), logger: slog.Default()}
-	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-does-not-exist-app-0", 100),
+	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100),
 		"btrfs EnsureQuota on a missing subvolume must be a no-op")
 }
 
@@ -149,8 +149,9 @@ func TestXfsQuotaArgs_TrailingArgIsMountpoint(t *testing.T) {
 	assert.Equal(t, mount, limit[len(limit)-1], "limit -p: trailing fs arg must be the mount point")
 	assert.Contains(t, strings.Join(limit, " "), "limit -p bhard=100m")
 
-	report := xfsQuotaArgs("report -p -b -N", mount)
+	report := xfsQuotaArgs("report -p -b -n -N", mount)
 	assert.Equal(t, mount, report[len(report)-1], "report: trailing fs arg must be the mount point")
+	assert.Equal(t, "report -p -b -n -N -L 1501154529 -U 1501154529", xfsProjectReportCmd("b", projID))
 }
 
 // newXfsManagerForTest builds a bare xfsVolumeManager over dataPath with empty
@@ -158,31 +159,163 @@ func TestXfsQuotaArgs_TrailingArgIsMountpoint(t *testing.T) {
 // Destroy teardown path without any live XFS mount or xfs_quota tooling.
 func newXfsManagerForTest(dataPath string) *xfsVolumeManager {
 	return &xfsVolumeManager{
-		dataPath:   dataPath,
-		mountPoint: dataPath,
-		logger:     slog.Default(),
-		activeIDs:  make(map[uint32]string),
-		volumeToID: make(map[string]uint32),
+		dataPath:          dataPath,
+		mountPoint:        dataPath,
+		logger:            slog.Default(),
+		projectAttributes: fixedXFSProjectAttributeReader{attr: linuxFSXAttr{XFlags: linuxFSXFlagProjInherit}},
+		activeIDs:         make(map[uint32]string),
+		volumeToID:        make(map[string]uint32),
 	}
 }
 
-// TestResolveProjectID_PrefersMarkerFile pins the ENG-459 resolution rule: the
+func installLoggingXFSQuota(t *testing.T) string {
+	t.Helper()
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "xfs-quota.log")
+	fakeQuota := filepath.Join(binDir, "xfs_quota")
+	require.NoError(t, os.WriteFile(fakeQuota, []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$FRED_TEST_XFS_LOG"
+`), 0o700))
+	t.Setenv("PATH", binDir)
+	t.Setenv("FRED_TEST_XFS_LOG", logPath)
+	return logPath
+}
+
+func TestXFSCreateExistingRetagsBeforeApplyingLimit(t *testing.T) {
+	dataPath := t.TempDir()
+	const (
+		name   = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+		projID = uint32(4242)
+	)
+	dir := filepath.Join(dataPath, name)
+	require.NoError(t, os.Mkdir(dir, 0o700))
+	require.NoError(t, writeProjectIDFile(dir, projID))
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "xfs-quota.log")
+	fakeQuota := filepath.Join(binDir, "xfs_quota")
+	require.NoError(t, os.WriteFile(fakeQuota, []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$FRED_TEST_XFS_LOG"
+`), 0o700))
+	t.Setenv("PATH", binDir)
+	t.Setenv("FRED_TEST_XFS_LOG", logPath)
+	mgr := newXfsManagerForTest(dataPath)
+
+	hostPath, created, err := mgr.Create(t.Context(), name, 100)
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, dir, hostPath)
+	commands, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	logText := string(commands)
+	setupAt := strings.Index(logText, "project -s -p "+dir)
+	limitAt := strings.Index(logText, "limit -p bhard=100m")
+	assert.GreaterOrEqual(t, setupAt, 0, "existing recovery directory must be re-tagged")
+	assert.Greater(t, limitAt, setupAt, "quota limit must follow project tagging")
+}
+
+func TestXFSCreateEEXISTNeverGrantsCleanupAuthority(t *testing.T) {
+	dataPath := t.TempDir()
+	const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	dirPath := filepath.Join(dataPath, name)
+	sentinelPath := filepath.Join(dirPath, "racer-owned")
+	require.NoError(t, os.Mkdir(dirPath, 0o700))
+	require.NoError(t, os.WriteFile(sentinelPath, []byte("keep"), 0o600))
+	mgr := newXfsManagerForTest(dataPath)
+
+	logPath := installLoggingXFSQuota(t)
+	_, _, err := mgr.Create(t.Context(), name, 100)
+	require.ErrorContains(t, err, "project ID marker")
+	assert.FileExists(t, sentinelPath, "an EEXIST loser must not remove the racer's directory")
+	assert.NoFileExists(t, filepath.Join(dirPath, projectIDFile), "an EEXIST loser must not retag the racer's directory")
+	assert.NoFileExists(t, logPath, "unverified EEXIST must not reach xfs_quota")
+	assert.Empty(t, mgr.activeIDs)
+	assert.Empty(t, mgr.volumeToID)
+}
+
+func TestXFSCreateAssignmentFailurePreservesPreexistingAuthority(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+	const (
+		name      = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+		otherName = "fred-550e8400-e29b-41d4-a716-446655440000-app-1"
+		projID    = uint32(4242)
+	)
+	// Deliberately inconsistent preexisting evidence makes reservation fail.
+	// The fresh directory belongs to this call, but neither map entry does.
+	mgr.volumeToID[name] = projID
+	mgr.activeIDs[projID] = otherName
+
+	_, _, err := mgr.Create(t.Context(), name, 100)
+	require.ErrorContains(t, err, "project ID maps are inconsistent")
+	assert.NoDirExists(t, filepath.Join(dataPath, name), "the definitely-created directory may be compensated")
+	assert.Equal(t, projID, mgr.volumeToID[name], "preexisting reverse authority must survive compensation")
+	assert.Equal(t, otherName, mgr.activeIDs[projID], "preexisting forward authority must survive compensation")
+}
+
+func TestXFSDurableStageCleanupRetainsProjectIDUntilRemoval(t *testing.T) {
+	dataPath := t.TempDir()
+	const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	volumeID, err := parseManagedVolumeName(name)
+	require.NoError(t, err)
+	mgr := newXfsManagerForTest(dataPath)
+	reservedID, createdProjectID, err := mgr.reserveProjectID(name)
+	require.NoError(t, err)
+	require.NotNil(t, createdProjectID)
+	stage, err := newXFSStageName(reservedID, volumeID)
+	require.NoError(t, err)
+	creationRoot, parent, err := openXFSRootCapabilities(dataPath)
+	require.NoError(t, err)
+	createdStage, err := createXFSStageDirectory(creationRoot, stage)
+	require.NoError(t, err)
+	require.NotNil(t, createdStage)
+	require.NoError(t, parent.Sync())
+	require.NoError(t, mgr.rememberDurableStage(stage))
+	require.NoError(t, ensureXFSStageMarker(creationRoot, stage))
+	require.NoError(t, creationRoot.Close())
+	require.NoError(t, parent.Close())
+
+	t.Setenv("PATH", t.TempDir())
+	err = mgr.cleanupXFSStage(t.Context(), stage)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	assert.Equal(t, reservedID, mgr.volumeToID[name], "failed cleanup must retain the reverse reservation")
+	assert.Equal(t, name, mgr.activeIDs[reservedID], "failed cleanup must retain the forward reservation")
+	assert.DirExists(t, stage.hostPath(dataPath))
+
+	installLoggingXFSQuota(t)
+	require.NoError(t, mgr.cleanupXFSStage(t.Context(), stage))
+	assert.NotContains(t, mgr.volumeToID, name)
+	assert.NotContains(t, mgr.activeIDs, reservedID)
+	assert.NoDirExists(t, stage.hostPath(dataPath))
+}
+
+func resolveProjectIDForTest(t *testing.T, mgr *xfsVolumeManager, id string) (uint32, bool) {
+	t.Helper()
+	volumeID, err := parseManagedVolumeName(id)
+	require.NoError(t, err)
+	root, err := os.OpenRoot(mgr.dataPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = root.Close() })
+	return mgr.resolveProjectID(root, volumeID)
+}
+
+// TestResolveProjectID_UsesMarkerFile pins the ENG-459 resolution rule: the
 // on-disk .fred-project-id marker (the authoritative record of the projID that was
-// actually tagged + limited, and the only source that survives a restart) wins over
-// the in-memory map. Resolving via the marker — never by recomputing crc32(id) — is
+// actually tagged + limited, and the only source that survives a restart) is used
+// when no live map contradicts it. Resolving via the marker — never by recomputing crc32(id) — is
 // required because assignProjectID's collision-probe can make the derived candidate
 // differ from the assigned id, so a recompute-based clear could zero the wrong project.
-func TestResolveProjectID_PrefersMarkerFile(t *testing.T) {
+func TestResolveProjectID_UsesMarkerFile(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 
-	const id = "fred-vol-app-0"
+	const id = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
 	dir := filepath.Join(dataPath, id)
 	require.NoError(t, os.MkdirAll(dir, 0700))
 	require.NoError(t, writeProjectIDFile(dir, 4242))
-	mgr.volumeToID[id] = 9999 // map disagrees; the on-disk marker must win
 
-	got, ok := mgr.resolveProjectID(id)
+	got, ok := resolveProjectIDForTest(t, mgr, id)
 	require.True(t, ok)
 	assert.Equal(t, uint32(4242), got, "the on-disk marker is authoritative over the in-memory map")
 }
@@ -194,10 +327,11 @@ func TestResolveProjectID_FallsBackToMapWhenNoMarker(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 
-	const id = "fred-vol-app-0" // no directory / marker on disk
+	const id = "fred-550e8400-e29b-41d4-a716-446655440000-app-0" // no directory / marker on disk
+	mgr.activeIDs[777] = id
 	mgr.volumeToID[id] = 777
 
-	got, ok := mgr.resolveProjectID(id)
+	got, ok := resolveProjectIDForTest(t, mgr, id)
 	require.True(t, ok)
 	assert.Equal(t, uint32(777), got)
 }
@@ -209,7 +343,7 @@ func TestResolveProjectID_NotFoundWhenNeitherKnows(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 
-	_, ok := mgr.resolveProjectID("fred-unknown-app-0")
+	_, ok := resolveProjectIDForTest(t, mgr, "fred-550e8400-e29b-41d4-a716-446655440000-app-0")
 	assert.False(t, ok, "an already-cleared / never-created volume resolves to no projID")
 }
 
@@ -220,13 +354,48 @@ func TestResolveProjectID_RejectsZeroMarker(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 
-	const id = "fred-vol-app-0"
+	const id = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
 	dir := filepath.Join(dataPath, id)
 	require.NoError(t, os.MkdirAll(dir, 0700))
-	require.NoError(t, writeProjectIDFile(dir, 0))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, projectIDFile), []byte("0"), 0o600))
 
-	_, ok := mgr.resolveProjectID(id)
+	_, ok := resolveProjectIDForTest(t, mgr, id)
 	assert.False(t, ok, "project ID 0 (reserved default project) must never resolve")
+}
+
+func TestXFSVolumeManagerRejectsDefaultProjectMarkerBeforeMutation(t *testing.T) {
+	t.Parallel()
+
+	dataPath := t.TempDir()
+	const id = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	dir := filepath.Join(dataPath, id)
+	require.NoError(t, os.Mkdir(dir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, projectIDFile), []byte("0"), 0o600))
+	mgr := newXfsManagerForTest(dataPath)
+
+	_, _, err := mgr.Create(context.Background(), id, 100)
+	require.ErrorContains(t, err, "project ID 0 is reserved")
+	require.ErrorContains(t, mgr.EnsureQuota(context.Background(), id, 100), "project ID 0 is reserved")
+	require.ErrorContains(t, mgr.loadProjectIDs(), "project ID 0 is reserved")
+	assert.Empty(t, mgr.volumeToID)
+	assert.Empty(t, mgr.activeIDs)
+}
+
+func TestXFSVolumeManagerAttestsRealDirectoryAndNonzeroMarker(t *testing.T) {
+	t.Parallel()
+
+	rootPath := t.TempDir()
+	name := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
+	dirPath := filepath.Join(rootPath, name)
+	require.NoError(t, os.Mkdir(dirPath, 0o700))
+	require.NoError(t, writeProjectIDFile(dirPath, 4242))
+	managedName, err := parseManagedVolumeName(name)
+	require.NoError(t, err)
+	mgr := newXfsManagerForTest(rootPath)
+
+	require.NoError(t, mgr.AttestManagedVolume(t.Context(), managedName))
+	require.NoError(t, os.WriteFile(filepath.Join(dirPath, projectIDFile), []byte("0"), 0o600))
+	require.ErrorContains(t, mgr.AttestManagedVolume(t.Context(), managedName), "project ID 0 is reserved")
 }
 
 // TestResolveProjectID_SkipsOnUnreadableMarker verifies that a marker that EXISTS
@@ -237,65 +406,181 @@ func TestResolveProjectID_SkipsOnUnreadableMarker(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 
-	const id = "fred-vol-app-0"
+	const id = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
 	dir := filepath.Join(dataPath, id)
 	require.NoError(t, os.MkdirAll(dir, 0700))
 	// A present-but-corrupt marker (unparseable content); the map even knows a projID.
 	require.NoError(t, os.WriteFile(filepath.Join(dir, projectIDFile), []byte("not-a-number"), 0600))
 	mgr.volumeToID[id] = 555
 
-	_, ok := mgr.resolveProjectID(id)
+	_, ok := resolveProjectIDForTest(t, mgr, id)
 	assert.False(t, ok, "a present-but-corrupt marker must skip the clear, not fall back to the map")
 }
 
-// TestDestroy_QuotaClearFailure_StillRemovesDirAndCounts pins the ENG-459
-// best-effort contract on the failure branch (per fred's "test the error branch"
-// discipline): if the xfs_quota clear fails, Destroy must still remove the
-// directory, still return nil, and record the leak on the observable counter.
-// Returning an error would break the caller invariant (a Destroy error means
-// "bytes still on disk" → the lease is kept Failed and its footprint counted), and
-// a zero-byte quota-clear failure must not strand the lease. The clear is forced to
-// fail hermetically by pointing PATH at an empty dir so xfs_quota is not found —
-// exercising the exact err!=nil branch a real EPERM (missing CAP_SYS_ADMIN) hits,
-// with no root or live XFS mount required.
-func TestDestroy_QuotaClearFailure_StillRemovesDirAndCounts(t *testing.T) {
+func TestProjectIDMarker_RejectsCrossVolumeSymlink(t *testing.T) {
+	t.Parallel()
+
+	dataPath := t.TempDir()
+	const sourceName = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	const targetName = "fred-550e8400-e29b-41d4-a716-446655440000-app-1"
+	sourceDir := filepath.Join(dataPath, sourceName)
+	targetDir := filepath.Join(dataPath, targetName)
+	require.NoError(t, os.Mkdir(sourceDir, 0o700))
+	require.NoError(t, os.Mkdir(targetDir, 0o700))
+	require.NoError(t, writeProjectIDFile(targetDir, 4242))
+	require.NoError(t, os.Symlink(filepath.Join("..", targetName, projectIDFile), filepath.Join(sourceDir, projectIDFile)))
+
+	root, err := os.OpenRoot(dataPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = root.Close() })
+	source, err := parseManagedVolumeName(sourceName)
+	require.NoError(t, err)
+
+	_, err = readProjectIDFileAtRoot(root, source)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "not a regular file")
+	err = writeProjectIDFileAtRoot(root, source, 9999)
+	require.Error(t, err, "exclusive no-follow creation must reject a pre-existing marker symlink")
+
+	got, err := readProjectIDFile(targetDir)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(4242), got, "a foreign volume's marker must remain untouched")
+}
+
+// TestDestroy_QuotaClearFailure_RetainsTypedTombstoneAndCounts pins the durable
+// delete protocol's post-content-removal crash window. The tombstone stays
+// named until its dquot is definitely clear, so an xfs_quota failure is
+// retryable after restart rather than leaking the collision-probed project ID.
+func TestDestroy_QuotaClearFailure_RetainsTypedTombstoneAndCounts(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 
-	const id = "fred-vol-app-0"
+	const id = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
 	dir := filepath.Join(dataPath, id)
 	require.NoError(t, os.MkdirAll(dir, 0700))
 	require.NoError(t, writeProjectIDFile(dir, 4242))
 
-	// Force the clear's xfs_quota exec to fail (binary not found) — a stand-in for
-	// any real clear failure. t.Setenv forbids t.Parallel, which is fine here.
-	t.Setenv("PATH", t.TempDir())
+	// Let both zero-usage proofs succeed, then fail only the dquot clear.
+	binDir := t.TempDir()
+	fakeQuota := filepath.Join(binDir, "xfs_quota")
+	require.NoError(t, os.WriteFile(fakeQuota, []byte(`#!/bin/sh
+case "$*" in
+  *"bhard=0 bsoft=0 ihard=0 isoft=0"*) exit 19 ;;
+esac
+`), 0o700))
+	t.Setenv("PATH", binDir)
 
 	before := testutil.ToFloat64(volumeQuotaClearFailedTotal)
 	err := mgr.Destroy(context.Background(), id)
-	require.NoError(t, err, "a quota-clear failure must not fail Destroy (would strand the lease)")
+	require.ErrorContains(t, err, "clear xfs project quota for delete-stage")
+	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
 
-	assert.NoDirExists(t, dir, "the directory must still be removed despite the clear failure")
+	assert.NoDirExists(t, dir, "tenant bytes must no longer remain under the live volume name")
+	volumeID, parseErr := parseManagedVolumeName(id)
+	require.NoError(t, parseErr)
+	stage, stageErr := newXFSDeleteStageName(4242, volumeID)
+	require.NoError(t, stageErr)
+	assert.DirExists(t, stage.hostPath(dataPath), "failed clear must retain durable delete authority")
+	entries, readErr := os.ReadDir(stage.hostPath(dataPath))
+	require.NoError(t, readErr)
+	assert.Empty(t, entries, "all tenant bytes are gone before quota clear is attempted")
 	assert.Equal(t, before+1, testutil.ToFloat64(volumeQuotaClearFailedTotal),
 		"a clear failure must be recorded on the leak counter")
+	assert.Equal(t, uint32(4242), mgr.volumeToID[id], "the project ID must remain reserved for retry")
+
+	// A crash here loses every in-memory map after the tenant tree is gone but
+	// before quota clear. The sibling must independently rebuild authority and
+	// make the idempotent clear/removal retry possible.
+	restarted := newXfsManagerForTest(dataPath)
+	require.NoError(t, restarted.loadProjectIDs())
+	installLoggingXFSQuota(t)
+	require.NoError(t, restarted.RecoverInterruptedVolumeMutations(t.Context()))
+	assert.NoDirExists(t, stage.hostPath(dataPath))
+	assert.Empty(t, restarted.volumeToID)
+}
+
+func TestXFSDestroyQuotaClearSurvivesCanceledCaller(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+	const (
+		name   = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+		projID = uint32(4242)
+	)
+	dirPath := filepath.Join(dataPath, name)
+	require.NoError(t, os.Mkdir(dirPath, 0o700))
+	require.NoError(t, writeProjectIDFile(dirPath, projID))
+	logPath := installLoggingXFSQuota(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.NoError(t, mgr.Destroy(ctx, name))
+	assert.NoDirExists(t, dirPath)
+	commands, err := os.ReadFile(logPath)
+	require.NoError(t, err, "the detached quota clear must execute despite caller cancellation")
+	assert.Contains(t, string(commands), xfsLimitClearCmd(projID))
+}
+
+func TestXFSRejectsForeignProjectIDAuthorityBeforeQuotaMutation(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+	const (
+		victimName = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+		ownerName  = "fred-550e8400-e29b-41d4-a716-446655440000-app-1"
+		projID     = uint32(4242)
+	)
+	victimDir := filepath.Join(dataPath, victimName)
+	sentinelPath := filepath.Join(victimDir, "tenant-data")
+	require.NoError(t, os.Mkdir(victimDir, 0o700))
+	require.NoError(t, writeProjectIDFile(victimDir, projID))
+	require.NoError(t, os.WriteFile(sentinelPath, []byte("keep"), 0o600))
+	mgr.mu.Lock()
+	registerErr := mgr.registerProjectIDLocked(ownerName, projID)
+	mgr.mu.Unlock()
+	require.NoError(t, registerErr)
+	logPath := installLoggingXFSQuota(t)
+
+	_, _, err := mgr.Create(t.Context(), victimName, 100)
+	require.ErrorContains(t, err, "already registered to volume")
+	require.ErrorContains(t, mgr.EnsureQuota(t.Context(), victimName, 100), "already registered to volume")
+	require.ErrorContains(t, mgr.Destroy(t.Context(), victimName), "project ID authority conflicts")
+
+	assert.NoFileExists(t, logPath, "foreign project authority must be rejected before xfs_quota")
+	assert.FileExists(t, sentinelPath, "conflicting authority must not authorize recursive deletion")
+	assert.Equal(t, ownerName, mgr.activeIDs[projID])
+	assert.Equal(t, projID, mgr.volumeToID[ownerName])
+	assert.NotContains(t, mgr.volumeToID, victimName)
+}
+
+func TestDestroy_RejectsTraversalBeforeFilesystemAccess(t *testing.T) {
+	t.Parallel()
+
+	parent := t.TempDir()
+	dataPath := filepath.Join(parent, "volumes")
+	require.NoError(t, os.Mkdir(dataPath, 0o700))
+	victimDir := filepath.Join(parent, "victim")
+	require.NoError(t, os.Mkdir(victimDir, 0o700))
+	victim := filepath.Join(victimDir, "tenant-data")
+	require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
+
+	mgr := newXfsManagerForTest(dataPath)
+	err := mgr.Destroy(context.Background(), filepath.Join("..", filepath.Base(victimDir)))
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "validate xfs volume ID for destroy")
+	assert.FileExists(t, victim, "an invalid volume ID must not reach recursive deletion")
 }
 
 // TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError pins the ordering
-// invariant: the quota limit is cleared only AFTER the directory is successfully
-// removed. If os.RemoveAll fails, Destroy must return an error (the caller reads
-// that as "bytes still on disk" and retries) and must NOT clear the limit — the
-// surviving volume stays enforced. Proven by forcing RemoveAll to fail (a
-// non-writable volume dir whose file cannot be unlinked) while an empty PATH would
-// make any attempted clear fail-and-count: the counter staying flat proves the
-// clear was never reached.
+// invariant: the quota limit is cleared only AFTER every child of the durable
+// delete-stage is removed. A partial failure retains the tombstone and project
+// map so a retry/restart never depends on the marker surviving.
 func TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError(t *testing.T) {
 	if os.Getuid() == 0 {
-		t.Skip("root bypasses directory permissions, so os.RemoveAll would not fail")
+		t.Skip("root bypasses directory permissions, so recursive removal would not fail")
 	}
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 
-	const id = "fred-vol-app-0"
+	const id = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
 	const projID = uint32(4242)
 	dir := filepath.Join(dataPath, id)
 	require.NoError(t, os.MkdirAll(dir, 0700))
@@ -309,14 +594,24 @@ func TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError(t *testing.T) {
 	require.NoError(t, os.Chmod(dir, 0500))
 	t.Cleanup(func() { _ = os.Chmod(dir, 0700) }) // let t.TempDir cleanup remove the tree
 
-	t.Setenv("PATH", t.TempDir()) // any attempted clear would fail (xfs_quota not found) and bump the counter
+	logPath := installLoggingXFSQuota(t)
 	before := testutil.ToFloat64(volumeQuotaClearFailedTotal)
 
 	err := mgr.Destroy(context.Background(), id)
 	require.Error(t, err, "a RemoveAll failure must surface (bytes still on disk -> caller retries)")
-	assert.DirExists(t, dir, "the volume must remain on disk when removal fails")
+	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	assert.DirExists(t, dir, "a partial recursive removal retains the managed root for an exact retry")
+	volumeID, parseErr := parseManagedVolumeName(id)
+	require.NoError(t, parseErr)
+	deleteStage, stageErr := newXFSDeleteStageName(projID, volumeID)
+	require.NoError(t, stageErr)
+	assert.DirExists(t, deleteStage.hostPath(dataPath), "a partial removal must retain its typed tombstone")
 	assert.Equal(t, before, testutil.ToFloat64(volumeQuotaClearFailedTotal),
 		"the quota limit must be left intact (clear not attempted) while the volume survives")
+	commands, readErr := os.ReadFile(logPath)
+	require.NoError(t, readErr)
+	assert.NotContains(t, string(commands), xfsLimitClearCmd(projID),
+		"partial recursive deletion must not reach dquot clear")
 
 	// The in-memory mapping must survive the failed removal: a retry must still
 	// resolve the projID, and it must not be reallocated while the inodes exist.

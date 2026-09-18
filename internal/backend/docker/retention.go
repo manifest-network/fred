@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/manifest-network/fred/internal/backend"
 )
@@ -14,13 +15,17 @@ func (b *Backend) ListRetentions(_ context.Context) ([]backend.RetainedLease, er
 	if b.retentionStore == nil {
 		return []backend.RetainedLease{}, nil
 	}
-	keys, err := b.retentionStore.Keys()
+	entries, err := b.retentionStore.List()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]backend.RetainedLease, 0, len(keys))
-	for _, k := range keys {
-		out = append(out, backend.RetainedLease{LeaseUUID: k})
+	out := make([]backend.RetainedLease, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, backend.RetainedLease{
+			LeaseUUID:    entry.OriginalLeaseUUID,
+			ProviderUUID: entry.ProviderUUID,
+			Tenant:       entry.Tenant,
+		})
 	}
 	return out, nil
 }
@@ -43,8 +48,19 @@ func (b *Backend) ListRetentionsPage(_ context.Context, after string, limit int)
 		return nil, "", err
 	}
 	out := make([]backend.RetainedLease, 0, len(keys))
-	for _, k := range keys {
-		out = append(out, backend.RetainedLease{LeaseUUID: k})
+	for _, key := range keys {
+		entry, getErr := b.retentionStore.Get(key)
+		if getErr != nil {
+			return nil, "", getErr
+		}
+		if entry == nil {
+			return nil, "", fmt.Errorf("retention %q disappeared during inventory read", key)
+		}
+		out = append(out, backend.RetainedLease{
+			LeaseUUID:    entry.OriginalLeaseUUID,
+			ProviderUUID: entry.ProviderUUID,
+			Tenant:       entry.Tenant,
+		})
 	}
 	return out, next, nil
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/util"
 )
@@ -36,17 +37,17 @@ func TestNewTokenTracker(t *testing.T) {
 		assert.False(t, errors.Is(err, fs.ErrNotExist), "database file was not created")
 	})
 
-	t.Run("uses_default_max_age", func(t *testing.T) {
+	t.Run("uses_default_cleanup_interval", func(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "tokens.db")
 
 		tracker, err := NewTokenTracker(TokenTrackerConfig{
 			DBPath: dbPath,
-			// MaxAge not set - should default to MaxTokenAge
+			// Cleanup defaults to the token validity window.
 		})
 		require.NoError(t, err)
 		defer tracker.Close()
 
-		assert.Equal(t, MaxTokenAge, tracker.maxAge)
+		assert.Equal(t, MaxTokenAge, tracker.cleanupInterval)
 	})
 }
 
@@ -55,12 +56,11 @@ func TestTokenTracker_TryUse(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "tokens.db")
 		tracker, err := NewTokenTracker(TokenTrackerConfig{
 			DBPath: dbPath,
-			MaxAge: 1 * time.Minute,
 		})
 		require.NoError(t, err)
 		defer tracker.Close()
 
-		err = tracker.TryUse("test-token-123")
+		err = tracker.TryUse(replayClaimForTest("test-token-123"))
 		assert.NoError(t, err)
 	})
 
@@ -68,17 +68,16 @@ func TestTokenTracker_TryUse(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "tokens.db")
 		tracker, err := NewTokenTracker(TokenTrackerConfig{
 			DBPath: dbPath,
-			MaxAge: 1 * time.Minute,
 		})
 		require.NoError(t, err)
 		defer tracker.Close()
 
 		// First use
-		err = tracker.TryUse("test-token-456")
+		err = tracker.TryUse(replayClaimForTest("test-token-456"))
 		require.NoError(t, err)
 
 		// Second use should fail
-		err = tracker.TryUse("test-token-456")
+		err = tracker.TryUse(replayClaimForTest("test-token-456"))
 		assert.Equal(t, ErrTokenAlreadyUsed, err)
 	})
 
@@ -86,44 +85,29 @@ func TestTokenTracker_TryUse(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "tokens.db")
 		tracker, err := NewTokenTracker(TokenTrackerConfig{
 			DBPath: dbPath,
-			MaxAge: 1 * time.Minute,
 		})
 		require.NoError(t, err)
 		defer tracker.Close()
 
 		// Use token A
-		err = tracker.TryUse("token-A")
+		err = tracker.TryUse(replayClaimForTest("token-A"))
 		require.NoError(t, err)
 
 		// Use token B should succeed
-		err = tracker.TryUse("token-B")
+		err = tracker.TryUse(replayClaimForTest("token-B"))
 		assert.NoError(t, err)
 
 		// Use token A again should fail
-		err = tracker.TryUse("token-A")
+		err = tracker.TryUse(replayClaimForTest("token-A"))
 		assert.Equal(t, ErrTokenAlreadyUsed, err)
 	})
 
-	t.Run("expired_token_can_be_reused", func(t *testing.T) {
-		dbPath := filepath.Join(t.TempDir(), "tokens.db")
-		tracker, err := NewTokenTracker(TokenTrackerConfig{
-			DBPath:          dbPath,
-			MaxAge:          50 * time.Millisecond, // Very short for testing
-			CleanupInterval: 1 * time.Hour,         // Don't auto-cleanup during test
-		})
+	t.Run("expired_claim_is_rejected", func(t *testing.T) {
+		tracker, err := NewTokenTracker(TokenTrackerConfig{DBPath: filepath.Join(t.TempDir(), "tokens.db")})
 		require.NoError(t, err)
 		defer tracker.Close()
-
-		// First use
-		err = tracker.TryUse("expiring-token")
-		require.NoError(t, err)
-
-		// Wait for expiry
-		time.Sleep(60 * time.Millisecond)
-
-		// Should be able to reuse after expiry
-		err = tracker.TryUse("expiring-token")
-		assert.NoError(t, err)
+		assert.ErrorIs(t, tracker.TryUse(TokenReplayClaim{signature: "expired", expiresAt: time.Now()}), ErrInvalidReplayClaim)
+		assert.ErrorIs(t, tracker.TryUse(TokenReplayClaim{}), ErrInvalidReplayClaim)
 	})
 }
 
@@ -131,30 +115,42 @@ func TestTokenTracker_Cleanup(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "tokens.db")
 	tracker, err := NewTokenTracker(TokenTrackerConfig{
 		DBPath:          dbPath,
-		MaxAge:          50 * time.Millisecond, // Very short for testing
-		CleanupInterval: 1 * time.Hour,         // Don't auto-cleanup
+		CleanupInterval: 1 * time.Hour, // Don't auto-cleanup
 	})
 	require.NoError(t, err)
 	defer tracker.Close()
 
 	// Add tokens
-	tracker.TryUse("token-1")
-	tracker.TryUse("token-2")
+	tracker.TryUse(replayClaimForTest("token-1"))
+	tracker.TryUse(replayClaimForTest("token-2"))
 
 	// Verify tokens are tracked (replay should fail)
-	err = tracker.TryUse("token-1")
+	err = tracker.TryUse(replayClaimForTest("token-1"))
 	require.Equal(t, ErrTokenAlreadyUsed, err, "TryUse() before expiry should return ErrTokenAlreadyUsed")
 
-	// Wait for expiry
-	time.Sleep(60 * time.Millisecond)
+	// Expire both records deterministically. A sub-100ms wall-clock window makes
+	// the pre-expiry assertion flaky when the full repository suite is under CPU
+	// contention, and this test is about cleanup semantics rather than timers.
+	err = tracker.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		expired := util.TimeToBytes(time.Now().Add(-MaxFutureClockSkew - time.Second))
+		if err := b.Put([]byte("token-1"), expired); err != nil {
+			return err
+		}
+		return b.Put([]byte("token-2"), expired)
+	})
+	require.NoError(t, err)
 
 	// Manual cleanup
 	err = tracker.cleanup()
 	require.NoError(t, err)
 
-	// After cleanup, tokens should be reusable (they were cleaned up)
-	assert.NoError(t, tracker.TryUse("token-1"), "token should be reusable")
-	assert.NoError(t, tracker.TryUse("token-2"), "token should be reusable")
+	// Cleanup removes persisted expired rows, without authorizing an expired claim.
+	require.NoError(t, tracker.db.View(func(tx *bolt.Tx) error {
+		assert.Nil(t, tx.Bucket(bucketName).Get([]byte("token-1")))
+		assert.Nil(t, tx.Bucket(bucketName).Get([]byte("token-2")))
+		return nil
+	}))
 }
 
 func TestTokenTracker_Persistence(t *testing.T) {
@@ -163,11 +159,10 @@ func TestTokenTracker_Persistence(t *testing.T) {
 	// Create tracker and add tokens
 	tracker1, err := NewTokenTracker(TokenTrackerConfig{
 		DBPath: dbPath,
-		MaxAge: 1 * time.Minute,
 	})
 	require.NoError(t, err)
 
-	err = tracker1.TryUse("persistent-token")
+	err = tracker1.TryUse(replayClaimForTest("persistent-token"))
 	require.NoError(t, err)
 
 	// Close first tracker
@@ -176,13 +171,12 @@ func TestTokenTracker_Persistence(t *testing.T) {
 	// Open new tracker with same DB
 	tracker2, err := NewTokenTracker(TokenTrackerConfig{
 		DBPath: dbPath,
-		MaxAge: 1 * time.Minute,
 	})
 	require.NoError(t, err)
 	defer tracker2.Close()
 
 	// Token should still be marked as used
-	err = tracker2.TryUse("persistent-token")
+	err = tracker2.TryUse(replayClaimForTest("persistent-token"))
 	assert.Equal(t, ErrTokenAlreadyUsed, err)
 }
 
@@ -191,7 +185,6 @@ func TestTokenTracker_Close(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "tokens.db")
 		tracker, err := NewTokenTracker(TokenTrackerConfig{
 			DBPath: dbPath,
-			MaxAge: 1 * time.Minute,
 		})
 		require.NoError(t, err)
 
@@ -204,7 +197,6 @@ func TestTokenTracker_Close(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "tokens.db")
 		tracker, err := NewTokenTracker(TokenTrackerConfig{
 			DBPath: dbPath,
-			MaxAge: 1 * time.Minute,
 		})
 		require.NoError(t, err)
 
@@ -236,4 +228,9 @@ func TestBytesToTime_InvalidInput(t *testing.T) {
 	// Invalid length should return zero time
 	result := util.BytesToTime([]byte{1, 2, 3}) // Only 3 bytes, need 8
 	assert.True(t, result.IsZero())
+}
+
+// Cache mechanics fixtures do not bypass cryptographic validation in production.
+func replayClaimForTest(signature string) TokenReplayClaim {
+	return TokenReplayClaim{signature: signature, expiresAt: time.Now().Add(time.Hour)}
 }

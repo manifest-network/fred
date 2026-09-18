@@ -42,9 +42,8 @@ func newLifecycleTestManagerWithPayloadStore(t *testing.T, payloadStore *payload
 	})
 	require.NoError(t, err)
 
-	m, err := NewManager(ManagerConfig{
+	m, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:     "provider-1",
-		CallbackBaseURL:  "http://localhost:8080",
 		PayloadStore:     payloadStore,
 		AckBatchInterval: 20 * time.Millisecond,
 		AckBatchSize:     10,
@@ -111,7 +110,7 @@ func TestManager_CloseCancelsLifecycleContext(t *testing.T) {
 	}
 
 	// Positive control: the lanes really are running.
-	acked, _, err := m.AckBatcher().Acknowledge(ctx, "lease-1")
+	acked, _, err := m.ackBatcher.Acknowledge(ctx, "lease-1")
 	require.NoError(t, err)
 	require.True(t, acked)
 	require.NoError(t, m.stopCtx.Err(), "lifecycle context must still be live while running")
@@ -211,7 +210,7 @@ func TestManager_CloseFinishesShutdownWhenRouterCloseFails(t *testing.T) {
 
 	// Positive controls. Without them every post-Close assertion below passes
 	// vacuously against a batcher that never ran and a store that was never open.
-	acked, _, ackErr := m.AckBatcher().Acknowledge(startCtx, "lease-1")
+	acked, _, ackErr := m.ackBatcher.Acknowledge(startCtx, "lease-1")
 	require.NoError(t, ackErr, "ack lanes must be live before Close()")
 	require.True(t, acked, "ack lanes must be live before Close()")
 	require.NoError(t, m.stopCtx.Err(), "lifecycle context must be live before Close()")
@@ -233,7 +232,7 @@ func TestManager_CloseFinishesShutdownWhenRouterCloseFails(t *testing.T) {
 	// (c) The ack batcher lanes are stopped anyway — and gone, not merely quiescent.
 	assert.True(t, waitGroupSettled(m.ackBatcher.wg, 5*time.Second),
 		"a failing router close must not skip the ack batcher shutdown (ENG-723)")
-	_, _, ackErr = m.AckBatcher().Acknowledge(context.Background(), "lease-1")
+	_, _, ackErr = m.ackBatcher.Acknowledge(context.Background(), "lease-1")
 	assert.ErrorIs(t, ackErr, errAckLaneUnavailable,
 		"the ack lanes must be gone after Close(), not merely idle")
 
@@ -274,7 +273,7 @@ func TestManager_AckBatcherExitsOnLifecycleContextCancel(t *testing.T) {
 	// Positive control: prove the lanes are actually RUNNING before we cancel.
 	// Without this, a batcher that was never started would satisfy the exit
 	// assertion below vacuously.
-	acked, _, err := m.AckBatcher().Acknowledge(startCtx, "lease-1")
+	acked, _, err := m.ackBatcher.Acknowledge(startCtx, "lease-1")
 	require.NoError(t, err, "ack batcher must be live once Manager.Start has run")
 	require.True(t, acked, "ack batcher must be live once Manager.Start has run")
 
@@ -285,7 +284,7 @@ func TestManager_AckBatcherExitsOnLifecycleContextCancel(t *testing.T) {
 		"ack batcher lanes did not exit on lifecycle-context cancellation — they are not owned by the manager's lifecycle (ENG-723)")
 
 	// And the batcher is genuinely gone, not merely quiescent.
-	_, _, err = m.AckBatcher().Acknowledge(startCtx, "lease-1")
+	_, _, err = m.ackBatcher.Acknowledge(startCtx, "lease-1")
 	assert.Error(t, err, "Acknowledge must fail once the lifecycle context is canceled")
 
 	assert.NoError(t, m.Close())

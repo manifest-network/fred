@@ -39,32 +39,34 @@ type tokenValidator struct {
 
 // validateCommon performs common token validation: timestamp, signature, and address verification.
 // The signData parameter is the message that was signed (differs by token type).
-func (v *tokenValidator) validateCommon(signData []byte, bech32Prefix string) error {
+func (v *tokenValidator) validateCommon(signData []byte, bech32Prefix string) (TokenReplayClaim, error) {
 	// Validate tenant is present
 	if v.tenant == "" {
-		return fmt.Errorf("tenant is required")
+		return TokenReplayClaim{}, fmt.Errorf("tenant is required")
 	}
 
 	// Check timestamp
 	tokenTime := time.Unix(v.timestamp, 0)
-	if time.Since(tokenTime) > MaxTokenAge {
-		return fmt.Errorf("token expired: issued at %v", tokenTime)
+	expiresAt := tokenTime.Add(MaxTokenAge)
+	now := time.Now()
+	if !now.Before(expiresAt) {
+		return TokenReplayClaim{}, fmt.Errorf("token expired: issued at %v", tokenTime)
 	}
 	// Use tighter tolerance for future timestamps to limit pre-generated token attacks
-	if time.Until(tokenTime) > MaxFutureClockSkew {
-		return fmt.Errorf("token timestamp too far in future: %v (max skew: %v)", tokenTime, MaxFutureClockSkew)
+	if tokenTime.Sub(now) > MaxFutureClockSkew {
+		return TokenReplayClaim{}, fmt.Errorf("token timestamp too far in future: %v (max skew: %v)", tokenTime, MaxFutureClockSkew)
 	}
 
 	// Decode public key
 	pubKeyBytes, err := base64.StdEncoding.DecodeString(v.pubKey)
 	if err != nil {
-		return fmt.Errorf("failed to decode public key: %w", err)
+		return TokenReplayClaim{}, fmt.Errorf("failed to decode public key: %w", err)
 	}
 
 	// Decode signature
 	sigBytes, err := base64.StdEncoding.DecodeString(v.signature)
 	if err != nil {
-		return fmt.Errorf("failed to decode signature: %w", err)
+		return TokenReplayClaim{}, fmt.Errorf("failed to decode signature: %w", err)
 	}
 
 	// Normalize signature to low-S canonical form before verification and storage.
@@ -73,7 +75,7 @@ func (v *tokenValidator) validateCommon(signData []byte, bech32Prefix string) er
 	// to create a different-but-valid signature that bypasses replay deduplication.
 	normalizedSig := adr036.NormalizeToLowS(sigBytes)
 	if normalizedSig == nil {
-		return fmt.Errorf("invalid signature length: expected 64, got %d", len(sigBytes))
+		return TokenReplayClaim{}, fmt.Errorf("invalid signature length: expected 64, got %d", len(sigBytes))
 	}
 	// Update the stored signature to the canonical form so the replay tracker
 	// always sees the same key regardless of which S-variant the client sent.
@@ -82,15 +84,15 @@ func (v *tokenValidator) validateCommon(signData []byte, bech32Prefix string) er
 	// Verify ADR-036 signature (also normalizes internally, but we pre-normalize
 	// above to ensure v.signature is updated before returning to the caller)
 	if err := adr036.VerifySignature(pubKeyBytes, signData, normalizedSig, v.tenant); err != nil {
-		return fmt.Errorf("signature verification failed: %w", err)
+		return TokenReplayClaim{}, fmt.Errorf("signature verification failed: %w", err)
 	}
 
 	// Verify the public key corresponds to the tenant address
 	if err := v.verifyAddress(pubKeyBytes, bech32Prefix); err != nil {
-		return fmt.Errorf("address verification failed: %w", err)
+		return TokenReplayClaim{}, fmt.Errorf("address verification failed: %w", err)
 	}
 
-	return nil
+	return TokenReplayClaim{signature: v.signature, expiresAt: expiresAt}, nil
 }
 
 // verifyAddress verifies that the public key corresponds to the tenant address.

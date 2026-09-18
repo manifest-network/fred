@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -35,14 +34,14 @@ func TestComputeRetainedDiskMB(t *testing.T) {
 	withMicroSKU(b, 1024)
 
 	// Two active retained leases: one with qty 2, one with qty 1 → 3 * 1024 MB.
-	require.NoError(t, rs.Put(retentionEntryFixture("lease-a", "t1", time.Now()))) // qty 2
+	require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("lease-a", "t1", time.Now()))) // qty 2
 	one := retentionEntryFixture("lease-b", "t1", time.Now())
 	one.Items = []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
-	require.NoError(t, rs.Put(one))
+	require.NoError(t, putRetentionForTest(t, rs, one))
 	// A restoring record must NOT count toward the active projection.
 	restoring := retentionEntryFixture("lease-c", "t1", time.Now())
 	restoring.Status = shared.RetentionStatusRestoring
-	require.NoError(t, rs.Put(restoring))
+	putRestoringRetention(t, rs, restoring)
 
 	mb, count, _, err := b.computeRetainedDiskMB()
 	require.NoError(t, err)
@@ -53,7 +52,8 @@ func TestComputeRetainedDiskMB(t *testing.T) {
 func TestRefreshRetentionAccounting_PushesToPoolAndMetrics(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)
-	require.NoError(t, rs.Put(retentionEntryFixture("lease-a", "t1", time.Now()))) // qty 2 → 2048 MB
+	leaseUUID := "0192f1a0-1111-4abc-8def-000000000901"
+	require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture(leaseUUID, "t1", time.Now()))) // qty 2 → 2048 MB
 
 	b.refreshRetentionAccounting()
 	assert.Equal(t, int64(2048), b.pool.Stats().RetainedDiskMB)
@@ -61,7 +61,12 @@ func TestRefreshRetentionAccounting_PushesToPoolAndMetrics(t *testing.T) {
 	assert.Equal(t, float64(1), testutil.ToFloat64(retainedLeases))
 
 	// Remove the record and refresh → projection drops to 0.
-	require.NoError(t, rs.Delete("lease-a"))
+	reaping, begun, err := rs.BeginReaping(activeRetentionCandidateForTest(t, rs, leaseUUID))
+	require.NoError(t, err)
+	require.True(t, begun)
+	deleted, err := rs.DeleteReaped(reaping)
+	require.NoError(t, err)
+	require.True(t, deleted)
 	b.refreshRetentionAccounting()
 	assert.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB)
 	assert.Equal(t, float64(0), testutil.ToFloat64(retainedVolumeBytes))
@@ -74,7 +79,7 @@ func TestRecoverRebuildsRetainedProjection(t *testing.T) {
 	// 1024 (not 512 like the ordering test) is fine: this test exercises only the
 	// computeRetainedDiskMB path (reads b.cfg.GetSKUProfile), never b.pool.TryAllocate,
 	// so the pool's constructor-time resolver is not involved.
-	require.NoError(t, rs.Put(retentionEntryFixture("lease-a", "t1", time.Now()))) // 2048 MB
+	require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("lease-a", "t1", time.Now()))) // 2048 MB
 
 	// Wire ListManagedContainers to return no containers so recoverState can
 	// run without a full Docker daemon; the test exercises the retained
@@ -100,12 +105,12 @@ func TestBreachRetentionCap(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	withMicroSKU(b, 1000) // 1000 MB per unit for clean math
 	// Store holds one active retained lease = qty2 * 1000 = 2000 MB (TRUE retained).
-	require.NoError(t, rs.Put(retentionEntryFixture("other", "t1", time.Now())))
+	require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("other", "t1", time.Now())))
 	incoming := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}} // 2000 MB
 
 	// Cap unset (0) → never breaches (even with a stale-high cache).
 	b.cfg.MaxRetainedDiskMB = 0
-	b.pool.SetRetainedDisk(1_000_000)
+	require.NoError(t, b.pool.SetRetainedDisk(1_000_000))
 	_, breached := b.breachRetentionCaps("t1", "", incoming, resolveTenantRetentionBudget(b.cfg, "t1"))
 	assert.False(t, breached)
 
@@ -127,9 +132,9 @@ func TestBreachRetentionCap_UsesStoreNotStaleCache(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	withMicroSKU(b, 1000)
 	b.cfg.MaxRetainedDiskMB = 5000
-	require.NoError(t, rs.Put(retentionEntryFixture("other", "t1", time.Now())))            // TRUE retained = 2000
-	b.pool.SetRetainedDisk(9_999_999)                                                       // stale-HIGH cache (e.g. a just-reaped record not yet refreshed)
-	incoming := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}} // 2000
+	require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("other", "t1", time.Now()))) // TRUE retained = 2000
+	require.NoError(t, b.pool.SetRetainedDisk(9_999_999))                                            // stale-HIGH cache (e.g. a just-reaped record not yet refreshed)
+	incoming := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}          // 2000
 	// TRUE: 2000 + 2000 = 4000 <= 5000 → must NOT breach, even though the stale cache (9.9M) would.
 	_, breached := b.breachRetentionCaps("t1", "", incoming, resolveTenantRetentionBudget(b.cfg, "t1"))
 	assert.False(t, breached,
@@ -159,11 +164,13 @@ func TestBreachRetentionCap_StoreErrorFailsOpen(t *testing.T) {
 // cost. The fixture has qty=2 → footprint = 2 * 512 = 1024 MB.
 func TestRestoreOrdering_NeverUnderCounts(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
+	sourceLease := canonicalRetentionFixtureUUID("lease-a")
+	destinationLease := canonicalRetentionFixtureUUID("lease-a-destination")
 	// Use 512 MB to match the pool resolver's view of docker-micro
 	// (defaultTestSKUProfiles: DiskMB=512). computeRetainedDiskMB also
 	// reads b.cfg.GetSKUProfile; withMicroSKU(b, 512) aligns both views.
 	withMicroSKU(b, 512)
-	require.NoError(t, rs.Put(retentionEntryFixture("lease-a", "t1", time.Now()))) // active, 2 x 512 = 1024 MB
+	require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture(sourceLease, "t1", time.Now()))) // active, 2 x 512 = 1024 MB
 	b.refreshRetentionAccounting()
 	require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB)
 
@@ -171,16 +178,23 @@ func TestRestoreOrdering_NeverUnderCounts(t *testing.T) {
 	// flips active→restoring (which a refresh drops from the active projection).
 	// Model that order; live+retained must never dip below the footprint
 	// (under-count == over-admit, the dangerous direction).
-	require.NoError(t, b.pool.TryAllocate("lease-a-web-0", "docker-micro", "t1")) // +512 live
-	require.NoError(t, b.pool.TryAllocate("lease-a-web-1", "docker-micro", "t1")) // +512 live
+	require.NoError(t, b.pool.TryAllocate(destinationLease+"-web-0", "docker-micro", "t1")) // +512 live
+	require.NoError(t, b.pool.TryAllocate(destinationLease+"-web-1", "docker-micro", "t1")) // +512 live
 	s := b.pool.Stats()
 	assert.GreaterOrEqual(t, s.AllocatedDiskMB+s.RetainedDiskMB, int64(1024),
 		"live+retained must never under-count during the claim window")
 
 	// Record flips to restoring; refresh drops it from the active projection.
-	entry := retentionEntryFixture("lease-a", "t1", time.Now())
-	entry.Status = shared.RetentionStatusRestoring
-	require.NoError(t, rs.Put(entry))
+	entry, err := rs.Get(sourceLease)
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
+	_, err = claimRetentionForTest(
+		t, rs, sourceLease, destinationLease, 0,
+		entry.Items, entry.ResourceProfiles, operationID,
+		callbackURL, lifecycleCallbackURL,
+	)
+	require.NoError(t, err)
 	b.refreshRetentionAccounting()
 	s = b.pool.Stats()
 	assert.Equal(t, int64(0), s.RetainedDiskMB, "restoring record leaves the active projection")
@@ -305,7 +319,7 @@ func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
 	b, _ := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)
 	b.cfg.MaxRetainedDiskMB = 1000 // smaller than a single 2 x 1024 = 2048 MB lease
-	b.pool.SetRetainedDisk(0)
+	require.NoError(t, b.pool.SetRetainedDisk(0))
 
 	// A capturing fake volume manager records Destroy calls (mirrors the
 	// fakeVolumeBackend pattern in testsupport_test.go).
@@ -318,7 +332,7 @@ func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
 
 	before := testutil.ToFloat64(retentionRefusedTotal)
 	canonical := []string{"fred-lease-z-web-0", "fred-lease-z-web-1"}
-	rep := b.destroyOnRefuseToRetain(context.Background(), b.volumeOp("lease-z", b.logger),
+	rep := b.destroyOnRefuseToRetain(volumeDestroyCapabilityForTest(b), context.Background(), b.volumeOp("lease-z", b.logger),
 		canonical, "lease-z", "t1", "", refuseScopeGlobal, b.logger)
 
 	assert.NoError(t, rep.err())
@@ -332,8 +346,8 @@ func TestShouldRefuseRetention_UnlimitedSkipsStoreRead(t *testing.T) {
 	b.cfg.MaxRetainedDiskMB = 0 // unlimited
 	// Close the store so any Get would error; the unlimited path must not touch it.
 	require.NoError(t, rs.Close())
-	_, refuse := b.shouldRefuseRetention("lease-x", "t1", "",
-		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}, resolveTenantRetentionBudget(b.cfg, "t1"))
+	_, refuse := b.shouldRefuseRetentionWithResourceProfiles("lease-x", "t1", "",
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}, nil, resolveTenantRetentionBudget(b.cfg, "t1"))
 	assert.False(t, refuse,
 		"unlimited cap must return false without reading the retention store")
 }
@@ -343,18 +357,23 @@ func TestShouldRefuseRetention_SkipsWhenAlreadyRetained(t *testing.T) {
 	withMicroSKU(b, 1024)
 	b.cfg.MaxRetainedDiskMB = 1000 // tight: a 2 x 1024 = 2048 MB lease breaches
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
+	leaseUUID := canonicalRetentionFixtureUUID("lease-x")
 
 	// No record yet → breach → refuse.
-	b.pool.SetRetainedDisk(0)
-	_, refuse := b.shouldRefuseRetention("lease-x", "t1", "", items, resolveTenantRetentionBudget(b.cfg, "t1"))
+	require.NoError(t, b.pool.SetRetainedDisk(0))
+	_, refuse := b.shouldRefuseRetentionWithResourceProfiles(
+		leaseUUID, "t1", "", items, nil, resolveTenantRetentionBudget(b.cfg, "t1"),
+	)
 	assert.True(t, refuse)
 
 	// A prior attempt already wrote an ACTIVE record for this lease (retry case);
 	// its footprint is already in retainedDisk. Re-deciding must NOT refuse
 	// (no double-count, no inconsistent destroy-some/retain-some state).
-	require.NoError(t, rs.Put(retentionEntryFixture("lease-x", "t1", time.Now()))) // active, docker-micro qty 2
-	b.pool.SetRetainedDisk(2048)                                                   // reflects the existing record
-	_, refuse = b.shouldRefuseRetention("lease-x", "t1", "", items, resolveTenantRetentionBudget(b.cfg, "t1"))
+	require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture(leaseUUID, "t1", time.Now()))) // active, docker-micro qty 2
+	require.NoError(t, b.pool.SetRetainedDisk(2048))                                                   // reflects the existing record
+	_, refuse = b.shouldRefuseRetentionWithResourceProfiles(
+		leaseUUID, "t1", "", items, nil, resolveTenantRetentionBudget(b.cfg, "t1"),
+	)
 	assert.False(t, refuse, "retry of an already-retained lease must not be refused")
 }
 
@@ -365,12 +384,13 @@ func TestLeaseDiskMB_UnknownSKUSkipped(t *testing.T) {
 		{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}, // 2048
 		{SKU: "ghost-sku", Quantity: 5, ServiceName: "db"},     // unknown → skipped + reported
 	}
-	mb, unresolved := b.leaseDiskMB(items)
+	mb, unresolved, err := b.leaseDiskMB(items)
+	require.NoError(t, err)
 	assert.Equal(t, int64(2048), mb)
 	assert.Equal(t, []string{"ghost-sku"}, unresolved)
 }
 
-func TestLeaseDiskMB_NonPositiveQuantitySkipped(t *testing.T) {
+func TestLeaseDiskMB_NonPositiveQuantityRejected(t *testing.T) {
 	b, _ := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)
 	items := []backend.LeaseItem{
@@ -378,21 +398,21 @@ func TestLeaseDiskMB_NonPositiveQuantitySkipped(t *testing.T) {
 		{SKU: "docker-micro", Quantity: -3, ServiceName: "bad"}, // invalid → must contribute 0, not reduce
 		{SKU: "docker-micro", Quantity: 0, ServiceName: "zero"}, // 0 → 0
 	}
-	mb, _ := b.leaseDiskMB(items)
-	assert.Equal(t, int64(2048), mb,
-		"non-positive quantities must contribute 0 (never reduce the projection into the over-admit direction)")
+	_, _, err := b.leaseDiskMB(items)
+	require.ErrorContains(t, err, "non-positive quantity")
 }
 
 func TestShouldRefuseRetention_SkipsWhenRestoring(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)
 	b.cfg.MaxRetainedDiskMB = 1000 // tight: a 2x1024 lease would breach
-	b.pool.SetRetainedDisk(2048)
-	entry := retentionEntryFixture("lease-x", "t1", time.Now())
+	require.NoError(t, b.pool.SetRetainedDisk(2048))
+	leaseUUID := canonicalRetentionFixtureUUID("lease-x")
+	entry := retentionEntryFixture(leaseUUID, "t1", time.Now())
 	entry.Status = shared.RetentionStatusRestoring
-	require.NoError(t, rs.Put(entry))
-	_, refuse := b.shouldRefuseRetention("lease-x", "t1", "",
-		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}, resolveTenantRetentionBudget(b.cfg, "t1"))
+	putRestoringRetention(t, rs, entry)
+	_, refuse := b.shouldRefuseRetentionWithResourceProfiles(leaseUUID, "t1", "",
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}, nil, resolveTenantRetentionBudget(b.cfg, "t1"))
 	assert.False(t, refuse,
 		"a restore-claimed (restoring) record must not be refused — defer to PutActiveMerged ok=false")
 }
@@ -401,11 +421,11 @@ func TestShouldRefuseRetention_StoreReadErrorDoesNotRefuse(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)
 	b.cfg.MaxRetainedDiskMB = 1000 // tight: would breach if the cap check were reached
-	b.pool.SetRetainedDisk(2048)
+	require.NoError(t, b.pool.SetRetainedDisk(2048))
 	require.NoError(t, rs.Close()) // any Get now errors (closeOnce makes the t.Cleanup double-close harmless)
 	refuseGetBefore := testutil.ToFloat64(retentionCapCheckFailedTotal.WithLabelValues(capCheckRefuseGet))
-	_, refuse := b.shouldRefuseRetention("lease-x", "t1", "",
-		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}, resolveTenantRetentionBudget(b.cfg, "t1"))
+	_, refuse := b.shouldRefuseRetentionWithResourceProfiles("lease-x", "t1", "",
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}, nil, resolveTenantRetentionBudget(b.cfg, "t1"))
 	assert.False(t, refuse,
 		"a retention-store read error must NOT refuse (refuse destroys volumes; fail-open is data-safe)")
 	assert.Equal(t, refuseGetBefore+1, testutil.ToFloat64(retentionCapCheckFailedTotal.WithLabelValues(capCheckRefuseGet)),
@@ -434,7 +454,7 @@ func TestCloseRetainOrdering_NeverUnderCounts(t *testing.T) {
 	require.Equal(t, int64(0), s.RetainedDiskMB)
 
 	// Write the retained record (models doDeprovision having called PutActiveMerged).
-	require.NoError(t, rs.Put(retentionEntryFixture("lease-x", "t1", time.Now()))) // active, 2×512=1024 MB
+	require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("lease-x", "t1", time.Now()))) // active, 2×512=1024 MB
 
 	// The correct hand-off order: refresh (counts F as retained) THEN release
 	// (removes F from live). At every observed step, live+retained >= F.
@@ -496,6 +516,7 @@ func TestCloseRetainOrdering_FailedRetainKeepsLiveCounted(t *testing.T) {
 // and refresh the footprint was counted in neither pool — a concurrent
 // TryAllocate could over-admit (ENOSPC).
 func TestDeprovision_RetainHandoff_LiveMovesToRetained(t *testing.T) {
+	leaseUUID := canonicalRetentionFixtureUUID("lease-z")
 	callbackDone := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -506,25 +527,19 @@ func TestDeprovision_RetainHandoff_LiveMovesToRetained(t *testing.T) {
 	}))
 	defer server.Close()
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "retention.db"),
-	})
-	require.NoError(t, err)
-	defer rs.Close()
-
 	// docker-micro at 512 MB to match the pool resolver (defaultTestSKUProfiles).
 	// Qty=2 → footprint F = 1024 MB.
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
-	canonical0 := canonicalVolumeName("lease-z", "web", 0)
-	canonical1 := canonicalVolumeName("lease-z", "web", 1)
+	canonical0 := canonicalVolumeName(leaseUUID, "web", 0)
+	canonical1 := canonicalVolumeName(leaseUUID, "web", 1)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-z": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-z", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
 		}},
@@ -532,31 +547,19 @@ func TestDeprovision_RetainHandoff_LiveMovesToRetained(t *testing.T) {
 
 	// Use 512 MB to match the pool resolver for docker-micro.
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	seedProvisionReleaseFromProjectionForBackendTest(t, b, leaseUUID)
 
 	// Pre-allocate the lease's footprint in the pool (simulates a live provision).
-	require.NoError(t, b.pool.TryAllocate("lease-z-web-0", "docker-micro", "tenant-a"))
-	require.NoError(t, b.pool.TryAllocate("lease-z-web-1", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-1", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=1024 MB")
 
-	b.volumes = &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			return []string{canonical0, canonical1}, nil
-		},
-		RenameVolumeFn: func(_, _ string) error { return nil },
-	}
+	b.volumes = newVolumeSet(canonical0, canonical1).manager()
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-z"))
-
-	// Wait for the terminal callback so the deferred hand-off has run.
-	select {
-	case <-callbackDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for deprovisioned callback")
-	}
+	require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
 
 	s := b.pool.Stats()
 	// After a successful retain close:
@@ -579,6 +582,7 @@ func TestDeprovision_RetainHandoff_LiveMovesToRetained(t *testing.T) {
 // This is an end-to-end drive of the real doDeprovision; the volume fake records
 // Destroy calls so the test can assert the volumes were destroyed, not retained.
 func TestDeprovision_BranchSelection_OverCap(t *testing.T) {
+	leaseUUID := canonicalRetentionFixtureUUID("lease-oc")
 	callbackDone := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -589,66 +593,53 @@ func TestDeprovision_BranchSelection_OverCap(t *testing.T) {
 	}))
 	defer server.Close()
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "retention.db"),
-	})
-	require.NoError(t, err)
-	defer rs.Close()
-
 	// docker-micro at 512 MB; qty=2 → footprint F = 1024 MB.
 	// Cap = 500 MB < 1024 MB → shouldRefuseRetention returns true (breach).
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
-	canonical0 := canonicalVolumeName("lease-oc", "web", 0)
-	canonical1 := canonicalVolumeName("lease-oc", "web", 1)
+	canonical0 := canonicalVolumeName(leaseUUID, "web", 0)
+	canonical1 := canonicalVolumeName(leaseUUID, "web", 1)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-oc": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-oc", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
 		}},
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	rs := b.retentionStore
 	b.cfg.RetainOnClose = true
 	b.cfg.MaxRetainedDiskMB = 500 // tight: 1024 MB lease breaches immediately
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	seedProvisionReleaseFromProjectionForBackendTest(t, b, leaseUUID)
 
-	require.NoError(t, b.pool.TryAllocate("lease-oc-web-0", "docker-micro", "tenant-a"))
-	require.NoError(t, b.pool.TryAllocate("lease-oc-web-1", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-1", "docker-micro", "tenant-a"))
 
 	// Track which volumes were destroyed vs renamed.
 	var destroyed []string
 	var renamed [][2]string
+	inventory := newVolumeSet(canonical0, canonical1)
 	b.volumes = &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			return []string{canonical0, canonical1}, nil
-		},
+		ListFn: inventory.list,
 		DestroyFn: func(_ context.Context, id string) error {
 			destroyed = append(destroyed, id)
-			return nil
+			return inventory.destroy(context.Background(), id)
 		},
 		RenameVolumeFn: func(old, newName string) error {
 			renamed = append(renamed, [2]string{old, newName})
-			return nil
+			return inventory.rename(old, newName)
 		},
 	}
 
 	before := testutil.ToFloat64(retentionRefusedTotal)
-	require.NoError(t, b.Deprovision(context.Background(), "lease-oc"))
-
-	// Wait for terminal callback (deferred accounting runs before it).
-	select {
-	case <-callbackDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for deprovisioned callback")
-	}
+	require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
 
 	// Volumes must be DESTROYED (not renamed).
 	assert.ElementsMatch(t, []string{canonical0, canonical1}, destroyed,
@@ -660,7 +651,7 @@ func TestDeprovision_BranchSelection_OverCap(t *testing.T) {
 		"over-cap: retention_refused_total must increment by 1")
 
 	// No retention record must exist in the store.
-	rec, err := rs.Get("lease-oc")
+	rec, err := rs.Get(leaseUUID)
 	require.NoError(t, err)
 	assert.Nil(t, rec, "over-cap: no active retention record must be written")
 }
@@ -674,6 +665,7 @@ func TestDeprovision_BranchSelection_OverCap(t *testing.T) {
 // This is the inverse of TestDeprovision_BranchSelection_OverCap and together
 // they pin the branch-selecting predicate inside doDeprovision end-to-end.
 func TestDeprovision_BranchSelection_UnderCap(t *testing.T) {
+	leaseUUID := canonicalRetentionFixtureUUID("lease-uc")
 	callbackDone := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -684,66 +676,53 @@ func TestDeprovision_BranchSelection_UnderCap(t *testing.T) {
 	}))
 	defer server.Close()
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "retention.db"),
-	})
-	require.NoError(t, err)
-	defer rs.Close()
-
 	// docker-micro at 512 MB; qty=2 → footprint F = 1024 MB.
 	// Cap = 0 (unlimited) → shouldRefuseRetention returns false immediately.
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
-	canonical0 := canonicalVolumeName("lease-uc", "web", 0)
-	canonical1 := canonicalVolumeName("lease-uc", "web", 1)
+	canonical0 := canonicalVolumeName(leaseUUID, "web", 0)
+	canonical1 := canonicalVolumeName(leaseUUID, "web", 1)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-uc": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-uc", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
 		}},
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	rs := b.retentionStore
 	b.cfg.RetainOnClose = true
 	b.cfg.MaxRetainedDiskMB = 0 // unlimited: never refuse
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	seedProvisionReleaseFromProjectionForBackendTest(t, b, leaseUUID)
 
-	require.NoError(t, b.pool.TryAllocate("lease-uc-web-0", "docker-micro", "tenant-a"))
-	require.NoError(t, b.pool.TryAllocate("lease-uc-web-1", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-1", "docker-micro", "tenant-a"))
 
 	// Track which volumes were renamed vs destroyed.
 	var destroyed []string
 	var renamed [][2]string
+	inventory := newVolumeSet(canonical0, canonical1)
 	b.volumes = &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			return []string{canonical0, canonical1}, nil
-		},
+		ListFn: inventory.list,
 		DestroyFn: func(_ context.Context, id string) error {
 			destroyed = append(destroyed, id)
-			return nil
+			return inventory.destroy(context.Background(), id)
 		},
 		RenameVolumeFn: func(old, newName string) error {
 			renamed = append(renamed, [2]string{old, newName})
-			return nil
+			return inventory.rename(old, newName)
 		},
 	}
 
 	before := testutil.ToFloat64(retentionRefusedTotal)
-	require.NoError(t, b.Deprovision(context.Background(), "lease-uc"))
-
-	// Wait for terminal callback (deferred accounting runs before it).
-	select {
-	case <-callbackDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for deprovisioned callback")
-	}
+	require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
 
 	// Volumes must be RENAMED into retained namespace (not destroyed).
 	assert.Empty(t, destroyed, "under-cap: no volumes must be destroyed")
@@ -760,7 +739,7 @@ func TestDeprovision_BranchSelection_UnderCap(t *testing.T) {
 		"under-cap: retention_refused_total must not increment")
 
 	// An ACTIVE retention record must exist in the store.
-	rec, err := rs.Get("lease-uc")
+	rec, err := rs.Get(leaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, rec, "under-cap: an active retention record must be written")
 	assert.Equal(t, shared.RetentionStatusActive, rec.Status,
@@ -772,39 +751,34 @@ func TestDeprovision_BranchSelection_UnderCap(t *testing.T) {
 // live pool allocation is NOT released. Volumes are still on disk under canonical
 // names; releasing live would open a window where F is counted in neither pool.
 func TestDeprovision_RetainFailure_KeepsLiveCounted(t *testing.T) {
+	leaseUUID := canonicalRetentionFixtureUUID("lease-w")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "retention.db"),
-	})
-	require.NoError(t, err)
-	defer rs.Close()
-
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
-	canonical := canonicalVolumeName("lease-w", "web", 0)
+	canonical := canonicalVolumeName(leaseUUID, "web", 0)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-w": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-w", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
 		}},
 	})
 
 	withMicroSKU(b, 512) // F = 1 × 512 = 512 MB
-	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	seedProvisionReleaseFromProjectionForBackendTest(t, b, leaseUUID)
 
-	require.NoError(t, b.pool.TryAllocate("lease-w-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
 
 	b.volumes = &mockVolumeManager{
@@ -815,7 +789,7 @@ func TestDeprovision_RetainFailure_KeepsLiveCounted(t *testing.T) {
 	}
 
 	// Rename failure → volume-cleanup error (under limit) → returns error, lease kept Failed.
-	err = b.Deprovision(context.Background(), "lease-w")
+	err := b.Deprovision(context.Background(), leaseUUID)
 	require.Error(t, err, "rename failure must bubble as a volume-cleanup error")
 
 	// The live allocation must NOT have been released — the volume is still on
@@ -826,77 +800,6 @@ func TestDeprovision_RetainFailure_KeepsLiveCounted(t *testing.T) {
 		"after failed retain close, live must remain counted (volume still on disk under canonical name)")
 }
 
-// TestDeprovision_RetainGiveUp_ReleasesLive verifies that when a retain close
-// exhausts maxVolumeCleanupAttempts (rename keeps failing), the give-up branch
-// — which deletes the provision and returns nil so no retry can ever run — still
-// releases the live pool allocation. Without this, live would leak forever
-// (allocatedDisk never returns to 0) AND, if a retention record was written,
-// the footprint would be double-counted as both live and retained (2F), wedging
-// any later restore via the pool's "already has allocated resources" guard.
-func TestDeprovision_RetainGiveUp_ReleasesLive(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "retention.db"),
-	})
-	require.NoError(t, err)
-	defer rs.Close()
-
-	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
-	canonical := canonicalVolumeName("lease-g", "web", 0)
-
-	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-g": {
-			ProvisionState: leasesm.ProvisionState{
-				LeaseUUID: "lease-g", Tenant: "tenant-a", ProviderUUID: "prov-1",
-				Status:        backend.ProvisionStatusReady,
-				ContainerIDs:  []string{"c1"},
-				CallbackURL:   server.URL,
-				Items:         items,
-				StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
-			},
-			// One short of the limit so a single Deprovision (increment to the
-			// limit) hits the give-up branch immediately.
-			VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1,
-		},
-	})
-
-	withMicroSKU(b, 512) // F = 1 × 512 = 512 MB
-	b.retentionStore = rs
-	b.cfg.RetainOnClose = true
-	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b, server.Client())
-
-	require.NoError(t, b.pool.TryAllocate("lease-g-web-0", "docker-micro", "tenant-a"))
-	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
-
-	b.volumes = &mockVolumeManager{
-		ListFn: func() ([]string, error) { return []string{canonical}, nil },
-		RenameVolumeFn: func(_, _ string) error {
-			return fmt.Errorf("rename failed: disk full")
-		},
-	}
-
-	// Give-up branch returns nil (not an error) — the lease is abandoned.
-	require.NoError(t, b.Deprovision(context.Background(), "lease-g"))
-
-	// Provision is gone (give-up deletes it).
-	b.provisionsMu.RLock()
-	_, ok := b.provisions["lease-g"]
-	b.provisionsMu.RUnlock()
-	require.False(t, ok, "provision must be deleted after give-up")
-
-	// Live MUST be released even on the abandoned retain path — otherwise it
-	// leaks forever (no retry left) and double-counts against retained.
-	s := b.pool.Stats()
-	assert.Equal(t, int64(0), s.AllocatedDiskMB,
-		"give-up branch must release live (no leak); was %d", s.AllocatedDiskMB)
-}
-
 // TestDeprovision_RetainListError_KeepsLiveCounted verifies that when the
 // retain path cannot enumerate the lease's volumes (List() errors), the live
 // allocation is NOT released. The volumes are likely still on disk (List just
@@ -904,38 +807,33 @@ func TestDeprovision_RetainGiveUp_ReleasesLive(t *testing.T) {
 // would leave the footprint counted in neither pool → over-admit. The lease must
 // keep live counted and retry on a later attempt.
 func TestDeprovision_RetainListError_KeepsLiveCounted(t *testing.T) {
+	leaseUUID := canonicalRetentionFixtureUUID("lease-le")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "retention.db"),
-	})
-	require.NoError(t, err)
-	defer rs.Close()
-
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-le": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-le", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
 		}},
 	})
 
 	withMicroSKU(b, 512) // F = 512 MB
-	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	seedProvisionReleaseFromProjectionForBackendTest(t, b, leaseUUID)
 
-	require.NoError(t, b.pool.TryAllocate("lease-le-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
 
 	// List() errors → canonical stays empty, but volumes are NOT actually absent.
@@ -944,7 +842,7 @@ func TestDeprovision_RetainListError_KeepsLiveCounted(t *testing.T) {
 	}
 
 	// The List error surfaces as a volume-cleanup error → under-limit retry path.
-	err = b.Deprovision(context.Background(), "lease-le")
+	err := b.Deprovision(context.Background(), leaseUUID)
 	require.Error(t, err, "a List error must bubble as a volume-cleanup error (keep lease for retry)")
 
 	// Live MUST remain counted — the volumes were never confirmed absent, so the
@@ -970,8 +868,8 @@ func TestRestoreRollback_Success_HandsOffLiveToRetained(t *testing.T) {
 	// qty=1 → footprint F = 512 MB.
 	withMicroSKU(b, 512)
 
-	origLease := "orig-lease"
-	newLease := "new-lease"
+	origLease := canonicalRetentionFixtureUUID("orig-lease")
+	newLease := canonicalRetentionFixtureUUID("new-lease")
 
 	// Write a restoring retention record for the original lease.
 	rec := shared.RetentionEntry{
@@ -981,26 +879,26 @@ func TestRestoreRollback_Success_HandsOffLiveToRetained(t *testing.T) {
 		Status:              shared.RetentionStatusRestoring,
 		Generation:          1,
 		Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
-		RetainedVolumeNames: []string{"fred-retained-orig-lease-web-0"},
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(origLease, "web", 0))},
 	}
-	require.NoError(t, rs.Put(rec))
+	rec = *putRestoringRetention(t, rs, rec)
 
 	// Allocate the new-lease live footprint in the pool (simulates the restore
 	// pool allocation from Restore() step c). The allocation id format must
 	// match what rollbackRestoreAdoption passes to releaseAll.
-	allocID := newLease + "-web-0"
+	allocID := rec.NewLeaseUUID + "-web-0"
 	require.NoError(t, b.pool.TryAllocate(allocID, "docker-micro", "t1"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
 	require.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB, "pre-condition: retained=0 (record is restoring)")
 
 	// RenameVolume SUCCEEDS → rollback can revert the record to active.
-	b.volumes = &mockVolumeManager{
-		RenameVolumeFn: func(_, _ string) error { return nil },
-	}
+	volumes := newVolumeSet(canonicalVolumeName(rec.NewLeaseUUID, "web", 0)).manager()
+	volumes.UsageFn = func(context.Context, string) (int64, error) { return 0, nil }
+	b.volumes = volumes
 
 	logger := slog.Default()
 	// dropProvision=false: no provision entry to remove, avoids a map write under provisionsMu.
-	b.rollbackRestoreAdoption(context.Background(), newLease, []string{allocID}, &rec, false, logger)
+	b.rollbackRestoreAdoption(context.Background(), rec.NewLeaseUUID, []string{allocID}, &rec, false, logger)
 
 	s := b.pool.Stats()
 	assert.Equal(t, int64(0), s.AllocatedDiskMB,
@@ -1033,7 +931,7 @@ func TestRestoreRollback_FailedRequarantine_KeepsLiveCounted(t *testing.T) {
 		Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
 		RetainedVolumeNames: []string{"fred-retained-orig-lease2-web-0"},
 	}
-	require.NoError(t, rs.Put(rec))
+	rec = *putRestoringRetention(t, rs, rec)
 
 	allocID := newLease + "-web-0"
 	require.NoError(t, b.pool.TryAllocate(allocID, "docker-micro", "t1"))
@@ -1060,7 +958,7 @@ func TestRestoreRollback_FailedRequarantine_KeepsLiveCounted(t *testing.T) {
 //
 // Before the fix: reconcileRestoring called removeProvision (map delete) but never
 // pool.Release → the new-lease live allocation lingered → retained F counted
-// (from refreshRetentionAccounting after RevertToActive) + live F still counted =
+// (from refreshRetentionAccounting after RevertToActiveWithResourceProfiles) + live F still counted =
 // 2F over-count (over-deny, data-safe, but a real steady-state inaccuracy).
 //
 // Post-fix invariant: AllocatedDiskMB == 0 AND RetainedDiskMB == F (= 512 MB).
@@ -1070,20 +968,25 @@ func TestReconcileRestoring_OrphanedArm_ReleasesNewLeaseLive(t *testing.T) {
 	// qty=1 → footprint F = 512 MB.
 	withMicroSKU(b, 512)
 
-	origLease := "orig-orphaned"
-	newLease := "new-orphaned"
+	origLease := "0192f1a0-1111-4abc-8def-000000000a01"
+	newLease := "0192f1a0-2222-4abc-8def-000000000a02"
 
 	// Write a restoring retention record for the original lease.
 	entry := shared.RetentionEntry{
-		OriginalLeaseUUID:   origLease,
-		NewLeaseUUID:        newLease,
-		Tenant:              "t1",
-		Status:              shared.RetentionStatusRestoring,
-		Generation:          1,
-		Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
-		RetainedVolumeNames: []string{"fred-retained-orig-orphaned-web-0"},
+		OriginalLeaseUUID: origLease,
+		NewLeaseUUID:      newLease,
+		Tenant:            "t1",
+		ProviderUUID:      nominalDockerProviderUUID,
+		Status:            shared.RetentionStatusRestoring,
+		Generation:        1,
+		Items:             []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
+		StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+			"web": {Image: "nginx:latest"},
+		}},
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(origLease, "web", 0))},
 	}
-	require.NoError(t, rs.Put(entry))
+	entry = *putRestoringRetention(t, rs, entry)
+	recordRestoreOperationOutcome(t, b, entry, backend.CallbackStatusFailed)
 
 	// Allocate the new-lease live footprint (simulates the pool allocation from
 	// Restore() step c). The id scheme matches {newLease}-{svc}-{idx}.
@@ -1098,6 +1001,7 @@ func TestReconcileRestoring_OrphanedArm_ReleasesNewLeaseLive(t *testing.T) {
 	// RenameVolume SUCCEEDS → re-quarantine works, orphaned arm can revert.
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(_, _ string) error { return nil },
+		UsageFn:        func(context.Context, string) (int64, error) { return 0, nil },
 	}
 	// compose.Down must succeed (default mockComposeExecutor.DownFn is nil → no-op).
 
@@ -1119,6 +1023,7 @@ func TestReconcileRestoring_OrphanedArm_ReleasesNewLeaseLive(t *testing.T) {
 // This guards against a future refactor that unconditionally sets
 // releaseLiveOnRetainPath=true on the refuse branch regardless of destroy errors.
 func TestDeprovision_RefuseToRetain_DestroyFailure_KeepsLiveCounted(t *testing.T) {
+	leaseUUID := canonicalRetentionFixtureUUID("lease-rf")
 	callbackDone := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1129,39 +1034,34 @@ func TestDeprovision_RefuseToRetain_DestroyFailure_KeepsLiveCounted(t *testing.T
 	}))
 	defer server.Close()
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "retention.db"),
-	})
-	require.NoError(t, err)
-	defer rs.Close()
-
 	// docker-micro at 512 MB; qty=2 → footprint F = 1024 MB.
 	// Cap = 500 MB < 1024 MB → shouldRefuseRetention returns true (breach).
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
-	canonical0 := canonicalVolumeName("lease-rf", "web", 0)
-	canonical1 := canonicalVolumeName("lease-rf", "web", 1)
+	canonical0 := canonicalVolumeName(leaseUUID, "web", 0)
+	canonical1 := canonicalVolumeName(leaseUUID, "web", 1)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-rf": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-rf", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
 		}},
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	rs := b.retentionStore
 	b.cfg.RetainOnClose = true
 	b.cfg.MaxRetainedDiskMB = 500 // tight: 1024 MB lease breaches immediately
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	seedProvisionReleaseFromProjectionForBackendTest(t, b, leaseUUID)
 
-	require.NoError(t, b.pool.TryAllocate("lease-rf-web-0", "docker-micro", "tenant-a"))
-	require.NoError(t, b.pool.TryAllocate("lease-rf-web-1", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-1", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=1024 MB")
 
 	// Destroy FAILS → volumes may still be on disk; live must remain counted.
@@ -1175,8 +1075,8 @@ func TestDeprovision_RefuseToRetain_DestroyFailure_KeepsLiveCounted(t *testing.T
 	}
 
 	// Deprovision returns an error (volume cleanup failed) and the lease is kept
-	// Failed for retry — not the give-up path (VolumeCleanupAttempts < max).
-	err = b.Deprovision(context.Background(), "lease-rf")
+	// Incomplete physical cleanup remains durably pending and retryable.
+	err := b.Deprovision(context.Background(), leaseUUID)
 	require.Error(t, err, "destroy failure must bubble as a volume-cleanup error")
 
 	// The live allocation must NOT have been released.
@@ -1185,7 +1085,7 @@ func TestDeprovision_RefuseToRetain_DestroyFailure_KeepsLiveCounted(t *testing.T
 		"refuse-to-retain destroy failure: live must remain counted (volumes still on disk, not released)")
 
 	// No retention record must have been written (refuse path never writes a record).
-	rec, rerr := rs.Get("lease-rf")
+	rec, rerr := rs.Get(leaseUUID)
 	require.NoError(t, rerr)
 	assert.Nil(t, rec, "refuse-to-retain: no retention record must be written")
 }
@@ -1200,6 +1100,7 @@ func TestDeprovision_RefuseToRetain_DestroyFailure_KeepsLiveCounted(t *testing.T
 // This test MUST fail before Fix A (live drops to 0 on Destroy error) and pass
 // after (live stays at F until all volumes are destroyed without error).
 func TestDeprovision_NonRetain_DestroyFailure_KeepsLiveCounted(t *testing.T) {
+	leaseUUID := canonicalRetentionFixtureUUID("lease-nd")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -1210,13 +1111,13 @@ func TestDeprovision_NonRetain_DestroyFailure_KeepsLiveCounted(t *testing.T) {
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-nd": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:     "lease-nd",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     leaseUUID,
 			Tenant:        "tenant-a",
-			ProviderUUID:  "prov-1",
+			ProviderUUID:  nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
 		}},
@@ -1226,23 +1127,27 @@ func TestDeprovision_NonRetain_DestroyFailure_KeepsLiveCounted(t *testing.T) {
 	// RetainOnClose stays false (default) — non-retain close.
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	seedProvisionReleaseFromProjectionForBackendTest(t, b, leaseUUID)
 
-	require.NoError(t, b.pool.TryAllocate("lease-nd-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
 
 	// Destroy FAILS → volume still on disk; lease kept Failed for retry.
 	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			return []string{canonicalVolumeName(leaseUUID, "web", 0)}, nil
+		},
 		DestroyFn: func(_ context.Context, _ string) error {
 			return fmt.Errorf("destroy failed: device busy")
 		},
 	}
 
-	err := b.Deprovision(context.Background(), "lease-nd")
+	err := b.Deprovision(context.Background(), leaseUUID)
 	require.Error(t, err, "volume destroy failure must return an error")
 
 	// Lease must be kept Failed for retry (not deleted).
 	b.provisionsMu.RLock()
-	p, ok := b.provisions["lease-nd"]
+	p, ok := b.provisions[leaseUUID]
 	var gotStatus backend.ProvisionStatus
 	if ok {
 		gotStatus = p.Status
@@ -1262,6 +1167,7 @@ func TestDeprovision_NonRetain_DestroyFailure_KeepsLiveCounted(t *testing.T) {
 // path, when ALL volumes are destroyed successfully, the live pool allocation IS
 // released. This guards that the moved release still fires on the happy path.
 func TestDeprovision_NonRetain_Success_ReleasesLive(t *testing.T) {
+	leaseUUID := canonicalRetentionFixtureUUID("lease-ns")
 	callbackDone := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1276,13 +1182,13 @@ func TestDeprovision_NonRetain_Success_ReleasesLive(t *testing.T) {
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-ns": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:     "lease-ns",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:     leaseUUID,
 			Tenant:        "tenant-a",
-			ProviderUUID:  "prov-1",
+			ProviderUUID:  nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
 		}},
@@ -1291,23 +1197,15 @@ func TestDeprovision_NonRetain_Success_ReleasesLive(t *testing.T) {
 	withMicroSKU(b, 512) // F = 512 MB
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	seedProvisionReleaseFromProjectionForBackendTest(t, b, leaseUUID)
 
-	require.NoError(t, b.pool.TryAllocate("lease-ns-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
 
 	// Destroy succeeds → all bytes are gone; live must be released.
-	b.volumes = &mockVolumeManager{
-		DestroyFn: func(_ context.Context, _ string) error { return nil },
-	}
+	b.volumes = newVolumeSet(canonicalVolumeName(leaseUUID, "web", 0)).manager()
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-ns"))
-
-	// Wait for terminal callback to ensure the deferred accounting has run.
-	select {
-	case <-callbackDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for deprovisioned callback")
-	}
+	require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
 
 	// Live MUST be released — all bytes are gone.
 	s := b.pool.Stats()
@@ -1316,7 +1214,7 @@ func TestDeprovision_NonRetain_Success_ReleasesLive(t *testing.T) {
 
 	// Provision must be deleted (not kept).
 	b.provisionsMu.RLock()
-	_, ok := b.provisions["lease-ns"]
+	_, ok := b.provisions[leaseUUID]
 	b.provisionsMu.RUnlock()
 	assert.False(t, ok, "provision must be deleted after successful non-retain close")
 }
@@ -1328,6 +1226,7 @@ func TestDeprovision_NonRetain_Success_ReleasesLive(t *testing.T) {
 // release must run only AFTER teardown succeeds; otherwise CPU/mem/disk are
 // freed while the stuck containers still run → undercount → over-admit (ENOSPC).
 func TestDeprovision_NonRetainPartialFailure_KeepsLiveCounted(t *testing.T) {
+	leaseUUID := canonicalRetentionFixtureUUID("lease-pf")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -1346,11 +1245,11 @@ func TestDeprovision_NonRetainPartialFailure_KeepsLiveCounted(t *testing.T) {
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) { return nil, nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-pf": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-pf", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
 		}},
@@ -1365,17 +1264,35 @@ func TestDeprovision_NonRetainPartialFailure_KeepsLiveCounted(t *testing.T) {
 	// RetainOnClose stays false (default) — pure non-retain close.
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	seedProvisionReleaseFromProjectionForBackendTest(t, b, leaseUUID)
+	b.provisionsMu.RLock()
+	runtimeCallbackURL := b.provisions[leaseUUID].CallbackURL
+	runtimeLifecycleURL := b.provisions[leaseUUID].LifecycleCallbackURL
+	b.provisionsMu.RUnlock()
+	mock.InspectContainerFn = func(_ context.Context, containerID string) (*ContainerInfo, error) {
+		if containerID != "c1" {
+			return nil, fmt.Errorf("unexpected container %q", containerID)
+		}
+		return &ContainerInfo{
+			ContainerID: "c1", Name: "fred-" + leaseUUID + "-web-0",
+			LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+			BackendName: "docker", SKU: "docker-micro", ServiceName: "web", InstanceIndex: 0,
+			Image: "nginx:1.25", CallbackURL: runtimeCallbackURL,
+			LifecycleCallbackURL: runtimeLifecycleURL, Status: "running",
+		}, nil
+	}
 
-	require.NoError(t, b.pool.TryAllocate("lease-pf-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
 
 	// Partial container-teardown failure → returns an error, lease kept Failed.
-	err := b.Deprovision(context.Background(), "lease-pf")
-	require.Error(t, err, "a partial container-teardown failure must return an error")
+	err := b.Deprovision(context.Background(), leaseUUID)
+	require.ErrorContains(t, err, "container stuck",
+		"the test must reach the intended exact-container removal failure")
 
 	// The lease is kept visible in Failed with the stuck container for retry.
 	b.provisionsMu.RLock()
-	p, ok := b.provisions["lease-pf"]
+	p, ok := b.provisions[leaseUUID]
 	var gotStatus backend.ProvisionStatus
 	if ok {
 		gotStatus = p.Status
@@ -1401,7 +1318,7 @@ func TestRefreshRetentionAccounting_StoreError_KeepsLastValue(t *testing.T) {
 	withMicroSKU(b, 1024)
 
 	// Seed one ACTIVE record with a known footprint F = 2 * 1024 = 2048 MB.
-	require.NoError(t, rs.Put(retentionEntryFixture("lease-a", "t1", time.Now())))
+	require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("lease-a", "t1", time.Now())))
 
 	// First refresh with a working store → pool must reflect F.
 	b.refreshRetentionAccounting()
@@ -1421,39 +1338,6 @@ func TestRefreshRetentionAccounting_StoreError_KeepsLastValue(t *testing.T) {
 		"store error must keep the last valid retained projection (not reset to 0)")
 }
 
-// TestComputeRetainedDiskMB_UnknownSKUInActiveRecord (G2) verifies that when
-// an ACTIVE retention record references a mix of a resolvable SKU and an
-// unresolvable one, computeRetainedDiskMB:
-//   - returns err == nil (the unknown SKU is only a warn, not a fatal error),
-//   - includes the record in the count,
-//   - sums only the resolvable item's DiskMB×Quantity (the unknown item
-//     contributes 0 — conservative undercount, flagged by the WARN log).
-func TestComputeRetainedDiskMB_UnknownSKUInActiveRecord(t *testing.T) {
-	b, rs := newBackendWithRetention(t)
-	// Only "docker-micro" is known; "ghost-sku" is absent.
-	withMicroSKU(b, 1024)
-
-	// One ACTIVE record whose Items mix a resolvable and an unresolvable SKU.
-	// docker-micro qty=2 → 2 * 1024 = 2048 MB (resolvable).
-	// ghost-sku qty=3 → 0 MB (unresolvable → skipped + logged).
-	e := retentionEntryFixture("lease-mixed", "t1", time.Now())
-	e.Items = []backend.LeaseItem{
-		{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
-		{SKU: "ghost-sku", Quantity: 3, ServiceName: "db"},
-	}
-	require.NoError(t, rs.Put(e))
-
-	mb, count, _, err := b.computeRetainedDiskMB()
-
-	// Must not error — unknown SKU is a warn-and-undercount, not a fatal.
-	require.NoError(t, err)
-	// The record IS counted (even with a partially-unresolvable Items set).
-	assert.Equal(t, 1, count, "record with mixed SKUs must still be counted")
-	// Only the resolvable docker-micro contributes; ghost-sku contributes 0.
-	assert.Equal(t, int64(2048), mb,
-		"unknown SKU must contribute 0 to the disk projection (resolvable part only)")
-}
-
 // TestRefreshCountsReapingInPoolNotCap verifies a reaping record's footprint is
 // included in the admission pool (SetRetainedDisk) and the reaping gauges, but is
 // EXCLUDED from computeRetainedDiskMB (the active-only cap-breach input — a destroy
@@ -1463,10 +1347,10 @@ func TestRefreshCountsReapingInPoolNotCap(t *testing.T) {
 	withMicroSKU(b, 1024)
 
 	active := retentionEntryFixture("lease-a", "t1", time.Now()) // qty 2 → 2048 MB
-	require.NoError(t, rs.Put(active))
+	require.NoError(t, putRetentionForTest(t, rs, active))
 	reaping := retentionEntryFixture("lease-b", "t1", time.Now()) // qty 2 → 2048 MB
 	reaping.Status = shared.RetentionStatusReaping
-	require.NoError(t, rs.Put(reaping))
+	require.NoError(t, putRetentionForTest(t, rs, reaping))
 
 	// Cap-breach input stays active-only (data-safe destroy direction).
 	activeMB, activeCount, _, err := b.computeRetainedDiskMB()
@@ -1546,7 +1430,7 @@ func TestBreachRetentionCaps_Scopes(t *testing.T) {
 		e := shared.RetentionEntry{OriginalLeaseUUID: uuid, Tenant: tenant, ProviderUUID: "prov-1",
 			Items: items, StackManifest: &manifest.StackManifest{}, Status: shared.RetentionStatusActive,
 			Partition: part, CreatedAt: time.Now()}
-		require.NoError(t, rs.Put(e))
+		require.NoError(t, putRetentionForTest(t, rs, e))
 	}
 	put("s-1", "agg", "p1")
 	put("s-2", "agg", "")
@@ -1615,7 +1499,7 @@ func TestBreachRetentionCaps_L1Only_TenantIsolated(t *testing.T) {
 	b.cfg.MaxRetainedDiskMB = 0 // global L0 unlimited
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}
 	put := func(uuid, tenant string) {
-		require.NoError(t, rs.Put(shared.RetentionEntry{
+		require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
 			OriginalLeaseUUID: uuid, Tenant: tenant, ProviderUUID: "prov-1", Items: items,
 			StackManifest: &manifest.StackManifest{}, Status: shared.RetentionStatusActive, CreatedAt: time.Now(),
 		}))
@@ -1636,33 +1520,6 @@ func TestBreachRetentionCaps_L1Only_TenantIsolated(t *testing.T) {
 	scope, breached := b.breachRetentionCaps("agg", "", items, budget)
 	require.True(t, breached)
 	require.Equal(t, refuseScopeTenant, scope)
-}
-
-// TestBreachRetentionCaps_L1Only_SkipsNeighborSKUScan pins the observable effect
-// of the L0-off fast path: the gate reads only the closing tenant's records, so a
-// NEIGHBOR tenant's unknown SKU is not surfaced here (it is reported store-wide by
-// refreshRetentionAccounting instead). This also proves the neighbor is not scanned.
-func TestBreachRetentionCaps_L1Only_SkipsNeighborSKUScan(t *testing.T) {
-	b, rs := newBackendWithRetention(t)
-	withMicroSKU(b, 1024)
-	b.cfg.MaxRetainedDiskMB = 0 // global L0 unlimited → tenant-scoped read
-	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID: "agg-1", Tenant: "agg", ProviderUUID: "prov-1", Items: items,
-		StackManifest: &manifest.StackManifest{}, Status: shared.RetentionStatusActive, CreatedAt: time.Now(),
-	}))
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID: "other-1", Tenant: "other", ProviderUUID: "prov-1",
-		Items:         []backend.LeaseItem{{SKU: "ghost-sku", Quantity: 1, ServiceName: "app"}},
-		StackManifest: &manifest.StackManifest{}, Status: shared.RetentionStatusActive, CreatedAt: time.Now(),
-	}))
-
-	var buf bytes.Buffer
-	b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	_, _ = b.breachRetentionCaps("agg", "", items, retentionBudget{CountCap: 100, DiskCapMB: 2500})
-
-	require.NotContains(t, buf.String(), "ghost-sku",
-		"L0-off gate must read only the closing tenant, not scan the neighbor's records")
 }
 
 // TestLogRetentionBudgetSanity_WarnsWhenOverHoldings: a budget below the tenant's
@@ -1711,33 +1568,6 @@ func TestLogRetentionBudgetSanity_InfoWhenWithinBudget(t *testing.T) {
 	require.Contains(t, out, "retention budget sanity")
 	require.Contains(t, out, "tenant=agg")
 	require.NotContains(t, out, "retention budget below tenant's current holdings")
-}
-
-// TestLogRetentionBudgetSanity_SurfacesUnresolvedSKUs: an active retained lease
-// that references an unknown SKU makes active_mb an UNDERCOUNT (the unknown item
-// contributes 0), so a "within budget" reading can be silently wrong. The sanity
-// line must name the unresolved SKU(s) — the one leaseDiskMB caller that used to
-// discard them.
-func TestLogRetentionBudgetSanity_SurfacesUnresolvedSKUs(t *testing.T) {
-	b, rs := newBackendWithRetention(t)
-	withMicroSKU(b, 1024)
-	b.cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
-		"agg": {MaxRetainedLeases: 10, MaxRetainedDiskMB: 500000, MaxPartitions: 4},
-	}
-	e := retentionEntryFixture("lease-ghost", "agg", time.Now().Add(-time.Hour))
-	e.Items = []backend.LeaseItem{
-		{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
-		{SKU: "ghost-sku", Quantity: 1, ServiceName: "db"},
-	}
-	require.NoError(t, rs.Put(e))
-
-	var buf bytes.Buffer
-	b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	b.logRetentionBudgetSanity()
-
-	out := buf.String()
-	require.Contains(t, out, "unresolved_skus", "sanity line must flag the undercount")
-	require.Contains(t, out, "ghost-sku")
 }
 
 // TestRetentionPartitionsGauge pins the retention_partitions gauge: it counts
