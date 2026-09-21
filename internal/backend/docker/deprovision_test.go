@@ -96,13 +96,24 @@ func TestDoDeprovision_ReleaseDeleteFailureRemainsRetryable(t *testing.T) {
 	}}
 
 	err = b.doDeprovisionForTest(t, context.Background(), leaseUUID)
-	// Closing the authoritative store also invalidates the bound diagnostic
-	// handoff, so close must stop before either terminal publication or release
-	// retirement can proceed with unavailable authority.
-	require.ErrorContains(t, err, "publish interrupted close diagnostics")
+	// Closing the authoritative store invalidates terminal authority. Assert
+	// the preserved retry state, independently of which proof first refuses it.
+	require.Error(t, err)
 	prov, exists := b.provisions[leaseUUID]
 	require.True(t, exists, "failed release retirement must preserve an in-memory retry owner")
 	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	_, pending, err := b.callbackStore.GetCloseIntent(leaseUUID)
+	require.NoError(t, err)
+	require.True(t, pending, "unavailable authority cannot retire the durable close owner")
+	closed, err := b.callbackStore.LookupClosedLeaseReceipts([]string{leaseUUID})
+	require.NoError(t, err)
+	require.Empty(t, closed)
+	callbacks, err := b.callbackStore.ListPending()
+	require.NoError(t, err)
+	for _, callback := range callbacks {
+		require.NotEqual(t, backend.CallbackStatusDeprovisioned, callback.Status,
+			"unavailable authority cannot publish terminal cleanup")
+	}
 
 	reopened, err := shared.OpenIdentityBoundReleaseStore(
 		shared.ReleaseStoreConfig{DBPath: b.cfg.ReleasesDBPath},
