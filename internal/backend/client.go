@@ -2053,7 +2053,9 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 		return fmt.Errorf("marshal deprovision request: %w", err)
 	}
 
+	invoked := false
 	_, cbErr := c.cb.Execute(func() (any, error) {
+		invoked = true
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/deprovision", bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
@@ -2076,8 +2078,8 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 		return nil, nil
 	})
 
-	if isCircuitBreakerError(cbErr) {
-		return ErrCircuitOpen
+	if !invoked && isCircuitBreakerError(cbErr) {
+		return &deprovisionNotDispatchedError{client: c, leaseUUID: leaseUUID}
 	}
 	return cbErr
 }

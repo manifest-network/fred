@@ -256,11 +256,6 @@ func TestCloseSettlementCleanupConsumesFailedOperationWithExactReleaseAbsence(t 
 	require.NoError(t, err)
 	require.NoError(t, stores.callbacks.removeEntry(failure))
 
-	projected, err := settlement.NewCloseRequest(spec.LeaseUUID, false)
-	require.NoError(t, err)
-	_, err = settlement.BeginClose(projected)
-	require.ErrorIs(t, err, ErrCloseAuthorityMissing)
-
 	request, err := settlement.NewCleanupCloseRequest(spec.LeaseUUID)
 	require.NoError(t, err)
 	admission, err := settlement.BeginCleanupClose(request)

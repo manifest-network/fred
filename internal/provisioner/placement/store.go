@@ -1928,24 +1928,41 @@ func (s *Store) leaseSideEffectError(leaseUUID string) error {
 	return s.unprojectedPositiveErrorLocked(leaseUUID)
 }
 
-// placementForDeprovision returns one detached teardown view only when no
+type deprovisionPlacementDisposition uint8
+
+const (
+	deprovisionPlacementUnavailable deprovisionPlacementDisposition = iota
+	deprovisionPlacementObserved
+	deprovisionPlacementInventoryPending
+)
+
+// deprovisionPlacementObservation keeps a local inventory wait distinct from
+// storage failure. Only the mutex-protected Store observation can issue it.
+type deprovisionPlacementObservation struct {
+	disposition deprovisionPlacementDisposition
+	placement   Placement
+	err         error
+}
+
+// observeDeprovisionPlacement returns a detached teardown view only when no
 // inventory observation is waiting to change its candidate owner set. The
-// deprovision coordinator calls it after acquiring the lease operation claim,
-// making the Store check the capability-minting boundary rather than leaving
-// this invariant to a handler.
-func (s *Store) placementForDeprovision(leaseUUID string) (Placement, error) {
+// coordinator's observation after acquiring a lease claim supplies authority;
+// its preflight observation may only defer a call without claiming mutation.
+func (s *Store) observeDeprovisionPlacement(leaseUUID string) deprovisionPlacementObservation {
 	if err := s.reattestRuntimeAuthority(); err != nil {
-		return Placement{}, err
+		return deprovisionPlacementObservation{disposition: deprovisionPlacementUnavailable, err: err}
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if err := s.unprojectedPositiveErrorLocked(leaseUUID); err != nil {
-		return Placement{}, err
+		return deprovisionPlacementObservation{
+			disposition: deprovisionPlacementInventoryPending, err: err,
+		}
 	}
 	record := s.cache[leaseUUID]
 	record.ConflictBackends = slices.Clone(record.ConflictBackends)
 	record.recordRevision = s.newRecordRevision(leaseUUID, record.revision)
-	return record, nil
+	return deprovisionPlacementObservation{disposition: deprovisionPlacementObserved, placement: record}
 }
 
 type inventorySessionReport struct {

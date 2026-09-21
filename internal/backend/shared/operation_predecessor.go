@@ -1,11 +1,13 @@
 package shared
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -122,6 +124,15 @@ type failedOperationWithoutRelease struct {
 	successorDigest [sha256.Size]byte
 }
 
+// failedOperationProjectedClose preserves the failed operation's principal,
+// callback generation and immutable topology when retiring its live projection.
+// Unlike callbackless orphan cleanup, it may publish a Deprovisioned receipt.
+// Its embedded absence is issued only under the journal pair's lease gate.
+type failedOperationProjectedClose struct {
+	issuer  *CloseSettlement
+	absence failedOperationWithoutRelease
+}
+
 func (absence failedOperationWithoutRelease) validForHead(
 	callbacks *CallbackStore,
 	releases *ReleaseStore,
@@ -147,6 +158,26 @@ type failedOperationCloseAuthority interface {
 
 func (failedOperationOverRelease) isFailedOperationCloseAuthority()    {}
 func (failedOperationWithoutRelease) isFailedOperationCloseAuthority() {}
+func (failedOperationProjectedClose) isFailedOperationCloseAuthority() {}
+
+func (authority failedOperationProjectedClose) validForClose(
+	head OperationIntentClaim,
+	next CloseIntentClaim,
+) bool {
+	return authority.issuer.valid() && authority.absence.validForHead(
+		authority.issuer.callbacks, authority.issuer.releases, head,
+	) && !next.CleanupOnly() && next.ActiveReleaseVersion() == 0 &&
+		next.ActiveReleaseDigest() == ([sha256.Size]byte{}) &&
+		next.ActiveReleaseOperationID().IsZero() &&
+		next.LeaseUUID() == head.LeaseUUID() && next.Backend() == head.Backend() &&
+		next.BackendStorageID() == head.BackendStorageID() &&
+		next.Tenant() == head.Tenant() && next.ProviderUUID() == head.ProviderUUID() &&
+		next.CallbackURL() == head.CallbackURL() &&
+		next.LifecycleCallbackURL() == head.LifecycleCallbackURL() &&
+		slices.Equal(next.Items(), head.EffectiveItems()) &&
+		slices.Equal(next.ResourceProfiles(), head.ResourceProfiles()) &&
+		bytes.Equal(next.Manifest(), head.Manifest())
+}
 
 func (relation failedOperationOverRelease) validForClose(
 	head OperationIntentClaim,
@@ -306,8 +337,8 @@ func bindFailedOperationOverRelease(
 	}, nil
 }
 
-// bindFailedOperationWithoutRelease reconstructs cleanup-only authority from
-// the durable absent variant. Release absence is re-attested before the
+// bindFailedOperationWithoutRelease reconstructs exact predecessor absence for
+// the distinct close witnesses. Release absence is re-attested before the
 // callback head, matching the pair's Release -> Callback lock order. The
 // caller owns the shared lease gate, so no pair writer can create a Release
 // between this proof and the close-head transaction.

@@ -271,8 +271,7 @@ func (b *Backend) probeOperationIntent(
 		disposition == shared.OperationIntentAdmissionCompleted, nil
 }
 
-func (b *Backend) beginOperationIntent(
-	kind shared.OperationIntentKind,
+func (b *Backend) beginRestoreOperationIntent(
 	leaseUUID, callbackURL, lifecycleCallbackURL, tenant, providerUUID string,
 	items []backend.LeaseItem,
 	resourceProfiles []shared.SKUResourceSnapshot,
@@ -282,6 +281,7 @@ func (b *Backend) beginOperationIntent(
 	sourceLeaseUUID string,
 	sourceGeneration int,
 ) (shared.OperationIntentClaim, bool, error) {
+	const kind = shared.OperationIntentRestore
 	if b.operationSettlement == nil {
 		return shared.OperationIntentClaim{}, false, errors.New("durable callback store is required for asynchronous operation")
 	}
@@ -361,7 +361,7 @@ func (b *Backend) refuseOperationIntent(claim shared.OperationIntentClaim, cause
 
 // settleUnacceptedRestoreIntent durably settles a restore that never crossed
 // the lease actor's acceptance boundary. It deliberately does not accept nil:
-// once beginOperationIntent returns proceed=true, the typed claim is mandatory
+// once beginRestoreOperationIntent returns proceed=true, the typed claim is mandatory
 // authority for every synchronous failure path.
 //
 // The caller must invoke this only after teardown, re-quarantine, and source

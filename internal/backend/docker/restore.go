@@ -1861,8 +1861,7 @@ func (b *Backend) Restore(ctx context.Context, request backend.RestoreRequest) e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	intent, proceed, err := b.beginOperationIntent(
-		shared.OperationIntentRestore,
+	intent, proceed, err := b.beginRestoreOperationIntent(
 		req.LeaseUUID,
 		req.CallbackURL,
 		req.LifecycleCallbackURL,

@@ -621,6 +621,17 @@ var (
 
 // Watermill metrics
 var (
+	// DeferredClosesPending includes queued and executing close retry hints.
+	DeferredClosesPending = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace, Subsystem: "provisioner", Name: "deferred_closes_pending",
+		Help: "Close retry hints owned by the bounded provider scheduler, including executing hints.",
+	})
+	// DeferredClosesTotal distinguishes scheduled admission waits from failures.
+	DeferredClosesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: "provisioner", Name: "deferred_closes_total",
+		Help: "Close retry scheduling outcomes; dispatched is not proof of physical teardown.",
+	}, []string{"outcome", "reason"})
+
 	// WatermillMessagesTotal tracks Watermill message processing.
 	WatermillMessagesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,

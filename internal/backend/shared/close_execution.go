@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"runtime/debug"
 
+	bolt "go.etcd.io/bbolt"
+
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 )
@@ -26,12 +28,14 @@ type CloseExecutionDestroyed struct {
 	settlement *CloseSettlement
 	subject    ClosePhysicalSubject
 	evidence   CloseDestroyed
+	authority  closeTerminalAuthority
 }
 
 type CloseExecutionRetained struct {
 	settlement *CloseSettlement
 	subject    ClosePhysicalSubject
 	evidence   CloseRetained
+	authority  closeTerminalAuthority
 }
 
 // CloseExecutionPending deliberately grants no terminal authority. Refusal,
@@ -46,12 +50,14 @@ type CloseExecutionPending struct {
 
 func (outcome CloseExecutionDestroyed) Valid() bool {
 	return outcome.settlement != nil && outcome.subject.validFor(outcome.settlement) &&
-		outcome.evidence.Valid() && outcome.evidence.validForClose(outcome.subject)
+		outcome.evidence.Valid() && outcome.evidence.validForClose(outcome.subject) &&
+		outcome.authority.validFor(outcome.settlement, outcome.subject)
 }
 
 func (outcome CloseExecutionRetained) Valid() bool {
 	return outcome.settlement != nil && outcome.subject.validFor(outcome.settlement) &&
-		outcome.evidence.Valid() && outcome.evidence.validForClose(outcome.subject)
+		outcome.evidence.Valid() && outcome.evidence.validForClose(outcome.subject) &&
+		outcome.authority.validFor(outcome.settlement, outcome.subject)
 }
 
 func (outcome CloseExecutionPending) Valid() bool {
@@ -192,6 +198,18 @@ func (s *CloseSettlement) ExecuteClose(
 	if err := substratemutation.ValidateLiveResult(s.mutation, execution.started, physical); err != nil {
 		return CloseExecutionPending{settlement: s, subject: execution.subject, cause: err}
 	}
+	if physical.Kind() == substratemutation.Refused {
+		// The exact executor proved that this generation entered no tenant
+		// effect. An already-empty cohort needs no mutation, so obtain its
+		// terminal evidence from the fixed read-only classifier instead. This
+		// does not apply to Ambiguous: a delayed effect could follow its read.
+		observed, err := s.inspectStartedClose(ctx, execution.subject.state.claim)
+		if err != nil {
+			return CloseExecutionPending{settlement: s, subject: execution.subject,
+				cause: errors.Join(physical.Err(), err)}
+		}
+		return observed
+	}
 	return s.closeOutcomeForResult(execution.subject, physical)
 }
 
@@ -211,9 +229,17 @@ func (s *CloseSettlement) closeOutcomeForResult(
 		}
 		switch evidence.kind {
 		case closePhysicalEvidenceDestroyed:
-			return CloseExecutionDestroyed{settlement: s, subject: subject, evidence: evidence.destroyed}
+			authority, err := s.proveCloseTerminal(subject)
+			if err != nil {
+				return CloseExecutionPending{settlement: s, subject: subject, cause: err}
+			}
+			return CloseExecutionDestroyed{settlement: s, subject: subject, evidence: evidence.destroyed, authority: authority}
 		case closePhysicalEvidenceRetained:
-			return CloseExecutionRetained{settlement: s, subject: subject, evidence: evidence.retained}
+			authority, err := s.proveCloseTerminal(subject)
+			if err != nil {
+				return CloseExecutionPending{settlement: s, subject: subject, cause: err}
+			}
+			return CloseExecutionRetained{settlement: s, subject: subject, evidence: evidence.retained, authority: authority}
 		case closePhysicalEvidenceIncomplete:
 			return CloseExecutionPending{settlement: s, subject: subject,
 				cause: errors.New("close substrate cleanup is incomplete"), retryable: true}
@@ -253,6 +279,16 @@ func (s *CloseSettlement) RecoverCloseExecution(
 		return nil, errors.New("close recovery requires exact actor or lease-quiescence authority")
 	}
 	defer releaseScope()
+	return s.inspectStartedClose(ctx, claim)
+}
+
+// inspectStartedClose is reachable only with either an entered recovery scope
+// or this executor's validated effect-free live result. Both paths re-attest
+// the exact durable Started generation before the fixed physical observation.
+func (s *CloseSettlement) inspectStartedClose(
+	ctx context.Context,
+	claim CloseIntentClaim,
+) (CloseExecutionOutcome, error) {
 	if s.recovery == nil {
 		return nil, errors.New("close substrate recovery attestor is not bound")
 	}
@@ -327,7 +363,7 @@ func (s *CloseSettlement) completeTerminal(
 
 	// This check precedes release retirement. A stale execution generation must
 	// never delete the still-live release and fail only at the later callback CAS.
-	if err := s.callbacks.requireCloseIntent(claim); err != nil {
+	if err := s.callbacks.view(func(tx *bolt.Tx) error { return verifyCloseTerminalTx(tx, claim) }); err != nil {
 		return CallbackEntry{}, err
 	}
 

@@ -436,6 +436,17 @@ authority safely and is rejected by the mandatory stopped adoption preflight.
 Callbackless historical cleanup/close evidence remains readable, but never
 authorizes zero-survivor recovery or maintenance.
 
+A replacement provision prepares its predecessor before admitting a new
+Pending operation. An unfrozen legacy Release requires a complete, strictly
+inspected cohort with one matching principal and callback pair; its exact
+Release is then backfilled before admission. Missing, partial, foreign, or
+unreadable evidence leaves the existing workload and reservations intact and
+creates no new Pending head. After admission, the backend owns the bounded
+backfill and revalidation work even if the HTTP caller disconnects. This
+prerequisite does not reinterpret historical Pending operations: exact retries
+remain idempotent, and existing recovery or operator repair must resolve their
+original uncertainty.
+
 Runtime callback URLs contain causal capabilities. Treat `releases.db` and every
 stopped-process copy or backup as sensitive together with `callbacks.db` and
 `retention.db`; do not paste raw Release rows into logs or tickets.
@@ -1047,9 +1058,13 @@ tenant churn between passes; close completion does not imply immediate subnet
 reuse. Backend shutdown cancels and waits for the worker.
 
 Candidate collection uses one Docker list with managed/backend labels and
-`dangling=true`; it does not inspect every active network. Each selected tenant
-still reacquires its network stripe, checks current workload ownership and
-inspects the exact network immediately before removal. State and network worker
+`dangling=true`; it does not inspect every active network. On Engine 28.x,
+the list filter can include connected networks because attachment details are
+not populated before filtering. Each selected tenant still reacquires its
+network stripe and checks current workload ownership, skipping active tenants.
+The exact network is inspected immediately before removal. Candidate counts and
+`tenant_active`/`in_use` outcomes can therefore include connected networks and
+must not be interpreted as orphan counts. State and network worker
 iterations contain panics, increment the corresponding
 `fred_background_cleanup_panics_total` component, and retry on the next tick.
 
@@ -1263,9 +1278,14 @@ callback sender may fail after step 3 without reopening teardown: no HTTP runs i
 the lease actor or startup recovery, the durable outbox owns delivery, and its
 periodic 30-second sweep backs up the immediate wake. There is no attempt-count
 terminalization. A plain error or ambiguous effect preserves the exact Started
-generation; restart performs read-only strict classification. Only executor-
-minted `Destroyed` or `Retained` evidence can cross terminal settlement, while
-`Incomplete` evidence can authorize another durable generation.
+generation; restart performs read-only strict classification. An exact executor
+refusal proving no tenant effect began may also obtain fresh strict observation,
+so an already-empty retaining close does not need a synthetic mutation.
+Terminal `Destroyed` and `Retained` outcomes join physical evidence with a
+private journal proof that the exact namespace has no unsettled workload launch.
+Settlement rechecks that proof before deleting Release history and again in the
+callback transaction. Empty inventory cannot retire an earlier uncertain Docker
+request. `Incomplete` evidence can authorize another durable generation.
 When a complete Release or exact container cohort supplies tenant/provider
 identity, that pair remains in the sealed close authority and every late-
 container cleanup must match it. Only a true orphan with no principal witness

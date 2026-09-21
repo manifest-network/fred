@@ -269,6 +269,24 @@ type failedWithoutReleaseCleanupCloseIntentAdmissionAuthority struct {
 
 func (failedWithoutReleaseCleanupCloseIntentAdmissionAuthority) isCloseIntentAdmissionAuthority() {}
 
+type failedOperationProjectedCloseIntentAdmissionAuthority struct {
+	authority failedOperationProjectedClose
+}
+
+func (failedOperationProjectedCloseIntentAdmissionAuthority) isCloseIntentAdmissionAuthority() {}
+
+func (s *CallbackStore) beginProjectedCloseAfterFailedOperationLocked(
+	candidate closeIntentCandidate,
+	authority failedOperationProjectedClose,
+) (CloseIntentAdmission, error) {
+	if authority.issuer == nil || authority.issuer.callbacks != s ||
+		authority.absence.callbacks != s || authority.absence.releases != authority.issuer.releases {
+		return CloseIntentAdmission{}, errors.New("failed-operation projected close belongs to another journal pair")
+	}
+	return s.beginCloseIntentWithAuthorityLocked(candidate,
+		failedOperationProjectedCloseIntentAdmissionAuthority{authority: authority})
+}
+
 // beginCloseIntentLocked durably publishes the ordinary close barrier before
 // destructive work. A terminal Failed operation cannot enter through this
 // path; it requires one of the distinct pair-bound witnesses below.
@@ -505,6 +523,12 @@ func (s *CallbackStore) beginCloseIntentWithAuthorityLocked(
 				transition, transitionErr = newReplaceFailedOperationWithCloseLeaseMutation(
 					operationClaim, admissionAuthority.absence,
 					operationReceipt, claim,
+				)
+
+			case failedOperationProjectedCloseIntentAdmissionAuthority:
+				operationReceipt = *operationClaim.entry
+				transition, transitionErr = newReplaceFailedOperationWithCloseLeaseMutation(
+					operationClaim, admissionAuthority.authority, operationReceipt, claim,
 				)
 
 			default:
@@ -768,7 +792,7 @@ func (s *CallbackStore) resolveCloseIntentLocked(
 
 	var data []byte
 	err := s.update(func(tx *bolt.Tx) error {
-		if err := verifyCloseIntentTx(tx, claim); err != nil {
+		if err := verifyCloseTerminalTx(tx, claim); err != nil {
 			return err
 		}
 		if !callbackless {

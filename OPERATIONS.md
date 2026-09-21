@@ -155,7 +155,8 @@ when later probes or recovery passes succeed.
 | `fred_docker_backend_network_reclamation_total{outcome=~"error|list_error|budget_exhausted"}` sustained | The separate bounded network worker cannot drain its backlog in a pass | Check Docker errors, idle network count and address-pool headroom. Only `outcome="removed"` counts actual removals; active, connected or busy tenants are safe deferrals. This worker does not spend the operation-recovery budget |
 | `fred_docker_backend_lease_terminal_event_dropped_total` rising under clean shutdown | Real data loss pattern | The release store / provision struct may be out of sync with Docker — reconciler will re-detect on next cycle, but root-cause the wedged actor |
 | `fred_provisioner_reconciler_panics_total > 0` | Bug — a reconciler worker panicked. A `stage="placement_cleanup"` panic preserves that exact durable candidate while the bounded healthy lanes continue | File an issue with the stack trace. The next sweep retries preserved work; do not delete placement evidence |
-| `fred_background_cleanup_panics_total > 0` | Bug in a cleanup loop. **Emitted by every fred binary**, so read `job` alongside `component`: `token` is providerd; `callback`, `diagnostics` and `releases` are a backend, and `retention` is the docker backend specifically | Same — keep running, file issue. Go to the journal of the host the `job`/`server` labels name, not to providerd by default |
+| `fred_chain_health_probe_panics_total > 0` | The chain client panicked during a providerd health probe; that probe is reported unhealthy | Correlate `chain health probe panicked` in providerd logs, verify subsequent chain probes recover, and file an issue. A healthy later response does not erase the panic counter |
+| `fred_background_cleanup_panics_total > 0` | Bug in a cleanup loop. **Emitted by every fred binary**, so read `job` alongside `component`: `token` is providerd; `callback`, `diagnostics` and `releases` are a backend; `retention`, `docker_reconciliation` and `docker_network_reclamation` are docker-backend components | Inspect the recovered panic stack, verify the next iteration makes progress, and file an issue. Go to the journal of the host the `job`/`server` labels name, not to providerd by default |
 | `fred_background_goroutine_panics_total{component="callback_replay"} > 0` | A bundled backend recovered a panic while replaying one lease's durable callback FIFO. That lease remains queued for a later pass; the bounded worker pool continues with unrelated leases | Check the backend log for `panic while replaying callback outbox` and its lease UUID/stack, then file an issue. Do not delete `callbacks.db`; replay is the recovery owner |
 | `fred_background_goroutine_panics_total{component=~"timeout_checker_(sweep|candidate)"} > 0` | The timeout checker recovered a bug at its periodic boundary. Exact operation/placement evidence remains durable; candidate isolation lets unrelated timeout settlements continue, and the next cadence retries preserved work | Check the providerd stack trace and file an issue. Do not repair the placement DB merely to clear the alert |
 | `fred_api_rate_limit_rejections_total{limiter="tenant"}` spike | Specific tenant exceeded their bucket | Expected if a tenant is bursting; sustained spikes indicate a misbehaving client |
@@ -171,7 +172,9 @@ when later probes or recovery passes succeed.
 | `fred_reconciler_cleanup_skips_total{reason="chain_live"}` rising steadily | The sweep's lease snapshot is often stale by the time cleanup runs — expected at a low rate, but a high one means sweeps are slow relative to lease churn | Compare `fred_reconciler_duration_seconds` against the reconcile interval; no action if the rate is low |
 | `fred_reconciler_cleanup_skips_total{pass="placement",reason="backend_silent"}` steady for an unreachable backend | Expected: that backend's placement records are never pruned from silence. Removing its name while records refer to it is rejected at startup | [Removing, renaming or pausing a backend](#removing-renaming-or-pausing-a-backend) |
 | `fred_reconciler_cleanup_skips_total{pass="placement",reason="attempt_pending"}` sustained for the same lease | A write-ahead backend effect is still causally unresolved, so Fred preserves its placement evidence and refuses destructive cleanup. A low rate during ordinary provision/restore is expected; each live sweep redelivers the exact typed operation, persisted callback pair, immutable tenant/provider/item snapshot, and payload fingerprint or restore source only to its pinned backend. Accepted/idempotent responses promote it, transport-minted contract refusals clear it, and ambiguity retains it. Public Go error sentinels are diagnostic only: a custom/legacy backend's non-nil return cannot manufacture refusal evidence. A terminal chain lease uses exact deprovision instead; every distinct attempted/confirmed backend must succeed before conservative affinity is promoted | Correlate the attempted backend and operation fingerprint with that backend's durable intent/callback queue and inventory. Restore an unavailable backend, callback path, or payload database so exact recovery can settle. Missing payload data is retriable and never downgrades the request or terminates the live lease. If the backend definitively created nothing and cannot return a conforming refusal, follow the explicit placement-repair procedure; never clear the row from inventory silence alone |
-| `fred_watermill_poisoned_messages_total > 0` | A handler exhausted retries on a message | Logs around the topic in question; the poison log identifies the message |
+| `fred_watermill_poisoned_messages_total > 0` | A handler exhausted retries on a message. Known close inventory/lifecycle waits and locally proven circuit refusals normally transfer to the bounded deferred-close scheduler instead | Read the topic and reason in the poison log. Queue saturation or shutdown can still return a close event error; reconciliation remains the durable recovery path |
+| `fred_provisioner_deferred_closes_pending` remains elevated | Queued or executing close retries await inventory projection, lifecycle ownership, or local backend circuit admission | Correlate `lease close deferred` with the bounded `reason` in `fred_provisioner_deferred_closes_total`. Restore the named dependency; never remove an inventory fence or durable attempt to accelerate a close |
+| `increase(fred_provisioner_deferred_closes_total{outcome=~"failed|full|unavailable"}[5m]) > 0` | A retry encountered an actual failure, all 1,024 slots were occupied, or scheduler admission was closed | Inspect `deferred lease close failed` and event errors. `dispatched` means the call returned successfully, not physical completion; verify the exact deprovision callback or backend retention status. No tenant or lease identifiers appear in metric labels |
 | `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
 | `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps | A volume owned by an exact retained-data tombstone cannot be destroyed — its footprint **is** counted in the admission pool (no over-admit) but pins capacity and likely needs manual repair. A rising `..._retention_leaked_total` with `reaping_bytes` flat is instead the self-healing rollback store-error case (no action). This is not unattributed-volume GC. | [Reclaiming retained-data / stuck-reaping volumes](#reclaiming-retained-data--stuck-reaping-volumes) |
 | `sum without (outcome) (increase(fred_docker_backend_retention_sweep_total[3h])) == 0` (with retention enabled) | The periodic retention sweep has stopped iterating entirely — the loop goroutine is gone, the ticker is starved, or the process is wedged. The sum advances on **every** pass regardless of outcome, so a flat sum is absence, not failure. Nothing is being reaped, no interrupted restore is being reconciled, and no orphan record is being pruned | Check the docker-backend process and its logs for `retention cleanup panic`; `fred_background_cleanup_panics_total{component="retention"}` distinguishes a panicking sweep from a dead one |
@@ -774,8 +777,11 @@ cannot add a warning to an otherwise complete owner-specific result.
 That availability rule assumes the preceding inventory sweep ended cleanly. If
 providerd restarts with an interrupted-sweep marker in `placements.db`, a lost
 positive observation may not yet be represented by any placement row. Fred then
-withholds all fresh lease side effects—even owner-affine maintenance and
-cleanup—during partial sweeps. A complete fleet projection clears the marker.
+withholds fresh lease side effects—even owner-affine maintenance and
+cleanup—until a projection covers every configured, pinned backend endpoint and
+durably accounts for every positive. Constructor-issued paired-topology coverage
+can retire this inherited fence even when individual leases remain quarantined;
+it cannot establish a new admission baseline or prove an empty backend.
 Exact authenticated callback settlement and replay of already-durable attempts
 or maintenance commands remain available. An increase in
 `fred_placement_write_failures_total` accompanied by “inventory sweep marker
@@ -835,13 +841,19 @@ depends on the unavailable backend, not every healthy node.
    (`GET /health`, `GET /stats`, its own logs).
 2. Bring it back. Recovery needs no action on fred's side — the next sweep can
    resume its pinned leases. Exact positive observations can confirm attempts;
-   inventory absence never clears attempts or conflict quarantine. A sole
-   `untrusted_positive` candidate self-resolves only when a later sealed
+   inventory absence alone never clears attempts or conflict quarantine. A sole
+   `untrusted_positive` candidate can regain its owner when a later sealed
    observation covers that lease across **all configured backends**: paired,
    identity-valid responses, the same sole trusted reporter, and absence on each
    peer. An unrelated lease's overlap does not block that proof. A missing peer,
    continued ambiguity for this lease, silence, a different reporter, multiple
-   candidates, unknown ownership, or an ordinary conflict cannot self-resolve.
+   candidates, unknown ownership, or an ordinary conflict cannot establish a
+   single owner this way. Separately, terminal pruning can remove a known-owner
+   quarantine after paired, identity-valid absence from every recorded candidate
+   and an exact chain read proving CLOSED, REJECTED, or EXPIRED. It requires no
+   unresolved attempt, maintenance, or restore claim and rechecks the exact
+   placement revision under lease exclusion. Missing or unknown owners remain
+   fenced; inventory absence alone is insufficient.
 3. If it is gone for good, that is a **removal**, not an outage — see the next
    section. Do not leave it configured-but-absent indefinitely: PENDING leases on
    it are on a ~30-minute chain expiry clock the whole time.
@@ -933,12 +945,17 @@ They are the only surviving pointers to where that machine's data may be. A
 lease ever reported by multiple backends retains the sorted union of every
 candidate in conflict quarantine. Fred also preserves a positive fact from a
 rejected inventory response as `untrusted_positive`, including when it has only
-one candidate. That narrow one-candidate quarantine may self-resolve only from a
+one candidate. That narrow one-candidate quarantine can regain its owner from a
 later identity-valid matching positive from the same backend, with paired
 responses from every configured backend and absence of that lease on every
 peer. Ambiguity for another lease does not block this proof, but a missing peer
-or silence never resolves it; multi-candidate, unknown-owner, and ordinary
-conflicts require explicit operator proof and repair.
+or silence cannot establish ownership. Separately, a fully known candidate set
+can be pruned after paired, identity-valid absence from every candidate and an
+exact chain read proving CLOSED, REJECTED, or EXPIRED, with no unresolved attempt,
+maintenance, or restore claim. This includes a sole `untrusted_positive`
+candidate. The proof is tied to the current placement revision and consumed
+under lease exclusion. Unknown owners or incomplete evidence still require
+operator investigation; absence alone never authorizes deletion.
 
 > **Ansible caution.** `roles/fred/templates/providerd.yaml.j2` renders backend
 > names from each host's explicit `backend_index`; the role validates that every
@@ -1626,8 +1643,14 @@ of a delayed backend call or retained tenant data. Recover it as follows:
    historical backend that could have owned it. `placement-repair -inspect`
    always emits `untrusted_positive`: `true` means the candidate set came from
    positive membership in a rejected inventory response, not an authoritative
-   owner. A sole such candidate can self-resolve only from a later complete,
-   identity-valid matching positive; every other conflict remains operator-only.
+   owner. A sole such candidate can regain its owner from a later matching
+   trusted reporter with paired, identity-valid coverage of every configured
+   backend and absence on every peer. An unrelated lease's ambiguity does not
+   block this proof. Separately, a fully known candidate set can be pruned by
+   reconciliation after exact dual-endpoint absence from every candidate plus
+   chain-terminal proof, with no unresolved attempt, maintenance, or restore
+   claim and with the current revision protected by lease exclusion. Unknown
+   owners, missing evidence, and chain absence do not authorize pruning.
 3. Prefer restoring a known-good stopped-process backup. If no backup exists,
    preserve the row and escalate for operator repair unless the collected
    evidence explicitly proves that it represents no owner, retained data, or

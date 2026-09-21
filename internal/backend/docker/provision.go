@@ -191,7 +191,12 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 	// effective items record DNS-deferred empty domains for exact crash recovery.
 	desiredItems := slices.Clone(req.Items)
 	b.deferUnreadyCustomDomains(ctx, req.Items, req.LeaseUUID, logger)
-	effectiveItems := slices.Clone(req.Items)
+	// Refusal must be representable before accepting a successor. An unfrozen
+	// legacy predecessor cannot supply failure lineage after Pending is written.
+	prepared, err := b.prepareProvisionOperation(ctx, req, desiredItems, resourceProfiles, healthCheckServices)
+	if err != nil {
+		return err
+	}
 
 	// Bridge the durable acceptance row to a volatile projection while excluding
 	// recoverState's inventory/publication snapshot. Without this short read-side
@@ -208,21 +213,7 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 			b.recoverySnapshotMu.RUnlock()
 		}
 	}()
-	intent, proceed, err := b.beginOperationIntent(
-		shared.OperationIntentProvision,
-		req.LeaseUUID,
-		req.CallbackURL,
-		req.LifecycleCallbackURL,
-		req.Tenant,
-		req.ProviderUUID,
-		desiredItems,
-		resourceProfiles,
-		effectiveItems,
-		healthCheckServices,
-		req.Payload,
-		"",
-		0,
-	)
+	intent, proceed, err := prepared.begin()
 	if err != nil {
 		return err
 	}
@@ -383,11 +374,14 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 					errors.New("legacy predecessor classification has no durable release store fence"),
 				)
 			}
-			if persistErr := b.releaseBackfiller.BackfillLegacyRuntimeAuthorityContext(
-				ctx, req.LeaseUUID,
+			backfillCtx, cancelBackfill := b.recoveryDockerReadContext(b.stopCtx)
+			persistErr := b.releaseBackfiller.BackfillLegacyRuntimeAuthorityContext(
+				backfillCtx, req.LeaseUUID,
 				*classification.legacyPredecessor,
 				*classification.legacyAuthority,
-			); persistErr != nil {
+			)
+			cancelBackfill()
+			if persistErr != nil {
 				return b.refuseOperationIntent(intent, fmt.Errorf(
 					"persist failed provision predecessor runtime authority: %w", persistErr,
 				))

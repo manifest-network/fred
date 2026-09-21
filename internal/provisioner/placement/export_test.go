@@ -9,6 +9,13 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
 
+// Preserve concise legacy assertions while production consumes the closed
+// placement observation, which keeps inventory waits distinct from errors.
+func (s *Store) placementForDeprovision(leaseUUID string) (Placement, error) {
+	observation := s.observeDeprovisionPlacement(leaseUUID)
+	return observation.placement, observation.err
+}
+
 // RecordProvision, RecordRetention, and RecordUntrusted deliberately exist
 // only in the placement package's white-box test binary. Production and
 // dependent-package tests must consume opaque responses collected by the

@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Bounded close-event deferral with typed inventory/lifecycle waits and exact
+  HTTP-client circuit refusal evidence. The manager coalesces up to 1,024 hints
+  across four workers and reacquires ownership for every attempt, avoiding
+  poison-queue exhaustion during short admission waits. New
+  `fred_provisioner_deferred_closes_pending` and
+  `fred_provisioner_deferred_closes_total{outcome,reason}` distinguish scheduled
+  retries, dispatch and failures without implying physical completion.
+  (ENG-986, ENG-997, ENG-1025)
+
 - `fred_health_check_duration_seconds{check,backend}`,
   `fred_docker_backend_health_check_duration_seconds{check}` and
   `fred_docker_backend_storage_identity_check_duration_seconds{check}` expose
@@ -762,6 +771,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (ENG-632)
 
 ### Fixed
+
+- Failed operations that never published a Release can now close their live
+  Docker projection through a distinct journal-pair witness. Exact predecessor
+  absence, principal, topology and callback FIFO remain required; failed image
+  pulls no longer leave a repeatedly uncloseable inventory row. An empty
+  retaining close completes only from strict same-generation observation after
+  the executor proves no effect was entered; ambiguous effects stay pending.
+  (ENG-997, ENG-1025)
+- Terminal close outcomes now require journal-backed namespace quiescence in
+  addition to physical evidence. Empty inventory cannot retire ownership while
+  an earlier Docker workload launch remains uncertain, including during retry
+  and restart recovery. (ENG-1025)
+- A known inventory wait preserves the live operation without acquiring a new
+  Registry claim, keeping the same sweep's terminal cleanup observation usable.
+  Each retry checks the Store again under lifecycle ownership and releases any
+  deferred settlement claim without finishing the operation. (ENG-986)
+- Docker recovery releases the projection lock after a contained merge panic,
+  allowing later reads and reconciliation to progress. Legacy replacement
+  provisioning prepares an exact predecessor identity before accepting Pending
+  work, so a later refusal has durable settlement authority. (ENG-1025)
 
 - ACK batch recovery now observes the exact lease UUID and configured provider
   before an individual retry and after an ambiguous broadcast. Only a verified

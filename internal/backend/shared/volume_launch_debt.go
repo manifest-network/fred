@@ -138,15 +138,19 @@ func (j *VolumeLaunchJournal) CheckNamespace(leaseUUID string) error {
 	}
 	backend, storage := j.store.journalBackendIdentity("")
 	return j.store.view(func(tx *bolt.Tx) error {
-		return visitVolumeLaunchDebtsTx(tx, func(r volumeLaunchDebtRecord) error {
-			if r.Backend != backend || r.StorageID != storage.String() {
-				return errors.New("volume launch debt belongs to another storage lineage")
-			}
-			if r.LeaseUUID == leaseUUID {
-				return fmt.Errorf("%w: %s %s retains its canonical volume namespace", ErrVolumeLaunchUnsettled, r.Kind, r.SubjectID)
-			}
-			return nil
-		})
+		return checkVolumeLaunchNamespaceTx(tx, backend, storage, leaseUUID)
+	})
+}
+
+func checkVolumeLaunchNamespaceTx(tx *bolt.Tx, backend string, storage backendidentity.ID, leaseUUID string) error {
+	return visitVolumeLaunchDebtsTx(tx, func(r volumeLaunchDebtRecord) error {
+		if r.Backend != backend || r.StorageID != storage.String() {
+			return errors.New("volume launch debt belongs to another storage lineage")
+		}
+		if r.LeaseUUID == leaseUUID {
+			return fmt.Errorf("%w: %s %s retains its canonical volume namespace", ErrVolumeLaunchUnsettled, r.Kind, r.SubjectID)
+		}
+		return nil
 	})
 }
 

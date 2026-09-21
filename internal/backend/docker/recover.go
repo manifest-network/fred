@@ -1613,316 +1613,321 @@ func (b *Backend) recoverState(ctx context.Context) error {
 
 	maintenanceReadiness := b.inspectMaintenanceFailureReadiness(ctx, provisionBaseline, building, containers)
 
-	// Merge with existing state and detect status transitions.
-	b.provisionsMu.Lock()
-	// Close the intent-snapshot/publication TOCTOU without globally serializing
-	// slow inventory collection with admissions. If an operation was admitted
-	// after the first snapshot, it is either visible in this re-read or is still
-	// waiting on provisionsMu before it can capture/publish a projection. Union
-	// rather than replace: settlement between the two reads only means preserving
-	// one live generation for an extra recovery pass, which is conservative.
-	latestPendingIntentLeases, _, latestIntentGenerations, err := b.listRecoveryPendingIntents(closeIntents)
-	if err != nil {
-		b.provisionsMu.Unlock()
-		return err
-	}
-	changedIntentLeases := changedRecoveryIntentGenerations(intentGenerations, latestIntentGenerations)
-	pendingIntentLeases = latestPendingIntentLeases
-	intentGenerations = latestIntentGenerations
-	// A concurrent operation may have changed one lease while this pass collected
-	// inventory. Remove only those stale per-lease products: the live projection
-	// and current pool keys are overlaid/preserved below, while unrelated leases
-	// still converge in this pass. This avoids both stale-generation publication
-	// and fleet-wide starvation from one hot lease.
-	changedProjectionLeases := b.changedProvisionRecoveryLeases(provisionBaseline)
-	b.refreshProvisionRecoveryBaselineLocked(provisionBaseline, changedProjectionLeases)
-	for leaseUUID := range changedIntentLeases {
-		changedProjectionLeases[leaseUUID] = "durable operation generation changed"
-	}
-	for leaseUUID, reason := range changedProjectionLeases {
-		if _, closing := closeIntents[leaseUUID]; closing {
-			// recoverySnapshotMu prevents this claim from settling while we
-			// publish. Its immutable snapshot, not the teardown worker's
-			// intentionally changing volatile projection, remains authoritative.
-			delete(changedProjectionLeases, leaseUUID)
-			continue
+	var final map[string]*provision
+	var cohortFailed, cohortTransitionLeases, failedLeases, coldStartFailed []string
+	// Build the detached merge candidate under one lexical lock scope. The
+	// periodic caller contains panics, so every recoverable exit must release
+	// provisionsMu before the next pass or a foreground lease operation runs.
+	mergeErr := func() error {
+		b.provisionsMu.Lock()
+		defer b.provisionsMu.Unlock()
+		// Close the intent-snapshot/publication TOCTOU without globally serializing
+		// slow inventory collection with admissions. If an operation was admitted
+		// after the first snapshot, it is either visible in this re-read or is still
+		// waiting on provisionsMu before it can capture/publish a projection. Union
+		// rather than replace: settlement between the two reads only means preserving
+		// one live generation for an extra recovery pass, which is conservative.
+		latestPendingIntentLeases, _, latestIntentGenerations, err := b.listRecoveryPendingIntents(closeIntents)
+		if err != nil {
+			return err
 		}
-		delete(building, leaseUUID)
-		delete(durableAllocsByLease, leaseUUID)
-		delete(cohortIssues, leaseUUID)
-		delete(firstExitedByLease, leaseUUID)
-		b.logger.Debug("provision changed while recovery collected inventory; preserving its live generation",
-			"lease_uuid", leaseUUID, "reason", reason)
-	}
-	// A cold-start maintenance projection has no live actor-owned state to
-	// preserve. Its exact pending journal, rather than running containers or a
-	// temporarily absent source cohort, owns the transition until recovery proves
-	// the outcome. Keep the durable resource reservation reconstructed above and
-	// expose the pending maintenance transition instead of a premature Ready.
-	for leaseUUID, generation := range intentGenerations {
-		if generation.class != recoveryMaintenanceIntent || b.provisions[leaseUUID] != nil {
-			continue
+		changedIntentLeases := changedRecoveryIntentGenerations(intentGenerations, latestIntentGenerations)
+		pendingIntentLeases = latestPendingIntentLeases
+		intentGenerations = latestIntentGenerations
+		// A concurrent operation may have changed one lease while this pass collected
+		// inventory. Remove only those stale per-lease products: the live projection
+		// and current pool keys are overlaid/preserved below, while unrelated leases
+		// still converge in this pass. This avoids both stale-generation publication
+		// and fleet-wide starvation from one hot lease.
+		changedProjectionLeases := b.changedProvisionRecoveryLeases(provisionBaseline)
+		b.refreshProvisionRecoveryBaselineLocked(provisionBaseline, changedProjectionLeases)
+		for leaseUUID := range changedIntentLeases {
+			changedProjectionLeases[leaseUUID] = "durable operation generation changed"
 		}
-		recovered := building[leaseUUID]
-		if recovered == nil {
-			continue
-		}
-		recovered.Status = backend.ProvisionStatusRestarting
-		if generation.maintenanceKind == shared.MaintenanceIntentUpdate {
-			recovered.Status = backend.ProvisionStatusUpdating
-		}
-		recovered.LastError = ""
-		recovered.Reason = ""
-		recovered.Message = ""
-		delete(cohortIssues, leaseUUID)
-	}
-
-	// An unchanged Ready runtime retains its last failed attempt's cause, even
-	// when that cause is more specific than RestartFailed/UpdateFailed. Failed
-	// maintenance may recover to Ready under ENG-414 only after fresh inspection.
-	for leaseUUID, existing := range b.provisions {
-		if existing.Reason == "" {
-			continue
-		}
-		recovered := building[leaseUUID]
-		if recovered == nil || recovered.ActiveReleaseVersion != existing.ActiveReleaseVersion ||
-			recovered.ActiveOperationID != existing.ActiveOperationID {
-			continue
-		}
-		_, divergent := cohortIssues[leaseUUID]
-		if existing.Status == backend.ProvisionStatusReady && recovered.Status == backend.ProvisionStatusReady &&
-			!divergent {
-			// A failed replacement may leave the exact source healthy. Its Ready
-			// status does not erase the maintenance failure reported to the tenant.
-			recovered.LastError = existing.LastError
-			recovered.Reason = existing.Reason
-			recovered.Message = existing.Message
-			continue
-		}
-		if existing.Status != backend.ProvisionStatusFailed ||
-			(existing.Reason != backend.ReasonRestartFailed && existing.Reason != backend.ReasonUpdateFailed) {
-			continue
-		}
-		if recovered.Status == backend.ProvisionStatusReady && !divergent && maintenanceReadiness[leaseUUID] {
-			continue
-		}
-		recovered.Status = backend.ProvisionStatusFailed
-		recovered.LastError = existing.LastError
-		recovered.Reason = existing.Reason
-		recovered.Message = existing.Message
-		delete(cohortIssues, leaseUUID)
-	}
-
-	const incompleteCohortMessage = leasesm.ErrMsgCohortDiverged
-	cohortDirectFailures := make(map[string]struct{}, len(cohortIssues))
-	var cohortFailed []string
-	var cohortTransitionLeases []string
-	for leaseUUID, cohortErr := range cohortIssues {
-		recovered := building[leaseUUID]
-		existing, existed := b.provisions[leaseUUID]
-		if existed && existing.Status == backend.ProvisionStatusReady {
-			// Preserve the actor-visible source state. A typed event after the map
-			// swap performs the Ready→Failed transition serially with every other
-			// command for this lease.
-			recovered.Status = backend.ProvisionStatusReady
-			recovered.FailCount = existing.FailCount
-			recovered.LastError = existing.LastError
-			recovered.Reason = existing.Reason
-			recovered.Message = existing.Message
-			cohortTransitionLeases = append(cohortTransitionLeases, leaseUUID)
-			continue
-		}
-		// On cold start there is no actor to synchronize. Materialize Failed
-		// directly; any subsequently created actor initializes from that state.
-		recovered.Status = backend.ProvisionStatusFailed
-		if existed {
-			recovered.FailCount = max(recovered.FailCount, existing.FailCount)
-		} else {
-			recovered.FailCount++
-		}
-		recovered.LastError = fmt.Sprintf("%s: %v", incompleteCohortMessage, cohortErr)
-		recovered.Reason = backend.ReasonInternal
-		recovered.Message = incompleteCohortMessage
-		cohortDirectFailures[leaseUUID] = struct{}{}
-		cohortFailed = append(cohortFailed, leaseUUID)
-	}
-
-	// Detect ready→failed transitions: containers that were running but have
-	// since crashed. We hand off to the SM by firing containerDiedMsg on the
-	// actor *after* the merge. Status stays Ready in the building value so the
-	// actor's guard sees the pre-transition state and permits evContainerDied;
-	// FailCount and LastError are populated by the SM's Failing entry action.
-	var failedLeases []string
-	for uuid, existing := range b.provisions {
-		if existing.Status == backend.ProvisionStatusReady {
-			if _, diverged := cohortIssues[uuid]; diverged {
+		for leaseUUID, reason := range changedProjectionLeases {
+			if _, closing := closeIntents[leaseUUID]; closing {
+				// recoverySnapshotMu prevents this claim from settling while we
+				// publish. Its immutable snapshot, not the teardown worker's
+				// intentionally changing volatile projection, remains authoritative.
+				delete(changedProjectionLeases, leaseUUID)
 				continue
 			}
-			if rec, ok := building[uuid]; ok && rec.Status == backend.ProvisionStatusFailed {
-				rec.Status = backend.ProvisionStatusReady
-				rec.FailCount = existing.FailCount
-				rec.LastError = existing.LastError
-				rec.Reason = existing.Reason
-				rec.Message = existing.Message
-				failedLeases = append(failedLeases, uuid)
-				b.logger.Warn("container crashed after provisioning",
-					"lease_uuid", uuid,
-					"tenant", existing.Tenant,
-				)
-			}
+			delete(building, leaseUUID)
+			delete(durableAllocsByLease, leaseUUID)
+			delete(cohortIssues, leaseUUID)
+			delete(firstExitedByLease, leaseUUID)
+			b.logger.Debug("provision changed while recovery collected inventory; preserving its live generation",
+				"lease_uuid", leaseUUID, "reason", reason)
 		}
-	}
+		// A cold-start maintenance projection has no live actor-owned state to
+		// preserve. Its exact pending journal, rather than running containers or a
+		// temporarily absent source cohort, owns the transition until recovery proves
+		// the outcome. Keep the durable resource reservation reconstructed above and
+		// expose the pending maintenance transition instead of a premature Ready.
+		for leaseUUID, generation := range intentGenerations {
+			if generation.class != recoveryMaintenanceIntent || b.provisions[leaseUUID] != nil {
+				continue
+			}
+			recovered := building[leaseUUID]
+			if recovered == nil {
+				continue
+			}
+			recovered.Status = backend.ProvisionStatusRestarting
+			if generation.maintenanceKind == shared.MaintenanceIntentUpdate {
+				recovered.Status = backend.ProvisionStatusUpdating
+			}
+			recovered.LastError = ""
+			recovered.Reason = ""
+			recovered.Message = ""
+			delete(cohortIssues, leaseUUID)
+		}
 
-	// Cold-start correction: provisions recovered as failed with no prior
-	// in-memory state carry a creation-time FailCount label. Increment it to
-	// account for the failure evidenced by the dead container. The baseline
-	// LastError rides the materialized value.
-	var coldStartFailed []string
-	for uuid, rec := range building {
-		if rec.Status == backend.ProvisionStatusFailed {
-			if _, hasExisting := b.provisions[uuid]; !hasExisting {
-				if _, cohortFailure := cohortDirectFailures[uuid]; cohortFailure {
+		// An unchanged Ready runtime retains its last failed attempt's cause, even
+		// when that cause is more specific than RestartFailed/UpdateFailed. Failed
+		// maintenance may recover to Ready under ENG-414 only after fresh inspection.
+		for leaseUUID, existing := range b.provisions {
+			if existing.Reason == "" {
+				continue
+			}
+			recovered := building[leaseUUID]
+			if recovered == nil || recovered.ActiveReleaseVersion != existing.ActiveReleaseVersion ||
+				recovered.ActiveOperationID != existing.ActiveOperationID {
+				continue
+			}
+			_, divergent := cohortIssues[leaseUUID]
+			if existing.Status == backend.ProvisionStatusReady && recovered.Status == backend.ProvisionStatusReady &&
+				!divergent {
+				// A failed replacement may leave the exact source healthy. Its Ready
+				// status does not erase the maintenance failure reported to the tenant.
+				recovered.LastError = existing.LastError
+				recovered.Reason = existing.Reason
+				recovered.Message = existing.Message
+				continue
+			}
+			if existing.Status != backend.ProvisionStatusFailed ||
+				(existing.Reason != backend.ReasonRestartFailed && existing.Reason != backend.ReasonUpdateFailed) {
+				continue
+			}
+			if recovered.Status == backend.ProvisionStatusReady && !divergent && maintenanceReadiness[leaseUUID] {
+				continue
+			}
+			recovered.Status = backend.ProvisionStatusFailed
+			recovered.LastError = existing.LastError
+			recovered.Reason = existing.Reason
+			recovered.Message = existing.Message
+			delete(cohortIssues, leaseUUID)
+		}
+
+		const incompleteCohortMessage = leasesm.ErrMsgCohortDiverged
+		cohortDirectFailures := make(map[string]struct{}, len(cohortIssues))
+		for leaseUUID, cohortErr := range cohortIssues {
+			recovered := building[leaseUUID]
+			existing, existed := b.provisions[leaseUUID]
+			if existed && existing.Status == backend.ProvisionStatusReady {
+				// Preserve the actor-visible source state. A typed event after the map
+				// swap performs the Ready→Failed transition serially with every other
+				// command for this lease.
+				recovered.Status = backend.ProvisionStatusReady
+				recovered.FailCount = existing.FailCount
+				recovered.LastError = existing.LastError
+				recovered.Reason = existing.Reason
+				recovered.Message = existing.Message
+				cohortTransitionLeases = append(cohortTransitionLeases, leaseUUID)
+				continue
+			}
+			// On cold start there is no actor to synchronize. Materialize Failed
+			// directly; any subsequently created actor initializes from that state.
+			recovered.Status = backend.ProvisionStatusFailed
+			if existed {
+				recovered.FailCount = max(recovered.FailCount, existing.FailCount)
+			} else {
+				recovered.FailCount++
+			}
+			recovered.LastError = fmt.Sprintf("%s: %v", incompleteCohortMessage, cohortErr)
+			recovered.Reason = backend.ReasonInternal
+			recovered.Message = incompleteCohortMessage
+			cohortDirectFailures[leaseUUID] = struct{}{}
+			cohortFailed = append(cohortFailed, leaseUUID)
+		}
+
+		// Detect ready→failed transitions: containers that were running but have
+		// since crashed. We hand off to the SM by firing containerDiedMsg on the
+		// actor *after* the merge. Status stays Ready in the building value so the
+		// actor's guard sees the pre-transition state and permits evContainerDied;
+		// FailCount and LastError are populated by the SM's Failing entry action.
+		for uuid, existing := range b.provisions {
+			if existing.Status == backend.ProvisionStatusReady {
+				if _, diverged := cohortIssues[uuid]; diverged {
 					continue
 				}
-				rec.FailCount++
-				rec.LastError = leasesm.ErrMsgContainerExited
-				rec.Reason = backend.ReasonContainerExited
-				rec.Message = leasesm.ErrMsgContainerExited
-				coldStartFailed = append(coldStartFailed, uuid)
-				b.logger.Info("cold-start: adjusted FailCount for already-failed provision",
-					"lease_uuid", uuid,
-					"fail_count", rec.FailCount,
-				)
+				if rec, ok := building[uuid]; ok && rec.Status == backend.ProvisionStatusFailed {
+					rec.Status = backend.ProvisionStatusReady
+					rec.FailCount = existing.FailCount
+					rec.LastError = existing.LastError
+					rec.Reason = existing.Reason
+					rec.Message = existing.Message
+					failedLeases = append(failedLeases, uuid)
+					b.logger.Warn("container crashed after provisioning",
+						"lease_uuid", uuid,
+						"tenant", existing.Tenant,
+					)
+				}
 			}
 		}
-	}
 
-	// FailCount anti-regression on rebuilt entries: a re-list after an in-memory
-	// increment would otherwise regress FailCount to the stale label. Preserve
-	// the higher in-memory value. Skipped for in-flight statuses (preserved
-	// wholesale below).
-	for uuid, rec := range building {
-		existing, ok := b.provisions[uuid]
-		if !ok {
-			continue
-		}
-		switch existing.Status {
-		case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
-			// preserved wholesale below
-		default:
-			if existing.FailCount > rec.FailCount {
-				rec.FailCount = existing.FailCount
-			}
-			// Re-observing the same failed runtime does not replace its original
-			// actor-authored cause with a generic cohort diagnosis. A different
-			// release/operation or an actual transition to Ready is independent.
-			if existing.Status == backend.ProvisionStatusFailed && rec.Status == backend.ProvisionStatusFailed &&
-				existing.Reason != "" && rec.ActiveReleaseVersion == existing.ActiveReleaseVersion &&
-				rec.ActiveOperationID == existing.ActiveOperationID {
-				rec.LastError = existing.LastError
-				rec.Reason = existing.Reason
-				rec.Message = existing.Message
+		// Cold-start correction: provisions recovered as failed with no prior
+		// in-memory state carry a creation-time FailCount label. Increment it to
+		// account for the failure evidenced by the dead container. The baseline
+		// LastError rides the materialized value.
+		for uuid, rec := range building {
+			if rec.Status == backend.ProvisionStatusFailed {
+				if _, hasExisting := b.provisions[uuid]; !hasExisting {
+					if _, cohortFailure := cohortDirectFailures[uuid]; cohortFailure {
+						continue
+					}
+					rec.FailCount++
+					rec.LastError = leasesm.ErrMsgContainerExited
+					rec.Reason = backend.ReasonContainerExited
+					rec.Message = leasesm.ErrMsgContainerExited
+					coldStartFailed = append(coldStartFailed, uuid)
+					b.logger.Info("cold-start: adjusted FailCount for already-failed provision",
+						"lease_uuid", uuid,
+						"fail_count", rec.FailCount,
+					)
+				}
 			}
 		}
-	}
 
-	// Publish: materialize every rebuilt entry into a fresh *provision (the only
-	// path a recoveredProvision reaches b.provisions). A fresh struct clears
-	// stale fields such as LastError exactly as the prior
-	// fresh-&provision{}+swap did.
-	final := make(map[string]*provision, len(building))
-	for uuid, rec := range building {
-		final[uuid] = rec.materialize()
-	}
-
-	// Overlay existing entries that must be preserved: the actor / deprovision
-	// goroutine owns their live state, so reuse the live *provision pointer
-	// (no off-actor field mutation).
-	for uuid, existing := range b.provisions {
-		if _, closing := closeIntents[uuid]; closing {
-			// The immutable close claim supersedes every volatile projection.
-			// Cleanup-only closes deliberately remove a stale projection; full
-			// closes use the conservative value materialized above.
-			continue
-		}
-		if _, closed := closedLeaseUUIDs[uuid]; closed {
-			// A successful close permanently retires the UUID. Its sealed receipt
-			// supersedes both stale volatile state and any pre-close release row.
-			continue
-		}
-		if _, changed := changedProjectionLeases[uuid]; changed {
-			// Inventory and its derived allocation snapshot predate this live
-			// projection generation. Preserve the exact actor-owned value and its
-			// existing pool keys; the next recovery pass can converge it from a
-			// fresh baseline without delaying unrelated leases in this pass.
-			final[uuid] = existing
-			continue
-		}
-		if _, pending := pendingIntentLeases[uuid]; pending {
-			// A durable operation/maintenance intent closes the admission-to-
-			// projection-publication window that the volatile status alone cannot
-			// represent, and preserves unresolved execution afterward. An accepted
-			// re-provision is Provisioning, while predecessor container identity and
-			// runtime authority can remain necessary for recovery. Preserve the exact
-			// actor-owned projection and its allocation generation instead of
-			// rebuilding them from predecessor inventory before settlement.
-			final[uuid] = existing
-			continue
-		}
-		if _, hasContainers := building[uuid]; hasContainers {
-			// By-design (ENG-414): only the in-flight statuses below are preserved
-			// here. Stable Ready and Failing/Failed entries may use the container-
-			// derived value, so a crashed-then-running lease recovers to Ready
-			// (TestRecoverState_FailCountAntiRegression). Actor transitions after the
-			// inventory baseline are excluded by changedProjectionLeases above; the
-			// second baseline comparison and actor-quiescence claim below also defer
-			// changes during publication hand-off and active actor ownership.
+		// FailCount anti-regression on rebuilt entries: a re-list after an in-memory
+		// increment would otherwise regress FailCount to the stale label. Preserve
+		// the higher in-memory value. Skipped for in-flight statuses (preserved
+		// wholesale below).
+		for uuid, rec := range building {
+			existing, ok := b.provisions[uuid]
+			if !ok {
+				continue
+			}
 			switch existing.Status {
 			case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
-				// In-flight re-provision: the rebuilt containers belong to the
-				// previous (failed) provision; keep the in-flight entry so the
-				// next container creation picks up the right FailCount.
+				// preserved wholesale below
+			default:
+				if existing.FailCount > rec.FailCount {
+					rec.FailCount = existing.FailCount
+				}
+				// Re-observing the same failed runtime does not replace its original
+				// actor-authored cause with a generic cohort diagnosis. A different
+				// release/operation or an actual transition to Ready is independent.
+				if existing.Status == backend.ProvisionStatusFailed && rec.Status == backend.ProvisionStatusFailed &&
+					existing.Reason != "" && rec.ActiveReleaseVersion == existing.ActiveReleaseVersion &&
+					rec.ActiveOperationID == existing.ActiveOperationID {
+					rec.LastError = existing.LastError
+					rec.Reason = existing.Reason
+					rec.Message = existing.Message
+				}
+			}
+		}
+
+		// Publish: materialize every rebuilt entry into a fresh *provision (the only
+		// path a recoveredProvision reaches b.provisions). A fresh struct clears
+		// stale fields such as LastError exactly as the prior
+		// fresh-&provision{}+swap did.
+		final = make(map[string]*provision, len(building))
+		for uuid, rec := range building {
+			final[uuid] = rec.materialize()
+		}
+
+		// Overlay existing entries that must be preserved: the actor / deprovision
+		// goroutine owns their live state, so reuse the live *provision pointer
+		// (no off-actor field mutation).
+		for uuid, existing := range b.provisions {
+			if _, closing := closeIntents[uuid]; closing {
+				// The immutable close claim supersedes every volatile projection.
+				// Cleanup-only closes deliberately remove a stale projection; full
+				// closes use the conservative value materialized above.
+				continue
+			}
+			if _, closed := closedLeaseUUIDs[uuid]; closed {
+				// A successful close permanently retires the UUID. Its sealed receipt
+				// supersedes both stale volatile state and any pre-close release row.
+				continue
+			}
+			if _, changed := changedProjectionLeases[uuid]; changed {
+				// Inventory and its derived allocation snapshot predate this live
+				// projection generation. Preserve the exact actor-owned value and its
+				// existing pool keys; the next recovery pass can converge it from a
+				// fresh baseline without delaying unrelated leases in this pass.
+				final[uuid] = existing
+				continue
+			}
+			if _, pending := pendingIntentLeases[uuid]; pending {
+				// A durable operation/maintenance intent closes the admission-to-
+				// projection-publication window that the volatile status alone cannot
+				// represent, and preserves unresolved execution afterward. An accepted
+				// re-provision is Provisioning, while predecessor container identity and
+				// runtime authority can remain necessary for recovery. Preserve the exact
+				// actor-owned projection and its allocation generation instead of
+				// rebuilding them from predecessor inventory before settlement.
+				final[uuid] = existing
+				continue
+			}
+			if _, hasContainers := building[uuid]; hasContainers {
+				// By-design (ENG-414): only the in-flight statuses below are preserved
+				// here. Stable Ready and Failing/Failed entries may use the container-
+				// derived value, so a crashed-then-running lease recovers to Ready
+				// (TestRecoverState_FailCountAntiRegression). Actor transitions after the
+				// inventory baseline are excluded by changedProjectionLeases above; the
+				// second baseline comparison and actor-quiescence claim below also defer
+				// changes during publication hand-off and active actor ownership.
+				switch existing.Status {
+				case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
+					// In-flight re-provision: the rebuilt containers belong to the
+					// previous (failed) provision; keep the in-flight entry so the
+					// next container creation picks up the right FailCount.
+					final[uuid] = existing
+				case backend.ProvisionStatusDeprovisioning:
+					// The deprovision goroutine owns this lease; do not resurrect it
+					// to a container-derived status (ENG-193 explicit case).
+					final[uuid] = existing
+				}
+				continue
+			}
+			switch existing.Status {
+			case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
+				// In-flight operation that hasn't produced containers yet.
+				final[uuid] = existing
+			case backend.ProvisionStatusFailing:
+				// Failing is transient (container-death detected, diag goroutine not
+				// yet fired DiagGathered). Normalize to Failed so retry paths (which
+				// require Status == Failed) can proceed. Build the kept entry as a
+				// value — no in-place mutation of the published struct.
+				rec := recoveredFromProvision(existing)
+				rec.Status = backend.ProvisionStatusFailed
+				final[uuid] = rec.materialize()
+			case backend.ProvisionStatusFailed:
+				// Failed provision whose containers are gone — preserve so the
+				// reconciler sees the failure and its FailCount.
 				final[uuid] = existing
 			case backend.ProvisionStatusDeprovisioning:
-				// The deprovision goroutine owns this lease; do not resurrect it
-				// to a container-derived status (ENG-193 explicit case).
+				// Owned by the in-flight deprovision goroutine; preserve untouched
+				// (ENG-193 explicit case — previously dropped on recovery).
 				final[uuid] = existing
 			}
-			continue
 		}
-		switch existing.Status {
-		case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
-			// In-flight operation that hasn't produced containers yet.
-			final[uuid] = existing
-		case backend.ProvisionStatusFailing:
-			// Failing is transient (container-death detected, diag goroutine not
-			// yet fired DiagGathered). Normalize to Failed so retry paths (which
-			// require Status == Failed) can proceed. Build the kept entry as a
-			// value — no in-place mutation of the published struct.
-			rec := recoveredFromProvision(existing)
-			rec.Status = backend.ProvisionStatusFailed
-			final[uuid] = rec.materialize()
-		case backend.ProvisionStatusFailed:
-			// Failed provision whose containers are gone — preserve so the
-			// reconciler sees the failure and its FailCount.
-			final[uuid] = existing
-		case backend.ProvisionStatusDeprovisioning:
-			// Owned by the in-flight deprovision goroutine; preserve untouched
-			// (ENG-193 explicit case — previously dropped on recovery).
-			final[uuid] = existing
-		}
+		return nil
+	}()
+	if mergeErr != nil {
+		return mergeErr
 	}
 	// Candidate construction intentionally does not hold the actor registry: slow
 	// inventory parsing must not pause unrelated lease admission. Publication is a
-	// much smaller critical section. Drop provisionsMu, then reacquire the two
-	// authorities in their canonical actorsMu -> provisionsMu order through an
+	// much smaller critical section. The merge scope released provisionsMu; acquire
+	// the two authorities in their canonical actorsMu -> provisionsMu order through an
 	// opaque capability. Any lease that changed in the gap, gained a durable
 	// operation, or still has an active actor is preserved for the next sweep.
 	// The first comparison refreshed only changed snapshots. Candidate building
 	// above mutates detached values, so that baseline still describes the live map
 	// at this hand-off without another deep clone of every tracked lease.
 	publicationBaseline := provisionBaseline
-	b.provisionsMu.Unlock()
 
 	publicationDeferred := make(map[string]struct{})
 	var cohortTransitionGenerations []shared.RuntimeGenerationProof

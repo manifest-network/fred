@@ -1848,6 +1848,17 @@ reconciliation can recover missed edges from current state. Accepted backend
 effects are different and remain protected by durable attempts, mutation
 journals, receipts, and callback outboxes.
 
+Close events that encounter a locally proven inventory wait, busy lifecycle,
+or HTTP circuit refusal transfer a typed retry hint to the manager. A fixed
+four-worker scheduler coalesces hints by lease, retains at most 1,024 queued or
+executing hints, and retries after one second with backoff capped at five
+seconds. Each attempt has a 30-second budget and reacquires current ownership;
+queuing or dispatching a close never means resources were retained or removed.
+Only the callback and queried backend state report physical completion.
+Saturation returns an event error, unknown backend effects remain failures,
+and shutdown cancels and joins the workers. Periodic reconciliation recovers
+work after lost events, queue saturation, or process restart.
+
 ### How It Works
 
 Instead of replaying missed events (edge-triggered), reconciliation queries current state. Before reading provisions, the reconciler calls `RefreshState` on each backend. That call synchronizes an in-process backend; the standard HTTP client deliberately implements it as a no-op because a remote backend owns its own projection. In the normal separate-process deployment, Docker substrate/WAL recovery runs at docker-backend startup and on its own `reconcile_interval` (default `5m`), independently of providerd's `reconciliation_interval`.

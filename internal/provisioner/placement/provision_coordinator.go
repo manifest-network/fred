@@ -205,10 +205,16 @@ func (authority *ProvisionCoordinator) Valid() bool {
 // physical call, retry memory, and settlement. The caller supplies only the
 // lifecycle subject and cannot choose a backend or terminal outcome.
 func (authority *ProvisionCoordinator) Deprovision(ctx context.Context, leaseUUID string) error {
+	return authority.DeprovisionEvent(ctx, leaseUUID).Err()
+}
+
+// DeprovisionEvent additionally exposes constructor-observed deferral for a
+// bounded event scheduler. An ordinary backend error never issues retry proof.
+func (authority *ProvisionCoordinator) DeprovisionEvent(ctx context.Context, leaseUUID string) DeprovisionEventResult {
 	if !authority.Valid() {
-		return ErrDeprovisionExecution
+		return deprovisionEventFromError(ErrDeprovisionExecution)
 	}
-	return authority.deprovision.execute(ctx, leaseUUID)
+	return authority.deprovision.executeEvent(ctx, leaseUUID)
 }
 
 // readLease performs a bounded read through the exact chain authority bound at

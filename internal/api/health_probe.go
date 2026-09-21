@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"runtime/debug"
 	"time"
 
 	"github.com/manifest-network/fred/internal/metrics"
@@ -45,7 +46,7 @@ func (h *Handlers) startChainHealthProbe(ctx context.Context) <-chan healthProbe
 			// become an unhealthy observation rather than terminate providerd.
 			defer func() {
 				if recovered := recover(); recovered != nil {
-					slog.Error("chain health probe panicked", "panic", recovered)
+					slog.Error("chain health probe panicked", "panic", recovered, "stack", string(debug.Stack()))
 					metrics.ChainHealthProbePanicsTotal.Inc()
 					err = errors.New("chain health probe panicked")
 				}

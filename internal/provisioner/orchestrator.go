@@ -39,6 +39,7 @@ type provisionOrchestratorMarker struct{ _ byte }
 type HandlerEventCoordinator struct {
 	orchestrator *ProvisionOrchestrator
 	issuer       *provisionOrchestratorMarker
+	deferred     *deferredCloseScheduler
 }
 
 func (o *ProvisionOrchestrator) HandlerEvents() *HandlerEventCoordinator {
@@ -68,15 +69,27 @@ func (events *HandlerEventCoordinator) Deprovision(ctx context.Context, leaseUUI
 	if !events.Valid() {
 		return errors.New("handler event coordinator is invalid")
 	}
-	err := events.orchestrator.coordinator.Deprovision(ctx, leaseUUID)
-	if err == nil {
+	result := events.orchestrator.coordinator.DeprovisionEvent(ctx, leaseUUID)
+	switch result.Disposition() {
+	case placement.DeprovisionEventCompleted:
 		return nil
+	case placement.DeprovisionEventDeferred:
+		if events.deferred != nil {
+			if err := events.deferred.enqueue(result.Deferred()); err != nil {
+				return errors.Join(ErrDeprovisionFailed, result.Err(), err)
+			}
+			return nil // Retry ownership transferred; no physical completion is implied.
+		}
+	case placement.DeprovisionEventFailed:
+	default:
+		return errors.New("invalid deprovision event result")
 	}
-	result := errors.Join(ErrDeprovisionFailed, err)
+	err := result.Err()
+	failure := errors.Join(ErrDeprovisionFailed, err)
 	if errors.Is(err, placement.ErrDeprovisionAuthorityUnresolvable) {
-		result = errors.Join(result, ErrPlacementUnresolvable)
+		failure = errors.Join(failure, ErrPlacementUnresolvable)
 	}
-	return result
+	return failure
 }
 
 // ErrPlacementStoreUnavailable means a placement-dependent write path was

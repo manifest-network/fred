@@ -1743,13 +1743,21 @@ An ordinary durable conflict means at least two backends have positively
 reported the same lease. A rejected inventory response can instead create an
 `untrusted_positive` quarantine with only one candidate: Fred preserves the raw
 membership fact while refusing to trust that endpoint's ownership payload. A
-sole candidate of that exact kind may self-resolve when a later **complete**,
-identity-valid projection positively reports the same lease from the same
-backend. A partial projection, silence, a different reporter, more than one
-candidate, unknown ownership, or an ordinary conflict never self-resolves.
-Reconciliation intentionally retains the union in all those operator-only
-cases: later point-in-time absence cannot prove that a delayed request, effect,
-or callback on an absent candidate has been eliminated.
+sole candidate of that exact kind can regain its owner when a later sealed
+observation positively reports the same lease from the same backend, with
+paired, identity-valid responses from every configured backend and absence on
+every peer. Unrelated lease ambiguity does not block that per-lease proof. A
+missing peer, silence, a different reporter, multiple candidates, unknown
+ownership, or an ordinary conflict cannot establish a single owner this way.
+
+Terminal pruning is a separate path: a fully known candidate set, including a
+sole `untrusted_positive` candidate, can be removed after paired, identity-valid
+absence from every recorded candidate and an exact chain read proving CLOSED,
+REJECTED, or EXPIRED. No unresolved attempt, maintenance, or restore claim may
+remain. The proof binds the current placement revision and is consumed under
+lease exclusion. Chain absence, unknown owners, or incomplete inventory retain
+the quarantine. For conflicts that cannot satisfy either proof, use the stopped
+operator procedure below; point-in-time inventory absence alone is insufficient.
 
 1. Stop ingress and `providerd`, then use `-inspect` to record the exact revision
    and complete candidate set. All candidates must still belong to the durable

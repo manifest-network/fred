@@ -81,6 +81,7 @@ type Manager struct {
 	operationRuntime     operation.RuntimeController
 	executionCoordinator *placement.ExecutionCoordinator
 	handlers             *HandlerSet
+	deferredCloses       *deferredCloseScheduler
 
 	// Timeout checker for callback timeouts
 	timeoutChecker *TimeoutChecker
@@ -325,8 +326,11 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ManagerCh
 	if err != nil {
 		return nil, fmt.Errorf("create callback service: %w", err)
 	}
+	deferredCloses := newDeferredCloseScheduler()
+	handlerEvents := orchestrator.HandlerEvents()
+	handlerEvents.deferred = deferredCloses
 	handlers, err := NewHandlerSet(HandlerDeps{
-		Events:       orchestrator.HandlerEvents(),
+		Events:       handlerEvents,
 		PayloadStore: cfg.PayloadStore,
 		Publisher:    pubSub,
 		Callbacks:    callbacks,
@@ -357,6 +361,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ManagerCh
 		operationRuntime:     operationCoordinator.RuntimeController(),
 		executionCoordinator: executionCoordinator,
 		handlers:             handlers,
+		deferredCloses:       deferredCloses,
 		timeoutChecker:       timeoutChecker,
 		callbackTimeout:      callbackTimeout,
 		timeoutCheckInterval: timeoutCheckInterval,
@@ -501,6 +506,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	// shutdown sequence, several steps before Close(), and the batcher's
 	// lifetime belongs to Close(). Start is once-only; a second call is a no-op.
 	m.ackBatcher.Start(m.stopCtx)
+	m.deferredCloses.start(m.stopCtx)
 	m.openCallbackAdmission()
 	defer m.pauseCallbackAdmission()
 
@@ -537,6 +543,7 @@ func (m *Manager) Close() error {
 	// irreversible ordinary-work admission barrier defensively before closing
 	// any of the settlement paths below.
 	m.BeginDrain()
+	m.deferredCloses.wg.Wait()
 
 	// Reject new callback requests before draining either execution path. Direct
 	// callbacks are not owned by Watermill, so the router alone cannot account

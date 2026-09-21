@@ -63,5 +63,8 @@ func (m *Manager) WaitForDrain(ctx context.Context, timeout time.Duration) int {
 // BeginDrain irreversibly rejects new ordinary lifecycle work while preserving
 // settlement of operations and durable callbacks that were already accepted.
 func (m *Manager) BeginDrain() {
+	if m.deferredCloses != nil {
+		m.deferredCloses.stop()
+	}
 	m.operationRuntime.BeginDrain()
 }

@@ -459,9 +459,20 @@ func (derivation failedWithoutReleaseCleanupCloseIntentDerivation) spec() closeI
 	return derivation.value
 }
 
+type failedOperationProjectedCloseIntentDerivation struct {
+	value     closeIntentSpec
+	authority failedOperationProjectedClose
+}
+
+func (failedOperationProjectedCloseIntentDerivation) isCloseIntentDerivation() {}
+func (derivation failedOperationProjectedCloseIntentDerivation) spec() closeIntentSpec {
+	return derivation.value
+}
+
 // BeginClose derives the complete destructive and observational authority from
 // the exact release selected under the journal pair's per-lease gate. If no
-// release exists, an exact pending operation may supply the same authority.
+// release exists, an exact pending operation or a Failed operation with sealed,
+// re-attested predecessor absence may supply the same authority.
 func (s *CloseSettlement) BeginClose(request CloseRequest) (CloseIntentAdmission, error) {
 	if request.issuer != s {
 		return CloseIntentAdmission{}, errors.New("close request belongs to another settlement")
@@ -545,6 +556,10 @@ func (s *CloseSettlement) begin(
 	case failedWithoutReleaseCleanupCloseIntentDerivation:
 		admission, err = s.callbacks.beginCleanupCloseAfterFailedOperationLocked(
 			candidate, authority.absence,
+		)
+	case failedOperationProjectedCloseIntentDerivation:
+		admission, err = s.callbacks.beginProjectedCloseAfterFailedOperationLocked(
+			candidate, authority.authority,
 		)
 	default:
 		err = fmt.Errorf("unsupported close intent derivation %T", derivation)
@@ -635,14 +650,17 @@ func (s *CloseSettlement) deriveCloseSpecLocked(
 	}
 	operation := operationHead.claim.operationAuthority
 	if operationHead.claim.entry.State == operationIntentFailed {
-		if !cleanupOnly {
-			return nil, fmt.Errorf("%w for lease %q", ErrCloseAuthorityMissing, leaseUUID)
-		}
 		absence, err := bindFailedOperationWithoutRelease(
 			s.callbacks, s.releases, operationHead,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("derive failed-operation cleanup authority: %w", err)
+		}
+		if !cleanupOnly {
+			return failedOperationProjectedCloseIntentDerivation{
+				value:     closeSpecForOperationAuthority(leaseUUID, operation, retainOnClose, false),
+				authority: failedOperationProjectedClose{issuer: s, absence: absence},
+			}, nil
 		}
 		return failedWithoutReleaseCleanupCloseIntentDerivation{
 			value: closeSpecForOperationAuthority(

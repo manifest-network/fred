@@ -61,8 +61,9 @@ func classifyBracket[Subject, Evidence any](
 	return evidence, nil
 }
 
-// Inspect classifies one exact typed subject after the original execution's
-// process/call-stack boundary. Any classifier or identity-bracket failure is
+// Inspect classifies one exact typed subject after its protocol owner establishes
+// recovery exclusion, or consumes the exact live Refused result proving that no
+// tenant effect was entered. Any classifier or identity-bracket failure is
 // Ambiguous; only a complete strict read returns Attested evidence.
 func (a *RecoveryAttestor[Subject, Evidence]) Inspect(
 	execution RecoveryExecution[Subject],
