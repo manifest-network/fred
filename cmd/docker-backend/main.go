@@ -32,6 +32,7 @@ import (
 	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/configyaml"
+	"github.com/manifest-network/fred/internal/healthprobe"
 	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/tlsconfig"
 	"github.com/manifest-network/fred/internal/util"
@@ -570,10 +571,10 @@ func (s *Server) Handler() http.Handler {
 
 	// Operational endpoints — no auth required (monitoring, health checks).
 	if s.storageIdentity.Valid() {
-		mux.Handle("GET /health", s.verifyStorageIdentity(http.HandlerFunc(s.handleHealth)))
+		mux.Handle("GET /health", s.observeHealth(s.verifyStorageIdentity(http.HandlerFunc(s.handleHealth))))
 		mux.Handle("GET /stats", s.verifyStorageIdentity(http.HandlerFunc(s.handleStats)))
 	} else {
-		mux.HandleFunc("GET /health", s.handleHealth)
+		mux.Handle("GET /health", s.observeHealth(http.HandlerFunc(s.handleHealth)))
 		mux.HandleFunc("GET /stats", s.handleStats)
 	}
 	mux.Handle("GET /metrics", promhttp.Handler())
@@ -611,7 +612,10 @@ func (s *Server) verifyStorageIdentity(next http.Handler) http.Handler {
 			http.Error(w, "backend storage identity verifier unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		if err := s.identityVerifier.VerifyStorageIdentity(r.Context()); err != nil {
+		started := time.Now()
+		err := s.identityVerifier.VerifyStorageIdentity(r.Context())
+		healthprobe.Record(r.Context(), healthprobe.IdentityAdmission, time.Since(started), err)
+		if err != nil {
 			s.logger.Error("backend storage identity verification failed", "error", err)
 			w.Header().Del(backendidentity.ResponseHeader)
 			http.Error(w, "backend storage identity verification failed", http.StatusServiceUnavailable)

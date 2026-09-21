@@ -2,6 +2,9 @@ package shared
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -12,6 +15,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/maintenanceid"
 )
 
 func TestCallbackHealthValidationMatchesOriginalTraversal(t *testing.T) {
@@ -126,7 +130,7 @@ func TestCallbackHealthValidationMatchesOriginalTraversal(t *testing.T) {
 	}
 }
 
-func seedCallbackHealthOperationHistory(t *testing.T, store *CallbackStore, tx *bolt.Tx, leaseUUID, backendName string) {
+func seedCallbackHealthOperationHistory(t testing.TB, store *CallbackStore, tx *bolt.Tx, leaseUUID, backendName string) {
 	t.Helper()
 	_, storage := store.journalBackendIdentity("")
 	callback := "https://fred.example/callbacks/provision"
@@ -149,10 +153,69 @@ func seedCallbackHealthOperationHistory(t *testing.T, store *CallbackStore, tx *
 	require.NoError(t, tx.Bucket(callbackLeaseMutationHeadBucketName).SetSequence(1))
 }
 
+func seedCallbackHealthMaintenanceHistory(t testing.TB, store *CallbackStore, tx *bolt.Tx, leaseUUID string, count int) {
+	t.Helper()
+	_, storage := store.journalBackendIdentity("")
+	history, err := tx.Bucket(callbackMaintenanceHistoryBucketName).CreateBucketIfNotExists([]byte(leaseUUID))
+	require.NoError(t, err)
+	digest := sha256.Sum256([]byte(leaseUUID))
+	for index := range count {
+		id, err := maintenanceid.Parse(fmt.Sprintf("00000000-0000-4000-8000-%012x", index+1))
+		require.NoError(t, err)
+		record := maintenanceCompletionRecord{
+			Version: maintenanceCompletionRecordV1, MaintenanceID: id,
+			Kind: MaintenanceIntentRestart, LeaseUUID: leaseUUID,
+			RequestDigest: hex.EncodeToString(digest[:]), CompletionSequence: uint64(index + 1),
+			Backend: "docker-a", BackendStorageID: storage.String(), Tenant: "health-benchmark-tenant",
+			ProviderUUID: "33333333-3333-4333-8333-333333333333",
+			Status:       backend.CallbackStatusFailed, SettledAt: time.Unix(2, 0).UTC(),
+		}
+		data, err := marshalMaintenanceCompletionRecord(record)
+		require.NoError(t, err)
+		require.NoError(t, history.Put([]byte(id.String()), data))
+	}
+}
+
+func TestCallbackHealthHeadlessLeaseWithBothHistories(t *testing.T) {
+	const lease = "00000000-0000-4000-8000-000000000001"
+	for _, mode := range []string{"valid", "operation corrupt", "maintenance corrupt", "omitted reservation"} {
+		t.Run(mode, func(t *testing.T) {
+			store := newBoundCallbackHealthStore(t, 1)
+			require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
+				seedCallbackHealthOperationHistory(t, store, tx, lease, "docker-a")
+				seedCallbackHealthMaintenanceHistory(t, store, tx, lease, 2)
+				heads := tx.Bucket(callbackLeaseMutationHeadBucketName)
+				require.NoError(t, heads.Delete([]byte(lease)))
+				require.NoError(t, heads.SetSequence(3))
+				switch mode {
+				case "operation corrupt", "maintenance corrupt":
+					root := callbackOperationHistoryBucketName
+					if mode == "maintenance corrupt" {
+						root = callbackMaintenanceHistoryBucketName
+					}
+					bucket := tx.Bucket(root).Bucket([]byte(lease))
+					key, _ := bucket.Cursor().First()
+					require.NoError(t, bucket.Put(key, []byte("invalid")))
+				case "omitted reservation":
+					require.NoError(t, heads.SetSequence(1))
+				}
+				return nil
+			}))
+			oldErr, newErr := referenceCallbackHealth(store), store.HealthyContext(t.Context())
+			require.Equal(t, oldErr == nil, newErr == nil, "reference=%v current=%v", oldErr, newErr)
+			if mode == "valid" {
+				require.NoError(t, newErr, "both histories contribute their reservations exactly once")
+			} else {
+				require.Error(t, newErr, "neither history can hide behind the other root")
+			}
+		})
+	}
+}
+
 func TestCallbackHealthValidationIsTransactionScoped(t *testing.T) {
 	store := newBoundCallbackHealthStore(t, 1)
 	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
-		_, err := newCallbackReceiptValidation(tx)
+		_, err := newCallbackReceiptValidation(context.Background(), tx)
 		require.ErrorContains(t, err, "immutable read transaction")
 		return nil
 	}))

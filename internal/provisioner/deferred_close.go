@@ -22,11 +22,26 @@ const (
 
 var errDeferredCloseUnavailable = errors.New("deferred close capacity is unavailable")
 
+// Every hint has a distinct immutable identity, even when its proof names the
+// same lease. A running attempt can therefore consume only the hint it saw.
+type deferredCloseHint struct {
+	proof placement.DeferredDeprovision
+}
+
 type deferredCloseEntry struct {
-	proof   placement.DeferredDeprovision
-	next    time.Time
-	delay   time.Duration
-	running bool
+	hint       *deferredCloseHint
+	admittedAt time.Time
+	next       time.Time
+	delay      time.Duration
+	running    *deferredCloseAttempt
+}
+
+// Only dispatch constructs attempts, while holding the scheduler mutex. The
+// worker reads the captured hint; coalescing can replace the entry's hint
+// without changing the proof or lifetime of work already dispatched.
+type deferredCloseAttempt struct {
+	entry *deferredCloseEntry
+	hint  *deferredCloseHint
 }
 
 // deferredCloseScheduler owns bounded, coalesced retry hints. Only an opaque
@@ -57,7 +72,9 @@ func (scheduler *deferredCloseScheduler) enqueue(proof placement.DeferredDeprovi
 		metrics.DeferredClosesTotal.WithLabelValues("unavailable", string(proof.Reason())).Inc()
 		return errDeferredCloseUnavailable
 	}
-	if _, exists := scheduler.entries[proof.LeaseUUID()]; exists {
+	defer scheduler.updateOldestAgeLocked(time.Now())
+	if entry, exists := scheduler.entries[proof.LeaseUUID()]; exists {
+		entry.hint = &deferredCloseHint{proof: proof}
 		metrics.DeferredClosesTotal.WithLabelValues("coalesced", string(proof.Reason())).Inc()
 		return nil
 	}
@@ -65,8 +82,10 @@ func (scheduler *deferredCloseScheduler) enqueue(proof placement.DeferredDeprovi
 		metrics.DeferredClosesTotal.WithLabelValues("full", string(proof.Reason())).Inc()
 		return errDeferredCloseUnavailable
 	}
+	now := time.Now()
 	scheduler.entries[proof.LeaseUUID()] = &deferredCloseEntry{
-		proof: proof, delay: deferredCloseInterval, next: time.Now().Add(deferredCloseInterval),
+		hint: &deferredCloseHint{proof: proof}, admittedAt: now,
+		delay: deferredCloseInterval, next: now.Add(deferredCloseInterval),
 	}
 	metrics.DeferredClosesPending.Inc()
 	metrics.DeferredClosesTotal.WithLabelValues("queued", string(proof.Reason())).Inc()
@@ -83,15 +102,15 @@ func (scheduler *deferredCloseScheduler) start(parent context.Context) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	scheduler.cancel, scheduler.started = cancel, true
-	jobs := make(chan *deferredCloseEntry)
+	jobs := make(chan *deferredCloseAttempt)
 	for range deferredCloseWorkers {
 		scheduler.wg.Go(func() {
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case entry := <-jobs:
-					scheduler.retry(ctx, entry)
+				case attempt := <-jobs:
+					scheduler.retry(ctx, attempt)
 				}
 			}
 		})
@@ -112,59 +131,97 @@ func (scheduler *deferredCloseScheduler) start(parent context.Context) {
 	})
 }
 
-func (scheduler *deferredCloseScheduler) dispatch(now time.Time, jobs chan<- *deferredCloseEntry) {
+func (scheduler *deferredCloseScheduler) dispatch(now time.Time, jobs chan<- *deferredCloseAttempt) {
 	scheduler.mu.Lock()
 	defer scheduler.mu.Unlock()
 	if scheduler.closed {
 		return
 	}
+	scheduler.updateOldestAgeLocked(now)
 	for range deferredCloseWorkers {
 		var next *deferredCloseEntry
 		for _, entry := range scheduler.entries {
-			if !entry.running && !entry.next.After(now) && (next == nil || entry.next.Before(next.next)) {
+			if entry.running == nil && !entry.next.After(now) && (next == nil || entry.next.Before(next.next)) {
 				next = entry
 			}
 		}
 		if next == nil {
 			return
 		}
+		attempt := &deferredCloseAttempt{entry: next, hint: next.hint}
 		select {
-		case jobs <- next:
-			next.running = true
+		case jobs <- attempt:
+			next.running = attempt
 		default:
 			return
 		}
 	}
 }
 
-func (scheduler *deferredCloseScheduler) retry(ctx context.Context, entry *deferredCloseEntry) {
+func (scheduler *deferredCloseScheduler) retry(ctx context.Context, attempt *deferredCloseAttempt) {
 	defer scheduler.wakeDispatch()
 	attemptCtx, cancel := context.WithTimeout(ctx, deferredCloseAttemptTimeout)
-	result, panicErr := executeDeferredClose(attemptCtx, entry.proof)
+	result, panicErr := executeDeferredClose(attemptCtx, attempt.hint.proof)
 	cancel()
+	scheduler.finishAttempt(attempt, result, panicErr)
+}
+
+func (scheduler *deferredCloseScheduler) finishAttempt(
+	attempt *deferredCloseAttempt,
+	result placement.DeprovisionEventResult,
+	panicErr error,
+) {
 	scheduler.mu.Lock()
 	defer scheduler.mu.Unlock()
-	if scheduler.closed {
+	if scheduler.closed || attempt == nil || attempt.hint == nil {
 		return
 	}
+	proof := attempt.hint.proof
+	entry := scheduler.entries[proof.LeaseUUID()]
+	if entry == nil || entry != attempt.entry || entry.running != attempt {
+		return
+	}
+	defer scheduler.updateOldestAgeLocked(time.Now())
+	entry.running = nil
+	newerHint := entry.hint != attempt.hint
 	if result.Disposition() == placement.DeprovisionEventDeferred {
-		entry.proof = result.Deferred()
-		entry.running = false
+		if !newerHint {
+			entry.hint = &deferredCloseHint{proof: result.Deferred()}
+		}
 		entry.delay = min(2*entry.delay, deferredCloseMaxInterval)
 		entry.next = time.Now().Add(entry.delay)
-		metrics.DeferredClosesTotal.WithLabelValues("retry", string(entry.proof.Reason())).Inc()
+		metrics.DeferredClosesTotal.WithLabelValues("retry", string(result.Deferred().Reason())).Inc()
 		return
 	}
-	delete(scheduler.entries, entry.proof.LeaseUUID())
-	metrics.DeferredClosesPending.Dec()
+	if newerHint {
+		// Completion accounts for the dispatched hint only. A later hint must
+		// reacquire current authority in a separate attempt, even if this one
+		// failed or panicked. It retains the same bounded queue slot and age.
+		entry.delay = deferredCloseInterval
+		entry.next = time.Now().Add(entry.delay)
+	} else {
+		delete(scheduler.entries, proof.LeaseUUID())
+		metrics.DeferredClosesPending.Dec()
+	}
 	if result.Disposition() == placement.DeprovisionEventCompleted {
-		metrics.DeferredClosesTotal.WithLabelValues("dispatched", string(entry.proof.Reason())).Inc()
-		slog.Info("deferred lease close dispatched", "lease_uuid", entry.proof.LeaseUUID())
+		metrics.DeferredClosesTotal.WithLabelValues("dispatched", string(proof.Reason())).Inc()
+		slog.Info("deferred lease close dispatched", "lease_uuid", proof.LeaseUUID())
 		return
 	}
-	metrics.DeferredClosesTotal.WithLabelValues("failed", string(entry.proof.Reason())).Inc()
+	metrics.DeferredClosesTotal.WithLabelValues("failed", string(proof.Reason())).Inc()
 	slog.Error("deferred lease close failed; reconciliation will retry",
-		"lease_uuid", entry.proof.LeaseUUID(), "error", errors.Join(result.Err(), panicErr))
+		"lease_uuid", proof.LeaseUUID(), "error", errors.Join(result.Err(), panicErr))
+}
+
+// Age includes running work and survives coalescing and backoff. Dispatch's
+// one-second ticker refreshes it even when every worker is occupied.
+// Caller holds scheduler.mu.
+func (scheduler *deferredCloseScheduler) updateOldestAgeLocked(now time.Time) {
+	var oldestAge float64
+	for _, entry := range scheduler.entries {
+		oldestAge = max(oldestAge, now.Sub(entry.admittedAt).Seconds())
+	}
+	metrics.DeferredClosesOldestAge.Set(oldestAge)
 }
 
 func (scheduler *deferredCloseScheduler) wakeDispatch() {
@@ -200,8 +257,9 @@ func (scheduler *deferredCloseScheduler) stop() {
 		scheduler.cancel()
 	}
 	for _, entry := range scheduler.entries {
-		metrics.DeferredClosesTotal.WithLabelValues("stopped", string(entry.proof.Reason())).Inc()
+		metrics.DeferredClosesTotal.WithLabelValues("stopped", string(entry.hint.proof.Reason())).Inc()
 	}
 	metrics.DeferredClosesPending.Sub(float64(len(scheduler.entries)))
 	clear(scheduler.entries)
+	metrics.DeferredClosesOldestAge.Set(0)
 }

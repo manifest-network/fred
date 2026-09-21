@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Provider-to-Docker health probes now correlate slow or failed HTTP requests
+  through a validated `X-Fred-Health-Probe` diagnostic ID and completion logs
+  with bounded stage timings. Docker also logs fast successful completions at
+  INFO so later client timeouts can be correlated; slow or failed completions
+  use WARN. IDs do not grant authority or appear in metric labels; the
+  three-second remote probe budget is unchanged. (ENG-1006, ENG-1025)
+
+- `fred_provisioner_deferred_closes_oldest_age_seconds` exposes the age of the
+  oldest queued or executing close hint, preserving its first-enqueue time
+  across coalescing and retries. It resets when the scheduler is empty or
+  stopped. (ENG-1025)
+
 - Bounded close-event deferral with typed inventory/lifecycle waits and exact
   HTTP-client circuit refusal evidence. The manager coalesces up to 1,024 hints
   across four workers and reacquires ownership for every attempt, avoiding
@@ -771,6 +783,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (ENG-632)
 
 ### Fixed
+
+- Callback-store health validation reuses the already strictly decoded closed
+  tombstone within the same fresh transaction, removing a redundant decode
+  while preserving semantic, size and digest checks. Cancellation stops row
+  traversal cooperatively and prevents later health stages from starting;
+  synchronous database and filesystem waits remain non-preemptible. No healthy
+  verdict is cached and readiness checks are unchanged. (ENG-1006, ENG-1025)
+
+- A deferred close hint arriving during an older attempt now survives that
+  attempt's completion or failure. Private hint and attempt identities retain
+  the newer work in the same bounded slot; every retry still reacquires current
+  placement and lifecycle authority. (ENG-986, ENG-1025)
+- Documented deferred-close metrics in the architecture contract and linked
+  pending backend closes to the unsettled Docker-effects procedure when
+  durable launch debt prevents terminal settlement. (ENG-1025)
 
 - Docker retention inventory now decodes each page and its continuation from
   one identity-bound database snapshot. Concurrent restore finalization cannot

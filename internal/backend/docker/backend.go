@@ -3057,13 +3057,13 @@ func (b *Backend) TerminalStorageAuthorityFailure() <-chan error {
 // fail — the most data-loss-sensitive subsystem must not be the unmonitored
 // one. (ENG-448 / F31)
 func (b *Backend) Health(ctx context.Context) error {
-	if err := measureBackendHealth(healthStageIdentity, func() error { return b.requireStorageIdentity(ctx) }); err != nil {
+	if err := measureBackendHealth(ctx, healthStageIdentity, func() error { return b.requireStorageIdentity(ctx) }); err != nil {
 		return fmt.Errorf("backend storage identity unhealthy: %w", err)
 	}
-	if err := measureBackendHealth(healthStageDocker, func() error { return b.docker.Ping(ctx) }); err != nil {
+	if err := measureBackendHealth(ctx, healthStageDocker, func() error { return b.docker.Ping(ctx) }); err != nil {
 		return err
 	}
-	if err := measureBackendHealth(healthStageAccounting, func() error {
+	if err := measureBackendHealth(ctx, healthStageAccounting, func() error {
 		if b.pool != nil && b.pool.Stats().AccountingHeld {
 			return shared.ErrResourceAccountingIncomplete
 		}
@@ -3072,28 +3072,28 @@ func (b *Backend) Health(ctx context.Context) error {
 		return err
 	}
 	if b.callbackStore != nil {
-		if err := measureBackendHealth(healthStageCallbacks, b.callbackStore.Healthy); err != nil {
+		if err := measureBackendHealth(ctx, healthStageCallbacks, func() error { return b.callbackStore.HealthyContext(ctx) }); err != nil {
 			return fmt.Errorf("callback store unhealthy: %w", err)
 		}
 	}
 	if b.diagnosticsStore != nil {
-		if err := measureBackendHealth(healthStageDiagnostics, b.diagnosticsStore.Healthy); err != nil {
+		if err := measureBackendHealth(ctx, healthStageDiagnostics, b.diagnosticsStore.Healthy); err != nil {
 			return fmt.Errorf("diagnostics store unhealthy: %w", err)
 		}
 	}
 	if b.releaseStore != nil {
-		if err := measureBackendHealth(healthStageReleases, b.releaseStore.Healthy); err != nil {
+		if err := measureBackendHealth(ctx, healthStageReleases, b.releaseStore.Healthy); err != nil {
 			return fmt.Errorf("release store unhealthy: %w", err)
 		}
 	}
 	if b.retentionStore != nil {
-		if err := measureBackendHealth(healthStageRetentions, b.retentionStore.Healthy); err != nil {
+		if err := measureBackendHealth(ctx, healthStageRetentions, b.retentionStore.Healthy); err != nil {
 			return fmt.Errorf("retention store unhealthy: %w", err)
 		}
 	}
 	if b.volumeLaunches != nil {
 		var count int
-		err := measureBackendHealth(healthStageLaunches, func() error {
+		err := measureBackendHealth(ctx, healthStageLaunches, func() error {
 			var countErr error
 			count, countErr = b.volumeLaunches.pendingCount()
 			return countErr

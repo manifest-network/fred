@@ -2,6 +2,7 @@ package shared
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -1872,6 +1873,10 @@ func releaseClosedLeaseOperationReceiptsTx(tx *bolt.Tx, leaseUUID string) error 
 }
 
 func listOperationHistoryTx(tx *bolt.Tx, leaseUUID string) ([]operationCompletionRecord, error) {
+	return listOperationHistoryContextTx(context.Background(), tx, leaseUUID)
+}
+
+func listOperationHistoryContextTx(ctx context.Context, tx *bolt.Tx, leaseUUID string) ([]operationCompletionRecord, error) {
 	root := tx.Bucket(callbackOperationHistoryBucketName)
 	if root == nil {
 		return nil, errors.New("completed operation history bucket missing")
@@ -1888,7 +1893,7 @@ func listOperationHistoryTx(tx *bolt.Tx, leaseUUID string) ([]operationCompletio
 	var first operationCompletionRecord
 	operationCallbacks := make(map[OperationID]string)
 	callbackOperations := make(map[string]OperationID)
-	err := leaseBucket.ForEach(func(key, value []byte) error {
+	err := walkCallbackValidationRows(ctx, leaseBucket, func(key, value []byte) error {
 		if value == nil {
 			return fmt.Errorf("completed operation history %q contains a nested bucket", leaseUUID)
 		}

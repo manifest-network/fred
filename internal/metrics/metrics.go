@@ -626,6 +626,11 @@ var (
 		Namespace: namespace, Subsystem: "provisioner", Name: "deferred_closes_pending",
 		Help: "Close retry hints owned by the bounded provider scheduler, including executing hints.",
 	})
+	// DeferredClosesOldestAge includes running work and is refreshed each second.
+	DeferredClosesOldestAge = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace, Subsystem: "provisioner", Name: "deferred_closes_oldest_age_seconds",
+		Help: "Age since first enqueue of the oldest queued or executing close hint; zero when empty, refreshed each second.",
+	})
 	// DeferredClosesTotal distinguishes scheduled admission waits from failures.
 	DeferredClosesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: "provisioner", Name: "deferred_closes_total",

@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -12,6 +13,7 @@ import (
 // together, then discarded. No decoded payload survives into another lease or
 // request, and no result grants mutation authority.
 type callbackReceiptValidation struct {
+	ctx                 context.Context
 	tx                  *bolt.Tx
 	heads               *bolt.Bucket
 	operations          *bolt.Bucket
@@ -20,11 +22,12 @@ type callbackReceiptValidation struct {
 	maintenanceReserved uint64
 }
 
-func newCallbackReceiptValidation(tx *bolt.Tx) (*callbackReceiptValidation, error) {
+func newCallbackReceiptValidation(ctx context.Context, tx *bolt.Tx) (*callbackReceiptValidation, error) {
 	if tx == nil || tx.Writable() {
 		return nil, errors.New("callback receipt validation requires an immutable read transaction")
 	}
 	validation := &callbackReceiptValidation{
+		ctx:         ctx,
 		tx:          tx,
 		heads:       tx.Bucket(callbackLeaseMutationHeadBucketName),
 		operations:  tx.Bucket(callbackOperationHistoryBucketName),
@@ -37,7 +40,7 @@ func newCallbackReceiptValidation(tx *bolt.Tx) (*callbackReceiptValidation, erro
 }
 
 func (validation *callbackReceiptValidation) validate() error {
-	if err := validation.heads.ForEach(func(key, value []byte) error {
+	if err := walkCallbackValidationRows(validation.ctx, validation.heads, func(key, value []byte) error {
 		if value == nil {
 			return fmt.Errorf("callback lease mutation head %q is a nested bucket", key)
 		}
@@ -51,7 +54,7 @@ func (validation *callbackReceiptValidation) validate() error {
 	}
 	// Histories can outlive their head. Validate every root member's shape and
 	// key, then visit only leases not already decoded by an earlier root.
-	if err := validation.operations.ForEach(func(key, value []byte) error {
+	if err := walkCallbackValidationRows(validation.ctx, validation.operations, func(key, value []byte) error {
 		if value != nil {
 			return fmt.Errorf("completed operation history %q is not a nested bucket", key)
 		}
@@ -65,7 +68,7 @@ func (validation *callbackReceiptValidation) validate() error {
 	}); err != nil {
 		return err
 	}
-	if err := validation.maintenance.ForEach(func(key, value []byte) error {
+	if err := walkCallbackValidationRows(validation.ctx, validation.maintenance, func(key, value []byte) error {
 		if value != nil {
 			return fmt.Errorf("completed maintenance history %q is not a nested bucket", key)
 		}
@@ -94,7 +97,7 @@ func (validation *callbackReceiptValidation) validate() error {
 }
 
 func (validation *callbackReceiptValidation) validateLease(leaseUUID string, head leaseMutationHead) error {
-	operations, err := listOperationHistoryTx(validation.tx, leaseUUID)
+	operations, err := listOperationHistoryContextTx(validation.ctx, validation.tx, leaseUUID)
 	if err != nil {
 		return err
 	}
@@ -125,7 +128,7 @@ func (validation *callbackReceiptValidation) validateLease(leaseUUID string, hea
 			}
 		}
 	}
-	maintenance, err := listMaintenanceReceiptsTx(validation.tx, leaseUUID)
+	maintenance, err := listMaintenanceReceiptsContextTx(validation.ctx, validation.tx, leaseUUID)
 	if err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package shared
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -278,15 +279,20 @@ func decodeLeaseMutationHead(key, value []byte) (leaseMutationHead, error) {
 		if stored.Closed == nil {
 			return nil, fmt.Errorf("callback lease mutation head %q closed tag has different payload", key)
 		}
+		// The strict envelope decoder has already checked the complete nested
+		// payload. Keep its semantic and encoded-size checks without decoding
+		// the same immutable tombstone a second time on every health traversal.
+		if err := validateClosedLeaseTombstone(*stored.Closed, string(key)); err != nil {
+			return nil, fmt.Errorf("invalid closed callback lease %q: %w", key, err)
+		}
 		payload, err := json.Marshal(stored.Closed)
 		if err != nil {
 			return nil, fmt.Errorf("remarshal callback closed head %q: %w", key, err)
 		}
-		entry, err := decodeClosedLeaseTombstone(key, payload)
-		if err != nil {
-			return nil, err
+		if len(payload) > maxCloseIntentEntryBytes {
+			return nil, fmt.Errorf("closed callback lease exceeds %d bytes", maxCloseIntentEntryBytes)
 		}
-		return closedLeaseMutationHead{entry: entry, digest: digest}, nil
+		return closedLeaseMutationHead{entry: *stored.Closed, digest: digest}, nil
 	default:
 		return nil, fmt.Errorf("callback lease mutation head %q has invalid kind %q", key, stored.Kind)
 	}
@@ -758,7 +764,11 @@ func releaseCallbackReceiptReservationsTx(tx *bolt.Tx, released uint64) error {
 }
 
 func validateCallbackReceiptStateTx(tx *bolt.Tx) error {
-	validation, err := newCallbackReceiptValidation(tx)
+	return validateCallbackReceiptStateContextTx(context.Background(), tx)
+}
+
+func validateCallbackReceiptStateContextTx(ctx context.Context, tx *bolt.Tx) error {
+	validation, err := newCallbackReceiptValidation(ctx, tx)
 	if err != nil {
 		return err
 	}
@@ -831,12 +841,16 @@ func (s *CallbackStore) LeaseMutationUUIDCapacity() (LeaseMutationUUIDCapacity, 
 }
 
 func validateLeaseMutationUUIDSlotsTx(tx *bolt.Tx) error {
+	return validateLeaseMutationUUIDSlotsContextTx(context.Background(), tx)
+}
+
+func validateLeaseMutationUUIDSlotsContextTx(ctx context.Context, tx *bolt.Tx) error {
 	slots := tx.Bucket(callbackLeaseMutationUUIDSlotBucketName)
 	if slots == nil {
 		return errors.New("callback lease mutation UUID slot bucket missing")
 	}
 	var count uint64
-	if err := slots.ForEach(func(key, value []byte) error {
+	if err := walkCallbackValidationRows(ctx, slots, func(key, value []byte) error {
 		if value == nil {
 			return fmt.Errorf("callback lease mutation UUID slot %q is a nested bucket", key)
 		}
@@ -867,7 +881,7 @@ func validateLeaseMutationUUIDSlotsTx(tx *bolt.Tx) error {
 	if heads == nil {
 		return errors.New("callback lease mutation head bucket missing")
 	}
-	return heads.ForEach(func(key, value []byte) error {
+	return walkCallbackValidationRows(ctx, heads, func(key, value []byte) error {
 		if value == nil {
 			return fmt.Errorf("callback lease mutation head %q is a nested bucket", key)
 		}

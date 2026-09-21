@@ -21,6 +21,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/callbackurl"
+	"github.com/manifest-network/fred/internal/healthprobe"
 	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/maintenanceid"
 	"github.com/manifest-network/fred/internal/strictjson"
@@ -2767,12 +2768,16 @@ func (c *HTTPClient) fetchRetentionsPage(
 
 // Health checks if the backend is reachable and healthy.
 // It sends a GET request to /health on the backend.
-func (c *HTTPClient) Health(ctx context.Context) error {
+func (c *HTTPClient) Health(ctx context.Context) (err error) {
+	ctx, observation := healthprobe.Start(ctx)
+	status := 0
+	defer func() { observation.Finish(slog.Default().With("backend", c.Name()), healthprobe.Client, status, err) }()
 	// Don't go through circuit breaker for health checks - we want to know actual status
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
 	if err != nil {
 		return fmt.Errorf("create health request: %w", err)
 	}
+	httpReq.Header.Set(healthprobe.Header, observation.ID())
 
 	if err := c.prepareRequest(httpReq, nil, requestIdentityRead); err != nil {
 		return err
@@ -2782,6 +2787,7 @@ func (c *HTTPClient) Health(ctx context.Context) error {
 		return fmt.Errorf("health check failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	status = resp.StatusCode
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("backend unhealthy: status %d", resp.StatusCode)

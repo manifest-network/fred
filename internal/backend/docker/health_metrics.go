@@ -1,23 +1,26 @@
 package docker
 
 import (
+	"context"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/manifest-network/fred/internal/healthprobe"
 )
 
-type backendHealthStage string
+type backendHealthStage = healthprobe.Stage
 
 const (
-	healthStageIdentity    backendHealthStage = "storage_identity"
-	healthStageDocker      backendHealthStage = "docker_ping"
-	healthStageAccounting  backendHealthStage = "resource_accounting"
-	healthStageCallbacks   backendHealthStage = "callback_store"
-	healthStageDiagnostics backendHealthStage = "diagnostics_store"
-	healthStageReleases    backendHealthStage = "release_store"
-	healthStageRetentions  backendHealthStage = "retention_store"
-	healthStageLaunches    backendHealthStage = "launch_journal"
+	healthStageIdentity    backendHealthStage = healthprobe.StorageIdentity
+	healthStageDocker      backendHealthStage = healthprobe.DockerPing
+	healthStageAccounting  backendHealthStage = healthprobe.ResourceAccounting
+	healthStageCallbacks   backendHealthStage = healthprobe.CallbackStore
+	healthStageDiagnostics backendHealthStage = healthprobe.DiagnosticsStore
+	healthStageReleases    backendHealthStage = healthprobe.ReleaseStore
+	healthStageRetentions  backendHealthStage = healthprobe.RetentionStore
+	healthStageLaunches    backendHealthStage = healthprobe.LaunchJournal
 )
 
 var backendHealthDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
@@ -28,10 +31,17 @@ var backendHealthDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Buckets:   prometheus.DefBuckets,
 }, []string{"check"})
 
-func measureBackendHealth(stage backendHealthStage, probe func() error) error {
+func measureBackendHealth(ctx context.Context, stage backendHealthStage, probe func() error) error {
+	// The stage boundary owns cancellation admission. A canceled request cannot
+	// start another synchronous store traversal or publish a skipped timing.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	started := time.Now()
 	err := probe()
-	backendHealthDuration.WithLabelValues(string(stage)).Observe(time.Since(started).Seconds())
+	duration := time.Since(started)
+	backendHealthDuration.WithLabelValues(string(stage)).Observe(duration.Seconds())
+	healthprobe.Record(ctx, stage, duration, err)
 	return err
 }
 

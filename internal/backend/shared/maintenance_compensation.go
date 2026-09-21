@@ -614,11 +614,15 @@ func NewMaintenanceCompensationSourceFailed(subject MaintenanceCompensationSubje
 // validateMaintenanceCompensationsTx verifies the subordinate extension against
 // the canonical lease head; orphan plans are corruption, never restored claims.
 func validateMaintenanceCompensationsTx(tx *bolt.Tx) error {
+	return validateMaintenanceCompensationsContextTx(context.Background(), tx)
+}
+
+func validateMaintenanceCompensationsContextTx(ctx context.Context, tx *bolt.Tx) error {
 	bucket := tx.Bucket(maintenanceCompensationBucket)
 	if bucket == nil {
 		return nil
 	}
-	return bucket.ForEach(func(key, value []byte) error {
+	return walkCallbackValidationRows(ctx, bucket, func(key, value []byte) error {
 		var record maintenanceCompensationRecord
 		if err := decodeStrictAuthoritativeObject(value, maxMaintenanceIntentEntryBytes, &record); err != nil {
 			return err

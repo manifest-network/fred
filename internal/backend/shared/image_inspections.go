@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -325,12 +326,16 @@ func (j *ImageInspectionJournal) validateTx(tx *bolt.Tx) error {
 }
 
 func visitImageInspectionsTx(tx *bolt.Tx, visit func(imageInspectionRecord) error) error {
+	return visitImageInspectionsContextTx(context.Background(), tx, visit)
+}
+
+func visitImageInspectionsContextTx(ctx context.Context, tx *bolt.Tx, visit func(imageInspectionRecord) error) error {
 	bucket := tx.Bucket(imageInspectionsBucketName)
 	if bucket == nil {
 		return nil
 	} // Optional extension: drained v0.13 journals remain adoptable.
 	count := 0
-	return bucket.ForEach(func(key, value []byte) error {
+	return walkCallbackValidationRows(ctx, bucket, func(key, value []byte) error {
 		count++
 		if count > maxImageInspectionReceipts {
 			return errors.New("image inspection journal exceeds receipt limit")

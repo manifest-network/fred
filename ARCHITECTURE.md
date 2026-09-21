@@ -1692,6 +1692,9 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `fred_provisioner_in_flight_provisions` | gauge | — | Current in-flight provisions |
+| `fred_provisioner_deferred_closes_pending` | gauge | — | Queued or executing close retry hints owned by the bounded provider scheduler; at most 1,024 lease entries. These are scheduling hints, not physical cleanup progress |
+| `fred_provisioner_deferred_closes_oldest_age_seconds` | gauge | — | Age since first enqueue of the oldest queued or executing lease entry, preserved across coalescing and retries. Refreshed approximately once per second and on queue mutations; zero when empty or stopped. This is scheduler age, not the age of a durable backend close intent |
+| `fred_provisioner_deferred_closes_total` | counter | `outcome, reason` | Close-hint scheduling outcomes: `queued`, `coalesced`, `retry`, `dispatched`, `failed`, `full`, `unavailable`, or `stopped`. Reasons are `inventory_pending`, `lifecycle_busy`, or `backend_unavailable`. Every attempt reacquires current authority; `dispatched` means successful call return, not physical completion. A completed or failed attempt can leave a newer coalesced hint pending |
 | `fred_provisioner_provisioning_total` | counter | `outcome, backend, operation` | Provisioning operations by outcome/backend. `operation` ∈ `provision`/`restore` separates fresh provisions from restores (ENG-358) |
 | `fred_provisioner_provisioning_duration_seconds` | histogram | `backend, operation` | Provisioning latency. `operation` ∈ `provision`/`restore` |
 | `fred_provisioner_callback_timeouts_total` | counter | — | Backend callback timeouts |
@@ -1737,6 +1740,23 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_backend_allocated_cpu_ratio` | gauge | `backend` | Allocated-CPU ratio observed by the router at provision time (allocated/total). Per-backend router-decision signal, event-sampled on multi-candidate routing; not intended for cross-backend aggregation — use the backends' own `/stats` component gauges for fleet views (ENG-318) |
 | `fred_backend_routing_fallback_total` | counter | — | Provision-routing decisions that fell back to round-robin (no usable backend load stats) |
 | `fred_backend_health_probe_panics_total` | counter | — | Panics recovered inside a per-backend health-probe goroutine. Always a bug: the probe is an HTTP call that should return errors. The recover exists because these probes run on their own goroutines, where net/http's per-connection panic recovery does not reach them |
+
+Health-request diagnostics are separate from these cumulative metrics. Each
+outbound probe sends a fresh `X-Fred-Health-Probe` UUIDv4; Docker accepts one
+canonical value or generates a local ID and echoes it. Docker emits a
+`health probe completed` log for every server completion: INFO for fast success,
+WARN for failure or duration of at least one second. The provider client logs
+only slow or failed completions at WARN. A matching server success establishes
+completed backend work; it does not by itself locate the cause of a client timeout.
+Records contain duration, HTTP status, bounded outcome and completed Docker
+stages, including identity admission. An HTTP cancellation does not
+rewrite earlier completed stage outcomes. The ID is diagnostic only, carries no
+authority and never becomes a metric label. The three-second remote budget,
+storage-identity verification and health verdict contract are unchanged.
+Callback-store traversal observes cancellation between bounded rows in a fresh
+identity-bound transaction, without caching health or starting background work;
+database acquisition and filesystem waits remain synchronous. See
+[health diagnosis](OPERATIONS.md#why-health-never-503s) for interpretation.
 
 **Chain:**
 

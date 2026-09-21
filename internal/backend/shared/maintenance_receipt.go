@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -407,6 +408,14 @@ func listMaintenanceReceiptsTx(
 	tx *bolt.Tx,
 	leaseUUID string,
 ) ([]maintenanceCompletionRecord, error) {
+	return listMaintenanceReceiptsContextTx(context.Background(), tx, leaseUUID)
+}
+
+func listMaintenanceReceiptsContextTx(
+	ctx context.Context,
+	tx *bolt.Tx,
+	leaseUUID string,
+) ([]maintenanceCompletionRecord, error) {
 	root := tx.Bucket(callbackMaintenanceHistoryBucketName)
 	if root == nil {
 		return nil, errors.New("completed maintenance history bucket missing")
@@ -420,7 +429,7 @@ func listMaintenanceReceiptsTx(
 		return nil, nil
 	}
 	var records []maintenanceCompletionRecord
-	err := leaseBucket.ForEach(func(key, value []byte) error {
+	err := walkCallbackValidationRows(ctx, leaseBucket, func(key, value []byte) error {
 		if value == nil {
 			return fmt.Errorf("completed maintenance history %q contains nested receipt %q", leaseUUID, key)
 		}

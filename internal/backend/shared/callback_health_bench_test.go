@@ -26,6 +26,33 @@ func BenchmarkCallbackHealth(b *testing.B) {
 	}
 }
 
+// Histories can survive without a current head. This fixture exercises both
+// receipt roots and increasing per-lease depth independently of closed heads,
+// whose successful close normally compacts both histories into a tombstone.
+func BenchmarkCallbackHealthHistories(b *testing.B) {
+	for _, depth := range []int{1, 16, 128} {
+		b.Run(fmt.Sprintf("leases=64/depth=%d", depth), func(b *testing.B) {
+			store := newBoundCallbackHealthStore(b, 64)
+			require.NoError(b, store.db.Update(func(tx *bolt.Tx) error {
+				for index := range 64 {
+					lease := fmt.Sprintf("00000000-0000-4000-8000-%012x", index+1)
+					seedCallbackHealthOperationHistory(b, store, tx, lease, "docker-a")
+					seedCallbackHealthMaintenanceHistory(b, store, tx, lease, depth)
+					require.NoError(b, tx.Bucket(callbackLeaseMutationHeadBucketName).Delete([]byte(lease)))
+				}
+				return tx.Bucket(callbackLeaseMutationHeadBucketName).SetSequence(uint64(64 * (depth + 1)))
+			}))
+			require.NoError(b, store.Healthy())
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := store.HealthyContext(b.Context()); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func newBoundCallbackHealthStore(t testing.TB, closedRows int) *CallbackStore {
 	t.Helper()
 	path, storage := initializeBoundCallbackStore(t)

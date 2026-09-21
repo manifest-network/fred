@@ -1240,8 +1240,20 @@ func walkV2CallbackEntries(
 	leaseUUID string,
 	visit func(CallbackEntry) error,
 ) error {
+	return walkV2CallbackEntriesContext(context.Background(), leaseBucket, leaseUUID, visit)
+}
+
+func walkV2CallbackEntriesContext(
+	ctx context.Context,
+	leaseBucket *bolt.Bucket,
+	leaseUUID string,
+	visit func(CallbackEntry) error,
+) error {
 	cursor := leaseBucket.Cursor()
 	for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if value == nil {
 			return fmt.Errorf("callback v2 lease %q contains nested delivery bucket %q",
 				leaseUUID, string(key))
@@ -1279,11 +1291,15 @@ func walkV2CallbackEntries(
 }
 
 func validateCallbackQueueTx(tx *bolt.Tx) error {
+	return validateCallbackQueueContextTx(context.Background(), tx)
+}
+
+func validateCallbackQueueContextTx(ctx context.Context, tx *bolt.Tx) error {
 	root := tx.Bucket(callbackV2BucketName)
 	if root == nil {
 		return fmt.Errorf("callback v2 bucket missing")
 	}
-	return root.ForEach(func(leaseKey, value []byte) error {
+	return walkCallbackValidationRows(ctx, root, func(leaseKey, value []byte) error {
 		leaseUUID := string(leaseKey)
 		if value != nil {
 			return fmt.Errorf("callback v2 lease %q is not a nested bucket", leaseUUID)
@@ -1295,7 +1311,7 @@ func validateCallbackQueueTx(tx *bolt.Tx) error {
 		if leaseBucket == nil {
 			return fmt.Errorf("callback v2 lease %q is unreadable", leaseUUID)
 		}
-		return walkV2CallbackEntries(leaseBucket, leaseUUID, nil)
+		return walkV2CallbackEntriesContext(ctx, leaseBucket, leaseUUID, nil)
 	})
 }
 
@@ -1447,11 +1463,25 @@ func (s *CallbackStore) notifyReplaySubscribers(wake callbackReplayWake) {
 // an operator cannot miss preserved poison evidence. The embedded boltStore
 // health check only knows its legacy bucket and cannot enforce that contract.
 func (s *CallbackStore) Healthy() error {
-	return s.view(func(tx *bolt.Tx) error {
+	return s.HealthyContext(context.Background())
+}
+
+// HealthyContext validates the current immutable store snapshot, cooperatively
+// stopping between bounded records when the caller cancels. It never caches a
+// healthy verdict or leaves a traversal running after it returns. Filesystem
+// operations and bbolt read-transaction acquisition remain synchronous.
+func (s *CallbackStore) HealthyContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := s.view(func(tx *bolt.Tx) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := requireCompleteCallbackSchema(tx); err != nil {
 			return err
 		}
-		if err := visitImageInspectionsTx(tx, func(r imageInspectionRecord) error {
+		if err := visitImageInspectionsContextTx(ctx, tx, func(r imageInspectionRecord) error {
 			name, storage := s.journalBackendIdentity("")
 			if r.Backend != name || r.StorageID != storage.String() {
 				return errors.New("image inspection receipt belongs to another storage lineage")
@@ -1460,23 +1490,27 @@ func (s *CallbackStore) Healthy() error {
 		}); err != nil {
 			return err
 		}
-		if err := validateMaintenanceCompensationsTx(tx); err != nil {
+		if err := validateMaintenanceCompensationsContextTx(ctx, tx); err != nil {
 			return err
 		}
-		if err := (&VolumeLaunchJournal{store: s}).validateTx(tx); err != nil {
+		if err := (&VolumeLaunchJournal{store: s}).validateContextTx(ctx, tx); err != nil {
 			return err
 		}
-		if err := validateLeaseMutationUUIDSlotsTx(tx); err != nil {
+		if err := validateLeaseMutationUUIDSlotsContextTx(ctx, tx); err != nil {
 			return err
 		}
-		if err := validateCallbackReceiptStateTx(tx); err != nil {
+		if err := validateCallbackReceiptStateContextTx(ctx, tx); err != nil {
 			return err
 		}
-		if err := validateCallbackQueueTx(tx); err != nil {
+		if err := validateCallbackQueueContextTx(ctx, tx); err != nil {
 			return fmt.Errorf("callback queue unhealthy: %w", err)
 		}
-		return nil
+		return ctx.Err()
 	})
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 // requireDrainedLegacyCallbackBucket enforces the stopped-and-drained v0.13

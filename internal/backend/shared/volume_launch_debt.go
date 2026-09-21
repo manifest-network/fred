@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -323,8 +324,12 @@ func (j *VolumeLaunchJournal) checkTx(tx *bolt.Tx, proposed volumeLaunchDebtReco
 }
 
 func (j *VolumeLaunchJournal) validateTx(tx *bolt.Tx) error {
+	return j.validateContextTx(context.Background(), tx)
+}
+
+func (j *VolumeLaunchJournal) validateContextTx(ctx context.Context, tx *bolt.Tx) error {
 	backend, storage := j.store.journalBackendIdentity("")
-	return visitVolumeLaunchDebtsTx(tx, func(r volumeLaunchDebtRecord) error {
+	return visitVolumeLaunchDebtsContextTx(ctx, tx, func(r volumeLaunchDebtRecord) error {
 		if r.Backend != backend || r.StorageID != storage.String() {
 			return errors.New("volume launch debt belongs to another storage lineage")
 		}
@@ -333,12 +338,16 @@ func (j *VolumeLaunchJournal) validateTx(tx *bolt.Tx) error {
 }
 
 func visitVolumeLaunchDebtsTx(tx *bolt.Tx, visit func(volumeLaunchDebtRecord) error) error {
+	return visitVolumeLaunchDebtsContextTx(context.Background(), tx, visit)
+}
+
+func visitVolumeLaunchDebtsContextTx(ctx context.Context, tx *bolt.Tx, visit func(volumeLaunchDebtRecord) error) error {
 	bucket := tx.Bucket(volumeLaunchDebtBucketName)
 	if bucket == nil {
 		return nil
 	}
 	count := 0
-	return bucket.ForEach(func(key, value []byte) error {
+	return walkCallbackValidationRows(ctx, bucket, func(key, value []byte) error {
 		count++
 		if count > maxVolumeLaunchDebts {
 			return errors.New("volume launch debt journal exceeds capacity")
