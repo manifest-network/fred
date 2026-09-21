@@ -798,6 +798,13 @@ state, so unrelated leases may still use healthy answering backends. Retention,
 untrusted identity, novel reporters, and generation/principal contradictions
 remain unresolved and fail closed.
 
+Docker reads each retention page's records and continuation cursor in one
+identity-bound database snapshot. A concurrent restore finalizer cannot remove
+a selected row between key selection and decoding. Corrupt records and invalid
+identities still fail the page; they are never skipped as if absent. Separate
+pages and the provision/retention endpoints remain separate observations, so
+the existing paired-inventory and lifecycle checks still apply.
+
 **Symptoms**
 
 - `fred_reconciler_backend_fetch_total{backend="X",outcome!="ok"}` rising.
@@ -848,7 +855,15 @@ depends on the unavailable backend, not every healthy node.
    peer. An unrelated lease's overlap does not block that proof. A missing peer,
    continued ambiguity for this lease, silence, a different reporter, multiple
    candidates, unknown ownership, or an ordinary conflict cannot establish a
-   single owner this way. Separately, terminal pruning can remove a known-owner
+   single owner this way. An in-flight operation need not finish before that
+   narrow quarantine can be removed: the Store must match its existing typed
+   operation generation, backend and tenant/provider principal to the fresh
+   provision observation. It preserves the complete attempt, callback route
+   and lifecycle record; it does not confirm the attempt or settle the callback.
+   The current sweep, record revision, maintenance, restore-source and active
+   settlement-claim fences still apply. Normal authenticated settlement or
+   independently authorized reconciliation must then complete the operation.
+   Separately, terminal pruning can remove a known-owner
    quarantine after paired, identity-valid absence from every recorded candidate
    and an exact chain read proving CLOSED, REJECTED, or EXPIRED. It requires no
    unresolved attempt, maintenance, or restore claim and rechecks the exact
@@ -857,6 +872,14 @@ depends on the unavailable backend, not every healthy node.
 3. If it is gone for good, that is a **removal**, not an outage — see the next
    section. Do not leave it configured-but-absent indefinitely: PENDING leases on
    it are on a ~30-minute chain expiry clock the whole time.
+
+A healthy endpoint or complete inventory is not proof that every lease has
+settled. If `exact durable placement generation is unavailable for operation
+settlement` repeats, correlate the callback's lease UUID with quarantine logs,
+in-flight work and physical inventory after a later authoritative sweep. A
+deferred close's `dispatched` record likewise does not prove teardown. Inventory
+waits can last until the next sweep; retain the original close deadline failure
+even if a later callback or retention record establishes eventual completion.
 
 > **Why cleanup no longer pauses fleet-wide.** Orphan detection, payload cleanup
 > and placement pruning all delete durable state, and until ENG-654 all three were
@@ -949,7 +972,10 @@ one candidate. That narrow one-candidate quarantine can regain its owner from a
 later identity-valid matching positive from the same backend, with paired
 responses from every configured backend and absence of that lease on every
 peer. Ambiguity for another lease does not block this proof, but a missing peer
-or silence cannot establish ownership. Separately, a fully known candidate set
+or silence cannot establish ownership. For an in-flight operation, exact typed
+generation and principal matching can remove only the observation quarantine,
+preserving its existing attempt and lifecycle until normal settlement. This
+does not repair ordinary conflicts or grant cleanup authority. Separately, a fully known candidate set
 can be pruned after paired, identity-valid absence from every candidate and an
 exact chain read proving CLOSED, REJECTED, or EXPIRED, with no unresolved attempt,
 maintenance, or restore claim. This includes a sole `untrusted_positive`

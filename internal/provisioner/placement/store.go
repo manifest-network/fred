@@ -2889,6 +2889,17 @@ func (s *Store) projectInventory(
 	}
 
 	result := projectionResult{Fenced: make(map[string]struct{})}
+	// An in-flight operation owns its transition, but must not prevent a later
+	// exact inventory from removing an observation-only quarantine. These
+	// Store-issued proofs preserve the operation and lifecycle byte-for-byte;
+	// they are independent of caller-selected positive projection policy.
+	reaffirmations := make(map[string]quarantineReaffirmation)
+	for leaseUUID := range projection.causalExclusions {
+		proof := s.observeQuarantineReaffirmationLocked(fence, projection.AbsenceEvidence, leaseUUID)
+		if _, valid := proof.placementLocked(s); valid {
+			reaffirmations[leaseUUID] = proof
+		}
+	}
 	keySet := make(map[string]struct{},
 		len(projection.Placements)+len(projection.Conflicts)+
 			len(projection.UntrustedPositives)+len(projection.retentionPositives))
@@ -2904,6 +2915,9 @@ func (s *Store) projectInventory(
 	for leaseUUID := range projection.retentionPositives {
 		keySet[leaseUUID] = struct{}{}
 	}
+	for leaseUUID := range reaffirmations {
+		keySet[leaseUUID] = struct{}{}
+	}
 	keys := slices.Sorted(maps.Keys(keySet))
 
 	now := s.now().UTC()
@@ -2911,8 +2925,9 @@ func (s *Store) projectInventory(
 	mutations := make(map[string]projectionMutation, len(keys))
 	lifecycleMutations := make(map[string]projectionLifecycleMutation, len(keys))
 	for _, leaseUUID := range keys {
+		reaffirmed, reaffirmationValid := reaffirmations[leaseUUID].placementLocked(s)
 		if _, excluded := projection.causalExclusions[leaseUUID]; excluded &&
-			projection.Placements[leaseUUID] != "" {
+			projection.Placements[leaseUUID] != "" && !reaffirmationValid {
 			result.markFenced(leaseUUID)
 			continue
 		}
@@ -2933,6 +2948,9 @@ func (s *Store) projectInventory(
 		var candidate Placement
 		acceptedPositive := false
 		switch {
+		case reaffirmationValid:
+			candidate = reaffirmed
+
 		case projection.Conflicts[leaseUUID] != nil:
 			candidate = projectConflict(existing, exists, projection.Conflicts[leaseUUID], now)
 

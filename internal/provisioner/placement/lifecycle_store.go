@@ -494,8 +494,8 @@ func quarantineLifecycleBindings(
 		}
 		// Placement usability is checked before lifecycle authority is exposed.
 		// Keep an independently valid capability behind that gate so a future
-		// explicit repair path can retain the exact ID. No current reconciler caller
-		// supplies such a repair. The binding checks below still quarantine any
+		// exact inventory reaffirmation can retain the original ID without
+		// promoting an unfinished operation. The binding checks below quarantine any
 		// owner or attempt mismatch.
 		if placement.Backend != "" && capability.backend != placement.Backend {
 			quarantine(leaseUUID, fmt.Sprintf(

@@ -2,7 +2,6 @@ package docker
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/manifest-network/fred/internal/backend"
 )
@@ -43,19 +42,12 @@ func (b *Backend) ListRetentionsPage(_ context.Context, after string, limit int)
 	if limit > backend.MaxPageLimit {
 		limit = backend.MaxPageLimit
 	}
-	keys, next, err := b.retentionStore.KeysPage(after, limit)
+	entries, next, err := b.retentionStore.ListPage(after, limit)
 	if err != nil {
 		return nil, "", err
 	}
-	out := make([]backend.RetainedLease, 0, len(keys))
-	for _, key := range keys {
-		entry, getErr := b.retentionStore.Get(key)
-		if getErr != nil {
-			return nil, "", getErr
-		}
-		if entry == nil {
-			return nil, "", fmt.Errorf("retention %q disappeared during inventory read", key)
-		}
+	out := make([]backend.RetainedLease, 0, len(entries))
+	for _, entry := range entries {
 		out = append(out, backend.RetainedLease{
 			LeaseUUID:    entry.OriginalLeaseUUID,
 			ProviderUUID: entry.ProviderUUID,

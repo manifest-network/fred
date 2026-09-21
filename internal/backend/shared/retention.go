@@ -1362,7 +1362,8 @@ func (s *RetentionStore) deleteIfRestoringUnsafe(
 
 // List returns all RetentionEntry records in the store.
 func (s *RetentionStore) List() ([]RetentionEntry, error) {
-	return s.filter(func(_ *RetentionEntry) bool { return true })
+	entries, _, err := s.ListPage("", 0)
+	return entries, err
 }
 
 // Keys returns every retained lease UUID (the bbolt key) without unmarshalling the heavy
@@ -1379,55 +1380,66 @@ func (s *RetentionStore) Keys() ([]string, error) {
 	return out, err
 }
 
-// KeysPage returns one keyset page of retained lease UUIDs (the bbolt keys) in
-// ascending key order, containing the keys strictly greater than `after`. It
-// uses a bbolt cursor Seek so the read is O(limit), not a full-bucket scan, and
-// (like Keys) skips the heavy per-record value unmarshal.
-//
-//   - limit <= 0 -> returns ALL keys, next "" — the unpaginated passthrough. The
-//     cursor is ignored in this mode, matching PaginateRetentions/keysetPage.
-//   - limit  > 0 -> returns up to limit keys strictly greater than `after`; next
-//     is the last returned key iff a full page was returned AND more keys remain,
-//     otherwise "".
-//
-// The returned slice is always non-nil so callers serialize it as [] not null.
-// Precondition: keys are canonical lease UUIDs — bbolt stores keys byte-sorted,
-// which matches the client's keyset cursor order (canonical-lowercase UUID).
-func (s *RetentionStore) KeysPage(after string, limit int) (keys []string, next string, err error) {
-	keys = []string{}
-	err = s.view(func(tx *bolt.Tx) error {
-		b := tx.Bucket(retentionBucketName)
-		if b == nil {
-			return nil
-		}
-		c := b.Cursor()
-
-		var k []byte
-		// limit <= 0 is the unpaginated passthrough: return every key and ignore
-		// the cursor, matching PaginateRetentions/keysetPage. (ParsePageParams
-		// never pairs a non-empty cursor with limit<=0, so a cursor with limit<=0
-		// only reaches a direct store caller — keep the two consistent anyway.)
-		if after == "" || limit <= 0 {
-			k, _ = c.First()
-		} else {
-			// Seek lands on the first key >= after; advance past an exact match so
-			// the page starts strictly after the cursor (keyset semantics).
-			k, _ = c.Seek([]byte(after))
-			if k != nil && string(k) == after {
-				k, _ = c.Next()
-			}
-		}
-
-		for ; k != nil; k, _ = c.Next() {
-			if limit > 0 && len(keys) == limit {
-				next = keys[len(keys)-1] // full page + at least one more key remains
-				return nil
-			}
-			keys = append(keys, string(k)) // string(k) copies; no cursor bytes escape the txn
-		}
-		return nil
+// ListPage returns detached retention records and their continuation from one
+// identity-bound bbolt snapshot. Decoding happens before that view closes, so a
+// concurrent restore finalizer cannot separate a selected key from its value.
+// Positive limits use an ordered cursor and decode at most limit records; next
+// is the last returned key only when more keys exist. A nonpositive limit is
+// the unpaginated passthrough and ignores after. Separate pages are separate
+// snapshots: the cursor establishes key order, not a whole-walk transaction.
+func (s *RetentionStore) ListPage(after string, limit int) ([]RetentionEntry, string, error) {
+	var entries []RetentionEntry
+	var next string
+	err := s.view(func(tx *bolt.Tx) error {
+		var err error
+		entries, next, err = s.retentionPageTx(tx, after, limit)
+		return err
 	})
-	return keys, next, err
+	if err != nil {
+		return nil, "", err
+	}
+	return entries, next, nil
+}
+
+func (s *RetentionStore) retentionPageTx(tx *bolt.Tx, after string, limit int) ([]RetentionEntry, string, error) {
+	if err := validateRetentionRootBuckets(tx); err != nil {
+		return nil, "", err
+	}
+	entries := make([]RetentionEntry, 0)
+	cursor := tx.Bucket(retentionBucketName).Cursor()
+	var key, value []byte
+	if after == "" || limit <= 0 {
+		key, value = cursor.First()
+	} else {
+		key, value = cursor.Seek([]byte(after))
+		if string(key) == after {
+			key, value = cursor.Next()
+		}
+	}
+	last := ""
+	for ; key != nil; key, value = cursor.Next() {
+		if limit > 0 && len(entries) == limit {
+			return entries, last, nil
+		}
+		entry, err := decodeRetentionEntry(value)
+		if err != nil {
+			return nil, "", fmt.Errorf("malformed retention record %q: %w", key, err)
+		}
+		if err := validateRetentionEntryResourceProfiles(&entry); err != nil {
+			return nil, "", fmt.Errorf("invalid retention record %q: %w", key, err)
+		}
+		if s.binding != nil {
+			if err := validateAuthoritativeRetentionIdentity(key, &entry); err != nil {
+				return nil, "", fmt.Errorf("invalid retention identity %q: %w", key, err)
+			}
+			if err := validateRetentionSourceAuthorityForBinding(&entry); err != nil {
+				return nil, "", fmt.Errorf("invalid retention source %q: %w", key, err)
+			}
+		}
+		entries = append(entries, entry)
+		last = string(key)
+	}
+	return entries, "", nil
 }
 
 // ListExpired returns active entries whose CreatedAt is older than maxAge.

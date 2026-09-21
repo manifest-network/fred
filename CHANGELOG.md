@@ -772,6 +772,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Docker retention inventory now decodes each page and its continuation from
+  one identity-bound database snapshot. Concurrent restore finalization cannot
+  make a selected key disappear before its record is read; malformed records
+  still fail the page. (ENG-1002, ENG-997, ENG-1025)
+- An exact paired inventory can remove a sole rejected-observation quarantine
+  from an existing typed operation even while it remains in flight. The Store
+  preserves its owner, full attempt and lifecycle authority, requires the same
+  generation and principal, and retains sweep, revision and mutation fences.
+  Normal callback or reconciliation settlement must still finish the operation;
+  foreign, ambiguous and ordinary conflict evidence remains fenced.
+  (ENG-997, ENG-1025)
+
 - Failed operations that never published a Release can now close their live
   Docker projection through a distinct journal-pair witness. Exact predecessor
   absence, principal, topology and callback FIFO remain required; failed image
