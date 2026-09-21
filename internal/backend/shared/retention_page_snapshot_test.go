@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
@@ -136,7 +137,10 @@ func TestRetentionPageRejectsInvalidSnapshotWithoutPartialRows(t *testing.T) {
 func TestRetentionPageReturnsDetachedNestedValues(t *testing.T) {
 	stores := openOperationHandoffStores(t, "docker-page-detached")
 	_, _, source := restoreHandoffFixture(t, stores, "detached-page")
-	source.CreatedAt = source.CreatedAt.Round(0) // JSON persistence omits the monotonic clock reading.
+	// Persist UTC explicitly so strict object equality is independent of the
+	// host's Local location and JSON's zero-offset timestamp normalization.
+	source.CreatedAt = time.Date(2026, time.September, 21, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, stores.retentions.putForTest(source))
 	page, _, err := stores.retentions.ListPage("", 1)
 	require.NoError(t, err)
 	require.Len(t, page, 1)
