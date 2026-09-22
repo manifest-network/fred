@@ -14,7 +14,6 @@ func BenchmarkTokenTracker_TryUse(b *testing.B) {
 	dir := b.TempDir()
 	tracker, err := NewTokenTracker(TokenTrackerConfig{
 		DBPath:          filepath.Join(dir, "tokens.db"),
-		MaxAge:          time.Hour,
 		CleanupInterval: time.Hour,
 	})
 	if err != nil {
@@ -28,7 +27,7 @@ func BenchmarkTokenTracker_TryUse(b *testing.B) {
 	i := 0
 	for b.Loop() {
 		token := fmt.Sprintf("bench-token-%d", i)
-		if err := tracker.TryUse(token); err != nil {
+		if err := tracker.TryUse(replayClaimForTest(token)); err != nil {
 			b.Fatal(err)
 		}
 		i++
@@ -40,7 +39,6 @@ func BenchmarkTokenTracker_TryUse_Parallel(b *testing.B) {
 	dir := b.TempDir()
 	tracker, err := NewTokenTracker(TokenTrackerConfig{
 		DBPath:          filepath.Join(dir, "tokens.db"),
-		MaxAge:          time.Hour,
 		CleanupInterval: time.Hour,
 	})
 	if err != nil {
@@ -55,7 +53,7 @@ func BenchmarkTokenTracker_TryUse_Parallel(b *testing.B) {
 		for pb.Next() {
 			id := counter.Add(1)
 			token := fmt.Sprintf("token-%d", id)
-			if err := tracker.TryUse(token); err != nil {
+			if err := tracker.TryUse(replayClaimForTest(token)); err != nil {
 				b.Error(err)
 			}
 		}
@@ -67,7 +65,6 @@ func BenchmarkTokenTracker_ReplayDetection(b *testing.B) {
 	dir := b.TempDir()
 	tracker, err := NewTokenTracker(TokenTrackerConfig{
 		DBPath:          filepath.Join(dir, "tokens.db"),
-		MaxAge:          time.Hour,
 		CleanupInterval: time.Hour,
 	})
 	if err != nil {
@@ -80,7 +77,7 @@ func BenchmarkTokenTracker_ReplayDetection(b *testing.B) {
 	tokens := make([]string, numTokens)
 	for i := range numTokens {
 		tokens[i] = fmt.Sprintf("preload-token-%d", i)
-		if err := tracker.TryUse(tokens[i]); err != nil {
+		if err := tracker.TryUse(replayClaimForTest(tokens[i])); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -90,7 +87,7 @@ func BenchmarkTokenTracker_ReplayDetection(b *testing.B) {
 	i := 0
 	for b.Loop() {
 		// Try to reuse an existing token - should return ErrTokenAlreadyUsed
-		err := tracker.TryUse(tokens[i%numTokens])
+		err := tracker.TryUse(replayClaimForTest(tokens[i%numTokens]))
 		if err != ErrTokenAlreadyUsed {
 			b.Fatalf("expected ErrTokenAlreadyUsed, got %v", err)
 		}
@@ -103,7 +100,6 @@ func BenchmarkTokenTracker_MixedWorkload(b *testing.B) {
 	dir := b.TempDir()
 	tracker, err := NewTokenTracker(TokenTrackerConfig{
 		DBPath:          filepath.Join(dir, "tokens.db"),
-		MaxAge:          time.Hour,
 		CleanupInterval: time.Hour,
 	})
 	if err != nil {
@@ -116,7 +112,7 @@ func BenchmarkTokenTracker_MixedWorkload(b *testing.B) {
 	existingTokens := make([]string, numExistingTokens)
 	for i := range numExistingTokens {
 		existingTokens[i] = fmt.Sprintf("existing-token-%d", i)
-		tracker.TryUse(existingTokens[i])
+		tracker.TryUse(replayClaimForTest(existingTokens[i]))
 	}
 
 	var newTokenCounter atomic.Int64
@@ -128,11 +124,11 @@ func BenchmarkTokenTracker_MixedWorkload(b *testing.B) {
 			localCounter++
 			// 90% new tokens, 10% replay attempts
 			if localCounter%10 == 0 {
-				tracker.TryUse(existingTokens[localCounter%numExistingTokens])
+				tracker.TryUse(replayClaimForTest(existingTokens[localCounter%numExistingTokens]))
 			} else {
 				id := newTokenCounter.Add(1)
 				token := fmt.Sprintf("new-token-%d", id)
-				tracker.TryUse(token)
+				tracker.TryUse(replayClaimForTest(token))
 			}
 		}
 	})
@@ -147,7 +143,6 @@ func TestTokenTracker_StressTest(t *testing.T) {
 	dir := t.TempDir()
 	tracker, err := NewTokenTracker(TokenTrackerConfig{
 		DBPath:          filepath.Join(dir, "tokens.db"),
-		MaxAge:          time.Hour,
 		CleanupInterval: time.Hour,
 	})
 	if err != nil {
@@ -185,7 +180,7 @@ func TestTokenTracker_StressTest(t *testing.T) {
 					token = fmt.Sprintf("token-%d-%d", gid, i)
 				}
 
-				err := tracker.TryUse(token)
+				err := tracker.TryUse(replayClaimForTest(token))
 				switch err {
 				case nil:
 					newTokens.Add(1)
@@ -224,7 +219,6 @@ func TestTokenTracker_HighContention(t *testing.T) {
 	dir := t.TempDir()
 	tracker, err := NewTokenTracker(TokenTrackerConfig{
 		DBPath:          filepath.Join(dir, "tokens.db"),
-		MaxAge:          time.Hour,
 		CleanupInterval: time.Hour,
 	})
 	if err != nil {
@@ -254,7 +248,7 @@ func TestTokenTracker_HighContention(t *testing.T) {
 
 			for i := range opsPerRoutine {
 				token := sharedTokens[i%numSharedTokens]
-				err := tracker.TryUse(token)
+				err := tracker.TryUse(replayClaimForTest(token))
 				switch err {
 				case nil:
 					firstUse.Add(1)

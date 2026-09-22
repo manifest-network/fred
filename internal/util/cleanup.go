@@ -38,45 +38,48 @@ func StartCleanupLoop(ctx context.Context, interval time.Duration, cleanup Clean
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	runOnce := func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error(component+" cleanup panic — recovering to keep fred alive",
-					"panic", r,
-					"stack", string(debug.Stack()),
-				)
-				if onPanic != nil {
-					// Nested recover: a panic inside the observability
-					// hook must not escape and crash the process. The
-					// outer recover above has already consumed the
-					// original panic, so any further panic in onPanic
-					// would otherwise propagate unconstrained.
-					func() {
-						defer func() {
-							if r2 := recover(); r2 != nil {
-								slog.Error("cleanup panic handler itself panicked",
-									"component", component,
-									"panic", r2,
-									"stack", string(debug.Stack()),
-								)
-							}
-						}()
-						onPanic(r)
-					}()
-				}
-			}
-		}()
-		if err := cleanup(); err != nil {
-			slog.Error(component+" cleanup failed", "error", err)
-		}
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runOnce()
+			RunCleanupIteration(cleanup, component, onPanic)
 		}
+	}
+}
+
+// RunCleanupIteration contains one background iteration, including the optional
+// immediate first pass of a periodic worker, within the same panic boundary.
+// Ordinary errors and panics are logged; onPanic observes only panics.
+func RunCleanupIteration(cleanup CleanupFunc, component string, onPanic PanicHandler) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error(component+" cleanup panic — recovering to keep fred alive",
+				"panic", r,
+				"stack", string(debug.Stack()),
+			)
+			if onPanic != nil {
+				// Nested recover: a panic inside the observability
+				// hook must not escape and crash the process. The
+				// outer recover above has already consumed the
+				// original panic, so any further panic in onPanic
+				// would otherwise propagate unconstrained.
+				func() {
+					defer func() {
+						if r2 := recover(); r2 != nil {
+							slog.Error("cleanup panic handler itself panicked",
+								"component", component,
+								"panic", r2,
+								"stack", string(debug.Stack()),
+							)
+						}
+					}()
+					onPanic(r)
+				}()
+			}
+		}
+	}()
+	if err := cleanup(); err != nil {
+		slog.Error(component+" cleanup failed", "error", err)
 	}
 }

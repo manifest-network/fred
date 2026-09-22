@@ -1,7 +1,10 @@
 package manifest
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -572,6 +575,12 @@ func TestManifest_Labels_RejectsMixedCaseReservedPrefix(t *testing.T) {
 		{"TrAeFiK.http.services.x.loadbalancer.server.port", "traefik."},
 		{"FRED.lease", "fred."},
 		{"Fred.retention", "fred."},
+		{"com.docker.compose.project", "com.docker.compose."},
+		{"CoM.DoCkEr.CoMpOsE.oneoff", "com.docker.compose."},
+		{"traefiK.enable", "traefik."},
+		{"com.docKer.compose.project", "com.docker.compose."},
+		{"com.docker.compoſe.project", "com.docker.compose."},
+		{"COM.DOCKER.COMPOſE.project", "com.docker.compose."},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
 			m := &Manifest{Image: "nginx", Labels: map[string]string{tc.key: "x"}}
@@ -590,11 +599,52 @@ func TestManifest_Labels_AllowsReservedLookalike(t *testing.T) {
 		"traefikish.foo",      // no dot boundary
 		"com.example.traefik", // reserved token not at the start
 		"myfred.bookkeeping",  // not a prefix
-		"FREDDIE.mercury",     // lowercases to "freddie." — not "fred."
+		"com.docker.composeish.project",
+		"my.com.docker.compose.project",
+		"FREDDIE.mercury", // lowercases to "freddie." — not "fred."
+		"traefiKish.enable",
+		"com.docKer.compoſeish.project",
+		"my.traefiK.enable",
+		"traefık.enable", // dotless I is not a Unicode case-fold equivalent of I
+		"traefik．enable", // full-width dot is not the namespace separator
 	} {
 		t.Run(key, func(t *testing.T) {
 			m := &Manifest{Image: "nginx", Labels: map[string]string{key: "x"}}
 			assert.NoError(t, m.Validate(), "benign lookalike must be allowed")
+		})
+	}
+}
+
+func TestReservedLabelSchemaMatchesRuntime(t *testing.T) {
+	data, err := os.ReadFile("../../../../docs/manifest-schema.json")
+	require.NoError(t, err)
+	var schema struct {
+		Defs map[string]struct {
+			Properties map[string]struct {
+				PropertyNames struct {
+					Not struct {
+						Pattern string `json:"pattern"`
+					} `json:"not"`
+				} `json:"propertyNames"`
+			} `json:"properties"`
+		} `json:"$defs"`
+	}
+	require.NoError(t, json.Unmarshal(data, &schema))
+	pattern := schema.Defs["DockerManifestBase"].Properties["labels"].PropertyNames.Not.Pattern
+	require.NotEmpty(t, pattern)
+	// This schema uses only anchors, alternatives and explicit character classes,
+	// which have the same meaning in JSON Schema's regexp syntax and Go's regexp.
+	blocked, err := regexp.Compile(pattern)
+	require.NoError(t, err)
+	for _, key := range []string{
+		"fred.lease", "TrAeFiK.enable", "COM.DOCKER.COMPOSE.project",
+		"traefiK.enable", "com.docKer.compose.project", "com.docker.compoſe.project",
+		"COM.DOCKER.COMPOſE.project", "traefiKish.enable", "my.traefiK.enable",
+		"com.docKer.compoſeish.project", "traefık.enable", "traefik．enable",
+		"org.opencontainers.image.title", "", "fred", "traefik", "com.docker.compose",
+	} {
+		t.Run(key, func(t *testing.T) {
+			assert.Equal(t, IsReservedLabelKey(key), blocked.MatchString(key), "schema and runtime must agree")
 		})
 	}
 }
@@ -615,15 +665,18 @@ func TestStackManifest_Labels_RejectsTraefikPrefix(t *testing.T) {
 
 func TestIsReservedLabelKey(t *testing.T) {
 	for key, want := range map[string]bool{
-		"fred.retention":         true,
-		"traefik.http.routers.x": true,
-		"Traefik.http.routers.x": true, // ENG-595: case-insensitive
-		"TRAEFIK.enable":         true,
-		"FRED.lease":             true,
-		"com.example.customer":   false,
-		"fredx.anything":         false,
-		"traefikish.x":           false,
-		"":                       false,
+		"fred.retention":                true,
+		"com.docker.compose.project":    true,
+		"COM.DOCKER.COMPOSE.oneoff":     true,
+		"com.docker.composeish.project": false,
+		"traefik.http.routers.x":        true,
+		"Traefik.http.routers.x":        true, // ENG-595: case-insensitive
+		"TRAEFIK.enable":                true,
+		"FRED.lease":                    true,
+		"com.example.customer":          false,
+		"fredx.anything":                false,
+		"traefikish.x":                  false,
+		"":                              false,
 	} {
 		require.Equal(t, want, IsReservedLabelKey(key), "key=%q", key)
 	}

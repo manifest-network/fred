@@ -26,7 +26,7 @@ func TestHealth_ProbesEachStore(t *testing.T) {
 		wire    func(t *testing.T, b *Backend) interface{ Close() error }
 	}{
 		{"callback", "callback store unhealthy", func(t *testing.T, b *Backend) interface{ Close() error } {
-			s, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: filepath.Join(dir, "cb.db")})
+			s, err := newBoundCallbackStoreForTest(t, shared.CallbackStoreConfig{DBPath: filepath.Join(dir, "cb.db")})
 			require.NoError(t, err)
 			b.callbackStore = s
 			return s
@@ -38,13 +38,13 @@ func TestHealth_ProbesEachStore(t *testing.T) {
 			return s
 		}},
 		{"release", "release store unhealthy", func(t *testing.T, b *Backend) interface{ Close() error } {
-			s, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: filepath.Join(dir, "rl.db")})
+			s, err := newBoundReleaseStoreForTest(t, shared.ReleaseStoreConfig{DBPath: filepath.Join(dir, "rl.db")})
 			require.NoError(t, err)
 			b.releaseStore = s
 			return s
 		}},
 		{"retention", "retention store unhealthy", func(t *testing.T, b *Backend) interface{ Close() error } {
-			s, err := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: filepath.Join(dir, "rt.db")})
+			s, err := newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{DBPath: filepath.Join(dir, "rt.db")})
 			require.NoError(t, err)
 			b.retentionStore = s
 			return s
@@ -56,6 +56,7 @@ func TestHealth_ProbesEachStore(t *testing.T) {
 			// Only the target store is wired (others nil → skipped), so it is the
 			// first — and only — branch that can fail.
 			b := &Backend{docker: mock}
+			installMutationTestVerifier(t, b, nil)
 			store := tc.wire(t, b)
 
 			require.NoError(t, b.Health(context.Background()), "docker ok + store open → healthy")

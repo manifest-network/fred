@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSignAndVerify(t *testing.T) {
@@ -238,4 +239,85 @@ func TestVerifyRequest_ParityWithVerify(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "mismatch")
 	})
+}
+
+func TestVerifyRoutedWithTimeMintsImmutableExactRequestEvidence(t *testing.T) {
+	verifier, consumer := NewCallbackProofBoundary()
+	secret := "test-secret-that-is-at-least-32-chars!"
+	now := time.Unix(1700000000, 0)
+	body := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
+	method := http.MethodPost
+	uri := "/callbacks/provision?operation_id=2b0fb1e9-b9ad-4f52-a93d-69e8eb72830a"
+	route := "01J5V5CM7F3N9KDST0Q13XQD4Q"
+	signature := SignWithTime(secret, method, uri, body, now)
+
+	proof, err := verifier.VerifyRoutedWithTime(
+		secret, method, uri, body, signature, route,
+		"/callbacks/provision",
+		5*time.Minute, time.Minute, now,
+	)
+	assert.NoError(t, err)
+	assert.True(t, proof.Valid())
+	assert.Equal(t, method, proof.Method())
+	assert.Equal(t, uri, proof.URI())
+	assert.Equal(t, route, proof.KeyRoute())
+	assert.Equal(t, body, proof.Body())
+	assert.True(t, proof.ValidCallback())
+	assert.True(t, consumer.Accepts(proof))
+
+	body[0] = 'x'
+	detached := proof.Body()
+	detached[0] = 'y'
+	assert.Equal(t, byte('{'), proof.Body()[0])
+
+	assert.False(t, (VerifiedRequest{}).Valid())
+	_, err = verifier.VerifyRoutedWithTime(
+		secret, method, uri+"&replayed=true", proof.Body(), signature, route,
+		"/callbacks/provision",
+		5*time.Minute, time.Minute, now,
+	)
+	assert.Error(t, err)
+	_, err = verifier.VerifyRoutedWithTime(
+		secret, method, "/other", proof.Body(), signature, route,
+		"/callbacks/provision",
+		5*time.Minute, time.Minute, now,
+	)
+	assert.Error(t, err)
+}
+
+func TestCallbackProofBoundaryIsIssuerSpecific(t *testing.T) {
+	verifierA, consumerA := NewCallbackProofBoundary()
+	verifierB, consumerB := NewCallbackProofBoundary()
+	require.True(t, verifierA.Valid())
+	require.True(t, consumerA.Valid())
+	assert.False(t, (CallbackProofVerifier{}).Valid())
+	assert.False(t, (CallbackProofConsumer{}).Valid())
+
+	secret := "same-secret-for-both-proof-boundaries!"
+	now := time.Unix(1700000000, 0)
+	body := []byte(`{"lease_uuid":"abc-123","status":"success"}`)
+	uri := "/callbacks/provision"
+	signature := SignWithTime(secret, http.MethodPost, uri, body, now)
+	proofA, err := verifierA.VerifyRoutedWithTime(
+		secret, http.MethodPost, uri, body, signature, "route-a", uri,
+		5*time.Minute, time.Minute, now,
+	)
+	require.NoError(t, err)
+	proofB, err := verifierB.VerifyRoutedWithTime(
+		secret, http.MethodPost, uri, body, signature, "route-a", uri,
+		5*time.Minute, time.Minute, now,
+	)
+	require.NoError(t, err)
+
+	assert.True(t, consumerA.Accepts(proofA))
+	assert.False(t, consumerA.Accepts(proofB))
+	assert.True(t, consumerB.Accepts(proofB))
+	assert.False(t, consumerB.Accepts(proofA))
+	assert.False(t, consumerA.Accepts(VerifiedRequest{}))
+
+	_, err = (CallbackProofVerifier{}).VerifyRoutedWithTime(
+		secret, http.MethodPost, uri, body, signature, "route-a", uri,
+		5*time.Minute, time.Minute, now,
+	)
+	assert.ErrorContains(t, err, "unavailable")
 }

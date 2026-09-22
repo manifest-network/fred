@@ -76,9 +76,8 @@ func TestHandleLeaseCreated_WithMetaHash(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-1",
-		CallbackBaseURL: "http://localhost:8080",
+	manager, err := newTestManager(t, ManagerConfig{
+		ProviderUUID: "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -108,9 +107,8 @@ func TestHandleLeaseCreated_LeaseNotFound(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-1",
-		CallbackBaseURL: "http://localhost:8080",
+	manager, err := newTestManager(t, ManagerConfig{
+		ProviderUUID: "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -120,9 +118,14 @@ func TestHandleLeaseCreated_LeaseNotFound(t *testing.T) {
 		Tenant:    "tenant-1",
 	})
 
-	// Should return nil (no retry)
+	// An immutable-ledger NotFound response can mean the RPC endpoint is wrong,
+	// reset, or lagging. Preserve the event for retry rather than treating the
+	// error shape as proof that this lease cannot exist.
 	err = handlersOf(manager).HandleLeaseCreated(msg)
-	assert.NoError(t, err, "handleLeaseCreated() for lease not found")
+	require.ErrorIs(t, err, billingtypes.ErrLeaseNotFound)
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Empty(t, mockBackend.provisionCalls)
 }
 
 func TestHandleLeaseCreated_ChainError(t *testing.T) {
@@ -137,9 +140,8 @@ func TestHandleLeaseCreated_ChainError(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-1",
-		CallbackBaseURL: "http://localhost:8080",
+	manager, err := newTestManager(t, ManagerConfig{
+		ProviderUUID: "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -173,9 +175,8 @@ func TestHandleLeaseClosed_NoPlacement_SweepsAllBackends(t *testing.T) {
 
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-1",
-		CallbackBaseURL: "http://localhost:8080",
+	manager, err := newTestManager(t, ManagerConfig{
+		ProviderUUID: "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -215,9 +216,8 @@ func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {
 	// close no longer fetches the lease from chain for SKU routing).
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-1",
-		CallbackBaseURL: "http://localhost:8080",
+	manager, err := newTestManager(t, ManagerConfig{
+		ProviderUUID: "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -257,9 +257,8 @@ func TestHandleLeaseClosed_AllBackendsFail(t *testing.T) {
 	// Not in-flight, no placement -> sweeps all backends, all fail (ENG-335).
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-1",
-		CallbackBaseURL: "http://localhost:8080",
+	manager, err := newTestManager(t, ManagerConfig{
+		ProviderUUID: "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -287,16 +286,15 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 	require.NoError(t, err, "NewPayloadStore()")
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-1",
-		CallbackBaseURL: "http://localhost:8080",
-		PayloadStore:    payloadStore,
+	manager, err := newTestManager(t, ManagerConfig{
+		ProviderUUID: "provider-1",
+		PayloadStore: payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
-	// Store a payload for a lease, then track it as in-flight
+	// Store a payload for a lease. Close cleanup is a lifecycle consequence and
+	// does not require tests to manufacture process-local Registry state.
 	payloadStore.Store("lease-1", []byte("deployment data"))
-	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
 
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseClosed,
@@ -343,10 +341,9 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 	require.NoError(t, err, "NewPayloadStore()")
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
-		ProviderUUID:    "provider-1",
-		CallbackBaseURL: "http://localhost:8080",
-		PayloadStore:    payloadStore,
+	manager, err := newTestManager(t, ManagerConfig{
+		ProviderUUID: "provider-1",
+		PayloadStore: payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 

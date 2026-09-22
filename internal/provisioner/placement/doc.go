@@ -1,6 +1,7 @@
-// Package placement implements a bbolt-backed lease→backend mapping with an
-// in-memory cache. It is the routing primitive that makes round-robin
-// backends safe for read operations.
+// Package placement implements Fred's durable multi-backend placement
+// authority. It persists confirmed owners, operation-scoped write-ahead
+// attempts, and quarantined ownership conflicts in bbolt, with an in-memory
+// read projection.
 //
 // # Why this exists
 //
@@ -10,8 +11,13 @@
 // reach the specific backend that holds the lease's state. Round-robin'ing
 // reads would produce 404s on N-1 of N backends.
 //
-// The placement store records `lease_uuid → backend_name` at provision time
-// and is consulted on every read-path call.
+// A confirmed `lease_uuid → backend_name` record routes reads and retained-data
+// restore to the machine that owns the workload. Before provision or restore
+// can contact a backend, an attempt carrying the same typed operation identity
+// as its callback URL and an immutable snapshot of tenant, provider, and exact
+// ordered backend items is written durably. An ambiguous synchronous result
+// keeps that evidence so no retry can silently choose a second backend or
+// rebuild a different request from later mutable chain state.
 //
 // # Concurrency
 //
@@ -22,14 +28,67 @@
 //
 // # Recovery
 //
-// On startup the reconciler calls SetBatch with placements derived from
-// every backend's ListProvisions response. This rebuilds the cache from
-// authoritative state and corrects any drift introduced by manual operator
-// intervention or cross-backend lease moves.
+// Backend names are immutable storage identities. The Store durably records both
+// the current topology and every historically adopted name, so removing a
+// referenced identity is rejected. A temporarily absent name may return only as
+// the same storage identity; replacement storage must receive a new name.
 //
-// # Optional
+// The first complete `/provisions` and `/retentions` projection establishes an
+// AdmissionBaseline bound to the current topology. It survives Store reopen and
+// transient incomplete sweeps. A topology change invalidates it until another
+// complete projection commits. A later sweep can attenuate the baseline to an
+// AdmissionScope containing exactly the backends that answered both inventories;
+// only a genuinely recordless PENDING reconciliation may use that scope.
 //
-// The placement store is optional. It is only required when multiple
-// backends share the same SKU list (round-robin setups). For single-backend
-// or per-SKU-dedicated-backend deployments it can be omitted entirely.
+// ReconciliationSweep.Project applies positive observations at its inseparable
+// causal fence. An exact
+// positive confirms its attempted owner only when an active upgraded backend
+// reports the same paired typed lifecycle generation. Older/unknown generations
+// preserve the attempt; retention-only evidence carries no lifecycle authority.
+// A lease reported by both sequential endpoints is sealed exclusively as
+// untrusted positive membership. It cannot issue lifecycle or absence evidence,
+// while validated sibling rows keep their authority. Such a sweep is incomplete
+// and cannot establish a new AdmissionBaseline; excluded ambiguous membership
+// retains its durable pending marker until safely represented or resolved.
+// Constructor-issued, identity-valid overlap may preserve an existing confirmed
+// sole owner with no attempt when its current lifecycle and principal already
+// represent the row. This redundant observation grants no new authority and
+// does not revoke retained-source restore affinity. Explicit rejection cannot
+// issue that observation; contradictions still require quarantine.
+// A later sole-reporter proof may resolve only a single known-candidate
+// untrusted quarantine. It accounts for that exact lease across all paired,
+// identity-valid backend endpoints, independently of other leases' ambiguity;
+// It does not repair historical multi-owner conflicts. Any attempt settlement
+// still requires the positive row's exact typed lifecycle generation.
+// A separate paired-topology proof can discharge inherited pending-sweep
+// fencing after every positive is durably represented. It requires all existing
+// storage pins and grants no new baseline, storage identity, or drain evidence.
+// A contradictory positive is unioned with all owners and attempts into durable
+// conflict quarantine. Inventory
+// silence, complete or partial, never clears an attempt because an old request
+// may commit after the list response. A known-candidate quarantine with no
+// attempt may be pruned only by exact dual-endpoint absence from every candidate,
+// an independent terminal chain read and a current exclusive lease claim.
+// A trusted retention in a partial sweep may reaffirm an already confirmed
+// same-backend owner, so an unrelated outage cannot revoke restore affinity;
+// it cannot create an owner or clear an unresolved attempt or conflict.
+// This same semantic rule discharges causally excluded retention evidence:
+// preserving an unchanged owner does not require a redundant projection write
+// and cannot leave unrelated healthy-backend admission waiting on that write.
+// A historical exclusion clears when one fresh sweep accounts for every
+// remembered reporter and the still-confirmed owner: peers must prove
+// identity-bound absence on both endpoints; the owner may instead report its
+// provision or retention. This also retires the diagnostic after container
+// loss without erasing affinity or requiring the container to reappear first.
+// Evidence is never accumulated piecemeal across sweeps; an unavailable peer,
+// unresolved attempt, or durable conflict keeps the exclusion fenced. Clearing
+// the diagnostic grants no lifecycle or mutation authority: a later action
+// still needs its exact chain read and causal Registry claim.
+//
+// # Required authority
+//
+// Every supported deployment uses multiple backends, so production startup
+// requires a writable placement database. Production consumers receive narrow
+// typed capability ports for provision, callback, restore, or reconciliation
+// work.
 package placement

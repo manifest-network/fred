@@ -3,6 +3,7 @@ package shared
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -25,13 +26,27 @@ type DiagnosticEntry struct {
 	Message   string            `json:"message,omitempty"`
 	Logs      map[string]string `json:"logs,omitempty"`
 	FailCount int               `json:"fail_count"`
-	CreatedAt time.Time         `json:"created_at"`
+	// RuntimeReleaseVersion identifies the observed active release when this is
+	// a runtime failure snapshot. It is not authority; publication rechecks it
+	// against the current journal under the lease transition gate.
+	RuntimeReleaseVersion int `json:"runtime_release_version,omitempty"`
+	// LifecycleGeneration is the historical, non-secret observation captured
+	// from the callback pair that owned this failure. It keeps a singular
+	// diagnostics read consistent after the live projection disappears, but is
+	// never lifecycle/settlement authority: diagnostic-only rows remain excluded
+	// from fleet inventory. Older rows omit it and remain readable as unknown.
+	LifecycleGeneration *backend.LifecycleGenerationObservation `json:"lifecycle_generation,omitempty"`
+	CreatedAt           time.Time                               `json:"created_at"`
 }
 
 // DiagnosticsStore persists failure diagnostics in bbolt so they survive
 // container removal and backend restarts.
 type DiagnosticsStore struct {
 	*boltStore
+	retentionMu sync.Mutex
+	retained    map[string]*retainedDiagnostic
+	actions     sync.WaitGroup
+	closing     bool
 }
 
 // DiagnosticsStoreConfig configures the diagnostics store.
@@ -56,7 +71,18 @@ func NewDiagnosticsStore(cfg DiagnosticsStoreConfig) (*DiagnosticsStore, error) 
 		return nil, err
 	}
 
-	s := &DiagnosticsStore{boltStore: base}
+	s := &DiagnosticsStore{boltStore: base, retained: make(map[string]*retainedDiagnostic)}
+	if err := base.update(func(tx *bolt.Tx) error {
+		for _, name := range [][]byte{attemptDiagnosticsBucketName, diagnosticPublicationsBucketName} {
+			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		_ = base.Close()
+		return nil, fmt.Errorf("initialize attempt diagnostics: %w", err)
+	}
 
 	if cfg.MaxAge > 0 {
 		base.startCleanup("diagnostics", cfg.CleanupInterval, s.RemoveOlderThan, cfg.OnCleanupPanic)
@@ -72,7 +98,13 @@ func (s *DiagnosticsStore) Store(entry DiagnosticEntry) error {
 		return fmt.Errorf("failed to marshal diagnostic entry: %w", err)
 	}
 
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
+		// Attempt publication is owned by a terminal journal proof. A legacy
+		// actor snapshot, including an empty post-cleanup log map, cannot replace
+		// it. Current runtime observations use the bound publication service.
+		if published := tx.Bucket(diagnosticPublicationsBucketName); published != nil && published.Get([]byte(entry.LeaseUUID)) != nil {
+			return nil
+		}
 		b := tx.Bucket(diagnosticsBucketName)
 		return b.Put([]byte(entry.LeaseUUID), data)
 	})
@@ -83,7 +115,7 @@ func (s *DiagnosticsStore) Store(entry DiagnosticEntry) error {
 func (s *DiagnosticsStore) Get(leaseUUID string) (*DiagnosticEntry, error) {
 	var entry *DiagnosticEntry
 
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket(diagnosticsBucketName)
 		data := b.Get([]byte(leaseUUID))
 		if data == nil {
@@ -94,6 +126,17 @@ func (s *DiagnosticsStore) Get(leaseUUID string) (*DiagnosticEntry, error) {
 		if err := json.Unmarshal(data, entry); err != nil {
 			return fmt.Errorf("failed to unmarshal diagnostic entry: %w", err)
 		}
+		if key := tx.Bucket(diagnosticPublicationsBucketName).Get([]byte(leaseUUID)); key != nil {
+			record, err := decodeAttemptDiagnostic(tx.Bucket(attemptDiagnosticsBucketName).Get(key))
+			if err != nil {
+				return err
+			}
+			if record.Identity.LeaseUUID != leaseUUID || record.Entry.Tenant != entry.Tenant || record.Entry.ProviderUUID != entry.ProviderUUID {
+				return fmt.Errorf("published diagnostic selector has inconsistent identity")
+			}
+			record.Entry.FailCount = entry.FailCount
+			entry = &record.Entry
+		}
 		return nil
 	})
 
@@ -103,7 +146,17 @@ func (s *DiagnosticsStore) Get(leaseUUID string) (*DiagnosticEntry, error) {
 // Delete removes a diagnostic entry by lease UUID. It is a no-op if the
 // entry does not exist.
 func (s *DiagnosticsStore) Delete(leaseUUID string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
+		if published := tx.Bucket(diagnosticPublicationsBucketName); published != nil {
+			if previous := published.Get([]byte(leaseUUID)); previous != nil {
+				if err := s.deleteAttemptTx(tx, previous); err != nil {
+					return err
+				}
+			}
+			if err := published.Delete([]byte(leaseUUID)); err != nil {
+				return err
+			}
+		}
 		b := tx.Bucket(diagnosticsBucketName)
 		return b.Delete([]byte(leaseUUID))
 	})
@@ -112,7 +165,43 @@ func (s *DiagnosticsStore) Delete(leaseUUID string) error {
 // RemoveOlderThan deletes diagnostic entries older than maxAge and returns
 // the number of entries removed.
 func (s *DiagnosticsStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
-	return removeOlderThan[DiagnosticEntry](s.db, diagnosticsBucketName, maxAge, func(e *DiagnosticEntry) time.Time {
-		return e.CreatedAt
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+	err := s.update(func(tx *bolt.Tx) error {
+		visible := tx.Bucket(diagnosticsBucketName)
+		publications := tx.Bucket(diagnosticPublicationsBucketName)
+		cursor := visible.Cursor()
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			var entry DiagnosticEntry
+			// Diagnostics are observational: preserve a malformed row for
+			// inspection, but do not let it prevent unrelated expiry forever.
+			if err := json.Unmarshal(value, &entry); err != nil {
+				continue
+			}
+			if entry.CreatedAt.Before(cutoff) {
+				if err := publications.Delete(key); err != nil {
+					return err
+				}
+				if err := cursor.Delete(); err != nil {
+					return err
+				}
+				removed++
+			}
+		}
+		attempts := tx.Bucket(attemptDiagnosticsBucketName)
+		cursor = attempts.Cursor()
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			record, err := decodeAttemptDiagnostic(value)
+			if err != nil {
+				continue
+			}
+			if record.Entry.CreatedAt.Before(cutoff) {
+				if err := s.deleteAttemptTx(tx, key); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	})
+	return removed, err
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,12 +13,20 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sony/gobreaker"
 
+	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/callbackurl"
+	"github.com/manifest-network/fred/internal/healthprobe"
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/maintenanceid"
+	"github.com/manifest-network/fred/internal/strictjson"
+	"github.com/manifest-network/fred/internal/util"
+	"github.com/manifest-network/fred/internal/uuidv4"
 )
 
 // Backend defines the interface for interacting with a provisioning backend.
@@ -118,6 +125,14 @@ type Backend interface {
 	Name() string
 }
 
+// IdentityInventoryBackend exposes the physical storage identity observed on
+// each complete inventory endpoint. Reconciliation requires this stronger
+// interface before it can establish or reuse a placement admission baseline.
+type IdentityInventoryBackend interface {
+	ListProvisionsWithIdentity(context.Context) ([]ProvisionInfo, backendidentity.ID, error)
+	ListRetentionsWithIdentity(context.Context) ([]RetainedLease, backendidentity.ID, error)
+}
+
 // LeaseItem represents a single SKU with its quantity in a lease.
 type LeaseItem struct {
 	SKU         string `json:"sku"`
@@ -182,13 +197,14 @@ func NormalizeProvisionRequest(req *ProvisionRequest) error {
 
 // ProvisionRequest contains the data needed to provision a resource.
 type ProvisionRequest struct {
-	LeaseUUID    string      `json:"lease_uuid"`
-	Tenant       string      `json:"tenant"`
-	ProviderUUID string      `json:"provider_uuid"`
-	Items        []LeaseItem `json:"items"`
-	CallbackURL  string      `json:"callback_url"`
-	Payload      []byte      `json:"payload,omitempty"`
-	PayloadHash  string      `json:"payload_hash,omitempty"`
+	LeaseUUID            string      `json:"lease_uuid"`
+	Tenant               string      `json:"tenant"`
+	ProviderUUID         string      `json:"provider_uuid"`
+	Items                []LeaseItem `json:"items"`
+	CallbackURL          string      `json:"callback_url"`
+	LifecycleCallbackURL string      `json:"lifecycle_callback_url,omitempty"`
+	Payload              []byte      `json:"payload,omitempty"`
+	PayloadHash          string      `json:"payload_hash,omitempty"`
 }
 
 // RoutingSKU returns the SKU of the first item for backend routing decisions.
@@ -255,6 +271,28 @@ type LeaseService struct {
 	Instances []LeaseInstance `json:"instances,omitempty"`
 }
 
+// LifecycleGenerationKind classifies the callback authority a backend has
+// durably paired with one live provision. The observation carries no URL or
+// other bearer material; a typed observation exposes only the UUID that Fred
+// originally supplied as both operation_id and lifecycle_id.
+type LifecycleGenerationKind string
+
+const (
+	LifecycleGenerationUnknown  LifecycleGenerationKind = "unknown"
+	LifecycleGenerationLegacy   LifecycleGenerationKind = "legacy"
+	LifecycleGenerationTyped    LifecycleGenerationKind = "typed"
+	LifecycleGenerationUnusable LifecycleGenerationKind = "unusable"
+)
+
+// LifecycleGenerationObservation is an internal backend observation. A nil
+// *LifecycleGenerationObservation on ProvisionInfo is equivalent to Unknown
+// and preserves compatibility with older and third-party backends. Its
+// authority depends on the provenance documented on ProvisionInfo's field.
+type LifecycleGenerationObservation struct {
+	Kind LifecycleGenerationKind `json:"kind"`
+	ID   string                  `json:"id,omitempty"`
+}
+
 // ProvisionInfo describes a single provisioned resource.
 type ProvisionInfo struct {
 	LeaseUUID    string          `json:"lease_uuid"`
@@ -273,15 +311,26 @@ type ProvisionInfo struct {
 	BackendName string `json:"-"` // Set by the backend or reconciler; excluded from JSON serialization
 
 	// RetainedUntil is the grace-window deadline (CreatedAt + RetentionMaxAge)
-	// for a soft-deleted (Status=retained) lease. Zero for live provisions.
-	RetainedUntil time.Time `json:"retained_until,omitempty"`
+	// for a soft-deleted (Status=retained) lease. Zero, and omitted on the wire,
+	// for live provisions or when age-based retention expiry is disabled.
+	RetainedUntil time.Time `json:"retained_until,omitzero"`
 	// Tenant is the owning tenant. It crosses the backend→providerd hop (an
-	// HMAC-signed, trusted internal hop, like RestoreRequest.Tenant) so the
-	// closed-lease authz fallback (when the chain has pruned the lease) can bind
-	// a retained record to its owner. It MUST NOT be copied into tenant-facing
-	// API responses (LeaseStatusResponse/LeaseProvisionResponse), which would
-	// leak one tenant's address to another.
+	// HMAC-signed, trusted internal hop, like RestoreRequest.Tenant) so a complete
+	// identity-bearing inventory can bind a live placement's runtime maintenance
+	// principal, and so the closed-lease authz fallback (when the chain has
+	// pruned the lease) can bind a retained record to its owner. It MUST NOT be
+	// copied into tenant-facing API responses (LeaseStatusResponse/
+	// LeaseProvisionResponse), which would leak one tenant's address to another.
 	Tenant string `json:"tenant,omitempty"`
+
+	// LifecycleGeneration reports only the class and, for current typed
+	// callbacks, canonical UUID of the callback pair persisted by the backend.
+	// Only an observation from complete identity-bearing ListProvisions inventory
+	// is settlement evidence. A point lookup may repeat a historical diagnostics
+	// observation for read-model continuity, but it is never settlement authority.
+	// The field MUST NOT be copied into a tenant-facing response. Nil means that
+	// the backend did not report this upgraded internal observation.
+	LifecycleGeneration *LifecycleGenerationObservation `json:"lifecycle_generation,omitempty"`
 
 	// Partition is the retained record's optional sub-tenant grouping key
 	// (retention partitioning). Unlike Tenant above, it MAY be copied into
@@ -312,9 +361,15 @@ type ListProvisionsResponse struct {
 // RetainedLease identifies a lease whose data this backend currently retains
 // (soft-deleted, awaiting restore or grace-reap). The reconciler consumes this
 // to keep placement affinity for retained leases so a restore routes to the
-// backend holding the source data (ENG-333).
+// backend holding the source data (ENG-333). ProviderUUID and Tenant are
+// optional for wire compatibility with older/third-party backends; when
+// present they are trusted-internal inventory evidence, never tenant-facing
+// response fields. Offline repair treats missing identity as routing-only and
+// rejects contradictory nonempty identity.
 type RetainedLease struct {
-	LeaseUUID string `json:"lease_uuid"`
+	LeaseUUID    string `json:"lease_uuid"`
+	ProviderUUID string `json:"provider_uuid,omitempty"`
+	Tenant       string `json:"tenant,omitempty"`
 }
 
 // ListRetentionsResponse is the response from the GET /retentions endpoint.
@@ -326,30 +381,421 @@ type ListRetentionsResponse struct {
 	Continue string `json:"continue,omitempty"`
 }
 
+const (
+	// DefaultCallbackApplicationTimeout bounds Fred's synchronous processing of
+	// one authenticated callback. The provider must return a terminal HTTP
+	// response within this budget so the backend can safely advance its durable
+	// per-lease callback queue.
+	DefaultCallbackApplicationTimeout = 2 * time.Minute
+
+	// DefaultCallbackDeliveryTimeout is the bundled backend sender's total
+	// HTTP delivery retry budget. It remains strictly greater than
+	// DefaultCallbackApplicationTimeout so a fresh first attempt normally gives
+	// Fred time to serialize a retryable response after its application timeout.
+	// Quick retries share whatever remains of this budget, so a later attempt may
+	// reach the sender's deadline first.
+	DefaultCallbackDeliveryTimeout = DefaultCallbackApplicationTimeout + 15*time.Second
+)
+
 // CallbackPayload is sent by backends to fred's callback endpoint.
 type CallbackPayload struct {
 	LeaseUUID string         `json:"lease_uuid"`
 	Status    CallbackStatus `json:"status"` // "success", "failed", or "deprovisioned"
 	Error     string         `json:"error,omitempty"`
-	Backend   string         `json:"backend,omitempty"` // Backend name; empty from pre-upgrade senders.
+	// BackendStorageID binds the observation to the backend storage lineage
+	// that produced it. Upgraded senders persist this value with new outbox
+	// entries and include it in the HMAC-covered body on every delivery.
+	BackendStorageID string `json:"backend_storage_id,omitempty"`
+	// Backend is optional sender metadata retained for bounded metrics on
+	// callbacks that have no current operation. It is not lifecycle authority:
+	// the exact HMAC-authenticated operation URL or durable lifecycle capability
+	// selects the store-authoritative backend.
+	Backend string `json:"backend,omitempty"`
+	// OperationID is injected by fred's callback HTTP endpoint from the
+	// HMAC-authenticated callback URL. Backends need only POST to the URL they
+	// received; they do not interpret or echo the token in their JSON body.
+	OperationID string `json:"operation_id,omitempty"`
+	// LifecycleID is likewise injected from an authenticated lifecycle callback
+	// URL. A provider overwrites either body field before application so backend
+	// JSON can never mint callback authority.
+	LifecycleID string `json:"lifecycle_id,omitempty"`
 	// Retained is set true on a deprovisioned callback when the backend actually
 	// soft-deleted (retained) the lease's volumes. Best-effort ground truth for
 	// the optimistic push; the queryable retention status is the durable backstop.
 	Retained bool `json:"retained,omitempty"`
 }
 
+// CallbackOperationIDQueryParameter is the capability carried only by an
+// asynchronous provision or restore completion URL. A backend must not reuse
+// that operation-scoped URL for later autonomous lifecycle observations.
+const CallbackOperationIDQueryParameter = "operation_id"
+
+// CallbackLifecycleIDQueryParameter is the capability carried by an
+// observation-only lifecycle callback URL. It is deliberately distinct from
+// operation_id even though a paired URL derives both typed identities from the
+// same canonical UUIDv4 value.
+const CallbackLifecycleIDQueryParameter = "lifecycle_id"
+
+var (
+	// ErrInvalidOperationCallbackURL reports that an exact-completion URL mixes,
+	// duplicates, or malforms callback authority.
+	ErrInvalidOperationCallbackURL = errors.New("invalid operation callback URL")
+
+	// ErrInvalidLifecycleCallbackURL reports that a separately supplied lifecycle
+	// callback URL is not the exact lifecycle route derived from its completion
+	// URL. Keeping this relationship strict prevents a backend request from
+	// silently splitting settlement and observation traffic across unrelated
+	// endpoints or carrying both kinds of authority at once.
+	ErrInvalidLifecycleCallbackURL = errors.New("invalid lifecycle callback URL")
+)
+
+// ResolveLifecycleCallbackURL validates or derives the observation-only URL
+// paired with a completion URL. A current completion URL must contain exactly
+// one canonical UUIDv4 operation_id and no lifecycle_id; derivation replaces
+// that one field with lifecycle_id while retaining all unrelated raw query
+// fields byte for byte and in their original order. A legacy operationless URL
+// remains tokenless. Duplicate identities, preexisting lifecycle authority,
+// and non-canonical operation IDs are rejected.
+//
+// The optional explicit form lets current Fred versions make the distinction
+// visible on the wire. It must equal the derived URL exactly. Operationless
+// derivation preserves callbacks already embedded in adopted v0.13 workloads;
+// it does not authorize new tokenless provision or restore admission. A current
+// request may omit lifecycle_callback_url when callback_url carries its typed
+// operation identity.
+func ResolveLifecycleCallbackURL(callbackURL, lifecycleCallbackURL string) (string, error) {
+	endpoint, err := callbackurl.ParseEndpoint(callbackURL)
+	if err != nil {
+		return "", fmt.Errorf("%w: validate callback endpoint: %w", ErrInvalidLifecycleCallbackURL, err)
+	}
+
+	rawQuery, err := deriveLifecycleCallbackQuery(endpoint.RawQuery())
+	if err != nil {
+		return "", err
+	}
+	derived, err := endpoint.WithRawQuery(rawQuery)
+	if err != nil {
+		return "", fmt.Errorf("%w: derive lifecycle callback endpoint: %w", ErrInvalidLifecycleCallbackURL, err)
+	}
+	if lifecycleCallbackURL == "" {
+		return derived, nil
+	}
+	if lifecycleCallbackURL != derived {
+		return "", fmt.Errorf("%w: lifecycle URL must exactly match the route derived from callback_url",
+			ErrInvalidLifecycleCallbackURL)
+	}
+	return lifecycleCallbackURL, nil
+}
+
+// ObserveLifecycleGeneration classifies an exact callback pair already stored
+// by a backend without returning either URL. Missing halves are Unknown so
+// upgraded Fred remains compatible with records written by older backends.
+// Present but malformed, mixed-authority, or non-matching pairs are Unusable
+// and must quarantine lifecycle callbacks for that lease.
+func ObserveLifecycleGeneration(
+	callbackURL, lifecycleCallbackURL string,
+) LifecycleGenerationObservation {
+	if callbackURL == "" || lifecycleCallbackURL == "" {
+		return LifecycleGenerationObservation{Kind: LifecycleGenerationUnknown}
+	}
+	resolved, err := ResolveLifecycleCallbackURL(callbackURL, lifecycleCallbackURL)
+	if err != nil || resolved != lifecycleCallbackURL {
+		return LifecycleGenerationObservation{Kind: LifecycleGenerationUnusable}
+	}
+	id, typed, err := lifecycleCallbackIdentity(lifecycleCallbackURL)
+	if err != nil {
+		return LifecycleGenerationObservation{Kind: LifecycleGenerationUnusable}
+	}
+	if !typed {
+		return LifecycleGenerationObservation{Kind: LifecycleGenerationLegacy}
+	}
+	return LifecycleGenerationObservation{Kind: LifecycleGenerationTyped, ID: id}
+}
+
+// ResolveMaintenanceCallbackURLs validates a trusted maintenance request
+// against the callback authority already persisted by a backend. Restart,
+// update, and autonomous reconciler replacement may move the callback route to
+// a new base, but they must retain the same authority class and exact lifecycle
+// UUID. A typed route can never be downgraded to tokenless (or vice versa), and
+// a different typed ID is stale or misrouted authority.
+//
+// requestedLifecycleURL may be empty for an autonomous backend operation; in
+// that case the persisted route is retained. The returned operation/lifecycle
+// pair uses the requested base and one shared identity, so it remains suitable
+// for durable labels and later exact pair validation. Legacy tokenless pairs
+// remain tokenless. When no route was persisted, the trusted requested route is
+// adopted after full lifecycle validation.
+func ResolveMaintenanceCallbackURLs(
+	callbackURL, lifecycleCallbackURL, requestedLifecycleURL string,
+) (string, string, error) {
+	currentLifecycleURL := lifecycleCallbackURL
+	switch {
+	case callbackURL != "":
+		resolved, err := ResolveLifecycleCallbackURL(callbackURL, lifecycleCallbackURL)
+		if err != nil {
+			return "", "", fmt.Errorf("validate persisted callback pair: %w", err)
+		}
+		currentLifecycleURL = resolved
+	case lifecycleCallbackURL != "":
+		if err := ValidateLifecycleCallbackURL(lifecycleCallbackURL); err != nil {
+			return "", "", fmt.Errorf("validate persisted lifecycle callback: %w", err)
+		}
+	}
+
+	if requestedLifecycleURL == "" {
+		requestedLifecycleURL = currentLifecycleURL
+	}
+	if requestedLifecycleURL == "" {
+		return "", "", nil
+	}
+	if err := ValidateLifecycleCallbackURL(requestedLifecycleURL); err != nil {
+		return "", "", fmt.Errorf("validate requested lifecycle callback: %w", err)
+	}
+
+	if currentLifecycleURL != "" {
+		currentID, currentTyped, err := lifecycleCallbackIdentity(currentLifecycleURL)
+		if err != nil {
+			return "", "", err
+		}
+		requestedID, requestedTyped, err := lifecycleCallbackIdentity(requestedLifecycleURL)
+		if err != nil {
+			return "", "", err
+		}
+		if currentTyped != requestedTyped {
+			return "", "", fmt.Errorf(
+				"%w: maintenance callback cannot change authority class",
+				ErrInvalidLifecycleCallbackURL,
+			)
+		}
+		if currentTyped && currentID != requestedID {
+			return "", "", fmt.Errorf(
+				"%w: maintenance lifecycle ID does not match persisted authority",
+				ErrInvalidLifecycleCallbackURL,
+			)
+		}
+	}
+
+	nextOperationURL, err := resolveOperationCallbackURL(requestedLifecycleURL)
+	if err != nil {
+		return "", "", err
+	}
+	nextLifecycleURL, err := ResolveLifecycleCallbackURL(nextOperationURL, "")
+	if err != nil {
+		return "", "", fmt.Errorf("derive canonical maintenance lifecycle callback: %w", err)
+	}
+	return nextOperationURL, nextLifecycleURL, nil
+}
+
+func lifecycleCallbackIdentity(callbackURL string) (string, bool, error) {
+	endpoint, err := callbackurl.ParseEndpoint(callbackURL)
+	if err != nil {
+		return "", false, fmt.Errorf("%w: validate lifecycle callback endpoint: %w", ErrInvalidLifecycleCallbackURL, err)
+	}
+	for _, part := range strings.Split(endpoint.RawQuery(), "&") {
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, decodeErr := url.QueryUnescape(rawKey)
+		if decodeErr != nil {
+			return "", false, fmt.Errorf("%w: decode lifecycle callback query key: %w", ErrInvalidLifecycleCallbackURL, decodeErr)
+		}
+		if key != CallbackLifecycleIDQueryParameter {
+			continue
+		}
+		id, parseErr := parseCanonicalCallbackQueryID(
+			rawValue, CallbackLifecycleIDQueryParameter, ErrInvalidLifecycleCallbackURL,
+		)
+		return id, true, parseErr
+	}
+	return "", false, nil
+}
+
+func resolveOperationCallbackURL(lifecycleCallbackURL string) (string, error) {
+	endpoint, err := callbackurl.ParseEndpoint(lifecycleCallbackURL)
+	if err != nil {
+		return "", fmt.Errorf("%w: validate lifecycle callback endpoint: %w", ErrInvalidLifecycleCallbackURL, err)
+	}
+	rawQuery, err := deriveOperationCallbackQuery(endpoint.RawQuery())
+	if err != nil {
+		return "", err
+	}
+	result, err := endpoint.WithRawQuery(rawQuery)
+	if err != nil {
+		return "", fmt.Errorf("%w: derive operation callback endpoint: %w", ErrInvalidLifecycleCallbackURL, err)
+	}
+	return result, nil
+}
+
+// ValidateOperationCallbackURL validates an exact requested-operation route.
+// Current routes carry exactly one canonical UUIDv4 operation_id and no
+// lifecycle_id. A legacy route with neither identity remains valid for stored
+// evidence and exact replay lookup; new operation admission separately requires
+// typed runtime authority. Duplicate, mixed, or malformed authority is rejected.
+func ValidateOperationCallbackURL(callbackURL string) error {
+	endpoint, err := callbackurl.ParseEndpoint(callbackURL)
+	if err != nil {
+		return fmt.Errorf("%w: validate operation callback endpoint: %w", ErrInvalidOperationCallbackURL, err)
+	}
+
+	operationSeen := false
+	for _, part := range strings.Split(endpoint.RawQuery(), "&") {
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, decodeErr := url.QueryUnescape(rawKey)
+		if decodeErr != nil {
+			return fmt.Errorf("%w: decode operation callback query key: %w", ErrInvalidOperationCallbackURL, decodeErr)
+		}
+
+		switch key {
+		case CallbackLifecycleIDQueryParameter:
+			return fmt.Errorf("%w: operation URL must not contain %s",
+				ErrInvalidOperationCallbackURL, CallbackLifecycleIDQueryParameter)
+		case CallbackOperationIDQueryParameter:
+			if operationSeen {
+				return fmt.Errorf("%w: %s must occur exactly once",
+					ErrInvalidOperationCallbackURL, CallbackOperationIDQueryParameter)
+			}
+			if _, parseErr := parseCanonicalCallbackQueryID(
+				rawValue, CallbackOperationIDQueryParameter, ErrInvalidOperationCallbackURL,
+			); parseErr != nil {
+				return parseErr
+			}
+			operationSeen = true
+		}
+	}
+	return nil
+}
+
+// ValidateLifecycleCallbackURL validates an observation-only callback route.
+// Current routes carry exactly one canonical UUIDv4 lifecycle_id and no
+// operation_id. A legacy route with neither identity remains valid for the
+// lifecycle of an adopted workload. Duplicate, mixed, or malformed authority
+// is always rejected.
+func ValidateLifecycleCallbackURL(callbackURL string) error {
+	endpoint, err := callbackurl.ParseEndpoint(callbackURL)
+	if err != nil {
+		return fmt.Errorf("%w: validate lifecycle callback endpoint: %w", ErrInvalidLifecycleCallbackURL, err)
+	}
+
+	lifecycleSeen := false
+	for _, part := range strings.Split(endpoint.RawQuery(), "&") {
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, decodeErr := url.QueryUnescape(rawKey)
+		if decodeErr != nil {
+			return fmt.Errorf("%w: decode lifecycle callback query key: %w", ErrInvalidLifecycleCallbackURL, decodeErr)
+		}
+
+		switch key {
+		case CallbackOperationIDQueryParameter:
+			return fmt.Errorf("%w: lifecycle URL must not contain %s",
+				ErrInvalidLifecycleCallbackURL, CallbackOperationIDQueryParameter)
+		case CallbackLifecycleIDQueryParameter:
+			if lifecycleSeen {
+				return fmt.Errorf("%w: %s must occur exactly once",
+					ErrInvalidLifecycleCallbackURL, CallbackLifecycleIDQueryParameter)
+			}
+			if _, parseErr := parseCanonicalCallbackQueryID(
+				rawValue, CallbackLifecycleIDQueryParameter, ErrInvalidLifecycleCallbackURL,
+			); parseErr != nil {
+				return parseErr
+			}
+			lifecycleSeen = true
+		}
+	}
+	return nil
+}
+
+func deriveLifecycleCallbackQuery(rawQuery string) (string, error) {
+	return rewriteCallbackIdentityQuery(
+		rawQuery,
+		CallbackOperationIDQueryParameter,
+		CallbackLifecycleIDQueryParameter,
+		"callback_url",
+		"callback query key",
+	)
+}
+
+func deriveOperationCallbackQuery(rawQuery string) (string, error) {
+	return rewriteCallbackIdentityQuery(
+		rawQuery,
+		CallbackLifecycleIDQueryParameter,
+		CallbackOperationIDQueryParameter,
+		"lifecycle URL",
+		"lifecycle callback query key",
+	)
+}
+
+// rewriteCallbackIdentityQuery swaps one typed callback identity for another
+// without parsing and re-encoding unrelated query fields. Callback request
+// signatures cover the exact RequestURI, so preserving every other byte is a
+// protocol requirement rather than an optimization.
+func rewriteCallbackIdentityQuery(
+	rawQuery, sourceParameter, targetParameter, sourceDescription, keyDescription string,
+) (string, error) {
+	if rawQuery == "" {
+		return "", nil
+	}
+
+	parts := strings.Split(rawQuery, "&")
+	rewritten := append([]string(nil), parts...)
+	sourceIndex := -1
+	sourceID := ""
+	for index, part := range parts {
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			return "", fmt.Errorf("%w: decode %s: %w", ErrInvalidLifecycleCallbackURL, keyDescription, err)
+		}
+
+		switch key {
+		case targetParameter:
+			return "", fmt.Errorf("%w: %s must not contain %s",
+				ErrInvalidLifecycleCallbackURL, sourceDescription, targetParameter)
+		case sourceParameter:
+			if sourceIndex >= 0 {
+				return "", fmt.Errorf("%w: %s must occur exactly once",
+					ErrInvalidLifecycleCallbackURL, sourceParameter)
+			}
+			parsedID, parseErr := parseCanonicalCallbackQueryID(
+				rawValue, sourceParameter, ErrInvalidLifecycleCallbackURL,
+			)
+			if parseErr != nil {
+				return "", parseErr
+			}
+			sourceIndex = index
+			sourceID = parsedID
+		}
+	}
+
+	if sourceIndex < 0 {
+		return rawQuery, nil
+	}
+	rewritten[sourceIndex] = targetParameter + "=" + sourceID
+	return strings.Join(rewritten, "&"), nil
+}
+
+func parseCanonicalCallbackQueryID(rawValue, parameter string, invalidURL error) (string, error) {
+	decodedValue, err := url.QueryUnescape(rawValue)
+	if err != nil {
+		return "", fmt.Errorf("%w: decode %s: %w", invalidURL, parameter, err)
+	}
+	parsedID, err := uuidv4.Parse(decodedValue, invalidURL)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s must be a canonical UUIDv4", invalidURL, parameter)
+	}
+	return parsedID.String(), nil
+}
+
 // RestartRequest contains the data needed to restart a lease's containers.
 type RestartRequest struct {
-	LeaseUUID   string `json:"lease_uuid"`
-	CallbackURL string `json:"callback_url"`
+	LeaseUUID     string           `json:"lease_uuid"`
+	MaintenanceID maintenanceid.ID `json:"maintenance_id"`
+	CallbackURL   string           `json:"callback_url"`
 }
 
 // UpdateRequest contains the data needed to update a lease to a new manifest.
 type UpdateRequest struct {
-	LeaseUUID   string `json:"lease_uuid"`
-	CallbackURL string `json:"callback_url"`
-	Payload     []byte `json:"payload"`
-	PayloadHash string `json:"payload_hash,omitempty"`
+	LeaseUUID     string           `json:"lease_uuid"`
+	MaintenanceID maintenanceid.ID `json:"maintenance_id"`
+	CallbackURL   string           `json:"callback_url"`
+	Payload       []byte           `json:"payload"`
 }
 
 // RestoreRequest contains the data needed to restore a soft-deleted lease's
@@ -358,12 +804,13 @@ type UpdateRequest struct {
 // the data is restored into. Items must match the retained set's shape
 // (service-name → summed-quantity).
 type RestoreRequest struct {
-	LeaseUUID     string      `json:"lease_uuid"`      // NEW lease
-	FromLeaseUUID string      `json:"from_lease_uuid"` // original (retained) lease
-	Tenant        string      `json:"tenant"`
-	ProviderUUID  string      `json:"provider_uuid"` // when non-empty, cross-checked against the retained record
-	Items         []LeaseItem `json:"items"`         // must match the retained set
-	CallbackURL   string      `json:"callback_url"`
+	LeaseUUID            string      `json:"lease_uuid"`      // NEW lease
+	FromLeaseUUID        string      `json:"from_lease_uuid"` // original (retained) lease
+	Tenant               string      `json:"tenant"`
+	ProviderUUID         string      `json:"provider_uuid"` // when non-empty, cross-checked against the retained record
+	Items                []LeaseItem `json:"items"`         // must match the retained set
+	CallbackURL          string      `json:"callback_url"`
+	LifecycleCallbackURL string      `json:"lifecycle_callback_url,omitempty"`
 }
 
 // ErrNotRetained is returned when no retained data exists for the original
@@ -467,7 +914,7 @@ var ErrValidation = errors.New("validation error")
 //
 // Deliberately NOT wrapping ErrValidation. ErrValidation is the reconciler's
 // PERMANENT branch — it rejects a PENDING lease and CLOSES an ACTIVE one
-// on-chain (handleProvisionError) — and a body fred could not parse is no
+// on-chain (handleProvisionResult) — and a body fred could not parse is no
 // evidence that the tenant is at fault.
 //
 // Scope, stated precisely (ENG-739): this is an operator-introduced
@@ -523,6 +970,32 @@ const CodeDemoteExceedsTier = "demote_exceeds_tier"
 // misclassification.
 const CodeAlreadyProvisioned = "already_provisioned"
 
+// CodeOperationCompletionPending reports a valid earlier callback completion
+// occupying the lease FIFO. It is an availability-success diagnostic only:
+// callers must preserve the exact unresolved attempt, never settle a refusal.
+const CodeOperationCompletionPending = "operation_completion_pending"
+
+// operationCompletionPendingResponse is minted only by the exact transport
+// response branch. It deliberately unwraps to no lifecycle/refusal sentinel.
+type operationCompletionPendingResponse struct{}
+
+func (*operationCompletionPendingResponse) Error() string {
+	return "an earlier operation completion is pending"
+}
+
+func isOperationCompletionPendingResponse(err error) bool {
+	var pending *operationCompletionPendingResponse
+	return errors.As(err, &pending)
+}
+
+// CodeInsufficientResources is the contract discriminator for a capacity
+// refusal before asynchronous work starts. It establishes response-envelope
+// conformance, not cryptographic authorship: backend responses are not HMAC
+// authenticated, so deployments still trust the configured transport. A bare
+// 503 is deliberately not equivalent because ordinary intermediaries may emit
+// one after the backend accepted the request.
+const CodeInsufficientResources = "insufficient_resources"
+
 // Validation sub-category sentinels. These wrap ErrValidation so errors.Is(err, ErrValidation)
 // still works, while allowing callers to classify the failure without string matching.
 var (
@@ -564,8 +1037,34 @@ func ClassifyValidationError(err error) ValidationCode {
 }
 
 // ErrInsufficientResources is returned when there are not enough resources
-// to fulfill a provision request.
+// to fulfill a provision or restore request. On its own this sentinel does not
+// prove whether the backend started work because legacy and intermediary 503
+// responses also map to it.
 var ErrInsufficientResources = errors.New("insufficient resources")
+
+// ErrCapacityRefused is returned only for a contract-conforming error envelope
+// whose code is CodeInsufficientResources. It wraps ErrInsufficientResources
+// so callers that only map the tenant-facing capacity result remain compatible,
+// while lifecycle coordinators can clear an exact durable attempt under the
+// configured backend transport's trust boundary.
+var ErrCapacityRefused = fmt.Errorf("%w: backend refused the request", ErrInsufficientResources)
+
+// readCapacityError is a transport observation about a read response. It does
+// not unwrap to a mutation refusal and cannot settle a durable operation.
+type readCapacityError struct {
+	detail string
+}
+
+func (e *readCapacityError) Error() string {
+	return "backend read response capacity exhausted: " + e.detail
+}
+
+// IsReadCapacity reports a complete, bounded backend read-capacity response.
+// This observation only supports retry guidance; it grants no mutation authority.
+func IsReadCapacity(err error) bool {
+	var capacity *readCapacityError
+	return errors.As(err, &capacity)
+}
 
 // ErrInvalidState is returned when an operation is not valid for the current lease state.
 var ErrInvalidState = errors.New("invalid state for operation")
@@ -575,6 +1074,84 @@ var ErrResponseTooLarge = errors.New("response body too large")
 
 // ErrCircuitOpen is returned when the circuit breaker is open.
 var ErrCircuitOpen = errors.New("circuit breaker is open")
+
+var (
+	// ErrBackendStorageIdentityUnbound means the production client has no
+	// durable expected identity and therefore refuses non-bootstrap requests.
+	ErrBackendStorageIdentityUnbound = errors.New("backend storage identity is not bound")
+	// ErrBackendStorageIdentityMissing means an upgraded backend response did
+	// not carry the required identity header.
+	ErrBackendStorageIdentityMissing = errors.New("backend response omitted storage identity")
+	// ErrBackendStorageIdentityMismatch means a response or request path names
+	// storage other than the identity pinned for the configured backend name.
+	ErrBackendStorageIdentityMismatch = errors.New("backend storage identity mismatch")
+	// ErrBackendUpgradeRequired proves an upgraded-only side-effect path was not
+	// dispatched: an older backend returned its route-level 404 without an
+	// identity header. Callers may refuse the exact write-ahead attempt.
+	ErrBackendUpgradeRequired = errors.New("backend must be upgraded before side effects are enabled")
+)
+
+// backendUpgradeRequiredError is private proof that the identity-bound client
+// itself observed the upgraded-only route missing before any legacy handler
+// could decode or execute the request. The public sentinel remains available
+// for compatibility, but an arbitrary transport error that merely wraps that
+// sentinel cannot manufacture no-dispatch evidence.
+type backendUpgradeRequiredError struct{ backend string }
+
+func (err *backendUpgradeRequiredError) Error() string {
+	return fmt.Sprintf("%s: %q", ErrBackendUpgradeRequired, err.backend)
+}
+
+func (*backendUpgradeRequiredError) Unwrap() error { return ErrBackendUpgradeRequired }
+
+func isBackendUpgradeRequiredProof(err error) bool {
+	var proof *backendUpgradeRequiredError
+	return errors.As(err, &proof)
+}
+
+// backendStorageIdentityMissingResponseError retains the response class that
+// accompanied a missing identity header. ErrBackendStorageIdentityMissing
+// remains the public fail-closed sentinel; callers may use the narrow helper
+// below to distinguish an unhealthy endpoint from a successful response that
+// failed to attest its identity.
+type backendStorageIdentityMissingResponseError struct {
+	backend    string
+	statusCode int
+	mode       requestIdentityMode
+}
+
+func (err *backendStorageIdentityMissingResponseError) Error() string {
+	return fmt.Sprintf(
+		"%s: backend %q returned status %d",
+		ErrBackendStorageIdentityMissing,
+		err.backend,
+		err.statusCode,
+	)
+}
+
+func (*backendStorageIdentityMissingResponseError) Unwrap() error {
+	return ErrBackendStorageIdentityMissing
+}
+
+// IsBackendStorageIdentityMissingServerError reports whether an
+// identity-bound observation received an HTTP 5xx response with no
+// storage-identity header at all. Observation-only health probes may treat that
+// as transient endpoint unavailability: explicitly empty, duplicate, or
+// malformed headers remain contradictions, and side-effect responses always
+// return false because this classification cannot prove refusal.
+func IsBackendStorageIdentityMissingServerError(err error) bool {
+	var responseErr *backendStorageIdentityMissingResponseError
+	return errors.As(err, &responseErr) &&
+		responseErr.mode == requestIdentityRead &&
+		responseErr.statusCode >= http.StatusInternalServerError &&
+		responseErr.statusCode <= 599
+}
+
+// BackendStorageIdentityResolver supplies the durable identity pinned by the
+// placement store. Implementations must be safe for concurrent calls.
+type BackendStorageIdentityResolver interface {
+	ExpectedBackendStorageIdentity(string) (backendidentity.ID, bool)
+}
 
 // isCircuitBreakerError checks if the error is a circuit breaker error
 // (either open state or too many requests in half-open state).
@@ -589,6 +1166,11 @@ type HTTPClient struct {
 	secret     string
 	httpClient *http.Client
 	cb         *gobreaker.CircuitBreaker
+	identity   BackendStorageIdentityResolver
+
+	// One complete inventory walk may run independently of the tenant breaker.
+	// The constructor owns the slot; callers cannot select a bypass mode.
+	inventorySlot chan struct{}
 
 	// Response body size limits
 	maxInfoBytes             int64
@@ -608,6 +1190,21 @@ type HTTPClient struct {
 	malformedErrorBodyTotal *prometheus.CounterVec
 }
 
+type requestIdentityMode uint8
+
+const (
+	requestIdentityRead requestIdentityMode = iota + 1
+	requestIdentityBootstrap
+	requestIdentitySideEffect
+)
+
+type requestIdentityContext struct {
+	expected backendidentity.ID
+	mode     requestIdentityMode
+}
+
+type requestIdentityContextKey struct{}
+
 // MaxLookupUUIDs caps the number of lease UUIDs accepted by a single
 // LookupProvisions call (and the matching server-side filter on
 // GET /provisions?lease_uuid=...). Shared across the HTTP client, the
@@ -617,14 +1214,25 @@ const MaxLookupUUIDs = 100
 
 // Default response body size limits (defense-in-depth against buggy/misrouted backends).
 const (
-	DefaultMaxInfoBytes             int64 = 1 << 20  // 1 MiB — single lease info
-	DefaultMaxProvisionBytes        int64 = 1 << 20  // 1 MiB — single provision record
-	DefaultMaxProvisionsBytes       int64 = 8 << 20  // 8 MiB — list of all provisions
-	DefaultMaxLookupProvisionsBytes int64 = 8 << 20  // 8 MiB — filtered provisions lookup; matches MaxProvisionsBytes because stack leases carry unbounded ServiceImages
-	DefaultMaxLogsBytes             int64 = 16 << 20 // 16 MiB — container logs can be large
-	DefaultMaxReleasesBytes         int64 = 8 << 20  // 8 MiB — release history with manifests
-	DefaultMaxStatsBytes            int64 = 1 << 20  // 1 MiB — load stats snapshot (small JSON)
-	DefaultMaxRetentionsBytes       int64 = 1 << 20  // 1 MiB — bounds a single /retentions PAGE (not the whole list) since pagination
+	DefaultMaxInfoBytes             int64 = 1 << 20 // 1 MiB — single lease info
+	DefaultMaxProvisionBytes        int64 = 1 << 20 // 1 MiB — single provision record
+	DefaultMaxProvisionsBytes       int64 = 8 << 20 // 8 MiB — list of all provisions
+	DefaultMaxLookupProvisionsBytes int64 = 8 << 20 // 8 MiB — filtered provisions lookup; matches MaxProvisionsBytes because stack leases carry unbounded ServiceImages
+	DefaultMaxLogsBytes             int64 = int64(MaxProjectedLogsResponseBytes)
+	// MaxStoredReleaseHistoryBytes is the encoded per-lease history contract
+	// enforced by the authoritative release journal. Keep this in the parent
+	// backend package so both the HTTP boundary and the shared store use one
+	// compile-time value without an import cycle.
+	MaxStoredReleaseHistoryBytes = 32 << 20
+	// MaxProjectedReleasesResponseBytes includes bounded projection headroom.
+	// A legacy failed row may omit Reason on disk but gain ReasonUnknown at the
+	// backend read boundary, so a valid response is not necessarily byte-smaller
+	// than its stored history. Forty-eight MiB safely covers the worst valid
+	// status-only history while retaining a finite response-body guard.
+	MaxProjectedReleasesResponseBytes       = 48 << 20
+	DefaultMaxReleasesBytes           int64 = MaxProjectedReleasesResponseBytes
+	DefaultMaxStatsBytes              int64 = 1 << 20 // 1 MiB — load stats snapshot (small JSON)
+	DefaultMaxRetentionsBytes         int64 = 1 << 20 // 1 MiB — bounds a single /retentions PAGE (not the whole list) since pagination
 
 	// DefaultProvisionsPageLimit is the page size the client requests on
 	// GET /provisions. The server coerces a larger value down to MaxPageLimit.
@@ -643,19 +1251,19 @@ const (
 // real fleet.
 const maxListPages = 100_000
 
-// HTTPClientConfig configures an HTTP backend client.
-type HTTPClientConfig struct {
-	Name                string
-	BaseURL             string
-	Timeout             time.Duration
+// Inventory safety budgets apply to each complete endpoint walk, independently
+// of backend page size. Exceeding either fails the whole observation; callers
+// must never interpret a truncated inventory as evidence of absence.
+const (
+	MaxInventoryItems       = 100_000
+	MaxInventoryBytes int64 = 128 << 20
+)
+
+// HTTPClientOptions tunes resource limits, circuit breaking, and telemetry.
+// Connection authority is supplied separately as an opaque ConnectionPolicy.
+type HTTPClientOptions struct {
 	MaxIdleConns        int // Max idle connections across all hosts (default: 100)
 	MaxIdleConnsPerHost int // Max idle connections per host (default: 10)
-	Secret              string
-
-	// TLSClientConfig, when non-nil, is applied to the backend HTTP transport
-	// (private-CA trust and/or a client certificate for mTLS). Built by the
-	// caller from per-backend config so this package performs no file I/O.
-	TLSClientConfig *tls.Config
 
 	// Circuit breaker settings
 	CBMaxRequests   uint32        // Max requests in half-open state (default: 1)
@@ -669,8 +1277,8 @@ type HTTPClientConfig struct {
 	MaxProvisionBytes        int64 // GetProvision response limit (default: 1 MiB)
 	MaxProvisionsBytes       int64 // ListProvisions response limit (default: 8 MiB)
 	MaxLookupProvisionsBytes int64 // LookupProvisions response limit (default: 8 MiB)
-	MaxLogsBytes             int64 // GetLogs response limit (default: 16 MiB)
-	MaxReleasesBytes         int64 // GetReleases response limit (default: 8 MiB)
+	MaxLogsBytes             int64 // GetLogs encoded response limit (default: MaxProjectedLogsResponseBytes)
+	MaxReleasesBytes         int64 // GetReleases response limit (default: 48 MiB projected response)
 	MaxStatsBytes            int64 // GetLoadStats response limit (default: 1 MiB)
 	MaxRetentionsBytes       int64 // /retentions per-page response limit (default: 1 MiB)
 	ProvisionsPageLimit      int   // /provisions page size requested by the client (default: 1000)
@@ -699,10 +1307,14 @@ func positiveOr(v, fallback int64) int64 {
 	return fallback
 }
 
-// NewHTTPClient creates a new HTTP backend client.
-func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
+// newHTTPClient constructs the transport implementation without attaching a
+// durable storage-identity resolver. Keep it private: the resulting method set
+// includes every backend side effect, so returning it to bootstrap inventory
+// code would make mutation authority available by accident.
+func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
+	connection := policy.state
 	// Apply defaults using cmp.Or (returns first non-zero value)
-	timeout := cmp.Or(cfg.Timeout, 30*time.Second)
+	timeout := cmp.Or(connection.timeout, 30*time.Second)
 	maxIdleConns := cmp.Or(cfg.MaxIdleConns, 100)
 	maxIdleConnsPerHost := cmp.Or(cfg.MaxIdleConnsPerHost, 10) // Higher than default (2)
 
@@ -716,18 +1328,14 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		MaxIdleConnsPerHost: maxIdleConnsPerHost,
 		IdleConnTimeout:     90 * time.Second,
 	}
-	if cfg.TLSClientConfig != nil {
-		transport.TLSClientConfig = cfg.TLSClientConfig
-		// The hop stays HTTP/1.1 over TLS (it is plaintext HTTP/1.1 today).
-		// A custom TLSClientConfig disables Go's automatic HTTP/2; we
-		// deliberately do NOT set ForceAttemptHTTP2 — these are low-volume
-		// JSON request/response calls and h2 with a custom TLS config carries
-		// a known footgun (golang/go#20645).
-	}
+	// Each client owns its transport configuration; immutable trust material
+	// remains private to the policy. No nil/default TLS path is exposed.
+	// The backend hop keeps its existing HTTP/1.1 transport behavior.
+	transport.TLSClientConfig = connection.tlsConfig.Clone()
 
 	// Create circuit breaker
 	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
-		Name:        cfg.Name,
+		Name:        connection.name,
 		MaxRequests: cbMaxRequests,
 		Interval:    cfg.CBInterval, // 0 = don't clear counts
 		Timeout:     cbTimeout,
@@ -741,14 +1349,18 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			//   - ErrNotProvisioned: 404 from GetInfo/GetProvision/GetLogs (valid "not found")
 			//   - ErrValidation: 400 from Provision/Update (permanent client error)
 			//   - ErrInsufficientResources: 503 from Provision (backend at capacity, not unhealthy)
-			//   - ErrAlreadyProvisioned: 409 from Provision (idempotent duplicate)
+			//   - readCapacityError: exact read-capacity envelope; retry pressure does
+			//     not make the backend unhealthy or grant mutation refusal authority.
+			//   - ErrAlreadyProvisioned: 409 from Provision (breaker-exempt conflict;
+			//     not ownership proof until authoritative inventory validates it)
 			//   - ErrInvalidState: 409 from Restart/Update (wrong lease state for operation)
 			//   - ErrNotRetained: 422 from Restore (no retained data — benign client condition)
 			//   - ErrDemoteDataExceedsTier: 422 (code=demote_exceeds_tier) from Restore — data exceeds the tier cap, a permanent client error, not a backend failure
 			//   - ErrRestoreRefused: a well-formed Restore refusal whose code fred does not know.
-			//     Belongs here with the other authored refusals: the envelope was valid, so this is
-			//     a business outcome, and "code" is an open add-only set — a backend that ships a
-			//     new discriminator before providerd learns it must not open the breaker.
+			//     Belongs here with the other contract-conforming refusals: the envelope was
+			//     valid, so this is a business outcome, and "code" is an open add-only set — a
+			//     backend that ships a new discriminator before providerd learns it must not
+			//     open the breaker.
 			// ErrMalformedErrorBody is deliberately ABSENT from this list, unlike every
 			// other 4xx above: a body fred cannot parse is not an expected business
 			// outcome, it is a backend that is off-contract. Counting it makes the
@@ -762,11 +1374,15 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 				errors.Is(err, ErrNotProvisioned) ||
 				errors.Is(err, ErrValidation) ||
 				errors.Is(err, ErrInsufficientResources) ||
+				IsReadCapacity(err) ||
+				isOperationCompletionPendingResponse(err) ||
 				errors.Is(err, ErrAlreadyProvisioned) ||
 				errors.Is(err, ErrInvalidState) ||
 				errors.Is(err, ErrNotRetained) ||
 				errors.Is(err, ErrDemoteDataExceedsTier) ||
-				errors.Is(err, ErrRestoreRefused)
+				errors.Is(err, ErrRestoreRefused) ||
+				errors.Is(err, ErrBackendStorageIdentityUnbound) ||
+				errors.Is(err, ErrBackendUpgradeRequired)
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			slog.Warn("circuit breaker state change",
@@ -793,19 +1409,26 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 	}
 
 	return &HTTPClient{
-		name:    cfg.Name,
-		baseURL: cfg.BaseURL,
-		secret:  cfg.Secret,
+		name:    connection.name,
+		baseURL: connection.baseURL,
+		secret:  connection.secret,
 		httpClient: &http.Client{
 			Timeout:   timeout,
 			Transport: transport,
+			// HMAC and storage authority are bound to the original RequestURI.
+			// Following a redirect could replay a POST body onto an unsigned legacy
+			// path or another host, so every backend redirect is returned untouched.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 		cb:                       cb,
+		inventorySlot:            make(chan struct{}, 1),
 		maxInfoBytes:             positiveOr(cfg.MaxInfoBytes, DefaultMaxInfoBytes),
 		maxProvisionBytes:        positiveOr(cfg.MaxProvisionBytes, DefaultMaxProvisionBytes),
 		maxProvisionsBytes:       positiveOr(cfg.MaxProvisionsBytes, DefaultMaxProvisionsBytes),
 		maxLookupProvisionsBytes: positiveOr(cfg.MaxLookupProvisionsBytes, DefaultMaxLookupProvisionsBytes),
-		maxLogsBytes:             positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes),
+		maxLogsBytes:             min(positiveOr(cfg.MaxLogsBytes, DefaultMaxLogsBytes), DefaultMaxLogsBytes),
 		maxReleasesBytes:         positiveOr(cfg.MaxReleasesBytes, DefaultMaxReleasesBytes),
 		maxStatsBytes:            positiveOr(cfg.MaxStatsBytes, DefaultMaxStatsBytes),
 		maxRetentionsBytes:       positiveOr(cfg.MaxRetentionsBytes, DefaultMaxRetentionsBytes),
@@ -815,6 +1438,188 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		requestsTotal:            cfg.RequestsTotal,
 		malformedErrorBodyTotal:  cfg.MalformedErrorBodyTotal,
 	}
+}
+
+// BootstrapInventoryClient is the complete read-only inventory capability
+// required while a stopped/prepared placement database has not yet supplied a
+// backend storage identity. Its method set deliberately excludes every backend
+// mutation.
+type BootstrapInventoryClient interface {
+	Name() string
+	ListProvisionsWithIdentity(context.Context) ([]ProvisionInfo, backendidentity.ID, error)
+	ListRetentionsWithIdentity(context.Context) ([]RetainedLease, backendidentity.ID, error)
+}
+
+// bootstrapInventoryClient uses composition rather than embedding so neither
+// the concrete HTTPClient nor its side-effect methods leak through the narrow
+// bootstrap capability.
+type bootstrapInventoryClient struct {
+	client *HTTPClient
+}
+
+var _ BootstrapInventoryClient = bootstrapInventoryClient{}
+
+// NewBootstrapInventoryClient constructs the only unbound production client.
+// It can collect identity-bearing inventory but cannot express a mutation.
+func NewBootstrapInventoryClient(policy ConnectionPolicy, cfg HTTPClientOptions) (BootstrapInventoryClient, error) {
+	if !policy.valid() {
+		return nil, errors.New("backend connection policy is required")
+	}
+	return bootstrapInventoryClient{client: newHTTPClient(policy, cfg)}, nil
+}
+
+func (c bootstrapInventoryClient) Name() string {
+	return c.client.Name()
+}
+
+func (c bootstrapInventoryClient) ListProvisionsWithIdentity(
+	ctx context.Context,
+) ([]ProvisionInfo, backendidentity.ID, error) {
+	return c.client.ListProvisionsWithIdentity(ctx)
+}
+
+func (c bootstrapInventoryClient) ListRetentionsWithIdentity(
+	ctx context.Context,
+) ([]RetainedLease, backendidentity.ID, error) {
+	return c.client.ListRetentionsWithIdentity(ctx)
+}
+
+// NewIdentityBoundHTTPClient creates the production client. It refuses every
+// non-inventory request until the placement store has pinned this configured
+// name to an immutable backend storage identity. Side effects use upgraded-only
+// identity paths, so an old/reverted backend returns 404 before decoding or
+// executing the request rather than merely ignoring a new query parameter. A
+// strong HMAC secret and the shared TLS policy are required at construction.
+func NewIdentityBoundHTTPClient(
+	policy ConnectionPolicy,
+	cfg HTTPClientOptions,
+	resolver BackendStorageIdentityResolver,
+) (*HTTPClient, error) {
+	if !policy.valid() {
+		return nil, errors.New("backend connection policy is required")
+	}
+	if util.IsNilInterface(resolver) {
+		return nil, errors.New("backend storage identity resolver is required")
+	}
+	client := newHTTPClient(policy, cfg)
+	client.identity = resolver
+	return client, nil
+}
+
+func (c *HTTPClient) prepareRequest(
+	req *http.Request,
+	body []byte,
+	mode requestIdentityMode,
+) error {
+	if c.identity == nil {
+		c.signRequest(req, body)
+		return nil
+	}
+	expected, bound := c.identity.ExpectedBackendStorageIdentity(c.name)
+	if !bound || !expected.Valid() {
+		if mode != requestIdentityBootstrap {
+			return fmt.Errorf("%w: %q", ErrBackendStorageIdentityUnbound, c.name)
+		}
+		expected = backendidentity.ID{}
+	}
+	if mode == requestIdentitySideEffect {
+		path, err := backendidentity.BoundPath(expected, req.URL.Path)
+		if err != nil {
+			return fmt.Errorf("bind backend side-effect path: %w", err)
+		}
+		req.URL.Path = path
+		req.URL.RawPath = ""
+	}
+	if expected.Valid() {
+		query := req.URL.Query()
+		query.Set(backendidentity.QueryParameter, expected.String())
+		req.URL.RawQuery = query.Encode()
+	}
+	ctx := context.WithValue(req.Context(), requestIdentityContextKey{}, requestIdentityContext{
+		expected: expected,
+		mode:     mode,
+	})
+	*req = *req.WithContext(ctx)
+	c.signRequest(req, body)
+	return nil
+}
+
+func (c *HTTPClient) do(req *http.Request) (*http.Response, error) {
+	resp, err := c.httpClient.Do(req)
+	if err != nil || c.identity == nil {
+		return resp, err
+	}
+	identityContext, ok := req.Context().Value(requestIdentityContextKey{}).(requestIdentityContext)
+	if !ok {
+		if resp != nil {
+			discardAndCloseResponse(resp)
+		}
+		return nil, errors.New("identity-bound backend request was not prepared")
+	}
+	values := resp.Header.Values(backendidentity.ResponseHeader)
+	if len(values) == 0 {
+		if identityContext.mode == requestIdentitySideEffect &&
+			resp.StatusCode == http.StatusNotFound {
+			discardAndCloseResponse(resp)
+			return nil, &backendUpgradeRequiredError{backend: c.name}
+		}
+		missingErr := &backendStorageIdentityMissingResponseError{
+			backend:    c.name,
+			statusCode: resp.StatusCode,
+			mode:       identityContext.mode,
+		}
+		discardAndCloseResponse(resp)
+		return nil, missingErr
+	}
+	if len(values) != 1 || values[0] == "" {
+		discardAndCloseResponse(resp)
+		return nil, fmt.Errorf(
+			"%w: backend %q returned an empty or duplicate identity header",
+			ErrBackendStorageIdentityMissing,
+			c.name,
+		)
+	}
+	observed, parseErr := backendidentity.Parse(values[0])
+	if parseErr != nil {
+		discardAndCloseResponse(resp)
+		return nil, fmt.Errorf("%w: backend %q returned %q: %w",
+			ErrBackendStorageIdentityMismatch, c.name, values[0], parseErr)
+	}
+	if identityContext.expected.Valid() && observed != identityContext.expected {
+		discardAndCloseResponse(resp)
+		return nil, fmt.Errorf("%w: backend %q returned %s, expected %s",
+			ErrBackendStorageIdentityMismatch, c.name, observed, identityContext.expected)
+	}
+	return resp, nil
+}
+
+func discardAndCloseResponse(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	drainResponseBody(resp.Body)
+	_ = resp.Body.Close()
+}
+
+// maxResponseDrainBytes bounds the best-effort work spent making a backend
+// connection reusable after the caller has all protocol-relevant bytes. A
+// backend response is an untrusted stream: draining it to EOF would otherwise
+// let a peer keep one worker reading arbitrary data until the request deadline.
+const maxResponseDrainBytes int64 = 64 << 10
+
+func drainResponseBody(body io.Reader) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxResponseDrainBytes))
+}
+
+func responseStorageIdentity(resp *http.Response) (backendidentity.ID, error) {
+	if resp == nil {
+		return backendidentity.ID{}, ErrBackendStorageIdentityMissing
+	}
+	values := resp.Header.Values(backendidentity.ResponseHeader)
+	if len(values) != 1 {
+		return backendidentity.ID{}, ErrBackendStorageIdentityMissing
+	}
+	return backendidentity.Parse(values[0])
 }
 
 // Name returns the backend's configured name.
@@ -840,13 +1645,15 @@ func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error)
 	}
 }
 
-// readErrorBodyBytes reads up to 4 KiB from an HTTP response body for
-// inclusion in error messages. Remaining bytes are drained to allow
-// connection reuse. If reading fails, a placeholder message is returned.
+const maxBackendErrorBytes = 4 << 10
+
+// readErrorBodyBytes preserves one overflow byte so an oversized stream cannot
+// become a valid refusal after truncation. The common envelope decoder rejects
+// overflow before interpreting any field. A bounded remainder is drained for
+// connection reuse; a read failure remains an unparseable diagnostic.
 func readErrorBodyBytes(resp *http.Response) []byte {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	// Drain any remaining bytes so the underlying connection can be reused.
-	_, _ = io.Copy(io.Discard, resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBackendErrorBytes+1))
+	drainResponseBody(resp.Body)
 	if err != nil {
 		return []byte(fmt.Sprintf("<body read error: %v>", err))
 	}
@@ -859,23 +1666,29 @@ func readErrorBody(resp *http.Response) string {
 }
 
 // decodeJSONLimited reads at most limit bytes from r, then JSON-unmarshals into dst.
-// Returns ErrResponseTooLarge if the body exceeds limit. Remaining bytes are drained
-// to allow connection reuse.
+// Returns ErrResponseTooLarge if the body exceeds limit. A bounded remainder
+// is drained for connection reuse without trusting the backend to reach EOF.
 func decodeJSONLimited(r io.ReadCloser, limit int64, dst any) error {
+	_, err := decodeJSONMeasured(r, limit, dst)
+	return err
+}
+
+// decodeJSONMeasured retains the complete wire size, including JSON whitespace,
+// so pagination cannot discard each page's contribution to the total budget.
+func decodeJSONMeasured(r io.ReadCloser, limit int64, dst any) (int64, error) {
 	lr := io.LimitReader(r, limit+1)
 	body, err := io.ReadAll(lr)
-	// Drain any remaining bytes so the underlying connection can be reused.
-	_, _ = io.Copy(io.Discard, r)
+	drainResponseBody(r)
 	if err != nil {
-		return fmt.Errorf("read response body: %w", err)
+		return 0, fmt.Errorf("read response body: %w", err)
 	}
 	if int64(len(body)) > limit {
-		return fmt.Errorf("%w: %d bytes exceeds %d byte limit", ErrResponseTooLarge, len(body), limit)
+		return 0, fmt.Errorf("%w: %d bytes exceeds %d byte limit", ErrResponseTooLarge, len(body), limit)
 	}
 	if err := json.Unmarshal(body, dst); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+		return 0, fmt.Errorf("decode response: %w", err)
 	}
-	return nil
+	return int64(len(body)), nil
 }
 
 // parseValidationError parses a 400 response body and returns an error
@@ -891,15 +1704,9 @@ func decodeJSONLimited(r io.ReadCloser, limit int64, dst any) error {
 // wrote it, and bytes fred could not parse carry no such duty. The unparsed
 // body is recorded on the operator channel by noteMalformedErrorBody.
 func (c *HTTPClient) parseValidationError(body []byte, operation string) error {
-	var resp struct {
-		Error          string         `json:"error"`
-		ValidationCode ValidationCode `json:"validation_code"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		// Unparseable: fred cannot even tell whether the BACKEND produced this
-		// 400. An intermediary emitting its own (oversized header, h2 quirk,
-		// WAF rule) is exactly the case that must not be filed as permanent.
-		return c.noteMalformedErrorBody(body, operation, "body is not the JSON error envelope")
+	resp, err := c.decodeErrorEnvelope(body, operation)
+	if err != nil {
+		return err
 	}
 	if resp.Error == "" {
 		// Parsing is NOT the test — carrying the required field is.
@@ -954,20 +1761,53 @@ func (c *HTTPClient) parseValidationError(body []byte, operation string) error {
 // msg is returned only when it came out of the envelope's declared "error"
 // field; the raw bytes never leave this function.
 func (c *HTTPClient) parseErrorCode(body []byte, operation string) (code, msg string, err error) {
-	if len(bytes.TrimSpace(body)) == 0 {
-		return "", "", nil // bare status: the one documented no-body case
-	}
-	var resp struct {
-		Error string `json:"error"`
-		Code  string `json:"code"`
-	}
-	if jsonErr := json.Unmarshal(body, &resp); jsonErr != nil {
-		return "", "", c.noteMalformedErrorBody(body, operation, "body is not the JSON error envelope")
-	}
-	if resp.Error == "" {
-		return "", "", c.noteMalformedErrorBody(body, operation, `envelope is missing the required "error" field`)
+	resp, err := c.decodeErrorEnvelope(body, operation)
+	if err != nil {
+		return "", "", err
 	}
 	return resp.Code, resp.Error, nil
+}
+
+// backendErrorEnvelope is decoded once at the transport boundary. Only an
+// exact, bounded envelope may select a refusal classification; an actually
+// empty body retains the documented bare-status compatibility.
+type backendErrorEnvelope struct {
+	Error          string         `json:"error"`
+	Code           string         `json:"code,omitempty"`
+	ValidationCode ValidationCode `json:"validation_code,omitempty"`
+}
+
+func (c *HTTPClient) decodeErrorEnvelope(body []byte, operation string) (backendErrorEnvelope, error) {
+	if len(body) == 0 {
+		return backendErrorEnvelope{}, nil
+	}
+	var envelope backendErrorEnvelope
+	if err := strictjson.DecodeObject(body, maxBackendErrorBytes, &envelope); err != nil {
+		return backendErrorEnvelope{}, c.noteMalformedErrorBody(body, operation, "body is not one bounded, exact JSON error envelope")
+	}
+	if envelope.Error == "" {
+		return backendErrorEnvelope{}, c.noteMalformedErrorBody(body, operation, `envelope is missing the required "error" field`)
+	}
+	return envelope, nil
+}
+
+// parseCapacityError distinguishes a contract-conforming refusal from an
+// unvalidated 503. The declared envelope plus shared code is sufficient under
+// the configured transport's trust boundary; it is not response authentication.
+// Empty, malformed, legacy, and unknown-code responses retain their conservative
+// classifications.
+func (c *HTTPClient) parseCapacityError(body []byte, operation string) error {
+	code, msg, err := c.parseErrorCode(body, operation)
+	if err != nil {
+		return err
+	}
+	if code == CodeInsufficientResources {
+		return detailOr(ErrCapacityRefused, msg)
+	}
+	if code != "" {
+		c.noteUnrecognizedErrorCode(operation, http.StatusServiceUnavailable, code)
+	}
+	return detailOr(ErrInsufficientResources, msg)
 }
 
 // detailOr returns sentinel decorated with detail, or the bare sentinel when
@@ -1013,7 +1853,9 @@ func (c *HTTPClient) noteMalformedErrorBody(body []byte, operation, why string) 
 }
 
 // signRequest adds an HMAC-SHA256 signature header to the request.
-// If no secret is configured, this is a no-op (backwards compatible).
+// If no secret is configured, this is a no-op for transport test fixtures.
+// Both production factories reject that state, so
+// mutation-capable production clients cannot reach this compatibility branch.
 func (c *HTTPClient) signRequest(req *http.Request, body []byte) {
 	if c.secret == "" {
 		return
@@ -1025,6 +1867,16 @@ func (c *HTTPClient) signRequest(req *http.Request, body []byte) {
 // JSON response as T. It handles 404→ErrNotProvisioned and enforces a
 // response size limit.
 func doGet[T any](c *HTTPClient, ctx context.Context, metric, url string, maxBytes int64) (_ *T, err error) {
+	return doGetDecoded(c, ctx, metric, url, maxBytes, func(r io.ReadCloser, limit int64) (*T, error) {
+		var v T
+		if err := decodeJSONLimited(r, limit, &v); err != nil {
+			return nil, err
+		}
+		return &v, nil
+	})
+}
+
+func doGetDecoded[T any](c *HTTPClient, ctx context.Context, metric, url string, maxBytes int64, decode func(io.ReadCloser, int64) (*T, error)) (_ *T, err error) {
 	start := time.Now()
 	defer func() { c.recordMetrics(metric, start, err) }()
 
@@ -1033,9 +1885,11 @@ func doGet[T any](c *HTTPClient, ctx context.Context, metric, url string, maxByt
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
-		c.signRequest(httpReq, nil)
+		if err := c.prepareRequest(httpReq, nil, requestIdentityRead); err != nil {
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("%s request failed: %w", metric, err)
 		}
@@ -1044,15 +1898,25 @@ func doGet[T any](c *HTTPClient, ctx context.Context, metric, url string, maxByt
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, ErrNotProvisioned
 		}
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			envelope, err := c.decodeErrorEnvelope(readErrorBodyBytes(resp), metric)
+			if err != nil {
+				return nil, err
+			}
+			if envelope.Code == CodeInsufficientResources {
+				return nil, &readCapacityError{detail: envelope.Error}
+			}
+			return nil, fmt.Errorf("%s failed with status %d: %s", metric, resp.StatusCode, envelope.Error)
+		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("%s failed with status %d: %s", metric, resp.StatusCode, readErrorBody(resp))
 		}
 
-		var v T
-		if err := decodeJSONLimited(resp.Body, maxBytes, &v); err != nil {
+		v, err := decode(resp.Body, maxBytes)
+		if err != nil {
 			return nil, fmt.Errorf("decode %s response: %w", metric, err)
 		}
-		return &v, nil
+		return v, nil
 	})
 
 	if isCircuitBreakerError(cbErr) {
@@ -1068,27 +1932,50 @@ func doGet[T any](c *HTTPClient, ctx context.Context, metric, url string, maxByt
 	return v, nil
 }
 
-// Provision sends a provision request to the backend.
-func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err error) {
+// Provision sends a provision request to the backend while preserving the
+// legacy Backend surface. Placement settlement uses InvokeProvision so causal
+// transport evidence is not flattened back into an arbitrary error tree.
+func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) error {
+	return c.provisionCall(ctx, req).Err()
+}
+
+// provisionCall executes one request and mints its causal outcome at the exact
+// transport branch that observed it.
+func (c *HTTPClient) provisionCall(
+	ctx context.Context,
+	req ProvisionRequest,
+) (outcome ProvisionCallOutcome) {
 	start := time.Now()
-	defer func() { c.recordMetrics("provision", start, err) }()
+	defer func() { c.recordMetrics("provision", start, outcome.Err()) }()
 
 	body, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("marshal provision request: %w", err)
+		return notDispatchedProvisionCall(fmt.Errorf("marshal provision request: %w", err))
 	}
 
+	var observed ProvisionCallOutcome
 	_, cbErr := c.cb.Execute(func() (any, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/provision", bytes.NewReader(body))
 		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
+			callErr := fmt.Errorf("create request: %w", err)
+			observed = notDispatchedProvisionCall(callErr)
+			return nil, callErr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		c.signRequest(httpReq, body)
+		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			observed = notDispatchedProvisionCall(err)
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
-			return nil, fmt.Errorf("provision request failed: %w", err)
+			callErr := fmt.Errorf("provision request failed: %w", err)
+			if isBackendUpgradeRequiredProof(err) {
+				observed = notDispatchedProvisionCall(callErr)
+			} else {
+				observed = ambiguousProvisionCall(callErr)
+			}
+			return nil, callErr
 		}
 		defer func() { _ = resp.Body.Close() }()
 
@@ -1098,25 +1985,58 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 			switch resp.StatusCode {
 			case http.StatusBadRequest:
 				// 400: validation error — permanent, won't succeed on retry.
-				return nil, c.parseValidationError(readErrorBodyBytes(resp), "provision")
+				callErr := c.parseValidationError(readErrorBodyBytes(resp), "provision")
+				if errors.Is(callErr, ErrValidation) {
+					observed = refusedProvisionCall(callErr, ProvisionRefusalValidation)
+				} else {
+					observed = ambiguousProvisionCall(callErr)
+				}
+				return nil, callErr
 			case http.StatusConflict:
-				// 409: lease already provisioned — idempotent duplicate.
-				return nil, fmt.Errorf("%w: %s", ErrAlreadyProvisioned, readErrorBody(resp))
+				// 409: the backend reports a conflict. Callers must validate it
+				// against authoritative inventory before treating it as ownership.
+				code, msg, parseErr := c.parseErrorCode(readErrorBodyBytes(resp), "provision")
+				if parseErr != nil {
+					observed = ambiguousProvisionCall(parseErr)
+					return nil, parseErr
+				}
+				callErr := detailOr(ErrAlreadyProvisioned, msg)
+				if code == CodeOperationCompletionPending {
+					callErr = &operationCompletionPendingResponse{}
+				}
+				observed = ambiguousProvisionCall(callErr)
+				return nil, callErr
 			case http.StatusServiceUnavailable:
-				// 503: backend at capacity — not a health failure.
-				return nil, fmt.Errorf("%w: %s", ErrInsufficientResources, readErrorBody(resp))
+				// Only the contract envelope and shared code authorize refusal
+				// settlement. A bare/proxy 503 remains ambiguous.
+				callErr := c.parseCapacityError(readErrorBodyBytes(resp), "provision")
+				if errors.Is(callErr, ErrCapacityRefused) {
+					observed = refusedProvisionCall(callErr, ProvisionRefusalCapacity)
+				} else {
+					observed = ambiguousProvisionCall(callErr)
+				}
+				return nil, callErr
 			default:
-				return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+				callErr := fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+				observed = ambiguousProvisionCall(callErr)
+				return nil, callErr
 			}
 		}
 
+		observed = acceptedProvisionCall()
 		return nil, nil
 	})
 
-	if isCircuitBreakerError(cbErr) {
-		return ErrCircuitOpen
+	if observed.Valid() {
+		return observed
 	}
-	return cbErr
+	if isCircuitBreakerError(cbErr) {
+		return notDispatchedProvisionCall(ErrCircuitOpen)
+	}
+	if cbErr != nil {
+		return ambiguousProvisionCall(cbErr)
+	}
+	return ambiguousProvisionCall(errors.New("provision transport returned no causal outcome"))
 }
 
 // GetInfo retrieves lease information including connection details.
@@ -1134,15 +2054,19 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 		return fmt.Errorf("marshal deprovision request: %w", err)
 	}
 
+	invoked := false
 	_, cbErr := c.cb.Execute(func() (any, error) {
+		invoked = true
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/deprovision", bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		c.signRequest(httpReq, body)
+		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("deprovision request failed: %w", err)
 		}
@@ -1155,44 +2079,94 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 		return nil, nil
 	})
 
-	if isCircuitBreakerError(cbErr) {
-		return ErrCircuitOpen
+	if !invoked && isCircuitBreakerError(cbErr) {
+		return &deprovisionNotDispatchedError{client: c, leaseUUID: leaseUUID}
 	}
 	return cbErr
 }
 
-// walkKeysetPages drives a complete-or-error keyset walk over a paginated
-// backend list endpoint, reassembling every page into one slice. fetchPage
-// returns one page's items and the next continue token ("" once the set is
-// exhausted). Shared by ListProvisions and ListRetentions so their fail-closed
-// defenses — the maxListPages backstop, the strict-increase continue-token
-// guard, inter-page ctx cancellation, and the non-nil accumulator — live in one
-// place and cannot drift between the two endpoints. op names the operation for
-// error messages (e.g. "list provisions").
-func walkKeysetPages[T any](ctx context.Context, op string, fetchPage func(ctx context.Context, continueToken string) (items []T, next string, err error)) ([]T, error) {
-	acc := []T{} // non-nil so an empty backend returns [] (not nil)
+// inventoryPage carries the actual decoded response size alongside its data.
+// Only the bounded HTTP decoder constructs pages used by production walks.
+type inventoryPage[T any] struct {
+	items     []T
+	next      string
+	identity  backendidentity.ID
+	bodyBytes int64
+}
+
+// walkKeysetPages owns completeness, storage identity and resource budgets for
+// both inventory endpoints. The configured request timeout bounds the whole
+// walk, so successful slow pages cannot indefinitely stall fleet reconciliation.
+// No prefix or identity escapes a failed walk.
+func walkKeysetPages[T any](ctx context.Context, op string, requireIdentity bool, timeout time.Duration, fetchPage func(context.Context, string) (inventoryPage[T], error)) ([]T, backendidentity.ID, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	acc := []T{}
+	var observed backendidentity.ID
+	var totalBytes int64
 	cont := ""
 	for page := 0; ; page++ {
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("%s: %w", op, err) // responsive inter-page cancellation
+			return nil, backendidentity.ID{}, fmt.Errorf("%s: %w", op, err)
 		}
 		if page >= maxListPages {
-			return nil, fmt.Errorf("%s: exceeded %d pages (last continue=%q); backend not converging", op, maxListPages, cont)
+			return nil, backendidentity.ID{}, fmt.Errorf("%s: exceeded %d pages; backend not converging", op, maxListPages)
 		}
-		items, next, err := fetchPage(ctx, cont)
+		current, err := fetchPage(ctx, cont)
 		if err != nil {
-			return nil, err
+			return nil, backendidentity.ID{}, err
 		}
-		acc = append(acc, items...)
-		if next == "" {
-			break // exhausted — the complete set
+		if err := ctx.Err(); err != nil {
+			return nil, backendidentity.ID{}, fmt.Errorf("%s: %w", op, err)
 		}
-		if next <= cont {
-			return nil, fmt.Errorf("%s: backend returned non-advancing continue token %q (sent %q)", op, next, cont)
+		if current.items == nil {
+			return nil, backendidentity.ID{}, fmt.Errorf("%s response must contain a non-null %s array", op, strings.TrimPrefix(op, "list "))
 		}
-		cont = next
+		if current.bodyBytes <= 0 || current.bodyBytes > MaxInventoryBytes-totalBytes || len(current.items) > MaxInventoryItems-len(acc) {
+			return nil, backendidentity.ID{}, fmt.Errorf("%s: %w: complete inventory exceeds %d items or %d response bytes", op, ErrResponseTooLarge, MaxInventoryItems, MaxInventoryBytes)
+		}
+		if requireIdentity && !current.identity.Valid() {
+			return nil, backendidentity.ID{}, ErrBackendStorageIdentityMissing
+		}
+		if current.identity.Valid() {
+			if observed.Valid() && observed != current.identity {
+				return nil, backendidentity.ID{}, fmt.Errorf("%w: %s pages changed from %s to %s", ErrBackendStorageIdentityMismatch, op, observed, current.identity)
+			}
+			observed = current.identity
+		}
+		if current.next != "" && current.next <= cont {
+			return nil, backendidentity.ID{}, fmt.Errorf("%s: backend returned non-advancing continue token %q (sent %q)", op, current.next, cont)
+		}
+		totalBytes += current.bodyBytes
+		acc = append(acc, current.items...)
+		if current.next == "" {
+			return acc, observed, nil
+		}
+		cont = current.next
 	}
-	return acc, nil
+}
+
+// beginInventoryWalk bounds queueing and the entire paginated read with one
+// deadline. Inventory is a recovery observation, so tenant transport failures
+// must not suppress it. This lane neither trips nor resets the tenant breaker;
+// all page authentication, identity, size, and completeness checks still apply.
+func (c *HTTPClient) beginInventoryWalk(ctx context.Context) (context.Context, func(), error) {
+	ctx, cancel := context.WithTimeout(ctx, c.httpClient.Timeout)
+	select {
+	case c.inventorySlot <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-c.inventorySlot
+			cancel()
+			return nil, nil, err
+		}
+		return ctx, func() {
+			<-c.inventorySlot
+			cancel()
+		}, nil
+	case <-ctx.Done():
+		cancel()
+		return nil, nil, ctx.Err()
+	}
 }
 
 // ListProvisions returns all provisioned resources from this backend. It walks
@@ -1200,21 +2174,52 @@ func walkKeysetPages[T any](ctx context.Context, op string, fetchPage func(ctx c
 // returns an error rather than a partial set (complete-or-error) so the
 // reconciler never acts on incomplete data.
 func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err error) {
+	provisions, _, err := c.listProvisionsWithIdentity(ctx, c.identity != nil)
+	return provisions, err
+}
+
+// ListProvisionsWithIdentity returns a complete provision inventory plus the
+// one storage identity carried consistently by every page.
+func (c *HTTPClient) ListProvisionsWithIdentity(
+	ctx context.Context,
+) ([]ProvisionInfo, backendidentity.ID, error) {
+	return c.listProvisionsWithIdentity(ctx, true)
+}
+
+func (c *HTTPClient) listProvisionsWithIdentity(
+	ctx context.Context,
+	requireIdentity bool,
+) (_ []ProvisionInfo, observed backendidentity.ID, err error) {
 	start := time.Now()
 	defer func() { c.recordMetrics("list_provisions", start, err) }()
 
-	return walkKeysetPages(ctx, "list provisions", func(ctx context.Context, cont string) ([]ProvisionInfo, string, error) {
-		resp, ferr := c.fetchProvisionsPage(ctx, cont)
-		if ferr != nil {
-			return nil, "", ferr
-		}
-		return resp.Provisions, resp.Continue, nil
+	ctx, release, err := c.beginInventoryWalk(ctx)
+	if err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	defer release()
+
+	provisions, observed, err := walkKeysetPages(ctx, "list provisions", requireIdentity, c.httpClient.Timeout, func(ctx context.Context, cont string) (inventoryPage[ProvisionInfo], error) {
+		return c.fetchProvisionsPage(ctx, cont, requireIdentity)
 	})
+	if err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	if err := validateInventoryLeaseUUIDs("provisions", len(provisions), func(index int) string {
+		return provisions[index].LeaseUUID
+	}); err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	return provisions, observed, nil
 }
 
 // fetchProvisionsPage fetches one keyset page. continueToken == "" requests the
 // first page. The per-page body is bounded by maxProvisionsBytes (fail-closed).
-func (c *HTTPClient) fetchProvisionsPage(ctx context.Context, continueToken string) (ListProvisionsResponse, error) {
+func (c *HTTPClient) fetchProvisionsPage(
+	ctx context.Context,
+	continueToken string,
+	requireIdentity bool,
+) (inventoryPage[ProvisionInfo], error) {
 	q := url.Values{}
 	q.Set("limit", strconv.Itoa(c.provisionsPageLimit))
 	if continueToken != "" {
@@ -1222,41 +2227,37 @@ func (c *HTTPClient) fetchProvisionsPage(ctx context.Context, continueToken stri
 	}
 	target := c.baseURL + "/provisions?" + q.Encode()
 
-	result, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return inventoryPage[ProvisionInfo]{}, fmt.Errorf("create request: %w", err)
+	}
+	if err := c.prepareRequest(httpReq, nil, requestIdentityBootstrap); err != nil {
+		return inventoryPage[ProvisionInfo]{}, err
+	}
+
+	resp, err := c.do(httpReq)
+	if err != nil {
+		return inventoryPage[ProvisionInfo]{}, fmt.Errorf("list provisions request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return inventoryPage[ProvisionInfo]{}, fmt.Errorf("list provisions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+	}
+	var storageID backendidentity.ID
+	if requireIdentity {
+		storageID, err = responseStorageIdentity(resp)
 		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
+			return inventoryPage[ProvisionInfo]{}, fmt.Errorf("list provisions response identity: %w", err)
 		}
-		c.signRequest(httpReq, nil)
-
-		resp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("list provisions request failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("list provisions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
-		}
-
-		var provResult ListProvisionsResponse
-		if err := decodeJSONLimited(resp.Body, c.maxProvisionsBytes, &provResult); err != nil {
-			return nil, fmt.Errorf("decode provisions response: %w", err)
-		}
-		return provResult, nil
-	})
-
-	if isCircuitBreakerError(cbErr) {
-		return ListProvisionsResponse{}, ErrCircuitOpen
 	}
-	if cbErr != nil {
-		return ListProvisionsResponse{}, cbErr
+
+	var provResult ListProvisionsResponse
+	bodyBytes, err := decodeJSONMeasured(resp.Body, c.maxProvisionsBytes, &provResult)
+	if err != nil {
+		return inventoryPage[ProvisionInfo]{}, fmt.Errorf("decode provisions response: %w", err)
 	}
-	pr, ok := result.(ListProvisionsResponse)
-	if !ok {
-		return ListProvisionsResponse{}, fmt.Errorf("list provisions: unexpected result type %T", result)
-	}
-	return pr, nil
+	return inventoryPage[ProvisionInfo]{items: provResult.Provisions, next: provResult.Continue, identity: storageID, bodyBytes: bodyBytes}, nil
 }
 
 // GetProvision retrieves status information for a single provision.
@@ -1301,139 +2302,191 @@ func (c *HTTPClient) LookupProvisions(ctx context.Context, uuids []string) ([]Pr
 
 // GetLogs retrieves container logs for a provisioned lease.
 func (c *HTTPClient) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
-	result, err := doGet[map[string]string](c, ctx, "get_logs", fmt.Sprintf("%s/logs/%s?tail=%d", c.baseURL, leaseUUID, tail), c.maxLogsBytes)
+	result, err := doGetDecoded(c, ctx, "get_logs", fmt.Sprintf("%s/logs/%s?tail=%d", c.baseURL, leaseUUID, tail), c.maxLogsBytes, decodeLogResponse)
 	if err != nil {
 		return nil, err
 	}
 	return *result, nil
 }
 
-// Restart sends a restart request to the backend.
-func (c *HTTPClient) Restart(ctx context.Context, req RestartRequest) (err error) {
-	start := time.Now()
-	defer func() { c.recordMetrics("restart", start, err) }()
-
-	body, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("marshal restart request: %w", err)
-	}
-
-	_, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/restart", bytes.NewReader(body))
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		c.signRequest(httpReq, body)
-
-		resp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("restart request failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		switch resp.StatusCode {
-		case http.StatusAccepted:
-			return nil, nil
-		case http.StatusNotFound:
-			return nil, ErrNotProvisioned
-		case http.StatusConflict:
-			return nil, ErrInvalidState
-		default:
-			return nil, fmt.Errorf("restart failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
-		}
-	})
-
-	if isCircuitBreakerError(cbErr) {
-		return ErrCircuitOpen
-	}
-	return cbErr
+// Restart preserves the legacy Backend surface. Placement consumes InvokeRestart
+// so a verified refusal cannot be confused with an arbitrary wrapped error.
+func (c *HTTPClient) Restart(ctx context.Context, req RestartRequest) error {
+	return c.restartCall(ctx, req).Err()
 }
 
-// Update sends an update request to the backend.
-func (c *HTTPClient) Update(ctx context.Context, req UpdateRequest) (err error) {
+func (c *HTTPClient) restartCall(
+	ctx context.Context,
+	req RestartRequest,
+) MaintenanceCallOutcome {
+	return executeHTTPMaintenanceCall(c, ctx, "restart", req)
+}
+
+// Update preserves the legacy Backend surface. Placement consumes InvokeUpdate.
+func (c *HTTPClient) Update(ctx context.Context, req UpdateRequest) error {
+	return c.updateCall(ctx, req).Err()
+}
+
+func (c *HTTPClient) updateCall(
+	ctx context.Context,
+	req UpdateRequest,
+) MaintenanceCallOutcome {
+	return executeHTTPMaintenanceCall(c, ctx, "update", req)
+}
+
+func executeHTTPMaintenanceCall[T RestartRequest | UpdateRequest](
+	c *HTTPClient,
+	ctx context.Context,
+	operation string,
+	req T,
+) (outcome MaintenanceCallOutcome) {
 	start := time.Now()
-	defer func() { c.recordMetrics("update", start, err) }()
+	defer func() { c.recordMetrics(operation, start, outcome.Err()) }()
 
 	body, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("marshal update request: %w", err)
+		return notDispatchedMaintenanceCall(fmt.Errorf("marshal %s request: %w", operation, err))
 	}
-
+	var observed MaintenanceCallOutcome
 	_, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/update", bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(
+			ctx, http.MethodPost, c.baseURL+"/"+operation, bytes.NewReader(body),
+		)
 		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
+			callErr := fmt.Errorf("create request: %w", err)
+			observed = notDispatchedMaintenanceCall(callErr)
+			return nil, callErr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		c.signRequest(httpReq, body)
+		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			observed = notDispatchedMaintenanceCall(err)
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
-			return nil, fmt.Errorf("update request failed: %w", err)
+			callErr := fmt.Errorf("%s request failed: %w", operation, err)
+			if isBackendUpgradeRequiredProof(err) {
+				observed = notDispatchedMaintenanceCall(callErr)
+			} else {
+				observed = ambiguousMaintenanceCall(callErr)
+			}
+			return nil, callErr
 		}
 		defer func() { _ = resp.Body.Close() }()
 
 		switch resp.StatusCode {
 		case http.StatusAccepted:
+			observed = acceptedMaintenanceCall()
 			return nil, nil
 		case http.StatusBadRequest:
-			return nil, c.parseValidationError(readErrorBodyBytes(resp), "update")
+			callErr := c.parseValidationError(readErrorBodyBytes(resp), operation)
+			if errors.Is(callErr, ErrValidation) {
+				observed = refusedMaintenanceCall(callErr, MaintenanceRefusalValidation)
+			} else {
+				observed = ambiguousMaintenanceCall(callErr)
+			}
+			return nil, callErr
 		case http.StatusNotFound:
+			observed = refusedMaintenanceCall(ErrNotProvisioned, MaintenanceRefusalNotProvisioned)
 			return nil, ErrNotProvisioned
 		case http.StatusConflict:
+			observed = refusedMaintenanceCall(ErrInvalidState, MaintenanceRefusalInvalidState)
 			return nil, ErrInvalidState
+		case http.StatusServiceUnavailable:
+			callErr := c.parseCapacityError(readErrorBodyBytes(resp), operation)
+			if errors.Is(callErr, ErrCapacityRefused) {
+				observed = refusedMaintenanceCall(callErr, MaintenanceRefusalCapacity)
+			} else {
+				observed = ambiguousMaintenanceCall(callErr)
+			}
+			return nil, callErr
 		default:
-			return nil, fmt.Errorf("update failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+			callErr := fmt.Errorf("%s failed with status %d: %s", operation, resp.StatusCode, readErrorBody(resp))
+			observed = ambiguousMaintenanceCall(callErr)
+			return nil, callErr
 		}
 	})
 
-	if isCircuitBreakerError(cbErr) {
-		return ErrCircuitOpen
+	if observed.Valid() {
+		return observed
 	}
-	return cbErr
+	if isCircuitBreakerError(cbErr) {
+		return notDispatchedMaintenanceCall(ErrCircuitOpen)
+	}
+	if cbErr != nil {
+		return ambiguousMaintenanceCall(cbErr)
+	}
+	return ambiguousMaintenanceCall(fmt.Errorf("%s transport returned no causal outcome", operation))
 }
 
-// Restore sends a restore request to the backend.
-func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error) {
+// Restore preserves the legacy Backend surface. Placement consumes InvokeRestore
+// so only transport-minted causal evidence reaches durable settlement.
+func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) error {
+	return c.restoreCall(ctx, req).Err()
+}
+
+// restoreCall executes one restore request and mints its causal outcome at the
+// exact transport branch that observed it.
+func (c *HTTPClient) restoreCall(
+	ctx context.Context,
+	req RestoreRequest,
+) (outcome RestoreCallOutcome) {
 	start := time.Now()
-	defer func() { c.recordMetrics("restore", start, err) }()
+	defer func() { c.recordMetrics("restore", start, outcome.Err()) }()
 
 	body, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("marshal restore request: %w", err)
+		return notDispatchedRestoreCall(fmt.Errorf("marshal restore request: %w", err))
 	}
 
+	var observed RestoreCallOutcome
 	_, cbErr := c.cb.Execute(func() (any, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/restore", bytes.NewReader(body))
 		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
+			callErr := fmt.Errorf("create request: %w", err)
+			observed = notDispatchedRestoreCall(callErr)
+			return nil, callErr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		c.signRequest(httpReq, body)
+		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			observed = notDispatchedRestoreCall(err)
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
-			return nil, fmt.Errorf("restore request failed: %w", err)
+			callErr := fmt.Errorf("restore request failed: %w", err)
+			if isBackendUpgradeRequiredProof(err) {
+				observed = notDispatchedRestoreCall(callErr)
+			} else {
+				observed = ambiguousRestoreCall(callErr)
+			}
+			return nil, callErr
 		}
 		defer func() { _ = resp.Body.Close() }()
 
 		switch resp.StatusCode {
 		case http.StatusAccepted:
+			observed = acceptedRestoreCall()
 			return nil, nil
 		case http.StatusUnprocessableEntity:
 			// 422 is overloaded: bare 422 = ErrNotRetained; 422 with
 			// code="demote_exceeds_tier" = ErrDemoteDataExceedsTier.
 			code, msg, perr := c.parseErrorCode(readErrorBodyBytes(resp), "restore")
 			if perr != nil {
+				observed = ambiguousRestoreCall(perr)
 				return nil, perr
 			}
 			switch code {
 			case "":
 				// No discriminator: the documented bare 422.
+				observed = refusedRestoreCall(ErrNotRetained, RestoreRefusalNotRetained)
 				return nil, ErrNotRetained
 			case CodeDemoteExceedsTier:
-				return nil, detailOr(ErrDemoteDataExceedsTier, msg)
+				callErr := detailOr(ErrDemoteDataExceedsTier, msg)
+				observed = refusedRestoreCall(callErr, RestoreRefusalDemoteDataExceedsTier)
+				return nil, callErr
 			default:
 				// A code fred does not know is evidence AGAINST "no retained
 				// data", not for it — yet this used to fall through to
@@ -1441,9 +2494,13 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 				// data found for that lease". That discarded the message the
 				// backend was obliged to curate and replaced it with a positive
 				// claim about the tenant's data that its own body contradicted.
-				// Relay the backend's words at the status it chose instead.
+				// Preserve the declared detail for operator diagnostics, but keep the
+				// outcome ambiguous: an unknown protocol verdict cannot authorize
+				// durable settlement or a tenant-facing lease-state claim.
 				c.noteUnrecognizedErrorCode("restore", resp.StatusCode, code)
-				return nil, detailOr(ErrRestoreRefused, msg)
+				callErr := detailOr(ErrRestoreRefused, msg)
+				observed = ambiguousRestoreCall(callErr)
+				return nil, callErr
 			}
 		case http.StatusConflict:
 			// Restore overloads 409 for two sentinels: the backend tags the
@@ -1453,42 +2510,70 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 			// ErrInvalidState (wrong lease state for restore).
 			code, msg, perr := c.parseErrorCode(readErrorBodyBytes(resp), "restore")
 			if perr != nil {
+				observed = ambiguousRestoreCall(perr)
 				return nil, perr
 			}
-			if code == CodeAlreadyProvisioned {
-				return nil, detailOr(ErrAlreadyProvisioned, msg)
+			if code == CodeOperationCompletionPending {
+				callErr := &operationCompletionPendingResponse{}
+				observed = ambiguousRestoreCall(callErr)
+				return nil, callErr
 			}
-			// An unrecognized code is left on ErrInvalidState deliberately,
-			// unlike the 422 above. The asymmetry is the 404 remap: for 422 fred
-			// CHANGES the status class and asserts that no retained data exists,
-			// which an unknown code contradicts. Here the tenant gets 409 — the
-			// status the backend itself chose, and RFC 9110's 409 already means
-			// "conflict with the current state of the resource", so fred is
-			// restating the backend's verdict rather than inventing one. The
-			// message is carried for operators either way.
+			if code == CodeAlreadyProvisioned {
+				callErr := detailOr(ErrAlreadyProvisioned, msg)
+				observed = ambiguousRestoreCall(callErr)
+				return nil, callErr
+			}
+			// An unrecognized code keeps ErrInvalidState only as an operator-facing
+			// diagnostic. Its causal outcome remains ambiguous, so higher layers
+			// cannot turn this public sentinel into a tenant-facing state claim.
 			if code != "" {
 				c.noteUnrecognizedErrorCode("restore", resp.StatusCode, code)
+				callErr := detailOr(ErrInvalidState, msg)
+				observed = ambiguousRestoreCall(callErr)
+				return nil, callErr
 			}
-			return nil, detailOr(ErrInvalidState, msg)
+			callErr := detailOr(ErrInvalidState, msg)
+			observed = refusedRestoreCall(callErr, RestoreRefusalInvalidState)
+			return nil, callErr
 		case http.StatusServiceUnavailable:
-			// 503: backend at capacity — not a health failure (matches Provision).
-			return nil, fmt.Errorf("%w: %s", ErrInsufficientResources, readErrorBody(resp))
+			// Match Provision: only a contract-conforming coded refusal may settle.
+			callErr := c.parseCapacityError(readErrorBodyBytes(resp), "restore")
+			if errors.Is(callErr, ErrCapacityRefused) {
+				observed = refusedRestoreCall(callErr, RestoreRefusalCapacity)
+			} else {
+				observed = ambiguousRestoreCall(callErr)
+			}
+			return nil, callErr
 		case http.StatusBadRequest:
 			// Reconstruct the validation sub-category sentinel from the
 			// validation_code body field (matching Provision/Update). Restore's
 			// prelude returns ErrUnknownSKU/ErrInvalidManifest/ErrImageNotAllowed
 			// via GetSKUProfile/ValidateImage; the returned error still wraps
 			// ErrValidation so the breaker allowlist and 400 mapping hold.
-			return nil, c.parseValidationError(readErrorBodyBytes(resp), "restore")
+			callErr := c.parseValidationError(readErrorBodyBytes(resp), "restore")
+			if errors.Is(callErr, ErrValidation) {
+				observed = refusedRestoreCall(callErr, RestoreRefusalValidation)
+			} else {
+				observed = ambiguousRestoreCall(callErr)
+			}
+			return nil, callErr
 		default:
-			return nil, fmt.Errorf("restore failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+			callErr := fmt.Errorf("restore failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+			observed = ambiguousRestoreCall(callErr)
+			return nil, callErr
 		}
 	})
 
-	if isCircuitBreakerError(cbErr) {
-		return ErrCircuitOpen
+	if observed.Valid() {
+		return observed
 	}
-	return cbErr
+	if isCircuitBreakerError(cbErr) {
+		return notDispatchedRestoreCall(ErrCircuitOpen)
+	}
+	if cbErr != nil {
+		return ambiguousRestoreCall(cbErr)
+	}
+	return ambiguousRestoreCall(errors.New("restore transport returned no causal outcome"))
 }
 
 // GetReleases retrieves release history for a lease.
@@ -1529,9 +2614,11 @@ func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		c.signRequest(httpReq, body)
+		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("reconcile_custom_domain request failed: %w", err)
 		}
@@ -1567,21 +2654,78 @@ func (c *HTTPClient) GetLoadStats(ctx context.Context) (*LoadStats, error) {
 // an error rather than a partial set (complete-or-error) so the reconciler never
 // acts on incomplete retention data.
 func (c *HTTPClient) ListRetentions(ctx context.Context) (_ []RetainedLease, err error) {
+	retentions, _, err := c.listRetentionsWithIdentity(ctx, c.identity != nil)
+	return retentions, err
+}
+
+// ListRetentionsWithIdentity returns a complete retention inventory plus the
+// one storage identity carried consistently by every page.
+func (c *HTTPClient) ListRetentionsWithIdentity(
+	ctx context.Context,
+) ([]RetainedLease, backendidentity.ID, error) {
+	return c.listRetentionsWithIdentity(ctx, true)
+}
+
+func (c *HTTPClient) listRetentionsWithIdentity(
+	ctx context.Context,
+	requireIdentity bool,
+) (_ []RetainedLease, observed backendidentity.ID, err error) {
 	start := time.Now()
 	defer func() { c.recordMetrics("list_retentions", start, err) }()
 
-	return walkKeysetPages(ctx, "list retentions", func(ctx context.Context, cont string) ([]RetainedLease, string, error) {
-		resp, ferr := c.fetchRetentionsPage(ctx, cont)
-		if ferr != nil {
-			return nil, "", ferr
-		}
-		return resp.Retentions, resp.Continue, nil
+	ctx, release, err := c.beginInventoryWalk(ctx)
+	if err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	defer release()
+
+	retentions, observed, err := walkKeysetPages(ctx, "list retentions", requireIdentity, c.httpClient.Timeout, func(ctx context.Context, cont string) (inventoryPage[RetainedLease], error) {
+		return c.fetchRetentionsPage(ctx, cont, requireIdentity)
 	})
+	if err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	if err := validateInventoryLeaseUUIDs("retentions", len(retentions), func(index int) string {
+		return retentions[index].LeaseUUID
+	}); err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	return retentions, observed, nil
+}
+
+// validateInventoryLeaseUUIDs validates the fully reassembled endpoint rather
+// than individual pages so a backend cannot evade duplicate detection by
+// splitting the same lease across page boundaries. A malformed inventory is an
+// endpoint failure: callers receive no partial slice, and reconciliation marks
+// that backend unanswered instead of projecting or baselining the evidence.
+func validateInventoryLeaseUUIDs(
+	kind string,
+	length int,
+	leaseUUIDAt func(int) string,
+) error {
+	seen := make(map[string]struct{}, length)
+	for index := range length {
+		leaseUUID := leaseUUIDAt(index)
+		if !IsCanonicalLeaseUUID(leaseUUID) {
+			return fmt.Errorf("list %s: backend returned non-canonical lease UUID %q at index %d",
+				kind, leaseUUID, index)
+		}
+		if _, duplicate := seen[leaseUUID]; duplicate {
+			return fmt.Errorf("list %s: backend returned duplicate lease UUID %q",
+				kind, leaseUUID)
+		}
+		seen[leaseUUID] = struct{}{}
+	}
+	return nil
 }
 
 // fetchRetentionsPage fetches one keyset page. continueToken == "" requests the
 // first page. The per-page body is bounded by maxRetentionsBytes (fail-closed).
-func (c *HTTPClient) fetchRetentionsPage(ctx context.Context, continueToken string) (ListRetentionsResponse, error) {
+func (c *HTTPClient) fetchRetentionsPage(
+	ctx context.Context,
+	continueToken string,
+	requireIdentity bool,
+) (inventoryPage[RetainedLease], error) {
 	q := url.Values{}
 	q.Set("limit", strconv.Itoa(c.retentionsPageLimit))
 	if continueToken != "" {
@@ -1589,57 +2733,61 @@ func (c *HTTPClient) fetchRetentionsPage(ctx context.Context, continueToken stri
 	}
 	target := c.baseURL + "/retentions?" + q.Encode()
 
-	result, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return inventoryPage[RetainedLease]{}, fmt.Errorf("create request: %w", err)
+	}
+	if err := c.prepareRequest(httpReq, nil, requestIdentityBootstrap); err != nil {
+		return inventoryPage[RetainedLease]{}, err
+	}
+
+	resp, err := c.do(httpReq)
+	if err != nil {
+		return inventoryPage[RetainedLease]{}, fmt.Errorf("list retentions request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return inventoryPage[RetainedLease]{}, fmt.Errorf("list retentions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+	}
+	var storageID backendidentity.ID
+	if requireIdentity {
+		storageID, err = responseStorageIdentity(resp)
 		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
+			return inventoryPage[RetainedLease]{}, fmt.Errorf("list retentions response identity: %w", err)
 		}
-		c.signRequest(httpReq, nil)
-
-		resp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("list retentions request failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("list retentions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
-		}
-
-		var retResult ListRetentionsResponse
-		if err := decodeJSONLimited(resp.Body, c.maxRetentionsBytes, &retResult); err != nil {
-			return nil, fmt.Errorf("decode retentions response: %w", err)
-		}
-		return retResult, nil
-	})
-
-	if isCircuitBreakerError(cbErr) {
-		return ListRetentionsResponse{}, ErrCircuitOpen
 	}
-	if cbErr != nil {
-		return ListRetentionsResponse{}, cbErr
+
+	var retResult ListRetentionsResponse
+	bodyBytes, err := decodeJSONMeasured(resp.Body, c.maxRetentionsBytes, &retResult)
+	if err != nil {
+		return inventoryPage[RetainedLease]{}, fmt.Errorf("decode retentions response: %w", err)
 	}
-	rr, ok := result.(ListRetentionsResponse)
-	if !ok {
-		return ListRetentionsResponse{}, fmt.Errorf("list retentions: unexpected result type %T", result)
-	}
-	return rr, nil
+	return inventoryPage[RetainedLease]{items: retResult.Retentions, next: retResult.Continue, identity: storageID, bodyBytes: bodyBytes}, nil
 }
 
 // Health checks if the backend is reachable and healthy.
 // It sends a GET request to /health on the backend.
-func (c *HTTPClient) Health(ctx context.Context) error {
+func (c *HTTPClient) Health(ctx context.Context) (err error) {
+	ctx, observation := healthprobe.Start(ctx)
+	status := 0
+	defer func() { observation.Finish(slog.Default().With("backend", c.Name()), healthprobe.Client, status, err) }()
 	// Don't go through circuit breaker for health checks - we want to know actual status
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
 	if err != nil {
 		return fmt.Errorf("create health request: %w", err)
 	}
+	httpReq.Header.Set(healthprobe.Header, observation.ID())
 
-	resp, err := c.httpClient.Do(httpReq)
+	if err := c.prepareRequest(httpReq, nil, requestIdentityRead); err != nil {
+		return err
+	}
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("health check failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	status = resp.StatusCode
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("backend unhealthy: status %d", resp.StatusCode)

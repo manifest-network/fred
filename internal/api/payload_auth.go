@@ -49,7 +49,7 @@ func (t *PayloadAuthToken) Validate(bech32Prefix string) error {
 		signature: t.Signature,
 	}
 
-	if err := v.validateCommon(t.createSignData(), bech32Prefix); err != nil {
+	if _, err := v.validateCommon(t.createSignData(), bech32Prefix); err != nil {
 		return err
 	}
 

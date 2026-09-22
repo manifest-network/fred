@@ -433,7 +433,7 @@ func TestEnsureGrants_batchCarriesSimulatedGas(t *testing.T) {
 	// pool WITH a sub-signer; then it actually broadcasts a MsgGrant batch whose
 	// declared gas we capture. Assert it == 216000 (floor(1.2*180000)), not static.
 	pool := newTestSignerPool(t, 1) // 1 sub-signer so EnsureGrants doesn't early-return
-	primary := pool.Primary()
+	primary := pool.primary
 	primary.gasAdjustment, _ = math.LegacyNewDecFromStr("1.2") // 180000 sim → 216000 declared
 	addr, err := sdk.AccAddressFromBech32(primary.Address())
 	if err != nil {

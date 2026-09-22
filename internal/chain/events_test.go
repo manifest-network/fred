@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -853,5 +854,34 @@ func TestLeaseEventType_String(t *testing.T) {
 		t.Run(string(tt.eventType), func(t *testing.T) {
 			assert.Equal(t, tt.want, string(tt.eventType))
 		})
+	}
+}
+
+func TestEventSubscriber_BroadcastAndChannelRetirementShareOwnership(t *testing.T) {
+	for range 100 {
+		sub, err := NewEventSubscriber(EventSubscriberConfig{URL: "ws://localhost/websocket", ProviderUUID: testProviderUUID})
+		require.NoError(t, err)
+		first, second := sub.Subscribe(), sub.Subscribe()
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for _, action := range []func(){
+			func() {
+				for range 100 {
+					sub.broadcast(LeaseEvent{})
+				}
+			},
+			func() { sub.Unsubscribe(first) },
+			func() { sub.Close() },
+			func() { sub.Close() },
+		} {
+			wg.Go(func() { <-start; action() })
+		}
+		close(start)
+		wg.Wait()
+		for range first {
+		}
+		for range second {
+		}
+		require.Nil(t, sub.Subscribe())
 	}
 }

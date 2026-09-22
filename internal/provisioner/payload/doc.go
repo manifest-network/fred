@@ -1,4 +1,4 @@
-// Package payload implements bbolt-backed temporary storage for tenant
+// Package payload implements bbolt-backed lease-lifetime storage for tenant
 // deployment payloads.
 //
 // # Lifecycle
@@ -7,14 +7,14 @@
 // It is REPLACED when the tenant updates the deployment via
 // POST /v1/leases/{uuid}/update (Put). It is removed when:
 //
-//   - Provisioning starts and Pop succeeds (normal path), or
 //   - The lease is closed/expired (reconciler-driven cleanup), or
 //   - The TTL expires (background cleanup loop)
 //
 // The store is persistent (bbolt) so payloads survive restarts. This matters
-// because a tenant might upload a payload, then Fred restarts before the
-// provisioner picks it up — and because the reprovision path replays from here,
-// so whatever is stored is what the tenant's lease comes back as.
+// both before initial provisioning and throughout the lease lifetime: the
+// re-provision path replays from here, so whatever is stored is what the tenant's
+// lease comes back as. Production provisioning reads without consuming the
+// payload; Pop remains only as a store primitive and test/compatibility helper.
 //
 // # Recorded hashes
 //
@@ -54,7 +54,8 @@
 //
 // # Optional
 //
-// The store is optional at the provisioner level: if `payload_store_db_path`
-// is unset, payloads are kept only in memory. This is fine for development
-// but loses uploaded payloads on restart.
+// The store is optional at the provisioner composition boundary. If
+// `payload_store_db_path` is unset, no in-memory substitute is created: payload
+// upload/update paths that require persistence fail closed, while leases that do
+// not use tenant deployment payloads can continue.
 package payload

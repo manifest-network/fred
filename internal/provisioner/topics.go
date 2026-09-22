@@ -22,7 +22,7 @@ var (
 	// machine, so provisioning it elsewhere creates an empty volume while the
 	// real data sits untouched (ENG-635).
 	//
-	// It is deliberately NOT one of the terminal errors in handleProvisionError:
+	// It is deliberately NOT one of the terminal results in handleProvisionResult:
 	// a backend can be absent because it was paused, renamed or is mid-redeploy,
 	// and rejecting or closing a lease for that would turn a recoverable outage
 	// into permanent tenant data loss. It falls through to the transient default
@@ -48,23 +48,15 @@ var (
 	ErrPayloadStoreUnavailable = errors.New("payload store not configured")
 )
 
-// Watermill topic names for internal event routing.
+// Internal event-routing topics and stable message metric labels.
 const (
 	TopicLeaseCreated    = "events.lease.created"
 	TopicLeaseClosed     = "events.lease.closed"
 	TopicLeaseExpired    = "events.lease.expired"
-	TopicBackendCallback = "events.backend.callback"
+	TopicBackendCallback = "events.backend.callback" // legacy message-adapter label
 	TopicPayloadReceived = "events.payload.received"
 	TopicLeaseEvent      = "events.lease.event"
 )
-
-// CallbackPath is the path suffix for backend provision callbacks.
-const CallbackPath = "/callbacks/provision"
-
-// BuildCallbackURL constructs the full callback URL from a base URL.
-func BuildCallbackURL(baseURL string) string {
-	return baseURL + CallbackPath
-}
 
 // ChainClient defines the chain operations needed by the provisioner.
 type ChainClient interface {

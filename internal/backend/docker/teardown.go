@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 // teardownLeaseContainers removes every container fred owns for a lease, and with
@@ -49,13 +50,59 @@ import (
 // failure is itself an error: we cannot prove the host is clean, and the safe
 // direction is to keep the lease tracked and retry (cleanup gates fail open toward
 // "keep", counted in a metric).
-func (b *Backend) teardownLeaseContainers(ctx context.Context, leaseUUID string, recordedIDs []string,
+func (b *Backend) teardownLeaseContainersWith(mutations *storageMutations, ctx context.Context, leaseUUID string, recordedIDs []string,
 	stopTimeout time.Duration, operation string, logger *slog.Logger) ([]string, error) {
+	if mutations == nil {
+		return recordedIDs, errors.New("teardown mutation capability is unavailable")
+	}
+	if err := mutations.requireLease(leaseUUID, "container teardown"); err != nil {
+		return recordedIDs, err
+	}
+
+	// Compose Down failure is only the trigger for the exact rediscovery and
+	// per-container fallback below. Bracket the complete convergent operation as
+	// one tenant Step: recording the intermediate Down error as its own Step
+	// would poison an otherwise successful fallback and permanently retain the
+	// Started intent. The adapter is lexical to this exact Started subject; it
+	// cannot select another lease, project, or container authority.
+	var remaining []string
+	err := mutations.runner.Step(ctx, operation+" convergent container teardown", func(mutationCtx context.Context) error {
+		var teardownErr error
+		remaining, teardownErr = b.teardownLeaseContainersUsing(
+			exactOperationTeardown{mutations: mutations}, mutationCtx, leaseUUID,
+			recordedIDs, stopTimeout, operation, logger,
+		)
+		return teardownErr
+	})
+	return remaining, err
+}
+
+type teardownMutationCapability interface {
+	composeDown(context.Context, string, time.Duration) error
+	removeContainer(context.Context, string) error
+}
+
+func (b *Backend) teardownLeaseContainersUsing(mutations teardownMutationCapability, ctx context.Context, leaseUUID string, recordedIDs []string,
+	stopTimeout time.Duration, operation string, logger *slog.Logger) ([]string, error) {
+	if mutations == nil {
+		return recordedIDs, errors.New("teardown mutation capability is unavailable")
+	}
 	projectName := composeProjectName(leaseUUID)
-	downErr := b.compose.Down(ctx, projectName, stopTimeout)
+	downErr := mutations.composeDown(ctx, leaseUUID, stopTimeout)
 	if downErr == nil {
 		logger.Info("compose down completed", "project", projectName)
 		return nil, nil
+	}
+	// A lifecycle cancellation or permanent lineage contradiction is an
+	// authority failure, not a Compose implementation failure. Do not query a
+	// replacement daemon and do not attempt the per-container fallback after the
+	// guarded Down refused to mutate; durable recovery retries on the next valid
+	// backend lifetime.
+	if errors.Is(downErr, context.Canceled) || errors.Is(downErr, context.DeadlineExceeded) ||
+		errors.Is(downErr, backendidentity.ErrIdentityDrift) ||
+		errors.Is(downErr, backendidentity.ErrMutationOutcomeAmbiguous) {
+		teardownFallbackTotal.WithLabelValues(operation, teardownOutcomeFailed).Inc()
+		return recordedIDs, downErr
 	}
 	// No lease_uuid field here: most callers hand in a logger that already binds it,
 	// and slog would emit the key twice. The project name carries the lease anyway.
@@ -76,7 +123,7 @@ func (b *Backend) teardownLeaseContainers(ctx context.Context, leaseUUID string,
 		remaining []string
 	)
 	for _, id := range ids {
-		if rmErr := b.docker.RemoveContainer(ctx, id); rmErr != nil {
+		if rmErr := mutations.removeContainer(ctx, id); rmErr != nil {
 			logger.Error("failed to remove container", "container_id", leasesm.ShortID(id), "error", rmErr)
 			errs = append(errs, fmt.Errorf("container %s: %w", leasesm.ShortID(id), rmErr))
 			remaining = append(remaining, id)
