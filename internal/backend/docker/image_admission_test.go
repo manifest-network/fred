@@ -153,6 +153,79 @@ func TestImageCapacitySlowRegistryDoesNotBlockCachedTenantPreparation(t *testing
 	require.Zero(t, m.active)
 }
 
+func TestImageCapacityPullReusesUnpinnedLocalDigestAboveNewImageLimit(t *testing.T) {
+	server := httptest.NewTLSServer(registry.New())
+	t.Cleanup(server.Close)
+	ref := strings.TrimPrefix(server.URL, "https://") + "/existing:latest"
+	tag, err := name.NewTag(ref)
+	require.NoError(t, err)
+	fixture := imageCapacityRegistryImage(t, strings.Repeat("existing bytes", 200_000))
+	require.NoError(t, remote.Write(tag, fixture, remote.WithContext(t.Context()), remote.WithTransport(server.Client().Transport)))
+	manifestID, err := fixture.Digest()
+	require.NoError(t, err)
+	configID, err := fixture.ConfigName()
+	require.NoError(t, err)
+	digestRef := tag.Context().Digest(manifestID.String()).Name()
+	for _, test := range []struct {
+		name      string
+		size      int64
+		lowSpace  bool
+		wantError string
+	}{
+		{name: "already extracted", size: 3 * imageMiB},
+		{name: "invalid reported size", size: -1, wantError: "negative image size"},
+		{name: "insufficient headroom", size: 3 * imageMiB, lowSpace: true, wantError: "image disk admission"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m, daemon, fs := imageCapacityFixture(t)
+			m.cfg.ImageMaxSizeMB = 1
+			if test.lowSpace {
+				fs["/images"] = diskCapacity{total: 100 * uint64(imageMiB), available: uint64(imageMiB)}
+			}
+			var digestInspections, imports int
+			m.runtime = (&mockDockerClient{InspectImageFn: func(_ context.Context, inspected string) (*ImageInfo, error) {
+				switch inspected {
+				case digestRef:
+					digestInspections++
+				case configID.String():
+				default:
+					return nil, errors.New("local admission unexpectedly resolved a mutable reference")
+				}
+				return &ImageInfo{ID: configID.String()}, nil
+			}}).imageAdmitter()
+			daemon.imageInspect = func(context.Context, string, ...client.ImageInspectOption) (image.InspectResponse, error) {
+				return image.InspectResponse{ID: configID.String(), Size: test.size}, nil
+			}
+			attachImageCapacityLoader(t, m, func(context.Context, io.Reader) (image.LoadResponse, error) {
+				imports++
+				return image.LoadResponse{}, errors.New("already-local content was unexpectedly imported")
+			}, imagefetch.WithRegistryTransport(server.Client().Transport))
+			const lease = "550e8400-e29b-41d4-a716-446655440001"
+			results := make(chan string, 1)
+			runs := imagePreparationExecutions(t, m, map[string]string{lease: ref}, results)
+			pins, err := m.pins.List()
+			require.NoError(t, err)
+			require.Empty(t, pins, "reuse must not depend on an existing pin")
+			runs[lease]()
+			result := <-results
+			pins, err = m.pins.List()
+			require.NoError(t, err)
+			if test.wantError != "" {
+				require.Contains(t, result, test.wantError)
+				require.Empty(t, pins, "invalid content or inadequate capacity must not mint a pin")
+			} else {
+				require.Equal(t, lease, result)
+				require.Len(t, pins, 1)
+				require.Equal(t, lease, pins[0].LeaseUUID)
+				require.Equal(t, configID.String(), pins[0].ImageID)
+				require.Equal(t, digestRef, pins[0].PullDigest)
+			}
+			require.Positive(t, digestInspections)
+			require.Zero(t, imports)
+		})
+	}
+}
+
 func TestImageCapacityAllocationOwnershipSharesReleaseAndAccountsConcurrentWork(t *testing.T) {
 	m, _, fs := imageCapacityFixture(t)
 	first, err := m.reserveStaging(t.Context(), 10*imageMiB)

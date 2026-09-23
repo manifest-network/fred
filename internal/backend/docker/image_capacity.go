@@ -471,13 +471,8 @@ func (m *imageCapacityManager) ingestBounded(ctx context.Context, original, sour
 	if !daemonUsesContainerd(info) {
 		local, localErr := m.runtime.Admit(ctx, resolution.SourceReference())
 		if localErr == nil {
-			inspection, err := m.daemon.ImageInspect(ctx, local.ID())
-			if err != nil {
-				return resolvedImage{}, err
-			}
-			if inspection.Size < 0 || inspection.Size > budget {
-				return resolvedImage{}, errors.New("new image exceeds image_max_size_mb")
-			}
+			// Already-extracted content needs no ingestion allocation. Common
+			// resolution still verifies its size integrity and current headroom.
 			admitted, err := m.runtime.ReAdmit(ctx, local.ID(), local.Platform(), original)
 			return resolvedImage{image: admitted, pullDigest: resolution.SourceReference()}, err
 		}
