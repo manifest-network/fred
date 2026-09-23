@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -98,13 +99,20 @@ func TestRegistryIdleTimeoutRenewsOnBytesAndCloseReleasesOwnership(t *testing.T)
 
 func TestRegistryBlockedHTTPBodyHonorsCallerCancellation(t *testing.T) {
 	handlerFinished := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseHandler) }) }
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
+		// Returning would complete a valid empty chunked body and let EOF race
+		// cancellation. Keep the response unfinished until the client observes it.
+		<-releaseHandler
 		close(handlerFinished)
 	}))
 	defer server.Close()
+	defer release()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/v2/blob", nil)
@@ -112,9 +120,24 @@ func TestRegistryBlockedHTTPBodyHonorsCallerCancellation(t *testing.T) {
 	response, err := (boundedTransport{base: server.Client().Transport, limit: 1 << 20}).RoundTrip(request)
 	require.NoError(t, err)
 	defer response.Body.Close()
+	readStarted := make(chan struct{})
+	response.Body = &readStartedBody{ReadCloser: response.Body, started: readStarted}
 	finished := make(chan error, 1)
 	go func() { _, err := io.ReadAll(response.Body); finished <- err }()
+	<-readStarted
 	cancel()
 	require.ErrorIs(t, <-finished, context.Canceled)
+	release()
 	<-handlerFinished
+}
+
+type readStartedBody struct {
+	io.ReadCloser
+	started chan struct{}
+	once    sync.Once
+}
+
+func (b *readStartedBody) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.started) })
+	return b.ReadCloser.Read(p)
 }
