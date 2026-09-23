@@ -677,7 +677,19 @@ backend-owned actor handoff and its bounded recovery owner intact.
 
 Restore-specific re-deploy behavior worth knowing:
 
-- **Image must already be present on the node.** Restore reuses the replace machinery and starts by inspecting the local image. If it was garbage-collected since close, restore fails with an image-inspect error; pre-pull it before restoring. Classic images and independently addressable platform manifests require no registry access. A legacy containerd index whose selected platform lacks an independent image-store record needs a one-time pull by that exact manifest digest, even when its layers are cached. If the registry is unavailable, this preparation fails before creating containers.
+- **Restore keeps the pinned image identity.** Locally available pinned content
+  requires no registry access once its verified allocation allowance is known.
+  Legacy containerd pins without that allowance need one exact-digest
+  verification/import. If content is missing, Fred can recover it from the pin's
+  immutable repository digest through bounded verification and Docker
+  `ImageLoad`; it never resolves the old mutable tag to select replacement
+  content. Missing immutable recovery identity is refused. For a legacy
+  containerd index whose selected platform lacks an independent local record,
+  read-only admission returns `imageexec.MaterializationRequired`; the
+  preparation owner imports that exact selected manifest before retrying
+  admission. Cached layers alone do not make this step independent of registry
+  availability. Containerd admission proves extraction with a stopped helper
+  before the image can authorize workload creation.
 - **Image and configuration are fixed.** Restore deploys strictly from the retained `StackManifest` and items; the request carries no manifest. The new lease's requested service names and quantities must shape-match the retained set exactly (otherwise the restore is rejected with a validation error).
 - **The SKU tier may change (promote/demote).** Only the item *shape* must match (service names + quantities); the SKU's resource (disk) tier **may** differ from the source lease. A **promote** (same-or-larger `disk_mb` tier) is admitted only when its aggregate growth above the retained footprint fits disk capacity, then the larger cap is applied. A **demote** (smaller `disk_mb` tier) is allowed only if the retained volume's **measured** data fits the new tier's `disk_mb` cap — the backend runs `checkDemoteFit` before adopting (restoring durable stateful data into an ephemeral `disk_mb=0` tier is always refused). The conservative exact-name exception above may restore scratch only into another diskless row, after measuring it against that destination's pinned scratch allowance. A refused demote returns HTTP `422` with body `{"code":"demote_exceeds_tier"}` (`backend.ErrDemoteDataExceedsTier`) and is counted by `fred_docker_backend_restore_demote_refused_total{backend,reason}` (`reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`); it is **not** counted by `restore_total`.
 - **Containers are recreated, ownership is not rewritten.** Restore does not force-recreate beyond the normal replace, and the volume chown is non-recursive (it sets ownership on the VOLUME mount point only), so existing files keep their on-disk ownership.
@@ -795,7 +807,7 @@ record stays `reaping`.
      scratch directory is later required
 
 2. **Asynchronous provisioning** -- runs in a goroutine tracked by a `WaitGroup`:
-   - Pulls the image (once, shared across all containers in the lease)
+   - Admits the immutable image (shared across all containers in the lease)
    - Inspects the image to discover Dockerfile `VOLUME` declarations
    - Creates/ensures the per-tenant network (if `NetworkIsolation` is enabled)
    - For each item in the lease (supports multi-SKU), for each unit (supports multi-unit):
@@ -811,7 +823,41 @@ record stays `reaping`.
 
 Multi-unit leases create multiple containers from the same manifest. Multi-SKU leases create containers with different resource profiles per SKU. Instance indices are 0-based across all items.
 
-The entire async operation is bounded by `ProvisionTimeout` and is canceled on backend shutdown.
+`ProvisionTimeout` and backend shutdown cancel the async workflow. Already
+admitted Docker effects retain their completion owners while they drain; an
+admitted image import has a separate ten-minute deadline.
+
+### Image admission
+
+`imagefetch.Loader` verifies bounded registry content into private, unlinked
+staging files and mints a copy-safe `Prepared` capability. Only its issuer can
+import those exact bytes once. Shared-filesystem deployments keep their layout;
+classic `overlay2` uses the default `DockerRootDir/tmp` import staging, while
+containerd `overlayfs` additionally requires its actual `image_data_path`.
+External `DOCKER_TMPDIR` overrides are outside the supported space model.
+
+Before dispatch, the loader durably adds its verified allowance to
+`<callback_db_path>.image-staging/image-import-debit-v1`. Upload and completion
+drain under a ten-minute context detached from caller cancellation. Clean
+upload and terminal completion release only that import's debit, including a
+fully observed Docker refusal. The business failure still prevents image use;
+unknown completion retains the allocation across reopening. Capacity and
+collection checks include this amount before further staging, import or local
+reuse. These checks sample free space;
+they do not reserve physical capacity against other writers. The
+[offline recovery procedure](../../../OPERATIONS.md#recovering-outstanding-image-import-allocation)
+requires external Docker/runtime drain and matching backups before an explicit
+debit clear.
+
+Containerd pins persist `ImportBytes` with immutable image identity. A zero
+legacy allowance requires exact-digest re-ingestion. Every containerd admission
+then creates and removes a journal-owned stopped probe while holding the image
+capacity lock, forcing deferred extraction before publishing a pin or execution
+capability. The probe never starts, disables networking, and covers declared
+image `VOLUME` paths with tmpfs. Unknown Create completion fences the current
+storage authority; durable pending helper receipts exclude later containerd
+ingestion across restart until the normal helper protocol or
+[offline repair](../../../OPERATIONS.md#unsettled-docker-effects) settles them.
 
 ### Stack Provisioning
 
@@ -826,7 +872,7 @@ When lease items carry `service_name` fields (and the payload is a [stack manife
    - Validates each per-service manifest independently
 
 2. **Asynchronous provisioning** — Docker Compose-based deployment:
-   - Each service's image is pulled and inspected independently (pre-flight, before Compose)
+   - Each service's image is admitted independently before Compose; missing content passes bounded verification and exact-content import before inspection
    - Volumes are pre-created for stateful services (`disk_mb > 0` with image
      `VOLUME`s) and for detected writable-path scratch when available
      - Resource allocation ID: `{leaseUUID}-{serviceName}-{instanceIndex}`
@@ -888,7 +934,7 @@ When a provision has `status=failed` (e.g., a container crashed and was detected
 1. The existing `FailCount` is carried over from the failed provision record.
 2. Resource allocations are released and old containers are removed. Managed volumes are **kept** — stateful data persists across re-provisions.
 3. A new provision record is created with `FailCount` preserved.
-4. The full provisioning flow runs again (image pull, image inspect, volume setup via idempotent Create, container create/start, startup verification). Existing volumes are reused with quota updated; only new volumes are created.
+4. The full provisioning flow runs again (pinned image reuse or bounded image ingestion, image inspect, volume setup via idempotent Create, container create/start, startup verification). Existing volumes are reused with quota updated; only new volumes are created.
 5. On failure, `FailCount` is incremented. The `FailCount` is also persisted in the `fred.fail_count` container label. Only newly created volumes are cleaned up; reused volumes are preserved.
 
 ## Lease State Machine

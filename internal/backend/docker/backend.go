@@ -52,7 +52,7 @@ type dockerReadClient interface {
 // compile error while retaining one composite construction/test seam.
 type dockerMutationSink interface {
 	AdmitImage(context.Context, string) (imageexec.Image, error)
-	PullImage(ctx context.Context, imageName string, timeout time.Duration) error
+	RequireImage(context.Context, string) error
 	ResolveImageUser(ctx context.Context, imageName imageexec.Image, userOverride string, origin shared.ImageInspectionOrigin) (uid, gid int, err error)
 	StartContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	StopContainer(ctx context.Context, containerID string, timeout time.Duration) error
@@ -2286,7 +2286,7 @@ func newBackend(
 		return nil, fmt.Errorf("bind failed-attempt diagnostics: %w", err)
 	}
 	inspectionOwner, err := newImageInspectionCoordinator(docker, cbStore, stopCtx,
-		b.authorizeStorageMutation, b.completeStorageMutation, b.resolveBackgroundStorageStep, b.terminalStorageAuthorityError)
+		b.authorizeStorageMutation, b.completeStorageMutation, b.resolveBackgroundStorageStep, b.terminalStorageAuthorityError, b.latchAmbiguousOperationOutcome)
 	if err != nil {
 		return nil, fmt.Errorf("bind image inspection ownership: %w", err)
 	}

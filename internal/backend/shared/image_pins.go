@@ -34,6 +34,9 @@ type ImagePin struct {
 	ImageID      string           `json:"image_id"`
 	PullDigest   string           `json:"pull_digest,omitempty"`
 	Platform     ocispec.Platform `json:"platform"`
+	// ImportBytes records the verified import allowance for this immutable
+	// content. Legacy zero is readable but grants no deferred-unpack budget.
+	ImportBytes int64 `json:"import_bytes,omitempty"`
 }
 
 // ImagePinJournal is a bounded cache of immutable execution identities. The
@@ -131,8 +134,12 @@ func imagePinOriginManifest(origin ImageInspectionOrigin) (string, []byte, error
 }
 
 // Pin writes only the exact Started manifest's reference; repeated admission
-// cannot silently replace a previously pinned image after its tag moves.
-func (j *ImagePinJournal) Pin(origin ImageInspectionOrigin, ref, id, pullDigest string, platform ocispec.Platform) error {
+// cannot silently replace a previously pinned image after its tag moves. A
+// verified import allowance may increase for the same image and platform, but
+// can never shrink or authorize replacing the original execution identity.
+// That verification may also fill a missing legacy recovery digest; an existing
+// digest is never replaced.
+func (j *ImagePinJournal) Pin(origin ImageInspectionOrigin, ref, id, pullDigest string, platform ocispec.Platform, importBytes int64) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	prepared, err := j.inspections.Prepare(origin, id, ref)
@@ -158,7 +165,7 @@ func (j *ImagePinJournal) Pin(origin ImageInspectionOrigin, ref, id, pullDigest 
 	if err != nil {
 		return err
 	}
-	pin := ImagePin{LeaseUUID: lease, ManifestHash: hash, Reference: ref, ImageID: id, PullDigest: pullDigest, Platform: platform}
+	pin := ImagePin{LeaseUUID: lease, ManifestHash: hash, Reference: ref, ImageID: id, PullDigest: pullDigest, Platform: platform, ImportBytes: importBytes}
 	data, err := json.Marshal(pin)
 	if err != nil {
 		return err
@@ -179,10 +186,24 @@ func (j *ImagePinJournal) Pin(origin ImageInspectionOrigin, ref, id, pullDigest 
 			if err != nil {
 				return err
 			}
-			if old.ImageID != id {
+			if old.ImageID != id || old.Platform.OS != platform.OS || old.Platform.Architecture != platform.Architecture ||
+				old.Platform.Variant != platform.Variant || old.Platform.OSVersion != platform.OSVersion ||
+				!slices.Equal(old.Platform.OSFeatures, platform.OSFeatures) {
 				return errors.New("image pin cannot change immutable content")
 			}
-			return nil
+			fillRecoveryDigest := old.PullDigest == "" && importBytes > 0 && pullDigest != ""
+			if importBytes <= old.ImportBytes && !fillRecoveryDigest {
+				return nil
+			}
+			old.ImportBytes = max(old.ImportBytes, importBytes)
+			if fillRecoveryDigest {
+				old.PullDigest = pullDigest
+			}
+			updated, err := json.Marshal(old)
+			if err != nil {
+				return err
+			}
+			return bucket.Put(key, updated)
 		}
 		if bucket.Stats().KeyN >= maxImagePins {
 			return errors.New("image pin journal capacity exhausted")
@@ -201,7 +222,7 @@ func decodeImagePin(data []byte) (ImagePin, error) {
 	}
 	id, err := digest.Parse(pin.ImageID)
 	if err != nil || id.Algorithm() != digest.SHA256 || !canonicalInspectionUUID(pin.LeaseUUID) || len(pin.ManifestHash) != 64 ||
-		pin.Platform.OS == "" || pin.Platform.Architecture == "" {
+		pin.Platform.OS == "" || pin.Platform.Architecture == "" || pin.ImportBytes < 0 {
 		return pin, errors.New("invalid immutable image pin")
 	}
 	if _, err := hex.DecodeString(pin.ManifestHash); err != nil {

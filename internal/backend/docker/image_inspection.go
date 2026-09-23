@@ -34,6 +34,7 @@ type imageInspectionCoordinator struct {
 	complete  substratemutation.Complete
 	resolve   func(string, substratemutation.StepResult) error
 	authority func() error
+	fence     func(string, error) error
 	mu        sync.Mutex
 	active    map[string]struct{}
 }
@@ -46,8 +47,9 @@ func newImageInspectionCoordinator(
 	complete substratemutation.Complete,
 	resolve func(string, substratemutation.StepResult) error,
 	authority func() error,
+	fence func(string, error) error,
 ) (*imageInspectionCoordinator, error) {
-	if client == nil || client.creator == nil || client.launchObserver == nil || lifetime == nil || authorize == nil || complete == nil || resolve == nil || authority == nil {
+	if client == nil || client.creator == nil || client.launchObserver == nil || lifetime == nil || authorize == nil || complete == nil || resolve == nil || authority == nil || fence == nil {
 		return nil, errors.New("image inspection requires a client, journal and backend mutation lifetime")
 	}
 	if client.inspections != nil {
@@ -62,7 +64,7 @@ func newImageInspectionCoordinator(
 	}
 	c := &imageInspectionCoordinator{
 		journal: journal, creator: client.creator, observer: client.launchObserver, sdk: client.client,
-		lifetime: lifetime, authorize: authorize, complete: complete, resolve: resolve, authority: authority,
+		lifetime: lifetime, authorize: authorize, complete: complete, resolve: resolve, authority: authority, fence: fence,
 		active: make(map[string]struct{}),
 	}
 	client.inspections = c
@@ -90,6 +92,85 @@ func (d *DockerClient) openImageInspection(ctx context.Context, image imageexec.
 }
 
 func (c *imageInspectionCoordinator) open(ctx context.Context, image imageexec.Image, origin shared.ImageInspectionOrigin) (_ *imageInspectionSession, err error) {
+	return c.openFor(ctx, image, origin, imageContentInspection)
+}
+
+type imageInspectionPurpose uint8
+
+const (
+	imageContentInspection imageInspectionPurpose = iota
+	imageUnpackInspection
+)
+
+// verifyImageUnpacked makes Docker finish any deferred snapshot extraction while
+// the caller still owns the verified image's import allowance. Container Create
+// forces unpacking; this helper is never started and its image volumes are
+// covered by inert tmpfs declarations, so Create cannot copy their contents to
+// anonymous host volumes. The ordinary receipt protocol owns every effect.
+func (d *DockerClient) verifyImageUnpacked(ctx context.Context, image imageexec.Image, origin shared.ImageInspectionOrigin) error {
+	if err := d.creator.ValidateImage(image); err != nil {
+		return err
+	}
+	if d.inspections == nil {
+		return errors.New("docker image inspection owner is not bound")
+	}
+	session, err := d.inspections.openFor(ctx, image, origin, imageUnpackInspection)
+	if err != nil {
+		return err
+	}
+	return session.close()
+}
+
+// requireImageInspectionsSettled prevents a new containerd import allowance
+// from overlapping helper work whose cleanup or daemon completion is still
+// unknown. The durable journal keeps this exclusion effective after restart;
+// empty daemon inventory alone cannot settle a response-lost Create.
+func (d *DockerClient) requireImageInspectionsSettled() error {
+	if d.inspections == nil {
+		return errors.New("docker image inspection owner is not bound")
+	}
+	c := d.inspections
+	if err := errors.Join(c.authority(), c.lifetime.Err()); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	receipts, err := c.journal.List()
+	if err != nil {
+		return err
+	}
+	if len(receipts) != 0 {
+		return errors.New("image inspection completion or cleanup remains pending")
+	}
+	return nil
+}
+
+func inspectionCreateConfig(image imageexec.Image, receipt shared.ImageInspectionReceipt, purpose imageInspectionPurpose) (*container.Config, *container.HostConfig) {
+	config := &container.Config{Labels: inspectionLabels(receipt)}
+	if purpose != imageUnpackInspection {
+		return config, nil
+	}
+	config.WorkingDir = "/"
+	config.User = "0"
+	config.NetworkDisabled = true
+	config.Entrypoint = []string{"/__fred_image_probe_never_started__"}
+	config.Cmd = []string{"--never-start"}
+	config.Healthcheck = &container.HealthConfig{Test: []string{"NONE"}}
+	tmpfs := make(map[string]string, len(image.Volumes()))
+	for _, target := range image.Volumes() {
+		tmpfs[target] = "rw,noexec,nosuid,nodev,size=1m"
+	}
+	return config, &container.HostConfig{
+		ReadonlyRootfs: true,
+		NetworkMode:    "none",
+		Tmpfs:          tmpfs,
+		CapDrop:        []string{"ALL"},
+		SecurityOpt:    []string{"no-new-privileges:true"},
+		RestartPolicy:  container.RestartPolicy{Name: container.RestartPolicyDisabled},
+	}
+}
+
+func (c *imageInspectionCoordinator) openFor(ctx context.Context, image imageexec.Image, origin shared.ImageInspectionOrigin, purpose imageInspectionPurpose) (_ *imageInspectionSession, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -130,9 +211,13 @@ func (c *imageInspectionCoordinator) open(ctx context.Context, image imageexec.I
 					}
 					outcome = c.observer.run(ctx, func(ctx context.Context) error {
 						var createErr error
-						response, createErr = c.creator.Create(ctx, image, &container.Config{Labels: inspectionLabels(receipt)}, nil, nil, receipt.Name())
+						config, host := inspectionCreateConfig(image, receipt, purpose)
+						response, createErr = c.creator.Create(ctx, image, config, host, nil, receipt.Name())
 						return createErr
 					})
+					if purpose == imageUnpackInspection && !outcome.settled {
+						return c.fence("image unpack probe completion", outcome.completionError())
+					}
 					return outcome.completionError()
 				})
 				if err := c.resolve(shared.ImageInspectionCreationStep, step); err != nil {

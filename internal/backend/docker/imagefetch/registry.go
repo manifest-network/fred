@@ -1,0 +1,380 @@
+package imagefetch
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+
+	"github.com/containerd/platforms"
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+)
+
+const (
+	maxMetadataBytes = int64(2 << 20)
+	maxLayers        = 128
+	maxIndexDepth    = 8
+	maxIndexEntries  = 256
+)
+
+// Prepare performs bounded registry I/O and decompression without extracting
+// anything into Docker or the host filesystem. Staged blobs are unlinked while
+// open, so a process crash releases them without an orphan cleanup authority.
+func (l *Loader) Prepare(ctx context.Context, ref string, platform ocispec.Platform) (_ *Prepared, resultErr error) {
+	if l == nil {
+		return nil, errors.New("image loader is unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if platform.OS != "linux" || platform.Architecture == "" {
+		return nil, errors.New("image preparation requires an explicit Linux platform")
+	}
+	named, err := name.ParseReference(ref)
+	if err != nil {
+		return nil, fmt.Errorf("parse registry reference: %w", err)
+	}
+	dir, err := os.MkdirTemp(l.stageRoot, ".fred-image-")
+	if err != nil {
+		return nil, err
+	}
+	state := &preparedState{issuer: l, dir: dir}
+	p := &Prepared{state: state}
+	defer func() {
+		if resultErr != nil {
+			_ = p.Close()
+		}
+	}()
+	metadata := int64(0)
+	rawManifest, manifestID, err := l.selectManifest(ctx, named, platform, &metadata)
+	if err != nil {
+		return nil, err
+	}
+	var manifest ocispec.Manifest
+	if err := json.Unmarshal(rawManifest, &manifest); err != nil {
+		return nil, err
+	}
+	if manifest.SchemaVersion != 2 || manifest.Subject != nil || manifest.ArtifactType != "" || len(manifest.Layers) > maxLayers {
+		return nil, errors.New("image manifest is not a bounded runnable image")
+	}
+	if manifest.MediaType == "" {
+		manifest.MediaType = ocispec.MediaTypeImageManifest
+		if manifest.Config.MediaType == "application/vnd.docker.container.image.v1+json" {
+			manifest.MediaType = "application/vnd.docker.distribution.manifest.v2+json"
+		}
+	}
+	if manifest.Config.MediaType != ocispec.MediaTypeImageConfig && manifest.Config.MediaType != "application/vnd.docker.container.image.v1+json" {
+		return nil, errors.New("unsupported image config media type")
+	}
+	if manifest.Config.Size <= 0 || manifest.Config.Size > maxMetadataBytes-metadata {
+		return nil, errors.New("image config exceeds metadata budget")
+	}
+	config, err := l.fetchMemory(ctx, named, manifest.Config)
+	if err != nil {
+		return nil, err
+	}
+	metadata += int64(len(config))
+	var cfg ocispec.Image
+	if err := json.Unmarshal(config, &cfg); err != nil {
+		return nil, err
+	}
+	if cfg.RootFS.Type != "layers" || len(cfg.RootFS.DiffIDs) != len(manifest.Layers) || !platforms.OnlyStrict(platform).Match(cfg.Platform) {
+		return nil, errors.New("image config does not match the selected platform and layers")
+	}
+	state.imported = Imported{manifest: manifestID.String(), config: manifest.Config.Digest.String(), source: named.Context().Digest(manifestID.String()).Name(), platform: cfg.Platform}
+	state.blobs = append(state.blobs,
+		blob{name: blobPath(manifestID), size: int64(len(rawManifest)), data: rawManifest},
+		blob{name: blobPath(manifest.Config.Digest), size: int64(len(config)), data: config})
+	stageBytes := metadata
+	expansion := layerBudget{remaining: l.maxBytes}
+	seen := make(map[digest.Digest]bool)
+	layerNames := make([]string, 0, len(manifest.Layers))
+	for index, descriptor := range manifest.Layers {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := validDescriptor(descriptor); err != nil {
+			return nil, err
+		}
+		if descriptor.Size > l.maxBytes-stageBytes {
+			return nil, errors.New("image compressed content exceeds staging budget")
+		}
+		if seen[descriptor.Digest] {
+			return nil, errors.New("duplicate layer digest is not supported by bounded image preparation")
+		}
+		seen[descriptor.Digest] = true
+		stageBytes += descriptor.Size
+		b, err := l.fetchFile(ctx, named, state.dir, descriptor)
+		if err != nil {
+			return nil, err
+		}
+		state.blobs = append(state.blobs, b)
+		if err := inspectLayer(ctx, b.file, descriptor.MediaType, cfg.RootFS.DiffIDs[index], &expansion); err != nil {
+			return nil, fmt.Errorf("image layer %d: %w", index, err)
+		}
+		layerNames = append(layerNames, b.name)
+	}
+	// Both formats point at identical original blobs. Containerd honors OCI;
+	// classic Docker honors manifest.json and retains the config identity.
+	var tags []string
+	var annotations map[string]string
+	if tag, ok := named.(name.Tag); ok {
+		tags = []string{tag.Name()}
+		annotations = map[string]string{ocispec.AnnotationRefName: tag.Name()}
+	}
+	index, err := json.Marshal(ocispec.Index{Versioned: specs.Versioned{SchemaVersion: 2}, Manifests: []ocispec.Descriptor{{MediaType: manifest.MediaType, Digest: manifestID, Size: int64(len(rawManifest)), Platform: &cfg.Platform, Annotations: annotations}}})
+	if err != nil {
+		return nil, err
+	}
+	legacy, err := json.Marshal([]struct {
+		Config   string   `json:"Config"`
+		RepoTags []string `json:"RepoTags"`
+		Layers   []string `json:"Layers"`
+	}{{Config: blobPath(manifest.Config.Digest), RepoTags: tags, Layers: layerNames}})
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range []blob{{name: "oci-layout", data: []byte(`{"imageLayoutVersion":"1.0.0"}`)}, {name: "index.json", data: index}, {name: "manifest.json", data: legacy}} {
+		b.size = int64(len(b.data))
+		stageBytes += b.size
+		if stageBytes > l.maxBytes {
+			return nil, errors.New("image archive metadata exceeds staging budget")
+		}
+		state.blobs = append(state.blobs, b)
+	}
+	archiveBytes := int64(1024)
+	for _, b := range state.blobs {
+		archiveBytes += 512 + roundBlock(b.size, 512)
+	}
+	// Classic stores retain a config copy while the import archive still
+	// exists. Both stores also create per-image/per-layer metadata outside the
+	// layer tar entries (layerdb, snapshot records and graphdriver links).
+	state.importBytes = archiveBytes + expansion.allocated + 2*metadata + int64(len(manifest.Layers)+1)*(128<<10)
+	return p, nil
+}
+
+func (l *Loader) selectManifest(ctx context.Context, ref name.Reference, platform ocispec.Platform, used *int64) ([]byte, digest.Digest, error) {
+	for range maxIndexDepth {
+		descriptor, err := remote.Get(ref, l.options(ctx, maxMetadataBytes)...)
+		if err != nil {
+			return nil, "", err
+		}
+		*used += int64(len(descriptor.Manifest))
+		if *used > maxMetadataBytes || *used > l.maxBytes {
+			return nil, "", errors.New("image index and manifest metadata exceeds budget")
+		}
+		switch string(descriptor.MediaType) {
+		case ocispec.MediaTypeImageManifest, "application/vnd.docker.distribution.manifest.v2+json":
+			return descriptor.Manifest, digest.FromBytes(descriptor.Manifest), nil
+		case ocispec.MediaTypeImageIndex, "application/vnd.docker.distribution.manifest.list.v2+json":
+			var index ocispec.Index
+			if err := json.Unmarshal(descriptor.Manifest, &index); err != nil {
+				return nil, "", err
+			}
+			if len(index.Manifests) > maxIndexEntries {
+				return nil, "", errors.New("image index exceeds entry limit")
+			}
+			var selected *ocispec.Descriptor
+			for _, candidate := range index.Manifests {
+				if candidate.Platform != nil && platforms.OnlyStrict(platform).Match(*candidate.Platform) {
+					selected = &candidate
+					break
+				}
+			}
+			if selected == nil {
+				return nil, "", errors.New("image index has no matching platform")
+			}
+			if err := validDescriptor(*selected); err != nil {
+				return nil, "", err
+			}
+			ref = ref.Context().Digest(selected.Digest.String())
+		default:
+			return nil, "", fmt.Errorf("unsupported image manifest type %q", descriptor.MediaType)
+		}
+	}
+	return nil, "", errors.New("image index exceeds nesting limit")
+}
+
+func validDescriptor(d ocispec.Descriptor) error {
+	if err := d.Digest.Validate(); err != nil || d.Digest.Algorithm() != digest.SHA256 || d.Size < 0 || len(d.URLs) != 0 || len(d.Data) != 0 {
+		return errors.New("image descriptor must contain a SHA256 registry blob with an explicit size")
+	}
+	return nil
+}
+
+func blobPath(d digest.Digest) string { return "blobs/sha256/" + d.Encoded() }
+
+func (l *Loader) fetchMemory(ctx context.Context, ref name.Reference, d ocispec.Descriptor) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := l.fetch(ctx, ref, d, &buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (l *Loader) fetchFile(ctx context.Context, ref name.Reference, dir string, d ocispec.Descriptor) (_ blob, resultErr error) {
+	w, err := os.CreateTemp(dir, "blob-")
+	if err != nil {
+		return blob{}, err
+	}
+	defer func() { _ = w.Close() }()
+	r, err := os.Open(w.Name())
+	if err != nil {
+		_ = os.Remove(w.Name())
+		return blob{}, err
+	}
+	if err = os.Remove(w.Name()); err != nil {
+		_ = r.Close()
+		return blob{}, err
+	}
+	defer func() {
+		if resultErr != nil {
+			_ = r.Close()
+		}
+	}()
+	if err := l.fetch(ctx, ref, d, w); err != nil {
+		return blob{}, err
+	}
+	if err := w.Close(); err != nil {
+		return blob{}, err
+	}
+	return blob{name: blobPath(d.Digest), size: d.Size, file: r}, nil
+}
+
+func (l *Loader) fetch(ctx context.Context, ref name.Reference, d ocispec.Descriptor, out io.Writer) error {
+	if err := validDescriptor(d); err != nil {
+		return err
+	}
+	layer, err := remote.Layer(ref.Context().Digest(d.Digest.String()), l.options(ctx, l.maxBytes)...)
+	if err != nil {
+		return err
+	}
+	body, err := layer.Compressed()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = body.Close() }()
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(out, h), &budgetReader{reader: contextReader{ctx, body}, remaining: d.Size})
+	if err != nil {
+		return err
+	}
+	if n != d.Size || hex.EncodeToString(h.Sum(nil)) != d.Digest.Encoded() {
+		return errors.New("registry blob differs from its verified descriptor")
+	}
+	return nil
+}
+
+func (l *Loader) options(ctx context.Context, limit int64) []remote.Option {
+	return []remote.Option{remote.WithContext(ctx), remote.WithAuth(authn.Anonymous), remote.WithTransport(boundedTransport{base: remote.DefaultTransport, limit: limit})}
+}
+
+type boundedTransport struct {
+	base  http.RoundTripper
+	limit int64
+}
+
+func (t boundedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	limit := t.limit
+	if response.StatusCode != http.StatusOK || strings.Contains(response.Header.Get("Content-Type"), "json") || strings.Contains(req.URL.Path, "/manifests/") {
+		limit = min(limit, maxMetadataBytes)
+	}
+	response.Body = &boundedBody{ReadCloser: response.Body, reader: budgetReader{reader: response.Body, remaining: limit}}
+	return response, nil
+}
+
+type boundedBody struct {
+	io.ReadCloser
+	reader budgetReader
+}
+
+func (b *boundedBody) Read(p []byte) (int, error) { return b.reader.Read(p) }
+
+var stagingName = regexp.MustCompile(`^\.fred-image-[0-9]{1,10}$`)
+var stagingBlobName = regexp.MustCompile(`^blob-[0-9]{1,10}$`)
+
+// CleanupAbandoned removes only recognizable empty staging directories and
+// zero-byte creation remnants. Call only after acquiring exclusive backend
+// storage ownership; live preparation directories must never be scavenged.
+// Actual content is unlinked before downloading and needs no crash scavenger.
+func (l *Loader) CleanupAbandoned() error {
+	if l == nil {
+		return errors.New("image loader is unavailable")
+	}
+	root, err := os.OpenRoot(l.stageRoot)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	listing, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, err := listing.ReadDir(-1)
+	_ = listing.Close()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !stagingName.MatchString(entry.Name()) {
+			continue
+		}
+		dir, err := root.OpenRoot(entry.Name())
+		if err != nil {
+			return err
+		}
+		err = cleanEmptyStage(dir)
+		_ = dir.Close()
+		if err != nil {
+			return err
+		}
+		if err := root.Remove(entry.Name()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cleanEmptyStage(dir *os.Root) error {
+	f, err := dir.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, err := f.ReadDir(-1)
+	_ = f.Close()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !stagingBlobName.MatchString(entry.Name()) || !info.Mode().IsRegular() || info.Size() != 0 {
+			return errors.New("image staging directory contains unrecognized content")
+		}
+	}
+	for _, entry := range entries {
+		if err := dir.Remove(entry.Name()); err != nil {
+			return err
+		}
+	}
+	return nil
+}

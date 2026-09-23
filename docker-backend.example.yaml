@@ -86,17 +86,29 @@ total_disk_mb: 102400
 # operator removes the metadata volume. Stop never removes that ownership record.
 image_gc_high_percent: 85
 image_gc_low_percent: 75
-# Uncompressed image size checked AFTER Docker finishes downloading/extracting.
+# Staged-content and expanded-image limit checked before Docker import;
+# inspected image size is checked again afterward. First ingestion stages and
+# verifies exact content beside the callback journal before Docker writes it.
 image_max_size_mb: 10240
 # Classic Docker storage uses the daemon's reported data root automatically.
+# Bounded ingestion supports overlay2 and the containerd overlayfs snapshotter.
+# Keep Docker's default import staging at DockerRootDir/tmp; external
+# DOCKER_TMPDIR overrides are outside the supported capacity accounting.
 # Containerd snapshotters require the actual content directory explicitly;
-# production requires it and Docker's data root on the same isolated image LV.
-# image_data_path: "/data/images/containerd"
+# it may be on a different filesystem from Docker's data root.
+# Containerd pins retain verified extraction allowances; legacy pins require
+# one exact-digest verification/import. Each admission uses a stopped probe.
+# image_data_path: "/var/lib/containerd"
 # Every journal and managed-volume filesystem must keep this free-space floor.
-# Docker's image filesystem also needs image_max_size_mb before a pull starts.
-# A single expanding layer can exceed the post-pull cap: production_mode
-# therefore REQUIRES Docker's data root on a separate filesystem from journals
-# and managed volumes. Use an independently sized LV, not shared thin capacity.
+# Before staging, Fred also requires image_max_size_mb on its staging filesystem;
+# before import it checks the verified content's conservative import footprint.
+# Outstanding imports remain charged via
+# <callback_db_path>.image-staging/image-import-debit-v1, including after restart.
+# Imports with unknown completion need the offline procedure in OPERATIONS.md;
+# a fully observed terminal Docker refusal releases its allocation normally.
+# neither waiting nor removing temporary staging content clears their debit.
+# These sampled checks do not physically reserve space against concurrent writes.
+# Existing shared /data/docker layouts need no filesystem or quota changes.
 image_disk_min_free_mb: 2048
 # The same lease manifest reuses its first admitted immutable content. Change
 # the manifest (prefer an explicit repository digest) to deploy changed content.
@@ -446,7 +458,9 @@ volume_mount_path: "/var/lib/fred/volumes"
 # creation + start + startup verification). Default: 10m.
 provision_timeout: 10m
 
-# Timeout for pulling container images. Default: 5m.
+# Timeout for registry fetch and image verification. Default: 5m.
+# Once admitted, Docker import drains under a separate 10m bound even if this
+# caller is canceled. Unproven completion keeps its durable allocation charged.
 image_pull_timeout: 5m
 
 # Budget for the complete initial managed-volume storage-identity proof, not

@@ -22,7 +22,7 @@ const (
 	LabelImageID        = "fred.image_id"
 )
 
-// DockerSource binds inspection, pulling and creation to one SDK client at the
+// DockerSource binds inspection and creation to one SDK client at the
 // composition boundary. The runtime retains all raw capabilities privately.
 type DockerSource interface {
 	Source

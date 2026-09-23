@@ -21,7 +21,6 @@ type dockerSDKView struct {
 	close             func() error
 	ping              func(context.Context) (types.Ping, error)
 	info              func(context.Context) (system.Info, error)
-	imagePull         func(context.Context, string, image.PullOptions) (io.ReadCloser, error)
 	imageInspect      func(context.Context, string, ...client.ImageInspectOption) (image.InspectResponse, error)
 	imageList         func(context.Context, image.ListOptions) ([]image.Summary, error)
 	imageRemove       func(context.Context, string, image.RemoveOptions) ([]image.DeleteResponse, error)
@@ -47,7 +46,6 @@ func newDockerSDKView(cli *client.Client) dockerSDKView {
 		close:             cli.Close,
 		ping:              cli.Ping,
 		info:              cli.Info,
-		imagePull:         cli.ImagePull,
 		imageInspect:      cli.ImageInspect,
 		imageList:         cli.ImageList,
 		imageRemove:       cli.ImageRemove,
@@ -74,10 +72,6 @@ func (v dockerSDKView) Close() error { return v.close() }
 func (v dockerSDKView) Ping(ctx context.Context) (types.Ping, error) { return v.ping(ctx) }
 
 func (v dockerSDKView) Info(ctx context.Context) (system.Info, error) { return v.info(ctx) }
-
-func (v dockerSDKView) ImagePull(ctx context.Context, ref string, opts image.PullOptions) (io.ReadCloser, error) {
-	return v.imagePull(ctx, ref, opts)
-}
 
 func (v dockerSDKView) ImageInspect(ctx context.Context, ref string, opts ...client.ImageInspectOption) (image.InspectResponse, error) {
 	return v.imageInspect(ctx, ref, opts...)

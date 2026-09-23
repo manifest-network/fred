@@ -117,16 +117,16 @@ type Config struct {
 	// ImagePullTimeout is the timeout for pulling images.
 	ImagePullTimeout time.Duration `yaml:"image_pull_timeout"`
 
-	// ImageMaxSizeMB bounds each image's uncompressed inspected size after a
-	// pull. Docker cannot enforce this bound during layer extraction.
+	// ImageMaxSizeMB bounds staged content and expanded image bytes before
+	// Docker import, and the inspected image size afterward.
 	ImageMaxSizeMB int64 `yaml:"image_max_size_mb"`
 	// ImageDataPath declares the daemon's actual image content directory. It is
 	// required for containerd snapshotters, whose store can be outside DockerRootDir.
-	// Production requires it and DockerRootDir on the same isolated filesystem.
+	// It may share a filesystem with journals or reside apart from DockerRootDir.
 	ImageDataPath string `yaml:"image_data_path"`
-	// ImageDiskMinFreeMB reserves free space on Docker's data root and each
-	// journal filesystem. Pulls require this floor plus ImageMaxSizeMB; launches
-	// require the floor. Zero selects the 2048 MiB default.
+	// ImageDiskMinFreeMB is a sampled free-space floor, not a physical reservation.
+	// Staging also requires ImageMaxSizeMB; import rechecks the verified content's
+	// conservative footprint. Launches require the floor. Zero selects 2048 MiB.
 	ImageDiskMinFreeMB int64 `yaml:"image_disk_min_free_mb"`
 	// ImageGCHighPercent triggers collection of unused, unpinned images;
 	// ImageGCLowPercent is its stop threshold. Zero selects 85/75 percent.

@@ -36,7 +36,10 @@ type inspectionDaemon struct {
 	removes       int
 	volumes       int
 	removeVolumes []bool
+	createConfigs []*container.Config
+	createHosts   []*container.HostConfig
 	createErr     error
+	createStatus  int
 	removeErr     error
 	delayCreate   bool
 	late          *container.InspectResponse
@@ -55,27 +58,38 @@ func (d *inspectionDaemon) request(t *testing.T, req *http.Request) (*http.Respo
 		if d.beforeCreate != nil {
 			d.beforeCreate()
 		}
-		var config container.Config
-		require.NoError(t, json.NewDecoder(req.Body).Decode(&config))
+		var request struct {
+			container.Config
+			HostConfig *container.HostConfig
+		}
+		require.NoError(t, json.NewDecoder(req.Body).Decode(&request))
+		config := request.Config
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		d.creates++
+		d.createConfigs = append(d.createConfigs, &config)
+		d.createHosts = append(d.createHosts, request.HostConfig)
 		id := fmt.Sprintf("%064x", d.creates)
 		actual := container.InspectResponse{
-			ContainerJSONBase: &container.ContainerJSONBase{ID: id, Name: "/" + req.URL.Query().Get("name"), Image: config.Image, State: &container.State{Status: "created"}},
+			ContainerJSONBase: &container.ContainerJSONBase{ID: id, Name: "/" + req.URL.Query().Get("name"), Image: config.Image, State: &container.State{Status: "created"}, HostConfig: request.HostConfig},
 			Config:            &config,
 		}
 		if d.delayCreate {
 			d.late = &actual
 		} else {
 			d.containers[id] = actual
-			d.volumes++
+			if request.HostConfig == nil || request.HostConfig.Tmpfs["/data"] == "" {
+				d.volumes++
+			}
 		}
 		if d.afterCreate != nil {
 			d.afterCreate()
 		}
 		if d.createErr != nil {
 			return nil, d.createErr
+		}
+		if d.createStatus != 0 {
+			return imageSecurityResponse(d.createStatus, `{"message":"image unpack failed"}`), nil
 		}
 		return imageSecurityResponse(201, fmt.Sprintf(`{"Id":%q}`, id)), nil
 	case strings.HasSuffix(path, "/json") && strings.Contains(path, "/containers/"):
@@ -109,9 +123,9 @@ func (d *inspectionDaemon) request(t *testing.T, req *http.Request) (*http.Respo
 			return nil, d.removeErr
 		}
 		id := path[strings.Index(path, "/containers/")+len("/containers/"):]
-		_, exists := d.containers[id]
+		actual, exists := d.containers[id]
 		delete(d.containers, id)
-		if exists && withVolumes {
+		if exists && withVolumes && (actual.HostConfig == nil || actual.HostConfig.Tmpfs["/data"] == "") {
 			d.volumes--
 		}
 		return imageSecurityResponse(204, ""), nil
@@ -165,7 +179,7 @@ func newInspectionHarnessWithClient(t *testing.T, build func(*inspectionDaemon) 
 	t.Cleanup(stop)
 	h.backend = &Backend{stopCtx: lifetime, storageIdentity: h.authority.storage.ID(), storeAuthorityGate: h.authority.gate,
 		storageVerifier: testDockerRuntimeStorageVerifier{id: h.authority.storage.ID()}}
-	h.owner, err = newImageInspectionCoordinator(h.client, h.callbacks, lifetime, h.backend.authorizeStorageMutation, h.backend.completeStorageMutation, h.backend.resolveBackgroundStorageStep, h.backend.terminalStorageAuthorityError)
+	h.owner, err = newImageInspectionCoordinator(h.client, h.callbacks, lifetime, h.backend.authorizeStorageMutation, h.backend.completeStorageMutation, h.backend.resolveBackgroundStorageStep, h.backend.terminalStorageAuthorityError, h.backend.latchAmbiguousOperationOutcome)
 	require.NoError(t, err)
 	imageReference := "fixture:latest"
 	if len(reference) != 0 {
@@ -227,7 +241,7 @@ func (h *inspectionHarness) reopen(t *testing.T) {
 	// a fresh session owner, exactly as process restart construction does.
 	h.client = newImageSecurityDockerClient(t, func(req *http.Request) (*http.Response, error) { return h.daemon.request(t, req) })
 	h.client.backendName = "docker"
-	h.owner, err = newImageInspectionCoordinator(h.client, h.callbacks, lifetime, h.backend.authorizeStorageMutation, h.backend.completeStorageMutation, h.backend.resolveBackgroundStorageStep, h.backend.terminalStorageAuthorityError)
+	h.owner, err = newImageInspectionCoordinator(h.client, h.callbacks, lifetime, h.backend.authorizeStorageMutation, h.backend.completeStorageMutation, h.backend.resolveBackgroundStorageStep, h.backend.terminalStorageAuthorityError, h.backend.latchAmbiguousOperationOutcome)
 	require.NoError(t, err)
 }
 

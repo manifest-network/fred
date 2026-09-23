@@ -1465,12 +1465,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Isolate callback admission from tenant rate limits and apply authenticated
   limits by backend storage identity. Valid HMAC callbacks survive an exhausted
   pre-authentication IP bucket (ENG-1052).
-- Bound image admission with a post-pull size limit, free-space floors, periodic
-  high/low-watermark collection and durable immutable image pins. Production
-  requires image storage on a filesystem separate from control journals and
-  tenant volumes and durable exclusive ownership of its Docker daemon's image
-  cache. Shared development daemons cannot delete images. Containerd image
-  storage requires an explicit `image_data_path` (ENG-1052).
+- Bound image admission before Docker import by staging and verifying exact
+  compressed content, expanded layers and image metadata. Docker imports the
+  verified bytes without fetching them again; existing shared-filesystem
+  deployments keep their layout. Retain sampled free-space floors, a post-import
+  size check, periodic high/low-watermark collection and durable immutable image
+  pins. Production collection requires durable exclusive ownership of its Docker
+  daemon's image cache; shared development daemons cannot delete images.
+  Admitted imports drain through caller cancellation within a ten-minute bound;
+  imports with unknown completion retain a durable allocation debit across
+  restarts, while observed terminal failures settle their allocation.
+  Containerd admission proves extraction with a stopped, journal-owned probe
+  before pinning or use, and legacy pins acquire their verified allowance by
+  exact-digest ingestion. Unsettled helper receipts prevent further containerd
+  ingestion. Containerd image storage requires an explicit `image_data_path`
+  (ENG-1052).
 
 - Log retrieval now admits one materialized response per daemon, holding its
   slot through backend cleanup and the final client write even after a timeout.

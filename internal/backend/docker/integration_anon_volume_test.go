@@ -81,7 +81,7 @@ func TestIntegration_Docker_ComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 
 	// fred provisions with PullPolicy=never, so the image must be present before
 	// Up — otherwise Up errors on a clean daemon instead of pulling.
-	require.NoError(t, docker.PullImage(ctx, "busybox:latest", 60*time.Second))
+	require.NoError(t, pullImageForTest(t, docker, ctx, "busybox:latest", 60*time.Second))
 	admitted, err := docker.AdmitImage(ctx, "busybox:latest")
 	require.NoError(t, err)
 
@@ -161,7 +161,7 @@ func TestIntegration_Docker_RemoveContainer_RemovesAnonymousVolumes(t *testing.T
 	docker := newIntegrationDockerClient(t, ctx)
 	sdk := newImageSecurityFixtureClient(t)
 
-	require.NoError(t, docker.PullImage(ctx, "busybox:latest", 60*time.Second))
+	require.NoError(t, pullImageForTest(t, docker, ctx, "busybox:latest", 60*time.Second))
 
 	// Unique per run so concurrent runs / a crashed prior run can't collide.
 	name := fmt.Sprintf("fred-eng372-rmvol-%d", time.Now().UnixNano())
@@ -219,7 +219,7 @@ func TestIntegration_Docker_ImageIntrospection_DoesNotLeakAnonymousVolumes(t *te
 	const img = "redis:7-alpine" // declares VOLUME /data
 	// Pull rather than skip-if-absent: a skip here would silently turn the leak
 	// assertion into a false green on a clean CI daemon.
-	require.NoError(t, docker.PullImage(ctx, img, 120*time.Second))
+	require.NoError(t, pullImageForTest(t, docker, ctx, img, 120*time.Second))
 	_, err := docker.AdmitImage(ctx, img)
 	require.NoError(t, err)
 
@@ -287,7 +287,7 @@ func TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFail
 	docker := newIntegrationDockerClient(t, ctx)
 	sdk := newImageSecurityFixtureClient(t)
 
-	require.NoError(t, docker.PullImage(ctx, "busybox:latest", 60*time.Second))
+	require.NoError(t, pullImageForTest(t, docker, ctx, "busybox:latest", 60*time.Second))
 	admitted, err := docker.AdmitImage(ctx, "busybox:latest")
 	require.NoError(t, err)
 

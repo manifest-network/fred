@@ -425,13 +425,56 @@ across 1,043 volumes; no legacy recursive healing path is required.
 ## Image capacity and collection
 
 Docker image storage is accounted separately from per-volume project quotas.
-Production requires a separate image filesystem; containerd image storage also
-requires `image_data_path` naming its actual content directory. Inspect free
-space there and in the journal directories when image admission is refused.
-Pulls require the configured maximum image allowance above the free-space
-floor; launches require the floor. An image exceeding `image_max_size_mb` is
-rejected after inspection. A single expanding layer can exhaust the image
-filesystem, which is why the production separation is mandatory.
+Shared image, journal and tenant-volume filesystems are supported with the
+existing deployment layout. Containerd image storage requires `image_data_path`
+naming its actual content directory; it may differ from Docker's data root.
+Inspect free space there, in the Docker data root and beside the callback journal
+when image admission is refused.
+Ingestion supports classic `overlay2` and containerd's `overlayfs` snapshotter;
+other drivers are refused before staging. A driver that copies full parent
+filesystems needs a different space model. Existing `overlay2` deployments keep
+their configuration.
+Classic Docker's default import staging under `DockerRootDir/tmp` is included in
+the allowance. A `DOCKER_TMPDIR` override on another filesystem is not discoverable
+through Docker's API. Supported accounting requires the default daemon staging
+directory; explicit accounting for an external override is not implemented.
+
+Fred stages registry content in `<callback_db_path>.image-staging`, checks
+compressed-content digests, image configuration and expanded
+layers, then imports those same verified bytes into Docker. Docker does not
+perform a second registry fetch. The configured `image_max_size_mb` bounds
+staging and expanded content before import, and inspected image size afterward.
+Layer entry, path and metadata budgets also apply. Sparse entries, duplicate
+paths and hardlinks without an earlier regular-file target in the same layer
+are refused; rebuild such images with supported layer contents. Verification
+adds CPU and temporary disk use on first ingestion. Pinned images already
+present locally require no registry access once their verified allowance is
+recorded. A legacy containerd pin without that allowance needs one verification
+and import of its exact repository digest; Fred never falls back to its mutable
+tag.
+
+Before staging, admission checks the maximum staging allowance above the
+free-space floor. Before Docker import, it checks the verified image's
+conservative import footprint plus the floor again. Launches require the floor.
+Outstanding import allowances are added to admission and collection headroom
+checks, including local-image reuse. Before dispatch, Fred writes the allowance
+to `<callback_db_path>.image-staging/image-import-debit-v1`. An admitted import
+has its own ten-minute completion deadline and continues draining after caller
+cancellation. Clean upload and terminal completion release its amount even when
+Docker reports a completed failure; the deployment still fails. Transport,
+timeout or malformed-stream failures retain unproven allocation across restart,
+without automatic expiry. An unreadable debit record refuses admission.
+These checks sample available space; they do not physically reserve it against
+concurrent tenant or unrelated host writes. Keep the tenant disk pool and other
+host consumers within the filesystem's usable capacity with operational headroom.
+
+Containerd admission also creates and removes a stopped, journal-owned probe
+under the image admission lock to force any deferred snapshot extraction. It
+never starts, has no network, and covers image `VOLUME` declarations with tmpfs.
+The pin retains the verified extraction allowance for later admission. Pending
+image-helper receipts block further containerd ingestion after restart; unknown
+Create completion also fences the current storage authority. Recover those
+receipts through [unsettled Docker effects](#unsettled-docker-effects).
 
 The collector runs each minute and before image admission, prunes obsolete
 manifest pins even below its disk threshold, and removes unreferenced images
@@ -451,6 +494,29 @@ Never remove it to bypass an ownership error while any participating lineage
 still has active or retained authority. A mode transition requires an offline
 drain of every lineage. An unchanged manifest retains its pinned image even if
 its tag moves; deploy a new image reference or digest to change the content.
+
+### Recovering outstanding image import allocation
+
+The import debit represents work that may still allocate space. Freeing disk,
+waiting, restarting Fred, or observing an image in Docker cannot settle it.
+There is no automatic debit reset. For exceptional offline recovery:
+
+1. Stop Fred and every client that can submit Docker work. Stop Docker and drain
+   its container runtime; prevent automatic restart and establish that no old
+   import or extraction can resume. Stopping Fred alone is insufficient.
+2. Preserve a matching backup of `callbacks.db`, release/retention journals,
+   storage and daemon ownership markers, image storage, and the staging debit
+   record. Keep unresolved helper receipts; clearing the import debit does not
+   repair them.
+3. Check actual usage and free space on Docker's data root, any configured
+   containerd image directory, staging and journal filesystems. Resolve storage
+   faults and restore the required headroom while admission remains closed.
+4. Only after that external drain and backup, explicitly clear the outstanding
+   import amount offline by removing **only**
+   `<callback_db_path>.image-staging/image-import-debit-v1`. Do not edit its
+   checksummed bytes or delete the staging directory or callback journal.
+   Restart the same Docker/storage lineage and then Fred; repeat normal health
+   and capacity checks before reopening admission.
 
 ## Interrupted managed-volume mutation at startup
 

@@ -310,12 +310,12 @@ func (p testDockerMutationProxy) AdmitImage(ctx context.Context, reference strin
 	return sink.AdmitImage(ctx, reference)
 }
 
-func (p testDockerMutationProxy) PullImage(ctx context.Context, image string, timeout time.Duration) error {
+func (p testDockerMutationProxy) RequireImage(ctx context.Context, image string) error {
 	sink, err := p.sink()
 	if err != nil {
 		return err
 	}
-	return sink.PullImage(ctx, image, timeout)
+	return sink.RequireImage(ctx, image)
 }
 
 func (p testDockerMutationProxy) ResolveImageUser(ctx context.Context, image imageexec.Image, user string, origin shared.ImageInspectionOrigin) (int, int, error) {

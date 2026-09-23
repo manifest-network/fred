@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -25,7 +24,6 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
@@ -35,6 +33,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/docker/imagefetch"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/maintenanceid"
@@ -140,6 +139,7 @@ type DockerClient struct {
 	launchObserver *daemonLaunchObserver
 	inspections    *imageInspectionCoordinator
 	backendName    string
+	newImageLoader func(string, int64) (*imagefetch.Loader, error)
 }
 
 // NewDockerClient connects to Docker and requires the image execution API
@@ -183,7 +183,13 @@ func NewDockerClient(ctx context.Context, host string, backendName string) (*Doc
 		_ = cli.Close()
 		return nil, err
 	}
-	return &DockerClient{client: newDockerSDKView(cli), images: images, creator: creator, launchObserver: observer, backendName: backendName}, nil
+	return &DockerClient{
+		client: newDockerSDKView(cli), images: images, creator: creator,
+		launchObserver: observer, backendName: backendName,
+		newImageLoader: func(root string, maxBytes int64) (*imagefetch.Loader, error) {
+			return imagefetch.NewLoader(cli, root, maxBytes)
+		},
+	}, nil
 }
 
 // Close closes the Docker client.
@@ -865,66 +871,12 @@ func parseGroupForName(r io.Reader, groupName string) (gid int, err error) {
 	return 0, fmt.Errorf("group %q not found in /etc/group", groupName)
 }
 
-// PullImage pulls a container image with timeout.
-func (d *DockerClient) PullImage(ctx context.Context, imageName string, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	return d.pullImage(ctx, imageName)
-}
-
-func (d *DockerClient) pullImage(ctx context.Context, imageName string) error {
-	return pullImageStream(ctx, d.client, imageName)
-}
-
-func pullImageStream(ctx context.Context, source interface {
-	ImagePull(context.Context, string, image.PullOptions) (io.ReadCloser, error)
-}, imageName string) error {
-	reader, err := source.ImagePull(ctx, imageName, image.PullOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to pull image: %w", err)
-	}
-	defer func() { _ = reader.Close() }()
-
-	// The Docker daemon streams JSON progress messages. Errors such as
-	// "manifest unknown" are reported inside the stream (as an errorDetail
-	// field) rather than as an HTTP-level error. We must decode each
-	// message and check for embedded errors; discarding with io.Copy
-	// would silently swallow them.
-	decoder := json.NewDecoder(reader)
-	for {
-		var msg jsonPullMessage
-		if err := decoder.Decode(&msg); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("failed to read image pull output: %w", err)
-		}
-		if msg.Error != "" {
-			return fmt.Errorf("%s", msg.Error)
-		}
-		if msg.ErrorDetail != nil && msg.ErrorDetail.Message != "" {
-			return fmt.Errorf("%s", msg.ErrorDetail.Message)
-		}
-	}
-
-	return nil
-}
-
-// jsonPullMessage is the minimal structure needed to detect errors in the
-// Docker daemon's image-pull JSON stream. The daemon sends errors in two
-// fields: the deprecated top-level "error" string and the structured
-// "errorDetail" object. We check both so that errors are not missed if
-// either field is omitted in a future Docker release.
-type jsonPullMessage struct {
-	Error       string         `json:"error,omitempty"`
-	ErrorDetail *jsonPullError `json:"errorDetail,omitempty"`
-}
-
-// jsonPullError mirrors the structured error object the Docker daemon embeds
-// in image-pull progress messages under the "errorDetail" key.
-type jsonPullError struct {
-	Message string `json:"message,omitempty"`
+// RequireImage checks locally available executable content without changing the
+// daemon image store. Registry ingestion requires the backend's capacity owner,
+// its durable allocation ledger and a Started subject for pin publication.
+func (d *DockerClient) RequireImage(ctx context.Context, imageName string) error {
+	_, err := d.images.Admit(ctx, imageName)
+	return err
 }
 
 // CreateContainerParams holds parameters for creating a container.

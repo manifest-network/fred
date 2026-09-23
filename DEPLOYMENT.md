@@ -679,6 +679,13 @@ filesystem-level snapshot (LVM, ZFS, btrfs) — bbolt files are crash-consistent
 Restoring a complete matching snapshot intentionally preserves the same lineage,
 so fence the original backend before the restored copy starts.
 
+Include `<callback_db_path>.image-staging/image-import-debit-v1` with the matching
+Docker journals and image storage. This record preserves the allowance for
+imports whose completion is unproven; it is not disposable staging content.
+Capture it in the same consistent backup and preserve outstanding image-helper
+receipts in `callbacks.db`. Clearing an outstanding debit requires the separate
+offline recovery procedure with Fred and Docker stopped.
+
 `placement_store_db_path` is specifically not hot-swappable. Never copy over,
 unlink, rename, rotate, or restore that pathname while `providerd` is running;
 the process binds the exact private single-link inode it opened and permanently
@@ -817,30 +824,62 @@ acceptance records do not prove successful deployment, and callbacks without a
 maintenance ID cannot promote pending payloads. Previously overwritten payloads
 are not automatically reconstructed by this change.
 
-Production Docker image storage must use a filesystem separate from tenant
-volumes and every control-journal directory. Construction and subsequent disk
-admission checks reject a shared device in `production_mode`. Provision an
-independently sized image LV/filesystem before upgrading an existing shared
-`/data/docker` deployment, migrate the Docker data root with Docker and Fred
-stopped, and preserve the daemon/storage identity. A shared thin-provisioned
-pool that can exhaust underneath both filesystems does not provide this
-isolation. For Docker's containerd image store, set `image_data_path` to the actual
-containerd content directory. Fred requires this explicit path when the daemon
-reports the snapshotter store, and production requires it and `DockerRootDir`
-to share the isolated image filesystem. A post-pull image-size check cannot bound the extraction of a single
-compressed layer.
+Existing shared `/data/docker` deployments keep their storage layout and
+`overlay2` configuration. Image admission requires no new filesystem, partition,
+quota retagging or Docker data migration. For Docker's containerd image store,
+set `image_data_path` to its actual content directory, which may reside outside
+`DockerRootDir` and on a different filesystem. Classic Docker storage continues
+to use the daemon's reported data root automatically.
+Bounded image ingestion supports classic `overlay2` and containerd's `overlayfs`
+snapshotter. Other image stores, including drivers that copy entire parent
+filesystems for each layer, are refused before staging because they require a
+different import-space model. The existing deployment's `overlay2` setting is
+supported without changes.
+For classic Docker, import-space accounting assumes the daemon's default
+temporary directory under `DockerRootDir/tmp`. An external `DOCKER_TMPDIR`
+override is not reported by Docker's API and is outside that accounting; the
+supported allowance requires default daemon staging. The existing deployment
+does not set an override. Separate accounting for an external override is not
+implemented.
 
-Image management defaults to a 10 GiB maximum inspected image, 2 GiB free-space
-floor, and 85%/75% GC high/low thresholds (`image_max_size_mb`,
-`image_disk_min_free_mb`, `image_gc_high_percent`, `image_gc_low_percent`). Pull
-admission reserves the configured image allowance above the free-space floor.
+Before Docker writes image content, Fred stages the selected immutable image
+under `<callback_db_path>.image-staging`. It verifies the exact
+compressed blobs, image configuration and expanded layers, including their
+digests and bounded file and metadata content. Docker imports those verified
+bytes through `ImageLoad`; it does not fetch them again from the registry.
+Malformed or unsupported layer structures and images exceeding the admission
+budgets are rejected before import. First ingestion adds verification work and
+temporary staging space; reuse of an already pinned local image needs no
+registry access once its verified allocation allowance has been recorded.
+
+Before dispatch, Fred durably records the import allowance in
+`<callback_db_path>.image-staging/image-import-debit-v1`. An admitted import
+drains with its own ten-minute deadline even if its caller is canceled. Clean
+upload and terminal completion release that import's allowance, including when
+Docker reports a completed refusal. A lost, malformed or timed-out response
+keeps the unproven allocation charged across restarts. There is no automatic
+expiry or cleanup of this outstanding amount. Preserve the record and use the
+[offline recovery procedure](OPERATIONS.md#recovering-outstanding-image-import-allocation)
+if it prevents admission.
+
+Image management defaults to a 10 GiB staged-content and expanded-image limit,
+2 GiB free-space floor, and 85%/75% GC high/low thresholds
+(`image_max_size_mb`, `image_disk_min_free_mb`, `image_gc_high_percent`,
+`image_gc_low_percent`). The image size is also checked after Docker inspection.
+Before staging, Fred checks the configured image allowance above the free-space
+floor. After verification, it checks the conservative import footprint and floor
+again before importing. Outstanding import allowances remain charged for staging,
+import and local reuse. These are sampled headroom checks, not physical space
+reservations against concurrent tenant or other host writes; continue sizing
+the tenant disk pool and host storage with adequate headroom.
+
 Collection preserves images referenced by containers or durable lease image
 pins. Legacy active, superseded or retained manifests without immutable pins
 inhibit destructive collection until they are re-admitted or retired. Docker
 removal conflicts (including multiple tags) also preserve the image; collection
 never forces deletion or races mutable tag names. If enough space cannot be
-reclaimed, admission remains closed. Review these settings against the image
-filesystem's usable capacity.
+reclaimed, admission remains closed. Review these settings against the usable
+capacity of the filesystems holding image content, staging and journals.
 
 Production image collection requires one backend storage lineage per Docker
 daemon. Fred claims the persistent Docker metadata volume
@@ -852,7 +891,20 @@ participating lineage has active or retained authority. Moving a development
 daemon to production requires draining every lineage before an offline marker
 transition. Drain older backends before introducing this ownership protocol.
 Immutable image pins live in `callbacks.db`; preserve that journal with its
-matching release and retention stores and the daemon ownership marker.
+matching release and retention stores, outstanding import debit and daemon
+ownership marker.
+
+Containerd pins also retain the verified extraction allowance. A legacy pin
+without that allowance needs one exact-digest verification and import, even if
+the image is local; missing immutable recovery identity refuses admission
+without resolving a mutable tag. Every containerd admission creates and removes
+a stopped, journal-owned probe while holding the image admission lock. This
+forces any deferred extraction before pinning or use. The probe never starts,
+has no network, and overrides image `VOLUME` declarations with tmpfs. Pending
+helper receipts block subsequent containerd ingestion across restarts; an
+unknown Create result also fences the current storage authority. Use the
+[unsettled-effects runbook](OPERATIONS.md#unsettled-docker-effects) for unresolved
+helper requests. Classic `overlay2` deployments need no configuration change.
 
 An admitted image is pinned by immutable identity for its lease and manifest.
 Replaying the same manifest reuses that identity even if a mutable tag has moved.
@@ -868,10 +920,15 @@ Before upgrading,
 check image labels against the reserved namespaces in the
 [manifest guide](docs/manifest-guide.md). Existing containers are not rewritten.
 When first recreating a legacy containerd multi-platform image, the backend may
-need a one-time registry request for its exact selected manifest digest so that
-the manifest becomes independently addressable. Cached layers alone do not
-guarantee this step can run offline. Classic images and already-prepared
-platform manifests remain usable without registry access.
+need to ingest its exact selected manifest digest so that the manifest becomes
+independently addressable. Image inspection remains read-only: it reports the
+missing local identity, and Fred's bounded ingestion verifies and imports that
+identity through `ImageLoad`. Cached layers alone do not guarantee this step can
+run offline. Classic images and containerd pins with recorded verification
+allowances remain usable without registry access. If pinned content is missing during restore,
+Fred can recover it through the same bounded ingestion when the pin records its
+immutable repository digest. Missing content without that digest is refused;
+recovery never resolves the old mutable tag to select a replacement.
 
 Fred releases are tagged on GitHub with binaries via `goreleaser`. The release process is:
 

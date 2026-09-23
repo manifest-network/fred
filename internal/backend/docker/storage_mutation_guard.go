@@ -341,7 +341,7 @@ func (m *storageMutations) pullImage(ctx context.Context, image string, timeout 
 			_, err := capacity.prepare(ctx, m, image, true)
 			return err
 		}
-		return m.ops.docker.PullImage(ctx, image, timeout)
+		return m.ops.docker.RequireImage(ctx, image)
 	})
 }
 
