@@ -2624,9 +2624,15 @@ func testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t *testing.T, moun
 	require.Equal(t, frozen.HostConfig.SecurityOpt, restored.HostConfig.SecurityOpt)
 	require.Equal(t, frozen.Config.Labels[LabelLifecycleCallbackURL], restored.Config.Labels[LabelLifecycleCallbackURL])
 	require.Equal(t, frozen.Config.Labels[LabelMaintenanceID], restored.Config.Labels[LabelMaintenanceID])
-	for _, key := range []string{composeapi.ProjectLabel, composeapi.ServiceLabel, composeapi.VersionLabel, composeapi.ConfigHashLabel, composeapi.OneoffLabel} {
-		require.NotEmpty(t, frozen.Config.Labels[key])
+	for _, key := range []string{composeapi.ProjectLabel, composeapi.ServiceLabel, composeapi.ConfigHashLabel, composeapi.OneoffLabel} {
+		require.NotEmpty(t, frozen.Config.Labels[key], "source discovery label: %s", key)
 		require.Equal(t, frozen.Config.Labels[key], restored.Config.Labels[key], "compensation must preserve Compose discovery: %s", key)
+	}
+	// The embedded Compose library has an empty version when its CLI linker
+	// version was not set. The compiler owns that value, including explicit empty.
+	for _, labels := range []map[string]string{frozen.Config.Labels, restored.Config.Labels} {
+		require.Contains(t, labels, composeapi.VersionLabel)
+		require.Equal(t, composeapi.ComposeVersion, labels[composeapi.VersionLabel])
 	}
 	require.Equal(t, frozen.Config.Labels[LabelImageID], restored.Config.Labels[LabelImageID])
 	require.Equal(t, frozen.Config.Labels[LabelImageReference], restored.Config.Labels[LabelImageReference])
