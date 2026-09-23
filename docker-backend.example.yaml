@@ -73,6 +73,38 @@ total_cpu_cores: 8.0
 total_memory_mb: 16384
 total_disk_mb: 102400
 
+# Image layers are outside the tenant volume quota pool. Above the high disk
+# watermark, collect images that have no container or immutable lease pin,
+# continuing toward the low watermark. Pins persist in the callback journal.
+# Destructive collection requires production_mode and exclusive daemon ownership:
+# the persistent Docker metadata volume fred-image-cache-owner-v1 binds this
+# daemon to one backend storage identity, including while that backend is down.
+# A second backend storage lineage cannot start against an owned daemon.
+# Development claims a persistent shared mode and never removes cached images.
+# Shared and exclusive modes cannot mix or automatically replace each other;
+# a mode change requires draining every participating backend before an offline
+# operator removes the metadata volume. Stop never removes that ownership record.
+image_gc_high_percent: 85
+image_gc_low_percent: 75
+# Uncompressed image size checked AFTER Docker finishes downloading/extracting.
+image_max_size_mb: 10240
+# Classic Docker storage uses the daemon's reported data root automatically.
+# Containerd snapshotters require the actual content directory explicitly;
+# production requires it and Docker's data root on the same isolated image LV.
+# image_data_path: "/data/images/containerd"
+# Every journal and managed-volume filesystem must keep this free-space floor.
+# Docker's image filesystem also needs image_max_size_mb before a pull starts.
+# A single expanding layer can exceed the post-pull cap: production_mode
+# therefore REQUIRES Docker's data root on a separate filesystem from journals
+# and managed volumes. Use an independently sized LV, not shared thin capacity.
+image_disk_min_free_mb: 2048
+# The same lease manifest reuses its first admitted immutable content. Change
+# the manifest (prefer an explicit repository digest) to deploy changed content.
+# Legacy active/history or retained manifests without pins conservatively
+# inhibit image GC until re-admitted or retired, because their original untagged
+# image cannot be proved. Docker deletion conflicts also keep images; admission
+# still refuses new pulls when the required headroom cannot be reclaimed.
+
 # =============================================================================
 # SKU MAPPING (REQUIRED)
 # =============================================================================

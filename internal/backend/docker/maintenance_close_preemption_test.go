@@ -235,6 +235,54 @@ func TestDeprovisionDoesNotBypassUnknownMaintenanceLaunch(t *testing.T) {
 	require.Error(t, err, "the old maintenance capability cannot regain mutation ownership")
 }
 
+func TestDeprovisionDrainsAdmittedMaintenanceLaunchWithoutDebt(t *testing.T) {
+	for _, kind := range []shared.MaintenanceIntentKind{
+		shared.MaintenanceIntentRestart, shared.MaintenanceIntentUpdate,
+	} {
+		t.Run(string(kind), func(t *testing.T) {
+			h := newMaintenanceRecoveryHarnessForKind(t, kind)
+			h.appendTarget(true)
+			configureDiagnosticStartupFailure(t, h)
+			seedMaintenanceCloseProjection(t, h, kind)
+			h.b.provisions[h.leaseUUID].Status = backend.ProvisionStatusReady
+			bindBackendTestCloseExecutor(t, h.b, h.b.closeSettlement)
+			started := make(chan struct{})
+			h.b.compose.(*mockComposeExecutor).LaunchFn = func(ctx context.Context, _ *composetypes.Project, _ composeUpOpts) daemonLaunchOutcome {
+				return drainingDaemonLaunchForTest(t, ctx, started, func() {
+					h.inventory.mu.Lock()
+					defer h.inventory.mu.Unlock()
+					h.inventory.containers = h.containersFor(h.targetRelease, 2, "running", HealthStatusNone)
+				})
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			command, reply, err := leasesm.NewRestartCommand(ctx, h.target)
+			if kind == shared.MaintenanceIntentUpdate {
+				command, reply, err = leasesm.NewUpdateCommand(ctx, h.target)
+			}
+			require.NoError(t, err)
+			require.NoError(t, h.b.routeToLeaseBlocking(ctx, h.leaseUUID, command))
+			require.NoError(t, <-reply.Result())
+			select {
+			case <-started:
+			case <-ctx.Done():
+				t.Fatal("maintenance launch did not start")
+			}
+			require.ErrorIs(t, h.b.volumeLaunches.checkNamespace(h.leaseUUID), shared.ErrVolumeLaunchUnsettled)
+
+			require.NoError(t, h.b.Deprovision(ctx, h.leaseUUID), "close must drain the admitted request before exact cleanup")
+			require.NoError(t, h.b.volumeLaunches.checkNamespace(h.leaseUUID), "preemption must not manufacture launch debt")
+			require.Empty(t, h.inventory.containers)
+			require.Len(t, h.inventory.removed, 2)
+			pending, err := h.callbacks.ListPending()
+			require.NoError(t, err)
+			require.Len(t, pending, 2)
+			require.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
+			require.Equal(t, backend.CallbackStatusDeprovisioned, pending[1].Status)
+		})
+	}
+}
+
 func TestDeprovisionPreservesCommittedMaintenanceSuccess(t *testing.T) {
 	h := newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate)
 	h.appendTarget(true)

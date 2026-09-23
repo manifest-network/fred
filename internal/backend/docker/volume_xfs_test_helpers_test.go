@@ -2,6 +2,12 @@ package docker
 
 import "os"
 
+type xfsProjectAttributeReaderFunc func(*os.Root) (linuxFSXAttr, error)
+
+func (read xfsProjectAttributeReaderFunc) ReadProjectAttributes(root *os.Root) (linuxFSXAttr, error) {
+	return read(root)
+}
+
 type fixedXFSProjectAttributeReader struct {
 	attr linuxFSXAttr
 	err  error

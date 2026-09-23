@@ -25,6 +25,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/placementprobe"
@@ -263,7 +264,8 @@ func runWithDependencies(
 	// Suppress that unstructured write; main renders the returned error through
 	// writeCommandError, which cannot be used to forge a verdict line.
 	flags.SetOutput(io.Discard)
-	configPath := flags.String("config", "", "path to the stopped providerd configuration (required)")
+	configPath := flags.String("config", "", "path to the stopped providerd configuration (required except with -inspect-releases)")
+	inspectReleases := flags.String("inspect-releases", "", "offline read-only scan of a stopped backend releases.db for current manifest admission policy violations; writes a JSON report")
 	proofTimeout := flags.Duration(
 		"proof-timeout",
 		defaultProofTimeout,
@@ -309,6 +311,25 @@ func runWithDependencies(
 	if *showVersion {
 		if _, err := fmt.Fprintln(stdout, version); err != nil {
 			return fmt.Errorf("write version: %w", err)
+		}
+		return nil
+	}
+	if *inspectReleases != "" {
+		var incompatible string
+		flags.Visit(func(f *flag.Flag) {
+			if f.Name != "inspect-releases" {
+				incompatible = f.Name
+			}
+		})
+		if incompatible != "" {
+			return fmt.Errorf("-inspect-releases cannot be combined with -%s", incompatible)
+		}
+		report, err := shared.InspectReleaseAdmissionReadOnly(*inspectReleases)
+		if err != nil {
+			return err
+		}
+		if err := json.NewEncoder(stdout).Encode(report); err != nil {
+			return fmt.Errorf("write release admission report: %w", err)
 		}
 		return nil
 	}

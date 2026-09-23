@@ -72,21 +72,23 @@ type StatusChecker interface {
 
 // Server is the HTTP API server.
 type Server struct {
-	addr                  string
-	server                *http.Server
-	handlers              *Handlers
-	payloadHandler        *PayloadHandler
-	tokenTracker          *TokenTracker
-	providerUUID          string
-	bech32Prefix          string
-	tlsCertFile           string
-	tlsKeyFile            string
-	shutdownTimeout       time.Duration
-	rateLimiter           *RateLimiter
-	tenantRateLimiter     *TenantRateLimiter
-	callbackPublisher     CallbackPublisher
-	callbackAuthenticator callbackRequestAuthenticator
-	statusChecker         StatusChecker
+	addr                   string
+	server                 *http.Server
+	handlers               *Handlers
+	payloadHandler         *PayloadHandler
+	tokenTracker           *TokenTracker
+	providerUUID           string
+	bech32Prefix           string
+	tlsCertFile            string
+	tlsKeyFile             string
+	shutdownTimeout        time.Duration
+	rateLimiter            *RateLimiter
+	tenantRateLimiter      *TenantRateLimiter
+	callbackIngressLimiter *RateLimiter
+	callbackRateLimiter    *limiterCache
+	callbackPublisher      CallbackPublisher
+	callbackAuthenticator  callbackRequestAuthenticator
+	statusChecker          StatusChecker
 }
 
 // ServerConfig holds configuration for the API server.
@@ -238,20 +240,22 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	}
 
 	s := &Server{
-		addr:                  cfg.Addr,
-		handlers:              handlers,
-		payloadHandler:        payloadHandler,
-		tokenTracker:          tokenTracker,
-		providerUUID:          cfg.ProviderUUID,
-		bech32Prefix:          cfg.Bech32Prefix,
-		tlsCertFile:           cfg.TLSCertFile,
-		tlsKeyFile:            cfg.TLSKeyFile,
-		shutdownTimeout:       shutdownTimeout,
-		rateLimiter:           rateLimiter,
-		tenantRateLimiter:     tenantRateLimiter,
-		callbackPublisher:     callbackPublisher,
-		callbackAuthenticator: callbackAuth,
-		statusChecker:         statusChecker,
+		addr:                   cfg.Addr,
+		handlers:               handlers,
+		payloadHandler:         payloadHandler,
+		tokenTracker:           tokenTracker,
+		providerUUID:           cfg.ProviderUUID,
+		bech32Prefix:           cfg.Bech32Prefix,
+		tlsCertFile:            cfg.TLSCertFile,
+		tlsKeyFile:             cfg.TLSKeyFile,
+		shutdownTimeout:        shutdownTimeout,
+		rateLimiter:            rateLimiter,
+		callbackIngressLimiter: NewRateLimiter(callbackRateLimitRPS, callbackRateLimitBurst, trustedProxies),
+		callbackRateLimiter:    newLimiterCache(max(1, len(cfg.CallbackHMACSecrets)), visitorTTL, callbackRateLimitRPS, callbackRateLimitBurst),
+		tenantRateLimiter:      tenantRateLimiter,
+		callbackPublisher:      callbackPublisher,
+		callbackAuthenticator:  callbackAuth,
+		statusChecker:          statusChecker,
 	}
 
 	mux := http.NewServeMux()
@@ -269,7 +273,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	mux.Handle("GET /readyz", withTimeout(http.HandlerFunc(handlers.Readyz)))
 	mux.Handle("GET /metrics", withTimeout(promhttp.Handler()))
 	mux.Handle("GET /workloads", withTimeout(http.HandlerFunc(handlers.GetWorkloads)))
-	mux.Handle("POST /callbacks/provision", withCallbackTimeout(http.HandlerFunc(s.handleProvisionCallback)))
+	mux.Handle("POST /callbacks/provision", withCallbackTimeout(s.callbackPreauthBudget(http.HandlerFunc(s.handleProvisionCallback))))
 
 	// Authenticated routes validate tokens before downstream admission regardless
 	// of tenant rate-limit configuration. Optional buckets consume only validated
@@ -308,7 +312,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	var handler http.Handler = mux
 	handler = loggingMiddleware(handler)
 	handler = maxBodySizeMiddleware(maxBodySize)(handler)
-	handler = rateLimiter.Middleware(handler)
+	handler = callbackIngressRateLimit(rateLimiter, handler)
 	handler = securityHeadersMiddleware(handler)
 	if len(cfg.CORSOrigins) > 0 {
 		slog.Info("CORS middleware enabled", "origins", cfg.CORSOrigins)
@@ -376,7 +380,7 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	request, err := s.callbackAuthenticator.VerifyCallbackEvidence(r)
+	request, err := s.verifyCallback(r)
 	if err != nil {
 		if errors.Is(err, errInvalidCallbackPayload) {
 			slog.Warn("invalid callback payload",
@@ -400,6 +404,19 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 			"remote_addr", r.RemoteAddr,
 		)
 		writeError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Charge only a verified storage identity. Unauthenticated JSON must never
+	// choose a victim's bucket; legacy single-key embeddings share one bucket.
+	key := request.KeyRoute()
+	if key == "" {
+		key = "legacy"
+	}
+	if s.callbackRateLimiter != nil && !s.callbackRateLimiter.get(key).Allow() {
+		metrics.RateLimitRejectionsTotal.WithLabelValues("callback_storage").Inc()
+		w.Header().Set("Retry-After", calcRetryAfterSeconds(s.callbackRateLimiter.rate))
+		writeError(w, "callback rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 

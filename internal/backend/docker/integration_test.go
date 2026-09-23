@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -39,6 +40,18 @@ func newIntegrationLeaseUUID() string {
 	return uuid.NewString()
 }
 
+// integrationDockerConfig keeps deployment facts explicit. Docker's Info API
+// cannot report an independently managed containerd root; the integration
+// runner must declare its actual root instead of silently using DockerRootDir.
+func integrationDockerConfig() Config {
+	cfg := DefaultConfig()
+	cfg.ImageDataPath = os.Getenv("FRED_TEST_IMAGE_DATA_PATH")
+	// Loopback quota fixtures deliberately have small data filesystems. Keep
+	// the real floor enabled at a scale compatible with those test substrates.
+	cfg.ImageDiskMinFreeMB = 1
+	return cfg
+}
+
 // testBackendWithRealDocker creates a Backend connected to the real Docker daemon.
 // The backend is stopped and all test containers/networks are cleaned up via t.Cleanup.
 func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
@@ -52,7 +65,7 @@ func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 		t.Skip("Docker not available:", err)
 	}
 
-	cfg := DefaultConfig()
+	cfg := integrationDockerConfig()
 	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.Name = fmt.Sprintf("test-%s-%d", t.Name(), time.Now().UnixNano())
 	cfg.CallbackSecret = testCallbackSecret
@@ -1055,7 +1068,7 @@ func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
 func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 	callbackServer, callbackCh := startCallbackServer(t)
 
-	cfg := DefaultConfig()
+	cfg := integrationDockerConfig()
 	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.Name = fmt.Sprintf("test-cold-%d", time.Now().UnixNano())
 	cfg.CallbackSecret = testCallbackSecret
@@ -1151,7 +1164,7 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 	callbackServer1, callbackCh1 := startCallbackServer(t)
 
-	cfg := DefaultConfig()
+	cfg := integrationDockerConfig()
 	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.Name = fmt.Sprintf("test-cold-dead-%d", time.Now().UnixNano())
 	cfg.CallbackSecret = testCallbackSecret

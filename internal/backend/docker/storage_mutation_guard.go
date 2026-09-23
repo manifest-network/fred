@@ -335,6 +335,12 @@ func (m *storageMutations) requireLease(leaseUUID, operation string) error {
 
 func (m *storageMutations) pullImage(ctx context.Context, image string, timeout time.Duration) error {
 	return m.runner.Prepare(ctx, "pull image", func(ctx context.Context) error {
+		if capacity := m.ops.backend.imageCapacity; capacity != nil {
+			ctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			_, err := capacity.prepare(ctx, m, image, true)
+			return err
+		}
 		return m.ops.docker.PullImage(ctx, image, timeout)
 	})
 }
@@ -343,6 +349,10 @@ func (m *storageMutations) admitImage(ctx context.Context, reference string) (ad
 	err = m.runner.Prepare(ctx, "admit image", func(ctx context.Context) error {
 		ctx, cancel := context.WithTimeout(ctx, m.ops.backend.cfg.ImagePullTimeout)
 		defer cancel()
+		if capacity := m.ops.backend.imageCapacity; capacity != nil {
+			admitted, err = capacity.prepare(ctx, m, reference, false)
+			return err
+		}
 		admitted, err = m.ops.docker.AdmitImage(ctx, reference)
 		return err
 	})
@@ -688,6 +698,9 @@ func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchC
 		var outcome daemonLaunchOutcome
 		completed, stepResult := q.mutations.runner.StepCompleted(ctx, operation, func(ctx context.Context) error {
 			if err := q.requireActive(); err != nil {
+				return err
+			}
+			if err := q.mutations.ops.backend.requireImageDiskHeadroom(ctx); err != nil {
 				return err
 			}
 			var err error

@@ -1415,7 +1415,7 @@ func validateOperationIntentSpec(spec OperationIntentSpec) error {
 	if len(spec.Manifest) == 0 {
 		return fmt.Errorf("callback operation intent requires its manifest")
 	}
-	stack, err := manifest.ParsePayload(spec.Manifest)
+	stack, err := manifest.ParseStoredPayload(spec.Manifest)
 	if err != nil {
 		return fmt.Errorf("callback operation intent manifest: %w", err)
 	}

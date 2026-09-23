@@ -17,7 +17,8 @@ type maintenanceJournalPhase uint8
 const (
 	maintenancePhaseInvalid maintenanceJournalPhase = iota
 	maintenanceDeliveryOutstanding
-	maintenancePayloadOutstanding
+	maintenanceCompletionOutstanding
+	maintenancePayloadConfirmed
 	maintenanceCompleted
 )
 
@@ -25,8 +26,10 @@ func (phase maintenanceJournalPhase) String() string {
 	switch phase {
 	case maintenanceDeliveryOutstanding:
 		return "delivery_outstanding"
-	case maintenancePayloadOutstanding:
-		return "payload_outstanding"
+	case maintenanceCompletionOutstanding:
+		return "completion_outstanding"
+	case maintenancePayloadConfirmed:
+		return "confirmed_payload_outstanding"
 	default:
 		return ""
 	}
@@ -37,7 +40,7 @@ func (phase maintenanceJournalPhase) validFor(kind MaintenanceCommandKind, termi
 		return phase == maintenanceCompleted
 	}
 	return phase == maintenanceDeliveryOutstanding ||
-		(phase == maintenancePayloadOutstanding && kind == MaintenanceCommandUpdate)
+		((phase == maintenanceCompletionOutstanding || phase == maintenancePayloadConfirmed) && kind == MaintenanceCommandUpdate)
 }
 
 func decodeMaintenancePhase(raw string, outcome MaintenanceCommandOutcome) (maintenanceJournalPhase, error) {
@@ -52,8 +55,12 @@ func decodeMaintenancePhase(raw string, outcome MaintenanceCommandOutcome) (main
 		// Legacy Pending was written before dispatch. It cannot prove that an
 		// earlier process never sent the request, so reopen preserves ambiguity.
 		return maintenanceDeliveryOutstanding, nil
-	case "payload_outstanding":
-		return maintenancePayloadOutstanding, nil
+	case "payload_outstanding", "completion_outstanding":
+		// Old payload_outstanding proved HTTP acceptance only, never execution
+		// success. Reopen must retain the last committed payload until a receipt.
+		return maintenanceCompletionOutstanding, nil
+	case "confirmed_payload_outstanding":
+		return maintenancePayloadConfirmed, nil
 	default:
 		return maintenancePhaseInvalid, errors.New("unknown maintenance journal phase")
 	}
@@ -69,38 +76,58 @@ func (work maintenanceDelivery) valid() bool {
 	return work.claim.Valid() && work.claim.command.phase == maintenanceDeliveryOutstanding
 }
 
-// Accepted update work can only finish local payload persistence or retire
-// after exact terminal chain evidence. It cannot become backend dispatch work.
+// Accepted update work waits for an exact completion before local payload
+// persistence, or retires after exact terminal chain evidence. It cannot
+// become backend dispatch work.
 type acceptedMaintenanceUpdate struct{ claim MaintenanceCommandClaim }
 
 func (acceptedMaintenanceUpdate) maintenanceWork() {}
 func (work acceptedMaintenanceUpdate) valid() bool {
-	return work.claim.Valid() && work.claim.command.phase == maintenancePayloadOutstanding &&
+	return work.claim.Valid() && work.claim.command.phase == maintenanceCompletionOutstanding &&
 		work.claim.command.kind == MaintenanceCommandUpdate
 }
 
+// confirmedMaintenanceUpdate is minted only by loading a durable exact
+// successful completion. It alone may cross the payload persistence boundary.
+type confirmedMaintenanceUpdate struct{ claim MaintenanceCommandClaim }
+
+func (confirmedMaintenanceUpdate) maintenanceWork() {}
+func (work confirmedMaintenanceUpdate) valid() bool {
+	return work.claim.Valid() && work.claim.command.phase == maintenancePayloadConfirmed &&
+		work.claim.command.kind == MaintenanceCommandUpdate
+}
+
+type maintenanceUpdateWork interface {
+	maintenanceWork
+	valid() bool
+	updateClaim() MaintenanceCommandClaim
+}
+
+func (work acceptedMaintenanceUpdate) updateClaim() MaintenanceCommandClaim  { return work.claim }
+func (work confirmedMaintenanceUpdate) updateClaim() MaintenanceCommandClaim { return work.claim }
+
 // endedMaintenanceUpdate proves that the exact accepted command's lease is
 // terminal on the construction-bound control plane. It permits only the
-// payload-outstanding -> LeaseEnded transition, never backend dispatch or an
+// pending-update -> LeaseEnded transition, never backend dispatch or an
 // arbitrary caller-selected settlement. A decoded command alone cannot mint it.
 type endedMaintenanceUpdate struct {
 	issuer   *MaintenanceCoordinator
-	accepted acceptedMaintenanceUpdate
+	work     maintenanceUpdateWork
 	consumed *atomic.Bool
 }
 
 func (ended endedMaintenanceUpdate) valid() bool {
-	return ended.issuer != nil && ended.issuer.Valid() && ended.accepted.valid() &&
-		ended.accepted.claim.issuer == ended.issuer.coordinator.store && ended.consumed != nil
+	return ended.issuer != nil && ended.issuer.Valid() && ended.work != nil && ended.work.valid() &&
+		ended.work.updateClaim().issuer == ended.issuer.coordinator.store && ended.consumed != nil
 }
 
 func (authority *MaintenanceCoordinator) observeEndedMaintenanceUpdate(
-	ctx context.Context, accepted acceptedMaintenanceUpdate,
+	ctx context.Context, work maintenanceUpdateWork,
 ) endedMaintenanceUpdate {
-	if !authority.Valid() || !accepted.valid() || accepted.claim.issuer != authority.coordinator.store {
+	if !authority.Valid() || work == nil || !work.valid() || work.updateClaim().issuer != authority.coordinator.store {
 		return endedMaintenanceUpdate{}
 	}
-	command := accepted.claim.command
+	command := work.updateClaim().command
 	readCtx, cancel := context.WithTimeout(ctx, maintenanceChainReadTimeout)
 	defer cancel()
 	exact, ok := authority.controlPlane.observeLease(readCtx, command.LeaseUUID(), command.Tenant()).(observedExactLease)
@@ -109,18 +136,18 @@ func (authority *MaintenanceCoordinator) observeEndedMaintenanceUpdate(
 	}
 	switch exact.lease.State {
 	case billingtypes.LEASE_STATE_CLOSED, billingtypes.LEASE_STATE_REJECTED, billingtypes.LEASE_STATE_EXPIRED:
-		return endedMaintenanceUpdate{issuer: authority, accepted: accepted, consumed: &atomic.Bool{}}
+		return endedMaintenanceUpdate{issuer: authority, work: work, consumed: &atomic.Bool{}}
 	default:
 		return endedMaintenanceUpdate{}
 	}
 }
 
 func (s *Store) endAcceptedMaintenanceUpdate(ended endedMaintenanceUpdate) error {
-	if !ended.valid() || ended.accepted.claim.issuer != s || !ended.consumed.CompareAndSwap(false, true) {
+	if !ended.valid() || ended.work.updateClaim().issuer != s || !ended.consumed.CompareAndSwap(false, true) {
 		return ErrInvalidMaintenanceCommand
 	}
-	return s.settleMaintenancePhase(ended.accepted.claim,
-		maintenanceSettlement{outcome: MaintenanceOutcomeLeaseEnded}, maintenancePayloadOutstanding)
+	return s.settleMaintenancePhase(ended.work.updateClaim(),
+		maintenanceSettlement{outcome: MaintenanceOutcomeLeaseEnded}, ended.work.updateClaim().command.phase)
 }
 
 func (s *Store) maintenanceWork(claim MaintenanceCommandClaim) (maintenanceWork, error) {
@@ -139,8 +166,10 @@ func (s *Store) maintenanceWork(claim MaintenanceCommandClaim) (maintenanceWork,
 		switch command.phase {
 		case maintenanceDeliveryOutstanding:
 			result = maintenanceDelivery{claim: current}
-		case maintenancePayloadOutstanding:
+		case maintenanceCompletionOutstanding:
 			result = acceptedMaintenanceUpdate{claim: current}
+		case maintenancePayloadConfirmed:
+			result = confirmedMaintenanceUpdate{claim: current}
 		default:
 			return ErrMaintenanceCommandNotPending
 		}
@@ -185,17 +214,22 @@ func pendingMaintenanceCommandTx(tx *bolt.Tx, claim MaintenanceCommandClaim) (Ma
 	return stored, encoded, nil
 }
 
-func (s *Store) acceptMaintenanceUpdate(delivery maintenanceDelivery) (acceptedMaintenanceUpdate, error) {
+func (s *Store) acceptMaintenanceUpdate(delivery maintenanceDelivery) (maintenanceWork, error) {
 	if !delivery.valid() || delivery.claim.issuer != s || delivery.claim.command.kind != MaintenanceCommandUpdate {
-		return acceptedMaintenanceUpdate{}, ErrInvalidMaintenanceCommand
+		return nil, ErrInvalidMaintenanceCommand
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var accepted acceptedMaintenanceUpdate
+	var accepted maintenanceWork
 	err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
 		command, encoded, err := pendingMaintenanceCommandTx(tx, delivery.claim)
 		if err != nil {
 			return err
+		}
+		if command.phase == maintenancePayloadConfirmed {
+			// The exact callback may beat the HTTP acceptance response.
+			accepted = confirmedMaintenanceUpdate{claim: MaintenanceCommandClaim{issuer: s, command: command}}
+			return nil
 		}
 		if command.phase != maintenanceDeliveryOutstanding {
 			return ErrMaintenanceCommandNotPending
@@ -204,7 +238,7 @@ func (s *Store) acceptMaintenanceUpdate(delivery maintenanceDelivery) (acceptedM
 		if err != nil {
 			return err
 		}
-		command.phase = maintenancePayloadOutstanding
+		command.phase = maintenanceCompletionOutstanding
 		value, err := encodeMaintenanceCommand(command, MaintenanceOutcomePending, createdAt, settledAt)
 		if err != nil {
 			return err
@@ -220,25 +254,25 @@ func (s *Store) acceptMaintenanceUpdate(delivery maintenanceDelivery) (acceptedM
 		return nil
 	})
 	if err != nil {
-		return acceptedMaintenanceUpdate{}, err
+		return nil, err
 	}
 	return accepted, nil
 }
 
 // maintenancePayloadCommit is minted only after the construction-bound
-// persister acknowledges the exact accepted bytes. It cannot be forged from
+// persister acknowledges the exact successfully completed bytes. It cannot be forged from
 // a transport result, a decoded row or a caller-selected outcome.
 type maintenancePayloadCommit struct {
-	issuer   *MaintenanceCoordinator
-	accepted acceptedMaintenanceUpdate
-	consumed *atomic.Bool
+	issuer    *MaintenanceCoordinator
+	confirmed confirmedMaintenanceUpdate
+	consumed  *atomic.Bool
 }
 
 func (s *Store) completeMaintenanceUpdate(commit maintenancePayloadCommit) error {
 	if commit.issuer == nil || !commit.issuer.Valid() || commit.issuer.coordinator.store != s ||
-		!commit.accepted.valid() || commit.accepted.claim.issuer != s ||
+		!commit.confirmed.valid() || commit.confirmed.claim.issuer != s ||
 		commit.consumed == nil || !commit.consumed.CompareAndSwap(false, true) {
 		return ErrInvalidMaintenanceCommand
 	}
-	return s.settleMaintenancePhase(commit.accepted.claim, maintenanceSettlement{outcome: MaintenanceOutcomeAccepted}, maintenancePayloadOutstanding)
+	return s.settleMaintenancePhase(commit.confirmed.claim, maintenanceSettlement{outcome: MaintenanceOutcomeAccepted}, maintenancePayloadConfirmed)
 }

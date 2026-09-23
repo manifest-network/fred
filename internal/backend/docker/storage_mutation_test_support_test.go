@@ -74,13 +74,15 @@ func fullStorageClientsForTest(b *Backend) (dockerClient, volumeManager) {
 	if err != nil {
 		panic(err)
 	}
-	return testFullDockerClient{
-			dockerReadClient:   b.docker,
-			dockerMutationSink: ops.docker,
-		}, testFullVolumeManager{
-			volumeReader:       b.volumes,
-			volumeMutationSink: ops.volumes,
-		}
+	docker := testFullDockerClient{
+		dockerReadClient:   b.docker,
+		dockerMutationSink: ops.docker,
+	}
+	volumes := testFullVolumeManager{
+		volumeReader:       b.volumes,
+		volumeMutationSink: ops.volumes,
+	}
+	return docker, volumes
 }
 
 func (b *Backend) mutationAdapter() *testStorageMutationAdapter {

@@ -22,10 +22,14 @@ type dockerSDKView struct {
 	ping              func(context.Context) (types.Ping, error)
 	info              func(context.Context) (system.Info, error)
 	imagePull         func(context.Context, string, image.PullOptions) (io.ReadCloser, error)
+	imageInspect      func(context.Context, string, ...client.ImageInspectOption) (image.InspectResponse, error)
+	imageList         func(context.Context, image.ListOptions) ([]image.Summary, error)
+	imageRemove       func(context.Context, string, image.RemoveOptions) ([]image.DeleteResponse, error)
 	copyFromContainer func(context.Context, string, string) (io.ReadCloser, container.PathStat, error)
 	containerInspect  func(context.Context, string) (container.InspectResponse, error)
 	containerList     func(context.Context, container.ListOptions) ([]container.Summary, error)
 	volumeInspect     func(context.Context, string) (volume.Volume, error)
+	volumeCreate      func(context.Context, volume.CreateOptions) (volume.Volume, error)
 	containerLogs     func(context.Context, string, container.LogsOptions) (io.ReadCloser, error)
 	containerRemove   func(context.Context, string, container.RemoveOptions) error
 	containerRename   func(context.Context, string, string) error
@@ -44,10 +48,14 @@ func newDockerSDKView(cli *client.Client) dockerSDKView {
 		ping:              cli.Ping,
 		info:              cli.Info,
 		imagePull:         cli.ImagePull,
+		imageInspect:      cli.ImageInspect,
+		imageList:         cli.ImageList,
+		imageRemove:       cli.ImageRemove,
 		copyFromContainer: cli.CopyFromContainer,
 		containerInspect:  cli.ContainerInspect,
 		containerList:     cli.ContainerList,
 		volumeInspect:     cli.VolumeInspect,
+		volumeCreate:      cli.VolumeCreate,
 		containerLogs:     cli.ContainerLogs,
 		containerRemove:   cli.ContainerRemove,
 		containerRename:   cli.ContainerRename,
@@ -71,6 +79,18 @@ func (v dockerSDKView) ImagePull(ctx context.Context, ref string, opts image.Pul
 	return v.imagePull(ctx, ref, opts)
 }
 
+func (v dockerSDKView) ImageInspect(ctx context.Context, ref string, opts ...client.ImageInspectOption) (image.InspectResponse, error) {
+	return v.imageInspect(ctx, ref, opts...)
+}
+
+func (v dockerSDKView) ImageList(ctx context.Context, opts image.ListOptions) ([]image.Summary, error) {
+	return v.imageList(ctx, opts)
+}
+
+func (v dockerSDKView) ImageRemove(ctx context.Context, id string, opts image.RemoveOptions) ([]image.DeleteResponse, error) {
+	return v.imageRemove(ctx, id, opts)
+}
+
 func (v dockerSDKView) CopyFromContainer(ctx context.Context, id, path string) (io.ReadCloser, container.PathStat, error) {
 	return v.copyFromContainer(ctx, id, path)
 }
@@ -85,6 +105,10 @@ func (v dockerSDKView) ContainerList(ctx context.Context, opts container.ListOpt
 
 func (v dockerSDKView) VolumeInspect(ctx context.Context, name string) (volume.Volume, error) {
 	return v.volumeInspect(ctx, name)
+}
+
+func (v dockerSDKView) VolumeCreate(ctx context.Context, opts volume.CreateOptions) (volume.Volume, error) {
+	return v.volumeCreate(ctx, opts)
 }
 
 func (v dockerSDKView) ContainerLogs(ctx context.Context, id string, opts container.LogsOptions) (io.ReadCloser, error) {

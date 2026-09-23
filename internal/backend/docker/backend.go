@@ -265,6 +265,7 @@ type Backend struct {
 	diagnosticsStore        *shared.DiagnosticsStore
 	failureDiagnostics      *shared.FailureDiagnostics
 	imageInspectionRecovery func(context.Context) error
+	imageCapacity           *imageCapacityManager
 	volumeLaunches          *volumeLaunchCoordinator
 
 	// releaseStore persists release history in bbolt
@@ -1630,7 +1631,7 @@ func legacyReleaseMatchesInterruptedDeprovisionRetention(
 		len(release.ResourceProfiles) != 0 {
 		return false, nil
 	}
-	releaseManifest, err := manifest.ParsePayload(release.Manifest)
+	releaseManifest, err := manifest.ParseStoredPayload(release.Manifest)
 	if err != nil {
 		return false, fmt.Errorf("parse legacy active release manifest: %w", err)
 	}
@@ -2290,6 +2291,10 @@ func newBackend(
 		return nil, fmt.Errorf("bind image inspection ownership: %w", err)
 	}
 	b.imageInspectionRecovery = func(ctx context.Context) error { return inspectionOwner.RecoverAndReport(ctx, b.logger) }
+	b.imageCapacity, err = newImageCapacityManager(ctx, b, docker)
+	if err != nil {
+		return nil, fmt.Errorf("bind image capacity management: %w", err)
+	}
 	b.volumeLaunches, err = newVolumeLaunchCoordinator(cbStore)
 	if err != nil {
 		return nil, fmt.Errorf("bind physical volume launch journal: %w", err)
@@ -2544,10 +2549,9 @@ func (b *Backend) Start(ctx context.Context) error {
 		b.logger.Warn("retention reconciliation failed", "error", retentionReconcileErr)
 	}
 
-	// Backfill per-volume quotas onto existing volumes. Volumes provisioned
-	// before the daemon held CAP_SYS_ADMIN were created untagged/un-limited;
-	// once the capability is granted, this re-applies enforcement without a
-	// re-provision. Every expected present volume is attempted, then any failures
+	// Verify root project identity/inheritance and refresh per-volume limits.
+	// Existing tenant trees are never recursively walked during startup.
+	// Historical untagged descendants require stopped-writer offline repair. Every expected present volume is attempted, then any failures
 	// fail startup/readiness closed: serving while even one known tenant volume
 	// may be uncapped would violate the resource authority recovered above. Runs
 	// after reconcileRetentions so the fred-retained- namespace matches the
@@ -2605,6 +2609,9 @@ func (b *Backend) Start(ctx context.Context) error {
 
 	// Start periodic reconciliation (using WaitGroup.Go for Go 1.25+)
 	b.wg.Go(b.reconcileLoop)
+	if b.imageCapacity != nil {
+		b.wg.Go(b.imageGCLoop)
+	}
 	if b.cfg.IsNetworkIsolation() {
 		b.wg.Go(b.networkCleanupLoop)
 	}

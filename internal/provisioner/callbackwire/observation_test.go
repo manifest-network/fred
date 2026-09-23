@@ -74,3 +74,24 @@ func TestCallbackProofCannotBeMintedForAnotherPath(t *testing.T) {
 	)
 	require.Error(t, err)
 }
+
+func TestDecodeVerifiedMaintenanceCompletion(t *testing.T) {
+	const lease = "d144291f-a36f-47a4-8ccf-48afe590e29d"
+	body := []byte(`{"lease_uuid":"` + lease + `","status":"success","backend_storage_id":"` + testStorageID + `","maintenance_id":"` + testOperation + `"}`)
+	for _, uri := range []string{"/callbacks/provision", "/callbacks/provision?lifecycle_id=" + testLifecycle} {
+		observation, err := DecodeVerified(verifiedCallback(t, uri, body, testStorageID))
+		require.NoError(t, err)
+		require.Equal(t, testOperation, observation.MaintenanceID().String())
+		require.Equal(t, testOperation, observation.Payload().MaintenanceID)
+	}
+	_, err := DecodeVerified(verifiedCallback(t, "/callbacks/provision?operation_id="+testOperation, body, testStorageID))
+	require.ErrorIs(t, err, ErrInvalidPayload)
+	for _, raw := range []string{
+		`{"lease_uuid":"` + lease + `","status":"success","maintenance_id":"invalid"}`,
+		`{"lease_uuid":"` + lease + `","status":"deprovisioned","maintenance_id":"` + testOperation + `"}`,
+		`{"lease_uuid":"` + lease + `","status":"success","maintenance_id":"` + testOperation + `","Maintenance_ID":"` + testLifecycle + `"}`,
+	} {
+		_, err := DecodeVerified(verifiedCallback(t, "/callbacks/provision", []byte(raw), ""))
+		require.ErrorIs(t, err, ErrInvalidPayload)
+	}
+}

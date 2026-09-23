@@ -1201,7 +1201,7 @@ func (b *Backend) validateRecoveredOperationSuccessWithPromotion(
 	if len(payload) == 0 {
 		return fmt.Errorf("durable intent has no manifest")
 	}
-	if _, err := manifest.ParsePayload(payload); err != nil {
+	if _, err := manifest.ParseStoredPayload(payload); err != nil {
 		return fmt.Errorf("parse durable operation manifest: %w", err)
 	}
 	if b.releaseStore == nil {
@@ -1288,7 +1288,7 @@ func (b *Backend) ensureRecoveredOperationSuccess(
 		return shared.OperationReleaseCommitted{}, err
 	}
 	payload := claim.Manifest()
-	stack, err := manifest.ParsePayload(payload)
+	stack, err := manifest.ParseStoredPayload(payload)
 	if err != nil {
 		return shared.OperationReleaseCommitted{}, fmt.Errorf("parse durable operation manifest: %w", err)
 	}
@@ -1618,7 +1618,7 @@ func (b *Backend) validatePredecessorProvisionSubset(
 	if err := validateDockerResourceProfiles(release.Items, release.ResourceProfiles); err != nil {
 		return nil, nil, fmt.Errorf("predecessor active release has invalid resource authority: %w", err)
 	}
-	stack, err := manifest.ParsePayload(release.Manifest)
+	stack, err := manifest.ParseStoredPayload(release.Manifest)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse predecessor active manifest: %w", err)
 	}
@@ -1887,7 +1887,7 @@ func (b *Backend) classifyOperationIntentSubstrate(
 			waitEvidence: operationAwaitLateVisibility{},
 		}, nil
 	}
-	stack, err := manifest.ParsePayload(claim.Manifest())
+	stack, err := manifest.ParseStoredPayload(claim.Manifest())
 	if err != nil {
 		return operationIntentSubstrate{}, fmt.Errorf("parse durable operation manifest: %w", err)
 	}

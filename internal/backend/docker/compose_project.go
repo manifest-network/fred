@@ -400,8 +400,12 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 		LabelBackendName:          p.BackendName,
 		LabelServiceName:          p.ServiceName,
 	}
-	// Add user labels (already validated against the reserved namespace policy).
+	// Stored manifests may predate namespace admission rules. Never materialize
+	// tenant labels that can override substrate ownership or ingress authority.
 	for k, v := range p.Manifest.Labels {
+		if manifest.IsReservedLabelKey(k) {
+			continue
+		}
 		labels[k] = v
 	}
 

@@ -569,7 +569,7 @@ func TestXFSCreateStagesQuotaBeforeAtomicPublication(t *testing.T) {
 	require.NoError(t, err)
 	logText := string(commands)
 	stage := mustXFSStage(t, marker, xfsStageTestVolume)
-	setupAt := strings.Index(logText, xfsProjectSetupCmd(stage.hostPath(rootPath), marker))
+	setupAt := strings.Index(logText, xfsProjectSetupCmd(rootPath, stage))
 	limitAt := strings.Index(logText, xfsLimitCmd(marker, "100m", inodeHardLimit(100, 0)))
 	require.GreaterOrEqual(t, setupAt, 0)
 	assert.Greater(t, limitAt, setupAt, "the dquot limit must be established before publication")

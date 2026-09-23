@@ -952,6 +952,9 @@ func callbackEntryPayload(entry CallbackEntry, storageIdentity backendidentity.I
 			backendidentity.ErrIdentityDrift, parsed, storageIdentity)
 	}
 	payload.BackendStorageID = parsed.String()
+	if !entry.MaintenanceID.IsZero() {
+		payload.MaintenanceID = entry.MaintenanceID.String()
+	}
 	return json.Marshal(payload)
 }
 

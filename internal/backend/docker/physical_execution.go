@@ -44,7 +44,7 @@ func buildOperationSubstrate(
 			}
 			switch intent.Kind() {
 			case shared.OperationIntentProvision:
-				stack, err := manifest.ParsePayload(intent.Manifest())
+				stack, err := manifest.ParseStoredPayload(intent.Manifest())
 				if err != nil {
 					return fmt.Errorf("parse Started provision manifest: %w", err)
 				}
@@ -681,7 +681,7 @@ func (b *Backend) doMaintenancePhysical(
 	if mutations == nil || !intent.Valid() || !ok {
 		return errors.New("started maintenance authority is invalid")
 	}
-	stack, err := manifest.ParsePayload(target.Manifest)
+	stack, err := manifest.ParseStoredPayload(target.Manifest)
 	if err != nil {
 		return fmt.Errorf("parse Started maintenance manifest: %w", err)
 	}

@@ -214,7 +214,8 @@ type MaintenanceReauthorization struct {
 	authorization AuthorizedMaintenanceCommand
 	outcome       MaintenanceCommandOutcome
 	err           error
-	payload       acceptedMaintenanceUpdate
+	waiting       acceptedMaintenanceUpdate
+	payload       confirmedMaintenanceUpdate
 }
 
 func (result MaintenanceReauthorization) Authorized() bool {
@@ -232,7 +233,7 @@ func (result MaintenanceReauthorization) Authorization() AuthorizedMaintenanceCo
 
 func (result MaintenanceReauthorization) Settled() bool {
 	return result.issuer != nil && result.err == nil &&
-		result.outcome != MaintenanceOutcomePending && !result.authorization.Valid() && !result.payload.valid()
+		result.outcome != MaintenanceOutcomePending && !result.authorization.Valid() && !result.payload.valid() && !result.waiting.valid()
 }
 
 func (result MaintenanceReauthorization) Outcome() MaintenanceCommandOutcome {
@@ -258,8 +259,9 @@ func (authority *MaintenanceCoordinator) reauthorizeMaintenanceCommand(
 	}
 	var delivery maintenanceDelivery
 	switch work := work.(type) {
-	case acceptedMaintenanceUpdate:
-		if ended := authority.observeEndedMaintenanceUpdate(ctx, work); ended.valid() {
+	case acceptedMaintenanceUpdate, confirmedMaintenanceUpdate:
+		update := work.(maintenanceUpdateWork)
+		if ended := authority.observeEndedMaintenanceUpdate(ctx, update); ended.valid() {
 			if err := authority.coordinator.store.endAcceptedMaintenanceUpdate(ended); err != nil {
 				return MaintenanceReauthorization{issuer: authority.marker, err: err}
 			}
@@ -267,9 +269,12 @@ func (authority *MaintenanceCoordinator) reauthorizeMaintenanceCommand(
 		}
 		// Only positive exact terminal evidence makes the accepted payload
 		// unnecessary. Active, absent, foreign, unknown and failed observations
-		// do not grant that authority: local persistence can still complete
-		// without reauthorizing or contacting the backend.
-		return MaintenanceReauthorization{issuer: authority.marker, payload: work}
+		// do not grant that authority. Confirmed payload persistence can still
+		// complete locally; an unconfirmed update keeps awaiting its callback.
+		if confirmed, ok := work.(confirmedMaintenanceUpdate); ok {
+			return MaintenanceReauthorization{issuer: authority.marker, payload: confirmed}
+		}
+		return MaintenanceReauthorization{issuer: authority.marker, waiting: work.(acceptedMaintenanceUpdate)}
 	case maintenanceDelivery:
 		delivery = work
 	default:
@@ -434,9 +439,22 @@ func (authority *MaintenanceCoordinator) executeMaintenance(
 		}
 		accepted, err := authority.coordinator.store.acceptMaintenanceUpdate(call.delivery)
 		if err != nil {
+			// A failed completion may have atomically retired the command before
+			// the original HTTP acceptance reaches this goroutine.
+			record, found, lookupErr := authority.lookupMaintenanceCommand(command.LeaseUUID(), command.ID())
+			if lookupErr == nil && found && record.Outcome() != MaintenanceOutcomePending {
+				return MaintenanceCompletion{accepted: true, outcome: record.Outcome()}
+			}
 			return MaintenanceCompletion{accepted: true, err: fmt.Errorf("record backend update acceptance: %w", err)}
 		}
-		return authority.completeAcceptedUpdate(accepted)
+		switch work := accepted.(type) {
+		case acceptedMaintenanceUpdate:
+			return MaintenanceCompletion{accepted: true}
+		case confirmedMaintenanceUpdate:
+			return authority.completeConfirmedUpdate(work)
+		default:
+			return MaintenanceCompletion{accepted: true, err: ErrInvalidMaintenanceCommand}
+		}
 	}
 	return authority.completeMaintenanceCall(call, callOutcome)
 }
@@ -470,18 +488,16 @@ func classifyMaintenanceCall(observed backend.MaintenanceCallOutcome) (maintenan
 	}
 }
 
-// completeAcceptedUpdate owns the local half of an already accepted update.
-// The application retains its exclusive lease lane until this transaction
-// finishes, including through process reopen. If the receipt write fails,
-// repeating the exact payload write is idempotent and cannot overtake a newer
-// command. No transport result is accepted by this boundary.
-func (authority *MaintenanceCoordinator) completeAcceptedUpdate(accepted acceptedMaintenanceUpdate) MaintenanceCompletion {
-	if !authority.Valid() || !accepted.valid() || accepted.claim.issuer != authority.coordinator.store {
+// completeConfirmedUpdate owns payload persistence after an exact successful
+// backend completion. The exclusive lease lane survives until the terminal
+// receipt commits, so a retried write cannot overtake a successor command.
+func (authority *MaintenanceCoordinator) completeConfirmedUpdate(confirmed confirmedMaintenanceUpdate) MaintenanceCompletion {
+	if !authority.Valid() || !confirmed.valid() || confirmed.claim.issuer != authority.coordinator.store {
 		return MaintenanceCompletion{err: ErrInvalidMaintenanceCoordinator}
 	}
 	store := authority.coordinator.store
 	store.mu.RLock()
-	err := store.requireMaintenancePhaseLocked(accepted.claim, maintenancePayloadOutstanding)
+	err := store.requireMaintenancePhaseLocked(confirmed.claim, maintenancePayloadConfirmed)
 	store.mu.RUnlock()
 	if err != nil {
 		return MaintenanceCompletion{accepted: true, err: err}
@@ -489,11 +505,11 @@ func (authority *MaintenanceCoordinator) completeAcceptedUpdate(accepted accepte
 	if authority.payloads == nil {
 		return MaintenanceCompletion{accepted: true, err: errors.New("update payload persister is unavailable")}
 	}
-	command := accepted.claim.command
+	command := confirmed.claim.command
 	if err := authority.payloads.OverwritePayload(command.LeaseUUID(), command.Payload()); err != nil {
-		return MaintenanceCompletion{accepted: true, err: fmt.Errorf("persist accepted update payload: %w", err)}
+		return MaintenanceCompletion{accepted: true, err: fmt.Errorf("persist confirmed update payload: %w", err)}
 	}
-	commit := maintenancePayloadCommit{issuer: authority, accepted: accepted, consumed: &atomic.Bool{}}
+	commit := maintenancePayloadCommit{issuer: authority, confirmed: confirmed, consumed: &atomic.Bool{}}
 	if err := store.completeMaintenanceUpdate(commit); err != nil {
 		return MaintenanceCompletion{accepted: true, err: err}
 	}

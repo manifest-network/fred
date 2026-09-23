@@ -356,7 +356,7 @@ func resultForMaintenanceOutcome(outcome MaintenanceCommandOutcome) MaintenanceA
 		return maintenanceApplicationResult(MaintenanceApplicationAccepted, nil)
 	case MaintenanceOutcomeNotProvisioned:
 		return maintenanceApplicationResult(MaintenanceApplicationNotFound, nil)
-	case MaintenanceOutcomeInvalidState:
+	case MaintenanceOutcomeInvalidState, MaintenanceOutcomeExecutionFailed:
 		return maintenanceApplicationResult(MaintenanceApplicationBackendInvalidState, nil)
 	case MaintenanceOutcomeValidationRejected:
 		return maintenanceApplicationResult(MaintenanceApplicationBackendValidation, nil)
@@ -456,13 +456,19 @@ func (application *MaintenanceApplication) reauthorizeAndDispatch(
 		application.release(held.journalClaim.Command().LeaseUUID(), held)
 		return resultForMaintenanceOutcome(reauthorization.Outcome())
 	}
+	if reauthorization.waiting.valid() {
+		return maintenanceApplicationResult(MaintenanceApplicationAccepted, nil)
+	}
 	if reauthorization.payload.valid() {
-		completion := application.coordinator.completeAcceptedUpdate(reauthorization.payload)
+		completion := application.coordinator.completeConfirmedUpdate(reauthorization.payload)
 		if completion.Err() != nil {
 			return maintenanceApplicationResult(MaintenanceApplicationInternalFailure, completion.Err())
 		}
-		application.release(held.journalClaim.Command().LeaseUUID(), held)
-		return resultForMaintenanceOutcome(completion.Outcome())
+		if completion.Settled() {
+			application.release(held.journalClaim.Command().LeaseUUID(), held)
+			return resultForMaintenanceOutcome(completion.Outcome())
+		}
+		return maintenanceApplicationResult(MaintenanceApplicationAccepted, nil)
 	}
 	if !reauthorization.Authorized() {
 		return maintenanceApplicationResult(MaintenanceApplicationInternalFailure,
@@ -495,6 +501,9 @@ func (application *MaintenanceApplication) dispatch(
 		}
 		if completion.CallErr() != nil {
 			return false, completion.CallErr()
+		}
+		if !completion.Settled() && completion.BackendAccepted() {
+			return true, nil // Accepted asynchronous work remains durably fenced.
 		}
 		if !completion.Settled() || completion.Outcome() != MaintenanceOutcomeAccepted {
 			return completion.BackendAccepted(), errors.New("maintenance execution did not produce an accepted receipt")

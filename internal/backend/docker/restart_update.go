@@ -266,7 +266,7 @@ func validateReplaceSourceRelease(release shared.Release) error {
 	if _, ok := runtimeIdentityForRelease(&release); !ok {
 		return errors.New("source release lacks active runtime authority")
 	}
-	stack, err := manifest.ParsePayload(release.Manifest)
+	stack, err := manifest.ParseStoredPayload(release.Manifest)
 	if err != nil {
 		return fmt.Errorf("parse source manifest: %w", err)
 	}

@@ -20,7 +20,7 @@ import (
 
 func TestDaemonLaunchResponsesSeparateBusinessFailureFromCompletion(t *testing.T) {
 	for _, status := range []int{http.StatusCreated, http.StatusConflict, http.StatusForbidden, http.StatusInternalServerError} {
-		scope := new(daemonLaunchScope)
+		scope := newDaemonLaunchScope(t.Context(), nil)
 		transport := daemonLaunchTransport{scope: scope, next: dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) {
 			return imageSecurityResponse(status, `{}`), nil
 		})}
@@ -58,7 +58,7 @@ func TestCompensationSDKAuthorizationDenialRetainsFailureAndCompletesRequest(t *
 }
 
 func TestDaemonLaunchUnknownTransportNeverSuppliesCompletion(t *testing.T) {
-	scope := new(daemonLaunchScope)
+	scope := newDaemonLaunchScope(t.Context(), nil)
 	transport := daemonLaunchTransport{scope: scope, next: dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, context.DeadlineExceeded
 	})}
@@ -73,7 +73,7 @@ func TestDaemonLaunchUnknownTransportNeverSuppliesCompletion(t *testing.T) {
 
 func TestDaemonLaunchGatewayResponsesRemainUnknown(t *testing.T) {
 	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
-		scope := new(daemonLaunchScope)
+		scope := newDaemonLaunchScope(t.Context(), nil)
 		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://docker.invalid/v1.51/containers/create", nil)
 		require.NoError(t, err)
 		response, err := scope.roundTrip(dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) { return imageSecurityResponse(status, `{}`), nil }), request)
@@ -99,7 +99,7 @@ func TestComposeHTTPTransportExcludesEnvironmentProxy(t *testing.T) {
 
 func TestDaemonLaunchScopeFencesDetachedAndLateRequests(t *testing.T) {
 	for _, enterBeforeClose := range []bool{false, true} {
-		scope := new(daemonLaunchScope)
+		scope := newDaemonLaunchScope(t.Context(), nil)
 		var entered atomic.Int64
 		started, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		transport := daemonLaunchTransport{scope: scope, next: dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) {
@@ -122,19 +122,97 @@ func TestDaemonLaunchScopeFencesDetachedAndLateRequests(t *testing.T) {
 			}()
 			<-started
 		}
-		outcome := scope.finish(errors.New("Compose returned"))
-		require.Equal(t, !enterBeforeClose, outcome.settled)
+		scope.close()
+		finished := make(chan daemonLaunchOutcome, 1)
+		go func() { finished <- scope.finish(errors.New("Compose returned")) }()
 		_, err = transport.RoundTrip(request)
 		require.ErrorContains(t, err, "invocation has ended")
 		if enterBeforeClose {
+			select {
+			case <-finished:
+				t.Fatal("scope returned before the admitted daemon request drained")
+			case <-time.After(20 * time.Millisecond):
+			}
 			close(release)
 			<-returned
-			require.False(t, outcome.settled, "a late response cannot change the already returned proof")
 			require.Equal(t, int64(1), entered.Load())
 		} else {
 			require.Zero(t, entered.Load(), "closed scope must refuse before network dispatch")
 		}
+		require.True(t, (<-finished).settled, "admitted exchanges must drain before completion is classified")
 	}
+}
+
+func TestDaemonLaunchCanceledInvocationRejectsDetachedRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	scope := newDaemonLaunchScope(ctx, nil)
+	cancel()
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://docker.invalid/v1.51/containers/create", nil)
+	require.NoError(t, err)
+	_, err = scope.roundTrip(dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("canceled invocation must not admit a detached Compose launch")
+		return nil, nil
+	}), request)
+	require.ErrorIs(t, err, context.Canceled)
+	require.True(t, scope.finish(err).settled, "refusal before dispatch creates no unknown exchange")
+}
+
+func TestDaemonLaunchCancellationDrainsAdmittedExchangeAndClosesBodyContext(t *testing.T) {
+	for _, endpoint := range []string{"create", "source/start"} {
+		t.Run(endpoint, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			scope := newDaemonLaunchScope(ctx, nil)
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker.invalid/v1.51/containers/"+endpoint, nil)
+			require.NoError(t, err)
+			var exchangeCtx context.Context
+			response, err := scope.roundTrip(dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				exchangeCtx = req.Context()
+				deadline, bounded := exchangeCtx.Deadline()
+				require.True(t, bounded)
+				require.InDelta(t, daemonLaunchRequestTimeout.Seconds(), time.Until(deadline).Seconds(), 1)
+				cancel()
+				require.NoError(t, exchangeCtx.Err(), "preemption must not cancel an admitted exchange")
+				status := http.StatusCreated
+				if endpoint != "create" {
+					status = http.StatusNoContent
+				}
+				return imageSecurityResponse(status, `{}`), nil
+			}), request)
+			require.NoError(t, err)
+			require.NoError(t, exchangeCtx.Err(), "the SDK still needs to consume the response body")
+			require.NoError(t, response.Body.Close())
+			require.ErrorIs(t, exchangeCtx.Err(), context.Canceled, "closing the response releases its timeout")
+			require.True(t, scope.finish(ctx.Err()).settled)
+		})
+	}
+}
+
+// Model Compose returning cancellation after one admitted Create finishes.
+// The actual transport scope supplies completion authority to the durable
+// dispatch tests; the mock daemon observes the worker/Stop cancellation itself.
+func drainingDaemonLaunchForTest(t *testing.T, ctx context.Context, started chan<- struct{}, effect func()) daemonLaunchOutcome {
+	t.Helper()
+	scope := newDaemonLaunchScope(ctx, nil)
+	defer scope.close()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker.invalid/v1.51/containers/create", nil)
+	require.NoError(t, err)
+	response, err := scope.roundTrip(dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		close(started)
+		<-ctx.Done()
+		if err := req.Context().Err(); err != nil {
+			return nil, err
+		}
+		if effect != nil {
+			effect()
+		}
+		return imageSecurityResponse(http.StatusCreated, `{"Id":"drained-launch"}`), nil
+	}), request)
+	if err != nil {
+		return scope.finish(err)
+	}
+	require.NoError(t, response.Body.Close())
+	return scope.finish(ctx.Err())
 }
 
 func TestCompensationSDKStartPreservesRequestCompletionObservation(t *testing.T) {
@@ -155,6 +233,56 @@ func TestCompensationSDKStartPreservesRequestCompletionObservation(t *testing.T)
 		require.Equal(t, !transportFails, outcome.settled)
 		require.Error(t, outcome.err)
 	}
+}
+
+func TestCompensationSDKStartDrainsCanceledCaller(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	observer := new(daemonLaunchObserver)
+	transport := daemonContextTransport{observer: observer, next: dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		cancel()
+		require.NoError(t, req.Context().Err(), "the SDK's admitted Start must outlive caller cancellation")
+		return imageSecurityResponse(http.StatusNoContent, ""), nil
+	})}
+	sdk, err := client.NewClientWithOpts(client.WithHost("http://docker.invalid"), client.WithVersion("1.51"), client.WithHTTPClient(&http.Client{Transport: transport}))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sdk.Close() })
+	docker := &DockerClient{client: newDockerSDKView(sdk), launchObserver: observer}
+	outcome := docker.startCompensationContainer(ctx, "source", time.Second)
+	require.True(t, outcome.settled)
+	require.NoError(t, outcome.err)
+	require.NoError(t, outcome.completionError())
+}
+
+func TestDaemonLaunchScopeKeepsReadsCancelable(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	scope := newDaemonLaunchScope(ctx, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker.invalid/v1.51/containers/source/json", nil)
+	require.NoError(t, err)
+	_, err = scope.roundTrip(dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		cancel()
+		require.ErrorIs(t, req.Context().Err(), context.Canceled, "only Create/Start detach admitted requests")
+		return nil, req.Context().Err()
+	}), request)
+	require.ErrorIs(t, err, context.Canceled)
+	require.True(t, scope.finish(err).settled, "an interrupted read must not create launch debt")
+}
+
+func TestDaemonLaunchTransportPanicReleasesRequestContext(t *testing.T) {
+	scope := newDaemonLaunchScope(t.Context(), nil)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://docker.invalid/v1.51/containers/create", nil)
+	require.NoError(t, err)
+	var exchangeCtx context.Context
+	require.Panics(t, func() {
+		_, _ = scope.roundTrip(dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			exchangeCtx = req.Context()
+			panic("transport failure")
+		}), request)
+	})
+	require.NotNil(t, exchangeCtx)
+	require.ErrorIs(t, exchangeCtx.Err(), context.Canceled)
+	require.False(t, scope.finish(nil).settled, "transport panic leaves physical completion unknown")
 }
 
 func TestCompensationSDKCreatePreservesRequestCompletionObservation(t *testing.T) {

@@ -291,7 +291,7 @@ placement_store_db_path: "/var/lib/fred/placements.db"
 | `tls_key_file` | TLS private key file (PEM). | `""` |
 | `withdraw_interval` | How often to withdraw funds | `1h` |
 | `bech32_prefix` | Address prefix for validation | `manifest` |
-| `rate_limit_rps` | Per-IP API rate limit (req/s); one bucket shared across all routes | `10` |
+| `rate_limit_rps` | Per-IP tenant API rate limit (req/s); callbacks use separate buckets | `10` |
 | `rate_limit_burst` | Per-IP rate limit burst size | `20` |
 | `tenant_rate_limit_rps` | Per-tenant rate limit (requests/second) | `5` |
 | `tenant_rate_limit_burst` | Per-tenant burst size | `10` |
@@ -908,7 +908,20 @@ Content-Type: application/json
 
 Deploy a new manifest for a lease, replacing containers with a new image/configuration. The old containers are stopped, new ones are created from the updated manifest, and old containers are cleaned up after verification. On failure, the operation rolls back to the previous containers. Volumes are preserved.
 
-A successful update is also **persisted** to the payload store, replacing the manifest the lease was created with. This is what makes an update survive a reprovision: the reconciler replays whatever is stored, so an update applied only to the running containers would be silently undone by the next reboot, crash-restart or host failure (ENG-619). The payload is written *after* the backend accepts it, so a rejected update never enters the store; if that write fails the endpoint answers `500` rather than `202`, because a `202` would promise a durability fred does not have. Fred retains the pending command. Recovery replays the exact typed backend request until acceptance is durably recorded, then retries only local payload persistence; a tenant retry with the same `Idempotency-Key` joins that recovery.
+The accepted manifest is persisted as **pending desired state** in the maintenance
+journal. HTTP `202` confirms that durable acceptance, while the replay payload
+remains the last successfully deployed manifest. Only an authenticated completion
+for the exact maintenance ID, lifecycle and storage identity can authorize
+promotion. A failed or rolled-back update leaves the previous replay payload
+unchanged. The durable journal represents waiting-for-completion and
+confirmed-for-payload-write as separate states and in-memory capabilities.
+
+Recovery retries an ambiguous backend delivery using the same command. Once
+acceptance is recorded, it waits for the exact completion; after success it
+retries only the local payload commit. Repeating the same `Idempotency-Key`
+joins this work. Until the local commit or terminal failure settles, the lease
+remains excluded from conflicting maintenance and reprovision. An HTTP `202`
+is therefore not a promise that asynchronous deployment has succeeded.
 
 If an exact chain observation confirms that the lease has since ended, recovery
 can settle the accepted command without writing its payload. This lets teardown
@@ -929,7 +942,7 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
 ```
 
 **Response Codes:**
-- `202 Accepted` - Update initiated and persisted
+- `202 Accepted` - Update accepted with pending desired state persisted
 - `400 Bad Request` - Missing/invalid `Idempotency-Key`, payload, or manifest;
   curated backend validation diagnostics are preserved for exact retries
 - `401 Unauthorized` - Invalid signature or token
@@ -1179,6 +1192,7 @@ request URI, including its query. Requires HMAC-SHA256 authentication via the
 Status must be one of `"success"`, `"failed"`, or `"deprovisioned"` (the third is used by backends that perform autonomous deprovisioning, e.g. after a failed provision rollback).
 
 - `backend` (optional string) — legacy sender metadata used only for bounded metrics when no current operation exists. It need not equal Fred's configured router name and cannot authorize or redirect a typed callback; the HMAC-covered callback URL plus Fred's exact-operation registry or durable lifecycle record select the authoritative backend.
+- `maintenance_id` (optional canonical UUIDv4 string) — included only on the exact durable restart/update completion. Successful update completion authorizes promotion of that command's pending manifest; failed completion discards its promotion. Later runtime-failure observations omit this field. It is HMAC-covered and must match the command under the authorized lifecycle and storage identity.
 - `retained` (optional bool) — set `true` on a `deprovisioned` callback when the backend soft-deleted (retained) the lease's volumes instead of destroying them. Fred uses this to push the optimistic `retained` notice to the tenant; the queryable retained status (`GET /v1/leases/{uuid}/status`) is the durable backstop. Omitted/`false` means the volumes were destroyed.
 - `operation_id` in the JSON body, if sent by an older or custom backend, is untrusted metadata and is overwritten at ingress. Only the HMAC-authenticated URL query grants exact-operation authority.
 - `lifecycle_id` in the JSON body is likewise overwritten. Fred authorizes the authenticated query only when it matches the current durable per-lease lifecycle capability and backend.
@@ -1189,10 +1203,19 @@ Status must be one of `"success"`, `"failed"`, or `"deprovisioned"` (the third i
   backend may advance this lease's durable callback queue
 - `400 Bad Request` - Malformed JSON, lease UUID, status, or callback capability query. `operation_id` and `lifecycle_id` are mutually exclusive; a present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected
 - `401 Unauthorized` - Missing or invalid signature
-- `429 Too Many Requests` - Global callback rate limit exceeded
+- `429 Too Many Requests` - Callback ingress or verified-storage rate limit exceeded
 - `503 Service Unavailable` - Callback application is unavailable, not yet
   started, shutting down, failed, or timed out; keep the delivery durable and
   retry with backoff
+
+Callbacks have a separate pre-authentication IP budget (100 requests/s, burst
+200), independent of tenant routes, plus a post-HMAC budget with the same limits
+per verified backend storage identity. Unverified payload identity fields never
+spend another backend's authenticated allowance. When the pre-authentication
+bucket is exhausted, valid HMAC callbacks can still reach their own storage
+bucket, so junk sent directly to the callback route cannot starve a backend
+sharing that IP. The legacy single-key mode
+shares one authenticated callback bucket. Both limits return `Retry-After`.
 
 Callback application has a dedicated two-minute deadline. Bundled backends give
 the complete delivery retry chain two minutes fifteen seconds, so a fresh first

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/stretchr/testify/require"
@@ -196,6 +197,41 @@ func TestVolumeLaunchCompletedDaemonFailureCannotBypassStoragePostAttestation(t 
 		bucket := tx.Bucket([]byte("docker_volume_launch_debt_v1"))
 		require.NotNil(t, bucket)
 		require.Equal(t, 1, bucket.Stats().KeyN, "known response cannot clear debt after storage authority withdrew")
+		return nil
+	}))
+}
+
+func TestStopDrainsAdmittedVolumeLaunchBeforeClosingJournal(t *testing.T) {
+	h := newVolumeDispatchHarness(t)
+	h.backend.stopCtx, h.backend.stopCancel = context.WithCancel(t.Context())
+	h.backend.callbackStore = h.callbacks
+	h.backend.docker = &mockDockerClient{CloseFn: func() error { return nil }}
+	started := make(chan struct{})
+	h.compose.LaunchFn = func(ctx context.Context, _ *composetypes.Project, _ composeUpOpts) daemonLaunchOutcome {
+		return drainingDaemonLaunchForTest(t, ctx, started, nil)
+	}
+	h.backend.wg.Go(func() {
+		h.execute(t, func(ctx context.Context, q *quiescedVolumes) error {
+			err := h.backend.volumeLaunches.compose(ctx, q, h.prepared, composeUpOpts{})
+			require.ErrorIs(t, err, context.Canceled, "the caller still sees its cancellation")
+			require.NoError(t, h.backend.volumeLaunches.checkNamespace(q.mutations.leaseUUID),
+				"an admitted response must settle debt even when Stop canceled the worker")
+			return err
+		})
+	})
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("launch did not dispatch")
+	}
+	require.NoError(t, h.backend.Stop())
+	db, err := bolt.Open(h.callbackPath, 0o600, &bolt.Options{ReadOnly: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	require.NoError(t, db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("docker_volume_launch_debt_v1"))
+		require.NotNil(t, bucket)
+		require.Zero(t, bucket.Stats().KeyN, "graceful Stop must close the store after clearing completed launch debt")
 		return nil
 	}))
 }

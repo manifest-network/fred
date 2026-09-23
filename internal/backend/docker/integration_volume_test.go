@@ -1346,7 +1346,7 @@ func TestIntegration_XFS_InterruptedCreateStageRecoveryClearsQuota(t *testing.T)
 	require.NoError(t, stageDir.Sync())
 	require.NoError(t, stageDir.Close())
 
-	setupCmd := xfsProjectSetupCmd(stagePath, projID)
+	setupCmd := xfsProjectSetupCmd(dataPath, stage)
 	out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(setupCmd, mount)...).CombinedOutput()
 	require.NoError(t, err, "xfs_quota project setup for interrupted stage: %s", out)
 	limitCmd := xfsLimitCmd(projID, "20m", inodeHardLimit(20, 1024))
@@ -1415,7 +1415,7 @@ func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing
 	// Model a power loss after mkdir but before prepare's project-0 reset by
 	// deliberately charging the sibling itself to the retiring project.
 	out, err := exec.CommandContext(ctx, "xfs_quota",
-		xfsQuotaArgs(xfsProjectSetupCmd(deleteStagePath, projID), mount)...).CombinedOutput()
+		xfsQuotaArgs(xfsProjectRootSetupCmd(deleteStagePath, projID), mount)...).CombinedOutput()
 	require.NoError(t, err, "tag pre-reset delete-stage fixture: %s", out)
 	parent, err := os.Open(dataPath)
 	require.NoError(t, err)

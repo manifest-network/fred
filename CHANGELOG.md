@@ -784,6 +784,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Keep accepted updates pending until their exact authenticated maintenance
+  completion succeeds. Failed and rolled-back updates preserve the prior replay
+  payload, including after restart/recovery; payload promotion requires a
+  separate confirmed-update capability (ENG-1052).
+
+- Preserve previously admitted release history through storage-identity adoption,
+  recovery and restart even when current manifest admission rules changed.
+  The offline `placement-preflight -inspect-releases` command reports policy
+  drift by lease UUID and release version without editing history (ENG-1050).
+- Make XFS quota checks on existing volumes constant-time: verify root project
+  identity/inheritance and refresh limits without recursively walking tenant
+  content during startup or relaunch (ENG-1051).
+- Drain admitted Docker Create/Start exchanges through lifecycle preemption and
+  graceful shutdown, avoiding launch debt caused by Fred's own cancellation;
+  real daemon timeouts remain conservatively fenced (ENG-1052).
+
+
 - Callback-store health validation reuses the already strictly decoded closed
   tombstone within the same fresh transaction, removing a redundant decode
   while preserving semantic, size and digest checks. Cancellation stops row
@@ -1441,6 +1458,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (ENG-632)
 
 ### Security
+
+- Exclude caller-abandoned backend calls from circuit-breaker health accounting
+  without resetting real failure streaks. Encode expected close/state/capacity
+  refusals as typed non-health failures (ENG-1052).
+- Isolate callback admission from tenant rate limits and apply authenticated
+  limits by backend storage identity. Valid HMAC callbacks survive an exhausted
+  pre-authentication IP bucket (ENG-1052).
+- Bound image admission with a post-pull size limit, free-space floors, periodic
+  high/low-watermark collection and durable immutable image pins. Production
+  requires image storage on a filesystem separate from control journals and
+  tenant volumes and durable exclusive ownership of its Docker daemon's image
+  cache. Shared development daemons cannot delete images. Containerd image
+  storage requires an explicit `image_data_path` (ENG-1052).
 
 - Log retrieval now admits one materialized response per daemon, holding its
   slot through backend cleanup and the final client write even after a timeout.

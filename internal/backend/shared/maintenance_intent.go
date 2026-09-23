@@ -1128,6 +1128,7 @@ func callbackEntryForMaintenanceIntent(
 ) CallbackEntry {
 	authority, _ := releaseRuntimeIdentityFor(intent.TargetRelease)
 	return CallbackEntry{
+		MaintenanceID:    intent.MaintenanceID,
 		DeliveryID:       deliveryID,
 		LeaseUUID:        intent.LeaseUUID,
 		CallbackURL:      authority.lifecycleCallbackURL,

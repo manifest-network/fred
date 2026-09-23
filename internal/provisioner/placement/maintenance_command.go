@@ -87,6 +87,8 @@ func parseMaintenanceCommandKind(value string) MaintenanceCommandKind {
 
 // MaintenanceCommandOutcome is a durable terminal receipt. Pending is
 // represented by the explicit zero value; all nonzero outcomes are immutable.
+// Accepted updates require confirmed backend success and local payload commit;
+// restart acceptance has no pending payload to promote.
 type MaintenanceCommandOutcome uint8
 
 const (
@@ -101,6 +103,7 @@ const (
 	// MaintenanceOutcomeBackendUnavailable remains readable for legacy terminal
 	// receipts. A per-call NotDispatched outcome cannot produce one now.
 	MaintenanceOutcomeBackendUnavailable
+	MaintenanceOutcomeExecutionFailed
 )
 
 func (outcome MaintenanceCommandOutcome) String() string {
@@ -123,6 +126,8 @@ func (outcome MaintenanceCommandOutcome) String() string {
 		return "capacity_refused"
 	case MaintenanceOutcomeBackendUnavailable:
 		return "backend_unavailable"
+	case MaintenanceOutcomeExecutionFailed:
+		return "execution_failed"
 	default:
 		return "invalid"
 	}
@@ -148,6 +153,8 @@ func parseMaintenanceCommandOutcome(value string) (MaintenanceCommandOutcome, bo
 		return MaintenanceOutcomeCapacityRefused, true
 	case "backend_unavailable":
 		return MaintenanceOutcomeBackendUnavailable, true
+	case "execution_failed":
+		return MaintenanceOutcomeExecutionFailed, true
 	default:
 		return MaintenanceOutcomePending, false
 	}
@@ -585,7 +592,7 @@ func encodeMaintenanceSettlement(command MaintenanceCommand, settlement maintena
 	if !command.Valid() {
 		return nil, "", ErrInvalidMaintenanceCommand
 	}
-	if outcome > MaintenanceOutcomeBackendUnavailable {
+	if outcome > MaintenanceOutcomeExecutionFailed {
 		return nil, "", ErrInvalidMaintenanceCommand
 	}
 	persistedPayload := append([]byte(nil), command.payload...)
@@ -1069,7 +1076,7 @@ func (s *Store) settleMaintenancePhase(claim MaintenanceCommandClaim, settlement
 func (s *Store) settleMaintenancePhaseReceipt(claim MaintenanceCommandClaim, settlement maintenanceSettlement, phase maintenanceJournalPhase) (MaintenanceCommandRecord, error) {
 	outcome := settlement.outcome
 	if s == nil || !claim.Valid() || claim.issuer != s || outcome == MaintenanceOutcomePending ||
-		outcome > MaintenanceOutcomeBackendUnavailable {
+		outcome > MaintenanceOutcomeExecutionFailed {
 		return MaintenanceCommandRecord{}, ErrMaintenanceCommandNotPending
 	}
 	s.mu.Lock()

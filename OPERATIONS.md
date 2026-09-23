@@ -404,7 +404,8 @@ been accounted for.
 
 **Startup quota reconciliation.** After the preliminary guard passes, the
 backend re-applies each expected present managed volume's immutable effective
-quota (re-tag + limit) so existing leases are enforced without a re-provision.
+quota (root project/inheritance verification + limit refresh). Existing tenant
+trees are not recursively walked; mismatched roots are repaired at depth zero.
 It attempts the complete live and retained inventory and joins all failures, but
 any inventory, durable-resource-authority, or enforcement error makes `Start`
 fail before the command-line HTTP/metrics server is created. The process never
@@ -414,12 +415,42 @@ serves a known volume uncapped.
 {applied, failed}`) counts the individual attempts, but do not depend on scraping
 it from this failure mode: the normal binary has not bound its metrics endpoint.
 Use the nested `reconcile startup volume quotas` startup error to identify every
-affected name. On XFS, a common cause is missing `CAP_FOWNER` while recursively
-re-tagging a tree containing tenant-owned inodes. A truly fresh XFS root does not
-need that capability; an existing one may. Grant it or repair the reported
-substrate/authority error, then restart. No tenant volume needs reprovisioning.
+affected name. On XFS, repairing a tenant-owned root can require `CAP_FOWNER`.
+Grant it or repair the reported substrate/authority error, then restart.
+The 2026-09-23 fleet check recorded in ENG-1051 found no untagged descendants
+across 1,043 volumes; no legacy recursive healing path is required.
 
 ---
+
+## Image capacity and collection
+
+Docker image storage is accounted separately from per-volume project quotas.
+Production requires a separate image filesystem; containerd image storage also
+requires `image_data_path` naming its actual content directory. Inspect free
+space there and in the journal directories when image admission is refused.
+Pulls require the configured maximum image allowance above the free-space
+floor; launches require the floor. An image exceeding `image_max_size_mb` is
+rejected after inspection. A single expanding layer can exhaust the image
+filesystem, which is why the production separation is mandatory.
+
+The collector runs each minute and before image admission, prunes obsolete
+manifest pins even below its disk threshold, and removes unreferenced images
+between the high and low thresholds. It uses Docker's non-force removal and
+keeps every container-referenced or durably pinned image. Missing legacy pins
+or incomplete journal/container inventories prevent destructive collection.
+Removal conflicts keep their images; resolve them during fenced maintenance,
+without deleting pins or authoritative release history. Until real free space
+recovers, new image pulls remain refused. Lowering the image size cap does not
+authorize deleting content pinned by retained generations.
+
+The Docker volume `fred-image-cache-owner-v1` records durable cache ownership.
+Production uses an exclusive backend storage identity; development uses shared
+mode with no image deletion. A conflicting mode or storage identity prevents
+construction. Preserve this marker across restarts and backups of the daemon.
+Never remove it to bypass an ownership error while any participating lineage
+still has active or retained authority. A mode transition requires an offline
+drain of every lineage. An unchanged manifest retains its pinned image even if
+its tag moves; deploy a new image reference or digest to change the content.
 
 ## Interrupted managed-volume mutation at startup
 

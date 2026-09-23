@@ -383,7 +383,7 @@ func (b *Backend) doMaintenanceCompensation(ctx context.Context, mutations *stor
 		return err
 	}
 
-	stack, err := manifest.ParsePayload(source.Manifest)
+	stack, err := manifest.ParseStoredPayload(source.Manifest)
 	if err != nil {
 		return err
 	}

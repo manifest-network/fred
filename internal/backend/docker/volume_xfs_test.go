@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -137,10 +138,15 @@ func TestNewVolumeManager_XFS_ResolvesMountpoint(t *testing.T) {
 // unit-level guard for the ENG-449 regression (subdir passed as the fs arg).
 func TestXfsQuotaArgs_TrailingArgIsMountpoint(t *testing.T) {
 	const mount = "/data/fred"
-	const dir = "/data/fred/volumes/fred-x-app-0"
+	const root = "/data/fred/volumes"
 	const projID = uint32(1501154529)
 
-	setup := xfsQuotaArgs(xfsProjectSetupCmd(dir, projID), mount)
+	volume, err := parseManagedVolumeName("fred-550e8400-e29b-41d4-a716-446655440000-app-0")
+	require.NoError(t, err)
+	stage, err := newXFSStageName(projID, volume)
+	require.NoError(t, err)
+	dir := stage.hostPath(root)
+	setup := xfsQuotaArgs(xfsProjectSetupCmd(root, stage), mount)
 	assert.Equal(t, mount, setup[len(setup)-1], "project -s: trailing fs arg must be the mount point")
 	assert.Contains(t, strings.Join(setup, " "), "project -s -p "+dir,
 		"project -s must name the subdir inside -c, not as the fs arg")
@@ -181,7 +187,7 @@ printf '%s\n' "$*" >> "$FRED_TEST_XFS_LOG"
 	return logPath
 }
 
-func TestXFSCreateExistingRetagsBeforeApplyingLimit(t *testing.T) {
+func TestXFSCreateExistingRepairsOnlyRootBeforeApplyingLimit(t *testing.T) {
 	dataPath := t.TempDir()
 	const (
 		name   = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
@@ -200,6 +206,14 @@ printf '%s\n' "$*" >> "$FRED_TEST_XFS_LOG"
 	t.Setenv("PATH", binDir)
 	t.Setenv("FRED_TEST_XFS_LOG", logPath)
 	mgr := newXfsManagerForTest(dataPath)
+	var reads int
+	mgr.projectAttributes = xfsProjectAttributeReaderFunc(func(root *os.Root) (linuxFSXAttr, error) {
+		reads++
+		if reads == 1 {
+			return linuxFSXAttr{}, nil
+		}
+		return linuxFSXAttr{ProjectID: projID, XFlags: linuxFSXFlagProjInherit}, nil
+	})
 
 	hostPath, created, err := mgr.Create(t.Context(), name, 100)
 	require.NoError(t, err)
@@ -208,10 +222,161 @@ printf '%s\n' "$*" >> "$FRED_TEST_XFS_LOG"
 	commands, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	logText := string(commands)
-	setupAt := strings.Index(logText, "project -s -p "+dir)
+	setupAt := strings.Index(logText, "project -s -d 0 -p "+dir)
 	limitAt := strings.Index(logText, "limit -p bhard=100m")
-	assert.GreaterOrEqual(t, setupAt, 0, "existing recovery directory must be re-tagged")
+	assert.GreaterOrEqual(t, setupAt, 0, "existing recovery directory must be tagged without walking tenant data")
 	assert.Greater(t, limitAt, setupAt, "quota limit must follow project tagging")
+	assert.Equal(t, 2, reads, "root repair must be verified before reusing storage")
+}
+
+func installChurningXFSQuota(t *testing.T) string {
+	t.Helper()
+	logPath := installLoggingXFSQuota(t)
+	require.NoError(t, os.WriteFile(filepath.Join(os.Getenv("PATH"), "xfs_quota"), []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$FRED_TEST_XFS_LOG"
+case "$*" in
+  *"project -s"*) printf '%s\n' 'simulated FTW_NS from tenant file churn' >&2; exit 1 ;;
+esac
+`), 0o700))
+	return logPath
+}
+
+func TestXFSQuotaTaggedRootSkipsTenantWalk(t *testing.T) {
+	for _, operation := range []string{"ensure", "reuse"} {
+		t.Run(operation, func(t *testing.T) {
+			dataPath := t.TempDir()
+			const (
+				name   = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+				projID = uint32(4242)
+			)
+			dir := filepath.Join(dataPath, name)
+			require.NoError(t, os.Mkdir(dir, 0o700))
+			require.NoError(t, writeProjectIDFile(dir, projID))
+			logPath := installChurningXFSQuota(t)
+			mgr := newXfsManagerForTest(dataPath)
+			var reads int
+			mgr.projectAttributes = xfsProjectAttributeReaderFunc(func(root *os.Root) (linuxFSXAttr, error) {
+				reads++
+				id, err := readProjectIDFileInVolumeRoot(root)
+				require.NoError(t, err)
+				require.Equal(t, projID, id, "attributes must be read from the attested volume root")
+				return linuxFSXAttr{ProjectID: projID, XFlags: linuxFSXFlagProjInherit}, nil
+			})
+			if operation == "ensure" {
+				require.NoError(t, mgr.EnsureQuota(t.Context(), name, 100))
+			} else {
+				hostPath, created, err := mgr.Create(t.Context(), name, 100)
+				require.NoError(t, err)
+				assert.False(t, created)
+				assert.Equal(t, dir, hostPath)
+			}
+			commands, err := os.ReadFile(logPath)
+			require.NoError(t, err)
+			assert.NotContains(t, string(commands), "project -s")
+			assert.Contains(t, string(commands), xfsLimitCmd(projID, "100m", inodeHardFloor))
+			assert.Equal(t, 1, reads)
+		})
+	}
+}
+
+func TestXFSQuotaRootRepairFailsClosed(t *testing.T) {
+	const projID = uint32(4242)
+	readFailure := errors.New("simulated project attribute ioctl failure")
+	tests := []struct {
+		name       string
+		before     linuxFSXAttr
+		after      linuxFSXAttr
+		readErr    error
+		verifyErr  error
+		setupFails bool
+		wantError  string
+	}{
+		{
+			name:      "read failure",
+			readErr:   readFailure,
+			wantError: "read xfs root project attributes",
+		},
+		{
+			name:   "wrong ID is repaired",
+			before: linuxFSXAttr{ProjectID: 99, XFlags: linuxFSXFlagProjInherit},
+			after:  linuxFSXAttr{ProjectID: projID, XFlags: linuxFSXFlagProjInherit},
+		},
+		{
+			name:   "missing inheritance is repaired",
+			before: linuxFSXAttr{ProjectID: projID},
+			after:  linuxFSXAttr{ProjectID: projID, XFlags: linuxFSXFlagProjInherit},
+		},
+		{
+			name:       "setup failure",
+			setupFails: true,
+			wantError:  "root project setup",
+		},
+		{
+			name:      "verification failure",
+			verifyErr: readFailure,
+			wantError: "verify xfs root project attributes",
+		},
+		{
+			name:      "setup left wrong ID",
+			after:     linuxFSXAttr{ProjectID: 99, XFlags: linuxFSXFlagProjInherit},
+			wantError: "did not establish project",
+		},
+		{
+			name:      "setup left missing inheritance",
+			after:     linuxFSXAttr{ProjectID: projID},
+			wantError: "did not establish project",
+		},
+	}
+	for _, operation := range []string{"ensure", "reuse"} {
+		for _, tc := range tests {
+			t.Run(operation+"/"+tc.name, func(t *testing.T) {
+				const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+				dataPath := t.TempDir()
+				dir := filepath.Join(dataPath, name)
+				require.NoError(t, os.Mkdir(dir, 0o700))
+				require.NoError(t, writeProjectIDFile(dir, projID))
+				var logPath string
+				if tc.setupFails {
+					logPath = installChurningXFSQuota(t)
+				} else {
+					logPath = installLoggingXFSQuota(t)
+				}
+				mgr := newXfsManagerForTest(dataPath)
+				var reads int
+				mgr.projectAttributes = xfsProjectAttributeReaderFunc(func(*os.Root) (linuxFSXAttr, error) {
+					reads++
+					if reads == 1 {
+						return tc.before, tc.readErr
+					}
+					return tc.after, tc.verifyErr
+				})
+				var err error
+				if operation == "ensure" {
+					err = mgr.EnsureQuota(t.Context(), name, 100)
+				} else {
+					_, _, err = mgr.Create(t.Context(), name, 100)
+				}
+				if tc.wantError != "" {
+					require.ErrorContains(t, err, tc.wantError)
+				} else {
+					require.NoError(t, err)
+				}
+				if tc.readErr != nil {
+					assert.NoFileExists(t, logPath, "unknown root association must not reach quota mutation")
+					return
+				}
+				commands, err := os.ReadFile(logPath)
+				require.NoError(t, err)
+				assert.Contains(t, string(commands), xfsProjectRootSetupCmd(dir, projID))
+				assert.NotContains(t, string(commands), "project -s -p", "root repair must never recurse")
+				if tc.wantError != "" {
+					assert.NotContains(t, string(commands), "limit -p", "unverified repair must not reach quota limits")
+				} else {
+					assert.Contains(t, string(commands), xfsLimitCmd(projID, "100m", inodeHardFloor))
+				}
+			})
+		}
+	}
 }
 
 func TestXFSCreateEEXISTNeverGrantsCleanupAuthority(t *testing.T) {

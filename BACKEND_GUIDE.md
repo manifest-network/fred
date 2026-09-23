@@ -278,13 +278,31 @@ JSON, legacy code-less envelopes, and unknown codes.
 
 The one exception fred tolerates is an **empty** body: a backend that answers a `409`/`422` with nothing at all is read as the plain meaning of that status. An empty or code-less v0.13 `503` still produces the `ErrInsufficientResources` diagnostic sentinel for API compatibility, but its typed causal outcome is **ambiguous**, not refused; fred therefore retains the write-ahead attempt. (Note that *bare*, everywhere else in this guide and in README/ARCHITECTURE/OPERATIONS, means a response carrying **no `code` discriminator** — a different thing, and one that still owes an `error` body.) Anything that is not empty must be the envelope with a non-empty `error`: an unparseable body, and a body that is valid JSON but omits `error` (`{}`, `null`, `{"message": "..."}`, or even `{"code": "..."}`), are contract violations. A discriminator alone does not substitute for `error` — send both.
 
-The `code` set is **open and add-only**. If fred receives a `code` it does not recognize for that status — including one that is valid for a *different* status — it does not guess. It preserves the exact write-ahead attempt, keeps the declared `error` only for operator diagnostics, and returns a generic failure rather than asserting a tenant-visible backend or lease-state fact. That is not treated as a malformed body and does not count against the circuit breaker, so a new discriminator degrades safely against an older `providerd`. The precise mapping (and any tenant-facing status remap, e.g. a code-less `422` → `404`) appears only once `providerd` learns the code, so ship the fred side first if the mapping matters.
+The `code` set is **open and add-only**. If fred receives a `code` it does not recognize for that status — including one that is valid for a *different* status — it does not guess. It preserves the exact write-ahead attempt, keeps the declared `error` only for operator diagnostics, and returns a generic failure rather than asserting a tenant-visible backend or lease-state fact. That is not treated as a malformed body; breaker classification remains endpoint-specific as described below. An unknown discriminator never grants mutation settlement authority. The precise mapping (and any tenant-facing status remap, e.g. a code-less `422` → `404`) appears only once `providerd` learns the code, so ship the fred side first if the mapping matters.
 
 Settlement is type-enforced after this parse. Package-owned `backend.Invoke*`
 functions grant causal classification only to the exact identity-bound HTTP
 client type, which mints a zero-invalid call outcome at the transport branch
 that observed acceptance, a contract refusal, a proven pre-dispatch stop, or
 ambiguity. A decorator cannot acquire that authority through method embedding.
+
+Circuit-breaker classification is separate from mutation settlement:
+
+| Observation | Breaker treatment | Mutation implication |
+|---|---|---|
+| Caller context ended during a failed invocation | Excluded; preserves failure streak and releases a half-open probe slot | Preserve the invocation's original causal result, including ambiguity |
+| Successful response | Success | Only the endpoint's exact contract grants acceptance |
+| Valid not-found, validation, invalid-state, already-provisioned or restore refusal | Success | Endpoint-specific refusal or ambiguity; never inferred from breaker classification |
+| `/deprovision` `409` with `code: close_deferred` | Success | Retry close; cleanup has not completed |
+| `/provision` `409` with `code: invalid_state` | Success | Retain the attempt as ambiguous; does not prove existing ownership |
+| Capacity refusal (`503`, `code: insufficient_resources`), including custom-domain reconciliation | Success | Mutation refusal only where the endpoint supports that exact verdict |
+| `/stats` accounting hold or busy read (`503`, `code: insufficient_resources`) | Success | Retry/read admission only; no mutation authority |
+| Local storage identity unbound, upgrade required, or exact completion-pending response | Success | Preserve the endpoint's no-dispatch/ambiguous result |
+| Backend timeout while caller remains live, connection failure, malformed response or other server error | Failure | Preserve uncertainty; may open the breaker |
+| Complete inventory recovery walk | Outside the tenant breaker | Requires complete, identity-consistent inventory |
+
+The caller-cancellation exclusion is applied inside the transport invocation;
+a remote error that merely mentions cancellation cannot request exclusion.
 Placement consumes the outcome and never reconstructs authority by searching
 an arbitrary error tree for a sentinel. A backend wired directly to
 the legacy Go `backend.Backend` interface remains compatible, but every non-nil
@@ -911,6 +929,23 @@ operation's resource authority, and document whether the reservation is
 conservative. The Docker backend implements this (durable `disk_mb` or its
 mutually exclusive pinned diskless scratch). The mock backend returns its
 configured in-memory snapshot, or a zero-valued snapshot when none is set.
+
+## Exact maintenance completion
+
+A terminal restart/update callback carries `maintenance_id` equal to the
+canonical UUIDv4 from its durable request. Persist it with the outbox entry and
+include it in the HMAC-covered body. It accompanies the existing lifecycle URL
+and backend storage identity; it cannot replace either authority. Include it on
+the exact `success` or `failed` completion only. A later autonomous runtime
+failure must omit it, including the separate runtime observation paired with a
+successful maintenance receipt.
+
+For updates, HTTP acceptance retains pending desired bytes. Fred promotes the
+replay payload only after the matching successful completion; failed/rolled-back
+updates keep the previously committed payload. A callback may arrive before the
+HTTP response, and redelivery must preserve the same ID and outcome. Drain
+pending maintenance and outboxes before upgrading across this protocol addition;
+a legacy callback without the ID cannot establish exact update success.
 
 ## Callback Protocol
 

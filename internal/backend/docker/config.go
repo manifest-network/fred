@@ -117,6 +117,22 @@ type Config struct {
 	// ImagePullTimeout is the timeout for pulling images.
 	ImagePullTimeout time.Duration `yaml:"image_pull_timeout"`
 
+	// ImageMaxSizeMB bounds each image's uncompressed inspected size after a
+	// pull. Docker cannot enforce this bound during layer extraction.
+	ImageMaxSizeMB int64 `yaml:"image_max_size_mb"`
+	// ImageDataPath declares the daemon's actual image content directory. It is
+	// required for containerd snapshotters, whose store can be outside DockerRootDir.
+	// Production requires it and DockerRootDir on the same isolated filesystem.
+	ImageDataPath string `yaml:"image_data_path"`
+	// ImageDiskMinFreeMB reserves free space on Docker's data root and each
+	// journal filesystem. Pulls require this floor plus ImageMaxSizeMB; launches
+	// require the floor. Zero selects the 2048 MiB default.
+	ImageDiskMinFreeMB int64 `yaml:"image_disk_min_free_mb"`
+	// ImageGCHighPercent triggers collection of unused, unpinned images;
+	// ImageGCLowPercent is its stop threshold. Zero selects 85/75 percent.
+	ImageGCHighPercent int `yaml:"image_gc_high_percent"`
+	ImageGCLowPercent  int `yaml:"image_gc_low_percent"`
+
 	// StorageAttestationTimeout bounds the full startup storage inventory proof,
 	// including all per-volume substrate checks. Zero selects 30s. Large fleets
 	// can widen this without changing per-request Docker or provisioning limits.
@@ -443,6 +459,10 @@ func DefaultConfig() Config {
 		TotalMemoryMB:                16384,
 		TotalDiskMB:                  102400,
 		ImagePullTimeout:             5 * time.Minute,
+		ImageMaxSizeMB:               10240,
+		ImageDiskMinFreeMB:           2048,
+		ImageGCHighPercent:           85,
+		ImageGCLowPercent:            75,
 		ContainerCreateTimeout:       30 * time.Second,
 		ContainerStartTimeout:        30 * time.Second,
 		ContainerStopTimeout:         defaultContainerStopTimeout,
@@ -590,6 +610,9 @@ func (c *Config) Validate() error {
 
 	if c.ImagePullTimeout <= 0 {
 		return fmt.Errorf("image_pull_timeout must be positive")
+	}
+	if err := c.validateImageCapacity(); err != nil {
+		return err
 	}
 	if c.StorageAttestationTimeout < 0 {
 		return fmt.Errorf("storage_attestation_timeout must not be negative")

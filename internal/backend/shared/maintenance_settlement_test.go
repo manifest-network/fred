@@ -689,6 +689,13 @@ func TestMaintenanceTerminalProofMustBeReissuedAfterReopen(t *testing.T) {
 	entry, err := resolveMaintenanceSuccessForTest(reopened, freshProof)
 	require.NoError(t, err)
 	assert.Equal(t, backend.CallbackStatusSuccess, entry.Status)
+	require.Equal(t, claim.MaintenanceID(), entry.MaintenanceID)
+	wire, err := callbackEntryPayload(entry, claim.BackendStorageID())
+	require.NoError(t, err)
+	var payload backend.CallbackPayload
+	require.NoError(t, json.Unmarshal(wire, &payload))
+	require.Equal(t, claim.MaintenanceID().String(), payload.MaintenanceID,
+		"reopened completion must carry the exact identity in the HMAC-covered body")
 }
 
 func TestMaintenanceActiveProofRejectsLaterSupersession(t *testing.T) {

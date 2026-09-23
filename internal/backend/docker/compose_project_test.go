@@ -984,3 +984,18 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 		)
 	})
 }
+
+func TestBuildComposeProjectFiltersHistoricalReservedLabels(t *testing.T) {
+	params := baseProjectParams()
+	params.Stack.Services["web"].Labels = map[string]string{
+		"app.version":                    "legacy",
+		LabelLeaseUUID:                   "another-lease",
+		"com.docker.compose.project":     "another-project",
+		"traefiK.http.routers.evil.rule": "Host(`victim.example`)",
+	}
+	service := buildComposeProject(params).Services["web"]
+	assert.Equal(t, "legacy", service.Labels["app.version"])
+	assert.Equal(t, params.LeaseUUID, service.Labels[LabelLeaseUUID])
+	assert.NotContains(t, service.Labels, "com.docker.compose.project")
+	assert.NotContains(t, service.Labels, "traefiK.http.routers.evil.rule")
+}

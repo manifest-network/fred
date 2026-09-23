@@ -371,6 +371,59 @@ func TestStart_QuotaReconciliationFailureFailsReadiness(t *testing.T) {
 	assert.Equal(t, 1, quotaCalls)
 }
 
+// A tenant that churns directory entries can make recursive project setup fail
+// with FTW_NS. Correctly tagged roots must allow the actual Start boundary to
+// reach readiness while the concrete XFS manager only reapplies quota limits.
+func TestStart_XFSQuotaTaggedRootIgnoresTenantChurn(t *testing.T) {
+	b, _ := newBackendWithRetention(t)
+	mock, ok := b.docker.(*mockDockerClient)
+	require.True(t, ok)
+	mock.PingFn = func(context.Context) error { return nil }
+	bindTestStorageIdentity(t, b, mock)
+	rs := b.retentionStore
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
+
+	const (
+		leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+		projID    = uint32(4242)
+	)
+	volumeName := retainedName(canonicalVolumeName(leaseUUID, "app", 0))
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
+		OriginalLeaseUUID:   leaseUUID,
+		Tenant:              "tenant-a",
+		ProviderUUID:        nominalDockerProviderUUID,
+		Items:               []backend.LeaseItem{{SKU: "stateful", Quantity: 1, ServiceName: "app"}},
+		ResourceProfiles:    []shared.SKUResourceSnapshot{{SKU: "stateful", CPUCores: 1, MemoryMB: 512, DiskMB: 100}},
+		RetainedVolumeNames: []string{volumeName},
+		Status:              shared.RetentionStatusActive,
+		CreatedAt:           time.Now(),
+	}))
+
+	b.cfg.VolumeDataPath = t.TempDir()
+	dir := filepath.Join(b.cfg.VolumeDataPath, volumeName)
+	require.NoError(t, os.Mkdir(dir, 0o700))
+	require.NoError(t, writeProjectIDFile(dir, projID))
+	manager := newXfsManagerForTest(b.cfg.VolumeDataPath)
+	manager.projectAttributes = fixedXFSProjectAttributeReader{attr: linuxFSXAttr{
+		ProjectID: projID, XFlags: linuxFSXFlagProjInherit,
+	}}
+	logPath := installChurningXFSQuota(t)
+	b.volumes = &mockVolumeManager{
+		ListFn:        func() ([]string, error) { return []string{volumeName}, nil },
+		EnsureQuotaFn: manager.EnsureQuota,
+	}
+	bindRetentionOrphanPrunerForTest(t, b)
+
+	require.NoError(t, b.Start(t.Context()))
+	commands, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.NotContains(t, string(commands), "project -s")
+	assert.Contains(t, string(commands), xfsLimitCmd(projID, "100m", inodeHardFloor))
+}
+
 func TestReconcileVolumeQuotas_UsesPinnedProfilesAfterConfigDrift(t *testing.T) {
 	const (
 		liveLease     = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

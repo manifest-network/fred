@@ -125,6 +125,9 @@ const (
 // so persisting a second derived success bit would create contradictory states
 // without providing rollback compatibility.
 type CallbackEntry struct {
+	// MaintenanceID is present only on the exact maintenance completion, never
+	// on a subsequent runtime-failure observation from that generation.
+	MaintenanceID MaintenanceID `json:"maintenance_id,omitzero"`
 	// DeliveryID identifies this delivery inside its lease's durable v2 queue.
 	// Writers allocate a random UUIDv4; precise storage authority is the lease,
 	// delivery ID, and value digest together.
@@ -554,6 +557,11 @@ func PrepareBoundCallbackStoreStorage(
 }
 
 func validateCallbackStoreBeforeBinding(tx *bolt.Tx) error {
+	if err := visitImagePinsContextTx(context.Background(), tx, func(ImagePin) error {
+		return errors.New("image pins already belong to initialized backend storage")
+	}); err != nil {
+		return err
+	}
 	if err := visitVolumeLaunchDebtsTx(tx, func(volumeLaunchDebtRecord) error {
 		return errors.New("volume launch debt must be settled before storage adoption")
 	}); err != nil {
@@ -648,6 +656,7 @@ func validateCallbackRootBuckets(tx *bolt.Tx) error {
 		string(callbackBucketName):            {},
 		string(storeIdentityBucketName):       {},
 		string(imageInspectionsBucketName):    {},
+		string(imagePinsBucketName):           {},
 		string(volumeLaunchDebtBucketName):    {},
 		string(maintenanceCompensationBucket): {},
 	}
@@ -1493,6 +1502,9 @@ func (s *CallbackStore) HealthyContext(ctx context.Context) error {
 		if err := validateMaintenanceCompensationsContextTx(ctx, tx); err != nil {
 			return err
 		}
+		if err := visitImagePinsContextTx(ctx, tx, nil); err != nil {
+			return err
+		}
 		if err := (&VolumeLaunchJournal{store: s}).validateContextTx(ctx, tx); err != nil {
 			return err
 		}
@@ -1583,6 +1595,10 @@ func validateStoredV2CallbackEntry(entry CallbackEntry, leaseUUID string) error 
 }
 
 func validateCallbackEntrySemantics(entry CallbackEntry) error {
+	if !entry.MaintenanceID.IsZero() &&
+		(!entry.MaintenanceID.Valid() || entry.DeliveryKind != CallbackDeliveryKindMaintenance) {
+		return errors.New("maintenance callback identity requires an exact maintenance delivery")
+	}
 	if entry.BackendStorageID == "" {
 		return fmt.Errorf("callback backend storage identity is required")
 	}

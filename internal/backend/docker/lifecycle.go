@@ -874,7 +874,13 @@ func (d *DockerClient) PullImage(ctx context.Context, imageName string, timeout 
 }
 
 func (d *DockerClient) pullImage(ctx context.Context, imageName string) error {
-	reader, err := d.client.ImagePull(ctx, imageName, image.PullOptions{})
+	return pullImageStream(ctx, d.client, imageName)
+}
+
+func pullImageStream(ctx context.Context, source interface {
+	ImagePull(context.Context, string, image.PullOptions) (io.ReadCloser, error)
+}, imageName string) error {
+	reader, err := source.ImagePull(ctx, imageName, image.PullOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to pull image: %w", err)
 	}
