@@ -154,11 +154,18 @@ func (t *testReconcilerTracker) PayloadStore() *payload.Store {
 // reconstructing a fresh operation URL here would erase the route/generation
 // authority that these tests are meant to preserve.
 func (t *testReconcilerTracker) finishProvisionCallback(delivery integrationCallbackDelivery) bool {
+	result, err := t.applyCallback(delivery)
+	return err == nil && result.OperationOutcome() == placement.CallbackOperationSucceeded
+}
+
+// applyCallback preserves the captured request through either operation
+// settlement or exact maintenance completion, including across provider reopen.
+func (t *testReconcilerTracker) applyCallback(delivery integrationCallbackDelivery) (placement.CallbackResult, error) {
 	if t == nil || t.callbacks == nil || !t.callbackVerifier.Valid() ||
 		t.callbackPath == "" ||
 		delivery.LeaseUUID == "" || delivery.method == "" || delivery.requestURI == "" ||
 		len(delivery.body) == 0 || delivery.signature == "" {
-		return false
+		return placement.CallbackResult{}, errors.New("invalid captured integration callback")
 	}
 	now := time.Now()
 	proof, err := t.callbackVerifier.VerifyRoutedWithTime(
@@ -172,10 +179,9 @@ func (t *testReconcilerTracker) finishProvisionCallback(delivery integrationCall
 		5*time.Minute, time.Minute, now,
 	)
 	if err != nil {
-		return false
+		return placement.CallbackResult{}, err
 	}
-	result, err := t.callbacks.Apply(context.Background(), proof)
-	return err == nil && result.OperationOutcome() == placement.CallbackOperationSucceeded
+	return t.callbacks.Apply(context.Background(), proof)
 }
 
 func configuredIntegrationCallbackPath(t *testing.T, rawBase string) string {
@@ -1561,20 +1567,19 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 	storedPayload, err := env.tracker.store.Get(leaseUUID)
 	require.NoError(t, err)
 	assert.Equal(t, payloadV1, storedPayload,
-		"the provider must not overwrite desired state until acceptance is recoverable")
+		"the provider must not overwrite committed payload before exact successful completion")
 	providerRecord, found, err := env.placementStore.LookupMaintenanceCommand(
 		leaseUUID, maintenanceID,
 	)
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, placement.MaintenanceOutcomePending, providerRecord.Outcome())
-	select {
-	case cb := <-env.callbackCh:
-		require.Equal(t, leaseUUID, cb.LeaseUUID)
-		require.Equal(t, backend.CallbackStatusSuccess, cb.Status, "update should succeed")
-	case <-time.After(2 * time.Minute):
-		t.Fatal("timeout waiting for update success callback")
-	}
+	// Capture the real signed completion but delay provider application until
+	// after reopen and acceptance replay. HTTP acceptance alone must never
+	// promote the payload, even when Docker has already finished the update.
+	maintenanceDelivery := waitForCallbackDelivery(t, env.callbackCh, leaseUUID, 2*time.Minute)
+	require.Equal(t, backend.CallbackStatusSuccess, maintenanceDelivery.Status, "update should succeed")
+	require.Equal(t, maintenanceID.String(), maintenanceDelivery.MaintenanceID)
 
 	waitForProvisionStatus(t, env.backend, leaseUUID, backend.ProvisionStatusReady, 60*time.Second)
 	requestAuthority, err := env.backend.maintenanceSettlement.NewMaintenanceRequestAuthority(
@@ -1635,8 +1640,24 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 		"restart recovery must replay the exact command through the backend boundary")
 	storedPayload, err = env.tracker.store.Get(leaseUUID)
 	require.NoError(t, err)
-	assert.Equal(t, payloadV2, storedPayload,
-		"exact backend replay must authorize the provider payload commit")
+	require.Equal(t, payloadV1, storedPayload,
+		"exact acceptance replay must still await the signed execution completion")
+	providerRecord, found, err = reopenedPlacement.LookupMaintenanceCommand(
+		leaseUUID, maintenanceID,
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, placement.MaintenanceOutcomePending, providerRecord.Outcome())
+	completion, err := env.tracker.applyCallback(maintenanceDelivery)
+	require.NoError(t, err)
+	require.Equal(t, placement.CallbackLifecycleApplied, completion.LifecycleOutcome())
+	require.NoError(t, recoveredMaintenance.RecoverPending(ctx))
+	assert.Equal(t, 2, lostResponseBackend.updateCount(),
+		"confirmed completion must finish locally without another backend dispatch")
+	storedPayload, err = env.tracker.store.Get(leaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, payloadV2, storedPayload,
+		"only the exact signed success may authorize the provider payload commit")
 	providerRecord, found, err = reopenedPlacement.LookupMaintenanceCommand(
 		leaseUUID, maintenanceID,
 	)
