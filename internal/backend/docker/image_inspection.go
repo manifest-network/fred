@@ -36,8 +36,21 @@ type imageInspectionCoordinator struct {
 	authority func() error
 	fence     func(string, error) error
 	mu        sync.Mutex
-	active    map[string]struct{}
+	active    map[string]imageInspectionOwnership
 }
+
+// These states are minted only by the receipt owner. A live content helper may
+// coexist with image admission after its Create completion is durable; probes
+// and recovery retain exclusive accounting until their receipts are removed.
+type imageInspectionOwnership interface{ ownsImageInspection() }
+
+type contentInspectionCreating struct{ changed chan struct{} }
+type contentInspectionReady struct{ receipt shared.ImageInspectionReceipt }
+type exclusiveImageInspection struct{}
+
+func (*contentInspectionCreating) ownsImageInspection() {}
+func (contentInspectionReady) ownsImageInspection()     {}
+func (exclusiveImageInspection) ownsImageInspection()   {}
 
 func newImageInspectionCoordinator(
 	client *DockerClient,
@@ -65,7 +78,7 @@ func newImageInspectionCoordinator(
 	c := &imageInspectionCoordinator{
 		journal: journal, creator: client.creator, observer: client.launchObserver, sdk: client.client,
 		lifetime: lifetime, authorize: authorize, complete: complete, resolve: resolve, authority: authority, fence: fence,
-		active: make(map[string]struct{}),
+		active: make(map[string]imageInspectionOwnership),
 	}
 	client.inspections = c
 	return c, nil
@@ -121,28 +134,54 @@ func (d *DockerClient) verifyImageUnpacked(ctx context.Context, image imageexec.
 	return session.close()
 }
 
-// requireImageInspectionsSettled prevents a new containerd import allowance
-// from overlapping helper work whose cleanup or daemon completion is still
-// unknown. The durable journal keeps this exclusion effective after restart;
+// requireImageInspectionsSettled waits for a live content helper's Create to
+// settle, then permits its owned read session to coexist with image admission.
+// Abandoned or uncertain work retains its durable exclusion after restart;
 // empty daemon inventory alone cannot settle a response-lost Create.
-func (d *DockerClient) requireImageInspectionsSettled() error {
+func (d *DockerClient) requireImageInspectionsSettled(ctx context.Context) error {
 	if d.inspections == nil {
 		return errors.New("docker image inspection owner is not bound")
 	}
 	c := d.inspections
-	if err := errors.Join(c.authority(), c.lifetime.Err()); err != nil {
-		return err
+	for {
+		if err := errors.Join(ctx.Err(), c.authority(), c.lifetime.Err()); err != nil {
+			return err
+		}
+		changed, err := c.admissionWait()
+		if err != nil || changed == nil {
+			return err
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.lifetime.Done():
+			return c.lifetime.Err()
+		}
 	}
+}
+
+func (c *imageInspectionCoordinator) admissionWait() (<-chan struct{}, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	receipts, err := c.journal.List()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if len(receipts) != 0 {
-		return errors.New("image inspection completion or cleanup remains pending")
+	var changed <-chan struct{}
+	for _, receipt := range receipts {
+		switch ownership := c.active[receipt.ID()].(type) {
+		case contentInspectionReady:
+			if ownership.receipt.CreationSettled() && receipt.CreationSettled() {
+				continue
+			}
+		case *contentInspectionCreating:
+			changed = ownership.changed
+			continue
+		}
+		return nil, errors.New("image inspection completion or cleanup remains pending")
 	}
-	return nil
+	return changed, nil
 }
 
 func inspectionCreateConfig(image imageexec.Image, receipt shared.ImageInspectionReceipt, purpose imageInspectionPurpose) (*container.Config, *container.HostConfig) {
@@ -202,7 +241,11 @@ func (c *imageInspectionCoordinator) openFor(ctx context.Context, image imageexe
 					c.mu.Lock()
 					receipt, reserveErr := c.journal.Reserve(prepared)
 					if reserveErr == nil {
-						c.active[receipt.ID()] = struct{}{}
+						if purpose == imageContentInspection {
+							c.active[receipt.ID()] = &contentInspectionCreating{changed: make(chan struct{})}
+						} else {
+							c.active[receipt.ID()] = exclusiveImageInspection{}
+						}
 						s.receipt = receipt
 					}
 					c.mu.Unlock()
@@ -223,7 +266,7 @@ func (c *imageInspectionCoordinator) openFor(ctx context.Context, image imageexe
 				if err := c.resolve(shared.ImageInspectionCreationStep, step); err != nil {
 					return errors.Join(outcome.err, err)
 				}
-				settled, err := c.journal.RecordCreationSettled(s.receipt, response.ID, completed)
+				settled, err := c.recordCreationSettled(s.receipt, response.ID, completed)
 				if err != nil {
 					return errors.Join(outcome.err, err)
 				}
@@ -334,8 +377,25 @@ func (s *imageInspectionSession) close() error {
 
 func (c *imageInspectionCoordinator) release(id string) {
 	c.mu.Lock()
+	if creating, ok := c.active[id].(*contentInspectionCreating); ok {
+		close(creating.changed)
+	}
 	delete(c.active, id)
 	c.mu.Unlock()
+}
+
+func (c *imageInspectionCoordinator) recordCreationSettled(receipt shared.ImageInspectionReceipt, id string, completed substratemutation.CompletedStep) (shared.ImageInspectionReceipt, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	settled, err := c.journal.RecordCreationSettled(receipt, id, completed)
+	if err != nil {
+		return shared.ImageInspectionReceipt{}, err
+	}
+	if creating, ok := c.active[receipt.ID()].(*contentInspectionCreating); ok {
+		c.active[receipt.ID()] = contentInspectionReady{receipt: settled}
+		close(creating.changed)
+	}
+	return settled, nil
 }
 
 // inspectionRecoveryReport describes independently retained helper obligations.
@@ -401,7 +461,7 @@ func (c *imageInspectionCoordinator) Recover(ctx context.Context) (inspectionRec
 	if err == nil {
 		for _, receipt := range receipts {
 			if _, busy := c.active[receipt.ID()]; !busy {
-				c.active[receipt.ID()] = struct{}{}
+				c.active[receipt.ID()] = exclusiveImageInspection{}
 				claimed = append(claimed, receipt)
 			}
 		}

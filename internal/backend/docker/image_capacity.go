@@ -278,7 +278,7 @@ func (m *imageCapacityManager) prepare(ctx context.Context, mutations *storageMu
 		if err := requireBoundedImageStore(info); err != nil {
 			return imageexec.Image{}, err
 		}
-		if err := m.docker.requireImageInspectionsSettled(); err != nil {
+		if err := m.docker.requireImageInspectionsSettled(ctx); err != nil {
 			return imageexec.Image{}, err
 		}
 	}

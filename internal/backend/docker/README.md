@@ -858,6 +858,10 @@ image `VOLUME` paths with tmpfs. Unknown Create completion fences the current
 storage authority; durable pending helper receipts exclude later containerd
 ingestion across restart until the normal helper protocol or
 [offline repair](../../../OPERATIONS.md#unsettled-docker-effects) settles them.
+Within a live process, typed content-helper ownership lets admission wait for
+creation to settle durably, then coexist with the helper's read session. Probe
+and recovery ownership remain exclusive, and releasing an unresolved helper
+never grants that sharing permission.
 
 ### Stack Provisioning
 

@@ -18,7 +18,7 @@ import (
 func TestImageUnpackProbeOwnsStoppedSafeContainer(t *testing.T) {
 	h := newInspectionHarness(t)
 	h.execute(t, func(ctx context.Context, origin shared.ImageInspectionOrigin) error {
-		require.NoError(t, h.client.requireImageInspectionsSettled())
+		require.NoError(t, h.client.requireImageInspectionsSettled(t.Context()))
 		err := h.client.verifyImageUnpacked(ctx, h.image, origin)
 		require.NoError(t, err)
 		return err
@@ -45,7 +45,7 @@ func TestImageUnpackProbeOwnsStoppedSafeContainer(t *testing.T) {
 	assert.Equal(t, []string{"ALL"}, []string(host.CapDrop))
 	assert.Equal(t, []string{"no-new-privileges:true"}, host.SecurityOpt)
 	assert.Equal(t, container.RestartPolicyDisabled, host.RestartPolicy.Name)
-	require.NoError(t, h.client.requireImageInspectionsSettled())
+	require.NoError(t, h.client.requireImageInspectionsSettled(t.Context()))
 }
 
 func TestImageUnpackProbeRejectsForeignAdmissionBeforeJournalOrCreate(t *testing.T) {
@@ -56,7 +56,7 @@ func TestImageUnpackProbeRejectsForeignAdmissionBeforeJournalOrCreate(t *testing
 		return err
 	})
 	assert.Zero(t, h.daemon.creates)
-	require.NoError(t, h.client.requireImageInspectionsSettled())
+	require.NoError(t, h.client.requireImageInspectionsSettled(t.Context()))
 }
 
 func TestImageUnpackProbeDrainsAdmittedCreateAfterWorkCancellation(t *testing.T) {
@@ -73,7 +73,7 @@ func TestImageUnpackProbeDrainsAdmittedCreateAfterWorkCancellation(t *testing.T)
 	assert.Equal(t, 1, h.daemon.removes)
 	assert.Empty(t, h.daemon.containers)
 	require.NoError(t, h.backend.terminalStorageAuthorityError())
-	require.NoError(t, h.client.requireImageInspectionsSettled())
+	require.NoError(t, h.client.requireImageInspectionsSettled(t.Context()))
 }
 
 func TestImageUnpackProbeUnknownCreateFencesUntilDurableRecovery(t *testing.T) {
@@ -86,21 +86,21 @@ func TestImageUnpackProbeUnknownCreateFencesUntilDurableRecovery(t *testing.T) {
 		return err
 	})
 	require.ErrorIs(t, h.backend.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous)
-	require.Error(t, h.client.requireImageInspectionsSettled())
+	require.Error(t, h.client.requireImageInspectionsSettled(t.Context()))
 	assert.Zero(t, h.daemon.removes)
 	h.reopen(t)
 	require.NoError(t, h.backend.terminalStorageAuthorityError())
-	require.ErrorContains(t, h.client.requireImageInspectionsSettled(), "remains pending")
+	require.ErrorContains(t, h.client.requireImageInspectionsSettled(t.Context()), "remains pending")
 	report, err := h.owner.Recover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, report.pending, 1, "empty inventory cannot prove deferred daemon unpack ended")
-	require.Error(t, h.client.requireImageInspectionsSettled())
+	require.Error(t, h.client.requireImageInspectionsSettled(t.Context()))
 	h.daemon.containers[h.daemon.late.ID] = *h.daemon.late
 	report, err = h.owner.Recover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, report.pending, 1, "observing one late helper cannot settle a response-lost request")
 	assert.Empty(t, h.daemon.containers)
-	require.Error(t, h.client.requireImageInspectionsSettled())
+	require.Error(t, h.client.requireImageInspectionsSettled(t.Context()))
 }
 
 func TestImageUnpackProbeSettledFailureCannotProveUnpack(t *testing.T) {
@@ -114,7 +114,7 @@ func TestImageUnpackProbeSettledFailureCannotProveUnpack(t *testing.T) {
 	assert.Equal(t, 1, h.daemon.creates)
 	assert.Equal(t, 1, h.daemon.removes)
 	require.NoError(t, h.backend.terminalStorageAuthorityError(), "a completed daemon rejection is retryable")
-	require.NoError(t, h.client.requireImageInspectionsSettled())
+	require.NoError(t, h.client.requireImageInspectionsSettled(t.Context()))
 }
 
 func TestImageUnpackProbeCleanupFailureExcludesNextImportAcrossRestart(t *testing.T) {
@@ -125,12 +125,12 @@ func TestImageUnpackProbeCleanupFailureExcludesNextImportAcrossRestart(t *testin
 		require.ErrorContains(t, err, "remove unavailable")
 		return err
 	})
-	require.Error(t, h.client.requireImageInspectionsSettled())
+	require.Error(t, h.client.requireImageInspectionsSettled(t.Context()))
 	h.reopen(t)
-	require.Error(t, h.client.requireImageInspectionsSettled())
+	require.Error(t, h.client.requireImageInspectionsSettled(t.Context()))
 	h.daemon.removeErr = nil
 	report, err := h.owner.Recover(t.Context())
 	require.NoError(t, err)
 	assert.Empty(t, report.pending)
-	require.NoError(t, h.client.requireImageInspectionsSettled())
+	require.NoError(t, h.client.requireImageInspectionsSettled(t.Context()))
 }

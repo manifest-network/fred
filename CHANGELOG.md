@@ -1477,8 +1477,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   restarts, while observed terminal failures settle their allocation.
   Containerd admission proves extraction with a stopped, journal-owned probe
   before pinning or use, and legacy pins acquire their verified allowance by
-  exact-digest ingestion. Unsettled helper receipts prevent further containerd
-  ingestion. Containerd image storage requires an explicit `image_data_path`
+  exact-digest ingestion. Admission waits for live content-helper creation and
+  permits settled read sessions to coexist; abandoned or uncertain helper
+  receipts prevent further containerd ingestion. Containerd image storage
+  requires an explicit `image_data_path`
   (ENG-1052).
 
 - Log retrieval now admits one materialized response per daemon, holding its
