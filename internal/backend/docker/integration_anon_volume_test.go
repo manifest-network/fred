@@ -99,7 +99,7 @@ func TestIntegration_Docker_ComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
 	}
-	project := buildComposeProject(params)
+	project := buildTestComposeProject(t, params)
 	svc := project.Services["web"]
 	svc.Volumes = append(svc.Volumes, composetypes.ServiceVolumeConfig{
 		Type:   "volume",
@@ -309,7 +309,7 @@ func TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFail
 	params.VolBinds = map[string]map[int]serviceVolBinds{
 		"web": {0: {StatefulBinds: map[string]string{tenantDir: "/data"}}},
 	}
-	project := buildComposeProject(params)
+	project := buildTestComposeProject(t, params)
 	svc := project.Services["web"]
 	// Force the anonymous volume an uncovered image VOLUME would produce.
 	svc.Volumes = append(svc.Volumes, composetypes.ServiceVolumeConfig{

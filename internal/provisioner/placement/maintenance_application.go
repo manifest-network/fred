@@ -141,6 +141,7 @@ func (authority *MaintenanceCoordinator) Application(
 	if err := application.rehydrate(); err != nil {
 		return nil, err
 	}
+	application.observePending()
 	return application, nil
 }
 
@@ -202,6 +203,7 @@ func (application *MaintenanceApplication) Execute(
 	if !application.Valid() || !input.valid() {
 		return maintenanceApplicationResult(MaintenanceApplicationInternalFailure, ErrInvalidMaintenanceCommand)
 	}
+	defer application.observePending()
 	record, found, err := application.coordinator.lookupMaintenanceCommand(input.leaseUUID, input.id)
 	if err != nil {
 		return maintenanceApplicationResult(MaintenanceApplicationServiceUnavailable, err)
@@ -228,11 +230,12 @@ func (application *MaintenanceApplication) Execute(
 		}
 	}
 
+	completionChanged := application.coordinator.coordinator.store.completionCheckpoint()
 	held, acquired := application.acquire(input.leaseUUID, input.id)
 	if held == nil {
 		return maintenanceApplicationResult(MaintenanceApplicationAlreadyInProgress, nil)
 	}
-	defer held.dispatchMu.Unlock()
+	defer func() { held.dispatchMu.Unlock(); completionChanged() }()
 
 	record, found, err = application.coordinator.lookupMaintenanceCommand(input.leaseUUID, input.id)
 	if err != nil {
@@ -628,6 +631,7 @@ func (application *MaintenanceApplication) RecoverPending(ctx context.Context) e
 		return nil
 	}
 	defer application.recoveryMu.Unlock()
+	defer application.observePending()
 	if err := application.releaseSettled(); err != nil {
 		return fmt.Errorf("release durably settled maintenance claims: %w", err)
 	}
@@ -672,6 +676,7 @@ func (application *MaintenanceApplication) RecoverPending(ctx context.Context) e
 				result.lastKey = maintenanceRecoveryKey(entry.claim)
 				// A live request may own the command after selection. Its dispatch
 				// remains exclusive; a later recovery batch can revisit it.
+				completionChanged := application.coordinator.coordinator.store.completionCheckpoint()
 				if !entry.held.dispatchMu.TryLock() {
 					continue
 				}
@@ -694,6 +699,7 @@ func (application *MaintenanceApplication) RecoverPending(ctx context.Context) e
 					}
 				}
 				entry.held.dispatchMu.Unlock()
+				completionChanged()
 				if recoverErr != nil {
 					result.errs = append(result.errs, fmt.Errorf("recover maintenance %s for lease %s: %w", command.ID(), command.LeaseUUID(), recoverErr))
 				}

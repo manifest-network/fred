@@ -69,7 +69,7 @@ type filesystemCapacity interface {
 }
 
 type localFilesystemCapacity struct{}
-type diskCapacity struct{ total, available, device, blockBytes uint64 }
+type diskCapacity struct{ total, available, blockBytes uint64 }
 
 func (localFilesystemCapacity) capacity(path string) (diskCapacity, error) {
 	var stat unix.Statfs_t
@@ -79,11 +79,7 @@ func (localFilesystemCapacity) capacity(path string) (diskCapacity, error) {
 	if stat.Bsize <= 0 || stat.Blocks == 0 || stat.Blocks > math.MaxUint64/uint64(stat.Bsize) {
 		return diskCapacity{}, fmt.Errorf("invalid filesystem capacity for %s", path)
 	}
-	var identity unix.Stat_t
-	if err := unix.Stat(path, &identity); err != nil {
-		return diskCapacity{}, err
-	}
-	return diskCapacity{total: stat.Blocks * uint64(stat.Bsize), available: stat.Bavail * uint64(stat.Bsize), device: identity.Dev, blockBytes: uint64(stat.Bsize)}, nil
+	return diskCapacity{total: stat.Blocks * uint64(stat.Bsize), available: stat.Bavail * uint64(stat.Bsize), blockBytes: uint64(stat.Bsize)}, nil
 }
 
 func (d diskCapacity) usage() int {
@@ -93,24 +89,37 @@ func (d diskCapacity) usage() int {
 	return int(100 * (1 - float64(d.available)/float64(d.total)))
 }
 
-// imageCapacityManager serializes pulls, pin publication and GC. A collector
-// can never remove the just-pulled image in the interval before its pin commits.
-// Its disk checks also cover the filesystems housing all control journals.
+// imageCapacityManager owns short allocation/publication critical sections.
+// Active admissions exclude collection, but never hold its gate across registry
+// I/O or Docker import. Durable loader debits preserve that exclusion on crash.
 type imageCapacityManager struct {
-	daemon    imageCacheDaemon
-	runtime   *imageexec.Admitter
-	loader    *imagefetch.Loader
-	docker    *DockerClient
-	stageRoot string
-	pins      *shared.ImagePinJournal
-	fs        filesystemCapacity
-	cfg       Config
-	gate      chan struct{}
-	owner     *imageCacheOwnership
-	access    imageCacheParticipation
+	daemon     imageCacheDaemon
+	runtime    *imageexec.Admitter
+	loader     *imagefetch.Loader
+	docker     *DockerClient
+	stageRoot  string
+	pins       *shared.ImagePinJournal
+	backfiller *shared.ImagePinBackfiller
+	fs         filesystemCapacity
+	cfg        Config
+	gate       chan struct{}
+	owner      *imageCacheOwnership
+	access     imageCacheParticipation
+	active     int
+	staging    int64
+	probing    int64
+	stageSlots chan struct{}
+	probeGate  chan struct{}
 }
 
 func newImageCapacityManager(ctx context.Context, b *Backend, docker *DockerClient) (*imageCapacityManager, error) {
+	info, err := docker.client.Info(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireBoundedImageStore(info); err != nil {
+		return nil, err
+	}
 	pins, err := shared.NewImagePinJournal(b.callbackStore, b.releaseStore, b.retentionStore)
 	if err != nil {
 		return nil, err
@@ -118,6 +127,7 @@ func newImageCapacityManager(ctx context.Context, b *Backend, docker *DockerClie
 	manager := &imageCapacityManager{
 		daemon: docker.client, runtime: docker.images, docker: docker, pins: pins,
 		fs: localFilesystemCapacity{}, cfg: b.cfg, gate: make(chan struct{}, 1),
+		stageSlots: make(chan struct{}, 4), probeGate: make(chan struct{}, 1),
 	}
 	if manager.cfg.ProductionMode {
 		if err := manager.checkFilesystems(ctx, false, false); err != nil {
@@ -148,7 +158,13 @@ func newImageCapacityManager(ctx context.Context, b *Backend, docker *DockerClie
 	if err := manager.loader.CleanupAbandoned(); err != nil {
 		return nil, fmt.Errorf("recover image staging: %w", err)
 	}
-	if _, err := manager.loader.PendingBytes(); err != nil {
+	pending, err := manager.loader.PendingBytes()
+	if err != nil {
+		return nil, err
+	}
+	imageImportPendingBytes.Set(float64(pending))
+	manager.backfiller, err = newImagePinBackfiller(b, docker, pins)
+	if err != nil {
 		return nil, err
 	}
 	return manager, nil
@@ -212,7 +228,7 @@ func (m *imageCapacityManager) checkFilesystems(ctx context.Context, pulling, ch
 	}
 	var pending int64
 	if m.loader != nil {
-		pending, err = m.loader.PendingBytes()
+		pending, err = m.loader.UnknownBytes()
 		if err != nil {
 			return err
 		}
@@ -266,10 +282,12 @@ func (m *imageCapacityManager) selectedPin(mutations *storageMutations, ref stri
 }
 
 func (m *imageCapacityManager) prepare(ctx context.Context, mutations *storageMutations, ref string, pull bool) (imageexec.Image, error) {
-	if err := m.lock(ctx); err != nil {
+	admission, err := m.beginAdmission(ctx, mutations, ref)
+	if err != nil {
 		return imageexec.Image{}, err
 	}
-	defer m.unlock()
+	defer admission.close()
+	pin := admission.state.pin
 	info, err := m.daemon.Info(ctx)
 	if err != nil {
 		return imageexec.Image{}, err
@@ -278,33 +296,42 @@ func (m *imageCapacityManager) prepare(ctx context.Context, mutations *storageMu
 		if err := requireBoundedImageStore(info); err != nil {
 			return imageexec.Image{}, err
 		}
-		if err := m.docker.requireImageInspectionsSettled(ctx); err != nil {
-			return imageexec.Image{}, err
-		}
-	}
-	if err := m.collect(ctx); err != nil {
-		return imageexec.Image{}, err
-	}
-	pin, err := m.selectedPin(mutations, ref)
-	if err != nil {
-		return imageexec.Image{}, err
 	}
 	resolved, err := m.resolveImage(ctx, ref, pin, pull)
 	if err != nil {
 		return imageexec.Image{}, err
 	}
 	if daemonUsesContainerd(info) {
-		if err := m.importHeadroom(ctx, resolved.importBytes); err != nil {
-			return imageexec.Image{}, err
-		}
-		if err := m.docker.verifyImageUnpacked(ctx, resolved.image, mutations.inspectionOrigin); err != nil {
+		if err := m.verifyUnpacked(ctx, mutations.inspectionOrigin, resolved); err != nil {
 			return imageexec.Image{}, err
 		}
 	}
+	if err := m.lock(ctx); err != nil {
+		return imageexec.Image{}, err
+	}
+	defer m.unlock()
 	if err := m.pins.Pin(mutations.inspectionOrigin, ref, resolved.image.ID(), resolved.pullDigest, resolved.image.Platform(), resolved.importBytes); err != nil {
 		return imageexec.Image{}, err
 	}
 	return resolved.image, nil
+}
+
+func (m *imageCapacityManager) verifyUnpacked(ctx context.Context, origin shared.ImageInspectionOrigin, resolved resolvedImage) error {
+	select {
+	case m.probeGate <- struct{}{}:
+		defer func() { <-m.probeGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := m.docker.requireImageInspectionsSettled(ctx); err != nil {
+		return err
+	}
+	allocation, err := m.reserveUnpack(ctx, resolved.importBytes)
+	if err != nil {
+		return err
+	}
+	defer allocation.close()
+	return m.docker.verifyImageUnpacked(ctx, resolved.image, origin)
 }
 
 // resolvedImage keeps verified allocation evidence with the exact local image.
@@ -325,7 +352,7 @@ func (m *imageCapacityManager) resolveImage(ctx context.Context, ref string, pin
 		resolved.image, err = m.runtime.ReAdmit(ctx, pin.ImageID, pin.Platform, ref)
 		resolved.pullDigest, resolved.importBytes = pin.PullDigest, pin.ImportBytes
 		if err != nil && errdefs.IsNotFound(err) && pin.PullDigest != "" {
-			resolved, err = m.ingest(ctx, ref, pin.PullDigest)
+			resolved, err = m.ingestRecovery(ctx, ref, pin)
 			if err == nil && (resolved.image.ID() != pin.ImageID || !platforms.OnlyStrict(pin.Platform).Match(resolved.image.Platform())) {
 				return resolvedImage{}, errors.New("imported image differs from the pinned execution identity")
 			}
@@ -349,16 +376,8 @@ func (m *imageCapacityManager) resolveImage(ctx context.Context, ref string, pin
 	if err != nil {
 		return resolvedImage{}, err
 	}
-	if inspection.Size < 0 || inspection.Size > m.cfg.ImageMaxSizeMB*imageMiB {
-		// A pinned image belongs to another restorable generation and must not
-		// be destroyed if the operator has since lowered the admission cap.
-		if pin == nil {
-			inventory, pinErr := m.pins.Collect(ctx)
-			if pinErr == nil && m.owner != nil {
-				_ = m.owner.remove(ctx, inventory, resolved.image.ID())
-			}
-		}
-		return resolvedImage{}, fmt.Errorf("image size %d exceeds image_max_size_mb %d", inspection.Size, m.cfg.ImageMaxSizeMB)
+	if inspection.Size < 0 {
+		return resolvedImage{}, errors.New("docker returned a negative image size")
 	}
 	if err := m.headroom(ctx, false); err != nil {
 		return resolvedImage{}, err
@@ -374,7 +393,8 @@ func (m *imageCapacityManager) resolveImage(ctx context.Context, ref string, pin
 		if resolved.pullDigest == "" {
 			return resolvedImage{}, errors.New("legacy containerd image needs an immutable repository digest for bounded extraction")
 		}
-		verified, err := m.ingest(ctx, ref, resolved.pullDigest)
+		recoveryPin := &shared.ImagePin{ImageID: resolved.image.ID(), PullDigest: resolved.pullDigest, Platform: resolved.image.Platform(), ImportBytes: resolved.importBytes}
+		verified, err := m.ingestRecovery(ctx, ref, recoveryPin)
 		if err != nil {
 			return resolvedImage{}, err
 		}
@@ -390,9 +410,45 @@ func (m *imageCapacityManager) resolveImage(ctx context.Context, ref string, pin
 // writes. The loader owns the exact verified bytes; Docker never re-fetches
 // content from a tenant-controlled registry after validation.
 func (m *imageCapacityManager) ingest(ctx context.Context, original, source string) (resolvedImage, error) {
-	if err := m.headroom(ctx, true); err != nil {
+	return m.ingestBounded(ctx, original, source, m.loader, m.cfg.ImageMaxSizeMB*imageMiB)
+}
+
+// Recovery has already selected a durable immutable identity. Its verification
+// budget follows that admission's saved bound, never a subsequently lowered
+// new-image policy. Legacy rows use a finite budget derived from host capacity.
+func (m *imageCapacityManager) ingestRecovery(ctx context.Context, original string, pin *shared.ImagePin) (resolvedImage, error) {
+	budget := pin.ImportBytes
+	if budget == 0 {
+		paths, err := m.paths(ctx)
+		if err != nil {
+			return resolvedImage{}, err
+		}
+		pending, err := m.loader.PendingBytes()
+		if err != nil {
+			return resolvedImage{}, err
+		}
+		budget = math.MaxInt64 / 8
+		floor := m.cfg.ImageDiskMinFreeMB * imageMiB
+		for _, path := range paths {
+			space, err := m.fs.capacity(path)
+			if err != nil {
+				return resolvedImage{}, err
+			}
+			if uint64(floor) > space.available || uint64(pending) > space.available-uint64(floor) {
+				return resolvedImage{}, errors.New("no headroom for bounded legacy image recovery")
+			}
+			// One staging allowance plus a two-allowance peak import ceiling.
+			budget = min(budget, int64(min(uint64(math.MaxInt64), space.available-uint64(floor)-uint64(pending)))/3)
+		}
+	}
+	loader, err := m.loader.WithBudget(budget)
+	if err != nil {
 		return resolvedImage{}, err
 	}
+	return m.ingestBounded(ctx, original, pin.PullDigest, loader, budget)
+}
+
+func (m *imageCapacityManager) ingestBounded(ctx context.Context, original, source string, loader *imagefetch.Loader, budget int64) (resolvedImage, error) {
 	info, err := m.daemon.Info(ctx)
 	if err != nil {
 		return resolvedImage{}, err
@@ -400,21 +456,49 @@ func (m *imageCapacityManager) ingest(ctx context.Context, original, source stri
 	if err := requireBoundedImageStore(info); err != nil {
 		return resolvedImage{}, err
 	}
-	prepared, err := m.loader.Prepare(ctx, source, daemonImagePlatform(info))
+	if err := m.requireSettledHelpers(ctx, info); err != nil {
+		return resolvedImage{}, err
+	}
+	resolution, err := loader.Resolve(ctx, source, daemonImagePlatform(info))
+	if err != nil {
+		return resolvedImage{}, fmt.Errorf("resolve immutable image: %w", err)
+	}
+	if cached, ok, err := m.cachedImage(ctx, original, resolution); err != nil || ok {
+		return cached, err
+	}
+	// Classic Docker has already extracted locally available content. Looking
+	// up the resolved digest reuses it without importing mutable tag content.
+	if !daemonUsesContainerd(info) {
+		local, localErr := m.runtime.Admit(ctx, resolution.SourceReference())
+		if localErr == nil {
+			inspection, err := m.daemon.ImageInspect(ctx, local.ID())
+			if err != nil {
+				return resolvedImage{}, err
+			}
+			if inspection.Size < 0 || inspection.Size > budget {
+				return resolvedImage{}, errors.New("new image exceeds image_max_size_mb")
+			}
+			admitted, err := m.runtime.ReAdmit(ctx, local.ID(), local.Platform(), original)
+			return resolvedImage{image: admitted, pullDigest: resolution.SourceReference()}, err
+		}
+	}
+	staging, err := m.reserveStaging(ctx, budget)
+	if err != nil {
+		return resolvedImage{}, err
+	}
+	defer staging.close()
+	prepared, err := loader.PrepareResolved(ctx, resolution)
 	if err != nil {
 		return resolvedImage{}, fmt.Errorf("prepare bounded image: %w", err)
 	}
 	defer func() { _ = prepared.Close() }()
-	if err := m.access.verify(ctx); err != nil {
+	admission, err := m.reserveImport(ctx, loader, prepared)
+	if err != nil {
 		return resolvedImage{}, err
 	}
-	if err := m.headroom(ctx, false); err != nil {
-		return resolvedImage{}, err
-	}
-	if err := m.importHeadroom(ctx, prepared.ImportBytes()); err != nil {
-		return resolvedImage{}, err
-	}
-	loaded, err := m.loader.Import(ctx, prepared)
+	defer m.observeImportDebit()
+	defer func() { _ = admission.Close() }()
+	loaded, err := loader.ImportAdmitted(ctx, admission)
 	if err != nil {
 		return resolvedImage{}, err
 	}
@@ -426,6 +510,95 @@ func (m *imageCapacityManager) ingest(ctx context.Context, original, source stri
 	return resolvedImage{image: admitted, pullDigest: loaded.SourceReference(), importBytes: prepared.ImportBytes()}, err
 }
 
+// cachedImage reuses only exact immutable content vouched for by an existing
+// pin. A tag-resolution capability chooses the lookup; arbitrary caller IDs
+// cannot manufacture a host-wide verification record.
+func (m *imageCapacityManager) cachedImage(ctx context.Context, original string, resolution imagefetch.Resolution) (resolvedImage, bool, error) {
+	pins, err := m.pins.List()
+	if err != nil {
+		return resolvedImage{}, false, err
+	}
+	for _, pin := range pins {
+		if pin.ImportBytes == 0 || pin.PullDigest != resolution.SourceReference() || !platforms.OnlyStrict(resolution.Platform()).Match(pin.Platform) {
+			continue
+		}
+		admitted, err := m.runtime.ReAdmit(ctx, pin.ImageID, pin.Platform, original)
+		if errdefs.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return resolvedImage{}, false, err
+		}
+		return resolvedImage{image: admitted, pullDigest: pin.PullDigest, importBytes: pin.ImportBytes}, true, nil
+	}
+	return resolvedImage{}, false, nil
+}
+
+// reserveImport atomically checks all outstanding allocations and publishes
+// this import's durable debit. ImageLoad runs after the gate is released.
+func (m *imageCapacityManager) reserveImport(ctx context.Context, loader *imagefetch.Loader, prepared *imagefetch.Prepared) (*imagefetch.ImportAdmission, error) {
+	if err := m.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer m.unlock()
+	if err := m.access.verify(ctx); err != nil {
+		return nil, err
+	}
+	info, err := m.daemon.Info(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.snapshotSettledHelpers(ctx, info); err != nil {
+		return nil, err
+	}
+	if err := m.headroom(ctx, false); err != nil {
+		return nil, err
+	}
+	if err := m.importHeadroom(ctx, prepared.ImportBytes()); err != nil {
+		return nil, err
+	}
+	admission, err := loader.ReserveImport(ctx, prepared)
+	m.observeImportDebit()
+	return admission, err
+}
+
+func (m *imageCapacityManager) requireSettledHelpers(ctx context.Context, info system.Info) error {
+	if !daemonUsesContainerd(info) {
+		return nil
+	}
+	return m.docker.requireImageInspectionsSettled(ctx)
+}
+
+// snapshotSettledHelpers never waits while an allocation/GC gate is owned.
+// A live creator may finish after this snapshot; callers can wait for it before
+// reacquiring the gate, while unknown receipts remain a conservative refusal.
+func (m *imageCapacityManager) snapshotSettledHelpers(ctx context.Context, info system.Info) error {
+	if !daemonUsesContainerd(info) {
+		return nil
+	}
+	if m.docker == nil || m.docker.inspections == nil {
+		return errors.New("docker image inspection owner is not bound")
+	}
+	owner := m.docker.inspections
+	if err := errors.Join(ctx.Err(), owner.authority(), owner.lifetime.Err()); err != nil {
+		return err
+	}
+	changed, err := owner.admissionWait()
+	if err != nil {
+		return err
+	}
+	if changed != nil {
+		return errors.New("image inspection Create remains in progress")
+	}
+	return nil
+}
+
+func (m *imageCapacityManager) observeImportDebit() {
+	if pending, err := m.loader.PendingBytes(); err == nil {
+		imageImportPendingBytes.Set(float64(pending))
+	}
+}
+
 func (m *imageCapacityManager) importHeadroom(ctx context.Context, extra int64) error {
 	info, err := m.daemon.Info(ctx)
 	if err != nil {
@@ -435,14 +608,15 @@ func (m *imageCapacityManager) importHeadroom(ctx context.Context, extra int64) 
 	if err != nil {
 		return err
 	}
-	if extra < 0 || extra > math.MaxInt64-pending {
+	if extra < 0 || extra > math.MaxInt64-pending || m.staging > math.MaxInt64-pending-extra ||
+		m.probing > math.MaxInt64-pending-extra-m.staging {
 		return errors.New("image import allowance exceeds accounting range")
 	}
 	paths := []string{info.DockerRootDir}
 	if m.cfg.ImageDataPath != "" {
 		paths = append(paths, m.cfg.ImageDataPath)
 	}
-	return requireImageImportSpace(m.fs, paths, pending+extra, m.cfg.ImageDiskMinFreeMB*imageMiB)
+	return requireImageImportSpace(m.fs, paths, pending+extra+m.staging+m.probing, m.cfg.ImageDiskMinFreeMB*imageMiB)
 }
 
 func daemonUsesContainerd(info system.Info) bool {
@@ -532,14 +706,43 @@ func imageRecoveryDigest(ref, id string, inspection image.InspectResponse) strin
 }
 
 func (m *imageCapacityManager) collect(ctx context.Context) error {
+	if m.active != 0 {
+		imageGCTotal.WithLabelValues("inhibited").Inc()
+		return nil
+	}
+	info, err := m.daemon.Info(ctx)
+	if err != nil {
+		return err
+	}
+	if err := m.snapshotSettledHelpers(ctx, info); err != nil {
+		imageGCTotal.WithLabelValues("inhibited").Inc()
+		return err
+	}
+	if m.loader != nil {
+		pending, err := m.loader.PendingBytes()
+		if err != nil {
+			return err
+		}
+		imageImportPendingBytes.Set(float64(pending))
+		if pending != 0 {
+			imageGCTotal.WithLabelValues("inhibited").Inc()
+			return nil
+		}
+	}
 	if err := m.access.verify(ctx); err != nil {
 		return err
 	}
 	protected, err := m.pins.Collect(ctx)
 	if err != nil {
+		imageGCTotal.WithLabelValues("inhibited").Inc()
 		return err
 	}
+	if !protected.Complete() {
+		imageGCTotal.WithLabelValues("inhibited").Inc()
+		return nil
+	}
 	if m.owner == nil {
+		imageGCTotal.WithLabelValues("shared").Inc()
 		return nil // Development daemons can be shared with independent backends.
 	}
 	if err := m.owner.verify(ctx); err != nil {
@@ -559,6 +762,7 @@ func (m *imageCapacityManager) collect(ctx context.Context) error {
 		}
 	}
 	if capacity.usage() < m.cfg.ImageGCHighPercent && m.headroom(ctx, true) == nil {
+		imageGCTotal.WithLabelValues("below_threshold").Inc()
 		return nil
 	}
 	containers, err := m.daemon.ContainerList(ctx, container.ListOptions{All: true})
@@ -593,6 +797,7 @@ func (m *imageCapacityManager) collect(ctx context.Context) error {
 			}
 			return fmt.Errorf("remove unused image: %w", err)
 		}
+		imageGCTotal.WithLabelValues("removed").Inc()
 		capacity, err = m.fs.capacity(paths[0])
 		if err != nil {
 			return err
@@ -613,13 +818,28 @@ func (b *Backend) imageGCLoop() {
 			return
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(b.stopCtx, 30*time.Second)
-			err := b.collectImages(ctx)
+			err := b.collectImagesSafely(ctx)
 			cancel()
 			if err != nil {
 				b.logger.Warn("image garbage collection deferred", "error", err)
 			}
 		}
 	}
+}
+
+// A collector iteration is a background/foreign-daemon boundary. A panic
+// retains every remaining image and cannot silently terminate future sweeps.
+func (b *Backend) collectImagesSafely(ctx context.Context) (err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			imageGCTotal.WithLabelValues("panic").Inc()
+			err = fmt.Errorf("image collection panicked: %v", value)
+		}
+		if err != nil {
+			imageGCTotal.WithLabelValues("error").Inc()
+		}
+	}()
+	return b.collectImages(ctx)
 }
 
 func (b *Backend) collectImages(ctx context.Context) error {

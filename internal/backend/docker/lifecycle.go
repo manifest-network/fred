@@ -1020,14 +1020,12 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 
 	// Inject ingress labels for auto-discovery routing.
 	applyIngressLabels(labels, ingressLabelParams{
-		LeaseUUID:    params.LeaseUUID,
-		ServiceName:  params.ServiceName,
-		Instance:     params.InstanceIndex,
-		Quantity:     params.Quantity,
-		Ingress:      params.Ingress,
-		NetworkName:  params.NetworkName,
-		CustomDomain: params.CustomDomain,
-	}, params.Manifest.Ports)
+		LeaseUUID:   params.LeaseUUID,
+		ServiceName: params.ServiceName,
+		Instance:    params.InstanceIndex,
+		Quantity:    params.Quantity,
+		NetworkName: params.NetworkName,
+	}, newIngressRoute(params.Ingress, params.Manifest.Ports, params.CustomDomain))
 
 	// Build environment variables
 	var env []string

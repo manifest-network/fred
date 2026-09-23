@@ -746,8 +746,7 @@ func (b *Backend) validateRestoreOperationAuthority(
 	if claim.Tenant() != e.Tenant || claim.ProviderUUID() != e.ProviderUUID {
 		return errors.New("restore intent tenant/provider differs from source finalizer authority")
 	}
-	if !slices.Equal(claim.Items(), e.DestinationItems) ||
-		!slices.Equal(claim.EffectiveItems(), e.DestinationItems) ||
+	if !slices.Equal(claim.EffectiveItems(), e.DestinationItems) ||
 		!slices.Equal(claim.ResourceProfiles(), e.DestinationResourceProfiles) {
 		return errors.New("restore intent topology or resource profiles differ from source finalizer authority")
 	}
@@ -1842,6 +1841,10 @@ func (b *Backend) Restore(ctx context.Context, request backend.RestoreRequest) e
 		}
 	}
 	slices.Sort(healthCheckServices)
+	ingress, err := b.admitIngressPlan(ctx, rec.StackManifest, req.Items)
+	if err != nil {
+		return fmt.Errorf("plan restore ingress: %w", err)
+	}
 	restoreManifestPayload, err := json.Marshal(rec.StackManifest)
 	if err != nil {
 		return fmt.Errorf("marshal restore manifest for durable intent: %w", err)
@@ -1869,7 +1872,7 @@ func (b *Backend) Restore(ctx context.Context, request backend.RestoreRequest) e
 		rec.ProviderUUID,
 		req.Items,
 		resourceProfiles,
-		req.Items,
+		ingress,
 		healthCheckServices,
 		restoreManifestPayload,
 		req.FromLeaseUUID,
@@ -1925,7 +1928,7 @@ func (b *Backend) Restore(ctx context.Context, request backend.RestoreRequest) e
 			LifecycleCallbackURL: req.LifecycleCallbackURL,
 			ActiveReleaseVersion: 0,
 			ActiveOperationID:    shared.OperationID{},
-			Items:                slices.Clone(req.Items),
+			Items:                ingress.effectiveItems(),
 			ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 			ContainerIDs:         make([]string, 0),
 			StackManifest:        rec.StackManifest,

@@ -222,6 +222,10 @@ var payloadFields = [...]string{
 // decodePayload keeps unknown fields forward compatible while rejecting
 // duplicate or case-aliased protocol names and trailing JSON data.
 func decodePayload(body []byte) (backend.CallbackPayload, error) {
+	var budget envelopeBudget
+	if err := budget.consume(body); err != nil {
+		return backend.CallbackPayload{}, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	opening, err := decoder.Token()
 	if err != nil {

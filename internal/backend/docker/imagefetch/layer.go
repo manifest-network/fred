@@ -111,6 +111,31 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 		if budget.entries > maxLayerEntries {
 			return errors.New("image layers exceed entry budget")
 		}
+		metadata := len(header.Name) + len(header.Linkname) + len(header.Uname) + len(header.Gname)
+		for key, value := range header.PAXRecords {
+			if header.Typeflag != tar.TypeXGlobalHeader && (strings.HasPrefix(key, "SCHILY.xattr.trusted.overlay.") || strings.HasPrefix(key, "SCHILY.xattr.user.overlay.")) {
+				return errors.New("image layer contains reserved overlay filesystem attributes")
+			}
+			if header.Typeflag != tar.TypeXGlobalHeader && strings.HasPrefix(key, "GNU.sparse") {
+				return errors.New("sparse image layer entries are unsupported")
+			}
+			metadata += len(key) + len(value)
+		}
+		for key, value := range header.Xattrs {
+			if header.Typeflag != tar.TypeXGlobalHeader && (strings.HasPrefix(key, "trusted.overlay.") || strings.HasPrefix(key, "user.overlay.")) {
+				return errors.New("image layer contains reserved overlay filesystem attributes")
+			}
+			metadata += len(key) + len(value)
+		}
+		if metadata > maxHeaderBytes {
+			return errors.New("image layer header exceeds metadata budget")
+		}
+		// Moby and containerd ignore global PAX headers rather than applying
+		// their records to subsequent files. Bound their metadata and stream
+		// bytes, but grant them no namespace or allocation authority.
+		if header.Typeflag == tar.TypeXGlobalHeader {
+			continue
+		}
 		name, err := safeLayerPath(header.Name)
 		if err != nil {
 			return err
@@ -126,25 +151,6 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 			return errors.New("image layer exceeds logical file byte budget")
 		}
 		logical += header.Size
-		metadata := len(header.Name) + len(header.Linkname) + len(header.Uname) + len(header.Gname)
-		for key, value := range header.PAXRecords {
-			if strings.HasPrefix(key, "SCHILY.xattr.trusted.overlay.") || strings.HasPrefix(key, "SCHILY.xattr.user.overlay.") {
-				return errors.New("image layer contains reserved overlay filesystem attributes")
-			}
-			if strings.HasPrefix(key, "GNU.sparse") {
-				return errors.New("sparse image layer entries are unsupported")
-			}
-			metadata += len(key) + len(value)
-		}
-		for key, value := range header.Xattrs {
-			if strings.HasPrefix(key, "trusted.overlay.") || strings.HasPrefix(key, "user.overlay.") {
-				return errors.New("image layer contains reserved overlay filesystem attributes")
-			}
-			metadata += len(key) + len(value)
-		}
-		if metadata > maxHeaderBytes {
-			return errors.New("image layer header exceeds metadata budget")
-		}
 		budget.allocated += metadataAllocation + roundBlock(int64(metadata), 4096)
 		copied, err := tree.apply(ctx, name, header)
 		if err != nil {

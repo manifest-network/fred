@@ -53,7 +53,7 @@ type inspectedImage struct {
 	id          string
 	platform    ocispec.Platform
 	user        string
-	volumes     []string
+	metadata    Metadata
 	descriptor  *ocispec.Descriptor
 	repoDigests []string
 }
@@ -125,7 +125,7 @@ func (a *Admitter) mint(imageReference string, inspected inspectedImage) Image {
 	return Image{record: &imageRecord{
 		issuer: a.issuer, reference: imageReference, id: inspected.id,
 		platform: clonePlatform(inspected.platform), user: inspected.user,
-		volumes: slices.Clone(inspected.volumes),
+		metadata: inspected.metadata,
 	}}
 }
 
@@ -145,7 +145,7 @@ func (a *Admitter) inspect(ctx context.Context, imageReference string, platform 
 	if err != nil || parsed.Algorithm() != digest.SHA256 {
 		return inspectedImage{}, fmt.Errorf("image inspection returned an invalid immutable image ID %q", response.ID)
 	}
-	metadata, err := admitImageMetadata(response.Config.Labels, response.Config.Volumes)
+	metadata, err := AdmitMetadata(response.Config.Labels, response.Config.Volumes)
 	if err != nil {
 		return inspectedImage{}, err
 	}
@@ -165,7 +165,7 @@ func (a *Admitter) inspect(ctx context.Context, imageReference string, platform 
 		id: response.ID, descriptor: response.Descriptor, repoDigests: slices.Clone(response.RepoDigests),
 		platform: ocispec.Platform{OS: response.Os, Architecture: response.Architecture,
 			Variant: response.Variant, OSVersion: response.OsVersion},
-		user: response.Config.User, volumes: metadata.volumes,
+		user: response.Config.User, metadata: metadata,
 	}, nil
 }
 

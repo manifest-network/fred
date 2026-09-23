@@ -231,6 +231,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Docker image registry requests now originate from `docker-backend` over HTTPS
+  with its process proxy settings and system CA trust. Classic `overlay2` and
+  containerd `overlayfs` are the supported image stores; other drivers fail
+  startup. Verified content is staged beside the callback journal, with bounded
+  staging/import allowances and a durable record for unknown import completion.
+  Existing shared filesystems and deployments keep their layout. Preserve these
+  records in backups, check registry reachability before upgrading, and review
+  [image upgrade requirements](DEPLOYMENT.md). First pin/backfill persistence is
+  the downgrade boundary for older binaries that reject the new journal bucket.
+  Existing pinned/local images are not rejected solely by a lower new-image
+  size cap; startup backfills legacy identities from exact existing containers.
+  New ingestion accepts repeated layers and global PAX headers, but bounds
+  layer/path counts and rejects ambiguous or unsupported filesystem structures.
+  (ENG-1052)
+
 - Load testing distinguishes authenticated fixture traffic from deliberate
   rejection traffic. Real tenant signatures use ADR-036/secp256k1, connection
   requests respect the token replay window, and callbacks replay supplied exact
@@ -784,6 +799,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Images built by Docker Compose can retain its three standard build stamps.
+  Admitted metadata owns their replacements: compiled projects bind their own
+  project/service/version, and direct/helper creation writes neutral values.
+  Other reserved labels remain rejected, and inherited build labels cannot
+  grant container ownership or redirect helper cleanup. (ENG-1052)
+
+- Custom-domain provision, restore and maintenance admission now derives durable
+  effective items and Docker labels from one ingress plan. Disabled ingress,
+  missing routable ports, invalid domains or deferred DNS no longer record a
+  domain that the container cannot emit. Exact recovery comparisons remain
+  enforced; an unresolved legacy operation retains its lease fence while
+  sibling operation recovery can continue. (ENG-1055)
+- Image downloads and imports no longer hold the provider-wide admission lock.
+  Copy-safe staging, import and extraction owners account for concurrent work;
+  unrelated cached workloads can proceed. Collection failures inhibit deletion
+  without rejecting unrelated admission, and failed/superseded image pins expire
+  unless required by active compensation. GC decisions and outstanding import
+  allocations are exported as metrics. (ENG-1052)
+- XFS root project repair uses descriptor-bound ioctls without walking tenant
+  trees, including delete-stage normalization. Callback envelope scanning now
+  bounds structural work before authentication, and maintenance completion wakes
+  its owned lane immediately with aggregate pending count/byte limits. (ENG-1051, ENG-1052)
+
 - Keep accepted updates pending until their exact authenticated maintenance
   completion succeeds. Failed and rolled-back updates preserve the prior replay
   payload, including after restart/recovery; payload promotion requires a
@@ -791,6 +829,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Preserve previously admitted release history through storage-identity adoption,
   recovery and restart even when current manifest admission rules changed.
+  Reprovision accepts an equivalent historical manifest only for the exact
+  active release, tenant, provider and item topology; journal-bound replay
+  authority is checked again before acceptance. New or changed submissions
+  retain current admission policy.
   The offline `placement-preflight -inspect-releases` command reports policy
   drift by lease UUID and release version without editing history (ENG-1050).
 - Make XFS quota checks on existing volumes constant-time: verify root project
@@ -1468,11 +1510,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Bound image admission before Docker import by staging and verifying exact
   compressed content, expanded layers and image metadata. Docker imports the
   verified bytes without fetching them again; existing shared-filesystem
-  deployments keep their layout. Retain sampled free-space floors, a post-import
-  size check, periodic high/low-watermark collection and durable immutable image
+  deployments keep their layout. Retain sampled free-space floors, bounded
+  import allocation, periodic high/low-watermark collection and durable immutable image
   pins. Production collection requires durable exclusive ownership of its Docker
   daemon's image cache; shared development daemons cannot delete images.
-  Admitted imports drain through caller cancellation within a ten-minute bound;
+  Admitted imports receive a 30-second completion grace after caller cancellation
+  or backend shutdown;
   imports with unknown completion retain a durable allocation debit across
   restarts, while observed terminal failures settle their allocation.
   Containerd admission proves extraction with a stopped, journal-owned probe

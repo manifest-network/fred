@@ -259,13 +259,23 @@ Every non-2xx response **MUST** be JSON in this envelope:
 {
   "error": "human-readable description of what went wrong",
   "validation_code": "unknown_sku | invalid_manifest | image_not_allowed",
-  "code": "already_provisioned | demote_exceeds_tier | insufficient_resources"
+  "code": "already_provisioned | demote_exceeds_tier | insufficient_resources | lifecycle_pending"
 }
 ```
 
 - `error` **(required)** — a human-readable description. See the curation rule below.
 - `validation_code` (omitempty) — on a `400`, the sub-category of the validation failure. Fred parses it to reconstruct a precise sentinel error, which is what gives the on-chain rejection reason its precision; omit it and fred falls back to a generic validation failure.
 - `code` (omitempty) — a machine-readable discriminator. Today: `already_provisioned` on `/restore`'s `409`, `demote_exceeds_tier` on `/restore`'s `422`, and `insufficient_resources` on capacity-refused mutation requests or busy log reads (`503`). See those endpoints. A read-capacity response supplies retry guidance only; it cannot settle a durable mutation attempt.
+
+`POST /restart`, `/update`, `/deprovision` and `/reconcile_custom_domain`
+may return `503` with `{"error":"admitted lifecycle work remains pending","code":"lifecycle_pending"}`
+after observing validated journal contention or an admitted close whose physical
+result remains pending. Fred treats this exact envelope as a successful
+availability observation while preserving the unresolved request. It grants no
+refusal, no-dispatch, immediate replay, or completed-cleanup authority. Generic
+conflicts, corrupt journals and invalid execution evidence remain server errors.
+The distinct `503` also keeps older clients conservative: a maintenance `409`
+would incorrectly promise a definitive invalid-state refusal.
 
 These response fields establish **protocol conformance, not cryptographic
 authorship**. Fred HMAC-signs requests to the backend, but the backend does not
@@ -294,6 +304,7 @@ Circuit-breaker classification is separate from mutation settlement:
 | Successful response | Success | Only the endpoint's exact contract grants acceptance |
 | Valid not-found, validation, invalid-state, already-provisioned or restore refusal | Success | Endpoint-specific refusal or ambiguity; never inferred from breaker classification |
 | `/deprovision` `409` with `code: close_deferred` | Success | Retry close; cleanup has not completed |
+| Lifecycle mutation `503` with `code: lifecycle_pending` | Success | Preserve the unresolved request; no refusal, no-dispatch or completed-cleanup authority |
 | `/provision` `409` with `code: invalid_state` | Success | Retain the attempt as ambiguous; does not prove existing ownership |
 | Capacity refusal (`503`, `code: insufficient_resources`), including custom-domain reconciliation | Success | Mutation refusal only where the endpoint supports that exact verdict |
 | `/stats` accounting hold or busy read (`503`, `code: insufficient_resources`) | Success | Retry/read admission only; no mutation authority |

@@ -393,7 +393,7 @@ func TestApplyIngressLabels(t *testing.T) {
 
 	t.Run("disabled ingress emits nothing", func(t *testing.T) {
 		labels := map[string]string{}
-		applyIngressLabels(labels, ingressLabelParams{
+		applyTestIngressLabels(labels, testIngressLabelParams{
 			LeaseUUID:    "lease-1",
 			ServiceName:  "web",
 			Instance:     0,
@@ -407,7 +407,7 @@ func TestApplyIngressLabels(t *testing.T) {
 
 	t.Run("no routable port + no custom_domain emits nothing", func(t *testing.T) {
 		labels := map[string]string{}
-		applyIngressLabels(labels, ingressLabelParams{
+		applyTestIngressLabels(labels, testIngressLabelParams{
 			LeaseUUID:   "lease-1",
 			ServiceName: "redis",
 			Instance:    0,
@@ -423,7 +423,7 @@ func TestApplyIngressLabels(t *testing.T) {
 		// service must not see Fred emit a secondary router that would
 		// reference a non-existent port. Primary is also absent (no port).
 		labels := map[string]string{}
-		applyIngressLabels(labels, ingressLabelParams{
+		applyTestIngressLabels(labels, testIngressLabelParams{
 			LeaseUUID:    "lease-1",
 			ServiceName:  "redis",
 			Instance:     0,
@@ -437,7 +437,7 @@ func TestApplyIngressLabels(t *testing.T) {
 
 	t.Run("primary only when CustomDomain empty", func(t *testing.T) {
 		labels := map[string]string{}
-		applyIngressLabels(labels, ingressLabelParams{
+		applyTestIngressLabels(labels, testIngressLabelParams{
 			LeaseUUID:   "lease-1",
 			ServiceName: "web",
 			Instance:    0,
@@ -456,7 +456,7 @@ func TestApplyIngressLabels(t *testing.T) {
 
 	t.Run("primary + secondary when CustomDomain valid", func(t *testing.T) {
 		labels := map[string]string{}
-		applyIngressLabels(labels, ingressLabelParams{
+		applyTestIngressLabels(labels, testIngressLabelParams{
 			LeaseUUID:    "lease-1",
 			ServiceName:  "web",
 			Instance:     0,
@@ -487,7 +487,7 @@ func TestApplyIngressLabels(t *testing.T) {
 
 	t.Run("invalid CustomDomain skips secondary, primary kept", func(t *testing.T) {
 		labels := map[string]string{}
-		applyIngressLabels(labels, ingressLabelParams{
+		applyTestIngressLabels(labels, testIngressLabelParams{
 			LeaseUUID:    "lease-1",
 			ServiceName:  "web",
 			Instance:     0,
@@ -514,7 +514,7 @@ func TestApplyIngressLabels(t *testing.T) {
 		var l0, l1, l2 map[string]string
 		for i, dst := range []*map[string]string{&l0, &l1, &l2} {
 			labels := map[string]string{}
-			applyIngressLabels(labels, ingressLabelParams{
+			applyTestIngressLabels(labels, testIngressLabelParams{
 				LeaseUUID:    "lease-1",
 				ServiceName:  "web",
 				Instance:     i,

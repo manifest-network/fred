@@ -57,18 +57,21 @@ func NewImagePinJournal(store *CallbackStore, releases *ReleaseStore, retentions
 		retentions.binding.backendName != store.binding.backendName || retentions.binding.storageID != store.binding.storageID {
 		return nil, errors.New("image pins require the exact identity-bound retention journal")
 	}
-	inspections, err := NewImageInspectionJournal(store)
-	if err != nil {
+	// Pin verification needs inspection-origin authority, but constructing it
+	// must not create either optional image extension during read-only startup.
+	inspections := &ImageInspectionJournal{store: store}
+	if err := store.view(func(tx *bolt.Tx) error {
+		if err := requireCompleteCallbackSchema(tx); err != nil {
+			return err
+		}
+		return inspections.validateTx(tx)
+	}); err != nil {
 		return nil, err
 	}
 	j := &ImagePinJournal{journalPair: pair, inspections: inspections, retentions: retentions}
-	err = store.update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(imagePinsBucketName)
-		return err
-	})
-	if err == nil {
-		_, err = j.List()
-	}
+	// Reading or constructing the extension must not upgrade the journal. The
+	// downgrade boundary is its first admitted pin, never a failed startup.
+	_, err = j.List()
 	return j, err
 }
 
@@ -99,7 +102,7 @@ func (j *ImagePinJournal) Lookup(lease string, payload []byte, ref string) (*Ima
 	err = j.inspections.store.view(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket(imagePinsBucketName)
 		if bucket == nil {
-			return errors.New("image pin bucket missing")
+			return nil
 		}
 		data := bucket.Get(imagePinKey(lease, hash, ref))
 		if data == nil {
@@ -179,7 +182,10 @@ func (j *ImagePinJournal) Pin(origin ImageInspectionOrigin, ref, id, pullDigest 
 		if err := prepared.verifyOrigin(tx); err != nil {
 			return err
 		}
-		bucket := tx.Bucket(imagePinsBucketName)
+		bucket, err := tx.CreateBucketIfNotExists(imagePinsBucketName)
+		if err != nil {
+			return err
+		}
 		key := imagePinKey(lease, hash, ref)
 		if previous := bucket.Get(key); previous != nil {
 			old, err := decodeImagePin(previous)
@@ -246,9 +252,6 @@ func decodeImagePin(data []byte) (ImagePin, error) {
 func (j *ImagePinJournal) List() ([]ImagePin, error) {
 	var pins []ImagePin
 	err := j.inspections.store.view(func(tx *bolt.Tx) error {
-		if tx.Bucket(imagePinsBucketName) == nil {
-			return errors.New("image pin bucket missing")
-		}
 		return visitImagePinsContextTx(context.Background(), tx, func(pin ImagePin) error {
 			pins = append(pins, pin)
 			return nil
@@ -288,6 +291,10 @@ type ImagePinInventory struct {
 	images   map[string]bool
 	complete bool
 }
+
+// Complete reports whether every relaunchable generation has immutable pins.
+// Incompleteness inhibits deletion without rejecting unrelated admission.
+func (i ImagePinInventory) Complete() bool { return i.complete }
 
 // CanRemove proves that the complete journal snapshot did not name this image.
 // A zero value or legacy manifest with missing pins never grants collection.
@@ -349,8 +356,12 @@ func (j *ImagePinJournal) Collect(ctx context.Context) (ImagePinInventory, error
 
 func (j *ImagePinJournal) collectLeasePins(lease string, pins []ImagePin, protected map[string]bool) (bool, error) {
 	needed := make(map[string]bool)
+	complete := true
+	var compensationVersion int
+	unknownGeneration := false
 	add := func(payload []byte, requirePins bool) error {
 		if len(payload) == 0 {
+			unknownGeneration = unknownGeneration || requirePins
 			return nil
 		}
 		stack, err := manifest.ParseStoredPayload(payload)
@@ -374,8 +385,12 @@ func (j *ImagePinJournal) collectLeasePins(lease string, pins []ImagePin, protec
 		}
 		switch head := head.(type) {
 		case operationLeaseMutationHead:
-			return add(head.claim.Manifest(), false)
+			if head.claim.entry.State == operationIntentPending {
+				return add(head.claim.Manifest(), false)
+			}
+			return nil
 		case maintenanceLeaseMutationHead:
+			compensationVersion = head.claim.SourceRelease().Version()
 			return add(head.claim.TargetRelease().Manifest, false)
 		case closeLeaseMutationHead:
 			return add(head.claim.Manifest(), false)
@@ -388,8 +403,13 @@ func (j *ImagePinJournal) collectLeasePins(lease string, pins []ImagePin, protec
 	if err != nil {
 		return false, err
 	}
+	compensationFound := compensationVersion == 0
 	for _, release := range releases {
-		if err := add(release.Manifest, release.Status == "active" || release.Status == "superseded"); err != nil {
+		compensationFound = compensationFound || release.Version == compensationVersion
+		if release.Status != "active" && release.Version != compensationVersion {
+			continue
+		}
+		if err := add(release.Manifest, true); err != nil {
 			return false, err
 		}
 	}
@@ -397,7 +417,11 @@ func (j *ImagePinJournal) collectLeasePins(lease string, pins []ImagePin, protec
 	if err != nil && !errors.Is(err, ErrNoRetention) {
 		return false, err
 	}
-	if retained != nil {
+	if retained != nil && retained.StackManifest == nil {
+		// Legacy retention can predate recorded manifests. Preserve its images
+		// conservatively; this absence cannot authorize deletion or pin pruning.
+		unknownGeneration = true
+	} else if retained != nil {
 		payload, err := json.Marshal(retained.StackManifest)
 		if err != nil {
 			return false, err
@@ -406,11 +430,19 @@ func (j *ImagePinJournal) collectLeasePins(lease string, pins []ImagePin, protec
 			return false, err
 		}
 	}
+	if unknownGeneration || !compensationFound {
+		// Missing historical manifests/source generations cannot authorize pin
+		// pruning even though collection itself is already inhibited.
+		complete = false
+		for _, pin := range pins {
+			protected[pin.ImageID] = true
+			needed[string(imagePinKey(pin.LeaseUUID, pin.ManifestHash, pin.Reference))] = true
+		}
+	}
 	present := make(map[string]bool, len(pins))
 	for _, pin := range pins {
 		present[string(imagePinKey(pin.LeaseUUID, pin.ManifestHash, pin.Reference))] = true
 	}
-	complete := true
 	for key, required := range needed {
 		if required && !present[key] {
 			complete = false

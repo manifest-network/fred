@@ -768,6 +768,9 @@ func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.backend.Deprovision(r.Context(), req.LeaseUUID); err != nil {
+		if s.lifecyclePendingResponse(w, err) {
+			return
+		}
 		if errors.Is(err, backend.ErrInvalidState) {
 			s.errorResponseWithCode(w, http.StatusConflict, "close is deferred until lifecycle work settles", backend.CodeCloseDeferred)
 			return
@@ -804,6 +807,9 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	}
 	err := s.backend.Restart(r.Context(), req)
 	if err != nil {
+		if s.lifecyclePendingResponse(w, err) {
+			return
+		}
 		if errors.Is(err, backend.ErrNotProvisioned) {
 			s.errorResponse(w, http.StatusNotFound, "not provisioned")
 			return
@@ -944,6 +950,9 @@ func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Requ
 	}
 
 	if err := s.backend.ReconcileCustomDomain(r.Context(), req.LeaseUUID, req.Items); err != nil {
+		if s.lifecyclePendingResponse(w, err) {
+			return
+		}
 		// Surface ErrNotProvisioned and ErrInvalidState as 404/409 so the
 		// HTTPClient can map them back to typed errors. Both signal benign
 		// races (lease just deprovisioned, or status flipped between our
@@ -1001,6 +1010,9 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	err := s.backend.Update(r.Context(), req)
 	if err != nil {
+		if s.lifecyclePendingResponse(w, err) {
+			return
+		}
 		if errors.Is(err, backend.ErrNotProvisioned) {
 			s.errorResponse(w, http.StatusNotFound, "not provisioned")
 			return

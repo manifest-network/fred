@@ -405,7 +405,9 @@ been accounted for.
 **Startup quota reconciliation.** After the preliminary guard passes, the
 backend re-applies each expected present managed volume's immutable effective
 quota (root project/inheritance verification + limit refresh). Existing tenant
-trees are not recursively walked; mismatched roots are repaired at depth zero.
+trees are not walked: Fred repairs the already-open root inode with XFS
+`FSGETXATTR`/`FSSETXATTR`, preserving unrelated flags and verifying the result.
+It does not use `xfs_quota project -s`, whose depth option still traverses trees.
 It attempts the complete live and retained inventory and joins all failures, but
 any inventory, durable-resource-authority, or enforcement error makes `Start`
 fail before the command-line HTTP/metrics server is created. The process never
@@ -431,7 +433,7 @@ naming its actual content directory; it may differ from Docker's data root.
 Inspect free space there, in the Docker data root and beside the callback journal
 when image admission is refused.
 Ingestion supports classic `overlay2` and containerd's `overlayfs` snapshotter;
-other drivers are refused before staging. A driver that copies full parent
+other drivers prevent backend startup. A driver that copies full parent
 filesystems needs a different space model. Existing `overlay2` deployments keep
 their configuration.
 Classic Docker's default import staging under `DockerRootDir/tmp` is included in
@@ -439,12 +441,21 @@ the allowance. A `DOCKER_TMPDIR` override on another filesystem is not discovera
 through Docker's API. Supported accounting requires the default daemon staging
 directory; explicit accounting for an external override is not implemented.
 
+Registry access comes from `docker-backend` over HTTPS, with process proxy
+settings and system CA trust. Docker daemon mirrors, insecure-registry settings
+and `/etc/docker/certs.d` are not consulted. Configure the backend process
+accordingly; a registry response must continue making progress within 30 seconds.
+
 Fred stages registry content in `<callback_db_path>.image-staging`, checks
 compressed-content digests, image configuration and expanded
 layers, then imports those same verified bytes into Docker. Docker does not
 perform a second registry fetch. The configured `image_max_size_mb` bounds
-staging and expanded content before import, and inspected image size afterward.
-Layer entry, path and metadata budgets also apply. Sparse entries, duplicate
+new staging and expanded content before import; the peak import allowance is
+also capped at twice that budget. Lowering it does not invalidate a local or
+pinned historical image. Layer entry, path and metadata budgets also apply: at
+most 128 layers and 131,072 aggregate tar/implicit path entries, with a strict
+selected-platform match. Repeated layer descriptors and global PAX headers are
+supported. Sparse entries, duplicate
 paths and hardlinks without an earlier regular-file target in the same layer
 are refused; rebuild such images with supported layer contents. Verification
 adds CPU and temporary disk use on first ingestion. Pinned images already
@@ -456,20 +467,26 @@ tag.
 Before staging, admission checks the maximum staging allowance above the
 free-space floor. Before Docker import, it checks the verified image's
 conservative import footprint plus the floor again. Launches require the floor.
-Outstanding import allowances are added to admission and collection headroom
-checks, including local-image reuse. Before dispatch, Fred writes the allowance
+Staging, import and extraction owners account for each other without holding a
+provider-wide lock during network or daemon I/O. A local launch checks actual
+free space plus unknown import allocations; live owned imports are not added
+a second time to that launch floor. Before dispatch, Fred writes the allowance
 to `<callback_db_path>.image-staging/image-import-debit-v1`. An admitted import
-has its own ten-minute completion deadline and continues draining after caller
-cancellation. Clean upload and terminal completion release its amount even when
+keeps the active caller lifetime and receives a 30-second completion grace
+after caller cancellation or backend shutdown. Shutdown drains these owned
+requests before closing journals. Clean upload and terminal completion release its amount even when
 Docker reports a completed failure; the deployment still fails. Transport,
 timeout or malformed-stream failures retain unproven allocation across restart,
-without automatic expiry. An unreadable debit record refuses admission.
+without automatic expiry. A corrupt debit record or foreign staging content
+prevents startup; preserve it for investigation instead of deleting it. The
+`fred_docker_backend_image_import_pending_bytes` gauge reports outstanding
+allocation, including unknown completion.
 These checks sample available space; they do not physically reserve it against
 concurrent tenant or unrelated host writes. Keep the tenant disk pool and other
 host consumers within the filesystem's usable capacity with operational headroom.
 
 Containerd admission also creates and removes a stopped, journal-owned probe
-under the image admission lock to force any deferred snapshot extraction. It
+with an owned extraction allowance to force any deferred snapshot extraction. It
 never starts, has no network, and covers image `VOLUME` declarations with tmpfs.
 The pin retains the verified extraction allowance for later admission. Pending
 image-helper receipts block further containerd ingestion after restart; unknown
@@ -480,11 +497,17 @@ The collector runs each minute and before image admission, prunes obsolete
 manifest pins even below its disk threshold, and removes unreferenced images
 between the high and low thresholds. It uses Docker's non-force removal and
 keeps every container-referenced or durably pinned image. Missing legacy pins
-or incomplete journal/container inventories prevent destructive collection.
+or incomplete journal/container inventories prevent destructive collection,
+while unrelated admissions may continue if their own checks succeed. Startup
+backfills missing active pins from an exact live cohort and immutable image
+inspection. Failed/superseded history retains pins only when needed by an exact
+pending compensation. A null legacy retained manifest conservatively keeps
+images. `fred_docker_backend_image_gc_total{outcome}` reports inhibited, shared,
+below-threshold, removed, error and panic decisions.
 Removal conflicts keep their images; resolve them during fenced maintenance,
 without deleting pins or authoritative release history. Until real free space
-recovers, new image pulls remain refused. Lowering the image size cap does not
-authorize deleting content pinned by retained generations.
+recovers, capacity refusals remain possible. Lowering the new-image size cap
+neither deletes nor invalidates content pinned by retained generations.
 
 The Docker volume `fred-image-cache-owner-v1` records durable cache ownership.
 Production uses an exclusive backend storage identity; development uses shared
@@ -517,6 +540,34 @@ There is no automatic debit reset. For exceptional offline recovery:
    checksummed bytes or delete the staging directory or callback journal.
    Restart the same Docker/storage lineage and then Fred; repeat normal health
    and capacity checks before reopening admission.
+
+## Pending maintenance pressure
+
+Signed completion wakes the exact durable maintenance lane immediately; the
+periodic recovery tick remains the fallback. New pending commands are bounded
+to 1,024 records and 64 MiB of encoded journal content, including phase-growth
+headroom. Replays and settlement of existing records remain available even when
+a pre-upgrade journal exceeds these limits. The `fred_maintenance_pending`,
+`fred_maintenance_pending_bytes` and `fred_maintenance_pending_oldest_age_seconds`
+gauges expose each closed phase. Admission refusals are counted by `count` or
+`bytes` in `fred_maintenance_admission_refusals_total`. An old completion without
+its maintenance ID is still insufficient authority to promote or discard a
+payload; preserve that pending record for recovery.
+
+## Custom-domain operation recovery
+
+Ingress admission records only a domain that its typed route can emit. A lease
+may request a domain while ingress is disabled, while its service has no
+routable port, or while DNS is deferred; the workload still provisions without
+a custom-domain label. Desired chain metadata remains separate.
+
+A pre-fix ENG-1055 intent may already contain contradictory effective metadata.
+Recovery keeps that exact operation pending, preserves its reservation and lease
+fence, and logs `operation recovery retained unresolved lease authority`.
+Healthy sibling recovery and backend startup can continue. It does not erase
+the domain based on today's configuration or synthesize a success/timeout callback.
+Preserve the journals and container evidence for an explicit authority-aware
+repair; deleting the pending row can orphan a running workload.
 
 ## Interrupted managed-volume mutation at startup
 

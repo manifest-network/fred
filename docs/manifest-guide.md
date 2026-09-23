@@ -683,7 +683,7 @@ Requires a stateful SKU with `disk_mb > 0`. The backend auto-detects the volume 
 | `NONE` health check with `service_healthy` | Same as above | Use `CMD` or `CMD-SHELL` instead |
 | Setting `PATH` env var | `variable "PATH" is not allowed` | Use a different variable name or set PATH in the Dockerfile |
 | Using `fred.*` label prefix | `labels cannot use reserved prefix 'fred.'` | Choose a different prefix |
-| Using `com.docker.compose.*` label prefix | `labels cannot use reserved prefix 'com.docker.compose.'` | Remove Compose orchestration metadata from the manifest and image |
+| Using `com.docker.compose.*` label prefix | `labels cannot use reserved prefix 'com.docker.compose.'` | Remove reserved manifest labels. Images may carry only the three standard Compose project/service/version build stamps; Fred replaces those values before execution |
 | Using `traefik.*` label prefix | `labels cannot use reserved prefix 'traefik.'` | Remove it — configure ingress via the manifest `ingress`/port settings, not raw Traefik labels (ENG-497) |
 | More than 4 tmpfs mounts | `too many mounts (N), maximum is 4` | Consolidate mount points |
 | Tmpfs on `/tmp` or `/run` | `path "/tmp" is managed by the backend` | These are auto-mounted; use sub-paths if needed |

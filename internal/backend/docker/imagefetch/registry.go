@@ -9,10 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"regexp"
-	"strings"
 
 	"github.com/containerd/platforms"
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -21,6 +19,8 @@ import (
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 )
 
 const (
@@ -30,23 +30,82 @@ const (
 	maxIndexEntries  = 256
 )
 
-// Prepare performs bounded registry I/O and decompression without extracting
-// anything into Docker or the host filesystem. Staged blobs are unlinked while
-// open, so a process crash releases them without an orphan cleanup authority.
-func (l *Loader) Prepare(ctx context.Context, ref string, platform ocispec.Platform) (_ *Prepared, resultErr error) {
+// Resolution binds registry selection to one immutable manifest. Its zero value
+// carries no authority; copies retain the same original selection.
+type Resolution struct{ state *resolvedManifest }
+type resolvedManifest struct {
+	issuer   *Loader
+	named    name.Reference
+	raw      []byte
+	digest   digest.Digest
+	platform ocispec.Platform
+	metadata int64
+}
+
+func (r Resolution) SourceReference() string {
+	if r.state == nil {
+		return ""
+	}
+	return r.state.named.Context().Digest(r.state.digest.String()).Name()
+}
+func (r Resolution) ManifestID() string {
+	if r.state == nil {
+		return ""
+	}
+	return r.state.digest.String()
+}
+func (r Resolution) Platform() ocispec.Platform {
+	if r.state == nil {
+		return ocispec.Platform{}
+	}
+	return clonePlatform(r.state.platform)
+}
+
+// Resolve selects a runnable platform manifest without downloading layers.
+func (l *Loader) Resolve(ctx context.Context, ref string, platform ocispec.Platform) (Resolution, error) {
 	if l == nil {
-		return nil, errors.New("image loader is unavailable")
+		return Resolution{}, errors.New("image loader is unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return Resolution{}, err
+	}
+	if platform.OS != "linux" || platform.Architecture == "" {
+		return Resolution{}, errors.New("image preparation requires an explicit Linux platform")
+	}
+	named, err := name.ParseReference(ref)
+	if err != nil {
+		return Resolution{}, fmt.Errorf("parse registry reference: %w", err)
+	}
+	metadata := int64(0)
+	raw, id, err := l.selectManifest(ctx, named, platform, &metadata)
+	if err != nil {
+		return Resolution{}, err
+	}
+	return Resolution{state: &resolvedManifest{issuer: l, named: named, raw: raw, digest: id, platform: clonePlatform(platform), metadata: metadata}}, nil
+}
+
+// Prepare performs bounded registry I/O and decompression without extracting
+// anything into Docker or the host filesystem.
+func (l *Loader) Prepare(ctx context.Context, ref string, platform ocispec.Platform) (*Prepared, error) {
+	resolved, err := l.Resolve(ctx, ref, platform)
+	if err != nil {
+		return nil, err
+	}
+	return l.PrepareResolved(ctx, resolved)
+}
+
+// PrepareResolved verifies the exact selection without resolving its tag again.
+// Staged blobs are unlinked while open, so a crash releases their disk space.
+func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (_ *Prepared, resultErr error) {
+	if l == nil || resolution.state == nil || resolution.state.issuer != l {
+		return nil, errors.New("invalid or foreign image resolution")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if platform.OS != "linux" || platform.Architecture == "" {
-		return nil, errors.New("image preparation requires an explicit Linux platform")
-	}
-	named, err := name.ParseReference(ref)
-	if err != nil {
-		return nil, fmt.Errorf("parse registry reference: %w", err)
-	}
+	selected := resolution.state
+	named, platform := selected.named, selected.platform
+	rawManifest, manifestID, metadata := selected.raw, selected.digest, selected.metadata
 	dir, err := os.MkdirTemp(l.stageRoot, ".fred-image-")
 	if err != nil {
 		return nil, err
@@ -58,11 +117,6 @@ func (l *Loader) Prepare(ctx context.Context, ref string, platform ocispec.Platf
 			_ = p.Close()
 		}
 	}()
-	metadata := int64(0)
-	rawManifest, manifestID, err := l.selectManifest(ctx, named, platform, &metadata)
-	if err != nil {
-		return nil, err
-	}
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(rawManifest, &manifest); err != nil {
 		return nil, err
@@ -94,13 +148,21 @@ func (l *Loader) Prepare(ctx context.Context, ref string, platform ocispec.Platf
 	if cfg.RootFS.Type != "layers" || len(cfg.RootFS.DiffIDs) != len(manifest.Layers) || !platforms.OnlyStrict(platform).Match(cfg.Platform) {
 		return nil, errors.New("image config does not match the selected platform and layers")
 	}
+	state.metadata, err = imageexec.AdmitMetadata(cfg.Config.Labels, cfg.Config.Volumes)
+	if err != nil {
+		return nil, fmt.Errorf("admit image configuration: %w", err)
+	}
 	state.imported = Imported{manifest: manifestID.String(), config: manifest.Config.Digest.String(), source: named.Context().Digest(manifestID.String()).Name(), platform: cfg.Platform}
 	state.blobs = append(state.blobs,
 		blob{name: blobPath(manifestID), size: int64(len(rawManifest)), data: rawManifest},
 		blob{name: blobPath(manifest.Config.Digest), size: int64(len(config)), data: config})
 	stageBytes := metadata
 	expansion := layerBudget{remaining: l.maxBytes}
-	seen := make(map[digest.Digest]bool)
+	type stagedLayer struct {
+		descriptor ocispec.Descriptor
+		blob       blob
+	}
+	seen := make(map[digest.Digest]stagedLayer)
 	layerNames := make([]string, 0, len(manifest.Layers))
 	for index, descriptor := range manifest.Layers {
 		if err := ctx.Err(); err != nil {
@@ -109,19 +171,25 @@ func (l *Loader) Prepare(ctx context.Context, ref string, platform ocispec.Platf
 		if err := validDescriptor(descriptor); err != nil {
 			return nil, err
 		}
-		if descriptor.Size > l.maxBytes-stageBytes {
-			return nil, errors.New("image compressed content exceeds staging budget")
+		previous, exists := seen[descriptor.Digest]
+		var b blob
+		if exists {
+			if previous.descriptor.Size != descriptor.Size || previous.descriptor.MediaType != descriptor.MediaType {
+				return nil, errors.New("repeated layer descriptor differs from original blob")
+			}
+			b = previous.blob
+		} else {
+			if descriptor.Size > l.maxBytes-stageBytes {
+				return nil, errors.New("image compressed content exceeds staging budget")
+			}
+			stageBytes += descriptor.Size
+			b, err = l.fetchFile(ctx, named, state.dir, descriptor)
+			if err != nil {
+				return nil, err
+			}
+			seen[descriptor.Digest] = stagedLayer{descriptor: descriptor, blob: b}
+			state.blobs = append(state.blobs, b)
 		}
-		if seen[descriptor.Digest] {
-			return nil, errors.New("duplicate layer digest is not supported by bounded image preparation")
-		}
-		seen[descriptor.Digest] = true
-		stageBytes += descriptor.Size
-		b, err := l.fetchFile(ctx, named, state.dir, descriptor)
-		if err != nil {
-			return nil, err
-		}
-		state.blobs = append(state.blobs, b)
 		if err := inspectLayer(ctx, b.file, descriptor.MediaType, cfg.RootFS.DiffIDs[index], &expansion); err != nil {
 			return nil, fmt.Errorf("image layer %d: %w", index, err)
 		}
@@ -163,6 +231,9 @@ func (l *Loader) Prepare(ctx context.Context, ref string, platform ocispec.Platf
 	// exists. Both stores also create per-image/per-layer metadata outside the
 	// layer tar entries (layerdb, snapshot records and graphdriver links).
 	state.importBytes = archiveBytes + expansion.allocated + 2*metadata + int64(len(manifest.Layers)+1)*(128<<10)
+	if state.importBytes > 2*l.maxBytes {
+		return nil, errors.New("image import allocation exceeds twice the image byte limit")
+	}
 	return p, nil
 }
 
@@ -279,33 +350,8 @@ func (l *Loader) fetch(ctx context.Context, ref name.Reference, d ocispec.Descri
 }
 
 func (l *Loader) options(ctx context.Context, limit int64) []remote.Option {
-	return []remote.Option{remote.WithContext(ctx), remote.WithAuth(authn.Anonymous), remote.WithTransport(boundedTransport{base: remote.DefaultTransport, limit: limit})}
+	return []remote.Option{remote.WithContext(ctx), remote.WithAuth(authn.Anonymous), remote.WithTransport(boundedTransport{base: l.transport, limit: limit})}
 }
-
-type boundedTransport struct {
-	base  http.RoundTripper
-	limit int64
-}
-
-func (t boundedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	response, err := t.base.RoundTrip(req)
-	if err != nil {
-		return nil, err
-	}
-	limit := t.limit
-	if response.StatusCode != http.StatusOK || strings.Contains(response.Header.Get("Content-Type"), "json") || strings.Contains(req.URL.Path, "/manifests/") {
-		limit = min(limit, maxMetadataBytes)
-	}
-	response.Body = &boundedBody{ReadCloser: response.Body, reader: budgetReader{reader: response.Body, remaining: limit}}
-	return response, nil
-}
-
-type boundedBody struct {
-	io.ReadCloser
-	reader budgetReader
-}
-
-func (b *boundedBody) Read(p []byte) (int, error) { return b.reader.Read(p) }
 
 var stagingName = regexp.MustCompile(`^\.fred-image-[0-9]{1,10}$`)
 var stagingBlobName = regexp.MustCompile(`^blob-[0-9]{1,10}$`)

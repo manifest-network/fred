@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 )
 
@@ -308,7 +310,8 @@ func (c *imageInspectionCoordinator) openFor(ctx context.Context, image imageexe
 }
 
 func inspectionLabels(r shared.ImageInspectionReceipt) map[string]string {
-	return map[string]string{
+	labels := imageexec.DirectCreationLabels()
+	maps.Copy(labels, map[string]string{
 		"fred.inspection.schema":     "1",
 		"fred.inspection.id":         r.ID(),
 		"fred.inspection.backend":    r.Backend(),
@@ -318,7 +321,8 @@ func inspectionLabels(r shared.ImageInspectionReceipt) map[string]string {
 		"fred.inspection.lease_uuid": r.LeaseUUID(),
 		LabelImageID:                 r.ImageID(),
 		LabelImageReference:          r.ImageReference(),
-	}
+	})
+	return labels
 }
 
 func (s *imageInspectionSession) copy(ctx context.Context, path string) (io.ReadCloser, container.PathStat, error) {
@@ -572,8 +576,9 @@ func (c *imageInspectionCoordinator) inspect(ctx context.Context, receipt shared
 		}
 	}
 	for key := range actual.Config.Labels {
-		lower := strings.ToLower(key)
-		if strings.HasPrefix(lower, "fred.") || strings.HasPrefix(lower, "com.docker.compose.") || strings.HasPrefix(lower, "traefik.") {
+		// Docker inherits image labels verbatim. Admission and cleanup must
+		// use the same canonical policy, including its Unicode case folding.
+		if manifest.IsReservedLabelKey(key) {
 			if _, owned := labels[key]; !owned {
 				return "", false, errors.New("image inspection carries foreign reserved labels")
 			}

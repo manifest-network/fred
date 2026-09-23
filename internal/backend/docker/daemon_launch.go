@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/manifest-network/fred/internal/backend/shared/completion"
 )
 
 // daemonLaunchOutcome separates a completed daemon exchange from its business
@@ -29,24 +31,30 @@ func (o daemonLaunchOutcome) completionError() error {
 // Each admitted Create/Start keeps a bounded daemon exchange alive after caller
 // cancellation. It fits inside the backend's shutdown drain, allowing the exact
 // launch outcome to settle before journals close or compensation starts.
-const daemonLaunchRequestTimeout = 30 * time.Second
+const daemonLaunchCompletionGrace = 30 * time.Second
 
 // Each Compose invocation owns a permanently bound transport scope. Closing
 // admission before returning prevents a detached Compose goroutine from issuing
 // a new Create/Start after the journal has settled. The parent context controls
 // admission even if Compose replaces its own child request context.
-type daemonLaunchScope struct {
-	mu       sync.Mutex
-	ctx      context.Context
-	closed   bool
-	pending  int
-	unknown  bool
-	drained  chan struct{}
-	observer *daemonLaunchObserver
+type daemonLaunchScope struct{ state *daemonLaunchScopeState }
+
+type daemonLaunchScopeState struct {
+	mu         sync.Mutex
+	ctx        context.Context
+	closed     bool
+	pending    int
+	unknown    bool
+	drained    chan struct{}
+	observer   *daemonLaunchObserver
+	completion completion.Lifetime
 }
 
 func newDaemonLaunchScope(ctx context.Context, observer *daemonLaunchObserver) *daemonLaunchScope {
-	return &daemonLaunchScope{ctx: ctx, observer: observer, drained: make(chan struct{})}
+	return &daemonLaunchScope{state: &daemonLaunchScopeState{
+		ctx: ctx, observer: observer, drained: make(chan struct{}),
+		completion: completion.New(ctx, daemonLaunchCompletionGrace),
+	}}
 }
 
 // A nonzero-sized constructor lineage binds the direct SDK observer to the
@@ -65,26 +73,29 @@ func (o *daemonLaunchObserver) run(ctx context.Context, invoke func(context.Cont
 	return scope.finish(invoke(withDaemonLaunchScope(ctx, scope)))
 }
 
-func (s *daemonLaunchScope) close() {
+func (scope *daemonLaunchScope) close() {
+	s := scope.state
 	s.mu.Lock()
 	if !s.closed {
 		s.closed = true
 		if s.pending == 0 {
 			close(s.drained)
+			s.completion.Close()
 		}
 	}
 	s.mu.Unlock()
 }
 
-func (s *daemonLaunchScope) finish(err error) daemonLaunchOutcome {
-	s.close()
+func (scope *daemonLaunchScope) finish(err error) daemonLaunchOutcome {
+	s := scope.state
+	scope.close()
 	// Compose can return before a detached worker does. Close admission first,
-	// then drain already admitted requests without inheriting its cancellation.
-	drainCtx, cancel := context.WithTimeout(context.WithoutCancel(s.ctx), daemonLaunchRequestTimeout)
-	defer cancel()
+	// then drain admitted requests for the normal operation lifetime. Only an
+	// actual caller cancellation starts the bounded completion grace.
+	defer s.completion.Close()
 	select {
 	case <-s.drained:
-	case <-drainCtx.Done():
+	case <-s.completion.Context().Done():
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -99,7 +110,8 @@ func daemonContainerLaunchRequest(req *http.Request) bool {
 	return found && (endpoint == "create" || strings.HasSuffix(endpoint, "/start"))
 }
 
-func (s *daemonLaunchScope) roundTrip(next http.RoundTripper, req *http.Request) (*http.Response, error) {
+func (scope *daemonLaunchScope) roundTrip(next http.RoundTripper, req *http.Request) (*http.Response, error) {
+	s := scope.state
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -126,10 +138,11 @@ func (s *daemonLaunchScope) roundTrip(next http.RoundTripper, req *http.Request)
 		s.unknown = s.unknown || !responded
 		if s.closed && s.pending == 0 {
 			close(s.drained)
+			s.completion.Close()
 		}
 		s.mu.Unlock()
 	}()
-	admitted := newAdmittedDaemonRequest(req)
+	admitted := newAdmittedDaemonRequest(req, s.ctx)
 	response, err := admitted.roundTrip(next)
 	// Create and Start are non-streaming endpoints. A final daemon response
 	// follows the handler's operation even when decoding the response body or
@@ -142,27 +155,27 @@ func (s *daemonLaunchScope) roundTrip(next http.RoundTripper, req *http.Request)
 // A successful response transfers cancellation to its body; every other exit,
 // including a transport panic, releases it here.
 type admittedDaemonRequest struct {
-	request *http.Request
-	cancel  context.CancelFunc
+	request    *http.Request
+	completion completion.Lifetime
 }
 
-func newAdmittedDaemonRequest(req *http.Request) admittedDaemonRequest {
+func newAdmittedDaemonRequest(req *http.Request, invocation context.Context) admittedDaemonRequest {
 	// Once dispatch is admitted, an actor transition or Stop may stop future
 	// launches but cannot turn our own cancellation into unknown completion.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), daemonLaunchRequestTimeout)
-	return admittedDaemonRequest{request: req.Clone(ctx), cancel: cancel}
+	owned := completion.New(req.Context(), daemonLaunchCompletionGrace, invocation)
+	return admittedDaemonRequest{request: req.Clone(owned.Context()), completion: owned}
 }
 
 func (request admittedDaemonRequest) roundTrip(next http.RoundTripper) (*http.Response, error) {
 	handedOff := false
 	defer func() {
 		if !handedOff {
-			request.cancel()
+			request.completion.Close()
 		}
 	}()
 	response, err := next.RoundTrip(request.request)
 	if response != nil && response.Body != nil && err == nil {
-		response.Body = daemonLaunchResponseBody{ReadCloser: response.Body, cancel: request.cancel}
+		response.Body = daemonLaunchResponseBody{ReadCloser: response.Body, completion: request.completion}
 		handedOff = true
 	}
 	return response, err
@@ -172,11 +185,11 @@ func (request admittedDaemonRequest) roundTrip(next http.RoundTripper) (*http.Re
 // response body. Keep the bounded request context alive until it closes it.
 type daemonLaunchResponseBody struct {
 	io.ReadCloser
-	cancel context.CancelFunc
+	completion completion.Lifetime
 }
 
 func (b daemonLaunchResponseBody) Close() error {
-	defer b.cancel()
+	defer b.completion.Close()
 	return b.ReadCloser.Close()
 }
 
@@ -230,7 +243,7 @@ func (t daemonContextTransport) RoundTrip(req *http.Request) (response *http.Res
 		defer func() { scope.observe(t.observer, req, response, err) }()
 	}
 	if scope, ok := req.Context().Value(daemonLaunchContextKey{}).(*daemonLaunchScope); ok {
-		if t.observer == nil || scope.observer != t.observer {
+		if t.observer == nil || scope.state == nil || scope.state.observer != t.observer {
 			return nil, errors.New("docker launch observer belongs to another client")
 		}
 		return scope.roundTrip(t.next, req)

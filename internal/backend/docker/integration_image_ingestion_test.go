@@ -122,9 +122,9 @@ func verifyBoundedImageImportReference(t *testing.T, docker *client.Client, dige
 	t.Helper()
 	info, err := docker.Info(t.Context())
 	require.NoError(t, err)
-	server := httptest.NewServer(registry.New())
+	server := httptest.NewTLSServer(registry.New())
 	t.Cleanup(server.Close)
-	ref, err := name.ParseReference(strings.TrimPrefix(server.URL, "http://") + "/fred-import:latest")
+	ref, err := name.ParseReference(strings.TrimPrefix(server.URL, "https://") + "/fred-import:latest")
 	require.NoError(t, err)
 	var data bytes.Buffer
 	writer := tar.NewWriter(&data)
@@ -137,7 +137,9 @@ func verifyBoundedImageImportReference(t *testing.T, docker *client.Client, dige
 		return io.NopCloser(bytes.NewReader(data.Bytes())), nil
 	})
 	require.NoError(t, err)
-	fixture, err := mutate.AppendLayers(empty.Image, layer)
+	// Both stores must retain repeated layer references while the bounded
+	// archive contains only one copy of their original compressed blob.
+	fixture, err := mutate.AppendLayers(empty.Image, layer, layer)
 	require.NoError(t, err)
 	config, err := fixture.ConfigFile()
 	require.NoError(t, err)
@@ -145,12 +147,12 @@ func verifyBoundedImageImportReference(t *testing.T, docker *client.Client, dige
 	config.OS, config.Architecture, config.Variant = platform.OS, platform.Architecture, platform.Variant
 	fixture, err = mutate.ConfigFile(fixture, config)
 	require.NoError(t, err)
-	require.NoError(t, remote.Write(ref, fixture, remote.WithContext(t.Context())))
+	require.NoError(t, remote.Write(ref, fixture, remote.WithContext(t.Context()), remote.WithTransport(server.Client().Transport)))
 	manifestID, err := fixture.Digest()
 	require.NoError(t, err)
 	configID, err := fixture.ConfigName()
 	require.NoError(t, err)
-	loader, err := imagefetch.NewLoader(docker, t.TempDir(), 8*imageMiB)
+	loader, err := imagefetch.NewLoader(docker, t.TempDir(), 8*imageMiB, imagefetch.WithRegistryTransport(server.Client().Transport))
 	require.NoError(t, err)
 	source := ref.Name()
 	if digestOnly {

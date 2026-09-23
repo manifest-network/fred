@@ -569,8 +569,8 @@ is best-effort and skipped, while the conservative pool reservation remains.
 > **Capability requirement (xfs/btrfs):** setting a volume's block-quota limit is a privileged operation, so the docker-backend must hold `CAP_SYS_ADMIN` on an xfs or btrfs backend. The daemon **fails fast at startup** if it lacks it (`internal/backend/docker/capability.go`) rather than provisioning with silently-unenforced disk caps. Repairing a pre-existing tenant-owned volume root additionally needs `CAP_FOWNER`. Grant them ambiently — `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` on the systemd unit; a plain `setcap cap_sys_admin+ep` on the binary does **not** propagate to the exec'd `xfs_quota`/`btrfs` child processes. `zfs` is exempt (`zfs allow` delegation) and `noop` is unaffected. See [DEPLOYMENT.md](../../../DEPLOYMENT.md#xfs-good-for-large-fleets) and its [systemd section](../../../DEPLOYMENT.md#process-management-systemd) for the full setup.
 
 XFS startup and reuse inspect only the descriptor-bound root project ID and
-inheritance flag, repair that root at depth zero when necessary, then refresh
-quota limits. They never recursively walk tenant content. The 2026-09-23 fleet
+inheritance flag, repair that already-open inode with XFS ioctls when necessary,
+then refresh quota limits. They never recursively walk tenant content. The 2026-09-23 fleet
 check recorded in ENG-1051 found no untagged descendants requiring legacy healing.
 
 Startup quota backfill uses each generation's immutable effective authority:
@@ -824,8 +824,9 @@ record stays `reaping`.
 Multi-unit leases create multiple containers from the same manifest. Multi-SKU leases create containers with different resource profiles per SKU. Instance indices are 0-based across all items.
 
 `ProvisionTimeout` and backend shutdown cancel the async workflow. Already
-admitted Docker effects retain their completion owners while they drain; an
-admitted image import has a separate ten-minute deadline.
+admitted Docker effects retain their completion owners while they drain. Create,
+Start and image imports receive a 30-second grace only after caller cancellation
+or backend shutdown; an uncanceled request is not cut off after 30 seconds.
 
 ### Image admission
 
@@ -838,12 +839,15 @@ External `DOCKER_TMPDIR` overrides are outside the supported space model.
 
 Before dispatch, the loader durably adds its verified allowance to
 `<callback_db_path>.image-staging/image-import-debit-v1`. Upload and completion
-drain under a ten-minute context detached from caller cancellation. Clean
+keep the caller lifetime, followed by 30 seconds of completion grace after
+caller cancellation or loader shutdown. Backend shutdown drains that owner
+before journals close. Clean
 upload and terminal completion release only that import's debit, including a
 fully observed Docker refusal. The business failure still prevents image use;
 unknown completion retains the allocation across reopening. Capacity and
-collection checks include this amount before further staging, import or local
-reuse. These checks sample free space;
+collection checks include outstanding allocations before further staging or
+import. Local launches add only unknown completion allocations to their actual
+free-space floor. These checks sample free space;
 they do not reserve physical capacity against other writers. The
 [offline recovery procedure](../../../OPERATIONS.md#recovering-outstanding-image-import-allocation)
 requires external Docker/runtime drain and matching backups before an explicit
@@ -851,8 +855,8 @@ debit clear.
 
 Containerd pins persist `ImportBytes` with immutable image identity. A zero
 legacy allowance requires exact-digest re-ingestion. Every containerd admission
-then creates and removes a journal-owned stopped probe while holding the image
-capacity lock, forcing deferred extraction before publishing a pin or execution
+then creates and removes a journal-owned stopped probe with its own extraction
+allocation, forcing deferred extraction before publishing a pin or execution
 capability. The probe never starts, disables networking, and covers declared
 image `VOLUME` paths with tmpfs. Unknown Create completion fences the current
 storage authority; durable pending helper receipts exclude later containerd
@@ -862,6 +866,13 @@ Within a live process, typed content-helper ownership lets admission wait for
 creation to settle durably, then coexist with the helper's read session. Probe
 and recovery ownership remain exclusive, and releasing an unresolved helper
 never grants that sharing permission.
+
+Short manager critical sections allocate staging/import/probe owners and publish
+pins. A live admission excludes collection until publication; the durable debit
+preserves exclusion for an interrupted import. Registry and `ImageLoad` I/O
+happen outside this lock. Resolved immutable digests reuse host-wide verified
+pins or already-extracted classic Docker content. Startup can backfill legacy
+pins only from an exact recovered active cohort, never from a moved tag.
 
 ### Stack Provisioning
 

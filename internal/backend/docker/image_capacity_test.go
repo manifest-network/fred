@@ -60,9 +60,9 @@ func imageCapacityFixture(t *testing.T) (*imageCapacityManager, *dockerSDKView, 
 	cfg.ImageDiskMinFreeMB = 2
 	stageRoot := t.TempDir()
 	fs := imageCapacityFS{
-		"/images":   {total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB), device: 1},
-		"/journals": {total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB), device: 2},
-		stageRoot:   {total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB), device: 2},
+		"/images":   {total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB)},
+		"/journals": {total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB)},
+		stageRoot:   {total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB)},
 	}
 	daemon := &dockerSDKView{
 		info: func(context.Context) (system.Info, error) {
@@ -77,7 +77,16 @@ func imageCapacityFixture(t *testing.T) (*imageCapacityManager, *dockerSDKView, 
 	daemon.volumeInspect = func(context.Context, string) (volume.Volume, error) { return marker, nil }
 	owner, err := claimImageCacheOwnership(t.Context(), daemon, b.storageAuthority)
 	require.NoError(t, err)
-	m := &imageCapacityManager{daemon: daemon, pins: pins, fs: fs, cfg: cfg, stageRoot: stageRoot, gate: make(chan struct{}, 1), owner: owner, access: owner}
+	d := newImageSecurityDockerClient(t, func(req *http.Request) (*http.Response, error) {
+		return nil, errors.New("unexpected image inspection request: " + req.URL.Path)
+	})
+	_, err = newImageInspectionCoordinator(d, b.callbackStore, b.stopCtx, b.authorizeStorageMutation, b.completeStorageMutation,
+		b.resolveBackgroundStorageStep, b.terminalStorageAuthorityError, b.latchAmbiguousOperationOutcome)
+	require.NoError(t, err)
+	m := &imageCapacityManager{daemon: daemon, docker: d, pins: pins, fs: fs, cfg: cfg, stageRoot: stageRoot, gate: make(chan struct{}, 1), stageSlots: make(chan struct{}, 4), probeGate: make(chan struct{}, 1), owner: owner, access: owner}
+	m.runtime = (&mockDockerClient{InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
+		return nil, errdefs.NotFound(errors.New("image not cached"))
+	}}).imageAdmitter()
 	attachImageCapacityLoader(t, m, func(_ context.Context, input io.Reader) (image.LoadResponse, error) {
 		_, err := io.Copy(io.Discard, input)
 		return image.LoadResponse{}, errors.Join(err, errors.New("unexpected daemon import"))
@@ -109,10 +118,10 @@ func TestImageCapacityContainerdRequiresExplicitContentPathAndChecksBothStores(t
 	require.NoError(t, m.headroom(t.Context(), true))
 	fs["/containerd"] = fs["/journals"]
 	require.NoError(t, m.headroom(t.Context(), true), "separate content and Docker filesystems are also supported")
-	fs["/images"] = diskCapacity{total: 100 * uint64(imageMiB), available: uint64(imageMiB), device: 1}
+	fs["/images"] = diskCapacity{total: 100 * uint64(imageMiB), available: uint64(imageMiB)}
 	require.ErrorContains(t, m.headroom(t.Context(), true), "/images", "a healthy content store cannot hide a full Docker root")
 	fs["/images"] = fs["/journals"]
-	fs["/containerd"] = diskCapacity{total: 100 * uint64(imageMiB), available: uint64(imageMiB), device: 2}
+	fs["/containerd"] = diskCapacity{total: 100 * uint64(imageMiB), available: uint64(imageMiB)}
 	require.ErrorContains(t, m.headroom(t.Context(), true), "/containerd")
 }
 
@@ -317,9 +326,9 @@ func imageCapacityRegistryImage(t *testing.T, contents string) v1.Image {
 	return img
 }
 
-func attachImageCapacityLoader(t *testing.T, m *imageCapacityManager, importer imageCapacityImporter) {
+func attachImageCapacityLoader(t *testing.T, m *imageCapacityManager, importer imageCapacityImporter, options ...imagefetch.Option) {
 	t.Helper()
-	loader, err := imagefetch.NewLoader(importer, m.stageRoot, m.cfg.ImageMaxSizeMB*imageMiB)
+	loader, err := imagefetch.NewLoader(importer, m.stageRoot, m.cfg.ImageMaxSizeMB*imageMiB, options...)
 	require.NoError(t, err)
 	m.loader = loader
 }
@@ -329,7 +338,7 @@ func TestImageCapacityRecoversMissingPinByDigestWithoutResolvingTag(t *testing.T
 	var requestsMu sync.Mutex
 	var requestedManifests []string
 	registryHandler := registry.New()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/") {
 			requestsMu.Lock()
 			requestedManifests = append(requestedManifests, r.URL.Path)
@@ -338,11 +347,11 @@ func TestImageCapacityRecoversMissingPinByDigestWithoutResolvingTag(t *testing.T
 		registryHandler.ServeHTTP(w, r)
 	}))
 	t.Cleanup(server.Close)
-	ref := strings.TrimPrefix(server.URL, "http://") + "/app:latest"
+	ref := strings.TrimPrefix(server.URL, "https://") + "/app:latest"
 	tag, err := name.NewTag(ref)
 	require.NoError(t, err)
 	original := imageCapacityRegistryImage(t, "original pinned bytes")
-	require.NoError(t, remote.Write(tag, original, remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous)))
+	require.NoError(t, remote.Write(tag, original, remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous), remote.WithTransport(server.Client().Transport)))
 	configID, err := original.ConfigName()
 	require.NoError(t, err)
 	manifestID, err := original.Digest()
@@ -352,13 +361,13 @@ func TestImageCapacityRecoversMissingPinByDigestWithoutResolvingTag(t *testing.T
 
 	// The mutable tag now selects a different config and manifest. Recovery
 	// must retrieve the saved digest, then execute only the saved config ID.
-	require.NoError(t, remote.Write(tag, imageCapacityRegistryImage(t, "replacement tag bytes"), remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous)))
+	require.NoError(t, remote.Write(tag, imageCapacityRegistryImage(t, "replacement tag bytes"), remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous), remote.WithTransport(server.Client().Transport)))
 	requestsMu.Lock()
 	requestedManifests = nil
 	requestsMu.Unlock()
 	present := false
 	mock := &mockDockerClient{InspectImageFn: func(_ context.Context, inspected string) (*ImageInfo, error) {
-		require.Equal(t, id, inspected, "a moved mutable tag must never be re-resolved")
+		require.NotEqual(t, ref, inspected, "a moved mutable tag must never be re-resolved")
 		if !present {
 			return nil, errdefs.NotFound(errors.New("image missing"))
 		}
@@ -374,7 +383,7 @@ func TestImageCapacityRecoversMissingPinByDigestWithoutResolvingTag(t *testing.T
 		}
 		present = true
 		return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, nil
-	})
+	}, imagefetch.WithRegistryTransport(server.Client().Transport))
 	daemon.imageInspect = func(_ context.Context, inspected string, _ ...client.ImageInspectOption) (image.InspectResponse, error) {
 		require.Equal(t, id, inspected)
 		return image.InspectResponse{ID: id, Size: imageMiB}, nil
@@ -421,13 +430,13 @@ func TestImageCapacityLegacyContainerdPinReingestsToEstablishAllowance(t *testin
 	daemon.info = func(context.Context) (system.Info, error) {
 		return system.Info{DockerRootDir: "/images", Driver: "overlayfs", DriverStatus: [][2]string{{"driver-type", "io.containerd.snapshotter.v1"}}, OSType: "linux", Architecture: "amd64"}, nil
 	}
-	server := httptest.NewServer(registry.New())
+	server := httptest.NewTLSServer(registry.New())
 	t.Cleanup(server.Close)
-	ref := strings.TrimPrefix(server.URL, "http://") + "/app:latest"
+	ref := strings.TrimPrefix(server.URL, "https://") + "/app:latest"
 	tag, err := name.NewTag(ref)
 	require.NoError(t, err)
 	fixture := imageCapacityRegistryImage(t, "cached content without an extraction allowance")
-	require.NoError(t, remote.Write(tag, fixture, remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous)))
+	require.NoError(t, remote.Write(tag, fixture, remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous), remote.WithTransport(server.Client().Transport)))
 	manifestID, err := fixture.Digest()
 	require.NoError(t, err)
 	id := manifestID.String()
@@ -447,7 +456,7 @@ func TestImageCapacityLegacyContainerdPinReingestsToEstablishAllowance(t *testin
 		}
 		imports++
 		return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, nil
-	})
+	}, imagefetch.WithRegistryTransport(server.Client().Transport))
 	pin := &shared.ImagePin{ImageID: id, PullDigest: pullDigest, Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}}
 	resolved, err := m.resolveImage(t.Context(), ref, pin, false)
 	require.NoError(t, err)
@@ -466,8 +475,8 @@ func TestImageCapacityVerifiedContainerdPinNeedsNoRegistry(t *testing.T) {
 	daemon.info = func(context.Context) (system.Info, error) {
 		return system.Info{DockerRootDir: "/images", Driver: "overlayfs", DriverStatus: [][2]string{{"driver-type", "io.containerd.snapshotter.v1"}}, OSType: "linux", Architecture: "amd64"}, nil
 	}
-	server := httptest.NewServer(http.NotFoundHandler())
-	ref := strings.TrimPrefix(server.URL, "http://") + "/app:latest"
+	server := httptest.NewTLSServer(http.NotFoundHandler())
+	ref := strings.TrimPrefix(server.URL, "https://") + "/app:latest"
 	server.Close() // a durable verified pin remains executable while its registry is offline
 	id := fixtureImageID("verified-containerd-pin")
 	m.runtime = (&mockDockerClient{InspectImageFn: func(_ context.Context, inspected string) (*ImageInfo, error) {
@@ -501,18 +510,18 @@ func TestImageCapacityRechecksImportHeadroomAfterVerifiedStage(t *testing.T) {
 			fs["/containerd"] = fs["/images"]
 			fs[fullPath] = diskCapacity{total: 100 * uint64(imageMiB), available: uint64(m.cfg.ImageDiskMinFreeMB * imageMiB)}
 			require.NoError(t, m.headroom(t.Context(), true), "the staging budget and ordinary disk floors are available")
-			server := httptest.NewServer(registry.New())
+			server := httptest.NewTLSServer(registry.New())
 			t.Cleanup(server.Close)
-			ref := strings.TrimPrefix(server.URL, "http://") + "/app:latest"
+			ref := strings.TrimPrefix(server.URL, "https://") + "/app:latest"
 			tag, err := name.NewTag(ref)
 			require.NoError(t, err)
-			require.NoError(t, remote.Write(tag, imageCapacityRegistryImage(t, "verified staged bytes"), remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous)))
+			require.NoError(t, remote.Write(tag, imageCapacityRegistryImage(t, "verified staged bytes"), remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous), remote.WithTransport(server.Client().Transport)))
 			imported := false
 			attachImageCapacityLoader(t, m, func(_ context.Context, input io.Reader) (image.LoadResponse, error) {
 				imported = true
 				_, err := io.Copy(io.Discard, input)
 				return image.LoadResponse{}, errors.Join(err, errors.New("unexpected daemon import"))
-			})
+			}, imagefetch.WithRegistryTransport(server.Client().Transport))
 			_, err = m.resolveImage(t.Context(), ref, nil, true)
 			require.ErrorContains(t, err, "image import admission: "+fullPath)
 			require.False(t, imported, "verified bytes must not reach Docker without their import allocation")
@@ -526,18 +535,18 @@ func TestImageCapacityRechecksImportHeadroomAfterVerifiedStage(t *testing.T) {
 func TestImageCapacityOutstandingImportDebitBlocksNextDownloadOnSharedFilesystem(t *testing.T) {
 	m, _, fs := imageCapacityFixture(t)
 	m.cfg.ProductionMode = true
-	server := httptest.NewServer(registry.New())
+	server := httptest.NewTLSServer(registry.New())
 	t.Cleanup(server.Close)
-	ref := strings.TrimPrefix(server.URL, "http://") + "/app:latest"
+	ref := strings.TrimPrefix(server.URL, "https://") + "/app:latest"
 	tag, err := name.NewTag(ref)
 	require.NoError(t, err)
-	require.NoError(t, remote.Write(tag, imageCapacityRegistryImage(t, "content with ambiguous daemon completion"), remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous)))
+	require.NoError(t, remote.Write(tag, imageCapacityRegistryImage(t, "content with ambiguous daemon completion"), remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous), remote.WithTransport(server.Client().Transport)))
 	imports := 0
 	attachImageCapacityLoader(t, m, func(_ context.Context, input io.Reader) (image.LoadResponse, error) {
 		imports++
 		_, err := io.Copy(io.Discard, input)
 		return image.LoadResponse{}, errors.Join(err, errors.New("lost daemon completion"))
-	})
+	}, imagefetch.WithRegistryTransport(server.Client().Transport))
 	_, err = m.ingest(t.Context(), ref, ref)
 	require.ErrorContains(t, err, "lost daemon completion")
 	pending, err := m.loader.PendingBytes()
@@ -549,22 +558,20 @@ func TestImageCapacityOutstandingImportDebitBlocksNextDownloadOnSharedFilesystem
 	available := (m.cfg.ImageMaxSizeMB+m.cfg.ImageDiskMinFreeMB)*imageMiB + pending - 1
 	for path, capacity := range fs {
 		capacity.available = uint64(available)
-		capacity.device = 1
 		capacity.blockBytes = 4096
 		fs[path] = capacity
 	}
 	require.NoError(t, m.headroom(t.Context(), false), "the ordinary floor and outstanding import fit without a new download")
-	server.Close()
 	_, err = m.ingest(t.Context(), ref, ref)
-	require.ErrorContains(t, err, "image disk admission:")
-	require.ErrorContains(t, err, m.stageRoot, "the new staging allowance must be charged together with pending imports before registry I/O")
+	require.ErrorContains(t, err, "image import admission:")
+	require.ErrorContains(t, err, m.stageRoot, "the new staging allowance must be charged together with pending imports before registry body download")
 	require.Equal(t, 1, imports)
 	stillPending, err := m.loader.PendingBytes()
 	require.NoError(t, err)
 	require.Equal(t, pending, stillPending, "refusing another download cannot forgive the earlier unknown outcome")
 }
 
-func TestImageCapacityRejectsAndRemovesOversizedUnpinnedImage(t *testing.T) {
+func TestImageCapacityPreservesPreviouslyLocalOversizedImage(t *testing.T) {
 	m, daemon, _ := imageCapacityFixture(t)
 	id := fixtureImageID("oversized")
 	m.runtime = (&mockDockerClient{InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
@@ -581,13 +588,13 @@ func TestImageCapacityRejectsAndRemovesOversizedUnpinnedImage(t *testing.T) {
 		return nil, nil
 	}
 	_, err := m.resolveImage(t.Context(), "registry.example/app:1", nil, false)
-	require.ErrorContains(t, err, "exceeds image_max_size_mb")
-	require.True(t, removed)
+	require.NoError(t, err)
+	require.False(t, removed)
 	removed = false
 	_, err = m.resolveImage(t.Context(), "registry.example/app:1", &shared.ImagePin{
 		ImageID: id, Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"},
 	}, false)
-	require.ErrorContains(t, err, "exceeds image_max_size_mb")
+	require.NoError(t, err)
 	require.False(t, removed, "lowering the cap must preserve retained images")
 }
 

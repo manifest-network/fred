@@ -323,12 +323,14 @@ func TestPendingRestoreFinalizerBlocksDestinationReuseUntilHandback(t *testing.T
 		MaintenanceID: newTestMaintenanceID(t), LeaseUUID: destination,
 		CallbackURL: testMaintenanceLifecycleCallbackURL,
 	})
-	require.ErrorIs(t, restartErr, backend.ErrInvalidState)
+	require.True(t, shared.IsLifecyclePending(restartErr), restartErr)
+	require.NotErrorIs(t, restartErr, backend.ErrInvalidState)
 	updateErr := b.Update(context.Background(), backend.UpdateRequest{
 		MaintenanceID: newTestMaintenanceID(t), LeaseUUID: destination,
 		CallbackURL: testMaintenanceLifecycleCallbackURL,
 	})
-	require.ErrorIs(t, updateErr, backend.ErrInvalidState)
+	require.True(t, shared.IsLifecyclePending(updateErr), updateErr)
+	require.NotErrorIs(t, updateErr, backend.ErrInvalidState)
 
 	proof, err := retentions.ProveRestoringSnapshot(*claimed)
 	require.NoError(t, err)
@@ -419,7 +421,8 @@ func TestRecoverState_PendingRestoreCleanupCountsAllocationWithoutRestartablePro
 	restartErr := b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID: destinationLease, CallbackURL: testMaintenanceLifecycleCallbackURL,
 	})
-	require.ErrorIs(t, restartErr, backend.ErrInvalidState)
+	require.True(t, shared.IsLifecyclePending(restartErr), restartErr)
+	require.NotErrorIs(t, restartErr, backend.ErrInvalidState)
 }
 
 func TestRestore_CanceledWhileWaitingForRecoverySnapshotHasNoSideEffects(t *testing.T) {

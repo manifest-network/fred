@@ -94,6 +94,7 @@ type releaseHistoryCapacityPlanner interface {
 // by Docker. Tests may wrap it to inject commit failures without regaining any
 // raw status-selected or caller-spliced mutation API.
 type operationSettlementService interface {
+	AdmitProvisionManifest(context.Context, string, string, string, []backend.LeaseItem, []byte) (shared.ProvisionManifestAdmission, error)
 	NewOperationIntentProbe(string, string) (shared.OperationIntentProbe, error)
 	ProbeOperationIntent(shared.OperationIntentProbe) (shared.OperationIntentAdmissionDisposition, error)
 	NewOperationIntentCandidate(shared.OperationIntentSpec) (shared.OperationIntentCandidate, error)
@@ -2523,6 +2524,17 @@ func (b *Backend) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to recover state: %w", err)
 	}
+	if b.imageCapacity != nil && b.imageCapacity.backfiller != nil {
+		backfillCtx, cancelBackfill := b.startupPhaseContext(startupCtx)
+		report, err := b.imageCapacity.backfiller.Sweep(backfillCtx)
+		cancelBackfill()
+		if err != nil || report.UnresolvedLeases != 0 {
+			b.logger.Warn("legacy image pin backfill incomplete; image collection remains conservative",
+				"pins_added", report.PinsAdded, "unresolved_leases", report.UnresolvedLeases, "error", err)
+		} else if report.PinsAdded != 0 {
+			b.logger.Info("backfilled immutable image pins from existing containers", "pins_added", report.PinsAdded)
+		}
+	}
 	// Pending operation recovery is the sole owner of the write-ahead window.
 	// Run it before retention reconciliation: a Restoring finalizer must not read
 	// one empty/transitional Docker snapshot as rollback authority while an exact
@@ -2714,6 +2726,11 @@ func (b *Backend) waitForShutdownDrain() error {
 	b.shutdownWaitOnce.Do(func() {
 		b.shutdownWaitDone = make(chan struct{})
 		go func() {
+			if b.imageCapacity != nil && b.imageCapacity.loader != nil {
+				// Close import admission and start the same bounded completion
+				// grace used by daemon launches before draining workers/stores.
+				_ = b.imageCapacity.loader.Shutdown(context.Background())
+			}
 			b.wg.Wait()
 			close(b.shutdownWaitDone)
 		}()

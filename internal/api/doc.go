@@ -39,11 +39,18 @@
 //
 // # Rate Limiting
 //
-// The server implements two layers of rate limiting:
-//   - Per-IP rate limiting for all requests (via RateLimiter)
+// Tenant and observability routes use:
+//   - Per-IP rate limiting (via RateLimiter)
 //   - Per-tenant rate limiting for authenticated endpoints (via TenantRateLimiter)
 //
 // Both use token bucket algorithms with configurable RPS and burst sizes.
+// POST /callbacks/provision instead has independent, fixed 100 RPS / 200 burst
+// buckets for ingress IPs and verified backend storage identities. A valid HMAC
+// may bypass an exhausted ingress bucket, but still spends its storage budget.
+// This isolates backend completion from tenant traffic sharing the same NAT.
+// The shared wire decoder bounds every callback to 1 MiB, 256 structural tokens,
+// and 16 nesting levels before JSON decoding. Exact signed retries remain
+// authenticated and budgeted; there is no callback replay cache.
 //
 // # Endpoints
 //

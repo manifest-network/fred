@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -38,6 +39,7 @@ type inspectionDaemon struct {
 	removeVolumes []bool
 	createConfigs []*container.Config
 	createHosts   []*container.HostConfig
+	imageLabels   map[string]string
 	createErr     error
 	createStatus  int
 	removeErr     error
@@ -53,7 +55,9 @@ func (d *inspectionDaemon) request(t *testing.T, req *http.Request) (*http.Respo
 	path := req.URL.Path
 	switch {
 	case strings.Contains(path, "/images/"):
-		return imageSecurityResponse(200, fmt.Sprintf(`{"Id":%q,"Os":"linux","Architecture":"amd64","Config":{"Volumes":{"/data":{}},"User":"app"}}`, testImageID)), nil
+		labels, err := json.Marshal(d.imageLabels)
+		require.NoError(t, err)
+		return imageSecurityResponse(200, fmt.Sprintf(`{"Id":%q,"Os":"linux","Architecture":"amd64","Config":{"Volumes":{"/data":{}},"User":"app","Labels":%s}}`, testImageID, labels)), nil
 	case strings.HasSuffix(path, "/containers/create"):
 		if d.beforeCreate != nil {
 			d.beforeCreate()
@@ -64,6 +68,13 @@ func (d *inspectionDaemon) request(t *testing.T, req *http.Request) (*http.Respo
 		}
 		require.NoError(t, json.NewDecoder(req.Body).Decode(&request))
 		config := request.Config
+		// Docker inherits image labels verbatim, then overlays Create labels.
+		labels := maps.Clone(d.imageLabels)
+		if labels == nil {
+			labels = make(map[string]string)
+		}
+		maps.Copy(labels, config.Labels)
+		config.Labels = labels
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		d.creates++
@@ -443,7 +454,7 @@ func TestImageInspectionBackendAuthorityLossRetainsHelperForFreshOwner(t *testin
 }
 
 func TestImageInspectionRecoveryRefusesForeignHelperIdentity(t *testing.T) {
-	for _, field := range []string{"name", "image", "label", "container ID", "workload label", "running"} {
+	for _, field := range []string{"name", "image", "label", "container ID", "workload label", "compose project", "running"} {
 		t.Run(field, func(t *testing.T) {
 			h := newInspectionHarness(t)
 			h.daemon.copy = func(_ context.Context, path string) (io.ReadCloser, error) { return inspectionTar(t, path), nil }
@@ -470,6 +481,8 @@ func TestImageInspectionRecoveryRefusesForeignHelperIdentity(t *testing.T) {
 				actual.ID = strings.Repeat("f", 64)
 			case "workload label":
 				actual.Config.Labels[LabelManaged] = "true"
+			case "compose project":
+				actual.Config.Labels["com.docker.compose.project"] = "foreign-project"
 			case "running":
 				actual.State.Running = true
 			}

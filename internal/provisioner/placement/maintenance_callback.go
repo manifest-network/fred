@@ -27,7 +27,8 @@ func (coordinator *AuthenticatedCallbackCoordinator) recordMaintenanceCompletion
 	s := coordinator.coordinator.store
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+	changed := false
+	err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
 		pending, records, err := maintenanceCommandBuckets(tx)
 		if err != nil {
 			return err
@@ -66,7 +67,11 @@ func (coordinator *AuthenticatedCallbackCoordinator) recordMaintenanceCompletion
 			if err != nil {
 				return err
 			}
-			return records.Put(key, value)
+			if err := records.Put(key, value); err != nil {
+				return err
+			}
+			changed = true
+			return nil
 		}
 		if callback.Status() != backend.CallbackStatusFailed {
 			return errors.New("maintenance completion has invalid terminal status")
@@ -83,6 +88,16 @@ func (coordinator *AuthenticatedCallbackCoordinator) recordMaintenanceCompletion
 		if err := records.Put(key, value); err != nil {
 			return err
 		}
-		return pending.Delete([]byte(callback.LeaseUUID()))
+		if err := pending.Delete([]byte(callback.LeaseUUID())); err != nil {
+			return err
+		}
+		changed = true
+		return nil
 	})
+	if err == nil && changed {
+		s.maintenanceCompletionVersion.Add(1)
+		s.wakeMaintenance()
+	}
+	return err
+
 }

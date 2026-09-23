@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -168,9 +169,8 @@ func TestDaemonLaunchCancellationDrainsAdmittedExchangeAndClosesBodyContext(t *t
 			var exchangeCtx context.Context
 			response, err := scope.roundTrip(dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 				exchangeCtx = req.Context()
-				deadline, bounded := exchangeCtx.Deadline()
-				require.True(t, bounded)
-				require.InDelta(t, daemonLaunchRequestTimeout.Seconds(), time.Until(deadline).Seconds(), 1)
+				_, bounded := exchangeCtx.Deadline()
+				require.False(t, bounded, "an uncanceled exchange has no artificial completion deadline")
 				cancel()
 				require.NoError(t, exchangeCtx.Err(), "preemption must not cancel an admitted exchange")
 				status := http.StatusCreated
@@ -182,10 +182,111 @@ func TestDaemonLaunchCancellationDrainsAdmittedExchangeAndClosesBodyContext(t *t
 			require.NoError(t, err)
 			require.NoError(t, exchangeCtx.Err(), "the SDK still needs to consume the response body")
 			require.NoError(t, response.Body.Close())
-			require.ErrorIs(t, exchangeCtx.Err(), context.Canceled, "closing the response releases its timeout")
+			require.ErrorIs(t, exchangeCtx.Err(), context.Canceled, "closing the response releases its completion lifetime")
 			require.True(t, scope.finish(ctx.Err()).settled)
 		})
 	}
+}
+
+func TestDaemonLaunchPreservesUncanceledSlowRequests(t *testing.T) {
+	for _, endpoint := range []string{"create", "source/start"} {
+		t.Run(endpoint, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+				defer cancel()
+				scope := newDaemonLaunchScope(ctx, nil)
+				request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker.invalid/v1.51/containers/"+endpoint, nil)
+				require.NoError(t, err)
+				response, err := scope.roundTrip(dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					time.Sleep(2 * daemonLaunchCompletionGrace)
+					if err := req.Context().Err(); err != nil {
+						return nil, err
+					}
+					status := http.StatusCreated
+					if endpoint != "create" {
+						status = http.StatusNoContent
+					}
+					return imageSecurityResponse(status, `{}`), nil
+				}), request)
+				require.NoError(t, err, "the normal operation deadline, rather than 30 seconds since dispatch, bounds live work")
+				require.NoError(t, response.Body.Close())
+				require.True(t, scope.finish(nil).settled)
+			})
+		})
+	}
+}
+
+func TestDaemonLaunchCopiedScopeDrainsLiveDetachedRequest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		scope := newDaemonLaunchScope(t.Context(), nil)
+		copied := *scope
+		entered := make(chan struct{})
+		finished := make(chan error, 1)
+		request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://docker.invalid/v1.51/containers/create", nil)
+		require.NoError(t, err)
+		transport := dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			close(entered)
+			time.Sleep(2 * daemonLaunchCompletionGrace)
+			if err := req.Context().Err(); err != nil {
+				return nil, err
+			}
+			return imageSecurityResponse(http.StatusCreated, `{}`), nil
+		})
+		go func() {
+			response, err := scope.roundTrip(transport, request)
+			if err == nil {
+				err = response.Body.Close()
+			}
+			finished <- err
+		}()
+		<-entered
+		outcome := copied.finish(errors.New("Compose returned before its admitted worker"))
+		require.True(t, outcome.settled, "copied scopes share the admitted request and its full normal lifetime")
+		require.NoError(t, <-finished)
+		_, err = scope.roundTrip(transport, request)
+		require.ErrorContains(t, err, "invocation has ended")
+	})
+}
+
+func TestDaemonLaunchDetachedRequestHasBoundedGraceAfterInvocationCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		scope := newDaemonLaunchScope(ctx, nil)
+		entered := make(chan struct{})
+		returned := make(chan error, 1)
+		request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://docker.invalid/v1.51/containers/create", nil)
+		require.NoError(t, err)
+		go func() {
+			_, err := scope.roundTrip(dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				close(entered)
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			}), request)
+			returned <- err
+		}()
+		<-entered
+		drained := make(chan daemonLaunchOutcome, 1)
+		go func() { drained <- scope.finish(errors.New("worker still running")) }()
+		time.Sleep(2 * daemonLaunchCompletionGrace)
+		select {
+		case <-drained:
+			t.Fatal("uncanceled invocation must keep draining its admitted request")
+		default:
+		}
+		cancel()
+		synctest.Wait()
+		time.Sleep(daemonLaunchCompletionGrace - time.Second)
+		select {
+		case <-returned:
+			t.Fatal("caller cancellation must leave the entire completion grace")
+		default:
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		require.ErrorIs(t, <-returned, context.Canceled)
+		require.False(t, (<-drained).settled, "expiration supplies no daemon completion evidence")
+	})
 }
 
 // Model Compose returning cancellation after one admitted Create finishes.

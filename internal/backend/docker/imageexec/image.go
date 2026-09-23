@@ -27,7 +27,7 @@ type imageRecord struct {
 	id        string
 	platform  ocispec.Platform
 	user      string
-	volumes   []string
+	metadata  Metadata
 }
 
 // Image is an admitted, independently addressable immutable image. Only Admit
@@ -73,7 +73,7 @@ func (i Image) Volumes() []string {
 	if i.record == nil {
 		return nil
 	}
-	return slices.Clone(i.record.volumes)
+	return i.record.metadata.Volumes()
 }
 
 func (i Image) requireIssuer(owner *issuer) error {

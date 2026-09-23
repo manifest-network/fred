@@ -298,6 +298,9 @@ func TestInterruptedRestoreRecovery_MissingSourceFinalizerFailsStartupClosed(t *
 
 			err := f.b.Start(context.Background())
 			require.ErrorContains(t, err, "restore source finalizer is absent")
+			var authorityFailure *operationRecoveryAuthorityFailure
+			require.ErrorAs(t, err, &authorityFailure,
+				"loss of durable source ownership is distinct from a lease-local Docker observation")
 			assert.Empty(t, f.snapshotEvents(),
 				"startup must not tear down or re-quarantine substrate without source authority")
 

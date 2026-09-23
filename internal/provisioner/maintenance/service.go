@@ -172,6 +172,10 @@ func (service *Service) Start(ctx context.Context, interval time.Duration) error
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-service.application.CompletionChanged():
+			if err := service.RecoverPending(ctx); err != nil && ctx.Err() == nil {
+				slog.Warn("completed maintenance recovery pass incomplete", "error", err)
+			}
 		case <-ticker.C:
 			if err := service.RecoverPending(ctx); err != nil && ctx.Err() == nil {
 				slog.Warn("pending maintenance recovery pass incomplete", "error", err)

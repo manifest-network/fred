@@ -500,15 +500,12 @@ func (s *MaintenanceSettlement) BeginMaintenanceIntent(
 			switch state := head.(type) {
 			case operationLeaseMutationHead:
 				if state.claim.entry.State == operationIntentPending {
-					return fmt.Errorf("%w for lease %q: operation is already admitted",
-						ErrMaintenanceIntentConflict, entry.LeaseUUID)
+					return &maintenanceContention{leaseUUID: entry.LeaseUUID}
 				}
 			case maintenanceLeaseMutationHead:
-				return fmt.Errorf("%w for lease %q: maintenance is already admitted",
-					ErrMaintenanceIntentConflict, entry.LeaseUUID)
+				return &maintenanceContention{leaseUUID: entry.LeaseUUID}
 			case closeLeaseMutationHead:
-				return fmt.Errorf("%w for lease %q: close is already admitted",
-					ErrMaintenanceIntentConflict, entry.LeaseUUID)
+				return &maintenanceContention{leaseUUID: entry.LeaseUUID}
 			case closedLeaseMutationHead:
 				return fmt.Errorf("%w for lease %q: lease is permanently closed",
 					ErrMaintenanceIntentConflict, entry.LeaseUUID)

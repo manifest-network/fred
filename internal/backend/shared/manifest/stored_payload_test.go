@@ -38,3 +38,22 @@ func TestStoredPayloadRejectsCorruptRecoveryTopology(t *testing.T) {
 		})
 	}
 }
+
+func TestStoredPayloadPreservesPortExecutionEncoding(t *testing.T) {
+	for _, ports := range []string{
+		`{"80":{}}`, `{"80/tcp/extra":{}}`, `{"0/tcp":{}}`,
+		`{"65536/tcp":{}}`, `{"bad/tcp":{}}`, `{"80/sctp":{}}`,
+		`{"80/tcp":{"host_port":-1}}`, `{"80/tcp":{"host_port":65536}}`,
+	} {
+		t.Run(ports, func(t *testing.T) {
+			payload := []byte(`{"services":{"app":{"image":"nginx:1","ports":` + ports + `}}}`)
+			_, err := ParseStoredPayload(payload)
+			require.ErrorContains(t, err, "invalid port")
+		})
+	}
+	payload := []byte(`{"services":{"app":{"image":"nginx:1","ports":{"80/tcp":{"host_port":8080},"53/udp":{}},"labels":{"com.docker.compose.project":"legacy"},"user":"1:2:3"}}}`)
+	_, err := ParseStoredPayload(payload)
+	require.NoError(t, err, "stable port encoding must not reapply evolving label or USER policy")
+	_, err = ParsePayload(payload)
+	require.Error(t, err)
+}

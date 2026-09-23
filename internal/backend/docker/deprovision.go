@@ -261,7 +261,7 @@ func (b *Backend) doDeprovisionScoped(
 		}
 		if pending, ok := outcome.(shared.CloseExecutionPending); ok {
 			if !pending.RetryableNow() {
-				return fmt.Errorf("recovered close remains ambiguous: %w", pending.Cause())
+				return fmt.Errorf("recovered close remains ambiguous: %w", pending)
 			}
 			execution, retryErr := b.closeSettlement.RetryCloseExecution(pending)
 			if retryErr != nil {
@@ -284,10 +284,7 @@ func (b *Backend) doDeprovisionScoped(
 	case shared.CloseExecutionRetained:
 		err = b.completeCloseOutcome(terminal)
 	case shared.CloseExecutionPending:
-		err = terminal.Cause()
-		if err == nil {
-			err = errors.New("close execution remains pending")
-		}
+		err = terminal
 		b.markClosePending(leaseUUID, err)
 		return err
 	default:

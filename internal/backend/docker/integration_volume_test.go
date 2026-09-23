@@ -1414,9 +1414,10 @@ func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing
 	require.NoError(t, os.Mkdir(deleteStagePath, 0o700))
 	// Model a power loss after mkdir but before prepare's project-0 reset by
 	// deliberately charging the sibling itself to the retiring project.
-	out, err := exec.CommandContext(ctx, "xfs_quota",
-		xfsQuotaArgs(xfsProjectRootSetupCmd(deleteStagePath, projID), mount)...).CombinedOutput()
-	require.NoError(t, err, "tag pre-reset delete-stage fixture: %s", out)
+	preResetRoot, err := os.OpenRoot(deleteStagePath)
+	require.NoError(t, err)
+	require.NoError(t, (linuxXFSProjectAttributes{}).SetProjectID(preResetRoot, projID))
+	require.NoError(t, preResetRoot.Close())
 	parent, err := os.Open(dataPath)
 	require.NoError(t, err)
 	require.NoError(t, parent.Sync())
@@ -1444,7 +1445,7 @@ func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing
 	// proof. Read the typed kernel attribute rather than xfsprogs report prose.
 	deleteStageRoot, err := os.OpenRoot(deleteStagePath)
 	require.NoError(t, err)
-	deleteStageAttr, readAttrErr := (linuxXFSProjectAttributeReader{}).ReadProjectAttributes(deleteStageRoot)
+	deleteStageAttr, readAttrErr := (linuxXFSProjectAttributes{}).ReadProjectAttributes(deleteStageRoot)
 	closeRootErr := deleteStageRoot.Close()
 	require.NoError(t, readAttrErr)
 	require.NoError(t, closeRootErr)

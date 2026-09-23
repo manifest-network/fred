@@ -140,6 +140,9 @@ func (b *Backend) routeReplaceRestart(
 	if b.callbackStore != nil && b.releaseStore != nil {
 		disposition, err := b.maintenanceSettlement.ProbeMaintenanceIntent(request)
 		if err != nil {
+			if shared.IsLifecyclePending(err) {
+				return err
+			}
 			if errors.Is(err, shared.ErrMaintenanceIntentConflict) {
 				return fmt.Errorf("%w: maintenance id conflicts with stored restart authority", backend.ErrInvalidState)
 			}
@@ -229,11 +232,17 @@ func (b *Backend) routeReplaceRestart(
 	if marshalErr != nil {
 		return fmt.Errorf("failed to marshal manifest for release: %w", marshalErr)
 	}
+	// Current domains were already emitted; custom-domain overrides passed the
+	// reconciliation DNS gate. Do not revoke either decision on a second lookup.
+	ingress, ingressErr := newEffectiveIngressPlan(b.cfg.Ingress, stackManifest, items)
+	if ingressErr != nil {
+		return fmt.Errorf("plan restart ingress: %w", ingressErr)
+	}
 	admission, admitErr := b.admitMaintenance(request, sourceClaim, shared.Release{
 		Manifest:               manifestBytes,
 		Image:                  "stack",
 		OperationID:            active.OperationID,
-		Items:                  slices.Clone(items),
+		Items:                  ingress.effectiveItems(),
 		ResourceProfiles:       resourceProfiles,
 		RuntimeAuthority:       runtimeAuthority,
 		LegacyRuntimeAuthority: legacyRuntimeAuthority,
@@ -383,6 +392,9 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	if b.callbackStore != nil && b.releaseStore != nil {
 		disposition, err := b.maintenanceSettlement.ProbeMaintenanceIntent(request)
 		if err != nil {
+			if shared.IsLifecyclePending(err) {
+				return err
+			}
 			if errors.Is(err, shared.ErrMaintenanceIntentConflict) {
 				return fmt.Errorf("%w: maintenance id conflicts with stored update authority", backend.ErrInvalidState)
 			}
@@ -506,6 +518,10 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	if authorityErr != nil {
 		return fmt.Errorf("construct update release runtime authority: %w", authorityErr)
 	}
+	ingress, ingressErr := newEffectiveIngressPlan(b.cfg.Ingress, stackManifest, items)
+	if ingressErr != nil {
+		return fmt.Errorf("plan update ingress: %w", ingressErr)
+	}
 	admission, admitErr := b.admitMaintenance(
 		request,
 		sourceClaim,
@@ -513,7 +529,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 			Manifest:               req.Payload,
 			Image:                  "stack",
 			OperationID:            active.OperationID,
-			Items:                  slices.Clone(items),
+			Items:                  ingress.effectiveItems(),
 			ResourceProfiles:       resourceProfiles,
 			RuntimeAuthority:       runtimeAuthority,
 			LegacyRuntimeAuthority: legacyRuntimeAuthority,

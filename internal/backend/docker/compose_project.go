@@ -43,13 +43,14 @@ type serviceVolBinds struct {
 	WritableBinds map[string]string // hostPath → containerPath
 }
 
-// buildComposeProject generates a compose-go Project from the parameters.
+// buildPlannedComposeProject generates a compose-go Project from the parameters
+// and the exact ingress decision that owns emitted item metadata.
 // The project is fully in-memory — no YAML files or project directories.
-func buildComposeProject(params composeProjectParams) *composetypes.Project {
+func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIngressPlan) *composetypes.Project {
 	projectName := composeProjectName(params.LeaseUUID)
 	services := make(composetypes.Services)
 
-	for _, item := range params.Items {
+	for _, item := range ingress.items {
 		svcName := item.ServiceName
 		svc := params.Stack.Services[svcName]
 		profile := params.Profiles[item.SKU]
@@ -75,9 +76,8 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 				ImgSetup:             imgSetup,
 				NetworkName:          params.NetworkName,
 				Cfg:                  params.Cfg,
-				Ingress:              params.Ingress,
+				Ingress:              ingress.routes[svcName],
 				Quantity:             item.Quantity,
-				CustomDomain:         item.CustomDomain,
 			})
 
 			// Apply volume binds if present.
@@ -237,9 +237,8 @@ type composeServiceParams struct {
 	ImgSetup             *imageSetup
 	NetworkName          string
 	Cfg                  *Config
-	Ingress              IngressConfig
+	Ingress              ingressRoute
 	Quantity             int
-	CustomDomain         string // tenant-supplied FQDN; "" when not set
 }
 
 func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfig {
@@ -411,14 +410,12 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 
 	// Inject ingress labels for auto-discovery routing.
 	applyIngressLabels(labels, ingressLabelParams{
-		LeaseUUID:    p.LeaseUUID,
-		ServiceName:  p.ServiceName,
-		Instance:     p.Instance,
-		Quantity:     p.Quantity,
-		Ingress:      p.Ingress,
-		NetworkName:  p.NetworkName,
-		CustomDomain: p.CustomDomain,
-	}, p.Manifest.Ports)
+		LeaseUUID:   p.LeaseUUID,
+		ServiceName: p.ServiceName,
+		Instance:    p.Instance,
+		Quantity:    p.Quantity,
+		NetworkName: p.NetworkName,
+	}, p.Ingress)
 
 	svc.Labels = labels
 

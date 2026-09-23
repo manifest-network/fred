@@ -1393,6 +1393,7 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 				errors.Is(err, ErrInsufficientResources) ||
 				IsReadCapacity(err) ||
 				isOperationCompletionPendingResponse(err) ||
+				isLifecyclePendingResponse(err) ||
 				errors.Is(err, ErrAlreadyProvisioned) ||
 				errors.Is(err, ErrInvalidState) ||
 				errors.Is(err, ErrNotRetained) ||
@@ -1818,6 +1819,10 @@ func (c *HTTPClient) parseCapacityError(body []byte, operation string) error {
 	if err != nil {
 		return err
 	}
+	return c.capacityError(code, msg, operation)
+}
+
+func (c *HTTPClient) capacityError(code, msg, operation string) error {
 	if code == CodeInsufficientResources {
 		return detailOr(ErrCapacityRefused, msg)
 	}
@@ -2091,6 +2096,16 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 		}
 		defer func() { _ = resp.Body.Close() }()
 
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			code, _, err := c.parseErrorCode(readErrorBodyBytes(resp), "deprovision")
+			if err != nil {
+				return nil, err
+			}
+			if code == CodeLifecyclePending {
+				return nil, &lifecyclePendingResponse{}
+			}
+			return nil, fmt.Errorf("deprovision returned unknown unavailable code %q", code)
+		}
 		if resp.StatusCode == http.StatusConflict {
 			code, msg, err := c.parseErrorCode(readErrorBodyBytes(resp), "deprovision")
 			if err != nil {
@@ -2423,7 +2438,7 @@ func executeHTTPMaintenanceCall[T RestartRequest | UpdateRequest](
 			observed = refusedMaintenanceCall(ErrInvalidState, MaintenanceRefusalInvalidState)
 			return nil, ErrInvalidState
 		case http.StatusServiceUnavailable:
-			callErr := c.parseCapacityError(readErrorBodyBytes(resp), operation)
+			callErr := c.parseMaintenanceAvailability(readErrorBodyBytes(resp), operation)
 			if errors.Is(callErr, ErrCapacityRefused) {
 				observed = refusedMaintenanceCall(callErr, MaintenanceRefusalCapacity)
 			} else {
@@ -2659,7 +2674,7 @@ func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string
 		case http.StatusNotFound:
 			return nil, ErrNotProvisioned
 		case http.StatusServiceUnavailable:
-			return nil, c.parseCapacityError(readErrorBodyBytes(resp), "reconcile_custom_domain")
+			return nil, c.parseMaintenanceAvailability(readErrorBodyBytes(resp), "reconcile_custom_domain")
 		case http.StatusConflict:
 			return nil, ErrInvalidState
 		default:

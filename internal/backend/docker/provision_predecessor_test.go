@@ -12,6 +12,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
@@ -135,7 +136,13 @@ func TestPreparedProvisionAdmissionRequiresOwnedCandidate(t *testing.T) {
 		Items: slices.Clone(spec.Items), CallbackURL: spec.CallbackURL,
 		LifecycleCallbackURL: spec.LifecycleCallbackURL, Payload: slices.Clone(spec.Manifest),
 	})
-	prepared, err := b.prepareProvisionOperation(t.Context(), request, request.Items, spec.ResourceProfiles, nil)
+	stack, err := manifest.ParseStoredPayload(spec.Manifest)
+	require.NoError(t, err)
+	ingress, err := b.admitIngressPlan(t.Context(), stack, request.Items)
+	require.NoError(t, err)
+	admitted, err := b.operationSettlement.AdmitProvisionManifest(t.Context(), request.LeaseUUID, request.Tenant, request.ProviderUUID, request.Items, request.Payload)
+	require.NoError(t, err)
+	prepared, err := b.prepareProvisionOperation(request, request.Items, ingress, spec.ResourceProfiles, nil, admitted)
 	require.NoError(t, err)
 	request.Items[0].Quantity++
 	request.Payload[0] = '!'

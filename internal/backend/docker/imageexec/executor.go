@@ -92,6 +92,7 @@ func (c *DockerCreator) Create(ctx context.Context, image Image, config *contain
 	}
 	prepared.Labels[LabelImageReference] = image.Reference()
 	prepared.Labels[LabelImageID] = image.ID()
+	image.record.metadata.record.buildLabels.apply(prepared.Labels)
 	platform := image.Platform()
 	return c.create(ctx, &prepared, host, networks, &platform, name)
 }
@@ -153,6 +154,7 @@ func (a *Admitter) Compile(project *composetypes.Project, images map[string]Imag
 			return service, fmt.Errorf("service %s image differs from its admitted reference", name)
 		}
 		service.Image = image.ID()
+		service.Name = name
 		service.Platform = platforms.FormatAll(image.Platform())
 		service.PullPolicy = composetypes.PullPolicyNever
 		if service.Labels == nil {
@@ -167,6 +169,9 @@ func (a *Admitter) Compile(project *composetypes.Project, images map[string]Imag
 		}
 		service.CustomLabels[LabelImageReference] = image.Reference()
 		service.CustomLabels[LabelImageID] = image.ID()
+		buildLabels := image.record.metadata.record.buildLabels.forProject(project.Name, name)
+		buildLabels.apply(service.Labels)
+		buildLabels.apply(service.CustomLabels)
 		return service, nil
 	})
 	if err != nil {

@@ -33,6 +33,7 @@ var (
 	ErrMaintenanceCommandNotPending = errors.New("maintenance command is not pending")
 	ErrMaintenanceJournalCorrupt    = errors.New("maintenance command journal is corrupt")
 	ErrMaintenanceHistoryFull       = errors.New("maintenance command history is full")
+	ErrMaintenancePendingFull       = errors.New("maintenance pending admission budget is full")
 )
 
 const maintenanceCommandSchema = 1
@@ -983,6 +984,9 @@ func (s *Store) beginMaintenanceCommand(
 		}
 		if len(encoded) > maxMaintenanceCommandAdmissionBytes {
 			return fmt.Errorf("%w: command exceeds %d-byte admission budget", ErrInvalidMaintenanceCommand, maxMaintenanceCommandAdmissionBytes)
+		}
+		if err := admitPendingMaintenance(pending, records, len(encoded)); err != nil {
+			return err
 		}
 		if err := records.Put(key, encoded); err != nil {
 			return err

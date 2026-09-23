@@ -226,8 +226,9 @@ type OperationIntentSpec struct {
 	// authority.
 	ResourceProfiles []SKUResourceSnapshot
 	// EffectiveItems is the exact item metadata emitted to substrate labels.
-	// It may differ from desired Items only where a custom domain was deferred
-	// by the DNS-readiness gate.
+	// It may differ from desired Items only by omitting a custom domain that
+	// ingress configuration, routable-port selection, domain validation, or DNS
+	// admission did not authorize for this exact operation.
 	EffectiveItems      []backend.LeaseItem
 	HealthCheckServices []string
 	Manifest            []byte
@@ -242,12 +243,13 @@ type OperationIntentSpec struct {
 // requires a canonical UUIDv4 operation callback and makes success and refusal
 // representable before Pending can become durable. The zero value is invalid.
 type OperationIntentCandidate struct {
-	issuer     *CallbackStore
-	settlement *OperationSettlement
-	spec       OperationIntentSpec
-	runtime    ReleaseRuntimeAuthority
-	backend    string
-	storageID  backendidentity.ID
+	provisionReplay *ReleaseClaim
+	issuer          *CallbackStore
+	settlement      *OperationSettlement
+	spec            OperationIntentSpec
+	runtime         ReleaseRuntimeAuthority
+	backend         string
+	storageID       backendidentity.ID
 }
 
 // newOperationIntentCandidate validates and detaches the complete operation
@@ -797,6 +799,9 @@ func (s *CallbackStore) beginOperationIntent(
 
 	unlock := s.lockDeliveryLease(entry.LeaseUUID)
 	defer unlock()
+	if err := candidate.verifyProvisionReplay(); err != nil {
+		return OperationIntentAdmission{}, err
+	}
 	admission := OperationIntentAdmission{}
 	err = s.update(func(tx *bolt.Tx) error {
 		head, present, err := getLeaseMutationHeadTx(tx, entry.LeaseUUID)

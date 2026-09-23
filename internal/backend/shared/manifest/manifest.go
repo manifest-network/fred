@@ -302,15 +302,11 @@ func (m *flatManifest) validate(inStack bool) error {
 		return fmt.Errorf("too many labels (%d), maximum is %d", len(m.Labels), MaxLabels)
 	}
 
-	// Validate port specifications
+	if err := validatePortEncoding(m.Ports); err != nil {
+		return err
+	}
 	var ingressPorts []string
 	for portSpec, portCfg := range m.Ports {
-		if err := validatePortSpec(portSpec); err != nil {
-			return fmt.Errorf("invalid port %q: %w", portSpec, err)
-		}
-		if portCfg.HostPort < 0 || portCfg.HostPort > 65535 {
-			return fmt.Errorf("invalid port %q: host_port must be between 0 and 65535", portSpec)
-		}
 		if portCfg.Ingress {
 			ingressPorts = append(ingressPorts, portSpec)
 			if _, ok := ParseTCPPort(portSpec); !ok {
@@ -414,6 +410,21 @@ func ParseTCPPort(spec string) (int, bool) {
 		return 0, false
 	}
 	return port, true
+}
+
+// validatePortEncoding is the stable execution shape shared by admission and
+// stored replay. Consumers decode these keys as a port/protocol pair; relaxing
+// admission policy must never admit an undecodable durable representation.
+func validatePortEncoding(ports map[string]PortConfig) error {
+	for spec, cfg := range ports {
+		if err := validatePortSpec(spec); err != nil {
+			return fmt.Errorf("invalid port %q: %w", spec, err)
+		}
+		if cfg.HostPort < 0 || cfg.HostPort > 65535 {
+			return fmt.Errorf("invalid port %q: host_port must be between 0 and 65535", spec)
+		}
+	}
+	return nil
 }
 
 // validatePortSpec validates a port specification like "80/tcp".
@@ -707,6 +718,9 @@ func (s *StackManifest) ValidateStored() error {
 		}
 		if svc.Image == "" {
 			return fmt.Errorf("service %q: image is required", name)
+		}
+		if err := validatePortEncoding(svc.Ports); err != nil {
+			return fmt.Errorf("service %q: %w", name, err)
 		}
 	}
 

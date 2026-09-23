@@ -476,13 +476,15 @@ var (
 
 // Rate limit metrics
 var (
-	// RateLimitRejectionsTotal tracks requests rejected by rate limiting.
+	// RateLimitRejectionsTotal distinguishes the tenant/observability IP bucket,
+	// authenticated tenant buckets, callback ingress IPs, and verified callback
+	// storage identities. Labels never contain an IP, tenant, or backend UUID.
 	RateLimitRejectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "api",
 		Name:      "rate_limit_rejections_total",
 		Help:      "Total number of requests rejected by rate limiting",
-	}, []string{"limiter"}) // limiter: global, tenant
+	}, []string{"limiter"}) // limiter: global, tenant, callback_ingress, callback_storage
 )
 
 // API metrics

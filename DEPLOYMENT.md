@@ -73,7 +73,8 @@ image.
 | Docker | Engine **28.1+ (API 1.49+)** is the image-admission compatibility floor for binding inspected metadata to a single immutable platform image. Production also requires a currently security-patched Engine (see below). iptables must be enabled (the default). `--iptables=false` disables cross-tenant network isolation; the docker-backend logs a daemon-warning at startup if it detects this |
 | CPU / RAM | Sized for the SKU pool you advertise; budget 10–20% overhead for the daemon |
 | Disk | Image cache + per-tenant volumes (see [Stateful workloads](#stateful-workloads-disk_mb--0-skus)) |
-| Network | Reachable from `providerd`; outbound reachability to image registries |
+| Network | Reachable from `providerd`; HTTPS registry access from the `docker-backend` process using system CA trust and process proxy settings |
+| Docker image storage | Classic `overlay2` or containerd `overlayfs`; other drivers fail construction. Shared filesystems remain supported. Containerd requires its actual `image_data_path` |
 
 The Docker daemon is installed and patched independently of Fred's Go dependencies.
 Engine **29.3.1** fixes the AuthZ plugin bypass
@@ -179,7 +180,7 @@ Each container gets a directory with an xfs project quota.
 > **`CAP_FOWNER` is required when repairing a tenant-owned volume root.**
 > Startup and reuse read the volume root's project ID and inheritance flag
 > through an attested descriptor. Correctly tagged roots need only an O(1)
-> quota-limit refresh; a mismatched root is repaired with depth zero and
+> quota-limit refresh; a mismatched root is repaired through its open descriptor and
 > verified before limits are applied. Fred never recursively walks an existing
 > tenant tree during startup, restart, update or restore. The 2026-09-23 fleet
 > check recorded in ENG-1051 found every descendant correctly tagged; no legacy
@@ -832,7 +833,7 @@ set `image_data_path` to its actual content directory, which may reside outside
 to use the daemon's reported data root automatically.
 Bounded image ingestion supports classic `overlay2` and containerd's `overlayfs`
 snapshotter. Other image stores, including drivers that copy entire parent
-filesystems for each layer, are refused before staging because they require a
+filesystems for each layer, prevent backend startup because they require a
 different import-space model. The existing deployment's `overlay2` setting is
 supported without changes.
 For classic Docker, import-space accounting assumes the daemon's default
@@ -841,6 +842,12 @@ override is not reported by Docker's API and is outside that accounting; the
 supported allowance requires default daemon staging. The existing deployment
 does not set an override. Separate accounting for an external override is not
 implemented.
+
+Registry requests now originate from `docker-backend` over HTTPS, using its
+process proxy environment and system certificate roots. Docker daemon mirrors,
+`insecure-registries` and `/etc/docker/certs.d` do not configure these requests.
+Provide registry reachability and trusted CA certificates to the backend process
+before upgrading; plaintext fallback is disabled even for private IPs.
 
 Before Docker writes image content, Fred stages the selected immutable image
 under `<callback_db_path>.image-staging`. It verifies the exact
@@ -854,7 +861,9 @@ registry access once its verified allocation allowance has been recorded.
 
 Before dispatch, Fred durably records the import allowance in
 `<callback_db_path>.image-staging/image-import-debit-v1`. An admitted import
-drains with its own ten-minute deadline even if its caller is canceled. Clean
+keeps its caller lifetime while the caller is active, then receives a 30-second
+completion grace on caller cancellation or backend shutdown. Shutdown closes
+import admission and drains these owned requests before closing stores. Clean
 upload and terminal completion release that import's allowance, including when
 Docker reports a completed refusal. A lost, malformed or timed-out response
 keeps the unproven allocation charged across restarts. There is no automatic
@@ -865,17 +874,28 @@ if it prevents admission.
 Image management defaults to a 10 GiB staged-content and expanded-image limit,
 2 GiB free-space floor, and 85%/75% GC high/low thresholds
 (`image_max_size_mb`, `image_disk_min_free_mb`, `image_gc_high_percent`,
-`image_gc_low_percent`). The image size is also checked after Docker inspection.
+`image_gc_low_percent`). The verified peak import allowance cannot exceed twice
+the new-image size budget. Existing pinned or already-local execution content
+is not rejected solely because that size limit was lowered; missing pinned
+content is recovered by its exact digest under its saved allowance.
 Before staging, Fred checks the configured image allowance above the free-space
 floor. After verification, it checks the conservative import footprint and floor
-again before importing. Outstanding import allowances remain charged for staging,
-import and local reuse. These are sampled headroom checks, not physical space
+again before importing. Up to four staging owners reserve their full budgets;
+imports and deferred-extraction probes account for concurrent owners. Registry
+and import I/O do not hold the admission lock. Ordinary local launches check
+actual free space plus allocations whose completion is unknown, without
+charging live owned imports a second time. These are sampled headroom checks, not physical space
 reservations against concurrent tenant or other host writes; continue sizing
 the tenant disk pool and host storage with adequate headroom.
 
 Collection preserves images referenced by containers or durable lease image
-pins. Legacy active, superseded or retained manifests without immutable pins
-inhibit destructive collection until they are re-admitted or retired. Docker
+pins. Startup backfills active legacy pins only from an exact recovered
+container cohort and immutable image inspection; it never resolves a tag to
+invent historical identity. Active or retained manifests still missing pins,
+and retained rows without a manifest, inhibit deletion. Failed and superseded
+release history does not retain images unless a pending compensation needs its
+exact source. Incomplete collection inventories do not reject unrelated image
+admission when its identity and capacity can still be established. Docker
 removal conflicts (including multiple tags) also preserve the image; collection
 never forces deletion or races mutable tag names. If enough space cannot be
 reclaimed, admission remains closed. Review these settings against the usable
@@ -892,13 +912,15 @@ daemon to production requires draining every lineage before an offline marker
 transition. Drain older backends before introducing this ownership protocol.
 Immutable image pins live in `callbacks.db`; preserve that journal with its
 matching release and retention stores, outstanding import debit and daemon
-ownership marker.
+ownership marker. Constructing a pin journal is read-only. Its first pin or
+positive legacy backfill creates the new bucket and is the downgrade boundary:
+older binaries that reject unknown journal buckets cannot reopen it.
 
 Containerd pins also retain the verified extraction allowance. A legacy pin
 without that allowance needs one exact-digest verification and import, even if
 the image is local; missing immutable recovery identity refuses admission
 without resolving a mutable tag. Every containerd admission creates and removes
-a stopped, journal-owned probe while holding the image admission lock. This
+a stopped, journal-owned probe with its own extraction allowance. This
 forces any deferred extraction before pinning or use. The probe never starts,
 has no network, and overrides image `VOLUME` declarations with tmpfs. Pending
 helper receipts block subsequent containerd ingestion across restarts; an
@@ -946,8 +968,9 @@ Fred releases are tagged on GitHub with binaries via `goreleaser`. The release p
 2. Pull the new binary or image to your hosts.
 3. Fence new mutation ingress and let existing backend work drain before each
    backend restart. Stop the backend normally and wait for successful shutdown;
-   admitted Docker Create/Start exchanges have a bounded 30-second completion
-   window and the backend drains workers before closing journals. Preserve the
+   admitted Docker Create/Start/import exchanges receive 30 seconds of completion
+   grace after cancellation or shutdown, and the backend drains their owners
+   before closing journals. Preserve the
    systemd stop allowance described above (over 30s HTTP shutdown + 90s worker
    drain); a forced kill or genuine daemon timeout can still leave launch debt.
    Roll the backend binaries one at a time when the release's backend protocol

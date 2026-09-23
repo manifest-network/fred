@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,8 +18,11 @@ import (
 
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/shared/completion"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -33,19 +37,111 @@ type Loader struct {
 	stageRoot string
 	maxBytes  int64
 	ledger    *debitLedger
+	transport http.RoundTripper
+	life      *loaderLifetime
 }
 
 // NewLoader creates a bounded importer in an existing writable directory. Its
 // caller must hold exclusive authority for that directory while this Loader is
 // used. Copies of a Loader share the same durable debit synchronization.
-func NewLoader(source Importer, stageRoot string, maxBytes int64) (*Loader, error) {
-	if util.IsNilInterface(source) || !filepath.IsAbs(stageRoot) || maxBytes <= 0 || maxBytes > math.MaxInt64/8 {
+func NewLoader(source Importer, stageRoot string, maxBytes int64, options ...Option) (*Loader, error) {
+	if util.IsNilInterface(source) || !filepath.IsAbs(stageRoot) || !validByteLimit(maxBytes) {
 		return nil, errors.New("image importer requires a daemon, absolute staging directory, and bounded positive byte limit")
 	}
 	if info, err := os.Stat(stageRoot); err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("image staging directory is unavailable: %s", stageRoot)
 	}
-	return &Loader{daemon: source, stageRoot: stageRoot, maxBytes: maxBytes, ledger: &debitLedger{root: stageRoot}}, nil
+	shutdown, cancel := context.WithCancel(context.Background())
+	loader := &Loader{daemon: source, stageRoot: stageRoot, maxBytes: maxBytes, ledger: &debitLedger{root: stageRoot}, transport: remote.DefaultTransport, life: &loaderLifetime{shutdown: shutdown, cancel: cancel, drained: make(chan struct{})}}
+	for _, option := range options {
+		if option == nil {
+			cancel()
+			return nil, errors.New("nil image loader option")
+		}
+		if err := option(loader); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
+	return loader, nil
+}
+
+func validByteLimit(maxBytes int64) bool { return maxBytes > 0 && maxBytes <= math.MaxInt64/8 }
+
+// WithBudget derives a distinct preparation issuer for bounded recovery while
+// retaining this owner's transport, durable debit ledger and shutdown lifetime.
+// The caller supplies an independently verified recovery allowance, rather than
+// changing the admission limit of the existing issuer.
+func (l *Loader) WithBudget(maxBytes int64) (*Loader, error) {
+	if l == nil || l.life == nil || !validByteLimit(maxBytes) {
+		return nil, errors.New("image recovery requires a bounded positive byte limit")
+	}
+	derived := *l
+	derived.maxBytes = maxBytes
+	return &derived, nil
+}
+
+// Option configures registry transport while retaining the mandatory HTTPS and
+// response-byte boundaries.
+type Option func(*Loader) error
+
+// WithRegistryTransport supplies operator trust or routing configuration. HTTP
+// requests remain refused before they reach this transport.
+func WithRegistryTransport(transport http.RoundTripper) Option {
+	return func(l *Loader) error {
+		if util.IsNilInterface(transport) {
+			return errors.New("nil registry transport")
+		}
+		l.transport = transport
+		return nil
+	}
+}
+
+type loaderLifetime struct {
+	mu          sync.Mutex
+	shutdown    context.Context
+	cancel      context.CancelFunc
+	drained     chan struct{}
+	closed      bool
+	active      int
+	activeBytes int64
+}
+
+// Shutdown closes admission, starts the bounded cancellation grace for active
+// daemon exchanges, and waits for every admission owner to finish or Close.
+func (l *Loader) Shutdown(ctx context.Context) error {
+	if l == nil || l.life == nil {
+		return nil
+	}
+	life := l.life
+	life.mu.Lock()
+	if !life.closed {
+		life.closed = true
+		life.cancel()
+		if life.active == 0 {
+			close(life.drained)
+		}
+	}
+	drained := life.drained
+	life.mu.Unlock()
+	select {
+	case <-drained:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// UnknownBytes excludes live owned admissions from durable unfinished imports.
+// A reopened loader has no such owners and therefore charges the complete debt.
+func (l *Loader) UnknownBytes() (int64, error) {
+	if l == nil || l.life == nil {
+		return 0, errors.New("image loader is unavailable")
+	}
+	l.life.mu.Lock()
+	defer l.life.mu.Unlock()
+	pending, err := l.PendingBytes()
+	return max(0, pending-l.life.activeBytes), err
 }
 
 type blob struct {
@@ -69,9 +165,13 @@ type preparedState struct {
 	dir         string
 	blobs       []blob
 	imported    Imported
+	metadata    imageexec.Metadata
+	reservation *importAdmissionState
 	importBytes int64
 	consumed    bool
 	closed      bool
+	closeDone   chan struct{}
+	closeErr    error
 }
 
 // ImportBytes returns a conservative allowance for the daemon's archive,
@@ -91,6 +191,33 @@ func (p *Prepared) SourceReference() string {
 	return p.state.imported.source
 }
 
+// ManifestID and ConfigID expose the immutable identity before dispatch, for
+// callers that durably protect content while admission is in flight.
+func (p *Prepared) ManifestID() string {
+	if p == nil || p.state == nil {
+		return ""
+	}
+	return p.state.imported.ManifestID()
+}
+func (p *Prepared) ConfigID() string {
+	if p == nil || p.state == nil {
+		return ""
+	}
+	return p.state.imported.ConfigID()
+}
+func (p *Prepared) Platform() ocispec.Platform {
+	if p == nil || p.state == nil {
+		return ocispec.Platform{}
+	}
+	return p.state.imported.Platform()
+}
+func (p *Prepared) Metadata() imageexec.Metadata {
+	if p == nil || p.state == nil {
+		return imageexec.Metadata{}
+	}
+	return p.state.metadata
+}
+
 // Close is idempotent and serialized against an active import.
 func (p *Prepared) Close() error {
 	if p == nil || p.state == nil {
@@ -98,12 +225,24 @@ func (p *Prepared) Close() error {
 	}
 	state := p.state
 	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.closed {
-		return nil
+	if state.closeDone != nil {
+		done := state.closeDone
+		state.mu.Unlock()
+		<-done
+		return state.closeErr
 	}
+	// Closing consumes preparation authority before relinquishing the lock.
+	// A concurrent reservation therefore cannot be inserted after this snapshot.
 	state.closed = true
+	state.closeDone = make(chan struct{})
+	reservation := state.reservation
+	state.mu.Unlock()
 	var err error
+	if reservation != nil {
+		err = (&ImportAdmission{state: reservation}).Close()
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	for _, b := range state.blobs {
 		if b.file != nil {
 			err = errors.Join(err, b.file.Close())
@@ -112,6 +251,8 @@ func (p *Prepared) Close() error {
 	if state.dir != "" {
 		err = errors.Join(err, os.Remove(state.dir))
 	}
+	state.closeErr = err
+	close(state.closeDone)
 	return err
 }
 
@@ -125,43 +266,132 @@ func (i Imported) ManifestID() string      { return i.manifest }
 func (i Imported) ConfigID() string        { return i.config }
 func (i Imported) SourceReference() string { return i.source }
 func (i Imported) Platform() ocispec.Platform {
-	p := i.platform
+	return clonePlatform(i.platform)
+}
+
+func clonePlatform(p ocispec.Platform) ocispec.Platform {
 	p.OSFeatures = slices.Clone(p.OSFeatures)
 	return p
 }
 
-// Import accepts only this Loader's unconsumed capability. The upload contains
-// original verified blobs, so neither tag races nor registry response changes
-// can introduce unmeasured content into Docker.
-func (l *Loader) Import(ctx context.Context, p *Prepared) (Imported, error) {
+// ImportAdmission owns a persisted allocation and a single possible dispatch.
+// Copies share its lifecycle. Close cancels an undispatched admission with
+// positive evidence that Docker never received it, or waits for its exchange.
+type ImportAdmission struct{ state *importAdmissionState }
+type importAdmissionState struct {
+	mu         sync.Mutex
+	issuer     *Loader
+	prepared   *preparedState
+	finished   bool
+	dispatched bool
+}
+
+// ReserveImport durably charges allocation before a caller releases its storage
+// admission gate. The returned owner must be closed on every subsequent path.
+func (l *Loader) ReserveImport(ctx context.Context, p *Prepared) (*ImportAdmission, error) {
 	if l == nil || p == nil || p.state == nil {
-		return Imported{}, errors.New("invalid prepared image")
+		return nil, errors.New("invalid prepared image")
 	}
 	state := p.state
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.issuer != l || state.closed || state.consumed {
-		return Imported{}, errors.New("invalid, foreign, closed or consumed prepared image")
+	if state.issuer != l || state.closed || state.consumed || !state.metadata.Valid() {
+		return nil, errors.New("invalid, foreign, closed or consumed prepared image")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	life := l.life
+	life.mu.Lock()
+	defer life.mu.Unlock()
+	if life.closed {
+		return nil, errors.New("image loader is shut down")
+	}
+	state.consumed = true
+	if err := l.changeDebit(state.importBytes); err != nil {
+		return nil, fmt.Errorf("reserve outstanding image import allocation: %w", err)
+	}
+	life.active++
+	life.activeBytes += state.importBytes
+	admission := &importAdmissionState{issuer: l, prepared: state}
+	state.reservation = admission
+	return &ImportAdmission{state: admission}, nil
+}
+
+func (a *importAdmissionState) finish(settle bool) error {
+	if a.finished {
+		return nil
+	}
+	life := a.issuer.life
+	life.mu.Lock()
+	defer life.mu.Unlock()
+	var err error
+	if settle {
+		err = a.issuer.changeDebit(-a.prepared.importBytes)
+	}
+	a.finished = true
+	life.active--
+	life.activeBytes -= a.prepared.importBytes
+	if life.closed && life.active == 0 {
+		close(life.drained)
+	}
+	return err
+}
+
+// Close releases only an allocation that is proven never dispatched. An
+// uncertain completed request retains its durable debit for operator recovery.
+func (a *ImportAdmission) Close() error {
+	if a == nil || a.state == nil {
+		return nil
+	}
+	state := a.state
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.finished {
+		return nil
+	}
+	return state.finish(true)
+}
+
+// Import is the combined reservation and dispatch convenience boundary.
+func (l *Loader) Import(ctx context.Context, p *Prepared) (Imported, error) {
+	admission, err := l.ReserveImport(ctx, p)
+	if err != nil {
+		return Imported{}, err
+	}
+	defer func() { _ = admission.Close() }()
+	return l.ImportAdmitted(ctx, admission)
+}
+
+// ImportAdmitted dispatches only this Loader's single-use reserved capability.
+// Original verified blobs prevent registry changes from introducing new data.
+func (l *Loader) ImportAdmitted(ctx context.Context, admission *ImportAdmission) (Imported, error) {
+	if l == nil || admission == nil || admission.state == nil {
+		return Imported{}, errors.New("invalid image import admission")
+	}
+	owned := admission.state
+	owned.mu.Lock()
+	defer owned.mu.Unlock()
+	if owned.issuer != l || owned.finished || owned.dispatched {
+		return Imported{}, errors.New("foreign, closed or consumed image import admission")
 	}
 	if err := ctx.Err(); err != nil {
 		return Imported{}, err
 	}
-	state.consumed = true
-	// Persist the complete allocation before dispatch. A lost response can
-	// leave Docker extracting after its client disconnects, so uncertainty
-	// must continue consuming admission capacity, including after a restart.
-	if err := l.changeDebit(state.importBytes); err != nil {
-		return Imported{}, fmt.Errorf("reserve outstanding image import allocation: %w", err)
+	if err := l.life.shutdown.Err(); err != nil {
+		return Imported{}, errors.New("image loader is shut down")
 	}
-	work, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
-	defer cancel()
+	owned.dispatched = true
+	defer func() { _ = owned.finish(false) }()
+	state := owned.prepared
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	lifetime := completion.New(ctx, 30*time.Second, l.life.shutdown)
+	defer lifetime.Close()
+	work := lifetime.Context()
 	reader, writer := io.Pipe()
 	written := make(chan error, 1)
-	go func() {
-		err := writeArchive(work, writer, state.blobs)
-		_ = writer.CloseWithError(err)
-		written <- err
-	}()
+	go func() { err := writeArchive(work, writer, state.blobs); _ = writer.CloseWithError(err); written <- err }()
 	response, err := l.daemon.ImageLoad(work, reader, client.ImageLoadWithQuiet(true), client.ImageLoadWithPlatforms(state.imported.platform))
 	var completion importCompletion
 	if err == nil {
@@ -175,10 +405,8 @@ func (l *Loader) Import(ctx context.Context, p *Prepared) (Imported, error) {
 	_ = reader.CloseWithError(err)
 	uploadErr := <-written
 	err = errors.Join(err, uploadErr)
-	// A daemon refusal is still completed work when its entire response and
-	// upload terminated. Preserve the business failure without inventing debt.
 	if completion.completed && uploadErr == nil {
-		if settleErr := l.changeDebit(-state.importBytes); settleErr != nil {
+		if settleErr := owned.finish(true); settleErr != nil {
 			err = errors.Join(err, fmt.Errorf("settle completed image import allocation: %w", settleErr))
 		}
 	}

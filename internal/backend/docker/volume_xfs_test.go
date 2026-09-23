@@ -206,14 +206,25 @@ printf '%s\n' "$*" >> "$FRED_TEST_XFS_LOG"
 	t.Setenv("PATH", binDir)
 	t.Setenv("FRED_TEST_XFS_LOG", logPath)
 	mgr := newXfsManagerForTest(dataPath)
-	var reads int
-	mgr.projectAttributes = xfsProjectAttributeReaderFunc(func(root *os.Root) (linuxFSXAttr, error) {
-		reads++
-		if reads == 1 {
-			return linuxFSXAttr{}, nil
-		}
-		return linuxFSXAttr{ProjectID: projID, XFlags: linuxFSXFlagProjInherit}, nil
-	})
+	var reads, writes int
+	mgr.projectAttributes = xfsProjectAttributeFuncs{
+		read: func(root *os.Root) (linuxFSXAttr, error) {
+			reads++
+			if reads == 1 {
+				return linuxFSXAttr{}, nil
+			}
+			return linuxFSXAttr{ProjectID: projID, XFlags: linuxFSXFlagProjInherit}, nil
+		},
+		set: func(root *os.Root, id uint32) error {
+			writes++
+			marker, err := readProjectIDFileInVolumeRoot(root)
+			require.NoError(t, err)
+			require.Equal(t, projID, marker)
+			require.Equal(t, projID, id)
+			require.NoFileExists(t, logPath, "root repair must precede quota mutation")
+			return nil
+		},
+	}
 
 	hostPath, created, err := mgr.Create(t.Context(), name, 100)
 	require.NoError(t, err)
@@ -222,10 +233,9 @@ printf '%s\n' "$*" >> "$FRED_TEST_XFS_LOG"
 	commands, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	logText := string(commands)
-	setupAt := strings.Index(logText, "project -s -d 0 -p "+dir)
-	limitAt := strings.Index(logText, "limit -p bhard=100m")
-	assert.GreaterOrEqual(t, setupAt, 0, "existing recovery directory must be tagged without walking tenant data")
-	assert.Greater(t, limitAt, setupAt, "quota limit must follow project tagging")
+	assert.NotContains(t, logText, "project -s", "even -d 0 traverses the tree with nftw")
+	assert.Contains(t, logText, "limit -p bhard=100m")
+	assert.Equal(t, 1, writes)
 	assert.Equal(t, 2, reads, "root repair must be verified before reusing storage")
 }
 
@@ -335,21 +345,26 @@ func TestXFSQuotaRootRepairFailsClosed(t *testing.T) {
 				dir := filepath.Join(dataPath, name)
 				require.NoError(t, os.Mkdir(dir, 0o700))
 				require.NoError(t, writeProjectIDFile(dir, projID))
-				var logPath string
-				if tc.setupFails {
-					logPath = installChurningXFSQuota(t)
-				} else {
-					logPath = installLoggingXFSQuota(t)
-				}
+				logPath := installChurningXFSQuota(t)
 				mgr := newXfsManagerForTest(dataPath)
-				var reads int
-				mgr.projectAttributes = xfsProjectAttributeReaderFunc(func(*os.Root) (linuxFSXAttr, error) {
-					reads++
-					if reads == 1 {
-						return tc.before, tc.readErr
-					}
-					return tc.after, tc.verifyErr
-				})
+				var reads, writes int
+				mgr.projectAttributes = xfsProjectAttributeFuncs{
+					read: func(*os.Root) (linuxFSXAttr, error) {
+						reads++
+						if reads == 1 {
+							return tc.before, tc.readErr
+						}
+						return tc.after, tc.verifyErr
+					},
+					set: func(root *os.Root, id uint32) error {
+						writes++
+						require.Equal(t, projID, id)
+						if tc.setupFails {
+							return syscall.EPERM
+						}
+						return nil
+					},
+				}
 				var err error
 				if operation == "ensure" {
 					err = mgr.EnsureQuota(t.Context(), name, 100)
@@ -362,16 +377,17 @@ func TestXFSQuotaRootRepairFailsClosed(t *testing.T) {
 					require.NoError(t, err)
 				}
 				if tc.readErr != nil {
+					assert.Zero(t, writes)
 					assert.NoFileExists(t, logPath, "unknown root association must not reach quota mutation")
 					return
 				}
-				commands, err := os.ReadFile(logPath)
-				require.NoError(t, err)
-				assert.Contains(t, string(commands), xfsProjectRootSetupCmd(dir, projID))
-				assert.NotContains(t, string(commands), "project -s -p", "root repair must never recurse")
+				assert.Equal(t, 1, writes)
 				if tc.wantError != "" {
-					assert.NotContains(t, string(commands), "limit -p", "unverified repair must not reach quota limits")
+					assert.NoFileExists(t, logPath, "unverified repair must not reach quota limits")
 				} else {
+					commands, err := os.ReadFile(logPath)
+					require.NoError(t, err)
+					assert.NotContains(t, string(commands), "project -s", "root repair must never enumerate descendants")
 					assert.Contains(t, string(commands), xfsLimitCmd(projID, "100m", inodeHardFloor))
 				}
 			})
@@ -774,7 +790,11 @@ func TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError(t *testing.T) {
 	assert.Equal(t, before, testutil.ToFloat64(volumeQuotaClearFailedTotal),
 		"the quota limit must be left intact (clear not attempted) while the volume survives")
 	commands, readErr := os.ReadFile(logPath)
-	require.NoError(t, readErr)
+	// Descriptor-only stage repair runs no quota command before RemoveAll.
+	// An absent log therefore proves the same no-clear invariant as an empty log.
+	if !errors.Is(readErr, os.ErrNotExist) {
+		require.NoError(t, readErr)
+	}
 	assert.NotContains(t, string(commands), xfsLimitClearCmd(projID),
 		"partial recursive deletion must not reach dquot clear")
 

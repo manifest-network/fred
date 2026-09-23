@@ -160,7 +160,7 @@ func TestAdmissionRejectsUntrustedMetadata(t *testing.T) {
 		}, want: "unsupported"},
 	}
 	for _, label := range []string{
-		"fred.lease_id", "TrAeFiK.enable", "com.docker.compose.project", "COM.DOCKER.COMPOSE.replace",
+		"fred.lease_id", "TrAeFiK.enable", "com.docker.compose.oneoff", "COM.DOCKER.COMPOSE.project", "COM.DOCKER.COMPOSE.replace",
 		"traefiK.enable", "com.docKer.compose.project", "com.docker.compoſe.project",
 	} {
 		tests = append(tests, struct {

@@ -46,6 +46,7 @@ type CloseExecutionPending struct {
 	subject    ClosePhysicalSubject
 	cause      error
 	retryable  bool
+	observable bool
 }
 
 func (outcome CloseExecutionDestroyed) Valid() bool {
@@ -65,6 +66,11 @@ func (outcome CloseExecutionPending) Valid() bool {
 }
 
 func (outcome CloseExecutionPending) Cause() error { return outcome.cause }
+
+// Unwrap preserves internal recovery diagnostics while the typed outcome keeps
+// its pending authority. HTTP encoders emit only the separate transport marker,
+// which deliberately has no cause or refusal sentinel.
+func (outcome CloseExecutionPending) Unwrap() error { return outcome.cause }
 
 // RetryableNow reports that strict classification proved the current cohort
 // incomplete (or the guard refused before entering a Step), so a new durable
@@ -242,7 +248,7 @@ func (s *CloseSettlement) closeOutcomeForResult(
 			return CloseExecutionRetained{settlement: s, subject: subject, evidence: evidence.retained, authority: authority}
 		case closePhysicalEvidenceIncomplete:
 			return CloseExecutionPending{settlement: s, subject: subject,
-				cause: errors.New("close substrate cleanup is incomplete"), retryable: true}
+				cause: errors.New("close substrate cleanup is incomplete"), retryable: true, observable: true}
 		default:
 			return CloseExecutionPending{settlement: s, subject: subject,
 				cause: errors.New("unknown close evidence")}
@@ -254,7 +260,7 @@ func (s *CloseSettlement) closeOutcomeForResult(
 		}
 		return CloseExecutionPending{
 			settlement: s, subject: subject, cause: cause,
-			retryable: physical.Kind() == substratemutation.Refused,
+			retryable: physical.Kind() == substratemutation.Refused, observable: true,
 		}
 	default:
 		return CloseExecutionPending{settlement: s, subject: subject,
