@@ -75,6 +75,26 @@ func NewDockerRuntime(ctx context.Context, source DockerSource) (*Admitter, *Doc
 // Create assigns execution identity itself; config.Image and image-binding
 // labels supplied by the caller cannot override the admitted content.
 func (c *DockerCreator) Create(ctx context.Context, image Image, config *container.Config, host *container.HostConfig, networks *network.NetworkingConfig, name string) (container.CreateResponse, error) {
+	return c.createBound(ctx, image, composeBuildLabels{}, config, host, networks, name)
+}
+
+// CreateProjectContainer consumes the image and grouping authority selected from
+// one compiled service. Raw config labels cannot choose a project or substitute
+// another image; ordinary direct creation remains outside Compose discovery.
+func (c *DockerCreator) CreateProjectContainer(ctx context.Context, binding ProjectContainer, config *container.Config, host *container.HostConfig, networks *network.NetworkingConfig, name string) (container.CreateResponse, error) {
+	if c == nil || c.issuer == nil || c.create == nil {
+		return container.CreateResponse{}, ErrUnavailable
+	}
+	if binding.record == nil {
+		return container.CreateResponse{}, ErrInvalidProject
+	}
+	if binding.record.issuer != c.issuer {
+		return container.CreateResponse{}, ErrForeignProject
+	}
+	return c.createBound(ctx, binding.record.image, binding.record.labels, config, host, networks, name)
+}
+
+func (c *DockerCreator) createBound(ctx context.Context, image Image, labels composeBuildLabels, config *container.Config, host *container.HostConfig, networks *network.NetworkingConfig, name string) (container.CreateResponse, error) {
 	if err := c.ValidateImage(image); err != nil {
 		return container.CreateResponse{}, err
 	}
@@ -92,7 +112,7 @@ func (c *DockerCreator) Create(ctx context.Context, image Image, config *contain
 	}
 	prepared.Labels[LabelImageReference] = image.Reference()
 	prepared.Labels[LabelImageID] = image.ID()
-	image.record.metadata.record.buildLabels.apply(prepared.Labels)
+	labels.apply(prepared.Labels)
 	platform := image.Platform()
 	return c.create(ctx, &prepared, host, networks, &platform, name)
 }
@@ -111,6 +131,7 @@ func (c *DockerCreator) ValidateImage(image Image) error {
 type preparedProjectRecord struct {
 	issuer  *issuer
 	project *composetypes.Project
+	images  map[string]Image
 }
 
 // PreparedProject is a complete Compose project bound to admitted images.
@@ -125,6 +146,41 @@ func (p PreparedProject) Name() string {
 		return ""
 	}
 	return p.record.project.Name
+}
+
+type projectContainerRecord struct {
+	issuer *issuer
+	image  Image
+	labels composeBuildLabels
+}
+
+// ProjectContainer owns the admitted image and generated grouping stamps of one
+// compiled service. Its zero value cannot authorize direct creation.
+type ProjectContainer struct{ record *projectContainerRecord }
+
+// Image returns the same admitted image owned by this service binding. Volume
+// preparation may inspect it without acquiring independent creation authority.
+func (p ProjectContainer) Image() Image {
+	if p.record == nil {
+		return Image{}
+	}
+	return p.record.image
+}
+
+// Container selects an exact service from this immutable compiled project. It
+// does not accept replacement image or label values from the caller.
+func (p PreparedProject) Container(service string) (ProjectContainer, error) {
+	if p.record == nil {
+		return ProjectContainer{}, ErrInvalidProject
+	}
+	image, ok := p.record.images[service]
+	if !ok {
+		return ProjectContainer{}, fmt.Errorf("service %q is absent from compiled project", service)
+	}
+	return ProjectContainer{record: &projectContainerRecord{
+		issuer: p.record.issuer, image: image,
+		labels: (composeBuildLabels{}).forProject(p.record.project.Name, service),
+	}}, nil
 }
 
 // Compile binds every active service to its admitted image and freezes the
@@ -177,7 +233,7 @@ func (a *Admitter) Compile(project *composetypes.Project, images map[string]Imag
 	if err != nil {
 		return PreparedProject{}, err
 	}
-	return PreparedProject{record: &preparedProjectRecord{issuer: a.issuer, project: prepared}}, nil
+	return PreparedProject{record: &preparedProjectRecord{issuer: a.issuer, project: prepared, images: maps.Clone(images)}}, nil
 }
 
 // ComposeUpFunc is captured once when wiring the Compose execution sink.

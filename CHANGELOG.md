@@ -801,7 +801,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Images built by Docker Compose can retain its three standard build stamps.
   Admitted metadata owns their replacements: compiled projects bind their own
-  project/service/version, and direct/helper creation writes neutral values.
+  project/service/version, and ordinary direct/helper creation writes neutral
+  values. Frozen-source compensation carries a compiler-issued service binding
+  so restored workloads remain discoverable by Compose and can be deprovisioned.
   Other reserved labels remain rejected, and inherited build labels cannot
   grant container ownership or redirect helper cleanup. (ENG-1052)
 
@@ -1582,7 +1584,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Docker image admission rejects reserved `fred.*`, `traefik.*`, and
   `com.docker.compose.*` labels before any workload or inspection helper is
   created, preventing inherited labels from hijacking ingress or Compose
-  lifecycle ownership. Guarded admission mints an opaque image capability; helpers
+  lifecycle ownership. The three exact Compose project/service/version build
+  stamps are admitted only as placeholders replaced by the owned creation plan.
+  Admission mints an opaque image capability; helpers
   and workloads require that capability, and Compose requires a complete prepared
   project with repulls disabled. Container creation and image setup use the exact inspected
   immutable image ID and platform, resolving multi-platform indexes to a single
@@ -1594,9 +1598,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   instead of rejecting every provision on an otherwise healthy backend.
   Manifest validation also reserves Compose labels and matches
   Unicode case-fold variants of reserved prefixes consistently with the
-  published schema. Images
-  carrying orchestration metadata, including automatic Compose build labels,
-  must be rebuilt without it. Existing containers are not rewritten automatically.
+  published schema. Images carrying other reserved orchestration metadata must
+  be rebuilt without it. Existing containers are not rewritten automatically.
 
 - XFS project IDs and dquots are filesystem-global even when
   `volume_data_path` is a subdirectory. Fred allocates across the nonzero 32-bit

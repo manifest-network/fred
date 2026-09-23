@@ -83,3 +83,53 @@ func TestComposeBuildLabelsCannotCarryGroupingAcrossCreationBoundaries(t *testin
 	require.NoError(t, executor.Up(t.Context(), prepared, false))
 	require.Equal(t, "foreign-project", response.Config.Labels[composeapi.ProjectLabel])
 }
+
+func TestProjectContainerBindsImageAndGroupingWithoutRawLabelAuthority(t *testing.T) {
+	admitter, creator, source, image := safeRuntime(t)
+	_, foreignCreator, _, foreignImage := safeRuntime(t)
+	project := &composetypes.Project{Name: "owned-project", Services: composetypes.Services{
+		"web-1": {Image: image.Reference()},
+	}}
+	images := map[string]imageexec.Image{"web-1": image}
+	prepared, err := admitter.Compile(project, images)
+	require.NoError(t, err)
+	// Neither constructor input remains authority after compilation.
+	project.Name = "mutated-project"
+	delete(project.Services, "web-1")
+	images["web-1"] = foreignImage
+	binding, err := prepared.Container("web-1")
+	require.NoError(t, err)
+	_, err = prepared.Container("absent")
+	require.Error(t, err)
+	_, err = (imageexec.PreparedProject{}).Container("web-1")
+	require.ErrorIs(t, err, imageexec.ErrInvalidProject)
+	config := &container.Config{Image: "caller-controlled:latest", Labels: map[string]string{
+		composeapi.ProjectLabel: "foreign-project", composeapi.ServiceLabel: "foreign-service", composeapi.VersionLabel: "foreign-version",
+		composeapi.ConfigHashLabel: "frozen-config-hash", composeapi.OneoffLabel: "False",
+		imageexec.LabelImageID: "forged-id",
+	}}
+	creates := 0
+	source.create = func(_ context.Context, actual *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+		creates++
+		require.Equal(t, image.ID(), actual.Image)
+		require.Equal(t, image.ID(), actual.Labels[imageexec.LabelImageID])
+		require.Equal(t, "owned-project", actual.Labels[composeapi.ProjectLabel])
+		require.Equal(t, "web-1", actual.Labels[composeapi.ServiceLabel])
+		require.Equal(t, composeapi.ComposeVersion, actual.Labels[composeapi.VersionLabel])
+		require.Equal(t, "frozen-config-hash", actual.Labels[composeapi.ConfigHashLabel])
+		require.Equal(t, "False", actual.Labels[composeapi.OneoffLabel])
+		return container.CreateResponse{ID: "restored"}, nil
+	}
+	_, err = creator.CreateProjectContainer(t.Context(), binding, config, nil, nil, "source")
+	require.NoError(t, err)
+	require.Equal(t, "foreign-project", config.Labels[composeapi.ProjectLabel])
+	_, err = creator.CreateProjectContainer(t.Context(), imageexec.ProjectContainer{}, config, nil, nil, "source")
+	require.ErrorIs(t, err, imageexec.ErrInvalidProject)
+	_, err = foreignCreator.CreateProjectContainer(t.Context(), binding, config, nil, nil, "source")
+	require.ErrorIs(t, err, imageexec.ErrForeignProject)
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = creator.CreateProjectContainer(canceled, binding, config, nil, nil, "source")
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 1, creates, "invalid authority must never enter Docker")
+}

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/containerd/platforms"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
@@ -52,7 +53,7 @@ type compensationVolumeRoot struct {
 // frozen execution snapshot. Only the whole-plan volume launch sink consumes it.
 type compensationContainer struct {
 	Name     string
-	Image    imageexec.Image
+	Binding  imageexec.ProjectContainer
 	Config   *container.Config
 	Host     *container.HostConfig
 	Networks *network.NetworkingConfig
@@ -252,21 +253,60 @@ func decodeCompensationSourcePlan(subject shared.MaintenancePhysicalSubject, enc
 // createCompensationContainer is the raw, construction-only source creation
 // operation. The whole-plan volume sink is its sole production caller. Image
 // execution remains bound to this DockerClient's admitter/creator lineage.
-func (d *DockerClient) createCompensationContainer(ctx context.Context, image imageexec.Image, snapshot compensationContainer) (string, daemonLaunchOutcome) {
+func (d *DockerClient) createCompensationContainer(ctx context.Context, snapshot compensationContainer) (string, daemonLaunchOutcome) {
 	var created container.CreateResponse
 	outcome := d.launchObserver.run(ctx, func(ctx context.Context) error {
 		config := cloneCompensationConfig(*snapshot.Config)
 		config.Labels = maps.Clone(config.Labels)
 		config.Labels[LabelCreatedAt] = time.Now().Format(time.RFC3339)
 		var err error
-		created, err = d.creator.Create(ctx, image, &config, snapshot.Host, snapshot.Networks, snapshot.Name)
+		created, err = d.creator.CreateProjectContainer(ctx, snapshot.Binding, &config, snapshot.Host, snapshot.Networks, snapshot.Name)
 		return err
 	})
 	return created.ID, outcome
 }
 
-func (d *DockerClient) readmitCompensationImage(ctx context.Context, snapshot compensationContainerRecord) (imageexec.Image, error) {
-	return d.images.ReAdmit(ctx, snapshot.ImageID, snapshot.Platform, snapshot.Config.Labels[LabelImageReference])
+func (d *DockerClient) prepareCompensationContainer(ctx context.Context, subject shared.MaintenanceCompensationSubject, snapshot compensationContainerRecord) (compensationContainer, error) {
+	image, err := d.images.ReAdmit(ctx, snapshot.ImageID, snapshot.Platform, snapshot.Config.Labels[LabelImageReference])
+	if err != nil {
+		return compensationContainer{}, err
+	}
+	return bindCompensationContainer(d.images, subject, snapshot, image)
+}
+
+// bindCompensationContainer joins the exact source topology and immutable image
+// before physical launch. The created capability owns both; the launch sink
+// receives no separate image or caller-selected Compose grouping.
+func bindCompensationContainer(admitter *imageexec.Admitter, subject shared.MaintenanceCompensationSubject, snapshot compensationContainerRecord, image imageexec.Image) (compensationContainer, error) {
+	source, ok := subject.SourceRelease()
+	if !ok || snapshot.Config == nil || image.ID() != snapshot.ImageID || !platforms.OnlyStrict(snapshot.Platform).Match(image.Platform()) {
+		return compensationContainer{}, errors.New("compensation image or source authority is unavailable")
+	}
+	meta, err := parseLabelMeta(snapshot.Config.Labels)
+	if err != nil {
+		return compensationContainer{}, err
+	}
+	var service string
+	for _, item := range source.Items {
+		if item.ServiceName == snapshot.Config.Labels[LabelServiceName] && meta.InstanceIndex >= 0 && meta.InstanceIndex < item.Quantity {
+			service = composeServiceName(item, meta.InstanceIndex)
+			break
+		}
+	}
+	if service == "" {
+		return compensationContainer{}, errors.New("compensation instance is absent from the exact source topology")
+	}
+	project, err := admitter.Compile(&composetypes.Project{
+		Name: composeProjectName(subject.Intent().LeaseUUID()), Services: composetypes.Services{service: {Image: image.Reference()}},
+	}, map[string]imageexec.Image{service: image})
+	if err != nil {
+		return compensationContainer{}, err
+	}
+	binding, err := project.Container(service)
+	if err != nil {
+		return compensationContainer{}, err
+	}
+	return compensationContainer{Name: snapshot.Name, Binding: binding, Config: snapshot.Config, Host: snapshot.Host, Networks: snapshot.Networks, Mounts: snapshot.Mounts}, nil
 }
 
 func snapshotCompensationContainer(resp container.InspectResponse, mounts []ContainerMount) *compensationContainerRecord {
@@ -361,19 +401,16 @@ func (b *Backend) doMaintenanceCompensation(ctx context.Context, mutations *stor
 	source, _ := subject.SourceRelease()
 	launch := compensationLaunchPlan{Subject: subject, Source: source, VolumeRoots: plan.VolumeRoots}
 	for _, snapshot := range plan.Containers {
-		var admitted imageexec.Image
-		err := mutations.runner.Prepare(ctx, "readmit immutable source image", func(ctx context.Context) error {
+		var prepared compensationContainer
+		err := mutations.runner.Prepare(ctx, "bind immutable source container", func(ctx context.Context) error {
 			var err error
-			admitted, err = mutations.ops.docker.readmitCompensationImage(ctx, snapshot)
+			prepared, err = mutations.ops.docker.prepareCompensationContainer(ctx, subject, snapshot)
 			return err
 		})
 		if err != nil {
 			return fmt.Errorf("readmit immutable compensation image: %w", err)
 		}
-		if admitted.ID() != snapshot.ImageID || !platforms.OnlyStrict(snapshot.Platform).Match(admitted.Platform()) {
-			return errors.New("compensation image content or platform changed")
-		}
-		launch.Containers = append(launch.Containers, compensationContainer{Name: snapshot.Name, Image: admitted, Config: snapshot.Config, Host: snapshot.Host, Networks: snapshot.Networks, Mounts: snapshot.Mounts})
+		launch.Containers = append(launch.Containers, prepared)
 	}
 	if err := b.cleanupFailedMaintenanceTargets(ctx, mutations, subject.FailedTarget(), nil); err != nil {
 		return err

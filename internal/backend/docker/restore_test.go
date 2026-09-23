@@ -3237,6 +3237,8 @@ func TestRestore_ConcurrentTargetsClaimSourceAtMostOnce(t *testing.T) {
 			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
 		},
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+		// The custom delayed executor below owns this fixture's inventory.
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
@@ -3256,27 +3258,35 @@ func TestRestore_ConcurrentTargetsClaimSourceAtMostOnce(t *testing.T) {
 		stopReplay()
 	})
 
-	b.compose = &mockComposeExecutor{
+	compose := &mockComposeExecutor{
 		UpFn: func(_ context.Context, _ *composetypes.Project, _ composeUpOpts) error {
 			workerStartedOnce.Do(func() { close(workerStarted) })
 			<-releaseWorker
 			return nil
 		},
-		PSFn: func(_ context.Context, _ string) ([]composeContainerSummary, error) {
+		PSFn: func(_ context.Context, project string) ([]composeContainerSummary, error) {
 			return []composeContainerSummary{{
-				ID: "container-1", Service: manifest.DefaultServiceName, State: "running",
+				ID: "container-" + project, Service: manifest.DefaultServiceName, State: "running",
 			}}, nil
 		},
 		DownFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
 	}
+	installStackStrictCohortInventory(t, mock, compose)
+	b.compose = compose
 	b.volumes = &mockVolumeManager{
 		RenameVolumeFn: func(_, _ string) error { return nil },
 	}
 
-	callbackSeen := make(chan struct{}, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	callbackSeen := make(chan backend.CallbackPayload, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload backend.CallbackPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode restore callback: %v", err)
+			http.Error(w, "invalid callback", http.StatusBadRequest)
+			return
+		}
 		select {
-		case callbackSeen <- struct{}{}:
+		case callbackSeen <- payload:
 		default:
 		}
 		w.WriteHeader(http.StatusOK)
@@ -3345,11 +3355,27 @@ func TestRestore_ConcurrentTargetsClaimSourceAtMostOnce(t *testing.T) {
 	assert.False(t, loserTracked, "a failed source claim must roll back the losing target reservation")
 
 	release()
-	select {
-	case <-callbackSeen:
-	case <-time.After(5 * time.Second):
-		t.Fatal("accepted restore worker did not finish after release")
+	completionDeadline := time.NewTimer(5 * time.Second)
+	defer completionDeadline.Stop()
+completion:
+	for {
+		select {
+		case completed := <-callbackSeen:
+			if completed.LeaseUUID == accepted[0] {
+				require.Equal(t, backend.CallbackStatusSuccess, completed.Status)
+				break completion
+			}
+			// A loser that reached durable admission can publish its exact
+			// refusal before the accepted worker finishes; it is not success.
+			require.Equal(t, loser, completed.LeaseUUID)
+			require.Equal(t, backend.CallbackStatusFailed, completed.Status)
+		case <-completionDeadline.C:
+			t.Fatal("accepted restore worker did not finish after release")
+		}
 	}
+	info, err := b.GetProvision(t.Context(), accepted[0])
+	require.NoError(t, err)
+	require.Equal(t, backend.ProvisionStatusReady, info.Status)
 }
 
 // ---------------------------------------------------------------------------

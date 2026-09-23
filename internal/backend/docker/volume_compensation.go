@@ -118,7 +118,7 @@ func (q *quiescedVolumes) prepareCompensationBinds(ctx context.Context, plan com
 			}
 		}
 		if len(stateful) != 0 {
-			uid, gid, err := q.mutations.resolveImageUser(ctx, snapshot.Image, snapshot.Config.User)
+			uid, gid, err := q.mutations.resolveImageUser(ctx, snapshot.Binding.Image(), snapshot.Config.User)
 			if err != nil {
 				return fmt.Errorf("resolve frozen source volume user: %w", err)
 			}
@@ -135,7 +135,7 @@ func (q *quiescedVolumes) prepareCompensationBinds(ctx context.Context, plan com
 			if err != nil {
 				return err
 			}
-			binds := q.mutations.ops.backend.setupWritablePathBinds(volume, ctx, snapshot.Image, writable,
+			binds := q.mutations.ops.backend.setupWritablePathBinds(volume, ctx, snapshot.Binding.Image(), writable,
 				sizeMB*bytesPerMiB, inodeHardLimit(sizeMB, q.mutations.ops.backend.cfg.GetMinAvgFileBytes()))
 			for _, target := range writable {
 				if binds[filepath.Join(hostPath, writablePathSubdir, sanitizeVolumePath(target))] != target {

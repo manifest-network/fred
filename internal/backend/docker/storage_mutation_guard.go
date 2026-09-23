@@ -750,7 +750,7 @@ func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchC
 					if err := q.requireActive(); err != nil {
 						return daemonLaunchOutcome{settled: true, err: err}
 					}
-					id, outcome := m.ops.docker.createCompensationContainer(ctx, snapshot.Image, snapshot)
+					id, outcome := m.ops.docker.createCompensationContainer(ctx, snapshot)
 					if !outcome.settled || outcome.err != nil {
 						return outcome
 					}

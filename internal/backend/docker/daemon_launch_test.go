@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
+	composeapi "github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
@@ -87,7 +90,7 @@ func TestDaemonLaunchGatewayResponsesRemainUnknown(t *testing.T) {
 func TestUnboundDockerClientCannotSupplyLaunchCompletion(t *testing.T) {
 	docker := new(DockerClient)
 	require.False(t, docker.startCompensationContainer(t.Context(), "source", time.Second).settled)
-	_, created := docker.createCompensationContainer(t.Context(), imageexec.Image{}, compensationContainer{})
+	_, created := docker.createCompensationContainer(t.Context(), compensationContainer{})
 	require.False(t, created.settled)
 }
 
@@ -393,6 +396,12 @@ func TestCompensationSDKCreatePreservesRequestCompletionObservation(t *testing.T
 				return imageSecurityResponse(http.StatusOK, platformSecurityJSON(testImageID, ocispec.MediaTypeImageManifest)), nil
 			}
 			require.True(t, strings.HasSuffix(req.URL.Path, "/containers/create"))
+			var actual container.Config
+			require.NoError(t, json.NewDecoder(req.Body).Decode(&actual))
+			require.Equal(t, testImageID, actual.Image)
+			require.Equal(t, "fred-source-lease", actual.Labels[composeapi.ProjectLabel])
+			require.Equal(t, "web-1", actual.Labels[composeapi.ServiceLabel])
+			require.Equal(t, composeapi.ComposeVersion, actual.Labels[composeapi.VersionLabel])
 			if transportFails {
 				return nil, context.DeadlineExceeded
 			}
@@ -400,7 +409,15 @@ func TestCompensationSDKCreatePreservesRequestCompletionObservation(t *testing.T
 		})
 		image, err := docker.AdmitImage(t.Context(), testImageID)
 		require.NoError(t, err)
-		_, outcome := docker.createCompensationContainer(t.Context(), image, compensationContainer{Name: "source", Config: &container.Config{Labels: map[string]string{LabelLeaseUUID: "source-lease"}}})
+		project, err := docker.images.Compile(&composetypes.Project{Name: "fred-source-lease", Services: composetypes.Services{"web-1": {Image: image.Reference()}}}, map[string]imageexec.Image{"web-1": image})
+		require.NoError(t, err)
+		binding, err := project.Container("web-1")
+		require.NoError(t, err)
+		_, outcome := docker.createCompensationContainer(t.Context(), compensationContainer{
+			Name: "source", Binding: binding, Config: &container.Config{Labels: map[string]string{
+				LabelLeaseUUID: "source-lease", composeapi.ProjectLabel: "forged-project", composeapi.ServiceLabel: "forged-service", composeapi.VersionLabel: "forged-version",
+			}},
+		})
 		require.Equal(t, !transportFails, outcome.settled)
 		require.Error(t, outcome.err)
 	}

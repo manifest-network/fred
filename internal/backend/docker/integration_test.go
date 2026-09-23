@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	composeapi "github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	networktypes "github.com/docker/docker/api/types/network"
@@ -2623,6 +2624,12 @@ func testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t *testing.T, moun
 	require.Equal(t, frozen.HostConfig.SecurityOpt, restored.HostConfig.SecurityOpt)
 	require.Equal(t, frozen.Config.Labels[LabelLifecycleCallbackURL], restored.Config.Labels[LabelLifecycleCallbackURL])
 	require.Equal(t, frozen.Config.Labels[LabelMaintenanceID], restored.Config.Labels[LabelMaintenanceID])
+	for _, key := range []string{composeapi.ProjectLabel, composeapi.ServiceLabel, composeapi.VersionLabel, composeapi.ConfigHashLabel, composeapi.OneoffLabel} {
+		require.NotEmpty(t, frozen.Config.Labels[key])
+		require.Equal(t, frozen.Config.Labels[key], restored.Config.Labels[key], "compensation must preserve Compose discovery: %s", key)
+	}
+	require.Equal(t, frozen.Config.Labels[LabelImageID], restored.Config.Labels[LabelImageID])
+	require.Equal(t, frozen.Config.Labels[LabelImageReference], restored.Config.Labels[LabelImageReference])
 	if mountPath != "" {
 		var restoredDataPath string
 		for _, bound := range restored.Mounts {
@@ -2658,6 +2665,11 @@ func testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t *testing.T, moun
 	require.Len(t, durable, 2)
 	require.Equal(t, maintenanceID, durable[1].MaintenanceID)
 	require.NoError(t, b.Deprovision(ctx, leaseUUID))
+	require.Empty(t, inspectProvisionContainers(t, leaseUUID), "Compose close must remove the replayed source cohort")
+	if mountPath != "" {
+		_, err := os.Stat(originalDataPath)
+		require.ErrorIs(t, err, os.ErrNotExist, "successful close must remove the managed source volume")
+	}
 }
 
 func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) {

@@ -24,13 +24,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend/docker/imagefetch"
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 // localPlatformSecurityRegistry serves only a tiny test-owned OCI index and its
-// blobs over loopback. It exercises the daemon's real pull/index/manifest path
+// blobs over TLS loopback. It exercises Fred's real index/manifest selection
 // without a public registry, build service, credentials, or executable workload.
-func localPlatformSecurityRegistry(t *testing.T) (imageName string, leaf digest.Digest) {
+func localPlatformSecurityRegistry(t *testing.T) (imageName string, leaf digest.Digest, transport http.RoundTripper) {
 	t.Helper()
 	var layer bytes.Buffer
 	tw := tar.NewWriter(&layer)
@@ -95,7 +96,7 @@ func localPlatformSecurityRegistry(t *testing.T) (imageName string, leaf digest.
 	require.NoError(t, err)
 	indexDescriptor := add(indexJSON, ocispec.MediaTypeImageIndex, "manifests")
 	objects["/v2/app/manifests/latest"] = objects["/v2/app/manifests/"+indexDescriptor.Digest.String()]
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
 		if r.URL.Path == "/v2/" {
 			w.WriteHeader(http.StatusOK)
@@ -115,7 +116,7 @@ func localPlatformSecurityRegistry(t *testing.T) (imageName string, leaf digest.
 		}
 	}))
 	t.Cleanup(server.Close)
-	return strings.TrimPrefix(server.URL, "http://") + "/app:latest", leaf
+	return strings.TrimPrefix(server.URL, "https://") + "/app:latest", leaf, server.Client().Transport
 }
 
 func TestIntegration_Docker_MultiPlatformImageExecutesCheckedLeaf(t *testing.T) {
@@ -123,7 +124,10 @@ func TestIntegration_Docker_MultiPlatformImageExecutesCheckedLeaf(t *testing.T) 
 	defer cancel()
 	docker := newIntegrationDockerClient(t, ctx)
 	sdk := newImageSecurityFixtureClient(t)
-	imageName, expectedLeaf := localPlatformSecurityRegistry(t)
+	imageName, expectedLeaf, registryTransport := localPlatformSecurityRegistry(t)
+	docker.newImageLoader = func(root string, maxBytes int64) (*imagefetch.Loader, error) {
+		return imagefetch.NewLoader(sdk, root, maxBytes, imagefetch.WithRegistryTransport(registryTransport))
+	}
 	leafReference := strings.TrimSuffix(imageName, ":latest") + "@" + expectedLeaf.String()
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
@@ -138,9 +142,11 @@ func TestIntegration_Docker_MultiPlatformImageExecutesCheckedLeaf(t *testing.T) 
 	require.NoError(t, err)
 	assert.Equal(t, imageName, prepared.Reference())
 	assert.Equal(t, runtime.GOARCH, prepared.Platform().Architecture)
-	if raw.Descriptor != nil && raw.Descriptor.MediaType == ocispec.MediaTypeImageIndex {
+	info, err := sdk.Info(ctx)
+	require.NoError(t, err)
+	if daemonUsesContainerd(info) {
 		assert.Equal(t, expectedLeaf.String(), prepared.ID(), "containerd execution must pin the native manifest, not the parent index")
-		assert.NotEqual(t, raw.ID, prepared.ID())
+		assert.Equal(t, prepared.ID(), raw.ID, "bounded import publishes only the checked leaf")
 	} else {
 		assert.Equal(t, raw.ID, prepared.ID(), "classic stores already expose an immutable config ID")
 	}
