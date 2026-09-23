@@ -532,18 +532,11 @@ func (m *imageCapacityManager) cachedImage(ctx context.Context, original string,
 // reserveImport atomically checks all outstanding allocations and publishes
 // this import's durable debit. ImageLoad runs after the gate is released.
 func (m *imageCapacityManager) reserveImport(ctx context.Context, loader *imagefetch.Loader, prepared *imagefetch.Prepared) (*imagefetch.ImportAdmission, error) {
-	if err := m.lock(ctx); err != nil {
+	if err := m.lockForImport(ctx); err != nil {
 		return nil, err
 	}
 	defer m.unlock()
 	if err := m.access.verify(ctx); err != nil {
-		return nil, err
-	}
-	info, err := m.daemon.Info(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if err := m.snapshotSettledHelpers(ctx, info); err != nil {
 		return nil, err
 	}
 	if err := m.headroom(ctx, false); err != nil {
@@ -564,28 +557,61 @@ func (m *imageCapacityManager) requireSettledHelpers(ctx context.Context, info s
 	return m.docker.requireImageInspectionsSettled(ctx)
 }
 
+// lockForImport acquires admission against the current helper ownership. A
+// live helper may have started during registry work; its owner supplies a wake
+// signal instead of a refusal. Waiting never owns the capacity gate, so helper
+// completion can release its allocation and unrelated work can make progress.
+// Success retains the gate for the caller's capacity check and durable debit.
+func (m *imageCapacityManager) lockForImport(ctx context.Context) error {
+	for {
+		if err := m.lock(ctx); err != nil {
+			return err
+		}
+		info, err := m.daemon.Info(ctx)
+		if err != nil {
+			m.unlock()
+			return err
+		}
+		changed, err := m.inspectionAdmissionChange(ctx, info)
+		if err != nil {
+			m.unlock()
+			return err
+		}
+		if changed == nil {
+			return nil
+		}
+		m.unlock()
+		if err := m.docker.inspections.waitForAdmissionChange(ctx, changed); err != nil {
+			return err
+		}
+	}
+}
+
 // snapshotSettledHelpers never waits while an allocation/GC gate is owned.
-// A live creator may finish after this snapshot; callers can wait for it before
-// reacquiring the gate, while unknown receipts remain a conservative refusal.
+// Collection is best effort and remains inhibited while live work is pending.
 func (m *imageCapacityManager) snapshotSettledHelpers(ctx context.Context, info system.Info) error {
-	if !daemonUsesContainerd(info) {
-		return nil
-	}
-	if m.docker == nil || m.docker.inspections == nil {
-		return errors.New("docker image inspection owner is not bound")
-	}
-	owner := m.docker.inspections
-	if err := errors.Join(ctx.Err(), owner.authority(), owner.lifetime.Err()); err != nil {
-		return err
-	}
-	changed, err := owner.admissionWait()
+	changed, err := m.inspectionAdmissionChange(ctx, info)
 	if err != nil {
 		return err
 	}
 	if changed != nil {
-		return errors.New("image inspection Create remains in progress")
+		return errors.New("image inspection work remains in progress")
 	}
 	return nil
+}
+
+func (m *imageCapacityManager) inspectionAdmissionChange(ctx context.Context, info system.Info) (<-chan struct{}, error) {
+	if !daemonUsesContainerd(info) {
+		return nil, nil
+	}
+	if m.docker == nil || m.docker.inspections == nil {
+		return nil, errors.New("docker image inspection owner is not bound")
+	}
+	owner := m.docker.inspections
+	if err := errors.Join(ctx.Err(), owner.authority(), owner.lifetime.Err()); err != nil {
+		return nil, err
+	}
+	return owner.admissionWait()
 }
 
 func (m *imageCapacityManager) observeImportDebit() {

@@ -43,15 +43,18 @@ type imageInspectionCoordinator struct {
 
 // These states are minted only by the receipt owner. A live content helper may
 // coexist with image admission after its Create completion is durable; probes
-// and recovery retain exclusive accounting until their receipts are removed.
+// remain exclusive through cleanup. Live owners supply completion signals;
+// abandoned or recovery-owned receipts cannot promise progress.
 type imageInspectionOwnership interface{ ownsImageInspection() }
 
 type contentInspectionCreating struct{ changed chan struct{} }
 type contentInspectionReady struct{ receipt shared.ImageInspectionReceipt }
+type liveUnpackInspection struct{ changed chan struct{} }
 type exclusiveImageInspection struct{}
 
 func (*contentInspectionCreating) ownsImageInspection() {}
 func (contentInspectionReady) ownsImageInspection()     {}
+func (*liveUnpackInspection) ownsImageInspection()      {}
 func (exclusiveImageInspection) ownsImageInspection()   {}
 
 func newImageInspectionCoordinator(
@@ -136,8 +139,8 @@ func (d *DockerClient) verifyImageUnpacked(ctx context.Context, image imageexec.
 	return session.close()
 }
 
-// requireImageInspectionsSettled waits for a live content helper's Create to
-// settle, then permits its owned read session to coexist with image admission.
+// requireImageInspectionsSettled waits for live creators and unpack cleanup.
+// A settled content helper's owned read session can coexist with image admission.
 // Abandoned or uncertain work retains its durable exclusion after restart;
 // empty daemon inventory alone cannot settle a response-lost Create.
 func (d *DockerClient) requireImageInspectionsSettled(ctx context.Context) error {
@@ -153,13 +156,23 @@ func (d *DockerClient) requireImageInspectionsSettled(ctx context.Context) error
 		if err != nil || changed == nil {
 			return err
 		}
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-c.lifetime.Done():
-			return c.lifetime.Err()
+		if err := c.waitForAdmissionChange(ctx, changed); err != nil {
+			return err
 		}
+	}
+}
+
+// waitForAdmissionChange waits only on an existing live owner's signal. The
+// caller must inspect authority and receipts again after waking: cleanup may
+// have handed an unresolved obligation to recovery instead of settling it.
+func (c *imageInspectionCoordinator) waitForAdmissionChange(ctx context.Context, changed <-chan struct{}) error {
+	select {
+	case <-changed:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.lifetime.Done():
+		return c.lifetime.Err()
 	}
 }
 
@@ -178,6 +191,9 @@ func (c *imageInspectionCoordinator) admissionWait() (<-chan struct{}, error) {
 				continue
 			}
 		case *contentInspectionCreating:
+			changed = ownership.changed
+			continue
+		case *liveUnpackInspection:
 			changed = ownership.changed
 			continue
 		}
@@ -246,7 +262,7 @@ func (c *imageInspectionCoordinator) openFor(ctx context.Context, image imageexe
 						if purpose == imageContentInspection {
 							c.active[receipt.ID()] = &contentInspectionCreating{changed: make(chan struct{})}
 						} else {
-							c.active[receipt.ID()] = exclusiveImageInspection{}
+							c.active[receipt.ID()] = &liveUnpackInspection{changed: make(chan struct{})}
 						}
 						s.receipt = receipt
 					}
@@ -381,8 +397,11 @@ func (s *imageInspectionSession) close() error {
 
 func (c *imageInspectionCoordinator) release(id string) {
 	c.mu.Lock()
-	if creating, ok := c.active[id].(*contentInspectionCreating); ok {
-		close(creating.changed)
+	switch ownership := c.active[id].(type) {
+	case *contentInspectionCreating:
+		close(ownership.changed)
+	case *liveUnpackInspection:
+		close(ownership.changed)
 	}
 	delete(c.active, id)
 	c.mu.Unlock()

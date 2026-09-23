@@ -3,6 +3,8 @@ package docker
 import (
 	"context"
 	"errors"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -122,13 +124,72 @@ func TestImageAdmissionRejectsAbandonedSettledContentHelper(t *testing.T) {
 	require.NoError(t, h.client.requireImageInspectionsSettled(t.Context()))
 }
 
-func TestImageAdmissionDoesNotShareLiveUnpackProbe(t *testing.T) {
-	h := newInspectionHarness(t)
-	h.execute(t, func(ctx context.Context, origin shared.ImageInspectionOrigin) error {
-		session, err := h.owner.openFor(ctx, h.image, origin, imageUnpackInspection)
-		require.NoError(t, err)
-		require.ErrorContains(t, h.client.requireImageInspectionsSettled(ctx), "remains pending")
-		return session.close()
-	})
-	require.NoError(t, h.client.requireImageInspectionsSettled(t.Context()))
+func TestImageAdmissionWaitsForLiveUnpackCleanup(t *testing.T) {
+	for _, cleanupFails := range []bool{false, true} {
+		name := "cleanup settles admission"
+		if cleanupFails {
+			name = "failed cleanup retains exclusion"
+		}
+		t.Run(name, func(t *testing.T) {
+			removeEntered, continueRemoval := make(chan struct{}), make(chan struct{})
+			resumeRemoval := sync.OnceFunc(func() { close(continueRemoval) })
+			defer resumeRemoval()
+			h := newInspectionHarnessWithClient(t, func(daemon *inspectionDaemon) *DockerClient {
+				return newImageSecurityDockerClient(t, func(req *http.Request) (*http.Response, error) {
+					if req.Method == http.MethodDelete && strings.Contains(req.URL.Path, "/containers/") {
+						close(removeEntered)
+						<-continueRemoval
+					}
+					return daemon.request(t, req)
+				})
+			})
+			if cleanupFails {
+				h.daemon.removeErr = errors.New("unpack cleanup unavailable")
+			}
+			h.execute(t, func(ctx context.Context, origin shared.ImageInspectionOrigin) error {
+				session, err := h.owner.openFor(ctx, h.image, origin, imageUnpackInspection)
+				require.NoError(t, err)
+				waited := make(chan error, 1)
+				go func() { waited <- h.client.requireImageInspectionsSettled(ctx) }()
+				select {
+				case err := <-waited:
+					t.Fatalf("admission returned before the live unpack owner completed cleanup: %v", err)
+				case <-time.After(20 * time.Millisecond):
+				}
+				closed := make(chan error, 1)
+				go func() { closed <- session.close() }()
+				<-removeEntered
+				changed, err := h.owner.admissionWait()
+				require.NoError(t, err)
+				require.NotNil(t, changed, "the unpack owner must retain admission until DELETE completes")
+				select {
+				case <-changed:
+					t.Fatal("unpack owner signaled completion while DELETE remains in progress")
+				default:
+				}
+				select {
+				case err := <-waited:
+					t.Fatalf("admission returned while unpack cleanup remains in progress: %v", err)
+				case <-time.After(20 * time.Millisecond):
+				}
+				resumeRemoval()
+				err = <-closed
+				admissionErr := <-waited
+				if cleanupFails {
+					require.ErrorContains(t, err, "unpack cleanup unavailable")
+					require.ErrorContains(t, admissionErr, "remains pending")
+				} else {
+					require.NoError(t, err)
+					require.NoError(t, admissionErr)
+				}
+				return err
+			})
+			h.reopen(t)
+			if cleanupFails {
+				require.ErrorContains(t, h.client.requireImageInspectionsSettled(t.Context()), "remains pending")
+			} else {
+				require.NoError(t, h.client.requireImageInspectionsSettled(t.Context()))
+			}
+		})
+	}
 }

@@ -1523,8 +1523,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Containerd admission proves extraction with a stopped, journal-owned probe
   before pinning or use, and legacy pins acquire their verified allowance by
   exact-digest ingestion. Admission waits for live content-helper creation and
-  permits settled read sessions to coexist; abandoned or uncertain helper
-  receipts prevent further containerd ingestion. Containerd image storage
+  unpack cleanup without holding the capacity gate, including helpers started
+  during another lease's download. Settled read sessions can coexist; abandoned
+  or uncertain helper receipts prevent further containerd ingestion. Containerd image storage
   requires an explicit `image_data_path`
   (ENG-1052).
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
@@ -248,6 +249,99 @@ func TestImageCapacityAllocationOwnershipSharesReleaseAndAccountsConcurrentWork(
 	copyOfProbe.close()
 	require.NoError(t, m.importHeadroom(t.Context(), 4*imageMiB))
 	require.Zero(t, m.probing)
+}
+
+func TestImageImportAdmissionCoordinatesHelperStartedAfterPreflight(t *testing.T) {
+	for _, purpose := range []imageInspectionPurpose{imageContentInspection, imageUnpackInspection} {
+		for _, cancelWait := range []bool{false, true} {
+			caseName := "content"
+			if purpose == imageUnpackInspection {
+				caseName = "unpack"
+			}
+			if cancelWait {
+				caseName += " cancellation"
+			}
+			t.Run(caseName, func(t *testing.T) {
+				m, daemon, fs := imageCapacityFixture(t)
+				h := newInspectionHarness(t)
+				m.docker = h.client
+				m.cfg.ImageDataPath = "/containerd"
+				fs["/containerd"] = fs["/images"]
+				info := system.Info{DockerRootDir: "/images", Driver: "overlayfs", DriverStatus: [][2]string{{"driver-type", "io.containerd.snapshotter.v1"}}, OSType: "linux", Architecture: "amd64"}
+				admissionEntered := make(chan struct{})
+				notifyAdmission := sync.OnceFunc(func() { close(admissionEntered) })
+				daemon.info = func(context.Context) (system.Info, error) {
+					notifyAdmission()
+					return info, nil
+				}
+				server := httptest.NewTLSServer(registry.New())
+				t.Cleanup(server.Close)
+				ref := strings.TrimPrefix(server.URL, "https://") + "/app:latest"
+				tag, err := name.NewTag(ref)
+				require.NoError(t, err)
+				require.NoError(t, remote.Write(tag, imageCapacityRegistryImage(t, "concurrent verified bytes"), remote.WithContext(t.Context()), remote.WithTransport(server.Client().Transport)))
+				attachImageCapacityLoader(t, m, func(context.Context, io.Reader) (image.LoadResponse, error) {
+					return image.LoadResponse{}, errors.New("reservation test must not dispatch ImageLoad")
+				}, imagefetch.WithRegistryTransport(server.Client().Transport))
+				prepared, err := m.loader.Prepare(t.Context(), ref, daemonImagePlatform(info))
+				require.NoError(t, err)
+				defer func() { require.NoError(t, prepared.Close()) }()
+				createEntered, resume := make(chan struct{}), make(chan struct{})
+				resumeCreate := sync.OnceFunc(func() { close(resume) })
+				defer resumeCreate()
+				h.daemon.beforeCreate = func() { close(createEntered); <-resume }
+				h.execute(t, func(ctx context.Context, origin shared.ImageInspectionOrigin) error {
+					// This is the real race: preflight succeeds, but a sibling starts
+					// a helper before verified bytes reach the import reservation.
+					require.NoError(t, m.requireSettledHelpers(ctx, info))
+					opened := make(chan inspectionOpenResult, 1)
+					go func() {
+						session, err := h.owner.openFor(ctx, h.image, origin, purpose)
+						opened <- inspectionOpenResult{session: session, err: err}
+					}()
+					<-createEntered
+					waitCtx, cancel := context.WithCancel(ctx)
+					defer cancel()
+					reserved := make(chan error, 1)
+					go func() {
+						admission, err := m.reserveImport(waitCtx, m.loader, prepared)
+						if err == nil {
+							err = admission.Close()
+						}
+						reserved <- err
+					}()
+					<-admissionEntered
+					gateCtx, stopGateWait := context.WithTimeout(ctx, time.Second)
+					defer stopGateWait()
+					require.NoError(t, m.lock(gateCtx), "waiting for a helper must release the capacity gate")
+					m.unlock()
+					select {
+					case err := <-reserved:
+						t.Fatalf("a live helper became a terminal admission result: %v", err)
+					case <-time.After(20 * time.Millisecond):
+					}
+					if cancelWait {
+						cancel()
+						require.ErrorIs(t, <-reserved, context.Canceled)
+					}
+					resumeCreate()
+					result := <-opened
+					require.NoError(t, result.err, "canceling an admission waiter cannot cancel the helper owner")
+					if purpose == imageUnpackInspection {
+						require.NoError(t, result.session.close())
+					}
+					if !cancelWait {
+						require.NoError(t, <-reserved)
+					}
+					return result.session.close()
+				})
+				pending, err := m.loader.PendingBytes()
+				require.NoError(t, err)
+				require.Zero(t, pending, "unstarted or canceled reservations must not retain an import debit")
+				require.NoError(t, h.client.requireImageInspectionsSettled(t.Context()))
+			})
+		}
+	}
 }
 
 func TestImageCapacityRecoveryKeepsSavedBudgetAfterNewLimitDrops(t *testing.T) {
