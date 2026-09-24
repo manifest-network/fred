@@ -120,8 +120,20 @@ func TestImagePinCollectorRetainsOnlyCurrentAndExactCompensationSource(t *testin
 	seedLivenessPin(t, stores, lease, target.Manifest, "example.invalid/app:target", imagePinTarget)
 	journal, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
 	require.NoError(t, err)
-	active := activateMaintenanceOutcomeForTest(t, settlement, bound)
+	// The target is still deploying: only the exact maintenance head owns
+	// its future use. Collection between image preparation and activation
+	// must preserve it independently of the active predecessor's pins.
 	inventory, err := journal.Collect(t.Context())
+	require.NoError(t, err)
+	require.True(t, inventory.Complete())
+	require.True(t, inventory.CanRemove(imagePinOld))
+	require.False(t, inventory.CanRemove(imagePinCurrent))
+	require.False(t, inventory.CanRemove(imagePinTarget), "pending maintenance must protect its prepared target before activation")
+	prepared, err := journal.Lookup(lease, target.Manifest, "example.invalid/app:target")
+	require.NoError(t, err)
+	require.NotNil(t, prepared, "collection cannot prune a pending maintenance target pin")
+	active := activateMaintenanceOutcomeForTest(t, settlement, bound)
+	inventory, err = journal.Collect(t.Context())
 	require.NoError(t, err)
 	require.True(t, inventory.Complete())
 	require.True(t, inventory.CanRemove(imagePinOld), "unrelated superseded history must not pin images")

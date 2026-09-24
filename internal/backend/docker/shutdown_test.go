@@ -174,6 +174,10 @@ func TestStopOwnsLoaderDrainBeforeClosingDependencies(t *testing.T) {
 					require.ErrorIs(t, <-stopped, ErrShutdownDrainTimeout)
 					require.ErrorIs(t, work.Err(), context.Canceled, "the backend deadline must cancel the loader's admitted exchanges")
 					require.Zero(t, closeCalls.Load(), "deadline expiry must not close dependencies while the SDK still unwinds")
+					// A timed-out drain still owns its waiter. Retrying Stop before
+					// the SDK returns must not mistake cancellation for completion.
+					require.ErrorIs(t, b.Stop(), ErrShutdownDrainTimeout)
+					require.Zero(t, closeCalls.Load(), "a stop retry cannot close dependencies while the SDK still owns them")
 					unwind()
 					require.ErrorIs(t, <-imported, context.Canceled)
 					synctest.Wait()

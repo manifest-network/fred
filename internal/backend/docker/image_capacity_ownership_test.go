@@ -22,6 +22,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imagefetch"
@@ -127,12 +128,18 @@ func TestImageCapacityProtectsResolvedImageUntilPinPublication(t *testing.T) {
 	go func() { defer close(finished); runs[lease]() }()
 	<-resolved
 	require.NoError(t, m.lock(t.Context()))
+	busyBefore := testutil.ToFloat64(imageGCTotal.WithLabelValues("busy"))
+	inhibitedBefore := testutil.ToFloat64(imageGCTotal.WithLabelValues("inhibited"))
 	err = m.collect(t.Context())
+	busyAfter := testutil.ToFloat64(imageGCTotal.WithLabelValues("busy"))
+	inhibitedAfter := testutil.ToFloat64(imageGCTotal.WithLabelValues("inhibited"))
 	m.unlock()
 	require.NoError(t, err)
 	require.Empty(t, removed, "resolved content is owned before its durable pin exists")
 	release()
 	<-finished
+	require.Equal(t, busyBefore+1, busyAfter, "an admitted preparation postpones collection as ordinary live work")
+	require.Equal(t, inhibitedBefore, inhibitedAfter, "live preparation must not trigger the uncertainty alert")
 	require.Equal(t, lease, <-results)
 	pins, err := m.pins.List()
 	require.NoError(t, err)

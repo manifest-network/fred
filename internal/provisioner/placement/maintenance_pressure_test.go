@@ -52,6 +52,14 @@ func seedMaintenancePressure(t *testing.T, s *Store, template MaintenanceCommand
 	}))
 }
 
+func maintenanceRefusalCountsForTest() map[string]float64 {
+	counts := make(map[string]float64)
+	for _, reason := range []string{"count", "bytes", "reserved_count", "reserved_bytes"} {
+		counts[reason] = testutil.ToFloat64(metrics.MaintenanceAdmissionRefusalsTotal.WithLabelValues(reason))
+	}
+	return counts
+}
+
 func TestFreshMaintenanceAdmissionBoundsAggregatePendingJournal(t *testing.T) {
 	for _, reason := range []string{"count", "bytes"} {
 		t.Run(reason, func(t *testing.T) {
@@ -69,9 +77,12 @@ func TestFreshMaintenanceAdmissionBoundsAggregatePendingJournal(t *testing.T) {
 			previousTenant.tenant = "incumbent-tenant"
 			seedMaintenancePressure(t, store, previousTenant, count)
 			fresh := testMaintenanceCommand(t, authority, maintenanceIDB, MaintenanceCommandUpdate, []byte("fresh bytes"))
+			refusals := maintenanceRefusalCountsForTest()
 			_, err := store.beginMaintenanceCommand(fresh)
 			require.ErrorIs(t, err, ErrMaintenancePendingFull)
 			require.EqualError(t, err, ErrMaintenancePendingFull.Error()+": "+reason)
+			refusals[reason]++
+			require.Equal(t, refusals, maintenanceRefusalCountsForTest(), "only the exhausted global budget must be counted")
 			_, found, err := store.LookupMaintenanceCommand(maintenanceLease, fresh.command.ID())
 			require.NoError(t, err)
 			require.False(t, found, "capacity refusal must happen before the dispatch WAL is minted")
@@ -93,8 +104,10 @@ func TestPendingBudgetCannotBlockExactReplayOrAuthenticatedSettlement(t *testing
 	require.NoError(t, err)
 	require.True(t, found)
 	seedMaintenancePressure(t, store, record.Command(), maxPendingMaintenanceCommands)
+	refusals := maintenanceRefusalCountsForTest()
 	result := application.Execute(t.Context(), request)
 	require.Equal(t, MaintenanceApplicationAccepted, result.Outcome(), result.Err())
+	require.Equal(t, refusals, maintenanceRefusalCountsForTest(), "exact pending replay does not attempt fresh capacity admission")
 	require.NoError(t, applyMaintenanceCompletionForTest(t, authority, id, backend.CallbackStatusFailed))
 	record, found, err = store.LookupMaintenanceCommand(maintenanceLease, id)
 	require.NoError(t, err)
@@ -102,6 +115,7 @@ func TestPendingBudgetCannotBlockExactReplayOrAuthenticatedSettlement(t *testing
 	require.Equal(t, MaintenanceOutcomeExecutionFailed, record.Outcome())
 	require.Equal(t, MaintenanceApplicationBackendInvalidState, application.Execute(t.Context(), request).Outcome())
 	require.NotContains(t, authority.coordinator.RuntimeController().PendingLeaseUUIDs(), maintenanceLease)
+	require.Equal(t, refusals, maintenanceRefusalCountsForTest(), "settlement and terminal replay do not report capacity refusals")
 }
 
 func TestMaintenanceWakeOnlyFollowsExactDurableCompletionAndCoalesces(t *testing.T) {
@@ -216,6 +230,7 @@ func TestMaintenanceReservationPreservesNewcomerAndSettlementCapacity(t *testing
 			}
 			var admitted []MaintenanceCommandAdmission
 			var refused PreparedMaintenanceCommand
+			refusals := maintenanceRefusalCountsForTest()
 			for index := range maxPendingMaintenanceCommands {
 				command := prepareTenantMaintenance(t, store, scope, index, "tenant-a", payload)
 				admission, err := store.beginMaintenanceCommand(command)
@@ -229,6 +244,8 @@ func TestMaintenanceReservationPreservesNewcomerAndSettlementCapacity(t *testing
 				admitted = append(admitted, admission)
 			}
 			require.True(t, refused.Valid())
+			refusals["reserved_"+dimension]++
+			require.Equal(t, refusals, maintenanceRefusalCountsForTest(), "reservation backpressure must not count as provider exhaustion")
 			other := prepareTenantMaintenance(t, store, scope, 2000, "tenant-b", payload)
 			_, err := store.beginMaintenanceCommand(other)
 			require.NoError(t, err, "one tenant's pressure must not consume another tenant's reserved opportunity")
@@ -237,13 +254,17 @@ func TestMaintenanceReservationPreservesNewcomerAndSettlementCapacity(t *testing
 			_, err = store.beginMaintenanceCommand(spoofed)
 			require.ErrorIs(t, err, ErrMaintenanceCommandConflict, "the share follows the durable principal, never a caller-selected key")
 			require.NoError(t, store.settleMaintenanceCommand(admitted[0].Claim(), MaintenanceOutcomeValidationRejected))
+			require.Equal(t, refusals, maintenanceRefusalCountsForTest(), "newcomer admission, identity conflict and settlement do not report capacity refusals")
 			_, err = store.beginMaintenanceCommand(refused)
 			require.Equal(t, MaintenanceApplicationCapacityReserved, resultForMaintenanceBeginError(err).Outcome(), "the newcomer spent capacity; leave its reservation intact")
+			refusals["reserved_"+dimension]++
+			require.Equal(t, refusals, maintenanceRefusalCountsForTest(), "each new refused attempt reports its exact reservation reason")
 			for _, previous := range admitted[1:3] {
 				require.NoError(t, store.settleMaintenanceCommand(previous.Claim(), MaintenanceOutcomeValidationRejected))
 			}
 			_, err = store.beginMaintenanceCommand(refused)
 			require.NoError(t, err, "terminal settlement releases count and byte charges")
+			require.Equal(t, refusals, maintenanceRefusalCountsForTest(), "successful admission after settlement does not report capacity refusal")
 		})
 	}
 }
