@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"testing"
 
@@ -196,10 +197,13 @@ func TestImagePinCallbackAliasesShareBackfillAdmissionAndRollbackCounts(t *testi
 	appendPinAccountingRelease(t, stores, other)
 	// The value copy predates either constructor: both must still share the
 	// owner allocated when the authoritative callback store opened.
-	copied := *stores.callbacks //nolint:govet // Deliberately exercise an adversarial value copy before pin construction.
+	// Reflection confines this deliberately unsafe full-value copy to the
+	// adversarial fixture; ordinary Go code must obey the store's lock ownership.
+	copied := new(CallbackStore)
+	reflect.ValueOf(copied).Elem().Set(reflect.ValueOf(stores.callbacks).Elem())
 	journal, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
 	require.NoError(t, err)
-	alias, err := NewImagePinJournal(&copied, stores.releases, stores.retentions)
+	alias, err := NewImagePinJournal(copied, stores.releases, stores.retentions)
 	require.NoError(t, err)
 	require.Same(t, journal, alias)
 	journalCopy := *alias
