@@ -63,8 +63,9 @@ func TestImportOwnsCompletionAfterCallerCancellation(t *testing.T) {
 		time.Sleep(31 * time.Second)
 		synctest.Wait()
 		require.NoError(t, work.Err(), "tenant cancellation must not impose the former 30-second completion deadline")
-		_, bounded := work.Deadline()
-		require.False(t, bounded, "admitted import lifetime belongs to its loader")
+		deadline, bounded := work.Deadline()
+		require.True(t, bounded, "the loader must bound its own admitted import lifetime")
+		require.Equal(t, importCompletionTimeout-31*time.Second, time.Until(deadline))
 		daemon.results <- nil
 		require.NoError(t, <-finished)
 		pending, err = loader.PendingBytes()
@@ -105,6 +106,40 @@ func TestCanceledImportAdmissionNeverDispatchesAndReleasesDebit(t *testing.T) {
 			require.NoError(t, loader.Shutdown(t.Context()))
 		})
 	}
+}
+
+func TestAdmittedImportHasLoaderOwnedCeilingFromDispatch(t *testing.T) {
+	f := newRegistry(t, layerTar(t, []byte("content")))
+	transport := f.server.Client().Transport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	stage := t.TempDir()
+	synctest.Test(t, func(t *testing.T) {
+		daemon := &coordinatedImporter{arrivals: make(chan context.Context, 1), results: make(chan error, 1)}
+		loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(transport))
+		require.NoError(t, err)
+		prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
+		require.NoError(t, err)
+		defer prepared.Close()
+		// Preparation time does not consume the independent dispatch budget.
+		time.Sleep(5 * time.Minute)
+		caller, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		finished := make(chan error, 1)
+		go func() { _, err := loader.Import(caller, prepared); finished <- err }()
+		work := <-daemon.arrivals
+		deadline, ok := work.Deadline()
+		require.True(t, ok)
+		require.Equal(t, importCompletionTimeout, time.Until(deadline))
+		cancel()
+		time.Sleep(importCompletionTimeout - time.Second)
+		require.NoError(t, work.Err(), "tenant cancellation cannot shorten the dispatch budget")
+		time.Sleep(time.Second)
+		require.ErrorIs(t, <-finished, context.DeadlineExceeded)
+		pending, err := loader.PendingBytes()
+		require.NoError(t, err)
+		require.Equal(t, prepared.ImportBytes(), pending, "deadline expiry is not evidence that Docker stopped writing")
+		require.NoError(t, loader.Shutdown(t.Context()), "the deadline must release the live loader owner")
+	})
 }
 
 func TestOutstandingImportDebitSurvivesReopenAndUnknownCompletion(t *testing.T) {

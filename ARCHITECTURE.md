@@ -610,13 +610,16 @@ stopped and rerun the same mode against unchanged input.
 That sequence and the configurable `shutdown_timeout` belong to `providerd`.
 Docker-backend has a separate fail-closed boundary. A terminal runtime storage-
 authority withdrawal publishes its first cause to the main loop, which closes
-the listener, allows up to 30 seconds for HTTP shutdown, cancels backend work,
-and waits up to 90 seconds for backend-owned goroutines. It exits status 1 even
+the listener and shares one 75-second deadline across HTTP shutdown and backend
+drain. HTTP gets at most 30 seconds; admitted imports and backend-owned workers
+receive the remaining budget. Direct Go `Backend.Stop` calls retain their
+90-second default. The binary exits status 1 even
 when that drain succeeds so a supervisor must launch a fresh `Start` to recover
 the retained evidence. A drain timeout also exits 1 and leaves the Docker client
 and durable stores open until process death so a still-running worker cannot use
-closed dependencies. A failure during `Start` happens before listener bind and
-exits 1 immediately; there is no running server or worker set to drain.
+closed dependencies. TLS validation and listener binding precede `Start`, so
+either failure preserves the old pin schema. A failure during `Start` exits 1
+immediately; the bound listener has not started serving requests.
 
 ## Backend Integration
 
@@ -1709,7 +1712,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_maintenance_pending` | gauge | `phase` | Pending durable commands by closed phase |
 | `fred_maintenance_pending_bytes` | gauge | `phase` | Encoded pending command bytes by phase |
 | `fred_maintenance_pending_oldest_age_seconds` | gauge | `phase` | Age of the oldest pending command in each phase |
-| `fred_maintenance_admission_refusals_total` | counter | `reason` | Aggregate admission limit reached (`count` or `bytes`); existing commands can still recover |
+| `fred_maintenance_admission_refusals_total` | counter | `reason` | Global capacity (`count`, `bytes`) or newcomer reservation (`reserved_count`, `reserved_bytes`) reached; existing commands can still recover |
 
 **Provisioner:**
 
@@ -1876,10 +1879,10 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_resource_cpu_allocated_ratio` | gauge | — | Allocated/total CPU |
 | `fred_docker_backend_resource_memory_allocated_ratio` | gauge | — | Allocated/total memory |
 | `fred_docker_backend_resource_disk_allocated_ratio` | gauge | — | Allocated/total physical disk. Docker includes durable `disk_mb` plus the pinned scratch allowance for every live diskless instance, even if no managed scratch directory was ultimately needed |
-| `fred_docker_backend_image_gc_total` | counter | `outcome` | Bounded collector decisions: inhibited, shared, below_threshold, removed, error, panic |
+| `fred_docker_backend_image_gc_total` | counter | `outcome` | Bounded collector decisions: busy, inhibited, shared, below_threshold, removed, error, panic; inhibited is diagnostic and may persist for unpinned legacy retention |
 | `fred_docker_backend_image_import_pending_bytes` | gauge | — | Durable import allocation, including completion still unknown |
 | `fred_docker_backend_restore_demote_refused_total` | counter | `backend, reason` | Restores refused by the demote fit-gate (`checkDemoteFit`) because the retained data does not fit the requested smaller SKU tier. `reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`. Synchronous-prelude refusals — NOT counted by `restore_total` (worker-scoped); surfaced to the tenant as HTTP 422 — the `demote_exceeds_tier` string discriminator rides only the backend→fred hop (ENG-438) |
-| `fred_docker_backend_volume_quota_backfill_total` | counter | `outcome` | Startup quota reconciliation (XFS root-attribute verification/repair plus limits), `outcome` ∈ `applied`/`failed`; re-applies the immutable effective quota (`disk_mb` for stateful volumes or pinned scratch for a present diskless writable-path volume) without a re-provision or a recursive XFS tenant-tree walk. The complete inventory is attempted, then any failed application, inventory error, or durable-profile error fails startup/readiness before the normal metrics endpoint binds (ENG-454) |
+| `fred_docker_backend_volume_quota_backfill_total` | counter | `outcome` | Startup quota reconciliation (XFS root-attribute verification/repair plus limits), `outcome` ∈ `applied`/`failed`; `applied` confirms root attributes and limits, not historical descendant tagging. Re-applies the immutable effective quota (`disk_mb` for stateful volumes or pinned scratch for a present diskless writable-path volume) without a re-provision or a recursive XFS tenant-tree walk. The complete inventory is attempted, then any failed application, inventory error, or durable-profile error fails startup/readiness before the normal metrics endpoint serves requests (ENG-454) |
 | `fred_docker_backend_volume_quota_clear_failed_total` | counter | — | Failed XFS quota-clear commands during interrupted-create compensation or typed deletion; preceding block/inode proof failures are not counted. Typed authority is retained and the current backend instance fail-stops for recovery by a fresh `Start`; only historical already-absent/no-authority leaks need classified one-time manual cleanup (ENG-459/ENG-632) |
 
 **Retention:**

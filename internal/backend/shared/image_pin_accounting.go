@@ -39,6 +39,18 @@ type imagePinAccounting struct {
 	leases     map[string]imagePinLeaseUsage
 }
 
+// lockedImagePins is the scoped writer for a journal and its accounting
+// projection. Only withLockedPins constructs it, holding the shared owner lock
+// through durable commit and OnCommit publication. Lease locks are acquired
+// inside this scope, consistently ordering pin ownership before lease ownership.
+type lockedImagePins struct{ journal *ImagePinJournal }
+
+func (j *ImagePinJournal) withLockedPins(run func(*lockedImagePins) error) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return run(&lockedImagePins{journal: j})
+}
+
 func (j *ImagePinJournal) loadAccounting() (*imagePinAccounting, error) {
 	pins, err := j.List()
 	if err != nil {
@@ -147,7 +159,8 @@ type imagePinTransaction struct {
 	leases     map[string]imagePinLeaseUsage
 }
 
-func (j *ImagePinJournal) updatePins(mutate func(*imagePinTransaction) error) error {
+func (pins *lockedImagePins) updatePins(mutate func(*imagePinTransaction) error) error {
+	j := pins.journal
 	return j.callbacks.update(func(tx *bolt.Tx) error {
 		writer := &imagePinTransaction{
 			journal: j, tx: tx, total: j.accounting.total, unassigned: j.accounting.unassigned,

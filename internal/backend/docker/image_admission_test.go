@@ -252,7 +252,7 @@ func TestImageCapacityAllocationOwnershipSharesReleaseAndAccountsConcurrentWork(
 	first.close()
 	copyOfFirst.close()
 	require.Equal(t, 10*imageMiB, m.staging)
-	require.Len(t, m.stageSlots, 1)
+	require.Equal(t, 1, m.tenantShares.used)
 	fs["/images"] = diskCapacity{available: uint64(15 * imageMiB)}
 	require.Error(t, m.importHeadroom(t.Context(), 4*imageMiB), "unwritten staging bytes must be reserved against concurrent import")
 	second.close()

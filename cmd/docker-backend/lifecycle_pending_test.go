@@ -70,7 +70,15 @@ func (r lifecycleTestIdentity) ExpectedBackendStorageIdentity(string) (backendid
 }
 
 func TestLifecyclePendingServerAndClientPreserveAmbiguousWork(t *testing.T) {
-	pending := journalLifecyclePendingError(t)
+	for _, pending := range []error{journalLifecyclePendingError(t), actorLifecyclePendingError(t)} {
+		t.Run(fmt.Sprintf("%T", pending), func(t *testing.T) {
+			testLifecyclePendingServerAndClient(t, pending)
+		})
+	}
+}
+
+func testLifecyclePendingServerAndClient(t *testing.T, pending error) {
+	t.Helper()
 	for _, operation := range []string{"restart", "update", "deprovision"} {
 		t.Run(operation, func(t *testing.T) {
 			var calls atomic.Int32

@@ -855,6 +855,17 @@ Clients must generate a fresh UUIDv4 for each new logical command and reuse it
 only for retries. A live lease that reaches the 1,024-receipt safety ceiling is
 refused before dispatch rather than forgetting an identity.
 
+The provider shares a separate budget of 1,024 pending commands and 64 MiB of
+journal content, including 512 bytes of phase-growth allowance per command.
+There is no fixed per-tenant concurrency cap. A tenant that already has pending
+work can borrow the shared pool while leaving one command and 2 MiB available
+for a tenant without pending work. Reaching that reserve returns `429` with
+`reason: maintenance_capacity_reserved` and `Retry-After: 1` before recording a
+new command. Retry that request after your pending work completes. Exact replay
+and settlement of admitted commands remain available. Global exhaustion returns
+`503`; this finite reserve does not guarantee admission for unlimited new tenant
+addresses.
+
 For both restart and update, a `503` response can leave a durably admitted
 command pending. Even when an open backend circuit blocks its first attempt,
 the command remains pending. Fred retries work at startup and every `reconciliation_interval`
@@ -887,6 +898,9 @@ Once established, an unrelated backend outage does not revoke it.
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - The key conflicts with a prior command, another command is
   pending, or the lease is in a state that cannot be restarted
+- `429 Too Many Requests` with `reason: maintenance_capacity_reserved` - Shared
+  capacity is reserved for a tenant without pending work; this new command was
+  not recorded. Retry after your pending work completes (`Retry-After: 1`)
 - `503 Service Unavailable` - Backend dispatch is blocked (for example by an
   open circuit) or its outcome is uncertain, authentication/routing authority
   is temporarily unavailable, or a bounded idempotency journal refused admission
@@ -950,6 +964,9 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - The key conflicts with a prior command, another command is
   pending, or the lease is in a state that cannot be updated
+- `429 Too Many Requests` with `reason: maintenance_capacity_reserved` - Shared
+  capacity is reserved for a tenant without pending work; this new command was
+  not recorded. Retry after your pending work completes (`Retry-After: 1`)
 - `500 Internal Server Error` - An accepted update could not yet be persisted
   to the provider payload store; the durable pending command remains recoverable
 - `503 Service Unavailable` - Backend dispatch is blocked (for example by an

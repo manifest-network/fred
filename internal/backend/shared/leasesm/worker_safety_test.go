@@ -50,9 +50,9 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
 	select {
 	case err := <-reply:
-		require.ErrorIs(t, err, ErrWorkerDrainTimeout)
+		require.True(t, IsLifecyclePending(err), "the exact live worker must issue a pending observation: %v", err)
 	case <-time.After(2 * time.Second):
-		t.Fatal("deprovision did not report the worker-drain timeout")
+		t.Fatal("deprovision did not promptly report the draining worker")
 	}
 
 	assert.True(t, cancelCalled.Load(), "preemption must still signal cancellation")
@@ -63,9 +63,8 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	_, exists := store.Get("lease-1")
 	assert.True(t, exists, "the live provision must remain for safe retry/recovery")
 
-	// Once the real worker exits, a retry may transition and tear down. This
-	// proves the fail-closed timeout is recoverable rather than a permanent
-	// Deprovisioning wedge.
+	// Once the real worker exits, a retry may transition and tear down. The
+	// immediate observation cannot strand the actor in Deprovisioning.
 	actor.workers.Done()
 	retryReply := make(chan error, 1)
 	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: retryReply}))
@@ -77,6 +76,17 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	}
 	assert.Equal(t, int64(1), deprovisionCalls.Load())
 	<-actor.Done()
+}
+
+func TestWorkerPendingRequiresActorIssuedObservation(t *testing.T) {
+	for _, err := range []error{
+		errors.New("worker still draining"),
+		ErrWorkerDrainTimeout,
+		workerDrainPending{},
+		shared.CloseExecutionPending{},
+	} {
+		require.False(t, IsLifecyclePending(err), "unissued errors cannot become worker observations: %v", err)
+	}
 }
 
 func TestDeprovisionAbsentProjectionStillRunsSubstrateFinalizer(t *testing.T) {

@@ -190,13 +190,17 @@ func completeUpdateForTest(t *testing.T, store *placement.Store, id maintenancei
 
 type maintenanceInventoryBackend struct {
 	backend.Backend
+	*maintenanceInventory
+}
+
+type maintenanceInventory struct {
 	mu         sync.Mutex
 	storageID  backendidentity.ID
 	provisions []backend.ProvisionInfo
 	retentions []backend.RetainedLease
 }
 
-func (client *maintenanceInventoryBackend) stage(
+func (client *maintenanceInventory) stage(
 	storageID backendidentity.ID,
 	provisions []backend.ProvisionInfo,
 	retentions []backend.RetainedLease,
@@ -208,7 +212,7 @@ func (client *maintenanceInventoryBackend) stage(
 	client.mu.Unlock()
 }
 
-func (client *maintenanceInventoryBackend) ListProvisionsWithIdentity(
+func (client *maintenanceInventory) ListProvisionsWithIdentity(
 	context.Context,
 ) ([]backend.ProvisionInfo, backendidentity.ID, error) {
 	client.mu.Lock()
@@ -216,7 +220,7 @@ func (client *maintenanceInventoryBackend) ListProvisionsWithIdentity(
 	return append([]backend.ProvisionInfo(nil), client.provisions...), client.storageID, nil
 }
 
-func (client *maintenanceInventoryBackend) ListRetentionsWithIdentity(
+func (client *maintenanceInventory) ListRetentionsWithIdentity(
 	context.Context,
 ) ([]backend.RetainedLease, backendidentity.ID, error) {
 	client.mu.Lock()
@@ -237,7 +241,7 @@ func newMaintenanceInventoryRuntime(runtime maintenanceBackendRuntime) *maintena
 	}
 	for _, client := range runtime.Backends() {
 		if client != nil {
-			result.backends[client.Name()] = &maintenanceInventoryBackend{Backend: client}
+			result.backends[client.Name()] = &maintenanceInventoryBackend{Backend: client, maintenanceInventory: &maintenanceInventory{}}
 		}
 	}
 	return result
@@ -258,8 +262,7 @@ func (runtime *maintenanceInventoryRuntime) wrap(client backend.Backend) backend
 	// replacement backend process. Keep the inventory adapter bound to the
 	// backend returned for this operation rather than the one present when the
 	// coordinator was constructed.
-	wrapper.Backend = client
-	return wrapper
+	return &maintenanceInventoryBackend{Backend: client, maintenanceInventory: wrapper.maintenanceInventory}
 }
 
 func (runtime *maintenanceInventoryRuntime) Route(sku string) backend.Backend {

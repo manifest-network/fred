@@ -11,5 +11,11 @@ var (
 	MaintenancePending                = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: namespace, Subsystem: "maintenance", Name: "pending", Help: "Durable unresolved maintenance commands by phase"}, []string{"phase"})
 	MaintenancePendingBytes           = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: namespace, Subsystem: "maintenance", Name: "pending_bytes", Help: "Encoded durable unresolved maintenance bytes by phase"}, []string{"phase"})
 	MaintenancePendingOldestAge       = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: namespace, Subsystem: "maintenance", Name: "pending_oldest_age_seconds", Help: "Age of the oldest durable unresolved maintenance command by phase"}, []string{"phase"})
-	MaintenanceAdmissionRefusalsTotal = promauto.NewCounterVec(prometheus.CounterOpts{Namespace: namespace, Subsystem: "maintenance", Name: "admission_refusals_total", Help: "Fresh maintenance commands refused by aggregate pending budget"}, []string{"reason"})
+	MaintenanceAdmissionRefusalsTotal = promauto.NewCounterVec(prometheus.CounterOpts{Namespace: namespace, Subsystem: "maintenance", Name: "admission_refusals_total", Help: "Fresh maintenance commands refused by global pending budget or its newcomer reservation"}, []string{"reason"})
 )
+
+func init() {
+	for _, reason := range []string{"count", "bytes", "reserved_count", "reserved_bytes"} {
+		MaintenanceAdmissionRefusalsTotal.WithLabelValues(reason)
+	}
+}

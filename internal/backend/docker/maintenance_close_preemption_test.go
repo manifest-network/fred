@@ -34,7 +34,7 @@ func TestDeprovisionPreemptsStartedMaintenance(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			err = h.b.Deprovision(ctx, h.leaseUUID)
+			err = deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID)
 			require.NoError(t, err, "close must hand drained Started maintenance to its durable finalizer")
 			require.Empty(t, h.inventory.containers, "close must remove both source and partial target")
 			require.Len(t, h.inventory.removed, 3)
@@ -118,7 +118,7 @@ func TestDeprovisionCancelsInFlightMaintenanceBeforeCloseHandoff(t *testing.T) {
 			// Compose has successfully completed the physical replacement. The
 			// worker is blocked observing readiness; close must cancel and drain
 			// that worker before changing the durable owner and removing targets.
-			require.NoError(t, h.b.Deprovision(ctx, h.leaseUUID))
+			require.NoError(t, deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID))
 			require.Empty(t, h.inventory.containers)
 			require.Len(t, h.inventory.removed, 2)
 			pending, err := h.callbacks.ListPending()
@@ -143,7 +143,7 @@ func TestDeprovisionStartedMaintenanceKeepsUnknownCleanupPending(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	require.Error(t, h.b.Deprovision(ctx, h.leaseUUID))
+	require.Error(t, deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID))
 	claim, found, err := h.b.closeSettlement.GetCloseIntent(h.leaseUUID)
 	require.NoError(t, err)
 	require.True(t, found, "unknown physical effects must retain the exact durable close owner")
@@ -211,7 +211,7 @@ func TestDeprovisionDoesNotBypassUnknownMaintenanceLaunch(t *testing.T) {
 
 	// Cancellation drains the local worker, but does not prove that the Docker
 	// daemon finished its request. A close handoff cannot erase that uncertainty.
-	require.ErrorIs(t, h.b.Deprovision(ctx, h.leaseUUID), shared.ErrVolumeLaunchUnsettled)
+	require.ErrorIs(t, deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID), shared.ErrVolumeLaunchUnsettled)
 	claim, found, err := h.b.closeSettlement.GetCloseIntent(h.leaseUUID)
 	require.NoError(t, err)
 	require.True(t, found)
@@ -270,7 +270,7 @@ func TestDeprovisionDrainsAdmittedMaintenanceLaunchWithoutDebt(t *testing.T) {
 			}
 			require.ErrorIs(t, h.b.volumeLaunches.checkNamespace(h.leaseUUID), shared.ErrVolumeLaunchUnsettled)
 
-			require.NoError(t, h.b.Deprovision(ctx, h.leaseUUID), "close must drain the admitted request before exact cleanup")
+			require.NoError(t, deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID), "close must drain the admitted request before exact cleanup")
 			require.NoError(t, h.b.volumeLaunches.checkNamespace(h.leaseUUID), "preemption must not manufacture launch debt")
 			require.Empty(t, h.inventory.containers)
 			require.Len(t, h.inventory.removed, 2)
@@ -293,7 +293,7 @@ func TestDeprovisionPreservesCommittedMaintenanceSuccess(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	require.NoError(t, h.b.Deprovision(ctx, h.leaseUUID))
+	require.NoError(t, deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID))
 	pending, err := h.callbacks.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 2)

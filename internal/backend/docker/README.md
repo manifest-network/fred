@@ -828,7 +828,10 @@ admitted Docker effects retain their completion owners while they drain. Create
 and Start receive a 30-second grace only after caller cancellation or backend
 shutdown; an uncanceled request is not cut off after 30 seconds. Admitted image
 imports instead belong to the loader lifetime and continue through tenant
-cancellation, with the backend-worker drain allowance on shutdown.
+cancellation, with a 30-minute ceiling from dispatch and the backend-worker
+drain allowance on shutdown. A close cancels the workflow and immediately returns
+typed, breaker-neutral `503 lifecycle_pending` while its owned worker remains
+active; later retries can acquire exclusive teardown after that worker drains.
 
 ### Image admission
 
@@ -840,14 +843,17 @@ containerd `overlayfs` additionally requires its actual `image_data_path`.
 External `DOCKER_TMPDIR` overrides are outside the supported space model.
 
 The Started operation or maintenance subject supplies the tenant for an opaque
-preparation capability. One preparation per tenant may resolve or stage images;
-other requests from that tenant wait without holding a provider staging slot or
-GC admission. Its single-use staging ownership is retained until cleanup, even
-if a copied parent capability closes early. Up to four distinct tenants can
-stage concurrently. A cached image for the same tenant waits behind its current
-preparation; cancellation removes only the waiting request.
+preparation capability. Pinned and locally reusable image preparation never
+enters the staging queue. A single scheduler owns four slots, all available to a
+sole tenant. When capacity becomes available, it selects the waiting tenant with
+the fewest active stages; ties and requests within each tenant follow arrival
+order. No separate semaphore can reverse that choice. The single-use staging
+ownership is retained until cleanup, even if a copied parent capability closes
+early; cancellation removes only the waiting request. Occupied slots are not
+preempted, and this policy does not provide isolation against multiple addresses.
 
-Image pins share one store-owned commit accounting path: at most 100,000 total
+Image pins share one store-owned commit accounting path, available only inside a
+scoped pin-lock capability: at most 100,000 total
 and 10,000 per verified durable tenant. Existing exact pins can be reused or
 recovered above these ceilings. The common accounting applies to both new
 admission and legacy backfill. On reopening, a row without positive durable
@@ -858,21 +864,35 @@ unknown ownership nor an exceeded budget authorizes deletion or debit reset.
 Before dispatch, the loader durably adds its verified allowance to
 `<callback_db_path>.image-staging/image-import-debit-v1`. Upload and completion
 belong to the loader lifetime once admitted, independently of tenant
-cancellation. The caller keeps staging and capacity ownership until the exchange
+cancellation, with a 30-minute ceiling measured from dispatch. The caller keeps
+staging and capacity ownership until the exchange
 finishes. Backend shutdown closes new admission, allows the owner to finish
-within its remaining 90-second worker-drain budget, then cancels it at the
+within its remaining shutdown budget, then cancels it at the
 deadline and drains it before journals close. Clean
 upload and terminal completion release only that import's debit, including a
 fully observed Docker refusal. The business failure still prevents image use;
 unknown completion retains the allocation across reopening. Capacity
 admission checks include outstanding allocations before further staging or
 import. Unknown allocation alone does not block collection of unpinned, unused
-images; live admission still protects content until its pin is durable. Local
+images; live admission still protects content until its pin is durable. The
+periodic collector can prune obsolete pins while admissions remain active, but
+does not remove images during that interval. Pre-upgrade retained generations
+without pins conservatively inhibit image deletion until restored or safely
+reaped. That can last for the remaining retention grace (90 days by default)
+plus a sweep interval, or longer when reaping is parked; the inhibited counter
+alone is not a paging condition while disk headroom is healthy. Local
 launches add only unknown completion allocations to their actual free-space floor. These checks sample free space;
 they do not reserve physical capacity against other writers. The
 [offline recovery procedure](../../../OPERATIONS.md#recovering-outstanding-image-import-allocation)
 requires external Docker/runtime drain and matching backups before an explicit
 debit clear.
+
+The `docker-backend` command uses one 75-second deadline for HTTP shutdown
+(at most 30 seconds) and the remaining backend-worker drain. This fits the
+existing 90-second systemd stop allowance. `Backend.StopContext` consumes the
+owner's deadline; direct `Backend.Stop` callers retain the 90-second default.
+If owned work cannot drain in time, stores stay open and the process reports a
+typed drain failure rather than claiming successful shutdown.
 
 Containerd pins persist `ImportBytes` with immutable image identity. A zero
 legacy allowance requires exact-digest re-ingestion. Every containerd admission

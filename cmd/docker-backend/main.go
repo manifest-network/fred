@@ -154,15 +154,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start backend only after the marker and Docker substrate match.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := b.Start(ctx); err != nil {
-		cancel()
-		logger.Error("failed to start backend", "error", err)
-		os.Exit(1)
-	}
-	cancel()
-
 	// Create server
 	server, err := NewIdentityBoundServer(
 		b, string(cfg.CallbackSecret), logger, cfg.MaxRequestBodySize, b.StorageIdentity(),
@@ -172,8 +163,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Build the listener TLS config up front so a bad cert fails fast before we
-	// announce readiness. Config.Validate (run in docker.New) already enforces
+	// Build the listener TLS config before Start can publish optional image
+	// pins. Config.Validate already enforces
 	// field pairing; ServerConfig loads and parses the actual files.
 	var tlsServerConfig *tls.Config
 	if cfg.TLSCertFile != "" {
@@ -183,6 +174,24 @@ func main() {
 			os.Exit(1)
 		}
 	}
+
+	// Bind before Start can publish optional image pins. A conflicting listener
+	// must leave a failed first startup on the older database format.
+	listener, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		logger.Error("failed to bind HTTP listener", "error", err)
+		os.Exit(1)
+	}
+	defer listener.Close()
+
+	// Start backend only after the marker and Docker substrate match.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := b.Start(ctx); err != nil {
+		cancel()
+		logger.Error("failed to start backend", "error", err)
+		os.Exit(1)
+	}
+	cancel()
 
 	// Setup HTTP server
 	httpServer := &http.Server{
@@ -203,10 +212,10 @@ func main() {
 				"mtls", cfg.TLSClientCAFile != "", "pinned_names", len(cfg.TLSClientAllowedNames))
 			// The cert/key live in tlsServerConfig.Certificates (loaded by
 			// tlsconfig.ServerConfig), so the file arguments are empty.
-			serveErr = httpServer.ListenAndServeTLS("", "")
+			serveErr = httpServer.ServeTLS(listener, "", "")
 		} else {
 			logger.Info("starting HTTP server", "addr", cfg.ListenAddr)
-			serveErr = httpServer.ListenAndServe()
+			serveErr = httpServer.Serve(listener)
 		}
 		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			serverErr <- serveErr
@@ -218,10 +227,8 @@ func main() {
 	// its typed on-disk recovery evidence is consumed only by a fresh Start.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	// startupErr captures a ListenAndServe failure (port in use, bind refused,
-	// etc.) so the process can exit non-zero after the graceful-shutdown path
-	// runs. Without this, supervisors / k8s liveness probes / CI would see the
-	// "binary that never bound" as a successful run.
+	// A serving failure must still exit non-zero after graceful shutdown, so
+	// the supervisor can distinguish it from an operator-requested stop.
 	trigger := waitForShutdownTrigger(sigCh, serverErr, b.TerminalStorageAuthorityFailure())
 	var (
 		startupErr          = trigger.serverErr
@@ -237,18 +244,14 @@ func main() {
 			"error", storageAuthorityErr)
 	}
 
-	// Graceful shutdown
-	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := httpServer.Shutdown(ctx); err != nil {
-		logger.Error("HTTP shutdown error", "error", err)
+	// One process-owned budget includes HTTP and worker drain, leaving margin
+	// inside the deployed service manager's default 90-second stop timeout.
+	httpShutdownErr, backendShutdownErr := drainHTTPAndBackend(context.Background(), httpServer, b)
+	if httpShutdownErr != nil {
+		logger.Error("HTTP shutdown error", "error", httpShutdownErr)
 	}
-
-	var backendShutdownErr error
-	if err := b.Stop(); err != nil {
-		backendShutdownErr = err
-		logger.Error("backend shutdown error", "error", err)
+	if backendShutdownErr != nil {
+		logger.Error("backend shutdown error", "error", backendShutdownErr)
 	}
 	// If an operator/listener event won the initial select concurrently with a
 	// storage latch, observe the buffered first cause after all backend workers

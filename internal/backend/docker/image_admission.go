@@ -56,24 +56,14 @@ type imageStagingState struct {
 }
 
 func (m *imageCapacityManager) reserveStaging(ctx context.Context, preparation imageTenantPreparation, bytes int64) (stage imageStaging, err error) {
-	if err := preparation.startStaging(m); err != nil {
+	if err := preparation.startStaging(ctx, m); err != nil {
 		return imageStaging{}, err
 	}
-	slotAcquired := false
 	defer func() {
 		if stage.state == nil {
-			if slotAcquired {
-				<-m.stageSlots
-			}
 			preparation.finishStaging()
 		}
 	}()
-	select {
-	case m.stageSlots <- struct{}{}:
-		slotAcquired = true
-	case <-ctx.Done():
-		return imageStaging{}, ctx.Err()
-	}
 	if err := m.lock(ctx); err != nil {
 		return imageStaging{}, err
 	}
@@ -138,7 +128,6 @@ func (s imageStaging) close() {
 		_ = m.lock(context.Background())
 		m.staging -= s.state.bytes
 		m.unlock()
-		<-m.stageSlots
 		s.state.preparation.finishStaging()
 	})
 }

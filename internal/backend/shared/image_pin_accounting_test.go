@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"testing"
+	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
@@ -253,4 +254,92 @@ func TestImagePinProviderLimitIncludesLegacyRowsWithoutBlockingExactRecovery(t *
 	require.ErrorContains(t, pinAccountingImage(t, journal, refusedOrigin, 0), "journal capacity exhausted")
 	require.NoError(t, pinAccountingImage(t, journal, legacyOrigin, 256<<20), "a full provider still permits exact immutable recovery")
 	require.Equal(t, maxImagePins, journal.accounting.total)
+}
+
+func TestImagePinConcurrentAliasesCannotSpendLastTenantSlotTwice(t *testing.T) {
+	stores := openOperationHandoffStores(t, "image-pin-concurrent-aliases")
+	legacy := testOperationIntentSpec(t, "near-tenant-cap")
+	appendPinAccountingRelease(t, stores, legacy)
+	seedHistoricalPinRows(t, stores, legacy.LeaseUUID, maxTenantImagePins-1, legacy.Manifest, "example.invalid/app:1")
+	origins := []ImageInspectionOrigin{
+		startedPinAccountingOrigin(t, stores, testOperationIntentSpec(t, "contender-one")),
+		startedPinAccountingOrigin(t, stores, testOperationIntentSpec(t, "contender-two")),
+	}
+	journal, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
+	require.NoError(t, err)
+	alias := *journal
+	start := make(chan struct{})
+	results := make(chan error, len(origins))
+	for index, origin := range origins {
+		owner := journal
+		if index == 1 {
+			owner = &alias
+		}
+		go func() {
+			<-start
+			results <- owner.Pin(origin, "example.invalid/app:1", inspectionJournalTestImage, "",
+				ocispec.Platform{OS: "linux", Architecture: "amd64"}, 0)
+		}()
+	}
+	close(start)
+	accepted, refused := 0, 0
+	for range origins {
+		err := <-results
+		if err == nil {
+			accepted++
+			continue
+		}
+		var capacity *imagePinCapacityRefusal
+		require.ErrorAs(t, err, &capacity)
+		refused++
+	}
+	require.Equal(t, 1, accepted)
+	require.Equal(t, 1, refused)
+	actual, err := journal.List()
+	require.NoError(t, err)
+	require.Len(t, actual, maxTenantImagePins)
+	require.Equal(t, len(actual), journal.accounting.total)
+	require.Equal(t, maxTenantImagePins, alias.accounting.tenants[legacy.Tenant])
+}
+
+func TestImagePinBackfillPanicReleasesSharedJournalAndLeaseOwnership(t *testing.T) {
+	stores := openOperationHandoffStores(t, "image-pin-backfill-panic")
+	spec := testOperationIntentSpec(t, "active-for-backfill")
+	appendPinAccountingRelease(t, stores, spec)
+	journal, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
+	require.NoError(t, err)
+	alias := *journal
+	panicked := false
+	backfiller, err := NewImagePinBackfiller(&alias, imagePinObserverFunc(func(context.Context, ImagePinBackfillSubject) ([]ImagePinBackfillObservation, error) {
+		if !panicked {
+			panicked = true
+			panic("image observer failed")
+		}
+		return []ImagePinBackfillObservation{{Reference: "example.invalid/app:1", ImageID: inspectionJournalTestImage,
+			Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}}}, nil
+	}))
+	require.NoError(t, err)
+	require.PanicsWithValue(t, "image observer failed", func() { _, _ = backfiller.Sweep(t.Context()) })
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	type sweepResult struct {
+		report ImagePinBackfillReport
+		err    error
+	}
+	result := make(chan sweepResult, 1)
+	go func() {
+		report, err := backfiller.Sweep(ctx)
+		result <- sweepResult{report: report, err: err}
+	}()
+	select {
+	case result := <-result:
+		require.NoError(t, result.err)
+		require.Equal(t, ImagePinBackfillReport{PinsAdded: 1}, result.report)
+	case <-ctx.Done():
+		t.Fatal("panicking observer stranded journal or lease ownership")
+	}
+	require.Equal(t, 1, journal.accounting.total)
+	pin, err := journal.Lookup(spec.LeaseUUID, spec.Manifest, "example.invalid/app:1")
+	require.NoError(t, err)
+	require.NotNil(t, pin)
 }

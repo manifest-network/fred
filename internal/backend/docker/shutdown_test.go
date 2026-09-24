@@ -60,6 +60,41 @@ func TestStopIsBoundedAndLeavesDependenciesOpenWhileWorkerMayRun(t *testing.T) {
 	assert.Equal(t, int64(1), closeCalls.Load())
 }
 
+func TestStopContextSpendsOnlyRemainingProcessDrainBudget(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var closeCalls atomic.Int64
+		b := newBackendForTest(&mockDockerClient{CloseFn: func() error {
+			closeCalls.Add(1)
+			return nil
+		}}, nil)
+		process, cancel := context.WithTimeout(t.Context(), 75*time.Second)
+		defer cancel()
+		started := time.Now()
+		// The HTTP server spent its full request-drain allowance first.
+		time.Sleep(30 * time.Second)
+		b.wg.Add(1)
+		stopped := make(chan error, 1)
+		go func() { stopped <- b.StopContext(process) }()
+		synctest.Wait()
+		time.Sleep(44 * time.Second)
+		select {
+		case err := <-stopped:
+			t.Fatalf("backend returned before the remaining process budget expired: %v", err)
+		default:
+		}
+		time.Sleep(time.Second)
+		err := <-stopped
+		require.ErrorIs(t, err, ErrShutdownDrainTimeout)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.Equal(t, 75*time.Second, time.Since(started))
+		require.Zero(t, closeCalls.Load(), "deadline cannot close dependencies under a live owner")
+		b.wg.Done()
+		synctest.Wait()
+		require.NoError(t, b.Stop())
+		require.EqualValues(t, 1, closeCalls.Load())
+	})
+}
+
 func TestStopOwnsLoaderDrainBeforeClosingDependencies(t *testing.T) {
 	server := httptest.NewTLSServer(registry.New())
 	defer server.Close()
@@ -69,7 +104,7 @@ func TestStopOwnsLoaderDrainBeforeClosingDependencies(t *testing.T) {
 		remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous), remote.WithTransport(server.Client().Transport)))
 	transport := server.Client().Transport.(*http.Transport).Clone()
 	transport.DisableKeepAlives = true
-	for _, scenario := range []string{"completes after 75 seconds", "deadline while SDK still unwinds"} {
+	for _, scenario := range []string{"completes after 75 seconds", "deadline while SDK still unwinds", "shared process deadline while SDK still unwinds"} {
 		t.Run(scenario, func(t *testing.T) {
 			stage := t.TempDir()
 			synctest.Test(t, func(t *testing.T) {
@@ -110,7 +145,16 @@ func TestStopOwnsLoaderDrainBeforeClosingDependencies(t *testing.T) {
 				go func() { _, err := loader.Import(b.stopCtx, prepared); imported <- err }()
 				work := <-arrivals
 				stopped := make(chan error, 1)
-				go func() { stopped <- b.Stop() }()
+				drain := 90 * time.Second
+				if scenario == "shared process deadline while SDK still unwinds" {
+					process, cancel := context.WithTimeout(t.Context(), 75*time.Second)
+					defer cancel()
+					time.Sleep(30 * time.Second)
+					drain = 45 * time.Second
+					go func() { stopped <- b.StopContext(process) }()
+				} else {
+					go func() { stopped <- b.Stop() }()
+				}
 				synctest.Wait()
 				require.ErrorIs(t, b.stopCtx.Err(), context.Canceled)
 				require.NoError(t, work.Err(), "Stop must preserve the owned import until its drain deadline")
@@ -125,7 +169,7 @@ func TestStopOwnsLoaderDrainBeforeClosingDependencies(t *testing.T) {
 					require.NoError(t, err)
 					require.Zero(t, pending)
 				} else {
-					time.Sleep(90 * time.Second)
+					time.Sleep(drain)
 					synctest.Wait()
 					require.ErrorIs(t, <-stopped, ErrShutdownDrainTimeout)
 					require.ErrorIs(t, work.Err(), context.Canceled, "the backend deadline must cancel the loader's admitted exchanges")

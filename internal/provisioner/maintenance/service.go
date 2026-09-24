@@ -44,6 +44,7 @@ const (
 	OutcomeCommandConflict
 	OutcomeBackendInvalidState
 	OutcomeBackendValidation
+	OutcomeCapacityReserved
 	OutcomeServiceUnavailable
 	OutcomeInternalFailure
 )
@@ -66,7 +67,7 @@ func NewResult(outcome Outcome, cause error) Result {
 	switch outcome {
 	case OutcomeAccepted, OutcomeNotFound, OutcomeNoLongerActive, OutcomeForbidden,
 		OutcomeAlreadyInProgress, OutcomeCommandConflict, OutcomeBackendInvalidState,
-		OutcomeBackendValidation, OutcomeServiceUnavailable, OutcomeInternalFailure:
+		OutcomeBackendValidation, OutcomeCapacityReserved, OutcomeServiceUnavailable, OutcomeInternalFailure:
 		return Result{outcome: outcome, cause: cause}
 	default:
 		return Result{outcome: OutcomeInternalFailure, cause: errors.New("invalid maintenance result")}
@@ -143,6 +144,8 @@ func resultFromApplication(result placement.MaintenanceApplicationResult) Result
 		outcome = OutcomeBackendInvalidState
 	case placement.MaintenanceApplicationBackendValidation:
 		outcome = OutcomeBackendValidation
+	case placement.MaintenanceApplicationCapacityReserved:
+		outcome = OutcomeCapacityReserved
 	case placement.MaintenanceApplicationServiceUnavailable:
 		outcome = OutcomeServiceUnavailable
 	case placement.MaintenanceApplicationInternalFailure,

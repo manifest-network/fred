@@ -2177,6 +2177,22 @@ func (a *LeaseActor) tryEnqueue(msg leaseMessage) bool {
 // The ctx threaded in is the actor-owned ctx from the inbound
 // deprovision command (which carries the caller's ctx from Backend.Deprovision).
 func (a *LeaseActor) handleDeprovision(ctx context.Context) error {
+	// Cancellation asks the exact actor-owned worker to stop; only its barrier
+	// proves that it has stopped. In particular, an admitted image import keeps
+	// its loader-owned lifetime after cancellation. Return an observation now
+	// instead of occupying the actor and the HTTP caller while that owner drains.
+	if a.workCancel != nil {
+		a.workCancel()
+		// Keep this actor-owned cancellation capability until OnExit consumes
+		// it. Every retry therefore observes the same mutation worker. Diagnostic
+		// workers still drain inside their transition, which suppresses a stale
+		// Failed callback when close preempts diagnostic collection.
+		select {
+		case <-a.workers.Zero():
+		default:
+			return workerDrainPending{leaseUUID: a.leaseUUID}
+		}
+	}
 	// Attempt the SM transition. If it's not permitted, check whether the
 	// provision is already gone or we're in an unexpected state. Absence from
 	// this volatile projection is not terminal authority: a substrate finalizer

@@ -67,20 +67,30 @@ func (b *ImagePinBackfiller) Sweep(ctx context.Context) (ImagePinBackfillReport,
 	if ctx == nil || b == nil || b.journal == nil || !b.journal.valid() || !retentionStoreIsOpen(b.journal.retentions) {
 		return report, errors.New("image pin backfill requires live ownership")
 	}
-	j := b.journal
-	j.mu.Lock()
-	defer j.mu.Unlock()
+	err := b.journal.withLockedPins(func(pins *lockedImagePins) error {
+		var err error
+		report, err = pins.sweep(ctx, b.observer)
+		return err
+	})
+	return report, err
+}
+
+func (pins *lockedImagePins) sweep(ctx context.Context, observer ImagePinBackfillObserver) (ImagePinBackfillReport, error) {
+	var report ImagePinBackfillReport
+	j := pins.journal
 	leases, err := j.releases.LeaseUUIDs()
 	if err != nil {
 		return report, err
 	}
 	for _, lease := range leases {
-		unlock, err := j.lockLeaseContext(ctx, lease)
-		if err != nil {
-			return report, err
-		}
-		added, unresolved, err := b.sweepLease(ctx, lease)
-		unlock()
+		added, unresolved, err := func() (int, bool, error) {
+			unlock, err := j.lockLeaseContext(ctx, lease)
+			if err != nil {
+				return 0, false, err
+			}
+			defer unlock()
+			return pins.sweepLease(ctx, lease, observer)
+		}()
 		if err != nil {
 			var unavailable *unavailableImagePinEvidence
 			var capacity *imagePinCapacityRefusal
@@ -111,8 +121,8 @@ func imagePinBackfillSettled(tx *bolt.Tx, lease string) (bool, error) {
 	return false, nil
 }
 
-func (b *ImagePinBackfiller) sweepLease(ctx context.Context, lease string) (int, bool, error) {
-	j := b.journal
+func (locked *lockedImagePins) sweepLease(ctx context.Context, lease string, observer ImagePinBackfillObserver) (int, bool, error) {
+	j := locked.journal
 	release, err := j.releases.LatestActive(lease)
 	if err != nil || release == nil {
 		return 0, false, err
@@ -148,7 +158,7 @@ func (b *ImagePinBackfiller) sweepLease(ctx context.Context, lease string) (int,
 		return 0, false, nil
 	}
 	subject := ImagePinBackfillSubject{issuer: j, lease: lease, release: cloneRelease(*release)}
-	observations, err := b.observer.ObserveImagePins(ctx, subject)
+	observations, err := observer.ObserveImagePins(ctx, subject)
 	if ctx.Err() != nil {
 		return 0, false, ctx.Err()
 	}
@@ -180,7 +190,7 @@ func (b *ImagePinBackfiller) sweepLease(ctx context.Context, lease string) (int,
 		return 0, true, nil
 	}
 	added := 0
-	err = j.updatePins(func(writer *imagePinTransaction) error {
+	err = locked.updatePins(func(writer *imagePinTransaction) error {
 		authority, err := writer.forBackfill(subject)
 		if err != nil {
 			return err

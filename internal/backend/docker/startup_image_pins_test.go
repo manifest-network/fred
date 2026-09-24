@@ -31,16 +31,24 @@ func (o *startupImagePinObserver) ObserveImagePins(_ context.Context, subject sh
 }
 
 func TestStart_ImagePinUpgradeFollowsFatalRecoveryChecks(t *testing.T) {
-	for _, failQuota := range []bool{true, false} {
-		name := "ready upgrades"
-		if failQuota {
-			name = "quota refusal preserves rollback"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, phase := range []string{"operation recovery", "quota", "retained accounting", "final identity", "ready"} {
+		t.Run(phase, func(t *testing.T) {
 			const lease = "f5ab7a6a-2222-4222-8222-222222222222"
+			phaseErr := errors.New("fatal startup phase refused")
+			identityLost := false
 			mock := &mockDockerClient{PingFn: func(context.Context) error { return nil }}
 			b := newBackendForProvisionTest(t, mock, nil)
 			bindTestStorageIdentity(t, b, mock)
+			verifier := b.storageVerifier
+			b.storageVerifier = testDockerRuntimeStorageVerifier{
+				id: b.storageIdentity,
+				verify: func(ctx context.Context) error {
+					if identityLost {
+						return phaseErr
+					}
+					return verifier.Verify(ctx)
+				},
+			}
 			t.Cleanup(func() { b.stopCancel(); b.wg.Wait() })
 			b.cfg.VolumeDataPath = t.TempDir()
 			b.provisions[lease] = &provision{ProvisionState: leasesm.ProvisionState{
@@ -61,14 +69,24 @@ func TestStart_ImagePinUpgradeFollowsFatalRecoveryChecks(t *testing.T) {
 					CallbackURL: p.CallbackURL, LifecycleCallbackURL: p.LifecycleCallbackURL,
 				}}, nil
 			}
-			quotaErr := errors.New("quota refused after state recovery")
 			quotaCalls := 0
 			b.volumes = &mockVolumeManager{
-				ListFn: func() ([]string, error) { return []string{canonicalVolumeName(lease, "app", 0)}, nil },
+				ListFn: func() ([]string, error) {
+					if phase == "final identity" && quotaCalls > 0 {
+						// The post-quota inventory precedes the best-effort reap
+						// and the final fatal identity check. Keep the context
+						// live so premature backfill really would persist pins.
+						identityLost = true
+					}
+					return []string{canonicalVolumeName(lease, "app", 0)}, nil
+				},
 				EnsureQuotaFn: func(context.Context, string, int64) error {
 					quotaCalls++
-					if failQuota {
-						return quotaErr
+					if phase == "quota" {
+						return phaseErr
+					}
+					if phase == "retained accounting" {
+						require.NoError(t, b.retentionStore.Close())
 					}
 					return nil
 				},
@@ -81,15 +99,49 @@ func TestStart_ImagePinUpgradeFollowsFatalRecoveryChecks(t *testing.T) {
 			require.NoError(t, err)
 			b.imageCapacity = &imageCapacityManager{backfiller: backfiller}
 
+			if phase == "operation recovery" {
+				b.operationSettlement = operationSettlementServiceForCallbackTest(t, b.callbackStore)
+				spec := dockerOperationIntentSpec(t, b.storageIdentity)
+				_, err := beginDockerTestOperationIntent(t, b.callbackStore, spec, b.storageIdentity)
+				require.NoError(t, err)
+				startPendingOperationForRecoveryTest(t, b)
+				inventory := mock.ListManagedContainersFn
+				mock.ListManagedContainersFn = func(ctx context.Context) ([]ContainerInfo, error) {
+					// Only interrupted-operation recovery owns this lease's
+					// command fence. Fail its real substrate observation.
+					if unlock, available := b.commandFence.TryLock(spec.LeaseUUID); available {
+						unlock()
+						return inventory(ctx)
+					}
+					return nil, phaseErr
+				}
+			}
 			err = b.Start(t.Context())
-			if failQuota {
-				require.ErrorIs(t, err, quotaErr)
+			if phase != "ready" {
+				require.Error(t, err)
+				switch phase {
+				case "operation recovery":
+					require.ErrorContains(t, err, "recover interrupted operations")
+					require.ErrorIs(t, err, phaseErr)
+				case "quota":
+					require.ErrorContains(t, err, "reconcile startup volume quotas")
+					require.ErrorIs(t, err, phaseErr)
+				case "retained accounting":
+					require.ErrorContains(t, err, "rebuild retained resource accounting before startup")
+				case "final identity":
+					require.ErrorContains(t, err, "storage identity lost during startup recovery")
+					require.ErrorIs(t, err, phaseErr)
+				}
 				require.Zero(t, observer.calls, "failed startup must not enter the optional schema upgrade")
 			} else {
 				require.NoError(t, err)
 				require.Equal(t, 1, observer.calls, "the same legacy release upgrades after successful startup checks")
 			}
-			require.Equal(t, 1, quotaCalls)
+			if phase == "operation recovery" {
+				require.Zero(t, quotaCalls)
+			} else {
+				require.Equal(t, 1, quotaCalls)
+			}
 			b.stopCancel()
 			b.wg.Wait()
 			require.NoError(t, b.callbackStore.Close())
@@ -98,7 +150,7 @@ func TestStart_ImagePinUpgradeFollowsFatalRecoveryChecks(t *testing.T) {
 			defer db.Close()
 			require.NoError(t, db.View(func(tx *bolt.Tx) error {
 				bucket := tx.Bucket([]byte("docker_image_pins_v1"))
-				if failQuota {
+				if phase != "ready" {
 					require.Nil(t, bucket, "even an empty extension bucket blocks the previous binary")
 				} else {
 					require.NotNil(t, bucket)

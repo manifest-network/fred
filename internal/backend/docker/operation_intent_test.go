@@ -2962,6 +2962,9 @@ func TestProvisionIntentToReservationWindowIsFencedAgainstDeprovision(t *testing
 	require.NoError(t, <-provisionDone)
 	select {
 	case err := <-deprovisionDone:
+		if leasesm.IsLifecyclePending(err) {
+			err = deprovisionAfterWorkerDrain(t, t.Context(), b, req.LeaseUUID)
+		}
 		require.NoError(t, err)
 	case <-time.After(3 * time.Second):
 		t.Fatal("deprovision did not complete after provision published its reservation")

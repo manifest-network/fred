@@ -13,14 +13,41 @@ import (
 )
 
 const (
-	maxPendingMaintenanceCommands       = 1024
-	maxPendingMaintenanceBytes          = int64(64 << 20)
-	maxTenantPendingMaintenanceCommands = 16
-	maxTenantPendingMaintenanceBytes    = int64(8 << 20)
+	maxPendingMaintenanceCommands = 1024
+	maxPendingMaintenanceBytes    = int64(64 << 20)
 	// Pending phase changes add only bounded fixed metadata. Reserve the same
 	// framing allowance used by the individual pending-record budget.
 	pendingMaintenanceTransitionBytes = int64(512)
+	// Incumbents may borrow the shared budget, but must leave one maximum-size
+	// pending command for a tenant with no pending work. This is a finite
+	// newcomer opportunity, not a guarantee against arbitrarily many tenants.
+	reservedMaintenanceCommands = 1
+	reservedMaintenanceBytes    = int64(maxMaintenanceCommandPendingBytes) + pendingMaintenanceTransitionBytes
 )
+
+// Only the journal's admission transaction can issue this refusal. It proves
+// that no command was written and that the caller already owns pending work;
+// callers cannot acquire that classification from a diagnostic error string.
+type maintenanceReservation uint8
+
+const (
+	maintenanceCountReserved maintenanceReservation = iota + 1
+	maintenanceBytesReserved
+)
+
+func (reservation maintenanceReservation) reason() string {
+	if reservation == maintenanceCountReserved {
+		return "reserved_count"
+	}
+	return "reserved_bytes"
+}
+
+type maintenanceReservationRefusal struct{ reservation maintenanceReservation }
+
+func (refusal maintenanceReservationRefusal) Error() string {
+	return ErrMaintenancePendingFull.Error() + ": " + refusal.reservation.reason()
+}
+func (maintenanceReservationRefusal) Unwrap() error { return ErrMaintenancePendingFull }
 
 // CompletionChanged is a coalesced scheduling hint, never completion evidence.
 // Receivers must reload typed work from the durable journal before mutation.
@@ -69,6 +96,8 @@ type maintenanceUsage struct {
 
 type maintenancePendingEntry struct {
 	lease     string
+	id        maintenanceid.ID
+	backend   string
 	tenant    string
 	phase     maintenanceJournalPhase
 	bytes     int64
@@ -142,12 +171,18 @@ func (journal *maintenanceJournalTransaction) admit(command MaintenanceCommand, 
 	if charge > maxPendingMaintenanceBytes-journal.total.bytes {
 		return refuse("bytes")
 	}
-	tenant := journal.tenantUsage(command.tenant)
-	if tenant.count >= maxTenantPendingMaintenanceCommands {
-		return refuse("tenant_count")
-	}
-	if charge > maxTenantPendingMaintenanceBytes-tenant.bytes {
-		return refuse("tenant_bytes")
+	if journal.tenantUsage(command.tenant).count > 0 {
+		var reservation maintenanceReservation
+		switch {
+		case journal.total.count >= maxPendingMaintenanceCommands-reservedMaintenanceCommands:
+			reservation = maintenanceCountReserved
+		case charge > maxPendingMaintenanceBytes-reservedMaintenanceBytes-journal.total.bytes:
+			reservation = maintenanceBytesReserved
+		}
+		if reservation != 0 {
+			metrics.MaintenanceAdmissionRefusalsTotal.WithLabelValues(reservation.reason()).Inc()
+			return maintenanceReservationRefusal{reservation: reservation}
+		}
 	}
 	return nil
 }
@@ -165,6 +200,7 @@ func (accounting *maintenancePendingAccounting) replace(command MaintenanceComma
 	}
 	entry := &maintenancePendingEntry{
 		lease: command.leaseUUID, tenant: command.tenant, phase: command.phase,
+		id: command.id, backend: command.backendName,
 		bytes: int64(encodedBytes), createdAt: createdAt,
 	}
 	phase := accounting.phases[entry.phase]

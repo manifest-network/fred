@@ -79,11 +79,11 @@ func (s *OperationSettlement) AdmitProvisionManifest(ctx context.Context, lease,
 		}
 		identity, valid := release.RuntimeIdentity()
 		if !valid || identity.Tenant() != tenant || identity.ProviderUUID() != provider ||
-			!sameProvisionItemMultiset(items, release.Items) || !bytes.Equal(requestedJSON, storedJSON) {
+			!sameProvisionTopology(items, release.Items) || !bytes.Equal(requestedJSON, storedJSON) {
 			return ProvisionManifestAdmission{}, fmt.Errorf("manifest differs from exact historical replay authority: %w", policyErr)
 		}
 		return ProvisionManifestAdmission{issuer: s, payload: slices.Clone(release.Manifest), replay: &provisionManifestReplay{
-			source: source, tenant: identity.Tenant(), provider: identity.ProviderUUID(), items: slices.Clone(release.Items),
+			source: source, tenant: identity.Tenant(), provider: identity.ProviderUUID(), items: items,
 		}}, nil
 	}
 }
@@ -118,9 +118,37 @@ func (a ProvisionManifestAdmission) Bind(candidate OperationIntentCandidate) (Op
 	return candidate, nil
 }
 
-// sameProvisionItemMultiset preserves the entire service/SKU/quantity/domain
-// binding while allowing a v0.13 backfill's service-sorted order to differ from
-// the chain request. Counts matter: a set comparison would hide duplicates.
+// Release items contain effective routing, while the chain request carries
+// desired routing. Historical payload admission depends on the same instance
+// topology, not on whether the old backend could publish the desired domain.
+// This projection deliberately has no domain field. The replay capability
+// separately captures the exact admitted request items for candidate binding.
+type provisionTopologyItem struct {
+	service string
+	sku     string
+	count   int
+}
+
+func sameProvisionTopology(left, right []backend.LeaseItem) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[provisionTopologyItem]int, len(left))
+	for _, item := range left {
+		counts[provisionTopologyItem{service: item.ServiceName, sku: item.SKU, count: item.Quantity}]++
+	}
+	for _, item := range right {
+		key := provisionTopologyItem{service: item.ServiceName, sku: item.SKU, count: item.Quantity}
+		if counts[key] == 0 {
+			return false
+		}
+		counts[key]--
+	}
+	return true
+}
+
+// sameProvisionItemMultiset preserves the entire admitted request, including
+// its desired routing. Counts matter: a set comparison would hide duplicates.
 func sameProvisionItemMultiset(left, right []backend.LeaseItem) bool {
 	if len(left) != len(right) {
 		return false

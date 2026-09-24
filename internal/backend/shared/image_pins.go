@@ -156,8 +156,13 @@ func imagePinOriginManifest(origin ImageInspectionOrigin) (string, []byte, error
 // That verification may also fill a missing legacy recovery digest; an existing
 // digest is never replaced.
 func (j *ImagePinJournal) Pin(origin ImageInspectionOrigin, ref, id, pullDigest string, platform ocispec.Platform, importBytes int64) error {
-	j.mu.Lock()
-	defer j.mu.Unlock()
+	return j.withLockedPins(func(pins *lockedImagePins) error {
+		return pins.pin(origin, ref, id, pullDigest, platform, importBytes)
+	})
+}
+
+func (pins *lockedImagePins) pin(origin ImageInspectionOrigin, ref, id, pullDigest string, platform ocispec.Platform, importBytes int64) error {
+	j := pins.journal
 	prepared, err := j.inspections.Prepare(origin, id, ref)
 	if err != nil {
 		return err
@@ -184,7 +189,7 @@ func (j *ImagePinJournal) Pin(origin ImageInspectionOrigin, ref, id, pullDigest 
 	pin := ImagePin{LeaseUUID: lease, ManifestHash: hash, Reference: ref, ImageID: id, PullDigest: pullDigest, Platform: platform, ImportBytes: importBytes}
 	unlock := j.lockLease(lease)
 	defer unlock()
-	return j.updatePins(func(writer *imagePinTransaction) error {
+	return pins.updatePins(func(writer *imagePinTransaction) error {
 		authority, err := writer.forOrigin(prepared)
 		if err != nil {
 			return err
@@ -283,8 +288,17 @@ func (i ImagePinInventory) CanRemove(imageID string) bool {
 // pruning, preventing a release-to-retention or intent-to-release handoff gap.
 // Exact manifest references, rather than mere lease existence, keep pins live.
 func (j *ImagePinJournal) Collect(ctx context.Context) (ImagePinInventory, error) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
+	var inventory ImagePinInventory
+	err := j.withLockedPins(func(pins *lockedImagePins) error {
+		var err error
+		inventory, err = pins.collect(ctx)
+		return err
+	})
+	return inventory, err
+}
+
+func (locked *lockedImagePins) collect(ctx context.Context) (ImagePinInventory, error) {
+	j := locked.journal
 	pins, err := j.List()
 	if err != nil {
 		return ImagePinInventory{}, err
@@ -314,13 +328,14 @@ func (j *ImagePinJournal) Collect(ctx context.Context) (ImagePinInventory, error
 	protected := make(map[string]bool)
 	complete := true
 	for _, lease := range slices.Sorted(maps.Keys(byLease)) {
-		unlock, err := j.lockLeaseContext(ctx, lease)
-		if err != nil {
-			return ImagePinInventory{}, err
-		}
-		var leaseComplete bool
-		leaseComplete, err = j.collectLeasePins(lease, byLease[lease], protected)
-		unlock()
+		leaseComplete, err := func() (bool, error) {
+			unlock, err := j.lockLeaseContext(ctx, lease)
+			if err != nil {
+				return false, err
+			}
+			defer unlock()
+			return locked.collectLeasePins(lease, byLease[lease], protected)
+		}()
 		if err != nil {
 			return ImagePinInventory{}, err
 		}
@@ -329,7 +344,8 @@ func (j *ImagePinJournal) Collect(ctx context.Context) (ImagePinInventory, error
 	return ImagePinInventory{images: protected, complete: complete}, nil
 }
 
-func (j *ImagePinJournal) collectLeasePins(lease string, pins []ImagePin, protected map[string]bool) (bool, error) {
+func (locked *lockedImagePins) collectLeasePins(lease string, pins []ImagePin, protected map[string]bool) (bool, error) {
+	j := locked.journal
 	needed := make(map[string]bool)
 	complete := true
 	var compensationVersion int
@@ -435,7 +451,7 @@ func (j *ImagePinJournal) collectLeasePins(lease string, pins []ImagePin, protec
 	if len(obsolete) == 0 {
 		return complete, nil
 	}
-	err = j.updatePins(func(writer *imagePinTransaction) error {
+	err = locked.updatePins(func(writer *imagePinTransaction) error {
 		for _, key := range obsolete {
 			if err := writer.remove(key); err != nil {
 				return err

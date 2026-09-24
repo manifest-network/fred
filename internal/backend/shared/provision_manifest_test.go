@@ -88,7 +88,7 @@ func TestProvisionManifestAdmissionReplaysReorderedHistoricalTopology(t *testing
 	require.True(t, created)
 	require.Equal(t, spec.Items, claim.Items(), "admission preserves the request order")
 
-	for _, change := range []string{"service", "sku", "quantity", "domain", "duplicate", "remove"} {
+	for _, change := range []string{"service", "sku", "quantity", "duplicate", "remove"} {
 		t.Run(change, func(t *testing.T) {
 			items := slices.Clone(spec.Items)
 			switch change {
@@ -98,8 +98,6 @@ func TestProvisionManifestAdmissionReplaysReorderedHistoricalTopology(t *testing
 				items[0].SKU, items[1].SKU = items[1].SKU, items[0].SKU
 			case "quantity":
 				items[0].Quantity, items[1].Quantity = items[1].Quantity, items[0].Quantity
-			case "domain":
-				items[0].CustomDomain = "changed.example"
 			case "duplicate":
 				items[1] = items[0]
 			case "remove":
@@ -114,6 +112,37 @@ func TestProvisionManifestAdmissionReplaysReorderedHistoricalTopology(t *testing
 				_, err = admission.Bind(candidate)
 			}
 			require.Error(t, err, "a replay admission cannot splice a changed topology into acceptance")
+		})
+	}
+}
+
+func TestProvisionManifestReplaySeparatesHistoricalTopologyFromDesiredRouting(t *testing.T) {
+	for _, domain := range []string{"", "desired.example"} {
+		t.Run("desired="+domain, func(t *testing.T) {
+			stores, spec, release := historicalProvisionFixture(t)
+			release.Items = slices.Clone(release.Items)
+			release.Items[0].CustomDomain = "old-effective.example"
+			require.NoError(t, stores.releases.appendActive(spec.LeaseUUID, release))
+			spec.Items[0].CustomDomain = domain
+			admission, err := stores.settlement.AdmitProvisionManifest(t.Context(), spec.LeaseUUID, spec.Tenant, spec.ProviderUUID, spec.Items, spec.Manifest)
+			require.NoError(t, err, "historical effective routing is not the chain's desired routing")
+			spec.Manifest = admission.Payload()
+			candidate, err := stores.settlement.NewOperationIntentCandidate(spec)
+			require.NoError(t, err)
+			bound, err := admission.Bind(candidate)
+			require.NoError(t, err)
+			changed := spec
+			changed.Items = slices.Clone(spec.Items)
+			changed.Items[0].CustomDomain = "spliced.example"
+			foreign, err := stores.settlement.NewOperationIntentCandidate(changed)
+			require.NoError(t, err)
+			_, err = admission.Bind(foreign)
+			require.Error(t, err, "admission must still bind the exact desired routing it accepted")
+			accepted, err := stores.settlement.BeginOperationIntent(bound)
+			require.NoError(t, err)
+			claim, created := accepted.CreatedClaim()
+			require.True(t, created)
+			require.Equal(t, domain, claim.Items()[0].CustomDomain)
 		})
 	}
 }

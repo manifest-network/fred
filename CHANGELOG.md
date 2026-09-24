@@ -231,12 +231,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Each tenant can prepare one image at a time, sharing four staging slots;
-  requests waiting for the same tenant hold neither a staging slot nor the
-  collection gate. Pending maintenance is bounded to 16 commands and 8 MiB per
-  tenant within the existing provider limits. Exact replay and settlement remain
-  available above the new limits; transaction-owned counters avoid rescanning
-  the journal on every request. Image pins have a 10,000-pin tenant share within
+- Image downloads share four staging slots. A sole tenant can use all four;
+  waiting tenants with fewer active downloads receive the next available slot,
+  with arrival order breaking ties. Cached and local image preparation bypasses
+  staging admission. Pending maintenance shares the existing 1,024-command /
+  64 MiB provider budget, reserving one maximum-size command for a tenant with
+  no pending work. An incumbent reaching that reserve receives typed
+  `429 maintenance_capacity_reserved`; actual provider exhaustion remains 503.
+  Exact replay and settlement remain available above the limits;
+  transaction-owned counters avoid rescanning the journal on every request.
+  Image pins have a 10,000-pin tenant share within
   the existing 100,000-pin total; exact pin reuse and recovery remain available
   above the share. Legacy pins without proven tenant attribution conservatively
   consume each tenant's fresh share until positively attributed or pruned.
@@ -809,6 +813,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (ENG-632)
 
 ### Fixed
+
+- Closing a lease with an actor-owned mutation still draining returns immediate,
+  breaker-neutral `503 lifecycle_pending`, including during a loader-owned
+  image import. Retry independently checks the worker barrier before teardown.
+  Maintenance recovery selects candidates from a compact committed projection
+  before decoding only selected receipts. Periodic pin pruning progresses
+  during downloads, while image deletion continues to protect active work.
+  Pin accounting writes require the journal's scoped lock owner. (ENG-1052)
+
+- Docker-backend shutdown shares a 75-second budget across HTTP and backend
+  draining, fitting existing 90-second service stop allowances. TLS validation
+  and listener binding precede startup image-pin backfill. Historical manifest
+  replay compares instance topology independently of previously effective
+  custom-domain routing, while binding the exact newly admitted request to its
+  journal-owned replay authority. (ENG-1052, ENG-1055)
 
 - K3s stub failure completion and deprovision now share one per-lease command
   fence across proof and durable publication, preventing concurrent close from
@@ -1484,7 +1503,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   snapshot or a separate proof-bearing repair procedure. (ENG-632)
 - Docker-backend shutdown no longer waits forever for a worker that ignored
   cancellation or closes shared dependencies underneath it. Backend-owned work
-  receives a fixed 90-second drain after cancellation; timeout leaves the Docker
+  receives the remaining process shutdown budget after cancellation; direct
+  `Backend.Stop` callers retain a 90-second default. Timeout leaves the Docker
   client and durable stores open, returns a typed shutdown error, and makes the
   binary exit non-zero so its supervisor restarts through normal recovery.
   Preempting lease transitions likewise refuse substrate teardown until the
@@ -1542,9 +1562,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   import allocation, periodic high/low-watermark collection and durable immutable image
   pins. Production collection requires durable exclusive ownership of its Docker
   daemon's image cache; shared development daemons cannot delete images.
-  Dispatched imports belong to the loader and survive tenant cancellation;
-  backend shutdown grants its full 90-second drain budget before canceling
-  remaining imports. Imports with unknown completion retain a durable allocation
+  Dispatched imports belong to the loader and survive tenant cancellation, with
+  a 30-minute completion ceiling measured from dispatch. Backend shutdown grants
+  the remaining process drain budget before canceling imports. Imports with
+  unknown completion retain a durable allocation
   debit across restarts, while observed terminal failures settle their allocation.
   Unknown debit continues to count against disk headroom without preventing
   collection of unrelated unused images. Collection metrics distinguish ordinary

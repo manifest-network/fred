@@ -2690,8 +2690,15 @@ func (b *Backend) checkDaemonCapabilities(ctx context.Context) {
 
 // Stop shuts down the backend gracefully.
 func (b *Backend) Stop() error {
+	return b.StopContext(context.Background())
+}
+
+// StopContext shares the caller's shutdown deadline with admitted imports and
+// worker drain. The process can budget HTTP and backend shutdown together;
+// direct Stop callers retain the ordinary backend drain limit.
+func (b *Backend) StopContext(ctx context.Context) error {
 	b.stopCancel()
-	if err := b.waitForShutdownDrain(); err != nil {
+	if err := b.waitForShutdownDrain(ctx); err != nil {
 		// A worker that ignored cancellation may still be inside Docker or one
 		// of the durable stores. Closing those dependencies under it turns an
 		// already-ambiguous mutation into data loss or a panic. Leave them open;
@@ -2725,10 +2732,10 @@ func (b *Backend) Stop() error {
 	return errors.Join(errs...)
 }
 
-func (b *Backend) waitForShutdownDrain() error {
+func (b *Backend) waitForShutdownDrain(ctx context.Context) error {
 	b.shutdownWaitOnce.Do(func() {
 		b.shutdownWaitDone = make(chan struct{})
-		drainCtx, cancel := context.WithTimeout(context.Background(), cmp.Or(b.shutdownDrainTimeout, defaultShutdownDrainTimeout))
+		drainCtx, cancel := context.WithTimeout(ctx, cmp.Or(b.shutdownDrainTimeout, defaultShutdownDrainTimeout))
 		go func() {
 			defer cancel()
 			if b.imageCapacity != nil && b.imageCapacity.loader != nil {
@@ -2756,6 +2763,8 @@ func (b *Backend) waitForShutdownDrain() error {
 			ErrShutdownDrainTimeout,
 			timeout,
 		)
+	case <-ctx.Done():
+		return fmt.Errorf("%w: process shutdown budget ended: %w; dependencies remain open until actual drain", ErrShutdownDrainTimeout, ctx.Err())
 	}
 }
 

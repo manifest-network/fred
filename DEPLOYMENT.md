@@ -473,17 +473,15 @@ WantedBy=multi-user.target
 - **Native XFS volume management needs `CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN CAP_FOWNER`.** Ownership changes require `CAP_CHOWN`; managing restrictive tenant-owned trees requires `CAP_DAC_OVERRIDE`. XFS quota limits require `CAP_SYS_ADMIN`, and repairing a tenant-owned root project ID requires `CAP_FOWNER`. Set both `AmbientCapabilities=` and `CapabilityBoundingSet=` to these four capabilities, as the manifest-deploy unit does. Ambient capabilities are compatible with `NoNewPrivileges=true` and propagate to the quota subprocesses. A capability grant on the Fred executable alone does not provide this subprocess contract. Scope these capabilities to `docker-backend`; `providerd` does not need them.
 - `ReadWritePaths` should cover the directories holding `callback_db_path`, `diagnostics_db_path`, `releases_db_path`, `retention_db_path`, and `volume_data_path`. The authoritative retention database is required even when `retain_on_close` is false.
 
-`TimeoutStopSec` should comfortably exceed the graceful-drain window so systemd
-doesn't SIGKILL mid-shutdown. For `providerd` this window is `shutdown_timeout`
-from your config (default 30s). Docker-backend has two sequential bounds: a
-fixed 30s HTTP-server shutdown followed by a fixed 90s backend-worker drain.
-Configure its unit comfortably above the combined two minutes so the binary can
-report a typed drain failure and exit non-zero rather than being killed first;
-neither Docker bound is configurable. Use `TimeoutStopSec=180s` (or a larger
-site value) and verify the rendered live unit with
-`systemctl show fred-docker-backend -p TimeoutStopUSec` before rollout. The
-common 90-second systemd default is insufficient. The manifest-deploy unit must
-be updated separately before relying on this graceful runtime-latch path.
+`TimeoutStopSec` should exceed the graceful-drain window so systemd does not
+SIGKILL mid-shutdown. For `providerd` this window is `shutdown_timeout` from your
+config (default 30s). The `docker-backend` command shares one 75-second deadline
+across HTTP shutdown and backend-worker drain. HTTP shutdown gets at most
+30 seconds; backend drain uses the remaining budget. The common 90-second
+systemd default therefore leaves time to report a typed drain failure and exit
+nonzero, without a deployment change. A longer existing unit allowance remains
+compatible. Direct Go callers of `Backend.Stop` retain its 90-second default;
+`StopContext` lets a process owner provide its remaining shutdown budget.
 
 ---
 
@@ -861,10 +859,13 @@ registry access once its verified allocation allowance has been recorded.
 
 Before dispatch, Fred durably records the import allowance in
 `<callback_db_path>.image-staging/image-import-debit-v1`. An admitted import
-runs under the loader's lifetime after admission; tenant cancellation or the
-pull timeout does not abort the admitted import. Staging files and capacity
+runs under the loader's lifetime after admission, with a 30-minute ceiling from
+dispatch; tenant cancellation or the pull timeout does not abort the admitted
+import. A lease close returns breaker-neutral `503 lifecycle_pending` while its
+owned worker drains, allowing close to retry without waiting on the HTTP request.
+Staging files and capacity
 ownership remain held until completion. Shutdown closes import admission and
-gives those requests the remaining 90-second backend-worker drain before
+gives those requests the remaining process shutdown budget before
 canceling their owner; it drains them before closing stores. Clean
 upload and terminal completion release that import's allowance, including when
 Docker reports a completed refusal. A lost, malformed or timed-out response
@@ -882,9 +883,13 @@ is not rejected solely because that size limit was lowered; missing pinned
 content is recovered by its exact digest under its saved allowance.
 Before staging, Fred checks the configured image allowance above the free-space
 floor. After verification, it checks the conservative import footprint and floor
-again before importing. Up to four staging owners reserve their full budgets,
-with at most one preparation per tenant. Queued same-tenant work holds no global
-slot; cached preparation for that tenant also waits behind its active pull.
+again before importing. Up to four staging owners reserve their full budgets.
+Pinned and locally reusable image preparations bypass the staging queue. A sole
+tenant can use all four slots; when a slot becomes available, the waiting tenant
+with the fewest active stages is selected, with arrival order breaking ties.
+Requests within a tenant remain FIFO. This needs no per-address configuration
+and accommodates aggregator tenants sharing one on-chain address. It neither
+preempts occupied slots nor provides isolation against multiple tenant addresses.
 Imports and deferred-extraction probes account for concurrent owners. Registry
 and import I/O do not hold the admission lock. Ordinary local launches check
 actual free space plus allocations whose completion is unknown, without
@@ -897,7 +902,12 @@ pins. After all fatal startup checks succeed, startup backfills active legacy
 pins only from an exact recovered container cohort and immutable image
 inspection; it never resolves a tag to
 invent historical identity. Active or retained manifests still missing pins,
-and retained rows without a manifest, inhibit deletion. Failed and superseded
+and retained rows without a manifest, inhibit deletion. Legacy retained rows can
+keep collection inhibited until restore or safe reaping, normally up to the
+remaining retention grace (90 days by default) plus a sweep interval. Unresolved
+reaping can extend that window. Treat this as a diagnostic during upgrade;
+alert only when it coincides with sustained disk pressure, rather than paging on
+the inhibited counter alone. Failed and superseded
 release history does not retain images unless a pending compensation needs its
 exact source. Incomplete collection inventories do not reject unrelated image
 admission when its identity and capacity can still be established. Docker
@@ -986,9 +996,10 @@ Fred releases are tagged on GitHub with binaries via `goreleaser`. The release p
    admitted Docker Create/Start exchanges receive 30 seconds of completion grace
    after cancellation or shutdown. Admitted image imports are independent of
    tenant cancellation and receive the remaining backend-worker drain on shutdown.
-   The backend drains these owners before closing journals. Preserve the
-   systemd stop allowance described above (over 30s HTTP shutdown + 90s worker
-   drain); a forced kill or genuine daemon timeout can still leave launch debt.
+   The backend drains these owners before closing journals. The command shares
+   its 75-second shutdown budget across HTTP and worker drain, fitting the
+   existing 90-second systemd default. A forced kill or genuine daemon timeout
+   can still leave launch debt or unknown image-import allocation.
    Roll the backend binaries one at a time when the release's backend protocol
    is backward-compatible, then stop the single `providerd` instance and start
    the upgraded binary. Never overlap the old and new `providerd` processes for

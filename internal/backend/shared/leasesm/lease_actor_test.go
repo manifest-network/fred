@@ -388,7 +388,7 @@ func TestGatherDiagAsync_SuppressesOnCanceled(t *testing.T) {
 	}
 }
 
-// TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine guards
+// TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains guards
 // the orphan-containers invariant for the Restart flow: when
 // Deprovision preempts an in-flight restart, Restarting.OnExit must
 // cancel the work goroutine and wait on workers before doDeprovision
@@ -398,7 +398,7 @@ func TestGatherDiagAsync_SuppressesOnCanceled(t *testing.T) {
 // The Update flow uses the exact same SM transition and OnExit
 // handler, so this single test covers both — the behaviour is
 // identical.
-func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
+func TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 	store := newMockProvisionStore()
 	store.put("lease-1", &ProvisionState{
 		LeaseUUID:    "lease-1",
@@ -436,7 +436,7 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 
 	// Simulate an in-flight replace worker via workers.Add + workCancel
 	// closure. Same construction as the production spawnReplaceWorker:
-	// onExitProvisioning will call workCancel then wait on workers.Zero().
+	// Deprovision cancels work and reports pending until workers.Zero closes.
 	var cancelCalled atomic.Bool
 	workerRelease := make(chan struct{})
 	actor.workCancel = func() { cancelCalled.Store(true) }
@@ -453,26 +453,26 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 	}()
 
 	// Route the Deprovision message through the actor's inbox. The
-	// actor's handler fires evDeprovisionRequested → Restarting.OnExit
-	// (cancels worker, waits on workers.Zero) → handleDeprovision body
-	// runs (calls DoDeprovisionFn).
+	// actor cancels the worker and answers pending. Only a later request may
+	// transition and run DoDeprovisionFn once the worker actually exits.
 	reply := make(chan error, 1)
 	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
 		"OnExit must call workCancel before waiting for the worker (Restart path)")
 
-	// doDeprovision must NOT have run yet — it's blocked behind
-	// waitForWorkers waiting for the in-flight goroutine.
+	// Pending cannot grant teardown while the in-flight worker still owns it.
 	select {
 	case <-deprovRan:
 		t.Fatal("doDeprovision ran before worker finished — onExitProvisioning didn't wait on workers")
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	// Release the worker → workers.Done → onExitProvisioning unblocks →
-	// doDeprovision runs.
+	// Release the worker, then retry with the now-drained actor.
+	require.True(t, IsLifecyclePending(<-reply), "the caller must receive pending before the worker is released")
 	close(workerRelease)
+	<-actor.workers.Zero()
+	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
 
 	select {
 	case err := <-reply:
@@ -493,7 +493,7 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 // it must not enter substrate close until that terminal defer is fully done.
 // This transitive ordering is why the restore worker must not try to re-lock the
 // command fence itself (doing so would deadlock against Deprovision's wait).
-func TestLeaseActor_RestoreDeprovisionWaitsForTerminalDefer(t *testing.T) {
+func TestLeaseActor_RestoreDeprovisionDefersUntilTerminalDeferDrains(t *testing.T) {
 	leaseUUID := testActorLeaseUUID
 	store := newMockProvisionStore()
 	store.put(leaseUUID, &ProvisionState{
@@ -549,7 +549,10 @@ func TestLeaseActor_RestoreDeprovisionWaitsForTerminalDefer(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
+	require.True(t, IsLifecyclePending(<-deprovisionReply))
 	close(allowTerminalDefer)
+	<-actor.workers.Zero()
+	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: deprovisionReply}))
 	select {
 	case err := <-deprovisionReply:
 		require.NoError(t, err)
@@ -1098,7 +1101,7 @@ func TestRestartRedeliveryFromDurableStartedStateCannotSpawnSecondWorker(t *test
 		"redelivery after durable Started must not duplicate physical restart work")
 }
 
-// TestProvision_DeprovisionWaitsForInFlightGoroutine guards the
+// TestProvision_DeprovisionDefersUntilInFlightWorkerDrains guards the
 // orphan-containers invariant for the Provision flow: when Deprovision
 // preempts an in-flight doProvision, Provisioning.OnExit must (1)
 // cancel the goroutine's context and (2) wait for the goroutine to
@@ -1107,10 +1110,10 @@ func TestRestartRedeliveryFromDurableStartedStateCannotSpawnSecondWorker(t *test
 // though the provision struct reports none.
 //
 // Migrated from docker/provision_test.go at PR5b-2 E sub-batch 3.
-// Mirrors TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine
+// Mirrors TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains
 // but with the Provisioning→Deprovisioning SM transition instead of
 // Restarting→Deprovisioning.
-func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
+func TestProvision_DeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 	store := newMockProvisionStore()
 	store.put("lease-1", &ProvisionState{
 		LeaseUUID:    "lease-1",
@@ -1145,7 +1148,7 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 	require.Equal(t, backend.ProvisionStatusProvisioning, actor.State())
 
 	// Simulate an in-flight provision worker via workers + workCancel.
-	// onExitProvisioning will call workCancel then waitForWorkers.
+	// Deprovision cancels work and reports pending until the barrier drains.
 	var cancelCalled atomic.Bool
 	workerRelease := make(chan struct{})
 	actor.workCancel = func() { cancelCalled.Store(true) }
@@ -1162,25 +1165,26 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 		actor.workers.Done()
 	}()
 
-	// Route the Deprovision message. The actor fires
-	// evDeprovisionRequested → Provisioning.OnExit (workCancel +
-	// waitForWorkers) → handleDeprovision body runs DoDeprovisionFn.
+	// Route Deprovision through the actor. Its pending response keeps teardown
+	// fenced until a retry independently observes the drained barrier.
 	reply := make(chan error, 1)
 	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
 		"OnExit must call workCancel before waitForWorkers")
 
-	// doDeprovision must NOT have run yet — blocked in waitForWorkers.
+	// doDeprovision must not run while the worker still owns its effects.
 	select {
 	case <-deprovRan:
 		t.Fatal("doDeprovision ran before worker finished — Provisioning.OnExit didn't wait")
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	// Release the worker → workers.Done → waitForWorkers unblocks →
-	// doDeprovision runs and reads the pre-published ContainerIDs.
+	// A retry after workers.Done reads the pre-published ContainerIDs.
+	require.True(t, IsLifecyclePending(<-reply), "the caller must receive pending before the worker is released")
 	close(workerRelease)
+	<-actor.workers.Zero()
+	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
 
 	select {
 	case err := <-reply:
@@ -1437,8 +1441,8 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 		t.Fatalf("no ack from second %s", op)
 	}
 
-	// Deprovision preempts: onExitProvisioning cancels the in-flight worker
-	// (whose workCancel must still be request #1's) then waits for it.
+	// Deprovision preempts the in-flight worker (whose workCancel must still
+	// be request #1's), returning pending while it drains.
 	reply := make(chan error, 1)
 	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
 
@@ -1447,8 +1451,11 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 	assert.False(t, secondWorkerRan.Load(),
 		"the rejected second %s must not run", op)
 
-	// Release worker #1 so waitForWorkers unblocks and the deprovision completes.
+	// Release worker #1, then independently retry the pending close.
+	require.True(t, IsLifecyclePending(<-reply))
 	close(worker1Release)
+	<-actor.workers.Zero()
+	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
 	select {
 	case err := <-reply:
 		require.NoError(t, err)

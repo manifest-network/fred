@@ -19,6 +19,26 @@
 
 Fred accepts deployment manifests as JSON payloads that describe how containers should be provisioned. There are two formats: **single-service** manifests for standalone containers (**deprecated**), and **stack** manifests for multi-service deployments (**preferred**).
 
+Image preparations that can reuse pinned or locally verified content bypass the
+backend's staging queue. New image content shares four staging slots per backend;
+one tenant can use all unused slots. When a slot opens, waiting tenants with less
+active staging get priority, with requests from the same tenant processed in
+arrival order. A tenant address shared by many customers does not serialize
+cached restarts behind a cold image download. Waiting and downloads remain
+subject to the configured pull timeout. Once Docker import is dispatched, it
+has its own 30-minute ceiling and continues through caller cancellation. A close
+can remain pending until that owned work has drained.
+
+Restart and update admission shares a provider-wide journal budget of 1,024
+pending commands and 64 MiB (including 512 bytes of phase-growth allowance per
+command), with no fixed per-address concurrency cap. When you already have
+pending work, Fred keeps one command and 2 MiB for a tenant without pending work.
+Reaching that reserve returns `429` before recording your new command; retry
+after your pending work completes. Its response carries
+`reason: maintenance_capacity_reserved` and `Retry-After: 1`. A fully exhausted provider budget returns
+`503`. An exact retry of an already admitted command can still make progress;
+follow the [restart/update retry contract](../README.md#restart-lease).
+
 ## Manifest Formats
 
 ### Single-Service Manifest *(deprecated)*

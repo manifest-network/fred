@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
@@ -104,6 +105,11 @@ type loaderLifetime struct {
 	active      int
 	activeBytes int64
 }
+
+// An admitted import owns its own deadline from dispatch. Tenant cancellation
+// cannot truncate an accepted exchange, but a hung daemon cannot occupy its
+// staging and allocation forever. This matches the default image pull budget.
+const importCompletionTimeout = 30 * time.Minute
 
 // Shutdown closes admission and lets admitted exchanges finish within the
 // backend's drain budget. Only expiry of that budget cancels daemon work;
@@ -392,7 +398,8 @@ func (l *Loader) ImportAdmitted(ctx context.Context, admission *ImportAdmission)
 	// Dispatch transfers execution lifetime to the loader. Keep the prepared
 	// files and allocation owned until the actual daemon exchange completes,
 	// even when the tenant closes its lease or its pull deadline expires.
-	work := l.life.shutdown
+	work, cancel := context.WithTimeout(l.life.shutdown, importCompletionTimeout)
+	defer cancel()
 	reader, writer := io.Pipe()
 	written := make(chan error, 1)
 	go func() { err := writeArchive(work, writer, state.blobs); _ = writer.CloseWithError(err); written <- err }()

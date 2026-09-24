@@ -46,7 +46,7 @@ func TestDeprovisionEmptyInventoryPreservesUnknownLaunch(t *testing.T) {
 				t.Fatal("maintenance launch did not start")
 			}
 
-			closeErr := h.b.Deprovision(ctx, h.leaseUUID)
+			closeErr := deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID)
 			require.True(t, shared.IsLifecyclePending(closeErr), "actual Deprovision must project durable launch debt into the breaker-neutral pending class: %v", closeErr)
 			switch mode {
 			case "first close":

@@ -17,6 +17,7 @@ import (
 	"github.com/docker/docker/errdefs"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -43,15 +44,9 @@ func imageTenantPreparationForTest(t *testing.T, m *imageCapacityManager) imageT
 func TestImageTenantStagingOwnershipIsSingleUseAndRetainedThroughCleanup(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		m, _, _ := imageCapacityFixture(t)
-		const lease = "550e8400-e29b-41d4-a716-446655440001"
-		var mutations *storageMutations
-		_, runs := imagePreparationSubjects(t, map[string]string{lease: "example.invalid/app:1"}, nil,
-			func(_ context.Context, subject *storageMutations) error { mutations = subject; return nil })
-		runs[lease]()
-		preparation, err := m.beginTenantPreparation(t.Context(), mutations)
-		require.NoError(t, err)
+		preparation := imageTenantPreparationForTest(t, m)
 		copyOfPreparation := preparation
-		_, err = m.reserveStaging(t.Context(), imageTenantPreparation{}, imageMiB)
+		_, err := m.reserveStaging(t.Context(), imageTenantPreparation{}, imageMiB)
 		require.Error(t, err)
 		foreign, _, _ := imageCapacityFixture(t)
 		_, err = foreign.reserveStaging(t.Context(), preparation, imageMiB)
@@ -62,76 +57,117 @@ func TestImageTenantStagingOwnershipIsSingleUseAndRetainedThroughCleanup(t *test
 		require.Error(t, err, "copies cannot acquire another provider slot")
 		preparation.close()
 		copyOfPreparation.close()
-		acquired := make(chan imageTenantPreparation, 1)
-		go func() {
-			next, err := m.beginTenantPreparation(t.Context(), mutations)
-			if err == nil {
-				acquired <- next
-			}
-		}()
-		synctest.Wait()
-		require.Empty(t, acquired, "closing a parent cannot release an outstanding stage's tenant share")
+		require.Equal(t, 1, m.tenantShares.used, "parent close cannot release an outstanding stage")
 		copyOfStage := stage
 		stage.close()
 		copyOfStage.close()
-		synctest.Wait()
-		next := <-acquired
-		next.close()
-		require.Empty(t, m.stageSlots)
+		require.Zero(t, m.tenantShares.used)
 		require.Empty(t, m.tenantShares.active)
+	})
+}
+
+func TestImageTenantStagingPoolBorrowsUnusedCapacityAndPrioritizesNewTenantFIFO(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var shares imageTenantShares
+		owners := make([]func(), maxImageStages)
+		for index := range owners {
+			release, err := shares.acquire(t.Context(), "aggregator")
+			require.NoError(t, err)
+			owners[index] = release
+		}
+		require.Equal(t, maxImageStages, shares.active["aggregator"], "a sole aggregator can use all staging slots")
+		order := make(chan string, 3)
+		acquired := make(chan func(), 3)
+		for _, tenant := range []string{"aggregator", "new-tenant", "new-tenant"} {
+			go func() {
+				release, err := shares.acquire(t.Context(), tenant)
+				require.NoError(t, err)
+				order <- tenant
+				acquired <- release
+			}()
+			synctest.Wait()
+		}
+		require.Empty(t, order)
+		owners[0]()
+		synctest.Wait()
+		require.Equal(t, "new-tenant", <-order)
+		(<-acquired)()
+		synctest.Wait()
+		require.Equal(t, "new-tenant", <-order)
+		(<-acquired)()
+		synctest.Wait()
+		require.Equal(t, "aggregator", <-order)
+		(<-acquired)()
+		for _, owner := range owners {
+			owner()
+		}
+		require.Zero(t, shares.used)
+		require.Empty(t, shares.waiters)
+		require.Empty(t, shares.active)
 	})
 }
 
 func TestImageTenantWaitCancellationAndHeadroomRefusalReleaseCapacity(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		m, _, fs := imageCapacityFixture(t)
-		const lease = "550e8400-e29b-41d4-a716-446655440001"
-		var mutations *storageMutations
-		_, runs := imagePreparationSubjects(t, map[string]string{lease: "example.invalid/app:1"}, nil,
-			func(_ context.Context, subject *storageMutations) error { mutations = subject; return nil })
-		runs[lease]()
-		first, err := m.beginTenantPreparation(t.Context(), mutations)
-		require.NoError(t, err)
+		var held []imageStaging
+		for range maxImageStages {
+			stage, err := m.reserveStaging(t.Context(), imageTenantPreparationForTest(t, m), imageMiB)
+			require.NoError(t, err)
+			held = append(held, stage)
+		}
 		ctx, cancel := context.WithCancel(t.Context())
 		result := make(chan error, 1)
-		go func() { _, err := m.beginTenantPreparation(ctx, mutations); result <- err }()
+		waiter := imageTenantPreparationForTest(t, m)
+		go func() { _, err := m.reserveStaging(ctx, waiter, imageMiB); result <- err }()
 		synctest.Wait()
 		cancel()
 		require.ErrorIs(t, <-result, context.Canceled)
-		require.Empty(t, m.stageSlots, "tenant waiters never own global staging capacity")
+		require.Equal(t, maxImageStages, m.tenantShares.used, "canceled waiters consume no capacity")
+		require.Empty(t, m.tenantShares.waiters)
+		for _, stage := range held {
+			stage.close()
+		}
 		fs[m.stageRoot] = diskCapacity{total: 100 * uint64(imageMiB), available: uint64(imageMiB)}
-		_, err = m.reserveStaging(t.Context(), first, imageMiB)
+		_, err := m.reserveStaging(t.Context(), imageTenantPreparationForTest(t, m), imageMiB)
 		require.Error(t, err)
-		first.close()
-		require.Empty(t, m.stageSlots, "headroom refusal releases the global slot")
+		require.Zero(t, m.tenantShares.used, "headroom refusal releases the owned slot")
 		require.Zero(t, m.staging)
-		require.Empty(t, m.tenantShares.active, "headroom refusal leaves no tenant owner")
+		require.Empty(t, m.tenantShares.active)
 		fs[m.stageRoot] = diskCapacity{total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB)}
-		next, err := m.beginTenantPreparation(t.Context(), mutations)
-		require.NoError(t, err)
-		defer next.close()
-		stage, err := m.reserveStaging(t.Context(), next, imageMiB)
+		stage, err := m.reserveStaging(t.Context(), imageTenantPreparationForTest(t, m), imageMiB)
 		require.NoError(t, err)
 		stage.close()
 	})
 }
 
-func TestImageCapacityFourSlowLeasesCannotConsumeAnotherTenantsStagingShare(t *testing.T) {
-	synctest.Test(t, testImageCapacityFourSlowLeasesCannotConsumeAnotherTenantsStagingShare)
+func TestImageCapacityAggregatorCachedRolloutBypassesOccupiedStaging(t *testing.T) {
+	for _, environment := range []struct {
+		name   string
+		leases int
+	}{{"morpheus", 200}, {"dev", 50}} {
+		t.Run(environment.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { testImageCapacityAggregatorCachedRollout(t, environment.leases) })
+		})
+	}
 }
 
-func testImageCapacityFourSlowLeasesCannotConsumeAnotherTenantsStagingShare(t *testing.T) {
-	m, daemon, _ := imageCapacityFixture(t)
-	fixture := imageCapacityRegistryImage(t, "shared content requiring initial import")
-	layers, err := fixture.Layers()
+func testImageCapacityAggregatorCachedRollout(t *testing.T, warmLeases int) {
+	m, daemon, fs := imageCapacityFixture(t)
+	fs[m.stageRoot] = diskCapacity{total: 1000 * uint64(imageMiB), available: 900 * uint64(imageMiB)}
+	fs["/images"] = fs[m.stageRoot]
+	cold := imageCapacityRegistryImage(t, "cold content requiring import")
+	warm := imageCapacityRegistryImage(t, "cached aggregator content")
+	layers, err := cold.Layers()
 	require.NoError(t, err)
 	layer, err := layers[0].Digest()
 	require.NoError(t, err)
-	config, err := fixture.ConfigName()
+	coldID, err := cold.ConfigName()
 	require.NoError(t, err)
-	blocked, release := make(chan struct{}, 4), make(chan struct{})
+	warmID, err := warm.ConfigName()
+	require.NoError(t, err)
+	blocked, release := make(chan struct{}, maxImageStages), make(chan struct{})
 	unblock := sync.OnceFunc(func() { close(release) })
-	var slowReads atomic.Int32
 	registryHandler := registry.New()
 	transport := dockerReplayRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		r = r.Clone(r.Context())
@@ -139,8 +175,7 @@ func testImageCapacityFourSlowLeasesCannotConsumeAnotherTenantsStagingShare(t *t
 			r.Body = http.NoBody
 		}
 		w := httptest.NewRecorder()
-		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v2/slow") && strings.HasSuffix(r.URL.Path, "/blobs/"+layer.String()) {
-			slowReads.Add(1)
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v2/cold") && strings.HasSuffix(r.URL.Path, "/blobs/"+layer.String()) {
 			blocked <- struct{}{}
 			select {
 			case <-release:
@@ -154,68 +189,68 @@ func testImageCapacityFourSlowLeasesCannotConsumeAnotherTenantsStagingShare(t *t
 		return response, nil
 	})
 	t.Cleanup(unblock)
-	refs, tenants := make(map[string]string), make(map[string]string)
-	leases := []string{
-		"550e8400-e29b-41d4-a716-446655440001", "550e8400-e29b-41d4-a716-446655440002",
-		"550e8400-e29b-41d4-a716-446655440003", "550e8400-e29b-41d4-a716-446655440004",
-		"550e8400-e29b-41d4-a716-446655440005",
-	}
-	for index, lease := range leases {
-		repo := "slow" + lease
-		tenants[lease] = "tenant-a"
-		if index == 4 {
-			repo, tenants[lease] = "other", "tenant-b"
-		}
-		ref := "registry.example/" + repo + ":latest"
-		refs[lease] = ref
+	for ref, fixture := range map[string]v1.Image{"registry.example/cold:latest": cold, "registry.example/warm:latest": warm} {
 		tag, err := name.NewTag(ref)
 		require.NoError(t, err)
 		require.NoError(t, remote.Write(tag, fixture, remote.WithContext(t.Context()), remote.WithTransport(transport)))
 	}
-	var present atomic.Bool
-	m.runtime = (&mockDockerClient{InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
-		if !present.Load() {
-			return nil, errdefs.NotFound(errors.New("not imported"))
+	refs, tenants := make(map[string]string), make(map[string]string)
+	var coldLeases, cached []string
+	for index := range maxImageStages + warmLeases {
+		lease := uuid.NewString()
+		tenants[lease] = "one-on-chain-aggregator"
+		if index < maxImageStages {
+			refs[lease] = "registry.example/cold:latest"
+			coldLeases = append(coldLeases, lease)
+		} else {
+			refs[lease] = "registry.example/warm:latest"
+			cached = append(cached, lease)
 		}
-		return &ImageInfo{ID: config.String()}, nil
+	}
+	var imported atomic.Bool
+	m.runtime = (&mockDockerClient{InspectImageFn: func(_ context.Context, id string) (*ImageInfo, error) {
+		if id == warmID.String() {
+			return &ImageInfo{ID: id}, nil
+		}
+		if imported.Load() {
+			return &ImageInfo{ID: coldID.String()}, nil
+		}
+		return nil, errdefs.NotFound(errors.New("cold image absent"))
 	}}).imageAdmitter()
-	daemon.imageInspect = func(context.Context, string, ...client.ImageInspectOption) (image.InspectResponse, error) {
-		return image.InspectResponse{ID: config.String(), Size: imageMiB}, nil
+	daemon.imageInspect = func(_ context.Context, id string, _ ...client.ImageInspectOption) (image.InspectResponse, error) {
+		return image.InspectResponse{ID: id, Size: imageMiB}, nil
 	}
 	attachImageCapacityLoader(t, m, func(_ context.Context, input io.Reader) (image.LoadResponse, error) {
 		if _, err := io.Copy(io.Discard, input); err != nil {
 			return image.LoadResponse{}, err
 		}
-		present.Store(true)
+		imported.Store(true)
 		return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, nil
 	}, imagefetch.WithRegistryTransport(transport))
-	results := make(chan string, len(leases))
+	results := make(chan string, len(refs))
 	runs := imagePreparationExecutionsForTenants(t, m, refs, tenants, results)
 	var workers sync.WaitGroup
 	t.Cleanup(func() { unblock(); workers.Wait() })
-	workers.Go(runs[leases[0]])
-	synctest.Wait()
-	require.Len(t, blocked, 1, "the first tenant must hold one layer download")
-	for _, lease := range leases[1:4] {
+	for _, lease := range coldLeases {
 		workers.Go(runs[lease])
 	}
 	synctest.Wait()
-	require.Equal(t, int32(1), slowReads.Load(), "all three same-tenant waiters must remain outside provider staging")
-	require.Empty(t, results)
-	workers.Go(runs[leases[4]])
+	require.Len(t, blocked, maxImageStages, "one aggregator borrows all unused staging capacity")
+	for _, lease := range cached {
+		workers.Go(runs[lease])
+	}
 	synctest.Wait()
-	require.Len(t, results, 1, "another tenant must finish while all same-tenant leases remain behind their one download")
-	require.Equal(t, leases[4], <-results)
-	require.NoError(t, m.lock(t.Context()))
-	require.Equal(t, 1, m.active)
-	require.Len(t, m.stageSlots, 1)
-	m.unlock()
+	require.Len(t, results, warmLeases, "all cached requests must finish while the same tenant's staging pool is occupied")
+	for range warmLeases {
+		require.Contains(t, cached, <-results)
+	}
+	require.Equal(t, maxImageStages, m.tenantShares.used)
 	unblock()
 	workers.Wait()
-	for range 4 {
-		require.Contains(t, leases[:4], <-results)
+	for range maxImageStages {
+		require.Contains(t, coldLeases, <-results)
 	}
 	require.Empty(t, m.tenantShares.active)
-	require.Empty(t, m.stageSlots)
+	require.Zero(t, m.tenantShares.used)
 	require.Zero(t, m.active)
 }

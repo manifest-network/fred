@@ -109,7 +109,6 @@ type imageCapacityManager struct {
 	active       int
 	staging      int64
 	probing      int64
-	stageSlots   chan struct{}
 	probeGate    chan struct{}
 	tenantShares imageTenantShares
 }
@@ -129,7 +128,7 @@ func newImageCapacityManager(ctx context.Context, b *Backend, docker *DockerClie
 	manager := &imageCapacityManager{
 		daemon: docker.client, runtime: docker.images, docker: docker, pins: pins,
 		fs: localFilesystemCapacity{}, cfg: b.cfg, gate: make(chan struct{}, 1),
-		stageSlots: make(chan struct{}, 4), probeGate: make(chan struct{}, 1),
+		probeGate: make(chan struct{}, 1),
 	}
 	if manager.cfg.ProductionMode {
 		if err := manager.checkFilesystems(ctx, false, false); err != nil {
@@ -860,6 +859,13 @@ func (b *Backend) collectImages(ctx context.Context) error {
 		return err
 	}
 	defer done()
+	// Pin liveness follows durable generations, independently of a download's
+	// temporary image protection. Periodic pruning must progress even when
+	// overlapping admissions keep physical image deletion busy.
+	if _, err := b.imageCapacity.pins.Collect(ctx); err != nil {
+		imageGCTotal.WithLabelValues("inhibited").Inc()
+		return b.completeStorageMutation(ctx, "prune image pins", err)
+	}
 	err = b.imageCapacity.collect(ctx)
 	return b.completeStorageMutation(ctx, "collect images", err)
 }

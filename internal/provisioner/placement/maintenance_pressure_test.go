@@ -65,11 +65,13 @@ func TestFreshMaintenanceAdmissionBoundsAggregatePendingJournal(t *testing.T) {
 				require.NoError(t, err)
 				count = int(maxPendingMaintenanceBytes/(int64(len(encoded))+pendingMaintenanceTransitionBytes)) + 1
 			}
-			seedMaintenancePressure(t, store, template.command, count)
+			previousTenant := template.command
+			previousTenant.tenant = "incumbent-tenant"
+			seedMaintenancePressure(t, store, previousTenant, count)
 			fresh := testMaintenanceCommand(t, authority, maintenanceIDB, MaintenanceCommandUpdate, []byte("fresh bytes"))
 			_, err := store.beginMaintenanceCommand(fresh)
 			require.ErrorIs(t, err, ErrMaintenancePendingFull)
-			require.ErrorContains(t, err, reason)
+			require.EqualError(t, err, ErrMaintenancePendingFull.Error()+": "+reason)
 			_, found, err := store.LookupMaintenanceCommand(maintenanceLease, fresh.command.ID())
 			require.NoError(t, err)
 			require.False(t, found, "capacity refusal must happen before the dispatch WAL is minted")
@@ -202,7 +204,7 @@ func prepareTenantMaintenance(t *testing.T, store *Store, scope AdmissionScope, 
 	return command
 }
 
-func TestMaintenanceTenantSharesPreserveOtherTenantsAndSettlementCapacity(t *testing.T) {
+func TestMaintenanceReservationPreservesNewcomerAndSettlementCapacity(t *testing.T) {
 	for _, dimension := range []string{"count", "bytes"} {
 		t.Run(dimension, func(t *testing.T) {
 			store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
@@ -214,19 +216,20 @@ func TestMaintenanceTenantSharesPreserveOtherTenantsAndSettlementCapacity(t *tes
 			}
 			var admitted []MaintenanceCommandAdmission
 			var refused PreparedMaintenanceCommand
-			for index := range maxTenantPendingMaintenanceCommands + 1 {
+			for index := range maxPendingMaintenanceCommands {
 				command := prepareTenantMaintenance(t, store, scope, index, "tenant-a", payload)
 				admission, err := store.beginMaintenanceCommand(command)
 				if err != nil {
 					require.ErrorIs(t, err, ErrMaintenancePendingFull)
-					require.ErrorContains(t, err, "tenant_"+dimension)
+					require.Equal(t, MaintenanceApplicationCapacityReserved, resultForMaintenanceBeginError(err).Outcome())
+					require.EqualError(t, err, ErrMaintenancePendingFull.Error()+": reserved_"+dimension)
 					refused = command
 					break
 				}
 				admitted = append(admitted, admission)
 			}
 			require.True(t, refused.Valid())
-			other := prepareTenantMaintenance(t, store, scope, 100, "tenant-b", payload)
+			other := prepareTenantMaintenance(t, store, scope, 2000, "tenant-b", payload)
 			_, err := store.beginMaintenanceCommand(other)
 			require.NoError(t, err, "one tenant's pressure must not consume another tenant's reserved opportunity")
 			spoofed := refused
@@ -235,19 +238,22 @@ func TestMaintenanceTenantSharesPreserveOtherTenantsAndSettlementCapacity(t *tes
 			require.ErrorIs(t, err, ErrMaintenanceCommandConflict, "the share follows the durable principal, never a caller-selected key")
 			require.NoError(t, store.settleMaintenanceCommand(admitted[0].Claim(), MaintenanceOutcomeValidationRejected))
 			_, err = store.beginMaintenanceCommand(refused)
-			require.NoError(t, err, "terminal settlement must release both count and byte charges")
+			require.Equal(t, MaintenanceApplicationCapacityReserved, resultForMaintenanceBeginError(err).Outcome(), "the newcomer spent capacity; leave its reservation intact")
+			for _, previous := range admitted[1:3] {
+				require.NoError(t, store.settleMaintenanceCommand(previous.Claim(), MaintenanceOutcomeValidationRejected))
+			}
+			_, err = store.beginMaintenanceCommand(refused)
+			require.NoError(t, err, "terminal settlement releases count and byte charges")
 		})
 	}
 }
 
-func TestMaintenanceTenantAdmissionSerializesConcurrentFinalShare(t *testing.T) {
+func TestMaintenanceAdmissionSerializesConcurrentFinalBorrowedSlot(t *testing.T) {
 	store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
 	baseline := requireAdmissionBaseline(t, store, "backend-a")
 	scope := requireAdmissionScope(t, store, baseline, "backend-a")
-	for index := range maxTenantPendingMaintenanceCommands - 1 {
-		_, err := store.beginMaintenanceCommand(prepareTenantMaintenance(t, store, scope, index, "tenant-a", []byte("x")))
-		require.NoError(t, err)
-	}
+	template := prepareTenantMaintenance(t, store, scope, 0, "tenant-a", []byte("x"))
+	seedMaintenancePressure(t, store, template.command, maxPendingMaintenanceCommands-reservedMaintenanceCommands-1)
 	first := prepareTenantMaintenance(t, store, scope, 100, "tenant-a", []byte("x"))
 	second := prepareTenantMaintenance(t, store, scope, 101, "tenant-a", []byte("x"))
 	start := make(chan struct{})
@@ -279,7 +285,7 @@ func TestMaintenanceAccountingRebuildsOnOpenAndDoesNotPublishRolledBackWrites(t 
 	baseline := requireAdmissionBaseline(t, store, "backend-a")
 	scope := requireAdmissionScope(t, store, baseline, "backend-a")
 	var first PreparedMaintenanceCommand
-	for index := range maxTenantPendingMaintenanceCommands {
+	for index := range 32 {
 		command := prepareTenantMaintenance(t, store, scope, index, "tenant-a", []byte("x"))
 		if index == 0 {
 			first = command
@@ -314,7 +320,7 @@ func TestMaintenanceAccountingRebuildsOnOpenAndDoesNotPublishRolledBackWrites(t 
 	require.Equal(t, before, after)
 	scope = requireAdmissionScope(t, reopened, reopened.CurrentAdmissionBaseline(), "backend-a")
 	_, err = reopened.beginMaintenanceCommand(prepareTenantMaintenance(t, reopened, scope, 100, "tenant-a", []byte("x")))
-	require.ErrorIs(t, err, ErrMaintenancePendingFull)
+	require.NoError(t, err, "aggregators may borrow beyond the old 16-command ceiling")
 	_, err = reopened.beginMaintenanceCommand(prepareTenantMaintenance(t, reopened, scope, 101, "tenant-b", []byte("x")))
 	require.NoError(t, err)
 }
@@ -367,7 +373,7 @@ func TestMaintenanceCompletionWakeFinalizesBeyondOrdinaryRecoveryBatch(t *testin
 			scope := requireAdmissionScope(t, store, store.CurrentAdmissionBaseline(), "backend-a")
 			for index := range maxMaintenanceRecoveryCommandsPerBackendPass + 1 {
 				command := prepareTenantMaintenance(t, store, scope, index,
-					fmt.Sprintf("tenant-%d", index/maxTenantPendingMaintenanceCommands), []byte("waiting for backend"))
+					"tenant-aggregator", []byte("waiting for backend"))
 				admission, err := store.beginMaintenanceCommand(command)
 				require.NoError(t, err)
 				_, err = store.acceptMaintenanceUpdate(maintenanceDelivery{claim: admission.Claim()})
@@ -408,12 +414,12 @@ func TestMaintenanceCompletionWakeFinalizesBeyondOrdinaryRecoveryBatch(t *testin
 	}
 }
 
-func TestMaintenanceTransactionCannotOverspendTenantShareBeforeCommit(t *testing.T) {
+func TestMaintenanceTransactionCannotOverspendReservationBeforeCommit(t *testing.T) {
 	store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
 	baseline := requireAdmissionBaseline(t, store, "backend-a")
 	scope := requireAdmissionScope(t, store, baseline, "backend-a")
 	var commands []PreparedMaintenanceCommand
-	for index := range maxTenantPendingMaintenanceCommands + 1 {
+	for index := range maxPendingMaintenanceCommands {
 		commands = append(commands, prepareTenantMaintenance(t, store, scope, index, "tenant-a", []byte("x")))
 	}
 	store.mu.Lock()
@@ -443,18 +449,18 @@ func TestMaintenanceTransactionCannotOverspendTenantShareBeforeCommit(t *testing
 	require.NoError(t, err, "rolled back reservations must not spend durable capacity")
 }
 
-func TestMaintenanceOpenPreservesLegacyOverTenantBudgetReplayAndSettlement(t *testing.T) {
+func TestMaintenanceOpenPreservesAggregatorReplayAndSettlement(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "placements.db")
 	store, err := newStoreForTest(path, WithCallbackRouteFactory(testCallbackRoutes(t)))
 	require.NoError(t, err)
 	baseline := requireAdmissionBaseline(t, store, "backend-a")
 	scope := requireAdmissionScope(t, store, baseline, "backend-a")
 	var commands []PreparedMaintenanceCommand
-	for index := range maxTenantPendingMaintenanceCommands + 1 {
+	for index := range 32 {
 		commands = append(commands, prepareTenantMaintenance(t, store, scope, index, "tenant-a", []byte("historical candidate")))
 	}
 	// Encode valid older-provider rows whose principal and lifecycle authority
-	// are all present, but whose aggregate exceeds the new per-tenant share.
+	// are all present, and whose aggregate exceeds the removed per-tenant share.
 	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
 		pending, records, err := maintenanceCommandBuckets(tx)
 		if err != nil {
@@ -498,4 +504,43 @@ func TestMaintenanceOpenPreservesLegacyOverTenantBudgetReplayAndSettlement(t *te
 		require.Zero(t, phase.bytes)
 		require.True(t, phase.oldest.IsZero())
 	}
+}
+
+func TestMaintenanceReservationClassificationRequiresExactSourceRefusal(t *testing.T) {
+	refusal := maintenanceReservationRefusal{reservation: maintenanceCountReserved}
+	require.Equal(t, MaintenanceApplicationCapacityReserved, resultForMaintenanceBeginError(refusal).Outcome())
+	for _, err := range []error{
+		maintenanceReservationRefusal{},
+		errors.New(refusal.Error()),
+		fmt.Errorf("foreign call: %w", refusal),
+		errors.Join(refusal, errors.New("authority unavailable")),
+	} {
+		require.Equal(t, MaintenanceApplicationServiceUnavailable, resultForMaintenanceBeginError(err).Outcome())
+	}
+}
+
+func TestMaintenanceRecoveryDecodesOnlySelectedDurableCommands(t *testing.T) {
+	base, store := newMaintenanceCoordinatorForTest(t, maintenanceActiveLeaseReader(), &executionTestBackend{name: "backend-a"})
+	scope := requireAdmissionScope(t, store, store.CurrentAdmissionBaseline(), "backend-a")
+	var last PreparedMaintenanceCommand
+	for index := range maxMaintenanceRecoveryCommandsPerBackendPass + 1 {
+		last = prepareTenantMaintenance(t, store, scope, index, "tenant-test", []byte("waiting"))
+		admission, err := store.beginMaintenanceCommand(last)
+		require.NoError(t, err)
+		_, err = store.acceptMaintenanceUpdate(maintenanceDelivery{claim: admission.Claim()})
+		require.NoError(t, err)
+	}
+	application, err := base.Application(nil, 0)
+	require.NoError(t, err)
+	// Corrupt an undispatched row after startup validation. A scheduling
+	// snapshot must not parse its payload; selecting that exact command must.
+	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
+		_, records, err := maintenanceCommandBuckets(tx)
+		if err != nil {
+			return err
+		}
+		return records.Put(maintenanceReceiptKey(last.command.leaseUUID, last.command.id), []byte("invalid receipt"))
+	}))
+	require.NoError(t, application.RecoverPending(t.Context()), "unselected payloads must not be decoded under the store read lock")
+	require.ErrorIs(t, application.RecoverPending(t.Context()), ErrMaintenanceJournalCorrupt, "the next selected batch must validate its exact durable receipt")
 }

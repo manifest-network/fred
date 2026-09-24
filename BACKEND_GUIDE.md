@@ -270,7 +270,11 @@ Every non-2xx response **MUST** be JSON in this envelope:
 `POST /restart`, `/update`, `/deprovision` and `/reconcile_custom_domain`
 may return `503` with `{"error":"admitted lifecycle work remains pending","code":"lifecycle_pending"}`
 after observing validated journal contention or an admitted close whose physical
-result remains pending. Fred treats this exact envelope as a successful
+result remains pending. The bundled Docker backend also responds immediately
+with this envelope when close cancels a workflow whose exact worker is still
+draining, including a loader-owned image import; it does not wait for the import
+inside the HTTP request. Teardown can proceed after the worker exits. Fred
+treats this exact envelope as a successful
 availability observation while preserving the unresolved request. It grants no
 refusal, no-dispatch, immediate replay, or completed-cleanup authority. Generic
 conflicts, corrupt journals and invalid execution evidence remain server errors.
@@ -617,6 +621,19 @@ automatic recovery. A different tenant idempotency key receives `409` while
 that command is pending; an exact retry joins recovery. Backends must therefore
 apply the durable `maintenance_id` replay rule below to delayed delivery as well
 as immediate retries. See [the tenant retry contract](README.md#restart-lease).
+
+Provider admission separately bounds pending maintenance to 1,024 commands and
+64 MiB, including 512 bytes of phase-growth allowance per record. There is no
+fixed per-tenant concurrency cap. A tenant with pending commands can borrow the
+shared pool while leaving one command and 2 MiB for a tenant with none pending.
+If that reserve would be consumed, the tenant API returns `429` before recording
+a new command, with `reason: maintenance_capacity_reserved`, `Retry-After: 1`,
+and `maintenance capacity is reserved for tenants without
+pending work; retry after your pending work completes`. Global exhaustion
+returns `503`. Exact command replay and settlement remain possible above either
+boundary. These are provider admission responses, separate from the backend
+endpoint contract below; the reservation needs no deployment override for an
+aggregator address.
 
 **Request:**
 ```json
