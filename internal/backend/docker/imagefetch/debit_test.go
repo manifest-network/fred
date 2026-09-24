@@ -108,6 +108,38 @@ func TestCanceledImportAdmissionNeverDispatchesAndReleasesDebit(t *testing.T) {
 	}
 }
 
+func TestCancelBeforeDispatchCannotRepeatProofAfterDebitReleaseFailure(t *testing.T) {
+	f := newRegistry(t, layerTar(t, []byte("content")))
+	stage := filepath.Join(t.TempDir(), "stage")
+	require.NoError(t, os.Mkdir(stage, 0o700))
+	daemon := &recordingImporter{}
+	loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	require.NoError(t, err)
+	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
+	require.NoError(t, err)
+	defer prepared.Close()
+	admission, err := loader.ReserveImport(t.Context(), prepared)
+	require.NoError(t, err)
+	copyOfAdmission := *admission
+	moved := stage + "-moved"
+	require.NoError(t, os.Rename(stage, moved))
+	defer func() { _ = os.Rename(moved, stage) }()
+	unsent, err := admission.CancelBeforeDispatch()
+	require.Error(t, err)
+	require.False(t, unsent, "failed allocation release cannot mint retry evidence")
+	for _, retry := range []*ImportAdmission{admission, &copyOfAdmission} {
+		unsent, _ = retry.CancelBeforeDispatch()
+		require.False(t, unsent, "copies/retries cannot turn failed cleanup into a fresh successful proof")
+		_, err = loader.ImportAdmitted(t.Context(), retry)
+		require.Error(t, err, "the failed cleanup still consumes dispatch authority")
+	}
+	require.NoError(t, os.Rename(moved, stage))
+	pending, err := loader.PendingBytes()
+	require.NoError(t, err)
+	require.Equal(t, prepared.ImportBytes(), pending, "a retry cannot forgive the unreleased debit")
+	require.Zero(t, daemon.loads)
+}
+
 func TestAdmittedImportHasLoaderOwnedCeilingFromDispatch(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
 	transport := f.server.Client().Transport.(*http.Transport).Clone()

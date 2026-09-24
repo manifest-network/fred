@@ -14,7 +14,8 @@ func (*lifecyclePendingResponse) Error() string { return "admitted lifecycle wor
 
 func isLifecyclePendingResponse(err error) bool {
 	var pending *lifecyclePendingResponse
-	return errors.As(err, &pending)
+	var closePending *deprovisionLifecyclePendingResponse
+	return errors.As(err, &pending) || errors.As(err, &closePending)
 }
 
 // parseMaintenanceAvailability shares the strict capacity-envelope decoder,

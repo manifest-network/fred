@@ -111,6 +111,7 @@ type imageCapacityManager struct {
 	probing      int64
 	probeGate    chan struct{}
 	tenantShares imageTenantShares
+	flights      imageFlights
 }
 
 func newImageCapacityManager(ctx context.Context, b *Backend, docker *DockerClient) (*imageCapacityManager, error) {
@@ -469,8 +470,49 @@ func (m *imageCapacityManager) ingestBounded(ctx context.Context, tenantPreparat
 	if err != nil {
 		return resolvedImage{}, fmt.Errorf("resolve immutable image: %w", err)
 	}
-	if cached, ok, err := m.cachedImage(ctx, original, resolution); err != nil || ok {
+	if cached, ok, err := m.reuseResolvedImage(ctx, original, resolution, info); err != nil || ok {
 		return cached, err
+	}
+	for {
+		member, leader, err := tenantPreparation.joinFlight(m, resolution)
+		if err != nil {
+			return resolvedImage{}, err
+		}
+		if leader != nil {
+			m.runImageFlight(ctx, leader, tenantPreparation, original, resolution, loader, budget, info)
+		}
+		outcome, err := member.wait(ctx)
+		if err != nil {
+			member.retire()
+			return resolvedImage{}, err
+		}
+		// A leader may have published a pin or materialized an already-selected
+		// classic image. Each follower verifies reuse with its own context/ref.
+		if cached, ok, err := m.reuseResolvedImage(ctx, original, resolution, info); err != nil || ok {
+			if verified, ok := outcome.(imageFlightVerified); err == nil && ok && cached.image.ID() == verified.content.id &&
+				cached.pullDigest == verified.content.source && platforms.OnlyStrict(verified.content.platform).Match(cached.image.Platform()) {
+				cached.importBytes = max(cached.importBytes, verified.content.bytes)
+			}
+			return cached, err
+		}
+		switch outcome := outcome.(type) {
+		case imageFlightRetry:
+			member.retire()
+			continue
+		case imageFlightFailure:
+			member.retire()
+			return resolvedImage{}, outcome.err
+		case imageFlightVerified:
+			content := outcome.content
+			admitted, err := m.runtime.ReAdmit(ctx, content.id, content.platform, original)
+			return resolvedImage{image: admitted, pullDigest: content.source, importBytes: content.bytes}, err
+		}
+	}
+}
+
+func (m *imageCapacityManager) reuseResolvedImage(ctx context.Context, original string, resolution imagefetch.Resolution, info system.Info) (resolvedImage, bool, error) {
+	if cached, ok, err := m.cachedImage(ctx, original, resolution); err != nil || ok {
+		return cached, ok, err
 	}
 	// Classic Docker addresses extracted content by config ID. A local image
 	// pulled from an index need not have a repo@leaf-digest alias; the selected
@@ -480,35 +522,65 @@ func (m *imageCapacityManager) ingestBounded(ctx context.Context, tenantPreparat
 		if localErr == nil {
 			// Already-extracted content needs no ingestion allocation. Common
 			// resolution still verifies its size integrity and current headroom.
-			return resolvedImage{image: local, pullDigest: resolution.SourceReference()}, nil
+			return resolvedImage{image: local, pullDigest: resolution.SourceReference()}, true, nil
 		}
 	}
+	return resolvedImage{}, false, nil
+}
+
+func (m *imageCapacityManager) runImageFlight(ctx context.Context, leader *imageFlightLeader, tenantPreparation imageTenantPreparation, original string, resolution imagefetch.Resolution, loader *imagefetch.Loader, budget int64, info system.Info) {
+	// Foreign registry/SDK panics propagate to the worker boundary, but cannot
+	// strand followers or let them assume an uncertain dispatch never happened.
+	defer leader.complete(imageFlightFailure{err: errors.New("image preparation ended without completion")})
+	outcome := m.stageImageFlight(ctx, tenantPreparation, original, resolution, loader, budget, info)
+	leader.complete(outcome)
+}
+
+func (m *imageCapacityManager) stageImageFlight(ctx context.Context, tenantPreparation imageTenantPreparation, original string, resolution imagefetch.Resolution, loader *imagefetch.Loader, budget int64, info system.Info) imageFlightOutcome {
 	staging, err := m.reserveStaging(ctx, tenantPreparation, budget)
 	if err != nil {
-		return resolvedImage{}, err
+		return imageFlightBeforeDispatchFailure(ctx, err)
 	}
 	defer staging.close()
+	// Admission may have queued behind other work. Recheck after acquiring the
+	// slot so a newly published pin/local image never causes another download.
+	if cached, ok, err := m.reuseResolvedImage(ctx, original, resolution, info); err != nil || ok {
+		if err != nil {
+			return imageFlightBeforeDispatchFailure(ctx, err)
+		}
+		return imageFlightVerified{content: imageFlightContent{id: cached.image.ID(), source: cached.pullDigest, platform: cached.image.Platform(), bytes: cached.importBytes}}
+	}
 	prepared, err := loader.PrepareResolved(ctx, resolution)
 	if err != nil {
-		return resolvedImage{}, fmt.Errorf("prepare bounded image: %w", err)
+		return imageFlightBeforeDispatchFailure(ctx, fmt.Errorf("prepare bounded image: %w", err))
 	}
 	defer func() { _ = prepared.Close() }()
 	admission, err := m.reserveImport(ctx, loader, prepared)
 	if err != nil {
-		return resolvedImage{}, err
+		return imageFlightBeforeDispatchFailure(ctx, err)
 	}
+	return m.importImageFlight(ctx, loader, prepared, admission, info)
+}
+
+func (m *imageCapacityManager) importImageFlight(ctx context.Context, loader *imagefetch.Loader, prepared *imagefetch.Prepared, admission *imagefetch.ImportAdmission, info system.Info) imageFlightOutcome {
 	defer m.observeImportDebit()
 	defer func() { _ = admission.Close() }()
 	loaded, err := loader.ImportAdmitted(ctx, admission)
 	if err != nil {
-		return resolvedImage{}, err
+		unsent, closeErr := admission.CancelBeforeDispatch()
+		if unsent && ctx.Err() != nil {
+			return imageFlightRetry{}
+		}
+		if closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("release undispatched image import: %w", closeErr))
+		}
+		return imageFlightFailure{err: err}
 	}
 	id := loaded.ConfigID()
 	if daemonUsesContainerd(info) {
 		id = loaded.ManifestID()
 	}
-	admitted, err := m.runtime.ReAdmit(ctx, id, loaded.Platform(), original)
-	return resolvedImage{image: admitted, pullDigest: loaded.SourceReference(), importBytes: prepared.ImportBytes()}, err
+	return imageFlightVerified{content: imageFlightContent{id: id, source: loaded.SourceReference(), platform: loaded.Platform(), bytes: prepared.ImportBytes()}}
 }
 
 // cachedImage reuses only exact immutable content vouched for by an existing
@@ -712,6 +784,31 @@ func imageRecoveryDigest(ref, id string, inspection image.InspectResponse) strin
 }
 
 func (m *imageCapacityManager) collect(ctx context.Context) error {
+	// Admission calls cannot collect physical images while another preparation
+	// owns them. Keep this path cheap; periodic collection prunes independently.
+	if m.active != 0 {
+		imageGCTotal.WithLabelValues("busy").Inc()
+		return nil
+	}
+	protected, err := m.pruneImagePins(ctx)
+	if err != nil {
+		return err
+	}
+	return m.collectProtected(ctx, protected)
+}
+
+func (m *imageCapacityManager) pruneImagePins(ctx context.Context) (shared.ImagePinInventory, error) {
+	protected, err := m.pins.Collect(ctx)
+	if err != nil {
+		imageGCTotal.WithLabelValues("inhibited").Inc()
+		return protected, err
+	}
+	imageUnpinnedGenerations.WithLabelValues("active").Set(float64(protected.UnpinnedActiveGenerations()))
+	imageUnpinnedGenerations.WithLabelValues("retained").Set(float64(protected.UnpinnedRetainedGenerations()))
+	return protected, nil
+}
+
+func (m *imageCapacityManager) collectProtected(ctx context.Context, protected shared.ImagePinInventory) error {
 	if m.active != 0 {
 		imageGCTotal.WithLabelValues("busy").Inc()
 		return nil
@@ -737,11 +834,6 @@ func (m *imageCapacityManager) collect(ctx context.Context) error {
 		imageImportPendingBytes.Set(float64(pending))
 	}
 	if err := m.access.verify(ctx); err != nil {
-		return err
-	}
-	protected, err := m.pins.Collect(ctx)
-	if err != nil {
-		imageGCTotal.WithLabelValues("inhibited").Inc()
 		return err
 	}
 	if !protected.Complete() {
@@ -859,13 +951,12 @@ func (b *Backend) collectImages(ctx context.Context) error {
 		return err
 	}
 	defer done()
-	// Pin liveness follows durable generations, independently of a download's
-	// temporary image protection. Periodic pruning must progress even when
-	// overlapping admissions keep physical image deletion busy.
-	if _, err := b.imageCapacity.pins.Collect(ctx); err != nil {
-		imageGCTotal.WithLabelValues("inhibited").Inc()
+	// Periodic pruning progresses through long admissions. Pass the same typed
+	// inventory to physical collection rather than scanning it twice when idle.
+	protected, err := b.imageCapacity.pruneImagePins(ctx)
+	if err != nil {
 		return b.completeStorageMutation(ctx, "prune image pins", err)
 	}
-	err = b.imageCapacity.collect(ctx)
+	err = b.imageCapacity.collectProtected(ctx, protected)
 	return b.completeStorageMutation(ctx, "collect images", err)
 }

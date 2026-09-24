@@ -103,6 +103,7 @@ type imageTenantPreparationState struct {
 	closed       bool
 	stageClaimed bool
 	staging      bool
+	flights      map[*imageFlightMembership]struct{}
 }
 
 func (m *imageCapacityManager) beginTenantPreparation(ctx context.Context, mutations *storageMutations) (imageTenantPreparation, error) {
@@ -158,6 +159,10 @@ func (p imageTenantPreparation) close() {
 	p.state.mu.Lock()
 	defer p.state.mu.Unlock()
 	p.state.closed = true
+	for flight := range p.state.flights {
+		flight.close()
+	}
+	p.state.flights = nil
 	if !p.state.staging && p.state.release != nil {
 		p.state.release()
 	}

@@ -148,6 +148,7 @@ when later probes or recovery passes succeed.
 | `fred_backend_circuit_breaker_state{backend="X"} == 2` (open) | Backend X has been unhealthy long enough to trip the breaker | `curl backendX/health`, check backend logs |
 | `fred_backend_healthy{backend="X"} == 0` for >1 min | Backend health probe failing | Same as above. Note this no longer affects the tenant API's availability — the provider reports `degraded` and keeps serving |
 | `fred_docker_backend_volume_launches_pending > 0` beyond the expected launch window | Outstanding Docker launch receipts; a transient nonzero value is normal while launches run | Confirm recent successful backend health sampling, then correlate pending requests with backend logs. The gauge holds its last sample when health fails and does not count image-helper receipts. Follow [Unsettled Docker effects](#unsettled-docker-effects) for persistent unknown requests; never delete a receipt to clear the gauge |
+| `increase(fred_docker_backend_image_import_total{outcome=~"deadline\|shutdown"}[15m]) > 0` | An import owner reached its dispatch ceiling or shutdown deadline; Docker may still be unwinding | Correlate with pending import bytes and daemon logs. Before planned stops, fence new mutations, quiesce work and wait for pending bytes to reach zero. Owner cancellation is not completion proof |
 | `fred_docker_backend_image_import_pending_bytes > 0` beyond the normal import window | The gauge includes both live owned imports and allocation whose completion is unknown. A persistent value after the backend becomes idle can be durable import debt; restarting does not clear it | Correlate imports, Docker response failures and shutdown logs. Alert with a site-specific `for` duration longer than a normal import; investigate sustained debt using [Recovering outstanding image import allocation](#recovering-outstanding-image-import-allocation). Never clear the debit while the runtime can still allocate |
 | `increase(fred_docker_backend_image_gc_total{outcome="inhibited"}[15m]) > 0` together with sustained image-filesystem disk pressure | Incomplete pin authority or unresolved inspection evidence prevents safe deletion. This counter is diagnostic, not a standalone paging condition: pre-upgrade retained generations can legitimately lack pins for their remaining retention period | Check legacy pin-backfill warnings, retained rows and inspection receipts. Unpinned retained generations remain conservative until restored or safely reaped; the default grace is 90 days, plus the reaper interval, and unresolved reaping can extend it. Do not page on this expected upgrade condition while disk headroom is healthy. Docker inventory failures increment `outcome="error"`; ordinary live admissions increment `outcome="busy"`. Preserve authoritative evidence; import debt alone does not inhibit collection |
 | `increase(fred_maintenance_admission_refusals_total{reason=~"count\|bytes"}[5m]) > 0` | New restart/update admission reached the provider pending-journal count/byte cap. Existing commands can still replay and settle | Correlate pending phase/oldest-age gauges with backend completion and callback health. Restore stalled completion rather than deleting pending rows. `reserved_count` and `reserved_bytes` are caller backpressure (`429`) while preserving room for a tenant without pending work; exclude those reasons from provider exhaustion alerts |
@@ -480,8 +481,12 @@ Staging, import and extraction owners account for each other without holding a
 provider-wide lock during network or daemon I/O. A Started journal subject grants
 an image preparation its immutable tenant identity. Only an actual staging miss
 enters the four-slot pool; pinned and locally reusable images bypass this queue.
-A sole tenant can use all four slots. When capacity becomes available, the
-waiting tenant with the fewest active stages goes first; ties and requests within
+Concurrent preparations of the same resolved source digest and platform share
+one verified download/import. Followers hold no staging slot and retain their
+own journal authority for pin publication. Canceling a follower cannot cancel
+the import owner. Cache/local reuse is checked again after queue admission.
+A sole tenant can use all four slots for distinct images. When capacity becomes
+available, the waiting tenant with the fewest active stages goes first; ties and requests within
 a tenant follow arrival order. Waiting requests consume no staging allowance,
 and cancellation removes them from the queue. This scheduling does not preempt
 occupied slots or guarantee isolation from a tenant using multiple addresses.
@@ -495,7 +500,10 @@ pull timeout once dispatch is admitted, with a 30-minute ceiling measured from
 dispatch. Its staging files and capacity ownership remain held until the exchange
 completes. Closing the lease cancels its workflow and immediately returns the
 breaker-neutral `503 lifecycle_pending` while the owned worker is still draining;
-teardown retries after that worker exits. Shutdown closes import admission and
+providerd places the exact lease/client response on its bounded deferred-close
+scheduler, without poisoning the close event. The actor retains close ownership
+so a canceled worker settles as preempted by lease close. Teardown retries after
+that worker exits. Shutdown closes import admission and
 allows admitted imports to finish within the remaining shutdown budget, then
 cancels their owner if that deadline expires. The command shares 75 seconds
 between HTTP shutdown and backend drain, fitting the existing 90-second systemd
@@ -509,6 +517,11 @@ without automatic expiry. A corrupt debit record or foreign staging content
 prevents startup; preserve it for investigation instead of deleting it. The
 `fred_docker_backend_image_import_pending_bytes` gauge reports outstanding
 allocation, including unknown completion.
+`fred_docker_backend_image_import_total{outcome}` counts each dispatched import
+once as `success`, `failure`, `deadline`, or `shutdown`. Deadline and shutdown
+are classified by the loader’s own lifetime; they are visible even while the
+Docker SDK is still unwinding. Such an outcome does not prove the daemon stopped
+allocating or authorize clearing its debit.
 These checks sample available space; they do not physically reserve it against
 concurrent tenant or unrelated host writes. Keep the tenant disk pool and other
 host consumers within the filesystem's usable capacity with operational headroom.
@@ -536,8 +549,14 @@ pending compensation. Pre-upgrade retained generations with missing pins, and
 retained rows without a manifest, conservatively keep images until restored or
 safely reaped. The default retention grace is 90 days plus the sweep interval;
 parked reaping can extend it. This expected upgrade condition does not indicate
-a new disk leak or require an alert while headroom is healthy. The current
-counter does not distinguish it from other incomplete authority.
+a new disk leak or require an alert while headroom is healthy.
+`fred_docker_backend_image_unpinned_generations{kind="retained"}` reports
+retained generations without complete pins, including historical rows without
+a manifest. `kind="active"` reports active generations and required compensation
+ancestry without complete pins. Counts are per generation, not per image; they
+reflect the latest successful pin inventory. A failed inventory read preserves
+the last observation. Use these gauges with inventory errors and disk pressure
+to distinguish expected retention inhibition from incomplete active authority.
 `fred_docker_backend_image_gc_total{outcome}` distinguishes `busy`
 (ordinary live admission or helper work) from `inhibited` (incomplete pin authority or
 unresolved inspection evidence). It also reports shared, below-threshold, removed, error and
@@ -618,8 +637,9 @@ returns `503`; an incumbent reaching the newcomer reserve receives `429` with
 `reason: maintenance_capacity_reserved`, `Retry-After: 1`, and the message
 `maintenance capacity is reserved for tenants without pending work;
 retry after your pending work completes`. That refusal occurs before a new
-command is recorded; retry once pending work has completed. It is not a provider
-health failure and belongs outside provider exhaustion alerts. No per-address
+command is recorded; retry once pending work has completed. `Retry-After` is a
+minimum wait, not a polling cadence: use bounded exponential backoff with jitter
+while work remains pending. It is not a provider health failure and belongs outside provider exhaustion alerts. No per-address
 deployment override is required. An old completion
 without
 its maintenance ID is still insufficient authority to promote or discard a
@@ -2205,14 +2225,24 @@ While the pool is demoted, `fred_signer_balance{role="sub_signer"}` series stop 
 admission, operation, HTTP, scheduler, and manager drain. It does not configure
 docker-backend.
 
-Docker-backend first gives its HTTP server 30s to stop accepting and drain
-requests, then cancels backend work and waits a separate, fixed 90s for all
-backend-owned goroutines. If a worker still has not returned, `Stop` leaves the
-Docker client and bbolt stores open rather than closing dependencies underneath
-an ambiguous mutation, logs `docker backend workers did not drain before
-shutdown deadline`, and the binary exits non-zero. Let the service supervisor
-restart it so startup recovery can re-attest Docker and durable state. There is
-no production knob to lengthen this 90s fail-closed bound.
+Docker-backend shares one 75s process deadline across HTTP and backend drain.
+HTTP requests receive at most 30s; backend-owned work receives the remaining
+45–75s. If a worker still has not returned, shutdown leaves the Docker client
+and bbolt stores open, logs `docker backend workers did not drain before
+shutdown deadline`, and the binary exits non-zero. A fresh process re-attests
+Docker and durable state; restart alone cannot discharge unknown import debt.
+The command fits the existing 90s service stop allowance. Direct Go callers of
+`Backend.Stop` retain a separate 90s default; it is not added to the command
+budget. There is no production knob to extend either deadline.
+
+For a planned upgrade, fence new mutations and let admitted lifecycle work
+quiesce while docker-backend is still running. Require
+`fred_docker_backend_image_import_pending_bytes == 0` before stopping it. A
+75s shutdown can cancel a longer import and leave its allocation charged. If
+the gauge remains nonzero after work has quiesced, follow
+[the outstanding-import recovery procedure](#recovering-outstanding-image-import-allocation);
+waiting or restarting alone cannot prove completion. Stopping Fred does not
+fence Docker or its runtime.
 
 `fred_docker_backend_lease_terminal_event_dropped_total` should remain zero, but
 it is a bug signal rather than a shutdown-tuning signal. Capture the shutdown
@@ -2231,9 +2261,9 @@ The tracked replay loop alone owns delivery.
 A slow callback can therefore hold one replay worker and that lease's FIFO lock
 for up to 2m15s, while actors and unrelated leases continue. `backends[].timeout`
 applies to Fred-to-backend requests and does not control this callback deadline.
-Backend shutdown cancels the shared callback context before starting its 90s
-worker drain. The 30s level-triggered sweep discovers pre-start rows and retries
-dormant failed heads from the same durable outbox.
+Backend shutdown cancels the shared callback context before draining workers
+within the remaining process deadline. The 30s level-triggered sweep discovers
+pre-start rows and retries dormant failed heads from the same durable outbox.
 
 Upgrade the backend binaries one at a time when their wire protocol is backward-compatible,
 then stop and replace the single `providerd` process. Do not run active-active or

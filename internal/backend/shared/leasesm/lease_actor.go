@@ -219,6 +219,30 @@ type workerTerminalMessage interface {
 	isWorkerTerminalMessage()
 }
 
+// A requested close owns settlement before cancellation. Its activity lifetime
+// excludes recovery replacement between a drained worker and the deferred
+// close retry. Copies share the exact actor and one release, consumed only
+// after retirement drains worker notifications. The durable close journal
+// still decides whether the mutation committed before preemption.
+type actorCloseSettlement struct {
+	release func()
+}
+
+func newActorCloseSettlement(actor *LeaseActor) *actorCloseSettlement {
+	// The current accepted message already excludes quiescence. Retain that
+	// ownership before returning any pending response or canceling the worker.
+	actor.activityMu.Lock()
+	actor.activity++
+	actor.activityMu.Unlock()
+	return &actorCloseSettlement{release: sync.OnceFunc(actor.endActivity)}
+}
+
+func (settlement *actorCloseSettlement) retire() {
+	if settlement != nil && settlement.release != nil {
+		settlement.release()
+	}
+}
+
 // containerDiedMsg signals a container belonging to this lease has died.
 type containerDiedMsg struct {
 	ContainerID string
@@ -849,7 +873,8 @@ type LeaseActor struct {
 	// from handleProvisionRequested / handleRestartRequested /
 	// handleUpdateRequested, and called by Provisioning/Restarting/
 	// Updating.OnExit on DeprovisionRequested preemption.
-	workCancel context.CancelFunc
+	workCancel      context.CancelFunc
+	closeSettlement *actorCloseSettlement
 	// replaceCallbackKind distinguishes provision/restore operation completion
 	// from restart/update lifecycle observation. It is set by the serial actor
 	// with the replace entry transition and consumed by the terminal entry
@@ -880,8 +905,10 @@ type LeaseActor struct {
 	workers *workbarrier.Barrier
 	// activity counts accepted/handling messages and workers. The actor overlaps
 	// the count across message->worker and worker->terminal-message hand-offs, so
-	// zero is a real quiescence proof rather than three racy snapshots. activityMu
-	// serializes count transitions with TryAcquireQuiescence; a recovery owner that
+	// zero is a real quiescence proof rather than three racy snapshots. A requested
+	// close retains one count until retirement, covering the gap between a drained
+	// worker and the deferred close retry so recovery cannot replace its owner.
+	// activityMu serializes count transitions with TryClaimQuiescence; a recovery owner that
 	// claims zero holds the mutex and prevents any new actor mutation until release.
 	activityMu sync.Mutex
 	activity   int64
@@ -1071,6 +1098,7 @@ func (a *LeaseActor) retire() {
 	_ = a.waitForWorkers()
 	a.closeTerminalAdmission()
 	a.drainRetiringInbox()
+	a.closeSettlement.retire()
 	a.removeFromRegistry()
 	close(a.done)
 }
@@ -1192,6 +1220,18 @@ func (a *LeaseActor) handle(msg leaseMessage) {
 			msg.onPanic(fmt.Errorf("handler panic: %v", r))
 		}
 	}()
+	if a.closeSettlement != nil {
+		if _, continuation := msg.(deprovisionMsg); !continuation {
+			// Keep the pending maintenance generation owned by this actor until
+			// close or retirement. Recovery must not race the close handoff merely
+			// because the canceled worker has now drained. This is a closed admission
+			// state: even if the FSM transition failed, no new mutation may enter
+			// an actor whose terminal settlement now belongs to close. Worker
+			// notifications have no caller, so their onPanic method is a no-op.
+			msg.onPanic(fmt.Errorf("%w: lease close owns lifecycle settlement", backend.ErrInvalidState))
+			return
+		}
+	}
 	if observation, ok := msg.(actorObservationMessage); ok {
 		generation := classifyActorObservation(a.cfg.ProvisionStore, observation)
 		if generation != ObservationGenerationCurrent {
@@ -1823,9 +1863,9 @@ func (a *LeaseActor) spawnReplaceWorker(
 	})
 }
 
-// OwnsMaintenance is the concurrency-safe, exact worker-ownership proof used
-// by periodic recovery. A projected Restarting/Updating status alone is not an
-// ownership proof: a dropped terminal event can leave it stale indefinitely.
+// OwnsMaintenance observes this actor's exact maintenance generation, including
+// its requested close handoff. Recovery exclusion is owned by activity and
+// TryClaimQuiescence; this observation does not itself grant mutation authority.
 func (a *LeaseActor) OwnsMaintenance(id shared.MaintenanceID) bool {
 	if a == nil || !id.Valid() {
 		return false
@@ -2177,6 +2217,9 @@ func (a *LeaseActor) tryEnqueue(msg leaseMessage) bool {
 // The ctx threaded in is the actor-owned ctx from the inbound
 // deprovision command (which carries the caller's ctx from Backend.Deprovision).
 func (a *LeaseActor) handleDeprovision(ctx context.Context) error {
+	if a.closeSettlement == nil {
+		a.closeSettlement = newActorCloseSettlement(a)
+	}
 	// Cancellation asks the exact actor-owned worker to stop; only its barrier
 	// proves that it has stopped. In particular, an admitted image import keeps
 	// its loader-owned lifetime after cancellation. Return an observation now

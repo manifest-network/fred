@@ -76,6 +76,7 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	}
 	assert.Equal(t, int64(1), deprovisionCalls.Load())
 	<-actor.Done()
+	require.Zero(t, actor.activity, "retirement releases the exact close activity ownership")
 }
 
 func TestWorkerPendingRequiresActorIssuedObservation(t *testing.T) {
@@ -86,6 +87,60 @@ func TestWorkerPendingRequiresActorIssuedObservation(t *testing.T) {
 		shared.CloseExecutionPending{},
 	} {
 		require.False(t, IsLifecyclePending(err), "unissued errors cannot become worker observations: %v", err)
+	}
+}
+
+func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) {
+	for _, kind := range []shared.MaintenanceIntentKind{shared.MaintenanceIntentRestart, shared.MaintenanceIntentUpdate} {
+		t.Run(string(kind), func(t *testing.T) {
+			store := newMockProvisionStore()
+			store.put(testActorLeaseUUID, &ProvisionState{
+				LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusFailing,
+			})
+			var workers, teardown atomic.Int32
+			actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+				ProvisionStore: store, WorkerDrainTimeout: time.Millisecond,
+				MaintenanceWorkFn: func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+					workers.Add(1)
+					return nil
+				},
+				DoDeprovisionFn: func(context.Context, ActorCloseScope) error {
+					teardown.Add(1)
+					store.remove(testActorLeaseUUID)
+					return nil
+				},
+			})
+			// A diagnostic owner can still be unwinding when its close caller
+			// leaves. The failed OnExit preserves Failing, which normally permits
+			// restart/update; close ownership must independently fence admission.
+			actor.beginWorkerActivity()
+			ctx, cancel := context.WithCancel(t.Context())
+			command, reply, err := NewDeprovisionCommand(ctx)
+			require.NoError(t, err)
+			cancel()
+			actor.handle(command.envelope.message)
+			require.ErrorIs(t, <-reply.Result(), ErrWorkerDrainTimeout)
+			require.Equal(t, backend.ProvisionStatusFailing, actor.State())
+			actor.endWorkerActivity()
+			require.Nil(t, actor.TryClaimQuiescence(), "a drained worker does not let recovery retire the requested close owner")
+			claim := newTestMaintenanceClaim(t, testActorLeaseUUID, kind)
+			target := testMaintenanceTarget(t, claim)
+			command, reply, err = NewRestartCommand(t.Context(), target)
+			if kind == shared.MaintenanceIntentUpdate {
+				command, reply, err = NewUpdateCommand(t.Context(), target)
+			}
+			require.NoError(t, err)
+			actor.handle(command.envelope.message)
+			require.ErrorIs(t, <-reply.Result(), backend.ErrInvalidState)
+			actor.cfg.WG.Wait()
+			require.Zero(t, workers.Load(), "close-owned actor cannot acknowledge a mutation whose terminal result it would suppress")
+			require.Zero(t, teardown.Load())
+			command, reply, err = NewDeprovisionCommand(t.Context())
+			require.NoError(t, err)
+			actor.handle(command.envelope.message)
+			require.NoError(t, <-reply.Result())
+			require.EqualValues(t, 1, teardown.Load(), "the close continuation remains admissible")
+		})
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/docker/imagefetch"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
@@ -113,4 +114,15 @@ func TestDeprovisionDuringOwnedImageImportReturnsPendingBeforeHTTPDeadline(t *te
 	pending, err := m.loader.PendingBytes()
 	require.NoError(t, err)
 	require.Zero(t, pending, "the completed daemon exchange settles its own debit")
+	callbacks, err := b.callbackStore.ListPending()
+	require.NoError(t, err)
+	require.Len(t, callbacks, 2, "one interrupted operation and one terminal close")
+	require.Equal(t, backend.CallbackStatusFailed, callbacks[0].Status)
+	require.Equal(t, "operation preempted by lease close", callbacks[0].Error,
+		"the worker's canceled image wait cannot settle an image-pull failure after close requested ownership")
+	require.Equal(t, backend.CallbackStatusDeprovisioned, callbacks[1].Status)
+	require.NoError(t, b.Deprovision(t.Context(), request.LeaseUUID))
+	replayed, err := b.callbackStore.ListPending()
+	require.NoError(t, err)
+	require.Equal(t, callbacks, replayed, "repeated close cannot publish duplicate settlements")
 }

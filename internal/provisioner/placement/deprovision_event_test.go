@@ -225,56 +225,119 @@ func TestDeprovisionEventDeferralRequiresLocalAuthority(t *testing.T) {
 	assert.Equal(t, DeprovisionEventFailed, zero.Retry(t.Context()).Disposition())
 }
 
-func TestDeprovisionEventRequiresEveryFailedCandidateToBeNotDispatched(t *testing.T) {
-	for _, peerResult := range []string{"success", "unknown effect"} {
-		t.Run(peerResult, func(t *testing.T) {
-			const leaseUUID = "00000000-0000-4000-8000-000000003104"
-			store := newTestStore(t)
-			requireAdmissionBaseline(t, store, "backend-a", "backend-b")
-			requireConflictPlacement(t, store, leaseUUID, "backend-a", "backend-b")
-			id, bound := store.ExpectedBackendStorageIdentity("backend-a")
-			require.True(t, bound)
-			var httpCalls atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				httpCalls.Add(1)
-				w.Header().Set(backendidentity.ResponseHeader, id.String())
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte(`{"error":"uncertain"}`))
-			}))
-			t.Cleanup(server.Close)
-			policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
-				Name: "backend-a", BaseURL: server.URL, Secret: causalOutcomeTestSecret,
-			})
-			require.NoError(t, err)
-			client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{
-				CBFailureThresh: 1, CBTimeout: time.Hour,
-			}, causalOutcomeTestIdentity{id: id})
-			require.NoError(t, err)
-			_, err = client.GetProvision(t.Context(), leaseUUID)
-			require.Error(t, err, "trip the real client circuit with an uncertain response")
-			var peerCalls int
-			peer := &executionTestBackend{name: "backend-b", deprovision: func(context.Context, string) error {
-				peerCalls++
-				if peerResult == "unknown effect" {
-					return errors.Join(backend.ErrCircuitOpen, context.DeadlineExceeded)
-				}
-				return nil
-			}}
-			base, err := store.BindOperationCoordinator(nil)
-			require.NoError(t, err)
-			execution := bindExecutionForTest(t, base, newExecutionTestRuntime(client, peer))
-			provision, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
-			require.NoError(t, err)
-			result := provision.DeprovisionEvent(t.Context(), leaseUUID)
-			require.Equal(t, int32(1), httpCalls.Load(), "deferred owner never entered HTTP transport")
-			require.Equal(t, 1, peerCalls)
-			require.Error(t, result.Err(), "a successful sibling does not complete the remaining close")
-			if peerResult == "success" {
-				require.Equal(t, DeprovisionEventDeferred, result.Disposition())
-				require.Equal(t, DeprovisionDeferredBackendUnavailable, result.Deferred().Reason())
-			} else {
-				require.Equal(t, DeprovisionEventFailed, result.Disposition())
-				require.False(t, result.Deferred().Valid(), "one exact refusal cannot classify another backend's uncertainty")
+func TestDeprovisionLifecyclePendingKeepsLiveOperation(t *testing.T) {
+	const lease = "00000000-0000-4000-8000-000000003107"
+	fixture := newProvisionDispatchFixture(t, lease)
+	call, calling := fixture.coordinator.beginProvisionCall(fixture.dispatch)
+	require.True(t, calling)
+	require.True(t, fixture.coordinator.completeProvision(call, backend.ConservativeProvisionCallOutcome(nil)).Applied())
+	before, found := fixture.coordinator.Lookup(lease)
+	require.True(t, found)
+	id, bound := fixture.store.ExpectedBackendStorageIdentity("backend-a")
+	require.True(t, bound)
+	var drained atomic.Bool
+	var teardown atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(backendidentity.ResponseHeader, id.String())
+		if !drained.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"pending","code":"lifecycle_pending"}`))
+			return
+		}
+		teardown.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
+		Name: "backend-a", BaseURL: server.URL, Secret: causalOutcomeTestSecret,
+	})
+	require.NoError(t, err)
+	client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{CBFailureThresh: 1}, causalOutcomeTestIdentity{id: id})
+	require.NoError(t, err)
+	execution := bindExecutionForTest(t, fixture.coordinator, newExecutionTestRuntime(client))
+	provision, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
+	require.NoError(t, err)
+	result := provision.DeprovisionEvent(t.Context(), lease)
+	for range 3 {
+		require.Equal(t, DeprovisionEventDeferred, result.Disposition(), result.Err())
+		require.Equal(t, DeprovisionDeferredLifecycle, result.Deferred().Reason())
+		after, found := fixture.coordinator.Lookup(lease)
+		require.True(t, found, "pending close releases its claim without finishing the live operation")
+		require.Equal(t, before, after)
+		require.Zero(t, teardown.Load())
+		result = result.Deferred().Retry(t.Context())
+	}
+	drained.Store(true)
+	require.Equal(t, DeprovisionEventCompleted, result.Deferred().Retry(t.Context()).Disposition())
+	require.EqualValues(t, 1, teardown.Load())
+	require.False(t, fixture.coordinator.RuntimeController().Contains(lease))
+}
+
+func TestDeprovisionEventRequiresEveryFailedCandidateToCarryDeferralProvenance(t *testing.T) {
+	for _, availability := range []string{"circuit open", "lifecycle pending"} {
+		t.Run(availability, func(t *testing.T) {
+			for _, peerResult := range []string{"success", "unknown effect"} {
+				t.Run(peerResult, func(t *testing.T) {
+					const leaseUUID = "00000000-0000-4000-8000-000000003104"
+					store := newTestStore(t)
+					requireAdmissionBaseline(t, store, "backend-a", "backend-b")
+					requireConflictPlacement(t, store, leaseUUID, "backend-a", "backend-b")
+					id, bound := store.ExpectedBackendStorageIdentity("backend-a")
+					require.True(t, bound)
+					var httpCalls atomic.Int32
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						httpCalls.Add(1)
+						w.Header().Set(backendidentity.ResponseHeader, id.String())
+						if availability == "lifecycle pending" {
+							w.WriteHeader(http.StatusServiceUnavailable)
+							_, _ = w.Write([]byte(`{"error":"pending","code":"lifecycle_pending"}`))
+							return
+						}
+						w.WriteHeader(http.StatusInternalServerError)
+						_, _ = w.Write([]byte(`{"error":"uncertain"}`))
+					}))
+					t.Cleanup(server.Close)
+					policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
+						Name: "backend-a", BaseURL: server.URL, Secret: causalOutcomeTestSecret,
+					})
+					require.NoError(t, err)
+					client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{
+						CBFailureThresh: 1, CBTimeout: time.Hour,
+					}, causalOutcomeTestIdentity{id: id})
+					require.NoError(t, err)
+					if availability == "circuit open" {
+						_, err = client.GetProvision(t.Context(), leaseUUID)
+						require.Error(t, err, "trip the real client circuit with an uncertain response")
+					}
+					var peerCalls int
+					peer := &executionTestBackend{name: "backend-b", deprovision: func(context.Context, string) error {
+						peerCalls++
+						if peerResult == "unknown effect" {
+							return errors.Join(backend.ErrCircuitOpen, context.DeadlineExceeded)
+						}
+						return nil
+					}}
+					base, err := store.BindOperationCoordinator(nil)
+					require.NoError(t, err)
+					execution := bindExecutionForTest(t, base, newExecutionTestRuntime(client, peer))
+					provision, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
+					require.NoError(t, err)
+					result := provision.DeprovisionEvent(t.Context(), leaseUUID)
+					require.Equal(t, int32(1), httpCalls.Load())
+					require.Equal(t, 1, peerCalls)
+					require.Error(t, result.Err(), "a successful sibling does not complete the remaining close")
+					if peerResult == "success" {
+						require.Equal(t, DeprovisionEventDeferred, result.Disposition())
+						wantReason := DeprovisionDeferredBackendUnavailable
+						if availability == "lifecycle pending" {
+							wantReason = DeprovisionDeferredLifecycle
+						}
+						require.Equal(t, wantReason, result.Deferred().Reason())
+					} else {
+						require.Equal(t, DeprovisionEventFailed, result.Disposition())
+						require.False(t, result.Deferred().Valid(), "one exact refusal cannot classify another backend's uncertainty")
+					}
+				})
 			}
 		})
 	}

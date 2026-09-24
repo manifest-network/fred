@@ -339,6 +339,11 @@ manifests or alert rules.
 
 ### Docker startup and recovery budgets
 
+The command validates TLS and binds its listener before startup can publish
+image pins. While recovery runs, that listener returns a prompt `503` without
+a storage-identity claim. Only successful backend startup publishes the normal
+identity-bound handler; failed startup closes the listener.
+
 Docker-backend uses finite, nested safety budgets. The production constructor
 uses `storage_attestation_timeout` (default `30s`) for the full initial
 Docker/storage-lineage attestation. `Start` shares at most 30 seconds across its
@@ -862,7 +867,9 @@ Before dispatch, Fred durably records the import allowance in
 runs under the loader's lifetime after admission, with a 30-minute ceiling from
 dispatch; tenant cancellation or the pull timeout does not abort the admitted
 import. A lease close returns breaker-neutral `503 lifecycle_pending` while its
-owned worker drains, allowing close to retry without waiting on the HTTP request.
+owned worker drains. The upgraded providerd defers that exact response through
+its bounded close scheduler, avoiding close-event poisoning. Use the stopped
+upgrade path so an older providerd cannot misclassify the new pending response.
 Staging files and capacity
 ownership remain held until completion. Shutdown closes import admission and
 gives those requests the remaining process shutdown budget before
@@ -872,7 +879,10 @@ Docker reports a completed refusal. A lost, malformed or timed-out response
 keeps the unproven allocation charged across restarts. There is no automatic
 expiry or cleanup of this outstanding amount. Preserve the record and use the
 [offline recovery procedure](OPERATIONS.md#recovering-outstanding-image-import-allocation)
-if it prevents admission.
+if it prevents admission. For a planned stop, fence new mutations and let
+admitted lifecycle work quiesce, then require
+`fred_docker_backend_image_import_pending_bytes == 0` while the backend is still
+running. A shutdown deadline can otherwise leave an admitted import unresolved.
 
 Image management defaults to a 10 GiB staged-content and expanded-image limit,
 2 GiB free-space floor, and 85%/75% GC high/low thresholds
@@ -884,8 +894,11 @@ content is recovered by its exact digest under its saved allowance.
 Before staging, Fred checks the configured image allowance above the free-space
 floor. After verification, it checks the conservative import footprint and floor
 again before importing. Up to four staging owners reserve their full budgets.
-Pinned and locally reusable image preparations bypass the staging queue. A sole
-tenant can use all four slots; when a slot becomes available, the waiting tenant
+Concurrent preparations of one resolved source digest and platform share one
+verified download/import; each lease publishes its own pin with its own journal
+authority. Followers do not consume staging slots. Pinned and locally reusable
+image preparations bypass the staging queue. A sole tenant can use all four
+slots for distinct images; when a slot becomes available, the waiting tenant
 with the fewest active stages is selected, with arrival order breaking ties.
 Requests within a tenant remain FIFO. This needs no per-address configuration
 and accommodates aggregator tenants sharing one on-chain address. It neither

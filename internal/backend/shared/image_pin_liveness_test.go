@@ -8,6 +8,8 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 const (
@@ -155,6 +157,7 @@ func TestImagePinCollectorLegacyNilRetentionKeepsAllPinsAndInhibitsRemoval(t *te
 	stores := openOperationHandoffStores(t, "image-pin-legacy-retention")
 	lease := testLeaseUUID("image-pin-legacy-retention")
 	retained := sampleEntry(lease)
+	retained.ProviderUUID = testLeaseUUID("image-pin-retention-provider")
 	retained.StackManifest = nil
 	require.NoError(t, stores.retentions.putForTest(retained))
 	payload := []byte(`{"services":{"app":{"image":"example.invalid/app:retained"}}}`)
@@ -164,10 +167,89 @@ func TestImagePinCollectorLegacyNilRetentionKeepsAllPinsAndInhibitsRemoval(t *te
 	inventory, err := journal.Collect(t.Context())
 	require.NoError(t, err)
 	require.False(t, inventory.Complete())
+	require.Zero(t, inventory.UnpinnedActiveGenerations())
+	require.Equal(t, 1, inventory.UnpinnedRetainedGenerations())
 	require.False(t, inventory.CanRemove(imagePinOld))
 	require.False(t, inventory.CanRemove(imagePinTarget), "unknown retention ancestry inhibits the complete destructive inventory")
 	pins, err := journal.List()
 	require.NoError(t, err)
 	require.Len(t, pins, 1)
 	require.Equal(t, imagePinOld, pins[0].ImageID)
+}
+
+func TestImagePinCollectorProtectsRetainedManifestAndRequiresItsPins(t *testing.T) {
+	for _, pinned := range []bool{true, false} {
+		name := "unpinned"
+		if pinned {
+			name = "pinned"
+		}
+		t.Run(name, func(t *testing.T) {
+			stores := openOperationHandoffStores(t, "retained-image-"+name)
+			lease := testLeaseUUID("retained-image-" + name)
+			payload := []byte(`{"services":{"app":{"image":"example.invalid/app:retained"}}}`)
+			retained := sampleEntry(lease)
+			retained.ProviderUUID = testLeaseUUID("image-pin-retention-provider")
+			retained.Items[0].ServiceName = "app"
+			var err error
+			retained.StackManifest, err = manifest.ParseStoredPayload(payload)
+			require.NoError(t, err)
+			require.NoError(t, stores.retentions.putForTest(retained))
+			if pinned {
+				seedLivenessPin(t, stores, lease, payload, "example.invalid/app:retained", imagePinCurrent)
+			}
+			journal, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
+			require.NoError(t, err)
+			inventory, err := journal.Collect(t.Context())
+			require.NoError(t, err)
+			require.Equal(t, pinned, inventory.Complete())
+			require.False(t, inventory.CanRemove(imagePinCurrent), "restorable content cannot become an eviction candidate")
+			require.Equal(t, pinned, inventory.CanRemove(imagePinTarget), "only complete retained authority permits collecting unrelated images")
+			require.Zero(t, inventory.UnpinnedActiveGenerations())
+			pins, err := journal.List()
+			require.NoError(t, err)
+			if pinned {
+				require.Zero(t, inventory.UnpinnedRetainedGenerations())
+				require.Len(t, pins, 1, "periodic pruning must preserve the retained generation's immutable execution identity")
+				require.Equal(t, imagePinCurrent, pins[0].ImageID)
+			} else {
+				require.Equal(t, 1, inventory.UnpinnedRetainedGenerations())
+				require.Empty(t, pins)
+			}
+		})
+	}
+}
+
+func TestImagePinCollectorCountsMissingGenerationsByAuthority(t *testing.T) {
+	stores := openOperationHandoffStores(t, "image-pin-generation-counts")
+	active := testOperationIntentSpec(t, "unpinned-active-generation")
+	active.Manifest = []byte(`{"services":{"app":{"image":"example.invalid/app:1"},"worker":{"image":"example.invalid/worker:1"}}}`)
+	worker := active.Items[0]
+	worker.ServiceName = "worker"
+	active.Items = append(active.Items, worker)
+	appendPinAccountingRelease(t, stores, active)
+	retained := sampleEntry(testLeaseUUID("partially-pinned-retained-generation"))
+	retained.ProviderUUID = active.ProviderUUID
+	retained.Items = active.Items
+	retained.ResourceProfiles = active.ResourceProfiles
+	var err error
+	retained.StackManifest, err = manifest.ParseStoredPayload(active.Manifest)
+	require.NoError(t, err)
+	require.NoError(t, stores.retentions.putForTest(retained))
+	seedLivenessPin(t, stores, retained.OriginalLeaseUUID, active.Manifest, "example.invalid/app:1", imagePinCurrent)
+	unknown := sampleEntry(testLeaseUUID("unknown-retained-generation"))
+	unknown.ProviderUUID = active.ProviderUUID
+	unknown.StackManifest = nil
+	require.NoError(t, stores.retentions.putForTest(unknown))
+	startedPinAccountingOrigin(t, stores, testOperationIntentSpec(t, "pending-not-yet-pinned-generation"))
+	journal, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
+	require.NoError(t, err)
+	inventory, err := journal.Collect(t.Context())
+	require.NoError(t, err)
+	require.False(t, inventory.Complete())
+	require.Equal(t, 1, inventory.UnpinnedActiveGenerations(), "two missing service pins belong to one required generation; an in-flight target is not yet required")
+	require.Equal(t, 2, inventory.UnpinnedRetainedGenerations(), "partially pinned and unknown legacy retentions have distinct required generations")
+	require.False(t, inventory.CanRemove(imagePinCurrent))
+	stored, err := journal.Lookup(retained.OriginalLeaseUUID, active.Manifest, "example.invalid/app:1")
+	require.NoError(t, err)
+	require.NotNil(t, stored, "an incomplete retained generation must keep its positively known pins")
 }

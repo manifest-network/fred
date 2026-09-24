@@ -125,6 +125,7 @@ func TestDeprovisionCancelsInFlightMaintenanceBeforeCloseHandoff(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, pending, 2, "canceled worker cannot enqueue a late duplicate completion")
 			require.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
+			require.Equal(t, "maintenance preempted by lease close", pending[0].Error)
 			require.Equal(t, backend.CallbackStatusDeprovisioned, pending[1].Status)
 			require.Less(t, pending[0].Sequence, pending[1].Sequence)
 		})

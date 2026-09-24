@@ -270,11 +270,45 @@ func visitImagePinsContextTx(ctx context.Context, tx *bolt.Tx, visit func(ImageP
 type ImagePinInventory struct {
 	images   map[string]bool
 	complete bool
+	unpinned imagePinGenerationGaps
+}
+
+type imagePinGenerationSource uint8
+
+const (
+	imagePinInFlight imagePinGenerationSource = iota
+	imagePinActive
+	imagePinRetained
+)
+
+type imagePinGeneration struct {
+	manifestHash string
+	source       imagePinGenerationSource
+}
+
+type imagePinGenerationGaps struct{ active, retained int }
+
+func (g *imagePinGenerationGaps) add(source imagePinGenerationSource) {
+	switch source {
+	case imagePinActive:
+		g.active++
+	case imagePinRetained:
+		g.retained++
+	}
 }
 
 // Complete reports whether every relaunchable generation has immutable pins.
 // Incompleteness inhibits deletion without rejecting unrelated admission.
 func (i ImagePinInventory) Complete() bool { return i.complete }
+
+// UnpinnedActiveGenerations counts active or required compensation generations
+// with at least one missing immutable pin, including unavailable ancestry.
+// Pending targets have not completed image admission and are not counted.
+func (i ImagePinInventory) UnpinnedActiveGenerations() int { return i.unpinned.active }
+
+// UnpinnedRetainedGenerations counts restorable manifests with at least one
+// missing immutable pin. A legacy retention without a manifest counts once.
+func (i ImagePinInventory) UnpinnedRetainedGenerations() int { return i.unpinned.retained }
 
 // CanRemove proves that the complete journal snapshot did not name this image.
 // A zero value or legacy manifest with missing pins never grants collection.
@@ -327,6 +361,7 @@ func (locked *lockedImagePins) collect(ctx context.Context) (ImagePinInventory, 
 	}
 	protected := make(map[string]bool)
 	complete := true
+	var unpinned imagePinGenerationGaps
 	for _, lease := range slices.Sorted(maps.Keys(byLease)) {
 		leaseComplete, err := func() (bool, error) {
 			unlock, err := j.lockLeaseContext(ctx, lease)
@@ -334,25 +369,29 @@ func (locked *lockedImagePins) collect(ctx context.Context) (ImagePinInventory, 
 				return false, err
 			}
 			defer unlock()
-			return locked.collectLeasePins(lease, byLease[lease], protected)
+			return locked.collectLeasePins(lease, byLease[lease], protected, &unpinned)
 		}()
 		if err != nil {
 			return ImagePinInventory{}, err
 		}
 		complete = complete && leaseComplete
 	}
-	return ImagePinInventory{images: protected, complete: complete}, nil
+	return ImagePinInventory{images: protected, complete: complete, unpinned: unpinned}, nil
 }
 
-func (locked *lockedImagePins) collectLeasePins(lease string, pins []ImagePin, protected map[string]bool) (bool, error) {
+func (locked *lockedImagePins) collectLeasePins(lease string, pins []ImagePin, protected map[string]bool, unpinned *imagePinGenerationGaps) (bool, error) {
 	j := locked.journal
-	needed := make(map[string]bool)
+	needed := make(map[string]struct{})
+	required := make(map[imagePinGeneration][]string)
 	complete := true
 	var compensationVersion int
 	unknownGeneration := false
-	add := func(payload []byte, requirePins bool) error {
+	add := func(payload []byte, source imagePinGenerationSource) error {
 		if len(payload) == 0 {
-			unknownGeneration = unknownGeneration || requirePins
+			if source != imagePinInFlight {
+				unknownGeneration = true
+				unpinned.add(source)
+			}
 			return nil
 		}
 		stack, err := manifest.ParseStoredPayload(payload)
@@ -363,9 +402,14 @@ func (locked *lockedImagePins) collectLeasePins(lease string, pins []ImagePin, p
 		if err != nil {
 			return err
 		}
+		var keys []string
 		for _, service := range stack.Services {
 			key := string(imagePinKey(lease, hash, service.Image))
-			needed[key] = needed[key] || requirePins
+			needed[key] = struct{}{}
+			keys = append(keys, key)
+		}
+		if source != imagePinInFlight {
+			required[imagePinGeneration{manifestHash: hash, source: source}] = keys
 		}
 		return nil
 	}
@@ -377,14 +421,14 @@ func (locked *lockedImagePins) collectLeasePins(lease string, pins []ImagePin, p
 		switch head := head.(type) {
 		case operationLeaseMutationHead:
 			if head.claim.entry.State == operationIntentPending {
-				return add(head.claim.Manifest(), false)
+				return add(head.claim.Manifest(), imagePinInFlight)
 			}
 			return nil
 		case maintenanceLeaseMutationHead:
 			compensationVersion = head.claim.SourceRelease().Version()
-			return add(head.claim.TargetRelease().Manifest, false)
+			return add(head.claim.TargetRelease().Manifest, imagePinInFlight)
 		case closeLeaseMutationHead:
-			return add(head.claim.Manifest(), false)
+			return add(head.claim.Manifest(), imagePinInFlight)
 		}
 		return nil
 	}); err != nil {
@@ -400,7 +444,7 @@ func (locked *lockedImagePins) collectLeasePins(lease string, pins []ImagePin, p
 		if release.Status != "active" && release.Version != compensationVersion {
 			continue
 		}
-		if err := add(release.Manifest, true); err != nil {
+		if err := add(release.Manifest, imagePinActive); err != nil {
 			return false, err
 		}
 	}
@@ -412,12 +456,13 @@ func (locked *lockedImagePins) collectLeasePins(lease string, pins []ImagePin, p
 		// Legacy retention can predate recorded manifests. Preserve its images
 		// conservatively; this absence cannot authorize deletion or pin pruning.
 		unknownGeneration = true
+		unpinned.add(imagePinRetained)
 	} else if retained != nil {
 		payload, err := json.Marshal(retained.StackManifest)
 		if err != nil {
 			return false, err
 		}
-		if err := add(payload, true); err != nil {
+		if err := add(payload, imagePinRetained); err != nil {
 			return false, err
 		}
 	}
@@ -425,18 +470,25 @@ func (locked *lockedImagePins) collectLeasePins(lease string, pins []ImagePin, p
 		// Missing historical manifests/source generations cannot authorize pin
 		// pruning even though collection itself is already inhibited.
 		complete = false
+		if !compensationFound {
+			unpinned.add(imagePinActive)
+		}
 		for _, pin := range pins {
 			protected[pin.ImageID] = true
-			needed[string(imagePinKey(pin.LeaseUUID, pin.ManifestHash, pin.Reference))] = true
+			needed[string(imagePinKey(pin.LeaseUUID, pin.ManifestHash, pin.Reference))] = struct{}{}
 		}
 	}
 	present := make(map[string]bool, len(pins))
 	for _, pin := range pins {
 		present[string(imagePinKey(pin.LeaseUUID, pin.ManifestHash, pin.Reference))] = true
 	}
-	for key, required := range needed {
-		if required && !present[key] {
-			complete = false
+	for generation, keys := range required {
+		for _, key := range keys {
+			if !present[key] {
+				complete = false
+				unpinned.add(generation.source)
+				break
+			}
 		}
 	}
 	var obsolete [][]byte

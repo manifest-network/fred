@@ -59,9 +59,18 @@ func TestDeprovisionEmptyInventoryPreservesUnknownLaunch(t *testing.T) {
 				require.True(t, shared.IsLifecyclePending(retryErr))
 			case "journal reopen":
 				require.Error(t, closeErr, "initial uncertainty must retain a retry owner")
+				oldActor := h.b.actorFor(h.leaseUUID)
+				oldLineage := h.b.recoveryCoordinator.Lineage()
 				h.reopen()
+				select {
+				case <-oldActor.Done():
+				default:
+					t.Fatal("reopened journals must not retain actors from the old recovery lineage")
+				}
+				require.False(t, oldLineage == h.b.recoveryCoordinator.Lineage(), "restart constructs a distinct recovery lineage")
 				bindBackendTestCloseExecutor(t, h.b, h.b.closeSettlement)
 				require.NoError(t, h.b.recoverState(ctx), "a pending close is a lease-local startup deferral")
+				require.NotSame(t, oldActor, h.b.actorFor(h.leaseUUID))
 				recoveredErr := h.b.Deprovision(ctx, h.leaseUUID)
 				require.ErrorIs(t, recoveredErr, shared.ErrVolumeLaunchUnsettled)
 				require.True(t, shared.IsLifecyclePending(recoveredErr))

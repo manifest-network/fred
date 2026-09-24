@@ -184,43 +184,27 @@ func main() {
 	}
 	defer listener.Close()
 
-	// Start backend only after the marker and Docker substrate match.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := b.Start(ctx); err != nil {
-		cancel()
-		logger.Error("failed to start backend", "error", err)
-		os.Exit(1)
-	}
-	cancel()
-
 	// Setup HTTP server
 	httpServer := &http.Server{
 		Addr:         cfg.ListenAddr,
-		Handler:      server.Handler(),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
 		TLSConfig:    tlsServerConfig, // nil => plaintext HTTP
 	}
 
-	// Start HTTP server
-	serverErr := make(chan error, 1)
-	go func() {
-		var serveErr error
-		if tlsServerConfig != nil {
-			logger.Info("starting HTTPS server", "addr", cfg.ListenAddr,
-				"mtls", cfg.TLSClientCAFile != "", "pinned_names", len(cfg.TLSClientAllowedNames))
-			// The cert/key live in tlsServerConfig.Certificates (loaded by
-			// tlsconfig.ServerConfig), so the file arguments are empty.
-			serveErr = httpServer.ServeTLS(listener, "", "")
-		} else {
-			logger.Info("starting HTTP server", "addr", cfg.ListenAddr)
-			serveErr = httpServer.Serve(listener)
-		}
-		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			serverErr <- serveErr
-		}
-	}()
+	// Serve a startup response while storage recovery runs. Only a successful
+	// Start publishes the identity-bound runtime handler.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	serverErr, err := serveStartingBackend(ctx, listener, httpServer, server.Handler(), b)
+	cancel()
+	if err != nil {
+		logger.Error("failed to start backend", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("backend HTTP server ready", "addr", cfg.ListenAddr,
+		"tls", tlsServerConfig != nil, "mtls", cfg.TLSClientCAFile != "",
+		"pinned_names", len(cfg.TLSClientAllowedNames))
 
 	// Wait for an operator signal, listener failure, or a terminal storage
 	// authority withdrawal. The last case must return a non-zero process status:

@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -189,7 +190,11 @@ func testImageCapacityAggregatorCachedRollout(t *testing.T, warmLeases int) {
 		return response, nil
 	})
 	t.Cleanup(unblock)
-	for ref, fixture := range map[string]v1.Image{"registry.example/cold:latest": cold, "registry.example/warm:latest": warm} {
+	fixtures := map[string]v1.Image{"registry.example/warm:latest": warm}
+	for index := range maxImageStages {
+		fixtures[fmt.Sprintf("registry.example/cold%d:latest", index)] = cold
+	}
+	for ref, fixture := range fixtures {
 		tag, err := name.NewTag(ref)
 		require.NoError(t, err)
 		require.NoError(t, remote.Write(tag, fixture, remote.WithContext(t.Context()), remote.WithTransport(transport)))
@@ -200,7 +205,7 @@ func testImageCapacityAggregatorCachedRollout(t *testing.T, warmLeases int) {
 		lease := uuid.NewString()
 		tenants[lease] = "one-on-chain-aggregator"
 		if index < maxImageStages {
-			refs[lease] = "registry.example/cold:latest"
+			refs[lease] = fmt.Sprintf("registry.example/cold%d:latest", index)
 			coldLeases = append(coldLeases, lease)
 		} else {
 			refs[lease] = "registry.example/warm:latest"

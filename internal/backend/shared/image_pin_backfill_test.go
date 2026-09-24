@@ -51,6 +51,8 @@ func TestImagePinBackfillPublishesOnlyExactActiveMissingPins(t *testing.T) {
 	inventory, err := journal.Collect(t.Context())
 	require.NoError(t, err)
 	require.False(t, inventory.Complete())
+	require.Equal(t, 1, inventory.UnpinnedActiveGenerations())
+	require.Zero(t, inventory.UnpinnedRetainedGenerations())
 	report, err := owner.Sweep(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, ImagePinBackfillReport{PinsAdded: 1}, report)
@@ -62,6 +64,8 @@ func TestImagePinBackfillPublishesOnlyExactActiveMissingPins(t *testing.T) {
 	inventory, err = journal.Collect(t.Context())
 	require.NoError(t, err)
 	require.True(t, inventory.Complete())
+	require.Zero(t, inventory.UnpinnedActiveGenerations(), "verified backfill resolves the exact missing active generation")
+	require.Zero(t, inventory.UnpinnedRetainedGenerations())
 	require.False(t, inventory.CanRemove(inspectionJournalTestImage))
 	require.True(t, inventory.CanRemove("sha256:"+strings.Repeat("c", 64)))
 	// Reconstruct the owner over the open journals. Existing pins cannot be

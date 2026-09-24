@@ -35,6 +35,7 @@ func TestLifecyclePendingRequiresExactUnavailableEnvelope(t *testing.T) {
 				if operation == "deprovision" {
 					err = client.Deprovision(t.Context(), "lease")
 					require.False(t, DeprovisionNotDispatched(client, "lease", err))
+					require.False(t, DeprovisionLifecyclePending(client, "lease", err))
 				} else {
 					var outcome MaintenanceCallOutcome
 					if operation == "restart" {

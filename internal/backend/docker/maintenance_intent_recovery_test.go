@@ -360,6 +360,17 @@ func (h *maintenanceRecoveryHarness) appendTarget(bind bool) {
 
 func (h *maintenanceRecoveryHarness) reopen() {
 	h.t.Helper()
+	// Reopening the journals also creates a new recovery-coordinator lineage.
+	// Model the process boundary first: an old actor must never survive with
+	// constructor-bound authority over the replaced journal/coordinator pair.
+	// In particular, requested-close ownership intentionally prevents periodic
+	// recovery from retiring that actor merely because its worker has drained.
+	h.b.stopCancel()
+	h.b.wg.Wait()
+	h.b.actorsMu.Lock()
+	remainingActors := len(h.b.actors)
+	h.b.actorsMu.Unlock()
+	require.Zero(h.t, remainingActors, "journal reopen requires the previous actor lifecycle to drain")
 	require.NoError(h.t, h.callbacks.Close())
 	require.NoError(h.t, h.releases.Close())
 	require.NoError(h.t, h.retentions.Close())
@@ -396,6 +407,7 @@ func (h *maintenanceRecoveryHarness) reopen() {
 	h.b.storageIdentity = storage.ID()
 	h.b.storageAuthority = storage
 	h.b.storageVerifier = testDockerRuntimeStorageVerifier{id: storage.ID()}
+	h.b.stopCtx, h.b.stopCancel = context.WithCancel(context.Background())
 	require.NoError(h.t, bindBackendTestPhysicalExecutors(
 		h.t, h.b, h.operations, h.b.maintenanceSettlement,
 	))

@@ -108,7 +108,8 @@ type loaderLifetime struct {
 
 // An admitted import owns its own deadline from dispatch. Tenant cancellation
 // cannot truncate an accepted exchange, but a hung daemon cannot occupy its
-// staging and allocation forever. This matches the default image pull budget.
+// staging and allocation forever. This independent completion ceiling starts
+// at dispatch; it is separate from the configurable registry pull timeout.
 const importCompletionTimeout = 30 * time.Minute
 
 // Shutdown closes admission and lets admitted exchanges finish within the
@@ -359,6 +360,26 @@ func (a *ImportAdmission) Close() error {
 	return state.finish(true)
 }
 
+// CancelBeforeDispatch consumes this exact admission and proves it cannot issue
+// a daemon request. A copied capability cannot race a later dispatch past this
+// check. False means the admission already dispatched or was consumed; an error
+// means allocation release could not be proven. Neither permits replacement work.
+func (a *ImportAdmission) CancelBeforeDispatch() (bool, error) {
+	if a == nil || a.state == nil {
+		return false, errors.New("invalid image import admission")
+	}
+	state := a.state
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.dispatched || state.finished {
+		return false, nil
+	}
+	if err := state.finish(true); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Import is the combined reservation and dispatch convenience boundary.
 func (l *Loader) Import(ctx context.Context, p *Prepared) (Imported, error) {
 	admission, err := l.ReserveImport(ctx, p)
@@ -400,6 +421,9 @@ func (l *Loader) ImportAdmitted(ctx context.Context, admission *ImportAdmission)
 	// even when the tenant closes its lease or its pull deadline expires.
 	work, cancel := context.WithTimeout(l.life.shutdown, importCompletionTimeout)
 	defer cancel()
+	finishObservation := observeImport(work)
+	success := false
+	defer func() { finishObservation(success) }()
 	reader, writer := io.Pipe()
 	written := make(chan error, 1)
 	go func() { err := writeArchive(work, writer, state.blobs); _ = writer.CloseWithError(err); written <- err }()
@@ -432,6 +456,7 @@ func (l *Loader) ImportAdmitted(ctx context.Context, admission *ImportAdmission)
 	if err != nil {
 		return Imported{}, fmt.Errorf("import verified image: %w", err)
 	}
+	success = true
 	return state.imported, nil
 }
 

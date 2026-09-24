@@ -278,6 +278,12 @@ treats this exact envelope as a successful
 availability observation while preserving the unresolved request. It grants no
 refusal, no-dispatch, immediate replay, or completed-cleanup authority. Generic
 conflicts, corrupt journals and invalid execution evidence remain server errors.
+For `/deprovision`, only the identity-bound client’s exact response for that
+lease grants a lifecycle deferral to the bounded close scheduler. It preserves
+any in-flight operation and retries with newly acquired ownership; a wrapped
+or replayed diagnostic from another client, lease or endpoint grants no such
+deferral. The actor latches close ownership before canceling its worker, so a
+late canceled result cannot be published as an unrelated execution failure.
 The distinct `503` also keeps older clients conservative: a maintenance `409`
 would incorrectly promise a definitive invalid-state refusal.
 

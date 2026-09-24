@@ -186,6 +186,70 @@ func TestImagePinUnassignedDebtCannotMintAnotherShareAfterReopen(t *testing.T) {
 	require.NoError(t, pinAccountingImage(t, journal, otherOrigin, 0), "only positive orphan pruning frees the unknown debt")
 }
 
+func TestImagePinStartedAttributionTransfersLegacyDebtWithoutSpendingAnotherShare(t *testing.T) {
+	stores := openOperationHandoffStores(t, "image-pin-positive-attribution")
+	legacy := testOperationIntentSpec(t, "legacy-pins-without-principal")
+	seedHistoricalPinRows(t, stores, legacy.LeaseUUID, maxTenantImagePins, legacy.Manifest, "example.invalid/app:1")
+	journal, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
+	require.NoError(t, err)
+	require.Equal(t, maxTenantImagePins, journal.accounting.unassigned)
+	other := testOperationIntentSpec(t, "attribution-other-tenant")
+	other.Tenant = "tenant-b"
+	otherOrigin := startedPinAccountingOrigin(t, stores, other)
+	require.ErrorContains(t, pinAccountingImage(t, journal, otherOrigin, 0), "ownership remains unassigned")
+	owner := startedPinAccountingOrigin(t, stores, legacy)
+	require.NoError(t, pinAccountingImage(t, journal, owner, 64<<20), "exact Started reuse positively binds the historical lease's durable principal")
+	require.NoError(t, pinAccountingImage(t, journal, otherOrigin, 0), "attributed debt must no longer consume unrelated principals' capacity")
+	freshOwner := startedPinAccountingOrigin(t, stores, testOperationIntentSpec(t, "attribution-owner-still-full"))
+	require.ErrorContains(t, pinAccountingImage(t, journal, freshOwner, 0), "tenant capacity", "attribution transfers the charge instead of dropping it")
+	require.Zero(t, journal.accounting.unassigned)
+	require.Equal(t, maxTenantImagePins, journal.accounting.tenants[legacy.Tenant])
+	require.Equal(t, 1, journal.accounting.tenants[other.Tenant])
+	require.Equal(t, maxTenantImagePins+1, journal.accounting.total)
+}
+
+func TestImagePinBackfillRejectsChangedDurableLeasePrincipal(t *testing.T) {
+	for _, changed := range []string{"tenant", "provider"} {
+		t.Run(changed, func(t *testing.T) {
+			stores := openOperationHandoffStores(t, "image-pin-principal-"+changed)
+			original := testOperationIntentSpec(t, "image-pin-original-principal-"+changed)
+			appendPinAccountingRelease(t, stores, original)
+			seedHistoricalPinRows(t, stores, original.LeaseUUID, 1, original.Manifest, "example.invalid/app:1")
+			journal, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
+			require.NoError(t, err)
+			// Model contradictory durable history appearing after the journal
+			// loaded. Physical evidence of a new active image cannot transfer
+			// the existing lease's pin ownership to another principal.
+			contradictory := testOperationIntentSpec(t, "image-pin-changed-principal-"+changed)
+			contradictory.LeaseUUID = original.LeaseUUID
+			contradictory.Manifest = []byte(`{"services":{"app":{"image":"example.invalid/app:2"}}}`)
+			if changed == "tenant" {
+				contradictory.Tenant = "tenant-b"
+			} else {
+				contradictory.ProviderUUID = testLeaseUUID("image-pin-another-provider")
+			}
+			appendPinAccountingRelease(t, stores, contradictory)
+			backfiller, err := NewImagePinBackfiller(journal, imagePinObserverFunc(func(_ context.Context, subject ImagePinBackfillSubject) ([]ImagePinBackfillObservation, error) {
+				require.Equal(t, contradictory.Manifest, subject.Release().Manifest)
+				return []ImagePinBackfillObservation{{Reference: "example.invalid/app:2", ImageID: imagePinTarget,
+					Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}}}, nil
+			}))
+			require.NoError(t, err)
+			report, err := backfiller.Sweep(t.Context())
+			require.ErrorContains(t, err, "principal differs from its durable lease")
+			require.Zero(t, report.PinsAdded)
+			pin, err := journal.Lookup(original.LeaseUUID, contradictory.Manifest, "example.invalid/app:2")
+			require.NoError(t, err)
+			require.Nil(t, pin, "principal mismatch must roll back the attempted pin")
+			pins, err := journal.List()
+			require.NoError(t, err)
+			require.Len(t, pins, 1)
+			require.Equal(t, 1, journal.accounting.total)
+			require.Equal(t, 1, journal.accounting.tenants[original.Tenant])
+		})
+	}
+}
+
 func TestImagePinCallbackAliasesShareBackfillAdmissionAndRollbackCounts(t *testing.T) {
 	stores := openOperationHandoffStores(t, "image-pin-aliases")
 	spec := testOperationIntentSpec(t, "near-cap")

@@ -831,7 +831,10 @@ imports instead belong to the loader lifetime and continue through tenant
 cancellation, with a 30-minute ceiling from dispatch and the backend-worker
 drain allowance on shutdown. A close cancels the workflow and immediately returns
 typed, breaker-neutral `503 lifecycle_pending` while its owned worker remains
-active; later retries can acquire exclusive teardown after that worker drains.
+active. The close command takes settlement ownership before cancellation;
+late worker messages cannot publish a failure or admit another mutation over
+that handoff. Provider close events defer through the bounded scheduler, and
+later retries can acquire exclusive teardown after that worker drains.
 
 ### Image admission
 
@@ -841,6 +844,13 @@ import those exact bytes once. Shared-filesystem deployments keep their layout;
 classic `overlay2` uses the default `DockerRootDir/tmp` import staging, while
 containerd `overlayfs` additionally requires its actual `image_data_path`.
 External `DOCKER_TMPDIR` overrides are outside the supported space model.
+
+Concurrent preparations of one immutable source reference and selected platform
+share one download/import flight. A private leader owns staging and completion;
+followers receive only verified image evidence and obtain their own execution
+and pin authority. Membership survives import through per-lease pin publication.
+A canceled follower leaves independently. Only positive pre-dispatch evidence
+permits leader replacement; an uncertain dispatched result remains shared.
 
 The Started operation or maintenance subject supplies the tenant for an opaque
 preparation capability. Pinned and locally reusable image preparation never

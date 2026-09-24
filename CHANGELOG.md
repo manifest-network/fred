@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `fred_docker_backend_image_import_total{outcome}` distinguishes completed
+  imports from loader deadline and shutdown expiry.
+  `fred_docker_backend_image_unpinned_generations{kind}` separates incomplete
+  active pins from expected legacy retention inhibition. (ENG-1052)
+
 - Provider-to-Docker health probes now correlate slow or failed HTTP requests
   through a validated `X-Fred-Health-Probe` diagnostic ID and completion logs
   with bounded stage timings. Docker also logs fast successful completions at
@@ -230,6 +235,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   any increase is still a bug requiring investigation. (ENG-632)
 
 ### Changed
+
+- Closing a lease while its worker drains returns breaker-neutral
+  `503 lifecycle_pending`. Provider close events defer through the bounded
+  scheduler; the actor keeps close ownership so canceled work settles as
+  preempted by lease close. Docker-backend shares one 75-second shutdown budget
+  across HTTP and worker drain. Admitted image imports have a separate
+  30-minute ceiling from dispatch, shortened by shutdown. For planned stops,
+  quiesce mutations and wait for outstanding import allocation to reach zero.
+  The bound listener answers 503 until backend startup succeeds. (ENG-1052)
+
+- Concurrent cold preparations of one immutable image source and platform now
+  share a verified download/import. Followers consume no staging slot and
+  retain independent lease pin authority; cancellation cannot release another
+  preparation’s import ownership. Cache/local reuse is checked again after
+  queue admission. (ENG-1052)
 
 - Image downloads share four staging slots. A sole tenant can use all four;
   waiting tenants with fewer active downloads receive the next available slot,
@@ -814,18 +834,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Closing a lease with an actor-owned mutation still draining returns immediate,
-  breaker-neutral `503 lifecycle_pending`, including during a loader-owned
-  image import. Retry independently checks the worker barrier before teardown.
-  Maintenance recovery selects candidates from a compact committed projection
+- Maintenance recovery selects candidates from a compact committed projection
   before decoding only selected receipts. Periodic pin pruning progresses
   during downloads, while image deletion continues to protect active work.
   Pin accounting writes require the journal's scoped lock owner. (ENG-1052)
 
-- Docker-backend shutdown shares a 75-second budget across HTTP and backend
-  draining, fitting existing 90-second service stop allowances. TLS validation
-  and listener binding precede startup image-pin backfill. Historical manifest
-  replay compares instance topology independently of previously effective
+- TLS validation and listener binding precede startup image-pin backfill.
+  Historical manifest replay compares instance topology independently of
+  previously effective
   custom-domain routing, while binding the exact newly admitted request to its
   journal-owned replay authority. (ENG-1052, ENG-1055)
 

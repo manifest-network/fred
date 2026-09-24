@@ -462,8 +462,9 @@ volume_mount_path: "/var/lib/fred/volumes"
 provision_timeout: 10m
 
 # Timeout for registry fetch and image verification. Default: 5m.
-# Once admitted, Docker import drains under a separate 10m bound even if this
-# caller is canceled. Unproven completion keeps its durable allocation charged.
+# Once admitted, Docker import has a separate 30m ceiling measured from dispatch,
+# even if this caller is canceled. Shutdown can shorten its remaining budget.
+# Unproven completion keeps its durable allocation charged.
 image_pull_timeout: 5m
 
 # Budget for the complete initial managed-volume storage-identity proof, not

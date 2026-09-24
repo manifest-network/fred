@@ -2442,12 +2442,28 @@ func TestRestore_PartitionSurvivesLineage(t *testing.T) {
 	// The orig record is gone (deleted on successful restore); the partition is NOT
 	// carried in any record — it survives only because the manifest carries the label.
 	finalizeRestoreRetentionForTest(t, b, rs, orig)
+	closingActor := b.actorFor(newLease)
 	require.NoError(t, b.Deprovision(context.Background(), newLease))
 	require.Eventually(t, func() bool {
 		newRec, gerr := rs.Get(newLease)
 		return gerr == nil && newRec != nil && newRec.Partition == "cust-a"
 	}, 5*time.Second, 50*time.Millisecond,
 		"the restored lease's close must re-extract the same partition from the carried manifest")
+	select {
+	case <-closingActor.Done():
+	case <-time.After(time.Second):
+		t.Fatal("retained close must retire its actor and its close settlement latch")
+	}
+	const successor = "ffffffff-0000-4000-8000-000000000002"
+	require.NoError(t, b.Restore(t.Context(), restoreRequest(successor, newLease, server.URL+"/callbacks/provision")))
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		p := b.provisions[successor]
+		return p != nil && p.Status == backend.ProvisionStatusReady
+	}, 5*time.Second, 20*time.Millisecond, "close ownership cannot suppress the next restored generation's completion")
+	require.NotSame(t, closingActor, b.actorFor(successor))
+	finalizeRestoreRetentionForTest(t, b, rs, newLease)
 
 	b.stopCancel()
 	b.wg.Wait()

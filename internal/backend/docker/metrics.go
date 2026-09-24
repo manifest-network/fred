@@ -179,6 +179,10 @@ var (
 		Namespace: metricsNamespace, Subsystem: metricsSubsystem,
 		Name: "image_import_pending_bytes", Help: "Durable outstanding image import allocation, including unknown completion",
 	})
+	imageUnpinnedGenerations = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace, Subsystem: metricsSubsystem,
+		Name: "image_unpinned_generations", Help: "Required manifest generations with missing image pins by durable authority kind",
+	}, []string{"kind"})
 	// provisionsTotal tracks the total number of provision attempts by outcome.
 	provisionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
@@ -1017,6 +1021,9 @@ var restoreOutcomes = []string{"success", "failure"}
 var quotaBackfillOutcomes = []string{"applied", "failed"}
 
 func init() {
+	for _, kind := range []string{"active", "retained"} {
+		imageUnpinnedGenerations.WithLabelValues(kind).Set(0)
+	}
 	for _, outcome := range []string{"busy", "inhibited", "shared", "below_threshold", "removed", "error", "panic"} {
 		imageGCTotal.WithLabelValues(outcome).Add(0)
 	}

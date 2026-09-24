@@ -2102,7 +2102,7 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 				return nil, err
 			}
 			if code == CodeLifecyclePending {
-				return nil, &lifecyclePendingResponse{}
+				return nil, &deprovisionLifecyclePendingResponse{client: c, leaseUUID: leaseUUID}
 			}
 			return nil, fmt.Errorf("deprovision returned unknown unavailable code %q", code)
 		}
