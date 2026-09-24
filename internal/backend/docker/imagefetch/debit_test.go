@@ -3,11 +3,15 @@ package imagefetch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
@@ -37,29 +41,70 @@ func (d *coordinatedImporter) ImageLoad(ctx context.Context, input io.Reader, _ 
 
 func TestImportOwnsCompletionAfterCallerCancellation(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
-	daemon := &coordinatedImporter{arrivals: make(chan context.Context, 1), results: make(chan error, 1)}
-	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
-	require.NoError(t, err)
-	p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, p.Close()) }()
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	finished := make(chan error, 1)
-	go func() { _, err := loader.Import(ctx, p); finished <- err }()
-	work := <-daemon.arrivals
-	pending, err := loader.PendingBytes()
-	require.NoError(t, err)
-	require.Equal(t, p.ImportBytes(), pending)
-	cancel()
-	require.NoError(t, work.Err(), "caller cancellation cannot detach Docker extraction from its admission owner")
-	_, bounded := work.Deadline()
-	require.False(t, bounded, "uncanceled work has no artificial import deadline")
-	daemon.results <- nil
-	require.NoError(t, <-finished)
-	pending, err = loader.PendingBytes()
-	require.NoError(t, err)
-	require.Zero(t, pending)
+	transport := f.server.Client().Transport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	stage := t.TempDir()
+	synctest.Test(t, func(t *testing.T) {
+		daemon := &coordinatedImporter{arrivals: make(chan context.Context, 1), results: make(chan error, 1)}
+		loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(transport))
+		require.NoError(t, err)
+		p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, p.Close()) }()
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		finished := make(chan error, 1)
+		go func() { _, err := loader.Import(ctx, p); finished <- err }()
+		work := <-daemon.arrivals
+		pending, err := loader.PendingBytes()
+		require.NoError(t, err)
+		require.Equal(t, p.ImportBytes(), pending)
+		cancel()
+		time.Sleep(31 * time.Second)
+		synctest.Wait()
+		require.NoError(t, work.Err(), "tenant cancellation must not impose the former 30-second completion deadline")
+		_, bounded := work.Deadline()
+		require.False(t, bounded, "admitted import lifetime belongs to its loader")
+		daemon.results <- nil
+		require.NoError(t, <-finished)
+		pending, err = loader.PendingBytes()
+		require.NoError(t, err)
+		require.Zero(t, pending)
+		require.NoError(t, loader.Shutdown(t.Context()))
+	})
+}
+
+func TestCanceledImportAdmissionNeverDispatchesAndReleasesDebit(t *testing.T) {
+	f := newRegistry(t, layerTar(t, []byte("content")))
+	for _, cancelAfterReservation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reserved=%t", cancelAfterReservation), func(t *testing.T) {
+			daemon := &recordingImporter{}
+			loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+			require.NoError(t, err)
+			prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
+			require.NoError(t, err)
+			defer prepared.Close()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if cancelAfterReservation {
+				admitted, err := loader.ReserveImport(ctx, prepared)
+				require.NoError(t, err)
+				cancel()
+				_, err = loader.ImportAdmitted(ctx, admitted)
+				require.ErrorIs(t, err, context.Canceled)
+				require.NoError(t, admitted.Close())
+			} else {
+				cancel()
+				_, err = loader.Import(ctx, prepared)
+				require.ErrorIs(t, err, context.Canceled)
+			}
+			pending, err := loader.PendingBytes()
+			require.NoError(t, err)
+			require.Zero(t, pending)
+			require.Zero(t, daemon.loads)
+			require.NoError(t, loader.Shutdown(t.Context()))
+		})
+	}
 }
 
 func TestOutstandingImportDebitSurvivesReopenAndUnknownCompletion(t *testing.T) {

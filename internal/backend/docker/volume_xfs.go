@@ -1970,6 +1970,7 @@ func (x *xfsVolumeManager) ensureVolumeRootProject(
 	if attr.ProjectID == projID && attr.XFlags&linuxFSXFlagProjInherit != 0 {
 		return nil
 	}
+	previousProjectID, previousFlags := attr.ProjectID, attr.XFlags
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1984,6 +1985,9 @@ func (x *xfsVolumeManager) ensureVolumeRootProject(
 		return fmt.Errorf("xfs root project setup for %s did not establish project %d with inheritance (id=%d, xflags=%#x)",
 			dirPath, projID, attr.ProjectID, attr.XFlags)
 	}
+	x.logger.Warn("repaired xfs volume root project attributes; descendants require offline verification",
+		"path", dirPath, "project_id", projID,
+		"previous_project_id", previousProjectID, "previous_xflags", previousFlags)
 	return nil
 }
 

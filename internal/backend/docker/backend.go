@@ -2524,17 +2524,6 @@ func (b *Backend) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to recover state: %w", err)
 	}
-	if b.imageCapacity != nil && b.imageCapacity.backfiller != nil {
-		backfillCtx, cancelBackfill := b.startupPhaseContext(startupCtx)
-		report, err := b.imageCapacity.backfiller.Sweep(backfillCtx)
-		cancelBackfill()
-		if err != nil || report.UnresolvedLeases != 0 {
-			b.logger.Warn("legacy image pin backfill incomplete; image collection remains conservative",
-				"pins_added", report.PinsAdded, "unresolved_leases", report.UnresolvedLeases, "error", err)
-		} else if report.PinsAdded != 0 {
-			b.logger.Info("backfilled immutable image pins from existing containers", "pins_added", report.PinsAdded)
-		}
-	}
 	// Pending operation recovery is the sole owner of the write-ahead window.
 	// Run it before retention reconciliation: a Restoring finalizer must not read
 	// one empty/transitional Docker snapshot as rollback authority while an exact
@@ -2607,6 +2596,20 @@ func (b *Backend) Start(ctx context.Context) error {
 	cancelFinalIdentity()
 	if err != nil {
 		return fmt.Errorf("storage identity lost during startup recovery: %w", err)
+	}
+	// The optional pin extension is a downgrade boundary. Populate it only
+	// after every fatal startup check has succeeded, so a refused first start
+	// leaves a pre-upgrade callback journal readable by the previous binary.
+	if b.imageCapacity != nil && b.imageCapacity.backfiller != nil {
+		backfillCtx, cancelBackfill := b.startupPhaseContext(startupCtx)
+		report, err := b.imageCapacity.backfiller.Sweep(backfillCtx)
+		cancelBackfill()
+		if err != nil || report.UnresolvedLeases != 0 {
+			b.logger.Warn("legacy image pin backfill incomplete; image collection remains conservative",
+				"pins_added", report.PinsAdded, "unresolved_leases", report.UnresolvedLeases, "error", err)
+		} else if report.PinsAdded != 0 {
+			b.logger.Info("backfilled immutable image pins from existing containers", "pins_added", report.PinsAdded)
+		}
 	}
 	b.callbackStore.StartMaintenance()
 	b.releaseStore.StartMaintenance()
@@ -2725,10 +2728,15 @@ func (b *Backend) Stop() error {
 func (b *Backend) waitForShutdownDrain() error {
 	b.shutdownWaitOnce.Do(func() {
 		b.shutdownWaitDone = make(chan struct{})
+		drainCtx, cancel := context.WithTimeout(context.Background(), cmp.Or(b.shutdownDrainTimeout, defaultShutdownDrainTimeout))
 		go func() {
+			defer cancel()
 			if b.imageCapacity != nil && b.imageCapacity.loader != nil {
-				// Close import admission and start the same bounded completion
-				// grace used by daemon launches before draining workers/stores.
+				// Admitted imports own their completion independently of tenant
+				// cancellation, with the same drain deadline as the backend.
+				_ = b.imageCapacity.loader.Shutdown(drainCtx)
+				// A timed-out SDK call may still be unwinding. The waiter must
+				// retain dependencies until the loader actually releases its owners.
 				_ = b.imageCapacity.loader.Shutdown(context.Background())
 			}
 			b.wg.Wait()

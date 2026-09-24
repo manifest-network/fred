@@ -610,12 +610,21 @@ func maintenanceRecoveryBatch(
 			start = 0
 		}
 	}
-	count := min(limit, len(ordered))
-	batch := make([]maintenanceRecoveryEntry, 0, count)
-	for offset := range count {
-		batch = append(batch, ordered[(start+offset)%len(ordered)])
+	// Exact completions need local payload finalization, not another backend
+	// attempt. A callback wake must cover those commands even when its lease
+	// falls outside the rotating network-retry batch. Preserve rotation within
+	// both sets so the lane deadline still yields fair progress across passes.
+	confirmed := make([]maintenanceRecoveryEntry, 0)
+	retry := make([]maintenanceRecoveryEntry, 0, min(limit, len(ordered)))
+	for offset := range len(ordered) {
+		entry := ordered[(start+offset)%len(ordered)]
+		if entry.claim.command.phase == maintenancePayloadConfirmed {
+			confirmed = append(confirmed, entry)
+		} else if len(retry) < limit {
+			retry = append(retry, entry)
+		}
 	}
-	return batch
+	return append(confirmed, retry...)
 }
 
 // RecoverPending owns recovery selection, exact reauthorization, backend

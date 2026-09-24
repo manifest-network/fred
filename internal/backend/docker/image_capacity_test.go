@@ -389,7 +389,7 @@ func TestImageCapacityRecoversMissingPinByDigestWithoutResolvingTag(t *testing.T
 		return image.InspectResponse{ID: id, Size: imageMiB}, nil
 	}
 	pin := &shared.ImagePin{ImageID: id, PullDigest: pullDigest, Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}}
-	resolved, err := m.resolveImage(t.Context(), ref, pin, true)
+	resolved, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, pin, true)
 	require.NoError(t, err)
 	require.Equal(t, id, resolved.image.ID())
 	require.Equal(t, ref, resolved.image.Reference())
@@ -458,7 +458,7 @@ func TestImageCapacityLegacyContainerdPinReingestsToEstablishAllowance(t *testin
 		return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, nil
 	}, imagefetch.WithRegistryTransport(server.Client().Transport))
 	pin := &shared.ImagePin{ImageID: id, PullDigest: pullDigest, Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}}
-	resolved, err := m.resolveImage(t.Context(), ref, pin, false)
+	resolved, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, pin, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, imports, "a cached legacy manifest still needs verified preparation and import before deferred unpack")
 	require.Equal(t, id, resolved.image.ID())
@@ -491,7 +491,7 @@ func TestImageCapacityVerifiedContainerdPinNeedsNoRegistry(t *testing.T) {
 		ImageID: id, PullDigest: strings.TrimSuffix(ref, ":latest") + "@" + id,
 		Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}, ImportBytes: 3 * imageMiB,
 	}
-	resolved, err := m.resolveImage(t.Context(), ref, pin, false)
+	resolved, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, pin, false)
 	require.NoError(t, err)
 	require.Equal(t, id, resolved.image.ID())
 	require.Equal(t, ref, resolved.image.Reference())
@@ -522,7 +522,7 @@ func TestImageCapacityRechecksImportHeadroomAfterVerifiedStage(t *testing.T) {
 				_, err := io.Copy(io.Discard, input)
 				return image.LoadResponse{}, errors.Join(err, errors.New("unexpected daemon import"))
 			}, imagefetch.WithRegistryTransport(server.Client().Transport))
-			_, err = m.resolveImage(t.Context(), ref, nil, true)
+			_, err = m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, nil, true)
 			require.ErrorContains(t, err, "image import admission: "+fullPath)
 			require.False(t, imported, "verified bytes must not reach Docker without their import allocation")
 			staged, err := os.ReadDir(m.stageRoot)
@@ -547,7 +547,7 @@ func TestImageCapacityOutstandingImportDebitBlocksNextDownloadOnSharedFilesystem
 		_, err := io.Copy(io.Discard, input)
 		return image.LoadResponse{}, errors.Join(err, errors.New("lost daemon completion"))
 	}, imagefetch.WithRegistryTransport(server.Client().Transport))
-	_, err = m.ingest(t.Context(), ref, ref)
+	_, err = m.ingest(t.Context(), imageTenantPreparationForTest(t, m), ref, ref)
 	require.ErrorContains(t, err, "lost daemon completion")
 	pending, err := m.loader.PendingBytes()
 	require.NoError(t, err)
@@ -562,7 +562,7 @@ func TestImageCapacityOutstandingImportDebitBlocksNextDownloadOnSharedFilesystem
 		fs[path] = capacity
 	}
 	require.NoError(t, m.headroom(t.Context(), false), "the ordinary floor and outstanding import fit without a new download")
-	_, err = m.ingest(t.Context(), ref, ref)
+	_, err = m.ingest(t.Context(), imageTenantPreparationForTest(t, m), ref, ref)
 	require.ErrorContains(t, err, "image import admission:")
 	require.ErrorContains(t, err, m.stageRoot, "the new staging allowance must be charged together with pending imports before registry body download")
 	require.Equal(t, 1, imports)
@@ -587,11 +587,11 @@ func TestImageCapacityPreservesPreviouslyLocalOversizedImage(t *testing.T) {
 		removed = true
 		return nil, nil
 	}
-	_, err := m.resolveImage(t.Context(), "registry.example/app:1", nil, false)
+	_, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), "registry.example/app:1", nil, false)
 	require.NoError(t, err)
 	require.False(t, removed)
 	removed = false
-	_, err = m.resolveImage(t.Context(), "registry.example/app:1", &shared.ImagePin{
+	_, err = m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), "registry.example/app:1", &shared.ImagePin{
 		ImageID: id, Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"},
 	}, false)
 	require.NoError(t, err)

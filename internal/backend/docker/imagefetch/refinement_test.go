@@ -239,15 +239,17 @@ func TestLoaderShutdownOwnsImportGraceAndUnknownDebit(t *testing.T) {
 		synctest.Wait()
 		require.NoError(t, work.Err())
 		drained := make(chan error, 1)
-		go func() { drained <- loader.Shutdown(t.Context()) }()
+		drainCtx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+		defer cancel()
+		go func() { drained <- loader.Shutdown(drainCtx) }()
 		synctest.Wait()
 		require.NoError(t, work.Err())
-		time.Sleep(29 * time.Second)
+		time.Sleep(89 * time.Second)
 		require.NoError(t, work.Err())
 		time.Sleep(time.Second)
 		synctest.Wait()
 		require.Error(t, <-imported)
-		require.NoError(t, <-drained)
+		require.ErrorIs(t, <-drained, context.DeadlineExceeded)
 		require.ErrorIs(t, work.Err(), context.Canceled)
 		pending, err := loader.PendingBytes()
 		require.NoError(t, err)
@@ -255,6 +257,38 @@ func TestLoaderShutdownOwnsImportGraceAndUnknownDebit(t *testing.T) {
 		unknown, err := loader.UnknownBytes()
 		require.NoError(t, err)
 		require.Equal(t, pending, unknown)
+		require.NoError(t, loader.Shutdown(t.Context()), "subsequent shutdown observes the actual completed unwind")
+	})
+}
+
+func TestLoaderShutdownAllowsCompletionWithinBackendDrainBudget(t *testing.T) {
+	f := newRegistry(t, layerTar(t, []byte("content")))
+	transport := f.server.Client().Transport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	stage := t.TempDir()
+	synctest.Test(t, func(t *testing.T) {
+		daemon := &coordinatedImporter{arrivals: make(chan context.Context, 1), results: make(chan error, 1)}
+		loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(transport))
+		require.NoError(t, err)
+		prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
+		require.NoError(t, err)
+		defer prepared.Close()
+		imported := make(chan error, 1)
+		go func() { _, err := loader.Import(t.Context(), prepared); imported <- err }()
+		work := <-daemon.arrivals
+		drainCtx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+		defer cancel()
+		drained := make(chan error, 1)
+		go func() { drained <- loader.Shutdown(drainCtx) }()
+		synctest.Wait()
+		time.Sleep(75 * time.Second)
+		require.NoError(t, work.Err(), "shutdown must allow the configured backend grace, including completions after 30 seconds")
+		daemon.results <- nil
+		require.NoError(t, <-imported)
+		require.NoError(t, <-drained)
+		pending, err := loader.PendingBytes()
+		require.NoError(t, err)
+		require.Zero(t, pending, "positive daemon completion must settle its debit during shutdown")
 	})
 }
 

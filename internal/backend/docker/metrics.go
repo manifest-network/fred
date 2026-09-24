@@ -1017,7 +1017,7 @@ var restoreOutcomes = []string{"success", "failure"}
 var quotaBackfillOutcomes = []string{"applied", "failed"}
 
 func init() {
-	for _, outcome := range []string{"inhibited", "shared", "below_threshold", "removed", "error", "panic"} {
+	for _, outcome := range []string{"busy", "inhibited", "shared", "below_threshold", "removed", "error", "panic"} {
 		imageGCTotal.WithLabelValues(outcome).Add(0)
 	}
 	for _, branch := range []string{"committed_target", "deploying_target", "cleanup_source", "source_only"} {

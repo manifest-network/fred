@@ -38,6 +38,7 @@ type resolvedManifest struct {
 	named    name.Reference
 	raw      []byte
 	digest   digest.Digest
+	config   digest.Digest
 	platform ocispec.Platform
 	metadata int64
 }
@@ -53,6 +54,17 @@ func (r Resolution) ManifestID() string {
 		return ""
 	}
 	return r.state.digest.String()
+}
+
+// ConfigID identifies the exact image config selected through the verified
+// manifest. Classic Docker can address already-extracted content by this ID
+// even when its repository digests contain only the multi-platform index.
+// It is selection evidence only; the local admitter still validates the image.
+func (r Resolution) ConfigID() string {
+	if r.state == nil {
+		return ""
+	}
+	return r.state.config.String()
 }
 func (r Resolution) Platform() ocispec.Platform {
 	if r.state == nil {
@@ -81,7 +93,14 @@ func (l *Loader) Resolve(ctx context.Context, ref string, platform ocispec.Platf
 	if err != nil {
 		return Resolution{}, err
 	}
-	return Resolution{state: &resolvedManifest{issuer: l, named: named, raw: raw, digest: id, platform: clonePlatform(platform), metadata: metadata}}, nil
+	var manifest ocispec.Manifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return Resolution{}, err
+	}
+	if manifest.SchemaVersion != 2 || validDescriptor(manifest.Config) != nil {
+		return Resolution{}, errors.New("image manifest has no valid config identity")
+	}
+	return Resolution{state: &resolvedManifest{issuer: l, named: named, raw: raw, digest: id, config: manifest.Config.Digest, platform: clonePlatform(platform), metadata: metadata}}, nil
 }
 
 // Prepare performs bounded registry I/O and decompression without extracting

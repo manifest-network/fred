@@ -171,11 +171,8 @@ func TestImagePinJournalCanonicalManifestHash(t *testing.T) {
 func TestImagePinCollectorPrunesObsoleteManifestWhileLeaseRemainsLive(t *testing.T) {
 	stores := openOperationHandoffStores(t, "image-pins-exact-manifest")
 	origin := startedInspectionOrigin(t, stores)
-	journal, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
-	require.NoError(t, err)
 	const ref = "example.invalid/app:1"
 	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
-	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, "", platform, 0))
 	oldHash, err := imagePinManifestHash([]byte(`{"services":{"app":{"image":"example.invalid/app:old"}}}`))
 	require.NoError(t, err)
 	old := ImagePin{
@@ -188,8 +185,15 @@ func TestImagePinCollectorPrunesObsoleteManifestWhileLeaseRemainsLive(t *testing
 	data, err := json.Marshal(old)
 	require.NoError(t, err)
 	require.NoError(t, stores.callbacks.update(func(tx *bolt.Tx) error {
-		return tx.Bucket(imagePinsBucketName).Put(imagePinKey(old.LeaseUUID, old.ManifestHash, old.Reference), data)
+		bucket, err := tx.CreateBucketIfNotExists(imagePinsBucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.Put(imagePinKey(old.LeaseUUID, old.ManifestHash, old.Reference), data)
 	}))
+	journal, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
+	require.NoError(t, err)
+	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, "", platform, 0))
 	inventory, err := journal.Collect(t.Context())
 	require.NoError(t, err)
 	require.True(t, inventory.CanRemove(old.ImageID))

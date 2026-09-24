@@ -101,6 +101,12 @@ func TestStoredPolicyDriftCloseSettlementRecordsRetention(t *testing.T) {
 	created, err := settlement.RecordRetention(claim, "", volumes)
 	require.NoError(t, err, "retention must preserve stored policy instead of parsing it as new tenant input")
 	require.True(t, created)
+	// A retried physical rename reaches retentionEntryMatchesClose on the
+	// existing row. It must compare the admitted historical manifest rather
+	// than reapplying today's tenant policy during cleanup.
+	created, err = settlement.RecordRetention(claim, "", volumes)
+	require.NoError(t, err, "retrying an existing historical retention must keep stored-policy validation")
+	require.True(t, created)
 	entry, err := stores.retentions.Get(spec.LeaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, entry)

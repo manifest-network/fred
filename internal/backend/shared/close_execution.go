@@ -237,13 +237,13 @@ func (s *CloseSettlement) closeOutcomeForResult(
 		case closePhysicalEvidenceDestroyed:
 			authority, err := s.proveCloseTerminal(subject)
 			if err != nil {
-				return CloseExecutionPending{settlement: s, subject: subject, cause: err}
+				return s.pendingCloseTerminal(subject, err)
 			}
 			return CloseExecutionDestroyed{settlement: s, subject: subject, evidence: evidence.destroyed, authority: authority}
 		case closePhysicalEvidenceRetained:
 			authority, err := s.proveCloseTerminal(subject)
 			if err != nil {
-				return CloseExecutionPending{settlement: s, subject: subject, cause: err}
+				return s.pendingCloseTerminal(subject, err)
 			}
 			return CloseExecutionRetained{settlement: s, subject: subject, evidence: evidence.retained, authority: authority}
 		case closePhysicalEvidenceIncomplete:

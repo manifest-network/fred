@@ -64,6 +64,60 @@ func TestProvisionManifestAdmissionReplaysCanonicalHistoricalContent(t *testing.
 	require.Equal(t, release.Items, claim.Items())
 }
 
+func TestProvisionManifestAdmissionReplaysReorderedHistoricalTopology(t *testing.T) {
+	stores, spec, release := historicalProvisionFixture(t)
+	release.Manifest = []byte(`{"services":{"app":{"image":"example.invalid/app:1","labels":{"com.docker.compose.project":"old-build"}},"worker":{"image":"example.invalid/worker:1"}}}`)
+	release.Items = []backend.LeaseItem{
+		{SKU: "small", ServiceName: "app", Quantity: 1},
+		{SKU: "large", ServiceName: "worker", Quantity: 2, CustomDomain: "worker.example"},
+	}
+	release.ResourceProfiles = testResourceProfilesForItems(release.Items)
+	require.NoError(t, stores.releases.appendActive(spec.LeaseUUID, release))
+	spec.Items = []backend.LeaseItem{release.Items[1], release.Items[0]}
+	spec.ResourceProfiles = release.ResourceProfiles
+	spec.Manifest = release.Manifest
+	admission, err := stores.settlement.AdmitProvisionManifest(t.Context(), spec.LeaseUUID, spec.Tenant, spec.ProviderUUID, spec.Items, spec.Manifest)
+	require.NoError(t, err, "service-sorted historical authority must admit the chain's original order")
+	candidate, err := stores.settlement.NewOperationIntentCandidate(spec)
+	require.NoError(t, err)
+	candidate, err = admission.Bind(candidate)
+	require.NoError(t, err, "candidate binding must use the same multiset as manifest admission")
+	accepted, err := stores.settlement.BeginOperationIntent(candidate)
+	require.NoError(t, err)
+	claim, created := accepted.CreatedClaim()
+	require.True(t, created)
+	require.Equal(t, spec.Items, claim.Items(), "admission preserves the request order")
+
+	for _, change := range []string{"service", "sku", "quantity", "domain", "duplicate", "remove"} {
+		t.Run(change, func(t *testing.T) {
+			items := slices.Clone(spec.Items)
+			switch change {
+			case "service":
+				items[0].ServiceName, items[1].ServiceName = items[1].ServiceName, items[0].ServiceName
+			case "sku":
+				items[0].SKU, items[1].SKU = items[1].SKU, items[0].SKU
+			case "quantity":
+				items[0].Quantity, items[1].Quantity = items[1].Quantity, items[0].Quantity
+			case "domain":
+				items[0].CustomDomain = "changed.example"
+			case "duplicate":
+				items[1] = items[0]
+			case "remove":
+				items = items[:1]
+			}
+			_, err := stores.settlement.AdmitProvisionManifest(t.Context(), spec.LeaseUUID, spec.Tenant, spec.ProviderUUID, items, spec.Manifest)
+			require.ErrorIs(t, err, backend.ErrInvalidManifest)
+			changed := spec
+			changed.Items = items
+			candidate, err := stores.settlement.NewOperationIntentCandidate(changed)
+			if err == nil {
+				_, err = admission.Bind(candidate)
+			}
+			require.Error(t, err, "a replay admission cannot splice a changed topology into acceptance")
+		})
+	}
+}
+
 func TestProvisionManifestAdmissionKeepsChangedAndNewSubmissionsStrict(t *testing.T) {
 	for _, change := range []string{"new-lease", "tenant", "provider", "quantity", "sku", "image", "env", "labels", "port", "malformed-port"} {
 		t.Run(change, func(t *testing.T) {

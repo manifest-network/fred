@@ -49,45 +49,53 @@ func (a imageAdmission) close() {
 // allocation. No registry body is downloaded before this constructor succeeds.
 type imageStaging struct{ state *imageStagingState }
 type imageStagingState struct {
-	owner  *imageCapacityManager
-	bytes  int64
-	closed sync.Once
+	preparation imageTenantPreparation
+	owner       *imageCapacityManager
+	bytes       int64
+	closed      sync.Once
 }
 
-func (m *imageCapacityManager) reserveStaging(ctx context.Context, bytes int64) (imageStaging, error) {
+func (m *imageCapacityManager) reserveStaging(ctx context.Context, preparation imageTenantPreparation, bytes int64) (stage imageStaging, err error) {
+	if err := preparation.startStaging(m); err != nil {
+		return imageStaging{}, err
+	}
+	slotAcquired := false
+	defer func() {
+		if stage.state == nil {
+			if slotAcquired {
+				<-m.stageSlots
+			}
+			preparation.finishStaging()
+		}
+	}()
 	select {
 	case m.stageSlots <- struct{}{}:
+		slotAcquired = true
 	case <-ctx.Done():
 		return imageStaging{}, ctx.Err()
 	}
 	if err := m.lock(ctx); err != nil {
-		<-m.stageSlots
 		return imageStaging{}, err
 	}
 	defer m.unlock()
 	if bytes <= 0 || bytes > math.MaxInt64-m.staging {
-		<-m.stageSlots
 		return imageStaging{}, errors.New("invalid image staging allocation")
 	}
 	if err := m.headroom(ctx, false); err != nil {
-		<-m.stageSlots
 		return imageStaging{}, err
 	}
 	pending, err := m.loader.PendingBytes()
 	if err != nil {
-		<-m.stageSlots
 		return imageStaging{}, err
 	}
 	if pending > math.MaxInt64-m.staging-bytes || m.probing > math.MaxInt64-m.staging-bytes-pending {
-		<-m.stageSlots
 		return imageStaging{}, errors.New("image staging allocation exceeds accounting range")
 	}
 	if err := requireImageImportSpace(m.fs, []string{m.stageRoot}, pending+m.staging+bytes+m.probing, m.cfg.ImageDiskMinFreeMB*imageMiB); err != nil {
-		<-m.stageSlots
 		return imageStaging{}, err
 	}
 	m.staging += bytes
-	return imageStaging{state: &imageStagingState{owner: m, bytes: bytes}}, nil
+	return imageStaging{state: &imageStagingState{owner: m, bytes: bytes, preparation: preparation}}, nil
 }
 
 // imageUnpackAllocation owns the peak extraction allowance while a stopped
@@ -131,5 +139,6 @@ func (s imageStaging) close() {
 		m.staging -= s.state.bytes
 		m.unlock()
 		<-m.stageSlots
+		s.state.preparation.finishStaging()
 	})
 }

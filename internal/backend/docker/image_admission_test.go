@@ -31,6 +31,24 @@ import (
 // The admission runs inside a real Started operation with its journal-bound
 // physical subject, so preparation must select and publish an authorized pin.
 func imagePreparationExecutions(t *testing.T, m *imageCapacityManager, refs map[string]string, results chan<- string) map[string]func() {
+	return imagePreparationExecutionsForTenants(t, m, refs, nil, results)
+}
+
+func imagePreparationExecutionsForTenants(t *testing.T, m *imageCapacityManager, refs, tenants map[string]string, results chan<- string) map[string]func() {
+	pins, runs := imagePreparationSubjects(t, refs, tenants, func(ctx context.Context, mutations *storageMutations) error {
+		_, err := m.prepare(ctx, mutations, refs[mutations.leaseUUID], true)
+		if err != nil {
+			results <- err.Error()
+		} else {
+			results <- mutations.leaseUUID
+		}
+		return err
+	})
+	m.pins = pins
+	return runs
+}
+
+func imagePreparationSubjects(t *testing.T, refs, tenants map[string]string, prepare func(context.Context, *storageMutations) error) (*shared.ImagePinJournal, map[string]func()) {
 	t.Helper()
 	callbacks, err := newBoundCallbackStoreForTest(t, shared.CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "callbacks.db")})
 	require.NoError(t, err)
@@ -41,20 +59,14 @@ func imagePreparationExecutions(t *testing.T, m *imageCapacityManager, refs map[
 	authority := value.(*operationIntentTestAuthority)
 	b := &Backend{stopCtx: t.Context(), storageIdentity: authority.storage.ID(), storeAuthorityGate: authority.gate,
 		storageVerifier: testDockerRuntimeStorageVerifier{id: authority.storage.ID()}}
-	m.pins, err = shared.NewImagePinJournal(callbacks, releases, retentions)
+	pins, err := shared.NewImagePinJournal(callbacks, releases, retentions)
 	require.NoError(t, err)
 	require.NoError(t, shared.BindOperationSubstrateExecutor(settlement, b.authorizeStorageMutation, b.completeStorageMutation,
 		func(runner substratemutation.Runner, subject shared.OperationPhysicalSubject) func(context.Context) error {
 			return func(ctx context.Context) error {
 				return runner.Prepare(ctx, "prepare image", func(ctx context.Context) error {
 					mutations := &storageMutations{operationSubject: subject, inspectionOrigin: shared.ImageInspectionForOperation(subject), leaseUUID: subject.LeaseUUID()}
-					_, err := m.prepare(ctx, mutations, refs[subject.LeaseUUID()], true)
-					if err != nil {
-						results <- err.Error()
-					} else {
-						results <- subject.LeaseUUID()
-					}
-					return err
+					return prepare(ctx, mutations)
 				})
 			}
 		},
@@ -69,6 +81,10 @@ func imagePreparationExecutions(t *testing.T, m *imageCapacityManager, refs map[
 	for lease, ref := range refs {
 		spec := dockerOperationIntentSpec(t, authority.storage.ID())
 		spec.LeaseUUID = lease
+		spec.Tenant = tenants[lease]
+		if spec.Tenant == "" {
+			spec.Tenant = lease
+		}
 		spec.Manifest = validStackManifestJSON(map[string]string{"app": ref})
 		candidate, err := settlement.NewOperationIntentCandidate(spec)
 		require.NoError(t, err)
@@ -82,7 +98,7 @@ func imagePreparationExecutions(t *testing.T, m *imageCapacityManager, refs map[
 		require.NoError(t, err)
 		runs[lease] = func() { _ = settlement.ExecuteOperation(t.Context(), execution) }
 	}
-	return runs
+	return pins, runs
 }
 
 func TestImageCapacitySlowRegistryDoesNotBlockCachedTenantPreparation(t *testing.T) {
@@ -183,12 +199,11 @@ func TestImageCapacityPullReusesUnpinnedLocalDigestAboveNewImageLimit(t *testing
 			if test.lowSpace {
 				fs["/images"] = diskCapacity{total: 100 * uint64(imageMiB), available: uint64(imageMiB)}
 			}
-			var digestInspections, imports int
+			var configInspections, imports int
 			m.runtime = (&mockDockerClient{InspectImageFn: func(_ context.Context, inspected string) (*ImageInfo, error) {
 				switch inspected {
-				case digestRef:
-					digestInspections++
 				case configID.String():
+					configInspections++
 				default:
 					return nil, errors.New("local admission unexpectedly resolved a mutable reference")
 				}
@@ -221,7 +236,7 @@ func TestImageCapacityPullReusesUnpinnedLocalDigestAboveNewImageLimit(t *testing
 				require.Equal(t, configID.String(), pins[0].ImageID)
 				require.Equal(t, digestRef, pins[0].PullDigest)
 			}
-			require.Positive(t, digestInspections)
+			require.Positive(t, configInspections)
 			require.Zero(t, imports)
 		})
 	}
@@ -229,9 +244,9 @@ func TestImageCapacityPullReusesUnpinnedLocalDigestAboveNewImageLimit(t *testing
 
 func TestImageCapacityAllocationOwnershipSharesReleaseAndAccountsConcurrentWork(t *testing.T) {
 	m, _, fs := imageCapacityFixture(t)
-	first, err := m.reserveStaging(t.Context(), 10*imageMiB)
+	first, err := m.reserveStaging(t.Context(), imageTenantPreparationForTest(t, m), 10*imageMiB)
 	require.NoError(t, err)
-	second, err := m.reserveStaging(t.Context(), 10*imageMiB)
+	second, err := m.reserveStaging(t.Context(), imageTenantPreparationForTest(t, m), 10*imageMiB)
 	require.NoError(t, err)
 	copyOfFirst := first
 	first.close()
@@ -378,7 +393,7 @@ func TestImageCapacityRecoveryKeepsSavedBudgetAfterNewLimitDrops(t *testing.T) {
 	}, imagefetch.WithRegistryTransport(server.Client().Transport))
 	pin := &shared.ImagePin{ImageID: configID.String(), PullDigest: tag.Context().Digest(manifestID.String()).Name(), ImportBytes: 8 * imageMiB}
 	pin.Platform.OS, pin.Platform.Architecture = "linux", "amd64"
-	resolved, err := m.resolveImage(t.Context(), ref, pin, true)
+	resolved, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, pin, true)
 	require.NoError(t, err)
 	require.Equal(t, pin.ImageID, resolved.image.ID())
 	require.Greater(t, resolved.importBytes, imageMiB)

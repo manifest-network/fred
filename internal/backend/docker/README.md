@@ -824,9 +824,11 @@ record stays `reaping`.
 Multi-unit leases create multiple containers from the same manifest. Multi-SKU leases create containers with different resource profiles per SKU. Instance indices are 0-based across all items.
 
 `ProvisionTimeout` and backend shutdown cancel the async workflow. Already
-admitted Docker effects retain their completion owners while they drain. Create,
-Start and image imports receive a 30-second grace only after caller cancellation
-or backend shutdown; an uncanceled request is not cut off after 30 seconds.
+admitted Docker effects retain their completion owners while they drain. Create
+and Start receive a 30-second grace only after caller cancellation or backend
+shutdown; an uncanceled request is not cut off after 30 seconds. Admitted image
+imports instead belong to the loader lifetime and continue through tenant
+cancellation, with the backend-worker drain allowance on shutdown.
 
 ### Image admission
 
@@ -837,17 +839,36 @@ classic `overlay2` uses the default `DockerRootDir/tmp` import staging, while
 containerd `overlayfs` additionally requires its actual `image_data_path`.
 External `DOCKER_TMPDIR` overrides are outside the supported space model.
 
+The Started operation or maintenance subject supplies the tenant for an opaque
+preparation capability. One preparation per tenant may resolve or stage images;
+other requests from that tenant wait without holding a provider staging slot or
+GC admission. Its single-use staging ownership is retained until cleanup, even
+if a copied parent capability closes early. Up to four distinct tenants can
+stage concurrently. A cached image for the same tenant waits behind its current
+preparation; cancellation removes only the waiting request.
+
+Image pins share one store-owned commit accounting path: at most 100,000 total
+and 10,000 per verified durable tenant. Existing exact pins can be reused or
+recovered above these ceilings. The common accounting applies to both new
+admission and legacy backfill. On reopening, a row without positive durable
+tenant attribution conservatively consumes the global budget and every tenant's
+fresh-pin budget until attribution or safe collection resolves it. Neither
+unknown ownership nor an exceeded budget authorizes deletion or debit reset.
+
 Before dispatch, the loader durably adds its verified allowance to
 `<callback_db_path>.image-staging/image-import-debit-v1`. Upload and completion
-keep the caller lifetime, followed by 30 seconds of completion grace after
-caller cancellation or loader shutdown. Backend shutdown drains that owner
-before journals close. Clean
+belong to the loader lifetime once admitted, independently of tenant
+cancellation. The caller keeps staging and capacity ownership until the exchange
+finishes. Backend shutdown closes new admission, allows the owner to finish
+within its remaining 90-second worker-drain budget, then cancels it at the
+deadline and drains it before journals close. Clean
 upload and terminal completion release only that import's debit, including a
 fully observed Docker refusal. The business failure still prevents image use;
-unknown completion retains the allocation across reopening. Capacity and
-collection checks include outstanding allocations before further staging or
-import. Local launches add only unknown completion allocations to their actual
-free-space floor. These checks sample free space;
+unknown completion retains the allocation across reopening. Capacity
+admission checks include outstanding allocations before further staging or
+import. Unknown allocation alone does not block collection of unpinned, unused
+images; live admission still protects content until its pin is durable. Local
+launches add only unknown completion allocations to their actual free-space floor. These checks sample free space;
 they do not reserve physical capacity against other writers. The
 [offline recovery procedure](../../../OPERATIONS.md#recovering-outstanding-image-import-allocation)
 requires external Docker/runtime drain and matching backups before an explicit
@@ -1847,14 +1868,16 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 | `fred.image_reference` | image reference string | Original manifest image reference, preserved for release comparisons while execution uses an immutable image ID |
 | `fred.image_id` | `sha256:` image ID | Binds `fred.image_reference` to Docker's actual image ID and the container's configured image; partial or inconsistent bindings fail inventory validation |
 
-Manifest and image labels may not use the `fred.*`, `traefik.*`, or
-`com.docker.compose.*` namespaces, matched case-insensitively. Image metadata is
-checked before creating workloads or inspection helpers, and execution uses
-the inspected immutable image ID. This prevents inherited labels from becoming
-ingress or container-lifecycle instructions. Images built with Compose may carry
-reserved labels automatically; rebuild them without orchestration metadata
-(for example, with `docker build`) before provisioning or replacing workloads.
-Existing containers are not rewritten by this admission check.
+Manifest labels may not use the `fred.*`, `traefik.*`, or
+`com.docker.compose.*` namespaces, matched case-insensitively. Image labels have
+three exact exceptions: `com.docker.compose.project`, `com.docker.compose.service`
+and `com.docker.compose.version`. Fred discards these automatic build-stamp
+values and supplies ownership from the compiled workload; direct helpers get
+neutral values. Other reserved keys and case variants remain refused. A
+Compose-built image containing only those three stamps needs no rebuild.
+Newly fetched image metadata is checked before layer download or import; all
+images are admitted before creating workloads or inspection helpers. Execution
+uses the inspected immutable image ID. Existing containers are not rewritten.
 
 ## Bandwidth Limiting
 

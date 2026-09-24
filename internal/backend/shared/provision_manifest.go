@@ -79,7 +79,7 @@ func (s *OperationSettlement) AdmitProvisionManifest(ctx context.Context, lease,
 		}
 		identity, valid := release.RuntimeIdentity()
 		if !valid || identity.Tenant() != tenant || identity.ProviderUUID() != provider ||
-			!slices.Equal(items, release.Items) || !bytes.Equal(requestedJSON, storedJSON) {
+			!sameProvisionItemMultiset(items, release.Items) || !bytes.Equal(requestedJSON, storedJSON) {
 			return ProvisionManifestAdmission{}, fmt.Errorf("manifest differs from exact historical replay authority: %w", policyErr)
 		}
 		return ProvisionManifestAdmission{issuer: s, payload: slices.Clone(release.Manifest), replay: &provisionManifestReplay{
@@ -109,13 +109,33 @@ func (a ProvisionManifestAdmission) Bind(candidate OperationIntentCandidate) (Op
 	}
 	if a.replay != nil {
 		if candidate.spec.LeaseUUID != a.replay.source.LeaseUUID() || candidate.spec.Tenant != a.replay.tenant ||
-			candidate.spec.ProviderUUID != a.replay.provider || !slices.Equal(candidate.spec.Items, a.replay.items) {
+			candidate.spec.ProviderUUID != a.replay.provider || !sameProvisionItemMultiset(candidate.spec.Items, a.replay.items) {
 			return OperationIntentCandidate{}, errors.New("historical provision candidate differs from its exact release authority")
 		}
 		source := a.replay.source
 		candidate.provisionReplay = &source
 	}
 	return candidate, nil
+}
+
+// sameProvisionItemMultiset preserves the entire service/SKU/quantity/domain
+// binding while allowing a v0.13 backfill's service-sorted order to differ from
+// the chain request. Counts matter: a set comparison would hide duplicates.
+func sameProvisionItemMultiset(left, right []backend.LeaseItem) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[backend.LeaseItem]int, len(left))
+	for _, item := range left {
+		counts[item]++
+	}
+	for _, item := range right {
+		if counts[item] == 0 {
+			return false
+		}
+		counts[item]--
+	}
+	return true
 }
 
 // verifyProvisionReplay runs only while Begin holds the existing lease lock.

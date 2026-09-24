@@ -1060,11 +1060,21 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 
 ### Fred Response Contract
 
+Before HMAC verification, the callback reader accepts at most **1 MiB** of exact
+wire bytes, **256 JSON structural tokens**, and **16 nesting levels**. These are
+fixed protocol limits, including unknown fields. Exceeding them returns `401`
+while the unauthenticated ingress budget remains available, or `429` once that
+budget is exhausted. A valid signature does not bypass envelope limits. The
+reader preserves the received bytes for HMAC verification; senders must sign the
+same serialized body they transmit. Keep callbacks compact and store verbose
+diagnostics separately. Authenticated callbacks, including duplicate replays,
+consume the storage lineage's independent callback budget.
+
 - `200 OK` — synchronously applied to a terminal application result, or
   terminally ignored as a duplicate/stale exact-operation callback. A backend
   may advance that lease's durable callback queue only after this response.
 - `400 Bad Request` — malformed JSON, lease UUID, status, or callback capability query. `operation_id` and `lifecycle_id` are mutually exclusive; a present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected.
-- `401 Unauthorized` — missing or invalid HMAC signature.
+- `401 Unauthorized` — missing or invalid HMAC signature, or a callback envelope that cannot pass the bounded pre-authentication parser (including excessive size, token count or nesting).
 - `429 Too Many Requests` — callback ingress rate limit exceeded; retry with backoff.
 - `503 Service Unavailable` — callback application is unavailable, has not
   started, is shutting down, or failed/timed out; keep the callback durable and

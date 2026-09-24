@@ -933,7 +933,8 @@ func (s *Store) beginMaintenanceCommand(
 		return MaintenanceCommandAdmission{}, ErrMaintenanceCommandConflict
 	}
 	var result MaintenanceCommandAdmission
-	err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+	err := s.updateMaintenanceAuthority(func(journal *maintenanceJournalTransaction) error {
+		tx := journal.tx
 		if err := validateMaintenanceAdmissionTx(tx, command); err != nil {
 			return err
 		}
@@ -985,13 +986,7 @@ func (s *Store) beginMaintenanceCommand(
 		if len(encoded) > maxMaintenanceCommandAdmissionBytes {
 			return fmt.Errorf("%w: command exceeds %d-byte admission budget", ErrInvalidMaintenanceCommand, maxMaintenanceCommandAdmissionBytes)
 		}
-		if err := admitPendingMaintenance(pending, records, len(encoded)); err != nil {
-			return err
-		}
-		if err := records.Put(key, encoded); err != nil {
-			return err
-		}
-		if err := pending.Put([]byte(command.leaseUUID), []byte(command.id.String())); err != nil {
+		if err := journal.write(encoded); err != nil {
 			return err
 		}
 		claim := MaintenanceCommandClaim{issuer: s, command: command}
@@ -1086,7 +1081,8 @@ func (s *Store) settleMaintenancePhaseReceipt(claim MaintenanceCommandClaim, set
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var receipt MaintenanceCommandRecord
-	err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+	err := s.updateMaintenanceAuthority(func(journal *maintenanceJournalTransaction) error {
+		tx := journal.tx
 		pending, records, err := maintenanceCommandBuckets(tx)
 		if err != nil {
 			return err
@@ -1116,10 +1112,7 @@ func (s *Store) settleMaintenancePhaseReceipt(claim MaintenanceCommandClaim, set
 		if err != nil {
 			return err
 		}
-		if err := records.Put(key, settled); err != nil {
-			return err
-		}
-		if err := pending.Delete([]byte(command.leaseUUID)); err != nil {
+		if err := journal.write(settled); err != nil {
 			return err
 		}
 		stored.terminal, stored.phase, stored.payload = true, maintenanceCompleted, nil

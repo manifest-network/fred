@@ -24,6 +24,25 @@ func TestLifecyclePendingRequiresJournalIssuedContention(t *testing.T) {
 	require.False(t, IsLifecyclePending(fmt.Errorf("%w: admitted lifecycle work remains pending", ErrMaintenanceIntentConflict)))
 	require.False(t, IsLifecyclePending(CloseExecutionPending{}))
 	require.False(t, IsLifecyclePending(errors.New("storage journal corrupt")))
+	require.False(t, IsLifecyclePending(fmt.Errorf("%w: fabricated launch debt", ErrVolumeLaunchUnsettled)))
+}
+
+func TestCloseTerminalPendingRejectsSentinelAndForeignNamespace(t *testing.T) {
+	stores := openOperationHandoffStores(t, "docker-a")
+	settlement := newCloseSettlementForTest(t, stores)
+	bindTestCloseMutation(t, settlement, nil, nil)
+	spec := seedCloseSettlementRelease(t, stores, "pending-terminal-source")
+	claim := admitSettlementClose(t, settlement, spec.LeaseUUID, false)
+	execution := startTestCloseExecution(t, settlement, claim)
+	for _, cause := range []error{
+		ErrVolumeLaunchUnsettled,
+		fmt.Errorf("untrusted observation: %w", ErrVolumeLaunchUnsettled),
+		errors.New("corrupt launch journal"),
+		volumeLaunchNamespacePending{record: volumeLaunchDebtRecord{LeaseUUID: testLeaseUUID("another-lease")}},
+	} {
+		pending := settlement.pendingCloseTerminal(execution.subject, cause)
+		require.False(t, IsLifecyclePending(pending), "only the exact durable namespace observation may issue lifecycle pending: %v", cause)
+	}
 }
 
 func TestLifecyclePendingClosePreservesExecutionAndRejectsBoundaryFailures(t *testing.T) {

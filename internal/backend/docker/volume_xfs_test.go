@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -206,6 +207,8 @@ printf '%s\n' "$*" >> "$FRED_TEST_XFS_LOG"
 	t.Setenv("PATH", binDir)
 	t.Setenv("FRED_TEST_XFS_LOG", logPath)
 	mgr := newXfsManagerForTest(dataPath)
+	var repairLog bytes.Buffer
+	mgr.logger = slog.New(slog.NewTextHandler(&repairLog, nil))
 	var reads, writes int
 	mgr.projectAttributes = xfsProjectAttributeFuncs{
 		read: func(root *os.Root) (linuxFSXAttr, error) {
@@ -237,6 +240,10 @@ printf '%s\n' "$*" >> "$FRED_TEST_XFS_LOG"
 	assert.Contains(t, logText, "limit -p bhard=100m")
 	assert.Equal(t, 1, writes)
 	assert.Equal(t, 2, reads, "root repair must be verified before reusing storage")
+	assert.Contains(t, repairLog.String(), "repaired xfs volume root project attributes")
+	assert.Contains(t, repairLog.String(), "descendants require offline verification")
+	assert.Contains(t, repairLog.String(), "previous_project_id=0")
+	assert.Contains(t, repairLog.String(), "project_id=4242")
 }
 
 func installChurningXFSQuota(t *testing.T) string {
@@ -347,6 +354,8 @@ func TestXFSQuotaRootRepairFailsClosed(t *testing.T) {
 				require.NoError(t, writeProjectIDFile(dir, projID))
 				logPath := installChurningXFSQuota(t)
 				mgr := newXfsManagerForTest(dataPath)
+				var repairLog bytes.Buffer
+				mgr.logger = slog.New(slog.NewTextHandler(&repairLog, nil))
 				var reads, writes int
 				mgr.projectAttributes = xfsProjectAttributeFuncs{
 					read: func(*os.Root) (linuxFSXAttr, error) {
@@ -375,6 +384,11 @@ func TestXFSQuotaRootRepairFailsClosed(t *testing.T) {
 					require.ErrorContains(t, err, tc.wantError)
 				} else {
 					require.NoError(t, err)
+				}
+				if tc.wantError != "" {
+					assert.NotContains(t, repairLog.String(), "repaired xfs volume root project attributes")
+				} else {
+					assert.Contains(t, repairLog.String(), "repaired xfs volume root project attributes")
 				}
 				if tc.readErr != nil {
 					assert.Zero(t, writes)

@@ -2042,7 +2042,7 @@ such case keeps the state and increments
 - **Tenant Authentication**: ADR-036 secp256k1 signatures with 30-second token expiry and low-S normalization
 - **Replay Protection**: Persistent token tracking (bbolt) with fail-closed semantics on mutating endpoints
 - **Callback Authentication**: Per-backend HMAC-SHA256 keys; timestamps bound same-endpoint replay to a 5-minute window, while method/URI binding prevents cross-endpoint replay
-- **Rate Limiting**: Dual-layer token bucket — one per-IP limiter shared across all routes (10 RPS) and a per-tenant limiter (5 RPS); behind a proxy, set `trusted_proxies` so it keys on the real client IP
+- **Rate Limiting**: Tenant routes use a shared per-IP bucket (10 RPS) and a per-tenant bucket (5 RPS). Callbacks have independent pre-authentication ingress and authenticated storage-lineage budgets, so tenant traffic cannot consume callback capacity. Behind a proxy, set `trusted_proxies` so ingress keys on the real client IP
 - **Container Hardening**: Drop all capabilities, no-new-privileges, read-only rootfs, PID limits, network isolation
 - **Input Validation**: UUID format checks, URL scheme/host validation, manifest parsing, image allowlisting
 - **Production Mode**: Enforces replay protection, blocks TLS skip-verify, SSRF checks on all URLs

@@ -30,6 +30,19 @@ func (s *CloseSettlement) proveCloseTerminal(subject ClosePhysicalSubject) (clos
 	return closeTerminalAuthority{subject: subject}, nil
 }
 
+// pendingCloseTerminal consumes the direct journal observation from
+// proveCloseTerminal. Wrapped sentinels, classifier failures, and storage
+// errors cannot acquire this transport observation or terminal authority.
+func (s *CloseSettlement) pendingCloseTerminal(subject ClosePhysicalSubject, err error) CloseExecutionPending {
+	pending := CloseExecutionPending{settlement: s, subject: subject, cause: err}
+	if debt, ok := err.(volumeLaunchNamespacePending); ok { //nolint:errorlint // Only the direct journal observation may issue this exact namespace's pending class.
+		claim := subject.Intent()
+		pending.observable = debt.record.Backend == claim.Backend() &&
+			debt.record.StorageID == claim.BackendStorageID().String() && debt.record.LeaseUUID == claim.LeaseUUID()
+	}
+	return pending
+}
+
 func verifyCloseTerminalTx(tx *bolt.Tx, claim CloseIntentClaim) error {
 	if err := verifyCloseIntentTx(tx, claim); err != nil {
 		return err

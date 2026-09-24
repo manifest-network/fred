@@ -48,6 +48,7 @@ type maintenanceSeedPlan struct {
 	backendNames  []string
 	inventories   map[string]placement.BackendInventory
 	leaseBackends map[string]string
+	leaseTenants  map[string]string
 }
 
 var maintenanceSeedPlans sync.Map
@@ -400,13 +401,17 @@ func projectMaintenanceSeed(
 	placements := make(map[string]string, len(plan.leaseBackends))
 	reported := make(map[string][]backend.ProvisionInfo, len(plan.backendNames))
 	for leaseUUID, backendName := range plan.leaseBackends {
+		tenant := testTenant
+		if selected := plan.leaseTenants[leaseUUID]; selected != "" {
+			tenant = selected
+		}
 		placements[leaseUUID] = backendName
 		lifecycleID, parseErr := lifecycle.ParseID(leaseUUID)
 		require.NoError(t, parseErr)
 		reported[backendName] = append(reported[backendName],
 			backend.ProvisionInfo{
 				LeaseUUID: leaseUUID, ProviderUUID: testProviderUUID,
-				Tenant: testTenant, BackendName: backendName,
+				Tenant: tenant, BackendName: backendName,
 				LifecycleGeneration: &backend.LifecycleGenerationObservation{
 					Kind: backend.LifecycleGenerationTyped, ID: lifecycleID.String(),
 				},
@@ -1608,33 +1613,45 @@ func TestPendingRecoveryGivesEachBackendAnIndependentLane(t *testing.T) {
 func preparePendingMaintenanceCommands(
 	t *testing.T,
 	count int,
-) (string, []string) {
+) (string, []string, map[string]string) {
 	t.Helper()
 	leaseBackends := make(map[string]string, count)
+	leaseTenants := make(map[string]string, count)
 	leaseUUIDs := make([]string, 0, count)
 	requestIDs := make([]maintenanceid.ID, 0, count)
 	for index := 1; index <= count; index++ {
 		leaseUUID := fmt.Sprintf("30000000-0000-4000-8000-%012d", index)
 		leaseBackends[leaseUUID] = "backend-a"
+		leaseTenants[leaseUUID] = testTenant
+		if count > 16 {
+			leaseTenants[leaseUUID] = fmt.Sprintf("tenant-%d", index/8)
+		}
 		leaseUUIDs = append(leaseUUIDs, leaseUUID)
 		requestIDs = append(requestIDs, requestID(t,
 			fmt.Sprintf("40000000-0000-4000-8000-%012d", index)))
 	}
 	store, path := newPlacementAuthorityForTopology(t, leaseBackends)
-	initial := newTestService(t, store, &fakeBackend{
-		restart: func(backend.RestartRequest) error {
-			return errors.New("initial ambiguous transport result")
-		},
-	}, nil, leaseUUIDs...)
+	value, found := maintenanceSeedPlans.Load(store)
+	require.True(t, found)
+	plan := value.(maintenanceSeedPlan)
+	plan.leaseTenants = leaseTenants
+	maintenanceSeedPlans.Store(store, plan)
+	chain := testChain(leaseUUIDs...)
+	for lease, tenant := range leaseTenants {
+		chain.leases[lease].Tenant = tenant
+	}
+	client := &fakeBackend{restart: func(backend.RestartRequest) error { return errors.New("initial ambiguous transport result") }}
+	initial, err := NewService(Config{Coordinator: maintenanceCoordinatorForTest(t, store, chain, fakeRouter{backend: client}, nil)})
+	require.NoError(t, err)
 	for index, leaseUUID := range leaseUUIDs {
 		result := initial.Execute(t.Context(), Command{
 			ID: requestIDs[index], LeaseUUID: leaseUUID,
-			Tenant: testTenant, Kind: KindRestart,
+			Tenant: leaseTenants[leaseUUID], Kind: KindRestart,
 		})
 		require.Equal(t, OutcomeServiceUnavailable, result.Outcome())
 	}
 	require.NoError(t, store.Close())
-	return path, leaseUUIDs
+	return path, leaseUUIDs, leaseTenants
 }
 
 func TestPendingRecoveryBoundsEachBackendBatch(t *testing.T) {
@@ -1642,15 +1659,18 @@ func TestPendingRecoveryBoundsEachBackendBatch(t *testing.T) {
 		expectedRecoveryBatchLimit = 32
 		pendingCount               = expectedRecoveryBatchLimit + 8
 	)
-	path, leaseUUIDs := preparePendingMaintenanceCommands(t, pendingCount)
+	path, leaseUUIDs, leaseTenants := preparePendingMaintenanceCommands(t, pendingCount)
 	reopened := reopenPlacementAuthority(t, path)
 	t.Cleanup(func() { _ = reopened.Close() })
 	backendClient := &fakeBackend{restart: func(backend.RestartRequest) error {
 		return errors.New("backend remains unavailable")
 	}}
-	service := newTestService(
-		t, reopened, backendClient, nil, leaseUUIDs...,
-	)
+	chain := testChain(leaseUUIDs...)
+	for lease, tenant := range leaseTenants {
+		chain.leases[lease].Tenant = tenant
+	}
+	service, err := NewService(Config{Coordinator: maintenanceCoordinatorForTest(t, reopened, chain, fakeRouter{backend: backendClient}, nil)})
+	require.NoError(t, err)
 
 	require.Error(t, service.RecoverPending(t.Context()))
 	firstBatch := backendClient.restartedLeases()
@@ -1671,7 +1691,7 @@ func TestPendingRecoveryBoundsEachBackendBatch(t *testing.T) {
 
 func TestRecoveryAfterRestartRotatesPastRepeatedlyStalledLease(t *testing.T) {
 	const pendingCount = 4
-	path, leaseUUIDs := preparePendingMaintenanceCommands(t, pendingCount)
+	path, leaseUUIDs, _ := preparePendingMaintenanceCommands(t, pendingCount)
 	reopened := reopenPlacementAuthority(t, path)
 	t.Cleanup(func() { _ = reopened.Close() })
 	blocking := &perLeaseBlockingBackend{name: "backend-a", entered: make(chan struct{}, 1)}

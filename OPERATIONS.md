@@ -148,6 +148,9 @@ when later probes or recovery passes succeed.
 | `fred_backend_circuit_breaker_state{backend="X"} == 2` (open) | Backend X has been unhealthy long enough to trip the breaker | `curl backendX/health`, check backend logs |
 | `fred_backend_healthy{backend="X"} == 0` for >1 min | Backend health probe failing | Same as above. Note this no longer affects the tenant API's availability — the provider reports `degraded` and keeps serving |
 | `fred_docker_backend_volume_launches_pending > 0` beyond the expected launch window | Outstanding Docker launch receipts; a transient nonzero value is normal while launches run | Confirm recent successful backend health sampling, then correlate pending requests with backend logs. The gauge holds its last sample when health fails and does not count image-helper receipts. Follow [Unsettled Docker effects](#unsettled-docker-effects) for persistent unknown requests; never delete a receipt to clear the gauge |
+| `fred_docker_backend_image_import_pending_bytes > 0` beyond the normal import window | The gauge includes both live owned imports and allocation whose completion is unknown. A persistent value after the backend becomes idle can be durable import debt; restarting does not clear it | Correlate imports, Docker response failures and shutdown logs. Alert with a site-specific `for` duration longer than a normal import; investigate sustained debt using [Recovering outstanding image import allocation](#recovering-outstanding-image-import-allocation). Never clear the debit while the runtime can still allocate |
+| `increase(fred_docker_backend_image_gc_total{outcome="inhibited"}[15m]) > 0` sustained across collection ticks | Incomplete pin authority or unresolved inspection evidence prevents safe deletion. Ordinary live admissions increment `outcome="busy"` instead | Check legacy pin-backfill warnings, retained rows without manifests and inspection receipts. Docker container/image inventory call failures increment `outcome="error"`; correlate those with daemon logs. Preserve unknown content and repair its authoritative evidence. Import debt alone does not block collection; `busy` by itself is not a debt alert |
+| `increase(fred_maintenance_admission_refusals_total[5m]) > 0` | New restart/update admission reached a provider or tenant pending-journal count/byte cap. Existing commands can still replay and settle | Split by `reason` (`count`, `bytes`, `tenant_count`, `tenant_bytes`) and correlate pending phase/oldest-age gauges with backend completion and callback health. Restore stalled completion rather than deleting pending rows; tenant caps preserve other tenants' shares |
 | Backend X reports `callback store unhealthy` | `callbacks.db` is missing a delivery/intent bucket, contains malformed durable evidence, or gives one lease simultaneous operation, maintenance, or close rows. A terminal Succeeded/Failed operation row is history rather than active mutation authority; authorized successor admission retires it atomically instead of leaving simultaneous rows. Current deliveries live below a lease-identifying nested bucket. Operation identity/snapshot fields are immutable; maintenance advances through typed pre-append and append-started phases and then binds one exact target fence; close preserves its immutable snapshot while durably advancing a monotonic execution generation immediately before physical work. Every change uses an exact digest-bearing claim. Replay/TTL never silently deletes poison data, terminal operation rows remain after delivery until an authorized successor, and causal intents, close intents, and exact completions never age out | Stop that backend, take a copy of `callbacks.db` with the matching release store, storage markers, containers, and volumes. Inspect or restore the named lease offline (or the complete file when a root bucket is missing). Prefer exact repair/restore over deleting the database; wholesale deletion can lose accepted work, terminal decisions, replacement identity, destructive-cleanup authority, and pending completions. Keep the node out of new placement until `/health` is clean |
 | Backend latches after `post-mutation storage verification`, refuses startup with `recover interrupted operations`, or `fred_*_backend_callback_store_errors_total` increases | A raw mutation returned without a usable postcheck, callback persistence/store access failed on an instrumented path, operation-intent startup recovery failed, or another authoritative journal/substrate proof reached a terminal identity or outcome-unknown failure. The first cause is sticky for the backend lifetime: callback, release, and retention journals (where present), substrate mutation admission, and callback delivery all refuse through the same latch. A running docker-backend publishes that first cause to its main loop, closes the listener, drains workers, and exits status 1 so the supervisor must launch a fresh `Start`; a persistent fault therefore crash-loops closed instead of serving. A valid but semantically indeterminate maintenance row is different: it need not make `/health` fail or increment this counter; use the Docker reconciliation signal below. A close intent already owns destruction, so recovery resumes it from its immutable snapshot before ordinary exact-cohort validation and reports retry errors in the lease-scoped close log below | Fence mutation ingress and preserve `callbacks.db`, `releases.db`, `retention.db` where present, the storage-identity marker pair, and the substrate as one evidence set. Do not treat one still-readable sibling journal or a queued callback as permission to continue; the shared latch intentionally withdrew the entire lineage. Let the supervised restart retry only after repairing the Docker/retention/SKU/store inconsistency or restoring the matching stopped-process snapshot. Restart only against that same set. Never delete an intent, finalizer, release fence, retained data, or callback evidence merely to make readiness green |
 | `fred_docker_backend_oldest_close_intent_age_seconds` remains above the normal close window, `fred_docker_backend_pending_close_intents` remains non-zero, or `durable close recovery remains pending` repeats for one lease | Docker admitted deprovision before teardown, then a transient container/volume/release/accounting/outbox failure prevented finalization. The aggregate gauges deliberately omit lease labels; the log's lease UUID and durable `execution_generation` identify the exact attempted run and survive restart. A full close keeps a conservative projection and capacity reservation; a cleanup-only close may have no tenant-visible projection but remains the sole non-expiring retry owner. An unresolved launch receipt can also prevent terminal close even when current container and volume inventories are empty | Correlate the recovery log's lease UUID with nearby teardown, retention, release-store, and callback-store errors. Restore the failed dependency and let the next docker-backend recovery tick independently classify the Started generation before authorizing another run. If offline inspection is required, stop the backend and inspect that lease's close-tagged head in `callback_lease_mutation_heads` together with the exact `releases.db` history and substrate; callback URLs contain causal identifiers, so do not paste raw row contents into tickets. Never delete the row merely because Docker reports zero containers. If the exact lease retains an unknown launch request, follow [Unsettled Docker effects](#unsettled-docker-effects). A timeout, restart or empty inventory cannot retire that receipt; preserve the close intent and launch evidence until exact completion or stopped-backend operator fencing and repair establishes quiescence |
@@ -377,9 +380,15 @@ to start so per-volume disk_mb limits are enforced, not silently skipped
 This is deliberate: a missing capability would otherwise silently drop every
 `disk_mb` cap. Grant `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` on the
 docker-backend systemd unit — `CAP_SYS_ADMIN` to set the block limit, and
-`CAP_FOWNER` so the startup backfill can re-tag pre-existing tenant-owned volumes.
-A plain `setcap …+ep` on the binary does **not** work — the grant must reach the
-exec'd `xfs_quota`/`btrfs` children. Full setup is in the xfs section and the
+`CAP_FOWNER` so startup can repair the root inode of a pre-existing tenant-owned volume.
+A plain `setcap …+ep` on the binary is insufficient for CLI quota operations —
+`CAP_SYS_ADMIN` must reach the exec'd `xfs_quota`/`btrfs` children. XFS root repair
+uses descriptor-bound kernel ioctls in the backend process and never walks tenant
+descendants. The warning `repaired xfs volume root project attributes; descendants
+require offline verification` distinguishes a repaired root from ordinary limit
+refresh. Preserve its path and previous project attributes, then verify historical
+descendant tagging during stopped-writer maintenance; the warning does not attest
+the existing tree. Full setup is in the xfs section and the
 systemd note of [DEPLOYMENT.md](DEPLOYMENT.md#xfs-good-for-large-fleets). The `zfs`
 backend is exempt (it supports `zfs allow` delegation, so a properly-delegated
 non-root host is not rejected) and the `noop` backend is unaffected (no privileged
@@ -468,13 +477,22 @@ Before staging, admission checks the maximum staging allowance above the
 free-space floor. Before Docker import, it checks the verified image's
 conservative import footprint plus the floor again. Launches require the floor.
 Staging, import and extraction owners account for each other without holding a
-provider-wide lock during network or daemon I/O. A local launch checks actual
-free space plus unknown import allocations; live owned imports are not added
+provider-wide lock during network or daemon I/O. A Started journal subject grants
+one preparation at a time per tenant; queued requests consume no provider-wide
+staging slots. A tenant with many slow pulls can occupy only one of the four
+staging slots. Other image preparations for that same tenant, including cached
+images, wait for its current preparation or their own cancellation. A local
+launch checks actual free space plus unknown import allocations; live owned
+imports are not added
 a second time to that launch floor. Before dispatch, Fred writes the allowance
 to `<callback_db_path>.image-staging/image-import-debit-v1`. An admitted import
-keeps the active caller lifetime and receives a 30-second completion grace
-after caller cancellation or backend shutdown. Shutdown drains these owned
-requests before closing journals. Clean upload and terminal completion release its amount even when
+belongs to the loader's lifetime, independent of tenant cancellation or the
+pull timeout once dispatch is admitted. Its staging files and capacity ownership
+remain held until the exchange completes. Shutdown closes import admission and
+allows admitted imports to finish within the backend's existing 90-second worker
+drain, then cancels their owner if that deadline expires. Journals close after
+the owned requests drain. Clean upload and terminal completion release its amount
+even when
 Docker reports a completed failure; the deployment still fails. Transport,
 timeout or malformed-stream failures retain unproven allocation across restart,
 without automatic expiry. A corrupt debit record or foreign staging content
@@ -500,14 +518,30 @@ keeps every container-referenced or durably pinned image. Missing legacy pins
 or incomplete journal/container inventories prevent destructive collection,
 while unrelated admissions may continue if their own checks succeed. Startup
 backfills missing active pins from an exact live cohort and immutable image
-inspection. Failed/superseded history retains pins only when needed by an exact
+inspection after all fatal startup checks have succeeded. Failed/superseded
+history retains pins only when needed by an exact
 pending compensation. A null legacy retained manifest conservatively keeps
-images. `fred_docker_backend_image_gc_total{outcome}` reports inhibited, shared,
-below-threshold, removed, error and panic decisions.
+images. `fred_docker_backend_image_gc_total{outcome}` distinguishes `busy`
+(ordinary live admission or helper work) from `inhibited` (incomplete pin authority or
+unresolved inspection evidence). It also reports shared, below-threshold, removed, error and
+panic decisions. Unknown import allocation alone does not inhibit collection of
+unused, unpinned images; it still raises the headroom needed for admission.
 Removal conflicts keep their images; resolve them during fenced maintenance,
 without deleting pins or authoritative release history. Until real free space
 recovers, capacity refusals remain possible. Lowering the new-image size cap
 neither deletes nor invalidates content pinned by retained generations.
+
+The image-pin journal admits at most 100,000 pins in total and 10,000 per
+tenant. A tenant's share follows its verified durable lease/release identity;
+a supplied label or image reference cannot choose a different owner. Exact
+reuse and recovery of an existing pin remain available above these limits.
+Fresh pins can be refused until obsolete pins are pruned by normal collection.
+If an old row lacks positive durable tenant attribution, it counts against the
+global cap and every tenant's fresh-pin share until authority proves its owner
+or normal collection can safely prune it. Correlate pin-capacity refusals with
+legacy backfill and collection warnings; preserve journal evidence rather than
+deleting pins or assigning owners manually. The quota never automatically
+forgives outstanding import allocation.
 
 The Docker volume `fred-image-cache-owner-v1` records durable cache ownership.
 Production uses an exclusive backend storage identity; development uses shared
@@ -543,14 +577,21 @@ There is no automatic debit reset. For exceptional offline recovery:
 
 ## Pending maintenance pressure
 
-Signed completion wakes the exact durable maintenance lane immediately; the
-periodic recovery tick remains the fallback. New pending commands are bounded
-to 1,024 records and 64 MiB of encoded journal content, including phase-growth
-headroom. Replays and settlement of existing records remain available even when
+Signed completion wakes recovery and selects all durably confirmed completions
+before the ordinary rotating batch of 32 retries per backend. A confirmed
+command therefore does not wait for the batch cursor to reach its lease. Live
+dispatch ownership and the per-backend recovery timeout still apply; the
+periodic tick retries failed persistence without a wake-driven retry loop. New pending commands are bounded
+to 1,024 records and 64 MiB of encoded journal content provider-wide, and
+16 records and 8 MiB per tenant. Each record reserves 512 bytes of phase-growth
+headroom. All four limits are checked in the accepting write transaction.
+Replays and settlement of existing records remain available even when
 a pre-upgrade journal exceeds these limits. The `fred_maintenance_pending`,
 `fred_maintenance_pending_bytes` and `fred_maintenance_pending_oldest_age_seconds`
-gauges expose each closed phase. Admission refusals are counted by `count` or
-`bytes` in `fred_maintenance_admission_refusals_total`. An old completion without
+gauges expose each closed phase from transaction-maintained counts. Admission
+refusals carry the bounded `reason` values `count`, `bytes`, `tenant_count` or
+`tenant_bytes` in `fred_maintenance_admission_refusals_total`. An old completion
+without
 its maintenance ID is still insufficient authority to promote or discard a
 payload; preserve that pending record for recovery.
 
@@ -566,8 +607,12 @@ Recovery keeps that exact operation pending, preserves its reservation and lease
 fence, and logs `operation recovery retained unresolved lease authority`.
 Healthy sibling recovery and backend startup can continue. It does not erase
 the domain based on today's configuration or synthesize a success/timeout callback.
-Preserve the journals and container evidence for an explicit authority-aware
-repair; deleting the pending row can orphan a running workload.
+Preserve the journals and container evidence and keep that lease fenced while
+engineering prepares a repair from the exact operation and physical cohort.
+There is currently no shipped repair command for contradictory ENG-1055 ingress
+metadata. The Docker effect-debt repair commands below do not repair it. Do not
+delete the pending row or edit its domain to make recovery succeed; either can
+orphan a running workload or invent a terminal decision.
 
 ## Interrupted managed-volume mutation at startup
 
@@ -648,8 +693,10 @@ namespace across restart. Ordinary work on unrelated leases remains independent.
 The configured `docker_host` must reach a direct, trusted Docker endpoint. Fred
 disables environment HTTP proxies for its Docker SDK transport so gateway errors
 cannot masquerade as daemon completion. A recognized terminal Docker failure can
-settle a finished request while the workflow still fails; cancellation, lost
-responses and unrecognized outcomes retain the unresolved record. Neither request
+settle a finished request while the workflow still fails. Caller cancellation
+alone does not settle or abandon an owned effect: a positive completion during
+the completion owner's lifetime can still settle it. Lost responses or
+unrecognized outcomes retain the unresolved record. Neither request
 completion nor repair invents a Ready workload.
 
 Image helpers use the same completion protocol as managed launches. Their durable

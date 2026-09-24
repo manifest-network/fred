@@ -173,6 +173,9 @@ type storedV2CallbackEntry struct {
 type CallbackStore struct {
 	*boltStore
 
+	// Optional image pin accounting has one owner per open durable journal.
+	imagePins *imagePinOwner
+
 	// deliveryLocks are shared with every CallbackSender constructed over this
 	// store. They serialize the short journal mutations that allocate FIFO
 	// sequence numbers, settle intents, and precisely remove delivered rows.
@@ -500,6 +503,7 @@ func finishCallbackStoreOpen(
 		return nil, errors.New("callback store base and schema initializer are required")
 	}
 	s := &CallbackStore{
+		imagePins:         &imagePinOwner{},
 		boltStore:         base,
 		deliveryLocksMu:   &sync.Mutex{},
 		deliveryLocks:     make(map[string]*callbackLeaseLock),

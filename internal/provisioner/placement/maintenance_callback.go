@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
-
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/provisioner/callbackwire"
 )
@@ -28,7 +26,8 @@ func (coordinator *AuthenticatedCallbackCoordinator) recordMaintenanceCompletion
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	changed := false
-	err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+	err := s.updateMaintenanceAuthority(func(journal *maintenanceJournalTransaction) error {
+		tx := journal.tx
 		pending, records, err := maintenanceCommandBuckets(tx)
 		if err != nil {
 			return err
@@ -67,7 +66,7 @@ func (coordinator *AuthenticatedCallbackCoordinator) recordMaintenanceCompletion
 			if err != nil {
 				return err
 			}
-			if err := records.Put(key, value); err != nil {
+			if err := journal.write(value); err != nil {
 				return err
 			}
 			changed = true
@@ -85,10 +84,7 @@ func (coordinator *AuthenticatedCallbackCoordinator) recordMaintenanceCompletion
 		if err != nil {
 			return err
 		}
-		if err := records.Put(key, value); err != nil {
-			return err
-		}
-		if err := pending.Delete([]byte(callback.LeaseUUID())); err != nil {
+		if err := journal.write(value); err != nil {
 			return err
 		}
 		changed = true

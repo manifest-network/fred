@@ -47,18 +47,24 @@ func TestDeprovisionEmptyInventoryPreservesUnknownLaunch(t *testing.T) {
 			}
 
 			closeErr := h.b.Deprovision(ctx, h.leaseUUID)
+			require.True(t, shared.IsLifecyclePending(closeErr), "actual Deprovision must project durable launch debt into the breaker-neutral pending class: %v", closeErr)
 			switch mode {
 			case "first close":
 				require.ErrorIs(t, closeErr, shared.ErrVolumeLaunchUnsettled)
 			case "retry":
 				require.Error(t, closeErr, "initial uncertainty must retain a retry owner")
-				require.ErrorIs(t, h.b.Deprovision(ctx, h.leaseUUID), shared.ErrVolumeLaunchUnsettled,
+				retryErr := h.b.Deprovision(ctx, h.leaseUUID)
+				require.ErrorIs(t, retryErr, shared.ErrVolumeLaunchUnsettled,
 					"a later independent observation cannot erase durable dispatch uncertainty")
+				require.True(t, shared.IsLifecyclePending(retryErr))
 			case "journal reopen":
 				require.Error(t, closeErr, "initial uncertainty must retain a retry owner")
 				h.reopen()
 				bindBackendTestCloseExecutor(t, h.b, h.b.closeSettlement)
 				require.NoError(t, h.b.recoverState(ctx), "a pending close is a lease-local startup deferral")
+				recoveredErr := h.b.Deprovision(ctx, h.leaseUUID)
+				require.ErrorIs(t, recoveredErr, shared.ErrVolumeLaunchUnsettled)
+				require.True(t, shared.IsLifecyclePending(recoveredErr))
 			}
 			assertPending := func() {
 				t.Helper()

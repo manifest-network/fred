@@ -231,6 +231,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Each tenant can prepare one image at a time, sharing four staging slots;
+  requests waiting for the same tenant hold neither a staging slot nor the
+  collection gate. Pending maintenance is bounded to 16 commands and 8 MiB per
+  tenant within the existing provider limits. Exact replay and settlement remain
+  available above the new limits; transaction-owned counters avoid rescanning
+  the journal on every request. Image pins have a 10,000-pin tenant share within
+  the existing 100,000-pin total; exact pin reuse and recovery remain available
+  above the share. Legacy pins without proven tenant attribution conservatively
+  consume each tenant's fresh share until positively attributed or pruned.
+  (ENG-1052)
+
 - Docker image registry requests now originate from `docker-backend` over HTTPS
   with its process proxy settings and system CA trust. Classic `overlay2` and
   containerd `overlayfs` are the supported image stores; other drivers fail
@@ -799,6 +810,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- K3s stub failure completion and deprovision now share one per-lease command
+  fence across proof and durable publication, preventing concurrent close from
+  consuming a stale unresolved-operation claim. (ENG-1052)
+
+- A close fenced by journal-owned launch debt now returns breaker-neutral
+  `503 lifecycle_pending`, including after restart. Historical active-manifest
+  replay accepts equivalent item order while preserving exact principal and
+  item contents. Confirmed maintenance completions are prioritized ahead of
+  the ordinary bounded recovery batch. (ENG-1052)
+- Legacy image pin backfill runs only after fatal startup checks succeed.
+  Classic Docker reuses multi-platform local images by their selected config
+  identity, including content above a subsequently lowered image size cap.
+  (ENG-1052)
+
 - Images built by Docker Compose can retain its three standard build stamps.
   Admitted metadata owns their replacements: compiled projects bind their own
   project/service/version, and ordinary direct/helper creation writes neutral
@@ -1295,9 +1320,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Docker startup quota reconciliation now attempts every expected present live
   or retained volume and then fails startup/readiness on any inventory,
   immutable-resource-authority, or quota-enforcement error. A truly fresh XFS
-  root does not need `CAP_FOWNER`, but an existing tree may need it for recursive
-  project-ID re-tagging; the backend no longer serves while a known tenant
-  volume may remain uncapped. (ENG-632)
+  root does not need `CAP_FOWNER`; repairing an existing root changes only that
+  pinned inode and logs the verified repair, without walking tenant files. The
+  backend no longer serves while a known tenant volume may remain uncapped.
+  (ENG-632)
 - XFS volume creation now prepares a parent-synced, typed hidden stage carrying
   the nonzero project ID and final managed name, writes and syncs its marker,
   applies the project tag and limits, and only then publishes the final name with
@@ -1516,10 +1542,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   import allocation, periodic high/low-watermark collection and durable immutable image
   pins. Production collection requires durable exclusive ownership of its Docker
   daemon's image cache; shared development daemons cannot delete images.
-  Admitted imports receive a 30-second completion grace after caller cancellation
-  or backend shutdown;
-  imports with unknown completion retain a durable allocation debit across
-  restarts, while observed terminal failures settle their allocation.
+  Dispatched imports belong to the loader and survive tenant cancellation;
+  backend shutdown grants its full 90-second drain budget before canceling
+  remaining imports. Imports with unknown completion retain a durable allocation
+  debit across restarts, while observed terminal failures settle their allocation.
+  Unknown debit continues to count against disk headroom without preventing
+  collection of unrelated unused images. Collection metrics distinguish ordinary
+  work in progress from uncertainty requiring operator attention.
   Containerd admission proves extraction with a stopped, journal-owned probe
   before pinning or use, and legacy pins acquire their verified allowance by
   exact-digest ingestion. Admission waits for live content-helper creation and

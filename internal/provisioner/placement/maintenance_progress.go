@@ -221,7 +221,8 @@ func (s *Store) acceptMaintenanceUpdate(delivery maintenanceDelivery) (maintenan
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var accepted maintenanceWork
-	err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+	err := s.updateMaintenanceAuthority(func(journal *maintenanceJournalTransaction) error {
+		tx := journal.tx
 		command, encoded, err := pendingMaintenanceCommandTx(tx, delivery.claim)
 		if err != nil {
 			return err
@@ -243,11 +244,7 @@ func (s *Store) acceptMaintenanceUpdate(delivery maintenanceDelivery) (maintenan
 		if err != nil {
 			return err
 		}
-		_, records, err := maintenanceCommandBuckets(tx)
-		if err != nil {
-			return err
-		}
-		if err := records.Put(maintenanceReceiptKey(command.leaseUUID, command.id), value); err != nil {
+		if err := journal.write(value); err != nil {
 			return err
 		}
 		accepted = acceptedMaintenanceUpdate{claim: MaintenanceCommandClaim{issuer: s, command: command}}

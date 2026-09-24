@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"reflect"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -16,6 +15,7 @@ import (
 // ImagePinBackfillSubject is the exact active generation held by the backfiller's
 // lease transition lock. Detached Release values cannot authorize pin writes.
 type ImagePinBackfillSubject struct {
+	issuer  *ImagePinJournal
 	lease   string
 	release Release
 }
@@ -83,7 +83,8 @@ func (b *ImagePinBackfiller) Sweep(ctx context.Context) (ImagePinBackfillReport,
 		unlock()
 		if err != nil {
 			var unavailable *unavailableImagePinEvidence
-			if errors.As(err, &unavailable) {
+			var capacity *imagePinCapacityRefusal
+			if errors.As(err, &unavailable) || errors.As(err, &capacity) {
 				report.UnresolvedLeases++
 				continue
 			}
@@ -146,7 +147,8 @@ func (b *ImagePinBackfiller) sweepLease(ctx context.Context, lease string) (int,
 	if len(missing) == 0 {
 		return 0, false, nil
 	}
-	observations, err := b.observer.ObserveImagePins(ctx, ImagePinBackfillSubject{lease: lease, release: cloneRelease(*release)})
+	subject := ImagePinBackfillSubject{issuer: j, lease: lease, release: cloneRelease(*release)}
+	observations, err := b.observer.ObserveImagePins(ctx, subject)
 	if ctx.Err() != nil {
 		return 0, false, ctx.Err()
 	}
@@ -178,32 +180,17 @@ func (b *ImagePinBackfiller) sweepLease(ctx context.Context, lease string) (int,
 		return 0, true, nil
 	}
 	added := 0
-	err = j.callbacks.update(func(tx *bolt.Tx) error {
-		settled, err := imagePinBackfillSettled(tx, lease)
+	err = j.updatePins(func(writer *imagePinTransaction) error {
+		authority, err := writer.forBackfill(subject)
 		if err != nil {
 			return err
 		}
-		if !settled {
-			return errors.New("image pin backfill generation is no longer settled")
-		}
-		bucket, err := tx.CreateBucketIfNotExists(imagePinsBucketName)
-		if err != nil {
-			return err
-		}
-		count := bucket.Stats().KeyN
 		for _, pin := range pins {
-			key := imagePinKey(lease, hash, pin.Reference)
-			if bucket.Get(key) != nil {
+			bucket := writer.tx.Bucket(imagePinsBucketName)
+			if bucket != nil && bucket.Get(imagePinKey(lease, hash, pin.Reference)) != nil {
 				continue
 			}
-			if count+added >= maxImagePins {
-				return fmt.Errorf("image pin journal capacity exceeded")
-			}
-			data, err := json.Marshal(pin)
-			if err != nil {
-				return err
-			}
-			if err := bucket.Put(key, data); err != nil {
+			if err := writer.put(authority, pin); err != nil {
 				return err
 			}
 			added++

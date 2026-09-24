@@ -45,7 +45,8 @@ type ImagePinJournal struct {
 	journalPair
 	inspections *ImageInspectionJournal
 	retentions  *RetentionStore
-	mu          sync.Mutex
+	mu          *sync.Mutex
+	accounting  *imagePinAccounting
 }
 
 func NewImagePinJournal(store *CallbackStore, releases *ReleaseStore, retentions *RetentionStore) (*ImagePinJournal, error) {
@@ -56,6 +57,14 @@ func NewImagePinJournal(store *CallbackStore, releases *ReleaseStore, retentions
 	if !retentionStoreIsOpen(retentions) || retentions.backendAuthorityGate != store.backendAuthorityGate ||
 		retentions.binding.backendName != store.binding.backendName || retentions.binding.storageID != store.binding.storageID {
 		return nil, errors.New("image pins require the exact identity-bound retention journal")
+	}
+	store.imagePins.mu.Lock()
+	defer store.imagePins.mu.Unlock()
+	if existing := store.imagePins.journal; existing != nil {
+		if existing.releases != releases || existing.retentions != retentions {
+			return nil, errors.New("image pins already bind different release or retention journals")
+		}
+		return existing, nil
 	}
 	// Pin verification needs inspection-origin authority, but constructing it
 	// must not create either optional image extension during read-only startup.
@@ -68,11 +77,15 @@ func NewImagePinJournal(store *CallbackStore, releases *ReleaseStore, retentions
 	}); err != nil {
 		return nil, err
 	}
-	j := &ImagePinJournal{journalPair: pair, inspections: inspections, retentions: retentions}
+	j := &ImagePinJournal{journalPair: pair, inspections: inspections, retentions: retentions, mu: &store.imagePins.mu}
 	// Reading or constructing the extension must not upgrade the journal. The
 	// downgrade boundary is its first admitted pin, never a failed startup.
-	_, err = j.List()
-	return j, err
+	j.accounting, err = j.loadAccounting()
+	if err != nil {
+		return nil, err
+	}
+	store.imagePins.journal = j
+	return j, nil
 }
 
 func imagePinManifestHash(payload []byte) (string, error) {
@@ -169,52 +182,14 @@ func (j *ImagePinJournal) Pin(origin ImageInspectionOrigin, ref, id, pullDigest 
 		return err
 	}
 	pin := ImagePin{LeaseUUID: lease, ManifestHash: hash, Reference: ref, ImageID: id, PullDigest: pullDigest, Platform: platform, ImportBytes: importBytes}
-	data, err := json.Marshal(pin)
-	if err != nil {
-		return err
-	}
-	if _, err := decodeImagePin(data); err != nil {
-		return err
-	}
 	unlock := j.lockLease(lease)
 	defer unlock()
-	return j.inspections.store.update(func(tx *bolt.Tx) error {
-		if err := prepared.verifyOrigin(tx); err != nil {
-			return err
-		}
-		bucket, err := tx.CreateBucketIfNotExists(imagePinsBucketName)
+	return j.updatePins(func(writer *imagePinTransaction) error {
+		authority, err := writer.forOrigin(prepared)
 		if err != nil {
 			return err
 		}
-		key := imagePinKey(lease, hash, ref)
-		if previous := bucket.Get(key); previous != nil {
-			old, err := decodeImagePin(previous)
-			if err != nil {
-				return err
-			}
-			if old.ImageID != id || old.Platform.OS != platform.OS || old.Platform.Architecture != platform.Architecture ||
-				old.Platform.Variant != platform.Variant || old.Platform.OSVersion != platform.OSVersion ||
-				!slices.Equal(old.Platform.OSFeatures, platform.OSFeatures) {
-				return errors.New("image pin cannot change immutable content")
-			}
-			fillRecoveryDigest := old.PullDigest == "" && importBytes > 0 && pullDigest != ""
-			if importBytes <= old.ImportBytes && !fillRecoveryDigest {
-				return nil
-			}
-			old.ImportBytes = max(old.ImportBytes, importBytes)
-			if fillRecoveryDigest {
-				old.PullDigest = pullDigest
-			}
-			updated, err := json.Marshal(old)
-			if err != nil {
-				return err
-			}
-			return bucket.Put(key, updated)
-		}
-		if bucket.Stats().KeyN >= maxImagePins {
-			return errors.New("image pin journal capacity exhausted")
-		}
-		return bucket.Put(key, data)
+		return writer.put(authority, pin)
 	})
 }
 
@@ -460,13 +435,9 @@ func (j *ImagePinJournal) collectLeasePins(lease string, pins []ImagePin, protec
 	if len(obsolete) == 0 {
 		return complete, nil
 	}
-	err = j.callbacks.update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(imagePinsBucketName)
-		if bucket == nil {
-			return errors.New("image pin bucket missing")
-		}
+	err = j.updatePins(func(writer *imagePinTransaction) error {
 		for _, key := range obsolete {
-			if err := bucket.Delete(key); err != nil {
+			if err := writer.remove(key); err != nil {
 				return err
 			}
 		}

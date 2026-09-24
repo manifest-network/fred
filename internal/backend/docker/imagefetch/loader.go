@@ -14,7 +14,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
@@ -22,7 +21,6 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
-	"github.com/manifest-network/fred/internal/backend/shared/completion"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -107,8 +105,9 @@ type loaderLifetime struct {
 	activeBytes int64
 }
 
-// Shutdown closes admission, starts the bounded cancellation grace for active
-// daemon exchanges, and waits for every admission owner to finish or Close.
+// Shutdown closes admission and lets admitted exchanges finish within the
+// backend's drain budget. Only expiry of that budget cancels daemon work;
+// tenant cancellation cannot terminate an import this owner already dispatched.
 func (l *Loader) Shutdown(ctx context.Context) error {
 	if l == nil || l.life == nil {
 		return nil
@@ -117,7 +116,6 @@ func (l *Loader) Shutdown(ctx context.Context) error {
 	life.mu.Lock()
 	if !life.closed {
 		life.closed = true
-		life.cancel()
 		if life.active == 0 {
 			close(life.drained)
 		}
@@ -126,8 +124,10 @@ func (l *Loader) Shutdown(ctx context.Context) error {
 	life.mu.Unlock()
 	select {
 	case <-drained:
+		life.cancel()
 		return nil
 	case <-ctx.Done():
+		life.cancel()
 		return ctx.Err()
 	}
 }
@@ -378,20 +378,32 @@ func (l *Loader) ImportAdmitted(ctx context.Context, admission *ImportAdmission)
 	if err := ctx.Err(); err != nil {
 		return Imported{}, err
 	}
-	if err := l.life.shutdown.Err(); err != nil {
+	l.life.mu.Lock()
+	if l.life.closed {
+		l.life.mu.Unlock()
 		return Imported{}, errors.New("image loader is shut down")
 	}
 	owned.dispatched = true
+	l.life.mu.Unlock()
 	defer func() { _ = owned.finish(false) }()
 	state := owned.prepared
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	lifetime := completion.New(ctx, 30*time.Second, l.life.shutdown)
-	defer lifetime.Close()
-	work := lifetime.Context()
+	// Dispatch transfers execution lifetime to the loader. Keep the prepared
+	// files and allocation owned until the actual daemon exchange completes,
+	// even when the tenant closes its lease or its pull deadline expires.
+	work := l.life.shutdown
 	reader, writer := io.Pipe()
 	written := make(chan error, 1)
 	go func() { err := writeArchive(work, writer, state.blobs); _ = writer.CloseWithError(err); written <- err }()
+	// Foreign daemon/response code can panic. The upload still owns the staged
+	// blobs until its writer has stopped; cleanup must join it before releasing
+	// either the preparation mutex or the loader's active admission.
+	finishUpload := sync.OnceValue(func() error {
+		_ = reader.Close()
+		return <-written
+	})
+	defer func() { _ = finishUpload() }()
 	response, err := l.daemon.ImageLoad(work, reader, client.ImageLoadWithQuiet(true), client.ImageLoadWithPlatforms(state.imported.platform))
 	var completion importCompletion
 	if err == nil {
@@ -403,7 +415,7 @@ func (l *Loader) ImportAdmitted(ctx context.Context, admission *ImportAdmission)
 		}
 	}
 	_ = reader.CloseWithError(err)
-	uploadErr := <-written
+	uploadErr := finishUpload()
 	err = errors.Join(err, uploadErr)
 	if completion.completed && uploadErr == nil {
 		if settleErr := owned.finish(true); settleErr != nil {
