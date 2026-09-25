@@ -920,7 +920,7 @@ Content-Type: application/json
 }
 ```
 
-Deploy a new manifest for a lease, replacing containers with a new image/configuration. The old containers are stopped, new ones are created from the updated manifest, and old containers are cleaned up after verification. On failure, the operation rolls back to the previous containers. Volumes are preserved.
+Deploy a new manifest for a lease, replacing containers with a new image/configuration. Fred captures the exact source before replacing it. If replacement fails and Docker effects are settled, bounded compensation can preserve or recreate that source. Unknown effects remain pending; lease close or backend shutdown cancels compensation while retaining completion ownership. Volumes are preserved, but compensation does not undo application writes or database migrations.
 
 The accepted manifest is persisted as **pending desired state** in the maintenance
 journal. HTTP `202` confirms that durable acceptance, while the replay payload

@@ -628,7 +628,10 @@ Signed completion wakes recovery. Each backend interleaves durably confirmed
 completions with an ordinary rotating batch of at most 32 retries, and alternates
 which class leads successive passes. Each class has its own progress cursor, so
 slow or persistently failing completion settlement cannot continually consume
-the entire backend budget before an ordinary retry gets an opportunity. Selection uses
+the entire backend budget before an ordinary retry gets an opportunity.
+This fairness applies across returning recovery passes: a synchronous payload
+write must return before another pass can start; the lane deadline does not abort
+that write. Selection uses
 compact committed lease/ID/backend/phase accounting; only the exact commands
 actually processed are decoded. A confirmed
 command therefore does not wait for the ordinary batch cursor to reach its lease. Live
