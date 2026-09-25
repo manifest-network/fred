@@ -243,13 +243,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   across HTTP and worker drain. Admitted image imports have a separate
   30-minute ceiling from dispatch, shortened by shutdown. For planned stops,
   quiesce mutations and wait for outstanding import allocation to reach zero.
-  The bound listener answers 503 until backend startup succeeds. (ENG-1052)
+  Listener availability continues to mean startup completed: a temporary bind
+  probe detects conflicts before recovery, and serving starts only after recovery.
+  Shutdown logs outstanding import allocation because its outcome counter may
+  no longer be scrapeable. (ENG-1052)
 
-- Concurrent cold preparations of one immutable image source and platform now
-  share a verified download/import. Followers consume no staging slot and
-  retain independent lease pin authority; cancellation cannot release another
-  preparation’s import ownership. Cache/local reuse is checked again after
-  queue admission. (ENG-1052)
+- Concurrent cold preparations of one immutable image source, platform and
+  verification budget share a manager-owned download/import. Closing the first
+  lease preserves progress for surviving members. The flight owns the staging
+  slot, competes using its least-loaded live tenant and transfers that charge
+  when necessary. Each member retains its own deadline and pin authority;
+  dispatched imports keep independent completion ownership. (ENG-1052)
+
+- Image verification admits large dependency trees through one bounded
+  namespace-memory allowance instead of a fixed entry-count cutoff. Ordinary
+  and saved recovery use the same allowance; compressed/decoded byte limits,
+  path-work limits and complete physical import accounting remain enforced.
+  This supports the measured 167,561-entry Morpheus image. (ENG-1052)
+
+- Image import accounting separately reserves retained metadata for decoded
+  padding after the tar terminator, including compression streams that produce
+  one retained JSON segment per decoded byte. (ENG-1052)
+
+- Registry reads retry transient connection, no-progress and availability
+  failures with a shared three-attempt bound per request. Immutable layer
+  downloads resume retained prefixes when Range is supported; integrity and
+  size checks remain mandatory. Completed layers and Docker imports are not
+  replayed. (ENG-1052)
+
+- Deferred closes older than 35 minutes emit an Error and increment the bounded
+  `overdue` outcome once per retained entry. Retries continue with their existing
+  ownership and durable-effect obligations. (ENG-1052)
 
 - Image downloads share four staging slots. A sole tenant can use all four;
   waiting tenants with fewer active downloads receive the next available slot,
@@ -855,7 +879,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   during downloads, while image deletion continues to protect active work.
   Pin accounting writes require the journal's scoped lock owner. (ENG-1052)
 
-- TLS validation and listener binding precede startup image-pin backfill.
+- TLS validation and a temporary listener bind probe precede startup image-pin backfill.
   Historical manifest replay compares instance topology independently of
   previously effective
   custom-domain routing, while binding the exact newly admitted request to its

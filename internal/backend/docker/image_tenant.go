@@ -21,31 +21,65 @@ type imageTenantShares struct {
 	waiters []*imageTenantWaiter
 }
 type imageTenantWaiter struct {
-	tenant   string
-	ready    chan struct{}
-	admitted bool
+	owner                       *imageTenantShares
+	members                     map[string]int
+	tenants                     []string
+	ready                       chan struct{}
+	tenant                      string // Active accounting sponsor; the slot itself belongs to the flight.
+	claimed, admitted, released bool
 }
 
-func (s *imageTenantShares) acquire(ctx context.Context, tenant string) (func(), error) {
+// updateMember changes scheduling evidence, never staging authority. A flight
+// competes at its least-loaded live member's share, and transfers an active
+// charge if that sponsor leaves. The flight retains the slot until cleanup.
+func (s *imageTenantShares) updateMember(w *imageTenantWaiter, tenant string, delta int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w.members[tenant] == 0 && delta > 0 {
+		w.tenants = append(w.tenants, tenant)
+	}
+	w.members[tenant] += delta
+	if w.members[tenant] == 0 {
+		delete(w.members, tenant)
+		for i, member := range w.tenants {
+			if member == tenant {
+				w.tenants = slices.Delete(w.tenants, i, i+1)
+				break
+			}
+		}
+	}
+	if w.admitted && !w.released && w.members[w.tenant] == 0 {
+		s.uncharge(w.tenant)
+		w.tenant = s.bestTenant(w)
+		if w.tenant != "" {
+			s.active[w.tenant]++
+		}
+	}
+	s.admit()
+}
+
+func (s *imageTenantShares) acquire(ctx context.Context, waiter *imageTenantWaiter) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
+	if waiter == nil || waiter.owner != s || waiter.claimed || len(waiter.members) == 0 {
+		s.mu.Unlock()
+		return nil, errors.New("image staging requires an unconsumed live flight")
+	}
 	if s.active == nil {
 		s.active = make(map[string]int)
 	}
-	waiter := &imageTenantWaiter{tenant: tenant, ready: make(chan struct{})}
+	waiter.claimed = true
 	s.waiters = append(s.waiters, waiter)
 	s.admit()
 	s.mu.Unlock()
 	release := sync.OnceFunc(func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		waiter.released = true
 		s.used--
-		s.active[tenant]--
-		if s.active[tenant] == 0 {
-			delete(s.active, tenant)
-		}
+		s.uncharge(waiter.tenant)
 		s.admit()
 	})
 	select {
@@ -73,37 +107,57 @@ func (s *imageTenantShares) acquire(ctx context.Context, tenant string) (func(),
 	}
 }
 
+func (s *imageTenantShares) uncharge(tenant string) {
+	if tenant == "" {
+		return
+	}
+	s.active[tenant]--
+	if s.active[tenant] == 0 {
+		delete(s.active, tenant)
+	}
+}
+
+func (s *imageTenantShares) bestTenant(w *imageTenantWaiter) string {
+	var selected string
+	for _, tenant := range w.tenants {
+		if selected == "" || s.active[tenant] < s.active[selected] {
+			selected = tenant
+		}
+	}
+	return selected
+}
+
 func (s *imageTenantShares) admit() {
 	for s.used < maxImageStages && len(s.waiters) != 0 {
-		selected := 0
+		selected, tenant := -1, ""
 		for index, waiter := range s.waiters {
-			if s.active[waiter.tenant] < s.active[s.waiters[selected].tenant] {
-				selected = index
+			candidate := s.bestTenant(waiter)
+			if candidate != "" && (selected < 0 || s.active[candidate] < s.active[tenant]) {
+				selected, tenant = index, candidate
 			}
+		}
+		if selected < 0 {
+			return
 		}
 		waiter := s.waiters[selected]
 		s.waiters = slices.Delete(s.waiters, selected, selected+1)
 		s.used++
-		s.active[waiter.tenant]++
-		waiter.admitted = true
+		s.active[tenant]++
+		waiter.tenant, waiter.admitted = tenant, true
 		close(waiter.ready)
 	}
 }
 
 // imageTenantPreparation comes only from a Started journal subject, never a
-// caller-selected tenant string. Copies share a single-use staging entitlement.
-// Constructing it takes no capacity. Only actual staging consumes a slot, and
-// retains that slot until cleanup even if a copied parent closes first.
+// caller-selected tenant string. It can join flights but cannot stage work.
+// Closing it releases membership; only the flight owns staged files and slots.
 type imageTenantPreparation struct{ state *imageTenantPreparationState }
 type imageTenantPreparationState struct {
-	owner        *imageCapacityManager
-	tenant       string
-	release      func()
-	mu           sync.Mutex
-	closed       bool
-	stageClaimed bool
-	staging      bool
-	flights      map[*imageFlightMembership]struct{}
+	owner   *imageCapacityManager
+	tenant  string
+	mu      sync.Mutex
+	closed  bool
+	flights map[*imageFlightMembership]struct{}
 }
 
 func (m *imageCapacityManager) beginTenantPreparation(ctx context.Context, mutations *storageMutations) (imageTenantPreparation, error) {
@@ -124,37 +178,6 @@ func (m *imageCapacityManager) beginTenantPreparation(ctx context.Context, mutat
 	return imageTenantPreparation{state: &imageTenantPreparationState{owner: m, tenant: tenant}}, nil
 }
 
-func (p imageTenantPreparation) startStaging(ctx context.Context, m *imageCapacityManager) error {
-	if p.state == nil || p.state.owner != m {
-		return errors.New("image staging requires its tenant preparation owner")
-	}
-	p.state.mu.Lock()
-	if p.state.closed || p.state.stageClaimed {
-		p.state.mu.Unlock()
-		return errors.New("image tenant preparation staging is already consumed")
-	}
-	p.state.stageClaimed, p.state.staging = true, true
-	p.state.mu.Unlock()
-	release, err := m.tenantShares.acquire(ctx, p.state.tenant)
-	p.state.mu.Lock()
-	defer p.state.mu.Unlock()
-	if err != nil {
-		p.state.staging = false
-		return err
-	}
-	p.state.release = release
-	return nil
-}
-
-func (p imageTenantPreparation) finishStaging() {
-	p.state.mu.Lock()
-	defer p.state.mu.Unlock()
-	p.state.staging = false
-	if p.state.release != nil {
-		p.state.release()
-	}
-}
-
 func (p imageTenantPreparation) close() {
 	p.state.mu.Lock()
 	defer p.state.mu.Unlock()
@@ -163,7 +186,4 @@ func (p imageTenantPreparation) close() {
 		flight.close()
 	}
 	p.state.flights = nil
-	if !p.state.staging && p.state.release != nil {
-		p.state.release()
-	}
 }

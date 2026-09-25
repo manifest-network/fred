@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -35,7 +34,7 @@ type Importer interface {
 type Loader struct {
 	daemon    Importer
 	stageRoot string
-	maxBytes  int64
+	budget    imagebudget.VerificationBudget
 	ledger    *debitLedger
 	transport http.RoundTripper
 	life      *loaderLifetime
@@ -45,14 +44,15 @@ type Loader struct {
 // caller must hold exclusive authority for that directory while this Loader is
 // used. Copies of a Loader share the same durable debit synchronization.
 func NewLoader(source Importer, stageRoot string, maxBytes int64, options ...Option) (*Loader, error) {
-	if util.IsNilInterface(source) || !filepath.IsAbs(stageRoot) || !validByteLimit(maxBytes) {
+	budget, err := imagebudget.NewVerificationBudget(maxBytes)
+	if util.IsNilInterface(source) || !filepath.IsAbs(stageRoot) || err != nil {
 		return nil, errors.New("image importer requires a daemon, absolute staging directory, and bounded positive byte limit")
 	}
 	if info, err := os.Stat(stageRoot); err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("image staging directory is unavailable: %s", stageRoot)
 	}
 	shutdown, cancel := context.WithCancel(context.Background())
-	loader := &Loader{daemon: source, stageRoot: stageRoot, maxBytes: maxBytes, ledger: &debitLedger{root: stageRoot}, transport: remote.DefaultTransport, life: &loaderLifetime{shutdown: shutdown, cancel: cancel, drained: make(chan struct{})}}
+	loader := &Loader{daemon: source, stageRoot: stageRoot, budget: budget, ledger: &debitLedger{root: stageRoot}, transport: remote.DefaultTransport, life: &loaderLifetime{shutdown: shutdown, cancel: cancel, drained: make(chan struct{})}}
 	for _, option := range options {
 		if option == nil {
 			cancel()
@@ -66,7 +66,9 @@ func NewLoader(source Importer, stageRoot string, maxBytes int64, options ...Opt
 	return loader, nil
 }
 
-func validByteLimit(maxBytes int64) bool { return maxBytes > 0 && maxBytes <= math.MaxInt64/8 }
+// VerificationBudget is this issuer's staging and decoding ceiling. Flight
+// admission derives its identity and reservation from this same typed value.
+func (l *Loader) VerificationBudget() imagebudget.VerificationBudget { return l.budget }
 
 // WithBudget derives a distinct preparation issuer for bounded recovery while
 // retaining this owner's transport, durable debit ledger and shutdown lifetime.
@@ -77,7 +79,7 @@ func (l *Loader) WithBudget(budget imagebudget.VerificationBudget) (*Loader, err
 		return nil, errors.New("image recovery requires a bounded positive byte limit")
 	}
 	derived := *l
-	derived.maxBytes = budget.Bytes()
+	derived.budget = budget
 	return &derived, nil
 }
 

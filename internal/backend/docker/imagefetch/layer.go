@@ -21,7 +21,6 @@ import (
 )
 
 const (
-	maxLayerEntries      = 131072
 	maxPathBytes         = 4096
 	maxHeaderBytes       = 64 << 10
 	maxRetainedPathBytes = 32 << 20
@@ -35,6 +34,7 @@ type layerBudget struct {
 	entries, nodes, pathBytes, resolvedBytes int
 	layer                                    int
 	root                                     *layerNode
+	namespace                                namespaceMemory
 }
 
 // layerNode models the actual image namespace, including inherited aliases.
@@ -92,6 +92,7 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 	reader := tar.NewReader(stream)
 	if budget.root == nil {
 		budget.root = &layerNode{kind: tar.TypeDir, children: make(map[string]*layerNode)}
+		budget.namespace = newNamespaceMemory()
 	}
 	budget.layer++
 	tree := layerTree{budget: budget, seen: make(map[string]bool)}
@@ -108,10 +109,10 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		budget.entries++
-		if budget.entries > maxLayerEntries {
-			return errors.New("image layers exceed entry budget")
+		if err := budget.namespace.claim(namespaceHeaderMemory); err != nil {
+			return err
 		}
+		budget.entries++
 		metadata := len(header.Name) + len(header.Linkname) + len(header.Uname) + len(header.Gname)
 		for key, value := range header.PAXRecords {
 			if header.Typeflag != tar.TypeXGlobalHeader && (strings.HasPrefix(key, "SCHILY.xattr.trusted.overlay.") || strings.HasPrefix(key, "SCHILY.xattr.user.overlay.")) {
@@ -175,20 +176,23 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 	}
 	// A tar terminator is not a compression terminator. Charge trailing decoded
 	// bytes and require the entire compressor checksum and diffID to match.
-	if _, err := io.Copy(io.Discard, stream); err != nil {
+	tailBytes, err := io.Copy(io.Discard, stream)
+	if err != nil {
 		return err
 	}
 	if hex.EncodeToString(hash.Sum(nil)) != diffID.Encoded() {
 		return errors.New("image layer differs from its uncompressed digest")
 	}
 	consumed := budget.remaining - bounded.remaining
-	// Classic Docker retains every non-file byte in tar-split JSON, including
-	// PAX/long-name headers and arbitrary post-EOF padding. Base64 expands these
-	// bytes by 4/3; twice their raw size covers that expansion and gzip framing
-	// or incompressible output. Per-entry JSON names/checksums/escaping and fixed
-	// compressor headers are covered by entry and per-layer metadata allowances.
-	// Charge each layer occurrence, even when its compressed blob is shared.
-	budget.allocated += 2 * (consumed - payload)
+	// Header/inter-entry segments are parser-owned and bounded by the entry
+	// allowance. Post-EOF padding can instead emit one JSON segment per byte;
+	// retain its independent framing allowance for every layer occurrence.
+	metadata := retainedTarMetadata{parserBytes: uint64(consumed - payload - tailBytes), tailBytes: uint64(tailBytes)}
+	allowance, err := metadata.allowance(uint64(budget.allocated))
+	if err != nil {
+		return err
+	}
+	budget.allocated += allowance
 	budget.remaining -= max(consumed, logical)
 	return nil
 }
@@ -212,13 +216,16 @@ func (t *layerTree) accountName(name string) error {
 	if len(name) > maxRetainedPathBytes-t.budget.pathBytes {
 		return errors.New("image paths exceed retained path byte budget")
 	}
+	if err := t.budget.namespace.claim(namespaceStringMemory(len(name))); err != nil {
+		return err
+	}
 	t.budget.pathBytes += len(name)
 	return nil
 }
 
 func (t *layerTree) newNode(name string, kind byte) (*layerNode, error) {
-	if t.budget.nodes >= maxLayerEntries {
-		return nil, errors.New("image explicit and implicit paths exceed entry budget")
+	if err := t.budget.namespace.claim(namespaceNodeMemory); err != nil {
+		return nil, err
 	}
 	if err := t.accountName(name); err != nil {
 		return nil, err

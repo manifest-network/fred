@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -113,6 +114,7 @@ type imageCapacityManager struct {
 	probeGate    chan struct{}
 	tenantShares imageTenantShares
 	flights      imageFlights
+	lifetime     context.Context
 }
 
 func newImageCapacityManager(ctx context.Context, b *Backend, docker *DockerClient) (*imageCapacityManager, error) {
@@ -130,7 +132,7 @@ func newImageCapacityManager(ctx context.Context, b *Backend, docker *DockerClie
 	manager := &imageCapacityManager{
 		daemon: docker.client, runtime: docker.images, docker: docker, pins: pins,
 		fs: localFilesystemCapacity{}, cfg: b.cfg, gate: make(chan struct{}, 1),
-		probeGate: make(chan struct{}, 1),
+		probeGate: make(chan struct{}, 1), lifetime: b.stopCtx,
 	}
 	if manager.cfg.ProductionMode {
 		if err := manager.checkFilesystems(ctx, false, false); err != nil {
@@ -422,7 +424,7 @@ func (m *imageCapacityManager) resolveImage(ctx context.Context, tenantPreparati
 // writes. The loader owns the exact verified bytes; Docker never re-fetches
 // content from a tenant-controlled registry after validation.
 func (m *imageCapacityManager) ingest(ctx context.Context, tenantPreparation imageTenantPreparation, original, source string) (resolvedImage, error) {
-	return m.ingestBounded(ctx, tenantPreparation, original, source, m.loader, m.cfg.ImageMaxSizeMB*imageMiB)
+	return m.ingestBounded(ctx, tenantPreparation, original, source, m.loader)
 }
 
 // Recovery has already selected a durable immutable identity. Its verification
@@ -465,10 +467,10 @@ func (m *imageCapacityManager) ingestRecovery(ctx context.Context, tenantPrepara
 	if err != nil {
 		return resolvedImage{}, err
 	}
-	return m.ingestBounded(ctx, tenantPreparation, original, pin.PullDigest, loader, verification.Bytes())
+	return m.ingestBounded(ctx, tenantPreparation, original, pin.PullDigest, loader)
 }
 
-func (m *imageCapacityManager) ingestBounded(ctx context.Context, tenantPreparation imageTenantPreparation, original, source string, loader *imagefetch.Loader, budget int64) (resolvedImage, error) {
+func (m *imageCapacityManager) ingestBounded(ctx context.Context, tenantPreparation imageTenantPreparation, original, source string, loader *imagefetch.Loader) (resolvedImage, error) {
 	info, err := m.daemon.Info(ctx)
 	if err != nil {
 		return resolvedImage{}, err
@@ -487,12 +489,14 @@ func (m *imageCapacityManager) ingestBounded(ctx context.Context, tenantPreparat
 		return cached, err
 	}
 	for {
-		member, leader, err := tenantPreparation.joinFlight(m, resolution)
+		member, leader, err := tenantPreparation.joinFlight(m, resolution, loader.VerificationBudget())
 		if err != nil {
 			return resolvedImage{}, err
 		}
 		if leader != nil {
-			m.runImageFlight(ctx, leader, tenantPreparation, original, resolution, loader, budget, info)
+			go leader.run(func(work context.Context) imageFlightOutcome {
+				return m.stageImageFlight(work, leader, original, resolution, loader, info)
+			})
 		}
 		outcome, err := member.wait(ctx)
 		if err != nil {
@@ -541,16 +545,8 @@ func (m *imageCapacityManager) reuseResolvedImage(ctx context.Context, original 
 	return resolvedImage{}, false, nil
 }
 
-func (m *imageCapacityManager) runImageFlight(ctx context.Context, leader *imageFlightLeader, tenantPreparation imageTenantPreparation, original string, resolution imagefetch.Resolution, loader *imagefetch.Loader, budget int64, info system.Info) {
-	// Foreign registry/SDK panics propagate to the worker boundary, but cannot
-	// strand followers or let them assume an uncertain dispatch never happened.
-	defer leader.complete(imageFlightFailure{err: errors.New("image preparation ended without completion")})
-	outcome := m.stageImageFlight(ctx, tenantPreparation, original, resolution, loader, budget, info)
-	leader.complete(outcome)
-}
-
-func (m *imageCapacityManager) stageImageFlight(ctx context.Context, tenantPreparation imageTenantPreparation, original string, resolution imagefetch.Resolution, loader *imagefetch.Loader, budget int64, info system.Info) imageFlightOutcome {
-	staging, err := m.reserveStaging(ctx, tenantPreparation, budget)
+func (m *imageCapacityManager) stageImageFlight(ctx context.Context, worker *imageFlightLeader, original string, resolution imagefetch.Resolution, loader *imagefetch.Loader, info system.Info) imageFlightOutcome {
+	staging, err := m.reserveStaging(ctx, worker, worker.state.key.verification.Bytes())
 	if err != nil {
 		return imageFlightBeforeDispatchFailure(ctx, err)
 	}
@@ -691,6 +687,8 @@ func (m *imageCapacityManager) inspectionAdmissionChange(ctx context.Context, in
 func (m *imageCapacityManager) observeImportDebit() {
 	if pending, err := m.loader.PendingBytes(); err == nil {
 		imageImportPendingBytes.Set(float64(pending))
+	} else {
+		slog.Warn("image import allocation observation failed", "backend", m.cfg.Name, "error", err)
 	}
 }
 

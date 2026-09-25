@@ -101,7 +101,7 @@ func TestLayerBoundsImplicitPathsBeforeAllocation(t *testing.T) {
 	err := checkLayer(t, budget, encodedTar(t, headers...))
 	require.ErrorContains(t, err, "retained path byte budget")
 	require.LessOrEqual(t, budget.pathBytes, maxRetainedPathBytes)
-	require.LessOrEqual(t, budget.nodes, maxLayerEntries)
+	require.LessOrEqual(t, budget.nodes, int(maxNamespaceMemory/namespaceNodeMemory))
 }
 
 func TestLayerBoundsSymlinkLoops(t *testing.T) {

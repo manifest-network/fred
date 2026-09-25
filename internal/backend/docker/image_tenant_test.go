@@ -28,9 +28,14 @@ import (
 
 func imageTenantPreparationForTest(t *testing.T, m *imageCapacityManager) imageTenantPreparation {
 	t.Helper()
+	return imageTenantPreparationForTenantTest(t, m, "tenant-a")
+}
+
+func imageTenantPreparationForTenantTest(t *testing.T, m *imageCapacityManager, tenant string) imageTenantPreparation {
+	t.Helper()
 	lease := uuid.NewString()
 	var preparation imageTenantPreparation
-	_, runs := imagePreparationSubjects(t, map[string]string{lease: "example.invalid/app:1"}, nil,
+	_, runs := imagePreparationSubjects(t, map[string]string{lease: "example.invalid/app:1"}, map[string]string{lease: tenant},
 		func(ctx context.Context, mutations *storageMutations) error {
 			var err error
 			preparation, err = m.beginTenantPreparation(ctx, mutations)
@@ -42,12 +47,26 @@ func imageTenantPreparationForTest(t *testing.T, m *imageCapacityManager) imageT
 	return preparation
 }
 
+func imageShareForTest(shares *imageTenantShares, tenant string) *imageTenantWaiter {
+	waiter := &imageTenantWaiter{owner: shares, ready: make(chan struct{}), members: make(map[string]int)}
+	shares.updateMember(waiter, tenant, 1)
+	return waiter
+}
+
+func imageStagingFlightForTest(t *testing.T, m *imageCapacityManager) *imageFlightLeader {
+	t.Helper()
+	preparation := imageTenantPreparationForTest(t, m)
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	return &imageFlightLeader{state: &imageFlightState{manager: m, ctx: ctx, cancel: cancel, share: imageShareForTest(&m.tenantShares, preparation.state.tenant)}}
+}
+
 func TestImageTenantStagingOwnershipIsSingleUseAndRetainedThroughCleanup(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		m, _, _ := imageCapacityFixture(t)
-		preparation := imageTenantPreparationForTest(t, m)
+		preparation := imageStagingFlightForTest(t, m)
 		copyOfPreparation := preparation
-		_, err := m.reserveStaging(t.Context(), imageTenantPreparation{}, imageMiB)
+		_, err := m.reserveStaging(t.Context(), nil, imageMiB)
 		require.Error(t, err)
 		foreign, _, _ := imageCapacityFixture(t)
 		_, err = foreign.reserveStaging(t.Context(), preparation, imageMiB)
@@ -56,8 +75,8 @@ func TestImageTenantStagingOwnershipIsSingleUseAndRetainedThroughCleanup(t *test
 		require.NoError(t, err)
 		_, err = m.reserveStaging(t.Context(), copyOfPreparation, imageMiB)
 		require.Error(t, err, "copies cannot acquire another provider slot")
-		preparation.close()
-		copyOfPreparation.close()
+		preparation.state.cancel()
+		copyOfPreparation.state.cancel()
 		require.Equal(t, 1, m.tenantShares.used, "parent close cannot release an outstanding stage")
 		copyOfStage := stage
 		stage.close()
@@ -72,7 +91,7 @@ func TestImageTenantStagingPoolBorrowsUnusedCapacityAndPrioritizesNewTenantFIFO(
 		var shares imageTenantShares
 		owners := make([]func(), maxImageStages)
 		for index := range owners {
-			release, err := shares.acquire(t.Context(), "aggregator")
+			release, err := shares.acquire(t.Context(), imageShareForTest(&shares, "aggregator"))
 			require.NoError(t, err)
 			owners[index] = release
 		}
@@ -81,7 +100,7 @@ func TestImageTenantStagingPoolBorrowsUnusedCapacityAndPrioritizesNewTenantFIFO(
 		acquired := make(chan func(), 3)
 		for _, tenant := range []string{"aggregator", "new-tenant", "new-tenant"} {
 			go func() {
-				release, err := shares.acquire(t.Context(), tenant)
+				release, err := shares.acquire(t.Context(), imageShareForTest(&shares, tenant))
 				require.NoError(t, err)
 				order <- tenant
 				acquired <- release
@@ -113,13 +132,13 @@ func TestImageTenantWaitCancellationAndHeadroomRefusalReleaseCapacity(t *testing
 		m, _, fs := imageCapacityFixture(t)
 		var held []imageStaging
 		for range maxImageStages {
-			stage, err := m.reserveStaging(t.Context(), imageTenantPreparationForTest(t, m), imageMiB)
+			stage, err := m.reserveStaging(t.Context(), imageStagingFlightForTest(t, m), imageMiB)
 			require.NoError(t, err)
 			held = append(held, stage)
 		}
 		ctx, cancel := context.WithCancel(t.Context())
 		result := make(chan error, 1)
-		waiter := imageTenantPreparationForTest(t, m)
+		waiter := imageStagingFlightForTest(t, m)
 		go func() { _, err := m.reserveStaging(ctx, waiter, imageMiB); result <- err }()
 		synctest.Wait()
 		cancel()
@@ -130,13 +149,13 @@ func TestImageTenantWaitCancellationAndHeadroomRefusalReleaseCapacity(t *testing
 			stage.close()
 		}
 		fs[m.stageRoot] = diskCapacity{total: 100 * uint64(imageMiB), available: uint64(imageMiB)}
-		_, err := m.reserveStaging(t.Context(), imageTenantPreparationForTest(t, m), imageMiB)
+		_, err := m.reserveStaging(t.Context(), imageStagingFlightForTest(t, m), imageMiB)
 		require.Error(t, err)
 		require.Zero(t, m.tenantShares.used, "headroom refusal releases the owned slot")
 		require.Zero(t, m.staging)
 		require.Empty(t, m.tenantShares.active)
 		fs[m.stageRoot] = diskCapacity{total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB)}
-		stage, err := m.reserveStaging(t.Context(), imageTenantPreparationForTest(t, m), imageMiB)
+		stage, err := m.reserveStaging(t.Context(), imageStagingFlightForTest(t, m), imageMiB)
 		require.NoError(t, err)
 		stage.close()
 	})

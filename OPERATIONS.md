@@ -148,7 +148,7 @@ when later probes or recovery passes succeed.
 | `fred_backend_circuit_breaker_state{backend="X"} == 2` (open) | Backend X has been unhealthy long enough to trip the breaker | `curl backendX/health`, check backend logs |
 | `fred_backend_healthy{backend="X"} == 0` for >1 min | Backend health probe failing | Same as above. Note this no longer affects the tenant API's availability — the provider reports `degraded` and keeps serving |
 | `fred_docker_backend_volume_launches_pending > 0` beyond the expected launch window | Outstanding Docker launch receipts; a transient nonzero value is normal while launches run | Confirm recent successful backend health sampling, then correlate pending requests with backend logs. The gauge holds its last sample when health fails and does not count image-helper receipts. Follow [Unsettled Docker effects](#unsettled-docker-effects) for persistent unknown requests; never delete a receipt to clear the gauge |
-| `increase(fred_docker_backend_image_import_total{outcome=~"deadline\|shutdown"}[15m]) > 0` | An import owner reached its dispatch ceiling or shutdown deadline; Docker may still be unwinding | Correlate with pending import bytes and daemon logs. Before planned stops, fence new mutations, quiesce work and wait for pending bytes to reach zero. Owner cancellation is not completion proof |
+| `increase(fred_docker_backend_image_import_total{outcome="deadline"}[15m]) > 0` | An import owner reached its dispatch ceiling; Docker may still be unwinding | Correlate with pending import bytes and daemon logs. Before planned stops, fence new mutations, quiesce work and wait for pending bytes to reach zero. Owner cancellation is not completion proof |
 | `fred_docker_backend_image_import_pending_bytes > 0` beyond the normal import window | The gauge includes both live owned imports and allocation whose completion is unknown. A persistent value after the backend becomes idle can be durable import debt; restarting does not clear it | Correlate imports, Docker response failures and shutdown logs. Alert with a site-specific `for` duration longer than a normal import; investigate sustained debt using [Recovering outstanding image import allocation](#recovering-outstanding-image-import-allocation). Never clear the debit while the runtime can still allocate |
 | `increase(fred_docker_backend_image_gc_total{outcome="inhibited"}[15m]) > 0` together with sustained image-filesystem disk pressure | Incomplete pin authority or unresolved inspection evidence prevents safe deletion. This counter is diagnostic, not a standalone paging condition: pre-upgrade retained generations can legitimately lack pins for their remaining retention period | Check legacy pin-backfill warnings, retained rows and inspection receipts. Unpinned retained generations remain conservative until restored or safely reaped; the default grace is 90 days, plus the reaper interval, and unresolved reaping can extend it. Do not page on this expected upgrade condition while disk headroom is healthy. Docker inventory failures increment `outcome="error"`; ordinary live admissions increment `outcome="busy"`. Preserve authoritative evidence; import debt alone does not inhibit collection |
 | `increase(fred_maintenance_admission_refusals_total{reason=~"count\|bytes"}[5m]) > 0` | New restart/update admission reached the provider pending-journal count/byte cap. Existing commands can still replay and settle | Correlate pending phase/oldest-age gauges with backend completion and callback health. Restore stalled completion rather than deleting pending rows. `reserved_count` and `reserved_bytes` are caller backpressure (`429`) while preserving room for a tenant without pending work; exclude those reasons from provider exhaustion alerts |
@@ -206,6 +206,7 @@ when later probes or recovery passes succeed.
 | `fred_watermill_poisoned_messages_total > 0` | A handler exhausted retries on a message. Known close inventory/lifecycle waits and locally proven circuit refusals normally transfer to the bounded deferred-close scheduler instead | Read the topic and reason in the poison log. Queue saturation or shutdown can still return a close event error; reconciliation remains the durable recovery path |
 | `fred_provisioner_deferred_closes_pending` remains elevated | Queued or executing close retries await inventory projection, lifecycle ownership, or local backend circuit admission | Correlate `lease close deferred` with the bounded `reason` in `fred_provisioner_deferred_closes_total`. Restore the named dependency; never remove an inventory fence or durable attempt to accelerate a close |
 | `fred_provisioner_deferred_closes_oldest_age_seconds` keeps increasing | The oldest queued or executing lease entry has not left the provider scheduler. Its first-enqueue age survives coalescing and retries, so repeated hints do not hide an extended wait | Correlate the oldest affected lease in deferred-close logs with inventory, lifecycle ownership or the named backend circuit. The gauge refreshes approximately once per second and on queue mutations and is zero when empty or stopped; it is not durable close-intent age. Restore the dependency instead of deleting attempts or relaxing fences |
+| `fred_provisioner_deferred_closes_oldest_age_seconds > 2100` or `fred_provisioner_deferred_closes_total{outcome="overdue"}` increases | A retained close has waited beyond the 30-minute import ceiling plus five minutes. The scheduler emits an Error and increments `overdue` once per queued entry; retries and ownership continue | Inspect the named lease and backend dependency. Escalation never authorizes abandoning the close, releasing import allocation or deleting durable receipts |
 | `increase(fred_provisioner_deferred_closes_total{outcome=~"failed|full|unavailable"}[5m]) > 0` | A retry encountered an actual failure, all 1,024 slots were occupied, or scheduler admission was closed | Inspect `deferred lease close failed` and event errors. `dispatched` means the call returned successfully, not physical completion; verify the exact deprovision callback or backend retention status. A newer hint can remain queued after the older attempt increments `dispatched` or `failed`. No tenant or lease identifiers appear in metric labels |
 | `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
 | `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps | A volume owned by an exact retained-data tombstone cannot be destroyed — its footprint **is** counted in the admission pool (no over-admit) but pins capacity and likely needs manual repair. A rising `..._retention_leaked_total` with `reaping_bytes` flat is instead the self-healing rollback store-error case (no action). This is not unattributed-volume GC. | [Reclaiming retained-data / stuck-reaping volumes](#reclaiming-retained-data--stuck-reaping-volumes) |
@@ -485,10 +486,29 @@ Staging, import and extraction owners account for each other without holding a
 provider-wide lock during network or daemon I/O. A Started journal subject grants
 an image preparation its immutable tenant identity. Only an actual staging miss
 enters the four-slot pool; pinned and locally reusable images bypass this queue.
-Concurrent preparations of the same resolved source digest and platform share
-one verified download/import. Followers hold no staging slot and retain their
-own journal authority for pin publication. Canceling a follower cannot cancel
-the import owner. Cache/local reuse is checked again after queue admission.
+Concurrent preparations of the same resolved source digest, platform and
+verification budget share one manager-owned download/import. Each member keeps
+its own deadline and journal authority for pin publication; the first member
+has no special cancellation authority. The last member leaving cancels
+undispatched preparation. Dispatched imports retain their independent ownership.
+The flight owns its staging slot and competes using its least-loaded live tenant;
+if its accounting tenant leaves, a surviving tenant takes that charge. Cache/local reuse is checked again after queue admission.
+Verification uses a fixed 128-MiB logical namespace-memory allowance per flight,
+charged for every header, constructed node and rounded retained name. Replaced
+nodes and deleted paths do not refund parsing-work allowance. The 32-MiB retained
+path and 64-MiB path-resolution-work limits remain, as does the separately bounded
+64-MiB decoder. Four staging slots bound concurrent verification; the namespace
+allowance is an accounting model, not a hard process-RSS limit. Recovery uses the
+same fixed envelope even when its saved byte ceiling is smaller.
+Decoded padding after the tar terminator has a separate retained-metadata
+allowance: compression streams can make Docker retain one JSON segment per
+decoded byte. This charge is distinct from tar headers and file allocation.
+Registry GETs have at most three attempts for transient connection, no-progress
+or availability failures. Interrupted immutable blobs resume at the retained
+prefix length when the registry supports Range; otherwise only that blob's
+prefix is replayed. The final digest and descriptor size still bind all bytes.
+Completed layers and dispatched Docker imports are never retried through this
+path. Content, metadata and budget refusals remain terminal.
 A sole tenant can use all four slots for distinct images. When capacity becomes
 available, the waiting tenant with the fewest active stages goes first; ties and requests within
 a tenant follow arrival order. Waiting requests consume no staging allowance,
@@ -527,9 +547,11 @@ prevents startup; preserve it for investigation instead of deleting it. The
 allocation, including unknown completion.
 `fred_docker_backend_image_import_total{outcome}` counts each dispatched import
 once as `success`, `failure`, `deadline`, or `shutdown`. Deadline and shutdown
-are classified by the loader’s own lifetime; they are visible even while the
-Docker SDK is still unwinding. Such an outcome does not prove the daemon stopped
-allocating or authorize clearing its debit.
+are classified by the loader’s own lifetime. Deadline outcomes can be scraped
+while Docker unwinds; shutdown outcomes happen after the metrics listener closes
+and cannot be relied on for alerting. Shutdown instead logs a WARN with outstanding
+admitted bytes (or an unreadable-allocation warning). Such an outcome does not
+prove the daemon stopped allocating or authorize clearing its debit.
 These checks sample available space; they do not physically reserve it against
 concurrent tenant or unrelated host writes. Keep the tenant disk pool and other
 host consumers within the filesystem's usable capacity with operational headroom.

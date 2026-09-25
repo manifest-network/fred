@@ -47,7 +47,7 @@ func TestImageCapacityStartedMaintenanceReusesCachedImageWhileTenantStagesAreFul
 				return image.InspectResponse{ID: testImageID, Size: imageMiB}, nil
 			}
 			for range maxImageStages {
-				release, err := m.tenantShares.acquire(t.Context(), spec.Tenant)
+				release, err := m.tenantShares.acquire(t.Context(), imageShareForTest(&m.tenantShares, spec.Tenant))
 				require.NoError(t, err)
 				defer release()
 			}

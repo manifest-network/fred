@@ -83,7 +83,7 @@ func imageCapacityFixture(t *testing.T) (*imageCapacityManager, *dockerSDKView, 
 	_, err = newImageInspectionCoordinator(d, b.callbackStore, b.stopCtx, b.authorizeStorageMutation, b.completeStorageMutation,
 		b.resolveBackgroundStorageStep, b.terminalStorageAuthorityError, b.latchAmbiguousOperationOutcome)
 	require.NoError(t, err)
-	m := &imageCapacityManager{daemon: daemon, docker: d, pins: pins, fs: fs, cfg: cfg, stageRoot: stageRoot, gate: make(chan struct{}, 1), probeGate: make(chan struct{}, 1), owner: owner, access: owner}
+	m := &imageCapacityManager{lifetime: t.Context(), daemon: daemon, docker: d, pins: pins, fs: fs, cfg: cfg, stageRoot: stageRoot, gate: make(chan struct{}, 1), probeGate: make(chan struct{}, 1), owner: owner, access: owner}
 	m.runtime = (&mockDockerClient{InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
 		return nil, errdefs.NotFound(errors.New("image not cached"))
 	}}).imageAdmitter()

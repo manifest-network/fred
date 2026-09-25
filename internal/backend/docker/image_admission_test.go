@@ -244,9 +244,9 @@ func TestImageCapacityPullReusesUnpinnedLocalDigestAboveNewImageLimit(t *testing
 
 func TestImageCapacityAllocationOwnershipSharesReleaseAndAccountsConcurrentWork(t *testing.T) {
 	m, _, fs := imageCapacityFixture(t)
-	first, err := m.reserveStaging(t.Context(), imageTenantPreparationForTest(t, m), 10*imageMiB)
+	first, err := m.reserveStaging(t.Context(), imageStagingFlightForTest(t, m), 10*imageMiB)
 	require.NoError(t, err)
-	second, err := m.reserveStaging(t.Context(), imageTenantPreparationForTest(t, m), 10*imageMiB)
+	second, err := m.reserveStaging(t.Context(), imageStagingFlightForTest(t, m), 10*imageMiB)
 	require.NoError(t, err)
 	copyOfFirst := first
 	first.close()

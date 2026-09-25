@@ -276,13 +276,17 @@ func TestDeprovisionLifecyclePendingKeepsLiveOperation(t *testing.T) {
 func TestDeprovisionEventRequiresEveryFailedCandidateToCarryDeferralProvenance(t *testing.T) {
 	for _, availability := range []string{"circuit open", "lifecycle pending"} {
 		t.Run(availability, func(t *testing.T) {
-			for _, peerResult := range []string{"success", "unknown effect"} {
+			for _, peerResult := range []string{"success", "unknown effect", "unknown effect first"} {
 				t.Run(peerResult, func(t *testing.T) {
 					const leaseUUID = "00000000-0000-4000-8000-000000003104"
 					store := newTestStore(t)
 					requireAdmissionBaseline(t, store, "backend-a", "backend-b")
 					requireConflictPlacement(t, store, leaseUUID, "backend-a", "backend-b")
-					id, bound := store.ExpectedBackendStorageIdentity("backend-a")
+					pendingName, peerName := "backend-a", "backend-b"
+					if peerResult == "unknown effect first" {
+						pendingName, peerName = peerName, pendingName
+					}
+					id, bound := store.ExpectedBackendStorageIdentity(pendingName)
 					require.True(t, bound)
 					var httpCalls atomic.Int32
 					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -298,7 +302,7 @@ func TestDeprovisionEventRequiresEveryFailedCandidateToCarryDeferralProvenance(t
 					}))
 					t.Cleanup(server.Close)
 					policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
-						Name: "backend-a", BaseURL: server.URL, Secret: causalOutcomeTestSecret,
+						Name: pendingName, BaseURL: server.URL, Secret: causalOutcomeTestSecret,
 					})
 					require.NoError(t, err)
 					client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{
@@ -310,9 +314,9 @@ func TestDeprovisionEventRequiresEveryFailedCandidateToCarryDeferralProvenance(t
 						require.Error(t, err, "trip the real client circuit with an uncertain response")
 					}
 					var peerCalls int
-					peer := &executionTestBackend{name: "backend-b", deprovision: func(context.Context, string) error {
+					peer := &executionTestBackend{name: peerName, deprovision: func(context.Context, string) error {
 						peerCalls++
-						if peerResult == "unknown effect" {
+						if peerResult != "success" {
 							return errors.Join(backend.ErrCircuitOpen, context.DeadlineExceeded)
 						}
 						return nil
@@ -424,4 +428,43 @@ func TestDeferredDeprovisionRetriesExactHTTPSubjectAfterCircuitRecovery(t *testi
 	require.False(t, result.Deferred().Valid())
 	require.Len(t, requests, 1)
 	require.Equal(t, owner, <-requests)
+}
+
+func TestDeprovisionEventUnaccountableOwnerCannotBeHiddenByPendingConfiguredBackend(t *testing.T) {
+	const leaseUUID = "00000000-0000-4000-8000-000000003107"
+	store := newTestStore(t)
+	requireAdmissionBaseline(t, store, "backend-a")
+	// A new inventory-positive orphan has only one untrusted reporter; it
+	// cannot establish that all historical owners have been reached.
+	projectInventoryForTest(t, store, InventoryProjection{
+		UntrustedPositives: map[string][]string{leaseUUID: {"backend-a"}},
+	})
+	require.Equal(t, StateUnusable, store.Lookup(leaseUUID).State())
+
+	identity, bound := store.ExpectedBackendStorageIdentity("backend-a")
+	require.True(t, bound)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set(backendidentity.ResponseHeader, identity.String())
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"pending","code":"lifecycle_pending"}`))
+	}))
+	t.Cleanup(server.Close)
+	policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
+		Name: "backend-a", BaseURL: server.URL, Secret: causalOutcomeTestSecret,
+	})
+	require.NoError(t, err)
+	client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{}, causalOutcomeTestIdentity{id: identity})
+	require.NoError(t, err)
+	base, err := store.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	execution := bindExecutionForTest(t, base, newExecutionTestRuntime(client))
+	coordinator, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
+	require.NoError(t, err)
+	result := coordinator.DeprovisionEvent(t.Context(), leaseUUID)
+	require.EqualValues(t, 1, calls.Load())
+	require.Equal(t, DeprovisionEventFailed, result.Disposition())
+	require.ErrorIs(t, result.Err(), ErrDeprovisionAuthorityUnresolvable)
+	require.False(t, result.Deferred().Valid(), "the missing historical owner cannot be replaced by a configured backend's wait")
 }

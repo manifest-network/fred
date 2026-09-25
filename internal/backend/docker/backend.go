@@ -2741,10 +2741,18 @@ func (b *Backend) waitForShutdownDrain(ctx context.Context) error {
 			if b.imageCapacity != nil && b.imageCapacity.loader != nil {
 				// Admitted imports own their completion independently of tenant
 				// cancellation, with the same drain deadline as the backend.
+				if pending, err := b.imageCapacity.loader.PendingBytes(); err != nil {
+					b.logger.Warn("shutdown image import allocation is unknown", "error", err)
+				} else if pending > 0 {
+					b.logger.Warn("shutdown waiting for image imports", "admitted_bytes", pending)
+				}
 				_ = b.imageCapacity.loader.Shutdown(drainCtx)
 				// A timed-out SDK call may still be unwinding. The waiter must
 				// retain dependencies until the loader actually releases its owners.
 				_ = b.imageCapacity.loader.Shutdown(context.Background())
+			}
+			if b.imageCapacity != nil {
+				_ = b.imageCapacity.flights.shutdown(context.Background())
 			}
 			b.wg.Wait()
 			close(b.shutdownWaitDone)

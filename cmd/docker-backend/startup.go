@@ -3,38 +3,38 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 )
 
 type backendStartupOwner interface {
+	backendShutdownOwner
 	Start(context.Context) error
 }
 
-// startingBackendHandler can observe readiness but cannot publish it. Only the
-// successful Start below releases requests to the identity-bound backend.
-type startingBackendHandler struct {
-	ready <-chan struct{}
-	next  http.Handler
-}
-
-func (h startingBackendHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	select {
-	case <-h.ready:
-		h.next.ServeHTTP(w, r)
-	default:
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "backend startup in progress", http.StatusServiceUnavailable)
+// startAndServeBackend checks for an existing listener before Start can publish
+// optional image pins, then relinquishes the probe. The serving listener is
+// created only after successful recovery, so an open port retains its readiness
+// meaning for deployment tooling. A concurrent process can still win the final
+// bind; that is a startup failure, never a partially available HTTP service.
+func startAndServeBackend(ctx context.Context, server *http.Server, next http.Handler, owner backendStartupOwner) (<-chan error, error) {
+	probe, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("probe HTTP listener: %w", err)
 	}
-}
-
-// serveStartingBackend consumes an already-bound listener before Start can
-// persist optional image pins. Requests receive a prompt, identity-free 503
-// until Start succeeds; failed startup closes the listener without publishing
-// the runtime handler. The readiness channel never escapes its startup owner.
-func serveStartingBackend(ctx context.Context, listener net.Listener, server *http.Server, next http.Handler, owner backendStartupOwner) (<-chan error, error) {
-	ready := make(chan struct{})
-	server.Handler = startingBackendHandler{ready: ready, next: next}
+	if err := probe.Close(); err != nil {
+		return nil, fmt.Errorf("close HTTP listener probe: %w", err)
+	}
+	if err := owner.Start(ctx); err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		_, stopErr := drainHTTPAndBackend(context.WithoutCancel(ctx), server, owner)
+		return nil, errors.Join(fmt.Errorf("bind ready HTTP listener: %w", err), stopErr)
+	}
+	server.Handler = next
 	serverErr := make(chan error, 1)
 	go func() {
 		var err error
@@ -48,9 +48,5 @@ func serveStartingBackend(ctx context.Context, listener net.Listener, server *ht
 			serverErr <- err
 		}
 	}()
-	if err := owner.Start(ctx); err != nil {
-		return nil, errors.Join(err, server.Close())
-	}
-	close(ready)
 	return serverErr, nil
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -45,7 +46,7 @@ func TestImagePeriodicCollectionPrunesObsoletePinsWhileAdmissionRemainsActive(t 
 	daemon.imageList = func(context.Context, image.ListOptions) ([]image.Summary, error) {
 		return []image.Summary{{ID: testImageID}, {ID: otherTestImageID}}, nil
 	}
-	activeLease, obsoleteLease := uuid.NewString(), uuid.NewString()
+	activeLease, obsoleteLease, unpinnedLease := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	var admission imageAdmission
 	require.NoError(t, shared.BindOperationSubstrateExecutor(settlement, b.authorizeStorageMutation, b.completeStorageMutation,
 		func(runner substratemutation.Runner, subject shared.OperationPhysicalSubject) func(context.Context) error {
@@ -55,8 +56,10 @@ func TestImagePeriodicCollectionPrunesObsoletePinsWhileAdmissionRemainsActive(t 
 			}
 			mutations := newOperationStorageMutations(runner, subject, storageMutationOperations{backend: b})
 			return func(ctx context.Context) error {
-				if _, err := mutations.admitImage(ctx, ref); err != nil {
-					return err
+				if subject.LeaseUUID() != unpinnedLease {
+					if _, err := mutations.admitImage(ctx, ref); err != nil {
+						return err
+					}
 				}
 				if subject.LeaseUUID() == obsoleteLease {
 					var err error
@@ -79,7 +82,7 @@ func TestImagePeriodicCollectionPrunesObsoletePinsWhileAdmissionRemainsActive(t 
 		},
 	))
 	publisher := callbackPublisherForCallbackTest(t, callbacks)
-	for _, lease := range []string{activeLease, obsoleteLease} {
+	for _, lease := range []string{activeLease, obsoleteLease, unpinnedLease} {
 		spec := dockerOperationIntentSpec(t, authority.storage.ID())
 		spec.LeaseUUID = lease
 		_, spec.CallbackURL, spec.LifecycleCallbackURL = newTestRestoreCallbackAuthority(t)
@@ -127,4 +130,6 @@ func TestImagePeriodicCollectionPrunesObsoletePinsWhileAdmissionRemainsActive(t 
 	require.Equal(t, activeLease, pins[0].LeaseUUID)
 	require.Equal(t, testImageID, pins[0].ImageID)
 	require.Equal(t, 1, m.active, "pin pruning cannot release live image ownership")
+	require.EqualValues(t, 1, testutil.ToFloat64(imageUnpinnedGenerations.WithLabelValues("active")))
+	require.Zero(t, testutil.ToFloat64(imageUnpinnedGenerations.WithLabelValues("retained")))
 }

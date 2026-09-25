@@ -339,10 +339,11 @@ manifests or alert rules.
 
 ### Docker startup and recovery budgets
 
-The command validates TLS and binds its listener before startup can publish
-image pins. While recovery runs, that listener returns a prompt `503` without
-a storage-identity claim. Only successful backend startup publishes the normal
-identity-bound handler; failed startup closes the listener.
+The command validates TLS and probes the configured listener address before
+startup can publish image pins, then immediately closes that probe. The serving
+listener binds only after backend startup succeeds, preserving deployment gates
+that treat a bound port as completed recovery. If another process takes the
+address during recovery, the final bind fails and the backend is shut down.
 
 Docker-backend uses finite, nested safety budgets. The production constructor
 uses `storage_attestation_timeout` (default `30s`) for the full initial

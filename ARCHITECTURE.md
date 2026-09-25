@@ -617,9 +617,11 @@ receive the remaining budget. Direct Go `Backend.Stop` calls retain their
 when that drain succeeds so a supervisor must launch a fresh `Start` to recover
 the retained evidence. A drain timeout also exits 1 and leaves the Docker client
 and durable stores open until process death so a still-running worker cannot use
-closed dependencies. TLS validation and listener binding precede `Start`, so
-either failure preserves the old pin schema. A failure during `Start` exits 1
-immediately; the bound listener has not started serving requests.
+closed dependencies. TLS validation and a temporary bind-and-close probe precede
+`Start`, so failures at those checks preserve the old pin schema. The serving
+listener binds only after successful recovery. A failure during `Start` exits 1
+without a serving listener; a final-bind conflict drains the started backend
+under the process shutdown budget before exiting 1.
 
 ## Backend Integration
 

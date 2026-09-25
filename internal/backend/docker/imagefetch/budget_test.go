@@ -1,6 +1,7 @@
 package imagefetch
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
@@ -55,7 +56,7 @@ func TestImageBudgetExactRecoveryCoversDecodedPadding(t *testing.T) {
 		for _, repeats := range []int{1, 2} {
 			raw := append(layerTar(t, []byte("content")), padding...)
 			f := zstdBudgetRegistry(t, raw, repeats)
-			loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 8<<20, WithRegistryTransport(f.server.Client().Transport))
+			loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<30, WithRegistryTransport(f.server.Client().Transport))
 			require.NoError(t, err)
 			p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 			require.NoError(t, err)
@@ -72,6 +73,87 @@ func TestImageBudgetExactRecoveryCoversDecodedPadding(t *testing.T) {
 			require.NoError(t, recovered.Close())
 		}
 	}
+}
+
+func TestImageBudgetExactRecoveryCoversCompressibleFilePayload(t *testing.T) {
+	f := newRegistry(t, layerTar(t, bytes.Repeat([]byte{0}, 4<<20)))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 8<<20, WithRegistryTransport(f.server.Client().Transport))
+	require.NoError(t, err)
+	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
+	require.NoError(t, err)
+	defer prepared.Close()
+	recovery, err := loader.WithBudget(prepared.Budget().Verification())
+	require.NoError(t, err)
+	again, err := recovery.Prepare(t.Context(), prepared.SourceReference(), prepared.Platform())
+	require.NoError(t, err)
+	require.NoError(t, again.Close())
+}
+
+func TestImageBudgetExactRecoveryCoversCompressedSkippableFrames(t *testing.T) {
+	f := zstdBudgetRegistry(t, layerTar(t, []byte("content")), 1)
+	// Zstd skippable frames consume staging bytes while decoding to no bytes.
+	// They make the compressed/staged dimension independently load-bearing.
+	var header [8]byte
+	binary.LittleEndian.PutUint32(header[:4], 0x184D2A50)
+	binary.LittleEndian.PutUint32(header[4:], 2<<20)
+	f.compressed = append(f.compressed, header[:]...)
+	f.compressed = append(f.compressed, bytes.Repeat([]byte{'x'}, 2<<20)...)
+	f.layerID = digest.FromBytes(f.compressed)
+	f.updateImage(t, func(_ *ocispec.Image, manifest *ocispec.Manifest) {
+		manifest.Layers[0].Digest = f.layerID
+		manifest.Layers[0].Size = int64(len(f.compressed))
+	})
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 4<<20, WithRegistryTransport(f.server.Client().Transport))
+	require.NoError(t, err)
+	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
+	require.NoError(t, err)
+	defer prepared.Close()
+	recovery, err := loader.WithBudget(prepared.Budget().Verification())
+	require.NoError(t, err)
+	again, err := recovery.Prepare(t.Context(), prepared.SourceReference(), prepared.Platform())
+	require.NoError(t, err, "the saved staging dimension must include skippable compressed frames")
+	require.NoError(t, again.Close())
+}
+
+func TestLayerAllocationCoversRetainedGlobalHeaderJSON(t *testing.T) {
+	// Global PAX entries create no filesystem nodes, but tar-split retains
+	// their entry names. JSON escaping can expand one name byte to six.
+	for _, size := range []int{2000, 32000} {
+		name := strings.Repeat("\x01", size)
+		raw := encodedTar(t, tar.Header{Name: name, Typeflag: tar.TypeXGlobalHeader, PAXRecords: map[string]string{"comment": "metadata"}})
+		budget := &layerBudget{remaining: 1 << 20}
+		require.NoError(t, checkLayer(t, budget, raw))
+		entry, err := json.Marshal(struct {
+			Type     int    `json:"type"`
+			Name     string `json:"name"`
+			Position int    `json:"position"`
+		}{Type: 1, Name: name})
+		require.NoError(t, err)
+		require.Greater(t, budget.allocated, int64(len(entry)), "the allocation must cover retained entry JSON even with no filesystem entry")
+	}
+}
+
+func TestLayerAllocationCoversIncompressibleTarSplitSegments(t *testing.T) {
+	padding := bytes.Repeat(imageBudgetPadding(), 4)
+	raw := append(encodedTar(t), padding...)
+	budget := &layerBudget{remaining: 16 << 20}
+	require.NoError(t, checkLayer(t, budget, raw))
+	// Use tar-split's stored segment shape and gzip encoding to measure the
+	// retained bytes independently of the allocation formula.
+	var retained bytes.Buffer
+	compressor := gzip.NewWriter(&retained)
+	encoder := json.NewEncoder(compressor)
+	for start := 0; start < len(raw); start += 1 << 20 {
+		end := min(start+(1<<20), len(raw))
+		require.NoError(t, encoder.Encode(struct {
+			Type     int    `json:"type"`
+			Payload  []byte `json:"payload"`
+			Position int    `json:"position"`
+		}{Type: 2, Payload: raw[start:end], Position: start / (1 << 20)}))
+	}
+	require.NoError(t, compressor.Close())
+	require.Greater(t, retained.Len(), len(raw), "fixture must expose base64/gzip expansion")
+	require.Greater(t, budget.allocated, int64(retained.Len()))
 }
 
 func TestImageAllocationCoversTarSplitPaddingAcrossUnknownReopen(t *testing.T) {
@@ -91,7 +173,7 @@ func TestImageAllocationCoversTarSplitPaddingAcrossUnknownReopen(t *testing.T) {
 	require.NoError(t, compressed.Close())
 	f := zstdBudgetRegistry(t, append(layerTar(t, []byte("content")), padding...), 2)
 	stage := t.TempDir()
-	loader, err := NewLoader(&recordingImporter{result: `{"stream":`}, stage, 8<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{result: `{"stream":`}, stage, 1<<30, WithRegistryTransport(f.server.Client().Transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -99,7 +181,7 @@ func TestImageAllocationCoversTarSplitPaddingAcrossUnknownReopen(t *testing.T) {
 	_, err = loader.Import(t.Context(), prepared)
 	require.Error(t, err)
 	require.NoError(t, prepared.Close())
-	reopened, err := NewLoader(&recordingImporter{}, stage, 8<<20)
+	reopened, err := NewLoader(&recordingImporter{}, stage, 1<<30)
 	require.NoError(t, err)
 	unknown, err := reopened.UnknownBytes()
 	require.NoError(t, err)

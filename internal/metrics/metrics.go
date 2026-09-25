@@ -633,7 +633,8 @@ var (
 		Namespace: namespace, Subsystem: "provisioner", Name: "deferred_closes_oldest_age_seconds",
 		Help: "Age since first enqueue of the oldest queued or executing close hint; zero when empty, refreshed each second.",
 	})
-	// DeferredClosesTotal distinguishes scheduled admission waits from failures.
+	// DeferredClosesTotal distinguishes scheduled admission waits, overdue
+	// retained work requiring operator attention, and failures.
 	DeferredClosesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: "provisioner", Name: "deferred_closes_total",
 		Help: "Close retry scheduling outcomes; dispatched is not proof of physical teardown.",

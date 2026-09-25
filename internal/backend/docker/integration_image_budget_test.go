@@ -66,7 +66,7 @@ func TestIntegration_ImageBudgetCoversClassicTarSplitAndExactRecovery(t *testing
 	fixture, err = mutate.ConfigFile(fixture, config)
 	require.NoError(t, err)
 	require.NoError(t, remote.Write(ref, fixture, remote.WithContext(t.Context()), remote.WithTransport(server.Client().Transport)))
-	loader, err := imagefetch.NewLoader(docker, t.TempDir(), 8*imageMiB, imagefetch.WithRegistryTransport(server.Client().Transport))
+	loader, err := imagefetch.NewLoader(docker, t.TempDir(), 1024*imageMiB, imagefetch.WithRegistryTransport(server.Client().Transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), ref.Name(), platform)
 	require.NoError(t, err)

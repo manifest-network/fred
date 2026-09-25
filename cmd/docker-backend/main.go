@@ -175,15 +175,6 @@ func main() {
 		}
 	}
 
-	// Bind before Start can publish optional image pins. A conflicting listener
-	// must leave a failed first startup on the older database format.
-	listener, err := net.Listen("tcp", cfg.ListenAddr)
-	if err != nil {
-		logger.Error("failed to bind HTTP listener", "error", err)
-		os.Exit(1)
-	}
-	defer listener.Close()
-
 	// Setup HTTP server
 	httpServer := &http.Server{
 		Addr:         cfg.ListenAddr,
@@ -193,10 +184,10 @@ func main() {
 		TLSConfig:    tlsServerConfig, // nil => plaintext HTTP
 	}
 
-	// Serve a startup response while storage recovery runs. Only a successful
-	// Start publishes the identity-bound runtime handler.
+	// Probe listener availability before recovery; bind the serving listener only
+	// after Start succeeds so TCP readiness continues to mean ready.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	serverErr, err := serveStartingBackend(ctx, listener, httpServer, server.Handler(), b)
+	serverErr, err := startAndServeBackend(ctx, httpServer, server.Handler(), b)
 	cancel()
 	if err != nil {
 		logger.Error("failed to start backend", "error", err)

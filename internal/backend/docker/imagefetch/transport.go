@@ -12,6 +12,8 @@ import (
 
 const registryIdleTimeout = 30 * time.Second
 
+var errRegistryIdle = errors.New("registry exchange exceeded its no-progress timeout")
+
 // registryExchange owns one request's cancellation and no-progress timer. A
 // single timer covers headers and body; reading never creates waiter goroutines.
 type registryExchange struct {
@@ -45,7 +47,7 @@ func (e *registryExchange) expire() {
 		return
 	}
 	e.closed = true
-	e.cancel(errors.New("registry exchange exceeded its no-progress timeout"))
+	e.cancel(errRegistryIdle)
 }
 
 func (e *registryExchange) progress() {
@@ -87,12 +89,15 @@ func (t boundedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}()
 	response, err := t.base.RoundTrip(req.WithContext(exchange.ctx))
 	if err != nil {
+		if errors.Is(context.Cause(exchange.ctx), errRegistryIdle) {
+			err = errRegistryIdle
+		}
 		exchange.close()
 		return nil, err
 	}
 	exchange.progress()
 	limit := t.limit
-	if response.StatusCode != http.StatusOK || strings.Contains(response.Header.Get("Content-Type"), "json") || strings.Contains(req.URL.Path, "/manifests/") {
+	if (response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent) || strings.Contains(response.Header.Get("Content-Type"), "json") || strings.Contains(req.URL.Path, "/manifests/") {
 		limit = min(limit, maxMetadataBytes)
 	}
 	response.Body = &boundedBody{body: response.Body, reader: budgetReader{reader: response.Body, remaining: limit}, exchange: exchange}
@@ -109,6 +114,9 @@ type boundedBody struct {
 func (b *boundedBody) Read(p []byte) (int, error) {
 	n, err := b.reader.Read(p)
 	if err != nil {
+		if errors.Is(context.Cause(b.exchange.ctx), errRegistryIdle) {
+			err = errRegistryIdle
+		}
 		b.exchange.close()
 	} else if n > 0 {
 		b.exchange.progress()

@@ -24,3 +24,21 @@ func testMaintenanceLifetime(t *testing.T, shutdown context.Context) shared.Main
 	t.Cleanup(lifetime.Cancel)
 	return lifetime
 }
+
+func TestMaintenanceWorkerHandoffUsesConfiguredProvisionTimeout(t *testing.T) {
+	for _, timeout := range []time.Duration{37 * time.Second, 19 * time.Minute} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			shutdown, stop := context.WithCancel(t.Context())
+			defer stop()
+			b := &Backend{cfg: Config{ProvisionTimeout: timeout}, stopCtx: shutdown}
+			start := time.Now()
+			handoff, discard := b.maintenanceWorkerHandoff()
+			defer discard()
+			deadline, bounded := handoff.TargetContext().Deadline()
+			require.True(t, bounded)
+			require.WithinDuration(t, start.Add(timeout), deadline, time.Second)
+			stop()
+			require.ErrorIs(t, handoff.TargetContext().Err(), context.Canceled)
+		})
+	}
+}

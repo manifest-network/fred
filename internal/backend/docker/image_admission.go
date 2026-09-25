@@ -49,19 +49,20 @@ func (a imageAdmission) close() {
 // allocation. No registry body is downloaded before this constructor succeeds.
 type imageStaging struct{ state *imageStagingState }
 type imageStagingState struct {
-	preparation imageTenantPreparation
-	owner       *imageCapacityManager
-	bytes       int64
-	closed      sync.Once
+	release func()
+	owner   *imageCapacityManager
+	bytes   int64
+	closed  sync.Once
 }
 
-func (m *imageCapacityManager) reserveStaging(ctx context.Context, preparation imageTenantPreparation, bytes int64) (stage imageStaging, err error) {
-	if err := preparation.startStaging(ctx, m); err != nil {
+func (m *imageCapacityManager) reserveStaging(ctx context.Context, preparation *imageFlightLeader, bytes int64) (stage imageStaging, err error) {
+	release, err := preparation.startStaging(ctx, m)
+	if err != nil {
 		return imageStaging{}, err
 	}
 	defer func() {
 		if stage.state == nil {
-			preparation.finishStaging()
+			release()
 		}
 	}()
 	if err := m.lock(ctx); err != nil {
@@ -85,7 +86,8 @@ func (m *imageCapacityManager) reserveStaging(ctx context.Context, preparation i
 		return imageStaging{}, err
 	}
 	m.staging += bytes
-	return imageStaging{state: &imageStagingState{owner: m, bytes: bytes, preparation: preparation}}, nil
+	m.active++
+	return imageStaging{state: &imageStagingState{owner: m, bytes: bytes, release: release}}, nil
 }
 
 // imageUnpackAllocation owns the peak extraction allowance while a stopped
@@ -127,7 +129,8 @@ func (s imageStaging) close() {
 		m := s.state.owner
 		_ = m.lock(context.Background())
 		m.staging -= s.state.bytes
+		m.active--
 		m.unlock()
-		s.state.preparation.finishStaging()
+		s.state.release()
 	})
 }

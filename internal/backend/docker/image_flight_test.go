@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/system"
@@ -237,32 +238,50 @@ func TestImageFlightContainerdFollowersReuseVerifiedImportBeforePinPublication(t
 	})
 }
 
-func TestImageFlightCanceledDownloadLeaderTransfersOnlyUndispatchedWork(t *testing.T) {
+// One model second represents one rollout minute, keeping the transport idle
+// ceiling out of this lifetime test. Registry progress/resume has its own suite.
+func TestImageFlightCanceledFirstMemberPreservesEightMinuteDownloadForSixteenFollowers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		var downloads atomic.Int64
 		f := newImageFlightFixture(t, func(ctx context.Context) error {
-			if downloads.Add(1) == 1 {
-				<-ctx.Done()
+			select {
+			case <-time.After(8 * time.Second):
+				return nil
+			case <-ctx.Done():
 				return ctx.Err()
 			}
-			return nil
 		}, nil)
+		start := time.Now()
 		ctx, cancel := context.WithCancel(t.Context())
-		leader := imageTenantPreparationForTest(t, f.m)
-		follower := imageTenantPreparationForTest(t, f.m)
-		first, second := make(chan error, 1), make(chan error, 1)
-		go func() { _, err := f.m.ingest(ctx, leader, f.ref, f.ref); leader.close(); first <- err }()
-		synctest.Wait()
+		firstPreparation := imageTenantPreparationForTest(t, f.m)
+		first := make(chan error, 1)
 		go func() {
-			_, err := f.m.ingest(t.Context(), follower, f.alias, f.alias)
-			follower.close()
-			second <- err
+			_, err := f.m.ingest(ctx, firstPreparation, f.ref, f.ref)
+			firstPreparation.close()
+			first <- err
 		}()
 		synctest.Wait()
+		const followers = 16
+		results := make(chan error, followers)
+		for range followers {
+			preparation := imageTenantPreparationForTest(t, f.m)
+			go func() {
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				defer cancel()
+				_, err := f.m.ingest(ctx, preparation, f.alias, f.alias)
+				preparation.close()
+				results <- err
+			}()
+		}
+		synctest.Wait()
+		time.Sleep(7 * time.Second)
 		cancel()
 		require.ErrorIs(t, <-first, context.Canceled)
-		require.NoError(t, <-second)
-		require.EqualValues(t, 2, f.downloads.Load(), "one canceled attempt and one elected replacement")
+		require.Empty(t, results)
+		for range followers {
+			require.NoError(t, <-results)
+		}
+		require.Equal(t, 8*time.Second, time.Since(start))
+		require.EqualValues(t, 1, f.downloads.Load())
 		require.EqualValues(t, 1, f.imports.Load())
 		require.Empty(t, f.m.flights.active)
 		require.Zero(t, f.m.tenantShares.used)
@@ -299,12 +318,11 @@ func TestImageFlightKeepsDispatchedImportAfterLeaderCancellation(t *testing.T) {
 				cancel()
 				synctest.Wait()
 				require.NoError(t, work.Err())
-				require.Empty(t, first, "leader keeps files/admission until the actual SDK return")
+				require.ErrorIs(t, <-first, context.Canceled, "membership can leave while the manager retains import ownership")
 				require.Empty(t, second)
 				require.EqualValues(t, 1, f.downloads.Load())
 				require.Equal(t, 1, f.m.tenantShares.used)
 				unblock()
-				require.ErrorIs(t, <-first, context.Canceled)
 				if failed {
 					require.ErrorContains(t, <-second, "unknown daemon completion")
 					pending, err := f.m.loader.PendingBytes()
@@ -327,7 +345,7 @@ func TestImageFlightRechecksLocalImageAfterStagingAdmission(t *testing.T) {
 		f := newImageFlightFixture(t, nil, nil)
 		var held []imageStaging
 		for range maxImageStages {
-			stage, err := f.m.reserveStaging(t.Context(), imageTenantPreparationForTest(t, f.m), imageMiB)
+			stage, err := f.m.reserveStaging(t.Context(), imageStagingFlightForTest(t, f.m), imageMiB)
 			require.NoError(t, err)
 			held = append(held, stage)
 		}
@@ -362,11 +380,11 @@ func TestImageFlightDoesNotShareDifferentPlatformSelections(t *testing.T) {
 	require.Equal(t, firstResolution.SourceReference(), secondResolution.SourceReference())
 	first := imageTenantPreparationForTest(t, f.m)
 	second := imageTenantPreparationForTest(t, f.m)
-	_, firstLeader, err := first.joinFlight(f.m, firstResolution)
+	_, firstLeader, err := first.joinFlight(f.m, firstResolution, f.m.loader.VerificationBudget())
 	require.NoError(t, err)
 	require.NotNil(t, firstLeader)
 	defer firstLeader.complete(imageFlightFailure{err: errors.New("fixture does not stage")})
-	_, secondLeader, err := second.joinFlight(f.m, secondResolution)
+	_, secondLeader, err := second.joinFlight(f.m, secondResolution, f.m.loader.VerificationBudget())
 	require.NoError(t, err)
 	require.NotNil(t, secondLeader, "another requested platform must validate its own config/layers")
 	defer secondLeader.complete(imageFlightFailure{err: errors.New("fixture does not stage")})
@@ -381,11 +399,11 @@ func TestImageFlightCancellationAfterReservationRetriesOnlyClosedUnsentAdmission
 		leaderPreparation := imageTenantPreparationForTest(t, f.m)
 		resolution, err := f.m.loader.Resolve(ctx, f.ref, ocispec.Platform{OS: "linux", Architecture: "amd64"})
 		require.NoError(t, err)
-		_, leader, err := leaderPreparation.joinFlight(f.m, resolution)
+		_, leader, err := leaderPreparation.joinFlight(f.m, resolution, f.m.loader.VerificationBudget())
 		require.NoError(t, err)
 		require.NotNil(t, leader)
 		defer leader.complete(imageFlightFailure{err: errors.New("fixture aborted")})
-		stage, err := f.m.reserveStaging(ctx, leaderPreparation, f.m.cfg.ImageMaxSizeMB*imageMiB)
+		stage, err := f.m.reserveStaging(ctx, leader, f.m.cfg.ImageMaxSizeMB*imageMiB)
 		require.NoError(t, err)
 		defer stage.close()
 		prepared, err := f.m.loader.PrepareResolved(ctx, resolution)

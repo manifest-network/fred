@@ -30,3 +30,13 @@ func testMaintenanceLifetime(t *testing.T, shutdown context.Context) Maintenance
 	t.Cleanup(lifetime.Cancel)
 	return lifetime
 }
+
+func TestMaintenanceHandoffDiscardReleasesTargetAndShutdownRegistration(t *testing.T) {
+	handoff, discard := NewMaintenanceWorkerHandoff(t.Context(), time.Hour)
+	discard()
+	require.ErrorIs(t, handoff.TargetContext().Err(), context.Canceled)
+	require.ErrorIs(t, handoff.state.cancellation.Err(), context.Canceled)
+	_, err := handoff.ClaimWorker()
+	require.Error(t, err, "discard consumes the one-shot ownership transfer")
+	discard()
+}

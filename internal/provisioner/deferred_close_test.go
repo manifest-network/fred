@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -276,4 +279,39 @@ func TestDeferredCloseUnknownFailureIsObservableAndNotSuccess(t *testing.T) {
 		require.Equal(t, beforeDispatched, promtestutil.ToFloat64(dispatched))
 		require.Empty(t, scheduler.entries, "unknown errors return to level-triggered recovery")
 	})
+}
+
+func TestDeferredCloseOverdueReportsOnceWithoutRelinquishingRetryOwnership(t *testing.T) {
+	manager, proofs, _ := newDeferredCloseFixture(t, 1, func(context.Context, string) error { return nil })
+	scheduler := manager.deferredCloses
+	proof := proofs[0]
+	before := promtestutil.ToFloat64(metrics.DeferredClosesTotal.WithLabelValues("overdue", string(proof.Reason())))
+	logPath := filepath.Join(t.TempDir(), "overdue.log")
+	logs, err := os.Create(logPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, logs.Close()) })
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(oldLogger) })
+	require.NoError(t, scheduler.enqueue(proof))
+	scheduler.mu.Lock()
+	entry := scheduler.entries[proof.LeaseUUID()]
+	admitted := time.Now()
+	entry.admittedAt = admitted
+	scheduler.updateOldestAgeLocked(admitted.Add(deferredCloseOverdueAfter - time.Nanosecond))
+	require.Equal(t, before, promtestutil.ToFloat64(metrics.DeferredClosesTotal.WithLabelValues("overdue", string(proof.Reason()))))
+	scheduler.updateOldestAgeLocked(admitted.Add(deferredCloseOverdueAfter))
+	scheduler.mu.Unlock()
+	require.NoError(t, scheduler.enqueue(proof), "coalescing must retain the same overdue reporting owner")
+	scheduler.mu.Lock()
+	scheduler.updateOldestAgeLocked(admitted.Add(2 * deferredCloseOverdueAfter))
+	require.Same(t, entry, scheduler.entries[proof.LeaseUUID()])
+	require.True(t, entry.hint.proof.Valid(), "overdue reporting must not revoke the close capability")
+	scheduler.mu.Unlock()
+	require.Equal(t, before+1, promtestutil.ToFloat64(metrics.DeferredClosesTotal.WithLabelValues("overdue", string(proof.Reason()))))
+	logBytes, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	require.Contains(t, string(logBytes), "level=ERROR")
+	require.Contains(t, string(logBytes), "deferred lease close overdue; retry ownership retained")
+	require.Contains(t, string(logBytes), proof.LeaseUUID())
 }

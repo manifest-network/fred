@@ -178,7 +178,7 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 		blob{name: blobPath(manifestID), size: int64(len(rawManifest)), data: rawManifest},
 		blob{name: blobPath(manifest.Config.Digest), size: int64(len(config)), data: config})
 	stageBytes := metadata
-	expansion := layerBudget{remaining: l.maxBytes}
+	expansion := layerBudget{remaining: l.budget.Bytes()}
 	type stagedLayer struct {
 		descriptor ocispec.Descriptor
 		blob       blob
@@ -200,7 +200,7 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 			}
 			b = previous.blob
 		} else {
-			if descriptor.Size > l.maxBytes-stageBytes {
+			if descriptor.Size > l.budget.Bytes()-stageBytes {
 				return nil, errors.New("image compressed content exceeds staging budget")
 			}
 			stageBytes += descriptor.Size
@@ -239,7 +239,7 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 	for _, b := range []blob{{name: "oci-layout", data: []byte(`{"imageLayoutVersion":"1.0.0"}`)}, {name: "index.json", data: index}, {name: "manifest.json", data: legacy}} {
 		b.size = int64(len(b.data))
 		stageBytes += b.size
-		if stageBytes > l.maxBytes {
+		if stageBytes > l.budget.Bytes() {
 			return nil, errors.New("image archive metadata exceeds staging budget")
 		}
 		state.blobs = append(state.blobs, b)
@@ -252,12 +252,12 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 	// exists. Both stores also create per-image/per-layer metadata outside the
 	// layer tar entries (layerdb, snapshot records and graphdriver links).
 	importBytes := archiveBytes + expansion.allocated + 2*metadata + int64(len(manifest.Layers)+1)*(128<<10)
-	if importBytes > 2*l.maxBytes {
+	if importBytes > 2*l.budget.Bytes() {
 		return nil, errors.New("image import allocation exceeds twice the image byte limit")
 	}
 	// Recovery must cover both independent verification counters and the import
 	// ceiling, even when compressible tar metadata consumes almost no file data.
-	verificationBytes := max(stageBytes, l.maxBytes-expansion.remaining, (importBytes+1)/2)
+	verificationBytes := max(stageBytes, l.budget.Bytes()-expansion.remaining, (importBytes+1)/2)
 	verification, err := imagebudget.NewVerificationBudget(verificationBytes)
 	if err != nil {
 		return nil, err
@@ -272,12 +272,12 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 
 func (l *Loader) selectManifest(ctx context.Context, ref name.Reference, platform ocispec.Platform, used *int64) ([]byte, digest.Digest, error) {
 	for range maxIndexDepth {
-		descriptor, err := remote.Get(ref, l.options(ctx, maxMetadataBytes)...)
+		descriptor, err := remote.Get(ref, l.options(ctx, maxMetadataBytes, nil)...)
 		if err != nil {
 			return nil, "", err
 		}
 		*used += int64(len(descriptor.Manifest))
-		if *used > maxMetadataBytes || *used > l.maxBytes {
+		if *used > maxMetadataBytes || *used > l.budget.Bytes() {
 			return nil, "", errors.New("image index and manifest metadata exceeds budget")
 		}
 		switch string(descriptor.MediaType) {
@@ -364,7 +364,7 @@ func (l *Loader) fetch(ctx context.Context, ref name.Reference, d ocispec.Descri
 	if err := validDescriptor(d); err != nil {
 		return err
 	}
-	layer, err := remote.Layer(ref.Context().Digest(d.Digest.String()), l.options(ctx, l.maxBytes)...)
+	layer, err := remote.Layer(ref.Context().Digest(d.Digest.String()), l.options(ctx, l.budget.Bytes(), &d)...)
 	if err != nil {
 		return err
 	}
@@ -384,8 +384,16 @@ func (l *Loader) fetch(ctx context.Context, ref name.Reference, d ocispec.Descri
 	return nil
 }
 
-func (l *Loader) options(ctx context.Context, limit int64) []remote.Option {
-	return []remote.Option{remote.WithContext(ctx), remote.WithAuth(authn.Anonymous), remote.WithTransport(boundedTransport{base: l.transport, limit: limit})}
+func (l *Loader) options(ctx context.Context, limit int64, blob *ocispec.Descriptor) []remote.Option {
+	return []remote.Option{
+		remote.WithContext(ctx), remote.WithAuth(authn.Anonymous),
+		remote.WithTransport(registryTransport{base: boundedTransport{base: l.transport, limit: limit}, blob: blob}),
+		// Our transport shares one attempt bound across headers and body. Do
+		// not multiply it by the registry client's default request retries.
+		remote.WithRetryBackoff(remote.Backoff{Steps: 1}),
+		remote.WithRetryPredicate(func(error) bool { return false }),
+		remote.WithRetryStatusCodes(),
+	}
 }
 
 var stagingName = regexp.MustCompile(`^\.fred-image-[0-9]{1,10}$`)

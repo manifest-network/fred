@@ -369,6 +369,8 @@ func TestRecoveryBudgetSharesDebitAndShutdownWithoutMutatingAdmissionLimit(t *te
 	require.NoError(t, err)
 	recovery, err := original.WithBudget(budget)
 	require.NoError(t, err)
+	require.Equal(t, budget, recovery.VerificationBudget())
+	require.EqualValues(t, 64<<10, original.VerificationBudget().Bytes())
 	_, err = original.Prepare(t.Context(), f.ref(), testPlatform)
 	require.ErrorContains(t, err, "import allocation exceeds")
 	prepared, err := recovery.Prepare(t.Context(), f.ref(), testPlatform)
