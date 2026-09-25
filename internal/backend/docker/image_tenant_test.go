@@ -250,7 +250,7 @@ func testImageCapacityAggregatorCachedRollout(t *testing.T, warmLeases int) {
 		}
 		imported.Store(true)
 		return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, nil
-	}, imagefetch.WithRegistryTransport(transport))
+	}, imagefetch.WithRegistryTransport(nativeRegistryTransport(t, transport)))
 	results := make(chan string, len(refs))
 	runs := imagePreparationExecutionsForTenants(t, m, refs, tenants, results)
 	var workers sync.WaitGroup

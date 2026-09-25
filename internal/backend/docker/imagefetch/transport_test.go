@@ -13,6 +13,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Protocol unit tests can construct the private exchange owner around a scripted
+// wire. Native transports still pass through the public construction boundary;
+// wire-level replay and protocol guarantees are covered by exchange_test.go.
+func withRegistryTransportForTest(transport http.RoundTripper) Option {
+	if native, ok := transport.(*http.Transport); ok {
+		return WithRegistryTransport(native)
+	}
+	return func(loader *Loader) error {
+		loader.transport = singleRegistryExchange{wire: transport}
+		return nil
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }

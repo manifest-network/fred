@@ -56,7 +56,7 @@ func TestImageBudgetExactRecoveryCoversDecodedPadding(t *testing.T) {
 		for _, repeats := range []int{1, 2} {
 			raw := append(layerTar(t, []byte("content")), padding...)
 			f := zstdBudgetRegistry(t, raw, repeats)
-			loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<30, WithRegistryTransport(f.server.Client().Transport))
+			loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<30, withRegistryTransportForTest(f.server.Client().Transport))
 			require.NoError(t, err)
 			p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 			require.NoError(t, err)
@@ -77,7 +77,7 @@ func TestImageBudgetExactRecoveryCoversDecodedPadding(t *testing.T) {
 
 func TestImageBudgetExactRecoveryCoversCompressibleFilePayload(t *testing.T) {
 	f := newRegistry(t, layerTar(t, bytes.Repeat([]byte{0}, 4<<20)))
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 8<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 8<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -103,7 +103,7 @@ func TestImageBudgetExactRecoveryCoversCompressedSkippableFrames(t *testing.T) {
 		manifest.Layers[0].Digest = f.layerID
 		manifest.Layers[0].Size = int64(len(f.compressed))
 	})
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 4<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 4<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -173,7 +173,7 @@ func TestImageAllocationCoversTarSplitPaddingAcrossUnknownReopen(t *testing.T) {
 	require.NoError(t, compressed.Close())
 	f := zstdBudgetRegistry(t, append(layerTar(t, []byte("content")), padding...), 2)
 	stage := t.TempDir()
-	loader, err := NewLoader(&recordingImporter{result: `{"stream":`}, stage, 1<<30, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{result: `{"stream":`}, stage, 1<<30, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -249,7 +249,7 @@ func TestImageBudgetRejectsMalformedCompressionAfterTarEOF(t *testing.T) {
 	f.updateImage(t, func(_ *ocispec.Image, manifest *ocispec.Manifest) {
 		manifest.Layers[0].Digest = f.layerID
 	})
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 4<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 4<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	_, err = loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.ErrorContains(t, err, "checksum")
@@ -263,7 +263,7 @@ func TestImageBudgetPreservesIndexAndArchiveMetadataBound(t *testing.T) {
 		Annotations: map[string]string{"example.invalid/metadata": strings.Repeat("x", 1<<20)},
 	})
 	f.manifestType = ocispec.MediaTypeImageIndex
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 4<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 4<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)

@@ -486,24 +486,46 @@ func publishCallbackReplayCompletion(
 }
 
 // callbackReplayQueue is the process-local scheduling view of the durable
-// outbox. Durable rows remain the authority. This queue exists only to bound
-// concurrency, deduplicate lease work, and let a newly discovered lease move
-// ahead of a large outage backlog without weakening per-lease FIFO.
+// outbox. A queued lease owns one FIFO position until dispatch. New work gets a
+// prompt lane; existing suffix/retry work gets an independent retained lane.
+// Actual dispatches alternate between nonempty lanes, so neither continued new
+// commits nor an outage backlog can monopolize every scheduling opportunity.
+type callbackReplayClass uint8
+
+const (
+	callbackReplayFresh callbackReplayClass = iota
+	callbackReplayRetained
+)
+
+func (class callbackReplayClass) other() callbackReplayClass {
+	if class == callbackReplayFresh {
+		return callbackReplayRetained
+	}
+	return callbackReplayFresh
+}
+
+type callbackReplayPosition struct {
+	class   callbackReplayClass
+	element *list.Element
+}
+
 type callbackReplayQueue struct {
-	ready    *list.List
-	queued   map[string]*list.Element
-	inFlight map[string]struct{}
-	dormant  map[string]struct{}
-	dirty    map[string]struct{}
+	ready     [2]*list.List
+	nextClass callbackReplayClass
+	queued    map[string]callbackReplayPosition
+	inFlight  map[string]struct{}
+	dormant   map[string]struct{}
+	dirty     map[string]struct{}
 }
 
 func newCallbackReplayQueue() *callbackReplayQueue {
 	return &callbackReplayQueue{
-		ready:    list.New(),
-		queued:   make(map[string]*list.Element),
-		inFlight: make(map[string]struct{}),
-		dormant:  make(map[string]struct{}),
-		dirty:    make(map[string]struct{}),
+		ready:     [2]*list.List{list.New(), list.New()},
+		nextClass: callbackReplayFresh,
+		queued:    make(map[string]callbackReplayPosition),
+		inFlight:  make(map[string]struct{}),
+		dormant:   make(map[string]struct{}),
+		dirty:     make(map[string]struct{}),
 	}
 }
 
@@ -534,13 +556,13 @@ func (q *callbackReplayQueue) discover(
 				continue
 			}
 			delete(q.dormant, leaseUUID)
-			q.enqueueBack(leaseUUID)
+			q.enqueue(leaseUUID, callbackReplayRetained)
 			continue
 		}
 		if prioritizeNew {
-			q.enqueueFront(leaseUUID)
+			q.enqueue(leaseUUID, callbackReplayFresh)
 		} else {
-			q.enqueueBack(leaseUUID)
+			q.enqueue(leaseUUID, callbackReplayRetained)
 		}
 	}
 	// A failed delivery remains dormant only while a durable row still exists.
@@ -575,29 +597,25 @@ func (q *callbackReplayQueue) wake(wake callbackReplayWake) {
 		}
 		delete(q.dormant, leaseUUID)
 	}
-	q.enqueueFront(leaseUUID)
+	q.enqueue(leaseUUID, callbackReplayFresh)
 }
 
-func (q *callbackReplayQueue) enqueueFront(leaseUUID string) {
+func (q *callbackReplayQueue) enqueue(leaseUUID string, class callbackReplayClass) {
 	if leaseUUID == "" {
 		return
 	}
-	if element := q.queued[leaseUUID]; element != nil {
-		q.ready.MoveToFront(element)
+	if _, queued := q.queued[leaseUUID]; queued {
 		return
 	}
-	q.queued[leaseUUID] = q.ready.PushFront(leaseUUID)
-}
-
-func (q *callbackReplayQueue) enqueueBack(leaseUUID string) {
-	if leaseUUID == "" || q.queued[leaseUUID] != nil {
-		return
-	}
-	q.queued[leaseUUID] = q.ready.PushBack(leaseUUID)
+	q.queued[leaseUUID] = callbackReplayPosition{class: class, element: q.ready[class].PushBack(leaseUUID)}
 }
 
 func (q *callbackReplayQueue) next() (string, bool) {
-	element := q.ready.Front()
+	class := q.nextClass
+	element := q.ready[class].Front()
+	if element == nil {
+		element = q.ready[class.other()].Front()
+	}
 	if element == nil {
 		return "", false
 	}
@@ -606,13 +624,14 @@ func (q *callbackReplayQueue) next() (string, bool) {
 }
 
 func (q *callbackReplayQueue) dispatched(leaseUUID string) {
-	element := q.queued[leaseUUID]
-	if element == nil {
+	position, queued := q.queued[leaseUUID]
+	if !queued {
 		return
 	}
-	q.ready.Remove(element)
+	q.ready[position.class].Remove(position.element)
 	delete(q.queued, leaseUUID)
 	q.inFlight[leaseUUID] = struct{}{}
+	q.nextClass = position.class.other()
 }
 
 func (q *callbackReplayQueue) completed(completion callbackReplayCompletion) {
@@ -624,18 +643,18 @@ func (q *callbackReplayQueue) completed(completion callbackReplayCompletion) {
 	switch completion.outcome {
 	case callbackReplayMore:
 		delete(q.dormant, leaseUUID)
-		q.enqueueBack(leaseUUID)
+		q.enqueue(leaseUUID, callbackReplayRetained)
 	case callbackReplayDeferred:
 		if dirty {
 			delete(q.dormant, leaseUUID)
-			q.enqueueFront(leaseUUID)
+			q.enqueue(leaseUUID, callbackReplayFresh)
 		} else {
 			q.dormant[leaseUUID] = struct{}{}
 		}
 	case callbackReplayEmpty:
 		delete(q.dormant, leaseUUID)
 		if dirty {
-			q.enqueueFront(leaseUUID)
+			q.enqueue(leaseUUID, callbackReplayFresh)
 		}
 	}
 }

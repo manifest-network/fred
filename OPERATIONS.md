@@ -468,8 +468,10 @@ cannot borrow authority from a physical disk estimate. Import accounting include
 classic Docker's retained tar-split metadata, including repeated layer occurrences.
 Lowering the configured limit does not invalidate a local or
 pinned historical image. Layer entry, path and metadata budgets also apply: at
-most 128 layers and 131,072 aggregate tar/implicit path entries, with a strict
-selected-platform match. Repeated layer descriptors and global PAX headers are
+most 128 layers, with a strict selected-platform match and the namespace
+allowances below. Each normalized header is limited to 64 KiB of metadata;
+its entire raw parser span, including hidden PAX/GNU extensions and framing,
+is independently limited to 130 KiB. Repeated layer descriptors and global PAX headers are
 supported. Sparse entries, duplicate
 paths and hardlinks without an earlier regular-file target in the same layer
 are refused; rebuild such images with supported layer contents. Verification
@@ -478,6 +480,12 @@ present locally require no registry access once their verified allowance is
 recorded. A legacy containerd pin without a separate saved verification bound needs one verification
 and import of its exact repository digest; Fred never falls back to its mutable
 tag.
+Tag selection verifies bounded manifest and config metadata, including their
+platform and layer-count agreement, before a classic Docker cache hit can
+persist its recovery reference. This adds a config fetch to uncached tag
+selection, under the aggregate 2-MiB metadata allowance. It does not download cached layers or
+prove their future availability: missing local content still requires full
+verification of the exact pinned registry content before import.
 
 Before staging, admission checks the maximum staging allowance above the
 free-space floor. Before Docker import, it checks the verified image's
@@ -515,6 +523,10 @@ Registry metadata GETs have at most three attempts for transient connection,
 no-progress or availability failures. Each immutable blob owns one three-attempt
 allowance shared across resumes, redirects and authentication renewal; wrapper
 copies cannot reset it. Every blob attempt starts at its immutable registry URL,
+using a fresh HTTP/1 connection so the native transport cannot silently replay
+requests below that counter. This adds connection/TLS setup per exchange;
+registries must support HTTP/1.1. Connections closed before response headers
+may retry within the same allowance. Every retry starts at the registry origin,
 refreshing redirects instead of reusing an expired CDN URL. Resumed downloads
 can renew expired authentication within that allowance; token responses always
 retain the separate metadata limit. Interrupted blobs
@@ -530,6 +542,8 @@ available, the waiting tenant with the fewest active stages goes first; ties and
 a tenant follow arrival order. Waiting requests consume no staging allowance,
 and cancellation removes them from the queue. This scheduling does not preempt
 occupied slots or guarantee isolation from a tenant using multiple addresses.
+A shared flight may continue while successive eligible members sponsor ongoing
+progress; there is no absolute flight lifetime or queue-wait guarantee.
 A local
 launch checks actual free space plus unknown import allocations; live owned
 imports are not added

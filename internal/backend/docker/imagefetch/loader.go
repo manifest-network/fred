@@ -17,7 +17,6 @@ import (
 
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
@@ -36,7 +35,7 @@ type Loader struct {
 	stageRoot string
 	budget    imagebudget.VerificationBudget
 	ledger    *debitLedger
-	transport http.RoundTripper
+	transport singleRegistryExchange
 	life      *loaderLifetime
 }
 
@@ -52,7 +51,7 @@ func NewLoader(source Importer, stageRoot string, maxBytes int64, options ...Opt
 		return nil, fmt.Errorf("image staging directory is unavailable: %s", stageRoot)
 	}
 	shutdown, cancel := context.WithCancel(context.Background())
-	loader := &Loader{daemon: source, stageRoot: stageRoot, budget: budget, ledger: &debitLedger{root: stageRoot}, transport: remote.DefaultTransport, life: &loaderLifetime{shutdown: shutdown, cancel: cancel, drained: make(chan struct{})}}
+	loader := &Loader{daemon: source, stageRoot: stageRoot, budget: budget, ledger: &debitLedger{root: stageRoot}, transport: defaultRegistryExchange(), life: &loaderLifetime{shutdown: shutdown, cancel: cancel, drained: make(chan struct{})}}
 	for _, option := range options {
 		if option == nil {
 			cancel()
@@ -87,14 +86,16 @@ func (l *Loader) WithBudget(budget imagebudget.VerificationBudget) (*Loader, err
 // response-byte boundaries.
 type Option func(*Loader) error
 
-// WithRegistryTransport supplies operator trust or routing configuration. HTTP
-// requests remain refused before they reach this transport.
-func WithRegistryTransport(transport http.RoundTripper) Option {
+// WithRegistryTransport projects operator trust and routing settings into an
+// owned native transport. Fred controls HTTP protocol negotiation and replay;
+// custom TLS dialers cannot bypass that construction boundary.
+func WithRegistryTransport(transport *http.Transport) Option {
 	return func(l *Loader) error {
-		if util.IsNilInterface(transport) {
-			return errors.New("nil registry transport")
+		exchange, err := newSingleRegistryExchange(transport)
+		if err != nil {
+			return err
 		}
-		l.transport = transport
+		l.transport = exchange
 		return nil
 	}
 }

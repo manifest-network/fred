@@ -85,7 +85,7 @@ func TestImageFlightRecoveryBudgetDoesNotInheritNewImageRefusal(t *testing.T) {
 			_, err := io.Copy(io.Discard, input)
 			present.Store(true)
 			return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, err
-		}, imagefetch.WithRegistryTransport(transport))
+		}, imagefetch.WithRegistryTransport(nativeRegistryTransport(t, transport)))
 		pin := &shared.ImagePin{ImageID: configID.String(), PullDigest: tag.Context().Digest(manifestID.String()).Name(), ImportBytes: 8 * imageMiB, VerificationBytes: 8 * imageMiB}
 		pin.Platform.OS, pin.Platform.Architecture = "linux", "amd64"
 

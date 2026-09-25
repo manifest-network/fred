@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -76,7 +77,7 @@ func TestDeprovisionDuringOwnedImageImportReturnsPendingBeforeHTTPDeadline(t *te
 		<-complete
 		imported.Store(true)
 		return image.LoadResponse{Body: io.NopCloser(strings.NewReader(`{"stream":"Loaded image"}`)), JSON: true}, nil
-	}, imagefetch.WithRegistryTransport(server.Client().Transport))
+	}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 	t.Cleanup(func() {
 		finish()
 		b.stopCancel()

@@ -861,6 +861,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Bound image registry attempts at the native HTTP exchange boundary using
+  owned, fresh HTTP/1 connections; recover from connections closed before
+  headers within the same attempt allowance. Bound complete raw tar header
+  spans, including chained hidden PAX/GNU records, before Docker import.
+  Classic cached-image selection now verifies bounded manifest/config metadata
+  and their platform/layer agreement before recording the immutable recovery
+  source. Existing cached layers remain
+  reusable without downloading them against a smaller new-image limit.
+- Writable-path image extraction now owns one byte allowance across all paths
+  and retains reservations after partial writes, cancellation or other errors.
+  Partial-write errors report bytes actually written.
+- Durable callback replay alternates dispatches between fresh and retained
+  work, preserving FIFO within each class so sustained new arrivals cannot
+  indefinitely postpone an older maintenance completion.
+
 - Image inspection uses a restricted creator that overrides image volumes with
   tmpfs and owns the working directory, user and stopped-container settings.
   Content reads retain image files and ownership without creating anonymous

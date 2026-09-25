@@ -205,7 +205,8 @@ func (t *registryTransfer) canRetry(err error) bool {
 
 func transientRegistryError(err error) bool {
 	var network net.Error
-	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, errRegistryIdle) || errors.Is(err, errRegistryRedirectExpired) ||
+	var interrupted interruptedRegistryHeaders
+	return errors.As(err, &interrupted) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, errRegistryIdle) || errors.Is(err, errRegistryRedirectExpired) ||
 		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) ||
 		errors.Is(err, syscall.EPIPE) || errors.Is(err, net.ErrClosed) ||
 		(errors.As(err, &network) && network.Timeout())

@@ -63,7 +63,7 @@ func TestRegistryResumesOnlyInterruptedImmutableBlob(t *testing.T) {
 				return response, nil
 			})
 			daemon := &recordingImporter{}
-			loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(transport))
+			loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(transport))
 			require.NoError(t, err)
 			prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 			require.NoError(t, err)
@@ -89,7 +89,7 @@ func TestRegistryRetriesMetadataBeforePublishingAnyBytes(t *testing.T) {
 		}
 		return response, err
 	})
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -118,7 +118,7 @@ func TestRegistryDoesNotRedownloadCompletedLayers(t *testing.T) {
 		}
 		return response, nil
 	})
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), first.ref(), testPlatform)
 	require.NoError(t, err)
@@ -167,7 +167,7 @@ func TestRegistryResumesLargeRedirectedBlobWithinItsDescriptorBound(t *testing.T
 		}
 		return response, nil
 	})
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 8<<20, WithRegistryTransport(transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 8<<20, withRegistryTransportForTest(transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -190,18 +190,18 @@ func TestRegistryTransientAttemptsShareOneBoundAcrossHeadersAndBody(t *testing.T
 					}
 					return &http.Response{StatusCode: http.StatusOK, ContentLength: descriptor.Size, Header: make(http.Header), Body: &interruptedRegistryBody{ReadCloser: io.NopCloser(bytes.NewReader(data)), remaining: 1}}, nil
 				})
-				loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(base))
+				loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(base))
 				require.NoError(t, err)
 				ref, err := name.ParseReference("registry.example/tenant/image:latest")
 				require.NoError(t, err)
 				// Exercise the authenticated library path as well: its retries
 				// must not multiply our shared bound. The registry ping succeeds.
-				loader.transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				loader.transport = singleRegistryExchange{wire: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 					if req.URL.Path == "/v2/" {
 						return &http.Response{StatusCode: http.StatusOK, ContentLength: 0, Header: make(http.Header), Body: http.NoBody}, nil
 					}
 					return base.RoundTrip(req)
-				})
+				})}
 				var output bytes.Buffer
 				require.Error(t, loader.fetch(t.Context(), ref, descriptor, &output))
 				require.Equal(t, registryAttempts, attempts)
@@ -254,7 +254,7 @@ func TestRegistryPermanentBlobFaultsNeverRetry(t *testing.T) {
 				return response, nil
 			})
 			daemon := &recordingImporter{}
-			loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(transport))
+			loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(transport))
 			require.NoError(t, err)
 			_, err = loader.Prepare(t.Context(), f.ref(), testPlatform)
 			require.Error(t, err)

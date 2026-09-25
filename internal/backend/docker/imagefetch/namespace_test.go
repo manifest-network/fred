@@ -28,7 +28,7 @@ func TestNamespaceLargeDependencyImagePreparesAndRecoversAtDefaultByteLimit(t *t
 	require.NoError(t, writer.Close())
 	f := newRegistry(t, raw.Bytes())
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, t.TempDir(), 10<<30, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, t.TempDir(), 10<<30, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -205,7 +205,7 @@ func TestNamespaceImplicitNodesRecoverAboveCompatibilityFloor(t *testing.T) {
 	}
 	require.NoError(t, writer.Close())
 	f := newRegistry(t, raw.Bytes())
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 10<<30, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 10<<30, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)

@@ -151,7 +151,7 @@ func TestPrepareImportUsesOriginalVerifiedBytesAndIdentities(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("tenant content")))
 	daemon := &recordingImporter{}
 	stage := t.TempDir()
-	loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, stage, 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -207,9 +207,9 @@ func TestPrepareImportUsesOriginalVerifiedBytesAndIdentities(t *testing.T) {
 func TestPreparedCapabilityRejectsZeroForeignAndClosed(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
-	other, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	other, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	for _, invalid := range []*Prepared{nil, {}} {
 		_, err = loader.Import(t.Context(), invalid)
@@ -241,7 +241,7 @@ func TestPreparationRejectsExpansionTrailingDataAndLogicalBombs(t *testing.T) {
 			f := newRegistry(t, tt.layer)
 			daemon := &recordingImporter{}
 			stage := t.TempDir()
-			loader, err := NewLoader(daemon, stage, 64<<10, WithRegistryTransport(f.server.Client().Transport))
+			loader, err := NewLoader(daemon, stage, 64<<10, withRegistryTransportForTest(f.server.Client().Transport))
 			require.NoError(t, err)
 			_, err = loader.Prepare(t.Context(), f.ref(), testPlatform)
 			require.Error(t, err)
@@ -261,7 +261,7 @@ func TestPreparationRejectsChangedOrOversizedRegistryBlob(t *testing.T) {
 			if oversized {
 				f.replaceBlob = bytes.Repeat([]byte("x"), 2<<20)
 			}
-			loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 64<<10, WithRegistryTransport(f.server.Client().Transport))
+			loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 64<<10, withRegistryTransportForTest(f.server.Client().Transport))
 			require.NoError(t, err)
 			_, err = loader.Prepare(t.Context(), f.ref(), testPlatform)
 			require.Error(t, err)
@@ -273,7 +273,7 @@ func TestPreparationBoundsManifestHTTPBodyBeforeDecode(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
 	f.manifestResponse = bytes.Repeat([]byte(" "), int(maxMetadataBytes)+1)
 	f.manifestType = ocispec.MediaTypeImageManifest
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 8<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 8<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	_, err = loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.ErrorContains(t, err, "byte limit")
@@ -281,7 +281,7 @@ func TestPreparationBoundsManifestHTTPBodyBeforeDecode(t *testing.T) {
 
 func TestImportPropagatesDaemonStreamFailure(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
-	loader, err := NewLoader(&recordingImporter{result: `{"errorDetail":{"message":"disk full"}}`}, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{result: `{"errorDetail":{"message":"disk full"}}`}, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -335,7 +335,7 @@ func TestPreparationSelectsImmutablePlatformLeaf(t *testing.T) {
 		{MediaType: ocispec.MediaTypeImageManifest, Digest: f.manifestID, Size: int64(len(f.manifest)), Platform: &testPlatform},
 	}})
 	f.manifestType = ocispec.MediaTypeImageIndex
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -357,7 +357,7 @@ func TestPreparationBoundsNestedImageIndexes(t *testing.T) {
 		child = ocispec.Descriptor{MediaType: ocispec.MediaTypeImageIndex, Digest: id, Size: int64(len(raw)), Platform: &testPlatform}
 	}
 	f.manifestType = ocispec.MediaTypeImageIndex
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	_, err = loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.ErrorContains(t, err, "nesting limit")
@@ -372,7 +372,7 @@ func TestNewLoaderRejectsTypedNilImporter(t *testing.T) {
 func TestCopiedPreparedSharesImportAndCloseLifetime(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -408,7 +408,7 @@ func (d *pausedImporter) ImageLoad(ctx context.Context, input io.Reader, opts ..
 func TestCopiedPreparedCloseWaitsForActiveImport(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
 	daemon := &pausedImporter{started: make(chan struct{}), release: make(chan struct{})}
-	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)

@@ -47,7 +47,7 @@ func TestImportOutcomeCountsOwnedInterruptionBeforeSDKUnwinds(t *testing.T) {
 				unwind := sync.OnceFunc(func() { close(release) })
 				defer unwind()
 				daemon := interruptedMetricImporter{dispatched: make(chan context.Context, 1), unwind: release}
-				loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(transport))
+				loader, err := NewLoader(daemon, stage, 1<<20, withRegistryTransportForTest(transport))
 				require.NoError(t, err)
 				prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 				require.NoError(t, err)
@@ -90,7 +90,7 @@ func TestImportOutcomeDoesNotTrustDaemonContextErrors(t *testing.T) {
 			f := newRegistry(t, layerTar(t, []byte("content")))
 			daemon := &coordinatedImporter{arrivals: make(chan context.Context, 1), results: make(chan error, 1)}
 			daemon.results <- errors.Join(errors.New("daemon rejection"), failure)
-			loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+			loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 			require.NoError(t, err)
 			prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 			require.NoError(t, err)
@@ -140,7 +140,7 @@ func TestImportOutcomeSuccessRecordsOnlyCompletedExchange(t *testing.T) {
 	}
 	fixture := newRegistry(t, layerTar(t, []byte("successful import")))
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(fixture.server.Client().Transport))
+	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(fixture.server.Client().Transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), fixture.ref(), testPlatform)
 	require.NoError(t, err)

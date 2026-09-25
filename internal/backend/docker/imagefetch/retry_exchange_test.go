@@ -39,7 +39,7 @@ func (*stalledRegistryBody) Close() error { return nil }
 // multiply the transfer's one attempt budget, including 30-second idle stalls.
 func fetchRegistryTestBlob(t *testing.T, data []byte, transport http.RoundTripper) ([]byte, error) {
 	t.Helper()
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if req.URL.Path == "/v2/" {
 			return &http.Response{StatusCode: http.StatusOK, ContentLength: 0, Header: make(http.Header), Body: http.NoBody}, nil
 		}
@@ -325,7 +325,7 @@ func TestRegistryBlobRetryPreservesBearerAuthentication(t *testing.T) {
 			}
 			return response, nil
 		})
-		loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(transport))
+		loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(transport))
 		require.NoError(t, err)
 		ref, err := name.ParseReference("registry.example/tenant/image:latest")
 		require.NoError(t, err)
@@ -387,7 +387,7 @@ func TestRegistryBearerFailuresKeepMetadataBoundsAndOriginRefusal(t *testing.T) 
 				response.Body, response.ContentLength = io.NopCloser(bytes.NewReader(body)), int64(len(body))
 				return response, nil
 			})
-			loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 4<<20, WithRegistryTransport(transport))
+			loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 4<<20, withRegistryTransportForTest(transport))
 			require.NoError(t, err)
 			ref, err := name.ParseReference("registry.example/tenant/image:latest")
 			require.NoError(t, err)
@@ -448,7 +448,7 @@ func TestRegistryAuthRenewalKeepsOneDescriptorAttemptBound(t *testing.T) {
 						}
 						return response, nil
 					})
-					loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(transport))
+					loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(transport))
 					require.NoError(t, err)
 					ref, err := name.ParseReference("registry.example/tenant/image:latest")
 					require.NoError(t, err)
@@ -549,7 +549,7 @@ func TestRegistryBodyResumeRenewsExpiredTokenWithinAttemptBudget(t *testing.T) {
 			}
 			return response, nil
 		})
-		loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(transport))
+		loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(transport))
 		require.NoError(t, err)
 		ref, err := name.ParseReference("registry.example/tenant/image:latest")
 		require.NoError(t, err)

@@ -30,7 +30,7 @@ func TestImportPanicJoinsUploadBeforeReleasingItsOwners(t *testing.T) {
 	stage := t.TempDir()
 	synctest.Test(t, func(t *testing.T) {
 		daemon := panickingImporter{entered: make(chan io.Reader, 1), panicNow: make(chan struct{})}
-		loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(transport))
+		loader, err := NewLoader(daemon, stage, 1<<20, withRegistryTransportForTest(transport))
 		require.NoError(t, err)
 		prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 		require.NoError(t, err)

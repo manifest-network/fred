@@ -17,16 +17,46 @@ import (
 	"github.com/manifest-network/fred/internal/backend/docker/imagefetch"
 )
 
-func TestImageFlightLastMemberDepartureCancelsAndDrainsBeforeAnotherAttempt(t *testing.T) {
+func TestImageFlightLastMemberDepartureClosesNativeRegistryExchange(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		request := make(chan context.Context, 1)
 		released := make(chan struct{})
+		defer close(released)
 		f := newImageFlightFixture(t, func(ctx context.Context) error {
 			request <- ctx
 			<-ctx.Done()
-			<-released // Model the registry unwinding after cancellation.
+			<-released // A remote handler need not finish for Fred's HTTP client to drain.
 			return ctx.Err()
 		}, nil)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		preparation := imageTenantPreparationForTest(t, f.m)
+		done := make(chan error, 1)
+		go func() { _, err := f.m.ingest(ctx, preparation, f.ref, f.ref); preparation.close(); done <- err }()
+		work := <-request
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
+		require.NoError(t, f.m.flights.shutdown(t.Context()))
+		synctest.Wait()
+		require.ErrorIs(t, work.Err(), context.Canceled)
+		require.Empty(t, f.m.flights.active)
+		require.Zero(t, f.m.flights.workers)
+		require.Zero(t, f.m.staging)
+		require.Zero(t, f.m.tenantShares.used)
+		require.Zero(t, f.m.active)
+		require.Zero(t, f.imports.Load())
+	})
+}
+
+func TestImageFlightLastMemberDepartureRetainsDispatchedImportUntilDrain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		request := make(chan context.Context, 1)
+		released := make(chan struct{})
+		f := newImageFlightFixture(t, nil, func(ctx context.Context) error {
+			request <- ctx
+			<-released // The accepted foreign daemon consumer owns its completion lifetime.
+			return ctx.Err()
+		})
 		ctx, cancel := context.WithCancel(t.Context())
 		preparation := imageTenantPreparationForTest(t, f.m)
 		done := make(chan error, 1)
@@ -34,10 +64,10 @@ func TestImageFlightLastMemberDepartureCancelsAndDrainsBeforeAnotherAttempt(t *t
 		work := <-request
 		cancel()
 		require.ErrorIs(t, <-done, context.Canceled)
-		require.ErrorIs(t, work.Err(), context.Canceled)
+		require.NoError(t, work.Err(), "tenant departure cannot revoke an accepted daemon exchange")
 		synctest.Wait()
 		require.Equal(t, 1, f.m.flights.workers)
-		require.Equal(t, 1, f.m.tenantShares.used, "flight retains staging until the registry releases it")
+		require.Equal(t, 1, f.m.tenantShares.used, "flight retains staging until the daemon consumer releases it")
 		require.Equal(t, 1, f.m.active, "orphaned worker keeps its independent collection exclusion")
 		ctx, cancelDrain := context.WithTimeout(t.Context(), time.Second)
 		defer cancelDrain()
@@ -48,7 +78,7 @@ func TestImageFlightLastMemberDepartureCancelsAndDrainsBeforeAnotherAttempt(t *t
 		require.Zero(t, f.m.staging)
 		require.Zero(t, f.m.tenantShares.used)
 		require.Zero(t, f.m.active)
-		require.Zero(t, f.imports.Load())
+		require.EqualValues(t, 1, f.imports.Load())
 	})
 }
 
@@ -74,7 +104,7 @@ func TestImageFlightShutdownCancelsDownloadsAndRefusesNewWorkers(t *testing.T) {
 	})
 }
 
-func TestImageFlightPanicReleasesFilesAndPublishesFailureToAllMembers(t *testing.T) {
+func TestImageFlightForeignFailureReleasesFilesAndPublishesFailureToAllMembers(t *testing.T) {
 	for _, dispatched := range []bool{false, true} {
 		name := "registry"
 		if dispatched {
@@ -88,7 +118,12 @@ func TestImageFlightPanicReleasesFilesAndPublishesFailureToAllMembers(t *testing
 				if dispatched {
 					f = newImageFlightFixture(t, nil, crash)
 				} else {
-					f = newImageFlightFixture(t, crash, nil)
+					// A registry failure crosses an HTTP boundary, not a
+					// foreign RoundTripper panic boundary inside Fred.
+					f = newImageFlightFixture(t, func(context.Context) error {
+						<-release
+						return errors.New("registry dropped the connection")
+					}, nil)
 				}
 				results := make(chan error, 2)
 				for range 2 {
@@ -102,7 +137,11 @@ func TestImageFlightPanicReleasesFilesAndPublishesFailureToAllMembers(t *testing
 				}
 				close(release)
 				for range 2 {
-					require.ErrorContains(t, <-results, "foreign worker panic")
+					err := <-results
+					require.Error(t, err)
+					if dispatched {
+						require.ErrorContains(t, err, "foreign worker panic")
+					}
 				}
 				require.NoError(t, f.m.flights.shutdown(t.Context()))
 				require.Zero(t, f.m.staging)
@@ -203,7 +242,7 @@ func TestStopRetainsDependenciesUntilCanceledFlightActuallyUnwinds(t *testing.T)
 		b := newBackendForTest(&mockDockerClient{CloseFn: func() error { closed++; return nil }}, nil)
 		b.shutdownDrainTimeout = time.Second
 		unwind := make(chan struct{})
-		f := newImageFlightFixture(t, func(ctx context.Context) error { <-ctx.Done(); <-unwind; return ctx.Err() }, nil)
+		f := newImageFlightFixture(t, nil, func(ctx context.Context) error { <-ctx.Done(); <-unwind; return ctx.Err() })
 		f.m.lifetime = b.stopCtx
 		b.imageCapacity = f.m
 		ctx, cancel := context.WithCancel(t.Context())
@@ -214,7 +253,7 @@ func TestStopRetainsDependenciesUntilCanceledFlightActuallyUnwinds(t *testing.T)
 		cancel()
 		require.ErrorIs(t, <-result, context.Canceled)
 		require.ErrorIs(t, b.Stop(), ErrShutdownDrainTimeout)
-		require.Zero(t, closed, "a canceled registry worker still owns the daemon and journals")
+		require.Zero(t, closed, "a canceled import worker still owns the daemon and journals")
 		close(unwind)
 		synctest.Wait()
 		require.NoError(t, b.Stop())
@@ -322,7 +361,7 @@ func TestImageFlightEightMinuteProgressingDownloadSurvivesFirstMemberCloseAtSeve
 			}
 			return response, nil
 		})
-		require.NoError(t, imagefetch.WithRegistryTransport(transport)(f.m.loader))
+		require.NoError(t, imagefetch.WithRegistryTransport(nativeRegistryTransport(t, transport))(f.m.loader))
 		started := time.Now()
 		firstCtx, cancelFirst := context.WithTimeout(t.Context(), 10*time.Minute)
 		defer cancelFirst()

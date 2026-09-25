@@ -21,7 +21,6 @@ import (
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 )
 
@@ -32,15 +31,16 @@ const (
 	maxIndexEntries  = 256
 )
 
-// Resolution binds registry selection to one immutable manifest. Its zero value
-// carries no authority; copies retain the same original selection.
+// Resolution binds one immutable manifest to digest-verified configuration and
+// an admitted platform/layer schema. Its zero value carries no authority;
+// copies retain the same original evidence. It grants no layer/import budget.
 type Resolution struct{ state *resolvedManifest }
 type resolvedManifest struct {
 	issuer   *Loader
 	named    name.Reference
 	raw      []byte
 	digest   digest.Digest
-	config   digest.Digest
+	manifest runnableManifest
 	platform ocispec.Platform
 	metadata int64
 }
@@ -66,7 +66,7 @@ func (r Resolution) ConfigID() string {
 	if r.state == nil {
 		return ""
 	}
-	return r.state.config.String()
+	return r.state.manifest.config.Digest.String()
 }
 func (r Resolution) Platform() ocispec.Platform {
 	if r.state == nil {
@@ -75,7 +75,7 @@ func (r Resolution) Platform() ocispec.Platform {
 	return clonePlatform(r.state.platform)
 }
 
-// Resolve selects a runnable platform manifest without downloading layers.
+// Resolve verifies bounded manifest/config metadata without downloading layers.
 func (l *Loader) Resolve(ctx context.Context, ref string, platform ocispec.Platform) (Resolution, error) {
 	if l == nil {
 		return Resolution{}, errors.New("image loader is unavailable")
@@ -95,14 +95,20 @@ func (l *Loader) Resolve(ctx context.Context, ref string, platform ocispec.Platf
 	if err != nil {
 		return Resolution{}, err
 	}
-	var manifest ocispec.Manifest
-	if err := json.Unmarshal(raw, &manifest); err != nil {
+	shape, err := parseManifestShape(raw, metadata)
+	if err != nil {
 		return Resolution{}, err
 	}
-	if manifest.SchemaVersion != 2 || validDescriptor(manifest.Config) != nil {
-		return Resolution{}, errors.New("image manifest has no valid config identity")
+	config, err := l.fetchMemory(ctx, named, shape.config)
+	if err != nil {
+		return Resolution{}, err
 	}
-	return Resolution{state: &resolvedManifest{issuer: l, named: named, raw: raw, digest: id, config: manifest.Config.Digest, platform: clonePlatform(platform), metadata: metadata}}, nil
+	manifest, err := admitRunnableManifest(shape, config, platform)
+	if err != nil {
+		return Resolution{}, err
+	}
+	metadata += int64(len(config))
+	return Resolution{state: &resolvedManifest{issuer: l, named: named, raw: raw, digest: id, manifest: manifest, platform: clonePlatform(platform), metadata: metadata}}, nil
 }
 
 // Prepare performs bounded registry I/O and decompression without extracting
@@ -125,7 +131,7 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 		return nil, err
 	}
 	selected := resolution.state
-	named, platform := selected.named, selected.platform
+	named := selected.named
 	rawManifest, manifestID, metadata := selected.raw, selected.digest, selected.metadata
 	dir, err := os.MkdirTemp(l.stageRoot, ".fred-image-")
 	if err != nil {
@@ -139,67 +145,26 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 			_ = p.Close()
 		}
 	}()
-	var manifest ocispec.Manifest
-	if err := json.Unmarshal(rawManifest, &manifest); err != nil {
-		return nil, err
-	}
-	if manifest.SchemaVersion != 2 || manifest.Subject != nil || manifest.ArtifactType != "" || len(manifest.Layers) > maxLayers {
-		return nil, errors.New("image manifest is not a bounded runnable image")
-	}
-	if manifest.MediaType == "" {
-		manifest.MediaType = ocispec.MediaTypeImageManifest
-		if manifest.Config.MediaType == "application/vnd.docker.container.image.v1+json" {
-			manifest.MediaType = "application/vnd.docker.distribution.manifest.v2+json"
-		}
-	}
-	if manifest.Config.MediaType != ocispec.MediaTypeImageConfig && manifest.Config.MediaType != "application/vnd.docker.container.image.v1+json" {
-		return nil, errors.New("unsupported image config media type")
-	}
-	if manifest.Config.Size <= 0 || manifest.Config.Size > maxMetadataBytes-metadata {
-		return nil, errors.New("image config exceeds metadata budget")
-	}
-	config, err := l.fetchMemory(ctx, named, manifest.Config)
-	if err != nil {
-		return nil, err
-	}
-	metadata += int64(len(config))
-	var cfg ocispec.Image
-	if err := json.Unmarshal(config, &cfg); err != nil {
-		return nil, err
-	}
-	if cfg.RootFS.Type != "layers" || len(cfg.RootFS.DiffIDs) != len(manifest.Layers) || !platforms.OnlyStrict(platform).Match(cfg.Platform) {
-		return nil, errors.New("image config does not match the selected platform and layers")
-	}
-	state.metadata, err = imageexec.AdmitMetadata(cfg.Config.Labels, cfg.Config.Volumes)
-	if err != nil {
-		return nil, fmt.Errorf("admit image configuration: %w", err)
-	}
-	state.imported = Imported{manifest: manifestID.String(), config: manifest.Config.Digest.String(), source: named.Context().Digest(manifestID.String()).Name(), platform: cfg.Platform}
+	manifest := selected.manifest
+	config := manifest.configBytes
+	state.metadata = manifest.admittedMetadata
+	state.imported = Imported{manifest: manifestID.String(), config: manifest.config.Digest.String(), source: named.Context().Digest(manifestID.String()).Name(), platform: manifest.platform}
 	state.blobs = append(state.blobs,
 		blob{name: blobPath(manifestID), size: int64(len(rawManifest)), data: rawManifest},
-		blob{name: blobPath(manifest.Config.Digest), size: int64(len(config)), data: config})
+		blob{name: blobPath(manifest.config.Digest), size: int64(len(config)), data: config})
 	stageBytes := metadata
 	expansion := newLayerBudget(l.budget)
-	type stagedLayer struct {
-		descriptor ocispec.Descriptor
-		blob       blob
-	}
-	seen := make(map[digest.Digest]stagedLayer)
-	layerNames := make([]string, 0, len(manifest.Layers))
-	for index, descriptor := range manifest.Layers {
+	seen := make(map[digest.Digest]blob)
+	layerNames := make([]string, 0, len(manifest.layers))
+	for index, layer := range manifest.layers {
+		descriptor := layer.descriptor
 		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if err := validDescriptor(descriptor); err != nil {
 			return nil, err
 		}
 		previous, exists := seen[descriptor.Digest]
 		var b blob
 		if exists {
-			if previous.descriptor.Size != descriptor.Size || previous.descriptor.MediaType != descriptor.MediaType {
-				return nil, errors.New("repeated layer descriptor differs from original blob")
-			}
-			b = previous.blob
+			b = previous
 		} else {
 			if descriptor.Size > l.budget.Bytes()-stageBytes {
 				return nil, errors.New("image compressed content exceeds staging budget")
@@ -209,10 +174,10 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 			if err != nil {
 				return nil, err
 			}
-			seen[descriptor.Digest] = stagedLayer{descriptor: descriptor, blob: b}
+			seen[descriptor.Digest] = b
 			state.blobs = append(state.blobs, b)
 		}
-		if err := inspectLayer(ctx, b.file, descriptor.MediaType, cfg.RootFS.DiffIDs[index], &expansion); err != nil {
+		if err := inspectLayer(ctx, b.file, descriptor.MediaType, layer.diffID, &expansion); err != nil {
 			return nil, fmt.Errorf("image layer %d: %w", index, err)
 		}
 		layerNames = append(layerNames, b.name)
@@ -225,7 +190,7 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 		tags = []string{tag.Name()}
 		annotations = map[string]string{ocispec.AnnotationRefName: tag.Name()}
 	}
-	index, err := json.Marshal(ocispec.Index{Versioned: specs.Versioned{SchemaVersion: 2}, Manifests: []ocispec.Descriptor{{MediaType: manifest.MediaType, Digest: manifestID, Size: int64(len(rawManifest)), Platform: &cfg.Platform, Annotations: annotations}}})
+	index, err := json.Marshal(ocispec.Index{Versioned: specs.Versioned{SchemaVersion: 2}, Manifests: []ocispec.Descriptor{{MediaType: manifest.mediaType, Digest: manifestID, Size: int64(len(rawManifest)), Platform: &manifest.platform, Annotations: annotations}}})
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +198,7 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 		Config   string   `json:"Config"`
 		RepoTags []string `json:"RepoTags"`
 		Layers   []string `json:"Layers"`
-	}{{Config: blobPath(manifest.Config.Digest), RepoTags: tags, Layers: layerNames}})
+	}{{Config: blobPath(manifest.config.Digest), RepoTags: tags, Layers: layerNames}})
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +217,7 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 	// Classic stores retain a config copy while the import archive still
 	// exists. Both stores also create per-image/per-layer metadata outside the
 	// layer tar entries (layerdb, snapshot records and graphdriver links).
-	importBytes := archiveBytes + expansion.allocated + 2*metadata + int64(len(manifest.Layers)+1)*(128<<10)
+	importBytes := archiveBytes + expansion.allocated + 2*metadata + int64(len(manifest.layers)+1)*(128<<10)
 	if importBytes > 2*l.budget.Bytes() {
 		return nil, errors.New("image import allocation exceeds twice the image byte limit")
 	}
@@ -326,7 +291,7 @@ func blobPath(d digest.Digest) string { return "blobs/sha256/" + d.Encoded() }
 
 func (l *Loader) fetchMemory(ctx context.Context, ref name.Reference, d ocispec.Descriptor) ([]byte, error) {
 	var buf bytes.Buffer
-	if err := l.fetch(ctx, ref, d, &buf); err != nil {
+	if err := l.fetchBounded(ctx, ref, d, &buf, maxMetadataBytes); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
@@ -364,10 +329,14 @@ func (l *Loader) fetchFile(ctx context.Context, ref name.Reference, dir string, 
 }
 
 func (l *Loader) fetch(ctx context.Context, ref name.Reference, d ocispec.Descriptor, out io.Writer) error {
+	return l.fetchBounded(ctx, ref, d, out, l.budget.Bytes())
+}
+
+func (l *Loader) fetchBounded(ctx context.Context, ref name.Reference, d ocispec.Descriptor, out io.Writer, limit int64) error {
 	if err := validDescriptor(d); err != nil {
 		return err
 	}
-	transfer, err := newRegistryBlobTransfer(ctx, ref, d, boundedTransport{base: l.transport, limit: l.budget.Bytes()})
+	transfer, err := newRegistryBlobTransfer(ctx, ref, d, boundedTransport{base: l.transport, limit: limit})
 	if err != nil {
 		return err
 	}

@@ -139,7 +139,7 @@ func TestImageCapacitySlowRegistryDoesNotBlockCachedTenantPreparation(t *testing
 	}
 	attachImageCapacityLoader(t, m, func(context.Context, io.Reader) (image.LoadResponse, error) {
 		return image.LoadResponse{}, errors.New("cached image was unexpectedly imported")
-	}, imagefetch.WithRegistryTransport(server.Client().Transport))
+	}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 	const slowLease = "550e8400-e29b-41d4-a716-446655440001"
 	const warmLease = "550e8400-e29b-41d4-a716-446655440002"
 	results := make(chan string, 2)
@@ -215,7 +215,7 @@ func TestImageCapacityPullReusesUnpinnedLocalDigestAboveNewImageLimit(t *testing
 			attachImageCapacityLoader(t, m, func(context.Context, io.Reader) (image.LoadResponse, error) {
 				imports++
 				return image.LoadResponse{}, errors.New("already-local content was unexpectedly imported")
-			}, imagefetch.WithRegistryTransport(server.Client().Transport))
+			}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 			const lease = "550e8400-e29b-41d4-a716-446655440001"
 			results := make(chan string, 1)
 			runs := imagePreparationExecutions(t, m, map[string]string{lease: ref}, results)
@@ -297,7 +297,7 @@ func TestImageImportAdmissionCoordinatesHelperStartedAfterPreflight(t *testing.T
 				require.NoError(t, remote.Write(tag, imageCapacityRegistryImage(t, "concurrent verified bytes"), remote.WithContext(t.Context()), remote.WithTransport(server.Client().Transport)))
 				attachImageCapacityLoader(t, m, func(context.Context, io.Reader) (image.LoadResponse, error) {
 					return image.LoadResponse{}, errors.New("reservation test must not dispatch ImageLoad")
-				}, imagefetch.WithRegistryTransport(server.Client().Transport))
+				}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 				prepared, err := m.loader.Prepare(t.Context(), ref, daemonImagePlatform(info))
 				require.NoError(t, err)
 				defer func() { require.NoError(t, prepared.Close()) }()
@@ -390,7 +390,7 @@ func TestImageCapacityRecoveryKeepsSavedBudgetAfterNewLimitDrops(t *testing.T) {
 		_, err := io.Copy(io.Discard, input)
 		present = true
 		return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, err
-	}, imagefetch.WithRegistryTransport(server.Client().Transport))
+	}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 	pin := &shared.ImagePin{ImageID: configID.String(), PullDigest: tag.Context().Digest(manifestID.String()).Name(), ImportBytes: 8 * imageMiB, VerificationBytes: 8 * imageMiB}
 	pin.Platform.OS, pin.Platform.Architecture = "linux", "amd64"
 	resolved, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, pin, true)
@@ -424,7 +424,7 @@ func TestImageCapacityReusesVerifiedPinAcrossTenantsAndProtectsItFromCollection(
 		_, err := io.Copy(io.Discard, input)
 		imports++
 		return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, err
-	}, imagefetch.WithRegistryTransport(server.Client().Transport))
+	}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 	const first = "550e8400-e29b-41d4-a716-446655440001"
 	const second = "550e8400-e29b-41d4-a716-446655440002"
 	results := make(chan string, 2)
@@ -485,7 +485,7 @@ func TestImageCapacityIncompleteCollectionDoesNotRefuseCachedAdmission(t *testin
 	}
 	attachImageCapacityLoader(t, m, func(context.Context, io.Reader) (image.LoadResponse, error) {
 		return image.LoadResponse{}, errors.New("cached admission must not import")
-	}, imagefetch.WithRegistryTransport(server.Client().Transport))
+	}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 	const lease = "550e8400-e29b-41d4-a716-446655440001"
 	results := make(chan string, 1)
 	runs := imagePreparationExecutions(t, m, map[string]string{lease: ref}, results)

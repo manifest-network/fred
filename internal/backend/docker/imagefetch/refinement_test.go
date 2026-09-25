@@ -44,7 +44,7 @@ func TestRepeatedLayerDescriptorsStageOnceAndPreserveReferences(t *testing.T) {
 		m.Layers = []ocispec.Descriptor{m.Layers[0], m.Layers[0], m.Layers[0]}
 	})
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -81,7 +81,7 @@ func TestRepeatedLayerMustMatchItsOriginalDescriptorAndDiffID(t *testing.T) {
 					cfg.RootFS.DiffIDs[1] = digest.FromString("other")
 				}
 			})
-			loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+			loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 			require.NoError(t, err)
 			_, err = loader.Prepare(t.Context(), f.ref(), testPlatform)
 			require.Error(t, err)
@@ -91,7 +91,7 @@ func TestRepeatedLayerMustMatchItsOriginalDescriptorAndDiffID(t *testing.T) {
 
 func TestResolutionBindsSelectionAcrossMutableTagChanges(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	resolved, err := loader.Resolve(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -134,7 +134,7 @@ func TestMetadataAdmissionPrecedesLayerDownloadAndDaemonMutation(t *testing.T) {
 			})
 			f.replaceBlob = []byte("never admissible")
 			daemon := &recordingImporter{}
-			loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+			loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 			require.NoError(t, err)
 			_, err = loader.Prepare(t.Context(), f.ref(), testPlatform)
 			require.ErrorContains(t, err, "admit image configuration")
@@ -149,7 +149,7 @@ func TestMetadataAdmissionPrecedesLayerDownloadAndDaemonMutation(t *testing.T) {
 func TestImportAllowanceCapsFilesystemMetadataExpansion(t *testing.T) {
 	f := newRegistry(t, encodedTar(t, tar.Header{Name: strings.Repeat("d/", 200) + "file", Typeflag: tar.TypeReg}))
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	_, err = loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.ErrorContains(t, err, "import allocation exceeds")
@@ -173,7 +173,7 @@ func TestRegistryRefusesPrivateIPHTTPFallbackAndDowngrade(t *testing.T) {
 				}))
 				defer secure.Close()
 				registryURL = secure.URL
-				opts = append(opts, WithRegistryTransport(secure.Client().Transport))
+				opts = append(opts, withRegistryTransportForTest(secure.Client().Transport))
 			}
 			loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, opts...)
 			require.NoError(t, err)
@@ -198,7 +198,7 @@ func TestGlobalPAXMetadataMatchesDaemonIgnoreSemantics(t *testing.T) {
 func TestImportAdmissionCopiesShareSingleUseAndUndispatchedRelease(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -230,7 +230,7 @@ func TestLoaderShutdownOwnsImportGraceAndUnknownDebit(t *testing.T) {
 	stage := t.TempDir()
 	synctest.Test(t, func(t *testing.T) {
 		daemon := &coordinatedImporter{arrivals: make(chan context.Context, 1), results: make(chan error)}
-		loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(transport))
+		loader, err := NewLoader(daemon, stage, 1<<20, withRegistryTransportForTest(transport))
 		require.NoError(t, err)
 		p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 		require.NoError(t, err)
@@ -270,7 +270,7 @@ func TestLoaderShutdownAllowsCompletionWithinBackendDrainBudget(t *testing.T) {
 	stage := t.TempDir()
 	synctest.Test(t, func(t *testing.T) {
 		daemon := &coordinatedImporter{arrivals: make(chan context.Context, 1), results: make(chan error, 1)}
-		loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(transport))
+		loader, err := NewLoader(daemon, stage, 1<<20, withRegistryTransportForTest(transport))
 		require.NoError(t, err)
 		prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 		require.NoError(t, err)
@@ -296,7 +296,7 @@ func TestLoaderShutdownAllowsCompletionWithinBackendDrainBudget(t *testing.T) {
 
 func TestUnknownDebitIsNotHiddenBySettlingAnotherAdmission(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
-	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	require.NoError(t, loader.changeDebit(123))
 	p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
@@ -317,7 +317,7 @@ func TestUnknownDebitIsNotHiddenBySettlingAnotherAdmission(t *testing.T) {
 func TestPreparedCloseAndReservationShareOneLifetime(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	for range 16 {
 		prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
@@ -341,7 +341,7 @@ func TestPreparedCloseAndReservationShareOneLifetime(t *testing.T) {
 func TestCopiedImportAdmissionCannotDispatchTwiceOrThroughForeignLoader(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -363,7 +363,7 @@ func TestCopiedImportAdmissionCannotDispatchTwiceOrThroughForeignLoader(t *testi
 
 func TestRecoveryBudgetSharesDebitAndShutdownWithoutMutatingAdmissionLimit(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
-	original, err := NewLoader(&recordingImporter{}, t.TempDir(), 64<<10, WithRegistryTransport(f.server.Client().Transport))
+	original, err := NewLoader(&recordingImporter{}, t.TempDir(), 64<<10, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	budget, err := imagebudget.NewVerificationBudget(1 << 20)
 	require.NoError(t, err)

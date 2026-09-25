@@ -61,7 +61,7 @@ func TestTarSplitTailAllowanceCoversPrimaryCodecReadFragmentation(t *testing.T) 
 		manifest.Layers[0].Size = int64(len(compressed))
 	})
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, t.TempDir(), 64<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, t.TempDir(), 64<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)

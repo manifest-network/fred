@@ -46,7 +46,7 @@ func TestImportOwnsCompletionAfterCallerCancellation(t *testing.T) {
 	stage := t.TempDir()
 	synctest.Test(t, func(t *testing.T) {
 		daemon := &coordinatedImporter{arrivals: make(chan context.Context, 1), results: make(chan error, 1)}
-		loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(transport))
+		loader, err := NewLoader(daemon, stage, 1<<20, withRegistryTransportForTest(transport))
 		require.NoError(t, err)
 		p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 		require.NoError(t, err)
@@ -80,7 +80,7 @@ func TestCanceledImportAdmissionNeverDispatchesAndReleasesDebit(t *testing.T) {
 	for _, cancelAfterReservation := range []bool{false, true} {
 		t.Run(fmt.Sprintf("reserved=%t", cancelAfterReservation), func(t *testing.T) {
 			daemon := &recordingImporter{}
-			loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+			loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 			require.NoError(t, err)
 			prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 			require.NoError(t, err)
@@ -113,7 +113,7 @@ func TestCancelBeforeDispatchCannotRepeatProofAfterDebitReleaseFailure(t *testin
 	stage := filepath.Join(t.TempDir(), "stage")
 	require.NoError(t, os.Mkdir(stage, 0o700))
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, stage, 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -147,7 +147,7 @@ func TestAdmittedImportHasLoaderOwnedCeilingFromDispatch(t *testing.T) {
 	stage := t.TempDir()
 	synctest.Test(t, func(t *testing.T) {
 		daemon := &coordinatedImporter{arrivals: make(chan context.Context, 1), results: make(chan error, 1)}
-		loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(transport))
+		loader, err := NewLoader(daemon, stage, 1<<20, withRegistryTransportForTest(transport))
 		require.NoError(t, err)
 		prepared, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 		require.NoError(t, err)
@@ -179,14 +179,14 @@ func TestOutstandingImportDebitSurvivesReopenAndUnknownCompletion(t *testing.T) 
 		t.Run(result, func(t *testing.T) {
 			f := newRegistry(t, layerTar(t, []byte("content")))
 			stage := t.TempDir()
-			loader, err := NewLoader(&recordingImporter{result: result}, stage, 1<<20, WithRegistryTransport(f.server.Client().Transport))
+			loader, err := NewLoader(&recordingImporter{result: result}, stage, 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 			require.NoError(t, err)
 			p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 			require.NoError(t, err)
 			_, err = loader.Import(t.Context(), p)
 			require.Error(t, err)
 			require.NoError(t, p.Close())
-			reopened, err := NewLoader(&recordingImporter{}, stage, 1<<20, WithRegistryTransport(f.server.Client().Transport))
+			reopened, err := NewLoader(&recordingImporter{}, stage, 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 			require.NoError(t, err)
 			pending, err := reopened.PendingBytes()
 			require.NoError(t, err)
@@ -202,7 +202,7 @@ func TestOutstandingImportDebitSurvivesReopenAndUnknownCompletion(t *testing.T) 
 func TestConcurrentImportsSettleOnlyTheirOwnDebit(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
 	daemon := &coordinatedImporter{arrivals: make(chan context.Context, 2), results: make(chan error, 2)}
-	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	first, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -231,7 +231,7 @@ func TestUnreadableDebitPreventsDaemonDispatch(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
 	stage := t.TempDir()
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, stage, 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -249,7 +249,7 @@ func TestMissingLedgerDirectoryPreventsDaemonDispatch(t *testing.T) {
 	stage := filepath.Join(t.TempDir(), "stage")
 	require.NoError(t, os.Mkdir(stage, 0o700))
 	daemon := &recordingImporter{}
-	loader, err := NewLoader(daemon, stage, 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(daemon, stage, 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
@@ -315,7 +315,7 @@ func TestDefinitiveDaemonFailuresSettleTheirOwnDebit(t *testing.T) {
 		t.Run(result, func(t *testing.T) {
 			f := newRegistry(t, layerTar(t, []byte("content")))
 			stage := t.TempDir()
-			loader, err := NewLoader(&recordingImporter{result: result}, stage, 1<<20, WithRegistryTransport(f.server.Client().Transport))
+			loader, err := NewLoader(&recordingImporter{result: result}, stage, 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 			require.NoError(t, err)
 			// A terminal refusal must settle only this attempt, preserving
 			// unrelated earlier work whose completion remains unknown.
@@ -329,7 +329,7 @@ func TestDefinitiveDaemonFailuresSettleTheirOwnDebit(t *testing.T) {
 			pending, err := loader.PendingBytes()
 			require.NoError(t, err)
 			require.Equal(t, int64(123), pending)
-			reopened, err := NewLoader(&recordingImporter{}, stage, 1<<20, WithRegistryTransport(f.server.Client().Transport))
+			reopened, err := NewLoader(&recordingImporter{}, stage, 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 			require.NoError(t, err)
 			pending, err = reopened.PendingBytes()
 			require.NoError(t, err)
@@ -346,7 +346,7 @@ func (immediateCompletionImporter) ImageLoad(context.Context, io.Reader, ...clie
 
 func TestTerminalResponseWithoutCompletedUploadRetainsDebit(t *testing.T) {
 	f := newRegistry(t, layerTar(t, []byte("content")))
-	loader, err := NewLoader(immediateCompletionImporter{}, t.TempDir(), 1<<20, WithRegistryTransport(f.server.Client().Transport))
+	loader, err := NewLoader(immediateCompletionImporter{}, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
 	require.NoError(t, err)
 	p, err := loader.Prepare(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)

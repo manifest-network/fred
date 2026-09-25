@@ -1,8 +1,11 @@
 package docker
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,11 +25,73 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imagefetch"
 )
+
+func TestImageCapacityCachedResolutionCannotPinNonRunnableRecoverySource(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*ocispec.Manifest)
+	}{
+		{name: "artifact", mutate: func(manifest *ocispec.Manifest) { manifest.ArtifactType = "application/vnd.fixture.non-runnable" }},
+		{name: "missing layers", mutate: func(manifest *ocispec.Manifest) { manifest.Layers = nil }},
+		{name: "extra layer", mutate: func(manifest *ocispec.Manifest) { manifest.Layers = append(manifest.Layers, manifest.Layers[0]) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newImageFlightFixture(t, nil, nil)
+			malicious := dockerReplayRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				response, err := f.transport.RoundTrip(request)
+				if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(request.URL.Path, "/manifests/") {
+					return response, err
+				}
+				raw, err := io.ReadAll(response.Body)
+				closeErr := response.Body.Close()
+				if err != nil || closeErr != nil {
+					return nil, errors.Join(err, closeErr)
+				}
+				var manifest ocispec.Manifest
+				if err := json.Unmarshal(raw, &manifest); err != nil {
+					return nil, err
+				}
+				test.mutate(&manifest)
+				raw, err = json.Marshal(manifest)
+				if err != nil {
+					return nil, err
+				}
+				response.Body = io.NopCloser(bytes.NewReader(raw))
+				response.ContentLength = int64(len(raw))
+				response.Header.Set("Content-Length", fmt.Sprint(len(raw)))
+				response.Header.Set("Docker-Content-Digest", digest.FromBytes(raw).String())
+				return response, nil
+			})
+			var imports atomic.Int64
+			attachImageCapacityLoader(t, f.m, func(context.Context, io.Reader) (image.LoadResponse, error) {
+				imports.Add(1)
+				return image.LoadResponse{}, errors.New("non-runnable manifest must never import")
+			}, imagefetch.WithRegistryTransport(nativeRegistryTransport(t, malicious)))
+			f.local.Store(true) // The matching classic config is already cached locally.
+			const lease = "550e8400-e29b-41d4-a716-446655440088"
+			var preparationErr error
+			pins, runs := imagePreparationSubjects(t, map[string]string{lease: f.ref}, nil, func(ctx context.Context, mutations *storageMutations) error {
+				_, preparationErr = f.m.prepare(ctx, mutations, f.ref, true)
+				return preparationErr
+			})
+			f.m.pins = pins
+			runs[lease]()
+			require.Error(t, preparationErr, "manifest metadata must agree with the cached config before issuing recovery authority")
+			saved, err := pins.List()
+			require.NoError(t, err)
+			require.Empty(t, saved, "cached config identity cannot authorize a non-runnable future recovery source")
+			require.Zero(t, imports.Load())
+			require.Zero(t, f.downloads.Load())
+		})
+	}
+}
 
 func TestImageCapacityUnknownImportAllowsUnrelatedCollectionAndRetainsAccounting(t *testing.T) {
 	m, daemon, fs := imageCapacityFixture(t)
@@ -39,7 +104,7 @@ func TestImageCapacityUnknownImportAllowsUnrelatedCollectionAndRetainsAccounting
 	attachImageCapacityLoader(t, m, func(_ context.Context, reader io.Reader) (image.LoadResponse, error) {
 		_, err := io.Copy(io.Discard, reader)
 		return image.LoadResponse{}, errors.Join(err, errors.New("lost import response"))
-	}, imagefetch.WithRegistryTransport(server.Client().Transport))
+	}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 	prepared, err := m.loader.Prepare(t.Context(), ref, daemonImagePlatform(system.Info{OSType: "linux", Architecture: "amd64"}))
 	require.NoError(t, err)
 	defer func() { require.NoError(t, prepared.Close()) }()
@@ -98,7 +163,7 @@ func TestImageCapacityProtectsResolvedImageUntilPinPublication(t *testing.T) {
 	}}).imageAdmitter()
 	attachImageCapacityLoader(t, m, func(context.Context, io.Reader) (image.LoadResponse, error) {
 		return image.LoadResponse{}, errors.New("local content must not be imported")
-	}, imagefetch.WithRegistryTransport(server.Client().Transport))
+	}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 	resolved, resume := make(chan struct{}), make(chan struct{})
 	release := sync.OnceFunc(func() { close(resume) })
 	defer release()
@@ -151,11 +216,16 @@ func TestImageCapacityReusesClassicMultiPlatformConfigAboveNewLimit(t *testing.T
 	m, daemon, _ := imageCapacityFixture(t)
 	m.cfg.ImageMaxSizeMB = 1
 	var observe atomic.Bool
-	var blobGets atomic.Int64
+	var configGets, layerGets atomic.Int64
+	var configPath string
 	registryHandler := registry.New()
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if observe.Load() && r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/") {
-			blobGets.Add(1)
+			if r.URL.Path == configPath {
+				configGets.Add(1)
+			} else {
+				layerGets.Add(1)
+			}
 		}
 		registryHandler.ServeHTTP(w, r)
 	}))
@@ -191,14 +261,16 @@ func TestImageCapacityReusesClassicMultiPlatformConfigAboveNewLimit(t *testing.T
 	}
 	attachImageCapacityLoader(t, m, func(context.Context, io.Reader) (image.LoadResponse, error) {
 		return image.LoadResponse{}, errors.New("existing multi-platform content must not be imported")
-	}, imagefetch.WithRegistryTransport(server.Client().Transport))
+	}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
+	configPath = "/v2/multi/blobs/" + configID.String()
 	observe.Store(true)
 	const lease = "550e8400-e29b-41d4-a716-446655440001"
 	results := make(chan string, 1)
 	runs := imagePreparationExecutions(t, m, map[string]string{lease: ref}, results)
 	runs[lease]()
 	require.Equal(t, lease, <-results)
-	require.Zero(t, blobGets.Load(), "local config reuse must not download or revalidate old layers against new ingestion limits")
+	require.EqualValues(t, 1, configGets.Load(), "selection verifies the bounded config metadata once")
+	require.Zero(t, layerGets.Load(), "local config reuse must not download or revalidate old layers against new ingestion limits")
 	pins, err := m.pins.List()
 	require.NoError(t, err)
 	require.Len(t, pins, 1)

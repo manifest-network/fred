@@ -1928,8 +1928,14 @@ func TestCallbackReplayQueue_TypedWakeTouchesOnlyItsLease(t *testing.T) {
 	assert.NotContains(t, queue.dormant, inFlightLease)
 	leaseUUID, ready = queue.next()
 	require.True(t, ready)
+	assert.Equal(t, otherLease, leaseUUID,
+		"a later ownership handoff cannot displace an already queued fresh lease")
+	queue.dispatched(leaseUUID)
+	queue.completed(callbackReplayCompletion{leaseUUID: leaseUUID, outcome: callbackReplayEmpty})
+	leaseUUID, ready = queue.next()
+	require.True(t, ready)
 	assert.Equal(t, inFlightLease, leaseUUID,
-		"ownership handoff must promptly retry the exact dormant lease")
+		"ownership handoff must receive the next fresh-lane opportunity")
 }
 
 func TestCallbackReplayQueue_SameLeaseCommitRechecksInFlightDrain(t *testing.T) {

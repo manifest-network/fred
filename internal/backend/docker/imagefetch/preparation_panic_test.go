@@ -29,7 +29,7 @@ func TestPreparationPanicClosesEveryStagedFileAndExchange(t *testing.T) {
 		}
 		return f.server.Client().Transport.RoundTrip(req)
 	})
-	loader, err := NewLoader(&recordingImporter{}, stage, 1<<20, WithRegistryTransport(transport))
+	loader, err := NewLoader(&recordingImporter{}, stage, 1<<20, withRegistryTransportForTest(transport))
 	require.NoError(t, err)
 	require.PanicsWithValue(t, "registry transport panic", func() {
 		_, _ = loader.Prepare(t.Context(), f.ref(), testPlatform)

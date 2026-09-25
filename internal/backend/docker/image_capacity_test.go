@@ -383,7 +383,7 @@ func TestImageCapacityRecoversMissingPinByDigestWithoutResolvingTag(t *testing.T
 		}
 		present = true
 		return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, nil
-	}, imagefetch.WithRegistryTransport(server.Client().Transport))
+	}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 	daemon.imageInspect = func(_ context.Context, inspected string, _ ...client.ImageInspectOption) (image.InspectResponse, error) {
 		require.Equal(t, id, inspected)
 		return image.InspectResponse{ID: id, Size: imageMiB}, nil
@@ -461,7 +461,7 @@ func TestImageCapacityLegacyContainerdPinReingestsToEstablishAllowance(t *testin
 				}
 				imports++
 				return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, nil
-			}, imagefetch.WithRegistryTransport(server.Client().Transport))
+			}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 			legacyBytes := test.bytes
 			pin := &shared.ImagePin{ImageID: id, PullDigest: pullDigest, Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}, ImportBytes: legacyBytes}
 			resolved, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, pin, false)
@@ -530,7 +530,7 @@ func TestImageCapacityRechecksImportHeadroomAfterVerifiedStage(t *testing.T) {
 				imported = true
 				_, err := io.Copy(io.Discard, input)
 				return image.LoadResponse{}, errors.Join(err, errors.New("unexpected daemon import"))
-			}, imagefetch.WithRegistryTransport(server.Client().Transport))
+			}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 			_, err = m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, nil, true)
 			require.ErrorContains(t, err, "image import admission: "+fullPath)
 			require.False(t, imported, "verified bytes must not reach Docker without their import allocation")
@@ -555,7 +555,7 @@ func TestImageCapacityOutstandingImportDebitBlocksNextDownloadOnSharedFilesystem
 		imports++
 		_, err := io.Copy(io.Discard, input)
 		return image.LoadResponse{}, errors.Join(err, errors.New("lost daemon completion"))
-	}, imagefetch.WithRegistryTransport(server.Client().Transport))
+	}, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 	firstPreparation := imageTenantPreparationForTest(t, m)
 	_, err = m.ingest(t.Context(), firstPreparation, ref, ref)
 	firstPreparation.close()

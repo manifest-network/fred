@@ -31,7 +31,7 @@ import (
 // localPlatformSecurityRegistry serves only a tiny test-owned OCI index and its
 // blobs over TLS loopback. It exercises Fred's real index/manifest selection
 // without a public registry, build service, credentials, or executable workload.
-func localPlatformSecurityRegistry(t *testing.T) (imageName string, leaf digest.Digest, transport http.RoundTripper) {
+func localPlatformSecurityRegistry(t *testing.T) (imageName string, leaf digest.Digest, transport *http.Transport) {
 	t.Helper()
 	var layer bytes.Buffer
 	tw := tar.NewWriter(&layer)
@@ -116,7 +116,7 @@ func localPlatformSecurityRegistry(t *testing.T) (imageName string, leaf digest.
 		}
 	}))
 	t.Cleanup(server.Close)
-	return strings.TrimPrefix(server.URL, "https://") + "/app:latest", leaf, server.Client().Transport
+	return strings.TrimPrefix(server.URL, "https://") + "/app:latest", leaf, server.Client().Transport.(*http.Transport)
 }
 
 func TestIntegration_Docker_MultiPlatformImageExecutesCheckedLeaf(t *testing.T) {

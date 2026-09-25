@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -160,7 +161,7 @@ func verifyBoundedImageImportReference(t *testing.T, docker *client.Client, dige
 	require.NoError(t, err)
 	configID, err := fixture.ConfigName()
 	require.NoError(t, err)
-	loader, err := imagefetch.NewLoader(docker, t.TempDir(), 8*imageMiB, imagefetch.WithRegistryTransport(server.Client().Transport))
+	loader, err := imagefetch.NewLoader(docker, t.TempDir(), 8*imageMiB, imagefetch.WithRegistryTransport(server.Client().Transport.(*http.Transport)))
 	require.NoError(t, err)
 	source := ref.Name()
 	if digestOnly {

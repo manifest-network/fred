@@ -93,16 +93,15 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 	bounded := &budgetReader{reader: raw, remaining: budget.remaining}
 	hash := sha256.New()
 	stream := io.TeeReader(bounded, hash)
-	reader := tar.NewReader(stream)
+	archive := newLayerArchive(stream)
 	if budget.root == nil {
 		budget.root = &layerNode{kind: tar.TypeDir, children: make(map[string]*layerNode)}
 	}
 	budget.layer++
 	tree := layerTree{budget: budget, seen: make(map[string]bool)}
 	logical := int64(0)
-	payload := int64(0)
 	for {
-		header, err := reader.Next()
+		header, err := archive.next()
 		if err == io.EOF {
 			break
 		}
@@ -170,12 +169,6 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 			return errors.New("image hardlinks exceed expanded byte budget")
 		}
 		logical += copied
-		//nolint:gosec // G110: decoded bytes and logical tar sizes are independently bounded above.
-		copiedPayload, err := io.Copy(io.Discard, reader)
-		if err != nil {
-			return err
-		}
-		payload += copiedPayload
 	}
 	// A tar terminator is not a compression terminator. Charge trailing decoded
 	// bytes and require the entire compressor checksum and diffID to match.
@@ -190,7 +183,7 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 	// Header/inter-entry segments are parser-owned and bounded by the entry
 	// allowance. Post-EOF padding can instead emit one JSON segment per byte;
 	// retain its independent framing allowance for every layer occurrence.
-	metadata := retainedTarMetadata{parserBytes: uint64(consumed - payload - tailBytes), tailBytes: uint64(tailBytes)}
+	metadata := retainedTarMetadata{parserBytes: uint64(consumed - archive.payloadBytes() - tailBytes), tailBytes: uint64(tailBytes)}
 	allowance, err := metadata.allowance(uint64(budget.allocated))
 	if err != nil {
 		return err

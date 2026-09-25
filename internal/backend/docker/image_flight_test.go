@@ -96,7 +96,7 @@ func newImageFlightFixture(t *testing.T, download, imported func(context.Context
 		}
 		f.local.Store(true)
 		return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, nil
-	}, imagefetch.WithRegistryTransport(f.transport))
+	}, imagefetch.WithRegistryTransport(nativeRegistryTransport(t, f.transport)))
 	return f
 }
 
@@ -371,24 +371,23 @@ func TestImageFlightRechecksLocalImageAfterStagingAdmission(t *testing.T) {
 	})
 }
 
-func TestImageFlightDoesNotShareDifferentPlatformSelections(t *testing.T) {
+func TestImageFlightCannotAdmitMismatchedPlatformSelection(t *testing.T) {
 	f := newImageFlightFixture(t, nil, nil)
 	firstResolution, err := f.m.loader.Resolve(t.Context(), f.ref, ocispec.Platform{OS: "linux", Architecture: "amd64"})
 	require.NoError(t, err)
-	secondResolution, err := f.m.loader.Resolve(t.Context(), f.ref, ocispec.Platform{OS: "linux", Architecture: "arm64"})
-	require.NoError(t, err)
-	require.Equal(t, firstResolution.SourceReference(), secondResolution.SourceReference())
 	first := imageTenantPreparationForTest(t, f.m)
-	second := imageTenantPreparationForTest(t, f.m)
 	_, firstLeader, err := first.joinFlight(f.m, firstResolution, f.m.loader.VerificationBudget())
 	require.NoError(t, err)
 	require.NotNil(t, firstLeader)
 	defer firstLeader.complete(imageFlightFailure{err: errors.New("fixture does not stage")})
+	secondResolution, err := f.m.loader.Resolve(t.Context(), f.ref, ocispec.Platform{OS: "linux", Architecture: "arm64"})
+	require.ErrorContains(t, err, "does not match the selected platform")
+	require.Empty(t, secondResolution.SourceReference(), "a mismatched config cannot issue resolution authority")
+	second := imageTenantPreparationForTest(t, f.m)
 	_, secondLeader, err := second.joinFlight(f.m, secondResolution, f.m.loader.VerificationBudget())
-	require.NoError(t, err)
-	require.NotNil(t, secondLeader, "another requested platform must validate its own config/layers")
-	defer secondLeader.complete(imageFlightFailure{err: errors.New("fixture does not stage")})
-	require.Len(t, f.m.flights.active, 2)
+	require.Error(t, err)
+	require.Nil(t, secondLeader, "invalid selection cannot join the existing flight or create another")
+	require.Len(t, f.m.flights.active, 1)
 }
 
 func TestImageFlightCancellationAfterReservationRetriesOnlyClosedUnsentAdmission(t *testing.T) {
