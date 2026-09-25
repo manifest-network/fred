@@ -134,7 +134,7 @@ func TestRegistryResumesLargeRedirectedBlobWithinItsDescriptorBound(t *testing.T
 	f.updateImage(t, func(_ *ocispec.Image, manifest *ocispec.Manifest) {
 		manifest.Layers[0] = ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayer, Digest: f.layerID, Size: int64(len(f.layer))}
 	})
-	var attempts atomic.Int64
+	var attempts, redirects atomic.Int64
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		response, err := f.server.Client().Transport.RoundTrip(req)
 		if err != nil {
@@ -143,7 +143,11 @@ func TestRegistryResumesLargeRedirectedBlobWithinItsDescriptorBound(t *testing.T
 		if strings.HasSuffix(req.URL.Path, "/blobs/"+f.layerID.String()) {
 			_ = response.Body.Close()
 			response.StatusCode, response.ContentLength, response.Body = http.StatusTemporaryRedirect, 0, http.NoBody
-			response.Header.Set("Location", f.server.URL+"/cdn/content")
+			generation := redirects.Add(1)
+			response.Header.Set("Location", fmt.Sprintf("%s/cdn/content?generation=%d", f.server.URL, generation))
+			if generation > 1 {
+				require.Equal(t, "bytes=1048576-", req.Header.Get("Range"))
+			}
 		}
 		if req.URL.Path == "/cdn/content" {
 			_ = response.Body.Close()
@@ -153,6 +157,7 @@ func TestRegistryResumesLargeRedirectedBlobWithinItsDescriptorBound(t *testing.T
 			if attempts.Add(1) == 1 {
 				response.Body = &interruptedRegistryBody{ReadCloser: response.Body, remaining: 1 << 20}
 			} else {
+				require.Equal(t, "2", req.URL.Query().Get("generation"), "resume obtains a fresh registry redirect")
 				require.Equal(t, "bytes=1048576-", req.Header.Get("Range"))
 				response.StatusCode = http.StatusPartialContent
 				response.ContentLength -= 1 << 20
@@ -168,6 +173,7 @@ func TestRegistryResumesLargeRedirectedBlobWithinItsDescriptorBound(t *testing.T
 	require.NoError(t, err)
 	require.NoError(t, prepared.Close())
 	require.EqualValues(t, 2, attempts.Load())
+	require.EqualValues(t, 2, redirects.Load())
 }
 
 func TestRegistryTransientAttemptsShareOneBoundAcrossHeadersAndBody(t *testing.T) {

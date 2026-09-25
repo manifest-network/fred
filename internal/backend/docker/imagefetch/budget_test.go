@@ -121,7 +121,7 @@ func TestLayerAllocationCoversRetainedGlobalHeaderJSON(t *testing.T) {
 	for _, size := range []int{2000, 32000} {
 		name := strings.Repeat("\x01", size)
 		raw := encodedTar(t, tar.Header{Name: name, Typeflag: tar.TypeXGlobalHeader, PAXRecords: map[string]string{"comment": "metadata"}})
-		budget := &layerBudget{remaining: 1 << 20}
+		budget := layerTestBudget(t, 1<<20)
 		require.NoError(t, checkLayer(t, budget, raw))
 		entry, err := json.Marshal(struct {
 			Type     int    `json:"type"`
@@ -136,7 +136,7 @@ func TestLayerAllocationCoversRetainedGlobalHeaderJSON(t *testing.T) {
 func TestLayerAllocationCoversIncompressibleTarSplitSegments(t *testing.T) {
 	padding := bytes.Repeat(imageBudgetPadding(), 4)
 	raw := append(encodedTar(t), padding...)
-	budget := &layerBudget{remaining: 16 << 20}
+	budget := layerTestBudget(t, 16<<20)
 	require.NoError(t, checkLayer(t, budget, raw))
 	// Use tar-split's stored segment shape and gzip encoding to measure the
 	// retained bytes independently of the allocation formula.

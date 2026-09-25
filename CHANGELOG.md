@@ -255,21 +255,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   when necessary. Each member retains its own deadline and pin authority;
   dispatched imports keep independent completion ownership. (ENG-1052)
 
-- Image verification admits large dependency trees through one bounded
-  namespace-memory allowance instead of a fixed entry-count cutoff. Ordinary
-  and saved recovery use the same allowance; compressed/decoded byte limits,
-  path-work limits and complete physical import accounting remain enforced.
-  This supports the measured 167,561-entry Morpheus image. (ENG-1052)
+- Image verification charges the actual retained paths, node base components
+  and symlink targets through a monotonic namespace owner. Its memory, retained
+  path and resolution-work allowances scale with `image_max_size_mb`, while fixed
+  floors preserve older pins. The saved verification budget includes consumed
+  namespace authority, preserving recovery after policy decreases. Independent
+  compressed/decoded and physical import limits remain enforced. (ENG-1052)
 
 - Image import accounting separately reserves retained metadata for decoded
   padding after the tar terminator, including compression streams that produce
   one retained JSON segment per decoded byte. (ENG-1052)
 
 - Registry reads retry transient connection, no-progress and availability
-  failures with a shared three-attempt bound per request. Immutable layer
-  downloads resume retained prefixes when Range is supported; integrity and
-  size checks remain mandatory. Completed layers and Docker imports are not
-  replayed. (ENG-1052)
+  failures with a three-attempt bound. Each immutable blob owns its allowance
+  across resumes and authentication renewal. Attempts start from the immutable
+  registry URL to refresh CDN redirects; unsupported ranges
+  fall back to a full GET within that bound. HTTP 429/503 Retry-After delays are
+  bounded to 30 seconds. Retained prefixes, integrity and size checks remain
+  mandatory; completed layers and Docker imports are not replayed. (ENG-1052)
 
 - Deferred closes older than 35 minutes emit an Error and increment the bounded
   `overdue` outcome once per retained entry. Retries continue with their existing

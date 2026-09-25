@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"regexp"
 
@@ -178,7 +179,7 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 		blob{name: blobPath(manifestID), size: int64(len(rawManifest)), data: rawManifest},
 		blob{name: blobPath(manifest.Config.Digest), size: int64(len(config)), data: config})
 	stageBytes := metadata
-	expansion := layerBudget{remaining: l.budget.Bytes()}
+	expansion := newLayerBudget(l.budget)
 	type stagedLayer struct {
 		descriptor ocispec.Descriptor
 		blob       blob
@@ -255,9 +256,11 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 	if importBytes > 2*l.budget.Bytes() {
 		return nil, errors.New("image import allocation exceeds twice the image byte limit")
 	}
-	// Recovery must cover both independent verification counters and the import
-	// ceiling, even when compressible tar metadata consumes almost no file data.
-	verificationBytes := max(stageBytes, l.budget.Bytes()-expansion.remaining, (importBytes+1)/2)
+	// Recovery covers every verification dimension, including namespace usage
+	// above the fixed compatibility floors, without copying the entire issuer's
+	// unused allowance into durable pins.
+	verificationBytes := max(stageBytes, l.budget.Bytes()-expansion.remaining, (importBytes+1)/2,
+		expansion.namespace.recoveryBytes())
 	verification, err := imagebudget.NewVerificationBudget(verificationBytes)
 	if err != nil {
 		return nil, err
@@ -272,7 +275,7 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 
 func (l *Loader) selectManifest(ctx context.Context, ref name.Reference, platform ocispec.Platform, used *int64) ([]byte, digest.Digest, error) {
 	for range maxIndexDepth {
-		descriptor, err := remote.Get(ref, l.options(ctx, maxMetadataBytes, nil)...)
+		descriptor, err := remote.Get(ref, l.options(ctx, maxMetadataBytes)...)
 		if err != nil {
 			return nil, "", err
 		}
@@ -364,14 +367,19 @@ func (l *Loader) fetch(ctx context.Context, ref name.Reference, d ocispec.Descri
 	if err := validDescriptor(d); err != nil {
 		return err
 	}
-	layer, err := remote.Layer(ref.Context().Digest(d.Digest.String()), l.options(ctx, l.budget.Bytes(), &d)...)
+	transfer, err := newRegistryBlobTransfer(ctx, ref, d, boundedTransport{base: l.transport, limit: l.budget.Bytes()})
 	if err != nil {
 		return err
 	}
-	body, err := layer.Compressed()
+	response, err := transfer.openBlob(0)
 	if err != nil {
 		return err
 	}
+	if response.StatusCode != http.StatusOK {
+		_ = response.Body.Close()
+		return fmt.Errorf("registry blob returned HTTP %d", response.StatusCode)
+	}
+	body := &resumingBody{transfer: transfer, body: response.Body}
 	defer func() { _ = body.Close() }()
 	h := sha256.New()
 	n, err := io.Copy(io.MultiWriter(out, h), &budgetReader{reader: contextReader{ctx, body}, remaining: d.Size})
@@ -384,10 +392,10 @@ func (l *Loader) fetch(ctx context.Context, ref name.Reference, d ocispec.Descri
 	return nil
 }
 
-func (l *Loader) options(ctx context.Context, limit int64, blob *ocispec.Descriptor) []remote.Option {
+func (l *Loader) options(ctx context.Context, limit int64) []remote.Option {
 	return []remote.Option{
 		remote.WithContext(ctx), remote.WithAuth(authn.Anonymous),
-		remote.WithTransport(registryTransport{base: boundedTransport{base: l.transport, limit: limit}, blob: blob}),
+		remote.WithTransport(registryTransport{base: boundedTransport{base: l.transport, limit: limit}}),
 		// Our transport shares one attempt bound across headers and body. Do
 		// not multiply it by the registry client's default request retries.
 		remote.WithRetryBackoff(remote.Backoff{Steps: 1}),

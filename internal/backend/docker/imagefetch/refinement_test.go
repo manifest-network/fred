@@ -186,13 +186,13 @@ func TestRegistryRefusesPrivateIPHTTPFallbackAndDowngrade(t *testing.T) {
 
 func TestGlobalPAXMetadataMatchesDaemonIgnoreSemantics(t *testing.T) {
 	raw := encodedTar(t, tar.Header{Name: "GlobalHead.0", Typeflag: tar.TypeXGlobalHeader, PAXRecords: map[string]string{"comment": "archive metadata", "path": "ignored", "SCHILY.xattr.trusted.overlay.metacopy": ""}}, tar.Header{Name: "app", Typeflag: tar.TypeReg, Size: 12})
-	budget := &layerBudget{remaining: 1 << 20}
+	budget := layerTestBudget(t, 1<<20)
 	require.NoError(t, checkLayer(t, budget, raw))
 	require.NotContains(t, budget.root.children, "ignored")
 	require.NotContains(t, budget.root.children, "GlobalHead.0")
 	require.Contains(t, budget.root.children, "app")
 	oversized := encodedTar(t, tar.Header{Name: "GlobalHead.1", Typeflag: tar.TypeXGlobalHeader, PAXRecords: map[string]string{"comment": strings.Repeat("x", maxHeaderBytes)}})
-	require.ErrorContains(t, checkLayer(t, &layerBudget{remaining: 1 << 20}, oversized), "header exceeds metadata budget")
+	require.ErrorContains(t, checkLayer(t, layerTestBudget(t, 1<<20), oversized), "header exceeds metadata budget")
 }
 
 func TestImportAdmissionCopiesShareSingleUseAndUndispatchedRelease(t *testing.T) {

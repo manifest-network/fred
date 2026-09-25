@@ -18,23 +18,27 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 )
 
 const (
-	maxPathBytes         = 4096
-	maxHeaderBytes       = 64 << 10
-	maxRetainedPathBytes = 32 << 20
-	maxResolvedPathBytes = 64 << 20
-	metadataAllocation   = int64(16 << 10)
+	maxPathBytes       = 4096
+	maxHeaderBytes     = 64 << 10
+	metadataAllocation = int64(16 << 10)
 )
 
 type layerBudget struct {
-	remaining                                int64
-	allocated                                int64
-	entries, nodes, pathBytes, resolvedBytes int
-	layer                                    int
-	root                                     *layerNode
-	namespace                                namespaceMemory
+	remaining      int64
+	allocated      int64
+	entries, nodes int
+	layer          int
+	root           *layerNode
+	namespace      namespaceMemory
+}
+
+func newLayerBudget(verification imagebudget.VerificationBudget) layerBudget {
+	return layerBudget{remaining: verification.Bytes(), namespace: newNamespaceMemory(verification)}
 }
 
 // layerNode models the actual image namespace, including inherited aliases.
@@ -92,7 +96,6 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 	reader := tar.NewReader(stream)
 	if budget.root == nil {
 		budget.root = &layerNode{kind: tar.TypeDir, children: make(map[string]*layerNode)}
-		budget.namespace = newNamespaceMemory()
 	}
 	budget.layer++
 	tree := layerTree{budget: budget, seen: make(map[string]bool)}
@@ -150,7 +153,7 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 		if tree.seen[name] {
 			return errors.New("image layer contains duplicate paths")
 		}
-		if err := tree.accountName(name); err != nil {
+		if err := budget.namespace.claimName(name); err != nil {
 			return err
 		}
 		tree.seen[name] = true
@@ -212,22 +215,11 @@ func safeLayerPath(value string) (string, error) {
 
 func roundBlock(size, block int64) int64 { return (size + block - 1) / block * block }
 
-func (t *layerTree) accountName(name string) error {
-	if len(name) > maxRetainedPathBytes-t.budget.pathBytes {
-		return errors.New("image paths exceed retained path byte budget")
-	}
-	if err := t.budget.namespace.claim(namespaceStringMemory(len(name))); err != nil {
-		return err
-	}
-	t.budget.pathBytes += len(name)
-	return nil
-}
-
-func (t *layerTree) newNode(name string, kind byte) (*layerNode, error) {
+func (t *layerTree) newNode(base string, kind byte) (*layerNode, error) {
 	if err := t.budget.namespace.claim(namespaceNodeMemory); err != nil {
 		return nil, err
 	}
-	if err := t.accountName(name); err != nil {
+	if err := t.budget.namespace.claimName(base); err != nil {
 		return nil, err
 	}
 	t.budget.nodes++
@@ -246,7 +238,6 @@ func (t *layerTree) parent(ctx context.Context, name string, create bool) ([]*la
 	base := path.Base(name)
 	pending := strings.Split(path.Dir(name), "/")
 	stack := []*layerNode{t.budget.root}
-	names := make([]string, 0)
 	links := 0
 	for len(pending) > 0 {
 		if err := ctx.Err(); err != nil {
@@ -254,17 +245,15 @@ func (t *layerTree) parent(ctx context.Context, name string, create bool) ([]*la
 		}
 		component := pending[0]
 		pending = pending[1:]
-		if len(component)+1 > maxResolvedPathBytes-t.budget.resolvedBytes {
-			return nil, "", errors.New("image symlink resolution exceeds path work budget")
+		if err := t.budget.namespace.claimResolution(component); err != nil {
+			return nil, "", err
 		}
-		t.budget.resolvedBytes += len(component) + 1
 		switch component {
 		case "", ".":
 			continue
 		case "..":
 			if len(stack) > 1 {
 				stack = stack[:len(stack)-1]
-				names = names[:len(names)-1]
 			}
 			continue
 		}
@@ -275,7 +264,7 @@ func (t *layerTree) parent(ctx context.Context, name string, create bool) ([]*la
 				return nil, "", errors.New("image hardlink source parent is missing")
 			}
 			var err error
-			node, err = t.newNode(path.Join(append(names, component)...), tar.TypeDir)
+			node, err = t.newNode(component, tar.TypeDir)
 			if err != nil {
 				return nil, "", err
 			}
@@ -291,7 +280,6 @@ func (t *layerTree) parent(ctx context.Context, name string, create bool) ([]*la
 			}
 			if strings.HasPrefix(node.target, "/") {
 				stack = stack[:1]
-				names = names[:0]
 			}
 			pending = append(strings.Split(node.target, "/"), pending...)
 			continue
@@ -304,7 +292,6 @@ func (t *layerTree) parent(ctx context.Context, name string, create bool) ([]*la
 			t.budget.allocated += metadataAllocation
 		}
 		stack = append(stack, node)
-		names = append(names, component)
 	}
 	return stack, base, nil
 }
@@ -359,7 +346,7 @@ func (t *layerTree) apply(ctx context.Context, name string, h *tar.Header) (int6
 		if err := stableSymlinkTarget(h.Linkname); err != nil {
 			return 0, err
 		}
-		if err := t.accountName(h.Linkname); err != nil {
+		if err := t.budget.namespace.claimName(h.Linkname); err != nil {
 			return 0, err
 		}
 	case tar.TypeDir, tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
@@ -370,7 +357,7 @@ func (t *layerTree) apply(ctx context.Context, name string, h *tar.Header) (int6
 	if old != nil && old.kind == tar.TypeDir && kind == tar.TypeDir {
 		node = old
 	} else {
-		node, err = t.newNode(name, kind)
+		node, err = t.newNode(base, kind)
 		if err != nil {
 			return 0, err
 		}

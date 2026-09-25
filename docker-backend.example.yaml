@@ -90,6 +90,9 @@ image_gc_low_percent: 75
 # import allowance is capped at twice this budget. Existing local/pinned content
 # is not invalidated solely by lowering this limit. First ingestion stages and
 # verifies exact content beside the callback journal before Docker writes it.
+# Also sizes the bounded namespace model: at 10240 MiB, 320 MiB for namespace
+# allocations, 80 MiB of retained names and 160 MiB of path-resolution work.
+# Saved pins retain the verification budget required by their admitted content.
 image_max_size_mb: 10240
 # Classic Docker storage uses the daemon's reported data root automatically.
 # Bounded ingestion supports overlay2 and the containerd overlayfs snapshotter;

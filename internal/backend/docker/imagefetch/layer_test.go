@@ -13,7 +13,17 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 )
+
+func layerTestBudget(t *testing.T, bytes int64) *layerBudget {
+	t.Helper()
+	verification, err := imagebudget.NewVerificationBudget(bytes)
+	require.NoError(t, err)
+	budget := newLayerBudget(verification)
+	return &budget
+}
 
 func encodedTar(t *testing.T, headers ...tar.Header) []byte {
 	t.Helper()
@@ -41,7 +51,7 @@ func checkLayer(t *testing.T, budget *layerBudget, raw []byte) error {
 }
 
 func TestLayerNamespaceAcceptsInheritedUsrmergeAndRelativeLinks(t *testing.T) {
-	budget := &layerBudget{remaining: 1 << 20}
+	budget := layerTestBudget(t, 1<<20)
 	require.NoError(t, checkLayer(t, budget, encodedTar(t,
 		tar.Header{Name: "usr", Typeflag: tar.TypeDir},
 		tar.Header{Name: "usr/bin", Typeflag: tar.TypeDir},
@@ -73,7 +83,7 @@ func TestLayerRejectsStaleHardlinkAuthority(t *testing.T) {
 		{"absolute aliases", nil, []tar.Header{{Name: "/file", Typeflag: tar.TypeReg}, {Name: "//file", Typeflag: tar.TypeReg}}, "duplicate"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			budget := &layerBudget{remaining: 1 << 20}
+			budget := layerTestBudget(t, 1<<20)
 			if len(tt.previous) > 0 {
 				require.NoError(t, checkLayer(t, budget, encodedTar(t, tt.previous...)))
 			}
@@ -83,7 +93,7 @@ func TestLayerRejectsStaleHardlinkAuthority(t *testing.T) {
 }
 
 func TestLayerCountsInheritedDanglingSymlinkDirectories(t *testing.T) {
-	budget := &layerBudget{remaining: 1 << 20}
+	budget := layerTestBudget(t, 1<<20)
 	target := strings.Repeat("nested/", 40) + "target"
 	require.NoError(t, checkLayer(t, budget, encodedTar(t, tar.Header{Name: "a", Typeflag: tar.TypeSymlink, Linkname: target})))
 	before := budget.allocated
@@ -93,25 +103,26 @@ func TestLayerCountsInheritedDanglingSymlinkDirectories(t *testing.T) {
 }
 
 func TestLayerBoundsImplicitPathsBeforeAllocation(t *testing.T) {
-	budget := &layerBudget{remaining: 16 << 20}
+	budget := layerTestBudget(t, 16<<20)
+	budget.namespace.remaining = 1 << 20
 	var headers []tar.Header
 	for i := range 20 {
 		headers = append(headers, tar.Header{Name: fmt.Sprintf("%d/", i) + strings.Repeat("d/", 2000) + "file", Typeflag: tar.TypeReg})
 	}
 	err := checkLayer(t, budget, encodedTar(t, headers...))
-	require.ErrorContains(t, err, "retained path byte budget")
-	require.LessOrEqual(t, budget.pathBytes, maxRetainedPathBytes)
-	require.LessOrEqual(t, budget.nodes, int(maxNamespaceMemory/namespaceNodeMemory))
+	require.ErrorContains(t, err, "namespace exceeds memory budget")
+	require.LessOrEqual(t, budget.namespace.pathBytes, int64(minRetainedPathBytes))
+	require.LessOrEqual(t, budget.nodes, int((1<<20)/namespaceNodeMemory))
 }
 
 func TestLayerBoundsSymlinkLoops(t *testing.T) {
-	budget := &layerBudget{remaining: 1 << 20}
+	budget := layerTestBudget(t, 1<<20)
 	require.NoError(t, checkLayer(t, budget, encodedTar(t, tar.Header{Name: "a", Typeflag: tar.TypeSymlink, Linkname: "b"}, tar.Header{Name: "b", Typeflag: tar.TypeSymlink, Linkname: "a"})))
 	require.ErrorContains(t, checkLayer(t, budget, encodedTar(t, tar.Header{Name: "a/file", Typeflag: tar.TypeReg})), "traversal limit")
 }
 
 func TestLayerChargesDirectoryCopiesAcrossLayers(t *testing.T) {
-	budget := &layerBudget{remaining: 1 << 20}
+	budget := layerTestBudget(t, 1<<20)
 	require.NoError(t, checkLayer(t, budget, encodedTar(t, tar.Header{Name: "d", Typeflag: tar.TypeDir})))
 	before := budget.allocated
 	require.NoError(t, checkLayer(t, budget, encodedTar(t, tar.Header{Name: "d/file", Typeflag: tar.TypeReg})))
@@ -122,7 +133,7 @@ func TestLayerRejectsOverlayNamespaceXattrs(t *testing.T) {
 	for _, key := range []string{"trusted.overlay.redirect", "trusted.overlay.metacopy", "user.overlay.opaque"} {
 		t.Run(key, func(t *testing.T) {
 			raw := encodedTar(t, tar.Header{Name: "d", Typeflag: tar.TypeDir, PAXRecords: map[string]string{"SCHILY.xattr." + key: "target"}})
-			require.ErrorContains(t, checkLayer(t, &layerBudget{remaining: 1 << 20}, raw), "reserved overlay")
+			require.ErrorContains(t, checkLayer(t, layerTestBudget(t, 1<<20), raw), "reserved overlay")
 		})
 	}
 }
@@ -148,8 +159,8 @@ func TestLayerValidatesZstdAndGzipChecksums(t *testing.T) {
 			defer f.Close()
 			_, err = f.Write(tt.body)
 			require.NoError(t, err)
-			require.NoError(t, inspectLayer(t.Context(), f, tt.media, digest.FromBytes(raw), &layerBudget{remaining: 1 << 20}))
-			require.ErrorContains(t, inspectLayer(t.Context(), f, tt.media, digest.FromString("wrong"), &layerBudget{remaining: 1 << 20}), "uncompressed digest")
+			require.NoError(t, inspectLayer(t.Context(), f, tt.media, digest.FromBytes(raw), layerTestBudget(t, 1<<20)))
+			require.ErrorContains(t, inspectLayer(t.Context(), f, tt.media, digest.FromString("wrong"), layerTestBudget(t, 1<<20)), "uncompressed digest")
 		})
 	}
 }
@@ -157,34 +168,35 @@ func TestLayerValidatesZstdAndGzipChecksums(t *testing.T) {
 func TestLayerRejectsEmptyOverlayControlPAXRecords(t *testing.T) {
 	for _, key := range []string{"trusted.overlay.metacopy", "user.overlay.metacopy"} {
 		raw := encodedTar(t, tar.Header{Name: "file", Typeflag: tar.TypeReg, PAXRecords: map[string]string{"SCHILY.xattr." + key: ""}})
-		require.ErrorContains(t, checkLayer(t, &layerBudget{remaining: 1 << 20}, raw), "reserved overlay")
+		require.ErrorContains(t, checkLayer(t, layerTestBudget(t, 1<<20), raw), "reserved overlay")
 	}
 }
 
 func TestLayerChargesRetainedSymlinkTargets(t *testing.T) {
-	budget := &layerBudget{remaining: 1 << 20, pathBytes: maxRetainedPathBytes - 256}
+	budget := layerTestBudget(t, 1<<20)
+	budget.namespace.pathBytes = minRetainedPathBytes - 256
 	raw := encodedTar(t, tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: strings.Repeat("d/", 512)})
 	require.ErrorContains(t, checkLayer(t, budget, raw), "retained path byte budget")
-	require.LessOrEqual(t, budget.pathBytes, maxRetainedPathBytes)
+	require.LessOrEqual(t, budget.namespace.pathBytes, int64(minRetainedPathBytes))
 }
 
 func TestLayerChargesSlashHeavySymlinkResolution(t *testing.T) {
-	budget := &layerBudget{remaining: 1 << 20}
+	budget := layerTestBudget(t, 1<<20)
 	require.NoError(t, checkLayer(t, budget, encodedTar(t, tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: strings.Repeat("/", maxPathBytes)})))
-	budget.resolvedBytes = maxResolvedPathBytes - 128
+	budget.namespace.resolvedBytes = minResolvedPathBytes - 128
 	require.ErrorContains(t, checkLayer(t, budget, encodedTar(t, tar.Header{Name: "link/file", Typeflag: tar.TypeReg})), "path work budget")
-	require.LessOrEqual(t, budget.resolvedBytes, maxResolvedPathBytes)
+	require.LessOrEqual(t, budget.namespace.resolvedBytes, int64(minResolvedPathBytes))
 }
 
 func TestLayerRejectsGNUSparseEntries(t *testing.T) {
 	raw := encodedTar(t, tar.Header{Name: "sparse", Typeflag: tar.TypeGNUSparse, Format: tar.FormatGNU})
-	require.Error(t, checkLayer(t, &layerBudget{remaining: 1 << 20}, raw))
+	require.Error(t, checkLayer(t, layerTestBudget(t, 1<<20), raw))
 }
 
 func TestLayerRejectsAmbiguousSymlinkParentTraversal(t *testing.T) {
 	for _, target := range []string{"alias/../file", "../alias/../file", "/alias/../file"} {
 		raw := encodedTar(t, tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: target})
-		require.ErrorContains(t, checkLayer(t, &layerBudget{remaining: 1 << 20}, raw), "ambiguous internal parent traversal")
+		require.ErrorContains(t, checkLayer(t, layerTestBudget(t, 1<<20), raw), "ambiguous internal parent traversal")
 	}
 	for _, target := range []string{"../bin", "../../lib", "./../bin", "/../../bin"} {
 		require.NoError(t, stableSymlinkTarget(target))

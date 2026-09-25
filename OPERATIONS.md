@@ -493,22 +493,38 @@ has no special cancellation authority. The last member leaving cancels
 undispatched preparation. Dispatched imports retain their independent ownership.
 The flight owns its staging slot and competes using its least-loaded live tenant;
 if its accounting tenant leaves, a surviving tenant takes that charge. Cache/local reuse is checked again after queue admission.
-Verification uses a fixed 128-MiB logical namespace-memory allowance per flight,
-charged for every header, constructed node and rounded retained name. Replaced
-nodes and deleted paths do not refund parsing-work allowance. The 32-MiB retained
-path and 64-MiB path-resolution-work limits remain, as does the separately bounded
-64-MiB decoder. Four staging slots bound concurrent verification; the namespace
-allowance is an accounting model, not a hard process-RSS limit. Recovery uses the
-same fixed envelope even when its saved byte ceiling is smaller.
+Verification derives its namespace allowances from the same typed byte budget
+that owns staging and decoding. Namespace memory is at least 128 MiB or 1/32 of
+that budget, retained names at least 32 MiB or 1/128, and cumulative path-resolution
+work at least 64 MiB or 1/64. At the default 10 GiB these limits are 320, 80 and
+160 MiB. Headers retain full paths; tree nodes charge their retained base component,
+and symlinks separately charge their targets. Replacements and deletions never
+refund usage. The namespace owner projects all three consumed dimensions into
+the saved verification budget, so lowering new-image policy cannot remove an
+already admitted image's recovery authority. The fixed floors preserve old pins.
+Four staging slots bound concurrent verification, and each decoder remains
+bounded to 64 MiB. Namespace allowances model retained allocations and work;
+they are not a hard process-RSS limit. Raising `image_max_size_mb` also raises
+these allowances. Compressed/decoded bytes and physical import allocation remain
+independent constraints: namespace headroom does not promise equal image-byte
+growth within the default 20-GiB import ceiling.
 Decoded padding after the tar terminator has a separate retained-metadata
 allowance: compression streams can make Docker retain one JSON segment per
 decoded byte. This charge is distinct from tar headers and file allocation.
-Registry GETs have at most three attempts for transient connection, no-progress
-or availability failures. Interrupted immutable blobs resume at the retained
-prefix length when the registry supports Range; otherwise only that blob's
-prefix is replayed. The final digest and descriptor size still bind all bytes.
-Completed layers and dispatched Docker imports are never retried through this
-path. Content, metadata and budget refusals remain terminal.
+Registry metadata GETs have at most three attempts for transient connection,
+no-progress or availability failures. Each immutable blob owns one three-attempt
+allowance shared across resumes, redirects and authentication renewal; wrapper
+copies cannot reset it. Every blob attempt starts at its immutable registry URL,
+refreshing redirects instead of reusing an expired CDN URL. Resumed downloads
+can renew expired authentication within that allowance; token responses always
+retain the separate metadata limit. Interrupted blobs
+resume at the retained prefix when Range is supported; a rejected range falls
+back to a full GET within the same attempt bound, replaying only that blob's
+prefix. For HTTP 429/503, Retry-After can delay the next attempt by up to 30 seconds,
+subject to the existing caller deadline. Redirects preserve HTTPS and credential
+isolation. The final digest and descriptor size still bind all bytes. Completed
+layers and dispatched Docker imports are never retried through this path.
+Content, metadata and budget refusals remain terminal.
 A sole tenant can use all four slots for distinct images. When capacity becomes
 available, the waiting tenant with the fewest active stages goes first; ties and requests within
 a tenant follow arrival order. Waiting requests consume no staging allowance,
