@@ -64,7 +64,7 @@ func TestFailureDiagnosticsCaptureSurvivesReopenAndEmptyRecovery(t *testing.T) {
 	again, _, err := capture.Snapshot()
 	require.NoError(t, err)
 	require.Equal(t, "fatal: required startup file missing", again.Logs["web/0"])
-	outcome, ok := fixture.settlement.ExecuteMaintenance(context.Background(), execution).(MaintenanceExecutionFailure)
+	outcome, ok := fixture.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, context.Background()), execution).(MaintenanceExecutionFailure)
 	require.True(t, ok)
 	proof, err := fixture.settlement.FailMaintenance(outcome, backend.ReasonRestartFailed, "recovered interruption")
 	require.NoError(t, err)
@@ -147,7 +147,7 @@ func TestFailureDiagnosticsOlderCaptureCannotReplaceNewerSameLifecycleFailure(t 
 		Error: "old failure", Message: "old startup failed", Logs: map[string]string{"web/0": "old startup output"}, Status: DiagnosticCaptureComplete,
 	})
 	require.NoError(t, err)
-	failed, ok := fixture.settlement.ExecuteMaintenance(t.Context(), execution).(MaintenanceExecutionFailure)
+	failed, ok := fixture.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution).(MaintenanceExecutionFailure)
 	require.True(t, ok)
 	proof, err := fixture.settlement.FailMaintenance(failed, backend.ReasonRestartFailed, "old failed")
 	require.NoError(t, err)
@@ -205,7 +205,7 @@ func TestFailureDiagnosticsOlderCaptureCannotReplaceNewerSameLifecycleFailure(t 
 
 func TestFailureDiagnosticsTryPublicationDoesNotWaitForBusyLease(t *testing.T) {
 	fixture, diagnostics, execution := newMaintenanceDiagnosticsFixture(t, "busy-publication")
-	failed, ok := fixture.settlement.ExecuteMaintenance(t.Context(), execution).(MaintenanceExecutionFailure)
+	failed, ok := fixture.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution).(MaintenanceExecutionFailure)
 	require.True(t, ok)
 	proof, err := fixture.settlement.FailMaintenance(failed, backend.ReasonRestartFailed, "failed")
 	require.NoError(t, err)

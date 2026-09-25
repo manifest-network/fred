@@ -21,6 +21,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 )
 
 const (
@@ -115,7 +116,7 @@ func (l *Loader) Prepare(ctx context.Context, ref string, platform ocispec.Platf
 
 // PrepareResolved verifies the exact selection without resolving its tag again.
 // Staged blobs are unlinked while open, so a crash releases their disk space.
-func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (_ *Prepared, resultErr error) {
+func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*Prepared, error) {
 	if l == nil || resolution.state == nil || resolution.state.issuer != l {
 		return nil, errors.New("invalid or foreign image resolution")
 	}
@@ -131,8 +132,9 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (_ 
 	}
 	state := &preparedState{issuer: l, dir: dir}
 	p := &Prepared{state: state}
+	transferred := false
 	defer func() {
-		if resultErr != nil {
+		if !transferred {
 			_ = p.Close()
 		}
 	}()
@@ -249,10 +251,22 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (_ 
 	// Classic stores retain a config copy while the import archive still
 	// exists. Both stores also create per-image/per-layer metadata outside the
 	// layer tar entries (layerdb, snapshot records and graphdriver links).
-	state.importBytes = archiveBytes + expansion.allocated + 2*metadata + int64(len(manifest.Layers)+1)*(128<<10)
-	if state.importBytes > 2*l.maxBytes {
+	importBytes := archiveBytes + expansion.allocated + 2*metadata + int64(len(manifest.Layers)+1)*(128<<10)
+	if importBytes > 2*l.maxBytes {
 		return nil, errors.New("image import allocation exceeds twice the image byte limit")
 	}
+	// Recovery must cover both independent verification counters and the import
+	// ceiling, even when compressible tar metadata consumes almost no file data.
+	verificationBytes := max(stageBytes, l.maxBytes-expansion.remaining, (importBytes+1)/2)
+	verification, err := imagebudget.NewVerificationBudget(verificationBytes)
+	if err != nil {
+		return nil, err
+	}
+	state.budget, err = imagebudget.Verified(verification, importBytes)
+	if err != nil {
+		return nil, err
+	}
+	transferred = true
 	return p, nil
 }
 
@@ -315,7 +329,7 @@ func (l *Loader) fetchMemory(ctx context.Context, ref name.Reference, d ocispec.
 	return buf.Bytes(), nil
 }
 
-func (l *Loader) fetchFile(ctx context.Context, ref name.Reference, dir string, d ocispec.Descriptor) (_ blob, resultErr error) {
+func (l *Loader) fetchFile(ctx context.Context, ref name.Reference, dir string, d ocispec.Descriptor) (blob, error) {
 	w, err := os.CreateTemp(dir, "blob-")
 	if err != nil {
 		return blob{}, err
@@ -330,8 +344,9 @@ func (l *Loader) fetchFile(ctx context.Context, ref name.Reference, dir string, 
 		_ = r.Close()
 		return blob{}, err
 	}
+	transferred := false
 	defer func() {
-		if resultErr != nil {
+		if !transferred {
 			_ = r.Close()
 		}
 	}()
@@ -341,6 +356,7 @@ func (l *Loader) fetchFile(ctx context.Context, ref name.Reference, dir string, 
 	if err := w.Close(); err != nil {
 		return blob{}, err
 	}
+	transferred = true
 	return blob{name: blobPath(d.Digest), size: d.Size, file: r}, nil
 }
 

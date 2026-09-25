@@ -468,7 +468,7 @@ type testActorOpts struct {
 	Metrics                   SMMetrics
 	ProvisionWorkFn           func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome
 	RestoreWorkFn             func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome
-	MaintenanceWorkFn         func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome
+	MaintenanceWorkFn         func(shared.MaintenanceWorkerLifetime, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome
 	OnTerminated              func(uuid string)
 	PersistDiagnosticsFn      func(entry shared.DiagnosticEntry, ids []string, keys map[string]string)
 	SendOperationCallbackFn   func(uuid, url string, status backend.CallbackStatus, errMsg string)
@@ -557,7 +557,7 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 		}
 	}
 	if opts.MaintenanceWorkFn == nil {
-		opts.MaintenanceWorkFn = func(_ context.Context, target shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+		opts.MaintenanceWorkFn = func(_ shared.MaintenanceWorkerLifetime, target shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
 			outcome, _ := NewAmbiguousMaintenanceWork(
 				errors.New("test maintenance work not configured"), target.Intent(),
 			)
@@ -687,7 +687,7 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 		}
 	}
 	if opts.MaintenanceWorkFn == nil {
-		opts.MaintenanceWorkFn = func(_ context.Context, target shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+		opts.MaintenanceWorkFn = func(_ shared.MaintenanceWorkerLifetime, target shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
 			outcome, _ := NewAmbiguousMaintenanceWork(
 				errors.New("test maintenance work not configured"), target.Intent(),
 			)
@@ -883,7 +883,7 @@ func testMaintenanceSuccess(t *testing.T, intent shared.MaintenanceIntentClaim, 
 	authority := value.(testMaintenanceAuthority)
 	execution, err := authority.settlement.StartMaintenanceExecution(authority.target)
 	require.NoError(t, err)
-	physical := authority.settlement.ExecuteMaintenance(context.Background(), execution)
+	physical := authority.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, context.Background()), execution)
 	success, ok := physical.(shared.MaintenanceExecutionSuccess)
 	require.True(t, ok)
 	proof, err := authority.settlement.ActivateMaintenance(success)
@@ -939,7 +939,7 @@ func testMaintenanceFailure(t *testing.T, intent shared.MaintenanceIntentClaim, 
 		maintenanceAuthorities.Store(intent.MaintenanceID(), authority)
 		execution, startErr := authority.settlement.StartMaintenanceExecution(authority.target)
 		require.NoError(t, startErr)
-		outcome := authority.settlement.ExecuteMaintenance(context.Background(), execution)
+		outcome := authority.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, context.Background()), execution)
 		var ok bool
 		failure, ok = outcome.(shared.MaintenanceExecutionFailure)
 		require.True(t, ok, "%T: %v", outcome, outcome)
@@ -990,7 +990,7 @@ func testFailedCompensation(t *testing.T, intent shared.MaintenanceIntentClaim, 
 			return shared.NewMaintenanceTargetAbsent(subject)
 		},
 	))
-	require.NoError(t, shared.BindMaintenanceCompensationExecutor(s, t.Context(), authorize, complete,
+	require.NoError(t, shared.BindMaintenanceCompensationExecutor(s, authorize, complete,
 		func(context.Context, shared.MaintenancePhysicalSubject) (shared.MaintenanceSourceCapture, error) {
 			return shared.CapturedMaintenanceSource([]byte(`{"version":1}`))
 		},
@@ -1029,7 +1029,7 @@ func testFailedCompensation(t *testing.T, intent shared.MaintenanceIntentClaim, 
 	maintenanceAuthorities.Store(intent.MaintenanceID(), authority)
 	execution, err := s.StartMaintenanceExecution(authority.target)
 	require.NoError(t, err)
-	outcome := s.ExecuteMaintenance(t.Context(), execution)
+	outcome := s.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
 	failure, ok := outcome.(shared.MaintenanceExecutionFailure)
 	require.True(t, ok, "%T", outcome)
 	proof, err := s.FailMaintenance(failure, backend.ReasonUpdateFailed, "source compensation failed")

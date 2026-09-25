@@ -214,11 +214,11 @@ func TestMaintenanceExecutionRejectsOutcomeFromAnotherStartedGeneration(t *testi
 	require.NoError(t, err)
 	executionB, err := fixture.settlement.StartMaintenanceExecution(targetB)
 	require.NoError(t, err)
-	acceptedA := fixture.settlement.ExecuteMaintenance(context.Background(), executionA)
+	acceptedA := fixture.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, context.Background()), executionA)
 	require.IsType(t, MaintenanceExecutionSuccess{}, acceptedA)
 	forgedB := executionB
 	forgedB.started = executionA.started
-	rejectedB := fixture.settlement.ExecuteMaintenance(context.Background(), forgedB)
+	rejectedB := fixture.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, context.Background()), forgedB)
 	require.IsType(t, MaintenanceExecutionAmbiguous{}, rejectedB)
 }
 
@@ -449,7 +449,7 @@ func TestMaintenanceCapabilitiesBindExactCoordinatorWithSameStores(t *testing.T)
 	bindTestMaintenanceMutation(t, first, nil)
 	execution, err := first.StartMaintenanceExecution(targetClaim)
 	require.NoError(t, err)
-	outcome := first.ExecuteMaintenance(context.Background(), execution)
+	outcome := first.ExecuteMaintenance(testMaintenanceLifetime(t, context.Background()), execution)
 	success, ok := outcome.(MaintenanceExecutionSuccess)
 	require.True(t, ok)
 	proof, err := first.ActivateMaintenance(success)

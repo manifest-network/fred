@@ -411,7 +411,6 @@ func TestMaintenanceCompletionWakeFinalizesBeyondOrdinaryRecoveryBatch(t *testin
 			request, err := NewMaintenanceApplicationRequest(mustMaintenanceID(t, maintenanceIDA), maintenanceLease, "tenant-test", MaintenanceCommandUpdate, []byte("confirmed candidate"))
 			require.NoError(t, err)
 			require.Equal(t, MaintenanceApplicationAccepted, application.Execute(t.Context(), request).Outcome())
-			application.recoveryCursor["backend-a"] = maintenanceLease + "\x00" + request.id.String()
 			require.NoError(t, applyMaintenanceCompletionForTest(t, authority, request.id, backend.CallbackStatusSuccess))
 			<-application.CompletionChanged()
 			err = application.RecoverPending(t.Context())

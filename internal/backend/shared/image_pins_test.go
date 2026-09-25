@@ -8,6 +8,8 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 )
 
 func TestImagePinJournalBindsStartedManifestAndSurvivesReopen(t *testing.T) {
@@ -18,17 +20,17 @@ func TestImagePinJournalBindsStartedManifestAndSurvivesReopen(t *testing.T) {
 	const ref = "example.invalid/app:1"
 	const importBytes = int64(64 << 20)
 	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
-	require.Error(t, journal.Pin(ImageInspectionOrigin{}, ref, inspectionJournalTestImage, "", platform, importBytes))
-	require.ErrorContains(t, journal.Pin(origin, "other:latest", inspectionJournalTestImage, "", platform, importBytes), "absent from Started")
+	require.Error(t, journal.Pin(ImageInspectionOrigin{}, ref, inspectionJournalTestImage, "", platform, legacyImagePinBudget(t, importBytes)))
+	require.ErrorContains(t, journal.Pin(origin, "other:latest", inspectionJournalTestImage, "", platform, legacyImagePinBudget(t, importBytes)), "absent from Started")
 	foreign := openOperationHandoffStores(t, "foreign-image-pins")
 	foreignJournal, err := NewImagePinJournal(foreign.callbacks, foreign.releases, foreign.retentions)
 	require.NoError(t, err)
-	require.ErrorContains(t, foreignJournal.Pin(origin, ref, inspectionJournalTestImage, "", platform, importBytes), "another journal")
+	require.ErrorContains(t, foreignJournal.Pin(origin, ref, inspectionJournalTestImage, "", platform, legacyImagePinBudget(t, importBytes)), "another journal")
 	const pullDigest = "example.invalid/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, importBytes))
-	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, importBytes))
+	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, legacyImagePinBudget(t, importBytes)))
+	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, legacyImagePinBudget(t, importBytes)))
 	require.ErrorContains(t, journal.Pin(origin, ref,
-		"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", pullDigest, platform, importBytes), "cannot change")
+		"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", pullDigest, platform, legacyImagePinBudget(t, importBytes)), "cannot change")
 	pin, err := journal.Lookup(origin.operation.LeaseUUID(), origin.operation.Intent().Manifest(), ref)
 	require.NoError(t, err)
 	require.Equal(t, inspectionJournalTestImage, pin.ImageID)
@@ -57,7 +59,7 @@ func TestImagePinJournalUpgradesLegacyImportAllowanceForExactIdentity(t *testing
 	const ref = "example.invalid/app:1"
 	const pullDigest = "example.invalid/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
-	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, 0))
+	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, imagebudget.Budget{}))
 	legacy, err := journal.Lookup(origin.operation.LeaseUUID(), origin.operation.Intent().Manifest(), ref)
 	require.NoError(t, err)
 	require.Zero(t, legacy.ImportBytes)
@@ -70,9 +72,9 @@ func TestImagePinJournalUpgradesLegacyImportAllowanceForExactIdentity(t *testing
 	reopened, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
 	require.NoError(t, err)
 	const verifiedBytes = int64(64 << 20)
-	require.NoError(t, reopened.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, verifiedBytes))
-	require.NoError(t, reopened.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, verifiedBytes/2))
-	require.NoError(t, reopened.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, 0))
+	require.NoError(t, reopened.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, legacyImagePinBudget(t, verifiedBytes)))
+	require.NoError(t, reopened.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, legacyImagePinBudget(t, verifiedBytes/2)))
+	require.NoError(t, reopened.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, imagebudget.Budget{}))
 	pin, err := reopened.Lookup(legacy.LeaseUUID, origin.operation.Intent().Manifest(), ref)
 	require.NoError(t, err)
 	expected := *legacy
@@ -86,16 +88,17 @@ func TestImagePinJournalUpgradesLegacyImportAllowanceForExactIdentity(t *testing
 		{OS: "linux", Architecture: "amd64", OSVersion: "other"},
 		{OS: "linux", Architecture: "amd64", OSFeatures: []string{"other"}},
 	} {
-		require.ErrorContains(t, reopened.Pin(origin, ref, inspectionJournalTestImage, pullDigest, changedPlatform, 2*verifiedBytes), "cannot change immutable content")
+		require.ErrorContains(t, reopened.Pin(origin, ref, inspectionJournalTestImage, pullDigest, changedPlatform, legacyImagePinBudget(t, 2*verifiedBytes)), "cannot change immutable content")
 	}
 	require.ErrorContains(t, reopened.Pin(origin, ref,
-		"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", pullDigest, platform, 2*verifiedBytes), "cannot change immutable content")
-	require.Error(t, reopened.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, -1))
+		"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", pullDigest, platform, legacyImagePinBudget(t, 2*verifiedBytes)), "cannot change immutable content")
+	_, invalidErr := imagebudget.Decode(imagebudget.Stored{ImportBytes: -1})
+	require.Error(t, invalidErr)
 	pin, err = reopened.Lookup(legacy.LeaseUUID, origin.operation.Intent().Manifest(), ref)
 	require.NoError(t, err)
 	require.Equal(t, expected, *pin, "invalid observations must not raise or replace the stored allowance")
 
-	require.NoError(t, reopened.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, 2*verifiedBytes))
+	require.NoError(t, reopened.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, legacyImagePinBudget(t, 2*verifiedBytes)))
 	final, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
 	require.NoError(t, err)
 	pins, err := final.List()
@@ -136,15 +139,15 @@ func TestImagePinJournalAddsMissingRecoveryDigestOnlyWithVerifiedAllowance(t *te
 	const ref = "example.invalid/app:1"
 	const pullDigest = "example.invalid/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
-	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, "", platform, 0))
-	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, 0))
+	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, "", platform, imagebudget.Budget{}))
+	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, imagebudget.Budget{}))
 	pin, err := journal.Lookup(origin.operation.LeaseUUID(), origin.operation.Intent().Manifest(), ref)
 	require.NoError(t, err)
 	require.Empty(t, pin.PullDigest, "an unverified observation cannot add recovery authority")
 
 	const verifiedBytes = int64(64 << 20)
-	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, "", platform, verifiedBytes))
-	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, verifiedBytes/2))
+	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, "", platform, legacyImagePinBudget(t, verifiedBytes)))
+	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, pullDigest, platform, legacyImagePinBudget(t, verifiedBytes/2)))
 	reopened, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
 	require.NoError(t, err)
 	pin, err = reopened.Lookup(origin.operation.LeaseUUID(), origin.operation.Intent().Manifest(), ref)
@@ -153,7 +156,7 @@ func TestImagePinJournalAddsMissingRecoveryDigestOnlyWithVerifiedAllowance(t *te
 	require.Equal(t, verifiedBytes, pin.ImportBytes, "adding a digest cannot shrink the allowance")
 
 	const otherDigest = "other.invalid/app@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-	require.NoError(t, reopened.Pin(origin, ref, inspectionJournalTestImage, otherDigest, platform, 2*verifiedBytes))
+	require.NoError(t, reopened.Pin(origin, ref, inspectionJournalTestImage, otherDigest, platform, legacyImagePinBudget(t, 2*verifiedBytes)))
 	pin, err = reopened.Lookup(origin.operation.LeaseUUID(), origin.operation.Intent().Manifest(), ref)
 	require.NoError(t, err)
 	require.Equal(t, pullDigest, pin.PullDigest, "a later observation cannot replace established recovery authority")
@@ -193,7 +196,7 @@ func TestImagePinCollectorPrunesObsoleteManifestWhileLeaseRemainsLive(t *testing
 	}))
 	journal, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
 	require.NoError(t, err)
-	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, "", platform, 0))
+	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, "", platform, imagebudget.Budget{}))
 	inventory, err := journal.Collect(t.Context())
 	require.NoError(t, err)
 	require.True(t, inventory.CanRemove(old.ImageID))
@@ -217,4 +220,48 @@ func TestImagePinCollectorLegacyManifestCannotAuthorizeImageRemoval(t *testing.T
 	require.NoError(t, err)
 	require.False(t, inventory.CanRemove(inspectionJournalTestImage))
 	require.False(t, (ImagePinInventory{}).CanRemove(inspectionJournalTestImage))
+}
+
+func TestImagePinJournalPersistsDistinctVerificationAndAllocationBounds(t *testing.T) {
+	stores := openOperationHandoffStores(t, "image-pin-budget-dimensions")
+	origin := startedInspectionOrigin(t, stores)
+	journal, err := NewImagePinJournal(stores.callbacks, stores.releases, stores.retentions)
+	require.NoError(t, err)
+	const ref = "example.invalid/app:1"
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	// An old nonzero allocation supplies no decoded verification evidence.
+	// Even a large legacy allowance cannot inflate new decoding authority.
+	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, "", platform, legacyImagePinBudget(t, 32<<20)))
+	legacy, err := journal.Lookup(origin.operation.LeaseUUID(), origin.operation.Intent().Manifest(), ref)
+	require.NoError(t, err)
+	require.Zero(t, legacy.VerificationBytes)
+	// Exact verification enriches its own dimension without changing identity.
+	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, "", platform, verifiedImagePinBudget(t, 4<<20, 1<<20)))
+	require.NoError(t, journal.Pin(origin, ref, inspectionJournalTestImage, "", platform, verifiedImagePinBudget(t, 1<<20, 1<<20)))
+	pin, err := journal.Lookup(origin.operation.LeaseUUID(), origin.operation.Intent().Manifest(), ref)
+	require.NoError(t, err)
+	require.Equal(t, int64(4<<20), pin.VerificationBytes)
+	require.Equal(t, int64(32<<20), pin.ImportBytes)
+	data, err := json.Marshal(pin)
+	require.NoError(t, err)
+	restored, err := decodeImagePin(data)
+	require.NoError(t, err)
+	require.Equal(t, *pin, restored)
+
+}
+
+func legacyImagePinBudget(t *testing.T, bytes int64) imagebudget.Budget {
+	t.Helper()
+	budget, err := imagebudget.Decode(imagebudget.Stored{ImportBytes: bytes})
+	require.NoError(t, err)
+	return budget
+}
+
+func verifiedImagePinBudget(t *testing.T, verificationBytes, allocationBytes int64) imagebudget.Budget {
+	t.Helper()
+	verification, err := imagebudget.NewVerificationBudget(verificationBytes)
+	require.NoError(t, err)
+	budget, err := imagebudget.Verified(verification, allocationBytes)
+	require.NoError(t, err)
+	return budget
 }

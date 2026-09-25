@@ -46,6 +46,14 @@ func TestIntegration_BoundedImageImportPreservesIdentity(t *testing.T) {
 // deliberately uses containerd, so exercise the same verified archive against
 // a second private classic daemon without changing the host's Docker service.
 func TestIntegration_BoundedImageImportClassicOverlay2(t *testing.T) {
+	verifyBoundedImageImport(t, newClassicImageTestDaemon(t))
+}
+
+// newClassicImageTestDaemon owns a disposable daemon and its private data root.
+// Image-allocation and inspection contracts must hold on the production driver
+// as well as the integration host's containerd snapshotter.
+func newClassicImageTestDaemon(t *testing.T) *client.Client {
+	t.Helper()
 	if os.Geteuid() != 0 {
 		t.Skip("a private classic Docker daemon requires root")
 	}
@@ -106,7 +114,7 @@ func TestIntegration_BoundedImageImportClassicOverlay2(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "overlay2", info.Driver)
 	require.False(t, daemonUsesContainerd(info))
-	verifyBoundedImageImport(t, docker)
+	return docker
 }
 
 func verifyBoundedImageImport(t *testing.T, docker *client.Client) {

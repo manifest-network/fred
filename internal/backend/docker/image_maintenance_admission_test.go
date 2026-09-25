@@ -94,7 +94,7 @@ func TestImageCapacityStartedMaintenanceReusesCachedImageWhileTenantStagesAreFul
 			require.NoError(t, err)
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			_ = settlement.ExecuteMaintenance(ctx, execution)
+			_ = settlement.ExecuteMaintenance(testMaintenanceLifetime(t, ctx), execution)
 			require.NoError(t, preparationErr)
 			require.True(t, prepared, "a real Started maintenance subject must admit cached content despite the occupied staging pool")
 			pin, err := m.pins.Lookup(spec.LeaseUUID, target.Manifest, "docker.io/library/nginx:1.27")

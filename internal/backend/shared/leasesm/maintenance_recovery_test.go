@@ -431,9 +431,9 @@ func TestRestartUpdateRejectMissingMaintenanceAuthorityBeforeTransition(t *testi
 		actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{ProvisionStore: store})
 		ack := make(chan error, 1)
 		if update {
-			actor.handleUpdateRequested(updateRequestedMsg{Ctx: t.Context(), Ack: ack})
+			actor.handleUpdateRequested(updateRequestedMsg{Lifetime: testMaintenanceHandoff(t, t.Context()), Ack: ack})
 		} else {
-			actor.handleRestartRequested(restartRequestedMsg{Ctx: t.Context(), Ack: ack})
+			actor.handleRestartRequested(restartRequestedMsg{Lifetime: testMaintenanceHandoff(t, t.Context()), Ack: ack})
 		}
 		assert.ErrorContains(t, <-ack, "valid maintenance intent claim")
 		assert.Equal(t, backend.ProvisionStatusReady, actor.State())

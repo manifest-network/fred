@@ -1031,7 +1031,7 @@ func testRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testin
 		maintenanceSeedAmbiguous, workerStarted, workerRelease,
 	)
 	defer cleanup()
-	command, reply, err := leasesm.NewRestartCommand(t.Context(), h.target)
+	command, reply, err := leasesm.NewRestartCommand(testMaintenanceHandoff(t, t.Context()), h.target)
 	require.NoError(t, err)
 	require.NoError(t, h.b.routeToLeaseBlocking(t.Context(), h.leaseUUID, command))
 	require.NoError(t, <-reply.Result())
@@ -1119,7 +1119,7 @@ func testRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testin
 		maintenanceSeedAmbiguous, nil, nil,
 	)
 	defer nextCleanup()
-	command, reply, err = leasesm.NewRestartCommand(t.Context(), nextAdmission.target)
+	command, reply, err = leasesm.NewRestartCommand(testMaintenanceHandoff(t, t.Context()), nextAdmission.target)
 	require.NoError(t, err)
 	require.NoError(t, h.b.routeToLeaseBlocking(t.Context(), h.leaseUUID, command))
 	require.NoError(t, <-reply.Result())

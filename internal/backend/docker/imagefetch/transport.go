@@ -79,6 +79,12 @@ func (t boundedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, errors.New("image registries and redirects require HTTPS")
 	}
 	exchange := newRegistryExchange(req.Context())
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			exchange.close()
+		}
+	}()
 	response, err := t.base.RoundTrip(req.WithContext(exchange.ctx))
 	if err != nil {
 		exchange.close()
@@ -90,6 +96,7 @@ func (t boundedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		limit = min(limit, maxMetadataBytes)
 	}
 	response.Body = &boundedBody{body: response.Body, reader: budgetReader{reader: response.Body, remaining: limit}, exchange: exchange}
+	handedOff = true
 	return response, nil
 }
 

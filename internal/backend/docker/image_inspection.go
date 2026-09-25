@@ -28,9 +28,9 @@ const imageInspectionRecoveryTimeout = 10 * time.Second
 // receipts. Neither path exposes a raw Create/Remove or a caller-selected ID.
 type imageInspectionCoordinator struct {
 	journal   *shared.ImageInspectionJournal
-	creator   *imageexec.DockerCreator
+	creator   *imageexec.InspectionCreator
 	observer  *daemonLaunchObserver
-	sdk       dockerSDKView
+	sdk       imageInspectionDaemon
 	lifetime  context.Context
 	authorize substratemutation.Authorize
 	complete  substratemutation.Complete
@@ -39,6 +39,15 @@ type imageInspectionCoordinator struct {
 	fence     func(string, error) error
 	mu        sync.Mutex
 	active    map[string]imageInspectionOwnership
+}
+
+// Keep only the method values the helper protocol needs. Retaining a general
+// SDK or an interface backed by it would also retain a route to Start or volume
+// creation, outside the fixed inspection constructor.
+type imageInspectionDaemon struct {
+	CopyFromContainer func(context.Context, string, string) (io.ReadCloser, container.PathStat, error)
+	ContainerInspect  func(context.Context, string) (container.InspectResponse, error)
+	ContainerRemove   func(context.Context, string, container.RemoveOptions) error
 }
 
 // These states are minted only by the receipt owner. A live content helper may
@@ -81,7 +90,12 @@ func newImageInspectionCoordinator(
 		return nil, err
 	}
 	c := &imageInspectionCoordinator{
-		journal: journal, creator: client.creator, observer: client.launchObserver, sdk: client.client,
+		journal: journal, creator: client.creator.ForInspection(), observer: client.launchObserver,
+		sdk: imageInspectionDaemon{
+			CopyFromContainer: client.client.CopyFromContainer,
+			ContainerInspect:  client.client.ContainerInspect,
+			ContainerRemove:   client.client.ContainerRemove,
+		},
 		lifetime: lifetime, authorize: authorize, complete: complete, resolve: resolve, authority: authority, fence: fence,
 		active: make(map[string]imageInspectionOwnership),
 	}
@@ -202,31 +216,6 @@ func (c *imageInspectionCoordinator) admissionWait() (<-chan struct{}, error) {
 	return changed, nil
 }
 
-func inspectionCreateConfig(image imageexec.Image, receipt shared.ImageInspectionReceipt, purpose imageInspectionPurpose) (*container.Config, *container.HostConfig) {
-	config := &container.Config{Labels: inspectionLabels(receipt)}
-	if purpose != imageUnpackInspection {
-		return config, nil
-	}
-	config.WorkingDir = "/"
-	config.User = "0"
-	config.NetworkDisabled = true
-	config.Entrypoint = []string{"/__fred_image_probe_never_started__"}
-	config.Cmd = []string{"--never-start"}
-	config.Healthcheck = &container.HealthConfig{Test: []string{"NONE"}}
-	tmpfs := make(map[string]string, len(image.Volumes()))
-	for _, target := range image.Volumes() {
-		tmpfs[target] = "rw,noexec,nosuid,nodev,size=1m"
-	}
-	return config, &container.HostConfig{
-		ReadonlyRootfs: true,
-		NetworkMode:    "none",
-		Tmpfs:          tmpfs,
-		CapDrop:        []string{"ALL"},
-		SecurityOpt:    []string{"no-new-privileges:true"},
-		RestartPolicy:  container.RestartPolicy{Name: container.RestartPolicyDisabled},
-	}
-}
-
 func (c *imageInspectionCoordinator) openFor(ctx context.Context, image imageexec.Image, origin shared.ImageInspectionOrigin, purpose imageInspectionPurpose) (_ *imageInspectionSession, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -272,8 +261,7 @@ func (c *imageInspectionCoordinator) openFor(ctx context.Context, image imageexe
 					}
 					outcome = c.observer.run(ctx, func(ctx context.Context) error {
 						var createErr error
-						config, host := inspectionCreateConfig(image, receipt, purpose)
-						response, createErr = c.creator.Create(ctx, image, config, host, nil, receipt.Name())
+						response, createErr = c.creator.Create(ctx, image, inspectionLabels(receipt), receipt.Name())
 						return createErr
 					})
 					if purpose == imageUnpackInspection && !outcome.settled {

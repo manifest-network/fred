@@ -22,6 +22,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -71,12 +72,12 @@ func validByteLimit(maxBytes int64) bool { return maxBytes > 0 && maxBytes <= ma
 // retaining this owner's transport, durable debit ledger and shutdown lifetime.
 // The caller supplies an independently verified recovery allowance, rather than
 // changing the admission limit of the existing issuer.
-func (l *Loader) WithBudget(maxBytes int64) (*Loader, error) {
-	if l == nil || l.life == nil || !validByteLimit(maxBytes) {
+func (l *Loader) WithBudget(budget imagebudget.VerificationBudget) (*Loader, error) {
+	if l == nil || l.life == nil || !budget.Valid() {
 		return nil, errors.New("image recovery requires a bounded positive byte limit")
 	}
 	derived := *l
-	derived.maxBytes = maxBytes
+	derived.maxBytes = budget.Bytes()
 	return &derived, nil
 }
 
@@ -174,7 +175,7 @@ type preparedState struct {
 	imported    Imported
 	metadata    imageexec.Metadata
 	reservation *importAdmissionState
-	importBytes int64
+	budget      imagebudget.Budget
 	consumed    bool
 	closed      bool
 	closeDone   chan struct{}
@@ -187,7 +188,15 @@ func (p *Prepared) ImportBytes() int64 {
 	if p == nil || p.state == nil {
 		return 0
 	}
-	return p.state.importBytes
+	return p.state.budget.Allocation().Bytes()
+}
+
+// Budget returns the separate verified content and physical allocation bounds.
+func (p *Prepared) Budget() imagebudget.Budget {
+	if p == nil || p.state == nil {
+		return imagebudget.Budget{}
+	}
+	return p.state.budget
 }
 
 // SourceReference identifies the original repository and selected manifest.
@@ -315,11 +324,11 @@ func (l *Loader) ReserveImport(ctx context.Context, p *Prepared) (*ImportAdmissi
 		return nil, errors.New("image loader is shut down")
 	}
 	state.consumed = true
-	if err := l.changeDebit(state.importBytes); err != nil {
+	if err := l.changeDebit(state.budget.Allocation().Bytes()); err != nil {
 		return nil, fmt.Errorf("reserve outstanding image import allocation: %w", err)
 	}
 	life.active++
-	life.activeBytes += state.importBytes
+	life.activeBytes += state.budget.Allocation().Bytes()
 	admission := &importAdmissionState{issuer: l, prepared: state}
 	state.reservation = admission
 	return &ImportAdmission{state: admission}, nil
@@ -334,11 +343,11 @@ func (a *importAdmissionState) finish(settle bool) error {
 	defer life.mu.Unlock()
 	var err error
 	if settle {
-		err = a.issuer.changeDebit(-a.prepared.importBytes)
+		err = a.issuer.changeDebit(-a.prepared.budget.Allocation().Bytes())
 	}
 	a.finished = true
 	life.active--
-	life.activeBytes -= a.prepared.importBytes
+	life.activeBytes -= a.prepared.budget.Allocation().Bytes()
 	if life.closed && life.active == 0 {
 		close(life.drained)
 	}

@@ -443,10 +443,10 @@ func (b *Backend) executeRestoreWork(
 }
 
 func (b *Backend) executeMaintenanceWork(
-	ctx context.Context,
+	lifetime shared.MaintenanceWorkerLifetime,
 	target shared.MaintenanceReleaseClaim,
 ) leasesm.ReplaceWorkOutcome {
-	return b.executeMaintenancePhysicalOutcome(ctx, target)
+	return b.executeMaintenancePhysicalOutcome(lifetime, target)
 }
 
 // doOperationRecoveryCleanup is selected only by the construction-bound
@@ -863,7 +863,7 @@ func mustRestoreAmbiguous(err error, claim shared.OperationIntentClaim) leasesm.
 }
 
 func (b *Backend) executeMaintenancePhysicalOutcome(
-	ctx context.Context,
+	lifetime shared.MaintenanceWorkerLifetime,
 	target shared.MaintenanceReleaseClaim,
 ) leasesm.ReplaceWorkOutcome {
 	intent := target.Intent()
@@ -871,7 +871,7 @@ func (b *Backend) executeMaintenancePhysicalOutcome(
 	if err != nil {
 		return mustMaintenanceAmbiguous(err, intent)
 	}
-	switch outcome := b.maintenanceSettlement.ExecuteMaintenance(ctx, execution).(type) {
+	switch outcome := b.maintenanceSettlement.ExecuteMaintenance(lifetime, execution).(type) {
 	case shared.MaintenanceExecutionSuccess:
 		active, err := b.maintenanceSettlement.ActivateMaintenance(outcome)
 		if err != nil {

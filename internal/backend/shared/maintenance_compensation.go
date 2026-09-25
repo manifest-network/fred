@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"time"
 
 	bolt "go.etcd.io/bbolt"
 
@@ -123,7 +122,7 @@ type maintenanceCompensationBinding struct {
 	protocol *substratemutation.Protocol[MaintenanceCompensationSubject]
 	prepare  func(context.Context, MaintenancePhysicalSubject) (MaintenanceSourceCapture, error)
 	validate func(MaintenancePhysicalSubject, []byte) error
-	live     func(context.Context, substratemutation.LiveExecution[MaintenanceCompensationSubject]) substratemutation.Result[MaintenanceCompensationSubject, MaintenancePhysicalEvidence]
+	live     func(MaintenanceWorkerLifetime, substratemutation.LiveExecution[MaintenanceCompensationSubject]) substratemutation.Result[MaintenanceCompensationSubject, MaintenancePhysicalEvidence]
 	recover  func(context.Context, substratemutation.RecoveryExecution[MaintenanceCompensationSubject]) substratemutation.Result[MaintenanceCompensationSubject, MaintenancePhysicalEvidence]
 }
 
@@ -132,7 +131,6 @@ type maintenanceCompensationBinding struct {
 // closure at admission or recovery, and no use of cleanup authority to launch.
 func BindMaintenanceCompensationExecutor[T any](
 	s *MaintenanceSettlement,
-	lifetime context.Context,
 	authorize substratemutation.Authorize,
 	complete substratemutation.Complete,
 	capture func(context.Context, MaintenancePhysicalSubject) (MaintenanceSourceCapture, error),
@@ -141,7 +139,7 @@ func BindMaintenanceCompensationExecutor[T any](
 	run func(context.Context, T, MaintenanceCompensationSubject) error,
 	classify func(context.Context, MaintenanceCompensationSubject) (MaintenancePhysicalEvidence, error),
 ) error {
-	if s == nil || lifetime == nil || s.compensation != nil || capture == nil || validate == nil {
+	if s == nil || s.compensation != nil || capture == nil || validate == nil {
 		return errors.New("maintenance compensation requires one complete bound executor")
 	}
 	p := substratemutation.NewProtocol[MaintenanceCompensationSubject]()
@@ -160,8 +158,8 @@ func BindMaintenanceCompensationExecutor[T any](
 				func(ctx context.Context) error { plan, err = capture(ctx, subject); return err })
 			return plan, result.Err()
 		},
-		live: func(ctx context.Context, claim substratemutation.LiveExecution[MaintenanceCompensationSubject]) substratemutation.Result[MaintenanceCompensationSubject, MaintenancePhysicalEvidence] {
-			sourceCtx, cancel := compensationExecutionContext(ctx, lifetime)
+		live: func(lifetime MaintenanceWorkerLifetime, claim substratemutation.LiveExecution[MaintenanceCompensationSubject]) substratemutation.Result[MaintenanceCompensationSubject, MaintenancePhysicalEvidence] {
+			sourceCtx, cancel := lifetime.compensationContext()
 			defer cancel()
 			return guard.Execute(claim, sourceCtx)
 		},
@@ -170,24 +168,6 @@ func BindMaintenanceCompensationExecutor[T any](
 		},
 	}
 	return nil
-}
-
-// The fixed source executor remains inside the original lease worker. Close
-// cancels and drains that worker before replacing its durable head; a drain
-// timeout refuses close rather than granting concurrent cleanup authority.
-// Source recovery gets its own bounded budget after target startup timeout,
-// while explicit cancellation and backend shutdown still revoke execution.
-func compensationExecutionContext(target, lifetime context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(lifetime, 2*time.Minute)
-	if errors.Is(target.Err(), context.Canceled) {
-		cancel()
-	}
-	stop := context.AfterFunc(target, func() {
-		if errors.Is(target.Err(), context.Canceled) {
-			cancel()
-		}
-	})
-	return ctx, func() { stop(); cancel() }
 }
 
 func (s *MaintenanceSettlement) prepareCompensation(ctx context.Context, execution MaintenanceExecutionClaim) error {
@@ -486,7 +466,7 @@ func (s *MaintenanceSettlement) finishCompensation(subject MaintenanceCompensati
 	return MaintenanceExecutionFailure{settlement: s, authority: execution.target, subject: execution.subject, evidence: evidence, cause: cause}
 }
 
-func (s *MaintenanceSettlement) compensateLive(ctx context.Context, execution MaintenanceExecutionClaim, cause error) MaintenanceExecutionOutcome {
+func (s *MaintenanceSettlement) compensateLive(lifetime MaintenanceWorkerLifetime, execution MaintenanceExecutionClaim, cause error) MaintenanceExecutionOutcome {
 	if s.compensation == nil {
 		return MaintenanceExecutionAmbiguous{settlement: s, execution: execution, cause: cause}
 	}
@@ -499,7 +479,7 @@ func (s *MaintenanceSettlement) compensateLive(ctx context.Context, execution Ma
 	if err != nil {
 		return MaintenanceExecutionAmbiguous{settlement: s, execution: execution, cause: errors.Join(cause, err)}
 	}
-	result := s.compensation.live(ctx, claim)
+	result := s.compensation.live(lifetime, claim)
 	if err := substratemutation.ValidateLiveResult(s.compensation.protocol, claim, result); err != nil {
 		return MaintenanceExecutionAmbiguous{settlement: s, execution: execution, cause: errors.Join(cause, err)}
 	}

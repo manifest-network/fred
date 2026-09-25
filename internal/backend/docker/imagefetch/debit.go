@@ -15,7 +15,8 @@ import (
 
 const debitFileName = "image-import-debit-v1"
 const debitRecordSize = 8 + 8 + sha256.Size
-const debitMagic = "FREDIMG1"
+const debitMagic = "FREDIMG2"
+const legacyDebitMagic = "FREDIMG1"
 
 // debitLedger belongs to the staging directory's exclusive owner. It is a
 // shared pointer so copying a Loader cannot duplicate its update mutex. Every
@@ -81,12 +82,16 @@ func readDebit(root *os.Root) (int64, error) {
 		return 0, err
 	}
 	checksum := sha256.Sum256(record[:16])
-	if string(record[:8]) != debitMagic || subtle.ConstantTimeCompare(checksum[:], record[16:]) != 1 {
+	magic := string(record[:8])
+	if (magic != debitMagic && magic != legacyDebitMagic) || subtle.ConstantTimeCompare(checksum[:], record[16:]) != 1 {
 		return 0, errors.New("corrupt image import debit record")
 	}
 	amount := binary.BigEndian.Uint64(record[8:16])
 	if amount > math.MaxInt64 {
 		return 0, errors.New("invalid image import debit amount")
+	}
+	if magic == legacyDebitMagic && amount != 0 {
+		return 0, errors.New("legacy image import allocation lacks complete metadata accounting; external runtime drain and offline debit recovery are required")
 	}
 	return int64(amount), nil
 }

@@ -861,6 +861,11 @@ Malformed or unsupported layer structures and images exceeding the admission
 budgets are rejected before import. First ingestion adds verification work and
 temporary staging space; reuse of an already pinned local image needs no
 registry access once its verified allocation allowance has been recorded.
+Pins record verification and physical import bounds separately. The verification
+bound covers decoded tar bytes, including padding and metadata, independently
+of their physical disk estimate. Import allocation includes classic Docker's
+retained tar-split metadata and repeated layer occurrences. Highly compressed
+metadata-heavy images can therefore require more import headroom than before.
 
 Before dispatch, Fred durably records the import allowance in
 `<callback_db_path>.image-staging/image-import-debit-v1`. An admitted import
@@ -883,6 +888,15 @@ if it prevents admission. For a planned stop, fence new mutations and let
 admitted lifecycle work quiesce, then require
 `fred_docker_backend_image_import_pending_bytes == 0` while the backend is still
 running. A shutdown deadline can otherwise leave an admitted import unresolved.
+The record now uses `FREDIMG2` accounting without changing its filename. An empty
+older `FREDIMG1` record remains readable and upgrades on the next write. A positive
+older record refuses startup without modifying its bytes: the old allowance
+does not cover all retained metadata. Use the same external runtime drain,
+matching backup and offline recovery procedure before clearing that debt.
+Writing `FREDIMG2` debt or pins with `verification_bytes` also makes those records
+incompatible with earlier PR candidates that reject unknown formats or fields.
+Preserve the stopped, matching pre-upgrade backup for any rollback; never remove
+new accounting fields to make an older reader accept the journal.
 
 Image management defaults to a 10 GiB staged-content and expanded-image limit,
 2 GiB free-space floor, and 85%/75% GC high/low thresholds
@@ -955,12 +969,16 @@ runs after the final storage identity check; a first start refused by any earlie
 fatal recovery check does not create the optional pin bucket.
 
 Containerd pins also retain the verified extraction allowance. A legacy pin
-without that allowance needs one exact-digest verification and import, even if
+without a separate verification bound needs one exact-digest verification and import, even if
 the image is local; missing immutable recovery identity refuses admission
 without resolving a mutable tag. Every containerd admission creates and removes
 a stopped, journal-owned probe with its own extraction allowance. This
 forces any deferred extraction before pinning or use. The probe never starts,
-has no network, and overrides image `VOLUME` declarations with tmpfs. Pending
+has no network, and overrides image `VOLUME` declarations with tmpfs. Content
+inspection uses the same fixed helper construction: declared volumes do not
+create anonymous copies, and image working directories are not materialized.
+Archive reads preserve the image's files and ownership for user resolution,
+volume ownership and extraction. Pending
 helper receipts block subsequent containerd ingestion across restarts; an
 unknown Create result also fences the current storage authority. Use the
 [unsettled-effects runbook](OPERATIONS.md#unsettled-docker-effects) for unresolved

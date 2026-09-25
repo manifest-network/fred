@@ -11,6 +11,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imagefetch"
+	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 )
 
 // imageFlights coalesces preparation of one immutable selection. Membership is
@@ -47,7 +48,7 @@ type imageFlightLeader struct{ state *imageFlightState }
 type imageFlightContent struct {
 	id, source string
 	platform   ocispec.Platform
-	bytes      int64
+	budget     imagebudget.Budget
 }
 
 type imageFlightOutcome interface{ imageFlightOutcome() }

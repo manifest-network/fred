@@ -631,15 +631,13 @@ func (operationAmbiguousMsg) isleaseMessage()          {}
 func (operationAmbiguousMsg) onPanic(error)            {}
 func (operationAmbiguousMsg) isWorkerTerminalMessage() {}
 
-// restartRequestedMsg and updateRequestedMsg carry a Cancel func + Work
-// closure + Ack chan, analogous to provisionRequestedMsg. The Work closure
-// returns a ReplaceResult consumed by the actor to pick the right terminal
-// SM event (completed / recovered / failed). Their validating constructors
+// restartRequestedMsg and updateRequestedMsg carry an exact target, a one-shot
+// worker lifetime handoff and an acknowledgment channel. Their constructors
 // derive maintenance identity and callback authority from the exact target.
 type restartRequestedMsg struct {
-	Ctx    context.Context
-	Ack    chan error
-	Target shared.MaintenanceReleaseClaim
+	Lifetime shared.MaintenanceWorkerHandoff
+	Ack      chan error
+	Target   shared.MaintenanceReleaseClaim
 	// The callback pair remains pending until replacement succeeds. New
 	// containers and the completion callback use it immediately, but failed
 	// maintenance leaves the committed runtime pair unchanged.
@@ -651,6 +649,7 @@ type restartRequestedMsg struct {
 func (restartRequestedMsg) isleaseMessage()        {}
 func (restartRequestedMsg) isactorCommandMessage() {}
 func (m restartRequestedMsg) onPanic(err error) {
+	m.Lifetime.Discard()
 	select {
 	case m.Ack <- err:
 	default:
@@ -658,9 +657,9 @@ func (m restartRequestedMsg) onPanic(err error) {
 }
 
 type updateRequestedMsg struct {
-	Ctx    context.Context
-	Ack    chan error
-	Target shared.MaintenanceReleaseClaim
+	Lifetime shared.MaintenanceWorkerHandoff
+	Ack      chan error
+	Target   shared.MaintenanceReleaseClaim
 	// The callback pair remains pending until replacement succeeds. New
 	// containers and the completion callback use it immediately, but failed
 	// maintenance leaves the committed runtime pair unchanged.
@@ -672,6 +671,7 @@ type updateRequestedMsg struct {
 func (updateRequestedMsg) isleaseMessage()        {}
 func (updateRequestedMsg) isactorCommandMessage() {}
 func (m updateRequestedMsg) onPanic(err error) {
+	m.Lifetime.Discard()
 	select {
 	case m.Ack <- err:
 	default:
@@ -680,54 +680,54 @@ func (m updateRequestedMsg) onPanic(err error) {
 
 func newMaintenanceCommand(
 	kind shared.MaintenanceIntentKind,
-	ctx context.Context,
+	lifetime shared.MaintenanceWorkerHandoff,
 	target shared.MaintenanceReleaseClaim,
-) (context.Context, shared.MaintenanceReleaseClaim, shared.MaintenanceIntentClaim, chan error, ActorReply, error) {
-	if ctx == nil {
-		return nil, shared.MaintenanceReleaseClaim{}, shared.MaintenanceIntentClaim{}, nil, ActorReply{}, errors.New("maintenance context is required")
+) (shared.MaintenanceWorkerHandoff, shared.MaintenanceReleaseClaim, shared.MaintenanceIntentClaim, chan error, ActorReply, error) {
+	if !lifetime.Valid() {
+		return shared.MaintenanceWorkerHandoff{}, shared.MaintenanceReleaseClaim{}, shared.MaintenanceIntentClaim{}, nil, ActorReply{}, errors.New("maintenance worker lifetime is required")
 	}
 	if !target.Valid() {
-		return nil, shared.MaintenanceReleaseClaim{}, shared.MaintenanceIntentClaim{}, nil, ActorReply{}, errors.New("maintenance command requires an exact bound target release")
+		return shared.MaintenanceWorkerHandoff{}, shared.MaintenanceReleaseClaim{}, shared.MaintenanceIntentClaim{}, nil, ActorReply{}, errors.New("maintenance command requires an exact bound target release")
 	}
 	maintenance := target.Intent()
 	if !maintenance.Valid() || maintenance.Kind() != kind || maintenance.MaintenanceID() != target.MaintenanceID() {
-		return nil, shared.MaintenanceReleaseClaim{}, shared.MaintenanceIntentClaim{}, nil, ActorReply{}, errors.New("maintenance command target differs from intent")
+		return shared.MaintenanceWorkerHandoff{}, shared.MaintenanceReleaseClaim{}, shared.MaintenanceIntentClaim{}, nil, ActorReply{}, errors.New("maintenance command target differs from intent")
 	}
 	ack, receiver := newActorReply()
-	return ctx, target, maintenance, ack, receiver, nil
+	return lifetime, target, maintenance, ack, receiver, nil
 }
 
 func newRestartCommand(
 	kind shared.MaintenanceIntentKind,
-	ctx context.Context,
+	lifetime shared.MaintenanceWorkerHandoff,
 	target shared.MaintenanceReleaseClaim,
 ) (ActorCommand, ActorReply, error) {
-	ctx, target, maintenance, ack, receiver, err := newMaintenanceCommand(kind, ctx, target)
+	lifetime, target, maintenance, ack, receiver, err := newMaintenanceCommand(kind, lifetime, target)
 	if err != nil {
 		return ActorCommand{}, ActorReply{}, err
 	}
-	return newActorCommand(restartRequestedMsg{Ctx: ctx, Target: target, Ack: ack,
+	return newActorCommand(restartRequestedMsg{Lifetime: lifetime, Target: target, Ack: ack,
 		CallbackURL: maintenance.CallbackURL(), LifecycleCallbackURL: maintenance.LifecycleCallbackURL(), Maintenance: maintenance}), receiver, nil
 }
 
-func NewRestartCommand(ctx context.Context, target shared.MaintenanceReleaseClaim) (ActorCommand, ActorReply, error) {
-	return newRestartCommand(shared.MaintenanceIntentRestart, ctx, target)
+func NewRestartCommand(lifetime shared.MaintenanceWorkerHandoff, target shared.MaintenanceReleaseClaim) (ActorCommand, ActorReply, error) {
+	return newRestartCommand(shared.MaintenanceIntentRestart, lifetime, target)
 }
 
 // NewCustomDomainCommand preserves the restart-shaped actor transition while
 // requiring a target minted from custom-domain maintenance authority. Keeping
 // this constructor distinct prevents either caller from relabeling a generic
 // restart command with the wrong durable intent kind.
-func NewCustomDomainCommand(ctx context.Context, target shared.MaintenanceReleaseClaim) (ActorCommand, ActorReply, error) {
-	return newRestartCommand(shared.MaintenanceIntentCustomDomain, ctx, target)
+func NewCustomDomainCommand(lifetime shared.MaintenanceWorkerHandoff, target shared.MaintenanceReleaseClaim) (ActorCommand, ActorReply, error) {
+	return newRestartCommand(shared.MaintenanceIntentCustomDomain, lifetime, target)
 }
 
-func NewUpdateCommand(ctx context.Context, target shared.MaintenanceReleaseClaim) (ActorCommand, ActorReply, error) {
-	ctx, target, maintenance, ack, receiver, err := newMaintenanceCommand(shared.MaintenanceIntentUpdate, ctx, target)
+func NewUpdateCommand(lifetime shared.MaintenanceWorkerHandoff, target shared.MaintenanceReleaseClaim) (ActorCommand, ActorReply, error) {
+	lifetime, target, maintenance, ack, receiver, err := newMaintenanceCommand(shared.MaintenanceIntentUpdate, lifetime, target)
 	if err != nil {
 		return ActorCommand{}, ActorReply{}, err
 	}
-	return newActorCommand(updateRequestedMsg{Ctx: ctx, Target: target, Ack: ack,
+	return newActorCommand(updateRequestedMsg{Lifetime: lifetime, Target: target, Ack: ack,
 		CallbackURL: maintenance.CallbackURL(), LifecycleCallbackURL: maintenance.LifecycleCallbackURL(), Maintenance: maintenance}), receiver, nil
 }
 
@@ -1604,15 +1604,26 @@ func (a *LeaseActor) handleProvisionErrored(
 
 func (a *LeaseActor) handleRestartRequested(msg restartRequestedMsg) {
 	if a.terminated {
-		msg.Ack <- errActorTerminated
+		msg.onPanic(errActorTerminated)
 		return
 	}
 	if err := a.validateMaintenanceRequest(
 		msg.Maintenance, msg.CallbackURL, msg.LifecycleCallbackURL,
 	); err != nil {
-		msg.Ack <- err
+		msg.onPanic(err)
 		return
 	}
+	workerLifetime, err := msg.Lifetime.ClaimWorker()
+	if err != nil {
+		msg.onPanic(err)
+		return
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			workerLifetime.Cancel()
+		}
+	}()
 	// onEnterRestarting publishes Status=Restarting and captures the validated
 	// callback pair as pending inside this Fire before the ack.
 	if err := a.sm.requestRestart(a.cfg.StopCtx, replaceEntryArgs{
@@ -1621,7 +1632,7 @@ func (a *LeaseActor) handleRestartRequested(msg restartRequestedMsg) {
 	}); err != nil {
 		// A concurrent same-lease restart that lost the race finds the SM
 		// already busy → classifyReplaceReject returns ErrInvalidState (409).
-		msg.Ack <- a.classifyReplaceReject(err)
+		msg.onPanic(a.classifyReplaceReject(err))
 		return
 	}
 	// Set workCancel only AFTER a successful fire (ENG-230 §4): a rejected
@@ -1629,9 +1640,9 @@ func (a *LeaseActor) handleRestartRequested(msg restartRequestedMsg) {
 	// func, which onExitProvisioning uses on Deprovision-preempt. workCancel
 	// is consumed only by onExitProvisioning, which can run only after the
 	// state was entered (i.e. after a successful fire).
-	workerCtx, cancel := context.WithCancel(msg.Ctx)
-	a.workCancel = cancel
-	a.spawnMaintenanceWorker(workerCtx, msg.Target)
+	a.workCancel = workerLifetime.Cancel
+	a.spawnMaintenanceWorker(workerLifetime, msg.Target)
+	transferred = true
 	msg.Ack <- nil
 }
 
@@ -1677,15 +1688,26 @@ func (a *LeaseActor) handleRestoreRequested(msg restoreRequestedMsg) {
 
 func (a *LeaseActor) handleUpdateRequested(msg updateRequestedMsg) {
 	if a.terminated {
-		msg.Ack <- errActorTerminated
+		msg.onPanic(errActorTerminated)
 		return
 	}
 	if err := a.validateMaintenanceRequest(
 		msg.Maintenance, msg.CallbackURL, msg.LifecycleCallbackURL,
 	); err != nil {
-		msg.Ack <- err
+		msg.onPanic(err)
 		return
 	}
+	workerLifetime, err := msg.Lifetime.ClaimWorker()
+	if err != nil {
+		msg.onPanic(err)
+		return
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			workerLifetime.Cancel()
+		}
+	}()
 	// onEnterUpdating publishes Status=Updating and captures the validated
 	// callback pair as pending inside this Fire before the ack.
 	if err := a.sm.requestUpdate(a.cfg.StopCtx, replaceEntryArgs{
@@ -1694,14 +1716,14 @@ func (a *LeaseActor) handleUpdateRequested(msg updateRequestedMsg) {
 	}); err != nil {
 		// A concurrent same-lease update that lost the race finds the SM
 		// already busy → classifyReplaceReject returns ErrInvalidState (409).
-		msg.Ack <- a.classifyReplaceReject(err)
+		msg.onPanic(a.classifyReplaceReject(err))
 		return
 	}
 	// Set workCancel only AFTER a successful fire (ENG-230 §4); see
 	// handleRestartRequested for the rationale.
-	workerCtx, cancel := context.WithCancel(msg.Ctx)
-	a.workCancel = cancel
-	a.spawnMaintenanceWorker(workerCtx, msg.Target)
+	a.workCancel = workerLifetime.Cancel
+	a.spawnMaintenanceWorker(workerLifetime, msg.Target)
+	transferred = true
 	msg.Ack <- nil
 }
 
@@ -1727,21 +1749,22 @@ func (a *LeaseActor) validateMaintenanceRequest(
 // Pre-publishes new ContainerIDs / ServiceContainers on success so a
 // preempting Deprovision reading prov observes the new set under lock.
 func (a *LeaseActor) spawnMaintenanceWorker(
-	ctx context.Context,
+	lifetime shared.MaintenanceWorkerLifetime,
 	target shared.MaintenanceReleaseClaim,
 ) {
-	a.spawnReplaceWorker(ctx, target, shared.OperationIntentClaim{})
+	a.spawnReplaceWorker(lifetime.TargetContext(), lifetime, target, shared.OperationIntentClaim{})
 }
 
 func (a *LeaseActor) spawnRestoreWorker(
 	ctx context.Context,
 	operation shared.OperationIntentClaim,
 ) {
-	a.spawnReplaceWorker(ctx, shared.MaintenanceReleaseClaim{}, operation)
+	a.spawnReplaceWorker(ctx, shared.MaintenanceWorkerLifetime{}, shared.MaintenanceReleaseClaim{}, operation)
 }
 
 func (a *LeaseActor) spawnReplaceWorker(
 	ctx context.Context,
+	lifetime shared.MaintenanceWorkerLifetime,
 	target shared.MaintenanceReleaseClaim,
 	operation shared.OperationIntentClaim,
 ) {
@@ -1760,6 +1783,9 @@ func (a *LeaseActor) spawnReplaceWorker(
 		var terminalMsg workerTerminalMessage
 		var event string
 		defer a.endWorkerActivity()
+		if lifetime.Valid() {
+			defer lifetime.Cancel()
+		}
 		defer func() {
 			if terminalMsg == nil {
 				kind := string(shared.OperationIntentRestore)
@@ -1808,7 +1834,7 @@ func (a *LeaseActor) spawnReplaceWorker(
 		}()
 		var outcome ReplaceWorkOutcome
 		if hasMaintenanceAuthority {
-			outcome = a.cfg.MaintenanceWorkFn(ctx, target)
+			outcome = a.cfg.MaintenanceWorkFn(lifetime, target)
 		} else {
 			outcome = a.cfg.RestoreWorkFn(ctx, operation)
 		}

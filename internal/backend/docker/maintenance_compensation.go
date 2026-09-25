@@ -359,7 +359,7 @@ func newCompensationStorageMutations(runner substratemutation.Runner, subject sh
 }
 
 func bindDockerMaintenanceCompensation(b *Backend, ops storageMutationOperations) error {
-	return shared.BindMaintenanceCompensationExecutor(b.maintenanceSettlement, b.stopCtx, b.authorizeStorageMutation, b.completeStorageMutation,
+	return shared.BindMaintenanceCompensationExecutor(b.maintenanceSettlement, b.authorizeStorageMutation, b.completeStorageMutation,
 		func(ctx context.Context, subject shared.MaintenancePhysicalSubject) (shared.MaintenanceSourceCapture, error) {
 			return b.captureMaintenanceSource(ctx, subject, ops.docker.AdmitImage)
 		}, b.validateMaintenanceSourcePlan,

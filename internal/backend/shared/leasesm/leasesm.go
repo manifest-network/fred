@@ -340,7 +340,7 @@ type LeaseActorConfig struct {
 	ProvisionWorkFn   func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome
 	RestoreWorkFn     func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome
 	MaintenanceWorkFn func(
-		context.Context,
+		shared.MaintenanceWorkerLifetime,
 		shared.MaintenanceReleaseClaim,
 	) ReplaceWorkOutcome
 

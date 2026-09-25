@@ -96,6 +96,7 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 	budget.layer++
 	tree := layerTree{budget: budget, seen: make(map[string]bool)}
 	logical := int64(0)
+	payload := int64(0)
 	for {
 		header, err := reader.Next()
 		if err == io.EOF {
@@ -130,9 +131,14 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 		if metadata > maxHeaderBytes {
 			return errors.New("image layer header exceeds metadata budget")
 		}
+		// Tar-split also emits each entry name as JSON. Account for the
+		// maximum six-byte escape per UTF-8 input byte, its gzip overhead,
+		// checksums, scalar fields and block rounding independently of the
+		// namespace and xattrs. Global PAX headers retain this metadata too.
+		budget.allocated += metadataAllocation + roundBlock(7*int64(len(header.Name)), 4096)
 		// Moby and containerd ignore global PAX headers rather than applying
-		// their records to subsequent files. Bound their metadata and stream
-		// bytes, but grant them no namespace or allocation authority.
+		// their records to subsequent files. Bound their retained metadata and
+		// stream bytes, but grant them no namespace authority.
 		if header.Typeflag == tar.TypeXGlobalHeader {
 			continue
 		}
@@ -161,9 +167,11 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 		}
 		logical += copied
 		//nolint:gosec // G110: decoded bytes and logical tar sizes are independently bounded above.
-		if _, err := io.Copy(io.Discard, reader); err != nil {
+		copiedPayload, err := io.Copy(io.Discard, reader)
+		if err != nil {
 			return err
 		}
+		payload += copiedPayload
 	}
 	// A tar terminator is not a compression terminator. Charge trailing decoded
 	// bytes and require the entire compressor checksum and diffID to match.
@@ -174,6 +182,13 @@ func inspectLayer(ctx context.Context, file *os.File, mediaType string, diffID d
 		return errors.New("image layer differs from its uncompressed digest")
 	}
 	consumed := budget.remaining - bounded.remaining
+	// Classic Docker retains every non-file byte in tar-split JSON, including
+	// PAX/long-name headers and arbitrary post-EOF padding. Base64 expands these
+	// bytes by 4/3; twice their raw size covers that expansion and gzip framing
+	// or incompressible output. Per-entry JSON names/checksums/escaping and fixed
+	// compressor headers are covered by entry and per-layer metadata allowances.
+	// Charge each layer occurrence, even when its compressed blob is shared.
+	budget.allocated += 2 * (consumed - payload)
 	budget.remaining -= max(consumed, logical)
 	return nil
 }

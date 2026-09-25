@@ -137,7 +137,7 @@ func TestDockerRecoveryRepairSettlesOnlyDispatchPhase(t *testing.T) {
 			bindCompensationTest(t, f.settlement, state)
 			execution, err := f.settlement.StartMaintenanceExecution(target)
 			require.NoError(t, err)
-			require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(t.Context(), execution))
+			require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution))
 			intent := execution.subject.Intent()
 			path, storage := f.settlement.callbacks.binding.dbPath, f.stores.storage
 			require.NoError(t, f.settlement.callbacks.Close())
@@ -172,7 +172,7 @@ func TestDockerRecoveryRepairPreservesObservedSourceReady(t *testing.T) {
 	bindCompensationTest(t, f.settlement, state)
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(t.Context(), execution))
+	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution))
 	intent := execution.subject.Intent()
 	state.sourceReady = true // The full cohort becomes observable after the lost reply.
 	coordinator := newTestRecoveryCoordinator(t, nil, f.settlement, nil)

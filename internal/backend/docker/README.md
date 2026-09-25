@@ -271,6 +271,14 @@ survivors refuse replacement. Unknown Docker effects retain pending work;
 an activated target release is never rolled back. Recreating the old application
 does not reverse database migrations or other writes it made to retained data.
 
+Maintenance admission transfers a one-shot `MaintenanceWorkerHandoff` to the
+actor. Its claimed `MaintenanceWorkerLifetime` owns explicit close/shutdown
+cancellation independently of the target deadline. Target timeout can therefore
+leave the source's separate two-minute compensation budget available, while a
+later lease close still cancels that work. Copies cannot issue another worker or
+revive a canceled lifetime, and an HTTP waiter cannot revoke a claimed worker.
+Already admitted Docker effects retain their completion and drain obligations.
+
 Image inspection helpers have their own durable ownership records in
 `callbacks.db`. Their exact random name, image identity, and attempt precede
 Create; cleanup uses the backend lifetime even when the inspection caller was
@@ -845,6 +853,12 @@ classic `overlay2` uses the default `DockerRootDir/tmp` import staging, while
 containerd `overlayfs` additionally requires its actual `image_data_path`.
 External `DOCKER_TMPDIR` overrides are outside the supported space model.
 
+`shared/imagebudget` separates decoded/staged verification from physical daemon
+allocation. Preparation and pin publication carry one opaque envelope containing
+both dimensions; a saved import estimate cannot stand in for a decoding bound.
+The physical allowance includes classic Docker's retained tar-split metadata,
+including padding, escaped entry names and repeated layer occurrences.
+
 Concurrent preparations of one immutable source reference and selected platform
 share one download/import flight. A private leader owns staging and completion;
 followers receive only verified image evidence and obtain their own execution
@@ -897,6 +911,11 @@ they do not reserve physical capacity against other writers. The
 requires external Docker/runtime drain and matching backups before an explicit
 debit clear.
 
+The debit file now uses `FREDIMG2` accounting under the existing filename. An
+empty `FREDIMG1` record is compatible; a positive older record is preserved and
+refuses startup because its metadata allowance is incomplete. It requires the
+same external drain and offline recovery as unknown import completion.
+
 The `docker-backend` command uses one 75-second deadline for HTTP shutdown
 (at most 30 seconds) and the remaining backend-worker drain. This fits the
 existing 90-second systemd stop allowance. `Backend.StopContext` consumes the
@@ -904,12 +923,18 @@ owner's deadline; direct `Backend.Stop` callers retain the 90-second default.
 If owned work cannot drain in time, stores stay open and the process reports a
 typed drain failure rather than claiming successful shutdown.
 
-Containerd pins persist `ImportBytes` with immutable image identity. A zero
-legacy allowance requires exact-digest re-ingestion. Every containerd admission
+Pins persist separate `ImportBytes` and `VerificationBytes` with immutable image
+identity. Missing verification evidence cannot authorize recovery decoding.
+Every containerd admission
 then creates and removes a journal-owned stopped probe with its own extraction
 allocation, forcing deferred extraction before publishing a pin or execution
 capability. The probe never starts, disables networking, and covers declared
-image `VOLUME` paths with tmpfs. Unknown Create completion fences the current
+image `VOLUME` paths with tmpfs. All content-inspection helpers use the same
+restricted `imageexec.InspectionCreator`: it owns these mount settings, neutral
+user and working directory, and never grants a start capability. Docker archive
+reads still expose the original image files and ownership, while Create cannot
+populate anonymous volumes or materialize the image's working directory.
+Unknown Create completion fences the current
 storage authority; durable pending helper receipts exclude later containerd
 ingestion across restart until the normal helper protocol or
 [offline repair](../../../OPERATIONS.md#unsettled-docker-effects) settles them.

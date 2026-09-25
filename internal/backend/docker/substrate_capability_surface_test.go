@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 )
 
 func TestBackendRetainsOnlyReadViewsAndExplicitSettlementCapabilities(t *testing.T) {
@@ -41,6 +43,25 @@ func TestBackendRetainsOnlyReadViewsAndExplicitSettlementCapabilities(t *testing
 	assertFieldType("compose", reflect.TypeFor[composeReader]())
 	assertFieldType("volumes", reflect.TypeFor[volumeReader]())
 	assertFieldType("backgroundMaintenance", reflect.TypeFor[*backgroundMaintenanceCoordinator]())
+	inspectionCreator, ok := reflect.TypeFor[imageInspectionCoordinator]().FieldByName("creator")
+	if !ok || inspectionCreator.Type != reflect.TypeFor[*imageexec.InspectionCreator]() {
+		t.Fatal("image inspection retains a caller-configurable container creator")
+	}
+	inspectionSDK, ok := reflect.TypeFor[imageInspectionCoordinator]().FieldByName("sdk")
+	if !ok || inspectionSDK.Type != reflect.TypeFor[imageInspectionDaemon]() {
+		t.Fatal("image inspection retains general Docker mutation authority")
+	}
+	for index := range inspectionSDK.Type.NumField() {
+		field := inspectionSDK.Type.Field(index)
+		switch field.Name {
+		case "CopyFromContainer", "ContainerInspect", "ContainerRemove":
+			if field.Type.Kind() != reflect.Func {
+				t.Fatal("image inspection must retain method values without an assertable SDK")
+			}
+		default:
+			t.Fatalf("image inspection retains unexpected Docker authority %s", field.Name)
+		}
+	}
 
 	for index := range backendType.NumField() {
 		field := backendType.Field(index)

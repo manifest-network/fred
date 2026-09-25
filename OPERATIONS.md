@@ -461,7 +461,11 @@ compressed-content digests, image configuration and expanded
 layers, then imports those same verified bytes into Docker. Docker does not
 perform a second registry fetch. The configured `image_max_size_mb` bounds
 new staging and expanded content before import; the peak import allowance is
-also capped at twice that budget. Lowering it does not invalidate a local or
+also capped at twice that budget. Verification bytes and physical import bytes
+are separate saved bounds: compressed staging, decoded tar padding and metadata
+cannot borrow authority from a physical disk estimate. Import accounting includes
+classic Docker's retained tar-split metadata, including repeated layer occurrences.
+Lowering the configured limit does not invalidate a local or
 pinned historical image. Layer entry, path and metadata budgets also apply: at
 most 128 layers and 131,072 aggregate tar/implicit path entries, with a strict
 selected-platform match. Repeated layer descriptors and global PAX headers are
@@ -470,7 +474,7 @@ paths and hardlinks without an earlier regular-file target in the same layer
 are refused; rebuild such images with supported layer contents. Verification
 adds CPU and temporary disk use on first ingestion. Pinned images already
 present locally require no registry access once their verified allowance is
-recorded. A legacy containerd pin without that allowance needs one verification
+recorded. A legacy containerd pin without a separate saved verification bound needs one verification
 and import of its exact repository digest; Fred never falls back to its mutable
 tag.
 
@@ -513,7 +517,11 @@ the owned requests drain. Clean upload and terminal completion release its amoun
 even when
 Docker reports a completed failure; the deployment still fails. Transport,
 timeout or malformed-stream failures retain unproven allocation across restart,
-without automatic expiry. A corrupt debit record or foreign staging content
+without automatic expiry. Positive debit records written with the older
+`FREDIMG1` accounting are preserved and refuse startup because their allowance
+omits part of Docker's retained metadata. Follow the offline recovery procedure
+below before clearing such a record. An empty old record upgrades automatically;
+the new `FREDIMG2` record retains the same filename. A corrupt debit record or foreign staging content
 prevents startup; preserve it for investigation instead of deleting it. The
 `fred_docker_backend_image_import_pending_bytes` gauge reports outstanding
 allocation, including unknown completion.
@@ -529,6 +537,9 @@ host consumers within the filesystem's usable capacity with operational headroom
 Containerd admission also creates and removes a stopped, journal-owned probe
 with an owned extraction allowance to force any deferred snapshot extraction. It
 never starts, has no network, and covers image `VOLUME` declarations with tmpfs.
+Content-inspection helpers use the same fixed configuration, so Docker does not
+populate anonymous volumes or create the image's working directory. Archive
+reads still expose the original image content and ownership.
 The pin retains the verified extraction allowance for later admission. Pending
 image-helper receipts block further containerd ingestion after restart; unknown
 Create completion also fences the current storage authority. Recover those
@@ -613,11 +624,14 @@ There is no automatic debit reset. For exceptional offline recovery:
 
 ## Pending maintenance pressure
 
-Signed completion wakes recovery and selects all durably confirmed completions
-before the ordinary rotating batch of 32 retries per backend. Selection uses
+Signed completion wakes recovery. Each backend interleaves durably confirmed
+completions with an ordinary rotating batch of at most 32 retries, and alternates
+which class leads successive passes. Each class has its own progress cursor, so
+slow or persistently failing completion settlement cannot continually consume
+the entire backend budget before an ordinary retry gets an opportunity. Selection uses
 compact committed lease/ID/backend/phase accounting; only the exact commands
 actually processed are decoded. A confirmed
-command therefore does not wait for the batch cursor to reach its lease. Live
+command therefore does not wait for the ordinary batch cursor to reach its lease. Live
 dispatch ownership and the per-backend recovery timeout still apply; the
 periodic tick retries failed persistence without a wake-driven retry loop. New
 pending commands are bounded to 1,024 records and 64 MiB of encoded journal

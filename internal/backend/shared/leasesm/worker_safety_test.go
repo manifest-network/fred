@@ -100,7 +100,7 @@ func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) 
 			var workers, teardown atomic.Int32
 			actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
 				ProvisionStore: store, WorkerDrainTimeout: time.Millisecond,
-				MaintenanceWorkFn: func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+				MaintenanceWorkFn: func(shared.MaintenanceWorkerLifetime, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
 					workers.Add(1)
 					return nil
 				},
@@ -125,9 +125,9 @@ func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) 
 			require.Nil(t, actor.TryClaimQuiescence(), "a drained worker does not let recovery retire the requested close owner")
 			claim := newTestMaintenanceClaim(t, testActorLeaseUUID, kind)
 			target := testMaintenanceTarget(t, claim)
-			command, reply, err = NewRestartCommand(t.Context(), target)
+			command, reply, err = NewRestartCommand(testMaintenanceHandoff(t, t.Context()), target)
 			if kind == shared.MaintenanceIntentUpdate {
-				command, reply, err = NewUpdateCommand(t.Context(), target)
+				command, reply, err = NewUpdateCommand(testMaintenanceHandoff(t, t.Context()), target)
 			}
 			require.NoError(t, err)
 			actor.handle(command.envelope.message)

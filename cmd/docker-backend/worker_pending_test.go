@@ -78,7 +78,7 @@ func actorLifecyclePendingError(t *testing.T) error {
 			RestoreWorkFn: func(context.Context, shared.OperationIntentClaim) leasesm.ReplaceWorkOutcome {
 				panic("unexpected restore")
 			},
-			MaintenanceWorkFn: func(context.Context, shared.MaintenanceReleaseClaim) leasesm.ReplaceWorkOutcome {
+			MaintenanceWorkFn: func(shared.MaintenanceWorkerLifetime, shared.MaintenanceReleaseClaim) leasesm.ReplaceWorkOutcome {
 				panic("unexpected maintenance")
 			},
 			PersistDiagnosticsFn:     func(shared.DiagnosticEntry, []string, map[string]string) {},

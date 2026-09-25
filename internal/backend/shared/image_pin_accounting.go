@@ -281,10 +281,11 @@ func (writer *imagePinTransaction) put(authority imagePinWriteAuthority, pin Ima
 				return errors.New("image pin cannot change immutable content")
 			}
 			fillRecoveryDigest := old.PullDigest == "" && pin.ImportBytes > 0 && pin.PullDigest != ""
-			if pin.ImportBytes <= old.ImportBytes && !fillRecoveryDigest {
+			if pin.ImportBytes <= old.ImportBytes && pin.VerificationBytes <= old.VerificationBytes && !fillRecoveryDigest {
 				return nil
 			}
 			old.ImportBytes = max(old.ImportBytes, pin.ImportBytes)
+			old.VerificationBytes = max(old.VerificationBytes, pin.VerificationBytes)
 			if fillRecoveryDigest {
 				old.PullDigest = pin.PullDigest
 			}

@@ -16,6 +16,8 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 )
 
 func (f *registryFixture) updateImage(t *testing.T, update func(*ocispec.Image, *ocispec.Manifest)) {
@@ -363,7 +365,9 @@ func TestRecoveryBudgetSharesDebitAndShutdownWithoutMutatingAdmissionLimit(t *te
 	f := newRegistry(t, layerTar(t, []byte("content")))
 	original, err := NewLoader(&recordingImporter{}, t.TempDir(), 64<<10, WithRegistryTransport(f.server.Client().Transport))
 	require.NoError(t, err)
-	recovery, err := original.WithBudget(1 << 20)
+	budget, err := imagebudget.NewVerificationBudget(1 << 20)
+	require.NoError(t, err)
+	recovery, err := original.WithBudget(budget)
 	require.NoError(t, err)
 	_, err = original.Prepare(t.Context(), f.ref(), testPlatform)
 	require.ErrorContains(t, err, "import allocation exceeds")
@@ -387,6 +391,6 @@ func TestRecoveryBudgetSharesDebitAndShutdownWithoutMutatingAdmissionLimit(t *te
 	defer another.Close()
 	_, err = recovery.ReserveImport(t.Context(), another)
 	require.ErrorContains(t, err, "shut down")
-	_, err = original.WithBudget(0)
+	_, err = original.WithBudget(imagebudget.VerificationBudget{})
 	require.Error(t, err)
 }

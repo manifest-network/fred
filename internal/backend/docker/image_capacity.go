@@ -24,6 +24,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/docker/imagefetch"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 )
 
 const imageMiB = int64(1 << 20)
@@ -317,7 +318,7 @@ func (m *imageCapacityManager) prepare(ctx context.Context, mutations *storageMu
 		return imageexec.Image{}, err
 	}
 	defer m.unlock()
-	if err := m.pins.Pin(mutations.inspectionOrigin, ref, resolved.image.ID(), resolved.pullDigest, resolved.image.Platform(), resolved.importBytes); err != nil {
+	if err := m.pins.Pin(mutations.inspectionOrigin, ref, resolved.image.ID(), resolved.pullDigest, resolved.image.Platform(), resolved.budget); err != nil {
 		return imageexec.Image{}, err
 	}
 	return resolved.image, nil
@@ -333,7 +334,7 @@ func (m *imageCapacityManager) verifyUnpacked(ctx context.Context, origin shared
 	if err := m.docker.requireImageInspectionsSettled(ctx); err != nil {
 		return err
 	}
-	allocation, err := m.reserveUnpack(ctx, resolved.importBytes)
+	allocation, err := m.reserveUnpack(ctx, resolved.budget.Allocation().Bytes())
 	if err != nil {
 		return err
 	}
@@ -344,9 +345,9 @@ func (m *imageCapacityManager) verifyUnpacked(ctx context.Context, origin shared
 // resolvedImage keeps verified allocation evidence with the exact local image.
 // A legacy zero allowance never authorizes potentially deferred extraction.
 type resolvedImage struct {
-	image       imageexec.Image
-	pullDigest  string
-	importBytes int64
+	image      imageexec.Image
+	pullDigest string
+	budget     imagebudget.Budget
 }
 
 // resolveImage never falls back to a mutable tag when pinned content is absent.
@@ -356,8 +357,12 @@ func (m *imageCapacityManager) resolveImage(ctx context.Context, tenantPreparati
 	var err error
 	switch {
 	case pin != nil:
+		resolved.pullDigest = pin.PullDigest
+		resolved.budget, err = pin.Budget()
+		if err != nil {
+			return resolvedImage{}, err
+		}
 		resolved.image, err = m.runtime.ReAdmit(ctx, pin.ImageID, pin.Platform, ref)
-		resolved.pullDigest, resolved.importBytes = pin.PullDigest, pin.ImportBytes
 		if err != nil && errdefs.IsNotFound(err) && pin.PullDigest != "" {
 			resolved, err = m.ingestRecovery(ctx, tenantPreparation, ref, pin)
 			if err == nil && (resolved.image.ID() != pin.ImageID || !platforms.OnlyStrict(pin.Platform).Match(resolved.image.Platform())) {
@@ -396,11 +401,11 @@ func (m *imageCapacityManager) resolveImage(ctx context.Context, tenantPreparati
 	if err != nil {
 		return resolvedImage{}, err
 	}
-	if daemonUsesContainerd(info) && resolved.importBytes == 0 {
+	if daemonUsesContainerd(info) && !resolved.budget.Verification().Valid() {
 		if resolved.pullDigest == "" {
 			return resolvedImage{}, errors.New("legacy containerd image needs an immutable repository digest for bounded extraction")
 		}
-		recoveryPin := &shared.ImagePin{ImageID: resolved.image.ID(), PullDigest: resolved.pullDigest, Platform: resolved.image.Platform(), ImportBytes: resolved.importBytes}
+		recoveryPin := &shared.ImagePin{ImageID: resolved.image.ID(), PullDigest: resolved.pullDigest, Platform: resolved.image.Platform(), ImportBytes: resolved.budget.Allocation().Bytes(), VerificationBytes: resolved.budget.Verification().Bytes()}
 		verified, err := m.ingestRecovery(ctx, tenantPreparation, ref, recoveryPin)
 		if err != nil {
 			return resolvedImage{}, err
@@ -424,8 +429,12 @@ func (m *imageCapacityManager) ingest(ctx context.Context, tenantPreparation ima
 // budget follows that admission's saved bound, never a subsequently lowered
 // new-image policy. Legacy rows use a finite budget derived from host capacity.
 func (m *imageCapacityManager) ingestRecovery(ctx context.Context, tenantPreparation imageTenantPreparation, original string, pin *shared.ImagePin) (resolvedImage, error) {
-	budget := pin.ImportBytes
-	if budget == 0 {
+	saved, err := pin.Budget()
+	if err != nil {
+		return resolvedImage{}, err
+	}
+	verification := saved.Verification()
+	if !verification.Valid() {
 		paths, err := m.paths(ctx)
 		if err != nil {
 			return resolvedImage{}, err
@@ -434,7 +443,7 @@ func (m *imageCapacityManager) ingestRecovery(ctx context.Context, tenantPrepara
 		if err != nil {
 			return resolvedImage{}, err
 		}
-		budget = math.MaxInt64 / 8
+		budget := int64(math.MaxInt64 / 8)
 		floor := m.cfg.ImageDiskMinFreeMB * imageMiB
 		for _, path := range paths {
 			space, err := m.fs.capacity(path)
@@ -447,12 +456,16 @@ func (m *imageCapacityManager) ingestRecovery(ctx context.Context, tenantPrepara
 			// One staging allowance plus a two-allowance peak import ceiling.
 			budget = min(budget, int64(min(uint64(math.MaxInt64), space.available-uint64(floor)-uint64(pending)))/3)
 		}
+		verification, err = imagebudget.NewVerificationBudget(budget)
+		if err != nil {
+			return resolvedImage{}, err
+		}
 	}
-	loader, err := m.loader.WithBudget(budget)
+	loader, err := m.loader.WithBudget(verification)
 	if err != nil {
 		return resolvedImage{}, err
 	}
-	return m.ingestBounded(ctx, tenantPreparation, original, pin.PullDigest, loader, budget)
+	return m.ingestBounded(ctx, tenantPreparation, original, pin.PullDigest, loader, verification.Bytes())
 }
 
 func (m *imageCapacityManager) ingestBounded(ctx context.Context, tenantPreparation imageTenantPreparation, original, source string, loader *imagefetch.Loader, budget int64) (resolvedImage, error) {
@@ -491,7 +504,7 @@ func (m *imageCapacityManager) ingestBounded(ctx context.Context, tenantPreparat
 		if cached, ok, err := m.reuseResolvedImage(ctx, original, resolution, info); err != nil || ok {
 			if verified, ok := outcome.(imageFlightVerified); err == nil && ok && cached.image.ID() == verified.content.id &&
 				cached.pullDigest == verified.content.source && platforms.OnlyStrict(verified.content.platform).Match(cached.image.Platform()) {
-				cached.importBytes = max(cached.importBytes, verified.content.bytes)
+				cached.budget = cached.budget.Merge(verified.content.budget)
 			}
 			return cached, err
 		}
@@ -505,7 +518,7 @@ func (m *imageCapacityManager) ingestBounded(ctx context.Context, tenantPreparat
 		case imageFlightVerified:
 			content := outcome.content
 			admitted, err := m.runtime.ReAdmit(ctx, content.id, content.platform, original)
-			return resolvedImage{image: admitted, pullDigest: content.source, importBytes: content.bytes}, err
+			return resolvedImage{image: admitted, pullDigest: content.source, budget: content.budget}, err
 		}
 	}
 }
@@ -548,7 +561,7 @@ func (m *imageCapacityManager) stageImageFlight(ctx context.Context, tenantPrepa
 		if err != nil {
 			return imageFlightBeforeDispatchFailure(ctx, err)
 		}
-		return imageFlightVerified{content: imageFlightContent{id: cached.image.ID(), source: cached.pullDigest, platform: cached.image.Platform(), bytes: cached.importBytes}}
+		return imageFlightVerified{content: imageFlightContent{id: cached.image.ID(), source: cached.pullDigest, platform: cached.image.Platform(), budget: cached.budget}}
 	}
 	prepared, err := loader.PrepareResolved(ctx, resolution)
 	if err != nil {
@@ -580,7 +593,7 @@ func (m *imageCapacityManager) importImageFlight(ctx context.Context, loader *im
 	if daemonUsesContainerd(info) {
 		id = loaded.ManifestID()
 	}
-	return imageFlightVerified{content: imageFlightContent{id: id, source: loaded.SourceReference(), platform: loaded.Platform(), bytes: prepared.ImportBytes()}}
+	return imageFlightVerified{content: imageFlightContent{id: id, source: loaded.SourceReference(), platform: loaded.Platform(), budget: prepared.Budget()}}
 }
 
 // cachedImage reuses only exact immutable content vouched for by an existing
@@ -592,7 +605,7 @@ func (m *imageCapacityManager) cachedImage(ctx context.Context, original string,
 		return resolvedImage{}, false, err
 	}
 	for _, pin := range pins {
-		if pin.ImportBytes == 0 || pin.PullDigest != resolution.SourceReference() || !platforms.OnlyStrict(resolution.Platform()).Match(pin.Platform) {
+		if pin.VerificationBytes == 0 || pin.PullDigest != resolution.SourceReference() || !platforms.OnlyStrict(resolution.Platform()).Match(pin.Platform) {
 			continue
 		}
 		admitted, err := m.runtime.ReAdmit(ctx, pin.ImageID, pin.Platform, original)
@@ -602,7 +615,11 @@ func (m *imageCapacityManager) cachedImage(ctx context.Context, original string,
 		if err != nil {
 			return resolvedImage{}, false, err
 		}
-		return resolvedImage{image: admitted, pullDigest: pin.PullDigest, importBytes: pin.ImportBytes}, true, nil
+		budget, err := pin.Budget()
+		if err != nil {
+			return resolvedImage{}, false, err
+		}
+		return resolvedImage{image: admitted, pullDigest: pin.PullDigest, budget: budget}, true, nil
 	}
 	return resolvedImage{}, false, nil
 }

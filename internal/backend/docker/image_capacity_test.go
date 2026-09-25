@@ -394,7 +394,7 @@ func TestImageCapacityRecoversMissingPinByDigestWithoutResolvingTag(t *testing.T
 	require.Equal(t, id, resolved.image.ID())
 	require.Equal(t, ref, resolved.image.Reference())
 	require.Equal(t, pullDigest, resolved.pullDigest)
-	require.Positive(t, resolved.importBytes, "the returned identity must carry its verified allocation")
+	require.Positive(t, resolved.budget.Allocation().Bytes(), "the returned identity must carry its verified allocation")
 	require.True(t, present, "admission must follow completion of the exact-content import")
 	requestsMu.Lock()
 	requests := append([]string(nil), requestedManifests...)
@@ -457,15 +457,19 @@ func TestImageCapacityLegacyContainerdPinReingestsToEstablishAllowance(t *testin
 		imports++
 		return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, nil
 	}, imagefetch.WithRegistryTransport(server.Client().Transport))
-	pin := &shared.ImagePin{ImageID: id, PullDigest: pullDigest, Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}}
-	resolved, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, pin, false)
-	require.NoError(t, err)
-	require.Equal(t, 1, imports, "a cached legacy manifest still needs verified preparation and import before deferred unpack")
-	require.Equal(t, id, resolved.image.ID())
-	require.Equal(t, ref, resolved.image.Reference())
-	require.Equal(t, pullDigest, resolved.pullDigest)
-	require.Positive(t, resolved.importBytes)
-	require.Zero(t, pin.ImportBytes, "the returned evidence must await the journal's identity-bound publication")
+	for _, legacyBytes := range []int64{0, 8 * imageMiB} {
+		pin := &shared.ImagePin{ImageID: id, PullDigest: pullDigest, Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}, ImportBytes: legacyBytes}
+		before := imports
+		resolved, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, pin, false)
+		require.NoError(t, err)
+		require.Equal(t, before+1, imports, "a cached legacy manifest still needs verified preparation and import before deferred unpack")
+		require.Equal(t, id, resolved.image.ID())
+		require.Equal(t, ref, resolved.image.Reference())
+		require.Equal(t, pullDigest, resolved.pullDigest)
+		require.Positive(t, resolved.budget.Allocation().Bytes())
+		require.True(t, resolved.budget.Verification().Valid())
+		require.Equal(t, legacyBytes, pin.ImportBytes, "the returned evidence must await the journal's identity-bound publication")
+	}
 }
 
 func TestImageCapacityVerifiedContainerdPinNeedsNoRegistry(t *testing.T) {
@@ -489,14 +493,14 @@ func TestImageCapacityVerifiedContainerdPinNeedsNoRegistry(t *testing.T) {
 	}
 	pin := &shared.ImagePin{
 		ImageID: id, PullDigest: strings.TrimSuffix(ref, ":latest") + "@" + id,
-		Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}, ImportBytes: 3 * imageMiB,
+		Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}, ImportBytes: 3 * imageMiB, VerificationBytes: 3 * imageMiB,
 	}
 	resolved, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, pin, false)
 	require.NoError(t, err)
 	require.Equal(t, id, resolved.image.ID())
 	require.Equal(t, ref, resolved.image.Reference())
 	require.Equal(t, pin.PullDigest, resolved.pullDigest)
-	require.Equal(t, pin.ImportBytes, resolved.importBytes, "cached resolution must preserve its previously verified allowance")
+	require.Equal(t, pin.ImportBytes, resolved.budget.Allocation().Bytes(), "cached resolution must preserve its previously verified allowance")
 }
 
 func TestImageCapacityRechecksImportHeadroomAfterVerifiedStage(t *testing.T) {

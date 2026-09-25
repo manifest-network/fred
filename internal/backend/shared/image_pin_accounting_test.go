@@ -16,6 +16,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 )
 
@@ -102,7 +103,7 @@ func startedPinAccountingOrigin(t *testing.T, stores operationHandoffStores, spe
 func pinAccountingImage(t *testing.T, journal *ImagePinJournal, origin ImageInspectionOrigin, budget int64) error {
 	t.Helper()
 	return journal.Pin(origin, "example.invalid/app:1", inspectionJournalTestImage, "",
-		ocispec.Platform{OS: "linux", Architecture: "amd64"}, budget)
+		ocispec.Platform{OS: "linux", Architecture: "amd64"}, legacyImagePinBudget(t, budget))
 }
 
 func reopenPinAccountingStore(t *testing.T, stores operationHandoffStores) operationHandoffStores {
@@ -342,7 +343,7 @@ func TestImagePinConcurrentAliasesCannotSpendLastTenantSlotTwice(t *testing.T) {
 		go func() {
 			<-start
 			results <- owner.Pin(origin, "example.invalid/app:1", inspectionJournalTestImage, "",
-				ocispec.Platform{OS: "linux", Architecture: "amd64"}, 0)
+				ocispec.Platform{OS: "linux", Architecture: "amd64"}, imagebudget.Budget{})
 		}()
 	}
 	close(start)

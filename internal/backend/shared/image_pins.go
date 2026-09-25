@@ -17,6 +17,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -37,6 +38,15 @@ type ImagePin struct {
 	// ImportBytes records the verified import allowance for this immutable
 	// content. Legacy zero is readable but grants no deferred-unpack budget.
 	ImportBytes int64 `json:"import_bytes,omitempty"`
+	// VerificationBytes bounds compressed staging and decoded verification.
+	// Its absence marks legacy evidence; ImportBytes cannot supply this bound.
+	VerificationBytes int64 `json:"verification_bytes,omitempty"`
+}
+
+// Budget decodes both durable dimensions together. The pin journal verifies the
+// containing immutable identity before returning the record to its owner.
+func (pin ImagePin) Budget() (imagebudget.Budget, error) {
+	return imagebudget.Decode(imagebudget.Stored{VerificationBytes: pin.VerificationBytes, ImportBytes: pin.ImportBytes})
 }
 
 // ImagePinJournal is a bounded cache of immutable execution identities. The
@@ -155,13 +165,13 @@ func imagePinOriginManifest(origin ImageInspectionOrigin) (string, []byte, error
 // can never shrink or authorize replacing the original execution identity.
 // That verification may also fill a missing legacy recovery digest; an existing
 // digest is never replaced.
-func (j *ImagePinJournal) Pin(origin ImageInspectionOrigin, ref, id, pullDigest string, platform ocispec.Platform, importBytes int64) error {
+func (j *ImagePinJournal) Pin(origin ImageInspectionOrigin, ref, id, pullDigest string, platform ocispec.Platform, budget imagebudget.Budget) error {
 	return j.withLockedPins(func(pins *lockedImagePins) error {
-		return pins.pin(origin, ref, id, pullDigest, platform, importBytes)
+		return pins.pin(origin, ref, id, pullDigest, platform, budget)
 	})
 }
 
-func (pins *lockedImagePins) pin(origin ImageInspectionOrigin, ref, id, pullDigest string, platform ocispec.Platform, importBytes int64) error {
+func (pins *lockedImagePins) pin(origin ImageInspectionOrigin, ref, id, pullDigest string, platform ocispec.Platform, budget imagebudget.Budget) error {
 	j := pins.journal
 	prepared, err := j.inspections.Prepare(origin, id, ref)
 	if err != nil {
@@ -186,7 +196,7 @@ func (pins *lockedImagePins) pin(origin ImageInspectionOrigin, ref, id, pullDige
 	if err != nil {
 		return err
 	}
-	pin := ImagePin{LeaseUUID: lease, ManifestHash: hash, Reference: ref, ImageID: id, PullDigest: pullDigest, Platform: platform, ImportBytes: importBytes}
+	pin := ImagePin{LeaseUUID: lease, ManifestHash: hash, Reference: ref, ImageID: id, PullDigest: pullDigest, Platform: platform, ImportBytes: budget.Allocation().Bytes(), VerificationBytes: budget.Verification().Bytes()}
 	unlock := j.lockLease(lease)
 	defer unlock()
 	return pins.updatePins(func(writer *imagePinTransaction) error {
@@ -206,9 +216,12 @@ func decodeImagePin(data []byte) (ImagePin, error) {
 	if err := decodeStrictAuthoritativeObject(data, 16<<10, &pin); err != nil {
 		return pin, err
 	}
+	if _, err := pin.Budget(); err != nil {
+		return pin, err
+	}
 	id, err := digest.Parse(pin.ImageID)
 	if err != nil || id.Algorithm() != digest.SHA256 || !canonicalInspectionUUID(pin.LeaseUUID) || len(pin.ManifestHash) != 64 ||
-		pin.Platform.OS == "" || pin.Platform.Architecture == "" || pin.ImportBytes < 0 {
+		pin.Platform.OS == "" || pin.Platform.Architecture == "" {
 		return pin, errors.New("invalid immutable image pin")
 	}
 	if _, err := hex.DecodeString(pin.ManifestHash); err != nil {

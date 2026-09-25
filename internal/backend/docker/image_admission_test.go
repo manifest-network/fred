@@ -391,12 +391,12 @@ func TestImageCapacityRecoveryKeepsSavedBudgetAfterNewLimitDrops(t *testing.T) {
 		present = true
 		return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, err
 	}, imagefetch.WithRegistryTransport(server.Client().Transport))
-	pin := &shared.ImagePin{ImageID: configID.String(), PullDigest: tag.Context().Digest(manifestID.String()).Name(), ImportBytes: 8 * imageMiB}
+	pin := &shared.ImagePin{ImageID: configID.String(), PullDigest: tag.Context().Digest(manifestID.String()).Name(), ImportBytes: 8 * imageMiB, VerificationBytes: 8 * imageMiB}
 	pin.Platform.OS, pin.Platform.Architecture = "linux", "amd64"
 	resolved, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, pin, true)
 	require.NoError(t, err)
 	require.Equal(t, pin.ImageID, resolved.image.ID())
-	require.Greater(t, resolved.importBytes, imageMiB)
+	require.Greater(t, resolved.budget.Allocation().Bytes(), imageMiB)
 }
 
 func TestImageCapacityReusesVerifiedPinAcrossTenantsAndProtectsItFromCollection(t *testing.T) {

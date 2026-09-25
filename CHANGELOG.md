@@ -834,6 +834,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Image inspection uses a restricted creator that overrides image volumes with
+  tmpfs and owns the working directory, user and stopped-container settings.
+  Content reads retain image files and ownership without creating anonymous
+  volume copies. Image pins keep distinct typed verification and physical import
+  budgets; recovery retains the decoded-content bound, and import accounting
+  includes Docker's retained tar-split metadata. Positive import debt using the
+  older accounting is preserved and requires offline recovery before startup.
+  (ENG-1052)
+
+- Maintenance recovery interleaves confirmed settlement and ordinary retries
+  with independent cursors and alternating first opportunities. A slow or failing
+  completion class can no longer starve another tenant's ordinary recovery.
+  Maintenance workers transfer a single cancellation owner to the lease actor;
+  lease close and shutdown cancel compensation even after the target operation's
+  deadline has expired. (ENG-1052)
+
 - Maintenance recovery selects candidates from a compact committed projection
   before decoding only selected receipts. Periodic pin pruning progresses
   during downloads, while image deletion continues to protect active work.
@@ -852,8 +868,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A close fenced by journal-owned launch debt now returns breaker-neutral
   `503 lifecycle_pending`, including after restart. Historical active-manifest
   replay accepts equivalent item order while preserving exact principal and
-  item contents. Confirmed maintenance completions are prioritized ahead of
-  the ordinary bounded recovery batch. (ENG-1052)
+  item contents. Confirmed maintenance completions participate in recovery
+  independently of the ordinary bounded batch cursor. (ENG-1052)
 - Legacy image pin backfill runs only after fatal startup checks succeed.
   Classic Docker reuses multi-platform local images by their selected config
   identity, including content above a subsequently lowered image size cap.

@@ -36,7 +36,7 @@ func TestDeprovisionEmptyInventoryPreservesUnknownLaunch(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			command, reply, err := leasesm.NewRestartCommand(ctx, h.target)
+			command, reply, err := leasesm.NewRestartCommand(testMaintenanceHandoff(t, ctx), h.target)
 			require.NoError(t, err)
 			require.NoError(t, h.b.routeToLeaseBlocking(ctx, h.leaseUUID, command))
 			require.NoError(t, <-reply.Result())

@@ -338,7 +338,6 @@ func TestImageInspectionRecoveryRetainsResponseLostCreateForLateAppearance(t *te
 	require.NoError(t, err)
 	require.Len(t, receipts, 1)
 	h.daemon.containers[h.daemon.late.ID] = *h.daemon.late
-	h.daemon.volumes++
 	_, err = h.owner.Recover(t.Context())
 	require.NoError(t, err)
 	assert.Empty(t, h.daemon.containers)
@@ -349,6 +348,26 @@ func TestImageInspectionRecoveryRetainsResponseLostCreateForLateAppearance(t *te
 	_, err = h.owner.Recover(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, 1, h.daemon.removes)
+}
+
+func TestContentInspectionCannotMaterializeImageVolumes(t *testing.T) {
+	h := newInspectionHarness(t)
+	h.execute(t, func(ctx context.Context, origin shared.ImageInspectionOrigin) error {
+		first, err := h.client.openImageInspection(ctx, h.image, origin)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, first.close()) }()
+		second, err := h.client.openImageInspection(ctx, h.image, origin)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, second.close()) }()
+		require.Equal(t, 2, h.daemon.creates)
+		require.Zero(t, h.daemon.volumes, "live inspection sessions must never create image-volume copies")
+		for index, config := range h.daemon.createConfigs {
+			require.Equal(t, "/", config.WorkingDir, "image WORKDIR must not cause copy-up")
+			require.Equal(t, "0", config.User)
+			require.Equal(t, container.NetworkMode("none"), h.daemon.createHosts[index].NetworkMode)
+		}
+		return nil
+	})
 }
 
 func TestImageInspectionRemovalFailureRetriesAfterRestart(t *testing.T) {

@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -110,7 +108,7 @@ type MaintenanceApplication struct {
 	heldMu          sync.Mutex
 	held            map[string]*maintenanceHeld
 	recoveryMu      sync.Mutex
-	recoveryCursor  map[string]string
+	recovery        maintenanceRecoveryScheduler
 }
 
 type maintenanceHeld struct {
@@ -137,7 +135,7 @@ func (authority *MaintenanceCoordinator) Application(
 		coordinator: authority, issuer: authority.marker, events: events,
 		recoveryTimeout: recoveryTimeout,
 		held:            make(map[string]*maintenanceHeld),
-		recoveryCursor:  make(map[string]string),
+		recovery:        newMaintenanceRecoveryScheduler(),
 	}
 	if err := application.rehydrate(); err != nil {
 		return nil, err
@@ -149,7 +147,7 @@ func (authority *MaintenanceCoordinator) Application(
 func (application *MaintenanceApplication) Valid() bool {
 	return application != nil && application.coordinator != nil &&
 		application.coordinator.Valid() && application.issuer == application.coordinator.marker &&
-		application.held != nil && application.recoveryCursor != nil &&
+		application.held != nil && application.recovery.valid() &&
 		application.recoveryTimeout > 0
 }
 
@@ -578,52 +576,6 @@ func (application *MaintenanceApplication) releaseSettled(pending map[string]mai
 	return errors.Join(errs...)
 }
 
-type maintenanceRecoveryEntry struct {
-	candidate maintenanceRecoveryCandidate
-	held      *maintenanceHeld
-}
-
-func maintenanceRecoveryBatch(
-	pending []maintenanceRecoveryEntry,
-	after string,
-	limit int,
-) []maintenanceRecoveryEntry {
-	if len(pending) == 0 || limit <= 0 {
-		return nil
-	}
-	ordered := slices.Clone(pending)
-	slices.SortFunc(ordered, func(left, right maintenanceRecoveryEntry) int {
-		return strings.Compare(left.candidate.key(), right.candidate.key())
-	})
-	start := 0
-	if after != "" {
-		start, _ = slices.BinarySearchFunc(ordered, after, func(entry maintenanceRecoveryEntry, target string) int {
-			return strings.Compare(entry.candidate.key(), target)
-		})
-		for start < len(ordered) && ordered[start].candidate.key() <= after {
-			start++
-		}
-		if start == len(ordered) {
-			start = 0
-		}
-	}
-	// Exact completions need local payload finalization, not another backend
-	// attempt. A callback wake must cover those commands even when its lease
-	// falls outside the rotating network-retry batch. Preserve rotation within
-	// both sets so the lane deadline still yields fair progress across passes.
-	confirmed := make([]maintenanceRecoveryEntry, 0)
-	retry := make([]maintenanceRecoveryEntry, 0, min(limit, len(ordered)))
-	for offset := range len(ordered) {
-		entry := ordered[(start+offset)%len(ordered)]
-		if entry.candidate.phase == maintenancePayloadConfirmed {
-			confirmed = append(confirmed, entry)
-		} else if len(retry) < limit {
-			retry = append(retry, entry)
-		}
-	}
-	return append(confirmed, retry...)
-}
-
 // RecoverPending owns recovery selection, exact reauthorization, backend
 // invocation, and settlement. Callers cannot choose a claim or outcome.
 func (application *MaintenanceApplication) RecoverPending(ctx context.Context) error {
@@ -664,30 +616,20 @@ func (application *MaintenanceApplication) RecoverPending(ctx context.Context) e
 		}
 		byBackend[candidate.backend] = append(byBackend[candidate.backend], maintenanceRecoveryEntry{candidate: candidate, held: held})
 	}
-	for backendName := range application.recoveryCursor {
-		if _, pending := byBackend[backendName]; !pending {
-			delete(application.recoveryCursor, backendName)
-		}
-	}
-	type laneResult struct {
-		backendName string
-		lastKey     string
-		errs        []error
-	}
-	results := make(chan laneResult, len(byBackend))
+	application.recovery.retain(byBackend)
+	results := make(chan []error, len(byBackend))
 	var group sync.WaitGroup
 	for backendName, entries := range byBackend {
-		backendName := backendName
-		batch := maintenanceRecoveryBatch(entries, application.recoveryCursor[backendName], maxMaintenanceRecoveryCommandsPerBackendPass)
+		pass := application.recovery.begin(backendName, entries)
 		group.Go(func() {
-			result := laneResult{backendName: backendName}
+			var laneErrors []error
 			laneCtx, cancel := context.WithTimeout(ctx, application.recoveryTimeout)
 			defer cancel()
-			for _, entry := range batch {
-				if laneCtx.Err() != nil {
+			for {
+				entry, selected := pass.next(laneCtx)
+				if !selected {
 					break
 				}
-				result.lastKey = entry.candidate.key()
 				// A live request may own the command after selection. Its dispatch
 				// remains exclusive; a later recovery batch can revisit it.
 				completionChanged := application.coordinator.coordinator.store.completionCheckpoint()
@@ -713,20 +655,17 @@ func (application *MaintenanceApplication) RecoverPending(ctx context.Context) e
 				entry.held.dispatchMu.Unlock()
 				completionChanged()
 				if recoverErr != nil {
-					result.errs = append(result.errs, fmt.Errorf("recover maintenance %s for lease %s: %w", candidate.id, candidate.lease, recoverErr))
+					laneErrors = append(laneErrors, fmt.Errorf("recover maintenance %s for lease %s: %w", candidate.id, candidate.lease, recoverErr))
 				}
 			}
-			results <- result
+			results <- laneErrors
 		})
 	}
 	group.Wait()
 	close(results)
 	var errs []error
-	for result := range results {
-		if result.lastKey != "" {
-			application.recoveryCursor[result.backendName] = result.lastKey
-		}
-		errs = append(errs, result.errs...)
+	for laneErrors := range results {
+		errs = append(errs, laneErrors...)
 	}
 	return errors.Join(errs...)
 }

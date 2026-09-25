@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -63,7 +64,7 @@ func TestImagePinConstructorAndReadsNeverUpgradeOptionalJournalBuckets(t *testin
 		return nil
 	}))
 	origin := startedInspectionOrigin(t, stores)
-	require.NoError(t, journal.Pin(origin, "example.invalid/app:1", imagePinCurrent, "", ocispec.Platform{OS: "linux", Architecture: "amd64"}, 0))
+	require.NoError(t, journal.Pin(origin, "example.invalid/app:1", imagePinCurrent, "", ocispec.Platform{OS: "linux", Architecture: "amd64"}, imagebudget.Budget{}))
 	require.NoError(t, stores.callbacks.view(func(tx *bolt.Tx) error { require.NotNil(t, tx.Bucket(imagePinsBucketName)); return nil }))
 }
 
