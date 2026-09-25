@@ -24,9 +24,9 @@ func (b VerificationBudget) Bytes() int64 { return b.bytes }
 func (b VerificationBudget) Valid() bool  { return b.bytes > 0 && b.bytes <= math.MaxInt64/8 }
 
 // ImportAllocation bounds daemon archive, extraction and retained metadata.
-type ImportAllocation struct{ bytes int64 }
+type ImportAllocation struct{ allocatedBytes int64 }
 
-func (a ImportAllocation) Bytes() int64 { return a.bytes }
+func (a ImportAllocation) Bytes() int64 { return a.allocatedBytes }
 
 // Budget keeps both dimensions together. A legacy allocation without a
 // verification bound cannot authorize recovery decoding.
@@ -45,7 +45,7 @@ func Verified(verification VerificationBudget, allocationBytes int64) (Budget, e
 	if !verification.Valid() || allocationBytes <= 0 || allocationBytes > 2*verification.Bytes() {
 		return Budget{}, errors.New("invalid verified image byte allowances")
 	}
-	return Budget{verification: verification, allocation: ImportAllocation{bytes: allocationBytes}}, nil
+	return Budget{verification: verification, allocation: ImportAllocation{allocatedBytes: allocationBytes}}, nil
 }
 
 // Stored is a durable codec DTO, never a preparation or import capability.
@@ -63,7 +63,7 @@ func Decode(stored Stored) (Budget, error) {
 		(stored.VerificationBytes > 0 && stored.ImportBytes == 0) {
 		return Budget{}, errors.New("invalid saved image byte allowances")
 	}
-	return Budget{verification: VerificationBudget{bytes: stored.VerificationBytes}, allocation: ImportAllocation{bytes: stored.ImportBytes}}, nil
+	return Budget{verification: VerificationBudget{bytes: stored.VerificationBytes}, allocation: ImportAllocation{allocatedBytes: stored.ImportBytes}}, nil
 }
 
 // Merge preserves independently established bounds for the same image. Its
@@ -72,6 +72,6 @@ func Decode(stored Stored) (Budget, error) {
 func (b Budget) Merge(other Budget) Budget {
 	return Budget{
 		verification: VerificationBudget{bytes: max(b.verification.bytes, other.verification.bytes)},
-		allocation:   ImportAllocation{bytes: max(b.allocation.bytes, other.allocation.bytes)},
+		allocation:   ImportAllocation{allocatedBytes: max(b.allocation.allocatedBytes, other.allocation.allocatedBytes)},
 	}
 }

@@ -16,7 +16,7 @@ type MaintenanceWorkerHandoff struct{ state *maintenanceWorkerLifetime }
 // MaintenanceWorkerLifetime is the claimed actor worker's cancellation owner.
 // Both target and compensation budgets derive from its backend shutdown root.
 // Copies share cancellation; no copy can revive a closed worker.
-type MaintenanceWorkerLifetime struct{ state *maintenanceWorkerLifetime }
+type MaintenanceWorkerLifetime struct{ owner *maintenanceWorkerLifetime }
 
 type maintenanceWorkerLifetime struct {
 	cancellation context.Context
@@ -63,26 +63,26 @@ func (h MaintenanceWorkerHandoff) ClaimWorker() (MaintenanceWorkerLifetime, erro
 	if !h.Valid() || !h.state.claimed.CompareAndSwap(false, true) {
 		return MaintenanceWorkerLifetime{}, errors.New("maintenance worker lifetime is invalid or already claimed")
 	}
-	return MaintenanceWorkerLifetime{state: h.state}, nil
+	return MaintenanceWorkerLifetime{owner: h.state}, nil
 }
 
-func (l MaintenanceWorkerLifetime) Valid() bool { return l.state != nil }
+func (l MaintenanceWorkerLifetime) Valid() bool { return l.owner != nil }
 
 func (l MaintenanceWorkerLifetime) TargetContext() context.Context {
 	if !l.Valid() {
 		return nil
 	}
-	return l.state.target
+	return l.owner.target
 }
 
 // Cancel revokes target and compensation work and releases the handoff's
 // shutdown registration. The actor invokes it on close and worker completion.
 func (l MaintenanceWorkerLifetime) Cancel() {
 	if l.Valid() {
-		l.state.cancel()
+		l.owner.cancel()
 	}
 }
 
 func (l MaintenanceWorkerLifetime) compensationContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(l.state.cancellation, 2*time.Minute)
+	return context.WithTimeout(l.owner.cancellation, 2*time.Minute)
 }

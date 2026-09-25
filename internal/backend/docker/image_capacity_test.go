@@ -424,51 +424,56 @@ func TestImageCapacityRecoversMissingPinByDigestWithoutResolvingTag(t *testing.T
 }
 
 func TestImageCapacityLegacyContainerdPinReingestsToEstablishAllowance(t *testing.T) {
-	m, daemon, fs := imageCapacityFixture(t)
-	m.cfg.ImageDataPath = "/containerd"
-	fs["/containerd"] = fs["/images"]
-	daemon.info = func(context.Context) (system.Info, error) {
-		return system.Info{DockerRootDir: "/images", Driver: "overlayfs", DriverStatus: [][2]string{{"driver-type", "io.containerd.snapshotter.v1"}}, OSType: "linux", Architecture: "amd64"}, nil
-	}
-	server := httptest.NewTLSServer(registry.New())
-	t.Cleanup(server.Close)
-	ref := strings.TrimPrefix(server.URL, "https://") + "/app:latest"
-	tag, err := name.NewTag(ref)
-	require.NoError(t, err)
-	fixture := imageCapacityRegistryImage(t, "cached content without an extraction allowance")
-	require.NoError(t, remote.Write(tag, fixture, remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous), remote.WithTransport(server.Client().Transport)))
-	manifestID, err := fixture.Digest()
-	require.NoError(t, err)
-	id := manifestID.String()
-	pullDigest := tag.Context().Digest(id).Name()
-	m.runtime = (&mockDockerClient{InspectImageFn: func(_ context.Context, inspected string) (*ImageInfo, error) {
-		require.Equal(t, id, inspected)
-		return &ImageInfo{ID: id}, nil // already cached; existence alone does not prove bounded extraction
-	}}).imageAdmitter()
-	daemon.imageInspect = func(_ context.Context, inspected string, _ ...client.ImageInspectOption) (image.InspectResponse, error) {
-		require.Equal(t, id, inspected)
-		return image.InspectResponse{ID: id, Size: imageMiB}, nil
-	}
-	imports := 0
-	attachImageCapacityLoader(t, m, func(_ context.Context, input io.Reader) (image.LoadResponse, error) {
-		if _, err := io.Copy(io.Discard, input); err != nil {
-			return image.LoadResponse{}, err
-		}
-		imports++
-		return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, nil
-	}, imagefetch.WithRegistryTransport(server.Client().Transport))
-	for _, legacyBytes := range []int64{0, 8 * imageMiB} {
-		pin := &shared.ImagePin{ImageID: id, PullDigest: pullDigest, Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}, ImportBytes: legacyBytes}
-		before := imports
-		resolved, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, pin, false)
-		require.NoError(t, err)
-		require.Equal(t, before+1, imports, "a cached legacy manifest still needs verified preparation and import before deferred unpack")
-		require.Equal(t, id, resolved.image.ID())
-		require.Equal(t, ref, resolved.image.Reference())
-		require.Equal(t, pullDigest, resolved.pullDigest)
-		require.Positive(t, resolved.budget.Allocation().Bytes())
-		require.True(t, resolved.budget.Verification().Valid())
-		require.Equal(t, legacyBytes, pin.ImportBytes, "the returned evidence must await the journal's identity-bound publication")
+	for _, test := range []struct {
+		name  string
+		bytes int64
+	}{{"zero", 0}, {"positive", 8 * imageMiB}} {
+		t.Run(test.name, func(t *testing.T) {
+			m, daemon, fs := imageCapacityFixture(t)
+			m.cfg.ImageDataPath = "/containerd"
+			fs["/containerd"] = fs["/images"]
+			daemon.info = func(context.Context) (system.Info, error) {
+				return system.Info{DockerRootDir: "/images", Driver: "overlayfs", DriverStatus: [][2]string{{"driver-type", "io.containerd.snapshotter.v1"}}, OSType: "linux", Architecture: "amd64"}, nil
+			}
+			server := httptest.NewTLSServer(registry.New())
+			t.Cleanup(server.Close)
+			ref := strings.TrimPrefix(server.URL, "https://") + "/app:latest"
+			tag, err := name.NewTag(ref)
+			require.NoError(t, err)
+			fixture := imageCapacityRegistryImage(t, "cached content without an extraction allowance")
+			require.NoError(t, remote.Write(tag, fixture, remote.WithContext(t.Context()), remote.WithAuth(authn.Anonymous), remote.WithTransport(server.Client().Transport)))
+			manifestID, err := fixture.Digest()
+			require.NoError(t, err)
+			id := manifestID.String()
+			pullDigest := tag.Context().Digest(id).Name()
+			m.runtime = (&mockDockerClient{InspectImageFn: func(_ context.Context, inspected string) (*ImageInfo, error) {
+				require.Equal(t, id, inspected)
+				return &ImageInfo{ID: id}, nil // already cached; existence alone does not prove bounded extraction
+			}}).imageAdmitter()
+			daemon.imageInspect = func(_ context.Context, inspected string, _ ...client.ImageInspectOption) (image.InspectResponse, error) {
+				require.Equal(t, id, inspected)
+				return image.InspectResponse{ID: id, Size: imageMiB}, nil
+			}
+			imports := 0
+			attachImageCapacityLoader(t, m, func(_ context.Context, input io.Reader) (image.LoadResponse, error) {
+				if _, err := io.Copy(io.Discard, input); err != nil {
+					return image.LoadResponse{}, err
+				}
+				imports++
+				return image.LoadResponse{Body: io.NopCloser(strings.NewReader("{}"))}, nil
+			}, imagefetch.WithRegistryTransport(server.Client().Transport))
+			legacyBytes := test.bytes
+			pin := &shared.ImagePin{ImageID: id, PullDigest: pullDigest, Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}, ImportBytes: legacyBytes}
+			resolved, err := m.resolveImage(t.Context(), imageTenantPreparationForTest(t, m), ref, pin, false)
+			require.NoError(t, err)
+			require.Equal(t, 1, imports, "a cached legacy manifest still needs verified preparation and import before deferred unpack")
+			require.Equal(t, id, resolved.image.ID())
+			require.Equal(t, ref, resolved.image.Reference())
+			require.Equal(t, pullDigest, resolved.pullDigest)
+			require.Positive(t, resolved.budget.Allocation().Bytes())
+			require.True(t, resolved.budget.Verification().Valid())
+			require.Equal(t, legacyBytes, pin.ImportBytes, "the returned evidence must await the journal's identity-bound publication")
+		})
 	}
 }
 

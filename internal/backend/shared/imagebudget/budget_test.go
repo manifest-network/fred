@@ -2,11 +2,19 @@ package imagebudget
 
 import (
 	"math"
+	"reflect"
 	"testing"
 	"testing/quick"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestBudgetDimensionsCannotConvert(t *testing.T) {
+	verification := reflect.TypeFor[VerificationBudget]()
+	allocation := reflect.TypeFor[ImportAllocation]()
+	require.False(t, verification.ConvertibleTo(allocation), "verification cannot manufacture physical allocation")
+	require.False(t, allocation.ConvertibleTo(verification), "physical allocation cannot authorize decoded content")
+}
 
 func TestMergePreservesIndependentDimensions(t *testing.T) {
 	property := func(legacyBytes uint32, verifiedBytes uint32) bool {
