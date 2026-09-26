@@ -848,7 +848,10 @@ does not set an override. Separate accounting for an external override is not
 implemented.
 
 Registry requests now originate from `docker-backend` over HTTPS, using its
-process proxy environment and system certificate roots. Docker daemon mirrors,
+process proxy environment and system certificate roots. Registries, blob CDNs
+and authentication endpoints must support HTTP/1.1; each exchange uses a fresh
+connection. Verify that reachability as the backend service user before the
+stopped upgrade, including redirects and resumed blob reads. Docker daemon mirrors,
 `insecure-registries` and `/etc/docker/certs.d` do not configure these requests.
 Provide registry reachability and trusted CA certificates to the backend process
 before upgrading; plaintext fallback is disabled even for private IPs.

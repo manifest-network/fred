@@ -84,9 +84,12 @@ type runnableLayer struct {
 	diffID     digest.Digest
 }
 
-func admitRunnableManifest(shape manifestShape, config []byte, platform ocispec.Platform) (runnableManifest, error) {
+func admitRunnableManifest(shape manifestShape, config verifiedConfig, platform ocispec.Platform) (runnableManifest, error) {
+	if config.digest != shape.config.Digest || int64(len(config.raw)) != shape.config.Size {
+		return runnableManifest{}, errors.New("verified config does not belong to the selected manifest descriptor")
+	}
 	var cfg ocispec.Image
-	if err := json.Unmarshal(config, &cfg); err != nil {
+	if err := json.Unmarshal(config.raw, &cfg); err != nil {
 		return runnableManifest{}, err
 	}
 	if cfg.RootFS.Type != "layers" || len(cfg.RootFS.DiffIDs) != len(shape.layers) || !platforms.OnlyStrict(platform).Match(cfg.Platform) {
@@ -112,5 +115,5 @@ func admitRunnableManifest(shape manifestShape, config []byte, platform ocispec.
 	if err != nil {
 		return runnableManifest{}, fmt.Errorf("admit image configuration: %w", err)
 	}
-	return runnableManifest{mediaType: shape.mediaType, config: shape.config, layers: layers, configBytes: config, platform: cfg.Platform, admittedMetadata: metadata}, nil
+	return runnableManifest{mediaType: shape.mediaType, config: shape.config, layers: layers, configBytes: config.raw, platform: cfg.Platform, admittedMetadata: metadata}, nil
 }

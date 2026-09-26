@@ -124,14 +124,14 @@ func TestNamespaceEnvelopePreservesPreviouslyAdmittedShapes(t *testing.T) {
 }
 
 func TestNamespaceEnvelopeDerivesEveryDimensionFromVerificationBudget(t *testing.T) {
-	for _, bytes := range []int64{1, 10 << 30, 20 << 30, math.MaxInt64 / 8} {
+	for _, bytes := range []int64{1, 10 << 30, 20 << 30, 32 << 30, 2 << 40, math.MaxInt64 / 8} {
 		t.Run(fmt.Sprint(bytes), func(t *testing.T) {
 			verification, err := imagebudget.NewVerificationBudget(bytes)
 			require.NoError(t, err)
 			issued := newNamespaceMemory(verification)
-			require.EqualValues(t, max(minNamespaceMemory, bytes/namespaceMemoryRatio), issued.remaining)
-			require.EqualValues(t, max(minRetainedPathBytes, bytes/retainedPathRatio), issued.retainedPathLimit())
-			require.EqualValues(t, max(minResolvedPathBytes, bytes/resolvedPathRatio), issued.resolvedPathLimit())
+			require.EqualValues(t, max(minNamespaceMemory, min(bytes, maxNamespaceVerification)/namespaceMemoryRatio), issued.remaining)
+			require.EqualValues(t, max(minRetainedPathBytes, min(bytes, maxNamespaceVerification)/retainedPathRatio), issued.retainedPathLimit())
+			require.EqualValues(t, max(minResolvedPathBytes, min(bytes, maxNamespaceVerification)/resolvedPathRatio), issued.resolvedPathLimit())
 			require.NoError(t, issued.claim(issued.remaining))
 			issued.pathBytes = issued.retainedPathLimit()
 			issued.resolvedBytes = issued.resolvedPathLimit()
@@ -290,4 +290,23 @@ func TestNamespaceMorpheusPathHistogramHasThreefoldHeadroom(t *testing.T) {
 		require.Equal(t, fixture.Measurement.RetainedPathBytes*factor, issued.pathBytes)
 		require.Equal(t, fixture.Measurement.ResolvedPathBytes*factor, issued.resolvedBytes)
 	}
+}
+
+func TestNamespaceLegacyDiskHeadroomCannotBecomeParserMemory(t *testing.T) {
+	legacy, err := imagebudget.NewVerificationBudget(2 << 40)
+	require.NoError(t, err)
+	memory := newNamespaceMemory(legacy)
+	require.EqualValues(t, 1<<30, memory.limit())
+	require.EqualValues(t, 256<<20, memory.retainedPathLimit())
+	require.EqualValues(t, 512<<20, memory.resolvedPathLimit())
+	require.NoError(t, memory.claim(memory.limit()))
+	require.Error(t, memory.claim(namespaceNodeMemory))
+	memory.pathBytes = memory.retainedPathLimit()
+	memory.resolvedBytes = memory.resolvedPathLimit()
+	require.Error(t, memory.claimName("another"))
+	require.Error(t, memory.claimResolution("another"))
+	saved, err := imagebudget.NewVerificationBudget(memory.recoveryBytes())
+	require.NoError(t, err)
+	again := newNamespaceMemory(saved)
+	require.Equal(t, memory.envelope, again.envelope, "saved projection preserves all admitted dimensions without regranting disk-derived memory")
 }

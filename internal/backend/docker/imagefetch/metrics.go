@@ -13,7 +13,18 @@ var imageImportTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Dispatched image imports by completion or loader-owned interruption; interruptions are counted before SDK unwind",
 }, []string{"outcome"})
 
+var imagePreparationRefusals = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "fred", Subsystem: "docker_backend", Name: "image_preparation_refusals_total",
+	Help: "Image preparations refused at the measured import-allocation boundary by bounded reason",
+}, []string{"reason"})
+
+var imageAllocationPressure = promauto.NewCounter(prometheus.CounterOpts{
+	Namespace: "fred", Subsystem: "docker_backend", Name: "image_allocation_pressure_total",
+	Help: "Successful new-image preparations using more than 80 percent of their configured import-allocation ceiling",
+})
+
 func init() {
+	imagePreparationRefusals.WithLabelValues("import_allocation").Add(0)
 	for _, outcome := range []string{"success", "failure", "deadline", "shutdown"} {
 		imageImportTotal.WithLabelValues(outcome).Add(0)
 	}

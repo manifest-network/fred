@@ -11,9 +11,14 @@ const (
 	minNamespaceMemory   = 128 << 20
 	minRetainedPathBytes = 32 << 20
 	minResolvedPathBytes = 64 << 20
-	namespaceMemoryRatio = 32
-	retainedPathRatio    = 128
-	resolvedPathRatio    = 64
+
+	// Verification bytes may come from multi-terabyte legacy disk headroom.
+	// They never grant more than 1 GiB model memory, 256 MiB retained paths
+	// or 512 MiB resolution work to a single active preparation.
+	maxNamespaceVerification = 32 << 30
+	namespaceMemoryRatio     = 32
+	retainedPathRatio        = 128
+	resolvedPathRatio        = 64
 	// Each observed header may retain a seen-map entry. Nodes additionally
 	// own the namespace object, a child-map entry, and (for directories) a
 	// child map with its minimum bucket. These conservative allowances include
@@ -34,41 +39,36 @@ type namespaceCharge uint64
 // The single root and at most maxLayers empty seen-map headers are fixed
 // overhead outside this envelope; all variable map entries are charged here.
 type namespaceMemory struct {
-	verification  imagebudget.VerificationBudget
+	envelope      namespaceEnvelope
 	remaining     namespaceCharge
 	pathBytes     int64
 	resolvedBytes int64
+}
+
+// namespaceEnvelope separates parser resources from disk-sized verification.
+// Every new or recovered preparation receives the same construction ceiling;
+// callers cannot accidentally turn host free disk into unbounded model memory.
+type namespaceEnvelope struct {
+	memory             namespaceCharge
+	retained, resolved int64
 }
 
 func newNamespaceMemory(verification imagebudget.VerificationBudget) namespaceMemory {
 	if !verification.Valid() {
 		return namespaceMemory{}
 	}
-	memory := namespaceMemory{verification: verification}
-	memory.remaining = memory.limit()
-	return memory
+	bytes := min(verification.Bytes(), int64(maxNamespaceVerification))
+	envelope := namespaceEnvelope{
+		memory:   namespaceCharge(max(minNamespaceMemory, bytes/namespaceMemoryRatio)),
+		retained: max(minRetainedPathBytes, bytes/retainedPathRatio),
+		resolved: max(minResolvedPathBytes, bytes/resolvedPathRatio),
+	}
+	return namespaceMemory{envelope: envelope, remaining: envelope.memory}
 }
 
-func (m namespaceMemory) limit() namespaceCharge {
-	if !m.verification.Valid() {
-		return 0
-	}
-	return namespaceCharge(max(minNamespaceMemory, m.verification.Bytes()/namespaceMemoryRatio))
-}
-
-func (m namespaceMemory) retainedPathLimit() int64 {
-	if !m.verification.Valid() {
-		return 0
-	}
-	return max(minRetainedPathBytes, m.verification.Bytes()/retainedPathRatio)
-}
-
-func (m namespaceMemory) resolvedPathLimit() int64 {
-	if !m.verification.Valid() {
-		return 0
-	}
-	return max(minResolvedPathBytes, m.verification.Bytes()/resolvedPathRatio)
-}
+func (m namespaceMemory) limit() namespaceCharge   { return m.envelope.memory }
+func (m namespaceMemory) retainedPathLimit() int64 { return m.envelope.retained }
+func (m namespaceMemory) resolvedPathLimit() int64 { return m.envelope.resolved }
 
 func (m *namespaceMemory) claimName(name string) error {
 	if int64(len(name)) > m.retainedPathLimit()-m.pathBytes {
@@ -90,7 +90,7 @@ func (m *namespaceMemory) claimResolution(component string) error {
 }
 
 // recoveryBytes projects consumed namespace authority back into the existing
-// durable verification dimension. Issued limits are floor(verification/ratio),
+// durable verification dimension. Issued limits are bounded by floor(verification/ratio),
 // so each multiplication is bounded by its valid issuer and cannot overflow.
 // Usage within a fixed floor needs no extra byte authority on recovery.
 func (m namespaceMemory) recoveryBytes() int64 {

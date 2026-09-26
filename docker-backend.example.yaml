@@ -92,6 +92,8 @@ image_gc_low_percent: 75
 # verifies exact content beside the callback journal before Docker writes it.
 # Also sizes the bounded namespace model: at 10240 MiB, 320 MiB for namespace
 # allocations, 80 MiB of retained names and 160 MiB of path-resolution work.
+# Parser construction ceilings are 1 GiB / 256 MiB / 512 MiB, reached at a
+# 32768-MiB image budget; larger byte policies do not increase parser resources.
 # Saved pins retain the verification budget required by their admitted content.
 image_max_size_mb: 10240
 # Classic Docker storage uses the daemon's reported data root automatically.

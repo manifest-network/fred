@@ -148,6 +148,8 @@ when later probes or recovery passes succeed.
 | `fred_backend_circuit_breaker_state{backend="X"} == 2` (open) | Backend X has been unhealthy long enough to trip the breaker | `curl backendX/health`, check backend logs |
 | `fred_backend_healthy{backend="X"} == 0` for >1 min | Backend health probe failing | Same as above. Note this no longer affects the tenant API's availability — the provider reports `degraded` and keeps serving |
 | `fred_docker_backend_volume_launches_pending > 0` beyond the expected launch window | Outstanding Docker launch receipts; a transient nonzero value is normal while launches run | Confirm recent successful backend health sampling, then correlate pending requests with backend logs. The gauge holds its last sample when health fails and does not count image-helper receipts. Follow [Unsettled Docker effects](#unsettled-docker-effects) for persistent unknown requests; never delete a receipt to clear the gauge |
+| `increase(fred_docker_backend_image_preparation_refusals_total{reason="import_allocation"}[15m]) > 0` | A measured image footprint exceeded twice its verification allowance before Docker import; one tenant can encounter this without a fleet-wide failure rate | Open a sizing ticket on any increase and correlate the immutable source, `import_bytes` and `limit_bytes` in the WARN. Review temporary disk, parser limits and the existing image-size setting before raising it; updates fail before replacing workloads |
+| `increase(fred_docker_backend_image_allocation_pressure_total[15m]) > 0` | A successful new-image preparation used over 80% of its configured import ceiling | Plan growth headroom using the measured footprint and source in the WARN. Exact saved-budget recovery is excluded because its content-derived allowance is deliberately close to usage. This is a capacity-planning signal, not a standalone page |
 | `increase(fred_docker_backend_image_import_total{outcome="deadline"}[15m]) > 0` | An import owner reached its dispatch ceiling; Docker may still be unwinding | Correlate with pending import bytes and daemon logs. Before planned stops, fence new mutations, quiesce work and wait for pending bytes to reach zero. Owner cancellation is not completion proof |
 | `fred_docker_backend_image_import_pending_bytes > 0` beyond the normal import window | The gauge includes both live owned imports and allocation whose completion is unknown. A persistent value after the backend becomes idle can be durable import debt; restarting does not clear it | Correlate imports, Docker response failures and shutdown logs. Alert with a site-specific `for` duration longer than a normal import; investigate sustained debt using [Recovering outstanding image import allocation](#recovering-outstanding-image-import-allocation). Never clear the debit while the runtime can still allocate |
 | `increase(fred_docker_backend_image_gc_total{outcome="inhibited"}[15m]) > 0` together with sustained image-filesystem disk pressure | Incomplete pin authority or unresolved inspection evidence prevents safe deletion. This counter is diagnostic, not a standalone paging condition: pre-upgrade retained generations can legitimately lack pins for their remaining retention period | Check legacy pin-backfill warnings, retained rows and inspection receipts. Unpinned retained generations remain conservative until restored or safely reaped; the default grace is 90 days, plus the reaper interval, and unresolved reaping can extend it. Do not page on this expected upgrade condition while disk headroom is healthy. Docker inventory failures increment `outcome="error"`; ordinary live admissions increment `outcome="busy"`. Preserve authoritative evidence; import debt alone does not inhibit collection |
@@ -482,8 +484,11 @@ and import of its exact repository digest; Fred never falls back to its mutable
 tag.
 Tag selection verifies bounded manifest and config metadata, including their
 platform and layer-count agreement, before a classic Docker cache hit can
-persist its recovery reference. This adds a config fetch to uncached tag
-selection, under the aggregate 2-MiB metadata allowance. It does not download cached layers or
+persist its recovery reference. Every unpinned preparation resolves its manifest. Config content is reused
+from a backend-owned, digest-verified LRU (at most 128 entries / 32 MiB); a miss
+requires a config fetch under the aggregate 2-MiB metadata allowance. Each
+manifest still receives platform/layer/metadata admission, including on a cache
+hit. Eviction or restart can require that fetch again. It does not download cached layers or
 prove their future availability: missing local content still requires full
 verification of the exact pinned registry content before import.
 
@@ -505,15 +510,22 @@ Verification derives its namespace allowances from the same typed byte budget
 that owns staging and decoding. Namespace memory is at least 128 MiB or 1/32 of
 that budget, retained names at least 32 MiB or 1/128, and cumulative path-resolution
 work at least 64 MiB or 1/64. At the default 10 GiB these limits are 320, 80 and
-160 MiB. Headers retain full paths; tree nodes charge their retained base component,
+160 MiB. A separate construction ceiling limits each preparation to 1 GiB
+model memory, 256 MiB names and 512 MiB resolution work, including legacy
+recovery derived from host disk headroom. These maxima are reached at a 32-GiB
+verification allowance; larger byte budgets do not raise parser resources.
+Headers retain full paths; tree nodes charge their retained base component,
 and symlinks separately charge their targets. Replacements and deletions never
 refund usage. The namespace owner projects all three consumed dimensions into
 the saved verification budget, so lowering new-image policy cannot remove an
-already admitted image's recovery authority. The fixed floors preserve old pins.
+already admitted image's recovery authority within the construction ceilings.
+The fixed floors preserve old pins within those ceilings. An exceptionally
+large historical image that exceeds them may be refused if its local content
+is missing and must be verified again; free host disk cannot enlarge the parser.
 Four staging slots bound concurrent verification, and each decoder remains
 bounded to 64 MiB. Namespace allowances model retained allocations and work;
 they are not a hard process-RSS limit. Raising `image_max_size_mb` also raises
-these allowances. Compressed/decoded bytes and physical import allocation remain
+these allowances up to their construction ceilings. Compressed/decoded bytes and physical import allocation remain
 independent constraints: namespace headroom does not promise equal image-byte
 growth within the default 20-GiB import ceiling.
 Decoded padding after the tar terminator has a separate retained-metadata
@@ -521,7 +533,10 @@ allowance: compression streams can make Docker retain one JSON segment per
 decoded byte. This charge is distinct from tar headers and file allocation.
 Registry metadata GETs have at most three attempts for transient connection,
 no-progress or availability failures. Each immutable blob owns one three-attempt
-allowance shared across resumes, redirects and authentication renewal; wrapper
+allowance shared across resumes, redirects and authentication renewal. Mixed
+faults can exhaust it: token renewal plus two interrupted bodies receives no
+fourth canonical request. This deliberate work bound is not three retries per
+fault type; a lost response cannot prove how much content was sent. Wrapper
 copies cannot reset it. Every blob attempt starts at its immutable registry URL,
 using a fresh HTTP/1 connection so the native transport cannot silently replay
 requests below that counter. This adds connection/TLS setup per exchange;
@@ -533,8 +548,12 @@ retain the separate metadata limit. Interrupted blobs
 resume at the retained prefix when Range is supported; a rejected range falls
 back to a full GET within the same attempt bound, replaying only that blob's
 prefix. For HTTP 429/503, Retry-After can delay the next attempt by up to 30 seconds,
-subject to the existing caller deadline. Redirects preserve HTTPS and credential
-isolation. The final digest and descriptor size still bind all bytes. Completed
+subject to the existing caller deadline. Each metadata redirect chain, including
+its transient retries, owns at most ten actual HTTP exchanges. Each canonical
+blob attempt has the same ten-exchange redirect bound. Chain copies share the
+allowance. Redirects preserve HTTPS and exact-origin credentials, and private-IP
+checks normalize IPv6 zones, legacy IPv4 spellings and trailing dots. The final
+digest and descriptor size still bind all bytes. Completed
 layers and dispatched Docker imports are never retried through this path.
 Content, metadata and budget refusals remain terminal.
 A sole tenant can use all four slots for distinct images. When capacity becomes

@@ -1906,14 +1906,14 @@ func TestCallbackReplayQueue_TypedWakeTouchesOnlyItsLease(t *testing.T) {
 	inFlightLease := testLeaseUUID("typed-wake-in-flight")
 	otherLease := testLeaseUUID("typed-wake-other")
 	queue := newCallbackReplayQueue()
-	queue.discover([]string{inFlightLease}, false, false)
+	queue.discover([]string{inFlightLease}, callbackReplayStartup)
 	leaseUUID, ready := queue.next()
 	require.True(t, ready)
 	require.Equal(t, inFlightLease, leaseUUID)
 	queue.dispatched(inFlightLease)
 
 	queue.wake(newCallbackReplayCommitWake(otherLease))
-	assert.NotContains(t, queue.dirty, inFlightLease,
+	assert.Equal(t, callbackReplayUnchanged, queue.inFlight[inFlightLease],
 		"an unrelated commit must not restart an in-flight failed delivery")
 	queue.completed(callbackReplayCompletion{
 		leaseUUID: inFlightLease,
@@ -1941,11 +1941,11 @@ func TestCallbackReplayQueue_TypedWakeTouchesOnlyItsLease(t *testing.T) {
 func TestCallbackReplayQueue_SameLeaseCommitRechecksInFlightDrain(t *testing.T) {
 	leaseUUID := testLeaseUUID("typed-wake-same-lease")
 	queue := newCallbackReplayQueue()
-	queue.discover([]string{leaseUUID}, false, false)
+	queue.discover([]string{leaseUUID}, callbackReplayStartup)
 	queue.dispatched(leaseUUID)
 
 	queue.wake(newCallbackReplayCommitWake(leaseUUID))
-	assert.Contains(t, queue.dirty, leaseUUID)
+	assert.Equal(t, callbackReplayCommitted, queue.inFlight[leaseUUID])
 	queue.completed(callbackReplayCompletion{
 		leaseUUID: leaseUUID,
 		outcome:   callbackReplayEmpty,

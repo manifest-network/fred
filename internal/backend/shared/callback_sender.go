@@ -509,13 +509,39 @@ type callbackReplayPosition struct {
 	element *list.Element
 }
 
+// Discovery has one scheduling cause, rather than independently selectable
+// retry and priority flags. An explicit notification gives previously unseen
+// leases fresh service; a periodic retry keeps the outage backlog retained.
+type callbackReplayDiscovery uint8
+
+const (
+	callbackReplayStartup callbackReplayDiscovery = iota
+	callbackReplayPeriodic
+	callbackReplayRequested
+)
+
+// callbackReplayPending belongs to one dispatched lease. Coalescing preserves
+// the strongest observed cause until that dispatch completes. Observation and
+// commit can invalidate an empty read, but cannot retry a failed head. Only an
+// explicit retry request or transfer of drain ownership grants that authority.
+// The declaration order defines that precedence; a later weaker fact cannot
+// consume stronger permission. Dispatch starts a new, unchanged observation.
+type callbackReplayPending uint8
+
+const (
+	callbackReplayUnchanged callbackReplayPending = iota
+	callbackReplayObserved
+	callbackReplayCommitted
+	callbackReplayRetryRequested
+	callbackReplayHandedOff
+)
+
 type callbackReplayQueue struct {
 	ready     [2]*list.List
 	nextClass callbackReplayClass
 	queued    map[string]callbackReplayPosition
-	inFlight  map[string]struct{}
+	inFlight  map[string]callbackReplayPending
 	dormant   map[string]struct{}
-	dirty     map[string]struct{}
 }
 
 func newCallbackReplayQueue() *callbackReplayQueue {
@@ -523,16 +549,14 @@ func newCallbackReplayQueue() *callbackReplayQueue {
 		ready:     [2]*list.List{list.New(), list.New()},
 		nextClass: callbackReplayFresh,
 		queued:    make(map[string]callbackReplayPosition),
-		inFlight:  make(map[string]struct{}),
+		inFlight:  make(map[string]callbackReplayPending),
 		dormant:   make(map[string]struct{}),
-		dirty:     make(map[string]struct{}),
 	}
 }
 
 func (q *callbackReplayQueue) discover(
 	leaseUUIDs []string,
-	retryDormant bool,
-	prioritizeNew bool,
+	cause callbackReplayDiscovery,
 ) {
 	present := make(map[string]struct{}, len(leaseUUIDs))
 	for _, leaseUUID := range leaseUUIDs {
@@ -540,26 +564,25 @@ func (q *callbackReplayQueue) discover(
 			continue
 		}
 		present[leaseUUID] = struct{}{}
-		if _, active := q.inFlight[leaseUUID]; active {
-			// A commit wake can race the drainer's final empty check. Remember the
-			// edge so completion rechecks this lease instead of consuming the wake.
-			if prioritizeNew || retryDormant {
-				q.dirty[leaseUUID] = struct{}{}
-			}
+		pending := callbackReplayObserved
+		if cause == callbackReplayRequested {
+			pending = callbackReplayRetryRequested
+		}
+		if q.observeInFlight(leaseUUID, pending) {
 			continue
 		}
 		if _, waiting := q.queued[leaseUUID]; waiting {
 			continue
 		}
 		if _, deferred := q.dormant[leaseUUID]; deferred {
-			if !retryDormant {
+			if cause == callbackReplayStartup {
 				continue
 			}
 			delete(q.dormant, leaseUUID)
 			q.enqueue(leaseUUID, callbackReplayRetained)
 			continue
 		}
-		if prioritizeNew {
+		if cause == callbackReplayRequested {
 			q.enqueue(leaseUUID, callbackReplayFresh)
 		} else {
 			q.enqueue(leaseUUID, callbackReplayRetained)
@@ -575,15 +598,24 @@ func (q *callbackReplayQueue) discover(
 	}
 }
 
+func (q *callbackReplayQueue) observeInFlight(leaseUUID string, pending callbackReplayPending) bool {
+	previous, active := q.inFlight[leaseUUID]
+	if active && pending > previous {
+		q.inFlight[leaseUUID] = pending
+	}
+	return active
+}
+
 func (q *callbackReplayQueue) wake(wake callbackReplayWake) {
 	if q == nil || !wake.valid() {
 		return
 	}
 	leaseUUID := wake.leaseUUID
-	if _, active := q.inFlight[leaseUUID]; active {
-		// Unlike a fleet-wide scan, this fact proves the active lease itself changed
-		// while its worker was draining. Completion must therefore recheck it.
-		q.dirty[leaseUUID] = struct{}{}
+	pending := callbackReplayCommitted
+	if wake.kind == callbackReplayWakeHandoff {
+		pending = callbackReplayHandedOff
+	}
+	if q.observeInFlight(leaseUUID, pending) {
 		return
 	}
 	if _, waiting := q.queued[leaseUUID]; waiting {
@@ -630,30 +662,36 @@ func (q *callbackReplayQueue) dispatched(leaseUUID string) {
 	}
 	q.ready[position.class].Remove(position.element)
 	delete(q.queued, leaseUUID)
-	q.inFlight[leaseUUID] = struct{}{}
+	q.inFlight[leaseUUID] = callbackReplayUnchanged
 	q.nextClass = position.class.other()
 }
 
 func (q *callbackReplayQueue) completed(completion callbackReplayCompletion) {
 	leaseUUID := completion.leaseUUID
+	pending := q.inFlight[leaseUUID]
 	delete(q.inFlight, leaseUUID)
-	_, dirty := q.dirty[leaseUUID]
-	delete(q.dirty, leaseUUID)
 
 	switch completion.outcome {
 	case callbackReplayMore:
 		delete(q.dormant, leaseUUID)
 		q.enqueue(leaseUUID, callbackReplayRetained)
 	case callbackReplayDeferred:
-		if dirty {
+		switch pending {
+		case callbackReplayHandedOff:
 			delete(q.dormant, leaseUUID)
 			q.enqueue(leaseUUID, callbackReplayFresh)
-		} else {
+		case callbackReplayRetryRequested:
+			delete(q.dormant, leaseUUID)
+			q.enqueue(leaseUUID, callbackReplayRetained)
+		default:
 			q.dormant[leaseUUID] = struct{}{}
 		}
 	case callbackReplayEmpty:
 		delete(q.dormant, leaseUUID)
-		if dirty {
+		switch pending {
+		case callbackReplayObserved:
+			q.enqueue(leaseUUID, callbackReplayRetained)
+		case callbackReplayCommitted, callbackReplayRetryRequested, callbackReplayHandedOff:
 			q.enqueue(leaseUUID, callbackReplayFresh)
 		}
 	}
@@ -661,8 +699,7 @@ func (q *callbackReplayQueue) completed(completion callbackReplayCompletion) {
 
 func (s *CallbackSender) discoverReplayWork(
 	queue *callbackReplayQueue,
-	retryDormant bool,
-	prioritizeNew bool,
+	cause callbackReplayDiscovery,
 ) {
 	if s.store == nil || s.stopCtx.Err() != nil {
 		return
@@ -676,14 +713,16 @@ func (s *CallbackSender) discoverReplayWork(
 		s.logger.Error("callback outbox discovery found durable corruption", "error", err)
 		s.reportStoreError()
 	}
-	queue.discover(leaseUUIDs, retryDormant, prioritizeNew)
+	queue.discover(leaseUUIDs, cause)
 }
 
 // NotifyPendingCallbacks asks the tracked replay loop to drain the durable
 // outbox promptly. The notification is deliberately non-blocking and
 // coalescing: the bbolt rows, not this in-memory signal, are the delivery
 // authority, and the periodic sweep remains the fallback if no loop is running
-// yet or another wake is already pending.
+// yet or another wake is already pending. This explicit request can retry an
+// in-flight failed head once, in the retained lane. Ordinary commits and timer
+// observations cannot carry that permission across a failed attempt.
 func (s *CallbackSender) NotifyPendingCallbacks() {
 	if s.store == nil || s.stopCtx.Err() != nil {
 		return
@@ -771,7 +810,7 @@ func (s *CallbackSender) runReplayLoop(queue *callbackReplayQueue) {
 	if queue == nil {
 		return
 	}
-	s.discoverReplayWork(queue, false, false)
+	s.discoverReplayWork(queue, callbackReplayStartup)
 	jobs := make(chan string)
 	completions := make(chan callbackReplayCompletion, callbackReplayWorkerLimit)
 	var workers sync.WaitGroup
@@ -812,9 +851,9 @@ func (s *CallbackSender) runReplayLoop(queue *callbackReplayQueue) {
 				queue.wake(wake)
 			}
 		case <-s.replayRetry:
-			s.discoverReplayWork(queue, true, true)
+			s.discoverReplayWork(queue, callbackReplayRequested)
 		case <-timer.C:
-			s.discoverReplayWork(queue, true, false)
+			s.discoverReplayWork(queue, callbackReplayPeriodic)
 			timer.Reset(s.replayInterval)
 		case dispatch <- leaseUUID:
 			queue.dispatched(leaseUUID)

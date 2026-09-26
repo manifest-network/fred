@@ -861,6 +861,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Callback retry ownership now distinguishes observation, new commits, explicit
+  retry and handoff. Failed work cannot re-enter the fresh lane merely because
+  a replay tick occurred while it was in flight; retained and fresh work both
+  keep bounded dispatch opportunities.
+- Verified config bytes are shared through a bounded per-backend cache while
+  every manifest retains independent platform/layer validation. Legacy image
+  recovery cannot turn multi-terabyte disk headroom into unbounded namespace
+  memory; parser resources have independent construction ceilings. Exceptionally
+  large historical images exceeding these ceilings may refuse re-verification
+  when their local content is missing.
+- Image allocation admission warns above 80% of the configured import ceiling
+  and exposes bounded counters for new-image pressure and allocation refusals.
+  Exact saved-budget recovery does not emit growth-pressure observations.
+- Registry redirect chains own a ten-exchange allowance shared across metadata
+  retries and copied request handles. Private-IP redirect checks also normalize
+  IPv6 zones, legacy IPv4 forms and trailing dots.
 - Bound image registry attempts at the native HTTP exchange boundary using
   owned, fresh HTTP/1 connections; recover from connections closed before
   headers within the same attempt allowance. Bound complete raw tar header

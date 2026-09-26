@@ -20,8 +20,6 @@ import (
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
-	"github.com/manifest-network/fred/internal/backend/shared/imagebudget"
 )
 
 const (
@@ -99,7 +97,7 @@ func (l *Loader) Resolve(ctx context.Context, ref string, platform ocispec.Platf
 	if err != nil {
 		return Resolution{}, err
 	}
-	config, err := l.fetchMemory(ctx, named, shape.config)
+	config, err := l.resolveConfig(ctx, named, shape.config)
 	if err != nil {
 		return Resolution{}, err
 	}
@@ -107,7 +105,8 @@ func (l *Loader) Resolve(ctx context.Context, ref string, platform ocispec.Platf
 	if err != nil {
 		return Resolution{}, err
 	}
-	metadata += int64(len(config))
+	l.configs.retain(config)
+	metadata += int64(len(config.raw))
 	return Resolution{state: &resolvedManifest{issuer: l, named: named, raw: raw, digest: id, manifest: manifest, platform: clonePlatform(platform), metadata: metadata}}, nil
 }
 
@@ -218,19 +217,12 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 	// exists. Both stores also create per-image/per-layer metadata outside the
 	// layer tar entries (layerdb, snapshot records and graphdriver links).
 	importBytes := archiveBytes + expansion.allocated + 2*metadata + int64(len(manifest.layers)+1)*(128<<10)
-	if importBytes > 2*l.budget.Bytes() {
-		return nil, errors.New("image import allocation exceeds twice the image byte limit")
-	}
 	// Recovery covers every verification dimension, including namespace usage
 	// above the fixed compatibility floors, without copying the entire issuer's
 	// unused allowance into durable pins.
 	verificationBytes := max(stageBytes, l.budget.Bytes()-expansion.remaining, (importBytes+1)/2,
 		expansion.namespace.recoveryBytes())
-	verification, err := imagebudget.NewVerificationBudget(verificationBytes)
-	if err != nil {
-		return nil, err
-	}
-	state.budget, err = imagebudget.Verified(verification, importBytes)
+	state.budget, err = l.admitPreparedBudget(p.SourceReference(), verificationBytes, importBytes)
 	if err != nil {
 		return nil, err
 	}

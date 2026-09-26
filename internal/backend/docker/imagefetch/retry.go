@@ -118,11 +118,16 @@ func (b *registryAttemptBudget) claim() bool {
 }
 
 func (t registryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	chain, err := registryMetadataRedirectChain(req)
+	if err != nil {
+		return nil, err
+	}
+	redirects := registryRedirectTransport{base: t.base, chain: chain}
 	if req.Method != http.MethodGet {
-		return t.base.RoundTrip(req)
+		return redirects.RoundTrip(req)
 	}
 	attempts := &registryAttemptBudget{}
-	transfer := &registryTransfer{transport: attemptedRegistryTransport{base: t.base, attempts: attempts}, request: req, attempts: attempts}
+	transfer := &registryTransfer{transport: attemptedRegistryTransport{base: redirects, attempts: attempts}, request: req, attempts: attempts}
 	for {
 		response, err := transfer.open(0)
 		if err != nil {
@@ -153,42 +158,22 @@ func readRegistryMetadata(body io.ReadCloser) ([]byte, error) {
 type blobRedirectTransport struct{ base boundedTransport }
 
 func (t blobRedirectTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	redirected := false
-	client := http.Client{Transport: t.base, CheckRedirect: func(next *http.Request, via []*http.Request) error {
-		if err := registryBlobRedirect(next, via); err != nil {
-			return err
-		}
-		redirected = true
-		return nil
-	}}
+	chain := newRegistryRedirectChain(request)
+	client := http.Client{
+		Transport: registryRedirectTransport{base: t.base, chain: chain},
+		// The transport owns the complete chain, including its first request.
+		// It refuses a hop before dispatch; http.Client only builds redirects.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return nil },
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
 	}
-	if redirected && response.StatusCode == http.StatusForbidden {
+	if chain.spent.Load() > 1 && response.StatusCode == http.StatusForbidden {
 		_ = response.Body.Close()
 		return nil, errRegistryRedirectExpired
 	}
 	return response, nil
-}
-
-func registryBlobRedirect(request *http.Request, via []*http.Request) error {
-	if len(via) >= 10 {
-		return errors.New("registry blob exceeded redirect limit")
-	}
-	original := via[0].URL
-	if request.URL.Host != original.Host {
-		// net/http permits credentials on subdomain redirects by default;
-		// registry credentials belong to this exact registry authority only.
-		request.Header.Del("Authorization")
-	}
-	if request.URL.Hostname() != original.Hostname() {
-		ip := net.ParseIP(request.URL.Hostname())
-		if ip != nil && (ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsPrivate() || ip.IsUnspecified()) {
-			return errors.New("registry blob redirect to private or link-local IP is forbidden")
-		}
-	}
-	return nil
 }
 
 type registryTransfer struct {

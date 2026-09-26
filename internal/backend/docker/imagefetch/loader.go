@@ -37,7 +37,16 @@ type Loader struct {
 	ledger    *debitLedger
 	transport singleRegistryExchange
 	life      *loaderLifetime
+	configs   *configCache
+	kind      preparationKind
 }
+
+type preparationKind uint8
+
+const (
+	newImagePreparation preparationKind = iota
+	recoveryPreparation
+)
 
 // NewLoader creates a bounded importer in an existing writable directory. Its
 // caller must hold exclusive authority for that directory while this Loader is
@@ -51,7 +60,7 @@ func NewLoader(source Importer, stageRoot string, maxBytes int64, options ...Opt
 		return nil, fmt.Errorf("image staging directory is unavailable: %s", stageRoot)
 	}
 	shutdown, cancel := context.WithCancel(context.Background())
-	loader := &Loader{daemon: source, stageRoot: stageRoot, budget: budget, ledger: &debitLedger{root: stageRoot}, transport: defaultRegistryExchange(), life: &loaderLifetime{shutdown: shutdown, cancel: cancel, drained: make(chan struct{})}}
+	loader := &Loader{daemon: source, stageRoot: stageRoot, budget: budget, ledger: &debitLedger{root: stageRoot}, transport: defaultRegistryExchange(), life: &loaderLifetime{shutdown: shutdown, cancel: cancel, drained: make(chan struct{})}, configs: &configCache{}}
 	for _, option := range options {
 		if option == nil {
 			cancel()
@@ -79,6 +88,7 @@ func (l *Loader) WithBudget(budget imagebudget.VerificationBudget) (*Loader, err
 	}
 	derived := *l
 	derived.budget = budget
+	derived.kind = recoveryPreparation
 	return &derived, nil
 }
 

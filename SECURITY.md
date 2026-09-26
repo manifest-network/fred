@@ -521,8 +521,10 @@ reachability and trust to the backend process itself; see
 Verified content is staged beside `callback_db_path` in its `.image-staging`
 directory before exact-content import. The durable import debit reserves
 unsettled daemon work across restarts. Supported stores are classic `overlay2`
-and containerd's overlayfs image store. Fixed metadata, layer-count, archive
-entry, and path budgets bound preparation in addition to `image_max_size_mb`;
+and containerd's overlayfs image store. Fixed metadata, layer-count and individual
+path/header limits accompany typed namespace memory, retained-name and resolution
+work budgets. Those scale with `image_max_size_mb` up to independent 1-GiB /
+256-MiB / 512-MiB parser ceilings; decoded content retains its separate byte bound;
 an image Docker can otherwise load may be refused by these bounds. These are
 intentional admission limits. The registry client verifies manifest/config/blob
 identity and layer expansion before dispatching the import.
