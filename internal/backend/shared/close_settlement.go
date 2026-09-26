@@ -259,7 +259,7 @@ func (s *CloseSettlement) RecordRetention(
 		seenVolumes[name] = struct{}{}
 	}
 	retainedVolumeNames = slices.Clone(retainedVolumeNames)
-	stack, err := manifest.ParsePayload(claim.Manifest())
+	stack, err := manifest.ParseStoredPayload(claim.Manifest())
 	if err != nil {
 		return false, fmt.Errorf("parse close retention manifest: %w", err)
 	}
@@ -290,7 +290,7 @@ func (s *CloseSettlement) RecordRetention(
 }
 
 func retentionEntryMatchesClose(entry RetentionEntry, claim CloseIntentClaim) error {
-	stack, err := manifest.ParsePayload(claim.Manifest())
+	stack, err := manifest.ParseStoredPayload(claim.Manifest())
 	if err != nil {
 		return fmt.Errorf("parse close retention manifest: %w", err)
 	}
@@ -336,7 +336,7 @@ func (s *CloseSettlement) ProveRetention(
 }
 
 func retentionMatchesClose(proof ActiveRetentionProof, claim CloseIntentClaim) error {
-	stack, err := manifest.ParsePayload(claim.Manifest())
+	stack, err := manifest.ParseStoredPayload(claim.Manifest())
 	if err != nil {
 		return fmt.Errorf("parse close manifest for retention proof: %w", err)
 	}

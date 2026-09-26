@@ -271,6 +271,14 @@ survivors refuse replacement. Unknown Docker effects retain pending work;
 an activated target release is never rolled back. Recreating the old application
 does not reverse database migrations or other writes it made to retained data.
 
+Maintenance admission transfers a one-shot `MaintenanceWorkerHandoff` to the
+actor. Its claimed `MaintenanceWorkerLifetime` owns explicit close/shutdown
+cancellation independently of the target deadline. Target timeout can therefore
+leave the source's separate two-minute compensation budget available, while a
+later lease close still cancels that work. Copies cannot issue another worker or
+revive a canceled lifetime, and an HTTP waiter cannot revoke a claimed worker.
+Already admitted Docker effects retain their completion and drain obligations.
+
 Image inspection helpers have their own durable ownership records in
 `callbacks.db`. Their exact random name, image identity, and attempt precede
 Create; cleanup uses the backend lifetime even when the inspection caller was
@@ -566,7 +574,12 @@ is best-effort and skipped, while the conservative pool reservation remains.
 
 > **Production support:** **`xfs` is the only filesystem validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. The **`btrfs`** and **`zfs`** backends have automated coverage but are **not production-validated and not used in any deployment** — treat them as experimental. In particular, the inode-exhaustion backstops that XFS enforces via kernel project quotas have no equivalent production evidence on btrfs/zfs. Use `xfs` for any production deployment.
 
-> **Capability requirement (xfs/btrfs):** setting a volume's block-quota limit is a privileged operation, so the docker-backend must hold `CAP_SYS_ADMIN` on an xfs or btrfs backend. The daemon **fails fast at startup** if it lacks it (`internal/backend/docker/capability.go`) rather than provisioning with silently-unenforced disk caps. The startup backfill that re-tags pre-existing tenant-owned volumes additionally needs `CAP_FOWNER`. Grant them ambiently — `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` on the systemd unit; a plain `setcap cap_sys_admin+ep` on the binary does **not** propagate to the exec'd `xfs_quota`/`btrfs` child processes. `zfs` is exempt (`zfs allow` delegation) and `noop` is unaffected. See [DEPLOYMENT.md](../../../DEPLOYMENT.md#xfs-good-for-large-fleets) and its [systemd section](../../../DEPLOYMENT.md#process-management-systemd) for the full setup.
+> **Capability requirement (xfs/btrfs):** setting a volume's block-quota limit is a privileged operation, so the docker-backend must hold `CAP_SYS_ADMIN` on an xfs or btrfs backend. The daemon **fails fast at startup** if it lacks it (`internal/backend/docker/capability.go`) rather than provisioning with silently-unenforced disk caps. Repairing a pre-existing tenant-owned volume root additionally needs `CAP_FOWNER`. Grant them ambiently — `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` on the systemd unit; a plain `setcap cap_sys_admin+ep` on the binary does **not** propagate to the exec'd `xfs_quota`/`btrfs` child processes. `zfs` is exempt (`zfs allow` delegation) and `noop` is unaffected. See [DEPLOYMENT.md](../../../DEPLOYMENT.md#xfs-good-for-large-fleets) and its [systemd section](../../../DEPLOYMENT.md#process-management-systemd) for the full setup.
+
+XFS startup and reuse inspect only the descriptor-bound root project ID and
+inheritance flag, repair that already-open inode with XFS ioctls when necessary,
+then refresh quota limits. They never recursively walk tenant content. The 2026-09-23 fleet
+check recorded in ENG-1051 found no untagged descendants requiring legacy healing.
 
 Startup quota backfill uses each generation's immutable effective authority:
 durable `disk_mb` for stateful volumes and pinned scratch for a physically
@@ -672,7 +685,19 @@ backend-owned actor handoff and its bounded recovery owner intact.
 
 Restore-specific re-deploy behavior worth knowing:
 
-- **Image must already be present on the node.** Restore reuses the replace machinery and starts by inspecting the local image. If it was garbage-collected since close, restore fails with an image-inspect error; pre-pull it before restoring. Classic images and independently addressable platform manifests require no registry access. A legacy containerd index whose selected platform lacks an independent image-store record needs a one-time pull by that exact manifest digest, even when its layers are cached. If the registry is unavailable, this preparation fails before creating containers.
+- **Restore keeps the pinned image identity.** Locally available pinned content
+  requires no registry access once its verified allocation allowance is known.
+  Legacy containerd pins without that allowance need one exact-digest
+  verification/import. If content is missing, Fred can recover it from the pin's
+  immutable repository digest through bounded verification and Docker
+  `ImageLoad`; it never resolves the old mutable tag to select replacement
+  content. Missing immutable recovery identity is refused. For a legacy
+  containerd index whose selected platform lacks an independent local record,
+  read-only admission returns `imageexec.MaterializationRequired`; the
+  preparation owner imports that exact selected manifest before retrying
+  admission. Cached layers alone do not make this step independent of registry
+  availability. Containerd admission proves extraction with a stopped helper
+  before the image can authorize workload creation.
 - **Image and configuration are fixed.** Restore deploys strictly from the retained `StackManifest` and items; the request carries no manifest. The new lease's requested service names and quantities must shape-match the retained set exactly (otherwise the restore is rejected with a validation error).
 - **The SKU tier may change (promote/demote).** Only the item *shape* must match (service names + quantities); the SKU's resource (disk) tier **may** differ from the source lease. A **promote** (same-or-larger `disk_mb` tier) is admitted only when its aggregate growth above the retained footprint fits disk capacity, then the larger cap is applied. A **demote** (smaller `disk_mb` tier) is allowed only if the retained volume's **measured** data fits the new tier's `disk_mb` cap — the backend runs `checkDemoteFit` before adopting (restoring durable stateful data into an ephemeral `disk_mb=0` tier is always refused). The conservative exact-name exception above may restore scratch only into another diskless row, after measuring it against that destination's pinned scratch allowance. A refused demote returns HTTP `422` with body `{"code":"demote_exceeds_tier"}` (`backend.ErrDemoteDataExceedsTier`) and is counted by `fred_docker_backend_restore_demote_refused_total{backend,reason}` (`reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`); it is **not** counted by `restore_total`.
 - **Containers are recreated, ownership is not rewritten.** Restore does not force-recreate beyond the normal replace, and the volume chown is non-recursive (it sets ownership on the VOLUME mount point only), so existing files keep their on-disk ownership.
@@ -790,7 +815,7 @@ record stays `reaping`.
      scratch directory is later required
 
 2. **Asynchronous provisioning** -- runs in a goroutine tracked by a `WaitGroup`:
-   - Pulls the image (once, shared across all containers in the lease)
+   - Admits the immutable image (shared across all containers in the lease)
    - Inspects the image to discover Dockerfile `VOLUME` declarations
    - Creates/ensures the per-tenant network (if `NetworkIsolation` is enabled)
    - For each item in the lease (supports multi-SKU), for each unit (supports multi-unit):
@@ -806,7 +831,124 @@ record stays `reaping`.
 
 Multi-unit leases create multiple containers from the same manifest. Multi-SKU leases create containers with different resource profiles per SKU. Instance indices are 0-based across all items.
 
-The entire async operation is bounded by `ProvisionTimeout` and is canceled on backend shutdown.
+`ProvisionTimeout` and backend shutdown cancel the async workflow. Already
+admitted Docker effects retain their completion owners while they drain. Create
+and Start receive a 30-second grace only after caller cancellation or backend
+shutdown; an uncanceled request is not cut off after 30 seconds. Admitted image
+imports instead belong to the loader lifetime and continue through tenant
+cancellation, with a 30-minute ceiling from dispatch and the backend-worker
+drain allowance on shutdown. A close cancels the workflow and immediately returns
+typed, breaker-neutral `503 lifecycle_pending` while its owned worker remains
+active. The close command takes settlement ownership before cancellation;
+late worker messages cannot publish a failure or admit another mutation over
+that handoff. Provider close events defer through the bounded scheduler, and
+later retries can acquire exclusive teardown after that worker drains.
+
+### Image admission
+
+`imagefetch.Loader` verifies bounded registry content into private, unlinked
+staging files and mints a copy-safe `Prepared` capability. Only its issuer can
+import those exact bytes once. Shared-filesystem deployments keep their layout;
+classic `overlay2` uses the default `DockerRootDir/tmp` import staging, while
+containerd `overlayfs` additionally requires its actual `image_data_path`.
+External `DOCKER_TMPDIR` overrides are outside the supported space model.
+
+`shared/imagebudget` separates decoded/staged verification from physical daemon
+allocation. Preparation and pin publication carry one opaque envelope containing
+both dimensions; a saved import estimate cannot stand in for a decoding bound.
+The physical allowance includes classic Docker's retained tar-split metadata,
+including padding, escaped entry names and repeated layer occurrences.
+
+Concurrent preparations of one immutable source reference and selected platform
+share one download/import flight. A private leader owns staging and completion;
+followers receive only verified image evidence and obtain their own execution
+and pin authority. Membership survives import through per-lease pin publication.
+A canceled follower leaves independently. Only positive pre-dispatch evidence
+permits leader replacement; an uncertain dispatched result remains shared.
+
+The Started operation or maintenance subject supplies the tenant for an opaque
+preparation capability. Pinned and locally reusable image preparation never
+enters the staging queue. A single scheduler owns four slots, all available to a
+sole tenant. When capacity becomes available, it selects the waiting tenant with
+the fewest active stages; ties and requests within each tenant follow arrival
+order. No separate semaphore can reverse that choice. The single-use staging
+ownership is retained until cleanup, even if a copied parent capability closes
+early; cancellation removes only the waiting request. Occupied slots are not
+preempted, and this policy does not provide isolation against multiple addresses.
+
+Image pins share one store-owned commit accounting path, available only inside a
+scoped pin-lock capability: at most 100,000 total
+and 10,000 per verified durable tenant. Existing exact pins can be reused or
+recovered above these ceilings. The common accounting applies to both new
+admission and legacy backfill. On reopening, a row without positive durable
+tenant attribution conservatively consumes the global budget and every tenant's
+fresh-pin budget until attribution or safe collection resolves it. Neither
+unknown ownership nor an exceeded budget authorizes deletion or debit reset.
+
+Before dispatch, the loader durably adds its verified allowance to
+`<callback_db_path>.image-staging/image-import-debit-v1`. Upload and completion
+belong to the loader lifetime once admitted, independently of tenant
+cancellation, with a 30-minute ceiling measured from dispatch. The caller keeps
+staging and capacity ownership until the exchange
+finishes. Backend shutdown closes new admission, allows the owner to finish
+within its remaining shutdown budget, then cancels it at the
+deadline and drains it before journals close. Clean
+upload and terminal completion release only that import's debit, including a
+fully observed Docker refusal. The business failure still prevents image use;
+unknown completion retains the allocation across reopening. Capacity
+admission checks include outstanding allocations before further staging or
+import. Unknown allocation alone does not block collection of unpinned, unused
+images; live admission still protects content until its pin is durable. The
+periodic collector can prune obsolete pins while admissions remain active, but
+does not remove images during that interval. Pre-upgrade retained generations
+without pins conservatively inhibit image deletion until restored or safely
+reaped. That can last for the remaining retention grace (90 days by default)
+plus a sweep interval, or longer when reaping is parked; the inhibited counter
+alone is not a paging condition while disk headroom is healthy. Local
+launches add only unknown completion allocations to their actual free-space floor. These checks sample free space;
+they do not reserve physical capacity against other writers. The
+[offline recovery procedure](../../../OPERATIONS.md#recovering-outstanding-image-import-allocation)
+requires external Docker/runtime drain and matching backups before an explicit
+debit clear.
+
+The debit file now uses `FREDIMG2` accounting under the existing filename. An
+empty `FREDIMG1` record is compatible; a positive older record is preserved and
+refuses startup because its metadata allowance is incomplete. It requires the
+same external drain and offline recovery as unknown import completion.
+
+The `docker-backend` command uses one 75-second deadline for HTTP shutdown
+(at most 30 seconds) and the remaining backend-worker drain. This fits the
+existing 90-second systemd stop allowance. `Backend.StopContext` consumes the
+owner's deadline; direct `Backend.Stop` callers retain the 90-second default.
+If owned work cannot drain in time, stores stay open and the process reports a
+typed drain failure rather than claiming successful shutdown.
+
+Pins persist separate `ImportBytes` and `VerificationBytes` with immutable image
+identity. Missing verification evidence cannot authorize recovery decoding.
+Every containerd admission
+then creates and removes a journal-owned stopped probe with its own extraction
+allocation, forcing deferred extraction before publishing a pin or execution
+capability. The probe never starts, disables networking, and covers declared
+image `VOLUME` paths with tmpfs. All content-inspection helpers use the same
+restricted `imageexec.InspectionCreator`: it owns these mount settings, neutral
+user and working directory, and never grants a start capability. Docker archive
+reads still expose the original image files and ownership, while Create cannot
+populate anonymous volumes or materialize the image's working directory.
+Unknown Create completion fences the current
+storage authority; durable pending helper receipts exclude later containerd
+ingestion across restart until the normal helper protocol or
+[offline repair](../../../OPERATIONS.md#unsettled-docker-effects) settles them.
+Within a live process, typed content-helper ownership lets admission wait for
+creation to settle durably, then coexist with the helper's read session. Probe
+and recovery ownership remain exclusive, and releasing an unresolved helper
+never grants that sharing permission.
+
+Short manager critical sections allocate staging/import/probe owners and publish
+pins. A live admission excludes collection until publication; the durable debit
+preserves exclusion for an interrupted import. Registry and `ImageLoad` I/O
+happen outside this lock. Resolved immutable digests reuse host-wide verified
+pins or already-extracted classic Docker content. Startup can backfill legacy
+pins only from an exact recovered active cohort, never from a moved tag.
 
 ### Stack Provisioning
 
@@ -821,7 +963,7 @@ When lease items carry `service_name` fields (and the payload is a [stack manife
    - Validates each per-service manifest independently
 
 2. **Asynchronous provisioning** — Docker Compose-based deployment:
-   - Each service's image is pulled and inspected independently (pre-flight, before Compose)
+   - Each service's image is admitted independently before Compose; missing content passes bounded verification and exact-content import before inspection
    - Volumes are pre-created for stateful services (`disk_mb > 0` with image
      `VOLUME`s) and for detected writable-path scratch when available
      - Resource allocation ID: `{leaseUUID}-{serviceName}-{instanceIndex}`
@@ -883,7 +1025,7 @@ When a provision has `status=failed` (e.g., a container crashed and was detected
 1. The existing `FailCount` is carried over from the failed provision record.
 2. Resource allocations are released and old containers are removed. Managed volumes are **kept** — stateful data persists across re-provisions.
 3. A new provision record is created with `FailCount` preserved.
-4. The full provisioning flow runs again (image pull, image inspect, volume setup via idempotent Create, container create/start, startup verification). Existing volumes are reused with quota updated; only new volumes are created.
+4. The full provisioning flow runs again (pinned image reuse or bounded image ingestion, image inspect, volume setup via idempotent Create, container create/start, startup verification). Existing volumes are reused with quota updated; only new volumes are created.
 5. On failure, `FailCount` is incremented. The `FailCount` is also persisted in the `fred.fail_count` container label. Only newly created volumes are cleaned up; reused volumes are preserved.
 
 ## Lease State Machine
@@ -1781,14 +1923,16 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 | `fred.image_reference` | image reference string | Original manifest image reference, preserved for release comparisons while execution uses an immutable image ID |
 | `fred.image_id` | `sha256:` image ID | Binds `fred.image_reference` to Docker's actual image ID and the container's configured image; partial or inconsistent bindings fail inventory validation |
 
-Manifest and image labels may not use the `fred.*`, `traefik.*`, or
-`com.docker.compose.*` namespaces, matched case-insensitively. Image metadata is
-checked before creating workloads or inspection helpers, and execution uses
-the inspected immutable image ID. This prevents inherited labels from becoming
-ingress or container-lifecycle instructions. Images built with Compose may carry
-reserved labels automatically; rebuild them without orchestration metadata
-(for example, with `docker build`) before provisioning or replacing workloads.
-Existing containers are not rewritten by this admission check.
+Manifest labels may not use the `fred.*`, `traefik.*`, or
+`com.docker.compose.*` namespaces, matched case-insensitively. Image labels have
+three exact exceptions: `com.docker.compose.project`, `com.docker.compose.service`
+and `com.docker.compose.version`. Fred discards these automatic build-stamp
+values and supplies ownership from the compiled workload; direct helpers get
+neutral values. Other reserved keys and case variants remain refused. A
+Compose-built image containing only those three stamps needs no rebuild.
+Newly fetched image metadata is checked before layer download or import; all
+images are admitted before creating workloads or inspection helpers. Execution
+uses the inspected immutable image ID. Existing containers are not rewritten.
 
 ## Bandwidth Limiting
 

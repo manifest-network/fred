@@ -335,7 +335,13 @@ func (m *storageMutations) requireLease(leaseUUID, operation string) error {
 
 func (m *storageMutations) pullImage(ctx context.Context, image string, timeout time.Duration) error {
 	return m.runner.Prepare(ctx, "pull image", func(ctx context.Context) error {
-		return m.ops.docker.PullImage(ctx, image, timeout)
+		if capacity := m.ops.backend.imageCapacity; capacity != nil {
+			ctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			_, err := capacity.prepare(ctx, m, image, true)
+			return err
+		}
+		return m.ops.docker.RequireImage(ctx, image)
 	})
 }
 
@@ -343,6 +349,10 @@ func (m *storageMutations) admitImage(ctx context.Context, reference string) (ad
 	err = m.runner.Prepare(ctx, "admit image", func(ctx context.Context) error {
 		ctx, cancel := context.WithTimeout(ctx, m.ops.backend.cfg.ImagePullTimeout)
 		defer cancel()
+		if capacity := m.ops.backend.imageCapacity; capacity != nil {
+			admitted, err = capacity.prepare(ctx, m, reference, false)
+			return err
+		}
 		admitted, err = m.ops.docker.AdmitImage(ctx, reference)
 		return err
 	})
@@ -690,6 +700,9 @@ func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchC
 			if err := q.requireActive(); err != nil {
 				return err
 			}
+			if err := q.mutations.ops.backend.requireImageDiskHeadroom(ctx); err != nil {
+				return err
+			}
 			var err error
 			debt, err = journal.Begin(q.mutations.volumeLaunchOrigin(), q.reserved.ids)
 			if err != nil {
@@ -737,7 +750,7 @@ func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchC
 					if err := q.requireActive(); err != nil {
 						return daemonLaunchOutcome{settled: true, err: err}
 					}
-					id, outcome := m.ops.docker.createCompensationContainer(ctx, snapshot.Image, snapshot)
+					id, outcome := m.ops.docker.createCompensationContainer(ctx, snapshot)
 					if !outcome.settled || outcome.err != nil {
 						return outcome
 					}

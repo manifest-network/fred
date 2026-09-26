@@ -627,6 +627,9 @@ func (coordinator *AuthenticatedCallbackCoordinator) observeLifecycle(
 	if err := coordinator.verifyStorage(callback, result.authoritativeBackend); err != nil {
 		return result, err
 	}
+	if err := coordinator.recordMaintenanceCompletion(callback, result.authoritativeBackend); err != nil {
+		return result, err
+	}
 	if callback.Status() == backend.CallbackStatusDeprovisioned {
 		retired, err := coordinator.coordinator.retireLifecycle(callback.LeaseUUID(), callback.LifecycleID())
 		if err != nil {

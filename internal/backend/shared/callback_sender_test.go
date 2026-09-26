@@ -1906,14 +1906,14 @@ func TestCallbackReplayQueue_TypedWakeTouchesOnlyItsLease(t *testing.T) {
 	inFlightLease := testLeaseUUID("typed-wake-in-flight")
 	otherLease := testLeaseUUID("typed-wake-other")
 	queue := newCallbackReplayQueue()
-	queue.discover([]string{inFlightLease}, false, false)
+	queue.discover([]string{inFlightLease}, callbackReplayStartup)
 	leaseUUID, ready := queue.next()
 	require.True(t, ready)
 	require.Equal(t, inFlightLease, leaseUUID)
 	queue.dispatched(inFlightLease)
 
 	queue.wake(newCallbackReplayCommitWake(otherLease))
-	assert.NotContains(t, queue.dirty, inFlightLease,
+	assert.Equal(t, callbackReplayUnchanged, queue.inFlight[inFlightLease],
 		"an unrelated commit must not restart an in-flight failed delivery")
 	queue.completed(callbackReplayCompletion{
 		leaseUUID: inFlightLease,
@@ -1928,18 +1928,24 @@ func TestCallbackReplayQueue_TypedWakeTouchesOnlyItsLease(t *testing.T) {
 	assert.NotContains(t, queue.dormant, inFlightLease)
 	leaseUUID, ready = queue.next()
 	require.True(t, ready)
+	assert.Equal(t, otherLease, leaseUUID,
+		"a later ownership handoff cannot displace an already queued fresh lease")
+	queue.dispatched(leaseUUID)
+	queue.completed(callbackReplayCompletion{leaseUUID: leaseUUID, outcome: callbackReplayEmpty})
+	leaseUUID, ready = queue.next()
+	require.True(t, ready)
 	assert.Equal(t, inFlightLease, leaseUUID,
-		"ownership handoff must promptly retry the exact dormant lease")
+		"ownership handoff must receive the next fresh-lane opportunity")
 }
 
 func TestCallbackReplayQueue_SameLeaseCommitRechecksInFlightDrain(t *testing.T) {
 	leaseUUID := testLeaseUUID("typed-wake-same-lease")
 	queue := newCallbackReplayQueue()
-	queue.discover([]string{leaseUUID}, false, false)
+	queue.discover([]string{leaseUUID}, callbackReplayStartup)
 	queue.dispatched(leaseUUID)
 
 	queue.wake(newCallbackReplayCommitWake(leaseUUID))
-	assert.Contains(t, queue.dirty, leaseUUID)
+	assert.Equal(t, callbackReplayCommitted, queue.inFlight[leaseUUID])
 	queue.completed(callbackReplayCompletion{
 		leaseUUID: leaseUUID,
 		outcome:   callbackReplayEmpty,

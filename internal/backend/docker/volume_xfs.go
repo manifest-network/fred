@@ -63,8 +63,9 @@ func inodeHardLimit(sizeMB, minAvgFileBytes int64) int64 {
 }
 
 // xfsVolumeManager creates directories with XFS project quotas.
-type xfsProjectAttributeReader interface {
+type xfsProjectAttributes interface {
 	ReadProjectAttributes(*os.Root) (linuxFSXAttr, error)
+	SetProjectID(*os.Root, uint32) error
 }
 
 type xfsVolumeManager struct {
@@ -78,10 +79,10 @@ type xfsVolumeManager struct {
 	// minAvgFileBytes is the ratio used by inodeHardLimit to derive each volume's
 	// XFS inode hard limit from its block quota. Set from Config.GetMinAvgFileBytes().
 	minAvgFileBytes int64
-	// projectAttributes is a descriptor-rooted kernel reader. Keeping the
+	// projectAttributes is a descriptor-rooted kernel boundary. Keeping the
 	// interface at its consumer boundary lets filesystem-free unit tests model
 	// the UAPI result without weakening the production XFS check.
-	projectAttributes xfsProjectAttributeReader
+	projectAttributes xfsProjectAttributes
 
 	// rootWatch refuses to report an emptiness it cannot vouch for (ENG-687).
 	rootWatch volumeRootWatch
@@ -924,17 +925,11 @@ func xfsQuotaArgs(cmd, mountPoint string) []string {
 }
 
 // xfsProjectSetupCmd is the `project -s` command that tags dirPath's inode (and
-// its existing children) with projID. dirPath is the volume subdirectory.
-func xfsProjectSetupCmd(dirPath string, projID uint32) string {
-	return fmt.Sprintf("project -s -p %s %d", dirPath, projID)
-}
-
-// xfsProjectResetToDefaultCmd assigns only the empty teardown-authority inode
-// to project 0. `-d 0` is load-bearing: the authority directory must remain a
-// separate, untagged sibling while the managed tree keeps its original project
-// ID and quota until byte deletion and both usage proofs complete.
-func xfsProjectResetToDefaultCmd(dirPath string) string {
-	return fmt.Sprintf("project -s -d 0 -p %s 0", dirPath)
+// its existing children) with projID. Use it only for a private create-stage,
+// which contains no tenant data; steady-state quota work must never walk a
+// live tenant tree.
+func xfsProjectSetupCmd(rootPath string, stage xfsStageName) string {
+	return fmt.Sprintf("project -s -p %s %d", stage.hostPath(rootPath), stage.projID)
 }
 
 // linuxFSXAttr is the stable Linux UAPI struct consumed by
@@ -959,26 +954,46 @@ const linuxFSIOCFSGetXAttr = (uintptr(unix.FS_IOC_GETFLAGS) & 0xc0000000) |
 	(uintptr('X') << 8) |
 	31
 
+// _IOW('X', 32, struct fsxattr), with the architecture's write-direction bits.
+const linuxFSIOCFSSetXAttr = (uintptr(unix.FS_IOC_SETFLAGS) & 0xc0000000) |
+	(unsafe.Sizeof(linuxFSXAttr{}) << 16) |
+	(uintptr('X') << 8) |
+	32
+
 const (
 	linuxXFSFilesystemMagic = 0x58465342
 	linuxFSXFlagProjInherit = 0x00000200
 )
 
-type linuxXFSProjectAttributeReader struct{}
+type linuxXFSProjectAttributes struct{}
 
-func (linuxXFSProjectAttributeReader) ReadProjectAttributes(root *os.Root) (linuxFSXAttr, error) {
+func openXFSRootDirectory(root *os.Root) (*os.File, error) {
 	file, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	var filesystem unix.Statfs_t
+	if err := unix.Fstatfs(int(file.Fd()), &filesystem); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if uint64(filesystem.Type) != linuxXFSFilesystemMagic {
+		_ = file.Close()
+		return nil, fmt.Errorf("opened directory is on filesystem type %#x, want XFS", filesystem.Type)
+	}
+	return file, nil
+}
+
+func (linuxXFSProjectAttributes) ReadProjectAttributes(root *os.Root) (linuxFSXAttr, error) {
+	file, err := openXFSRootDirectory(root)
 	if err != nil {
 		return linuxFSXAttr{}, err
 	}
 	defer func() { _ = file.Close() }()
-	var filesystem unix.Statfs_t
-	if err := unix.Fstatfs(int(file.Fd()), &filesystem); err != nil {
-		return linuxFSXAttr{}, err
-	}
-	if uint64(filesystem.Type) != linuxXFSFilesystemMagic {
-		return linuxFSXAttr{}, fmt.Errorf("opened delete-stage is on filesystem type %#x, want XFS", filesystem.Type)
-	}
+	return readXFSProjectAttributes(file)
+}
+
+func readXFSProjectAttributes(file *os.File) (linuxFSXAttr, error) {
 	var attr linuxFSXAttr
 	_, _, errno := unix.Syscall(
 		unix.SYS_IOCTL,
@@ -991,6 +1006,35 @@ func (linuxXFSProjectAttributeReader) ReadProjectAttributes(root *os.Root) (linu
 		return linuxFSXAttr{}, errno
 	}
 	return attr, nil
+}
+
+// SetProjectID changes only the inode represented by root. xfs_quota's -d 0
+// suppresses descendant changes but still traverses the whole tree with nftw;
+// an ioctl on the pinned directory descriptor cannot inspect tenant entries or
+// re-resolve a replaced display path. Preserve unrelated flags and extent hints.
+func (linuxXFSProjectAttributes) SetProjectID(root *os.Root, projectID uint32) error {
+	file, err := openXFSRootDirectory(root)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	attr, err := readXFSProjectAttributes(file)
+	if err != nil {
+		return err
+	}
+	attr.ProjectID = projectID
+	attr.XFlags |= linuxFSXFlagProjInherit
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		file.Fd(),
+		linuxFSIOCFSSetXAttr,
+		uintptr(unsafe.Pointer(&attr)), // #nosec G103 -- stable Linux fsxattr UAPI buffer
+	)
+	runtime.KeepAlive(file)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 func validateXFSDefaultProject(attr linuxFSXAttr) error {
@@ -1182,18 +1226,15 @@ func (x *xfsVolumeManager) publishXFSStageWith(
 }
 
 func (x *xfsVolumeManager) prepareXFSDeleteStage(
-	ctx context.Context,
 	root *os.Root,
 	parent *fsidentity.Directory,
 	stage xfsDeleteStageName,
 ) error {
-	return x.prepareXFSDeleteStageWith(ctx, root, parent, stage, parent.Sync, root.Remove)
+	return x.prepareXFSDeleteStageWith(root, stage, parent.Sync, root.Remove)
 }
 
 func (x *xfsVolumeManager) prepareXFSDeleteStageWith(
-	ctx context.Context,
 	root *os.Root,
-	parent *fsidentity.Directory,
 	stage xfsDeleteStageName,
 	syncParent func() error,
 	removeStage func(string) error,
@@ -1236,7 +1277,7 @@ func (x *xfsVolumeManager) prepareXFSDeleteStageWith(
 			fmt.Errorf("open project-reset xfs delete-stage %q: %w", stage.value(), err),
 		)
 	}
-	normalizeErr := x.normalizeXFSDeleteStageProjectWith(ctx, root, parent, stage, stageRoot, syncParent)
+	normalizeErr := x.normalizeXFSDeleteStageProjectWith(root, stage, stageRoot, syncParent)
 	stageCloseErr := stageRoot.Close()
 	if err := errors.Join(normalizeErr, stageCloseErr); err != nil {
 		return rollbackUndurableDeleteStage(
@@ -1256,9 +1297,7 @@ func (x *xfsVolumeManager) prepareXFSDeleteStageWith(
 }
 
 func (x *xfsVolumeManager) normalizeXFSDeleteStageProjectWith(
-	ctx context.Context,
 	root *os.Root,
-	parent *fsidentity.Directory,
 	stage xfsDeleteStageName,
 	stageRoot *os.Root,
 	syncParent func() error,
@@ -1270,14 +1309,9 @@ func (x *xfsVolumeManager) normalizeXFSDeleteStageProjectWith(
 	// Repeat this normalization during recovery, not only initial prepare. A
 	// crash can replay the mkdir without the following project-ID change, and a
 	// configured root may cause that inode to inherit the retiring project.
-	resetCtx, cancel := newDetachedBoundedContext(ctx, 30*time.Second)
-	resetCmd := xfsProjectResetToDefaultCmd(parent.DisplayPath(stage.value()))
-	out, resetErr := exec.CommandContext(resetCtx, "xfs_quota", xfsQuotaArgs(resetCmd, x.mountPoint)...).CombinedOutput()
-	if resetErr != nil {
-		cancel()
-		return fmt.Errorf("reset xfs delete-stage %q to project 0: %w: %s", stage.value(), resetErr, out)
+	if err := x.projectAttributes.SetProjectID(stageRoot, 0); err != nil {
+		return fmt.Errorf("reset xfs delete-stage %q to project 0: %w", stage.value(), err)
 	}
-	cancel()
 	attr, attrErr := x.projectAttributes.ReadProjectAttributes(stageRoot)
 	if attrErr != nil {
 		return fmt.Errorf("read xfs delete-stage %q project attributes: %w", stage.value(), attrErr)
@@ -1412,7 +1446,7 @@ func (x *xfsVolumeManager) cleanupXFSDeleteStageWith(
 		_ = stageRoot.Close()
 		return fmt.Errorf("stat opened xfs delete-stage %q: %w", stage.value(), err)
 	}
-	if err := x.normalizeXFSDeleteStageProjectWith(ctx, root, parent, stage, stageRoot, parent.Sync); err != nil {
+	if err := x.normalizeXFSDeleteStageProjectWith(root, stage, stageRoot, parent.Sync); err != nil {
 		_ = stageRoot.Close()
 		return fmt.Errorf("normalize recovered xfs delete-stage %q before cleanup: %w", stage.value(), err)
 	}
@@ -1770,7 +1804,12 @@ func (x *xfsVolumeManager) reuseExistingVolume(
 	if !exists {
 		return "", fmt.Errorf("existing xfs volume %s disappeared before verification", dirPath)
 	}
-	projID, err := readProjectIDFileAtRoot(root, volumeID)
+	volumeRoot, err := openAttestedManagedVolumeRoot(root, volumeID)
+	if err != nil {
+		return "", fmt.Errorf("open existing xfs volume %s: %w", dirPath, err)
+	}
+	defer func() { _ = volumeRoot.Close() }()
+	projID, err := readProjectIDFileInVolumeRoot(volumeRoot)
 	if err != nil {
 		return "", fmt.Errorf("read project ID marker for existing volume %s: %w", dirPath, err)
 	}
@@ -1783,14 +1822,10 @@ func (x *xfsVolumeManager) reuseExistingVolume(
 		return "", fmt.Errorf("register existing xfs volume authority: %w", registerErr)
 	}
 
-	// A prior process can have crashed after writing the marker but before
-	// tagging the inode. Reapply the project association before its limit so an
-	// existing recovery directory cannot be returned as unquotaed storage.
-	cmd := xfsProjectSetupCmd(dirPath, projID)
-	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(cmd, x.mountPoint)...).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("xfs_quota project setup on existing %s (id=%d): %w: %s", dirPath, projID, err, out)
+	if err := x.ensureVolumeRootProject(ctx, volumeRoot, dirPath, projID); err != nil {
+		return "", err
 	}
-	cmd = xfsLimitCmd(projID, quota, ihard)
+	cmd := xfsLimitCmd(projID, quota, ihard)
 	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(cmd, x.mountPoint)...).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("xfs_quota limit on existing %s (id=%d, quota=%s): %w: %s", dirPath, projID, quota, err, out)
 	}
@@ -1888,7 +1923,7 @@ func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 		)
 	}
 	stagePath := parent.DisplayPath(stage.value())
-	cmd := xfsProjectSetupCmd(stagePath, projID)
+	cmd := xfsProjectSetupCmd(filepath.Dir(stagePath), stage)
 	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(cmd, x.mountPoint)...).CombinedOutput(); err != nil {
 		return "", false, x.failDurableXFSStageCreate(
 			ctx,
@@ -1918,11 +1953,48 @@ func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 	return dirPath, true, nil
 }
 
-// EnsureQuota re-applies the project tag + block (bhard) and inode (ihard)
-// limits to an existing volume, recovering the projID from its
-// .fred-project-id marker. It re-tags the inode (project -s) — which heals a
-// volume left untagged by a pre-CAP_SYS_ADMIN daemon (ENG-454) — then
-// re-applies the limit. No-op if the directory is absent (never creates), so
+// ensureVolumeRootProject checks the descriptor-rooted kernel attributes before
+// setting limits. Correctly tagged roots need no project setup; repair touches
+// only the root and is checked again before accepting it. This keeps startup and
+// reuse independent of the number of tenant entries and of live file churn.
+func (x *xfsVolumeManager) ensureVolumeRootProject(
+	ctx context.Context,
+	volumeRoot *os.Root,
+	dirPath string,
+	projID uint32,
+) error {
+	attr, err := x.projectAttributes.ReadProjectAttributes(volumeRoot)
+	if err != nil {
+		return fmt.Errorf("read xfs root project attributes for %s: %w", dirPath, err)
+	}
+	if attr.ProjectID == projID && attr.XFlags&linuxFSXFlagProjInherit != 0 {
+		return nil
+	}
+	previousProjectID, previousFlags := attr.ProjectID, attr.XFlags
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := x.projectAttributes.SetProjectID(volumeRoot, projID); err != nil {
+		return fmt.Errorf("xfs root project setup for %s (id=%d): %w", dirPath, projID, err)
+	}
+	attr, err = x.projectAttributes.ReadProjectAttributes(volumeRoot)
+	if err != nil {
+		return fmt.Errorf("verify xfs root project attributes for %s: %w", dirPath, err)
+	}
+	if attr.ProjectID != projID || attr.XFlags&linuxFSXFlagProjInherit == 0 {
+		return fmt.Errorf("xfs root project setup for %s did not establish project %d with inheritance (id=%d, xflags=%#x)",
+			dirPath, projID, attr.ProjectID, attr.XFlags)
+	}
+	x.logger.Warn("repaired xfs volume root project attributes; descendants require offline verification",
+		"path", dirPath, "project_id", projID,
+		"previous_project_id", previousProjectID, "previous_xflags", previousFlags)
+	return nil
+}
+
+// EnsureQuota verifies the volume root's project association and inheritance,
+// then re-applies block (bhard) and inode (ihard) limits using the project ID in
+// .fred-project-id. A missing association is repaired on the root only, never
+// by walking tenant data. No-op if the directory is absent (never creates), so
 // a concurrent deprovision is never resurrected.
 func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
 	volumeID, err := parseManagedVolumeName(id)
@@ -1945,7 +2017,12 @@ func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB in
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("existing xfs volume %s is not a real directory", dirPath)
 	}
-	projID, err := readProjectIDFileAtRoot(root, volumeID)
+	volumeRoot, err := openAttestedManagedVolumeRoot(root, volumeID)
+	if err != nil {
+		return fmt.Errorf("open existing xfs volume %s: %w", dirPath, err)
+	}
+	defer func() { _ = volumeRoot.Close() }()
+	projID, err := readProjectIDFileInVolumeRoot(volumeRoot)
 	if err != nil {
 		return fmt.Errorf("read project ID marker for %s: %w", dirPath, err)
 	}
@@ -1957,9 +2034,8 @@ func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB in
 		return fmt.Errorf("register existing xfs volume authority: %w", registerErr)
 	}
 
-	tagCmd := xfsProjectSetupCmd(dirPath, projID)
-	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(tagCmd, x.mountPoint)...).CombinedOutput(); err != nil {
-		return fmt.Errorf("xfs_quota project re-tag for %s (id=%d): %w: %s", dirPath, projID, err, out)
+	if err := x.ensureVolumeRootProject(ctx, volumeRoot, dirPath, projID); err != nil {
+		return err
 	}
 	limitCmd := xfsLimitCmd(projID, fmt.Sprintf("%dm", sizeMB), inodeHardLimit(sizeMB, x.minAvgFileBytes))
 	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(limitCmd, x.mountPoint)...).CombinedOutput(); err != nil {
@@ -2075,7 +2151,7 @@ func (x *xfsVolumeManager) destroyWith(ctx context.Context, id string, removeAll
 	if stageErr != nil {
 		return stageErr
 	}
-	if stageErr := x.prepareXFSDeleteStage(ctx, root, parent, deleteStage); stageErr != nil {
+	if stageErr := x.prepareXFSDeleteStage(root, parent, deleteStage); stageErr != nil {
 		return stageErr
 	}
 	return x.cleanupXFSDeleteStageWith(

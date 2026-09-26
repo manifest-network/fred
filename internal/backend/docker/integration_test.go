@@ -10,10 +10,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	composeapi "github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	networktypes "github.com/docker/docker/api/types/network"
@@ -39,6 +41,18 @@ func newIntegrationLeaseUUID() string {
 	return uuid.NewString()
 }
 
+// integrationDockerConfig keeps deployment facts explicit. Docker's Info API
+// cannot report an independently managed containerd root; the integration
+// runner must declare its actual root instead of silently using DockerRootDir.
+func integrationDockerConfig() Config {
+	cfg := DefaultConfig()
+	cfg.ImageDataPath = os.Getenv("FRED_TEST_IMAGE_DATA_PATH")
+	// Loopback quota fixtures deliberately have small data filesystems. Keep
+	// the real floor enabled at a scale compatible with those test substrates.
+	cfg.ImageDiskMinFreeMB = 1
+	return cfg
+}
+
 // testBackendWithRealDocker creates a Backend connected to the real Docker daemon.
 // The backend is stopped and all test containers/networks are cleaned up via t.Cleanup.
 func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
@@ -52,7 +66,7 @@ func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 		t.Skip("Docker not available:", err)
 	}
 
-	cfg := DefaultConfig()
+	cfg := integrationDockerConfig()
 	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.Name = fmt.Sprintf("test-%s-%d", t.Name(), time.Now().UnixNano())
 	cfg.CallbackSecret = testCallbackSecret
@@ -1055,7 +1069,7 @@ func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
 func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 	callbackServer, callbackCh := startCallbackServer(t)
 
-	cfg := DefaultConfig()
+	cfg := integrationDockerConfig()
 	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.Name = fmt.Sprintf("test-cold-%d", time.Now().UnixNano())
 	cfg.CallbackSecret = testCallbackSecret
@@ -1151,7 +1165,7 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 	callbackServer1, callbackCh1 := startCallbackServer(t)
 
-	cfg := DefaultConfig()
+	cfg := integrationDockerConfig()
 	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.Name = fmt.Sprintf("test-cold-dead-%d", time.Now().UnixNano())
 	cfg.CallbackSecret = testCallbackSecret
@@ -2610,6 +2624,18 @@ func testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t *testing.T, moun
 	require.Equal(t, frozen.HostConfig.SecurityOpt, restored.HostConfig.SecurityOpt)
 	require.Equal(t, frozen.Config.Labels[LabelLifecycleCallbackURL], restored.Config.Labels[LabelLifecycleCallbackURL])
 	require.Equal(t, frozen.Config.Labels[LabelMaintenanceID], restored.Config.Labels[LabelMaintenanceID])
+	for _, key := range []string{composeapi.ProjectLabel, composeapi.ServiceLabel, composeapi.ConfigHashLabel, composeapi.OneoffLabel} {
+		require.NotEmpty(t, frozen.Config.Labels[key], "source discovery label: %s", key)
+		require.Equal(t, frozen.Config.Labels[key], restored.Config.Labels[key], "compensation must preserve Compose discovery: %s", key)
+	}
+	// The embedded Compose library has an empty version when its CLI linker
+	// version was not set. The compiler owns that value, including explicit empty.
+	for _, labels := range []map[string]string{frozen.Config.Labels, restored.Config.Labels} {
+		require.Contains(t, labels, composeapi.VersionLabel)
+		require.Equal(t, composeapi.ComposeVersion, labels[composeapi.VersionLabel])
+	}
+	require.Equal(t, frozen.Config.Labels[LabelImageID], restored.Config.Labels[LabelImageID])
+	require.Equal(t, frozen.Config.Labels[LabelImageReference], restored.Config.Labels[LabelImageReference])
 	if mountPath != "" {
 		var restoredDataPath string
 		for _, bound := range restored.Mounts {
@@ -2645,6 +2671,11 @@ func testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t *testing.T, moun
 	require.Len(t, durable, 2)
 	require.Equal(t, maintenanceID, durable[1].MaintenanceID)
 	require.NoError(t, b.Deprovision(ctx, leaseUUID))
+	require.Empty(t, inspectProvisionContainers(t, leaseUUID), "Compose close must remove the replayed source cohort")
+	if mountPath != "" {
+		_, err := os.Stat(originalDataPath)
+		require.ErrorIs(t, err, os.ErrNotExist, "successful close must remove the managed source volume")
+	}
 }
 
 func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) {

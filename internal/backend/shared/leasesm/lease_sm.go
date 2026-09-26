@@ -1345,7 +1345,7 @@ func validateCompleteReleaseProjection(
 			return nil, fmt.Errorf("service %q container quantity differs from release", item.ServiceName)
 		}
 	}
-	stack, err := manifest.ParsePayload(release.Manifest)
+	stack, err := manifest.ParseStoredPayload(release.Manifest)
 	if err != nil {
 		return nil, fmt.Errorf("release manifest: %w", err)
 	}
@@ -1571,7 +1571,7 @@ func NewMaintenanceReplaceFailure(err error, details ReplaceFailureDetails, proo
 	info.maintenanceRelease = proof
 	info.maintenance = proof.Intent()
 	if release, ids, services, ok := proof.SourceProjection(); ok {
-		stack, projectionErr := manifest.ParsePayload(release.Manifest)
+		stack, projectionErr := manifest.ParseStoredPayload(release.Manifest)
 		if projectionErr != nil {
 			return ReplaceResult{}, fmt.Errorf("restored maintenance source: %w", projectionErr)
 		}

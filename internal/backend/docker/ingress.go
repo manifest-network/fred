@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -317,71 +316,50 @@ func TraefikCustomDomainLabels(cfg IngressConfig, customRouterName, customDomain
 // stack path, so they share this struct (and the helper) to keep label
 // emission in lockstep across both code paths.
 type ingressLabelParams struct {
-	LeaseUUID    string
-	ServiceName  string
-	Instance     int
-	Quantity     int
-	Ingress      IngressConfig
-	NetworkName  string
-	CustomDomain string
+	LeaseUUID   string
+	ServiceName string
+	Instance    int
+	Quantity    int
+	NetworkName string
 }
 
 // applyIngressLabels merges primary (per-instance generated subdomain) and
 // secondary (per-service custom domain) Traefik labels into the given label
-// map. Validation failures on the secondary router skip only that router —
-// the primary stays. Services with no routable HTTP port emit no labels at
-// all (and warn if a CustomDomain was set on such an item).
+// map. The construction-owned route has already fixed the selected port and
+// effective custom domain; rendering cannot make another admission decision.
 //
 // Used identically by lifecycle.go's CreateContainer (legacy single-item
 // lease) and compose_project.go's buildComposeServiceConfig (stack).
 // Keeping the glue in one place ensures the two paths can never drift in
 // what they emit for the same logical item.
-func applyIngressLabels(labels map[string]string, p ingressLabelParams, ports map[string]manifest.PortConfig) {
-	if !p.Ingress.Enabled {
-		return
-	}
-	port, ok := SelectIngressPort(ports)
-	if !ok {
-		if p.CustomDomain != "" {
-			slog.Warn("custom_domain set on item with no routable HTTP port; skipping",
-				"lease_uuid", p.LeaseUUID,
-				"service_name", p.ServiceName,
-				"custom_domain", p.CustomDomain)
-		}
+func applyIngressLabels(labels map[string]string, p ingressLabelParams, route ingressRoute) {
+	if route.port == 0 {
 		return
 	}
 
 	subdomain := ComputeSubdomain(p.LeaseUUID, p.ServiceName, p.Instance, p.Quantity)
-	fqdn := ComputeFQDN(subdomain, p.Ingress.WildcardDomain)
+	fqdn := ComputeFQDN(subdomain, route.config.WildcardDomain)
 	routerName := RouterName(p.LeaseUUID, p.ServiceName, p.Instance, p.Quantity)
-	for k, v := range TraefikLabels(p.Ingress, p.NetworkName, routerName, fqdn, port) {
+	for k, v := range TraefikLabels(route.config, p.NetworkName, routerName, fqdn, route.port) {
 		labels[k] = v
 	}
 	labels[LabelFQDN] = fqdn
 
-	if p.CustomDomain == "" {
-		return
-	}
-	if err := validateCustomDomain(p.CustomDomain, p.Ingress.WildcardDomain); err != nil {
-		slog.Error("skipping custom-domain router (validation failed)",
-			"lease_uuid", p.LeaseUUID,
-			"service_name", p.ServiceName,
-			"custom_domain", p.CustomDomain,
-			"error", err)
+	if route.domain == "" {
 		return
 	}
 	customRouterName := CustomDomainRouterName(p.LeaseUUID, p.ServiceName)
-	for k, v := range TraefikCustomDomainLabels(p.Ingress, customRouterName, p.CustomDomain, port) {
+	for k, v := range TraefikCustomDomainLabels(route.config, customRouterName, route.domain, route.port) {
 		labels[k] = v
 	}
-	labels[LabelCustomDomain] = p.CustomDomain
+	labels[LabelCustomDomain] = route.domain
 }
 
 // validateCustomDomain is Fred's defense-in-depth check on a tenant-supplied
 // custom domain before emitting Traefik labels. Chain authoritatively
 // validates the FQDN format, reserved-suffix collisions, and global
 // uniqueness in MsgSetItemCustomDomain; this function re-runs the
-// cheap checks at emit time so a corrupted or out-of-band-set domain
+// cheap checks during plan construction so a corrupted or out-of-band-set domain
 // can never produce labels.
 //
 // Reuses billingtypes.IsValidFQDN for format. Locally rejects domains

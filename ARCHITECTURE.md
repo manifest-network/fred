@@ -610,13 +610,18 @@ stopped and rerun the same mode against unchanged input.
 That sequence and the configurable `shutdown_timeout` belong to `providerd`.
 Docker-backend has a separate fail-closed boundary. A terminal runtime storage-
 authority withdrawal publishes its first cause to the main loop, which closes
-the listener, allows up to 30 seconds for HTTP shutdown, cancels backend work,
-and waits up to 90 seconds for backend-owned goroutines. It exits status 1 even
+the listener and shares one 75-second deadline across HTTP shutdown and backend
+drain. HTTP gets at most 30 seconds; admitted imports and backend-owned workers
+receive the remaining budget. Direct Go `Backend.Stop` calls retain their
+90-second default. The binary exits status 1 even
 when that drain succeeds so a supervisor must launch a fresh `Start` to recover
 the retained evidence. A drain timeout also exits 1 and leaves the Docker client
 and durable stores open until process death so a still-running worker cannot use
-closed dependencies. A failure during `Start` happens before listener bind and
-exits 1 immediately; there is no running server or worker set to drain.
+closed dependencies. TLS validation and a temporary bind-and-close probe precede
+`Start`, so failures at those checks preserve the old pin schema. The serving
+listener binds only after successful recovery. A failure during `Start` exits 1
+without a serving listener; a final-bind conflict drains the started backend
+under the process shutdown budget before exiting 1.
 
 ## Backend Integration
 
@@ -656,8 +661,16 @@ States: Closed → Open → Half-Open → Closed
 When a backend is unhealthy, requests fail fast with `ErrCircuitOpen` rather than waiting for timeouts.
 
 **What counts as a failure:**
-- Network errors (connection refused, timeout)
-- HTTP 5xx errors (server errors)
+- Network errors, including transport timeouts while the caller remains live
+- Unexpected HTTP errors and malformed backend response envelopes
+
+**What is neutral:** an error returned after that invocation's caller context
+has been canceled or reached its own deadline is excluded from breaker health
+accounting. A private invocation marker authorizes this exclusion; matching an
+arbitrary `context.Canceled` or `DeadlineExceeded` error is insufficient. Such a
+call neither adds a failure nor resets an existing failure streak, and it frees
+its half-open slot. This health classification does not settle an ambiguous
+mutation or remove its durable retry authority.
 
 **What does NOT count as a failure (exempted via `IsSuccessful`):**
 - `ErrNotProvisioned` (HTTP 404) — valid "lease not found" from read endpoints
@@ -667,8 +680,15 @@ When a backend is unhealthy, requests fail fast with `ErrCircuitOpen` rather tha
   distinguish a configured-endpoint conflict from an intermediary-generated 409
 - `ErrInvalidState` (HTTP 409 from Restart/Update) — wrong lease state for operation
 - `ErrInsufficientResources` (HTTP 503 from Provision) — treated as a capacity signal for circuit-breaker health, but not as a settlement verdict because an intermediary may have emitted an unvalidated 503 after backend acceptance. Its `ErrCapacityRefused` subtype requires the declared envelope plus `code="insufficient_resources"`; this is a contract verdict under transport trust, not an authenticated response.
+- The exact bounded-read capacity response and `operation_completion_pending`
+  envelope — retry pressure or an earlier durable completion, without mutation
+  refusal authority
+- Restore refusals (`ErrNotRetained`, `ErrDemoteDataExceedsTier`, and a valid
+  unknown restore refusal code), plus local unbound-identity or upgrade gates
 
-This ensures that expected business conditions don't trip the circuit breaker and block backend operations.
+Complete backend inventory walks use their own bounded admission lane and do
+not trip or reset this tenant-facing breaker. Inventory remains available to
+resolve durable attempts while ordinary request traffic is unhealthy.
 
 ### Lease Actor Model (Docker backend)
 
@@ -1453,7 +1473,12 @@ Container evidence separately proves the label-derived volume and exact
 target-derived subtree, rejecting a symlink at any component. XFS startup quota
 reconciliation establishes the live kernel project tag and limits before
 readiness; the marker alone is durable project-ID authority, not proof that a
-previous tagging command completed.
+previous tagging command completed. Correct roots require only a kernel read.
+Repair uses `FS_IOC_FSGETXATTR` / `FS_IOC_FSSETXATTR` on the already-pinned root
+descriptor, preserves unrelated attributes, and re-reads the result before
+setting limits. Tenant descendants are never enumerated:
+`xfs_quota project -s -d 0` still traverses them, so it is not used for live repair. New children inherit
+the repaired root's project; historical untagged children need offline repair.
 
 The XFS allocator's ownership domain is the containing filesystem, not the
 managed directory. Project IDs and dquots are filesystem-global, while Fred
@@ -1684,8 +1709,12 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 |---|---|---|---|
 | `fred_api_requests_total` | counter | `method, path, status` | API request count. The `path` label is the matched-route TEMPLATE (e.g. `/v1/leases/{lease_uuid}/status`), with a single `unmatched` bucket for requests matching no route — bounding `path` to the finite set of registered routes + 1 (closes an unauthenticated path-scan cardinality vector, ENG-448/F28) |
 | `fred_api_request_duration_seconds` | histogram | `method, path, status` | Request latency |
-| `fred_api_rate_limit_rejections_total` | counter | `limiter` | Rate limit rejections. `limiter="global"` = the single per-IP limiter shared across all routes (no route/path dimension); `limiter="tenant"` = per-tenant limiter |
+| `fred_api_rate_limit_rejections_total` | counter | `limiter` | `global`: IP budget for tenant/observability routes; `tenant`: authenticated tenant budget; `callback_ingress`: independent callback IP budget; `callback_storage`: verified backend storage budget. No IP, route, tenant, or storage UUID labels |
 | `fred_api_non_in_flight_callbacks_total` | counter | `backend, status` | Callbacks received at ingress outside exact in-flight operation settlement, including observations later dropped by lifecycle policy |
+| `fred_maintenance_pending` | gauge | `phase` | Pending durable commands by closed phase |
+| `fred_maintenance_pending_bytes` | gauge | `phase` | Encoded pending command bytes by phase |
+| `fred_maintenance_pending_oldest_age_seconds` | gauge | `phase` | Age of the oldest pending command in each phase |
+| `fred_maintenance_admission_refusals_total` | counter | `reason` | Global capacity (`count`, `bytes`) or newcomer reservation (`reserved_count`, `reserved_bytes`) reached; existing commands can still recover |
 
 **Provisioner:**
 
@@ -1852,8 +1881,12 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_resource_cpu_allocated_ratio` | gauge | — | Allocated/total CPU |
 | `fred_docker_backend_resource_memory_allocated_ratio` | gauge | — | Allocated/total memory |
 | `fred_docker_backend_resource_disk_allocated_ratio` | gauge | — | Allocated/total physical disk. Docker includes durable `disk_mb` plus the pinned scratch allowance for every live diskless instance, even if no managed scratch directory was ultimately needed |
+| `fred_docker_backend_image_gc_total` | counter | `outcome` | Bounded collector decisions: busy, inhibited, shared, below_threshold, removed, error, panic; inhibited is diagnostic and may persist for unpinned legacy retention |
+| `fred_docker_backend_image_import_pending_bytes` | gauge | — | Durable import allocation, including completion still unknown |
+| `fred_docker_backend_image_import_total` | counter | `outcome` | Dispatched import success, failure, deadline or shutdown; owner expiry is counted before SDK unwind completes |
+| `fred_docker_backend_image_unpinned_generations` | gauge | `kind` | Active (including required compensation ancestry) versus retained generations with incomplete image pins at the latest successful inventory |
 | `fred_docker_backend_restore_demote_refused_total` | counter | `backend, reason` | Restores refused by the demote fit-gate (`checkDemoteFit`) because the retained data does not fit the requested smaller SKU tier. `reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`. Synchronous-prelude refusals — NOT counted by `restore_total` (worker-scoped); surfaced to the tenant as HTTP 422 — the `demote_exceeds_tier` string discriminator rides only the backend→fred hop (ENG-438) |
-| `fred_docker_backend_volume_quota_backfill_total` | counter | `outcome` | Startup quota-reconciliation per-volume re-application (re-tag + re-limit) attempts, `outcome` ∈ `applied`/`failed`; re-applies the immutable effective quota (`disk_mb` for stateful volumes or pinned scratch for a present diskless writable-path volume) without a re-provision. The complete inventory is attempted, then any failed application, inventory error, or durable-profile error fails startup/readiness before the normal metrics endpoint binds (ENG-454) |
+| `fred_docker_backend_volume_quota_backfill_total` | counter | `outcome` | Startup quota reconciliation (XFS root-attribute verification/repair plus limits), `outcome` ∈ `applied`/`failed`; `applied` confirms root attributes and limits, not historical descendant tagging. Re-applies the immutable effective quota (`disk_mb` for stateful volumes or pinned scratch for a present diskless writable-path volume) without a re-provision or a recursive XFS tenant-tree walk. The complete inventory is attempted, then any failed application, inventory error, or durable-profile error fails startup/readiness before the normal metrics endpoint serves requests (ENG-454) |
 | `fred_docker_backend_volume_quota_clear_failed_total` | counter | — | Failed XFS quota-clear commands during interrupted-create compensation or typed deletion; preceding block/inode proof failures are not counted. Typed authority is retained and the current backend instance fail-stops for recovery by a fresh `Start`; only historical already-absent/no-authority leaks need classified one-time manual cleanup (ENG-459/ENG-632) |
 
 **Retention:**
@@ -2028,16 +2061,27 @@ key uniqueness prevents a compromised backend from authenticating commands or
 callbacks for another backend. The legacy fleet-wide top-level key is permitted
 only outside production.
 
+Callback admission is separate from tenant and observability traffic. Its
+ingress IP bucket and authenticated storage-identity bucket each use fixed
+100 RPS / 200 burst limits. Valid HMAC evidence can pass an exhausted IP bucket
+but must still spend its storage bucket. Before JSON decoding, the canonical
+callback envelope scanner enforces 1 MiB, 256 structural tokens, and 16 nesting
+levels; both untrusted key selection and verified decoding share those bounds.
+
 The timestamp is not a nonce: the exact request can be replayed against the
 same method and URI inside the five-minute window. This is required for durable
 callback retry. Typed operation/lifecycle settlement and idempotent handlers
 make duplicates safe; method/URI binding prevents moving the signature to a
-different endpoint or operation.
+different endpoint or operation. Replays still spend the victim storage
+identity's budget until signature expiry; there is no callback replay cache.
+Production TLS and keeping callback capabilities confidential protect against
+capturing such a request.
 
 ### Defense in Depth
 
 - Input validation at API boundary
-- Rate limiting per-IP and per-tenant
+- Separate tenant/observability IP, authenticated tenant, callback IP, and
+  authenticated callback storage rate limits
 - Request size limits
 - TLS for transport security
 - Generic error messages to clients

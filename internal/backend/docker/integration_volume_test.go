@@ -1346,7 +1346,7 @@ func TestIntegration_XFS_InterruptedCreateStageRecoveryClearsQuota(t *testing.T)
 	require.NoError(t, stageDir.Sync())
 	require.NoError(t, stageDir.Close())
 
-	setupCmd := xfsProjectSetupCmd(stagePath, projID)
+	setupCmd := xfsProjectSetupCmd(dataPath, stage)
 	out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(setupCmd, mount)...).CombinedOutput()
 	require.NoError(t, err, "xfs_quota project setup for interrupted stage: %s", out)
 	limitCmd := xfsLimitCmd(projID, "20m", inodeHardLimit(20, 1024))
@@ -1414,9 +1414,10 @@ func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing
 	require.NoError(t, os.Mkdir(deleteStagePath, 0o700))
 	// Model a power loss after mkdir but before prepare's project-0 reset by
 	// deliberately charging the sibling itself to the retiring project.
-	out, err := exec.CommandContext(ctx, "xfs_quota",
-		xfsQuotaArgs(xfsProjectSetupCmd(deleteStagePath, projID), mount)...).CombinedOutput()
-	require.NoError(t, err, "tag pre-reset delete-stage fixture: %s", out)
+	preResetRoot, err := os.OpenRoot(deleteStagePath)
+	require.NoError(t, err)
+	require.NoError(t, (linuxXFSProjectAttributes{}).SetProjectID(preResetRoot, projID))
+	require.NoError(t, preResetRoot.Close())
 	parent, err := os.Open(dataPath)
 	require.NoError(t, err)
 	require.NoError(t, parent.Sync())
@@ -1444,7 +1445,7 @@ func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing
 	// proof. Read the typed kernel attribute rather than xfsprogs report prose.
 	deleteStageRoot, err := os.OpenRoot(deleteStagePath)
 	require.NoError(t, err)
-	deleteStageAttr, readAttrErr := (linuxXFSProjectAttributeReader{}).ReadProjectAttributes(deleteStageRoot)
+	deleteStageAttr, readAttrErr := (linuxXFSProjectAttributes{}).ReadProjectAttributes(deleteStageRoot)
 	closeRootErr := deleteStageRoot.Close()
 	require.NoError(t, readAttrErr)
 	require.NoError(t, closeRootErr)
@@ -1570,11 +1571,11 @@ func TestIntegration_Zfs_QuotaSet_RequiresPrivilege(t *testing.T) {
 	}
 }
 
-// TestIntegration_XFS_Backfill_TagsUntaggedVolume proves the ENG-454 startup
-// backfill mechanism: EnsureQuota (what reconcileVolumeQuotas invokes) re-tags +
-// limits a volume that a pre-CAP_SYS_ADMIN daemon left untagged and unenforced —
-// restoring measurement + enforcement with no re-provision or data move.
-func TestIntegration_XFS_Backfill_TagsUntaggedVolume(t *testing.T) {
+// TestIntegration_XFS_EnsureQuota_RepairsRootForNewWrites verifies that root-only
+// repair restores inheritance and enforcement for new files. Historical untagged
+// files remain outside the project; repairing them requires stopped-writer
+// offline maintenance, never recursive work in startup or reuse.
+func TestIntegration_XFS_EnsureQuota_RepairsRootForNewWrites(t *testing.T) {
 	mount := setupXFSLoopback(t) // requires root
 	dataPath := filepath.Join(mount, "volumes")
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
@@ -1600,17 +1601,24 @@ func TestIntegration_XFS_Backfill_TagsUntaggedVolume(t *testing.T) {
 	_, uerr := mgr.Usage(ctx, volName)
 	require.Error(t, uerr, "an untagged volume must not be measurable before backfill")
 
-	// Backfill via EnsureQuota (what reconcileVolumeQuotas invokes).
+	// Repair only the root via EnsureQuota (what reconcileVolumeQuotas invokes).
 	require.NoError(t, mgr.EnsureQuota(ctx, volName, capMiB))
 
-	// Post-backfill: measurable...
+	// Historical bytes must not be recursively charged to the repaired root.
 	used, err := mgr.Usage(ctx, volName)
-	require.NoError(t, err, "after backfill the volume must be measurable")
-	assert.GreaterOrEqual(t, used, int64(10*1024*1024), "Usage under-reports: %d", used)
+	require.NoError(t, err, "after root repair the project must be measurable")
+	assert.Less(t, used, int64(10*1024*1024), "root repair must not retag historical data")
 
-	// ...and enforced: a write past the cap is EDQUOT'd.
+	// A file created after repair inherits the project and consumes its quota.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "new-data.bin"), make([]byte, 10*1024*1024), 0600))
+	used, err = mgr.Usage(ctx, volName)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, used, int64(10*1024*1024), "new writes must be measured: %d", used)
+	assert.Less(t, used, int64(20*1024*1024), "historical data must remain outside the project")
+
+	// The new files exceed the repaired 20 MiB cap together and are rejected.
 	werr := os.WriteFile(filepath.Join(dir, "big.bin"), make([]byte, 20*1024*1024), 0600)
-	require.Error(t, werr, "a write past the backfilled cap must be quota-enforced")
+	require.Error(t, werr, "new writes past the repaired cap must be quota-enforced")
 	assert.True(t,
 		errors.Is(werr, syscall.EDQUOT) || errors.Is(werr, syscall.ENOSPC) ||
 			strings.Contains(werr.Error(), "disk quota exceeded") ||
@@ -1618,12 +1626,11 @@ func TestIntegration_XFS_Backfill_TagsUntaggedVolume(t *testing.T) {
 		"expected a quota/space error, got: %v", werr)
 }
 
-// TestIntegration_XFS_ReconcileBackfill_EndToEnd exercises the FULL startup
-// backfill wired to a real xfs manager: an active lease whose on-disk volume was
-// left untagged by a pre-CAP_SYS_ADMIN daemon is healed by reconcileVolumeQuotas
-// — becoming measurable and enforced — with no re-provision. This composes the
-// enumeration (name derivation + existence gate + SKU sizing) with the real
-// EnsureQuota, catching wiring bugs the mock-based unit test cannot.
+// TestIntegration_XFS_ReconcileBackfill_EndToEnd exercises startup reconciliation
+// against a normally created, project-tagged active volume. Reconciliation must
+// preserve accounting and tighten the original cap to the lease's disk_mb. This
+// composes enumeration (name derivation + existence gate + SKU sizing) with the
+// real EnsureQuota, catching wiring bugs the mock-based unit test cannot.
 func TestIntegration_XFS_ReconcileBackfill_EndToEnd(t *testing.T) {
 	mount := setupXFSLoopback(t) // requires root
 	dataPath := filepath.Join(mount, "volumes")
@@ -1635,24 +1642,25 @@ func TestIntegration_XFS_ReconcileBackfill_EndToEnd(t *testing.T) {
 
 	const lease = "550e8400-e29b-41d4-a716-446655440106"
 	volName := canonicalVolumeName(lease, "app", 0)
-	dir := filepath.Join(dataPath, volName)
-	require.NoError(t, os.MkdirAll(dir, 0700))
-	require.NoError(t, writeProjectIDFile(dir, 555001))
+	dir, created, err := mgr.Create(ctx, volName, 100)
+	require.NoError(t, err)
+	require.True(t, created)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "data.bin"), make([]byte, 10*1024*1024), 0600))
 
 	b := backendForReconcileTest(t, mgr, dataPath, lease, "app", "e2e-stateful", 20)
 
-	_, uerr := mgr.Usage(ctx, volName)
-	require.Error(t, uerr, "untagged volume must not be measurable before backfill")
+	used, err := mgr.Usage(ctx, volName)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, used, int64(10*1024*1024), "the fixture must already account for tenant data")
 
 	require.NoError(t, b.reconcileVolumeQuotas(ctx))
 
-	used, err := mgr.Usage(ctx, volName)
-	require.NoError(t, err, "reconcile backfill must make the volume measurable")
+	used, err = mgr.Usage(ctx, volName)
+	require.NoError(t, err, "reconciliation must preserve project accounting")
 	assert.GreaterOrEqual(t, used, int64(10*1024*1024), "Usage under-reports: %d", used)
 
 	werr := os.WriteFile(filepath.Join(dir, "big.bin"), make([]byte, 20*1024*1024), 0600)
-	require.Error(t, werr, "a write past the backfilled cap must be quota-enforced")
+	require.Error(t, werr, "reconciliation must tighten the active volume's cap from 100 to 20 MiB")
 	assert.True(t,
 		errors.Is(werr, syscall.EDQUOT) || errors.Is(werr, syscall.ENOSPC) ||
 			strings.Contains(werr.Error(), "disk quota exceeded") ||
@@ -1661,9 +1669,9 @@ func TestIntegration_XFS_ReconcileBackfill_EndToEnd(t *testing.T) {
 }
 
 // TestIntegration_XFS_ReconcileBackfill_RetainedVolume covers the retained-volume
-// arm of the backfill end-to-end: a soft-deleted (fred-retained-) volume left
-// untagged by a pre-CAP_SYS_ADMIN daemon is healed by reconcileVolumeQuotas via
-// its active retention record — the population that dominated the prod backlog.
+// arm of startup reconciliation. A normally created volume is renamed into
+// retention with its project tags intact, and reconciliation must apply the
+// retained record's smaller cap while preserving accounting.
 func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 	mount := setupXFSLoopback(t) // requires root
 	dataPath := filepath.Join(mount, "volumes")
@@ -1674,11 +1682,14 @@ func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 	require.NoError(t, err)
 
 	origLease := newIntegrationLeaseUUID()
-	retName := retainedName(canonicalVolumeName(origLease, "db", 0))
-	dir := filepath.Join(dataPath, retName)
-	require.NoError(t, os.MkdirAll(dir, 0700))
-	require.NoError(t, writeProjectIDFile(dir, 556001))
+	volName := canonicalVolumeName(origLease, "db", 0)
+	retName := retainedName(volName)
+	dir, created, err := mgr.Create(ctx, volName, 100)
+	require.NoError(t, err)
+	require.True(t, created)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "data.bin"), make([]byte, 10*1024*1024), 0600))
+	require.NoError(t, mgr.RenameVolume(ctx, volName, retName))
+	dir = filepath.Join(dataPath, retName)
 
 	b, rs := newBackendWithRetention(t)
 	b.volumes = mgr
@@ -1694,17 +1705,18 @@ func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 		CreatedAt:           time.Now(),
 	}))
 
-	_, uerr := mgr.Usage(ctx, retName)
-	require.Error(t, uerr, "untagged retained volume must not be measurable before backfill")
+	used, err := mgr.Usage(ctx, retName)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, used, int64(10*1024*1024), "the retained fixture must already account for tenant data")
 
 	require.NoError(t, b.reconcileVolumeQuotas(ctx))
 
-	used, err := mgr.Usage(ctx, retName)
-	require.NoError(t, err, "reconcile must backfill the retained volume")
+	used, err = mgr.Usage(ctx, retName)
+	require.NoError(t, err, "reconciliation must preserve retained project accounting")
 	assert.GreaterOrEqual(t, used, int64(10*1024*1024), "Usage under-reports: %d", used)
 
 	werr := os.WriteFile(filepath.Join(dir, "big.bin"), make([]byte, 20*1024*1024), 0600)
-	require.Error(t, werr, "retained volume cap must be enforced after backfill")
+	require.Error(t, werr, "reconciliation must tighten the retained volume's cap from 100 to 20 MiB")
 	assert.True(t,
 		errors.Is(werr, syscall.EDQUOT) || errors.Is(werr, syscall.ENOSPC) ||
 			strings.Contains(werr.Error(), "disk quota exceeded") ||

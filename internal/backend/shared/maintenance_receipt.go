@@ -730,15 +730,9 @@ func classifyMaintenanceReplayTx(
 	if present {
 		switch state := head.(type) {
 		case maintenanceLeaseMutationHead:
-			return MaintenanceIntentAdmissionNone, fmt.Errorf(
-				"%w for lease %q: maintenance %q is already admitted",
-				ErrMaintenanceIntentConflict, leaseUUID, state.claim.MaintenanceID(),
-			)
+			return MaintenanceIntentAdmissionNone, &maintenanceContention{leaseUUID: leaseUUID}
 		case closeLeaseMutationHead:
-			return MaintenanceIntentAdmissionNone, fmt.Errorf(
-				"%w for lease %q: close is already admitted",
-				ErrMaintenanceIntentConflict, leaseUUID,
-			)
+			return MaintenanceIntentAdmissionNone, &maintenanceContention{leaseUUID: leaseUUID}
 		case closedLeaseMutationHead:
 			return MaintenanceIntentAdmissionNone, fmt.Errorf(
 				"%w for lease %q: lease is permanently closed",
@@ -746,10 +740,7 @@ func classifyMaintenanceReplayTx(
 			)
 		case operationLeaseMutationHead:
 			if state.claim.entry.State == operationIntentPending {
-				return MaintenanceIntentAdmissionNone, fmt.Errorf(
-					"%w for lease %q: operation is already admitted",
-					ErrMaintenanceIntentConflict, leaseUUID,
-				)
+				return MaintenanceIntentAdmissionNone, &maintenanceContention{leaseUUID: leaseUUID}
 			}
 		}
 	}

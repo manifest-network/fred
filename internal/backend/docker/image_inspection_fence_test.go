@@ -38,6 +38,9 @@ func TestImageInspectionOperatorFenceStillRequiresExactCleanup(t *testing.T) {
 			// drains prior requests without asserting that their effects are absent.
 			if scenario != "absent" {
 				actual := *h.daemon.late
+				// An older process could have dispatched a helper whose image
+				// volumes were inherited. Upgrade recovery must still reap them.
+				actual.HostConfig = nil
 				if scenario == "foreign" {
 					actual.Config.Labels["fred.inspection.backend"] = "another-backend"
 				}

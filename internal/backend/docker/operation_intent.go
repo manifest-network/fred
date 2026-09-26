@@ -275,7 +275,7 @@ func (b *Backend) beginRestoreOperationIntent(
 	leaseUUID, callbackURL, lifecycleCallbackURL, tenant, providerUUID string,
 	items []backend.LeaseItem,
 	resourceProfiles []shared.SKUResourceSnapshot,
-	effectiveItems []backend.LeaseItem,
+	ingress effectiveIngressPlan,
 	healthCheckServices []string,
 	manifestPayload []byte,
 	sourceLeaseUUID string,
@@ -297,7 +297,7 @@ func (b *Backend) beginRestoreOperationIntent(
 		ProviderUUID:         providerUUID,
 		Items:                items,
 		ResourceProfiles:     resourceProfiles,
-		EffectiveItems:       effectiveItems,
+		EffectiveItems:       ingress.effectiveItems(),
 		HealthCheckServices:  healthCheckServices,
 		Manifest:             manifestPayload,
 		SourceLeaseUUID:      sourceLeaseUUID,
@@ -482,9 +482,10 @@ func operationInventoryByLease(containers []ContainerInfo) map[string][]Containe
 }
 
 // recoverOperationIntents classifies the durable write-ahead window from
-// strict Docker substrate evidence. It first classifies every intent and only
-// then settles any of them, so one ambiguous lease keeps the complete startup
-// evidence set intact and makes readiness fail closed.
+// strict Docker substrate evidence. It classifies every intent before settling
+// any of them. Unresolved physical evidence retains that lease's exact pending
+// authority while independent leases may converge; shared journal and inventory
+// failures still prevent the pass from publishing any settlement.
 func (b *Backend) recoverOperationIntents(ctx context.Context) error {
 	if b.operationSettlement == nil || b.recoveryCoordinator == nil {
 		return nil
@@ -725,8 +726,25 @@ func (b *Backend) recoverOperationIntentClaims(
 		classification, classifyErr := b.classifyOperationIntent(ctx, claim, inventory[claim.LeaseUUID()])
 		awaitRecovery := classification.waitEvidence != nil
 		if classifyErr != nil && !awaitRecovery {
-			return fmt.Errorf("%s operation intent for lease %q remains unresolved: %w",
-				claim.Kind(), claim.LeaseUUID(), classifyErr)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := b.terminalStorageAuthorityError(); err != nil {
+				return err
+			}
+			var authorityFailure *operationRecoveryAuthorityFailure
+			if errors.As(classifyErr, &authorityFailure) {
+				return fmt.Errorf("operation recovery lost durable authority: %w", authorityFailure)
+			}
+			// Classification cannot authorize an effect or a terminal callback.
+			// The unchanged journal row retains this lease's mutation fence and
+			// reservation. Unlike a positively classified transitional cohort,
+			// contradictory evidence grants no deadline-based teardown authority.
+			entry.deferred = true
+			b.logger.Warn("operation recovery retained unresolved lease authority",
+				"lease_uuid", claim.LeaseUUID(), "operation", claim.Kind(),
+				"operation_fingerprint", claim.OperationID().Fingerprint(), "error", classifyErr)
+			continue
 		}
 		// An exact Ready cohort is durable success evidence even after a process
 		// restart; the deadline only bounds a generation that remains empty or
@@ -1201,7 +1219,7 @@ func (b *Backend) validateRecoveredOperationSuccessWithPromotion(
 	if len(payload) == 0 {
 		return fmt.Errorf("durable intent has no manifest")
 	}
-	if _, err := manifest.ParsePayload(payload); err != nil {
+	if _, err := manifest.ParseStoredPayload(payload); err != nil {
 		return fmt.Errorf("parse durable operation manifest: %w", err)
 	}
 	if b.releaseStore == nil {
@@ -1288,7 +1306,7 @@ func (b *Backend) ensureRecoveredOperationSuccess(
 		return shared.OperationReleaseCommitted{}, err
 	}
 	payload := claim.Manifest()
-	stack, err := manifest.ParsePayload(payload)
+	stack, err := manifest.ParseStoredPayload(payload)
 	if err != nil {
 		return shared.OperationReleaseCommitted{}, fmt.Errorf("parse durable operation manifest: %w", err)
 	}
@@ -1444,6 +1462,14 @@ func intentItemsMatchProjection(expected, actual []backend.LeaseItem) bool {
 	return true
 }
 
+// operationRecoveryAuthorityFailure distinguishes an unreadable or inconsistent
+// durable owner from an uncertain Docker observation. The latter retains its
+// lease fence; the former cannot authorize starting the recovery workers.
+type operationRecoveryAuthorityFailure struct{ cause error }
+
+func (failure *operationRecoveryAuthorityFailure) Error() string { return failure.cause.Error() }
+func (failure *operationRecoveryAuthorityFailure) Unwrap() error { return failure.cause }
+
 func (b *Backend) classifyOperationIntent(
 	ctx context.Context,
 	claim shared.OperationIntentClaim,
@@ -1451,7 +1477,7 @@ func (b *Backend) classifyOperationIntent(
 ) (operationIntentSubstrate, error) {
 	committed, err := b.operationIntentHasCommittedRelease(claim)
 	if err != nil {
-		return operationIntentSubstrate{}, err
+		return operationIntentSubstrate{}, &operationRecoveryAuthorityFailure{cause: err}
 	}
 	if committed {
 		return operationIntentSubstrate{status: backend.CallbackStatusSuccess}, nil
@@ -1460,7 +1486,7 @@ func (b *Backend) classifyOperationIntent(
 	if claim.Kind() == shared.OperationIntentProvision {
 		active, readErr := b.releaseStore.LatestActive(claim.LeaseUUID())
 		if readErr != nil {
-			return operationIntentSubstrate{}, fmt.Errorf("read predecessor active release: %w", readErr)
+			return operationIntentSubstrate{}, &operationRecoveryAuthorityFailure{cause: fmt.Errorf("read predecessor active release: %w", readErr)}
 		}
 		classification, err = b.classifyProvisionIntentSubstrate(ctx, claim, active, all)
 	} else {
@@ -1470,7 +1496,7 @@ func (b *Backend) classifyOperationIntent(
 		return classification, err
 	}
 	if err := b.validateRestoreIntentSource(claim, classification.hasCurrent); err != nil {
-		return operationIntentSubstrate{}, err
+		return operationIntentSubstrate{}, &operationRecoveryAuthorityFailure{cause: err}
 	}
 	return classification, err
 }
@@ -1618,7 +1644,7 @@ func (b *Backend) validatePredecessorProvisionSubset(
 	if err := validateDockerResourceProfiles(release.Items, release.ResourceProfiles); err != nil {
 		return nil, nil, fmt.Errorf("predecessor active release has invalid resource authority: %w", err)
 	}
-	stack, err := manifest.ParsePayload(release.Manifest)
+	stack, err := manifest.ParseStoredPayload(release.Manifest)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse predecessor active manifest: %w", err)
 	}
@@ -1887,7 +1913,7 @@ func (b *Backend) classifyOperationIntentSubstrate(
 			waitEvidence: operationAwaitLateVisibility{},
 		}, nil
 	}
-	stack, err := manifest.ParsePayload(claim.Manifest())
+	stack, err := manifest.ParseStoredPayload(claim.Manifest())
 	if err != nil {
 		return operationIntentSubstrate{}, fmt.Errorf("parse durable operation manifest: %w", err)
 	}

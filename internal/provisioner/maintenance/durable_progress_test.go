@@ -84,6 +84,11 @@ func TestFirstMaintenanceAttemptWithOpenCircuitRemainsPendingAndRecovers(t *test
 			routing["backend-a"] = available
 			require.NoError(t, service.RecoverPending(t.Context()))
 			assert.Equal(t, 1, acceptedCalls(), "recovery executes the deferred command without a new tenant request")
+			if kind == KindUpdate {
+				assertMaintenanceLaneHeld(t, runtime, testLeaseA)
+				completeUpdateForTest(t, store, command.ID, backend.CallbackStatusSuccess)
+				require.NoError(t, service.RecoverPending(t.Context()))
+			}
 			assertMaintenanceLaneReleased(t, runtime, testLeaseA)
 			assert.Equal(t, OutcomeAccepted, service.Execute(t.Context(), command).Outcome())
 			assert.Equal(t, 1, acceptedCalls(), "same-key terminal replay is read-only")
@@ -104,7 +109,9 @@ func TestAcceptedUpdateRecoveryIsIndependentOfBackendAvailability(t *testing.T) 
 	require.NoError(t, err)
 	command := Command{ID: requestID(t, testRequestA), LeaseUUID: testLeaseA, Tenant: testTenant,
 		Kind: KindUpdate, Payload: []byte(`services: {app: {image: alpine:3.23}}`)}
-	require.Equal(t, OutcomeInternalFailure, service.Execute(t.Context(), command).Outcome())
+	require.Equal(t, OutcomeAccepted, service.Execute(t.Context(), command).Outcome())
+	completeUpdateForTest(t, store, command.ID, backend.CallbackStatusSuccess)
+	require.Error(t, service.RecoverPending(t.Context()), "confirmed payload failure must remain recoverable")
 	require.Equal(t, 1, acceptedCalls())
 	routing["backend-a"] = unavailableClient
 	require.NoError(t, service.RecoverPending(t.Context()))
@@ -141,7 +148,7 @@ func TestAcceptedUpdateTerminalLeaseRecoverySurvivesFailedSettlementAndRestart(t
 	require.NoError(t, err)
 	command := Command{ID: requestID(t, testRequestA), LeaseUUID: testLeaseA, Tenant: testTenant,
 		Kind: KindUpdate, Payload: []byte("accepted payload before terminal observation")}
-	require.Equal(t, OutcomeInternalFailure, service.Execute(t.Context(), command).Outcome())
+	require.Equal(t, OutcomeAccepted, service.Execute(t.Context(), command).Outcome())
 	state = billingtypes.LEASE_STATE_CLOSED
 	require.Error(t, service.RecoverPending(t.Context()), "failed terminal receipt must keep its live fence")
 	assertMaintenanceLaneHeld(t, runtime, testLeaseA)
@@ -167,7 +174,7 @@ func TestAcceptedUpdateTerminalLeaseRecoverySurvivesFailedSettlementAndRestart(t
 	assert.Equal(t, placement.MaintenanceOutcomeLeaseEnded, receipt.Outcome())
 	assert.Empty(t, receipt.Command().Payload())
 	assert.Zero(t, nextBackend.updateCount())
-	assert.Equal(t, 1, writes, "terminal recovery does not depend on repairing the payload authority")
+	assert.Zero(t, writes, "an unconfirmed update must never consult payload persistence, including terminal recovery")
 	assertMaintenanceLaneReleased(t, nextRuntime, testLeaseA)
 }
 
@@ -191,7 +198,9 @@ func TestAcceptedUpdatePayloadCommitBeforeReceiptFailureRecoversLocally(t *testi
 	service := newTestService(t, store, backendClient, payloads, testLeaseA)
 	command := Command{ID: requestID(t, testRequestA), LeaseUUID: testLeaseA, Tenant: testTenant,
 		Kind: KindUpdate, Payload: []byte("accepted exact bytes")}
-	require.Equal(t, OutcomeInternalFailure, service.Execute(t.Context(), command).Outcome())
+	require.Equal(t, OutcomeAccepted, service.Execute(t.Context(), command).Outcome())
+	completeUpdateForTest(t, store, command.ID, backend.CallbackStatusSuccess)
+	require.Error(t, service.RecoverPending(t.Context()), "receipt commit fails after confirmed payload persistence")
 	require.Equal(t, command.Payload, committed)
 	require.Equal(t, 1, backendClient.updateCount())
 

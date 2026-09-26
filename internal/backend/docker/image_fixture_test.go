@@ -3,7 +3,6 @@ package docker
 import (
 	"context"
 	"fmt"
-	"io"
 	"testing"
 
 	"github.com/docker/docker/api/types"
@@ -31,9 +30,6 @@ type mockImageSource struct{ mock *mockDockerClient }
 func (s mockImageSource) ClientVersion() string { return "1.51" }
 func (s mockImageSource) ServerVersion(context.Context) (types.Version, error) {
 	return types.Version{APIVersion: "1.51"}, nil
-}
-func (s mockImageSource) ImagePull(context.Context, string, dockerimage.PullOptions) (io.ReadCloser, error) {
-	return nil, fmt.Errorf("unexpected fixture manifest materialization")
 }
 func (s mockImageSource) ContainerCreate(context.Context, *container.Config, *container.HostConfig, *network.NetworkingConfig, *ocispec.Platform, string) (container.CreateResponse, error) {
 	return container.CreateResponse{}, fmt.Errorf("unexpected raw fixture container creation")

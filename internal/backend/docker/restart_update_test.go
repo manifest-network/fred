@@ -707,9 +707,9 @@ func TestDoReplace_ActivationPersistenceFailurePreservesTargetForRecovery(t *tes
 			var command leasesm.ActorCommand
 			var reply leasesm.ActorReply
 			if operation == "restart" {
-				command, reply, err = leasesm.NewRestartCommand(t.Context(), targetClaim)
+				command, reply, err = leasesm.NewRestartCommand(testMaintenanceHandoff(t, t.Context()), targetClaim)
 			} else {
-				command, reply, err = leasesm.NewUpdateCommand(t.Context(), targetClaim)
+				command, reply, err = leasesm.NewUpdateCommand(testMaintenanceHandoff(t, t.Context()), targetClaim)
 			}
 			require.NoError(t, err)
 			require.True(t, b.routeToLease(leaseUUID, command))
@@ -1239,7 +1239,7 @@ func TestContainerDiedThenRestart_Succeeds(t *testing.T) {
 		maintenanceSeedTargetReady, workerStarted, workerRelease,
 	)
 	defer cleanup()
-	command, reply, err := leasesm.NewRestartCommand(t.Context(), target)
+	command, reply, err := leasesm.NewRestartCommand(testMaintenanceHandoff(t, t.Context()), target)
 	require.NoError(t, err)
 	require.True(t, b.routeToLease(leaseUUID, command))
 
@@ -1383,7 +1383,7 @@ func routeRestartFailure(
 	// asynchronous worker has crossed and classified the substrate boundary.
 	// Keep the exact physical-evidence plan alive for the worker's lifetime.
 	t.Cleanup(cleanup)
-	command, reply, err := leasesm.NewRestartCommand(t.Context(), target)
+	command, reply, err := leasesm.NewRestartCommand(testMaintenanceHandoff(t, t.Context()), target)
 	require.NoError(t, err)
 	require.True(t, b.routeToLease(durableCallbackTestLeaseUUID, command))
 	require.NoError(t, <-reply.Result(), "restart must be accepted by the SM")
@@ -1435,7 +1435,7 @@ func TestUpdatePreflight_StaysFailed(t *testing.T) {
 		t, b.maintenanceSettlement, target, maintenanceSeedAbsent, nil, nil,
 	)
 	defer cleanup()
-	command, reply, err := leasesm.NewUpdateCommand(t.Context(), target)
+	command, reply, err := leasesm.NewUpdateCommand(testMaintenanceHandoff(t, t.Context()), target)
 	require.NoError(t, err)
 	require.True(t, b.routeToLease(durableCallbackTestLeaseUUID, command))
 	require.NoError(t, <-reply.Result(), "update must be accepted by the SM")
@@ -1578,7 +1578,7 @@ func TestDoUpdate_PreflightFailure_ReasonIsImagePullFailed(t *testing.T) {
 		ResourceProfiles: shared.CloneSKUResourceSnapshot(resourceProfiles), StackManifest: stack,
 	}}
 	b.provisionsMu.Unlock()
-	command, reply, err := leasesm.NewUpdateCommand(t.Context(), admission.target)
+	command, reply, err := leasesm.NewUpdateCommand(testMaintenanceHandoff(t, t.Context()), admission.target)
 	require.NoError(t, err)
 	require.True(t, b.routeToLease(leaseUUID, command))
 	require.NoError(t, <-reply.Result())

@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sony/gobreaker"
+	"github.com/sony/gobreaker/v2"
 
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/callbackurl"
@@ -399,9 +399,13 @@ const (
 
 // CallbackPayload is sent by backends to fred's callback endpoint.
 type CallbackPayload struct {
-	LeaseUUID string         `json:"lease_uuid"`
-	Status    CallbackStatus `json:"status"` // "success", "failed", or "deprovisioned"
-	Error     string         `json:"error,omitempty"`
+	// MaintenanceID identifies an exact restart/update completion. It is
+	// authenticated in the body and matched to the provider's pending command;
+	// ordinary lifecycle observations omit it.
+	MaintenanceID string         `json:"maintenance_id,omitempty"`
+	LeaseUUID     string         `json:"lease_uuid"`
+	Status        CallbackStatus `json:"status"` // "success", "failed", or "deprovisioned"
+	Error         string         `json:"error,omitempty"`
 	// BackendStorageID binds the observation to the backend storage lineage
 	// that produced it. Upgraded senders persist this value with new outbox
 	// entries and include it in the HMAC-covered body on every delivery.
@@ -996,6 +1000,15 @@ func isOperationCompletionPendingResponse(err error) bool {
 // one after the backend accepted the request.
 const CodeInsufficientResources = "insufficient_resources"
 
+// CodeCloseDeferred reports retryable lifecycle contention, never completed cleanup.
+const CodeCloseDeferred = "close_deferred"
+
+// CodeInvalidState disambiguates a provision-state refusal from existing ownership.
+const CodeInvalidState = "invalid_state"
+
+// ErrCloseDeferred means close must be retried after current lifecycle work settles.
+var ErrCloseDeferred = fmt.Errorf("%w: close deferred", ErrInvalidState)
+
 // Validation sub-category sentinels. These wrap ErrValidation so errors.Is(err, ErrValidation)
 // still works, while allowing callers to classify the failure without string matching.
 var (
@@ -1165,7 +1178,7 @@ type HTTPClient struct {
 	baseURL    string
 	secret     string
 	httpClient *http.Client
-	cb         *gobreaker.CircuitBreaker
+	cb         *gobreaker.CircuitBreaker[any]
 	identity   BackendStorageIdentityResolver
 
 	// One complete inventory walk may run independently of the tenant breaker.
@@ -1334,13 +1347,17 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 	transport.TLSClientConfig = connection.tlsConfig.Clone()
 
 	// Create circuit breaker
-	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+	cb := gobreaker.NewCircuitBreaker[any](gobreaker.Settings{
 		Name:        connection.name,
 		MaxRequests: cbMaxRequests,
 		Interval:    cfg.CBInterval, // 0 = don't clear counts
 		Timeout:     cbTimeout,
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
 			return counts.ConsecutiveFailures >= cbFailureThresh
+		},
+		IsExcluded: func(err error) bool {
+			_, abandoned := err.(*callerAbandonedError) //nolint:errorlint // Only this invocation's direct marker grants exclusion.
+			return abandoned
 		},
 		IsSuccessful: func(err error) bool {
 			// These errors represent client-side or capacity conditions, not backend
@@ -1376,6 +1393,7 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 				errors.Is(err, ErrInsufficientResources) ||
 				IsReadCapacity(err) ||
 				isOperationCompletionPendingResponse(err) ||
+				isLifecyclePendingResponse(err) ||
 				errors.Is(err, ErrAlreadyProvisioned) ||
 				errors.Is(err, ErrInvalidState) ||
 				errors.Is(err, ErrNotRetained) ||
@@ -1801,6 +1819,10 @@ func (c *HTTPClient) parseCapacityError(body []byte, operation string) error {
 	if err != nil {
 		return err
 	}
+	return c.capacityError(code, msg, operation)
+}
+
+func (c *HTTPClient) capacityError(code, msg, operation string) error {
 	if code == CodeInsufficientResources {
 		return detailOr(ErrCapacityRefused, msg)
 	}
@@ -1880,7 +1902,7 @@ func doGetDecoded[T any](c *HTTPClient, ctx context.Context, metric, url string,
 	start := time.Now()
 	defer func() { c.recordMetrics(metric, start, err) }()
 
-	result, cbErr := c.cb.Execute(func() (any, error) {
+	result, cbErr := c.execute(ctx, func() (any, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
@@ -1954,7 +1976,7 @@ func (c *HTTPClient) provisionCall(
 	}
 
 	var observed ProvisionCallOutcome
-	_, cbErr := c.cb.Execute(func() (any, error) {
+	_, cbErr := c.execute(ctx, func() (any, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/provision", bytes.NewReader(body))
 		if err != nil {
 			callErr := fmt.Errorf("create request: %w", err)
@@ -2003,6 +2025,8 @@ func (c *HTTPClient) provisionCall(
 				callErr := detailOr(ErrAlreadyProvisioned, msg)
 				if code == CodeOperationCompletionPending {
 					callErr = &operationCompletionPendingResponse{}
+				} else if code == CodeInvalidState {
+					callErr = detailOr(ErrInvalidState, msg)
 				}
 				observed = ambiguousProvisionCall(callErr)
 				return nil, callErr
@@ -2055,7 +2079,7 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 	}
 
 	invoked := false
-	_, cbErr := c.cb.Execute(func() (any, error) {
+	_, cbErr := c.execute(ctx, func() (any, error) {
 		invoked = true
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/deprovision", bytes.NewReader(body))
 		if err != nil {
@@ -2072,6 +2096,26 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 		}
 		defer func() { _ = resp.Body.Close() }()
 
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			code, _, err := c.parseErrorCode(readErrorBodyBytes(resp), "deprovision")
+			if err != nil {
+				return nil, err
+			}
+			if code == CodeLifecyclePending {
+				return nil, &deprovisionLifecyclePendingResponse{client: c, leaseUUID: leaseUUID}
+			}
+			return nil, fmt.Errorf("deprovision returned unknown unavailable code %q", code)
+		}
+		if resp.StatusCode == http.StatusConflict {
+			code, msg, err := c.parseErrorCode(readErrorBodyBytes(resp), "deprovision")
+			if err != nil {
+				return nil, err
+			}
+			if code == CodeCloseDeferred {
+				return nil, detailOr(ErrCloseDeferred, msg)
+			}
+			return nil, fmt.Errorf("deprovision returned unknown conflict code %q", code)
+		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("deprovision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
@@ -2348,7 +2392,7 @@ func executeHTTPMaintenanceCall[T RestartRequest | UpdateRequest](
 		return notDispatchedMaintenanceCall(fmt.Errorf("marshal %s request: %w", operation, err))
 	}
 	var observed MaintenanceCallOutcome
-	_, cbErr := c.cb.Execute(func() (any, error) {
+	_, cbErr := c.execute(ctx, func() (any, error) {
 		httpReq, err := http.NewRequestWithContext(
 			ctx, http.MethodPost, c.baseURL+"/"+operation, bytes.NewReader(body),
 		)
@@ -2394,7 +2438,7 @@ func executeHTTPMaintenanceCall[T RestartRequest | UpdateRequest](
 			observed = refusedMaintenanceCall(ErrInvalidState, MaintenanceRefusalInvalidState)
 			return nil, ErrInvalidState
 		case http.StatusServiceUnavailable:
-			callErr := c.parseCapacityError(readErrorBodyBytes(resp), operation)
+			callErr := c.parseMaintenanceAvailability(readErrorBodyBytes(resp), operation)
 			if errors.Is(callErr, ErrCapacityRefused) {
 				observed = refusedMaintenanceCall(callErr, MaintenanceRefusalCapacity)
 			} else {
@@ -2441,7 +2485,7 @@ func (c *HTTPClient) restoreCall(
 	}
 
 	var observed RestoreCallOutcome
-	_, cbErr := c.cb.Execute(func() (any, error) {
+	_, cbErr := c.execute(ctx, func() (any, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/restore", bytes.NewReader(body))
 		if err != nil {
 			callErr := fmt.Errorf("create request: %w", err)
@@ -2608,7 +2652,7 @@ func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string
 		return fmt.Errorf("marshal reconcile_custom_domain request: %w", err)
 	}
 
-	_, cbErr := c.cb.Execute(func() (any, error) {
+	_, cbErr := c.execute(ctx, func() (any, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/reconcile_custom_domain", bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
@@ -2629,6 +2673,8 @@ func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string
 			return nil, nil
 		case http.StatusNotFound:
 			return nil, ErrNotProvisioned
+		case http.StatusServiceUnavailable:
+			return nil, c.parseMaintenanceAvailability(readErrorBodyBytes(resp), "reconcile_custom_domain")
 		case http.StatusConflict:
 			return nil, ErrInvalidState
 		default:

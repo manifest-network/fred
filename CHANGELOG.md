@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `fred_docker_backend_image_import_total{outcome}` distinguishes completed
+  imports from loader deadline and shutdown expiry.
+  `fred_docker_backend_image_unpinned_generations{kind}` separates incomplete
+  active pins from expected legacy retention inhibition. (ENG-1052)
+
 - Provider-to-Docker health probes now correlate slow or failed HTTP requests
   through a validated `X-Fred-Health-Probe` diagnostic ID and completion logs
   with bounded stage timings. Docker also logs fast successful completions at
@@ -230,6 +235,78 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   any increase is still a bug requiring investigation. (ENG-632)
 
 ### Changed
+
+- Closing a lease while its worker drains returns breaker-neutral
+  `503 lifecycle_pending`. Provider close events defer through the bounded
+  scheduler; the actor keeps close ownership so canceled work settles as
+  preempted by lease close. Docker-backend shares one 75-second shutdown budget
+  across HTTP and worker drain. Admitted image imports have a separate
+  30-minute ceiling from dispatch, shortened by shutdown. For planned stops,
+  quiesce mutations and wait for outstanding import allocation to reach zero.
+  Listener availability continues to mean startup completed: a temporary bind
+  probe detects conflicts before recovery, and serving starts only after recovery.
+  Shutdown logs outstanding import allocation because its outcome counter may
+  no longer be scrapeable. (ENG-1052)
+
+- Concurrent cold preparations of one immutable image source, platform and
+  verification budget share a manager-owned download/import. Closing the first
+  lease preserves progress for surviving members. The flight owns the staging
+  slot, competes using its least-loaded live tenant and transfers that charge
+  when necessary. Each member retains its own deadline and pin authority;
+  dispatched imports keep independent completion ownership. (ENG-1052)
+
+- Image verification charges the actual retained paths, node base components
+  and symlink targets through a monotonic namespace owner. Its memory, retained
+  path and resolution-work allowances scale with `image_max_size_mb`, while fixed
+  floors preserve older pins. The saved verification budget includes consumed
+  namespace authority, preserving recovery after policy decreases. Independent
+  compressed/decoded and physical import limits remain enforced. (ENG-1052)
+
+- Image import accounting separately reserves retained metadata for decoded
+  padding after the tar terminator, including compression streams that produce
+  one retained JSON segment per decoded byte. (ENG-1052)
+
+- Registry reads retry transient connection, no-progress and availability
+  failures with a three-attempt bound. Each immutable blob owns its allowance
+  across resumes and authentication renewal. Attempts start from the immutable
+  registry URL to refresh CDN redirects; unsupported ranges
+  fall back to a full GET within that bound. HTTP 429/503 Retry-After delays are
+  bounded to 30 seconds. Retained prefixes, integrity and size checks remain
+  mandatory; completed layers and Docker imports are not replayed. (ENG-1052)
+
+- Deferred closes older than 35 minutes emit an Error and increment the bounded
+  `overdue` outcome once per retained entry. Retries continue with their existing
+  ownership and durable-effect obligations. (ENG-1052)
+
+- Image downloads share four staging slots. A sole tenant can use all four;
+  waiting tenants with fewer active downloads receive the next available slot,
+  with arrival order breaking ties. Cached and local image preparation bypasses
+  staging admission. Pending maintenance shares the existing 1,024-command /
+  64 MiB provider budget, reserving one maximum-size command for a tenant with
+  no pending work. An incumbent reaching that reserve receives typed
+  `429 maintenance_capacity_reserved`; actual provider exhaustion remains 503.
+  Exact replay and settlement remain available above the limits;
+  transaction-owned counters avoid rescanning the journal on every request.
+  Image pins have a 10,000-pin tenant share within
+  the existing 100,000-pin total; exact pin reuse and recovery remain available
+  above the share. Legacy pins without proven tenant attribution conservatively
+  consume each tenant's fresh share until positively attributed or pruned.
+  (ENG-1052)
+
+- Docker image registry requests now originate from `docker-backend` over HTTPS
+  with its process proxy settings and system CA trust. Classic `overlay2` and
+  containerd `overlayfs` are the supported image stores; other drivers fail
+  startup. Verified content is staged beside the callback journal, with bounded
+  staging/import allowances and a durable record for unknown import completion.
+  Existing shared filesystems and deployments keep their layout. Preserve these
+  records in backups, check registry reachability before upgrading, and review
+  [image upgrade requirements](DEPLOYMENT.md). First pin/backfill persistence is
+  the downgrade boundary for older binaries that reject the new journal bucket.
+  Existing pinned/local images are not rejected solely by a lower new-image
+  size cap; startup backfills legacy identities from exact existing containers.
+  New ingestion accepts repeated layers and global PAX headers, but bounds
+  layer/path counts and rejects ambiguous or unsupported filesystem structures.
+  (ENG-1052)
 
 - Load testing distinguishes authenticated fixture traffic from deliberate
   rejection traffic. Real tenant signatures use ADR-036/secp256k1, connection
@@ -784,6 +861,124 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Callback retry ownership now distinguishes observation, new commits, explicit
+  retry and handoff. Failed work cannot re-enter the fresh lane merely because
+  a replay tick occurred while it was in flight; retained and fresh work both
+  keep bounded dispatch opportunities.
+- Verified config bytes are shared through a bounded per-backend cache while
+  every manifest retains independent platform/layer validation. Legacy image
+  recovery cannot turn multi-terabyte disk headroom into unbounded namespace
+  memory; parser resources have independent construction ceilings. Exceptionally
+  large historical images exceeding these ceilings may refuse re-verification
+  when their local content is missing.
+- Image allocation admission warns above 80% of the configured import ceiling
+  and exposes bounded counters for new-image pressure and allocation refusals.
+  Exact saved-budget recovery does not emit growth-pressure observations.
+- Registry redirect chains own a ten-exchange allowance shared across metadata
+  retries and copied request handles. Private-IP redirect checks also normalize
+  IPv6 zones, legacy IPv4 forms and trailing dots.
+- Bound image registry attempts at the native HTTP exchange boundary using
+  owned, fresh HTTP/1 connections; recover from connections closed before
+  headers within the same attempt allowance. Bound complete raw tar header
+  spans, including chained hidden PAX/GNU records, before Docker import.
+  Classic cached-image selection now verifies bounded manifest/config metadata
+  and their platform/layer agreement before recording the immutable recovery
+  source. Existing cached layers remain
+  reusable without downloading them against a smaller new-image limit.
+- Writable-path image extraction now owns one byte allowance across all paths
+  and retains reservations after partial writes, cancellation or other errors.
+  Partial-write errors report bytes actually written.
+- Durable callback replay alternates dispatches between fresh and retained
+  work, preserving FIFO within each class so sustained new arrivals cannot
+  indefinitely postpone an older maintenance completion.
+
+- Image inspection uses a restricted creator that overrides image volumes with
+  tmpfs and owns the working directory, user and stopped-container settings.
+  Content reads retain image files and ownership without creating anonymous
+  volume copies. Image pins keep distinct typed verification and physical import
+  budgets; recovery retains the decoded-content bound, and import accounting
+  includes Docker's retained tar-split metadata. Positive import debt using the
+  older accounting is preserved and requires offline recovery before startup.
+  (ENG-1052)
+
+- Maintenance recovery interleaves confirmed settlement and ordinary retries
+  with independent cursors and alternating first opportunities. A slow or failing
+  completion class can no longer starve another tenant's ordinary recovery.
+  Maintenance workers transfer a single cancellation owner to the lease actor;
+  lease close and shutdown cancel compensation even after the target operation's
+  deadline has expired. (ENG-1052)
+
+- Maintenance recovery selects candidates from a compact committed projection
+  before decoding only selected receipts. Periodic pin pruning progresses
+  during downloads, while image deletion continues to protect active work.
+  Pin accounting writes require the journal's scoped lock owner. (ENG-1052)
+
+- TLS validation and a temporary listener bind probe precede startup image-pin backfill.
+  Historical manifest replay compares instance topology independently of
+  previously effective
+  custom-domain routing, while binding the exact newly admitted request to its
+  journal-owned replay authority. (ENG-1052, ENG-1055)
+
+- K3s stub failure completion and deprovision now share one per-lease command
+  fence across proof and durable publication, preventing concurrent close from
+  consuming a stale unresolved-operation claim. (ENG-1052)
+
+- A close fenced by journal-owned launch debt now returns breaker-neutral
+  `503 lifecycle_pending`, including after restart. Historical active-manifest
+  replay accepts equivalent item order while preserving exact principal and
+  item contents. Confirmed maintenance completions participate in recovery
+  independently of the ordinary bounded batch cursor. (ENG-1052)
+- Legacy image pin backfill runs only after fatal startup checks succeed.
+  Classic Docker reuses multi-platform local images by their selected config
+  identity, including content above a subsequently lowered image size cap.
+  (ENG-1052)
+
+- Images built by Docker Compose can retain its three standard build stamps.
+  Admitted metadata owns their replacements: compiled projects bind their own
+  project/service/version, and ordinary direct/helper creation writes neutral
+  values. Frozen-source compensation carries a compiler-issued service binding
+  so restored workloads remain discoverable by Compose and can be deprovisioned.
+  Other reserved labels remain rejected, and inherited build labels cannot
+  grant container ownership or redirect helper cleanup. (ENG-1052)
+
+- Custom-domain provision, restore and maintenance admission now derives durable
+  effective items and Docker labels from one ingress plan. Disabled ingress,
+  missing routable ports, invalid domains or deferred DNS no longer record a
+  domain that the container cannot emit. Exact recovery comparisons remain
+  enforced; an unresolved legacy operation retains its lease fence while
+  sibling operation recovery can continue. (ENG-1055)
+- Image downloads and imports no longer hold the provider-wide admission lock.
+  Copy-safe staging, import and extraction owners account for concurrent work;
+  unrelated cached workloads can proceed. Collection failures inhibit deletion
+  without rejecting unrelated admission, and failed/superseded image pins expire
+  unless required by active compensation. GC decisions and outstanding import
+  allocations are exported as metrics. (ENG-1052)
+- XFS root project repair uses descriptor-bound ioctls without walking tenant
+  trees, including delete-stage normalization. Callback envelope scanning now
+  bounds structural work before authentication, and maintenance completion wakes
+  its owned lane immediately with aggregate pending count/byte limits. (ENG-1051, ENG-1052)
+
+- Keep accepted updates pending until their exact authenticated maintenance
+  completion succeeds. Failed and rolled-back updates preserve the prior replay
+  payload, including after restart/recovery; payload promotion requires a
+  separate confirmed-update capability (ENG-1052).
+
+- Preserve previously admitted release history through storage-identity adoption,
+  recovery and restart even when current manifest admission rules changed.
+  Reprovision accepts an equivalent historical manifest only for the exact
+  active release, tenant, provider and item topology; journal-bound replay
+  authority is checked again before acceptance. New or changed submissions
+  retain current admission policy.
+  The offline `placement-preflight -inspect-releases` command reports policy
+  drift by lease UUID and release version without editing history (ENG-1050).
+- Make XFS quota checks on existing volumes constant-time: verify root project
+  identity/inheritance and refresh limits without recursively walking tenant
+  content during startup or relaunch (ENG-1051).
+- Drain admitted Docker Create/Start exchanges through lifecycle preemption and
+  graceful shutdown, avoiding launch debt caused by Fred's own cancellation;
+  real daemon timeouts remain conservatively fenced (ENG-1052).
+
+
 - Callback-store health validation reuses the already strictly decoded closed
   tombstone within the same fresh transaction, removing a redundant decode
   while preserving semantic, size and digest checks. Cancellation stops row
@@ -1234,9 +1429,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Docker startup quota reconciliation now attempts every expected present live
   or retained volume and then fails startup/readiness on any inventory,
   immutable-resource-authority, or quota-enforcement error. A truly fresh XFS
-  root does not need `CAP_FOWNER`, but an existing tree may need it for recursive
-  project-ID re-tagging; the backend no longer serves while a known tenant
-  volume may remain uncapped. (ENG-632)
+  root does not need `CAP_FOWNER`; repairing an existing root changes only that
+  pinned inode and logs the verified repair, without walking tenant files. The
+  backend no longer serves while a known tenant volume may remain uncapped.
+  (ENG-632)
 - XFS volume creation now prepares a parent-synced, typed hidden stage carrying
   the nonzero project ID and final managed name, writes and syncs its marker,
   applies the project tag and limits, and only then publishes the final name with
@@ -1397,7 +1593,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   snapshot or a separate proof-bearing repair procedure. (ENG-632)
 - Docker-backend shutdown no longer waits forever for a worker that ignored
   cancellation or closes shared dependencies underneath it. Backend-owned work
-  receives a fixed 90-second drain after cancellation; timeout leaves the Docker
+  receives the remaining process shutdown budget after cancellation; direct
+  `Backend.Stop` callers retain a 90-second default. Timeout leaves the Docker
   client and durable stores open, returns a typed shutdown error, and makes the
   binary exit non-zero so its supervisor restarts through normal recovery.
   Preempting lease transitions likewise refuse substrate teardown until the
@@ -1441,6 +1638,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (ENG-632)
 
 ### Security
+
+- Exclude caller-abandoned backend calls from circuit-breaker health accounting
+  without resetting real failure streaks. Encode expected close/state/capacity
+  refusals as typed non-health failures (ENG-1052).
+- Isolate callback admission from tenant rate limits and apply authenticated
+  limits by backend storage identity. Valid HMAC callbacks survive an exhausted
+  pre-authentication IP bucket (ENG-1052).
+- Bound image admission before Docker import by staging and verifying exact
+  compressed content, expanded layers and image metadata. Docker imports the
+  verified bytes without fetching them again; existing shared-filesystem
+  deployments keep their layout. Retain sampled free-space floors, bounded
+  import allocation, periodic high/low-watermark collection and durable immutable image
+  pins. Production collection requires durable exclusive ownership of its Docker
+  daemon's image cache; shared development daemons cannot delete images.
+  Dispatched imports belong to the loader and survive tenant cancellation, with
+  a 30-minute completion ceiling measured from dispatch. Backend shutdown grants
+  the remaining process drain budget before canceling imports. Imports with
+  unknown completion retain a durable allocation
+  debit across restarts, while observed terminal failures settle their allocation.
+  Unknown debit continues to count against disk headroom without preventing
+  collection of unrelated unused images. Collection metrics distinguish ordinary
+  work in progress from uncertainty requiring operator attention.
+  Containerd admission proves extraction with a stopped, journal-owned probe
+  before pinning or use, and legacy pins acquire their verified allowance by
+  exact-digest ingestion. Admission waits for live content-helper creation and
+  unpack cleanup without holding the capacity gate, including helpers started
+  during another lease's download. Settled read sessions can coexist; abandoned
+  or uncertain helper receipts prevent further containerd ingestion. Containerd image storage
+  requires an explicit `image_data_path`
+  (ENG-1052).
 
 - Log retrieval now admits one materialized response per daemon, holding its
   slot through backend cleanup and the final client write even after a timeout.
@@ -1498,7 +1725,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Docker image admission rejects reserved `fred.*`, `traefik.*`, and
   `com.docker.compose.*` labels before any workload or inspection helper is
   created, preventing inherited labels from hijacking ingress or Compose
-  lifecycle ownership. Guarded admission mints an opaque image capability; helpers
+  lifecycle ownership. The three exact Compose project/service/version build
+  stamps are admitted only as placeholders replaced by the owned creation plan.
+  Admission mints an opaque image capability; helpers
   and workloads require that capability, and Compose requires a complete prepared
   project with repulls disabled. Container creation and image setup use the exact inspected
   immutable image ID and platform, resolving multi-platform indexes to a single
@@ -1510,9 +1739,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   instead of rejecting every provision on an otherwise healthy backend.
   Manifest validation also reserves Compose labels and matches
   Unicode case-fold variants of reserved prefixes consistently with the
-  published schema. Images
-  carrying orchestration metadata, including automatic Compose build labels,
-  must be rebuilt without it. Existing containers are not rewritten automatically.
+  published schema. Images carrying other reserved orchestration metadata must
+  be rebuilt without it. Existing containers are not rewritten automatically.
 
 - XFS project IDs and dquots are filesystem-global even when
   `volume_data_path` is a subdirectory. Fred allocates across the nonzero 32-bit

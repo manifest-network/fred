@@ -56,6 +56,10 @@ var unlabelledMetricNames = []string{
 // legitimately-written Vec family apart from a collector that was renamed, or
 // added without being declared here.
 var labelledMetricNames = []string{
+	"fred_maintenance_pending",
+	"fred_maintenance_pending_bytes",
+	"fred_maintenance_pending_oldest_age_seconds",
+	"fred_maintenance_admission_refusals_total",
 	"fred_api_non_in_flight_callbacks_total",
 	"fred_api_rate_limit_rejections_total",
 	"fred_api_request_duration_seconds",
@@ -102,6 +106,7 @@ var labelledMetricNames = []string{
 // three.
 func allCollectors() []prometheus.Collector {
 	return []prometheus.Collector{
+		MaintenancePending, MaintenancePendingBytes, MaintenancePendingOldestAge, MaintenanceAdmissionRefusalsTotal,
 		// Provisioning
 		PlacementWriteFailuresTotal,
 		InFlightProvisions,

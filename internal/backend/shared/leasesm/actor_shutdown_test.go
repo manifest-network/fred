@@ -33,7 +33,7 @@ func validConstructionTestActorConfig(ctx context.Context, store LeaseProvisionS
 		RestoreWorkFn: func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome {
 			return nil
 		},
-		MaintenanceWorkFn: func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
+		MaintenanceWorkFn: func(shared.MaintenanceWorkerLifetime, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome {
 			return nil
 		},
 		OnTerminated: func(string, *LeaseActor) {},

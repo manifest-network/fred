@@ -3,7 +3,7 @@ package imageexec_test
 import (
 	"context"
 	"errors"
-	"io"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -29,7 +29,6 @@ var (
 type fakeSource struct {
 	version string
 	inspect func(context.Context, string, ...client.ImageInspectOption) (dockerimage.InspectResponse, error)
-	pull    func(context.Context, string, dockerimage.PullOptions) (io.ReadCloser, error)
 	create  func(context.Context, *container.Config, *container.HostConfig, *network.NetworkingConfig, *ocispec.Platform, string) (container.CreateResponse, error)
 }
 
@@ -40,13 +39,6 @@ func (s *fakeSource) ServerVersion(context.Context) (types.Version, error) {
 
 func (s *fakeSource) ImageInspect(ctx context.Context, ref string, opts ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
 	return s.inspect(ctx, ref, opts...)
-}
-
-func (s *fakeSource) ImagePull(ctx context.Context, ref string, opts dockerimage.PullOptions) (io.ReadCloser, error) {
-	if s.pull == nil {
-		return nil, errors.New("unexpected image pull")
-	}
-	return s.pull(ctx, ref, opts)
 }
 
 func (s *fakeSource) ContainerCreate(ctx context.Context, cfg *container.Config, host *container.HostConfig, networks *network.NetworkingConfig, platform *ocispec.Platform, name string) (container.CreateResponse, error) {
@@ -168,7 +160,7 @@ func TestAdmissionRejectsUntrustedMetadata(t *testing.T) {
 		}, want: "unsupported"},
 	}
 	for _, label := range []string{
-		"fred.lease_id", "TrAeFiK.enable", "com.docker.compose.project", "COM.DOCKER.COMPOSE.replace",
+		"fred.lease_id", "TrAeFiK.enable", "com.docker.compose.oneoff", "COM.DOCKER.COMPOSE.project", "COM.DOCKER.COMPOSE.replace",
 		"traefiK.enable", "com.docKer.compose.project", "com.docker.compoſe.project",
 	} {
 		tests = append(tests, struct {
@@ -194,11 +186,10 @@ func TestAdmissionRejectsUntrustedMetadata(t *testing.T) {
 	}
 }
 
-func TestAdmissionMaterializesSelectedLeafWithoutResolvingTagAgain(t *testing.T) {
+func TestAdmissionRequiresExplicitMaterializationWithoutResolvingTagAgain(t *testing.T) {
 	for _, present := range []bool{false, true} {
-		t.Run(map[bool]string{false: "materialize", true: "already local"}[present], func(t *testing.T) {
+		t.Run(map[bool]string{false: "requires materialization", true: "already local"}[present], func(t *testing.T) {
 			var inspections []string
-			var pulls []string
 			local := present
 			source := &fakeSource{version: "1.51"}
 			source.inspect = func(_ context.Context, ref string, opts ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
@@ -224,24 +215,28 @@ func TestAdmissionMaterializesSelectedLeafWithoutResolvingTagAgain(t *testing.T)
 					return dockerimage.InspectResponse{}, nil
 				}
 			}
-			source.pull = func(_ context.Context, ref string, _ dockerimage.PullOptions) (io.ReadCloser, error) {
-				pulls = append(pulls, ref)
-				local = true
-				return io.NopCloser(strings.NewReader("{\"status\":\"complete\"}\n")), nil
-			}
-			a, _ := newRuntime(t, source)
+			a, creator := newRuntime(t, source)
 			i, err := a.Admit(t.Context(), "registry.example/app:latest")
-			if err != nil || i.ID() != imageID || i.Reference() != "registry.example/app:latest" {
-				t.Fatalf("Admit = %q, %v", i.ID(), err)
-			}
 			wantInspections := []string{"registry.example/app:latest", indexID, imageID}
 			if !present {
-				wantInspections = append(wantInspections, imageID)
-				if !reflect.DeepEqual(pulls, []string{"registry.example/app@" + imageID}) {
-					t.Fatalf("pulls = %v", pulls)
+				var required *imageexec.MaterializationRequired
+				if !errors.As(fmt.Errorf("prepare image: %w", err), &required) {
+					t.Fatalf("missing leaf did not return a materialization requirement: %v", err)
 				}
-			} else if len(pulls) != 0 {
-				t.Fatalf("present immutable leaf required registry access: %v", pulls)
+				if required.Reference() != "registry.example/app@"+imageID || required.ID() != imageID || i.ID() != "" || local {
+					t.Fatalf("missing leaf granted authority or changed local state: image=%s requirement=%+v local=%t", i.ID(), required, local)
+				}
+				if _, createErr := creator.Create(t.Context(), i, &container.Config{}, nil, nil, "refused"); !errors.Is(createErr, imageexec.ErrInvalidImage) {
+					t.Fatalf("missing leaf authorized creation: %v", createErr)
+				}
+				// The fixture models successful bounded ingestion by the caller.
+				// Retry the selected identity, never the possibly moved tag.
+				local = true
+				i, err = a.ReAdmit(t.Context(), required.ID(), ocispec.Platform{OS: "linux", Architecture: "amd64"}, "registry.example/app:latest")
+				wantInspections = append(wantInspections, imageID)
+			}
+			if err != nil || i.ID() != imageID || i.Reference() != "registry.example/app:latest" {
+				t.Fatalf("Admit = %q, %v", i.ID(), err)
 			}
 			if !reflect.DeepEqual(inspections, wantInspections) {
 				t.Fatalf("inspections = %v; want %v", inspections, wantInspections)
@@ -250,31 +245,7 @@ func TestAdmissionMaterializesSelectedLeafWithoutResolvingTagAgain(t *testing.T)
 	}
 }
 
-func TestAdmissionNeverMintsFromFailedMaterialization(t *testing.T) {
-	for _, output := range []string{"{\"error\":\"registry denied\"}", "{\"errorDetail\":{\"message\":\"registry denied\"}}", "invalid JSON"} {
-		t.Run(output, func(t *testing.T) {
-			source := &fakeSource{version: "1.51", inspect: func(_ context.Context, ref string, _ ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
-				switch ref {
-				case "app:latest":
-					return indexImage(), nil
-				case indexID:
-					return leafImage(), nil
-				default:
-					return dockerimage.InspectResponse{}, errdefs.NotFound(errors.New("absent"))
-				}
-			}, pull: func(context.Context, string, dockerimage.PullOptions) (io.ReadCloser, error) {
-				return io.NopCloser(strings.NewReader(output)), nil
-			}}
-			a, _ := newRuntime(t, source)
-			i, err := a.Admit(t.Context(), "app:latest")
-			if err == nil || i.ID() != "" {
-				t.Fatalf("failed pull minted capability: %s, %v", i.ID(), err)
-			}
-		})
-	}
-}
-
-func TestAdmissionDoesNotPullAfterOtherInspectionFailure(t *testing.T) {
+func TestAdmissionDoesNotRequestMaterializationAfterOtherInspectionFailure(t *testing.T) {
 	for _, failure := range []error{context.Canceled, errdefs.Forbidden(errors.New("denied"))} {
 		source := &fakeSource{version: "1.51", inspect: func(_ context.Context, ref string, _ ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
 			switch ref {
@@ -285,13 +256,15 @@ func TestAdmissionDoesNotPullAfterOtherInspectionFailure(t *testing.T) {
 			default:
 				return dockerimage.InspectResponse{}, failure
 			}
-		}, pull: func(context.Context, string, dockerimage.PullOptions) (io.ReadCloser, error) {
-			t.Fatal("inspection refusal triggered registry mutation")
-			return nil, nil
 		}}
 		a, _ := newRuntime(t, source)
-		if _, err := a.Admit(t.Context(), "app:latest"); !errors.Is(err, failure) {
+		_, err := a.Admit(t.Context(), "app:latest")
+		if !errors.Is(err, failure) {
 			t.Fatalf("Admit error = %v; want %v", err, failure)
+		}
+		var required *imageexec.MaterializationRequired
+		if errors.As(err, &required) {
+			t.Fatalf("inspection failure requested materialization: %v", err)
 		}
 	}
 }

@@ -4,15 +4,10 @@ import (
 	"context"
 	"errors"
 	"net"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 type fakeResolver struct {
@@ -146,52 +141,6 @@ func TestDNSGateAllows_DelegatesToFunc(t *testing.T) {
 	assert.Equal(t, "app.example.com", called)
 }
 
-func TestDeferUnreadyCustomDomains(t *testing.T) {
-	// ENG-266 provision-path gate: zero the CustomDomain of items whose DNS
-	// isn't resolving yet (so provision emits no -custom router / no order),
-	// preserve ready ones, leave empties untouched. Mutates in place.
-	b := newBackendForTest(&mockDockerClient{}, nil)
-	b.customDomainDNSReady = func(_ context.Context, d string) bool { return d == "ready.example.com" }
-
-	items := []backend.LeaseItem{
-		{ServiceName: "app", CustomDomain: "notready.example.com"},
-		{ServiceName: "api", CustomDomain: "ready.example.com"},
-		{ServiceName: "db", CustomDomain: ""},
-	}
-	b.deferUnreadyCustomDomains(context.Background(), items, "lease-1", b.logger)
-
-	assert.Equal(t, "", items[0].CustomDomain, "not-ready domain must be deferred (zeroed)")
-	assert.Equal(t, "ready.example.com", items[1].CustomDomain, "ready domain must be preserved")
-	assert.Equal(t, "", items[2].CustomDomain, "empty stays empty")
-}
-
-func TestDeferUnreadyCustomDomains_ZeroesStoredProvItems(t *testing.T) {
-	// ENG-193 regression: enrichReserved deep-copies Items, so prov.Items is a
-	// DISTINCT array from the caller's req.Items. Deferring an unready domain
-	// must zero BOTH — otherwise the in-memory prov.Items keeps the domain while
-	// the emitted container labels (built from req.Items) have it zeroed, so
-	// ReconcileCustomDomain reads a stale "already-emitted" value and never
-	// re-applies the domain once DNS goes live.
-	b := newBackendForTest(&mockDockerClient{}, nil)
-	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return false } // defer all
-
-	// prov.Items is a separate slice from reqItems (mirrors the deep-copy), with
-	// equal values index-for-index.
-	storedItems := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "x.example.com"}}
-	b.provisionsMu.Lock()
-	b.provisions["L1"] = &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Items: storedItems}}
-	b.provisionsMu.Unlock()
-	reqItems := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "x.example.com"}}
-
-	b.deferUnreadyCustomDomains(context.Background(), reqItems, "L1", b.logger)
-
-	assert.Equal(t, "", reqItems[0].CustomDomain, "caller's slice (label-emit path) must be zeroed")
-	b.provisionsMu.RLock()
-	got := b.provisions["L1"].Items[0].CustomDomain
-	b.provisionsMu.RUnlock()
-	assert.Equal(t, "", got, "stored prov.Items must be zeroed too (distinct array post-deep-copy)")
-}
-
 func TestNewResolvers(t *testing.T) {
 	servers := []string{"1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"}
 	rs := newResolvers(servers)
@@ -224,75 +173,6 @@ func TestIngressConfig_DnsQuorum(t *testing.T) {
 			assert.Equal(t, tc.want, ic.dnsQuorum(tc.n))
 		})
 	}
-}
-
-func TestDeferUnreadyCustomDomains_SuppressesCustomLabel(t *testing.T) {
-	// End-to-end for the provision gate: the helper's mutation must actually
-	// suppress the -custom Traefik router label in the built project (ENG-266),
-	// and leave it present when the domain is ready.
-	b := newBackendForTest(&mockDockerClient{}, nil)
-	b.customDomainDNSReady = func(_ context.Context, d string) bool { return d == "ready.example.com" }
-
-	buildWebLabels := func(domain string) map[string]string {
-		params := baseProjectParams()
-		params.Stack.Services["web"] = &manifest.Manifest{
-			Image: "nginx:latest",
-			Ports: map[string]manifest.PortConfig{"80/tcp": {}},
-		}
-		params.Items[0].CustomDomain = domain
-		params.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
-		b.deferUnreadyCustomDomains(context.Background(), params.Items, params.LeaseUUID, b.logger)
-		return buildComposeProject(params).Services["web"].Labels
-	}
-
-	t.Run("not ready → no -custom router / no custom-domain label", func(t *testing.T) {
-		labels := buildWebLabels("notready.example.com")
-		assert.Empty(t, labels[LabelCustomDomain])
-		router := CustomDomainRouterName("lease-1", "web")
-		assert.NotContains(t, labels, "traefik.http.routers."+router+".rule")
-	})
-	t.Run("ready → -custom router emitted", func(t *testing.T) {
-		labels := buildWebLabels("ready.example.com")
-		assert.Equal(t, "ready.example.com", labels[LabelCustomDomain])
-	})
-}
-
-func TestDeferUnreadyCustomDomains_MutatesUnderLock(t *testing.T) {
-	// Regression for the provision-path data race: in the provision path `items`
-	// aliases the stored prov.Items, which other goroutines read under
-	// provisionsMu — so the deferral mutation must hold the lock. Run under
-	// -race with a concurrent locked reader of the same backing array; this
-	// fails without the lock and passes with it.
-	b := newBackendForTest(&mockDockerClient{}, nil)
-	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return false } // defer all
-
-	items := []backend.LeaseItem{{ServiceName: "app", CustomDomain: "notready.example.com"}}
-	b.provisionsMu.Lock()
-	b.provisions["lease-1"] = &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Items: items}}
-	b.provisionsMu.Unlock()
-
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			b.provisionsMu.RLock()
-			_ = b.provisions["lease-1"].Items[0].CustomDomain // same backing array as items[0]
-			b.provisionsMu.RUnlock()
-		}
-	}()
-
-	b.deferUnreadyCustomDomains(context.Background(), items, "lease-1", b.logger)
-	close(stop)
-	wg.Wait()
-
-	assert.Equal(t, "", items[0].CustomDomain, "not-ready domain deferred")
 }
 
 func TestIngressConfig_Validate_DNSResolvers(t *testing.T) {

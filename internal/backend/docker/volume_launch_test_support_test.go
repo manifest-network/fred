@@ -70,7 +70,8 @@ func (m *mockDockerClient) ListVolumeWriters(ctx context.Context) ([]ContainerIn
 	return m.ListManagedContainersStrict(ctx)
 }
 
-func (m *mockDockerClient) createCompensationContainer(ctx context.Context, image imageexec.Image, snapshot compensationContainer) (string, daemonLaunchOutcome) {
+func (m *mockDockerClient) createCompensationContainer(ctx context.Context, snapshot compensationContainer) (string, daemonLaunchOutcome) {
+	image := snapshot.Binding.Image()
 	if m.CreateCompensationOutcomeFn != nil {
 		return m.CreateCompensationOutcomeFn(ctx, image, snapshot)
 	}
@@ -89,19 +90,26 @@ func (m *mockDockerClient) startCompensationContainer(ctx context.Context, id st
 	return daemonLaunchOutcome{settled: err == nil, err: err}
 }
 
-func (m *mockDockerClient) readmitCompensationImage(ctx context.Context, snapshot compensationContainerRecord) (imageexec.Image, error) {
+func (m *mockDockerClient) prepareCompensationContainer(ctx context.Context, subject shared.MaintenanceCompensationSubject, snapshot compensationContainerRecord) (compensationContainer, error) {
+	var image imageexec.Image
+	var err error
 	if m.ReadmitCompensationImageFn != nil {
-		return m.ReadmitCompensationImageFn(ctx, snapshot)
+		image, err = m.ReadmitCompensationImageFn(ctx, snapshot)
+	} else {
+		image, err = m.AdmitImage(ctx, snapshot.ImageID)
 	}
-	return m.AdmitImage(ctx, snapshot.ImageID)
+	if err != nil {
+		return compensationContainer{}, err
+	}
+	return bindCompensationContainer(m.imageAdmitter(), subject, snapshot, image)
 }
 
-func (p testDockerMutationProxy) createCompensationContainer(ctx context.Context, image imageexec.Image, snapshot compensationContainer) (string, daemonLaunchOutcome) {
+func (p testDockerMutationProxy) createCompensationContainer(ctx context.Context, snapshot compensationContainer) (string, daemonLaunchOutcome) {
 	sink, err := p.sink()
 	if err != nil {
 		return "", daemonLaunchOutcome{settled: true, err: err}
 	}
-	return sink.createCompensationContainer(ctx, image, snapshot)
+	return sink.createCompensationContainer(ctx, snapshot)
 }
 
 func (p testDockerMutationProxy) startCompensationContainer(ctx context.Context, id string, timeout time.Duration) daemonLaunchOutcome {
@@ -112,10 +120,10 @@ func (p testDockerMutationProxy) startCompensationContainer(ctx context.Context,
 	return sink.startCompensationContainer(ctx, id, timeout)
 }
 
-func (p testDockerMutationProxy) readmitCompensationImage(ctx context.Context, snapshot compensationContainerRecord) (imageexec.Image, error) {
+func (p testDockerMutationProxy) prepareCompensationContainer(ctx context.Context, subject shared.MaintenanceCompensationSubject, snapshot compensationContainerRecord) (compensationContainer, error) {
 	sink, err := p.sink()
 	if err != nil {
-		return imageexec.Image{}, err
+		return compensationContainer{}, err
 	}
-	return sink.readmitCompensationImage(ctx, snapshot)
+	return sink.prepareCompensationContainer(ctx, subject, snapshot)
 }

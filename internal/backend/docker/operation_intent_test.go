@@ -96,6 +96,10 @@ func (j *blockingOperationIntentJournal) NewOperationIntentProbe(
 	return j.delegate.NewOperationIntentProbe(leaseUUID, callbackURL)
 }
 
+func (j *blockingOperationIntentJournal) AdmitProvisionManifest(ctx context.Context, lease, tenant, provider string, items []backend.LeaseItem, payload []byte) (shared.ProvisionManifestAdmission, error) {
+	return j.delegate.AdmitProvisionManifest(ctx, lease, tenant, provider, items, payload)
+}
+
 func (j *blockingOperationIntentJournal) NewOperationIntentCandidate(
 	spec shared.OperationIntentSpec,
 ) (shared.OperationIntentCandidate, error) {
@@ -544,9 +548,11 @@ func TestRecoverOperationIntent_BoundsContainerInspection(t *testing.T) {
 	}
 
 	forbidOperationRecoveryTeardown(t, b)
+	warnings := captureOperationRecoveryWarnings(b)
 	started := time.Now()
 	err = b.recoverOperationIntents(context.Background())
-	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.NoError(t, err)
+	require.Contains(t, warnings.String(), context.DeadlineExceeded.Error())
 	assert.Less(t, time.Since(started), time.Second,
 		"a stalled Docker inspection must not wedge operation recovery")
 	intents, listErr := listOperationIntentsForCallbackTest(t, store)
@@ -1465,8 +1471,10 @@ func TestRecoverOperationIntent_NonterminalCandidateRejectsContradictoryPredeces
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
+	warnings := captureOperationRecoveryWarnings(b)
 	err = b.recoverOperationIntents(ctx)
-	require.ErrorContains(t, err, "different tenant or provider")
+	require.NoError(t, err)
+	require.Contains(t, warnings.String(), "different tenant or provider")
 	assert.Zero(t, teardownCalls, "contradictory predecessor evidence cannot mint lease-wide teardown authority")
 	intents, listErr := listOperationIntentsForCallbackTest(t, store)
 	require.NoError(t, listErr)
@@ -2954,6 +2962,9 @@ func TestProvisionIntentToReservationWindowIsFencedAgainstDeprovision(t *testing
 	require.NoError(t, <-provisionDone)
 	select {
 	case err := <-deprovisionDone:
+		if leasesm.IsLifecyclePending(err) {
+			err = deprovisionAfterWorkerDrain(t, t.Context(), b, req.LeaseUUID)
+		}
 		require.NoError(t, err)
 	case <-time.After(3 * time.Second):
 		t.Fatal("deprovision did not complete after provision published its reservation")
@@ -3476,8 +3487,10 @@ func TestRecoverOperationIntentRejectsAmbiguousLegacyPredecessor(t *testing.T) {
 				return nil
 			}}
 			forbidOperationRecoveryTeardown(t, b)
+			warnings := captureOperationRecoveryWarnings(b)
 			err = b.recoverOperationIntents(context.Background())
-			require.ErrorContains(t, err, tc.want)
+			require.NoError(t, err)
+			require.Contains(t, warnings.String(), tc.want)
 			assert.Zero(t, downCalls)
 			intents, listErr := listOperationIntentsForCallbackTest(t, store)
 			require.NoError(t, listErr)
@@ -3851,12 +3864,14 @@ func TestRecoverOperationIntent_RequiresExactManifestImageAndEffectiveDomain(t *
 			)
 
 			forbidOperationRecoveryTeardown(t, b)
+			warnings := captureOperationRecoveryWarnings(b)
 			err = b.recoverOperationIntents(context.Background())
 			if tt.wantOK {
 				require.NoError(t, err)
 				return
 			}
-			require.ErrorContains(t, err, tt.want)
+			require.NoError(t, err)
+			require.Contains(t, warnings.String(), tt.want)
 			intents, listErr := listOperationIntentsForCallbackTest(t, store)
 			require.NoError(t, listErr)
 			assert.Len(t, intents, 1)

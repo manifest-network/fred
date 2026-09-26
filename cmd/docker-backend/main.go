@@ -154,15 +154,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start backend only after the marker and Docker substrate match.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := b.Start(ctx); err != nil {
-		cancel()
-		logger.Error("failed to start backend", "error", err)
-		os.Exit(1)
-	}
-	cancel()
-
 	// Create server
 	server, err := NewIdentityBoundServer(
 		b, string(cfg.CallbackSecret), logger, cfg.MaxRequestBodySize, b.StorageIdentity(),
@@ -172,8 +163,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Build the listener TLS config up front so a bad cert fails fast before we
-	// announce readiness. Config.Validate (run in docker.New) already enforces
+	// Build the listener TLS config before Start can publish optional image
+	// pins. Config.Validate already enforces
 	// field pairing; ServerConfig loads and parses the actual files.
 	var tlsServerConfig *tls.Config
 	if cfg.TLSCertFile != "" {
@@ -187,41 +178,32 @@ func main() {
 	// Setup HTTP server
 	httpServer := &http.Server{
 		Addr:         cfg.ListenAddr,
-		Handler:      server.Handler(),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
 		TLSConfig:    tlsServerConfig, // nil => plaintext HTTP
 	}
 
-	// Start HTTP server
-	serverErr := make(chan error, 1)
-	go func() {
-		var serveErr error
-		if tlsServerConfig != nil {
-			logger.Info("starting HTTPS server", "addr", cfg.ListenAddr,
-				"mtls", cfg.TLSClientCAFile != "", "pinned_names", len(cfg.TLSClientAllowedNames))
-			// The cert/key live in tlsServerConfig.Certificates (loaded by
-			// tlsconfig.ServerConfig), so the file arguments are empty.
-			serveErr = httpServer.ListenAndServeTLS("", "")
-		} else {
-			logger.Info("starting HTTP server", "addr", cfg.ListenAddr)
-			serveErr = httpServer.ListenAndServe()
-		}
-		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			serverErr <- serveErr
-		}
-	}()
+	// Probe listener availability before recovery; bind the serving listener only
+	// after Start succeeds so TCP readiness continues to mean ready.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	serverErr, err := startAndServeBackend(ctx, httpServer, server.Handler(), b)
+	cancel()
+	if err != nil {
+		logger.Error("failed to start backend", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("backend HTTP server ready", "addr", cfg.ListenAddr,
+		"tls", tlsServerConfig != nil, "mtls", cfg.TLSClientCAFile != "",
+		"pinned_names", len(cfg.TLSClientAllowedNames))
 
 	// Wait for an operator signal, listener failure, or a terminal storage
 	// authority withdrawal. The last case must return a non-zero process status:
 	// its typed on-disk recovery evidence is consumed only by a fresh Start.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	// startupErr captures a ListenAndServe failure (port in use, bind refused,
-	// etc.) so the process can exit non-zero after the graceful-shutdown path
-	// runs. Without this, supervisors / k8s liveness probes / CI would see the
-	// "binary that never bound" as a successful run.
+	// A serving failure must still exit non-zero after graceful shutdown, so
+	// the supervisor can distinguish it from an operator-requested stop.
 	trigger := waitForShutdownTrigger(sigCh, serverErr, b.TerminalStorageAuthorityFailure())
 	var (
 		startupErr          = trigger.serverErr
@@ -237,18 +219,14 @@ func main() {
 			"error", storageAuthorityErr)
 	}
 
-	// Graceful shutdown
-	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := httpServer.Shutdown(ctx); err != nil {
-		logger.Error("HTTP shutdown error", "error", err)
+	// One process-owned budget includes HTTP and worker drain, leaving margin
+	// inside the deployed service manager's default 90-second stop timeout.
+	httpShutdownErr, backendShutdownErr := drainHTTPAndBackend(context.Background(), httpServer, b)
+	if httpShutdownErr != nil {
+		logger.Error("HTTP shutdown error", "error", httpShutdownErr)
 	}
-
-	var backendShutdownErr error
-	if err := b.Stop(); err != nil {
-		backendShutdownErr = err
-		logger.Error("backend shutdown error", "error", err)
+	if backendShutdownErr != nil {
+		logger.Error("backend shutdown error", "error", backendShutdownErr)
 	}
 	// If an operator/listener event won the initial select concurrently with a
 	// storage latch, observe the buffered first cause after all backend workers
@@ -662,6 +640,10 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 				"an earlier operation completion is pending", backend.CodeOperationCompletionPending)
 			return
 		}
+		if errors.Is(err, backend.ErrInvalidState) {
+			s.errorResponseWithCode(w, http.StatusConflict, "invalid state for provision", backend.CodeInvalidState)
+			return
+		}
 		if errors.Is(err, backend.ErrAlreadyProvisioned) {
 			s.errorResponse(w, http.StatusConflict, "lease already provisioned")
 			return
@@ -764,6 +746,13 @@ func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.backend.Deprovision(r.Context(), req.LeaseUUID); err != nil {
+		if s.lifecyclePendingResponse(w, err) {
+			return
+		}
+		if errors.Is(err, backend.ErrInvalidState) {
+			s.errorResponseWithCode(w, http.StatusConflict, "close is deferred until lifecycle work settles", backend.CodeCloseDeferred)
+			return
+		}
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -796,6 +785,9 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	}
 	err := s.backend.Restart(r.Context(), req)
 	if err != nil {
+		if s.lifecyclePendingResponse(w, err) {
+			return
+		}
 		if errors.Is(err, backend.ErrNotProvisioned) {
 			s.errorResponse(w, http.StatusNotFound, "not provisioned")
 			return
@@ -936,6 +928,9 @@ func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Requ
 	}
 
 	if err := s.backend.ReconcileCustomDomain(r.Context(), req.LeaseUUID, req.Items); err != nil {
+		if s.lifecyclePendingResponse(w, err) {
+			return
+		}
 		// Surface ErrNotProvisioned and ErrInvalidState as 404/409 so the
 		// HTTPClient can map them back to typed errors. Both signal benign
 		// races (lease just deprovisioned, or status flipped between our
@@ -949,6 +944,10 @@ func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Requ
 		}
 		if errors.Is(err, backend.ErrInvalidState) {
 			s.errorResponse(w, http.StatusConflict, "invalid state for reconcile")
+			return
+		}
+		if errors.Is(err, backend.ErrInsufficientResources) {
+			s.errorResponseWithCode(w, http.StatusServiceUnavailable, "insufficient resources", backend.CodeInsufficientResources)
 			return
 		}
 		s.logger.Error("reconcile_custom_domain failed", "lease_uuid", req.LeaseUUID, "error", err)
@@ -989,6 +988,9 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	err := s.backend.Update(r.Context(), req)
 	if err != nil {
+		if s.lifecyclePendingResponse(w, err) {
+			return
+		}
 		if errors.Is(err, backend.ErrNotProvisioned) {
 			s.errorResponse(w, http.StatusNotFound, "not provisioned")
 			return
@@ -1143,7 +1145,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := s.backend.Stats()
 	load, err := stats.RoutingLoadStats()
 	if err != nil {
-		s.errorResponse(w, http.StatusServiceUnavailable, err.Error())
+		s.errorResponseWithCode(w, http.StatusServiceUnavailable, err.Error(), backend.CodeInsufficientResources)
 		return
 	}
 

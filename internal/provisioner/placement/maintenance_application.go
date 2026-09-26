@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +35,7 @@ const (
 	MaintenanceApplicationCommandConflict
 	MaintenanceApplicationBackendInvalidState
 	MaintenanceApplicationBackendValidation
+	MaintenanceApplicationCapacityReserved
 	MaintenanceApplicationServiceUnavailable
 	MaintenanceApplicationInternalFailure
 )
@@ -109,7 +108,7 @@ type MaintenanceApplication struct {
 	heldMu          sync.Mutex
 	held            map[string]*maintenanceHeld
 	recoveryMu      sync.Mutex
-	recoveryCursor  map[string]string
+	recovery        maintenanceRecoveryScheduler
 }
 
 type maintenanceHeld struct {
@@ -136,18 +135,19 @@ func (authority *MaintenanceCoordinator) Application(
 		coordinator: authority, issuer: authority.marker, events: events,
 		recoveryTimeout: recoveryTimeout,
 		held:            make(map[string]*maintenanceHeld),
-		recoveryCursor:  make(map[string]string),
+		recovery:        newMaintenanceRecoveryScheduler(),
 	}
 	if err := application.rehydrate(); err != nil {
 		return nil, err
 	}
+	application.observePending()
 	return application, nil
 }
 
 func (application *MaintenanceApplication) Valid() bool {
 	return application != nil && application.coordinator != nil &&
 		application.coordinator.Valid() && application.issuer == application.coordinator.marker &&
-		application.held != nil && application.recoveryCursor != nil &&
+		application.held != nil && application.recovery.valid() &&
 		application.recoveryTimeout > 0
 }
 
@@ -202,6 +202,7 @@ func (application *MaintenanceApplication) Execute(
 	if !application.Valid() || !input.valid() {
 		return maintenanceApplicationResult(MaintenanceApplicationInternalFailure, ErrInvalidMaintenanceCommand)
 	}
+	defer application.observePending()
 	record, found, err := application.coordinator.lookupMaintenanceCommand(input.leaseUUID, input.id)
 	if err != nil {
 		return maintenanceApplicationResult(MaintenanceApplicationServiceUnavailable, err)
@@ -228,11 +229,12 @@ func (application *MaintenanceApplication) Execute(
 		}
 	}
 
+	completionChanged := application.coordinator.coordinator.store.completionCheckpoint()
 	held, acquired := application.acquire(input.leaseUUID, input.id)
 	if held == nil {
 		return maintenanceApplicationResult(MaintenanceApplicationAlreadyInProgress, nil)
 	}
-	defer held.dispatchMu.Unlock()
+	defer func() { held.dispatchMu.Unlock(); completionChanged() }()
 
 	record, found, err = application.coordinator.lookupMaintenanceCommand(input.leaseUUID, input.id)
 	if err != nil {
@@ -330,6 +332,10 @@ func resultForPreparation(preparation MaintenancePreparation) MaintenanceApplica
 }
 
 func resultForMaintenanceBeginError(err error) MaintenanceApplicationResult {
+	if refusal, reserved := err.(maintenanceReservationRefusal); reserved && //nolint:errorlint // Only an exact source refusal proves the complete authority boundary succeeded.
+		(refusal.reservation == maintenanceCountReserved || refusal.reservation == maintenanceBytesReserved) {
+		return maintenanceApplicationResult(MaintenanceApplicationCapacityReserved, err)
+	}
 	switch {
 	case errors.Is(err, ErrMaintenanceCommandConflict):
 		return maintenanceApplicationResult(MaintenanceApplicationCommandConflict, err)
@@ -356,7 +362,7 @@ func resultForMaintenanceOutcome(outcome MaintenanceCommandOutcome) MaintenanceA
 		return maintenanceApplicationResult(MaintenanceApplicationAccepted, nil)
 	case MaintenanceOutcomeNotProvisioned:
 		return maintenanceApplicationResult(MaintenanceApplicationNotFound, nil)
-	case MaintenanceOutcomeInvalidState:
+	case MaintenanceOutcomeInvalidState, MaintenanceOutcomeExecutionFailed:
 		return maintenanceApplicationResult(MaintenanceApplicationBackendInvalidState, nil)
 	case MaintenanceOutcomeValidationRejected:
 		return maintenanceApplicationResult(MaintenanceApplicationBackendValidation, nil)
@@ -373,16 +379,13 @@ func resultForMaintenanceOutcome(outcome MaintenanceCommandOutcome) MaintenanceA
 }
 
 func (application *MaintenanceApplication) attach(held *maintenanceHeld, leaseUUID string, id maintenanceid.ID) error {
-	claims, err := application.coordinator.pendingMaintenanceCommands()
+	claim, pending, err := application.coordinator.coordinator.store.pendingMaintenanceClaim(leaseUUID, id)
 	if err != nil {
 		return err
 	}
-	for _, claim := range claims {
-		command := claim.Command()
-		if claim.Valid() && command.LeaseUUID() == leaseUUID && command.ID() == id {
-			held.journalClaim = claim
-			return nil
-		}
+	if pending {
+		held.journalClaim = claim
+		return nil
 	}
 	return errors.New("pending maintenance record has no settlement capability")
 }
@@ -456,13 +459,19 @@ func (application *MaintenanceApplication) reauthorizeAndDispatch(
 		application.release(held.journalClaim.Command().LeaseUUID(), held)
 		return resultForMaintenanceOutcome(reauthorization.Outcome())
 	}
+	if reauthorization.waiting.valid() {
+		return maintenanceApplicationResult(MaintenanceApplicationAccepted, nil)
+	}
 	if reauthorization.payload.valid() {
-		completion := application.coordinator.completeAcceptedUpdate(reauthorization.payload)
+		completion := application.coordinator.completeConfirmedUpdate(reauthorization.payload)
 		if completion.Err() != nil {
 			return maintenanceApplicationResult(MaintenanceApplicationInternalFailure, completion.Err())
 		}
-		application.release(held.journalClaim.Command().LeaseUUID(), held)
-		return resultForMaintenanceOutcome(completion.Outcome())
+		if completion.Settled() {
+			application.release(held.journalClaim.Command().LeaseUUID(), held)
+			return resultForMaintenanceOutcome(completion.Outcome())
+		}
+		return maintenanceApplicationResult(MaintenanceApplicationAccepted, nil)
 	}
 	if !reauthorization.Authorized() {
 		return maintenanceApplicationResult(MaintenanceApplicationInternalFailure,
@@ -496,6 +505,9 @@ func (application *MaintenanceApplication) dispatch(
 		if completion.CallErr() != nil {
 			return false, completion.CallErr()
 		}
+		if !completion.Settled() && completion.BackendAccepted() {
+			return true, nil // Accepted asynchronous work remains durably fenced.
+		}
 		if !completion.Settled() || completion.Outcome() != MaintenanceOutcomeAccepted {
 			return completion.BackendAccepted(), errors.New("maintenance execution did not produce an accepted receipt")
 		}
@@ -528,7 +540,7 @@ func (application *MaintenanceApplication) dispatch(
 	return maintenanceApplicationResult(MaintenanceApplicationServiceUnavailable, err)
 }
 
-func (application *MaintenanceApplication) releaseSettled() error {
+func (application *MaintenanceApplication) releaseSettled(pending map[string]maintenanceRecoveryCandidate) error {
 	application.heldMu.Lock()
 	entries := make(map[string]*maintenanceHeld, len(application.held))
 	for leaseUUID, held := range application.held {
@@ -537,6 +549,9 @@ func (application *MaintenanceApplication) releaseSettled() error {
 	application.heldMu.Unlock()
 	var errs []error
 	for leaseUUID, held := range entries {
+		if candidate, found := pending[leaseUUID]; found && candidate.id == held.id {
+			continue // A committed pending projection needs no payload decode.
+		}
 		// A live request owns its own settlement and release. Waiting here would
 		// hold every backend's recovery behind that request's independent context.
 		if !held.dispatchMu.TryLock() {
@@ -561,51 +576,6 @@ func (application *MaintenanceApplication) releaseSettled() error {
 	return errors.Join(errs...)
 }
 
-type maintenanceRecoveryEntry struct {
-	claim MaintenanceCommandClaim
-	held  *maintenanceHeld
-}
-
-func maintenanceRecoveryKey(claim MaintenanceCommandClaim) string {
-	command := claim.Command()
-	if !command.Valid() {
-		return ""
-	}
-	return command.LeaseUUID() + "\x00" + command.ID().String()
-}
-
-func maintenanceRecoveryBatch(
-	pending []maintenanceRecoveryEntry,
-	after string,
-	limit int,
-) []maintenanceRecoveryEntry {
-	if len(pending) == 0 || limit <= 0 {
-		return nil
-	}
-	ordered := slices.Clone(pending)
-	slices.SortFunc(ordered, func(left, right maintenanceRecoveryEntry) int {
-		return strings.Compare(maintenanceRecoveryKey(left.claim), maintenanceRecoveryKey(right.claim))
-	})
-	start := 0
-	if after != "" {
-		start, _ = slices.BinarySearchFunc(ordered, after, func(entry maintenanceRecoveryEntry, target string) int {
-			return strings.Compare(maintenanceRecoveryKey(entry.claim), target)
-		})
-		for start < len(ordered) && maintenanceRecoveryKey(ordered[start].claim) <= after {
-			start++
-		}
-		if start == len(ordered) {
-			start = 0
-		}
-	}
-	count := min(limit, len(ordered))
-	batch := make([]maintenanceRecoveryEntry, 0, count)
-	for offset := range count {
-		batch = append(batch, ordered[(start+offset)%len(ordered)])
-	}
-	return batch
-}
-
 // RecoverPending owns recovery selection, exact reauthorization, backend
 // invocation, and settlement. Callers cannot choose a claim or outcome.
 func (application *MaintenanceApplication) RecoverPending(ctx context.Context) error {
@@ -619,63 +589,61 @@ func (application *MaintenanceApplication) RecoverPending(ctx context.Context) e
 		return nil
 	}
 	defer application.recoveryMu.Unlock()
-	if err := application.releaseSettled(); err != nil {
-		return fmt.Errorf("release durably settled maintenance claims: %w", err)
-	}
-	claims, err := application.coordinator.pendingMaintenanceCommands()
+	defer application.observePending()
+	snapshot, err := application.coordinator.coordinator.store.maintenanceRecoverySnapshot()
 	if err != nil {
 		return err
 	}
+	if err := application.releaseSettled(snapshot); err != nil {
+		return fmt.Errorf("release durably settled maintenance claims: %w", err)
+	}
 	byBackend := make(map[string][]maintenanceRecoveryEntry)
-	for _, claim := range claims {
-		command := claim.Command()
+	for _, candidate := range snapshot {
 		application.heldMu.Lock()
-		held := application.held[command.LeaseUUID()]
+		held := application.held[candidate.lease]
 		application.heldMu.Unlock()
-		if held == nil || held.id != command.ID() {
-			return fmt.Errorf("pending maintenance %s for lease %s has no lifecycle claim", command.ID(), command.LeaseUUID())
+		if held == nil || held.id != candidate.id {
+			// A callback may have settled and released this exact entry after
+			// the scheduling snapshot. Only its durable receipt can prove that.
+			_, pending, lookupErr := application.coordinator.coordinator.store.pendingMaintenanceClaim(candidate.lease, candidate.id)
+			if lookupErr != nil {
+				return lookupErr
+			}
+			if !pending {
+				continue
+			}
+			return fmt.Errorf("pending maintenance %s for lease %s has no lifecycle claim", candidate.id, candidate.lease)
 		}
-		byBackend[command.BackendName()] = append(byBackend[command.BackendName()], maintenanceRecoveryEntry{claim: claim, held: held})
+		byBackend[candidate.backend] = append(byBackend[candidate.backend], maintenanceRecoveryEntry{candidate: candidate, held: held})
 	}
-	for backendName := range application.recoveryCursor {
-		if _, pending := byBackend[backendName]; !pending {
-			delete(application.recoveryCursor, backendName)
-		}
-	}
-	type laneResult struct {
-		backendName string
-		lastKey     string
-		errs        []error
-	}
-	results := make(chan laneResult, len(byBackend))
+	application.recovery.retain(byBackend)
+	results := make(chan []error, len(byBackend))
 	var group sync.WaitGroup
 	for backendName, entries := range byBackend {
-		backendName := backendName
-		batch := maintenanceRecoveryBatch(entries, application.recoveryCursor[backendName], maxMaintenanceRecoveryCommandsPerBackendPass)
+		pass := application.recovery.begin(backendName, entries)
 		group.Go(func() {
-			result := laneResult{backendName: backendName}
+			var laneErrors []error
 			laneCtx, cancel := context.WithTimeout(ctx, application.recoveryTimeout)
 			defer cancel()
-			for _, entry := range batch {
-				if laneCtx.Err() != nil {
+			for {
+				entry, selected := pass.next(laneCtx)
+				if !selected {
 					break
 				}
-				result.lastKey = maintenanceRecoveryKey(entry.claim)
 				// A live request may own the command after selection. Its dispatch
 				// remains exclusive; a later recovery batch can revisit it.
+				completionChanged := application.coordinator.coordinator.store.completionCheckpoint()
 				if !entry.held.dispatchMu.TryLock() {
 					continue
 				}
-				command := entry.claim.Command()
-				record, found, recoverErr := application.coordinator.lookupMaintenanceCommand(command.LeaseUUID(), command.ID())
+				candidate := entry.candidate
+				claim, pending, recoverErr := application.coordinator.coordinator.store.pendingMaintenanceClaim(candidate.lease, candidate.id)
 				switch {
 				case recoverErr != nil:
-				case !found:
-					recoverErr = errors.New("retained maintenance claim has no durable command")
-				case record.Outcome() != MaintenanceOutcomePending:
-					application.release(command.LeaseUUID(), entry.held)
+				case !pending:
+					application.release(candidate.lease, entry.held)
 				default:
-					entry.held.journalClaim = entry.claim
+					entry.held.journalClaim = claim
 					applied := application.reauthorizeAndDispatch(laneCtx, entry.held)
 					if applied.outcome != MaintenanceApplicationAccepted &&
 						applied.outcome != MaintenanceApplicationNotFound &&
@@ -685,21 +653,19 @@ func (application *MaintenanceApplication) RecoverPending(ctx context.Context) e
 					}
 				}
 				entry.held.dispatchMu.Unlock()
+				completionChanged()
 				if recoverErr != nil {
-					result.errs = append(result.errs, fmt.Errorf("recover maintenance %s for lease %s: %w", command.ID(), command.LeaseUUID(), recoverErr))
+					laneErrors = append(laneErrors, fmt.Errorf("recover maintenance %s for lease %s: %w", candidate.id, candidate.lease, recoverErr))
 				}
 			}
-			results <- result
+			results <- laneErrors
 		})
 	}
 	group.Wait()
 	close(results)
 	var errs []error
-	for result := range results {
-		if result.lastKey != "" {
-			application.recoveryCursor[result.backendName] = result.lastKey
-		}
-		errs = append(errs, result.errs...)
+	for laneErrors := range results {
+		errs = append(errs, laneErrors...)
 	}
 	return errors.Join(errs...)
 }

@@ -26,7 +26,7 @@ func TestFailureDiagnosticsRetirementRequiresExactTerminalReceiptWhenHeadAbsent(
 		Logs: map[string]string{"web/0": "only captured failure"}, Status: DiagnosticCaptureComplete,
 	})
 	require.NoError(t, err)
-	failed, ok := fixture.settlement.ExecuteMaintenance(t.Context(), execution).(MaintenanceExecutionFailure)
+	failed, ok := fixture.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution).(MaintenanceExecutionFailure)
 	require.True(t, ok)
 	proof, err := fixture.settlement.FailMaintenance(failed, backend.ReasonRestartFailed, "startup failed")
 	require.NoError(t, err)
@@ -64,7 +64,7 @@ func TestFailureDiagnosticsRetainsConstantCaptureCountAcrossManyFailedAttempts(t
 		require.NoError(t, diagnostics.RetireHistoricalCapture(capture))
 		_, _, err = capture.Snapshot()
 		require.NoError(t, err, "pending exact attempt must retain its only captured logs")
-		failed, ok := fixture.settlement.ExecuteMaintenance(t.Context(), execution).(MaintenanceExecutionFailure)
+		failed, ok := fixture.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution).(MaintenanceExecutionFailure)
 		require.True(t, ok)
 		proof, err := fixture.settlement.FailMaintenance(failed, backend.ReasonRestartFailed, "startup failed")
 		require.NoError(t, err)

@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -25,7 +24,6 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
@@ -35,6 +33,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/docker/imagefetch"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/maintenanceid"
@@ -140,6 +139,7 @@ type DockerClient struct {
 	launchObserver *daemonLaunchObserver
 	inspections    *imageInspectionCoordinator
 	backendName    string
+	newImageLoader func(string, int64) (*imagefetch.Loader, error)
 }
 
 // NewDockerClient connects to Docker and requires the image execution API
@@ -183,7 +183,13 @@ func NewDockerClient(ctx context.Context, host string, backendName string) (*Doc
 		_ = cli.Close()
 		return nil, err
 	}
-	return &DockerClient{client: newDockerSDKView(cli), images: images, creator: creator, launchObserver: observer, backendName: backendName}, nil
+	return &DockerClient{
+		client: newDockerSDKView(cli), images: images, creator: creator,
+		launchObserver: observer, backendName: backendName,
+		newImageLoader: func(root string, maxBytes int64) (*imagefetch.Loader, error) {
+			return imagefetch.NewLoader(cli, root, maxBytes)
+		},
+	}, nil
 }
 
 // Close closes the Docker client.
@@ -525,7 +531,7 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName imagee
 		}
 	}()
 
-	remainingBytes := maxBytes
+	extractor := newTarExtractor(maxBytes, maxEntries)
 	for _, path := range paths {
 		rc, _, copyErr := session.copy(ctx, path)
 		if copyErr != nil {
@@ -553,12 +559,12 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName imagee
 			continue
 		}
 
-		// remainingBytes is a single budget shared across all writable paths; maxEntries
+		// The extractor owns one byte budget across all writable paths; maxEntries
 		// is instead applied per-path (not decremented) because the true cross-path /
 		// volume-wide inode gate is the caller's XFS ihard quota. On a filesystem without
 		// an inode quota (btrfs/zfs) this backstop therefore bounds entries at
 		// maxDetectedWritablePaths x maxEntries, not maxEntries alone. See ENG-548.
-		written, skippedSymlinks, extractErr := sanitizeAndExtractTarContext(ctx, rc, extractDir, remainingBytes, maxEntries)
+		_, skippedSymlinks, extractErr := extractor.extract(ctx, rc, extractDir)
 		_ = rc.Close()
 		if extractErr != nil {
 			if failures == nil {
@@ -570,7 +576,6 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName imagee
 		for _, sl := range skippedSymlinks {
 			slog.Debug("extracted symlink with out-of-scope target", "path", path, "symlink", sl)
 		}
-		remainingBytes -= written
 	}
 
 	return failures
@@ -583,8 +588,9 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName imagee
 // source's walk order. It rejects absolute paths, path traversal via "..", and
 // device nodes, and skips entries that refer to the destination root itself
 // (".", "./", or empty) so a tar cannot mkdir or chown destDir. Setuid/setgid
-// bits are stripped. Total bytes written are tracked and an error is returned if
-// maxBytes is exceeded; the number of inode-consuming entries (dirs/files/
+// bits are stripped. File sizes are reserved before writing and remain charged
+// on failure; actual bytes written are reported separately. An error is returned
+// if maxBytes would be exceeded; the number of inode-consuming entries (dirs/files/
 // symlinks) is likewise tracked and an error is returned if maxEntries is
 // exceeded — a defense-in-depth backstop against inode-flood DoS (see ENG-548)
 // that is filesystem-agnostic, unlike the XFS ihard quota it complements. File
@@ -603,6 +609,33 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes, maxEntries i
 }
 
 func sanitizeAndExtractTarContext(ctx context.Context, src io.Reader, destDir string, maxBytes, maxEntries int64) (int64, []string, error) {
+	return newTarExtractor(maxBytes, maxEntries).extract(ctx, src, destDir)
+}
+
+// tarExtractor owns the allowance for a complete extraction, including every
+// writable path. Copies share the same budget; a failed archive cannot return
+// bytes for a subsequent path to spend. Entry limits remain per archive.
+type tarExtractor struct {
+	budget     *tarExtractionBudget
+	maxEntries int64
+}
+
+type tarExtractionBudget struct {
+	limit     int64
+	remaining int64
+}
+
+func newTarExtractor(maxBytes, maxEntries int64) tarExtractor {
+	return tarExtractor{
+		budget:     &tarExtractionBudget{limit: maxBytes, remaining: maxBytes},
+		maxEntries: maxEntries,
+	}
+}
+
+func (e tarExtractor) extract(ctx context.Context, src io.Reader, destDir string) (int64, []string, error) {
+	if e.budget == nil || e.budget.limit < 0 {
+		return 0, nil, errors.New("tar extraction requires a nonnegative byte budget")
+	}
 	if err := ctx.Err(); err != nil {
 		return 0, nil, err
 	}
@@ -655,8 +688,8 @@ func sanitizeAndExtractTarContext(ctx context.Context, src io.Reader, destDir st
 		// is permissive-only — acceptable for a defense-in-depth backstop behind
 		// the XFS ihard quota. See ENG-548.
 		entries++
-		if entries > maxEntries {
-			return totalBytes, outOfScope, fmt.Errorf("tar extraction exceeds %d-entry limit", maxEntries)
+		if entries > e.maxEntries {
+			return totalBytes, outOfScope, fmt.Errorf("tar extraction exceeds %d-entry limit", e.maxEntries)
 		}
 
 		// Strip setuid/setgid bits.
@@ -672,39 +705,10 @@ func sanitizeAndExtractTarContext(ctx context.Context, src io.Reader, destDir st
 			}
 
 		case tar.TypeReg:
-			// Compare against the remaining budget instead of summing first: a
-			// tenant-controlled hdr.Size near math.MaxInt64 would overflow
-			// totalBytes+hdr.Size to a negative value and slip past a "> maxBytes"
-			// gate, letting a single entry stream unbounded bytes to disk. The
-			// maxBytes-totalBytes subtraction cannot underflow because the loop
-			// maintains 0 <= totalBytes <= maxBytes. Negative sizes are rejected
-			// outright.
-			if hdr.Size < 0 || hdr.Size > maxBytes-totalBytes {
-				return totalBytes, outOfScope, fmt.Errorf("tar extraction exceeds %d-byte limit", maxBytes)
-			}
-			if dir := filepath.Dir(name); dir != "." {
-				if mkErr := root.MkdirAll(dir, 0o700); mkErr != nil {
-					return totalBytes, outOfScope, fmt.Errorf("mkdir for %s: %w", name, mkErr)
-				}
-			}
-			// root.OpenFile will not follow a symlink that escapes the root, so a
-			// same-name or ancestor symlink left by an earlier entry cannot redirect
-			// this write outside destDir.
-			f, fErr := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&os.ModePerm)
-			if fErr != nil {
-				return totalBytes, outOfScope, fmt.Errorf("create %s: %w", name, fErr)
-			}
-			n, copyErr := io.Copy(f, contextReader{ctx: ctx, reader: tr})
-			closeErr := f.Close()
-			if copyErr != nil {
-				return totalBytes, outOfScope, fmt.Errorf("write %s: %w", name, copyErr)
-			}
-			if closeErr != nil {
-				return totalBytes, outOfScope, fmt.Errorf("close %s: %w", name, closeErr)
-			}
+			n, writeErr := e.writeRegularFile(ctx, root, name, hdr, tr)
 			totalBytes += n
-			if chErr := root.Lchown(name, hdr.Uid, hdr.Gid); chErr != nil && !errors.Is(chErr, syscall.EPERM) {
-				return totalBytes, outOfScope, fmt.Errorf("chown %s: %w", name, chErr)
+			if writeErr != nil {
+				return totalBytes, outOfScope, writeErr
 			}
 
 		case tar.TypeSymlink:
@@ -735,6 +739,41 @@ func sanitizeAndExtractTarContext(ctx context.Context, src io.Reader, destDir st
 		}
 	}
 	return totalBytes, outOfScope, nil
+}
+
+// writeRegularFile owns both the reservation and every file effect. It charges
+// the declared size before creating parents or opening the file and never
+// refunds it, even if the stream, destination, or context fails partway through.
+// The tar reader bounds the body to the admitted header's size.
+func (e tarExtractor) writeRegularFile(ctx context.Context, root *os.Root, name string, hdr *tar.Header, src *tar.Reader) (int64, error) {
+	// Subtraction after comparison avoids overflowing on a tenant-supplied size.
+	if hdr.Size < 0 || hdr.Size > e.budget.remaining {
+		return 0, fmt.Errorf("tar extraction exceeds %d-byte limit", e.budget.limit)
+	}
+	e.budget.remaining -= hdr.Size
+	if dir := filepath.Dir(name); dir != "." {
+		if err := root.MkdirAll(dir, 0o700); err != nil {
+			return 0, fmt.Errorf("mkdir for %s: %w", name, err)
+		}
+	}
+	// os.Root refuses an escaping same-name or ancestor symlink left by an
+	// earlier entry, preserving containment for both creation and truncation.
+	f, err := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&os.ModePerm)
+	if err != nil {
+		return 0, fmt.Errorf("create %s: %w", name, err)
+	}
+	n, copyErr := io.Copy(f, contextReader{ctx: ctx, reader: src})
+	closeErr := f.Close()
+	if copyErr != nil {
+		return n, fmt.Errorf("write %s: %w", name, errors.Join(copyErr, closeErr))
+	}
+	if closeErr != nil {
+		return n, fmt.Errorf("close %s: %w", name, closeErr)
+	}
+	if chErr := root.Lchown(name, hdr.Uid, hdr.Gid); chErr != nil && !errors.Is(chErr, syscall.EPERM) {
+		return n, fmt.Errorf("chown %s: %w", name, chErr)
+	}
+	return n, nil
 }
 
 type contextReader struct {
@@ -865,60 +904,12 @@ func parseGroupForName(r io.Reader, groupName string) (gid int, err error) {
 	return 0, fmt.Errorf("group %q not found in /etc/group", groupName)
 }
 
-// PullImage pulls a container image with timeout.
-func (d *DockerClient) PullImage(ctx context.Context, imageName string, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	return d.pullImage(ctx, imageName)
-}
-
-func (d *DockerClient) pullImage(ctx context.Context, imageName string) error {
-	reader, err := d.client.ImagePull(ctx, imageName, image.PullOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to pull image: %w", err)
-	}
-	defer func() { _ = reader.Close() }()
-
-	// The Docker daemon streams JSON progress messages. Errors such as
-	// "manifest unknown" are reported inside the stream (as an errorDetail
-	// field) rather than as an HTTP-level error. We must decode each
-	// message and check for embedded errors; discarding with io.Copy
-	// would silently swallow them.
-	decoder := json.NewDecoder(reader)
-	for {
-		var msg jsonPullMessage
-		if err := decoder.Decode(&msg); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("failed to read image pull output: %w", err)
-		}
-		if msg.Error != "" {
-			return fmt.Errorf("%s", msg.Error)
-		}
-		if msg.ErrorDetail != nil && msg.ErrorDetail.Message != "" {
-			return fmt.Errorf("%s", msg.ErrorDetail.Message)
-		}
-	}
-
-	return nil
-}
-
-// jsonPullMessage is the minimal structure needed to detect errors in the
-// Docker daemon's image-pull JSON stream. The daemon sends errors in two
-// fields: the deprecated top-level "error" string and the structured
-// "errorDetail" object. We check both so that errors are not missed if
-// either field is omitted in a future Docker release.
-type jsonPullMessage struct {
-	Error       string         `json:"error,omitempty"`
-	ErrorDetail *jsonPullError `json:"errorDetail,omitempty"`
-}
-
-// jsonPullError mirrors the structured error object the Docker daemon embeds
-// in image-pull progress messages under the "errorDetail" key.
-type jsonPullError struct {
-	Message string `json:"message,omitempty"`
+// RequireImage checks locally available executable content without changing the
+// daemon image store. Registry ingestion requires the backend's capacity owner,
+// its durable allocation ledger and a Started subject for pin publication.
+func (d *DockerClient) RequireImage(ctx context.Context, imageName string) error {
+	_, err := d.images.Admit(ctx, imageName)
+	return err
 }
 
 // CreateContainerParams holds parameters for creating a container.
@@ -1062,14 +1053,12 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 
 	// Inject ingress labels for auto-discovery routing.
 	applyIngressLabels(labels, ingressLabelParams{
-		LeaseUUID:    params.LeaseUUID,
-		ServiceName:  params.ServiceName,
-		Instance:     params.InstanceIndex,
-		Quantity:     params.Quantity,
-		Ingress:      params.Ingress,
-		NetworkName:  params.NetworkName,
-		CustomDomain: params.CustomDomain,
-	}, params.Manifest.Ports)
+		LeaseUUID:   params.LeaseUUID,
+		ServiceName: params.ServiceName,
+		Instance:    params.InstanceIndex,
+		Quantity:    params.Quantity,
+		NetworkName: params.NetworkName,
+	}, newIngressRoute(params.Ingress, params.Manifest.Ports, params.CustomDomain))
 
 	// Build environment variables
 	var env []string

@@ -143,13 +143,25 @@ func (j *VolumeLaunchJournal) CheckNamespace(leaseUUID string) error {
 	})
 }
 
+// volumeLaunchNamespacePending is issued only after the durable journal has
+// decoded and lineage-checked a launch in the requested namespace. The public
+// sentinel remains diagnostic; only this exact observation can establish the
+// pending lifecycle class at the close settlement boundary.
+type volumeLaunchNamespacePending struct{ record volumeLaunchDebtRecord }
+
+func (pending volumeLaunchNamespacePending) Error() string {
+	return fmt.Sprintf("%s: %s %s retains its canonical volume namespace", ErrVolumeLaunchUnsettled, pending.record.Kind, pending.record.SubjectID)
+}
+
+func (volumeLaunchNamespacePending) Unwrap() error { return ErrVolumeLaunchUnsettled }
+
 func checkVolumeLaunchNamespaceTx(tx *bolt.Tx, backend string, storage backendidentity.ID, leaseUUID string) error {
 	return visitVolumeLaunchDebtsTx(tx, func(r volumeLaunchDebtRecord) error {
 		if r.Backend != backend || r.StorageID != storage.String() {
 			return errors.New("volume launch debt belongs to another storage lineage")
 		}
 		if r.LeaseUUID == leaseUUID {
-			return fmt.Errorf("%w: %s %s retains its canonical volume namespace", ErrVolumeLaunchUnsettled, r.Kind, r.SubjectID)
+			return volumeLaunchNamespacePending{record: r}
 		}
 		return nil
 	})

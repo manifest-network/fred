@@ -6,10 +6,12 @@ import (
 	"path/filepath"
 	"testing"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
@@ -25,7 +27,7 @@ func TestCompensationReseedsSourceWritablePathsAfterDifferentTargetImage(t *test
 	dataPath := filepath.Join(volume, "data", "tenant-data")
 	require.NoError(t, os.MkdirAll(filepath.Dir(dataPath), 0o700))
 	require.NoError(t, os.WriteFile(dataPath, []byte("retained data"), 0o600))
-	image := admittedFixtureImage(t, "old-app:stable")
+	var image imageexec.Image
 	var extracted bool
 	mock := &mockDockerClient{
 		ListVolumeWritersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
@@ -41,6 +43,12 @@ func TestCompensationReseedsSourceWritablePathsAfterDifferentTargetImage(t *test
 			return nil
 		},
 	}
+	image, err := mock.AdmitImage(t.Context(), "old-app:stable")
+	require.NoError(t, err)
+	project, err := mock.imageAdmitter().Compile(&composetypes.Project{Name: composeProjectName(lease), Services: composetypes.Services{"app": {Image: image.Reference()}}}, map[string]imageexec.Image{"app": image})
+	require.NoError(t, err)
+	binding, err := project.Container("app")
+	require.NoError(t, err)
 	b := newBackendForTest(mock, nil)
 	defer b.stopCancel()
 	b.cfg.VolumeDataPath = root
@@ -51,12 +59,12 @@ func TestCompensationReseedsSourceWritablePathsAfterDifferentTargetImage(t *test
 			ResourceProfiles: []shared.SKUResourceSnapshot{{SKU: "diskless", CPUCores: 1, MemoryMB: 64, ScratchDiskMB: 64}},
 		},
 		Containers: []compensationContainer{{
-			Image:  image,
-			Config: &container.Config{Labels: map[string]string{LabelServiceName: "app", LabelSKU: "diskless", LabelInstanceIndex: "0"}},
-			Mounts: []ContainerMount{{Type: "bind", Source: oldPath, Target: "/var/lib/old-app"}},
+			Binding: binding,
+			Config:  &container.Config{Labels: map[string]string{LabelServiceName: "app", LabelSKU: "diskless", LabelInstanceIndex: "0"}},
+			Mounts:  []ContainerMount{{Type: "bind", Source: oldPath, Target: "/var/lib/old-app"}},
 		}},
 	}
-	err := runSubjectStorageMutationForTest(t, b, lease, func(mutations *storageMutations) error {
+	err = runSubjectStorageMutationForTest(t, b, lease, func(mutations *storageMutations) error {
 		q := quiescedVolumeForTest(t, mutations, volume)
 		defer q.release()
 		return q.prepareCompensationBinds(t.Context(), plan)

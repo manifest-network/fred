@@ -12,7 +12,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/sony/gobreaker"
+	"github.com/sony/gobreaker/v2"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backendidentity"

@@ -259,13 +259,33 @@ Every non-2xx response **MUST** be JSON in this envelope:
 {
   "error": "human-readable description of what went wrong",
   "validation_code": "unknown_sku | invalid_manifest | image_not_allowed",
-  "code": "already_provisioned | demote_exceeds_tier | insufficient_resources"
+  "code": "already_provisioned | demote_exceeds_tier | insufficient_resources | lifecycle_pending"
 }
 ```
 
 - `error` **(required)** — a human-readable description. See the curation rule below.
 - `validation_code` (omitempty) — on a `400`, the sub-category of the validation failure. Fred parses it to reconstruct a precise sentinel error, which is what gives the on-chain rejection reason its precision; omit it and fred falls back to a generic validation failure.
 - `code` (omitempty) — a machine-readable discriminator. Today: `already_provisioned` on `/restore`'s `409`, `demote_exceeds_tier` on `/restore`'s `422`, and `insufficient_resources` on capacity-refused mutation requests or busy log reads (`503`). See those endpoints. A read-capacity response supplies retry guidance only; it cannot settle a durable mutation attempt.
+
+`POST /restart`, `/update`, `/deprovision` and `/reconcile_custom_domain`
+may return `503` with `{"error":"admitted lifecycle work remains pending","code":"lifecycle_pending"}`
+after observing validated journal contention or an admitted close whose physical
+result remains pending. The bundled Docker backend also responds immediately
+with this envelope when close cancels a workflow whose exact worker is still
+draining, including a loader-owned image import; it does not wait for the import
+inside the HTTP request. Teardown can proceed after the worker exits. Fred
+treats this exact envelope as a successful
+availability observation while preserving the unresolved request. It grants no
+refusal, no-dispatch, immediate replay, or completed-cleanup authority. Generic
+conflicts, corrupt journals and invalid execution evidence remain server errors.
+For `/deprovision`, only the identity-bound client’s exact response for that
+lease grants a lifecycle deferral to the bounded close scheduler. It preserves
+any in-flight operation and retries with newly acquired ownership; a wrapped
+or replayed diagnostic from another client, lease or endpoint grants no such
+deferral. The actor latches close ownership before canceling its worker, so a
+late canceled result cannot be published as an unrelated execution failure.
+The distinct `503` also keeps older clients conservative: a maintenance `409`
+would incorrectly promise a definitive invalid-state refusal.
 
 These response fields establish **protocol conformance, not cryptographic
 authorship**. Fred HMAC-signs requests to the backend, but the backend does not
@@ -278,13 +298,32 @@ JSON, legacy code-less envelopes, and unknown codes.
 
 The one exception fred tolerates is an **empty** body: a backend that answers a `409`/`422` with nothing at all is read as the plain meaning of that status. An empty or code-less v0.13 `503` still produces the `ErrInsufficientResources` diagnostic sentinel for API compatibility, but its typed causal outcome is **ambiguous**, not refused; fred therefore retains the write-ahead attempt. (Note that *bare*, everywhere else in this guide and in README/ARCHITECTURE/OPERATIONS, means a response carrying **no `code` discriminator** — a different thing, and one that still owes an `error` body.) Anything that is not empty must be the envelope with a non-empty `error`: an unparseable body, and a body that is valid JSON but omits `error` (`{}`, `null`, `{"message": "..."}`, or even `{"code": "..."}`), are contract violations. A discriminator alone does not substitute for `error` — send both.
 
-The `code` set is **open and add-only**. If fred receives a `code` it does not recognize for that status — including one that is valid for a *different* status — it does not guess. It preserves the exact write-ahead attempt, keeps the declared `error` only for operator diagnostics, and returns a generic failure rather than asserting a tenant-visible backend or lease-state fact. That is not treated as a malformed body and does not count against the circuit breaker, so a new discriminator degrades safely against an older `providerd`. The precise mapping (and any tenant-facing status remap, e.g. a code-less `422` → `404`) appears only once `providerd` learns the code, so ship the fred side first if the mapping matters.
+The `code` set is **open and add-only**. If fred receives a `code` it does not recognize for that status — including one that is valid for a *different* status — it does not guess. It preserves the exact write-ahead attempt, keeps the declared `error` only for operator diagnostics, and returns a generic failure rather than asserting a tenant-visible backend or lease-state fact. That is not treated as a malformed body; breaker classification remains endpoint-specific as described below. An unknown discriminator never grants mutation settlement authority. The precise mapping (and any tenant-facing status remap, e.g. a code-less `422` → `404`) appears only once `providerd` learns the code, so ship the fred side first if the mapping matters.
 
 Settlement is type-enforced after this parse. Package-owned `backend.Invoke*`
 functions grant causal classification only to the exact identity-bound HTTP
 client type, which mints a zero-invalid call outcome at the transport branch
 that observed acceptance, a contract refusal, a proven pre-dispatch stop, or
 ambiguity. A decorator cannot acquire that authority through method embedding.
+
+Circuit-breaker classification is separate from mutation settlement:
+
+| Observation | Breaker treatment | Mutation implication |
+|---|---|---|
+| Caller context ended during a failed invocation | Excluded; preserves failure streak and releases a half-open probe slot | Preserve the invocation's original causal result, including ambiguity |
+| Successful response | Success | Only the endpoint's exact contract grants acceptance |
+| Valid not-found, validation, invalid-state, already-provisioned or restore refusal | Success | Endpoint-specific refusal or ambiguity; never inferred from breaker classification |
+| `/deprovision` `409` with `code: close_deferred` | Success | Retry close; cleanup has not completed |
+| Lifecycle mutation `503` with `code: lifecycle_pending` | Success | Preserve the unresolved request; no refusal, no-dispatch or completed-cleanup authority |
+| `/provision` `409` with `code: invalid_state` | Success | Retain the attempt as ambiguous; does not prove existing ownership |
+| Capacity refusal (`503`, `code: insufficient_resources`), including custom-domain reconciliation | Success | Mutation refusal only where the endpoint supports that exact verdict |
+| `/stats` accounting hold or busy read (`503`, `code: insufficient_resources`) | Success | Retry/read admission only; no mutation authority |
+| Local storage identity unbound, upgrade required, or exact completion-pending response | Success | Preserve the endpoint's no-dispatch/ambiguous result |
+| Backend timeout while caller remains live, connection failure, malformed response or other server error | Failure | Preserve uncertainty; may open the breaker |
+| Complete inventory recovery walk | Outside the tenant breaker | Requires complete, identity-consistent inventory |
+
+The caller-cancellation exclusion is applied inside the transport invocation;
+a remote error that merely mentions cancellation cannot request exclusion.
 Placement consumes the outcome and never reconstructs authority by searching
 an arbitrary error tree for a sentinel. A backend wired directly to
 the legacy Go `backend.Backend` interface remains compatible, but every non-nil
@@ -588,6 +627,19 @@ automatic recovery. A different tenant idempotency key receives `409` while
 that command is pending; an exact retry joins recovery. Backends must therefore
 apply the durable `maintenance_id` replay rule below to delayed delivery as well
 as immediate retries. See [the tenant retry contract](README.md#restart-lease).
+
+Provider admission separately bounds pending maintenance to 1,024 commands and
+64 MiB, including 512 bytes of phase-growth allowance per record. There is no
+fixed per-tenant concurrency cap. A tenant with pending commands can borrow the
+shared pool while leaving one command and 2 MiB for a tenant with none pending.
+If that reserve would be consumed, the tenant API returns `429` before recording
+a new command, with `reason: maintenance_capacity_reserved`, `Retry-After: 1`,
+and `maintenance capacity is reserved for tenants without
+pending work; retry after your pending work completes`. Global exhaustion
+returns `503`. Exact command replay and settlement remain possible above either
+boundary. These are provider admission responses, separate from the backend
+endpoint contract below; the reservation needs no deployment override for an
+aggregator address.
 
 **Request:**
 ```json
@@ -912,6 +964,23 @@ conservative. The Docker backend implements this (durable `disk_mb` or its
 mutually exclusive pinned diskless scratch). The mock backend returns its
 configured in-memory snapshot, or a zero-valued snapshot when none is set.
 
+## Exact maintenance completion
+
+A terminal restart/update callback carries `maintenance_id` equal to the
+canonical UUIDv4 from its durable request. Persist it with the outbox entry and
+include it in the HMAC-covered body. It accompanies the existing lifecycle URL
+and backend storage identity; it cannot replace either authority. Include it on
+the exact `success` or `failed` completion only. A later autonomous runtime
+failure must omit it, including the separate runtime observation paired with a
+successful maintenance receipt.
+
+For updates, HTTP acceptance retains pending desired bytes. Fred promotes the
+replay payload only after the matching successful completion; failed/rolled-back
+updates keep the previously committed payload. A callback may arrive before the
+HTTP response, and redelivery must preserve the same ID and outcome. Drain
+pending maintenance and outboxes before upgrading across this protocol addition;
+a legacy callback without the ID cannot establish exact update success.
+
 ## Callback Protocol
 
 When provisioning or restoration completes (success or failure), POST to the
@@ -1014,11 +1083,21 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 
 ### Fred Response Contract
 
+Before HMAC verification, the callback reader accepts at most **1 MiB** of exact
+wire bytes, **256 JSON structural tokens**, and **16 nesting levels**. These are
+fixed protocol limits, including unknown fields. Exceeding them returns `401`
+while the unauthenticated ingress budget remains available, or `429` once that
+budget is exhausted. A valid signature does not bypass envelope limits. The
+reader preserves the received bytes for HMAC verification; senders must sign the
+same serialized body they transmit. Keep callbacks compact and store verbose
+diagnostics separately. Authenticated callbacks, including duplicate replays,
+consume the storage lineage's independent callback budget.
+
 - `200 OK` — synchronously applied to a terminal application result, or
   terminally ignored as a duplicate/stale exact-operation callback. A backend
   may advance that lease's durable callback queue only after this response.
 - `400 Bad Request` — malformed JSON, lease UUID, status, or callback capability query. `operation_id` and `lifecycle_id` are mutually exclusive; a present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected.
-- `401 Unauthorized` — missing or invalid HMAC signature.
+- `401 Unauthorized` — missing or invalid HMAC signature, or a callback envelope that cannot pass the bounded pre-authentication parser (including excessive size, token count or nesting).
 - `429 Too Many Requests` — callback ingress rate limit exceeded; retry with backoff.
 - `503 Service Unavailable` — callback application is unavailable, has not
   started, is shutting down, or failed/timed out; keep the callback durable and

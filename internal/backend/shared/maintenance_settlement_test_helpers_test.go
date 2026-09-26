@@ -196,7 +196,7 @@ func activateMaintenanceForTest(
 	if err != nil {
 		return err
 	}
-	physical := settlement.ExecuteMaintenance(context.Background(), execution)
+	physical := settlement.ExecuteMaintenance(testMaintenanceLifetime(t, context.Background()), execution)
 	success, ok := physical.(MaintenanceExecutionSuccess)
 	if !ok {
 		return errors.New("test maintenance execution did not succeed")
@@ -216,7 +216,7 @@ func activateMaintenanceOutcomeForTest(
 	}
 	execution, err := settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	physical := settlement.ExecuteMaintenance(context.Background(), execution)
+	physical := settlement.ExecuteMaintenance(testMaintenanceLifetime(t, context.Background()), execution)
 	success, ok := physical.(MaintenanceExecutionSuccess)
 	require.True(t, ok)
 	active, err := settlement.ActivateMaintenance(success)

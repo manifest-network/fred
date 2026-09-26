@@ -49,7 +49,7 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 	// its tmpDir and randomizes Name, so it cannot be fed to a second New()). Mirror
 	// TestIntegration_Docker_ColdStartRecovery, plus an explicit ReleasesDBPath so the
 	// release record persists in tmpDir and is shared by both backend instances.
-	cfg := DefaultConfig()
+	cfg := integrationDockerConfig()
 	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.Name = fmt.Sprintf("test-eng440-%d", time.Now().UnixNano())
 	cfg.CallbackSecret = testCallbackSecret

@@ -171,6 +171,11 @@ complete-URI binding prevent moving a captured signature to another endpoint,
 resource, or operation; body and timestamp binding prevent payload or timestamp
 substitution. Typed operation/lifecycle settlement and idempotent application
 remain the defense against duplicate delivery within the freshness window.
+Every accepted replay still consumes the authenticated storage identity's
+callback bucket. Capturing one valid request therefore permits spending that
+backend's callback budget until its signature expires; HMAC and idempotent
+settlement do not provide replay-based availability protection. Production TLS
+and callback-capability confidentiality protect against capturing that request.
 
 ## Input Validation
 
@@ -295,6 +300,13 @@ rename are descriptor-rooted after exact managed-volume-name validation, and
 XFS project-marker access uses attested, no-follow descriptor lookups. External
 Docker, ZFS, btrfs, and xfs_quota operations still require a substrate-native
 generation/CAS primitive to close the residual same-root replacement window.
+Live XFS quota repair reads and changes only the pinned volume-root inode with
+`FS_IOC_FSGETXATTR` / `FS_IOC_FSSETXATTR`, preserving unrelated attributes and
+verifying the project ID and inheritance flag afterward. It does not invoke
+`xfs_quota project -s -d 0`: that command still walks descendants despite
+suppressing their mutation. Already-correct roots require no attribute write;
+historical untagged descendants require separate offline repair with writers
+stopped.
 
 XFS also withholds the bind-ready final name until a typed hidden stage is
 parent-synced, its project marker is durable, and both project tag and limits
@@ -359,7 +371,7 @@ All requests are wrapped with `http.MaxBytesReader` enforcing a configurable max
 
 ### Manifest Validation (Docker Backend)
 
-**Reserved image metadata.** Both manifest labels and image-baked labels reject the `fred.`, `traefik.`, and `com.docker.compose.` namespaces case-insensitively. Docker inherits image labels even for stopped inspection helpers, so each service first passes one guarded image-admission step. That step mints an opaque image capability required by every helper and workload creation API; raw image strings cannot authorize creation. Secure image creation requires Docker Engine 28.1+ (API 1.49+). All image setup, extraction, and creation use the inspected immutable image ID. On the containerd image store, Fred resolves a multi-platform index to one platform manifest and, when necessary, pulls that exact digest to make it independently addressable; this remains inside the authorized mutation boundary. A first restart of an older index-based image may therefore require registry access. Classic image-store IDs and already prepared platform manifests need no extra pull. Compose compilation requires admitted images for every service and produces an immutable prepared project with exact image IDs, platforms, and repulls disabled. Only that prepared project can reach the retained Compose execution sink. Fred binds the original manifest image reference to that ID in backend-owned labels so recovery keeps exact release-reference comparisons without resolving mutable tags. Images built through Compose may include reserved labels automatically and must be rebuilt without them (for example, using `docker build`). This admission rule applies to new and replacement containers; existing containers are not automatically inspected, stopped, or rewritten.
+**Reserved image metadata.** Manifest labels reject the `fred.`, `traefik.`, and `com.docker.compose.` namespaces case-insensitively. Image-baked labels follow the same policy except for the three exact Compose build stamps: `com.docker.compose.project`, `com.docker.compose.service`, and `com.docker.compose.version`. Admission discards their image-supplied values. The creation sinks overwrite all three: ordinary direct containers and stopped helpers receive empty values; prepared Compose workloads receive the owned project, service, and Compose version. Direct frozen-source compensation requires an opaque service binding issued by the same image compiler, with ownership derived from the admitted source topology rather than inherited or snapshot Compose stamp values. Other reserved keys, including case and Unicode variants of those stamps, remain rejected. Helper recovery requires the same neutral projection, so a foreign project association cannot become cleanup authority. Docker inherits image labels even for stopped inspection helpers, so each service first passes one guarded image-admission step. That step mints an opaque image capability required by every helper and workload creation API; raw image strings cannot authorize creation. Secure image creation requires Docker Engine 28.1+ (API 1.49+). All image setup, extraction, and creation use the inspected immutable image ID. On the containerd image store, Fred resolves a multi-platform index to one platform manifest and, when necessary, pulls that exact digest to make it independently addressable; this remains inside the authorized mutation boundary. A first restart of an older index-based image may therefore require registry access. Classic image-store IDs and already prepared platform manifests need no extra pull. Compose compilation requires admitted images for every service and produces an immutable prepared project with exact image IDs, platforms, and repulls disabled. Only that prepared project can reach the retained Compose execution sink. Fred binds the original manifest image reference to that ID in backend-owned labels so recovery keeps exact release-reference comparisons without resolving mutable tags. This admission rule applies to new and replacement containers; existing containers are not automatically inspected, stopped, or rewritten.
 
 Tenant-submitted manifests are validated before provisioning:
 - `image` field required
@@ -391,7 +403,10 @@ Stateful-volume seed data is extracted from tenant-controlled container images v
 
 ### Global (Per-IP)
 
-A single token-bucket limiter applied to **all** HTTP routes, keyed per client IP. It is "global" in the sense of being one limiter shared across every route (not per-route), reported as `fred_api_rate_limit_rejections_total{limiter="global"}` (a single series, no route/path dimension). It is **not** one shared budget for the whole API — each distinct client IP gets its own bucket.
+A token bucket is shared across tenant and observability routes, keyed per
+client IP. `POST /callbacks/provision` uses the separate callback budgets below.
+The IP bucket reports `fred_api_rate_limit_rejections_total{limiter="global"}`
+without route/path labels; each client IP has its own budget.
 
 | Parameter | Default |
 |-----------|---------|
@@ -402,7 +417,32 @@ A single token-bucket limiter applied to **all** HTTP routes, keyed per client I
 
 Because the bucket is shared across routes, all direct API operations from one client IP contend for the same budget — lease restore, update, restart, and `/data` uploads draw from a single bucket, so a burst of one can `429` the others. The defaults above are protective production values; for load tests or high-throughput direct-API workloads, raise `rate_limit_rps`/`rate_limit_burst` (and/or set `trusted_proxies`); otherwise the limiter, not the backends, becomes the binding throughput ceiling.
 
-Trusted proxies can be configured via CIDR ranges. When the direct connection comes from a trusted proxy, `X-Forwarded-For` is used to extract the real client IP. Untrusted `X-Forwarded-For` headers are ignored. **If fred runs behind a reverse proxy and `trusted_proxies` is not configured, every request appears to come from the proxy's IP, collapsing all clients into one bucket — effectively a single global cap at `rate_limit_rps`.**
+Trusted proxies can be configured via CIDR ranges. When the direct connection comes from a trusted proxy, `X-Forwarded-For` is used to extract the real client IP. Untrusted `X-Forwarded-For` headers are ignored. **Without `trusted_proxies`, requests behind a reverse proxy share its IP bucket.** Callback ingress uses the same proxy identity rules but its own bucket.
+
+### Backend Callbacks
+
+| Bucket | Fixed rate / burst | Key | Metric `limiter` |
+|--------|--------------------|-----|------------------|
+| Callback ingress | 100 RPS / 200 | Client IP | `callback_ingress` |
+| Authenticated callback | 100 RPS / 200 | HMAC-verified immutable backend storage UUID | `callback_storage` |
+
+An exhausted ingress bucket admits only a valid callback HMAC. The authenticated
+callback then spends its storage bucket, so an unauthenticated tenant sharing a
+NAT cannot starve the backend by consuming its IP budget. Claimed storage UUIDs
+never select a charged bucket until the exact body is authenticated. Legacy
+single-key embeddings share one authenticated bucket. IP tracking has the same
+10,000-entry ceiling and three-minute lifetime as the global IP cache; storage
+tracking is bounded by the configured backend count with a three-minute lifetime.
+
+Authentication still examines a request when the ingress bucket is exhausted.
+A streaming canonical envelope budget bounds that work before JSON decoding:
+1 MiB of bytes, 256 structural tokens outside strings, and 16 nesting levels.
+The same bounds apply to both pre-auth key selection and verified decoding.
+Oversized field collections or deeply nested unknown values are rejected before
+the JSON decoder can allocate per-field state; exact wire bytes remain unchanged
+for HMAC verification. These fixed limits are independent of tenant rate-limit
+settings. Signed retries and captured replays consume the storage budget as
+described under callback replay above.
 
 ### Per-Tenant
 
@@ -419,7 +459,8 @@ Separate token bucket per tenant, applied after token extraction.
 
 ### Response Headers
 
-Rate-limited responses include `Retry-After` with the number of seconds until the next request will be accepted.
+Rate-limited responses include `Retry-After` with a conservative per-token refill
+interval. Concurrent traffic may consume the next token before the retry arrives.
 
 ## Transport Security
 
@@ -467,6 +508,27 @@ Wired via `tlsconfig.ClientConfig` (`cmd/providerd/main.go:263`).
 
 **Client-identity pinning.** `tls.Config.RequireAndVerifyClientCert` only proves the client's certificate chains to the configured CA — it does not check *who* the client is. Without `tls_client_allowed_names`, any certificate signed by the configured client CA is accepted. When `tls_client_allowed_names` is set, the verified client leaf's CommonName or one of its DNS SANs must appear in the list. The check is implemented as a `tls.Config.VerifyConnection` callback, **not** `VerifyPeerCertificate` — a `VerifyPeerCertificate` callback is skipped on resumed TLS sessions, so using it would let a previously-authenticated client resume a session and bypass the name pin. `VerifyConnection` runs on every handshake, including resumptions, closing that bypass (`internal/tlsconfig/tlsconfig.go:24-27,47-49,84-113`).
 
+### Image Registry Transport
+
+Image downloads originate in `docker-backend` through the bounded image loader,
+using anonymous HTTPS requests and system certificate trust. HTTPS is required
+for registries and redirects, including private-address registries. Docker's
+`daemon.json` mirrors, daemon proxy configuration, insecure-registry entries,
+and `/etc/docker/certs.d` are not inherited. Upgrades must provide registry
+reachability and trust to the backend process itself; see
+[DEPLOYMENT.md](DEPLOYMENT.md) for the image-store requirements.
+
+Verified content is staged beside `callback_db_path` in its `.image-staging`
+directory before exact-content import. The durable import debit reserves
+unsettled daemon work across restarts. Supported stores are classic `overlay2`
+and containerd's overlayfs image store. Fixed metadata, layer-count and individual
+path/header limits accompany typed namespace memory, retained-name and resolution
+work budgets. Those scale with `image_max_size_mb` up to independent 1-GiB /
+256-MiB / 512-MiB parser ceilings; decoded content retains its separate byte bound;
+an image Docker can otherwise load may be refused by these bounds. These are
+intentional admission limits. The registry client verifies manifest/config/blob
+identity and layer expansion before dispatching the import.
+
 ### Security Headers
 
 All responses include:
@@ -506,7 +568,17 @@ Every container created by the Docker backend runs with these security measures:
 
 Network isolation places each tenant's containers in a dedicated Docker bridge network. Docker's `DOCKER-ISOLATION` iptables chains drop forwarded traffic between different bridge networks, preventing cross-tenant communication.
 
-**Daemon capabilities vs. container privileges.** The controls above constrain the tenant *container*, which continues to run with `CapDrop: ["ALL"]` — that is unchanged. Enforcing the per-volume disk quota, however, requires the docker-backend *daemon itself* to hold `CAP_SYS_ADMIN` to set the xfs/btrfs block limit — granted via `AmbientCapabilities=CAP_SYS_ADMIN` on the systemd unit, or by running as root. On an xfs or btrfs backend the daemon **fails fast at startup** if it lacks `CAP_SYS_ADMIN`, rather than silently skipping the cap and leaving `disk_mb` unenforced (`internal/backend/docker/capability.go`). zfs is exempt (it uses `zfs allow` delegation, so a cap check would wrongly reject a properly-delegated non-root host); the noop backend is unaffected. Re-tagging an existing XFS tree may additionally need `CAP_FOWNER` when it contains tenant-owned inodes. A truly fresh root does not need that capability, so the preliminary capability probe checks only `CAP_SYS_ADMIN`; startup quota reconciliation then attempts every expected present live or retained volume and refuses readiness on any inventory, durable-authority, or enforcement error. See [DEPLOYMENT.md](DEPLOYMENT.md) — filesystem setup (xfs) and the systemd capabilities note — for the full `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` grant procedure.
+**Daemon capabilities vs. container privileges.** Tenant containers run with
+`CapDrop: ["ALL"]`. The docker-backend daemon needs `CAP_SYS_ADMIN` for XFS/btrfs
+quota limits, granted by systemd capabilities or by running as root; startup
+rejects a missing capability (`internal/backend/docker/capability.go`). ZFS uses
+`zfs allow` delegation and is exempt, as is the noop backend. Repairing an XFS
+root inode owned by another UID can additionally need `CAP_FOWNER`. Live repair
+touches that root only, never tenant-owned descendants. The preliminary probe
+checks `CAP_SYS_ADMIN`; quota reconciliation attempts all expected present live
+and retained volumes and refuses readiness on inventory, durable-authority, or
+enforcement errors. See [DEPLOYMENT.md](DEPLOYMENT.md) for the systemd
+`AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` grant procedure.
 
 ## Error Handling
 

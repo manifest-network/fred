@@ -86,7 +86,7 @@ func validateRecoveredReleaseCohort(release *shared.Release, containers []Contai
 	if err != nil {
 		return fmt.Errorf("validate durable release quantities: %w", err)
 	}
-	stack, err := manifest.ParsePayload(release.Manifest)
+	stack, err := manifest.ParseStoredPayload(release.Manifest)
 	if err != nil {
 		return fmt.Errorf("parse durable release manifest: %w", err)
 	}
@@ -1004,7 +1004,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			// provision is stack-form on disk, so the populated field is
 			// always prov.StackManifest.
 			if rel := releasesByLease[c.LeaseUUID]; rel != nil && len(rel.Manifest) > 0 {
-				stackM, payloadErr := manifest.ParsePayload(rel.Manifest)
+				stackM, payloadErr := manifest.ParseStoredPayload(rel.Manifest)
 				if payloadErr != nil {
 					b.logger.Warn("failed to parse recovered manifest",
 						"lease_uuid", c.LeaseUUID, "error", payloadErr)
@@ -1116,7 +1116,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if quantityErr != nil {
 			return fmt.Errorf("validate pending provision quantities for lease %q: %w", leaseUUID, quantityErr)
 		}
-		stackManifest, parseErr := manifest.ParsePayload(claim.Manifest())
+		stackManifest, parseErr := manifest.ParseStoredPayload(claim.Manifest())
 		if parseErr != nil {
 			return fmt.Errorf("parse pending provision manifest for lease %q: %w", leaseUUID, parseErr)
 		}
@@ -1251,7 +1251,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			return fmt.Errorf("validate durable runtime quantities for lease %q: %w", leaseUUID, quantityErr)
 		}
 		resourceProfiles := shared.CloneSKUResourceSnapshot(release.ResourceProfiles)
-		stackManifest, parseErr := manifest.ParsePayload(release.Manifest)
+		stackManifest, parseErr := manifest.ParseStoredPayload(release.Manifest)
 		if parseErr != nil {
 			return fmt.Errorf("parse durable runtime manifest for lease %q: %w", leaseUUID, parseErr)
 		}
@@ -1330,7 +1330,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			durableAllocsByLease[leaseUUID] = newDurableRecoveryAllocationCohort(allocations)
 			continue
 		}
-		stackManifest, parseErr := manifest.ParsePayload(claim.Manifest())
+		stackManifest, parseErr := manifest.ParseStoredPayload(claim.Manifest())
 		if parseErr != nil {
 			return fmt.Errorf("parse durable close manifest for lease %q: %w", leaseUUID, parseErr)
 		}

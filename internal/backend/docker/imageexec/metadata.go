@@ -22,9 +22,38 @@ const (
 	MaxInspectResponseBytes = 2 << 20
 )
 
-type admittedImageMetadata struct{ volumes []string }
+type admittedImageMetadata struct {
+	volumes     []string
+	buildLabels composeBuildLabels
+}
+
+// Metadata is image configuration admitted by the same policy used by the
+// execution boundary. Its zero value carries no admission evidence.
+type Metadata struct{ record *admittedImageMetadata }
+
+// AdmitMetadata validates registry configuration before it can reach Docker,
+// and is also used when inspecting a local execution identity.
+func AdmitMetadata(labels map[string]string, volumes map[string]struct{}) (Metadata, error) {
+	admitted, err := admitImageMetadata(labels, volumes)
+	if err != nil {
+		return Metadata{}, err
+	}
+	return Metadata{record: &admitted}, nil
+}
+
+// Valid reports whether this metadata passed admission.
+func (m Metadata) Valid() bool { return m.record != nil }
+
+// Volumes returns independent storage for the canonical admitted volume paths.
+func (m Metadata) Volumes() []string {
+	if m.record == nil {
+		return nil
+	}
+	return slices.Clone(m.record.volumes)
+}
 
 func admitImageMetadata(labels map[string]string, volumes map[string]struct{}) (admittedImageMetadata, error) {
+	buildLabels := composeBuildLabels{}
 	if len(labels) > MaxImageLabels {
 		return admittedImageMetadata{}, fmt.Errorf("image has more than %d labels", MaxImageLabels)
 	}
@@ -40,7 +69,7 @@ func admitImageMetadata(labels map[string]string, volumes map[string]struct{}) (
 		labelBytes += len(value)
 	}
 	for _, key := range slices.Sorted(maps.Keys(labels)) {
-		if manifest.IsReservedLabelKey(key) {
+		if manifest.IsReservedLabelKey(key) && !buildLabels.owns(key) {
 			return admittedImageMetadata{}, fmt.Errorf("image contains reserved label %q", key)
 		}
 	}
@@ -75,5 +104,5 @@ func admitImageMetadata(labels map[string]string, volumes map[string]struct{}) (
 		}
 		seen[target] = struct{}{}
 	}
-	return admittedImageMetadata{volumes: ordered}, nil
+	return admittedImageMetadata{volumes: ordered, buildLabels: buildLabels}, nil
 }

@@ -107,7 +107,7 @@ func TestMaintenanceRecoveryProjectionAcceptsLegacyRuntimeAuthority(t *testing.T
 	bindLeaseSMMaintenanceExecutor(t, settlement)
 	execution, err := settlement.StartMaintenanceExecution(targetClaim)
 	require.NoError(t, err)
-	physical := settlement.ExecuteMaintenance(t.Context(), execution)
+	physical := settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
 	success, ok := physical.(shared.MaintenanceExecutionSuccess)
 	require.True(t, ok)
 	committed, err := settlement.ActivateMaintenance(success)

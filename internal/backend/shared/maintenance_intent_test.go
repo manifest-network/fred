@@ -1099,6 +1099,8 @@ func TestTryResolveMaintenanceIntentWithRuntimeFailureIsAtomicAndOrdered(t *test
 	require.Len(t, pending, 2)
 	assert.Equal(t, CallbackDeliveryKindMaintenance, pending[0].DeliveryKind)
 	assert.Equal(t, backend.CallbackStatusSuccess, pending[0].Status)
+	assert.Equal(t, intent.MaintenanceID(), pending[0].MaintenanceID)
+	assert.True(t, pending[1].MaintenanceID.IsZero(), "runtime loss must not report update execution failure")
 	assert.Equal(t, CallbackDeliveryKindMaintenance, pending[1].DeliveryKind)
 	assert.Equal(t, backend.CallbackStatusFailed, pending[1].Status)
 	assert.Equal(t, "committed runtime cohort is missing", pending[1].Error)

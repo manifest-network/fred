@@ -73,7 +73,8 @@ image.
 | Docker | Engine **28.1+ (API 1.49+)** is the image-admission compatibility floor for binding inspected metadata to a single immutable platform image. Production also requires a currently security-patched Engine (see below). iptables must be enabled (the default). `--iptables=false` disables cross-tenant network isolation; the docker-backend logs a daemon-warning at startup if it detects this |
 | CPU / RAM | Sized for the SKU pool you advertise; budget 10–20% overhead for the daemon |
 | Disk | Image cache + per-tenant volumes (see [Stateful workloads](#stateful-workloads-disk_mb--0-skus)) |
-| Network | Reachable from `providerd`; outbound reachability to image registries |
+| Network | Reachable from `providerd`; HTTPS registry access from the `docker-backend` process using system CA trust and process proxy settings |
+| Docker image storage | Classic `overlay2` or containerd `overlayfs`; other drivers fail construction. Shared filesystems remain supported. Containerd requires its actual `image_data_path` |
 
 The Docker daemon is installed and patched independently of Fred's Go dependencies.
 Engine **29.3.1** fixes the AuthZ plugin bypass
@@ -176,21 +177,15 @@ Each container gets a directory with an xfs project quota.
 > `volume_data_path` may be the mount itself, as above, or a subdirectory of it,
 > e.g. `/data/fred/volumes` under a `/data` mount.)
 >
-> **`CAP_FOWNER` is additionally required for the startup quota backfill.**
-> Tagging a directory with its project ID (`xfs_quota project -s`, i.e.
-> `FS_IOC_FSSETXATTR`) is permitted for the inode's owner, so a *fresh* provision
-> — which tags the still-empty, daemon-owned volume before chown'ing its subdirs
-> to the tenant — needs only `CAP_SYS_ADMIN`. The startup backfill that heals
-> volumes provisioned before the capability was granted, however, re-tags
-> directories that have already been chown'd to the tenant UID; setting a project
-> ID on an inode the daemon does not own requires `CAP_FOWNER`. A fresh backend
-> with no pre-existing volumes does not need that capability, so the preliminary
-> capability probe gates only on `CAP_SYS_ADMIN`. Existing storage is proved by
-> the startup quota reconciliation itself: it attempts every expected present
-> active or retained volume, logs and counts each failed re-application, and then
-> fails startup/readiness if any inventory, durable-authority, or enforcement
-> error remains. Grant `CAP_FOWNER` and restart the backend; it will not serve
-> while a known tenant volume may remain unenforced.
+> **`CAP_FOWNER` is required when repairing a tenant-owned volume root.**
+> Startup and reuse read the volume root's project ID and inheritance flag
+> through an attested descriptor. Correctly tagged roots need only an O(1)
+> quota-limit refresh; a mismatched root is repaired through its open descriptor and
+> verified before limits are applied. Fred never recursively walks an existing
+> tenant tree during startup, restart, update or restore. The 2026-09-23 fleet
+> check recorded in ENG-1051 found every descendant correctly tagged; no legacy
+> recursive healing path is required. Inventory, authority and root-enforcement
+> errors still fail startup closed.
 
 #### Experimental backends (not production-validated or deployed)
 
@@ -344,6 +339,12 @@ manifests or alert rules.
 
 ### Docker startup and recovery budgets
 
+The command validates TLS and probes the configured listener address before
+startup can publish image pins, then immediately closes that probe. The serving
+listener binds only after backend startup succeeds, preserving deployment gates
+that treat a bound port as completed recovery. If another process takes the
+address during recovery, the final bind fails and the backend is shut down.
+
 Docker-backend uses finite, nested safety budgets. The production constructor
 uses `storage_attestation_timeout` (default `30s`) for the full initial
 Docker/storage-lineage attestation. `Start` shares at most 30 seconds across its
@@ -475,20 +476,18 @@ WantedBy=multi-user.target
 
 `docker-backend.service` is the same shape with three differences:
 - It needs Docker socket access. Either add `SupplementaryGroups=docker` to the unit (so the service user inherits the `docker` group), add the service user to the `docker` group out of band, or run as root. Note this makes the docker-backend effectively host-root-equivalent regardless of `User=` (access to a rootful Docker socket can launch a privileged container) — so unlike `providerd`, its minimal-capability hardening is partly cosmetic. The real lever for de-privileging it is rootless Docker.
-- **Native XFS volume management needs `CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN CAP_FOWNER`.** Ownership changes require `CAP_CHOWN`; managing restrictive tenant-owned trees requires `CAP_DAC_OVERRIDE`. XFS quota limits require `CAP_SYS_ADMIN`, and re-tagging tenant-owned files with project IDs requires `CAP_FOWNER`. Set both `AmbientCapabilities=` and `CapabilityBoundingSet=` to these four capabilities, as the manifest-deploy unit does. Ambient capabilities are compatible with `NoNewPrivileges=true` and propagate to the quota subprocesses. A capability grant on the Fred executable alone does not provide this subprocess contract. Scope these capabilities to `docker-backend`; `providerd` does not need them.
+- **Native XFS volume management needs `CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN CAP_FOWNER`.** Ownership changes require `CAP_CHOWN`; managing restrictive tenant-owned trees requires `CAP_DAC_OVERRIDE`. XFS quota limits require `CAP_SYS_ADMIN`, and repairing a tenant-owned root project ID requires `CAP_FOWNER`. Set both `AmbientCapabilities=` and `CapabilityBoundingSet=` to these four capabilities, as the manifest-deploy unit does. Ambient capabilities are compatible with `NoNewPrivileges=true` and propagate to the quota subprocesses. A capability grant on the Fred executable alone does not provide this subprocess contract. Scope these capabilities to `docker-backend`; `providerd` does not need them.
 - `ReadWritePaths` should cover the directories holding `callback_db_path`, `diagnostics_db_path`, `releases_db_path`, `retention_db_path`, and `volume_data_path`. The authoritative retention database is required even when `retain_on_close` is false.
 
-`TimeoutStopSec` should comfortably exceed the graceful-drain window so systemd
-doesn't SIGKILL mid-shutdown. For `providerd` this window is `shutdown_timeout`
-from your config (default 30s). Docker-backend has two sequential bounds: a
-fixed 30s HTTP-server shutdown followed by a fixed 90s backend-worker drain.
-Configure its unit comfortably above the combined two minutes so the binary can
-report a typed drain failure and exit non-zero rather than being killed first;
-neither Docker bound is configurable. Use `TimeoutStopSec=180s` (or a larger
-site value) and verify the rendered live unit with
-`systemctl show fred-docker-backend -p TimeoutStopUSec` before rollout. The
-common 90-second systemd default is insufficient. The manifest-deploy unit must
-be updated separately before relying on this graceful runtime-latch path.
+`TimeoutStopSec` should exceed the graceful-drain window so systemd does not
+SIGKILL mid-shutdown. For `providerd` this window is `shutdown_timeout` from your
+config (default 30s). The `docker-backend` command shares one 75-second deadline
+across HTTP shutdown and backend-worker drain. HTTP shutdown gets at most
+30 seconds; backend drain uses the remaining budget. The common 90-second
+systemd default therefore leaves time to report a typed drain failure and exit
+nonzero, without a deployment change. A longer existing unit allowance remains
+compatible. Direct Go callers of `Backend.Stop` retain its 90-second default;
+`StopContext` lets a process owner provide its remaining shutdown budget.
 
 ---
 
@@ -685,6 +684,13 @@ filesystem-level snapshot (LVM, ZFS, btrfs) — bbolt files are crash-consistent
 Restoring a complete matching snapshot intentionally preserves the same lineage,
 so fence the original backend before the restored copy starts.
 
+Include `<callback_db_path>.image-staging/image-import-debit-v1` with the matching
+Docker journals and image storage. This record preserves the allowance for
+imports whose completion is unproven; it is not disposable staging content.
+Capture it in the same consistent backup and preserve outstanding image-helper
+receipts in `callbacks.db`. Clearing an outstanding debit requires the separate
+offline recovery procedure with Fred and Docker stopped.
+
 `placement_store_db_path` is specifically not hot-swappable. Never copy over,
 unlink, rename, rotate, or restore that pathname while `providerd` is running;
 the process binds the exact private single-link inode it opened and permanently
@@ -816,6 +822,177 @@ forward-fix; never point v0.13 at it or discard it in favor of a fresh file.
 
 ## Upgrades
 
+This release adds exact maintenance IDs to terminal callbacks. Drain all pending
+restart/update commands and callback outboxes before replacing the binaries;
+update backends and provider together while mutation ingress is fenced. Legacy
+acceptance records do not prove successful deployment, and callbacks without a
+maintenance ID cannot promote pending payloads. Previously overwritten payloads
+are not automatically reconstructed by this change.
+
+Existing shared `/data/docker` deployments keep their storage layout and
+`overlay2` configuration. Image admission requires no new filesystem, partition,
+quota retagging or Docker data migration. For Docker's containerd image store,
+set `image_data_path` to its actual content directory, which may reside outside
+`DockerRootDir` and on a different filesystem. Classic Docker storage continues
+to use the daemon's reported data root automatically.
+Bounded image ingestion supports classic `overlay2` and containerd's `overlayfs`
+snapshotter. Other image stores, including drivers that copy entire parent
+filesystems for each layer, prevent backend startup because they require a
+different import-space model. The existing deployment's `overlay2` setting is
+supported without changes.
+For classic Docker, import-space accounting assumes the daemon's default
+temporary directory under `DockerRootDir/tmp`. An external `DOCKER_TMPDIR`
+override is not reported by Docker's API and is outside that accounting; the
+supported allowance requires default daemon staging. The existing deployment
+does not set an override. Separate accounting for an external override is not
+implemented.
+
+Registry requests now originate from `docker-backend` over HTTPS, using its
+process proxy environment and system certificate roots. Registries, blob CDNs
+and authentication endpoints must support HTTP/1.1; each exchange uses a fresh
+connection. Verify that reachability as the backend service user before the
+stopped upgrade, including redirects and resumed blob reads. Docker daemon mirrors,
+`insecure-registries` and `/etc/docker/certs.d` do not configure these requests.
+Provide registry reachability and trusted CA certificates to the backend process
+before upgrading; plaintext fallback is disabled even for private IPs.
+
+Before Docker writes image content, Fred stages the selected immutable image
+under `<callback_db_path>.image-staging`. It verifies the exact
+compressed blobs, image configuration and expanded layers, including their
+digests and bounded file and metadata content. Docker imports those verified
+bytes through `ImageLoad`; it does not fetch them again from the registry.
+Malformed or unsupported layer structures and images exceeding the admission
+budgets are rejected before import. First ingestion adds verification work and
+temporary staging space; reuse of an already pinned local image needs no
+registry access once its verified allocation allowance has been recorded.
+Pins record verification and physical import bounds separately. The verification
+bound covers decoded tar bytes, including padding and metadata, independently
+of their physical disk estimate. Import allocation includes classic Docker's
+retained tar-split metadata and repeated layer occurrences. Highly compressed
+metadata-heavy images can therefore require more import headroom than before.
+
+Before dispatch, Fred durably records the import allowance in
+`<callback_db_path>.image-staging/image-import-debit-v1`. An admitted import
+runs under the loader's lifetime after admission, with a 30-minute ceiling from
+dispatch; tenant cancellation or the pull timeout does not abort the admitted
+import. A lease close returns breaker-neutral `503 lifecycle_pending` while its
+owned worker drains. The upgraded providerd defers that exact response through
+its bounded close scheduler, avoiding close-event poisoning. Use the stopped
+upgrade path so an older providerd cannot misclassify the new pending response.
+Staging files and capacity
+ownership remain held until completion. Shutdown closes import admission and
+gives those requests the remaining process shutdown budget before
+canceling their owner; it drains them before closing stores. Clean
+upload and terminal completion release that import's allowance, including when
+Docker reports a completed refusal. A lost, malformed or timed-out response
+keeps the unproven allocation charged across restarts. There is no automatic
+expiry or cleanup of this outstanding amount. Preserve the record and use the
+[offline recovery procedure](OPERATIONS.md#recovering-outstanding-image-import-allocation)
+if it prevents admission. For a planned stop, fence new mutations and let
+admitted lifecycle work quiesce, then require
+`fred_docker_backend_image_import_pending_bytes == 0` while the backend is still
+running. A shutdown deadline can otherwise leave an admitted import unresolved.
+The record now uses `FREDIMG2` accounting without changing its filename. An empty
+older `FREDIMG1` record remains readable and upgrades on the next write. A positive
+older record refuses startup without modifying its bytes: the old allowance
+does not cover all retained metadata. Use the same external runtime drain,
+matching backup and offline recovery procedure before clearing that debt.
+Writing `FREDIMG2` debt or pins with `verification_bytes` also makes those records
+incompatible with earlier PR candidates that reject unknown formats or fields.
+Preserve the stopped, matching pre-upgrade backup for any rollback; never remove
+new accounting fields to make an older reader accept the journal.
+
+Image management defaults to a 10 GiB staged-content and expanded-image limit,
+2 GiB free-space floor, and 85%/75% GC high/low thresholds
+(`image_max_size_mb`, `image_disk_min_free_mb`, `image_gc_high_percent`,
+`image_gc_low_percent`). The verified peak import allowance cannot exceed twice
+the new-image size budget. Existing pinned or already-local execution content
+is not rejected solely because that size limit was lowered; missing pinned
+content is recovered by its exact digest under its saved allowance.
+Before staging, Fred checks the configured image allowance above the free-space
+floor. After verification, it checks the conservative import footprint and floor
+again before importing. Up to four staging owners reserve their full budgets.
+Concurrent preparations of one resolved source digest and platform share one
+verified download/import; each lease publishes its own pin with its own journal
+authority. Followers do not consume staging slots. Pinned and locally reusable
+image preparations bypass the staging queue. A sole tenant can use all four
+slots for distinct images; when a slot becomes available, the waiting tenant
+with the fewest active stages is selected, with arrival order breaking ties.
+Requests within a tenant remain FIFO. This needs no per-address configuration
+and accommodates aggregator tenants sharing one on-chain address. It neither
+preempts occupied slots nor provides isolation against multiple tenant addresses.
+Imports and deferred-extraction probes account for concurrent owners. Registry
+and import I/O do not hold the admission lock. Ordinary local launches check
+actual free space plus allocations whose completion is unknown, without
+charging live owned imports a second time. These are sampled headroom checks, not physical space
+reservations against concurrent tenant or other host writes; continue sizing
+the tenant disk pool and host storage with adequate headroom.
+
+Collection preserves images referenced by containers or durable lease image
+pins. After all fatal startup checks succeed, startup backfills active legacy
+pins only from an exact recovered container cohort and immutable image
+inspection; it never resolves a tag to
+invent historical identity. Active or retained manifests still missing pins,
+and retained rows without a manifest, inhibit deletion. Legacy retained rows can
+keep collection inhibited until restore or safe reaping, normally up to the
+remaining retention grace (90 days by default) plus a sweep interval. Unresolved
+reaping can extend that window. Treat this as a diagnostic during upgrade;
+alert only when it coincides with sustained disk pressure, rather than paging on
+the inhibited counter alone. Failed and superseded
+release history does not retain images unless a pending compensation needs its
+exact source. Incomplete collection inventories do not reject unrelated image
+admission when its identity and capacity can still be established. Docker
+removal conflicts (including multiple tags) also preserve the image; collection
+never forces deletion or races mutable tag names. If enough space cannot be
+reclaimed, admission remains closed. Review these settings against the usable
+capacity of the filesystems holding image content, staging and journals.
+
+Fresh image pins have a 100,000-pin host-wide limit and a 10,000-pin limit per
+tenant. Existing pins remain reusable and recoverable when a limit is reached;
+new pins can be refused until obsolete history is safely pruned. Tenant attribution comes
+from durable authority. Historical pins whose tenant cannot yet be proved count
+toward every tenant's fresh-pin limit as well as the global limit. Investigate
+pin-capacity and backfill warnings before rollout; do not delete or rewrite
+journal rows to make room.
+
+Production image collection requires one backend storage lineage per Docker
+daemon. Fred claims the persistent Docker metadata volume
+`fred-image-cache-owner-v1` with its storage identity and backend name; another
+lineage cannot start against that daemon. Development backends share a durable
+shared-mode marker and do not delete cached images. Shared and exclusive modes
+cannot coexist. The marker survives shutdown: do not remove it while any
+participating lineage has active or retained authority. Moving a development
+daemon to production requires draining every lineage before an offline marker
+transition. Drain older backends before introducing this ownership protocol.
+Immutable image pins live in `callbacks.db`; preserve that journal with its
+matching release and retention stores, outstanding import debit and daemon
+ownership marker. Constructing a pin journal is read-only. Its first pin or
+positive legacy backfill creates the new bucket and is the downgrade boundary:
+older binaries that reject unknown journal buckets cannot reopen it. Backfill
+runs after the final storage identity check; a first start refused by any earlier
+fatal recovery check does not create the optional pin bucket.
+
+Containerd pins also retain the verified extraction allowance. A legacy pin
+without a separate verification bound needs one exact-digest verification and import, even if
+the image is local; missing immutable recovery identity refuses admission
+without resolving a mutable tag. Every containerd admission creates and removes
+a stopped, journal-owned probe with its own extraction allowance. This
+forces any deferred extraction before pinning or use. The probe never starts,
+has no network, and overrides image `VOLUME` declarations with tmpfs. Content
+inspection uses the same fixed helper construction: declared volumes do not
+create anonymous copies, and image working directories are not materialized.
+Archive reads preserve the image's files and ownership for user resolution,
+volume ownership and extraction. Pending
+helper receipts block subsequent containerd ingestion across restarts; an
+unknown Create result also fences the current storage authority. Use the
+[unsettled-effects runbook](OPERATIONS.md#unsettled-docker-effects) for unresolved
+helper requests. Classic `overlay2` deployments need no configuration change.
+
+An admitted image is pinned by immutable identity for its lease and manifest.
+Replaying the same manifest reuses that identity even if a mutable tag has moved.
+To deploy new image content, change the manifest image reference, preferably to
+its new digest.
+
 Image admission requires Docker Engine **28.1+ (API 1.49+)**. The backend probes
 the daemon and verifies the negotiated API during construction, before storage
 initialization or recovery; an unsupported API or failed probe prevents startup.
@@ -825,10 +1002,15 @@ Before upgrading,
 check image labels against the reserved namespaces in the
 [manifest guide](docs/manifest-guide.md). Existing containers are not rewritten.
 When first recreating a legacy containerd multi-platform image, the backend may
-need a one-time registry request for its exact selected manifest digest so that
-the manifest becomes independently addressable. Cached layers alone do not
-guarantee this step can run offline. Classic images and already-prepared
-platform manifests remain usable without registry access.
+need to ingest its exact selected manifest digest so that the manifest becomes
+independently addressable. Image inspection remains read-only: it reports the
+missing local identity, and Fred's bounded ingestion verifies and imports that
+identity through `ImageLoad`. Cached layers alone do not guarantee this step can
+run offline. Classic images and containerd pins with recorded verification
+allowances remain usable without registry access. If pinned content is missing during restore,
+Fred can recover it through the same bounded ingestion when the pin records its
+immutable repository digest. Missing content without that digest is refused;
+recovery never resolves the old mutable tag to select a replacement.
 
 Fred releases are tagged on GitHub with binaries via `goreleaser`. The release process is:
 
@@ -844,7 +1026,16 @@ Fred releases are tagged on GitHub with binaries via `goreleaser`. The release p
    binary from its archive. The locally built backend image is for stateless
    development (see [Docker images](#docker-images)).
 2. Pull the new binary or image to your hosts.
-3. Roll the backend binaries one at a time when the release's backend protocol
+3. Fence new mutation ingress and let existing backend work drain before each
+   backend restart. Stop the backend normally and wait for successful shutdown;
+   admitted Docker Create/Start exchanges receive 30 seconds of completion grace
+   after cancellation or shutdown. Admitted image imports are independent of
+   tenant cancellation and receive the remaining backend-worker drain on shutdown.
+   The backend drains these owners before closing journals. The command shares
+   its 75-second shutdown budget across HTTP and worker drain, fitting the
+   existing 90-second systemd default. A forced kill or genuine daemon timeout
+   can still leave launch debt or unknown image-import allocation.
+   Roll the backend binaries one at a time when the release's backend protocol
    is backward-compatible, then stop the single `providerd` instance and start
    the upgraded binary. Never overlap the old and new `providerd` processes for
    the same provider and backend fleet. This does **not** apply to the v0.13.0
@@ -1074,7 +1265,24 @@ substrate mutation. This release deliberately performs no in-place conversion
 and infers no missing authority for those shapes. Restore a known-good supported
 snapshot or use a separate proof-bearing repair procedure before continuing.
 
-After the backup, seal each existing v0.13 storage lineage exactly once before
+After the backup, inspect each stopped v0.13 backend's release history with the
+new binary's read-only tool, before storage-identity adoption:
+
+```bash
+placement-preflight -inspect-releases /var/lib/fred/releases.db
+```
+
+This standalone mode needs no provider configuration or network access and
+never edits the journal. Its JSON includes `histories`, `releases` and
+`findings` with `lease_uuid`, `version`, `status` and `policy_error`. Policy
+findings are advisory and return exit zero: valid historical manifests remain
+readable even if current provision/update admission rejects their labels or
+user syntax. Malformed structure, topology or journal identity returns nonzero
+and must be resolved before adoption; do not delete release history. Reserved
+legacy runtime labels are filtered when containers are materialized. Archive
+the report with the stopped backup.
+
+Then seal each existing v0.13 storage lineage exactly once before
 its first normal upgraded start:
 
 ```bash

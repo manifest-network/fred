@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 )
 
@@ -26,17 +28,43 @@ const imageInspectionRecoveryTimeout = 10 * time.Second
 // receipts. Neither path exposes a raw Create/Remove or a caller-selected ID.
 type imageInspectionCoordinator struct {
 	journal   *shared.ImageInspectionJournal
-	creator   *imageexec.DockerCreator
+	creator   *imageexec.InspectionCreator
 	observer  *daemonLaunchObserver
-	sdk       dockerSDKView
+	sdk       imageInspectionDaemon
 	lifetime  context.Context
 	authorize substratemutation.Authorize
 	complete  substratemutation.Complete
 	resolve   func(string, substratemutation.StepResult) error
 	authority func() error
+	fence     func(string, error) error
 	mu        sync.Mutex
-	active    map[string]struct{}
+	active    map[string]imageInspectionOwnership
 }
+
+// Keep only the method values the helper protocol needs. Retaining a general
+// SDK or an interface backed by it would also retain a route to Start or volume
+// creation, outside the fixed inspection constructor.
+type imageInspectionDaemon struct {
+	CopyFromContainer func(context.Context, string, string) (io.ReadCloser, container.PathStat, error)
+	ContainerInspect  func(context.Context, string) (container.InspectResponse, error)
+	ContainerRemove   func(context.Context, string, container.RemoveOptions) error
+}
+
+// These states are minted only by the receipt owner. A live content helper may
+// coexist with image admission after its Create completion is durable; probes
+// remain exclusive through cleanup. Live owners supply completion signals;
+// abandoned or recovery-owned receipts cannot promise progress.
+type imageInspectionOwnership interface{ ownsImageInspection() }
+
+type contentInspectionCreating struct{ changed chan struct{} }
+type contentInspectionReady struct{ receipt shared.ImageInspectionReceipt }
+type liveUnpackInspection struct{ changed chan struct{} }
+type exclusiveImageInspection struct{}
+
+func (*contentInspectionCreating) ownsImageInspection() {}
+func (contentInspectionReady) ownsImageInspection()     {}
+func (*liveUnpackInspection) ownsImageInspection()      {}
+func (exclusiveImageInspection) ownsImageInspection()   {}
 
 func newImageInspectionCoordinator(
 	client *DockerClient,
@@ -46,8 +74,9 @@ func newImageInspectionCoordinator(
 	complete substratemutation.Complete,
 	resolve func(string, substratemutation.StepResult) error,
 	authority func() error,
+	fence func(string, error) error,
 ) (*imageInspectionCoordinator, error) {
-	if client == nil || client.creator == nil || client.launchObserver == nil || lifetime == nil || authorize == nil || complete == nil || resolve == nil || authority == nil {
+	if client == nil || client.creator == nil || client.launchObserver == nil || lifetime == nil || authorize == nil || complete == nil || resolve == nil || authority == nil || fence == nil {
 		return nil, errors.New("image inspection requires a client, journal and backend mutation lifetime")
 	}
 	if client.inspections != nil {
@@ -61,9 +90,14 @@ func newImageInspectionCoordinator(
 		return nil, err
 	}
 	c := &imageInspectionCoordinator{
-		journal: journal, creator: client.creator, observer: client.launchObserver, sdk: client.client,
-		lifetime: lifetime, authorize: authorize, complete: complete, resolve: resolve, authority: authority,
-		active: make(map[string]struct{}),
+		journal: journal, creator: client.creator.ForInspection(), observer: client.launchObserver,
+		sdk: imageInspectionDaemon{
+			CopyFromContainer: client.client.CopyFromContainer,
+			ContainerInspect:  client.client.ContainerInspect,
+			ContainerRemove:   client.client.ContainerRemove,
+		},
+		lifetime: lifetime, authorize: authorize, complete: complete, resolve: resolve, authority: authority, fence: fence,
+		active: make(map[string]imageInspectionOwnership),
 	}
 	client.inspections = c
 	return c, nil
@@ -90,6 +124,99 @@ func (d *DockerClient) openImageInspection(ctx context.Context, image imageexec.
 }
 
 func (c *imageInspectionCoordinator) open(ctx context.Context, image imageexec.Image, origin shared.ImageInspectionOrigin) (_ *imageInspectionSession, err error) {
+	return c.openFor(ctx, image, origin, imageContentInspection)
+}
+
+type imageInspectionPurpose uint8
+
+const (
+	imageContentInspection imageInspectionPurpose = iota
+	imageUnpackInspection
+)
+
+// verifyImageUnpacked makes Docker finish any deferred snapshot extraction while
+// the caller still owns the verified image's import allowance. Container Create
+// forces unpacking; this helper is never started and its image volumes are
+// covered by inert tmpfs declarations, so Create cannot copy their contents to
+// anonymous host volumes. The ordinary receipt protocol owns every effect.
+func (d *DockerClient) verifyImageUnpacked(ctx context.Context, image imageexec.Image, origin shared.ImageInspectionOrigin) error {
+	if err := d.creator.ValidateImage(image); err != nil {
+		return err
+	}
+	if d.inspections == nil {
+		return errors.New("docker image inspection owner is not bound")
+	}
+	session, err := d.inspections.openFor(ctx, image, origin, imageUnpackInspection)
+	if err != nil {
+		return err
+	}
+	return session.close()
+}
+
+// requireImageInspectionsSettled waits for live creators and unpack cleanup.
+// A settled content helper's owned read session can coexist with image admission.
+// Abandoned or uncertain work retains its durable exclusion after restart;
+// empty daemon inventory alone cannot settle a response-lost Create.
+func (d *DockerClient) requireImageInspectionsSettled(ctx context.Context) error {
+	if d.inspections == nil {
+		return errors.New("docker image inspection owner is not bound")
+	}
+	c := d.inspections
+	for {
+		if err := errors.Join(ctx.Err(), c.authority(), c.lifetime.Err()); err != nil {
+			return err
+		}
+		changed, err := c.admissionWait()
+		if err != nil || changed == nil {
+			return err
+		}
+		if err := c.waitForAdmissionChange(ctx, changed); err != nil {
+			return err
+		}
+	}
+}
+
+// waitForAdmissionChange waits only on an existing live owner's signal. The
+// caller must inspect authority and receipts again after waking: cleanup may
+// have handed an unresolved obligation to recovery instead of settling it.
+func (c *imageInspectionCoordinator) waitForAdmissionChange(ctx context.Context, changed <-chan struct{}) error {
+	select {
+	case <-changed:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.lifetime.Done():
+		return c.lifetime.Err()
+	}
+}
+
+func (c *imageInspectionCoordinator) admissionWait() (<-chan struct{}, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	receipts, err := c.journal.List()
+	if err != nil {
+		return nil, err
+	}
+	var changed <-chan struct{}
+	for _, receipt := range receipts {
+		switch ownership := c.active[receipt.ID()].(type) {
+		case contentInspectionReady:
+			if ownership.receipt.CreationSettled() && receipt.CreationSettled() {
+				continue
+			}
+		case *contentInspectionCreating:
+			changed = ownership.changed
+			continue
+		case *liveUnpackInspection:
+			changed = ownership.changed
+			continue
+		}
+		return nil, errors.New("image inspection completion or cleanup remains pending")
+	}
+	return changed, nil
+}
+
+func (c *imageInspectionCoordinator) openFor(ctx context.Context, image imageexec.Image, origin shared.ImageInspectionOrigin, purpose imageInspectionPurpose) (_ *imageInspectionSession, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -121,7 +248,11 @@ func (c *imageInspectionCoordinator) open(ctx context.Context, image imageexec.I
 					c.mu.Lock()
 					receipt, reserveErr := c.journal.Reserve(prepared)
 					if reserveErr == nil {
-						c.active[receipt.ID()] = struct{}{}
+						if purpose == imageContentInspection {
+							c.active[receipt.ID()] = &contentInspectionCreating{changed: make(chan struct{})}
+						} else {
+							c.active[receipt.ID()] = &liveUnpackInspection{changed: make(chan struct{})}
+						}
 						s.receipt = receipt
 					}
 					c.mu.Unlock()
@@ -130,15 +261,18 @@ func (c *imageInspectionCoordinator) open(ctx context.Context, image imageexec.I
 					}
 					outcome = c.observer.run(ctx, func(ctx context.Context) error {
 						var createErr error
-						response, createErr = c.creator.Create(ctx, image, &container.Config{Labels: inspectionLabels(receipt)}, nil, nil, receipt.Name())
+						response, createErr = c.creator.Create(ctx, image, inspectionLabels(receipt), receipt.Name())
 						return createErr
 					})
+					if purpose == imageUnpackInspection && !outcome.settled {
+						return c.fence("image unpack probe completion", outcome.completionError())
+					}
 					return outcome.completionError()
 				})
 				if err := c.resolve(shared.ImageInspectionCreationStep, step); err != nil {
 					return errors.Join(outcome.err, err)
 				}
-				settled, err := c.journal.RecordCreationSettled(s.receipt, response.ID, completed)
+				settled, err := c.recordCreationSettled(s.receipt, response.ID, completed)
 				if err != nil {
 					return errors.Join(outcome.err, err)
 				}
@@ -180,7 +314,8 @@ func (c *imageInspectionCoordinator) open(ctx context.Context, image imageexec.I
 }
 
 func inspectionLabels(r shared.ImageInspectionReceipt) map[string]string {
-	return map[string]string{
+	labels := imageexec.DirectCreationLabels()
+	maps.Copy(labels, map[string]string{
 		"fred.inspection.schema":     "1",
 		"fred.inspection.id":         r.ID(),
 		"fred.inspection.backend":    r.Backend(),
@@ -190,7 +325,8 @@ func inspectionLabels(r shared.ImageInspectionReceipt) map[string]string {
 		"fred.inspection.lease_uuid": r.LeaseUUID(),
 		LabelImageID:                 r.ImageID(),
 		LabelImageReference:          r.ImageReference(),
-	}
+	})
+	return labels
 }
 
 func (s *imageInspectionSession) copy(ctx context.Context, path string) (io.ReadCloser, container.PathStat, error) {
@@ -249,8 +385,28 @@ func (s *imageInspectionSession) close() error {
 
 func (c *imageInspectionCoordinator) release(id string) {
 	c.mu.Lock()
+	switch ownership := c.active[id].(type) {
+	case *contentInspectionCreating:
+		close(ownership.changed)
+	case *liveUnpackInspection:
+		close(ownership.changed)
+	}
 	delete(c.active, id)
 	c.mu.Unlock()
+}
+
+func (c *imageInspectionCoordinator) recordCreationSettled(receipt shared.ImageInspectionReceipt, id string, completed substratemutation.CompletedStep) (shared.ImageInspectionReceipt, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	settled, err := c.journal.RecordCreationSettled(receipt, id, completed)
+	if err != nil {
+		return shared.ImageInspectionReceipt{}, err
+	}
+	if creating, ok := c.active[receipt.ID()].(*contentInspectionCreating); ok {
+		c.active[receipt.ID()] = contentInspectionReady{receipt: settled}
+		close(creating.changed)
+	}
+	return settled, nil
 }
 
 // inspectionRecoveryReport describes independently retained helper obligations.
@@ -316,7 +472,7 @@ func (c *imageInspectionCoordinator) Recover(ctx context.Context) (inspectionRec
 	if err == nil {
 		for _, receipt := range receipts {
 			if _, busy := c.active[receipt.ID()]; !busy {
-				c.active[receipt.ID()] = struct{}{}
+				c.active[receipt.ID()] = exclusiveImageInspection{}
 				claimed = append(claimed, receipt)
 			}
 		}
@@ -427,8 +583,9 @@ func (c *imageInspectionCoordinator) inspect(ctx context.Context, receipt shared
 		}
 	}
 	for key := range actual.Config.Labels {
-		lower := strings.ToLower(key)
-		if strings.HasPrefix(lower, "fred.") || strings.HasPrefix(lower, "com.docker.compose.") || strings.HasPrefix(lower, "traefik.") {
+		// Docker inherits image labels verbatim. Admission and cleanup must
+		// use the same canonical policy, including its Unicode case folding.
+		if manifest.IsReservedLabelKey(key) {
 			if _, owned := labels[key]; !owned {
 				return "", false, errors.New("image inspection carries foreign reserved labels")
 			}

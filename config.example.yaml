@@ -154,10 +154,9 @@ tls_key_file: ""
 # =============================================================================
 # RATE LIMITING
 # =============================================================================
-# Fred applies ONE token-bucket limiter across ALL HTTP routes, keyed per
-# client IP. It is "global" only in the sense of being a single limiter shared
-# by every route (not per-route) — it is NOT one shared budget for the whole
-# API: each distinct client IP gets its own bucket.
+# Fred shares a per-IP token bucket across tenant and observability routes.
+# POST /callbacks/provision has separate admission, described below. Each
+# distinct client IP has its own bucket; there is no fleet-wide IP budget.
 #
 # Because the bucket is shared across routes, all direct API operations from a
 # given client IP contend for the SAME budget — lease restore, update, restart,
@@ -166,10 +165,20 @@ tls_key_file: ""
 # fred_api_rate_limit_rejections_total{limiter="global"} (a single series, with
 # no route/path/method dimension); the per-tenant limiter reports {limiter="tenant"}.
 #
+# CALLBACKS: independent fixed 100 RPS / 200 burst buckets apply to callback
+# ingress IPs and to HMAC-verified backend storage identities. Valid callbacks
+# can bypass an exhausted ingress IP bucket, then spend their storage bucket;
+# tenant traffic sharing a NAT cannot consume that storage budget. Rejections
+# report limiter="callback_ingress" or limiter="callback_storage". Before JSON
+# decoding, callback bodies are bounded to 1 MiB, 256 structural tokens, and 16
+# nesting levels. These protocol bounds and callback bucket sizes are fixed,
+# unaffected by rate_limit_rps/burst below. Captured, still-valid signed replays
+# spend the authenticated storage budget; TLS protects the callback envelope.
+#
 # BEHIND A REVERSE PROXY: if fred sits behind a proxy (e.g. Traefik) and
 # trusted_proxies (below) is NOT configured, every request appears to come from
 # the proxy's IP, so all clients collapse into ONE bucket and this behaves as a
-# single global cap at rate_limit_rps. Set trusted_proxies so the limiter keys
+# single tenant/observability cap at rate_limit_rps. Set trusted_proxies so the limiter keys
 # on the real client IP from X-Forwarded-For.
 #
 # TUNING: the defaults below are protective values suitable for production. For

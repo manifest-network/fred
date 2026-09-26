@@ -33,6 +33,7 @@ var (
 	ErrMaintenanceCommandNotPending = errors.New("maintenance command is not pending")
 	ErrMaintenanceJournalCorrupt    = errors.New("maintenance command journal is corrupt")
 	ErrMaintenanceHistoryFull       = errors.New("maintenance command history is full")
+	ErrMaintenancePendingFull       = errors.New("maintenance pending admission budget is full")
 )
 
 const maintenanceCommandSchema = 1
@@ -87,6 +88,8 @@ func parseMaintenanceCommandKind(value string) MaintenanceCommandKind {
 
 // MaintenanceCommandOutcome is a durable terminal receipt. Pending is
 // represented by the explicit zero value; all nonzero outcomes are immutable.
+// Accepted updates require confirmed backend success and local payload commit;
+// restart acceptance has no pending payload to promote.
 type MaintenanceCommandOutcome uint8
 
 const (
@@ -101,6 +104,7 @@ const (
 	// MaintenanceOutcomeBackendUnavailable remains readable for legacy terminal
 	// receipts. A per-call NotDispatched outcome cannot produce one now.
 	MaintenanceOutcomeBackendUnavailable
+	MaintenanceOutcomeExecutionFailed
 )
 
 func (outcome MaintenanceCommandOutcome) String() string {
@@ -123,6 +127,8 @@ func (outcome MaintenanceCommandOutcome) String() string {
 		return "capacity_refused"
 	case MaintenanceOutcomeBackendUnavailable:
 		return "backend_unavailable"
+	case MaintenanceOutcomeExecutionFailed:
+		return "execution_failed"
 	default:
 		return "invalid"
 	}
@@ -148,6 +154,8 @@ func parseMaintenanceCommandOutcome(value string) (MaintenanceCommandOutcome, bo
 		return MaintenanceOutcomeCapacityRefused, true
 	case "backend_unavailable":
 		return MaintenanceOutcomeBackendUnavailable, true
+	case "execution_failed":
+		return MaintenanceOutcomeExecutionFailed, true
 	default:
 		return MaintenanceOutcomePending, false
 	}
@@ -585,7 +593,7 @@ func encodeMaintenanceSettlement(command MaintenanceCommand, settlement maintena
 	if !command.Valid() {
 		return nil, "", ErrInvalidMaintenanceCommand
 	}
-	if outcome > MaintenanceOutcomeBackendUnavailable {
+	if outcome > MaintenanceOutcomeExecutionFailed {
 		return nil, "", ErrInvalidMaintenanceCommand
 	}
 	persistedPayload := append([]byte(nil), command.payload...)
@@ -925,7 +933,8 @@ func (s *Store) beginMaintenanceCommand(
 		return MaintenanceCommandAdmission{}, ErrMaintenanceCommandConflict
 	}
 	var result MaintenanceCommandAdmission
-	err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+	err := s.updateMaintenanceAuthority(func(journal *maintenanceJournalTransaction) error {
+		tx := journal.tx
 		if err := validateMaintenanceAdmissionTx(tx, command); err != nil {
 			return err
 		}
@@ -977,10 +986,7 @@ func (s *Store) beginMaintenanceCommand(
 		if len(encoded) > maxMaintenanceCommandAdmissionBytes {
 			return fmt.Errorf("%w: command exceeds %d-byte admission budget", ErrInvalidMaintenanceCommand, maxMaintenanceCommandAdmissionBytes)
 		}
-		if err := records.Put(key, encoded); err != nil {
-			return err
-		}
-		if err := pending.Put([]byte(command.leaseUUID), []byte(command.id.String())); err != nil {
+		if err := journal.write(encoded); err != nil {
 			return err
 		}
 		claim := MaintenanceCommandClaim{issuer: s, command: command}
@@ -1069,13 +1075,14 @@ func (s *Store) settleMaintenancePhase(claim MaintenanceCommandClaim, settlement
 func (s *Store) settleMaintenancePhaseReceipt(claim MaintenanceCommandClaim, settlement maintenanceSettlement, phase maintenanceJournalPhase) (MaintenanceCommandRecord, error) {
 	outcome := settlement.outcome
 	if s == nil || !claim.Valid() || claim.issuer != s || outcome == MaintenanceOutcomePending ||
-		outcome > MaintenanceOutcomeBackendUnavailable {
+		outcome > MaintenanceOutcomeExecutionFailed {
 		return MaintenanceCommandRecord{}, ErrMaintenanceCommandNotPending
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var receipt MaintenanceCommandRecord
-	err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+	err := s.updateMaintenanceAuthority(func(journal *maintenanceJournalTransaction) error {
+		tx := journal.tx
 		pending, records, err := maintenanceCommandBuckets(tx)
 		if err != nil {
 			return err
@@ -1105,10 +1112,7 @@ func (s *Store) settleMaintenancePhaseReceipt(claim MaintenanceCommandClaim, set
 		if err != nil {
 			return err
 		}
-		if err := records.Put(key, settled); err != nil {
-			return err
-		}
-		if err := pending.Delete([]byte(command.leaseUUID)); err != nil {
+		if err := journal.write(settled); err != nil {
 			return err
 		}
 		stored.terminal, stored.phase, stored.payload = true, maintenanceCompleted, nil

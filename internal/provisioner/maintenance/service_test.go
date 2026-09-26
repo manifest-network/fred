@@ -10,6 +10,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/maintenanceid"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
@@ -46,9 +48,19 @@ type maintenanceSeedPlan struct {
 	backendNames  []string
 	inventories   map[string]placement.BackendInventory
 	leaseBackends map[string]string
+	leaseTenants  map[string]string
 }
 
 var maintenanceSeedPlans sync.Map
+
+type maintenanceCallbackFixture struct {
+	verifier  hmacauth.CallbackProofVerifier
+	apply     *placement.AuthenticatedCallbackCoordinator
+	execution *placement.ExecutionCoordinator
+	inventory *maintenanceInventoryRuntime
+}
+
+var maintenanceCallbackFixtures sync.Map
 
 type maintenanceReconciliationChain struct {
 	placement.MaintenanceLeaseReader
@@ -126,6 +138,13 @@ func maintenanceCoordinatorWithRuntimeForTest(
 	control := maintenanceReconciliationChain{MaintenanceLeaseReader: leases}
 	execution, err := coordinator.BindBackendRuntime(inventoryRuntime, control)
 	require.NoError(t, err)
+	verifier, consumer := hmacauth.NewCallbackProofBoundary()
+	callbacks, err := execution.AuthenticatedCallbackCoordinator(consumer)
+	require.NoError(t, err)
+	maintenanceCallbackFixtures.Store(authority, maintenanceCallbackFixture{
+		verifier: verifier, apply: callbacks, execution: execution, inventory: inventoryRuntime,
+	})
+	t.Cleanup(func() { maintenanceCallbackFixtures.Delete(authority) })
 	if value, pending := maintenanceSeedPlans.Load(authority); pending {
 		plan := value.(maintenanceSeedPlan)
 		reconciliation, bindErr := execution.ReconciliationCoordinator(nil, nil)
@@ -141,15 +160,47 @@ func maintenanceCoordinatorWithRuntimeForTest(
 	return result, coordinator.RuntimeController()
 }
 
+// Exercise the public authenticated callback capability. HTTP acceptance cannot
+// manufacture the proof that authorizes promoting an update's replay payload.
+func completeUpdateForTest(t *testing.T, store *placement.Store, id maintenanceid.ID, status backend.CallbackStatus) {
+	t.Helper()
+	record, found, err := store.LookupMaintenanceCommand(testLeaseA, id)
+	require.NoError(t, err)
+	require.True(t, found)
+	command := record.Command()
+	body, err := json.Marshal(backend.CallbackPayload{
+		LeaseUUID: command.LeaseUUID(), MaintenanceID: id.String(), Status: status,
+		BackendStorageID: command.BackendStorageID().String(),
+	})
+	require.NoError(t, err)
+	route, err := url.Parse(command.CallbackURL())
+	require.NoError(t, err)
+	fixtureValue, found := maintenanceCallbackFixtures.Load(store)
+	require.True(t, found)
+	fixture := fixtureValue.(maintenanceCallbackFixture)
+	const secret = "maintenance-external-completion-secret-0123456789"
+	now := time.Now()
+	proof, err := fixture.verifier.VerifyRoutedWithTime(secret, http.MethodPost, route.RequestURI(), body,
+		hmacauth.SignWithTime(secret, http.MethodPost, route.RequestURI(), body, now), command.BackendStorageID().String(),
+		"/callbacks/provision", time.Minute, time.Minute, now)
+	require.NoError(t, err)
+	_, err = fixture.apply.Apply(t.Context(), proof)
+	require.NoError(t, err)
+}
+
 type maintenanceInventoryBackend struct {
 	backend.Backend
+	*maintenanceInventory
+}
+
+type maintenanceInventory struct {
 	mu         sync.Mutex
 	storageID  backendidentity.ID
 	provisions []backend.ProvisionInfo
 	retentions []backend.RetainedLease
 }
 
-func (client *maintenanceInventoryBackend) stage(
+func (client *maintenanceInventory) stage(
 	storageID backendidentity.ID,
 	provisions []backend.ProvisionInfo,
 	retentions []backend.RetainedLease,
@@ -161,7 +212,7 @@ func (client *maintenanceInventoryBackend) stage(
 	client.mu.Unlock()
 }
 
-func (client *maintenanceInventoryBackend) ListProvisionsWithIdentity(
+func (client *maintenanceInventory) ListProvisionsWithIdentity(
 	context.Context,
 ) ([]backend.ProvisionInfo, backendidentity.ID, error) {
 	client.mu.Lock()
@@ -169,7 +220,7 @@ func (client *maintenanceInventoryBackend) ListProvisionsWithIdentity(
 	return append([]backend.ProvisionInfo(nil), client.provisions...), client.storageID, nil
 }
 
-func (client *maintenanceInventoryBackend) ListRetentionsWithIdentity(
+func (client *maintenanceInventory) ListRetentionsWithIdentity(
 	context.Context,
 ) ([]backend.RetainedLease, backendidentity.ID, error) {
 	client.mu.Lock()
@@ -190,7 +241,7 @@ func newMaintenanceInventoryRuntime(runtime maintenanceBackendRuntime) *maintena
 	}
 	for _, client := range runtime.Backends() {
 		if client != nil {
-			result.backends[client.Name()] = &maintenanceInventoryBackend{Backend: client}
+			result.backends[client.Name()] = &maintenanceInventoryBackend{Backend: client, maintenanceInventory: &maintenanceInventory{}}
 		}
 	}
 	return result
@@ -211,8 +262,7 @@ func (runtime *maintenanceInventoryRuntime) wrap(client backend.Backend) backend
 	// replacement backend process. Keep the inventory adapter bound to the
 	// backend returned for this operation rather than the one present when the
 	// coordinator was constructed.
-	wrapper.Backend = client
-	return wrapper
+	return &maintenanceInventoryBackend{Backend: client, maintenanceInventory: wrapper.maintenanceInventory}
 }
 
 func (runtime *maintenanceInventoryRuntime) Route(sku string) backend.Backend {
@@ -354,13 +404,17 @@ func projectMaintenanceSeed(
 	placements := make(map[string]string, len(plan.leaseBackends))
 	reported := make(map[string][]backend.ProvisionInfo, len(plan.backendNames))
 	for leaseUUID, backendName := range plan.leaseBackends {
+		tenant := testTenant
+		if selected := plan.leaseTenants[leaseUUID]; selected != "" {
+			tenant = selected
+		}
 		placements[leaseUUID] = backendName
 		lifecycleID, parseErr := lifecycle.ParseID(leaseUUID)
 		require.NoError(t, parseErr)
 		reported[backendName] = append(reported[backendName],
 			backend.ProvisionInfo{
 				LeaseUUID: leaseUUID, ProviderUUID: testProviderUUID,
-				Tenant: testTenant, BackendName: backendName,
+				Tenant: tenant, BackendName: backendName,
 				LifecycleGeneration: &backend.LifecycleGenerationObservation{
 					Kind: backend.LifecycleGenerationTyped, ID: lifecycleID.String(),
 				},
@@ -1562,33 +1616,45 @@ func TestPendingRecoveryGivesEachBackendAnIndependentLane(t *testing.T) {
 func preparePendingMaintenanceCommands(
 	t *testing.T,
 	count int,
-) (string, []string) {
+) (string, []string, map[string]string) {
 	t.Helper()
 	leaseBackends := make(map[string]string, count)
+	leaseTenants := make(map[string]string, count)
 	leaseUUIDs := make([]string, 0, count)
 	requestIDs := make([]maintenanceid.ID, 0, count)
 	for index := 1; index <= count; index++ {
 		leaseUUID := fmt.Sprintf("30000000-0000-4000-8000-%012d", index)
 		leaseBackends[leaseUUID] = "backend-a"
+		leaseTenants[leaseUUID] = testTenant
+		if count > 16 {
+			leaseTenants[leaseUUID] = fmt.Sprintf("tenant-%d", index/8)
+		}
 		leaseUUIDs = append(leaseUUIDs, leaseUUID)
 		requestIDs = append(requestIDs, requestID(t,
 			fmt.Sprintf("40000000-0000-4000-8000-%012d", index)))
 	}
 	store, path := newPlacementAuthorityForTopology(t, leaseBackends)
-	initial := newTestService(t, store, &fakeBackend{
-		restart: func(backend.RestartRequest) error {
-			return errors.New("initial ambiguous transport result")
-		},
-	}, nil, leaseUUIDs...)
+	value, found := maintenanceSeedPlans.Load(store)
+	require.True(t, found)
+	plan := value.(maintenanceSeedPlan)
+	plan.leaseTenants = leaseTenants
+	maintenanceSeedPlans.Store(store, plan)
+	chain := testChain(leaseUUIDs...)
+	for lease, tenant := range leaseTenants {
+		chain.leases[lease].Tenant = tenant
+	}
+	client := &fakeBackend{restart: func(backend.RestartRequest) error { return errors.New("initial ambiguous transport result") }}
+	initial, err := NewService(Config{Coordinator: maintenanceCoordinatorForTest(t, store, chain, fakeRouter{backend: client}, nil)})
+	require.NoError(t, err)
 	for index, leaseUUID := range leaseUUIDs {
 		result := initial.Execute(t.Context(), Command{
 			ID: requestIDs[index], LeaseUUID: leaseUUID,
-			Tenant: testTenant, Kind: KindRestart,
+			Tenant: leaseTenants[leaseUUID], Kind: KindRestart,
 		})
 		require.Equal(t, OutcomeServiceUnavailable, result.Outcome())
 	}
 	require.NoError(t, store.Close())
-	return path, leaseUUIDs
+	return path, leaseUUIDs, leaseTenants
 }
 
 func TestPendingRecoveryBoundsEachBackendBatch(t *testing.T) {
@@ -1596,15 +1662,18 @@ func TestPendingRecoveryBoundsEachBackendBatch(t *testing.T) {
 		expectedRecoveryBatchLimit = 32
 		pendingCount               = expectedRecoveryBatchLimit + 8
 	)
-	path, leaseUUIDs := preparePendingMaintenanceCommands(t, pendingCount)
+	path, leaseUUIDs, leaseTenants := preparePendingMaintenanceCommands(t, pendingCount)
 	reopened := reopenPlacementAuthority(t, path)
 	t.Cleanup(func() { _ = reopened.Close() })
 	backendClient := &fakeBackend{restart: func(backend.RestartRequest) error {
 		return errors.New("backend remains unavailable")
 	}}
-	service := newTestService(
-		t, reopened, backendClient, nil, leaseUUIDs...,
-	)
+	chain := testChain(leaseUUIDs...)
+	for lease, tenant := range leaseTenants {
+		chain.leases[lease].Tenant = tenant
+	}
+	service, err := NewService(Config{Coordinator: maintenanceCoordinatorForTest(t, reopened, chain, fakeRouter{backend: backendClient}, nil)})
+	require.NoError(t, err)
 
 	require.Error(t, service.RecoverPending(t.Context()))
 	firstBatch := backendClient.restartedLeases()
@@ -1625,7 +1694,7 @@ func TestPendingRecoveryBoundsEachBackendBatch(t *testing.T) {
 
 func TestRecoveryAfterRestartRotatesPastRepeatedlyStalledLease(t *testing.T) {
 	const pendingCount = 4
-	path, leaseUUIDs := preparePendingMaintenanceCommands(t, pendingCount)
+	path, leaseUUIDs, _ := preparePendingMaintenanceCommands(t, pendingCount)
 	reopened := reopenPlacementAuthority(t, path)
 	t.Cleanup(func() { _ = reopened.Close() })
 	blocking := &perLeaseBlockingBackend{name: "backend-a", entered: make(chan struct{}, 1)}
@@ -1785,7 +1854,7 @@ func TestFirstDispatchRepeatsChainAuthorizationAfterDurableAdmission(t *testing.
 	assertMaintenanceLaneReleased(t, runtime, testLeaseA)
 }
 
-func TestAcceptedUpdatePersistsPayloadBeforeSettlementAndTerminalReplayIsReadOnly(t *testing.T) {
+func TestConfirmedUpdatePersistsPayloadBeforeSettlementAndTerminalReplayIsReadOnly(t *testing.T) {
 	store, _ := newPlacementAuthority(t, testLeaseA)
 	backendClient := &fakeBackend{}
 	payloads := &fakePayloads{failures: 1}
@@ -1799,9 +1868,15 @@ func TestAcceptedUpdatePersistsPayloadBeforeSettlementAndTerminalReplayIsReadOnl
 	}
 
 	first := service.Execute(t.Context(), command)
-	assert.Equal(t, OutcomeInternalFailure, first.Outcome())
+	assert.Equal(t, OutcomeAccepted, first.Outcome())
 	assert.Equal(t, 1, backendClient.updateCount())
 	assert.Equal(t, 0, payloads.writeCount())
+	assertMaintenanceLaneHeld(t, runtime, testLeaseA)
+	assert.Equal(t, OutcomeAccepted, service.Execute(t.Context(), command).Outcome())
+	assert.Zero(t, payloads.writeCount(), "accepted retries cannot promote an unconfirmed update")
+	completeUpdateForTest(t, store, id, backend.CallbackStatusSuccess)
+	assert.Equal(t, OutcomeInternalFailure, service.Execute(t.Context(), command).Outcome(),
+		"confirmed update keeps its lane when payload persistence fails")
 	assertMaintenanceLaneHeld(t, runtime, testLeaseA)
 
 	second := service.Execute(t.Context(), command)
@@ -1833,10 +1908,10 @@ func TestOrderedStartPublicationUsesDurableDispatchDisposition(t *testing.T) {
 		wantAccepted    bool
 		wantOutcome     Outcome
 	}{
-		"accepted backend with local payload failure": {
+		"accepted backend awaits exact completion": {
 			payloadFailures: 1,
 			wantAccepted:    true,
-			wantOutcome:     OutcomeInternalFailure,
+			wantOutcome:     OutcomeAccepted,
 		},
 		"definitive backend refusal": {
 			responseStatus: http.StatusBadRequest,
@@ -1879,7 +1954,8 @@ func TestOrderedStartPublicationUsesDurableDispatchDisposition(t *testing.T) {
 			if test.wantError != nil {
 				assert.ErrorIs(t, events.err, test.wantError)
 			} else {
-				assert.Error(t, events.err, "local settlement failure must remain visible")
+				assert.NoError(t, events.err, "acceptance must not attempt payload persistence")
+				assert.Zero(t, payloads.writeCount())
 			}
 		})
 	}
@@ -1899,7 +1975,9 @@ func TestAcceptedUpdatePayloadPersistenceRecoversAcrossProviderRestart(t *testin
 	}
 
 	result := first.Execute(t.Context(), command)
-	require.Equal(t, OutcomeInternalFailure, result.Outcome())
+	require.Equal(t, OutcomeAccepted, result.Outcome())
+	completeUpdateForTest(t, store, id, backend.CallbackStatusSuccess)
+	require.Error(t, first.RecoverPending(t.Context()), "confirmed payload failure remains recoverable")
 	assert.Equal(t, 1, firstBackend.updateCount())
 	assertMaintenanceLaneHeld(t, firstRuntime, testLeaseA)
 	require.NoError(t, store.Close())
@@ -2106,7 +2184,11 @@ func TestLiveLeaseProviderReceiptPreventsLateUpdateFromOverwritingNewerPayload(t
 		Tenant: testTenant, Kind: KindUpdate, Payload: []byte("payload-b"),
 	}
 	require.Equal(t, OutcomeAccepted, service.Execute(t.Context(), first).Outcome())
+	completeUpdateForTest(t, store, first.ID, backend.CallbackStatusSuccess)
+	require.NoError(t, service.RecoverPending(t.Context()))
 	require.Equal(t, OutcomeAccepted, service.Execute(t.Context(), second).Outcome())
+	completeUpdateForTest(t, store, second.ID, backend.CallbackStatusSuccess)
+	require.NoError(t, service.RecoverPending(t.Context()))
 	require.Equal(t, []byte("payload-b"), payloads.lastWrite())
 
 	clock.now = clock.now.Add(100 * 365 * 24 * time.Hour)

@@ -25,3 +25,26 @@ func DeprovisionNotDispatched(client Backend, leaseUUID string, err error) bool 
 	return ok && refused != nil &&
 		refused.client == transport && refused.leaseUUID == leaseUUID
 }
+
+// DeprovisionLifecyclePending recognizes a deferred close observation from
+// this exact HTTP client, lease and endpoint. It authorizes scheduling a retry,
+// never completing the interrupted operation or claiming cleanup has run.
+func DeprovisionLifecyclePending(client Backend, leaseUUID string, err error) bool {
+	transport, ok := client.(*HTTPClient)
+	if !ok || transport == nil || leaseUUID == "" {
+		return false
+	}
+	pending, ok := err.(*deprovisionLifecyclePendingResponse) //nolint:errorlint // Only the direct transport result carries scheduling provenance.
+	return ok && pending != nil && pending.client == transport && pending.leaseUUID == leaseUUID
+}
+
+// Only the exact decoded /deprovision response branch creates this variant.
+// Other endpoints produce lifecyclePendingResponse, which has no close scope.
+type deprovisionLifecyclePendingResponse struct {
+	client    *HTTPClient
+	leaseUUID string
+}
+
+func (*deprovisionLifecyclePendingResponse) Error() string {
+	return "admitted lifecycle work remains pending"
+}
