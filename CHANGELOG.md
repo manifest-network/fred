@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `fred_docker_backend_image_registry_requests_total{endpoint,method,status}`
+  counts every registry exchange docker-backend makes, including retries and
+  redirect hops, with `status="429"` for quota refusals.
+  `fred_docker_backend_image_tag_resolutions_total{source}` shows whether each
+  tag resolution reused verified manifests or needed a GET, and why a registry
+  fell back to a tag GET. Labels are bounded classes and every alerting series
+  starts at zero. The operations runbook adds a 429 alert and per-lease registry
+  cost.
+
 - `fred_docker_backend_image_import_total{outcome}` distinguishes completed
   imports from loader deadline and shutdown expiry.
   `fred_docker_backend_image_unpinned_generations{kind}` separates incomplete
@@ -270,9 +279,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   failures with a three-attempt bound. Each immutable blob owns its allowance
   across resumes and authentication renewal. Attempts start from the immutable
   registry URL to refresh CDN redirects; unsupported ranges
-  fall back to a full GET within that bound. HTTP 429/503 Retry-After delays are
-  bounded to 30 seconds. Retained prefixes, integrity and size checks remain
-  mandatory; completed layers and Docker imports are not replayed. (ENG-1052)
+  fall back to a full GET within that bound. HTTP 503 and blob (config or
+  layer) 429 Retry-After delays are bounded to 30 seconds; a 429 on a manifest,
+  ping or token request is retried only when its Retry-After asks for at most
+  30 seconds. Retained prefixes, integrity and size checks remain mandatory;
+  completed layers and Docker imports are not replayed. (ENG-1052)
 
 - Deferred closes older than 35 minutes emit an Error and increment the bounded
   `overdue` outcome once per retained entry. Retries continue with their existing
@@ -294,9 +305,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (ENG-1052)
 
 - Docker image registry requests now originate from `docker-backend` over HTTPS
-  with its process proxy settings and system CA trust. Classic `overlay2` and
-  containerd `overlayfs` are the supported image stores; other drivers fail
-  startup. Verified content is staged beside the callback journal, with bounded
+  with its process proxy settings and system CA trust. They stay anonymous, and
+  dockerd `registry-mirrors`, `insecure-registries` and `/etc/docker/certs.d` no
+  longer apply to them. Classic `overlay2` and containerd `overlayfs` are the
+  supported image stores; other drivers fail startup.
+  Verified content is staged beside the callback journal, with bounded
   staging/import allowances and a durable record for unknown import completion.
   Existing shared filesystems and deployments keep their layout. Preserve these
   records in backups, check registry reachability before upgrading, and review
@@ -861,6 +874,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- New leases and updates spend an anonymous Docker Hub pull only when the
+  backend has not yet verified the tag's current manifest. Each preparation
+  re-resolves its tag with one manifest HEAD, which Docker Hub does not meter,
+  and reads the announced digest from manifest bytes docker-backend has already
+  hashed for the same registry repository: an unchanged image costs one
+  manifest GET per backend process (two for an index), and a moved tag is
+  observed on the next preparation. Only admitted bytes are cached, and
+  concurrent misses share one read. A registry that answers the HEAD with
+  405/501, or with a 2xx lacking a usable digest, type or length, costs one GET
+  per preparation; any other HEAD failure fails the preparation. A 429 on a
+  manifest, ping or token request is retried only when Retry-After asks for at
+  most 30 seconds, and a tag's HEAD and GET share one ten-exchange redirect
+  allowance.
 - Callback retry ownership now distinguishes observation, new commits, explicit
   retry and handoff. Failed work cannot re-enter the fresh lane merely because
   a replay tick occurred while it was in flight; retained and fresh work both

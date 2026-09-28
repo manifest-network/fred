@@ -20,6 +20,9 @@ import (
 	"github.com/docker/docker/errdefs"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/uuid"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -29,12 +32,13 @@ import (
 )
 
 type imageFlightFixture struct {
-	m                        *imageCapacityManager
-	daemon                   *dockerSDKView
-	ref, alias, id, manifest string
-	downloads, imports       atomic.Int64
-	local                    atomic.Bool
-	transport                http.RoundTripper
+	m                           *imageCapacityManager
+	daemon                      *dockerSDKView
+	ref, alias, id, manifest    string
+	downloads, imports          atomic.Int64
+	manifestGets, manifestHeads atomic.Int64
+	local                       atomic.Bool
+	transport                   http.RoundTripper
 }
 
 func newImageFlightFixture(t *testing.T, download, imported func(context.Context) error) *imageFlightFixture {
@@ -64,6 +68,14 @@ func newImageFlightFixture(t *testing.T, download, imported func(context.Context
 				}
 			}
 		}
+		if strings.Contains(r.URL.Path, "/manifests/") {
+			switch r.Method {
+			case http.MethodGet:
+				f.manifestGets.Add(1)
+			case http.MethodHead:
+				f.manifestHeads.Add(1)
+			}
+		}
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, r)
 		response := w.Result()
@@ -75,6 +87,8 @@ func newImageFlightFixture(t *testing.T, download, imported func(context.Context
 		require.NoError(t, err)
 		require.NoError(t, remote.Write(tag, fixture, remote.WithContext(t.Context()), remote.WithTransport(f.transport)))
 	}
+	f.manifestGets.Store(0)
+	f.manifestHeads.Store(0)
 	m.runtime = (&mockDockerClient{InspectImageFn: func(_ context.Context, id string) (*ImageInfo, error) {
 		if f.local.Load() {
 			return &ImageInfo{ID: id}, nil
@@ -167,6 +181,91 @@ func TestImageFlightColdRolloutDownloadsOnceAndPublishesEachLeasePin(t *testing.
 		require.Zero(t, f.m.tenantShares.used)
 		require.Zero(t, f.m.staging)
 	})
+}
+
+// writeImageFlightIndex publishes a two-platform index whose native member
+// shares the fixture registry, returning the native config identity.
+func writeImageFlightIndex(t *testing.T, f *imageFlightFixture, ref string) string {
+	t.Helper()
+	native := imageCapacityRegistryImage(t, "native index member")
+	foreignConfig, err := native.ConfigFile()
+	require.NoError(t, err)
+	foreignConfig = foreignConfig.DeepCopy()
+	foreignConfig.Architecture = "arm64"
+	foreign, err := mutate.ConfigFile(native, foreignConfig)
+	require.NoError(t, err)
+	index := mutate.AppendManifests(empty.Index,
+		mutate.IndexAddendum{Add: foreign, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "arm64"}}},
+		mutate.IndexAddendum{Add: native, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}}})
+	tag, err := name.NewTag(ref)
+	require.NoError(t, err)
+	require.NoError(t, remote.WriteIndex(tag, index, remote.WithContext(t.Context()), remote.WithTransport(f.transport)))
+	id, err := native.ConfigName()
+	require.NoError(t, err)
+	f.manifestGets.Store(0)
+	f.manifestHeads.Store(0)
+	return id.String()
+}
+
+// New leases naming a present, unchanged tag re-resolve it with one HEAD each,
+// which Docker Hub does not meter, and read its manifests from bytes this
+// backend already verified: one manifest GET per image for the process
+// lifetime (two for an index), as dockerd's HEAD-then-local-store pull was.
+// Launch admission (pull=false) reuses the lease's pin with no registry access.
+func TestImagePreparationReResolvesPresentTagWithoutRepeatingManifestGets(t *testing.T) {
+	for _, shape := range []string{"single-manifest", "index"} {
+		for _, mode := range []string{"sequential", "concurrent"} {
+			t.Run(shape+"/"+mode, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					f := newImageFlightFixture(t, nil, nil)
+					ref, id, gets := f.ref, f.id, int64(1)
+					if shape == "index" {
+						ref, gets = "registry.example/multiarch:latest", 2
+						id = writeImageFlightIndex(t, f, ref)
+					}
+					const leases = 16
+					refs, tenants := make(map[string]string), make(map[string]string)
+					for range leases {
+						lease := uuid.NewString()
+						refs[lease], tenants[lease] = ref, "morpheus-aggregator"
+					}
+					results := make(chan error, leases)
+					pins, runs := imagePreparationSubjects(t, refs, tenants, func(ctx context.Context, mutations *storageMutations) error {
+						prepared, err := f.m.prepare(ctx, mutations, ref, true)
+						if err == nil && prepared.ID() != id {
+							err = fmt.Errorf("prepared %s instead of %s", prepared.ID(), id)
+						}
+						if err == nil {
+							_, err = f.m.prepare(ctx, mutations, ref, false)
+						}
+						results <- err
+						return err
+					})
+					f.m.pins = pins
+					if mode == "sequential" {
+						for _, run := range runs {
+							run()
+						}
+					} else {
+						var workers sync.WaitGroup
+						for _, run := range runs {
+							workers.Go(run)
+						}
+						workers.Wait()
+					}
+					for range leases {
+						require.NoError(t, <-results)
+					}
+					require.EqualValues(t, gets, f.manifestGets.Load(), "an unchanged tag's verified manifests are never fetched again")
+					require.EqualValues(t, leases, f.manifestHeads.Load(), "every new lease re-resolves the mutable tag")
+					require.EqualValues(t, 1, f.imports.Load(), "later leases reuse the imported image")
+					if shape == "single-manifest" {
+						require.EqualValues(t, 1, f.downloads.Load(), "the fixture's layer is downloaded once")
+					}
+				})
+			})
+		}
+	}
 }
 
 func TestImageFlightFollowerCancellationDoesNotCancelLeader(t *testing.T) {

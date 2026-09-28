@@ -856,6 +856,23 @@ stopped upgrade, including redirects and resumed blob reads. Docker daemon mirro
 Provide registry reachability and trusted CA certificates to the backend process
 before upgrading; plaintext fallback is disabled even for private IPs.
 
+Requests are anonymous and count against each backend host's public-registry
+allowance, such as Docker Hub's per-IP manifest-pull limit. As with dockerd,
+every new lease or update re-resolves its image tag with one manifest HEAD,
+which Docker Hub does not meter. docker-backend then reuses manifests it has
+already verified in memory, so an unchanged image costs one manifest GET per
+backend process while cached (two for a multi-platform index), plus one per tag
+move. After an upgrade or restart each distinct image pays that GET again. A
+registry that answers the HEAD with 405/501, or with a 2xx lacking a usable
+digest, content type or length, costs one GET per preparation. Any other HEAD
+failure, such as 401, 403 or 404, fails the preparation without the fallback
+GET that dockerd's classic pull made. Before upgrading, confirm that every
+registry in `allowed_registries` answers an anonymous manifest HEAD for a tag
+with `Docker-Content-Digest`, `Content-Type` and `Content-Length`, and serves a
+GET by that digest. Size lease-start bursts against the allowance of each
+backend's egress address; see
+[Registry rate limits](OPERATIONS.md#registry-rate-limits).
+
 Before Docker writes image content, Fred stages the selected immutable image
 under `<callback_db_path>.image-staging`. It verifies the exact
 compressed blobs, image configuration and expanded layers, including their

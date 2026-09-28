@@ -14,9 +14,7 @@ import (
 	"regexp"
 
 	"github.com/containerd/platforms"
-	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -88,8 +86,10 @@ func (l *Loader) Resolve(ctx context.Context, ref string, platform ocispec.Platf
 	if err != nil {
 		return Resolution{}, fmt.Errorf("parse registry reference: %w", err)
 	}
+	manifests := l.newManifestReader(named.Context())
+	defer manifests.close()
 	metadata := int64(0)
-	raw, id, err := l.selectManifest(ctx, named, platform, &metadata)
+	raw, id, err := l.selectManifest(ctx, manifests, named, platform, &metadata)
 	if err != nil {
 		return Resolution{}, err
 	}
@@ -106,6 +106,7 @@ func (l *Loader) Resolve(ctx context.Context, ref string, platform ocispec.Platf
 		return Resolution{}, err
 	}
 	l.configs.retain(config)
+	manifests.retainAdmitted()
 	metadata += int64(len(config.raw))
 	return Resolution{state: &resolvedManifest{issuer: l, named: named, raw: raw, digest: id, manifest: manifest, platform: clonePlatform(platform), metadata: metadata}}, nil
 }
@@ -230,22 +231,25 @@ func (l *Loader) PrepareResolved(ctx context.Context, resolution Resolution) (*P
 	return p, nil
 }
 
-func (l *Loader) selectManifest(ctx context.Context, ref name.Reference, platform ocispec.Platform, used *int64) ([]byte, digest.Digest, error) {
+// selectManifest walks from the reference to one runnable platform manifest.
+// Every manifest, including one served from verified cache, is charged to the
+// metadata budget and parsed again before selection.
+func (l *Loader) selectManifest(ctx context.Context, manifests *manifestReader, ref name.Reference, platform ocispec.Platform, used *int64) ([]byte, digest.Digest, error) {
 	for range maxIndexDepth {
-		descriptor, err := remote.Get(ref, l.options(ctx, maxMetadataBytes)...)
+		current, err := manifests.read(ctx, ref)
 		if err != nil {
 			return nil, "", err
 		}
-		*used += int64(len(descriptor.Manifest))
+		*used += int64(len(current.raw))
 		if *used > maxMetadataBytes || *used > l.budget.Bytes() {
 			return nil, "", errors.New("image index and manifest metadata exceeds budget")
 		}
-		switch string(descriptor.MediaType) {
+		switch current.mediaType {
 		case ocispec.MediaTypeImageManifest, "application/vnd.docker.distribution.manifest.v2+json":
-			return descriptor.Manifest, digest.FromBytes(descriptor.Manifest), nil
+			return current.raw, current.digest, nil
 		case ocispec.MediaTypeImageIndex, "application/vnd.docker.distribution.manifest.list.v2+json":
 			var index ocispec.Index
-			if err := json.Unmarshal(descriptor.Manifest, &index); err != nil {
+			if err := json.Unmarshal(current.raw, &index); err != nil {
 				return nil, "", err
 			}
 			if len(index.Manifests) > maxIndexEntries {
@@ -266,7 +270,7 @@ func (l *Loader) selectManifest(ctx context.Context, ref name.Reference, platfor
 			}
 			ref = ref.Context().Digest(selected.Digest.String())
 		default:
-			return nil, "", fmt.Errorf("unsupported image manifest type %q", descriptor.MediaType)
+			return nil, "", fmt.Errorf("unsupported image manifest type %q", current.mediaType)
 		}
 	}
 	return nil, "", errors.New("image index exceeds nesting limit")
@@ -351,18 +355,6 @@ func (l *Loader) fetchBounded(ctx context.Context, ref name.Reference, d ocispec
 		return errors.New("registry blob differs from its verified descriptor")
 	}
 	return nil
-}
-
-func (l *Loader) options(ctx context.Context, limit int64) []remote.Option {
-	return []remote.Option{
-		remote.WithContext(ctx), remote.WithAuth(authn.Anonymous),
-		remote.WithTransport(registryTransport{base: boundedTransport{base: l.transport, limit: limit}}),
-		// Our transport shares one attempt bound across headers and body. Do
-		// not multiply it by the registry client's default request retries.
-		remote.WithRetryBackoff(remote.Backoff{Steps: 1}),
-		remote.WithRetryPredicate(func(error) bool { return false }),
-		remote.WithRetryStatusCodes(),
-	}
 }
 
 var stagingName = regexp.MustCompile(`^\.fred-image-[0-9]{1,10}$`)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -123,11 +124,13 @@ func (t registryTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		return nil, err
 	}
 	redirects := registryRedirectTransport{base: t.base, chain: chain}
-	if req.Method != http.MethodGet {
+	// A manifest HEAD is bodyless and idempotent, so it spends the same
+	// attempt owner as a metadata GET. A token POST is not replayable.
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
 		return redirects.RoundTrip(req)
 	}
 	attempts := &registryAttemptBudget{}
-	transfer := &registryTransfer{transport: attemptedRegistryTransport{base: redirects, attempts: attempts}, request: req, attempts: attempts}
+	transfer := &registryTransfer{transport: attemptedRegistryTransport{base: redirects, attempts: attempts}, request: req, attempts: attempts, metadata: true}
 	for {
 		response, err := transfer.open(0)
 		if err != nil {
@@ -182,6 +185,7 @@ type registryTransfer struct {
 	attempts  *registryAttemptBudget
 	delay     time.Duration
 	size      int64
+	metadata  bool
 }
 
 func (t *registryTransfer) canRetry(err error) bool {
@@ -238,26 +242,48 @@ func (t *registryTransfer) open(offset int64) (*http.Response, error) {
 			return nil, err
 		}
 		if transientRegistryStatus(response.StatusCode) && t.attempts.available() {
-			t.delay = registryRetryAfter(response)
-			_ = response.Body.Close()
-			continue
+			if delay, retry := t.retryDelay(response); retry {
+				t.delay = delay
+				_ = response.Body.Close()
+				continue
+			}
 		}
 		return response, nil
 	}
+}
+
+// retryDelay admits another attempt after a transient status. A metadata 429
+// is a registry quota decision, such as Docker Hub's pull allowance, whose
+// window an attempt's sub-second backoff cannot outlast; retrying only sends
+// more requests against it. It is retried only when the registry itself asks
+// for a delay no longer than the Retry-After ceiling. Blob transfers keep the
+// bounded backoff for every transient status.
+func (t *registryTransfer) retryDelay(response *http.Response) (time.Duration, bool) {
+	if t.metadata && response.StatusCode == http.StatusTooManyRequests {
+		delay, ok := parseRetryAfter(response.Header.Get("Retry-After"))
+		return delay, ok && delay <= registryRetryAfterMax
+	}
+	return registryRetryAfter(response), true
 }
 
 func registryRetryAfter(response *http.Response) time.Duration {
 	if response.StatusCode != http.StatusTooManyRequests && response.StatusCode != http.StatusServiceUnavailable {
 		return 0
 	}
-	value := response.Header.Get("Retry-After")
+	delay, _ := parseRetryAfter(response.Header.Get("Retry-After"))
+	return min(delay, registryRetryAfterMax)
+}
+
+// parseRetryAfter accepts delay-seconds or an HTTP date. Large values saturate
+// instead of overflowing; a date in the past is no delay.
+func parseRetryAfter(value string) (time.Duration, bool) {
 	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
-		return time.Duration(min(seconds, int64(registryRetryAfterMax/time.Second))) * time.Second
+		return time.Duration(min(seconds, int64(math.MaxInt64/time.Second))) * time.Second, true
 	}
 	if deadline, err := http.ParseTime(value); err == nil {
-		return min(max(time.Until(deadline), 0), registryRetryAfterMax)
+		return max(time.Until(deadline), 0), true
 	}
-	return 0
+	return 0, false
 }
 
 func (t *registryTransfer) openBlob(offset int64) (*http.Response, error) {

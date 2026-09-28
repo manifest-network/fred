@@ -88,6 +88,7 @@ func (t boundedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}()
 	response, err := t.base.RoundTrip(req.WithContext(exchange.ctx))
+	observeRegistryExchange(req, response, err)
 	if err != nil {
 		if errors.Is(context.Cause(exchange.ctx), errRegistryIdle) {
 			err = errRegistryIdle
@@ -97,7 +98,7 @@ func (t boundedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	exchange.progress()
 	limit := t.limit
-	if (response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent) || strings.Contains(response.Header.Get("Content-Type"), "json") || strings.Contains(req.URL.Path, "/manifests/") {
+	if (response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent) || strings.Contains(response.Header.Get("Content-Type"), "json") || registryEndpoint(req.URL.Path) == endpointManifest {
 		limit = min(limit, maxMetadataBytes)
 	}
 	response.Body = &boundedBody{body: response.Body, reader: budgetReader{reader: response.Body, remaining: limit}, exchange: exchange}

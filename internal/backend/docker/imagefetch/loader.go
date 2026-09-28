@@ -38,6 +38,7 @@ type Loader struct {
 	transport singleRegistryExchange
 	life      *loaderLifetime
 	configs   *configCache
+	manifests *manifestCache
 	kind      preparationKind
 }
 
@@ -60,7 +61,7 @@ func NewLoader(source Importer, stageRoot string, maxBytes int64, options ...Opt
 		return nil, fmt.Errorf("image staging directory is unavailable: %s", stageRoot)
 	}
 	shutdown, cancel := context.WithCancel(context.Background())
-	loader := &Loader{daemon: source, stageRoot: stageRoot, budget: budget, ledger: &debitLedger{root: stageRoot}, transport: defaultRegistryExchange(), life: &loaderLifetime{shutdown: shutdown, cancel: cancel, drained: make(chan struct{})}, configs: &configCache{}}
+	loader := &Loader{daemon: source, stageRoot: stageRoot, budget: budget, ledger: &debitLedger{root: stageRoot}, transport: defaultRegistryExchange(), life: &loaderLifetime{shutdown: shutdown, cancel: cancel, drained: make(chan struct{})}, configs: &configCache{}, manifests: &manifestCache{}}
 	for _, option := range options {
 		if option == nil {
 			cancel()

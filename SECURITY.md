@@ -529,6 +529,15 @@ an image Docker can otherwise load may be refused by these bounds. These are
 intentional admission limits. The registry client verifies manifest/config/blob
 identity and layer expansion before dispatching the import.
 
+A tag's HEAD `Docker-Content-Digest` only selects cached manifest bytes whose
+SHA256 the loader computed for the same registry repository. The header never
+supplies content or identity; bytes that contradict it are keyed by their own
+digest, and only admitted bytes are cached. The manifest cache is repository
+scoped, but config reuse and classic-store reuse by config ID are keyed by
+content digest alone. That is safe while every pull is anonymous. A future
+registry credential must therefore be a public-repository-read-only token, or
+those reuse paths must become repository scoped first.
+
 ### Security Headers
 
 All responses include:

@@ -20,6 +20,21 @@ type registryRedirectChain struct {
 	authority string
 	hostname  string
 	spent     atomic.Uint32
+	// operation also bounds every other chain its metadata operation starts.
+	operation *registryOperationAllowance
+}
+
+// registryOperationAllowance is one logical metadata operation's complete
+// exchange allowance. A tag HEAD and the GET that it selects form one tag
+// resolution, so a failed or redirected HEAD cannot buy the GET a second
+// ten-exchange chain. Authentication renewal inside the operation also spends
+// from it; this only narrows, and never widens, any chain's own allowance.
+type registryOperationAllowance struct{ spent atomic.Uint32 }
+
+type registryOperationAllowanceKey struct{}
+
+func withRegistryOperationAllowance(ctx context.Context) context.Context {
+	return context.WithValue(ctx, registryOperationAllowanceKey{}, &registryOperationAllowance{})
 }
 
 type registryRedirectReceiptKey struct{}
@@ -35,7 +50,9 @@ func newRegistryRedirectChain(request *http.Request) *registryRedirectChain {
 
 func registryMetadataRedirectChain(request *http.Request) (*registryRedirectChain, error) {
 	if request.Response == nil {
-		return newRegistryRedirectChain(request), nil
+		chain := newRegistryRedirectChain(request)
+		chain.operation, _ = request.Context().Value(registryOperationAllowanceKey{}).(*registryOperationAllowance)
+		return chain, nil
 	}
 	previous := request.Response
 	if previous.Request != nil {
@@ -54,14 +71,10 @@ func (c *registryRedirectChain) admit(request *http.Request) (*http.Request, err
 	if request.URL.Hostname() != c.hostname && privateRegistryIP(request.URL.Hostname()) {
 		return nil, errors.New("registry redirect to private or link-local IP is forbidden")
 	}
-	for {
-		spent := c.spent.Load()
-		if spent >= registryRedirectRequests {
-			return nil, errors.New("registry exceeded redirect limit")
-		}
-		if c.spent.CompareAndSwap(spent, spent+1) {
-			break
-		}
+	// An operation's count includes this chain's, so its claim is checked
+	// first; a chain claim after a successful operation claim cannot fail.
+	if (c.operation != nil && !claimRegistryExchange(&c.operation.spent)) || !claimRegistryExchange(&c.spent) {
+		return nil, errors.New("registry exceeded redirect limit")
 	}
 	owned := request.Clone(request.Context())
 	if owned.URL.Host != c.authority {
@@ -70,6 +83,18 @@ func (c *registryRedirectChain) admit(request *http.Request) (*http.Request, err
 		owned.Header.Del("Authorization")
 	}
 	return owned, nil
+}
+
+func claimRegistryExchange(spent *atomic.Uint32) bool {
+	for {
+		current := spent.Load()
+		if current >= registryRedirectRequests {
+			return false
+		}
+		if spent.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
 }
 
 func (c *registryRedirectChain) stamp(response *http.Response, request *http.Request) {

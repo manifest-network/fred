@@ -69,7 +69,10 @@ func TestRegistryResumesOnlyInterruptedImmutableBlob(t *testing.T) {
 			require.NoError(t, err)
 			defer prepared.Close()
 			require.EqualValues(t, 2, downloads.Load())
-			require.EqualValues(t, 5, metadata.Load(), "resuming does not repeat manifest/config selection or authentication")
+			// Ping, tag HEAD and tag GET (this fixture's HEAD has no digest), the
+			// config transfer's ping and GET, then the layer transfer's ping. The
+			// HEAD is the only exchange tag re-resolution adds.
+			require.EqualValues(t, 6, metadata.Load(), "resuming does not repeat manifest/config selection or authentication")
 			require.Zero(t, daemon.loads)
 			_, err = loader.Import(t.Context(), prepared)
 			require.NoError(t, err)
@@ -84,7 +87,8 @@ func TestRegistryRetriesMetadataBeforePublishingAnyBytes(t *testing.T) {
 	var attempts atomic.Int64
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		response, err := f.server.Client().Transport.RoundTrip(req)
-		if err == nil && strings.Contains(req.URL.Path, "/manifests/") && attempts.Add(1) == 1 {
+		// Interrupt the manifest body itself; the preceding tag HEAD has none.
+		if err == nil && req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/manifests/") && attempts.Add(1) == 1 {
 			response.Body = &interruptedRegistryBody{ReadCloser: response.Body, remaining: len(f.manifest) / 2}
 		}
 		return response, err

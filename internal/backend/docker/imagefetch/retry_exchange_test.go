@@ -230,9 +230,37 @@ func TestRegistryBlobRedirectsRemainHTTPSAndBounded(t *testing.T) {
 	}
 }
 
+// A repository may contain a manifests path component. Only the final API
+// marker selects the metadata byte limit, so its layers keep their blob limit.
+func TestRegistryBlobInRepositoryNamedManifestsKeepsItsLimit(t *testing.T) {
+	data := bytes.Repeat([]byte("layer bytes "), int(maxMetadataBytes)/8)
+	require.Greater(t, int64(len(data)), maxMetadataBytes)
+	id := digest.FromBytes(data)
+	loader, err := NewLoader(&recordingImporter{}, t.TempDir(), 8<<20, withRegistryTransportForTest(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/v2/":
+			return &http.Response{StatusCode: http.StatusOK, ContentLength: 0, Header: make(http.Header), Body: http.NoBody}, nil
+		case "/v2/acme/manifests/app/blobs/" + id.String():
+			return &http.Response{StatusCode: http.StatusOK, ContentLength: int64(len(data)), Header: http.Header{"Content-Type": {"application/octet-stream"}}, Body: io.NopCloser(bytes.NewReader(data))}, nil
+		default:
+			return &http.Response{StatusCode: http.StatusNotFound, ContentLength: 0, Header: make(http.Header), Body: http.NoBody}, nil
+		}
+	})))
+	require.NoError(t, err)
+	ref, err := name.ParseReference("registry.example/acme/manifests/app:latest")
+	require.NoError(t, err)
+	blobs := registryRequestCount("blob", http.MethodGet, "ok")
+	var output bytes.Buffer
+	require.NoError(t, loader.fetch(t.Context(), ref, ocispec.Descriptor{Digest: id, Size: int64(len(data))}, &output))
+	require.Equal(t, data, output.Bytes())
+	require.Equal(t, blobs+1, registryRequestCount("blob", http.MethodGet, "ok"), "the layer counts as a blob exchange")
+}
+
 func TestRegistryRetryAfterIsBoundedAndCancelable(t *testing.T) {
 	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
-		for _, value := range []string{"2", "999999999999", "date", "invalid", "-1"} {
+		// Seconds past time.Duration's range saturate: an unchecked multiply
+		// wraps 9223372037 to a negative delay and 18446744074 to 0.29s.
+		for _, value := range []string{"absent", "2", "30", "31", "999999999999", "9223372037", "18446744074", "date", "distant date", "invalid", "-1"} {
 			t.Run(fmt.Sprintf("status=%d/retry-after=%s", status, value), func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					attempts := 0
@@ -240,18 +268,31 @@ func TestRegistryRetryAfterIsBoundedAndCancelable(t *testing.T) {
 					expected := 100 * time.Millisecond
 					header := value
 					switch value {
+					case "absent":
+						header = ""
 					case "2":
 						expected = 2 * time.Second
-					case "999999999999":
+					case "30", "31", "999999999999", "9223372037", "18446744074":
 						expected = registryRetryAfterMax
 					case "date":
 						expected = 5 * time.Second
 						header = started.Add(expected).UTC().Format(http.TimeFormat)
+					case "distant date":
+						expected = registryRetryAfterMax
+						header = started.Add(time.Hour).UTC().Format(http.TimeFormat)
 					}
+					// A metadata quota refusal is retried only at the registry's
+					// own request for a delay within the Retry-After ceiling.
+					// Availability failures keep the bounded backoff.
+					retried := status == http.StatusServiceUnavailable || value == "2" || value == "30" || value == "date"
 					transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
 						attempts++
 						if attempts == 1 {
-							return &http.Response{StatusCode: status, ContentLength: 0, Header: http.Header{"Retry-After": {header}}, Body: http.NoBody}, nil
+							response := &http.Response{StatusCode: status, ContentLength: 0, Header: make(http.Header), Body: http.NoBody}
+							if header != "" {
+								response.Header.Set("Retry-After", header)
+							}
+							return response, nil
 						}
 						require.Equal(t, expected, time.Since(started))
 						return &http.Response{StatusCode: http.StatusOK, ContentLength: 0, Header: make(http.Header), Body: http.NoBody}, nil
@@ -261,11 +302,37 @@ func TestRegistryRetryAfterIsBoundedAndCancelable(t *testing.T) {
 					response, err := (registryTransport{base: boundedTransport{base: transport, limit: 1 << 20}}).RoundTrip(request)
 					require.NoError(t, err)
 					require.NoError(t, response.Body.Close())
-					require.Equal(t, 2, attempts)
+					if retried {
+						require.Equal(t, 2, attempts)
+						require.Equal(t, http.StatusOK, response.StatusCode)
+					} else {
+						require.Equal(t, 1, attempts, "a metadata quota refusal without a short Retry-After is final")
+						require.Equal(t, http.StatusTooManyRequests, response.StatusCode)
+						require.Zero(t, time.Since(started))
+					}
 				})
 			})
 		}
 	}
+	t.Run("blob 429 keeps bounded backoff", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			data := []byte("immutable tenant content")
+			attempts := 0
+			started := time.Now()
+			transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+				attempts++
+				if attempts == 1 {
+					return &http.Response{StatusCode: http.StatusTooManyRequests, ContentLength: 0, Header: make(http.Header), Body: http.NoBody}, nil
+				}
+				require.Equal(t, 100*time.Millisecond, time.Since(started))
+				return &http.Response{StatusCode: http.StatusOK, ContentLength: int64(len(data)), Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(data))}, nil
+			})
+			output, err := fetchRegistryTestBlob(t, data, transport)
+			require.NoError(t, err)
+			require.Equal(t, data, output)
+			require.Equal(t, 2, attempts, "blob reads are not metered as pulls and keep their transient retry")
+		})
+	})
 	t.Run("cancel", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)

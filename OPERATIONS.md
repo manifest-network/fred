@@ -150,6 +150,7 @@ when later probes or recovery passes succeed.
 | `fred_docker_backend_volume_launches_pending > 0` beyond the expected launch window | Outstanding Docker launch receipts; a transient nonzero value is normal while launches run | Confirm recent successful backend health sampling, then correlate pending requests with backend logs. The gauge holds its last sample when health fails and does not count image-helper receipts. Follow [Unsettled Docker effects](#unsettled-docker-effects) for persistent unknown requests; never delete a receipt to clear the gauge |
 | `increase(fred_docker_backend_image_preparation_refusals_total{reason="import_allocation"}[15m]) > 0` | A measured image footprint exceeded twice its verification allowance before Docker import; one tenant can encounter this without a fleet-wide failure rate | Open a sizing ticket on any increase and correlate the immutable source, `import_bytes` and `limit_bytes` in the WARN. Review temporary disk, parser limits and the existing image-size setting before raising it; updates fail before replacing workloads |
 | `increase(fred_docker_backend_image_allocation_pressure_total[15m]) > 0` | A successful new-image preparation used over 80% of its configured import ceiling | Plan growth headroom using the measured footprint and source in the WARN. Exact saved-budget recovery is excluded because its content-derived allowance is deliberately close to usage. This is a capacity-planning signal, not a standalone page |
+| `increase(fred_docker_backend_image_registry_requests_total{status="429"}[15m]) > 0` | A registry refused docker-backend's requests for quota. On Docker Hub this is the anonymous per-IP manifest-pull allowance, so new leases and updates that need a manifest GET (an image this backend has not verified since its start, or a moved tag) fail with `ImagePullFailed` until the registry's window resets. Every `GET`/`HEAD` series is initialized at zero, so the first refusal after a scrape is visible | Follow [Registry rate limits](#registry-rate-limits): check the remaining allowance with a non-metered HEAD from the backend host and compare `endpoint="manifest",method="GET"` with `fred_docker_backend_image_tag_resolutions_total`. Warning severity; page only if tenant rejections are sustained |
 | `increase(fred_docker_backend_image_import_total{outcome="deadline"}[15m]) > 0` | An import owner reached its dispatch ceiling; Docker may still be unwinding | Correlate with pending import bytes and daemon logs. Before planned stops, fence new mutations, quiesce work and wait for pending bytes to reach zero. Owner cancellation is not completion proof |
 | `fred_docker_backend_image_import_pending_bytes > 0` beyond the normal import window | The gauge includes both live owned imports and allocation whose completion is unknown. A persistent value after the backend becomes idle can be durable import debt; restarting does not clear it | Correlate imports, Docker response failures and shutdown logs. Alert with a site-specific `for` duration longer than a normal import; investigate sustained debt using [Recovering outstanding image import allocation](#recovering-outstanding-image-import-allocation). Never clear the debit while the runtime can still allocate |
 | `increase(fred_docker_backend_image_gc_total{outcome="inhibited"}[15m]) > 0` together with sustained image-filesystem disk pressure | Incomplete pin authority or unresolved inspection evidence prevents safe deletion. This counter is diagnostic, not a standalone paging condition: pre-upgrade retained generations can legitimately lack pins for their remaining retention period | Check legacy pin-backfill warnings, retained rows and inspection receipts. Unpinned retained generations remain conservative until restored or safely reaped; the default grace is 90 days, plus the reaper interval, and unresolved reaping can extend it. Do not page on this expected upgrade condition while disk headroom is healthy. Docker inventory failures increment `outcome="error"`; ordinary live admissions increment `outcome="busy"`. Preserve authoritative evidence; import debt alone does not inhibit collection |
@@ -264,7 +265,7 @@ If `lease_actor_stuck_seconds` exceeds your alert threshold, one specific lease'
 3. Check what handler it's in — typically `provision.go`, `deprovision.go`, or `restart_update.go`.
 
 **Common causes and remedies:**
-- **Image pull stuck**: Docker Hub rate-limited or registry unreachable. Check `docker logs` for the daemon, then `docker pull <image>` manually. Reduce `image_pull_timeout` so the actor errors out sooner.
+- **Image pull stuck or failing**: the registry is rate-limiting or unreachable. docker-backend makes these registry requests itself, so dockerd logs and a manual `docker pull` show neither the requests nor their errors. Search the docker-backend log for `resolve immutable image:` (a Docker Hub quota refusal contains `TOOMANYREQUESTS` or `429`), check `fred_docker_backend_image_registry_requests_total{status=~"429|5xx|error"}`, and follow [Registry rate limits](#registry-rate-limits). Reduce `image_pull_timeout` so the actor errors out sooner.
 - **`docker stop` hanging**: a container is ignoring SIGTERM and the grace period is long. Lower `container_stop_timeout`.
 - **Volume cleanup hanging on btrfs/zfs**: a quota or subvolume operation is blocked in the kernel. Inspect the filesystem state directly.
 - **Genuine deadlock**: file an issue with the goroutine dump. The actor will not unblock; the reconciler will re-detect the lease on its next cycle and retry, but the wedged goroutine leaks until restart.
@@ -484,13 +485,28 @@ and import of its exact repository digest; Fred never falls back to its mutable
 tag.
 Tag selection verifies bounded manifest and config metadata, including their
 platform and layer-count agreement, before a classic Docker cache hit can
-persist its recovery reference. Every unpinned preparation resolves its manifest. Config content is reused
+persist its recovery reference. Every unpinned preparation re-resolves its tag
+with one manifest HEAD, which Docker Hub does not meter as a pull, so a moved
+tag is observed on the next preparation as it was with dockerd. The HEAD's
+`Docker-Content-Digest` only selects manifest bytes this backend has already
+hashed itself for the same registry repository, from a backend-owned LRU of at
+most 1,024 manifests (an index image uses two) and 32 MiB; any manifest within
+the 2-MiB metadata limit fits. Only an uncached digest costs a manifest GET,
+made by that digest; a cached digest reference or index child needs no request.
+Bytes enter the LRU only after the resolution that read them passes metadata,
+platform and layer admission. Concurrent misses for one repository digest share
+one read: the other preparations wait, each under its own `image_pull_timeout`,
+until the first finishes its manifest and config reads and admission, so a
+stalled registry exchange in that first preparation also delays them.
+Config content is reused
 from a backend-owned, digest-verified LRU (at most 128 entries / 32 MiB); a miss
 requires a config fetch under the aggregate 2-MiB metadata allowance. Each
 manifest still receives platform/layer/metadata admission, including on a cache
-hit. Eviction or restart can require that fetch again. It does not download cached layers or
+hit. Both caches are in memory, so eviction or restart can require those fetches
+again. They do not download cached layers or
 prove their future availability: missing local content still requires full
-verification of the exact pinned registry content before import.
+verification of the exact pinned registry content before import. Per-lease
+registry cost is described under [Registry rate limits](#registry-rate-limits).
 
 Before staging, admission checks the maximum staging allowance above the
 free-space floor. Before Docker import, it checks the verified image's
@@ -531,7 +547,7 @@ growth within the default 20-GiB import ceiling.
 Decoded padding after the tar terminator has a separate retained-metadata
 allowance: compression streams can make Docker retain one JSON segment per
 decoded byte. This charge is distinct from tar headers and file allocation.
-Registry metadata GETs have at most three attempts for transient connection,
+Registry metadata GETs and manifest HEADs have at most three attempts for transient connection,
 no-progress or availability failures. Each immutable blob owns one three-attempt
 allowance shared across resumes, redirects and authentication renewal. Mixed
 faults can exhaust it: token renewal plus two interrupted bodies receives no
@@ -547,9 +563,12 @@ can renew expired authentication within that allowance; token responses always
 retain the separate metadata limit. Interrupted blobs
 resume at the retained prefix when Range is supported; a rejected range falls
 back to a full GET within the same attempt bound, replaying only that blob's
-prefix. For HTTP 429/503, Retry-After can delay the next attempt by up to 30 seconds,
-subject to the existing caller deadline. Each metadata redirect chain, including
-its transient retries, owns at most ten actual HTTP exchanges. Each canonical
+prefix. For HTTP 503, and for a blob's 429, Retry-After can delay the next
+attempt by up to 30 seconds, subject to the existing caller deadline. A metadata
+429 is a quota decision: it is retried only when Retry-After asks for at most
+30 seconds, and otherwise fails at once. Each metadata redirect chain, including
+its transient retries, owns at most ten actual HTTP exchanges; a tag's HEAD and
+the manifest GET it selects share one such allowance. Each canonical
 blob attempt has the same ten-exchange redirect bound. Chain copies share the
 allowance. Redirects preserve HTTPS and exact-origin credentials, and private-IP
 checks normalize IPv6 zones, legacy IPv4 spellings and trailing dots. The final
@@ -669,6 +688,68 @@ Never remove it to bypass an ownership error while any participating lineage
 still has active or retained authority. A mode transition requires an offline
 drain of every lineage. An unchanged manifest retains its pinned image even if
 its tag moves; deploy a new image reference or digest to change the content.
+
+### Registry rate limits
+
+docker-backend pulls anonymously; dockerd's `registry-mirrors` and credentials
+do not apply to it. Docker Hub counts manifest GETs against an anonymous
+allowance per source IP address and reports it in the `ratelimit-limit` and
+`ratelimit-remaining` response headers; a manifest HEAD is not counted. A
+refused GET fails the preparation with `TOOMANYREQUESTS`, and the tenant sees
+`ImagePullFailed`. Leases whose image pin is already published (restarts and
+launch admission) resolve no tag and make no registry request while their
+content is local.
+
+| Unpinned preparation | Manifest requests | Metered manifest GETs |
+|---|---|---|
+| Tag unchanged, its manifests already verified by this backend process | ping, token, HEAD | 0 |
+| First preparation of an image since backend start, or the tag moved | ping, token, HEAD, GET by digest | 1 (2 for an index) |
+| Immutable reference or index child already verified | none | 0 |
+| Registry answers the HEAD with 405/501, or a 2xx without a usable digest, content type or length | ping, token, HEAD, GET of the tag | 1 per preparation; index children stay cached |
+| HEAD refused with any other status (such as 401, 403, 404 or 429), unavailable after its attempts, or unreachable | preparation fails without a GET | 0 |
+
+The image config is read separately and reused from the 128-entry verified
+config cache. A config missing from it, after a restart, an eviction or for a
+new image, adds its own ping, token and blob GET, which Docker Hub does not
+meter.
+
+Budget one metered GET per distinct image (two for a multi-platform index) per
+backend process while its manifests stay cached, plus one per tag move.
+Concurrent preparations of one image share its GET and wait for the first
+preparation to finish its reads. The verified-manifest cache is in memory, so
+each restart pays those GETs again; avoid restart loops during a quota
+incident. A metadata 429 is not retried unless its Retry-After asks for at most
+30 seconds.
+
+`fred_docker_backend_image_registry_requests_total{endpoint,method,status}`
+counts every exchange, including retries and redirect hops;
+`endpoint="manifest",method="GET"` approximates metered pulls and `status="429"`
+counts quota refusals. `endpoint="ping",status="4xx"` includes ordinary bearer
+challenges. `fred_docker_backend_image_tag_resolutions_total{source}` shows how
+each tag resolution that passed its HEAD found its manifest: `cache` needed no
+GET, `registry` fetched an uncached announced digest, and a sustained
+`fallback_unsupported` or `fallback_incomplete` share identifies a registry that
+costs one GET per preparation. In steady state this ratio stays near zero:
+
+```promql
+sum(rate(fred_docker_backend_image_registry_requests_total{endpoint="manifest",method="GET"}[1h]))
+  / sum(rate(fred_docker_backend_image_tag_resolutions_total[1h]))
+```
+
+To check the remaining Docker Hub allowance without spending it, send a HEAD
+from the backend host through the backend's proxy settings:
+
+```bash
+TOKEN=$(curl -fsS "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
+curl -fsS --head -H "Authorization: Bearer $TOKEN" \
+  https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep -i '^ratelimit'
+```
+
+Refusals stop when the registry's window resets; tenants must create new leases
+to replace rejected ones. Registry credentials and pull-through mirrors are not
+yet configurable for docker-backend. Shared credentials would let any tenant pull
+whatever they can read, so any future credential must be a
+public-repository-read-only token scoped to its registry host.
 
 ### Recovering outstanding image import allocation
 

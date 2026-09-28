@@ -853,6 +853,21 @@ classic `overlay2` uses the default `DockerRootDir/tmp` import staging, while
 containerd `overlayfs` additionally requires its actual `image_data_path`.
 External `DOCKER_TMPDIR` overrides are outside the supported space model.
 
+`Loader.Resolve` re-resolves a mutable tag with one manifest HEAD per
+preparation and uses its `Docker-Content-Digest` only as a lookup key into a
+bounded, in-memory LRU of manifest bytes the loader hashed itself, keyed by
+registry repository and digest. A miss GETs that digest; if the bytes contradict
+the header, their own digest wins. Only a 405/501 HEAD or a 2xx without a
+usable digest, type or length falls back to a GET of the tag; other HEAD
+failures fail the resolution. Entries are retained only after the resolution
+passes metadata, platform and layer admission, and concurrent misses for one
+repository digest wait for a single claimant under their own contexts, then
+re-read the cache. The claim lasts through the claimant's config read and
+admission, so waiters also reuse its verified config, and a stalled claimant
+delays them within its own timeouts. Any manifest within the 2-MiB metadata
+limit fits one cache entry. Index children and immutable references are served
+from the same cache without a request.
+
 `shared/imagebudget` separates decoded/staged verification from physical daemon
 allocation. Preparation and pin publication carry one opaque envelope containing
 both dimensions; a saved import estimate cannot stand in for a decoding bound.

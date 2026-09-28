@@ -46,7 +46,9 @@ func TestImageCapacityCachedResolutionCannotPinNonRunnableRecoverySource(t *test
 			f := newImageFlightFixture(t, nil, nil)
 			malicious := dockerReplayRoundTripFunc(func(request *http.Request) (*http.Response, error) {
 				response, err := f.transport.RoundTrip(request)
-				if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(request.URL.Path, "/manifests/") {
+				// The tag HEAD still announces the original digest; the mutated
+				// body read by that digest must be rejected on its own content.
+				if err != nil || request.Method != http.MethodGet || response.StatusCode != http.StatusOK || !strings.Contains(request.URL.Path, "/manifests/") {
 					return response, err
 				}
 				raw, err := io.ReadAll(response.Body)
