@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/types"
@@ -542,6 +543,42 @@ func TestManifestClaimCancellationStaysWithItsOwner(t *testing.T) {
 			require.Equal(t, 1, registry.manifestGETs())
 		})
 	})
+}
+
+// A registry read that panics unwinds through Resolve to a caller that may
+// recover it. The claim that read held must still be released, or every later
+// resolution of the same content waits out its own deadline.
+func TestManifestClaimReleasedWhenItsRegistryReadPanics(t *testing.T) {
+	for name, pinned := range map[string]bool{"tag": false, "digest": true} {
+		t.Run(name, func(t *testing.T) {
+			f := newRegistry(t, encodedTar(t))
+			synctest.Test(t, func(t *testing.T) {
+				registry := newMemoryRegistry(f)
+				var armed atomic.Bool
+				armed.Store(true)
+				registry.get = func(*http.Request) error {
+					if armed.CompareAndSwap(true, false) {
+						panic("registry read panic")
+					}
+					return nil
+				}
+				loader := newMemoryLoader(t, registry)
+				reference := f.ref()
+				if pinned {
+					reference = fixtureRepository(t, f).Digest(f.manifestID.String()).String()
+				}
+				require.PanicsWithValue(t, "registry read panic", func() {
+					_, _ = loader.Resolve(t.Context(), reference, testPlatform)
+				})
+				require.Empty(t, loader.manifests.claims, "the panicking read released its claim")
+				bounded, cancel := context.WithTimeout(t.Context(), time.Minute)
+				defer cancel()
+				_, err := loader.Resolve(bounded, reference, testPlatform)
+				require.NoError(t, err, "the next resolution does not wait on the dead read")
+				require.Equal(t, 2, registry.manifestGETs())
+			})
+		})
+	}
 }
 
 func TestHeadDigestContradictedByContentIsKeyedByContent(t *testing.T) {

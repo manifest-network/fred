@@ -32,7 +32,9 @@ var manifestAccept = strings.Join([]string{
 //
 // A claim whose read returned its key's bytes stays held until Resolve retains
 // its admitted bytes or ends, so concurrent resolutions of the same content
-// wait for that outcome rather than repeating the registry read.
+// wait for that outcome rather than repeating the registry read. Every claim
+// is registered with close as soon as it is granted, before its registry read,
+// so a read that panics still releases it while Resolve unwinds.
 type manifestReader struct {
 	cache         *manifestCache
 	exchange      singleRegistryExchange
@@ -55,6 +57,12 @@ func (r *manifestReader) retainAdmitted() {
 	for _, content := range r.fetched {
 		r.cache.retain(content)
 	}
+}
+
+// hold registers a granted claim with close. Release is idempotent, so a read
+// that fails or is contradicted may still release its claim early.
+func (r *manifestReader) hold(release func()) {
+	r.claims = append(r.claims, release)
 }
 
 // close releases every claim after any retain, waking waiters to re-read.
@@ -110,15 +118,14 @@ func (r *manifestReader) resolveTag(ctx context.Context, tag name.Tag) (verified
 		imageTagResolutions.WithLabelValues(tagFromCache).Inc()
 		return cached, nil
 	}
+	r.hold(release)
 	imageTagResolutions.WithLabelValues(tagFromRegistry).Inc()
 	content, err := r.get(operation, client, r.repository.Digest(announced.String()))
 	if err != nil {
 		release()
 		return verifiedManifest{}, err
 	}
-	if content.digest == announced {
-		r.claims = append(r.claims, release)
-	} else {
+	if content.digest != announced {
 		// The content digest wins: the header only chose what to request.
 		// Keep no claim naming other bytes, so every held claim remains a
 		// verified ancestor of whatever this resolution waits for next.
@@ -142,12 +149,12 @@ func (r *manifestReader) readDigest(ctx context.Context, reference name.Digest) 
 	if release == nil {
 		return cached, nil
 	}
+	r.hold(release)
 	content, err := r.fetchExact(ctx, reference, want)
 	if err != nil {
 		release()
 		return verifiedManifest{}, err
 	}
-	r.claims = append(r.claims, release)
 	r.fetched = append(r.fetched, content)
 	return content, nil
 }
