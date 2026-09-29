@@ -2540,11 +2540,14 @@ func testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t *testing.T, moun
 	ctx := t.Context()
 	leaseUUID := newIntegrationLeaseUUID()
 	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
+	// Automatic snapshots stay off: a SET would schedule a background save
+	// that the explicit SAVE below can race ("Background save already in
+	// progress"). SAVE alone persists the key.
 	source := manifest.Manifest{
 		Image:   "redis:7",
 		User:    "999:999",
 		Env:     map[string]string{"PR240_POLICY": "frozen-source"},
-		Command: []string{"sh", "-c", "echo pr240-source-ready; exec redis-server --save 1 1"},
+		Command: []string{"sh", "-c", "echo pr240-source-ready; exec redis-server --save ''"},
 	}
 	payload, err := json.Marshal(source)
 	require.NoError(t, err)
