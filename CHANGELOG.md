@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `providerd --validate-config` and `docker-backend -validate-config` check a
+  config file exactly as startup would, without opening a store or touching
+  Docker or the network, and exit 0 or 1. Typed Fred rejects unknown keys, so
+  checking before a swap avoids a crash loop. With `sub_signer_count > 0`, the
+  sub-signer funding amounts are now parsed with the rest of the config instead
+  of after the chain client starts.
 - `placement-preflight -prepare` reports a machine-readable outcome: the last
   stdout line is `{"outcome":"<name>"}` and the exit status is 0 `prepared`,
   10 `not_mutated`, 11 `backup_published`, 12 `outcome_unknown`, or 13

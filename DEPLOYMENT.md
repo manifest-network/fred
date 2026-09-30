@@ -242,7 +242,17 @@ containing it.
 
 ## Configuration files
 
-Two files, both validated at startup. The daemon refuses to start with any required field missing or invalid.
+Two files, both validated at startup. The daemon refuses to start with any required field missing or invalid, and with any key it does not recognize.
+
+Check a file before swapping it in, or before replacing a binary that will read
+it. Each command runs every configuration check its startup makes before
+touching a store, Docker, or the network (environment overrides included), prints
+one line on success, and exits 0 or 1:
+
+```bash
+providerd --validate-config --config /etc/fred/config.yaml
+docker-backend -validate-config -config /etc/fred/docker-backend.yaml
+```
 
 | File | Mounted at | Owner |
 |---|---|---|

@@ -65,7 +65,8 @@ func main() {
 
 	// Bootstrap logger for startup messages (before config is loaded).
 	logOutput := io.Writer(os.Stdout)
-	if startup.preflightStorageIdentityAdoption || startup.dockerEffects.mode != dockerEffectsNone {
+	if startup.preflightStorageIdentityAdoption || startup.dockerEffects.mode != dockerEffectsNone ||
+		startup.validateConfig {
 		// Keep one-shot reports on stdout machine-readable. Diagnostics,
 		// including configuration and proof failures, remain visible on stderr.
 		logOutput = os.Stderr
@@ -75,22 +76,23 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	// Load configuration
-	cfg, err := loadConfig(configPath)
+	if startup.validateConfig {
+		if _, err := validateStartupConfig(configPath); err != nil {
+			logger.Error("config rejected", "error", err)
+			os.Exit(1)
+		}
+		if _, err := fmt.Fprintf(os.Stdout, "docker-backend: config %q is valid\n", configPath); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+	cfg, logLevel, err := loadStartupConfig(configPath)
 	if err != nil {
-		logger.Error("failed to load config", "error", err)
+		logger.Error("config rejected", "error", err)
 		os.Exit(1)
 	}
-
-	// Apply environment variable overrides
-	applyEnvOverrides(&cfg)
 
 	// Re-configure logger with the configured log level.
-	logLevel, err := config.ParseLogLevel(cmp.Or(cfg.LogLevel, "info"))
-	if err != nil {
-		logger.Error("invalid log_level in config", "error", err)
-		os.Exit(1)
-	}
 	logger = slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{
 		Level: logLevel,
 	}))
@@ -331,6 +333,7 @@ type startupFlags struct {
 	preflightStorageIdentityAdoption bool
 	storageIdentityOperationTimeout  time.Duration
 	dockerEffects                    dockerEffectsCommand
+	validateConfig                   bool
 }
 
 func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
@@ -355,6 +358,8 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		"one-shot: repair unresolved Docker effects after external fencing; requires acknowledgement and backup")
 	effectsAcknowledgement := fs.String("docker-effects-acknowledgement", "", "exact acknowledgement from inspection; only valid with repair")
 	effectsBackup := fs.String("docker-effects-backup", "", "new backup path required for Docker-effects repair; only valid with repair")
+	validateConfig := fs.Bool("validate-config", false,
+		"check the config file as startup would, without opening a store or touching Docker, and exit")
 	if err := fs.Parse(args); err != nil {
 		return startupFlags{}, err
 	}
@@ -362,14 +367,16 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		return startupFlags{}, errors.New("-storage-identity-operation-timeout must be positive")
 	}
 	oneShotModes := 0
-	for _, requested := range []bool{*preflightAdoption, *initializeIdentity != "", *inspectEffects, *repairEffects} {
+	for _, requested := range []bool{
+		*preflightAdoption, *initializeIdentity != "", *inspectEffects, *repairEffects, *validateConfig,
+	} {
 		if requested {
 			oneShotModes++
 		}
 	}
 	if oneShotModes > 1 {
 		return startupFlags{}, errors.New(
-			"storage-identity preflight, initialization, Docker-effects inspection and repair are mutually exclusive",
+			"storage-identity preflight, initialization, Docker-effects inspection and repair, and config validation are mutually exclusive",
 		)
 	}
 	repairArgumentsSupplied := false
@@ -392,7 +399,37 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		preflightStorageIdentityAdoption: *preflightAdoption,
 		storageIdentityOperationTimeout:  *identityOperationTimeout,
 		dockerEffects:                    effects,
+		validateConfig:                   *validateConfig,
 	}, nil
+}
+
+// loadStartupConfig is the configuration pipeline every mode runs before it
+// dispatches. Each mode then validates the result first thing (docker.New and
+// every offline operation), reporting a failure in its own output format.
+func loadStartupConfig(path string) (docker.Config, slog.Level, error) {
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return cfg, 0, fmt.Errorf("failed to load config: %w", err)
+	}
+	applyEnvOverrides(&cfg)
+	logLevel, err := config.ParseLogLevel(cmp.Or(cfg.LogLevel, "info"))
+	if err != nil {
+		return cfg, 0, fmt.Errorf("invalid log_level in config: %w", err)
+	}
+	return cfg, logLevel, nil
+}
+
+// validateStartupConfig is every configuration check a mode makes before its
+// first side effect. -validate-config runs exactly this.
+func validateStartupConfig(path string) (docker.Config, error) {
+	cfg, _, err := loadStartupConfig(path)
+	if err != nil {
+		return cfg, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return cfg, fmt.Errorf("invalid config: %w", err)
+	}
+	return cfg, nil
 }
 
 // parseFlags retains the small version/config parsing seam used by existing

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/google/uuid"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/spf13/viper"
@@ -445,6 +446,14 @@ func (c *Config) Validate() error {
 	}
 	if c.SubSignerCount > 0 && c.SubSignerFundCheckInterval <= 0 {
 		return fmt.Errorf("sub_signer_fund_check_interval must be positive when sub_signer_count > 0")
+	}
+	if c.SubSignerCount > 0 {
+		if _, err := sdk.ParseCoinNormalized(c.SubSignerMinBalance); err != nil {
+			return fmt.Errorf("invalid sub_signer_min_balance: %w", err)
+		}
+		if _, err := sdk.ParseCoinNormalized(c.SubSignerTopUpAmount); err != nil {
+			return fmt.Errorf("invalid sub_signer_top_up_amount: %w", err)
+		}
 	}
 
 	// Reconciliation validations

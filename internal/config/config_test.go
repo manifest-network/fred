@@ -810,6 +810,26 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			},
 			wantErr: "sub_signer_count must be non-negative",
 		},
+		{
+			name: "unparseable sub_signer_min_balance with sub_signer_count > 0",
+			modify: func(c *Config) {
+				c.SubSignerCount = 3
+				c.SubSignerFundCheckInterval = time.Hour
+				c.SubSignerMinBalance = "ten umfx"
+				c.SubSignerTopUpAmount = "50000000umfx"
+			},
+			wantErr: "invalid sub_signer_min_balance",
+		},
+		{
+			name: "unparseable sub_signer_top_up_amount with sub_signer_count > 0",
+			modify: func(c *Config) {
+				c.SubSignerCount = 3
+				c.SubSignerFundCheckInterval = time.Hour
+				c.SubSignerMinBalance = "10000000umfx"
+				c.SubSignerTopUpAmount = "umfx"
+			},
+			wantErr: "invalid sub_signer_top_up_amount",
+		},
 	}
 
 	for _, tt := range tests {
