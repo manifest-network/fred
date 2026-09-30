@@ -1071,6 +1071,10 @@ type Store struct {
 	inventorySweepSequence    uint64
 	pendingInventorySweepID   uint64
 	inventoryRecoveryRequired bool
+	// inventoryReporters is the durable write-ahead journal of backends whose
+	// positives the pending sweep chain may not have projected. It narrows
+	// what an inherited marker must re-observe to exactly those reporters.
+	inventoryReporters sweepReporterJournal
 	// unprojectedPositives is the lease-local same-process half of the durable
 	// sweep marker. Sweep-owned collection installs typed reporter affinity here
 	// before an opaque endpoint receipt returns, so policy code cannot race the
@@ -1369,6 +1373,7 @@ func loadStoreWithExpectedAuthority(
 		inventorySweepSequence:    metadata.InventorySweepSequence,
 		pendingInventorySweepID:   metadata.PendingInventorySweepID,
 		inventoryRecoveryRequired: metadata.PendingInventorySweepID != 0,
+		inventoryReporters:        sweepReporterJournalFromMetadata(metadata),
 		emptyInventoryBackends: func() map[string]struct{} {
 			set := make(map[string]struct{}, len(metadata.EmptyInventoryBackends))
 			for _, backendName := range metadata.EmptyInventoryBackends {
@@ -1388,6 +1393,10 @@ func loadStoreWithExpectedAuthority(
 	}
 	if s.now == nil {
 		s.now = time.Now
+	}
+	s.setInventoryRecoveryRequiredLocked(s.inventoryRecoveryRequired)
+	if s.inventoryRecoveryRequired {
+		s.logInventoryRecoveryPendingLocked()
 	}
 	return s, nil
 }
@@ -1843,22 +1852,30 @@ func (s *Store) beginInventorySession() (inventoryFence, error) {
 		return inventoryFence{}, errors.New("placement inventory sweep identity exhausted")
 	}
 	nextSweepID := s.inventorySweepSequence + 1
+	inheritedRecovery := s.inventoryRecoveryRequired || s.pendingInventorySweepID != 0
+	// A sweep that inherits nothing unresolved starts an empty journal; one
+	// that supersedes an unresolved chain keeps every reporter it recorded.
+	nextReporters := trackedSweepReporters()
+	if inheritedRecovery {
+		nextReporters = s.inventoryReporters.successor()
+	}
 	metadata := s.topologyMetadataLocked()
 	metadata.InventorySweepSequence = nextSweepID
 	metadata.PendingInventorySweepID = nextSweepID
+	metadata.InventorySweepReporters = nextReporters.persisted(nextSweepID)
 	if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
 		return putTopologyMetadata(tx, metadata)
 	}); err != nil {
 		return inventoryFence{}, mutationFailure("begin placement inventory sweep", err)
 	}
-	inheritedRecovery := s.inventoryRecoveryRequired || s.pendingInventorySweepID != 0
+	s.inventoryReporters = nextReporters
+	s.inventorySweepSequence = nextSweepID
+	s.pendingInventorySweepID = nextSweepID
 	if inheritedRecovery {
 		// Superseding a still-pending sweep means it may already have observed a
 		// positive that never reached the durable projection.
-		s.inventoryRecoveryRequired = true
+		s.setInventoryRecoveryRequiredLocked(true)
 	}
-	s.inventorySweepSequence = nextSweepID
-	s.pendingInventorySweepID = nextSweepID
 	// A new collection supersedes every process-local inventory fence issued
 	// from an older collection.
 	s.advanceAuthorityEpochLocked()
@@ -1869,21 +1886,60 @@ func (s *Store) beginInventorySession() (inventoryFence, error) {
 	return fence, nil
 }
 
+// setInventoryRecoveryRequiredLocked is the only writer of the recovery flag
+// after construction, so the exported gauge cannot drift from the state that
+// withholds fresh lease side effects.
+// Caller holds s.mu.
+func (s *Store) setInventoryRecoveryRequiredLocked(required bool) {
+	changed := s.inventoryRecoveryRequired != required
+	s.inventoryRecoveryRequired = required
+	if !required {
+		metrics.PlacementInventoryRecoveryPending.Set(0)
+		if changed {
+			slog.Info("placement inventory recovery complete", "sweep_id", s.pendingInventorySweepID)
+		}
+		return
+	}
+	metrics.PlacementInventoryRecoveryPending.Set(1)
+	if changed {
+		s.logInventoryRecoveryPendingLocked()
+	}
+}
+
+// logInventoryRecoveryPendingLocked names what recovery waits for, so an
+// operator can see which backends hold every lease side effect back.
+// Caller holds s.mu.
+func (s *Store) logInventoryRecoveryPendingLocked() {
+	if s.inventoryReporters.tracked {
+		slog.Warn("placement inventory recovery pending: waiting for the interrupted sweep's reporters "+
+			"to answer both endpoints with their pinned storage",
+			"sweep_id", s.pendingInventorySweepID, "reporters", s.inventoryReporters.names())
+		return
+	}
+	slog.Warn("placement inventory recovery pending: waiting for every configured backend "+
+		"to answer both endpoints with its pinned storage",
+		"sweep_id", s.pendingInventorySweepID, "backends", s.backendTopology)
+}
+
 // recordUnprojectedPositives installs the process-local exclusion half of an
 // inventory observation before a sweep-owned endpoint receipt returns to its
 // caller. The durable pending sweep marker is already committed by
-// beginInventorySession, so a process restart fails closed even though this
-// lease-local acceleration is intentionally volatile.
+// beginInventorySession, and the reporter is committed to the sweep's durable
+// journal before any barrier is installed. The barriers themselves stay
+// volatile: after a restart, the journal names every backend whose lost
+// positives must be re-observed.
 func (s *Store) recordUnprojectedPositives(
 	fence inventoryFence,
 	backendName string,
 	class inventoryPositiveClass,
+	attribution inventoryAttribution,
 	leaseUUIDs []string,
 ) error {
 	if len(leaseUUIDs) == 0 {
 		return nil
 	}
-	if class < inventoryPositiveProvision || class > inventoryPositiveUntrusted {
+	if class < inventoryPositiveProvision || class > inventoryPositiveUntrusted ||
+		(class == inventoryPositiveUntrusted && attribution == inventoryAttributed) {
 		return ErrInvalidInventoryEvidence
 	}
 	if err := s.reattestRuntimeAuthority(); err != nil {
@@ -1898,6 +1954,85 @@ func (s *Store) recordUnprojectedPositives(
 	if err := s.validateConfiguredBackendLocked(backendName); err != nil {
 		return err
 	}
+	recorded, err := s.recordSweepReporterLocked(fence, backendName, attribution)
+	if err != nil {
+		return err
+	}
+	s.installUnprojectedPositivesLocked(recorded, class, leaseUUIDs)
+	return nil
+}
+
+// untrackSweepReporters returns the pending chain to the whole-topology rule
+// before a sweep records any positive as untrusted.
+func (s *Store) untrackSweepReporters(fence inventoryFence) error {
+	if err := s.reattestRuntimeAuthority(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !fence.valid() || fence.issuer != s || fence.epoch != s.authorityEpoch ||
+		fence.sweepID != s.pendingInventorySweepID {
+		return ErrInvalidInventoryFence
+	}
+	return s.untrackSweepReportersLocked()
+}
+
+// untrackSweepReportersLocked lowers the live process to the stricter rule
+// before writing it, so a failed write cannot leave memory narrower than the
+// evidence it holds; the error stops the caller from using that evidence.
+// Caller holds s.mu.
+func (s *Store) untrackSweepReportersLocked() error {
+	if !s.inventoryReporters.tracked {
+		return nil
+	}
+	s.inventoryReporters = untrackedSweepReporters()
+	metadata := s.topologyMetadataLocked()
+	if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+		return putTopologyMetadata(tx, metadata)
+	}); err != nil {
+		return mutationFailure("untrack placement inventory sweep reporters", err)
+	}
+	return nil
+}
+
+// recordSweepReporterLocked durably journals backendName for the fence's
+// pending sweep before its first positive can become a lease barrier. An
+// untracked chain writes nothing: it already requires every configured
+// backend to answer. A failed write returns an error, so the caller discards
+// the response and the backend is treated as silent for this sweep.
+// Caller holds s.mu.
+func (s *Store) recordSweepReporterLocked(
+	fence inventoryFence,
+	backendName string,
+	attribution inventoryAttribution,
+) (sweepReporterRecorded, error) {
+	if attribution != inventoryAttributed {
+		if err := s.untrackSweepReportersLocked(); err != nil {
+			return sweepReporterRecorded{}, err
+		}
+	} else if s.inventoryReporters.tracked && !s.inventoryReporters.recorded(backendName) {
+		next := s.inventoryReporters.with(backendName)
+		metadata := s.topologyMetadataLocked()
+		metadata.InventorySweepReporters = next.persisted(s.pendingInventorySweepID)
+		if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+			return putTopologyMetadata(tx, metadata)
+		}); err != nil {
+			return sweepReporterRecorded{}, mutationFailure("record placement inventory sweep reporter", err)
+		}
+		s.inventoryReporters = next
+	}
+	return sweepReporterRecorded{sweepID: fence.sweepID, backendName: backendName}, nil
+}
+
+// installUnprojectedPositivesLocked takes its reporter and sweep only from a
+// recordSweepReporterLocked proof, so a barrier cannot name a reporter the
+// durable journal does not.
+// Caller holds s.mu.
+func (s *Store) installUnprojectedPositivesLocked(
+	recorded sweepReporterRecorded,
+	class inventoryPositiveClass,
+	leaseUUIDs []string,
+) {
 	for _, leaseUUID := range leaseUUIDs {
 		if leaseUUID == "" {
 			continue
@@ -1907,17 +2042,16 @@ func (s *Store) recordUnprojectedPositives(
 			boundaries = make(map[uint64]map[inventoryPositiveObservation]struct{})
 			s.unprojectedPositives[leaseUUID] = boundaries
 		}
-		reporters := boundaries[fence.sweepID]
+		reporters := boundaries[recorded.sweepID]
 		if reporters == nil {
 			reporters = make(map[inventoryPositiveObservation]struct{})
-			boundaries[fence.sweepID] = reporters
+			boundaries[recorded.sweepID] = reporters
 		}
 		reporters[inventoryPositiveObservation{
-			backendName: backendName,
+			backendName: recorded.backendName,
 			class:       class,
 		}] = struct{}{}
 	}
-	return nil
 }
 
 func (s *Store) unprojectedPositiveErrorLocked(leaseUUID string) error {
@@ -1997,12 +2131,13 @@ func (s *Store) endInventorySession(fence inventoryFence, report inventorySessio
 		canClear := !fence.recoveryRequired && sealed && !report.hasPositive
 		if canClear {
 			metadata := s.topologyMetadataLocked()
-			metadata.PendingInventorySweepID = 0
+			metadata.clearPendingInventorySweep()
 			if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
 				return putTopologyMetadata(tx, metadata)
 			}); err == nil {
 				s.pendingInventorySweepID = 0
-				s.inventoryRecoveryRequired = false
+				s.inventoryReporters = sweepReporterJournal{}
+				s.setInventoryRecoveryRequiredLocked(false)
 				s.clearInventoryPositiveBarriersLocked(fence.sweepID, false, nil)
 			} else {
 				failure := mutationFailure("clear represented inventory sweep", err)
@@ -2010,17 +2145,61 @@ func (s *Store) endInventorySession(fence inventoryFence, report inventorySessio
 					"sweep_id", fence.sweepID,
 					"error", failure,
 				)
-				s.inventoryRecoveryRequired = true
+				s.setInventoryRecoveryRequiredLocked(true)
 			}
 		} else {
 			// A successful projection clears this exact durable marker first. If
 			// an unrepresented positive remains at End, degraded recordless
 			// admission stays withdrawn until a complete projection accounts for
 			// every reporter.
-			s.inventoryRecoveryRequired = true
+			s.setInventoryRecoveryRequiredLocked(true)
 		}
 	}
 	s.endInventorySnapshotLocked(fence.revision)
+}
+
+// InventoryReadiness is the closed reason placement inventory does or does not
+// currently admit fresh lease side effects. Its zero value is invalid and is
+// never returned.
+type InventoryReadiness uint8
+
+const (
+	// The zero value is reserved as invalid.
+	_ InventoryReadiness = iota
+	// InventoryReady means a complete inventory for the current topology is
+	// durable and no interrupted sweep withholds fresh side effects.
+	InventoryReady
+	// InventoryAwaitingBaseline means no complete inventory has committed for
+	// the current topology yet.
+	InventoryAwaitingBaseline
+	// InventoryRecoveryPending means an interrupted sweep withholds fresh side
+	// effects until every backend that could have reported a lost positive
+	// answers both endpoints again.
+	InventoryRecoveryPending
+	// InventoryAuthorityWithdrawn means the placement store's durable runtime
+	// authority failed.
+	InventoryAuthorityWithdrawn
+)
+
+// InventoryReadiness reports why fresh lease side effects are or are not
+// currently admitted. Recovery takes precedence over a missing baseline: it is
+// the state that names what must answer next.
+func (s *Store) InventoryReadiness() InventoryReadiness {
+	if err := s.reattestRuntimeAuthority(); err != nil {
+		return InventoryAuthorityWithdrawn
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	switch {
+	case s.runtimeAuthorityFailure() != nil:
+		return InventoryAuthorityWithdrawn
+	case s.inventoryRecoveryRequired:
+		return InventoryRecoveryPending
+	case !s.hasCurrentAdmissionBaselineLocked():
+		return InventoryAwaitingBaseline
+	default:
+		return InventoryReady
+	}
 }
 
 // InventoryBootstrapped reports whether a complete fleet inventory was
@@ -2029,12 +2208,7 @@ func (s *Store) endInventorySession(fence inventoryFence, report inventorySessio
 // change makes the prior baseline inapplicable until a complete projection
 // commits for the new topology.
 func (s *Store) InventoryBootstrapped() bool {
-	if err := s.reattestRuntimeAuthority(); err != nil {
-		return false
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.hasCurrentAdmissionBaselineLocked()
+	return s.InventoryReadiness() == InventoryReady
 }
 
 // Caller holds s.mu.
@@ -3144,14 +3318,14 @@ func (s *Store) projectInventory(
 		nextMetadata.EmptyInventoryBackends = slices.Clone(projection.emptyBackends)
 	}
 	recoveryCovered := projection.complete || (!unresolvedPositive &&
-		s.pairedTopologyObservationLocked(projection.AbsenceEvidence).ValidFor(s.inventoryEvidence))
+		s.inheritedFenceCoveredLocked(projection.AbsenceEvidence))
 	if (!s.inventoryRecoveryRequired || recoveryCovered) && !unresolvedPositive {
 		// Clear only this exact live sweep. When an earlier sweep was abandoned,
 		// missing or mismatched endpoints cannot account for lost observations.
 		// Paired topology coverage can recover the marker despite lease-local
 		// ambiguity only after every current positive is durably represented.
 		// This does not establish a baseline or grant drain/absence authority.
-		nextMetadata.PendingInventorySweepID = 0
+		nextMetadata.clearPendingInventorySweep()
 	}
 	if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
@@ -3191,6 +3365,9 @@ func (s *Store) projectInventory(
 	}
 	s.revision = nextRevision
 	s.pendingInventorySweepID = nextMetadata.PendingInventorySweepID
+	if s.pendingInventorySweepID == 0 {
+		s.inventoryReporters = sweepReporterJournal{}
+	}
 	if projection.complete {
 		for backendName, id := range projection.backendStorageIdentities {
 			s.backendStorageIDs[backendName] = id
@@ -3203,7 +3380,7 @@ func (s *Store) projectInventory(
 			s.emptyInventoryBackends[backendName] = struct{}{}
 		}
 	}
-	s.inventoryRecoveryRequired = nextMetadata.PendingInventorySweepID != 0
+	s.setInventoryRecoveryRequiredLocked(nextMetadata.PendingInventorySweepID != 0)
 	s.clearInventoryPositiveBarriersLocked(
 		fence.sweepID, recoveryCovered, unresolvedPositives,
 	)
@@ -3779,6 +3956,27 @@ func projectConflict(
 		attemptRequestSnapshot:        existing.attemptRequestSnapshot,
 		attemptCallbackPair:           existing.attemptCallbackPair,
 	}
+}
+
+// inheritedFenceCoveredLocked reports whether this sealed collection
+// re-observed every backend that could have reported a positive the pending
+// chain lost, each bound to its durable storage pin. A tracked journal names
+// exactly those reporters. An untracked chain cannot name a subset, so the
+// whole configured topology must answer, as before reporter tracking.
+// Caller holds s.mu.
+func (s *Store) inheritedFenceCoveredLocked(snapshot inventory.Snapshot) bool {
+	if !s.inventoryReporters.tracked {
+		return s.pairedTopologyObservationLocked(snapshot).ValidFor(s.inventoryEvidence)
+	}
+	reporters := s.inventoryReporters.names()
+	identities := snapshot.StorageIdentities(s.inventoryEvidence)
+	for _, backendName := range reporters {
+		expected, bound := s.backendStorageIDs[backendName]
+		if !bound || !expected.Valid() || identities[backendName] != expected {
+			return false
+		}
+	}
+	return snapshot.PairedCoverage(s.inventoryEvidence, reporters).ValidFor(s.inventoryEvidence)
 }
 
 // pairedTopologyObservationLocked binds full endpoint coverage to every

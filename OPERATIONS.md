@@ -1220,10 +1220,21 @@ That availability rule assumes the preceding inventory sweep ended cleanly. If
 providerd restarts with an interrupted-sweep marker in `placements.db`, a lost
 positive observation may not yet be represented by any placement row. Fred then
 withholds fresh lease side effects—even owner-affine maintenance and
-cleanup—until a projection covers every configured, pinned backend endpoint and
-durably accounts for every positive. Constructor-issued paired-topology coverage
-can retire this inherited fence even when individual leases remain quarantined;
-it cannot establish a new admission baseline or prove an empty backend.
+cleanup—until every backend that reported a positive during the interrupted
+sweep chain answers both endpoints again, matching its storage pin, and the
+projection durably accounts for every positive. Fred journals each reporter
+before its positive can take effect, so a backend that was already down during
+the interrupted sweep does not keep the whole provider fenced. Every configured
+backend is still needed when the interrupted chain held evidence Fred could not
+attribute to its reporter (a failed refresh, an identity that does not match
+the pin, malformed rows, a lease in both endpoints of one backend, or a rejected
+endpoint response), and for a marker written by an earlier revision. The WARN
+log `placement inventory recovery pending` names the `reporters` (or every
+configured backend) recovery is waiting for.
+`/readyz` then reports `placement inventory recovery pending`, and
+`fred_placement_inventory_recovery_pending` is 1. The coverage proof can retire
+this inherited fence even when individual leases remain quarantined; it cannot
+establish a new admission baseline or prove an empty backend.
 Exact authenticated callback settlement and replay of already-durable attempts
 or maintenance commands remain available. An increase in
 `fred_placement_write_failures_total` accompanied by “inventory sweep marker

@@ -59,7 +59,28 @@ type PlacementLookup interface {
 // separate optional capability from PlacementLookup: ordinary read routing can
 // remain available while new multi-backend side effects are still fail-closed.
 type PlacementBootstrap interface {
-	InventoryBootstrapped() bool
+	InventoryReadiness() placement.InventoryReadiness
+}
+
+// The readiness gate is wired by a runtime type assertion that drops it when
+// the store stops satisfying this interface; keep that a compile error.
+var _ PlacementBootstrap = (*placement.Store)(nil)
+
+// placementInventoryReadinessError maps the closed readiness reason to the
+// probe verdict. An unrecognized value fails closed.
+func placementInventoryReadinessError(readiness placement.InventoryReadiness) error {
+	switch readiness {
+	case placement.InventoryReady:
+		return nil
+	case placement.InventoryRecoveryPending:
+		return errors.New("an interrupted placement inventory sweep awaits its reporters")
+	case placement.InventoryAwaitingBaseline:
+		return errors.New("authoritative placement inventory has not completed")
+	case placement.InventoryAuthorityWithdrawn:
+		return errors.New("placement store authority was withdrawn")
+	default:
+		return fmt.Errorf("unknown placement inventory readiness %d", readiness)
+	}
 }
 
 // PayloadStoreHealth reports whether the payload store's bbolt database is
@@ -1573,15 +1594,20 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 			measureHealthProbe(ctx, h.placementLookup.Healthy))
 	}
 	if h.placementBootstrap != nil {
+		// The store call is the measured work: it reattests runtime authority
+		// and waits on the store lock.
+		var readiness placement.InventoryReadiness
 		probe := measureHealthProbe(ctx, func() error {
-			if !h.placementBootstrap.InventoryBootstrapped() {
-				return errors.New("authoritative placement inventory has not completed")
-			}
-			return nil
+			readiness = h.placementBootstrap.InventoryReadiness()
+			return placementInventoryReadinessError(readiness)
 		})
+		clientMsg := "placement inventory not ready"
+		if readiness == placement.InventoryRecoveryPending {
+			clientMsg = "placement inventory recovery pending"
+		}
 		record(healthCheckInventory, true,
 			"health check: placement inventory not bootstrapped",
-			"placement inventory not ready", probe)
+			clientMsg, probe)
 	}
 
 	// Check payload store (bbolt database)

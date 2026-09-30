@@ -498,9 +498,13 @@ func TestHealthCheck_RecordsCheckGauges(t *testing.T) {
 			return unhealthyStore()
 		}
 
+		readiness := placement.InventoryAwaitingBaseline
+		if healthy {
+			readiness = placement.InventoryReady
+		}
 		bootstrap := &mockBootstrapPlacementLookup{
 			mockPlacementLookup: mockPlacementLookup{healthyFunc: result},
-			bootstrapped:        healthy,
+			readiness:           readiness,
 		}
 		h := &Handlers{
 			client: &mockChainClient{
@@ -852,17 +856,40 @@ func TestReadyz_AllHealthy(t *testing.T) {
 
 func TestReadyz_WaitsForFirstAuthoritativePlacementInventory(t *testing.T) {
 	for _, tt := range []struct {
-		name         string
-		bootstrapped bool
-		wantStatus   int
-		wantCheck    string
+		name       string
+		readiness  placement.InventoryReadiness
+		wantStatus int
+		wantCheck  string
+		wantDetail string
 	}{
-		{name: "startup inventory pending", wantStatus: http.StatusServiceUnavailable, wantCheck: "unhealthy"},
-		{name: "startup inventory complete", bootstrapped: true, wantStatus: http.StatusOK, wantCheck: "healthy"},
+		{
+			name: "startup inventory pending", readiness: placement.InventoryAwaitingBaseline,
+			wantStatus: http.StatusServiceUnavailable, wantCheck: "unhealthy",
+			wantDetail: "placement inventory not ready",
+		},
+		{
+			name: "interrupted sweep recovery pending", readiness: placement.InventoryRecoveryPending,
+			wantStatus: http.StatusServiceUnavailable, wantCheck: "unhealthy",
+			wantDetail: "placement inventory recovery pending",
+		},
+		{
+			name: "store authority withdrawn", readiness: placement.InventoryAuthorityWithdrawn,
+			wantStatus: http.StatusServiceUnavailable, wantCheck: "unhealthy",
+			wantDetail: "placement inventory not ready",
+		},
+		{
+			name: "unknown readiness fails closed", readiness: placement.InventoryReadiness(0),
+			wantStatus: http.StatusServiceUnavailable, wantCheck: "unhealthy",
+			wantDetail: "placement inventory not ready",
+		},
+		{
+			name: "startup inventory complete", readiness: placement.InventoryReady,
+			wantStatus: http.StatusOK, wantCheck: "healthy",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			h := NewHandlers(HandlersConfig{
-				PlacementLookup: &mockBootstrapPlacementLookup{bootstrapped: tt.bootstrapped},
+				PlacementLookup: &mockBootstrapPlacementLookup{readiness: tt.readiness},
 				ProviderUUID:    testutil.ValidUUID1,
 				Bech32Prefix:    "manifest",
 			})
@@ -874,6 +901,7 @@ func TestReadyz_WaitsForFirstAuthoritativePlacementInventory(t *testing.T) {
 			var response HealthResponse
 			require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 			assert.Equal(t, tt.wantCheck, response.Checks["placement_inventory"].Status)
+			assert.Equal(t, tt.wantDetail, response.Checks["placement_inventory"].Message)
 			assert.Equal(t, "healthy", response.Checks["placement_store"].Status,
 				"database health and startup authority are independent checks")
 		})
@@ -4119,11 +4147,11 @@ type mockPlacementLookup struct {
 
 type mockBootstrapPlacementLookup struct {
 	mockPlacementLookup
-	bootstrapped bool
+	readiness placement.InventoryReadiness
 }
 
-func (m *mockBootstrapPlacementLookup) InventoryBootstrapped() bool {
-	return m.bootstrapped
+func (m *mockBootstrapPlacementLookup) InventoryReadiness() placement.InventoryReadiness {
+	return m.readiness
 }
 
 func (m *mockPlacementLookup) Lookup(leaseUUID string) placement.Placement {

@@ -453,6 +453,7 @@ func TestStore_BackendRemovalRequiresEmptyInventoryAndNoLifecycleAuthority(t *te
 			fence,
 			"backend-b",
 			inventoryPositiveProvision,
+			inventoryAttributed,
 			[]string{"11638ef8-1401-4f14-a355-1ae02afeb35b"},
 		))
 		pendingSweepID := store.pendingInventorySweepID

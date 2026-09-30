@@ -60,6 +60,17 @@ var (
 		Help:      "Total failed writes or durable-sync verifications in the placement store",
 	})
 
+	// PlacementInventoryRecoveryPending is 1 while an interrupted inventory
+	// sweep withholds fresh lease side effects. It returns to 0 once every
+	// backend that could have reported a lost positive answers both endpoints
+	// again, or a complete projection commits.
+	PlacementInventoryRecoveryPending = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "placement",
+		Name:      "inventory_recovery_pending",
+		Help:      "1 while an interrupted inventory sweep withholds fresh lease side effects until its journaled reporters (every backend, if the sweep held unattributed evidence or predates the journal) answer both endpoints with their pinned storage and every positive is durably represented; 0 otherwise",
+	})
+
 	// InFlightProvisions tracks the number of provisions currently in progress.
 	InFlightProvisions = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,

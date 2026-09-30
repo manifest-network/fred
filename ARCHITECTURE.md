@@ -450,11 +450,23 @@ Reconciler interplay (level-triggered backstop):
   restart inherits the marker, a lost positive might name a different owner, a
   retained copy, or unusable identity evidence. Missing or rejected endpoint
   coverage then prevents fresh provision, restore, maintenance, chain-write,
-  prune, or backend-cleanup authority. A sealed full-topology pair matching every
-  existing storage pin can clear inherited fencing after the projection durably
-  represents every positive, including quarantines. That narrower coverage proof
-  does not establish a new baseline, adopt storage identities, or prove a backend
-  empty. Exact durable callback, attempt, and
+  prune, or backend-cleanup authority. Before a backend's first positive in a
+  pending sweep chain can become a lease barrier, the Store journals that
+  backend durably with the marker, so a lost positive can only have come from a
+  journaled reporter. A sealed pair from every journaled reporter, each matching
+  its storage pin, can clear inherited fencing after the projection durably
+  represents every positive, including quarantines. A backend that never
+  reported contributed nothing a restart could lose, so its silence does not
+  hold the provider fenced. Only attributed evidence narrows recovery: a
+  refreshed answer from the backend's pinned storage, with well-formed rows
+  and no lease in both of its endpoints. A response that fails any of those,
+  or that disposal rejects, could name a lease held elsewhere; a sweep would
+  quarantine it until whole-topology coverage, so the Store durably returns the
+  chain to the whole-topology rule before that evidence is used. A marker
+  without a journal, written before reporter tracking, also needs a sealed pair
+  from the whole topology. That
+  narrower coverage proof does not establish a new baseline, adopt storage
+  identities, or prove a backend empty. Exact durable callback, attempt, and
   maintenance-command recovery remains available because it replays recorded
   authority rather than inferring new authority from absence.
   Projected actions are also bound to the Store inventory epoch. Beginning a
@@ -1737,6 +1749,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_provisioner_ack_batch_individual_fallbacks_total` | counter | `lane` | Ack-batch failures that fell back to per-lease retries |
 | `fred_provisioner_reconciler_inflight_skips_total` | counter | — | Ready leases the reconciler skipped because the main flow owns them |
 | `fred_provisioner_reconciler_panics_total` | counter | `stage` | Panics recovered in reconciler goroutines (`process_lease`, `process_orphan`, `fetch_provisions`, `fetch_retentions`, `check_placement_marker`, `placement_cleanup`) — any non-zero is a latent bug; placement-cleanup recovery preserves the exact candidate while unrelated worker lanes continue |
+| `fred_placement_inventory_recovery_pending` | gauge | — | 1 while an interrupted inventory sweep withholds fresh lease side effects until every journaled reporter (every backend, if the sweep held unattributed evidence or predates the journal) answers both endpoints with its pinned storage and every positive is durably represented; 0 otherwise. `/readyz` reports `placement inventory recovery pending` for the same state |
 | `fred_placement_write_failures_total` | counter | — | Failed durable placement mutations or sync verification. Any increase is actionable: a definitely pre-commit failure blocks the backend call and may be retried, while an outcome-unknown bbolt `Commit` error permanently withdraws this process's placement authority for offline classification |
 
 **Reconciler:**

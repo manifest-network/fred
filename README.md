@@ -1938,11 +1938,18 @@ sweep or operator repair. This partial inventory cannot establish a new
 admission baseline or prove an empty backend. Identity, refresh, or malformed
 endpoint failures still reject the backend's entire response.
 
-After an interrupted sweep or process restart, fresh paired responses matching
-every configured storage pin can retire inherited inventory fencing once the
+After an interrupted sweep or process restart, fresh paired responses from
+every backend that reported a positive during the interrupted sweep chain, each
+matching its storage pin, can retire inherited inventory fencing once the
 projection durably accounts for every positive, including quarantined leases.
-This endpoint-coverage proof does not establish a new admission baseline or
-prove a backend empty.
+The Store journals each such reporter durably before its positive can become a
+lease barrier, so a backend that stayed silent cannot hold the provider fenced.
+Evidence that cannot be attributed to its reporter (failed refresh, identity
+mismatch, malformed rows, a lease in both endpoints of one backend, or a
+rejected response) returns the chain to the whole-topology rule before it is
+used, as does a marker written before reporter tracking: those need paired
+responses from every configured backend. This endpoint-coverage proof does not
+establish a new admission baseline or prove a backend empty.
 
 ```
 Chain state       Backend inventory       Durable placement/attempts

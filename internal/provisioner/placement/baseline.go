@@ -19,6 +19,7 @@ import (
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/backendname"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
+	"github.com/manifest-network/fred/internal/strictjson"
 )
 
 var (
@@ -168,6 +169,17 @@ type topologyMetadata struct {
 	// external inventory reads but did not durably finish its projection.
 	InventorySweepSequence  uint64 `json:"inventory_sweep_sequence,omitempty"`
 	PendingInventorySweepID uint64 `json:"pending_inventory_sweep_id,omitempty"`
+	// InventorySweepReporters names the backends that could have reported a
+	// positive the pending sweep chain has not yet projected. Absent while a
+	// sweep is pending means untracked: every configured backend must answer.
+	InventorySweepReporters *inventorySweepReporters `json:"inventory_sweep_reporters,omitempty"`
+}
+
+// clearPendingInventorySweep retires the pending marker and its reporter
+// journal together; validation rejects a journal without its marker.
+func (metadata *topologyMetadata) clearPendingInventorySweep() {
+	metadata.PendingInventorySweepID = 0
+	metadata.InventorySweepReporters = nil
 }
 
 func emptyTopologyMetadata() topologyMetadata {
@@ -307,6 +319,16 @@ func decodeTopologyMetadata(encoded []byte) (topologyMetadata, error) {
 			return topologyMetadata{}, err
 		}
 	}
+	// The top-level decoder below would accept a duplicated or case-aliased
+	// nested name, and a later duplicate "backends" could empty the journal.
+	if rawReporters, present := fields["inventory_sweep_reporters"]; present {
+		var reporters inventorySweepReporters
+		if err := strictjson.DecodeObject(rawReporters, maxAuthorityRowValueBytes, &reporters); err != nil {
+			return topologyMetadata{}, fmt.Errorf(
+				"decode placement metadata field %q: %w", "inventory_sweep_reporters", err,
+			)
+		}
+	}
 
 	strictDecoder := json.NewDecoder(bytes.NewReader(encoded))
 	strictDecoder.DisallowUnknownFields()
@@ -373,7 +395,7 @@ func topologyMetadataFieldAllowed(name string) bool {
 	case "schema", "topology", "topology_fingerprint", "known_backends", "topology_id",
 		"baseline_fingerprint", "baseline_topology_id", "provider_uuid",
 		"known_backend_storage_ids", "inventory_topology_id", "empty_inventory_backends",
-		"inventory_sweep_sequence", "pending_inventory_sweep_id":
+		"inventory_sweep_sequence", "pending_inventory_sweep_id", "inventory_sweep_reporters":
 		return true
 	default:
 		return false
@@ -400,7 +422,7 @@ func validateTopologyMetadata(metadata topologyMetadata) error {
 			metadata.BaselineFingerprint != "" ||
 			metadata.BaselineTopologyID != 0 || metadata.InventoryTopologyID != 0 ||
 			len(metadata.EmptyInventoryBackends) != 0 || metadata.InventorySweepSequence != 0 ||
-			metadata.PendingInventorySweepID != 0 {
+			metadata.PendingInventorySweepID != 0 || metadata.InventorySweepReporters != nil {
 			return errors.New("malformed unconfigured placement metadata")
 		}
 		return nil
@@ -459,6 +481,9 @@ func validateTopologyMetadata(metadata topologyMetadata) error {
 	if metadata.PendingInventorySweepID > metadata.InventorySweepSequence {
 		return errors.New("pending placement inventory sweep is newer than its durable sequence")
 	}
+	if err := validateInventorySweepReporters(metadata); err != nil {
+		return err
+	}
 	if len(metadata.EmptyInventoryBackends) != 0 {
 		if err := validateCanonicalBackendNames(metadata.EmptyInventoryBackends, false); err != nil {
 			return fmt.Errorf("malformed empty-inventory backend set: %w", err)
@@ -483,6 +508,39 @@ func validateTopologyMetadata(metadata topologyMetadata) error {
 			if metadata.KnownBackendStorageIDs[backendName] == "" {
 				return fmt.Errorf("%w: %q", ErrBackendStorageIdentityUnbound, backendName)
 			}
+		}
+	}
+	return nil
+}
+
+// validateInventorySweepReporters binds the journal to the exact pending sweep
+// and to active backends. A journal naming another sweep, an inactive backend,
+// or a non-canonical set could narrow interrupted-sweep recovery below the
+// reporters that actually answered.
+func validateInventorySweepReporters(metadata topologyMetadata) error {
+	record := metadata.InventorySweepReporters
+	if record == nil {
+		return nil
+	}
+	if metadata.PendingInventorySweepID == 0 || record.SweepID != metadata.PendingInventorySweepID {
+		return errors.New("placement inventory sweep reporters do not name the pending sweep")
+	}
+	if record.Backends == nil {
+		return errors.New("placement inventory sweep reporters must list backends")
+	}
+	if len(record.Backends) == 0 {
+		return nil
+	}
+	if err := validateCanonicalBackendNames(record.Backends, false); err != nil {
+		return fmt.Errorf("malformed placement inventory sweep reporters: %w", err)
+	}
+	active := make(map[string]struct{}, len(metadata.Topology))
+	for _, backendName := range metadata.Topology {
+		active[backendName] = struct{}{}
+	}
+	for _, backendName := range record.Backends {
+		if _, present := active[backendName]; !present {
+			return fmt.Errorf("placement inventory sweep reporters name inactive backend %q", backendName)
 		}
 	}
 	return nil
@@ -936,6 +994,7 @@ func (s *Store) topologyMetadataLocked() topologyMetadata {
 		EmptyInventoryBackends:  slices.Sorted(maps.Keys(s.emptyInventoryBackends)),
 		InventorySweepSequence:  s.inventorySweepSequence,
 		PendingInventorySweepID: s.pendingInventorySweepID,
+		InventorySweepReporters: s.inventoryReporters.persisted(s.pendingInventorySweepID),
 	}
 }
 

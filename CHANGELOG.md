@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `fred_placement_inventory_recovery_pending` is 1 while an interrupted
+  inventory sweep withholds fresh lease side effects, and `/readyz` reports
+  `placement inventory recovery pending` for that state instead of the generic
+  `placement inventory not ready`.
 - `fred_docker_backend_image_registry_requests_total{endpoint,method,status}`
   counts every registry exchange docker-backend makes, including retries and
   redirect hops, with `status="429"` for quota refusals.
@@ -686,8 +690,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   transition, and cannot seal with an outstanding receipt. Only a successful
   semantic projection (or an orderly sealed zero-positive end) clears the exact
   marker. After an interrupted sweep and restart, partial inventory cannot
-  mint fresh lease side effects until a complete projection resolves the lost
-  evidence; exact durable callback, attempt, and maintenance recovery remains
+  mint fresh lease side effects until every backend that reported a positive
+  during the interrupted sweep chain answers again and the projection resolves
+  the lost evidence. Each reporter is journaled durably before its positive can
+  take effect, so a backend that was already silent cannot hold the provider
+  fenced. Evidence that cannot be attributed to its reporter (failed refresh,
+  identity mismatch, malformed rows, a lease in both endpoints of one backend,
+  or a rejected response) and a marker without a journal still need every
+  configured backend. An older binary refuses a database stopped with an
+  interrupted sweep; run this release until recovery completes before rolling
+  back.
+  Exact durable callback, attempt, and maintenance recovery remains
   available. A newer sweep also invalidates unclaimed actions from an older
   projected epoch, while actions that already hold a lease claim are captured
   in the newer operation boundary and excluded. A fenced trusted provision that exactly matches the durable

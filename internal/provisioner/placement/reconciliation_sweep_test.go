@@ -1587,6 +1587,11 @@ func TestInheritedInventoryRecoveryBlocksFreshSideEffectsButAllowsExactMaintenan
 	for _, test := range []struct {
 		name      string
 		interrupt func(*testing.T, *ReconciliationSweep)
+		// reporterRecovers: the lost evidence was backend-a's own, so its fresh
+		// paired answer retires the fence without backend-b, exactly as a
+		// sweep that never crashed would. Unattributed evidence could name a
+		// lease held on backend-b and keeps the whole-topology rule.
+		reporterRecovers bool
 	}{
 		{
 			name: "same-backend retention",
@@ -1595,6 +1600,7 @@ func TestInheritedInventoryRecoveryBlocksFreshSideEffectsButAllowsExactMaintenan
 					"backend-a", testBackendStorageID("backend-a"), []string{ownerUUID},
 				))
 			},
+			reporterRecovers: true,
 		},
 		{
 			name: "same-backend untrusted provision",
@@ -1728,6 +1734,17 @@ func TestInheritedInventoryRecoveryBlocksFreshSideEffectsButAllowsExactMaintenan
 			})
 			require.NoError(t, err)
 			require.False(t, projected.Complete())
+			if test.reporterRecovers {
+				require.False(t, reopened.inventoryRecoveryRequired)
+				require.True(t, projected.AdmissionBaseline().Valid())
+				_, err = reopened.prepareMaintenanceCommand(
+					maintenanceID, ownerUUID, MaintenanceCommandRestart, nil,
+				)
+				require.NoError(t, err)
+				partial.End()
+				return
+			}
+			require.True(t, reopened.inventoryRecoveryRequired)
 			require.False(t, projected.AdmissionBaseline().Valid())
 			require.False(t, projected.HasPruneAbsence(ownerUUID),
 				"inherited uncertainty must not mint a destructive absence capability")
