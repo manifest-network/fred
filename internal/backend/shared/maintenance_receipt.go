@@ -475,99 +475,134 @@ func (s *CallbackStore) listFailedMaintenanceCompletionRecords() (
 // ListFailedMaintenanceReceipts returns only permanent failure records which
 // prove the exact maintenance generation crossed the effect boundary. Each
 // result is joined to its immutable target release under the journal pair's
-// lease lock; a missing or divergent target fails closed instead of turning a
-// receipt into caller-selected cleanup authority. A live close head exclusively
-// owns the lease's physical cleanup, so it cannot issue a competing receipt.
+// lease lock. A missing or divergent target is returned separately as
+// unverifiable: it grants no cleanup authority, and it never fails the listing
+// for other leases, which one tenant's compacted history could otherwise do to
+// the whole backend. A live close head exclusively owns the lease's physical
+// cleanup, so it cannot issue a competing receipt.
+// UnverifiableMaintenanceReceipt is a failed, effect-started receipt whose
+// exact target release could not be read or verified, for example after
+// release-history compaction dropped the target row. It grants no cleanup
+// authority: uncertainty keeps the bytes, and it never blocks another lease's
+// receipts.
+type UnverifiableMaintenanceReceipt struct {
+	LeaseUUID     string
+	MaintenanceID MaintenanceID
+	Cause         error
+}
+
 func (s *MaintenanceSettlement) ListFailedMaintenanceReceipts() (
 	[]FailedMaintenanceReceipt,
+	[]UnverifiableMaintenanceReceipt,
 	error,
 ) {
 	if s == nil || s.callbacks == nil || s.releases == nil {
-		return nil, errors.New("maintenance settlement is invalid")
+		return nil, nil, errors.New("maintenance settlement is invalid")
 	}
 	records, err := s.callbacks.listFailedMaintenanceCompletionRecords()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	receipts := make([]FailedMaintenanceReceipt, 0, len(records))
+	var unverifiable []UnverifiableMaintenanceReceipt
 	for _, snapshot := range records {
-		unlock := s.lockLease(snapshot.LeaseUUID)
-		var (
-			current maintenanceCompletionRecord
-			found   bool
-			release Release
+		receipt, found, err := s.verifyFailedMaintenanceReceipt(snapshot)
+		if err != nil {
+			// One lease's missing or divergent evidence is that lease's
+			// problem; it must not fail recovery for every other lease.
+			unverifiable = append(unverifiable, UnverifiableMaintenanceReceipt{
+				LeaseUUID: snapshot.LeaseUUID, MaintenanceID: snapshot.MaintenanceID, Cause: err,
+			})
+			continue
+		}
+		if found {
+			receipts = append(receipts, receipt)
+		}
+	}
+	return receipts, unverifiable, nil
+}
+
+// verifyFailedMaintenanceReceipt joins one listed record to its immutable
+// target release under the journal pair's lease lock. found is false when the
+// record is no longer current (a close took ownership, or it was replaced).
+func (s *MaintenanceSettlement) verifyFailedMaintenanceReceipt(
+	snapshot maintenanceCompletionRecord,
+) (FailedMaintenanceReceipt, bool, error) {
+	unlock := s.lockLease(snapshot.LeaseUUID)
+	var (
+		current maintenanceCompletionRecord
+		found   bool
+		release Release
+	)
+	err := s.callbacks.view(func(tx *bolt.Tx) error {
+		head, _, readErr := getLeaseMutationHeadTx(tx, snapshot.LeaseUUID)
+		if readErr != nil {
+			return readErr
+		}
+		if _, closing := head.(closeLeaseMutationHead); closing {
+			return nil
+		}
+		current, found, readErr = findMaintenanceReceiptTx(
+			tx, snapshot.LeaseUUID, snapshot.MaintenanceID,
 		)
-		err = s.callbacks.view(func(tx *bolt.Tx) error {
-			head, _, readErr := getLeaseMutationHeadTx(tx, snapshot.LeaseUUID)
+		return readErr
+	})
+	if err == nil && found && current == snapshot {
+		err = s.releases.view(func(tx *bolt.Tx) error {
+			history, readErr := readReleaseHistoryTx(tx, current.LeaseUUID)
 			if readErr != nil {
 				return readErr
 			}
-			if _, closing := head.(closeLeaseMutationHead); closing {
-				return nil
+			for _, candidate := range history {
+				if candidate.Version == current.TargetReleaseVersion &&
+					candidate.MaintenanceID == current.MaintenanceID {
+					release = cloneRelease(candidate)
+					return nil
+				}
 			}
-			current, found, readErr = findMaintenanceReceiptTx(
-				tx, snapshot.LeaseUUID, snapshot.MaintenanceID,
-			)
-			return readErr
+			return errors.New("failed maintenance receipt target release is missing")
 		})
-		if err == nil && found && current == snapshot {
-			err = s.releases.view(func(tx *bolt.Tx) error {
-				history, readErr := readReleaseHistoryTx(tx, current.LeaseUUID)
-				if readErr != nil {
-					return readErr
-				}
-				for _, candidate := range history {
-					if candidate.Version == current.TargetReleaseVersion &&
-						candidate.MaintenanceID == current.MaintenanceID {
-						release = cloneRelease(candidate)
-						return nil
-					}
-				}
-				return errors.New("failed maintenance receipt target release is missing")
-			})
-		}
-		unlock()
-		if err != nil {
-			return nil, err
-		}
-		if !found || current != snapshot {
-			continue
-		}
-		wantDigest, err := parseMaintenanceDigest(current.TargetReleaseDigest, false)
-		if err != nil {
-			return nil, err
-		}
-		actualDigest, err := maintenanceReleaseDigest(release)
-		if err != nil {
-			return nil, err
-		}
-		if actualDigest != wantDigest {
-			return nil, errors.New("failed maintenance receipt target release is divergent")
-		}
-		identity, ok := releaseRuntimeIdentityFor(release)
-		if !ok || identity.Tenant() != current.Tenant ||
-			identity.ProviderUUID() != current.ProviderUUID {
-			return nil, errors.New("failed maintenance receipt target authority is divergent")
-		}
-		storageID, err := backendidentity.Parse(current.BackendStorageID)
-		if err != nil {
-			return nil, err
-		}
-		receipt := FailedMaintenanceReceipt{
-			settlement: s, callbacks: s.callbacks, releases: s.releases,
-			record: current, storageID: storageID,
-			target: ReleaseClaim{
-				issuer: s.releases, leaseUUID: current.LeaseUUID,
-				version: current.TargetReleaseVersion, digest: wantDigest,
-			},
-			release: release,
-		}
-		if !receipt.Valid() {
-			return nil, errors.New("failed maintenance receipt could not be sealed")
-		}
-		receipts = append(receipts, receipt)
 	}
-	return receipts, nil
+	unlock()
+	if err != nil {
+		return FailedMaintenanceReceipt{}, false, err
+	}
+	if !found || current != snapshot {
+		return FailedMaintenanceReceipt{}, false, nil
+	}
+	wantDigest, err := parseMaintenanceDigest(current.TargetReleaseDigest, false)
+	if err != nil {
+		return FailedMaintenanceReceipt{}, false, err
+	}
+	actualDigest, err := maintenanceReleaseDigest(release)
+	if err != nil {
+		return FailedMaintenanceReceipt{}, false, err
+	}
+	if actualDigest != wantDigest {
+		return FailedMaintenanceReceipt{}, false, errors.New("failed maintenance receipt target release is divergent")
+	}
+	identity, ok := releaseRuntimeIdentityFor(release)
+	if !ok || identity.Tenant() != current.Tenant ||
+		identity.ProviderUUID() != current.ProviderUUID {
+		return FailedMaintenanceReceipt{}, false, errors.New("failed maintenance receipt target authority is divergent")
+	}
+	storageID, err := backendidentity.Parse(current.BackendStorageID)
+	if err != nil {
+		return FailedMaintenanceReceipt{}, false, err
+	}
+	receipt := FailedMaintenanceReceipt{
+		settlement: s, callbacks: s.callbacks, releases: s.releases,
+		record: current, storageID: storageID,
+		target: ReleaseClaim{
+			issuer: s.releases, leaseUUID: current.LeaseUUID,
+			version: current.TargetReleaseVersion, digest: wantDigest,
+		},
+		release: release,
+	}
+	if !receipt.Valid() {
+		return FailedMaintenanceReceipt{}, false, errors.New("failed maintenance receipt could not be sealed")
+	}
+	return receipt, true, nil
 }
 
 func reserveMaintenanceReceiptTx(tx *bolt.Tx, entry maintenanceIntentEntry) error {

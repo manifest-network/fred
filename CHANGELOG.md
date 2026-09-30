@@ -920,6 +920,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- One tenant could stop a whole docker-backend. A failed, effect-started
+  update keeps a receipt that names its target release row, but release-history
+  compaction protects only the newest and the latest active rows, so later
+  large updates to the same lease could drop that row. The missing target then
+  failed the backend-wide listing every recovery pass and startup depend on,
+  so recovery aborted on every tick and the backend could not restart. Such a receipt is now reported as unverifiable, grants no cleanup
+  authority (a late container for that generation is kept), and never blocks
+  other leases; `fred_docker_backend_maintenance_receipts_unverifiable_total`
+  counts it. Cleanup also re-verifies only its own receipt instead of
+  re-listing the backend.
 - New leases and updates spend an anonymous Docker Hub pull only when the
   backend has not yet verified the tag's current manifest. Each preparation
   re-resolves its tag with one manifest HEAD, which Docker Hub does not meter,

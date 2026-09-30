@@ -545,9 +545,17 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 }
 
 func (b *Backend) recoverFailedMaintenanceReceipts(ctx context.Context) error {
-	receipts, err := b.maintenanceSettlement.ListFailedMaintenanceReceipts()
+	receipts, unverifiable, err := b.maintenanceSettlement.ListFailedMaintenanceReceipts()
 	if err != nil {
 		return fmt.Errorf("list failed maintenance receipts: %w", err)
+	}
+	for _, receipt := range unverifiable {
+		// No cleanup authority: a late container for this generation is kept
+		// and handled by ordinary lease-local recovery.
+		maintenanceReceiptsUnverifiableTotal.Inc()
+		b.logger.Error("failed maintenance receipt target cannot be verified; keeping any late container",
+			"lease_uuid", receipt.LeaseUUID, "maintenance_id", receipt.MaintenanceID.String(),
+			"error", receipt.Cause)
 	}
 	for _, receipt := range receipts {
 		if receipt.Backend() != b.Name() || receipt.BackendStorageID() != b.storageIdentity {

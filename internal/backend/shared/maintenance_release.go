@@ -1188,18 +1188,13 @@ func (s *MaintenanceSettlement) CleanupFailedMaintenanceReceipt(
 	}
 	var subject MaintenancePhysicalSubject
 	execution, err := s.mutation.RecoverAfter(func() (MaintenancePhysicalSubject, error) {
-		current, err := s.ListFailedMaintenanceReceipts()
+		// Re-verify exactly this receipt: another lease's evidence can
+		// neither block nor authorize this cleanup.
+		current, found, err := s.verifyFailedMaintenanceReceipt(receipt.record)
 		if err != nil {
 			return MaintenancePhysicalSubject{}, err
 		}
-		found := false
-		for _, candidate := range current {
-			if sameFailedMaintenanceReceipt(candidate, receipt) {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !found || !sameFailedMaintenanceReceipt(current, receipt) {
 			return MaintenancePhysicalSubject{}, errors.New(
 				"failed-maintenance cleanup receipt is no longer durable",
 			)
