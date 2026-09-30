@@ -96,7 +96,8 @@ func TestRun_PrepareRejectsBackupParentReplacementAfterAuthorization(t *testing.
 	require.ErrorContains(t, err, "directory identity changed")
 	assert.NotErrorIs(t, err, placement.ErrExactBackupPublished,
 		"the replaced parent must be rejected before publication")
-	assert.Empty(t, stdout.String(), "a replaced backup parent must never produce a verdict")
+	assert.Equal(t, `{"outcome":"not_mutated"}`+"\n", stdout.String(),
+		"a replaced backup parent must never produce a verdict")
 
 	after, readErr := os.ReadFile(dbPath)
 	require.NoError(t, readErr)

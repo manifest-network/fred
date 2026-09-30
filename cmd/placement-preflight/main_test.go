@@ -320,6 +320,7 @@ func TestRun_DocumentedInspectThenPrepareSequenceCreatesRollbackBackup(t *testin
 	require.NoError(t, err)
 	assert.Contains(t, inspectOut.String(), inspectSuccessVerdict+":")
 	assert.Contains(t, inspectOut.String(), "database remained read-only")
+	assert.NotContains(t, inspectOut.String(), `"outcome"`, "only -prepare reports an outcome")
 	afterInspect, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
 	assert.Equal(t, legacyBytes, afterInspect,
@@ -337,6 +338,10 @@ func TestRun_DocumentedInspectThenPrepareSequenceCreatesRollbackBackup(t *testin
 	assert.NotContains(t, prepareOut.String(), "\nPASS: forged-preflight-verdict.bak\n",
 		"an operator-supplied backup path must not be able to forge a verdict line")
 	assert.Contains(t, prepareOut.String(), "old-binary rollback now requires restoring the backup")
+	assert.True(t, strings.HasSuffix(prepareOut.String(),
+		"database prepared; exact legacy backup: "+strconv.Quote(backupPath)+"\n"+
+			`{"outcome":"prepared"}`+"\n"),
+		"the outcome is the final line, after the verdict")
 
 	backupInfo, err := os.Stat(backupPath)
 	require.NoError(t, err)
@@ -443,13 +448,14 @@ func TestRun_PreparePostCommitFailuresRequireReadOnlyInspection(t *testing.T) {
 				return test.wrapPreparer(preparer, cause), nil
 			}
 
+			stdout := test.stdout(cause)
 			err := runWithDependencies(t.Context(), []string{
 				"-config", configPath,
 				"-proof-timeout", "5s",
 				"-prepare",
 				"-backup", backupPath,
 				"-attest-drained", placement.LegacyPreparationDrainAttestation,
-			}, test.stdout(cause), &bytes.Buffer{}, dependencies)
+			}, stdout, &bytes.Buffer{}, dependencies)
 			require.ErrorIs(t, err, errPreflightPrepared)
 			require.ErrorIs(t, err, cause)
 			require.ErrorContains(t, err, "PREPARED:")
@@ -457,6 +463,10 @@ func TestRun_PreparePostCommitFailuresRequireReadOnlyInspection(t *testing.T) {
 			require.ErrorContains(t, err,
 				"run placement-repair -classify with the same providerd config immediately")
 			require.ErrorContains(t, err, "do not retry blindly")
+			assert.Equal(t, 13, commandExitCode(err))
+			if buffer, ok := stdout.(*bytes.Buffer); ok {
+				assert.True(t, strings.HasSuffix(buffer.String(), `{"outcome":"prepared_unverified"}`+"\n"))
+			}
 			if test.wantReportingOnly {
 				require.ErrorContains(t, err,
 					"database was durably written and closed; only command reporting is indeterminate")
@@ -557,6 +567,8 @@ func TestRun_PrepareReopenSemanticFailureIsCategoricallyCommitted(t *testing.T) 
 	require.ErrorContains(t, err,
 		"run placement-repair -classify with the same providerd config immediately")
 	assert.NotContains(t, stdout.String(), "PASS:")
+	assert.Equal(t, 13, commandExitCode(err))
+	assert.Equal(t, `{"outcome":"prepared_unverified"}`+"\n", stdout.String())
 
 	inspector, openErr := placement.OpenRepairInspector(
 		dbPath, "550e8400-e29b-41d4-a716-446655440000",
@@ -1214,7 +1226,8 @@ func TestRun_PrepareRejectsEmptyOrTruncatedSourceWithoutMutation(t *testing.T) {
 				"-attest-drained", placement.LegacyPreparationDrainAttestation,
 			}, &stdout, &bytes.Buffer{}, dependencies)
 			require.Error(t, err)
-			assert.Empty(t, stdout.String())
+			assert.Equal(t, 10, commandExitCode(err))
+			assert.Equal(t, `{"outcome":"not_mutated"}`+"\n", stdout.String())
 			after, readErr := os.ReadFile(dbPath)
 			require.NoError(t, readErr)
 			assert.Equal(t, before, after)

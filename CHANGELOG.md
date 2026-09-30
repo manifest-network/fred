@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `placement-preflight -prepare` reports a machine-readable outcome: the last
+  stdout line is `{"outcome":"<name>"}` and the exit status is 0 `prepared`,
+  10 `not_mutated`, 11 `backup_published`, 12 `outcome_unknown`, or 13
+  `prepared_unverified`, so automation can tell a safe retry from one that must
+  classify first. Other failures still exit 1.
 - `placement-repair -attest-restored-backup` makes a restored placement
   database safe to start. A copy restored from before a lease was dispatched
   has no row for it, and its admission baseline read the missing row as "never

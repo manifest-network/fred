@@ -1726,7 +1726,24 @@ emitted backup, and that backup must never be restored after upgraded side
 effects begin. Normal upgraded startup opens only an existing fully prepared
 database and performs no schema/bootstrap write.
 
-`PREPARED_FOR_CUTOVER` is rendered last and the complete verdict is issued in one write after
+`-prepare` also reports its outcome for automation. The last stdout line is
+`{"outcome":"<name>"}` (after the verdict, in the same write, on success), and the
+exit status names the same outcome:
+
+| Exit | `outcome` | Meaning | Next step |
+|---|---|---|---|
+| 0 | `prepared` | Prepared and every postcondition verified | Cut over |
+| 10 | `not_mutated` | Neither the database nor the backup path changed | Rerun the read-only preflight, then `-prepare` |
+| 11 | `backup_published` | The exact backup exists; no preparation committed | Keep the backup; rerun with a new `-backup` path |
+| 12 | `outcome_unknown` | The commit returned an error | Keep providerd stopped; `placement-repair -classify` |
+| 13 | `prepared_unverified` | Committed, but a later sync, close, verification, or report failed | Keep providerd stopped; `placement-repair -classify` |
+
+Any other status (1) is a failure outside `-prepare`, such as a usage error. A
+failure before the preparation capability is consumed writes nothing, so it is
+always `not_mutated`; a disagreement between the command's durable status and
+the preparer's error classes resolves toward the more severe outcome.
+
+`PREPARED_FOR_CUTOVER` is the final verdict line and the complete verdict is issued in one write after
 the prepared database closes. If the command instead exits with a `PREPARED:`
 error, the migration transaction already succeeded before a later sync, close,
 or verdict-reporting failure. Do not blindly rerun `-prepare`, do not infer that
