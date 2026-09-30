@@ -500,6 +500,16 @@ var (
 
 // API metrics
 var (
+	// APIMaintenanceLegacyKeyTotal counts restart/update requests accepted
+	// without Idempotency-Key from a tenant listed in
+	// maintenance_legacy_idempotency_tenants.
+	APIMaintenanceLegacyKeyTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "api",
+		Name:      "maintenance_legacy_key_total",
+		Help:      "Restart/update requests accepted without Idempotency-Key, each keyed by its single-use signed token",
+	})
+
 	// APIRequestDuration tracks API request latency.
 	APIRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: namespace,

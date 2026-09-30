@@ -5,10 +5,13 @@
 package maintenanceid
 
 import (
+	"crypto/sha256"
 	"encoding"
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/google/uuid"
 
 	"github.com/manifest-network/fred/internal/uuidv4"
 )
@@ -16,9 +19,9 @@ import (
 var ErrInvalid = errors.New("maintenance request ID must be a canonical UUIDv4")
 
 // ID identifies one logical maintenance command. Its representation is
-// private, comparable, and invalid at the zero value. The only construction
-// paths either use cryptographic randomness or validate the canonical wire
-// representation.
+// private, comparable, and invalid at the zero value. Construction paths use
+// cryptographic randomness, validate the canonical wire representation, or
+// Derive from a digest of single-use authenticated input.
 type ID struct {
 	value uuidv4.Value
 }
@@ -40,6 +43,18 @@ func New() (ID, error) {
 		return ID{}, fmt.Errorf("generate maintenance request ID: %w", err)
 	}
 	return ID{value: value}, nil
+}
+
+// Derive shapes a 256-bit digest into a UUIDv4 identity. It is the only
+// non-random construction path, reserved for requests that carry no caller
+// key: the caller must derive the digest from single-use, authenticated input
+// so that equal digests can only name one command.
+func Derive(digest [sha256.Size]byte) ID {
+	var value uuid.UUID
+	copy(value[:], digest[:len(value)])
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	return ID{value: uuidv4.FromUUID(value)}
 }
 
 // Parse accepts only the canonical lowercase, hyphenated RFC 4122 UUIDv4

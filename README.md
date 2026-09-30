@@ -855,6 +855,17 @@ Clients must generate a fresh UUIDv4 for each new logical command and reuse it
 only for retries. A live lease that reaches the 1,024-receipt safety ceiling is
 refused before dispatch rather than forgetting an identity.
 
+For clients written before `Idempotency-Key` existed, an operator can list
+tenant addresses in `maintenance_legacy_idempotency_tenants`. A restart or update
+from a listed tenant may then omit the header: Fred authenticates the request
+first, which consumes its single-use signed token, and keys the command by that
+token. Each accepted token is one command, as before keys existed, and a
+replayed token is refused with `401`; a retry therefore needs a new token and is
+a new command. Every such request logs a WARN and increments
+`fred_api_maintenance_legacy_key_total`. A malformed or repeated header is still
+refused with `400` before authentication, and an unlisted tenant that omits the
+header receives `400`.
+
 The provider shares a separate budget of 1,024 pending commands and 64 MiB of
 journal content, including 512 bytes of phase-growth allowance per command.
 There is no fixed per-tenant concurrency cap. A tenant that already has pending

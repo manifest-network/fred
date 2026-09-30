@@ -478,6 +478,8 @@ func run(cmd *cobra.Command, args []string) error {
 		CallbackCanonicalPathPrefix: cfg.CallbackCanonicalPathPrefix,
 		TokenTrackerDBPath:          cfg.TokenTrackerDBPath,
 		CallbackBaseURL:             cfg.CallbackBaseURL,
+
+		MaintenanceLegacyIdempotencyTenants: cfg.MaintenanceLegacyIdempotencyTenants,
 	}, api.ServerDeps{
 		ChainClient:           chainClient,
 		BackendRouter:         backendRouter,

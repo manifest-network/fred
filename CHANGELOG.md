@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `maintenance_legacy_idempotency_tenants` lets listed tenants omit
+  `Idempotency-Key` on restart and update, for integrators written before the
+  header. Fred authenticates first, consuming the single-use signed token, and
+  keys the command by that token; a replayed token is refused. Each such
+  request logs a WARN and increments `fred_api_maintenance_legacy_key_total`.
+  Empty by default.
 - `providerd --validate-config` and `docker-backend -validate-config` check a
   config file exactly as startup would, without opening a store or touching
   Docker or the network, and exit 0 or 1. Typed Fred rejects unknown keys, so
