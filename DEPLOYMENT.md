@@ -672,7 +672,7 @@ and preserve that safety evidence.
 | `<docker>/diagnostics.db` | Medium — failure diagnostics for past 7 days, but no lifecycle authority | May be recreated after loss while the backend is stopped; only historical diagnostics are lost. Open/create still refuses a symlink, hard link, non-regular file, or mode other than exact `0600`, but the file is not identity-bound or continuously re-attested |
 | `<docker>/callbacks.db` | Critical — write-ahead provision/restore operation rows (Pending/Succeeded/Failed), replacement intents, immutable resource/target authority, non-expiring destructive-close finalizers, durable exact/lifecycle deliveries, and per-lease FIFO evidence. Terminal operation rows remain after callback delivery as exact retry and restore-recovery authority until an authorized successor atomically retires them. Causal/close rows and exact operation/maintenance completions do not age out; typed lifecycle observations are retained up to `callback_max_age`. Pre-identity v0.13 outbox rows must be drained while the old backend is still running and are never admitted into the current runtime queue | Accepted or terminal operation state, partial-replacement/close authority, immutable sizing, and queued callback evidence are not recreated. Normal startup refuses a missing file instead of rebuilding its schema. Losing a terminal restore result can make a safe source handback unknowable; absence is invalid rather than Failed. Losing a maintenance row can make an exact replacement cohort unclassifiable; losing a close row after teardown starts can turn an intentional zero-survivor cohort into unexplained release divergence. Restore this file with the matching `releases.db`, `retention.db`, marker pair, and substrate |
 | Backend storage-lineage seal | Critical — the marker pair plus every identity-bound authoritative store bind a backend name to one substrate generation | Docker's set is `callbacks.db`, `releases.db`, `retention.db`, both markers, and the substrate; k3s uses `callbacks.db`, `releases.db`, both markers, and the cluster. Every authoritative database must remain an unsymlinked, single-link regular file with exact mode `0600`; startup and runtime re-attestation fail closed on drift. Restore the complete matching set. One missing, corrupt, foreign, cross-kind, or path/inode-replaced member intentionally prevents startup. Never copy markers onto replacement storage or rerun initialization to repair a committed seal. Whenever Docker has `volume_data_path`, the primary is `volume_data_path/.fred-backend-storage-identity.json` and the anchor is `callback_db_path.storage-identity-anchor.json`; Docker without a managed volume root and k3s keep both adjacent to `callback_db_path`. If all paths share one mount, the set detects partial deletion/torn initialization but is not an independent backup—protect and snapshot the whole mount |
-| `placement_store_db_path` | Critical — provider binding, unresolved attempts, ordinary and rejected-positive (`untrusted_positive`) quarantine, immutable backend-name/storage pins, topology history, and the durable inventory baseline are non-derivable safety authority | Restore the exact file only while `providerd` is stopped. It must be an unsymlinked, single-link regular file with exact mode `0600`. Normal startup never creates, initializes, or migrates an absent/empty/unprepared replacement, and rejects a file bound to another provider. The fresh initializer is only for a genuinely new provider with zero total chain lease history; it is never recovery for a lost database |
+| `placement_store_db_path` | Critical — provider binding, unresolved attempts, ordinary and rejected-positive (`untrusted_positive`) quarantine, immutable backend-name/storage pins, topology history, and the durable inventory baseline are non-derivable safety authority | Restore the exact file only while `providerd` is stopped, then [attest it](#restoring-an-older-placement-backup) before the first start. It must be an unsymlinked, single-link regular file with exact mode `0600`. Normal startup never creates, initializes, or migrates an absent/empty/unprepared replacement, and rejects a file bound to another provider. The fresh initializer is only for a genuinely new provider with zero total chain lease history; it is never recovery for a lost database |
 | `payload_store_db_path` | Low — pending tenant manifests, which tenants can re-upload | Restore only while `providerd` is stopped as an unsymlinked, single-link regular file with exact mode `0600`; otherwise tenants must re-upload pending payloads |
 | `token_tracker_db_path` | None — replay protection has 30s window anyway | Empties on restart, acceptable. bbolt creates a missing file with mode `0600`, but this short-lived cache is not lineage/path identity-bound like placement or payload authority; replace it only while providerd is stopped |
 
@@ -699,6 +699,41 @@ drifts. A live backup must be an atomic
 filesystem snapshot, not pathname replacement. Restore only while stopped. A
 stopped restore may naturally create a new inode: the next strict open validates
 the provider-bound authority and binds that inode before using it.
+
+### Restoring an older placement backup
+
+A restored copy keeps the admission baseline and backend drain evidence of the
+fleet it was copied from, but has no row for anything placed after the copy was
+taken. If a PENDING lease was dispatched after that point and its owner is
+unreachable on the first sweep, the restored baseline reads the missing row as
+"never placed" and provisions the lease a second time on a peer. Attest every
+restored copy, including filesystem snapshots and exact pre-repair backups,
+before `providerd` first starts on it:
+
+```bash
+# providerd stopped, restored file in place
+placement-repair -config /etc/fred/config.yaml -attest-restored-backup
+placement-repair -config /etc/fred/config.yaml -attest-restored-backup \
+  -apply -backup /var/lib/fred/placements.pre-attestation.db -confirm '<confirm>'
+```
+
+The dry run prints one JSON object: `provider_uuid`, `database_path`,
+`topology`, `topology_id`, the pinned `storage_ids`, the evidence it would
+forget (`baseline_topology_id`, `inventory_topology_id`,
+`empty_inventory_backends`), `pending_inventory_sweep`, and `required`. When
+`required` is true it also prints `confirm`, which binds the provider, the
+canonical database path, and every byte of the placement metadata record, so a
+database that changes between the dry run and the apply is refused. When
+`required` is false there is nothing to forget and no apply is needed.
+
+The apply publishes an exact no-overwrite backup of the restored copy, then
+forgets the admission baseline and drain evidence in one transaction. Every
+placement row, storage pin, pending-sweep marker, and reporter journal is kept.
+It contacts no backend and takes no drain attestation, because it only removes
+authority. On the next start `/readyz` reports `placement inventory not ready`
+until one sweep in which every configured backend answers both inventory
+endpoints; until then new admission and backend removal wait, and existing
+leases keep running. That sweep adopts every lease its owner reports.
 
 ### Initializing a genuinely fresh placement authority
 

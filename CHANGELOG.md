@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `placement-repair -attest-restored-backup` makes a restored placement
+  database safe to start. A copy restored from before a lease was dispatched
+  has no row for it, and its admission baseline read the missing row as "never
+  placed": if the owner was unreachable on the first sweep, the lease was
+  provisioned a second time on a peer. The dry run prints the bound plan as one
+  JSON object; `-apply -backup <path> -confirm <value>` publishes an exact
+  backup and forgets only the admission baseline and drain evidence, so
+  admission waits for one complete inventory.
 - `fred_placement_inventory_recovery_pending` is 1 while an interrupted
   inventory sweep withholds fresh lease side effects, and `/readyz` reports
   `placement inventory recovery pending` for that state instead of the generic
