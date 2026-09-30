@@ -66,7 +66,7 @@ func main() {
 	// Bootstrap logger for startup messages (before config is loaded).
 	logOutput := io.Writer(os.Stdout)
 	if startup.preflightStorageIdentityAdoption || startup.dockerEffects.mode != dockerEffectsNone ||
-		startup.validateConfig {
+		startup.validateConfig || startup.auditStorageIdentityAdoption {
 		// Keep one-shot reports on stdout machine-readable. Diagnostics,
 		// including configuration and proof failures, remain visible on stderr.
 		logOutput = os.Stderr
@@ -112,6 +112,14 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+	if startup.auditStorageIdentityAdoption {
+		auditCtx, auditCancel := context.WithTimeout(
+			context.Background(), startup.storageIdentityOperationTimeout,
+		)
+		audit, auditErr := docker.AuditStorageIdentityAdoptionForConfig(auditCtx, cfg, logger)
+		auditCancel()
+		os.Exit(storageIdentityAdoptionAuditExit(os.Stdout, logger, audit, auditErr))
 	}
 	if startup.preflightStorageIdentityAdoption {
 		preflightCtx, preflightCancel := context.WithTimeout(
@@ -296,6 +304,41 @@ func shutdownExitCode(startupErr, backendShutdownErr, storageAuthorityErr error)
 	return 0
 }
 
+// storageIdentityAdoptionAuditExit writes the audit as one JSON object and
+// returns the exit status: 0 when nothing blocks adoption, 3 when findings do,
+// and 1 when the audit itself could not complete (nothing is written then).
+func storageIdentityAdoptionAuditExit(
+	out io.Writer,
+	logger *slog.Logger,
+	audit docker.StorageIdentityAdoptionAudit,
+	auditErr error,
+) int {
+	if auditErr != nil {
+		logger.Error("storage identity adoption audit failed", "error", auditErr)
+		return 1
+	}
+	encoded, err := json.Marshal(audit)
+	if err != nil {
+		logger.Error("encode storage identity adoption audit", "error", err)
+		return 1
+	}
+	encoded = append(encoded, '\n')
+	if written, err := out.Write(encoded); err != nil || written != len(encoded) {
+		logger.Error("write storage identity adoption audit", "error", err)
+		return 1
+	}
+	switch {
+	case audit.Verdict == docker.StorageIdentityAdoptionReady && len(audit.Findings) == 0:
+		return 0
+	case audit.Verdict == docker.StorageIdentityAdoptionBlocked && len(audit.Findings) != 0:
+		return 3
+	default:
+		logger.Error("storage identity adoption audit is internally inconsistent",
+			"verdict", audit.Verdict, "findings", len(audit.Findings))
+		return 1
+	}
+}
+
 func writeStorageIdentityAdoptionVerdict(
 	out io.Writer,
 	verdict docker.StorageIdentityAdoptionVerdict,
@@ -334,6 +377,7 @@ type startupFlags struct {
 	storageIdentityOperationTimeout  time.Duration
 	dockerEffects                    dockerEffectsCommand
 	validateConfig                   bool
+	auditStorageIdentityAdoption     bool
 }
 
 func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
@@ -360,6 +404,8 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	effectsBackup := fs.String("docker-effects-backup", "", "new backup path required for Docker-effects repair; only valid with repair")
 	validateConfig := fs.Bool("validate-config", false,
 		"check the config file as startup would, without opening a store or touching Docker, and exit")
+	auditAdoption := fs.Bool("audit-storage-identity-adoption", false,
+		"one-shot read-only: report every shape that blocks v0.13 storage identity adoption as JSON; exit 0 clean, 3 findings, 1 failed")
 	if err := fs.Parse(args); err != nil {
 		return startupFlags{}, err
 	}
@@ -369,6 +415,7 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	oneShotModes := 0
 	for _, requested := range []bool{
 		*preflightAdoption, *initializeIdentity != "", *inspectEffects, *repairEffects, *validateConfig,
+		*auditAdoption,
 	} {
 		if requested {
 			oneShotModes++
@@ -376,7 +423,7 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	}
 	if oneShotModes > 1 {
 		return startupFlags{}, errors.New(
-			"storage-identity preflight, initialization, Docker-effects inspection and repair, and config validation are mutually exclusive",
+			"storage-identity preflight, audit, initialization, Docker-effects inspection and repair, and config validation are mutually exclusive",
 		)
 	}
 	repairArgumentsSupplied := false
@@ -400,6 +447,7 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		storageIdentityOperationTimeout:  *identityOperationTimeout,
 		dockerEffects:                    effects,
 		validateConfig:                   *validateConfig,
+		auditStorageIdentityAdoption:     *auditAdoption,
 	}, nil
 }
 

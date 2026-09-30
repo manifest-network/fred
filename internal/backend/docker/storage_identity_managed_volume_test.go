@@ -204,7 +204,7 @@ func TestStorageIdentityProofRejectsUnattestedManagedVolumeBeforePublication(t *
 		{
 			name: "read-only preflight",
 			run: func(ctx context.Context, cfg Config, dockerClient storageIdentityProofClient, volumes storageIdentityProofVolumes) error {
-				_, err := preflightStorageIdentityAdoptionWithDependencies(ctx, cfg, dockerClient, volumes)
+				_, err := preflightWithDifferentialAudit(t, ctx, cfg, dockerClient, volumes)
 				return err
 			},
 		},
@@ -370,8 +370,8 @@ func TestStorageIdentityAdoptionRejectsRetentionVolumeIdentityMismatch(t *testin
 				return []string{test.volumeName}, nil
 			}}
 
-			verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-				t.Context(), cfg, storageIdentityPreflightDockerMock(t), volumes,
+			verdict, err := preflightWithDifferentialAudit(
+				t, t.Context(), cfg, storageIdentityPreflightDockerMock(t), volumes,
 			)
 			require.Error(t, err)
 			assert.Empty(t, verdict)
@@ -423,8 +423,8 @@ func TestStorageIdentityAdoptionRejectsCrossLeaseContainerVolumeEvidence(t *test
 	}}
 	before := snapshotStorageIdentityAuthorityFiles(t, cfg)
 
-	verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-		t.Context(), cfg, dockerClient, volumes,
+	verdict, err := preflightWithDifferentialAudit(
+		t, t.Context(), cfg, dockerClient, volumes,
 	)
 	require.Error(t, err)
 	assert.Empty(t, verdict)

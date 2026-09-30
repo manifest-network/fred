@@ -1234,6 +1234,29 @@ reservation: keep the old processes stopped, take the placement plus complete
 backend substrate/control-state backups only after every backend passes, and
 let `adopt` repeat the proof at its own publication boundary.
 
+The preflight stops at the first refused shape. To see every shape in one pass
+before the fence (for example against byte copies of the journals through a
+shadow config), run the read-only audit:
+
+```bash
+docker-backend -config /etc/fred/docker-backend.yaml \
+  -audit-storage-identity-adoption
+```
+
+It runs the preflight's checks in the same order but records each refused
+shape and moves on to the next independent lease, retention, container, or
+volume. Stdout is one JSON object: `verdict`
+(`ready_for_v0_13_storage_identity_adoption` or
+`v0_13_storage_identity_adoption_blocked`), `findings` (each with `class`,
+advisory `remedy`, optional `lease_uuid` and `subject`, and `message`), the
+v0.13 `items` adoption would freeze for each entry in `active_releases`, and
+`pending_callbacks`. The first finding's `message` is exactly the error the
+preflight reports. A shape that makes later checks meaningless, such as an
+unreadable journal or a sealed lineage, fails the audit instead. Exit status is
+0 when nothing blocks adoption, 3 when findings do, and 1 when the audit
+itself failed, which prints nothing on stdout. The audit authorizes nothing:
+only the preflight's verdict does.
+
 `stats.in_flight_provisions == 0` and a drained callback outbox are necessary
 but not sufficient. A v0.13 restore can leave a durable `status:"restoring"`
 row after a teardown, re-quarantine, or finalization failure even when no

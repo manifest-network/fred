@@ -68,8 +68,8 @@ func TestIntegrationStorageIdentityAdoptionRejectsV013RestoringBeforeMutation(t 
 			return nil, nil
 		},
 	}
-	verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-		t.Context(), cfg, dockerClient, &mockVolumeManager{},
+	verdict, err := preflightWithDifferentialAudit(
+		t, t.Context(), cfg, dockerClient, &mockVolumeManager{},
 	)
 	require.Error(t, err)
 	assert.Empty(t, verdict)
@@ -160,8 +160,8 @@ func TestIntegrationStorageIdentityAdoptionPreflightAllowsPartiallyReapedV013Row
 		return []string{presentVolume}, nil
 	}}
 
-	verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-		t.Context(), cfg, dockerClient, volumes,
+	verdict, err := preflightWithDifferentialAudit(
+		t, t.Context(), cfg, dockerClient, volumes,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, StorageIdentityAdoptionReady, verdict)
@@ -200,8 +200,8 @@ func TestIntegrationStorageIdentityAdoptionPreflightRejectsMissingNonReapingVolu
 	writeRawLegacyRetentionRow(t, cfg.RetentionDBPath, source, row)
 	before := snapshotStorageIdentityAuthorityFiles(t, cfg)
 
-	verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-		t.Context(), cfg, storageIdentityPreflightDockerMock(t), &mockVolumeManager{},
+	verdict, err := preflightWithDifferentialAudit(
+		t, t.Context(), cfg, storageIdentityPreflightDockerMock(t), &mockVolumeManager{},
 	)
 	require.Error(t, err)
 	assert.Empty(t, verdict)
@@ -233,8 +233,8 @@ func TestIntegrationStorageIdentityAdoptionPreflightRejectsUnexplainedManagedVol
 	volumes := &mockVolumeManager{ListFn: func() ([]string, error) {
 		return []string{unexplainedVolume}, nil
 	}}
-	verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-		t.Context(), cfg, dockerClient, volumes,
+	verdict, err := preflightWithDifferentialAudit(
+		t, t.Context(), cfg, dockerClient, volumes,
 	)
 	require.Error(t, err)
 	assert.Empty(t, verdict)
@@ -270,8 +270,8 @@ func TestIntegrationStorageIdentityAdoptionPreflightExplainsV013GiveUpFootprintR
 	volumes := &mockVolumeManager{ListFn: func() ([]string, error) {
 		return []string{canonicalVolume, retainedVolume}, nil
 	}}
-	verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-		t.Context(), cfg, storageIdentityPreflightDockerMock(t), volumes,
+	verdict, err := preflightWithDifferentialAudit(
+		t, t.Context(), cfg, storageIdentityPreflightDockerMock(t), volumes,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, StorageIdentityAdoptionReady, verdict)
@@ -312,8 +312,8 @@ func TestIntegrationStorageIdentityAdoptionPreflightDiagnosesInterruptedV013Depr
 			writeRawLegacyRetentionRow(t, cfg.RetentionDBPath, leaseUUID, legacyRetention)
 			before := snapshotStorageIdentityAuthorityFiles(t, cfg)
 
-			verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-				t.Context(), cfg, storageIdentityPreflightDockerMock(t), &mockVolumeManager{
+			verdict, err := preflightWithDifferentialAudit(
+				t, t.Context(), cfg, storageIdentityPreflightDockerMock(t), &mockVolumeManager{
 					ListFn: func() ([]string, error) {
 						return nil, nil
 					},
@@ -361,8 +361,8 @@ func TestIntegrationStorageIdentityAdoptionPreflightDiagnosesUnresolvedV013Close
 			}
 			before := snapshotStorageIdentityAuthorityFiles(t, cfg)
 
-			verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-				t.Context(), cfg, storageIdentityPreflightDockerMock(t), &mockVolumeManager{
+			verdict, err := preflightWithDifferentialAudit(
+				t, t.Context(), cfg, storageIdentityPreflightDockerMock(t), &mockVolumeManager{
 					ListFn: func() ([]string, error) {
 						return test.managedVolumes, nil
 					},
@@ -405,8 +405,8 @@ func TestIntegrationStorageIdentityAdoptionPreflightDoesNotMisclassifyDivergentV
 	writeRawLegacyRetentionRow(t, cfg.RetentionDBPath, leaseUUID, legacyRetention)
 	before := snapshotStorageIdentityAuthorityFiles(t, cfg)
 
-	verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-		t.Context(), cfg, storageIdentityPreflightDockerMock(t), &mockVolumeManager{},
+	verdict, err := preflightWithDifferentialAudit(
+		t, t.Context(), cfg, storageIdentityPreflightDockerMock(t), &mockVolumeManager{},
 	)
 	require.Error(t, err)
 	assert.Empty(t, verdict)
@@ -431,8 +431,8 @@ func TestIntegrationStorageIdentityAdoptionPreflightRejectsUnresolvableV013Reten
 	writeRawLegacyRetentionRow(t, cfg.RetentionDBPath, leaseUUID, legacyRetention)
 	before := snapshotStorageIdentityAuthorityFiles(t, cfg)
 
-	verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-		t.Context(), cfg, storageIdentityPreflightDockerMock(t), &mockVolumeManager{},
+	verdict, err := preflightWithDifferentialAudit(
+		t, t.Context(), cfg, storageIdentityPreflightDockerMock(t), &mockVolumeManager{},
 	)
 	require.Error(t, err)
 	assert.Empty(t, verdict)

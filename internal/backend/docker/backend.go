@@ -1270,6 +1270,9 @@ type storageIdentityEvidenceClient interface {
 	ListManagedContainersStrict(context.Context) ([]ContainerInfo, error)
 }
 
+// verifyStorageIdentityInitializationEvidence is the fail-fast verifier the
+// preflight and the initializer have always run: it stops at the first
+// refused shape.
 func verifyStorageIdentityInitializationEvidence(
 	ctx context.Context,
 	cfg Config,
@@ -1280,44 +1283,93 @@ func verifyStorageIdentityInitializationEvidence(
 	prepared bool,
 	paths *dockerStorageInitializationPaths,
 ) error {
+	_, err := collectStorageIdentityInitializationEvidence(
+		ctx, cfg, dockerClient, volumes, mode, profile, prepared, paths, failFastAdoptionFindings{},
+	)
+	return err
+}
+
+// collectStorageIdentityInitializationEvidence runs every check in one fixed
+// order and reports each refused shape to findings. A fail-fast sink returns
+// the first; the audit's sink records it and the check moves on to the next
+// independent lease, retention, container, or volume. An error that is not a
+// finding (an unreadable journal or substrate) stops both.
+func collectStorageIdentityInitializationEvidence(
+	ctx context.Context,
+	cfg Config,
+	dockerClient storageIdentityEvidenceClient,
+	volumes storageIdentityProofVolumes,
+	mode StorageIdentityInitializationMode,
+	profile backendidentity.InitializationProfile,
+	prepared bool,
+	paths *dockerStorageInitializationPaths,
+	findings adoptionFindings,
+) (adoptionEvidence, error) {
+	var evidence adoptionEvidence
 	if paths == nil {
-		return errors.New("docker storage initialization paths are required")
+		return evidence, errors.New("docker storage initialization paths are required")
 	}
 	callbackStore, err := shared.InspectBoundCallbackStoreReadOnly(paths.callbacks)
 	if err != nil {
-		return fmt.Errorf("inspect callback outbox before storage identity initialization: %w", err)
+		return evidence, fmt.Errorf("inspect callback outbox before storage identity initialization: %w", err)
 	}
+	evidence.pendingCallbacks = callbackStore.Pending
 	if callbackStore.UpgradedSchema && !prepared {
-		return errors.New("storage identity initialization refuses an already-upgraded callback store; restore the sealed marker pair instead of resealing this lineage")
+		if err := findings.add(adoptionFinding{
+			class: AdoptionFindingUpgradedCallbackStore,
+			err:   errors.New("storage identity initialization refuses an already-upgraded callback store; restore the sealed marker pair instead of resealing this lineage"),
+		}); err != nil {
+			return evidence, err
+		}
 	}
 	if callbackStore.Pending != 0 {
-		return fmt.Errorf(
-			"storage identity initialization requires a drained callback outbox; %d pending callbacks remain",
-			callbackStore.Pending,
-		)
+		if err := findings.add(adoptionFinding{
+			class: AdoptionFindingPendingCallbacks,
+			err: fmt.Errorf(
+				"storage identity initialization requires a drained callback outbox; %d pending callbacks remain",
+				callbackStore.Pending,
+			),
+		}); err != nil {
+			return evidence, err
+		}
 	}
 	if profile == backendidentity.InitializationProfileExisting &&
 		(!callbackStore.Exists || !callbackStore.LegacySchema) {
-		return errors.New("existing storage identity requires an existing drained v0.13 callback store")
+		if err := findings.add(adoptionFinding{
+			class: AdoptionFindingIncompleteJournals,
+			err:   errors.New("existing storage identity requires an existing drained v0.13 callback store"),
+		}); err != nil {
+			return evidence, err
+		}
 	}
 	releases, err := shared.InspectBoundLegacyReleaseStoreReadOnly(paths.releases)
 	if err != nil {
-		return fmt.Errorf("inspect release journal before storage identity initialization: %w", err)
+		return evidence, fmt.Errorf("inspect release journal before storage identity initialization: %w", err)
 	}
 	retentionStore, err := shared.InspectBoundRetentionStoreReadOnly(paths.retention)
 	if err != nil {
-		return fmt.Errorf("inspect retention journal before storage identity initialization: %w", err)
+		return evidence, fmt.Errorf("inspect retention journal before storage identity initialization: %w", err)
 	}
 	if profile == backendidentity.InitializationProfileExisting &&
 		(!releases.Exists || !retentionStore.Exists) {
-		return errors.New("existing storage identity requires complete v0.13 callback, release, and retention journals")
+		if err := findings.add(adoptionFinding{
+			class: AdoptionFindingIncompleteJournals,
+			err:   errors.New("existing storage identity requires complete v0.13 callback, release, and retention journals"),
+		}); err != nil {
+			return evidence, err
+		}
 	}
 	containers, err := dockerClient.ListManagedContainersStrict(ctx)
 	if err != nil {
-		return fmt.Errorf("inspect managed containers before storage identity initialization: %w", err)
+		return evidence, fmt.Errorf("inspect managed containers before storage identity initialization: %w", err)
 	}
 	if _, err := recoveredCallbackPairs(containers); err != nil {
-		return fmt.Errorf("validate managed callback cohorts before storage identity initialization: %w", err)
+		if err := findings.add(adoptionFinding{
+			class: AdoptionFindingCallbackCohort,
+			err:   fmt.Errorf("validate managed callback cohorts before storage identity initialization: %w", err),
+		}); err != nil {
+			return evidence, err
+		}
 	}
 	containersByLease := make(map[string][]ContainerInfo, len(releases.ActiveReleases))
 	for _, container := range containers {
@@ -1333,7 +1385,7 @@ func verifyStorageIdentityInitializationEvidence(
 	}
 	managedSet, err := attestManagedVolumeInventory(ctx, volumes)
 	if err != nil {
-		return fmt.Errorf("prove managed volume substrate before storage identity initialization: %w", err)
+		return evidence, fmt.Errorf("prove managed volume substrate before storage identity initialization: %w", err)
 	}
 	managedVolumeCountsByLease := make(map[string]int)
 	for _, volumeName := range managedSet {
@@ -1345,10 +1397,15 @@ func verifyStorageIdentityInitializationEvidence(
 			managedVolumeCountsByLease[leaseUUID] != 0 {
 			continue
 		}
-		return fmt.Errorf(
-			"managed stack lease %q has containers but no release, retention, or managed-volume authority",
-			leaseUUID,
-		)
+		if err := findings.add(adoptionFinding{
+			class: AdoptionFindingContainerWithoutAuthority, leaseUUID: leaseUUID,
+			err: fmt.Errorf(
+				"managed stack lease %q has containers but no release, retention, or managed-volume authority",
+				leaseUUID,
+			),
+		}); err != nil {
+			return evidence, err
+		}
 	}
 	for _, leaseUUID := range slices.Sorted(maps.Keys(releases.ActiveReleases)) {
 		release := releases.ActiveReleases[leaseUUID]
@@ -1357,27 +1414,45 @@ func verifyStorageIdentityInitializationEvidence(
 			retention := retentionsByLease[leaseUUID]
 			matches, matchErr := legacyReleaseMatchesInterruptedDeprovisionRetention(&release, retention)
 			if matchErr != nil {
-				return fmt.Errorf(
-					"compare active v0.13 release %s with retention finalizer: %w",
-					leaseUUID,
-					matchErr,
-				)
+				if err := findings.add(adoptionFinding{
+					class: AdoptionFindingReleaseRetentionComparison, leaseUUID: leaseUUID,
+					err: fmt.Errorf(
+						"compare active v0.13 release %s with retention finalizer: %w",
+						leaseUUID,
+						matchErr,
+					),
+				}); err != nil {
+					return evidence, err
+				}
+				continue
 			}
 			if matches {
-				return fmt.Errorf(
-					"%w: lease %s has an active release, no managed containers, and a matching %s retention; restart the complete matching v0.13 lineage in isolation and replay the exact close/deprovision event or request until it purges the stale active release while preserving the retention, then drain callbacks, stop it, take a new backup, and rerun the read-only preflight",
-					ErrV013InterruptedDeprovision,
-					leaseUUID,
-					retention.Status,
-				)
+				if err := findings.add(adoptionFinding{
+					class: AdoptionFindingInterruptedDeprovision, leaseUUID: leaseUUID,
+					err: fmt.Errorf(
+						"%w: lease %s has an active release, no managed containers, and a matching %s retention; restart the complete matching v0.13 lineage in isolation and replay the exact close/deprovision event or request until it purges the stale active release while preserving the retention, then drain callbacks, stop it, take a new backup, and rerun the read-only preflight",
+						ErrV013InterruptedDeprovision,
+						leaseUUID,
+						retention.Status,
+					),
+				}); err != nil {
+					return evidence, err
+				}
+				continue
 			}
 			if retention == nil {
-				return fmt.Errorf(
-					"%w: lease %s has an active release, no managed container cohort, no retention finalizer, and %d managed volumes in its exact canonical/retained namespace; this is compatible with a v0.13 crash after teardown but before retention or release finalization, and replaying deprovision can purge the release while stranding tenant data; restore the complete matching pre-close snapshot and restart its v0.13 lineage in isolation, or require height-pinned chain plus provider-inventory proof that the lease is terminal before making an explicit manual data-disposition and authority-repair decision; then stop, rerun the read-only preflight, and take a fresh backup",
-					ErrV013UnresolvedClose,
-					leaseUUID,
-					managedVolumeCountsByLease[leaseUUID],
-				)
+				if err := findings.add(adoptionFinding{
+					class: AdoptionFindingUnresolvedClose, leaseUUID: leaseUUID,
+					err: fmt.Errorf(
+						"%w: lease %s has an active release, no managed container cohort, no retention finalizer, and %d managed volumes in its exact canonical/retained namespace; this is compatible with a v0.13 crash after teardown but before retention or release finalization, and replaying deprovision can purge the release while stranding tenant data; restore the complete matching pre-close snapshot and restart its v0.13 lineage in isolation, or require height-pinned chain plus provider-inventory proof that the lease is terminal before making an explicit manual data-disposition and authority-repair decision; then stop, rerun the read-only preflight, and take a fresh backup",
+						ErrV013UnresolvedClose,
+						leaseUUID,
+						managedVolumeCountsByLease[leaseUUID],
+					),
+				}); err != nil {
+					return evidence, err
+				}
+				continue
 			}
 		}
 		authorityItems := slices.Clone(release.Items)
@@ -1386,30 +1461,51 @@ func verifyStorageIdentityInitializationEvidence(
 			authorityItems, authorityErr = deriveV013ActiveReleaseItems(&release, cohort)
 		}
 		if authorityErr != nil {
-			return fmt.Errorf(
-				"validate managed cohort for active v0.13 release %s: %w",
-				leaseUUID,
-				authorityErr,
-			)
+			if err := findings.add(adoptionFinding{
+				class: AdoptionFindingReleaseItems, leaseUUID: leaseUUID,
+				err: fmt.Errorf(
+					"validate managed cohort for active v0.13 release %s: %w",
+					leaseUUID,
+					authorityErr,
+				),
+			}); err != nil {
+				return evidence, err
+			}
+			continue
 		}
+		evidence.activeReleaseItems = append(evidence.activeReleaseItems, adoptionReleaseItems{
+			leaseUUID: leaseUUID, items: slices.Clone(authorityItems),
+		})
 		authorityProfiles, profileErr := resolveResourceProfilesForConfig(cfg, authorityItems)
 		if profileErr != nil {
-			return fmt.Errorf(
-				"resolve startup release authority for active v0.13 release %s: %w",
-				leaseUUID,
-				profileErr,
-			)
+			if err := findings.add(adoptionFinding{
+				class: AdoptionFindingReleaseSKU, leaseUUID: leaseUUID,
+				err: fmt.Errorf(
+					"resolve startup release authority for active v0.13 release %s: %w",
+					leaseUUID,
+					profileErr,
+				),
+			}); err != nil {
+				return evidence, err
+			}
+			continue
 		}
 		var legacyRuntimeAuthority *shared.LegacyRuntimeAuthority
 		if release.OperationID.IsZero() && release.RuntimeAuthority == nil &&
 			release.LegacyRuntimeAuthority == nil {
 			callbackURL, lifecycleCallbackURL, callbackErr := resolveV013ContainerCallbackURLs(cohort)
 			if callbackErr != nil {
-				return fmt.Errorf(
-					"resolve startup runtime authority for active v0.13 release %s: %w",
-					leaseUUID,
-					callbackErr,
-				)
+				if err := findings.add(adoptionFinding{
+					class: AdoptionFindingRuntimeAuthority, leaseUUID: leaseUUID,
+					err: fmt.Errorf(
+						"resolve startup runtime authority for active v0.13 release %s: %w",
+						leaseUUID,
+						callbackErr,
+					),
+				}); err != nil {
+					return evidence, err
+				}
+				continue
 			}
 			identity := cohort[0]
 			frozen, freezeErr := shared.NewLegacyRuntimeAuthority(
@@ -1419,11 +1515,17 @@ func verifyStorageIdentityInitializationEvidence(
 				lifecycleCallbackURL,
 			)
 			if freezeErr != nil {
-				return fmt.Errorf(
-					"validate startup runtime authority for active v0.13 release %s: %w",
-					leaseUUID,
-					freezeErr,
-				)
+				if err := findings.add(adoptionFinding{
+					class: AdoptionFindingRuntimeAuthority, leaseUUID: leaseUUID,
+					err: fmt.Errorf(
+						"validate startup runtime authority for active v0.13 release %s: %w",
+						leaseUUID,
+						freezeErr,
+					),
+				}); err != nil {
+					return evidence, err
+				}
+				continue
 			}
 			legacyRuntimeAuthority = &frozen
 		}
@@ -1448,16 +1550,21 @@ func verifyStorageIdentityInitializationEvidence(
 			)
 		}
 		if capacityErr != nil {
-			return fmt.Errorf(
-				"active v0.13 release %s cannot fit its required startup authority backfill: %w",
-				leaseUUID,
-				capacityErr,
-			)
+			if err := findings.add(adoptionFinding{
+				class: AdoptionFindingReleaseCapacity, leaseUUID: leaseUUID,
+				err: fmt.Errorf(
+					"active v0.13 release %s cannot fit its required startup authority backfill: %w",
+					leaseUUID,
+					capacityErr,
+				),
+			}); err != nil {
+				return evidence, err
+			}
 		}
 	}
-	evidenceVolumes, err := storageIdentityContainerVolumeEvidence(cfg, containers)
+	evidenceVolumes, err := collectStorageIdentityContainerVolumeEvidence(cfg, containers, findings)
 	if err != nil {
-		return err
+		return evidence, err
 	}
 
 	reapingLeases := make(map[string]managedVolumeEvidenceAuthority)
@@ -1467,54 +1574,92 @@ func verifyStorageIdentityInitializationEvidence(
 			retention.Items,
 		)
 		if expectedErr != nil {
-			return fmt.Errorf(
-				"derive exact managed-volume identities for retention %s: %w",
-				retention.OriginalLeaseUUID,
-				expectedErr,
-			)
+			if err := findings.add(adoptionFinding{
+				class: AdoptionFindingRetentionIdentity, leaseUUID: retention.OriginalLeaseUUID,
+				err: fmt.Errorf(
+					"derive exact managed-volume identities for retention %s: %w",
+					retention.OriginalLeaseUUID,
+					expectedErr,
+				),
+			}); err != nil {
+				return evidence, err
+			}
+			continue
 		}
 		if retention.Status == shared.RetentionStatusReaping {
 			reapingLeases[retention.OriginalLeaseUUID] = expectedVolumeNames
 		}
 		if len(retention.ResourceProfiles) == 0 {
 			for _, item := range retention.Items {
-				if _, err := cfg.GetSKUProfile(item.SKU); err != nil {
-					return fmt.Errorf(
-						"retention %s cannot resolve v0.13 SKU %q; restore the matching v0.13 SKU mapping and profile before adoption: %w",
-						retention.OriginalLeaseUUID,
-						item.SKU,
-						err,
-					)
+				if _, skuErr := cfg.GetSKUProfile(item.SKU); skuErr != nil {
+					if err := findings.add(adoptionFinding{
+						class: AdoptionFindingRetentionSKU, leaseUUID: retention.OriginalLeaseUUID,
+						err: fmt.Errorf(
+							"retention %s cannot resolve v0.13 SKU %q; restore the matching v0.13 SKU mapping and profile before adoption: %w",
+							retention.OriginalLeaseUUID,
+							item.SKU,
+							skuErr,
+						),
+					}); err != nil {
+						return evidence, err
+					}
 				}
 			}
 		}
 		if len(retention.RetainedVolumeNames) > 0 && cfg.VolumeDataPath == "" {
-			return fmt.Errorf("retention %s names stateful volumes but volume_data_path is empty",
-				retention.OriginalLeaseUUID)
+			if err := findings.add(adoptionFinding{
+				class: AdoptionFindingRetentionVolume, leaseUUID: retention.OriginalLeaseUUID,
+				err: fmt.Errorf("retention %s names stateful volumes but volume_data_path is empty",
+					retention.OriginalLeaseUUID),
+			}); err != nil {
+				return evidence, err
+			}
+			continue
 		}
 		if len(retention.RetainedVolumeNames) > 0 {
-			if err := requireExistingPathUnderRoot(cfg.VolumeDataPath, cfg.VolumeDataPath); err != nil {
-				return fmt.Errorf("retention %s cannot attest configured volume root: %w",
-					retention.OriginalLeaseUUID, err)
+			if rootErr := requireExistingPathUnderRoot(cfg.VolumeDataPath, cfg.VolumeDataPath); rootErr != nil {
+				if err := findings.add(adoptionFinding{
+					class: AdoptionFindingRetentionVolume, leaseUUID: retention.OriginalLeaseUUID,
+					err: fmt.Errorf("retention %s cannot attest configured volume root: %w",
+						retention.OriginalLeaseUUID, rootErr),
+				}); err != nil {
+					return evidence, err
+				}
+				continue
 			}
 		}
 		seenRetentionVolumes := make(map[string]struct{}, len(retention.RetainedVolumeNames))
 		for _, volumeName := range retention.RetainedVolumeNames {
+			retentionVolumeFinding := func(cause error) error {
+				return findings.add(adoptionFinding{
+					class: AdoptionFindingRetentionVolume, leaseUUID: retention.OriginalLeaseUUID,
+					subject: volumeName, err: cause,
+				})
+			}
 			managedName, parseErr := parseManagedVolumeName(volumeName)
 			if parseErr != nil {
-				return fmt.Errorf("retention %s contains invalid managed volume name %q: %w",
-					retention.OriginalLeaseUUID, volumeName, parseErr)
+				if err := retentionVolumeFinding(fmt.Errorf("retention %s contains invalid managed volume name %q: %w",
+					retention.OriginalLeaseUUID, volumeName, parseErr)); err != nil {
+					return evidence, err
+				}
+				continue
 			}
 			if !expectedVolumeNames.containsRetained(managedName) {
-				return fmt.Errorf(
+				if err := retentionVolumeFinding(fmt.Errorf(
 					"retention %s volume %q is not an exact retained identity for its source lease items",
 					retention.OriginalLeaseUUID,
 					volumeName,
-				)
+				)); err != nil {
+					return evidence, err
+				}
+				continue
 			}
 			if _, duplicate := seenRetentionVolumes[volumeName]; duplicate {
-				return fmt.Errorf("retention %s contains duplicate managed volume name %q",
-					retention.OriginalLeaseUUID, volumeName)
+				if err := retentionVolumeFinding(fmt.Errorf("retention %s contains duplicate managed volume name %q",
+					retention.OriginalLeaseUUID, volumeName)); err != nil {
+					return evidence, err
+				}
+				continue
 			}
 			seenRetentionVolumes[volumeName] = struct{}{}
 			volumePath := filepath.Join(cfg.VolumeDataPath, volumeName)
@@ -1529,12 +1674,18 @@ func verifyStorageIdentityInitializationEvidence(
 					// rejected by the reverse cross-check.
 					continue
 				}
-				return fmt.Errorf("retention %s volume %q is not present under configured volume root: %w",
-					retention.OriginalLeaseUUID, volumeName, statErr)
+				if err := retentionVolumeFinding(fmt.Errorf("retention %s volume %q is not present under configured volume root: %w",
+					retention.OriginalLeaseUUID, volumeName, statErr)); err != nil {
+					return evidence, err
+				}
+				continue
 			}
-			if err := requireExistingPathUnderRoot(cfg.VolumeDataPath, volumePath); err != nil {
-				return fmt.Errorf("retention %s volume %q is not present under configured volume root: %w",
-					retention.OriginalLeaseUUID, volumeName, err)
+			if rootErr := requireExistingPathUnderRoot(cfg.VolumeDataPath, volumePath); rootErr != nil {
+				if err := retentionVolumeFinding(fmt.Errorf("retention %s volume %q is not present under configured volume root: %w",
+					retention.OriginalLeaseUUID, volumeName, rootErr)); err != nil {
+					return evidence, err
+				}
+				continue
 			}
 			evidenceVolumes[volumeName] = struct{}{}
 		}
@@ -1546,23 +1697,38 @@ func verifyStorageIdentityInitializationEvidence(
 	// while the reverse cross-check below still rejects every volume outside an
 	// exact reaping lease identity. Index by UUID and scan the managed inventory
 	// once so an operator-controlled 100k-row journal cannot force O(R*V) work.
-	for volumeName, managedName := range managedSet {
+	// Sorted, so the first refusal is the same on every run and the audit's
+	// first finding is always the preflight's error.
+	for _, volumeName := range slices.Sorted(maps.Keys(managedSet)) {
+		managedName := managedSet[volumeName]
 		leaseUUID := managedVolumeLeaseUUID(managedName)
 		expectedVolumeNames, explained := reapingLeases[leaseUUID]
 		if !explained {
 			continue
 		}
 		if !expectedVolumeNames.containsEither(managedName) {
-			return fmt.Errorf(
-				"reaping retention %s matched managed volume %q outside its exact source item identities",
-				leaseUUID,
-				volumeName,
-			)
+			if err := findings.add(adoptionFinding{
+				class: AdoptionFindingReapingVolume, leaseUUID: leaseUUID, subject: volumeName,
+				err: fmt.Errorf(
+					"reaping retention %s matched managed volume %q outside its exact source item identities",
+					leaseUUID,
+					volumeName,
+				),
+			}); err != nil {
+				return evidence, err
+			}
+			continue
 		}
 		volumePath := filepath.Join(cfg.VolumeDataPath, volumeName)
-		if err := requireExistingPathUnderRoot(cfg.VolumeDataPath, volumePath); err != nil {
-			return fmt.Errorf("reaping retention %s cannot attest managed volume %q: %w",
-				leaseUUID, volumeName, err)
+		if rootErr := requireExistingPathUnderRoot(cfg.VolumeDataPath, volumePath); rootErr != nil {
+			if err := findings.add(adoptionFinding{
+				class: AdoptionFindingReapingVolume, leaseUUID: leaseUUID, subject: volumeName,
+				err: fmt.Errorf("reaping retention %s cannot attest managed volume %q: %w",
+					leaseUUID, volumeName, rootErr),
+			}); err != nil {
+				return evidence, err
+			}
+			continue
 		}
 		evidenceVolumes[volumeName] = struct{}{}
 	}
@@ -1570,26 +1736,42 @@ func verifyStorageIdentityInitializationEvidence(
 	switch mode {
 	case StorageIdentityInitializeNew:
 		if len(containers) != 0 || len(retentions) != 0 || len(managedSet) != 0 || len(releases.ActiveLeaseUUIDs) != 0 {
-			return fmt.Errorf("new storage identity requires an empty backend (containers=%d retentions=%d managed_volumes=%d); use adopt for a verified v0.13 lineage",
-				len(containers), len(retentions), len(managedSet))
+			return evidence, findings.add(adoptionFinding{
+				class: AdoptionFindingNonEmptySubstrate,
+				err: fmt.Errorf("new storage identity requires an empty backend (containers=%d retentions=%d managed_volumes=%d); use adopt for a verified v0.13 lineage",
+					len(containers), len(retentions), len(managedSet)),
+			})
 		}
 	case StorageIdentityInitializeAdopt:
 		if len(containers) == 0 && len(retentions) == 0 && len(managedSet) == 0 {
-			return errors.New(
-				"adopt storage identity found a drained v0.13 callback outbox but no managed " +
-					"containers, retentions, or volumes; rerun with -initialize-storage-identity new " +
-					"only after independently confirming this is the expected empty v0.13 substrate " +
-					"(not lost state) and its legacy callback outbox was fully drained",
-			)
+			return evidence, findings.add(adoptionFinding{
+				class: AdoptionFindingEmptySubstrate,
+				err: errors.New(
+					"adopt storage identity found a drained v0.13 callback outbox but no managed " +
+						"containers, retentions, or volumes; rerun with -initialize-storage-identity new " +
+						"only after independently confirming this is the expected empty v0.13 substrate " +
+						"(not lost state) and its legacy callback outbox was fully drained",
+				),
+			})
 		}
-		for volumeName := range evidenceVolumes {
+		for _, volumeName := range slices.Sorted(maps.Keys(evidenceVolumes)) {
 			if _, exists := managedSet[volumeName]; !exists {
-				return fmt.Errorf("adoption evidence names managed volume %q that is absent from configured root", volumeName)
+				if err := findings.add(adoptionFinding{
+					class: AdoptionFindingMissingEvidenceVolume, subject: volumeName,
+					err: fmt.Errorf("adoption evidence names managed volume %q that is absent from configured root", volumeName),
+				}); err != nil {
+					return evidence, err
+				}
 			}
 		}
-		for volumeName := range managedSet {
+		for _, volumeName := range slices.Sorted(maps.Keys(managedSet)) {
 			if _, explained := evidenceVolumes[volumeName]; !explained {
-				return fmt.Errorf("managed volume %q has no strict live-container or retention evidence", volumeName)
+				if err := findings.add(adoptionFinding{
+					class: AdoptionFindingUnexplainedVolume, subject: volumeName,
+					err: fmt.Errorf("managed volume %q has no strict live-container or retention evidence", volumeName),
+				}); err != nil {
+					return evidence, err
+				}
 			}
 		}
 		seenLeases := make(map[string]struct{})
@@ -1599,16 +1781,26 @@ func verifyStorageIdentityInitializationEvidence(
 			}
 			seenLeases[container.LeaseUUID] = struct{}{}
 			if _, active := releases.ActiveLeaseUUIDs[container.LeaseUUID]; !active {
-				return fmt.Errorf("managed lease %s has no active v0.13 release authority", container.LeaseUUID)
+				if err := findings.add(adoptionFinding{
+					class: AdoptionFindingLeaseWithoutRelease, leaseUUID: container.LeaseUUID,
+					err: fmt.Errorf("managed lease %s has no active v0.13 release authority", container.LeaseUUID),
+				}); err != nil {
+					return evidence, err
+				}
 			}
 		}
 		for _, leaseUUID := range slices.Sorted(maps.Keys(releases.ActiveLeaseUUIDs)) {
 			if _, live := seenLeases[leaseUUID]; !live {
-				return fmt.Errorf("active v0.13 release %s has no managed container cohort", leaseUUID)
+				if err := findings.add(adoptionFinding{
+					class: AdoptionFindingReleaseWithoutCohort, leaseUUID: leaseUUID,
+					err: fmt.Errorf("active v0.13 release %s has no managed container cohort", leaseUUID),
+				}); err != nil {
+					return evidence, err
+				}
 			}
 		}
 	}
-	return nil
+	return evidence, nil
 }
 
 // legacyReleaseMatchesInterruptedDeprovisionRetention recognizes the exact
@@ -1838,47 +2030,82 @@ func storageIdentityContainerVolumeEvidence(
 	cfg Config,
 	containers []ContainerInfo,
 ) (map[string]struct{}, error) {
+	return collectStorageIdentityContainerVolumeEvidence(cfg, containers, failFastAdoptionFindings{})
+}
+
+// collectStorageIdentityContainerVolumeEvidence reports a refused container
+// and moves on to the next one, or a refused mount and moves on to the next
+// mount, when findings keeps going.
+func collectStorageIdentityContainerVolumeEvidence(
+	cfg Config,
+	containers []ContainerInfo,
+	findings adoptionFindings,
+) (map[string]struct{}, error) {
 	evidenceVolumes := make(map[string]struct{})
 	for _, container := range containers {
+		containerFinding := func(cause error) error {
+			return findings.add(adoptionFinding{
+				class: AdoptionFindingContainerVolume, leaseUUID: container.LeaseUUID,
+				subject: container.ContainerID, err: cause,
+			})
+		}
 		profile, profileErr := cfg.GetSKUProfile(container.SKU)
 		if profileErr != nil {
-			return nil, fmt.Errorf("resolve SKU for managed container %s before storage identity initialization: %w",
-				container.ContainerID, profileErr)
+			if err := containerFinding(fmt.Errorf("resolve SKU for managed container %s before storage identity initialization: %w",
+				container.ContainerID, profileErr)); err != nil {
+				return nil, err
+			}
+			continue
 		}
 		stateful := profile.DiskMB > 0
 		if stateful && cfg.VolumeDataPath == "" {
-			return nil, fmt.Errorf("managed stateful container %s exists but volume_data_path is empty",
-				container.ContainerID)
+			if err := containerFinding(fmt.Errorf("managed stateful container %s exists but volume_data_path is empty",
+				container.ContainerID)); err != nil {
+				return nil, err
+			}
+			continue
 		}
 		for _, mount := range container.Mounts {
 			if mount.Type != "bind" {
 				continue
 			}
 			if cfg.VolumeDataPath == "" {
-				return nil, fmt.Errorf("managed diskless container %s has a bind mount but volume_data_path is empty",
-					container.ContainerID)
+				if err := containerFinding(fmt.Errorf("managed diskless container %s has a bind mount but volume_data_path is empty",
+					container.ContainerID)); err != nil {
+					return nil, err
+				}
+				continue
 			}
 			source := mount.Source
-			if err := requireExistingPathUnderRoot(cfg.VolumeDataPath, source); err != nil {
-				return nil, fmt.Errorf("managed container %s mount %q is not owned by configured volume root: %w",
-					container.ContainerID, source, err)
+			if rootErr := requireExistingPathUnderRoot(cfg.VolumeDataPath, source); rootErr != nil {
+				if err := containerFinding(fmt.Errorf("managed container %s mount %q is not owned by configured volume root: %w",
+					container.ContainerID, source, rootErr)); err != nil {
+					return nil, err
+				}
+				continue
 			}
 			relative, relErr := filepath.Rel(cfg.VolumeDataPath, source)
 			if relErr != nil || relative == "." || relative == ".." ||
 				strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-				return nil, fmt.Errorf("managed container %s mount %q has no managed volume root",
-					container.ContainerID, source)
+				if err := containerFinding(fmt.Errorf("managed container %s mount %q has no managed volume root",
+					container.ContainerID, source)); err != nil {
+					return nil, err
+				}
+				continue
 			}
 			volumeName := strings.Split(relative, string(filepath.Separator))[0]
 			managedName, parseErr := parseManagedVolumeName(volumeName)
 			if parseErr != nil {
-				return nil, fmt.Errorf(
+				if err := containerFinding(fmt.Errorf(
 					"managed container %s mount %q has invalid managed volume identity %q: %w",
 					container.ContainerID,
 					source,
 					volumeName,
 					parseErr,
-				)
+				)); err != nil {
+					return nil, err
+				}
+				continue
 			}
 			expectedName := canonicalVolumeName(
 				container.LeaseUUID,
@@ -1887,35 +2114,44 @@ func storageIdentityContainerVolumeEvidence(
 			)
 			expectedManagedName, expectedErr := parseManagedVolumeName(expectedName)
 			if expectedErr != nil {
-				return nil, fmt.Errorf(
+				if err := containerFinding(fmt.Errorf(
 					"managed container %s labels do not derive a valid managed volume identity %q: %w",
 					container.ContainerID,
 					expectedName,
 					expectedErr,
-				)
+				)); err != nil {
+					return nil, err
+				}
+				continue
 			}
 			if managedName != expectedManagedName {
-				return nil, fmt.Errorf(
+				if err := containerFinding(fmt.Errorf(
 					"managed container %s mount %q identifies volume %q, expected exact live identity %q from its lease, service, and instance labels",
 					container.ContainerID,
 					source,
 					managedName.value(),
 					expectedManagedName.value(),
-				)
+				)); err != nil {
+					return nil, err
+				}
+				continue
 			}
-			if err := requireManagedVolumeMountSource(
+			if mountErr := requireManagedVolumeMountSource(
 				cfg.VolumeDataPath,
 				source,
 				managedName,
 				mount.Target,
-			); err != nil {
-				return nil, fmt.Errorf(
+			); mountErr != nil {
+				if err := containerFinding(fmt.Errorf(
 					"managed container %s mount %q does not prove volume %q: %w",
 					container.ContainerID,
 					source,
 					managedName.value(),
-					err,
-				)
+					mountErr,
+				)); err != nil {
+					return nil, err
+				}
+				continue
 			}
 			evidenceVolumes[managedName.value()] = struct{}{}
 		}

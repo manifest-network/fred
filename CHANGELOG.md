@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `docker-backend -audit-storage-identity-adoption` reports every v0.13 shape
+  that blocks storage-identity adoption in one read-only pass, as JSON, where
+  the preflight stops at the first. Each finding carries its class, an
+  advisory remedy, and the lease or volume it is about; the output also lists
+  the v0.13 items adoption would freeze per active release and the pending
+  callback count. The first finding is exactly the preflight's error, which is
+  now the same on every run when several volumes are refused. Exit 0 clean, 3
+  findings, 1 failed.
 - `maintenance_legacy_idempotency_tenants` lets listed tenants omit
   `Idempotency-Key` on restart and update, for integrators written before the
   header. Fred authenticates first, consuming the single-use signed token, and
