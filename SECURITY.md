@@ -648,7 +648,10 @@ For runbook-style guidance on responding to active incidents — replay attempts
 ### Containing a compromised backend
 
 When a backend can no longer be trusted, set `fenced: true` on it in
-providerd's config and restart providerd. Keep the backend in the config: a
+providerd's config and restart providerd. Stop providerd right after a
+`reconciliation complete` log line: a stop that interrupts a sweep in which the
+backend reported leases leaves it recorded as an unprojected reporter (below),
+which holds new-lease admission until the fence ends. Keep the backend in the config: a
 fence contains it without removing it, so its leases and placements stay
 accounted for. The fence lasts until it is removed and providerd restarts
 again.
@@ -675,7 +678,10 @@ What the fence does:
 - Interrupted-sweep recovery does not wait for it. If the backend reported a
   positive in a sweep that never projected, recovery clears without it and
   the placement database records it as an unprojected reporter until it
-  answers both inventories again
+  answers both inventories again. While it is recorded, no lease without a
+  placement row is admitted, since the fenced backend may already hold one:
+  new leases wait, leases with a row keep working, and `/readyz` reports
+  `placement inventory waits on a fenced backend`
   (`fred_placement_unprojected_fenced_reporter{backend}`, and
   `unprojected_fenced_reporters` in `placement-repair -classify`). Retiring
   it while it is recorded marks the retirement `recordless_unproven`.

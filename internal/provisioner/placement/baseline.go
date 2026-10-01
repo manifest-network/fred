@@ -1141,6 +1141,12 @@ func (s *Store) hasCurrentAdmissionBaselineLocked() bool {
 	if s.runtimeAuthorityFailure() != nil || s.inventoryRecoveryRequired {
 		return false
 	}
+	// The baseline proves every placed lease has a placement row. A recorded
+	// fenced reporter may hold a lease whose row Fred never wrote, so that
+	// proof is suspended until the backend answers again or is retired.
+	if len(s.unprojectedFencedReporters) != 0 {
+		return false
+	}
 	if s.topologyID == 0 || s.baselineTopologyID != s.topologyID ||
 		s.baselineFingerprint == "" || s.baselineFingerprint != s.topologyFingerprint {
 		return false

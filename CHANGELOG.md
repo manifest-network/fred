@@ -32,8 +32,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `target_probe: fenced`. An interrupted inventory sweep no longer waits for a
   fenced reporter. Recovery clears without it and the placement database
   records the backend as an unprojected reporter until it answers both
-  inventories again. Retiring it then records `recordless_unproven`, and the
-  record also refuses removing it from the topology. The record shows as
+  inventories again. While it is recorded, no lease without a placement row is
+  admitted, because the fenced backend may already hold it; leases with a row
+  are unaffected, and `/readyz` reports `placement inventory waits on a fenced
+  backend`. Retiring it records `recordless_unproven`, and the record also
+  refuses removing it from the topology. The record shows as
   `fred_placement_unprojected_fenced_reporter{backend}` and as
   `unprojected_fenced_reporters` in `placement-repair -classify`. Older
   binaries refuse a database that holds this record. See SECURITY.md,

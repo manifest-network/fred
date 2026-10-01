@@ -910,6 +910,11 @@ func TestReadyz_WaitsForFirstAuthoritativePlacementInventory(t *testing.T) {
 			wantDetail: "placement inventory not ready",
 		},
 		{
+			name: "fenced reporter unaccounted", readiness: placement.InventoryFencedReporterUnaccounted,
+			wantStatus: http.StatusServiceUnavailable, wantCheck: "unhealthy",
+			wantDetail: "placement inventory waits on a fenced backend",
+		},
+		{
 			name: "unknown readiness fails closed", readiness: placement.InventoryReadiness(0),
 			wantStatus: http.StatusServiceUnavailable, wantCheck: "unhealthy",
 			wantDetail: "placement inventory not ready",

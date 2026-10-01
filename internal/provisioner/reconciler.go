@@ -1390,12 +1390,18 @@ func (r *Reconciler) fetchFleetSnapshot(
 		complete:           true,
 	}
 
+	// Fenced backends are recorded before any worker starts, so this
+	// goroutine never writes the snapshot concurrently with them.
+	live := make([]string, 0, len(backendNames))
 	for _, backendName := range backendNames {
 		if _, isFenced := fenced[backendName]; isFenced {
 			snap.markUnanswered(backendName)
 			metrics.ReconcilerBackendFetchTotal.WithLabelValues(backendName, metrics.FetchOutcomeFenced).Inc()
 			continue
 		}
+		live = append(live, backendName)
+	}
+	for _, backendName := range live {
 		g.Go(func() error {
 			inventory, err := sweep.CollectProvisionInventory(gctx, backendName)
 			if err != nil {
@@ -1734,11 +1740,16 @@ func (r *Reconciler) fetchAllRetentions(
 	if len(backendNames) > 0 {
 		g.SetLimit(len(backendNames))
 	}
+	// As in fetchFleetSnapshot: fenced results are written before any worker.
+	live := make([]string, 0, len(backendNames))
 	for _, backendName := range backendNames {
 		if _, isFenced := fenced[backendName]; isFenced {
 			answered[backendName] = false
 			continue
 		}
+		live = append(live, backendName)
+	}
+	for _, backendName := range live {
 		g.Go(func() error {
 			inventory, err := sweep.CollectRetentionInventory(gctx, backendName)
 			if err != nil {

@@ -25,12 +25,16 @@ func (resolver fencedFleetResolver) ExpectedBackendStorageIdentity(name string) 
 	return id, ok
 }
 
-// restartFenced restarts Fred with the named backends fenced, as an operator
-// would after setting backends[].fenced: their clients carry no connection and
-// the placement store is told which backends are fenced.
+// restartFenced restarts Fred with exactly the named backends fenced, as an
+// operator would after editing backends[].fenced: their clients carry no
+// connection and the placement store is told which backends are fenced. With
+// no names it lifts every fence.
 func (f *fleet) restartFenced(fenced ...string) {
 	f.t.Helper()
-	entries := slices.Clone(f.routerEntries)
+	if f.liveRouterEntries == nil {
+		f.liveRouterEntries = slices.Clone(f.routerEntries)
+	}
+	entries := slices.Clone(f.liveRouterEntries)
 	for index, entry := range entries {
 		name := entry.Backend.Name()
 		if !slices.Contains(fenced, name) {
@@ -191,8 +195,8 @@ func TestFleet_QueuedCloseParksOnceOnlyTheFenceRemains(t *testing.T) {
 	require.NoError(t, scheduler.enqueue(result.Deferred()))
 
 	require.NoError(t, f.sweep())
-	require.Equal(t, placement.InventoryReady, f.placement.InventoryReadiness(),
-		"recovery clears without the fenced reporter")
+	require.Equal(t, placement.InventoryFencedReporterUnaccounted, f.placement.InventoryReadiness(),
+		"recovery clears without the fenced reporter, which stays unaccounted")
 	require.Eventually(t, func() bool {
 		scheduler.mu.Lock()
 		defer scheduler.mu.Unlock()
@@ -238,4 +242,66 @@ func TestFleet_AttemptOnAFencedBackendWaitsQuietly(t *testing.T) {
 	p := f.placement.Lookup(fleetLeaseUUID("lease-attempt"))
 	assert.Equal(t, placement.StateAttempting, p.State())
 	assert.Equal(t, f.backendAt(2).name, p.Attempt, "the write-ahead attempt is preserved")
+}
+
+// interruptSweepAfterProvisions cancels a sweep once the fast backends have
+// answered their provision inventories, leaving the marker pending with those
+// reporters journaled.
+func (f *fleet) interruptSweepAfterProvisions(hang *fakeBackendServer) {
+	f.t.Helper()
+	hang.setFault(faultHang)
+	ctx, cancel := context.WithCancel(f.t.Context())
+	defer cancel()
+	stop := time.AfterFunc(200*time.Millisecond, cancel)
+	defer stop.Stop()
+	require.ErrorIs(f.t, f.reconciler.ReconcileAll(ctx), context.Canceled)
+	hang.setFault(faultNone)
+}
+
+// Codex review of #245: a fenced reporter's lost positive may be a lease with
+// no placement row. Clearing recovery must not let Fred admit that lease on a
+// healthy peer while the original workload still runs on the fenced backend.
+func TestFleet_FencedReporterLostPositiveIsNotAdmittedElsewhere(t *testing.T) {
+	f := newFleet(t, fleetOptions{})
+	require.NoError(t, f.sweep(), "establish the admission baseline")
+	f.addLease("lease-lost-positive", billingtypes.LEASE_STATE_PENDING)
+	fencedServer := f.backendAt(2)
+	fencedServer.seedProvision(t, "lease-lost-positive", f.providerUUID, backend.ProvisionStatusReady)
+
+	f.interruptSweepAfterProvisions(f.backendAt(3))
+	f.restartFenced(fencedServer.name)
+	require.Equal(t, placement.InventoryRecoveryPending, f.placement.InventoryReadiness())
+
+	require.NoError(t, f.sweepN(2))
+
+	assert.Equal(t, placement.InventoryFencedReporterUnaccounted, f.placement.InventoryReadiness())
+	for _, server := range []*fakeBackendServer{f.backendAt(1), f.backendAt(3)} {
+		assert.Zero(t, server.provisionCount("lease-lost-positive"),
+			"the lease may already run on the fenced backend; it is not admitted on %s", server.name)
+	}
+	_, rejected, _ := f.chainCalls()
+	assert.NotContains(t, rejected, fleetLeaseUUID("lease-lost-positive"))
+
+	// The fence lifts: the backend answers, its positive is projected, and
+	// admission resumes without a second copy.
+	f.restartFenced()
+	require.NoError(t, f.sweepN(2))
+	assert.Equal(t, placement.InventoryReady, f.placement.InventoryReadiness())
+	f.assertPlacementPinned("lease-lost-positive", fencedServer.name)
+	for _, server := range []*fakeBackendServer{f.backendAt(1), f.backendAt(3)} {
+		assert.Zero(t, server.provisionCount("lease-lost-positive"), server.name)
+	}
+}
+
+// Under -race this pins that the fenced branches never write the shared
+// inventory maps while workers run. The fenced backend sorts last, so no
+// later worker launch orders its write before the earlier workers' writes.
+func TestFleet_FencedInventoryBranchDoesNotRaceItsWorkers(t *testing.T) {
+	f := newFleet(t, fleetOptions{})
+	f.addLease("lease-race", billingtypes.LEASE_STATE_ACTIVE)
+	f.backendAt(1).seedProvision(t, "lease-race", f.providerUUID, backend.ProvisionStatusReady)
+	require.NoError(t, f.sweep())
+	f.restartFenced(f.backendAt(3).name)
+	require.NoError(t, f.sweepN(3))
+	f.assertPlacementPinned("lease-race", f.backendAt(1).name)
 }

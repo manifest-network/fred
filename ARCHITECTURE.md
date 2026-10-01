@@ -1790,7 +1790,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 |---|---|---|---|
 | `fred_backend_requests_total` | counter | `backend, operation, status` | Backend request count; `status` is `success`, `error`, or `fenced` (refused locally, nothing sent) |
 | `fred_backend_fenced` | gauge | `backend` | 1 while the operator has fenced the backend (`backends[].fenced`), 0 otherwise. Set once when its client is built. Gate the backend's availability alerts on it |
-| `fred_placement_unprojected_fenced_reporter` | gauge | `backend` | 1 while the placement database records the backend as a fenced reporter whose positives an interrupted sweep never projected, 0 otherwise. Published at open and after every projection; clears when the backend answers both inventories again or is retired |
+| `fred_placement_unprojected_fenced_reporter` | gauge | `backend` | 1 while the placement database records the backend as a fenced reporter whose positives an interrupted sweep never projected, 0 otherwise. While any backend is 1, no lease without a placement row is admitted and `/readyz` reports `placement inventory waits on a fenced backend`. Published at open and after every projection; clears when the backend answers both inventories again or is retired |
 | `fred_backend_request_duration_seconds` | histogram | `backend, operation, status` | Backend request latency |
 | `fred_backend_circuit_breaker_state` | gauge | `backend` | Circuit breaker state (0=closed, 1=half-open, 2=open) |
 | `fred_backend_healthy` | gauge | `backend` | Backend health (1=healthy, 0=unhealthy). Written **only** from inside the `/health` and `/readyz` handlers, so it is exactly as fresh as whatever polls them; with no prober it latches at its last value rather than going absent |
@@ -2118,7 +2118,10 @@ that can only classify a refusal; `hmacauth.MatchCallbackKeys` checks a
 signature without issuing a proof. The placement store receives the fenced set
 once, at construction, and excuses a fenced reporter from interrupted-sweep
 recovery, recording it durably as an unprojected reporter so retirement and
-topology removal still see what it might hold.
+topology removal still see what it might hold. While any reporter is recorded
+the admission baseline is not current: it claims every placed lease has a
+placement row, which the fenced backend could contradict, so no lease without
+a row is admitted until the backend answers again or is retired.
 
 Callback admission is separate from tenant and observability traffic. Its
 ingress IP bucket and authenticated storage-identity bucket each use fixed

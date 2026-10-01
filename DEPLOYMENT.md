@@ -1031,8 +1031,8 @@ sweep, and the retirement then sets `recordless_unproven`. To avoid that, start
 and plan again. If it stays true, the marker is waiting on an answer that
 cannot arrive, typically from the lost backend, and the retirement must set the
 flag. Fencing the lost backend lets the marker clear without that answer; the
-database then records the backend as an unprojected reporter, and its
-retirement still sets the flag.
+database then records the backend as an unprojected reporter, new leases wait
+until it is retired, and its retirement still sets the flag.
 
 `recordless_unproven` is true when the database had no current admission
 baseline: a sweep was interrupted, or the retirement follows another retirement

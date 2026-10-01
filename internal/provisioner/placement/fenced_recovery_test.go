@@ -46,9 +46,11 @@ func TestFencedReporterDoesNotHoldInheritedRecovery(t *testing.T) {
 
 	fixture.sweep(t, reporterRecoveryBackend)
 
-	assert.Equal(t, InventoryReady, fixture.reopened.InventoryReadiness(),
+	assert.NoError(t, fixture.reopened.leaseSideEffectError(reporterRecoveryLease),
 		"the operator distrusts the fenced reporter; waiting for it would freeze every lease")
-	assert.NoError(t, fixture.reopened.leaseSideEffectError(reporterRecoveryLease))
+	assert.Equal(t, InventoryFencedReporterUnaccounted, fixture.reopened.InventoryReadiness())
+	assert.False(t, fixture.reopened.CurrentAdmissionBaseline().Valid(),
+		"the fenced reporter may hold a lease with no row, so nothing without a row is admitted")
 	metadata := persistedTopologyMetadata(t, fixture.reopened)
 	assert.Zero(t, metadata.PendingInventorySweepID)
 	assert.Equal(t, []string{reporterSilentBackend}, metadata.UnprojectedFencedReporters,
@@ -62,7 +64,7 @@ func TestUnprojectedFencedReporterClearsOnlyWhenItAnswersBothInventories(t *test
 
 	// The operator lifts the fence. The record survives the restart.
 	fixture.reopen(t)
-	require.Equal(t, InventoryReady, fixture.reopened.InventoryReadiness())
+	require.Equal(t, InventoryFencedReporterUnaccounted, fixture.reopened.InventoryReadiness())
 	fixture.sweep(t, reporterRecoveryBackend)
 	assert.Equal(t, []string{reporterSilentBackend},
 		persistedTopologyMetadata(t, fixture.reopened).UnprojectedFencedReporters,
@@ -72,6 +74,8 @@ func TestUnprojectedFencedReporterClearsOnlyWhenItAnswersBothInventories(t *test
 	assert.Nil(t, persistedTopologyMetadata(t, fixture.reopened).UnprojectedFencedReporters,
 		"a paired, pinned answer accounts for whatever the backend holds")
 	assert.Empty(t, fixture.reopened.unprojectedFencedReporters)
+	assert.Equal(t, InventoryReady, fixture.reopened.InventoryReadiness())
+	assert.True(t, fixture.reopened.CurrentAdmissionBaseline().Valid(), "admission resumes")
 }
 
 func TestFencedNonReporterRecordsNothing(t *testing.T) {
@@ -106,8 +110,8 @@ func TestUntrackedMarkerExcusesExactlyTheFencedBackends(t *testing.T) {
 	fixture.reopenFenced(t, reporterSilentBackend)
 
 	fixture.sweep(t, reporterRecoveryBackend)
-	assert.Equal(t, InventoryReady, fixture.reopened.InventoryReadiness(),
-		"every unfenced backend answered")
+	assert.Equal(t, InventoryFencedReporterUnaccounted, fixture.reopened.InventoryReadiness(),
+		"every unfenced backend answered; the fenced one stays unaccounted")
 	assert.Equal(t, []string{reporterSilentBackend},
 		persistedTopologyMetadata(t, fixture.reopened).UnprojectedFencedReporters,
 		"an untracked chain cannot name its reporters, so every fenced backend is recorded")

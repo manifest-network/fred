@@ -2271,6 +2271,11 @@ const (
 	// InventoryAuthorityWithdrawn means the placement store's durable runtime
 	// authority failed.
 	InventoryAuthorityWithdrawn
+	// InventoryFencedReporterUnaccounted means a fenced backend may hold a
+	// lease with no placement row, so no lease without a row is admitted until
+	// it answers both endpoints again or is retired. Leases with a row are
+	// unaffected.
+	InventoryFencedReporterUnaccounted
 )
 
 // InventoryReadiness reports why fresh lease side effects are or are not
@@ -2287,6 +2292,8 @@ func (s *Store) InventoryReadiness() InventoryReadiness {
 		return InventoryAuthorityWithdrawn
 	case s.inventoryRecoveryRequired:
 		return InventoryRecoveryPending
+	case len(s.unprojectedFencedReporters) != 0:
+		return InventoryFencedReporterUnaccounted
 	case !s.hasCurrentAdmissionBaselineLocked():
 		return InventoryAwaitingBaseline
 	default:

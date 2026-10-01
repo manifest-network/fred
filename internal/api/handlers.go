@@ -80,6 +80,8 @@ func placementInventoryReadinessError(readiness placement.InventoryReadiness) er
 		return errors.New("authoritative placement inventory has not completed")
 	case placement.InventoryAuthorityWithdrawn:
 		return errors.New("placement store authority was withdrawn")
+	case placement.InventoryFencedReporterUnaccounted:
+		return errors.New("a fenced backend may hold a lease with no placement row")
 	default:
 		return fmt.Errorf("unknown placement inventory readiness %d", readiness)
 	}
@@ -1722,8 +1724,11 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 			return placementInventoryReadinessError(readiness)
 		})
 		clientMsg := "placement inventory not ready"
-		if readiness == placement.InventoryRecoveryPending {
+		switch readiness {
+		case placement.InventoryRecoveryPending:
 			clientMsg = "placement inventory recovery pending"
+		case placement.InventoryFencedReporterUnaccounted:
+			clientMsg = "placement inventory waits on a fenced backend"
 		}
 		record(healthCheckInventory, true,
 			"health check: placement inventory not bootstrapped",
