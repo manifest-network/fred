@@ -878,6 +878,11 @@ type Placement struct {
 	// reporters from a legacy conflict whose owner set is unknown. It remains
 	// private so callers cannot manufacture a resolvable quarantine.
 	untrustedPositive bool
+	// lostBackend names the retired backend whose lost storage held this
+	// lease. A lost placement is also unusable, so every caller that does not
+	// ask fails closed; only the explicit retirement paths close, prune, or
+	// report it.
+	lostBackend string
 
 	unusable bool
 	revision uint64
@@ -906,6 +911,14 @@ func clonePlacements(input map[string]Placement) map[string]Placement {
 		output[leaseUUID] = clonePlacement(placement)
 	}
 	return output
+}
+
+// LostBackend reports the retired backend whose attested-lost storage held
+// this lease. A lost placement is terminal: StateUnusable, never
+// re-provisioned, closed or rejected on chain, and pruned after an exact
+// terminal chain read.
+func (p Placement) LostBackend() (string, bool) {
+	return p.lostBackend, p.lostBackend != ""
 }
 
 // State returns the placement's derived state. The zero Placement is Absent.
@@ -1016,6 +1029,10 @@ type record struct {
 	ConflictBackends       []string            `json:"conflict_backends,omitempty"`
 	ConflictOwnersUnknown  bool                `json:"conflict_owners_unknown,omitempty"`
 	UntrustedPositive      bool                `json:"untrusted_positive,omitempty"`
+	// LostBackend is set only by an attested backend retirement: the lease's
+	// data lived on that backend's irrecoverably lost storage. Such a record
+	// carries no other placement evidence.
+	LostBackend string `json:"lost_backend,omitempty"`
 }
 
 // Store is a bbolt-backed placement store with an in-memory read cache. All
@@ -1075,6 +1092,9 @@ type Store struct {
 	// positives the pending sweep chain may not have projected. It narrows
 	// what an inherited marker must re-observe to exactly those reporters.
 	inventoryReporters sweepReporterJournal
+	// retiredBackends are the operator-attested retirements carried by every
+	// metadata write.
+	retiredBackends map[string]retiredBackend
 	// unprojectedPositives is the lease-local same-process half of the durable
 	// sweep marker. Sweep-owned collection installs typed reporter affinity here
 	// before an opaque endpoint receipt returns, so policy code cannot race the
@@ -1374,6 +1394,7 @@ func loadStoreWithExpectedAuthority(
 		pendingInventorySweepID:   metadata.PendingInventorySweepID,
 		inventoryRecoveryRequired: metadata.PendingInventorySweepID != 0,
 		inventoryReporters:        sweepReporterJournalFromMetadata(metadata),
+		retiredBackends:           cloneRetiredBackends(metadata.RetiredBackends),
 		emptyInventoryBackends: func() map[string]struct{} {
 			set := make(map[string]struct{}, len(metadata.EmptyInventoryBackends))
 			for _, backendName := range metadata.EmptyInventoryBackends {
@@ -1433,7 +1454,7 @@ func migrateLegacyConfirmedRevisions(tx *bolt.Tx) error {
 		// previously confirmed owner unusable. Object rows continue through the
 		// current structural decoder so their historical SetAt value is retained.
 		p := decodeRecord(leaseUUID, v)
-		if p.unusable {
+		if _, lost := p.LostBackend(); p.unusable && !lost {
 			legacy, legacyErr := decodeV013PlacementForMigration(v)
 			if legacyErr == nil {
 				p = legacy
@@ -1478,6 +1499,9 @@ func decodeRecord(leaseUUID string, v []byte) Placement {
 	r, fields, err := decodeCurrentPlacementRecord(v)
 	if err != nil {
 		return unusableRecord(leaseUUID, err)
+	}
+	if r.LostBackend != "" {
+		return decodeLostRecord(leaseUUID, r)
 	}
 
 	operationID, operationErr := decodeOperationID(r.OperationID)
@@ -1723,6 +1747,31 @@ func decodeV013PlacementForMigration(value []byte) (Placement, error) {
 	return placement, nil
 }
 
+// decodeLostRecord accepts a lost placement only in the exact shape the
+// retirement writes: the retired name, its time and revision, and no live
+// placement evidence. It keeps the revision so the row stays prunable and
+// conditionally writable.
+func decodeLostRecord(leaseUUID string, r record) Placement {
+	lost, ok := lostPlacementFromRecord(r)
+	if !ok {
+		return unusableRecord(leaseUUID, errors.New("lost placement carries live placement evidence"))
+	}
+	return lost
+}
+
+// lostPlacementFromRecord accepts only the exact LOST shape: the retired name,
+// a revision and a time, and no live placement evidence of any kind.
+func lostPlacementFromRecord(r record) (Placement, bool) {
+	if r.LostBackend == "" || r.Backend != "" || r.Attempt != "" || r.OperationID != "" ||
+		r.OperationKind != "" || r.RestoreSourceLeaseUUID != "" || r.PayloadHash != "" ||
+		r.Tenant != "" || r.ProviderUUID != "" || r.RequestItems != nil || r.CallbackURL != "" ||
+		r.LifecycleCallbackURL != "" || r.Conflict || r.ConflictBackends != nil ||
+		r.ConflictOwnersUnknown || r.UntrustedPositive || r.Revision == 0 || r.SetAt.IsZero() {
+		return Placement{}, false
+	}
+	return Placement{SetAt: r.SetAt, revision: r.Revision, lostBackend: r.LostBackend, unusable: true}, true
+}
+
 func unusableRecord(leaseUUID string, err error) Placement {
 	slog.Warn("placement: loaded unparseable record",
 		"lease_uuid", leaseUUID, "error", err)
@@ -1757,6 +1806,7 @@ func encodePlacement(p Placement) ([]byte, error) {
 		ConflictBackends:       normalizeBackendNames(p.ConflictBackends),
 		ConflictOwnersUnknown:  p.ConflictOwnersUnknown,
 		UntrustedPositive:      p.untrustedPositive,
+		LostBackend:            p.lostBackend,
 	})
 }
 
@@ -1798,6 +1848,7 @@ func equalPlacementIgnoringRevision(a, b Placement) bool {
 		a.attemptPayloadFingerprint == b.attemptPayloadFingerprint &&
 		a.attemptRequestSnapshot == b.attemptRequestSnapshot &&
 		a.attemptCallbackPair == b.attemptCallbackPair &&
+		a.lostBackend == b.lostBackend &&
 		a.unusable == b.unusable
 }
 
@@ -3107,6 +3158,16 @@ func (s *Store) projectInventory(
 	mutations := make(map[string]projectionMutation, len(keys))
 	lifecycleMutations := make(map[string]projectionLifecycleMutation, len(keys))
 	for _, leaseUUID := range keys {
+		if existing, exists := s.cache[leaseUUID]; exists {
+			if _, lost := existing.LostBackend(); lost {
+				// A lost placement is terminal and absorbs every observation.
+				// Nothing may rewrite it, fence it, or hold recovery on it: the
+				// retirement attested the owner's storage is gone, and a copy a
+				// survivor still reports becomes an ordinary orphan once the lease
+				// is closed.
+				continue
+			}
+		}
 		reaffirmed, reaffirmationValid := reaffirmations[leaseUUID].placementLocked(s)
 		if _, excluded := projection.causalExclusions[leaseUUID]; excluded &&
 			projection.Placements[leaseUUID] != "" && !reaffirmationValid {
@@ -3442,13 +3503,17 @@ func (s *Store) excludedPositiveDurablyRepresentedLocked(
 	snapshot inventory.Snapshot,
 	leaseUUID string,
 ) bool {
+	record, exists := s.cache[leaseUUID]
+	if _, lost := record.LostBackend(); exists && lost {
+		// The durable lost fact represents every observation of the lease.
+		return true
+	}
 	observations := s.unprojectedPositives[leaseUUID][sweepID]
 	if len(observations) == 0 ||
 		!snapshot.ValidFor(s.inventoryEvidence) ||
 		!snapshot.LeasePresent(s.inventoryEvidence, leaseUUID) {
 		return false
 	}
-	record, exists := s.cache[leaseUUID]
 	if s.pairedOverlapPreservesOwnerLocked(snapshot, leaseUUID) {
 		return true
 	}
@@ -3680,6 +3745,27 @@ func (s *Store) mintPruneAbsenceProofsLocked(
 
 	proofs := make(map[string]PruneAbsenceProof)
 	for leaseUUID, record := range s.cache {
+		if _, lost := record.LostBackend(); lost {
+			// The retirement is the lost placement's absence evidence; no
+			// survivor answer can add to it. Consumption still needs an exact
+			// terminal chain read.
+			if record.revision == 0 || s.mutationRevisionLocked(leaseUUID) > fence.revision {
+				continue
+			}
+			if _, pending := pendingMaintenance[leaseUUID]; pending {
+				continue
+			}
+			if s.restoreSourceClaimedLocked(leaseUUID) || s.attemptClaimedLocked(leaseUUID) {
+				continue
+			}
+			proofs[leaseUUID] = PruneAbsenceProof{
+				store: s, coordinator: s.operationCoordinator,
+				fence: fence, projection: s.currentInventoryProjection,
+				record:   s.newRecordRevision(leaseUUID, record.revision),
+				evidence: projection.AbsenceEvidence,
+			}
+			continue
+		}
 		_, projected := projection.Placements[leaseUUID]
 		_, conflicted := projection.Conflicts[leaseUUID]
 		_, untrusted := projection.UntrustedPositives[leaseUUID]
@@ -4148,8 +4234,25 @@ func verifyAuthorityBuckets(tx *bolt.Tx) error {
 	}); err != nil {
 		return err
 	}
-	if _, err := loadTopologyMetadata(tx); err != nil {
+	metadata, err := loadTopologyMetadata(tx)
+	if err != nil {
 		return fmt.Errorf("placement topology metadata: %w", err)
+	}
+	if err := placements.ForEach(func(key, value []byte) error {
+		current, _, err := decodeCurrentPlacementRecord(value)
+		if err != nil {
+			return fmt.Errorf("placement record %q is not current schema: %w", key, err)
+		}
+		if current.LostBackend == "" {
+			return nil
+		}
+		if _, retired := metadata.RetiredBackends[current.LostBackend]; !retired {
+			return fmt.Errorf("placement record %q is lost to backend %q, which was never retired",
+				key, current.LostBackend)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if err := verifyMaintenanceCommandJournal(tx); err != nil {
 		return err

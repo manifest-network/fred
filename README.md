@@ -738,11 +738,26 @@ The set defined today:
 | `RestoreFailed` | A tenant-initiated restore (redeploy from retained data) failed |
 | `VolumeCleanupExhausted` | Volume cleanup on deprovision failed after exhausting all retry attempts |
 | `CleanupFailed` | Cleanup on deprovision failed (containers or volumes) |
+| `BackendStorageLost` | An operator retired the lease's backend because its storage was irrecoverably lost; the lease is closed (or, if pending, rejected) on chain |
 | `Unknown` | Read-boundary default: the lease is `failed` but no specific reason was recorded |
 
 `message` is a short, human-readable string for display; it contains no host filesystem paths or
 raw command/daemon output (that detail is retained operator-side, correlated by `lease_uuid`, for
 support/debugging).
+
+A lease whose backend an operator retired as lost (see DEPLOYMENT.md, "Retiring
+a backend whose storage is lost") is answered from its placement record and no
+backend is asked. Its status reports `provision_status: failed` with
+`reason: BackendStorageLost`. Provision, connection, logs, releases, restart,
+and update, and a restore that names it as the source, answer:
+
+```json
+{"error":"the backend storage holding this lease was irrecoverably lost","code":410,"reason":"backend_storage_lost"}
+```
+
+The data on the lost storage cannot be recovered; do not retry. These answers
+hold until the lease has ended on chain and a later sweep prunes its placement
+row; from then on it is answered like any other ended lease.
 
 ### Get Container Logs
 
@@ -909,6 +924,8 @@ Once established, an unrelated backend outage does not revoke it.
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - The key conflicts with a prior command, another command is
   pending, or the lease is in a state that cannot be restarted
+- `410 Gone` with `reason: backend_storage_lost` - The lease's backend was
+  retired because its storage was lost; the lease is being ended on chain
 - `429 Too Many Requests` with `reason: maintenance_capacity_reserved` - Shared
   capacity is reserved for a tenant without pending work; this new command was
   not recorded. Retry after your pending work completes (`Retry-After: 1`)
@@ -975,6 +992,8 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - The key conflicts with a prior command, another command is
   pending, or the lease is in a state that cannot be updated
+- `410 Gone` with `reason: backend_storage_lost` - The lease's backend was
+  retired because its storage was lost; the lease is being ended on chain
 - `429 Too Many Requests` with `reason: maintenance_capacity_reserved` - Shared
   capacity is reserved for a tenant without pending work; this new command was
   not recorded. Retry after your pending work completes (`Retry-After: 1`)
@@ -1071,6 +1090,7 @@ off to a complete durable close intent before teardown.
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - The source has no placement record, is not `CLOSED` or `EXPIRED`, belongs to another tenant/provider, or its configured backend reports no retained data (including retention that has expired)
 - `409 Conflict` - Source or target lifecycle work is already in progress, or the target is not `PENDING`, has an unresolved durable provision/restore attempt, or is not in a restorable state
+- `410 Gone` with `reason: backend_storage_lost` - The source's backend was retired because its storage was lost; its data cannot be restored
 - `422 Unprocessable Entity` - The retained data exceeds a requested smaller tier's `disk_mb` cap; the response relays the backend's bounded, recognized refusal detail
 - `500 Internal Server Error` - The restore returned an unexpected or ambiguous backend result, such as a transport error, timeout, generic 5xx, coded already-provisioned response, or unknown refusal code; the durable target attempt is retained until positive evidence confirms it or an operator safely repairs it
 - `502 Bad Gateway` - The backend rejected the restore with an unusable or off-contract error response
@@ -2006,6 +2026,8 @@ Chain state       Backend inventory       Durable placement/attempts
 | CLOSED/REJECTED/EXPIRED | Provisioned | Orphan candidate: bounded exact chain re-read, then deprovision only if still terminal |
 | Not found in the PENDING/ACTIVE sweep | Provisioned | Orphan candidate: exact chain re-read; absence, query failure, `UNSPECIFIED`, or a future state defers cleanup |
 | UNSPECIFIED or unknown future state | Any | **Defer — no action; never infer terminality** |
+| ACTIVE / PENDING | Placement lost with a retired backend | Close / reject on chain (`backend storage lost`); never provision |
+| ACTIVE | No placement row, and a retirement could not prove every live lease had one | Close on chain as lost; never provision |
 | PENDING/ACTIVE | Placement conflict/unusable, or unresolved attempt | **Defer — no action this sweep** |
 | PENDING/ACTIVE | Positive membership from a rejected inventory endpoint (`untrusted_positive`) | **Durably quarantine — do not treat the rejected payload as ownership or its removal as absence** |
 | PENDING/ACTIVE | Positive report disagrees with confirmed placement | **Defer — no action this sweep** |
@@ -2013,7 +2035,10 @@ Chain state       Backend inventory       Durable placement/attempts
 | PENDING/ACTIVE | Owning backend did not answer | **Defer — no action this sweep** |
 
 For live (`PENDING`/`ACTIVE`) chain leases, the placement-safety rows take
-precedence over every normal state row. A positive backend report is not
+precedence over every normal state row. A placement lost with a retired
+backend (see DEPLOYMENT.md, "Retiring a backend whose storage is lost") is
+terminal, needs no backend's answer, and is decided ahead of them all; the
+sweep-wide safety gates can still defer the close to a later sweep. A positive backend report is not
 sufficient when the durable record remains unusable, still has an unresolved
 attempt, or names a different confirmed owner.
 A confirmed owner must remain configured and must answer the sweep. Anything

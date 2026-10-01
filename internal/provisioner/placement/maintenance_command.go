@@ -105,6 +105,11 @@ const (
 	// receipts. A per-call NotDispatched outcome cannot produce one now.
 	MaintenanceOutcomeBackendUnavailable
 	MaintenanceOutcomeExecutionFailed
+	// MaintenanceOutcomeBackendLost settles a command whose lease lived on a
+	// backend an operator retired as irrecoverably lost.
+	MaintenanceOutcomeBackendLost
+
+	maxMaintenanceCommandOutcome = MaintenanceOutcomeBackendLost
 )
 
 func (outcome MaintenanceCommandOutcome) String() string {
@@ -129,6 +134,8 @@ func (outcome MaintenanceCommandOutcome) String() string {
 		return "backend_unavailable"
 	case MaintenanceOutcomeExecutionFailed:
 		return "execution_failed"
+	case MaintenanceOutcomeBackendLost:
+		return "backend_lost"
 	default:
 		return "invalid"
 	}
@@ -156,6 +163,8 @@ func parseMaintenanceCommandOutcome(value string) (MaintenanceCommandOutcome, bo
 		return MaintenanceOutcomeBackendUnavailable, true
 	case "execution_failed":
 		return MaintenanceOutcomeExecutionFailed, true
+	case "backend_lost":
+		return MaintenanceOutcomeBackendLost, true
 	default:
 		return MaintenanceOutcomePending, false
 	}
@@ -593,7 +602,7 @@ func encodeMaintenanceSettlement(command MaintenanceCommand, settlement maintena
 	if !command.Valid() {
 		return nil, "", ErrInvalidMaintenanceCommand
 	}
-	if outcome > MaintenanceOutcomeExecutionFailed {
+	if outcome > maxMaintenanceCommandOutcome {
 		return nil, "", ErrInvalidMaintenanceCommand
 	}
 	persistedPayload := append([]byte(nil), command.payload...)
@@ -814,6 +823,10 @@ func (s *Store) prepareMaintenanceCommand(
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// A lost placement is terminal whatever inventory later reports.
+	if _, lost := s.cache[leaseUUID].LostBackend(); lost {
+		return PreparedMaintenanceCommand{}, ErrPlacementLost
+	}
 	if err := s.unprojectedPositiveErrorLocked(leaseUUID); err != nil {
 		return PreparedMaintenanceCommand{}, err
 	}
@@ -1075,7 +1088,7 @@ func (s *Store) settleMaintenancePhase(claim MaintenanceCommandClaim, settlement
 func (s *Store) settleMaintenancePhaseReceipt(claim MaintenanceCommandClaim, settlement maintenanceSettlement, phase maintenanceJournalPhase) (MaintenanceCommandRecord, error) {
 	outcome := settlement.outcome
 	if s == nil || !claim.Valid() || claim.issuer != s || outcome == MaintenanceOutcomePending ||
-		outcome > MaintenanceOutcomeExecutionFailed {
+		outcome > maxMaintenanceCommandOutcome {
 		return MaintenanceCommandRecord{}, ErrMaintenanceCommandNotPending
 	}
 	s.mu.Lock()

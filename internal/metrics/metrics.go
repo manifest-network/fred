@@ -166,6 +166,17 @@ var (
 		Help:      "Total leases reconciliation deferred because ownership or lifecycle evidence was unsafe or changed during the sweep",
 	})
 
+	// ReconcilerLostLeasesTotal counts reconciliation of leases whose data
+	// lived on a backend an operator retired as lost, and of ACTIVE leases with
+	// no placement row that an unproven retirement closes. outcome: closed,
+	// rejected, deferred, error.
+	ReconcilerLostLeasesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "reconciler_lost_leases_total",
+		Help:      "Leases whose data lived on a retired backend's lost storage, by reconciliation outcome",
+	}, []string{"outcome"})
+
 	// ReconcilerPanicsTotal counts panics recovered inside reconciler
 	// per-unit goroutines (per-lease, per-orphan, per-backend-fetch). The
 	// recover exists specifically to prevent one bad lease/orphan/backend

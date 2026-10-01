@@ -285,6 +285,12 @@ func (inspector *semanticFailingRepairInspector) VerifyRestoredBackupPostconditi
 	return inspector.cause
 }
 
+func (inspector *semanticFailingRepairInspector) VerifyBackendRetirementPostcondition(
+	placement.BackendRetirementResult,
+) error {
+	return inspector.cause
+}
+
 type repairVerdictErrorWriter struct{}
 
 func (repairVerdictErrorWriter) Write([]byte) (int, error) {

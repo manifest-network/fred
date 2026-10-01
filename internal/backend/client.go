@@ -1502,6 +1502,34 @@ func (c bootstrapInventoryClient) ListRetentionsWithIdentity(
 	return c.client.ListRetentionsWithIdentity(ctx)
 }
 
+// ProbeStorageIdentity asks one backend which storage it serves, with a single
+// one-row inventory request. It reads only the identity response header, which
+// a backend sets on every response once its storage identity verifies, so a
+// backend whose inventory is failing still answers. The answer grants no
+// authority: the offline retirement tool uses it only to refuse retiring a
+// backend that still serves its pinned storage.
+func ProbeStorageIdentity(ctx context.Context, policy ConnectionPolicy) (backendidentity.ID, error) {
+	if !policy.valid() {
+		return backendidentity.ID{}, errors.New("backend connection policy is required")
+	}
+	c := newHTTPClient(policy, HTTPClientOptions{})
+	ctx, cancel := context.WithTimeout(ctx, c.httpClient.Timeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/provisions?limit=1", nil)
+	if err != nil {
+		return backendidentity.ID{}, fmt.Errorf("create request: %w", err)
+	}
+	if err := c.prepareRequest(httpReq, nil, requestIdentityBootstrap); err != nil {
+		return backendidentity.ID{}, err
+	}
+	resp, err := c.do(httpReq)
+	if err != nil {
+		return backendidentity.ID{}, fmt.Errorf("probe storage identity: %w", err)
+	}
+	defer discardAndCloseResponse(resp)
+	return responseStorageIdentity(resp)
+}
+
 // NewIdentityBoundHTTPClient creates the production client. It refuses every
 // non-inventory request until the placement store has pinned this configured
 // name to an immutable backend storage identity. Side effects use upgraded-only

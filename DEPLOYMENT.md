@@ -745,6 +745,107 @@ until one sweep in which every configured backend answers both inventory
 endpoints; until then new admission and backend removal wait, and existing
 leases keep running. That sweep adopts every lease its owner reports.
 
+### Retiring a backend whose storage is lost
+
+Fred never moves a lease to another backend, and refuses to drop a backend from
+its topology while any lease still refers to it. When a backend's storage is
+irrecoverably lost (the disks failed with no backup, or the host was
+destroyed), its leases are stranded: they cannot be served, restarted, or
+cleaned up. Retire the backend. Retirement ends every lease that lived there on
+chain, and it cannot be undone.
+
+1. Stop `providerd`. Fence the lost host so it cannot answer or run workloads:
+   power it off, or stop its `docker-backend`. Keep the lost backend in the
+   providerd config for now; the tool requires the config to match the durable
+   topology exactly.
+2. Read the backend's pinned storage identity from `storage_bindings` in
+   `placement-repair -config /etc/fred/config.yaml -classify`.
+3. Dry run:
+
+   ```bash
+   placement-repair -config /etc/fred/config.yaml -retire-lost-backend \
+     -backend backend-b -storage-id 6ba7b811-9dad-41d1-80b4-00c04fd430c8
+   ```
+
+   It prints one JSON object:
+
+   | Field | Meaning |
+   |---|---|
+   | `lost_leases` | Leases the backend owned, and leases with no surviving owner whose only other evidence is one survivor's report. Each is closed (ACTIVE) or rejected (PENDING) on chain with reason `backend storage lost` |
+   | `lost_with_survivor_copies` | Lost leases that a surviving backend also reported. Once such a lease has ended, the survivor deprovisions its copy under its retention policy |
+   | `stripped_leases` | Leases that keep a surviving owner, or two or more surviving candidates, and only forget the backend's name. Several candidates stay an operator-only quarantine for `-resolve-conflict` |
+   | `unknown_owner_conflicts`, `uninterpretable_leases` | Legacy quarantines and unreadable rows. Their placement rows are left exactly as they are, even when they name this backend, because a survivor may hold their data; they stay operator-only |
+   | `lifecycle_scrubbed` | Leases whose lifecycle authority is revoked: a lost lease's authority, and any authority that names the backend. A lease with no placement row loses the authority row entirely |
+   | `reclaimed_receipt_leases` | Leases that lose their last authority row, so their settled restart and update receipts are deleted with it |
+   | `maintenance_settled` | Pending restarts and updates that settle as `backend_lost`; a retried request answers 410 |
+   | `topology_before`, `topology_after`, `topology_id` | The active topology before and after, and its current generation |
+   | `pending_inventory_sweep`, `recordless_unproven` | See below |
+   | `target_probe` | One single-row request for the backend's storage identity, read from a response header so a failing inventory still answers: `no_identity` (unreachable, or its storage identity did not verify) or `answered_with_other_storage` (for example a host rebuilt on new disks). The run refuses when the answer is the backend's own pin, because then its storage is not lost, or another backend's pin, because then the configured address reaches a different backend. The probe uses the backend's configured request timeout; `-timeout` is refused |
+   | `attest_lost`, `confirm` | The exact values the apply requires |
+
+   The probe only guards against retiring the wrong name. Silence proves
+   nothing, which is why the apply also takes your attestation.
+4. Apply with a new backup path, the printed `confirm`, and the attestation:
+
+   ```bash
+   placement-repair -config /etc/fred/config.yaml -retire-lost-backend \
+     -backend backend-b -storage-id 6ba7b811-9dad-41d1-80b4-00c04fd430c8 \
+     -apply -backup /var/lib/fred/placements.pre-retirement.db -confirm '<confirm>' \
+     -attest-lost 'I attest the storage of this backend is irrecoverably lost and its host is fenced'
+   ```
+
+   `confirm` binds the provider, the canonical database path, the backend and
+   its pin, and every byte the retirement rewrites or deletes, so a database
+   that changed after the dry run is refused. The apply publishes an exact
+   no-overwrite backup, then writes everything in one transaction: the backend
+   leaves the topology as a new generation, lost leases get a terminal `lost`
+   row, stripped leases forget the name, pending maintenance settles, and the
+   admission baseline and drain evidence are cleared. Every rewritten row is
+   decoded back before the commit and again after the reopen, and must read as
+   planned. The failure prefixes (`BACKUP PUBLISHED`, `COMMITTED:`,
+   `OUTCOME UNKNOWN`) mean what they mean for the other repair modes below.
+5. Remove the backend, and its secret, from the providerd config, then start
+   `providerd`. Startup refuses a config that still names a retired backend.
+
+The retired name can never rejoin the topology, and its storage identity stays
+pinned to it, so no other name can claim that storage. To reuse the host,
+install a fresh `docker-backend` and add it under a new name. Adding a backend,
+like any topology change, is refused while an unknown-owner or unreadable
+placement row remains.
+
+After the start, `/readyz` reports `placement inventory not ready` until one
+sweep in which every surviving backend answers; meanwhile existing leases keep
+running. The reconciler then ends each lost lease on chain and counts it in
+`fred_provisioner_reconciler_lost_leases_total{outcome}`. The sweep-wide
+safety gates still apply: an untrusted report of the lease, or pending
+inventory recovery, defers it to a later sweep. Tenants see the answers
+described in README.md until the lease has ended on chain and a later sweep
+prunes its row; from then on it is answered like any other ended lease. A copy of a lost
+lease that a survivor still reports is never adopted while the lease is live;
+once the lease has ended and its row is pruned, the survivor deprovisions that
+copy as an ordinary orphan, under its retention policy.
+
+`pending_inventory_sweep` is true when `providerd` stopped in the middle of a
+sweep, and the retirement then sets `recordless_unproven`. To avoid that, start
+`providerd`, stop it right after the next `reconciliation complete` log line,
+and plan again. If it stays true, the marker is waiting on an answer that
+cannot arrive, typically from the lost backend, and the retirement must set the
+flag.
+
+`recordless_unproven` is true when the database had no current admission
+baseline: a sweep was interrupted, or the retirement follows another retirement
+or a restored-backup attestation with no complete sweep in between. A live
+lease with no placement row may then have lived on the lost backend, so from
+then on `providerd` closes any ACTIVE lease that has no placement row as lost
+instead of provisioning it empty on a survivor. The flag is permanent for the
+database. When two backends are lost together, retire them one after the
+other; the second retirement always sets the flag, because the first cleared
+the baseline and no sweep can complete while the second is still configured.
+
+An older binary refuses a database that records a retirement. The exact backup
+is the pre-retirement database; restoring it follows "Restoring an older
+placement backup" above, and leases already ended on chain stay ended.
+
 ### Initializing a genuinely fresh placement authority
 
 Normal `providerd` startup deliberately cannot create `placement_store_db_path`.

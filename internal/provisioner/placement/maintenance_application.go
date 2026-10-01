@@ -38,6 +38,7 @@ const (
 	MaintenanceApplicationCapacityReserved
 	MaintenanceApplicationServiceUnavailable
 	MaintenanceApplicationInternalFailure
+	MaintenanceApplicationBackendLost
 )
 
 // MaintenanceApplicationRequest is an opaque authenticated intent. The
@@ -312,6 +313,9 @@ func maintenanceRecordMatches(record MaintenanceCommandRecord, input Maintenance
 
 func resultForPreparation(preparation MaintenancePreparation) MaintenanceApplicationResult {
 	if err := preparation.Err(); err != nil {
+		if errors.Is(err, ErrPlacementLost) {
+			return maintenanceApplicationResult(MaintenanceApplicationBackendLost, nil)
+		}
 		return maintenanceApplicationResult(MaintenanceApplicationServiceUnavailable, err)
 	}
 	switch preparation.Outcome() {
@@ -372,6 +376,8 @@ func resultForMaintenanceOutcome(outcome MaintenanceCommandOutcome) MaintenanceA
 		return maintenanceApplicationResult(MaintenanceApplicationForbidden, nil)
 	case MaintenanceOutcomeCapacityRefused, MaintenanceOutcomeBackendUnavailable:
 		return maintenanceApplicationResult(MaintenanceApplicationServiceUnavailable, nil)
+	case MaintenanceOutcomeBackendLost:
+		return maintenanceApplicationResult(MaintenanceApplicationBackendLost, nil)
 	default:
 		return maintenanceApplicationResult(MaintenanceApplicationInternalFailure,
 			errors.New("invalid durable maintenance outcome"))

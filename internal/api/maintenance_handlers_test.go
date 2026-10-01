@@ -189,6 +189,7 @@ func TestMaintenanceHandlersTranslateServiceOutcomes(t *testing.T) {
 		"temporarily down":     {maintenanceapp.OutcomeServiceUnavailable, http.StatusServiceUnavailable},
 		"newcomer reservation": {maintenanceapp.OutcomeCapacityReserved, http.StatusTooManyRequests},
 		"internal":             {maintenanceapp.OutcomeInternalFailure, http.StatusInternalServerError},
+		"backend storage lost": {maintenanceapp.OutcomeBackendLost, http.StatusGone},
 	} {
 		t.Run(name, func(t *testing.T) {
 			service := maintenanceServiceFunc(func(
@@ -206,6 +207,9 @@ func TestMaintenanceHandlersTranslateServiceOutcomes(t *testing.T) {
 			if test.outcome == maintenanceapp.OutcomeCapacityReserved {
 				assert.Equal(t, "1", response.Header().Get("Retry-After"))
 				assert.JSONEq(t, `{"error":"maintenance capacity is reserved for tenants without pending work; retry after your pending work completes","code":429,"reason":"maintenance_capacity_reserved"}`, response.Body.String())
+			}
+			if test.outcome == maintenanceapp.OutcomeBackendLost {
+				assert.JSONEq(t, `{"error":"the backend storage holding this lease was irrecoverably lost","code":410,"reason":"backend_storage_lost"}`, response.Body.String())
 			}
 		})
 	}

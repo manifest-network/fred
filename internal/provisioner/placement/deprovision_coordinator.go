@@ -176,6 +176,13 @@ func (coordinator *deprovisionCoordinator) executeEvent(
 		return deprovisionEventFromError(errors.Join(err, finish()))
 	}
 	placement := observation.placement
+	if _, lost := placement.LostBackend(); lost {
+		// The retirement attested this lease's storage lost: nothing Fred
+		// placed survives to tear down, and a copy a survivor still holds is
+		// an ordinary orphan once the lease is terminal.
+		coordinator.forget(leaseUUID, "")
+		return deprovisionEventFromError(finish())
+	}
 	add(placement.Backend)
 	add(placement.Attempt)
 	unresolved, unaccountable := false, false

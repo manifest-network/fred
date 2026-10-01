@@ -173,6 +173,10 @@ type topologyMetadata struct {
 	// positive the pending sweep chain has not yet projected. Absent while a
 	// sweep is pending means untracked: every configured backend must answer.
 	InventorySweepReporters *inventorySweepReporters `json:"inventory_sweep_reporters,omitempty"`
+	// RetiredBackends names every backend an operator retired as lost. Its
+	// presence makes the database unreadable by a binary that predates
+	// retirement, which could otherwise resurrect or re-admit those names.
+	RetiredBackends map[string]retiredBackend `json:"retired_backends,omitempty"`
 }
 
 // clearPendingInventorySweep retires the pending marker and its reporter
@@ -321,6 +325,14 @@ func decodeTopologyMetadata(encoded []byte) (topologyMetadata, error) {
 	}
 	// The top-level decoder below would accept a duplicated or case-aliased
 	// nested name, and a later duplicate "backends" could empty the journal.
+	if rawRetired, present := fields["retired_backends"]; present {
+		var retired map[string]retiredBackend
+		if err := strictjson.DecodeObject(rawRetired, maxAuthorityRowValueBytes, &retired); err != nil {
+			return topologyMetadata{}, fmt.Errorf(
+				"decode placement metadata field %q: %w", "retired_backends", err,
+			)
+		}
+	}
 	if rawReporters, present := fields["inventory_sweep_reporters"]; present {
 		var reporters inventorySweepReporters
 		if err := strictjson.DecodeObject(rawReporters, maxAuthorityRowValueBytes, &reporters); err != nil {
@@ -395,7 +407,8 @@ func topologyMetadataFieldAllowed(name string) bool {
 	case "schema", "topology", "topology_fingerprint", "known_backends", "topology_id",
 		"baseline_fingerprint", "baseline_topology_id", "provider_uuid",
 		"known_backend_storage_ids", "inventory_topology_id", "empty_inventory_backends",
-		"inventory_sweep_sequence", "pending_inventory_sweep_id", "inventory_sweep_reporters":
+		"inventory_sweep_sequence", "pending_inventory_sweep_id", "inventory_sweep_reporters",
+		"retired_backends":
 		return true
 	default:
 		return false
@@ -422,7 +435,8 @@ func validateTopologyMetadata(metadata topologyMetadata) error {
 			metadata.BaselineFingerprint != "" ||
 			metadata.BaselineTopologyID != 0 || metadata.InventoryTopologyID != 0 ||
 			len(metadata.EmptyInventoryBackends) != 0 || metadata.InventorySweepSequence != 0 ||
-			metadata.PendingInventorySweepID != 0 || metadata.InventorySweepReporters != nil {
+			metadata.PendingInventorySweepID != 0 || metadata.InventorySweepReporters != nil ||
+			metadata.RetiredBackends != nil {
 			return errors.New("malformed unconfigured placement metadata")
 		}
 		return nil
@@ -480,6 +494,9 @@ func validateTopologyMetadata(metadata topologyMetadata) error {
 	}
 	if metadata.PendingInventorySweepID > metadata.InventorySweepSequence {
 		return errors.New("pending placement inventory sweep is newer than its durable sequence")
+	}
+	if err := validateRetiredBackends(metadata); err != nil {
+		return err
 	}
 	if err := validateInventorySweepReporters(metadata); err != nil {
 		return err
@@ -721,6 +738,9 @@ func (s *Store) configureBackendTopology(
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.refuseRetiredBackendsLocked(canonical); err != nil {
+		return err
+	}
 
 	proposed := make(map[string]struct{}, len(canonical))
 	for _, backendName := range canonical {
@@ -954,6 +974,11 @@ func durableBackendNames(leaseUUID string, value []byte) ([]string, error) {
 		return nil, errors.New("empty record")
 	}
 	persisted := decodeRecord(leaseUUID, value)
+	if _, lost := persisted.LostBackend(); lost {
+		// A lost placement names no active backend; its retired name can
+		// never return, so it blocks no later membership change.
+		return []string{}, nil
+	}
 	if persisted.unusable {
 		return nil, errors.New("record failed placement decoding or structural validation")
 	}
@@ -995,6 +1020,7 @@ func (s *Store) topologyMetadataLocked() topologyMetadata {
 		InventorySweepSequence:  s.inventorySweepSequence,
 		PendingInventorySweepID: s.pendingInventorySweepID,
 		InventorySweepReporters: s.inventoryReporters.persisted(s.pendingInventorySweepID),
+		RetiredBackends:         cloneRetiredBackends(s.retiredBackends),
 	}
 }
 
@@ -1032,6 +1058,11 @@ func (s *Store) BackendTopologyRequiresIdentityProbe(names []string) (bool, erro
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// Refuse before any probe, so a config still naming a retired backend fails
+	// with its reason instead of an unreachable-backend error.
+	if err := s.refuseRetiredBackendsLocked(canonical); err != nil {
+		return false, err
+	}
 	if !slices.Equal(canonical, s.backendTopology) {
 		return true, nil
 	}
@@ -1242,6 +1273,12 @@ func (s *Store) validateProjectionAggregateLocked(
 		}
 	}
 	for _, leaseUUID := range projection.AbsenceEvidence.LeaseUUIDs(s.inventoryEvidence) {
+		if record, exists := s.cache[leaseUUID]; exists {
+			if _, lost := record.LostBackend(); lost {
+				// A lost placement accounts for every reporter, submitted or not.
+				continue
+			}
+		}
 		reporters := projection.AbsenceEvidence.LeaseReporters(
 			s.inventoryEvidence, leaseUUID,
 		)

@@ -48,6 +48,7 @@ type repairPostconditionInspector interface {
 		placement.ConflictRepairResult,
 	) error
 	VerifyRestoredBackupPostcondition(placement.RestoredBackupResult) error
+	VerifyBackendRetirementPostcondition(placement.BackendRetirementResult) error
 	Close() error
 }
 
@@ -217,6 +218,13 @@ func runWithDependencies(
 		false,
 		"forget the admission baseline and drain evidence of a database restored from an older copy (offline)",
 	)
+	retireLostBackend := flags.Bool(
+		"retire-lost-backend",
+		false,
+		"retire -backend, whose storage -storage-id is irrecoverably lost; its leases are closed as lost (offline)",
+	)
+	storageIDText := flags.String("storage-id", "", "exact pinned storage identity of the -backend being retired")
+	lostAttestation := flags.String("attest-lost", "", "exact lost-storage attestation required with -apply -retire-lost-backend")
 	timeout := flags.Duration(
 		"timeout",
 		defaultRepairTimeout,
@@ -258,6 +266,7 @@ func runWithDependencies(
 	modeCount := 0
 	for _, selected := range []bool{
 		*classifyAuthority, *listRecords, *inspectRecord, *resolveConflict, *attestRestoredBackup,
+		*retireLostBackend,
 	} {
 		if selected {
 			modeCount++
@@ -265,8 +274,26 @@ func runWithDependencies(
 	}
 	if modeCount > 1 {
 		return fmt.Errorf(
-			"-classify, -list, -inspect, -resolve-conflict, and -attest-restored-backup are mutually exclusive",
+			"-classify, -list, -inspect, -resolve-conflict, -attest-restored-backup, and -retire-lost-backend are mutually exclusive",
 		)
+	}
+	if *retireLostBackend {
+		if timeoutExplicit {
+			return fmt.Errorf("-retire-lost-backend probes with the backend's configured timeout and does not accept -timeout")
+		}
+		if *backendName == "" || *storageIDText == "" {
+			return fmt.Errorf("-retire-lost-backend requires -backend and -storage-id")
+		}
+		if *leaseUUID != "" || *operationText != "" || *attestation != "" {
+			return fmt.Errorf(
+				"-retire-lost-backend cannot be combined with -lease, -operation-id, or -attest-drained",
+			)
+		}
+		if !*apply && *lostAttestation != "" {
+			return fmt.Errorf("-attest-lost requires -apply; no mutation was attempted")
+		}
+	} else if *storageIDText != "" || *lostAttestation != "" {
+		return fmt.Errorf("-storage-id and -attest-lost require -retire-lost-backend")
 	}
 	if *attestRestoredBackup {
 		if timeoutExplicit {
@@ -310,7 +337,8 @@ func runWithDependencies(
 	newRepairClients := func(resolver backend.BackendStorageIdentityResolver) ([]placementprobe.Client, error) {
 		return placementprobe.NewIdentityBoundClients(cfg, resolver)
 	}
-	if *apply && !*attestRestoredBackup {
+	// Neither whole-database mode reads authenticated inventory evidence.
+	if *apply && !*attestRestoredBackup && !*retireLostBackend {
 		fleet, err := placementprobe.NewAuthenticatedFleet(cfg)
 		if err != nil {
 			return err
@@ -366,9 +394,9 @@ func runWithDependencies(
 			cfg.PlacementStoreDBPath, cfg.ProviderUUID, *leaseUUID, *listRecords, stdout,
 		)
 	}
-	// -attest-restored-backup targets the whole database; its flags were
-	// validated before the config was loaded.
-	if !*attestRestoredBackup {
+	// -attest-restored-backup and -retire-lost-backend target the whole
+	// database; their flags were validated before the config was loaded.
+	if !*attestRestoredBackup && !*retireLostBackend {
 		if *leaseUUID == "" || *backendName == "" {
 			flags.Usage()
 			return fmt.Errorf("-lease and -backend are required")
@@ -433,6 +461,16 @@ func runWithDependencies(
 			"provider config backend topology %q does not exactly match durable topology %q",
 			canonicalConfigured, repair.BackendTopology(),
 		)
+	}
+
+	if *retireLostBackend {
+		return runBackendRetirement(ctx, backendRetirementRequest{
+			cfg: cfg, repair: repair, closeRepair: closeRepair,
+			backendName: *backendName, storageIDText: *storageIDText,
+			apply: *apply, confirmation: *confirmation, attestation: *lostAttestation,
+			backupTarget:      boundBackupTarget,
+			mutationCommitted: &mutationCommitted, mutationOutcomeUnknown: &mutationOutcomeUnknown,
+		}, stdout, dependencies)
 	}
 
 	if *attestRestoredBackup {

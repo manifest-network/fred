@@ -34,6 +34,9 @@ const (
 	RestoreApplicationServiceUnavailable
 	RestoreApplicationNotRetained
 	RestoreApplicationBackendRejected
+	// RestoreApplicationSourceLost: the source's data lived on a backend an
+	// operator retired as irrecoverably lost.
+	RestoreApplicationSourceLost
 )
 
 // RestoreApplicationRequest carries only authenticated identities. It cannot
@@ -351,6 +354,8 @@ func restoreAdmissionApplicationFailure(err error) RestoreApplicationResult {
 		disposition = RestoreApplicationTargetBusy
 	case errors.Is(err, ErrRestoreSourceUnavailable):
 		disposition = RestoreApplicationSourceUnavailable
+	case errors.Is(err, ErrPlacementLost):
+		disposition = RestoreApplicationSourceLost
 	}
 	return RestoreApplicationResult{disposition: disposition, err: err}
 }

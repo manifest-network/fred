@@ -369,9 +369,40 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(r.maxWorkers)
+	recordlessUnproven := r.coordinator.RecordlessLeasesUnproven()
 
 	for leaseUUID, lease := range chainLeases {
 		provision, isProvisioned := allProvisions[leaseUUID]
+		// A lost placement is terminal and waits on no backend's answer, so it
+		// runs ahead of the per-lease gates below. ObserveLiveAction still
+		// applies the sweep-wide safety gates before anything reaches chain.
+		if _, lost := placementRecords[leaseUUID].LostBackend(); lost {
+			g.Go(func() error {
+				defer func() {
+					if rec := recover(); rec != nil {
+						slog.Error("reconciler lost-lease panic — recovering to keep fred alive",
+							"lease_uuid", leaseUUID, "panic", rec, "stack", string(debug.Stack()))
+						metrics.ReconcilerPanicsTotal.WithLabelValues("process_lease").Inc()
+						leaseErrors.Add(1)
+					}
+				}()
+				if sweep.WasInFlight(leaseUUID) || projection.projected == nil {
+					deferred.Add(1)
+					metrics.ReconcilerDeferredLeasesTotal.Inc()
+					metrics.ReconcilerLostLeasesTotal.WithLabelValues("deferred").Inc()
+					return nil
+				}
+				wasDeferred, err := r.resolveLostLease(gctx, leaseUUID, projection.projected)
+				if wasDeferred {
+					deferred.Add(1)
+				}
+				if err != nil {
+					leaseErrors.Add(1)
+				}
+				return nil
+			})
+			continue
+		}
 		if owners, ambiguous := ambiguousOwners[leaseUUID]; ambiguous {
 			deferred.Add(1)
 			metrics.ReconcilerDeferredLeasesTotal.Inc()
@@ -555,6 +586,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 			authority := reconcileActionAuthority{action: observed}
 
 			r.processLease(gctx, leaseUUID, lease, provision, isProvisioned,
+				recordlessUnproven && placementRecord.State() == placement.StateAbsent,
 				authority, &provisioned,
 				&acknowledged, &anomalies, &leaseErrors, &deferred)
 			return nil // Don't fail fast - continue processing other leases
@@ -1083,6 +1115,50 @@ func (r *Reconciler) closeLease(
 	)
 
 	return nil
+}
+
+// lostBackendChainReason is the fixed on-chain reason for a lease whose data
+// lived on a retired backend's lost storage. It names no backend.
+const lostBackendChainReason = "backend storage lost"
+
+// resolveLostLease closes an ACTIVE or rejects a PENDING lease whose placement
+// was lost with its retired backend's storage; a terminal lease needs nothing
+// and is pruned after an exact terminal read. deferred reports that the sweep
+// could not act on the lease this time.
+func (r *Reconciler) resolveLostLease(
+	ctx context.Context,
+	leaseUUID string,
+	projected *placement.ProjectedReconciliationSweep,
+) (deferred bool, err error) {
+	observed, disposition, err := projected.ObserveLiveAction(ctx, leaseUUID)
+	if err != nil {
+		metrics.ReconcilerLostLeasesTotal.WithLabelValues("error").Inc()
+		slog.Error("reconcile: failed to re-read lost lease under lifecycle claim",
+			"lease_uuid", leaseUUID, "error", err)
+		return false, err
+	}
+	if disposition != placement.ReconciliationObservationReady || !observed.Valid() {
+		metrics.ReconcilerDeferredLeasesTotal.Inc()
+		metrics.ReconcilerLostLeasesTotal.WithLabelValues("deferred").Inc()
+		return true, nil
+	}
+	defer r.coordinator.ReleaseAction(observed)
+	outcome := ""
+	switch observed.Lease().State {
+	case billingtypes.LEASE_STATE_ACTIVE:
+		outcome, err = "closed", r.closeLease(ctx, observed, lostBackendChainReason)
+	case billingtypes.LEASE_STATE_PENDING:
+		outcome, err = "rejected", r.rejectLease(ctx, observed, lostBackendChainReason)
+	default:
+		return false, nil
+	}
+	if err != nil {
+		metrics.ReconcilerLostLeasesTotal.WithLabelValues("error").Inc()
+		slog.Error("reconcile: failed to end lost lease on chain", "lease_uuid", leaseUUID, "error", err)
+		return false, err
+	}
+	metrics.ReconcilerLostLeasesTotal.WithLabelValues(outcome).Inc()
+	return false, nil
 }
 
 // cleanupTerminalLease removes the stored payload for a lease that has reached
@@ -1821,6 +1897,7 @@ func (r *Reconciler) processLease(
 	lease billingtypes.Lease,
 	provision backend.ProvisionInfo,
 	isProvisioned bool,
+	recordlessUnproven bool,
 	authority reconcileActionAuthority,
 	provisioned, acknowledged, anomalies, leaseErrors, deferred *atomic.Int32,
 ) {
@@ -1885,6 +1962,8 @@ func (r *Reconciler) processLease(
 		hasMetaHash:     len(lease.MetaHash) > 0,
 		payload:         payload,
 		inFlight:        inFlight,
+
+		recordlessUnproven: recordlessUnproven,
 	})
 
 	if plan.anomaly {
@@ -1984,6 +2063,17 @@ func (r *Reconciler) processLease(
 				"error", err,
 			)
 		}
+
+	case reconcileActionCloseLost:
+		slog.Error("reconcile: closing a live lease with no placement row that may have lived on a retired backend",
+			"lease_uuid", leaseUUID, "tenant", lease.Tenant)
+		if err := r.closeLease(ctx, authority.action, lostBackendChainReason); err != nil {
+			metrics.ReconcilerLostLeasesTotal.WithLabelValues("error").Inc()
+			slog.Error("reconcile: failed to close possibly lost lease", "lease_uuid", leaseUUID, "error", err)
+			hadError = true
+			return
+		}
+		metrics.ReconcilerLostLeasesTotal.WithLabelValues("closed").Inc()
 
 	case reconcileActionReconcileCustomDomain:
 		if err := r.coordinator.ReconcileObservedCustomDomain(ctx, authority.action); err != nil {

@@ -47,6 +47,7 @@ const (
 	OutcomeCapacityReserved
 	OutcomeServiceUnavailable
 	OutcomeInternalFailure
+	OutcomeBackendLost
 )
 
 type Result struct {
@@ -67,7 +68,8 @@ func NewResult(outcome Outcome, cause error) Result {
 	switch outcome {
 	case OutcomeAccepted, OutcomeNotFound, OutcomeNoLongerActive, OutcomeForbidden,
 		OutcomeAlreadyInProgress, OutcomeCommandConflict, OutcomeBackendInvalidState,
-		OutcomeBackendValidation, OutcomeCapacityReserved, OutcomeServiceUnavailable, OutcomeInternalFailure:
+		OutcomeBackendValidation, OutcomeCapacityReserved, OutcomeServiceUnavailable, OutcomeInternalFailure,
+		OutcomeBackendLost:
 		return Result{outcome: outcome, cause: cause}
 	default:
 		return Result{outcome: OutcomeInternalFailure, cause: errors.New("invalid maintenance result")}
@@ -136,6 +138,8 @@ func resultFromApplication(result placement.MaintenanceApplicationResult) Result
 		outcome = OutcomeNoLongerActive
 	case placement.MaintenanceApplicationForbidden:
 		outcome = OutcomeForbidden
+	case placement.MaintenanceApplicationBackendLost:
+		outcome = OutcomeBackendLost
 	case placement.MaintenanceApplicationAlreadyInProgress:
 		outcome = OutcomeAlreadyInProgress
 	case placement.MaintenanceApplicationCommandConflict:

@@ -309,6 +309,10 @@ func (h *Handlers) authenticateAndResolve(w http.ResponseWriter, r *http.Request
 		return nil, leaseUUID, nil, false
 	}
 
+	if h.placementLost(leaseUUID) {
+		writeBackendStorageLost(w)
+		return nil, leaseUUID, nil, false
+	}
 	sku := provisioner.ExtractRoutingSKU(auth.Lease)
 	b = h.resolveBackend(leaseUUID, sku)
 	if b == nil {
@@ -789,7 +793,12 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 	// ENG-333 keeps alive on close) and falls back to the bounded fan-out otherwise.
 	// Errors are intentionally ignored — provision status on /status is
 	// best-effort and ErrNotProvisioned during initial setup is expected.
-	if h.backendRouter != nil {
+	if h.placementLost(leaseUUID) {
+		// Decided from the durable record: no backend can answer for it.
+		response.ProvisionStatus = string(backend.ProvisionStatusFailed)
+		response.Reason = string(backend.ReasonBackendStorageLost)
+		response.Message = backend.MsgBackendStorageLost
+	} else if h.backendRouter != nil {
 		sku := provisioner.ExtractRoutingSKU(lease)
 		info, fanErr := h.findProvision(r.Context(), leaseUUID, sku)
 		if fanErr != nil {
@@ -944,6 +953,11 @@ func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 
 	var sku string
 	if lease != nil {
+		// Only a chain-authorized caller learns the lease is lost.
+		if h.placementLost(leaseUUID) {
+			writeBackendStorageLost(w)
+			return
+		}
 		sku = provisioner.ExtractRoutingSKU(lease)
 	}
 	// Placement fast-path for the ACTIVE common case; bounded fan-out otherwise.
@@ -1202,6 +1216,8 @@ func (h *Handlers) writeRestoreResult(
 			"lease_uuid", leaseUUID, "from_lease", sourceLeaseUUID,
 			"cause", fmt.Sprintf("%.1024s", fmt.Sprint(result.Cause())))
 		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+	case restoreapp.OutcomeSourceLost:
+		writeBackendStorageLost(w)
 	case restoreapp.OutcomeSourceBusy:
 		writeRestoreConflict(w, "lease is already being provisioned or restored", "source_busy")
 	case restoreapp.OutcomeTargetBusy:
@@ -1401,6 +1417,8 @@ func (h *Handlers) writeMaintenanceResult(
 		writeError(w, "lease is no longer active", http.StatusConflict)
 	case maintenanceapp.OutcomeForbidden:
 		writeError(w, errMsgForbidden, http.StatusForbidden)
+	case maintenanceapp.OutcomeBackendLost:
+		writeBackendStorageLost(w)
 	case maintenanceapp.OutcomeAlreadyInProgress:
 		writeError(w, "lease is already undergoing a lifecycle operation", http.StatusConflict)
 	case maintenanceapp.OutcomeCommandConflict:
@@ -2396,4 +2414,25 @@ func extractBearerToken(r *http.Request) (string, error) {
 		return "", errInvalidAuthFormat
 	}
 	return parts[1], nil
+}
+
+// writeBackendStorageLost is the one terminal answer for a lease whose
+// backend an operator retired as irrecoverably lost: the workload and its data
+// are gone, so no retry can succeed.
+func writeBackendStorageLost(w http.ResponseWriter) {
+	writeJSON(w, ErrorResponse{
+		Error:  backend.MsgBackendStorageLost,
+		Code:   http.StatusGone,
+		Reason: "backend_storage_lost",
+	}, http.StatusGone)
+}
+
+// placementLost reports whether the lease's durable placement was lost with a
+// retired backend's storage. It never consults a backend.
+func (h *Handlers) placementLost(leaseUUID string) bool {
+	if h.placementLookup == nil {
+		return false
+	}
+	_, lost := h.placementLookup.Lookup(leaseUUID).LostBackend()
+	return lost
 }

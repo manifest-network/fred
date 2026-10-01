@@ -41,6 +41,7 @@ const (
 	OutcomeInvalidRequest
 	OutcomeBackendMalformedResponse
 	OutcomeInternalFailure
+	OutcomeSourceLost
 )
 
 // Result is the typed result contract returned by Service. Detail contains
@@ -150,6 +151,8 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 		result.Outcome = OutcomeSourceNotFound
 	case placement.RestoreApplicationSourceUnavailable:
 		result.Outcome = OutcomeSourceUnavailable
+	case placement.RestoreApplicationSourceLost:
+		result.Outcome = OutcomeSourceLost
 	case placement.RestoreApplicationSourceBusy:
 		result.Outcome = OutcomeSourceBusy
 	case placement.RestoreApplicationTargetBusy:

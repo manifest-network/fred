@@ -8,6 +8,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `placement-repair -retire-lost-backend` retires a backend whose storage is
+  irrecoverably lost, which was previously impossible: Fred refuses to drop a
+  backend while leases refer to it, so such a backend stranded its leases
+  forever. The dry run lists every lease the backend owned, which of them a
+  survivor also reported, and every pending restart or update it settles. It
+  probes the backend once and refuses if the answer is the backend's own
+  pinned storage or another backend's. The apply takes an exact
+  confirmation and a lost-storage attestation, publishes an exact backup, and
+  writes the retirement in one transaction. `providerd` then closes each lost
+  ACTIVE lease and rejects each lost PENDING lease on chain with reason
+  `backend storage lost`, never provisions them elsewhere, and prunes them
+  once the chain shows them terminal; `fred_provisioner_reconciler_lost_leases_total`
+  counts it. Until the prune, tenants see `provision_status: failed` with reason
+  `BackendStorageLost`, and `410 Gone` with reason `backend_storage_lost` on
+  provision, connection, logs, releases, restart, update, and restore from a
+  lost source. A retired name can never rejoin, and its storage cannot be
+  claimed by another name. Older binaries refuse a database that records a
+  retirement. See DEPLOYMENT.md, "Retiring a backend whose storage is lost".
 - `docker-backend -audit-storage-identity-adoption` reports every v0.13 shape
   that blocks storage-identity adoption in one read-only pass, as JSON, where
   the preflight stops at the first. Each finding carries its class, an

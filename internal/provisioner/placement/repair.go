@@ -77,6 +77,8 @@ type RepairRecord struct {
 	UntrustedPositive      bool                `json:"untrusted_positive"`
 	ConflictBackends       []string            `json:"conflict_backends,omitempty"`
 	ConflictOwnersUnknown  bool                `json:"conflict_owners_unknown"`
+	// LostBackend names the retired backend whose lost storage held the lease.
+	LostBackend string `json:"lost_backend,omitempty"`
 }
 
 // OpenRepairInspector opens an existing placement database read-only and
@@ -169,9 +171,15 @@ func newRepairRecord(leaseUUID string, p Placement) RepairRecord {
 		payloadHash = p.attemptPayloadFingerprint.String()
 		requestSnapshot = p.attemptRequestSnapshot
 	}
+	lostBackend, lost := p.LostBackend()
+	state := p.State().String()
+	if lost {
+		state = "lost"
+	}
 	return RepairRecord{
 		LeaseUUID:              leaseUUID,
-		State:                  p.State().String(),
+		State:                  state,
+		LostBackend:            lostBackend,
 		Backend:                p.Backend,
 		Attempt:                p.Attempt,
 		OperationID:            operationID,

@@ -33,6 +33,8 @@ func TestRestoreLeaseSemanticConflictReasonsPreserveNumericCode(t *testing.T) {
 			body: `{"error":"lease not in a restorable state","code":409}`},
 		{name: "tier refusal keeps existing numeric code", outcome: restoreapp.OutcomeTierTooSmall, status: http.StatusUnprocessableEntity,
 			body: `{"error":"retained data exceeds the requested smaller tier","code":422}`},
+		{name: "source storage lost", outcome: restoreapp.OutcomeSourceLost, status: http.StatusGone,
+			body: lostLeaseBodyPattern},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			kp := testutil.NewTestKeyPair("test-tenant")

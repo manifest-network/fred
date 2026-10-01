@@ -19,6 +19,27 @@ func TestPlanLease_DecisionTable(t *testing.T) {
 		want  leasePlan
 	}{
 		{
+			name: "recordless active lease a retired backend may have held closes as lost",
+			facts: leaseFacts{
+				authority:          lifecycleAuthorityDurable,
+				chain:              billingtypes.LEASE_STATE_ACTIVE,
+				recordlessUnproven: true,
+			},
+			want: leasePlan{
+				action: reconcileActionCloseLost, anomaly: true,
+				reason: "active lease may have lived on a retired backend's lost storage",
+			},
+		},
+		{
+			name: "recordless pending lease still starts after a retirement",
+			facts: leaseFacts{
+				authority:          lifecycleAuthorityDurable,
+				chain:              billingtypes.LEASE_STATE_PENDING,
+				recordlessUnproven: true,
+			},
+			want: leasePlan{action: reconcileActionStart},
+		},
+		{
 			name: "pending payload-free lease starts",
 			facts: leaseFacts{
 				authority: lifecycleAuthorityDurable,
