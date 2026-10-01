@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Per-backend reconciliation metrics for a readiness gate that tolerates a
+  known-down backend: `fred_reconciler_backend_inventory_total{backend,outcome}`
+  (`authoritative`, `partial`, `untrusted`, `provisions_only`, `retentions_only`,
+  `unanswered`), `fred_reconciler_backend_inventory_answered{backend}` and
+  `fred_reconciler_sweep_projection_committed`. `fred_reconciler_sweep_complete`
+  stays 0 fleet-wide while any backend is down; gate instead on
+  `sweep_projection_committed == 1` and `backend_inventory_answered == 1` for each
+  backend that must be up.
+- `fred_docker_backend_image_helpers_unsettled{reason}` counts the
+  image-inspection helpers left after each recovery pass: `unknown_create` (kept
+  in case the container appears late) and `cleanup_pending` (retried every pass).
+  Either blocks image ingestion and image GC. These were previously only logged.
 - `placement-repair -retire-lost-backend` retires a backend whose storage is
   irrecoverably lost, which was previously impossible: Fred refuses to drop a
   backend while leases refer to it, so such a backend stranded its leases

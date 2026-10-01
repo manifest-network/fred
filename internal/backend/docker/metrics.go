@@ -310,6 +310,21 @@ var (
 		Help:      "Interrupted operation cleanup passes deferred with their exact durable intent and resource reservation retained",
 	}, []string{"kind"})
 
+	// imageHelpersUnsettled counts the image-inspection helper receipts that
+	// survived the latest recovery pass and no live inspection owns, by reason.
+	// "unknown_create" means the helper's Create response was never durably
+	// recorded, so the receipt is kept indefinitely in case the container
+	// appears late; "cleanup_pending" means removal failed or was not reached
+	// and is retried every pass. Either blocks containerd image ingestion and
+	// image GC on this backend. When the journal cannot be read the previous
+	// value is kept; reconciliation_total already counts that error.
+	imageHelpersUnsettled = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "image_helpers_unsettled",
+		Help:      "Image-inspection helper receipts left after the latest recovery pass and owned by no live inspection, by reason; nonzero blocks image ingestion and image GC",
+	}, []string{"reason"})
+
 	// Terminal receipts retain cleanup authority after their resource snapshots
 	// are retired. These metrics expose the associated capacity exclusions.
 	terminalSubstratePendingContainers = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -1035,6 +1050,9 @@ var quotaBackfillOutcomes = []string{"applied", "failed"}
 func init() {
 	for _, kind := range []string{"active", "retained"} {
 		imageUnpinnedGenerations.WithLabelValues(kind).Set(0)
+	}
+	for _, reason := range []string{imageHelperUnsettledUnknownCreate, imageHelperUnsettledCleanupPending} {
+		imageHelpersUnsettled.WithLabelValues(reason).Set(0)
 	}
 	for _, outcome := range []string{"busy", "inhibited", "shared", "below_threshold", "removed", "error", "panic"} {
 		imageGCTotal.WithLabelValues(outcome).Add(0)

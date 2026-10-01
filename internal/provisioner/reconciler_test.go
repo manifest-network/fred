@@ -6423,6 +6423,7 @@ func TestReconciler_CycleCompletenessRequiresInventoriesAndProjection(t *testing
 			const previousSuccess = 123
 			metrics.ReconcilerLastSuccessTimestamp.Set(previousSuccess)
 			metrics.ReconcilerSweepComplete.Set(1)
+			metrics.ReconcilerSweepProjectionCommitted.Set(1)
 			degraded := metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeDegraded)
 			success := metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeSuccess)
 			degradedBefore := promtestutil.ToFloat64(degraded)
@@ -6437,6 +6438,10 @@ func TestReconciler_CycleCompletenessRequiresInventoriesAndProjection(t *testing
 				"an incomplete or unpersisted fleet projection must not advance last-success")
 			assert.Equal(t, degradedBefore+1, promtestutil.ToFloat64(degraded))
 			assert.Equal(t, successBefore, promtestutil.ToFloat64(success))
+			if tt.projectionFailure {
+				assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.ReconcilerSweepProjectionCommitted),
+					"a failed projection never reports a commit")
+			}
 		})
 	}
 }

@@ -1059,6 +1059,49 @@ func TestFleet_DegradedSweep_EmitsDegradedOutcomeAndWithholdsSuccess(t *testing.
 		"sweep_complete must report 0 while the fleet view is incomplete")
 }
 
+// A readiness gate that tolerates one known-down backend needs per-sweep,
+// per-backend evidence, because sweep_complete stays 0 fleet-wide while any
+// backend is silent. The answered gauges and the commit gauge describe the
+// same sweep: the commit gauge is reset before the seal rewrites the answers.
+func TestFleet_DegradedSweep_ReportsWhichBackendsAnsweredAndThatTheProjectionCommitted(t *testing.T) {
+	// Not parallel: process-global collectors, as above.
+	f := newFleet(t, fleetOptions{})
+	f.addLease("lease-x", billingtypes.LEASE_STATE_ACTIVE)
+	f.backendAt(1).seedProvision(t, "lease-x", f.providerUUID, backend.ProvisionStatusReady)
+
+	require.NoError(t, f.sweep())
+	for _, backendName := range []string{"backend-1", "backend-2", "backend-3"} {
+		assert.Equal(t, 1.0, promtestutil.ToFloat64(
+			metrics.ReconcilerBackendInventoryAnswered.WithLabelValues(backendName)), backendName)
+	}
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.ReconcilerSweepProjectionCommitted))
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.ReconcilerSweepComplete))
+
+	unanswered := metrics.ReconcilerBackendInventoryTotal.WithLabelValues(
+		"backend-2", metrics.InventoryOutcomeUnanswered)
+	authoritative := metrics.ReconcilerBackendInventoryTotal.WithLabelValues(
+		"backend-1", metrics.InventoryOutcomeAuthoritative)
+	unansweredBefore := promtestutil.ToFloat64(unanswered)
+	authoritativeBefore := promtestutil.ToFloat64(authoritative)
+
+	f.backendAt(2).setFault(faultConnReset)
+	require.NoError(t, f.sweep())
+
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(
+		metrics.ReconcilerBackendInventoryAnswered.WithLabelValues("backend-2")),
+		"the silent backend's answered gauge drops from 1 to 0")
+	for _, backendName := range []string{"backend-1", "backend-3"} {
+		assert.Equal(t, 1.0, promtestutil.ToFloat64(
+			metrics.ReconcilerBackendInventoryAnswered.WithLabelValues(backendName)), backendName)
+	}
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.ReconcilerSweepProjectionCommitted),
+		"the degraded sweep still committed its projection")
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.ReconcilerSweepComplete))
+	assert.Equal(t, unansweredBefore+1, promtestutil.ToFloat64(unanswered),
+		"the silent backend is counted once per sealed sweep")
+	assert.Equal(t, authoritativeBefore+1, promtestutil.ToFloat64(authoritative))
+}
+
 // Tenant failures must stop tenant requests without suppressing the inventory
 // needed to observe recovery. A successful recovery sweep is not permission to
 // reset the independent tenant breaker or dispatch a tenant request through it.

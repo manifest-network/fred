@@ -332,6 +332,47 @@ var (
 		Help:      "1 only while a complete full-fleet inventory is durably projected and no newer sweep has invalidated authority; 0 during startup, an in-progress sweep, or any incomplete or failed read or projection",
 	})
 
+	// ReconcilerBackendInventoryTotal counts, once per configured backend per
+	// sealed sweep, how that backend's paired inventory evidence was disposed.
+	// "authoritative" and "partial" answered both inventories with the pinned
+	// storage identity ("partial" kept some of its leases conservative);
+	// "untrusted" answered both but failed the identity or refresh checks;
+	// "provisions_only" and "retentions_only" answered one endpoint;
+	// "unanswered" answered neither. Unlike backend_fetch_total, which counts
+	// provision-list attempts, this covers both endpoints and identity. Alert on
+	// a backend sustaining anything other than authoritative.
+	ReconcilerBackendInventoryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "reconciler",
+		Name:      "backend_inventory_total",
+		Help:      "Per-backend inventory evidence in each sealed reconciliation sweep, by disposition",
+	}, []string{"backend", "outcome"})
+
+	// ReconcilerBackendInventoryAnswered is 1 when the backend answered both
+	// inventories with its pinned storage identity in the latest sealed sweep,
+	// and 0 otherwise. Every configured backend is rewritten at each seal. Read
+	// it only while fred_reconciler_sweep_projection_committed is 1, which
+	// proves the values belong to the sweep whose projection committed.
+	ReconcilerBackendInventoryAnswered = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "reconciler",
+		Name:      "backend_inventory_answered",
+		Help:      "1 if the backend answered both inventories with its pinned storage identity in the latest sealed sweep, 0 otherwise",
+	}, []string{"backend"})
+
+	// ReconcilerSweepProjectionCommitted is 0 from the start of every sweep
+	// until that sweep's placement projection commits durably, and 1 after,
+	// even when some backends did not answer. With
+	// fred_reconciler_backend_inventory_answered it lets a readiness gate
+	// tolerate one known-down backend, which fred_reconciler_sweep_complete
+	// cannot: that gauge stays 0 fleet-wide while any backend is down.
+	ReconcilerSweepProjectionCommitted = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "reconciler",
+		Name:      "sweep_projection_committed",
+		Help:      "1 once the current sweep's placement projection committed durably, even with unanswered backends; 0 from the start of every sweep until then",
+	})
+
 	// ReconcilerCleanupSkipsTotal counts destructive cleanup actions the
 	// reconciler declined to take because it lacked positive evidence (ENG-654).
 	//
@@ -881,6 +922,17 @@ const (
 	FetchOutcomeOK          = "ok"
 	FetchOutcomeError       = "error"
 	FetchOutcomeCircuitOpen = "circuit_open"
+)
+
+// Outcome constants for the `outcome` label on
+// fred_reconciler_backend_inventory_total. The set is closed.
+const (
+	InventoryOutcomeAuthoritative  = "authoritative"
+	InventoryOutcomePartial        = "partial"
+	InventoryOutcomeUntrusted      = "untrusted"
+	InventoryOutcomeProvisionsOnly = "provisions_only"
+	InventoryOutcomeRetentionsOnly = "retentions_only"
+	InventoryOutcomeUnanswered     = "unanswered"
 )
 
 // Pass and reason constants for the `pass` / `reason` labels on
