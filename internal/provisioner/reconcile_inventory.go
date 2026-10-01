@@ -72,6 +72,13 @@ func (r *Reconciler) collectInventory(
 		inventory.retentionsReportedByBackend,
 		inventory.retentionStorageIdentities,
 		inventory.retentionCollected = r.fetchAllRetentions(ctx, sweep)
+	// A sweep canceled while reading is Fred's own interruption, not silence
+	// from the backends it did not finish reading. Abandon it before disposing
+	// any response: rejecting a half-read reporter would widen the recovery
+	// its interrupted marker needs from that reporter to the whole topology.
+	if err := ctx.Err(); err != nil {
+		return reconcileInventory{}, err
+	}
 	configuredBackends, err := r.coordinator.BackendNames()
 	if err != nil {
 		return reconcileInventory{}, fmt.Errorf("enumerate configured backends: %w", err)
@@ -110,9 +117,8 @@ func (r *Reconciler) collectInventory(
 		}
 		inventory.rejectBackend(backendName)
 	}
-	// A sweep canceled while reading is Fred's own interruption, not silence
-	// from the backends it did not finish reading. Abandon it unsealed, so it
-	// records no outcome and commits no projection.
+	// Cancellation can still arrive during disposal. Abandon unsealed, so the
+	// sweep records no outcome and commits no projection.
 	if err := ctx.Err(); err != nil {
 		return reconcileInventory{}, err
 	}

@@ -1009,6 +1009,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A sweep canceled at shutdown between its provision and retention reads no
+  longer widens the recovery its interrupted marker needs. It is abandoned
+  before any response is disposed, so after the restart only the backends that
+  reported a positive must answer again, not every backend.
 - Backup guidance no longer calls a lost `payloads.db` low-risk. Tenants can
   re-upload only a PENDING lease's original manifest, so without the file an
   ACTIVE lease cannot be re-provisioned and an in-flight attempt cannot be

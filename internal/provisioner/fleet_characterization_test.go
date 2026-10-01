@@ -1127,6 +1127,31 @@ func TestFleet_CanceledSweepRecordsNoBackendOutcome(t *testing.T) {
 		"a canceled sweep commits nothing")
 }
 
+// A shutdown that cancels a sweep between its two inventory reads must not
+// widen what the interrupted marker needs: only the backend that reported a
+// positive has to answer again, not every backend.
+func TestFleet_CanceledSweepKeepsRecoveryNarrow(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+	f.addLease("lease-narrow", billingtypes.LEASE_STATE_ACTIVE)
+	f.backendAt(1).seedProvision(t, "lease-narrow", f.providerUUID, backend.ProvisionStatusReady)
+	require.NoError(t, f.sweep())
+
+	f.backendAt(2).setFault(faultHang)
+	ctx, cancel := context.WithCancel(f.t.Context())
+	defer cancel()
+	stop := time.AfterFunc(200*time.Millisecond, cancel)
+	defer stop.Stop()
+	require.ErrorIs(t, f.reconciler.ReconcileAll(ctx), context.Canceled)
+	require.Equal(t, placement.InventoryRecoveryPending, f.placement.InventoryReadiness())
+
+	f.backendAt(2).setFault(faultNone)
+	f.backendAt(3).setFault(faultHTTP500)
+	require.NoError(t, f.sweep())
+	assert.Equal(t, placement.InventoryReady, f.placement.InventoryReadiness(),
+		"backend-1 was the only reporter; backend-3's silence cannot hold recovery")
+}
+
 // Tenant failures must stop tenant requests without suppressing the inventory
 // needed to observe recovery. A successful recovery sweep is not permission to
 // reset the independent tenant breaker or dispatch a tenant request through it.
