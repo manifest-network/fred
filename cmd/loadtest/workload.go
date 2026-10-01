@@ -298,6 +298,10 @@ func recordedCallbackFactory(origin, secret string, callbacks []callbackFixture)
 		return nil, errors.New("recorded callbacks require a callback-secret of at least 32 bytes")
 	}
 	proofVerifier, _ := hmacauth.NewCallbackProofBoundary()
+	keys, err := hmacauth.NewVerifyKeys(secret, "")
+	if err != nil {
+		return nil, fmt.Errorf("recorded callback key: %w", err)
+	}
 	for _, fixture := range callbacks {
 		parsed, err := url.ParseRequestURI(fixture.RequestURI)
 		if err != nil || parsed.IsAbs() || parsed.Host != "" || !strings.HasPrefix(fixture.RequestURI, "/") || strings.HasPrefix(fixture.RequestURI, "//") {
@@ -307,7 +311,10 @@ func recordedCallbackFactory(origin, secret string, callbacks []callbackFixture)
 		if err != nil {
 			return nil, fmt.Errorf("callback fixture: %w", err)
 		}
-		verifier, err := api.NewCallbackKeyringAuthenticator(map[backendidentity.ID]string{storageID: secret}, proofVerifier)
+		verifier, err := api.NewCallbackKeyringAuthenticator(
+			map[backendidentity.ID]api.CallbackKey{storageID: {Backend: "recorded-callback", Keys: keys}},
+			proofVerifier,
+		)
 		if err != nil {
 			return nil, err
 		}

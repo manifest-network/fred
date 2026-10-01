@@ -133,6 +133,27 @@ func (gate *Gate) latchPanicLocked(panicValue any) (error, bool) {
 	return gate.failure, true
 }
 
+// Hold excludes writers for a read-only section, such as beginning the read
+// transactions of an online snapshot. It refuses a withdrawn gate. Unlike Run,
+// an error from section never withdraws authority, and a panic is re-raised
+// after the gate is released without being latched: a read leaves no partial
+// write effects. section must not take the gate again (Error, Withdraw, Run)
+// and must stay short, because every writer waits for it.
+func (gate *Gate) Hold(section func() error) error {
+	if !gate.Valid() {
+		return ErrInvalidGate
+	}
+	if section == nil {
+		return errors.New("store authority read section is required")
+	}
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.failure != nil {
+		return gate.failure
+	}
+	return section()
+}
+
 // Withdraw publishes cause as the first terminal authority failure. If a Run
 // callback is active, Withdraw waits for its complete durability boundary; the
 // admitted write therefore finishes before withdrawal becomes visible.

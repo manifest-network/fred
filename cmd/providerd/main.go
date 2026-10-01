@@ -68,9 +68,10 @@ func demoteOnGrantSetupError(err error) bool {
 var version = "dev"
 
 var (
-	configFile     string
-	validateConfig bool
-	rootCmd        = &cobra.Command{
+	configFile      string
+	validateConfig  bool
+	printHMACKeyIDs bool
+	rootCmd         = &cobra.Command{
 		Use:   "providerd",
 		Short: "Manifest Provider Daemon",
 		Long:  `A daemon that watches for lease events, auto-acknowledges them, serves tenant authentication API, and periodically withdraws funds.`,
@@ -87,6 +88,8 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "path to config file")
 	rootCmd.PersistentFlags().BoolVar(&validateConfig, "validate-config", false,
 		"check the config file as startup would, without opening a store or touching the network, and exit")
+	rootCmd.PersistentFlags().BoolVar(&printHMACKeyIDs, "print-hmac-key-ids", false,
+		"print non-secret IDs of every backend's HMAC keys as JSON, without opening a store or touching the network, and exit")
 
 	// Configure SDK with manifest bech32 prefixes.
 	// Use sync.Once to prevent panic if config is already sealed by a dependency.
@@ -132,9 +135,15 @@ func run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if validateConfig && printHMACKeyIDs {
+		return errors.New("--validate-config and --print-hmac-key-ids are mutually exclusive")
+	}
 	if validateConfig {
 		_, err := fmt.Fprintf(cmd.OutOrStdout(), "providerd: config %q is valid\n", configFile)
 		return err
+	}
+	if printHMACKeyIDs {
+		return printBackendKeyIDs(cmd.OutOrStdout(), cfg)
 	}
 
 	// Set up structured logging with configured level
@@ -181,7 +190,7 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	defer placementStore.Close()
 	var (
-		callbackKeyring      map[backendidentity.ID]string
+		callbackKeyring      map[backendidentity.ID]api.CallbackKey
 		legacyCallbackSecret string
 	)
 	if cfg.CallbackSecret != "" {
@@ -190,7 +199,7 @@ func run(cmd *cobra.Command, args []string) error {
 		// verifier below.
 		legacyCallbackSecret = string(cfg.CallbackSecret)
 	} else {
-		callbackKeyring, err = callbackHMACSecrets(cfg, placementStore)
+		callbackKeyring, err = callbackKeys(cfg, placementStore)
 		if err != nil {
 			return fmt.Errorf("build backend callback HMAC keyring: %w", err)
 		}
@@ -371,6 +380,18 @@ func run(cmd *cobra.Command, args []string) error {
 		slog.Warn("payload store disabled (no payload_store_db_path configured)")
 	}
 
+	// Online snapshots copy both live stores. Opening the directory here refuses
+	// a misconfigured one before any chain work.
+	placementSnapshots, closePlacementSnapshots, err := newPlacementSnapshots(cfg, placementStore, payloadStore)
+	if err != nil {
+		return fmt.Errorf("failed to configure placement snapshots: %w", err)
+	}
+	defer func() {
+		if err := closePlacementSnapshots(); err != nil {
+			slog.Warn("failed to close placement snapshot directory", "error", err)
+		}
+	}()
+
 	// Create event broker for real-time lease event delivery
 	eventBroker := api.NewEventBroker()
 
@@ -474,7 +495,7 @@ func run(cmd *cobra.Command, args []string) error {
 		ShutdownTimeout:             cfg.ShutdownTimeout,
 		MaxRequestBodySize:          cfg.MaxRequestBodySize,
 		CallbackSecret:              legacyCallbackSecret,
-		CallbackHMACSecrets:         callbackKeyring,
+		CallbackKeys:                callbackKeyring,
 		CallbackCanonicalPathPrefix: cfg.CallbackCanonicalPathPrefix,
 		TokenTrackerDBPath:          cfg.TokenTrackerDBPath,
 		CallbackBaseURL:             cfg.CallbackBaseURL,
@@ -538,11 +559,15 @@ func run(cmd *cobra.Command, args []string) error {
 	// Each component is wrapped with panic recovery via safeGo() to prevent
 	// silent crashes and convert panics to errors.
 	var wg sync.WaitGroup
+	// The snapshot loop reads both live stores, so shutdown joins it on its own
+	// before they close, whatever the shutdown timeout did to wg.
+	var snapshotWG sync.WaitGroup
 	// Every long-lived component can report at most one terminal error. Keep
-	// room for all nine (including optional sub-signer maintenance) because the
-	// first error starts shutdown and no goroutine may block its WaitGroup.Done
-	// while trying to report another concurrent failure.
-	errChan := make(chan error, 9)
+	// room for all ten (including optional sub-signer maintenance and
+	// placement snapshots) because the first error starts shutdown and no
+	// goroutine may block its WaitGroup.Done while trying to report another
+	// concurrent failure.
+	errChan := make(chan error, 10)
 
 	// Start API server FIRST and wait for it to be listening.
 	// This is critical because startup reconciliation may trigger backend callbacks
@@ -615,6 +640,14 @@ func run(cmd *cobra.Command, args []string) error {
 		safeGo(&wg, errChan, "reconciler", func() error {
 			return reconciler.Start(workCtx)
 		})
+
+		// Start online placement snapshots after the startup reconcile, so the
+		// first one captures reconciled state.
+		if placementSnapshots != nil {
+			safeGo(&snapshotWG, errChan, "placement snapshots", func() error {
+				return placementSnapshots.Run(workCtx)
+			})
+		}
 
 		// Start periodic sub-signer maintenance (if multi-signer). Both halves are
 		// level-triggered: EnsureGrants and EnsureFunding each compare the desired
@@ -739,6 +772,16 @@ func run(cmd *cobra.Command, args []string) error {
 	case <-shutdownCtx.Done():
 		timedOut = true
 		slog.Warn("shutdown timed out, some components may not have stopped cleanly")
+	}
+
+	// Join the snapshot loop before the stores it reads close. Once workCtx is
+	// canceled its attempt stops at its next step. If an uninterruptible step
+	// (an fsync or a consistency check) outlasts the shutdown budget, closing
+	// the stores is still safe: bbolt's Close waits for every open read
+	// transaction, and a captured cut's transactions end within the copy
+	// deadline.
+	if !joinWithin(shutdownCtx, &snapshotWG) {
+		slog.Warn("placement snapshot loop still running at shutdown; closing the stores anyway")
 	}
 
 	// Always close provision manager to clean up Watermill router and payload store.

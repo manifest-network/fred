@@ -8,6 +8,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/callbackwire"
 )
 
@@ -64,12 +65,20 @@ type CallbackAuthenticator struct {
 	nowFunc func() time.Time
 }
 
-// CallbackKeyringAuthenticator verifies callbacks with the key assigned to the
+// CallbackKey is one backend's callback authentication: its configured name,
+// which labels metrics only after its key verified a callback, and the keys it
+// may sign with (its current key and, during a rotation, its previous key).
+type CallbackKey struct {
+	Backend string
+	Keys    hmacauth.VerifyKeys
+}
+
+// CallbackKeyringAuthenticator verifies callbacks with the keys assigned to the
 // immutable storage lineage named in the HMAC-covered payload. The map is copied
 // at construction so callers cannot rotate authority behind an in-flight
 // verification. Its zero value is invalid.
 type CallbackKeyringAuthenticator struct {
-	secrets             map[backendidentity.ID]string
+	keys                map[backendidentity.ID]CallbackKey
 	maxAge              time.Duration
 	canonicalPathPrefix string
 	nowFunc             func() time.Time
@@ -77,42 +86,137 @@ type CallbackKeyringAuthenticator struct {
 }
 
 // NewCallbackKeyringAuthenticator constructs the production callback verifier.
-// Identities and secrets must both be unique: accepting the same key for two
-// lineages would silently restore fleet-wide callback authority.
+// Identities, backend names and every key must be unique, keys compared by
+// HMAC equivalence: two lineages accepting a common key, even a previous key
+// during a rotation, would silently restore fleet-wide callback authority.
 func NewCallbackKeyringAuthenticator(
-	secrets map[backendidentity.ID]string,
+	keys map[backendidentity.ID]CallbackKey,
 	proofVerifier hmacauth.CallbackProofVerifier,
 ) (*CallbackKeyringAuthenticator, error) {
 	if !proofVerifier.Valid() {
 		return nil, fmt.Errorf("callback proof verifier is required")
 	}
-	if len(secrets) == 0 {
+	if len(keys) == 0 {
 		return nil, fmt.Errorf("callback HMAC keyring is required")
 	}
-	ownedSecrets := make(map[backendidentity.ID]string, len(secrets))
-	secretOwners := make(map[string]backendidentity.ID, len(secrets))
-	for storageID, secret := range secrets {
+	owned := make(map[backendidentity.ID]CallbackKey, len(keys))
+	names := make(map[string]backendidentity.ID, len(keys))
+	for storageID, key := range keys {
 		if !storageID.Valid() {
 			return nil, fmt.Errorf("callback HMAC keyring contains an invalid backend storage identity")
 		}
-		if err := validateCallbackSecret(secret); err != nil {
-			return nil, fmt.Errorf("callback HMAC key for storage %s: %w", storageID, err)
+		if key.Backend == "" {
+			return nil, fmt.Errorf("callback HMAC key for storage %s has no backend name", storageID)
 		}
-		if owner, duplicate := secretOwners[secret]; duplicate {
+		if !key.Keys.Valid() {
+			return nil, fmt.Errorf("callback HMAC key for storage %s is invalid", storageID)
+		}
+		if owner, duplicate := names[key.Backend]; duplicate {
 			return nil, fmt.Errorf(
-				"callback HMAC key for storage %s duplicates storage %s",
-				storageID, owner,
+				"callback backend %q is bound to storage %s and %s", key.Backend, owner, storageID,
 			)
 		}
-		ownedSecrets[storageID] = secret
-		secretOwners[secret] = storageID
+		for ownerID, other := range owned {
+			if key.Keys.SharesKeyWith(other.Keys) {
+				return nil, fmt.Errorf(
+					"callback HMAC key for storage %s duplicates storage %s", storageID, ownerID,
+				)
+			}
+		}
+		owned[storageID] = key
+		names[key.Backend] = storageID
+	}
+	for _, key := range owned {
+		metrics.APICallbackSignatureKeyTotal.WithLabelValues(key.Backend, metrics.CallbackKeySlotCurrent)
+		configured := 0.0
+		if key.Keys.HasRotation() {
+			metrics.APICallbackSignatureKeyTotal.WithLabelValues(key.Backend, metrics.CallbackKeySlotPrevious)
+			configured = 1
+		}
+		metrics.APICallbackPreviousKeyConfigured.WithLabelValues(key.Backend).Set(configured)
+	}
+	for _, failure := range callbackAuthFailures {
+		metrics.APICallbackAuthFailuresTotal.WithLabelValues(failure.label())
 	}
 	return &CallbackKeyringAuthenticator{
-		secrets:       ownedSecrets,
+		keys:          owned,
 		maxAge:        DefaultCallbackMaxAge,
 		nowFunc:       time.Now,
 		proofVerifier: proofVerifier,
 	}, nil
+}
+
+// callbackAuthFailure is the closed cause of a refused callback signature. The
+// zero value is invalid and never counted.
+type callbackAuthFailure uint8
+
+const (
+	callbackAuthFailureInvalid callbackAuthFailure = iota
+	callbackAuthFailureMissing
+	callbackAuthFailureFormat
+	callbackAuthFailureExpired
+	callbackAuthFailureFuture
+	callbackAuthFailureMismatch
+	callbackAuthFailureUnknownStorage
+)
+
+var callbackAuthFailures = [...]callbackAuthFailure{
+	callbackAuthFailureMissing,
+	callbackAuthFailureFormat,
+	callbackAuthFailureExpired,
+	callbackAuthFailureFuture,
+	callbackAuthFailureMismatch,
+	callbackAuthFailureUnknownStorage,
+}
+
+func (failure callbackAuthFailure) label() string {
+	switch failure {
+	case callbackAuthFailureMissing:
+		return metrics.CallbackAuthFailureMissing
+	case callbackAuthFailureFormat:
+		return metrics.CallbackAuthFailureFormat
+	case callbackAuthFailureExpired:
+		return metrics.CallbackAuthFailureExpired
+	case callbackAuthFailureFuture:
+		return metrics.CallbackAuthFailureFuture
+	case callbackAuthFailureMismatch:
+		return metrics.CallbackAuthFailureMismatch
+	case callbackAuthFailureUnknownStorage:
+		return metrics.CallbackAuthFailureUnknownStorage
+	default:
+		return ""
+	}
+}
+
+// callbackAuthFailureOf maps a verification failure to its counted cause; any
+// other error, such as an unavailable verifier, is not an authentication
+// failure and maps to the invalid zero value.
+func callbackAuthFailureOf(err error) callbackAuthFailure {
+	switch hmacauth.FailureReasonOf(err) {
+	case hmacauth.FailureFormat:
+		return callbackAuthFailureFormat
+	case hmacauth.FailureExpired:
+		return callbackAuthFailureExpired
+	case hmacauth.FailureFuture:
+		return callbackAuthFailureFuture
+	case hmacauth.FailureMismatch:
+		return callbackAuthFailureMismatch
+	default:
+		return callbackAuthFailureInvalid
+	}
+}
+
+func (failure callbackAuthFailure) count() {
+	if label := failure.label(); label != "" {
+		metrics.APICallbackAuthFailuresTotal.WithLabelValues(label).Inc()
+	}
+}
+
+func callbackKeySlotLabel(slot hmacauth.KeySlot) string {
+	if slot == hmacauth.KeySlotRotation {
+		return metrics.CallbackKeySlotPrevious
+	}
+	return metrics.CallbackKeySlotCurrent
 }
 
 // WithCanonicalPathPrefix applies the same reverse-proxy canonicalization
@@ -235,11 +339,12 @@ func (a *CallbackAuthenticator) VerifyCallbackEvidence(
 func (a *CallbackKeyringAuthenticator) VerifyCallbackEvidence(
 	r *http.Request,
 ) (hmacauth.VerifiedRequest, error) {
-	if a == nil || len(a.secrets) == 0 || a.nowFunc == nil || !a.proofVerifier.Valid() {
+	if a == nil || len(a.keys) == 0 || a.nowFunc == nil || !a.proofVerifier.Valid() {
 		return hmacauth.VerifiedRequest{}, fmt.Errorf("callback HMAC keyring is unavailable")
 	}
 	signature := r.Header.Get(CallbackSignatureHeader)
 	if signature == "" {
+		callbackAuthFailureMissing.count()
 		return hmacauth.VerifiedRequest{}, fmt.Errorf("missing %s header", CallbackSignatureHeader)
 	}
 	body, err := callbackwire.ReadEnvelope(r.Body)
@@ -250,20 +355,23 @@ func (a *CallbackKeyringAuthenticator) VerifyCallbackEvidence(
 	if err != nil {
 		return hmacauth.VerifiedRequest{}, fmt.Errorf("%w: %w", errInvalidCallbackPayload, err)
 	}
-	secret, exists := a.secrets[storageID]
+	key, exists := a.keys[storageID]
 	if !exists {
+		callbackAuthFailureUnknownStorage.count()
 		return hmacauth.VerifiedRequest{}, fmt.Errorf("callback backend storage identity is not configured")
 	}
 	uri := a.canonicalPathPrefix + r.URL.RequestURI()
-	proof, err := a.proofVerifier.VerifyRoutedWithTime(
-		secret, r.Method, uri, body, signature,
+	proof, slot, err := a.proofVerifier.VerifyRoutedKeysWithTime(
+		key.Keys, r.Method, uri, body, signature,
 		storageID.String(),
 		a.canonicalPathPrefix+"/callbacks/provision",
 		a.maxAge, callbackClockSkewTolerance, a.nowFunc(),
 	)
 	if err != nil {
+		callbackAuthFailureOf(err).count()
 		return hmacauth.VerifiedRequest{}, err
 	}
+	metrics.APICallbackSignatureKeyTotal.WithLabelValues(key.Backend, callbackKeySlotLabel(slot)).Inc()
 	return proof, nil
 }
 

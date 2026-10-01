@@ -91,7 +91,7 @@ func testLifecyclePendingServerAndClient(t *testing.T, pending error) {
 			}
 			identity, err := backendidentity.Parse("a8ff9194-0f55-4a31-854e-5f63b236ef3b")
 			require.NoError(t, err)
-			server, err := NewIdentityBoundServer(mock, testSecret, slog.Default(), docker.DefaultMaxRequestBodySize, identity)
+			server, err := NewIdentityBoundServer(mock, testRequestKeys, slog.Default(), docker.DefaultMaxRequestBodySize, identity)
 			require.NoError(t, err)
 			httpServer := httptest.NewServer(server.Handler())
 			defer httpServer.Close()

@@ -332,6 +332,70 @@ var (
 		Help:      "1 only while a complete full-fleet inventory is durably projected and no newer sweep has invalidated authority; 0 during startup, an in-progress sweep, or any incomplete or failed read or projection",
 	})
 
+	// ReconcilerBackendInventoryTotal counts, once per configured backend per
+	// sealed sweep, how that backend's paired inventory evidence was disposed.
+	// "authoritative" and "partial" answered both inventories with the pinned
+	// storage identity ("partial" kept some of its leases conservative);
+	// "untrusted" answered both but failed the identity or refresh checks;
+	// "provisions_only" and "retentions_only" answered one endpoint;
+	// "unanswered" answered neither. Unlike backend_fetch_total, which counts
+	// provision-list attempts, this covers both endpoints and identity. Alert on
+	// a backend sustaining anything other than authoritative.
+	ReconcilerBackendInventoryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "reconciler",
+		Name:      "backend_inventory_total",
+		Help:      "Per-backend inventory evidence in each sealed reconciliation sweep, by disposition",
+	}, []string{"backend", "outcome"})
+
+	// ReconcilerBackendInventoryAnswered is 1 when the backend answered both
+	// inventories with its pinned storage identity in the latest sealed sweep,
+	// and 0 otherwise. Every configured backend is rewritten at each seal. Read
+	// it only while fred_reconciler_sweep_projection_committed is 1, which
+	// proves the values belong to the sweep whose projection committed.
+	ReconcilerBackendInventoryAnswered = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "reconciler",
+		Name:      "backend_inventory_answered",
+		Help:      "1 if the backend answered both inventories with its pinned storage identity in the latest sealed sweep, 0 otherwise",
+	}, []string{"backend"})
+
+	// ReconcilerSweepProjectionCommitted is 0 from the start of every sweep
+	// until that sweep's placement projection commits durably, and 1 after,
+	// even when some backends did not answer. With
+	// fred_reconciler_backend_inventory_answered it lets a readiness gate
+	// tolerate one known-down backend, which fred_reconciler_sweep_complete
+	// cannot: that gauge stays 0 fleet-wide while any backend is down.
+	ReconcilerSweepProjectionCommitted = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "reconciler",
+		Name:      "sweep_projection_committed",
+		Help:      "1 once the current sweep's placement projection committed durably, even with unanswered backends; 0 from the start of every sweep until then",
+	})
+
+	// PlacementSnapshotsTotal counts online snapshot attempts of placements.db
+	// and payloads.db, exactly once per attempt. Its series exist only while
+	// snapshots are configured, so `increase(...{outcome="success"}[2h]) == 0`
+	// is a heartbeat that cannot fire on a provider that never enabled them.
+	// Deliberately not paired with a last-success timestamp gauge.
+	PlacementSnapshotsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "placement",
+		Name:      "snapshots_total",
+		Help:      "Online snapshot attempts of placements.db and payloads.db by outcome (success, error, insufficient_space)",
+	}, []string{"outcome"})
+
+	// PlacementSnapshotPruneFailuresTotal counts snapshot files pruning kept
+	// because it could not prove they were safe to delete, or failed to delete.
+	// Separate from PlacementSnapshotsTotal so a pruning problem never reads as
+	// a missing snapshot.
+	PlacementSnapshotPruneFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "placement",
+		Name:      "snapshot_prune_failures_total",
+		Help:      "Snapshot files pruning kept or failed to delete, by reason",
+	}, []string{"reason"})
+
 	// ReconcilerCleanupSkipsTotal counts destructive cleanup actions the
 	// reconciler declined to take because it lacked positive evidence (ENG-654).
 	//
@@ -531,6 +595,39 @@ var (
 		Name:      "maintenance_legacy_key_total",
 		Help:      "Restart/update requests accepted without Idempotency-Key, each keyed by its single-use signed token",
 	})
+
+	// APICallbackSignatureKeyTotal counts callbacks verified, by the backend
+	// whose key verified them and the key slot: "current" (the key providerd
+	// also signs with) or "previous" (hmac_secret_previous during a rotation).
+	// The backend label is the configured name bound to the verifying key,
+	// never a value taken from the callback. Before dropping a previous key,
+	// confirm "previous" stopped increasing while "current" still does.
+	APICallbackSignatureKeyTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "api",
+		Name:      "callback_signature_key_total",
+		Help:      "Backend callbacks verified, by backend and by key slot (current or previous)",
+	}, []string{"backend", "slot"})
+
+	// APICallbackAuthFailuresTotal counts callbacks refused at signature
+	// verification, by closed reason. It carries no backend label: before
+	// verification the backend is only an unauthenticated claim.
+	APICallbackAuthFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "api",
+		Name:      "callback_auth_failures_total",
+		Help:      "Backend callbacks refused at signature verification, by reason",
+	}, []string{"reason"})
+
+	// APICallbackPreviousKeyConfigured is 1 while a backend has
+	// hmac_secret_previous configured. A previous key keeps the old key valid,
+	// so alert when this stays 1 after a rotation should have finished.
+	APICallbackPreviousKeyConfigured = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "api",
+		Name:      "callback_previous_key_configured",
+		Help:      "1 while the backend has a verify-only previous callback key configured, 0 otherwise",
+	}, []string{"backend"})
 
 	// APIRequestDuration tracks API request latency.
 	APIRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
@@ -875,12 +972,40 @@ const (
 	OutcomeDegraded = "degraded"
 )
 
+// Slot constants for the `slot` label on fred_api_callback_signature_key_total.
+const (
+	CallbackKeySlotCurrent  = "current"
+	CallbackKeySlotPrevious = "previous"
+)
+
+// Reason constants for the `reason` label on
+// fred_api_callback_auth_failures_total. The set is closed.
+const (
+	CallbackAuthFailureMissing        = "missing"
+	CallbackAuthFailureFormat         = "format"
+	CallbackAuthFailureExpired        = "expired"
+	CallbackAuthFailureFuture         = "future"
+	CallbackAuthFailureMismatch       = "mismatch"
+	CallbackAuthFailureUnknownStorage = "unknown_storage"
+)
+
 // Outcome constants for the `outcome` label on
 // fred_reconciler_backend_fetch_total.
 const (
 	FetchOutcomeOK          = "ok"
 	FetchOutcomeError       = "error"
 	FetchOutcomeCircuitOpen = "circuit_open"
+)
+
+// Outcome constants for the `outcome` label on
+// fred_reconciler_backend_inventory_total. The set is closed.
+const (
+	InventoryOutcomeAuthoritative  = "authoritative"
+	InventoryOutcomePartial        = "partial"
+	InventoryOutcomeUntrusted      = "untrusted"
+	InventoryOutcomeProvisionsOnly = "provisions_only"
+	InventoryOutcomeRetentionsOnly = "retentions_only"
+	InventoryOutcomeUnanswered     = "unanswered"
 )
 
 // Pass and reason constants for the `pass` / `reason` labels on

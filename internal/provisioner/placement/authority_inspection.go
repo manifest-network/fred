@@ -98,7 +98,11 @@ type AuthorityCounts struct {
 	LostPlacementRows       int `json:"lost_placement_rows"`
 	LifecycleRows           int `json:"lifecycle_rows"`
 	UnusableLifecycleRows   int `json:"unusable_lifecycle_rows"`
-	DetachedLifecycleRows   int `json:"detached_lifecycle_rows"`
+	// UnusableAdoptionCandidates counts quarantined lifecycle rows whose stored
+	// pair placement-repair -adopt-observed-generation would accept. The repair
+	// also needs live inventory to agree, so a candidate can still be refused.
+	UnusableAdoptionCandidates int `json:"unusable_adoption_candidates"`
+	DetachedLifecycleRows      int `json:"detached_lifecycle_rows"`
 }
 
 // AuthorityDiagnostic is a fixed, non-secret explanation of an unsafe
@@ -1058,6 +1062,14 @@ func inspectAuthorityLifecycleBindingForPlacement(
 	}
 	if capability.unusable {
 		row.LifecycleVerdict = "unusable"
+		if adoptableQuarantine(
+			placement, capability, placement.Backend, assessment.report.ExpectedProviderUUID,
+		) == nil {
+			// The rows themselves explain nothing: the backend most likely moved
+			// past the stored generation, as after a restore from an older copy.
+			row.LifecycleVerdict = "unusable_adoption_candidate"
+			assessment.report.Counts.UnusableAdoptionCandidates++
+		}
 		return
 	}
 	if !lifecycleBindingMatches(placement, capability) {
@@ -1322,23 +1334,7 @@ func lifecycleBindingMatches(
 	placement Placement,
 	capability lifecycleCapability,
 ) bool {
-	if placement.Backend != "" && capability.backend != placement.Backend {
-		return false
-	}
-	if placement.Attempt == "" {
-		if capability.attemptBackend != "" {
-			return false
-		}
-		if placement.attemptOperationID.Valid() {
-			wantID, err := lifecycleIDForOperation(placement.attemptOperationID)
-			return err == nil && capability.backend == placement.Backend &&
-				capability.id == wantID && !capability.retired
-		}
-		return true
-	}
-	wantID, err := lifecycleIDForOperation(placement.attemptOperationID)
-	return err == nil && capability.attemptBackend == placement.Attempt &&
-		capability.attemptID == wantID
+	return lifecycleBindingProblem(placement, capability) == ""
 }
 
 func placementBackendNames(placement Placement) []string {

@@ -1187,7 +1187,8 @@ func OpenStore(dbPath, providerUUID string, opts ...Option) (*Store, error) {
 	}
 
 	db, err := bolt.Open(dbPath, 0o600, &bolt.Options{
-		Timeout: 5 * time.Second,
+		Timeout:         5 * time.Second,
+		InitialMmapSize: liveStoreInitialMmapSize,
 		OpenFile: func(name string, flag int, mode os.FileMode) (*os.File, error) {
 			// #nosec G304 -- dbPath is an absolute clean operator-supplied path;
 			// the database is opened without create and checked against the inode

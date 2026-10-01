@@ -42,6 +42,14 @@ func ParseLogLevel(s string) (slog.Level, error) {
 // Default values for configuration.
 const (
 	DefaultMaxRequestBodySize int64 = 1 << 20 // 1MB
+
+	// MinPlacementSnapshotInterval is the shortest placement_snapshot_interval:
+	// every snapshot briefly holds the placement write gate and copies both
+	// databases.
+	MinPlacementSnapshotInterval = 5 * time.Minute
+	// MaxPlacementSnapshotRetain bounds placement_snapshot_retain, and so the
+	// snapshot directory listing each pruning pass reads.
+	MaxPlacementSnapshotRetain = 1000
 )
 
 // Config holds all configuration for the provider daemon.
@@ -148,6 +156,12 @@ type Config struct {
 	// providerd always operates against a multi-backend placement pool.
 	PlacementStoreDBPath string `mapstructure:"placement_store_db_path"`
 
+	// Online snapshots of placements.db and payloads.db. An empty directory
+	// disables them; enabling them requires payload_store_db_path.
+	PlacementSnapshotDir      string        `mapstructure:"placement_snapshot_dir"`
+	PlacementSnapshotInterval time.Duration `mapstructure:"placement_snapshot_interval"`
+	PlacementSnapshotRetain   int           `mapstructure:"placement_snapshot_retain"`
+
 	// Shutdown configuration
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
 
@@ -168,6 +182,11 @@ type BackendConfig struct {
 	// callbacks for another node. CallbackSecret remains a non-production legacy
 	// fallback for isolated development and tests.
 	HMACSecret Secret `mapstructure:"hmac_secret"`
+	// HMACSecretPrevious is a verify-only key accepted on this backend's
+	// callbacks during a key rotation, while the backend still signs with its
+	// previous key. providerd never signs with it. See DEPLOYMENT.md, "Rotating
+	// a backend's HMAC key".
+	HMACSecretPrevious RotationSecret `mapstructure:"hmac_secret_previous"`
 
 	// TLS for the providerd -> backend hop (ENG-103). Empty fields fall back to
 	// Go defaults (system root CAs, no client certificate).
@@ -197,6 +216,26 @@ func (c *Config) ResolveBackendHMACSecret(backendName string) (Secret, error) {
 		return "", fmt.Errorf("backend %q has no HMAC secret", backendName)
 	}
 	return "", fmt.Errorf("backend %q is not configured", backendName)
+}
+
+// BackendCallbackKeys returns the keys accepted on one backend's callbacks: its
+// hmac_secret, which providerd also signs with, and its verify-only
+// hmac_secret_previous during a rotation. Only per-backend mode has callback
+// keys; the legacy shared callback_secret is not a keyring.
+func (c *Config) BackendCallbackKeys(backendName string) (hmacauth.VerifyKeys, error) {
+	if c == nil {
+		return hmacauth.VerifyKeys{}, fmt.Errorf("provider config is required")
+	}
+	for _, candidate := range c.Backends {
+		if candidate.Name != backendName {
+			continue
+		}
+		if candidate.HMACSecret == "" {
+			return hmacauth.VerifyKeys{}, fmt.Errorf("backend %q has no per-backend HMAC secret", backendName)
+		}
+		return hmacauth.NewVerifyKeys(string(candidate.HMACSecret), string(candidate.HMACSecretPrevious))
+	}
+	return hmacauth.VerifyKeys{}, fmt.Errorf("backend %q is not configured", backendName)
 }
 
 // TLSEnabled returns true if TLS is configured.
@@ -271,6 +310,12 @@ func Load(configPath string) (*Config, error) {
 
 	// Reconciliation defaults
 	v.SetDefault("reconciliation_interval", "5m")
+
+	// Placement snapshot defaults. The directory default is empty (disabled)
+	// but declared so PROVIDER_PLACEMENT_SNAPSHOT_DIR can set it.
+	v.SetDefault("placement_snapshot_dir", "")
+	v.SetDefault("placement_snapshot_interval", "1h")
+	v.SetDefault("placement_snapshot_retain", 24)
 
 	// Shutdown defaults
 	v.SetDefault("shutdown_timeout", "30s")
@@ -578,9 +623,27 @@ func (c *Config) Validate() error {
 	// all-or-nothing compatibility mode for non-production tests and development;
 	// accepting a partial or mixed fleet would silently recreate the cross-backend
 	// trust domain this boundary is intended to remove.
+	// Keys are compared by HMAC equivalence, not string equality: a key and its
+	// zero-padded copy authenticate the same messages. A previous key counts
+	// too, so no two backends ever accept a common key during a rotation.
 	perBackendSecrets := 0
-	seenHMACSecrets := make(map[string]int, len(c.Backends))
+	type configuredKey struct {
+		field string
+		key   string
+	}
+	var seenKeys []configuredKey
 	for i, configuredBackend := range c.Backends {
+		if configuredBackend.HMACSecretPrevious != "" {
+			if configuredBackend.HMACSecret == "" {
+				return fmt.Errorf("backends[%d].hmac_secret_previous requires hmac_secret on the same backend", i)
+			}
+			if len(configuredBackend.HMACSecretPrevious) < hmacauth.MinSecretLength {
+				return fmt.Errorf(
+					"backends[%d].hmac_secret_previous must be at least %d bytes",
+					i, hmacauth.MinSecretLength,
+				)
+			}
+		}
 		if configuredBackend.HMACSecret == "" {
 			continue
 		}
@@ -591,14 +654,24 @@ func (c *Config) Validate() error {
 				i, hmacauth.MinSecretLength,
 			)
 		}
-		secret := string(configuredBackend.HMACSecret)
-		if previous, duplicate := seenHMACSecrets[secret]; duplicate {
-			return fmt.Errorf(
-				"backends[%d].hmac_secret duplicates backends[%d].hmac_secret",
-				i, previous,
-			)
+		candidates := []configuredKey{{
+			field: fmt.Sprintf("backends[%d].hmac_secret", i),
+			key:   string(configuredBackend.HMACSecret),
+		}}
+		if configuredBackend.HMACSecretPrevious != "" {
+			candidates = append(candidates, configuredKey{
+				field: fmt.Sprintf("backends[%d].hmac_secret_previous", i),
+				key:   string(configuredBackend.HMACSecretPrevious),
+			})
 		}
-		seenHMACSecrets[secret] = i
+		for _, candidate := range candidates {
+			for _, seen := range seenKeys {
+				if hmacauth.Equivalent(candidate.key, seen.key) {
+					return fmt.Errorf("%s duplicates %s", candidate.field, seen.field)
+				}
+			}
+			seenKeys = append(seenKeys, candidate)
+		}
 	}
 	switch {
 	case perBackendSecrets == 0:
@@ -699,6 +772,36 @@ func (c *Config) Validate() error {
 		)
 	}
 
+	return c.validatePlacementSnapshots()
+}
+
+// validatePlacementSnapshots checks the snapshot settings only when snapshots
+// are enabled. Runtime checks the directory's ownership, permissions, and
+// physical identity when providerd opens it.
+func (c *Config) validatePlacementSnapshots() error {
+	dir := c.PlacementSnapshotDir
+	if dir == "" {
+		return nil
+	}
+	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
+		return fmt.Errorf("placement_snapshot_dir must be an absolute, clean path: %q", dir)
+	}
+	if c.PayloadStoreDBPath == "" {
+		return fmt.Errorf("placement_snapshot_dir requires payload_store_db_path: a snapshot copies placements.db and payloads.db together")
+	}
+	for _, live := range []string{c.PlacementStoreDBPath, c.PayloadStoreDBPath} {
+		if dir == filepath.Dir(live) {
+			return fmt.Errorf("placement_snapshot_dir must not be the directory of a live database: %q", dir)
+		}
+	}
+	if c.PlacementSnapshotInterval < MinPlacementSnapshotInterval {
+		return fmt.Errorf("placement_snapshot_interval must be at least %s, got %s",
+			MinPlacementSnapshotInterval, c.PlacementSnapshotInterval)
+	}
+	if c.PlacementSnapshotRetain < 1 || c.PlacementSnapshotRetain > MaxPlacementSnapshotRetain {
+		return fmt.Errorf("placement_snapshot_retain must be between 1 and %d, got %d",
+			MaxPlacementSnapshotRetain, c.PlacementSnapshotRetain)
+	}
 	return nil
 }
 

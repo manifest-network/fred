@@ -178,6 +178,9 @@ func NewReconciler(
 		interval, maxWorkers,
 	)
 	reconciler.placementSweepSeen.Store(reconciliation.AdmissionReady())
+	if backendNames, err := reconciliation.BackendNames(); err == nil {
+		initializeBackendInventoryMetrics(backendNames)
+	}
 	return reconciler, nil
 }
 
@@ -242,6 +245,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// separately persisted topology baseline remains valid through a transient
 	// backend outage.
 	metrics.ReconcilerSweepComplete.Set(0)
+	// Reset before the seal rewrites the per-backend answered gauges, so a gate
+	// reading both never pairs this sweep's answers with an older commit.
+	metrics.ReconcilerSweepProjectionCommitted.Set(0)
 
 	// Chain reads carry no backend ownership evidence. Finish them before
 	// registering the durable inventory marker so a transient chain failure
@@ -305,6 +311,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	})
 	if err != nil {
 		return err
+	}
+	if projection.projected != nil {
+		metrics.ReconcilerSweepProjectionCommitted.Set(1)
 	}
 	placementSyncOK := projection.syncOK
 	placementRecords := projection.records

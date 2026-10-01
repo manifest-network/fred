@@ -145,6 +145,7 @@ Images are validated before pull. The registry is extracted from the image refer
 | Field | YAML Key | Type | Default | Description |
 |---|---|---|---|---|
 | CallbackSecret | `callback_secret` | string | *(required, min 32 bytes)* | Bidirectional HMAC-SHA256 key; must match this backend's providerd `backends[].hmac_secret` and be unique across backends |
+| CallbackSecretNext | `callback_secret_next` | string | *(empty)* | Verify-only key accepted on providerd requests during a key rotation; never signs. At least 32 bytes and distinct from `callback_secret` by HMAC equivalence |
 | CallbackInsecureSkipVerify | `callback_insecure_skip_verify` | bool | `false` | Skip TLS verification for callbacks (dev only) |
 | CallbackDBPath | `callback_db_path` | string | `"callbacks.db"` | Path to the identity-bound bbolt operation-state, maintenance-intent, non-expiring close-finalizer, and callback-outbox journals; back it up with `releases.db`, `retention.db`, both storage-identity markers, and the matching substrate |
 | CallbackMaxAge | `callback_max_age` | duration | `24h` | Maximum age of typed lifecycle observations; Pending and terminal operation rows, maintenance/close intents, and exact operation/maintenance completions never expire; pre-identity v0.13 callback rows must be drained before upgrade and are never runtime queue entries; must be positive |

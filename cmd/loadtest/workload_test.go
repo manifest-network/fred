@@ -119,11 +119,15 @@ func TestAuthenticatedFixturesReachRealAPI(t *testing.T) {
 	address := listener.Addr().String()
 	require.NoError(t, listener.Close())
 	proofVerifier, _ := hmacauth.NewCallbackProofBoundary()
+	callbackKeys, err := hmacauth.NewVerifyKeys(secret, "")
+	require.NoError(t, err)
 	server, err := api.NewServer(api.ServerConfig{
 		Addr: address, ProviderUUID: providerID, Bech32Prefix: "manifest",
 		RateLimitRPS: 100, RateLimitBurst: 100, MaxRequestBodySize: 1 << 20,
-		TokenTrackerDBPath:  filepath.Join(t.TempDir(), "tokens.db"),
-		CallbackHMACSecrets: map[backendidentity.ID]string{storageID: secret},
+		TokenTrackerDBPath: filepath.Join(t.TempDir(), "tokens.db"),
+		CallbackKeys: map[backendidentity.ID]api.CallbackKey{
+			storageID: {Backend: "loadtest", Keys: callbackKeys},
+		},
 	}, api.ServerDeps{ChainClient: fixtureChain{leaseID: lease}, BackendRouter: router,
 		PayloadPublisher: publisher, CallbackPublisher: publisher, CallbackProofVerifier: proofVerifier})
 	require.NoError(t, err)

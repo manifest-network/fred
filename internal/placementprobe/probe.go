@@ -38,6 +38,10 @@ var (
 	// operator-selected conflict owner exactly once while reporting the target
 	// absent from every other configured backend.
 	ErrConflictOwnerEvidence = errors.New("inventory does not prove exactly one selected conflict owner")
+
+	// ErrGenerationOwnerEvidence means complete inventory did not report the
+	// lease exactly once, as an active provision on its confirmed backend.
+	ErrGenerationOwnerEvidence = errors.New("inventory does not prove the lease backend is its sole active owner")
 )
 
 // Client is the narrow backend inventory port used by offline placement tools.
@@ -72,6 +76,13 @@ type ConflictRepairCandidate interface {
 	LeaseUUID() string
 	SelectedBackend() string
 	CandidateBackends() []string
+}
+
+// GenerationAdoptionCandidate is the narrow read-only view of a placement-owned
+// lifecycle quarantine needed by the live inventory adapter.
+type GenerationAdoptionCandidate interface {
+	LeaseUUID() string
+	Backend() string
 }
 
 // NewClients constructs inventory clients with the exact HMAC, timeout, and
@@ -437,6 +448,103 @@ func RequireConflictRepairEvidence(
 		)
 	}
 
+	view := observeTarget(configuredBackends, inventories, target)
+	problems := view.problems
+	candidates := candidate.CandidateBackends()
+	canonicalCandidates := slices.Clone(candidates)
+	slices.Sort(canonicalCandidates)
+	canonicalCandidates = slices.Compact(canonicalCandidates)
+	if len(candidates) < 2 || !slices.Equal(candidates, canonicalCandidates) {
+		problems = append(problems, "durable conflict candidate set is incomplete or non-canonical")
+	}
+	if !slices.Contains(candidates, selected) {
+		problems = append(problems, fmt.Sprintf(
+			"selected backend %q is not a durable conflict candidate", selected,
+		))
+	}
+	for _, backendName := range candidates {
+		if _, ok := view.configured[backendName]; !ok {
+			problems = append(problems, fmt.Sprintf(
+				"durable conflict candidate %q is outside the configured fleet", backendName,
+			))
+		}
+	}
+	if len(problems) != 0 {
+		return placement.RepairInventorySnapshot{}, incompleteInventory(problems)
+	}
+	if len(view.positives) != 1 || view.positives[0].backendName != selected {
+		return placement.RepairInventorySnapshot{}, fmt.Errorf(
+			"%w: lease %q selected backend %q; positive locations=%v",
+			ErrConflictOwnerEvidence, target, selected, positiveLocations(view.positives),
+		)
+	}
+	return repairInventorySnapshot(configuredBackends, inventories)
+}
+
+// RequireGenerationAdoptionEvidence accepts only a complete structurally valid
+// inventory in which the target is reported exactly once, as an active
+// provision on the lease's confirmed backend, and by no other configured
+// backend. Placement checks the reported generation itself.
+func RequireGenerationAdoptionEvidence(
+	configuredBackends []string,
+	inventories map[string]Inventory,
+	candidate GenerationAdoptionCandidate,
+) (placement.RepairInventorySnapshot, error) {
+	if util.IsNilInterface(candidate) {
+		return placement.RepairInventorySnapshot{}, fmt.Errorf(
+			"%w: generation adoption candidate is required", ErrIncompleteInventory,
+		)
+	}
+	target := candidate.LeaseUUID()
+	owner := candidate.Backend()
+	if !canonicalLeaseUUID(target) {
+		return placement.RepairInventorySnapshot{}, fmt.Errorf(
+			"%w: target lease identity %q is not a canonical UUID",
+			ErrIncompleteInventory, target,
+		)
+	}
+	view := observeTarget(configuredBackends, inventories, target)
+	problems := view.problems
+	if _, ok := view.configured[owner]; !ok {
+		problems = append(problems, fmt.Sprintf(
+			"lease backend %q is outside the configured fleet", owner,
+		))
+	}
+	if len(problems) != 0 {
+		return placement.RepairInventorySnapshot{}, incompleteInventory(problems)
+	}
+	if len(view.positives) != 1 || view.positives[0].backendName != owner ||
+		view.positives[0].retention {
+		return placement.RepairInventorySnapshot{}, fmt.Errorf(
+			"%w: lease %q backend %q; positive locations=%v",
+			ErrGenerationOwnerEvidence, target, owner, positiveLocations(view.positives),
+		)
+	}
+	return repairInventorySnapshot(configuredBackends, inventories)
+}
+
+// positiveObservation is one backend's positive report of the target lease.
+type positiveObservation struct {
+	backendName string
+	provision   *backend.ProvisionInfo
+	retention   bool
+}
+
+// targetObservation is one complete inventory's account of one lease: every
+// structural problem, the configured fleet, and each positive report.
+type targetObservation struct {
+	configured map[string]struct{}
+	problems   []string
+	positives  []positiveObservation
+}
+
+// observeTarget validates the whole inventory against the configured fleet and
+// collects every positive report of target, whether active or retained.
+func observeTarget(
+	configuredBackends []string,
+	inventories map[string]Inventory,
+	target string,
+) targetObservation {
 	configured := make(map[string]struct{}, len(configuredBackends))
 	var problems []string
 	storageOwners := make(map[backendidentity.ID]string, len(inventories))
@@ -456,31 +564,6 @@ func RequireConflictRepairEvidence(
 				"configured backend %q has no complete inventory", backendName,
 			))
 		}
-	}
-	candidates := candidate.CandidateBackends()
-	canonicalCandidates := slices.Clone(candidates)
-	slices.Sort(canonicalCandidates)
-	canonicalCandidates = slices.Compact(canonicalCandidates)
-	if len(candidates) < 2 || !slices.Equal(candidates, canonicalCandidates) {
-		problems = append(problems, "durable conflict candidate set is incomplete or non-canonical")
-	}
-	if !slices.Contains(candidates, selected) {
-		problems = append(problems, fmt.Sprintf(
-			"selected backend %q is not a durable conflict candidate", selected,
-		))
-	}
-	for _, backendName := range candidates {
-		if _, ok := configured[backendName]; !ok {
-			problems = append(problems, fmt.Sprintf(
-				"durable conflict candidate %q is outside the configured fleet", backendName,
-			))
-		}
-	}
-
-	type positiveObservation struct {
-		backendName string
-		provision   *backend.ProvisionInfo
-		retention   bool
 	}
 	var positives []positiveObservation
 	for backendName, inventory := range inventories {
@@ -563,28 +646,25 @@ func RequireConflictRepairEvidence(
 			}
 		}
 	}
-	if len(problems) != 0 {
-		slices.Sort(problems)
-		return placement.RepairInventorySnapshot{}, fmt.Errorf(
-			"%w:\n- %s", ErrIncompleteInventory, strings.Join(problems, "\n- "),
-		)
-	}
-	if len(positives) != 1 || positives[0].backendName != selected {
-		locations := make([]string, 0, len(positives))
-		for _, positive := range positives {
-			kind := "provisions"
-			if positive.retention {
-				kind = "retentions"
-			}
-			locations = append(locations, positive.backendName+"/"+kind)
+	return targetObservation{configured: configured, problems: problems, positives: positives}
+}
+
+func incompleteInventory(problems []string) error {
+	slices.Sort(problems)
+	return fmt.Errorf("%w:\n- %s", ErrIncompleteInventory, strings.Join(problems, "\n- "))
+}
+
+func positiveLocations(positives []positiveObservation) []string {
+	locations := make([]string, 0, len(positives))
+	for _, positive := range positives {
+		kind := "provisions"
+		if positive.retention {
+			kind = "retentions"
 		}
-		slices.Sort(locations)
-		return placement.RepairInventorySnapshot{}, fmt.Errorf(
-			"%w: lease %q selected backend %q; positive locations=%v",
-			ErrConflictOwnerEvidence, target, selected, locations,
-		)
+		locations = append(locations, positive.backendName+"/"+kind)
 	}
-	return repairInventorySnapshot(configuredBackends, inventories)
+	slices.Sort(locations)
+	return locations
 }
 
 func repairInventorySnapshot(

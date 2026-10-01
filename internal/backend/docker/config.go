@@ -111,6 +111,11 @@ type Config struct {
 	// CallbackSecret is the HMAC secret for signing callbacks.
 	CallbackSecret config.Secret `yaml:"callback_secret"`
 
+	// CallbackSecretNext is a verify-only key accepted on providerd requests
+	// during a key rotation, before providerd switches to it. The backend
+	// never signs with it. See DEPLOYMENT.md, "Rotating a backend's HMAC key".
+	CallbackSecretNext config.RotationSecret `yaml:"callback_secret_next"`
+
 	// HostAddress is the external address for port mappings.
 	HostAddress string `yaml:"host_address"`
 
@@ -489,6 +494,16 @@ func DefaultConfig() Config {
 	}
 }
 
+// RequestKeys returns the keys accepted on providerd requests: callback_secret,
+// which the backend also signs callbacks with, and the verify-only
+// callback_secret_next during a rotation.
+func (c *Config) RequestKeys() (hmacauth.VerifyKeys, error) {
+	if c == nil {
+		return hmacauth.VerifyKeys{}, fmt.Errorf("docker backend config is required")
+	}
+	return hmacauth.NewVerifyKeys(string(c.CallbackSecret), string(c.CallbackSecretNext))
+}
+
 // Validate checks that the configuration is valid.
 func (c *Config) Validate() error {
 	if err := backendname.Validate(c.Name); err != nil {
@@ -585,6 +600,14 @@ func (c *Config) Validate() error {
 
 	if len(c.CallbackSecret) < hmacauth.MinSecretLength {
 		return fmt.Errorf("callback_secret must be at least %d characters", hmacauth.MinSecretLength)
+	}
+	if c.CallbackSecretNext != "" {
+		if len(c.CallbackSecretNext) < hmacauth.MinSecretLength {
+			return fmt.Errorf("callback_secret_next must be at least %d characters", hmacauth.MinSecretLength)
+		}
+		if hmacauth.Equivalent(string(c.CallbackSecret), string(c.CallbackSecretNext)) {
+			return fmt.Errorf("callback_secret_next must differ from callback_secret")
+		}
 	}
 
 	if c.HostAddress == "" {

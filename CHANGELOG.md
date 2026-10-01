@@ -8,6 +8,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `placement-repair -adopt-observed-generation -lease <uuid> -backend <name>`
+  repairs a lease left quarantined after a placement restore because its
+  backend re-provisioned it since the copy was taken. The backend must be the
+  lease's only owner in complete inventory, reporting a settled new generation
+  for the same tenant, and the stored rows must be consistent apart from the
+  quarantine. `-apply` requires `-backup`, `-confirm`, and
+  `-attest-generation`. `-classify` counts candidates in
+  `counts.unusable_adoption_candidates`, and `-list` marks each
+  `adoption_candidate`. See DEPLOYMENT.md, "Adopting a lifecycle generation
+  after a restore".
+- providerd can snapshot `placements.db` and `payloads.db` while it runs. Set
+  `placement_snapshot_dir` (with `placement_snapshot_interval`, default `1h`, and
+  `placement_snapshot_retain`, default 24 sets). Each set is one consistent pair
+  taken while placement writes pause for two transaction begins, with a manifest
+  of each file's size and SHA-256 written last. New metrics:
+  `fred_placement_snapshots_total{outcome}` and
+  `fred_placement_snapshot_prune_failures_total{reason}`. The restore procedure
+  is in DEPLOYMENT.md, "Online snapshots".
+- A backend's HMAC key can rotate without a coordinated stop. Each side accepts
+  one extra verify-only key during the rotation: `backends[].hmac_secret_previous`
+  in providerd and `callback_secret_next` in docker-backend
+  (`DOCKER_BACKEND_CALLBACK_SECRET_NEXT`). Neither is ever used to sign. The
+  four-step procedure is in DEPLOYMENT.md, "Rotating a backend's HMAC key".
+  `providerd --print-hmac-key-ids` and `docker-backend -print-hmac-key-ids`
+  print non-secret key IDs so operators can confirm both sides hold matching
+  keys before each restart. New metrics:
+  `fred_api_callback_signature_key_total{backend,slot}`,
+  `fred_api_callback_auth_failures_total{reason}`,
+  `fred_api_callback_previous_key_configured{backend}`,
+  `fred_docker_backend_request_signature_key_total{slot}`,
+  `fred_docker_backend_request_auth_failures_total{reason}` and
+  `fred_docker_backend_request_next_key_configured`. Key uniqueness is now
+  checked by HMAC equivalence across every current and previous key, so a key
+  with trailing zero bytes counts as the same key. Older binaries reject the
+  new YAML keys but ignore `DOCKER_BACKEND_CALLBACK_SECRET_NEXT`, so upgrade both
+  before the first rotation.
+- Per-backend reconciliation metrics for a readiness gate that tolerates a
+  known-down backend: `fred_reconciler_backend_inventory_total{backend,outcome}`
+  (`authoritative`, `partial`, `untrusted`, `provisions_only`, `retentions_only`,
+  `unanswered`), `fred_reconciler_backend_inventory_answered{backend}` and
+  `fred_reconciler_sweep_projection_committed`. `fred_reconciler_sweep_complete`
+  stays 0 fleet-wide while any backend is down; gate instead on
+  `sweep_projection_committed == 1` and `backend_inventory_answered == 1` for each
+  backend that must be up.
+- `fred_docker_backend_image_helpers_unsettled{reason}` counts the
+  image-inspection helpers left after each recovery pass: `unknown_create` (kept
+  in case the container appears late) and `cleanup_pending` (retried every pass).
+  On the containerd image store, either blocks image ingestion and image GC.
+  These were previously only logged.
 - `placement-repair -retire-lost-backend` retires a backend whose storage is
   irrecoverably lost, which was previously impossible: Fred refuses to drop a
   backend while leases refer to it, so such a backend stranded its leases
@@ -960,6 +1009,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Backup guidance no longer calls a lost `payloads.db` low-risk. Tenants can
+  re-upload only a PENDING lease's original manifest, so without the file an
+  ACTIVE lease cannot be re-provisioned and an in-flight attempt cannot be
+  re-sent. Back it up and restore it with `placements.db`, from the same moment.
+  The restore section now lists what restoring an older pair does to each lease.
 - One tenant could stop a whole docker-backend. A failed, effect-started
   update keeps a receipt that names its target release row, but release-history
   compaction protects only the newest and the latest active rows, so later

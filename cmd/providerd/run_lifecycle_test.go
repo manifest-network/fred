@@ -149,6 +149,8 @@ func TestRunLifecycleCancellationJoinsRealRuntime(t *testing.T) {
 			require.NoError(t, err)
 			apiAddress := apiListener.Addr().String()
 			require.NoError(t, apiListener.Close())
+			snapshotDir := filepath.Join(t.TempDir(), "snapshots")
+			require.NoError(t, os.Mkdir(snapshotDir, 0o700))
 			values := map[string]any{
 				"provider_uuid": cfg.ProviderUUID, "provider_address": address.String(),
 				"key_name": "provider", "keyring_backend": "test", "keyring_dir": keyDir,
@@ -156,9 +158,10 @@ func TestRunLifecycleCancellationJoinsRealRuntime(t *testing.T) {
 				"websocket_url":   "ws" + strings.TrimPrefix(wsServer.URL, "http"),
 				"api_listen_addr": apiAddress, "callback_base_url": "http://" + apiAddress,
 				"callback_secret": string(cfg.CallbackSecret), "placement_store_db_path": cfg.PlacementStoreDBPath,
-				"token_tracker_db_path": filepath.Join(t.TempDir(), "tokens.db"),
-				"payload_store_db_path": filepath.Join(t.TempDir(), "payloads.db"),
-				"shutdown_timeout":      "2s", "withdraw_interval": "1h", "reconciliation_interval": "1h",
+				"token_tracker_db_path":  filepath.Join(t.TempDir(), "tokens.db"),
+				"payload_store_db_path":  filepath.Join(t.TempDir(), "payloads.db"),
+				"placement_snapshot_dir": snapshotDir,
+				"shutdown_timeout":       "2s", "withdraw_interval": "1h", "reconciliation_interval": "1h",
 				"backends": []any{map[string]any{
 					"name": "backend-a", "url": backendServer.URL, "default": true,
 				}},

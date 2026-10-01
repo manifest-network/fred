@@ -417,7 +417,72 @@ Each production backend has its own bidirectional HMAC secret `K_i`, configured
 as that backend's `callback_secret` and the matching provider
 `backends[].hmac_secret`. Never reuse one backend's key for another: key
 separation prevents a compromised backend from authenticating requests or
-callbacks as a peer. Rotation requires a coordinated restart:
+callbacks as a peer. Keys are compared by HMAC equivalence, so a key with
+trailing zero bytes counts as the same key.
+
+### Rotating a backend's HMAC key
+
+Each side accepts one extra verify-only key, so one backend's key can rotate
+without stopping `providerd` and the backend together. `providerd` restarts
+twice, so expect two short API restarts; nothing needs draining. Signing always
+uses each side's main key. Upgrade both binaries before step 1. An older binary
+rejects the new YAML keys but silently ignores
+`DOCKER_BACKEND_CALLBACK_SECRET_NEXT`; the step 2 gate below catches that.
+
+For backend `B`, rotating `K_old` to `K_new`:
+
+1. On `B`'s docker-backend, set `callback_secret_next: K_new` (keep
+   `callback_secret: K_old`) and restart it. It accepts `providerd` requests
+   signed with either key and still signs callbacks with `K_old`.
+2. In `providerd`, set `B`'s `hmac_secret: K_new` and
+   `hmac_secret_previous: K_old`, and restart it. It signs `B`'s requests with
+   `K_new` and accepts `B`'s callbacks signed with either key.
+3. On `B`, set `callback_secret: K_new`, remove `callback_secret_next`, and
+   restart it. `B` signs callbacks with `K_new`.
+4. In `providerd`, remove `B`'s `hmac_secret_previous` and restart it. `K_old`
+   is no longer accepted anywhere.
+
+Before each restart, confirm the keys pair without exposing them.
+`providerd --print-hmac-key-ids --config <file>` and
+`docker-backend -print-hmac-key-ids -config <file>` print non-secret key IDs for
+the configuration you are about to start. Before step 2, `providerd`'s new
+`current_key_id` for `B` must equal `B`'s `next_key_id`, and its new
+`previous_key_id` for `B` must equal `B`'s `current_key_id`. Before step 3, `B`'s
+new `current_key_id` must equal `providerd`'s `current_key_id` for `B`. Print IDs
+only when needed and never log them: an ID still lets someone test guesses of a
+weak key.
+
+Gate each step on the metrics:
+
+- Before step 2, on the running `B`:
+  `fred_docker_backend_request_next_key_configured` is 1. The key-ID check reads
+  a configuration file and your shell's environment, not the service's, so only
+  this gauge proves the running backend accepts `K_new`.
+- Before step 3, on `B`: `fred_docker_backend_request_signature_key_total{slot="next"}`
+  rises and `slot="current"` stays flat, so `providerd` already signs with `K_new`.
+- Before step 4, on `providerd`:
+  `fred_api_callback_signature_key_total{backend="B",slot="current"}` rises and
+  `slot="previous"` stays flat, so `B` already signs with `K_new`. If `B` is idle,
+  run a test provision.
+- A misordered step shows up as `reason="mismatch"` on
+  `fred_api_callback_auth_failures_total` (callbacks) or
+  `fred_docker_backend_request_auth_failures_total` (requests). Restore the
+  previous configuration.
+- `fred_api_callback_previous_key_configured{backend="B"}` stays 1 until step 4.
+  Alert if it stays 1 longer than a rotation should take: the old key remains
+  valid until then.
+
+`DOCKER_BACKEND_CALLBACK_SECRET_NEXT` overrides `callback_secret_next`, but an
+environment override only sets a value; it cannot clear one set in YAML, so
+remove the YAML key at step 3. Roll back by reversing the steps.
+
+Never use a rolling rotation for a compromised key: the old key stays valid
+until step 4. Stop the backend and rotate with the stopped procedure below.
+
+### Stopped rotation
+
+A stopped rotation changes keys with everything stopped. Use it for a
+compromised key and for the non-production shared `callback_secret` mode:
 
 1. Drain operations and callback replay, remove provider ingress, then stop the
    single `providerd` and the backend(s) whose keys will change.
@@ -433,9 +498,7 @@ callbacks as a peer. Rotation requires a coordinated restart:
    v0.13 cutover with pending legacy rows; that outbox must be drained before
    storage-identity initialization.
 
-There is no built-in support for two-secret rotation (active + previous), so
-do not attempt a rolling mixed-key phase; secret rotation includes a brief
-`providerd` outage. Do not overlap two
+Either way, do not overlap two
 `providerd` instances for the same provider and backend fleet: the placement
 database is a single-writer bbolt file, while the lifecycle-operation registry
 is process-local and has no cross-process coordinator. A second instance with a
@@ -477,7 +540,8 @@ ProtectHome=true
 PrivateTmp=true
 # ReadWritePaths must include the directories holding any *_db_path values
 # from your config (token_tracker_db_path, payload_store_db_path,
-# placement_store_db_path). Adjust this line to match.
+# placement_store_db_path), and placement_snapshot_dir when it is set. Adjust
+# this line to match.
 ReadWritePaths=/var/lib/fred
 
 [Install]
@@ -683,7 +747,7 @@ and preserve that safety evidence.
 | `<docker>/callbacks.db` | Critical — write-ahead provision/restore operation rows (Pending/Succeeded/Failed), replacement intents, immutable resource/target authority, non-expiring destructive-close finalizers, durable exact/lifecycle deliveries, and per-lease FIFO evidence. Terminal operation rows remain after callback delivery as exact retry and restore-recovery authority until an authorized successor atomically retires them. Causal/close rows and exact operation/maintenance completions do not age out; typed lifecycle observations are retained up to `callback_max_age`. Pre-identity v0.13 outbox rows must be drained while the old backend is still running and are never admitted into the current runtime queue | Accepted or terminal operation state, partial-replacement/close authority, immutable sizing, and queued callback evidence are not recreated. Normal startup refuses a missing file instead of rebuilding its schema. Losing a terminal restore result can make a safe source handback unknowable; absence is invalid rather than Failed. Losing a maintenance row can make an exact replacement cohort unclassifiable; losing a close row after teardown starts can turn an intentional zero-survivor cohort into unexplained release divergence. Restore this file with the matching `releases.db`, `retention.db`, marker pair, and substrate |
 | Backend storage-lineage seal | Critical — the marker pair plus every identity-bound authoritative store bind a backend name to one substrate generation | Docker's set is `callbacks.db`, `releases.db`, `retention.db`, both markers, and the substrate; k3s uses `callbacks.db`, `releases.db`, both markers, and the cluster. Every authoritative database must remain an unsymlinked, single-link regular file with exact mode `0600`; startup and runtime re-attestation fail closed on drift. Restore the complete matching set. One missing, corrupt, foreign, cross-kind, or path/inode-replaced member intentionally prevents startup. Never copy markers onto replacement storage or rerun initialization to repair a committed seal. Whenever Docker has `volume_data_path`, the primary is `volume_data_path/.fred-backend-storage-identity.json` and the anchor is `callback_db_path.storage-identity-anchor.json`; Docker without a managed volume root and k3s keep both adjacent to `callback_db_path`. If all paths share one mount, the set detects partial deletion/torn initialization but is not an independent backup—protect and snapshot the whole mount |
 | `placement_store_db_path` | Critical — provider binding, unresolved attempts, ordinary and rejected-positive (`untrusted_positive`) quarantine, immutable backend-name/storage pins, topology history, and the durable inventory baseline are non-derivable safety authority | Restore the exact file only while `providerd` is stopped, then [attest it](#restoring-an-older-placement-backup) before the first start. It must be an unsymlinked, single-link regular file with exact mode `0600`. Normal startup never creates, initializes, or migrates an absent/empty/unprepared replacement, and rejects a file bound to another provider. The fresh initializer is only for a genuinely new provider with zero total chain lease history; it is never recovery for a lost database |
-| `payload_store_db_path` | Low — pending tenant manifests, which tenants can re-upload | Restore only while `providerd` is stopped as an unsymlinked, single-link regular file with exact mode `0600`; otherwise tenants must re-upload pending payloads |
+| `payload_store_db_path` | High — the manifest of every PENDING lease, the current manifest of every ACTIVE lease (Fred re-provisions from it after a crash or host reboot, including manifests a tenant `/update` replaced), and the exact bytes an in-flight provision attempt must re-send | Back it up and restore it together with `placement_store_db_path`, from the same moment, and only while `providerd` is stopped, as an unsymlinked, single-link regular file with exact mode `0600`. Tenants can re-upload only a PENDING lease's original manifest, which must match its on-chain hash. Without the file, an ACTIVE lease that needs re-provisioning stays deferred (`payload not available`) and an in-flight attempt stays unresolved. See [Restoring an older placement backup](#restoring-an-older-placement-backup) |
 | `token_tracker_db_path` | None — replay protection has 30s window anyway | Empties on restart, acceptable. bbolt creates a missing file with mode `0600`, but this short-lived cache is not lineage/path identity-bound like placement or payload authority; replace it only while providerd is stopped |
 
 Ordinary file-copy backups must be taken with the owning daemon stopped (bbolt's
@@ -691,6 +755,8 @@ file lock refuses a second bbolt open). Snapshot each backend's marker pair,
 complete authoritative-store set, and substrate as one unit so a restore cannot
 mix generations or times. For zero-downtime backups, use an atomic
 filesystem-level snapshot (LVM, ZFS, btrfs) — bbolt files are crash-consistent.
+providerd can also snapshot `placements.db` and `payloads.db` itself while it
+runs; see [Online snapshots](#online-snapshots).
 Restoring a complete matching snapshot intentionally preserves the same lineage,
 so fence the original backend before the restored copy starts.
 
@@ -709,6 +775,76 @@ drifts. A live backup must be an atomic
 filesystem snapshot, not pathname replacement. Restore only while stopped. A
 stopped restore may naturally create a new inode: the next strict open validates
 the provider-bound authority and binds that inode before using it.
+
+### Online snapshots
+
+Set `placement_snapshot_dir` and providerd copies `placements.db` and
+`payloads.db` into it while running: every `placement_snapshot_interval`
+(default `1h`, minimum `5m`), keeping the newest `placement_snapshot_retain`
+complete sets (default 24, at most 1000). Losing the host then costs at most one
+interval of placement history. Each set is one consistent pair: both read
+transactions begin while placement writes are paused for the length of two
+bbolt `Begin` calls, so the pair is a state a crash could have left. Attest it
+like any restored copy.
+
+The directory must exist, be owned by the providerd service user, and not be
+writable by group or others (`install -d -m 0700 -o fred -g fred
+/var/backups/fred`). It must not be the directory of either live database, and
+snapshots require `payload_store_db_path`. providerd refuses to start otherwise.
+Add the directory to `ReadWritePaths`. A snapshot on the same disk as the live
+databases does not survive that disk, and providerd logs a warning when they
+share a filesystem. Copy the directory off the host with your usual backup tool.
+
+Each set is three files with mode `0600`:
+
+```
+fred-snapshot-<provider_uuid>-<UTC yyyymmddThhmmssZ>-<id>.placements.db
+fred-snapshot-<provider_uuid>-<UTC yyyymmddThhmmssZ>-<id>.payloads.db
+fred-snapshot-<provider_uuid>-<UTC yyyymmddThhmmssZ>-<id>.manifest.json
+```
+
+The manifest is written last, after both copies were re-read and passed bbolt's
+consistency check. It records each data file's name, size, and SHA-256. A set
+without a manifest is incomplete; never restore one.
+
+- A snapshot holds its read transactions for at most 30 seconds. Live writers
+  never wait on it longer, and normally not at all.
+- A snapshot is skipped (`outcome="insufficient_space"`) unless the snapshot
+  filesystem has twice the databases' size plus 256 MiB free.
+- After a start, the first snapshot waits at least one minute and until one
+  interval has passed since the newest complete set, so restarts do not replace
+  older sets with new ones.
+- Pruning runs after each published set. It keeps the newest complete sets and
+  the set it just published, and deletes older complete sets, incomplete sets
+  older than the newest complete one, and staged files left by a crash
+  (`.fred-snapshot-tmp-<provider_uuid>-*`, removed before each attempt). A set
+  dated after the current time, left by a clock that ran ahead, is kept until
+  the clock passes it and does not count toward the retained sets. Pruning
+  considers only names carrying this provider's UUID, never deletes anything but a regular file owned by the service
+  user, never unlinks a live database, and keeps any set it cannot read.
+  Everything it keeps that way counts in
+  `fred_placement_snapshot_prune_failures_total{reason}`.
+
+To restore a set, with providerd stopped:
+
+```bash
+bash -euo pipefail -c '
+cd /var/backups/fred
+set=fred-snapshot-<provider_uuid>-<timestamp>-<id>
+jq -r ".placements.sha256 + \"  \" + .placements.name,
+       .payloads.sha256 + \"  \" + .payloads.name" "$set.manifest.json" | sha256sum -c
+mv /var/lib/fred/placements.db /var/lib/fred/placements.db.before-restore
+mv /var/lib/fred/payloads.db /var/lib/fred/payloads.db.before-restore
+install -m 0600 -o fred -g fred "$set.placements.db" /var/lib/fred/placements.db
+install -m 0600 -o fred -g fred "$set.payloads.db" /var/lib/fred/payloads.db
+sync
+'
+```
+
+The script stops at the first failure, so a copy that does not match its
+manifest is never installed.
+
+Then attest the restored pair as described next, and start providerd.
 
 ### Restoring an older placement backup
 
@@ -744,6 +880,69 @@ authority. On the next start `/readyz` reports `placement inventory not ready`
 until one sweep in which every configured backend answers both inventory
 endpoints; until then new admission and backend removal wait, and existing
 leases keep running. That sweep adopts every lease its owner reports.
+
+What restoring an older pair does to each lease, once attested (restore
+`placements.db` and `payloads.db` from the same moment; never combine files from
+different moments):
+
+- A lease created after the copy is adopted once, from its owner's report on the
+  first complete inventory. The restored `payloads.db` has no manifest for it:
+  it keeps running, but if it ever needs re-provisioning Fred cannot rebuild it.
+  The reconciler then retries it every sweep with `payload not available`, and
+  each sweep reports `partial`. A tenant update stores the manifest again.
+- A lease closed after the copy is pruned after a terminal chain read.
+- A lease re-provisioned after the copy reports a different lifecycle generation
+  and is quarantined `unusable`: its callbacks are dropped and restart and update
+  are refused until an operator repairs it (see
+  [Adopting a lifecycle generation after a restore](#adopting-a-lifecycle-generation-after-a-restore)).
+- A lease updated after the copy still has its pre-update manifest in
+  `payloads.db`, so its next re-provision brings the old manifest back. Re-apply
+  those updates.
+- A restart or update still pending in the copy is replayed with its original
+  key and stamp. One the backend completed settles from its receipt; one the
+  backend no longer remembers settles as expired and never runs again.
+
+### Adopting a lifecycle generation after a restore
+
+A lease re-provisioned after the restored copy was taken is quarantined
+`unusable` on the first sweep: its backend reports a lifecycle generation the
+copy has never seen. Its callbacks are dropped and restart and update are
+refused, but the workload keeps running. `placement-repair -classify` counts
+repair candidates in `counts.unusable_adoption_candidates`, and
+`placement-repair -list` marks each candidate row `"adoption_candidate": true`
+(`-classify` reports at most 128 rows, so use `-list` to find them). A
+candidate's stored rows are consistent apart from the quarantine; the repair
+still requires live inventory to agree, so it refuses, for example, a lease its
+backend now only retains. A quarantine the stored rows explain, such as an owner
+or tenant that contradicts the operation metadata, is never a candidate. Neither
+is a lease whose stored generation is untyped (adopted from v0.13) or carries no
+tenant: those leases stay quarantined.
+
+With providerd stopped, for each such lease:
+
+```bash
+placement-repair -config /etc/fred/config.yaml -adopt-observed-generation \
+  -lease <lease-uuid> -backend <backend>
+placement-repair -config /etc/fred/config.yaml -adopt-observed-generation \
+  -lease <lease-uuid> -backend <backend> \
+  -apply -backup /var/lib/fred/placements.pre-adoption.db -confirm '<confirm>' \
+  -attest-generation '<attestation>'
+```
+
+The dry run collects complete inventory from every configured backend. It
+requires `<backend>` to be the lease's only owner and to report it as an active
+provision that is not mid-operation (`ready`, `failing`, or `failed`), for the
+same tenant and provider, at a typed generation other than the stored one. It
+prints both generations only as fingerprints, because lifecycle IDs are
+callback capabilities, along with the `confirm` value and the exact
+attestation. Attest only if that backend was not itself restored from an
+older snapshot and nothing for the lease is in flight or being replayed.
+
+The apply takes an exact no-overwrite backup, collects the inventory again and
+requires the plan to be unchanged, then in one transaction gives the lease's
+lifecycle authority the reported generation and clears the old generation's
+operation metadata from its placement. It refuses a lease with an attempt in
+flight, a pending restart or update, or a restore using it as its source.
 
 ### Retiring a backend whose storage is lost
 

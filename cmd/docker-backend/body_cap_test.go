@@ -24,7 +24,7 @@ import (
 func TestHMACMiddleware_EnforcesConfiguredBodyCap(t *testing.T) {
 	send := func(t *testing.T, capBytes, bodyLen int64) int {
 		t.Helper()
-		mw := hmacAuthMiddleware(testSecret, slog.Default(), capBytes)
+		mw := hmacAuthMiddleware(testRequestKeys, slog.Default(), capBytes)
 		h := mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
 		req := httptest.NewRequest(http.MethodPost, "/provision", bytes.NewReader(make([]byte, bodyLen)))
 		req.Header.Set(hmacauth.SignatureHeader, "present-but-invalid") // non-empty → reaches the body read
@@ -53,6 +53,6 @@ func TestHMACMiddleware_EnforcesConfiguredBodyCap(t *testing.T) {
 // TestNewServer_NonPositiveBodyCapDefaults: a zero/negative cap falls back to
 // the package default rather than disabling the limit.
 func TestNewServer_NonPositiveBodyCapDefaults(t *testing.T) {
-	require.Equal(t, docker.DefaultMaxRequestBodySize, NewServer(nil, testSecret, slog.Default(), 0).maxRequestBodySize)
-	require.Equal(t, docker.DefaultMaxRequestBodySize, NewServer(nil, testSecret, slog.Default(), -1).maxRequestBodySize)
+	require.Equal(t, docker.DefaultMaxRequestBodySize, NewServer(nil, testRequestKeys, slog.Default(), 0).maxRequestBodySize)
+	require.Equal(t, docker.DefaultMaxRequestBodySize, NewServer(nil, testRequestKeys, slog.Default(), -1).maxRequestBodySize)
 }

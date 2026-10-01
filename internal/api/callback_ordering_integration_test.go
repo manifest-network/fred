@@ -818,10 +818,10 @@ func TestCallbackOutboxReplay_SettlesDurableAttemptAcrossBothProcessRestarts(t *
 		RateLimitRPS: 100, RateLimitBurst: 200,
 		ReadTimeout: time.Second, WriteTimeout: time.Second, IdleTimeout: time.Second,
 		RequestTimeout: time.Second, CallbackApplicationTimeout: 2 * time.Second,
-		CallbackHMACSecrets: map[backendidentity.ID]string{
+		CallbackKeys: callbackKeysForTest(t, map[backendidentity.ID]string{
 			storageIDA: secretA,
 			storageIDB: secretB,
-		},
+		}),
 	}, ServerDeps{
 		ChainClient: chainClient, CallbackPublisher: manager, StatusChecker: manager,
 		CallbackProofVerifier: proofVerifier,

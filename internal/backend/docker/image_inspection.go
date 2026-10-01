@@ -446,7 +446,54 @@ func (c *imageInspectionCoordinator) RecoverAndReport(ctx context.Context, logge
 	if report.deferred != nil {
 		logger.WarnContext(ctx, "Image inspection recovery deferred", "error", report.deferred)
 	}
+	// The journal, not this pass's outcome, is the account: a pass that failed
+	// still left exactly the receipts the journal lists.
+	if unsettled, listErr := c.unsettledHelpers(); listErr == nil {
+		unsettled.publish()
+	}
 	return err
+}
+
+// Reason labels for fred_docker_backend_image_helpers_unsettled.
+const (
+	imageHelperUnsettledUnknownCreate  = "unknown_create"
+	imageHelperUnsettledCleanupPending = "cleanup_pending"
+)
+
+// unsettledImageHelpers counts the helper receipts no live inspection owns.
+type unsettledImageHelpers struct {
+	unknownCreate  int
+	cleanupPending int
+}
+
+// publish writes both reasons together, so the gauge never mixes two passes.
+func (unsettled unsettledImageHelpers) publish() {
+	imageHelpersUnsettled.WithLabelValues(imageHelperUnsettledUnknownCreate).Set(float64(unsettled.unknownCreate))
+	imageHelpersUnsettled.WithLabelValues(imageHelperUnsettledCleanupPending).Set(float64(unsettled.cleanupPending))
+}
+
+// unsettledHelpers reads the journal itself rather than a recovery report, so
+// a pass that stopped at its time cap still counts the receipts it never
+// reached. A receipt held by a live inspection is in progress, not unsettled.
+func (c *imageInspectionCoordinator) unsettledHelpers() (unsettledImageHelpers, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	receipts, err := c.journal.List()
+	if err != nil {
+		return unsettledImageHelpers{}, err
+	}
+	var unsettled unsettledImageHelpers
+	for _, receipt := range receipts {
+		if _, live := c.active[receipt.ID()]; live {
+			continue
+		}
+		if receipt.CreationSettled() {
+			unsettled.cleanupPending++
+		} else {
+			unsettled.unknownCreate++
+		}
+	}
+	return unsettled, nil
 }
 
 // Recover scans both pending helpers and permanent response-loss receipts.

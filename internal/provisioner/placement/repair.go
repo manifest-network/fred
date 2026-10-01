@@ -79,6 +79,10 @@ type RepairRecord struct {
 	ConflictOwnersUnknown  bool                `json:"conflict_owners_unknown"`
 	// LostBackend names the retired backend whose lost storage held the lease.
 	LostBackend string `json:"lost_backend,omitempty"`
+	// AdoptionCandidate marks a quarantined lifecycle whose stored rows
+	// -adopt-observed-generation would accept. The repair also needs live
+	// inventory to agree, so a candidate can still be refused.
+	AdoptionCandidate bool `json:"adoption_candidate,omitempty"`
 }
 
 // OpenRepairInspector opens an existing placement database read-only and
@@ -132,9 +136,23 @@ func (inspector *RepairInspector) List() []RepairRecord {
 	keys := slices.Sorted(maps.Keys(placements))
 	records := make([]RepairRecord, 0, len(keys))
 	for _, leaseUUID := range keys {
-		records = append(records, newRepairRecord(leaseUUID, placements[leaseUUID]))
+		records = append(records, inspector.record(leaseUUID, placements[leaseUUID]))
 	}
 	return records
+}
+
+// record renders one row and marks it when its stored rows make it a lifecycle
+// generation adoption candidate.
+func (inspector *RepairInspector) record(leaseUUID string, p Placement) RepairRecord {
+	record := newRepairRecord(leaseUUID, p)
+	store := inspector.store
+	store.mu.RLock()
+	capability, bound := store.lifecycleCache[leaseUUID]
+	providerUUID := store.providerUUID
+	store.mu.RUnlock()
+	record.AdoptionCandidate = bound &&
+		adoptableQuarantine(p, capability, p.Backend, providerUUID) == nil
+	return record
 }
 
 // Inspect returns the exact durable row for leaseUUID. Missing rows are
@@ -151,7 +169,7 @@ func (inspector *RepairInspector) Inspect(leaseUUID string) (RepairRecord, bool,
 	if !exists {
 		return RepairRecord{}, false, nil
 	}
-	return newRepairRecord(leaseUUID, p), true, nil
+	return inspector.record(leaseUUID, p), true, nil
 }
 
 func newRepairRecord(leaseUUID string, p Placement) RepairRecord {

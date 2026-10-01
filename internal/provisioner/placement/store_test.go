@@ -244,7 +244,12 @@ func newStore(
 		return nil, fmt.Errorf("placement db path is required")
 	}
 
-	db, err := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	// Same mapping as the live store, so tests model writers proceeding while
+	// an online snapshot holds a read transaction.
+	db, err := bolt.Open(dbPath, 0o600, &bolt.Options{
+		Timeout:         5 * time.Second,
+		InitialMmapSize: liveStoreInitialMmapSize,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("open placement test fixture: %w", err)
 	}

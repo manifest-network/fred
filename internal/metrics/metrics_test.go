@@ -44,6 +44,7 @@ var unlabelledMetricNames = []string{
 	"fred_reconciler_duration_seconds",
 	"fred_reconciler_last_success_timestamp_seconds",
 	"fred_reconciler_sweep_complete",
+	"fred_reconciler_sweep_projection_committed",
 	"fred_signer_pool_lane_count",
 	"fred_signer_pool_size",
 	"fred_watermill_poisoned_messages_total",
@@ -97,6 +98,13 @@ var labelledMetricNames = []string{
 	"fred_provisioner_reconciler_lost_leases_total",
 	"fred_reconciler_actions_total",
 	"fred_reconciler_backend_fetch_total",
+	"fred_reconciler_backend_inventory_total",
+	"fred_api_callback_signature_key_total",
+	"fred_api_callback_auth_failures_total",
+	"fred_api_callback_previous_key_configured",
+	"fred_reconciler_backend_inventory_answered",
+	"fred_placement_snapshots_total",
+	"fred_placement_snapshot_prune_failures_total",
 	"fred_reconciler_cleanup_skips_total",
 	"fred_reconciler_runs_total",
 	"fred_signer_balance_query_failures_total",
@@ -113,6 +121,8 @@ func allCollectors() []prometheus.Collector {
 		MaintenancePending, MaintenancePendingBytes, MaintenancePendingOldestAge, MaintenanceAdmissionRefusalsTotal,
 		// Provisioning
 		PlacementWriteFailuresTotal, PlacementInventoryRecoveryPending, APIMaintenanceLegacyKeyTotal,
+		APICallbackSignatureKeyTotal, APICallbackAuthFailuresTotal, APICallbackPreviousKeyConfigured,
+		PlacementSnapshotsTotal, PlacementSnapshotPruneFailuresTotal,
 		InFlightProvisions,
 		ProvisioningTotal,
 		ProvisioningDuration,
@@ -136,7 +146,10 @@ func allCollectors() []prometheus.Collector {
 		ReconcilerLastSuccessTimestamp,
 		ReconciliationActions,
 		ReconcilerBackendFetchTotal,
+		ReconcilerBackendInventoryTotal,
+		ReconcilerBackendInventoryAnswered,
 		ReconcilerSweepComplete,
+		ReconcilerSweepProjectionCommitted,
 		ReconcilerCleanupSkipsTotal,
 		// Payload
 		PayloadUploadsTotal,
@@ -327,6 +340,27 @@ func TestCounterVecLabels(t *testing.T) {
 		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeOK)
 		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeError)
 		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeCircuitOpen)
+	})
+	assert.NotPanics(t, func() {
+		for _, outcome := range []string{
+			InventoryOutcomeAuthoritative, InventoryOutcomePartial, InventoryOutcomeUntrusted,
+			InventoryOutcomeProvisionsOnly, InventoryOutcomeRetentionsOnly, InventoryOutcomeUnanswered,
+		} {
+			ReconcilerBackendInventoryTotal.WithLabelValues("docker", outcome)
+		}
+		ReconcilerBackendInventoryAnswered.WithLabelValues("docker")
+	})
+	assert.NotPanics(t, func() {
+		for _, slot := range []string{CallbackKeySlotCurrent, CallbackKeySlotPrevious} {
+			APICallbackSignatureKeyTotal.WithLabelValues("docker", slot)
+		}
+		for _, reason := range []string{
+			CallbackAuthFailureMissing, CallbackAuthFailureFormat, CallbackAuthFailureExpired,
+			CallbackAuthFailureFuture, CallbackAuthFailureMismatch, CallbackAuthFailureUnknownStorage,
+		} {
+			APICallbackAuthFailuresTotal.WithLabelValues(reason)
+		}
+		APICallbackPreviousKeyConfigured.WithLabelValues("docker")
 	})
 	assert.NotPanics(t, func() {
 		// Both label sets are closed; every combination the reconciler can emit.

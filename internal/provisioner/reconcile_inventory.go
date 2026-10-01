@@ -77,6 +77,7 @@ func (r *Reconciler) collectInventory(
 		return reconcileInventory{}, fmt.Errorf("enumerate configured backends: %w", err)
 	}
 	inventory.backendStorageIdentities = make(map[string]backendidentity.ID, len(configuredBackends))
+	outcomes := make(map[string]backendInventoryOutcome, len(configuredBackends))
 	for _, backendName := range configuredBackends {
 		provisionResponse, provisionAnswered := inventory.fleet.collectedByBackend[backendName]
 		retentionResponse, retentionAnswered := inventory.retentionCollected[backendName]
@@ -96,6 +97,9 @@ func (r *Reconciler) collectInventory(
 				"dispose backend inventory evidence for %q: %w", backendName, err,
 			)
 		}
+		outcomes[backendName] = classifyBackendInventory(
+			provisionAnswered, retentionAnswered, result.Disposition(),
+		)
 		switch result.Disposition() {
 		case placement.BackendInventoryAuthoritative, placement.BackendInventoryPartial:
 			inventory.backendStorageIdentities[backendName] = provisionResponse.StorageID()
@@ -106,9 +110,16 @@ func (r *Reconciler) collectInventory(
 		}
 		inventory.rejectBackend(backendName)
 	}
+	// A sweep canceled while reading is Fred's own interruption, not silence
+	// from the backends it did not finish reading. Abandon it unsealed, so it
+	// records no outcome and commits no projection.
+	if err := ctx.Err(); err != nil {
+		return reconcileInventory{}, err
+	}
 	if err := sweep.SealInventory(); err != nil {
 		return reconcileInventory{}, fmt.Errorf("seal inventory evidence: %w", err)
 	}
+	recordBackendInventoryOutcomes(outcomes)
 	return inventory, nil
 }
 

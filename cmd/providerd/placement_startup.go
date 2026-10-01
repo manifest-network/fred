@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/manifest-network/fred/internal/api"
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/config"
@@ -20,25 +21,25 @@ import (
 
 const backendTopologyProbeTimeout = 2 * time.Minute
 
-// callbackHMACSecrets binds configured per-backend keys to the immutable
-// storage identities established by the prepared placement authority. Callback
-// ingress then selects by physical lineage rather than trusting a body-supplied
-// backend name.
-func callbackHMACSecrets(
+// callbackKeys binds configured per-backend keys to the immutable storage
+// identities established by the prepared placement authority. Callback ingress
+// then selects by physical lineage rather than trusting a body-supplied backend
+// name.
+func callbackKeys(
 	cfg *config.Config,
 	resolver backend.BackendStorageIdentityResolver,
-) (map[backendidentity.ID]string, error) {
+) (map[backendidentity.ID]api.CallbackKey, error) {
 	if cfg == nil {
 		return nil, errors.New("provider config is required")
 	}
 	if util.IsNilInterface(resolver) {
 		return nil, errors.New("backend storage identity resolver is required")
 	}
-	secrets := make(map[backendidentity.ID]string, len(cfg.Backends))
+	keys := make(map[backendidentity.ID]api.CallbackKey, len(cfg.Backends))
 	for _, configuredBackend := range cfg.Backends {
-		secret, err := cfg.ResolveBackendHMACSecret(configuredBackend.Name)
+		verifyKeys, err := cfg.BackendCallbackKeys(configuredBackend.Name)
 		if err != nil {
-			return nil, fmt.Errorf("backend %q: resolve callback HMAC secret: %w", configuredBackend.Name, err)
+			return nil, fmt.Errorf("backend %q: resolve callback HMAC keys: %w", configuredBackend.Name, err)
 		}
 		storageID, bound := resolver.ExpectedBackendStorageIdentity(configuredBackend.Name)
 		if !bound || !storageID.Valid() {
@@ -47,15 +48,15 @@ func callbackHMACSecrets(
 				configuredBackend.Name,
 			)
 		}
-		if _, duplicate := secrets[storageID]; duplicate {
+		if _, duplicate := keys[storageID]; duplicate {
 			return nil, fmt.Errorf(
 				"backend %q reuses callback storage identity %s",
 				configuredBackend.Name, storageID,
 			)
 		}
-		secrets[storageID] = string(secret)
+		keys[storageID] = api.CallbackKey{Backend: configuredBackend.Name, Keys: verifyKeys}
 	}
-	return secrets, nil
+	return keys, nil
 }
 
 // preparePlacementBackends is the first stateful startup phase. It opens and

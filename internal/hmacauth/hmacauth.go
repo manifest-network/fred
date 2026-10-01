@@ -41,6 +41,15 @@
 //
 // Verification uses hmac.Equal (constant-time) to prevent timing attacks.
 //
+// # Key rotation
+//
+// VerifyKeys holds the key a side signs with and, during a rotation, at most one
+// verify-only key. It can verify but never sign. A signature is checked once for
+// format and freshness, then against both keys (both MACs are always computed),
+// and the result names the KeySlot that matched. Failures carry a closed
+// FailureReason. Keys are compared by HMAC equivalence, since a key and its
+// zero-padded copy authenticate the same messages.
+//
 // # Method and URI conventions
 //
 // Method is case-sensitive (RFC 9110 §9.1) — callers pass it as-is, and no
@@ -207,10 +216,18 @@ const (
 // stable empty-body hash, so both sender and verifier always emit the
 // hash field.
 func ComputeMAC(secret string, timestamp int64, method, uri string, body []byte) []byte {
+	return macOf([]byte(secret), canonicalString(timestamp, method, uri, body))
+}
+
+// canonicalString builds the signed string, hashing body once.
+func canonicalString(timestamp int64, method, uri string, body []byte) []byte {
 	bodyHash := sha256.Sum256(body)
-	signed := fmt.Sprintf("%d\n%s\n%s\n%x", timestamp, method, uri, bodyHash[:])
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(signed))
+	return fmt.Appendf(nil, "%d\n%s\n%s\n%x", timestamp, method, uri, bodyHash[:])
+}
+
+func macOf(key, message []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(message)
 	return mac.Sum(nil)
 }
 
@@ -302,15 +319,8 @@ func (verifier CallbackProofVerifier) VerifyRoutedWithTime(
 	if !verifier.Valid() {
 		return VerifiedRequest{}, fmt.Errorf("callback proof verifier is unavailable")
 	}
-	if method != http.MethodPost {
-		return VerifiedRequest{}, fmt.Errorf("callback method must be POST")
-	}
-	parsed, err := url.ParseRequestURI(uri)
-	if err != nil {
-		return VerifiedRequest{}, fmt.Errorf("invalid callback request URI: %w", err)
-	}
-	if callbackPath == "" || parsed.EscapedPath() != callbackPath {
-		return VerifiedRequest{}, fmt.Errorf("callback request path mismatch")
+	if err := checkCallbackEnvelope(method, uri, callbackPath); err != nil {
+		return VerifiedRequest{}, err
 	}
 	request, err := verifyRoutedWithTime(
 		secret, method, uri, body, signature, route, verifiedPurposeCallback,
@@ -323,6 +333,89 @@ func (verifier CallbackProofVerifier) VerifyRoutedWithTime(
 	return request, nil
 }
 
+// VerifyRoutedKeysWithTime is VerifyRoutedWithTime for a side that may hold a
+// rotation key: it accepts a signature made by either key in keys and reports
+// which one matched.
+func (verifier CallbackProofVerifier) VerifyRoutedKeysWithTime(
+	keys VerifyKeys,
+	method, uri string,
+	body []byte,
+	signature, route, callbackPath string,
+	maxAge, clockSkew time.Duration,
+	now time.Time,
+) (VerifiedRequest, KeySlot, error) {
+	if !verifier.Valid() {
+		return VerifiedRequest{}, keySlotInvalid, fmt.Errorf("callback proof verifier is unavailable")
+	}
+	if err := checkCallbackEnvelope(method, uri, callbackPath); err != nil {
+		return VerifiedRequest{}, keySlotInvalid, err
+	}
+	envelope, err := parseEnvelope(method, uri, body, signature, maxAge, clockSkew, now)
+	if err != nil {
+		return VerifiedRequest{}, keySlotInvalid, err
+	}
+	slot, err := keys.match(envelope.provided, envelope.canonical)
+	if err != nil {
+		return VerifiedRequest{}, keySlotInvalid, err
+	}
+	return VerifiedRequest{
+		method:  method,
+		uri:     uri,
+		body:    bytes.Clone(body),
+		route:   route,
+		purpose: verifiedPurposeCallback,
+		issuer:  verifier.issuer,
+	}, slot, nil
+}
+
+// checkCallbackEnvelope binds a callback signature to the callback endpoint, so
+// a signature for another endpoint cannot be promoted to callback authority.
+func checkCallbackEnvelope(method, uri, callbackPath string) error {
+	if method != http.MethodPost {
+		return verificationFailure(FailureFormat, "callback method must be POST")
+	}
+	parsed, err := url.ParseRequestURI(uri)
+	if err != nil {
+		return &VerificationError{reason: FailureFormat, message: "invalid callback request URI: " + err.Error()}
+	}
+	if callbackPath == "" || parsed.EscapedPath() != callbackPath {
+		return verificationFailure(FailureFormat, "callback request path mismatch")
+	}
+	return nil
+}
+
+// parsedEnvelope is a fresh, well-formed signature and the canonical string it
+// must cover. It names no key: the caller decides which keys to try.
+type parsedEnvelope struct {
+	provided  []byte
+	canonical []byte
+}
+
+func parseEnvelope(
+	method, uri string,
+	body []byte,
+	signature string,
+	maxAge, clockSkew time.Duration,
+	now time.Time,
+) (parsedEnvelope, error) {
+	timestamp, sigHex, ok := ParseSignature(signature)
+	if !ok {
+		return parsedEnvelope{}, verificationFailure(FailureFormat, "invalid signature format: expected t=<timestamp>,sha256=<hex>")
+	}
+	signedAt := time.Unix(timestamp, 0)
+	if now.Sub(signedAt) > maxAge {
+		return parsedEnvelope{}, verificationFailure(FailureExpired, "signature expired: signed %v ago, max age is %v", now.Sub(signedAt).Round(time.Second), maxAge)
+	}
+	if signedAt.After(now.Add(clockSkew)) {
+		return parsedEnvelope{}, verificationFailure(FailureFuture, "signature timestamp too far in future: %v ahead", signedAt.Sub(now).Round(time.Second))
+	}
+	provided, err := hex.DecodeString(sigHex)
+	if err != nil {
+		return parsedEnvelope{}, &VerificationError{reason: FailureFormat, message: "invalid signature encoding: " + err.Error()}
+	}
+	return parsedEnvelope{provided: provided, canonical: canonicalString(timestamp, method, uri, body)}, nil
+}
+
 func verifyRoutedWithTime(
 	secret, method, uri string,
 	body []byte,
@@ -331,27 +424,12 @@ func verifyRoutedWithTime(
 	maxAge, clockSkew time.Duration,
 	now time.Time,
 ) (VerifiedRequest, error) {
-	timestamp, sigHex, ok := ParseSignature(signature)
-	if !ok {
-		return VerifiedRequest{}, fmt.Errorf("invalid signature format: expected t=<timestamp>,sha256=<hex>")
-	}
-
-	signedAt := time.Unix(timestamp, 0)
-	if now.Sub(signedAt) > maxAge {
-		return VerifiedRequest{}, fmt.Errorf("signature expired: signed %v ago, max age is %v", now.Sub(signedAt).Round(time.Second), maxAge)
-	}
-	if signedAt.After(now.Add(clockSkew)) {
-		return VerifiedRequest{}, fmt.Errorf("signature timestamp too far in future: %v ahead", signedAt.Sub(now).Round(time.Second))
-	}
-
-	providedSig, err := hex.DecodeString(sigHex)
+	envelope, err := parseEnvelope(method, uri, body, signature, maxAge, clockSkew, now)
 	if err != nil {
-		return VerifiedRequest{}, fmt.Errorf("invalid signature encoding: %w", err)
+		return VerifiedRequest{}, err
 	}
-
-	expectedSig := ComputeMAC(secret, timestamp, method, uri, body)
-	if !hmac.Equal(providedSig, expectedSig) {
-		return VerifiedRequest{}, fmt.Errorf("signature mismatch")
+	if !hmac.Equal(envelope.provided, macOf([]byte(secret), envelope.canonical)) {
+		return VerifiedRequest{}, verificationFailure(FailureMismatch, "signature mismatch")
 	}
 
 	return VerifiedRequest{

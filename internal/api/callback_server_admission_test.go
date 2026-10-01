@@ -24,10 +24,10 @@ func newCallbackAdmissionServer(t *testing.T) *Server {
 		ProviderUUID: "01234567-89ab-cdef-0123-456789abcdef",
 		Bech32Prefix: "manifest", RateLimitRPS: 0.001, RateLimitBurst: 1,
 		TrustedProxies: []string{"127.0.0.1/32"},
-		CallbackHMACSecrets: map[backendidentity.ID]string{
+		CallbackKeys: callbackKeysForTest(t, map[backendidentity.ID]string{
 			callbackKeyringID(t, callbackKeyringStorageA): callbackKeyringSecretA,
 			callbackKeyringID(t, callbackKeyringStorageB): callbackKeyringSecretB,
-		},
+		}),
 	}, ServerDeps{
 		ChainClient: &mockChainClient{}, CallbackPublisher: &mockCallbackPublisher{},
 		CallbackProofVerifier: verifier,

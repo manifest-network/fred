@@ -403,7 +403,7 @@ func (resolver startupIdentityResolver) ExpectedBackendStorageIdentity(
 	return id, exists && id.Valid()
 }
 
-func TestCallbackHMACSecretsBindKeysToPreparedStorageIdentities(t *testing.T) {
+func TestCallbackKeysBindKeysToPreparedStorageIdentities(t *testing.T) {
 	t.Parallel()
 	idA := startupStorageID(t, "253b5115-e341-40ee-8686-bb56f1d795d4")
 	idB := startupStorageID(t, "f547a804-17f8-4977-99c8-1154a939d899")
@@ -411,21 +411,30 @@ func TestCallbackHMACSecretsBindKeysToPreparedStorageIdentities(t *testing.T) {
 		secretA = "backend-a-secret-0123456789abcdef"
 		secretB = "backend-b-secret-0123456789abcdef"
 	)
+	const previousB = "backend-b-old-secret-0123456789ab"
 	cfg := &config.Config{Backends: []config.BackendConfig{
 		{Name: "backend-a", HMACSecret: secretA},
-		{Name: "backend-b", HMACSecret: secretB},
+		{Name: "backend-b", HMACSecret: secretB, HMACSecretPrevious: previousB},
 	}}
 
-	keyring, err := callbackHMACSecrets(cfg, startupIdentityResolver{
+	keyring, err := callbackKeys(cfg, startupIdentityResolver{
 		"backend-a": idA,
 		"backend-b": idB,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, map[backendidentity.ID]string{idA: secretA, idB: secretB}, keyring)
+	require.Len(t, keyring, 2)
+	assert.Equal(t, "backend-a", keyring[idA].Backend)
+	assert.Equal(t, hmacauth.KeyID(secretA), keyring[idA].Keys.CurrentKeyID())
+	assert.False(t, keyring[idA].Keys.HasRotation())
+	assert.Equal(t, "backend-b", keyring[idB].Backend)
+	assert.Equal(t, hmacauth.KeyID(secretB), keyring[idB].Keys.CurrentKeyID())
+	previousID, rotating := keyring[idB].Keys.RotationKeyID()
+	require.True(t, rotating)
+	assert.Equal(t, hmacauth.KeyID(previousB), previousID)
 
-	_, err = callbackHMACSecrets(cfg, startupIdentityResolver{"backend-a": idA})
+	_, err = callbackKeys(cfg, startupIdentityResolver{"backend-a": idA})
 	require.ErrorContains(t, err, `backend "backend-b" has no prepared storage identity`)
-	_, err = callbackHMACSecrets(cfg, startupIdentityResolver{
+	_, err = callbackKeys(cfg, startupIdentityResolver{
 		"backend-a": idA,
 		"backend-b": idA,
 	})

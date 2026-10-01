@@ -36,6 +36,10 @@ const (
 	// With DefaultBatchSize=50 and DefaultFlushInterval=50ms, the theoretical
 	// throughput is ~1000 ops/sec, so this buffer handles short bursts well.
 	writeChannelSize = 1000
+
+	// liveStoreInitialMmapSize is the live database's initial bbolt mapping.
+	// It reserves address space, not memory.
+	liveStoreInitialMmapSize = 1 << 30
 )
 
 var (
@@ -163,6 +167,10 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 	var openedInfo os.FileInfo
 	db, err := bolt.Open(canonicalPath, 0o600, &bolt.Options{
 		Timeout: 5 * time.Second,
+		// Online snapshots hold a read transaction while they copy; a writer
+		// that must remap blocks until it ends. A large initial mapping (virtual
+		// address space only) makes that rare.
+		InitialMmapSize: liveStoreInitialMmapSize,
 		OpenFile: func(requested string, flag int, mode os.FileMode) (*os.File, error) {
 			if requested != canonicalPath {
 				return nil, errors.New("bbolt requested an unexpected payload database path")

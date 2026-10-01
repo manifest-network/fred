@@ -601,15 +601,20 @@ enforcement errors. See [DEPLOYMENT.md](DEPLOYMENT.md) for the systemd
 | Secret | Minimum Length | Constant-Time | Logged |
 |--------|---------------|---------------|--------|
 | `backends[].hmac_secret` (providerd) / that backend's `callback_secret` | 32 bytes; unique per backend | Yes (`hmac.Equal`) | Never |
+| `backends[].hmac_secret_previous` (providerd) / a backend's `callback_secret_next` | 32 bytes; verify-only, never signs. By HMAC equivalence, providerd checks `hmac_secret_previous` against every key it holds; a backend checks `callback_secret_next` only against its own `callback_secret`, so never reuse another backend's key | Yes (`hmac.Equal`, both keys always computed) | Never; non-secret key IDs only on request (`-print-hmac-key-ids`) |
 | Callback `operation_id` / `lifecycle_id` capability | Canonical random UUIDv4 | Exact typed comparison after HMAC authentication | Never; only a domain-separated fingerprint |
 | Payload `meta_hash` | 64 hex chars | Yes (`subtle.ConstantTimeCompare`) | Never |
 | ADR-036 signatures | N/A | secp256k1 library verify | Signature logged in debug (public data) |
 
-**Secret rotation:** Each backend key is static for that provider/backend
-channel. Rotate one channel with a coordinated stopped restart so queued
-callbacks and provider commands never cross a mixed-key interval. See
-[DEPLOYMENT.md § Secret rotation](DEPLOYMENT.md#secret-rotation) for the
-procedure.
+**Secret rotation:** Each backend key can rotate without a coordinated stop.
+During the rotation each side accepts one extra verify-only key (providerd's
+`backends[].hmac_secret_previous`, the backend's `callback_secret_next`) and
+signs only with its main key; the key types make the extra key unusable for
+signing, and a test keeps every read of it in validation and its keys
+constructor. Uniqueness across every current and previous key is checked by
+HMAC equivalence. The old key stays valid until the last step, so rotate a
+compromised key with a stopped restart instead. See
+[DEPLOYMENT.md § Secret rotation](DEPLOYMENT.md#secret-rotation).
 
 ## Production Mode
 

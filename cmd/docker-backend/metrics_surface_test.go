@@ -55,7 +55,7 @@ var sharedFamilies = map[string]bool{
 // matched three docker-backends and missed the one host with a signer pool —
 // wrong in both directions at once, and silent.
 func TestMetricSurfaceIsBackendOwned(t *testing.T) {
-	h := NewServer(nil, testSecret, slog.Default(), docker.DefaultMaxRequestBodySize).Handler()
+	h := NewServer(nil, testRequestKeys, slog.Default(), docker.DefaultMaxRequestBodySize).Handler()
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
