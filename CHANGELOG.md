@@ -972,6 +972,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Backup guidance no longer calls a lost `payloads.db` low-risk. Tenants can
+  re-upload only a PENDING lease's original manifest, so without the file an
+  ACTIVE lease cannot be re-provisioned and an in-flight attempt cannot be
+  re-sent. Back it up and restore it with `placements.db`, from the same moment.
+  The restore section now lists what restoring an older pair does to each lease.
 - One tenant could stop a whole docker-backend. A failed, effect-started
   update keeps a receipt that names its target release row, but release-history
   compaction protects only the newest and the latest active rows, so later

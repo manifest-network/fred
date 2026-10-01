@@ -683,7 +683,7 @@ and preserve that safety evidence.
 | `<docker>/callbacks.db` | Critical — write-ahead provision/restore operation rows (Pending/Succeeded/Failed), replacement intents, immutable resource/target authority, non-expiring destructive-close finalizers, durable exact/lifecycle deliveries, and per-lease FIFO evidence. Terminal operation rows remain after callback delivery as exact retry and restore-recovery authority until an authorized successor atomically retires them. Causal/close rows and exact operation/maintenance completions do not age out; typed lifecycle observations are retained up to `callback_max_age`. Pre-identity v0.13 outbox rows must be drained while the old backend is still running and are never admitted into the current runtime queue | Accepted or terminal operation state, partial-replacement/close authority, immutable sizing, and queued callback evidence are not recreated. Normal startup refuses a missing file instead of rebuilding its schema. Losing a terminal restore result can make a safe source handback unknowable; absence is invalid rather than Failed. Losing a maintenance row can make an exact replacement cohort unclassifiable; losing a close row after teardown starts can turn an intentional zero-survivor cohort into unexplained release divergence. Restore this file with the matching `releases.db`, `retention.db`, marker pair, and substrate |
 | Backend storage-lineage seal | Critical — the marker pair plus every identity-bound authoritative store bind a backend name to one substrate generation | Docker's set is `callbacks.db`, `releases.db`, `retention.db`, both markers, and the substrate; k3s uses `callbacks.db`, `releases.db`, both markers, and the cluster. Every authoritative database must remain an unsymlinked, single-link regular file with exact mode `0600`; startup and runtime re-attestation fail closed on drift. Restore the complete matching set. One missing, corrupt, foreign, cross-kind, or path/inode-replaced member intentionally prevents startup. Never copy markers onto replacement storage or rerun initialization to repair a committed seal. Whenever Docker has `volume_data_path`, the primary is `volume_data_path/.fred-backend-storage-identity.json` and the anchor is `callback_db_path.storage-identity-anchor.json`; Docker without a managed volume root and k3s keep both adjacent to `callback_db_path`. If all paths share one mount, the set detects partial deletion/torn initialization but is not an independent backup—protect and snapshot the whole mount |
 | `placement_store_db_path` | Critical — provider binding, unresolved attempts, ordinary and rejected-positive (`untrusted_positive`) quarantine, immutable backend-name/storage pins, topology history, and the durable inventory baseline are non-derivable safety authority | Restore the exact file only while `providerd` is stopped, then [attest it](#restoring-an-older-placement-backup) before the first start. It must be an unsymlinked, single-link regular file with exact mode `0600`. Normal startup never creates, initializes, or migrates an absent/empty/unprepared replacement, and rejects a file bound to another provider. The fresh initializer is only for a genuinely new provider with zero total chain lease history; it is never recovery for a lost database |
-| `payload_store_db_path` | Low — pending tenant manifests, which tenants can re-upload | Restore only while `providerd` is stopped as an unsymlinked, single-link regular file with exact mode `0600`; otherwise tenants must re-upload pending payloads |
+| `payload_store_db_path` | High — the manifest of every PENDING lease, the current manifest of every ACTIVE lease (Fred re-provisions from it after a crash or host reboot, including manifests a tenant `/update` replaced), and the exact bytes an in-flight provision attempt must re-send | Back it up and restore it together with `placement_store_db_path`, from the same moment, and only while `providerd` is stopped, as an unsymlinked, single-link regular file with exact mode `0600`. Tenants can re-upload only a PENDING lease's original manifest, which must match its on-chain hash. Without the file, an ACTIVE lease that needs re-provisioning stays deferred (`payload not available`) and an in-flight attempt stays unresolved. See [Restoring an older placement backup](#restoring-an-older-placement-backup) |
 | `token_tracker_db_path` | None — replay protection has 30s window anyway | Empties on restart, acceptable. bbolt creates a missing file with mode `0600`, but this short-lived cache is not lineage/path identity-bound like placement or payload authority; replace it only while providerd is stopped |
 
 Ordinary file-copy backups must be taken with the owning daemon stopped (bbolt's
@@ -744,6 +744,23 @@ authority. On the next start `/readyz` reports `placement inventory not ready`
 until one sweep in which every configured backend answers both inventory
 endpoints; until then new admission and backend removal wait, and existing
 leases keep running. That sweep adopts every lease its owner reports.
+
+What restoring an older pair does to each lease, once attested (restore
+`placements.db` and `payloads.db` from the same moment; never combine files from
+different moments):
+
+- A lease created after the copy is adopted once, from its owner's report on the
+  first complete inventory.
+- A lease closed after the copy is pruned after a terminal chain read.
+- A lease re-provisioned after the copy reports a different lifecycle generation
+  and is quarantined `unusable`: its callbacks are dropped and restart and update
+  are refused until an operator repairs it.
+- A lease updated after the copy still has its pre-update manifest in
+  `payloads.db`, so its next re-provision brings the old manifest back. Re-apply
+  those updates.
+- A restart or update still pending in the copy is replayed with its original
+  key and stamp. One the backend completed settles from its receipt; one the
+  backend no longer remembers settles as expired and never runs again.
 
 ### Retiring a backend whose storage is lost
 
