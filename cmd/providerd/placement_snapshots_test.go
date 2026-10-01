@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,8 +63,9 @@ func TestPlacementSnapshotsBindTheConfiguredDirectory(t *testing.T) {
 }
 
 // TestShutdownJoinsPlacementSnapshotsBeforeTheStoresClose pins the composition
-// root: the snapshot loop runs on its own WaitGroup, and shutdown waits for it
-// before the provision manager closes the payload store.
+// root: the snapshot loop runs on its own WaitGroup, and shutdown joins it
+// within the shutdown budget before the provision manager closes the payload
+// store.
 func TestShutdownJoinsPlacementSnapshotsBeforeTheStoresClose(t *testing.T) {
 	fset := token.NewFileSet()
 	source, err := parser.ParseFile(fset, "main.go", nil, 0)
@@ -80,24 +83,28 @@ func TestShutdownJoinsPlacementSnapshotsBeforeTheStoresClose(t *testing.T) {
 		if !ok {
 			return true
 		}
+		groupArgument := func(index int) bool {
+			if len(call.Args) <= index {
+				return false
+			}
+			group, ok := call.Args[index].(*ast.UnaryExpr)
+			if !ok {
+				return false
+			}
+			name, ok := group.X.(*ast.Ident)
+			return ok && name.Name == "snapshotWG"
+		}
 		switch function := call.Fun.(type) {
 		case *ast.Ident:
-			if function.Name == "safeGo" && len(call.Args) > 0 {
-				if group, ok := call.Args[0].(*ast.UnaryExpr); ok {
-					if name, ok := group.X.(*ast.Ident); ok && name.Name == "snapshotWG" {
-						started = append(started, call.Pos())
-					}
-				}
+			switch {
+			case function.Name == "safeGo" && groupArgument(0):
+				started = append(started, call.Pos())
+			case function.Name == "joinWithin" && groupArgument(1):
+				joined = append(joined, call.Pos())
 			}
 		case *ast.SelectorExpr:
 			owner, ok := function.X.(*ast.Ident)
-			if !ok {
-				return true
-			}
-			switch {
-			case owner.Name == "snapshotWG" && function.Sel.Name == "Wait":
-				joined = append(joined, call.Pos())
-			case owner.Name == "provisionMgr" && function.Sel.Name == "Close":
+			if ok && owner.Name == "provisionMgr" && function.Sel.Name == "Close" {
 				closed = append(closed, call.Pos())
 			}
 		}
@@ -108,4 +115,15 @@ func TestShutdownJoinsPlacementSnapshotsBeforeTheStoresClose(t *testing.T) {
 	require.Len(t, closed, 1)
 	assert.Less(t, started[0], joined[0])
 	assert.Less(t, joined[0], closed[0], "shutdown joins the snapshot loop before the stores close")
+}
+
+func TestJoinWithinReportsWhetherTheGroupFinished(t *testing.T) {
+	var group sync.WaitGroup
+	assert.True(t, joinWithin(t.Context(), &group), "an idle group joins at once")
+
+	group.Add(1)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	assert.False(t, joinWithin(ctx, &group), "a busy group is abandoned when the budget ends")
+	group.Done()
 }

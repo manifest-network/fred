@@ -205,6 +205,11 @@ func (cut ConsistentCut) Stream(
 	if err := errors.Join(placements.err, payloads.err); err != nil {
 		return CutReceipt{}, fmt.Errorf("copy online snapshot: %w", err)
 	}
+	// A copy that ends at shutdown is never published, and the stores may
+	// already be closing.
+	if err := context.Cause(ctx); err != nil {
+		return CutReceipt{}, err
+	}
 	if placements.size != state.placementsSize || payloads.size != state.payloadsSize {
 		return CutReceipt{}, fmt.Errorf(
 			"copy online snapshot: copied %d and %d bytes, expected %d and %d",

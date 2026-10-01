@@ -98,8 +98,9 @@ type AuthorityCounts struct {
 	LostPlacementRows       int `json:"lost_placement_rows"`
 	LifecycleRows           int `json:"lifecycle_rows"`
 	UnusableLifecycleRows   int `json:"unusable_lifecycle_rows"`
-	// UnusableAdoptionCandidates counts quarantined lifecycle rows that
-	// placement-repair -adopt-observed-generation can repair.
+	// UnusableAdoptionCandidates counts quarantined lifecycle rows whose stored
+	// pair placement-repair -adopt-observed-generation would accept. The repair
+	// also needs live inventory to agree, so a candidate can still be refused.
 	UnusableAdoptionCandidates int `json:"unusable_adoption_candidates"`
 	DetachedLifecycleRows      int `json:"detached_lifecycle_rows"`
 }

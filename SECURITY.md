@@ -601,7 +601,7 @@ enforcement errors. See [DEPLOYMENT.md](DEPLOYMENT.md) for the systemd
 | Secret | Minimum Length | Constant-Time | Logged |
 |--------|---------------|---------------|--------|
 | `backends[].hmac_secret` (providerd) / that backend's `callback_secret` | 32 bytes; unique per backend | Yes (`hmac.Equal`) | Never |
-| `backends[].hmac_secret_previous` (providerd) / a backend's `callback_secret_next` | 32 bytes; verify-only, never signs; distinct from every other key by HMAC equivalence | Yes (`hmac.Equal`, both keys always computed) | Never; non-secret key IDs only on request (`-print-hmac-key-ids`) |
+| `backends[].hmac_secret_previous` (providerd) / a backend's `callback_secret_next` | 32 bytes; verify-only, never signs. By HMAC equivalence, providerd checks `hmac_secret_previous` against every key it holds; a backend checks `callback_secret_next` only against its own `callback_secret`, so never reuse another backend's key | Yes (`hmac.Equal`, both keys always computed) | Never; non-secret key IDs only on request (`-print-hmac-key-ids`) |
 | Callback `operation_id` / `lifecycle_id` capability | Canonical random UUIDv4 | Exact typed comparison after HMAC authentication | Never; only a domain-separated fingerprint |
 | Payload `meta_hash` | 64 hex chars | Yes (`subtle.ConstantTimeCompare`) | Never |
 | ADR-036 signatures | N/A | secp256k1 library verify | Signature logged in debug (public data) |

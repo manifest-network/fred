@@ -494,7 +494,6 @@ func DefaultConfig() Config {
 	}
 }
 
-// Validate checks that the configuration is valid.
 // RequestKeys returns the keys accepted on providerd requests: callback_secret,
 // which the backend also signs callbacks with, and the verify-only
 // callback_secret_next during a rotation.
@@ -505,6 +504,7 @@ func (c *Config) RequestKeys() (hmacauth.VerifyKeys, error) {
 	return hmacauth.NewVerifyKeys(string(c.CallbackSecret), string(c.CallbackSecretNext))
 }
 
+// Validate checks that the configuration is valid.
 func (c *Config) Validate() error {
 	if err := backendname.Validate(c.Name); err != nil {
 		return fmt.Errorf("name: %w", err)

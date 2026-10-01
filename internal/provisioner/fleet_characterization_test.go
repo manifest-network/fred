@@ -1102,6 +1102,31 @@ func TestFleet_DegradedSweep_ReportsWhichBackendsAnsweredAndThatTheProjectionCom
 	assert.Equal(t, authoritativeBefore+1, promtestutil.ToFloat64(authoritative))
 }
 
+// A sweep Fred cancels while a backend read is in flight is its own
+// interruption. It must not count the unread backend as unanswered or report a
+// committed projection.
+func TestFleet_CanceledSweepRecordsNoBackendOutcome(t *testing.T) {
+	// Not parallel: process-global collectors, as above.
+	f := newFleet(t, fleetOptions{})
+	require.NoError(t, f.sweep())
+	require.Equal(t, 1.0, promtestutil.ToFloat64(metrics.ReconcilerSweepProjectionCommitted))
+
+	unanswered := metrics.ReconcilerBackendInventoryTotal.WithLabelValues(
+		"backend-2", metrics.InventoryOutcomeUnanswered)
+	before := promtestutil.ToFloat64(unanswered)
+	f.backendAt(2).setFault(faultHang)
+	ctx, cancel := context.WithCancel(f.t.Context())
+	defer cancel()
+	stop := time.AfterFunc(200*time.Millisecond, cancel)
+	defer stop.Stop()
+
+	require.ErrorIs(t, f.reconciler.ReconcileAll(ctx), context.Canceled)
+	assert.Equal(t, before, promtestutil.ToFloat64(unanswered),
+		"the backend whose read Fred canceled is not counted as unanswered")
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.ReconcilerSweepProjectionCommitted),
+		"a canceled sweep commits nothing")
+}
+
 // Tenant failures must stop tenant requests without suppressing the inventory
 // needed to observe recovery. A successful recovery sweep is not permission to
 // reset the independent tenant breaker or dispatch a tenant request through it.

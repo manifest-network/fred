@@ -446,3 +446,28 @@ func TestGenerationAdoptionCapabilitiesAreMintedOnlyByTheirConstructors(t *testi
 		t.Error(violation)
 	}
 }
+
+func TestRepairListMarksOnlyAdoptionCandidates(t *testing.T) {
+	dbPath, _, _ := createGenerationQuarantineFixture(t)
+	inspector, err := OpenRepairInspector(dbPath, freshTestProviderUUID)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, inspector.Close()) }()
+	records := inspector.List()
+	require.Len(t, records, 1)
+	assert.True(t, records[0].AdoptionCandidate)
+	record, found, err := inspector.Inspect(repairLease)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.True(t, record.AdoptionCandidate)
+
+	healthyPath, _, _ := createGenerationQuarantineFixture(t)
+	rewriteLifecycleRowForTest(t, healthyPath, func(capability *lifecycleCapability) {
+		capability.unusable = false
+	})
+	healthy, err := OpenRepairInspector(healthyPath, freshTestProviderUUID)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, healthy.Close()) }()
+	for _, record := range healthy.List() {
+		assert.False(t, record.AdoptionCandidate, "a healthy lease is not a candidate")
+	}
+}

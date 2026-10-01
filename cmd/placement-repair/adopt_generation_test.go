@@ -224,6 +224,13 @@ func TestRun_AdoptObservedGenerationRefusesAGenerationTheDryRunDidNotShow(t *tes
 		"the confirmation binds the generation the operator saw")
 }
 
+func TestRun_ListMarksAdoptionCandidates(t *testing.T) {
+	fixture := newGenerationCommandFixture(t)
+	var stdout bytes.Buffer
+	require.NoError(t, run(t.Context(), []string{"-config", fixture.configPath, "-list"}, &stdout, &bytes.Buffer{}))
+	assert.Contains(t, stdout.String(), `"adoption_candidate":true`)
+}
+
 func TestRun_AdoptObservedGenerationFlagsAreExact(t *testing.T) {
 	fixture := newGenerationCommandFixture(t)
 	with := func(extra ...string) []string { return append(append([]string{}, fixture.args...), extra...) }

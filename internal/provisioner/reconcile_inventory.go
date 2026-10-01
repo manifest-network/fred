@@ -110,6 +110,12 @@ func (r *Reconciler) collectInventory(
 		}
 		inventory.rejectBackend(backendName)
 	}
+	// A sweep canceled while reading is Fred's own interruption, not silence
+	// from the backends it did not finish reading. Abandon it unsealed, so it
+	// records no outcome and commits no projection.
+	if err := ctx.Err(); err != nil {
+		return reconcileInventory{}, err
+	}
 	if err := sweep.SealInventory(); err != nil {
 		return reconcileInventory{}, fmt.Errorf("seal inventory evidence: %w", err)
 	}

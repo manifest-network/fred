@@ -14,9 +14,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   lease's only owner in complete inventory, reporting a settled new generation
   for the same tenant, and the stored rows must be consistent apart from the
   quarantine. `-apply` requires `-backup`, `-confirm`, and
-  `-attest-generation`. `-classify` counts such leases in
-  `counts.unusable_adoption_candidates`. See DEPLOYMENT.md, "Adopting a
-  lifecycle generation after a restore".
+  `-attest-generation`. `-classify` counts candidates in
+  `counts.unusable_adoption_candidates`, and `-list` marks each
+  `adoption_candidate`. See DEPLOYMENT.md, "Adopting a lifecycle generation
+  after a restore".
 - providerd can snapshot `placements.db` and `payloads.db` while it runs. Set
   `placement_snapshot_dir` (with `placement_snapshot_interval`, default `1h`, and
   `placement_snapshot_retain`, default 24 sets). Each set is one consistent pair
@@ -41,7 +42,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `fred_docker_backend_request_next_key_configured`. Key uniqueness is now
   checked by HMAC equivalence across every current and previous key, so a key
   with trailing zero bytes counts as the same key. Older binaries reject the
-  new keys, so upgrade both before the first rotation.
+  new YAML keys but ignore `DOCKER_BACKEND_CALLBACK_SECRET_NEXT`, so upgrade both
+  before the first rotation.
 - Per-backend reconciliation metrics for a readiness gate that tolerates a
   known-down backend: `fred_reconciler_backend_inventory_total{backend,outcome}`
   (`authoritative`, `partial`, `untrusted`, `provisions_only`, `retentions_only`,
@@ -53,7 +55,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `fred_docker_backend_image_helpers_unsettled{reason}` counts the
   image-inspection helpers left after each recovery pass: `unknown_create` (kept
   in case the container appears late) and `cleanup_pending` (retried every pass).
-  Either blocks image ingestion and image GC. These were previously only logged.
+  On the containerd image store, either blocks image ingestion and image GC.
+  These were previously only logged.
 - `placement-repair -retire-lost-backend` retires a backend whose storage is
   irrecoverably lost, which was previously impossible: Fred refuses to drop a
   backend while leases refer to it, so such a backend stranded its leases

@@ -72,11 +72,14 @@ func (snapshots *Directory) publishAs(
 	if err != nil {
 		return err
 	}
-	if err := errors.Join(attempt.seal(placementsTemp), attempt.seal(payloadsTemp)); err != nil {
+	if err := errors.Join(ctx.Err(), attempt.seal(placementsTemp), attempt.seal(payloadsTemp)); err != nil {
 		return err
 	}
 	verified, err := snapshots.verifyStaged(ctx, receipt, placementsTemp, payloadsTemp)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := attempt.publish(verified.placements, snapshots.names.file(set, fileKindPlacements)); err != nil {
@@ -89,6 +92,9 @@ func (snapshots *Directory) publishAs(
 		return fmt.Errorf("sync snapshot directory: %w", err)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	encoded, err := snapshots.names.newManifest(set, verified).encode()
 	if err != nil {
 		return err
@@ -183,6 +189,8 @@ func (attempt *publication) publish(staged stagedFile, final string) error {
 
 // abandon removes everything a failed attempt created: published files newest
 // first, so a manifest goes before the data it describes, then staged files.
+// If a published file cannot be removed, every older one is kept, so a manifest
+// never outlives the data it names.
 func (attempt *publication) abandon() error {
 	directory := attempt.snapshots.directory
 	var errs []error
@@ -192,23 +200,9 @@ func (attempt *publication) abandon() error {
 		}
 	}
 	for i := len(attempt.published) - 1; i >= 0; i-- {
-		final := attempt.published[i]
-		info, err := directory.Lstat(final.temp)
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-			continue
-		case err != nil:
-			errs = append(errs, fmt.Errorf("stat published snapshot file %s: %w", final.temp, err))
-			continue
-		case !os.SameFile(info, final.info):
-			errs = append(errs, fmt.Errorf("published snapshot file %s was replaced; leaving it", final.temp))
-			continue
-		}
-		if err := directory.Remove(final.temp); err != nil && !errors.Is(err, os.ErrNotExist) {
-			errs = append(errs, fmt.Errorf("remove published snapshot file %s: %w", final.temp, err))
-		}
-		if err := directory.Sync(); err != nil {
-			errs = append(errs, fmt.Errorf("sync snapshot directory: %w", err))
+		if err := attempt.unpublish(attempt.published[i]); err != nil {
+			errs = append(errs, err)
+			break
 		}
 	}
 	for _, temp := range attempt.temps {
@@ -217,6 +211,28 @@ func (attempt *publication) abandon() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// unpublish removes one file this attempt published and makes the removal
+// durable before anything older is touched.
+func (attempt *publication) unpublish(final stagedFile) error {
+	directory := attempt.snapshots.directory
+	info, err := directory.Lstat(final.temp)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	case err != nil:
+		return fmt.Errorf("stat published snapshot file %s: %w", final.temp, err)
+	case !os.SameFile(info, final.info):
+		return fmt.Errorf("published snapshot file %s was replaced; leaving it and older files", final.temp)
+	}
+	if err := directory.Remove(final.temp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove published snapshot file %s: %w", final.temp, err)
+	}
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("sync snapshot directory: %w", err)
+	}
+	return nil
 }
 
 // verifyStaged re-reads both staged copies against the receipt.
@@ -274,6 +290,9 @@ func (snapshots *Directory) verifyCopy(
 	}
 	if !bytes.Equal(hash.Sum(nil), want.SHA256[:]) {
 		return nil, errors.New("staged copy does not match the streamed digest")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if err := snapshots.checkBolt(temp, info); err != nil {
 		return nil, err

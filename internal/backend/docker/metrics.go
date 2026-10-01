@@ -350,7 +350,7 @@ var (
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "image_helpers_unsettled",
-		Help:      "Image-inspection helper receipts left after the latest recovery pass and owned by no live inspection, by reason; nonzero blocks image ingestion and image GC",
+		Help:      "Image-inspection helper receipts left after the latest recovery pass and owned by no live inspection, by reason; on the containerd image store, nonzero blocks image ingestion and image GC",
 	}, []string{"reason"})
 
 	// Terminal receipts retain cleanup authority after their resource snapshots

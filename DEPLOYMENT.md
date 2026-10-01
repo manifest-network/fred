@@ -425,8 +425,9 @@ trailing zero bytes counts as the same key.
 Each side accepts one extra verify-only key, so one backend's key can rotate
 without stopping `providerd` and the backend together. `providerd` restarts
 twice, so expect two short API restarts; nothing needs draining. Signing always
-uses each side's main key. Upgrade both binaries before step 1: an older binary
-rejects the new keys.
+uses each side's main key. Upgrade both binaries before step 1. An older binary
+rejects the new YAML keys but silently ignores
+`DOCKER_BACKEND_CALLBACK_SECRET_NEXT`; the step 2 gate below catches that.
 
 For backend `B`, rotating `K_old` to `K_new`:
 
@@ -445,13 +446,18 @@ Before each restart, confirm the keys pair without exposing them.
 `providerd --print-hmac-key-ids --config <file>` and
 `docker-backend -print-hmac-key-ids -config <file>` print non-secret key IDs for
 the configuration you are about to start. Before step 2, `providerd`'s new
-`current_key_id` for `B` must equal `B`'s `next_key_id`; before step 3, `B`'s new
-`current_key_id` must equal `providerd`'s `current_key_id` for `B`. Print IDs only
-when needed and never log them: an ID still lets someone test guesses of a weak
-key.
+`current_key_id` for `B` must equal `B`'s `next_key_id`, and its new
+`previous_key_id` for `B` must equal `B`'s `current_key_id`. Before step 3, `B`'s
+new `current_key_id` must equal `providerd`'s `current_key_id` for `B`. Print IDs
+only when needed and never log them: an ID still lets someone test guesses of a
+weak key.
 
 Gate each step on the metrics:
 
+- Before step 2, on the running `B`:
+  `fred_docker_backend_request_next_key_configured` is 1. The key-ID check reads
+  a configuration file and your shell's environment, not the service's, so only
+  this gauge proves the running backend accepts `K_new`.
 - Before step 3, on `B`: `fred_docker_backend_request_signature_key_total{slot="next"}`
   rises and `slot="current"` stays flat, so `providerd` already signs with `K_new`.
 - Before step 4, on `providerd`:
@@ -811,8 +817,10 @@ without a manifest is incomplete; never restore one.
 - Pruning runs after each published set. It keeps the newest complete sets and
   the set it just published, and deletes older complete sets, incomplete sets
   older than the newest complete one, and staged files left by a crash
-  (`.fred-snapshot-tmp-<provider_uuid>-*`). It considers only names carrying this
-  provider's UUID, never deletes anything but a regular file owned by the service
+  (`.fred-snapshot-tmp-<provider_uuid>-*`, removed before each attempt). A set
+  dated after the current time, left by a clock that ran ahead, is kept until
+  the clock passes it and does not count toward the retained sets. Pruning
+  considers only names carrying this provider's UUID, never deletes anything but a regular file owned by the service
   user, never unlinks a live database, and keeps any set it cannot read.
   Everything it keeps that way counts in
   `fred_placement_snapshot_prune_failures_total{reason}`.
@@ -820,15 +828,21 @@ without a manifest is incomplete; never restore one.
 To restore a set, with providerd stopped:
 
 ```bash
+bash -euo pipefail -c '
 cd /var/backups/fred
 set=fred-snapshot-<provider_uuid>-<timestamp>-<id>
-jq -r '.placements.sha256 + "  " + .placements.name,
-       .payloads.sha256 + "  " + .payloads.name' "$set.manifest.json" | sha256sum -c
+jq -r ".placements.sha256 + \"  \" + .placements.name,
+       .payloads.sha256 + \"  \" + .payloads.name" "$set.manifest.json" | sha256sum -c
 mv /var/lib/fred/placements.db /var/lib/fred/placements.db.before-restore
 mv /var/lib/fred/payloads.db /var/lib/fred/payloads.db.before-restore
 install -m 0600 -o fred -g fred "$set.placements.db" /var/lib/fred/placements.db
 install -m 0600 -o fred -g fred "$set.payloads.db" /var/lib/fred/payloads.db
+sync
+'
 ```
+
+The script stops at the first failure, so a copy that does not match its
+manifest is never installed.
 
 Then attest the restored pair as described next, and start providerd.
 
@@ -872,7 +886,10 @@ What restoring an older pair does to each lease, once attested (restore
 different moments):
 
 - A lease created after the copy is adopted once, from its owner's report on the
-  first complete inventory.
+  first complete inventory. The restored `payloads.db` has no manifest for it:
+  it keeps running, but if it ever needs re-provisioning Fred cannot rebuild it.
+  The reconciler then retries it every sweep with `payload not available`, and
+  each sweep reports `partial`. A tenant update stores the manifest again.
 - A lease closed after the copy is pruned after a terminal chain read.
 - A lease re-provisioned after the copy reports a different lifecycle generation
   and is quarantined `unusable`: its callbacks are dropped and restart and update
@@ -891,10 +908,15 @@ A lease re-provisioned after the restored copy was taken is quarantined
 `unusable` on the first sweep: its backend reports a lifecycle generation the
 copy has never seen. Its callbacks are dropped and restart and update are
 refused, but the workload keeps running. `placement-repair -classify` counts
-these leases in `counts.unusable_adoption_candidates` and marks their rows
-`unusable_adoption_candidate`. A quarantine that the lease's own stored rows
-explain, such as an owner or tenant that contradicts its operation metadata,
-never qualifies.
+repair candidates in `counts.unusable_adoption_candidates`, and
+`placement-repair -list` marks each candidate row `"adoption_candidate": true`
+(`-classify` reports at most 128 rows, so use `-list` to find them). A
+candidate's stored rows are consistent apart from the quarantine; the repair
+still requires live inventory to agree, so it refuses, for example, a lease its
+backend now only retains. A quarantine the stored rows explain, such as an owner
+or tenant that contradicts the operation metadata, is never a candidate. Neither
+is a lease whose stored generation is untyped (adopted from v0.13) or carries no
+tenant: those leases stay quarantined.
 
 With providerd stopped, for each such lease:
 

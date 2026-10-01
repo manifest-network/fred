@@ -52,7 +52,11 @@ func OpenDirectory(path, providerUUID string, live LiveDatabases) (*Directory, e
 		if err != nil {
 			return nil, fmt.Errorf("stat live database: %w", err)
 		}
-		parent, err := fsidentity.InspectDirectory(filepath.Dir(livePath))
+		parentPath, err := filepath.EvalSymlinks(filepath.Dir(livePath))
+		if err != nil {
+			return nil, fmt.Errorf("resolve live database directory: %w", err)
+		}
+		parent, err := fsidentity.InspectDirectory(parentPath)
 		if err != nil {
 			return nil, fmt.Errorf("inspect live database directory: %w", err)
 		}

@@ -104,7 +104,11 @@ func fileSHA256(t *testing.T, path string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-var baseTime = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+var (
+	baseTime = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	// pruneTime is a day after every fixture set, so none is dated ahead of it.
+	pruneTime = baseTime.Add(24 * time.Hour)
+)
 
 func TestNamesRoundTripAndIgnoreEveryOtherName(t *testing.T) {
 	names, err := newNamer(placementstore.ProviderUUID)
@@ -283,7 +287,7 @@ func TestPruneKeepsTheNewestSetsAndTheSetItJustPublished(t *testing.T) {
 	for i := range 5 {
 		sets = append(sets, f.publishAt(t, baseTime.Add(time.Duration(i)*time.Hour)))
 	}
-	report := f.snapshots.prune(sets[0], 2)
+	report := f.snapshots.prune(sets[0], 2, pruneTime)
 	assert.Empty(t, report.failures)
 	assert.Equal(t, 6, report.removed)
 	var want []string
@@ -331,7 +335,9 @@ func TestPruneTouchesOnlyWhatItCanProveIsItsOwn(t *testing.T) {
 	behindRefusal := f.snapshots.names.file(hardLinkedSet, fileKindPayloads)
 	require.NoError(t, os.WriteFile(path(behindRefusal), []byte("x"), 0o600))
 
-	report := f.snapshots.prune(setName{}, 1)
+	leftovers := f.snapshots.removeLeftoverStaging()
+	assert.Equal(t, 1, leftovers.removed)
+	report := f.snapshots.prune(setName{}, 1, pruneTime)
 	assert.Equal(t, map[pruneFailure]int{pruneFailureLiveDatabase: 1, pruneFailureNotOwned: 1}, report.failures)
 	entries := f.entries(t)
 	for _, name := range foreign {
@@ -351,7 +357,7 @@ func TestPruneTouchesOnlyWhatItCanProveIsItsOwn(t *testing.T) {
 	assert.Contains(t, entries, hardLinked)
 	assert.Contains(t, entries, behindRefusal, "a refused data file stops the rest of its set's deletion")
 
-	report = f.snapshots.prune(setName{}, 1)
+	report = f.snapshots.prune(setName{}, 1, pruneTime)
 	assert.Equal(t, map[pruneFailure]int{pruneFailureLiveDatabase: 1, pruneFailureNotOwned: 1}, report.failures)
 	for _, live := range []string{f.live.Placements, f.live.Payloads} {
 		info, err := os.Lstat(live)
@@ -374,7 +380,7 @@ func TestPruneKeepsASetWhoseManifestItCannotRead(t *testing.T) {
 	complete, doubt := f.snapshots.classify(old)
 	assert.False(t, complete)
 	assert.Equal(t, pruneFailureInspect, doubt)
-	report := f.snapshots.prune(setName{}, 1)
+	report := f.snapshots.prune(setName{}, 1, pruneTime)
 	assert.Equal(t, map[pruneFailure]int{pruneFailureInspect: 1}, report.failures)
 	for _, name := range f.setFiles(old) {
 		assert.Contains(t, f.entries(t), name, "doubt keeps the whole set")
@@ -587,4 +593,98 @@ func TestTheSnapshotPackageNeverWritesThroughAPath(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+func TestPruneKeepsSetsDatedAheadOfTheClockWithoutLettingThemDisplaceCurrentOnes(t *testing.T) {
+	f := newFixture(t)
+	older := f.publishAt(t, baseTime)
+	current := f.publishAt(t, baseTime.Add(time.Hour))
+	ahead := f.publishAt(t, baseTime.Add(48*time.Hour))
+	now := baseTime.Add(2 * time.Hour)
+
+	report := f.snapshots.prune(setName{}, 1, now)
+	assert.Empty(t, report.failures)
+	entries := f.entries(t)
+	for _, name := range append(f.setFiles(current), f.setFiles(ahead)...) {
+		assert.Contains(t, entries, name, "the current set and the set dated ahead are both kept")
+	}
+	for _, name := range f.setFiles(older) {
+		assert.NotContains(t, entries, name)
+	}
+}
+
+func TestEachAttemptFirstRemovesLeftoverStaging(t *testing.T) {
+	f := newFixture(t)
+	settings, err := NewSettings(time.Hour, 3)
+	require.NoError(t, err)
+	service, err := NewService(f.placements, f.payloads, f.snapshots, settings)
+	require.NoError(t, err)
+	own := f.snapshots.names.tempPrefix() + strings.Repeat("2", 32)
+	others, err := newNamer(otherProvider)
+	require.NoError(t, err)
+	foreign := others.tempPrefix() + strings.Repeat("3", 32)
+	for _, name := range []string{own, foreign} {
+		require.NoError(t, os.WriteFile(filepath.Join(f.dir, name), []byte("crashed attempt"), 0o600))
+	}
+
+	result, report := service.snapshotOnce(t.Context(), pruneTime)
+	require.Equal(t, outcomeSuccess, result)
+	assert.Equal(t, 1, report.removed)
+	entries := f.entries(t)
+	assert.NotContains(t, entries, own)
+	assert.Contains(t, entries, foreign, "another provider's staged file is never touched")
+}
+
+func TestACanceledAttemptLeavesNothingBehind(t *testing.T) {
+	f := newFixture(t)
+	cut := f.capture(t, time.Minute)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := f.snapshots.publish(ctx, cut, baseTime)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Empty(t, f.entries(t))
+}
+
+func TestAbandonKeepsOlderFilesWhenAPublishedFileCannotBeRemoved(t *testing.T) {
+	f := newFixture(t)
+	attempt := &publication{snapshots: f.snapshots, open: make(map[string]*os.File)}
+	stage := func(name string) stagedFile {
+		path := filepath.Join(f.dir, name)
+		require.NoError(t, os.WriteFile(path, []byte(name), 0o600))
+		info, err := os.Lstat(path)
+		require.NoError(t, err)
+		return stagedFile{temp: name, info: info}
+	}
+	data := stage("data")
+	manifest := stage("manifest")
+	attempt.published = []stagedFile{data, manifest}
+	// The manifest's name now holds another inode, so abandon must not remove
+	// it, and must then keep the data it describes.
+	require.NoError(t, os.Remove(filepath.Join(f.dir, "manifest")))
+	require.NoError(t, os.WriteFile(filepath.Join(f.dir, "manifest"), []byte("replaced"), 0o600))
+
+	assert.ErrorContains(t, attempt.abandon(), "was replaced")
+	assert.ElementsMatch(t, []string{"data", "manifest"}, f.entries(t))
+}
+
+func TestOpenDirectoryResolvesASymlinkedLiveDatabaseDirectory(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "fred")
+	require.NoError(t, os.Symlink(real, link))
+	for _, name := range []string{"placements.db", "payloads.db"} {
+		require.NoError(t, os.WriteFile(filepath.Join(real, name), nil, 0o600))
+	}
+	live := LiveDatabases{
+		Placements: filepath.Join(link, "placements.db"),
+		Payloads:   filepath.Join(link, "payloads.db"),
+	}
+	dir := filepath.Join(t.TempDir(), "snapshots")
+	require.NoError(t, os.Mkdir(dir, 0o700))
+	snapshots, err := OpenDirectory(dir, placementstore.ProviderUUID, live)
+	require.NoError(t, err, "a symlinked live database directory is followed")
+	require.NoError(t, snapshots.Close())
+
+	_, err = OpenDirectory(real, placementstore.ProviderUUID, live)
+	assert.ErrorContains(t, err, "live database's directory",
+		"the directory behind the symlink is still the live database's directory")
 }

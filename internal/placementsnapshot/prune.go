@@ -6,6 +6,7 @@ import (
 	"os"
 	"slices"
 	"syscall"
+	"time"
 )
 
 // maxDirectoryEntries bounds one directory listing. Classification checks each
@@ -194,21 +195,25 @@ func (snapshots *Directory) newestComplete() (setName, bool) {
 }
 
 // prune keeps the newest retain complete sets and keep, which this pass just
-// published. It deletes older complete sets, incomplete sets older than the
-// newest complete one, and this provider's staged files: no attempt is running
-// while prune does, so a staged file is left over from a crash.
-func (snapshots *Directory) prune(keep setName, retain int) pruneReport {
+// published. It deletes older complete sets and incomplete sets older than the
+// newest complete one. A set dated after now, left by a clock that ran ahead, is
+// kept until the clock passes it and never displaces a current set.
+func (snapshots *Directory) prune(keep setName, retain int, now time.Time) pruneReport {
 	var report pruneReport
 	view, ok := snapshots.list(&report)
 	if !ok {
 		return report
 	}
 	retained := make(map[setName]bool, retain+1)
-	for i, set := range view.complete {
-		if i >= retain {
-			break
+	current := 0
+	for _, set := range view.complete {
+		switch {
+		case set.created.After(now):
+			retained[set] = true
+		case current < retain:
+			retained[set] = true
+			current++
 		}
-		retained[set] = true
 	}
 	if keep.valid() {
 		retained[keep] = true
@@ -226,6 +231,24 @@ func (snapshots *Directory) prune(keep setName, retain int) pruneReport {
 		}
 		snapshots.removeSet(set, &report)
 	}
+	if report.removed > 0 {
+		if err := snapshots.directory.Sync(); err != nil {
+			report.fail(pruneFailureSync)
+		}
+	}
+	return report
+}
+
+// removeLeftoverStaging deletes this provider's staged files. Attempts never
+// overlap and each removes its own staged files, so any found between attempts
+// were left by a crash. Removing them before the space check returns their
+// space to it.
+func (snapshots *Directory) removeLeftoverStaging() pruneReport {
+	var report pruneReport
+	view, ok := snapshots.list(&report)
+	if !ok {
+		return report
+	}
 	for _, temp := range view.temps {
 		snapshots.remove(temp, &report)
 	}
@@ -235,6 +258,16 @@ func (snapshots *Directory) prune(keep setName, retain int) pruneReport {
 		}
 	}
 	return report
+}
+
+// merge adds other's counts to report.
+func (report *pruneReport) merge(other pruneReport) {
+	report.removed += other.removed
+	for failure, count := range other.failures {
+		for range count {
+			report.fail(failure)
+		}
+	}
 }
 
 // removeSet deletes a set's manifest, makes that durable, then deletes its

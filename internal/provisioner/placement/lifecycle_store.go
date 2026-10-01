@@ -465,11 +465,6 @@ func loadLifecycleCapabilities(tx *bolt.Tx) (map[string]lifecycleCapability, err
 	return cache, nil
 }
 
-// quarantineLifecycleBindings withdraws lifecycle authority only for leases
-// whose two durable records cannot be interpreted together. A bad row must not
-// prevent unrelated leases or the provider process from starting. Current
-// capabilities may intentionally outlive placement deletion, but every typed
-// placement attempt must have the exact marker written in the same transaction.
 // lifecycleBindingProblem reports why a placement and its lifecycle capability
 // do not describe one generation, or "" when they do. Open-time quarantine,
 // offline classification, and lifecycle generation adoption all use it, so
@@ -505,6 +500,11 @@ func lifecycleBindingProblem(placement Placement, capability lifecycleCapability
 	return ""
 }
 
+// quarantineLifecycleBindings withdraws lifecycle authority only for leases
+// whose two durable records cannot be interpreted together. A bad row must not
+// prevent unrelated leases or the provider process from starting. Current
+// capabilities may intentionally outlive placement deletion, but every typed
+// placement attempt must have the exact marker written in the same transaction.
 func quarantineLifecycleBindings(
 	placements map[string]Placement,
 	capabilities map[string]lifecycleCapability,

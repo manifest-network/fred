@@ -138,7 +138,8 @@ func firstSnapshotDelay(now, newest time.Time, interval time.Duration) time.Dura
 	return min(max(newest.Add(interval).Sub(now), startupDelay), max(interval, startupDelay))
 }
 
-// snapshotOnce makes one attempt and prunes after a successful publication. A
+// snapshotOnce removes a crash's leftover staged files, makes one attempt, and
+// prunes after a successful publication. Every step stops at cancellation. A
 // panic is an error outcome: a captured cut's transactions end at its deadline
 // on their own.
 func (service *Service) snapshotOnce(ctx context.Context, at time.Time) (result outcome, report pruneReport) {
@@ -149,32 +150,35 @@ func (service *Service) snapshotOnce(ctx context.Context, at time.Time) (result 
 			result, report = outcomeError, pruneReport{}
 		}
 	}()
+	report = service.directory.removeLeftoverStaging()
 	cut, err := service.placements.CaptureConsistentCut(service.payloads, copyDeadline)
 	if err != nil {
 		slog.Warn("placement snapshot could not capture the databases", "error", err)
-		return outcomeError, pruneReport{}
+		return outcomeError, report
 	}
 	available, err := service.directory.availableBytes()
 	if err != nil {
 		slog.Warn("placement snapshot could not measure free space",
 			"error", errors.Join(err, cut.Discard()), "snapshot_dir", service.directory.Path())
-		return outcomeError, pruneReport{}
+		return outcomeError, report
 	}
 	if !hasRoom(available, cut.Size()) {
 		slog.Warn("placement snapshot skipped: not enough free space",
 			"available_bytes", available, "required_bytes", requiredBytes(cut.Size()),
 			"snapshot_dir", service.directory.Path(), "discard_error", cut.Discard())
-		return outcomeInsufficientSpace, pruneReport{}
+		return outcomeInsufficientSpace, report
 	}
 	set, err := service.directory.publish(ctx, cut, at)
 	if err != nil {
 		slog.Warn("placement snapshot failed", "error", err, "snapshot_dir", service.directory.Path())
-		return outcomeError, pruneReport{}
+		return outcomeError, report
 	}
-	report = service.directory.prune(set, service.settings.retain)
+	if ctx.Err() == nil {
+		report.merge(service.directory.prune(set, service.settings.retain, at))
+	}
 	slog.Info("placement snapshot published",
 		"manifest", service.directory.names.file(set, fileKindManifest),
-		"snapshot_dir", service.directory.Path(), "pruned_files", report.removed)
+		"snapshot_dir", service.directory.Path(), "removed_files", report.removed)
 	return outcomeSuccess, report
 }
 

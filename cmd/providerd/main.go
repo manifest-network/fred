@@ -775,9 +775,14 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Join the snapshot loop before the stores it reads close. Once workCtx is
-	// canceled its attempt stops at the next step, and a captured cut's read
-	// transactions end within the copy deadline regardless.
-	snapshotWG.Wait()
+	// canceled its attempt stops at its next step. If an uninterruptible step
+	// (an fsync or a consistency check) outlasts the shutdown budget, closing
+	// the stores is still safe: bbolt's Close waits for every open read
+	// transaction, and a captured cut's transactions end within the copy
+	// deadline.
+	if !joinWithin(shutdownCtx, &snapshotWG) {
+		slog.Warn("placement snapshot loop still running at shutdown; closing the stores anyway")
+	}
 
 	// Always close provision manager to clean up Watermill router and payload store.
 	// This is safe even if components are still running - Watermill handles concurrent Close().
