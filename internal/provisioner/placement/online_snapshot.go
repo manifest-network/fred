@@ -300,12 +300,17 @@ func copyOwnedRead(
 
 // wait returns once the transaction has ended and the copy has ended, or ctx
 // is done. A destination write still blocked after ctx ends is abandoned: the
-// transaction it read from has already ended.
+// transaction it read from has already ended. A copy that failed after ctx
+// ended carries ctx's cause, whichever side reported first: bbolt flattens the
+// pipe's error to text, so the cause would otherwise be lost.
 func (state ownedCopy) wait(ctx context.Context) copyResult {
 	ownerErr := <-state.owner
 	select {
 	case result := <-state.reader:
 		result.err = errors.Join(result.err, ownerErr)
+		if result.err != nil && ctx.Err() != nil {
+			result.err = errors.Join(context.Cause(ctx), result.err)
+		}
 		return result
 	case <-ctx.Done():
 		return copyResult{err: errors.Join(context.Cause(ctx), ownerErr)}

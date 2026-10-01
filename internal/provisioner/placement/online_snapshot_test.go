@@ -2,6 +2,7 @@ package placement
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -178,6 +179,28 @@ func TestConsistentCutEndsItsTransactionsAtTheDeadline(t *testing.T) {
 	assert.Less(t, time.Since(started), 5*time.Second)
 	// The destination write is still blocked, yet both transactions ended.
 	requireStoresClose(t, store, payloads)
+}
+
+// TestCopyWaitKeepsTheCauseWhicheverSideReportsFirst covers the race at a
+// deadline or shutdown: the copy side and ctx are ready together, and select
+// picks either. bbolt reports the pipe error as text, so only wait can keep
+// the cause in the chain.
+func TestCopyWaitKeepsTheCauseWhicheverSideReportsFirst(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cancel(ErrSnapshotDeadline)
+	for range 64 {
+		state := ownedCopy{owner: make(chan error, 1), reader: make(chan copyResult, 1)}
+		state.owner <- errors.New("meta 0 copy: " + ErrSnapshotDeadline.Error())
+		state.reader <- copyResult{err: io.ErrClosedPipe}
+		require.ErrorIs(t, state.wait(ctx).err, ErrSnapshotDeadline)
+	}
+
+	succeeded := ownedCopy{owner: make(chan error, 1), reader: make(chan copyResult, 1)}
+	succeeded.owner <- nil
+	succeeded.reader <- copyResult{size: 7}
+	result := succeeded.wait(t.Context())
+	assert.NoError(t, result.err, "a finished copy under a live context is not an error")
+	assert.Equal(t, int64(7), result.size)
 }
 
 // requireStoresClose proves no read transaction is open: bbolt's Close waits
