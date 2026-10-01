@@ -66,13 +66,13 @@ func TestActorCommandConstructorsRejectMissingOrWrongCapabilities(t *testing.T) 
 
 	maintenance := newTestMaintenanceClaim(t, "33333333-3333-4333-8333-333333333333", shared.MaintenanceIntentRestart)
 	target := testMaintenanceTarget(t, maintenance)
-	_, _, err = NewUpdateCommand(context.Background(), target)
+	_, _, err = NewUpdateCommand(testMaintenanceHandoff(t, context.Background()), target)
 	require.Error(t, err, "restart authority must not construct an update command")
-	_, _, err = NewCustomDomainCommand(context.Background(), target)
+	_, _, err = NewCustomDomainCommand(testMaintenanceHandoff(t, context.Background()), target)
 	require.Error(t, err, "restart authority must not construct a custom-domain command")
 	customDomain := newTestMaintenanceClaim(t, "44444444-4444-4444-8444-444444444444", shared.MaintenanceIntentCustomDomain)
 	customDomainTarget := testMaintenanceTarget(t, customDomain)
-	_, _, err = NewRestartCommand(context.Background(), customDomainTarget)
+	_, _, err = NewRestartCommand(testMaintenanceHandoff(t, context.Background()), customDomainTarget)
 	require.Error(t, err, "custom-domain authority must not construct a restart command")
 	_, err = NewMaintenanceRecoveryFailureInfo(
 		shared.MaintenanceIntentClaim{}, ReplaceFailureDetails{},
@@ -214,14 +214,14 @@ func TestMaintenanceTerminalOutcomeCannotComposeAcrossJournalPairsWithSameID(t *
 			actor := newTestActorNoSpawn(t, leaseUUID, testActorOpts{
 				ProvisionStore: store,
 				MaintenanceWorkFn: func(
-					context.Context,
+					shared.MaintenanceWorkerLifetime,
 					shared.MaintenanceReleaseClaim,
 				) ReplaceWorkOutcome {
 					return outcome
 				},
 			})
 			actor.pendingMaintenance = left
-			actor.spawnMaintenanceWorker(t.Context(), leftTarget)
+			actor.spawnMaintenanceWorker(testMaintenanceLifetime(t, t.Context()), leftTarget)
 			require.NoError(t, actor.waitForWorkers())
 			terminal := <-actor.inbox
 			ambiguous, ok := terminal.(operationAmbiguousMsg)

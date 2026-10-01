@@ -19,6 +19,26 @@
 
 Fred accepts deployment manifests as JSON payloads that describe how containers should be provisioned. There are two formats: **single-service** manifests for standalone containers (**deprecated**), and **stack** manifests for multi-service deployments (**preferred**).
 
+Image preparations that can reuse pinned or locally verified content bypass the
+backend's staging queue. New image content shares four staging slots per backend;
+one tenant can use all unused slots. When a slot opens, waiting tenants with less
+active staging get priority, with requests from the same tenant processed in
+arrival order. A tenant address shared by many customers does not serialize
+cached restarts behind a cold image download. Waiting and downloads remain
+subject to the configured pull timeout. Once Docker import is dispatched, it
+has its own 30-minute ceiling and continues through caller cancellation. A close
+can remain pending until that owned work has drained.
+
+Restart and update admission shares a provider-wide journal budget of 1,024
+pending commands and 64 MiB (including 512 bytes of phase-growth allowance per
+command), with no fixed per-address concurrency cap. When you already have
+pending work, Fred keeps one command and 2 MiB for a tenant without pending work.
+Reaching that reserve returns `429` before recording your new command; retry
+after your pending work completes. Its response carries
+`reason: maintenance_capacity_reserved` and `Retry-After: 1`. A fully exhausted provider budget returns
+`503`. An exact retry of an already admitted command can still make progress;
+follow the [restart/update retry contract](../README.md#restart-lease).
+
 ## Manifest Formats
 
 ### Single-Service Manifest *(deprecated)*
@@ -212,7 +232,7 @@ Env var names are validated for security:
 - If you front many of your own end-customers behind one on-chain tenant, your provider may read a per-customer retention-partition key from a label (or env var) you declare — see [Retention partitioning (aggregator platforms)](#retention-partitioning-aggregator-platforms).
 - Keys must **not** start with `fred.`, `traefik.`, or `com.docker.compose.` (case-insensitive). These namespaces control backend ownership, shared ingress routing, and Compose container lifecycle. Configure ingress through the manifest's `ingress`/port settings.
 
-The same restriction applies to **labels baked into the image**, including base-image labels. Fred rejects these images after pulling, before creating a workload or inspection helper. Compose-built images may contain automatic `com.docker.compose.*` labels; rebuild them without orchestration metadata (for example, with `docker build`) before deploying. Application labels such as `org.opencontainers.image.*` remain allowed. Fred admits each service image once and carries the resulting immutable image identity through setup, helpers, and container creation; on the containerd image store this is a single platform manifest, not a multi-platform index. Preparing a previously unmaterialized platform manifest may require a registry request for that exact digest. The original tag or digest reference remains in the manifest and release history. Providers need Docker Engine 28.1+ (API 1.49+) for this admission check.
+The same restriction applies to **labels baked into the image**, including base-image labels, with three exact exceptions: `com.docker.compose.project`, `com.docker.compose.service`, and `com.docker.compose.version`. These automatic Compose build stamps are accepted; their image values are discarded and never grant workload ownership. Fred supplies the values from its compiled workload, or clears them on direct helpers. Other reserved labels, including differently cased variants of these three keys, are rejected before layer download or import for newly fetched images and before creating any workload or inspection helper. Compose-built images containing only the three accepted stamps need no rebuild. Application labels such as `org.opencontainers.image.*` remain allowed. Fred admits each service image once and carries the resulting immutable image identity through setup, helpers, and container creation; on the containerd image store this is a single platform manifest, not a multi-platform index. Preparing a previously unmaterialized platform manifest may require a registry request for that exact digest. The original tag or digest reference remains in the manifest and release history. Providers need Docker Engine 28.1+ (API 1.49+) for this admission check.
 
 ```json
 // Valid
@@ -683,7 +703,7 @@ Requires a stateful SKU with `disk_mb > 0`. The backend auto-detects the volume 
 | `NONE` health check with `service_healthy` | Same as above | Use `CMD` or `CMD-SHELL` instead |
 | Setting `PATH` env var | `variable "PATH" is not allowed` | Use a different variable name or set PATH in the Dockerfile |
 | Using `fred.*` label prefix | `labels cannot use reserved prefix 'fred.'` | Choose a different prefix |
-| Using `com.docker.compose.*` label prefix | `labels cannot use reserved prefix 'com.docker.compose.'` | Remove Compose orchestration metadata from the manifest and image |
+| Using `com.docker.compose.*` label prefix | `labels cannot use reserved prefix 'com.docker.compose.'` | Remove reserved manifest labels. Images may carry only the three standard Compose project/service/version build stamps; Fred replaces those values before execution |
 | Using `traefik.*` label prefix | `labels cannot use reserved prefix 'traefik.'` | Remove it — configure ingress via the manifest `ingress`/port settings, not raw Traefik labels (ENG-497) |
 | More than 4 tmpfs mounts | `too many mounts (N), maximum is 4` | Consolidate mount points |
 | Tmpfs on `/tmp` or `/run` | `path "/tmp" is managed by the backend` | These are auto-mounted; use sub-paths if needed |

@@ -237,7 +237,7 @@ func TestXFSPrepareDeleteStageRollbackClassifiesDurability(t *testing.T) {
 			}
 
 			err = mgr.prepareXFSDeleteStageWith(
-				t.Context(), root, parent, stage, syncParent, removeStage,
+				root, stage, syncParent, removeStage,
 			)
 			require.ErrorIs(t, err, syncFailure)
 			assert.Equal(t, tc.wantAmbiguous, errors.Is(err, backendidentity.ErrMutationOutcomeAmbiguous))
@@ -262,7 +262,7 @@ func TestXFSPrepareDeleteStageRememberConflictIsAmbiguous(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = root.Close(); _ = parent.Close() })
 
-	err = mgr.prepareXFSDeleteStage(t.Context(), root, parent, stage)
+	err = mgr.prepareXFSDeleteStage(root, parent, stage)
 	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
 	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
 	assert.DirExists(t, stage.hostPath(dataPath), "the parent-durable exact evidence must not be guessed away")
@@ -278,7 +278,7 @@ func TestXFSPrepareDeleteStageRejectsUntrackedExistingAuthorityAsRecoveryPending
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = root.Close(); _ = parent.Close() })
 
-	err = mgr.prepareXFSDeleteStage(t.Context(), root, parent, stage)
+	err = mgr.prepareXFSDeleteStage(root, parent, stage)
 	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
 	assert.DirExists(t, stage.hostPath(dataPath),
 		"an untracked typed name must be consumed only by a fresh strict startup scan")
@@ -289,16 +289,29 @@ func TestXFSPrepareDeleteStageResetsAndAttestsDefaultProjectBeforePublication(t 
 	mgr := newXfsManagerForTest(dataPath)
 	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
 	logPath := installXFSQuotaFixture(t, "")
+	var resets int
+	mgr.projectAttributes = xfsProjectAttributeFuncs{
+		read: func(*os.Root) (linuxFSXAttr, error) {
+			require.Equal(t, 1, resets, "the project-0 reset must precede attestation")
+			return linuxFSXAttr{XFlags: linuxFSXFlagProjInherit}, nil
+		},
+		set: func(root *os.Root, projectID uint32) error {
+			resets++
+			require.Zero(t, projectID)
+			entries, err := readXFSRootEntries(root)
+			require.NoError(t, err)
+			require.Empty(t, entries)
+			require.Empty(t, mgr.durableDeleteStages, "normalization must precede durable publication")
+			return nil
+		},
+	}
 	root, parent, err := openXFSRootCapabilities(dataPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = root.Close(); _ = parent.Close() })
 
-	require.NoError(t, mgr.prepareXFSDeleteStage(t.Context(), root, parent, stage))
-	commands, err := os.ReadFile(logPath)
-	require.NoError(t, err)
-	lines := strings.Split(strings.TrimSpace(string(commands)), "\n")
-	require.Len(t, lines, 1)
-	assert.Contains(t, lines[0], xfsProjectResetToDefaultCmd(stage.hostPath(dataPath)))
+	require.NoError(t, mgr.prepareXFSDeleteStage(root, parent, stage))
+	assert.Equal(t, 1, resets)
+	assert.NoFileExists(t, logPath, "project normalization uses only the pinned inode")
 	assert.DirExists(t, stage.hostPath(dataPath))
 	assert.Equal(t, stage, mgr.durableDeleteStages[stage.volumeID.value()])
 }
@@ -307,14 +320,12 @@ func TestXFSPrepareDeleteStageRollsBackFailedDefaultProjectReset(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
-	installXFSQuotaFixture(t, `case "$*" in
-  *"project -s -d 0"*) exit 24 ;;
-esac`)
+	mgr.projectAttributes = fixedXFSProjectAttributeReader{setErr: errors.New("injected FSSETXATTR failure")}
 	root, parent, err := openXFSRootCapabilities(dataPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = root.Close(); _ = parent.Close() })
 
-	err = mgr.prepareXFSDeleteStage(t.Context(), root, parent, stage)
+	err = mgr.prepareXFSDeleteStage(root, parent, stage)
 	require.ErrorContains(t, err, "reset xfs delete-stage")
 	assert.NoDirExists(t, stage.hostPath(dataPath), "failed reset must durably roll back the unpublished sibling")
 	assert.Empty(t, mgr.durableDeleteStages)
@@ -352,7 +363,7 @@ func TestXFSPrepareDeleteStageRollsBackFailedProjectAttributeAttestation(t *test
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = root.Close(); _ = parent.Close() })
 
-			err = mgr.prepareXFSDeleteStage(t.Context(), root, parent, stage)
+			err = mgr.prepareXFSDeleteStage(root, parent, stage)
 			require.ErrorContains(t, err, tc.want)
 			assert.NoDirExists(t, stage.hostPath(dataPath),
 				"failed kernel attestation must durably roll back the unpublished sibling")
@@ -573,15 +584,26 @@ func TestXFSRecoveredPreResetDeleteStageIsNormalizedBeforeCleanup(t *testing.T) 
 	restarted := newXfsManagerForTest(dataPath)
 	require.NoError(t, restarted.loadProjectIDs())
 	logPath := installXFSQuotaFixture(t, "")
+	var resets int
+	restarted.projectAttributes = xfsProjectAttributeFuncs{
+		read: func(*os.Root) (linuxFSXAttr, error) {
+			require.Positive(t, resets)
+			return linuxFSXAttr{XFlags: linuxFSXFlagProjInherit}, nil
+		},
+		set: func(*os.Root, uint32) error {
+			resets++
+			require.NoFileExists(t, logPath, "recovery must normalize before querying usage")
+			return nil
+		},
+	}
 
 	require.NoError(t, restarted.RecoverInterruptedVolumeMutations(t.Context()))
 	commands, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	logText := string(commands)
-	resetAt := strings.Index(logText, xfsProjectResetToDefaultCmd(stage.hostPath(dataPath)))
-	blockProofAt := strings.Index(logText, "report -p -b -n -N")
-	require.GreaterOrEqual(t, resetAt, 0)
-	assert.Greater(t, blockProofAt, resetAt, "usage proof must follow recovered-stage normalization")
+	require.Positive(t, resets)
+	assert.Contains(t, logText, "report -p -b -n -N")
+	assert.NotContains(t, logText, "project -s")
 	assert.NoDirExists(t, stage.hostPath(dataPath))
 }
 
@@ -646,10 +668,7 @@ func TestXFSDeleteRecoveryDeadlineStopsBetweenEntriesBeforeQuotaClear(t *testing
 	assert.Equal(t, 1, removeCalls, "expired aggregate budget must stop before the next recursive entry syscall")
 	assert.DirExists(t, stage.hostPath(dataPath))
 	assert.DirExists(t, volumePath)
-	commands, readErr := os.ReadFile(logPath)
-	require.NoError(t, readErr)
-	assert.NotContains(t, string(commands), "report -p -b", "deadline expiry must stop before quota proof")
-	assert.NotContains(t, string(commands), xfsLimitClearCmd(stage.projID))
+	assert.NoFileExists(t, logPath, "deadline expiry must stop before quota proof or clear")
 }
 
 func TestXFSLoadProjectIDsRejectsNonemptyDeleteAuthorityAtomically(t *testing.T) {

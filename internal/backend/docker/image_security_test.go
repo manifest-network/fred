@@ -59,7 +59,7 @@ func imageSecurityResponse(status int, body string) *http.Response {
 }
 
 func TestInspectImageRejectsReservedMetadata(t *testing.T) {
-	for _, key := range []string{"fred.managed", "FrEd.image_reference", "traefik.enable", "TrAeFiK.http.routers.victim.rule", "com.docker.compose.project", "CoM.DoCkEr.CoMpOsE.oneoff"} {
+	for _, key := range []string{"fred.managed", "FrEd.image_reference", "traefik.enable", "TrAeFiK.http.routers.victim.rule", "com.docker.compose.oneoff", "CoM.DoCkEr.CoMpOsE.project"} {
 		t.Run(key, func(t *testing.T) {
 			cli := newImageSecurityDockerClient(t, func(req *http.Request) (*http.Response, error) {
 				require.Contains(t, req.URL.Path, "/images/")
@@ -166,7 +166,7 @@ func TestPreparedComposeProjectPreservesIntentAndPreventsRepull(t *testing.T) {
 	admitted, err := mock.AdmitImage(t.Context(), params.Stack.Services["web"].Image)
 	require.NoError(t, err)
 	params.ImageSetups["web"].Image = admitted
-	project := buildComposeProject(params)
+	project := buildTestComposeProject(t, params)
 	before, err := json.Marshal(project)
 	require.NoError(t, err)
 	assert.Equal(t, "nginx:latest", project.Services["web"].Image, "builder retains desired reference")

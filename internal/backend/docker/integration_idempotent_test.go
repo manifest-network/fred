@@ -83,7 +83,7 @@ func TestIntegration_Docker_RemoveContainer_Concurrent(t *testing.T) {
 	ctx := context.Background()
 
 	// Pull a small image we can create and destroy quickly.
-	require.NoError(t, d.PullImage(ctx, "busybox:latest", 60*time.Second))
+	require.NoError(t, pullImageForTest(t, d, ctx, "busybox:latest", 60*time.Second))
 
 	params := baseCreateParams(t, ctx, d, newIntegrationLeaseUUID(), "busybox:latest")
 	containerID, err := d.CreateContainer(ctx, params, 30*time.Second)
@@ -125,7 +125,7 @@ func TestIntegration_Docker_CreateContainer_AdoptOnReplay(t *testing.T) {
 	d := newTestDockerClient(t)
 	ctx := context.Background()
 
-	require.NoError(t, d.PullImage(ctx, "busybox:latest", 60*time.Second))
+	require.NoError(t, pullImageForTest(t, d, ctx, "busybox:latest", 60*time.Second))
 
 	params := baseCreateParams(t, ctx, d, newIntegrationLeaseUUID(), "busybox:latest")
 
@@ -151,8 +151,8 @@ func TestIntegration_Docker_CreateContainer_RejectsImageMismatch(t *testing.T) {
 	d := newTestDockerClient(t)
 	ctx := context.Background()
 
-	require.NoError(t, d.PullImage(ctx, "busybox:latest", 60*time.Second))
-	require.NoError(t, d.PullImage(ctx, "alpine:latest", 60*time.Second))
+	require.NoError(t, pullImageForTest(t, d, ctx, "busybox:latest", 60*time.Second))
+	require.NoError(t, pullImageForTest(t, d, ctx, "alpine:latest", 60*time.Second))
 
 	leaseUUID := newIntegrationLeaseUUID()
 	firstParams := baseCreateParams(t, ctx, d, leaseUUID, "busybox:latest")

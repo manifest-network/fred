@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 func TestMaintenanceRefusalDetailEncodingPreservesBoundedDiagnostics(t *testing.T) {
@@ -57,7 +59,7 @@ func TestMaintenanceRefusalDetailEncoderRejectsInvalidDiagnostics(t *testing.T) 
 			require.ErrorContains(t, err, "invalid maintenance refusal detail")
 		})
 	}
-	for outcome := MaintenanceOutcomePending; outcome <= MaintenanceOutcomeBackendUnavailable; outcome++ {
+	for outcome := MaintenanceOutcomePending; outcome <= MaintenanceOutcomeExecutionFailed; outcome++ {
 		if outcome == MaintenanceOutcomeValidationRejected {
 			continue
 		}
@@ -96,7 +98,7 @@ func TestMaintenanceRefusalDetailDecoderRejectsInvalidDiagnostics(t *testing.T) 
 		_, _, _, _, _, err := decodeMaintenanceCommand(encoded)
 		require.Error(t, err)
 	})
-	for outcome := MaintenanceOutcomePending; outcome <= MaintenanceOutcomeBackendUnavailable; outcome++ {
+	for outcome := MaintenanceOutcomePending; outcome <= MaintenanceOutcomeExecutionFailed; outcome++ {
 		if outcome == MaintenanceOutcomeValidationRejected {
 			continue
 		}
@@ -183,10 +185,17 @@ func TestLegacyMaintenanceUpdateCanCommitAcceptedPayloadAboveNewAdmissionLimit(t
 	require.NoError(t, err)
 	delivery, ok := work.(maintenanceDelivery)
 	require.True(t, ok)
-	accepted, err := store.acceptMaintenanceUpdate(delivery)
+	waitingWork, err := store.acceptMaintenanceUpdate(delivery)
 	require.NoError(t, err, "adding the accepted phase must not apply the stricter new-admission budget to a legacy row")
+	accepted, ok := waitingWork.(acceptedMaintenanceUpdate)
+	require.True(t, ok)
 	assert.False(t, accepted.claim.Command().Dispatchable())
-	completion := coordinator.completeAcceptedUpdate(accepted)
+	require.NoError(t, applyMaintenanceCompletionForTest(t, coordinator, mustMaintenanceID(t, maintenanceIDA), backend.CallbackStatusSuccess))
+	confirmedWork, err := store.maintenanceWork(accepted.claim)
+	require.NoError(t, err)
+	confirmed, ok := confirmedWork.(confirmedMaintenanceUpdate)
+	require.True(t, ok)
+	completion := coordinator.completeConfirmedUpdate(confirmed)
 	require.NoError(t, completion.Err())
 	require.True(t, completion.Settled())
 	assert.Equal(t, MaintenanceOutcomeAccepted, completion.Outcome())

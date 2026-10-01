@@ -122,9 +122,8 @@ func TestRestoreRecoveryValidatesOperationSemanticAuthorityBeforePlanning(t *tes
 			wantErr: "health-check authority differs",
 		},
 		{
-			name:    "desired items differ from finalizer effective items",
-			mutate:  func(spec *shared.OperationIntentSpec) { spec.Items[0].CustomDomain = "desired.example" },
-			wantErr: "topology or resource profiles differ",
+			name:   "desired domain omitted from exact effective finalizer",
+			mutate: func(spec *shared.OperationIntentSpec) { spec.Items[0].CustomDomain = "desired.example" },
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

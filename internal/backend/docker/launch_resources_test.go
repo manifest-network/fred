@@ -96,7 +96,7 @@ func TestMaintenanceSourceBudgetRefusesBeforeTargetEffects(t *testing.T) {
 	require.NoError(t, bindDockerMaintenanceCompensation(h.b, ops))
 	execution, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
 	require.NoError(t, err)
-	outcome := h.b.maintenanceSettlement.ExecuteMaintenance(t.Context(), execution)
+	outcome := h.b.maintenanceSettlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
 	failed, ok := outcome.(shared.MaintenanceExecutionFailure)
 	require.True(t, ok, "%T: %v", outcome, outcome)
 	require.True(t, failed.SourceRecovered())

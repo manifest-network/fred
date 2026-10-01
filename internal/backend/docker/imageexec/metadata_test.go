@@ -91,3 +91,22 @@ func TestImageAdmissionAcceptsMetadataAtPublishedLimits(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, admitted.Volumes(), imageexec.MaxImageVolumes)
 }
+
+func TestRegistryMetadataCapabilityUsesExecutionPolicyAndIndependentVolumes(t *testing.T) {
+	var zero imageexec.Metadata
+	require.False(t, zero.Valid())
+	require.Nil(t, zero.Volumes())
+	labels := map[string]string{"application": "tenant"}
+	volumes := map[string]struct{}{"/data": {}}
+	admitted, err := imageexec.AdmitMetadata(labels, volumes)
+	require.NoError(t, err)
+	require.True(t, admitted.Valid())
+	volumes["/proc"] = struct{}{}
+	labels["fred.lease_id"] = "forged"
+	copied := admitted
+	exposed := admitted.Volumes()
+	exposed[0] = "/proc"
+	require.Equal(t, []string{"/data"}, copied.Volumes())
+	_, err = imageexec.AdmitMetadata(labels, volumes)
+	require.Error(t, err)
+}

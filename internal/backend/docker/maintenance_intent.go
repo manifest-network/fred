@@ -702,7 +702,7 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 			authority.LifecycleCallbackURL() != intent.LifecycleCallbackURL()) {
 		return false, errors.New("maintenance target projection route differs from durable intent")
 	}
-	stack, err := manifest.ParsePayload(release.Manifest)
+	stack, err := manifest.ParseStoredPayload(release.Manifest)
 	if err != nil {
 		return false, fmt.Errorf("parse maintenance projection manifest: %w", err)
 	}
@@ -891,7 +891,7 @@ func (b *Backend) classifyRecoveredMaintenanceReadiness(
 	target shared.Release,
 	containers []ContainerInfo,
 ) (maintenanceReadiness, error) {
-	stack, err := manifest.ParsePayload(target.Manifest)
+	stack, err := manifest.ParseStoredPayload(target.Manifest)
 	if err != nil {
 		return 0, fmt.Errorf("parse recovered maintenance manifest: %w", err)
 	}
@@ -1025,7 +1025,7 @@ func validateMaintenanceGenerationContainer(
 		container.LifecycleCallbackURL != authority.LifecycleCallbackURL() {
 		return &maintenanceObservationDeferred{cause: fmt.Errorf("container %q diverges from target runtime authority", container.ContainerID)}
 	}
-	stack, err := manifest.ParsePayload(target.Manifest)
+	stack, err := manifest.ParseStoredPayload(target.Manifest)
 	if err != nil {
 		return fmt.Errorf("parse target manifest: %w", err)
 	}

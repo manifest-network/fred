@@ -18,7 +18,14 @@ import (
 )
 
 func TestMaintenanceCommandsWaitForPriorCompletionDelivery(t *testing.T) {
-	h := newMaintenanceRecoveryHarness(t)
+	// Persist a routable service before creating the maintenance authority so
+	// custom-domain reconciliation reaches the same pending-completion gate.
+	h := newMaintenanceRecoveryHarnessForAuthorityAtCallbackOptions(
+		t, shared.MaintenanceIntentRestart, false, "", false,
+		&manifest.StackManifest{Services: map[string]*manifest.Manifest{
+			"web": {Image: "docker.io/library/nginx:1.27", Ports: map[string]manifest.PortConfig{"80/tcp": {}}},
+		}},
+	)
 	h.appendTarget(true)
 	activeProof, err := activateMaintenanceForTest(t, h.b.maintenanceSettlement, h.target)
 	require.NoError(t, err)

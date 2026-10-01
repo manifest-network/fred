@@ -2036,6 +2036,15 @@ func (j noopOperationIntentJournal) BeginOperationIntent(
 	return j.operationSettlementService.BeginOperationIntent(candidate)
 }
 
+func (j noopOperationIntentJournal) PrepareOperationRelease(
+	claim shared.OperationIntentClaim,
+) (shared.OperationReleaseCandidate, error) {
+	if j.operationSettlementService == nil {
+		return shared.OperationReleaseCandidate{}, errors.New("nominal operation-intent fixture has no execution journal")
+	}
+	return j.operationSettlementService.PrepareOperationRelease(claim)
+}
+
 func (j noopOperationIntentJournal) ListOperationIntents() ([]shared.OperationIntentClaim, error) {
 	if j.operationSettlementService == nil {
 		return nil, nil

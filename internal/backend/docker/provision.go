@@ -159,9 +159,20 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 	if err != nil {
 		return fmt.Errorf("%w: validate resource profiles: %w", backend.ErrValidation, err)
 	}
-	stackManifest, err := manifest.ParsePayload(req.Payload)
+	// Freeze a legacy predecessor before asking its journal to authorize an
+	// exact historical replay. New or changed payloads still require strict
+	// admission; only the opaque result can bind a replay to Pending.
+	if err := b.prepareProvisionPredecessor(ctx, req); err != nil {
+		return err
+	}
+	manifestAdmission, err := b.operationSettlement.AdmitProvisionManifest(ctx, req.LeaseUUID, req.Tenant, req.ProviderUUID, req.Items, req.Payload)
 	if err != nil {
-		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
+		return err
+	}
+	req.Payload = manifestAdmission.Payload()
+	stackManifest, err := manifestAdmission.Stack()
+	if err != nil {
+		return err
 	}
 	if isFlatPayload(req.Payload) {
 		logger.Warn("manifest deprecation: tenant submitted flat single-service manifest; auto-wrapped as 1-service stack",
@@ -188,12 +199,16 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 	slices.Sort(healthCheckServices)
 	// Decide the exact label-level custom domains before the write-ahead
 	// acceptance barrier. Desired items remain immutable operation input, while
-	// effective items record DNS-deferred empty domains for exact crash recovery.
+	// effective items describe only admitted routes for exact crash recovery.
 	desiredItems := slices.Clone(req.Items)
-	b.deferUnreadyCustomDomains(ctx, req.Items, req.LeaseUUID, logger)
+	ingress, err := b.admitIngressPlan(ctx, stackManifest, desiredItems)
+	if err != nil {
+		return fmt.Errorf("plan provision ingress: %w", err)
+	}
+	req.Items = ingress.effectiveItems()
 	// Refusal must be representable before accepting a successor. An unfrozen
 	// legacy predecessor cannot supply failure lineage after Pending is written.
-	prepared, err := b.prepareProvisionOperation(ctx, req, desiredItems, resourceProfiles, healthCheckServices)
+	prepared, err := b.prepareProvisionOperation(req, desiredItems, ingress, resourceProfiles, healthCheckServices, manifestAdmission)
 	if err != nil {
 		return err
 	}
@@ -872,56 +887,6 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 	return nil
 }
 
-// deferUnreadyCustomDomains zeroes the CustomDomain of any item whose domain
-// does not yet resolve (ENG-266), so the provision emits no
-// -custom Traefik router — and Traefik fires no HTTP-01 order — before DNS is
-// live. The periodic reconcile (ReconcileCustomDomain) re-applies the domain on
-// a later tick once it resolves. It zeroes the deferred domain on BOTH the
-// caller's `items` slice (the label-emit path reads it via buildComposeProject)
-// AND the stored prov.Items: enrichReserved deep-copies Items (ENG-193), so
-// prov.Items no longer aliases the caller's slice and the in-memory state that
-// recoverState / ReconcileCustomDomain read must be updated explicitly to stay
-// consistent with the emitted container labels.
-func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend.LeaseItem, leaseUUID string, logger *slog.Logger) {
-	// Phase 1: decide which items to defer — DNS I/O, no lock held.
-	var toDefer []int
-	for i := range items {
-		d := items[i].CustomDomain
-		if d == "" {
-			continue
-		}
-		// Validate before any DNS I/O: a malformed/forbidden value is rejected
-		// at label-emit time (applyIngressLabels), so resolving it is wasted
-		// network work and would leak the bad value to the public resolvers.
-		if err := validateCustomDomain(d, b.cfg.Ingress.WildcardDomain); err != nil {
-			continue
-		}
-		if !b.dnsGateAllows(ctx, d) {
-			logger.Info("custom_domain set but DNS does not resolve yet; deferring to reconcile",
-				"lease_uuid", leaseUUID, "custom_domain", d)
-			toDefer = append(toDefer, i)
-		}
-	}
-	if len(toDefer) == 0 {
-		return
-	}
-	// Phase 2: apply under provisionsMu. enrichReserved deep-copies Items, so
-	// prov.Items no longer aliases the caller's slice — update both explicitly:
-	// `items` for the label-emit path, prov.Items for the in-memory state that
-	// recoverState / ReconcileCustomDomain read under provisionsMu (ENG-193).
-	// Both slices are copies of the same normalized req.Items, so they
-	// correspond index-for-index.
-	b.provisionsMu.Lock()
-	prov, ok := b.provisions[leaseUUID]
-	for _, i := range toDefer {
-		items[i].CustomDomain = ""
-		if ok && i < len(prov.Items) {
-			prov.Items[i].CustomDomain = ""
-		}
-	}
-	b.provisionsMu.Unlock()
-}
-
 // physicalOperationError keeps callback-safe diagnostics attached to a typed
 // Refused result without granting any terminal settlement authority.
 type physicalOperationError struct {
@@ -1056,11 +1021,6 @@ func (b *Backend) doProvisionPhysical(
 		failCount = prov.FailCount
 	}
 	b.provisionsMu.RUnlock()
-
-	// DNS-readiness gate (ENG-266): defer not-yet-resolving custom domains so
-	// provision doesn't fire a premature HTTP-01 order; the reconcile adds them
-	// once DNS is live.
-	b.deferUnreadyCustomDomains(ctx, req.Items, req.LeaseUUID, logger)
 
 	// Build Compose project and bring it up.
 	params := composeProjectParams{

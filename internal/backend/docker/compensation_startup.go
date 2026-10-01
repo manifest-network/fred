@@ -20,7 +20,7 @@ type compensationStartup struct {
 }
 
 func orderCompensationContainers(plan compensationLaunchPlan) (compensationStartup, error) {
-	stack, err := manifest.ParsePayload(plan.Source.Manifest)
+	stack, err := manifest.ParseStoredPayload(plan.Source.Manifest)
 	if err != nil {
 		return compensationStartup{}, err
 	}

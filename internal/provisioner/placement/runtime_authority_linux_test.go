@@ -252,3 +252,36 @@ func TestRuntimeAuthorityWithdrawalLinearizesWithAdmittedCommit(t *testing.T) {
 	require.ErrorIs(t, err, ErrRuntimeAuthorityUnavailable)
 	assert.False(t, lateMutationRan, "no mutation may begin after withdrawal is published")
 }
+
+func TestRuntimeAuthorityPostcheckWithdrawsRefusalAuthority(t *testing.T) {
+	for _, reservation := range []maintenanceReservation{maintenanceCountReserved, maintenanceBytesReserved} {
+		t.Run(reservation.reason(), func(t *testing.T) {
+			store := newTestStore(t)
+			path := store.db.Path()
+			t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+			refusal := maintenanceReservationRefusal{reservation: reservation}
+			err := store.updateRuntimeAuthority(func(*bolt.Tx) error {
+				// A definite transaction refusal cannot grant a retryable tenant
+				// verdict once its storage authority fails the final attestation.
+				if chmodErr := os.Chmod(path, 0o640); chmodErr != nil {
+					return chmodErr
+				}
+				return refusal
+			})
+			require.ErrorIs(t, err, refusal, "preserve the original transaction diagnostic")
+			require.ErrorIs(t, err, ErrRuntimeAuthorityUnavailable)
+			require.ErrorIs(t, err, ErrRuntimeAuthorityPathChanged)
+			require.Equal(t, MaintenanceApplicationServiceUnavailable, resultForMaintenanceBeginError(err).Outcome(),
+				"withdrawn storage authority cannot be reported as tenant reservation backpressure")
+			require.NoError(t, os.Chmod(path, 0o600))
+			require.ErrorIs(t, store.Healthy(), ErrRuntimeAuthorityUnavailable, "restoring permissions cannot revive the withdrawn owner")
+			laterWriteRan := false
+			err = store.updateRuntimeAuthority(func(*bolt.Tx) error {
+				laterWriteRan = true
+				return nil
+			})
+			require.ErrorIs(t, err, ErrRuntimeAuthorityUnavailable)
+			require.False(t, laterWriteRan)
+		})
+	}
+}

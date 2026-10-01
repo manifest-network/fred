@@ -151,7 +151,7 @@ func TestReplaceContainers_RecordsPhaseDurationsByOperation(t *testing.T) {
 
 	execution, err := settlement.StartMaintenanceExecution(targetRelease)
 	require.NoError(t, err)
-	physical := settlement.ExecuteMaintenance(context.Background(), execution)
+	physical := settlement.ExecuteMaintenance(testMaintenanceLifetime(t, context.Background()), execution)
 	success, ok := physical.(shared.MaintenanceExecutionSuccess)
 	if !ok {
 		var cause error

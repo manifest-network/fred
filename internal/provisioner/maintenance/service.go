@@ -44,6 +44,7 @@ const (
 	OutcomeCommandConflict
 	OutcomeBackendInvalidState
 	OutcomeBackendValidation
+	OutcomeCapacityReserved
 	OutcomeServiceUnavailable
 	OutcomeInternalFailure
 )
@@ -66,7 +67,7 @@ func NewResult(outcome Outcome, cause error) Result {
 	switch outcome {
 	case OutcomeAccepted, OutcomeNotFound, OutcomeNoLongerActive, OutcomeForbidden,
 		OutcomeAlreadyInProgress, OutcomeCommandConflict, OutcomeBackendInvalidState,
-		OutcomeBackendValidation, OutcomeServiceUnavailable, OutcomeInternalFailure:
+		OutcomeBackendValidation, OutcomeCapacityReserved, OutcomeServiceUnavailable, OutcomeInternalFailure:
 		return Result{outcome: outcome, cause: cause}
 	default:
 		return Result{outcome: OutcomeInternalFailure, cause: errors.New("invalid maintenance result")}
@@ -143,6 +144,8 @@ func resultFromApplication(result placement.MaintenanceApplicationResult) Result
 		outcome = OutcomeBackendInvalidState
 	case placement.MaintenanceApplicationBackendValidation:
 		outcome = OutcomeBackendValidation
+	case placement.MaintenanceApplicationCapacityReserved:
+		outcome = OutcomeCapacityReserved
 	case placement.MaintenanceApplicationServiceUnavailable:
 		outcome = OutcomeServiceUnavailable
 	case placement.MaintenanceApplicationInternalFailure,
@@ -172,6 +175,10 @@ func (service *Service) Start(ctx context.Context, interval time.Duration) error
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-service.application.CompletionChanged():
+			if err := service.RecoverPending(ctx); err != nil && ctx.Err() == nil {
+				slog.Warn("completed maintenance recovery pass incomplete", "error", err)
+			}
 		case <-ticker.C:
 			if err := service.RecoverPending(ctx); err != nil && ctx.Err() == nil {
 				slog.Warn("pending maintenance recovery pass incomplete", "error", err)

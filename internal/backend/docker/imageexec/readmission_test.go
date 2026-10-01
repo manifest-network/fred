@@ -3,7 +3,6 @@ package imageexec_test
 import (
 	"context"
 	"errors"
-	"io"
 	"testing"
 
 	"github.com/docker/docker/api/types/container"
@@ -62,9 +61,6 @@ func TestReAdmitRefusesUnavailableOrMalformedPersistedIdentity(t *testing.T) {
 				inspects++
 				require.Equal(t, imageID, ref, "recovery must never resolve the mutable display reference")
 				return dockerimage.InspectResponse{}, failure
-			}, pull: func(context.Context, string, dockerimage.PullOptions) (io.ReadCloser, error) {
-				t.Fatal("failed recovery must not fetch a replacement")
-				return nil, nil
 			}}
 			admitter, _ := newRuntime(t, source)
 			admitted, err := admitter.ReAdmit(t.Context(), scenario.id, ocispec.Platform{OS: "linux", Architecture: "amd64"}, scenario.reference)

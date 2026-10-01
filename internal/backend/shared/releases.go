@@ -679,7 +679,7 @@ func (inspection ReleaseStoreInspection) checkLegacyActiveAuthorityAndRuntimeCap
 	if err := ValidateSKUResourceSnapshot(items, resourceProfiles); err != nil {
 		return fmt.Errorf("backfill legacy active release authority: %w", err)
 	}
-	stack, err := manifest.ParsePayload(expected.Manifest)
+	stack, err := manifest.ParseStoredPayload(expected.Manifest)
 	if err != nil {
 		return fmt.Errorf("backfill legacy active release manifest: %w", err)
 	}
@@ -971,28 +971,28 @@ func inspectReleaseBucketWithObserver(
 			return err
 		}
 		if value == nil {
-			return fmt.Errorf("release history with key length %d is a nested bucket", len(key))
+			return fmt.Errorf("release history for lease %q is a nested bucket", string(key))
 		}
 		if !backend.IsCanonicalLeaseUUID(string(key)) {
 			return fmt.Errorf("release history key with length %d is not a canonical lease UUID", len(key))
 		}
 		releases, err := decodeHistory(value)
 		if err != nil {
-			return fmt.Errorf("decode release history with key length %d: %w", len(key), err)
+			return fmt.Errorf("decode release history for lease %q: %w", string(key), err)
 		}
 		legacyMultipleActive, err := validateReleaseHistoryForAdoption(
 			releases,
 			allowLegacyMultipleActive,
 		)
 		if err != nil {
-			return fmt.Errorf("validate release history with key length %d: %w", len(key), err)
+			return fmt.Errorf("validate release history for lease %q: %w", string(key), err)
 		}
 		requiresNormalization = requiresNormalization || legacyMultipleActive
 		capacityHistory := releases
 		if legacyMultipleActive {
 			capacityHistory, err = normalizeLegacyReleaseHistoryForAdoption(releases)
 			if err != nil {
-				return fmt.Errorf("normalize release history with key length %d for capacity proof: %w", len(key), err)
+				return fmt.Errorf("normalize release history for lease %q for capacity proof: %w", string(key), err)
 			}
 		}
 		activeIndex := latestActiveReleaseIndex(releases)
@@ -1007,7 +1007,7 @@ func inspectReleaseBucketWithObserver(
 		if capacity != nil {
 			snapshot, snapshotErr := newReleaseHistoryCapacitySnapshot(capacityHistory)
 			if snapshotErr != nil {
-				return fmt.Errorf("snapshot release history with key length %d: %w", len(key), snapshotErr)
+				return fmt.Errorf("snapshot release history for lease %q: %w", string(key), snapshotErr)
 			}
 			capacity[string(key)] = snapshot
 		}
@@ -1215,7 +1215,7 @@ func validateStoredReleaseManifest(release Release) error {
 		}
 		return errors.New("release manifest is required with desired items")
 	}
-	stack, err := manifest.ParsePayload(release.Manifest)
+	stack, err := manifest.ParseStoredPayload(release.Manifest)
 	if err != nil {
 		return fmt.Errorf("release manifest: %w", err)
 	}
@@ -1405,7 +1405,7 @@ func validateV013RecordMigrationHistory(releases []Release, activeIndexes []int)
 	if oldWasStack || !migratedWasStack {
 		return errors.New("v0.13 migration pair is not flat-manifest then stack-manifest")
 	}
-	oldStack, err := manifest.ParsePayload(oldRelease.Manifest)
+	oldStack, err := manifest.ParseStoredPayload(oldRelease.Manifest)
 	if err != nil {
 		return fmt.Errorf("parse older active manifest: %w", err)
 	}
@@ -1427,11 +1427,11 @@ func validateV013RecordMigrationHistory(releases []Release, activeIndexes []int)
 }
 
 func semanticallyEqualReleaseManifests(left, right []byte) (bool, error) {
-	leftStack, err := manifest.ParsePayload(left)
+	leftStack, err := manifest.ParseStoredPayload(left)
 	if err != nil {
 		return false, fmt.Errorf("parse first manifest: %w", err)
 	}
-	rightStack, err := manifest.ParsePayload(right)
+	rightStack, err := manifest.ParseStoredPayload(right)
 	if err != nil {
 		return false, fmt.Errorf("parse second manifest: %w", err)
 	}
@@ -1697,23 +1697,23 @@ func normalizeLegacyReleaseBucketForAdoption(tx *bolt.Tx) error {
 			return err
 		}
 		if value == nil {
-			return fmt.Errorf("release history with key length %d is a nested bucket", len(key))
+			return fmt.Errorf("release history for lease %q is a nested bucket", string(key))
 		}
 		if !backend.IsCanonicalLeaseUUID(string(key)) {
 			return fmt.Errorf("release history key with length %d is not a canonical lease UUID", len(key))
 		}
 		releases, err := decodeLegacyReleaseHistory(value)
 		if err != nil {
-			return fmt.Errorf("decode release history with key length %d: %w", len(key), err)
+			return fmt.Errorf("decode release history for lease %q: %w", string(key), err)
 		}
 		requiresNormalization, err := validateReleaseHistoryForAdoption(releases, true)
 		if err != nil {
-			return fmt.Errorf("validate release history with key length %d: %w", len(key), err)
+			return fmt.Errorf("validate release history for lease %q: %w", string(key), err)
 		}
 		if requiresNormalization {
 			releases, err = normalizeLegacyReleaseHistoryForAdoption(releases)
 			if err != nil {
-				return fmt.Errorf("normalize release history with key length %d: %w", len(key), err)
+				return fmt.Errorf("normalize release history for lease %q: %w", string(key), err)
 			}
 		}
 		encoded, err := compactAndEncodeReleaseHistory(
@@ -1722,7 +1722,7 @@ func normalizeLegacyReleaseBucketForAdoption(tx *bolt.Tx) error {
 			backend.MaxStoredReleaseHistoryBytes,
 		)
 		if err != nil {
-			return fmt.Errorf("encode normalized release history with key length %d: %w", len(key), err)
+			return fmt.Errorf("encode normalized release history for lease %q: %w", string(key), err)
 		}
 		rewrites = append(rewrites, rewrite{
 			key:   slices.Clone(key),
@@ -1754,14 +1754,14 @@ func upgradeVersionlessCurrentReleaseBucket(tx *bolt.Tx) error {
 	var sawCurrent, sawVersionless bool
 	if err := bucket.ForEach(func(key, value []byte) error {
 		if value == nil {
-			return fmt.Errorf("release history with key length %d is a nested bucket", len(key))
+			return fmt.Errorf("release history for lease %q is a nested bucket", string(key))
 		}
 		if !backend.IsCanonicalLeaseUUID(string(key)) {
 			return fmt.Errorf("release history key with length %d is not a canonical lease UUID", len(key))
 		}
 		trimmed := bytes.TrimSpace(value)
 		if len(trimmed) == 0 {
-			return fmt.Errorf("release history with key length %d is empty", len(key))
+			return fmt.Errorf("release history for lease %q is empty", string(key))
 		}
 		var releases []Release
 		var err error
@@ -1776,18 +1776,18 @@ func upgradeVersionlessCurrentReleaseBucket(tx *bolt.Tx) error {
 			err = errors.New("expected a versioned object or versionless compatibility array")
 		}
 		if err != nil {
-			return fmt.Errorf("decode release history with key length %d: %w", len(key), err)
+			return fmt.Errorf("decode release history for lease %q: %w", string(key), err)
 		}
 		if sawCurrent && sawVersionless {
 			return errors.New("release journal mixes versioned and versionless histories")
 		}
 		if err := validateReleaseHistory(releases); err != nil {
-			return fmt.Errorf("validate release history with key length %d: %w", len(key), err)
+			return fmt.Errorf("validate release history for lease %q: %w", string(key), err)
 		}
 		if trimmed[0] == '[' {
 			encoded, err := encodeReleaseHistory(releases)
 			if err != nil {
-				return fmt.Errorf("encode upgraded release history with key length %d: %w", len(key), err)
+				return fmt.Errorf("encode upgraded release history for lease %q: %w", string(key), err)
 			}
 			rewrites = append(rewrites, rewrite{key: slices.Clone(key), value: encoded})
 		}
@@ -2228,7 +2228,7 @@ func (s *ReleaseStore) backfillLegacyActiveAuthorityWithinLimit(
 	if err := ValidateSKUResourceSnapshot(items, resourceProfiles); err != nil {
 		return fmt.Errorf("backfill legacy active release authority: %w", err)
 	}
-	stack, err := manifest.ParsePayload(expected.Manifest)
+	stack, err := manifest.ParseStoredPayload(expected.Manifest)
 	if err != nil {
 		return fmt.Errorf("backfill legacy active release manifest: %w", err)
 	}

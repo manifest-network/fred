@@ -18,6 +18,9 @@ const (
 	deferredCloseInterval       = time.Second
 	deferredCloseMaxInterval    = 5 * time.Second
 	deferredCloseAttemptTimeout = 30 * time.Second
+	// Imports have a 30-minute completion ceiling; allow five minutes for
+	// transport unwind and close retries before requiring operator attention.
+	deferredCloseOverdueAfter = 35 * time.Minute
 )
 
 var errDeferredCloseUnavailable = errors.New("deferred close capacity is unavailable")
@@ -29,11 +32,12 @@ type deferredCloseHint struct {
 }
 
 type deferredCloseEntry struct {
-	hint       *deferredCloseHint
-	admittedAt time.Time
-	next       time.Time
-	delay      time.Duration
-	running    *deferredCloseAttempt
+	hint            *deferredCloseHint
+	admittedAt      time.Time
+	next            time.Time
+	delay           time.Duration
+	running         *deferredCloseAttempt
+	overdueReported bool
 }
 
 // Only dispatch constructs attempts, while holding the scheduler mutex. The
@@ -219,7 +223,15 @@ func (scheduler *deferredCloseScheduler) finishAttempt(
 func (scheduler *deferredCloseScheduler) updateOldestAgeLocked(now time.Time) {
 	var oldestAge float64
 	for _, entry := range scheduler.entries {
-		oldestAge = max(oldestAge, now.Sub(entry.admittedAt).Seconds())
+		age := now.Sub(entry.admittedAt)
+		oldestAge = max(oldestAge, age.Seconds())
+		if age >= deferredCloseOverdueAfter && !entry.overdueReported {
+			entry.overdueReported = true
+			proof := entry.hint.proof
+			metrics.DeferredClosesTotal.WithLabelValues("overdue", string(proof.Reason())).Inc()
+			slog.Error("deferred lease close overdue; retry ownership retained",
+				"lease_uuid", proof.LeaseUUID(), "reason", proof.Reason(), "wait", age)
+		}
 	}
 	metrics.DeferredClosesOldestAge.Set(oldestAge)
 }

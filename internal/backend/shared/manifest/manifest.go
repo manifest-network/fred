@@ -302,15 +302,11 @@ func (m *flatManifest) validate(inStack bool) error {
 		return fmt.Errorf("too many labels (%d), maximum is %d", len(m.Labels), MaxLabels)
 	}
 
-	// Validate port specifications
+	if err := validatePortEncoding(m.Ports); err != nil {
+		return err
+	}
 	var ingressPorts []string
 	for portSpec, portCfg := range m.Ports {
-		if err := validatePortSpec(portSpec); err != nil {
-			return fmt.Errorf("invalid port %q: %w", portSpec, err)
-		}
-		if portCfg.HostPort < 0 || portCfg.HostPort > 65535 {
-			return fmt.Errorf("invalid port %q: host_port must be between 0 and 65535", portSpec)
-		}
 		if portCfg.Ingress {
 			ingressPorts = append(ingressPorts, portSpec)
 			if _, ok := ParseTCPPort(portSpec); !ok {
@@ -414,6 +410,21 @@ func ParseTCPPort(spec string) (int, bool) {
 		return 0, false
 	}
 	return port, true
+}
+
+// validatePortEncoding is the stable execution shape shared by admission and
+// stored replay. Consumers decode these keys as a port/protocol pair; relaxing
+// admission policy must never admit an undecodable durable representation.
+func validatePortEncoding(ports map[string]PortConfig) error {
+	for spec, cfg := range ports {
+		if err := validatePortSpec(spec); err != nil {
+			return fmt.Errorf("invalid port %q: %w", spec, err)
+		}
+		if cfg.HostPort < 0 || cfg.HostPort > 65535 {
+			return fmt.Errorf("invalid port %q: host_port must be between 0 and 65535", spec)
+		}
+	}
+	return nil
 }
 
 // validatePortSpec validates a port specification like "80/tcp".
@@ -674,6 +685,21 @@ type StackManifest struct {
 
 // Validate checks that the stack manifest is valid.
 func (s *StackManifest) Validate() error {
+	if err := s.ValidateStored(); err != nil {
+		return err
+	}
+	for name, svc := range s.Services {
+		if err := svc.ValidateInStack(); err != nil {
+			return fmt.Errorf("service %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// ValidateStored protects durable recovery topology without reapplying
+// evolving admission policy to manifests accepted by an earlier release.
+// Tenant admission must use Validate instead.
+func (s *StackManifest) ValidateStored() error {
 	if len(s.Services) == 0 {
 		return fmt.Errorf("stack manifest must have at least one service")
 	}
@@ -690,7 +716,10 @@ func (s *StackManifest) Validate() error {
 		if svc == nil {
 			return fmt.Errorf("service %q has nil manifest", name)
 		}
-		if err := svc.ValidateInStack(); err != nil {
+		if svc.Image == "" {
+			return fmt.Errorf("service %q: image is required", name)
+		}
+		if err := validatePortEncoding(svc.Ports); err != nil {
 			return fmt.Errorf("service %q: %w", name, err)
 		}
 	}
@@ -809,6 +838,20 @@ func (s *StackManifest) detectDependsOnCycles() error {
 // logging for flat payloads happens at the call site, which has access to
 // the logger and lease UUID; the parser stays pure.
 func ParsePayload(data []byte) (*StackManifest, error) {
+	return parsePayload(data, true)
+}
+
+// ParseStoredPayload decodes previously admitted durable manifests. It checks
+// the wire structure, service identities, images and dependency topology, but
+// deliberately does not apply current tenant-admission policy (for example,
+// reserved label namespaces or user syntax). Admission callers must instead use
+// ParsePayload. Consumers must enforce substrate ownership when materializing
+// stored data, including filtering reserved labels at container construction.
+func ParseStoredPayload(data []byte) (*StackManifest, error) {
+	return parsePayload(data, false)
+}
+
+func parsePayload(data []byte, admission bool) (*StackManifest, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty payload")
 	}
@@ -823,7 +866,7 @@ func ParsePayload(data []byte) (*StackManifest, error) {
 		if err := dec.Decode(&stack); err != nil {
 			return nil, fmt.Errorf("parse stack manifest: %w", err)
 		}
-		if err := stack.Validate(); err != nil {
+		if err := validateParsedStack(&stack, admission); err != nil {
 			return nil, fmt.Errorf("validate stack manifest: %w", err)
 		}
 		return &stack, nil
@@ -836,8 +879,10 @@ func ParsePayload(data []byte) (*StackManifest, error) {
 	if err := dec.Decode(&flat); err != nil {
 		return nil, fmt.Errorf("parse flat manifest: %w", err)
 	}
-	if err := flat.Validate(); err != nil {
-		return nil, fmt.Errorf("validate flat manifest: %w", err)
+	if admission {
+		if err := flat.Validate(); err != nil {
+			return nil, fmt.Errorf("validate flat manifest: %w", err)
+		}
 	}
 	// depends_on is structurally impossible on a flat payload (no peers).
 	// flat.Validate already rejects it via the non-inStack path, but the
@@ -846,10 +891,17 @@ func ParsePayload(data []byte) (*StackManifest, error) {
 		return nil, fmt.Errorf("depends_on is not valid in a flat manifest")
 	}
 	stack := &StackManifest{Services: map[string]*flatManifest{DefaultServiceName: &flat}}
-	if err := stack.Validate(); err != nil {
+	if err := validateParsedStack(stack, admission); err != nil {
 		return nil, fmt.Errorf("validate auto-wrapped stack: %w", err)
 	}
 	return stack, nil
+}
+
+func validateParsedStack(stack *StackManifest, admission bool) error {
+	if admission {
+		return stack.Validate()
+	}
+	return stack.ValidateStored()
 }
 
 // ValidateStackAgainstItems ensures a 1:1 mapping between manifest service

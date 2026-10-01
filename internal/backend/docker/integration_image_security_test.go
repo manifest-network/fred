@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	composeapi "github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
@@ -84,7 +85,7 @@ func TestIntegration_Docker_ReservedImageLabelsRejectedBeforeContainerCreation(t
 	sdk := newImageSecurityFixtureClient(t)
 	compose, err := newComposeService(sdk.DaemonHost(), docker.images)
 	require.NoError(t, err)
-	for _, key := range []string{"TrAeFiK.enable", "fred.managed", "com.docker.compose.project"} {
+	for _, key := range []string{"TrAeFiK.enable", "fred.managed", "com.docker.compose.oneoff"} {
 		t.Run(key, func(t *testing.T) {
 			tag, imageID := importImageSecurityFixture(t, ctx, sdk, map[string]string{key: "true"})
 			rejected, err := docker.AdmitImage(ctx, tag)
@@ -99,7 +100,7 @@ func TestIntegration_Docker_ReservedImageLabelsRejectedBeforeContainerCreation(t
 			params.LeaseUUID = uuid.NewString()
 			params.Stack.Services["web"].Image = tag
 			params.NetworkName = ""
-			desired := buildComposeProject(params)
+			desired := buildTestComposeProject(t, params)
 			evidence := make(map[string]imageexec.Image, len(desired.Services))
 			for name := range desired.Services {
 				evidence[name] = rejected
@@ -112,6 +113,44 @@ func TestIntegration_Docker_ReservedImageLabelsRejectedBeforeContainerCreation(t
 			assert.Empty(t, created, "a rejected image must never reach a workload or stopped helper")
 		})
 	}
+}
+
+func TestIntegration_Docker_ComposeBuiltImageCannotInheritForeignProject(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	docker := newIntegrationDockerClient(t, ctx)
+	sdk := newImageSecurityFixtureClient(t)
+	foreignProject := "foreign-" + uuid.NewString()
+	tag, imageID := importImageSecurityFixture(t, ctx, sdk, map[string]string{
+		composeapi.ProjectLabel: foreignProject, composeapi.ServiceLabel: "foreign-service",
+		composeapi.VersionLabel: "foreign-version", "app.owner": "tenant",
+	})
+	admitted, err := docker.AdmitImage(ctx, tag)
+	require.NoError(t, err)
+	id, err := docker.CreateContainer(ctx, CreateContainerParams{
+		Image: admitted, Manifest: &manifest.Manifest{Image: tag}, LeaseUUID: uuid.NewString(),
+		ServiceName: "direct", BackendName: "image-security",
+	}, 30*time.Second)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+		_ = docker.RemoveContainer(cleanupCtx, id)
+	})
+	actual, err := sdk.ContainerInspect(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, imageID, actual.Image)
+	for _, key := range []string{composeapi.ProjectLabel, composeapi.ServiceLabel, composeapi.VersionLabel} {
+		value, present := actual.Config.Labels[key]
+		require.True(t, present)
+		require.Empty(t, value, "Docker must overwrite image-inherited build stamps")
+	}
+	require.Equal(t, "tenant", actual.Config.Labels["app.owner"])
+	foreign, err := sdk.ContainerList(ctx, container.ListOptions{All: true, Filters: filters.NewArgs(
+		filters.Arg("ancestor", imageID), filters.Arg("label", composeapi.ProjectLabel+"="+foreignProject),
+	)})
+	require.NoError(t, err)
+	require.Empty(t, foreign, "foreign Compose project discovery must not claim this container")
 }
 
 func TestIntegration_Docker_ImmutableImageBindingSurvivesTagMovement(t *testing.T) {
@@ -158,7 +197,7 @@ func TestIntegration_Docker_ImmutableImageBindingSurvivesTagMovement(t *testing.
 	params.NetworkName = ""
 	compose, err := newComposeService(sdk.DaemonHost(), docker.images)
 	require.NoError(t, err)
-	desired := buildComposeProject(params)
+	desired := buildTestComposeProject(t, params)
 	evidence := make(map[string]imageexec.Image, len(desired.Services))
 	for name := range desired.Services {
 		evidence[name] = admitted

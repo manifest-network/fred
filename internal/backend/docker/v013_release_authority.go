@@ -37,7 +37,7 @@ func deriveV013ActiveReleaseItems(
 	if release.Image != "stack" {
 		return nil, fmt.Errorf("v0.13 active release has unsupported image class %q", release.Image)
 	}
-	stack, err := manifest.ParsePayload(release.Manifest)
+	stack, err := manifest.ParseStoredPayload(release.Manifest)
 	if err != nil {
 		return nil, fmt.Errorf("parse v0.13 active release manifest: %w", err)
 	}

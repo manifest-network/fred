@@ -104,7 +104,7 @@ func newComposeService(dockerHost string, images *imageexec.Admitter) (*composeS
 	return &composeService{
 		compile: images.Compile, down: backend.Down, ps: backend.Ps,
 		up: func(ctx context.Context, project imageexec.PreparedProject, opts composeUpOpts) daemonLaunchOutcome {
-			scope := new(daemonLaunchScope)
+			scope := newDaemonLaunchScope(ctx, nil)
 			defer scope.close()
 			transport, err := newComposeHTTPTransport(dockerHost)
 			if err != nil {

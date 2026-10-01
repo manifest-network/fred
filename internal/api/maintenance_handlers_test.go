@@ -187,6 +187,7 @@ func TestMaintenanceHandlersTranslateServiceOutcomes(t *testing.T) {
 		"invalid state":        {maintenanceapp.OutcomeBackendInvalidState, http.StatusConflict},
 		"validation":           {maintenanceapp.OutcomeBackendValidation, http.StatusBadRequest},
 		"temporarily down":     {maintenanceapp.OutcomeServiceUnavailable, http.StatusServiceUnavailable},
+		"newcomer reservation": {maintenanceapp.OutcomeCapacityReserved, http.StatusTooManyRequests},
 		"internal":             {maintenanceapp.OutcomeInternalFailure, http.StatusInternalServerError},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -202,6 +203,10 @@ func TestMaintenanceHandlersTranslateServiceOutcomes(t *testing.T) {
 			)
 			assert.Equal(t, test.status, response.Code)
 			assert.Len(t, commands, 1)
+			if test.outcome == maintenanceapp.OutcomeCapacityReserved {
+				assert.Equal(t, "1", response.Header().Get("Retry-After"))
+				assert.JSONEq(t, `{"error":"maintenance capacity is reserved for tenants without pending work; retry after your pending work completes","code":429,"reason":"maintenance_capacity_reserved"}`, response.Body.String())
+			}
 		})
 	}
 }

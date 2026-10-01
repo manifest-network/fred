@@ -467,7 +467,7 @@ func commitOperationSuccessFixture(
 }
 
 func activateMaintenanceForTest(
-	t require.TestingT,
+	t *testing.T,
 	settlement *shared.MaintenanceSettlement,
 	target shared.MaintenanceReleaseClaim,
 ) (shared.MaintenanceReleaseActive, error) {
@@ -478,7 +478,7 @@ func activateMaintenanceForTest(
 	defer cleanup()
 	execution, err := settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	outcome := settlement.ExecuteMaintenance(context.Background(), execution)
+	outcome := settlement.ExecuteMaintenance(testMaintenanceLifetime(t, context.Background()), execution)
 	success, ok := outcome.(shared.MaintenanceExecutionSuccess)
 	require.True(t, ok, "seed maintenance outcome = %T, want success", outcome)
 	active, err := settlement.ActivateMaintenance(success)
@@ -504,7 +504,7 @@ func registerMaintenanceExecutionForTest(
 }
 
 func failMaintenanceForTest(
-	t require.TestingT,
+	t *testing.T,
 	settlement *shared.MaintenanceSettlement,
 	target shared.MaintenanceReleaseClaim,
 	reason backend.Reason,
@@ -522,7 +522,7 @@ func failMaintenanceForTest(
 	defer cleanup()
 	execution, err := settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	outcome := settlement.ExecuteMaintenance(context.Background(), execution)
+	outcome := settlement.ExecuteMaintenance(testMaintenanceLifetime(t, context.Background()), execution)
 	failure, ok := outcome.(shared.MaintenanceExecutionFailure)
 	require.True(t, ok, "seed maintenance outcome = %T, want failure", outcome)
 	failed, err := settlement.FailMaintenance(failure, reason, message)

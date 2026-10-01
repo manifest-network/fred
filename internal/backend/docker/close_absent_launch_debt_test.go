@@ -36,7 +36,7 @@ func TestDeprovisionEmptyInventoryPreservesUnknownLaunch(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			command, reply, err := leasesm.NewRestartCommand(ctx, h.target)
+			command, reply, err := leasesm.NewRestartCommand(testMaintenanceHandoff(t, ctx), h.target)
 			require.NoError(t, err)
 			require.NoError(t, h.b.routeToLeaseBlocking(ctx, h.leaseUUID, command))
 			require.NoError(t, <-reply.Result())
@@ -46,19 +46,34 @@ func TestDeprovisionEmptyInventoryPreservesUnknownLaunch(t *testing.T) {
 				t.Fatal("maintenance launch did not start")
 			}
 
-			closeErr := h.b.Deprovision(ctx, h.leaseUUID)
+			closeErr := deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID)
+			require.True(t, shared.IsLifecyclePending(closeErr), "actual Deprovision must project durable launch debt into the breaker-neutral pending class: %v", closeErr)
 			switch mode {
 			case "first close":
 				require.ErrorIs(t, closeErr, shared.ErrVolumeLaunchUnsettled)
 			case "retry":
 				require.Error(t, closeErr, "initial uncertainty must retain a retry owner")
-				require.ErrorIs(t, h.b.Deprovision(ctx, h.leaseUUID), shared.ErrVolumeLaunchUnsettled,
+				retryErr := h.b.Deprovision(ctx, h.leaseUUID)
+				require.ErrorIs(t, retryErr, shared.ErrVolumeLaunchUnsettled,
 					"a later independent observation cannot erase durable dispatch uncertainty")
+				require.True(t, shared.IsLifecyclePending(retryErr))
 			case "journal reopen":
 				require.Error(t, closeErr, "initial uncertainty must retain a retry owner")
+				oldActor := h.b.actorFor(h.leaseUUID)
+				oldLineage := h.b.recoveryCoordinator.Lineage()
 				h.reopen()
+				select {
+				case <-oldActor.Done():
+				default:
+					t.Fatal("reopened journals must not retain actors from the old recovery lineage")
+				}
+				require.False(t, oldLineage == h.b.recoveryCoordinator.Lineage(), "restart constructs a distinct recovery lineage")
 				bindBackendTestCloseExecutor(t, h.b, h.b.closeSettlement)
 				require.NoError(t, h.b.recoverState(ctx), "a pending close is a lease-local startup deferral")
+				require.NotSame(t, oldActor, h.b.actorFor(h.leaseUUID))
+				recoveredErr := h.b.Deprovision(ctx, h.leaseUUID)
+				require.ErrorIs(t, recoveredErr, shared.ErrVolumeLaunchUnsettled)
+				require.True(t, shared.IsLifecyclePending(recoveredErr))
 			}
 			assertPending := func() {
 				t.Helper()

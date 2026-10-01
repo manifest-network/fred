@@ -57,6 +57,10 @@ func (j *stagedRecoveryOperationIntentJournal) NewOperationIntentProbe(
 	return j.delegate.NewOperationIntentProbe(leaseUUID, callbackURL)
 }
 
+func (j *stagedRecoveryOperationIntentJournal) AdmitProvisionManifest(ctx context.Context, lease, tenant, provider string, items []backend.LeaseItem, payload []byte) (shared.ProvisionManifestAdmission, error) {
+	return j.delegate.AdmitProvisionManifest(ctx, lease, tenant, provider, items, payload)
+}
+
 func (j *stagedRecoveryOperationIntentJournal) NewOperationIntentCandidate(
 	spec shared.OperationIntentSpec,
 ) (shared.OperationIntentCandidate, error) {

@@ -28,7 +28,7 @@ func TestDockerRecoveryRepairPreservesCloseAfterMaintenanceHandoff(t *testing.T)
 			execution, err := fixture.settlement.StartMaintenanceExecution(target)
 			require.NoError(t, err)
 			require.IsType(t, MaintenanceExecutionAmbiguous{},
-				fixture.settlement.ExecuteMaintenance(t.Context(), execution))
+				fixture.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution))
 			leaseUUID := target.LeaseUUID()
 			require.ErrorIs(t, state.journal.CheckNamespace(leaseUUID), ErrVolumeLaunchUnsettled)
 

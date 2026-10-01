@@ -10,6 +10,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
 )
@@ -54,7 +55,7 @@ func TestAcceptedUpdateTerminalLeaseReleasesDeprovisionFence(t *testing.T) {
 			command, err := NewMaintenanceApplicationRequest(mustMaintenanceID(t, maintenanceIDA),
 				maintenanceLease, "tenant-test", MaintenanceCommandUpdate, []byte("accepted bytes"))
 			require.NoError(t, err)
-			require.Equal(t, MaintenanceApplicationInternalFailure, application.Execute(t.Context(), command).Outcome())
+			require.Equal(t, MaintenanceApplicationAccepted, application.Execute(t.Context(), command).Outcome())
 			require.ErrorContains(t, provision.Deprovision(t.Context(), maintenanceLease), "lifecycle action is busy")
 			state = terminal
 			require.NoError(t, application.RecoverPending(t.Context()))
@@ -63,7 +64,7 @@ func TestAcceptedUpdateTerminalLeaseReleasesDeprovisionFence(t *testing.T) {
 			require.True(t, found)
 			assert.Equal(t, MaintenanceOutcomeLeaseEnded, receipt.Outcome())
 			assert.Empty(t, receipt.Command().Payload(), "terminal lease no longer needs accepted request bytes")
-			assert.Equal(t, 1, payloads.writes, "terminal proof bypasses the broken payload store")
+			assert.Zero(t, payloads.writes, "unconfirmed payload never reaches the broken payload store")
 			assert.Equal(t, 1, updates, "accepted update cannot acquire backend dispatch authority again")
 			assert.Equal(t, MaintenanceApplicationNoLongerActive, application.Execute(t.Context(), command).Outcome())
 			require.NoError(t, provision.Deprovision(t.Context(), maintenanceLease))
@@ -115,7 +116,8 @@ func TestAcceptedUpdateWithoutExactTerminalEvidenceKeepsLocalRecovery(t *testing
 			command, err := NewMaintenanceApplicationRequest(mustMaintenanceID(t, maintenanceIDA),
 				maintenanceLease, "tenant-test", MaintenanceCommandUpdate, []byte("exact accepted payload"))
 			require.NoError(t, err)
-			require.Equal(t, MaintenanceApplicationInternalFailure, application.Execute(t.Context(), command).Outcome())
+			require.Equal(t, MaintenanceApplicationAccepted, application.Execute(t.Context(), command).Outcome())
+			require.NoError(t, applyMaintenanceCompletionForTest(t, coordinator, command.id, backend.CallbackStatusSuccess))
 			setProviderControlPlaneForTest(t, base.coordinator.execution,
 				maintenanceLeaseReaderFunc(func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 					lease, err := maintenanceActiveLeaseReader()(ctx, leaseUUID)
@@ -159,8 +161,10 @@ func TestAcceptedUpdateTerminalExitRequiresExactOneShotCapability(t *testing.T) 
 	require.NoError(t, err)
 	delivery, ok := work.(maintenanceDelivery)
 	require.True(t, ok)
-	accepted, err := store.acceptMaintenanceUpdate(delivery)
+	waitingWork, err := store.acceptMaintenanceUpdate(delivery)
 	require.NoError(t, err)
+	accepted, ok := waitingWork.(acceptedMaintenanceUpdate)
+	require.True(t, ok)
 	require.ErrorIs(t, store.endAcceptedMaintenanceUpdate(endedMaintenanceUpdate{}), ErrInvalidMaintenanceCommand)
 	require.ErrorIs(t, store.settleMaintenanceCommand(admission.Claim(), MaintenanceOutcomeLeaseEnded),
 		ErrMaintenanceCommandNotPending, "generic delivery settlement cannot retire the accepted phase")
@@ -177,7 +181,7 @@ func TestAcceptedUpdateTerminalExitRequiresExactOneShotCapability(t *testing.T) 
 	require.ErrorIs(t, foreign.endAcceptedMaintenanceUpdate(ended), ErrInvalidMaintenanceCommand)
 	require.NoError(t, store.endAcceptedMaintenanceUpdate(ended))
 	require.ErrorIs(t, store.endAcceptedMaintenanceUpdate(ended), ErrInvalidMaintenanceCommand)
-	require.Error(t, coordinator.completeAcceptedUpdate(accepted).Err(),
+	require.Error(t, coordinator.completeConfirmedUpdate(confirmedMaintenanceUpdate{}).Err(),
 		"retired accepted authority cannot overwrite payload bytes after lease teardown is unblocked")
 }
 
@@ -199,23 +203,31 @@ func TestMaintenanceAcceptedPhaseCannotDispatchOrSettleWithoutPayloadCommit(t *t
 	require.NoError(t, err)
 	delivery, ok := work.(maintenanceDelivery)
 	require.True(t, ok)
-	accepted, err := store.acceptMaintenanceUpdate(delivery)
+	waitingWork, err := store.acceptMaintenanceUpdate(delivery)
 	require.NoError(t, err)
+	accepted, ok := waitingWork.(acceptedMaintenanceUpdate)
+	require.True(t, ok)
 	assert.False(t, accepted.claim.Command().Dispatchable())
 	_, err = store.acceptMaintenanceUpdate(delivery)
 	require.ErrorIs(t, err, ErrMaintenanceCommandNotPending, "stale delivery authority cannot cross phase commit")
 	require.ErrorIs(t, store.settleMaintenanceCommand(claim, MaintenanceOutcomeBackendUnavailable), ErrMaintenanceCommandNotPending)
 	require.ErrorIs(t, store.completeMaintenanceUpdate(maintenancePayloadCommit{}), ErrInvalidMaintenanceCommand)
+	waiting := coordinator.reauthorizeMaintenanceCommand(t.Context(), claim)
+	require.NoError(t, waiting.Err())
+	require.True(t, waiting.waiting.valid(), "202 alone must remain completion work")
+	require.False(t, waiting.payload.valid(), "202 cannot mint confirmed payload authority")
+	require.Zero(t, payloads.writes)
+	require.NoError(t, applyMaintenanceCompletionForTest(t, coordinator, mustMaintenanceID(t, maintenanceIDA), backend.CallbackStatusSuccess))
 	reauthorized := coordinator.reauthorizeMaintenanceCommand(t.Context(), claim)
 	assert.False(t, reauthorized.Authorized(), "rehydration must not mint backend work from known acceptance")
 	require.True(t, reauthorized.payload.valid())
-	completion := coordinator.completeAcceptedUpdate(reauthorized.payload)
+	completion := coordinator.completeConfirmedUpdate(reauthorized.payload)
 	require.NoError(t, completion.Err())
 	require.True(t, completion.Settled())
 	assert.Equal(t, MaintenanceOutcomeAccepted, completion.Outcome())
 	assert.Equal(t, maintenanceLease, payloads.lease)
 	assert.Equal(t, []byte("exact accepted update"), payloads.bytes)
-	require.Error(t, coordinator.completeAcceptedUpdate(accepted).Err())
+	require.Error(t, coordinator.completeConfirmedUpdate(reauthorized.payload).Err())
 	assert.Equal(t, 1, payloads.writes, "stale accepted capabilities cannot overwrite later payload state")
 }
 
@@ -258,4 +270,49 @@ func TestMaintenancePhaseDecoderPreservesLegacyAmbiguityAndRejectsCrossPhaseRows
 			require.Error(t, err)
 		})
 	}
+}
+
+func TestLegacyPayloadOutstandingCannotMintConfirmedUpdate(t *testing.T) {
+	base, store := newMaintenanceCoordinatorForTest(t, maintenanceActiveLeaseReader(), &executionTestBackend{name: "backend-a"})
+	payloads := &maintenanceProgressPayloads{bytes: []byte("last committed")}
+	coordinator, err := base.coordinator.execution.MaintenanceCoordinator(payloads)
+	require.NoError(t, err)
+	prepared := coordinator.prepareMaintenanceCommand(t.Context(), mustMaintenanceID(t, maintenanceIDA),
+		maintenanceLease, "tenant-test", MaintenanceCommandUpdate, []byte("historically accepted candidate"))
+	require.True(t, prepared.Authorized(), prepared.Err())
+	admission, err := coordinator.beginMaintenanceCommand(prepared)
+	require.NoError(t, err)
+	// Simulate a pre-fix provider crash after HTTP 202, when this wire phase
+	// carried acceptance but no successful backend completion evidence.
+	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
+		_, records, err := maintenanceCommandBuckets(tx)
+		if err != nil {
+			return err
+		}
+		key := maintenanceReceiptKey(maintenanceLease, prepared.Command().ID())
+		var row persistedMaintenanceCommand
+		if err := json.Unmarshal(records.Get(key), &row); err != nil {
+			return err
+		}
+		row.Phase = "payload_outstanding"
+		encoded, err := json.Marshal(row)
+		if err != nil {
+			return err
+		}
+		return records.Put(key, encoded)
+	}))
+	recovered := coordinator.reauthorizeMaintenanceCommand(t.Context(), admission.Claim())
+	require.NoError(t, recovered.Err())
+	require.True(t, recovered.waiting.valid())
+	require.False(t, recovered.payload.valid())
+	require.False(t, recovered.Authorized())
+	require.Error(t, coordinator.completeConfirmedUpdate(recovered.payload).Err())
+	require.Zero(t, payloads.writes)
+	require.Equal(t, []byte("last committed"), payloads.bytes)
+	require.NoError(t, applyMaintenanceCompletionForTest(t, coordinator, prepared.Command().ID(), backend.CallbackStatusSuccess))
+	recovered = coordinator.reauthorizeMaintenanceCommand(t.Context(), admission.Claim())
+	require.NoError(t, recovered.Err())
+	require.True(t, recovered.payload.valid())
+	require.NoError(t, coordinator.completeConfirmedUpdate(recovered.payload).Err())
+	require.Equal(t, prepared.Command().Payload(), payloads.bytes)
 }

@@ -19,7 +19,7 @@ func TestRuntimeFailureLogsRequireExactCompensatedSourceGeneration(t *testing.T)
 		Error: "target failed", Message: "target startup failed", Logs: map[string]string{"web/0": "failed target output"}, Status: DiagnosticCaptureComplete,
 	})
 	require.NoError(t, err)
-	failed, ok := fixture.settlement.ExecuteMaintenance(t.Context(), execution).(MaintenanceExecutionFailure)
+	failed, ok := fixture.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution).(MaintenanceExecutionFailure)
 	require.True(t, ok)
 	require.True(t, failed.SourceRecovered())
 	proof, err := fixture.settlement.FailMaintenance(failed, backend.ReasonRestartFailed, "target failed")
@@ -57,7 +57,7 @@ func TestRuntimeFailureLogsRequireExactCompensatedSourceGeneration(t *testing.T)
 
 func TestRuntimeFailureLogsCannotBeForgedByObservationalDiagnosticEntry(t *testing.T) {
 	fixture, diagnostics, execution := newMaintenanceDiagnosticsFixture(t, "no-source-proof")
-	failed, ok := fixture.settlement.ExecuteMaintenance(t.Context(), execution).(MaintenanceExecutionFailure)
+	failed, ok := fixture.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution).(MaintenanceExecutionFailure)
 	require.True(t, ok)
 	proof, err := fixture.settlement.FailMaintenance(failed, backend.ReasonRestartFailed, "failed")
 	require.NoError(t, err)

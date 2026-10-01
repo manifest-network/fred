@@ -127,6 +127,7 @@ type matchedDomain struct {
 	desired     string
 	emitted     string
 	serviceName string
+	route       ingressRoute
 }
 
 // customDomainDNSCandidates returns the deduped set of incoming custom domains
@@ -138,12 +139,12 @@ type matchedDomain struct {
 func (b *Backend) customDomainDNSCandidates(prov *provision, items []backend.LeaseItem) []string {
 	seen := make(map[string]bool)
 	var candidates []string
-	for _, m := range matchCustomDomainItems(prov, items) {
+	for _, m := range matchCustomDomainItems(prov, items, b.cfg.Ingress) {
 		d := m.desired
 		if d == "" || d == m.emitted || seen[d] {
 			continue
 		}
-		if err := validateCustomDomain(d, b.cfg.Ingress.WildcardDomain); err != nil {
+		if m.route.domain == "" {
 			continue
 		}
 		seen[d] = true
@@ -155,11 +156,12 @@ func (b *Backend) customDomainDNSCandidates(prov *provision, items []backend.Lea
 // matchCustomDomainItems matches each incoming chain item to a provision item by
 // normalized ServiceName (ENG-264) and returns one matchedDomain per MATCHED
 // chain item, in chain order, excluding chain items with no provision match. It
-// is pure and read-only: no validation, no DNS gate (those stay in the callers).
+// is pure and read-only: each match carries the same constructed route the
+// renderer accepts, without performing DNS admission.
 // The caller must hold provisionsMu (read or write). Shared by the candidate
 // pre-pass and computeCustomDomainOverrides so the resolved set and the applied
 // diff cannot diverge.
-func matchCustomDomainItems(prov *provision, items []backend.LeaseItem) []matchedDomain {
+func matchCustomDomainItems(prov *provision, items []backend.LeaseItem, config IngressConfig) []matchedDomain {
 	chainKeys := normalizedServiceKeys(items)
 	provKeys := normalizedServiceKeys(prov.Items)
 	matched := make([]matchedDomain, 0, len(items))
@@ -174,10 +176,17 @@ func matchCustomDomainItems(prov *provision, items []backend.LeaseItem) []matche
 		if idx == -1 {
 			continue
 		}
+		var route ingressRoute
+		if prov.StackManifest != nil {
+			if service := prov.StackManifest.Services[provKeys[idx]]; service != nil {
+				route = newIngressRoute(config, service.Ports, items[ci].CustomDomain)
+			}
+		}
 		matched = append(matched, matchedDomain{
 			desired:     items[ci].CustomDomain,
 			emitted:     prov.Items[idx].CustomDomain,
 			serviceName: prov.Items[idx].ServiceName,
+			route:       route,
 		})
 	}
 	return matched
@@ -193,18 +202,13 @@ func matchCustomDomainItems(prov *provision, items []backend.LeaseItem) []matche
 func (b *Backend) computeCustomDomainOverrides(prov *provision, items []backend.LeaseItem, dnsReady map[string]bool) map[string]string {
 	logger := slog.With("lease_uuid", prov.LeaseUUID)
 	overrides := make(map[string]string)
-	for _, m := range matchCustomDomainItems(prov, items) {
+	for _, m := range matchCustomDomainItems(prov, items, b.cfg.Ingress) {
 		emitted := m.emitted
 		desired := m.desired
-		// Defense-in-depth validation (empty clear bypasses the FQDN check).
-		if desired != "" {
-			if err := validateCustomDomain(desired, b.cfg.Ingress.WildcardDomain); err != nil {
-				logger.Error("skipping custom-domain reconcile (validation failed)",
-					"service_name", m.serviceName,
-					"custom_domain", desired,
-					"error", err)
-				continue
-			}
+		// A desired domain that cannot form an ingress route cannot be drift:
+		// recreating the cohort would emit the same absent label forever.
+		if desired != "" && m.route.domain == "" {
+			continue
 		}
 		// Asymmetric DNS-readiness gate (ENG-266): only gate emitting a domain
 		// that is not already the emitted one. Never tear down an already-emitted

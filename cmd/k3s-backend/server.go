@@ -220,6 +220,10 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	err := s.backend.Provision(r.Context(), req)
 	if err != nil {
+		if errors.Is(err, backend.ErrInvalidState) {
+			s.errorResponseWithCode(w, http.StatusConflict, "invalid state for provision", backend.CodeInvalidState)
+			return
+		}
 		if errors.Is(err, backend.ErrAlreadyProvisioned) {
 			s.errorResponse(w, http.StatusConflict, "lease already provisioned")
 			return
@@ -323,6 +327,10 @@ func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.backend.Deprovision(r.Context(), req.LeaseUUID); err != nil {
+		if errors.Is(err, backend.ErrInvalidState) {
+			s.errorResponseWithCode(w, http.StatusConflict, "close is deferred until lifecycle work settles", backend.CodeCloseDeferred)
+			return
+		}
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -429,6 +437,10 @@ func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Requ
 		}
 		if errors.Is(err, backend.ErrInvalidState) {
 			s.errorResponse(w, http.StatusConflict, "invalid state for reconcile")
+			return
+		}
+		if errors.Is(err, backend.ErrInsufficientResources) {
+			s.errorResponseWithCode(w, http.StatusServiceUnavailable, "insufficient resources", backend.CodeInsufficientResources)
 			return
 		}
 		s.logger.Error("reconcile_custom_domain failed", "lease_uuid", req.LeaseUUID, "error", err)
@@ -623,7 +635,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := s.backend.Stats()
 	load, err := stats.RoutingLoadStats()
 	if err != nil {
-		s.errorResponse(w, http.StatusServiceUnavailable, err.Error())
+		s.errorResponseWithCode(w, http.StatusServiceUnavailable, err.Error(), backend.CodeInsufficientResources)
 		return
 	}
 

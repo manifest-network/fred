@@ -3,7 +3,6 @@ package api
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 
@@ -212,7 +211,7 @@ func (a *CallbackAuthenticator) VerifyCallbackEvidence(
 	if signature == "" {
 		return hmacauth.VerifiedRequest{}, fmt.Errorf("missing %s header", CallbackSignatureHeader)
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := callbackwire.ReadEnvelope(r.Body)
 	if err != nil {
 		return hmacauth.VerifiedRequest{}, fmt.Errorf("failed to read request body: %w", err)
 	}
@@ -243,7 +242,7 @@ func (a *CallbackKeyringAuthenticator) VerifyCallbackEvidence(
 	if signature == "" {
 		return hmacauth.VerifiedRequest{}, fmt.Errorf("missing %s header", CallbackSignatureHeader)
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := callbackwire.ReadEnvelope(r.Body)
 	if err != nil {
 		return hmacauth.VerifiedRequest{}, fmt.Errorf("failed to read request body: %w", err)
 	}

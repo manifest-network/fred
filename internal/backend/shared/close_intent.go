@@ -888,7 +888,7 @@ func validateCloseIntentSpec(spec closeIntentSpec) error {
 	if len(spec.Manifest) == 0 {
 		return fmt.Errorf("callback close intent requires its manifest")
 	}
-	stack, err := manifest.ParsePayload(spec.Manifest)
+	stack, err := manifest.ParseStoredPayload(spec.Manifest)
 	if err != nil {
 		return fmt.Errorf("callback close intent manifest: %w", err)
 	}

@@ -31,6 +31,7 @@ type compensationTestState struct {
 	sourceSubject     MaintenanceCompensationSubject
 	journal           *VolumeLaunchJournal
 	targetReturned    func()
+	sourceRunning     func(context.Context) error
 }
 
 func bindCompensationTest(t *testing.T, s *MaintenanceSettlement, state *compensationTestState) {
@@ -40,7 +41,7 @@ func bindCompensationTest(t *testing.T, s *MaintenanceSettlement, state *compens
 	state.journal = journal
 	authorize := func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, ctx.Err() }
 	complete := func(context.Context, string, error) error { return nil }
-	require.NoError(t, BindMaintenanceCompensationExecutor(s, t.Context(), authorize, complete,
+	require.NoError(t, BindMaintenanceCompensationExecutor(s, authorize, complete,
 		func(context.Context, MaintenancePhysicalSubject) (MaintenanceSourceCapture, error) {
 			if state.captureErr != nil {
 				return MaintenanceSourceCapture{}, state.captureErr
@@ -67,7 +68,13 @@ func bindCompensationTest(t *testing.T, s *MaintenanceSettlement, state *compens
 					return err
 				}
 				assertCompensationJournalPhase(t, s, subject.Intent(), compensationSourceDispatching, 1)
-				receipt, stepResult := runner.StepCompleted(ctx, MaintenanceSourceLaunchStep, func(context.Context) error { state.launches++; return state.sourceErr })
+				receipt, stepResult := runner.StepCompleted(ctx, MaintenanceSourceLaunchStep, func(ctx context.Context) error {
+					state.launches++
+					if state.sourceRunning != nil {
+						return state.sourceRunning(ctx)
+					}
+					return state.sourceErr
+				})
 				if err := stepResult.Err(); err != nil {
 					return err
 				}
@@ -157,7 +164,7 @@ func TestMaintenanceSourceCaptureFailureRequiresIndependentSourceObservation(t *
 			bindCompensationTest(t, f.settlement, state)
 			execution, err := f.settlement.StartMaintenanceExecution(target)
 			require.NoError(t, err)
-			outcome := f.settlement.ExecuteMaintenance(t.Context(), execution)
+			outcome := f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
 			require.Zero(t, state.launches)
 			if !sourceReadable {
 				require.IsType(t, MaintenanceExecutionAmbiguous{}, outcome)
@@ -183,7 +190,7 @@ func TestMaintenanceCompensationClassifiesSourceAfterAuxiliaryTargetRefusal(t *t
 	bindCompensationTest(t, f.settlement, state)
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	outcome := f.settlement.ExecuteMaintenance(t.Context(), execution)
+	outcome := f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
 	failure, ok := outcome.(MaintenanceExecutionFailure)
 	require.True(t, ok, "%T: %v", outcome, outcome)
 	require.True(t, failure.SourceRecovered())
@@ -200,7 +207,7 @@ func TestMaintenanceCompensationRestoresSourceAfterCompletedFailedTarget(t *test
 	bindCompensationTest(t, f.settlement, state)
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	outcome := f.settlement.ExecuteMaintenance(t.Context(), execution)
+	outcome := f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
 	failed, ok := outcome.(MaintenanceExecutionFailure)
 	require.True(t, ok, "%T: %v", outcome, outcome)
 	require.True(t, failed.SourceRecovered())
@@ -220,7 +227,7 @@ func TestMaintenanceCompensationNeverUsesAmbiguousTargetOrZeroReceipt(t *testing
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
 	require.Error(t, state.journal.Complete(VolumeLaunchDebt{}, substratemutation.CompletedStep{}))
-	outcome := f.settlement.ExecuteMaintenance(t.Context(), execution)
+	outcome := f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
 	require.IsType(t, MaintenanceExecutionAmbiguous{}, outcome)
 	require.Zero(t, state.launches)
 	assertCompensationJournalPhase(t, f.settlement, execution.subject.Intent(), compensationTargetDispatching, 1)
@@ -231,7 +238,7 @@ func TestMaintenanceCompensationNeverUsesAmbiguousTargetOrZeroReceipt(t *testing
 	})
 	require.ErrorContains(t, err, "not durably settled")
 	require.Zero(t, state.launches)
-	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(t.Context(), execution), "copied original worker cannot recapture or relaunch")
+	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution), "copied original worker cannot recapture or relaunch")
 }
 
 func TestMaintenanceCompensationPrelaunchFailureHasUndispatchedSourceAuthority(t *testing.T) {
@@ -241,7 +248,7 @@ func TestMaintenanceCompensationPrelaunchFailureHasUndispatchedSourceAuthority(t
 	bindCompensationTest(t, f.settlement, state)
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	outcome := f.settlement.ExecuteMaintenance(t.Context(), execution)
+	outcome := f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
 	failed, ok := outcome.(MaintenanceExecutionFailure)
 	require.True(t, ok, "%T: %v", outcome, outcome)
 	require.True(t, failed.SourceRecovered())
@@ -256,7 +263,7 @@ func TestMaintenanceCompensationDoesNotReissueAmbiguousSourceLaunch(t *testing.T
 	bindCompensationTest(t, f.settlement, state)
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(t.Context(), execution))
+	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution))
 	require.Equal(t, 1, state.launches)
 	coordinator := newTestRecoveryCoordinator(t, nil, f.settlement, nil)
 	var outcome MaintenanceExecutionOutcome
@@ -285,7 +292,7 @@ func TestMaintenanceCompensationResumesPreparedSourceAfterStoreReopen(t *testing
 	bindCompensationTest(t, f.settlement, state)
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(t.Context(), execution))
+	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution))
 	require.Zero(t, state.launches)
 	oldSubject := state.sourceSubject
 	reopened := reopenCompensationSettlement(t, f)
@@ -320,7 +327,7 @@ func TestMaintenanceCompensationCapacityFailurePrecedesTargetEffects(t *testing.
 	f.settlement.compensation.validate = func(MaintenancePhysicalSubject, []byte) error { return nil }
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	outcome := f.settlement.ExecuteMaintenance(t.Context(), execution)
+	outcome := f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
 	require.IsType(t, MaintenanceExecutionAmbiguous{}, outcome, "capacity refusal does not prove the source remains ready")
 	require.ErrorContains(t, outcome.(MaintenanceExecutionAmbiguous).Cause(), "capacity")
 	require.Zero(t, state.launches)
@@ -359,7 +366,7 @@ func TestMaintenanceCompensationUnavailableSourceDoesNotBlockRestart(t *testing.
 	}
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	outcome := f.settlement.ExecuteMaintenance(t.Context(), execution)
+	outcome := f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
 	require.IsType(t, MaintenanceExecutionAmbiguous{}, outcome)
 	require.Zero(t, state.launches)
 	pending, err := f.settlement.CompensationPending(execution.subject.Intent())
@@ -375,7 +382,7 @@ func TestMaintenanceCompensationCannotMintFromWrongStoredGeneration(t *testing.T
 	bindCompensationTest(t, f.settlement, state)
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(t.Context(), execution))
+	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution))
 	require.NoError(t, f.stores.callbacks.update(func(tx *bolt.Tx) error {
 		record, err := readCompensationTx(tx, execution.subject.Intent())
 		if err != nil {
@@ -427,7 +434,7 @@ func TestMaintenanceCompensationSourceEffectsSettleBeforeUnhealthyTerminal(t *te
 			bindCompensationTest(t, f.settlement, state)
 			execution, err := f.settlement.StartMaintenanceExecution(target)
 			require.NoError(t, err)
-			outcome := f.settlement.ExecuteMaintenance(t.Context(), execution)
+			outcome := f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
 			failed, ok := outcome.(MaintenanceExecutionFailure)
 			require.True(t, ok, "%T: %v", outcome, outcome)
 			require.False(t, failed.SourceRecovered())
@@ -458,7 +465,7 @@ func TestMaintenanceCompensationAmbiguousSourceDebtSurvivesReopen(t *testing.T) 
 	bindCompensationTest(t, f.settlement, state)
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(t.Context(), execution))
+	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution))
 	assertCompensationJournalPhase(t, f.settlement, execution.subject.Intent(), compensationSourceDispatching, 1)
 	reopened := reopenCompensationSettlement(t, f)
 	bindCompensationTest(t, reopened, state)
@@ -486,7 +493,7 @@ func TestMaintenanceCompensationCloseRevokesSourcePlanAndRetainsAmbiguousDebt(t 
 	bindCompensationTest(t, f.settlement, state)
 	execution, err := f.settlement.StartMaintenanceExecution(target)
 	require.NoError(t, err)
-	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(t.Context(), execution))
+	require.IsType(t, MaintenanceExecutionAmbiguous{}, f.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution))
 	closeSettlement := newCloseSettlementForTest(t, f.stores)
 	_ = admitSettlementClose(t, closeSettlement, target.LeaseUUID(), false)
 	require.NoError(t, f.stores.callbacks.view(func(tx *bolt.Tx) error {
@@ -499,58 +506,92 @@ func TestMaintenanceCompensationCloseRevokesSourcePlanAndRetainsAmbiguousDebt(t 
 	require.NoError(t, f.stores.callbacks.Healthy())
 }
 
-func TestMaintenanceCompensationTargetDeadlineAllowsSourceButCancellationDoesNot(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		timeout bool
-	}{{"deadline", true}, {"close-cancellation", false}} {
-		t.Run(tc.name, func(t *testing.T) {
+func TestMaintenanceCompensationWorkerCancellationAfterTargetDeadline(t *testing.T) {
+	for _, event := range []string{"deadline-only", "close-before-deadline", "close-before-source", "close-during-source", "shutdown-before-source", "shutdown-during-source"} {
+		t.Run(event, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
+				shutdownContext, shutdown := context.WithCancel(t.Context())
+				defer shutdown()
+				handoff, cancelHandoff := NewMaintenanceWorkerHandoff(shutdownContext, time.Hour)
+				defer cancelHandoff()
+				worker, err := handoff.ClaimWorker()
+				require.NoError(t, err)
+				closeWorker := worker.Cancel
+				defer closeWorker()
 				f := beginBoundMaintenance(t, "compensation-context")
 				target := f.appendAndBind(t)
-				targetCtx, cancel := context.WithTimeout(t.Context(), time.Hour)
-				defer cancel()
 				state := &compensationTestState{targetReturned: func() {
-					if tc.timeout {
-						time.Sleep(time.Hour)
-						<-targetCtx.Done()
-					} else {
-						cancel()
+					if event == "close-before-deadline" {
+						closeWorker()
+						return
+					}
+					time.Sleep(time.Hour)
+					<-worker.TargetContext().Done()
+					require.ErrorIs(t, worker.TargetContext().Err(), context.DeadlineExceeded)
+					switch event {
+					case "close-before-source":
+						closeWorker()
+					case "shutdown-before-source":
+						shutdown()
 					}
 				}}
+				state.sourceRunning = func(ctx context.Context) error {
+					switch event {
+					case "close-during-source":
+						closeWorker()
+					case "shutdown-during-source":
+						shutdown()
+					default:
+						return nil
+					}
+					require.ErrorIs(t, ctx.Err(), context.Canceled)
+					return ctx.Err()
+				}
 				bindCompensationTest(t, f.settlement, state)
 				execution, err := f.settlement.StartMaintenanceExecution(target)
 				require.NoError(t, err)
-				outcome := f.settlement.ExecuteMaintenance(targetCtx, execution)
-				if tc.timeout {
-					require.ErrorIs(t, targetCtx.Err(), context.DeadlineExceeded)
+				outcome := f.settlement.ExecuteMaintenance(worker, execution)
+				switch event {
+				case "deadline-only":
 					require.IsType(t, MaintenanceExecutionFailure{}, outcome)
-					require.Equal(t, 1, state.launches, "expired target startup deadline must allow bounded source recovery")
-				} else {
+					require.Equal(t, 1, state.launches, "target deadline preserves bounded source recovery")
+				case "close-during-source", "shutdown-during-source":
 					require.IsType(t, MaintenanceExecutionAmbiguous{}, outcome)
-					require.Zero(t, state.launches, "close cancellation cannot dispatch source effects")
+					require.Equal(t, 1, state.launches)
+					require.ErrorIs(t, state.journal.CheckNamespace(target.LeaseUUID()), ErrVolumeLaunchUnsettled, "cancellation alone cannot attest admitted completion")
+				default:
+					require.IsType(t, MaintenanceExecutionAmbiguous{}, outcome)
+					require.Zero(t, state.launches, "whole-worker cancellation must prevent source dispatch")
 				}
 			})
 		})
 	}
 }
 
-func TestMaintenanceCompensationExecutionLifetimeIgnoresOnlyTargetDeadline(t *testing.T) {
+func TestMaintenanceCompensationBudgetAndCanceledHandoff(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		lifetime, shutdown := context.WithCancel(t.Context())
-		defer shutdown()
-		target, cancelTarget := context.WithTimeout(t.Context(), time.Second)
-		defer cancelTarget()
+		handoff, cancel := NewMaintenanceWorkerHandoff(t.Context(), time.Second)
+		lifetime, err := handoff.ClaimWorker()
+		require.NoError(t, err)
+		defer cancel()
 		time.Sleep(time.Second)
-		<-target.Done()
-		require.ErrorIs(t, target.Err(), context.DeadlineExceeded)
-		source, cancelSource := compensationExecutionContext(target, lifetime)
+		<-lifetime.TargetContext().Done()
+		require.ErrorIs(t, lifetime.TargetContext().Err(), context.DeadlineExceeded)
+		source, cancelSource := lifetime.compensationContext()
 		defer cancelSource()
 		require.NoError(t, source.Err(), "expired target timeout must not consume source recovery budget")
 		deadline, ok := source.Deadline()
 		require.True(t, ok)
 		require.Equal(t, 2*time.Minute, time.Until(deadline))
-		shutdown()
-		require.ErrorIs(t, source.Err(), context.Canceled, "backend shutdown cancels source recovery")
+		cancel()
+		require.NoError(t, source.Err(), "discarding an accepted handoff cannot revoke its worker")
+		lifetime.Cancel()
+		require.ErrorIs(t, source.Err(), context.Canceled)
+		_, err = handoff.ClaimWorker()
+		require.Error(t, err, "a copied handoff cannot issue another worker")
+		canceledHandoff, cancelHandoff := NewMaintenanceWorkerHandoff(t.Context(), time.Second)
+		cancelHandoff()
+		_, err = canceledHandoff.ClaimWorker()
+		require.Error(t, err, "a discarded handoff cannot issue a worker after waiting in the inbox")
 	})
 }

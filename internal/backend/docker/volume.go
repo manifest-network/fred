@@ -293,7 +293,7 @@ func newVolumeManager(dataPath, filesystem string, minAvgFileBytes int64, logger
 			mountPoint:        mountPoint,
 			logger:            logger,
 			minAvgFileBytes:   minAvgFileBytes,
-			projectAttributes: linuxXFSProjectAttributeReader{},
+			projectAttributes: linuxXFSProjectAttributes{},
 			activeIDs:         make(map[uint32]string),
 			volumeToID:        make(map[string]uint32),
 		}, nil

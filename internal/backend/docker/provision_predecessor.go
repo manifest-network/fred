@@ -20,11 +20,12 @@ type preparedProvisionOperation struct {
 }
 
 func (b *Backend) prepareProvisionOperation(
-	ctx context.Context,
 	request provisionOperationInput,
 	desiredItems []backend.LeaseItem,
+	ingress effectiveIngressPlan,
 	profiles []shared.SKUResourceSnapshot,
 	healthCheckServices []string,
+	manifestAdmission shared.ProvisionManifestAdmission,
 ) (preparedProvisionOperation, error) {
 	if b.operationSettlement == nil {
 		return preparedProvisionOperation{}, errors.New("provision admission requires the operation settlement")
@@ -36,13 +37,14 @@ func (b *Backend) prepareProvisionOperation(
 		Kind: shared.OperationIntentProvision, LeaseUUID: request.LeaseUUID,
 		CallbackURL: request.CallbackURL, LifecycleCallbackURL: request.LifecycleCallbackURL,
 		Tenant: request.Tenant, ProviderUUID: request.ProviderUUID,
-		Items: desiredItems, ResourceProfiles: profiles, EffectiveItems: request.Items,
+		Items: desiredItems, ResourceProfiles: profiles, EffectiveItems: ingress.effectiveItems(),
 		HealthCheckServices: healthCheckServices, Manifest: request.Payload,
 	})
 	if err != nil {
 		return preparedProvisionOperation{}, fmt.Errorf("construct provision operation intent: %w", err)
 	}
-	if err := b.prepareProvisionPredecessor(ctx, request); err != nil {
+	candidate, err = manifestAdmission.Bind(candidate)
+	if err != nil {
 		return preparedProvisionOperation{}, err
 	}
 	return preparedProvisionOperation{settlement: b.operationSettlement, candidate: candidate}, nil

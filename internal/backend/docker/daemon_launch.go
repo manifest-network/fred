@@ -3,9 +3,13 @@ package docker
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/manifest-network/fred/internal/backend/shared/completion"
 )
 
 // daemonLaunchOutcome separates a completed daemon exchange from its business
@@ -24,16 +28,33 @@ func (o daemonLaunchOutcome) completionError() error {
 	return errors.Join(errors.New("docker launch request completion is unknown"), o.err)
 }
 
+// Each admitted Create/Start keeps a bounded daemon exchange alive after caller
+// cancellation. It fits inside the backend's shutdown drain, allowing the exact
+// launch outcome to settle before journals close or compensation starts.
+const daemonLaunchCompletionGrace = 30 * time.Second
+
 // Each Compose invocation owns a permanently bound transport scope. Closing
 // admission before returning prevents a detached Compose goroutine from issuing
-// a new Create/Start after the journal has settled. Direct SDK methods preserve
-// their supplied context synchronously and use the same observer per call.
-type daemonLaunchScope struct {
-	mu       sync.Mutex
-	closed   bool
-	pending  int
-	unknown  bool
-	observer *daemonLaunchObserver
+// a new Create/Start after the journal has settled. The parent context controls
+// admission even if Compose replaces its own child request context.
+type daemonLaunchScope struct{ state *daemonLaunchScopeState }
+
+type daemonLaunchScopeState struct {
+	mu         sync.Mutex
+	ctx        context.Context
+	closed     bool
+	pending    int
+	unknown    bool
+	drained    chan struct{}
+	observer   *daemonLaunchObserver
+	completion completion.Lifetime
+}
+
+func newDaemonLaunchScope(ctx context.Context, observer *daemonLaunchObserver) *daemonLaunchScope {
+	return &daemonLaunchScope{state: &daemonLaunchScopeState{
+		ctx: ctx, observer: observer, drained: make(chan struct{}),
+		completion: completion.New(ctx, daemonLaunchCompletionGrace),
+	}}
 }
 
 // A nonzero-sized constructor lineage binds the direct SDK observer to the
@@ -47,21 +68,37 @@ func (o *daemonLaunchObserver) run(ctx context.Context, invoke func(context.Cont
 	if o == nil {
 		return daemonLaunchOutcome{err: errors.New("launch has no bound Docker observer")}
 	}
-	scope := &daemonLaunchScope{observer: o}
+	scope := newDaemonLaunchScope(ctx, o)
 	defer scope.close()
 	return scope.finish(invoke(withDaemonLaunchScope(ctx, scope)))
 }
 
-func (s *daemonLaunchScope) close() {
+func (scope *daemonLaunchScope) close() {
+	s := scope.state
 	s.mu.Lock()
-	s.closed = true
+	if !s.closed {
+		s.closed = true
+		if s.pending == 0 {
+			close(s.drained)
+			s.completion.Close()
+		}
+	}
 	s.mu.Unlock()
 }
 
-func (s *daemonLaunchScope) finish(err error) daemonLaunchOutcome {
+func (scope *daemonLaunchScope) finish(err error) daemonLaunchOutcome {
+	s := scope.state
+	scope.close()
+	// Compose can return before a detached worker does. Close admission first,
+	// then drain admitted requests for the normal operation lifetime. Only an
+	// actual caller cancellation starts the bounded completion grace.
+	defer s.completion.Close()
+	select {
+	case <-s.drained:
+	case <-s.completion.Context().Done():
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.closed = true
 	return daemonLaunchOutcome{settled: !s.unknown && s.pending == 0, err: err}
 }
 
@@ -73,32 +110,87 @@ func daemonContainerLaunchRequest(req *http.Request) bool {
 	return found && (endpoint == "create" || strings.HasSuffix(endpoint, "/start"))
 }
 
-func (s *daemonLaunchScope) roundTrip(next http.RoundTripper, req *http.Request) (*http.Response, error) {
+func (scope *daemonLaunchScope) roundTrip(next http.RoundTripper, req *http.Request) (*http.Response, error) {
+	s := scope.state
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return nil, errors.New("docker launch invocation has ended")
 	}
-	tracked := daemonContainerLaunchRequest(req)
-	if tracked {
-		s.pending++
+	if err := s.ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return nil, err
 	}
+	if err := req.Context().Err(); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	if !daemonContainerLaunchRequest(req) {
+		s.mu.Unlock()
+		return next.RoundTrip(req)
+	}
+	s.pending++
 	s.mu.Unlock()
 	var responded bool
 	defer func() {
-		if tracked {
-			s.mu.Lock()
-			s.pending--
-			s.unknown = s.unknown || !responded
-			s.mu.Unlock()
+		s.mu.Lock()
+		s.pending--
+		s.unknown = s.unknown || !responded
+		if s.closed && s.pending == 0 {
+			close(s.drained)
+			s.completion.Close()
 		}
+		s.mu.Unlock()
 	}()
-	response, err := next.RoundTrip(req)
+	admitted := newAdmittedDaemonRequest(req, s.ctx)
+	response, err := admitted.roundTrip(next)
 	// Create and Start are non-streaming endpoints. A final daemon response
 	// follows the handler's operation even when decoding the response body or
 	// the returned business status subsequently fails in the SDK.
 	responded = err == nil && daemonCompletedLaunchResponse(req, response)
 	return response, err
+}
+
+// admittedDaemonRequest owns the detached context until its transport returns.
+// A successful response transfers cancellation to its body; every other exit,
+// including a transport panic, releases it here.
+type admittedDaemonRequest struct {
+	request    *http.Request
+	completion completion.Lifetime
+}
+
+func newAdmittedDaemonRequest(req *http.Request, invocation context.Context) admittedDaemonRequest {
+	// Once dispatch is admitted, an actor transition or Stop may stop future
+	// launches but cannot turn our own cancellation into unknown completion.
+	owned := completion.New(req.Context(), daemonLaunchCompletionGrace, invocation)
+	return admittedDaemonRequest{request: req.Clone(owned.Context()), completion: owned}
+}
+
+func (request admittedDaemonRequest) roundTrip(next http.RoundTripper) (*http.Response, error) {
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			request.completion.Close()
+		}
+	}()
+	response, err := next.RoundTrip(request.request)
+	if response != nil && response.Body != nil && err == nil {
+		response.Body = daemonLaunchResponseBody{ReadCloser: response.Body, completion: request.completion}
+		handedOff = true
+	}
+	return response, err
+}
+
+// A response header proves handler completion, but the SDK still needs the
+// response body. Keep the bounded request context alive until it closes it.
+type daemonLaunchResponseBody struct {
+	io.ReadCloser
+	completion completion.Lifetime
+}
+
+func (b daemonLaunchResponseBody) Close() error {
+	defer b.completion.Close()
+	return b.ReadCloser.Close()
 }
 
 func daemonCompletedLaunchResponse(req *http.Request, response *http.Response) bool {
@@ -151,7 +243,7 @@ func (t daemonContextTransport) RoundTrip(req *http.Request) (response *http.Res
 		defer func() { scope.observe(t.observer, req, response, err) }()
 	}
 	if scope, ok := req.Context().Value(daemonLaunchContextKey{}).(*daemonLaunchScope); ok {
-		if t.observer == nil || scope.observer != t.observer {
+		if t.observer == nil || scope.state == nil || scope.state.observer != t.observer {
 			return nil, errors.New("docker launch observer belongs to another client")
 		}
 		return scope.roundTrip(t.next, req)

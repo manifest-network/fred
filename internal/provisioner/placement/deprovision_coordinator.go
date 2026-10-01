@@ -222,27 +222,30 @@ func (coordinator *deprovisionCoordinator) executeEvent(
 		if backend.DeprovisionNotDispatched(client, leaseUUID, err) {
 			return deprovisionBackendCall{disposition: deprovisionCallNotDispatched, err: err}
 		}
+		if backend.DeprovisionLifecyclePending(client, leaseUUID, err) {
+			return deprovisionBackendCall{disposition: deprovisionCallLifecyclePending, err: err}
+		}
 		return deprovisionBackendCall{disposition: deprovisionCallUnknown, err: err}
 	}
 	if !unresolved && len(reachable) > 0 {
 		var failures []error
 		failed := make([]string, 0)
-		allFailedNotDispatched := true
+		deferral := DeprovisionDeferredBackendUnavailable
 		for _, name := range reachable {
 			result := call(name)
 			if failure := result.failure(); failure != nil {
 				failures = append(failures, fmt.Errorf("backend %s: %w", name, failure))
 				failed = append(failed, name)
-				allFailedNotDispatched = allFailedNotDispatched && result.disposition == deprovisionCallNotDispatched
+				deferral = result.mergeDeferral(deferral)
 			} else {
 				coordinator.forget(leaseUUID, name)
 			}
 		}
 		if len(failures) != 0 {
 			err := fmt.Errorf("%w: lease %s: %w", ErrDeprovisionExecution, leaseUUID, errors.Join(failures...))
-			if allFailedNotDispatched {
+			if deferral != "" {
 				coordinator.remember(leaseUUID, failed)
-				return coordinator.deferredEvent(leaseUUID, DeprovisionDeferredBackendUnavailable, err)
+				return coordinator.deferredEvent(leaseUUID, deferral, err)
 			}
 			return finishWithError(err, failed)
 		}
@@ -252,13 +255,13 @@ func (coordinator *deprovisionCoordinator) executeEvent(
 
 	var sweepErrs []error
 	failed := make([]string, 0)
-	allFailedNotDispatched := true
+	deferral := DeprovisionDeferredBackendUnavailable
 	for _, name := range configured {
 		result := call(name)
 		if failure := result.failure(); failure != nil {
 			failed = append(failed, name)
 			sweepErrs = append(sweepErrs, fmt.Errorf("backend %s: %w", name, failure))
-			allFailedNotDispatched = allFailedNotDispatched && result.disposition == deprovisionCallNotDispatched
+			deferral = result.mergeDeferral(deferral)
 		} else {
 			coordinator.forget(leaseUUID, name)
 		}
@@ -274,9 +277,9 @@ func (coordinator *deprovisionCoordinator) executeEvent(
 	if len(sweepErrs) != 0 {
 		retry := append(append([]string(nil), failed...), missing...)
 		err := fmt.Errorf("%w: lease %s: %w", ErrDeprovisionExecution, leaseUUID, errors.Join(sweepErrs...))
-		if len(missing) == 0 && !unaccountable && allFailedNotDispatched {
+		if len(missing) == 0 && !unaccountable && deferral != "" {
 			coordinator.remember(leaseUUID, retry)
-			return coordinator.deferredEvent(leaseUUID, DeprovisionDeferredBackendUnavailable, err)
+			return coordinator.deferredEvent(leaseUUID, deferral, err)
 		}
 		return finishWithError(err, retry)
 	}
@@ -290,6 +293,7 @@ const (
 	deprovisionCallUnknown deprovisionCallDisposition = iota
 	deprovisionCallCompleted
 	deprovisionCallNotDispatched
+	deprovisionCallLifecyclePending
 )
 
 type deprovisionBackendCall struct {
@@ -304,4 +308,21 @@ func (result deprovisionBackendCall) failure() error {
 		return result.err
 	}
 	return ErrDeprovisionExecution
+}
+
+// Deferral is preserved only while every failed call has exact transport
+// provenance. An unknown failure poisons the aggregate; later known waits
+// cannot turn a partial, ambiguous cleanup into a deferred observation.
+func (result deprovisionBackendCall) mergeDeferral(previous DeprovisionDeferralReason) DeprovisionDeferralReason {
+	if previous == "" {
+		return ""
+	}
+	switch result.disposition {
+	case deprovisionCallNotDispatched:
+		return previous
+	case deprovisionCallLifecyclePending:
+		return DeprovisionDeferredLifecycle
+	default:
+		return ""
+	}
 }

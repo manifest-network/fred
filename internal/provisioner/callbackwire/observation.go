@@ -17,6 +17,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/maintenanceid"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
@@ -40,15 +41,16 @@ const (
 // request. It is useful for ingress validation and logging; only the original
 // VerifiedRequest may be submitted for settlement.
 type Observation struct {
-	leaseUUID   string
-	status      backend.CallbackStatus
-	failure     string
-	backendName string
-	retained    bool
-	operationID operation.OperationID
-	lifecycleID lifecycle.ID
-	storageID   backendidentity.ID
-	selector    Selector
+	maintenanceID maintenanceid.ID
+	leaseUUID     string
+	status        backend.CallbackStatus
+	failure       string
+	backendName   string
+	retained      bool
+	operationID   operation.OperationID
+	lifecycleID   lifecycle.ID
+	storageID     backendidentity.ID
+	selector      Selector
 }
 
 var (
@@ -78,6 +80,7 @@ func (o Observation) Retained() bool                     { return o.retained }
 func (o Observation) OperationID() operation.OperationID { return o.operationID }
 func (o Observation) LifecycleID() lifecycle.ID          { return o.lifecycleID }
 func (o Observation) StorageID() backendidentity.ID      { return o.storageID }
+func (o Observation) MaintenanceID() maintenanceid.ID    { return o.maintenanceID }
 func (o Observation) Selector() Selector                 { return o.selector }
 
 // Payload returns a detached compatibility DTO. It carries no settlement
@@ -86,6 +89,9 @@ func (o Observation) Payload() backend.CallbackPayload {
 	payload := backend.CallbackPayload{
 		LeaseUUID: o.leaseUUID, Status: o.status, Error: o.failure,
 		Backend: o.backendName, Retained: o.retained,
+	}
+	if o.maintenanceID.Valid() {
+		payload.MaintenanceID = o.maintenanceID.String()
 	}
 	if o.storageID.Valid() {
 		payload.BackendStorageID = o.storageID.String()
@@ -178,6 +184,16 @@ func DecodeVerified(request hmacauth.VerifiedRequest) (Observation, error) {
 		observation.lifecycleID = lifecycleID
 		observation.selector = SelectorLifecycle
 	}
+	if payload.MaintenanceID != "" {
+		if operationPresent || payload.Status == backend.CallbackStatusDeprovisioned {
+			return Observation{}, fmt.Errorf("%w: maintenance completion requires lifecycle or legacy success/failure", ErrInvalidPayload)
+		}
+		id, err := maintenanceid.Parse(payload.MaintenanceID)
+		if err != nil {
+			return Observation{}, fmt.Errorf("%w: maintenance ID: %w", ErrInvalidPayload, err)
+		}
+		observation.maintenanceID = id
+	}
 	return observation, nil
 }
 
@@ -200,12 +216,16 @@ func SelectUntrustedStorageRoute(body []byte) (backendidentity.ID, error) {
 
 var payloadFields = [...]string{
 	"lease_uuid", "status", "error", "backend_storage_id", "backend",
-	"operation_id", "lifecycle_id", "retained",
+	"operation_id", "lifecycle_id", "retained", "maintenance_id",
 }
 
 // decodePayload keeps unknown fields forward compatible while rejecting
 // duplicate or case-aliased protocol names and trailing JSON data.
 func decodePayload(body []byte) (backend.CallbackPayload, error) {
+	var budget envelopeBudget
+	if err := budget.consume(body); err != nil {
+		return backend.CallbackPayload{}, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	opening, err := decoder.Token()
 	if err != nil {
@@ -256,6 +276,8 @@ func decodePayload(body []byte) (backend.CallbackPayload, error) {
 			target = &payload.LifecycleID
 		case "retained":
 			target = &payload.Retained
+		case "maintenance_id":
+			target = &payload.MaintenanceID
 		default:
 			target = new(json.RawMessage)
 		}

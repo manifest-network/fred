@@ -54,7 +54,7 @@ func TestFailedMaintenanceStartupLogsSurviveCleanupAndJournalReopen(t *testing.T
 			bindTestDiagnosticsStore(t, h.b, store)
 			execution, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
 			require.NoError(t, err)
-			require.IsType(t, shared.MaintenanceExecutionAmbiguous{}, h.b.maintenanceSettlement.ExecuteMaintenance(t.Context(), execution))
+			require.IsType(t, shared.MaintenanceExecutionAmbiguous{}, h.b.maintenanceSettlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution))
 			require.NotEmpty(t, h.inventory.containers, "failure remains recoverable before cleanup")
 			// Reopen every journal before the timeout-driven failed-target retirement.
 			require.NoError(t, store.Close())
@@ -95,7 +95,7 @@ func TestFailedMaintenanceCleanupWaitsForWritableDiagnosticStore(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	execution, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
 	require.NoError(t, err)
-	require.IsType(t, shared.MaintenanceExecutionAmbiguous{}, h.b.maintenanceSettlement.ExecuteMaintenance(t.Context(), execution))
+	require.IsType(t, shared.MaintenanceExecutionAmbiguous{}, h.b.maintenanceSettlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution))
 	require.NoError(t, store.Close())
 	h.b.cfg.ProvisionTimeout = time.Nanosecond
 	require.Error(t, h.b.recoverMaintenanceIntents(t.Context()))
@@ -133,7 +133,7 @@ func TestInterruptedMaintenanceCloseCapturesStartupLogsBeforeTargetRemoval(t *te
 			configureDiagnosticStartupFailure(t, h)
 			execution, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
 			require.NoError(t, err)
-			require.IsType(t, shared.MaintenanceExecutionAmbiguous{}, h.b.maintenanceSettlement.ExecuteMaintenance(t.Context(), execution))
+			require.IsType(t, shared.MaintenanceExecutionAmbiguous{}, h.b.maintenanceSettlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution))
 			// Close must retire both the failed target and a surviving source,
 			// even when their callback routes name different provider bases.
 			h.inventory.containers = append(h.inventory.containers, h.containersFor(h.source, 1, "running", HealthStatusNone)...)

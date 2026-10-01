@@ -32,6 +32,10 @@ func (v completionPendingStorageVerifier) Verify(context.Context) error { return
 // This fixture obtains the diagnostic through real journal admission and
 // publication; the HTTP test cannot construct the private error itself.
 func journalCompletionPendingError(t *testing.T) error {
+	return journalPendingError(t, nil)
+}
+
+func journalPendingError(t *testing.T, observe func(*shared.OperationSettlement, *shared.MaintenanceSettlement, shared.OperationReleaseCandidate) error) error {
 	t.Helper()
 	dir := t.TempDir()
 	pair, err := backendidentity.BindMarkerPair(filepath.Join(dir, "storage.json"), filepath.Join(dir, "anchor.json"))
@@ -103,6 +107,9 @@ func journalCompletionPendingError(t *testing.T) error {
 	require.True(t, created)
 	release, err := operations.PrepareOperationRelease(claim)
 	require.NoError(t, err)
+	if observe != nil {
+		return observe(operations, maintenance, release)
+	}
 	refusal, err := operations.RefuseOperationExecution(release)
 	require.NoError(t, err)
 	uncommitted, err := operations.CommitOperationFailure(refusal)

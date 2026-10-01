@@ -162,7 +162,7 @@ func (f *writerRetirementHarness) execute(t *testing.T) {
 	t.Helper()
 	execution, err := f.h.b.maintenanceSettlement.StartMaintenanceExecution(f.h.target)
 	require.NoError(t, err)
-	_ = f.h.b.maintenanceSettlement.ExecuteMaintenance(t.Context(), execution)
+	_ = f.h.b.maintenanceSettlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
 }
 
 func TestVolumeWriterRetirementPrecedesBindPreparationAndLaunch(t *testing.T) {

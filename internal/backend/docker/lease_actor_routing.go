@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"sync"
@@ -511,27 +512,37 @@ func (b *Backend) handoffProvisionAdmission(
 	}, err)
 }
 
+// maintenanceWorkerHandoff preserves whole-worker cancellation after the target
+// deadline. Only the backend lifecycle, never the HTTP waiter, owns this work.
+func (b *Backend) maintenanceWorkerHandoff() (shared.MaintenanceWorkerHandoff, context.CancelFunc) {
+	return shared.NewMaintenanceWorkerHandoff(b.stopCtx, b.provisionOperationTimeout())
+}
+
+func (b *Backend) provisionOperationTimeout() time.Duration {
+	return cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
+}
+
 func (b *Backend) handoffMaintenanceAdmission(
 	callerCtx context.Context,
 	target shared.MaintenanceReleaseClaim,
 ) (asyncAcceptance, error) {
-	opCtx, cancel := b.shutdownAwareContext()
+	lifetime, cancel := b.maintenanceWorkerHandoff()
 	var command leasesm.ActorCommand
 	var reply leasesm.ActorReply
 	var err error
 	switch target.Intent().Kind() {
 	case shared.MaintenanceIntentRestart:
-		command, reply, err = leasesm.NewRestartCommand(opCtx, target)
+		command, reply, err = leasesm.NewRestartCommand(lifetime, target)
 	case shared.MaintenanceIntentUpdate:
-		command, reply, err = leasesm.NewUpdateCommand(opCtx, target)
+		command, reply, err = leasesm.NewUpdateCommand(lifetime, target)
 	case shared.MaintenanceIntentCustomDomain:
-		command, reply, err = leasesm.NewCustomDomainCommand(opCtx, target)
+		command, reply, err = leasesm.NewCustomDomainCommand(lifetime, target)
 	default:
 		err = fmt.Errorf("unsupported durable maintenance kind %q", target.Intent().Kind())
 	}
 	return b.handoffDurableActorCommand(callerCtx, durableActorHandoff{
 		leaseUUID: target.LeaseUUID(), command: command, reply: reply,
-		operation: opCtx, cancel: cancel,
+		operation: lifetime.TargetContext(), cancel: cancel,
 	}, err)
 }
 

@@ -321,6 +321,12 @@ func (b *Backend) persistStubDiagnostic(f stubFailure) (canceled bool) {
 // BACKEND_GUIDE.md) has nothing to surface. TestRunStubProvisioner_
 // PersistsDiagnosticBeforeCallback pins the order.
 func (b *Backend) sendStubFailureCallback(f stubFailure) {
+	// Proof consumption and callback settlement belong to one command owner.
+	// Teardown must either cancel this worker before it starts publication or
+	// observe the completed journal transition; it cannot consume the same
+	// unresolved operation between these two durable checks.
+	unlockCommand := b.commandFence.Lock(f.leaseUUID)
+	defer unlockCommand()
 	if err := f.leaseCtx.Err(); err != nil {
 		b.logger.Debug("suppressing callback send for canceled provision",
 			"lease_uuid", f.leaseUUID,

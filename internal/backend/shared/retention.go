@@ -431,7 +431,7 @@ func validateRetentionSourceAuthorityForBinding(entry *RetentionEntry) error {
 		}
 		return nil
 	}
-	if err := entry.StackManifest.Validate(); err != nil {
+	if err := entry.StackManifest.ValidateStored(); err != nil {
 		return fmt.Errorf("retention source manifest: %w", err)
 	}
 	if err := manifest.ValidateStackAgainstItems(entry.StackManifest, items); err != nil {

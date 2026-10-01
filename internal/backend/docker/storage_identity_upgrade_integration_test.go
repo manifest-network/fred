@@ -9,10 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -212,6 +214,8 @@ func newStorageIdentityDockerServerWithDaemonID(
 	daemonID func() string,
 ) *httptest.Server {
 	t.Helper()
+	var imageCacheMarkerMu sync.Mutex
+	var imageCacheMarker *volume.Volume
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -231,6 +235,24 @@ func newStorageIdentityDockerServerWithDaemonID(
 			}))
 		case strings.HasSuffix(r.URL.Path, "/containers/json"):
 			assert.NoError(t, json.NewEncoder(w).Encode(containers))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/volumes/create"):
+			var options volume.CreateOptions
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&options))
+			imageCacheMarkerMu.Lock()
+			defer imageCacheMarkerMu.Unlock()
+			if imageCacheMarker == nil {
+				imageCacheMarker = &volume.Volume{Name: options.Name, Driver: options.Driver, Labels: options.Labels}
+			}
+			w.WriteHeader(http.StatusCreated)
+			assert.NoError(t, json.NewEncoder(w).Encode(imageCacheMarker))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/volumes/"+imageCacheOwnerVolume):
+			imageCacheMarkerMu.Lock()
+			defer imageCacheMarkerMu.Unlock()
+			if imageCacheMarker == nil {
+				http.Error(w, `{"message":"volume not found"}`, http.StatusNotFound)
+				return
+			}
+			assert.NoError(t, json.NewEncoder(w).Encode(imageCacheMarker))
 		default:
 			http.Error(w, "unexpected Docker API path "+r.URL.Path, http.StatusNotFound)
 		}

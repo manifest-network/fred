@@ -199,3 +199,30 @@ func TestStrictManagedInventoryRejectsPreStackContainers(t *testing.T) {
 	})
 	require.ErrorIs(t, err, ErrPreStackWorkloadUnsupported)
 }
+
+func TestRecoverV013PolicyDriftPreservesRestartAndUpdateSource(t *testing.T) {
+	b, dockerState, _, releases := newMigrationTestBackend(t)
+	const (
+		leaseUUID    = "550e8400-e29b-41d4-a716-446655440000"
+		providerUUID = "22222222-2222-4222-8222-222222222222"
+	)
+	createdAt := time.Now().Add(-time.Hour).UTC()
+	dockerState.containers = []ContainerInfo{{
+		ContainerID: "app-0", LeaseUUID: leaseUUID, Tenant: "tenant-a",
+		ProviderUUID: providerUUID, BackendName: "docker", SKU: "docker-small",
+		ServiceName: "app", InstanceIndex: 0, Image: "nginx:1.27",
+		CallbackURL: "https://fred.example/callbacks/provision", Status: "running", CreatedAt: createdAt,
+	}}
+	releases.SeedRelease(t, leaseUUID, shared.Release{
+		Manifest: []byte(`{"services":{"app":{"image":"nginx:1.27","labels":{"com.docker.compose.project":"legacy","traefiK.enable":"true"},"user":"1:2:3"}}}`),
+		Image:    "stack", Status: "active", CreatedAt: createdAt,
+	})
+	require.NoError(t, b.recoverState(t.Context()))
+	active, err := releases.Store.LatestActive(leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	require.NotEmpty(t, active.Items)
+	require.NotEmpty(t, active.ResourceProfiles)
+	require.NoError(t, validateReplaceSourceRelease(*active))
+	require.NoError(t, releases.Store.Healthy())
+}

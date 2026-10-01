@@ -1021,9 +1021,13 @@ type record struct {
 // Store is a bbolt-backed placement store with an in-memory read cache. All
 // writes commit to bbolt before the cache or revision clock is changed.
 type Store struct {
-	db             *bolt.DB
-	cache          map[string]Placement
-	lifecycleCache map[string]lifecycleCapability
+	// Completion wakeups carry no authority; the journal remains the work queue.
+	maintenanceChanged           chan struct{}
+	maintenanceCompletionVersion atomic.Uint64
+	maintenanceAccounting        *maintenancePendingAccounting
+	db                           *bolt.DB
+	cache                        map[string]Placement
+	lifecycleCache               map[string]lifecycleCapability
 	// deleteRevisions fences stale inventory from recreating an exact key that
 	// was deleted after its snapshot began. Entries exist only while at least one
 	// registered inventory snapshot could still need them, so unrelated keys do
@@ -1253,6 +1257,7 @@ func loadStoreWithExpectedAuthority(
 	}
 	cache := make(map[string]Placement)
 	var lifecycleCache map[string]lifecycleCapability
+	var maintenanceAccounting *maintenancePendingAccounting
 	var revision uint64
 	var metadata topologyMetadata
 	if err := db.View(func(tx *bolt.Tx) error {
@@ -1285,7 +1290,8 @@ func loadStoreWithExpectedAuthority(
 			return err
 		}
 		quarantineLifecycleBindings(cache, lifecycleCache)
-		return nil
+		maintenanceAccounting, err = loadMaintenanceAccounting(tx)
+		return err
 	}); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to load placement store: %w", err)
@@ -1327,17 +1333,19 @@ func loadStoreWithExpectedAuthority(
 		return nil, fmt.Errorf("construct placement runtime authority gate: %w", err)
 	}
 	s := &Store{
-		db:                   db,
-		cache:                cache,
-		lifecycleCache:       lifecycleCache,
-		deleteRevisions:      make(map[string]uint64),
-		activeSnapshots:      make(map[uint64]uint64),
-		unprojectedPositives: make(map[string]map[uint64]map[inventoryPositiveObservation]struct{}),
-		now:                  time.Now,
-		revision:             revision,
-		authorityEpoch:       1,
-		providerUUID:         metadata.ProviderUUID,
-		backendTopology:      slices.Clone(metadata.Topology),
+		maintenanceChanged:    make(chan struct{}, 1),
+		maintenanceAccounting: maintenanceAccounting,
+		db:                    db,
+		cache:                 cache,
+		lifecycleCache:        lifecycleCache,
+		deleteRevisions:       make(map[string]uint64),
+		activeSnapshots:       make(map[uint64]uint64),
+		unprojectedPositives:  make(map[string]map[uint64]map[inventoryPositiveObservation]struct{}),
+		now:                   time.Now,
+		revision:              revision,
+		authorityEpoch:        1,
+		providerUUID:          metadata.ProviderUUID,
+		backendTopology:       slices.Clone(metadata.Topology),
 		backendTopologySet: func() map[string]struct{} {
 			set := make(map[string]struct{}, len(metadata.Topology))
 			for _, backendName := range metadata.Topology {

@@ -52,7 +52,7 @@ func TestZeroPhysicalEvidenceCannotMintTerminalAuthority(t *testing.T) {
 		execution, err := fixture.settlement.StartMaintenanceExecution(target)
 		require.NoError(t, err)
 		require.IsType(t, MaintenanceExecutionAmbiguous{},
-			fixture.settlement.ExecuteMaintenance(context.Background(), execution))
+			fixture.settlement.ExecuteMaintenance(testMaintenanceLifetime(t, context.Background()), execution))
 	})
 
 	t.Run("close", func(t *testing.T) {

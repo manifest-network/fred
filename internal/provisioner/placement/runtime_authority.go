@@ -254,8 +254,12 @@ func (s *Store) updateRuntimeAuthority(mutate func(*bolt.Tx) error) error {
 		identityErr := s.probeRuntimeAuthority()
 		if identityErr != nil {
 			identityErr = runtimeAuthorityTerminalFailure(identityErr)
+			return errors.Join(updateErr, identityErr)
 		}
-		return errors.Join(updateErr, identityErr)
+		// Preserve source-issued definite refusals only when the complete
+		// authority boundary succeeded. A failed postcheck must never project
+		// a retryable admission refusal in place of withdrawn authority.
+		return updateErr
 	})
 }
 

@@ -213,6 +213,10 @@ jobs:
           done
 
       - name: Run docker + btrfs integration suite (as root)
+        env:
+          # containerd.io uses this separately managed content root. Production
+          # requires image_data_path explicitly for snapshotter image stores.
+          FRED_TEST_IMAGE_DATA_PATH: /var/lib/containerd
         # `-run Integration` covers the ENTIRE docker package: core lifecycle,
         # stack, restart/update, reconciler, idempotency, image admission and
         # immutable platform binding, volume/quota, and the

@@ -52,7 +52,7 @@ type dockerReadClient interface {
 // compile error while retaining one composite construction/test seam.
 type dockerMutationSink interface {
 	AdmitImage(context.Context, string) (imageexec.Image, error)
-	PullImage(ctx context.Context, imageName string, timeout time.Duration) error
+	RequireImage(context.Context, string) error
 	ResolveImageUser(ctx context.Context, imageName imageexec.Image, userOverride string, origin shared.ImageInspectionOrigin) (uid, gid int, err error)
 	StartContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	StopContainer(ctx context.Context, containerID string, timeout time.Duration) error
@@ -62,9 +62,9 @@ type dockerMutationSink interface {
 	DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string, origin shared.ImageInspectionOrigin) (uid, gid int, err error)
 	DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string, origin shared.ImageInspectionOrigin) ([]string, error)
 	ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64, origin shared.ImageInspectionOrigin) map[string]error
-	createCompensationContainer(context.Context, imageexec.Image, compensationContainer) (string, daemonLaunchOutcome)
+	createCompensationContainer(context.Context, compensationContainer) (string, daemonLaunchOutcome)
 	startCompensationContainer(context.Context, string, time.Duration) daemonLaunchOutcome
-	readmitCompensationImage(context.Context, compensationContainerRecord) (imageexec.Image, error)
+	prepareCompensationContainer(context.Context, shared.MaintenanceCompensationSubject, compensationContainerRecord) (compensationContainer, error)
 }
 
 // dockerClient is the construction boundary implemented by DockerClient and
@@ -94,6 +94,7 @@ type releaseHistoryCapacityPlanner interface {
 // by Docker. Tests may wrap it to inject commit failures without regaining any
 // raw status-selected or caller-spliced mutation API.
 type operationSettlementService interface {
+	AdmitProvisionManifest(context.Context, string, string, string, []backend.LeaseItem, []byte) (shared.ProvisionManifestAdmission, error)
 	NewOperationIntentProbe(string, string) (shared.OperationIntentProbe, error)
 	ProbeOperationIntent(shared.OperationIntentProbe) (shared.OperationIntentAdmissionDisposition, error)
 	NewOperationIntentCandidate(shared.OperationIntentSpec) (shared.OperationIntentCandidate, error)
@@ -265,6 +266,7 @@ type Backend struct {
 	diagnosticsStore        *shared.DiagnosticsStore
 	failureDiagnostics      *shared.FailureDiagnostics
 	imageInspectionRecovery func(context.Context) error
+	imageCapacity           *imageCapacityManager
 	volumeLaunches          *volumeLaunchCoordinator
 
 	// releaseStore persists release history in bbolt
@@ -1630,7 +1632,7 @@ func legacyReleaseMatchesInterruptedDeprovisionRetention(
 		len(release.ResourceProfiles) != 0 {
 		return false, nil
 	}
-	releaseManifest, err := manifest.ParsePayload(release.Manifest)
+	releaseManifest, err := manifest.ParseStoredPayload(release.Manifest)
 	if err != nil {
 		return false, fmt.Errorf("parse legacy active release manifest: %w", err)
 	}
@@ -2285,11 +2287,15 @@ func newBackend(
 		return nil, fmt.Errorf("bind failed-attempt diagnostics: %w", err)
 	}
 	inspectionOwner, err := newImageInspectionCoordinator(docker, cbStore, stopCtx,
-		b.authorizeStorageMutation, b.completeStorageMutation, b.resolveBackgroundStorageStep, b.terminalStorageAuthorityError)
+		b.authorizeStorageMutation, b.completeStorageMutation, b.resolveBackgroundStorageStep, b.terminalStorageAuthorityError, b.latchAmbiguousOperationOutcome)
 	if err != nil {
 		return nil, fmt.Errorf("bind image inspection ownership: %w", err)
 	}
 	b.imageInspectionRecovery = func(ctx context.Context) error { return inspectionOwner.RecoverAndReport(ctx, b.logger) }
+	b.imageCapacity, err = newImageCapacityManager(ctx, b, docker)
+	if err != nil {
+		return nil, fmt.Errorf("bind image capacity management: %w", err)
+	}
 	b.volumeLaunches, err = newVolumeLaunchCoordinator(cbStore)
 	if err != nil {
 		return nil, fmt.Errorf("bind physical volume launch journal: %w", err)
@@ -2544,10 +2550,9 @@ func (b *Backend) Start(ctx context.Context) error {
 		b.logger.Warn("retention reconciliation failed", "error", retentionReconcileErr)
 	}
 
-	// Backfill per-volume quotas onto existing volumes. Volumes provisioned
-	// before the daemon held CAP_SYS_ADMIN were created untagged/un-limited;
-	// once the capability is granted, this re-applies enforcement without a
-	// re-provision. Every expected present volume is attempted, then any failures
+	// Verify root project identity/inheritance and refresh per-volume limits.
+	// Existing tenant trees are never recursively walked during startup.
+	// Historical untagged descendants require stopped-writer offline repair. Every expected present volume is attempted, then any failures
 	// fail startup/readiness closed: serving while even one known tenant volume
 	// may be uncapped would violate the resource authority recovered above. Runs
 	// after reconcileRetentions so the fred-retained- namespace matches the
@@ -2592,6 +2597,20 @@ func (b *Backend) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("storage identity lost during startup recovery: %w", err)
 	}
+	// The optional pin extension is a downgrade boundary. Populate it only
+	// after every fatal startup check has succeeded, so a refused first start
+	// leaves a pre-upgrade callback journal readable by the previous binary.
+	if b.imageCapacity != nil && b.imageCapacity.backfiller != nil {
+		backfillCtx, cancelBackfill := b.startupPhaseContext(startupCtx)
+		report, err := b.imageCapacity.backfiller.Sweep(backfillCtx)
+		cancelBackfill()
+		if err != nil || report.UnresolvedLeases != 0 {
+			b.logger.Warn("legacy image pin backfill incomplete; image collection remains conservative",
+				"pins_added", report.PinsAdded, "unresolved_leases", report.UnresolvedLeases, "error", err)
+		} else if report.PinsAdded != 0 {
+			b.logger.Info("backfilled immutable image pins from existing containers", "pins_added", report.PinsAdded)
+		}
+	}
 	b.callbackStore.StartMaintenance()
 	b.releaseStore.StartMaintenance()
 	b.startRetentionReaper()
@@ -2605,6 +2624,9 @@ func (b *Backend) Start(ctx context.Context) error {
 
 	// Start periodic reconciliation (using WaitGroup.Go for Go 1.25+)
 	b.wg.Go(b.reconcileLoop)
+	if b.imageCapacity != nil {
+		b.wg.Go(b.imageGCLoop)
+	}
 	if b.cfg.IsNetworkIsolation() {
 		b.wg.Go(b.networkCleanupLoop)
 	}
@@ -2668,8 +2690,15 @@ func (b *Backend) checkDaemonCapabilities(ctx context.Context) {
 
 // Stop shuts down the backend gracefully.
 func (b *Backend) Stop() error {
+	return b.StopContext(context.Background())
+}
+
+// StopContext shares the caller's shutdown deadline with admitted imports and
+// worker drain. The process can budget HTTP and backend shutdown together;
+// direct Stop callers retain the ordinary backend drain limit.
+func (b *Backend) StopContext(ctx context.Context) error {
 	b.stopCancel()
-	if err := b.waitForShutdownDrain(); err != nil {
+	if err := b.waitForShutdownDrain(ctx); err != nil {
 		// A worker that ignored cancellation may still be inside Docker or one
 		// of the durable stores. Closing those dependencies under it turns an
 		// already-ambiguous mutation into data loss or a panic. Leave them open;
@@ -2703,10 +2732,28 @@ func (b *Backend) Stop() error {
 	return errors.Join(errs...)
 }
 
-func (b *Backend) waitForShutdownDrain() error {
+func (b *Backend) waitForShutdownDrain(ctx context.Context) error {
 	b.shutdownWaitOnce.Do(func() {
 		b.shutdownWaitDone = make(chan struct{})
+		drainCtx, cancel := context.WithTimeout(ctx, cmp.Or(b.shutdownDrainTimeout, defaultShutdownDrainTimeout))
 		go func() {
+			defer cancel()
+			if b.imageCapacity != nil && b.imageCapacity.loader != nil {
+				// Admitted imports own their completion independently of tenant
+				// cancellation, with the same drain deadline as the backend.
+				if pending, err := b.imageCapacity.loader.PendingBytes(); err != nil {
+					b.logger.Warn("shutdown image import allocation is unknown", "error", err)
+				} else if pending > 0 {
+					b.logger.Warn("shutdown waiting for image imports", "admitted_bytes", pending)
+				}
+				_ = b.imageCapacity.loader.Shutdown(drainCtx)
+				// A timed-out SDK call may still be unwinding. The waiter must
+				// retain dependencies until the loader actually releases its owners.
+				_ = b.imageCapacity.loader.Shutdown(context.Background())
+			}
+			if b.imageCapacity != nil {
+				_ = b.imageCapacity.flights.shutdown(context.Background())
+			}
 			b.wg.Wait()
 			close(b.shutdownWaitDone)
 		}()
@@ -2724,6 +2771,8 @@ func (b *Backend) waitForShutdownDrain() error {
 			ErrShutdownDrainTimeout,
 			timeout,
 		)
+	case <-ctx.Done():
+		return fmt.Errorf("%w: process shutdown budget ended: %w; dependencies remain open until actual drain", ErrShutdownDrainTimeout, ctx.Err())
 	}
 }
 
@@ -3187,6 +3236,5 @@ func (b *Backend) deleteProvisionLocked(leaseUUID string) bool {
 //
 // The caller must call the returned cancel function when done.
 func (b *Backend) shutdownAwareContext() (context.Context, context.CancelFunc) {
-	provisionTimeout := cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute)
-	return context.WithTimeout(b.stopCtx, provisionTimeout)
+	return context.WithTimeout(b.stopCtx, b.provisionOperationTimeout())
 }

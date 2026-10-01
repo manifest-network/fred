@@ -34,7 +34,7 @@ func TestDeprovisionPreemptsStartedMaintenance(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			err = h.b.Deprovision(ctx, h.leaseUUID)
+			err = deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID)
 			require.NoError(t, err, "close must hand drained Started maintenance to its durable finalizer")
 			require.Empty(t, h.inventory.containers, "close must remove both source and partial target")
 			require.Len(t, h.inventory.removed, 3)
@@ -96,9 +96,9 @@ func TestDeprovisionCancelsInFlightMaintenanceBeforeCloseHandoff(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			command, reply, err := leasesm.NewRestartCommand(ctx, h.target)
+			command, reply, err := leasesm.NewRestartCommand(testMaintenanceHandoff(t, ctx), h.target)
 			if kind == shared.MaintenanceIntentUpdate {
-				command, reply, err = leasesm.NewUpdateCommand(ctx, h.target)
+				command, reply, err = leasesm.NewUpdateCommand(testMaintenanceHandoff(t, ctx), h.target)
 			}
 			require.NoError(t, err)
 			require.NoError(t, h.b.routeToLeaseBlocking(ctx, h.leaseUUID, command))
@@ -118,13 +118,14 @@ func TestDeprovisionCancelsInFlightMaintenanceBeforeCloseHandoff(t *testing.T) {
 			// Compose has successfully completed the physical replacement. The
 			// worker is blocked observing readiness; close must cancel and drain
 			// that worker before changing the durable owner and removing targets.
-			require.NoError(t, h.b.Deprovision(ctx, h.leaseUUID))
+			require.NoError(t, deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID))
 			require.Empty(t, h.inventory.containers)
 			require.Len(t, h.inventory.removed, 2)
 			pending, err := h.callbacks.ListPending()
 			require.NoError(t, err)
 			require.Len(t, pending, 2, "canceled worker cannot enqueue a late duplicate completion")
 			require.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
+			require.Equal(t, "maintenance preempted by lease close", pending[0].Error)
 			require.Equal(t, backend.CallbackStatusDeprovisioned, pending[1].Status)
 			require.Less(t, pending[0].Sequence, pending[1].Sequence)
 		})
@@ -143,7 +144,7 @@ func TestDeprovisionStartedMaintenanceKeepsUnknownCleanupPending(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	require.Error(t, h.b.Deprovision(ctx, h.leaseUUID))
+	require.Error(t, deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID))
 	claim, found, err := h.b.closeSettlement.GetCloseIntent(h.leaseUUID)
 	require.NoError(t, err)
 	require.True(t, found, "unknown physical effects must retain the exact durable close owner")
@@ -199,7 +200,7 @@ func TestDeprovisionDoesNotBypassUnknownMaintenanceLaunch(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	command, reply, err := leasesm.NewRestartCommand(ctx, h.target)
+	command, reply, err := leasesm.NewRestartCommand(testMaintenanceHandoff(t, ctx), h.target)
 	require.NoError(t, err)
 	require.NoError(t, h.b.routeToLeaseBlocking(ctx, h.leaseUUID, command))
 	require.NoError(t, <-reply.Result())
@@ -211,7 +212,7 @@ func TestDeprovisionDoesNotBypassUnknownMaintenanceLaunch(t *testing.T) {
 
 	// Cancellation drains the local worker, but does not prove that the Docker
 	// daemon finished its request. A close handoff cannot erase that uncertainty.
-	require.ErrorIs(t, h.b.Deprovision(ctx, h.leaseUUID), shared.ErrVolumeLaunchUnsettled)
+	require.ErrorIs(t, deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID), shared.ErrVolumeLaunchUnsettled)
 	claim, found, err := h.b.closeSettlement.GetCloseIntent(h.leaseUUID)
 	require.NoError(t, err)
 	require.True(t, found)
@@ -235,6 +236,54 @@ func TestDeprovisionDoesNotBypassUnknownMaintenanceLaunch(t *testing.T) {
 	require.Error(t, err, "the old maintenance capability cannot regain mutation ownership")
 }
 
+func TestDeprovisionDrainsAdmittedMaintenanceLaunchWithoutDebt(t *testing.T) {
+	for _, kind := range []shared.MaintenanceIntentKind{
+		shared.MaintenanceIntentRestart, shared.MaintenanceIntentUpdate,
+	} {
+		t.Run(string(kind), func(t *testing.T) {
+			h := newMaintenanceRecoveryHarnessForKind(t, kind)
+			h.appendTarget(true)
+			configureDiagnosticStartupFailure(t, h)
+			seedMaintenanceCloseProjection(t, h, kind)
+			h.b.provisions[h.leaseUUID].Status = backend.ProvisionStatusReady
+			bindBackendTestCloseExecutor(t, h.b, h.b.closeSettlement)
+			started := make(chan struct{})
+			h.b.compose.(*mockComposeExecutor).LaunchFn = func(ctx context.Context, _ *composetypes.Project, _ composeUpOpts) daemonLaunchOutcome {
+				return drainingDaemonLaunchForTest(t, ctx, started, func() {
+					h.inventory.mu.Lock()
+					defer h.inventory.mu.Unlock()
+					h.inventory.containers = h.containersFor(h.targetRelease, 2, "running", HealthStatusNone)
+				})
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			command, reply, err := leasesm.NewRestartCommand(testMaintenanceHandoff(t, ctx), h.target)
+			if kind == shared.MaintenanceIntentUpdate {
+				command, reply, err = leasesm.NewUpdateCommand(testMaintenanceHandoff(t, ctx), h.target)
+			}
+			require.NoError(t, err)
+			require.NoError(t, h.b.routeToLeaseBlocking(ctx, h.leaseUUID, command))
+			require.NoError(t, <-reply.Result())
+			select {
+			case <-started:
+			case <-ctx.Done():
+				t.Fatal("maintenance launch did not start")
+			}
+			require.ErrorIs(t, h.b.volumeLaunches.checkNamespace(h.leaseUUID), shared.ErrVolumeLaunchUnsettled)
+
+			require.NoError(t, deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID), "close must drain the admitted request before exact cleanup")
+			require.NoError(t, h.b.volumeLaunches.checkNamespace(h.leaseUUID), "preemption must not manufacture launch debt")
+			require.Empty(t, h.inventory.containers)
+			require.Len(t, h.inventory.removed, 2)
+			pending, err := h.callbacks.ListPending()
+			require.NoError(t, err)
+			require.Len(t, pending, 2)
+			require.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
+			require.Equal(t, backend.CallbackStatusDeprovisioned, pending[1].Status)
+		})
+	}
+}
+
 func TestDeprovisionPreservesCommittedMaintenanceSuccess(t *testing.T) {
 	h := newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate)
 	h.appendTarget(true)
@@ -245,7 +294,7 @@ func TestDeprovisionPreservesCommittedMaintenanceSuccess(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	require.NoError(t, h.b.Deprovision(ctx, h.leaseUUID))
+	require.NoError(t, deprovisionAfterWorkerDrain(t, ctx, h.b, h.leaseUUID))
 	pending, err := h.callbacks.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 2)

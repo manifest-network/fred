@@ -141,7 +141,8 @@ func TestMaintenanceReleasePreludeSerializedThroughActorAcceptance(t *testing.T)
 			require.NoError(t, <-firstDone)
 			secondErr := <-secondDone
 			require.Error(t, secondErr)
-			assert.True(t, errors.Is(secondErr, backend.ErrInvalidState), secondErr)
+			assert.True(t, shared.IsLifecyclePending(secondErr), secondErr)
+			assert.NotErrorIs(t, secondErr, backend.ErrInvalidState, "competing admitted work is not a definitive refusal")
 			select {
 			case <-workerStarted:
 			case <-time.After(time.Second):
@@ -354,7 +355,8 @@ func TestRestoreFinalizerRejectsUpdate(t *testing.T) {
 		CallbackURL: testMaintenanceLifecycleCallbackURL,
 		Payload:     validManifestJSON("docker.io/library/nginx:1.27"),
 	})
-	require.ErrorIs(t, err, backend.ErrInvalidState)
+	require.True(t, shared.IsLifecyclePending(err), err)
+	require.NotErrorIs(t, err, backend.ErrInvalidState, "the restore finalizer keeps the request unresolved")
 
 	got, err := releases.List(newLease)
 	require.NoError(t, err)

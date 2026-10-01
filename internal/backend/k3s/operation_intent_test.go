@@ -263,3 +263,82 @@ func TestProvisionIntentToReservationWindowIsFencedAgainstDeprovision(t *testing
 	require.Len(t, pending, 1, "deprovision must not duplicate a worker's exact completion")
 	assert.Equal(t, req.CallbackURL, pending[0].CallbackURL)
 }
+
+type blockingK3sOperationFailureJournal struct {
+	operationSettlementService
+	proved  chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (j *blockingK3sOperationFailureJournal) CommitOperationFailure(
+	failure shared.OperationExecutionFailure,
+) (shared.OperationReleaseUncommitted, error) {
+	uncommitted, err := j.operationSettlementService.CommitOperationFailure(failure)
+	if err != nil {
+		return uncommitted, err
+	}
+	first := false
+	j.once.Do(func() {
+		first = true
+		close(j.proved)
+	})
+	if first {
+		<-j.release
+	}
+	return uncommitted, nil
+}
+
+func TestProvisionFailurePublicationOwnsCompletionAgainstDeprovision(t *testing.T) {
+	b := newBackendForTest(t, "")
+	journal := &blockingK3sOperationFailureJournal{
+		operationSettlementService: b.operationSettlement,
+		proved:                     make(chan struct{}),
+		release:                    make(chan struct{}),
+	}
+	b.operationSettlement = journal
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(journal.release) }) }
+	defer release()
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+	req := newProvisionRequest(leaseUUID, "https://fred.example")
+	require.NoError(t, b.Provision(t.Context(), req))
+	select {
+	case <-journal.proved:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not obtain its exact operation failure proof")
+	}
+
+	// Pause between the real release-absence proof and callback publication.
+	// Teardown must wait for that owner to publish, rather than canceling its
+	// context and consuming the same unresolved operation itself.
+	b.provisionsMu.RLock()
+	leaseCtx := b.provisions[leaseUUID].ctx
+	b.provisionsMu.RUnlock()
+	deprovisionDone := make(chan error, 1)
+	go func() { deprovisionDone <- b.Deprovision(t.Context(), leaseUUID) }()
+	select {
+	case err := <-deprovisionDone:
+		t.Fatalf("deprovision stole the worker's active completion: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	require.NoError(t, leaseCtx.Err(), "the completion owner retains its publication context")
+
+	release()
+	select {
+	case err := <-deprovisionDone:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("deprovision did not finish after the completion owner published")
+	}
+	b.wg.Wait()
+	claims, err := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Empty(t, claims)
+	pending, err := b.callbackStore.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "the worker and teardown must share one completion owner")
+	assert.Equal(t, req.CallbackURL, pending[0].CallbackURL)
+	assert.Equal(t, stubProvisionerErrMsg, pending[0].Error)
+	require.ErrorIs(t, leaseCtx.Err(), context.Canceled)
+}

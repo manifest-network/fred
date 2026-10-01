@@ -829,10 +829,10 @@ func (s *MaintenanceSettlement) RefuseMaintenanceExecution(
 // panic or an explicitly ambiguous mutation outcome leaves the intent and
 // deploying release non-terminal for strict-inventory recovery.
 func (s *MaintenanceSettlement) ExecuteMaintenance(
-	ctx context.Context,
+	lifetime MaintenanceWorkerLifetime,
 	execution MaintenanceExecutionClaim,
 ) (outcome MaintenanceExecutionOutcome) {
-	if s == nil || s.execute == nil || ctx == nil || execution.settlement != s ||
+	if s == nil || s.execute == nil || !lifetime.Valid() || execution.settlement != s ||
 		!execution.target.validFor(s) || execution.target.intent.entry.EffectNotStarted ||
 		!execution.subject.validFor(s) {
 		return MaintenanceExecutionAmbiguous{
@@ -852,6 +852,7 @@ func (s *MaintenanceSettlement) ExecuteMaintenance(
 	if execution.invoked == nil || !execution.invoked.CompareAndSwap(false, true) {
 		return MaintenanceExecutionAmbiguous{settlement: s, execution: execution, cause: errors.New("maintenance execution was already consumed")}
 	}
+	ctx := lifetime.TargetContext()
 	if err := s.prepareCompensation(ctx, execution); err != nil {
 		return s.classifyMaintenancePreparationFailure(ctx, execution, err)
 	}
@@ -895,7 +896,7 @@ func (s *MaintenanceSettlement) ExecuteMaintenance(
 				return MaintenanceExecutionAmbiguous{settlement: s, execution: execution, cause: errors.Join(physical.Err(), err)}
 			}
 			if pending {
-				return s.compensateLive(ctx, execution, physical.Err())
+				return s.compensateLive(lifetime, execution, physical.Err())
 			}
 		}
 		return MaintenanceExecutionFailure{
@@ -907,7 +908,7 @@ func (s *MaintenanceSettlement) ExecuteMaintenance(
 		if cause == nil {
 			cause = errors.New("maintenance mutation outcome is ambiguous")
 		}
-		return s.compensateLive(ctx, execution, cause)
+		return s.compensateLive(lifetime, execution, cause)
 	default:
 		return MaintenanceExecutionAmbiguous{
 			settlement: s, execution: execution,

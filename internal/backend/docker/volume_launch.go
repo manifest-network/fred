@@ -160,6 +160,10 @@ func (b *Backend) launchCompose(ctx context.Context, mutations *storageMutations
 	if mutations == nil || params.LeaseUUID != mutations.leaseUUID || params.VolBinds != nil {
 		return errors.New("compose launch inputs differ from the physical subject")
 	}
+	ingress, err := restoreIngressPlan(params.Ingress, params.Stack, params.Items)
+	if err != nil {
+		return err
+	}
 	profiles, err := resourceProfileMap(params.Items, resources)
 	if err != nil {
 		return err
@@ -179,7 +183,7 @@ func (b *Backend) launchCompose(ctx context.Context, mutations *storageMutations
 		return err
 	}
 	params.VolBinds = binds
-	project := buildComposeProject(params)
+	project := buildPlannedComposeProject(params, ingress)
 	if err := volumes.validateProject(project); err != nil {
 		return err
 	}

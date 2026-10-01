@@ -11,10 +11,8 @@ import (
 )
 
 // reconcileVolumeQuotas re-applies each existing managed volume's quota (for
-// xfs: project-tag + block (bhard) and inode (ihard) limits) at startup, so
-// leases provisioned while the daemon lacked CAP_SYS_ADMIN (ENG-454) get
-// their immutable effective quota enforced without a re-provision or data
-// move. Effective quota is durable DiskMB or, for a physically present
+// xfs: root project inheritance + block (bhard) and inode (ihard) limits) at
+// startup. Effective quota is durable DiskMB or, for a physically present
 // diskless writable-path volume, its mutually exclusive pinned ScratchDiskMB.
 // It is idempotent and attempts every expected, present volume even when one
 // fails. Any inventory, durable-authority, or quota-enforcement failure is
@@ -24,9 +22,10 @@ import (
 // It enumerates the volumes that SHOULD carry a quota — active lease instances
 // (stateful, or ephemeral-with-writable-path) and active-status retained volumes
 // — then re-applies only to those actually present on disk, via each backend's
-// EnsureQuota primitive. For xfs, EnsureQuota re-tags the inode (project -s) AND
-// re-applies the limit, healing a volume a pre-CAP_SYS_ADMIN daemon left
-// untagged; unlike Create it never creates a missing volume. It must run after
+// EnsureQuota primitive. XFS verifies the root's project ID and inheritance,
+// repairs only the root when needed, and reapplies limits without walking live
+// tenant trees. Historical untagged descendants require offline repair. Unlike
+// Create, EnsureQuota never creates a missing volume. It must run after
 // recoverState (so b.provisions is populated) and reconcileRetentions (so the
 // fred-retained- namespace is settled), and before the serving loops.
 func (b *Backend) reconcileVolumeQuotasUsing(

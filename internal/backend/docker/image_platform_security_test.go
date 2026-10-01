@@ -24,18 +24,16 @@ func platformSecurityJSON(id, mediaType string) string {
 	return fmt.Sprintf(`{"Id":%q,"Os":"linux","Architecture":"amd64","Config":{},"Descriptor":{"mediaType":%q,"digest":%q}}`, id, mediaType, id)
 }
 
-func TestImageInspectionHelperMaterializesExactPlatformBeforeCreate(t *testing.T) {
-	pulled, created := false, false
+func TestImageInspectionHelperRequiresLocalExactPlatformBeforeCreate(t *testing.T) {
+	materialized, created := false, false
 	h := newInspectionHarnessWithClient(t, func(daemon *inspectionDaemon) *DockerClient {
-		return newImageSecurityDockerClient(t, func(req *http.Request) (*http.Response, error) {
+		docker := newImageSecurityDockerClient(t, func(req *http.Request) (*http.Response, error) {
 			switch {
 			case strings.HasSuffix(req.URL.Path, "/images/create"):
-				assert.Contains(t, req.URL.RawQuery, "sha256", "pull must name the immutable selected manifest")
-				assert.Contains(t, req.URL.Query().Encode(), strings.TrimPrefix(otherTestImageID, "sha256:"))
-				pulled = true
-				return imageSecurityResponse(http.StatusOK, `{}`), nil
+				t.Fatal("image admission must never issue an unbounded registry pull")
+				return nil, fmt.Errorf("unexpected registry pull")
 			case strings.HasSuffix(req.URL.Path, "/containers/create"):
-				require.True(t, pulled)
+				require.True(t, materialized)
 				body, err := io.ReadAll(req.Body)
 				require.NoError(t, err)
 				req.Body = io.NopCloser(bytes.NewReader(body))
@@ -48,7 +46,7 @@ func TestImageInspectionHelperMaterializesExactPlatformBeforeCreate(t *testing.T
 			case strings.Contains(req.URL.Path, "/containers/"):
 				return daemon.request(t, req)
 			case strings.Contains(req.URL.Path, otherTestImageID):
-				if !pulled {
+				if !materialized {
 					return imageSecurityResponse(http.StatusNotFound, `{"message":"no standalone leaf record"}`), nil
 				}
 				return imageSecurityResponse(http.StatusOK, platformSecurityJSON(otherTestImageID, ocispec.MediaTypeImageManifest)), nil
@@ -59,6 +57,15 @@ func TestImageInspectionHelperMaterializesExactPlatformBeforeCreate(t *testing.T
 				return imageSecurityResponse(http.StatusOK, platformSecurityJSON(testImageID, ocispec.MediaTypeImageIndex)), nil
 			}
 		})
+		_, err := docker.AdmitImage(t.Context(), "registry.example/app:latest")
+		var required *imageexec.MaterializationRequired
+		require.ErrorAs(t, err, &required)
+		require.Equal(t, otherTestImageID, required.ID())
+		require.False(t, created)
+		// The ingestion integration test covers the exact-content import. This
+		// fixture now exposes the independently loaded immutable leaf.
+		materialized = true
+		return docker
 	})
 	h.execute(t, func(ctx context.Context, origin shared.ImageInspectionOrigin) error {
 		session, err := h.client.openImageInspection(ctx, h.image, origin)

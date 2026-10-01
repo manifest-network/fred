@@ -33,7 +33,7 @@ func TestIntegration_Maintenance_ExactReplaySurvivesBackendRestart_XFS(t *testin
 	ctx := context.Background()
 	logger := slog.Default()
 
-	cfg := DefaultConfig()
+	cfg := integrationDockerConfig()
 	cfg.SKUProfiles = defaultTestSKUProfiles()
 	profile := cfg.SKUProfiles["docker-micro"]
 	profile.DiskMB = 64

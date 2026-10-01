@@ -218,6 +218,16 @@ func (m *mockDockerClient) PullImage(ctx context.Context, imageName string, time
 	panic("unexpected call to PullImage")
 }
 
+// Unit fixtures simulate image preparation through their existing callback;
+// the production construction seam exposes only a local availability check.
+func (m *mockDockerClient) RequireImage(ctx context.Context, imageName string) error {
+	var timeout time.Duration
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+	}
+	return m.PullImage(ctx, imageName, timeout)
+}
+
 func (m *mockDockerClient) InspectImage(ctx context.Context, imageName string) (*ImageInfo, error) {
 	if m.InspectImageFn != nil {
 		return m.InspectImageFn(ctx, imageName)
