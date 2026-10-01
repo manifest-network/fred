@@ -1095,6 +1095,21 @@ type Store struct {
 	// retiredBackends are the operator-attested retirements carried by every
 	// metadata write.
 	retiredBackends map[string]retiredBackend
+	// fencedBackends are the backends the operator fenced (backends[].fenced;
+	// unrelated to the lease barriers this package also calls fences), fixed
+	// when the Store is built and validated against the active topology. An
+	// operator-fenced backend is never asked for inventory, so interrupted-sweep
+	// recovery does not wait for it.
+	fencedBackends map[string]struct{}
+	// unprojectedFencedReporters is the durable record of fenced reporters
+	// whose journaled positives a cleared recovery never re-observed. A live
+	// lease with no placement row may live on one of them until it answers
+	// both inventories again; retiring it records exactly that.
+	unprojectedFencedReporters map[string]struct{}
+	// inheritedFencedReporters are the fenced backends that may hold a
+	// positive of the sweep chain pending at open. A fenced backend is never
+	// asked in this process, so no later chain can involve it.
+	inheritedFencedReporters map[string]struct{}
 	// unprojectedPositives is the lease-local same-process half of the durable
 	// sweep marker. Sweep-owned collection installs typed reporter affinity here
 	// before an opaque endpoint receipt returns, so policy code cannot race the
@@ -1159,6 +1174,18 @@ func WithCallbackRouteFactory(factory *CallbackRouteFactory) Option {
 	return func(s *Store) {
 		if factory != nil && factory.Valid() {
 			s.callbackRoutes = factory
+		}
+	}
+}
+
+// WithFencedBackends names the backends the operator fenced for this process
+// (backends[].fenced). Each must be in the durable active topology; the set
+// cannot change for the Store's lifetime.
+func WithFencedBackends(names []string) Option {
+	return func(s *Store) {
+		s.fencedBackends = make(map[string]struct{}, len(names))
+		for _, backendName := range names {
+			s.fencedBackends[backendName] = struct{}{}
 		}
 	}
 }
@@ -1396,6 +1423,13 @@ func loadStoreWithExpectedAuthority(
 		inventoryRecoveryRequired: metadata.PendingInventorySweepID != 0,
 		inventoryReporters:        sweepReporterJournalFromMetadata(metadata),
 		retiredBackends:           cloneRetiredBackends(metadata.RetiredBackends),
+		unprojectedFencedReporters: func() map[string]struct{} {
+			set := make(map[string]struct{}, len(metadata.UnprojectedFencedReporters))
+			for _, backendName := range metadata.UnprojectedFencedReporters {
+				set[backendName] = struct{}{}
+			}
+			return set
+		}(),
 		emptyInventoryBackends: func() map[string]struct{} {
 			set := make(map[string]struct{}, len(metadata.EmptyInventoryBackends))
 			for _, backendName := range metadata.EmptyInventoryBackends {
@@ -1416,6 +1450,12 @@ func loadStoreWithExpectedAuthority(
 	if s.now == nil {
 		s.now = time.Now
 	}
+	if err := s.validateFencedBackends(); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	s.inheritedFencedReporters = s.inheritedFencedReportersAtOpen()
+	s.publishUnprojectedFencedReporters()
 	s.setInventoryRecoveryRequiredLocked(s.inventoryRecoveryRequired)
 	if s.inventoryRecoveryRequired {
 		s.logInventoryRecoveryPendingLocked()
@@ -3379,8 +3419,12 @@ func (s *Store) projectInventory(
 		nextMetadata.InventoryTopologyID = s.topologyID
 		nextMetadata.EmptyInventoryBackends = slices.Clone(projection.emptyBackends)
 	}
-	recoveryCovered := projection.complete || (!unresolvedPositive &&
-		s.inheritedFenceCoveredLocked(projection.AbsenceEvidence))
+	recoveryCovered := projection.complete
+	var excusedReporters []string
+	if !recoveryCovered && !unresolvedPositive {
+		recoveryCovered, excusedReporters = s.inheritedFenceCoveredLocked(projection.AbsenceEvidence)
+	}
+	abandonedReporters := []string(nil)
 	if (!s.inventoryRecoveryRequired || recoveryCovered) && !unresolvedPositive {
 		// Clear only this exact live sweep. When an earlier sweep was abandoned,
 		// missing or mismatched endpoints cannot account for lost observations.
@@ -3388,7 +3432,18 @@ func (s *Store) projectInventory(
 		// ambiguity only after every current positive is durably represented.
 		// This does not establish a baseline or grant drain/absence authority.
 		nextMetadata.clearPendingInventorySweep()
+		if s.inventoryRecoveryRequired {
+			for _, backendName := range excusedReporters {
+				if _, inherited := s.inheritedFencedReporters[backendName]; inherited {
+					abandonedReporters = append(abandonedReporters, backendName)
+				}
+			}
+		}
 	}
+	answeredReporters := s.reobservedUnprojectedFencedReportersLocked(projection.AbsenceEvidence)
+	nextMetadata.UnprojectedFencedReporters = nextUnprojectedFencedReporters(
+		nextMetadata.UnprojectedFencedReporters, abandonedReporters, answeredReporters,
+	)
 	if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
 		capabilities := tx.Bucket(lifecycleCapabilityBucketName)
@@ -3429,6 +3484,23 @@ func (s *Store) projectInventory(
 	s.pendingInventorySweepID = nextMetadata.PendingInventorySweepID
 	if s.pendingInventorySweepID == 0 {
 		s.inventoryReporters = sweepReporterJournal{}
+	}
+	s.unprojectedFencedReporters = make(map[string]struct{}, len(nextMetadata.UnprojectedFencedReporters))
+	for _, backendName := range nextMetadata.UnprojectedFencedReporters {
+		s.unprojectedFencedReporters[backendName] = struct{}{}
+	}
+	if s.pendingInventorySweepID == 0 {
+		s.inheritedFencedReporters = nil
+	}
+	s.publishUnprojectedFencedReporters()
+	if len(abandonedReporters) != 0 {
+		slog.Warn("interrupted-sweep recovery cleared without fenced reporters; "+
+			"their unprojected positives stay unaccounted until each answers both inventories or is retired",
+			"fenced_reporters", abandonedReporters)
+	}
+	for _, backendName := range answeredReporters {
+		slog.Info("fenced reporter answered both inventories; its unprojected positives are accounted for",
+			"backend", backendName)
 	}
 	if projection.complete {
 		for backendName, id := range projection.backendStorageIdentities {
@@ -4050,20 +4122,141 @@ func projectConflict(
 // chain lost, each bound to its durable storage pin. A tracked journal names
 // exactly those reporters. An untracked chain cannot name a subset, so the
 // whole configured topology must answer, as before reporter tracking.
+//
+// An operator-fenced backend (WithFencedBackends) is excused and named in
+// excused: it is never asked, so requiring it would hold every lease until the
+// operator re-trusts it. The caller records the excused reporters durably
+// instead.
 // Caller holds s.mu.
-func (s *Store) inheritedFenceCoveredLocked(snapshot inventory.Snapshot) bool {
-	if !s.inventoryReporters.tracked {
-		return s.pairedTopologyObservationLocked(snapshot).ValidFor(s.inventoryEvidence)
+func (s *Store) inheritedFenceCoveredLocked(snapshot inventory.Snapshot) (covered bool, excused []string) {
+	var required []string
+	if s.inventoryReporters.tracked {
+		required = s.inventoryReporters.names()
+	} else {
+		if len(s.fencedTopologyLocked()) == 0 {
+			return s.pairedTopologyObservationLocked(snapshot).ValidFor(s.inventoryEvidence), nil
+		}
+		required = slices.Clone(s.backendTopology)
 	}
-	reporters := s.inventoryReporters.names()
+	required = slices.DeleteFunc(required, func(backendName string) bool {
+		if _, fenced := s.fencedBackends[backendName]; fenced {
+			excused = append(excused, backendName)
+			return true
+		}
+		return false
+	})
+	if !s.pairedCoverageLocked(snapshot, required) {
+		return false, nil
+	}
+	return true, excused
+}
+
+// pairedCoverageLocked reports whether every named backend answered both
+// inventories in this sealed collection, each with its durable storage pin.
+// Caller holds s.mu.
+func (s *Store) pairedCoverageLocked(snapshot inventory.Snapshot, backends []string) bool {
 	identities := snapshot.StorageIdentities(s.inventoryEvidence)
-	for _, backendName := range reporters {
+	for _, backendName := range backends {
 		expected, bound := s.backendStorageIDs[backendName]
 		if !bound || !expected.Valid() || identities[backendName] != expected {
 			return false
 		}
 	}
-	return snapshot.PairedCoverage(s.inventoryEvidence, reporters).ValidFor(s.inventoryEvidence)
+	return snapshot.PairedCoverage(s.inventoryEvidence, backends).ValidFor(s.inventoryEvidence)
+}
+
+// fencedTopologyLocked returns the fenced members of the active topology.
+// Caller holds s.mu.
+func (s *Store) fencedTopologyLocked() []string {
+	fenced := make([]string, 0, len(s.fencedBackends))
+	for _, backendName := range s.backendTopology {
+		if _, ok := s.fencedBackends[backendName]; ok {
+			fenced = append(fenced, backendName)
+		}
+	}
+	return fenced
+}
+
+// reobservedUnprojectedFencedReportersLocked names the recorded reporters
+// that answered both inventories with their storage pins in this sealed
+// collection: their current inventory now accounts for whatever they hold.
+// Caller holds s.mu.
+func (s *Store) reobservedUnprojectedFencedReportersLocked(snapshot inventory.Snapshot) []string {
+	var answered []string
+	for _, backendName := range slices.Sorted(maps.Keys(s.unprojectedFencedReporters)) {
+		if s.pairedCoverageLocked(snapshot, []string{backendName}) {
+			answered = append(answered, backendName)
+		}
+	}
+	return answered
+}
+
+// nextUnprojectedFencedReporters adds the reporters a cleared recovery
+// abandoned and drops the ones that answered again. The result is canonical,
+// and nil when empty so the metadata omits it.
+func nextUnprojectedFencedReporters(current, abandoned, answered []string) []string {
+	set := make(map[string]struct{}, len(current)+len(abandoned))
+	for _, backendName := range current {
+		set[backendName] = struct{}{}
+	}
+	for _, backendName := range abandoned {
+		set[backendName] = struct{}{}
+	}
+	for _, backendName := range answered {
+		delete(set, backendName)
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return slices.Sorted(maps.Keys(set))
+}
+
+// inheritedFencedReportersAtOpen names the fenced backends that may hold a
+// positive the pending chain lost: the journaled ones, or every fenced
+// backend when the chain is untracked and cannot name its reporters.
+func (s *Store) inheritedFencedReportersAtOpen() map[string]struct{} {
+	inherited := make(map[string]struct{})
+	if s.pendingInventorySweepID == 0 {
+		return inherited
+	}
+	for backendName := range s.fencedBackends {
+		if !s.inventoryReporters.tracked || s.inventoryReporters.recorded(backendName) {
+			inherited[backendName] = struct{}{}
+		}
+	}
+	return inherited
+}
+
+// publishUnprojectedFencedReporters exports the durable record per active
+// backend, so the record is visible while providerd holds the database.
+func (s *Store) publishUnprojectedFencedReporters() {
+	for _, backendName := range s.backendTopology {
+		recorded := 0.0
+		if _, ok := s.unprojectedFencedReporters[backendName]; ok {
+			recorded = 1
+		}
+		metrics.PlacementUnprojectedFencedReporter.WithLabelValues(backendName).Set(recorded)
+	}
+}
+
+// validateFencedBackends holds the fenced set to the durable active topology
+// and refuses fencing all of it, before any sweep can consult the set.
+func (s *Store) validateFencedBackends() error {
+	if len(s.fencedBackends) == 0 {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, backendName := range slices.Sorted(maps.Keys(s.fencedBackends)) {
+		if _, active := s.backendTopologySet[backendName]; !active {
+			return fmt.Errorf("%w: fenced backend %q is not in the active topology %q",
+				ErrInvalidBackendTopology, backendName, s.backendTopology)
+		}
+	}
+	if len(s.fencedBackends) >= len(s.backendTopology) {
+		return fmt.Errorf("%w: every backend is fenced", ErrInvalidBackendTopology)
+	}
+	return nil
 }
 
 // pairedTopologyObservationLocked binds full endpoint coverage to every

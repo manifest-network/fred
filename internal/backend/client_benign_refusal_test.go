@@ -26,7 +26,7 @@ func TestBenignBackendRefusalsDoNotTripBreaker(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "refusal", BaseURL: "http://backend.invalid", CBFailureThresh: 1})
-			c.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
+			c.wire.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: tc.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.body))}, nil
 			})
 			for range 6 {
@@ -36,7 +36,7 @@ func TestBenignBackendRefusalsDoNotTripBreaker(t *testing.T) {
 				} else {
 					require.ErrorIs(t, err, tc.want)
 				}
-				require.False(t, DeprovisionNotDispatched(c, "lease", err))
+				require.Equal(t, DeprovisionRefusalUnproven, DeprovisionRefusalOf(c, "lease", err))
 			}
 			require.Equal(t, gobreaker.StateClosed, c.cb.State())
 		})
@@ -45,12 +45,12 @@ func TestBenignBackendRefusalsDoNotTripBreaker(t *testing.T) {
 
 func TestUnknownDeprovisionConflictCannotBecomeCloseDeferral(t *testing.T) {
 	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "unknown", BaseURL: "http://backend.invalid", CBFailureThresh: 1})
-	c.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
+	c.wire.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusConflict, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":"conflict","code":"foreign"}`))}, nil
 	})
 	err := c.Deprovision(t.Context(), "lease")
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrCloseDeferred)
-	require.False(t, DeprovisionNotDispatched(c, "lease", err))
+	require.Equal(t, DeprovisionRefusalUnproven, DeprovisionRefusalOf(c, "lease", err))
 	require.Equal(t, gobreaker.StateOpen, c.cb.State())
 }

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -346,4 +348,40 @@ func TestRun_RetireLostBackendReopenedSemanticFailureIsCommitted(t *testing.T) {
 	require.ErrorIs(t, err, errRepairCommitted)
 	require.ErrorIs(t, err, cause)
 	require.ErrorContains(t, err, "reopened database semantic verification")
+}
+
+// fenceRetirementConfig moves the fixture to per-backend keys, which a fence
+// requires, and fences the retirement target.
+func fenceRetirementConfig(t *testing.T, configPath string) {
+	t.Helper()
+	contents, err := os.ReadFile(configPath)
+	require.NoError(t, err)
+	text := strings.Replace(string(contents), "callback_secret: \"0123456789abcdef0123456789abcdef\"\n", "", 1)
+	for _, name := range []string{repairCommandBackend, retirementCommandTarget} {
+		entry := fmt.Sprintf("  - name: %q\n", name)
+		extra := fmt.Sprintf("    hmac_secret: %q\n", name+"-secret-0123456789abcdef0123")
+		if name == retirementCommandTarget {
+			extra += "    fenced: true\n"
+		}
+		require.Contains(t, text, entry)
+		text = strings.Replace(text, entry, entry+extra, 1)
+	}
+	require.NoError(t, os.WriteFile(configPath, []byte(text), 0o600))
+}
+
+func TestRun_RetireLostBackendPlansAFencedTargetWithoutAskingIt(t *testing.T) {
+	dbPath, configPath := newRetirementCommandFixture(t, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		t.Errorf("retirement contacted the fenced target %s", r.URL.Path)
+	}))
+	fenceRetirementConfig(t, configPath)
+	before, err := os.ReadFile(dbPath)
+	require.NoError(t, err)
+
+	plan := planRetirementCommand(t, configPath)
+	assert.Equal(t, "fenced", plan.TargetProbe)
+	assert.Equal(t, []string{repairCommandLease}, plan.LostLeases)
+
+	after, err := os.ReadFile(dbPath)
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
 }

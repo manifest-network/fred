@@ -196,8 +196,17 @@ const cpuRatioEpsilon = 1e-9
 // it is tolerated because the backend's 503 admission gate hard-caps any
 // over-targeted backend and provision QPS is low. Tie rotation is intentionally
 // approximate because the same counter also drives no-stats fallback routing.
+//
+// A fenced backend never receives a new provision. A SKU that only fenced
+// backends serve yields nil, so its lease waits for the fence to lift rather
+// than landing on a backend the operator never assigned that SKU to.
 func (r *Router) RouteForProvision(ctx context.Context, sku string, inFlightByBackend map[string]int) Backend {
-	return r.routeForProvision(ctx, r.RouteAll(sku), r.defaultBackend, inFlightByBackend)
+	matches := r.RouteAll(sku)
+	candidates := withoutFenced(matches)
+	if len(matches) != 0 && len(candidates) == 0 {
+		return nil
+	}
+	return r.routeForProvision(ctx, candidates, r.provisionFallback(), inFlightByBackend)
 }
 
 // RouteForProvisionAmong selects a provision backend using the same SKU,
@@ -208,7 +217,10 @@ func (r *Router) RouteForProvision(ctx context.Context, sku string, inFlightByBa
 // When matching candidates expose no usable load stats, round-robin fallback is
 // restricted to those eligible candidates. The default backend is considered
 // only when no eligible backend matches the SKU, and only when it is itself
-// eligible.
+// eligible. Fenced backends are excluded exactly as in RouteForProvision. A SKU
+// that only fenced backends serve yields nil, never the default; this is
+// decided before eligibility, because a fenced backend never answers and so is
+// never eligible.
 func (r *Router) RouteForProvisionAmong(
 	ctx context.Context,
 	sku string,
@@ -219,20 +231,45 @@ func (r *Router) RouteForProvisionAmong(
 		return nil
 	}
 
-	allCandidates := r.RouteAll(sku)
-	candidates := make([]Backend, 0, len(allCandidates))
-	for _, candidate := range allCandidates {
+	matches := r.RouteAll(sku)
+	unfenced := withoutFenced(matches)
+	if len(matches) != 0 && len(unfenced) == 0 {
+		return nil
+	}
+	candidates := make([]Backend, 0, len(unfenced))
+	for _, candidate := range unfenced {
 		if _, eligible := eligibleNames[candidate.Name()]; eligible {
 			candidates = append(candidates, candidate)
 		}
 	}
 
 	var fallback Backend
-	if _, eligible := eligibleNames[r.defaultBackend.Name()]; eligible {
-		fallback = r.defaultBackend
+	if provisionDefault := r.provisionFallback(); provisionDefault != nil {
+		if _, eligible := eligibleNames[provisionDefault.Name()]; eligible {
+			fallback = provisionDefault
+		}
 	}
 
 	return r.routeForProvision(ctx, candidates, fallback, inFlightByBackend)
+}
+
+// provisionFallback is the default backend unless it is fenced.
+func (r *Router) provisionFallback() Backend {
+	if IsFenced(r.defaultBackend) {
+		return nil
+	}
+	return r.defaultBackend
+}
+
+// withoutFenced keeps the backends that may receive a new provision.
+func withoutFenced(backends []Backend) []Backend {
+	open := make([]Backend, 0, len(backends))
+	for _, b := range backends {
+		if !IsFenced(b) {
+			open = append(open, b)
+		}
+	}
+	return open
 }
 
 func (r *Router) routeForProvision(
@@ -375,6 +412,9 @@ type BackendHealth struct {
 	Name    string `json:"name"`
 	Healthy bool   `json:"healthy"`
 	Error   string `json:"error,omitempty"`
+	// Fenced means the operator fenced this backend, so it is unhealthy by
+	// configuration and was not asked.
+	Fenced bool `json:"fenced,omitempty"`
 
 	probeDuration time.Duration
 }
@@ -453,6 +493,7 @@ func (r *Router) probeBackend(ctx context.Context, b Backend) (health BackendHea
 
 	health.Healthy = false
 	health.Error = err.Error()
+	health.Fenced = IsFenced(b)
 
 	// Record the gauge for genuine backend failures, and a probe that blew its
 	// DEADLINE is one: a backend that accepts the connection and never answers

@@ -8,6 +8,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `backends[].fenced: true` contains a backend the operator no longer trusts
+  without removing it from the topology. providerd sends it nothing: its client
+  holds no address, key or TLS material, so the backend's revoked certificate
+  files may already be gone. It refuses the backend's callbacks, routes no new
+  lease to it and stops reading its inventory. Leases placed on it keep their
+  placement and wait; they are never closed, provisioned elsewhere or treated
+  as gone. Restart, update and restore against it answer `503` before anything
+  is journaled. A close that can finish only on the fenced backend is parked
+  for reconciliation to resume after the fence lifts, rather than retried every
+  few seconds. A SKU only fenced backends serve routes nowhere, not to the
+  default backend. New metric `fred_backend_fenced{backend}`; new `fenced`
+  values for `fred_reconciler_backend_inventory_total{outcome}`,
+  `fred_reconciler_backend_fetch_total{outcome}`,
+  `fred_backend_requests_total{status}`,
+  `fred_api_callback_auth_failures_total{reason}` (a callback carrying the
+  fenced backend's valid signature) and
+  `fred_provisioner_deferred_closes_total{outcome="parked"}`. Fencing requires
+  per-backend `hmac_secret`, at least one unfenced backend, and an unchanged
+  topology. `placement-preflight` and the inventory modes of `placement-repair`
+  refuse while any backend is fenced; `-retire-lost-backend` plans the
+  retirement of a fenced backend without contacting it and reports
+  `target_probe: fenced`. An interrupted inventory sweep no longer waits for a
+  fenced reporter. Recovery clears without it and the placement database
+  records the backend as an unprojected reporter until it answers both
+  inventories again. Retiring it then records `recordless_unproven`, and the
+  record also refuses removing it from the topology. The record shows as
+  `fred_placement_unprojected_fenced_reporter{backend}` and as
+  `unprojected_fenced_reporters` in `placement-repair -classify`. Older
+  binaries refuse a database that holds this record. See SECURITY.md,
+  "Containing a compromised backend".
 - `placement-repair -adopt-observed-generation -lease <uuid> -backend <name>`
   repairs a lease left quarantined after a placement restore because its
   backend re-provisioned it since the copy was taken. The backend must be the

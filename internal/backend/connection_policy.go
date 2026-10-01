@@ -32,13 +32,21 @@ type ConnectionConfig struct {
 // ConnectionPolicy is an immutable, validated backend connection. Both the
 // inventory-only and identity-bound factories require this same policy, so
 // system-root trust cannot accidentally select a different protocol floor.
-// Its zero value is invalid and cannot construct a usable client.
+// A fenced backend's policy holds only its name, so every client built from
+// it lacks the means to reach the network. Its zero value is invalid and
+// cannot construct a usable client.
 type ConnectionPolicy struct {
 	state *connectionPolicy
 }
 
 type connectionPolicy struct {
-	name      string
+	name string
+	// live is nil for a fenced backend: no address, HMAC key, or TLS material
+	// was loaded for it.
+	live *liveConnection
+}
+
+type liveConnection struct {
 	baseURL   string
 	secret    string
 	timeout   time.Duration
@@ -65,12 +73,29 @@ func NewConnectionPolicy(cfg ConnectionConfig) (ConnectionPolicy, error) {
 		return ConnectionPolicy{}, fmt.Errorf("backend TLS policy: %w", err)
 	}
 	return ConnectionPolicy{state: &connectionPolicy{
-		name: cfg.Name, baseURL: origin, secret: cfg.Secret,
-		timeout: cfg.Timeout, tlsConfig: trust,
+		name: cfg.Name,
+		live: &liveConnection{
+			baseURL: origin, secret: cfg.Secret,
+			timeout: cfg.Timeout, tlsConfig: trust,
+		},
 	}}, nil
 }
 
+// NewFencedConnectionPolicy is the policy of a fenced backend. It holds only
+// the backend's name and loads no address, HMAC key, or TLS material, so a
+// fenced backend's revoked certificate or key files may already be gone.
+// Every client built from it refuses every operation locally.
+func NewFencedConnectionPolicy(name string) (ConnectionPolicy, error) {
+	if strings.TrimSpace(name) == "" {
+		return ConnectionPolicy{}, errors.New("fenced backend name is required")
+	}
+	return ConnectionPolicy{state: &connectionPolicy{name: name}}, nil
+}
+
 func (policy ConnectionPolicy) valid() bool { return policy.state != nil }
+
+// Fenced reports whether policy is a fenced backend's.
+func (policy ConnectionPolicy) Fenced() bool { return policy.valid() && policy.state.live == nil }
 
 // Format and LogValue prevent reflective formatting from disclosing credentials.
 func (policy ConnectionPolicy) Format(state fmt.State, _ rune) {
@@ -88,8 +113,11 @@ func (policy ConnectionPolicy) LogValue() slog.Value {
 type AuthenticatedEvidencePolicy struct{ connection ConnectionPolicy }
 
 func NewAuthenticatedEvidencePolicy(policy ConnectionPolicy) (AuthenticatedEvidencePolicy, error) {
-	if !policy.valid() || !strings.HasPrefix(policy.state.baseURL, "https://") ||
-		policy.state.tlsConfig == nil || policy.state.tlsConfig.InsecureSkipVerify {
+	if policy.Fenced() {
+		return AuthenticatedEvidencePolicy{}, &fencedError{backend: policy.state.name}
+	}
+	if !policy.valid() || !strings.HasPrefix(policy.state.live.baseURL, "https://") ||
+		policy.state.live.tlsConfig == nil || policy.state.live.tlsConfig.InsecureSkipVerify {
 		return AuthenticatedEvidencePolicy{}, errors.New("authenticated backend evidence requires certificate-verified HTTPS")
 	}
 	return AuthenticatedEvidencePolicy{connection: policy}, nil

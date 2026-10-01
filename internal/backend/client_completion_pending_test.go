@@ -23,7 +23,7 @@ func TestOperationCompletionPendingIsAmbiguousWithoutTrippingBreaker(t *testing.
 			}, &testStorageIdentityResolver{id: mustBackendStorageID(t, testBackendStorageIDA), bound: true})
 			require.NoError(t, err)
 			calls := 0
-			client.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
+			client.wire.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
 				calls++
 				header := make(http.Header)
 				header.Set(backendidentity.ResponseHeader, testBackendStorageIDA)
@@ -73,7 +73,7 @@ func TestMalformedCompletionPendingAndGenericFailureStillTripBreaker(t *testing.
 				client := newUnboundHTTPClientForTest(HTTPClientConfig{
 					Name: "failure", BaseURL: "http://backend.example", CBFailureThresh: 1,
 				})
-				client.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
+				client.wire.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
 					return &http.Response{StatusCode: tc.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.body))}, nil
 				})
 				if operation == "provision" {

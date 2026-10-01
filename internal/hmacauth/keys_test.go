@@ -178,6 +178,34 @@ func TestVerifyRoutedKeysMintsAProofBoundToItsRoute(t *testing.T) {
 	assert.False(t, slot.Valid())
 }
 
+func TestMatchCallbackKeysChecksLikeTheVerifierWithoutAProof(t *testing.T) {
+	keys := rotatingKeys(t)
+	body := []byte(`{"lease_uuid":"abc"}`)
+	now := time.Now()
+	const path = "/callbacks/provision"
+
+	require.NoError(t, MatchCallbackKeys(keys, "POST", path, body,
+		SignWithTime(rotationTestKey, "POST", path, body, now), path, 5*time.Minute, time.Minute, now))
+	require.NoError(t, MatchCallbackKeys(keys, "POST", path, body,
+		SignWithTime(currentTestKey, "POST", path, body, now), path, 5*time.Minute, time.Minute, now))
+
+	for name, reason := range map[string]struct {
+		err  error
+		want FailureReason
+	}{
+		"mismatch": {MatchCallbackKeys(keys, "POST", path, body,
+			SignWithTime("another-key-0123456789abcdef0123", "POST", path, body, now), path, time.Minute, time.Minute, now), FailureMismatch},
+		"expired": {MatchCallbackKeys(keys, "POST", path, body,
+			SignWithTime(currentTestKey, "POST", path, body, now.Add(-time.Hour)), path, time.Minute, time.Minute, now), FailureExpired},
+		"path": {MatchCallbackKeys(keys, "POST", "/elsewhere", body,
+			SignWithTime(currentTestKey, "POST", "/elsewhere", body, now), path, time.Minute, time.Minute, now), FailureFormat},
+		"method": {MatchCallbackKeys(keys, "GET", path, body,
+			SignWithTime(currentTestKey, "GET", path, body, now), path, time.Minute, time.Minute, now), FailureFormat},
+	} {
+		assert.Equal(t, reason.want, FailureReasonOf(reason.err), name)
+	}
+}
+
 func TestFailureReasonsAreClosed(t *testing.T) {
 	assert.Equal(t, failureReasonInvalid, FailureReasonOf(errors.New("not a verification failure")))
 	assert.Empty(t, failureReasonInvalid.String())

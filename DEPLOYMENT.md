@@ -956,7 +956,8 @@ chain, and it cannot be undone.
 1. Stop `providerd`. Fence the lost host so it cannot answer or run workloads:
    power it off, or stop its `docker-backend`. Keep the lost backend in the
    providerd config for now; the tool requires the config to match the durable
-   topology exactly.
+   topology exactly. It may stay `fenced: true` (SECURITY.md, "Containing a
+   compromised backend"); the tool then never contacts it.
 2. Read the backend's pinned storage identity from `storage_bindings` in
    `placement-repair -config /etc/fred/config.yaml -classify`.
 3. Dry run:
@@ -979,7 +980,7 @@ chain, and it cannot be undone.
    | `maintenance_settled` | Pending restarts and updates that settle as `backend_lost`; a retried request answers 410 |
    | `topology_before`, `topology_after`, `topology_id` | The active topology before and after, and its current generation |
    | `pending_inventory_sweep`, `recordless_unproven` | See below |
-   | `target_probe` | One single-row request for the backend's storage identity, read from a response header so a failing inventory still answers: `no_identity` (unreachable, or its storage identity did not verify) or `answered_with_other_storage` (for example a host rebuilt on new disks). The run refuses when the answer is the backend's own pin, because then its storage is not lost, or any other pin the database has ever recorded, including a removed or retired backend's, because then the configured address reaches a different backend. The probe uses the backend's configured request timeout; `-timeout` is refused |
+   | `target_probe` | One single-row request for the backend's storage identity, read from a response header so a failing inventory still answers: `no_identity` (unreachable, or its storage identity did not verify), `answered_with_other_storage` (for example a host rebuilt on new disks), or `fenced` (the backend is fenced in the config, so it was not asked). The run refuses when the answer is the backend's own pin, because then its storage is not lost, or any other pin the database has ever recorded, including a removed or retired backend's, because then the configured address reaches a different backend. The probe uses the backend's configured request timeout; `-timeout` is refused |
    | `attest_lost`, `confirm` | The exact values the apply requires |
 
    The probe only guards against retiring the wrong name. Silence proves
@@ -1029,11 +1030,15 @@ sweep, and the retirement then sets `recordless_unproven`. To avoid that, start
 `providerd`, stop it right after the next `reconciliation complete` log line,
 and plan again. If it stays true, the marker is waiting on an answer that
 cannot arrive, typically from the lost backend, and the retirement must set the
-flag.
+flag. Fencing the lost backend lets the marker clear without that answer; the
+database then records the backend as an unprojected reporter, and its
+retirement still sets the flag.
 
 `recordless_unproven` is true when the database had no current admission
 baseline: a sweep was interrupted, or the retirement follows another retirement
-or a restored-backup attestation with no complete sweep in between. A live
+or a restored-backup attestation with no complete sweep in between. It is also
+true when the backend is recorded as an unprojected reporter: it reported a
+positive in an interrupted sweep whose recovery cleared while it was fenced. A live
 lease with no placement row may then have lived on the lost backend, so from
 then on `providerd` closes any ACTIVE lease that has no placement row as lost
 instead of provisioning it empty on a survivor. The flag is permanent for the

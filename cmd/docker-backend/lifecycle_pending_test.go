@@ -105,7 +105,7 @@ func testLifecyclePendingServerAndClient(t *testing.T, pending error) {
 				var callErr error
 				if operation == "deprovision" {
 					callErr = client.Deprovision(t.Context(), handlerTestLeaseUUID)
-					require.False(t, backend.DeprovisionNotDispatched(client, handlerTestLeaseUUID, callErr))
+					require.Equal(t, backend.DeprovisionRefusalUnproven, backend.DeprovisionRefusalOf(client, handlerTestLeaseUUID, callErr))
 				} else {
 					var outcome backend.MaintenanceCallOutcome
 					if operation == "restart" {

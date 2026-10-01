@@ -528,7 +528,8 @@ func (repair *AttemptRepair) PlanBackendRetirement(
 	})
 	plan.facts.TopologyID = metadata.TopologyID
 	plan.facts.PendingInventorySweep = metadata.PendingInventorySweepID != 0
-	plan.facts.RecordlessUnproven = !admissionBaselineCurrentInMetadata(metadata)
+	plan.facts.RecordlessUnproven = !admissionBaselineCurrentInMetadata(metadata) ||
+		slices.Contains(metadata.UnprojectedFencedReporters, backendName)
 	for _, list := range []*[]string{
 		&plan.facts.LostLeases, &plan.facts.LostWithSurvivorCopies, &plan.facts.StrippedLeases,
 		&plan.facts.UnknownOwnerConflicts, &plan.facts.UninterpretableLeases, &plan.facts.LifecycleScrubbed,
@@ -667,6 +668,9 @@ func (repair *AttemptRepair) RetireBackend(
 		})
 		next.InventorySweepReporters = &reporters
 	}
+	next.UnprojectedFencedReporters = nextUnprojectedFencedReporters(
+		next.UnprojectedFencedReporters, nil, []string{plan.backendName},
+	)
 	next.RetiredBackends = cloneRetiredBackends(next.RetiredBackends)
 	if next.RetiredBackends == nil {
 		next.RetiredBackends = make(map[string]retiredBackend, 1)

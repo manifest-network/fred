@@ -23,7 +23,7 @@ func TestDeprovisionNotDispatchedBindsCircuitRefusalToExactRequest(t *testing.T)
 	}, &testStorageIdentityResolver{id: mustBackendStorageID(t, testBackendStorageIDA), bound: true})
 	require.NoError(t, err)
 	calls := 0
-	client.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
+	client.wire.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
 		calls++
 		header := make(http.Header)
 		header.Set(backendidentity.ResponseHeader, testBackendStorageIDA)
@@ -32,20 +32,20 @@ func TestDeprovisionNotDispatchedBindsCircuitRefusalToExactRequest(t *testing.T)
 	})
 	unknown := client.Deprovision(t.Context(), testBackendStorageIDA)
 	require.Error(t, unknown)
-	require.False(t, DeprovisionNotDispatched(client, testBackendStorageIDA, unknown))
+	require.Equal(t, DeprovisionRefusalUnproven, DeprovisionRefusalOf(client, testBackendStorageIDA, unknown))
 	refused := client.Deprovision(t.Context(), testBackendStorageIDA)
 	require.ErrorIs(t, refused, ErrCircuitOpen)
 	require.Equal(t, 1, calls, "open circuit cannot enter the transport")
-	require.True(t, DeprovisionNotDispatched(client, testBackendStorageIDA, refused))
-	require.False(t, DeprovisionNotDispatched(client, testBackendStorageIDA, fmt.Errorf("wrapped: %w", refused)))
-	require.False(t, DeprovisionNotDispatched(client, testBackendStorageIDA, errors.Join(refused, unknown)))
-	require.False(t, DeprovisionNotDispatched(client, testBackendStorageIDB, refused))
+	require.Equal(t, DeprovisionRefusedCircuitOpen, DeprovisionRefusalOf(client, testBackendStorageIDA, refused))
+	require.Equal(t, DeprovisionRefusalUnproven, DeprovisionRefusalOf(client, testBackendStorageIDA, fmt.Errorf("wrapped: %w", refused)))
+	require.Equal(t, DeprovisionRefusalUnproven, DeprovisionRefusalOf(client, testBackendStorageIDA, errors.Join(refused, unknown)))
+	require.Equal(t, DeprovisionRefusalUnproven, DeprovisionRefusalOf(client, testBackendStorageIDB, refused))
 	other := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "close-owner", BaseURL: "https://backend.example"})
-	require.False(t, DeprovisionNotDispatched(other, testBackendStorageIDA, refused))
+	require.Equal(t, DeprovisionRefusalUnproven, DeprovisionRefusalOf(other, testBackendStorageIDA, refused))
 	for _, unproven := range []error{ErrCircuitOpen, gobreaker.ErrOpenState, errors.New(refused.Error()), nil} {
-		require.False(t, DeprovisionNotDispatched(client, testBackendStorageIDA, unproven))
+		require.Equal(t, DeprovisionRefusalUnproven, DeprovisionRefusalOf(client, testBackendStorageIDA, unproven))
 	}
-	require.False(t, DeprovisionNotDispatched(nil, testBackendStorageIDA, refused))
+	require.Equal(t, DeprovisionRefusalUnproven, DeprovisionRefusalOf(nil, testBackendStorageIDA, refused))
 }
 
 func TestDeprovisionLifecyclePendingBindsExactTransportLeaseAndEndpoint(t *testing.T) {
@@ -54,7 +54,7 @@ func TestDeprovisionLifecyclePendingBindsExactTransportLeaseAndEndpoint(t *testi
 		CBFailureThresh: 1,
 	}, &testStorageIdentityResolver{id: mustBackendStorageID(t, testBackendStorageIDA), bound: true})
 	require.NoError(t, err)
-	client.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
+	client.wire.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
 		header := make(http.Header)
 		header.Set(backendidentity.ResponseHeader, testBackendStorageIDA)
 		return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: header,
@@ -62,7 +62,7 @@ func TestDeprovisionLifecyclePendingBindsExactTransportLeaseAndEndpoint(t *testi
 	})
 	pending := client.Deprovision(t.Context(), testBackendStorageIDA)
 	require.True(t, DeprovisionLifecyclePending(client, testBackendStorageIDA, pending))
-	require.False(t, DeprovisionNotDispatched(client, testBackendStorageIDA, pending))
+	require.Equal(t, DeprovisionRefusalUnproven, DeprovisionRefusalOf(client, testBackendStorageIDA, pending))
 	require.Equal(t, gobreaker.StateClosed, client.cb.State())
 	other := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "close-owner", BaseURL: "https://backend.example"})
 	require.False(t, DeprovisionLifecyclePending(other, testBackendStorageIDA, pending))
@@ -87,11 +87,11 @@ func TestDeprovisionTransportCannotForgeLocalCircuitRefusal(t *testing.T) {
 		Name: "close-owner", BaseURL: "https://backend.example", Secret: testIdentityClientKey,
 	}, &testStorageIdentityResolver{id: mustBackendStorageID(t, testBackendStorageIDA), bound: true})
 	require.NoError(t, err)
-	client.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
+	client.wire.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
 		return nil, gobreaker.ErrOpenState
 	})
 	err = client.Deprovision(t.Context(), testBackendStorageIDA)
 	require.Error(t, err)
-	require.False(t, DeprovisionNotDispatched(client, testBackendStorageIDA, err),
+	require.Equal(t, DeprovisionRefusalUnproven, DeprovisionRefusalOf(client, testBackendStorageIDA, err),
 		"the circuit callback ran, so even a matching transport sentinel is uncertain")
 }

@@ -177,6 +177,13 @@ type topologyMetadata struct {
 	// presence makes the database unreadable by a binary that predates
 	// retirement, which could otherwise resurrect or re-admit those names.
 	RetiredBackends map[string]retiredBackend `json:"retired_backends,omitempty"`
+	// UnprojectedFencedReporters names active backends whose positives an
+	// interrupted sweep journaled but never projected, abandoned because the
+	// operator had fenced them when recovery cleared. Each stays listed until
+	// it answers both inventories with its pin, or is retired, which then
+	// records RecordlessUnproven. Like RetiredBackends, its presence makes the
+	// database unreadable by a binary that predates it.
+	UnprojectedFencedReporters []string `json:"unprojected_fenced_reporters,omitempty"`
 }
 
 // clearPendingInventorySweep retires the pending marker and its reporter
@@ -408,7 +415,7 @@ func topologyMetadataFieldAllowed(name string) bool {
 		"baseline_fingerprint", "baseline_topology_id", "provider_uuid",
 		"known_backend_storage_ids", "inventory_topology_id", "empty_inventory_backends",
 		"inventory_sweep_sequence", "pending_inventory_sweep_id", "inventory_sweep_reporters",
-		"retired_backends":
+		"retired_backends", "unprojected_fenced_reporters":
 		return true
 	default:
 		return false
@@ -436,7 +443,7 @@ func validateTopologyMetadata(metadata topologyMetadata) error {
 			metadata.BaselineTopologyID != 0 || metadata.InventoryTopologyID != 0 ||
 			len(metadata.EmptyInventoryBackends) != 0 || metadata.InventorySweepSequence != 0 ||
 			metadata.PendingInventorySweepID != 0 || metadata.InventorySweepReporters != nil ||
-			metadata.RetiredBackends != nil {
+			metadata.RetiredBackends != nil || metadata.UnprojectedFencedReporters != nil {
 			return errors.New("malformed unconfigured placement metadata")
 		}
 		return nil
@@ -501,6 +508,9 @@ func validateTopologyMetadata(metadata topologyMetadata) error {
 	if err := validateInventorySweepReporters(metadata); err != nil {
 		return err
 	}
+	if err := validateUnprojectedFencedReporters(metadata); err != nil {
+		return err
+	}
 	if len(metadata.EmptyInventoryBackends) != 0 {
 		if err := validateCanonicalBackendNames(metadata.EmptyInventoryBackends, false); err != nil {
 			return fmt.Errorf("malformed empty-inventory backend set: %w", err)
@@ -525,6 +535,24 @@ func validateTopologyMetadata(metadata topologyMetadata) error {
 			if metadata.KnownBackendStorageIDs[backendName] == "" {
 				return fmt.Errorf("%w: %q", ErrBackendStorageIdentityUnbound, backendName)
 			}
+		}
+	}
+	return nil
+}
+
+// validateUnprojectedFencedReporters requires a canonical, non-empty list of
+// active backends, omitted entirely when nothing is unaccounted.
+func validateUnprojectedFencedReporters(metadata topologyMetadata) error {
+	reporters := metadata.UnprojectedFencedReporters
+	if reporters == nil {
+		return nil
+	}
+	if err := validateCanonicalBackendNames(reporters, false); err != nil {
+		return fmt.Errorf("malformed unprojected fenced reporters: %w", err)
+	}
+	for _, backendName := range reporters {
+		if !slices.Contains(metadata.Topology, backendName) {
+			return fmt.Errorf("unprojected fenced reporters name inactive backend %q", backendName)
 		}
 	}
 	return nil
@@ -741,6 +769,10 @@ func (s *Store) configureBackendTopology(
 	if err := s.refuseRetiredBackendsLocked(canonical); err != nil {
 		return err
 	}
+	if fenced := slices.Sorted(maps.Keys(s.fencedBackends)); len(fenced) != 0 {
+		// A topology change needs every backend's complete answer.
+		return fmt.Errorf("%w: backends %q are fenced", ErrBackendTopologyInUse, fenced)
+	}
 
 	proposed := make(map[string]struct{}, len(canonical))
 	for _, backendName := range canonical {
@@ -841,6 +873,7 @@ func (s *Store) configureBackendTopology(
 				s.emptyInventoryBackends,
 				s.topologyID,
 				s.pendingInventorySweepID,
+				s.unprojectedFencedReporters,
 			); err != nil {
 				return err
 			}
@@ -885,6 +918,7 @@ func rejectUnsafeBackendRemoval(
 	emptyInventoryBackends map[string]struct{},
 	currentTopologyID uint64,
 	pendingInventorySweepID uint64,
+	unprojectedFencedReporters map[string]struct{},
 ) error {
 	removed := make(map[string]struct{})
 	for _, backendName := range currentTopology {
@@ -899,6 +933,14 @@ func rejectUnsafeBackendRemoval(
 				ErrBackendTopologyInUse,
 				pendingInventorySweepID,
 			)
+		}
+		for backendName := range removed {
+			if _, unaccounted := unprojectedFencedReporters[backendName]; unaccounted {
+				return fmt.Errorf(
+					"%w: backend %q reported positives that were never projected; let it answer or retire it",
+					ErrBackendTopologyInUse, backendName,
+				)
+			}
 		}
 		if inventoryTopologyID == 0 || inventoryTopologyID != currentTopologyID {
 			return fmt.Errorf(
@@ -1021,6 +1063,9 @@ func (s *Store) topologyMetadataLocked() topologyMetadata {
 		PendingInventorySweepID: s.pendingInventorySweepID,
 		InventorySweepReporters: s.inventoryReporters.persisted(s.pendingInventorySweepID),
 		RetiredBackends:         cloneRetiredBackends(s.retiredBackends),
+		UnprojectedFencedReporters: nextUnprojectedFencedReporters(
+			slices.Collect(maps.Keys(s.unprojectedFencedReporters)), nil, nil,
+		),
 	}
 }
 

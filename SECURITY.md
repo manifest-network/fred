@@ -644,3 +644,56 @@ The daemon refuses to start if any check fails.
 ## Incident response
 
 For runbook-style guidance on responding to active incidents — replay attempts, suspicious callback traffic, sustained auth failures, wedged actors — see [OPERATIONS.md](OPERATIONS.md). Security-relevant signals are flagged in the alert table there (rate-limit spikes, panic counters, callback timeouts, etc.).
+
+### Containing a compromised backend
+
+When a backend can no longer be trusted, set `fenced: true` on it in
+providerd's config and restart providerd. Keep the backend in the config: a
+fence contains it without removing it, so its leases and placements stay
+accounted for. The fence lasts until it is removed and providerd restarts
+again.
+
+What the fence does:
+
+- providerd builds the backend's client from its name alone: the client
+  holds no address, HMAC key, or TLS material, and every request is refused
+  before it exists. Nothing reaches the backend, and its TLS files are never
+  loaded, so its certificate and key files may already be revoked or deleted.
+  The backend's `hmac_secret` stays in the config, where it is checked for
+  uniqueness and used only to recognize the backend's refused callbacks.
+- Callbacks are refused. One that carries the backend's valid signature
+  counts as `fred_api_callback_auth_failures_total{reason="fenced"}`; its key
+  is never used to accept anything.
+- No new lease is routed to it. A SKU that only fenced backends serve routes
+  nowhere and its leases wait; they never fall back to the default backend.
+- Its inventory is not read, and its silence is never evidence. Leases placed
+  on it keep their placement: they are not closed, provisioned elsewhere, or
+  deprovisioned. Restart, update, and restore against them answer `503`
+  before anything is journaled. Closing one is parked
+  (`fred_provisioner_deferred_closes_total{outcome="parked"}`) and resumes by
+  reconciliation once the fence ends.
+- Interrupted-sweep recovery does not wait for it. If the backend reported a
+  positive in a sweep that never projected, recovery clears without it and
+  the placement database records it as an unprojected reporter until it
+  answers both inventories again
+  (`fred_placement_unprojected_fenced_reporter{backend}`, and
+  `unprojected_fenced_reporters` in `placement-repair -classify`). Retiring
+  it while it is recorded marks the retirement `recordless_unproven`.
+
+What it does not do: it does not stop the host or its workloads, and it does
+not rotate the backend's key. Isolate the host at the network as well. If you
+later lift the fence, first replace the backend's key with a stopped restart
+(see [Secret rotation](#secrets-management)).
+
+While any backend is fenced, these wait rather than act, and each fails
+closed: topology changes, `placement-preflight`, and the inventory modes of
+`placement-repair` refuse; a quarantine left by a live backend's half answer
+cannot be lifted; and an admission baseline that was lost, for example by
+retiring another backend or attesting a restored backup, cannot be rebuilt,
+so new leases are not admitted until the fence ends. PENDING leases on the
+fenced backend expire at the chain's pending timeout. A fence is a holding
+state: end it by removing `fenced` or by retiring the backend (DEPLOYMENT.md,
+"Retiring a backend whose storage is lost"), which closes its leases as lost.
+
+Fencing requires a per-backend `hmac_secret` on every backend, and at least one
+backend must stay unfenced.

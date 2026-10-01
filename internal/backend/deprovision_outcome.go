@@ -1,29 +1,57 @@
 package backend
 
-// deprovisionNotDispatchedError can only be issued by the HTTP client's
-// circuit admission boundary, before its request callback runs. It authorizes
-// scheduling another attempt, never settlement or a claim that cleanup ran.
+// DeprovisionRefusal names why a client withheld a deprovision request. Its
+// zero value proves nothing: the request may have been sent.
+type DeprovisionRefusal uint8
+
+const (
+	DeprovisionRefusalUnproven DeprovisionRefusal = iota
+	// DeprovisionRefusedCircuitOpen: the circuit breaker refused admission.
+	DeprovisionRefusedCircuitOpen
+	// DeprovisionRefusedFenced: the backend is fenced, so its client has no
+	// means to send anything until the operator lifts the fence.
+	DeprovisionRefusedFenced
+)
+
+// deprovisionNotDispatchedError can only be issued by the HTTP client before
+// its request exists: by a fenced client, or by the circuit admission boundary
+// before the request callback runs. It authorizes scheduling another attempt,
+// never settlement or a claim that cleanup ran.
 type deprovisionNotDispatchedError struct {
 	client    *HTTPClient
 	leaseUUID string
+	refusal   DeprovisionRefusal
 }
 
-func (*deprovisionNotDispatchedError) Error() string { return ErrCircuitOpen.Error() }
-func (*deprovisionNotDispatchedError) Unwrap() error { return ErrCircuitOpen }
+func (err *deprovisionNotDispatchedError) Error() string { return err.Unwrap().Error() }
+func (err *deprovisionNotDispatchedError) Unwrap() error {
+	if err.refusal == DeprovisionRefusedFenced {
+		return &fencedError{backend: err.client.name}
+	}
+	return ErrCircuitOpen
+}
 
-// DeprovisionNotDispatched recognizes local circuit refusal for this exact
-// client and lease. A sentinel error, remote response, unknown transport effect,
-// or proof from another client or lease cannot establish that no request was sent.
-func DeprovisionNotDispatched(client Backend, leaseUUID string, err error) bool {
+// DeprovisionRefusalOf recognizes a local refusal by this exact client for
+// this exact lease. A sentinel error, remote response, unknown transport
+// effect, or proof from another client or lease cannot establish that no
+// request was sent.
+func DeprovisionRefusalOf(client Backend, leaseUUID string, err error) DeprovisionRefusal {
 	transport, ok := client.(*HTTPClient)
 	if !ok || transport == nil || leaseUUID == "" {
-		return false
+		return DeprovisionRefusalUnproven
 	}
 	// Only the direct call result is evidence; wrappers and joined old proofs
 	// must not reclassify a request with unknown effects as undispatched.
 	refused, ok := err.(*deprovisionNotDispatchedError) //nolint:errorlint // Authority requires the direct, unwrapped transport result.
-	return ok && refused != nil &&
-		refused.client == transport && refused.leaseUUID == leaseUUID
+	if !ok || refused == nil || refused.client != transport || refused.leaseUUID != leaseUUID {
+		return DeprovisionRefusalUnproven
+	}
+	switch refused.refusal {
+	case DeprovisionRefusedCircuitOpen, DeprovisionRefusedFenced:
+		return refused.refusal
+	default:
+		return DeprovisionRefusalUnproven
+	}
 }
 
 // DeprovisionLifecyclePending recognizes a deferred close observation from

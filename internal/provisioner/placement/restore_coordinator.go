@@ -226,6 +226,14 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 		return restoreAdmissionApplicationFailure(err)
 	}
 	defer authority.coordinator.store.releaseRestoreSource(source)
+	if client, err := exactBackend(authority.backends, source.backendName); err == nil && backend.IsFenced(client) {
+		// The retained data lives on a fenced backend. Refuse before any
+		// target admission rather than journal a restore it cannot be asked.
+		return RestoreApplicationResult{
+			disposition: RestoreApplicationSourceUnavailable,
+			err:         fmt.Errorf("restore source backend %q: %w", source.backendName, backend.ErrBackendFenced),
+		}
+	}
 
 	targetObservation := authority.readLease(
 		ctx, request.targetLeaseUUID, request.tenant,

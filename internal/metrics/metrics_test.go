@@ -345,6 +345,7 @@ func TestCounterVecLabels(t *testing.T) {
 		for _, outcome := range []string{
 			InventoryOutcomeAuthoritative, InventoryOutcomePartial, InventoryOutcomeUntrusted,
 			InventoryOutcomeProvisionsOnly, InventoryOutcomeRetentionsOnly, InventoryOutcomeUnanswered,
+			InventoryOutcomeFenced,
 		} {
 			ReconcilerBackendInventoryTotal.WithLabelValues("docker", outcome)
 		}
@@ -357,10 +358,12 @@ func TestCounterVecLabels(t *testing.T) {
 		for _, reason := range []string{
 			CallbackAuthFailureMissing, CallbackAuthFailureFormat, CallbackAuthFailureExpired,
 			CallbackAuthFailureFuture, CallbackAuthFailureMismatch, CallbackAuthFailureUnknownStorage,
+			CallbackAuthFailureFenced,
 		} {
 			APICallbackAuthFailuresTotal.WithLabelValues(reason)
 		}
 		APICallbackPreviousKeyConfigured.WithLabelValues("docker")
+		PlacementUnprojectedFencedReporter.WithLabelValues("docker")
 	})
 	assert.NotPanics(t, func() {
 		// Both label sets are closed; every combination the reconciler can emit.

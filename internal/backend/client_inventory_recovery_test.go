@@ -71,7 +71,7 @@ func TestInventoryRecoveryFailurePreservesIdentityAndDoesNotTripTenantBreaker(t 
 		CBFailureThresh: 1,
 	}, &testStorageIdentityResolver{id: mustBackendStorageID(t, testBackendStorageIDA), bound: true})
 	require.NoError(t, err)
-	client.httpClient.Transport = causalOutcomeRoundTripper(func(r *http.Request) (*http.Response, error) {
+	client.wire.httpClient.Transport = causalOutcomeRoundTripper(func(r *http.Request) (*http.Response, error) {
 		identity := testBackendStorageIDA
 		if r.URL.Query().Get("continue") != "" {
 			identity = testBackendStorageIDB
@@ -96,7 +96,7 @@ func TestInventoryRecoverySerializesWholeWalkAndIncludesQueueInBudget(t *testing
 		})
 		entered := make(chan struct{})
 		var active, maximum atomic.Int32
-		client.httpClient.Transport = causalOutcomeRoundTripper(func(r *http.Request) (*http.Response, error) {
+		client.wire.httpClient.Transport = causalOutcomeRoundTripper(func(r *http.Request) (*http.Response, error) {
 			current := active.Add(1)
 			if current > maximum.Load() {
 				maximum.Store(current)

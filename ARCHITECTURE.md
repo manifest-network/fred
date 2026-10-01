@@ -1743,7 +1743,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_provisioner_in_flight_provisions` | gauge | — | Current in-flight provisions |
 | `fred_provisioner_deferred_closes_pending` | gauge | — | Queued or executing close retry hints owned by the bounded provider scheduler; at most 1,024 lease entries. These are scheduling hints, not physical cleanup progress |
 | `fred_provisioner_deferred_closes_oldest_age_seconds` | gauge | — | Age since first enqueue of the oldest queued or executing lease entry, preserved across coalescing and retries. Refreshed approximately once per second and on queue mutations; zero when empty or stopped. This is scheduler age, not the age of a durable backend close intent |
-| `fred_provisioner_deferred_closes_total` | counter | `outcome, reason` | Close-hint scheduling outcomes: `queued`, `coalesced`, `retry`, `dispatched`, `failed`, `full`, `unavailable`, or `stopped`. Reasons are `inventory_pending`, `lifecycle_busy`, or `backend_unavailable`. Every attempt reacquires current authority; `dispatched` means successful call return, not physical completion. A completed or failed attempt can leave a newer coalesced hint pending |
+| `fred_provisioner_deferred_closes_total` | counter | `outcome, reason` | Close-hint scheduling outcomes: `queued`, `coalesced`, `retry`, `dispatched`, `failed`, `full`, `unavailable`, `stopped`, or `parked` (only a fenced backend refused the close, so it waits for reconciliation after the fence ends instead of holding a retry slot). Reasons are `inventory_pending`, `lifecycle_busy`, `backend_unavailable`, or `backend_fenced`. Every attempt reacquires current authority; `dispatched` means successful call return, not physical completion. A completed or failed attempt can leave a newer coalesced hint pending |
 | `fred_provisioner_provisioning_total` | counter | `outcome, backend, operation` | Provisioning operations by outcome/backend. `operation` ∈ `provision`/`restore` separates fresh provisions from restores (ENG-358) |
 | `fred_provisioner_provisioning_duration_seconds` | histogram | `backend, operation` | Provisioning latency. `operation` ∈ `provision`/`restore` |
 | `fred_provisioner_callback_timeouts_total` | counter | — | Backend callback timeouts |
@@ -1769,13 +1769,13 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_reconciler_actions_total` | counter | `action` | Actions taken (`provisioned`, `acknowledged`, `deprovisioned`, `anomaly`, `lease_error`) |
 | `fred_reconciler_last_success_timestamp_seconds` | gauge | — | Unix timestamp of last **clean, complete** run — a degraded sweep does not advance it |
 | `fred_reconciler_conflicts_total` | counter | — | Reconciler conflicts (lease already in-flight) |
-| `fred_reconciler_backend_fetch_total` | counter | `backend`, `outcome` | Per-backend provision-list attempts (`ok`, `error`, `circuit_open`). The signal that a single backend is unreachable, which no longer breaks the fleet-wide sweep |
+| `fred_reconciler_backend_fetch_total` | counter | `backend`, `outcome` | Per-backend provision-list attempts (`ok`, `error`, `circuit_open`, `fenced`; a fenced backend is not asked). The signal that a single backend is unreachable, which no longer breaks the fleet-wide sweep |
 | `fred_reconciler_sweep_complete` | gauge | — | 0 while a sweep is in progress or after an incomplete/error sweep; 1 only after the most recently completed full-fleet inventory was durably projected. This is an observability signal, not a global admission gate; a matching durable topology baseline survives a 0 |
-| `fred_reconciler_backend_inventory_total` | counter | `backend`, `outcome` | Each configured backend's inventory evidence in every sealed sweep: `authoritative` or `partial` (answered both inventories with its pinned storage identity; `partial` kept some leases conservative), `untrusted`, `provisions_only`, `retentions_only`, `unanswered` |
+| `fred_reconciler_backend_inventory_total` | counter | `backend`, `outcome` | Each configured backend's inventory evidence in every sealed sweep: `authoritative` or `partial` (answered both inventories with its pinned storage identity; `partial` kept some leases conservative), `untrusted`, `provisions_only`, `retentions_only`, `unanswered`, `fenced` (the operator fenced it, so it was not asked) |
 | `fred_reconciler_backend_inventory_answered` | gauge | `backend` | 1 if the backend answered both inventories with its pinned storage identity in the latest sealed sweep, 0 otherwise. Read it only while `fred_reconciler_sweep_projection_committed` is 1 |
 | `fred_reconciler_sweep_projection_committed` | gauge | — | 1 once the current sweep's placement projection committed durably, even with unanswered backends; 0 from the start of every sweep until then. Reset before the seal rewrites the answered gauges, so a reader of both sees one sweep |
 | `fred_api_callback_signature_key_total` | counter | `backend`, `slot` | Callbacks verified, by the configured backend whose key verified them and the key slot: `current` or `previous` (`hmac_secret_previous` during a rotation) |
-| `fred_api_callback_auth_failures_total` | counter | `reason` | Callbacks refused at signature verification: `missing`, `format`, `expired`, `future`, `mismatch`, `unknown_storage`. No backend label: before verification the backend is only a claim |
+| `fred_api_callback_auth_failures_total` | counter | `reason` | Callbacks refused at signature verification: `missing`, `format`, `expired`, `future`, `mismatch`, `unknown_storage`, `fenced` (correctly signed by a fenced backend, refused anyway). No backend label: before verification the backend is only a claim |
 | `fred_api_callback_previous_key_configured` | gauge | `backend` | 1 while the backend has a verify-only previous callback key configured |
 | `fred_placement_snapshots_total` | counter | `outcome` | Online snapshot attempts of `placements.db` and `payloads.db`, exactly one per attempt: `success`, `error`, `insufficient_space`. Exported only when `placement_snapshot_dir` is set, so a heartbeat on `success` cannot fire on a provider without snapshots |
 | `fred_placement_snapshot_prune_failures_total` | counter | `reason` | Snapshot files pruning kept or failed to delete: `list`, `inspect`, `not_owned`, `live_database`, `remove`, `sync`. Separate from the attempt counter so a pruning problem never reads as a missing snapshot |
@@ -1788,7 +1788,9 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `fred_backend_requests_total` | counter | `backend, operation, status` | Backend request count |
+| `fred_backend_requests_total` | counter | `backend, operation, status` | Backend request count; `status` is `success`, `error`, or `fenced` (refused locally, nothing sent) |
+| `fred_backend_fenced` | gauge | `backend` | 1 while the operator has fenced the backend (`backends[].fenced`), 0 otherwise. Set once when its client is built. Gate the backend's availability alerts on it |
+| `fred_placement_unprojected_fenced_reporter` | gauge | `backend` | 1 while the placement database records the backend as a fenced reporter whose positives an interrupted sweep never projected, 0 otherwise. Published at open and after every projection; clears when the backend answers both inventories again or is retired |
 | `fred_backend_request_duration_seconds` | histogram | `backend, operation, status` | Backend request latency |
 | `fred_backend_circuit_breaker_state` | gauge | `backend` | Circuit breaker state (0=closed, 1=half-open, 2=open) |
 | `fred_backend_healthy` | gauge | `backend` | Backend health (1=healthy, 0=unhealthy). Written **only** from inside the `/health` and `/readyz` handlers, so it is exactly as fresh as whatever polls them; with no prober it latches at its last value rather than going absent |
@@ -2099,6 +2101,24 @@ verification and is then checked against durable callback authority. Pairwise
 key uniqueness prevents a compromised backend from authenticating commands or
 callbacks for another backend. The legacy fleet-wide top-level key is permitted
 only outside production.
+
+A fenced backend (`backends[].fenced`) is contained by construction rather
+than by checks at each call site. `ConnectionPolicy` is a sum type: a fenced
+backend's policy holds only its name, so its `HTTPClient` has no wire (no
+address, key, or HTTP client), and every operation must obtain the wire before
+it can build a request. Each operation's refusal is typed: provision, restore,
+and maintenance return a not-dispatched outcome, deprovision returns the
+not-dispatched variant `DeprovisionRefusedFenced`, and reads wrap
+`ErrBackendFenced`. None of them touches the circuit breaker. `backend.IsFenced` reads that same
+construction, so routing (no new provision), reconciliation (no inventory
+read, outcome `fenced`), deprovision deferral (`backend_fenced`, parked rather
+than retried) and the `fred_backend_fenced` gauge cannot disagree with the
+client. The callback keyring keeps the fenced backend's key in a separate map
+that can only classify a refusal; `hmacauth.MatchCallbackKeys` checks a
+signature without issuing a proof. The placement store receives the fenced set
+once, at construction, and excuses a fenced reporter from interrupted-sweep
+recovery, recording it durably as an unprojected reporter so retirement and
+topology removal still see what it might hold.
 
 Callback admission is separate from tenant and observability traffic. Its
 ingress IP bucket and authenticated storage-identity bucket each use fixed

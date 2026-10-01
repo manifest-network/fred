@@ -163,6 +163,12 @@ func newClients(
 		if err != nil {
 			return nil, fmt.Errorf("backend %q: compose connection policy: %w", backendConfig.Name, err)
 		}
+		if policy.Fenced() {
+			// Every caller needs the whole fleet's inventory, and a fenced
+			// backend's answer is exactly what the operator distrusts.
+			return nil, fmt.Errorf("%w: backend %q: %w; a complete fleet observation needs every backend unfenced",
+				ErrIncompleteInventory, backendConfig.Name, backend.ErrBackendFenced)
+		}
 		if resolver == nil {
 			client, err := backend.NewBootstrapInventoryClient(policy, backend.HTTPClientOptions{})
 			if err != nil {

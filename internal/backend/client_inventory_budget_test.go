@@ -61,13 +61,13 @@ func TestInventoryHTTPPagesPreserveCompleteWireSize(t *testing.T) {
 			defer server.Close()
 			client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "wire-budget", BaseURL: server.URL})
 			if endpoint == "provisions" {
-				page, err := client.fetchProvisionsPage(context.Background(), "", false)
+				page, err := client.fetchProvisionsPage(context.Background(), client.wire, "", false)
 				require.NoError(t, err)
 				require.EqualValues(t, len(body), page.bodyBytes)
 				require.NotNil(t, page.items)
 				require.Equal(t, "next", page.next)
 			} else {
-				page, err := client.fetchRetentionsPage(context.Background(), "", false)
+				page, err := client.fetchRetentionsPage(context.Background(), client.wire, "", false)
 				require.NoError(t, err)
 				require.EqualValues(t, len(body), page.bodyBytes)
 				require.NotNil(t, page.items)

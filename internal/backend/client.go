@@ -1107,6 +1107,27 @@ var ErrResponseTooLarge = errors.New("response body too large")
 // ErrCircuitOpen is returned when the circuit breaker is open.
 var ErrCircuitOpen = errors.New("circuit breaker is open")
 
+// ErrBackendFenced means the operator fenced this backend: its client cannot
+// reach the network, so the request was neither built nor sent.
+var ErrBackendFenced = errors.New("backend is fenced")
+
+// fencedError is a fenced client's refusal. It is returned before any request
+// exists, so it always means nothing was sent.
+type fencedError struct{ backend string }
+
+func (err *fencedError) Error() string {
+	return fmt.Sprintf("backend %q is fenced", err.backend)
+}
+func (*fencedError) Unwrap() error { return ErrBackendFenced }
+
+// IsFenced reports whether b is a fenced backend's client. It reads the
+// client's own construction, the one place the fence lives, so routing,
+// reconciliation, and metrics cannot disagree about it.
+func IsFenced(b Backend) bool {
+	client, ok := b.(*HTTPClient)
+	return ok && client != nil && client.wire == nil
+}
+
 var (
 	// ErrBackendStorageIdentityUnbound means the production client has no
 	// durable expected identity and therefore refuses non-bootstrap requests.
@@ -1193,12 +1214,13 @@ func isCircuitBreakerError(err error) bool {
 
 // HTTPClient implements Backend using HTTP calls to a backend service.
 type HTTPClient struct {
-	name       string
-	baseURL    string
-	secret     string
-	httpClient *http.Client
-	cb         *gobreaker.CircuitBreaker[any]
-	identity   BackendStorageIdentityResolver
+	name string
+	// wire is everything needed to reach the backend. A fenced backend's
+	// client has none, and every operation obtains the wire before building a
+	// request, so a fenced client cannot construct, sign, or send one.
+	wire     *httpWire
+	cb       *gobreaker.CircuitBreaker[any]
+	identity BackendStorageIdentityResolver
 
 	// One complete inventory walk may run independently of the tenant breaker.
 	// The constructor owns the slot; callers cannot select a bypass mode.
@@ -1220,6 +1242,22 @@ type HTTPClient struct {
 	requestDuration         *prometheus.HistogramVec
 	requestsTotal           *prometheus.CounterVec
 	malformedErrorBodyTotal *prometheus.CounterVec
+}
+
+// httpWire holds a live backend's address, request key, and HTTP client.
+type httpWire struct {
+	baseURL    string
+	secret     string
+	httpClient *http.Client
+}
+
+// connection returns the wire, or the fenced refusal before any request
+// exists.
+func (c *HTTPClient) connection() (*httpWire, error) {
+	if c.wire == nil {
+		return nil, &fencedError{backend: c.name}
+	}
+	return c.wire, nil
 }
 
 type requestIdentityMode uint8
@@ -1322,6 +1360,10 @@ type HTTPClientOptions struct {
 	RequestDuration     *prometheus.HistogramVec // labels: backend, operation, status
 	RequestsTotal       *prometheus.CounterVec   // labels: backend, operation, status
 	CircuitBreakerState *prometheus.GaugeVec     // labels: backend
+	// Fenced is set once at construction: 1 for a fenced backend's client,
+	// 0 otherwise. It is the operator's signal to silence that backend's
+	// availability alerts, and it cannot disagree with the client itself.
+	Fenced *prometheus.GaugeVec // labels: backend
 	// MalformedErrorBodyTotal counts client-error responses whose body was not
 	// the declared JSON error envelope. A backend contributing to this is
 	// off-contract (BACKEND_GUIDE.md) and its tenants are getting a generic
@@ -1345,25 +1387,11 @@ func positiveOr(v, fallback int64) int64 {
 // code would make mutation authority available by accident.
 func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 	connection := policy.state
-	// Apply defaults using cmp.Or (returns first non-zero value)
-	timeout := cmp.Or(connection.timeout, 30*time.Second)
-	maxIdleConns := cmp.Or(cfg.MaxIdleConns, 100)
-	maxIdleConnsPerHost := cmp.Or(cfg.MaxIdleConnsPerHost, 10) // Higher than default (2)
 
 	// Circuit breaker defaults
 	cbMaxRequests := cmp.Or(cfg.CBMaxRequests, uint32(1))
 	cbTimeout := cmp.Or(cfg.CBTimeout, 60*time.Second)
 	cbFailureThresh := cmp.Or(cfg.CBFailureThresh, uint32(5))
-
-	transport := &http.Transport{
-		MaxIdleConns:        maxIdleConns,
-		MaxIdleConnsPerHost: maxIdleConnsPerHost,
-		IdleConnTimeout:     90 * time.Second,
-	}
-	// Each client owns its transport configuration; immutable trust material
-	// remains private to the policy. No nil/default TLS path is exposed.
-	// The backend hop keeps its existing HTTP/1.1 transport behavior.
-	transport.TLSClientConfig = connection.tlsConfig.Clone()
 
 	// Create circuit breaker
 	cb := gobreaker.NewCircuitBreaker[any](gobreaker.Settings{
@@ -1437,6 +1465,14 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 		},
 	})
 
+	if cfg.Fenced != nil {
+		fenced := 0.0
+		if connection.live == nil {
+			fenced = 1
+		}
+		cfg.Fenced.WithLabelValues(connection.name).Set(fenced)
+	}
+
 	// Guard the page size: a zero OR negative page limit falls back to the
 	// default. cmp.Or (used above for the other defaults) only replaces zero, so a
 	// negative would be sent as limit=-N and rejected by the server each tick.
@@ -1450,19 +1486,8 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 	}
 
 	return &HTTPClient{
-		name:    connection.name,
-		baseURL: connection.baseURL,
-		secret:  connection.secret,
-		httpClient: &http.Client{
-			Timeout:   timeout,
-			Transport: transport,
-			// HMAC and storage authority are bound to the original RequestURI.
-			// Following a redirect could replay a POST body onto an unsigned legacy
-			// path or another host, so every backend redirect is returned untouched.
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
+		name:                     connection.name,
+		wire:                     newHTTPWire(connection.live, cfg),
 		cb:                       cb,
 		inventorySlot:            make(chan struct{}, 1),
 		maxInfoBytes:             positiveOr(cfg.MaxInfoBytes, DefaultMaxInfoBytes),
@@ -1478,6 +1503,37 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 		requestDuration:          cfg.RequestDuration,
 		requestsTotal:            cfg.RequestsTotal,
 		malformedErrorBodyTotal:  cfg.MalformedErrorBodyTotal,
+	}
+}
+
+// newHTTPWire builds a live backend's HTTP client. A fenced policy has no live
+// connection, so its client gets no wire at all.
+func newHTTPWire(live *liveConnection, cfg HTTPClientOptions) *httpWire {
+	if live == nil {
+		return nil
+	}
+	transport := &http.Transport{
+		MaxIdleConns:        cmp.Or(cfg.MaxIdleConns, 100),
+		MaxIdleConnsPerHost: cmp.Or(cfg.MaxIdleConnsPerHost, 10), // Higher than default (2)
+		IdleConnTimeout:     90 * time.Second,
+	}
+	// Each client owns its transport configuration; immutable trust material
+	// remains private to the policy. No nil/default TLS path is exposed.
+	// The backend hop keeps its existing HTTP/1.1 transport behavior.
+	transport.TLSClientConfig = live.tlsConfig.Clone()
+	return &httpWire{
+		baseURL: live.baseURL,
+		secret:  live.secret,
+		httpClient: &http.Client{
+			Timeout:   cmp.Or(live.timeout, 30*time.Second),
+			Transport: transport,
+			// HMAC and storage authority are bound to the original RequestURI.
+			// Following a redirect could replay a POST body onto an unsigned legacy
+			// path or another host, so every backend redirect is returned untouched.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
@@ -1536,16 +1592,20 @@ func ProbeStorageIdentity(ctx context.Context, policy ConnectionPolicy) (backend
 		return backendidentity.ID{}, errors.New("backend connection policy is required")
 	}
 	c := newHTTPClient(policy, HTTPClientOptions{})
-	ctx, cancel := context.WithTimeout(ctx, c.httpClient.Timeout)
+	wire, err := c.connection()
+	if err != nil {
+		return backendidentity.ID{}, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, wire.httpClient.Timeout)
 	defer cancel()
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/provisions?limit=1", nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, wire.baseURL+"/provisions?limit=1", nil)
 	if err != nil {
 		return backendidentity.ID{}, fmt.Errorf("create request: %w", err)
 	}
-	if err := c.prepareRequest(httpReq, nil, requestIdentityBootstrap); err != nil {
+	if err := c.prepareRequest(wire, httpReq, nil, requestIdentityBootstrap); err != nil {
 		return backendidentity.ID{}, err
 	}
-	resp, err := c.do(httpReq)
+	resp, err := c.do(wire, httpReq)
 	if err != nil {
 		return backendidentity.ID{}, fmt.Errorf("probe storage identity: %w", err)
 	}
@@ -1576,12 +1636,13 @@ func NewIdentityBoundHTTPClient(
 }
 
 func (c *HTTPClient) prepareRequest(
+	wire *httpWire,
 	req *http.Request,
 	body []byte,
 	mode requestIdentityMode,
 ) error {
 	if c.identity == nil {
-		c.signRequest(req, body)
+		signRequest(wire, req, body)
 		return nil
 	}
 	expected, bound := c.identity.ExpectedBackendStorageIdentity(c.name)
@@ -1609,12 +1670,12 @@ func (c *HTTPClient) prepareRequest(
 		mode:     mode,
 	})
 	*req = *req.WithContext(ctx)
-	c.signRequest(req, body)
+	signRequest(wire, req, body)
 	return nil
 }
 
-func (c *HTTPClient) do(req *http.Request) (*http.Response, error) {
-	resp, err := c.httpClient.Do(req)
+func (c *HTTPClient) do(wire *httpWire, req *http.Request) (*http.Response, error) {
+	resp, err := wire.httpClient.Do(req)
 	if err != nil || c.identity == nil {
 		return resp, err
 	}
@@ -1703,7 +1764,10 @@ func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error)
 		return
 	}
 	status := "success"
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrBackendFenced):
+		status = "fenced"
+	case err != nil:
 		status = "error"
 	}
 	if c.requestDuration != nil {
@@ -1941,18 +2005,18 @@ func (c *HTTPClient) noteMalformedErrorBody(body []byte, operation, why string) 
 // If no secret is configured, this is a no-op for transport test fixtures.
 // Both production factories reject that state, so
 // mutation-capable production clients cannot reach this compatibility branch.
-func (c *HTTPClient) signRequest(req *http.Request, body []byte) {
-	if c.secret == "" {
+func signRequest(wire *httpWire, req *http.Request, body []byte) {
+	if wire.secret == "" {
 		return
 	}
-	req.Header.Set(hmacauth.SignatureHeader, hmacauth.SignRequest(c.secret, req, body))
+	req.Header.Set(hmacauth.SignatureHeader, hmacauth.SignRequest(wire.secret, req, body))
 }
 
 // doGet executes a GET request through the circuit breaker, decoding the
 // JSON response as T. It handles 404→ErrNotProvisioned and enforces a
 // response size limit.
-func doGet[T any](c *HTTPClient, ctx context.Context, metric, url string, maxBytes int64) (_ *T, err error) {
-	return doGetDecoded(c, ctx, metric, url, maxBytes, func(r io.ReadCloser, limit int64) (*T, error) {
+func doGet[T any](c *HTTPClient, ctx context.Context, metric, path string, maxBytes int64) (_ *T, err error) {
+	return doGetDecoded(c, ctx, metric, path, maxBytes, func(r io.ReadCloser, limit int64) (*T, error) {
 		var v T
 		if err := decodeJSONLimited(r, limit, &v); err != nil {
 			return nil, err
@@ -1961,20 +2025,24 @@ func doGet[T any](c *HTTPClient, ctx context.Context, metric, url string, maxByt
 	})
 }
 
-func doGetDecoded[T any](c *HTTPClient, ctx context.Context, metric, url string, maxBytes int64, decode func(io.ReadCloser, int64) (*T, error)) (_ *T, err error) {
+func doGetDecoded[T any](c *HTTPClient, ctx context.Context, metric, path string, maxBytes int64, decode func(io.ReadCloser, int64) (*T, error)) (_ *T, err error) {
 	start := time.Now()
 	defer func() { c.recordMetrics(metric, start, err) }()
 
+	wire, err := c.connection()
+	if err != nil {
+		return nil, err
+	}
 	result, cbErr := c.execute(ctx, func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, wire.baseURL+path, nil)
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
-		if err := c.prepareRequest(httpReq, nil, requestIdentityRead); err != nil {
+		if err := c.prepareRequest(wire, httpReq, nil, requestIdentityRead); err != nil {
 			return nil, err
 		}
 
-		resp, err := c.do(httpReq)
+		resp, err := c.do(wire, httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("%s request failed: %w", metric, err)
 		}
@@ -2033,6 +2101,10 @@ func (c *HTTPClient) provisionCall(
 	start := time.Now()
 	defer func() { c.recordMetrics("provision", start, outcome.Err()) }()
 
+	wire, err := c.connection()
+	if err != nil {
+		return notDispatchedProvisionCall(err)
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return notDispatchedProvisionCall(fmt.Errorf("marshal provision request: %w", err))
@@ -2040,19 +2112,19 @@ func (c *HTTPClient) provisionCall(
 
 	var observed ProvisionCallOutcome
 	_, cbErr := c.execute(ctx, func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/provision", bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, wire.baseURL+"/provision", bytes.NewReader(body))
 		if err != nil {
 			callErr := fmt.Errorf("create request: %w", err)
 			observed = notDispatchedProvisionCall(callErr)
 			return nil, callErr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+		if err := c.prepareRequest(wire, httpReq, body, requestIdentitySideEffect); err != nil {
 			observed = notDispatchedProvisionCall(err)
 			return nil, err
 		}
 
-		resp, err := c.do(httpReq)
+		resp, err := c.do(wire, httpReq)
 		if err != nil {
 			callErr := fmt.Errorf("provision request failed: %w", err)
 			if isBackendUpgradeRequiredProof(err) {
@@ -2128,7 +2200,7 @@ func (c *HTTPClient) provisionCall(
 
 // GetInfo retrieves lease information including connection details.
 func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (*LeaseInfo, error) {
-	return doGet[LeaseInfo](c, ctx, "get_info", fmt.Sprintf("%s/info/%s", c.baseURL, leaseUUID), c.maxInfoBytes)
+	return doGet[LeaseInfo](c, ctx, "get_info", "/info/"+leaseUUID, c.maxInfoBytes)
 }
 
 // Deprovision releases resources for a lease.
@@ -2136,6 +2208,10 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 	start := time.Now()
 	defer func() { c.recordMetrics("deprovision", start, err) }()
 
+	wire, err := c.connection()
+	if err != nil {
+		return &deprovisionNotDispatchedError{client: c, leaseUUID: leaseUUID, refusal: DeprovisionRefusedFenced}
+	}
 	body, err := json.Marshal(map[string]string{"lease_uuid": leaseUUID})
 	if err != nil {
 		return fmt.Errorf("marshal deprovision request: %w", err)
@@ -2144,16 +2220,16 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 	invoked := false
 	_, cbErr := c.execute(ctx, func() (any, error) {
 		invoked = true
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/deprovision", bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, wire.baseURL+"/deprovision", bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+		if err := c.prepareRequest(wire, httpReq, body, requestIdentitySideEffect); err != nil {
 			return nil, err
 		}
 
-		resp, err := c.do(httpReq)
+		resp, err := c.do(wire, httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("deprovision request failed: %w", err)
 		}
@@ -2187,7 +2263,7 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 	})
 
 	if !invoked && isCircuitBreakerError(cbErr) {
-		return &deprovisionNotDispatchedError{client: c, leaseUUID: leaseUUID}
+		return &deprovisionNotDispatchedError{client: c, leaseUUID: leaseUUID, refusal: DeprovisionRefusedCircuitOpen}
 	}
 	return cbErr
 }
@@ -2257,8 +2333,8 @@ func walkKeysetPages[T any](ctx context.Context, op string, requireIdentity bool
 // deadline. Inventory is a recovery observation, so tenant transport failures
 // must not suppress it. This lane neither trips nor resets the tenant breaker;
 // all page authentication, identity, size, and completeness checks still apply.
-func (c *HTTPClient) beginInventoryWalk(ctx context.Context) (context.Context, func(), error) {
-	ctx, cancel := context.WithTimeout(ctx, c.httpClient.Timeout)
+func (c *HTTPClient) beginInventoryWalk(ctx context.Context, wire *httpWire) (context.Context, func(), error) {
+	ctx, cancel := context.WithTimeout(ctx, wire.httpClient.Timeout)
 	select {
 	case c.inventorySlot <- struct{}{}:
 		if err := ctx.Err(); err != nil {
@@ -2300,14 +2376,18 @@ func (c *HTTPClient) listProvisionsWithIdentity(
 	start := time.Now()
 	defer func() { c.recordMetrics("list_provisions", start, err) }()
 
-	ctx, release, err := c.beginInventoryWalk(ctx)
+	wire, err := c.connection()
+	if err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	ctx, release, err := c.beginInventoryWalk(ctx, wire)
 	if err != nil {
 		return nil, backendidentity.ID{}, err
 	}
 	defer release()
 
-	provisions, observed, err := walkKeysetPages(ctx, "list provisions", requireIdentity, c.httpClient.Timeout, func(ctx context.Context, cont string) (inventoryPage[ProvisionInfo], error) {
-		return c.fetchProvisionsPage(ctx, cont, requireIdentity)
+	provisions, observed, err := walkKeysetPages(ctx, "list provisions", requireIdentity, wire.httpClient.Timeout, func(ctx context.Context, cont string) (inventoryPage[ProvisionInfo], error) {
+		return c.fetchProvisionsPage(ctx, wire, cont, requireIdentity)
 	})
 	if err != nil {
 		return nil, backendidentity.ID{}, err
@@ -2324,6 +2404,7 @@ func (c *HTTPClient) listProvisionsWithIdentity(
 // first page. The per-page body is bounded by maxProvisionsBytes (fail-closed).
 func (c *HTTPClient) fetchProvisionsPage(
 	ctx context.Context,
+	wire *httpWire,
 	continueToken string,
 	requireIdentity bool,
 ) (inventoryPage[ProvisionInfo], error) {
@@ -2332,17 +2413,17 @@ func (c *HTTPClient) fetchProvisionsPage(
 	if continueToken != "" {
 		q.Set("continue", continueToken)
 	}
-	target := c.baseURL + "/provisions?" + q.Encode()
+	target := wire.baseURL + "/provisions?" + q.Encode()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return inventoryPage[ProvisionInfo]{}, fmt.Errorf("create request: %w", err)
 	}
-	if err := c.prepareRequest(httpReq, nil, requestIdentityBootstrap); err != nil {
+	if err := c.prepareRequest(wire, httpReq, nil, requestIdentityBootstrap); err != nil {
 		return inventoryPage[ProvisionInfo]{}, err
 	}
 
-	resp, err := c.do(httpReq)
+	resp, err := c.do(wire, httpReq)
 	if err != nil {
 		return inventoryPage[ProvisionInfo]{}, fmt.Errorf("list provisions request failed: %w", err)
 	}
@@ -2369,7 +2450,7 @@ func (c *HTTPClient) fetchProvisionsPage(
 
 // GetProvision retrieves status information for a single provision.
 func (c *HTTPClient) GetProvision(ctx context.Context, leaseUUID string) (*ProvisionInfo, error) {
-	return doGet[ProvisionInfo](c, ctx, "get_provision", fmt.Sprintf("%s/provisions/%s", c.baseURL, leaseUUID), c.maxProvisionBytes)
+	return doGet[ProvisionInfo](c, ctx, "get_provision", "/provisions/"+leaseUUID, c.maxProvisionBytes)
 }
 
 // LookupProvisions returns provision info for the requested lease UUIDs.
@@ -2390,9 +2471,7 @@ func (c *HTTPClient) LookupProvisions(ctx context.Context, uuids []string) ([]Pr
 	sort.Strings(sortedUUIDs)
 
 	q := url.Values{"lease_uuid": sortedUUIDs}
-	target := c.baseURL + "/provisions?" + q.Encode()
-
-	resp, err := doGet[ListProvisionsResponse](c, ctx, "lookup_provisions", target, c.maxLookupProvisionsBytes)
+	resp, err := doGet[ListProvisionsResponse](c, ctx, "lookup_provisions", "/provisions?"+q.Encode(), c.maxLookupProvisionsBytes)
 	if errors.Is(err, ErrNotProvisioned) {
 		// doGet maps 404 to ErrNotProvisioned. The filtered /provisions handler
 		// always returns 200 with a possibly-empty Provisions list, so this branch
@@ -2409,7 +2488,7 @@ func (c *HTTPClient) LookupProvisions(ctx context.Context, uuids []string) ([]Pr
 
 // GetLogs retrieves container logs for a provisioned lease.
 func (c *HTTPClient) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
-	result, err := doGetDecoded(c, ctx, "get_logs", fmt.Sprintf("%s/logs/%s?tail=%d", c.baseURL, leaseUUID, tail), c.maxLogsBytes, decodeLogResponse)
+	result, err := doGetDecoded(c, ctx, "get_logs", fmt.Sprintf("/logs/%s?tail=%d", leaseUUID, tail), c.maxLogsBytes, decodeLogResponse)
 	if err != nil {
 		return nil, err
 	}
@@ -2450,6 +2529,10 @@ func executeHTTPMaintenanceCall[T RestartRequest | UpdateRequest](
 	start := time.Now()
 	defer func() { c.recordMetrics(operation, start, outcome.Err()) }()
 
+	wire, err := c.connection()
+	if err != nil {
+		return notDispatchedMaintenanceCall(err)
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return notDispatchedMaintenanceCall(fmt.Errorf("marshal %s request: %w", operation, err))
@@ -2457,7 +2540,7 @@ func executeHTTPMaintenanceCall[T RestartRequest | UpdateRequest](
 	var observed MaintenanceCallOutcome
 	_, cbErr := c.execute(ctx, func() (any, error) {
 		httpReq, err := http.NewRequestWithContext(
-			ctx, http.MethodPost, c.baseURL+"/"+operation, bytes.NewReader(body),
+			ctx, http.MethodPost, wire.baseURL+"/"+operation, bytes.NewReader(body),
 		)
 		if err != nil {
 			callErr := fmt.Errorf("create request: %w", err)
@@ -2465,12 +2548,12 @@ func executeHTTPMaintenanceCall[T RestartRequest | UpdateRequest](
 			return nil, callErr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+		if err := c.prepareRequest(wire, httpReq, body, requestIdentitySideEffect); err != nil {
 			observed = notDispatchedMaintenanceCall(err)
 			return nil, err
 		}
 
-		resp, err := c.do(httpReq)
+		resp, err := c.do(wire, httpReq)
 		if err != nil {
 			callErr := fmt.Errorf("%s request failed: %w", operation, err)
 			if isBackendUpgradeRequiredProof(err) {
@@ -2549,6 +2632,10 @@ func (c *HTTPClient) restoreCall(
 	start := time.Now()
 	defer func() { c.recordMetrics("restore", start, outcome.Err()) }()
 
+	wire, err := c.connection()
+	if err != nil {
+		return notDispatchedRestoreCall(err)
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return notDispatchedRestoreCall(fmt.Errorf("marshal restore request: %w", err))
@@ -2556,19 +2643,19 @@ func (c *HTTPClient) restoreCall(
 
 	var observed RestoreCallOutcome
 	_, cbErr := c.execute(ctx, func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/restore", bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, wire.baseURL+"/restore", bytes.NewReader(body))
 		if err != nil {
 			callErr := fmt.Errorf("create request: %w", err)
 			observed = notDispatchedRestoreCall(callErr)
 			return nil, callErr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+		if err := c.prepareRequest(wire, httpReq, body, requestIdentitySideEffect); err != nil {
 			observed = notDispatchedRestoreCall(err)
 			return nil, err
 		}
 
-		resp, err := c.do(httpReq)
+		resp, err := c.do(wire, httpReq)
 		if err != nil {
 			callErr := fmt.Errorf("restore request failed: %w", err)
 			if isBackendUpgradeRequiredProof(err) {
@@ -2692,7 +2779,7 @@ func (c *HTTPClient) restoreCall(
 
 // GetReleases retrieves release history for a lease.
 func (c *HTTPClient) GetReleases(ctx context.Context, leaseUUID string) ([]ReleaseInfo, error) {
-	result, err := doGet[[]ReleaseInfo](c, ctx, "get_releases", fmt.Sprintf("%s/releases/%s", c.baseURL, leaseUUID), c.maxReleasesBytes)
+	result, err := doGet[[]ReleaseInfo](c, ctx, "get_releases", "/releases/"+leaseUUID, c.maxReleasesBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -2717,22 +2804,26 @@ func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string
 	start := time.Now()
 	defer func() { c.recordMetrics("reconcile_custom_domain", start, err) }()
 
+	wire, err := c.connection()
+	if err != nil {
+		return err
+	}
 	body, err := json.Marshal(ReconcileCustomDomainRequest{LeaseUUID: leaseUUID, Items: items})
 	if err != nil {
 		return fmt.Errorf("marshal reconcile_custom_domain request: %w", err)
 	}
 
 	_, cbErr := c.execute(ctx, func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/reconcile_custom_domain", bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, wire.baseURL+"/reconcile_custom_domain", bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+		if err := c.prepareRequest(wire, httpReq, body, requestIdentitySideEffect); err != nil {
 			return nil, err
 		}
 
-		resp, err := c.do(httpReq)
+		resp, err := c.do(wire, httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("reconcile_custom_domain request failed: %w", err)
 		}
@@ -2761,7 +2852,7 @@ func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string
 // GetLoadStats retrieves the backend's current resource-load snapshot from
 // GET /stats. Used by the router for least-loaded provision placement.
 func (c *HTTPClient) GetLoadStats(ctx context.Context) (*LoadStats, error) {
-	return doGet[LoadStats](c, ctx, "get_load_stats", c.baseURL+"/stats", c.maxStatsBytes)
+	return doGet[LoadStats](c, ctx, "get_load_stats", "/stats", c.maxStatsBytes)
 }
 
 // ListRetentions retrieves the leases whose data this backend currently retains
@@ -2789,14 +2880,18 @@ func (c *HTTPClient) listRetentionsWithIdentity(
 	start := time.Now()
 	defer func() { c.recordMetrics("list_retentions", start, err) }()
 
-	ctx, release, err := c.beginInventoryWalk(ctx)
+	wire, err := c.connection()
+	if err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	ctx, release, err := c.beginInventoryWalk(ctx, wire)
 	if err != nil {
 		return nil, backendidentity.ID{}, err
 	}
 	defer release()
 
-	retentions, observed, err := walkKeysetPages(ctx, "list retentions", requireIdentity, c.httpClient.Timeout, func(ctx context.Context, cont string) (inventoryPage[RetainedLease], error) {
-		return c.fetchRetentionsPage(ctx, cont, requireIdentity)
+	retentions, observed, err := walkKeysetPages(ctx, "list retentions", requireIdentity, wire.httpClient.Timeout, func(ctx context.Context, cont string) (inventoryPage[RetainedLease], error) {
+		return c.fetchRetentionsPage(ctx, wire, cont, requireIdentity)
 	})
 	if err != nil {
 		return nil, backendidentity.ID{}, err
@@ -2839,6 +2934,7 @@ func validateInventoryLeaseUUIDs(
 // first page. The per-page body is bounded by maxRetentionsBytes (fail-closed).
 func (c *HTTPClient) fetchRetentionsPage(
 	ctx context.Context,
+	wire *httpWire,
 	continueToken string,
 	requireIdentity bool,
 ) (inventoryPage[RetainedLease], error) {
@@ -2847,17 +2943,17 @@ func (c *HTTPClient) fetchRetentionsPage(
 	if continueToken != "" {
 		q.Set("continue", continueToken)
 	}
-	target := c.baseURL + "/retentions?" + q.Encode()
+	target := wire.baseURL + "/retentions?" + q.Encode()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return inventoryPage[RetainedLease]{}, fmt.Errorf("create request: %w", err)
 	}
-	if err := c.prepareRequest(httpReq, nil, requestIdentityBootstrap); err != nil {
+	if err := c.prepareRequest(wire, httpReq, nil, requestIdentityBootstrap); err != nil {
 		return inventoryPage[RetainedLease]{}, err
 	}
 
-	resp, err := c.do(httpReq)
+	resp, err := c.do(wire, httpReq)
 	if err != nil {
 		return inventoryPage[RetainedLease]{}, fmt.Errorf("list retentions request failed: %w", err)
 	}
@@ -2885,20 +2981,24 @@ func (c *HTTPClient) fetchRetentionsPage(
 // Health checks if the backend is reachable and healthy.
 // It sends a GET request to /health on the backend.
 func (c *HTTPClient) Health(ctx context.Context) (err error) {
+	wire, err := c.connection()
+	if err != nil {
+		return err
+	}
 	ctx, observation := healthprobe.Start(ctx)
 	status := 0
 	defer func() { observation.Finish(slog.Default().With("backend", c.Name()), healthprobe.Client, status, err) }()
 	// Don't go through circuit breaker for health checks - we want to know actual status
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, wire.baseURL+"/health", nil)
 	if err != nil {
 		return fmt.Errorf("create health request: %w", err)
 	}
 	httpReq.Header.Set(healthprobe.Header, observation.ID())
 
-	if err := c.prepareRequest(httpReq, nil, requestIdentityRead); err != nil {
+	if err := c.prepareRequest(wire, httpReq, nil, requestIdentityRead); err != nil {
 		return err
 	}
-	resp, err := c.do(httpReq)
+	resp, err := c.do(wire, httpReq)
 	if err != nil {
 		return fmt.Errorf("health check failed: %w", err)
 	}

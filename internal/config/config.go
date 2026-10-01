@@ -194,6 +194,14 @@ type BackendConfig struct {
 	TLSSkipVerify     bool   `mapstructure:"tls_skip_verify"`      // DEV ONLY; rejected when production_mode is true
 	TLSClientCertFile string `mapstructure:"tls_client_cert_file"` // client cert for mTLS (set with key)
 	TLSClientKeyFile  string `mapstructure:"tls_client_key_file"`  // client key for mTLS (set with cert)
+
+	// Fenced contains a backend the operator no longer trusts while keeping it
+	// in the topology, so its leases and placements stay accounted for.
+	// providerd sends it nothing (its TLS files are not even loaded), refuses
+	// its callbacks, routes no new lease to it, and ignores its inventory.
+	// Leases placed on it wait until the fence is lifted or the backend is
+	// retired. See SECURITY.md, "Containing a compromised backend".
+	Fenced bool `mapstructure:"fenced"`
 }
 
 // ResolveBackendHMACSecret returns the key assigned to one configured backend.
@@ -686,6 +694,9 @@ func (c *Config) Validate() error {
 	case perBackendSecrets != len(c.Backends):
 		return fmt.Errorf("hmac_secret must be configured on every backend; got %d of %d", perBackendSecrets, len(c.Backends))
 	}
+	if err := c.validateFences(perBackendSecrets != 0); err != nil {
+		return err
+	}
 
 	// callback_canonical_path_prefix is optional; empty preserves direct-call behavior.
 	// When set, it must start with "/" and must not end with "/" so that
@@ -773,6 +784,26 @@ func (c *Config) Validate() error {
 	}
 
 	return c.validatePlacementSnapshots()
+}
+
+// validateFences keeps at least one backend unfenced and requires per-backend
+// keys: under the shared legacy callback_secret, every other backend holds the
+// fenced backend's key, so its callbacks could not be told apart.
+func (c *Config) validateFences(perBackendKeys bool) error {
+	fenced := 0
+	for i, b := range c.Backends {
+		if !b.Fenced {
+			continue
+		}
+		fenced++
+		if !perBackendKeys {
+			return fmt.Errorf("backends[%d].fenced requires a per-backend hmac_secret on every backend", i)
+		}
+	}
+	if fenced != 0 && fenced == len(c.Backends) {
+		return fmt.Errorf("every backend is fenced; at least one backend must stay unfenced")
+	}
+	return nil
 }
 
 // validatePlacementSnapshots checks the snapshot settings only when snapshots

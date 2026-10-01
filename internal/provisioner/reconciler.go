@@ -502,6 +502,15 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				return nil
 			}
 			if metadata := placementRecord.AttemptMetadata(); metadata.Valid() {
+				if _, attemptFenced := inventory.fenced[placementRecord.Attempt]; attemptFenced {
+					// Redelivery to a fenced backend is refused locally every
+					// time. The attempt is preserved and waits for the fence.
+					deferred.Add(1)
+					metrics.ReconcilerDeferredLeasesTotal.Inc()
+					slog.Debug("reconcile: attempt waits on a fenced backend",
+						"lease_uuid", leaseUUID, "backend", placementRecord.Attempt)
+					return nil
+				}
 				result := r.attemptRecovery.Redeliver(gctx, leaseUUID, projection.projected)
 				switch result.outcome {
 				case attemptRedeliveryAccepted:
@@ -1361,6 +1370,11 @@ func (r *Reconciler) fetchFleetSnapshot(
 		}
 	}
 
+	fenced, fencedErr := r.coordinator.FencedBackendNames()
+	if fencedErr != nil {
+		slog.Error("reconciler cannot enumerate fenced backends", "error", fencedErr)
+	}
+
 	g, gctx := errgroup.WithContext(ctx)
 	if len(backendNames) > 0 {
 		g.SetLimit(len(backendNames)) // Query all backends concurrently
@@ -1377,6 +1391,11 @@ func (r *Reconciler) fetchFleetSnapshot(
 	}
 
 	for _, backendName := range backendNames {
+		if _, isFenced := fenced[backendName]; isFenced {
+			snap.markUnanswered(backendName)
+			metrics.ReconcilerBackendFetchTotal.WithLabelValues(backendName, metrics.FetchOutcomeFenced).Inc()
+			continue
+		}
 		g.Go(func() error {
 			inventory, err := sweep.CollectProvisionInventory(gctx, backendName)
 			if err != nil {
@@ -1706,11 +1725,20 @@ func (r *Reconciler) fetchAllRetentions(
 	storageIdentities := make(map[string]backendidentity.ID, len(backendNames))
 	collected := make(map[string]placement.BackendRetentionInventory, len(backendNames))
 
+	fenced, fencedErr := r.coordinator.FencedBackendNames()
+	if fencedErr != nil {
+		slog.Error("reconciler cannot enumerate fenced backends", "error", fencedErr)
+	}
+
 	g, gctx := errgroup.WithContext(ctx)
 	if len(backendNames) > 0 {
 		g.SetLimit(len(backendNames))
 	}
 	for _, backendName := range backendNames {
+		if _, isFenced := fenced[backendName]; isFenced {
+			answered[backendName] = false
+			continue
+		}
 		g.Go(func() error {
 			inventory, err := sweep.CollectRetentionInventory(gctx, backendName)
 			if err != nil {

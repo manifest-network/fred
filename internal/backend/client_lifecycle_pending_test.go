@@ -28,13 +28,13 @@ func TestLifecyclePendingRequiresExactUnavailableEnvelope(t *testing.T) {
 				id, idErr := maintenanceid.New()
 				require.NoError(t, idErr)
 				client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "pending-invalid", BaseURL: "http://backend.invalid", CBFailureThresh: 1})
-				client.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
+				client.wire.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
 					return &http.Response{StatusCode: tc.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.body))}, nil
 				})
 				var err error
 				if operation == "deprovision" {
 					err = client.Deprovision(t.Context(), "lease")
-					require.False(t, DeprovisionNotDispatched(client, "lease", err))
+					require.Equal(t, DeprovisionRefusalUnproven, DeprovisionRefusalOf(client, "lease", err))
 					require.False(t, DeprovisionLifecyclePending(client, "lease", err))
 				} else {
 					var outcome MaintenanceCallOutcome

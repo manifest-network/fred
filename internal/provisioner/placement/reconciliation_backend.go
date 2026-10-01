@@ -41,6 +41,22 @@ func (authority *ReconciliationCoordinator) BackendNames() ([]string, error) {
 	return backendNames(authority.backends)
 }
 
+// FencedBackendNames names the bound backends whose clients are fenced. Their
+// inventory is never requested: reconciliation records them as fenced rather
+// than unanswered.
+func (authority *ReconciliationCoordinator) FencedBackendNames() (map[string]struct{}, error) {
+	if !authority.Valid() {
+		return nil, errors.New("reconciliation coordinator is invalid")
+	}
+	fenced := make(map[string]struct{})
+	for _, candidate := range authority.backends.Backends() {
+		if backend.IsFenced(candidate) {
+			fenced[candidate.Name()] = struct{}{}
+		}
+	}
+	return fenced, nil
+}
+
 func (authority *ReconciliationCoordinator) routeProvision(
 	ctx context.Context,
 	leaseUUID, sku string,
@@ -59,6 +75,9 @@ func (authority *ReconciliationCoordinator) routeProvision(
 			return reconciliationProvisionRoute{}, ErrProvisionRouteUnresolvable
 		}
 		candidate, err = exactBackend(authority.backends, current.Backend)
+		if err == nil && backend.IsFenced(candidate) {
+			return reconciliationProvisionRoute{}, nil
+		}
 	} else {
 		candidate = authority.backends.RouteForProvisionAmong(ctx, sku, eligible, inFlight)
 		if util.IsNilInterface(candidate) {

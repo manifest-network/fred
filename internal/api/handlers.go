@@ -1672,11 +1672,18 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 		for _, result := range backendResults {
 			metrics.HealthCheckDuration.WithLabelValues(healthCheckBackend, result.Name).Observe(result.ProbeDuration().Seconds())
 			checkKey := "backend:" + result.Name
-			if result.Healthy {
+			switch {
+			case result.Healthy:
 				checks[checkKey] = &CheckResult{
 					Status: checkStatusHealthy,
 				}
-			} else {
+			case result.Fenced:
+				// Fenced by configuration: reported, but not a new failure.
+				checks[checkKey] = &CheckResult{
+					Status:  checkStatusUnhealthy,
+					Message: "backend is fenced",
+				}
+			default:
 				slog.Warn("health check: backend unhealthy", "backend", result.Name, "error", result.Error)
 				checks[checkKey] = &CheckResult{
 					Status:  checkStatusUnhealthy,

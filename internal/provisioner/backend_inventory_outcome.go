@@ -18,6 +18,9 @@ const (
 	backendInventoryOutcomeProvisionsOnly
 	backendInventoryOutcomeRetentionsOnly
 	backendInventoryOutcomeUnanswered
+	// backendInventoryOutcomeFenced: the operator fenced the backend, so it
+	// was not asked. Distinct from unanswered so silence alerts can skip it.
+	backendInventoryOutcomeFenced
 )
 
 // backendInventoryOutcomes lists every exported outcome.
@@ -28,6 +31,7 @@ var backendInventoryOutcomes = [...]backendInventoryOutcome{
 	backendInventoryOutcomeProvisionsOnly,
 	backendInventoryOutcomeRetentionsOnly,
 	backendInventoryOutcomeUnanswered,
+	backendInventoryOutcomeFenced,
 }
 
 // classifyBackendInventory maps which endpoints answered, and how the sweep
@@ -71,6 +75,8 @@ func (outcome backendInventoryOutcome) label() string {
 		return metrics.InventoryOutcomeRetentionsOnly
 	case backendInventoryOutcomeUnanswered:
 		return metrics.InventoryOutcomeUnanswered
+	case backendInventoryOutcomeFenced:
+		return metrics.InventoryOutcomeFenced
 	default:
 		return ""
 	}

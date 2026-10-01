@@ -54,7 +54,9 @@ func callbackKeys(
 				configuredBackend.Name, storageID,
 			)
 		}
-		keys[storageID] = api.CallbackKey{Backend: configuredBackend.Name, Keys: verifyKeys}
+		keys[storageID] = api.CallbackKey{
+			Backend: configuredBackend.Name, Keys: verifyKeys, Fenced: configuredBackend.Fenced,
+		}
 	}
 	return keys, nil
 }
@@ -86,6 +88,7 @@ func preparePlacementBackends(
 		cfg.PlacementStoreDBPath,
 		cfg.ProviderUUID,
 		placement.WithCallbackRouteFactory(callbackRoutes),
+		placement.WithFencedBackends(cfg.FencedBackendNames()),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open prepared placement authority: %w", err)
@@ -203,6 +206,7 @@ func newProductionBackendClient(
 		RequestDuration:         metrics.BackendRequestDuration,
 		RequestsTotal:           metrics.BackendRequestsTotal,
 		CircuitBreakerState:     metrics.BackendCircuitBreakerState,
+		Fenced:                  metrics.BackendFenced,
 		MalformedErrorBodyTotal: metrics.BackendMalformedErrorBodyTotal,
 	}, resolver)
 	if err != nil {
@@ -241,6 +245,11 @@ func attestPinnedBackendIdentitiesWithin(
 		group.Go(func() error {
 			if util.IsNilInterface(entry.Backend) {
 				return errors.New("backend identity attestation received a nil backend")
+			}
+			if backend.IsFenced(entry.Backend) {
+				slog.Warn("backend is fenced; its storage identity is not attested",
+					"backend", entry.Backend.Name())
+				return nil
 			}
 			err := entry.Backend.Health(groupCtx)
 			if err == nil {

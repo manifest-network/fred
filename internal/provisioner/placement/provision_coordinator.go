@@ -514,6 +514,11 @@ func (authority *ProvisionCoordinator) routeProvision(
 		return provisionRoute{}, fmt.Errorf("%w: lease %s has unusable placement", ErrProvisionRouteUnresolvable, leaseUUID)
 	case StateConfirmed:
 		candidate, err = exactBackend(authority.backends, current.Backend)
+		if err == nil && backend.IsFenced(candidate) {
+			// The lease lives on a fenced backend: it waits, and no attempt is
+			// written against a backend that cannot be asked.
+			return provisionRoute{}, nil
+		}
 	case StateAbsent, StateAttempting:
 		if eligible != nil {
 			candidate = authority.backends.RouteForProvisionAmong(ctx, sku, eligible, inFlight)

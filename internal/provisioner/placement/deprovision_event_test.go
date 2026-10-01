@@ -468,3 +468,35 @@ func TestDeprovisionEventUnaccountableOwnerCannotBeHiddenByPendingConfiguredBack
 	require.ErrorIs(t, result.Err(), ErrDeprovisionAuthorityUnresolvable)
 	require.False(t, result.Deferred().Valid(), "the missing historical owner cannot be replaced by a configured backend's wait")
 }
+
+// Deferral reasons merge upward. A close waits on the fence only when every
+// failed call was a fenced refusal; any wait time can resolve takes over, and
+// an unknown outcome poisons the aggregate.
+func TestDeprovisionDeferralMergeOrder(t *testing.T) {
+	call := func(disposition deprovisionCallDisposition) deprovisionBackendCall {
+		return deprovisionBackendCall{disposition: disposition}
+	}
+	fenced, circuit := call(deprovisionCallFenced), call(deprovisionCallNotDispatched)
+	pending, unknown := call(deprovisionCallLifecyclePending), call(deprovisionCallUnknown)
+	merge := func(calls ...deprovisionBackendCall) DeprovisionDeferralReason {
+		deferral := DeprovisionDeferredBackendFenced
+		for _, result := range calls {
+			deferral = result.mergeDeferral(deferral)
+		}
+		return deferral
+	}
+	for name, test := range map[string]struct {
+		calls []deprovisionBackendCall
+		want  DeprovisionDeferralReason
+	}{
+		"only fenced":            {[]deprovisionBackendCall{fenced, fenced}, DeprovisionDeferredBackendFenced},
+		"fenced then circuit":    {[]deprovisionBackendCall{fenced, circuit}, DeprovisionDeferredBackendUnavailable},
+		"circuit then fenced":    {[]deprovisionBackendCall{circuit, fenced}, DeprovisionDeferredBackendUnavailable},
+		"fenced and pending":     {[]deprovisionBackendCall{fenced, pending}, DeprovisionDeferredLifecycle},
+		"pending then fenced":    {[]deprovisionBackendCall{pending, fenced}, DeprovisionDeferredLifecycle},
+		"circuit then pending":   {[]deprovisionBackendCall{circuit, pending}, DeprovisionDeferredLifecycle},
+		"unknown poisons fenced": {[]deprovisionBackendCall{fenced, unknown, fenced}, ""},
+	} {
+		assert.Equal(t, test.want, merge(test.calls...), name)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
@@ -465,4 +467,111 @@ func TestNewProductionBackendClientSignsWithBackendSpecificKey(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.NoError(t, client.Health(t.Context()))
+}
+
+func TestCallbackKeysMarkFencedBackendsClassifyOnly(t *testing.T) {
+	t.Parallel()
+	idA := startupStorageID(t, "253b5115-e341-40ee-8686-bb56f1d795d4")
+	idB := startupStorageID(t, "f547a804-17f8-4977-99c8-1154a939d899")
+	cfg := &config.Config{Backends: []config.BackendConfig{
+		{Name: "backend-a", HMACSecret: "backend-a-secret-0123456789abcdef"},
+		{Name: "backend-b", HMACSecret: "backend-b-secret-0123456789abcdef", Fenced: true},
+	}}
+	keyring, err := callbackKeys(cfg, startupIdentityResolver{"backend-a": idA, "backend-b": idB})
+	require.NoError(t, err)
+	assert.False(t, keyring[idA].Fenced)
+	assert.True(t, keyring[idB].Fenced, "a fenced backend's key may only classify its refused callbacks")
+}
+
+func TestAttestPinnedBackendIdentitiesSkipsAFencedBackend(t *testing.T) {
+	t.Parallel()
+	policy, err := backend.NewFencedConnectionPolicy("fenced")
+	require.NoError(t, err)
+	fenced, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{},
+		startupIdentityResolver{"fenced": startupStorageID(t, "253b5115-e341-40ee-8686-bb56f1d795d4")})
+	require.NoError(t, err)
+	called := make(chan string, 1)
+	require.NoError(t, attestPinnedBackendIdentities(t.Context(), []backend.BackendEntry{
+		{Backend: fenced},
+		{Backend: &startupHealthBackend{name: "available", called: called}},
+	}))
+	assert.Equal(t, "available", <-called)
+}
+
+// startupFencedProviderConfig prepares a two-backend authority and fences
+// backend-b, as an operator would after its compromise.
+func startupFencedProviderConfig(t *testing.T, liveURL, fencedURL string, idA, idB backendidentity.ID) *config.Config {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "placements.db")
+	names := []string{"backend-a", "backend-b"}
+	chainProof, err := placement.NewFreshChainProof(startupChainSnapshot{})
+	require.NoError(t, err)
+	empty := func(id backendidentity.ID) placement.BackendInventory {
+		return placement.BackendInventory{
+			StorageIdentity: id, Provisions: []string{},
+			ProvisionProviderUUIDs: map[string]string{}, Retentions: []string{},
+		}
+	}
+	backendProof, err := placement.NewFreshBackendProof(names, map[string]placement.BackendInventory{
+		"backend-a": empty(idA), "backend-b": empty(idB),
+	})
+	require.NoError(t, err)
+	target, err := placement.NewFreshInitializationTarget(path, startupChainSnapshot{}.ProviderUUID(), names)
+	require.NoError(t, err)
+	quiescence, err := placement.ConfirmFreshQuiescence(target, target.Confirmation())
+	require.NoError(t, err)
+	proofCtx, cancelProof := context.WithTimeout(t.Context(), time.Minute)
+	t.Cleanup(cancelProof)
+	plan, err := placement.NewFreshInitializationPlan(proofCtx, target, chainProof, backendProof, quiescence)
+	require.NoError(t, err)
+	require.NoError(t, placement.InitializeFreshStoreContext(t.Context(), plan))
+	return &config.Config{
+		PlacementStoreDBPath: path,
+		ProviderUUID:         startupChainSnapshot{}.ProviderUUID(),
+		CallbackBaseURL:      "https://provider.test",
+		Backends: []config.BackendConfig{
+			{
+				Name: "backend-a", URL: liveURL, Timeout: time.Second, IsDefault: true,
+				HMACSecret: "backend-a-secret-0123456789abcdef",
+			},
+			{
+				Name: "backend-b", URL: fencedURL, Timeout: time.Second, Fenced: true,
+				HMACSecret: "backend-b-secret-0123456789abcdef",
+			},
+		},
+	}
+}
+
+func TestPreparePlacementBackendsFencesTheStoreAndNeverContactsTheFencedBackend(t *testing.T) {
+	idA := startupStorageID(t, "253b5115-e341-40ee-8686-bb56f1d795d4")
+	idB := startupStorageID(t, "f547a804-17f8-4977-99c8-1154a939d899")
+	live := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set(backendidentity.ResponseHeader, idA.String())
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer live.Close()
+	fenced := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		t.Errorf("startup contacted the fenced backend at %s", request.URL.Path)
+	}))
+	defer fenced.Close()
+
+	cfg := startupFencedProviderConfig(t, live.URL, fenced.URL, idA, idB)
+	store, entries, err := preparePlacementBackends(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	require.Len(t, entries, 2)
+	assert.False(t, backend.IsFenced(entries[0].Backend))
+	assert.True(t, backend.IsFenced(entries[1].Backend))
+	assert.InDelta(t, 1, promtestutil.ToFloat64(metrics.BackendFenced.WithLabelValues("backend-b")), 0)
+	assert.InDelta(t, 0, promtestutil.ToFloat64(metrics.BackendFenced.WithLabelValues("backend-a")), 0)
+
+	observations := make(map[string]placement.CompleteBackendObservation, 2)
+	for name, id := range map[string]backendidentity.ID{"backend-a": idA, "backend-b": idB} {
+		observation, err := placement.NewCompleteBackendObservation(id, []backend.ProvisionInfo{}, []backend.RetainedLease{})
+		require.NoError(t, err)
+		observations[name] = observation
+	}
+	require.ErrorIs(t, store.ConfigureBackendTopologyWithCompleteObservations(
+		[]string{"backend-a", "backend-b"}, observations,
+	), placement.ErrBackendTopologyInUse, "the store learned the fence at construction")
 }
