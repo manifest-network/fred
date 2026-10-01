@@ -738,11 +738,26 @@ The set defined today:
 | `RestoreFailed` | A tenant-initiated restore (redeploy from retained data) failed |
 | `VolumeCleanupExhausted` | Volume cleanup on deprovision failed after exhausting all retry attempts |
 | `CleanupFailed` | Cleanup on deprovision failed (containers or volumes) |
+| `BackendStorageLost` | An operator retired the lease's backend because its storage was irrecoverably lost; the lease is closed (or, if pending, rejected) on chain |
 | `Unknown` | Read-boundary default: the lease is `failed` but no specific reason was recorded |
 
 `message` is a short, human-readable string for display; it contains no host filesystem paths or
 raw command/daemon output (that detail is retained operator-side, correlated by `lease_uuid`, for
 support/debugging).
+
+A lease whose backend an operator retired as lost (see DEPLOYMENT.md, "Retiring
+a backend whose storage is lost") is answered from its placement record and no
+backend is asked. Its status reports `provision_status: failed` with
+`reason: BackendStorageLost`. Provision, connection, logs, releases, restart,
+and update, and a restore that names it as the source, answer:
+
+```json
+{"error":"the backend storage holding this lease was irrecoverably lost","code":410,"reason":"backend_storage_lost"}
+```
+
+The data on the lost storage cannot be recovered; do not retry. These answers
+hold until the lease has ended on chain and a later sweep prunes its placement
+row; from then on it is answered like any other ended lease.
 
 ### Get Container Logs
 
@@ -844,16 +859,33 @@ settled, retrying the exact same key and command returns its durable result
 without starting another replacement; reusing the key for a different command
 or update payload returns `409`. A
 different key also returns `409` while an earlier command is unresolved. Fred
-keeps terminal provider receipts for the lifetime of the lease's placement or
-lifecycle authority, and pending commands until they are definitively settled.
-Removing the lease's final placement or lifecycle authority atomically reclaims
-its terminal receipts in the same database transaction. The provider and
-backend therefore agree permanently whether a live-lease key names
-completed work; divergent reuse remains a conflict, and an arbitrarily late
-retry cannot restart work or move the provider's desired payload backward.
+keeps the receipts of the lease's 1,024 most recent restarts and updates, and
+pending commands until they are definitively settled; admitting a newer command
+evicts the oldest settled receipt, and closing the lease reclaims the rest.
 Clients must generate a fresh UUIDv4 for each new logical command and reuse it
-only for retries. A live lease that reaches the 1,024-receipt safety ceiling is
-refused before dispatch rather than forgetting an identity.
+only for retries, so a retry within the last 1,024 commands always replays its
+result. Never reuse a key for a new command: a key Fred has forgotten may still
+name an earlier release on the backend, and is then refused with `409`.
+
+Each command carries the time Fred admitted it, and Fred stamps a lease's
+commands in strictly increasing order. A backend refuses any restart or update
+it no longer has a receipt for and that is not newer than the newest command it
+has accepted for the lease, so an arbitrarily late or replayed command can
+never run again, restart work twice, or move the provider's desired payload
+backward. Such a command settles as `410 Gone` with
+`reason: maintenance_expired`; it did not run. Send a new command with a new
+key.
+
+For clients written before `Idempotency-Key` existed, an operator can list
+tenant addresses in `maintenance_legacy_idempotency_tenants`. A restart or update
+from a listed tenant may then omit the header: Fred authenticates the request
+first, which consumes its single-use signed token, and keys the command by that
+token. Each accepted token is one command, as before keys existed, and a
+replayed token is refused with `401`; a retry therefore needs a new token and is
+a new command. Every such request logs a WARN and increments
+`fred_api_maintenance_legacy_key_total`. A malformed or repeated header is still
+refused with `400` before authentication, and an unlisted tenant that omits the
+header receives `400`.
 
 The provider shares a separate budget of 1,024 pending commands and 64 MiB of
 journal content, including 512 bytes of phase-growth allowance per command.
@@ -898,6 +930,11 @@ Once established, an unrelated backend outage does not revoke it.
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - The key conflicts with a prior command, another command is
   pending, or the lease is in a state that cannot be restarted
+- `410 Gone` with `reason: backend_storage_lost` - The lease's backend was
+  retired because its storage was lost; the lease is being ended on chain
+- `410 Gone` with `reason: maintenance_expired` - The command is older than the
+  lease's retained maintenance history and was not run; send a new command with
+  a new key
 - `429 Too Many Requests` with `reason: maintenance_capacity_reserved` - Shared
   capacity is reserved for a tenant without pending work; this new command was
   not recorded. Retry after your pending work completes (`Retry-After: 1`)
@@ -964,6 +1001,11 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - The key conflicts with a prior command, another command is
   pending, or the lease is in a state that cannot be updated
+- `410 Gone` with `reason: backend_storage_lost` - The lease's backend was
+  retired because its storage was lost; the lease is being ended on chain
+- `410 Gone` with `reason: maintenance_expired` - The command is older than the
+  lease's retained maintenance history and was not run; send a new command with
+  a new key
 - `429 Too Many Requests` with `reason: maintenance_capacity_reserved` - Shared
   capacity is reserved for a tenant without pending work; this new command was
   not recorded. Retry after your pending work completes (`Retry-After: 1`)
@@ -1060,6 +1102,7 @@ off to a complete durable close intent before teardown.
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - The source has no placement record, is not `CLOSED` or `EXPIRED`, belongs to another tenant/provider, or its configured backend reports no retained data (including retention that has expired)
 - `409 Conflict` - Source or target lifecycle work is already in progress, or the target is not `PENDING`, has an unresolved durable provision/restore attempt, or is not in a restorable state
+- `410 Gone` with `reason: backend_storage_lost` - The source's backend was retired because its storage was lost; its data cannot be restored
 - `422 Unprocessable Entity` - The retained data exceeds a requested smaller tier's `disk_mb` cap; the response relays the backend's bounded, recognized refusal detail
 - `500 Internal Server Error` - The restore returned an unexpected or ambiguous backend result, such as a transport error, timeout, generic 5xx, coded already-provisioned response, or unknown refusal code; the durable target attempt is retained until positive evidence confirms it or an operator safely repairs it
 - `502 Bad Gateway` - The backend rejected the restore with an unusable or off-contract error response
@@ -1938,11 +1981,18 @@ sweep or operator repair. This partial inventory cannot establish a new
 admission baseline or prove an empty backend. Identity, refresh, or malformed
 endpoint failures still reject the backend's entire response.
 
-After an interrupted sweep or process restart, fresh paired responses matching
-every configured storage pin can retire inherited inventory fencing once the
+After an interrupted sweep or process restart, fresh paired responses from
+every backend that reported a positive during the interrupted sweep chain, each
+matching its storage pin, can retire inherited inventory fencing once the
 projection durably accounts for every positive, including quarantined leases.
-This endpoint-coverage proof does not establish a new admission baseline or
-prove a backend empty.
+The Store journals each such reporter durably before its positive can become a
+lease barrier, so a backend that stayed silent cannot hold the provider fenced.
+Evidence that cannot be attributed to its reporter (failed refresh, identity
+mismatch, malformed rows, a lease in both endpoints of one backend, or a
+rejected response) returns the chain to the whole-topology rule before it is
+used, as does a marker written before reporter tracking: those need paired
+responses from every configured backend. This endpoint-coverage proof does not
+establish a new admission baseline or prove a backend empty.
 
 ```
 Chain state       Backend inventory       Durable placement/attempts
@@ -1988,6 +2038,8 @@ Chain state       Backend inventory       Durable placement/attempts
 | CLOSED/REJECTED/EXPIRED | Provisioned | Orphan candidate: bounded exact chain re-read, then deprovision only if still terminal |
 | Not found in the PENDING/ACTIVE sweep | Provisioned | Orphan candidate: exact chain re-read; absence, query failure, `UNSPECIFIED`, or a future state defers cleanup |
 | UNSPECIFIED or unknown future state | Any | **Defer — no action; never infer terminality** |
+| ACTIVE / PENDING | Placement lost with a retired backend | Close / reject on chain (`backend storage lost`); never provision |
+| ACTIVE | No placement row, and a retirement could not prove every live lease had one | Close on chain as lost; never provision |
 | PENDING/ACTIVE | Placement conflict/unusable, or unresolved attempt | **Defer — no action this sweep** |
 | PENDING/ACTIVE | Positive membership from a rejected inventory endpoint (`untrusted_positive`) | **Durably quarantine — do not treat the rejected payload as ownership or its removal as absence** |
 | PENDING/ACTIVE | Positive report disagrees with confirmed placement | **Defer — no action this sweep** |
@@ -1995,7 +2047,10 @@ Chain state       Backend inventory       Durable placement/attempts
 | PENDING/ACTIVE | Owning backend did not answer | **Defer — no action this sweep** |
 
 For live (`PENDING`/`ACTIVE`) chain leases, the placement-safety rows take
-precedence over every normal state row. A positive backend report is not
+precedence over every normal state row. A placement lost with a retired
+backend (see DEPLOYMENT.md, "Retiring a backend whose storage is lost") is
+terminal, needs no backend's answer, and is decided ahead of them all; the
+sweep-wide safety gates can still defer the close to a later sweep. A positive backend report is not
 sufficient when the durable record remains unusable, still has an unresolved
 attempt, or names a different confirmed owner.
 A confirmed owner must remain configured and must answer the sweep. Anything

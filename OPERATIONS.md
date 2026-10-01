@@ -185,6 +185,8 @@ when later probes or recovery passes succeed.
 | `fred_docker_backend_lease_actor_stuck_seconds > 900` | Some actor's `handle()` has been running for >15 min | See [Wedged lease actor](#wedged-lease-actor-docker-backend) |
 | `fred_docker_backend_lease_actor_panics_total > 0` | Bug — actor handler panicked | Check logs for stack trace, file an issue |
 | `fred_docker_backend_maintenance_readiness_pending_total` rising with long-lived pending maintenance | Exact maintenance remains pending while startup age or health readiness is uncertain; retries count again | Correlate the once-per-intent/branch warning with container health. A committed target is not rolled back solely because readiness stays uncertain |
+| `fred_docker_backend_maintenance_expired_total` rising | A provider sent restarts or updates older than their lease's retained history, typically after a placement database was restored from an older copy and replayed its pending commands. If the provider's clock also stepped back, its new commands expire until the clock passes the newest stamp it issued before the restore | Each command was refused before mutation and settles for the tenant as `410 maintenance_expired`. Check for a recent placement database restore and the provider host's clock. Nothing needs repair |
+| `fred_docker_backend_maintenance_receipts_unverifiable_total` rising | A failed maintenance receipt's target release row is gone or divergent, typically compacted away by the lease's later large updates. The receipt no longer authorizes cleanup, so a late container from that failed generation would be kept rather than removed | Inspect the `failed maintenance receipt target cannot be verified` log for the lease and maintenance ID. Nothing is blocked; if a stray container for that maintenance ID appears, remove it only after confirming it is not the lease's active cohort |
 | `fred_docker_backend_maintenance_recovery_deferred_total` rising | A lease-local observation conflict retains its intent while sibling recovery proceeds | Inspect the lease-scoped recovery warning and substrate identity; do not delete the intent or release its reserved capacity manually |
 | `fred_docker_backend_network_reclamation_total{outcome=~"error|list_error|budget_exhausted"}` sustained | The separate bounded network worker cannot drain its backlog in a pass | Check Docker errors, idle network count and address-pool headroom. Only `outcome="removed"` counts actual removals; active, connected or busy tenants are safe deferrals. This worker does not spend the operation-recovery budget |
 | `fred_docker_backend_lease_terminal_event_dropped_total` rising under clean shutdown | Real data loss pattern | The release store / provision struct may be out of sync with Docker — reconciler will re-detect on next cycle, but root-cause the wedged actor |
@@ -199,6 +201,7 @@ when later probes or recovery passes succeed.
 | `fred_reconciler_last_success_timestamp_seconds` stalled | Reconciler is stuck, panicking, running with incomplete inventory, or failing an external read/durable projection — only a complete successful projection advances this | Check `fred_reconciler_sweep_complete` first: 0 means a sweep is in progress or the latest sweep did not complete a durable full-fleet projection, not that the durable topology baseline was revoked. Then inspect `fred_reconciler_backend_fetch_total{outcome!="ok"}`, chain health, placement-write logs, and `fred_reconciler_runs_total{outcome="error"}` |
 | `fred_reconciler_backend_fetch_total{outcome!="ok"}` sustained for one backend across ≥3 sweeps (~6 min at a 2m interval) | That backend is unreachable from providerd. Its owner-affine leases are deferred and inventory silence changes no attempt or conflict. With an established baseline, safe callbacks/status/cleanup can continue and the reconciler may use nodes that answered both inventories for genuinely new recordless `PENDING` work | [Backend unreachable during reconciliation](#backend-unreachable-during-reconciliation) |
 | `fred_reconciler_sweep_complete == 0` sustained | The last fleet observation was incomplete. The gauge becomes 0 before every sweep and remains there while it is in progress or after any chain read, provision/retention inventory, or durable projection failure. It is observability, not a fleet-wide authority switch: a matching durable baseline may remain healthy, while the reconciler narrows recordless `PENDING` admission to the exact answering-node scope and defers lease-specific unsafe work | Inspect backend fetch outcomes, chain health, reconciliation errors, placement-write failures, and deferred lease logs. Do not infer that all mutations are blocked or that absence on a silent node is evidence |
+| `fred_provisioner_reconciler_lost_leases_total{outcome="error"}` sustained | The reconciler cannot end a lease that was lost with a retired backend: the chain transaction or the lease re-read keeps failing | Check the `failed to end lost lease on chain` log and the signer and chain health. Each failure is a lease error, so the sweep reports `partial` and `fred_reconciler_last_success_timestamp_seconds` stops advancing until the close succeeds; each sweep retries. `closed`/`rejected` rise as each lost lease is ended after a retirement (see DEPLOYMENT.md, "Retiring a backend whose storage is lost") |
 | `fred_provisioner_reconciler_deferred_leases_total` rising while `fred_reconciler_sweep_complete == 1` | Every backend answered, but one or more leases still lacked a safe, current lifecycle decision: ownership was ambiguous, placement was unusable or unresolved, or an operation/placement change crossed the inventory boundary. A low rate during provisioning, restore, or other lease churn is expected | Correlate the lease-level `reconcile: deferring lease` logs with operation Registry and placement changes. Investigate a sustained rate or the same lease repeating without concurrent work; it can indicate a stuck unresolved record or unusually slow sweeps |
 | `fred_reconciler_cleanup_skips_total{reason="chain_unknown"}` rising | Fred is declining to clean up state for a lease **the chain has no record of**, and will decline again every sweep — this one does not self-heal. Either providerd is pointed at the wrong or a reset chain (check the `pass` label spread: fleet-wide means config, one lease means a phantom), or a provision exists that no lease ever created | Confirm the chain endpoint and provider UUID first. If the chain is right, the resource is genuinely unowned: deprovision it by hand once you have confirmed the tenant is gone |
 | `fred_reconciler_cleanup_skips_total{reason="chain_unknown_state"}` rising | The chain reports a lease state this providerd build cannot classify — either the zero `UNSPECIFIED`, or a state added to the ledger after this binary shipped. Cleanup is withheld, which is data-safe but permanent for those leases | **Upgrade fred** to a build whose `manifest-ledger` pin knows the new state. Unlike `chain_unknown` the chain is fine and providerd is behind it, so do not go looking for a phantom provision |
@@ -1220,10 +1223,21 @@ That availability rule assumes the preceding inventory sweep ended cleanly. If
 providerd restarts with an interrupted-sweep marker in `placements.db`, a lost
 positive observation may not yet be represented by any placement row. Fred then
 withholds fresh lease side effects—even owner-affine maintenance and
-cleanup—until a projection covers every configured, pinned backend endpoint and
-durably accounts for every positive. Constructor-issued paired-topology coverage
-can retire this inherited fence even when individual leases remain quarantined;
-it cannot establish a new admission baseline or prove an empty backend.
+cleanup—until every backend that reported a positive during the interrupted
+sweep chain answers both endpoints again, matching its storage pin, and the
+projection durably accounts for every positive. Fred journals each reporter
+before its positive can take effect, so a backend that was already down during
+the interrupted sweep does not keep the whole provider fenced. Every configured
+backend is still needed when the interrupted chain held evidence Fred could not
+attribute to its reporter (a failed refresh, an identity that does not match
+the pin, malformed rows, a lease in both endpoints of one backend, or a rejected
+endpoint response), and for a marker written by an earlier revision. The WARN
+log `placement inventory recovery pending` names the `reporters` (or every
+configured backend) recovery is waiting for.
+`/readyz` then reports `placement inventory recovery pending`, and
+`fred_placement_inventory_recovery_pending` is 1. The coverage proof can retire
+this inherited fence even when individual leases remain quarantined; it cannot
+establish a new admission baseline or prove an empty backend.
 Exact authenticated callback settlement and replay of already-durable attempts
 or maintenance commands remain available. An increase in
 `fred_placement_write_failures_total` accompanied by “inventory sweep marker
@@ -2142,7 +2156,7 @@ open, or known bad magic):
 1. **Stop the service**.
 2. **Move the file aside** rather than deleting (`mv X.db X.db.broken`) so you can inspect it later if needed.
 3. **Restore the file according to its authority class before restarting.** Some caches may be recreated, but release/retention/callback state should be restored whenever possible.
-4. **For `placement_store_db_path`, restore the exact provider-bound database before starting providerd.** Normal startup never creates, initializes, or migrates a missing/unprepared file. Current chain/backend silence cannot recover a lost authority: if the provider has any chain lease history, including terminal history, restore the database. The explicit fresh initializer is only for a genuinely new provider with zero total lease history, and additionally requires an independently supplied exact fleet roster, complete identity-consistent empty provision and retention inventories from every configured backend, and continuous fencing of providerd plus tenant/chain mutation ingress. Each backend stays running so the tool can authenticate its inventories, but must be empty and drained with no in-flight mutation and an idle callback/outbox queue. Its print-time acknowledgement binds the target parent's physical device/inode; do not rename, unmount, or recreate that parent between print and initialize. Publication is descriptor-relative and no-overwrite. Follow [Initializing a genuinely fresh placement authority](DEPLOYMENT.md#initializing-a-genuinely-fresh-placement-authority) for that first-boot workflow. The payload store may start empty (tenants re-upload), and the token tracker may start empty (acceptable, see above); restore each backend callback store whenever any exact delivery could remain.
+4. **For `placement_store_db_path`, restore the exact provider-bound database before starting providerd.** Normal startup never creates, initializes, or migrates a missing/unprepared file. Current chain/backend silence cannot recover a lost authority: if the provider has any chain lease history, including terminal history, restore the database. The explicit fresh initializer is only for a genuinely new provider with zero total lease history, and additionally requires an independently supplied exact fleet roster, complete identity-consistent empty provision and retention inventories from every configured backend, and continuous fencing of providerd plus tenant/chain mutation ingress. Each backend stays running so the tool can authenticate its inventories, but must be empty and drained with no in-flight mutation and an idle callback/outbox queue. Its print-time acknowledgement binds the target parent's physical device/inode; do not rename, unmount, or recreate that parent between print and initialize. Publication is descriptor-relative and no-overwrite. Follow [Initializing a genuinely fresh placement authority](DEPLOYMENT.md#initializing-a-genuinely-fresh-placement-authority) for that first-boot workflow. A restored placement database is older than the one it replaces: run `placement-repair -attest-restored-backup` on it before starting providerd ([Restoring an older placement backup](DEPLOYMENT.md#restoring-an-older-placement-backup)), or a lease dispatched after the backup can be provisioned twice. The payload store may start empty (tenants re-upload), and the token tracker may start empty (acceptable, see above); restore each backend callback store whenever any exact delivery could remain.
 
 Never run two `providerd` or `docker-backend` instances against the same bbolt files — bbolt enforces single-writer with a file lock and the second process will fail to start. If it doesn't fail, you have data corruption coming.
 
@@ -2174,29 +2188,32 @@ restart/update for the old owner fails closed. Afterward the principal is
 durable: a partial sweep or transient outage of another backend does not block
 maintenance on an available owner.
 
-Terminal provider receipts are scoped by lease and key and retained for as long
-as either placement or lifecycle authority for that lease exists. An exact
-replay returns the stable result and a divergent kind or payload returns `409`;
-a different key cannot pass a pending head. At most 1,024 terminal receipts per
-live lease may exist, and capacity is refused before backend dispatch with `503
-Service Unavailable` (it is not misreported as an idempotency-key conflict).
-The transaction that removes the lease's final placement or lifecycle authority
-also reclaims its terminal receipts atomically; startup and periodic command
-recovery never scan lifetime receipt history. The retained full-store sweep is
-an explicit repair/upgrade utility only. Pending never expires. Provider and backend
-therefore use the same lifetime identity boundary: neither can forget a key and
-mistake an arbitrarily late retry for new work. A completed update receipt also
-carries store-assigned ordering, so an older recovered update can never rewrite
-the provider payload store after a later generation. Generate a new UUIDv4 per
-logical action and preserve it for retries.
+Terminal provider receipts are scoped by lease and key. An exact replay
+returns the stable result and a divergent kind or payload returns `409`; a
+different key cannot pass a pending head. Provider and backend each keep a
+rolling window of the lease's 1,024 most recent restart and update receipts,
+and admitting a newer command evicts the oldest settled one, so there is no
+per-lease command limit. The backend keeps a failed update whose late-container
+cleanup is unconfirmed until cleanup attests absence at least an hour after the
+failure, and keeps custom-domain reconciles in their own window of 64. The
+transaction that removes the lease's final placement or lifecycle authority
+reclaims its terminal receipts atomically; startup and periodic command
+recovery never scan history. Pending never expires.
 
-The backend keeps at most 1,024 compact maintenance receipts for the lifetime
-of a live lease. This is a lifetime, not rolling, bound because forgetting an
-old ID would make a delayed provider replay unsafe. The 1,025th command is
-refused before any replacement as coded `503 insufficient_resources`; normal
-successful lease close removes the history. Reaching this bound indicates an
-abnormally maintenance-heavy long-lived lease and requires closing/replacing
-that lease rather than deleting receipt authority by hand.
+Forgetting old keys is safe because ordering does not depend on them: the
+provider stamps each command with its admission time, strictly increasing per
+lease, and the backend refuses a command it no longer has a receipt for that is
+not newer than the newest one it accepted for the lease. Such a command settles
+as `410 maintenance_expired` and never runs. A completed update also carries
+store-assigned ordering, so an older recovered update can never rewrite the
+provider payload store after a later generation. Generate a new UUIDv4 per
+logical action, preserve it for retries, and never reuse it: a forgotten key
+whose release generation the backend still retains is refused with `409`.
+
+A backend refuses a command for capacity, as coded `503
+insufficient_resources` before any replacement, only for an unstamped command
+from an older provider at a full window, or when the window is full of failed
+updates whose cleanup is unconfirmed; the latter clears as cleanup confirms.
 
 **On success**: a `success` callback is sent and the lease's status returns to `ready`. For update, provider settlement occurs only after the accepted payload is durably persisted. Once backend acceptance is durably recorded, recovery performs local payload persistence without another backend call. Positive evidence that the exact lease is closed, rejected, or expired can instead retire the pending command and release its fence; missing, unreadable, foreign, or active chain observations cannot authorize that exit.
 

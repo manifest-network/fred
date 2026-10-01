@@ -1388,6 +1388,19 @@ func TestHandleRestart(t *testing.T) {
 		assert.Contains(t, w.Body.String(), "invalid state for restart")
 	})
 
+	t.Run("an expired restart returns the coded 409", func(t *testing.T) {
+		mb := &mockBackend{
+			RestartFunc: func(context.Context, backend.RestartRequest) error {
+				return fmt.Errorf("probe restart maintenance replay: %w", backend.ErrMaintenanceExpired)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restart", validBody))
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.JSONEq(t, `{"error":"restart is older than the lease's retained maintenance history","code":"maintenance_expired"}`, w.Body.String())
+	})
+
 	t.Run("ErrValidation returns 400", func(t *testing.T) {
 		mb := &mockBackend{
 			RestartFunc: func(context.Context, backend.RestartRequest) error {
@@ -1469,6 +1482,19 @@ func TestHandleUpdate(t *testing.T) {
 
 		assert.Equal(t, http.StatusConflict, w.Code)
 		assert.Contains(t, w.Body.String(), "invalid state for update")
+	})
+
+	t.Run("an expired update returns the coded 409", func(t *testing.T) {
+		mb := &mockBackend{
+			UpdateFunc: func(context.Context, backend.UpdateRequest) error {
+				return fmt.Errorf("publish durable update maintenance intent: %w", backend.ErrMaintenanceExpired)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/update", validBody))
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.JSONEq(t, `{"error":"update is older than the lease's retained maintenance history","code":"maintenance_expired"}`, w.Body.String())
 	})
 
 	t.Run("ErrUnknownSKU returns 400 with validation_code", func(t *testing.T) {

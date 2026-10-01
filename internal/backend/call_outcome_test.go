@@ -2,11 +2,13 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -229,6 +231,10 @@ func TestHTTPClientMintsMaintenanceRefusalCategoryAtResponseBoundary(t *testing.
 		{name: "validation", status: http.StatusBadRequest, body: `{"error":"bad input"}`, refusal: MaintenanceRefusalValidation},
 		{name: "not provisioned", status: http.StatusNotFound, refusal: MaintenanceRefusalNotProvisioned},
 		{name: "invalid state", status: http.StatusConflict, refusal: MaintenanceRefusalInvalidState},
+		{name: "expired", status: http.StatusConflict, body: `{"error":"too old","code":"maintenance_expired"}`, refusal: MaintenanceRefusalExpired},
+		{name: "other coded conflict stays invalid state", status: http.StatusConflict, body: `{"error":"x","code":"already_provisioned"}`, refusal: MaintenanceRefusalInvalidState},
+		{name: "expiry needs the exact envelope", status: http.StatusConflict, body: `{"error":"too old","code":"maintenance_expired","extra":1}`, refusal: MaintenanceRefusalInvalidState},
+		{name: "malformed conflict stays invalid state", status: http.StatusConflict, body: `not json`, refusal: MaintenanceRefusalInvalidState},
 		{name: "capacity", status: http.StatusServiceUnavailable, body: `{"error":"full","code":"insufficient_resources"}`, refusal: MaintenanceRefusalCapacity},
 		{name: "malformed validation", status: http.StatusBadRequest, body: `{"message":"proxy"}`, ambiguous: true},
 	}
@@ -293,4 +299,38 @@ func TestIdentityBoundHTTPClientMintsNoDispatchAtPrivateUpgradeGate(t *testing.T
 	require.True(t, outcome.NotDispatched())
 	assert.False(t, outcome.Ambiguous())
 	assert.ErrorIs(t, outcome.Err(), ErrBackendUpgradeRequired)
+}
+
+func TestMaintenanceRequestsCarryTheAdmissionStampOnlyWhenSet(t *testing.T) {
+	t.Parallel()
+	id, err := maintenanceid.Parse("2b0fb1e9-b9ad-4f52-a93d-69e8eb72830a")
+	require.NoError(t, err)
+	unstamped, err := json.Marshal(RestartRequest{MaintenanceID: id})
+	require.NoError(t, err)
+	assert.NotContains(t, string(unstamped), "admitted_at", "an older backend sees the request it always has")
+	stamp := time.Date(2026, 9, 30, 12, 0, 0, 1, time.UTC)
+	stamped, err := json.Marshal(UpdateRequest{MaintenanceID: id, AdmittedAt: stamp})
+	require.NoError(t, err)
+	assert.Contains(t, string(stamped), `"admitted_at":"2026-09-30T12:00:00.000000001Z"`)
+	var decoded UpdateRequest
+	require.NoError(t, json.Unmarshal(stamped, &decoded))
+	assert.True(t, decoded.AdmittedAt.Equal(stamp))
+}
+
+// TestMaintenanceExpiredRefusalLeavesTheBreakerClosed keeps a burst of expired
+// replays, as after a provider database restore, from opening the circuit for
+// every lease on the backend.
+func TestMaintenanceExpiredRefusalLeavesTheBreakerClosed(t *testing.T) {
+	t.Parallel()
+	id, err := maintenanceid.Parse("2b0fb1e9-b9ad-4f52-a93d-69e8eb72830a")
+	require.NoError(t, err)
+	client := causalOutcomeClientForTest(t, http.StatusConflict, `{"error":"too old","code":"maintenance_expired"}`)
+	client.cb = newUnboundHTTPClientForTest(HTTPClientConfig{
+		Name: "one-failure-circuit", BaseURL: client.baseURL, CBFailureThresh: 1,
+	}).cb
+	for range 3 {
+		outcome := client.restartCall(t.Context(), RestartRequest{MaintenanceID: id})
+		require.True(t, outcome.Refused(), "a counted failure would open the one-failure circuit")
+		assert.Equal(t, MaintenanceRefusalExpired, outcome.Refusal())
+	}
 }

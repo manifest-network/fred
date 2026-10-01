@@ -314,6 +314,8 @@ The full transition matrix lives in [internal/backend/docker/README.md](internal
 
 The lease's **confirmed placement survives close** (only the payload is cleaned up). This is deliberate: it keeps the closed lease's backend resolvable so a later restore can be routed to the node that holds its retained data (restore affinity, ENG-333). A failed re-provision of an `ACTIVE` lease clears only its matching attempt and preserves its confirmed backend. After a `PENDING` operation is successfully rejected on chain, Fred conditionally deletes the entire placement record only when every backend named by the current record belongs to that failed operation; an unusable, foreign-owned, or concurrently revised record is preserved for reconciliation or operator repair.
 
+A **lost placement** is the terminal record `placement-repair -retire-lost-backend` writes for a lease whose data lived on a backend an operator retired as irrecoverably lost (see DEPLOYMENT.md, "Retiring a backend whose storage is lost"). It names only the retired backend, decodes as unusable on every path that does not handle it explicitly, and absorbs every inventory observation, so no backend report can rewrite or adopt it. The reconciler closes (`ACTIVE`) or rejects (`PENDING`) its lease on chain ahead of the per-lease gates, deprovision completes without a backend call, the tenant API answers `410` with reason `backend_storage_lost`, and the row is pruned after an exact terminal chain read.
+
 ### Lease Restore
 
 Restore adopts a soft-deleted lease's retained data into a new lease (see the [docker backend restore flow](internal/backend/docker/README.md#soft-delete--restore)):
@@ -450,11 +452,23 @@ Reconciler interplay (level-triggered backstop):
   restart inherits the marker, a lost positive might name a different owner, a
   retained copy, or unusable identity evidence. Missing or rejected endpoint
   coverage then prevents fresh provision, restore, maintenance, chain-write,
-  prune, or backend-cleanup authority. A sealed full-topology pair matching every
-  existing storage pin can clear inherited fencing after the projection durably
-  represents every positive, including quarantines. That narrower coverage proof
-  does not establish a new baseline, adopt storage identities, or prove a backend
-  empty. Exact durable callback, attempt, and
+  prune, or backend-cleanup authority. Before a backend's first positive in a
+  pending sweep chain can become a lease barrier, the Store journals that
+  backend durably with the marker, so a lost positive can only have come from a
+  journaled reporter. A sealed pair from every journaled reporter, each matching
+  its storage pin, can clear inherited fencing after the projection durably
+  represents every positive, including quarantines. A backend that never
+  reported contributed nothing a restart could lose, so its silence does not
+  hold the provider fenced. Only attributed evidence narrows recovery: a
+  refreshed answer from the backend's pinned storage, with well-formed rows
+  and no lease in both of its endpoints. A response that fails any of those,
+  or that disposal rejects, could name a lease held elsewhere; a sweep would
+  quarantine it until whole-topology coverage, so the Store durably returns the
+  chain to the whole-topology rule before that evidence is used. A marker
+  without a journal, written before reporter tracking, also needs a sealed pair
+  from the whole topology. That
+  narrower coverage proof does not establish a new baseline, adopt storage
+  identities, or prove a backend empty. Exact durable callback, attempt, and
   maintenance-command recovery remains available because it replays recorded
   authority rather than inferring new authority from absence.
   Projected actions are also bound to the Store inventory epoch. Beginning a
@@ -1385,20 +1399,25 @@ store, and only then may the provider replace Pending with a compact terminal
 receipt and release the lease claim. Transport uncertainty retains Pending.
 Authoritative chain evidence that the lease ended or its authority was revoked
 instead writes a terminal cancellation, preventing an immortal command from
-deadlocking close. Terminal provider receipts omit payload bytes, retain the
-SHA-256 fingerprint, and remain exact for as long as placement or lifecycle
-authority for the lease exists. Provider and backend therefore share the same
-lifetime command-identity boundary: neither side can age out a UUID and mistake
-an exact late retry for new asynchronous work. Both histories use an explicit
-ceiling of 1,024 compact receipts per live lease and safely refuse the next
-command before side effects. The transaction that removes the lease's final
-placement or lifecycle authority also reclaims provider receipts atomically;
-startup and periodic command recovery do not scan lifetime history. A retained
-full-store sweep exists only for explicit repair/upgrade. Pending commands never
-expire. The backend's store-assigned completion sequence also
-classifies an older completed update as superseded, preventing a recovered
-request from authorizing that update's stale payload to overwrite a later one.
-Successful close removes the backend receipt set under the permanent
+deadlocking close. Terminal provider receipts omit payload bytes and retain the
+SHA-256 fingerprint. Each side keeps a rolling window of the lease's 1,024 most
+recent restart and update receipts: admitting a newer command evicts the oldest
+settled one (the backend keeps custom-domain reconciles in a separate window of
+64, and keeps a failed update whose late-container cleanup is unconfirmed).
+Ordering does not depend on what is retained. The provider stamps each command
+with its admission time, strictly increasing per lease, and the backend keeps
+the newest stamp it ever accepted for the lease; a command it has no head or
+receipt for that is not newer is refused before side effects as
+`maintenance_expired`, so an evicted UUID can never be mistaken for new work. A
+maintenance ID also names at most one release generation per lease, so a
+forgotten key whose release is still retained is refused as a conflict. The
+transaction that removes the lease's final placement or lifecycle authority
+reclaims provider receipts atomically; startup and periodic command recovery do
+not scan history. Pending commands never expire. The backend's lineage keeps the
+newest settled update's completion sequence, so an older completed update is
+classified as superseded even after the newer receipt has left the window,
+preventing a recovered request from authorizing a stale payload. Successful
+close removes the backend receipt set and lineage under the permanent
 closed-lease fence.
 
 Callback-store health validates every delivery and intent bucket and the
@@ -1709,6 +1728,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 |---|---|---|---|
 | `fred_api_requests_total` | counter | `method, path, status` | API request count. The `path` label is the matched-route TEMPLATE (e.g. `/v1/leases/{lease_uuid}/status`), with a single `unmatched` bucket for requests matching no route — bounding `path` to the finite set of registered routes + 1 (closes an unauthenticated path-scan cardinality vector, ENG-448/F28) |
 | `fred_api_request_duration_seconds` | histogram | `method, path, status` | Request latency |
+| `fred_api_maintenance_legacy_key_total` | counter | — | Restart/update requests accepted without `Idempotency-Key` from a tenant in `maintenance_legacy_idempotency_tenants`, each keyed by its single-use signed token. Falling to zero means the integrator now sends keys and the tenant can be delisted |
 | `fred_api_rate_limit_rejections_total` | counter | `limiter` | `global`: IP budget for tenant/observability routes; `tenant`: authenticated tenant budget; `callback_ingress`: independent callback IP budget; `callback_storage`: verified backend storage budget. No IP, route, tenant, or storage UUID labels |
 | `fred_api_non_in_flight_callbacks_total` | counter | `backend, status` | Callbacks received at ingress outside exact in-flight operation settlement, including observations later dropped by lifecycle policy |
 | `fred_maintenance_pending` | gauge | `phase` | Pending durable commands by closed phase |
@@ -1737,6 +1757,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_provisioner_ack_batch_individual_fallbacks_total` | counter | `lane` | Ack-batch failures that fell back to per-lease retries |
 | `fred_provisioner_reconciler_inflight_skips_total` | counter | — | Ready leases the reconciler skipped because the main flow owns them |
 | `fred_provisioner_reconciler_panics_total` | counter | `stage` | Panics recovered in reconciler goroutines (`process_lease`, `process_orphan`, `fetch_provisions`, `fetch_retentions`, `check_placement_marker`, `placement_cleanup`) — any non-zero is a latent bug; placement-cleanup recovery preserves the exact candidate while unrelated worker lanes continue |
+| `fred_placement_inventory_recovery_pending` | gauge | — | 1 while an interrupted inventory sweep withholds fresh lease side effects until every journaled reporter (every backend, if the sweep held unattributed evidence or predates the journal) answers both endpoints with its pinned storage and every positive is durably represented; 0 otherwise. `/readyz` reports `placement inventory recovery pending` for the same state |
 | `fred_placement_write_failures_total` | counter | — | Failed durable placement mutations or sync verification. Any increase is actionable: a definitely pre-commit failure blocks the backend call and may be retried, while an outcome-unknown bbolt `Commit` error permanently withdraws this process's placement authority for offline classification |
 
 **Reconciler:**
@@ -1750,6 +1771,8 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_reconciler_conflicts_total` | counter | — | Reconciler conflicts (lease already in-flight) |
 | `fred_reconciler_backend_fetch_total` | counter | `backend`, `outcome` | Per-backend provision-list attempts (`ok`, `error`, `circuit_open`). The signal that a single backend is unreachable, which no longer breaks the fleet-wide sweep |
 | `fred_reconciler_sweep_complete` | gauge | — | 0 while a sweep is in progress or after an incomplete/error sweep; 1 only after the most recently completed full-fleet inventory was durably projected. This is an observability signal, not a global admission gate; a matching durable topology baseline survives a 0 |
+| `fred_provisioner_maintenance_receipts_evicted_total` | counter | — | Settled restart and update commands evicted from a lease's rolling window of 1,024 when a newer command was admitted. A retry of an evicted key is a new command |
+| `fred_provisioner_reconciler_lost_leases_total` | counter | `outcome` | Leases whose placement was lost with a retired backend, plus ACTIVE leases with no placement row closed after an unproven retirement: `closed` (ACTIVE), `rejected` (PENDING), `deferred` (an operation was in flight across the sweep, the projection failed, or a sweep-wide safety gate or a busy lease claim held it back), `error` (the lease re-read or chain transaction failed; retried next sweep) |
 | `fred_provisioner_reconciler_deferred_leases_total` | counter | — | Leases skipped because ownership or lifecycle evidence was not safe to act on: a backend was silent, placement was ambiguous/unresolved, or an operation or placement change crossed the inventory boundary. It can increase during a complete sweep under ordinary concurrent lease activity |
 | `fred_reconciler_cleanup_skips_total` | counter | `pass`, `reason` | Destructive cleanup withheld for lack of positive evidence. `pass`: `orphan`, `payload`, `placement`. `reason`: `chain_live`, `chain_unknown`, `chain_unknown_state`, `chain_error`, `backend_silent`, `attempt_pending`. Every value is a deliberate fail-safe refusal to delete; `attempt_pending` means an ambiguity remains while exact same-operation redelivery to the pinned backend, its callback, exact paired-generation inventory, a contract-conforming refusal, or operator repair may settle it. `chain_unknown` (no record — check the endpoint) and `chain_unknown_state` (fred is older than the chain — upgrade it) are the two absence/state reasons that do not self-heal |
 
@@ -1865,6 +1888,8 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total` | counter | `reason` | Exact provision/restore intents classified past their durable admission deadline (`reason="provision_timeout"`, shared by both kinds). Cleanup uncertainty retains the intent and reservation for periodic retry; there is no separate container-start recovery timer |
 | `fred_docker_backend_operation_intent_recovery_cleanup_retries_total` | counter | kind | Deferred exact operation cleanup (`provision`/`restore`); intent and reservation remain for periodic retry |
 | `fred_docker_backend_maintenance_readiness_pending_total` | counter | `branch` | Exact maintenance readiness deferrals by recovery branch; each retry counts, while the warning is emitted once per intent and branch. Readiness uncertainty does not grant rollback authority |
+| `fred_docker_backend_maintenance_expired_total` | counter | — | Provider restarts and updates refused with `409 maintenance_expired` because they are older than their lease's retained maintenance history. Each was refused before mutation; Fred settles it as expired |
+| `fred_docker_backend_maintenance_receipts_unverifiable_total` | counter | — | Per recovery pass, failed maintenance receipts whose target release is missing or divergent (for example after release-history compaction). Each grants no cleanup authority, so a late container for that generation is kept; recovery for every other lease continues |
 | `fred_docker_backend_maintenance_recovery_deferred_total` | counter | — | Lease-local maintenance observation conflicts deferred while sibling recovery continues; preserves the exact intent and reservation |
 | `fred_docker_backend_network_reclamation_total` | counter | `outcome` | Independent bounded network reclamation: `removed`, `absent`, `in_use`, `tenant_active`, `tenant_busy`, `error`, `list_error`, `budget_exhausted`. Only `removed` represents deletion |
 | `fred_docker_backend_terminal_substrate_pending_containers` | gauge | receipt | Last late-container count for permanent `closed`/`failed_operation` receipts; nonzero withholds this backend’s pool capacity/readiness until strict absence |

@@ -446,6 +446,12 @@ callback_base_url: "http://localhost:8080"
 # How often to check sub-signer balances and top up if needed.
 # sub_signer_fund_check_interval: "1h"
 
+# Tenant addresses whose restart/update requests may omit Idempotency-Key.
+# Each keyless request is keyed by its single-use signed token, so a retry is
+# a new command. Only for clients that predate the header; empty (default)
+# keeps it mandatory. Entries must be canonical bech32 account addresses.
+# maintenance_legacy_idempotency_tenants: ["manifest1..."]
+
 # =============================================================================
 # WITHDRAWAL CONFIGURATION
 # =============================================================================

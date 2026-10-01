@@ -400,17 +400,23 @@ func TestPendingMaintenanceStructurallyFencesPlacementMutations(t *testing.T) {
 		"a pending command must fence only its lease, not the inventory batch")
 }
 
-func TestMaintenanceHistoryCapacityRefusesForLiveLeaseWithoutForgettingIdentity(t *testing.T) {
+// TestMaintenanceWindowEvictsTheOldestSettledCommand pins the provider's
+// rolling window: admitting into a full window deletes the oldest settled
+// command, and the new command is stamped strictly after every retained one
+// even when the wall clock has stepped back.
+func TestMaintenanceWindowEvictsTheOldestSettledCommand(t *testing.T) {
 	createdAt := time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC)
-	clock := &fakeClock{now: createdAt.Add(time.Hour)}
+	clock := &fakeClock{now: createdAt.Add(-time.Hour)}
 	store := newTestStore(t, WithClock(clock.Now))
 	authority := prepareMaintenanceLease(t, store)
+	keys := make([][]byte, 0, maxMaintenanceCommandsPerLease)
+	newest := createdAt
 	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
 		_, records, err := maintenanceCommandBuckets(tx)
 		if err != nil {
 			return err
 		}
-		for range maxMaintenanceCommandsPerLease {
+		for index := range maxMaintenanceCommandsPerLease {
 			id, idErr := maintenanceid.New()
 			if idErr != nil {
 				return idErr
@@ -418,13 +424,17 @@ func TestMaintenanceHistoryCapacityRefusesForLiveLeaseWithoutForgettingIdentity(
 			command := testMaintenanceCommand(
 				t, authority, id.String(), MaintenanceCommandRestart, nil,
 			)
+			stamp := createdAt.Add(time.Duration(index) * time.Second)
+			newest = stamp
 			encoded, encodeErr := encodeMaintenanceCommand(
-				command.Command(), MaintenanceOutcomeAccepted, createdAt, createdAt.Add(time.Second),
+				command.Command(), MaintenanceOutcomeAccepted, stamp, stamp.Add(time.Second),
 			)
 			if encodeErr != nil {
 				return encodeErr
 			}
-			if putErr := records.Put(maintenanceReceiptKey(maintenanceLease, id), encoded); putErr != nil {
+			key := maintenanceReceiptKey(maintenanceLease, id)
+			keys = append(keys, key)
+			if putErr := records.Put(key, encoded); putErr != nil {
 				return putErr
 			}
 		}
@@ -433,16 +443,24 @@ func TestMaintenanceHistoryCapacityRefusesForLiveLeaseWithoutForgettingIdentity(
 	extra := testMaintenanceCommand(
 		t, authority, maintenanceIDA, MaintenanceCommandRestart, nil,
 	)
-	_, err := store.beginMaintenanceCommand(extra)
-	assert.ErrorIs(t, err, ErrMaintenanceHistoryFull)
+	admission, err := store.beginMaintenanceCommand(extra)
+	require.NoError(t, err, "a full window admits by evicting, never refuses")
 	claims, pendingErr := store.pendingMaintenanceCommands()
 	require.NoError(t, pendingErr)
-	assert.Empty(t, claims)
-
-	clock.now = createdAt.Add(100 * 365 * 24 * time.Hour)
-	_, err = store.beginMaintenanceCommand(extra)
-	assert.ErrorIs(t, err, ErrMaintenanceHistoryFull,
-		"age cannot erase a live lease's exact command identity")
+	require.Len(t, claims, 1)
+	assert.True(t, admission.command.AdmittedAt().Equal(newest.Add(maintenanceStampStep)),
+		"a stepped-back clock still stamps after every retained command")
+	assert.True(t, claims[0].Command().AdmittedAt().Equal(admission.command.AdmittedAt()),
+		"the stamp is durable, so recovery dispatches the same value")
+	require.NoError(t, store.db.View(func(tx *bolt.Tx) error {
+		_, records, err := maintenanceCommandBuckets(tx)
+		if err != nil {
+			return err
+		}
+		assert.Nil(t, records.Get(keys[0]), "the oldest settled command left the window")
+		assert.NotNil(t, records.Get(keys[1]))
+		return nil
+	}))
 }
 
 func TestMaintenanceSettlementClampsBackwardWallClock(t *testing.T) {

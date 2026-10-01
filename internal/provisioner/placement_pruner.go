@@ -252,8 +252,11 @@ schedule:
 				// keeping a young one is harmless (processOrphan GCs the real resource and
 				// a closed lease is never restored) — so we never prune within 2× the
 				// reconcile interval, comfortably longer than one sweep.
+				// A lost row is exempt: admission refuses it, so no provision can
+				// be in flight, and its SetAt is the retirement time.
 				grace := 2 * p.interval
-				if !record.SetAt.IsZero() && grace > 0 && now.Sub(record.SetAt) < grace {
+				_, lost := record.LostBackend()
+				if !lost && !record.SetAt.IsZero() && grace > 0 && now.Sub(record.SetAt) < grace {
 					// Log the raw timestamps rather than a derived age: now is the
 					// sweep-start time, so a placement Set during this sweep has
 					// set_at > sweep_start (a negative "age") — the timestamps make

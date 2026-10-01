@@ -480,6 +480,8 @@ func classifyMaintenanceCall(observed backend.MaintenanceCallOutcome) (maintenan
 			return maintenanceSettlement{outcome: MaintenanceOutcomeValidationRejected, detail: observed.RefusalDetail()}, true
 		case backend.MaintenanceRefusalCapacity:
 			return maintenanceSettlement{outcome: MaintenanceOutcomeCapacityRefused}, true
+		case backend.MaintenanceRefusalExpired:
+			return maintenanceSettlement{outcome: MaintenanceOutcomeExpired}, true
 		default:
 			return maintenanceSettlement{outcome: MaintenanceOutcomePending}, false
 		}

@@ -8,6 +8,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `placement-repair -retire-lost-backend` retires a backend whose storage is
+  irrecoverably lost, which was previously impossible: Fred refuses to drop a
+  backend while leases refer to it, so such a backend stranded its leases
+  forever. The dry run lists every lease the backend owned, which of them a
+  survivor also reported, and every pending restart or update it settles. It
+  probes the backend once and refuses if the answer is the backend's own
+  pinned storage or any other storage the database has ever pinned, including
+  a removed or retired backend's. The apply takes an exact
+  confirmation and a lost-storage attestation, publishes an exact backup, and
+  writes the retirement in one transaction. `providerd` then closes each lost
+  ACTIVE lease and rejects each lost PENDING lease on chain with reason
+  `backend storage lost`, never provisions them elsewhere, and prunes them
+  once the chain shows them terminal; `fred_provisioner_reconciler_lost_leases_total`
+  counts it. Until the prune, tenants see `provision_status: failed` with reason
+  `BackendStorageLost`, and `410 Gone` with reason `backend_storage_lost` on
+  provision, connection, logs, releases, restart, update, and restore from a
+  lost source. A retired name can never rejoin, and its storage cannot be
+  claimed by another name. Older binaries refuse a database that records a
+  retirement. See DEPLOYMENT.md, "Retiring a backend whose storage is lost".
+- `docker-backend -audit-storage-identity-adoption` reports every v0.13 shape
+  that blocks storage-identity adoption in one read-only pass, as JSON, where
+  the preflight stops at the first. Each finding carries its class, an
+  advisory remedy, and the lease or volume it is about; the output also lists
+  the v0.13 items adoption would freeze per active release and the pending
+  callback count. The first finding is exactly the preflight's error, which is
+  now the same on every run when several volumes are refused. Exit 0 clean, 3
+  findings, 1 failed.
+- `maintenance_legacy_idempotency_tenants` lets listed tenants omit
+  `Idempotency-Key` on restart and update, for integrators written before the
+  header. Fred authenticates first, consuming the single-use signed token, and
+  keys the command by that token; a replayed token is refused. Each such
+  request logs a WARN and increments `fred_api_maintenance_legacy_key_total`.
+  Empty by default.
+- `providerd --validate-config` and `docker-backend -validate-config` check a
+  config file exactly as startup would, without opening a store or touching
+  Docker or the network, and exit 0 or 1. Typed Fred rejects unknown keys, so
+  checking before a swap avoids a crash loop. With `sub_signer_count > 0`, the
+  sub-signer funding amounts are now parsed with the rest of the config instead
+  of after the chain client starts.
+- `placement-preflight -prepare` reports a machine-readable outcome: the last
+  stdout line is `{"outcome":"<name>"}` and the exit status is 0 `prepared`,
+  10 `not_mutated`, 11 `backup_published`, 12 `outcome_unknown`, or 13
+  `prepared_unverified`, so automation can tell a safe retry from one that must
+  classify first. Other failures still exit 1.
+- `placement-repair -attest-restored-backup` makes a restored placement
+  database safe to start. A copy restored from before a lease was dispatched
+  has no row for it, and its admission baseline read the missing row as "never
+  placed": if the owner was unreachable on the first sweep, the lease was
+  provisioned a second time on a peer. The dry run prints the bound plan as one
+  JSON object; `-apply -backup <path> -confirm <value>` publishes an exact
+  backup and forgets only the admission baseline and drain evidence, so
+  admission waits for one complete inventory.
+- `fred_placement_inventory_recovery_pending` is 1 while an interrupted
+  inventory sweep withholds fresh lease side effects, and `/readyz` reports
+  `placement inventory recovery pending` for that state instead of the generic
+  `placement inventory not ready`.
 - `fred_docker_backend_image_registry_requests_total{endpoint,method,status}`
   counts every registry exchange docker-backend makes, including retries and
   redirect hops, with `status="429"` for quota refusals.
@@ -245,6 +301,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Restart and update no longer stop at 1,024 commands per lease. Fred and the
+  docker-backend keep a rolling window of each lease's 1,024 most recent
+  commands and evict the oldest settled one to admit a newer command; the
+  docker-backend keeps custom-domain reconciles in a separate window of 64, so
+  they never evict a tenant's receipt. A retry within the window still replays
+  its result; an older key is a new command. Every dispatch now carries the
+  provider's `admitted_at` stamp, strictly increasing per lease, and a backend
+  refuses a command it has no receipt for that is not newer than the newest one
+  it accepted, with `409` and code `maintenance_expired`, so a late or replayed
+  command can never run again or move an update backward. Fred settles it as
+  expired and tenants get `410 Gone` with reason `maintenance_expired`.
+  Completion callbacks echo `maintenance_admitted_at`, and Fred ignores one
+  that does not match its pending command. A failed update whose late-container
+  cleanup is unconfirmed stays in the window until cleanup attests absence at
+  least an hour after the failure, or the receipt can no longer authorize
+  cleanup. Keys must not be reused: a forgotten key that still names a release
+  generation on the backend is refused with `409`. New counters:
+  `fred_provisioner_maintenance_receipts_evicted_total` and
+  `fred_docker_backend_maintenance_expired_total`. Upgrade docker-backends
+  before `providerd`: an older backend ignores `admitted_at`. Neither binary
+  can be downgraded once it has written the new state.
 - Closing a lease while its worker drains returns breaker-neutral
   `503 lifecycle_pending`. Provider close events defer through the bounded
   scheduler; the actor keeps close ownership so canceled work settles as
@@ -686,8 +763,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   transition, and cannot seal with an outstanding receipt. Only a successful
   semantic projection (or an orderly sealed zero-positive end) clears the exact
   marker. After an interrupted sweep and restart, partial inventory cannot
-  mint fresh lease side effects until a complete projection resolves the lost
-  evidence; exact durable callback, attempt, and maintenance recovery remains
+  mint fresh lease side effects until every backend that reported a positive
+  during the interrupted sweep chain answers again and the projection resolves
+  the lost evidence. Each reporter is journaled durably before its positive can
+  take effect, so a backend that was already silent cannot hold the provider
+  fenced. Evidence that cannot be attributed to its reporter (failed refresh,
+  identity mismatch, malformed rows, a lease in both endpoints of one backend,
+  or a rejected response) and a marker without a journal still need every
+  configured backend. An older binary refuses a database stopped with an
+  interrupted sweep; run this release until recovery completes before rolling
+  back.
+  Exact durable callback, attempt, and maintenance recovery remains
   available. A newer sweep also invalidates unclaimed actions from an older
   projected epoch, while actions that already hold a lease claim are captured
   in the newer operation boundary and excluded. A fenced trusted provision that exactly matches the durable
@@ -874,6 +960,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- One tenant could stop a whole docker-backend. A failed, effect-started
+  update keeps a receipt that names its target release row, but release-history
+  compaction protects only the newest and the latest active rows, so later
+  large updates to the same lease could drop that row. The missing target then
+  failed the backend-wide listing every recovery pass and startup depend on,
+  so recovery aborted on every tick and the backend could not restart. Such a receipt is now reported as unverifiable, grants no cleanup
+  authority (a late container for that generation is kept), and never blocks
+  other leases; `fred_docker_backend_maintenance_receipts_unverifiable_total`
+  counts it. Cleanup also re-verifies only its own receipt instead of
+  re-listing the backend.
 - New leases and updates spend an anonymous Docker Hub pull only when the
   backend has not yet verified the tag's current manifest. Each preparation
   re-resolves its tag with one manifest HEAD, which Docker Hub does not meter,

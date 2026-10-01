@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -18,6 +19,7 @@ import (
 	"github.com/manifest-network/fred/internal/backendname"
 	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/maintenanceid"
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/strictjson"
@@ -32,7 +34,6 @@ var (
 	ErrMaintenanceCommandConflict   = errors.New("maintenance command conflicts with durable history")
 	ErrMaintenanceCommandNotPending = errors.New("maintenance command is not pending")
 	ErrMaintenanceJournalCorrupt    = errors.New("maintenance command journal is corrupt")
-	ErrMaintenanceHistoryFull       = errors.New("maintenance command history is full")
 	ErrMaintenancePendingFull       = errors.New("maintenance pending admission budget is full")
 )
 
@@ -51,7 +52,12 @@ const (
 	// transitions use the full record limit so legacy rows remain recoverable.
 	maxMaintenanceCommandPendingBytes   = maxMaintenanceCommandValueBytes - 512
 	maxMaintenanceCommandAdmissionBytes = maxMaintenanceCommandPendingBytes - 6*maxMaintenanceRefusalDetailBytes
-	maxMaintenanceCommandsPerLease      = 1024
+	// maxMaintenanceCommandsPerLease is the rolling window of commands kept
+	// per lease. Admitting another evicts the oldest settled one.
+	maxMaintenanceCommandsPerLease = 1024
+	// maintenanceStampStep keeps one lease's admission stamps strictly
+	// increasing even when the wall clock repeats or steps back.
+	maintenanceStampStep = time.Microsecond
 )
 
 // MaintenanceCommandKind is the closed set of tenant maintenance effects.
@@ -105,6 +111,14 @@ const (
 	// receipts. A per-call NotDispatched outcome cannot produce one now.
 	MaintenanceOutcomeBackendUnavailable
 	MaintenanceOutcomeExecutionFailed
+	// MaintenanceOutcomeBackendLost settles a command whose lease lived on a
+	// backend an operator retired as irrecoverably lost.
+	MaintenanceOutcomeBackendLost
+	// MaintenanceOutcomeExpired settles a command the backend refused because
+	// it is older than the lease's retained maintenance history. It never ran.
+	MaintenanceOutcomeExpired
+
+	maxMaintenanceCommandOutcome = MaintenanceOutcomeExpired
 )
 
 func (outcome MaintenanceCommandOutcome) String() string {
@@ -129,6 +143,10 @@ func (outcome MaintenanceCommandOutcome) String() string {
 		return "backend_unavailable"
 	case MaintenanceOutcomeExecutionFailed:
 		return "execution_failed"
+	case MaintenanceOutcomeBackendLost:
+		return "backend_lost"
+	case MaintenanceOutcomeExpired:
+		return "expired"
 	default:
 		return "invalid"
 	}
@@ -156,6 +174,10 @@ func parseMaintenanceCommandOutcome(value string) (MaintenanceCommandOutcome, bo
 		return MaintenanceOutcomeBackendUnavailable, true
 	case "execution_failed":
 		return MaintenanceOutcomeExecutionFailed, true
+	case "backend_lost":
+		return MaintenanceOutcomeBackendLost, true
+	case "expired":
+		return MaintenanceOutcomeExpired, true
 	default:
 		return MaintenanceOutcomePending, false
 	}
@@ -179,6 +201,11 @@ type MaintenanceCommand struct {
 	callbackURL       string
 	terminal          bool
 	phase             maintenanceJournalPhase
+	// admittedAt is the durable admission stamp, sent with every dispatch so
+	// the backend can order this command against its lease's history. It is
+	// set only from the journal and is not part of equal: a tenant retry is
+	// the same command whatever its own clock.
+	admittedAt time.Time
 }
 
 // newMaintenanceCommand validates and detaches every fact needed to safely
@@ -366,6 +393,9 @@ func (command MaintenanceCommand) BackendStorageID() backendidentity.ID {
 func (command MaintenanceCommand) LifecycleID() lifecycle.ID { return command.lifecycleID }
 func (command MaintenanceCommand) CallbackURL() string       { return command.callbackURL }
 
+// AdmittedAt is the command's durable admission stamp; zero before admission.
+func (command MaintenanceCommand) AdmittedAt() time.Time { return command.admittedAt }
+
 func (command MaintenanceCommand) equal(other MaintenanceCommand) bool {
 	return command.id == other.id && command.leaseUUID == other.leaseUUID &&
 		command.tenant == other.tenant && command.providerUUID == other.providerUUID &&
@@ -545,7 +575,7 @@ func pendingMaintenanceLeasesTx(tx *bolt.Tx) (map[string]struct{}, error) {
 
 // LookupMaintenanceCommand reads one lease-scoped ID. The same UUID may be
 // used for a different lease without collision; within a lease it names one
-// immutable command forever.
+// immutable command for as long as the command is in the lease's window.
 func (s *Store) LookupMaintenanceCommand(
 	leaseUUID string,
 	id maintenanceid.ID,
@@ -593,7 +623,7 @@ func encodeMaintenanceSettlement(command MaintenanceCommand, settlement maintena
 	if !command.Valid() {
 		return nil, "", ErrInvalidMaintenanceCommand
 	}
-	if outcome > MaintenanceOutcomeExecutionFailed {
+	if outcome > maxMaintenanceCommandOutcome {
 		return nil, "", ErrInvalidMaintenanceCommand
 	}
 	persistedPayload := append([]byte(nil), command.payload...)
@@ -782,6 +812,7 @@ func decodeMaintenanceCommand(encoded []byte) (
 		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "",
 			errors.New("maintenance payload fingerprint mismatch")
 	}
+	command.admittedAt = record.CreatedAt
 	return command, outcome, record.CreatedAt, record.SettledAt, record.Detail, nil
 }
 
@@ -814,6 +845,10 @@ func (s *Store) prepareMaintenanceCommand(
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// A lost placement is terminal whatever inventory later reports.
+	if _, lost := s.cache[leaseUUID].LostBackend(); lost {
+		return PreparedMaintenanceCommand{}, ErrPlacementLost
+	}
 	if err := s.unprojectedPositiveErrorLocked(leaseUUID); err != nil {
 		return PreparedMaintenanceCommand{}, err
 	}
@@ -933,6 +968,7 @@ func (s *Store) beginMaintenanceCommand(
 		return MaintenanceCommandAdmission{}, ErrMaintenanceCommandConflict
 	}
 	var result MaintenanceCommandAdmission
+	evicted := 0
 	err := s.updateMaintenanceAuthority(func(journal *maintenanceJournalTransaction) error {
 		tx := journal.tx
 		if err := validateMaintenanceAdmissionTx(tx, command); err != nil {
@@ -942,7 +978,7 @@ func (s *Store) beginMaintenanceCommand(
 		if err != nil {
 			return err
 		}
-		count, err := countMaintenanceReceipts(records, command.leaseUUID)
+		retained, err := scanMaintenanceReceipts(records, command.leaseUUID)
 		if err != nil {
 			return err
 		}
@@ -975,10 +1011,11 @@ func (s *Store) beginMaintenanceCommand(
 		if head := pending.Get([]byte(command.leaseUUID)); head != nil {
 			return ErrMaintenanceCommandConflict
 		}
-		if count >= maxMaintenanceCommandsPerLease {
-			return ErrMaintenanceHistoryFull
+		if evicted, err = evictOldestMaintenanceReceipts(records, retained); err != nil {
+			return err
 		}
-		createdAt := s.now().UTC()
+		createdAt := nextMaintenanceAdmissionStamp(s.now(), retained)
+		command.admittedAt = createdAt
 		encoded, err := encodeMaintenanceCommand(command, MaintenanceOutcomePending, createdAt, time.Time{})
 		if err != nil {
 			return err
@@ -993,34 +1030,87 @@ func (s *Store) beginMaintenanceCommand(
 		result = MaintenanceCommandAdmission{claim: claim, command: command, outcome: MaintenanceOutcomePending}
 		return nil
 	})
+	if err == nil && evicted != 0 {
+		metrics.MaintenanceReceiptsEvictedTotal.Add(float64(evicted))
+	}
 	return result, err
 }
 
-// countMaintenanceReceipts reserves the lease's bounded, lifetime idempotency
-// history before dispatch. No live-lease receipt may age out: the provider and
-// backend must agree forever whether a UUID names completed work, otherwise an
-// exact late retry could be mistaken for a new asynchronous mutation. History
-// is reclaimed only after both placement and lifecycle authority are gone.
-func countMaintenanceReceipts(
+// retainedMaintenanceReceipt is one stored command of a lease, as admission
+// orders and evicts it.
+type retainedMaintenanceReceipt struct {
+	key       []byte
+	createdAt time.Time
+	settled   bool
+}
+
+// scanMaintenanceReceipts reads a lease's stored commands for admission. The
+// window keeps the newest maxMaintenanceCommandsPerLease of them; a retry of
+// an evicted key is new work, while the backend refuses a replay older than
+// its own retained history as expired, never executing it as new.
+func scanMaintenanceReceipts(
 	records *bolt.Bucket,
 	leaseUUID string,
-) (int, error) {
+) ([]retainedMaintenanceReceipt, error) {
 	prefix := []byte(leaseUUID + "\x00")
 	cursor := records.Cursor()
-	retained := 0
+	var retained []retainedMaintenanceReceipt
 	for key, value := cursor.Seek(prefix); key != nil && bytes.HasPrefix(key, prefix); key, value = cursor.Next() {
-		command, _, _, _, _, err := decodeMaintenanceCommand(value)
+		command, outcome, createdAt, _, _, err := decodeMaintenanceCommand(value)
 		if err != nil {
-			return 0, fmt.Errorf("%w: decode receipt for capacity: %w", ErrMaintenanceJournalCorrupt, err)
+			return nil, fmt.Errorf("%w: decode receipt for capacity: %w", ErrMaintenanceJournalCorrupt, err)
 		}
 		if command.leaseUUID != leaseUUID || !bytes.Equal(
 			key, maintenanceReceiptKey(command.leaseUUID, command.id),
 		) {
-			return 0, fmt.Errorf("%w: command record key mismatch", ErrMaintenanceJournalCorrupt)
+			return nil, fmt.Errorf("%w: command record key mismatch", ErrMaintenanceJournalCorrupt)
 		}
-		retained++
+		retained = append(retained, retainedMaintenanceReceipt{
+			key: bytes.Clone(key), createdAt: createdAt, settled: outcome != MaintenanceOutcomePending,
+		})
 	}
 	return retained, nil
+}
+
+// evictOldestMaintenanceReceipts makes room for one more command by deleting
+// the oldest settled ones, by admission stamp then key. A pending command is
+// never evicted; admission already refused while one exists.
+func evictOldestMaintenanceReceipts(records *bolt.Bucket, retained []retainedMaintenanceReceipt) (int, error) {
+	excess := len(retained) - (maxMaintenanceCommandsPerLease - 1)
+	if excess <= 0 {
+		return 0, nil
+	}
+	settled := slices.DeleteFunc(slices.Clone(retained), func(receipt retainedMaintenanceReceipt) bool {
+		return !receipt.settled
+	})
+	if len(settled) < excess {
+		return 0, fmt.Errorf("%w: maintenance window holds unsettled commands", ErrMaintenanceJournalCorrupt)
+	}
+	slices.SortFunc(settled, func(a, b retainedMaintenanceReceipt) int {
+		if order := a.createdAt.Compare(b.createdAt); order != 0 {
+			return order
+		}
+		return bytes.Compare(a.key, b.key)
+	})
+	for _, receipt := range settled[:excess] {
+		if err := records.Delete(receipt.key); err != nil {
+			return 0, err
+		}
+	}
+	return excess, nil
+}
+
+// nextMaintenanceAdmissionStamp is a per-lease hybrid clock: the wall clock,
+// but always strictly after every retained command's stamp, so a backend can
+// order this lease's commands even across a wall-clock step back.
+func nextMaintenanceAdmissionStamp(now time.Time, retained []retainedMaintenanceReceipt) time.Time {
+	stamp := now.UTC()
+	for _, receipt := range retained {
+		if !stamp.After(receipt.createdAt) {
+			stamp = receipt.createdAt.UTC().Add(maintenanceStampStep)
+		}
+	}
+	return stamp
 }
 
 func validateMaintenanceAdmissionTx(tx *bolt.Tx, command MaintenanceCommand) error {
@@ -1075,7 +1165,7 @@ func (s *Store) settleMaintenancePhase(claim MaintenanceCommandClaim, settlement
 func (s *Store) settleMaintenancePhaseReceipt(claim MaintenanceCommandClaim, settlement maintenanceSettlement, phase maintenanceJournalPhase) (MaintenanceCommandRecord, error) {
 	outcome := settlement.outcome
 	if s == nil || !claim.Valid() || claim.issuer != s || outcome == MaintenanceOutcomePending ||
-		outcome > MaintenanceOutcomeExecutionFailed {
+		outcome > maxMaintenanceCommandOutcome {
 		return MaintenanceCommandRecord{}, ErrMaintenanceCommandNotPending
 	}
 	s.mu.Lock()

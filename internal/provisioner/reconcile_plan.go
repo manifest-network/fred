@@ -39,6 +39,9 @@ const (
 	reconcileActionReject
 	reconcileActionCloseAndDeprovision
 	reconcileActionReconcileCustomDomain
+	// reconcileActionCloseLost closes a live lease whose data may have lived
+	// on a retired backend's lost storage, instead of provisioning it empty.
+	reconcileActionCloseLost
 )
 
 // leaseFacts is the immutable input to planLease. I/O adapters are responsible
@@ -55,6 +58,9 @@ type leaseFacts struct {
 	hasMetaHash bool
 	payload     payloadEvidence
 	inFlight    bool
+	// recordlessUnproven: the lease has no placement row and a retired
+	// backend may have held it, so its absence is not "never placed".
+	recordlessUnproven bool
 }
 
 // leasePlan is deliberately small and closed within this package. withPayload
@@ -108,6 +114,13 @@ func planLease(f leaseFacts) leasePlan {
 		}
 
 	case billingtypes.LEASE_STATE_ACTIVE:
+		if !f.hasProvision && f.recordlessUnproven {
+			return leasePlan{
+				action:  reconcileActionCloseLost,
+				anomaly: true,
+				reason:  "active lease may have lived on a retired backend's lost storage",
+			}
+		}
 		if !f.hasProvision {
 			return leasePlan{
 				action:      reconcileActionStart,

@@ -68,8 +68,9 @@ func demoteOnGrantSetupError(err error) bool {
 var version = "dev"
 
 var (
-	configFile string
-	rootCmd    = &cobra.Command{
+	configFile     string
+	validateConfig bool
+	rootCmd        = &cobra.Command{
 		Use:   "providerd",
 		Short: "Manifest Provider Daemon",
 		Long:  `A daemon that watches for lease events, auto-acknowledges them, serves tenant authentication API, and periodically withdraws funds.`,
@@ -84,6 +85,8 @@ var sdkConfigOnce sync.Once
 func init() {
 	rootCmd.Version = version
 	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "path to config file")
+	rootCmd.PersistentFlags().BoolVar(&validateConfig, "validate-config", false,
+		"check the config file as startup would, without opening a store or touching the network, and exit")
 
 	// Configure SDK with manifest bech32 prefixes.
 	// Use sync.Once to prevent panic if config is already sealed by a dependency.
@@ -110,18 +113,31 @@ func main() {
 	}
 }
 
-func run(cmd *cobra.Command, args []string) error {
-	// Load configuration (uses default logger during loading)
-	cfg, err := config.Load(configFile)
+// loadStartupConfig is every configuration check startup makes before its
+// first side effect. --validate-config runs exactly this.
+func loadStartupConfig(path string) (*config.Config, slog.Level, error) {
+	cfg, err := config.Load(path)
 	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
+		return nil, 0, fmt.Errorf("failed to load config: %w", err)
+	}
+	logLevel, err := config.ParseLogLevel(cfg.LogLevel)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid log_level: %w", err)
+	}
+	return cfg, logLevel, nil
+}
+
+func run(cmd *cobra.Command, args []string) error {
+	cfg, logLevel, err := loadStartupConfig(configFile)
+	if err != nil {
+		return err
+	}
+	if validateConfig {
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "providerd: config %q is valid\n", configFile)
+		return err
 	}
 
 	// Set up structured logging with configured level
-	logLevel, err := config.ParseLogLevel(cfg.LogLevel)
-	if err != nil {
-		return fmt.Errorf("invalid log_level: %w", err)
-	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: logLevel,
 	}))
@@ -462,6 +478,8 @@ func run(cmd *cobra.Command, args []string) error {
 		CallbackCanonicalPathPrefix: cfg.CallbackCanonicalPathPrefix,
 		TokenTrackerDBPath:          cfg.TokenTrackerDBPath,
 		CallbackBaseURL:             cfg.CallbackBaseURL,
+
+		MaintenanceLegacyIdempotencyTenants: cfg.MaintenanceLegacyIdempotencyTenants,
 	}, api.ServerDeps{
 		ChainClient:           chainClient,
 		BackendRouter:         backendRouter,

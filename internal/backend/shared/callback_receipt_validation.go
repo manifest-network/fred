@@ -82,6 +82,20 @@ func (validation *callbackReceiptValidation) validate() error {
 	}); err != nil {
 		return err
 	}
+	if lineages := validation.tx.Bucket(maintenanceLineageBucketName); lineages != nil {
+		if err := walkCallbackValidationRows(validation.ctx, lineages, func(key, value []byte) error {
+			if value == nil {
+				return fmt.Errorf("maintenance lineage %q is a nested bucket", key)
+			}
+			if err := validateCanonicalLeaseUUID(string(key)); err != nil {
+				return fmt.Errorf("maintenance lineage has invalid lease key: %w", err)
+			}
+			_, _, err := loadStoredMaintenanceLineageTx(validation.tx, string(key))
+			return err
+		}); err != nil {
+			return err
+		}
+	}
 	stored, err := callbackReceiptReservationCountTx(validation.tx)
 	if err != nil {
 		return err
@@ -132,8 +146,16 @@ func (validation *callbackReceiptValidation) validateLease(leaseUUID string, hea
 	if err != nil {
 		return err
 	}
-	if len(maintenance) > maxMaintenanceReceiptsPerLease {
-		return fmt.Errorf("maintenance receipt capacity exceeded for lease %q", leaseUUID)
+	var headKind *MaintenanceIntentKind
+	if current, ok := head.(maintenanceLeaseMutationHead); ok {
+		kind := current.claim.Kind()
+		headKind = &kind
+	}
+	if err := validateMaintenanceWindowCounts(leaseUUID, maintenance, headKind); err != nil {
+		return err
+	}
+	if _, _, err := loadStoredMaintenanceLineageTx(validation.tx, leaseUUID); err != nil {
+		return err
 	}
 	validation.maintenanceReserved += uint64(len(maintenance))
 	sequences := make(map[uint64]struct{}, len(maintenance))
@@ -149,9 +171,6 @@ func (validation *callbackReceiptValidation) validateLease(leaseUUID string, hea
 	}
 	if current, ok := head.(maintenanceLeaseMutationHead); ok {
 		validation.maintenanceReserved++
-		if len(maintenance) >= maxMaintenanceReceiptsPerLease {
-			return fmt.Errorf("maintenance head for lease %q has no reserved receipt capacity", leaseUUID)
-		}
 		for _, record := range maintenance {
 			if !maintenanceReceiptMatchesEntryAuthority(record, current.claim.entry) {
 				return fmt.Errorf("maintenance head for lease %q crosses completed-history authority", leaseUUID)

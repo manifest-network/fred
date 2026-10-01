@@ -48,6 +48,8 @@ func TestParseStartupFlagsRejectsConflictingOfflineModes(t *testing.T) {
 		{"-repair-unsettled-docker-effects", "-docker-effects-acknowledgement", "exact-ack", "-docker-effects-backup", "/backup.db"},
 		{"-preflight-storage-identity-adoption"},
 		{"-initialize-storage-identity", "adopt"},
+		{"-validate-config"},
+		{"-audit-storage-identity-adoption"},
 	}
 	for i, first := range modes {
 		for _, second := range modes[i+1:] {

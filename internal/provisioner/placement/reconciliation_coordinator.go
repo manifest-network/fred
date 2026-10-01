@@ -93,6 +93,16 @@ func (authority *ReconciliationCoordinator) Valid() bool {
 		authority.coordinator.store.callbackRoutes.Valid()
 }
 
+// RecordlessLeasesUnproven reports whether a retired backend may have held a
+// live lease that has no placement row. It fails closed to true when the
+// coordinator is invalid.
+func (authority *ReconciliationCoordinator) RecordlessLeasesUnproven() bool {
+	if !authority.Valid() {
+		return true
+	}
+	return authority.coordinator.store.RecordlessLeasesUnproven()
+}
+
 // ProviderUUID returns the provider identity permanently bound to the Store.
 // It is observational only; reconciliation cannot be constructed with an
 // independently supplied provider identity.

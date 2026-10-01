@@ -40,7 +40,10 @@ func (sweep *ReconciliationSweep) RecordProvision(
 			leaseUUIDs = append(leaseUUIDs, provision.LeaseUUID)
 		}
 		if err := sweep.coordinator.coordinator.store.recordUnprojectedPositives(
-			sweep.fence, backendName, inventoryPositiveProvision, leaseUUIDs,
+			sweep.fence, backendName, inventoryPositiveProvision,
+			sweep.provisionAttributionLocked(BackendProvisionInventory{
+				backendName: backendName, provisions: provisions, storageID: storageID,
+			}), leaseUUIDs,
 		); err != nil {
 			return err
 		}
@@ -63,8 +66,15 @@ func (sweep *ReconciliationSweep) RecordRetention(
 	}
 	if len(leaseUUIDs) != 0 {
 		sweep.positive = true
+		retentions := make([]backend.RetainedLease, 0, len(leaseUUIDs))
+		for _, leaseUUID := range leaseUUIDs {
+			retentions = append(retentions, backend.RetainedLease{LeaseUUID: leaseUUID})
+		}
 		if err := sweep.coordinator.coordinator.store.recordUnprojectedPositives(
-			sweep.fence, backendName, inventoryPositiveRetention, leaseUUIDs,
+			sweep.fence, backendName, inventoryPositiveRetention,
+			sweep.retentionAttributionLocked(BackendRetentionInventory{
+				backendName: backendName, retentions: retentions, storageID: storageID,
+			}), leaseUUIDs,
 		); err != nil {
 			return err
 		}
@@ -87,7 +97,7 @@ func (sweep *ReconciliationSweep) RecordUntrusted(
 	if len(leaseUUIDs) != 0 {
 		sweep.positive = true
 		if err := sweep.coordinator.coordinator.store.recordUnprojectedPositives(
-			sweep.fence, backendName, inventoryPositiveUntrusted, leaseUUIDs,
+			sweep.fence, backendName, inventoryPositiveUntrusted, inventoryUnattributed, leaseUUIDs,
 		); err != nil {
 			return err
 		}

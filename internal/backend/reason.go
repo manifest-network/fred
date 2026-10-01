@@ -21,6 +21,9 @@ const (
 	ReasonRestoreFailed          Reason = "RestoreFailed"
 	ReasonVolumeCleanupExhausted Reason = "VolumeCleanupExhausted"
 	ReasonCleanupFailed          Reason = "CleanupFailed"
+	// ReasonBackendStorageLost marks a lease whose backend an operator
+	// retired as irrecoverably lost; it is authored by the placement store.
+	ReasonBackendStorageLost Reason = "BackendStorageLost"
 	// ReasonUnknown is the read-boundary default for a FAILED lease with no
 	// authored reason (a legacy pre-upgrade record or a future-unmapped
 	// path). gRPC-UNKNOWN-equivalent: "failed, cause unclassified".
@@ -38,4 +41,5 @@ const (
 	MsgUpdateFailed           = "update failed"
 	MsgVolumeCleanupExhausted = "volume cleanup exhausted"
 	MsgCleanupFailed          = "cleanup failed"
+	MsgBackendStorageLost     = "the backend storage holding this lease was irrecoverably lost"
 )

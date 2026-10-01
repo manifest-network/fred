@@ -1174,61 +1174,62 @@ func (s *MaintenanceSettlement) CleanupFailedMaintenanceReceipt(
 	ctx context.Context,
 	scope LeaseRecoveryScope,
 	receipt FailedMaintenanceReceipt,
-) error {
+) (FailedMaintenanceCleanupProof, error) {
 	if s == nil {
-		return errors.New("failed-maintenance cleanup requires exact lease-quiescence authority")
+		return FailedMaintenanceCleanupProof{}, errors.New("failed-maintenance cleanup requires exact lease-quiescence authority")
 	}
 	releaseScope, valid := scope.enter(s.recoveryCoordinator, receipt.LeaseUUID())
 	if !valid {
-		return errors.New("failed-maintenance cleanup requires exact lease-quiescence authority")
+		return FailedMaintenanceCleanupProof{}, errors.New("failed-maintenance cleanup requires exact lease-quiescence authority")
 	}
 	defer releaseScope()
 	if s.executeRecovery == nil || !s.ownsFailedMaintenanceReceipt(receipt) {
-		return errors.New("failed-maintenance cleanup receipt belongs to another journal pair")
+		return FailedMaintenanceCleanupProof{}, errors.New("failed-maintenance cleanup receipt belongs to another journal pair")
 	}
 	var subject MaintenancePhysicalSubject
 	execution, err := s.mutation.RecoverAfter(func() (MaintenancePhysicalSubject, error) {
-		current, err := s.ListFailedMaintenanceReceipts()
+		// Re-verify exactly this receipt: another lease's evidence can
+		// neither block nor authorize this cleanup.
+		current, found, err := s.verifyFailedMaintenanceReceipt(receipt.record)
 		if err != nil {
 			return MaintenancePhysicalSubject{}, err
 		}
-		found := false
-		for _, candidate := range current {
-			if sameFailedMaintenanceReceipt(candidate, receipt) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return MaintenancePhysicalSubject{}, errors.New(
-				"failed-maintenance cleanup receipt is no longer durable",
-			)
+		if !found || !sameFailedMaintenanceReceipt(current, receipt) {
+			return MaintenancePhysicalSubject{}, ErrFailedMaintenanceReceiptGone
 		}
 		subject = newFailedMaintenanceCleanupSubject(s, receipt)
 		return subject, nil
 	})
 	if err != nil {
-		return err
+		return FailedMaintenanceCleanupProof{}, err
 	}
+	// Absence is observed during execution, so stamp the proof before it: a
+	// slow inventory never counts toward the grace window.
+	attestedAt := time.Now()
 	result := s.executeRecovery(ctx, execution)
 	if err := substratemutation.ValidateRecoveryResult(s.mutation, execution, result); err != nil {
-		return err
+		return FailedMaintenanceCleanupProof{}, err
 	}
 	if result.Kind() != substratemutation.Attested {
-		return fmt.Errorf("failed-maintenance cleanup is %s: %w", result.Kind(), result.Err())
+		return FailedMaintenanceCleanupProof{}, fmt.Errorf("failed-maintenance cleanup is %s: %w", result.Kind(), result.Err())
 	}
 	evidence, ok := result.Evidence()
 	if !ok {
-		return errors.New("attested failed-maintenance cleanup has no evidence")
+		return FailedMaintenanceCleanupProof{}, errors.New("attested failed-maintenance cleanup has no evidence")
 	}
 	if err := validateMaintenancePhysicalEvidence(subject, evidence); err != nil {
-		return err
+		return FailedMaintenanceCleanupProof{}, err
 	}
 	if evidence.kind != maintenancePhysicalEvidenceFailedReceiptAbsent {
-		return errors.New("failed-maintenance cleanup has wrong evidence")
+		return FailedMaintenanceCleanupProof{}, errors.New("failed-maintenance cleanup has wrong evidence")
 	}
-	return nil
+	return FailedMaintenanceCleanupProof{settlement: s, record: receipt.record, attestedAt: attestedAt}, nil
 }
+
+// ErrFailedMaintenanceReceiptGone means the receipt left the journal after it
+// was listed: evicted from the window once its cleanup was confirmed, or taken
+// by a lease close. Its cleanup authority went with it.
+var ErrFailedMaintenanceReceiptGone = errors.New("failed-maintenance cleanup receipt is no longer durable")
 
 func (s *MaintenanceSettlement) ownsFailedMaintenanceReceipt(receipt FailedMaintenanceReceipt) bool {
 	return s != nil && receipt.Valid() && receipt.settlement == s &&

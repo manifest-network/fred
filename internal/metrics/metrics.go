@@ -60,6 +60,28 @@ var (
 		Help:      "Total failed writes or durable-sync verifications in the placement store",
 	})
 
+	// PlacementInventoryRecoveryPending is 1 while an interrupted inventory
+	// sweep withholds fresh lease side effects. It returns to 0 once every
+	// backend that could have reported a lost positive answers both endpoints
+	// again, or a complete projection commits.
+	PlacementInventoryRecoveryPending = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "placement",
+		Name:      "inventory_recovery_pending",
+		Help:      "1 while an interrupted inventory sweep withholds fresh lease side effects until its journaled reporters (every backend, if the sweep held unattributed evidence or predates the journal) answer both endpoints with their pinned storage and every positive is durably represented; 0 otherwise",
+	})
+
+	// MaintenanceReceiptsEvictedTotal counts settled restart and update
+	// commands that left a lease's rolling window of 1,024 when a newer command
+	// was admitted. A retry of an evicted key is new work; a backend refuses a
+	// replay older than its own history as expired.
+	MaintenanceReceiptsEvictedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "maintenance_receipts_evicted_total",
+		Help:      "Settled restart and update commands evicted from a lease's rolling window of 1,024 when a newer command was admitted",
+	})
+
 	// InFlightProvisions tracks the number of provisions currently in progress.
 	InFlightProvisions = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,
@@ -154,6 +176,17 @@ var (
 		Name:      "reconciler_deferred_leases_total",
 		Help:      "Total leases reconciliation deferred because ownership or lifecycle evidence was unsafe or changed during the sweep",
 	})
+
+	// ReconcilerLostLeasesTotal counts reconciliation of leases whose data
+	// lived on a backend an operator retired as lost, and of ACTIVE leases with
+	// no placement row that an unproven retirement closes. outcome: closed,
+	// rejected, deferred, error.
+	ReconcilerLostLeasesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "reconciler_lost_leases_total",
+		Help:      "Leases whose data lived on a retired backend's lost storage, by reconciliation outcome",
+	}, []string{"outcome"})
 
 	// ReconcilerPanicsTotal counts panics recovered inside reconciler
 	// per-unit goroutines (per-lease, per-orphan, per-backend-fetch). The
@@ -489,6 +522,16 @@ var (
 
 // API metrics
 var (
+	// APIMaintenanceLegacyKeyTotal counts restart/update requests accepted
+	// without Idempotency-Key from a tenant listed in
+	// maintenance_legacy_idempotency_tenants.
+	APIMaintenanceLegacyKeyTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "api",
+		Name:      "maintenance_legacy_key_total",
+		Help:      "Restart/update requests accepted without Idempotency-Key, each keyed by its single-use signed token",
+	})
+
 	// APIRequestDuration tracks API request latency.
 	APIRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: namespace,

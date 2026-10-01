@@ -12,6 +12,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/provisioner/inventory"
 	"github.com/manifest-network/fred/internal/provisioner/leaseitems"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
@@ -89,7 +90,8 @@ func (sweep *ReconciliationSweep) CollectProvisionInventory(
 			leaseUUIDs = append(leaseUUIDs, provision.LeaseUUID)
 		}
 		if err := coordinator.coordinator.store.recordUnprojectedPositives(
-			sweep.fence, result.backendName, inventoryPositiveProvision, leaseUUIDs,
+			sweep.fence, result.backendName, inventoryPositiveProvision,
+			sweep.provisionAttributionLocked(result), leaseUUIDs,
 		); err != nil {
 			return BackendProvisionInventory{}, err
 		}
@@ -138,7 +140,8 @@ func (sweep *ReconciliationSweep) CollectRetentionInventory(
 			leaseUUIDs = append(leaseUUIDs, retention.LeaseUUID)
 		}
 		if err := coordinator.coordinator.store.recordUnprojectedPositives(
-			sweep.fence, result.backendName, inventoryPositiveRetention, leaseUUIDs,
+			sweep.fence, result.backendName, inventoryPositiveRetention,
+			sweep.retentionAttributionLocked(result), leaseUUIDs,
 		); err != nil {
 			return BackendRetentionInventory{}, err
 		}
@@ -314,6 +317,19 @@ func (sweep *ReconciliationSweep) RecordBackendInventory(
 		seenRetentions[leaseUUID] = struct{}{}
 	}
 
+	overlapping := false
+	for leaseUUID := range seenRetentions {
+		if _, both := provisioned[leaseUUID]; both {
+			overlapping = true
+			break
+		}
+	}
+	if (!authoritative || overlapping) && len(provisioned)+len(seenRetentions) != 0 {
+		if err := sweep.coordinator.coordinator.store.untrackSweepReporters(sweep.fence); err != nil {
+			return BackendInventoryResult{}, err
+		}
+	}
+
 	var (
 		err         error
 		observation inventory.BackendObservation
@@ -375,6 +391,11 @@ func (sweep *ReconciliationSweep) RejectProvisionInventory(
 	for _, provision := range canonical.provisions {
 		leaseUUIDs = append(leaseUUIDs, provision.LeaseUUID)
 	}
+	if len(leaseUUIDs) != 0 {
+		if err := sweep.coordinator.coordinator.store.untrackSweepReporters(sweep.fence); err != nil {
+			return err
+		}
+	}
 	if err := sweep.collection.RecordUntrusted(canonical.backendName, leaseUUIDs); err != nil {
 		return err
 	}
@@ -401,6 +422,11 @@ func (sweep *ReconciliationSweep) RejectRetentionInventory(
 	if !pending {
 		return inventory.ErrInvalidSession
 	}
+	if len(canonical.retentions) != 0 {
+		if err := sweep.coordinator.coordinator.store.untrackSweepReporters(sweep.fence); err != nil {
+			return err
+		}
+	}
 	if err := sweep.collection.RecordUntrusted(
 		canonical.backendName, retentionLeaseUUIDs(canonical.retentions),
 	); err != nil {
@@ -408,6 +434,80 @@ func (sweep *ReconciliationSweep) RejectRetentionInventory(
 	}
 	delete(sweep.pendingRetentions, response.receipt)
 	return nil
+}
+
+// provisionAttributionLocked applies at collection every check
+// RecordBackendInventory later applies to this half, plus the same-backend
+// overlap with a retention response already collected. The second endpoint to
+// arrive detects an overlap, so no classification waits for disposal, which
+// cannot run until every backend in the sweep has answered.
+// Caller holds sweep.mu.
+func (sweep *ReconciliationSweep) provisionAttributionLocked(
+	response BackendProvisionInventory,
+) inventoryAttribution {
+	if response.refreshErr != nil || !sweep.pinnedIdentity(response.backendName, response.storageID) {
+		return inventoryUnattributed
+	}
+	seen := make(map[string]struct{}, len(response.provisions))
+	for _, row := range response.provisions {
+		if row.LeaseUUID == "" || row.BackendName != response.backendName {
+			return inventoryUnattributed
+		}
+		if _, duplicate := seen[row.LeaseUUID]; duplicate {
+			return inventoryUnattributed
+		}
+		seen[row.LeaseUUID] = struct{}{}
+	}
+	for _, retention := range sweep.pendingRetentions {
+		if retention.backendName != response.backendName {
+			continue
+		}
+		for _, leaseUUID := range retentionLeaseUUIDs(retention.retentions) {
+			if _, overlap := seen[leaseUUID]; overlap {
+				return inventoryUnattributed
+			}
+		}
+	}
+	return inventoryAttributed
+}
+
+// retentionAttributionLocked is the retention counterpart of
+// provisionAttributionLocked.
+// Caller holds sweep.mu.
+func (sweep *ReconciliationSweep) retentionAttributionLocked(
+	response BackendRetentionInventory,
+) inventoryAttribution {
+	if !sweep.pinnedIdentity(response.backendName, response.storageID) {
+		return inventoryUnattributed
+	}
+	seen := make(map[string]struct{}, len(response.retentions))
+	for _, leaseUUID := range retentionLeaseUUIDs(response.retentions) {
+		if leaseUUID == "" {
+			return inventoryUnattributed
+		}
+		if _, duplicate := seen[leaseUUID]; duplicate {
+			return inventoryUnattributed
+		}
+		seen[leaseUUID] = struct{}{}
+	}
+	for _, provision := range sweep.pendingProvisions {
+		if provision.backendName != response.backendName {
+			continue
+		}
+		for _, row := range provision.provisions {
+			if _, overlap := seen[row.LeaseUUID]; overlap {
+				return inventoryUnattributed
+			}
+		}
+	}
+	return inventoryAttributed
+}
+
+// pinnedIdentity is true only for a valid identity equal to the backend's
+// durable pin. An unbound pin cannot attribute a single endpoint.
+func (sweep *ReconciliationSweep) pinnedIdentity(backendName string, storageID backendidentity.ID) bool {
+	expected, bound := sweep.coordinator.coordinator.store.ExpectedBackendStorageIdentity(backendName)
+	return bound && storageID.Valid() && expected == storageID
 }
 
 func retentionLeaseUUIDs(retentions []backend.RetainedLease) []string {

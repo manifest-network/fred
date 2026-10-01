@@ -259,6 +259,18 @@ var (
 
 	// These are attempts, not distinct leases; labels describe a closed set of
 	// recovery branches or reclamation results rather than tenant identities.
+	maintenanceReceiptsUnverifiableTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "maintenance_receipts_unverifiable_total",
+		Help:      "Failed maintenance receipts, per recovery pass, whose target release could not be verified; each grants no cleanup authority and its late container is kept",
+	})
+	maintenanceExpiredTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "maintenance_expired_total",
+		Help:      "Provider restarts and updates refused because they are older than their lease's retained maintenance history",
+	})
 	maintenanceRecoveryDeferredTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,

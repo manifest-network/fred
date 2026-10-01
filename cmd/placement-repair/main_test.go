@@ -210,11 +210,15 @@ func (repairAttemptLeaseReader) Acknowledge(
 	return true, "", nil
 }
 
+// removedRepairBackend names a backend that joined the topology and left it.
+const removedRepairBackend = "backend-z"
+
 func repairBackendStorageID(t *testing.T, backendName string) backendidentity.ID {
 	t.Helper()
 	encoded := map[string]string{
-		"backend-a": "550e8400-e29b-41d4-a716-446655440001",
-		"backend-b": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
+		"backend-a":          "550e8400-e29b-41d4-a716-446655440001",
+		"backend-b":          "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
+		removedRepairBackend: "8f14e45f-ceea-467a-9575-4b5b2a0a2e01",
 	}[backendName]
 	id, err := backendidentity.Parse(encoded)
 	require.NoError(t, err)
@@ -275,6 +279,18 @@ func (inspector *semanticFailingRepairInspector) VerifyRefusalPostcondition(
 func (inspector *semanticFailingRepairInspector) VerifyConflictResolutionPostcondition(
 	placement.ConflictRepairCandidate,
 	placement.ConflictRepairResult,
+) error {
+	return inspector.cause
+}
+
+func (inspector *semanticFailingRepairInspector) VerifyRestoredBackupPostcondition(
+	placement.RestoredBackupResult,
+) error {
+	return inspector.cause
+}
+
+func (inspector *semanticFailingRepairInspector) VerifyBackendRetirementPostcondition(
+	placement.BackendRetirementResult,
 ) error {
 	return inspector.cause
 }

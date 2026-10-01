@@ -38,6 +38,8 @@ const (
 	MaintenanceApplicationCapacityReserved
 	MaintenanceApplicationServiceUnavailable
 	MaintenanceApplicationInternalFailure
+	MaintenanceApplicationBackendLost
+	MaintenanceApplicationExpired
 )
 
 // MaintenanceApplicationRequest is an opaque authenticated intent. The
@@ -312,6 +314,9 @@ func maintenanceRecordMatches(record MaintenanceCommandRecord, input Maintenance
 
 func resultForPreparation(preparation MaintenancePreparation) MaintenanceApplicationResult {
 	if err := preparation.Err(); err != nil {
+		if errors.Is(err, ErrPlacementLost) {
+			return maintenanceApplicationResult(MaintenanceApplicationBackendLost, nil)
+		}
 		return maintenanceApplicationResult(MaintenanceApplicationServiceUnavailable, err)
 	}
 	switch preparation.Outcome() {
@@ -339,8 +344,6 @@ func resultForMaintenanceBeginError(err error) MaintenanceApplicationResult {
 	switch {
 	case errors.Is(err, ErrMaintenanceCommandConflict):
 		return maintenanceApplicationResult(MaintenanceApplicationCommandConflict, err)
-	case errors.Is(err, ErrMaintenanceHistoryFull):
-		return maintenanceApplicationResult(MaintenanceApplicationServiceUnavailable, err)
 	case errors.Is(err, ErrInvalidMaintenanceCommand):
 		return maintenanceApplicationResult(MaintenanceApplicationInternalFailure, err)
 	default:
@@ -372,6 +375,10 @@ func resultForMaintenanceOutcome(outcome MaintenanceCommandOutcome) MaintenanceA
 		return maintenanceApplicationResult(MaintenanceApplicationForbidden, nil)
 	case MaintenanceOutcomeCapacityRefused, MaintenanceOutcomeBackendUnavailable:
 		return maintenanceApplicationResult(MaintenanceApplicationServiceUnavailable, nil)
+	case MaintenanceOutcomeBackendLost:
+		return maintenanceApplicationResult(MaintenanceApplicationBackendLost, nil)
+	case MaintenanceOutcomeExpired:
+		return maintenanceApplicationResult(MaintenanceApplicationExpired, nil)
 	default:
 		return maintenanceApplicationResult(MaintenanceApplicationInternalFailure,
 			errors.New("invalid durable maintenance outcome"))

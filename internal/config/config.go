@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/bech32"
 	"github.com/google/uuid"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/spf13/viper"
@@ -123,6 +125,12 @@ type Config struct {
 	SubSignerMinBalance        string        `mapstructure:"sub_signer_min_balance"`         // Top-up when below this (default: "10000000umfx")
 	SubSignerTopUpAmount       string        `mapstructure:"sub_signer_top_up_amount"`       // Amount per top-up (default: "50000000umfx")
 	SubSignerFundCheckInterval time.Duration `mapstructure:"sub_signer_fund_check_interval"` // Balance check interval (default: 1h)
+
+	// MaintenanceLegacyIdempotencyTenants lists tenant addresses whose restart
+	// and update requests may omit Idempotency-Key. Each keyless request is
+	// keyed by its single-use signed token instead. Empty (the default) keeps
+	// the header mandatory for everyone.
+	MaintenanceLegacyIdempotencyTenants []string `mapstructure:"maintenance_legacy_idempotency_tenants"`
 
 	// Reconciliation configuration
 	ReconciliationInterval time.Duration `mapstructure:"reconciliation_interval"`
@@ -330,6 +338,11 @@ func (c *Config) Validate() error {
 	if c.Bech32Prefix == "" {
 		return fmt.Errorf("bech32_prefix is required")
 	}
+	if err := validateTenantAddresses(
+		"maintenance_legacy_idempotency_tenants", c.MaintenanceLegacyIdempotencyTenants, c.Bech32Prefix,
+	); err != nil {
+		return err
+	}
 
 	// Numeric validations
 	if c.WithdrawInterval <= 0 {
@@ -445,6 +458,14 @@ func (c *Config) Validate() error {
 	}
 	if c.SubSignerCount > 0 && c.SubSignerFundCheckInterval <= 0 {
 		return fmt.Errorf("sub_signer_fund_check_interval must be positive when sub_signer_count > 0")
+	}
+	if c.SubSignerCount > 0 {
+		if _, err := sdk.ParseCoinNormalized(c.SubSignerMinBalance); err != nil {
+			return fmt.Errorf("invalid sub_signer_min_balance: %w", err)
+		}
+		if _, err := sdk.ParseCoinNormalized(c.SubSignerTopUpAmount); err != nil {
+			return fmt.Errorf("invalid sub_signer_top_up_amount: %w", err)
+		}
 	}
 
 	// Reconciliation validations
@@ -726,5 +747,27 @@ func validateExternalURL(rawURL string) error {
 		return fmt.Errorf("URL must not use an unspecified address")
 	}
 
+	return nil
+}
+
+// validateTenantAddresses accepts only canonical, distinct bech32 account
+// addresses with the configured prefix: authenticated tenants are compared by
+// exact string, so any other spelling could never match.
+func validateTenantAddresses(key string, addresses []string, prefix string) error {
+	seen := make(map[string]struct{}, len(addresses))
+	for _, address := range addresses {
+		hrp, data, err := bech32.DecodeAndConvert(address)
+		if err != nil || hrp != prefix || len(data) == 0 {
+			return fmt.Errorf("%s: %q is not a %s account address", key, address, prefix)
+		}
+		canonical, err := bech32.ConvertAndEncode(prefix, data)
+		if err != nil || canonical != address {
+			return fmt.Errorf("%s: %q is not in canonical form", key, address)
+		}
+		if _, duplicate := seen[address]; duplicate {
+			return fmt.Errorf("%s: %q is listed twice", key, address)
+		}
+		seen[address] = struct{}{}
+	}
 	return nil
 }

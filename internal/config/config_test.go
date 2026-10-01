@@ -5,9 +5,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/cosmos/cosmos-sdk/types/bech32"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -809,6 +811,47 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 				c.SubSignerCount = -1
 			},
 			wantErr: "sub_signer_count must be non-negative",
+		},
+		{
+			name: "legacy idempotency tenant with the wrong prefix",
+			modify: func(c *Config) {
+				c.MaintenanceLegacyIdempotencyTenants = []string{"cosmos1qypqxpq9qcrsszg2pvxq6rs0zqg3yyc5lzv7xu"}
+			},
+			wantErr: "is not a manifest account address",
+		},
+		{
+			name: "legacy idempotency tenant in non-canonical case",
+			modify: func(c *Config) {
+				c.MaintenanceLegacyIdempotencyTenants = []string{strings.ToUpper(testLegacyTenant)}
+			},
+			wantErr: "maintenance_legacy_idempotency_tenants",
+		},
+		{
+			name: "legacy idempotency tenant listed twice",
+			modify: func(c *Config) {
+				c.MaintenanceLegacyIdempotencyTenants = []string{testLegacyTenant, testLegacyTenant}
+			},
+			wantErr: "is listed twice",
+		},
+		{
+			name: "unparseable sub_signer_min_balance with sub_signer_count > 0",
+			modify: func(c *Config) {
+				c.SubSignerCount = 3
+				c.SubSignerFundCheckInterval = time.Hour
+				c.SubSignerMinBalance = "ten umfx"
+				c.SubSignerTopUpAmount = "50000000umfx"
+			},
+			wantErr: "invalid sub_signer_min_balance",
+		},
+		{
+			name: "unparseable sub_signer_top_up_amount with sub_signer_count > 0",
+			modify: func(c *Config) {
+				c.SubSignerCount = 3
+				c.SubSignerFundCheckInterval = time.Hour
+				c.SubSignerMinBalance = "10000000umfx"
+				c.SubSignerTopUpAmount = "umfx"
+			},
+			wantErr: "invalid sub_signer_top_up_amount",
 		},
 	}
 
@@ -2063,4 +2106,19 @@ func TestConfig_Validate_CreditCheckZeroGracePeriod(t *testing.T) {
 		c.CreditCheckZeroGracePeriod = -1 * time.Second
 		require.ErrorContains(t, c.Validate(), "credit_check_zero_grace_period cannot be negative")
 	})
+}
+
+// testLegacyTenant is a canonical manifest account address.
+var testLegacyTenant = func() string {
+	address, err := bech32.ConvertAndEncode("manifest", make([]byte, 20))
+	if err != nil {
+		panic(err)
+	}
+	return address
+}()
+
+func TestConfig_Validate_AcceptsCanonicalLegacyIdempotencyTenants(t *testing.T) {
+	cfg := validConfig()
+	cfg.MaintenanceLegacyIdempotencyTenants = []string{testLegacyTenant}
+	require.NoError(t, cfg.Validate())
 }

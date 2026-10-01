@@ -95,6 +95,7 @@ type AuthorityCounts struct {
 	LegacyPlacementRows     int `json:"legacy_placement_rows"`
 	RevisionedPlacementRows int `json:"revisioned_placement_rows"`
 	UnusablePlacementRows   int `json:"unusable_placement_rows"`
+	LostPlacementRows       int `json:"lost_placement_rows"`
 	LifecycleRows           int `json:"lifecycle_rows"`
 	UnusableLifecycleRows   int `json:"unusable_lifecycle_rows"`
 	DetachedLifecycleRows   int `json:"detached_lifecycle_rows"`
@@ -129,6 +130,7 @@ type AuthorityRowFact struct {
 	ConflictBackendsOmitted int      `json:"conflict_backends_omitted,omitempty"`
 	IdentityFieldsOmitted   int      `json:"identity_fields_omitted,omitempty"`
 	ConflictOwnersUnknown   bool     `json:"conflict_owners_unknown,omitempty"`
+	LostBackend             string   `json:"lost_backend,omitempty"`
 	LifecycleVerdict        string   `json:"lifecycle_verdict"`
 }
 
@@ -914,6 +916,11 @@ func inspectCurrentPlacementRows(
 			})
 			return nil
 		}
+		if lostBackend, lost := placement.LostBackend(); lost {
+			inspectLostPlacementRow(leaseUUID, placement, lostBackend, metadata, metadataDecoded,
+				lifecycleBucket, assessment)
+			return nil
+		}
 		state := placement.State().String()
 		if placement.Conflict {
 			state = "conflict"
@@ -982,6 +989,42 @@ func inspectCurrentPlacementRows(
 	}
 }
 
+// inspectLostPlacementRow reports a lease closed as lost with a retired
+// backend. The name must be a recorded retirement; otherwise the row is not
+// one retirement wrote.
+func inspectLostPlacementRow(
+	leaseUUID string,
+	placement Placement,
+	lostBackend string,
+	metadata topologyMetadata,
+	metadataDecoded bool,
+	lifecycleBucket *bolt.Bucket,
+	assessment *authorityAssessment,
+) {
+	assessment.report.Counts.LostPlacementRows++
+	assessment.report.Counts.RevisionedPlacementRows++
+	row := AuthorityRowFact{
+		LeaseUUID: leaseUUID, State: "lost", Revision: placement.revision,
+		LifecycleVerdict: "missing",
+	}
+	if safeAuthorityBackendName(lostBackend) {
+		row.LostBackend = lostBackend
+	} else {
+		assessment.mixedFinding(
+			"placement_backend_identity_invalid",
+			"a placement backend cannot be rendered safely",
+		)
+	}
+	if _, retired := metadata.RetiredBackends[lostBackend]; metadataDecoded && !retired {
+		assessment.corruptFinding(
+			"lost_placement_backend_not_retired",
+			"a lost placement names a backend with no recorded retirement",
+		)
+	}
+	inspectAuthorityLifecycleBindingForPlacement(leaseUUID, placement, lifecycleBucket, &row, assessment)
+	assessment.setRow(row)
+}
+
 func inspectAuthorityLifecycleBindingForPlacement(
 	leaseUUID string,
 	placement Placement,
@@ -1038,6 +1081,9 @@ func decodeAuthorityPlacement(leaseUUID string, value []byte) (Placement, bool) 
 	persisted, fields, err := decodeCurrentPlacementRecord(value)
 	if err != nil {
 		return Placement{}, false
+	}
+	if persisted.LostBackend != "" {
+		return lostPlacementFromRecord(persisted)
 	}
 	operationID, operationErr := decodeOperationID(persisted.OperationID)
 	operationKind, kindErr := decodeOperationKind(persisted.OperationKind)

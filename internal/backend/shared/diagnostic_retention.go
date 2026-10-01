@@ -39,6 +39,7 @@ func (diagnostics *FailureDiagnostics) pruneAttemptCapturesLocked(candidate diag
 	var present bool
 	var completedOperations []operationCompletionRecord
 	var completedMaintenance []maintenanceCompletionRecord
+	var evictedThrough int
 	err := diagnostics.operations.callbacks.view(func(tx *bolt.Tx) error {
 		var err error
 		head, present, err = getLeaseMutationHeadTx(tx, candidate.LeaseUUID)
@@ -53,12 +54,19 @@ func (diagnostics *FailureDiagnostics) pruneAttemptCapturesLocked(candidate diag
 			return err
 		}
 		completedMaintenance, err = listMaintenanceReceiptsTx(tx, candidate.LeaseUUID)
+		if err != nil {
+			return err
+		}
+		// An evicted receipt's attempt completed too; the lineage keeps the
+		// positive fact after the receipt leaves the window.
+		lineage, err := loadMaintenanceLineageTx(tx, candidate.LeaseUUID)
+		evictedThrough = lineage.EvictedThroughReleaseVersion
 		return err
 	})
 	if err != nil {
 		return err
 	}
-	if !present && len(completedOperations) == 0 && len(completedMaintenance) == 0 {
+	if !present && len(completedOperations) == 0 && len(completedMaintenance) == 0 && evictedThrough == 0 {
 		return nil
 	}
 	return diagnostics.store.update(func(tx *bolt.Tx) error {
@@ -77,7 +85,8 @@ func (diagnostics *FailureDiagnostics) pruneAttemptCapturesLocked(candidate diag
 			if diagnosticCanPublishThroughHead(record.Identity, head) {
 				continue
 			}
-			if !present && !diagnosticHasCompletedReceipt(record.Identity, completedOperations, completedMaintenance) {
+			if !present && !diagnosticHasCompletedReceipt(record.Identity, completedOperations, completedMaintenance) &&
+				!diagnosticEvicted(record.Identity, evictedThrough) {
 				continue
 			}
 			if err := diagnostics.store.deleteAttemptTx(tx, key); err != nil {
@@ -109,6 +118,15 @@ func diagnosticHasCompletedReceipt(identity diagnosticAttemptIdentity, operation
 		}
 	}
 	return false
+}
+
+// diagnosticEvicted reports a maintenance attempt whose receipt left the
+// rolling window: target release versions only increase and one maintenance
+// head runs at a time, so any attempt at or below the highest evicted
+// receipt's target completed.
+func diagnosticEvicted(identity diagnosticAttemptIdentity, evictedThrough int) bool {
+	return identity.Kind == "maintenance" && identity.ReleaseVersion > 0 &&
+		identity.ReleaseVersion <= evictedThrough
 }
 
 func diagnosticCanPublishThroughHead(identity diagnosticAttemptIdentity, head leaseMutationHead) bool {

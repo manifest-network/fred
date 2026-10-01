@@ -140,6 +140,109 @@ func newDurablePreflightVerdictFailure(
 	}
 }
 
+// preparationOutcome is the machine-readable result of one -prepare run, for
+// callers that must choose a retry without parsing prose. The command exits
+// with its code and ends stdout with {"outcome":"<name>"}.
+type preparationOutcome uint8
+
+const (
+	// The zero value is reserved as invalid.
+	_ preparationOutcome = iota
+	// preparationPrepared: the database is prepared and every postcondition
+	// verified.
+	preparationPrepared
+	// preparationNotMutated: neither the database nor the backup path changed,
+	// so rerunning the proof and -prepare is safe.
+	preparationNotMutated
+	// preparationBackupPublished: the exact backup exists but no preparation
+	// committed; retry with a new -backup path.
+	preparationBackupPublished
+	// preparationOutcomeUnknown: the commit returned an error; classify first.
+	preparationOutcomeUnknown
+	// preparationPreparedUnverified: the preparation committed but a later
+	// verification or report failed; classify first.
+	preparationPreparedUnverified
+)
+
+func (outcome preparationOutcome) String() string {
+	switch outcome {
+	case preparationPrepared:
+		return "prepared"
+	case preparationNotMutated:
+		return "not_mutated"
+	case preparationBackupPublished:
+		return "backup_published"
+	case preparationOutcomeUnknown:
+		return "outcome_unknown"
+	case preparationPreparedUnverified:
+		return "prepared_unverified"
+	default:
+		return "invalid"
+	}
+}
+
+// exitCode leaves 1 to failures outside -prepare and to an invalid outcome.
+func (outcome preparationOutcome) exitCode() int {
+	switch outcome {
+	case preparationPrepared:
+		return 0
+	case preparationNotMutated:
+		return 10
+	case preparationBackupPublished:
+		return 11
+	case preparationOutcomeUnknown:
+		return 12
+	case preparationPreparedUnverified:
+		return 13
+	default:
+		return 1
+	}
+}
+
+func (outcome preparationOutcome) line() string {
+	return fmt.Sprintf("{\"outcome\":%q}\n", outcome.String())
+}
+
+// classifyPreparationFailure takes the durable status this command tracked
+// first and the sentinels the preparer authored at each durable step second,
+// and resolves a disagreement toward the more severe outcome. Nothing else
+// can be not_mutated: every failure after the preparation capability is
+// consumed carries one of those sentinels.
+func classifyPreparationFailure(status durablePreflightStatus, err error) preparationOutcome {
+	switch {
+	case status == preflightPreparationOutcomeUnknown,
+		errors.Is(err, errPreflightOutcomeUnknown),
+		errors.Is(err, placement.ErrLegacyPreparationOutcomeUnknown):
+		return preparationOutcomeUnknown
+	case status == preflightPrepared,
+		errors.Is(err, errPreflightPrepared),
+		errors.Is(err, placement.ErrLegacyPreparationCommitted):
+		return preparationPreparedUnverified
+	case errors.Is(err, placement.ErrExactBackupPublished):
+		return preparationBackupPublished
+	default:
+		return preparationNotMutated
+	}
+}
+
+// preparationFailure carries a failed -prepare run's outcome to main.
+type preparationFailure struct {
+	outcome preparationOutcome
+	cause   error
+}
+
+func (failure *preparationFailure) Error() string { return failure.cause.Error() }
+
+func (failure *preparationFailure) Unwrap() error { return failure.cause }
+
+func commandExitCode(err error) int {
+	var failure *preparationFailure
+	if errors.As(err, &failure) {
+		return failure.outcome.exitCode()
+	}
+	return 1
+}
+
 type inventoryClient = placementprobe.Client
 
 type providerLeaseSnapshot interface {
@@ -228,7 +331,7 @@ func main() {
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		writeCommandError(os.Stderr, err)
-		os.Exit(1)
+		os.Exit(commandExitCode(err))
 	}
 }
 
@@ -313,6 +416,20 @@ func runWithDependencies(
 			return fmt.Errorf("write version: %w", err)
 		}
 		return nil
+	}
+	durableStatus := preflightNotMutated
+	if *prepare {
+		// Registered before the database closer, so it classifies the final
+		// error, including a close failure after the commit. The success
+		// verdict carries its own outcome line.
+		defer func() {
+			if runErr == nil {
+				return
+			}
+			outcome := classifyPreparationFailure(durableStatus, runErr)
+			_, _ = io.WriteString(stdout, outcome.line())
+			runErr = &preparationFailure{outcome: outcome, cause: runErr}
+		}()
 	}
 	if *inspectReleases != "" {
 		var incompatible string
@@ -479,7 +596,6 @@ func runWithDependencies(
 		placementClosed = true
 		return closePlacement()
 	}
-	durableStatus := preflightNotMutated
 	defer func() {
 		closeErr := closePlacementOnce()
 		if closeErr == nil {
@@ -653,6 +769,9 @@ func runWithDependencies(
 		summary.ConfiguredBackends, verdict,
 	); err != nil {
 		return fmt.Errorf("render preflight verdict: %w", err)
+	}
+	if *prepare {
+		output.WriteString(preparationPrepared.line())
 	}
 	if err := writeCompleteVerdict(stdout, output.Bytes()); err != nil {
 		if durableStatus != preflightNotMutated {

@@ -576,7 +576,8 @@ func TestFailedMaintenanceReceiptRemovesLateExactTarget(t *testing.T) {
 
 	require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
 	h.assertSettled(backend.CallbackStatusFailed)
-	receipts, err := h.b.maintenanceSettlement.ListFailedMaintenanceReceipts()
+	receipts, unverifiable, err := h.b.maintenanceSettlement.ListFailedMaintenanceReceipts()
+	require.Empty(t, unverifiable)
 	require.NoError(t, err)
 	require.Len(t, receipts, 1)
 	acknowledgePendingCallbacksForTest(t, h.callbacks)

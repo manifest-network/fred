@@ -63,10 +63,11 @@ func (s *CallbackStore) ProbeMaintenanceIntent(
 	var disposition MaintenanceIntentAdmissionDisposition
 	err := s.view(func(tx *bolt.Tx) error {
 		var classifyErr error
-		disposition, classifyErr = classifyMaintenanceReplayTx(
-			tx, request.LeaseUUID(), request.MaintenanceID(),
-			encodeMaintenanceDigest(request.digest),
-		)
+		disposition, classifyErr = classifyMaintenanceReplayTx(tx, maintenanceReplayRequest{
+			leaseUUID: request.LeaseUUID(), id: request.MaintenanceID(),
+			digest: encodeMaintenanceDigest(request.digest), kind: request.Kind(),
+			admittedAt: request.AdmittedAt(),
+		})
 		return classifyErr
 	})
 	return disposition, err

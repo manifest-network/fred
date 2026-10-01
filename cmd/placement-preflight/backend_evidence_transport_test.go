@@ -51,7 +51,11 @@ func TestRun_MutationsRequireAuthenticatedBackendEvidence(t *testing.T) {
 				var output bytes.Buffer
 				err := runWithDependencies(t.Context(), args, &output, &bytes.Buffer{}, dependencies)
 				require.ErrorContains(t, err, "authenticated backend evidence requires certificate-verified HTTPS")
-				require.Empty(t, output.String())
+				if mode == "prepare" {
+					require.Equal(t, `{"outcome":"not_mutated"}`+"\n", output.String())
+				} else {
+					require.Empty(t, output.String())
+				}
 				require.Zero(t, bound, "transport authority must be constructed before binding a backup target")
 				require.Zero(t, requests.Load())
 				require.NoFileExists(t, dbPath)

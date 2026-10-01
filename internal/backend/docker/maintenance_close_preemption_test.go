@@ -163,7 +163,8 @@ func TestDeprovisionStartedMaintenanceKeepsUnknownCleanupPending(t *testing.T) {
 
 	// The exact close head now exclusively owns this Started generation. Its
 	// failure callback is history, not another physical cleanup capability.
-	receipts, err := h.b.maintenanceSettlement.ListFailedMaintenanceReceipts()
+	receipts, unverifiable, err := h.b.maintenanceSettlement.ListFailedMaintenanceReceipts()
+	require.Empty(t, unverifiable)
 	require.NoError(t, err)
 	require.Empty(t, receipts)
 	h.inventory.mu.Lock()

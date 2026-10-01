@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -59,7 +61,28 @@ type PlacementLookup interface {
 // separate optional capability from PlacementLookup: ordinary read routing can
 // remain available while new multi-backend side effects are still fail-closed.
 type PlacementBootstrap interface {
-	InventoryBootstrapped() bool
+	InventoryReadiness() placement.InventoryReadiness
+}
+
+// The readiness gate is wired by a runtime type assertion that drops it when
+// the store stops satisfying this interface; keep that a compile error.
+var _ PlacementBootstrap = (*placement.Store)(nil)
+
+// placementInventoryReadinessError maps the closed readiness reason to the
+// probe verdict. An unrecognized value fails closed.
+func placementInventoryReadinessError(readiness placement.InventoryReadiness) error {
+	switch readiness {
+	case placement.InventoryReady:
+		return nil
+	case placement.InventoryRecoveryPending:
+		return errors.New("an interrupted placement inventory sweep awaits its reporters")
+	case placement.InventoryAwaitingBaseline:
+		return errors.New("authoritative placement inventory has not completed")
+	case placement.InventoryAuthorityWithdrawn:
+		return errors.New("placement store authority was withdrawn")
+	default:
+		return fmt.Errorf("unknown placement inventory readiness %d", readiness)
+	}
 }
 
 // PayloadStoreHealth reports whether the payload store's bbolt database is
@@ -109,6 +132,8 @@ type Handlers struct {
 	wsMaxConnLifetime  time.Duration // max lifetime of an /events subscription before forced reconnect
 	providerUUID       string
 	bech32Prefix       string
+	// legacyIdempotencyTenants may omit Idempotency-Key on restart/update.
+	legacyIdempotencyTenants map[string]struct{}
 }
 
 // HandlersConfig configures a Handlers instance.
@@ -124,6 +149,10 @@ type HandlersConfig struct {
 	EventBroker        *EventBroker          // optional — if nil, the events endpoint will return 501
 	ProviderUUID       string
 	Bech32Prefix       string
+	// MaintenanceLegacyIdempotencyTenants lists tenants whose restart/update
+	// requests may omit Idempotency-Key; each such request is keyed by its
+	// single-use signed token. Empty keeps the header mandatory.
+	MaintenanceLegacyIdempotencyTenants []string
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -162,6 +191,13 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		wsMaxConnLifetime: wsDefaultMaxConnLifetime,
 		providerUUID:      cfg.ProviderUUID,
 		bech32Prefix:      cfg.Bech32Prefix,
+		legacyIdempotencyTenants: func() map[string]struct{} {
+			tenants := make(map[string]struct{}, len(cfg.MaintenanceLegacyIdempotencyTenants))
+			for _, tenant := range cfg.MaintenanceLegacyIdempotencyTenants {
+				tenants[tenant] = struct{}{}
+			}
+			return tenants
+		}(),
 	}
 }
 
@@ -273,6 +309,10 @@ func (h *Handlers) authenticateAndResolve(w http.ResponseWriter, r *http.Request
 		return nil, leaseUUID, nil, false
 	}
 
+	if h.placementLost(leaseUUID) {
+		writeBackendStorageLost(w)
+		return nil, leaseUUID, nil, false
+	}
 	sku := provisioner.ExtractRoutingSKU(auth.Lease)
 	b = h.resolveBackend(leaseUUID, sku)
 	if b == nil {
@@ -753,7 +793,12 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 	// ENG-333 keeps alive on close) and falls back to the bounded fan-out otherwise.
 	// Errors are intentionally ignored — provision status on /status is
 	// best-effort and ErrNotProvisioned during initial setup is expected.
-	if h.backendRouter != nil {
+	if h.placementLost(leaseUUID) {
+		// Decided from the durable record: no backend can answer for it.
+		response.ProvisionStatus = string(backend.ProvisionStatusFailed)
+		response.Reason = string(backend.ReasonBackendStorageLost)
+		response.Message = backend.MsgBackendStorageLost
+	} else if h.backendRouter != nil {
 		sku := provisioner.ExtractRoutingSKU(lease)
 		info, fanErr := h.findProvision(r.Context(), leaseUUID, sku)
 		if fanErr != nil {
@@ -908,6 +953,11 @@ func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 
 	var sku string
 	if lease != nil {
+		// Only a chain-authorized caller learns the lease is lost.
+		if h.placementLost(leaseUUID) {
+			writeBackendStorageLost(w)
+			return
+		}
 		sku = provisioner.ExtractRoutingSKU(lease)
 	}
 	// Placement fast-path for the ACTIVE common case; bounded fan-out otherwise.
@@ -1071,11 +1121,15 @@ type LeaseReleasesResponse struct {
 
 // RestartLease handles POST /v1/leases/{lease_uuid}/restart
 func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
-	requestID, ok := h.parseMaintenanceID(w, r)
+	key, ok := h.parseMaintenanceKey(w, r)
 	if !ok {
 		return
 	}
 	token, leaseUUID, ok := h.authenticateMaintenanceToken(w, r)
+	if !ok {
+		return
+	}
+	requestID, ok := h.maintenanceID(w, key, token, leaseUUID, maintenanceapp.KindRestart)
 	if !ok {
 		return
 	}
@@ -1162,6 +1216,8 @@ func (h *Handlers) writeRestoreResult(
 			"lease_uuid", leaseUUID, "from_lease", sourceLeaseUUID,
 			"cause", fmt.Sprintf("%.1024s", fmt.Sprint(result.Cause())))
 		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+	case restoreapp.OutcomeSourceLost:
+		writeBackendStorageLost(w)
 	case restoreapp.OutcomeSourceBusy:
 		writeRestoreConflict(w, "lease is already being provisioned or restored", "source_busy")
 	case restoreapp.OutcomeTargetBusy:
@@ -1205,11 +1261,15 @@ func writeRestoreConflict(w http.ResponseWriter, message, reason string) {
 
 // UpdateLease handles POST /v1/leases/{lease_uuid}/update
 func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
-	requestID, ok := h.parseMaintenanceID(w, r)
+	key, ok := h.parseMaintenanceKey(w, r)
 	if !ok {
 		return
 	}
 	token, leaseUUID, ok := h.authenticateMaintenanceToken(w, r)
+	if !ok {
+		return
+	}
+	requestID, ok := h.maintenanceID(w, key, token, leaseUUID, maintenanceapp.KindUpdate)
 	if !ok {
 		return
 	}
@@ -1253,21 +1313,87 @@ func (h *Handlers) authenticateMaintenanceToken(
 	return token, leaseUUID, true
 }
 
-func (h *Handlers) parseMaintenanceID(
+const errMsgIdempotencyKeyRequired = "Idempotency-Key header must occur exactly once"
+
+// maintenanceKey is a request's idempotency identity before authentication.
+// A keyless request has none until authentication consumes its single-use
+// token; only a tenant listed for legacy keys may then derive one from it.
+type maintenanceKey struct {
+	id      maintenanceid.ID
+	keyless bool
+}
+
+// parseMaintenanceKey refuses a malformed or repeated header before
+// authentication. An absent header is deferred to authentication only when
+// some tenant may use legacy keys; otherwise it is refused here, as before.
+func (h *Handlers) parseMaintenanceKey(
 	w http.ResponseWriter,
 	r *http.Request,
-) (maintenanceid.ID, bool) {
+) (maintenanceKey, bool) {
 	values := r.Header.Values(idempotencyKeyHeader)
+	if len(values) == 0 && len(h.legacyIdempotencyTenants) != 0 {
+		return maintenanceKey{keyless: true}, true
+	}
 	if len(values) != 1 || values[0] == "" {
-		writeError(w, "Idempotency-Key header must occur exactly once", http.StatusBadRequest)
-		return maintenanceid.ID{}, false
+		writeError(w, errMsgIdempotencyKeyRequired, http.StatusBadRequest)
+		return maintenanceKey{}, false
 	}
 	id, err := maintenanceid.Parse(values[0])
 	if err != nil {
 		writeError(w, "Idempotency-Key must be a canonical UUIDv4", http.StatusBadRequest)
+		return maintenanceKey{}, false
+	}
+	return maintenanceKey{id: id}, true
+}
+
+// maintenanceID resolves the command identity after authentication. A keyless
+// request from a listed tenant is keyed by its signed token, which the replay
+// tracker has just consumed: a retry needs a new token and becomes a new
+// command, as with the pre-key API, and a replayed token is refused before
+// this point. The request body is deliberately not part of the key, so a later
+// identical request is never mistaken for a replay.
+func (h *Handlers) maintenanceID(
+	w http.ResponseWriter,
+	key maintenanceKey,
+	token *AuthToken,
+	leaseUUID string,
+	kind maintenanceapp.Kind,
+) (maintenanceid.ID, bool) {
+	if !key.keyless {
+		return key.id, true
+	}
+	if _, listed := h.legacyIdempotencyTenants[token.Tenant]; !listed || token.Signature == "" {
+		writeError(w, errMsgIdempotencyKeyRequired, http.StatusBadRequest)
 		return maintenanceid.ID{}, false
 	}
+	id := legacyMaintenanceID(h.providerUUID, leaseUUID, kind, token.Signature)
+	metrics.APIMaintenanceLegacyKeyTotal.Inc()
+	slog.Warn("maintenance request without Idempotency-Key keyed by its signed token",
+		"lease_uuid", leaseUUID, "tenant", token.Tenant, "maintenance_id", id.String())
 	return id, true
+}
+
+// legacyMaintenanceID hashes length-prefixed fields, so no field can absorb a
+// neighbor's bytes. The signature is the low-S canonical form Validate keeps.
+func legacyMaintenanceID(
+	providerUUID string,
+	leaseUUID string,
+	kind maintenanceapp.Kind,
+	signature string,
+) maintenanceid.ID {
+	digest := sha256.New()
+	for _, field := range []string{
+		"fred/maintenance-legacy-idempotency-key/v1", providerUUID, leaseUUID,
+		strconv.Itoa(int(kind)), signature,
+	} {
+		var length [8]byte
+		binary.BigEndian.PutUint64(length[:], uint64(len(field)))
+		digest.Write(length[:])
+		digest.Write([]byte(field))
+	}
+	var sum [sha256.Size]byte
+	copy(sum[:], digest.Sum(nil))
+	return maintenanceid.Derive(sum)
 }
 
 func (h *Handlers) writeMaintenanceResult(
@@ -1291,6 +1417,14 @@ func (h *Handlers) writeMaintenanceResult(
 		writeError(w, "lease is no longer active", http.StatusConflict)
 	case maintenanceapp.OutcomeForbidden:
 		writeError(w, errMsgForbidden, http.StatusForbidden)
+	case maintenanceapp.OutcomeBackendLost:
+		writeBackendStorageLost(w)
+	case maintenanceapp.OutcomeExpired:
+		writeJSON(w, ErrorResponse{
+			Error:  "this command is older than the lease's retained maintenance history and was not run; send a new command",
+			Code:   http.StatusGone,
+			Reason: "maintenance_expired",
+		}, http.StatusGone)
 	case maintenanceapp.OutcomeAlreadyInProgress:
 		writeError(w, "lease is already undergoing a lifecycle operation", http.StatusConflict)
 	case maintenanceapp.OutcomeCommandConflict:
@@ -1573,15 +1707,20 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 			measureHealthProbe(ctx, h.placementLookup.Healthy))
 	}
 	if h.placementBootstrap != nil {
+		// The store call is the measured work: it reattests runtime authority
+		// and waits on the store lock.
+		var readiness placement.InventoryReadiness
 		probe := measureHealthProbe(ctx, func() error {
-			if !h.placementBootstrap.InventoryBootstrapped() {
-				return errors.New("authoritative placement inventory has not completed")
-			}
-			return nil
+			readiness = h.placementBootstrap.InventoryReadiness()
+			return placementInventoryReadinessError(readiness)
 		})
+		clientMsg := "placement inventory not ready"
+		if readiness == placement.InventoryRecoveryPending {
+			clientMsg = "placement inventory recovery pending"
+		}
 		record(healthCheckInventory, true,
 			"health check: placement inventory not bootstrapped",
-			"placement inventory not ready", probe)
+			clientMsg, probe)
 	}
 
 	// Check payload store (bbolt database)
@@ -2281,4 +2420,25 @@ func extractBearerToken(r *http.Request) (string, error) {
 		return "", errInvalidAuthFormat
 	}
 	return parts[1], nil
+}
+
+// writeBackendStorageLost is the one terminal answer for a lease whose
+// backend an operator retired as irrecoverably lost: the workload and its data
+// are gone, so no retry can succeed.
+func writeBackendStorageLost(w http.ResponseWriter) {
+	writeJSON(w, ErrorResponse{
+		Error:  backend.MsgBackendStorageLost,
+		Code:   http.StatusGone,
+		Reason: "backend_storage_lost",
+	}, http.StatusGone)
+}
+
+// placementLost reports whether the lease's durable placement was lost with a
+// retired backend's storage. It never consults a backend.
+func (h *Handlers) placementLost(leaseUUID string) bool {
+	if h.placementLookup == nil {
+		return false
+	}
+	_, lost := h.placementLookup.Lookup(leaseUUID).LostBackend()
+	return lost
 }

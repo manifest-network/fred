@@ -72,6 +72,11 @@ func (b *Backend) admitMaintenance(
 	}
 	admission, err := b.maintenanceSettlement.BeginMaintenanceIntent(candidate)
 	if err != nil {
+		if errors.Is(err, shared.ErrMaintenanceIntentConflict) {
+			// Nothing was published: a definitive refusal, not an ambiguous call.
+			return maintenanceAdmission{},
+				fmt.Errorf("%w: publish durable %s maintenance intent: %w", backend.ErrInvalidState, request.Kind(), err)
+		}
 		return maintenanceAdmission{},
 			fmt.Errorf("publish durable %s maintenance intent: %w", request.Kind(), err)
 	}
@@ -545,10 +550,19 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 }
 
 func (b *Backend) recoverFailedMaintenanceReceipts(ctx context.Context) error {
-	receipts, err := b.maintenanceSettlement.ListFailedMaintenanceReceipts()
+	receipts, unverifiable, err := b.maintenanceSettlement.ListFailedMaintenanceReceipts()
 	if err != nil {
 		return fmt.Errorf("list failed maintenance receipts: %w", err)
 	}
+	for _, receipt := range unverifiable {
+		// No cleanup authority: a late container for this generation is kept
+		// and handled by ordinary lease-local recovery.
+		maintenanceReceiptsUnverifiableTotal.Inc()
+		b.logger.Error("failed maintenance receipt target cannot be verified; keeping any late container",
+			"lease_uuid", receipt.LeaseUUID, "maintenance_id", receipt.MaintenanceID.String(),
+			"error", receipt.Cause)
+	}
+	proofs := make([]shared.FailedMaintenanceCleanupProof, 0, len(receipts))
 	for _, receipt := range receipts {
 		if receipt.Backend() != b.Name() || receipt.BackendStorageID() != b.storageIdentity {
 			return fmt.Errorf(
@@ -556,14 +570,21 @@ func (b *Backend) recoverFailedMaintenanceReceipts(ctx context.Context) error {
 				receipt.LeaseUUID(), receipt.Backend(), receipt.BackendStorageID(),
 			)
 		}
-		_, cleanupErr := b.recoveryCoordinator.WithLease(
+		var proof shared.FailedMaintenanceCleanupProof
+		ran, cleanupErr := b.recoveryCoordinator.WithLease(
 			ctx, receipt.LeaseUUID(),
 			func(scope shared.LeaseRecoveryScope) error {
-				return b.maintenanceSettlement.CleanupFailedMaintenanceReceipt(
+				var err error
+				proof, err = b.maintenanceSettlement.CleanupFailedMaintenanceReceipt(
 					ctx, scope, receipt,
 				)
+				return err
 			},
 		)
+		if errors.Is(cleanupErr, shared.ErrFailedMaintenanceReceiptGone) {
+			// Evicted or closed since the listing: nothing remains to clean.
+			continue
+		}
 		if cleanupErr != nil {
 			if _, deferred := maintenanceRecoveryRetry(cleanupErr); deferred && ctx.Err() == nil {
 				maintenanceRecoveryDeferredTotal.Inc()
@@ -575,6 +596,15 @@ func (b *Backend) recoverFailedMaintenanceReceipts(ctx context.Context) error {
 			return fmt.Errorf("clean late failed maintenance for lease %q: %w",
 				receipt.LeaseUUID(), cleanupErr)
 		}
+		if ran {
+			proofs = append(proofs, proof)
+		}
+	}
+	// Confirming lets those receipts leave the rolling window. Failing to
+	// record it only keeps them longer, so it never fails recovery.
+	if err := b.maintenanceSettlement.ConfirmFailedMaintenanceCleanup(proofs, unverifiable); err != nil {
+		b.logger.Warn("failed-maintenance cleanup confirmation not recorded; those receipts stay in the window",
+			"error", err)
 	}
 	return nil
 }

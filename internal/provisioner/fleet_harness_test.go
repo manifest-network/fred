@@ -724,6 +724,7 @@ type fleet struct {
 	servers       []*fakeBackendServer
 	byName        map[string]*fakeBackendServer
 	router        *backend.Router
+	routerEntries []backend.BackendEntry
 	reconciler    *Reconciler
 	chain         *chaintest.MockClient
 	placement     *placement.Store
@@ -817,6 +818,7 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 	router, err := backend.NewRouter(backend.RouterConfig{Backends: entries})
 	require.NoError(t, err)
 	f.router = router
+	f.routerEntries = entries
 
 	payloads, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "payloads.db"),

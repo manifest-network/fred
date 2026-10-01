@@ -242,7 +242,17 @@ containing it.
 
 ## Configuration files
 
-Two files, both validated at startup. The daemon refuses to start with any required field missing or invalid.
+Two files, both validated at startup. The daemon refuses to start with any required field missing or invalid, and with any key it does not recognize.
+
+Check a file before swapping it in, or before replacing a binary that will read
+it. Each command runs every configuration check its startup makes before
+touching a store, Docker, or the network (environment overrides included), prints
+one line on success, and exits 0 or 1:
+
+```bash
+providerd --validate-config --config /etc/fred/config.yaml
+docker-backend -validate-config -config /etc/fred/docker-backend.yaml
+```
 
 | File | Mounted at | Owner |
 |---|---|---|
@@ -672,7 +682,7 @@ and preserve that safety evidence.
 | `<docker>/diagnostics.db` | Medium — failure diagnostics for past 7 days, but no lifecycle authority | May be recreated after loss while the backend is stopped; only historical diagnostics are lost. Open/create still refuses a symlink, hard link, non-regular file, or mode other than exact `0600`, but the file is not identity-bound or continuously re-attested |
 | `<docker>/callbacks.db` | Critical — write-ahead provision/restore operation rows (Pending/Succeeded/Failed), replacement intents, immutable resource/target authority, non-expiring destructive-close finalizers, durable exact/lifecycle deliveries, and per-lease FIFO evidence. Terminal operation rows remain after callback delivery as exact retry and restore-recovery authority until an authorized successor atomically retires them. Causal/close rows and exact operation/maintenance completions do not age out; typed lifecycle observations are retained up to `callback_max_age`. Pre-identity v0.13 outbox rows must be drained while the old backend is still running and are never admitted into the current runtime queue | Accepted or terminal operation state, partial-replacement/close authority, immutable sizing, and queued callback evidence are not recreated. Normal startup refuses a missing file instead of rebuilding its schema. Losing a terminal restore result can make a safe source handback unknowable; absence is invalid rather than Failed. Losing a maintenance row can make an exact replacement cohort unclassifiable; losing a close row after teardown starts can turn an intentional zero-survivor cohort into unexplained release divergence. Restore this file with the matching `releases.db`, `retention.db`, marker pair, and substrate |
 | Backend storage-lineage seal | Critical — the marker pair plus every identity-bound authoritative store bind a backend name to one substrate generation | Docker's set is `callbacks.db`, `releases.db`, `retention.db`, both markers, and the substrate; k3s uses `callbacks.db`, `releases.db`, both markers, and the cluster. Every authoritative database must remain an unsymlinked, single-link regular file with exact mode `0600`; startup and runtime re-attestation fail closed on drift. Restore the complete matching set. One missing, corrupt, foreign, cross-kind, or path/inode-replaced member intentionally prevents startup. Never copy markers onto replacement storage or rerun initialization to repair a committed seal. Whenever Docker has `volume_data_path`, the primary is `volume_data_path/.fred-backend-storage-identity.json` and the anchor is `callback_db_path.storage-identity-anchor.json`; Docker without a managed volume root and k3s keep both adjacent to `callback_db_path`. If all paths share one mount, the set detects partial deletion/torn initialization but is not an independent backup—protect and snapshot the whole mount |
-| `placement_store_db_path` | Critical — provider binding, unresolved attempts, ordinary and rejected-positive (`untrusted_positive`) quarantine, immutable backend-name/storage pins, topology history, and the durable inventory baseline are non-derivable safety authority | Restore the exact file only while `providerd` is stopped. It must be an unsymlinked, single-link regular file with exact mode `0600`. Normal startup never creates, initializes, or migrates an absent/empty/unprepared replacement, and rejects a file bound to another provider. The fresh initializer is only for a genuinely new provider with zero total chain lease history; it is never recovery for a lost database |
+| `placement_store_db_path` | Critical — provider binding, unresolved attempts, ordinary and rejected-positive (`untrusted_positive`) quarantine, immutable backend-name/storage pins, topology history, and the durable inventory baseline are non-derivable safety authority | Restore the exact file only while `providerd` is stopped, then [attest it](#restoring-an-older-placement-backup) before the first start. It must be an unsymlinked, single-link regular file with exact mode `0600`. Normal startup never creates, initializes, or migrates an absent/empty/unprepared replacement, and rejects a file bound to another provider. The fresh initializer is only for a genuinely new provider with zero total chain lease history; it is never recovery for a lost database |
 | `payload_store_db_path` | Low — pending tenant manifests, which tenants can re-upload | Restore only while `providerd` is stopped as an unsymlinked, single-link regular file with exact mode `0600`; otherwise tenants must re-upload pending payloads |
 | `token_tracker_db_path` | None — replay protection has 30s window anyway | Empties on restart, acceptable. bbolt creates a missing file with mode `0600`, but this short-lived cache is not lineage/path identity-bound like placement or payload authority; replace it only while providerd is stopped |
 
@@ -699,6 +709,142 @@ drifts. A live backup must be an atomic
 filesystem snapshot, not pathname replacement. Restore only while stopped. A
 stopped restore may naturally create a new inode: the next strict open validates
 the provider-bound authority and binds that inode before using it.
+
+### Restoring an older placement backup
+
+A restored copy keeps the admission baseline and backend drain evidence of the
+fleet it was copied from, but has no row for anything placed after the copy was
+taken. If a PENDING lease was dispatched after that point and its owner is
+unreachable on the first sweep, the restored baseline reads the missing row as
+"never placed" and provisions the lease a second time on a peer. Attest every
+restored copy, including filesystem snapshots and exact pre-repair backups,
+before `providerd` first starts on it:
+
+```bash
+# providerd stopped, restored file in place
+placement-repair -config /etc/fred/config.yaml -attest-restored-backup
+placement-repair -config /etc/fred/config.yaml -attest-restored-backup \
+  -apply -backup /var/lib/fred/placements.pre-attestation.db -confirm '<confirm>'
+```
+
+The dry run prints one JSON object: `provider_uuid`, `database_path`,
+`topology`, `topology_id`, the pinned `storage_ids`, the evidence it would
+forget (`baseline_topology_id`, `inventory_topology_id`,
+`empty_inventory_backends`), `pending_inventory_sweep`, and `required`. When
+`required` is true it also prints `confirm`, which binds the provider, the
+canonical database path, and every byte of the placement metadata record, so a
+database that changes between the dry run and the apply is refused. When
+`required` is false there is nothing to forget and no apply is needed.
+
+The apply publishes an exact no-overwrite backup of the restored copy, then
+forgets the admission baseline and drain evidence in one transaction. Every
+placement row, storage pin, pending-sweep marker, and reporter journal is kept.
+It contacts no backend and takes no drain attestation, because it only removes
+authority. On the next start `/readyz` reports `placement inventory not ready`
+until one sweep in which every configured backend answers both inventory
+endpoints; until then new admission and backend removal wait, and existing
+leases keep running. That sweep adopts every lease its owner reports.
+
+### Retiring a backend whose storage is lost
+
+Fred never moves a lease to another backend, and refuses to drop a backend from
+its topology while any lease still refers to it. When a backend's storage is
+irrecoverably lost (the disks failed with no backup, or the host was
+destroyed), its leases are stranded: they cannot be served, restarted, or
+cleaned up. Retire the backend. Retirement ends every lease that lived there on
+chain, and it cannot be undone.
+
+1. Stop `providerd`. Fence the lost host so it cannot answer or run workloads:
+   power it off, or stop its `docker-backend`. Keep the lost backend in the
+   providerd config for now; the tool requires the config to match the durable
+   topology exactly.
+2. Read the backend's pinned storage identity from `storage_bindings` in
+   `placement-repair -config /etc/fred/config.yaml -classify`.
+3. Dry run:
+
+   ```bash
+   placement-repair -config /etc/fred/config.yaml -retire-lost-backend \
+     -backend backend-b -storage-id 6ba7b811-9dad-41d1-80b4-00c04fd430c8
+   ```
+
+   It prints one JSON object:
+
+   | Field | Meaning |
+   |---|---|
+   | `lost_leases` | Leases the backend owned, and leases with no surviving owner whose only other evidence is one survivor's report. Each is closed (ACTIVE) or rejected (PENDING) on chain with reason `backend storage lost` |
+   | `lost_with_survivor_copies` | Lost leases that a surviving backend also reported. Once such a lease has ended, the survivor deprovisions its copy under its retention policy |
+   | `stripped_leases` | Leases that keep a surviving owner, or two or more surviving candidates, and only forget the backend's name. Several candidates stay an operator-only quarantine for `-resolve-conflict` |
+   | `unknown_owner_conflicts`, `uninterpretable_leases` | Legacy quarantines and unreadable rows. Their placement rows are left exactly as they are, even when they name this backend, because a survivor may hold their data; they stay operator-only |
+   | `lifecycle_scrubbed` | Leases whose lifecycle authority is revoked: a lost lease's authority, and any authority that names the backend. A lease with no placement row loses the authority row entirely |
+   | `reclaimed_receipt_leases` | Leases that lose their last authority row, so their settled restart and update receipts are deleted with it |
+   | `maintenance_settled` | Pending restarts and updates that settle as `backend_lost`; a retried request answers 410 |
+   | `topology_before`, `topology_after`, `topology_id` | The active topology before and after, and its current generation |
+   | `pending_inventory_sweep`, `recordless_unproven` | See below |
+   | `target_probe` | One single-row request for the backend's storage identity, read from a response header so a failing inventory still answers: `no_identity` (unreachable, or its storage identity did not verify) or `answered_with_other_storage` (for example a host rebuilt on new disks). The run refuses when the answer is the backend's own pin, because then its storage is not lost, or any other pin the database has ever recorded, including a removed or retired backend's, because then the configured address reaches a different backend. The probe uses the backend's configured request timeout; `-timeout` is refused |
+   | `attest_lost`, `confirm` | The exact values the apply requires |
+
+   The probe only guards against retiring the wrong name. Silence proves
+   nothing, which is why the apply also takes your attestation.
+4. Apply with a new backup path, the printed `confirm`, and the attestation:
+
+   ```bash
+   placement-repair -config /etc/fred/config.yaml -retire-lost-backend \
+     -backend backend-b -storage-id 6ba7b811-9dad-41d1-80b4-00c04fd430c8 \
+     -apply -backup /var/lib/fred/placements.pre-retirement.db -confirm '<confirm>' \
+     -attest-lost 'I attest the storage of this backend is irrecoverably lost and its host is fenced'
+   ```
+
+   `confirm` binds the provider, the canonical database path, the backend and
+   its pin, and every byte the retirement rewrites or deletes, so a database
+   that changed after the dry run is refused. The apply publishes an exact
+   no-overwrite backup, then writes everything in one transaction: the backend
+   leaves the topology as a new generation, lost leases get a terminal `lost`
+   row, stripped leases forget the name, pending maintenance settles, and the
+   admission baseline and drain evidence are cleared. Every rewritten row is
+   decoded back before the commit and again after the reopen, and must read as
+   planned. The failure prefixes (`BACKUP PUBLISHED`, `COMMITTED:`,
+   `OUTCOME UNKNOWN`) mean what they mean for the other repair modes below.
+5. Remove the backend, and its secret, from the providerd config, then start
+   `providerd`. Startup refuses a config that still names a retired backend.
+
+The retired name can never rejoin the topology, and its storage identity stays
+pinned to it, so no other name can claim that storage. To reuse the host,
+install a fresh `docker-backend` and add it under a new name. Adding a backend,
+like any topology change, is refused while an unknown-owner or unreadable
+placement row remains.
+
+After the start, `/readyz` reports `placement inventory not ready` until one
+sweep in which every surviving backend answers; meanwhile existing leases keep
+running. The reconciler then ends each lost lease on chain and counts it in
+`fred_provisioner_reconciler_lost_leases_total{outcome}`. The sweep-wide
+safety gates still apply: an untrusted report of the lease, or pending
+inventory recovery, defers it to a later sweep. Tenants see the answers
+described in README.md until the lease has ended on chain and a later sweep
+prunes its row; from then on it is answered like any other ended lease. A copy of a lost
+lease that a survivor still reports is never adopted while the lease is live;
+once the lease has ended and its row is pruned, the survivor deprovisions that
+copy as an ordinary orphan, under its retention policy.
+
+`pending_inventory_sweep` is true when `providerd` stopped in the middle of a
+sweep, and the retirement then sets `recordless_unproven`. To avoid that, start
+`providerd`, stop it right after the next `reconciliation complete` log line,
+and plan again. If it stays true, the marker is waiting on an answer that
+cannot arrive, typically from the lost backend, and the retirement must set the
+flag.
+
+`recordless_unproven` is true when the database had no current admission
+baseline: a sweep was interrupted, or the retirement follows another retirement
+or a restored-backup attestation with no complete sweep in between. A live
+lease with no placement row may then have lived on the lost backend, so from
+then on `providerd` closes any ACTIVE lease that has no placement row as lost
+instead of provisioning it empty on a survivor. The flag is permanent for the
+database. When two backends are lost together, retire them one after the
+other; the second retirement always sets the flag, because the first cleared
+the baseline and no sweep can complete while the second is still configured.
+
+An older binary refuses a database that records a retirement. The exact backup
+is the pre-retirement database; restoring it follows "Restoring an older
+placement backup" above, and leases already ended on chain stay ended.
 
 ### Initializing a genuinely fresh placement authority
 
@@ -828,6 +974,16 @@ update backends and provider together while mutation ingress is fenced. Legacy
 acceptance records do not prove successful deployment, and callbacks without a
 maintenance ID cannot promote pending payloads. Previously overwritten payloads
 are not automatically reconstructed by this change.
+
+Restart and update receipts are a rolling window of 1,024 per lease, ordered by
+the provider's admission stamp. If backends and `providerd` cannot be replaced
+together, replace the docker-backends first: an older backend ignores the stamp
+and keeps no window, so a tenant reusing a key the provider has forgotten could
+wait on a completion the backend never resends. Neither binary can go back
+once it has written the new state: an older docker-backend refuses a journal
+with any lineage row (written by the first stamped command, eviction, or
+cleanup confirmation), and an older `providerd` refuses a placement database
+that recorded an expired command.
 
 Existing shared `/data/docker` deployments keep their storage layout and
 `overlay2` configuration. Image admission requires no new filesystem, partition,
@@ -1188,6 +1344,29 @@ marker/store mutation or recovery capability. It is mutually exclusive with
 reservation: keep the old processes stopped, take the placement plus complete
 backend substrate/control-state backups only after every backend passes, and
 let `adopt` repeat the proof at its own publication boundary.
+
+The preflight stops at the first refused shape. To see every shape in one pass
+before the fence (for example against byte copies of the journals through a
+shadow config), run the read-only audit:
+
+```bash
+docker-backend -config /etc/fred/docker-backend.yaml \
+  -audit-storage-identity-adoption
+```
+
+It runs the preflight's checks in the same order but records each refused
+shape and moves on to the next independent lease, retention, container, or
+volume. Stdout is one JSON object: `verdict`
+(`ready_for_v0_13_storage_identity_adoption` or
+`v0_13_storage_identity_adoption_blocked`), `findings` (each with `class`,
+advisory `remedy`, optional `lease_uuid` and `subject`, and `message`), the
+v0.13 `items` adoption would freeze for each entry in `active_releases`, and
+`pending_callbacks`. The first finding's `message` is exactly the error the
+preflight reports. A shape that makes later checks meaningless, such as an
+unreadable journal or a sealed lineage, fails the audit instead. Exit status is
+0 when nothing blocks adoption, 3 when findings do, and 1 when the audit
+itself failed, which prints nothing on stdout. The audit authorizes nothing:
+only the preflight's verdict does.
 
 `stats.in_flight_provisions == 0` and a drained callback outbox are necessary
 but not sufficient. A v0.13 restore can leave a durable `status:"restoring"`
@@ -1691,7 +1870,24 @@ emitted backup, and that backup must never be restored after upgraded side
 effects begin. Normal upgraded startup opens only an existing fully prepared
 database and performs no schema/bootstrap write.
 
-`PREPARED_FOR_CUTOVER` is rendered last and the complete verdict is issued in one write after
+`-prepare` also reports its outcome for automation. The last stdout line is
+`{"outcome":"<name>"}` (after the verdict, in the same write, on success), and the
+exit status names the same outcome:
+
+| Exit | `outcome` | Meaning | Next step |
+|---|---|---|---|
+| 0 | `prepared` | Prepared and every postcondition verified | Cut over |
+| 10 | `not_mutated` | Neither the database nor the backup path changed | Rerun the read-only preflight, then `-prepare` |
+| 11 | `backup_published` | The exact backup exists; no preparation committed | Keep the backup; rerun with a new `-backup` path |
+| 12 | `outcome_unknown` | The commit returned an error | Keep providerd stopped; `placement-repair -classify` |
+| 13 | `prepared_unverified` | Committed, but a later sync, close, verification, or report failed | Keep providerd stopped; `placement-repair -classify` |
+
+Any other status (1) is a failure outside `-prepare`, such as a usage error. A
+failure before the preparation capability is consumed writes nothing, so it is
+always `not_mutated`; a disagreement between the command's durable status and
+the preparer's error classes resolves toward the more severe outcome.
+
+`PREPARED_FOR_CUTOVER` is the final verdict line and the complete verdict is issued in one write after
 the prepared database closes. If the command instead exits with a `PREPARED:`
 error, the migration transaction already succeeded before a later sync, close,
 or verdict-reporting failure. Do not blindly rerun `-prepare`, do not infer that

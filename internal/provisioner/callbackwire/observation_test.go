@@ -95,3 +95,24 @@ func TestDecodeVerifiedMaintenanceCompletion(t *testing.T) {
 		require.ErrorIs(t, err, ErrInvalidPayload)
 	}
 }
+
+func TestDecodeVerifiedMaintenanceAdmissionStamp(t *testing.T) {
+	const lease = "d144291f-a36f-47a4-8ccf-48afe590e29d"
+	stamp := `2026-09-30T12:00:00.000000001Z`
+	body := []byte(`{"lease_uuid":"` + lease + `","status":"success","backend_storage_id":"` + testStorageID +
+		`","maintenance_id":"` + testOperation + `","maintenance_admitted_at":"` + stamp + `"}`)
+	observation, err := DecodeVerified(verifiedCallback(t, "/callbacks/provision", body, testStorageID))
+	require.NoError(t, err)
+	assert.True(t, observation.MaintenanceAdmittedAt().Equal(time.Date(2026, 9, 30, 12, 0, 0, 1, time.UTC)))
+	assert.Equal(t, stamp, observation.Payload().MaintenanceAdmittedAt)
+
+	for name, raw := range map[string]string{
+		"stamp without a maintenance ID": `{"lease_uuid":"` + lease + `","status":"success","maintenance_admitted_at":"` + stamp + `"}`,
+		"not RFC 3339":                   `{"lease_uuid":"` + lease + `","status":"success","maintenance_id":"` + testOperation + `","maintenance_admitted_at":"yesterday"}`,
+		"not UTC": `{"lease_uuid":"` + lease + `","status":"success","maintenance_id":"` + testOperation +
+			`","maintenance_admitted_at":"2026-09-30T14:00:00+02:00"}`,
+	} {
+		_, err := DecodeVerified(verifiedCallback(t, "/callbacks/provision", []byte(raw), ""))
+		require.ErrorIs(t, err, ErrInvalidPayload, name)
+	}
+}

@@ -65,7 +65,8 @@ func main() {
 
 	// Bootstrap logger for startup messages (before config is loaded).
 	logOutput := io.Writer(os.Stdout)
-	if startup.preflightStorageIdentityAdoption || startup.dockerEffects.mode != dockerEffectsNone {
+	if startup.preflightStorageIdentityAdoption || startup.dockerEffects.mode != dockerEffectsNone ||
+		startup.validateConfig || startup.auditStorageIdentityAdoption {
 		// Keep one-shot reports on stdout machine-readable. Diagnostics,
 		// including configuration and proof failures, remain visible on stderr.
 		logOutput = os.Stderr
@@ -75,22 +76,23 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	// Load configuration
-	cfg, err := loadConfig(configPath)
+	if startup.validateConfig {
+		if _, err := validateStartupConfig(configPath); err != nil {
+			logger.Error("config rejected", "error", err)
+			os.Exit(1)
+		}
+		if _, err := fmt.Fprintf(os.Stdout, "docker-backend: config %q is valid\n", configPath); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+	cfg, logLevel, err := loadStartupConfig(configPath)
 	if err != nil {
-		logger.Error("failed to load config", "error", err)
+		logger.Error("config rejected", "error", err)
 		os.Exit(1)
 	}
-
-	// Apply environment variable overrides
-	applyEnvOverrides(&cfg)
 
 	// Re-configure logger with the configured log level.
-	logLevel, err := config.ParseLogLevel(cmp.Or(cfg.LogLevel, "info"))
-	if err != nil {
-		logger.Error("invalid log_level in config", "error", err)
-		os.Exit(1)
-	}
 	logger = slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{
 		Level: logLevel,
 	}))
@@ -110,6 +112,14 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+	if startup.auditStorageIdentityAdoption {
+		auditCtx, auditCancel := context.WithTimeout(
+			context.Background(), startup.storageIdentityOperationTimeout,
+		)
+		audit, auditErr := docker.AuditStorageIdentityAdoptionForConfig(auditCtx, cfg, logger)
+		auditCancel()
+		os.Exit(storageIdentityAdoptionAuditExit(os.Stdout, logger, audit, auditErr))
 	}
 	if startup.preflightStorageIdentityAdoption {
 		preflightCtx, preflightCancel := context.WithTimeout(
@@ -294,6 +304,41 @@ func shutdownExitCode(startupErr, backendShutdownErr, storageAuthorityErr error)
 	return 0
 }
 
+// storageIdentityAdoptionAuditExit writes the audit as one JSON object and
+// returns the exit status: 0 when nothing blocks adoption, 3 when findings do,
+// and 1 when the audit itself could not complete (nothing is written then).
+func storageIdentityAdoptionAuditExit(
+	out io.Writer,
+	logger *slog.Logger,
+	audit docker.StorageIdentityAdoptionAudit,
+	auditErr error,
+) int {
+	if auditErr != nil {
+		logger.Error("storage identity adoption audit failed", "error", auditErr)
+		return 1
+	}
+	encoded, err := json.Marshal(audit)
+	if err != nil {
+		logger.Error("encode storage identity adoption audit", "error", err)
+		return 1
+	}
+	encoded = append(encoded, '\n')
+	if written, err := out.Write(encoded); err != nil || written != len(encoded) {
+		logger.Error("write storage identity adoption audit", "error", err)
+		return 1
+	}
+	switch {
+	case audit.Verdict == docker.StorageIdentityAdoptionReady && len(audit.Findings) == 0:
+		return 0
+	case audit.Verdict == docker.StorageIdentityAdoptionBlocked && len(audit.Findings) != 0:
+		return 3
+	default:
+		logger.Error("storage identity adoption audit is internally inconsistent",
+			"verdict", audit.Verdict, "findings", len(audit.Findings))
+		return 1
+	}
+}
+
 func writeStorageIdentityAdoptionVerdict(
 	out io.Writer,
 	verdict docker.StorageIdentityAdoptionVerdict,
@@ -331,6 +376,8 @@ type startupFlags struct {
 	preflightStorageIdentityAdoption bool
 	storageIdentityOperationTimeout  time.Duration
 	dockerEffects                    dockerEffectsCommand
+	validateConfig                   bool
+	auditStorageIdentityAdoption     bool
 }
 
 func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
@@ -355,6 +402,10 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		"one-shot: repair unresolved Docker effects after external fencing; requires acknowledgement and backup")
 	effectsAcknowledgement := fs.String("docker-effects-acknowledgement", "", "exact acknowledgement from inspection; only valid with repair")
 	effectsBackup := fs.String("docker-effects-backup", "", "new backup path required for Docker-effects repair; only valid with repair")
+	validateConfig := fs.Bool("validate-config", false,
+		"check the config file as startup would, without opening a store or touching Docker, and exit")
+	auditAdoption := fs.Bool("audit-storage-identity-adoption", false,
+		"one-shot read-only: report every shape that blocks v0.13 storage identity adoption as JSON; exit 0 clean, 3 findings, 1 failed")
 	if err := fs.Parse(args); err != nil {
 		return startupFlags{}, err
 	}
@@ -362,14 +413,17 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		return startupFlags{}, errors.New("-storage-identity-operation-timeout must be positive")
 	}
 	oneShotModes := 0
-	for _, requested := range []bool{*preflightAdoption, *initializeIdentity != "", *inspectEffects, *repairEffects} {
+	for _, requested := range []bool{
+		*preflightAdoption, *initializeIdentity != "", *inspectEffects, *repairEffects, *validateConfig,
+		*auditAdoption,
+	} {
 		if requested {
 			oneShotModes++
 		}
 	}
 	if oneShotModes > 1 {
 		return startupFlags{}, errors.New(
-			"storage-identity preflight, initialization, Docker-effects inspection and repair are mutually exclusive",
+			"storage-identity preflight, audit, initialization, Docker-effects inspection and repair, and config validation are mutually exclusive",
 		)
 	}
 	repairArgumentsSupplied := false
@@ -392,7 +446,38 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		preflightStorageIdentityAdoption: *preflightAdoption,
 		storageIdentityOperationTimeout:  *identityOperationTimeout,
 		dockerEffects:                    effects,
+		validateConfig:                   *validateConfig,
+		auditStorageIdentityAdoption:     *auditAdoption,
 	}, nil
+}
+
+// loadStartupConfig is the configuration pipeline every mode runs before it
+// dispatches. Each mode then validates the result first thing (docker.New and
+// every offline operation), reporting a failure in its own output format.
+func loadStartupConfig(path string) (docker.Config, slog.Level, error) {
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return cfg, 0, fmt.Errorf("failed to load config: %w", err)
+	}
+	applyEnvOverrides(&cfg)
+	logLevel, err := config.ParseLogLevel(cmp.Or(cfg.LogLevel, "info"))
+	if err != nil {
+		return cfg, 0, fmt.Errorf("invalid log_level in config: %w", err)
+	}
+	return cfg, logLevel, nil
+}
+
+// validateStartupConfig is every configuration check a mode makes before its
+// first side effect. -validate-config runs exactly this.
+func validateStartupConfig(path string) (docker.Config, error) {
+	cfg, _, err := loadStartupConfig(path)
+	if err != nil {
+		return cfg, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return cfg, fmt.Errorf("invalid config: %w", err)
+	}
+	return cfg, nil
 }
 
 // parseFlags retains the small version/config parsing seam used by existing
@@ -792,6 +877,11 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 			s.errorResponse(w, http.StatusNotFound, "not provisioned")
 			return
 		}
+		if errors.Is(err, backend.ErrMaintenanceExpired) {
+			s.errorResponseWithCode(w, http.StatusConflict,
+				"restart is older than the lease's retained maintenance history", backend.CodeMaintenanceExpired)
+			return
+		}
 		if errors.Is(err, backend.ErrInvalidState) {
 			s.errorResponse(w, http.StatusConflict, "invalid state for restart")
 			return
@@ -993,6 +1083,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, backend.ErrNotProvisioned) {
 			s.errorResponse(w, http.StatusNotFound, "not provisioned")
+			return
+		}
+		if errors.Is(err, backend.ErrMaintenanceExpired) {
+			s.errorResponseWithCode(w, http.StatusConflict,
+				"update is older than the lease's retained maintenance history", backend.CodeMaintenanceExpired)
 			return
 		}
 		if errors.Is(err, backend.ErrInvalidState) {

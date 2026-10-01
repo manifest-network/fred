@@ -116,6 +116,9 @@ type ServerConfig struct {
 	CallbackCanonicalPathPrefix string                        // Path prefix prepended to inbound URIs before HMAC verification (proxy stripPrefix compensation)
 	TokenTrackerDBPath          string                        // Path to token tracker database (enables replay protection)
 	CallbackBaseURL             string                        // Base URL for backend callbacks (used by restart/update)
+	// MaintenanceLegacyIdempotencyTenants may omit Idempotency-Key on
+	// restart/update; see HandlersConfig.
+	MaintenanceLegacyIdempotencyTenants []string
 }
 
 // ServerDeps holds the runtime dependencies for the API server.
@@ -182,6 +185,8 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		EventBroker:        eventBroker,
 		ProviderUUID:       cfg.ProviderUUID,
 		Bech32Prefix:       cfg.Bech32Prefix,
+
+		MaintenanceLegacyIdempotencyTenants: cfg.MaintenanceLegacyIdempotencyTenants,
 	})
 
 	// Parse trusted proxies for secure X-Forwarded-For handling

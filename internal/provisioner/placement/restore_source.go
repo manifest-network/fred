@@ -56,6 +56,9 @@ func (s *Store) reserveRestoreSource(leaseUUID string) (*restoreSourceReservatio
 	if !exists || record.State() == StateAbsent {
 		return nil, fmt.Errorf("%w: lease %q", ErrRestoreSourceNotFound, leaseUUID)
 	}
+	if _, lost := record.LostBackend(); lost {
+		return nil, fmt.Errorf("%w: restore source %q", ErrPlacementLost, leaseUUID)
+	}
 	revision := s.newRecordRevision(leaseUUID, record.revision)
 	if record.State() != StateConfirmed || record.Attempt != "" || !revision.Valid() {
 		return nil, fmt.Errorf("%w: lease %q", ErrRestoreSourceUnavailable, leaseUUID)

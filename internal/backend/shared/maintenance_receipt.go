@@ -1,11 +1,13 @@
 package shared
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -16,7 +18,6 @@ import (
 )
 
 const (
-	maxMaintenanceReceiptsPerLease  = 1_024
 	maxMaintenanceReceiptEntryBytes = 16 << 10
 	maintenanceCompletionRecordV1   = 1
 )
@@ -24,9 +25,10 @@ const (
 var callbackMaintenanceHistoryBucketName = []byte("completed_callback_maintenance_history")
 
 // ErrMaintenanceReceiptCapacity is a pre-side-effect refusal: the backend
-// cannot accept another maintenance generation while preserving every retry
-// identity for the live lease. Receipts are reclaimed only after successful
-// close installs the stronger permanent closed-lease fence.
+// cannot accept another maintenance generation without dropping a receipt it
+// must keep. That happens for an unstamped command from an older provider at
+// a full window, which cannot be ordered against the history, or for a window
+// full of failed receipts whose late-container cleanup is unconfirmed.
 var ErrMaintenanceReceiptCapacity = errors.New("maintenance receipt capacity exhausted")
 
 // MaintenanceReceiptCapacityError preserves whether the lease-local or shared
@@ -73,6 +75,10 @@ type MaintenanceRequestAuthority struct {
 	storageID     backendidentity.ID
 	payloadDigest [sha256.Size]byte
 	digest        [sha256.Size]byte
+	// admittedAt is the provider's admission stamp. It orders the request but
+	// is deliberately outside digest: a replay of a receipt written before
+	// stamps existed must still match its stored authority.
+	admittedAt time.Time
 }
 
 type storedMaintenanceRequestAuthority struct {
@@ -141,6 +147,35 @@ func (s *MaintenanceSettlement) NewMaintenanceRequestAuthority(
 	return authority, nil
 }
 
+// NewProviderMaintenanceRequestAuthority mints request authority for a
+// provider restart or update carrying the provider's admission stamp. A zero
+// stamp is an older provider's unstamped request.
+func (s *MaintenanceSettlement) NewProviderMaintenanceRequestAuthority(
+	maintenanceID MaintenanceID,
+	kind MaintenanceIntentKind,
+	leaseUUID, callbackURL string,
+	payload []byte,
+	admittedAt time.Time,
+) (MaintenanceRequestAuthority, error) {
+	if maintenanceWindowFor(kind) != maintenanceWindowProvider {
+		return MaintenanceRequestAuthority{}, fmt.Errorf("maintenance kind %q is not provider-originated", kind)
+	}
+	// The stamp orders the provider's own commands; it is never compared with
+	// this host's clock, so clock skew between the hosts cannot refuse a
+	// command or contradict one that is already running.
+	if !admittedAt.IsZero() {
+		if err := validateMaintenanceAdmissionStamp(admittedAt); err != nil {
+			return MaintenanceRequestAuthority{}, err
+		}
+	}
+	authority, err := s.NewMaintenanceRequestAuthority(maintenanceID, kind, leaseUUID, callbackURL, payload)
+	if err != nil {
+		return MaintenanceRequestAuthority{}, err
+	}
+	authority.admittedAt = admittedAt
+	return authority, nil
+}
+
 func (a MaintenanceRequestAuthority) Valid() bool {
 	if validateMaintenanceRequestAuthority(a) != nil || a.digest == ([sha256.Size]byte{}) {
 		return false
@@ -152,6 +187,7 @@ func (a MaintenanceRequestAuthority) MaintenanceID() MaintenanceID { return a.id
 func (a MaintenanceRequestAuthority) Kind() MaintenanceIntentKind  { return a.kind }
 func (a MaintenanceRequestAuthority) LeaseUUID() string            { return a.leaseUUID }
 func (a MaintenanceRequestAuthority) CallbackURL() string          { return a.callbackURL }
+func (a MaintenanceRequestAuthority) AdmittedAt() time.Time        { return a.admittedAt }
 func (a MaintenanceRequestAuthority) Backend() string              { return a.backend }
 func (a MaintenanceRequestAuthority) BackendStorageID() backendidentity.ID {
 	return a.storageID
@@ -222,18 +258,23 @@ type maintenanceCompletionRecord struct {
 	ProviderUUID       string                 `json:"provider_uuid"`
 	Status             backend.CallbackStatus `json:"status"`
 	Error              string                 `json:"error,omitempty"`
-	// EffectStarted and the exact target release identity preserve permanent
-	// late-arrival cleanup authority after the live intent is consumed. Older
-	// receipts omit these fields and therefore cannot authorize destruction.
+	// EffectStarted and the exact target release identity preserve
+	// late-arrival cleanup authority after the live intent is consumed, for as
+	// long as the receipt is retained; it stays in the window until that
+	// cleanup is confirmed. Older receipts omit these fields and therefore
+	// cannot authorize destruction.
 	EffectStarted        bool      `json:"effect_started,omitempty"`
 	TargetReleaseVersion int       `json:"target_release_version,omitempty"`
 	TargetReleaseDigest  string    `json:"target_release_digest,omitempty"`
 	SettledAt            time.Time `json:"settled_at"`
+	// AdmittedAt is the provider's admission stamp; zero for an unstamped or
+	// backend-minted command.
+	AdmittedAt time.Time `json:"admitted_at,omitzero"`
 }
 
-// FailedMaintenanceReceipt is permanent, store-issued authority to remove a
-// replacement generation that becomes visible after its failed terminal
-// settlement. It is minted only for an intent which durably crossed the
+// FailedMaintenanceReceipt is store-issued authority to remove a replacement
+// generation that becomes visible after its failed terminal settlement. It
+// lasts as long as its receipt is retained. It is minted only for an intent which durably crossed the
 // physical-effect boundary and binds the exact immutable target release row.
 // Pre-effect failures and older receipts deliberately cannot produce one.
 type FailedMaintenanceReceipt struct {
@@ -312,6 +353,7 @@ func maintenanceCompletionRecordFor(
 		TargetReleaseVersion: claim.entry.TargetReleaseVersion,
 		TargetReleaseDigest:  claim.entry.TargetReleaseDigest,
 		SettledAt:            settledAt,
+		AdmittedAt:           claim.entry.AdmittedAt,
 	}
 }
 
@@ -369,7 +411,21 @@ func validateMaintenanceCompletionRecord(record maintenanceCompletionRecord, lea
 	default:
 		return fmt.Errorf("maintenance receipt has invalid status %q", record.Status)
 	}
+	if err := validateMaintenanceStampForKind(record.Kind, record.AdmittedAt); err != nil {
+		return fmt.Errorf("maintenance receipt: %w", err)
+	}
 	return validateStoredCallbackCreatedAt(record.SettledAt)
+}
+
+// validateMaintenanceStampForKind allows a stamp only on provider kinds.
+func validateMaintenanceStampForKind(kind MaintenanceIntentKind, stamp time.Time) error {
+	if stamp.IsZero() {
+		return nil
+	}
+	if maintenanceWindowFor(kind) != maintenanceWindowProvider {
+		return fmt.Errorf("a %q command cannot carry a provider admission stamp", kind)
+	}
+	return validateMaintenanceAdmissionStamp(stamp)
 }
 
 func marshalMaintenanceCompletionRecord(record maintenanceCompletionRecord) ([]byte, error) {
@@ -472,114 +528,156 @@ func (s *CallbackStore) listFailedMaintenanceCompletionRecords() (
 	return records, err
 }
 
-// ListFailedMaintenanceReceipts returns only permanent failure records which
+// UnverifiableMaintenanceReceipt is a failed, effect-started receipt whose
+// exact target release could not be read or verified, for example after
+// release-history compaction dropped the target row. It grants no cleanup
+// authority: uncertainty keeps the bytes, and it never blocks another lease's
+// receipts. Only ListFailedMaintenanceReceipts mints one.
+type UnverifiableMaintenanceReceipt struct {
+	LeaseUUID     string
+	MaintenanceID MaintenanceID
+	Cause         error
+
+	settlement *MaintenanceSettlement
+	record     maintenanceCompletionRecord
+}
+
+// ListFailedMaintenanceReceipts returns only retained failure records which
 // prove the exact maintenance generation crossed the effect boundary. Each
 // result is joined to its immutable target release under the journal pair's
-// lease lock; a missing or divergent target fails closed instead of turning a
-// receipt into caller-selected cleanup authority. A live close head exclusively
-// owns the lease's physical cleanup, so it cannot issue a competing receipt.
+// lease lock. A missing or divergent target is returned separately as
+// unverifiable: it grants no cleanup authority, and it never fails the listing
+// for other leases, which one tenant's compacted history could otherwise do to
+// the whole backend. A live close head exclusively owns the lease's physical
+// cleanup, so it cannot issue a competing receipt.
 func (s *MaintenanceSettlement) ListFailedMaintenanceReceipts() (
 	[]FailedMaintenanceReceipt,
+	[]UnverifiableMaintenanceReceipt,
 	error,
 ) {
 	if s == nil || s.callbacks == nil || s.releases == nil {
-		return nil, errors.New("maintenance settlement is invalid")
+		return nil, nil, errors.New("maintenance settlement is invalid")
 	}
 	records, err := s.callbacks.listFailedMaintenanceCompletionRecords()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	receipts := make([]FailedMaintenanceReceipt, 0, len(records))
+	var unverifiable []UnverifiableMaintenanceReceipt
 	for _, snapshot := range records {
-		unlock := s.lockLease(snapshot.LeaseUUID)
-		var (
-			current maintenanceCompletionRecord
-			found   bool
-			release Release
+		receipt, found, err := s.verifyFailedMaintenanceReceipt(snapshot)
+		if err != nil {
+			// One lease's missing or divergent evidence is that lease's
+			// problem; it must not fail recovery for every other lease.
+			unverifiable = append(unverifiable, UnverifiableMaintenanceReceipt{
+				LeaseUUID: snapshot.LeaseUUID, MaintenanceID: snapshot.MaintenanceID, Cause: err,
+				settlement: s, record: snapshot,
+			})
+			continue
+		}
+		if found {
+			receipts = append(receipts, receipt)
+		}
+	}
+	return receipts, unverifiable, nil
+}
+
+// verifyFailedMaintenanceReceipt joins one listed record to its immutable
+// target release under the journal pair's lease lock. found is false when the
+// record is no longer current (a close took ownership, or it was replaced).
+func (s *MaintenanceSettlement) verifyFailedMaintenanceReceipt(
+	snapshot maintenanceCompletionRecord,
+) (FailedMaintenanceReceipt, bool, error) {
+	unlock := s.lockLease(snapshot.LeaseUUID)
+	var (
+		current maintenanceCompletionRecord
+		found   bool
+		release Release
+	)
+	err := s.callbacks.view(func(tx *bolt.Tx) error {
+		head, _, readErr := getLeaseMutationHeadTx(tx, snapshot.LeaseUUID)
+		if readErr != nil {
+			return readErr
+		}
+		if _, closing := head.(closeLeaseMutationHead); closing {
+			return nil
+		}
+		current, found, readErr = findMaintenanceReceiptTx(
+			tx, snapshot.LeaseUUID, snapshot.MaintenanceID,
 		)
-		err = s.callbacks.view(func(tx *bolt.Tx) error {
-			head, _, readErr := getLeaseMutationHeadTx(tx, snapshot.LeaseUUID)
+		return readErr
+	})
+	if err == nil && found && current == snapshot {
+		err = s.releases.view(func(tx *bolt.Tx) error {
+			history, readErr := readReleaseHistoryTx(tx, current.LeaseUUID)
 			if readErr != nil {
 				return readErr
 			}
-			if _, closing := head.(closeLeaseMutationHead); closing {
-				return nil
+			for _, candidate := range history {
+				if candidate.Version == current.TargetReleaseVersion &&
+					candidate.MaintenanceID == current.MaintenanceID {
+					release = cloneRelease(candidate)
+					return nil
+				}
 			}
-			current, found, readErr = findMaintenanceReceiptTx(
-				tx, snapshot.LeaseUUID, snapshot.MaintenanceID,
-			)
-			return readErr
+			return errors.New("failed maintenance receipt target release is missing")
 		})
-		if err == nil && found && current == snapshot {
-			err = s.releases.view(func(tx *bolt.Tx) error {
-				history, readErr := readReleaseHistoryTx(tx, current.LeaseUUID)
-				if readErr != nil {
-					return readErr
-				}
-				for _, candidate := range history {
-					if candidate.Version == current.TargetReleaseVersion &&
-						candidate.MaintenanceID == current.MaintenanceID {
-						release = cloneRelease(candidate)
-						return nil
-					}
-				}
-				return errors.New("failed maintenance receipt target release is missing")
-			})
-		}
-		unlock()
-		if err != nil {
-			return nil, err
-		}
-		if !found || current != snapshot {
-			continue
-		}
-		wantDigest, err := parseMaintenanceDigest(current.TargetReleaseDigest, false)
-		if err != nil {
-			return nil, err
-		}
-		actualDigest, err := maintenanceReleaseDigest(release)
-		if err != nil {
-			return nil, err
-		}
-		if actualDigest != wantDigest {
-			return nil, errors.New("failed maintenance receipt target release is divergent")
-		}
-		identity, ok := releaseRuntimeIdentityFor(release)
-		if !ok || identity.Tenant() != current.Tenant ||
-			identity.ProviderUUID() != current.ProviderUUID {
-			return nil, errors.New("failed maintenance receipt target authority is divergent")
-		}
-		storageID, err := backendidentity.Parse(current.BackendStorageID)
-		if err != nil {
-			return nil, err
-		}
-		receipt := FailedMaintenanceReceipt{
-			settlement: s, callbacks: s.callbacks, releases: s.releases,
-			record: current, storageID: storageID,
-			target: ReleaseClaim{
-				issuer: s.releases, leaseUUID: current.LeaseUUID,
-				version: current.TargetReleaseVersion, digest: wantDigest,
-			},
-			release: release,
-		}
-		if !receipt.Valid() {
-			return nil, errors.New("failed maintenance receipt could not be sealed")
-		}
-		receipts = append(receipts, receipt)
 	}
-	return receipts, nil
+	unlock()
+	if err != nil {
+		return FailedMaintenanceReceipt{}, false, err
+	}
+	if !found || current != snapshot {
+		return FailedMaintenanceReceipt{}, false, nil
+	}
+	wantDigest, err := parseMaintenanceDigest(current.TargetReleaseDigest, false)
+	if err != nil {
+		return FailedMaintenanceReceipt{}, false, err
+	}
+	actualDigest, err := maintenanceReleaseDigest(release)
+	if err != nil {
+		return FailedMaintenanceReceipt{}, false, err
+	}
+	if actualDigest != wantDigest {
+		return FailedMaintenanceReceipt{}, false, errors.New("failed maintenance receipt target release is divergent")
+	}
+	identity, ok := releaseRuntimeIdentityFor(release)
+	if !ok || identity.Tenant() != current.Tenant ||
+		identity.ProviderUUID() != current.ProviderUUID {
+		return FailedMaintenanceReceipt{}, false, errors.New("failed maintenance receipt target authority is divergent")
+	}
+	storageID, err := backendidentity.Parse(current.BackendStorageID)
+	if err != nil {
+		return FailedMaintenanceReceipt{}, false, err
+	}
+	receipt := FailedMaintenanceReceipt{
+		settlement: s, callbacks: s.callbacks, releases: s.releases,
+		record: current, storageID: storageID,
+		target: ReleaseClaim{
+			issuer: s.releases, leaseUUID: current.LeaseUUID,
+			version: current.TargetReleaseVersion, digest: wantDigest,
+		},
+		release: release,
+	}
+	if !receipt.Valid() {
+		return FailedMaintenanceReceipt{}, false, errors.New("failed maintenance receipt could not be sealed")
+	}
+	return receipt, true, nil
 }
 
 func reserveMaintenanceReceiptTx(tx *bolt.Tx, entry maintenanceIntentEntry) error {
-	return reserveMaintenanceReceiptWithinLimitsTx(
-		tx, entry, maxMaintenanceReceiptsPerLease, maxCallbackReceiptReservationsGlobal,
-	)
+	return reserveMaintenanceReceiptWithinLimitsTx(tx, entry, maxCallbackReceiptReservationsGlobal)
 }
 
+// reserveMaintenanceReceiptWithinLimitsTx admits one more receipt for the
+// published intent. A stamped provider publish raises the lease's admission
+// high-water mark and evicts its oldest evictable provider receipts; a
+// backend-minted custom-domain publish evicts only custom-domain receipts. An
+// unstamped provider publish cannot be ordered, so it never evicts and keeps
+// the old fixed limit.
 func reserveMaintenanceReceiptWithinLimitsTx(
 	tx *bolt.Tx,
 	entry maintenanceIntentEntry,
-	perLeaseLimit int,
 	globalLimit uint64,
 ) error {
 	records, err := listMaintenanceReceiptsTx(tx, entry.LeaseUUID)
@@ -594,10 +692,34 @@ func reserveMaintenanceReceiptWithinLimitsTx(
 			)
 		}
 	}
-	if len(records) >= perLeaseLimit {
-		return &MaintenanceReceiptCapacityError{
-			LeaseUUID: entry.LeaseUUID,
-			Limit:     uint64(perLeaseLimit),
+	window := maintenanceWindowFor(entry.Kind)
+	if window == maintenanceWindowInvalid {
+		return fmt.Errorf("maintenance intent for lease %q has invalid kind %q", entry.LeaseUUID, entry.Kind)
+	}
+	lineage, err := loadMaintenanceLineageTx(tx, entry.LeaseUUID)
+	if err != nil {
+		return err
+	}
+	stamped := !entry.AdmittedAt.IsZero()
+	evictions, fits := planMaintenanceEvictions(records, lineage, window)
+	if window == maintenanceWindowProvider && !stamped && len(evictions) != 0 {
+		fits = false
+	}
+	if !fits {
+		return &MaintenanceReceiptCapacityError{LeaseUUID: entry.LeaseUUID, Limit: uint64(window.limit())}
+	}
+	// refuseExpiredMaintenanceTx ran in this transaction, so the stamp is at
+	// or past the mark; only ever move it forward.
+	if stamped && entry.AdmittedAt.After(lineage.HighWaterAdmittedAt) {
+		lineage.HighWaterAdmittedAt = entry.AdmittedAt
+		lineage.HighWaterID = entry.MaintenanceID
+	}
+	if err := evictMaintenanceReceiptsTx(tx, entry.LeaseUUID, &lineage, evictions); err != nil {
+		return err
+	}
+	if stamped || len(evictions) != 0 {
+		if err := putMaintenanceLineageTx(tx, entry.LeaseUUID, lineage); err != nil {
+			return err
 		}
 	}
 	reserved, err := reserveCallbackReceiptReservationWithinLimitTx(tx, globalLimit)
@@ -664,7 +786,20 @@ func archiveMaintenanceCompletionTx(tx *bolt.Tx, record maintenanceCompletionRec
 			)
 		}
 	}
-	return leaseBucket.Put(key, data)
+	if err := leaseBucket.Put(key, data); err != nil {
+		return err
+	}
+	if record.Kind != MaintenanceIntentUpdate {
+		return nil
+	}
+	// A lease without a stored lineage derives it from a complete receipt
+	// set; once one is stored, it must follow every newer update.
+	lineage, stored, err := loadStoredMaintenanceLineageTx(tx, record.LeaseUUID)
+	if err != nil || !stored || lineage.LatestUpdateSequence >= record.CompletionSequence {
+		return err
+	}
+	lineage.LatestUpdateSequence = record.CompletionSequence
+	return putMaintenanceLineageTx(tx, record.LeaseUUID, lineage)
 }
 
 func findMaintenanceReceiptTx(
@@ -672,25 +807,56 @@ func findMaintenanceReceiptTx(
 	leaseUUID string,
 	maintenanceID MaintenanceID,
 ) (maintenanceCompletionRecord, bool, error) {
-	records, err := listMaintenanceReceiptsTx(tx, leaseUUID)
+	root := tx.Bucket(callbackMaintenanceHistoryBucketName)
+	if root == nil {
+		return maintenanceCompletionRecord{}, false, errors.New("completed maintenance history bucket missing")
+	}
+	leaseKey := []byte(leaseUUID)
+	if root.Get(leaseKey) != nil {
+		return maintenanceCompletionRecord{}, false, fmt.Errorf("completed maintenance history %q is not a nested bucket", leaseUUID)
+	}
+	leaseBucket := root.Bucket(leaseKey)
+	if leaseBucket == nil {
+		return maintenanceCompletionRecord{}, false, nil
+	}
+	key := []byte(maintenanceID.String())
+	if leaseBucket.Bucket(key) != nil {
+		return maintenanceCompletionRecord{}, false, fmt.Errorf("maintenance receipt %q is a nested bucket", maintenanceID)
+	}
+	value := leaseBucket.Get(key)
+	if value == nil {
+		return maintenanceCompletionRecord{}, false, nil
+	}
+	record, err := decodeMaintenanceCompletionRecord(leaseKey, key, value)
 	if err != nil {
 		return maintenanceCompletionRecord{}, false, err
 	}
-	for _, record := range records {
-		if record.MaintenanceID != maintenanceID {
-			continue
-		}
-		return record, true, nil
-	}
-	return maintenanceCompletionRecord{}, false, nil
+	return record, true, nil
+}
+
+// maintenanceReplayRequest is what replay classification needs to know about
+// one exact request.
+type maintenanceReplayRequest struct {
+	leaseUUID  string
+	id         MaintenanceID
+	digest     string
+	kind       MaintenanceIntentKind
+	admittedAt time.Time
+}
+
+// stampsAgree compares stamps only when both sides carry one. A zero stamp
+// predates stamping: stored, it is a receipt or head from an older provider;
+// requested, it is an older provider's replay. Either side then matches the
+// exact command by ID and request digest alone, as before stamping.
+func stampsAgree(stored, requested time.Time) bool {
+	return stored.IsZero() || requested.IsZero() || stored.Equal(requested)
 }
 
 func classifyMaintenanceReplayTx(
 	tx *bolt.Tx,
-	leaseUUID string,
-	maintenanceID MaintenanceID,
-	requestDigest string,
+	request maintenanceReplayRequest,
 ) (MaintenanceIntentAdmissionDisposition, error) {
+	leaseUUID, maintenanceID := request.leaseUUID, request.id
 	head, present, err := getLeaseMutationHeadTx(tx, leaseUUID)
 	if err != nil {
 		return MaintenanceIntentAdmissionNone, err
@@ -698,7 +864,8 @@ func classifyMaintenanceReplayTx(
 	if present {
 		if maintenance, ok := head.(maintenanceLeaseMutationHead); ok &&
 			maintenance.claim.MaintenanceID() == maintenanceID {
-			if maintenance.claim.entry.RequestDigest != requestDigest {
+			if maintenance.claim.entry.RequestDigest != request.digest ||
+				!stampsAgree(maintenance.claim.entry.AdmittedAt, request.admittedAt) {
 				return MaintenanceIntentAdmissionNone, fmt.Errorf(
 					"%w for lease %q: maintenance ID has divergent request authority",
 					ErrMaintenanceIntentConflict, leaseUUID,
@@ -712,7 +879,7 @@ func classifyMaintenanceReplayTx(
 		return MaintenanceIntentAdmissionNone, err
 	}
 	if found {
-		if receipt.RequestDigest != requestDigest {
+		if receipt.RequestDigest != request.digest || !stampsAgree(receipt.AdmittedAt, request.admittedAt) {
 			return MaintenanceIntentAdmissionNone, fmt.Errorf(
 				"%w for lease %q: completed maintenance ID has divergent request authority",
 				ErrMaintenanceIntentConflict, leaseUUID,
@@ -744,7 +911,36 @@ func classifyMaintenanceReplayTx(
 			}
 		}
 	}
-	return MaintenanceIntentAdmissionNone, nil
+	return MaintenanceIntentAdmissionNone, refuseExpiredMaintenanceTx(tx, request)
+}
+
+// refuseExpiredMaintenanceTx is the single admission rule that lets receipts
+// leave the window: a provider command with no head and no receipt is new
+// work only if its stamp is past the lease's high-water mark. An unstamped
+// provider command is new work only while nothing has been evicted. A
+// backend-minted command is never stamped and never expires.
+func refuseExpiredMaintenanceTx(tx *bolt.Tx, request maintenanceReplayRequest) error {
+	if maintenanceWindowFor(request.kind) != maintenanceWindowProvider {
+		return nil
+	}
+	lineage, err := loadMaintenanceLineageTx(tx, request.leaseUUID)
+	if err != nil {
+		return err
+	}
+	expired := &MaintenanceExpiredError{LeaseUUID: request.leaseUUID, HighWater: lineage.HighWaterAdmittedAt}
+	if request.admittedAt.IsZero() {
+		if lineage.ProviderEvicted {
+			return expired
+		}
+		return nil
+	}
+	if lineage.HighWaterAdmittedAt.IsZero() || request.admittedAt.After(lineage.HighWaterAdmittedAt) {
+		return nil
+	}
+	if request.admittedAt.Equal(lineage.HighWaterAdmittedAt) && request.id == lineage.HighWaterID {
+		return nil
+	}
+	return expired
 }
 
 // maintenanceReceiptSupersededTx decides whether replaying a completed update
@@ -772,20 +968,13 @@ func maintenanceReceiptSupersededTx(
 			return true, nil
 		}
 	}
-	records, err := listMaintenanceReceiptsTx(tx, receipt.LeaseUUID)
+	// The lineage remembers the newest settled update even after its receipt
+	// leaves the window.
+	lineage, err := loadMaintenanceLineageTx(tx, receipt.LeaseUUID)
 	if err != nil {
 		return false, err
 	}
-	for _, candidate := range records {
-		if candidate.MaintenanceID == receipt.MaintenanceID ||
-			candidate.Kind != MaintenanceIntentUpdate {
-			continue
-		}
-		if candidate.CompletionSequence > receipt.CompletionSequence {
-			return true, nil
-		}
-	}
-	return false, nil
+	return lineage.LatestUpdateSequence > receipt.CompletionSequence, nil
 }
 
 func releaseClosedLeaseMaintenanceReceiptsTx(tx *bolt.Tx, leaseUUID string) error {
@@ -793,9 +982,124 @@ func releaseClosedLeaseMaintenanceReceiptsTx(tx *bolt.Tx, leaseUUID string) erro
 	if root == nil {
 		return errors.New("completed maintenance history bucket missing")
 	}
+	if err := deleteMaintenanceLineageTx(tx, leaseUUID); err != nil {
+		return err
+	}
 	key := []byte(leaseUUID)
 	if root.Bucket(key) == nil {
 		return nil
 	}
 	return root.DeleteBucket(key)
+}
+
+// FailedMaintenanceCleanupProof is store-issued evidence that one exact
+// failed receipt's late-arrival cleanup attested that no container of its
+// generation exists. Only CleanupFailedMaintenanceReceipt mints it.
+type FailedMaintenanceCleanupProof struct {
+	settlement *MaintenanceSettlement
+	record     maintenanceCompletionRecord
+	attestedAt time.Time
+}
+
+// ConfirmFailedMaintenanceCleanup advances, per lease, the completion
+// sequence through which failed, effect-started receipts no longer need to
+// stay in the window for their late-arrival cleanup authority. A receipt
+// qualifies when its cleanup attested absence at least the grace window after
+// it settled, so no in-flight creation can still land, or when it can no
+// longer authorize cleanup at all. The sequence advances only over a
+// contiguous run of qualifying receipts and never moves backward.
+func (s *MaintenanceSettlement) ConfirmFailedMaintenanceCleanup(
+	proofs []FailedMaintenanceCleanupProof,
+	unverifiable []UnverifiableMaintenanceReceipt,
+) error {
+	if s == nil || s.callbacks == nil {
+		return errors.New("maintenance settlement is invalid")
+	}
+	qualified := make(map[string]map[qualifiedFailedReceipt]struct{})
+	qualify := func(record maintenanceCompletionRecord) {
+		if qualified[record.LeaseUUID] == nil {
+			qualified[record.LeaseUUID] = make(map[qualifiedFailedReceipt]struct{})
+		}
+		qualified[record.LeaseUUID][qualifiedFailedReceipt{
+			id: record.MaintenanceID, sequence: record.CompletionSequence,
+		}] = struct{}{}
+	}
+	var errs []error
+	for _, proof := range proofs {
+		if proof.settlement != s {
+			// A foreign or unminted proof qualifies nothing; other leases proceed.
+			errs = append(errs, errors.New("failed-maintenance cleanup proof was not minted by this journal pair"))
+			continue
+		}
+		if proof.attestedAt.Sub(proof.record.SettledAt) >= failedReceiptEvictionGrace {
+			qualify(proof.record)
+		}
+	}
+	for _, receipt := range unverifiable {
+		if receipt.settlement != s {
+			errs = append(errs, errors.New("unverifiable maintenance receipt was not minted by this journal pair"))
+			continue
+		}
+		qualify(receipt.record)
+	}
+	leases := make([]string, 0, len(qualified))
+	for leaseUUID := range qualified {
+		leases = append(leases, leaseUUID)
+	}
+	slices.Sort(leases)
+	for _, leaseUUID := range leases {
+		// One lease's failure must not hold back another's window.
+		if err := s.confirmFailedMaintenanceCleanupForLease(leaseUUID, qualified[leaseUUID]); err != nil {
+			errs = append(errs, fmt.Errorf("lease %q: %w", leaseUUID, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// qualifiedFailedReceipt names one exact failed receipt: an ID alone could
+// match a later receipt that reused it.
+type qualifiedFailedReceipt struct {
+	id       MaintenanceID
+	sequence uint64
+}
+
+func (s *MaintenanceSettlement) confirmFailedMaintenanceCleanupForLease(
+	leaseUUID string,
+	qualified map[qualifiedFailedReceipt]struct{},
+) error {
+	unlock := s.lockLease(leaseUUID)
+	defer unlock()
+	return s.callbacks.update(func(tx *bolt.Tx) error {
+		records, err := listMaintenanceReceiptsTx(tx, leaseUUID)
+		if err != nil {
+			return err
+		}
+		failed := slices.DeleteFunc(records, func(record maintenanceCompletionRecord) bool {
+			return record.Status != backend.CallbackStatusFailed || !record.EffectStarted
+		})
+		slices.SortFunc(failed, func(a, b maintenanceCompletionRecord) int {
+			return cmp.Compare(a.CompletionSequence, b.CompletionSequence)
+		})
+		lineage, err := loadMaintenanceLineageTx(tx, leaseUUID)
+		if err != nil {
+			return err
+		}
+		through := lineage.CleanupConfirmedSequence
+		for _, record := range failed {
+			if record.CompletionSequence <= through {
+				continue
+			}
+			if _, ok := qualified[qualifiedFailedReceipt{
+				id: record.MaintenanceID, sequence: record.CompletionSequence,
+			}]; !ok {
+				break
+			}
+			through = record.CompletionSequence
+		}
+		if through == lineage.CleanupConfirmedSequence {
+			return nil
+		}
+		lineage.CleanupConfirmedSequence = through
+		return putMaintenanceLineageTx(tx, leaseUUID, lineage)
+	})
 }

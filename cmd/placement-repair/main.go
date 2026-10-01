@@ -47,6 +47,8 @@ type repairPostconditionInspector interface {
 		placement.ConflictRepairCandidate,
 		placement.ConflictRepairResult,
 	) error
+	VerifyRestoredBackupPostcondition(placement.RestoredBackupResult) error
+	VerifyBackendRetirementPostcondition(placement.BackendRetirementResult) error
 	Close() error
 }
 
@@ -211,6 +213,18 @@ func runWithDependencies(
 	listRecords := flags.Bool("list", false, "list every durable placement row read-only (offline)")
 	inspectRecord := flags.Bool("inspect", false, "inspect the exact -lease row read-only (offline)")
 	resolveConflict := flags.Bool("resolve-conflict", false, "resolve one exact durable conflict to -backend")
+	attestRestoredBackup := flags.Bool(
+		"attest-restored-backup",
+		false,
+		"forget the admission baseline and drain evidence of a database restored from an older copy (offline)",
+	)
+	retireLostBackend := flags.Bool(
+		"retire-lost-backend",
+		false,
+		"retire -backend, whose storage -storage-id is irrecoverably lost; its leases are closed as lost (offline)",
+	)
+	storageIDText := flags.String("storage-id", "", "exact pinned storage identity of the -backend being retired")
+	lostAttestation := flags.String("attest-lost", "", "exact lost-storage attestation required with -apply -retire-lost-backend")
 	timeout := flags.Duration(
 		"timeout",
 		defaultRepairTimeout,
@@ -250,13 +264,46 @@ func runWithDependencies(
 		return fmt.Errorf("-config is required")
 	}
 	modeCount := 0
-	for _, selected := range []bool{*classifyAuthority, *listRecords, *inspectRecord, *resolveConflict} {
+	for _, selected := range []bool{
+		*classifyAuthority, *listRecords, *inspectRecord, *resolveConflict, *attestRestoredBackup,
+		*retireLostBackend,
+	} {
 		if selected {
 			modeCount++
 		}
 	}
 	if modeCount > 1 {
-		return fmt.Errorf("-classify, -list, -inspect, and -resolve-conflict are mutually exclusive")
+		return fmt.Errorf(
+			"-classify, -list, -inspect, -resolve-conflict, -attest-restored-backup, and -retire-lost-backend are mutually exclusive",
+		)
+	}
+	if *retireLostBackend {
+		if timeoutExplicit {
+			return fmt.Errorf("-retire-lost-backend probes with the backend's configured timeout and does not accept -timeout")
+		}
+		if *backendName == "" || *storageIDText == "" {
+			return fmt.Errorf("-retire-lost-backend requires -backend and -storage-id")
+		}
+		if *leaseUUID != "" || *operationText != "" || *attestation != "" {
+			return fmt.Errorf(
+				"-retire-lost-backend cannot be combined with -lease, -operation-id, or -attest-drained",
+			)
+		}
+		if !*apply && *lostAttestation != "" {
+			return fmt.Errorf("-attest-lost requires -apply; no mutation was attempted")
+		}
+	} else if *storageIDText != "" || *lostAttestation != "" {
+		return fmt.Errorf("-storage-id and -attest-lost require -retire-lost-backend")
+	}
+	if *attestRestoredBackup {
+		if timeoutExplicit {
+			return fmt.Errorf("-attest-restored-backup reads no backend inventory and does not accept -timeout")
+		}
+		if *leaseUUID != "" || *backendName != "" || *operationText != "" || *attestation != "" {
+			return fmt.Errorf(
+				"-attest-restored-backup cannot be combined with -lease, -backend, -operation-id, or -attest-drained",
+			)
+		}
 	}
 	if timeoutExplicit && *classifyAuthority {
 		return fmt.Errorf("read-only -classify does not accept -timeout")
@@ -290,7 +337,8 @@ func runWithDependencies(
 	newRepairClients := func(resolver backend.BackendStorageIdentityResolver) ([]placementprobe.Client, error) {
 		return placementprobe.NewIdentityBoundClients(cfg, resolver)
 	}
-	if *apply {
+	// Neither whole-database mode reads authenticated inventory evidence.
+	if *apply && !*attestRestoredBackup && !*retireLostBackend {
 		fleet, err := placementprobe.NewAuthenticatedFleet(cfg)
 		if err != nil {
 			return err
@@ -346,16 +394,20 @@ func runWithDependencies(
 			cfg.PlacementStoreDBPath, cfg.ProviderUUID, *leaseUUID, *listRecords, stdout,
 		)
 	}
-	if *leaseUUID == "" || *backendName == "" {
-		flags.Usage()
-		return fmt.Errorf("-lease and -backend are required")
-	}
-	if *resolveConflict {
-		if *operationText != "" {
-			return fmt.Errorf("-resolve-conflict does not accept -operation-id")
+	// -attest-restored-backup and -retire-lost-backend target the whole
+	// database; their flags were validated before the config was loaded.
+	if !*attestRestoredBackup && !*retireLostBackend {
+		if *leaseUUID == "" || *backendName == "" {
+			flags.Usage()
+			return fmt.Errorf("-lease and -backend are required")
 		}
-	} else if *operationText == "" {
-		return fmt.Errorf("-operation-id is required for attempt refusal")
+		if *resolveConflict {
+			if *operationText != "" {
+				return fmt.Errorf("-resolve-conflict does not accept -operation-id")
+			}
+		} else if *operationText == "" {
+			return fmt.Errorf("-operation-id is required for attempt refusal")
+		}
 	}
 
 	repair, err := placement.OpenAttemptRepair(cfg.PlacementStoreDBPath, cfg.ProviderUUID)
@@ -409,6 +461,111 @@ func runWithDependencies(
 			"provider config backend topology %q does not exactly match durable topology %q",
 			canonicalConfigured, repair.BackendTopology(),
 		)
+	}
+
+	if *retireLostBackend {
+		return runBackendRetirement(ctx, backendRetirementRequest{
+			cfg: cfg, repair: repair, closeRepair: closeRepair,
+			backendName: *backendName, storageIDText: *storageIDText,
+			apply: *apply, confirmation: *confirmation, attestation: *lostAttestation,
+			backupTarget:      boundBackupTarget,
+			mutationCommitted: &mutationCommitted, mutationOutcomeUnknown: &mutationOutcomeUnknown,
+		}, stdout, dependencies)
+	}
+
+	if *attestRestoredBackup {
+		plan, planErr := repair.PlanRestoredBackupAttestation()
+		if planErr != nil {
+			return planErr
+		}
+		facts := plan.Facts()
+		if !*apply {
+			if err := closeRepair(); err != nil {
+				return fmt.Errorf("close dry-run placement repair: %w", err)
+			}
+			output := struct {
+				placement.RestoredBackupFacts
+				Confirm string `json:"confirm,omitempty"`
+			}{RestoredBackupFacts: facts}
+			if facts.Required {
+				output.Confirm = plan.ConfirmationValue()
+			}
+			if err := json.NewEncoder(stdout).Encode(output); err != nil {
+				return fmt.Errorf("write restored-backup attestation plan: %w", err)
+			}
+			return nil
+		}
+		if !facts.Required {
+			return fmt.Errorf(
+				"placement database carries no admission baseline or drain evidence; nothing to attest and no backup was taken",
+			)
+		}
+		if *confirmation != plan.ConfirmationValue() {
+			return fmt.Errorf("-confirm must exactly equal %q", plan.ConfirmationValue())
+		}
+		if err := dependencies.createExactBackup(repair, boundBackupTarget); err != nil {
+			if errors.Is(err, placement.ErrExactBackupPublished) {
+				return publishedRepairBackupFailure(boundBackupTarget.Path(), err)
+			}
+			return err
+		}
+		result, attestErr := repair.AttestRestoredBackup(plan)
+		if attestErr != nil {
+			if errors.Is(attestErr, placement.ErrRepairMutationOutcomeUnknown) {
+				mutationOutcomeUnknown = true
+				return newOutcomeUnknownRepairFailure(
+					"attesting the restored placement database", attestErr,
+				)
+			}
+			if errors.Is(attestErr, placement.ErrRepairMutationCommitted) {
+				mutationCommitted = true
+				return newCommittedRepairFailure("post-commit invariant verification", attestErr)
+			}
+			return publishedRepairBackupFailure(boundBackupTarget.Path(), attestErr)
+		}
+		mutationCommitted = true
+		if err := repair.Sync(); err != nil {
+			return newCommittedRepairFailure("explicit database sync verification", err)
+		}
+		if err := closeRepair(); err != nil {
+			return newCommittedRepairFailure("database close verification", err)
+		}
+		reopened, openErr := dependencies.openPostconditionInspector(
+			cfg.PlacementStoreDBPath, cfg.ProviderUUID,
+		)
+		if openErr != nil {
+			return newCommittedRepairFailure(
+				"database reopen physical/schema verification", openErr,
+			)
+		}
+		verifyErr := reopened.VerifyRestoredBackupPostcondition(result)
+		reopenedCloseErr := reopened.Close()
+		if verifyErr != nil {
+			if reopenedCloseErr != nil {
+				verifyErr = errors.Join(
+					verifyErr,
+					fmt.Errorf("close reopened database: %w", reopenedCloseErr),
+				)
+			}
+			return newCommittedRepairFailure(
+				"reopened database semantic verification", verifyErr,
+			)
+		}
+		if reopenedCloseErr != nil {
+			return newCommittedRepairFailure(
+				"reopened database close verification", reopenedCloseErr,
+			)
+		}
+		if err := boundBackupTarget.VerifyPublished(); err != nil {
+			return newCommittedRepairFailure("final exact-backup authority verification", err)
+		}
+		if _, err := fmt.Fprintf(stdout,
+			"PASS: attested restored placement database %q; admission baseline and drain evidence cleared, so new admission and backend removal wait for one complete inventory; exact pre-mutation backup %q; database synced and closed\n",
+			facts.DatabasePath, boundBackupTarget.Path(),
+		); err != nil {
+			return newCommittedVerdictFailure(err)
+		}
+		return nil
 	}
 
 	if *resolveConflict {

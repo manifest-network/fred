@@ -174,8 +174,8 @@ func referenceMaintenanceHistoryTx(tx *bolt.Tx) (uint64, error) {
 		if err != nil {
 			return err
 		}
-		if len(records) > maxMaintenanceReceiptsPerLease {
-			return fmt.Errorf("maintenance receipt capacity exceeded for lease %q", leaseKey)
+		if err := validateMaintenanceWindowCounts(string(leaseKey), records, nil); err != nil {
+			return err
 		}
 		completedCount += uint64(len(records))
 		sequences := make(map[uint64]struct{}, len(records))
@@ -224,8 +224,9 @@ func referenceMaintenanceHistoryTx(tx *bolt.Tx) (uint64, error) {
 		if err != nil {
 			return err
 		}
-		if len(records) >= maxMaintenanceReceiptsPerLease {
-			return fmt.Errorf("maintenance head for lease %q has no reserved receipt capacity", leaseKey)
+		kind := maintenance.claim.Kind()
+		if err := validateMaintenanceWindowCounts(string(leaseKey), records, &kind); err != nil {
+			return err
 		}
 		for _, record := range records {
 			if !maintenanceReceiptMatchesEntryAuthority(record, maintenance.claim.entry) {

@@ -50,6 +50,11 @@ func (coordinator *AuthenticatedCallbackCoordinator) recordMaintenanceCompletion
 			string(pending.Get([]byte(callback.LeaseUUID()))) != callback.MaintenanceID().String() {
 			return nil
 		}
+		if stamp := callback.MaintenanceAdmittedAt(); !stamp.IsZero() && !stamp.Equal(createdAt) {
+			// The completion of an earlier command that reused this key cannot
+			// settle the newer one. An unstamped completion predates stamping.
+			return nil
+		}
 		switch command.phase {
 		case maintenanceDeliveryOutstanding, maintenanceCompletionOutstanding:
 		case maintenancePayloadConfirmed:
