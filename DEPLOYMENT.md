@@ -780,7 +780,7 @@ chain, and it cannot be undone.
    | `maintenance_settled` | Pending restarts and updates that settle as `backend_lost`; a retried request answers 410 |
    | `topology_before`, `topology_after`, `topology_id` | The active topology before and after, and its current generation |
    | `pending_inventory_sweep`, `recordless_unproven` | See below |
-   | `target_probe` | One single-row request for the backend's storage identity, read from a response header so a failing inventory still answers: `no_identity` (unreachable, or its storage identity did not verify) or `answered_with_other_storage` (for example a host rebuilt on new disks). The run refuses when the answer is the backend's own pin, because then its storage is not lost, or another backend's pin, because then the configured address reaches a different backend. The probe uses the backend's configured request timeout; `-timeout` is refused |
+   | `target_probe` | One single-row request for the backend's storage identity, read from a response header so a failing inventory still answers: `no_identity` (unreachable, or its storage identity did not verify) or `answered_with_other_storage` (for example a host rebuilt on new disks). The run refuses when the answer is the backend's own pin, because then its storage is not lost, or any other pin the database has ever recorded, including a removed or retired backend's, because then the configured address reaches a different backend. The probe uses the backend's configured request timeout; `-timeout` is refused |
    | `attest_lost`, `confirm` | The exact values the apply requires |
 
    The probe only guards against retiring the wrong name. Silence proves

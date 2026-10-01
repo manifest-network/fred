@@ -308,6 +308,57 @@ type BackendRetirementResult struct {
 
 func (plan BackendRetirementPlan) ConfirmationValue() string { return plan.confirmation }
 
+// RetirementProbeTarget is the backend proposed for retirement together with
+// every storage identity its database has ever pinned: active, removed, and
+// retired names alike, read from the retirement plan's own snapshot. The probe
+// that guards against retiring the wrong name must recognize an answer from
+// any backend this provider has known, not only the active ones, so only a
+// plan mints this. Its zero value is invalid.
+type RetirementProbeTarget struct {
+	backendName string
+	pin         backendidentity.ID
+	owners      map[backendidentity.ID]string
+}
+
+// ProbeTarget returns the plan's backend and the database's complete storage
+// pin history for the wrong-target probe.
+func (plan BackendRetirementPlan) ProbeTarget() (RetirementProbeTarget, error) {
+	if plan.issuer == nil || plan.backendName == "" || !plan.storageID.Valid() {
+		return RetirementProbeTarget{}, errors.New("backend retirement plan is invalid")
+	}
+	owners := make(map[backendidentity.ID]string, len(plan.current.KnownBackendStorageIDs))
+	for backendName, encoded := range plan.current.KnownBackendStorageIDs {
+		id, err := backendidentity.Parse(encoded)
+		if err != nil || !id.Valid() {
+			return RetirementProbeTarget{}, fmt.Errorf("backend %q has an invalid storage pin", backendName)
+		}
+		if other, duplicate := owners[id]; duplicate {
+			return RetirementProbeTarget{}, fmt.Errorf(
+				"backends %q and %q share storage pin %s", other, backendName, id,
+			)
+		}
+		owners[id] = backendName
+	}
+	if owners[plan.storageID] != plan.backendName {
+		return RetirementProbeTarget{}, fmt.Errorf(
+			"backend %q is not pinned to storage %s", plan.backendName, plan.storageID,
+		)
+	}
+	return RetirementProbeTarget{backendName: plan.backendName, pin: plan.storageID, owners: owners}, nil
+}
+
+// BackendName is the backend proposed for retirement.
+func (target RetirementProbeTarget) BackendName() string { return target.backendName }
+
+// Pin is the storage identity pinned to the backend proposed for retirement.
+func (target RetirementProbeTarget) Pin() backendidentity.ID { return target.pin }
+
+// StorageOwner names the backend, active or not, pinned to storage id.
+func (target RetirementProbeTarget) StorageOwner(id backendidentity.ID) (string, bool) {
+	backendName, known := target.owners[id]
+	return backendName, known
+}
+
 func (plan BackendRetirementPlan) Facts() BackendRetirementFacts {
 	facts := plan.facts
 	facts.TopologyBefore = slices.Clone(facts.TopologyBefore)

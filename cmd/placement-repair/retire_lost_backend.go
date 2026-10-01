@@ -51,13 +51,11 @@ func runBackendRetirement(
 	if err != nil {
 		return err
 	}
-	pins := make(map[string]backendidentity.ID, len(request.repair.BackendTopology()))
-	for _, name := range request.repair.BackendTopology() {
-		if pin, bound := request.repair.ExpectedBackendStorageIdentity(name); bound {
-			pins[name] = pin
-		}
+	target, err := plan.ProbeTarget()
+	if err != nil {
+		return err
 	}
-	liveness, err := placementprobe.ProbeRetirementTarget(ctx, request.cfg, request.backendName, pins)
+	liveness, err := placementprobe.ProbeRetirementTarget(ctx, request.cfg, target)
 	if err != nil {
 		return err
 	}

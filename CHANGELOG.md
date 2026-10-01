@@ -14,7 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   forever. The dry run lists every lease the backend owned, which of them a
   survivor also reported, and every pending restart or update it settles. It
   probes the backend once and refuses if the answer is the backend's own
-  pinned storage or another backend's. The apply takes an exact
+  pinned storage or any other storage the database has ever pinned, including
+  a removed or retired backend's. The apply takes an exact
   confirmation and a lost-storage attestation, publishes an exact backup, and
   writes the retirement in one transaction. `providerd` then closes each lost
   ACTIVE lease and rejects each lost PENDING lease on chain with reason

@@ -352,6 +352,39 @@ func retiredFixtureStore(t *testing.T) (*Store, retirementFixture) {
 	return store, fixture
 }
 
+// TestRetirementProbeTargetKnowsEveryPinTheDatabaseRecorded pins the probe's
+// comparison set to the database's whole pin history, so an address that
+// reaches a retired backend is never read as unknown storage.
+func TestRetirementProbeTargetKnowsEveryPinTheDatabaseRecorded(t *testing.T) {
+	store, fixture := retiredFixtureStore(t)
+	require.NoError(t, store.Close())
+	repair, err := OpenAttemptRepair(fixture.dbPath, freshTestProviderUUID)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = repair.Close() })
+	pinB := testBackendStorageID("backend-b")
+	plan, err := repair.PlanBackendRetirement("backend-b", pinB)
+	require.NoError(t, err)
+
+	target, err := plan.ProbeTarget()
+	require.NoError(t, err)
+	assert.Equal(t, "backend-b", target.BackendName())
+	assert.Equal(t, pinB, target.Pin())
+	for backendName, pin := range map[string]backendidentity.ID{
+		"backend-a": testBackendStorageID("backend-a"),
+		"backend-b": pinB,
+		"backend-c": fixture.pinC, // retired earlier, so no longer active
+	} {
+		owner, known := target.StorageOwner(pin)
+		assert.True(t, known, backendName)
+		assert.Equal(t, backendName, owner)
+	}
+	_, known := target.StorageOwner(testBackendStorageID("backend-never-pinned"))
+	assert.False(t, known)
+
+	_, err = BackendRetirementPlan{}.ProbeTarget()
+	require.Error(t, err, "only a plan mints a probe target")
+}
+
 // TestProjectionNeverRewritesALostPlacement pins the store-side absorbing
 // rule independently of the reconciler's own filtering: no observation a
 // caller submits can rewrite, quarantine, or resurrect a lost placement.

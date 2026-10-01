@@ -6,8 +6,8 @@ import (
 	"fmt"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 var (
@@ -16,8 +16,9 @@ var (
 	ErrRetirementTargetAlive = errors.New("backend proposed for retirement still serves its pinned storage")
 
 	// ErrRetirementTargetMisrouted means the address configured for the backend
-	// proposed for retirement answered with another backend's pinned storage,
-	// so the probe never reached the backend being retired.
+	// proposed for retirement answered with the pinned storage of another
+	// backend, active, removed, or retired, so the probe never reached the
+	// backend being retired.
 	ErrRetirementTargetMisrouted = errors.New("backend proposed for retirement answered with another backend's storage")
 )
 
@@ -33,7 +34,8 @@ const (
 	// because it is unreachable or its storage identity did not verify.
 	RetirementTargetNoIdentity
 	// RetirementTargetOtherStorage: the target answered with a storage
-	// identity no backend is pinned to, such as a host rebuilt on new disks.
+	// identity no backend has ever been pinned to, such as a host rebuilt on
+	// new disks.
 	RetirementTargetOtherStorage
 )
 
@@ -58,18 +60,17 @@ func (liveness RetirementTargetLiveness) MarshalText() ([]byte, error) {
 
 // ProbeRetirementTarget asks the configured backend once, within its
 // configured request timeout, which storage it serves. It refuses when the
-// answer is the target's own pin (the storage is not lost) or another pinned
-// backend's storage (the configured address reaches a different backend).
-// pins maps every pinned backend name, the target included, to its storage.
+// answer is the target's own pin (the storage is not lost) or any other pin
+// the database has ever recorded (the configured address reaches a different
+// backend, even one that has since left the topology).
 func ProbeRetirementTarget(
 	ctx context.Context,
 	cfg *config.Config,
-	backendName string,
-	pins map[string]backendidentity.ID,
+	target placement.RetirementProbeTarget,
 ) (RetirementTargetLiveness, error) {
-	pin := pins[backendName]
-	if !pin.Valid() {
-		return retirementTargetLivenessInvalid, fmt.Errorf("backend %q has no storage pin", backendName)
+	backendName, pin := target.BackendName(), target.Pin()
+	if backendName == "" || !pin.Valid() {
+		return retirementTargetLivenessInvalid, errors.New("retirement probe target is invalid")
 	}
 	if cfg == nil {
 		return retirementTargetLivenessInvalid, errors.New("provider config is required")
@@ -82,18 +83,17 @@ func ProbeRetirementTarget(
 	if err != nil {
 		return RetirementTargetNoIdentity, nil //nolint:nilerr // an unanswered probe proves nothing either way
 	}
-	for name, other := range pins {
-		if other != observed {
-			continue
-		}
-		if name == backendName {
-			return retirementTargetLivenessInvalid, fmt.Errorf(
-				"%w: backend %q answered with storage identity %s", ErrRetirementTargetAlive, backendName, pin,
-			)
-		}
+	owner, known := target.StorageOwner(observed)
+	switch {
+	case !known:
+		return RetirementTargetOtherStorage, nil
+	case owner == backendName:
 		return retirementTargetLivenessInvalid, fmt.Errorf(
-			"%w: backend %q answered with the storage of backend %q", ErrRetirementTargetMisrouted, backendName, name,
+			"%w: backend %q answered with storage identity %s", ErrRetirementTargetAlive, backendName, pin,
+		)
+	default:
+		return retirementTargetLivenessInvalid, fmt.Errorf(
+			"%w: backend %q answered with the storage of backend %q", ErrRetirementTargetMisrouted, backendName, owner,
 		)
 	}
-	return RetirementTargetOtherStorage, nil
 }

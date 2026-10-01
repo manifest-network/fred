@@ -31,9 +31,23 @@ type retirementPlanOutput struct {
 // targetHandler (nil: nothing listens) while backend-a must never be contacted.
 func newRetirementCommandFixture(t *testing.T, targetHandler http.Handler) (dbPath, configPath string) {
 	t.Helper()
+	return newRetirementCommandFixtureAfter(t, targetHandler, nil)
+}
+
+// newRetirementCommandFixtureAfter is newRetirementCommandFixture with history
+// applied to the open store before the lease is projected.
+func newRetirementCommandFixtureAfter(
+	t *testing.T,
+	targetHandler http.Handler,
+	history func(*placement.Store),
+) (dbPath, configPath string) {
+	t.Helper()
 	names := []string{repairCommandBackend, retirementCommandTarget}
 	dbPath = filepath.Join(t.TempDir(), "placements.db")
 	store := initializeRepairPlacementStore(t, dbPath, names)
+	if history != nil {
+		history(store)
+	}
 	projectRepairInventoryWithRows(t, newRepairReconciliation(t, store, names), names,
 		placement.ReconciliationProjection{
 			Placements: map[string]string{repairCommandLease: retirementCommandTarget},
@@ -125,6 +139,65 @@ func TestRun_RetireLostBackendRefusesATargetAddressServingAnotherBackend(t *test
 	err = run(t.Context(), retirementArgs(configPath), &bytes.Buffer{}, &bytes.Buffer{})
 	require.ErrorIs(t, err, placementprobe.ErrRetirementTargetMisrouted,
 		"an address that reaches a survivor never probed the backend being retired")
+
+	after, err := os.ReadFile(dbPath)
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+}
+
+// joinAndRemoveRemovedBackend adds backend-z with two concrete empty
+// inventories and removes it again through the production topology API, so
+// its storage pin remains only as history.
+func joinAndRemoveRemovedBackend(t *testing.T) func(*placement.Store) {
+	t.Helper()
+	observe := func(backendName string) placement.CompleteBackendObservation {
+		observation, err := placement.NewCompleteBackendObservation(
+			repairBackendStorageID(t, backendName), []backend.ProvisionInfo{}, []backend.RetainedLease{},
+		)
+		require.NoError(t, err)
+		return observation
+	}
+	return func(store *placement.Store) {
+		require.NoError(t, store.ConfigureBackendTopologyWithCompleteObservations(
+			[]string{repairCommandBackend, retirementCommandTarget, removedRepairBackend},
+			map[string]placement.CompleteBackendObservation{
+				repairCommandBackend:    observe(repairCommandBackend),
+				retirementCommandTarget: observe(retirementCommandTarget),
+				removedRepairBackend:    observe(removedRepairBackend),
+			},
+		))
+		require.NoError(t, store.ConfigureBackendTopologyWithCompleteObservations(
+			[]string{repairCommandBackend, retirementCommandTarget},
+			map[string]placement.CompleteBackendObservation{
+				repairCommandBackend:    observe(repairCommandBackend),
+				retirementCommandTarget: observe(retirementCommandTarget),
+			},
+		))
+	}
+}
+
+// TestRun_RetireLostBackendRefusesATargetAddressServingARemovedBackend covers
+// an address that reaches a backend which has left the topology. Its storage
+// pin is history only, and the probe must still recognize it instead of
+// reading it as a rebuilt host's new storage and retiring backend-b.
+func TestRun_RetireLostBackendRefusesATargetAddressServingARemovedBackend(t *testing.T) {
+	dbPath, configPath := newRetirementCommandFixtureAfter(t, repairInventoryHandlerForBackend(
+		t, removedRepairBackend, []backend.ProvisionInfo{}, []backend.RetainedLease{}),
+		joinAndRemoveRemovedBackend(t),
+	)
+	before, err := os.ReadFile(dbPath)
+	require.NoError(t, err)
+
+	err = run(t.Context(), retirementArgs(configPath), &bytes.Buffer{}, &bytes.Buffer{})
+	require.ErrorIs(t, err, placementprobe.ErrRetirementTargetMisrouted,
+		"an address that reaches the removed backend-z never probed backend-b")
+	backupPath := filepath.Join(t.TempDir(), "pre-retirement.db")
+	err = run(t.Context(), retirementArgs(configPath,
+		"-apply", "-backup", backupPath, "-confirm", "unused",
+		"-attest-lost", placement.LostBackendAttestationText,
+	), &bytes.Buffer{}, &bytes.Buffer{})
+	require.ErrorIs(t, err, placementprobe.ErrRetirementTargetMisrouted)
+	assert.NoFileExists(t, backupPath, "the refusal comes before any backup")
 
 	after, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
