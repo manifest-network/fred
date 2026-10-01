@@ -29,13 +29,26 @@ func callbackKeyringID(t *testing.T, value string) backendidentity.ID {
 	return id
 }
 
+// callbackKeysForTest binds each storage identity to one current key and a
+// backend name derived from the identity.
+func callbackKeysForTest(t *testing.T, secrets map[backendidentity.ID]string) map[backendidentity.ID]CallbackKey {
+	t.Helper()
+	keys := make(map[backendidentity.ID]CallbackKey, len(secrets))
+	for id, secret := range secrets {
+		verifyKeys, err := hmacauth.NewVerifyKeys(secret, "")
+		require.NoError(t, err)
+		keys[id] = CallbackKey{Backend: "backend-" + id.String()[:8], Keys: verifyKeys}
+	}
+	return keys
+}
+
 func testCallbackKeyring(t *testing.T) *CallbackKeyringAuthenticator {
 	t.Helper()
 	verifier, _ := hmacauth.NewCallbackProofBoundary()
-	keyring, err := NewCallbackKeyringAuthenticator(map[backendidentity.ID]string{
+	keyring, err := NewCallbackKeyringAuthenticator(callbackKeysForTest(t, map[backendidentity.ID]string{
 		callbackKeyringID(t, callbackKeyringStorageA): callbackKeyringSecretA,
 		callbackKeyringID(t, callbackKeyringStorageB): callbackKeyringSecretB,
-	}, verifier)
+	}), verifier)
 	require.NoError(t, err)
 	return keyring
 }
@@ -171,28 +184,47 @@ func TestCallbackKeyringAuthenticatorConstructionIsClosed(t *testing.T) {
 	idB := callbackKeyringID(t, callbackKeyringStorageB)
 	verifier, _ := hmacauth.NewCallbackProofBoundary()
 	keyring, err := NewCallbackKeyringAuthenticator(
-		map[backendidentity.ID]string{idA: callbackKeyringSecretA},
+		callbackKeysForTest(t, map[backendidentity.ID]string{idA: callbackKeyringSecretA}),
 		hmacauth.CallbackProofVerifier{},
 	)
 	require.ErrorContains(t, err, "proof verifier is required")
 	assert.Nil(t, keyring)
 
+	keysA, err := hmacauth.NewVerifyKeys(callbackKeyringSecretA, "")
+	require.NoError(t, err)
 	_, err = NewCallbackKeyringAuthenticator(nil, verifier)
 	require.ErrorContains(t, err, "keyring is required")
-	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]string{{}: callbackKeyringSecretA}, verifier)
+	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]CallbackKey{{}: {Backend: "a", Keys: keysA}}, verifier)
 	require.ErrorContains(t, err, "invalid backend storage identity")
-	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]string{idA: "short"}, verifier)
-	require.ErrorContains(t, err, "at least")
-	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]string{
+	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]CallbackKey{idA: {Backend: "a"}}, verifier)
+	require.ErrorContains(t, err, "is invalid")
+	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]CallbackKey{idA: {Keys: keysA}}, verifier)
+	require.ErrorContains(t, err, "has no backend name")
+	keysB, err := hmacauth.NewVerifyKeys(callbackKeyringSecretB, "")
+	require.NoError(t, err)
+	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]CallbackKey{
+		idA: {Backend: "same", Keys: keysA},
+		idB: {Backend: "same", Keys: keysB},
+	}, verifier)
+	require.ErrorContains(t, err, "is bound to storage")
+	_, err = NewCallbackKeyringAuthenticator(callbackKeysForTest(t, map[backendidentity.ID]string{
 		idA: callbackKeyringSecretA,
 		idB: callbackKeyringSecretA,
-	}, verifier)
+	}), verifier)
 	require.ErrorContains(t, err, "duplicates storage")
+	rotatingB, err := hmacauth.NewVerifyKeys(callbackKeyringSecretB, callbackKeyringSecretA+"\x00")
+	require.NoError(t, err)
+	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]CallbackKey{
+		idA: {Backend: "a", Keys: keysA},
+		idB: {Backend: "b", Keys: rotatingB},
+	}, verifier)
+	require.ErrorContains(t, err, "duplicates storage",
+		"a previous key equivalent to another backend's key is a shared key")
 
-	configured := map[backendidentity.ID]string{idA: callbackKeyringSecretA}
+	configured := map[backendidentity.ID]CallbackKey{idA: {Backend: "a", Keys: keysA}}
 	keyring, err = NewCallbackKeyringAuthenticator(configured, verifier)
 	require.NoError(t, err)
-	configured[idA] = callbackKeyringSecretB
+	configured[idA] = CallbackKey{Backend: "a", Keys: keysB}
 	body := []byte(`{"lease_uuid":"d144291f-a36f-47a4-8ccf-48afe590e29d","status":"success","backend_storage_id":"` + callbackKeyringStorageA + `"}`)
 	_, err = keyring.VerifyCallbackRequest(signedKeyringCallbackRequest(body, callbackKeyringSecretA))
 	require.NoError(t, err, "construction must detach the caller's mutable map")
@@ -202,9 +234,9 @@ func TestNewServerRejectsAmbiguousCallbackAuthenticationModes(t *testing.T) {
 	t.Parallel()
 	server, err := NewServer(ServerConfig{
 		CallbackSecret: testCallbackSecret,
-		CallbackHMACSecrets: map[backendidentity.ID]string{
+		CallbackKeys: callbackKeysForTest(t, map[backendidentity.ID]string{
 			callbackKeyringID(t, callbackKeyringStorageA): callbackKeyringSecretA,
-		},
+		}),
 	}, ServerDeps{})
 	assert.Nil(t, server)
 	require.ErrorContains(t, err, "cannot be combined")
@@ -220,10 +252,10 @@ func TestNewServerConstructsStorageIdentityKeyring(t *testing.T) {
 	t.Parallel()
 	verifier, _ := hmacauth.NewCallbackProofBoundary()
 	server, err := NewServer(ServerConfig{
-		CallbackHMACSecrets: map[backendidentity.ID]string{
+		CallbackKeys: callbackKeysForTest(t, map[backendidentity.ID]string{
 			callbackKeyringID(t, callbackKeyringStorageA): callbackKeyringSecretA,
 			callbackKeyringID(t, callbackKeyringStorageB): callbackKeyringSecretB,
-		},
+		}),
 	}, ServerDeps{CallbackProofVerifier: verifier})
 	require.NoError(t, err)
 	require.IsType(t, &CallbackKeyringAuthenticator{}, server.callbackAuthenticator)

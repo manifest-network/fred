@@ -99,6 +99,9 @@ var labelledMetricNames = []string{
 	"fred_reconciler_actions_total",
 	"fred_reconciler_backend_fetch_total",
 	"fred_reconciler_backend_inventory_total",
+	"fred_api_callback_signature_key_total",
+	"fred_api_callback_auth_failures_total",
+	"fred_api_callback_previous_key_configured",
 	"fred_reconciler_backend_inventory_answered",
 	"fred_reconciler_cleanup_skips_total",
 	"fred_reconciler_runs_total",
@@ -116,6 +119,7 @@ func allCollectors() []prometheus.Collector {
 		MaintenancePending, MaintenancePendingBytes, MaintenancePendingOldestAge, MaintenanceAdmissionRefusalsTotal,
 		// Provisioning
 		PlacementWriteFailuresTotal, PlacementInventoryRecoveryPending, APIMaintenanceLegacyKeyTotal,
+		APICallbackSignatureKeyTotal, APICallbackAuthFailuresTotal, APICallbackPreviousKeyConfigured,
 		InFlightProvisions,
 		ProvisioningTotal,
 		ProvisioningDuration,
@@ -342,6 +346,18 @@ func TestCounterVecLabels(t *testing.T) {
 			ReconcilerBackendInventoryTotal.WithLabelValues("docker", outcome)
 		}
 		ReconcilerBackendInventoryAnswered.WithLabelValues("docker")
+	})
+	assert.NotPanics(t, func() {
+		for _, slot := range []string{CallbackKeySlotCurrent, CallbackKeySlotPrevious} {
+			APICallbackSignatureKeyTotal.WithLabelValues("docker", slot)
+		}
+		for _, reason := range []string{
+			CallbackAuthFailureMissing, CallbackAuthFailureFormat, CallbackAuthFailureExpired,
+			CallbackAuthFailureFuture, CallbackAuthFailureMismatch, CallbackAuthFailureUnknownStorage,
+		} {
+			APICallbackAuthFailuresTotal.WithLabelValues(reason)
+		}
+		APICallbackPreviousKeyConfigured.WithLabelValues("docker")
 	})
 	assert.NotPanics(t, func() {
 		// Both label sets are closed; every combination the reconciler can emit.

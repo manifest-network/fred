@@ -417,7 +417,66 @@ Each production backend has its own bidirectional HMAC secret `K_i`, configured
 as that backend's `callback_secret` and the matching provider
 `backends[].hmac_secret`. Never reuse one backend's key for another: key
 separation prevents a compromised backend from authenticating requests or
-callbacks as a peer. Rotation requires a coordinated restart:
+callbacks as a peer. Keys are compared by HMAC equivalence, so a key with
+trailing zero bytes counts as the same key.
+
+### Rotating a backend's HMAC key
+
+Each side accepts one extra verify-only key, so one backend's key can rotate
+without stopping `providerd` and the backend together. `providerd` restarts
+twice, so expect two short API restarts; nothing needs draining. Signing always
+uses each side's main key. Upgrade both binaries before step 1: an older binary
+rejects the new keys.
+
+For backend `B`, rotating `K_old` to `K_new`:
+
+1. On `B`'s docker-backend, set `callback_secret_next: K_new` (keep
+   `callback_secret: K_old`) and restart it. It accepts `providerd` requests
+   signed with either key and still signs callbacks with `K_old`.
+2. In `providerd`, set `B`'s `hmac_secret: K_new` and
+   `hmac_secret_previous: K_old`, and restart it. It signs `B`'s requests with
+   `K_new` and accepts `B`'s callbacks signed with either key.
+3. On `B`, set `callback_secret: K_new`, remove `callback_secret_next`, and
+   restart it. `B` signs callbacks with `K_new`.
+4. In `providerd`, remove `B`'s `hmac_secret_previous` and restart it. `K_old`
+   is no longer accepted anywhere.
+
+Before each restart, confirm the keys pair without exposing them.
+`providerd --print-hmac-key-ids --config <file>` and
+`docker-backend -print-hmac-key-ids -config <file>` print non-secret key IDs for
+the configuration you are about to start. Before step 2, `providerd`'s new
+`current_key_id` for `B` must equal `B`'s `next_key_id`; before step 3, `B`'s new
+`current_key_id` must equal `providerd`'s `current_key_id` for `B`. Print IDs only
+when needed and never log them: an ID still lets someone test guesses of a weak
+key.
+
+Gate each step on the metrics:
+
+- Before step 3, on `B`: `fred_docker_backend_request_signature_key_total{slot="next"}`
+  rises and `slot="current"` stays flat, so `providerd` already signs with `K_new`.
+- Before step 4, on `providerd`:
+  `fred_api_callback_signature_key_total{backend="B",slot="current"}` rises and
+  `slot="previous"` stays flat, so `B` already signs with `K_new`. If `B` is idle,
+  run a test provision.
+- A misordered step shows up as `reason="mismatch"` on
+  `fred_api_callback_auth_failures_total` (callbacks) or
+  `fred_docker_backend_request_auth_failures_total` (requests). Restore the
+  previous configuration.
+- `fred_api_callback_previous_key_configured{backend="B"}` stays 1 until step 4.
+  Alert if it stays 1 longer than a rotation should take: the old key remains
+  valid until then.
+
+`DOCKER_BACKEND_CALLBACK_SECRET_NEXT` overrides `callback_secret_next`, but an
+environment override only sets a value; it cannot clear one set in YAML, so
+remove the YAML key at step 3. Roll back by reversing the steps.
+
+Never use a rolling rotation for a compromised key: the old key stays valid
+until step 4. Stop the backend and rotate with the stopped procedure below.
+
+### Stopped rotation
+
+A stopped rotation changes keys with everything stopped. Use it for a
+compromised key and for the non-production shared `callback_secret` mode:
 
 1. Drain operations and callback replay, remove provider ingress, then stop the
    single `providerd` and the backend(s) whose keys will change.
@@ -433,9 +492,7 @@ callbacks as a peer. Rotation requires a coordinated restart:
    v0.13 cutover with pending legacy rows; that outbox must be drained before
    storage-identity initialization.
 
-There is no built-in support for two-secret rotation (active + previous), so
-do not attempt a rolling mixed-key phase; secret rotation includes a brief
-`providerd` outage. Do not overlap two
+Either way, do not overlap two
 `providerd` instances for the same provider and backend fleet: the placement
 database is a single-writer bbolt file, while the lifecycle-operation registry
 is process-local and has no cross-process coordinator. A second instance with a

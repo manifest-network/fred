@@ -310,6 +310,34 @@ var (
 		Help:      "Interrupted operation cleanup passes deferred with their exact durable intent and resource reservation retained",
 	}, []string{"kind"})
 
+	// requestSignatureKeyTotal counts providerd requests verified, by key slot:
+	// "current" (callback_secret) or "next" (callback_secret_next during a
+	// rotation). Before restarting providerd onto the next key, nothing here
+	// changes; after, "next" rises and "current" stops.
+	requestSignatureKeyTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "request_signature_key_total",
+		Help:      "Requests from providerd verified, by key slot (current or next)",
+	}, []string{"slot"})
+
+	// requestAuthFailuresTotal counts providerd requests refused at signature
+	// verification, by closed reason.
+	requestAuthFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "request_auth_failures_total",
+		Help:      "Requests from providerd refused at signature verification, by reason",
+	}, []string{"reason"})
+
+	// requestNextKeyConfigured is 1 while callback_secret_next is configured.
+	requestNextKeyConfigured = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "request_next_key_configured",
+		Help:      "1 while a verify-only next request key is configured, 0 otherwise",
+	})
+
 	// imageHelpersUnsettled counts the image-inspection helper receipts that
 	// survived the latest recovery pass and no live inspection owns, by reason.
 	// "unknown_create" means the helper's Create response was never durably
@@ -1053,6 +1081,9 @@ func init() {
 	}
 	for _, reason := range []string{imageHelperUnsettledUnknownCreate, imageHelperUnsettledCleanupPending} {
 		imageHelpersUnsettled.WithLabelValues(reason).Set(0)
+	}
+	for _, failure := range requestAuthFailures {
+		requestAuthFailuresTotal.WithLabelValues(failure.label())
 	}
 	for _, outcome := range []string{"busy", "inhibited", "shared", "below_threshold", "removed", "error", "panic"} {
 		imageGCTotal.WithLabelValues(outcome).Add(0)

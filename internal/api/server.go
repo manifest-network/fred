@@ -111,11 +111,11 @@ type ServerConfig struct {
 	CallbackApplicationTimeout  time.Duration // Timeout for terminal callback application (default: backend.DefaultCallbackApplicationTimeout)
 	ShutdownTimeout             time.Duration // Timeout for graceful shutdown (default: 30s)
 	MaxRequestBodySize          int64
-	CallbackSecret              string                        // Non-production legacy single HMAC secret for isolated embeddings.
-	CallbackHMACSecrets         map[backendidentity.ID]string // Production callback keys indexed by immutable backend storage identity.
-	CallbackCanonicalPathPrefix string                        // Path prefix prepended to inbound URIs before HMAC verification (proxy stripPrefix compensation)
-	TokenTrackerDBPath          string                        // Path to token tracker database (enables replay protection)
-	CallbackBaseURL             string                        // Base URL for backend callbacks (used by restart/update)
+	CallbackSecret              string                             // Non-production legacy single HMAC secret for isolated embeddings.
+	CallbackKeys                map[backendidentity.ID]CallbackKey // Production callback keys indexed by immutable backend storage identity.
+	CallbackCanonicalPathPrefix string                             // Path prefix prepended to inbound URIs before HMAC verification (proxy stripPrefix compensation)
+	TokenTrackerDBPath          string                             // Path to token tracker database (enables replay protection)
+	CallbackBaseURL             string                             // Base URL for backend callbacks (used by restart/update)
 	// MaintenanceLegacyIdempotencyTenants may omit Idempotency-Key on
 	// restart/update; see HandlersConfig.
 	MaintenanceLegacyIdempotencyTenants []string
@@ -216,12 +216,12 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	// available for isolated non-production embeddings, but accepting both would
 	// create an ambiguous authentication policy.
 	var callbackAuth callbackRequestAuthenticator
-	if cfg.CallbackSecret != "" && len(cfg.CallbackHMACSecrets) != 0 {
+	if cfg.CallbackSecret != "" && len(cfg.CallbackKeys) != 0 {
 		return nil, fmt.Errorf("callback HMAC keyring cannot be combined with legacy callback secret")
 	}
-	if len(cfg.CallbackHMACSecrets) != 0 {
+	if len(cfg.CallbackKeys) != 0 {
 		keyring, err := NewCallbackKeyringAuthenticator(
-			cfg.CallbackHMACSecrets, deps.CallbackProofVerifier,
+			cfg.CallbackKeys, deps.CallbackProofVerifier,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("create callback HMAC keyring: %w", err)
@@ -256,7 +256,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		shutdownTimeout:        shutdownTimeout,
 		rateLimiter:            rateLimiter,
 		callbackIngressLimiter: NewRateLimiter(callbackRateLimitRPS, callbackRateLimitBurst, trustedProxies),
-		callbackRateLimiter:    newLimiterCache(max(1, len(cfg.CallbackHMACSecrets)), visitorTTL, callbackRateLimitRPS, callbackRateLimitBurst),
+		callbackRateLimiter:    newLimiterCache(max(1, len(cfg.CallbackKeys)), visitorTTL, callbackRateLimitRPS, callbackRateLimitBurst),
 		tenantRateLimiter:      tenantRateLimiter,
 		callbackPublisher:      callbackPublisher,
 		callbackAuthenticator:  callbackAuth,

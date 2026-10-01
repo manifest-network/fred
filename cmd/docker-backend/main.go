@@ -66,7 +66,7 @@ func main() {
 	// Bootstrap logger for startup messages (before config is loaded).
 	logOutput := io.Writer(os.Stdout)
 	if startup.preflightStorageIdentityAdoption || startup.dockerEffects.mode != dockerEffectsNone ||
-		startup.validateConfig || startup.auditStorageIdentityAdoption {
+		startup.validateConfig || startup.auditStorageIdentityAdoption || startup.printHMACKeyIDs {
 		// Keep one-shot reports on stdout machine-readable. Diagnostics,
 		// including configuration and proof failures, remain visible on stderr.
 		logOutput = os.Stderr
@@ -82,6 +82,18 @@ func main() {
 			os.Exit(1)
 		}
 		if _, err := fmt.Fprintf(os.Stdout, "docker-backend: config %q is valid\n", configPath); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+	if startup.printHMACKeyIDs {
+		cfg, err := validateStartupConfig(configPath)
+		if err != nil {
+			logger.Error("config rejected", "error", err)
+			os.Exit(1)
+		}
+		if err := printRequestKeyIDs(os.Stdout, cfg); err != nil {
+			logger.Error("print request key IDs", "error", err)
 			os.Exit(1)
 		}
 		return
@@ -165,8 +177,13 @@ func main() {
 	}
 
 	// Create server
+	requestKeys, err := cfg.RequestKeys()
+	if err != nil {
+		logger.Error("failed to build request keys", "error", err)
+		os.Exit(1)
+	}
 	server, err := NewIdentityBoundServer(
-		b, string(cfg.CallbackSecret), logger, cfg.MaxRequestBodySize, b.StorageIdentity(),
+		b, requestKeys, logger, cfg.MaxRequestBodySize, b.StorageIdentity(),
 	)
 	if err != nil {
 		logger.Error("failed to create identity-bound server", "error", err)
@@ -378,6 +395,7 @@ type startupFlags struct {
 	dockerEffects                    dockerEffectsCommand
 	validateConfig                   bool
 	auditStorageIdentityAdoption     bool
+	printHMACKeyIDs                  bool
 }
 
 func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
@@ -406,6 +424,8 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		"check the config file as startup would, without opening a store or touching Docker, and exit")
 	auditAdoption := fs.Bool("audit-storage-identity-adoption", false,
 		"one-shot read-only: report every shape that blocks v0.13 storage identity adoption as JSON; exit 0 clean, 3 findings, 1 failed")
+	printKeyIDs := fs.Bool("print-hmac-key-ids", false,
+		"one-shot read-only: print non-secret IDs of the request keys as JSON and exit")
 	if err := fs.Parse(args); err != nil {
 		return startupFlags{}, err
 	}
@@ -415,7 +435,7 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	oneShotModes := 0
 	for _, requested := range []bool{
 		*preflightAdoption, *initializeIdentity != "", *inspectEffects, *repairEffects, *validateConfig,
-		*auditAdoption,
+		*auditAdoption, *printKeyIDs,
 	} {
 		if requested {
 			oneShotModes++
@@ -423,7 +443,7 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	}
 	if oneShotModes > 1 {
 		return startupFlags{}, errors.New(
-			"storage-identity preflight, audit, initialization, Docker-effects inspection and repair, and config validation are mutually exclusive",
+			"storage-identity preflight, audit, initialization, Docker-effects inspection and repair, config validation, and key ID printing are mutually exclusive",
 		)
 	}
 	repairArgumentsSupplied := false
@@ -448,6 +468,7 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		dockerEffects:                    effects,
 		validateConfig:                   *validateConfig,
 		auditStorageIdentityAdoption:     *auditAdoption,
+		printHMACKeyIDs:                  *printKeyIDs,
 	}, nil
 }
 
@@ -513,6 +534,9 @@ func applyEnvOverrides(cfg *docker.Config) {
 	if secret := os.Getenv("DOCKER_BACKEND_CALLBACK_SECRET"); secret != "" {
 		cfg.CallbackSecret = config.Secret(secret)
 	}
+	if next := os.Getenv("DOCKER_BACKEND_CALLBACK_SECRET_NEXT"); next != "" {
+		cfg.CallbackSecretNext = config.RotationSecret(next)
+	}
 	if host := os.Getenv("DOCKER_BACKEND_HOST_ADDRESS"); host != "" {
 		cfg.HostAddress = host
 	}
@@ -551,7 +575,7 @@ type backendService interface {
 // Server handles HTTP requests for the Docker backend.
 type Server struct {
 	backend            backendService
-	callbackSecret     string
+	requestKeys        hmacauth.VerifyKeys
 	logger             *slog.Logger
 	maxRequestBodySize int64
 	storageIdentity    backendidentity.ID
@@ -562,7 +586,7 @@ type Server struct {
 // validates one immutable physical-storage identity.
 func NewIdentityBoundServer(
 	b backendService,
-	callbackSecret string,
+	requestKeys hmacauth.VerifyKeys,
 	logger *slog.Logger,
 	maxRequestBodySize int64,
 	storageID backendidentity.ID,
@@ -577,7 +601,7 @@ func NewIdentityBoundServer(
 	if !ok {
 		return nil, errors.New("backend does not support runtime storage identity verification")
 	}
-	server := NewServer(b, callbackSecret, logger, maxRequestBodySize)
+	server := NewServer(b, requestKeys, logger, maxRequestBodySize)
 	server.storageIdentity = storageID
 	server.identityVerifier = verifier
 	return server, nil
@@ -596,13 +620,14 @@ func validateMutatingLeaseUUID(field, value string) error {
 // NewServer creates a new HTTP server for the Docker backend. maxRequestBodySize
 // caps inbound request bodies; a non-positive value falls back to
 // docker.DefaultMaxRequestBodySize. (ENG-448 / F42)
-func NewServer(b backendService, callbackSecret string, logger *slog.Logger, maxRequestBodySize int64) *Server {
+func NewServer(b backendService, requestKeys hmacauth.VerifyKeys, logger *slog.Logger, maxRequestBodySize int64) *Server {
 	if maxRequestBodySize <= 0 {
 		maxRequestBodySize = docker.DefaultMaxRequestBodySize
 	}
+	docker.InitRequestKeyMetrics(requestKeys)
 	return &Server{
 		backend:            b,
-		callbackSecret:     callbackSecret,
+		requestKeys:        requestKeys,
 		logger:             logger,
 		maxRequestBodySize: maxRequestBodySize,
 	}
@@ -612,7 +637,7 @@ func NewServer(b backendService, callbackSecret string, logger *slog.Logger, max
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	authMw := hmacAuthMiddleware(s.callbackSecret, s.logger, s.maxRequestBodySize)
+	authMw := hmacAuthMiddleware(s.requestKeys, s.logger, s.maxRequestBodySize)
 	protected := func(handler http.Handler) http.Handler {
 		if !s.storageIdentity.Valid() {
 			return authMw(handler)
@@ -1358,8 +1383,10 @@ func validateCallbackURL(rawURL string) error {
 	return nil
 }
 
-// hmacAuthMiddleware returns middleware that verifies HMAC-SHA256 signatures on requests.
-func hmacAuthMiddleware(secret string, logger *slog.Logger, maxRequestBodySize int64) func(http.Handler) http.Handler {
+// hmacAuthMiddleware returns middleware that verifies HMAC-SHA256 signatures on
+// requests with keys: callback_secret, and callback_secret_next during a
+// rotation.
+func hmacAuthMiddleware(keys hmacauth.VerifyKeys, logger *slog.Logger, maxRequestBodySize int64) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Limit request body size
@@ -1367,6 +1394,7 @@ func hmacAuthMiddleware(secret string, logger *slog.Logger, maxRequestBodySize i
 
 			sig := r.Header.Get(hmacauth.SignatureHeader)
 			if sig == "" {
+				docker.RecordRequestSignatureMissing()
 				logger.Warn("missing signature header", "remote", r.RemoteAddr, "path", r.URL.Path)
 				jsonError(w, http.StatusUnauthorized, "missing signature")
 				return
@@ -1379,7 +1407,9 @@ func hmacAuthMiddleware(secret string, logger *slog.Logger, maxRequestBodySize i
 				return
 			}
 
-			if err := hmacauth.VerifyRequest(secret, r, body, sig, 5*time.Minute); err != nil {
+			slot, err := hmacauth.VerifyRequestKeys(keys, r, body, sig, 5*time.Minute)
+			docker.RecordRequestSignatureChecked(slot, err)
+			if err != nil {
 				logger.Warn("signature verification failed",
 					"error", err,
 					"remote", r.RemoteAddr,

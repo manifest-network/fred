@@ -293,6 +293,11 @@ backends:
     url: "http://localhost:9000"    # Backend API base URL
     # Must equal this backend process's callback_secret. Never reuse across nodes.
     hmac_secret: "mock-backend-secret-change-me-0123456789"
+    # Verify-only key accepted on this backend's callbacks during a key
+    # rotation, while the backend still signs with its old key; providerd never
+    # signs with it. Set at step 2 of the rolling rotation, removed at step 4
+    # (DEPLOYMENT.md, "Rotating a backend's HMAC key").
+    # hmac_secret_previous: ""
     timeout: 30s                     # Request timeout for backend API calls
     default: true                    # Optional fallback marker (at most one)
 

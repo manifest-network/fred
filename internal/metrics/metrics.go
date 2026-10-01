@@ -573,6 +573,39 @@ var (
 		Help:      "Restart/update requests accepted without Idempotency-Key, each keyed by its single-use signed token",
 	})
 
+	// APICallbackSignatureKeyTotal counts callbacks verified, by the backend
+	// whose key verified them and the key slot: "current" (the key providerd
+	// also signs with) or "previous" (hmac_secret_previous during a rotation).
+	// The backend label is the configured name bound to the verifying key,
+	// never a value taken from the callback. Before dropping a previous key,
+	// confirm "previous" stopped increasing while "current" still does.
+	APICallbackSignatureKeyTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "api",
+		Name:      "callback_signature_key_total",
+		Help:      "Backend callbacks verified, by backend and by key slot (current or previous)",
+	}, []string{"backend", "slot"})
+
+	// APICallbackAuthFailuresTotal counts callbacks refused at signature
+	// verification, by closed reason. It carries no backend label: before
+	// verification the backend is only an unauthenticated claim.
+	APICallbackAuthFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "api",
+		Name:      "callback_auth_failures_total",
+		Help:      "Backend callbacks refused at signature verification, by reason",
+	}, []string{"reason"})
+
+	// APICallbackPreviousKeyConfigured is 1 while a backend has
+	// hmac_secret_previous configured. A previous key keeps the old key valid,
+	// so alert when this stays 1 after a rotation should have finished.
+	APICallbackPreviousKeyConfigured = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "api",
+		Name:      "callback_previous_key_configured",
+		Help:      "1 while the backend has a verify-only previous callback key configured, 0 otherwise",
+	}, []string{"backend"})
+
 	// APIRequestDuration tracks API request latency.
 	APIRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: namespace,
@@ -914,6 +947,23 @@ const (
 	// different operational condition and the one worth alerting on. Reusing
 	// "partial" would have buried the new signal in existing noise.
 	OutcomeDegraded = "degraded"
+)
+
+// Slot constants for the `slot` label on fred_api_callback_signature_key_total.
+const (
+	CallbackKeySlotCurrent  = "current"
+	CallbackKeySlotPrevious = "previous"
+)
+
+// Reason constants for the `reason` label on
+// fred_api_callback_auth_failures_total. The set is closed.
+const (
+	CallbackAuthFailureMissing        = "missing"
+	CallbackAuthFailureFormat         = "format"
+	CallbackAuthFailureExpired        = "expired"
+	CallbackAuthFailureFuture         = "future"
+	CallbackAuthFailureMismatch       = "mismatch"
+	CallbackAuthFailureUnknownStorage = "unknown_storage"
 )
 
 // Outcome constants for the `outcome` label on

@@ -40,7 +40,7 @@ func TestNewIdentityBoundServerRejectsTypedNilBackend(t *testing.T) {
 	require.NoError(t, err)
 
 	server, err := NewIdentityBoundServer(
-		typedNil, testSecret, slog.Default(), docker.DefaultMaxRequestBodySize, storageID,
+		typedNil, testRequestKeys, slog.Default(), docker.DefaultMaxRequestBodySize, storageID,
 	)
 	require.EqualError(t, err, "backend is required")
 	assert.Nil(t, server)
@@ -62,7 +62,7 @@ func TestIdentityBoundServerOmitsIdentityWhenRuntimeAttestationIsUnavailable(t *
 		},
 	}
 	server, err := NewIdentityBoundServer(
-		candidate, testSecret, slog.Default(), docker.DefaultMaxRequestBodySize, storageID,
+		candidate, testRequestKeys, slog.Default(), docker.DefaultMaxRequestBodySize, storageID,
 	)
 	require.NoError(t, err)
 
@@ -192,7 +192,7 @@ func TestVerifySignature(t *testing.T) {
 // that don't need it. If a handler change causes unexpected panics, it means
 // the change touched the backend in a path that previously didn't.
 func newTestHandler() http.Handler {
-	s := NewServer(nil, testSecret, slog.Default(), docker.DefaultMaxRequestBodySize)
+	s := NewServer(nil, testRequestKeys, slog.Default(), docker.DefaultMaxRequestBodySize)
 	return s.Handler()
 }
 
@@ -846,7 +846,7 @@ func (m *mockBackend) Stats() shared.ResourceStats {
 
 // newMockHandler creates a Handler backed by the given mockBackend.
 func newMockHandler(mb *mockBackend) http.Handler {
-	s := NewServer(mb, testSecret, slog.Default(), docker.DefaultMaxRequestBodySize)
+	s := NewServer(mb, testRequestKeys, slog.Default(), docker.DefaultMaxRequestBodySize)
 	return s.Handler()
 }
 
@@ -1825,7 +1825,7 @@ func TestHMACMiddleware_RejectsCrossPathReplay(t *testing.T) {
 // check. Wrapping the middleware around a permissive next-handler
 // proves the property the test cares about.
 func TestHMACMiddleware_RejectsCrossMethodReplay(t *testing.T) {
-	mw := hmacAuthMiddleware(testSecret, slog.Default(), docker.DefaultMaxRequestBodySize)
+	mw := hmacAuthMiddleware(testRequestKeys, slog.Default(), docker.DefaultMaxRequestBodySize)
 	authed := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))

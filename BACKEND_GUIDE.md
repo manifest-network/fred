@@ -121,6 +121,14 @@ The verifier uses the **same canonical string** documented for callbacks, comput
 
 Read the body, then verify before dispatching to the handler. Backends inside this repository can call `hmacauth.VerifyRequest(secret, r, body, sig, 5*time.Minute)`; external backends should re-derive the canonical string using the standalone sample in the Callback Protocol section (the computation is symmetric — sender and verifier hash identical bytes).
 
+To support rotating a key without a coordinated stop, a backend SHOULD accept
+one extra verify-only key while a rotation is in progress (docker-backend's
+`callback_secret_next`) and MUST keep signing callbacks with its main key only.
+Try the second key only when the signature does not match the first; format and
+timestamp failures do not depend on the key. Backends inside this repository use
+`hmacauth.VerifyKeys` and `hmacauth.VerifyRequestKeys`. The bundled k3s and mock
+backends accept one key only.
+
 **Unauthenticated endpoints:** only the operational endpoints `GET /health`, `GET /stats`, and `GET /metrics` are exempt. Every other (contract) endpoint below must be authenticated.
 
 ## Durable Backend Storage Identity

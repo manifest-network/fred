@@ -68,9 +68,10 @@ func demoteOnGrantSetupError(err error) bool {
 var version = "dev"
 
 var (
-	configFile     string
-	validateConfig bool
-	rootCmd        = &cobra.Command{
+	configFile      string
+	validateConfig  bool
+	printHMACKeyIDs bool
+	rootCmd         = &cobra.Command{
 		Use:   "providerd",
 		Short: "Manifest Provider Daemon",
 		Long:  `A daemon that watches for lease events, auto-acknowledges them, serves tenant authentication API, and periodically withdraws funds.`,
@@ -87,6 +88,8 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "c", "", "path to config file")
 	rootCmd.PersistentFlags().BoolVar(&validateConfig, "validate-config", false,
 		"check the config file as startup would, without opening a store or touching the network, and exit")
+	rootCmd.PersistentFlags().BoolVar(&printHMACKeyIDs, "print-hmac-key-ids", false,
+		"print non-secret IDs of every backend's HMAC keys as JSON, without opening a store or touching the network, and exit")
 
 	// Configure SDK with manifest bech32 prefixes.
 	// Use sync.Once to prevent panic if config is already sealed by a dependency.
@@ -132,9 +135,15 @@ func run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if validateConfig && printHMACKeyIDs {
+		return errors.New("--validate-config and --print-hmac-key-ids are mutually exclusive")
+	}
 	if validateConfig {
 		_, err := fmt.Fprintf(cmd.OutOrStdout(), "providerd: config %q is valid\n", configFile)
 		return err
+	}
+	if printHMACKeyIDs {
+		return printBackendKeyIDs(cmd.OutOrStdout(), cfg)
 	}
 
 	// Set up structured logging with configured level
@@ -181,7 +190,7 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	defer placementStore.Close()
 	var (
-		callbackKeyring      map[backendidentity.ID]string
+		callbackKeyring      map[backendidentity.ID]api.CallbackKey
 		legacyCallbackSecret string
 	)
 	if cfg.CallbackSecret != "" {
@@ -190,7 +199,7 @@ func run(cmd *cobra.Command, args []string) error {
 		// verifier below.
 		legacyCallbackSecret = string(cfg.CallbackSecret)
 	} else {
-		callbackKeyring, err = callbackHMACSecrets(cfg, placementStore)
+		callbackKeyring, err = callbackKeys(cfg, placementStore)
 		if err != nil {
 			return fmt.Errorf("build backend callback HMAC keyring: %w", err)
 		}
@@ -474,7 +483,7 @@ func run(cmd *cobra.Command, args []string) error {
 		ShutdownTimeout:             cfg.ShutdownTimeout,
 		MaxRequestBodySize:          cfg.MaxRequestBodySize,
 		CallbackSecret:              legacyCallbackSecret,
-		CallbackHMACSecrets:         callbackKeyring,
+		CallbackKeys:                callbackKeyring,
 		CallbackCanonicalPathPrefix: cfg.CallbackCanonicalPathPrefix,
 		TokenTrackerDBPath:          cfg.TokenTrackerDBPath,
 		CallbackBaseURL:             cfg.CallbackBaseURL,
