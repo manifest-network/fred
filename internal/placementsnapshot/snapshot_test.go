@@ -659,9 +659,12 @@ func TestAbandonKeepsOlderFilesWhenAPublishedFileCannotBeRemoved(t *testing.T) {
 	manifest := stage("manifest")
 	attempt.published = []stagedFile{data, manifest}
 	// The manifest's name now holds another inode, so abandon must not remove
-	// it, and must then keep the data it describes.
-	require.NoError(t, os.Remove(filepath.Join(f.dir, "manifest")))
-	require.NoError(t, os.WriteFile(filepath.Join(f.dir, "manifest"), []byte("replaced"), 0o600))
+	// it, and must then keep the data it describes. The replacement is created
+	// while the original still exists and renamed over it: recreating the file
+	// after an unlink can reuse the freed inode number.
+	replacement := filepath.Join(f.dir, "manifest.replacement")
+	require.NoError(t, os.WriteFile(replacement, []byte("replaced"), 0o600))
+	require.NoError(t, os.Rename(replacement, filepath.Join(f.dir, "manifest")))
 
 	assert.ErrorContains(t, attempt.abandon(), "was replaced")
 	assert.ElementsMatch(t, []string{"data", "manifest"}, f.entries(t))
