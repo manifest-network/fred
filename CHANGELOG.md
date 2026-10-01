@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- providerd can snapshot `placements.db` and `payloads.db` while it runs. Set
+  `placement_snapshot_dir` (with `placement_snapshot_interval`, default `1h`, and
+  `placement_snapshot_retain`, default 24 sets). Each set is one consistent pair
+  taken while placement writes pause for two transaction begins, with a manifest
+  of each file's size and SHA-256 written last. New metrics:
+  `fred_placement_snapshots_total{outcome}` and
+  `fred_placement_snapshot_prune_failures_total{reason}`. The restore procedure
+  is in DEPLOYMENT.md, "Online snapshots".
 - A backend's HMAC key can rotate without a coordinated stop. Each side accepts
   one extra verify-only key during the rotation: `backends[].hmac_secret_previous`
   in providerd and `callback_secret_next` in docker-backend

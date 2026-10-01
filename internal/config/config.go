@@ -42,6 +42,14 @@ func ParseLogLevel(s string) (slog.Level, error) {
 // Default values for configuration.
 const (
 	DefaultMaxRequestBodySize int64 = 1 << 20 // 1MB
+
+	// MinPlacementSnapshotInterval is the shortest placement_snapshot_interval:
+	// every snapshot briefly holds the placement write gate and copies both
+	// databases.
+	MinPlacementSnapshotInterval = 5 * time.Minute
+	// MaxPlacementSnapshotRetain bounds placement_snapshot_retain, and so the
+	// snapshot directory listing each pruning pass reads.
+	MaxPlacementSnapshotRetain = 1000
 )
 
 // Config holds all configuration for the provider daemon.
@@ -147,6 +155,12 @@ type Config struct {
 	// Placement store configuration. This durable authority is required because
 	// providerd always operates against a multi-backend placement pool.
 	PlacementStoreDBPath string `mapstructure:"placement_store_db_path"`
+
+	// Online snapshots of placements.db and payloads.db. An empty directory
+	// disables them; enabling them requires payload_store_db_path.
+	PlacementSnapshotDir      string        `mapstructure:"placement_snapshot_dir"`
+	PlacementSnapshotInterval time.Duration `mapstructure:"placement_snapshot_interval"`
+	PlacementSnapshotRetain   int           `mapstructure:"placement_snapshot_retain"`
 
 	// Shutdown configuration
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
@@ -296,6 +310,12 @@ func Load(configPath string) (*Config, error) {
 
 	// Reconciliation defaults
 	v.SetDefault("reconciliation_interval", "5m")
+
+	// Placement snapshot defaults. The directory default is empty (disabled)
+	// but declared so PROVIDER_PLACEMENT_SNAPSHOT_DIR can set it.
+	v.SetDefault("placement_snapshot_dir", "")
+	v.SetDefault("placement_snapshot_interval", "1h")
+	v.SetDefault("placement_snapshot_retain", 24)
 
 	// Shutdown defaults
 	v.SetDefault("shutdown_timeout", "30s")
@@ -752,6 +772,36 @@ func (c *Config) Validate() error {
 		)
 	}
 
+	return c.validatePlacementSnapshots()
+}
+
+// validatePlacementSnapshots checks the snapshot settings only when snapshots
+// are enabled. Runtime checks the directory's ownership, permissions, and
+// physical identity when providerd opens it.
+func (c *Config) validatePlacementSnapshots() error {
+	dir := c.PlacementSnapshotDir
+	if dir == "" {
+		return nil
+	}
+	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
+		return fmt.Errorf("placement_snapshot_dir must be an absolute, clean path: %q", dir)
+	}
+	if c.PayloadStoreDBPath == "" {
+		return fmt.Errorf("placement_snapshot_dir requires payload_store_db_path: a snapshot copies placements.db and payloads.db together")
+	}
+	for _, live := range []string{c.PlacementStoreDBPath, c.PayloadStoreDBPath} {
+		if dir == filepath.Dir(live) {
+			return fmt.Errorf("placement_snapshot_dir must not be the directory of a live database: %q", dir)
+		}
+	}
+	if c.PlacementSnapshotInterval < MinPlacementSnapshotInterval {
+		return fmt.Errorf("placement_snapshot_interval must be at least %s, got %s",
+			MinPlacementSnapshotInterval, c.PlacementSnapshotInterval)
+	}
+	if c.PlacementSnapshotRetain < 1 || c.PlacementSnapshotRetain > MaxPlacementSnapshotRetain {
+		return fmt.Errorf("placement_snapshot_retain must be between 1 and %d, got %d",
+			MaxPlacementSnapshotRetain, c.PlacementSnapshotRetain)
+	}
 	return nil
 }
 

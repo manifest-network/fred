@@ -380,6 +380,18 @@ func run(cmd *cobra.Command, args []string) error {
 		slog.Warn("payload store disabled (no payload_store_db_path configured)")
 	}
 
+	// Online snapshots copy both live stores. Opening the directory here refuses
+	// a misconfigured one before any chain work.
+	placementSnapshots, closePlacementSnapshots, err := newPlacementSnapshots(cfg, placementStore, payloadStore)
+	if err != nil {
+		return fmt.Errorf("failed to configure placement snapshots: %w", err)
+	}
+	defer func() {
+		if err := closePlacementSnapshots(); err != nil {
+			slog.Warn("failed to close placement snapshot directory", "error", err)
+		}
+	}()
+
 	// Create event broker for real-time lease event delivery
 	eventBroker := api.NewEventBroker()
 
@@ -547,11 +559,15 @@ func run(cmd *cobra.Command, args []string) error {
 	// Each component is wrapped with panic recovery via safeGo() to prevent
 	// silent crashes and convert panics to errors.
 	var wg sync.WaitGroup
+	// The snapshot loop reads both live stores, so shutdown joins it on its own
+	// before they close, whatever the shutdown timeout did to wg.
+	var snapshotWG sync.WaitGroup
 	// Every long-lived component can report at most one terminal error. Keep
-	// room for all nine (including optional sub-signer maintenance) because the
-	// first error starts shutdown and no goroutine may block its WaitGroup.Done
-	// while trying to report another concurrent failure.
-	errChan := make(chan error, 9)
+	// room for all ten (including optional sub-signer maintenance and
+	// placement snapshots) because the first error starts shutdown and no
+	// goroutine may block its WaitGroup.Done while trying to report another
+	// concurrent failure.
+	errChan := make(chan error, 10)
 
 	// Start API server FIRST and wait for it to be listening.
 	// This is critical because startup reconciliation may trigger backend callbacks
@@ -624,6 +640,14 @@ func run(cmd *cobra.Command, args []string) error {
 		safeGo(&wg, errChan, "reconciler", func() error {
 			return reconciler.Start(workCtx)
 		})
+
+		// Start online placement snapshots after the startup reconcile, so the
+		// first one captures reconciled state.
+		if placementSnapshots != nil {
+			safeGo(&snapshotWG, errChan, "placement snapshots", func() error {
+				return placementSnapshots.Run(workCtx)
+			})
+		}
 
 		// Start periodic sub-signer maintenance (if multi-signer). Both halves are
 		// level-triggered: EnsureGrants and EnsureFunding each compare the desired
@@ -749,6 +773,11 @@ func run(cmd *cobra.Command, args []string) error {
 		timedOut = true
 		slog.Warn("shutdown timed out, some components may not have stopped cleanly")
 	}
+
+	// Join the snapshot loop before the stores it reads close. Once workCtx is
+	// canceled its attempt stops at the next step, and a captured cut's read
+	// transactions end within the copy deadline regardless.
+	snapshotWG.Wait()
 
 	// Always close provision manager to clean up Watermill router and payload store.
 	// This is safe even if components are still running - Watermill handles concurrent Close().

@@ -103,6 +103,8 @@ var labelledMetricNames = []string{
 	"fred_api_callback_auth_failures_total",
 	"fred_api_callback_previous_key_configured",
 	"fred_reconciler_backend_inventory_answered",
+	"fred_placement_snapshots_total",
+	"fred_placement_snapshot_prune_failures_total",
 	"fred_reconciler_cleanup_skips_total",
 	"fred_reconciler_runs_total",
 	"fred_signer_balance_query_failures_total",
@@ -120,6 +122,7 @@ func allCollectors() []prometheus.Collector {
 		// Provisioning
 		PlacementWriteFailuresTotal, PlacementInventoryRecoveryPending, APIMaintenanceLegacyKeyTotal,
 		APICallbackSignatureKeyTotal, APICallbackAuthFailuresTotal, APICallbackPreviousKeyConfigured,
+		PlacementSnapshotsTotal, PlacementSnapshotPruneFailuresTotal,
 		InFlightProvisions,
 		ProvisioningTotal,
 		ProvisioningDuration,

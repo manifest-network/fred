@@ -534,7 +534,8 @@ ProtectHome=true
 PrivateTmp=true
 # ReadWritePaths must include the directories holding any *_db_path values
 # from your config (token_tracker_db_path, payload_store_db_path,
-# placement_store_db_path). Adjust this line to match.
+# placement_store_db_path), and placement_snapshot_dir when it is set. Adjust
+# this line to match.
 ReadWritePaths=/var/lib/fred
 
 [Install]
@@ -748,6 +749,8 @@ file lock refuses a second bbolt open). Snapshot each backend's marker pair,
 complete authoritative-store set, and substrate as one unit so a restore cannot
 mix generations or times. For zero-downtime backups, use an atomic
 filesystem-level snapshot (LVM, ZFS, btrfs) — bbolt files are crash-consistent.
+providerd can also snapshot `placements.db` and `payloads.db` itself while it
+runs; see [Online snapshots](#online-snapshots).
 Restoring a complete matching snapshot intentionally preserves the same lineage,
 so fence the original backend before the restored copy starts.
 
@@ -766,6 +769,68 @@ drifts. A live backup must be an atomic
 filesystem snapshot, not pathname replacement. Restore only while stopped. A
 stopped restore may naturally create a new inode: the next strict open validates
 the provider-bound authority and binds that inode before using it.
+
+### Online snapshots
+
+Set `placement_snapshot_dir` and providerd copies `placements.db` and
+`payloads.db` into it while running: every `placement_snapshot_interval`
+(default `1h`, minimum `5m`), keeping the newest `placement_snapshot_retain`
+complete sets (default 24, at most 1000). Losing the host then costs at most one
+interval of placement history. Each set is one consistent pair: both read
+transactions begin while placement writes are paused for the length of two
+bbolt `Begin` calls, so the pair is a state a crash could have left. Attest it
+like any restored copy.
+
+The directory must exist, be owned by the providerd service user, and not be
+writable by group or others (`install -d -m 0700 -o fred -g fred
+/var/backups/fred`). It must not be the directory of either live database, and
+snapshots require `payload_store_db_path`. providerd refuses to start otherwise.
+Add the directory to `ReadWritePaths`. A snapshot on the same disk as the live
+databases does not survive that disk, and providerd logs a warning when they
+share a filesystem. Copy the directory off the host with your usual backup tool.
+
+Each set is three files with mode `0600`:
+
+```
+fred-snapshot-<provider_uuid>-<UTC yyyymmddThhmmssZ>-<id>.placements.db
+fred-snapshot-<provider_uuid>-<UTC yyyymmddThhmmssZ>-<id>.payloads.db
+fred-snapshot-<provider_uuid>-<UTC yyyymmddThhmmssZ>-<id>.manifest.json
+```
+
+The manifest is written last, after both copies were re-read and passed bbolt's
+consistency check. It records each data file's name, size, and SHA-256. A set
+without a manifest is incomplete; never restore one.
+
+- A snapshot holds its read transactions for at most 30 seconds. Live writers
+  never wait on it longer, and normally not at all.
+- A snapshot is skipped (`outcome="insufficient_space"`) unless the snapshot
+  filesystem has twice the databases' size plus 256 MiB free.
+- After a start, the first snapshot waits at least one minute and until one
+  interval has passed since the newest complete set, so restarts do not replace
+  older sets with new ones.
+- Pruning runs after each published set. It keeps the newest complete sets and
+  the set it just published, and deletes older complete sets, incomplete sets
+  older than the newest complete one, and staged files left by a crash
+  (`.fred-snapshot-tmp-<provider_uuid>-*`). It considers only names carrying this
+  provider's UUID, never deletes anything but a regular file owned by the service
+  user, never unlinks a live database, and keeps any set it cannot read.
+  Everything it keeps that way counts in
+  `fred_placement_snapshot_prune_failures_total{reason}`.
+
+To restore a set, with providerd stopped:
+
+```bash
+cd /var/backups/fred
+set=fred-snapshot-<provider_uuid>-<timestamp>-<id>
+jq -r '.placements.sha256 + "  " + .placements.name,
+       .payloads.sha256 + "  " + .payloads.name' "$set.manifest.json" | sha256sum -c
+mv /var/lib/fred/placements.db /var/lib/fred/placements.db.before-restore
+mv /var/lib/fred/payloads.db /var/lib/fred/payloads.db.before-restore
+install -m 0600 -o fred -g fred "$set.placements.db" /var/lib/fred/placements.db
+install -m 0600 -o fred -g fred "$set.payloads.db" /var/lib/fred/payloads.db
+```
+
+Then attest the restored pair as described next, and start providerd.
 
 ### Restoring an older placement backup
 

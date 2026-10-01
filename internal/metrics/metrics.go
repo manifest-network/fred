@@ -373,6 +373,29 @@ var (
 		Help:      "1 once the current sweep's placement projection committed durably, even with unanswered backends; 0 from the start of every sweep until then",
 	})
 
+	// PlacementSnapshotsTotal counts online snapshot attempts of placements.db
+	// and payloads.db, exactly once per attempt. Its series exist only while
+	// snapshots are configured, so `increase(...{outcome="success"}[2h]) == 0`
+	// is a heartbeat that cannot fire on a provider that never enabled them.
+	// Deliberately not paired with a last-success timestamp gauge.
+	PlacementSnapshotsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "placement",
+		Name:      "snapshots_total",
+		Help:      "Online snapshot attempts of placements.db and payloads.db by outcome (success, error, insufficient_space)",
+	}, []string{"outcome"})
+
+	// PlacementSnapshotPruneFailuresTotal counts snapshot files pruning kept
+	// because it could not prove they were safe to delete, or failed to delete.
+	// Separate from PlacementSnapshotsTotal so a pruning problem never reads as
+	// a missing snapshot.
+	PlacementSnapshotPruneFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "placement",
+		Name:      "snapshot_prune_failures_total",
+		Help:      "Snapshot files pruning kept or failed to delete, by reason",
+	}, []string{"reason"})
+
 	// ReconcilerCleanupSkipsTotal counts destructive cleanup actions the
 	// reconciler declined to take because it lacked positive evidence (ENG-654).
 	//

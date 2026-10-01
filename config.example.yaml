@@ -561,6 +561,27 @@ payload_store_db_path: "/var/lib/fred/payloads.db"
 placement_store_db_path: "/var/lib/fred/placements.db"
 
 # =============================================================================
+# ONLINE PLACEMENT SNAPSHOTS (optional)
+# =============================================================================
+# Copies placements.db and payloads.db into this directory while providerd
+# runs, as one consistent pair per set, so losing the host costs at most one
+# interval of placement history. Empty (the default) disables snapshots.
+#
+# Requires payload_store_db_path. The directory must exist, be owned by the
+# providerd user, not be writable by group or others, and not be the directory
+# of either live database; providerd refuses to start otherwise. Put it on
+# another disk and copy it off the host. Restore procedure: DEPLOYMENT.md,
+# "Online snapshots".
+# placement_snapshot_dir: "/var/backups/fred"
+
+# How often to snapshot (minimum 5m). After a restart the next snapshot waits
+# until one interval has passed since the newest complete set.
+# placement_snapshot_interval: "1h"
+
+# Number of complete snapshot sets to keep (1 to 1000).
+# placement_snapshot_retain: 24
+
+# =============================================================================
 # ADVANCED: HTTP SERVER TIMEOUTS
 # =============================================================================
 # Fine-tune HTTP server behavior. Defaults are suitable for most deployments.
