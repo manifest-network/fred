@@ -844,10 +844,12 @@ type maintenanceReplayRequest struct {
 	admittedAt time.Time
 }
 
-// stampsAgree accepts a replay whose stamp equals the stored one. A stored
-// zero stamp predates stamping, so any request for that exact command agrees.
+// stampsAgree compares stamps only when both sides carry one. A zero stamp
+// predates stamping: stored, it is a receipt or head from an older provider;
+// requested, it is an older provider's replay. Either side then matches the
+// exact command by ID and request digest alone, as before stamping.
 func stampsAgree(stored, requested time.Time) bool {
-	return stored.IsZero() || stored.Equal(requested)
+	return stored.IsZero() || requested.IsZero() || stored.Equal(requested)
 }
 
 func classifyMaintenanceReplayTx(

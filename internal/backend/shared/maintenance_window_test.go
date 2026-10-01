@@ -271,6 +271,43 @@ func TestReplayWithADifferentStampIsAConflict(t *testing.T) {
 	require.ErrorIs(t, err, ErrMaintenanceIntentConflict)
 }
 
+// TestAReplayWithoutAStampMatchesTheStampedCommand pins that stamps are
+// compared only when both sides carry one. An older provider replays its
+// commands without admitted_at, so its replay must match the stamped head or
+// receipt by ID and fingerprint, instead of being refused as a conflict for a
+// command that ran. Two different stamps still conflict.
+func TestAReplayWithoutAStampMatchesTheStampedCommand(t *testing.T) {
+	releases, callbacks, source, target := maintenanceFixture(t, "window-unstamped-replay")
+	completed := newTestMaintenanceID(t)
+	completeMaintenanceForTest(t, releases, callbacks,
+		stampedMaintenanceSpec(t, callbacks, completed, MaintenanceIntentRestart, source, target, windowStamp(0)))
+	_, latest, err := releases.claimLatestActive(source.LeaseUUID())
+	require.NoError(t, err)
+	probe := func(id MaintenanceID, stamp time.Time) (MaintenanceIntentAdmissionDisposition, error) {
+		return callbacks.ProbeMaintenanceIntent(
+			stampedMaintenanceSpec(t, callbacks, id, MaintenanceIntentRestart, latest, target, stamp).request,
+		)
+	}
+
+	disposition, err := probe(completed, time.Time{})
+	require.NoError(t, err, "an unstamped replay of a completed stamped command")
+	assert.Equal(t, MaintenanceIntentAdmissionCompleted, disposition)
+	_, err = probe(completed, windowStamp(time.Millisecond))
+	require.ErrorIs(t, err, ErrMaintenanceIntentConflict, "a different stamp names a different command")
+
+	inFlight := newTestMaintenanceID(t)
+	admission, err := callbacks.BeginMaintenanceIntent(
+		stampedMaintenanceSpec(t, callbacks, inFlight, MaintenanceIntentRestart, latest, target, windowStamp(time.Second)),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, callbacks.CancelMaintenanceIntent(createdMaintenanceDispatch(t, admission)))
+	})
+	disposition, err = probe(inFlight, time.Time{})
+	require.NoError(t, err, "an unstamped replay of an in-flight stamped command")
+	assert.Equal(t, MaintenanceIntentAdmissionExisting, disposition)
+}
+
 // TestCustomDomainChurnNeverEvictsProviderReceipts pins the separate window
 // for backend-minted commands.
 func TestCustomDomainChurnNeverEvictsProviderReceipts(t *testing.T) {

@@ -666,8 +666,10 @@ the same value on every replay. Older providers omit it.
 0. Validate the canonical UUIDv4 `maintenance_id` and durably admit that exact
    ID, kind, source authority, request fingerprint, and `admitted_at` before any
    mutation. Exact replay returns the stored disposition without repeating
-   replacement; divergent reuse, including the same ID with a different
-   `admitted_at`, returns `409`. Keep a compact receipt for at least the lease's
+   replacement; divergent reuse returns `409`, including the same ID with a
+   different `admitted_at` when both the request and the stored command carry
+   one. A side without `admitted_at` predates stamping and matches on the ID
+   and fingerprint alone. Keep a compact receipt for at least the lease's
    1,024 most recent provider commands; the Docker backend evicts its oldest
    evictable receipt when it admits a newer stamped command (a failed update
    whose late-container cleanup is unconfirmed stays), and removes the rest only
