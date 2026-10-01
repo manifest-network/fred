@@ -49,6 +49,10 @@ type repairPostconditionInspector interface {
 	) error
 	VerifyRestoredBackupPostcondition(placement.RestoredBackupResult) error
 	VerifyBackendRetirementPostcondition(placement.BackendRetirementResult) error
+	VerifyGenerationAdoptionPostcondition(
+		placement.GenerationAdoptionCandidate,
+		placement.GenerationAdoptionResult,
+	) error
 	Close() error
 }
 
@@ -213,6 +217,16 @@ func runWithDependencies(
 	listRecords := flags.Bool("list", false, "list every durable placement row read-only (offline)")
 	inspectRecord := flags.Bool("inspect", false, "inspect the exact -lease row read-only (offline)")
 	resolveConflict := flags.Bool("resolve-conflict", false, "resolve one exact durable conflict to -backend")
+	adoptGeneration := flags.Bool(
+		"adopt-observed-generation",
+		false,
+		"replace the quarantined lifecycle generation of -lease with the one its -backend reports (offline)",
+	)
+	generationAttestation := flags.String(
+		"attest-generation",
+		"",
+		"exact current-generation attestation required with -apply -adopt-observed-generation",
+	)
 	attestRestoredBackup := flags.Bool(
 		"attest-restored-backup",
 		false,
@@ -266,7 +280,7 @@ func runWithDependencies(
 	modeCount := 0
 	for _, selected := range []bool{
 		*classifyAuthority, *listRecords, *inspectRecord, *resolveConflict, *attestRestoredBackup,
-		*retireLostBackend,
+		*retireLostBackend, *adoptGeneration,
 	} {
 		if selected {
 			modeCount++
@@ -274,7 +288,7 @@ func runWithDependencies(
 	}
 	if modeCount > 1 {
 		return fmt.Errorf(
-			"-classify, -list, -inspect, -resolve-conflict, -attest-restored-backup, and -retire-lost-backend are mutually exclusive",
+			"-classify, -list, -inspect, -resolve-conflict, -adopt-observed-generation, -attest-restored-backup, and -retire-lost-backend are mutually exclusive",
 		)
 	}
 	if *retireLostBackend {
@@ -294,6 +308,16 @@ func runWithDependencies(
 		}
 	} else if *storageIDText != "" || *lostAttestation != "" {
 		return fmt.Errorf("-storage-id and -attest-lost require -retire-lost-backend")
+	}
+	if *adoptGeneration {
+		if *attestation != "" {
+			return fmt.Errorf("-adopt-observed-generation takes -attest-generation, not -attest-drained")
+		}
+		if !*apply && *generationAttestation != "" {
+			return fmt.Errorf("-attest-generation requires -apply; no mutation was attempted")
+		}
+	} else if *generationAttestation != "" {
+		return fmt.Errorf("-attest-generation requires -adopt-observed-generation")
 	}
 	if *attestRestoredBackup {
 		if timeoutExplicit {
@@ -401,11 +425,16 @@ func runWithDependencies(
 			flags.Usage()
 			return fmt.Errorf("-lease and -backend are required")
 		}
-		if *resolveConflict {
+		switch {
+		case *resolveConflict:
 			if *operationText != "" {
 				return fmt.Errorf("-resolve-conflict does not accept -operation-id")
 			}
-		} else if *operationText == "" {
+		case *adoptGeneration:
+			if *operationText != "" {
+				return fmt.Errorf("-adopt-observed-generation does not accept -operation-id")
+			}
+		case *operationText == "":
 			return fmt.Errorf("-operation-id is required for attempt refusal")
 		}
 	}
@@ -566,6 +595,18 @@ func runWithDependencies(
 			return newCommittedVerdictFailure(err)
 		}
 		return nil
+	}
+
+	if *adoptGeneration {
+		return runGenerationAdoption(ctx, generationAdoptionRequest{
+			repair: repair, closeRepair: closeRepair, newRepairClients: newRepairClients,
+			configuredBackends: configuredBackends,
+			databasePath:       cfg.PlacementStoreDBPath, providerUUID: cfg.ProviderUUID,
+			leaseUUID: *leaseUUID, backendName: *backendName, timeout: *timeout,
+			apply: *apply, confirmation: *confirmation, attestation: *generationAttestation,
+			backupTarget:      boundBackupTarget,
+			mutationCommitted: &mutationCommitted, mutationOutcomeUnknown: &mutationOutcomeUnknown,
+		}, stdout, dependencies)
 	}
 
 	if *resolveConflict {

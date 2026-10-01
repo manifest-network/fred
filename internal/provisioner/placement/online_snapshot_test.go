@@ -376,14 +376,24 @@ var snapshotReadCallers = map[string]map[string]bool{
 // claims on ConsistentCut and CutReceipt true: a non-empty literal of either
 // appears only in its constructor.
 func TestSnapshotCapabilitiesAreMintedOnlyByTheirConstructors(t *testing.T) {
-	minters := map[string]string{
+	for _, violation := range literalsMintedOutside(t, map[string]string{
 		"ConsistentCut": "CaptureConsistentCut",
 		"cutState":      "CaptureConsistentCut",
 		"CutReceipt":    "Stream",
+	}) {
+		t.Error(violation)
 	}
+}
+
+// literalsMintedOutside reports every non-empty composite literal of a guarded
+// type in this package's production files that sits outside the one function
+// allowed to mint it. Empty literals are zero values and mint nothing.
+func literalsMintedOutside(t *testing.T, minters map[string]string) []string {
+	t.Helper()
 	paths, err := filepath.Glob("*.go")
 	require.NoError(t, err)
 	fset := token.NewFileSet()
+	var violations []string
 	for _, path := range paths {
 		if strings.HasSuffix(path, "_test.go") {
 			continue
@@ -405,12 +415,14 @@ func TestSnapshotCapabilitiesAreMintedOnlyByTheirConstructors(t *testing.T) {
 					return true
 				}
 				if minter, guarded := minters[name.Name]; guarded && owner != minter {
-					t.Errorf("%s: %s minted in %s", fset.Position(literal.Pos()), name.Name, owner)
+					violations = append(violations, fmt.Sprintf("%s: %s minted in %s",
+						fset.Position(literal.Pos()), name.Name, owner))
 				}
 				return true
 			})
 		}
 	}
+	return violations
 }
 
 func TestSnapshotReadsBeginOnlyInsideTheConsistentCut(t *testing.T) {

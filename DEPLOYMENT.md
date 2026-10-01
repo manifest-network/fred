@@ -876,13 +876,51 @@ different moments):
 - A lease closed after the copy is pruned after a terminal chain read.
 - A lease re-provisioned after the copy reports a different lifecycle generation
   and is quarantined `unusable`: its callbacks are dropped and restart and update
-  are refused until an operator repairs it.
+  are refused until an operator repairs it (see
+  [Adopting a lifecycle generation after a restore](#adopting-a-lifecycle-generation-after-a-restore)).
 - A lease updated after the copy still has its pre-update manifest in
   `payloads.db`, so its next re-provision brings the old manifest back. Re-apply
   those updates.
 - A restart or update still pending in the copy is replayed with its original
   key and stamp. One the backend completed settles from its receipt; one the
   backend no longer remembers settles as expired and never runs again.
+
+### Adopting a lifecycle generation after a restore
+
+A lease re-provisioned after the restored copy was taken is quarantined
+`unusable` on the first sweep: its backend reports a lifecycle generation the
+copy has never seen. Its callbacks are dropped and restart and update are
+refused, but the workload keeps running. `placement-repair -classify` counts
+these leases in `counts.unusable_adoption_candidates` and marks their rows
+`unusable_adoption_candidate`. A quarantine that the lease's own stored rows
+explain, such as an owner or tenant that contradicts its operation metadata,
+never qualifies.
+
+With providerd stopped, for each such lease:
+
+```bash
+placement-repair -config /etc/fred/config.yaml -adopt-observed-generation \
+  -lease <lease-uuid> -backend <backend>
+placement-repair -config /etc/fred/config.yaml -adopt-observed-generation \
+  -lease <lease-uuid> -backend <backend> \
+  -apply -backup /var/lib/fred/placements.pre-adoption.db -confirm '<confirm>' \
+  -attest-generation '<attestation>'
+```
+
+The dry run collects complete inventory from every configured backend. It
+requires `<backend>` to be the lease's only owner and to report it as an active
+provision that is not mid-operation (`ready`, `failing`, or `failed`), for the
+same tenant and provider, at a typed generation other than the stored one. It
+prints both generations only as fingerprints, because lifecycle IDs are
+callback capabilities, along with the `confirm` value and the exact
+attestation. Attest only if that backend was not itself restored from an
+older snapshot and nothing for the lease is in flight or being replayed.
+
+The apply takes an exact no-overwrite backup, collects the inventory again and
+requires the plan to be unchanged, then in one transaction gives the lease's
+lifecycle authority the reported generation and clears the old generation's
+operation metadata from its placement. It refuses a lease with an attempt in
+flight, a pending restart or update, or a restore using it as its source.
 
 ### Retiring a backend whose storage is lost
 

@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `placement-repair -adopt-observed-generation -lease <uuid> -backend <name>`
+  repairs a lease left quarantined after a placement restore because its
+  backend re-provisioned it since the copy was taken. The backend must be the
+  lease's only owner in complete inventory, reporting a settled new generation
+  for the same tenant, and the stored rows must be consistent apart from the
+  quarantine. `-apply` requires `-backup`, `-confirm`, and
+  `-attest-generation`. `-classify` counts such leases in
+  `counts.unusable_adoption_candidates`. See DEPLOYMENT.md, "Adopting a
+  lifecycle generation after a restore".
 - providerd can snapshot `placements.db` and `payloads.db` while it runs. Set
   `placement_snapshot_dir` (with `placement_snapshot_interval`, default `1h`, and
   `placement_snapshot_retain`, default 24 sets). Each set is one consistent pair

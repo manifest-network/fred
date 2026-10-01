@@ -470,6 +470,41 @@ func loadLifecycleCapabilities(tx *bolt.Tx) (map[string]lifecycleCapability, err
 // prevent unrelated leases or the provider process from starting. Current
 // capabilities may intentionally outlive placement deletion, but every typed
 // placement attempt must have the exact marker written in the same transaction.
+// lifecycleBindingProblem reports why a placement and its lifecycle capability
+// do not describe one generation, or "" when they do. Open-time quarantine,
+// offline classification, and lifecycle generation adoption all use it, so
+// none of them can accept a pair another refuses.
+func lifecycleBindingProblem(placement Placement, capability lifecycleCapability) string {
+	if placement.Backend != "" && capability.backend != placement.Backend {
+		return fmt.Sprintf("capability backend %q does not match placement backend %q",
+			capability.backend, placement.Backend)
+	}
+	if placement.Attempt == "" {
+		if capability.attemptBackend != "" {
+			return "capability attempt marker has no placement attempt"
+		}
+		if placement.attemptOperationID.Valid() {
+			wantID, err := lifecycleIDForOperation(placement.attemptOperationID)
+			if err != nil || capability.backend != placement.Backend ||
+				capability.id != wantID || capability.retired {
+				return "confirmed operation metadata does not match lifecycle generation"
+			}
+			if capability.principal.valid() &&
+				(capability.principal.tenant != placement.attemptRequestSnapshot.Tenant() ||
+					capability.principal.providerUUID != placement.attemptRequestSnapshot.ProviderUUID()) {
+				return "runtime principal does not match confirmed operation metadata"
+			}
+		}
+		return ""
+	}
+	wantID, err := lifecycleIDForOperation(placement.attemptOperationID)
+	if err != nil || capability.attemptBackend != placement.Attempt ||
+		capability.attemptID != wantID {
+		return "capability attempt marker does not match placement attempt"
+	}
+	return ""
+}
+
 func quarantineLifecycleBindings(
 	placements map[string]Placement,
 	capabilities map[string]lifecycleCapability,
@@ -495,39 +530,10 @@ func quarantineLifecycleBindings(
 		// Placement usability is checked before lifecycle authority is exposed.
 		// Keep an independently valid capability behind that gate so a future
 		// exact inventory reaffirmation can retain the original ID without
-		// promoting an unfinished operation. The binding checks below quarantine any
+		// promoting an unfinished operation. The binding check quarantines any
 		// owner or attempt mismatch.
-		if placement.Backend != "" && capability.backend != placement.Backend {
-			quarantine(leaseUUID, fmt.Sprintf(
-				"capability backend %q does not match placement backend %q",
-				capability.backend, placement.Backend,
-			))
-			continue
-		}
-		if placement.Attempt == "" {
-			if capability.attemptBackend != "" {
-				quarantine(leaseUUID, "capability attempt marker has no placement attempt")
-				continue
-			}
-			if placement.attemptOperationID.Valid() {
-				wantID, err := lifecycleIDForOperation(placement.attemptOperationID)
-				if err != nil || capability.backend != placement.Backend ||
-					capability.id != wantID || capability.retired {
-					quarantine(leaseUUID, "confirmed operation metadata does not match lifecycle generation")
-					continue
-				}
-				if capability.principal.valid() &&
-					(capability.principal.tenant != placement.attemptRequestSnapshot.Tenant() ||
-						capability.principal.providerUUID != placement.attemptRequestSnapshot.ProviderUUID()) {
-					quarantine(leaseUUID, "runtime principal does not match confirmed operation metadata")
-				}
-			}
-			continue
-		}
-		wantID, err := lifecycleIDForOperation(placement.attemptOperationID)
-		if err != nil || capability.attemptBackend != placement.Attempt ||
-			capability.attemptID != wantID {
-			quarantine(leaseUUID, "capability attempt marker does not match placement attempt")
+		if problem := lifecycleBindingProblem(placement, capability); problem != "" {
+			quarantine(leaseUUID, problem)
 		}
 	}
 
