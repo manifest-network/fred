@@ -2660,6 +2660,11 @@ func (s *Store) beginReservedRestore(
 	if err := s.validateAdmissionBaselineLocked(baseline); err != nil {
 		return RestoreClaim{}, err
 	}
+	// The target lease has no placement row yet, so restoring into it is
+	// admission of a lease a recorded fenced reporter might already hold.
+	if err := s.recordlessAdmissionErrorLocked(); err != nil {
+		return RestoreClaim{}, err
+	}
 	if s.restoreClaims[sourceLeaseUUID] != reserved {
 		return RestoreClaim{}, ErrInvalidRestoreClaim
 	}

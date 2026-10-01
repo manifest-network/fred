@@ -49,8 +49,12 @@ func TestFencedReporterDoesNotHoldInheritedRecovery(t *testing.T) {
 	assert.NoError(t, fixture.reopened.leaseSideEffectError(reporterRecoveryLease),
 		"the operator distrusts the fenced reporter; waiting for it would freeze every lease")
 	assert.Equal(t, InventoryFencedReporterUnaccounted, fixture.reopened.InventoryReadiness())
-	assert.False(t, fixture.reopened.CurrentAdmissionBaseline().Valid(),
+	baseline := fixture.reopened.CurrentAdmissionBaseline()
+	assert.True(t, baseline.Valid(), "work on leases with a row, such as owner recovery, continues")
+	assert.False(t, baseline.AdmitsRecordless(),
 		"the fenced reporter may hold a lease with no row, so nothing without a row is admitted")
+	_, err := fixture.reopened.scopeAdmission(baseline, []string{reporterRecoveryBackend})
+	assert.ErrorIs(t, err, ErrRecordlessAdmissionWithheld)
 	metadata := persistedTopologyMetadata(t, fixture.reopened)
 	assert.Zero(t, metadata.PendingInventorySweepID)
 	assert.Equal(t, []string{reporterSilentBackend}, metadata.UnprojectedFencedReporters,
@@ -75,7 +79,7 @@ func TestUnprojectedFencedReporterClearsOnlyWhenItAnswersBothInventories(t *test
 		"a paired, pinned answer accounts for whatever the backend holds")
 	assert.Empty(t, fixture.reopened.unprojectedFencedReporters)
 	assert.Equal(t, InventoryReady, fixture.reopened.InventoryReadiness())
-	assert.True(t, fixture.reopened.CurrentAdmissionBaseline().Valid(), "admission resumes")
+	assert.True(t, fixture.reopened.CurrentAdmissionBaseline().AdmitsRecordless(), "admission resumes")
 }
 
 func TestFencedNonReporterRecordsNothing(t *testing.T) {
@@ -294,4 +298,45 @@ func TestUnprojectedFencedReporterIsVisibleLiveAndOffline(t *testing.T) {
 	assert.InDelta(t, 1, gauge(reporterSilentBackend), 0, "the record is published again at open")
 	fixture.sweep(t, reporterRecoveryBackend, reporterSilentBackend)
 	assert.InDelta(t, 0, gauge(reporterSilentBackend), 0)
+}
+
+// A scope issued before a fenced reporter was recorded cannot be spent after,
+// and a restore into a new target is admission of a lease with no row.
+func TestRecordedFencedReporterWithholdsEveryRecordlessAdmission(t *testing.T) {
+	fixture := newFencedReporterFixture(t)
+	fixture.reopenFenced(t, reporterSilentBackend)
+	staleScope, err := fixture.reopened.scopeAdmission(
+		fixture.reopened.CurrentAdmissionBaseline(), []string{reporterRecoveryBackend},
+	)
+	require.Error(t, err, "recovery is still pending at open")
+	require.False(t, staleScope.Valid())
+
+	fixture.sweep(t, reporterRecoveryBackend)
+	store := fixture.reopened
+	require.NotEmpty(t, store.unprojectedFencedReporters)
+
+	source, err := store.reserveRestoreSource(reporterRecoveryLease)
+	require.NoError(t, err)
+	defer store.releaseRestoreSource(source)
+	restoreOperation := requireOperationID(t, "8711")
+	_, err = store.beginReservedRestore(store.CurrentAdmissionBaseline(), source,
+		"00000000-0000-4000-8000-000000000711", restoreOperation,
+		repairBackendRequestSnapshot(t), testCallbackPair(restoreOperation))
+	require.ErrorIs(t, err, ErrRecordlessAdmissionWithheld)
+
+	// A scope minted while admission was open is refused once a reporter is
+	// recorded.
+	store.mu.Lock()
+	recorded := store.unprojectedFencedReporters
+	store.unprojectedFencedReporters = map[string]struct{}{}
+	store.mu.Unlock()
+	scope, err := store.scopeAdmission(store.CurrentAdmissionBaseline(), []string{reporterRecoveryBackend})
+	require.NoError(t, err)
+	store.mu.Lock()
+	store.unprojectedFencedReporters = recorded
+	store.mu.Unlock()
+	store.mu.Lock()
+	err = store.validateAdmissionScopeLocked(scope)
+	store.mu.Unlock()
+	require.ErrorIs(t, err, ErrRecordlessAdmissionWithheld)
 }

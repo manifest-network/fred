@@ -271,10 +271,14 @@ func TestFleet_FencedReporterLostPositiveIsNotAdmittedElsewhere(t *testing.T) {
 	f.interruptSweepAfterProvisions(f.backendAt(3))
 	f.restartFenced(fencedServer.name)
 	require.Equal(t, placement.InventoryRecoveryPending, f.placement.InventoryReadiness())
+	leaseErrors := metrics.ReconciliationActions.WithLabelValues(metrics.ActionLeaseError)
+	errorsBefore := promtestutil.ToFloat64(leaseErrors)
 
 	require.NoError(t, f.sweepN(2))
 
 	assert.Equal(t, placement.InventoryFencedReporterUnaccounted, f.placement.InventoryReadiness())
+	assert.Equal(t, errorsBefore, promtestutil.ToFloat64(leaseErrors),
+		"the reconciler defers the lease quietly instead of attempting a refused admission")
 	for _, server := range []*fakeBackendServer{f.backendAt(1), f.backendAt(3)} {
 		assert.Zero(t, server.provisionCount("lease-lost-positive"),
 			"the lease may already run on the fenced backend; it is not admitted on %s", server.name)
@@ -304,4 +308,36 @@ func TestFleet_FencedInventoryBranchDoesNotRaceItsWorkers(t *testing.T) {
 	f.restartFenced(f.backendAt(3).name)
 	require.NoError(t, f.sweepN(3))
 	f.assertPlacementPinned("lease-race", f.backendAt(1).name)
+}
+
+// Codex re-review of #245: withholding admission of leases without a row must
+// not stop recovery of a lease that has one. A confirmed owner that answers
+// and has lost the workload still gets the lease back.
+func TestFleet_FencedReporterDoesNotBlockConfirmedOwnerRecovery(t *testing.T) {
+	f := newFleet(t, fleetOptions{})
+	f.addLease("lease-owned", billingtypes.LEASE_STATE_ACTIVE)
+	owner := f.backendAt(1)
+	owner.seedProvision(t, "lease-owned", f.providerUUID, backend.ProvisionStatusReady)
+	require.NoError(t, f.sweep())
+	f.assertPlacementPinned("lease-owned", owner.name)
+
+	f.addLease("lease-other", billingtypes.LEASE_STATE_PENDING)
+	fencedServer := f.backendAt(2)
+	fencedServer.seedProvision(t, "lease-other", f.providerUUID, backend.ProvisionStatusReady)
+	f.interruptSweepAfterProvisions(f.backendAt(3))
+	f.restartFenced(fencedServer.name)
+	require.NoError(t, f.sweep())
+	require.Equal(t, placement.InventoryFencedReporterUnaccounted, f.placement.InventoryReadiness())
+
+	// The owner keeps answering but has lost the workload.
+	require.NoError(t, owner.mock.Deprovision(t.Context(), fleetLeaseUUID("lease-owned")))
+	require.NoError(t, f.sweepN(2))
+
+	assert.Equal(t, 1, owner.provisionCount("lease-owned"),
+		"the confirmed owner gets its lease back while the fenced reporter stays unaccounted")
+	f.assertPlacementPinned("lease-owned", owner.name)
+	for _, server := range []*fakeBackendServer{f.backendAt(1), f.backendAt(3)} {
+		assert.Zero(t, server.provisionCount("lease-other"),
+			"the lease the fenced backend may hold is still not admitted on %s", server.name)
+	}
 }

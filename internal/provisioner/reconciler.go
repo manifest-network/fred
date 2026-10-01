@@ -539,8 +539,11 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				deferForSnapshotBoundary("placement_observation_excluded")
 				return nil
 			}
+			// A complete sweep has heard every backend, so no fenced reporter can
+			// remain recorded; otherwise the baseline must still admit leases
+			// without a row.
 			allowRecordless := cycleComplete ||
-				(placementSyncOK && admissionBaseline.Valid() &&
+				(placementSyncOK && admissionBaseline.AdmitsRecordless() &&
 					lease.State == billingtypes.LEASE_STATE_PENDING && len(eligibleBackends) > 0)
 			absenceTrusted := allowRecordless
 

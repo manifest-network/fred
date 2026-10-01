@@ -2118,10 +2118,13 @@ that can only classify a refusal; `hmacauth.MatchCallbackKeys` checks a
 signature without issuing a proof. The placement store receives the fenced set
 once, at construction, and excuses a fenced reporter from interrupted-sweep
 recovery, recording it durably as an unprojected reporter so retirement and
-topology removal still see what it might hold. While any reporter is recorded
-the admission baseline is not current: it claims every placed lease has a
-placement row, which the fenced backend could contradict, so no lease without
-a row is admitted until the backend answers again or is retired.
+topology removal still see what it might hold. The admission baseline claims
+every placed lease has a placement row, which a recorded reporter could
+contradict, so while any reporter is recorded the baseline withholds only
+recordless admission (`AdmitsRecordless`). The store refuses to issue or spend
+an admission scope, or to restore into a new target, until the backend answers
+again or is retired. Work on leases with a row, including recovery onto a
+confirmed owner, continues.
 
 Callback admission is separate from tenant and observability traffic. Its
 ingress IP bucket and authenticated storage-identity bucket each use fixed

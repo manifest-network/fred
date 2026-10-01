@@ -68,6 +68,10 @@ var (
 	// ErrBackendOutsideAdmissionScope means a recordless attempt names a
 	// configured backend that the scope did not authorize.
 	ErrBackendOutsideAdmissionScope = errors.New("backend is outside placement admission scope")
+	// ErrRecordlessAdmissionWithheld means a fenced backend may hold a lease
+	// that has no placement row, so no such lease is admitted until it answers
+	// both endpoints again or is retired.
+	ErrRecordlessAdmissionWithheld = errors.New("admission of a lease without a placement row is withheld while a fenced backend may hold it")
 )
 
 // AdmissionBaseline is the opaque durable-topology capability required before
@@ -78,12 +82,23 @@ type AdmissionBaseline struct {
 	issuer      *Store
 	topologyID  uint64
 	fingerprint string
+	// recordless is false while a fenced backend may hold a lease that has no
+	// placement row. The baseline still authorizes work on leases with a row,
+	// such as recovery onto a confirmed owner, but not admitting new ones.
+	recordless bool
 }
 
 // Valid reports whether this is a structurally complete capability. Its Store
 // still checks the exact current durable topology when consuming it.
 func (baseline AdmissionBaseline) Valid() bool {
 	return baseline.issuer != nil && baseline.topologyID != 0 && baseline.fingerprint != ""
+}
+
+// AdmitsRecordless reports whether the baseline was issued while leases with
+// no placement row could be admitted. The Store re-checks the live state when
+// a scope is issued or consumed.
+func (baseline AdmissionBaseline) AdmitsRecordless() bool {
+	return baseline.Valid() && baseline.recordless
 }
 
 // AdmissionScope is the opaque, topology-bound capability required to create a
@@ -1134,17 +1149,22 @@ func (s *Store) CurrentAdmissionBaseline() AdmissionBaseline {
 		issuer:      s,
 		topologyID:  s.topologyID,
 		fingerprint: s.topologyFingerprint,
+		recordless:  s.recordlessAdmissionErrorLocked() == nil,
 	}
+}
+
+// recordlessAdmissionErrorLocked refuses admitting a lease with no placement
+// row while a recorded fenced reporter may already hold it. Caller holds s.mu.
+func (s *Store) recordlessAdmissionErrorLocked() error {
+	if len(s.unprojectedFencedReporters) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %q", ErrRecordlessAdmissionWithheld,
+		slices.Sorted(maps.Keys(s.unprojectedFencedReporters)))
 }
 
 func (s *Store) hasCurrentAdmissionBaselineLocked() bool {
 	if s.runtimeAuthorityFailure() != nil || s.inventoryRecoveryRequired {
-		return false
-	}
-	// The baseline proves every placed lease has a placement row. A recorded
-	// fenced reporter may hold a lease whose row Fred never wrote, so that
-	// proof is suspended until the backend answers again or is retired.
-	if len(s.unprojectedFencedReporters) != 0 {
 		return false
 	}
 	if s.topologyID == 0 || s.baselineTopologyID != s.topologyID ||
@@ -1189,6 +1209,9 @@ func (s *Store) scopeAdmission(
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if err := s.validateAdmissionBaselineLocked(baseline); err != nil {
+		return AdmissionScope{}, err
+	}
+	if err := s.recordlessAdmissionErrorLocked(); err != nil {
 		return AdmissionScope{}, err
 	}
 	canonical, err := canonicalAdmissionScopeNames(names)
@@ -1236,7 +1259,8 @@ func (s *Store) validateAdmissionScopeLocked(scope AdmissionScope) error {
 		!s.hasCurrentAdmissionBaselineLocked() {
 		return ErrInvalidAdmissionScope
 	}
-	return nil
+	// A scope issued before a fenced reporter was recorded cannot be spent.
+	return s.recordlessAdmissionErrorLocked()
 }
 
 func (s *Store) validateConfiguredBackendLocked(backendName string) error {
