@@ -1013,6 +1013,9 @@ func callbackEntryPayload(entry CallbackEntry, storageIdentity backendidentity.I
 	if !entry.MaintenanceID.IsZero() {
 		payload.MaintenanceID = entry.MaintenanceID.String()
 	}
+	if !entry.MaintenanceAdmittedAt.IsZero() {
+		payload.MaintenanceAdmittedAt = entry.MaintenanceAdmittedAt.UTC().Format(time.RFC3339Nano)
+	}
 	return json.Marshal(payload)
 }
 

@@ -478,7 +478,7 @@ func TestMaintenanceReceiptCapacityRefusesBeforePublishingHead(t *testing.T) {
 	storageID := callbackStorageID(t, "550e8400-e29b-41d4-a716-446655440000")
 
 	require.NoError(t, callbacks.db.Update(func(tx *bolt.Tx) error {
-		for index := range maxMaintenanceReceiptsPerLease {
+		for index := range maxProviderMaintenanceWindow {
 			id := newTestMaintenanceID(t)
 			digest := sha256.Sum256([]byte(fmt.Sprintf("maintenance-receipt-%d", index)))
 			record := maintenanceCompletionRecord{
@@ -500,7 +500,7 @@ func TestMaintenanceReceiptCapacityRefusesBeforePublishingHead(t *testing.T) {
 			}
 		}
 		return tx.Bucket(callbackLeaseMutationHeadBucketName).
-			SetSequence(uint64(maxMaintenanceReceiptsPerLease))
+			SetSequence(uint64(maxProviderMaintenanceWindow))
 	}))
 	require.NoError(t, callbacks.Healthy())
 
@@ -518,7 +518,7 @@ func TestMaintenanceReceiptCapacityRefusesBeforePublishingHead(t *testing.T) {
 	var capacityErr *MaintenanceReceiptCapacityError
 	require.ErrorAs(t, err, &capacityErr)
 	assert.Equal(t, source.LeaseUUID(), capacityErr.LeaseUUID)
-	assert.Equal(t, uint64(maxMaintenanceReceiptsPerLease), capacityErr.Limit)
+	assert.Equal(t, uint64(maxProviderMaintenanceWindow), capacityErr.Limit)
 
 	intents, listErr := callbacks.listMaintenanceIntents()
 	require.NoError(t, listErr)

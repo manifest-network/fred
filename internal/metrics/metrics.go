@@ -71,6 +71,17 @@ var (
 		Help:      "1 while an interrupted inventory sweep withholds fresh lease side effects until its journaled reporters (every backend, if the sweep held unattributed evidence or predates the journal) answer both endpoints with their pinned storage and every positive is durably represented; 0 otherwise",
 	})
 
+	// MaintenanceReceiptsEvictedTotal counts settled restart and update
+	// commands that left a lease's rolling window of 1,024 when a newer command
+	// was admitted. A retry of an evicted key is new work; a backend refuses a
+	// replay older than its own history as expired.
+	MaintenanceReceiptsEvictedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "maintenance_receipts_evicted_total",
+		Help:      "Settled restart and update commands evicted from a lease's rolling window of 1,024 when a newer command was admitted",
+	})
+
 	// InFlightProvisions tracks the number of provisions currently in progress.
 	InFlightProvisions = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,

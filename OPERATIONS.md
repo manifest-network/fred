@@ -185,6 +185,7 @@ when later probes or recovery passes succeed.
 | `fred_docker_backend_lease_actor_stuck_seconds > 900` | Some actor's `handle()` has been running for >15 min | See [Wedged lease actor](#wedged-lease-actor-docker-backend) |
 | `fred_docker_backend_lease_actor_panics_total > 0` | Bug — actor handler panicked | Check logs for stack trace, file an issue |
 | `fred_docker_backend_maintenance_readiness_pending_total` rising with long-lived pending maintenance | Exact maintenance remains pending while startup age or health readiness is uncertain; retries count again | Correlate the once-per-intent/branch warning with container health. A committed target is not rolled back solely because readiness stays uncertain |
+| `fred_docker_backend_maintenance_expired_total` rising | A provider sent restarts or updates older than their lease's retained history, typically after a placement database was restored from an older copy and replayed its pending commands. If the provider's clock also stepped back, its new commands expire until the clock passes the newest stamp it issued before the restore | Each command was refused before mutation and settles for the tenant as `410 maintenance_expired`. Check for a recent placement database restore and the provider host's clock. Nothing needs repair |
 | `fred_docker_backend_maintenance_receipts_unverifiable_total` rising | A failed maintenance receipt's target release row is gone or divergent, typically compacted away by the lease's later large updates. The receipt no longer authorizes cleanup, so a late container from that failed generation would be kept rather than removed | Inspect the `failed maintenance receipt target cannot be verified` log for the lease and maintenance ID. Nothing is blocked; if a stray container for that maintenance ID appears, remove it only after confirming it is not the lease's active cohort |
 | `fred_docker_backend_maintenance_recovery_deferred_total` rising | A lease-local observation conflict retains its intent while sibling recovery proceeds | Inspect the lease-scoped recovery warning and substrate identity; do not delete the intent or release its reserved capacity manually |
 | `fred_docker_backend_network_reclamation_total{outcome=~"error|list_error|budget_exhausted"}` sustained | The separate bounded network worker cannot drain its backlog in a pass | Check Docker errors, idle network count and address-pool headroom. Only `outcome="removed"` counts actual removals; active, connected or busy tenants are safe deferrals. This worker does not spend the operation-recovery budget |
@@ -2187,29 +2188,32 @@ restart/update for the old owner fails closed. Afterward the principal is
 durable: a partial sweep or transient outage of another backend does not block
 maintenance on an available owner.
 
-Terminal provider receipts are scoped by lease and key and retained for as long
-as either placement or lifecycle authority for that lease exists. An exact
-replay returns the stable result and a divergent kind or payload returns `409`;
-a different key cannot pass a pending head. At most 1,024 terminal receipts per
-live lease may exist, and capacity is refused before backend dispatch with `503
-Service Unavailable` (it is not misreported as an idempotency-key conflict).
-The transaction that removes the lease's final placement or lifecycle authority
-also reclaims its terminal receipts atomically; startup and periodic command
-recovery never scan lifetime receipt history. The retained full-store sweep is
-an explicit repair/upgrade utility only. Pending never expires. Provider and backend
-therefore use the same lifetime identity boundary: neither can forget a key and
-mistake an arbitrarily late retry for new work. A completed update receipt also
-carries store-assigned ordering, so an older recovered update can never rewrite
-the provider payload store after a later generation. Generate a new UUIDv4 per
-logical action and preserve it for retries.
+Terminal provider receipts are scoped by lease and key. An exact replay
+returns the stable result and a divergent kind or payload returns `409`; a
+different key cannot pass a pending head. Provider and backend each keep a
+rolling window of the lease's 1,024 most recent restart and update receipts,
+and admitting a newer command evicts the oldest settled one, so there is no
+per-lease command limit. The backend keeps a failed update whose late-container
+cleanup is unconfirmed until cleanup attests absence at least an hour after the
+failure, and keeps custom-domain reconciles in their own window of 64. The
+transaction that removes the lease's final placement or lifecycle authority
+reclaims its terminal receipts atomically; startup and periodic command
+recovery never scan history. Pending never expires.
 
-The backend keeps at most 1,024 compact maintenance receipts for the lifetime
-of a live lease. This is a lifetime, not rolling, bound because forgetting an
-old ID would make a delayed provider replay unsafe. The 1,025th command is
-refused before any replacement as coded `503 insufficient_resources`; normal
-successful lease close removes the history. Reaching this bound indicates an
-abnormally maintenance-heavy long-lived lease and requires closing/replacing
-that lease rather than deleting receipt authority by hand.
+Forgetting old keys is safe because ordering does not depend on them: the
+provider stamps each command with its admission time, strictly increasing per
+lease, and the backend refuses a command it no longer has a receipt for that is
+not newer than the newest one it accepted for the lease. Such a command settles
+as `410 maintenance_expired` and never runs. A completed update also carries
+store-assigned ordering, so an older recovered update can never rewrite the
+provider payload store after a later generation. Generate a new UUIDv4 per
+logical action, preserve it for retries, and never reuse it: a forgotten key
+whose release generation the backend still retains is refused with `409`.
+
+A backend refuses a command for capacity, as coded `503
+insufficient_resources` before any replacement, only for an unstamped command
+from an older provider at a full window, or when the window is full of failed
+updates whose cleanup is unconfirmed; the latter clears as cleanup confirms.
 
 **On success**: a `success` callback is sent and the lease's status returns to `ready`. For update, provider settlement occurs only after the accepted payload is durably persisted. Once backend acceptance is durably recorded, recovery performs local payload persistence without another backend call. Positive evidence that the exact lease is closed, rejected, or expired can instead retire the pending command and release its fence; missing, unreadable, foreign, or active chain observations cannot authorize that exit.
 

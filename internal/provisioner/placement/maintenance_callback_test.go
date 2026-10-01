@@ -17,6 +17,19 @@ import (
 
 func applyMaintenanceCompletionForTest(t *testing.T, authority *MaintenanceCoordinator, id maintenanceid.ID, status backend.CallbackStatus) error {
 	t.Helper()
+	return applyStampedMaintenanceCompletionForTest(t, authority, id, status, "")
+}
+
+// applyStampedMaintenanceCompletionForTest delivers a signed completion that
+// echoes stamp as the command's admission stamp ("" omits it).
+func applyStampedMaintenanceCompletionForTest(
+	t *testing.T,
+	authority *MaintenanceCoordinator,
+	id maintenanceid.ID,
+	status backend.CallbackStatus,
+	stamp string,
+) error {
+	t.Helper()
 	record, found, err := authority.lookupMaintenanceCommand(maintenanceLease, mustMaintenanceID(t, maintenanceIDA))
 	require.NoError(t, err)
 	require.True(t, found)
@@ -27,6 +40,7 @@ func applyMaintenanceCompletionForTest(t *testing.T, authority *MaintenanceCoord
 	if id.Valid() {
 		payload.MaintenanceID = id.String()
 	}
+	payload.MaintenanceAdmittedAt = stamp
 	body, err := json.Marshal(payload)
 	require.NoError(t, err)
 	callbackURL, err := url.Parse(command.CallbackURL())
@@ -106,4 +120,42 @@ func TestUpdateCommitsOnlyExactSuccessfulCompletion(t *testing.T) {
 			})
 		}
 	}
+}
+
+// TestUpdateCompletionMustEchoTheCommandsOwnStamp keeps a late completion of
+// an earlier command that reused the key from settling the newer one.
+func TestUpdateCompletionMustEchoTheCommandsOwnStamp(t *testing.T) {
+	id := mustMaintenanceID(t, maintenanceIDA)
+	var dispatched backend.UpdateRequest
+	client := &executionTestBackend{name: "backend-a", update: func(_ context.Context, request backend.UpdateRequest) error {
+		dispatched = request
+		return nil
+	}}
+	base, store := newMaintenanceCoordinatorForTest(t, maintenanceActiveLeaseReader(), client)
+	payloads := &maintenanceProgressPayloads{bytes: []byte("old committed payload")}
+	coordinator, err := base.coordinator.execution.MaintenanceCoordinator(payloads)
+	require.NoError(t, err)
+	application, err := coordinator.Application(nil, 0)
+	require.NoError(t, err)
+	request, err := NewMaintenanceApplicationRequest(id, maintenanceLease, "tenant-test", MaintenanceCommandUpdate, []byte("new candidate payload"))
+	require.NoError(t, err)
+	require.Equal(t, MaintenanceApplicationAccepted, application.Execute(t.Context(), request).Outcome())
+	require.False(t, dispatched.AdmittedAt.IsZero(), "every dispatch carries the durable admission stamp")
+
+	stale := dispatched.AdmittedAt.Add(-time.Second).Format(time.RFC3339Nano)
+	require.NoError(t, applyStampedMaintenanceCompletionForTest(t, coordinator, id, backend.CallbackStatusSuccess, stale))
+	require.NoError(t, application.RecoverPending(t.Context()))
+	record, found, err := store.LookupMaintenanceCommand(maintenanceLease, id)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, MaintenanceOutcomePending, record.Outcome(), "another command's completion settles nothing")
+	require.Zero(t, payloads.writes)
+
+	own := dispatched.AdmittedAt.Format(time.RFC3339Nano)
+	require.NoError(t, applyStampedMaintenanceCompletionForTest(t, coordinator, id, backend.CallbackStatusSuccess, own))
+	require.NoError(t, application.RecoverPending(t.Context()))
+	record, _, err = store.LookupMaintenanceCommand(maintenanceLease, id)
+	require.NoError(t, err)
+	require.Equal(t, MaintenanceOutcomeAccepted, record.Outcome())
+	require.Equal(t, 1, payloads.writes)
 }

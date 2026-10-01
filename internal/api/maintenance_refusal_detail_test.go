@@ -32,152 +32,225 @@ func (persister maintenanceDetailPayloadStore) OverwritePayload(leaseUUID string
 	return persister.store.Put(leaseUUID, value)
 }
 
+// maintenanceAPIStack is a real API, maintenance service, placement store, and
+// identity-bound HTTP client in front of one fake backend.
+type maintenanceAPIStack struct {
+	mux          *http.ServeMux
+	payloads     *payload.Store
+	calls        *atomic.Int32
+	leaseUUID    string
+	keyPair      *testutil.TestKeyPair
+	lastDispatch atomic.Pointer[[]byte]
+}
+
+const maintenanceStackRequestID = "550e8400-e29b-41d4-a716-446655440000"
+
+// newMaintenanceAPIStack serves operation with respond after checking the
+// request is the exact signed maintenance call.
+func newMaintenanceAPIStack(
+	t *testing.T,
+	operation string,
+	respond func(w http.ResponseWriter),
+) *maintenanceAPIStack {
+	t.Helper()
+	const (
+		backendName = "backend-a"
+		secret      = "api-maintenance-detail-test-secret-at-least-32-bytes"
+		generation  = "253b5115-e341-40ee-8686-bb56f1d795d4"
+	)
+	leaseUUID, providerUUID := testutil.ValidUUID1, testutil.ValidUUID2
+	stack := &maintenanceAPIStack{
+		calls: &atomic.Int32{}, leaseUUID: leaseUUID,
+		keyPair: testutil.NewTestKeyPair("maintenance-refusal-detail"),
+	}
+	storageID := testAPIBackendStorageID(backendName)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if !assert.NoError(t, err) {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if err := hmacauth.VerifyRequest(secret, r, body, r.Header.Get(hmacauth.SignatureHeader), time.Minute); err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set(backendidentity.ResponseHeader, storageID.String())
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/provisions":
+			assert.NoError(t, json.NewEncoder(w).Encode(backend.ListProvisionsResponse{Provisions: []backend.ProvisionInfo{{
+				LeaseUUID: leaseUUID, ProviderUUID: providerUUID, Tenant: stack.keyPair.Address,
+				LifecycleGeneration: &backend.LifecycleGenerationObservation{
+					Kind: backend.LifecycleGenerationTyped, ID: generation,
+				},
+			}}}))
+		case "/retentions":
+			assert.NoError(t, json.NewEncoder(w).Encode(backend.ListRetentionsResponse{Retentions: []backend.RetainedLease{}}))
+		case backendidentity.BoundPathPrefix + storageID.String() + "/" + operation:
+			stack.calls.Add(1)
+			stack.lastDispatch.Store(&body)
+			assert.Equal(t, http.MethodPost, r.Method)
+			switch operation {
+			case "restart":
+				var restart backend.RestartRequest
+				if !assert.NoError(t, json.Unmarshal(body, &restart)) {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				assert.Equal(t, leaseUUID, restart.LeaseUUID)
+				assert.Equal(t, maintenanceStackRequestID, restart.MaintenanceID.String())
+			case "update":
+				var update backend.UpdateRequest
+				if !assert.NoError(t, json.Unmarshal(body, &update)) {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				assert.Equal(t, leaseUUID, update.LeaseUUID)
+				assert.Equal(t, maintenanceStackRequestID, update.MaintenanceID.String())
+				assert.Equal(t, []byte("manifest"), update.Payload)
+			}
+			respond(w)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	store, err := placementstore.NewStoreForProvider(filepath.Join(t.TempDir(), "placements.db"), providerUUID)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	configureAPIPlacementTopology(t, store, []string{backendName})
+	policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
+		Name: backendName, BaseURL: server.URL, Secret: secret, Timeout: time.Second,
+	})
+	require.NoError(t, err)
+	client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{}, store)
+	require.NoError(t, err)
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}}})
+	require.NoError(t, err)
+	chain := &mockChainClient{getLeaseFunc: func(_ context.Context, requested string) (*billingtypes.Lease, error) {
+		require.Equal(t, leaseUUID, requested)
+		return &billingtypes.Lease{
+			Uuid: leaseUUID, ProviderUuid: providerUUID, Tenant: stack.keyPair.Address,
+			State: billingtypes.LEASE_STATE_ACTIVE,
+			Items: []billingtypes.LeaseItem{{SkuUuid: "sku-test", Quantity: 1, ServiceName: "app"}},
+		}, nil
+	}}
+	coordinator, err := store.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	execution, err := coordinator.BindBackendRuntime(router, apiProviderControlPlane{
+		ReconciliationChain: apiReconciliationChain{PruneLeaseReader: chain},
+	})
+	require.NoError(t, err)
+	reconciliation, err := execution.ReconciliationCoordinator(nil, nil)
+	require.NoError(t, err)
+	sweep, err := reconciliation.BeginSweep()
+	require.NoError(t, err)
+	t.Cleanup(sweep.End)
+	provisions, err := sweep.CollectProvisionInventory(t.Context(), backendName)
+	require.NoError(t, err)
+	retentions, err := sweep.CollectRetentionInventory(t.Context(), backendName)
+	require.NoError(t, err)
+	disposition, err := sweep.RecordBackendInventory(provisions, retentions)
+	require.NoError(t, err)
+	require.Equal(t, placement.BackendInventoryAuthoritative, disposition.Disposition())
+	require.NoError(t, sweep.SealInventory())
+	_, err = sweep.Project(placement.ReconciliationProjection{Placements: map[string]string{leaseUUID: backendName}})
+	require.NoError(t, err)
+	sweep.End()
+	payloadStore, err := payload.NewStore(payload.StoreConfig{DBPath: filepath.Join(t.TempDir(), "payloads.db")})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, payloadStore.Close()) })
+	require.NoError(t, payloadStore.Put(leaseUUID, []byte("previously accepted manifest")))
+	stack.payloads = payloadStore
+	maintenanceCoordinator, err := execution.MaintenanceCoordinator(maintenanceDetailPayloadStore{store: payloadStore})
+	require.NoError(t, err)
+	service, err := maintenanceapp.NewService(maintenanceapp.Config{Coordinator: maintenanceCoordinator})
+	require.NoError(t, err)
+	handlers := NewHandlers(HandlersConfig{
+		MaintenanceService: service, ProviderUUID: providerUUID, Bech32Prefix: "manifest",
+	})
+	stack.mux = http.NewServeMux()
+	stack.mux.HandleFunc("POST /v1/leases/{lease_uuid}/restart", handlers.RestartLease)
+	stack.mux.HandleFunc("POST /v1/leases/{lease_uuid}/update", handlers.UpdateLease)
+	return stack
+}
+
+// send makes one signed tenant request; attempt varies the bearer token.
+func (stack *maintenanceAPIStack) send(t *testing.T, operation string, attempt int) *httptest.ResponseRecorder {
+	t.Helper()
+	var body io.Reader
+	if operation == "update" {
+		body = strings.NewReader(`{"payload":"bWFuaWZlc3Q="}`)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/leases/"+stack.leaseUUID+"/"+operation, body)
+	request.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(
+		stack.keyPair, stack.leaseUUID, time.Now().Add(time.Duration(attempt)*time.Second)))
+	request.Header.Set(idempotencyKeyHeader, maintenanceStackRequestID)
+	response := httptest.NewRecorder()
+	stack.mux.ServeHTTP(response, request)
+	return response
+}
+
 func TestMaintenanceLeaseReturnsCuratedBackendRefusalDetailAndReplaysReceipt(t *testing.T) {
 	t.Parallel()
 	for _, operation := range []string{"restart", "update"} {
 		t.Run(operation, func(t *testing.T) {
 			t.Parallel()
 			const (
-				backendName   = "backend-a"
-				secret        = "api-maintenance-detail-test-secret-at-least-32-bytes"
-				generation    = "253b5115-e341-40ee-8686-bb56f1d795d4"
-				requestID     = "550e8400-e29b-41d4-a716-446655440000"
 				backendDetail = "services.web.image:\nregistry is not allowed\x1b"
 				wantDetail    = "services.web.image: registry is not allowed"
 			)
-			leaseUUID, providerUUID := testutil.ValidUUID1, testutil.ValidUUID2
-			keyPair := testutil.NewTestKeyPair("maintenance-refusal-detail")
-			storageID := testAPIBackendStorageID(backendName)
-			var maintenanceCalls atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				body, err := io.ReadAll(r.Body)
-				if !assert.NoError(t, err) {
-					w.WriteHeader(http.StatusInternalServerError)
-					return
-				}
-				if err := hmacauth.VerifyRequest(secret, r, body, r.Header.Get(hmacauth.SignatureHeader), time.Minute); err != nil {
-					http.Error(w, "unauthorized", http.StatusUnauthorized)
-					return
-				}
-				w.Header().Set(backendidentity.ResponseHeader, storageID.String())
-				w.Header().Set("Content-Type", "application/json")
-				switch r.URL.Path {
-				case "/provisions":
-					assert.NoError(t, json.NewEncoder(w).Encode(backend.ListProvisionsResponse{Provisions: []backend.ProvisionInfo{{
-						LeaseUUID: leaseUUID, ProviderUUID: providerUUID, Tenant: keyPair.Address,
-						LifecycleGeneration: &backend.LifecycleGenerationObservation{
-							Kind: backend.LifecycleGenerationTyped, ID: generation,
-						},
-					}}}))
-				case "/retentions":
-					assert.NoError(t, json.NewEncoder(w).Encode(backend.ListRetentionsResponse{Retentions: []backend.RetainedLease{}}))
-				case backendidentity.BoundPathPrefix + storageID.String() + "/" + operation:
-					maintenanceCalls.Add(1)
-					assert.Equal(t, http.MethodPost, r.Method)
-					switch operation {
-					case "restart":
-						var restart backend.RestartRequest
-						if !assert.NoError(t, json.Unmarshal(body, &restart)) {
-							w.WriteHeader(http.StatusInternalServerError)
-							return
-						}
-						assert.Equal(t, leaseUUID, restart.LeaseUUID)
-						assert.Equal(t, requestID, restart.MaintenanceID.String())
-					case "update":
-						var update backend.UpdateRequest
-						if !assert.NoError(t, json.Unmarshal(body, &update)) {
-							w.WriteHeader(http.StatusInternalServerError)
-							return
-						}
-						assert.Equal(t, leaseUUID, update.LeaseUUID)
-						assert.Equal(t, requestID, update.MaintenanceID.String())
-						assert.Equal(t, []byte("manifest"), update.Payload)
-					}
-					w.WriteHeader(http.StatusBadRequest)
-					assert.NoError(t, json.NewEncoder(w).Encode(map[string]string{
-						"error": backendDetail, "validation_code": "image_not_allowed",
-					}))
-				default:
-					http.NotFound(w, r)
-				}
-			}))
-			t.Cleanup(server.Close)
-			store, err := placementstore.NewStoreForProvider(filepath.Join(t.TempDir(), "placements.db"), providerUUID)
-			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, store.Close()) })
-			configureAPIPlacementTopology(t, store, []string{backendName})
-			policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
-				Name: backendName, BaseURL: server.URL, Secret: secret, Timeout: time.Second,
+			stack := newMaintenanceAPIStack(t, operation, func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusBadRequest)
+				assert.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+					"error": backendDetail, "validation_code": "image_not_allowed",
+				}))
 			})
-			require.NoError(t, err)
-			client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{}, store)
-			require.NoError(t, err)
-			router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}}})
-			require.NoError(t, err)
-			chain := &mockChainClient{getLeaseFunc: func(_ context.Context, requested string) (*billingtypes.Lease, error) {
-				require.Equal(t, leaseUUID, requested)
-				return &billingtypes.Lease{
-					Uuid: leaseUUID, ProviderUuid: providerUUID, Tenant: keyPair.Address,
-					State: billingtypes.LEASE_STATE_ACTIVE,
-					Items: []billingtypes.LeaseItem{{SkuUuid: "sku-test", Quantity: 1, ServiceName: "app"}},
-				}, nil
-			}}
-			coordinator, err := store.BindOperationCoordinator(nil)
-			require.NoError(t, err)
-			execution, err := coordinator.BindBackendRuntime(router, apiProviderControlPlane{
-				ReconciliationChain: apiReconciliationChain{PruneLeaseReader: chain},
-			})
-			require.NoError(t, err)
-			reconciliation, err := execution.ReconciliationCoordinator(nil, nil)
-			require.NoError(t, err)
-			sweep, err := reconciliation.BeginSweep()
-			require.NoError(t, err)
-			t.Cleanup(sweep.End)
-			provisions, err := sweep.CollectProvisionInventory(t.Context(), backendName)
-			require.NoError(t, err)
-			retentions, err := sweep.CollectRetentionInventory(t.Context(), backendName)
-			require.NoError(t, err)
-			disposition, err := sweep.RecordBackendInventory(provisions, retentions)
-			require.NoError(t, err)
-			require.Equal(t, placement.BackendInventoryAuthoritative, disposition.Disposition())
-			require.NoError(t, sweep.SealInventory())
-			_, err = sweep.Project(placement.ReconciliationProjection{Placements: map[string]string{leaseUUID: backendName}})
-			require.NoError(t, err)
-			sweep.End()
-			payloadStore, err := payload.NewStore(payload.StoreConfig{DBPath: filepath.Join(t.TempDir(), "payloads.db")})
-			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, payloadStore.Close()) })
-			require.NoError(t, payloadStore.Put(leaseUUID, []byte("previously accepted manifest")))
-			maintenanceCoordinator, err := execution.MaintenanceCoordinator(maintenanceDetailPayloadStore{store: payloadStore})
-			require.NoError(t, err)
-			service, err := maintenanceapp.NewService(maintenanceapp.Config{Coordinator: maintenanceCoordinator})
-			require.NoError(t, err)
-			handlers := NewHandlers(HandlersConfig{
-				MaintenanceService: service, ProviderUUID: providerUUID, Bech32Prefix: "manifest",
-			})
-			mux := http.NewServeMux()
-			mux.HandleFunc("POST /v1/leases/{lease_uuid}/restart", handlers.RestartLease)
-			mux.HandleFunc("POST /v1/leases/{lease_uuid}/update", handlers.UpdateLease)
 			for attempt := range 2 {
-				var body io.Reader
-				if operation == "update" {
-					body = strings.NewReader(`{"payload":"bWFuaWZlc3Q="}`)
-				}
-				request := httptest.NewRequest(http.MethodPost, "/v1/leases/"+leaseUUID+"/"+operation, body)
-				request.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(keyPair, leaseUUID, time.Now().Add(time.Duration(attempt)*time.Second)))
-				request.Header.Set(idempotencyKeyHeader, requestID)
-				response := httptest.NewRecorder()
-				mux.ServeHTTP(response, request)
+				response := stack.send(t, operation, attempt)
 				require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
 				var result ErrorResponse
 				require.NoError(t, json.Unmarshal(response.Body.Bytes(), &result))
 				assert.Equal(t, wantDetail, result.Error, "both first response and receipt replay must retain the curated diagnostic")
 				assert.Equal(t, http.StatusBadRequest, result.Code)
 			}
-			assert.Equal(t, int32(1), maintenanceCalls.Load(), "the real service must replay the durable refusal without another backend call")
-			storedPayload, err := payloadStore.Get(leaseUUID)
+			assert.Equal(t, int32(1), stack.calls.Load(), "the real service must replay the durable refusal without another backend call")
+			storedPayload, err := stack.payloads.Get(stack.leaseUUID)
 			require.NoError(t, err)
 			assert.Equal(t, []byte("previously accepted manifest"), storedPayload, "a refused maintenance command must preserve the accepted manifest")
+		})
+	}
+}
+
+// TestMaintenanceLeaseReportsAnExpiredCommandAsGone covers a backend that
+// refuses a command older than the lease's retained history: the command
+// settles as expired, the tenant gets 410 maintenance_expired, and a retry of
+// the same key replays that receipt without another backend call.
+func TestMaintenanceLeaseReportsAnExpiredCommandAsGone(t *testing.T) {
+	t.Parallel()
+	for _, operation := range []string{"restart", "update"} {
+		t.Run(operation, func(t *testing.T) {
+			t.Parallel()
+			stack := newMaintenanceAPIStack(t, operation, func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusConflict)
+				assert.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+					"error": "too old", "code": backend.CodeMaintenanceExpired,
+				}))
+			})
+			for attempt := range 2 {
+				response := stack.send(t, operation, attempt)
+				require.Equal(t, http.StatusGone, response.Code, response.Body.String())
+				var result ErrorResponse
+				require.NoError(t, json.Unmarshal(response.Body.Bytes(), &result))
+				assert.Equal(t, "maintenance_expired", result.Reason)
+			}
+			assert.Equal(t, int32(1), stack.calls.Load())
+			dispatched := stack.lastDispatch.Load()
+			require.NotNil(t, dispatched)
+			assert.Contains(t, string(*dispatched), `"admitted_at":`, "the provider stamps every dispatch")
+			storedPayload, err := stack.payloads.Get(stack.leaseUUID)
+			require.NoError(t, err)
+			assert.Equal(t, []byte("previously accepted manifest"), storedPayload, "an expired update never replaces the accepted manifest")
 		})
 	}
 }

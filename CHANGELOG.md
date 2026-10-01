@@ -300,6 +300,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Restart and update no longer stop at 1,024 commands per lease. Fred and the
+  docker-backend keep a rolling window of each lease's 1,024 most recent
+  commands and evict the oldest settled one to admit a newer command; the
+  docker-backend keeps custom-domain reconciles in a separate window of 64, so
+  they never evict a tenant's receipt. A retry within the window still replays
+  its result; an older key is a new command. Every dispatch now carries the
+  provider's `admitted_at` stamp, strictly increasing per lease, and a backend
+  refuses a command it has no receipt for that is not newer than the newest one
+  it accepted, with `409` and code `maintenance_expired`, so a late or replayed
+  command can never run again or move an update backward. Fred settles it as
+  expired and tenants get `410 Gone` with reason `maintenance_expired`.
+  Completion callbacks echo `maintenance_admitted_at`, and Fred ignores one
+  that does not match its pending command. A failed update whose late-container
+  cleanup is unconfirmed stays in the window until cleanup attests absence at
+  least an hour after the failure, or the receipt can no longer authorize
+  cleanup. Keys must not be reused: a forgotten key that still names a release
+  generation on the backend is refused with `409`. New counters:
+  `fred_provisioner_maintenance_receipts_evicted_total` and
+  `fred_docker_backend_maintenance_expired_total`. Upgrade docker-backends
+  before `providerd`: an older backend ignores `admitted_at`. Neither binary
+  can be downgraded once it has written the new state.
 - Closing a lease while its worker drains returns breaker-neutral
   `503 lifecycle_pending`. Provider close events defer through the bounded
   scheduler; the actor keeps close ownership so canceled work settles as

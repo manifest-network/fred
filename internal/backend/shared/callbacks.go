@@ -128,6 +128,9 @@ type CallbackEntry struct {
 	// MaintenanceID is present only on the exact maintenance completion, never
 	// on a subsequent runtime-failure observation from that generation.
 	MaintenanceID MaintenanceID `json:"maintenance_id,omitzero"`
+	// MaintenanceAdmittedAt is that command's provider admission stamp, echoed
+	// on the wire; zero for an unstamped command.
+	MaintenanceAdmittedAt time.Time `json:"maintenance_admitted_at,omitzero"`
 	// DeliveryID identifies this delivery inside its lease's durable v2 queue.
 	// Writers allocate a random UUIDv4; precise storage authority is the lease,
 	// delivery ID, and value digest together.
@@ -432,6 +435,19 @@ func inspectCallbackStoreReadOnlyFile(
 		}); err != nil {
 			return err
 		}
+		if lineages := tx.Bucket(maintenanceLineageBucketName); lineages != nil {
+			if err := lineages.ForEach(func(key, value []byte) error {
+				if err := budget.observe(key, value); err != nil {
+					return err
+				}
+				if value == nil {
+					return fmt.Errorf("maintenance lineage %q is a nested bucket", key)
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
 		if err := validateCallbackReceiptStateTx(tx); err != nil {
 			return err
 		}
@@ -663,6 +679,7 @@ func validateCallbackRootBuckets(tx *bolt.Tx) error {
 		string(imagePinsBucketName):           {},
 		string(volumeLaunchDebtBucketName):    {},
 		string(maintenanceCompensationBucket): {},
+		string(maintenanceLineageBucketName):  {},
 	}
 	for _, bucketName := range callbackCurrentSchemaBuckets() {
 		allowed[string(bucketName)] = struct{}{}
@@ -1602,6 +1619,14 @@ func validateCallbackEntrySemantics(entry CallbackEntry) error {
 	if !entry.MaintenanceID.IsZero() &&
 		(!entry.MaintenanceID.Valid() || entry.DeliveryKind != CallbackDeliveryKindMaintenance) {
 		return errors.New("maintenance callback identity requires an exact maintenance delivery")
+	}
+	if !entry.MaintenanceAdmittedAt.IsZero() {
+		if entry.MaintenanceID.IsZero() {
+			return errors.New("a maintenance admission stamp requires a maintenance completion")
+		}
+		if err := validateMaintenanceAdmissionStamp(entry.MaintenanceAdmittedAt); err != nil {
+			return fmt.Errorf("maintenance callback: %w", err)
+		}
 	}
 	if entry.BackendStorageID == "" {
 		return fmt.Errorf("callback backend storage identity is required")

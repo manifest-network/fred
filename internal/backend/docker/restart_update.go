@@ -79,14 +79,23 @@ func applyCustomDomainOverrides(items []backend.LeaseItem, overrides map[string]
 // no-enqueue or explicit actor rejection can settle pre-effect refusal. A lost
 // reply preserves that exact head for replay and bounded recovery.
 func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error {
-	request, err := b.maintenanceSettlement.NewMaintenanceRequestAuthority(
+	request, err := b.maintenanceSettlement.NewProviderMaintenanceRequestAuthority(
 		req.MaintenanceID, shared.MaintenanceIntentRestart, req.LeaseUUID,
-		req.CallbackURL, nil,
+		req.CallbackURL, nil, req.AdmittedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("%w: invalid restart request authority: %w", backend.ErrValidation, err)
 	}
-	return b.routeReplaceRestart(ctx, request, nil)
+	return countExpiredMaintenance(b.routeReplaceRestart(ctx, request, nil))
+}
+
+// countExpiredMaintenance counts a provider command refused because it is
+// older than its lease's retained maintenance history.
+func countExpiredMaintenance(err error) error {
+	if errors.Is(err, backend.ErrMaintenanceExpired) {
+		maintenanceExpiredTotal.Inc()
+	}
+	return err
 }
 
 // resolveMaintenanceCallbackURLs validates a trusted maintenance route against
@@ -374,13 +383,21 @@ func exactServiceContainerCohort(
 // Status is Updating" contract holds without an off-actor write. No
 // rollback is needed on any failure path (nothing on prov was mutated).
 func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
-	request, err := b.maintenanceSettlement.NewMaintenanceRequestAuthority(
+	request, err := b.maintenanceSettlement.NewProviderMaintenanceRequestAuthority(
 		req.MaintenanceID, shared.MaintenanceIntentUpdate, req.LeaseUUID,
-		req.CallbackURL, req.Payload,
+		req.CallbackURL, req.Payload, req.AdmittedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("%w: invalid update request authority: %w", backend.ErrValidation, err)
 	}
+	return countExpiredMaintenance(b.update(ctx, req, request))
+}
+
+func (b *Backend) update(
+	ctx context.Context,
+	req backend.UpdateRequest,
+	request shared.MaintenanceRequestAuthority,
+) error {
 	if err := b.requireMutationAdmission(ctx, "update"); err != nil {
 		return fmt.Errorf("backend storage identity verification failed: %w", err)
 	}

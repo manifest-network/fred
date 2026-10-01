@@ -859,16 +859,22 @@ settled, retrying the exact same key and command returns its durable result
 without starting another replacement; reusing the key for a different command
 or update payload returns `409`. A
 different key also returns `409` while an earlier command is unresolved. Fred
-keeps terminal provider receipts for the lifetime of the lease's placement or
-lifecycle authority, and pending commands until they are definitively settled.
-Removing the lease's final placement or lifecycle authority atomically reclaims
-its terminal receipts in the same database transaction. The provider and
-backend therefore agree permanently whether a live-lease key names
-completed work; divergent reuse remains a conflict, and an arbitrarily late
-retry cannot restart work or move the provider's desired payload backward.
+keeps the receipts of the lease's 1,024 most recent restarts and updates, and
+pending commands until they are definitively settled; admitting a newer command
+evicts the oldest settled receipt, and closing the lease reclaims the rest.
 Clients must generate a fresh UUIDv4 for each new logical command and reuse it
-only for retries. A live lease that reaches the 1,024-receipt safety ceiling is
-refused before dispatch rather than forgetting an identity.
+only for retries, so a retry within the last 1,024 commands always replays its
+result. Never reuse a key for a new command: a key Fred has forgotten may still
+name an earlier release on the backend, and is then refused with `409`.
+
+Each command carries the time Fred admitted it, and Fred stamps a lease's
+commands in strictly increasing order. A backend refuses any restart or update
+it no longer has a receipt for and that is not newer than the newest command it
+has accepted for the lease, so an arbitrarily late or replayed command can
+never run again, restart work twice, or move the provider's desired payload
+backward. Such a command settles as `410 Gone` with
+`reason: maintenance_expired`; it did not run. Send a new command with a new
+key.
 
 For clients written before `Idempotency-Key` existed, an operator can list
 tenant addresses in `maintenance_legacy_idempotency_tenants`. A restart or update
@@ -926,6 +932,9 @@ Once established, an unrelated backend outage does not revoke it.
   pending, or the lease is in a state that cannot be restarted
 - `410 Gone` with `reason: backend_storage_lost` - The lease's backend was
   retired because its storage was lost; the lease is being ended on chain
+- `410 Gone` with `reason: maintenance_expired` - The command is older than the
+  lease's retained maintenance history and was not run; send a new command with
+  a new key
 - `429 Too Many Requests` with `reason: maintenance_capacity_reserved` - Shared
   capacity is reserved for a tenant without pending work; this new command was
   not recorded. Retry after your pending work completes (`Retry-After: 1`)
@@ -994,6 +1003,9 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
   pending, or the lease is in a state that cannot be updated
 - `410 Gone` with `reason: backend_storage_lost` - The lease's backend was
   retired because its storage was lost; the lease is being ended on chain
+- `410 Gone` with `reason: maintenance_expired` - The command is older than the
+  lease's retained maintenance history and was not run; send a new command with
+  a new key
 - `429 Too Many Requests` with `reason: maintenance_capacity_reserved` - Shared
   capacity is reserved for a tenant without pending work; this new command was
   not recorded. Retry after your pending work completes (`Retry-After: 1`)

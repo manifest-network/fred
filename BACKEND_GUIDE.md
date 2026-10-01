@@ -646,9 +646,14 @@ aggregator address.
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "maintenance_id": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
-  "callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
+  "callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
+  "admitted_at": "2026-09-30T12:00:00.000001Z"
 }
 ```
+
+`admitted_at` is the provider's admission stamp for this command (RFC 3339,
+UTC). Fred stamps one lease's commands in strictly increasing order and sends
+the same value on every replay. Older providers omit it.
 
 **Response:** `202 Accepted`
 ```json
@@ -659,16 +664,25 @@ aggregator address.
 
 **Behavior:**
 0. Validate the canonical UUIDv4 `maintenance_id` and durably admit that exact
-   ID, kind, source authority, and request fingerprint before any mutation.
-   Exact replay returns the stored disposition without repeating replacement;
-   divergent reuse returns `409`. Provider and backend both retain a compact
-   receipt for the lifetime of the live lease; the provider reclaims it only
-   after placement and lifecycle authority are gone, while the backend removes
-   it only through successful close. A store-assigned completion sequence makes
-   an older recovered update return `409` once a newer update exists, preventing
-   stale desired-payload persistence. At most 1,024 receipts are admitted per
-   live lease; exhaustion is refused before mutation as coded `503
-   insufficient_resources`, so it cannot create an ambiguous command.
+   ID, kind, source authority, request fingerprint, and `admitted_at` before any
+   mutation. Exact replay returns the stored disposition without repeating
+   replacement; divergent reuse, including the same ID with a different
+   `admitted_at`, returns `409`. Keep a compact receipt for at least the lease's
+   1,024 most recent provider commands; the Docker backend evicts its oldest
+   evictable receipt when it admits a newer stamped command (a failed update
+   whose late-container cleanup is unconfirmed stays), and removes the rest only
+   through successful close. A backend that lets receipts expire **MUST** keep,
+   per lease, the newest `admitted_at` it has ever accepted and the command that
+   carried it, and **MUST** refuse a command with no head and no receipt whose
+   `admitted_at` is not newer than that mark, unless it is that same command, or
+   (once anything has expired) a command with no `admitted_at`. Refuse with
+   `409` and `"code": "maintenance_expired"`, before any mutation. Fred
+   settles that command as expired and never resends it. Without this rule an
+   expired receipt would let a late or replayed command run again. A newer
+   update makes an older recovered update return `409`, preventing stale
+   desired-payload persistence. A command that cannot be admitted for capacity
+   is refused before mutation as coded `503 insufficient_resources`, so it
+   cannot create an ambiguous command.
 1. Validate the lease exists and is in a restartable state (`ready` or `failed`)
 2. Return 202 immediately
 3. In the background, durably capture the exact source image, effective runtime
@@ -688,6 +702,8 @@ aggregator address.
   validation details are relayed to the tenant and retained for exact replay
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for restart (e.g., already restarting, updating, or provisioning)
+- `409 Conflict` with `code: "maintenance_expired"` - The command is older than
+  the lease's retained maintenance history and was not run
 - `503 Service Unavailable` with `code: "insufficient_resources"` - The
   backend refused admission before side effects because its durable live-lease
   maintenance receipt capacity is exhausted
@@ -705,7 +721,8 @@ are not reversed by recreating the source.
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "maintenance_id": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
   "callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
-  "payload": "base64-encoded-manifest"
+  "payload": "base64-encoded-manifest",
+  "admitted_at": "2026-09-30T12:00:00.000001Z"
 }
 ```
 
@@ -718,7 +735,9 @@ are not reversed by recreating the source.
 
 **Behavior:**
 0. Apply the same durable `maintenance_id` admission/replay rule as `/restart`,
-   including the exact payload hash in the immutable request fingerprint.
+   including the exact payload hash in the immutable request fingerprint. A
+   `maintenance_id` names at most one release per lease: refuse a new command
+   whose ID already names a retained release with `409` before admission.
 1. Validate the lease exists and is in an updatable state (`ready` or `failed`)
 2. Parse and validate the new manifest
 3. Return 202 immediately
@@ -738,6 +757,8 @@ are not reversed by recreating the source.
 - `400 Bad Request` - Invalid manifest or validation error
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for update (e.g., currently restarting or provisioning)
+- `409 Conflict` with `code: "maintenance_expired"` - The command is older than
+  the lease's retained maintenance history and was not run
 - `503 Service Unavailable` with `code: "insufficient_resources"` - The
   backend refused admission before side effects because its durable live-lease
   maintenance receipt capacity is exhausted
@@ -967,8 +988,11 @@ configured in-memory snapshot, or a zero-valued snapshot when none is set.
 ## Exact maintenance completion
 
 A terminal restart/update callback carries `maintenance_id` equal to the
-canonical UUIDv4 from its durable request. Persist it with the outbox entry and
-include it in the HMAC-covered body. It accompanies the existing lifecycle URL
+canonical UUIDv4 from its durable request, and `maintenance_admitted_at` equal
+to the request's `admitted_at` when it had one. Persist both with the outbox
+entry and include them in the HMAC-covered body. Fred ignores a completion whose
+`maintenance_admitted_at` differs from its pending command, so a late completion
+of an earlier command that reused the key cannot settle the newer one. It accompanies the existing lifecycle URL
 and backend storage identity; it cannot replace either authority. Include it on
 the exact `success` or `failed` completion only. A later autonomous runtime
 failure must omit it, including the separate runtime observation paired with a

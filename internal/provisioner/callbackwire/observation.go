@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
@@ -42,15 +43,18 @@ const (
 // VerifiedRequest may be submitted for settlement.
 type Observation struct {
 	maintenanceID maintenanceid.ID
-	leaseUUID     string
-	status        backend.CallbackStatus
-	failure       string
-	backendName   string
-	retained      bool
-	operationID   operation.OperationID
-	lifecycleID   lifecycle.ID
-	storageID     backendidentity.ID
-	selector      Selector
+	// maintenanceAdmittedAt is the echoed provider admission stamp of the
+	// completed command; zero when the command was unstamped.
+	maintenanceAdmittedAt time.Time
+	leaseUUID             string
+	status                backend.CallbackStatus
+	failure               string
+	backendName           string
+	retained              bool
+	operationID           operation.OperationID
+	lifecycleID           lifecycle.ID
+	storageID             backendidentity.ID
+	selector              Selector
 }
 
 var (
@@ -81,6 +85,7 @@ func (o Observation) OperationID() operation.OperationID { return o.operationID 
 func (o Observation) LifecycleID() lifecycle.ID          { return o.lifecycleID }
 func (o Observation) StorageID() backendidentity.ID      { return o.storageID }
 func (o Observation) MaintenanceID() maintenanceid.ID    { return o.maintenanceID }
+func (o Observation) MaintenanceAdmittedAt() time.Time   { return o.maintenanceAdmittedAt }
 func (o Observation) Selector() Selector                 { return o.selector }
 
 // Payload returns a detached compatibility DTO. It carries no settlement
@@ -92,6 +97,9 @@ func (o Observation) Payload() backend.CallbackPayload {
 	}
 	if o.maintenanceID.Valid() {
 		payload.MaintenanceID = o.maintenanceID.String()
+	}
+	if !o.maintenanceAdmittedAt.IsZero() {
+		payload.MaintenanceAdmittedAt = o.maintenanceAdmittedAt.Format(time.RFC3339Nano)
 	}
 	if o.storageID.Valid() {
 		payload.BackendStorageID = o.storageID.String()
@@ -194,6 +202,16 @@ func DecodeVerified(request hmacauth.VerifiedRequest) (Observation, error) {
 		}
 		observation.maintenanceID = id
 	}
+	if payload.MaintenanceAdmittedAt != "" {
+		if payload.MaintenanceID == "" {
+			return Observation{}, fmt.Errorf("%w: a maintenance admission stamp requires a maintenance ID", ErrInvalidPayload)
+		}
+		stamp, err := time.Parse(time.RFC3339Nano, payload.MaintenanceAdmittedAt)
+		if err != nil || stamp.Location() != time.UTC {
+			return Observation{}, fmt.Errorf("%w: maintenance admission stamp is not an RFC 3339 UTC time", ErrInvalidPayload)
+		}
+		observation.maintenanceAdmittedAt = stamp
+	}
 	return observation, nil
 }
 
@@ -278,6 +296,8 @@ func decodePayload(body []byte) (backend.CallbackPayload, error) {
 			target = &payload.Retained
 		case "maintenance_id":
 			target = &payload.MaintenanceID
+		case "maintenance_admitted_at":
+			target = &payload.MaintenanceAdmittedAt
 		default:
 			target = new(json.RawMessage)
 		}

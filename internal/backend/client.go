@@ -402,10 +402,15 @@ type CallbackPayload struct {
 	// MaintenanceID identifies an exact restart/update completion. It is
 	// authenticated in the body and matched to the provider's pending command;
 	// ordinary lifecycle observations omit it.
-	MaintenanceID string         `json:"maintenance_id,omitempty"`
-	LeaseUUID     string         `json:"lease_uuid"`
-	Status        CallbackStatus `json:"status"` // "success", "failed", or "deprovisioned"
-	Error         string         `json:"error,omitempty"`
+	MaintenanceID string `json:"maintenance_id,omitempty"`
+	// MaintenanceAdmittedAt echoes the provider's admission stamp of that
+	// command (RFC 3339, UTC), so a stale completion of a reused key cannot
+	// settle the provider's newer command. Omitted when the command was
+	// unstamped.
+	MaintenanceAdmittedAt string         `json:"maintenance_admitted_at,omitempty"`
+	LeaseUUID             string         `json:"lease_uuid"`
+	Status                CallbackStatus `json:"status"` // "success", "failed", or "deprovisioned"
+	Error                 string         `json:"error,omitempty"`
 	// BackendStorageID binds the observation to the backend storage lineage
 	// that produced it. Upgraded senders persist this value with new outbox
 	// entries and include it in the HMAC-covered body on every delivery.
@@ -792,6 +797,10 @@ type RestartRequest struct {
 	LeaseUUID     string           `json:"lease_uuid"`
 	MaintenanceID maintenanceid.ID `json:"maintenance_id"`
 	CallbackURL   string           `json:"callback_url"`
+	// AdmittedAt is the provider's per-lease admission stamp (RFC 3339, UTC).
+	// Every replay of the command sends the same value. Omitted by older
+	// providers.
+	AdmittedAt time.Time `json:"admitted_at,omitzero"`
 }
 
 // UpdateRequest contains the data needed to update a lease to a new manifest.
@@ -800,6 +809,8 @@ type UpdateRequest struct {
 	MaintenanceID maintenanceid.ID `json:"maintenance_id"`
 	CallbackURL   string           `json:"callback_url"`
 	Payload       []byte           `json:"payload"`
+	// AdmittedAt is the provider's per-lease admission stamp; see RestartRequest.
+	AdmittedAt time.Time `json:"admitted_at,omitzero"`
 }
 
 // RestoreRequest contains the data needed to restore a soft-deleted lease's
@@ -973,6 +984,14 @@ const CodeDemoteExceedsTier = "demote_exceeds_tier"
 // and a shared constant makes drift a compile error rather than a silent
 // misclassification.
 const CodeAlreadyProvisioned = "already_provisioned"
+
+// CodeMaintenanceExpired is the code a backend sends with a 409 when a
+// restart or update is older than the lease's retained maintenance history.
+// The command was not executed and never will be.
+const CodeMaintenanceExpired = "maintenance_expired"
+
+// ErrMaintenanceExpired is the backend refusal CodeMaintenanceExpired names.
+var ErrMaintenanceExpired = errors.New("maintenance command is older than the lease's retained history")
 
 // CodeOperationCompletionPending reports a valid earlier callback completion
 // occupying the lease FIFO. It is an availability-success diagnostic only:
@@ -1371,6 +1390,9 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 			//   - ErrAlreadyProvisioned: 409 from Provision (breaker-exempt conflict;
 			//     not ownership proof until authoritative inventory validates it)
 			//   - ErrInvalidState: 409 from Restart/Update (wrong lease state for operation)
+			//   - ErrMaintenanceExpired: coded 409 from Restart/Update (the command is
+			//     older than the lease's retained history; a business refusal, so a
+			//     burst of replays after a provider restore cannot open the breaker)
 			//   - ErrNotRetained: 422 from Restore (no retained data — benign client condition)
 			//   - ErrDemoteDataExceedsTier: 422 (code=demote_exceeds_tier) from Restore — data exceeds the tier cap, a permanent client error, not a backend failure
 			//   - ErrRestoreRefused: a well-formed Restore refusal whose code fred does not know.
@@ -1396,6 +1418,7 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 				isLifecyclePendingResponse(err) ||
 				errors.Is(err, ErrAlreadyProvisioned) ||
 				errors.Is(err, ErrInvalidState) ||
+				errors.Is(err, ErrMaintenanceExpired) ||
 				errors.Is(err, ErrNotRetained) ||
 				errors.Is(err, ErrDemoteDataExceedsTier) ||
 				errors.Is(err, ErrRestoreRefused) ||
@@ -1821,6 +1844,18 @@ type backendErrorEnvelope struct {
 	Error          string         `json:"error"`
 	Code           string         `json:"code,omitempty"`
 	ValidationCode ValidationCode `json:"validation_code,omitempty"`
+}
+
+// maintenanceExpiredEnvelope recognizes only one exact, bounded expiry
+// envelope. It records nothing about other bodies: a 409 that is not exactly
+// this refusal keeps its invalid-state meaning.
+func maintenanceExpiredEnvelope(body []byte) (string, bool) {
+	var envelope backendErrorEnvelope
+	if err := strictjson.DecodeObject(body, maxBackendErrorBytes, &envelope); err != nil {
+		return "", false
+	}
+	return envelope.Error, envelope.Error != "" && envelope.Code == CodeMaintenanceExpired &&
+		envelope.ValidationCode == ""
 }
 
 func (c *HTTPClient) decodeErrorEnvelope(body []byte, operation string) (backendErrorEnvelope, error) {
@@ -2463,6 +2498,13 @@ func executeHTTPMaintenanceCall[T RestartRequest | UpdateRequest](
 			observed = refusedMaintenanceCall(ErrNotProvisioned, MaintenanceRefusalNotProvisioned)
 			return nil, ErrNotProvisioned
 		case http.StatusConflict:
+			// Only the exact coded envelope selects expiry; any other 409 stays
+			// the documented bare invalid-state refusal.
+			if message, expired := maintenanceExpiredEnvelope(readErrorBodyBytes(resp)); expired {
+				callErr := detailOr(ErrMaintenanceExpired, message)
+				observed = refusedMaintenanceCall(callErr, MaintenanceRefusalExpired)
+				return nil, callErr
+			}
 			observed = refusedMaintenanceCall(ErrInvalidState, MaintenanceRefusalInvalidState)
 			return nil, ErrInvalidState
 		case http.StatusServiceUnavailable:

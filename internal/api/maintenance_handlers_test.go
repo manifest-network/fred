@@ -190,6 +190,7 @@ func TestMaintenanceHandlersTranslateServiceOutcomes(t *testing.T) {
 		"newcomer reservation": {maintenanceapp.OutcomeCapacityReserved, http.StatusTooManyRequests},
 		"internal":             {maintenanceapp.OutcomeInternalFailure, http.StatusInternalServerError},
 		"backend storage lost": {maintenanceapp.OutcomeBackendLost, http.StatusGone},
+		"expired":              {maintenanceapp.OutcomeExpired, http.StatusGone},
 	} {
 		t.Run(name, func(t *testing.T) {
 			service := maintenanceServiceFunc(func(

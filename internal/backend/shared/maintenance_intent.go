@@ -331,6 +331,9 @@ type maintenanceIntentEntry struct {
 	RequestCallbackURL   string    `json:"request_callback_url"`
 	RequestPayloadDigest string    `json:"request_payload_digest"`
 	CreatedAt            time.Time `json:"created_at"`
+	// AdmittedAt is the provider's admission stamp; zero for an unstamped or
+	// backend-minted command.
+	AdmittedAt time.Time `json:"admitted_at,omitzero"`
 }
 
 // ProbeMaintenanceIntent classifies an exact request without minting mutation
@@ -351,13 +354,55 @@ func (s *MaintenanceSettlement) ProbeMaintenanceIntent(
 	var disposition MaintenanceIntentAdmissionDisposition
 	err := s.callbacks.view(func(tx *bolt.Tx) error {
 		var classifyErr error
-		disposition, classifyErr = classifyMaintenanceReplayTx(
-			tx, request.LeaseUUID(), request.MaintenanceID(),
-			encodeMaintenanceDigest(request.digest),
-		)
+		disposition, classifyErr = classifyMaintenanceReplayTx(tx, maintenanceReplayRequest{
+			leaseUUID: request.LeaseUUID(), id: request.MaintenanceID(),
+			digest: encodeMaintenanceDigest(request.digest), kind: request.Kind(),
+			admittedAt: request.AdmittedAt(),
+		})
 		return classifyErr
 	})
-	return disposition, err
+	if err != nil || disposition != MaintenanceIntentAdmissionNone {
+		return disposition, err
+	}
+	return disposition, s.refuseMaintenanceIDReuse(request.LeaseUUID(), request.MaintenanceID())
+}
+
+// refuseMaintenanceIDReuse refuses a new command whose ID already names one of
+// the lease's release generations. A maintenance ID names at most one release
+// per lease, and the history keeps a generation long after its receipt has
+// left the window, so a forgotten key is refused here, before admission
+// raises the high-water mark or evicts anything, rather than failing later at
+// append.
+func (s *MaintenanceSettlement) refuseMaintenanceIDReuse(leaseUUID string, id MaintenanceID) error {
+	reused, err := s.maintenanceIDNamesRelease(leaseUUID, id)
+	if err != nil || !reused {
+		return err
+	}
+	return fmt.Errorf(
+		"%w for lease %q: maintenance ID already names a release of this lease; send a new key",
+		ErrMaintenanceIntentConflict, leaseUUID,
+	)
+}
+
+func (s *MaintenanceSettlement) maintenanceIDNamesRelease(leaseUUID string, id MaintenanceID) (bool, error) {
+	var reused bool
+	err := s.releases.view(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(releasesBucketName)
+		if bucket == nil {
+			return errors.New("releases bucket missing")
+		}
+		if bucket.Get([]byte(leaseUUID)) == nil {
+			// No history names no release; admission's own checks decide the rest.
+			return nil
+		}
+		releases, err := readReleaseHistoryTx(tx, leaseUUID)
+		if err != nil {
+			return err
+		}
+		reused = maintenanceReleaseIndex(releases, id) >= 0
+		return nil
+	})
+	return reused, err
 }
 
 // BeginMaintenanceIntent publishes the durable barrier before a target release
@@ -447,6 +492,7 @@ func (s *MaintenanceSettlement) BeginMaintenanceIntent(
 		RequestCallbackURL:   candidate.request.CallbackURL(),
 		RequestPayloadDigest: encodeMaintenanceDigest(candidate.request.payloadDigest),
 		CreatedAt:            time.Now(),
+		AdmittedAt:           candidate.request.AdmittedAt(),
 	}
 	data, err := marshalMaintenanceIntent(entry)
 	if err != nil {
@@ -461,11 +507,18 @@ func (s *MaintenanceSettlement) BeginMaintenanceIntent(
 	if err != nil {
 		return MaintenanceIntentAdmission{}, err
 	}
+	// Read under the lease lock, before the callback write, like the release
+	// view above; it decides only a genuinely new admission below.
+	idNamesRelease, err := s.maintenanceIDNamesRelease(entry.LeaseUUID, entry.MaintenanceID)
+	if err != nil {
+		return MaintenanceIntentAdmission{}, err
+	}
 	var admission MaintenanceIntentAdmission
 	err = s.callbacks.update(func(tx *bolt.Tx) error {
-		disposition, err := classifyMaintenanceReplayTx(
-			tx, entry.LeaseUUID, entry.MaintenanceID, entry.RequestDigest,
-		)
+		disposition, err := classifyMaintenanceReplayTx(tx, maintenanceReplayRequest{
+			leaseUUID: entry.LeaseUUID, id: entry.MaintenanceID, digest: entry.RequestDigest,
+			kind: entry.Kind, admittedAt: entry.AdmittedAt,
+		})
 		if err != nil {
 			return err
 		}
@@ -492,6 +545,12 @@ func (s *MaintenanceSettlement) BeginMaintenanceIntent(
 				intent: intent, disposition: MaintenanceIntentAdmissionExisting,
 			}
 			return nil
+		}
+		if idNamesRelease {
+			return fmt.Errorf(
+				"%w for lease %q: maintenance ID already names a release of this lease; send a new key",
+				ErrMaintenanceIntentConflict, entry.LeaseUUID,
+			)
 		}
 		if err := rejectPendingMaintenanceCompletionTx(tx, entry.LeaseUUID); err != nil {
 			return err
@@ -1125,16 +1184,17 @@ func callbackEntryForMaintenanceIntent(
 ) CallbackEntry {
 	authority, _ := releaseRuntimeIdentityFor(intent.TargetRelease)
 	return CallbackEntry{
-		MaintenanceID:    intent.MaintenanceID,
-		DeliveryID:       deliveryID,
-		LeaseUUID:        intent.LeaseUUID,
-		CallbackURL:      authority.lifecycleCallbackURL,
-		DeliveryKind:     CallbackDeliveryKindMaintenance,
-		Status:           status,
-		Backend:          intent.Backend,
-		BackendStorageID: intent.BackendStorageID,
-		Error:            errMsg,
-		CreatedAt:        time.Now(),
+		MaintenanceID:         intent.MaintenanceID,
+		MaintenanceAdmittedAt: intent.AdmittedAt,
+		DeliveryID:            deliveryID,
+		LeaseUUID:             intent.LeaseUUID,
+		CallbackURL:           authority.lifecycleCallbackURL,
+		DeliveryKind:          CallbackDeliveryKindMaintenance,
+		Status:                status,
+		Backend:               intent.Backend,
+		BackendStorageID:      intent.BackendStorageID,
+		Error:                 errMsg,
+		CreatedAt:             time.Now(),
 	}
 }
 
@@ -1213,6 +1273,9 @@ func validateMaintenanceIntentEntry(entry maintenanceIntentEntry, leaseUUID stri
 	}
 	if err := validateStoredCallbackCreatedAt(entry.CreatedAt); err != nil {
 		return err
+	}
+	if err := validateMaintenanceStampForKind(entry.Kind, entry.AdmittedAt); err != nil {
+		return fmt.Errorf("maintenance intent: %w", err)
 	}
 	targetDigest, err := parseMaintenanceDigest(entry.TargetReleaseDigest, true)
 	if err != nil {

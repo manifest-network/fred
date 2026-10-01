@@ -302,13 +302,14 @@ func invokeMaintenance(
 	case MaintenanceCommandRestart:
 		request := backend.RestartRequest{
 			LeaseUUID: command.LeaseUUID(), MaintenanceID: command.ID(),
-			CallbackURL: command.CallbackURL(),
+			CallbackURL: command.CallbackURL(), AdmittedAt: command.AdmittedAt(),
 		}
 		outcome = backend.InvokeRestart(ctx, client, request)
 	case MaintenanceCommandUpdate:
 		request := backend.UpdateRequest{
 			LeaseUUID: command.LeaseUUID(), MaintenanceID: command.ID(),
 			CallbackURL: command.CallbackURL(), Payload: command.Payload(),
+			AdmittedAt: command.AdmittedAt(),
 		}
 		outcome = backend.InvokeUpdate(ctx, client, request)
 	default:

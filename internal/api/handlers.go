@@ -1419,6 +1419,12 @@ func (h *Handlers) writeMaintenanceResult(
 		writeError(w, errMsgForbidden, http.StatusForbidden)
 	case maintenanceapp.OutcomeBackendLost:
 		writeBackendStorageLost(w)
+	case maintenanceapp.OutcomeExpired:
+		writeJSON(w, ErrorResponse{
+			Error:  "this command is older than the lease's retained maintenance history and was not run; send a new command",
+			Code:   http.StatusGone,
+			Reason: "maintenance_expired",
+		}, http.StatusGone)
 	case maintenanceapp.OutcomeAlreadyInProgress:
 		writeError(w, "lease is already undergoing a lifecycle operation", http.StatusConflict)
 	case maintenanceapp.OutcomeCommandConflict:

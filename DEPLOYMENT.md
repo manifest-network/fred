@@ -975,6 +975,16 @@ acceptance records do not prove successful deployment, and callbacks without a
 maintenance ID cannot promote pending payloads. Previously overwritten payloads
 are not automatically reconstructed by this change.
 
+Restart and update receipts are a rolling window of 1,024 per lease, ordered by
+the provider's admission stamp. If backends and `providerd` cannot be replaced
+together, replace the docker-backends first: an older backend ignores the stamp
+and keeps no window, so a tenant reusing a key the provider has forgotten could
+wait on a completion the backend never resends. Neither binary can go back
+once it has written the new state: an older docker-backend refuses a journal
+with any lineage row (written by the first stamped command, eviction, or
+cleanup confirmation), and an older `providerd` refuses a placement database
+that recorded an expired command.
+
 Existing shared `/data/docker` deployments keep their storage layout and
 `overlay2` configuration. Image admission requires no new filesystem, partition,
 quota retagging or Docker data migration. For Docker's containerd image store,

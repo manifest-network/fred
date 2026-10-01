@@ -877,6 +877,11 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 			s.errorResponse(w, http.StatusNotFound, "not provisioned")
 			return
 		}
+		if errors.Is(err, backend.ErrMaintenanceExpired) {
+			s.errorResponseWithCode(w, http.StatusConflict,
+				"restart is older than the lease's retained maintenance history", backend.CodeMaintenanceExpired)
+			return
+		}
 		if errors.Is(err, backend.ErrInvalidState) {
 			s.errorResponse(w, http.StatusConflict, "invalid state for restart")
 			return
@@ -1078,6 +1083,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, backend.ErrNotProvisioned) {
 			s.errorResponse(w, http.StatusNotFound, "not provisioned")
+			return
+		}
+		if errors.Is(err, backend.ErrMaintenanceExpired) {
+			s.errorResponseWithCode(w, http.StatusConflict,
+				"update is older than the lease's retained maintenance history", backend.CodeMaintenanceExpired)
 			return
 		}
 		if errors.Is(err, backend.ErrInvalidState) {

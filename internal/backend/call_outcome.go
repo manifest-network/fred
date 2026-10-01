@@ -239,6 +239,9 @@ const (
 	MaintenanceRefusalInvalidState
 	MaintenanceRefusalValidation
 	MaintenanceRefusalCapacity
+	// MaintenanceRefusalExpired: the command is older than the lease's
+	// retained maintenance history and was refused instead of executed.
+	MaintenanceRefusalExpired
 )
 
 // MaintenanceCallOutcome is a zero-invalid causal result for restart/update.
@@ -254,7 +257,7 @@ func (outcome MaintenanceCallOutcome) Valid() bool {
 	}
 	if outcome.outcome.refused() {
 		return outcome.refusal >= MaintenanceRefusalNotProvisioned &&
-			outcome.refusal <= MaintenanceRefusalCapacity
+			outcome.refusal <= MaintenanceRefusalExpired
 	}
 	return outcome.refusal == MaintenanceRefusalNone
 }
