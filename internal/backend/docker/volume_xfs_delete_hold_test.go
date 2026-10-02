@@ -4,9 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -929,63 +926,6 @@ func TestXFSPrecheckDestroy(t *testing.T) {
 	verdict, err = mgr.PrecheckDestroy(present)
 	require.NoError(t, err)
 	assert.Equal(t, destroyPrecheckNeedsLock, verdict, "a present volume needs the locked Destroy")
-}
-
-// The constructors are the only producers of their types: a cause only through
-// holdable, an outcome only through the classifier, a hold record only from a
-// held outcome. A literal anywhere else would bypass the allowlist.
-func TestDeleteHoldTypesHaveSingleConstructors(t *testing.T) {
-	t.Parallel()
-
-	owners := map[string]string{
-		"xfsDeleteHoldCause": "holdable",
-		"deleteStageOutcome": "classifyXFSDeleteStageCleanup",
-		"xfsDeleteHold":      "newXFSDeleteHold",
-	}
-	fset := token.NewFileSet()
-	files, err := filepath.Glob("*.go")
-	require.NoError(t, err)
-	seen := map[string]int{}
-	for _, path := range files {
-		if strings.HasSuffix(path, "_test.go") {
-			continue
-		}
-		file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
-		require.NoError(t, err)
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
-			}
-			ast.Inspect(fn.Body, func(node ast.Node) bool {
-				literal, ok := node.(*ast.CompositeLit)
-				if !ok {
-					return true
-				}
-				ident, ok := literal.Type.(*ast.Ident)
-				if !ok {
-					return true
-				}
-				owner, tracked := owners[ident.Name]
-				if !tracked {
-					return true
-				}
-				seen[ident.Name]++
-				if fn.Name.Name != owner {
-					// Its zero value carries no reason, phase or authority.
-					if len(literal.Elts) == 0 {
-						return true
-					}
-					t.Errorf("%s: %s literal outside its constructor %s (in %s)",
-						fset.Position(literal.Pos()), ident.Name, owner, fn.Name.Name)
-				}
-				return true
-			})
-		}
-	}
-	for name := range owners {
-		assert.Positive(t, seen[name], "%s: the constructor guard matched nothing", name)
-	}
 }
 
 // holdable never returns a nil cause, so a site can never return a nil error

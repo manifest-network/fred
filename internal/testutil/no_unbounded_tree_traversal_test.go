@@ -43,9 +43,24 @@ var unboundedTreeFuncs = map[string][]string{
 // (*os.Root).RemoveAll, and any method value taken from either.
 const unboundedRemoveMethod = "RemoveAll"
 
+// fstreeImport is the bounded tree package. Its RemoveBeneath is itself an
+// unrestricted recursive delete under any directory it is handed, so it is
+// used only at its reviewed wiring sites (the forbidigo rule tagged
+// [tree-removal-wiring] mirrors this).
+const fstreeImport = "github.com/manifest-network/fred/internal/fstree"
+
+// treeRemovalWiring are the only production files that may name
+// fstree.RemoveBeneath: a condemned XFS volume's removal, and the live
+// writable-path wipe.
+var treeRemovalWiring = map[string]bool{
+	"internal/backend/docker/volume_xfs.go":             true,
+	"internal/backend/docker/storage_mutation_guard.go": true,
+}
+
 func TestNoUnboundedTreeTraversalInProductionFiles(t *testing.T) {
 	root := repoRoot(t)
-	var findings []string
+	var findings, sinks []string
+	wired := map[string]bool{}
 	for _, dir := range []string{"internal", "cmd"} {
 		walkGoFiles(t, filepath.Join(root, dir), root, func(rel string, file *ast.File, fset *token.FileSet) {
 			if inTestSupportPackage(rel) {
@@ -54,10 +69,102 @@ func TestNoUnboundedTreeTraversalInProductionFiles(t *testing.T) {
 			for _, finding := range unboundedTreeTraversals(file) {
 				findings = append(findings, rel+":"+strconv.Itoa(fset.Position(finding.pos).Line)+": "+finding.what)
 			}
+			for _, use := range treeRemovalSinkUses(file) {
+				if treeRemovalWiring[filepath.ToSlash(rel)] {
+					wired[filepath.ToSlash(rel)] = true
+					continue
+				}
+				sinks = append(sinks, rel+":"+strconv.Itoa(fset.Position(use.pos).Line)+": "+use.what)
+			}
 		})
 	}
 	for _, finding := range findings {
 		t.Errorf("%s: use internal/fstree (RemoveBeneath or WalkBeneath), which bounds descriptors, depth and work", finding)
+	}
+	for _, sink := range sinks {
+		t.Errorf("%s: fstree.RemoveBeneath is used only at its reviewed wiring sites", sink)
+	}
+	for file := range treeRemovalWiring {
+		if !wired[file] {
+			t.Errorf("%s: the wiring site no longer uses fstree.RemoveBeneath; the guard matched nothing there", file)
+		}
+	}
+}
+
+// treeRemovalSinkUses reports every use, call or not, of fstree.RemoveBeneath
+// in file, resolving the file's own import name for fstree.
+func treeRemovalSinkUses(file *ast.File) []treeTraversalFinding {
+	var local string
+	for _, spec := range file.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil || path != fstreeImport {
+			continue
+		}
+		local = filepath.Base(path)
+		if spec.Name != nil {
+			local = spec.Name.Name
+		}
+	}
+	if local == "" || local == "_" {
+		return nil
+	}
+	var uses []treeTraversalFinding
+	if local == "." {
+		return []treeTraversalFinding{{pos: file.Package, what: "dot import of " + fstreeImport}}
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		selector, ok := node.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "RemoveBeneath" {
+			return true
+		}
+		if pkg, ok := selector.X.(*ast.Ident); ok && pkg.Name == local {
+			uses = append(uses, treeTraversalFinding{pos: selector.Pos(), what: pkg.Name + ".RemoveBeneath"})
+		}
+		return true
+	})
+	return uses
+}
+
+func TestTreeRemovalSinkRules(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		src  string
+		want []string
+	}{
+		{
+			name: "call",
+			src:  `package p; import "github.com/manifest-network/fred/internal/fstree"; func f() { fstree.RemoveBeneath(nil, nil, fstree.Name{}, fstree.RemoveOptions{}) }`,
+			want: []string{"fstree.RemoveBeneath"},
+		},
+		{
+			name: "aliased import and method value",
+			src:  `package p; import ft "github.com/manifest-network/fred/internal/fstree"; var remove = ft.RemoveBeneath`,
+			want: []string{"ft.RemoveBeneath"},
+		},
+		{
+			name: "dot import",
+			src:  `package p; import . "github.com/manifest-network/fred/internal/fstree"; var _ = ParseName`,
+			want: []string{"dot import of " + fstreeImport},
+		},
+		{
+			name: "other fstree names and other packages are not flagged",
+			src:  `package p; import ("github.com/manifest-network/fred/internal/fstree"; other "example.com/fstree"); func f() { _, _ = fstree.ParseName("x"); other.RemoveBeneath() }`,
+			want: nil,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			file, err := parser.ParseFile(token.NewFileSet(), "p.go", test.src, parser.ParseComments)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			var got []string
+			for _, use := range treeRemovalSinkUses(file) {
+				got = append(got, use.what)
+			}
+			if !slices.Equal(got, test.want) {
+				t.Fatalf("uses = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
