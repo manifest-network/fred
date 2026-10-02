@@ -21,6 +21,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/docker/tenantseccomp"
+	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 func tenantSeccompTestProfiles() imageexec.TenantSeccompSource {
@@ -94,7 +95,85 @@ func TestTenantSeccompSinkLabelsAreClosed(t *testing.T) {
 	}
 	require.Empty(t, tenantSeccompSinkInvalid.label())
 	require.Empty(t, tenantSeccompSink(255).label())
-	require.Len(t, seen, 6)
+	require.Len(t, seen, 7)
+}
+
+// Every intent that recreates tenant containers has its own counted sink,
+// including the provider-initiated redeploy that applies a custom domain.
+func TestTenantSeccompSinksCoverEveryRecreatingIntent(t *testing.T) {
+	sinks := map[tenantSeccompSink]bool{}
+	for kind, want := range map[shared.MaintenanceIntentKind]string{
+		shared.MaintenanceIntentRestart:      "restart",
+		shared.MaintenanceIntentUpdate:       "update",
+		shared.MaintenanceIntentCustomDomain: "custom_domain",
+	} {
+		sink := tenantSeccompMaintenanceSink(kind)
+		require.Equal(t, want, sink.label(), string(kind))
+		sinks[sink] = true
+	}
+	for kind, want := range map[shared.OperationIntentKind]string{
+		shared.OperationIntentProvision: "provision",
+		shared.OperationIntentRestore:   "restore",
+	} {
+		sink := tenantSeccompOperationSink(kind)
+		require.Equal(t, want, sink.label(), string(kind))
+		sinks[sink] = true
+	}
+	require.Len(t, sinks, 5)
+	require.Equal(t, tenantSeccompSinkInvalid, tenantSeccompMaintenanceSink("unknown"))
+	require.Equal(t, tenantSeccompSinkInvalid, tenantSeccompOperationSink("unknown"))
+	require.Equal(t, tenantSeccompSinkInvalid, (*storageMutations)(nil).tenantSeccompSink())
+
+	counter := tenantSeccompProfileRefusalsTotal.WithLabelValues("custom_domain")
+	before := testutil.ToFloat64(counter)
+	refused := refuseWithoutTenantSeccomp(tenantSeccompMaintenanceSink(shared.MaintenanceIntentCustomDomain),
+		fmt.Errorf("%w: test", tenantseccomp.ErrRefused))
+	var authored *physicalOperationError
+	require.ErrorAs(t, refused, &authored)
+	require.Equal(t, backend.ReasonInternal, authored.reason)
+	require.Equal(t, before+1, testutil.ToFloat64(counter), "a refused custom-domain redeploy is counted")
+}
+
+// A daemon that reports no seccomp support refuses a custom profile, so the
+// readiness gauge reports 0 until it reports seccomp again; creation is still
+// left to the daemon.
+func TestDaemonWithoutSeccompReportsTheProfileUnready(t *testing.T) {
+	var securityOptions atomic.Value
+	securityOptions.Store([]string{"name=apparmor", "name=cgroupns"})
+	daemon := newTenantSeccompTestDaemon(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if !strings.HasSuffix(r.URL.Path, "/info") {
+			return false
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ID": "daemon", "SecurityOptions": securityOptions.Load()})
+		return true
+	})
+	docker, err := newDockerClient(t.Context(), daemon, "seccomp-daemon-test", tenantseccomp.Process())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = docker.Close() })
+	t.Cleanup(func() {
+		_, _ = tenantSeccompTestProfiles().TenantSeccompProfile() // restore the gauge for later tests
+	})
+
+	require.NoError(t, docker.requireTenantSeccompProfile())
+	require.Equal(t, 1.0, testutil.ToFloat64(tenantSeccompProfileReady))
+	_, err = docker.DaemonInfo(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, 0.0, testutil.ToFloat64(tenantSeccompProfileReady), "a report without seccomp drops readiness at once")
+	require.NoError(t, docker.requireTenantSeccompProfile(), "the daemon, not fred, refuses the launch")
+	require.Equal(t, 0.0, testutil.ToFloat64(tenantSeccompProfileReady), "a profile request keeps it at 0")
+
+	securityOptions.Store([]string{"name=apparmor", "name=seccomp,profile=builtin"})
+	_, err = docker.DaemonInfo(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, docker.requireTenantSeccompProfile())
+	require.Equal(t, 1.0, testutil.ToFloat64(tenantSeccompProfileReady))
+}
+
+func TestDaemonReportsSeccomp(t *testing.T) {
+	require.True(t, daemonReportsSeccomp([]string{"name=apparmor", "name=seccomp,profile=builtin"}))
+	require.True(t, daemonReportsSeccomp([]string{"name=seccomp,profile=default"}))
+	require.False(t, daemonReportsSeccomp([]string{"name=apparmor", "name=cgroupns"}))
+	require.False(t, daemonReportsSeccomp(nil))
 }
 
 func TestRefuseWithoutTenantSeccompAuthorsOneProviderFault(t *testing.T) {
@@ -204,6 +283,40 @@ func must(t *testing.T, open func() (io.ReadCloser, error)) io.ReadCloser {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = body.Close() })
 	return body
+}
+
+// The retained Compose engine only lists and tears down. Its client refuses
+// every container create before dispatch, with or without the profile, and
+// passes every other request.
+func TestComposeReadEngineRefusesEveryCreate(t *testing.T) {
+	var dispatched []string
+	client := newComposeReadHTTPClient(dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		dispatched = append(dispatched, req.Method+" "+req.URL.Path)
+		return imageSecurityResponse(http.StatusOK, `[]`), nil
+	}))
+	for name, securityOpt := range map[string][]string{
+		"with the profile":    tenantSeccompSecurityOpt(t, "no-new-privileges:true"),
+		"without the profile": {"no-new-privileges:true"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := client.Do(tenantSeccompCreateRequest(t, t.Context(), securityOpt))
+			require.ErrorIs(t, err, errComposeReadEngineCreate)
+		})
+	}
+	require.Empty(t, dispatched, "no create reaches the daemon")
+
+	for _, request := range []struct{ method, path string }{
+		{http.MethodGet, "/v1.51/containers/json"},
+		{http.MethodPost, "/v1.51/containers/abc/stop"},
+		{http.MethodDelete, "/v1.51/containers/abc"},
+	} {
+		req, err := http.NewRequestWithContext(t.Context(), request.method, "http://docker.invalid"+request.path, nil)
+		require.NoError(t, err)
+		response, err := client.Do(req)
+		require.NoError(t, err)
+		require.NoError(t, response.Body.Close())
+	}
+	require.Equal(t, []string{"GET /v1.51/containers/json", "POST /v1.51/containers/abc/stop", "DELETE /v1.51/containers/abc"}, dispatched)
 }
 
 // A Compose create carrying the profile passes; one without it settles as a

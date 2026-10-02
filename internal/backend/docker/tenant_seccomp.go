@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -31,13 +34,15 @@ const (
 	tenantSeccompSinkRestore
 	tenantSeccompSinkRestart
 	tenantSeccompSinkUpdate
+	tenantSeccompSinkCustomDomain
 	tenantSeccompSinkCompensation
 	tenantSeccompSinkInspection
 )
 
 var tenantSeccompSinks = [...]tenantSeccompSink{
 	tenantSeccompSinkProvision, tenantSeccompSinkRestore, tenantSeccompSinkRestart,
-	tenantSeccompSinkUpdate, tenantSeccompSinkCompensation, tenantSeccompSinkInspection,
+	tenantSeccompSinkUpdate, tenantSeccompSinkCustomDomain, tenantSeccompSinkCompensation,
+	tenantSeccompSinkInspection,
 }
 
 func (sink tenantSeccompSink) label() string {
@@ -50,6 +55,8 @@ func (sink tenantSeccompSink) label() string {
 		return "restart"
 	case tenantSeccompSinkUpdate:
 		return "update"
+	case tenantSeccompSinkCustomDomain:
+		return "custom_domain"
 	case tenantSeccompSinkCompensation:
 		return "compensation"
 	case tenantSeccompSinkInspection:
@@ -67,21 +74,39 @@ func (m *storageMutations) tenantSeccompSink() tenantSeccompSink {
 	case m.compensationSubject.Valid():
 		return tenantSeccompSinkCompensation
 	case m.maintenanceSubject.Valid():
-		switch m.maintenanceSubject.Intent().Kind() {
-		case shared.MaintenanceIntentRestart:
-			return tenantSeccompSinkRestart
-		case shared.MaintenanceIntentUpdate:
-			return tenantSeccompSinkUpdate
-		}
+		return tenantSeccompMaintenanceSink(m.maintenanceSubject.Intent().Kind())
 	case m.operationSubject.Valid():
-		switch m.operationSubject.Intent().Kind() {
-		case shared.OperationIntentProvision:
-			return tenantSeccompSinkProvision
-		case shared.OperationIntentRestore:
-			return tenantSeccompSinkRestore
-		}
+		return tenantSeccompOperationSink(m.operationSubject.Intent().Kind())
 	}
 	return tenantSeccompSinkInvalid
+}
+
+// tenantSeccompMaintenanceSink names the sink of each maintenance intent that
+// recreates containers: a restart, an update, and the redeploy that applies a
+// custom domain.
+func tenantSeccompMaintenanceSink(kind shared.MaintenanceIntentKind) tenantSeccompSink {
+	switch kind {
+	case shared.MaintenanceIntentRestart:
+		return tenantSeccompSinkRestart
+	case shared.MaintenanceIntentUpdate:
+		return tenantSeccompSinkUpdate
+	case shared.MaintenanceIntentCustomDomain:
+		return tenantSeccompSinkCustomDomain
+	default:
+		return tenantSeccompSinkInvalid
+	}
+}
+
+// tenantSeccompOperationSink names the sink of each operation intent.
+func tenantSeccompOperationSink(kind shared.OperationIntentKind) tenantSeccompSink {
+	switch kind {
+	case shared.OperationIntentProvision:
+		return tenantSeccompSinkProvision
+	case shared.OperationIntentRestore:
+		return tenantSeccompSinkRestore
+	default:
+		return tenantSeccompSinkInvalid
+	}
 }
 
 // msgTenantSeccompUnavailable is the tenant-facing message of a launch refused
@@ -118,9 +143,11 @@ func (m *storageMutations) requireTenantSeccomp() error {
 }
 
 // observedTenantSeccomp reports every profile request, from any sink, on
-// fred_docker_backend_tenant_seccomp_profile_ready.
+// fred_docker_backend_tenant_seccomp_profile_ready: 1 when the profile is
+// usable and the Docker daemon did not last report itself without seccomp.
 type observedTenantSeccomp struct {
 	source imageexec.TenantSeccompSource
+	daemon *daemonSeccompSupport
 }
 
 func (o observedTenantSeccomp) TenantSeccompProfile() (tenantseccomp.Profile, error) {
@@ -133,8 +160,50 @@ func (o observedTenantSeccomp) TenantSeccompProfile() (tenantseccomp.Profile, er
 		tenantSeccompProfileReady.Set(0)
 		return tenantseccomp.Profile{}, err
 	}
-	tenantSeccompProfileReady.Set(1)
+	if o.daemon.reportedMissing() {
+		tenantSeccompProfileReady.Set(0)
+	} else {
+		tenantSeccompProfileReady.Set(1)
+	}
 	return profile, nil
+}
+
+// daemonSeccompSupport is what the Docker daemon last reported about seccomp.
+// A daemon without seccomp refuses to run a container under a custom profile,
+// and every tenant container runs under fred's, so tenant launches fail there.
+// fred still sends them (the daemon is the authority), but the readiness gauge
+// reports 0. The zero value has seen no report.
+type daemonSeccompSupport struct {
+	missing atomic.Bool
+}
+
+// observe records one daemon report of its security options. A report
+// without seccomp drops the readiness gauge at once; a later report with it
+// lets the next profile request raise the gauge again.
+func (s *daemonSeccompSupport) observe(securityOptions []string) {
+	if s == nil {
+		return
+	}
+	missing := !daemonReportsSeccomp(securityOptions)
+	s.missing.Store(missing)
+	if missing {
+		tenantSeccompProfileReady.Set(0)
+	}
+}
+
+func (s *daemonSeccompSupport) reportedMissing() bool {
+	return s != nil && s.missing.Load()
+}
+
+// daemonReportsSeccomp reports whether docker info's security options name
+// seccomp ("name=seccomp,profile=...").
+func daemonReportsSeccomp(securityOptions []string) bool {
+	for _, option := range securityOptions {
+		if strings.HasPrefix(option, "name=seccomp") {
+			return true
+		}
+	}
+	return false
 }
 
 // maxLaunchCreateBody bounds the pre-dispatch read of one container create
@@ -149,7 +218,9 @@ func daemonContainerCreateRequest(req *http.Request) bool {
 // or not, from either SDK. It reads a copy of the body through GetBody and
 // leaves the request untouched, then requires that the body asks for exactly
 // the current tenant profile. A refusal happens before the request is admitted
-// to any launch scope, so it settles with no daemon effect.
+// to any launch scope, so it settles with no daemon effect. The one other
+// client to the daemon, the Compose engine that only lists and tears down,
+// refuses every create outright (daemonNoCreateTransport).
 func refuseUnconfinedCreate(profiles imageexec.TenantSeccompSource, req *http.Request) error {
 	if !daemonContainerCreateRequest(req) {
 		return nil
@@ -256,9 +327,10 @@ var tenantSeccompCensusOutcomes = []string{tenantSeccompCensusOK, tenantSeccompC
 func (b *Backend) tenantSeccompCensusLoop() {
 	ticker := time.NewTicker(tenantSeccompCensusInterval)
 	defer ticker.Stop()
+	var reported tenantSeccompCensusReport
 	for b.stopCtx.Err() == nil {
 		util.RunCleanupIteration(func() error {
-			b.runTenantSeccompCensus()
+			b.runTenantSeccompCensus(&reported)
 			return nil
 		}, "docker_seccomp_census", func(any) {
 			tenantSeccompCensusTotal.WithLabelValues(tenantSeccompCensusError).Inc()
@@ -274,7 +346,7 @@ func (b *Backend) tenantSeccompCensusLoop() {
 
 // runTenantSeccompCensus publishes one completed census. A failed pass is
 // counted and leaves the gauge at the last completed value. It only reads.
-func (b *Backend) runTenantSeccompCensus() {
+func (b *Backend) runTenantSeccompCensus(reported *tenantSeccompCensusReport) {
 	ctx, cancel := context.WithTimeout(b.stopCtx, tenantSeccompCensusTimeout)
 	defer cancel()
 	census, err := b.docker.TenantSeccompCensus(ctx)
@@ -288,8 +360,32 @@ func (b *Backend) runTenantSeccompCensus() {
 	}
 	tenantContainersWithoutCurrentSeccomp.Set(float64(census.withoutCurrent))
 	tenantSeccompCensusTotal.WithLabelValues(tenantSeccompCensusOK).Inc()
-	if census.withoutCurrent > 0 {
-		b.logger.Warn("tenant containers run without the current seccomp profile; restarting or updating their leases recreates them with it",
-			"containers", census.withoutCurrent)
+	reported.log(b.logger, census.withoutCurrent)
+}
+
+// tenantSeccompCensusReport is what the census last logged. Containers
+// created before an upgrade keep their profile until their lease is
+// restarted or updated, so a nonzero count can hold for a long time: only a
+// change warns, and a count that holds is logged at Info. The gauge carries
+// the value either way.
+type tenantSeccompCensusReport struct {
+	logged bool
+	count  int
+}
+
+// log reports one completed count.
+func (r *tenantSeccompCensusReport) log(logger *slog.Logger, withoutCurrent int) {
+	changed := !r.logged || r.count != withoutCurrent
+	previous := r.count
+	r.logged, r.count = true, withoutCurrent
+	switch {
+	case withoutCurrent > 0 && changed:
+		logger.Warn("tenant containers run without the current seccomp profile; restarting or updating their leases recreates them with it",
+			"containers", withoutCurrent, "previous", previous)
+	case withoutCurrent > 0:
+		logger.Info("tenant containers still run without the current seccomp profile",
+			"containers", withoutCurrent)
+	case changed && previous > 0:
+		logger.Info("every tenant container runs under the current seccomp profile", "previous", previous)
 	}
 }

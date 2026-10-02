@@ -145,6 +145,9 @@ type DockerClient struct {
 	// tenantSeccomp is the profile source its creators, its wire check and
 	// its census share.
 	tenantSeccomp imageexec.TenantSeccompSource
+	// daemonSeccomp records whether the daemon last reported seccomp
+	// support; tenantSeccomp reports readiness through it.
+	daemonSeccomp *daemonSeccompSupport
 }
 
 // NewDockerClient connects to Docker and requires the image execution API
@@ -161,7 +164,8 @@ func NewDockerClient(ctx context.Context, host string, backendName string) (*Doc
 // newDockerClient binds image admission, every creation sink and the
 // pre-dispatch wire check to one tenant profile source.
 func newDockerClient(ctx context.Context, host string, backendName string, source imageexec.TenantSeccompSource) (*DockerClient, error) {
-	profiles := observedTenantSeccomp{source: source}
+	daemonSeccomp := new(daemonSeccompSupport)
+	profiles := observedTenantSeccomp{source: source, daemon: daemonSeccomp}
 	opts := []client.Opt{
 		client.WithAPIVersionNegotiation(),
 	}
@@ -199,7 +203,7 @@ func newDockerClient(ctx context.Context, host string, backendName string, sourc
 	}
 	return &DockerClient{
 		client: newDockerSDKView(cli), images: images, creator: creator,
-		launchObserver: observer, backendName: backendName, tenantSeccomp: profiles,
+		launchObserver: observer, backendName: backendName, tenantSeccomp: profiles, daemonSeccomp: daemonSeccomp,
 		newImageLoader: func(root string, maxBytes int64) (*imagefetch.Loader, error) {
 			return imagefetch.NewLoader(cli, root, maxBytes)
 		},
@@ -227,12 +231,15 @@ func (d *DockerClient) Ping(ctx context.Context) error {
 	return err
 }
 
-// DaemonInfo returns Docker daemon capabilities for hardening validation.
+// DaemonInfo returns Docker daemon capabilities for hardening validation. It
+// also records whether the daemon reports seccomp support, which the tenant
+// profile's readiness gauge reflects.
 func (d *DockerClient) DaemonInfo(ctx context.Context) (DaemonSecurityInfo, error) {
 	info, err := d.client.Info(ctx)
 	if err != nil {
 		return DaemonSecurityInfo{}, fmt.Errorf("failed to get daemon info: %w", err)
 	}
+	d.daemonSeccomp.observe(info.SecurityOptions)
 
 	var backingFS string
 	for _, pair := range info.DriverStatus {

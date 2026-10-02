@@ -2967,16 +2967,11 @@ func (b *Backend) checkDaemonCapabilities(ctx context.Context) {
 		return
 	}
 
-	// Check seccomp availability
-	hasSeccomp := false
-	for _, opt := range info.SecurityOptions {
-		if strings.HasPrefix(opt, "name=seccomp") {
-			hasSeccomp = true
-			break
-		}
-	}
-	if !hasSeccomp {
-		b.logger.Warn("Docker daemon has seccomp disabled; containers will not have syscall filtering")
+	// Every tenant container runs under fred's seccomp profile, and a daemon
+	// without seccomp refuses a custom profile. This stays advisory: the daemon
+	// is the authority, and the readiness gauge already reports 0.
+	if !daemonReportsSeccomp(info.SecurityOptions) {
+		b.logger.Error("Docker daemon reports no seccomp support; it will refuse to run tenant containers, which all run under fred's seccomp profile")
 	}
 
 	// Check IPv4 forwarding — required for container networking (outbound
