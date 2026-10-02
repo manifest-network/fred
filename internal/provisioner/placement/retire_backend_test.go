@@ -13,6 +13,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/maintenanceid"
+	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 )
 
 func TestRetirePlacementDecidesByDurableOwner(t *testing.T) {
@@ -162,6 +163,12 @@ func TestRetireLifecycleScrubsEveryReferenceToTheRetiredBackend(t *testing.T) {
 	sentinel := lifecycleCapability{unusable: true}
 	owned := lifecycleCapability{backend: retired}
 	survivor := lifecycleCapability{backend: "backend-a"}
+	attemptID := requireLifecycleID(t, "501")
+	// A recordless attempt on the retired backend: its marker is the
+	// capability's only evidence (ENG-1119).
+	attemptOnly := lifecycleCapability{attemptBackend: retired, attemptID: attemptID}
+	quarantinedAttempt := lifecycleCapability{unusable: true, attemptBackend: retired, attemptID: attemptID}
+	survivorWithAttempt := lifecycleCapability{backend: "backend-a", attemptBackend: retired, attemptID: attemptID}
 	for _, test := range []struct {
 		name             string
 		in               lifecycleCapability
@@ -176,6 +183,12 @@ func TestRetireLifecycleScrubsEveryReferenceToTheRetiredBackend(t *testing.T) {
 		{"surviving lease whose capability owner was retired", owned, retirementStripped, true, sentinel, true, false},
 		{"detached capability naming the retired backend", owned, retirementUnchanged, false, owned, true, true},
 		{"detached unrelated capability", survivor, retirementUnchanged, false, survivor, false, false},
+		{"stripped conflict whose capability was only the retired attempt", attemptOnly, retirementStripped, true, sentinel, true, false},
+		{"uninterpretable placement whose capability was only the retired attempt", attemptOnly, retirementUnchanged, true, sentinel, true, false},
+		{"lost lease whose capability was only the retired attempt", attemptOnly, retirementLost, true, sentinel, true, false},
+		{"detached capability that was only the retired attempt", attemptOnly, retirementUnchanged, false, attemptOnly, true, true},
+		{"quarantined capability with a retired attempt", quarantinedAttempt, retirementStripped, true, sentinel, true, false},
+		{"survivor-owned capability with a retired attempt", survivorWithAttempt, retirementStripped, true, survivor, true, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got, changed, deleted := retireLifecycle(test.in, retired, test.disposition, test.placementExists)
@@ -184,6 +197,117 @@ func TestRetireLifecycleScrubsEveryReferenceToTheRetiredBackend(t *testing.T) {
 			assert.Equal(t, test.deleted, deleted)
 		})
 	}
+}
+
+// TestRetireLifecycleOutputAlwaysEncodes enumerates every valid capability
+// shape against every disposition. A retirement plan encodes each rewritten
+// capability, so an output the encoder refuses would make the whole retirement
+// refuse (ENG-1119). Every kept output must encode, never name the retired
+// backend, never lift a quarantine, and never gain authority.
+func TestRetireLifecycleOutputAlwaysEncodes(t *testing.T) {
+	const retired = "backend-c"
+	ownerID := requireLifecycleID(t, "502")
+	attemptID := requireLifecycleID(t, "503")
+	principal := runtimePrincipal{tenant: "tenant-test", providerUUID: freshTestProviderUUID}
+	type attempt struct {
+		backend string
+		id      lifecycle.ID
+	}
+	inputs, ownerlessRetiredAttempts := 0, 0
+	for _, backendName := range []string{"", "backend-a", retired} {
+		for _, id := range []lifecycle.ID{{}, ownerID} {
+			for _, marker := range []attempt{{}, {"backend-a", attemptID}, {retired, attemptID}} {
+				for _, unusable := range []bool{false, true} {
+					for _, retiredFlag := range []bool{false, true} {
+						for _, owner := range []runtimePrincipal{{}, principal} {
+							in := lifecycleCapability{
+								backend: backendName, id: id, principal: owner, retired: retiredFlag,
+								attemptBackend: marker.backend, attemptID: marker.id, unusable: unusable,
+							}
+							if validateLifecycleCapability(in) != nil {
+								continue
+							}
+							inputs++
+							if in.backend == "" && in.attemptBackend == retired && !in.unusable {
+								ownerlessRetiredAttempts++
+							}
+							for _, disposition := range []retirementDisposition{
+								retirementUnchanged, retirementLost, retirementStripped,
+							} {
+								for _, placementExists := range []bool{true, false} {
+									got, _, deleted := retireLifecycle(in, retired, disposition, placementExists)
+									if deleted {
+										continue
+									}
+									_, err := encodeLifecycleCapability(got)
+									require.NoError(t, err,
+										"in=%+v disposition=%d placement=%t got=%+v", in, disposition, placementExists, got)
+									assert.NotEqual(t, retired, got.backend, "in=%+v disposition=%d", in, disposition)
+									assert.NotEqual(t, retired, got.attemptBackend, "in=%+v disposition=%d", in, disposition)
+									if in.unusable {
+										assert.True(t, got.unusable, "a retirement never lifts a quarantine: in=%+v", in)
+									}
+									if !got.unusable {
+										assert.Equal(t, in.backend, got.backend, "in=%+v", in)
+										assert.Equal(t, in.id, got.id, "in=%+v", in)
+										assert.Equal(t, in.principal, got.principal, "in=%+v", in)
+										assert.Equal(t, in.retired, got.retired, "in=%+v", in)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	require.NotZero(t, inputs)
+	require.NotZero(t, ownerlessRetiredAttempts, "the refused shape must be enumerated")
+}
+
+// TestQuarantineOwnerlessLifecycleIsTheOnlyRewrite pins the normalizer every
+// retireLifecycle output passes through: it is the identity on every
+// capability the encoder accepts, and it turns exactly the ownerless usable
+// shape the encoder refuses into the evidence-free quarantine sentinel.
+func TestQuarantineOwnerlessLifecycleIsTheOnlyRewrite(t *testing.T) {
+	ownerID := requireLifecycleID(t, "504")
+	attemptID := requireLifecycleID(t, "505")
+	principal := runtimePrincipal{tenant: "tenant-test", providerUUID: freshTestProviderUUID}
+	type attempt struct {
+		backend string
+		id      lifecycle.ID
+	}
+	ownerless := 0
+	for _, backendName := range []string{"", "backend-a"} {
+		for _, id := range []lifecycle.ID{{}, ownerID} {
+			for _, marker := range []attempt{{}, {"backend-a", attemptID}} {
+				for _, unusable := range []bool{false, true} {
+					for _, retiredFlag := range []bool{false, true} {
+						for _, owner := range []runtimePrincipal{{}, principal} {
+							in := lifecycleCapability{
+								backend: backendName, id: id, principal: owner, retired: retiredFlag,
+								attemptBackend: marker.backend, attemptID: marker.id, unusable: unusable,
+							}
+							got := quarantineOwnerlessLifecycle(in)
+							if validateLifecycleCapability(in) == nil {
+								assert.Equal(t, in, got, "an encodable capability is never rewritten")
+								continue
+							}
+							if !unusable && backendName == "" && marker.backend == "" && !id.Valid() && !retiredFlag {
+								ownerless++
+								assert.Equal(t, lifecycleCapability{unusable: true}, got)
+								_, err := encodeLifecycleCapability(got)
+								require.NoError(t, err)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	require.Equal(t, 2, ownerless, "both principal shapes of the ownerless capability are enumerated")
+	corrupt := lifecycleCapability{rawCorrupt: true}
+	assert.Equal(t, corrupt, quarantineOwnerlessLifecycle(corrupt), "undecodable bytes are never rewritten")
 }
 
 // retirementFixture is a stopped provider database with three backends: a
@@ -643,6 +767,141 @@ func TestRetirementBindsTheReceiptsItReclaims(t *testing.T) {
 		}
 		assert.Nil(t, records.Get(receiptKey), "the reclaimed receipt is gone")
 		assert.Nil(t, tx.Bucket(lifecycleCapabilityBucketName).Get([]byte(fixture.owned)))
+		return nil
+	}))
+}
+
+// TestRetirementQuarantinesAnAttemptOnlyCapability covers ENG-1119: a
+// recordless attempt on backend-c wrote a usable capability whose only
+// evidence is that attempt, and two survivors then both reported the lease.
+// Stripping the attempt used to leave an ownerless capability the encoder
+// refuses, so the whole retirement refused in dry run and apply. The lease now
+// keeps its two-survivor conflict and the evidence-free quarantine sentinel.
+func TestRetirementQuarantinesAnAttemptOnlyCapability(t *testing.T) {
+	fixture := newRetirementFixture(t)
+	const attempted = "00000000-0000-4000-8000-000000000407"
+	attemptOperation := requireOperationID(t, "407")
+	store, err := OpenStore(fixture.dbPath, freshTestProviderUUID, WithCallbackRouteFactory(testCallbackRoutes(t)))
+	require.NoError(t, err)
+	baseline := store.CurrentAdmissionBaseline()
+	require.True(t, baseline.Valid())
+	scope := requireAdmissionScope(t, store, baseline, "backend-c")
+	_, applied, err := store.beginNewAttempt(
+		scope, attempted, "backend-c", attemptOperation, PayloadFingerprint{},
+		testBackendRequestSnapshot(t), testCallbackPair(attemptOperation),
+	)
+	require.NoError(t, err)
+	require.True(t, applied)
+	// backend-c never reports the lease; two survivors both do.
+	requireConflictPlacement(t, store, attempted, "backend-a", "backend-b")
+	conflict := store.Lookup(attempted)
+	require.Equal(t, "backend-c", conflict.Attempt)
+	require.Empty(t, conflict.Backend)
+	require.Equal(t, []string{"backend-a", "backend-b", "backend-c"}, conflict.ConflictBackends)
+	require.False(t, conflict.ConflictOwnersUnknown)
+	require.NoError(t, store.db.View(func(tx *bolt.Tx) error {
+		capability, err := decodeLifecycleCapability(tx.Bucket(lifecycleCapabilityBucketName).Get([]byte(attempted)))
+		require.NoError(t, err)
+		require.Empty(t, capability.backend)
+		require.Equal(t, "backend-c", capability.attemptBackend)
+		require.False(t, capability.unusable, "the durable capability names backend-c only through its attempt")
+		return nil
+	}))
+	require.NoError(t, store.Close())
+
+	repair, err := OpenAttemptRepair(fixture.dbPath, freshTestProviderUUID)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = repair.Close() })
+	plan, err := repair.PlanBackendRetirement("backend-c", fixture.pinC)
+	require.NoError(t, err, "an attempt-only capability must not refuse the retirement")
+	facts := plan.Facts()
+	assert.Contains(t, facts.StrippedLeases, attempted)
+	assert.Contains(t, facts.LifecycleScrubbed, attempted)
+	assert.NotContains(t, facts.LostLeases, attempted)
+	publishRetirementBackup(t, repair)
+	result, err := repair.RetireBackend(plan, LostBackendAttestationText)
+	require.NoError(t, err)
+	require.NoError(t, repair.Sync())
+	require.NoError(t, repair.Close())
+	inspector, err := OpenRepairInspector(fixture.dbPath, freshTestProviderUUID)
+	require.NoError(t, err)
+	require.NoError(t, inspector.VerifyBackendRetirementPostcondition(result))
+	require.NoError(t, inspector.Close())
+
+	store, err = OpenStore(fixture.dbPath, freshTestProviderUUID, WithCallbackRouteFactory(testCallbackRoutes(t)))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	kept := store.Lookup(attempted)
+	_, lost := kept.LostBackend()
+	assert.False(t, lost, "two survivors may hold the lease's data")
+	assert.True(t, kept.Conflict)
+	assert.Empty(t, kept.Backend)
+	assert.Empty(t, kept.Attempt)
+	assert.Equal(t, []string{"backend-a", "backend-b"}, kept.ConflictBackends)
+	requireLifecycleVerdict(t, store, attempted, lifecycleIDFromOperation(t, attemptOperation), LifecycleVerdictUnusable)
+	require.NoError(t, store.db.View(func(tx *bolt.Tx) error {
+		capability, err := decodeLifecycleCapability(tx.Bucket(lifecycleCapabilityBucketName).Get([]byte(attempted)))
+		require.NoError(t, err)
+		assert.Equal(t, lifecycleCapability{unusable: true}, capability,
+			"the capability keeps only the evidence-free quarantine sentinel")
+		return nil
+	}))
+}
+
+// TestRetirementQuarantinesTheAttemptOnlyCapabilityOfAnUninterpretableRow is
+// the second shape of ENG-1119: a current-schema placement row Fred cannot
+// interpret (here an attempt on backend-c without its exact operation
+// metadata) is left exactly as it is, while its decodable capability, whose
+// only evidence was an attempt on backend-c, becomes the evidence-free
+// quarantine sentinel.
+func TestRetirementQuarantinesTheAttemptOnlyCapabilityOfAnUninterpretableRow(t *testing.T) {
+	fixture := newRetirementFixture(t)
+	const garbled = "00000000-0000-4000-8000-000000000408"
+	garbage := []byte(`{"schema":1,"backend":"","attempt":"backend-c","set_at":"2026-09-01T00:00:00Z","revision":1003}`)
+	require.True(t, decodeRecord(garbled, garbage).unusable, "the fixture row must be uninterpretable")
+	capability, err := encodeLifecycleCapability(lifecycleCapability{
+		attemptBackend: "backend-c", attemptID: requireLifecycleID(t, "408"),
+	})
+	require.NoError(t, err)
+	db, err := bolt.Open(fixture.dbPath, 0o600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		if err := tx.Bucket(bucketName).Put([]byte(garbled), garbage); err != nil {
+			return err
+		}
+		return tx.Bucket(lifecycleCapabilityBucketName).Put([]byte(garbled), capability)
+	}))
+	require.NoError(t, db.Close())
+
+	repair, err := OpenAttemptRepair(fixture.dbPath, freshTestProviderUUID)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = repair.Close() })
+	plan, err := repair.PlanBackendRetirement("backend-c", fixture.pinC)
+	require.NoError(t, err, "an attempt-only capability must not refuse the retirement")
+	facts := plan.Facts()
+	assert.Contains(t, facts.UninterpretableLeases, garbled)
+	assert.Contains(t, facts.LifecycleScrubbed, garbled)
+	assert.NotContains(t, facts.LostLeases, garbled)
+	assert.NotContains(t, facts.StrippedLeases, garbled)
+	publishRetirementBackup(t, repair)
+	result, err := repair.RetireBackend(plan, LostBackendAttestationText)
+	require.NoError(t, err)
+	require.NoError(t, repair.Sync())
+	require.NoError(t, repair.Close())
+	inspector, err := OpenRepairInspector(fixture.dbPath, freshTestProviderUUID)
+	require.NoError(t, err)
+	require.NoError(t, inspector.VerifyBackendRetirementPostcondition(result))
+	require.NoError(t, inspector.Close())
+
+	db, err = bolt.Open(fixture.dbPath, 0o600, &bolt.Options{ReadOnly: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.View(func(tx *bolt.Tx) error {
+		assert.Equal(t, garbage, tx.Bucket(bucketName).Get([]byte(garbled)),
+			"an uninterpretable placement is left exactly as it is")
+		capability, err := decodeLifecycleCapability(tx.Bucket(lifecycleCapabilityBucketName).Get([]byte(garbled)))
+		require.NoError(t, err)
+		assert.Equal(t, lifecycleCapability{unusable: true}, capability)
 		return nil
 	}))
 }

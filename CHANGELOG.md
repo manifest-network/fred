@@ -107,8 +107,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `BackendStorageLost`, and `410 Gone` with reason `backend_storage_lost` on
   provision, connection, logs, releases, restart, update, and restore from a
   lost source. A retired name can never rejoin, and its storage cannot be
-  claimed by another name. Older binaries refuse a database that records a
-  retirement. See DEPLOYMENT.md, "Retiring a backend whose storage is lost".
+  claimed by another name. A surviving lease whose lifecycle capability named
+  the retired backend only through an in-flight attempt keeps an evidence-free
+  quarantine instead of making the whole retirement refuse (ENG-1119). Older
+  binaries refuse a database that records a retirement. See DEPLOYMENT.md,
+  "Retiring a backend whose storage is lost".
 - `docker-backend -audit-storage-identity-adoption` reports every v0.13 shape
   that blocks storage-identity adoption in one read-only pass, as JSON, where
   the preflight stops at the first. Each finding carries its class, an
