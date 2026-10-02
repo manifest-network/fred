@@ -43,16 +43,17 @@ func TestIntegration_BoundedImageImportPreservesIdentity(t *testing.T) {
 	verifyBoundedImageImport(t, docker)
 }
 
-// Production deployments use classic overlay2. The main integration daemon
-// deliberately uses containerd, so exercise the same verified archive against
-// a second private classic daemon without changing the host's Docker service.
+// Production deployments use classic overlay2. The main integration daemon may
+// run either store (CI runs one leg per store), so exercise the same verified
+// archive against a second private classic daemon on every run without
+// changing the host's Docker service.
 func TestIntegration_BoundedImageImportClassicOverlay2(t *testing.T) {
 	verifyBoundedImageImport(t, newClassicImageTestDaemon(t))
 }
 
 // newClassicImageTestDaemon owns a disposable daemon and its private data root.
 // Image-allocation and inspection contracts must hold on the production driver
-// as well as the integration host's containerd snapshotter.
+// whichever store the integration host runs.
 func newClassicImageTestDaemon(t *testing.T) *client.Client {
 	t.Helper()
 	if os.Geteuid() != 0 {
