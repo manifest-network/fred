@@ -20,6 +20,11 @@ package testutil
 //     .TerminalBudget field.
 //   - The budget's own fields are named only in leasesm/terminal_budget.go,
 //     and its Ready anchor is written only by crossStatus.
+//   - Inside that file the streak's count and start are written only by
+//     countFailure and resetStreak, so the minimum-span floor is always
+//     measured from the start of the streak being counted, and the exhausting
+//     standing is named only by streakVerdict (which applies both floors) and
+//     the predicate that reads it.
 //
 // Every rule is proven to fire by TestProjectionStatusGuardsFire.
 
@@ -51,7 +56,23 @@ var foreignStatusConstantPrefixes = []string{"DiagnosticCapture"}
 
 // budgetFieldNames are TerminalBudget's unexported fields. Only leasesm can
 // name them at all; the rule pins them to the one file that owns the rules.
-var budgetFieldNames = []string{"consecutive", "readySince", "lastFailureCounted"}
+var budgetFieldNames = []string{"consecutive", "streakStartedAt", "readySince", "standing"}
+
+// streakFieldNames are the streak's count and start. They move together: only
+// streakWriters write them, so a streak's start cannot drift from its count
+// and the minimum-span floor cannot be measured from a stale start.
+var (
+	streakFieldNames = []string{"consecutive", "streakStartedAt"}
+	streakWriters    = []string{"TerminalBudget.countFailure", "TerminalBudget.resetStreak"}
+)
+
+// exhaustingStanding is the one standing that exhausts the budget. Only the
+// streak decision (which applies the count threshold and the minimum span) and
+// the predicate that reads it may name it, so no other code can record or
+// test for an exhausting failure without both floors.
+const exhaustingStanding = "countedExhausting"
+
+var exhaustingStandingNamers = []string{"streakVerdict", "standingFailure.exhausts"}
 
 type parsedGoFile struct {
 	rel  string
@@ -144,6 +165,19 @@ func f(p *ProvisionState) { p.TerminalBudget.consecutive++ }`, "names TerminalBu
 		{"anchor written outside crossStatus", budgetChokeFile, `package leasesm
 import "time"
 func (b *TerminalBudget) other(now time.Time) { b.readySince = now }`, "writes the Ready anchor outside crossStatus"},
+		{"count raised outside countFailure", budgetChokeFile, `package leasesm
+func (b *TerminalBudget) other() { b.consecutive++ }`, "writes the streak outside countFailure and resetStreak"},
+		{"count cleared outside resetStreak", budgetChokeFile, `package leasesm
+func (b *TerminalBudget) crossStatus() { b.consecutive = 0 }`, "writes the streak outside countFailure and resetStreak"},
+		{"streak start written outside countFailure", budgetChokeFile, `package leasesm
+import "time"
+func (b *TerminalBudget) other(now time.Time) { b.streakStartedAt = now }`, "writes the streak outside countFailure and resetStreak"},
+		{"streak address taken", budgetChokeFile, `package leasesm
+func (b *TerminalBudget) other() *int { return &b.consecutive }`, "takes the address of the streak's consecutive"},
+		{"exhausting standing recorded without the floors", budgetChokeFile, `package leasesm
+func (b *TerminalBudget) other() { b.standing = countedExhausting }`, "names countedExhausting"},
+		{"exhausting standing named in another leasesm file", leasesm, `package leasesm
+var v = countedExhausting`, "names countedExhausting"},
 		{"dot import", docker, `package p
 import . "github.com/manifest-network/fred/internal/backend/shared/leasesm"
 var v = ProvisionState{}`, "dot-imports leasesm"},
@@ -161,7 +195,15 @@ var v = ProvisionState{}`, "dot-imports leasesm"},
 		{budgetChokeFile, `package leasesm
 import "time"
 func (p *ProvisionState) SetStatus(status backend.ProvisionStatus, now time.Time) { p.Status = status }
-func (b *TerminalBudget) crossStatus(now time.Time) { b.readySince = now; b.consecutive = 0 }
+func (b *TerminalBudget) crossStatus(now time.Time) { b.readySince = now; b.resetStreak() }
+func (b *TerminalBudget) countFailure(now time.Time) { b.streakStartedAt = now; b.consecutive++ }
+func (b *TerminalBudget) resetStreak() { b.consecutive = 0; b.streakStartedAt = time.Time{} }
+const (
+	countedWithinBudget standingFailure = iota
+	countedExhausting
+)
+func streakVerdict() standingFailure { return countedExhausting }
+func (s standingFailure) exhausts() bool { return s == countedExhausting }
 func (p *ProvisionState) InheritTerminalBudget() { p.TerminalBudget = TerminalBudget{} }`},
 		{"internal/backend/docker/failure_diagnostics.go", header +
 			`func f(o *shared.DiagnosticObservation) { o.Status = shared.DiagnosticCaptureUnavailable }`},
@@ -253,8 +295,25 @@ func projectionStatusFindings(rel string, file *ast.File, fset *token.FileSet) [
 	inspect := func(function string, root ast.Node) {
 		inSetStatus := rel == budgetChokeFile && function == "ProvisionState.SetStatus"
 		inCrossStatus := rel == budgetChokeFile && function == "TerminalBudget.crossStatus"
+		inStreakWriter := rel == budgetChokeFile && slices.Contains(streakWriters, function)
+		inExhaustingNamer := rel == budgetChokeFile && slices.Contains(exhaustingStandingNamers, function)
+		// The constant's own declaration names it; that is not a use.
+		declaring := make(map[*ast.Ident]bool)
+		if gen, ok := root.(*ast.GenDecl); ok && gen.Tok == token.CONST {
+			for _, spec := range gen.Specs {
+				if value, ok := spec.(*ast.ValueSpec); ok {
+					for _, name := range value.Names {
+						declaring[name] = true
+					}
+				}
+			}
+		}
 		ast.Inspect(root, func(node ast.Node) bool {
 			switch typed := node.(type) {
+			case *ast.Ident:
+				if inLeasesm && typed.Name == exhaustingStanding && !inExhaustingNamer && !declaring[typed] {
+					report(typed, "names %s outside streakVerdict and standingFailure.exhausts", exhaustingStanding)
+				}
 			case *ast.AssignStmt:
 				for index, lhs := range typed.Lhs {
 					selector, ok := lhs.(*ast.SelectorExpr)
@@ -279,11 +338,22 @@ func projectionStatusFindings(rel string, file *ast.File, fset *token.FileSet) [
 						if !inCrossStatus {
 							report(selector, "writes the Ready anchor outside crossStatus")
 						}
+					case "consecutive", "streakStartedAt":
+						if rel == budgetChokeFile && !inStreakWriter {
+							report(selector, "writes the streak outside countFailure and resetStreak")
+						}
 					}
 				}
 			case *ast.IncDecStmt:
-				if selector, ok := typed.X.(*ast.SelectorExpr); ok && selector.Sel.Name == "Status" && !inSetStatus {
+				selector, ok := typed.X.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				switch {
+				case selector.Sel.Name == "Status" && !inSetStatus:
 					report(selector, "writes Status outside SetStatus")
+				case rel == budgetChokeFile && slices.Contains(streakFieldNames, selector.Sel.Name) && !inStreakWriter:
+					report(selector, "writes the streak outside countFailure and resetStreak")
 				}
 			case *ast.UnaryExpr:
 				selector, ok := typed.X.(*ast.SelectorExpr)
@@ -295,6 +365,8 @@ func projectionStatusFindings(rel string, file *ast.File, fset *token.FileSet) [
 					report(selector, "takes the address of Status")
 				case selector.Sel.Name == "TerminalBudget" && rel != budgetChokeFile:
 					report(selector, "takes the address of TerminalBudget")
+				case rel == budgetChokeFile && slices.Contains(streakFieldNames, selector.Sel.Name):
+					report(selector, "takes the address of the streak's %s", selector.Sel.Name)
 				}
 			case *ast.SelectorExpr:
 				if inLeasesm && rel != budgetChokeFile && slices.Contains(budgetFieldNames, typed.Sel.Name) {

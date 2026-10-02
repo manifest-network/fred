@@ -32,9 +32,19 @@ import (
 //   - The budget lives in memory on the actor-owned projection. A backend
 //     restart resets it, as moby's daemon restore resets RestartCount; losing
 //     it can only delay a close, never cause one.
+//   - A streak exhausts the budget only once it is both long enough and old
+//     enough: terminalBudgetThreshold consecutive counted failures, the last
+//     landing at least terminalBudgetMinStreakSpan after the streak's first.
+//     An outage that kills the workload several times in quick succession,
+//     faster than a person can respond, never closes the lease on its own.
 //
 // The verdict is exhausted only while the lease is Failed, and only if the
-// failure that made it Failed was itself counted.
+// failure that made it Failed was itself counted and, when it was counted,
+// met both floors. That decision is recorded at the counted failure
+// (countFailure) as the budget's standing failure; the wire observation reads
+// the record and never the clock, so elapsed time alone never changes it. A
+// streak that reaches the threshold too quickly is re-evaluated at its next
+// counted failure.
 //
 // The Ready boundary is structural rather than wired into each transition by
 // hand: SetStatus is the only writer of ProvisionState.Status, and
@@ -52,7 +62,46 @@ const (
 	// terminalBudgetResetAfter is the sustained-Ready period that resets the
 	// count: the kubelet's 10-minute crash-loop backoff reset (KEP-4603).
 	terminalBudgetResetAfter = 10 * time.Minute
+	// terminalBudgetMinStreakSpan is the shortest streak that can exhaust the
+	// budget, measured from the streak's first counted failure to the one that
+	// exhausts it. A burst of deaths inside it (a host or network outage, a
+	// dependency restarting) only ever retries. A compile-time constant, not a
+	// knob.
+	terminalBudgetMinStreakSpan = 30 * time.Minute
 )
+
+// standingFailure is what the budget recorded about the failure that made the
+// lease Failing, and then Failed. It is a closed enum; its zero value means no
+// counted failure stands. Only countFailure records a counted one, and only
+// streakVerdict decides between its two counted values.
+type standingFailure uint8
+
+const (
+	// noCountedFailure: the current failure, if any, was not counted, or a
+	// status change has ended the counted one.
+	noCountedFailure standingFailure = iota
+	// countedWithinBudget: the current failure was counted, but when it was
+	// counted the streak was too short or too young to exhaust the budget.
+	countedWithinBudget
+	// countedExhausting: the current failure was counted and, when it was,
+	// the streak met both the count threshold and the minimum span.
+	countedExhausting
+)
+
+// exhausts reports whether this standing failure exhausts the budget.
+func (s standingFailure) exhausts() bool { return s == countedExhausting }
+
+// streakVerdict is the one decision between the two counted standings. A
+// streak exhausts only when it has reached terminalBudgetThreshold
+// consecutive counted failures and the failure being counted lands at least
+// terminalBudgetMinStreakSpan after the streak started.
+func streakVerdict(consecutive int, streakStartedAt, now time.Time) standingFailure {
+	if consecutive >= terminalBudgetThreshold && !streakStartedAt.IsZero() &&
+		now.Sub(streakStartedAt) >= terminalBudgetMinStreakSpan {
+		return countedExhausting
+	}
+	return countedWithinBudget
+}
 
 // TerminalBudget is one lease's consecutive-failure budget. It is opaque: a
 // substrate may carry it onto a rebuilt projection only through
@@ -64,15 +113,42 @@ type TerminalBudget struct {
 	leaseUUID string
 	// consecutive is the recorded count of consecutive counted failures. Time
 	// alone never decays it, so the wire observation changes only at
-	// transitions.
+	// transitions. Only countFailure and resetStreak write it.
 	consecutive int
+	// streakStartedAt is when the current streak's first counted failure was
+	// recorded. countFailure sets it as the count leaves zero; resetStreak
+	// clears it with the count. Nothing else writes it.
+	streakStartedAt time.Time
 	// readySince is when the lease last entered Ready. crossStatus writes it
 	// on every Ready entry and clears it at every Ready exit; nothing else
 	// does.
 	readySince time.Time
-	// lastFailureCounted is true only from a counted Ready -> Failing failure
-	// until the next status change other than Failing -> Failed.
-	lastFailureCounted bool
+	// standing is the decision recorded at the last counted Ready -> Failing
+	// failure. It holds until the next status change other than
+	// Failing -> Failed, which returns it to noCountedFailure.
+	standing standingFailure
+}
+
+// countFailure records one counted failure at now: it extends the streak,
+// starting it when the count leaves zero, and records the standing failure
+// the extended streak decides. It is the only place a counted standing is
+// recorded. A streak with no recorded start (never produced by the actor)
+// starts now, which can only delay exhaustion.
+func (b *TerminalBudget) countFailure(now time.Time) standingFailure {
+	if b.consecutive == 0 || b.streakStartedAt.IsZero() {
+		b.streakStartedAt = now
+	}
+	b.consecutive++
+	b.standing = streakVerdict(b.consecutive, b.streakStartedAt, now)
+	return b.standing
+}
+
+// resetStreak starts a fresh streak: the count, its start and any standing
+// counted failure are cleared together.
+func (b *TerminalBudget) resetStreak() {
+	b.consecutive = 0
+	b.streakStartedAt = time.Time{}
+	b.standing = noCountedFailure
 }
 
 // budgetOutcome is what one recorded failure did to the budget. The actor
@@ -82,7 +158,10 @@ type budgetOutcome struct {
 	cause       failurecause.Cause
 	counted     bool
 	consecutive int
-	exhausted   bool
+	// streakAge is how long the streak had run when this failure was
+	// counted; zero for an uncounted failure.
+	streakAge time.Duration
+	exhausted bool
 }
 
 // reasonEligibleForBudget is a necessary condition for a failure to count and
@@ -172,14 +251,14 @@ func (b *TerminalBudget) crossStatus(from, to backend.ProvisionStatus, now time.
 	switch {
 	case wasReady && !isReady:
 		if !b.readySince.IsZero() && now.Sub(b.readySince) >= terminalBudgetResetAfter {
-			b.consecutive = 0
+			b.resetStreak()
 		}
 		b.readySince = time.Time{}
 	case !wasReady && isReady:
 		b.readySince = now
 	}
 	if from != backend.ProvisionStatusFailing || to != backend.ProvisionStatusFailed {
-		b.lastFailureCounted = false
+		b.standing = noCountedFailure
 	}
 }
 
@@ -201,22 +280,20 @@ func (p *ProvisionState) recordFailure(
 	if !deathOfReadyWorkload || !cause.Counts() || !reasonEligibleForBudget(p.Reason) {
 		return budgetOutcome{cause: cause, consecutive: budget.consecutive}
 	}
-	budget.consecutive++
-	budget.lastFailureCounted = true
+	standing := budget.countFailure(now)
 	return budgetOutcome{
 		cause:       cause,
 		counted:     true,
 		consecutive: budget.consecutive,
-		exhausted:   budget.consecutive >= terminalBudgetThreshold,
+		streakAge:   now.Sub(budget.streakStartedAt),
+		exhausted:   standing.exhausts(),
 	}
 }
 
 // budgetResetByTenant: an accepted tenant restart or update starts a fresh
 // streak.
 func (p *ProvisionState) budgetResetByTenant() {
-	budget := p.boundBudget()
-	budget.consecutive = 0
-	budget.lastFailureCounted = false
+	p.boundBudget().resetStreak()
 }
 
 // deathTermination reads the substrate's own classification of a dead
@@ -248,6 +325,8 @@ func (lsm *leaseSM) observeBudgetOutcome(
 		"lease_uuid", lsm.actor.leaseUUID,
 		"consecutive_failures", outcome.consecutive,
 		"threshold", terminalBudgetThreshold,
+		"streak_age", outcome.streakAge,
+		"min_streak_span", terminalBudgetMinStreakSpan,
 		"budget_exhausted", outcome.exhausted,
 		"provenance", provenance.Label(),
 	}
@@ -266,9 +345,11 @@ func (lsm *leaseSM) observeBudgetOutcome(
 // ObserveTerminalBudget is the single place a backend mints the wire
 // observation of this lease's budget. It reads the projection's own identity,
 // status and reason, so a caller cannot supply a different gate. The verdict is
-// exhausted only for a Failed lease whose current failure was counted, whose
-// recorded streak reached the threshold, and whose reason is eligible.
-// ConsecutiveFailures is the recorded count, which time alone never decays.
+// exhausted only for a Failed lease whose current failure was recorded as
+// exhausting (the streak met the count threshold and the minimum span when that
+// failure was counted) and whose reason is eligible. It reads only recorded
+// facts, never the clock. ConsecutiveFailures is the recorded count, which
+// time alone never decays.
 func (p *ProvisionState) ObserveTerminalBudget() *backend.TerminalBudgetObservation {
 	budget := p.TerminalBudget
 	if budget.leaseUUID != p.LeaseUUID {
@@ -278,7 +359,9 @@ func (p *ProvisionState) ObserveTerminalBudget() *backend.TerminalBudgetObservat
 		Verdict:             backend.TerminalVerdictRetry,
 		ConsecutiveFailures: budget.consecutive,
 	}
-	if p.Status == backend.ProvisionStatusFailed && budget.lastFailureCounted &&
+	// The count check is defense in depth: only streakVerdict records an
+	// exhausting standing, and only for a streak at the threshold.
+	if p.Status == backend.ProvisionStatusFailed && budget.standing.exhausts() &&
 		budget.consecutive >= terminalBudgetThreshold && reasonEligibleForBudget(p.Reason) {
 		observation.Verdict = backend.TerminalVerdictExhausted
 	}

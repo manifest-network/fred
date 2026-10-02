@@ -290,14 +290,17 @@ curl -H "Authorization: Bearer $(fresh_token)" \
 
 A failed `ACTIVE` lease is re-provisioned automatically, with your volumes kept. For repeated
 failures, the provider closes it on-chain (reason `workload failed repeatedly`) only after
-**three consecutive failures of your own workload**: your container exiting on its own (any exit
-code, including an out-of-memory kill at your SKU's limit) while the lease was ready.
+**three or more consecutive failures of your own workload spanning at least 30 minutes**: your
+container exiting on its own (any exit code, including an out-of-memory kill at your SKU's limit)
+while the lease was ready, with the closing failure at least 30 minutes after the first one in the
+streak. A quick burst of failures, such as during an outage, never closes the lease by itself.
 `terminal_budget` shows the recorded count (`consecutive_failures`) and whether the lease will be
 closed (`verdict`: `retry` or `exhausted`).
 
 - Once the lease has stayed ready for ten minutes, its next failure, restart or update starts a
-  fresh streak. The count shown changes only at such a transition, so a lease that has been
-  healthy for a long time may still show an old count until then.
+  fresh streak, and the 30 minutes are counted again from that streak's first failure. The count
+  and verdict shown change only at such transitions, so a lease that has been healthy for a long
+  time may still show an old count until then.
 - A restart or update you request resets the count, and its outcome never counts, even if it
   fails and rolls back. A redeploy the provider starts on its own, for example after a
   custom-domain change, does not reset it.

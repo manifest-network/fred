@@ -302,8 +302,10 @@ const (
 	// TerminalVerdictRetry means the lease may be re-provisioned.
 	TerminalVerdictRetry TerminalVerdict = "retry"
 	// TerminalVerdictExhausted means the lease is Failed and its tenant
-	// workload has failed consecutively often enough that providerd closes
-	// the lease on-chain instead of re-provisioning it.
+	// workload has failed consecutively often enough, over a long enough
+	// streak, that providerd closes the lease on-chain instead of
+	// re-provisioning it. The backend records it at the counted failure;
+	// time alone never produces it.
 	TerminalVerdictExhausted TerminalVerdict = "exhausted"
 )
 

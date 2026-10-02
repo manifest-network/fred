@@ -221,7 +221,7 @@ func TestReadyBoundaryAppliedOnEveryTransition(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				state := test.drive(t)
 				budget := state.TerminalBudget
-				assert.False(t, budget.lastFailureCounted && state.Status != backend.ProvisionStatusFailing &&
+				assert.False(t, budget.standing != noCountedFailure && state.Status != backend.ProvisionStatusFailing &&
 					state.Status != backend.ProvisionStatusFailed, "a counted failure outlived its failure")
 				if test.into {
 					require.Equal(t, backend.ProvisionStatusReady, state.Status)
