@@ -489,6 +489,27 @@ func (b *Backend) refreshRetentionAccountingCheckedLocked() error {
 		retentionAccountingRefreshFailedTotal.Inc()
 		return fmt.Errorf("combine active and reaping retention accounting: %w", err)
 	}
+	if err := b.publishRetainedDiskLocked(totalMB); err != nil {
+		return err
+	}
+	updateRetentionMetrics(totalMB, activeCount, reapingMB, reapingCount, partitionCount)
+	return nil
+}
+
+// publishRetainedDiskLocked pushes the retained-disk projection to the pool:
+// the store-derived storeMB plus heldResidualMB, the footprint of every held
+// volume deletion in its residual phase. A residual hold has settled its
+// caller (the close completed, the reaping record went, the reservation was
+// released) while its project can still charge up to that footprint, so this
+// term is what keeps those bytes counted (ENG-1117). The caller MUST hold
+// retentionAccountingMu.
+func (b *Backend) publishRetainedDiskLocked(storeMB int64) error {
+	heldResidualMB := b.volumes.VolumeDeleteHolds().residualFootprintMB()
+	totalMB, err := addLeaseDiskMB(storeMB, heldResidualMB, 1)
+	if err != nil {
+		retentionAccountingRefreshFailedTotal.Inc()
+		return fmt.Errorf("combine retained and held-deletion accounting: %w", err)
+	}
 	if err := b.pool.SetRetainedDisk(totalMB); err != nil {
 		// totalMB was produced exclusively by checked non-negative additions, so
 		// this is a defensive boundary assertion. Preserve the previous projection
@@ -496,8 +517,25 @@ func (b *Backend) refreshRetentionAccountingCheckedLocked() error {
 		retentionAccountingRefreshFailedTotal.Inc()
 		return fmt.Errorf("publish retained disk accounting: %w", err)
 	}
-	updateRetentionMetrics(totalMB, activeCount, reapingMB, reapingCount, partitionCount)
+	b.retentionStoreDiskMB, b.retentionStoreDiskKnown = storeMB, true
+	volumeDeleteHeldResidualMB.Set(float64(heldResidualMB))
 	return nil
+}
+
+// refreshHeldResidualAccounting re-publishes the retained-disk projection
+// with a fresh residual term, reusing the store-derived part of the last
+// refresh. Every destroy entry point calls it after the manager may have moved
+// a hold into or out of its residual phase, before the destroy's caller can
+// settle on the answer. It reads no store, so it fails only on the pool's
+// defensive bound. Before the first full refresh there is nothing to update:
+// that refresh includes the term itself.
+func (b *Backend) refreshHeldResidualAccounting() error {
+	b.retentionAccountingMu.Lock()
+	defer b.retentionAccountingMu.Unlock()
+	if !b.retentionStoreDiskKnown {
+		return nil
+	}
+	return b.publishRetainedDiskLocked(b.retentionStoreDiskMB)
 }
 
 // logRetentionBudgetSanity reports, per configured budget, the tenant's current

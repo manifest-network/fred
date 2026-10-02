@@ -439,6 +439,11 @@ func (b *Backend) doClosePhysical(
 	op := b.volumeOp(leaseUUID, logger)
 	switch {
 	case retaining:
+		// A name with a pending deletion is never retained: its delete stage owns
+		// it, and a retention record naming it would outlive the bytes it names
+		// (ENG-1117). Read the pending set once, BEFORE the listing, so every
+		// listed name whose deletion began earlier is routed to destroy below.
+		deleting := b.volumes.VolumeDeleteHolds()
 		// Enumerate the lease's ACTUAL managed volumes (ground truth — no SKU guess).
 		all, listErr := b.volumes.ListForProof(ctx)
 		if listErr != nil {
@@ -486,8 +491,37 @@ func (b *Backend) doClosePhysical(
 		// never destroyed) and retain the rest. Only the VOLUME NAMES are narrowed
 		// (retainCanonical → RetainedVolumeNames); the record's Items and
 		// StackManifest MUST stay the FULL set (see the record write below).
+		// redriveDeletion finishes a pending deletion instead of retaining the
+		// name. A held deletion answers at once and keeps the close pending.
+		redriveDeletion := func(c string) {
+			if rep := op.destroy(mutations, ctx, destroySiteDeprovisionDestroy, c); rep.leftOnDisk() {
+				if err := rep.err(); err != nil {
+					volumeErrs = append(volumeErrs, fmt.Errorf("finish pending deletion of volume %s: %w", c, err))
+				} else {
+					claimedLeftBehind = true
+				}
+			}
+		}
 		retainCanonical := make([]string, 0, len(canonical))
 		for _, c := range canonical {
+			if deleting.deletePending(c) {
+				redriveDeletion(c)
+				continue
+			}
+			// A listed name can be gone by now (a deletion finished after the
+			// listing). Only a positive, identity-bound absence skips it, neither
+			// retained nor an error: an absent name must never reach
+			// retainCanonical through isWritablePathOnly's read-error default.
+			if name, parseErr := parseManagedVolumeName(c); parseErr == nil {
+				switch verdict, _ := b.volumes.PrecheckDestroy(name); verdict {
+				case destroyPrecheckGone:
+					continue
+				case destroyPrecheckHeld:
+					// Its deletion began after the pending set was read.
+					redriveDeletion(c)
+					continue
+				}
+			}
 			if b.isWritablePathOnly(c) {
 				// Routed through the choke point like every other destroy. `c` came from
 				// partition against the same cached table, so the re-check is free and

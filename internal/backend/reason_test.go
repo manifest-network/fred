@@ -15,6 +15,7 @@ func TestReasonConstants(t *testing.T) {
 		ReasonRestoreFailed:          "RestoreFailed",
 		ReasonVolumeCleanupExhausted: "VolumeCleanupExhausted",
 		ReasonCleanupFailed:          "CleanupFailed",
+		ReasonVolumeDeletePending:    "VolumeDeletePending",
 		ReasonUnknown:                "Unknown",
 	}
 	for r, want := range cases {
@@ -29,7 +30,10 @@ func TestReasonConstants(t *testing.T) {
 		}
 	}
 	// Curated messages must never embed a host path.
-	for _, m := range []string{MsgImagePullFailed, MsgRestartFailed, MsgUpdateFailed, MsgVolumeCleanupExhausted, MsgCleanupFailed} {
+	for _, m := range []string{
+		MsgImagePullFailed, MsgRestartFailed, MsgUpdateFailed, MsgVolumeCleanupExhausted, MsgCleanupFailed,
+		MsgVolumeDeletePending,
+	} {
 		if strings.Contains(m, "/") {
 			t.Errorf("message %q contains a path separator", m)
 		}

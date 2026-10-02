@@ -165,11 +165,21 @@ func (b *Backend) reconcileVolumeQuotasUsing(
 		}
 	}
 
-	var applied, failed, absent int
+	// A name with a pending deletion keeps the limits its delete authority set
+	// until the zero-usage proof clears them; no writer can exist, and its
+	// marker is usually already gone (ENG-1117). It is its own outcome, not
+	// "applied".
+	deleting := b.volumes.VolumeDeleteHolds()
+	var applied, failed, absent, deletePending int
 	for _, name := range slices.Sorted(maps.Keys(want)) {
 		sizeMB := want[name]
 		if _, ok := existing[name]; !ok {
 			absent++ // expected but not on disk (stateless instance, or already gone)
+			continue
+		}
+		if deleting.deletePending(name) {
+			deletePending++
+			volumeQuotaBackfillTotal.WithLabelValues(quotaBackfillDeletePending).Inc()
 			continue
 		}
 		if cerr := ensureQuota(ctx, name, sizeMB); cerr != nil {
@@ -185,9 +195,9 @@ func (b *Backend) reconcileVolumeQuotasUsing(
 		applied++
 		volumeQuotaBackfillTotal.WithLabelValues("applied").Inc()
 	}
-	if applied > 0 || failed > 0 {
+	if applied > 0 || failed > 0 || deletePending > 0 {
 		b.logger.Info("volume quota backfill complete", "backend", b.volumes.Kind(),
-			"applied", applied, "failed", failed, "expected_absent", absent)
+			"applied", applied, "failed", failed, "delete_pending", deletePending, "expected_absent", absent)
 	}
 	return errors.Join(reconcileErrs...)
 }

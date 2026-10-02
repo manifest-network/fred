@@ -117,9 +117,10 @@ func newBackgroundMaintenanceCoordinator(
 	})
 	destroyVolumes := backgroundVolumeDestroyCapability{
 		destroyFn: func(ctx context.Context, id string) error {
-			return performVolume(ctx, []string{id}, "background destroy volume", func(ctx context.Context) error {
-				return ops.volumes.Destroy(ctx, id)
-			})
+			return backend.afterVolumeDestroy(performVolume(ctx, []string{id}, "background destroy volume",
+				func(ctx context.Context) error {
+					return ops.volumes.Destroy(ctx, id)
+				}))
 		},
 	}
 	teardown := backgroundTeardownCapability{
@@ -477,11 +478,12 @@ func (m *storageMutations) destroyVolume(ctx context.Context, id string) error {
 	if err != nil || !m.volumeNameInScope(name) {
 		return fmt.Errorf("destroy volume target %q differs from Started subject", id)
 	}
-	return m.ops.backend.mutateManagedVolumeNamespace(ctx, []string{id}, func(ctx context.Context) error {
-		return m.runner.Step(ctx, "destroy volume", func(ctx context.Context) error {
-			return m.ops.volumes.Destroy(ctx, id)
-		})
-	})
+	return m.ops.backend.afterVolumeDestroy(m.ops.backend.mutateManagedVolumeNamespace(ctx, []string{id},
+		func(ctx context.Context) error {
+			return m.runner.Step(ctx, "destroy volume", func(ctx context.Context) error {
+				return m.ops.volumes.Destroy(ctx, id)
+			})
+		}))
 }
 
 func (m *storageMutations) canDestroyVolumes() bool { return m != nil && m.ops.volumes != nil }
@@ -1321,7 +1323,7 @@ func (m *storageMutations) recoverRestoreNamespaces(ctx context.Context) error {
 			return fmt.Errorf("restore namespace recovery target %q differs from Started subject", raw)
 		}
 	}
-	return b.mutateManagedVolumeNamespace(ctx, names, func(ctx context.Context) error {
+	return b.afterVolumeDestroy(b.mutateManagedVolumeNamespace(ctx, names, func(ctx context.Context) error {
 		return m.runner.Step(ctx, "recover exact restore volume namespaces", func(ctx context.Context) error {
 			if _, err := b.retentionStore.ProveRestoringSnapshot(retention.Entry()); err != nil {
 				return fmt.Errorf("re-attest restore source before namespace recovery: %w", err)
@@ -1409,5 +1411,5 @@ func (m *storageMutations) recoverRestoreNamespaces(ctx context.Context) error {
 			}
 			return nil
 		})
-	})
+	}))
 }
