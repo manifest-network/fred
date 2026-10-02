@@ -671,7 +671,9 @@ func TestInheritedFenceCoverageBindsReportersToTheirPins(t *testing.T) {
 				store.mu.Lock()
 				defer store.mu.Unlock()
 				store.inventoryReporters = trackedSweepReporters().with(reporterRecoveryBackend)
-				assert.Equal(t, pinned, store.inheritedFenceCoveredLocked(sweep.sealed))
+				covered, excused := store.inheritedFenceCoveredLocked(sweep.sealed)
+				assert.Equal(t, pinned, covered)
+				assert.Empty(t, excused)
 			})
 	}
 }

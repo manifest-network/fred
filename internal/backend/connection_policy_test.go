@@ -59,10 +59,10 @@ func TestConnectionPolicyOwnsAndSeparatesClientTLSConfiguration(t *testing.T) {
 	require.NoError(t, err)
 	runtime, err := NewIdentityBoundHTTPClient(policy, HTTPClientOptions{}, &testStorageIdentityResolver{})
 	require.NoError(t, err)
-	assert.Equal(t, "https://backend.invalid", runtime.baseURL)
-	assert.Equal(t, 5*time.Second, runtime.httpClient.Timeout)
-	readTransport := bootstrap.(bootstrapInventoryClient).client.httpClient.Transport.(*http.Transport)
-	runtimeTransport := runtime.httpClient.Transport.(*http.Transport)
+	assert.Equal(t, "https://backend.invalid", runtime.wire.baseURL)
+	assert.Equal(t, 5*time.Second, runtime.wire.httpClient.Timeout)
+	readTransport := bootstrap.(bootstrapInventoryClient).client.wire.httpClient.Transport.(*http.Transport)
+	runtimeTransport := runtime.wire.httpClient.Transport.(*http.Transport)
 	require.NotNil(t, readTransport.TLSClientConfig)
 	require.NotNil(t, runtimeTransport.TLSClientConfig)
 	assert.Equal(t, uint16(tls.VersionTLS13), readTransport.TLSClientConfig.MinVersion)
@@ -74,7 +74,7 @@ func TestConnectionPolicyOwnsAndSeparatesClientTLSConfiguration(t *testing.T) {
 	// per-transport adjustment must not change the reusable connection policy.
 	readTransport.TLSClientConfig.MinVersion = tls.VersionTLS12
 	assert.Equal(t, uint16(tls.VersionTLS13), runtimeTransport.TLSClientConfig.MinVersion)
-	assert.Equal(t, uint16(tls.VersionTLS13), policy.state.tlsConfig.MinVersion)
+	assert.Equal(t, uint16(tls.VersionTLS13), policy.state.live.tlsConfig.MinVersion)
 }
 
 func TestConnectionPolicyRedactsCredentials(t *testing.T) {

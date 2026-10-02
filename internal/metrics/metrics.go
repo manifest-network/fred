@@ -64,6 +64,17 @@ var (
 	// sweep withholds fresh lease side effects. It returns to 0 once every
 	// backend that could have reported a lost positive answers both endpoints
 	// again, or a complete projection commits.
+	// PlacementUnprojectedFencedReporter is 1 while the placement database
+	// records that the backend reported a positive an interrupted sweep never
+	// projected, and recovery cleared without it because it was fenced. It
+	// clears when the backend answers both inventories again or is retired.
+	PlacementUnprojectedFencedReporter = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "placement",
+		Name:      "unprojected_fenced_reporter",
+		Help:      "1 while the backend is recorded as a fenced reporter whose positives an interrupted sweep never projected, 0 otherwise",
+	}, []string{"backend"})
+
 	PlacementInventoryRecoveryPending = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,
 		Subsystem: "placement",
@@ -538,6 +549,16 @@ var (
 		Help:      "Circuit breaker state (0=closed, 1=half-open, 2=open)",
 	}, []string{"backend"})
 
+	// BackendFenced is 1 for a backend the operator fenced (backends[].fenced),
+	// 0 otherwise. Its other backend series, such as fred_backend_healthy,
+	// report it unavailable by design; gate their alerts on this gauge.
+	BackendFenced = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "backend",
+		Name:      "fenced",
+		Help:      "1 while the operator has fenced the backend, 0 otherwise",
+	}, []string{"backend"})
+
 	// BackendAllocatedCPURatio tracks the allocated-CPU ratio fred observed for
 	// each backend at provision-routing time (allocated/total). Distinct from the
 	// backend's own resource_cpu_allocated_ratio: this is fred's view, including
@@ -987,6 +1008,9 @@ const (
 	CallbackAuthFailureFuture         = "future"
 	CallbackAuthFailureMismatch       = "mismatch"
 	CallbackAuthFailureUnknownStorage = "unknown_storage"
+	// CallbackAuthFailureFenced is a callback correctly signed by a fenced
+	// backend. It is refused like any other failure.
+	CallbackAuthFailureFenced = "fenced"
 )
 
 // Outcome constants for the `outcome` label on
@@ -995,6 +1019,8 @@ const (
 	FetchOutcomeOK          = "ok"
 	FetchOutcomeError       = "error"
 	FetchOutcomeCircuitOpen = "circuit_open"
+	// FetchOutcomeFenced: the backend is fenced, so it was not asked.
+	FetchOutcomeFenced = "fenced"
 )
 
 // Outcome constants for the `outcome` label on
@@ -1006,6 +1032,8 @@ const (
 	InventoryOutcomeProvisionsOnly = "provisions_only"
 	InventoryOutcomeRetentionsOnly = "retentions_only"
 	InventoryOutcomeUnanswered     = "unanswered"
+	// InventoryOutcomeFenced: the backend is fenced, so it was not asked.
+	InventoryOutcomeFenced = "fenced"
 )
 
 // Pass and reason constants for the `pass` / `reason` labels on

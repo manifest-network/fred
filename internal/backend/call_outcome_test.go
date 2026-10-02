@@ -256,7 +256,7 @@ func TestHTTPClientMintsNotDispatchedOnlyWhenCircuitPreventsClosure(t *testing.T
 	t.Parallel()
 	client := causalOutcomeClientForTest(t, http.StatusInternalServerError, "backend failure")
 	client.cb = newUnboundHTTPClientForTest(HTTPClientConfig{
-		Name: "one-failure-circuit", BaseURL: client.baseURL, CBFailureThresh: 1,
+		Name: "one-failure-circuit", BaseURL: client.wire.baseURL, CBFailureThresh: 1,
 	}).cb
 
 	first := client.provisionCall(t.Context(), ProvisionRequest{})
@@ -271,7 +271,7 @@ func TestHTTPClientUpgradeGateProofCannotBeSpoofedByTransportError(t *testing.T)
 	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name: "causal-test", BaseURL: "https://backend.invalid",
 	})
-	client.httpClient.Transport = causalOutcomeRoundTripper(func(
+	client.wire.httpClient.Transport = causalOutcomeRoundTripper(func(
 		*http.Request,
 	) (*http.Response, error) {
 		return nil, fmt.Errorf("transport says: %w", ErrBackendUpgradeRequired)
@@ -326,7 +326,7 @@ func TestMaintenanceExpiredRefusalLeavesTheBreakerClosed(t *testing.T) {
 	require.NoError(t, err)
 	client := causalOutcomeClientForTest(t, http.StatusConflict, `{"error":"too old","code":"maintenance_expired"}`)
 	client.cb = newUnboundHTTPClientForTest(HTTPClientConfig{
-		Name: "one-failure-circuit", BaseURL: client.baseURL, CBFailureThresh: 1,
+		Name: "one-failure-circuit", BaseURL: client.wire.baseURL, CBFailureThresh: 1,
 	}).cb
 	for range 3 {
 		outcome := client.restartCall(t.Context(), RestartRequest{MaintenanceID: id})

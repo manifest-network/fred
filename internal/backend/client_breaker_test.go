@@ -22,7 +22,7 @@ func TestCallerCancellationIsNeutralForEveryBreakerOperation(t *testing.T) {
 			before := client.cb.Counts()
 			for range 6 {
 				ctx, cancel := context.WithCancel(t.Context())
-				client.httpClient.Transport = causalOutcomeRoundTripper(func(req *http.Request) (*http.Response, error) {
+				client.wire.httpClient.Transport = causalOutcomeRoundTripper(func(req *http.Request) (*http.Response, error) {
 					cancel()
 					return nil, req.Context().Err()
 				})
@@ -65,7 +65,7 @@ func TestBackendTimeoutWithLiveCallerStillTripsBreaker(t *testing.T) {
 	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name: "timeout", BaseURL: "http://backend.invalid", CBFailureThresh: 1,
 	})
-	client.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
+	client.wire.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {
 		return nil, context.DeadlineExceeded
 	})
 	_, err := client.GetInfo(t.Context(), "lease")

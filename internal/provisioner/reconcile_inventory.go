@@ -26,6 +26,9 @@ type reconcileInventory struct {
 	retentionStorageIdentities  map[string]backendidentity.ID
 	retentionCollected          map[string]placement.BackendRetentionInventory
 	backendStorageIdentities    map[string]backendidentity.ID
+	// fenced names the backends this sweep did not ask because the operator
+	// fenced them.
+	fenced map[string]struct{}
 
 	// untrustedPositiveObservations retains the conservative fact that a
 	// rejected backend reported a lease, without treating that backend's payload
@@ -72,10 +75,22 @@ func (r *Reconciler) collectInventory(
 		inventory.retentionsReportedByBackend,
 		inventory.retentionStorageIdentities,
 		inventory.retentionCollected = r.fetchAllRetentions(ctx, sweep)
+	// A sweep canceled while reading is Fred's own interruption, not silence
+	// from the backends it did not finish reading. Abandon it before disposing
+	// any response: rejecting a half-read reporter would widen the recovery
+	// its interrupted marker needs from that reporter to the whole topology.
+	if err := ctx.Err(); err != nil {
+		return reconcileInventory{}, err
+	}
 	configuredBackends, err := r.coordinator.BackendNames()
 	if err != nil {
 		return reconcileInventory{}, fmt.Errorf("enumerate configured backends: %w", err)
 	}
+	fenced, err := r.coordinator.FencedBackendNames()
+	if err != nil {
+		return reconcileInventory{}, fmt.Errorf("enumerate fenced backends: %w", err)
+	}
+	inventory.fenced = fenced
 	inventory.backendStorageIdentities = make(map[string]backendidentity.ID, len(configuredBackends))
 	outcomes := make(map[string]backendInventoryOutcome, len(configuredBackends))
 	for _, backendName := range configuredBackends {
@@ -100,6 +115,9 @@ func (r *Reconciler) collectInventory(
 		outcomes[backendName] = classifyBackendInventory(
 			provisionAnswered, retentionAnswered, result.Disposition(),
 		)
+		if _, isFenced := fenced[backendName]; isFenced {
+			outcomes[backendName] = backendInventoryOutcomeFenced
+		}
 		switch result.Disposition() {
 		case placement.BackendInventoryAuthoritative, placement.BackendInventoryPartial:
 			inventory.backendStorageIdentities[backendName] = provisionResponse.StorageID()
@@ -110,9 +128,8 @@ func (r *Reconciler) collectInventory(
 		}
 		inventory.rejectBackend(backendName)
 	}
-	// A sweep canceled while reading is Fred's own interruption, not silence
-	// from the backends it did not finish reading. Abandon it unsealed, so it
-	// records no outcome and commits no projection.
+	// Cancellation can still arrive during disposal. Abandon unsealed, so the
+	// sweep records no outcome and commits no projection.
 	if err := ctx.Err(); err != nil {
 		return reconcileInventory{}, err
 	}

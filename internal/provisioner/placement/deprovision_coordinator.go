@@ -226,8 +226,12 @@ func (coordinator *deprovisionCoordinator) executeEvent(
 		if err == nil {
 			return deprovisionBackendCall{disposition: deprovisionCallCompleted}
 		}
-		if backend.DeprovisionNotDispatched(client, leaseUUID, err) {
+		switch backend.DeprovisionRefusalOf(client, leaseUUID, err) {
+		case backend.DeprovisionRefusedCircuitOpen:
 			return deprovisionBackendCall{disposition: deprovisionCallNotDispatched, err: err}
+		case backend.DeprovisionRefusedFenced:
+			return deprovisionBackendCall{disposition: deprovisionCallFenced, err: err}
+		case backend.DeprovisionRefusalUnproven:
 		}
 		if backend.DeprovisionLifecyclePending(client, leaseUUID, err) {
 			return deprovisionBackendCall{disposition: deprovisionCallLifecyclePending, err: err}
@@ -237,7 +241,7 @@ func (coordinator *deprovisionCoordinator) executeEvent(
 	if !unresolved && len(reachable) > 0 {
 		var failures []error
 		failed := make([]string, 0)
-		deferral := DeprovisionDeferredBackendUnavailable
+		deferral := DeprovisionDeferredBackendFenced
 		for _, name := range reachable {
 			result := call(name)
 			if failure := result.failure(); failure != nil {
@@ -262,7 +266,7 @@ func (coordinator *deprovisionCoordinator) executeEvent(
 
 	var sweepErrs []error
 	failed := make([]string, 0)
-	deferral := DeprovisionDeferredBackendUnavailable
+	deferral := DeprovisionDeferredBackendFenced
 	for _, name := range configured {
 		result := call(name)
 		if failure := result.failure(); failure != nil {
@@ -300,6 +304,7 @@ const (
 	deprovisionCallUnknown deprovisionCallDisposition = iota
 	deprovisionCallCompleted
 	deprovisionCallNotDispatched
+	deprovisionCallFenced
 	deprovisionCallLifecyclePending
 )
 
@@ -320,12 +325,21 @@ func (result deprovisionBackendCall) failure() error {
 // Deferral is preserved only while every failed call has exact transport
 // provenance. An unknown failure poisons the aggregate; later known waits
 // cannot turn a partial, ambiguous cleanup into a deferred observation.
+//
+// Reasons merge upward: fenced, then unavailable, then lifecycle. Fenced is
+// the starting value, so a close waits on the fence only when every failed
+// call was refused by a fenced client; any other wait can still progress.
 func (result deprovisionBackendCall) mergeDeferral(previous DeprovisionDeferralReason) DeprovisionDeferralReason {
 	if previous == "" {
 		return ""
 	}
 	switch result.disposition {
+	case deprovisionCallFenced:
+		return previous
 	case deprovisionCallNotDispatched:
+		if previous == DeprovisionDeferredBackendFenced {
+			return DeprovisionDeferredBackendUnavailable
+		}
 		return previous
 	case deprovisionCallLifecyclePending:
 		return DeprovisionDeferredLifecycle

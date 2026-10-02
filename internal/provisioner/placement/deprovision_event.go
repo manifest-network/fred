@@ -20,6 +20,9 @@ const (
 	DeprovisionDeferredInventory          DeprovisionDeferralReason = "inventory_pending"
 	DeprovisionDeferredLifecycle          DeprovisionDeferralReason = "lifecycle_busy"
 	DeprovisionDeferredBackendUnavailable DeprovisionDeferralReason = "backend_unavailable"
+	// DeprovisionDeferredBackendFenced waits on an operator decision, not on
+	// time: every failed call was refused by a fenced backend's client.
+	DeprovisionDeferredBackendFenced DeprovisionDeferralReason = "backend_fenced"
 )
 
 // DeferredDeprovision grants only another attempt at the same lifecycle subject
@@ -37,7 +40,8 @@ func (deferred DeferredDeprovision) Valid() bool {
 		return false
 	}
 	switch deferred.reason {
-	case DeprovisionDeferredInventory, DeprovisionDeferredLifecycle, DeprovisionDeferredBackendUnavailable:
+	case DeprovisionDeferredInventory, DeprovisionDeferredLifecycle,
+		DeprovisionDeferredBackendUnavailable, DeprovisionDeferredBackendFenced:
 		return true
 	default:
 		return false

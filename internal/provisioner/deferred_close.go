@@ -66,9 +66,23 @@ func newDeferredCloseScheduler() *deferredCloseScheduler {
 	return &deferredCloseScheduler{entries: make(map[string]*deferredCloseEntry), wake: make(chan struct{}, 1)}
 }
 
+// waitsOnOperator reports a deferral only an operator can end: every failed
+// call was refused by a fenced backend. Retrying would only spin against the
+// fence and report the close overdue; reconciliation resumes it once the
+// fence is lifted or the backend is retired.
+func waitsOnOperator(proof placement.DeferredDeprovision) bool {
+	return proof.Reason() == placement.DeprovisionDeferredBackendFenced
+}
+
 func (scheduler *deferredCloseScheduler) enqueue(proof placement.DeferredDeprovision) error {
 	if !proof.Valid() {
 		return errors.New("invalid deferred close proof")
+	}
+	if waitsOnOperator(proof) {
+		metrics.DeferredClosesTotal.WithLabelValues("parked", string(proof.Reason())).Inc()
+		slog.Info("lease close waits on a fenced backend; reconciliation resumes it once the fence is lifted",
+			"lease_uuid", proof.LeaseUUID())
+		return nil
 	}
 	scheduler.mu.Lock()
 	defer scheduler.mu.Unlock()
@@ -188,6 +202,15 @@ func (scheduler *deferredCloseScheduler) finishAttempt(
 	defer scheduler.updateOldestAgeLocked(time.Now())
 	entry.running = nil
 	newerHint := entry.hint != attempt.hint
+	if result.Disposition() == placement.DeprovisionEventDeferred && !newerHint &&
+		waitsOnOperator(result.Deferred()) {
+		delete(scheduler.entries, proof.LeaseUUID())
+		metrics.DeferredClosesPending.Dec()
+		metrics.DeferredClosesTotal.WithLabelValues("parked", string(result.Deferred().Reason())).Inc()
+		slog.Info("lease close now waits only on a fenced backend; reconciliation resumes it once the fence is lifted",
+			"lease_uuid", proof.LeaseUUID())
+		return
+	}
 	if result.Disposition() == placement.DeprovisionEventDeferred {
 		if !newerHint {
 			entry.hint = &deferredCloseHint{proof: result.Deferred()}

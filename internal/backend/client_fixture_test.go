@@ -76,8 +76,11 @@ func (cfg HTTPClientConfig) options() HTTPClientOptions {
 // Other packages must pass the validated public connection policy boundary.
 func newUnboundHTTPClientForTest(cfg HTTPClientConfig) *HTTPClient {
 	return newHTTPClient(ConnectionPolicy{state: &connectionPolicy{
-		name: cfg.Name, baseURL: cfg.BaseURL, secret: cfg.Secret, timeout: cfg.Timeout,
-		tlsConfig: &tls.Config{MinVersion: tls.VersionTLS13},
+		name: cfg.Name,
+		live: &liveConnection{
+			baseURL: cfg.BaseURL, secret: cfg.Secret, timeout: cfg.Timeout,
+			tlsConfig: &tls.Config{MinVersion: tls.VersionTLS13},
+		},
 	}}, cfg.options())
 }
 

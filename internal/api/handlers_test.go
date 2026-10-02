@@ -25,6 +25,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
@@ -225,6 +226,37 @@ func TestHealthCheck_BackendUnhealthy(t *testing.T) {
 	backendCheck, ok := response.Checks["backend:test-backend"]
 	require.True(t, ok, "missing backend check in response, got: %v", response.Checks)
 	assert.Equal(t, "unhealthy", backendCheck.Status)
+}
+
+// unboundIdentityResolver satisfies the client constructor; a fenced client
+// never consults it.
+type unboundIdentityResolver struct{}
+
+func (unboundIdentityResolver) ExpectedBackendStorageIdentity(string) (backendidentity.ID, bool) {
+	return backendidentity.ID{}, false
+}
+
+func TestHealthCheck_FencedBackendIsNamedNotProbed(t *testing.T) {
+	policy, err := backend.NewFencedConnectionPolicy("fenced-backend")
+	require.NoError(t, err)
+	fenced, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{}, unboundIdentityResolver{})
+	require.NoError(t, err)
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: fenced, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	h := &Handlers{backendRouter: router, providerUUID: testutil.ValidUUID1, bech32Prefix: "manifest"}
+
+	rec := httptest.NewRecorder()
+	h.HealthCheck(rec, httptest.NewRequest("GET", "/health", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var response HealthResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+	assert.Equal(t, "degraded", response.Status)
+	check := response.Checks["backend:fenced-backend"]
+	require.NotNil(t, check)
+	assert.Equal(t, "unhealthy", check.Status)
+	assert.Equal(t, "backend is fenced", check.Message)
 }
 
 // TestHealthCheck_AllHealthy tests health check when both chain and backend are healthy.
@@ -876,6 +908,11 @@ func TestReadyz_WaitsForFirstAuthoritativePlacementInventory(t *testing.T) {
 			name: "store authority withdrawn", readiness: placement.InventoryAuthorityWithdrawn,
 			wantStatus: http.StatusServiceUnavailable, wantCheck: "unhealthy",
 			wantDetail: "placement inventory not ready",
+		},
+		{
+			name: "fenced reporter unaccounted", readiness: placement.InventoryFencedReporterUnaccounted,
+			wantStatus: http.StatusServiceUnavailable, wantCheck: "unhealthy",
+			wantDetail: "placement inventory waits on a fenced backend",
 		},
 		{
 			name: "unknown readiness fails closed", readiness: placement.InventoryReadiness(0),

@@ -139,8 +139,17 @@ func (authority *MaintenanceCoordinator) prepareMaintenanceCommand(
 			issuer: authority.marker, outcome: MaintenanceAuthorizationRevoked,
 		}
 	}
-	if _, err := exactBackend(authority.backends, command.BackendName()); err != nil {
+	client, err := exactBackend(authority.backends, command.BackendName())
+	if err != nil {
 		return MaintenancePreparation{issuer: authority.marker, err: err}
+	}
+	if backend.IsFenced(client) {
+		// Refused before durable admission: a command journaled now would
+		// dispatch whenever the fence lifts, long after the tenant asked.
+		return MaintenancePreparation{
+			issuer: authority.marker,
+			err:    fmt.Errorf("lease %s: %w", leaseUUID, backend.ErrBackendFenced),
+		}
 	}
 	if command.Kind() == MaintenanceCommandUpdate && authority.payloads == nil {
 		return MaintenancePreparation{

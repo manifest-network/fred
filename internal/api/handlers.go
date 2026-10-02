@@ -80,6 +80,8 @@ func placementInventoryReadinessError(readiness placement.InventoryReadiness) er
 		return errors.New("authoritative placement inventory has not completed")
 	case placement.InventoryAuthorityWithdrawn:
 		return errors.New("placement store authority was withdrawn")
+	case placement.InventoryFencedReporterUnaccounted:
+		return errors.New("a fenced backend may hold a lease with no placement row")
 	default:
 		return fmt.Errorf("unknown placement inventory readiness %d", readiness)
 	}
@@ -1672,11 +1674,18 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 		for _, result := range backendResults {
 			metrics.HealthCheckDuration.WithLabelValues(healthCheckBackend, result.Name).Observe(result.ProbeDuration().Seconds())
 			checkKey := "backend:" + result.Name
-			if result.Healthy {
+			switch {
+			case result.Healthy:
 				checks[checkKey] = &CheckResult{
 					Status: checkStatusHealthy,
 				}
-			} else {
+			case result.Fenced:
+				// Fenced by configuration: reported, but not a new failure.
+				checks[checkKey] = &CheckResult{
+					Status:  checkStatusUnhealthy,
+					Message: "backend is fenced",
+				}
+			default:
 				slog.Warn("health check: backend unhealthy", "backend", result.Name, "error", result.Error)
 				checks[checkKey] = &CheckResult{
 					Status:  checkStatusUnhealthy,
@@ -1715,8 +1724,11 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 			return placementInventoryReadinessError(readiness)
 		})
 		clientMsg := "placement inventory not ready"
-		if readiness == placement.InventoryRecoveryPending {
+		switch readiness {
+		case placement.InventoryRecoveryPending:
 			clientMsg = "placement inventory recovery pending"
+		case placement.InventoryFencedReporterUnaccounted:
+			clientMsg = "placement inventory waits on a fenced backend"
 		}
 		record(healthCheckInventory, true,
 			"health check: placement inventory not bootstrapped",

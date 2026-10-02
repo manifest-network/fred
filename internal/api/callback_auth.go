@@ -68,9 +68,12 @@ type CallbackAuthenticator struct {
 // CallbackKey is one backend's callback authentication: its configured name,
 // which labels metrics only after its key verified a callback, and the keys it
 // may sign with (its current key and, during a rotation, its previous key).
+// A fenced backend's keys authenticate nothing: they only let a refusal of its
+// callbacks be counted as fenced rather than as a forgery.
 type CallbackKey struct {
 	Backend string
 	Keys    hmacauth.VerifyKeys
+	Fenced  bool
 }
 
 // CallbackKeyringAuthenticator verifies callbacks with the keys assigned to the
@@ -78,7 +81,10 @@ type CallbackKey struct {
 // at construction so callers cannot rotate authority behind an in-flight
 // verification. Its zero value is invalid.
 type CallbackKeyringAuthenticator struct {
-	keys                map[backendidentity.ID]CallbackKey
+	keys map[backendidentity.ID]CallbackKey
+	// fenced holds fenced backends' keys. No path from this map issues a
+	// proof; it only classifies a refusal.
+	fenced              map[backendidentity.ID]CallbackKey
 	maxAge              time.Duration
 	canonicalPathPrefix string
 	nowFunc             func() time.Time
@@ -100,6 +106,7 @@ func NewCallbackKeyringAuthenticator(
 		return nil, fmt.Errorf("callback HMAC keyring is required")
 	}
 	owned := make(map[backendidentity.ID]CallbackKey, len(keys))
+	fenced := make(map[backendidentity.ID]CallbackKey)
 	names := make(map[string]backendidentity.ID, len(keys))
 	for storageID, key := range keys {
 		if !storageID.Valid() {
@@ -116,15 +123,24 @@ func NewCallbackKeyringAuthenticator(
 				"callback backend %q is bound to storage %s and %s", key.Backend, owner, storageID,
 			)
 		}
-		for ownerID, other := range owned {
-			if key.Keys.SharesKeyWith(other.Keys) {
-				return nil, fmt.Errorf(
-					"callback HMAC key for storage %s duplicates storage %s", storageID, ownerID,
-				)
+		for _, configured := range []map[backendidentity.ID]CallbackKey{owned, fenced} {
+			for ownerID, other := range configured {
+				if key.Keys.SharesKeyWith(other.Keys) {
+					return nil, fmt.Errorf(
+						"callback HMAC key for storage %s duplicates storage %s", storageID, ownerID,
+					)
+				}
 			}
 		}
-		owned[storageID] = key
+		if key.Fenced {
+			fenced[storageID] = key
+		} else {
+			owned[storageID] = key
+		}
 		names[key.Backend] = storageID
+	}
+	if len(owned) == 0 {
+		return nil, fmt.Errorf("callback HMAC keyring has no unfenced backend")
 	}
 	for _, key := range owned {
 		metrics.APICallbackSignatureKeyTotal.WithLabelValues(key.Backend, metrics.CallbackKeySlotCurrent)
@@ -140,6 +156,7 @@ func NewCallbackKeyringAuthenticator(
 	}
 	return &CallbackKeyringAuthenticator{
 		keys:          owned,
+		fenced:        fenced,
 		maxAge:        DefaultCallbackMaxAge,
 		nowFunc:       time.Now,
 		proofVerifier: proofVerifier,
@@ -158,6 +175,7 @@ const (
 	callbackAuthFailureFuture
 	callbackAuthFailureMismatch
 	callbackAuthFailureUnknownStorage
+	callbackAuthFailureFenced
 )
 
 var callbackAuthFailures = [...]callbackAuthFailure{
@@ -167,6 +185,7 @@ var callbackAuthFailures = [...]callbackAuthFailure{
 	callbackAuthFailureFuture,
 	callbackAuthFailureMismatch,
 	callbackAuthFailureUnknownStorage,
+	callbackAuthFailureFenced,
 }
 
 func (failure callbackAuthFailure) label() string {
@@ -183,6 +202,8 @@ func (failure callbackAuthFailure) label() string {
 		return metrics.CallbackAuthFailureMismatch
 	case callbackAuthFailureUnknownStorage:
 		return metrics.CallbackAuthFailureUnknownStorage
+	case callbackAuthFailureFenced:
+		return metrics.CallbackAuthFailureFenced
 	default:
 		return ""
 	}
@@ -355,12 +376,15 @@ func (a *CallbackKeyringAuthenticator) VerifyCallbackEvidence(
 	if err != nil {
 		return hmacauth.VerifiedRequest{}, fmt.Errorf("%w: %w", errInvalidCallbackPayload, err)
 	}
+	uri := a.canonicalPathPrefix + r.URL.RequestURI()
+	if fencedKey, fenced := a.fenced[storageID]; fenced {
+		return hmacauth.VerifiedRequest{}, a.refuseFenced(fencedKey, r.Method, uri, body, signature)
+	}
 	key, exists := a.keys[storageID]
 	if !exists {
 		callbackAuthFailureUnknownStorage.count()
 		return hmacauth.VerifiedRequest{}, fmt.Errorf("callback backend storage identity is not configured")
 	}
-	uri := a.canonicalPathPrefix + r.URL.RequestURI()
 	proof, slot, err := a.proofVerifier.VerifyRoutedKeysWithTime(
 		key.Keys, r.Method, uri, body, signature,
 		storageID.String(),
@@ -373,6 +397,31 @@ func (a *CallbackKeyringAuthenticator) VerifyCallbackEvidence(
 	}
 	metrics.APICallbackSignatureKeyTotal.WithLabelValues(key.Backend, callbackKeySlotLabel(slot)).Inc()
 	return proof, nil
+}
+
+// errCallbackBackendFenced refuses a callback correctly signed by a fenced
+// backend.
+var errCallbackBackendFenced = errors.New("callback backend is fenced")
+
+// refuseFenced always refuses. It checks the signature only to name the cause:
+// a fenced backend's own callback, or a forgery that merely names its storage.
+func (a *CallbackKeyringAuthenticator) refuseFenced(
+	key CallbackKey,
+	method, uri string,
+	body []byte,
+	signature string,
+) error {
+	err := hmacauth.MatchCallbackKeys(
+		key.Keys, method, uri, body, signature,
+		a.canonicalPathPrefix+"/callbacks/provision",
+		a.maxAge, callbackClockSkewTolerance, a.nowFunc(),
+	)
+	if err != nil {
+		callbackAuthFailureOf(err).count()
+		return err
+	}
+	callbackAuthFailureFenced.count()
+	return fmt.Errorf("%w: %q", errCallbackBackendFenced, key.Backend)
 }
 
 // verifySignatureWithError is like VerifySignature but returns a descriptive error.

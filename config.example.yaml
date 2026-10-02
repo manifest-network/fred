@@ -300,6 +300,13 @@ backends:
     # hmac_secret_previous: ""
     timeout: 30s                     # Request timeout for backend API calls
     default: true                    # Optional fallback marker (at most one)
+    # Contain a backend you no longer trust without removing it: providerd
+    # sends it nothing (its TLS files are not even loaded), refuses its
+    # callbacks, routes no new lease to it, and stops reading its inventory.
+    # Its leases keep their placement and wait. Needs a per-backend
+    # hmac_secret on every backend and at least one unfenced backend.
+    # See SECURITY.md, "Containing a compromised backend".
+    # fenced: false
 
   # ---------------------------------------------------------------------------
   # Exact UUID matching examples (production with on-chain SKU UUIDs)

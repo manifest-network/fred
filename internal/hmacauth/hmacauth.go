@@ -368,6 +368,29 @@ func (verifier CallbackProofVerifier) VerifyRoutedKeysWithTime(
 	}, slot, nil
 }
 
+// MatchCallbackKeys checks a callback signature exactly as
+// VerifyRoutedKeysWithTime does but issues no proof: nil means keys signed
+// this callback, which grants nothing. It lets a verifier name the cause of a
+// refusal it makes regardless, such as a callback from a fenced backend.
+func MatchCallbackKeys(
+	keys VerifyKeys,
+	method, uri string,
+	body []byte,
+	signature, callbackPath string,
+	maxAge, clockSkew time.Duration,
+	now time.Time,
+) error {
+	if err := checkCallbackEnvelope(method, uri, callbackPath); err != nil {
+		return err
+	}
+	envelope, err := parseEnvelope(method, uri, body, signature, maxAge, clockSkew, now)
+	if err != nil {
+		return err
+	}
+	_, err = keys.match(envelope.provided, envelope.canonical)
+	return err
+}
+
 // checkCallbackEnvelope binds a callback signature to the callback endpoint, so
 // a signature for another endpoint cannot be promoted to callback authority.
 func checkCallbackEnvelope(method, uri, callbackPath string) error {

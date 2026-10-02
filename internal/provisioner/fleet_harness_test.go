@@ -746,6 +746,10 @@ type fleet struct {
 	leaseMu     sync.Mutex
 	leases      map[string]billingtypes.Lease
 	getLeaseErr error
+
+	// liveRouterEntries keeps the unfenced clients once restartFenced swaps
+	// some out, so a later restart can lift the fence.
+	liveRouterEntries []backend.BackendEntry
 }
 
 // fleetReconcilerTracker composes the production operation registry with the

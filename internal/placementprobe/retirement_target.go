@@ -37,6 +37,8 @@ const (
 	// identity no backend has ever been pinned to, such as a host rebuilt on
 	// new disks.
 	RetirementTargetOtherStorage
+	// RetirementTargetFenced: the target is fenced, so it was not asked.
+	RetirementTargetFenced
 )
 
 func (liveness RetirementTargetLiveness) String() string {
@@ -45,6 +47,8 @@ func (liveness RetirementTargetLiveness) String() string {
 		return "no_identity"
 	case RetirementTargetOtherStorage:
 		return "answered_with_other_storage"
+	case RetirementTargetFenced:
+		return "fenced"
 	default:
 		return "invalid"
 	}
@@ -78,6 +82,9 @@ func ProbeRetirementTarget(
 	policy, err := cfg.BackendConnectionPolicy(backendName)
 	if err != nil {
 		return retirementTargetLivenessInvalid, fmt.Errorf("backend %q: compose connection policy: %w", backendName, err)
+	}
+	if policy.Fenced() {
+		return RetirementTargetFenced, nil
 	}
 	observed, err := backend.ProbeStorageIdentity(ctx, policy)
 	if err != nil {

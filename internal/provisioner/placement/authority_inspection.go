@@ -170,6 +170,10 @@ type AuthorityReport struct {
 	RowsOmitted                    int                       `json:"rows_omitted,omitempty"`
 	Diagnostics                    []AuthorityDiagnostic     `json:"diagnostics,omitempty"`
 	DiagnosticsOmitted             int                       `json:"diagnostics_omitted,omitempty"`
+	// UnprojectedFencedReporters are backends that may hold a lease with no
+	// placement row; retiring one records recordless_unproven.
+	UnprojectedFencedReporters        []string `json:"unprojected_fenced_reporters,omitempty"`
+	UnprojectedFencedReportersOmitted int      `json:"unprojected_fenced_reporters_omitted,omitempty"`
 }
 
 // SafeForCutover reports whether the stopped file is wholly on one side of the
@@ -792,6 +796,13 @@ func inspectCurrentMetadata(
 		assessment.report.EmptyInventoryBackends,
 			assessment.report.EmptyInventoryBackendsOmitted =
 			boundedAuthorityIdentities(metadata.EmptyInventoryBackends)
+	}
+	if len(metadata.UnprojectedFencedReporters) == 0 ||
+		(validateCanonicalBackendNames(metadata.UnprojectedFencedReporters, false) == nil &&
+			authorityBackendNamesSafe(metadata.UnprojectedFencedReporters)) {
+		assessment.report.UnprojectedFencedReporters,
+			assessment.report.UnprojectedFencedReportersOmitted =
+			boundedAuthorityIdentities(metadata.UnprojectedFencedReporters)
 	}
 	if metadata.ProviderUUID != expectation.providerUUID {
 		assessment.mixedFinding(

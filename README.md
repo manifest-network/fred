@@ -545,6 +545,7 @@ that it passed. `placement_store` and `placement_inventory` are mandatory in
     "chain": {"status": "healthy"},
     "backend:docker-1": {"status": "healthy"},
     "backend:docker-2": {"status": "unhealthy", "message": "backend health check failed"},
+    "backend:docker-3": {"status": "unhealthy", "message": "backend is fenced"},
     "token_tracker": {"status": "healthy"},
     "placement_store": {"status": "healthy"},
     "placement_inventory": {"status": "healthy"},
