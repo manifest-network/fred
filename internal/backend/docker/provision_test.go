@@ -2,6 +2,7 @@ package docker
 
 import (
 	"archive/tar"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -3220,22 +3221,83 @@ func TestDoProvision_CallbackSanitized_PullFailure(t *testing.T) {
 	assert.Contains(t, prov.LastError, "registry.example.com")
 }
 
-func TestStartupErrorToCallbackMsg(t *testing.T) {
+// TestStartupVerificationAuthorsCuratedSurface pins the curated surface each
+// startup observation authors where it is observed (ENG-508, ENG-1125). Only
+// an observed exit is ContainerExited, the one reason the terminal budget can
+// count; a failed read, a deadline, a cancellation or a container that never
+// stayed running never is.
+func TestStartupVerificationAuthorsCuratedSurface(t *testing.T) {
+	state := func(status string, health HealthStatus) func(context.Context, string) (*ContainerInfo, error) {
+		return func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: status, Health: health, ExitCode: 3}, nil
+		}
+	}
+	unreadable := func(context.Context, string) (*ContainerInfo, error) {
+		return nil, errors.New("docker daemon error")
+	}
+	gated := &manifest.Manifest{Image: "nginx:latest", HealthCheck: &manifest.HealthCheckConfig{
+		Test: []string{"CMD-SHELL", "true"}, Retries: 1,
+	}}
+	plain := &manifest.Manifest{Image: "nginx:latest"}
 	tests := []struct {
-		name string
-		err  error
-		want string
+		name         string
+		service      *manifest.Manifest
+		inspect      func(context.Context, string) (*ContainerInfo, error)
+		timeout      time.Duration
+		cancel       bool
+		wantCallback string
+		wantReason   backend.Reason
 	}{
-		{"unhealthy", fmt.Errorf("container 0 reported unhealthy: exit_code=1; logs: oops"), "container reported unhealthy"},
-		{"exited during startup", fmt.Errorf("container 0 exited during startup (status: exited): exit_code=1"), "container exited during startup"},
-		{"exited during health", fmt.Errorf("container 0 exited while waiting for healthy"), "container exited during health check"},
-		{"timeout", fmt.Errorf("timed out waiting for containers to become healthy"), "container exited during startup"},
-		{"canceled during verification", fmt.Errorf("canceled during startup verification: context canceled"), "container startup verification canceled"},
-		{"inspect failure", fmt.Errorf("failed to inspect container 0 during health check"), "container exited during startup"},
+		{"exited during startup", plain, state("exited", HealthStatusNone), 0, false,
+			backend.MsgContainerExitedDuringStartup, backend.ReasonContainerExited},
+		{"dead during startup", plain, state("dead", HealthStatusNone), 0, false,
+			backend.MsgStartupUnverified, backend.ReasonInternal},
+		{"created during startup", plain, state("created", HealthStatusNone), 0, false,
+			backend.MsgStartupUnverified, backend.ReasonInternal},
+		{"startup inspect failure", plain, unreadable, 0, false,
+			backend.MsgStartupUnverified, backend.ReasonInternal},
+		{"startup canceled", plain, state("running", HealthStatusNone), 0, true,
+			backend.MsgStartupCanceled, backend.ReasonInternal},
+		{"exited during health check", gated, state("exited", HealthStatusNone), 0, false,
+			backend.MsgContainerExitedDuringHealthCheck, backend.ReasonContainerExited},
+		{"removed during health check", gated, state("removing", HealthStatusNone), 0, false,
+			backend.MsgStartupUnverified, backend.ReasonInternal},
+		{"unhealthy", gated, state("running", HealthStatusUnhealthy), 0, false,
+			backend.MsgContainerUnhealthy, backend.ReasonHealthCheckFailed},
+		{"health deadline", gated, state("running", HealthStatusStarting), 100 * time.Millisecond, false,
+			backend.MsgHealthCheckDeadline, backend.ReasonHealthCheckFailed},
+		{"health inspect failure", gated, unreadable, 0, false,
+			backend.MsgStartupUnverified, backend.ReasonInternal},
+		{"health check canceled", gated, state("running", HealthStatusStarting), 0, true,
+			backend.MsgStartupCanceled, backend.ReasonInternal},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, startupErrorToCallbackMsg(tt.err))
+			b := newBackendForTest(&mockDockerClient{
+				InspectContainerFn: tt.inspect,
+				ContainerLogsFn:    func(context.Context, string, int) (string, error) { return "", nil },
+			}, nil)
+			b.cfg.StartupVerifyDuration = time.Millisecond
+			ctx, cancel := context.WithTimeout(t.Context(), cmp.Or(tt.timeout, 10*time.Second))
+			defer cancel()
+			if tt.cancel {
+				cancel()
+			}
+			failure := b.verifyServiceStartup(ctx, tt.service, []string{"c1"}, b.logger)
+			require.NotNil(t, failure)
+			assert.Equal(t, tt.wantCallback, failure.callback)
+			assert.Equal(t, tt.wantReason, failure.reason)
+			assert.NotEqual(t, tt.wantReason == backend.ReasonContainerExited,
+				tt.wantCallback != backend.MsgContainerExitedDuringStartup &&
+					tt.wantCallback != backend.MsgContainerExitedDuringHealthCheck,
+				"only an observed exit may be ContainerExited")
+
+			// The error-only form used by replacements carries the observation
+			// but never the provision surface, which would override their reason.
+			flattened := flattenStartupFailure(failure)
+			var physical *physicalOperationError
+			assert.False(t, errors.As(flattened, &physical))
+			assert.Contains(t, flattened.Error(), tt.wantCallback)
 		})
 	}
 }

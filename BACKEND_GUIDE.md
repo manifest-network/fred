@@ -610,7 +610,7 @@ The close cannot be undone, so the backend authors the verdict where each failur
 
 What this does not cover:
 
-- A workload that crashes during startup verification (before it was ever ready) on a re-provision of an ACTIVE lease is not reported as `failed` by the Docker backend today, so it never reaches the budget; the lease stays `provisioning`. In a multi-service stack, a service that passes its own startup verification and then dies while a later service is still being verified is also not caught: the stack reports ready with a dead container, the periodic sweep later finds the death without live provenance (never counted), and the lease is re-provisioned every pass. Both are tracked as ENG-1125.
+- A workload that crashes during startup verification (before it was ever ready) never reaches the budget. The Docker backend reports such a provision `failed` once its periodic recovery has settled the attempt (ENG-1125), but does not count it. In a multi-service stack, a service that passes its own startup verification and then dies while a later service is still being verified is also not caught: the stack reports ready with a dead container, the periodic sweep later finds the death without live provenance (never counted), and the lease is re-provisioned every pass. Both are tracked as ENG-1125.
 - The separate immediate close on a validation refusal (`400`) of an ACTIVE lease's re-provision is unchanged by this section (ENG-800).
 
 ### GET /logs/{lease_uuid}

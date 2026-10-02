@@ -619,7 +619,10 @@ func TestTerminalBudget_ExportedMutatorsOnlyMoveTowardReset(t *testing.T) {
 // without deciding whether it may count fails here.
 func TestReasonEligibleForBudget_EveryDeclaredReason(t *testing.T) {
 	decisions := map[string]bool{
-		"ReasonContainerExited":        true,
+		"ReasonContainerExited": true,
+		// A health check that never passed is a definite failure that never
+		// counts (ENG-1125).
+		"ReasonHealthCheckFailed":      false,
 		"ReasonImagePullFailed":        false,
 		"ReasonInternal":               false,
 		"ReasonRestartFailed":          false,

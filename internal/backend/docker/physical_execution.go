@@ -663,12 +663,26 @@ func (b *Backend) doRestorePhysical(
 		}
 	}
 	replacePhaseDurationSeconds.WithLabelValues("restore", phaseAdopt).Observe(time.Since(adoptStart).Seconds())
-	return b.doReplacePhysical(ctx, mutations, replaceContainersOp{
+	err = b.doReplacePhysical(ctx, mutations, replaceContainersOp{
 		LeaseUUID: subject.LeaseUUID(), Stack: record.StackManifest,
 		Items: intent.EffectiveItems(), ResourceProfiles: intent.ResourceProfiles(),
 		Operation: "restore",
 		Logger:    physicalLogger(b, subject.LeaseUUID()),
 	})
+	// A restore's startup failure is the restore's own: author its surface
+	// here, at the source, so the attempt's first capture (which recovery
+	// later publishes) names the restore and its startup cause rather than an
+	// internal error (ENG-1125). The live outcome stays ambiguous; recovery
+	// settles it from the kept, exited cohort.
+	var startup *replacementStartupError
+	if errors.As(err, &startup) {
+		return &physicalOperationError{
+			callback: backend.MsgRestoreFailed + ": " + startup.message,
+			reason:   backend.ReasonRestoreFailed,
+			cause:    err,
+		}
+	}
+	return err
 }
 
 func (b *Backend) doMaintenancePhysical(
@@ -818,7 +832,7 @@ func (b *Backend) executeRestorePhysicalOutcome(
 			cause = errors.New("restore substrate is exactly absent")
 		}
 		result, err := leasesm.NewRestoreReplaceFailure(cause, leasesm.ReplaceFailureDetails{
-			Reason: backend.ReasonRestoreFailed, CallbackErr: "restore failed", LastError: cause.Error(),
+			Reason: backend.ReasonRestoreFailed, CallbackErr: backend.MsgRestoreFailed, LastError: cause.Error(),
 		}, proof)
 		if err != nil {
 			return mustRestoreAmbiguous(err, claim)

@@ -1015,7 +1015,7 @@ After all containers in a lease are started, the backend verifies they are ready
 
 ### No health check (fixed-wait path)
 
-When the manifest has no `health_check` (or sets `Test[0]` to `"NONE"`), the backend waits for `StartupVerifyDuration` (default 5s) and then inspects each container. If any container has exited during this window, the entire provision is marked as failed and cleaned up.
+When the manifest has no `health_check` (or sets `Test[0]` to `"NONE"`), the backend waits for `StartupVerifyDuration` (default 5s) and then inspects each container. If any container has exited during this window, the provision fails with reason `ContainerExited`. Its containers were already launched, so the live outcome is ambiguous: the worker keeps the exited cohort, and the next periodic operation recovery removes it, proves the attempt absent, publishes the lease `failed` and settles the callback (ENG-1125). A failed inspection, a cancellation or a container in any other non-running state is `Internal`; none of them is `ContainerExited`.
 
 This catches containers that crash immediately on startup due to bad configuration, read-only filesystem errors, missing dependencies, or similar issues -- before a success callback is sent and the lease is acknowledged as active on chain.
 
@@ -1026,11 +1026,11 @@ Note: the runtime uses `cmp.Or` to fall back to 5s when the value is zero, so se
 When the manifest declares an active health check (`health_check` with `Test[0]` of `"CMD"` or `"CMD-SHELL"`), the backend polls every 2s until all containers report `healthy`. The behavior on each poll:
 
 - **`healthy`** -- container passes, removed from the pending set.
-- **`unhealthy`** -- provision fails immediately with an error.
-- **Container exited** -- provision fails immediately (caught before checking health status).
+- **`unhealthy`** -- provision fails immediately with reason `HealthCheckFailed`.
+- **Container exited** -- provision fails immediately with reason `ContainerExited` (caught before checking health status).
 - **`starting`** -- keep polling.
 
-The polling is bounded by the existing `ProvisionTimeout` context (default 10m). If the timeout fires before all containers are healthy, the provision fails. Operators must ensure `ProvisionTimeout` is compatible with their health check timing (start period + interval * retries).
+The polling is bounded by the existing `ProvisionTimeout` context (default 10m). If the timeout fires before all containers are healthy, the provision fails with reason `HealthCheckFailed`. Operators must ensure `ProvisionTimeout` is compatible with their health check timing (start period + interval * retries). As on the fixed-wait path, these failures are settled by the next periodic operation recovery.
 
 A health check defined in the Dockerfile but not in the manifest does **not** trigger the health-aware path -- the manifest is the contract.
 
