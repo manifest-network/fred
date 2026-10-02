@@ -128,6 +128,7 @@ type fakeBackendServer struct {
 	provisionStatus   int
 	provisionBody     string
 	lifecycleByLease  map[string]backend.LifecycleGenerationObservation
+	failureByLease    map[string]fakeFailureReport
 	restoreCalls      map[string]int
 	restoreRequests   map[string]backend.RestoreRequest
 	restoreHook       func(context.Context, backend.RestoreRequest) error
@@ -145,6 +146,7 @@ func newFakeBackendServer(t testing.TB, name string) *fakeBackendServer {
 		provisionCalls:    make(map[string]int),
 		provisionRequests: make(map[string]backend.ProvisionRequest),
 		lifecycleByLease:  make(map[string]backend.LifecycleGenerationObservation),
+		failureByLease:    make(map[string]fakeFailureReport),
 		restoreCalls:      make(map[string]int),
 		restoreRequests:   make(map[string]backend.RestoreRequest),
 		deprovisionCalls:  make(map[string]int),
@@ -331,6 +333,7 @@ func (f *fakeBackendServer) handleListProvisions(w http.ResponseWriter, r *http.
 		return
 	}
 	f.attachLifecycleObservations(all)
+	f.attachFailureReports(all)
 	page, next := backend.PaginateProvisions(all, cont, limit)
 	if page == nil {
 		page = []backend.ProvisionInfo{}
@@ -373,6 +376,9 @@ func (f *fakeBackendServer) handleGetProvision(w http.ResponseWriter, r *http.Re
 	if observed := f.lifecycleObservation(info.LeaseUUID); observed != nil {
 		info.LifecycleGeneration = observed
 	}
+	f.mu.Lock()
+	f.attachFailureReportLocked(info)
+	f.mu.Unlock()
 	writeJSON(w, info)
 }
 
@@ -624,6 +630,46 @@ func (f *fakeBackendServer) attachLifecycleObservations(provisions []backend.Pro
 	}
 }
 
+// fakeFailureReport is what a backend reports about a lease's failures: the
+// lifetime fail_count and, from an ENG-799 backend, its terminal budget. A nil
+// budget models an older backend that reports none.
+type fakeFailureReport struct {
+	failCount int
+	budget    *backend.TerminalBudgetObservation
+}
+
+// seedFailureReport makes this backend report the given failure state for a
+// lease on every provision read.
+func (f *fakeBackendServer) seedFailureReport(
+	leaseUUID string,
+	failCount int,
+	budget *backend.TerminalBudgetObservation,
+) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failureByLease[fleetLeaseUUID(leaseUUID)] = fakeFailureReport{failCount: failCount, budget: budget}
+}
+
+func (f *fakeBackendServer) attachFailureReports(provisions []backend.ProvisionInfo) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for index := range provisions {
+		f.attachFailureReportLocked(&provisions[index])
+	}
+}
+
+func (f *fakeBackendServer) attachFailureReportLocked(info *backend.ProvisionInfo) {
+	report, ok := f.failureByLease[info.LeaseUUID]
+	if !ok {
+		return
+	}
+	info.FailCount = report.failCount
+	if report.budget != nil {
+		budget := *report.budget
+		info.TerminalBudget = &budget
+	}
+}
+
 func (f *fakeBackendServer) seedRetention(leaseUUID string) {
 	leaseUUID = fleetLeaseUUID(leaseUUID)
 	existing, _ := f.mock.ListRetentions(context.Background())
@@ -747,6 +793,8 @@ type fleet struct {
 	acked    []string
 	rejected []string
 	closed   []string
+	// closeReasons records the on-chain reason of every close, by lease.
+	closeReasons map[string]string
 
 	leaseMu     sync.Mutex
 	leases      map[string]billingtypes.Lease
@@ -893,9 +941,15 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 			f.chainMu.Unlock()
 			return uint64(len(uuids)), nil, nil
 		},
-		CloseLeasesFunc: func(_ context.Context, uuids []string, _ string) (uint64, []string, error) {
+		CloseLeasesFunc: func(_ context.Context, uuids []string, reason string) (uint64, []string, error) {
 			f.chainMu.Lock()
 			f.closed = append(f.closed, uuids...)
+			if f.closeReasons == nil {
+				f.closeReasons = make(map[string]string)
+			}
+			for _, uuid := range uuids {
+				f.closeReasons[uuid] = reason
+			}
 			f.chainMu.Unlock()
 			return uint64(len(uuids)), nil, nil
 		},
@@ -919,10 +973,9 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 	require.True(t, f.placement.CurrentAdmissionBaseline().Valid(),
 		"fleet baseline must survive reconciliation coordinator construction")
 	reconcilerConfig := ReconcilerConfig{
-		Interval:               opts.interval,
-		MaxReprovisionAttempts: 3,
-		Coordinator:            reconciliation,
-		ShutdownSweepGrace:     opts.shutdownSweepGrace,
+		Interval:           opts.interval,
+		Coordinator:        reconciliation,
+		ShutdownSweepGrace: opts.shutdownSweepGrace,
 	}
 	f.reconcilerCfg = reconcilerConfig
 	rec, err := newTestReconciler(t, reconcilerConfig, f.chain, ack, router, f.tracker, f.placement)
@@ -1005,6 +1058,15 @@ func (f *fleet) chainCalls() (acked, rejected, closed []string) {
 	return append([]string(nil), f.acked...),
 		append([]string(nil), f.rejected...),
 		append([]string(nil), f.closed...)
+}
+
+// closeReason returns the on-chain reason a lease was closed with, if it was.
+func (f *fleet) closeReason(uuid string) (string, bool) {
+	uuid = fleetLeaseUUID(uuid)
+	f.chainMu.Lock()
+	defer f.chainMu.Unlock()
+	reason, ok := f.closeReasons[uuid]
+	return reason, ok
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

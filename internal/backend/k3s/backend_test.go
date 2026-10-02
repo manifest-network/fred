@@ -505,7 +505,7 @@ func TestProvision_AllowsRetryAfterFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	assert.Equal(t, 2, info.FailCount,
-		"FailCount must carry forward across retry-after-failure cycles for reconciler ceiling enforcement")
+		"FailCount must carry forward across retry-after-failure cycles as the lifetime diagnostic")
 
 	list, err := b.ListProvisions(context.Background())
 	require.NoError(t, err)

@@ -508,6 +508,7 @@ List currently provisioned resources. Used by Fred for reconciliation. Keyset-pa
       "reason": "",
       "message": "",
       "lifecycle_generation": {"kind": "typed", "id": "550e8400-e29b-41d4-a716-446655440001"},
+      "terminal_budget": {"verdict": "retry", "consecutive_failures": 0},
       "image": "nginx:latest",
       "sku": "docker-nginx",
       "quantity": 1,
@@ -532,7 +533,8 @@ replace a confirmed owner's result. These reads grant no placement authority.
 **Complete-inventory limits:** Fred accepts at most 100,000 items and 128 MiB of cumulative response-body bytes (including whitespace) for each complete `/provisions` or `/retentions` inventory, independently of page size. Complete `/provisions` and `/retentions` walks share one per-client recovery slot, independent of the tenant circuit breaker. The configured backend HTTP timeout bounds queueing and the entire walk, including every page and body read. Inventory neither trips nor resets the tenant breaker; filtered workload lookups and other tenant calls still use it. Exceeding a count, byte or time limit fails the whole walk; no partial result is usable as ownership, settlement or repair evidence.
 
 **Fields:**
-- `fail_count` - Number of provision failures for this lease
+- `fail_count` - Lifetime count of failures recorded for this lease, whoever caused them. Diagnostic only: Fred never closes a lease because of it (see `terminal_budget`).
+- `terminal_budget` (optional) - The lease's consecutive-failure budget: `verdict` (`retry` or `exhausted`) and `consecutive_failures`. Fred closes an ACTIVE lease for repeated failure only on an `exhausted` verdict; see [Terminal failure budget](#terminal-failure-budget-eng-799). Omission is backward-compatible and means Fred never closes the lease for repeated failure.
 - `reason` (omitempty) - Stable machine-readable failure category (CamelCase, e.g. `ContainerExited`, `ImagePullFailed`, `Internal`, `Unknown`). Open/add-only set; consumers must tolerate unknown values.
 - `message` (omitempty) - Curated human-readable failure message. MUST NOT contain host paths or raw command output (those stay in the backend's own logs).
 - `lifecycle_generation` (optional) - Non-secret internal observation of the callback pair actually persisted for this live provision: `unknown`, `legacy`, `typed` (with one canonical UUIDv4 `id`), or `unusable`. Never return either callback URL here. Omission is backward-compatible and is treated as `unknown`; retained-only records should omit it, and diagnostic-only records MUST NOT appear in list/lookup inventory. Fred uses an exact typed match from a complete, identity-bearing inventory to settle a durable attempt, verify lifecycle authority, and pair the row's `tenant`/`provider_uuid` with an existing prepared placement as its runtime maintenance principal. It never treats these fields as permission to bootstrap an absent authority file, and partial inventory cannot establish or change the principal. A singular `GET /provisions/{lease_uuid}` diagnostics fallback may repeat its historically captured observation for read-model continuity, but that expiring/recreateable diagnostic is not settlement or repair authority.
@@ -562,6 +564,7 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "status": "failed",
   "fail_count": 3,
+  "terminal_budget": {"verdict": "retry", "consecutive_failures": 1},
   "reason": "ContainerExited",
   "message": "container exited unexpectedly",
   "created_at": "2024-01-15T10:30:00Z"
@@ -571,13 +574,36 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
 **Fields:**
 - `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, or `deprovisioning`. A backend that implements soft-delete/retention (see `/restore` below) also returns `retained` for a closed or expired lease whose data is retained, alongside `items` (the restore shape).
 - `retained_until` (optional) - RFC3339 retention deadline for retained data with a configured age limit. Omit it when age-based expiry is disabled; do not encode a zero timestamp as a deadline. Other retention policy and capacity limits still apply.
-- `fail_count` - Number of provision failures
+- `fail_count` - Lifetime count of recorded failures (diagnostic only, as for `GET /provisions`)
+- `terminal_budget` (optional) - A live record reports the same budget as `GET /provisions`, which Fred also shows tenants. A diagnostics fallback or a retained record MUST omit it.
 - `reason` (omitempty) - Stable machine-readable failure category (CamelCase, e.g. `ContainerExited`, `ImagePullFailed`, `Internal`, `Unknown`). Open/add-only set; consumers must tolerate unknown values.
 - `message` (omitempty) - Curated human-readable failure message. MUST NOT contain host paths or raw command output (those stay in the backend's own logs).
 - `lifecycle_generation` (optional) - A live record reports the same non-secret observation described for `GET /provisions`. A persisted diagnostics fallback may repeat the historical observation captured with the failure so point reads do not change shape after teardown. It remains observability only: diagnostic rows are excluded from list/lookup inventory and MUST NOT authorize settlement, repair, or mutation.
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned (or diagnostics expired)
+
+### Terminal failure budget (ENG-799)
+
+When an ACTIVE lease's provision is `failed`, Fred re-provisions it on the next reconciliation pass. It closes the lease on-chain instead, with the fixed reason `workload failed repeatedly`, only when **all** of these hold for the row in a complete `GET /provisions` inventory:
+
+- `status` is `failed`;
+- `terminal_budget.verdict` is exactly `exhausted`;
+- `terminal_budget.consecutive_failures` is at least 1.
+
+An absent `terminal_budget`, any other `verdict` (including `""`), or an `exhausted` verdict on a row that is not `failed` never closes the lease. Fred counts each verdict it sees in `fred_reconciler_terminal_verdicts_total{verdict}`: `absent` means the backend does not implement this section, so a crash-looping lease on it is re-provisioned and billed indefinitely. `fail_count` no longer has any effect on closing; it is a lifetime diagnostic.
+
+The close cannot be undone, so the backend authors the verdict where each failure happens, never by deriving it from `fail_count` or from `reason`. The policy the bundled Docker backend implements, and the one recommended for third-party backends:
+
+- **Count only the tenant's own workload exits.** A failure counts only when the backend positively observed the tenant's own process exiting while the lease was ready. Every exit status counts, including 0, 137 and 143, and an OOM kill at the workload's own limit; an exit code cannot tell a self-kill from an external one, so attribution must come from how the death was observed. The Docker backend counts a `die` event only when the same continuous event subscription also saw that run's `start` and no `kill` (an API signal: `docker kill`, `docker stop`, or the daemon stopping it).
+- **Never count anything else**: a death after an observed signal; a container that vanished or is `removing`/`dead`; a death found only by a periodic inventory sweep; a host reboot or backend restart; a restart, update or restore outcome, whether it rolled back or not; a refusal before any substrate effect (image admission or pull); an internal error or a cohort that diverged from its release; anything unclassified.
+- **Consecutive, with a sustained-Ready reset.** Three consecutive counted failures make the verdict `exhausted`. The count resets to zero at the next transition after the lease has stayed ready for 10 minutes, anchored on entering ready (the kubelet's crash-loop reset; Cloud Foundry and the ECS deployment circuit breaker likewise count consecutive failures and reset on health). A tenant-initiated restart or update also resets it. A failure that does not count neither increments nor resets the streak.
+- **Exhausted describes the current failure.** Report `exhausted` only while the lease is `failed` and only if the failure that made it `failed` was itself counted. Any later uncounted failure, re-provision or ready state reports `retry`.
+- **Report the recorded count.** `consecutive_failures` is the count as last recorded; time alone never changes it, so a row's JSON (which Fred folds into repair confirmations) changes only at transitions. A lease that has been ready for a long time can therefore still show an old count until its next transition resets it.
+- **A backend restart may reset the budget.** The Docker backend keeps it in memory, as Docker's own daemon restore resets a container's restart count; losing it can only delay a close, never cause one.
+- **Live inventory only.** `GET /provisions` (list and lookup) and a live `GET /provisions/{lease_uuid}` report the budget. A diagnostics fallback and a retained record MUST omit it.
+
+What this does not cover: a workload that crashes during startup verification (before it was ever ready) on a re-provision of an ACTIVE lease is not reported as `failed` by the Docker backend today, so it never reaches the budget. The separate immediate close on a validation refusal (`400`) of an ACTIVE lease's re-provision is also unchanged by this section.
 
 ### GET /logs/{lease_uuid}
 

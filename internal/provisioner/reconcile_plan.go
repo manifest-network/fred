@@ -4,6 +4,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/provisioner/terminalverdict"
 )
 
 // lifecycleAuthority is deliberately not a bool. Its conservative zero value
@@ -52,8 +53,10 @@ type leaseFacts struct {
 
 	hasProvision    bool
 	provisionStatus backend.ProvisionStatus
-	failCount       int
-	maxFailures     int
+	// terminal is the backend's consecutive-failure verdict (ENG-799). The
+	// lifetime FailCount is deliberately not a fact: it never decides a close.
+	// The zero value is an absent verdict, which never closes.
+	terminal terminalverdict.Verdict
 
 	hasMetaHash bool
 	payload     payloadEvidence
@@ -65,12 +68,15 @@ type leaseFacts struct {
 
 // leasePlan is deliberately small and closed within this package. withPayload
 // only has meaning for reconcileActionStart; anomaly controls accounting for
-// ACTIVE drift and failed runtime recovery.
+// ACTIVE drift and failed runtime recovery. exhaustion is the proof the
+// failure-budget close requires; only reconcileActionCloseAndDeprovision
+// carries one.
 type leasePlan struct {
 	action      reconcileAction
 	withPayload bool
 	anomaly     bool
 	reason      string
+	exhaustion  terminalverdict.Exhaustion
 }
 
 // planLease is the level-triggered lease decision table. It is intentionally a
@@ -132,11 +138,14 @@ func planLease(f leaseFacts) leasePlan {
 		if f.provisionStatus != backend.ProvisionStatusFailed {
 			return leasePlan{action: reconcileActionReconcileCustomDomain}
 		}
-		if f.failCount >= f.maxFailures {
+		// Only the backend's exhausted verdict closes: its tenant workload failed
+		// consecutively. An absent or unrecognized verdict re-provisions.
+		if exhaustion, exhausted := f.terminal.Exhausted(); exhausted {
 			return leasePlan{
-				action:  reconcileActionCloseAndDeprovision,
-				anomaly: true,
-				reason:  "reprovision attempts exhausted",
+				action:     reconcileActionCloseAndDeprovision,
+				anomaly:    true,
+				reason:     "workload failure budget exhausted",
+				exhaustion: exhaustion,
 			}
 		}
 		return leasePlan{

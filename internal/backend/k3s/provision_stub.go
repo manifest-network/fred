@@ -109,10 +109,10 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// Mirror docker-backend's status-aware check: only entries in
 	// ProvisionStatusFailed are eligible for replacement. Fred's reconciler
 	// relies on this — it retries failed-active leases by calling Provision
-	// again until FailCount reaches the configured retry ceiling. Rejecting
-	// all existing entries (regardless of status) would loop the reconciler
-	// at 409 forever, never incrementing FailCount, never garbage-collecting
-	// the lease.
+	// again. Rejecting all existing entries (regardless of status) would loop
+	// the reconciler at 409 forever. The scaffold reports no terminal_budget,
+	// so Fred never closes one of its leases for repeated failure (ENG-799);
+	// FailCount is only the lifetime diagnostic.
 	var prevFailCount int
 	if existing, exists := b.provisions[req.LeaseUUID]; exists {
 		if existing.Status != backend.ProvisionStatusFailed {
