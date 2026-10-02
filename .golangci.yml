@@ -67,20 +67,31 @@ linters:
       # standard library's recursive removers and walkers recurse with one open
       # descriptor or one stack frame per level and no work bound, so every
       # recursive removal or traversal goes through internal/fstree, which
-      # bounds descriptors, depth and work (ENG-1117). These two rules are
-      # mirrored by internal/testutil/no_unbounded_tree_traversal_test.go,
-      # which also resolves aliased imports.
+      # bounds descriptors, depth and work (ENG-1117). fstree.RemoveBeneath is
+      # itself an unrestricted recursive delete, so only its two reviewed
+      # wiring sites may call it. These rules are mirrored by
+      # internal/testutil/no_unbounded_tree_traversal_test.go, which also
+      # resolves aliased imports.
+      #
+      # COUPLING: a per-file exemption below is keyed on a bracketed tag that
+      # starts its rules' messages ([composition-writer], [tree-removal-wiring]),
+      # never on prose another rule could reuse. Only the rules that carry a
+      # tag are exempt in its files; every other rule still fires there.
+      # internal/testutil/lint_exemption_test.go pins exactly which rules
+      # carry each tag and which files exempt it.
       forbid:
         - pattern: '\.Destroy$'
-          msg: "managed-volume destruction must use the construction-bound substrate mutation executor"
+          msg: "[composition-writer] managed-volume destruction must use the construction-bound substrate mutation executor"
         - pattern: 'volumes\.Create$'
-          msg: "managed-volume creation must use the construction-bound substrate mutation executor"
+          msg: "[composition-writer] managed-volume creation must use the construction-bound substrate mutation executor"
         - pattern: '\.RetryHeldVolumeDelete$'
-          msg: "held volume deletions are retried only by the hold executor through the construction-bound substrate mutation executor"
+          msg: "[composition-writer] held volume deletions are retried only by the hold executor through the construction-bound substrate mutation executor"
         - pattern: '\.RemoveAll$'
           msg: "recursive removal must use internal/fstree.RemoveBeneath, which bounds descriptors, depth and work"
         - pattern: '^(filepath\.Walk|filepath\.WalkDir|fs\.WalkDir|os\.CopyFS)$'
           msg: "recursive traversal must use internal/fstree.WalkBeneath, which bounds descriptors, depth and work"
+        - pattern: 'fstree\.RemoveBeneath$'
+          msg: "[tree-removal-wiring] tenant trees are removed only at the two reviewed wiring sites: a condemned XFS volume (volume_xfs.go) and the writable-path wipe (storage_mutation_guard.go)"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -110,12 +121,18 @@ linters:
       # The only production file allowed to invoke the raw volume writer. It
       # captures that writer during composition and exposes only subject-bound
       # or fixed background workflows; no request handler receives the sink.
-      # Only the writer rules (Destroy, Create, RetryHeldVolumeDelete) are
-      # exempt here: the tree removal and traversal rules still apply.
+      # Only the [composition-writer] rules (Destroy, Create,
+      # RetryHeldVolumeDelete) are exempt here: every other rule still applies.
       - path: ^internal/backend/docker/storage_mutation_guard\.go$
         linters:
           - forbidigo
-        text: "construction-bound substrate mutation executor"
+        text: '\[composition-writer\]'
+      # The two reviewed wiring sites of fstree.RemoveBeneath: the condemned
+      # XFS volume's removal and the live writable-path wipe.
+      - path: ^internal/backend/docker/(volume_xfs|storage_mutation_guard)\.go$
+        linters:
+          - forbidigo
+        text: '\[tree-removal-wiring\]'
       # Exclude test files from strict linters
       - path: _test\.go
         linters:

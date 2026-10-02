@@ -71,8 +71,9 @@ type xfsProjectAttributes interface {
 	SetProjectID(*os.Root, uint32) error
 	// DetachCondemnedAnchor moves one top-level directory of a condemned
 	// volume to project 0 with PROJINHERIT cleared, so that fstree can cut a
-	// deeper subtree into it. Only condemnedXFSVolume calls it, and only
-	// cleanupXFSDeleteStageWith mints one of those.
+	// deeper subtree into it. Only condemnedXFSVolume.detachAnchor calls it,
+	// and only emptyAndRemoveCondemnedXFSVolume mints a condemnedXFSVolume
+	// (both pinned by TestDeleteHoldTypesHaveSingleConstructors).
 	DetachCondemnedAnchor(anchorFD int, volumeRootDevice uint64) error
 }
 
@@ -1457,10 +1458,12 @@ func (x *xfsVolumeManager) normalizeXFSDeleteStageProjectWith(
 }
 
 // condemnedXFSVolume is the opened root directory of one managed volume whose
-// deletion a parent-durable delete stage authorizes. cleanupXFSDeleteStageWith
-// is the only code that mints one, after it has attested the stage, the
-// project-ID authority and the volume root. Nothing that holds a live volume
-// can therefore obtain one, nor the anchor detach that only it can build.
+// deletion a parent-durable delete stage authorizes. emptyAndRemoveCondemnedXFSVolume,
+// reached only through cleanupXFSDeleteStageWith, is the only code that mints
+// one, after the stage, the project-ID authority and the volume root were
+// attested. Nothing that holds a live volume can therefore obtain one, nor the
+// anchor detach that only it can build (pinned by
+// TestDeleteHoldTypesHaveSingleConstructors).
 type condemnedXFSVolume struct {
 	stage      xfsDeleteStageName
 	dir        *os.File
