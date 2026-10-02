@@ -25,6 +25,17 @@ type backgroundMaintenanceCoordinator struct {
 	reapExpiredRetentionsFn     func(context.Context) (int, error)
 	runRetentionSweepFn         func(context.Context) error
 	enableInlineVolumeDeletesFn func(context.Context)
+	retryHeldVolumeDeletesFn    func(context.Context) volumeDeleteHoldPassReport
+}
+
+// retryHeldVolumeDeletes runs one hold-executor pass over the manager's due
+// held deletions. The targets come from the manager's own hold table, never
+// from the caller.
+func (c *backgroundMaintenanceCoordinator) retryHeldVolumeDeletes(ctx context.Context) volumeDeleteHoldPassReport {
+	if c == nil || c.retryHeldVolumeDeletesFn == nil {
+		return volumeDeleteHoldPassReport{}
+	}
+	return c.retryHeldVolumeDeletesFn(ctx)
 }
 
 var errBackgroundMaintenanceUnavailable = errors.New("background maintenance coordinator is unavailable")
@@ -105,6 +116,10 @@ type backgroundVolumeRename func(context.Context, string, string) error
 type backgroundVolumeQuota func(context.Context, string, int64) error
 type backgroundContainerRemove func(context.Context, string) error
 type backgroundTenantNetworkRemove func(context.Context, string) (tenantNetworkRemoval, error)
+
+// backgroundHeldVolumeDeleteRetry retries one held deletion through the
+// storage-mutation bracket. Only the hold executor's pass receives one.
+type backgroundHeldVolumeDeleteRetry func(context.Context, string) error
 
 // backgroundTeardownCapability is captured privately by the retention
 // reconciliation closure. It satisfies teardownMutationCapability without

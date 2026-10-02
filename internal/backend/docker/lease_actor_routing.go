@@ -710,6 +710,7 @@ func (b *Backend) sampleCloseIntentMetrics(now time.Time) {
 	if b.callbackStore == nil {
 		pendingCloseIntents.Set(0)
 		oldestCloseIntentAgeSeconds.Set(0)
+		closeIntentsDeleteHeld.Set(0)
 		return
 	}
 	claims, err := b.closeSettlement.ListCloseIntents()
@@ -719,6 +720,14 @@ func (b *Backend) sampleCloseIntentMetrics(now time.Time) {
 	}
 
 	pendingCloseIntents.Set(float64(len(claims)))
+	holds := b.volumes.VolumeDeleteHolds()
+	deleteHeld := 0
+	for _, claim := range claims {
+		if b.closeAwaitsHeldDeletes(claim, holds) {
+			deleteHeld++
+		}
+	}
+	closeIntentsDeleteHeld.Set(float64(deleteHeld))
 	if len(claims) == 0 {
 		oldestCloseIntentAgeSeconds.Set(0)
 		return
@@ -777,6 +786,7 @@ func (b *Backend) actorMetricsSampleLoop() {
 			b.sampleActorMetrics()
 			b.sampleCloseIntentMetrics(time.Now())
 			b.sampleLeaseMutationCapacityMetrics()
+			b.sampleVolumeDeleteHoldMetrics()
 		}
 	}
 }

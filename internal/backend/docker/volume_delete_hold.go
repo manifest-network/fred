@@ -1,12 +1,17 @@
 package docker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/metrics/background"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // Held volume deletions (ENG-1117).
@@ -33,6 +38,25 @@ import (
 // Only the background hold executor runs held work, through
 // RetryHeldVolumeDelete in the storage-mutation bracket under the lease's
 // namespace lock.
+
+const (
+	// volumeDeleteHoldInterval paces the hold executor. Its first pass runs as
+	// soon as Start returns.
+	volumeDeleteHoldInterval = 30 * time.Second
+	// volumeDeleteHoldPassBudget bounds one pass over the due holds.
+	volumeDeleteHoldPassBudget = 60 * time.Second
+	// volumeDeleteHoldSlice bounds one hold's attempt, so one large tree
+	// cannot hold its lease's namespace, or the pass, for long; an attempt cut
+	// short is held with reason deadline and stays due.
+	volumeDeleteHoldSlice = 15 * time.Second
+	// volumeDeleteHoldMinSlice is the least budget worth starting an attempt.
+	volumeDeleteHoldMinSlice = time.Second
+	// volumeDeleteHoldResumeBudget bounds the close resumes a pass enqueues
+	// for leases whose holds left the removal phase.
+	volumeDeleteHoldResumeBudget = 30 * time.Second
+	// volumeDeleteHoldComponent labels the executor's recovered panics.
+	volumeDeleteHoldComponent = "docker_volume_delete_hold"
+)
 
 // volumeDeleteHoldView is a read-only copy of one hold. It grants nothing: the
 // executor's retry re-reads the hold under the manager's lock.
@@ -162,3 +186,174 @@ const (
 	// mapping; the destroy answers nil without the lock.
 	destroyPrecheckGone
 )
+
+// precheckDestroy answers a destroy of id from the manager's own state,
+// without the lease's namespace lock (ENG-1117): a removal-phase hold answers
+// ErrVolumeDeleteHeld, and a positively absent name with nothing pending
+// answers nil. answered is false when the destroy must take the lock. It is
+// what keeps a close, the reaper, or HTTP Deprovision from waiting behind the
+// hold executor's slice on a name that needs no work. A malformed name is
+// answered with its parse error, as the locked destroy would.
+func (b *Backend) precheckDestroy(id string) (answered bool, err error) {
+	name, parseErr := parseManagedVolumeName(id)
+	if parseErr != nil {
+		return true, fmt.Errorf("destroy volume %q: %w", id, parseErr)
+	}
+	switch verdict, heldErr := b.volumes.PrecheckDestroy(name); verdict {
+	case destroyPrecheckHeld:
+		return true, heldErr
+	case destroyPrecheckGone:
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+// volumeDeleteHoldPassReport is what one executor pass did.
+type volumeDeleteHoldPassReport struct {
+	// attempted counts the holds the pass retried.
+	attempted int
+	// leftRemoval names the holds that left the removal phase during the pass
+	// (completed, or durably gone and residual): their callers can now settle.
+	leftRemoval []managedVolumeName
+}
+
+// runVolumeDeleteHoldPass retries the due holds, least recently attempted
+// first, one bounded slice each, until ctx (the pass budget) runs out. Each
+// retry runs through retry, which the composition binds to the storage-mutation
+// bracket under the hold's lease namespace; it never takes the global
+// recovery gate, so one hold never stalls another lease.
+func (b *Backend) runVolumeDeleteHoldPass(
+	ctx context.Context,
+	now time.Time,
+	retry backgroundHeldVolumeDeleteRetry,
+) volumeDeleteHoldPassReport {
+	var report volumeDeleteHoldPassReport
+	if retry == nil {
+		return report
+	}
+	for _, hold := range b.volumes.VolumeDeleteHolds().dueInOrder(now) {
+		if ctx.Err() != nil {
+			break
+		}
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < volumeDeleteHoldMinSlice {
+			break
+		}
+		slice, cancel := context.WithTimeout(ctx, volumeDeleteHoldSlice)
+		err := retry(slice, hold.volume.value())
+		cancel()
+		report.attempted++
+		if err != nil && !errors.Is(err, ErrVolumeDeleteHeld) {
+			b.logger.Warn("held volume delete retry failed",
+				"volume_id", hold.volume.value(), "delete_stage", hold.stage, "error", err)
+		}
+		if !hold.residual && !b.volumes.VolumeDeleteHolds().removalHeld(hold.volume.value()) {
+			report.leftRemoval = append(report.leftRemoval, hold.volume)
+		}
+	}
+	return report
+}
+
+// volumeDeleteHoldLoop is the hold executor, the only runner of held
+// deletion work. It runs on the Backend's lifetime, first as soon as it
+// starts, then on volumeDeleteHoldInterval.
+func (b *Backend) volumeDeleteHoldLoop() {
+	ticker := time.NewTicker(volumeDeleteHoldInterval)
+	defer ticker.Stop()
+	for b.stopCtx.Err() == nil {
+		b.runVolumeDeleteHoldIteration()
+		select {
+		case <-b.stopCtx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// runVolumeDeleteHoldIteration is one executor pass inside the cleanup panic
+// boundary: retry the due holds under the pass budget, resume the closes whose
+// holds left the removal phase, and sample the gauges.
+func (b *Backend) runVolumeDeleteHoldIteration() {
+	util.RunCleanupIteration(func() error {
+		passCtx, cancel := context.WithTimeout(b.stopCtx, volumeDeleteHoldPassBudget)
+		report := b.backgroundMaintenance.retryHeldVolumeDeletes(passCtx)
+		cancel()
+		b.resumeClosesAfterHeldDeletes(report.leftRemoval)
+		b.sampleVolumeDeleteHoldMetrics()
+		return nil
+	}, volumeDeleteHoldComponent, func(any) {
+		background.CleanupPanicsTotal.WithLabelValues(volumeDeleteHoldComponent).Inc()
+	})
+}
+
+// resumeClosesAfterHeldDeletes enqueues a close resume for each lease whose
+// held deletion just left the removal phase, so the close settles now instead
+// of on the next reconcile. A lease whose command fence is busy is skipped:
+// the live command holding it observes the same state.
+func (b *Backend) resumeClosesAfterHeldDeletes(names []managedVolumeName) {
+	if len(names) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(b.stopCtx, volumeDeleteHoldResumeBudget)
+	defer cancel()
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		// A retained name belongs to the lease it was retained from, as in
+		// closeAwaitsHeldDeletes.
+		value := name.value()
+		if isRetainedVolume(value) {
+			value = canonicalFromRetained(value)
+		}
+		leaseUUID, ok := leaseUUIDFromVolumeName(value)
+		if !ok {
+			continue
+		}
+		if _, dup := seen[leaseUUID]; dup {
+			continue
+		}
+		seen[leaseUUID] = struct{}{}
+		if ctx.Err() != nil {
+			return
+		}
+		if _, err := b.tryResumeRecoveredClose(ctx, leaseUUID); err != nil {
+			b.logger.Warn("close resume after a held volume delete remains pending",
+				"lease_uuid", leaseUUID, "error", err)
+		}
+	}
+}
+
+// closeAwaitsHeldDeletes reports, from memory only, whether a pending close is
+// waiting on nothing but held deletions: every managed volume name of its
+// items is held in the removal phase, and its projection records no
+// container. Retrying such a close would only advance its durable generation
+// and rewrite its diagnostics; the hold executor resumes it when one of its
+// holds leaves the removal phase. Only a projection can vouch that no
+// container remains, so a close without one (cleanup-only) is never skipped:
+// a remaining container could be the very writer keeping a hold from
+// finishing.
+func (b *Backend) closeAwaitsHeldDeletes(claim shared.CloseIntentClaim, holds volumeDeleteHoldSnapshot) bool {
+	items := claim.Items()
+	if len(items) == 0 {
+		return false
+	}
+	for _, item := range items {
+		for i := range item.Quantity {
+			name := canonicalVolumeName(claim.LeaseUUID(), item.ServiceName, i)
+			if !holds.removalHeld(name) && !holds.removalHeld(retainedName(name)) {
+				return false
+			}
+		}
+	}
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+	projection := b.provisions[claim.LeaseUUID()]
+	return projection != nil && len(projection.ContainerIDs) == 0
+}
+
+// sampleVolumeDeleteHoldMetrics projects the manager's holds into the
+// Backend-owned gauge.
+func (b *Backend) sampleVolumeDeleteHoldMetrics() {
+	removal, residual := b.volumes.VolumeDeleteHolds().phaseCounts()
+	volumeDeleteHolds.WithLabelValues(volumeDeleteHoldPhaseRemoval).Set(float64(removal))
+	volumeDeleteHolds.WithLabelValues(volumeDeleteHoldPhaseResidual).Set(float64(residual))
+}

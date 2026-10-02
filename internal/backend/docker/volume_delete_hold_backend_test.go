@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -266,6 +267,37 @@ func TestReconcileVolumeQuotasCountsDeletePending(t *testing.T) {
 	assert.Equal(t, appliedBefore+1, counter("applied"))
 }
 
+// Start's quota reconciliation against the real XFS manager: a recovered held
+// deletion whose final directory already lost its marker, still named by a
+// closing lease's projection, is skipped rather than failing startup
+// (finding G6).
+func TestStartQuotaReconcileSkipsAHeldMarkerlessXFSVolume(t *testing.T) {
+	b, _ := newBackendWithRetention(t)
+	dataPath := t.TempDir()
+	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
+	require.NoError(t, os.Mkdir(stage.hostPath(dataPath), 0o700))
+	require.NoError(t, os.Mkdir(stage.volumeID.hostPath(dataPath), 0o700)) // marker-less
+	mgr := newXfsManagerForTest(dataPath)
+	require.NoError(t, mgr.loadProjectIDs())
+	b.volumes = mgr
+	installTestStorageMutationAdapters(b)
+	b.cfg.VolumeDataPath = dataPath
+	leaseUUID := managedVolumeLeaseUUID(stage.volumeID)
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
+	b.provisions[leaseUUID] = &provision{ProvisionState: leasesm.ProvisionState{
+		LeaseUUID: leaseUUID, Items: items, ResourceProfiles: testResourceProfiles(t, items),
+		Status: backend.ProvisionStatusDeprovisioning,
+	}}
+	logPath := installLoggingXFSQuota(t)
+	pending := volumeQuotaBackfillTotal.WithLabelValues(quotaBackfillDeletePending)
+	before := testutil.ToFloat64(pending)
+
+	require.NoError(t, b.reconcileVolumeQuotas(t.Context()), "startup quota reconciliation succeeds")
+	assert.Equal(t, before+1, testutil.ToFloat64(pending))
+	assert.NoFileExists(t, logPath, "no limit is touched for a held deletion")
+	assert.True(t, mgr.VolumeDeleteHolds().removalHeld(stage.volumeID.value()))
+}
+
 // The held twin of TestVolumeRecoveryPendingPreservesCloseFinalizersAndRejectsLiveRetry.
 // A held deletion keeps the close pending and observable (503 lifecycle_pending)
 // without latching; once the hold completes, the next attempt completes the close.
@@ -507,5 +539,68 @@ func TestAfterVolumeDestroyPublishesBeforeTheCallerSettles(t *testing.T) {
 	assert.Nil(t, record, "the residual deletion settled the reaping record")
 	assert.Equal(t, base+64, atConfirm.Load(),
 		"by the time the destroy answered nil, the residual footprint was counted")
+	require.NoError(t, b.terminalStorageAuthorityError())
+}
+
+// The reaper's production destroy entry point answers a held retained volume
+// from the pre-lock check: it never waits behind the executor's slice on the
+// lease's namespace, and the REAPING record stays for the next pass.
+func TestReaperAnswersAHeldVolumeWithoutTheLock(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440324"
+	name := retainedName(canonicalVolumeName(leaseUUID, "app", 0))
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	rs := attachRetentionStore(t, b)
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
+		OriginalLeaseUUID: leaseUUID,
+		Tenant:            "tenant-a",
+		Status:            shared.RetentionStatusReaping,
+		Items: []backend.LeaseItem{{
+			SKU: "docker-small", ServiceName: "app", Quantity: 1,
+		}},
+		RetainedVolumeNames: []string{name},
+		CreatedAt:           time.Now(),
+	}))
+	var destroys atomic.Int32
+	b.volumes = &mockVolumeManager{
+		ListFn:              func() ([]string, error) { return []string{name}, nil },
+		VolumeDeleteHoldsFn: func() volumeDeleteHoldSnapshot { return pendingDeletes(name) },
+		PrecheckDestroyFn: func(managedVolumeName) (destroyPrecheckVerdict, error) {
+			return destroyPrecheckHeld, heldDeleteErr(name)
+		},
+		DestroyFn: func(context.Context, string) error {
+			destroys.Add(1)
+			return nil
+		},
+	}
+	installTestStorageMutationAdapters(b)
+
+	parsed, err := parseManagedVolumeName(name)
+	require.NoError(t, err)
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_ = b.volumeAccess.mutateNamespace(context.Background(), []managedVolumeName{parsed},
+			func(context.Context) error {
+				close(holding)
+				<-release
+				return nil
+			})
+	})
+	<-holding
+	defer func() { close(release); wg.Wait() }()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	started := time.Now()
+	// The sweep's other stages may report unrelated fixture gaps; only the
+	// reaping finalizer, which runs the production destroy entry point, matters.
+	_ = b.runRetentionSweep(ctx)
+	assert.Less(t, time.Since(started), 5*time.Second, "the reaper must not wait behind the executor's slice")
+	assert.Zero(t, destroys.Load(), "a held deletion is answered without Destroy")
+	record, err := rs.Get(leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, record, "the record still accounts for the bytes")
+	assert.Equal(t, shared.RetentionStatusReaping, record.Status)
 	require.NoError(t, b.terminalStorageAuthorityError())
 }

@@ -117,12 +117,23 @@ func newBackgroundMaintenanceCoordinator(
 	})
 	destroyVolumes := backgroundVolumeDestroyCapability{
 		destroyFn: func(ctx context.Context, id string) error {
+			if answered, err := backend.precheckDestroy(id); answered {
+				return backend.afterVolumeDestroy(err)
+			}
 			return backend.afterVolumeDestroy(performVolume(ctx, []string{id}, "background destroy volume",
 				func(ctx context.Context) error {
 					return ops.volumes.Destroy(ctx, id)
 				}))
 		},
 	}
+	// The hold executor's retry: the per-lease namespace lock and the
+	// authorize/complete bracket, never the global recovery gate.
+	retryHeldVolumeDelete := backgroundHeldVolumeDeleteRetry(func(ctx context.Context, id string) error {
+		return backend.afterVolumeDestroy(performVolume(ctx, []string{id}, "retry held volume delete",
+			func(ctx context.Context) error {
+				return ops.volumes.RetryHeldVolumeDelete(ctx, id)
+			}))
+	})
 	teardown := backgroundTeardownCapability{
 		downFn: func(ctx context.Context, leaseUUID string, timeout time.Duration) error {
 			return perform(ctx, "background compose down", func(ctx context.Context) error {
@@ -175,6 +186,9 @@ func newBackgroundMaintenanceCoordinator(
 			return backend.runRetentionSweepUsing(ctx, renameVolume, teardown, destroyVolumes, ensureVolumeQuota)
 		},
 		enableInlineVolumeDeletesFn: func(context.Context) { ops.volumes.EnableInlineVolumeDeletes() },
+		retryHeldVolumeDeletesFn: func(ctx context.Context) volumeDeleteHoldPassReport {
+			return backend.runVolumeDeleteHoldPass(ctx, time.Now(), retryHeldVolumeDelete)
+		},
 	}, nil
 }
 
@@ -488,6 +502,9 @@ func (m *storageMutations) destroyVolume(ctx context.Context, id string) error {
 	name, err := parseManagedVolumeName(id)
 	if err != nil || !m.volumeNameInScope(name) {
 		return fmt.Errorf("destroy volume target %q differs from Started subject", id)
+	}
+	if answered, err := m.ops.backend.precheckDestroy(id); answered {
+		return m.ops.backend.afterVolumeDestroy(err)
 	}
 	return m.ops.backend.afterVolumeDestroy(m.ops.backend.mutateManagedVolumeNamespace(ctx, []string{id},
 		func(ctx context.Context) error {
@@ -1331,6 +1348,22 @@ func (m *storageMutations) recoverRestoreNamespaces(ctx context.Context) error {
 			return fmt.Errorf("re-quarantine recovered restore volume %q: %w", volume.canonical, err)
 		}
 	}
+	// A restore-created volume whose deletion is held answers without the
+	// namespace lock, which the hold executor may be holding, and the rollback
+	// stays pending for a later pass; one already gone needs no destroy
+	// (ENG-1117).
+	stillCreated := created[:0]
+	for _, name := range created {
+		answered, err := b.precheckDestroy(name)
+		if !answered {
+			stillCreated = append(stillCreated, name)
+			continue
+		}
+		if err := b.afterVolumeDestroy(err); err != nil {
+			return fmt.Errorf("destroy restore-created volume %q: %w", name, err)
+		}
+	}
+	created = stillCreated
 	if len(original) == 0 && len(created) == 0 {
 		return nil
 	}

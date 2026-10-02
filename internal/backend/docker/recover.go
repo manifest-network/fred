@@ -346,10 +346,29 @@ func (b *Backend) resumeRecoveredClose(
 	// the replacement generation.
 	unlockCommand := b.commandFence.Lock(claim.LeaseUUID())
 	defer unlockCommand()
+	return b.resumeRecoveredCloseFenced(ctx, claim.LeaseUUID())
+}
+
+// tryResumeRecoveredClose is resumeRecoveredClose for background work that
+// must not wait on a busy lease: it reports resumed=false when the command
+// fence is held, whose holder observes the same durable state.
+func (b *Backend) tryResumeRecoveredClose(ctx context.Context, leaseUUID string) (resumed bool, err error) {
+	unlock, acquired := b.commandFence.TryLock(leaseUUID)
+	if !acquired {
+		return false, nil
+	}
+	defer unlock()
+	return true, b.resumeRecoveredCloseFenced(ctx, leaseUUID)
+}
+
+// resumeRecoveredCloseFenced re-reads the lease's durable close authority and,
+// when a close is still pending, routes it through the lease actor. The caller
+// holds the lease's command fence.
+func (b *Backend) resumeRecoveredCloseFenced(ctx context.Context, leaseUUID string) error {
 	if b.callbackStore == nil {
 		return errors.New("resume recovered close requires a callback store")
 	}
-	current, found, err := b.closeSettlement.GetCloseIntent(claim.LeaseUUID())
+	current, found, err := b.closeSettlement.GetCloseIntent(leaseUUID)
 	if err != nil {
 		return fmt.Errorf("re-read recovered close intent: %w", err)
 	}
@@ -2154,7 +2173,17 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// resumeRecoveredClose preserves the close journal, its durable attempt
 	// count, and actor-owned retry state, so the next level-triggered sweep can
 	// retry without reconstructing authority from survivors.
+	//
+	// A close waiting on nothing but held volume deletions is skipped, answered
+	// from memory with no Docker, disk or store I/O: retrying it would only
+	// advance its durable generation and rewrite its diagnostics on every tick.
+	// The hold executor resumes it once one of its holds leaves the removal
+	// phase (ENG-1117).
+	holds := b.volumes.VolumeDeleteHolds()
 	for _, leaseUUID := range slices.Sorted(maps.Keys(closeIntents)) {
+		if b.closeAwaitsHeldDeletes(closeIntents[leaseUUID], holds) {
+			continue
+		}
 		closeErr := b.resumeRecoveredClose(ctx, closeIntents[leaseUUID])
 		if closeErr != nil {
 			executionGeneration := closeIntents[leaseUUID].ExecutionGeneration().Number()

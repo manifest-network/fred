@@ -2878,9 +2878,14 @@ func (b *Backend) Start(ctx context.Context) error {
 	b.callbackStore.StartMaintenance()
 	b.releaseStore.StartMaintenance()
 	b.startRetentionReaper()
-	// From here on a first-time volume deletion may run inline under its short
-	// budget; until now every deletion was handed to the hold executor at once.
+	// Start the hold executor, the only runner of held volume deletions; its
+	// first pass runs at once. From here on a first-time deletion may also run
+	// inline under its short budget: until now every deletion was handed to the
+	// executor without an attempt, so Start never waited on a tenant tree
+	// (ENG-1117).
 	b.backgroundMaintenance.enableInlineVolumeDeletes(startupCtx)
+	b.sampleVolumeDeleteHoldMetrics()
+	b.wg.Go(b.volumeDeleteHoldLoop)
 
 	// Replay callbacks on the tracked lifecycle goroutine. A Fred outage can
 	// consume the full delivery retry budget, so replay must not delay backend
