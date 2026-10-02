@@ -247,7 +247,16 @@ type mockDockerClient struct {
 	ContainerEventsFn             func(ctx context.Context) (<-chan ContainerEvent, <-chan error)
 	// SeccompProfiles replaces the process tenant seccomp profile source for
 	// the mock's image runtime and its pre-launch check.
-	SeccompProfiles imageexec.TenantSeccompSource
+	SeccompProfiles       imageexec.TenantSeccompSource
+	TenantSeccompCensusFn func(context.Context) (tenantSeccompCensus, error)
+}
+
+// TenantSeccompCensus reports an empty census unless a test supplies one.
+func (m *mockDockerClient) TenantSeccompCensus(ctx context.Context) (tenantSeccompCensus, error) {
+	if m.TenantSeccompCensusFn != nil {
+		return m.TenantSeccompCensusFn(ctx)
+	}
+	return tenantSeccompCensus{}, nil
 }
 
 func (m *mockDockerClient) Ping(ctx context.Context) error {

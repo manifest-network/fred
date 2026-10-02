@@ -1,15 +1,22 @@
 package docker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"time"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/errdefs"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/docker/tenantseccomp"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -179,4 +186,110 @@ func refuseCreate(req *http.Request, err error) (*http.Response, error) {
 		_ = req.Body.Close()
 	}
 	return nil, err
+}
+
+// tenantSeccompCensus is one completed census pass: the live containers of
+// this backend whose effective seccomp profile is not the current tenant
+// profile. Only a pass that listed and inspected every container yields one;
+// a failed pass yields an error and no count.
+type tenantSeccompCensus struct{ withoutCurrent int }
+
+// TenantSeccompCensus lists every fred-managed container of this backend,
+// whatever its labels say otherwise, inspects each through the SDK, and
+// counts those running, restarting or paused without the current profile.
+// It judges the unmodified HostConfig with dockerd's own rule: the last
+// seccomp option is the one applied, and a privileged container has none. A
+// container removed between list and inspect is skipped; any other failure
+// fails the pass. It never changes a container.
+func (d *DockerClient) TenantSeccompCensus(ctx context.Context) (tenantSeccompCensus, error) {
+	if d == nil || util.IsNilInterface(d.tenantSeccomp) {
+		return tenantSeccompCensus{}, errors.New("the Docker client has no tenant profile source")
+	}
+	profile, err := d.tenantSeccomp.TenantSeccompProfile()
+	if err != nil {
+		return tenantSeccompCensus{}, fmt.Errorf("census needs the current tenant profile: %w", err)
+	}
+	want := profile.Digest()
+	filter := filters.NewArgs(filters.Arg("label", LabelManaged+"=true"))
+	if d.backendName != "" {
+		filter.Add("label", LabelBackendName+"="+d.backendName)
+	}
+	listed, err := d.client.ContainerList(ctx, container.ListOptions{All: true, Filters: filter})
+	if err != nil {
+		return tenantSeccompCensus{}, fmt.Errorf("list managed containers: %w", err)
+	}
+	var census tenantSeccompCensus
+	for _, summary := range listed {
+		inspected, err := d.client.ContainerInspect(ctx, summary.ID)
+		if errdefs.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return tenantSeccompCensus{}, fmt.Errorf("inspect managed container: %w", err)
+		}
+		if inspected.ContainerJSONBase == nil || inspected.State == nil {
+			return tenantSeccompCensus{}, errors.New("container inspection returned no state")
+		}
+		if !inspected.State.Running && !inspected.State.Restarting && !inspected.State.Paused {
+			continue
+		}
+		host := inspected.HostConfig
+		if host == nil || !tenantseccomp.Applied(host.SecurityOpt, host.Privileged, want) {
+			census.withoutCurrent++
+		}
+	}
+	return census, nil
+}
+
+const (
+	tenantSeccompCensusInterval = 10 * time.Minute
+	tenantSeccompCensusTimeout  = 2 * time.Minute
+
+	tenantSeccompCensusOK    = "ok"
+	tenantSeccompCensusError = "error"
+)
+
+var tenantSeccompCensusOutcomes = []string{tenantSeccompCensusOK, tenantSeccompCensusError}
+
+// tenantSeccompCensusLoop runs the census once when Start launches it, after
+// recovery, and then every tenantSeccompCensusInterval until shutdown.
+func (b *Backend) tenantSeccompCensusLoop() {
+	ticker := time.NewTicker(tenantSeccompCensusInterval)
+	defer ticker.Stop()
+	for b.stopCtx.Err() == nil {
+		util.RunCleanupIteration(func() error {
+			b.runTenantSeccompCensus()
+			return nil
+		}, "docker_seccomp_census", func(any) {
+			tenantSeccompCensusTotal.WithLabelValues(tenantSeccompCensusError).Inc()
+			background.CleanupPanicsTotal.WithLabelValues("docker_seccomp_census").Inc()
+		})
+		select {
+		case <-b.stopCtx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// runTenantSeccompCensus publishes one completed census. A failed pass is
+// counted and leaves the gauge at the last completed value. It only reads.
+func (b *Backend) runTenantSeccompCensus() {
+	ctx, cancel := context.WithTimeout(b.stopCtx, tenantSeccompCensusTimeout)
+	defer cancel()
+	census, err := b.docker.TenantSeccompCensus(ctx)
+	if err != nil {
+		if b.stopCtx.Err() != nil {
+			return
+		}
+		tenantSeccompCensusTotal.WithLabelValues(tenantSeccompCensusError).Inc()
+		b.logger.Warn("tenant seccomp census failed; keeping the last completed count", "error", err)
+		return
+	}
+	tenantContainersWithoutCurrentSeccomp.Set(float64(census.withoutCurrent))
+	tenantSeccompCensusTotal.WithLabelValues(tenantSeccompCensusOK).Inc()
+	if census.withoutCurrent > 0 {
+		b.logger.Warn("tenant containers run without the current seccomp profile; restarting or updating their leases recreates them with it",
+			"containers", census.withoutCurrent)
+	}
 }
