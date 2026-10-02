@@ -26,15 +26,40 @@ const budgetTestLease = "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
 // deaths (ENG-799): a controllable Docker event stream and inventory feed the
 // real event loop, lease actor and recovery sweep.
 type budgetEventHarness struct {
-	t         *testing.T
-	b         *Backend
-	events    chan ContainerEvent
-	mu        sync.Mutex
-	container ContainerInfo
-	loopDone  chan struct{}
+	t        *testing.T
+	b        *Backend
+	loopDone chan struct{}
+
+	mu            sync.Mutex
+	events        chan ContainerEvent // the current subscription's stream
+	subscriptions int
+	container     ContainerInfo
 }
 
 func newBudgetEventHarness(t *testing.T) *budgetEventHarness {
+	t.Helper()
+	h := newUnstartedBudgetEventHarness(t)
+	h.start(func(b *Backend) { b.containerEventLoop() })
+	return h
+}
+
+// start runs the event loop the way run starts it, and stops it at cleanup.
+func (h *budgetEventHarness) start(run func(*Backend)) {
+	go func() {
+		defer close(h.loopDone)
+		run(h.b)
+	}()
+	h.t.Cleanup(func() {
+		h.b.stopCancel()
+		<-h.loopDone
+		h.b.wg.Wait()
+	})
+}
+
+// newUnstartedBudgetEventHarness builds the harness without starting its
+// event loop, so a test can first replace the storage verifier or choose the
+// reconnect backoff.
+func newUnstartedBudgetEventHarness(t *testing.T) *budgetEventHarness {
 	t.Helper()
 	h := &budgetEventHarness{t: t, events: make(chan ContainerEvent, 16), loopDone: make(chan struct{})}
 	operationID := mustDockerOperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
@@ -44,6 +69,9 @@ func newBudgetEventHarness(t *testing.T) *budgetEventHarness {
 	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}}
 	mock := &mockDockerClient{
 		ContainerEventsFn: func(context.Context) (<-chan ContainerEvent, <-chan error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			h.subscriptions++
 			return h.events, make(chan error)
 		},
 		InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
@@ -81,15 +109,6 @@ func newBudgetEventHarness(t *testing.T) *budgetEventHarness {
 		Status: "running",
 	}
 	h.b.provisionsMu.RUnlock()
-	go func() {
-		defer close(h.loopDone)
-		h.b.containerEventLoop()
-	}()
-	t.Cleanup(func() {
-		h.b.stopCancel()
-		<-h.loopDone
-		h.b.wg.Wait()
-	})
 	return h
 }
 
@@ -104,9 +123,29 @@ func (h *budgetEventHarness) setContainer(status string, exitCode int, oomKilled
 
 func (h *budgetEventHarness) send(actions ...string) {
 	h.t.Helper()
+	h.mu.Lock()
+	events := h.events
+	h.mu.Unlock()
 	for _, action := range actions {
-		h.events <- ContainerEvent{ContainerID: "c1", Action: action}
+		events <- ContainerEvent{ContainerID: "c1", Action: action}
 	}
+}
+
+// reconnectStream ends the current subscription and makes the next one a
+// fresh stream, then waits until the event loop has resubscribed.
+func (h *budgetEventHarness) reconnectStream() {
+	h.t.Helper()
+	h.mu.Lock()
+	ended := h.events
+	h.events = make(chan ContainerEvent, 16)
+	subscribed := h.subscriptions
+	h.mu.Unlock()
+	close(ended)
+	require.Eventually(h.t, func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.subscriptions > subscribed
+	}, 5*time.Second, 5*time.Millisecond, "event loop did not reconnect")
 }
 
 func (h *budgetEventHarness) status() backend.ProvisionStatus {
@@ -291,25 +330,12 @@ func TestTerminalBudget_LiveDeathProvenance(t *testing.T) {
 func TestTerminalBudget_StreamReconnectForgetsTheRun(t *testing.T) {
 	h := newBudgetEventHarness(t)
 	h.send(containerEventStart, containerEventKill)
-	reconnects := make(chan struct{})
-	mock := h.b.docker.(*mockDockerClient)
-	// Replace the stream before closing the current one: the loop drains the
-	// buffered events on the old stream, sees it closed, and reconnects.
-	fresh := make(chan ContainerEvent, 16)
-	var once sync.Once
-	mock.ContainerEventsFn = func(context.Context) (<-chan ContainerEvent, <-chan error) {
-		once.Do(func() { close(reconnects) })
-		return fresh, make(chan error)
-	}
-	close(h.events)
-	select {
-	case <-reconnects:
-	case <-time.After(5 * time.Second):
-		t.Fatal("event loop did not reconnect")
-	}
+	// The loop drains the buffered events on the old stream, sees it closed,
+	// and reconnects to the fresh one.
+	h.reconnectStream()
 	unknownBefore := failureCount("unknown")
 	h.setContainer("exited", 1, false)
-	fresh <- ContainerEvent{ContainerID: "c1", Action: containerEventDie}
+	h.send(containerEventDie)
 	h.awaitStatus(backend.ProvisionStatusFailed)
 	assert.Equal(t, 1.0, failureCount("unknown")-unknownBefore)
 	h.requireWire(0, backend.TerminalVerdictRetry)
