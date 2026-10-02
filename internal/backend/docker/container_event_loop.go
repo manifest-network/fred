@@ -66,13 +66,6 @@ var containerEventStreamOutcomes = []string{
 // fred_docker_backend_die_event_dropped_total.
 const dieEventSourceEventLoop = "event_loop"
 
-// liveContainerDeath is one die event as the reader observed it, queued for
-// dispatch with the provenance its session minted.
-type liveContainerDeath struct {
-	containerID string
-	provenance  failurecause.Provenance
-}
-
 // containerEventLoop subscribes to the Docker container events that matter to
 // leases and dispatches every death to its lease actor; see the file comment.
 func (b *Backend) containerEventLoop() {
@@ -82,7 +75,7 @@ func (b *Backend) containerEventLoop() {
 // runContainerEventLoop is containerEventLoop with its reconnect backoff as
 // parameters, so a test can drive many reconnects quickly.
 func (b *Backend) runContainerEventLoop(retryInitial, retryMax time.Duration) {
-	deaths := make(chan liveContainerDeath, containerDeathQueueCapacity)
+	deaths := make(chan failurecause.Provenance, containerDeathQueueCapacity)
 	var dispatcher sync.WaitGroup
 	dispatcher.Go(func() { b.dispatchLiveContainerDeaths(deaths) })
 	defer func() {
@@ -135,8 +128,11 @@ func (b *Backend) verifyContainerEventAuthority() error {
 // consumeContainerEventStream reads one subscription until it ends or the
 // backend stops, and reports whether it delivered any event. It owns that
 // subscription's event session: one per connection, because events missed in
-// a reconnect gap are unknowable.
-func (b *Backend) consumeContainerEventStream(deaths chan<- liveContainerDeath) bool {
+// a reconnect gap are unknowable. The session is the only minter of live
+// provenance and never leaves this frame (its type cannot even be named
+// here); internal/testutil confines failurecause.NewEventSession and the
+// session's Observe methods to this function.
+func (b *Backend) consumeContainerEventStream(deaths chan<- failurecause.Provenance) bool {
 	eventCh, errCh := b.docker.ContainerEvents(b.stopCtx)
 	session := failurecause.NewEventSession()
 	delivered := false
@@ -156,11 +152,9 @@ func (b *Backend) consumeContainerEventStream(deaths chan<- liveContainerDeath) 
 				session.ObserveSignal(event.ContainerID)
 			case containerEventDie:
 				// Consume the run's record first, so a death of an untracked
-				// container still frees its entry.
-				b.enqueueLiveContainerDeath(deaths, liveContainerDeath{
-					containerID: event.ContainerID,
-					provenance:  session.ObserveExit(event.ContainerID),
-				})
+				// container still frees its entry. The provenance is bound to
+				// this container and is all the dispatcher needs.
+				b.enqueueLiveContainerDeath(deaths, session.ObserveExit(event.ContainerID))
 			}
 		case err, ok := <-errCh:
 			if !ok {
@@ -174,35 +168,40 @@ func (b *Backend) consumeContainerEventStream(deaths chan<- liveContainerDeath) 
 
 // enqueueLiveContainerDeath hands one death to the dispatcher without ever
 // blocking the reader. A full queue drops the dispatch, toward unknown.
-func (b *Backend) enqueueLiveContainerDeath(deaths chan<- liveContainerDeath, death liveContainerDeath) {
+func (b *Backend) enqueueLiveContainerDeath(deaths chan<- failurecause.Provenance, death failurecause.Provenance) {
 	select {
 	case deaths <- death:
 	default:
 		dieEventDroppedTotal.WithLabelValues(dieEventSourceEventLoop).Inc()
 		b.logger.Warn("container death dropped: dispatch queue full; the reconcile sweep will find it, unattributed",
-			"container_id", leasesm.ShortID(death.containerID))
+			"container_id", leasesm.ShortID(death.InstanceID()))
 	}
 }
 
 // dispatchLiveContainerDeaths routes queued deaths in arrival order until the
 // reader closes the queue.
-func (b *Backend) dispatchLiveContainerDeaths(deaths <-chan liveContainerDeath) {
+func (b *Backend) dispatchLiveContainerDeaths(deaths <-chan failurecause.Provenance) {
 	for death := range deaths {
 		b.dispatchLiveContainerDeath(death)
 	}
 }
 
-func (b *Backend) dispatchLiveContainerDeath(death liveContainerDeath) {
-	if b.stopCtx.Err() != nil {
+// dispatchLiveContainerDeath routes one live death. The provenance names the
+// container it was minted for, so the observation is built for exactly that
+// container. This is the only caller of leasesm.NewLiveContainerDiedObservation
+// (internal/testutil).
+func (b *Backend) dispatchLiveContainerDeath(death failurecause.Provenance) {
+	containerID := death.InstanceID()
+	if b.stopCtx.Err() != nil || containerID == "" {
 		return
 	}
 	if err := b.verifyContainerEventAuthority(); err != nil {
 		dieEventDroppedTotal.WithLabelValues(dieEventSourceEventLoop).Inc()
 		b.logger.Error("container death dropped: backend storage identity unverified; the reconcile sweep will find it, unattributed",
-			"container_id", leasesm.ShortID(death.containerID), "error", err)
+			"container_id", leasesm.ShortID(containerID), "error", err)
 		return
 	}
-	leaseUUID, found := b.findLeaseByContainerID(death.containerID)
+	leaseUUID, found := b.findLeaseByContainerID(containerID)
 	if !found {
 		return
 	}
@@ -217,12 +216,12 @@ func (b *Backend) dispatchLiveContainerDeath(death liveContainerDeath) {
 			"lease_uuid", leaseUUID, "error", err)
 		return
 	}
-	observation, err := leasesm.NewLiveContainerDiedObservation(death.containerID, generation, death.provenance)
+	observation, err := leasesm.NewLiveContainerDiedObservation(generation, death)
 	if err != nil {
 		b.logger.Error("invalid container event ignored", "error", err)
 		return
 	}
-	b.dispatchContainerDeathObservation(observation, death.containerID, dieEventSourceEventLoop)
+	b.dispatchContainerDeathObservation(observation, containerID, dieEventSourceEventLoop)
 }
 
 // findLeaseByContainerID returns the lease UUID and true if a provision

@@ -262,17 +262,33 @@ func (containerDiedMsg) onPanic(error) {}
 
 // NewContainerDiedObservation reports a death found without a live event
 // stream, such as by the periodic inventory sweep. A signal that preceded it
-// cannot be ruled out, so it never counts against the terminal budget.
+// cannot be ruled out, so it carries no provenance and never counts against
+// the terminal budget.
 func NewContainerDiedObservation(
 	containerID string,
 	runtime shared.RuntimeGenerationProof,
 ) (ActorObservation, error) {
-	return NewLiveContainerDiedObservation(containerID, runtime, failurecause.Provenance{})
+	return newContainerDiedObservation(containerID, runtime, failurecause.Provenance{})
 }
 
 // NewLiveContainerDiedObservation reports a death delivered by a live event
-// stream, with the provenance that stream's failurecause.EventSession minted.
+// stream, with the provenance that stream's event session minted for it. The
+// container is the one the provenance was minted for, so the observation
+// cannot attach one container's observed run to another's death; a
+// provenance without an instance (the zero value) is refused.
+// internal/testutil confines the callers to the Docker event loop's
+// dispatcher.
 func NewLiveContainerDiedObservation(
+	runtime shared.RuntimeGenerationProof,
+	provenance failurecause.Provenance,
+) (ActorObservation, error) {
+	if provenance.InstanceID() == "" {
+		return ActorObservation{}, errors.New("live container death observation requires provenance minted for its container")
+	}
+	return newContainerDiedObservation(provenance.InstanceID(), runtime, provenance)
+}
+
+func newContainerDiedObservation(
 	containerID string,
 	runtime shared.RuntimeGenerationProof,
 	provenance failurecause.Provenance,

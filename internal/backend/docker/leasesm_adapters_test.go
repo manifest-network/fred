@@ -11,6 +11,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 )
 
 // TestDockerStatusToPhase verifies the truth-table mirroring of
@@ -83,6 +84,26 @@ func TestContainerInfoToInstanceState_FailedStatusAlsoAttachesExitCode(t *testin
 	assert.Equal(t, leasesm.PhaseFailed, state.Phase)
 	require.NotNil(t, state.ExitCode)
 	assert.Equal(t, 1, *state.ExitCode)
+}
+
+// The Docker adapter, not the shared state machine, decides how a dead
+// container ended for the terminal budget (ENG-799). An exited container
+// reported its status, so it is an observed exit whatever the code; removing
+// and dead containers are gone; nothing else is classified, so it never
+// counts. (A positively absent container is gone too; see
+// TestContainerEventLoopDaemonAbsentInstancePublishesFailure.)
+func TestContainerInfoToInstanceState_TerminationIsTheAdaptersCall(t *testing.T) {
+	for status, want := range map[string]failurecause.Termination{
+		"exited": failurecause.Exited(), "EXITED": failurecause.Exited(),
+		"removing": failurecause.Gone(), "dead": failurecause.Gone(),
+		"running": {}, "paused": {}, "created": {}, "restarting": {}, "": {}, "bogus": {},
+	} {
+		for _, code := range []int{0, 1, 137, 143} {
+			state := containerInfoToInstanceState(&ContainerInfo{Status: status, ExitCode: code})
+			require.NotNil(t, state)
+			assert.Equal(t, want, state.Termination, "%q with exit %d", status, code)
+		}
+	}
 }
 
 // TestDockerInstanceInspector_InspectInstance verifies the inspector

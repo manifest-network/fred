@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 )
 
 // An inspection scope observes only the exact request made by the concrete SDK
@@ -49,7 +50,9 @@ func (d *DockerClient) inspectInstance(ctx context.Context, instanceID string) (
 	absent := scope.finish()
 	if err != nil {
 		if absent && ctx.Err() == nil {
-			return &leasesm.InstanceState{Phase: leasesm.PhaseAbsent}, nil
+			// A positively absent container is gone: its end was not observed
+			// as a workload exit, so it never counts (ENG-799).
+			return &leasesm.InstanceState{Phase: leasesm.PhaseAbsent, Termination: failurecause.Gone()}, nil
 		}
 		return nil, err
 	}

@@ -29,29 +29,46 @@ import (
 
 // --- provenance and inspection fixtures --------------------------------------
 
-func observedRun() failurecause.Provenance {
+// The provenance fixtures mint for one instance, as the event loop does; the
+// harness passes the dying container's ID.
+
+func observedRun(id string) failurecause.Provenance {
 	session := failurecause.NewEventSession()
-	session.ObserveStart("run")
-	return session.ObserveExit("run")
+	session.ObserveStart(id)
+	return session.ObserveExit(id)
 }
 
-func signaledRun() failurecause.Provenance {
+func signaledRun(id string) failurecause.Provenance {
 	session := failurecause.NewEventSession()
-	session.ObserveStart("run")
-	session.ObserveSignal("run")
-	return session.ObserveExit("run")
+	session.ObserveStart(id)
+	session.ObserveSignal(id)
+	return session.ObserveExit(id)
 }
 
-func partialRun() failurecause.Provenance {
-	return failurecause.NewEventSession().ObserveExit("run")
+func partialRun(id string) failurecause.Provenance {
+	return failurecause.NewEventSession().ObserveExit(id)
 }
 
+// unobserved is a death found without a live event, such as by the sweep.
+func unobserved(string) failurecause.Provenance { return failurecause.Provenance{} }
+
+// observedOtherRun is an observed run minted for some other container.
+func observedOtherRun(string) failurecause.Provenance { return observedRun("another-container") }
+
+// exitedWith is an exit as the substrate adapter classifies it: an observed
+// exit with a status.
 func exitedWith(code int) InstanceState {
-	return InstanceState{Phase: PhaseExited, ExitCode: &code}
+	return InstanceState{Phase: PhaseExited, ExitCode: &code, Termination: failurecause.Exited()}
+}
+
+// gone is an instance the substrate adapter classifies as removing, dead or
+// absent.
+func gone(phase Phase) InstanceState {
+	return InstanceState{Phase: phase, Termination: failurecause.Gone()}
 }
 
 func tenantCause() failurecause.Cause {
-	return failurecause.ClassifyDeath(observedRun(), failurecause.Exited())
+	return failurecause.ClassifyDeath("run", observedRun("run"), failurecause.Exited())
 }
 
 // --- unit tests: the budget rules ---------------------------------------------
@@ -80,7 +97,7 @@ var everyStatus = []backend.ProvisionStatus{
 func uncountedCauses() []failurecause.Cause {
 	return []failurecause.Cause{
 		{}, failurecause.Platform(), failurecause.Maintenance(),
-		failurecause.ClassifyDeath(signaledRun(), failurecause.Exited()),
+		failurecause.ClassifyDeath("run", signaledRun("run"), failurecause.Exited()),
 	}
 }
 
@@ -656,13 +673,14 @@ func (h *budgetHarness) provisionReady() {
 
 // die delivers one container death to the Ready lease and completes
 // Failing -> Failed with the diagnostics worker's real terminal message.
-func (h *budgetHarness) die(provenance failurecause.Provenance, inspection InstanceState) {
+func (h *budgetHarness) die(mint func(id string) failurecause.Provenance, inspection InstanceState) {
 	h.t.Helper()
 	current, ok := h.store.Get(testActorLeaseUUID)
 	require.True(h.t, ok)
 	require.NotEmpty(h.t, current.ContainerIDs)
 	h.inspection.Store(&inspection)
-	require.NoError(h.t, h.actor.sm.containerDied(h.ctx, current.ContainerIDs[0], h.runtime, provenance))
+	containerID := current.ContainerIDs[0]
+	require.NoError(h.t, h.actor.sm.containerDied(h.ctx, containerID, h.runtime, mint(containerID)))
 	require.Equal(h.t, backend.ProvisionStatusFailing, h.actor.sm.State())
 	h.handleNextTerminal()
 	require.Equal(h.t, backend.ProvisionStatusFailed, h.actor.sm.State())
@@ -671,7 +689,7 @@ func (h *budgetHarness) die(provenance failurecause.Provenance, inspection Insta
 // crash is the tenant workload exiting on its own: an observed run, exit 1.
 func (h *budgetHarness) crash() {
 	h.t.Helper()
-	h.die(observedRun(), exitedWith(1))
+	h.die(observedRun, exitedWith(1))
 }
 
 func (h *budgetHarness) divergeCohort() {
@@ -855,21 +873,21 @@ func TestBudgetSequence_MixedCausesCountOnlyTenantExits(t *testing.T) {
 		h.provisionReady()
 		oom := exitedWith(137)
 		oom.OOMKilled = true
-		h.die(observedRun(), oom) // OOM kill at its own limit: counts
+		h.die(observedRun, oom) // OOM kill at its own limit: counts
 		h.requireBudget(2, backend.TerminalVerdictRetry)
 
 		h.provisionReady()
-		h.die(signaledRun(), exitedWith(137)) // operator kill
+		h.die(signaledRun, exitedWith(137)) // operator kill
 		h.provisionReady()
-		h.die(observedRun(), InstanceState{Phase: PhaseAbsent}) // vanished
+		h.die(observedRun, gone(PhaseAbsent)) // vanished
 		h.provisionReady()
-		h.die(observedRun(), InstanceState{Phase: PhaseFailed}) // removing or dead
+		h.die(observedRun, gone(PhaseFailed)) // removing or dead
 		h.provisionReady()
-		h.die(failurecause.Provenance{}, exitedWith(1)) // found by the sweep
+		h.die(unobserved, exitedWith(1)) // found by the sweep
 		h.provisionReady()
-		h.die(partialRun(), exitedWith(1)) // stream reconnected mid-run
+		h.die(partialRun, exitedWith(1)) // stream reconnected mid-run
 		h.provisionReady()
-		h.die(observedRun(), InstanceState{Phase: PhaseExited}) // no exit status
+		h.die(observedRun, InstanceState{Phase: PhaseExited}) // no exit status
 		h.provisionReady()
 		h.divergeCohort()
 		h.refuseProvision()
@@ -929,7 +947,7 @@ func TestBudgetSequence_SustainedReadyResetsAcrossAnyBoundary(t *testing.T) {
 			h.provisionReady()
 		},
 		"external kill": func(h *budgetHarness) {
-			h.die(signaledRun(), exitedWith(137))
+			h.die(signaledRun, exitedWith(137))
 			h.provisionReady()
 		},
 	}
@@ -958,7 +976,7 @@ func TestBudgetSequence_ShortReadyBoundaryKeepsTheStreak(t *testing.T) {
 			h.provisionReady()
 		},
 		"external kill": func(h *budgetHarness) {
-			h.die(signaledRun(), exitedWith(137))
+			h.die(signaledRun, exitedWith(137))
 			h.provisionReady()
 		},
 	}
@@ -1032,22 +1050,24 @@ func TestBudgetSequence_ProvenanceDecidesAttribution(t *testing.T) {
 	oom.OOMKilled = true
 	tests := []struct {
 		name       string
-		provenance failurecause.Provenance
+		provenance func(id string) failurecause.Provenance
 		inspection InstanceState
 		want       string
 	}{
-		{"self exit 1", observedRun(), exitedWith(1), "tenant_workload"},
-		{"clean exit 0", observedRun(), exitedWith(0), "tenant_workload"},
-		{"self SIGKILL 137", observedRun(), exitedWith(137), "tenant_workload"},
-		{"self SIGTERM 143", observedRun(), exitedWith(143), "tenant_workload"},
-		{"OOM killed", observedRun(), oom, "tenant_workload"},
-		{"api kill then exit", signaledRun(), exitedWith(1), "disruption"},
-		{"api kill then OOM", signaledRun(), oom, "disruption"},
-		{"absent", observedRun(), InstanceState{Phase: PhaseAbsent}, "disruption"},
-		{"removing or dead", observedRun(), InstanceState{Phase: PhaseFailed, ExitCode: oom.ExitCode}, "disruption"},
-		{"found by the sweep", failurecause.Provenance{}, exitedWith(1), "unknown"},
-		{"run start not observed", partialRun(), exitedWith(1), "unknown"},
-		{"no exit status", observedRun(), InstanceState{Phase: PhaseExited}, "unknown"},
+		{"self exit 1", observedRun, exitedWith(1), "tenant_workload"},
+		{"clean exit 0", observedRun, exitedWith(0), "tenant_workload"},
+		{"self SIGKILL 137", observedRun, exitedWith(137), "tenant_workload"},
+		{"self SIGTERM 143", observedRun, exitedWith(143), "tenant_workload"},
+		{"OOM killed", observedRun, oom, "tenant_workload"},
+		{"api kill then exit", signaledRun, exitedWith(1), "disruption"},
+		{"api kill then OOM", signaledRun, oom, "disruption"},
+		{"absent", observedRun, gone(PhaseAbsent), "disruption"},
+		{"removing or dead", observedRun, InstanceState{Phase: PhaseFailed, ExitCode: oom.ExitCode, Termination: failurecause.Gone()}, "disruption"},
+		{"found by the sweep", unobserved, exitedWith(1), "unknown"},
+		{"run start not observed", partialRun, exitedWith(1), "unknown"},
+		{"no exit status", observedRun, InstanceState{Phase: PhaseExited}, "unknown"},
+		{"exit the adapter did not classify", observedRun, InstanceState{Phase: PhaseFailed, ExitCode: oom.ExitCode}, "unknown"},
+		{"observed run of another container", observedOtherRun, exitedWith(1), "unknown"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1065,6 +1085,30 @@ func TestBudgetSequence_ProvenanceDecidesAttribution(t *testing.T) {
 			})
 		})
 	}
+}
+
+// A live death observation takes its container from the provenance minted for
+// it, so one container's observed run cannot be attached to another's death,
+// and a death without live provenance cannot pose as a live one.
+func TestLiveContainerDiedObservationIsBoundToItsProvenance(t *testing.T) {
+	runtime := newTestRuntimeGenerationProof(t, testActorLeaseUUID)
+	_, err := NewLiveContainerDiedObservation(runtime, failurecause.Provenance{})
+	require.Error(t, err, "a live observation needs provenance minted for its container")
+	_, err = NewLiveContainerDiedObservation(shared.RuntimeGenerationProof{}, observedRun("container-a"))
+	require.Error(t, err, "and an exact runtime generation")
+
+	observation, err := NewLiveContainerDiedObservation(runtime, observedRun("container-a"))
+	require.NoError(t, err)
+	died, ok := observation.envelope.message.(containerDiedMsg)
+	require.True(t, ok)
+	assert.Equal(t, "container-a", died.ContainerID)
+	assert.Equal(t, "observed_run", died.provenance.Label())
+
+	swept, err := NewContainerDiedObservation("container-a", runtime)
+	require.NoError(t, err)
+	sweptDeath, ok := swept.envelope.message.(containerDiedMsg)
+	require.True(t, ok)
+	assert.Equal(t, failurecause.Provenance{}, sweptDeath.provenance, "a swept death carries no provenance")
 }
 
 // Recovery re-application of a maintenance outcome must not record the
