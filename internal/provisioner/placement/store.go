@@ -1460,6 +1460,7 @@ func loadStoreWithExpectedAuthority(
 	if s.inventoryRecoveryRequired {
 		s.logInventoryRecoveryPendingLocked()
 	}
+	s.logInheritedFencedReporters()
 	return s, nil
 }
 
@@ -4232,11 +4233,26 @@ func (s *Store) inheritedFencedReportersAtOpen() map[string]struct{} {
 		return inherited
 	}
 	for backendName := range s.fencedBackends {
-		if !s.inventoryReporters.tracked || s.inventoryReporters.recorded(backendName) {
+		if s.inventoryReporters.mayHoldLostPositive(backendName) {
 			inherited[backendName] = struct{}{}
 		}
 	}
 	return inherited
+}
+
+// logInheritedFencedReporters warns at open that fenced backends may hold
+// positives the pending sweep never projected. Once interrupted-sweep recovery
+// clears without them they are recorded as unprojected reporters, and new-lease
+// admission stays withheld until each answers both inventories or is retired.
+func (s *Store) logInheritedFencedReporters() {
+	if len(s.inheritedFencedReporters) == 0 {
+		return
+	}
+	slog.Warn("placement: fenced backends may hold leases an interrupted sweep never projected; "+
+		"recovery records them as unprojected reporters and withholds new-lease admission "+
+		"until each answers both inventories or is retired",
+		"sweep_id", s.pendingInventorySweepID,
+		"fenced_reporters", slices.Sorted(maps.Keys(s.inheritedFencedReporters)))
 }
 
 // publishUnprojectedFencedReporters exports the durable record per active

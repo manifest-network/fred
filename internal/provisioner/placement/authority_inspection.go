@@ -174,6 +174,22 @@ type AuthorityReport struct {
 	// placement row; retiring one records recordless_unproven.
 	UnprojectedFencedReporters        []string `json:"unprojected_fenced_reporters,omitempty"`
 	UnprojectedFencedReportersOmitted int      `json:"unprojected_fenced_reporters_omitted,omitempty"`
+	// PendingInventorySweepID is non-zero when a reconciliation sweep began
+	// reading backend inventories but never durably projected them (a stop or
+	// crash mid-sweep).
+	PendingInventorySweepID uint64 `json:"pending_inventory_sweep_id,omitempty"`
+	// InventorySweepReporters is that sweep's reporter journal: the backends
+	// that answered it with at least one lease. When InventorySweepUntracked
+	// is set the chain cannot name them, and every active backend counts.
+	InventorySweepReporters        []string `json:"inventory_sweep_reporters,omitempty"`
+	InventorySweepReportersOmitted int      `json:"inventory_sweep_reporters_omitted,omitempty"`
+	InventorySweepUntracked        bool     `json:"inventory_sweep_untracked,omitempty"`
+	// FenceRestartWouldRecord names the active backends that, if fenced when
+	// providerd next starts, would be recorded as unprojected reporters,
+	// withholding new-lease admission until each answers both inventories or
+	// is retired. It is empty, never null, when no sweep is pending.
+	FenceRestartWouldRecord        []string `json:"fence_restart_would_record"`
+	FenceRestartWouldRecordOmitted int      `json:"fence_restart_would_record_omitted,omitempty"`
 }
 
 // SafeForCutover reports whether the stopped file is wholly on one side of the
@@ -199,6 +215,7 @@ func newAuthorityAssessment(expectation AuthorityExpectation) *authorityAssessme
 			ExpectedProviderUUID:           expectation.providerUUID,
 			ExpectedBackendTopology:        expected,
 			ExpectedBackendTopologyOmitted: expectedOmitted,
+			FenceRestartWouldRecord:        []string{},
 		},
 		seen: make(map[string]struct{}),
 		rows: make(map[string]AuthorityRowFact),
@@ -804,6 +821,9 @@ func inspectCurrentMetadata(
 			assessment.report.UnprojectedFencedReportersOmitted =
 			boundedAuthorityIdentities(metadata.UnprojectedFencedReporters)
 	}
+	if metadataErr == nil {
+		inspectPendingInventorySweep(metadata, assessment)
+	}
 	if metadata.ProviderUUID != expectation.providerUUID {
 		assessment.mixedFinding(
 			"provider_mismatch",
@@ -818,6 +838,38 @@ func inspectCurrentMetadata(
 	}
 	inspectAuthorityStorageBindings(metadata, knownTopologyValid, assessment)
 	return metadata, true
+}
+
+// inspectPendingInventorySweep reports a sweep that began but never projected
+// and derives which active backends a restart with them fenced would record as
+// unprojected reporters. It applies sweepReporterJournal.mayHoldLostPositive,
+// the rule the store applies at open, to the validated metadata.
+func inspectPendingInventorySweep(metadata topologyMetadata, assessment *authorityAssessment) {
+	if metadata.PendingInventorySweepID == 0 ||
+		validateCanonicalBackendNames(metadata.Topology, false) != nil ||
+		!authorityBackendNamesSafe(metadata.Topology) {
+		return
+	}
+	journal := sweepReporterJournalFromMetadata(metadata)
+	assessment.report.PendingInventorySweepID = metadata.PendingInventorySweepID
+	assessment.report.InventorySweepUntracked = !journal.tracked
+	if reporters := journal.names(); authorityBackendNamesSafe(reporters) {
+		assessment.report.InventorySweepReporters,
+			assessment.report.InventorySweepReportersOmitted =
+			boundedAuthorityIdentities(reporters)
+	}
+	wouldRecord := make([]string, 0, len(metadata.Topology))
+	for _, backendName := range metadata.Topology {
+		if journal.mayHoldLostPositive(backendName) {
+			wouldRecord = append(wouldRecord, backendName)
+		}
+	}
+	bounded, omitted := boundedAuthorityIdentities(wouldRecord)
+	if bounded == nil {
+		bounded = []string{}
+	}
+	assessment.report.FenceRestartWouldRecord = bounded
+	assessment.report.FenceRestartWouldRecordOmitted = omitted
 }
 
 func inspectAuthorityStorageBindings(

@@ -1,7 +1,12 @@
 package placement
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
+	"maps"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
@@ -103,14 +108,7 @@ func TestFenceDoesNotExcuseAnUnfencedReporter(t *testing.T) {
 
 func TestUntrackedMarkerExcusesExactlyTheFencedBackends(t *testing.T) {
 	fixture := newReporterRecoveryFixture(t, nil)
-	require.NoError(t, fixture.reopened.db.Update(func(tx *bolt.Tx) error {
-		metadata, err := loadTopologyMetadata(tx)
-		if err != nil {
-			return err
-		}
-		metadata.InventorySweepReporters = nil
-		return putTopologyMetadata(tx, metadata)
-	}))
+	fixture.untrack(t)
 	fixture.reopenFenced(t, reporterSilentBackend)
 
 	fixture.sweep(t, reporterRecoveryBackend)
@@ -298,6 +296,157 @@ func TestUnprojectedFencedReporterIsVisibleLiveAndOffline(t *testing.T) {
 	assert.InDelta(t, 1, gauge(reporterSilentBackend), 0, "the record is published again at open")
 	fixture.sweep(t, reporterRecoveryBackend, reporterSilentBackend)
 	assert.InDelta(t, 0, gauge(reporterSilentBackend), 0)
+}
+
+// classify closes the fixture's store and inspects the stopped database as
+// placement-repair -classify does.
+func (fixture *reporterRecoveryFixture) classify(t *testing.T) AuthorityReport {
+	t.Helper()
+	require.NoError(t, fixture.reopened.Close())
+	expectation, err := NewAuthorityExpectation(
+		freshTestProviderUUID, []string{reporterRecoveryBackend, reporterSilentBackend},
+	)
+	require.NoError(t, err)
+	report, err := InspectAuthorityFile(fixture.dbPath, expectation)
+	require.NoError(t, err)
+	return report
+}
+
+// untrack rewrites the pending sweep as one that predates reporter tracking.
+func (fixture *reporterRecoveryFixture) untrack(t *testing.T) {
+	t.Helper()
+	require.NoError(t, fixture.reopened.db.Update(func(tx *bolt.Tx) error {
+		metadata, err := loadTopologyMetadata(tx)
+		if err != nil {
+			return err
+		}
+		metadata.InventorySweepReporters = nil
+		return putTopologyMetadata(tx, metadata)
+	}))
+}
+
+// ENG-1119: an operator about to fence a backend checks the stopped database
+// with -classify. fence_restart_would_record must name exactly the backends a
+// store opened with them fenced inherits as reporters to record, so the store
+// and the classifier share one rule.
+func TestClassifyReportsWhatAFencedRestartWouldRecord(t *testing.T) {
+	topology := []string{reporterRecoveryBackend, reporterSilentBackend}
+	for _, test := range []struct {
+		name          string
+		fixture       func(*testing.T) *reporterRecoveryFixture
+		wantReporters []string
+		wantUntracked bool
+		wantRecord    []string
+	}{
+		{
+			name:          "tracked journal",
+			fixture:       func(t *testing.T) *reporterRecoveryFixture { return newReporterRecoveryFixture(t, nil) },
+			wantReporters: []string{reporterRecoveryBackend},
+			wantRecord:    []string{reporterRecoveryBackend},
+		},
+		{
+			name:          "tracked journal naming every backend",
+			fixture:       newFencedReporterFixture,
+			wantReporters: topology,
+			wantRecord:    topology,
+		},
+		{
+			name: "untracked chain",
+			fixture: func(t *testing.T) *reporterRecoveryFixture {
+				fixture := newReporterRecoveryFixture(t, nil)
+				fixture.untrack(t)
+				return fixture
+			},
+			wantUntracked: true,
+			wantRecord:    topology,
+		},
+		{
+			name: "no pending sweep",
+			fixture: func(t *testing.T) *reporterRecoveryFixture {
+				fixture := newReporterRecoveryFixture(t, nil)
+				fixture.sweep(t, reporterRecoveryBackend)
+				require.Equal(t, InventoryReady, fixture.reopened.InventoryReadiness())
+				return fixture
+			},
+			wantRecord: []string{},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := test.fixture(t)
+			report := fixture.classify(t)
+			assert.Equal(t, len(test.wantRecord) != 0, report.PendingInventorySweepID != 0)
+			assert.Equal(t, test.wantReporters, report.InventorySweepReporters)
+			assert.Equal(t, test.wantUntracked, report.InventorySweepUntracked)
+			assert.Equal(t, test.wantRecord, report.FenceRestartWouldRecord)
+
+			encoded, err := MarshalAuthorityReport(report)
+			require.NoError(t, err)
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(encoded, &fields))
+			wantRecord, err := json.Marshal(test.wantRecord)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(wantRecord), string(fields["fence_restart_would_record"]),
+				"the key is always present and never null")
+			_, pendingKey := fields["pending_inventory_sweep_id"]
+			assert.Equal(t, report.PendingInventorySweepID != 0, pendingKey)
+			_, untrackedKey := fields["inventory_sweep_untracked"]
+			assert.Equal(t, test.wantUntracked, untrackedKey)
+			_, reportersKey := fields["inventory_sweep_reporters"]
+			assert.Equal(t, len(test.wantReporters) != 0, reportersKey)
+
+			// A store opened with one backend fenced inherits exactly the
+			// fenced members of fence_restart_would_record.
+			for _, fenced := range topology {
+				store, err := OpenStore(fixture.dbPath, freshTestProviderUUID,
+					WithCallbackRouteFactory(fixture.routes), WithFencedBackends([]string{fenced}))
+				require.NoError(t, err)
+				want := []string{}
+				if slices.Contains(report.FenceRestartWouldRecord, fenced) {
+					want = []string{fenced}
+				}
+				store.mu.RLock()
+				inherited := slices.Sorted(maps.Keys(store.inheritedFencedReporters))
+				store.mu.RUnlock()
+				if inherited == nil {
+					inherited = []string{}
+				}
+				assert.Equal(t, want, inherited, "fenced %s", fenced)
+				require.NoError(t, store.Close())
+			}
+		})
+	}
+}
+
+// Not parallel: replaces the process-global logger.
+func TestStoreOpenWarnsAboutInheritedFencedReporters(t *testing.T) {
+	fixture := newReporterRecoveryFixture(t, nil)
+	require.NoError(t, fixture.reopened.Close())
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	const warning = "fenced backends may hold leases an interrupted sweep never projected"
+	for _, test := range []struct {
+		fenced string
+		warned bool
+	}{
+		// backend-b never reported in the interrupted sweep: fencing it
+		// records nothing and warns about nothing.
+		{reporterSilentBackend, false},
+		{reporterRecoveryBackend, true},
+	} {
+		logs.Reset()
+		store, err := OpenStore(fixture.dbPath, freshTestProviderUUID,
+			WithCallbackRouteFactory(fixture.routes), WithFencedBackends([]string{test.fenced}))
+		require.NoError(t, err)
+		require.NoError(t, store.Close())
+		if test.warned {
+			assert.Contains(t, logs.String(), warning)
+			assert.Contains(t, logs.String(), "fenced_reporters=["+test.fenced+"]")
+		} else {
+			assert.NotContains(t, logs.String(), warning)
+		}
+	}
 }
 
 // A scope issued before a fenced reporter was recorded cannot be spent after,

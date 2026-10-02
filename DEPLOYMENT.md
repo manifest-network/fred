@@ -1981,8 +1981,12 @@ the exact recognized bucket set, physical-check status, canonical
 provider/topology, sorted storage bindings, topology/baseline/inventory epochs,
 counts, and up to 128 lexicographically sorted per-lease state/revision,
 owner-or-attempt/lifecycle verdicts, and the always-present
-`untrusted_positive` quarantine flag (plus an omitted-row count). Each expected,
-observed, known, storage-binding, and empty-inventory collection is capped at 64
+`untrusted_positive` quarantine flag (plus an omitted-row count). It also reports
+an interrupted reconciliation sweep (`pending_inventory_sweep_id`, with its
+`inventory_sweep_reporters` or `inventory_sweep_untracked`) and the
+always-present `fence_restart_would_record` list; see SECURITY.md, "Containing
+a compromised backend". Each expected, observed, known, storage-binding,
+empty-inventory, sweep-reporter, and fence-record collection is capped at 64
 entries with its own omitted count; each row carries at most four conflict
 owners plus an omitted count, and overlong rendered identities are counted but
 not emitted. Raw metadata, placement, and lifecycle values are rejected before

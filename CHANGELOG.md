@@ -41,6 +41,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `unprojected_fenced_reporters` in `placement-repair -classify`. Older
   binaries refuse a database that holds this record. See SECURITY.md,
   "Containing a compromised backend".
+- `placement-repair -classify` reports an interrupted reconciliation sweep:
+  `pending_inventory_sweep_id`, the sweep's `inventory_sweep_reporters` (or
+  `inventory_sweep_untracked`), and `fence_restart_would_record`, the backends
+  that a restart with them fenced would record as unprojected reporters. Check
+  it before applying a fence. providerd also logs a WARN at startup when a
+  fenced backend is about to be recorded. (ENG-1119)
 - `placement-repair -adopt-observed-generation -lease <uuid> -backend <name>`
   repairs a lease left quarantined after a placement restore because its
   backend re-provisioned it since the copy was taken. The backend must be the

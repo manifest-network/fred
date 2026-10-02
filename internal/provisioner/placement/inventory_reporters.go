@@ -75,6 +75,16 @@ func (journal sweepReporterJournal) recorded(backendName string) bool {
 	return ok
 }
 
+// mayHoldLostPositive reports whether backendName may have reported a positive
+// that the pending chain lost: a journaled reporter, or any backend when the
+// chain is untracked and cannot name its reporters. It is meaningful only
+// while a sweep is pending. A store opened with such a backend fenced inherits
+// it as a reporter to record (inheritedFencedReportersAtOpen), and offline
+// classification derives fence_restart_would_record from the same rule.
+func (journal sweepReporterJournal) mayHoldLostPositive(backendName string) bool {
+	return !journal.tracked || journal.recorded(backendName)
+}
+
 // with returns a copy, so a failed durable write leaves the live journal
 // unchanged.
 func (journal sweepReporterJournal) with(backendName string) sweepReporterJournal {
