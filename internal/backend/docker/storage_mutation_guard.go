@@ -108,12 +108,19 @@ func newBackgroundMaintenanceCoordinator(
 			return ops.volumes.RenameVolume(ctx, oldName, newName)
 		})
 	})
-	ensureVolumeQuota := backgroundVolumeQuota(func(ctx context.Context, id string, sizeMB int64) error {
-		return backend.withManagedVolumeQuota(ctx, id, func(ctx context.Context) error {
+	ensureVolumeQuota := backgroundVolumeQuota(func(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error) {
+		var outcome volumeQuotaOutcome
+		err := backend.withManagedVolumeQuota(ctx, id, func(ctx context.Context) error {
 			return perform(ctx, "background ensure volume quota", func(ctx context.Context) error {
-				return ops.volumes.EnsureQuota(ctx, id, sizeMB)
+				var err error
+				outcome, err = ops.volumes.EnsureQuota(ctx, id, sizeMB)
+				return err
 			})
 		})
+		if err != nil {
+			return 0, err
+		}
+		return outcome, nil
 	})
 	destroyVolumes := backgroundVolumeDestroyCapability{
 		destroyFn: func(ctx context.Context, id string) error {
@@ -1349,9 +1356,12 @@ func (m *storageMutations) recoverRestoreNamespaces(ctx context.Context) error {
 		}
 	}
 	// A restore-created volume whose deletion is held answers without the
-	// namespace lock, which the hold executor may be holding, and the rollback
-	// stays pending for a later pass; one already gone needs no destroy
-	// (ENG-1117).
+	// namespace lock, which the hold executor may be holding; one already gone
+	// needs no destroy (ENG-1117). A held answer keeps the rollback pending,
+	// but only after the locked step below has still returned the interrupted
+	// source's volumes to retention and destroyed every other created volume:
+	// one held scratch volume must not stall either.
+	var deferred []error
 	stillCreated := created[:0]
 	for _, name := range created {
 		answered, err := b.precheckDestroy(name)
@@ -1360,13 +1370,32 @@ func (m *storageMutations) recoverRestoreNamespaces(ctx context.Context) error {
 			continue
 		}
 		if err := b.afterVolumeDestroy(err); err != nil {
-			return fmt.Errorf("destroy restore-created volume %q: %w", name, err)
+			deferred = append(deferred, fmt.Errorf("destroy restore-created volume %q: %w", name, err))
 		}
 	}
 	created = stillCreated
 	if len(original) == 0 && len(created) == 0 {
-		return nil
+		return errors.Join(deferred...)
 	}
+	if err := b.recoverRestoreNamespacesLocked(ctx, m, subject, retention, source, original, created); err != nil {
+		deferred = append(deferred, err)
+	}
+	return errors.Join(deferred...)
+}
+
+// recoverRestoreNamespacesLocked is recoverRestoreNamespaces' locked step:
+// under the namespace and physical exclusion of every name involved, it
+// returns the interrupted source's original volumes to retention and destroys
+// the restore-created volumes that need the lock.
+func (b *Backend) recoverRestoreNamespacesLocked(
+	ctx context.Context,
+	m *storageMutations,
+	subject shared.OperationPhysicalSubject,
+	retention shared.RestoringRetentionProof,
+	source shared.InterruptedRestoreSource,
+	original []restoreVolumeReturn,
+	created []string,
+) error {
 	names := slices.Clone(created)
 	for _, volume := range original {
 		if !slices.Contains(source.RetainedVolumeNames(), volume.retained) ||

@@ -159,30 +159,30 @@ func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 // EnsureQuota re-applies refquota (and clears any legacy quota=) to an existing
 // dataset. No-op if the dataset is absent (never creates). ZFS quota is inherent
 // to the dataset, so there is no separate "tag" step. See ENG-454.
-func (z *zfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
+func (z *zfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error) {
 	name, err := parseManagedVolumeName(id)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	dataset, err := z.volumeDataset(name)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	exists, err := z.datasetExists(ctx, name)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !exists {
-		return nil
+		return volumeQuotaAbsent, nil
 	}
 	if err := z.requireMountedManagedVolume(ctx, name); err != nil {
-		return fmt.Errorf("attest existing zfs volume %s before quota: %w", dataset, err)
+		return 0, fmt.Errorf("attest existing zfs volume %s before quota: %w", dataset, err)
 	}
 	quota := fmt.Sprintf("%dM", sizeMB)
 	if out, err := exec.CommandContext(ctx, "zfs", "set", "refquota="+quota, "quota=none", dataset).CombinedOutput(); err != nil {
-		return fmt.Errorf("zfs set refquota on %s: %w: %s", dataset, err, out)
+		return 0, fmt.Errorf("zfs set refquota on %s: %w: %s", dataset, err, out)
 	}
-	return nil
+	return volumeQuotaApplied, nil
 }
 
 func (z *zfsVolumeManager) Destroy(ctx context.Context, id string) error {

@@ -7,16 +7,17 @@ import (
 
 func TestReasonConstants(t *testing.T) {
 	cases := map[Reason]string{
-		ReasonContainerExited:        "ContainerExited",
-		ReasonImagePullFailed:        "ImagePullFailed",
-		ReasonInternal:               "Internal",
-		ReasonRestartFailed:          "RestartFailed",
-		ReasonUpdateFailed:           "UpdateFailed",
-		ReasonRestoreFailed:          "RestoreFailed",
-		ReasonVolumeCleanupExhausted: "VolumeCleanupExhausted",
-		ReasonCleanupFailed:          "CleanupFailed",
-		ReasonVolumeDeletePending:    "VolumeDeletePending",
-		ReasonUnknown:                "Unknown",
+		ReasonContainerExited:          "ContainerExited",
+		ReasonImagePullFailed:          "ImagePullFailed",
+		ReasonInternal:                 "Internal",
+		ReasonRestartFailed:            "RestartFailed",
+		ReasonUpdateFailed:             "UpdateFailed",
+		ReasonRestoreFailed:            "RestoreFailed",
+		ReasonVolumeCleanupExhausted:   "VolumeCleanupExhausted",
+		ReasonCleanupFailed:            "CleanupFailed",
+		ReasonVolumeDeletePending:      "VolumeDeletePending",
+		ReasonVolumeDeletionInProgress: "VolumeDeletionInProgress",
+		ReasonUnknown:                  "Unknown",
 	}
 	for r, want := range cases {
 		if string(r) != want {
@@ -32,10 +33,16 @@ func TestReasonConstants(t *testing.T) {
 	// Curated messages must never embed a host path.
 	for _, m := range []string{
 		MsgImagePullFailed, MsgRestartFailed, MsgUpdateFailed, MsgVolumeCleanupExhausted, MsgCleanupFailed,
-		MsgVolumeDeletePending,
+		MsgVolumeDeletePending, MsgVolumeDeletionInProgress,
 	} {
 		if strings.Contains(m, "/") {
 			t.Errorf("message %q contains a path separator", m)
+		}
+	}
+	// A provider-side deletion is nothing the tenant can retry or fix.
+	for _, m := range []string{MsgVolumeDeletePending, MsgVolumeDeletionInProgress} {
+		if strings.Contains(strings.ToLower(m), "retry") || strings.Contains(strings.ToLower(m), "fail") {
+			t.Errorf("message %q asks the tenant to retry or reads as a failure", m)
 		}
 	}
 }

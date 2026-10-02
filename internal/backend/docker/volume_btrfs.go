@@ -79,32 +79,32 @@ func (b *btrfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64
 // EnsureQuota re-applies the qgroup limit to an existing subvolume (a btrfs
 // subvolume's quota is inherent to it, so there is no separate "tag" step).
 // No-op if the subvolume is absent (never creates). See ENG-454.
-func (b *btrfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
+func (b *btrfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error) {
 	volumeID, err := parseManagedVolumeName(id)
 	if err != nil {
-		return fmt.Errorf("validate btrfs volume ID for quota: %w", err)
+		return 0, fmt.Errorf("validate btrfs volume ID for quota: %w", err)
 	}
 	subvolPath := volumeID.hostPath(b.dataPath)
 	root, err := os.OpenRoot(b.dataPath)
 	if err != nil {
-		return fmt.Errorf("open btrfs volume root %s: %w", b.dataPath, err)
+		return 0, fmt.Errorf("open btrfs volume root %s: %w", b.dataPath, err)
 	}
 	defer func() { _ = root.Close() }()
 	exists, err := managedDirectoryExistsAtRoot(root, volumeID)
 	if err != nil {
-		return fmt.Errorf("stat subvolume %s: %w", subvolPath, err)
+		return 0, fmt.Errorf("stat subvolume %s: %w", subvolPath, err)
 	}
 	if !exists {
-		return nil
+		return volumeQuotaAbsent, nil
 	}
 	if err := b.AttestManagedVolume(ctx, volumeID); err != nil {
-		return fmt.Errorf("attest existing btrfs subvolume %s before quota: %w", subvolPath, err)
+		return 0, fmt.Errorf("attest existing btrfs subvolume %s before quota: %w", subvolPath, err)
 	}
 	quota := fmt.Sprintf("%dm", sizeMB)
 	if out, err := exec.CommandContext(ctx, "btrfs", "qgroup", "limit", quota, subvolPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("btrfs qgroup limit %s on %s: %w: %s", quota, subvolPath, err, out)
+		return 0, fmt.Errorf("btrfs qgroup limit %s on %s: %w: %s", quota, subvolPath, err, out)
 	}
-	return nil
+	return volumeQuotaApplied, nil
 }
 
 func (b *btrfsVolumeManager) Destroy(ctx context.Context, id string) error {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
@@ -293,13 +294,13 @@ func (b *Backend) doDeprovisionScoped(
 		err = b.completeCloseOutcome(terminal)
 	case shared.CloseExecutionPending:
 		err = terminal
-		b.markClosePending(leaseUUID, err)
+		b.markClosePending(claim, err)
 		return err
 	default:
 		return fmt.Errorf("unknown close execution outcome %T", outcome)
 	}
 	if err != nil {
-		b.markClosePending(leaseUUID, err)
+		b.markClosePending(claim, err)
 		return err
 	}
 
@@ -334,14 +335,37 @@ func (b *Backend) completeCloseOutcome(
 	return nil
 }
 
-func (b *Backend) markClosePending(leaseUUID string, cause error) {
+// closeVolumeFailure is the tenant-facing reason, message and log level of a
+// close whose volume step left errors. Only when every error is a held volume
+// deletion is it a deletion in progress (INFO); anything else is a cleanup
+// failure (WARN).
+func closeVolumeFailure(
+	volumeErrs []error,
+	logger *slog.Logger,
+) (backend.Reason, string, func(string, ...any)) {
+	for _, err := range volumeErrs {
+		if !errors.Is(err, ErrVolumeDeleteHeld) {
+			return backend.ReasonCleanupFailed, backend.MsgCleanupFailed, logger.Warn
+		}
+	}
+	return backend.ReasonVolumeDeletionInProgress, backend.MsgVolumeDeletionInProgress, logger.Info
+}
+
+// markClosePending records a close that remains pending. A close waiting only
+// on held volume deletions (the same predicate as the close-churn skip) is a
+// deletion in progress, not a failed cleanup.
+func (b *Backend) markClosePending(claim shared.CloseIntentClaim, cause error) {
+	reason, message := backend.ReasonCleanupFailed, backend.MsgCleanupFailed
+	if b.closeAwaitsHeldDeletes(claim, b.volumes.VolumeDeleteHolds()) {
+		reason, message = backend.ReasonVolumeDeletionInProgress, backend.MsgVolumeDeletionInProgress
+	}
 	var diagSnap shared.DiagnosticEntry
 	now := time.Now()
-	b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+	b.provisionStore.UpdateFn(claim.LeaseUUID(), func(p *leasesm.ProvisionState) {
 		p.SetStatus(backend.ProvisionStatusFailed, now)
 		p.LastError = fmt.Sprintf("close execution remains pending: %v", cause)
-		p.Reason = backend.ReasonCleanupFailed
-		p.Message = backend.MsgCleanupFailed
+		p.Reason = reason
+		p.Message = message
 		diagSnap = leasesm.DiagnosticSnapshot(p)
 	})
 	b.persistDiagnostics(diagSnap, nil)
@@ -747,20 +771,24 @@ func (b *Backend) doClosePhysical(
 
 	if len(volumeErrs) > 0 {
 		joinedVolumeErr := errors.Join(volumeErrs...)
+		// A held deletion is a deletion still in progress on the provider, not
+		// a failed cleanup: author that reason here, at its source, and log it
+		// at INFO. Any other volume error is a cleanup failure (ENG-1117).
+		reason, message, log := closeVolumeFailure(volumeErrs, logger)
 		var diagSnap shared.DiagnosticEntry
 		failedAt := time.Now()
 		b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 			p.ContainerIDs = nil // containers are gone
 			p.SetStatus(backend.ProvisionStatusFailed, failedAt)
 			p.LastError = fmt.Sprintf("volume cleanup failed: %s", errors.Join(volumeErrs...))
-			p.Reason = backend.ReasonCleanupFailed
-			p.Message = backend.MsgCleanupFailed
+			p.Reason = reason
+			p.Message = message
 			diagSnap = leasesm.DiagnosticSnapshot(p)
 		})
 		// Correlation log so operators can still find the verbose detail (redacted
 		// from the tenant-facing Message) by lease_uuid (ENG-508).
-		logger.Warn("provision failed (verbose detail retained operator-side)",
-			"lease_uuid", leaseUUID, "reason", backend.ReasonCleanupFailed, "detail", errors.Join(volumeErrs...))
+		log("provision failed (verbose detail retained operator-side)",
+			"lease_uuid", leaseUUID, "reason", reason, "detail", errors.Join(volumeErrs...))
 		// Persist diagnostics outside the lock so failure state survives
 		// a process restart (no containers remain to recover from).
 		b.persistDiagnostics(diagSnap, nil)

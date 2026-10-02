@@ -501,12 +501,6 @@ func (x *xfsVolumeManager) pendingMutationNamesLocked(volumeID managedVolumeName
 	return names
 }
 
-func (x *xfsVolumeManager) hasDurableDeleteStage(stage xfsDeleteStageName) bool {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	return x.durableDeleteStages[stage.volumeID.value()] == stage
-}
-
 func (x *xfsVolumeManager) removeDeleteStageAuthorityLocked(stage xfsDeleteStageName) error {
 	volumeID := stage.volumeID.value()
 	if x.volumeToID[volumeID] != stage.projID || x.activeIDs[stage.projID] != volumeID {
@@ -1544,22 +1538,13 @@ func removeFromXFSRoot(root *os.Root, name string) error {
 	return root.Remove(name)
 }
 
-// cleanupXFSDeleteStage continues one parent-durable deletion. Tenant data
-// remains under the final managed name; the separately named empty stage keeps
-// project/name authority intact on every partial or ambiguous failure.
-func (x *xfsVolumeManager) cleanupXFSDeleteStage(
-	ctx context.Context,
-	stage xfsDeleteStageName,
-) deleteStageOutcome {
-	return x.cleanupXFSDeleteStageWith(
-		ctx, stage, removeCondemnedXFSEntry, removeFromXFSRoot, removeFromXFSRoot,
-	)
-}
-
 // cleanupXFSDeleteStageWith runs one cleanup attempt of stage and settles its
-// outcome: completed, held (the hold table now records it), or latched. The
-// attempt stops at ctx's end; callers bound it (the inline budget, or one
-// executor slice).
+// outcome: completed, held (the hold table now records it), or latched. Tenant
+// data remains under the final managed name; the separately named empty stage
+// keeps project/name authority intact on every partial or ambiguous failure.
+// The attempt stops at ctx's end; callers bound it (the inline budget, or one
+// executor slice). Its only callers are firstDeleteAttempt and
+// RetryHeldVolumeDelete (pinned by TestDeleteHoldTypesHaveSingleConstructors).
 func (x *xfsVolumeManager) cleanupXFSDeleteStageWith(
 	ctx context.Context,
 	stage xfsDeleteStageName,
@@ -1603,9 +1588,6 @@ func (x *xfsVolumeManager) runXFSDeleteStageCleanup(
 			return fmt.Errorf("attest xfs delete-stage %q for cleanup: %w", stage.value(), err)
 		}
 		stageExists = false
-		if !x.hasDurableDeleteStage(stage) {
-			return fmt.Errorf("refuse absent xfs delete-stage %q without live durable removal authority", stage.value())
-		}
 	}
 
 	x.mu.Lock()
@@ -1617,20 +1599,11 @@ func (x *xfsVolumeManager) runXFSDeleteStageCleanup(
 			stage.value())
 	}
 
+	held, wasHeld := x.heldDeletionOf(stage)
 	if !stageExists {
-		// The only implementation path that removes a durable delete-stage does
-		// so after a successful dquot clear. A live retry after an fsync error only
-		// needs to durably commit that already-safe absence.
-		if err := parent.Sync(); err != nil {
-			return fmt.Errorf("%w: xfs delete-stage %q is absent but the parent sync failed: %w",
-				backendidentity.ErrMutationOutcomeAmbiguous, stage.value(), err)
-		}
-		x.mu.Lock()
-		err = x.removeDeleteStageAuthorityLocked(stage)
-		x.mu.Unlock()
-		return err
+		return x.commitVanishedDeleteStage(root, parent, stage, held, wasHeld)
 	}
-	previous, wasHeld := x.holdPhaseOf(stage)
+	previous := held.phase
 
 	stageRoot, err := openAttestedXFSDeleteStageRoot(root, stage)
 	if err != nil {
@@ -1784,6 +1757,37 @@ func (x *xfsVolumeManager) runXFSDeleteStageCleanup(
 	err = x.removeDeleteStageAuthorityLocked(stage)
 	x.mu.Unlock()
 	return err
+}
+
+// commitVanishedDeleteStage releases the project of a delete stage that is no
+// longer on disk. Fred removes a stage only as the last step of its deletion,
+// after the zero-usage proof and the limit clear, so the stage may be gone
+// only after an attempt of this process reached that step and left it held as
+// stage_removal_failed, and only while the final path is positively absent.
+// Anything else (a stage removed from outside, or a final path that exists or
+// cannot be observed) is an authority contradiction: it returns an unmarked
+// error, which latches, and the project ID stays reserved.
+func (x *xfsVolumeManager) commitVanishedDeleteStage(
+	root *os.Root,
+	parent *fsidentity.Directory,
+	stage xfsDeleteStageName,
+	held xfsDeleteHold,
+	wasHeld bool,
+) error {
+	if !wasHeld || held.reason != holdReasonStageRemovalFailed {
+		return fmt.Errorf("xfs delete-stage %q disappeared before its deletion reached stage removal", stage.value())
+	}
+	if !observeFinalPathAtRoot(root, stage.volumeID).absent() {
+		return fmt.Errorf("xfs delete-stage %q disappeared while final volume %q is not proven absent",
+			stage.value(), stage.volumeID.value())
+	}
+	if err := parent.Sync(); err != nil {
+		return fmt.Errorf("%w: xfs delete-stage %q is absent but the parent sync failed: %w",
+			backendidentity.ErrMutationOutcomeAmbiguous, stage.value(), err)
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.removeDeleteStageAuthorityLocked(stage)
 }
 
 // emptyAndRemoveCondemnedXFSVolume is the removal phase of one attempt: it
@@ -2235,63 +2239,65 @@ func (x *xfsVolumeManager) ensureVolumeRootProject(
 // EnsureQuota verifies the volume root's project association and inheritance,
 // then re-applies block (bhard) and inode (ihard) limits using the project ID in
 // .fred-project-id. A missing association is repaired on the root only, never
-// by walking tenant data. No-op if the directory is absent (never creates), so
-// a concurrent deprovision is never resurrected.
-func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
+// by walking tenant data. It answers volumeQuotaAbsent if the directory is
+// absent (never creates), so a concurrent deprovision is never resurrected,
+// and volumeQuotaDeletePending, touching nothing, for a name whose deletion is
+// pending.
+func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error) {
 	volumeID, err := parseManagedVolumeName(id)
 	if err != nil {
-		return fmt.Errorf("validate xfs volume ID for quota: %w", err)
+		return 0, fmt.Errorf("validate xfs volume ID for quota: %w", err)
 	}
 	if _, deleting, stageErr := x.deleteStage(volumeID); stageErr != nil {
-		return stageErr
+		return 0, stageErr
 	} else if deleting {
 		// The delete authority owns this name's limits until its zero-usage
-		// proof, and no writer can exist. A marker-first partial removal has
-		// usually already unlinked the marker this would read.
-		return nil
+		// proof. A marker-first partial removal has usually already unlinked
+		// the marker this would read.
+		return volumeQuotaDeletePending, nil
 	}
 	dirPath := volumeID.hostPath(x.dataPath)
 	root, err := os.OpenRoot(x.dataPath)
 	if err != nil {
-		return fmt.Errorf("open xfs volume root %s: %w", x.dataPath, err)
+		return 0, fmt.Errorf("open xfs volume root %s: %w", x.dataPath, err)
 	}
 	defer func() { _ = root.Close() }()
 	info, err := root.Lstat(volumeID.value())
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil // vanished (e.g. concurrent deprovision): nothing to enforce
+			return volumeQuotaAbsent, nil // vanished (e.g. concurrent deprovision): nothing to enforce
 		}
-		return fmt.Errorf("stat volume dir %s: %w", dirPath, err)
+		return 0, fmt.Errorf("stat volume dir %s: %w", dirPath, err)
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("existing xfs volume %s is not a real directory", dirPath)
+		return 0, fmt.Errorf("existing xfs volume %s is not a real directory", dirPath)
 	}
 	volumeRoot, err := openAttestedManagedVolumeRoot(root, volumeID)
 	if err != nil {
-		return fmt.Errorf("open existing xfs volume %s: %w", dirPath, err)
+		return 0, fmt.Errorf("open existing xfs volume %s: %w", dirPath, err)
 	}
 	defer func() { _ = volumeRoot.Close() }()
 	projID, err := readProjectIDFileInVolumeRoot(volumeRoot)
 	if err != nil {
-		return fmt.Errorf("read project ID marker for %s: %w", dirPath, err)
+		return 0, fmt.Errorf("read project ID marker for %s: %w", dirPath, err)
 	}
 
 	x.mu.Lock()
 	registerErr := x.registerProjectIDLocked(volumeID.value(), projID)
 	x.mu.Unlock()
 	if registerErr != nil {
-		return fmt.Errorf("register existing xfs volume authority: %w", registerErr)
+		return 0, fmt.Errorf("register existing xfs volume authority: %w", registerErr)
 	}
 
 	if err := x.ensureVolumeRootProject(ctx, volumeRoot, dirPath, projID); err != nil {
-		return err
+		return 0, err
 	}
 	limitCmd := xfsLimitCmd(projID, fmt.Sprintf("%dm", sizeMB), inodeHardLimit(sizeMB, x.minAvgFileBytes))
 	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(limitCmd, x.mountPoint)...).CombinedOutput(); err != nil {
-		return fmt.Errorf("xfs_quota limit for %s (id=%d): %w: %s", dirPath, projID, err, out)
+		return 0, fmt.Errorf("xfs_quota limit for %s (id=%d): %w: %s", dirPath, projID, err, out)
 	}
 	x.logger.Debug("re-applied xfs project quota", "path", dirPath, "project_id", projID, "quota_mb", sizeMB)
-	return nil
+	return volumeQuotaApplied, nil
 }
 
 // Destroy deletes one managed volume under a parent-durable delete stage.
@@ -2490,6 +2496,17 @@ func (x *xfsVolumeManager) ListForProof(ctx context.Context) ([]string, error) {
 // nonzero project ID. Validate rebuilds the in-memory map from the same marker;
 // this narrower method lets the storage-identity proof repeat the check under
 // its caller-owned deadline immediately before publication.
+//
+// It also accepts a condemned volume: a name whose delete stage is registered,
+// present without its marker (a marker-first partial removal) or already gone
+// (ENG-1117), because the inventory proof must keep listing those. It
+// therefore does not by itself keep a condemned volume out of a launch:
+// Create's typed refusal does that on the provision, restart, update and
+// restore paths, before any bind. launchCompensation reaches the launch
+// quiesce without Create; that is unreachable for a condemned volume today
+// only because a maintenance source is never destroyed while its maintenance
+// is pending. A launch caller that does not first pass through Create must
+// refuse a delete-pending name itself (VolumeDeleteHolds().deletePending).
 func (x *xfsVolumeManager) AttestManagedVolume(ctx context.Context, name managedVolumeName) error {
 	if err := ctx.Err(); err != nil {
 		return err

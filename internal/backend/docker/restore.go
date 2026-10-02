@@ -2451,7 +2451,14 @@ func (b *Backend) restoreRetainedVolumeQuotasUsing(
 	}
 
 	for _, target := range targets {
-		if err := ensureQuota(ctx, target.name, target.diskMB); err != nil {
+		// Only an applied limit restores the source quota: a volume that is
+		// absent, or whose deletion is pending, carries no cap this rollback
+		// applied (ENG-1117), so the record stays Restoring and live-counted.
+		outcome, err := ensureQuota(ctx, target.name, target.diskMB)
+		if err == nil && outcome != volumeQuotaApplied {
+			err = fmt.Errorf("quota outcome %d is not an applied limit", outcome)
+		}
+		if err != nil {
 			b.logger.Error("restore rollback cannot apply immutable source quota",
 				"lease_uuid", rec.OriginalLeaseUUID,
 				"volume", target.name,

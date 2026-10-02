@@ -1787,7 +1787,7 @@ func TestIntegration_XFS_EnsureQuota_RepairsRootForNewWrites(t *testing.T) {
 	require.Error(t, uerr, "an untagged volume must not be measurable before backfill")
 
 	// Repair only the root via EnsureQuota (what reconcileVolumeQuotas invokes).
-	require.NoError(t, mgr.EnsureQuota(ctx, volName, capMiB))
+	require.NoError(t, ensureQuotaErr(mgr.EnsureQuota(ctx, volName, capMiB)))
 
 	// Historical bytes must not be recursively charged to the repaired root.
 	used, err := mgr.Usage(ctx, volName)

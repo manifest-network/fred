@@ -312,6 +312,12 @@ const (
 // hold executor's slice on a name that needs no work. A malformed name is
 // answered with its parse error, as the locked destroy would.
 func (b *Backend) precheckDestroy(id string) (answered bool, err error) {
+	// The locked path refuses every destroy once storage authority latched
+	// (authorizeStorageMutation); the lock-free answer must refuse as well, or
+	// a caller could settle on a memory-and-Lstat "gone" after the latch.
+	if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
+		return true, fmt.Errorf("destroy volume %q: %w", id, authorityErr)
+	}
 	name, parseErr := parseManagedVolumeName(id)
 	if parseErr != nil {
 		return true, fmt.Errorf("destroy volume %q: %w", id, parseErr)

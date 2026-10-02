@@ -737,6 +737,60 @@ esac`)
 	assert.DirExists(t, gone.volumeID.hostPath(dataPath), "it is never emptied as condemned data")
 }
 
+// A delete stage that disappears from disk releases its project only when
+// this process's own attempt reached stage removal (after the zero-usage proof
+// and the limit clear) and the final path is positively absent. A stage
+// removed from outside at any earlier point is an authority contradiction: it
+// latches and the project ID stays reserved, never a recorded completion.
+func TestXFSVanishedDeleteStageCompletesOnlyAfterStageRemovalWithTheVolumeGone(t *testing.T) {
+	t.Run("removed from outside during the removal phase", func(t *testing.T) {
+		dataPath := t.TempDir()
+		mgr := newXfsManagerForTest(dataPath)
+		stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
+		prepareDeleteStageForTest(t, mgr, stage)
+		volumePath := withVolume(t, mgr, stage, true)
+		installXFSQuotaFixture(t, "")
+		require.ErrorIs(t, mgr.destroyWith(t.Context(), stage.volumeID.value(),
+			failingRemoval(fmt.Errorf("x: %w", fstree.ErrUndeletable))), ErrVolumeDeleteHeld)
+		require.NoError(t, os.Remove(stage.hostPath(dataPath)))
+
+		err := mgr.RetryHeldVolumeDelete(t.Context(), stage.volumeID.value())
+		require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending, "a vanished stage is a contradiction")
+		assert.Equal(t, stage.projID, mgr.volumeToID[stage.volumeID.value()], "the project ID stays reserved")
+		assert.Equal(t, stage.volumeID.value(), mgr.activeIDs[stage.projID])
+		heldForTest(t, mgr, stage.volumeID.value())
+		assert.DirExists(t, volumePath, "nothing is removed")
+	})
+	stageRemovalFailed := func(t *testing.T) (*xfsVolumeManager, xfsDeleteStageName) {
+		dataPath := t.TempDir()
+		mgr := newXfsManagerForTest(dataPath)
+		stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
+		prepareDeleteStageForTest(t, mgr, stage)
+		withVolume(t, mgr, stage, true)
+		installXFSQuotaFixture(t, "")
+		outcome := mgr.cleanupXFSDeleteStageWith(t.Context(), stage, removeCondemnedXFSEntry, removeFromXFSRoot,
+			func(*os.Root, string) error { return unix.EBUSY })
+		require.Equal(t, deleteStageHeld, outcome.kind)
+		require.Equal(t, holdReasonStageRemovalFailed, heldForTest(t, mgr, stage.volumeID.value()).reason)
+		require.NoError(t, os.Remove(stage.hostPath(dataPath)))
+		return mgr, stage
+	}
+	t.Run("gone after stage removal with the volume gone", func(t *testing.T) {
+		mgr, stage := stageRemovalFailed(t)
+		require.NoError(t, mgr.RetryHeldVolumeDelete(t.Context(), stage.volumeID.value()))
+		assert.Empty(t, mgr.VolumeDeleteHolds().holds)
+		assert.NotContains(t, mgr.volumeToID, stage.volumeID.value())
+		assert.NotContains(t, mgr.activeIDs, stage.projID)
+	})
+	t.Run("gone after stage removal but the volume is back", func(t *testing.T) {
+		mgr, stage := stageRemovalFailed(t)
+		require.NoError(t, os.Mkdir(stage.volumeID.hostPath(mgr.dataPath), 0o700))
+		err := mgr.RetryHeldVolumeDelete(t.Context(), stage.volumeID.value())
+		require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+		assert.Equal(t, stage.projID, mgr.volumeToID[stage.volumeID.value()], "the project ID stays reserved")
+	})
+}
+
 // Start's report-row reads share one aggregate budget: a hung xfs_quota delays
 // Start by that budget once, not once per recovered stage, and every stage it
 // could not size is unsized.
@@ -827,7 +881,9 @@ func TestXFSEnsureQuotaSkipsADeletePendingName(t *testing.T) {
 	mgr := newXfsManagerForTest(dataPath)
 	require.NoError(t, mgr.loadProjectIDs())
 	logPath := installLoggingXFSQuota(t)
-	require.NoError(t, mgr.EnsureQuota(t.Context(), stage.volumeID.value(), 20))
+	outcome, err := mgr.EnsureQuota(t.Context(), stage.volumeID.value(), 20)
+	require.NoError(t, err)
+	assert.Equal(t, volumeQuotaDeletePending, outcome, "a skipped name is never reported as applied")
 	assert.NoFileExists(t, logPath, "no limit is touched for a held deletion")
 	assert.True(t, mgr.VolumeDeleteHolds().deletePending(stage.volumeID.value()))
 }

@@ -1090,6 +1090,59 @@ func TestRestoreRollbackAnswersAHeldCreatedVolumeWithoutTheLock(t *testing.T) {
 	}
 }
 
+// A held restore-created volume no longer stalls the rollback's locked step:
+// that step still runs (it also returns an interrupted source's volumes to
+// retention) and destroys the other created volume, and only then does the
+// held answer keep the rollback pending.
+func TestRestoreRollbackHeldCreatedVolumeDoesNotStallTheLockedStep(t *testing.T) {
+	f := newInterruptedRestoreRecoveryFixture(
+		t, 3, []string{"exited"}, backend.ProvisionStatusFailed, true,
+	)
+	volumes, ok := f.b.volumes.(*mockVolumeManager)
+	require.True(t, ok)
+	dockerMock, ok := f.b.docker.(*mockDockerClient)
+	require.True(t, ok)
+	dockerMock.ListVolumeWritersFn = func(context.Context) ([]ContainerInfo, error) { return nil, nil }
+	held := canonicalVolumeName(f.spec.LeaseUUID, f.spec.Items[0].ServiceName, 1)
+	unheld := canonicalVolumeName(f.spec.LeaseUUID, f.spec.Items[0].ServiceName, 2)
+	var unheldGone atomic.Bool
+	listed := volumes.ListForProofFn
+	volumes.ListForProofFn = func(ctx context.Context) ([]string, error) {
+		names, err := listed(ctx)
+		names = append(names, held)
+		if !unheldGone.Load() {
+			names = append(names, unheld)
+		}
+		return names, err
+	}
+	volumes.VolumeDeleteHoldsFn = func() volumeDeleteHoldSnapshot { return pendingDeletes(held) }
+	volumes.PrecheckDestroyFn = func(name managedVolumeName) (destroyPrecheckVerdict, error) {
+		if name.value() == held {
+			return destroyPrecheckHeld, heldDeleteErr(held)
+		}
+		return destroyPrecheckNeedsLock, nil
+	}
+	volumes.DestroyFn = func(_ context.Context, name string) error {
+		f.record("destroy:" + name)
+		if name == unheld {
+			unheldGone.Store(true)
+		}
+		return nil
+	}
+
+	retries := operationIntentRecoveryCleanupRetriesTotal.WithLabelValues("restore")
+	before := testutil.ToFloat64(retries)
+	require.NoError(t, f.b.recoverOperationIntents(t.Context()))
+	assert.Contains(t, f.snapshotEvents(), "destroy:"+unheld,
+		"the locked step ran despite the held created volume")
+	assert.NotContains(t, f.snapshotEvents(), "destroy:"+held, "the held volume is answered, never destroyed")
+	assert.Equal(t, before+1, testutil.ToFloat64(retries), "the held answer keeps the rollback pending")
+	intents, err := f.b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1)
+	require.NoError(t, f.b.terminalStorageAuthorityError())
+}
+
 // Start with three pending closes never waits on their volumes' trees: each
 // close's deletion is handed to the executor without an attempt during Start,
 // and once the executor runs it removes them and resumes the closes.

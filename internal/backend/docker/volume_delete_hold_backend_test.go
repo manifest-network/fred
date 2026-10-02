@@ -2,7 +2,9 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -126,6 +128,37 @@ func TestStorageMutationGuard_VolumeDeleteHeldDoesNotLatch(t *testing.T) {
 	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending)
 	require.NoError(t, b.terminalStorageAuthorityError(), "a held deletion must never latch")
 	require.NoError(t, b.stopCtx.Err(), "a held deletion must never stop the backend")
+}
+
+// Once storage authority latched, the lock-free destroy answer refuses like
+// the locked path does: a positively absent, unmapped name must not settle a
+// caller on a memory-and-Lstat "gone" after the latch, nor may a held one.
+func TestPrecheckDestroyRefusesAfterTheStorageAuthorityLatch(t *testing.T) {
+	t.Parallel()
+
+	stopCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	gate, err := backendidentity.NewStorageAuthorityGate(func(error) { stop() })
+	require.NoError(t, err)
+	const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	var prechecks atomic.Int32
+	b := &Backend{
+		volumes: &mockVolumeManager{PrecheckDestroyFn: func(managedVolumeName) (destroyPrecheckVerdict, error) {
+			prechecks.Add(1)
+			return destroyPrecheckGone, nil
+		}},
+		stopCtx: stopCtx, stopCancel: stop, storeAuthorityGate: gate,
+	}
+	answered, err := b.precheckDestroy(name)
+	require.True(t, answered)
+	require.NoError(t, err, "before the latch, a positively absent name settles")
+
+	cause := fmt.Errorf("%w: injected", backendidentity.ErrIdentityDrift)
+	require.Error(t, b.latchTerminalStorageAuthority(cause))
+	answered, err = b.precheckDestroy(name)
+	require.True(t, answered, "the refusal is answered without the lock")
+	require.ErrorIs(t, err, backendidentity.ErrIdentityDrift)
+	assert.Equal(t, int32(1), prechecks.Load(), "the manager is not consulted after the latch")
 }
 
 // A Create refused because the name's deletion is pending is an ordinary,
@@ -331,13 +364,14 @@ func TestReconcileVolumeQuotasCountsDeletePending(t *testing.T) {
 	}}
 	held := canonicalVolumeName(lease, "web", 0)
 	live := canonicalVolumeName(lease, "web", 1)
-	var ensured []string
 	b.volumes = &mockVolumeManager{
 		ListFn:              func() ([]string, error) { return []string{held, live}, nil },
 		VolumeDeleteHoldsFn: func() volumeDeleteHoldSnapshot { return pendingDeletes(held) },
-		EnsureQuotaFn: func(_ context.Context, id string, _ int64) error {
-			ensured = append(ensured, id)
-			return nil
+		EnsureQuotaOutcomeFn: func(_ context.Context, id string, _ int64) (volumeQuotaOutcome, error) {
+			if id == held {
+				return volumeQuotaDeletePending, nil // the manager touched nothing
+			}
+			return volumeQuotaApplied, nil
 		},
 	}
 	counter := func(outcome string) float64 {
@@ -345,9 +379,9 @@ func TestReconcileVolumeQuotasCountsDeletePending(t *testing.T) {
 	}
 	pendingBefore, appliedBefore := counter(quotaBackfillDeletePending), counter("applied")
 	require.NoError(t, b.reconcileVolumeQuotas(context.Background()))
-	assert.Equal(t, []string{live}, ensured, "a held deletion's limits belong to its delete authority")
-	assert.Equal(t, pendingBefore+1, counter(quotaBackfillDeletePending))
-	assert.Equal(t, appliedBefore+1, counter("applied"))
+	assert.Equal(t, pendingBefore+1, counter(quotaBackfillDeletePending),
+		"a held deletion's limits belong to its delete authority: its own outcome")
+	assert.Equal(t, appliedBefore+1, counter("applied"), "only an applied limit counts as applied")
 }
 
 // Start's quota reconciliation against the real XFS manager: a recovered held
@@ -401,6 +435,12 @@ func TestVolumeDeleteHeldKeepsClosePendingThenCompletes(t *testing.T) {
 			}
 			return nil, nil
 		},
+		VolumeDeleteHoldsFn: func() volumeDeleteHoldSnapshot {
+			if held.Load() {
+				return pendingDeletes(name)
+			}
+			return volumeDeleteHoldSnapshot{}
+		},
 		DestroyFn: func(context.Context, string) error {
 			destroyCalls.Add(1)
 			if held.Load() {
@@ -422,7 +462,9 @@ func TestVolumeDeleteHeldKeepsClosePendingThenCompletes(t *testing.T) {
 	b.provisionsMu.RUnlock()
 	require.NotNil(t, projected)
 	assert.Equal(t, backend.ProvisionStatusFailed, projected.Status)
-	assert.Equal(t, backend.ReasonCleanupFailed, projected.Reason)
+	assert.Equal(t, backend.ReasonVolumeDeletionInProgress, projected.Reason,
+		"a deletion still in progress is not a failed cleanup")
+	assert.Equal(t, backend.MsgVolumeDeletionInProgress, projected.Message)
 
 	// The hold executor finishes the deletion; the name leaves the listing and
 	// the next attempt classifies the close as destroyed.
@@ -433,6 +475,20 @@ func TestVolumeDeleteHeldKeepsClosePendingThenCompletes(t *testing.T) {
 	assert.False(t, found, "the close completes once the deletion has")
 	assert.Equal(t, int32(1), destroyCalls.Load(), "only the first attempt needed a destroy")
 	closeCloseRecoveryBackend(t, b, stores)
+}
+
+// Only a close whose every volume error is a held deletion reads as a deletion
+// in progress (logged at INFO); any other volume error is a cleanup failure.
+func TestCloseVolumeFailureAuthorsTheInProgressReasonOnlyForHolds(t *testing.T) {
+	t.Parallel()
+
+	held := heldDeleteErr("fred-550e8400-e29b-41d4-a716-446655440000-app-0")
+	reason, message, _ := closeVolumeFailure([]error{held, fmt.Errorf("wrapped: %w", held)}, slog.Default())
+	assert.Equal(t, backend.ReasonVolumeDeletionInProgress, reason)
+	assert.Equal(t, backend.MsgVolumeDeletionInProgress, message)
+	reason, message, _ = closeVolumeFailure([]error{held, errors.New("rename failed")}, slog.Default())
+	assert.Equal(t, backend.ReasonCleanupFailed, reason)
+	assert.Equal(t, backend.MsgCleanupFailed, message)
 }
 
 // A retaining close never retains a name whose deletion is pending (finding
