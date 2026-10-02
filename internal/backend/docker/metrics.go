@@ -5,6 +5,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 )
 
 const (
@@ -747,6 +748,20 @@ var (
 		Help:      "Container-death observations refused because the backend stopped, the actor was busy or recovery-owned, or the provision generation was stale; excludes deaths owned by an active actor close",
 	}, []string{"source"})
 
+	// leaseFailuresTotal counts every failure the lease state machine records
+	// in a lease's consecutive-failure terminal budget (ENG-799), by who caused
+	// it. Only tenant_workload consumes the budget that can close a lease
+	// on-chain; disruption (an observed API signal, or a vanished, removing or
+	// dead container), platform, maintenance (restart, update or restore
+	// outcomes) and unknown never do. The label set is failurecause.Labels, a
+	// closed enum, pre-initialized in init.
+	leaseFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_failures_total",
+		Help:      "Lease failures recorded by the consecutive-failure budget, by attribution; only tenant_workload counts toward closing a lease",
+	}, []string{"attribution"})
+
 	// leaseWorkerPanicsTotal counts panics recovered in lease worker
 	// goroutines (provision, replace, diag), labeled by worker type.
 	// Workers are Docker-interaction code that is NOT expected to panic;
@@ -1076,6 +1091,11 @@ var restoreOutcomes = []string{"success", "failure"}
 var quotaBackfillOutcomes = []string{"applied", "failed"}
 
 func init() {
+	// Pre-init every failure attribution (ENG-799) so an alert on a non-counted
+	// attribution reads 0, not no-data, before the first failure.
+	for _, attribution := range failurecause.Labels() {
+		leaseFailuresTotal.WithLabelValues(attribution).Add(0)
+	}
 	for _, kind := range []string{"active", "retained"} {
 		imageUnpinnedGenerations.WithLabelValues(kind).Set(0)
 	}

@@ -406,6 +406,10 @@ func defaultReason(status backend.ProvisionStatus, r backend.Reason) backend.Rea
 // prov.StackManifest. SKU is propagated unchanged. The legacy single-
 // service `Image` field was deleted in Task 15 — callers that need a
 // representative image consult ServiceImages or iterate Items.
+//
+// TerminalBudget is minted from the live actor-owned projection only, so it
+// reaches ListProvisions, LookupProvisions and a tracked GetProvision. The
+// diagnostics fallback and retained records never carry one (ENG-799).
 func provisionToInfo(prov *provision, backendName string) backend.ProvisionInfo {
 	lifecycleGeneration := backend.ObserveLifecycleGeneration(
 		prov.CallbackURL, prov.LifecycleCallbackURL,
@@ -422,6 +426,7 @@ func provisionToInfo(prov *provision, backendName string) backend.ProvisionInfo 
 		Message:             prov.Message,
 		Quantity:            prov.Quantity,
 		LifecycleGeneration: &lifecycleGeneration,
+		TerminalBudget:      prov.ObserveTerminalBudget(),
 	}
 	// Post-Task-15 every provision carries `prov.Items` (populated at
 	// Provision time by NormalizeProvisionRequest and rehydrated from

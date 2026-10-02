@@ -2083,14 +2083,21 @@ const (
 	HealthStatusNone      HealthStatus = "" // No health check configured
 )
 
-// ContainerEvents subscribes to Docker container lifecycle events, filtering
-// for "die" events on containers managed by fred (label fred.managed=true).
-// Returns a channel of ContainerEvent and a channel of errors. Both channels
-// are closed when the context is canceled or the Docker event stream closes.
+// ContainerEvents subscribes to Docker container lifecycle events on containers
+// managed by fred (label fred.managed=true): "die", plus the "start" and "kill"
+// events that attribute a death to its cause (ENG-799). The three share one
+// subscription so the daemon's own ordering holds between them: dockerd logs
+// "kill" after delivering an API signal and "die" from the exit handler, both
+// under the container lock, so a signal to a run is always delivered before
+// that run's death. Returns a channel of ContainerEvent and a channel of
+// errors. Both channels are closed when the context is canceled or the Docker
+// event stream closes.
 func (d *DockerClient) ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error) {
 	filter := filters.NewArgs(
 		filters.Arg("type", string(events.ContainerEventType)),
-		filters.Arg("event", "die"),
+		filters.Arg("event", containerEventStart),
+		filters.Arg("event", containerEventKill),
+		filters.Arg("event", containerEventDie),
 		filters.Arg("label", LabelManaged+"=true"),
 	)
 	if d.backendName != "" {

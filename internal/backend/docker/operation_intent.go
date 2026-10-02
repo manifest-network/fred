@@ -1087,11 +1087,15 @@ func recoveredReadyProjection(
 		)
 	}
 	failCount := 0
+	// The promotion replaces the projection pointer, so it carries the
+	// actor-owned terminal budget (ENG-799) exactly as it carries FailCount.
+	var budget leasesm.TerminalBudget
 	if current != nil {
 		failCount = current.FailCount
+		budget = current.TerminalBudget
 	}
 	profiles := claim.ResourceProfiles()
-	return (&recoveredProvision{ //exhaustruct:enforce
+	promoted := &recoveredProvision{ //exhaustruct:enforce
 		ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
 			LeaseUUID:            claim.LeaseUUID(),
 			Tenant:               claim.Tenant(),
@@ -1101,6 +1105,7 @@ func recoveredReadyProjection(
 			Quantity:             quantity,
 			CreatedAt:            claim.CreatedAt(),
 			FailCount:            failCount,
+			TerminalBudget:       budget,
 			LastError:            "",
 			Reason:               "",
 			Message:              "",
@@ -1114,7 +1119,11 @@ func recoveredReadyProjection(
 			StackManifest:        promotion.stackManifest,
 			ServiceContainers:    cloneOperationServiceContainers(promotion.serviceContainers),
 		},
-	}).materialize(), nil
+	}
+	// A Ready projection written outside the actor: it can only move the budget
+	// toward a reset.
+	promoted.ObserveReadyProjection(time.Now())
+	return promoted.materialize(), nil
 }
 
 func cloneOperationServiceContainers(source map[string][]string) map[string][]string {

@@ -144,6 +144,7 @@ func projectReadyRestoredLease(b *Backend, entry shared.RetentionEntry) {
 			Quantity:             entry.DestinationItems[0].Quantity,
 			CreatedAt:            time.Now(),
 			FailCount:            0,
+			TerminalBudget:       leasesm.TerminalBudget{},
 			LastError:            "",
 			Reason:               "",
 			Message:              "",

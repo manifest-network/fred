@@ -14,6 +14,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -151,6 +152,7 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 		evContainerDied,
 		reflect.TypeFor[string](),
 		reflect.TypeFor[shared.RuntimeGenerationProof](),
+		reflect.TypeFor[failurecause.Provenance](),
 	)
 	sm.SetTriggerParameters(evDeprovisionRequested)
 	sm.SetTriggerParameters(evRestartRequested, reflect.TypeFor[replaceEntryArgs]())
@@ -407,6 +409,7 @@ func (lsm *leaseSM) containerDied(
 	ctx context.Context,
 	id string,
 	runtime shared.RuntimeGenerationProof,
+	provenance failurecause.Provenance,
 ) error {
 	if id == "" || !runtime.Valid() {
 		return errors.New("container death requires an exact instance and runtime generation")
@@ -414,7 +417,7 @@ func (lsm *leaseSM) containerDied(
 	if err := lsm.requireProjection(evContainerDied); err != nil {
 		return err
 	}
-	return lsm.fireRaw(ctx, evContainerDied, id, runtime)
+	return lsm.fireRaw(ctx, evContainerDied, id, runtime, provenance)
 }
 func (lsm *leaseSM) diagnosticsGathered(ctx context.Context, result diagResult) error {
 	if err := lsm.requireProjection(evDiagGathered); err != nil {
@@ -625,8 +628,14 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	// discover fallible validation after that mutation.
 	containerID := args[0].(string)
 	runtime := args[1].(shared.RuntimeGenerationProof)
+	provenance := args[2].(failurecause.Provenance)
 	leaseUUID := lsm.actor.leaseUUID
 	info := lsm.actor.pendingDeathInfo
+	// The only budget-counting site. The cause is attributed from the guard's
+	// fresh inspection and the death's provenance; FailCount stays a lifetime
+	// diagnostic of every death, counted or not.
+	cause := failurecause.ClassifyDeath(provenance, deathTermination(info))
+	now := time.Now()
 
 	// No Status recheck needed (ENG-230). Off-actor Status writes for
 	// restart/update are eliminated — onEnterRestarting/onEnterUpdating
@@ -639,13 +648,18 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	// kept (cheap nil-guard: UpdateFn returns false if the lease was
 	// removed). The provision-store implementation derives observability from
 	// the Ready→Failing mutation in the same critical section.
-	lsm.actor.cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+	var outcome budgetOutcome
+	applied := lsm.actor.cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.Status = backend.ProvisionStatusFailing
 		p.FailCount++
 		p.LastError = errMsgContainerExited
 		p.Reason = backend.ReasonContainerExited
 		p.Message = errMsgContainerExited
+		outcome = p.budgetRecordFailure(cause, now)
 	})
+	if applied {
+		lsm.observeBudgetOutcome(outcome, info, provenance)
+	}
 	// Spawn the async diag gather. Its context is derived from
 	// context.Background() with a bounded timeout — NOT from stopCtx —
 	// so a backend shutdown doesn't cancel diag prematurely and leave
@@ -676,6 +690,7 @@ func (lsm *leaseSM) onEnterProvisioning(_ context.Context, _ ...any) error {
 		p.LastError = ""
 		p.Reason = ""
 		p.Message = ""
+		p.budgetEnterProvisioning()
 	})
 	return nil
 }
@@ -718,7 +733,16 @@ func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus
 	lifecycleCallbackURL := entry.LifecycleCallbackURL
 	callbackKind := entry.CallbackKind
 	maintenance := entry.Maintenance
+	now := time.Now()
 	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
+		// Leaving Ready ends the current Ready period. An accepted tenant
+		// restart or update (lifecycle maintenance) then starts a fresh streak,
+		// as `docker restart` resets Docker's RestartCount; a restore admits a
+		// new lease whose budget is already fresh.
+		p.budgetExitReady(now)
+		if callbackKind == replaceCallbackLifecycle {
+			p.budgetResetByTenant()
+		}
 		p.Status = status
 		if callbackKind == replaceCallbackOperation && callbackURL != "" {
 			p.CallbackURL = callbackURL
@@ -797,14 +821,22 @@ func (lsm *leaseSM) applyMaintenanceRecoveredSuccess(result ReplaceSuccessResult
 	if err := lsm.applyMaintenanceRecoveredProjection(result, backend.ProvisionStatusReady); err != nil {
 		return err
 	}
+	now := time.Now()
 	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
 		p.LastError = ""
 		p.Reason = ""
 		p.Message = ""
+		// Idempotent on re-application: an existing Ready anchor is kept.
+		p.budgetEnterReady(now)
 	})
 	return nil
 }
 
+// applyMaintenanceRecoveredFailure reapplies an exact durable projection. It is
+// shared by the entry actions and by idempotent recovery re-application, so it
+// records nothing new in the terminal budget: it only re-asserts that the
+// current failure is not counted (and, for Ready, that a Ready period is
+// anchored). Entry actions record the failure once, before calling it.
 func (lsm *leaseSM) applyMaintenanceRecoveredFailure(
 	projection ReplaceSuccessResult,
 	info ReplaceFailureInfo,
@@ -813,10 +845,16 @@ func (lsm *leaseSM) applyMaintenanceRecoveredFailure(
 	if err := lsm.applyMaintenanceRecoveredProjection(projection, status); err != nil {
 		return err
 	}
+	now := time.Now()
 	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
+		if status == backend.ProvisionStatusReady {
+			p.budgetEnterReady(now)
+		} else {
+			p.budgetClearCurrentFailure()
+		}
 	})
 	return nil
 }
@@ -828,6 +866,21 @@ func (lsm *leaseSM) applyMaintenanceRecoveredRuntimeFailure(
 	return lsm.applyMaintenanceRecoveredFailure(
 		projection, info, backend.ProvisionStatusFailed,
 	)
+}
+
+// recordMaintenanceRecoveredFailure records, exactly once per recovery entry
+// action, a failure that never counts. It runs before the projection is
+// reapplied so that leaving Ready applies the sustained-Ready reset against the
+// Ready period that is ending.
+func (lsm *leaseSM) recordMaintenanceRecoveredFailure(cause failurecause.Cause) {
+	now := time.Now()
+	var outcome budgetOutcome
+	applied := lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
+		outcome = p.budgetRecordFailure(cause, now)
+	})
+	if applied {
+		lsm.observeBudgetOutcome(outcome, nil, failurecause.Provenance{})
+	}
 }
 
 func (lsm *leaseSM) onEnterReadyFromMaintenanceRecoverySuccess(
@@ -846,7 +899,7 @@ func (lsm *leaseSM) onEnterReadyFromMaintenanceRecoveryFailure(
 	args ...any,
 ) error {
 	return lsm.applyMaintenanceRecoveryFailureArgs(
-		args, backend.ProvisionStatusReady,
+		args, backend.ProvisionStatusReady, failurecause.Maintenance(),
 	)
 }
 
@@ -855,15 +908,18 @@ func (lsm *leaseSM) onEnterFailedFromMaintenanceRecoveryFailure(
 	args ...any,
 ) error {
 	return lsm.applyMaintenanceRecoveryFailureArgs(
-		args, backend.ProvisionStatusFailed,
+		args, backend.ProvisionStatusFailed, failurecause.Maintenance(),
 	)
 }
 
+// onEnterFailedFromMaintenanceRuntimeFailure: the committed maintenance target's
+// running cohort diverged from its durable release, a platform failure.
 func (lsm *leaseSM) onEnterFailedFromMaintenanceRuntimeFailure(
 	_ context.Context,
 	args ...any,
 ) error {
 	recovery := args[0].(maintenanceRecoveryFailureArgs)
+	lsm.recordMaintenanceRecoveredFailure(failurecause.Platform())
 	_ = lsm.applyMaintenanceRecoveredRuntimeFailure(
 		recovery.projection, recovery.failure,
 	)
@@ -873,8 +929,10 @@ func (lsm *leaseSM) onEnterFailedFromMaintenanceRuntimeFailure(
 func (lsm *leaseSM) applyMaintenanceRecoveryFailureArgs(
 	args []any,
 	status backend.ProvisionStatus,
+	cause failurecause.Cause,
 ) error {
 	recovery := args[0].(maintenanceRecoveryFailureArgs)
+	lsm.recordMaintenanceRecoveredFailure(cause)
 	_ = lsm.applyMaintenanceRecoveredFailure(
 		recovery.projection, recovery.failure, status,
 	)
@@ -960,8 +1018,10 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 
 	// provisionCompleted validates and binds this release before Fire.
 	release, _ := result.operationRelease.Release()
+	now := time.Now()
 	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.Status = backend.ProvisionStatusReady
+		p.budgetEnterReady(now)
 		p.ContainerIDs = result.containerIDs
 		p.LastError = ""
 		// Clear any stale curated failure surface (ENG-508): a retried
@@ -1009,12 +1069,14 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
+	now := time.Now()
 	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.ContainerIDs = result.containerIDs
 		if result.serviceContainers != nil {
 			p.ServiceContainers = result.serviceContainers
 		}
 		p.Status = backend.ProvisionStatusReady
+		p.budgetEnterReady(now)
 		p.LastError = ""
 		// Clear any stale curated failure surface (ENG-508): a lease that
 		// failed (Reason/Message authored) and then successfully restarts
@@ -1051,13 +1113,18 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+	now := time.Now()
+	var outcome budgetOutcome
+	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		applyFailedReplaceSource(p, info)
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
 		p.FailCount++
+		// A restart or update outcome never counts, rolled back or not.
+		outcome = p.budgetRecordFailure(failurecause.Maintenance(), now)
 		p.Status = backend.ProvisionStatusReady
+		p.budgetEnterReady(now)
 		// Restart: if we actually stopped old containers and then restored
 		// them, we're back to the exact same state — no persistent error.
 		// Update: keep LastError so the UI shows why the update failed.
@@ -1067,6 +1134,9 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 			p.Message = ""
 		}
 	})
+	if applied {
+		lsm.observeBudgetOutcome(outcome, nil, failurecause.Provenance{})
+	}
 
 	if !info.preserveMaintenance {
 		lsm.sendReplaceFailureCallback(
@@ -1084,14 +1154,22 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+	now := time.Now()
+	var outcome budgetOutcome
+	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		applyFailedReplaceSource(p, info)
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
 		p.FailCount++
+		// A restart, update or restore that ends Failed never counts. The
+		// re-provision that follows can still count its own crashes.
+		outcome = p.budgetRecordFailure(failurecause.Maintenance(), now)
 		p.Status = backend.ProvisionStatusFailed
 	})
+	if applied {
+		lsm.observeBudgetOutcome(outcome, nil, failurecause.Provenance{})
+	}
 
 	if !info.preserveMaintenance {
 		lsm.sendReplaceFailureCallback(
@@ -1121,13 +1199,21 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
-	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+	now := time.Now()
+	var outcome budgetOutcome
+	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.Status = backend.ProvisionStatusFailed
 		p.FailCount++
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
+		// Only a refusal before any substrate effect reaches this transition
+		// (image admission and pull included): a platform failure, never counted.
+		outcome = p.budgetRecordFailure(failurecause.Platform(), now)
 	})
+	if applied {
+		lsm.observeBudgetOutcome(outcome, nil, failurecause.Provenance{})
+	}
 
 	// ORDERING CONTRACT: SendOperationFailureFn MUST remain the last statement of
 	// this entry action. The docker provision tests synchronize on the
@@ -1222,12 +1308,17 @@ func (lsm *leaseSM) onEnterFailedFromCohortDivergence(ctx context.Context, args 
 	var diagSnap shared.DiagnosticEntry
 	var diagInstanceIDs []string
 	var diagKeys map[string]string
+	now := time.Now()
+	var outcome budgetOutcome
 	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.Status = backend.ProvisionStatusFailed
 		p.FailCount++
 		p.LastError = errMsgCohortDiverged
 		p.Reason = backend.ReasonInternal
 		p.Message = errMsgCohortDiverged
+		// A cohort that diverged from its durable release is a platform
+		// failure. Leaving Ready still applies the sustained-Ready reset.
+		outcome = p.budgetRecordFailure(failurecause.Platform(), now)
 		failCount = p.FailCount
 		diagSnap = DiagnosticSnapshot(p)
 		diagInstanceIDs = append([]string(nil), p.ContainerIDs...)
@@ -1236,6 +1327,7 @@ func (lsm *leaseSM) onEnterFailedFromCohortDivergence(ctx context.Context, args 
 	if !applied {
 		return nil
 	}
+	lsm.observeBudgetOutcome(outcome, nil, failurecause.Provenance{})
 
 	if diagSnap.LeaseUUID != "" {
 		cfg.PersistDiagnosticsFn(diagSnap, diagInstanceIDs, diagKeys)

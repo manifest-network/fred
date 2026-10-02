@@ -15,6 +15,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
@@ -990,6 +991,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					ContainerIDs:         make([]string, 0),
 					StackManifest:        nil, // restored below
 					ServiceContainers:    nil, // rebuilt from labels below
+					TerminalBudget:       leasesm.TerminalBudget{},
 				},
 			}
 
@@ -1133,6 +1135,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Quantity:             quantity,
 					CreatedAt:            claim.CreatedAt(),
 					FailCount:            0,
+					TerminalBudget:       leasesm.TerminalBudget{},
 					LastError:            "",
 					Reason:               "",
 					Message:              "",
@@ -1267,6 +1270,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Quantity:             quantity,
 					CreatedAt:            release.CreatedAt,
 					FailCount:            0,
+					TerminalBudget:       leasesm.TerminalBudget{},
 					LastError:            "",
 					Reason:               "",
 					Message:              "",
@@ -1358,6 +1362,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				Quantity:             quantity,
 				CreatedAt:            claim.CreatedAt(),
 				FailCount:            0,
+				TerminalBudget:       leasesm.TerminalBudget{},
 				LastError:            "",
 				Reason:               "",
 				Message:              "",
@@ -1504,6 +1509,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Quantity:             quantity,
 					CreatedAt:            createdAt,
 					FailCount:            0,
+					TerminalBudget:       leasesm.TerminalBudget{},
 					LastError:            "",
 					Reason:               "",
 					Message:              "",
@@ -1802,6 +1808,16 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// increment would otherwise regress FailCount to the stale label. Preserve
 		// the higher in-memory value. Skipped for in-flight statuses (preserved
 		// wholesale below).
+		//
+		// The terminal budget (ENG-799) is carried by the same single loop. It
+		// lives only on the actor-owned projection, which no container label
+		// records, so a rebuild that dropped it would silently restart every
+		// streak. A rebuilt Ready that the existing projection did not hold was
+		// written outside the actor, so it is recorded with the helper that can
+		// only move the budget toward a reset. A rebuilt entry with no existing
+		// projection keeps its zero budget: a backend restart resets every
+		// streak, as moby's daemon restore resets RestartCount.
+		recoveredAt := time.Now()
 		for uuid, rec := range building {
 			existing, ok := b.provisions[uuid]
 			if !ok {
@@ -1813,6 +1829,10 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			default:
 				if existing.FailCount > rec.FailCount {
 					rec.FailCount = existing.FailCount
+				}
+				rec.TerminalBudget = existing.TerminalBudget
+				if rec.Status == backend.ProvisionStatusReady && existing.Status != backend.ProvisionStatusReady {
+					rec.ObserveReadyProjection(recoveredAt)
 				}
 				// Re-observing the same failed runtime does not replace its original
 				// actor-authored cause with a generic cohort diagnosis. A different
@@ -2241,7 +2261,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// (same code path as a live container-death event) and emits the
 	// terminal Failed callback from Failed.OnEntryFrom(evDiagGathered).
 	// Callback suppression on concurrent Deprovision is handled
-	// structurally by Failing.OnExit.
+	// structurally by Failing.OnExit. A death found by this sweep has no live
+	// event provenance, so it never counts against the terminal budget.
 	for _, generation := range failedGenerations {
 		containerID, ok := firstExitedByLease[generation.LeaseUUID()]
 		if !ok {
@@ -2432,6 +2453,14 @@ func (b *Backend) reconcileStateAndOperations(ctx context.Context) error {
 // containerEventLoop subscribes to Docker container "die" events and triggers
 // immediate failure handling. This provides near-instant detection of container
 // crashes, complementing the 5-minute reconcileLoop safety net.
+//
+// The same subscription carries "start" and "kill" events, recorded in one
+// failurecause.EventSession per connection, so each death carries how it was
+// observed (ENG-799): a death whose whole run this stream saw, with no API
+// signal to it, may count against the lease's terminal budget; a death after an
+// observed signal, or of a run that started before this stream connected, never
+// does. A reconnect starts an empty session because events missed in the gap are
+// unknowable.
 func (b *Backend) containerEventLoop() {
 	for {
 		select {
@@ -2445,6 +2474,7 @@ func (b *Backend) containerEventLoop() {
 		}
 
 		eventCh, errCh := b.docker.ContainerEvents(b.stopCtx)
+		session := failurecause.NewEventSession()
 
 	consume:
 		for {
@@ -2455,7 +2485,15 @@ func (b *Backend) containerEventLoop() {
 				if !ok {
 					break consume
 				}
-				if event.Action == "die" {
+				switch event.Action {
+				case containerEventStart:
+					session.ObserveStart(event.ContainerID)
+				case containerEventKill:
+					session.ObserveSignal(event.ContainerID)
+				case containerEventDie:
+					// Consume the run's record before any lookup, so a death of an
+					// untracked container still frees its entry.
+					provenance := session.ObserveExit(event.ContainerID)
 					if err := b.requireStorageIdentity(b.stopCtx); err != nil {
 						b.logger.Error("container event ignored after backend identity verification failed", "error", err)
 						return
@@ -2472,7 +2510,9 @@ func (b *Backend) containerEventLoop() {
 								"lease_uuid", leaseUUID, "error", generationErr)
 							continue
 						}
-						observation, observationErr := leasesm.NewContainerDiedObservation(event.ContainerID, generation)
+						observation, observationErr := leasesm.NewLiveContainerDiedObservation(
+							event.ContainerID, generation, provenance,
+						)
 						if observationErr != nil {
 							b.logger.Error("invalid container event ignored", "error", observationErr)
 							continue

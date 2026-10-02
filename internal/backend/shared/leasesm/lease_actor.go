@@ -12,6 +12,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 	"github.com/manifest-network/fred/internal/backend/shared/workbarrier"
 )
 
@@ -244,9 +245,12 @@ func (settlement *actorCloseSettlement) retire() {
 }
 
 // containerDiedMsg signals a container belonging to this lease has died.
+// provenance records how the death was observed; its zero value (a death found
+// without a live event) never counts against the terminal budget.
 type containerDiedMsg struct {
 	ContainerID string
 	Runtime     shared.RuntimeGenerationProof
+	provenance  failurecause.Provenance
 }
 
 func (containerDiedMsg) isleaseMessage()            {}
@@ -256,9 +260,22 @@ func (containerDiedMsg) onStaleGeneration()         {}
 // Observations have no waiting caller to notify on handler panic.
 func (containerDiedMsg) onPanic(error) {}
 
+// NewContainerDiedObservation reports a death found without a live event
+// stream, such as by the periodic inventory sweep. A signal that preceded it
+// cannot be ruled out, so it never counts against the terminal budget.
 func NewContainerDiedObservation(
 	containerID string,
 	runtime shared.RuntimeGenerationProof,
+) (ActorObservation, error) {
+	return NewLiveContainerDiedObservation(containerID, runtime, failurecause.Provenance{})
+}
+
+// NewLiveContainerDiedObservation reports a death delivered by a live event
+// stream, with the provenance that stream's failurecause.EventSession minted.
+func NewLiveContainerDiedObservation(
+	containerID string,
+	runtime shared.RuntimeGenerationProof,
+	provenance failurecause.Provenance,
 ) (ActorObservation, error) {
 	if containerID == "" {
 		return ActorObservation{}, errors.New("container death observation requires a container id")
@@ -266,7 +283,9 @@ func NewContainerDiedObservation(
 	if !runtime.Valid() {
 		return ActorObservation{}, errors.New("container death observation requires an exact runtime generation")
 	}
-	return newActorObservation(containerDiedMsg{ContainerID: containerID, Runtime: runtime}), nil
+	return newActorObservation(containerDiedMsg{
+		ContainerID: containerID, Runtime: runtime, provenance: provenance,
+	}), nil
 }
 
 // deprovisionMsg requests that the actor run the deprovision flow. Callers can
@@ -1250,7 +1269,7 @@ func (a *LeaseActor) handle(msg leaseMessage) {
 	}
 	switch m := msg.(type) {
 	case containerDiedMsg:
-		a.handleContainerDied(m.ContainerID, m.Runtime)
+		a.handleContainerDied(m.ContainerID, m.Runtime, m.provenance)
 	case deprovisionMsg:
 		m.Reply <- a.handleDeprovision(m.Ctx)
 	case cohortDivergedMsg:
@@ -1306,8 +1325,9 @@ func (a *LeaseActor) handleOperationAmbiguous(msg operationAmbiguousMsg) {
 func (a *LeaseActor) handleContainerDied(
 	containerID string,
 	runtime shared.RuntimeGenerationProof,
+	provenance failurecause.Provenance,
 ) {
-	_ = a.sm.containerDied(a.cfg.StopCtx, containerID, runtime)
+	_ = a.sm.containerDied(a.cfg.StopCtx, containerID, runtime, provenance)
 }
 
 func (a *LeaseActor) handleDiagGathered(result diagResult) {
