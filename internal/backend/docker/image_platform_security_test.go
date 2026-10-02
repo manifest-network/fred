@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/docker/tenantseccomp"
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
@@ -87,7 +88,7 @@ func TestImageRuntimeConstructionRejectsOldDockerAPI(t *testing.T) {
 	}))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = api.Close() })
-	images, creator, err := imageexec.NewDockerRuntime(t.Context(), api)
+	images, creator, err := imageexec.NewDockerRuntime(t.Context(), api, tenantseccomp.Process())
 	assert.Nil(t, images)
 	assert.Nil(t, creator)
 	require.ErrorContains(t, err, "Docker Engine 28.1+")

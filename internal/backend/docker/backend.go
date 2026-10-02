@@ -65,6 +65,9 @@ type dockerMutationSink interface {
 	createCompensationContainer(context.Context, compensationContainer) (string, daemonLaunchOutcome)
 	startCompensationContainer(context.Context, string, time.Duration) daemonLaunchOutcome
 	prepareCompensationContainer(context.Context, shared.MaintenanceCompensationSubject, compensationContainerRecord) (compensationContainer, error)
+	// requireTenantSeccompProfile reports whether creations can carry the
+	// tenant seccomp profile now. Every error wraps tenantseccomp.ErrRefused.
+	requireTenantSeccompProfile() error
 }
 
 // dockerClient is the construction boundary implemented by DockerClient and
@@ -2476,7 +2479,7 @@ func newBackend(
 		return nil, fmt.Errorf("bind close journals: %w", err)
 	}
 
-	composeSvc, err := newComposeService(cfg.DockerHost, docker.images)
+	composeSvc, err := newComposeService(cfg.DockerHost, docker.images, docker.tenantSeccomp)
 	if err != nil {
 		_ = cbStore.Close()
 		_ = diagStore.Close()

@@ -3,6 +3,7 @@ package docker
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // composeReader is the only Compose surface retained by Backend.
@@ -79,8 +81,13 @@ type composeService struct {
 }
 
 // newComposeService creates a composeService that uses the Docker daemon at
-// the given host for Compose operations.
-func newComposeService(dockerHost string, images *imageexec.Admitter) (*composeService, error) {
+// the given host for Compose operations. Every invocation-bound launch
+// transport checks container creates against profiles, the same source the
+// admitter compiles projects with.
+func newComposeService(dockerHost string, images *imageexec.Admitter, profiles imageexec.TenantSeccompSource) (*composeService, error) {
+	if util.IsNilInterface(profiles) {
+		return nil, errors.New("compose service requires a tenant seccomp profile source")
+	}
 	// Silence the Compose library's logrus logger. Compose emits noisy
 	// warnings (e.g., "No resource found to remove") via its own global
 	// logrus instance. Operational information is already logged by the
@@ -113,7 +120,7 @@ func newComposeService(dockerHost string, images *imageexec.Admitter) (*composeS
 			defer transport.CloseIdleConnections()
 			// This client belongs exclusively to this invocation. Even Compose
 			// work which detaches its context still crosses the same closed scope.
-			httpClient := &http.Client{Transport: daemonLaunchTransport{next: transport, scope: scope}, CheckRedirect: mobyclient.CheckRedirect}
+			httpClient := &http.Client{Transport: daemonLaunchTransport{next: transport, scope: scope, profiles: profiles}, CheckRedirect: mobyclient.CheckRedirect}
 			engine, err := newComposeEngine(dockerHost, httpClient)
 			if err != nil {
 				return scope.finish(err)
