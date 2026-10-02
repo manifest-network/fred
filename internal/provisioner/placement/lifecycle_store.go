@@ -168,7 +168,7 @@ func applyRuntimePrincipalObservation(
 	observation RuntimePrincipalObservation,
 	mayEstablish bool,
 ) (lifecycleCapability, bool) {
-	if capability.unusable || capability.retired || capability.attemptBackend != "" ||
+	if !capability.usable() || capability.retired || capability.attemptBackend != "" ||
 		!mayEstablish || capability.backend != observation.backendName ||
 		!lifecycleObservationConsistent(observation.lifecycle, true, capability) {
 		return capability, false
@@ -183,7 +183,7 @@ func applyRuntimePrincipalObservation(
 	// One lifecycle generation cannot change tenant or provider identity. Preserve
 	// the contradictory durable evidence as an explicit quarantine rather than
 	// accepting either side as maintenance authority.
-	capability.unusable = true
+	capability.quarantined = true
 	return capability, true
 }
 
@@ -262,6 +262,9 @@ func (result LifecycleAuthorization) ID() lifecycle.ID {
 	return result.id
 }
 
+// lifecycleCapability is one lease's durable lifecycle authority. Whether it
+// may carry authority at all is derived from its evidence by usable, never
+// stored on its own: an ownerless usable capability has no representation.
 type lifecycleCapability struct {
 	backend        string
 	id             lifecycle.ID
@@ -269,11 +272,13 @@ type lifecycleCapability struct {
 	retired        bool
 	attemptBackend string
 	attemptID      lifecycle.ID
-	// unusable is a fail-closed per-lease quarantine. A decoded persisted
-	// sentinel may carry a new exact attempt marker, while an undecodable row is
-	// represented only in memory so its original bytes remain available for
-	// operator diagnosis.
-	unusable bool
+	// quarantined is an explicit, fail-closed per-lease quarantine, persisted
+	// as the row's unusable flag together with every other unusable row. A new
+	// attempt does not lift it: lifecycleWithAttemptLocked keeps an unusable
+	// row quarantined beside the new exact attempt marker until that operation
+	// settles. An undecodable row is represented only in memory so its original
+	// bytes remain available for operator diagnosis.
+	quarantined bool
 	// rawCorrupt distinguishes an undecodable durable row from a missing or
 	// decodable-but-invalid binding. Inventory may durably replace the latter
 	// with an explicit unusable sentinel, but must preserve the former's bytes.
@@ -283,6 +288,47 @@ type lifecycleCapability struct {
 	// sentinel). It is process-local and cleared by the first safe projection
 	// write; raw corruption is never marked because its bytes must stay intact.
 	needsPersistence bool
+}
+
+// usable reports whether the capability may carry lifecycle authority: it is
+// not quarantined, its bytes decoded, and it names a current owner or an exact
+// attempt. Every authority decision reads this rather than a stored flag, so
+// the zero value, a map miss, and a capability whose only attempt was cleared
+// all withhold authority, and the encoder writes each of them as the
+// evidence-free quarantine sentinel instead of refusing it.
+func (capability lifecycleCapability) usable() bool {
+	return !capability.quarantined && !capability.rawCorrupt &&
+		(capability.backend != "" || capability.attemptBackend != "")
+}
+
+// quarantinedLifecycle is the evidence-free quarantine sentinel, in the form
+// decodeLifecycleCapability returns for its durable row.
+func quarantinedLifecycle() lifecycleCapability {
+	return lifecycleCapability{quarantined: true}
+}
+
+// asWritten returns the capability in the form decodeLifecycleCapability
+// returns for the row encodeLifecycleCapability writes from it. The encoder
+// writes the unusable flag as !usable(), so a capability that may carry no
+// authority comes back quarantined, and nothing in it still awaits
+// persistence. Every other field is written and decoded as is.
+func (capability lifecycleCapability) asWritten() lifecycleCapability {
+	capability.quarantined = !capability.usable()
+	capability.needsPersistence = false
+	return capability
+}
+
+// cacheWrittenLifecycleLocked records a capability whose row the caller has
+// just committed. It is the only writer of a lifecycleCache entry after the
+// store loads (TestLifecycleCacheIsWrittenOnlyInItsWrittenForm), so an entry
+// always equals what reopening the store would decode: one in-memory form per
+// row, and a struct comparison with the cache agrees with a comparison of the
+// rows. Without it, an attempt-only capability whose attempt was cleared would
+// stay cached as the zero value while its row decodes to the quarantined
+// sentinel, and the next projection would rewrite identical bytes and bump the
+// placement revision. Caller holds s.mu.
+func (s *Store) cacheWrittenLifecycleLocked(leaseUUID string, capability lifecycleCapability) {
+	s.lifecycleCache[leaseUUID] = capability.asWritten()
 }
 
 type persistedLifecycleCapability struct {
@@ -451,8 +497,8 @@ func loadLifecycleCapabilities(tx *bolt.Tx) (map[string]lifecycleCapability, err
 			slog.Warn("placement: loaded unparseable lifecycle capability",
 				"lease_uuid", leaseUUID, "error", decodeErr)
 			cache[leaseUUID] = lifecycleCapability{
-				unusable:   true,
-				rawCorrupt: true,
+				quarantined: true,
+				rawCorrupt:  true,
 			}
 			return nil
 		}
@@ -513,7 +559,7 @@ func quarantineLifecycleBindings(
 		slog.Warn("placement: lifecycle capability is unusable",
 			"lease_uuid", leaseUUID, "reason", reason)
 		capability := capabilities[leaseUUID]
-		capability.unusable = true
+		capability.quarantined = true
 		capability.needsPersistence = !capability.rawCorrupt
 		capabilities[leaseUUID] = capability
 	}
@@ -524,7 +570,7 @@ func quarantineLifecycleBindings(
 			quarantine(leaseUUID, "placement has no lifecycle capability")
 			continue
 		}
-		if capability.unusable {
+		if !capability.usable() {
 			continue
 		}
 		// Placement usability is checked before lifecycle authority is exposed.
@@ -538,7 +584,7 @@ func quarantineLifecycleBindings(
 	}
 
 	for leaseUUID, capability := range capabilities {
-		if capability.unusable {
+		if !capability.usable() {
 			continue
 		}
 		_, exists := placements[leaseUUID]
@@ -582,10 +628,16 @@ func decodeLifecycleCapability(value []byte) (lifecycleCapability, error) {
 		retired:        persisted.Retired,
 		attemptBackend: persisted.AttemptBackend,
 		attemptID:      attemptID,
-		unusable:       persisted.Unusable,
+		quarantined:    persisted.Unusable,
 	}
 	if err := validateLifecycleCapability(capability); err != nil {
 		return lifecycleCapability{}, err
+	}
+	if !persisted.Unusable && !capability.usable() {
+		// encodeLifecycleCapability writes a capability without evidence as the
+		// unusable sentinel, so a row that claims authority without an owner or
+		// an attempt is not one Fred wrote; it stays raw corruption.
+		return lifecycleCapability{}, errors.New("lifecycle capability has no current owner or attempt")
 	}
 	return capability, nil
 }
@@ -597,6 +649,11 @@ func parseOptionalLifecycleID(value string) (lifecycle.ID, error) {
 	return lifecycle.ParseID(value)
 }
 
+// encodeLifecycleCapability writes the unusable flag from usable, so the
+// durable row always says exactly whether the capability may carry authority.
+// A capability with neither an owner nor an attempt, such as the zero value or
+// one whose only attempt was cleared, becomes the evidence-free quarantine
+// sentinel rather than an encoding error.
 func encodeLifecycleCapability(capability lifecycleCapability) ([]byte, error) {
 	if err := validateLifecycleCapability(capability); err != nil {
 		return nil, err
@@ -608,7 +665,7 @@ func encodeLifecycleCapability(capability lifecycleCapability) ([]byte, error) {
 		Tenant:         capability.principal.tenant,
 		ProviderUUID:   capability.principal.providerUUID,
 		AttemptBackend: capability.attemptBackend,
-		Unusable:       capability.unusable,
+		Unusable:       !capability.usable(),
 	}
 	if capability.id.Valid() {
 		persisted.ID = capability.id.String()
@@ -619,29 +676,12 @@ func encodeLifecycleCapability(capability lifecycleCapability) ([]byte, error) {
 	return json.Marshal(persisted)
 }
 
+// validateLifecycleCapability checks the shape both the encoder and the
+// decoder require. Usability is not part of it: usable derives that from the
+// same fields.
 func validateLifecycleCapability(capability lifecycleCapability) error {
 	if capability.rawCorrupt {
 		return errors.New("raw corrupt lifecycle capability cannot be encoded")
-	}
-	if capability.unusable {
-		if !capability.principal.validOptional() {
-			return errors.New("runtime principal is incomplete")
-		}
-		if capability.backend == "" && capability.id.Valid() {
-			return errors.New("unusable lifecycle capability ID has no backend evidence")
-		}
-		if capability.retired && capability.backend == "" {
-			return errors.New("unusable retired lifecycle capability is incomplete")
-		}
-		if (capability.attemptBackend == "") != !capability.attemptID.Valid() {
-			return errors.New("lifecycle attempt marker is incomplete")
-		}
-		if capability.backend == "" && capability.attemptBackend == "" {
-			// An evidence-free sentinel is the canonical durable quarantine for a
-			// missing lifecycle row discovered through inventory.
-			return nil
-		}
-		return nil
 	}
 	if !capability.principal.validOptional() {
 		return errors.New("runtime principal is incomplete")
@@ -654,9 +694,6 @@ func validateLifecycleCapability(capability lifecycleCapability) error {
 	}
 	if (capability.attemptBackend == "") != !capability.attemptID.Valid() {
 		return errors.New("lifecycle attempt marker is incomplete")
-	}
-	if capability.backend == "" && capability.attemptBackend == "" {
-		return errors.New("lifecycle capability has no current owner or attempt")
 	}
 	return nil
 }
@@ -689,7 +726,7 @@ func (s *Store) authorizeLifecycle(
 	if !exists {
 		return LifecycleAuthorization{verdict: LifecycleVerdictMissing}
 	}
-	if capability.unusable {
+	if !capability.usable() {
 		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}
 	}
 	result := authorizeLifecycleCapability(capability, id)
@@ -722,7 +759,7 @@ func (s *Store) CurrentLifecycle(leaseUUID string) LifecycleAuthorization {
 	if !exists {
 		return LifecycleAuthorization{verdict: LifecycleVerdictMissing}
 	}
-	if capability.unusable {
+	if !capability.usable() {
 		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}
 	}
 	result := authorizeLifecycleCapability(capability, capability.id)
@@ -769,10 +806,12 @@ func authorizeLifecycleCapability(
 	capability lifecycleCapability,
 	id lifecycle.ID,
 ) LifecycleAuthorization {
-	if capability.unusable {
+	if !capability.usable() {
 		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}
 	}
 	if capability.backend == "" {
+		// A usable capability without an owner holds only an attempt marker,
+		// which never grants authority.
 		return LifecycleAuthorization{verdict: LifecycleVerdictMissing}
 	}
 	if !capability.id.Valid() {
@@ -833,7 +872,7 @@ func (s *Store) retireLifecycle(
 	if !exists {
 		return LifecycleAuthorization{verdict: LifecycleVerdictMissing}, nil
 	}
-	if capability.unusable {
+	if !capability.usable() {
 		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}, nil
 	}
 	result := authorizeLifecycleCapability(capability, id)
@@ -884,7 +923,7 @@ func (s *Store) retireLifecycle(
 	}); err != nil {
 		return LifecycleAuthorization{}, mutationFailure("retire lifecycle capability", err)
 	}
-	s.lifecycleCache[leaseUUID] = capability
+	s.cacheWrittenLifecycleLocked(leaseUUID, capability)
 	return LifecycleAuthorization{
 		backend: capability.backend,
 		id:      capability.id,
@@ -903,10 +942,14 @@ func (s *Store) lifecycleWithAttemptLocked(
 	}
 	capability, capabilityExists := s.lifecycleCache[leaseUUID]
 	placement := s.cache[leaseUUID]
-	if capability.unusable || (!capabilityExists && placement.State() == StateConfirmed) {
+	if !capability.usable() && (capabilityExists || placement.State() == StateConfirmed) {
 		// A new exact operation may replace quarantined authority, but the old
-		// owner remains unusable until that operation settles successfully.
-		capability = lifecycleCapability{unusable: true}
+		// owner remains unusable until that operation settles successfully. An
+		// existing row without usable evidence is such a quarantine, and so is a
+		// confirmed owner whose row is missing. Only a lease with neither a row
+		// nor a confirmed owner starts from nothing, so its first attempt marker
+		// is its only evidence and is usable.
+		capability = quarantinedLifecycle()
 	}
 	capability.attemptBackend = backendName
 	capability.attemptID = id
@@ -954,7 +997,7 @@ func projectPositiveLifecycle(
 	if exists && existing.Attempt == backendName &&
 		existing.attemptOperationID.Valid() {
 		wantID, err := lifecycleIDForOperation(existing.attemptOperationID)
-		markerExact := err == nil && capabilityExists && !capability.unusable &&
+		markerExact := err == nil && capabilityExists && capability.usable() &&
 			capability.attemptBackend == backendName && capability.attemptID == wantID
 		if err == nil && observationPresent &&
 			observation.Kind == LifecycleObservationTyped &&
@@ -997,7 +1040,7 @@ func projectPositiveLifecycle(
 		quarantined, persist := quarantineProjectedLifecycle(capability, capabilityExists)
 		return quarantined, persist, false
 	}
-	if capabilityExists && !capability.unusable && capability.backend == backendName &&
+	if capabilityExists && capability.usable() && capability.backend == backendName &&
 		lifecycleObservationConsistent(observation, observationPresent, capability) {
 		// A capability intentionally outlives placement deletion. Rediscovering
 		// that same backend must preserve both its typed identity and retirement
@@ -1058,25 +1101,31 @@ func quarantineProjectedLifecycle(
 		return capability, false
 	}
 	// Persist the quarantine flag together with all decodable current/attempt
-	// evidence. Authorization checks the flag first, while an operator or future
+	// evidence. Authorization reads usable first, while an operator or future
 	// explicit repair path can still inspect the exact conflicting generations.
-	capability.unusable = true
+	capability.quarantined = true
 	return capability, true
 }
 
+// lifecycleAfterPlacementDelete reports the capability a placement deletion
+// keeps, and whether to keep one. It keeps nothing unless a usable current
+// owner remains; the zero value it returns then encodes as the evidence-free
+// quarantine sentinel, should a caller ever write it instead of deleting the
+// row.
 func lifecycleAfterPlacementDelete(
 	capability lifecycleCapability,
 	placement Placement,
 ) (lifecycleCapability, bool) {
 	capability.attemptBackend = ""
 	capability.attemptID = lifecycle.ID{}
-	if capability.unusable || capability.retired || placement.State() == StateUnusable {
+	if !capability.usable() || capability.retired || placement.State() == StateUnusable {
 		// Exact placement deletion may remove fail-closed evidence tied to that
 		// placement. A consumed or conflict-withdrawn capability cannot regain
 		// authority because later inventory without a capability is quarantined.
+		// With its attempt cleared, a usable capability names its owner.
 		return lifecycleCapability{}, false
 	}
-	return capability, capability.backend != ""
+	return capability, true
 }
 
 // putPlacementWithLifecycleLocked commits the placement and lifecycle records
@@ -1112,7 +1161,7 @@ func (s *Store) putPlacementWithLifecycleLocked(
 		return mutationFailure(operationName, err)
 	}
 	s.cache[leaseUUID] = placement
-	s.lifecycleCache[leaseUUID] = capability
+	s.cacheWrittenLifecycleLocked(leaseUUID, capability)
 	delete(s.deleteRevisions, leaseUUID)
 	return nil
 }

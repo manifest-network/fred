@@ -1217,7 +1217,7 @@ func verifyLegacyPreparationPostcondition(
 			seen[leaseUUID] = struct{}{}
 			rawCapability := capabilities.Get(key)
 			capability, err := decodeLifecycleCapability(rawCapability)
-			if err != nil || capability.unusable || capability.retired ||
+			if err != nil || !capability.usable() || capability.retired ||
 				capability.backend != placement.Backend || capability.id.Valid() ||
 				capability.attemptBackend != "" || capability.attemptID.Valid() {
 				return fmt.Errorf("placement %q has invalid migrated legacy lifecycle authority", leaseUUID)

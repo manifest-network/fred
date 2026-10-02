@@ -174,6 +174,26 @@ type AuthorityReport struct {
 	// placement row; retiring one records recordless_unproven.
 	UnprojectedFencedReporters        []string `json:"unprojected_fenced_reporters,omitempty"`
 	UnprojectedFencedReportersOmitted int      `json:"unprojected_fenced_reporters_omitted,omitempty"`
+	// PendingInventorySweepID is non-zero when a reconciliation sweep began
+	// reading backend inventories but never durably projected them (a stop or
+	// crash mid-sweep).
+	PendingInventorySweepID uint64 `json:"pending_inventory_sweep_id,omitempty"`
+	// InventorySweepReporters is the reporter journal of the whole unresolved
+	// sweep chain that sweep ends, not of that sweep alone: every backend that
+	// answered any sweep of the chain with at least one lease. A chain starts
+	// at a sweep that inherits nothing unresolved, and each sweep that begins
+	// while it is still unresolved inherits its journal. When
+	// InventorySweepUntracked is set the chain cannot name its reporters, and
+	// every active backend counts.
+	InventorySweepReporters        []string `json:"inventory_sweep_reporters,omitempty"`
+	InventorySweepReportersOmitted int      `json:"inventory_sweep_reporters_omitted,omitempty"`
+	InventorySweepUntracked        bool     `json:"inventory_sweep_untracked,omitempty"`
+	// FenceRestartWouldRecord names the active backends that, if fenced when
+	// providerd next starts, would be recorded as unprojected reporters,
+	// withholding new-lease admission until each answers both inventories or
+	// is retired. It is empty, never null, when no sweep is pending.
+	FenceRestartWouldRecord        []string `json:"fence_restart_would_record"`
+	FenceRestartWouldRecordOmitted int      `json:"fence_restart_would_record_omitted,omitempty"`
 }
 
 // SafeForCutover reports whether the stopped file is wholly on one side of the
@@ -199,6 +219,7 @@ func newAuthorityAssessment(expectation AuthorityExpectation) *authorityAssessme
 			ExpectedProviderUUID:           expectation.providerUUID,
 			ExpectedBackendTopology:        expected,
 			ExpectedBackendTopologyOmitted: expectedOmitted,
+			FenceRestartWouldRecord:        []string{},
 		},
 		seen: make(map[string]struct{}),
 		rows: make(map[string]AuthorityRowFact),
@@ -804,6 +825,9 @@ func inspectCurrentMetadata(
 			assessment.report.UnprojectedFencedReportersOmitted =
 			boundedAuthorityIdentities(metadata.UnprojectedFencedReporters)
 	}
+	if metadataErr == nil {
+		inspectPendingInventorySweep(metadata, assessment)
+	}
 	if metadata.ProviderUUID != expectation.providerUUID {
 		assessment.mixedFinding(
 			"provider_mismatch",
@@ -818,6 +842,36 @@ func inspectCurrentMetadata(
 	}
 	inspectAuthorityStorageBindings(metadata, knownTopologyValid, assessment)
 	return metadata, true
+}
+
+// inspectPendingInventorySweep reports a sweep that began but never projected
+// and derives which active backends a restart with them fenced would record as
+// unprojected reporters. fenceRestartRecords, the function the store applies
+// at open, decides the set from the validated metadata.
+func inspectPendingInventorySweep(metadata topologyMetadata, assessment *authorityAssessment) {
+	if validateCanonicalBackendNames(metadata.Topology, false) != nil ||
+		!authorityBackendNamesSafe(metadata.Topology) {
+		return
+	}
+	journal := sweepReporterJournalFromMetadata(metadata)
+	bounded, omitted := boundedAuthorityIdentities(
+		fenceRestartRecords(metadata.PendingInventorySweepID, journal, metadata.Topology),
+	)
+	if bounded == nil {
+		bounded = []string{}
+	}
+	assessment.report.FenceRestartWouldRecord = bounded
+	assessment.report.FenceRestartWouldRecordOmitted = omitted
+	if metadata.PendingInventorySweepID == 0 {
+		return
+	}
+	assessment.report.PendingInventorySweepID = metadata.PendingInventorySweepID
+	assessment.report.InventorySweepUntracked = !journal.tracked
+	if reporters := journal.names(); authorityBackendNamesSafe(reporters) {
+		assessment.report.InventorySweepReporters,
+			assessment.report.InventorySweepReportersOmitted =
+			boundedAuthorityIdentities(reporters)
+	}
 }
 
 func inspectAuthorityStorageBindings(
@@ -1071,7 +1125,7 @@ func inspectAuthorityLifecycleBindingForPlacement(
 		row.LifecycleVerdict = "corrupt"
 		return
 	}
-	if capability.unusable {
+	if !capability.usable() {
 		row.LifecycleVerdict = "unusable"
 		if adoptableQuarantine(
 			placement, capability, placement.Backend, assessment.report.ExpectedProviderUUID,
@@ -1258,7 +1312,7 @@ func inspectCurrentLifecycleRows(
 			assessment.setRow(row)
 			return nil
 		}
-		if capability.unusable {
+		if !capability.usable() {
 			assessment.report.Counts.UnusableLifecycleRows++
 		}
 		for _, backendName := range []string{capability.backend, capability.attemptBackend} {
@@ -1317,7 +1371,7 @@ func authorityLifecycleVerdict(
 	capability lifecycleCapability,
 	attached bool,
 ) string {
-	if capability.unusable {
+	if !capability.usable() {
 		return "unusable"
 	}
 	if capability.attemptBackend != "" {

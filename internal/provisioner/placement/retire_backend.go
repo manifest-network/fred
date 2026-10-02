@@ -162,11 +162,18 @@ func verifyRetiredRow(
 	return nil
 }
 
-// retireLifecycle scrubs one capability. A lost lease keeps only the
+// retireLifecycle scrubs one decoded capability. A lost lease keeps only the
 // evidence-free quarantine sentinel; a surviving lease loses an attempt marker
-// on the retired backend, and a capability whose owner was the retired
-// backend becomes the sentinel too. deleteCapability reports a detached row,
-// which has no placement to keep it.
+// on the retired backend. A capability whose owner was the retired backend
+// becomes the sentinel too, and so does one whose only evidence was its
+// attempt there. deleteCapability reports a detached row, which has no
+// placement to keep it.
+//
+// Every output encodes: usable derives authority from evidence, so even a
+// capability left with neither an owner nor an attempt would be written as the
+// sentinel rather than refused, and could not make the whole retirement fail.
+// Returning the sentinel explicitly keeps the output in the form decoding its
+// row yields.
 func retireLifecycle(
 	capability lifecycleCapability,
 	retired string,
@@ -178,15 +185,19 @@ func retireLifecycle(
 		return capability, names, names
 	}
 	if disposition == retirementLost {
-		sentinel := lifecycleCapability{unusable: true}
+		sentinel := quarantinedLifecycle()
 		return sentinel, capability != sentinel, false
 	}
 	if !names {
 		return capability, false, false
 	}
-	if capability.backend == retired {
-		sentinel := lifecycleCapability{unusable: true}
-		return sentinel, true, false
+	if capability.backend == retired || capability.backend == "" {
+		// The retired backend was the owner, or the attempt on it was the
+		// capability's only evidence. Authority is already withheld for the
+		// latter: the placement is a conflict or an uninterpretable row, and a
+		// capability that does not match its placement is quarantined whenever
+		// the store loads.
+		return quarantinedLifecycle(), true, false
 	}
 	capability.attemptBackend = ""
 	capability.attemptID = lifecycle.ID{}

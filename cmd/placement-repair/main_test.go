@@ -399,6 +399,61 @@ func TestRun_ClassifyExposesPersistedUntrustedPositiveQuarantine(t *testing.T) {
 	assert.Contains(t, stdout.String(), `"untrusted_positive":true`)
 }
 
+// ENG-1119: before restarting providerd with a backend fenced, an operator
+// checks the stopped database. -classify names the interrupted sweep, its
+// reporter journal, and the backends a fenced restart would record.
+func TestRun_ClassifyReportsAnInterruptedSweepAndWhatAFenceWouldRecord(t *testing.T) {
+	backendNames := []string{"backend-a", "backend-b"}
+	for _, test := range []struct {
+		name       string
+		create     func(*testing.T) string
+		pending    bool
+		reporters  []string
+		wantRecord []string
+	}{
+		{
+			name: "interrupted sweep",
+			create: func(t *testing.T) string {
+				return createInterruptedSweepRepairCommandDatabase(t, backendNames)
+			},
+			pending:    true,
+			reporters:  []string{"backend-a"},
+			wantRecord: []string{"backend-a"},
+		},
+		{
+			name: "no pending sweep",
+			create: func(t *testing.T) string {
+				dbPath := filepath.Join(t.TempDir(), "placements.db")
+				require.NoError(t, initializeRepairPlacementStore(t, dbPath, backendNames).Close())
+				return dbPath
+			},
+			wantRecord: []string{},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dbPath := test.create(t)
+			configPath := writeRepairConfig(t, dbPath, "https://127.0.0.1:1", backendNames...)
+			var stdout bytes.Buffer
+			err := run(t.Context(), []string{"-config", configPath, "-classify"}, &stdout, &bytes.Buffer{})
+			require.NoError(t, err)
+
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(stdout.Bytes(), &fields))
+			wantRecord, err := json.Marshal(test.wantRecord)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(wantRecord), string(fields["fence_restart_would_record"]),
+				"the key is always present and never null")
+			_, untracked := fields["inventory_sweep_untracked"]
+			assert.False(t, untracked)
+			var report placement.AuthorityReport
+			require.NoError(t, json.Unmarshal(stdout.Bytes(), &report))
+			assert.Equal(t, test.pending, report.PendingInventorySweepID != 0)
+			assert.Equal(t, test.reporters, report.InventorySweepReporters)
+			assert.Equal(t, placement.AuthorityPreparedCurrent, report.Classification)
+		})
+	}
+}
+
 func TestRun_ClassifyUnsafeAuthorityStillEmitsJSONAndFails(t *testing.T) {
 	dbPath := writeRepairLegacyAuthorityDB(t)
 	db, err := bolt.Open(dbPath, 0o600, nil)
@@ -1673,6 +1728,31 @@ func createConflictRepairCommandDatabase(t *testing.T) string {
 			repairCommandLease: {"backend-a", "backend-b"},
 		},
 	})
+	require.NoError(t, store.Close())
+	return dbPath
+}
+
+// createInterruptedSweepRepairCommandDatabase leaves a sweep pending, as a stop
+// or crash mid-sweep does: backend-a answered with a lease and the sweep ended
+// before it was sealed or projected.
+func createInterruptedSweepRepairCommandDatabase(t *testing.T, backendNames []string) string {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	store := initializeRepairPlacementStore(t, dbPath, backendNames)
+	reconciliation := newRepairReconciliation(t, store, backendNames)
+	value, ok := repairReconciliationInventories.Load(reconciliation)
+	require.True(t, ok)
+	reporter := value.(map[string]*repairInventoryBackend)["backend-a"]
+	require.NotNil(t, reporter)
+	reporter.stage(repairBackendStorageID(t, "backend-a"), []backend.ProvisionInfo{{
+		LeaseUUID: repairCommandLease, BackendName: "backend-a",
+		ProviderUUID: repairCommandProviderUUID, Tenant: "tenant-a",
+	}}, nil)
+	sweep, err := reconciliation.BeginSweep()
+	require.NoError(t, err)
+	_, err = sweep.CollectProvisionInventory(t.Context(), "backend-a")
+	require.NoError(t, err)
+	sweep.End()
 	require.NoError(t, store.Close())
 	return dbPath
 }

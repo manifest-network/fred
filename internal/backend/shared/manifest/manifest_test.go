@@ -615,6 +615,30 @@ func TestManifest_Labels_AllowsReservedLookalike(t *testing.T) {
 	}
 }
 
+// TestManifest_Labels_RejectsComposeBuildStamps guards ENG-1119: image admission
+// accepts Compose's exact build stamps, including the classic builder's
+// com.docker.compose.image.builder, and replaces their values at creation. That
+// never lets a tenant manifest set any com.docker.compose.* label.
+func TestManifest_Labels_RejectsComposeBuildStamps(t *testing.T) {
+	for _, key := range []string{
+		"com.docker.compose.project", "com.docker.compose.service",
+		"com.docker.compose.version", "com.docker.compose.image.builder",
+	} {
+		t.Run(key, func(t *testing.T) {
+			m := &Manifest{Image: "nginx", Labels: map[string]string{key: "classic"}}
+			err := m.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "reserved prefix 'com.docker.compose.'")
+			stack := StackManifest{Services: map[string]*Manifest{
+				"web": {Image: "nginx", Labels: map[string]string{key: "classic"}},
+			}}
+			err = stack.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "reserved prefix 'com.docker.compose.'")
+		})
+	}
+}
+
 func TestReservedLabelSchemaMatchesRuntime(t *testing.T) {
 	data, err := os.ReadFile("../../../../docs/manifest-schema.json")
 	require.NoError(t, err)

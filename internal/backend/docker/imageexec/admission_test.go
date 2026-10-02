@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"strings"
 	"testing"
 
+	composeapi "github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	dockerimage "github.com/docker/docker/api/types/image"
@@ -162,6 +164,13 @@ func TestAdmissionRejectsUntrustedMetadata(t *testing.T) {
 	for _, label := range []string{
 		"fred.lease_id", "TrAeFiK.enable", "com.docker.compose.oneoff", "COM.DOCKER.COMPOSE.project", "COM.DOCKER.COMPOSE.replace",
 		"traefiK.enable", "com.docKer.compose.project", "com.docker.compoſe.project",
+		// The classic-builder stamp is owned only under its exact spelling.
+		"COM.DOCKER.COMPOSE.IMAGE.BUILDER", "com.docker.compoſe.image.builder", composeapi.ImageBuilderLabel + ".extra",
+		// Compose writes these on containers, never on images it builds. An
+		// image carrying them (for example a commit of a Compose container)
+		// stays refused.
+		composeapi.ImageDigestLabel, composeapi.ConfigHashLabel, composeapi.ContainerNumberLabel,
+		"com.docker.compose.image-volume-digest",
 	} {
 		tests = append(tests, struct {
 			name   string
@@ -181,6 +190,40 @@ func TestAdmissionRejectsUntrustedMetadata(t *testing.T) {
 			i, err := a.Admit(t.Context(), "app:latest")
 			if err == nil || !strings.Contains(err.Error(), tt.want) || i.ID() != "" {
 				t.Fatalf("Admit = %q, %v; want %q and no capability", i.ID(), err, tt.want)
+			}
+		})
+	}
+}
+
+// Compose's classic (non-BuildKit) builder stamps com.docker.compose.image.builder
+// into every image it builds. First-use admission, restart re-admission and
+// registry metadata admission all accept that exact stamp, alone or next to
+// the other Compose build stamps.
+func TestAdmissionAcceptsComposeClassicBuilderStamp(t *testing.T) {
+	for name, stamps := range map[string]map[string]string{
+		"builder only": {composeapi.ImageBuilderLabel: "classic"},
+		"classic compose build": {
+			composeapi.ProjectLabel: "foreign-project", composeapi.ServiceLabel: "foreign-service",
+			composeapi.VersionLabel: "foreign-version", composeapi.ImageBuilderLabel: "classic",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := classicImage()
+			maps.Copy(response.Config.Labels, stamps)
+			a, _ := newRuntime(t, &fakeSource{version: "1.51", inspect: func(context.Context, string, ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
+				return response, nil
+			}})
+			admitted, err := a.Admit(t.Context(), "registry.example/app:latest")
+			if err != nil || admitted.ID() != imageID {
+				t.Fatalf("Admit = %q, %v; want the classic-built image admitted", admitted.ID(), err)
+			}
+			readmitted, err := a.ReAdmit(t.Context(), admitted.ID(), admitted.Platform(), admitted.Reference())
+			if err != nil || readmitted.ID() != imageID {
+				t.Fatalf("ReAdmit = %q, %v; want the pinned classic-built image admitted after restart", readmitted.ID(), err)
+			}
+			metadata, err := imageexec.AdmitMetadata(response.Config.Labels, response.Config.Volumes)
+			if err != nil || !metadata.Valid() {
+				t.Fatalf("AdmitMetadata = %v, %v; want registry metadata admitted", metadata.Valid(), err)
 			}
 		})
 	}

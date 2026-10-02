@@ -605,6 +605,11 @@ stopped and rerun the same mode against unchanged input.
 
 ```
 1. Receive SIGINT/SIGTERM
+   └─ a reconciliation sweep already reading backend inventories may finish
+      those reads and commit its placement projection for up to half of
+      shutdown_timeout, in parallel with the steps below (a stop during the
+      startup reconciliation waits for it before step 2); it starts no
+      lifecycle action
 2. Close ordinary lifecycle admission, then wait for operations and held
    lease-action claims to drain (with timeout)
    └─ API stays running; authenticated callbacks may still settle durable work

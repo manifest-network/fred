@@ -287,17 +287,17 @@ func TestRetainedResponses_Partition(t *testing.T) {
 	})
 }
 
-// TestGetLeaseStatus_ChainPruned_AuthzFallback verifies (#5) the closed-lease
+// TestGetLeaseStatus_ChainAbsent_AuthzFallback verifies (#5) the closed-lease
 // authz fallback: when GetLease returns nil, the owner is authorized via the
 // retained record's Tenant, and a cross-tenant caller is rejected (404).
-func TestGetLeaseStatus_ChainPruned_AuthzFallback(t *testing.T) {
+func TestGetLeaseStatus_ChainAbsent_AuthzFallback(t *testing.T) {
 	owner := testutil.NewTestKeyPair("owner-tenant")
 	attacker := testutil.NewTestKeyPair("attacker-tenant")
 	leaseUUID := testutil.ValidUUID1
 	providerUUID := testutil.ValidUUID2
 	retainedUntil := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
 
-	// Chain has pruned the closed lease: GetLease returns nil for everyone.
+	// The chain has no record of the lease: GetLease returns nil for everyone.
 	chainClient := &mockChainClient{
 		getLeaseFunc: func(_ context.Context, _ string) (*billingtypes.Lease, error) { return nil, nil },
 	}
@@ -339,9 +339,9 @@ func TestGetLeaseStatus_ChainPruned_AuthzFallback(t *testing.T) {
 	})
 }
 
-// TestGetLeaseProvision_ChainPruned_AuthzFallback mirrors the status fallback for
+// TestGetLeaseProvision_ChainAbsent_AuthzFallback mirrors the status fallback for
 // GET /provision.
-func TestGetLeaseProvision_ChainPruned_AuthzFallback(t *testing.T) {
+func TestGetLeaseProvision_ChainAbsent_AuthzFallback(t *testing.T) {
 	owner := testutil.NewTestKeyPair("owner-tenant")
 	attacker := testutil.NewTestKeyPair("attacker-tenant")
 	leaseUUID := testutil.ValidUUID1
@@ -378,17 +378,17 @@ func TestGetLeaseProvision_ChainPruned_AuthzFallback(t *testing.T) {
 	})
 }
 
-// TestGetLeaseProvision_ChainPruned_BackendError_Returns404 pins the asymmetry
-// fix (FIX 2): a chain-pruned caller (not yet authorized) hitting a transiently
+// TestGetLeaseProvision_ChainAbsent_BackendError_Returns404 pins the asymmetry
+// fix (FIX 2): a chain-absent caller (not yet authorized) hitting a transiently
 // erroring backend must get 404, NOT 500 — surfacing a 500 would leak
 // backend-health/existence to a caller who has not proven ownership. The 500
 // path is reserved for the chain-present, already-authorized branch.
-func TestGetLeaseProvision_ChainPruned_BackendError_Returns404(t *testing.T) {
+func TestGetLeaseProvision_ChainAbsent_BackendError_Returns404(t *testing.T) {
 	caller := testutil.NewTestKeyPair("some-tenant")
 	leaseUUID := testutil.ValidUUID1
 	providerUUID := testutil.ValidUUID2
 
-	// Chain pruned the lease (GetLease → nil); the single backend 500s.
+	// The chain has no record of the lease (GetLease → nil); the single backend 500s.
 	chainClient := &mockChainClient{getLeaseFunc: func(_ context.Context, _ string) (*billingtypes.Lease, error) { return nil, nil }}
 	router, err := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: httpBackend(t, "b1", erroringBackendServer(t).URL), IsDefault: true}},
@@ -403,7 +403,7 @@ func TestGetLeaseProvision_ChainPruned_BackendError_Returns404(t *testing.T) {
 	h.GetLeaseProvision(rec, req)
 
 	assert.Equal(t, http.StatusNotFound, rec.Code,
-		"chain-pruned + erroring backend must 404, not leak a 500 to an unauthorized caller")
+		"chain-absent + erroring backend must 404, not leak a 500 to an unauthorized caller")
 }
 
 // TestGetLeaseProvision_ChainPresent_BackendError_Returns500 is the symmetric
@@ -513,10 +513,10 @@ func TestAuthorizeRetained_EmptyTenantNeverAuthorizes(t *testing.T) {
 	}
 }
 
-// TestGetLeaseStatus_ChainPruned_EmptyRecordTenant_Returns404 is the handler-level
-// counterpart (GAP 2a): a chain-pruned lease whose retained record carries an
+// TestGetLeaseStatus_ChainAbsent_EmptyRecordTenant_Returns404 is the handler-level
+// counterpart (GAP 2a): a chain-absent lease whose retained record carries an
 // EMPTY tenant must NOT authorize the caller (404), never binding on "" == "".
-func TestGetLeaseStatus_ChainPruned_EmptyRecordTenant_Returns404(t *testing.T) {
+func TestGetLeaseStatus_ChainAbsent_EmptyRecordTenant_Returns404(t *testing.T) {
 	caller := testutil.NewTestKeyPair("some-tenant")
 	leaseUUID := testutil.ValidUUID1
 	providerUUID := testutil.ValidUUID2
@@ -542,8 +542,9 @@ func TestGetLeaseStatus_ChainPruned_EmptyRecordTenant_Returns404(t *testing.T) {
 }
 
 // TestGetLeaseStatus_Retained_ExpiredLease verifies the EXPIRED-state authz
-// variant (GAP 2b): a chain lease in EXPIRED state (not just CLOSED/pruned) whose
-// data was retained → the owner is authorized and GET /status returns retained.
+// variant (GAP 2b): a chain lease in EXPIRED state (not just CLOSED or
+// chain-absent) whose data was retained → the owner is authorized and
+// GET /status returns retained.
 func TestGetLeaseStatus_Retained_ExpiredLease(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-tenant")
 	leaseUUID := testutil.ValidUUID1
@@ -557,7 +558,7 @@ func TestGetLeaseStatus_Retained_ExpiredLease(t *testing.T) {
 					Uuid:         leaseUUID,
 					Tenant:       kp.Address,
 					ProviderUuid: providerUUID,
-					State:        billingtypes.LEASE_STATE_EXPIRED, // expired, not closed/pruned
+					State:        billingtypes.LEASE_STATE_EXPIRED, // expired, not closed or chain-absent
 				}, nil
 			}
 			return nil, nil

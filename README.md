@@ -673,7 +673,7 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 - `items` - Restore shape (`service_name`, `sku`, `quantity`) to request when opening the fresh lease to restore into; present only when `retained`
 - `restore_hint` - Short human-readable next step for restoring; present only when `retained`
 
-> **Chain-pruned leases:** after a lease is auto-closed and pruned from the chain, this endpoint still answers from the retained record. In that case authorization is by the retained record's tenant (the signed caller must own it); a cross-tenant caller or an absent record gets `404`.
+> **Leases the chain cannot find:** `x/billing` never deletes a lease, so a closed lease normally answers through the chain path above, with its chain `state`. If the chain query returns not-found (a lagging or reset RPC node, or a provider pointed at the wrong chain), this endpoint still answers from the retained record. Authorization is then by the retained record's tenant (the signed caller must own it); a cross-tenant caller or an absent record gets `404`.
 
 ### Get Provision Diagnostics
 

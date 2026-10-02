@@ -900,7 +900,7 @@ func maintenanceAuthorityAvailable(
 	return placementRecord.State() == StateConfirmed && placementRecord.Attempt == "" &&
 		!placementRecord.Conflict && placementRecord.revision != 0 &&
 		capability.principal.valid() && capability.principal.providerUUID == providerUUID &&
-		!capability.unusable && !capability.retired && capability.attemptBackend == "" &&
+		capability.usable() && !capability.retired && capability.attemptBackend == "" &&
 		capability.backend == placementRecord.Backend
 }
 

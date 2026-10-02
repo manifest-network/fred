@@ -555,8 +555,11 @@ WantedBy=multi-user.target
 
 `TimeoutStopSec` should exceed the graceful-drain window so systemd does not
 SIGKILL mid-shutdown. For `providerd` this window is `shutdown_timeout` from your
-config (default 30s). The `docker-backend` command shares one 75-second deadline
-across HTTP shutdown and backend-worker drain. HTTP shutdown gets at most
+config (default 30s). A stop that arrives during the startup reconciliation can
+add up to half of `shutdown_timeout` before it, while an in-flight sweep
+finishes its inventory reads. The `docker-backend` command shares one
+75-second deadline across HTTP shutdown and backend-worker drain. HTTP
+shutdown gets at most
 30 seconds; backend drain uses the remaining budget. The common 90-second
 systemd default therefore leaves time to report a typed drain failure and exit
 nonzero, without a deployment change. A longer existing unit allowance remains
@@ -1028,11 +1031,16 @@ copy as an ordinary orphan, under its retention policy.
 `pending_inventory_sweep` is true when `providerd` stopped in the middle of a
 sweep, and the retirement then sets `recordless_unproven`. To avoid that, start
 `providerd`, stop it right after the next `reconciliation complete` log line,
-and plan again. If it stays true, the marker is waiting on an answer that
-cannot arrive, typically from the lost backend, and the retirement must set the
-flag. Fencing the lost backend lets the marker clear without that answer; the
-database then records the backend as an unprojected reporter, new leases wait
-until it is retired, and its retirement still sets the flag.
+and plan again. A SIGTERM lets an in-flight sweep finish for up to half of
+`shutdown_timeout`, so a sweep is left interrupted by a crash, a SIGKILL, or a
+sweep that outlasted that grace. `placement-repair -classify` shows the pending
+sweep (`pending_inventory_sweep_id`) and the backends it waits on
+(`fence_restart_would_record`). If `pending_inventory_sweep` stays true, the
+marker is waiting on an answer that cannot arrive, typically from the lost
+backend, and the retirement must set the flag. Fencing the lost backend lets
+the marker clear without that answer; the database then records the backend as
+an unprojected reporter, new leases wait until it is retired, and its
+retirement still sets the flag.
 
 `recordless_unproven` is true when the database had no current admission
 baseline: a sweep was interrupted, or the retirement follows another retirement
@@ -1364,6 +1372,16 @@ helper receipts block subsequent containerd ingestion across restarts; an
 unknown Create result also fences the current storage authority. Use the
 [unsettled-effects runbook](OPERATIONS.md#unsettled-docker-effects) for unresolved
 helper requests. Classic `overlay2` deployments need no configuration change.
+
+Inspection helpers this build creates carry Compose's
+`com.docker.compose.image.builder` label, written empty. An earlier build that
+does not own that label (for example #245) reads it as a foreign reserved label
+and can neither recover nor remove such a helper, so its receipt would stay
+unsettled until this build runs again. Do not roll back to such a build while
+any helper receipt is pending:
+`fred_docker_backend_image_helpers_unsettled` must be 0, or
+`docker-backend -inspect-unsettled-docker-effects` must list no helper
+receipt.
 
 An admitted image is pinned by immutable identity for its lease and manifest.
 Replaying the same manifest reuses that identity even if a mutable tag has moved.
@@ -1981,8 +1999,13 @@ the exact recognized bucket set, physical-check status, canonical
 provider/topology, sorted storage bindings, topology/baseline/inventory epochs,
 counts, and up to 128 lexicographically sorted per-lease state/revision,
 owner-or-attempt/lifecycle verdicts, and the always-present
-`untrusted_positive` quarantine flag (plus an omitted-row count). Each expected,
-observed, known, storage-binding, and empty-inventory collection is capped at 64
+`untrusted_positive` quarantine flag (plus an omitted-row count). It also reports
+an interrupted reconciliation sweep (`pending_inventory_sweep_id`, with the
+reporters of its unresolved sweep chain in `inventory_sweep_reporters`, or
+`inventory_sweep_untracked`) and the
+always-present `fence_restart_would_record` list; see SECURITY.md, "Containing
+a compromised backend". Each expected, observed, known, storage-binding,
+empty-inventory, sweep-reporter, and fence-record collection is capped at 64
 entries with its own omitted count; each row carries at most four conflict
 owners plus an omitted count, and overlong rendered identities are counted but
 not emitted. Raw metadata, placement, and lifecycle values are rejected before

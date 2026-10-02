@@ -50,7 +50,7 @@ func (s *Store) observeQuarantineReaffirmationLocked(
 	}
 	generation := sealedLifecycleObservation(row.LifecycleGeneration())
 	capability, exists := s.lifecycleCache[leaseUUID]
-	if !exists || capability.unusable || generation.Kind != LifecycleObservationTyped ||
+	if !exists || !capability.usable() || generation.Kind != LifecycleObservationTyped ||
 		(record.Backend != "" && capability.backend != record.Backend) {
 		return quarantineReaffirmation{}
 	}

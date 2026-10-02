@@ -1460,6 +1460,7 @@ func loadStoreWithExpectedAuthority(
 	if s.inventoryRecoveryRequired {
 		s.logInventoryRecoveryPendingLocked()
 	}
+	s.logInheritedFencedReporters()
 	return s, nil
 }
 
@@ -2840,23 +2841,10 @@ func (s *Store) settleRestore(claim RestoreClaim, settlement restoreSettlement) 
 			}
 			return true, nil
 		}
-		next, err := s.nextRevision()
-		if err != nil {
-			return true, err
-		}
-		target.Attempt = ""
-		clearOperationMetadata(&target)
-		target.revision = next
-		capability := clearAttemptLifecycle(
-			s.lifecycleCache[claim.targetLeaseUUID], claim.backendName, claim.operationID,
+		return true, s.clearRefusedAttemptLocked(
+			claim.targetLeaseUUID, target, claim.backendName, claim.operationID,
+			"refuse restore placement",
 		)
-		if err := s.putPlacementWithLifecycleLocked(
-			claim.targetLeaseUUID, target, capability, "refuse restore placement",
-		); err != nil {
-			return true, err
-		}
-		s.revision = next
-		return true, nil
 
 	default:
 		return true, ErrInvalidRestoreClaim
@@ -3028,23 +3016,56 @@ func (s *Store) refuseAttemptLocked(token AttemptToken) (bool, error) {
 		return true, nil
 	}
 
+	if err := s.clearRefusedAttemptLocked(
+		token.leaseUUID, p, token.backendName, token.operationID,
+		"refuse typed placement attempt",
+	); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// clearRefusedAttemptLocked clears a refused exact attempt from a placement
+// that keeps its confirmed owner, together with the attempt's lifecycle
+// marker. Caller holds s.mu and has matched the exact attempt.
+//
+// When inventory confirmed the owner while the capability held only that
+// attempt, the attempt was its only evidence: clearing it leaves a confirmed
+// placement whose capability names no owner and no attempt, written as the
+// evidence-free quarantine sentinel. Callbacks and maintenance for the lease
+// are then withheld until an exact operation or a repair establishes a
+// generation, so the transition is logged with what an operator needs to find
+// it.
+func (s *Store) clearRefusedAttemptLocked(
+	leaseUUID string,
+	p Placement,
+	backendName string,
+	operationID operation.OperationID,
+	mutation string,
+) error {
 	next, err := s.nextRevision()
 	if err != nil {
-		return false, err
+		return err
 	}
 	p.Attempt = ""
 	clearOperationMetadata(&p)
 	p.revision = next
-	capability := clearAttemptLifecycle(
-		s.lifecycleCache[token.leaseUUID], token.backendName, token.operationID,
-	)
-	if err := s.putPlacementWithLifecycleLocked(
-		token.leaseUUID, p, capability, "refuse typed placement attempt",
-	); err != nil {
-		return false, err
+	before := s.lifecycleCache[leaseUUID]
+	capability := clearAttemptLifecycle(before, backendName, operationID)
+	if err := s.putPlacementWithLifecycleLocked(leaseUUID, p, capability, mutation); err != nil {
+		return err
 	}
 	s.revision = next
-	return true, nil
+	if before.usable() && !capability.usable() {
+		slog.Warn("placement: refused attempt was the lifecycle capability's only evidence",
+			"lease_uuid", leaseUUID,
+			"backend", p.Backend,
+			"attempt_backend", backendName,
+			"operation_id", operationID.String(),
+			"mutation", mutation,
+		)
+	}
+	return nil
 }
 
 // matchAttemptTokenLocked checks every durable token component in one critical
@@ -3350,7 +3371,7 @@ func (s *Store) projectInventory(
 			// cross-row binding remains explicit rather than being rediscovered only
 			// in process memory after every restart.
 			capability, capabilityExists := s.lifecycleCache[leaseUUID]
-			if capabilityExists && capability.unusable && capability.needsPersistence {
+			if capabilityExists && !capability.usable() && capability.needsPersistence {
 				capability.needsPersistence = false
 				capabilityEncoded, capabilityErr := encodeLifecycleCapability(capability)
 				if capabilityErr != nil {
@@ -3488,7 +3509,7 @@ func (s *Store) projectInventory(
 		mutation := mutations[leaseUUID]
 		s.cache[leaseUUID] = mutation.placement
 		if lifecycleMutation, ok := lifecycleMutations[leaseUUID]; ok {
-			s.lifecycleCache[leaseUUID] = lifecycleMutation.capability
+			s.cacheWrittenLifecycleLocked(leaseUUID, lifecycleMutation.capability)
 		}
 		delete(s.deleteRevisions, leaseUUID)
 	}
@@ -3682,7 +3703,7 @@ func (s *Store) trustedProvisionDurablyRepresentedLocked(
 	if !exists {
 		return false
 	}
-	if capability.unusable {
+	if !capability.usable() {
 		return true
 	}
 	generation := sealedLifecycleObservation(row.LifecycleGeneration())
@@ -3757,7 +3778,7 @@ func (s *Store) pairedOverlapPreservesOwnerLocked(snapshot inventory.Snapshot, l
 		return false
 	}
 	capability, exists := s.lifecycleCache[leaseUUID]
-	if !exists || capability.unusable || capability.backend != record.Backend || !capability.principal.valid() {
+	if !exists || !capability.usable() || capability.backend != record.Backend || !capability.principal.valid() {
 		return false
 	}
 	row := observation.Provision()
@@ -4224,19 +4245,32 @@ func nextUnprojectedFencedReporters(current, abandoned, answered []string) []str
 }
 
 // inheritedFencedReportersAtOpen names the fenced backends that may hold a
-// positive the pending chain lost: the journaled ones, or every fenced
-// backend when the chain is untracked and cannot name its reporters.
+// positive the pending chain lost. fenceRestartRecords decides, so offline
+// classification reports exactly this set before the fence is applied.
 func (s *Store) inheritedFencedReportersAtOpen() map[string]struct{} {
-	inherited := make(map[string]struct{})
-	if s.pendingInventorySweepID == 0 {
-		return inherited
-	}
-	for backendName := range s.fencedBackends {
-		if !s.inventoryReporters.tracked || s.inventoryReporters.recorded(backendName) {
-			inherited[backendName] = struct{}{}
-		}
+	records := fenceRestartRecords(
+		s.pendingInventorySweepID, s.inventoryReporters, slices.Sorted(maps.Keys(s.fencedBackends)),
+	)
+	inherited := make(map[string]struct{}, len(records))
+	for _, backendName := range records {
+		inherited[backendName] = struct{}{}
 	}
 	return inherited
+}
+
+// logInheritedFencedReporters warns at open that fenced backends may hold
+// positives the pending sweep never projected. Once interrupted-sweep recovery
+// clears without them they are recorded as unprojected reporters, and new-lease
+// admission stays withheld until each answers both inventories or is retired.
+func (s *Store) logInheritedFencedReporters() {
+	if len(s.inheritedFencedReporters) == 0 {
+		return
+	}
+	slog.Warn("placement: fenced backends may hold leases an interrupted sweep never projected; "+
+		"recovery records them as unprojected reporters and withholds new-lease admission "+
+		"until each answers both inventories or is retired",
+		"sweep_id", s.pendingInventorySweepID,
+		"fenced_reporters", slices.Sorted(maps.Keys(s.inheritedFencedReporters)))
 }
 
 // publishUnprojectedFencedReporters exports the durable record per active
@@ -4547,7 +4581,7 @@ func (s *Store) deleteDurable(leaseUUID, operation string) error {
 		return mutationFailure(operation, err)
 	}
 	if capabilityExists && retainCapability {
-		s.lifecycleCache[leaseUUID] = capability
+		s.cacheWrittenLifecycleLocked(leaseUUID, capability)
 	} else {
 		delete(s.lifecycleCache, leaseUUID)
 	}

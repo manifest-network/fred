@@ -242,7 +242,8 @@ func (h *Handlers) AuthenticateLeaseRequest(r *http.Request, leaseUUID string, c
 // token, run the optional replay check, and confirm the token's lease UUID
 // matches the request. It does NOT query the chain — callers needing the
 // closed-lease authz fallback (ENG-329) verify the lease separately so they can
-// fall back to the retained record's tenant when the chain has pruned the lease.
+// fall back to the retained record's tenant when the chain has no record of the
+// lease (x/billing never deletes leases: a lagging, reset or wrong chain endpoint).
 func (h *Handlers) authenticateLeaseToken(r *http.Request, leaseUUID string, checkReplay bool) (*AuthToken, int, error) {
 	// Validate lease UUID format
 	if !config.IsValidUUID(leaseUUID) {
@@ -419,7 +420,7 @@ func (h *Handlers) findProvisionAcrossBackends(
 	}
 	candidates := h.backendRouter.RouteAll(sku)
 	if len(candidates) == 0 {
-		// Unknown/unmatched SKU (e.g. the chain pruned the lease, so we have no
+		// Unknown/unmatched SKU (e.g. the chain returned no lease, so we have no
 		// item to derive it from): fan out over every backend.
 		candidates = h.backendRouter.Backends()
 	}
@@ -736,11 +737,12 @@ type LeaseStatusResponse struct {
 // Authz is chain-primary with a retained-record fallback (ENG-329 #5): the
 // ADR-036-signed token is validated first, then the chain lease is queried
 // (any state). If the chain still has the lease, tenant/provider ownership is
-// verified against it (the existing path). If the chain has PRUNED the lease
-// (auto-closed cohort), the request is authorized iff the signed caller's
-// tenant equals the retained record's Tenant, surfaced via the bounded fan-out
-// GetProvision — mirroring restore's cross-tenant guard. A cross-tenant caller,
-// or an absent retained record, is rejected.
+// verified against it (the existing path). If the chain has NO RECORD of the
+// lease (x/billing never deletes leases, so only a lagging, reset or wrong
+// chain endpoint answers not-found), the request is authorized iff the signed
+// caller's tenant equals the retained record's Tenant, surfaced via the
+// bounded fan-out GetProvision — mirroring restore's cross-tenant guard. A
+// cross-tenant caller, or an absent retained record, is rejected.
 func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 	leaseUUID := r.PathValue("lease_uuid")
 
@@ -751,8 +753,9 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Query the chain (any lease state). nil means the chain has pruned a
-	// closed/expired lease — fall back to the retained record below.
+	// Query the chain (any lease state). nil means the chain has no record of the
+	// lease; x/billing never deletes one, so this is not "closed". Fall back to the
+	// retained record below.
 	lease, status, err := verifyLeaseAccess(r.Context(), h.client, h.providerUUID, leaseUUID, token.Tenant, false)
 	if err != nil && status != http.StatusNotFound {
 		writeError(w, err.Error(), status)
@@ -824,8 +827,8 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response, http.StatusOK)
 }
 
-// serveRetainedStatusFallback answers GET /status for a lease the chain has
-// pruned. It authorizes via the retained record's tenant (ENG-329 #5) and, on a
+// serveRetainedStatusFallback answers GET /status for a lease the chain has no
+// record of. It authorizes via the retained record's tenant (ENG-329 #5) and, on a
 // match, returns provision_status=retained with the restore shape. A
 // cross-tenant caller or an absent/non-retained record yields 404 (never
 // authorize on an empty/mismatched tenant).
@@ -855,7 +858,7 @@ func (h *Handlers) serveRetainedStatusFallback(w http.ResponseWriter, r *http.Re
 	}
 	applyRetentionFields(&response, info)
 
-	slog.Info("lease status served from retained record (chain-pruned lease)",
+	slog.Info("lease status served from retained record (chain has no record of the lease)",
 		"lease_uuid", leaseUUID,
 		"tenant", callerTenant,
 	)
@@ -940,7 +943,7 @@ func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Query the chain (any state). A tenant/provider mismatch (403) or other
-	// non-NotFound error surfaces here; nil lease means the chain pruned it.
+	// non-NotFound error surfaces here; nil lease means the chain has no record of it.
 	lease, status, err := verifyLeaseAccess(r.Context(), h.client, h.providerUUID, leaseUUID, token.Tenant, false)
 	if err != nil && status != http.StatusNotFound {
 		writeError(w, err.Error(), status)
@@ -967,13 +970,13 @@ func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case lease == nil:
-		// Chain-pruned: the caller is NOT yet authorized (the chain can no longer
+		// Chain has no record: the caller is NOT yet authorized (the chain cannot
 		// vouch for ownership). Authorize solely against the retained record's
 		// tenant. A genuine fan-out error is logged but treated as "not found" —
 		// surfacing a 500 here would leak backend-health/existence to a caller who
 		// has not proven ownership (symmetric with serveRetainedStatusFallback).
 		if fanErr != nil {
-			slog.Warn("provision fan-out failed during chain-pruned authz", "lease_uuid", leaseUUID, "error", fanErr)
+			slog.Warn("provision fan-out failed during retained-record authz", "lease_uuid", leaseUUID, "error", fanErr)
 		}
 		if !authorizeRetained(info, token.Tenant) {
 			writeError(w, errMsgLeaseNotFound, http.StatusNotFound)

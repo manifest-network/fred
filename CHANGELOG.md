@@ -41,6 +41,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `unprojected_fenced_reporters` in `placement-repair -classify`. Older
   binaries refuse a database that holds this record. See SECURITY.md,
   "Containing a compromised backend".
+- `placement-repair -classify` reports an interrupted reconciliation sweep:
+  `pending_inventory_sweep_id`, the reporters of its unresolved sweep chain in
+  `inventory_sweep_reporters` (or `inventory_sweep_untracked`), and
+  `fence_restart_would_record`, the backends that a restart with them fenced
+  would record as unprojected reporters. Check it before applying a fence.
+  providerd also logs a WARN at startup when a fenced backend is about to be
+  recorded. (ENG-1119)
 - `placement-repair -adopt-observed-generation -lease <uuid> -backend <name>`
   repairs a lease left quarantined after a placement restore because its
   backend re-provisioned it since the copy was taken. The backend must be the
@@ -107,8 +114,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `BackendStorageLost`, and `410 Gone` with reason `backend_storage_lost` on
   provision, connection, logs, releases, restart, update, and restore from a
   lost source. A retired name can never rejoin, and its storage cannot be
-  claimed by another name. Older binaries refuse a database that records a
-  retirement. See DEPLOYMENT.md, "Retiring a backend whose storage is lost".
+  claimed by another name. A surviving lease whose lifecycle capability named
+  the retired backend only through an in-flight attempt keeps an evidence-free
+  quarantine instead of making the whole retirement refuse (ENG-1119). Older
+  binaries refuse a database that records a retirement. See DEPLOYMENT.md,
+  "Retiring a backend whose storage is lost".
 - `docker-backend -audit-storage-identity-adoption` reports every v0.13 shape
   that blocks storage-identity adoption in one read-only pass, as JSON, where
   the preflight stops at the first. Each finding carries its class, an
@@ -383,6 +393,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- A graceful providerd stop now lets an in-flight reconciliation sweep finish
+  reading backend inventories and commit its placement projection, for at most
+  half of `shutdown_timeout`, instead of abandoning it. An abandoned sweep left
+  a pending inventory marker, and restarting with a backend fenced then held
+  new-lease admission until the fence ended. A sweep still reading when that
+  grace expires is abandoned as before. (ENG-1119)
 - Restart and update no longer stop at 1,024 commands per lease. Fred and the
   docker-backend keep a rolling window of each lease's 1,024 most recent
   commands and evict the oldest settled one to admit a newer command; the
@@ -1146,13 +1162,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   identity, including content above a subsequently lowered image size cap.
   (ENG-1052)
 
-- Images built by Docker Compose can retain its three standard build stamps.
-  Admitted metadata owns their replacements: compiled projects bind their own
-  project/service/version, and ordinary direct/helper creation writes neutral
+- Images built by Docker Compose can retain its standard build stamps: project,
+  service and version, plus the `com.docker.compose.image.builder` stamp of its
+  classic (non-BuildKit) builder. Admitted metadata owns their replacements:
+  compiled projects bind their own project/service/version, the builder stamp
+  is always cleared, and ordinary direct/helper creation writes neutral
   values. Frozen-source compensation carries a compiler-issued service binding
   so restored workloads remain discoverable by Compose and can be deprovisioned.
   Other reserved labels remain rejected, and inherited build labels cannot
-  grant container ownership or redirect helper cleanup. (ENG-1052)
+  grant container ownership or redirect helper cleanup. (ENG-1052, ENG-1119)
+  Rolling back to an earlier build that does not own the builder stamp (for
+  example #245) is not safe while an image-inspection helper receipt is
+  pending: that docker-backend reads the helper's empty
+  `com.docker.compose.image.builder` label as a foreign reserved label and can
+  neither recover nor remove the helper. Its receipt then stays unsettled, which
+  on the containerd image store blocks image ingestion and GC on that backend
+  until this build runs again. Before rolling back, confirm that
+  `fred_docker_backend_image_helpers_unsettled` is 0, or that
+  `docker-backend -inspect-unsettled-docker-effects` lists no helper receipt.
 
 - Custom-domain provision, restore and maintenance admission now derives durable
   effective items and Docker labels from one ingress plan. Disabled ingress,
@@ -1938,8 +1965,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Docker image admission rejects reserved `fred.*`, `traefik.*`, and
   `com.docker.compose.*` labels before any workload or inspection helper is
   created, preventing inherited labels from hijacking ingress or Compose
-  lifecycle ownership. The three exact Compose project/service/version build
-  stamps are admitted only as placeholders replaced by the owned creation plan.
+  lifecycle ownership. The exact Compose project/service/version build stamps,
+  and the `com.docker.compose.image.builder` stamp of Compose's classic builder,
+  are admitted only as placeholders replaced by the owned creation plan.
   Admission mints an opaque image capability; helpers
   and workloads require that capability, and Compose requires a complete prepared
   project with repulls disabled. Container creation and image setup use the exact inspected

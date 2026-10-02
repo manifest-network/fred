@@ -38,7 +38,7 @@ func TestPairedOverlapPreservesOnlyRepresentedOwner(t *testing.T) {
 				capability := fixture.store.lifecycleCache[leaseUUID]
 				switch scenario {
 				case "unusable lifecycle":
-					capability.unusable = true
+					capability.quarantined = true
 				case "lifecycle backend mismatch":
 					capability.backend = "backend-b"
 				case "principal unbound on both sides":

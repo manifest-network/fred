@@ -341,3 +341,101 @@ func TestFleet_FencedReporterDoesNotBlockConfirmedOwnerRecovery(t *testing.T) {
 			"the lease the fenced backend may hold is still not admitted on %s", server.name)
 	}
 }
+
+// classifyStopped closes the fleet's placement store and inspects the stopped
+// database exactly as placement-repair -classify does, as an operator would
+// before restarting with a backend fenced. A later restart reopens the store.
+func (f *fleet) classifyStopped() placement.AuthorityReport {
+	f.t.Helper()
+	require.NoError(f.t, f.placement.Close())
+	expectation, err := placement.NewAuthorityExpectation(f.providerUUID, backendTopologyNames(f.router))
+	require.NoError(f.t, err)
+	report, err := placement.InspectAuthorityFile(f.placementPath, expectation)
+	require.NoError(f.t, err)
+	return report
+}
+
+// ENG-1119: a graceful stop that lands while a backend is still answering lets
+// the in-flight sweep finish its reads and commit its projection instead of
+// abandoning it. Nothing is left pending, so restarting with the sweep's
+// reporter fenced records nothing and new leases are still admitted.
+// Not parallel: reads process-global collectors.
+func TestFleet_GracefulStopDrainsInFlightSweep(t *testing.T) {
+	f := newFleet(t, fleetOptions{shutdownSweepGrace: 5 * time.Second})
+	require.NoError(t, f.sweep(), "establish the admission baseline")
+	f.addLease("lease-drained", billingtypes.LEASE_STATE_ACTIVE)
+	reporter := f.backendAt(2)
+	reporter.seedProvision(t, "lease-drained", f.providerUUID, backend.ProvisionStatusReady)
+
+	slow := f.backendAt(3)
+	slow.setFault(faultSlowOK)
+	ctx, cancel := context.WithCancel(f.t.Context())
+	defer cancel()
+	stop := time.AfterFunc(100*time.Millisecond, cancel)
+	defer stop.Stop()
+	started := time.Now()
+	require.ErrorIs(t, f.reconciler.ReconcileAll(ctx), context.Canceled,
+		"a stopped sweep still starts no lifecycle work")
+	elapsed := time.Since(started)
+	assert.GreaterOrEqual(t, elapsed, 400*time.Millisecond,
+		"the sweep kept reading the slow backend after the stop at 100ms")
+	assert.Less(t, elapsed, 5*time.Second, "the sweep finished inside its grace")
+	slow.setFault(faultNone)
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.ReconcilerSweepProjectionCommitted),
+		"the sweep finished its reads and committed its projection")
+	assert.Equal(t, placement.InventoryReady, f.placement.InventoryReadiness(),
+		"the committed projection cleared the pending marker")
+	f.assertPlacementPinned("lease-drained", reporter.name)
+
+	report := f.classifyStopped()
+	assert.Zero(t, report.PendingInventorySweepID)
+	assert.Empty(t, report.FenceRestartWouldRecord, "-classify shows nothing a fence would record")
+
+	f.restartFenced(reporter.name)
+	f.addLease("lease-new", billingtypes.LEASE_STATE_PENDING)
+	require.NoError(t, f.sweepN(2))
+	assert.Equal(t, placement.InventoryReady, f.placement.InventoryReadiness(),
+		"the fenced reporter was never recorded as unaccounted")
+	assert.Equal(t, 1, f.backendAt(1).provisionCount("lease-new"),
+		"a new lease is admitted on an unfenced backend")
+	f.assertPlacementPinned("lease-drained", reporter.name)
+}
+
+// ENG-1119 G4: a stop whose grace expires while a backend still hangs abandons
+// the sweep as before: nothing is projected and the marker stays pending, with
+// the reporter journaled. -classify names that reporter in
+// fence_restart_would_record, and a restart with it fenced records it and
+// withholds new-lease admission.
+// Not parallel: reads process-global collectors.
+func TestFleet_GracefulStopPastGraceStillAbandonsSweep(t *testing.T) {
+	f := newFleet(t, fleetOptions{shutdownSweepGrace: 100 * time.Millisecond})
+	require.NoError(t, f.sweep(), "establish the admission baseline")
+	f.addLease("lease-abandoned", billingtypes.LEASE_STATE_PENDING)
+	reporter := f.backendAt(2)
+	reporter.seedProvision(t, "lease-abandoned", f.providerUUID, backend.ProvisionStatusReady)
+
+	f.interruptSweepAfterProvisions(f.backendAt(3))
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.ReconcilerSweepProjectionCommitted),
+		"a sweep abandoned past its grace commits nothing")
+	assert.Equal(t, placement.InventoryRecoveryPending, f.placement.InventoryReadiness())
+
+	report := f.classifyStopped()
+	assert.NotZero(t, report.PendingInventorySweepID)
+	assert.False(t, report.InventorySweepUntracked)
+	assert.Equal(t, []string{reporter.name}, report.InventorySweepReporters)
+	assert.Equal(t, []string{reporter.name}, report.FenceRestartWouldRecord,
+		"-classify names the backend whose fence would hold admission")
+
+	f.restartFenced(reporter.name)
+	require.Equal(t, placement.InventoryRecoveryPending, f.placement.InventoryReadiness())
+	require.NoError(t, f.sweepN(2))
+	assert.Equal(t, placement.InventoryFencedReporterUnaccounted, f.placement.InventoryReadiness())
+	f.addLease("lease-new", billingtypes.LEASE_STATE_PENDING)
+	require.NoError(t, f.sweepN(2))
+	for _, server := range []*fakeBackendServer{f.backendAt(1), f.backendAt(3)} {
+		assert.Zero(t, server.provisionCount("lease-new"),
+			"new-lease admission is withheld on %s while the fenced reporter is unaccounted", server.name)
+		assert.Zero(t, server.provisionCount("lease-abandoned"),
+			"the lease the fenced backend may hold is not admitted on %s", server.name)
+	}
+}

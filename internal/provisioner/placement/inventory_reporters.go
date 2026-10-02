@@ -75,6 +75,31 @@ func (journal sweepReporterJournal) recorded(backendName string) bool {
 	return ok
 }
 
+// fenceRestartRecords names the candidates a store opened with them fenced
+// inherits as reporters to record: none unless a sweep is pending, and then
+// each one that may have reported a positive the pending chain lost, which is
+// a journaled reporter, or any backend when the chain is untracked and cannot
+// name its reporters. Store open passes its fenced backends, and offline
+// classification passes the active topology to derive
+// fence_restart_would_record, so a gate added here reaches both. The result
+// keeps the candidates' order and is never nil.
+func fenceRestartRecords(
+	pendingSweepID uint64,
+	journal sweepReporterJournal,
+	candidates []string,
+) []string {
+	records := make([]string, 0, len(candidates))
+	if pendingSweepID == 0 {
+		return records
+	}
+	for _, backendName := range candidates {
+		if !journal.tracked || journal.recorded(backendName) {
+			records = append(records, backendName)
+		}
+	}
+	return records
+}
+
 // with returns a copy, so a failed durable write leaves the live journal
 // unchanged.
 func (journal sweepReporterJournal) with(backendName string) sweepReporterJournal {
