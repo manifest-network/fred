@@ -695,13 +695,16 @@ func drainFailureCallback(env *reconcilerTestEnv) {
 	}
 }
 
-// TestIntegration_Reconciler_CrashLoop_ClosesLease runs a workload that exits
-// on its own a few seconds after every start: a real crash loop of the
-// tenant's own process, observed live by the Docker event stream. The third
-// consecutive exit exhausts the backend's terminal budget and providerd closes
-// the lease (ENG-799). The exit is the container's own, never docker kill: an
-// API kill is a disruption and never counts (see the external-kill test).
-func TestIntegration_Reconciler_CrashLoop_ClosesLease(t *testing.T) {
+// TestIntegration_Reconciler_CrashLoop_CountsButRespectsTheMinimumSpan runs a
+// workload that exits on its own a few seconds after every start: a real crash
+// loop of the tenant's own process, observed live by the Docker event stream.
+// Every exit counts against the backend's terminal budget (ENG-799), but three
+// exits inside the 30-minute minimum streak span only retry: providerd
+// re-provisions the lease and never closes it. The exit is the container's
+// own, never docker kill: an API kill is a disruption and never counts (see
+// the external-kill test). Exhaustion past the span is pinned on the synctest
+// clock by leasesm's sequence tests and the docker-backend's real-death tests.
+func TestIntegration_Reconciler_CrashLoop_CountsButRespectsTheMinimumSpan(t *testing.T) {
 	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	sku := "docker-micro"
@@ -734,21 +737,17 @@ func TestIntegration_Reconciler_CrashLoop_ClosesLease(t *testing.T) {
 		budget := provisionedTerminalBudget(t, env.backend, leaseUUID)
 		require.NotNil(t, budget)
 		assert.Equal(t, crash, budget.ConsecutiveFailures, "crash %d", crash)
+		assert.Equal(t, backend.TerminalVerdictRetry, budget.Verdict,
+			"crash %d lands inside the minimum streak span", crash)
 
 		require.NoError(t, env.reconciler.RunOnce(ctx))
-		if crash < 3 {
-			assert.Equal(t, backend.TerminalVerdictRetry, budget.Verdict, "crash %d", crash)
-			delivery := waitForCallbackDelivery(t, env.callbackCh, leaseUUID, 2*time.Minute)
-			assert.Equal(t, backend.CallbackStatusSuccess, delivery.Status, "re-provision %d should succeed", crash)
-			require.True(t, env.tracker.finishProvisionCallback(delivery))
-		} else {
-			assert.Equal(t, backend.TerminalVerdictExhausted, budget.Verdict)
-		}
+		delivery := waitForCallbackDelivery(t, env.callbackCh, leaseUUID, 2*time.Minute)
+		assert.Equal(t, backend.CallbackStatusSuccess, delivery.Status, "re-provision %d should succeed", crash)
+		require.True(t, env.tracker.finishProvisionCallback(delivery))
 	}
 
-	closed, reasons := chain.closed()
-	assert.Equal(t, []string{leaseUUID}, closed, "the third consecutive own exit closes the lease")
-	assert.Equal(t, []string{"workload failed repeatedly"}, reasons)
+	closed, _ := chain.closed()
+	assert.Empty(t, closed, "a crash loop younger than the minimum streak span never closes the lease")
 }
 
 // TestIntegration_Reconciler_ExternalKillsDoNotCloseLease pins the Docker

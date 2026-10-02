@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -200,35 +201,100 @@ func failureCount(attribution string) float64 {
 	return testutil.ToFloat64(leaseFailuresTotal.WithLabelValues(attribution))
 }
 
+// failedInterval is how long the harness lease sits Failed between real deaths
+// in the aged crash loops: two such intervals put the third death past the
+// 30-minute minimum streak span. Time spent Failed is not Ready time, so it
+// never resets the streak.
+const failedInterval = 16 * time.Minute
+
 // A crash loop reaches an exhausted verdict on the wire only through real actor
-// deaths delivered by the live event stream, and the budget survives every
-// recovery rebuild in between (Failed -> Failed and Failed -> Ready).
+// deaths delivered by the live event stream, once the streak is both three
+// deaths long and 30 minutes old, and the budget survives every recovery
+// rebuild in between (Failed -> Failed and Failed -> Ready). Time alone never
+// changes what the wire serves.
 func TestTerminalBudget_RealDeathsExhaustAcrossRecoveryRebuilds(t *testing.T) {
-	h := newBudgetEventHarness(t)
-	tenantBefore := failureCount("tenant_workload")
-	h.requireWire(0, backend.TerminalVerdictRetry)
+	synctest.Test(t, func(t *testing.T) {
+		h := newBudgetEventHarness(t)
+		tenantBefore := failureCount("tenant_workload")
+		h.requireWire(0, backend.TerminalVerdictRetry)
 
-	for want := 1; want <= 3; want++ {
-		h.die(1, false, containerEventStart, containerEventDie)
-		verdict := backend.TerminalVerdictRetry
-		if want == 3 {
-			verdict = backend.TerminalVerdictExhausted
+		for want := 1; want <= 3; want++ {
+			h.die(1, false, containerEventStart, containerEventDie)
+			verdict := backend.TerminalVerdictRetry
+			if want == 3 {
+				verdict = backend.TerminalVerdictExhausted
+			}
+			h.requireWire(want, verdict)
+
+			// A sweep that re-observes the same failed runtime keeps the budget.
+			require.NoError(t, h.b.recoverState(context.Background()))
+			require.Equal(t, backend.ProvisionStatusFailed, h.status())
+			h.requireWire(want, verdict)
+			if want < 3 {
+				time.Sleep(failedInterval)
+				h.requireWire(want, backend.TerminalVerdictRetry)
+				h.restartOutOfBand()
+				h.requireWire(want, backend.TerminalVerdictRetry)
+			}
 		}
-		h.requireWire(want, verdict)
+		assert.Equal(t, 3.0, failureCount("tenant_workload")-tenantBefore)
+		h.b.provisionsMu.RLock()
+		assert.Equal(t, 3, h.b.provisions[budgetTestLease].FailCount, "fail_count stays the lifetime diagnostic")
+		h.b.provisionsMu.RUnlock()
+	})
+}
 
-		// A sweep that re-observes the same failed runtime keeps the budget.
-		require.NoError(t, h.b.recoverState(context.Background()))
-		require.Equal(t, backend.ProvisionStatusFailed, h.status())
-		h.requireWire(want, verdict)
-		if want < 3 {
-			h.restartOutOfBand()
+// The same real crash loop without the time between deaths: three deaths in
+// quick succession, as an outage produces, only ever retry. Later deaths keep
+// retrying until one lands 30 minutes after the streak's first.
+func TestTerminalBudget_RealDeathsInsideTheMinimumSpanRetry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newBudgetEventHarness(t)
+		start := time.Now()
+		for want := 1; ; want++ {
+			h.die(1, false, containerEventStart, containerEventDie)
+			if time.Since(start) >= 30*time.Minute {
+				require.GreaterOrEqual(t, want, 3)
+				h.requireWire(want, backend.TerminalVerdictExhausted)
+				return
+			}
 			h.requireWire(want, backend.TerminalVerdictRetry)
+			time.Sleep(4 * time.Minute)
+			h.restartOutOfBand()
 		}
-	}
-	assert.Equal(t, 3.0, failureCount("tenant_workload")-tenantBefore)
-	h.b.provisionsMu.RLock()
-	assert.Equal(t, 3, h.b.provisions[budgetTestLease].FailCount, "fail_count stays the lifetime diagnostic")
-	h.b.provisionsMu.RUnlock()
+	})
+}
+
+// readerGate lets the concurrent readers below run while the lease's budget
+// changes and parks them, durably blocked, while the synctest clock jumps
+// across the minimum streak span.
+type readerGate struct {
+	mu   sync.Mutex
+	open chan struct{}
+}
+
+func newReaderGate() *readerGate {
+	open := make(chan struct{})
+	close(open)
+	return &readerGate{open: open}
+}
+
+func (g *readerGate) wait() <-chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.open
+}
+
+func (g *readerGate) pause() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.open = make(chan struct{})
+}
+
+func (g *readerGate) resume() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	close(g.open)
 }
 
 // Inventory reads race every writer of the budget: the lease actor recording
@@ -236,60 +302,68 @@ func TestTerminalBudget_RealDeathsExhaustAcrossRecoveryRebuilds(t *testing.T) {
 // -race. Every read is one consistent snapshot: an exhausted verdict is only
 // ever served together with the Failed status it was minted for.
 func TestTerminalBudget_ConcurrentInventoryReadsSeeConsistentSnapshots(t *testing.T) {
-	h := newBudgetEventHarness(t)
-	stop := make(chan struct{})
-	var readers sync.WaitGroup
-	var reads atomic.Int64
-	// Registered after the harness, so it runs before the harness tears down,
-	// even when a require below ends the test early.
-	stopReaders := sync.OnceFunc(func() {
-		close(stop)
-		readers.Wait()
-	})
-	t.Cleanup(stopReaders)
-	check := func(info backend.ProvisionInfo) {
-		budget := info.TerminalBudget
-		if budget == nil {
-			t.Errorf("live inventory served no budget for %s", info.LeaseUUID)
-			return
-		}
-		if budget.ConsecutiveFailures < 0 || budget.ConsecutiveFailures > 3 {
-			t.Errorf("budget count out of range: %+v", *budget)
-		}
-		if budget.Verdict == backend.TerminalVerdictExhausted && info.Status != backend.ProvisionStatusFailed {
-			t.Errorf("exhausted verdict served with status %s", info.Status)
-		}
-		reads.Add(1)
-	}
-	for range 2 {
-		readers.Go(func() {
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				if provisions, err := h.b.ListProvisions(context.Background()); err == nil {
-					for _, info := range provisions {
-						check(info)
-					}
-				}
-				if info, err := h.b.GetProvision(context.Background(), budgetTestLease); err == nil {
-					check(*info)
-				}
-			}
+	synctest.Test(t, func(t *testing.T) {
+		h := newBudgetEventHarness(t)
+		stop := make(chan struct{})
+		gate := newReaderGate()
+		var readers sync.WaitGroup
+		var reads atomic.Int64
+		// Registered after the harness, so it runs before the harness tears
+		// down, even when a require below ends the test early.
+		stopReaders := sync.OnceFunc(func() {
+			close(stop)
+			readers.Wait()
 		})
-	}
-	for want := 1; want <= 3; want++ {
-		h.die(1, false, containerEventStart, containerEventDie)
-		require.NoError(t, h.b.recoverState(context.Background()))
-		if want < 3 {
-			h.restartOutOfBand()
+		t.Cleanup(stopReaders)
+		check := func(info backend.ProvisionInfo) {
+			budget := info.TerminalBudget
+			if budget == nil {
+				t.Errorf("live inventory served no budget for %s", info.LeaseUUID)
+				return
+			}
+			if budget.ConsecutiveFailures < 0 || budget.ConsecutiveFailures > 3 {
+				t.Errorf("budget count out of range: %+v", *budget)
+			}
+			if budget.Verdict == backend.TerminalVerdictExhausted && info.Status != backend.ProvisionStatusFailed {
+				t.Errorf("exhausted verdict served with status %s", info.Status)
+			}
+			reads.Add(1)
 		}
-	}
-	stopReaders()
-	assert.Positive(t, reads.Load())
-	h.requireWire(3, backend.TerminalVerdictExhausted)
+		for range 2 {
+			readers.Go(func() {
+				for {
+					select {
+					case <-stop:
+						return
+					case <-gate.wait():
+					}
+					if provisions, err := h.b.ListProvisions(context.Background()); err == nil {
+						for _, info := range provisions {
+							check(info)
+						}
+					}
+					if info, err := h.b.GetProvision(context.Background(), budgetTestLease); err == nil {
+						check(*info)
+					}
+					// A durable block, so the bubble's clock can advance.
+					time.Sleep(time.Millisecond)
+				}
+			})
+		}
+		for want := 1; want <= 3; want++ {
+			h.die(1, false, containerEventStart, containerEventDie)
+			require.NoError(t, h.b.recoverState(context.Background()))
+			if want < 3 {
+				gate.pause()
+				time.Sleep(failedInterval)
+				gate.resume()
+				h.restartOutOfBand()
+			}
+		}
+		stopReaders()
+		assert.Positive(t, reads.Load())
+		h.requireWire(3, backend.TerminalVerdictExhausted)
+	})
 }
 
 // Provenance, not the exit status, decides whether a live death counts.

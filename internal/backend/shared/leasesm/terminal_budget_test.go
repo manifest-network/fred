@@ -74,12 +74,22 @@ func tenantCause() failurecause.Cause {
 // --- unit tests: the budget rules ---------------------------------------------
 
 // readyAt returns a projection of the test lease with the given recorded
-// streak, which entered Ready at t0 through SetStatus.
+// streak, which entered Ready at t0 through SetStatus. A non-empty streak
+// started an hour before t0, so the minimum-span floor is already met and the
+// count alone decides; readyWithStreak chooses the start.
 func readyAt(t0 time.Time, consecutive int) *ProvisionState {
+	return readyWithStreak(t0, consecutive, t0.Add(-time.Hour))
+}
+
+func readyWithStreak(t0 time.Time, consecutive int, streakStartedAt time.Time) *ProvisionState {
+	budget := TerminalBudget{leaseUUID: testActorLeaseUUID, consecutive: consecutive}
+	if consecutive > 0 {
+		budget.streakStartedAt = streakStartedAt
+	}
 	p := &ProvisionState{
 		LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusProvisioning,
 		Reason:         backend.ReasonContainerExited,
-		TerminalBudget: TerminalBudget{leaseUUID: testActorLeaseUUID, consecutive: consecutive},
+		TerminalBudget: budget,
 	}
 	p.SetStatus(backend.ProvisionStatusReady, t0)
 	return p
@@ -94,6 +104,10 @@ var everyStatus = []backend.ProvisionStatus{
 	"", "bogus",
 }
 
+// everyStanding is the closed standingFailure vocabulary plus an undeclared
+// value, which must read as not exhausting.
+var everyStanding = []standingFailure{noCountedFailure, countedWithinBudget, countedExhausting, 99}
+
 func uncountedCauses() []failurecause.Cause {
 	return []failurecause.Cause{
 		{}, failurecause.Platform(), failurecause.Maintenance(),
@@ -101,36 +115,113 @@ func uncountedCauses() []failurecause.Cause {
 	}
 }
 
+// streakVerdict is the one decision between the counted standings: both the
+// count threshold and the minimum span, measured from the streak's start to
+// the failure being counted, must be met. A streak with no recorded start
+// never exhausts.
+func TestStreakVerdict_BothFloors(t *testing.T) {
+	start := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	spans := []time.Duration{
+		0, time.Minute, terminalBudgetMinStreakSpan - time.Nanosecond,
+		terminalBudgetMinStreakSpan, terminalBudgetMinStreakSpan + time.Hour, -time.Hour,
+	}
+	for consecutive := range terminalBudgetThreshold + 3 {
+		for _, span := range spans {
+			got := streakVerdict(consecutive, start, start.Add(span))
+			want := countedWithinBudget
+			if consecutive >= terminalBudgetThreshold && span >= terminalBudgetMinStreakSpan {
+				want = countedExhausting
+			}
+			assert.Equal(t, want, got, "consecutive=%d span=%s", consecutive, span)
+		}
+		assert.Equal(t, countedWithinBudget, streakVerdict(consecutive, time.Time{}, start.Add(time.Hour)),
+			"no recorded start")
+	}
+	for _, standing := range everyStanding {
+		assert.Equal(t, standing == countedExhausting, standing.exhausts(), "standing %d", standing)
+	}
+}
+
+// countFailure starts the streak as the count leaves zero, never moves the
+// start of a running streak, and records the standing the extended streak
+// decides; resetStreak clears the count, start and standing together.
+func TestTerminalBudget_StreakStartAndReset(t *testing.T) {
+	t0 := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	var budget TerminalBudget
+	assert.Equal(t, countedWithinBudget, budget.countFailure(t0))
+	assert.Equal(t, t0, budget.streakStartedAt, "the first counted failure starts the streak")
+	assert.Equal(t, countedWithinBudget, budget.countFailure(t0.Add(10*time.Minute)))
+	assert.Equal(t, countedWithinBudget, budget.countFailure(t0.Add(20*time.Minute)),
+		"three failures inside the minimum span only retry")
+	assert.Equal(t, t0, budget.streakStartedAt, "a running streak keeps its start")
+	assert.Equal(t, countedExhausting, budget.countFailure(t0.Add(terminalBudgetMinStreakSpan)),
+		"the next counted failure re-evaluates and exhausts once the streak is old enough")
+	assert.Equal(t, 4, budget.consecutive)
+
+	budget.resetStreak()
+	assert.Equal(t, TerminalBudget{}, budget, "a reset clears the count, its start and the standing")
+
+	// A streak with a count but no recorded start (never produced by the
+	// actor) starts at the failure being counted: it can only delay.
+	orphan := TerminalBudget{consecutive: 5}
+	assert.Equal(t, countedWithinBudget, orphan.countFailure(t0))
+	assert.Equal(t, t0, orphan.streakStartedAt)
+}
+
 func TestTerminalBudget_ConsecutiveCountAndSustainedReadyReset(t *testing.T) {
 	t0 := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
 
-	t.Run("three counted deaths inside the window exhaust", func(t *testing.T) {
+	// Each death comes one minute after Ready; between deaths the lease sits
+	// Failed for gap. Failed time is not Ready time, so it never resets.
+	crashLoop := func(t *testing.T, gap time.Duration) []budgetOutcome {
 		p := readyAt(t0, 0)
 		now := t0
-		for want := 1; want <= terminalBudgetThreshold; want++ {
+		var outcomes []budgetOutcome
+		for want := 1; want <= terminalBudgetThreshold+1; want++ {
 			now = now.Add(time.Minute)
 			outcome := p.recordFailure(backend.ProvisionStatusFailing, tenantCause(), now)
 			require.True(t, outcome.counted)
 			assert.Equal(t, want, outcome.consecutive)
-			assert.Equal(t, want >= terminalBudgetThreshold, outcome.exhausted)
 			p.SetStatus(backend.ProvisionStatusFailed, now) // diagnostics gathered
-			assert.True(t, p.TerminalBudget.lastFailureCounted, "Failing -> Failed keeps the counted failure")
+			assert.NotEqual(t, noCountedFailure, p.TerminalBudget.standing, "Failing -> Failed keeps the counted failure")
+			assert.Equal(t, outcome.exhausted, p.ObserveTerminalBudget().Verdict == backend.TerminalVerdictExhausted)
+			now = now.Add(gap)
 			p.SetStatus(backend.ProvisionStatusProvisioning, now)
-			assert.False(t, p.TerminalBudget.lastFailureCounted, "a new attempt ends the counted failure")
+			assert.Equal(t, noCountedFailure, p.TerminalBudget.standing, "a new attempt ends the counted failure")
 			p.SetStatus(backend.ProvisionStatusReady, now)
+			outcomes = append(outcomes, outcome)
+		}
+		return outcomes
+	}
+
+	t.Run("deaths inside the minimum span never exhaust", func(t *testing.T) {
+		for _, outcome := range crashLoop(t, 5*time.Minute) {
+			assert.False(t, outcome.exhausted, "death %d at most 18 minutes into the streak", outcome.consecutive)
+		}
+	})
+
+	t.Run("the third death past the minimum span exhausts", func(t *testing.T) {
+		outcomes := crashLoop(t, 15*time.Minute) // deaths at 1, 17 and 33 minutes
+		for _, outcome := range outcomes {
+			assert.Equal(t, outcome.consecutive >= terminalBudgetThreshold, outcome.exhausted,
+				"death %d", outcome.consecutive)
 		}
 	})
 
 	t.Run("a death after the reset period starts a new streak", func(t *testing.T) {
 		for _, ready := range []time.Duration{terminalBudgetResetAfter, terminalBudgetResetAfter + time.Hour} {
 			p := readyAt(t0, 2)
-			outcome := p.recordFailure(backend.ProvisionStatusFailing, tenantCause(), t0.Add(ready))
+			now := t0.Add(ready)
+			outcome := p.recordFailure(backend.ProvisionStatusFailing, tenantCause(), now)
 			assert.Equal(t, 1, outcome.consecutive, "Ready for %s must reset the streak", ready)
+			assert.Equal(t, now, p.TerminalBudget.streakStartedAt, "the new streak starts at its first failure")
+			assert.False(t, outcome.exhausted)
 		}
 		p := readyAt(t0, 2)
 		outcome := p.recordFailure(backend.ProvisionStatusFailing, tenantCause(),
 			t0.Add(terminalBudgetResetAfter-time.Nanosecond))
 		assert.Equal(t, 3, outcome.consecutive, "just short of the reset period the streak continues")
+		assert.Equal(t, t0.Add(-time.Hour), p.TerminalBudget.streakStartedAt, "and keeps its start")
 		assert.True(t, outcome.exhausted)
 	})
 
@@ -142,12 +233,14 @@ func TestTerminalBudget_ConsecutiveCountAndSustainedReadyReset(t *testing.T) {
 				}
 				p := &ProvisionState{
 					LeaseUUID: testActorLeaseUUID, Status: from, Reason: backend.ReasonContainerExited,
-					TerminalBudget: TerminalBudget{leaseUUID: testActorLeaseUUID, consecutive: 2},
+					TerminalBudget: TerminalBudget{
+						leaseUUID: testActorLeaseUUID, consecutive: 2, streakStartedAt: t0.Add(-time.Hour),
+					},
 				}
 				outcome := p.recordFailure(to, tenantCause(), t0)
 				assert.False(t, outcome.counted, "%s -> %s", from, to)
 				assert.Equal(t, 2, p.TerminalBudget.consecutive, "%s -> %s", from, to)
-				assert.False(t, p.TerminalBudget.lastFailureCounted, "%s -> %s", from, to)
+				assert.Equal(t, noCountedFailure, p.TerminalBudget.standing, "%s -> %s", from, to)
 				assert.Equal(t, to, p.Status, "the failure is the status change")
 			}
 		}
@@ -162,13 +255,15 @@ func TestTerminalBudget_ConsecutiveCountAndSustainedReadyReset(t *testing.T) {
 			outcome := short.recordFailure(backend.ProvisionStatusFailing, cause, t0.Add(time.Minute))
 			assert.False(t, outcome.counted, cause.Label())
 			assert.Equal(t, 2, short.TerminalBudget.consecutive, cause.Label())
-			assert.False(t, short.TerminalBudget.lastFailureCounted, cause.Label())
+			assert.Equal(t, t0.Add(-time.Hour), short.TerminalBudget.streakStartedAt, cause.Label())
+			assert.Equal(t, noCountedFailure, short.TerminalBudget.standing, cause.Label())
 			assert.True(t, short.TerminalBudget.readySince.IsZero(), "the failure ends the Ready period")
 
 			sustained := readyAt(t0, 2)
 			outcome = sustained.recordFailure(backend.ProvisionStatusFailing, cause, t0.Add(11*time.Minute))
 			assert.False(t, outcome.counted, cause.Label())
 			assert.Zero(t, sustained.TerminalBudget.consecutive, "%s after a sustained Ready", cause.Label())
+			assert.True(t, sustained.TerminalBudget.streakStartedAt.IsZero(), "%s clears the start", cause.Label())
 		}
 	})
 
@@ -179,65 +274,78 @@ func TestTerminalBudget_ConsecutiveCountAndSustainedReadyReset(t *testing.T) {
 			outcome := p.recordFailure(backend.ProvisionStatusFailing, tenantCause(), t0)
 			assert.False(t, outcome.counted, "reason %q", reason)
 			assert.Zero(t, p.TerminalBudget.consecutive)
+			assert.True(t, p.TerminalBudget.streakStartedAt.IsZero(), "an uncounted failure starts no streak")
 		}
 	})
 
 	t.Run("a budget carried onto another lease is fresh", func(t *testing.T) {
 		p := readyAt(t0, 0)
 		p.TerminalBudget = TerminalBudget{
-			leaseUUID: "22222222-2222-4222-8222-222222222222", consecutive: 2, lastFailureCounted: true,
+			leaseUUID: "22222222-2222-4222-8222-222222222222", consecutive: 2,
+			streakStartedAt: t0.Add(-time.Hour), standing: countedExhausting,
 		}
 		assert.Equal(t, 0, p.ObserveTerminalBudget().ConsecutiveFailures)
 		outcome := p.recordFailure(backend.ProvisionStatusFailing, tenantCause(), t0)
 		assert.Equal(t, 1, outcome.consecutive, "a foreign streak never contributes")
+		assert.Equal(t, t0, p.TerminalBudget.streakStartedAt, "nor does its start")
 		assert.Equal(t, testActorLeaseUUID, p.TerminalBudget.leaseUUID)
 	})
 
 	t.Run("a tenant reset clears the streak", func(t *testing.T) {
 		p := readyAt(t0, 2)
-		p.TerminalBudget.lastFailureCounted = true
+		p.TerminalBudget.standing = countedExhausting
 		p.budgetResetByTenant()
 		assert.Zero(t, p.TerminalBudget.consecutive)
-		assert.False(t, p.TerminalBudget.lastFailureCounted)
+		assert.True(t, p.TerminalBudget.streakStartedAt.IsZero())
+		assert.Equal(t, noCountedFailure, p.TerminalBudget.standing)
 	})
 }
 
 // SetStatus is the one Ready boundary. Every pair of statuses, from every
-// anchor and counted-failure state: entering Ready anchors at now, leaving
-// Ready resets after a sustained Ready and clears the anchor, nothing else
-// touches either, and a counted failure survives only Failing -> Failed.
+// anchor and standing failure: entering Ready anchors at now, leaving Ready
+// resets the streak (count and start) after a sustained Ready and clears the
+// anchor, nothing else touches either, and a counted failure survives only
+// Failing -> Failed.
 func TestSetStatus_ReadyBoundaryForEveryTransition(t *testing.T) {
 	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	streakStart := now.Add(-time.Hour)
 	anchors := []time.Time{{}, now.Add(-11 * time.Minute), now.Add(-time.Minute)}
 	for _, from := range everyStatus {
 		for _, to := range everyStatus {
 			for _, anchor := range anchors {
-				for _, counted := range []bool{false, true} {
+				for _, standing := range everyStanding {
 					p := &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: from}
 					p.TerminalBudget = TerminalBudget{
-						leaseUUID: testActorLeaseUUID, consecutive: 2, readySince: anchor, lastFailureCounted: counted,
+						leaseUUID: testActorLeaseUUID, consecutive: 2, streakStartedAt: streakStart,
+						readySince: anchor, standing: standing,
 					}
 					p.SetStatus(to, now)
-					label := fmt.Sprintf("%q -> %q anchor=%v counted=%t", from, to, anchor, counted)
+					label := fmt.Sprintf("%q -> %q anchor=%v standing=%d", from, to, anchor, standing)
 					budget := p.TerminalBudget
 					require.Equal(t, to, p.Status, label)
 					switch {
 					case from == backend.ProvisionStatusReady && to != backend.ProvisionStatusReady:
-						want := 2
+						want, wantStart := 2, streakStart
 						if !anchor.IsZero() && now.Sub(anchor) >= terminalBudgetResetAfter {
-							want = 0
+							want, wantStart = 0, time.Time{}
 						}
 						assert.Equal(t, want, budget.consecutive, label)
+						assert.Equal(t, wantStart, budget.streakStartedAt, label)
 						assert.True(t, budget.readySince.IsZero(), label)
 					case from != backend.ProvisionStatusReady && to == backend.ProvisionStatusReady:
 						assert.Equal(t, 2, budget.consecutive, label)
+						assert.Equal(t, streakStart, budget.streakStartedAt, label)
 						assert.Equal(t, now, budget.readySince, label)
 					default:
 						assert.Equal(t, 2, budget.consecutive, label)
+						assert.Equal(t, streakStart, budget.streakStartedAt, label)
 						assert.Equal(t, anchor, budget.readySince, label)
 					}
-					keep := counted && from == backend.ProvisionStatusFailing && to == backend.ProvisionStatusFailed
-					assert.Equal(t, keep, budget.lastFailureCounted, label)
+					want := noCountedFailure
+					if from == backend.ProvisionStatusFailing && to == backend.ProvisionStatusFailed {
+						want = standing
+					}
+					assert.Equal(t, want, budget.standing, label)
 				}
 			}
 		}
@@ -255,11 +363,12 @@ func TestInheritTerminalBudget_ReplacementCrossesTheReadyBoundary(t *testing.T) 
 		for _, to := range everyStatus {
 			predecessor := &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: from}
 			predecessor.TerminalBudget = TerminalBudget{
-				leaseUUID: testActorLeaseUUID, consecutive: 2, lastFailureCounted: true,
+				leaseUUID: testActorLeaseUUID, consecutive: 2, streakStartedAt: now.Add(-time.Hour),
+				standing: countedWithinBudget,
 			}
 			if from == backend.ProvisionStatusReady {
 				predecessor.TerminalBudget.readySince = readySince
-				predecessor.TerminalBudget.lastFailureCounted = false
+				predecessor.TerminalBudget.standing = noCountedFailure
 			}
 			replacement := &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: to}
 			replacement.InheritTerminalBudget(predecessor, now)
@@ -279,12 +388,13 @@ func TestInheritTerminalBudget_ReplacementCrossesTheReadyBoundary(t *testing.T) 
 		"another lease": {
 			LeaseUUID: "22222222-2222-4222-8222-222222222222", Status: backend.ProvisionStatusFailed,
 			TerminalBudget: TerminalBudget{
-				leaseUUID: "22222222-2222-4222-8222-222222222222", consecutive: 3, lastFailureCounted: true,
+				leaseUUID: "22222222-2222-4222-8222-222222222222", consecutive: 3,
+				streakStartedAt: now.Add(-time.Hour), standing: countedExhausting,
 			},
 		},
 		"an unbound budget": {
 			LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusFailed,
-			TerminalBudget: TerminalBudget{consecutive: 3, lastFailureCounted: true},
+			TerminalBudget: TerminalBudget{consecutive: 3, streakStartedAt: now.Add(-time.Hour), standing: countedExhausting},
 		},
 	}
 	for name, predecessor := range fresh {
@@ -309,19 +419,19 @@ func TestTerminalBudget_ObserveVerdictMatrix(t *testing.T) {
 		for _, reason := range reasons {
 			for bindingName, binding := range bindings {
 				for consecutive := range terminalBudgetThreshold + 2 {
-					for _, counted := range []bool{false, true} {
+					for _, standing := range everyStanding {
 						p := ProvisionState{
 							LeaseUUID: testActorLeaseUUID, Status: status, Reason: reason,
 							TerminalBudget: TerminalBudget{
-								leaseUUID: binding, consecutive: consecutive, lastFailureCounted: counted,
+								leaseUUID: binding, consecutive: consecutive, standing: standing,
 							},
 						}
 						got := p.ObserveTerminalBudget()
 						require.NotNil(t, got)
-						wantExhausted := status == backend.ProvisionStatusFailed && counted &&
+						wantExhausted := status == backend.ProvisionStatusFailed && standing == countedExhausting &&
 							consecutive >= terminalBudgetThreshold && reason == backend.ReasonContainerExited &&
 							bindingName == "same"
-						name := fmt.Sprintf("%s/%s/%s/%d/%t", status, reason, bindingName, consecutive, counted)
+						name := fmt.Sprintf("%s/%s/%s/%d/%d", status, reason, bindingName, consecutive, standing)
 						if wantExhausted {
 							assert.Equal(t, backend.TerminalVerdictExhausted, got.Verdict, name)
 						} else {
@@ -342,6 +452,9 @@ func TestTerminalBudget_ObserveVerdictMatrix(t *testing.T) {
 		"a fresh budget reports retry with no failures")
 }
 
+// The observation is the recorded fact. Neither the Ready anchor nor the
+// streak's age changes it: a streak recorded as within the budget stays retry
+// however old it grows, until the next counted failure re-evaluates it.
 func TestTerminalBudget_ObservationIgnoresElapsedTime(t *testing.T) {
 	t0 := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
 	p := ProvisionState{LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusReady}
@@ -350,14 +463,27 @@ func TestTerminalBudget_ObservationIgnoresElapsedTime(t *testing.T) {
 	p.TerminalBudget.readySince = t0.Add(-365 * 24 * time.Hour)
 	assert.Equal(t, first, p.ObserveTerminalBudget(),
 		"the observation is the recorded count: time alone never changes it")
+
+	failed := ProvisionState{
+		LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusFailed, Reason: backend.ReasonContainerExited,
+	}
+	failed.TerminalBudget = TerminalBudget{
+		leaseUUID: testActorLeaseUUID, consecutive: terminalBudgetThreshold,
+		streakStartedAt: t0, standing: countedWithinBudget,
+	}
+	young := failed.ObserveTerminalBudget()
+	assert.Equal(t, backend.TerminalVerdictRetry, young.Verdict)
+	failed.TerminalBudget.streakStartedAt = t0.Add(-365 * 24 * time.Hour)
+	assert.Equal(t, young, failed.ObserveTerminalBudget(),
+		"a streak recorded as too young stays retry however old it grows")
 }
 
 // The exported methods of *ProvisionState are the only budget mutators a
 // substrate can reach. The set is pinned, and every exported mutator in it is
 // driven below: whatever the starting budget and statuses, it can only move
-// the budget toward a reset. It never raises the count, never marks a failure
-// counted, and an exhausted verdict after it rests on a failure the actor had
-// already counted.
+// the budget toward a reset. It never raises the count, never moves a running
+// streak's start, never records a counted failure, and an exhausted verdict
+// after it rests on an exhausting failure the actor had already recorded.
 func TestTerminalBudget_ExportedMutatorsOnlyMoveTowardReset(t *testing.T) {
 	var exported []string
 	methods := reflect.TypeFor[*ProvisionState]()
@@ -383,15 +509,17 @@ func TestTerminalBudget_ExportedMutatorsOnlyMoveTowardReset(t *testing.T) {
 		}
 	}
 	anchors := []time.Time{{}, now.Add(-time.Hour), now.Add(-time.Minute), now}
+	streakStart := now.Add(-2 * time.Hour)
 	for name, apply := range mutators {
 		for _, binding := range []string{testActorLeaseUUID, "22222222-2222-4222-8222-222222222222"} {
 			for consecutive := range terminalBudgetThreshold + 2 {
-				for _, counted := range []bool{false, true} {
+				for _, standing := range everyStanding {
 					for _, anchor := range anchors {
 						for _, from := range everyStatus {
 							for _, to := range everyStatus {
 								before := TerminalBudget{
-									leaseUUID: binding, consecutive: consecutive, readySince: anchor, lastFailureCounted: counted,
+									leaseUUID: binding, consecutive: consecutive, streakStartedAt: streakStart,
+									readySince: anchor, standing: standing,
 								}
 								p := &ProvisionState{
 									LeaseUUID: testActorLeaseUUID, Status: from,
@@ -410,11 +538,16 @@ func TestTerminalBudget_ExportedMutatorsOnlyMoveTowardReset(t *testing.T) {
 								} else {
 									assert.Zero(t, after.consecutive, label)
 								}
-								if after.lastFailureCounted {
-									assert.True(t, bound && before.lastFailureCounted, label)
+								if after.consecutive > 0 {
+									assert.Equal(t, streakStart, after.streakStartedAt, "%s: a running streak keeps its start", label)
+								} else if after.consecutive == 0 && before.consecutive > 0 {
+									assert.True(t, after.streakStartedAt.IsZero(), "%s: a reset clears the start", label)
+								}
+								if after.standing != noCountedFailure {
+									assert.True(t, bound && after.standing == before.standing, label)
 								}
 								if p.ObserveTerminalBudget().Verdict == backend.TerminalVerdictExhausted {
-									assert.True(t, bound && before.lastFailureCounted &&
+									assert.True(t, bound && before.standing == countedExhausting &&
 										before.consecutive >= terminalBudgetThreshold, label)
 								}
 							}
@@ -800,7 +933,10 @@ func (h *budgetHarness) requireBudget(consecutive int, verdict backend.TerminalV
 	assert.Equal(h.t, verdict, observation.Verdict, "verdict")
 }
 
-// streakOfTwo leaves a Ready lease whose recorded streak is two tenant crashes.
+// streakOfTwo leaves a Ready lease whose recorded streak is two tenant crashes
+// and already older than the minimum span: the lease sat Failed for that span
+// after the second crash (Failed time is not Ready time, so it never resets).
+// The next counted crash therefore exhausts unless something reset the streak.
 func (h *budgetHarness) streakOfTwo() {
 	h.t.Helper()
 	h.provisionReady()
@@ -808,7 +944,25 @@ func (h *budgetHarness) streakOfTwo() {
 	h.provisionReady()
 	h.crash()
 	h.requireBudget(2, backend.TerminalVerdictRetry)
+	time.Sleep(terminalBudgetMinStreakSpan)
+	h.requireBudget(2, backend.TerminalVerdictRetry)
 	h.provisionReady()
+}
+
+// exhaust runs a real crash loop to an exhausted verdict: each crash soon
+// after Ready, with the lease Failed for half the minimum span between
+// crashes, so the third lands past the span.
+func (h *budgetHarness) exhaust() {
+	h.t.Helper()
+	for want := 1; want <= terminalBudgetThreshold; want++ {
+		if want > 1 {
+			time.Sleep(terminalBudgetMinStreakSpan / 2)
+		}
+		h.provisionReady()
+		time.Sleep(time.Minute)
+		h.crash()
+	}
+	h.requireBudget(terminalBudgetThreshold, backend.TerminalVerdictExhausted)
 }
 
 // ENG-799 AC1: the reported regression. Two updates that failed and rolled
@@ -832,21 +986,27 @@ func TestBudgetSequence_RecoveredUpdatesThenOneCrashDoNotClose(t *testing.T) {
 }
 
 // ENG-799 AC2: successful re-provisions between deaths. A real crash loop
-// (deaths shortly after each Ready) exhausts at the third death; a workload
-// that survives the reset period between crashes never exhausts.
+// (deaths shortly after each Ready) exhausts at the first counted death that is
+// both the third or later and 30 minutes into the streak; a workload that
+// survives the reset period between crashes never exhausts.
 func TestBudgetSequence_RepeatedCrashesAfterReprovision(t *testing.T) {
-	t.Run("crashing soon after each ready exhausts at the third", func(t *testing.T) {
+	t.Run("crashing soon after each ready exhausts once the streak spans the minimum", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			h := newBudgetHarness(t)
-			for want := 1; want <= terminalBudgetThreshold; want++ {
+			h.provisionReady()
+			time.Sleep(2 * time.Minute)
+			h.crash()
+			streakStart := time.Now()
+			for want := 2; ; want++ {
 				h.provisionReady()
 				time.Sleep(2 * time.Minute)
 				h.crash()
-				verdict := backend.TerminalVerdictRetry
-				if want == terminalBudgetThreshold {
-					verdict = backend.TerminalVerdictExhausted
+				if time.Since(streakStart) >= terminalBudgetMinStreakSpan {
+					h.requireBudget(want, backend.TerminalVerdictExhausted)
+					assert.Equal(t, 16, want, "a death every 2 minutes exhausts at the 16th, 30 minutes in")
+					return
 				}
-				h.requireBudget(want, verdict)
+				h.requireBudget(want, backend.TerminalVerdictRetry)
 			}
 		})
 	})
@@ -856,6 +1016,121 @@ func TestBudgetSequence_RepeatedCrashesAfterReprovision(t *testing.T) {
 			for range 2 * terminalBudgetThreshold {
 				h.provisionReady()
 				time.Sleep(15 * time.Minute)
+				h.crash()
+				h.requireBudget(1, backend.TerminalVerdictRetry)
+			}
+		})
+	})
+}
+
+// The minimum streak span, through the real state machine. An outage that
+// kills the workload again and again in quick succession never closes the
+// lease on its own; the verdict is decided only at a counted failure, so a
+// streak that reached the threshold too young waits for its next one; and the
+// sustained-Ready reset clears the streak's start with its count.
+func TestBudgetSequence_MinimumStreakSpan(t *testing.T) {
+	t.Run("an outage loop inside the span never exhausts", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			h := newBudgetHarness(t)
+			start := time.Now()
+			for want := 1; time.Since(start) < terminalBudgetMinStreakSpan-time.Minute; want++ {
+				h.provisionReady()
+				time.Sleep(2 * time.Minute)
+				h.crash()
+				h.requireBudget(want, backend.TerminalVerdictRetry)
+			}
+			assert.Greater(t, h.observation().ConsecutiveFailures, 2*terminalBudgetThreshold)
+		})
+	})
+
+	t.Run("the third counted failure after the span exhausts", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			h := newBudgetHarness(t)
+			h.provisionReady()
+			h.crash()
+			time.Sleep(10 * time.Minute) // Failed, retrying
+			h.provisionReady()
+			h.crash()
+			time.Sleep(terminalBudgetMinStreakSpan - 10*time.Minute)
+			h.provisionReady()
+			h.crash()
+			h.requireBudget(3, backend.TerminalVerdictExhausted)
+		})
+	})
+
+	t.Run("a young streak at the threshold waits for its next counted failure", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			h := newBudgetHarness(t)
+			for want := 1; want <= terminalBudgetThreshold; want++ {
+				h.provisionReady()
+				time.Sleep(time.Minute)
+				h.crash()
+				h.requireBudget(want, backend.TerminalVerdictRetry)
+			}
+			time.Sleep(time.Hour) // Failed: time alone changes nothing
+			h.requireBudget(terminalBudgetThreshold, backend.TerminalVerdictRetry)
+			h.provisionReady()
+			time.Sleep(time.Minute)
+			h.crash()
+			h.requireBudget(terminalBudgetThreshold+1, backend.TerminalVerdictExhausted)
+		})
+	})
+
+	t.Run("an uncounted failure past the span does not exhaust a young streak", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			h := newBudgetHarness(t)
+			for range terminalBudgetThreshold {
+				h.provisionReady()
+				h.crash()
+			}
+			time.Sleep(time.Hour)
+			h.provisionReady()
+			h.die(signaledRun, exitedWith(137)) // operator kill: never counts
+			h.requireBudget(terminalBudgetThreshold, backend.TerminalVerdictRetry)
+		})
+	})
+
+	t.Run("a sustained ready resets the streak start with its count", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			h := newBudgetHarness(t)
+			h.streakOfTwo() // two crashes, more than 30 minutes old
+			time.Sleep(terminalBudgetResetAfter + time.Minute)
+			h.crash() // the sustained Ready reset the streak: this starts a new one
+			h.requireBudget(1, backend.TerminalVerdictRetry)
+			for want := 2; want <= terminalBudgetThreshold; want++ {
+				h.provisionReady()
+				time.Sleep(time.Minute)
+				h.crash()
+				h.requireBudget(want, backend.TerminalVerdictRetry)
+			}
+		})
+	})
+
+	t.Run("ready just short of the reset period exhausts once the streak spans the minimum", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			h := newBudgetHarness(t)
+			// A death every 9 minutes of Ready: the reset never fires, so the
+			// streak keeps its start. Deaths at 9, 18, 27, 36 and 45 minutes;
+			// the fifth is the first 30 minutes after the first.
+			for want := 1; want <= 5; want++ {
+				h.provisionReady()
+				time.Sleep(terminalBudgetResetAfter - time.Minute)
+				h.crash()
+				verdict := backend.TerminalVerdictRetry
+				if want == 5 {
+					verdict = backend.TerminalVerdictExhausted
+				}
+				h.requireBudget(want, verdict)
+			}
+		})
+	})
+
+	t.Run("ready for the reset period between deaths never exhausts", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			h := newBudgetHarness(t)
+			for range 8 {
+				h.provisionReady()
+				time.Sleep(terminalBudgetResetAfter)
 				h.crash()
 				h.requireBudget(1, backend.TerminalVerdictRetry)
 			}
@@ -893,6 +1168,7 @@ func TestBudgetSequence_MixedCausesCountOnlyTenantExits(t *testing.T) {
 		h.refuseProvision()
 		h.requireBudget(2, backend.TerminalVerdictRetry)
 
+		time.Sleep(terminalBudgetMinStreakSpan) // Failed: the streak ages, nothing resets
 		h.provisionReady()
 		h.crash()
 		h.requireBudget(3, backend.TerminalVerdictExhausted)
@@ -910,11 +1186,7 @@ func TestBudgetSequence_MixedCausesCountOnlyTenantExits(t *testing.T) {
 func TestBudgetSequence_ExhaustedOnlyWhileTheCountedFailureStands(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newBudgetHarness(t)
-		for range terminalBudgetThreshold {
-			h.provisionReady()
-			h.crash()
-		}
-		h.requireBudget(3, backend.TerminalVerdictExhausted)
+		h.exhaust()
 
 		h.startProvision()
 		h.requireBudget(3, backend.TerminalVerdictRetry)
@@ -996,13 +1268,15 @@ func TestBudgetSequence_ShortReadyBoundaryKeepsTheStreak(t *testing.T) {
 }
 
 // The review's P2: the reset is anchored on Ready entry, not on the start of
-// the attempt, so a slow health-gated startup does not hide a crash loop.
+// the attempt, so a slow health-gated startup does not hide a crash loop. The
+// slow startups also carry the streak past the minimum span: deaths at 16.5,
+// 33 and 49.5 minutes.
 func TestBudgetSequence_SlowStartupCrashLoopExhausts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newBudgetHarness(t)
 		for want := 1; want <= terminalBudgetThreshold; want++ {
 			h.startProvision()
-			time.Sleep(12 * time.Minute) // health-gated startup
+			time.Sleep(16 * time.Minute) // health-gated startup
 			h.completeProvision()
 			time.Sleep(30 * time.Second)
 			h.crash()
@@ -1029,11 +1303,7 @@ func TestBudgetSequence_TenantRestartOrUpdateResetsTheStreak(t *testing.T) {
 		t.Run(string(kind)+" from failed", func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				h := newBudgetHarness(t)
-				for range terminalBudgetThreshold {
-					h.provisionReady()
-					h.crash()
-				}
-				h.requireBudget(3, backend.TerminalVerdictExhausted)
+				h.exhaust()
 				h.maintain(kind, maintenanceSucceeds)
 				h.requireBudget(0, backend.TerminalVerdictRetry)
 			})
@@ -1121,7 +1391,7 @@ func TestMaintenanceRecoveredFailureRecordsOnce(t *testing.T) {
 	actor.cfg.Metrics = metrics
 	store.UpdateFn(testActorLeaseUUID, func(state *ProvisionState) {
 		state.TerminalBudget = TerminalBudget{
-			leaseUUID: testActorLeaseUUID, consecutive: 2, lastFailureCounted: true,
+			leaseUUID: testActorLeaseUUID, consecutive: 2, standing: countedWithinBudget,
 		}
 	})
 	projection := MaintenanceRecoveryProjection{

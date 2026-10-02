@@ -11,8 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Backends report `terminal_budget` (`verdict`, `consecutive_failures`) on
   `GET /provisions` and `GET /provisions/{lease_uuid}`: the lease's
   consecutive-failure budget, which decides whether providerd closes a failing
-  lease for repeated failure. `consecutive_failures` is the recorded count;
-  time alone never changes it. Tenants see the same field on
+  lease for repeated failure. `consecutive_failures` is the recorded count and
+  `verdict` the decision recorded at the last counted failure; time alone
+  never changes either. Tenants see the same field on
   `GET /v1/leases/{uuid}/status` and `/provision`, next to the unchanged
   `fail_count`. (ENG-799)
 - Metrics `fred_docker_backend_lease_failures_total{attribution}`
@@ -1090,10 +1091,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- A lease is closed for repeated failures only after three consecutive failures
-  of the tenant's own workload, and that count resets once the lease has been
-  Ready for ten minutes. Restarts, updates, rollbacks, host reboots, backend
-  restarts and platform failures no longer count. (ENG-799)
+- A lease is closed for repeated failures only after three or more consecutive
+  failures of the tenant's own workload spanning at least 30 minutes: the
+  failure that closes it must land 30 minutes or more after the streak's first.
+  A burst of failures during an outage only re-provisions the lease; a streak
+  that reached three too quickly is re-evaluated at its next failure. The count,
+  and the streak's start, reset once the lease has been Ready for ten minutes.
+  Restarts, updates, rollbacks, host reboots, backend restarts and platform
+  failures no longer count. (ENG-799)
   - Two updates that failed and rolled back no longer close a lease at its next
     crash, and a host reboot no longer spends a strike.
   - A death counts only when the docker-backend's event stream saw the
