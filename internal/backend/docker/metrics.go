@@ -396,13 +396,15 @@ var (
 		Help:      "Managed XFS volumes audited for project-ID drift, by outcome",
 	}, []string{"outcome"})
 
-	// volumesWithProjidDrift is the number of managed volumes whose last
-	// audit found drift, recomputed after every audit pass.
+	// volumesWithProjidDrift is the number of managed volumes with recorded
+	// drift, recomputed after every audit pass. A recorded drift stays until a
+	// later audit of the volume finishes undisturbed and clean, or the volume
+	// leaves the inventory.
 	volumesWithProjidDrift = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "volumes_with_projid_drift",
-		Help:      "Managed XFS volumes whose last project-ID audit found drift",
+		Help:      "Managed XFS volumes with project-ID drift recorded by the audit and not since found clean",
 	})
 
 	// tenantSeccompProfileReady is 1 when the last request for the tenant
