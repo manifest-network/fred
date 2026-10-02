@@ -736,17 +736,36 @@ var (
 	// dieEventDroppedTotal counts container-death observations that
 	// routeActorObservation refused. Refusal means the backend is stopping,
 	// the actor inbox is full, recovery owns the actor key, or the exact
-	// provision generation that produced the event is no longer current. The
-	// reconciler re-detects a missed current-generation death on its next cycle
-	// (default 5m); stale-generation observations are intentionally discarded.
-	// Deaths positively owned by an active actor-close scope are excluded: they
-	// no longer require ordinary runtime-failure delivery.
+	// provision generation that produced the event is no longer current. For
+	// source event_loop it also counts deaths the event loop could not
+	// dispatch: its queue was full, or storage identity could not be
+	// re-verified. The reconciler re-detects a missed current-generation death
+	// on its next cycle (default 5m), without live provenance, so it is
+	// attributed unknown and never counts toward the terminal budget (ENG-799);
+	// stale-generation observations are intentionally discarded. Deaths
+	// positively owned by an active actor-close scope are excluded: they no
+	// longer require ordinary runtime-failure delivery.
 	dieEventDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "die_event_dropped_total",
-		Help:      "Container-death observations refused because the backend stopped, the actor was busy or recovery-owned, or the provision generation was stale; excludes deaths owned by an active actor close",
+		Help:      "Container-death observations refused because the backend stopped, the actor was busy or recovery-owned, or the provision generation was stale, or (event_loop) not dispatched because its queue was full or storage identity was unverified; excludes deaths owned by an active actor close",
 	}, []string{"source"})
+
+	// containerEventStreamTotal counts the container event loop's subscription
+	// lifecycle (ENG-799). The live stream is the only source of the provenance
+	// that lets a death count toward a lease's terminal budget, so a loop that
+	// keeps reconnecting, or stops, leaves crash loops unclosable: deaths in a
+	// gap, and the first death of a run that predates the stream, are
+	// attributed unknown. A counter, not a last-success gauge, per the deploy
+	// rules. The label set is containerEventStreamOutcomes, pre-initialized in
+	// init.
+	containerEventStreamTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "container_event_stream_total",
+		Help:      "Container event subscription lifecycle: connected (opened after storage re-verification), reconnect (ended or could not open; retried with backoff), exited (stopped at shutdown or after storage authority was withdrawn)",
+	}, []string{"outcome"})
 
 	// leaseFailuresTotal counts every failure the lease state machine records
 	// in a lease's consecutive-failure terminal budget (ENG-799), by who caused
@@ -1095,6 +1114,9 @@ func init() {
 	// attribution reads 0, not no-data, before the first failure.
 	for _, attribution := range failurecause.Labels() {
 		leaseFailuresTotal.WithLabelValues(attribution).Add(0)
+	}
+	for _, outcome := range containerEventStreamOutcomes {
+		containerEventStreamTotal.WithLabelValues(outcome).Add(0)
 	}
 	for _, kind := range []string{"active", "retained"} {
 		imageUnpinnedGenerations.WithLabelValues(kind).Set(0)

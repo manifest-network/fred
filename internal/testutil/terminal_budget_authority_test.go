@@ -41,7 +41,7 @@ const (
 	terminalBudgetMintFile    = "internal/backend/shared/leasesm/terminal_budget.go"
 	terminalBudgetDecodeFile  = "internal/provisioner/terminalverdict/verdict.go"
 	terminalBudgetDeathFile   = "internal/backend/shared/leasesm/lease_sm.go"
-	terminalBudgetSessionFile = "internal/backend/docker/recover.go"
+	terminalBudgetSessionFile = "internal/backend/docker/container_event_loop.go"
 )
 
 var terminalVerdictAuthorityFiles = []string{
