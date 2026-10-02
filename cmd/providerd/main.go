@@ -544,14 +544,9 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to bind reconciliation coordinator: %w", err)
 	}
 	reconciler, err := provisioner.NewReconciler(provisioner.ReconcilerConfig{
-		Interval:    cfg.ReconciliationInterval,
-		Coordinator: reconciliationCoordinator,
-		// A sweep already reading backend inventories when shutdown begins
-		// may finish them and its projection for up to half of
-		// shutdown_timeout, alongside the provision drain below. A timeout
-		// too short to halve keeps its whole value rather than falling back
-		// to the reconciler's default, which would exceed it.
-		ShutdownSweepGrace: cmp.Or(cfg.ShutdownTimeout/2, cfg.ShutdownTimeout),
+		Interval:           cfg.ReconciliationInterval,
+		Coordinator:        reconciliationCoordinator,
+		ShutdownSweepGrace: shutdownSweepGraceFor(cfg.ShutdownTimeout),
 	}, provisionMgr)
 	if err != nil {
 		return fmt.Errorf("failed to create reconciler: %w", err)
@@ -837,4 +832,13 @@ func runInitialProviderWork(ctx context.Context, withdraw, reconcile func(contex
 		}
 	}
 	return ctx.Err()
+}
+
+// shutdownSweepGraceFor is how long a sweep already reading backend
+// inventories when shutdown begins may finish them and its projection: half of
+// shutdown_timeout, alongside the provision drain. A timeout too short to
+// halve keeps its whole value rather than falling back to the reconciler's
+// default, which would exceed it.
+func shutdownSweepGraceFor(shutdownTimeout time.Duration) time.Duration {
+	return cmp.Or(shutdownTimeout/2, shutdownTimeout)
 }

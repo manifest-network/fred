@@ -212,3 +212,26 @@ func TestInitialProviderWork_TransientFailureStillReconciles(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"withdraw", "reconcile"}, calls)
 }
+
+// TestShutdownSweepGraceForStaysWithinTheShutdownTimeout pins the providerd
+// wiring of the reconciler's sweep drain: the grace is never zero, which the
+// reconciler would read as its 15s default, and never exceeds the configured
+// shutdown_timeout, even when that timeout is too short to halve.
+func TestShutdownSweepGraceForStaysWithinTheShutdownTimeout(t *testing.T) {
+	for _, test := range []struct {
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{timeout: time.Nanosecond, want: time.Nanosecond},
+		{timeout: 2 * time.Nanosecond, want: time.Nanosecond},
+		{timeout: time.Second, want: 500 * time.Millisecond},
+		{timeout: 30 * time.Second, want: 15 * time.Second},
+	} {
+		t.Run(test.timeout.String(), func(t *testing.T) {
+			got := shutdownSweepGraceFor(test.timeout)
+			assert.Equal(t, test.want, got)
+			assert.Positive(t, got)
+			assert.LessOrEqual(t, got, test.timeout)
+		})
+	}
+}
