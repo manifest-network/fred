@@ -1142,7 +1142,7 @@ func (b *Backend) destroyReapingVolumesUsing(
 		return false
 	}
 	// CONFIRM BEFORE DROPPING THE RECORD. Every destroy above reported success, but a
-	// destroy is an os.RemoveAll that deliberately treats an already-absent path as done —
+	// destroy deliberately treats an already-absent path as done —
 	// so "all succeeded" is also what a vanished mount looks like. If the root went away
 	// after the enumeration, each name was removed from a filesystem that is no longer
 	// there, and deleting the record here would drop the only accounting for volumes that

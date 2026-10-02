@@ -325,14 +325,21 @@ the stage, latches and stops the current backend instance, and requires a fresh
 
 Destruction has distinct authority:
 `.fred-xfs-delete-<project-id>-<managed-volume>` is created empty, normalized to
-project ID zero, and parent-synced before the final volume is changed. Recovery
+project ID zero, and parent-synced before the final volume is changed. Cleanup
 re-normalizes and re-attests that sibling, deletes only the encoded final tree,
 syncs its absence, and requires numeric block and inode usage for the encoded
 project ID to be zero before clearing its dquot. This detects open-but-unlinked
 files that pathname absence cannot. The sibling is removed and the parent
-synced only after the strict clear; until then it prevents readiness and
-same-name creation. Offline proof refuses the private authority rather than
-turning it into mutation permission.
+synced only after the strict clear; until then the project ID stays reserved
+and same-name creation is refused. The tenant controls the shape of the tree
+being removed, so removal uses `internal/fstree`, which bounds open
+descriptors, depth and work, acts only through descriptor-relative calls, and
+never follows a symlink or crosses a mount. A failure confined to that volume
+holds the deletion for that volume and retries it in the background instead of
+stopping the backend; the held authority keeps the caller pending until the
+volume is durably gone. Only a contradiction of the authority itself, or an
+outcome that cannot be classified, latches the backend. Offline proof refuses
+the private authority rather than turning it into mutation permission.
 
 ZFS retains an exact
 unmounted child after an ambiguous create and normal sealed startup remounts and

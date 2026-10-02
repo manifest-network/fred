@@ -35,6 +35,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   a flapping event stream, sustained `platform` failures. Never alert on
   `maintenance` or `tenant_workload`, so ordinary tenant updates and crashes do
   not page. (ENG-799)
+- docker-backend metrics for held volume deletions:
+  `fred_docker_backend_volume_delete_holds{phase}`,
+  `fred_docker_backend_volume_delete_outcomes_total{outcome}`,
+  `fred_docker_backend_volume_delete_held_residual_mb` and
+  `fred_docker_backend_close_intents_delete_held`; for tenant tree removal,
+  `fred_docker_backend_tree_removals_total{site,outcome}` and
+  `fred_docker_backend_tree_removal_cuts_total{site}`; and a `delete_pending`
+  outcome on `fred_docker_backend_volume_quota_backfill_total`. (ENG-1117)
+- Tenant reason `VolumeDeletePending`: a provision is refused with it while an
+  earlier deletion of a volume it needs is still finishing, and can be retried
+  later. (ENG-1117)
 - `backends[].fenced: true` contains a backend the operator no longer trusts
   without removing it from the topology. providerd sends it nothing: its client
   holds no address, key or TLS material, so the backend's revoked certificate
@@ -1217,6 +1228,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `docker info`: it backs off and reconnects with a fresh event session. It
   stops only at shutdown or once the backend's storage authority is withdrawn.
   (ENG-799)
+- docker-backend: a volume whose deletion cannot finish no longer stops the
+  backend or blocks its startup. The deletion is held for that volume, keeps
+  its delete stage and project ID, and is retried in the background, and the
+  closing lease stays pending until the volume is gone. Tenant directory trees
+  are removed with bounded resources. (ENG-1117)
 - A sweep canceled at shutdown between its provision and retention reads no
   longer widens the recovery its interrupted marker needs. It is abandoned
   before any response is disposed, so after the restart only the backends that
@@ -1861,10 +1877,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   authority, removes the final tree in place, parent-syncs its absence, proves
   both block and inode usage are zero (including open-but-unlinked files),
   strictly clears every project-quota limit, and removes the authority last.
-  Failure preserves the authority and blocks same-name creation. A runtime
-  failure gracefully drains and exits status 1; a startup recovery failure
-  exits 1 before listener bind. The supervisor's fresh `Start` must prove
-  completion. Offline preflight and storage initialization reject
+  Failure preserves the authority and blocks same-name creation. A failure
+  confined to that volume holds its deletion and retries it in the background
+  while the backend serves (ENG-1117); only a contradiction of the authority
+  itself or an unclassifiable outcome withdraws storage authority and exits
+  status 1. Offline preflight and storage initialization reject
   this upgraded private evidence without mutating it.
   (ENG-632)
 

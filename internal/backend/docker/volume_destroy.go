@@ -18,9 +18,11 @@ package docker
 // `b.volumes.Destroy(...)` a compile error. Its closure-only read projection
 // cannot be asserted back to a writer, while Backend retains only opaque,
 // Started-subject executors and target-free background workflows. The raw
-// destroy sink therefore
-// cannot be recovered from Backend; this ownership choke point is the only
-// production caller of the guarded destroy operation. (ENG-658)
+// destroy sink therefore cannot be recovered from Backend. Every close- and
+// retention-driven destroy passes this ownership choke point (ENG-658). The other
+// guarded destroys are bound to a Started operation subject and name only that
+// subject's own volumes (failed-provision cleanup and restore rollback), and the
+// hold executor only retries a deletion one of them already admitted (ENG-1117).
 
 import (
 	"context"
@@ -196,7 +198,7 @@ func (b *Backend) snapshotVolumeClaims() (*volumeClaims, error) {
 // This is the destroy-time half of the serialization the claim table cannot provide
 // on its own (ENG-681). The table is a point-in-time answer; the writer that races it
 // is Provision publishing its reservation, so the check that has to be atomic with the
-// RemoveAll is this one, taken under the volume's stripe.
+// destroy is this one, taken under the volume's stripe.
 //
 // It walks BACKWARDS from the name to its lease rather than rebuilding the table, so it
 // costs one map lookup plus one lease's items — it runs once per name inside the destroy
@@ -289,7 +291,7 @@ func (r destroyReport) err() error {
 // guards against is a collector acting on a stale one.
 //
 // The table is a snapshot, so it is NOT on its own a verdict that survives to the
-// RemoveAll it authorizes. What makes the decision atomic is destroyOne: it takes the
+// destroy it authorizes. What makes the decision atomic is destroyOne: it takes the
 // volume name's stripe — the same one setupVolBinds holds across its create-or-reuse —
 // and re-reads the live claim under it. A re-provision that has adopted the directory is
 // therefore seen and refused, rather than having the bytes deleted from under it mid-loop
@@ -432,7 +434,7 @@ func (o *volumeOp) destroy(
 //
 // The re-check is what makes the whole file's invariant hold under concurrency. The table
 // destroy() consulted is a snapshot; setupVolBinds' create-or-reuse takes the same stripe,
-// so once this holds it the answer cannot change underneath the RemoveAll, and a
+// so once this holds it the answer cannot change underneath the destroy, and a
 // re-provision that adopted the directory is seen rather than deleted out from under
 // (ENG-681). A provision that arrives entirely after this check still loses its bytes —
 // but that is the give-up's decision about abandoned data (ENG-676), not a torn read.
@@ -446,7 +448,7 @@ func (o *volumeOp) destroyOne(
 		// canonical ones — so there is no create to serialize against here, and no
 		// live claim can key it (TestVolumeClaims_KeysAreNeverRetainedNames). Taking
 		// the stripe would only block an unrelated volume's create for the length of
-		// this RemoveAll, and this is the bulk path (evictOldest can pass 32 records'
+		// this destroy, and this is the bulk path (evictOldest can pass 32 records'
 		// worth of retained names through a single close).
 		return volumeClaim{}, false, mutations.destroyVolume(ctx, name)
 	}
