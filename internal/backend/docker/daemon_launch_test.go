@@ -25,11 +25,10 @@ import (
 func TestDaemonLaunchResponsesSeparateBusinessFailureFromCompletion(t *testing.T) {
 	for _, status := range []int{http.StatusCreated, http.StatusConflict, http.StatusForbidden, http.StatusInternalServerError} {
 		scope := newDaemonLaunchScope(t.Context(), nil)
-		transport := daemonLaunchTransport{scope: scope, next: dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		transport := daemonLaunchTransport{scope: scope, profiles: tenantSeccompTestProfiles(), next: dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) {
 			return imageSecurityResponse(status, `{}`), nil
 		})}
-		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://docker.invalid/v1.51/containers/create", nil)
-		require.NoError(t, err)
+		request := tenantSeccompCreateRequest(t, t.Context(), nil)
 		response, err := transport.RoundTrip(request)
 		require.NoError(t, err)
 		require.NoError(t, response.Body.Close())
@@ -169,7 +168,7 @@ func TestDaemonLaunchScopeFencesDetachedAndLateRequests(t *testing.T) {
 		scope := newDaemonLaunchScope(t.Context(), nil)
 		var entered atomic.Int64
 		started, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
-		transport := daemonLaunchTransport{scope: scope, next: dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		transport := daemonLaunchTransport{scope: scope, profiles: tenantSeccompTestProfiles(), next: dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) {
 			entered.Add(1)
 			close(started)
 			<-release
@@ -177,8 +176,7 @@ func TestDaemonLaunchScopeFencesDetachedAndLateRequests(t *testing.T) {
 		})}
 		// A Compose child may intentionally replace its context. The transport
 		// instance still binds it to this exact invocation and closes admission.
-		request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://docker.invalid/v1.51/containers/create", nil)
-		require.NoError(t, err)
+		request := tenantSeccompCreateRequest(t, context.Background(), nil)
 		if enterBeforeClose {
 			go func() {
 				defer close(returned)
@@ -192,7 +190,7 @@ func TestDaemonLaunchScopeFencesDetachedAndLateRequests(t *testing.T) {
 		scope.close()
 		finished := make(chan daemonLaunchOutcome, 1)
 		go func() { finished <- scope.finish(errors.New("Compose returned")) }()
-		_, err = transport.RoundTrip(request)
+		_, err := transport.RoundTrip(request)
 		require.ErrorContains(t, err, "invocation has ended")
 		if enterBeforeClose {
 			select {

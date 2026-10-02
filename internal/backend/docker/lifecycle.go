@@ -34,9 +34,11 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/docker/imagefetch"
+	"github.com/manifest-network/fred/internal/backend/docker/tenantseccomp"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/maintenanceid"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // Labels used for tracking managed containers.
@@ -140,14 +142,26 @@ type DockerClient struct {
 	inspections    *imageInspectionCoordinator
 	backendName    string
 	newImageLoader func(string, int64) (*imagefetch.Loader, error)
+	// tenantSeccomp is the profile source its creators, its wire check and
+	// its census share.
+	tenantSeccomp imageexec.TenantSeccompSource
 }
 
 // NewDockerClient connects to Docker and requires the image execution API
 // prerequisite before returning an executable client. The context is used only
 // during construction. The backendName parameter scopes
 // all list/filter/event operations so that multiple backend instances sharing
-// the same Docker daemon do not interfere with each other.
+// the same Docker daemon do not interfere with each other. Every container the
+// client creates, directly or through Compose, carries the process's tenant
+// seccomp profile.
 func NewDockerClient(ctx context.Context, host string, backendName string) (*DockerClient, error) {
+	return newDockerClient(ctx, host, backendName, tenantseccomp.Process())
+}
+
+// newDockerClient binds image admission, every creation sink and the
+// pre-dispatch wire check to one tenant profile source.
+func newDockerClient(ctx context.Context, host string, backendName string, source imageexec.TenantSeccompSource) (*DockerClient, error) {
+	profiles := observedTenantSeccomp{source: source}
 	opts := []client.Opt{
 		client.WithAPIVersionNegotiation(),
 	}
@@ -172,24 +186,34 @@ func NewDockerClient(ctx context.Context, host string, backendName string) (*Doc
 	}
 	httpClient := cli.HTTPClient()
 	observer := new(daemonLaunchObserver)
-	httpClient.Transport = daemonContextTransport{next: httpClient.Transport, observer: observer}
+	httpClient.Transport = daemonContextTransport{next: httpClient.Transport, observer: observer, profiles: profiles}
 	if err := client.WithHTTPClient(httpClient)(cli); err != nil {
 		_ = cli.Close()
 		return nil, err
 	}
 
-	images, creator, err := imageexec.NewDockerRuntime(ctx, cli)
+	images, creator, err := imageexec.NewDockerRuntime(ctx, cli, profiles)
 	if err != nil {
 		_ = cli.Close()
 		return nil, err
 	}
 	return &DockerClient{
 		client: newDockerSDKView(cli), images: images, creator: creator,
-		launchObserver: observer, backendName: backendName,
+		launchObserver: observer, backendName: backendName, tenantSeccomp: profiles,
 		newImageLoader: func(root string, maxBytes int64) (*imagefetch.Loader, error) {
 			return imagefetch.NewLoader(cli, root, maxBytes)
 		},
 	}, nil
+}
+
+// requireTenantSeccompProfile reports whether this client's creations can
+// carry the tenant profile now. It asks the source again on every call.
+func (d *DockerClient) requireTenantSeccompProfile() error {
+	if d == nil || util.IsNilInterface(d.tenantSeccomp) {
+		return fmt.Errorf("%w: the Docker client has no profile source", tenantseccomp.ErrRefused)
+	}
+	_, err := d.tenantSeccomp.TenantSeccompProfile()
+	return err
 }
 
 // Close closes the Docker client.

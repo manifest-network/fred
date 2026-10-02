@@ -18,6 +18,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/docker/tenantseccomp"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
@@ -261,7 +262,7 @@ func (d *DockerClient) createCompensationContainer(ctx context.Context, snapshot
 		config.Labels[LabelCreatedAt] = time.Now().Format(time.RFC3339)
 		var err error
 		created, err = d.creator.CreateProjectContainer(ctx, snapshot.Binding, &config, snapshot.Host, snapshot.Networks, snapshot.Name)
-		return err
+		return refuseWithoutTenantSeccomp(tenantSeccompSinkCompensation, err)
 	})
 	return created.ID, outcome
 }
@@ -271,7 +272,8 @@ func (d *DockerClient) prepareCompensationContainer(ctx context.Context, subject
 	if err != nil {
 		return compensationContainer{}, err
 	}
-	return bindCompensationContainer(d.images, subject, snapshot, image)
+	prepared, err := bindCompensationContainer(d.images, subject, snapshot, image)
+	return prepared, refuseWithoutTenantSeccomp(tenantSeccompSinkCompensation, err)
 }
 
 // bindCompensationContainer joins the exact source topology and immutable image
@@ -336,7 +338,23 @@ func snapshotCompensationContainer(resp container.InspectResponse, mounts []Cont
 		// to reserve the old endpoint. Preserve explicit IPAM and aliases only.
 		networks[name] = &network.EndpointSettings{IPAMConfig: endpoint.IPAMConfig, Aliases: slices.Clone(endpoint.Aliases), DriverOpts: maps.Clone(endpoint.DriverOpts), GwPriority: endpoint.GwPriority}
 	}
-	return &compensationContainerRecord{Name: strings.TrimPrefix(resp.Name, "/"), ImageID: id, Config: &config, Host: resp.HostConfig, Networks: &network.NetworkingConfig{EndpointsConfig: networks}, Mounts: slices.Clone(mounts)}
+	return &compensationContainerRecord{Name: strings.TrimPrefix(resp.Name, "/"), ImageID: id, Config: &config, Host: compensationHostConfig(resp.HostConfig), Networks: &network.NetworkingConfig{EndpointsConfig: networks}, Mounts: slices.Clone(mounts)}
+}
+
+// compensationHostConfig is the one conversion of a captured or decoded host
+// configuration into a compensation snapshot. The private copy keeps every
+// security option except a seccomp profile, so a replayed snapshot never
+// carries a stale profile (and a plan never carries an inline profile per
+// instance); the creation sink adds the current profile.
+func compensationHostConfig(host *container.HostConfig) *container.HostConfig {
+	if host == nil {
+		return nil
+	}
+	snapshot := *host
+	if host.SecurityOpt != nil {
+		snapshot.SecurityOpt = tenantseccomp.WithoutSeccomp(host.SecurityOpt)
+	}
+	return &snapshot
 }
 
 func newCompensationStorageMutations(runner substratemutation.Runner, subject shared.MaintenanceCompensationSubject, ops storageMutationOperations) *storageMutations {
@@ -393,6 +411,10 @@ func (b *Backend) doMaintenanceCompensation(ctx context.Context, mutations *stor
 			_, err := b.classifyMaintenanceCompensation(ctx, subject)
 			return err
 		})
+	}
+	// Refuse before binding the source or retiring the failed target.
+	if err := mutations.requireTenantSeccomp(); err != nil {
+		return err
 	}
 	plan, err := decodeCompensationSourcePlan(subject.FailedTarget(), subject.Plan())
 	if err != nil {

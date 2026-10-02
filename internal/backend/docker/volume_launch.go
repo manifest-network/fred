@@ -201,12 +201,12 @@ func (b *Backend) launchCompose(ctx context.Context, mutations *storageMutations
 	}
 	prepared, err := mutations.ops.compose.PrepareProject(project, composeProjectImages(project, params.ImageSetups))
 	if err != nil {
-		return settledLaunch{}, err
+		return settledLaunch{}, refuseWithoutTenantSeccomp(mutations.tenantSeccompSink(), err)
 	}
 	composeStartedAt := time.Now()
 	launch, err := b.volumeLaunches.compose(ctx, volumes, prepared, opts)
 	mutations.observeReplacementPhase(phaseComposeUp, composeStartedAt)
-	return launch, err
+	return launch, refuseWithoutTenantSeccomp(mutations.tenantSeccompSink(), err)
 }
 
 // The complete launch owns the phase boundaries, while the exact physical

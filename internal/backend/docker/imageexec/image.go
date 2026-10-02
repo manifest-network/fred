@@ -15,10 +15,12 @@ var (
 	ErrForeignProject = errors.New("compose project belongs to another admitter")
 )
 
-// issuer binds admission and execution to the source captured at construction.
-// It is deliberately nonzero-sized so distinct issuers have distinct addresses.
+// issuer binds admission and execution to the source captured at construction,
+// and creation to the tenant seccomp profile source. It is deliberately
+// nonzero-sized so distinct issuers have distinct addresses.
 type issuer struct {
-	source Source
+	source   Source
+	profiles TenantSeccompSource
 }
 
 type imageRecord struct {

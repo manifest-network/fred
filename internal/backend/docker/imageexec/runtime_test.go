@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker/client"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/docker/tenantseccomp"
 )
 
 type runtimeRequestLog struct {
@@ -104,7 +105,7 @@ func TestDockerRuntimeNegotiatesVersionBeforeGrantingCapabilities(t *testing.T) 
 			if tc.clientVersion == "" && sdk.ClientVersion() != "1.51" {
 				t.Fatalf("fixture must begin at SDK default API 1.51, got %s", sdk.ClientVersion())
 			}
-			admitter, creator, err := imageexec.NewDockerRuntime(t.Context(), sdk)
+			admitter, creator, err := imageexec.NewDockerRuntime(t.Context(), sdk, tenantseccomp.Process())
 			if sdk.ClientVersion() != tc.wantVersion {
 				t.Fatalf("client API = %s; want %s", sdk.ClientVersion(), tc.wantVersion)
 			}
@@ -146,7 +147,7 @@ func TestDockerRuntimeVersionQueryFailureGrantsNoCapabilities(t *testing.T) {
 		}
 		http.Error(w, "version query unavailable", http.StatusInternalServerError)
 	}))
-	admitter, creator, err := imageexec.NewDockerRuntime(t.Context(), sdk)
+	admitter, creator, err := imageexec.NewDockerRuntime(t.Context(), sdk, tenantseccomp.Process())
 	if err == nil || !strings.Contains(err.Error(), "version query unavailable") || admitter != nil || creator != nil {
 		t.Fatalf("unavailable runtime = %v, %v, %v; want version-query error and no capabilities", admitter, creator, err)
 	}
@@ -161,7 +162,7 @@ func TestDockerRuntimeConnectionFailureGrantsNoCapabilities(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = sdk.Close() })
-	admitter, creator, err := imageexec.NewDockerRuntime(t.Context(), sdk)
+	admitter, creator, err := imageexec.NewDockerRuntime(t.Context(), sdk, tenantseccomp.Process())
 	if err == nil || !client.IsErrConnectionFailed(err) || admitter != nil || creator != nil {
 		t.Fatalf("disconnected runtime = %v, %v, %v; want connection error and no capabilities", admitter, creator, err)
 	}
@@ -193,7 +194,7 @@ func TestDockerRuntimeCanceledVersionQueryGrantsNoCapabilities(t *testing.T) {
 	}
 	finished := make(chan result, 1)
 	go func() {
-		a, c, err := imageexec.NewDockerRuntime(ctx, sdk)
+		a, c, err := imageexec.NewDockerRuntime(ctx, sdk, tenantseccomp.Process())
 		finished <- result{a, c, err}
 	}()
 	select {
@@ -228,7 +229,7 @@ func TestDockerRuntimeCanceledAfterSuccessfulProbeGrantsNoCapabilities(t *testin
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	source := cancelAfterVersionSource{fakeSource: &fakeSource{version: "1.51"}, cancel: cancel}
-	admitter, creator, err := imageexec.NewDockerRuntime(ctx, source)
+	admitter, creator, err := imageexec.NewDockerRuntime(ctx, source, tenantseccomp.Process())
 	if !errors.Is(err, context.Canceled) || admitter != nil || creator != nil {
 		t.Fatalf("runtime canceled after successful probe = %v, %v, %v; want cancellation and no capabilities", admitter, creator, err)
 	}

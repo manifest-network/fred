@@ -146,8 +146,10 @@ func decodeCompensationSourceSnapshot(encoded []byte) (compensationSourcePlan, e
 			usedLabels[key] = true
 			config.Labels[label] = value
 		}
+		// A plan persisted before the profile existed, or by any other
+		// writer, may name a seccomp profile; decoding drops it.
 		plan.Containers = append(plan.Containers, compensationContainerRecord{Name: instance.Name, ImageID: instance.ImageID, Platform: instance.Platform,
-			Config: &config, Host: instance.Host, Networks: instance.Networks, Mounts: instance.Mounts})
+			Config: &config, Host: compensationHostConfig(instance.Host), Networks: instance.Networks, Mounts: instance.Mounts})
 	}
 	if len(usedConfigs) != len(stored.Configs) || len(usedLabels) != len(stored.LabelValues) {
 		return compensationSourcePlan{}, errors.New("source execution plan contains unreferenced interned content")

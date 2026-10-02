@@ -14,6 +14,7 @@ import (
 	"github.com/docker/docker/api/types/versions"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/manifest-network/fred/internal/backend/docker/tenantseccomp"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -33,6 +34,14 @@ type DockerSource interface {
 
 type dockerCreateFunc func(context.Context, *container.Config, *container.HostConfig, *network.NetworkingConfig, *ocispec.Platform, string) (container.CreateResponse, error)
 
+// TenantSeccompSource yields the process's verified tenant seccomp profile.
+// tenantseccomp.Process is the production source; it builds the profile and
+// its sealed file on demand and attempts either again after a failure. Every
+// error it returns wraps tenantseccomp.ErrRefused.
+type TenantSeccompSource interface {
+	TenantSeccompProfile() (tenantseccomp.Profile, error)
+}
+
 // DockerCreator is a creation sink which accepts only images admitted by its
 // own Admitter. The raw Docker operation never escapes this type.
 type DockerCreator struct {
@@ -40,13 +49,17 @@ type DockerCreator struct {
 	create dockerCreateFunc
 }
 
-// NewDockerRuntime binds admission and direct creation to the same SDK client.
-// It probes the daemon and requires descriptor-capable API negotiation before
-// minting either capability. The context is used only during construction;
-// ownership of the supplied client remains with the caller, including on error.
-// Callers retain the typed capabilities instead of the raw creation operation.
-func NewDockerRuntime(ctx context.Context, source DockerSource) (*Admitter, *DockerCreator, error) {
-	if util.IsNilInterface(source) {
+// NewDockerRuntime binds admission and direct creation to the same SDK client
+// and to the tenant seccomp profile every creation must carry. There is no
+// way to build a creator without a profile source. An unusable profile does
+// not fail construction: each creation asks the source again and refuses
+// while it stays unusable. NewDockerRuntime probes the daemon and requires
+// descriptor-capable API negotiation before minting either capability. The
+// context is used only during construction; ownership of the supplied client
+// remains with the caller, including on error. Callers retain the typed
+// capabilities instead of the raw creation operation.
+func NewDockerRuntime(ctx context.Context, source DockerSource, profiles TenantSeccompSource) (*Admitter, *DockerCreator, error) {
+	if util.IsNilInterface(source) || util.IsNilInterface(profiles) {
 		return nil, nil, ErrUnavailable
 	}
 	if err := ctx.Err(); err != nil {
@@ -68,7 +81,10 @@ func NewDockerRuntime(ctx context.Context, source DockerSource) (*Admitter, *Doc
 	if versions.LessThan(server.APIVersion, "1.49") || versions.LessThan(source.ClientVersion(), "1.49") {
 		return nil, nil, fmt.Errorf("secure image creation requires Docker Engine 28.1+ (API 1.49+); daemon API %s, client API %s", server.APIVersion, source.ClientVersion())
 	}
-	owner := &issuer{source: source}
+	// Build the profile now so its readiness is known at startup. A failure
+	// is retried by the first creation that needs the profile.
+	_, _ = profiles.TenantSeccompProfile()
+	owner := &issuer{source: source, profiles: profiles}
 	return &Admitter{issuer: owner}, &DockerCreator{issuer: owner, create: source.ContainerCreate}, nil
 }
 
@@ -94,12 +110,29 @@ func (c *DockerCreator) CreateProjectContainer(ctx context.Context, binding Proj
 	return c.createBound(ctx, binding.record.image, binding.record.labels, config, host, networks, name)
 }
 
+// createBound is the only direct Docker creation. Whatever HostConfig the
+// caller supplies, possibly a frozen snapshot decoded from a durable plan,
+// the request carries a private copy whose security options name exactly the
+// current tenant profile, inline. The caller's value is never modified, so a
+// retry cannot accumulate entries.
 func (c *DockerCreator) createBound(ctx context.Context, image Image, labels composeBuildLabels, config *container.Config, host *container.HostConfig, networks *network.NetworkingConfig, name string) (container.CreateResponse, error) {
 	if err := c.ValidateImage(image); err != nil {
 		return container.CreateResponse{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return container.CreateResponse{}, err
+	}
+	profile, err := c.issuer.profiles.TenantSeccompProfile()
+	if err != nil {
+		return container.CreateResponse{}, fmt.Errorf("create container: %w", err)
+	}
+	var preparedHost container.HostConfig
+	if host != nil {
+		preparedHost = *host
+	}
+	preparedHost.SecurityOpt, err = tenantseccomp.InlineSecurityOpt(preparedHost.SecurityOpt, profile)
+	if err != nil {
+		return container.CreateResponse{}, fmt.Errorf("create container: %w", err)
 	}
 	var prepared container.Config
 	if config != nil {
@@ -114,7 +147,7 @@ func (c *DockerCreator) createBound(ctx context.Context, image Image, labels com
 	prepared.Labels[LabelImageID] = image.ID()
 	labels.apply(prepared.Labels)
 	platform := image.Platform()
-	return c.create(ctx, &prepared, host, networks, &platform, name)
+	return c.create(ctx, &prepared, &preparedHost, networks, &platform, name)
 }
 
 // ValidateImage checks issuer ownership without entering a mutation. Durable
@@ -183,8 +216,10 @@ func (p PreparedProject) Container(service string) (ProjectContainer, error) {
 	}}, nil
 }
 
-// Compile binds every active service to its admitted image and freezes the
-// resulting project. It is pure: it neither inspects nor pulls images.
+// Compile binds every active service to its admitted image and to the tenant
+// seccomp profile, and freezes the resulting project. Each service's security
+// options name exactly one profile, the sealed file of the current one, and
+// keep every other option. It neither inspects nor pulls images.
 func (a *Admitter) Compile(project *composetypes.Project, images map[string]Image) (PreparedProject, error) {
 	if a == nil || a.issuer == nil {
 		return PreparedProject{}, ErrUnavailable
@@ -194,6 +229,10 @@ func (a *Admitter) Compile(project *composetypes.Project, images map[string]Imag
 	}
 	if len(project.Services) != len(images) {
 		return PreparedProject{}, fmt.Errorf("every compose service requires exactly one admitted image")
+	}
+	profile, err := a.issuer.profiles.TenantSeccompProfile()
+	if err != nil {
+		return PreparedProject{}, fmt.Errorf("compile compose project: %w", err)
 	}
 	prepared, err := project.WithServicesTransform(func(name string, service composetypes.ServiceConfig) (composetypes.ServiceConfig, error) {
 		image, ok := images[name]
@@ -206,6 +245,16 @@ func (a *Admitter) Compile(project *composetypes.Project, images map[string]Imag
 		if service.Build != nil {
 			return service, fmt.Errorf("service %s: image builds are not supported", name)
 		}
+		// Compose creates pre_start hook containers from a bare host
+		// configuration that would not carry the profile.
+		if len(service.PreStart) != 0 {
+			return service, fmt.Errorf("service %s: pre_start hooks are not supported", name)
+		}
+		securityOpt, err := tenantseccomp.FileSecurityOpt(service.SecurityOpt, profile)
+		if err != nil {
+			return service, fmt.Errorf("service %s: %w", name, err)
+		}
+		service.SecurityOpt = securityOpt
 		if service.Image != image.Reference() {
 			return service, fmt.Errorf("service %s image differs from its admitted reference", name)
 		}

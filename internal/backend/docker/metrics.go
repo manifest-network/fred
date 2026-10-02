@@ -357,6 +357,26 @@ var (
 		Help:      "1 while a verify-only next request key is configured, 0 otherwise",
 	})
 
+	// tenantSeccompProfileRefusalsTotal counts launches refused because the
+	// tenant seccomp profile could not be applied, by the creation sink that
+	// refused. Any increase is a provider fault: no tenant container starts
+	// without the profile.
+	tenantSeccompProfileRefusalsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "seccomp_profile_refusals_total",
+		Help:      "Container launches refused because the tenant seccomp profile could not be applied, by sink",
+	}, []string{"sink"})
+
+	// tenantSeccompProfileReady is 1 when the last request for the tenant
+	// seccomp profile, by any sink, found it and its sealed file usable.
+	tenantSeccompProfileReady = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "tenant_seccomp_profile_ready",
+		Help:      "1 when the tenant seccomp profile was usable at its last request, 0 otherwise",
+	})
+
 	// imageHelpersUnsettled counts the image-inspection helper receipts that
 	// survived the latest recovery pass and no live inspection owns, by reason.
 	// "unknown_create" means the helper's Create response was never durably
@@ -1257,6 +1277,9 @@ func init() {
 	}
 	for _, failure := range requestAuthFailures {
 		requestAuthFailuresTotal.WithLabelValues(failure.label())
+	}
+	for _, sink := range tenantSeccompSinks {
+		tenantSeccompProfileRefusalsTotal.WithLabelValues(sink.label()).Add(0)
 	}
 	for _, outcome := range []string{"busy", "inhibited", "shared", "below_threshold", "removed", "error", "panic"} {
 		imageGCTotal.WithLabelValues(outcome).Add(0)

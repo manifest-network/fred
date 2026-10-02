@@ -245,6 +245,9 @@ type mockDockerClient struct {
 	DetectWritablePathsFn         func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error)
 	ExtractImageContentFn         func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error
 	ContainerEventsFn             func(ctx context.Context) (<-chan ContainerEvent, <-chan error)
+	// SeccompProfiles replaces the process tenant seccomp profile source for
+	// the mock's image runtime and its pre-launch check.
+	SeccompProfiles imageexec.TenantSeccompSource
 }
 
 func (m *mockDockerClient) Ping(ctx context.Context) error {

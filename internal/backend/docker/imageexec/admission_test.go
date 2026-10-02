@@ -21,6 +21,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/docker/tenantseccomp"
 )
 
 var (
@@ -76,7 +77,7 @@ func indexImage() dockerimage.InspectResponse {
 
 func newRuntime(t *testing.T, source *fakeSource) (*imageexec.Admitter, *imageexec.DockerCreator) {
 	t.Helper()
-	admitter, creator, err := imageexec.NewDockerRuntime(t.Context(), source)
+	admitter, creator, err := imageexec.NewDockerRuntime(t.Context(), source, tenantseccomp.Process())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,9 +100,13 @@ func safeRuntime(t *testing.T) (*imageexec.Admitter, *imageexec.DockerCreator, *
 func TestAdmissionRejectsUnavailableCapabilitiesAndEmptyReference(t *testing.T) {
 	var typedNil *fakeSource
 	for _, source := range []imageexec.DockerSource{nil, typedNil} {
-		if _, _, err := imageexec.NewDockerRuntime(t.Context(), source); !errors.Is(err, imageexec.ErrUnavailable) {
+		if _, _, err := imageexec.NewDockerRuntime(t.Context(), source, tenantseccomp.Process()); !errors.Is(err, imageexec.ErrUnavailable) {
 			t.Fatalf("constructor error = %v", err)
 		}
+	}
+	// A creator cannot exist without a profile source.
+	if _, _, err := imageexec.NewDockerRuntime(t.Context(), &fakeSource{version: "1.51"}, nil); !errors.Is(err, imageexec.ErrUnavailable) {
+		t.Fatalf("constructor without a profile source error = %v", err)
 	}
 	var zero imageexec.Admitter
 	if _, err := zero.Admit(t.Context(), "app"); !errors.Is(err, imageexec.ErrUnavailable) {

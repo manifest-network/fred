@@ -954,6 +954,10 @@ func (b *Backend) doProvisionPhysical(
 			cause:    fmt.Errorf("%w: lease volume(s) %v", ErrVolumeDeleteHeld, pending),
 		}
 	}
+	// Refuse before tearing down a failed predecessor or preparing anything.
+	if err := mutations.requireTenantSeccomp(); err != nil {
+		return acceptedStartupFailure{}, err
+	}
 	if err := b.prepareProvisionProjection(mutations, ctx, req, stack, resourceProfiles, logger); err != nil {
 		return acceptedStartupFailure{}, err
 	}
@@ -1094,8 +1098,7 @@ func (b *Backend) doProvisionPhysical(
 		if upErr == nil {
 			upErr = errors.New("launch returned no settled receipt")
 		}
-		failure = &physicalOperationError{callback: "container creation failed", reason: backend.ReasonInternal,
-			cause: fmt.Errorf("compose up failed: %w", upErr)}
+		failure = launchRejectedFailure(upErr)
 		return
 	}
 	// The exchange settled, so its cohort is kept from here on whatever the
