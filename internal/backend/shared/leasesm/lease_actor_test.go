@@ -170,7 +170,7 @@ func TestLeaseActor_DrainsTerminalEventsOnShutdown(t *testing.T) {
 		StopCtx:        ctx,
 		ProvisionStore: store,
 	})
-	require.NoError(t, actor.sm.requestProvision(context.Background()),
+	require.NoError(t, actor.sm.requestProvision(context.Background(), shared.OperationIntentClaim{}),
 		"test must model an admitted worker-owning Provisioning state, not a reservation")
 	require.Equal(t, backend.ProvisionStatusProvisioning, actor.State())
 
@@ -1144,7 +1144,7 @@ func TestProvision_DeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 		ProvisionStore:  store,
 		DoDeprovisionFn: doDeprovision,
 	})
-	require.NoError(t, actor.sm.requestProvision(context.Background()),
+	require.NoError(t, actor.sm.requestProvision(context.Background(), shared.OperationIntentClaim{}),
 		"test must model an admitted worker-owning Provisioning state, not a reservation")
 	require.Equal(t, backend.ProvisionStatusProvisioning, actor.State())
 
@@ -2045,7 +2045,7 @@ func TestProvisionErrored_AuthorsReasonMessage(t *testing.T) {
 	store := newMockProvisionStore()
 	store.put(leaseUUID, &ProvisionState{LeaseUUID: leaseUUID, Status: backend.ProvisionStatusProvisioning})
 	a := newTestActorNoSpawn(t, leaseUUID, testActorOpts{ProvisionStore: store})
-	require.NoError(t, a.sm.requestProvision(context.Background()))
+	require.NoError(t, a.sm.requestProvision(context.Background(), shared.OperationIntentClaim{}))
 	_, failure := newTestProvisionFailure(t, leaseUUID)
 	require.NoError(t, a.sm.provisionErrored(context.Background(), provisionErrorInfo{
 		callbackErr:      "image pull failed",
@@ -2151,7 +2151,7 @@ func TestProvisionCompleted_ClearsStaleReasonMessage(t *testing.T) {
 	})
 	a := newTestActorNoSpawn(t, leaseUUID, testActorOpts{ProvisionStore: store})
 
-	require.NoError(t, a.sm.requestProvision(context.Background()))
+	require.NoError(t, a.sm.requestProvision(context.Background(), shared.OperationIntentClaim{}))
 	_, success := testProvisionSuccess(t, leaseUUID, ProvisionSuccessProjection{ContainerIDs: []string{"c1"}})
 	require.NoError(t, a.sm.provisionCompleted(context.Background(), success))
 

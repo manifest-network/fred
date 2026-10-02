@@ -1503,7 +1503,7 @@ func (a *LeaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 		msg.onPanic(errors.New("provision operation belongs to another lease"))
 		return
 	}
-	if err := a.sm.requestProvision(a.cfg.StopCtx); err != nil {
+	if err := a.sm.requestProvision(a.cfg.StopCtx, msg.Admission.Operation()); err != nil {
 		msg.onPanic(err)
 		return
 	}
@@ -1709,7 +1709,7 @@ func (a *LeaseActor) handleRestoreRequested(msg restoreRequestedMsg) {
 	// this Fire, before the ack — preserving the handler-publish contract.
 	if err := a.sm.requestRestore(a.cfg.StopCtx, replaceEntryArgs{
 		CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
-		CallbackKind: replaceCallbackOperation,
+		CallbackKind: replaceCallbackOperation, Operation: msg.Operation,
 	}); err != nil {
 		// Restore is permitted only from Provisioning; from any other state
 		// (e.g. a duplicate after the SM already left Provisioning, or a

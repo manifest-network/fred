@@ -219,12 +219,20 @@ func (p *ProvisionState) boundBudget() *TerminalBudget {
 //     leaves the budget exactly as it was, so a defensive re-write of Failed
 //     can never turn an exhausted verdict back into retry.
 //
+// Entering Ready also clears the projection's PendingOperation: a Ready
+// lease awaits no provision or restore (ENG-1125).
+//
 // It never increments the count, so a substrate may call it outside the lease
 // actor: it can only complete a counted Failing -> Failed, leave the budget
 // unchanged, or move it toward a reset.
 func (p *ProvisionState) SetStatus(status backend.ProvisionStatus, now time.Time) {
 	p.boundBudget().crossStatus(p.Status, status, now)
 	p.Status = status
+	if status == backend.ProvisionStatusReady {
+		// A Ready projection has no operation in flight (ENG-1125): whichever
+		// provision or restore it awaited has committed.
+		p.awaitNoOperation()
+	}
 }
 
 // InheritTerminalBudget carries predecessor's budget onto p, a rebuilt

@@ -14,19 +14,18 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
-// TestCharacterization_ActiveReprovisionStartupCrashStaysProvisioning pins
-// what happens today when an ACTIVE lease's re-provision fails startup
-// verification after its first substrate Step (the predecessor teardown).
+// TestCharacterization_ActiveReprovisionStartupCrashSettlesFailed pins what
+// happens when an ACTIVE lease's re-provision fails startup verification
+// after its first substrate Step (the predecessor teardown).
 //
-// It is a characterization, not a specification. The worker outcome is
-// Ambiguous (a failure after an entered Step), so the actor makes no
-// Provisioning -> Failed transition. Live operation recovery then settles the
-// durable intent while preserving the projection, and recoverState preserves a
-// Provisioning projection wholesale. The lease therefore reads "provisioning"
-// indefinitely: it is never Failed, so the consecutive-failure budget never
-// sees it and providerd never re-provisions or closes it. A startup crash loop
-// on an ACTIVE lease does not reach the terminal budget (ENG-799 scope limit).
-func TestCharacterization_ActiveReprovisionStartupCrashStaysProvisioning(t *testing.T) {
+// The worker outcome is Ambiguous (a failure after an entered Step), so the
+// actor makes no Provisioning -> Failed transition. Once live operation
+// recovery has proven the attempt absent and settled it, it publishes Failed
+// on the projection that awaited this exact operation (ENG-1125): the lease no
+// longer reads "provisioning" indefinitely, and providerd can re-provision it.
+// The failure is recorded in fail_count but never counted toward the terminal
+// budget.
+func TestCharacterization_ActiveReprovisionStartupCrashSettlesFailed(t *testing.T) {
 	const leaseUUID = "550e8400-e29b-41d4-a716-446655440101"
 	payload := validManifestJSON("nginx:latest")
 	mock := &mockDockerClient{
@@ -112,10 +111,13 @@ func TestCharacterization_ActiveReprovisionStartupCrashStaysProvisioning(t *test
 	intents, err := b.operationSettlement.ListOperationIntents()
 	require.NoError(t, err)
 	assert.Empty(t, intents, "live recovery settles the expired operation intent")
-	assert.Equal(t, backend.ProvisionStatusProvisioning, status(),
-		"the settled failure preserves the Provisioning projection: never Failed, never counted")
+	assert.Equal(t, backend.ProvisionStatusFailed, status(),
+		"the settled failure is published on the projection that awaited it")
 	b.provisionsMu.RLock()
-	failCount := b.provisions[leaseUUID].FailCount
+	failed := recoveredFromProvision(b.provisions[leaseUUID])
 	b.provisionsMu.RUnlock()
-	assert.Equal(t, 2, failCount, "the startup crash is not counted in fail_count either")
+	assert.Equal(t, 3, failed.FailCount, "the startup crash is recorded in fail_count")
+	assert.Equal(t, backend.ReasonContainerExited, failed.Reason)
+	assert.Equal(t, 0, failed.ObserveTerminalBudget().ConsecutiveFailures,
+		"a recovery-published failure never counts")
 }

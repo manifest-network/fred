@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"cmp"
 	"context"
 	"errors"
 
@@ -25,20 +26,50 @@ func newDiagnosticCallbackPublisher(publisher callbackPublicationService, diagno
 }
 
 func (publisher *diagnosticCallbackPublisher) PublishOperationFailureContext(ctx context.Context, proof shared.OperationReleaseUncommitted, message string) error {
+	surface, err := publisher.prepareOperationFailure(ctx, proof, message)
+	if err != nil {
+		return err
+	}
+	return publisher.callbackPublicationService.PublishOperationFailureContext(ctx, proof, surface.message)
+}
+
+// operationFailureSurface is the curated tenant surface of one definitive
+// operation failure: the reason and message the attempt's first observed
+// failure authored at its source (ENG-508), and that failure's operator-side
+// detail. It is read back from the durable capture, never from err.Error().
+type operationFailureSurface struct {
+	reason    backend.Reason
+	message   string
+	lastError string
+}
+
+// operationFailurePreparer is the first half of operation failure
+// publication: it makes the attempt's diagnostic capture durable and returns
+// the surface settlement will publish. Recovery publishes the Failed
+// projection between the two halves (ENG-1125).
+type operationFailurePreparer interface {
+	prepareOperationFailure(context.Context, shared.OperationReleaseUncommitted, string) (operationFailureSurface, error)
+}
+
+func (publisher *diagnosticCallbackPublisher) prepareOperationFailure(ctx context.Context, proof shared.OperationReleaseUncommitted, message string) (operationFailureSurface, error) {
 	publication, err := publisher.diagnostics.OperationFailureContext(ctx, proof, shared.FailureDiagnosticObservation{
 		Error: message, Message: message, Reason: backend.ReasonInternal, Status: shared.DiagnosticCaptureUnavailable,
 	})
 	if err != nil {
-		return err
+		return operationFailureSurface{}, err
 	}
 	if err := publication.PublishContext(ctx, 1); err != nil {
-		return err
+		return operationFailureSurface{}, err
 	}
 	snapshot, _, err := publication.Snapshot()
 	if err != nil {
-		return err
+		return operationFailureSurface{}, err
 	}
-	return publisher.callbackPublicationService.PublishOperationFailureContext(ctx, proof, diagnosticCallbackMessage(snapshot.Message, message))
+	return operationFailureSurface{
+		reason:    cmp.Or(snapshot.Reason, backend.ReasonInternal),
+		message:   diagnosticCallbackMessage(snapshot.Message, message),
+		lastError: cmp.Or(snapshot.Error, message),
+	}, nil
 }
 
 func (publisher *diagnosticCallbackPublisher) prepareMaintenanceFailure(ctx context.Context, proof shared.MaintenanceReleaseFailure, message string) (string, error) {

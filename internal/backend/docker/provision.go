@@ -286,6 +286,7 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 				LifecycleCallbackURL: req.LifecycleCallbackURL,
 				ActiveReleaseVersion: 0,
 				ActiveOperationID:    shared.OperationID{},
+				PendingOperation:     leasesm.PendingOperation{},
 				Items:                slices.Clone(req.Items), // the ownership claim; see above
 				ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 				ContainerIDs:         make([]string, 0, totalQuantity),

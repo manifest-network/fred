@@ -158,7 +158,7 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	sm.SetTriggerParameters(evRestartRequested, reflect.TypeFor[replaceEntryArgs]())
 	sm.SetTriggerParameters(evUpdateRequested, reflect.TypeFor[replaceEntryArgs]())
 	sm.SetTriggerParameters(evRestoreRequested, reflect.TypeFor[replaceEntryArgs]())
-	sm.SetTriggerParameters(evProvisionRequested)
+	sm.SetTriggerParameters(evProvisionRequested, reflect.TypeFor[shared.OperationIntentClaim]())
 	sm.SetTriggerParameters(evProvisionCompleted, reflect.TypeFor[ProvisionSuccessResult]())
 	sm.SetTriggerParameters(evProvisionErrored, reflect.TypeFor[provisionErrorInfo]())
 	sm.SetTriggerParameters(evDiagGathered, reflect.TypeFor[diagResult]())
@@ -441,8 +441,11 @@ func (lsm *leaseSM) cohortDiverged(
 func (lsm *leaseSM) requestDeprovision(ctx context.Context) error {
 	return lsm.fireRaw(ctx, evDeprovisionRequested)
 }
-func (lsm *leaseSM) requestProvision(ctx context.Context) error {
-	return lsm.fireAndExpect(ctx, evProvisionRequested, backend.ProvisionStatusProvisioning)
+
+// requestProvision accepts the provision whose exact claim the projection then
+// awaits (ENG-1125).
+func (lsm *leaseSM) requestProvision(ctx context.Context, operation shared.OperationIntentClaim) error {
+	return lsm.fireAndExpect(ctx, evProvisionRequested, backend.ProvisionStatusProvisioning, operation)
 }
 func (lsm *leaseSM) requestRestart(ctx context.Context, entry replaceEntryArgs) error {
 	if err := lsm.requireProjection(evRestartRequested); err != nil {
@@ -683,11 +686,17 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 // onEnterProvisioning publishes the accepted actor transition before its
 // acknowledgement and worker start. On a retry, the predecessor's runtime and
 // reservation remain available to the Started executor, but its terminal
-// status and diagnostics no longer describe the in-flight operation.
-func (lsm *leaseSM) onEnterProvisioning(_ context.Context, _ ...any) error {
+// status and diagnostics no longer describe the in-flight operation. The
+// projection is stamped with the exact operation it now awaits, which is how
+// live recovery later finds it (ENG-1125).
+func (lsm *leaseSM) onEnterProvisioning(_ context.Context, args ...any) error {
+	// SetTriggerParameters checks this payload's type before stateless changes
+	// state; requestProvision is its only sender.
+	operation := args[0].(shared.OperationIntentClaim)
 	now := time.Now()
 	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
 		p.SetStatus(backend.ProvisionStatusProvisioning, now)
+		p.AwaitOperation(operation)
 		p.LastError = ""
 		p.Reason = ""
 		p.Message = ""
@@ -733,6 +742,7 @@ func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus
 	lifecycleCallbackURL := entry.LifecycleCallbackURL
 	callbackKind := entry.CallbackKind
 	maintenance := entry.Maintenance
+	operation := entry.Operation
 	now := time.Now()
 	tenantReset := maintenance.Valid() && tenantInitiatedMaintenance(maintenance.Kind())
 	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
@@ -745,6 +755,11 @@ func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus
 		p.SetStatus(status, now)
 		if tenantReset {
 			p.budgetResetByTenant()
+		}
+		// A restore awaits its exact operation, like a provision (ENG-1125);
+		// a maintenance replacement awaits none.
+		if !p.AwaitOperation(operation) {
+			p.awaitNoOperation()
 		}
 		if callbackKind == replaceCallbackOperation && callbackURL != "" {
 			p.CallbackURL = callbackURL
@@ -1519,6 +1534,9 @@ type replaceEntryArgs struct {
 	LifecycleCallbackURL string
 	CallbackKind         replaceCallbackKind
 	Maintenance          shared.MaintenanceIntentClaim
+	// Operation is the exact restore the projection awaits (ENG-1125); zero
+	// for a restart or update.
+	Operation shared.OperationIntentClaim
 }
 
 // ReplaceSuccessResult carries doReplaceContainers / doReplaceStackContainers

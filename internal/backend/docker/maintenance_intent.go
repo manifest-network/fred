@@ -779,7 +779,8 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 				LastError: "", Reason: "", Message: "",
 				CallbackURL: authority.CallbackURL(), LifecycleCallbackURL: authority.LifecycleCallbackURL(),
 				ActiveReleaseVersion: release.Version, ActiveOperationID: authority.OperationID(),
-				Items: nil, ResourceProfiles: nil, ContainerIDs: nil, StackManifest: nil, ServiceContainers: nil,
+				PendingOperation: leasesm.PendingOperation{},
+				Items:            nil, ResourceProfiles: nil, ContainerIDs: nil, StackManifest: nil, ServiceContainers: nil,
 			},
 		}
 		provision = recovered.materialize()

@@ -527,7 +527,7 @@ func TestTerminalBudget_ExportedMutatorsOnlyMoveTowardReset(t *testing.T) {
 	for index := range methods.NumMethod() {
 		exported = append(exported, methods.Method(index).Name)
 	}
-	require.Equal(t, []string{"InheritTerminalBudget", "ObserveTerminalBudget", "SetStatus"}, exported,
+	require.Equal(t, []string{"AwaitOperation", "InheritTerminalBudget", "ObserveTerminalBudget", "SetStatus"}, exported,
 		"a new exported *ProvisionState method needs a driver here")
 
 	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
@@ -540,13 +540,28 @@ func TestTerminalBudget_ExportedMutatorsOnlyMoveTowardReset(t *testing.T) {
 			p.InheritTerminalBudget(predecessor, now)
 		},
 	}
+	// AwaitOperation (ENG-1125) stamps the awaited operation and never reads or
+	// writes the budget at all: driven separately below.
 	for _, name := range exported {
-		if name != "ObserveTerminalBudget" {
+		if name != "ObserveTerminalBudget" && name != "AwaitOperation" {
 			require.Contains(t, mutators, name)
 		}
 	}
 	anchors := []time.Time{{}, now.Add(-time.Hour), now.Add(-time.Minute), now}
 	streakStart := now.Add(-2 * time.Hour)
+	operation := newTestOperationFixture(t, testActorLeaseUUID, shared.OperationIntentProvision).admission.Operation()
+	for _, binding := range []string{testActorLeaseUUID, "22222222-2222-4222-8222-222222222222"} {
+		for consecutive := range terminalBudgetThreshold + 2 {
+			for _, standing := range everyStanding {
+				before := TerminalBudget{
+					leaseUUID: binding, consecutive: consecutive, streakStartedAt: streakStart, standing: standing,
+				}
+				p := &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusFailed, TerminalBudget: before}
+				require.True(t, p.AwaitOperation(operation))
+				assert.Equal(t, before, p.TerminalBudget, "AwaitOperation leaves the budget byte-identical")
+			}
+		}
+	}
 	for name, apply := range mutators {
 		for _, binding := range []string{testActorLeaseUUID, "22222222-2222-4222-8222-222222222222"} {
 			for consecutive := range terminalBudgetThreshold + 2 {
@@ -823,7 +838,7 @@ func newBudgetHarness(t *testing.T) *budgetHarness {
 // startProvision enters Provisioning from the reserved or Failed state.
 func (h *budgetHarness) startProvision() {
 	h.t.Helper()
-	require.NoError(h.t, h.actor.sm.requestProvision(h.ctx))
+	require.NoError(h.t, h.actor.sm.requestProvision(h.ctx, shared.OperationIntentClaim{}))
 	require.Equal(h.t, backend.ProvisionStatusProvisioning, h.actor.sm.State())
 }
 

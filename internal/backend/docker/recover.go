@@ -988,6 +988,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					LifecycleCallbackURL: callbackPair.lifecycleCallbackURL,
 					ActiveReleaseVersion: 0,
 					ActiveOperationID:    shared.OperationID{},
+					PendingOperation:     leasesm.PendingOperation{},
 					Items:                nil, // rebuilt from labels below
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 					ContainerIDs:         make([]string, 0),
@@ -1146,6 +1147,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					LifecycleCallbackURL: claim.LifecycleCallbackURL(),
 					ActiveReleaseVersion: 0,
 					ActiveOperationID:    shared.OperationID{},
+					PendingOperation:     leasesm.PendingOperation{},
 					Items:                items,
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 					ContainerIDs:         nil,
@@ -1170,6 +1172,10 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			recovered.ResourceProfiles = shared.CloneSKUResourceSnapshot(resourceProfiles)
 			recovered.StackManifest = stackManifest
 		}
+		// The overlay awaits exactly this durable operation, as an actor's
+		// Provisioning entry does, so live recovery can later publish its failure
+		// on this projection (ENG-1125).
+		recovered.AwaitOperation(claim)
 		allocations, allocationErr := recoveredSnapshotAllocations(
 			leaseUUID, claim.Tenant(), items, resourceProfiles,
 		)
@@ -1281,6 +1287,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					LifecycleCallbackURL: authority.LifecycleCallbackURL(),
 					ActiveReleaseVersion: release.Version,
 					ActiveOperationID:    authority.OperationID(),
+					PendingOperation:     leasesm.PendingOperation{},
 					Items:                items,
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 					ContainerIDs:         nil,
@@ -1373,6 +1380,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				LifecycleCallbackURL: claim.LifecycleCallbackURL(),
 				ActiveReleaseVersion: claim.ActiveReleaseVersion(),
 				ActiveOperationID:    claim.ActiveReleaseOperationID(),
+				PendingOperation:     leasesm.PendingOperation{},
 				Items:                items,
 				ResourceProfiles:     claim.ResourceProfiles(),
 				ContainerIDs:         containerIDs,
@@ -1520,6 +1528,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					LifecycleCallbackURL: lifecycleCallbackURL,
 					ActiveReleaseVersion: release.Version,
 					ActiveOperationID:    release.OperationID,
+					PendingOperation:     leasesm.PendingOperation{},
 					Items:                items,
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 					ContainerIDs:         nil,

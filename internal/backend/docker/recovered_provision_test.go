@@ -225,6 +225,10 @@ func TestProvisionStateMatches_CoversEveryField(t *testing.T) {
 			// value: a fresh budget for this Ready lease anchors its Ready period.
 			p.InheritTerminalBudget(nil, time.Now())
 		},
+		"PendingOperation": func(p *provision) {
+			// The stamp is opaque; only a store-issued claim can mint one.
+			p.PendingOperation = pendingOperationStampForTest(t)
+		},
 	}
 
 	typeOfState := reflect.TypeFor[leasesm.ProvisionState]()

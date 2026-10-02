@@ -156,7 +156,12 @@ type ProvisionState struct {
 	// Autonomous observations must return this exact identity to the callback
 	// publisher; zero deliberately cannot authorize lifecycle publication.
 	ActiveOperationID shared.OperationID
-	Items             []backend.LeaseItem
+	// PendingOperation is the provision or restore this projection is waiting
+	// for, stamped on entry and matched exactly by live recovery (ENG-1125).
+	// It is opaque: only AwaitOperation stamps it, from a store-issued claim. A
+	// construction literal may only name the zero value.
+	PendingOperation PendingOperation
+	Items            []backend.LeaseItem
 	// ResourceProfiles is the immutable capacity authority paired with Items.
 	// It belongs in the actor-owned projection so a recovered maintenance
 	// target cannot publish new topology while retaining source-generation
