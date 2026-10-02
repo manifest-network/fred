@@ -338,14 +338,37 @@ func snapshotCompensationContainer(resp container.InspectResponse, mounts []Cont
 		// to reserve the old endpoint. Preserve explicit IPAM and aliases only.
 		networks[name] = &network.EndpointSettings{IPAMConfig: endpoint.IPAMConfig, Aliases: slices.Clone(endpoint.Aliases), DriverOpts: maps.Clone(endpoint.DriverOpts), GwPriority: endpoint.GwPriority}
 	}
-	return &compensationContainerRecord{Name: strings.TrimPrefix(resp.Name, "/"), ImageID: id, Config: &config, Host: compensationHostConfig(resp.HostConfig), Networks: &network.NetworkingConfig{EndpointsConfig: networks}, Mounts: slices.Clone(mounts)}
+	record := newCompensationContainerRecord(strings.TrimPrefix(resp.Name, "/"), id, ocispec.Platform{}, &config,
+		resp.HostConfig, &network.NetworkingConfig{EndpointsConfig: networks}, slices.Clone(mounts))
+	return &record
 }
 
-// compensationHostConfig is the one conversion of a captured or decoded host
-// configuration into a compensation snapshot. The private copy keeps every
-// security option except a seccomp profile, so a replayed snapshot never
-// carries a stale profile (and a plan never carries an inline profile per
-// instance); the creation sink adds the current profile.
+// newCompensationContainerRecord is the one constructor of a compensation
+// snapshot record. Both writers build their records here: capture from a live
+// container, and decode of a persisted plan. The record's host configuration
+// is always the private, seccomp-free copy compensationHostConfig makes, so a
+// replayed snapshot never carries a stale profile; the creation sink adds the
+// current one. A guard test pins that no other production code builds a
+// record, and the plan encoder strips again before persisting.
+func newCompensationContainerRecord(
+	name, imageID string,
+	platform ocispec.Platform,
+	config *container.Config,
+	host *container.HostConfig,
+	networks *network.NetworkingConfig,
+	mounts []ContainerMount,
+) compensationContainerRecord {
+	return compensationContainerRecord{
+		Name: name, ImageID: imageID, Platform: platform, Config: config,
+		Host: compensationHostConfig(host), Networks: networks, Mounts: mounts,
+	}
+}
+
+// compensationHostConfig is the one conversion of a captured, decoded or
+// persisted host configuration into a compensation snapshot. The private copy
+// keeps every security option except a seccomp profile, so a replayed
+// snapshot never carries a stale profile (and a plan never carries an inline
+// profile per instance); the creation sink adds the current profile.
 func compensationHostConfig(host *container.HostConfig) *container.HostConfig {
 	if host == nil {
 		return nil
