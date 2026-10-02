@@ -643,7 +643,10 @@ When provisioning `redis:latest` on this SKU:
 > phase the caller stays pending (a close answers 503 `lifecycle_pending`); in
 > the residual phase the volume is durably gone, the caller settles, and
 > admission counts the project's block hard limit (or its block usage, if
-> larger) until the hold completes. Only a contradiction of the stage's own
+> larger) until the hold completes. A stage found at startup whose volume is
+> gone but whose footprint cannot be read is unsized: the caller stays pending
+> and disk admission is withheld until the footprint is known. Only a
+> contradiction of the stage's own
 > authority, or an unclassifiable outcome, still latches the backend. See
 > OPERATIONS.md, "Held volume deletions". Entries leaked by pre-ENG-459
 > daemons without a typed authority still require the one-time manual operator
@@ -1188,8 +1191,8 @@ these phases do not measure the full wall time of a failed replacement.
   callback are excluded. `source` is `event_loop` or `reconcile`. The reconciler
   re-detects current failures; sustained growth flags churn, recovery contention,
   a wedged actor, or chronic burst.
-- `fred_docker_backend_volume_delete_holds{phase}` — XFS volume deletions held per volume and retried by the hold executor, by phase (`removal`: the caller stays pending; `residual`: the volume is gone and only its quota project remains). `fred_docker_backend_volume_delete_outcomes_total{outcome}` counts deletion attempts (`completed`, `held_removal`, `held_residual`, `latched`), and `fred_docker_backend_volume_delete_held_residual_mb` is the disk (MiB) that admission counts for residual holds (ENG-1117).
-- `fred_docker_backend_close_intents_delete_held` — pending close intents waiting only on held volume deletions; the hold executor resumes them, so close-age alerting can exclude them (ENG-1117).
+- `fred_docker_backend_volume_delete_holds{phase}` — XFS volume deletions held per volume and retried by the hold executor, by phase (`removal`: the caller stays pending; `unsized`: the volume is gone, a caller may have settled, and the footprint is not known yet, so disk admission is withheld; `residual`: the volume is gone and only its quota project remains). `fred_docker_backend_volume_delete_outcomes_total{outcome}` counts deletion attempts (`completed`, `held_removal`, `held_unsized`, `held_residual`, `latched`), and `fred_docker_backend_volume_delete_held_residual_mb` is the disk (MiB) that admission counts for residual holds (ENG-1117).
+- `fred_docker_backend_close_intents_delete_held` — pending close intents waiting only on held volume deletions (every remaining volume slot held, the rest done); the hold executor resumes them. `fred_docker_backend_oldest_unheld_close_intent_age_seconds` is the oldest age among the other pending closes, the gauge close-age paging uses (ENG-1117).
 - `fred_docker_backend_tree_removals_total{site,outcome}` and `fred_docker_backend_tree_removal_cuts_total{site}` — removals of tenant directory trees (`site` ∈ `delete_stage`, `writable_path`) by outcome, and the subtrees moved into the removal anchor because the tree was deeper than the remover's ancestry bound (ENG-1117).
 - `fred_docker_backend_pending_close_intents` and `fred_docker_backend_oldest_close_intent_age_seconds` — unlabeled aggregate count and oldest age for the non-expiring destructive-close journal. A brief non-zero value is normal while a close runs; sustained age means a finalizer dependency is unavailable. Use the lease-scoped recovery log to identify the row without introducing an unbounded lease label.
 - `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}` — exact provision/restore intents classified past their durable admission deadline. Both kinds share this configured horizon. Cleanup remains periodic and retryable; there is no container-start recovery timer.

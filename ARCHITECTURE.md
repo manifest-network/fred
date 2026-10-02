@@ -1558,11 +1558,19 @@ residual phase the final path is durably gone; `Destroy` answers success only
 after observing its absence, the caller settles, and admission counts the
 project's block hard limit (or its block usage, if larger) until the zero-usage
 proof, the clear and the stage removal finish. `Start` registers every
-authority it finds as a held deletion and serves; one background hold
-executor, the only runner of held work, retries due holds in bounded per-volume
-slices under each lease's namespace lock. A destroy answers a held or
-already-absent name before taking that lock, so a close or reaper never waits
-behind the executor.
+authority it finds as a held deletion and serves. A recovered authority whose
+final path is already gone may have settled its caller in an earlier process;
+if `Start` cannot size it from its quota row, it is unsized: callers still see
+it held, and admission refuses every disk-bearing provision until a later
+read sizes it, so its footprint is never counted as zero. One background hold
+executor, the only runner of held work, retries due holds in bounded
+per-volume slices under each lease's namespace lock, up to two leases at once,
+and starts its next pass at once while holds make progress. A destroy answers
+a held or already-absent name before taking that lock, so a close or reaper
+never waits behind the executor. A close waits only on held deletions when
+each of its volume slots is held or done; such closes are skipped by periodic
+recovery, answered from memory by Deprovision, and left out of the close-age
+gauge that pages.
 
 ZFS instead retains an exact unmounted child and normal sealed startup remounts
 and re-attests it without destruction. Any ambiguous recovery preserves evidence
@@ -1951,10 +1959,11 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_restore_demote_refused_total` | counter | `backend, reason` | Restores refused by the demote fit-gate (`checkDemoteFit`) because the retained data does not fit the requested smaller SKU tier. `reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`. Synchronous-prelude refusals — NOT counted by `restore_total` (worker-scoped); surfaced to the tenant as HTTP 422 — the `demote_exceeds_tier` string discriminator rides only the backend→fred hop (ENG-438) |
 | `fred_docker_backend_volume_quota_backfill_total` | counter | `outcome` | Startup quota reconciliation (XFS root-attribute verification/repair plus limits), `outcome` ∈ `applied`/`failed`/`delete_pending`; `delete_pending` is a name whose deletion is pending, whose limits its delete authority keeps (ENG-1117); `applied` confirms root attributes and limits, not historical descendant tagging. Re-applies the immutable effective quota (`disk_mb` for stateful volumes or pinned scratch for a present diskless writable-path volume) without a re-provision or a recursive XFS tenant-tree walk. The complete inventory is attempted, then any failed application, inventory error, or durable-profile error fails startup/readiness before the normal metrics endpoint serves requests (ENG-454) |
 | `fred_docker_backend_volume_quota_clear_failed_total` | counter | — | Failed XFS quota-clear commands during interrupted-create compensation or typed deletion; preceding block/inode proof failures are not counted. Typed authority is retained either way: a deletion is held for that volume and retried by the hold executor, while a failed create compensation fail-stops the current backend instance for recovery by a fresh `Start`; only historical already-absent/no-authority leaks need classified one-time manual cleanup (ENG-459/ENG-632/ENG-1117) |
-| `fred_docker_backend_volume_delete_holds` | gauge | `phase` | XFS volume deletions held per volume and retried by the hold executor. `removal`: tenant bytes may remain and the caller stays pending; `residual`: the volume is durably gone and only its quota project remains (ENG-1117) |
-| `fred_docker_backend_volume_delete_outcomes_total` | counter | `outcome` | XFS volume deletion attempts, inline, by the hold executor or at startup: `completed`, `held_removal`, `held_residual`, `latched` (ENG-1117) |
+| `fred_docker_backend_volume_delete_holds` | gauge | `phase` | XFS volume deletions held per volume and retried by the hold executor. `removal`: tenant bytes may remain and the caller stays pending; `unsized`: the volume is gone, a caller may have settled, and the footprint is not known yet, so disk admission is withheld; `residual`: the volume is durably gone and only its quota project remains (ENG-1117) |
+| `fred_docker_backend_volume_delete_outcomes_total` | counter | `outcome` | XFS volume deletion attempts, inline or by the hold executor: `completed`, `held_removal`, `held_unsized`, `held_residual`, `latched` (ENG-1117) |
 | `fred_docker_backend_volume_delete_held_residual_mb` | gauge | — | Disk (MiB) that admission counts for residual held deletions, each its project's block hard limit or block usage, whichever is larger; included in the retained-disk projection (ENG-1117) |
-| `fred_docker_backend_close_intents_delete_held` | gauge | — | Pending close intents waiting only on held volume deletions; close-age alerting can exclude them (ENG-1117) |
+| `fred_docker_backend_close_intents_delete_held` | gauge | — | Pending close intents waiting only on held volume deletions: every remaining volume slot held, the rest done (ENG-1117) |
+| `fred_docker_backend_oldest_unheld_close_intent_age_seconds` | gauge | — | Age of the oldest pending close that is not waiting only on held volume deletions; zero when there is none. Close-age paging uses it, so a held close neither pages nor hides another (ENG-1117) |
 | `fred_docker_backend_tree_removals_total` | counter | `site, outcome` | Removals of tenant directory trees. `site` ∈ `delete_stage`, `writable_path`; `outcome` ∈ `removed`, `canceled`, `cut_refused`, `tree_changed`, `cross_device`, `undeletable`, `error` (ENG-1117) |
 | `fred_docker_backend_tree_removal_cuts_total` | counter | `site` | Subtrees moved into the removal anchor because the tree was deeper than the remover's ancestry bound (ENG-1117) |
 

@@ -267,7 +267,8 @@ recognize as a generic failure and fall back to displaying `message`. The define
 | `RestoreFailed` | A tenant-initiated restore (redeploy from retained data) failed |
 | `VolumeCleanupExhausted` | Volume cleanup on deprovision failed after exhausting all retries |
 | `CleanupFailed` | Cleanup on deprovision failed (containers or volumes) |
-| `VolumeDeletePending` | A provision was refused because an earlier deletion of the lease's own volume has not finished yet; retry later |
+| `VolumeDeletePending` | A provision was refused because an earlier deletion of the lease's own volume is still finishing on the provider |
+| `VolumeDeletionInProgress` | The lease is closing and its volume is still being deleted by the provider; the close completes when the deletion does |
 | `Unknown` | The lease is `failed` but no specific reason was recorded |
 
 `message` is a short, human-readable summary and may be empty; it never contains host filesystem
