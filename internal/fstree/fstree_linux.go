@@ -55,6 +55,12 @@ const (
 	// bytes, free of '/' and NUL, and neither "." nor "..". ParseName returns
 	// it, and RemoveBeneath and WalkBeneath return it for the zero Name.
 	ErrInvalidName = fstreeError("fstree: invalid entry name")
+	// ErrUnsupportedKernel means the kernel does not report the mount IDs
+	// fstree needs to tell a bind mount from the directory it covers (statx
+	// STATX_MNT_ID, Linux 5.8 or later). On such a kernel every RemoveBeneath
+	// and WalkBeneath refuses with ErrCrossDevice. CheckKernelSupport returns
+	// it.
+	ErrUnsupportedKernel = fstreeError("fstree: the kernel does not report mount IDs; Linux 5.8 or later is required")
 )
 
 // BorrowedDir is a directory fstree lends to BeforeFirstCut or to a Visitor

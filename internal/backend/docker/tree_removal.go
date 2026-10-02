@@ -3,9 +3,28 @@ package docker
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 
 	"github.com/manifest-network/fred/internal/fstree"
 )
+
+// requireTreeRemovalSupport refuses to start a volume manager on a kernel
+// too old for fstree. Before Linux 5.8 the kernel reports no mount IDs, and
+// fstree then refuses every removal with ErrCrossDevice: every XFS deletion
+// would be held as cross_device and every writable-path wipe would fail,
+// while the backend looked healthy. Failing Start names the cause instead.
+func requireTreeRemovalSupport(dataPath string) error {
+	dir, err := os.Open(dataPath) //nolint:gosec // operator-configured volume root, validated at construction
+	if err != nil {
+		return fmt.Errorf("open volume root %s to check tree-removal support: %w", dataPath, err)
+	}
+	defer func() { _ = dir.Close() }()
+	if err := fstree.CheckKernelSupport(dir); err != nil {
+		return fmt.Errorf("volume root %s: tenant tree removal is unsupported on this kernel: %w", dataPath, err)
+	}
+	return nil
+}
 
 // Tenant directory trees are removed in two places, both through fstree
 // (ENG-1117): the XFS deletion of a condemned volume (delete_stage) and the

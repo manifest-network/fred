@@ -384,6 +384,5 @@ func (b *btrfsVolumeManager) Validate() error {
 	if err := requireCapSysAdmin(b.Kind(), b.logger); err != nil {
 		return err
 	}
-
-	return nil
+	return requireTreeRemovalSupport(b.dataPath)
 }
