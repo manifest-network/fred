@@ -1510,7 +1510,7 @@ func (repair *AttemptRepair) refuseAttemptContextLocked(
 			store.deleteRevisions[candidate.leaseUUID] = next
 		}
 		if candidate.retainLifecycle {
-			store.lifecycleCache[candidate.leaseUUID] = candidate.lifecycleAfter
+			store.cacheWrittenLifecycleLocked(candidate.leaseUUID, candidate.lifecycleAfter)
 		} else {
 			delete(store.lifecycleCache, candidate.leaseUUID)
 		}
@@ -1556,7 +1556,7 @@ func (repair *AttemptRepair) refuseAttemptContextLocked(
 		return false, mutationFailure(operationName, err)
 	}
 	store.cache[candidate.leaseUUID] = p
-	store.lifecycleCache[candidate.leaseUUID] = candidate.lifecycleAfter
+	store.cacheWrittenLifecycleLocked(candidate.leaseUUID, candidate.lifecycleAfter)
 	delete(store.deleteRevisions, candidate.leaseUUID)
 	store.revision = next
 	return true, nil
@@ -1764,7 +1764,7 @@ func (repair *AttemptRepair) ResolveConflictContext(
 		return ConflictRepairResult{}, err
 	}
 	store.cache[candidate.leaseUUID] = resolved
-	store.lifecycleCache[candidate.leaseUUID] = capability
+	store.cacheWrittenLifecycleLocked(candidate.leaseUUID, capability)
 	delete(store.deleteRevisions, candidate.leaseUUID)
 	store.revision = next
 	if err := repair.verifySourcePathAfterMutation("resolve exact placement conflict"); err != nil {

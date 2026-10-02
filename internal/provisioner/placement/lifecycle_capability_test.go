@@ -1,6 +1,12 @@
 package placement
 
 import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -16,8 +22,9 @@ const evidenceFreeSentinelRow = `{"schema":1,"unusable":true}`
 // forEachLifecycleCapability visits every combination of lifecycleCapability's
 // fields: each of backends, or none, as owner and as attempt, with or without
 // each ID, principal, retirement, quarantine, raw corruption and pending
-// persistence. The literal is exhaustruct-enforced, so a new field fails lint
-// here until this domain covers it.
+// persistence. The literal is exhaustruct-enforced, so a new field must be
+// named here before lint passes. Lint cannot tell whether the field then
+// ranges over its domain: give it a bit, as every field below has.
 func forEachLifecycleCapability(t *testing.T, backends []string, visit func(lifecycleCapability)) {
 	t.Helper()
 	ownerID := requireLifecycleID(t, "502")
@@ -56,10 +63,11 @@ func forEachLifecycleCapability(t *testing.T, backends []string, visit func(life
 
 // TestLifecycleCapabilityUsabilityIsDerivedFromEvidence pins ENG-1119's P2: no
 // capability is both ownerless and usable, because usability is derived from
-// evidence; usability never makes the encoder refuse; and the row written
-// decodes back to the same authority and evidence.
+// evidence; usability never makes the encoder refuse; the row written decodes
+// back to the same authority and evidence; and asWritten, the form the cache
+// holds, is exactly what that row decodes to.
 func TestLifecycleCapabilityUsabilityIsDerivedFromEvidence(t *testing.T) {
-	shapes, ownerless, written := 0, 0, 0
+	shapes, ownerless, ownerlessWritten, written := 0, 0, 0, 0
 	forEachLifecycleCapability(t, []string{"backend-a"}, func(capability lifecycleCapability) {
 		shapes++
 		evidence := capability.backend != "" || capability.attemptBackend != ""
@@ -68,6 +76,16 @@ func TestLifecycleCapabilityUsabilityIsDerivedFromEvidence(t *testing.T) {
 		if !evidence {
 			ownerless++
 		}
+		// The encoder's acceptance, stated independently of
+		// validateLifecycleCapability: it refuses raw corruption and an
+		// incomplete shape, and nothing else. Owner and attempt evidence is not
+		// part of it, so an ownerless capability with a complete shape encodes.
+		principal := capability.principal
+		completeShape := !capability.rawCorrupt &&
+			(principal == (runtimePrincipal{}) || (principal.tenant != "" && principal.providerUUID != "")) &&
+			(capability.backend != "" || !capability.id.Valid()) &&
+			(capability.backend != "" || !capability.retired) &&
+			(capability.attemptBackend == "") == !capability.attemptID.Valid()
 		if !capability.usable() {
 			authorization := authorizeLifecycleCapability(capability, capability.id)
 			assert.Equal(t, LifecycleVerdictUnusable, authorization.Verdict(), "%+v", capability)
@@ -78,14 +96,19 @@ func TestLifecycleCapabilityUsabilityIsDerivedFromEvidence(t *testing.T) {
 		}
 
 		row, err := encodeLifecycleCapability(capability)
-		if err != nil {
-			assert.True(t, capability.rawCorrupt || validateLifecycleCapability(capability) != nil,
-				"only raw corruption or an incomplete shape is refused, never an ownerless one: %+v", capability)
+		if !completeShape {
+			require.Error(t, err, "%+v", capability)
 			return
 		}
+		require.NoError(t, err, "a complete shape encodes, with or without an owner: %+v", capability)
 		written++
+		if !evidence {
+			ownerlessWritten++
+		}
 		decoded, err := decodeLifecycleCapability(row)
 		require.NoError(t, err, "every written row decodes: %+v", capability)
+		assert.Equal(t, capability.asWritten(), decoded,
+			"the cache's written form is what reopening decodes: %+v", capability)
 		assert.Equal(t, capability.usable(), decoded.usable(), "%+v", capability)
 		assert.Equal(t, !capability.usable(), decoded.quarantined,
 			"the row records exactly whether it may carry authority: %+v", capability)
@@ -104,7 +127,51 @@ func TestLifecycleCapabilityUsabilityIsDerivedFromEvidence(t *testing.T) {
 	})
 	require.Equal(t, 2*2*(1<<7), shapes, "owner and attempt each range over none and backend-a")
 	require.NotZero(t, ownerless)
+	require.NotZero(t, ownerlessWritten, "ownerless capabilities with a complete shape were enumerated")
 	require.NotZero(t, written)
+}
+
+// TestLifecycleCacheIsWrittenOnlyInItsWrittenForm pins the choke point that
+// keeps one in-memory form per durable row: after the store loads, no code in
+// the package assigns a lifecycleCache entry except
+// cacheWrittenLifecycleLocked, which stores asWritten.
+func TestLifecycleCacheIsWrittenOnlyInItsWrittenForm(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	require.NoError(t, err)
+	fileSet := token.NewFileSet()
+	var writers []string
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fileSet, name, nil, 0)
+		require.NoError(t, err)
+		for _, decl := range file.Decls {
+			function, ok := decl.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				assign, ok := node.(*ast.AssignStmt)
+				if !ok {
+					return true
+				}
+				for _, target := range assign.Lhs {
+					index, ok := target.(*ast.IndexExpr)
+					if !ok {
+						continue
+					}
+					if selector, ok := index.X.(*ast.SelectorExpr); ok && selector.Sel.Name == "lifecycleCache" {
+						writers = append(writers, fmt.Sprintf("%s (%s)",
+							function.Name.Name, fileSet.Position(assign.Pos())))
+					}
+				}
+				return true
+			})
+		}
+	}
+	require.Len(t, writers, 1, "lifecycleCache entry writers: %v", writers)
+	assert.True(t, strings.HasPrefix(writers[0], "cacheWrittenLifecycleLocked "), writers[0])
 }
 
 // TestLifecycleCapabilityWithoutEvidenceIsTheQuarantineSentinel covers the
@@ -145,11 +212,13 @@ func TestLifecycleCapabilityWithoutEvidenceIsTheQuarantineSentinel(t *testing.T)
 	})
 }
 
-// TestLifecycleWithAttemptKeepsAQuarantineButNotAMapMiss pins the one place a
-// map miss is not a quarantine. A lease with neither a lifecycle row nor a
+// TestLifecycleWithAttemptKeepsAQuarantineButNotAMapMiss pins how a new
+// attempt treats a map miss. A lease with neither a lifecycle row nor a
 // confirmed owner starts from nothing, so its first attempt marker is usable;
-// every row without usable evidence, including the decoded sentinel, stays
-// quarantined beside a new attempt until that operation settles.
+// a confirmed owner without a row, and every row without usable evidence
+// (including the decoded sentinel), stays quarantined beside a new attempt
+// until that operation settles. Authorization reads a map miss as Missing,
+// not as a quarantine, but grants nothing either way.
 func TestLifecycleWithAttemptKeepsAQuarantineButNotAMapMiss(t *testing.T) {
 	operationID := requireOperationID(t, "505")
 	attemptID := lifecycleIDFromOperation(t, operationID)

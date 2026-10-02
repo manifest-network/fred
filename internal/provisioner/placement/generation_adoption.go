@@ -592,7 +592,7 @@ func (repair *AttemptRepair) AdoptObservedGenerationContext(
 		return GenerationAdoptionResult{}, err
 	}
 	store.cache[candidate.leaseUUID] = adopted
-	store.lifecycleCache[candidate.leaseUUID] = capability
+	store.cacheWrittenLifecycleLocked(candidate.leaseUUID, capability)
 	store.revision = next
 	if err := repair.verifySourcePathAfterMutation("adopt observed lifecycle generation"); err != nil {
 		return GenerationAdoptionResult{}, err

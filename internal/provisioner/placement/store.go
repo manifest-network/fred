@@ -2841,23 +2841,10 @@ func (s *Store) settleRestore(claim RestoreClaim, settlement restoreSettlement) 
 			}
 			return true, nil
 		}
-		next, err := s.nextRevision()
-		if err != nil {
-			return true, err
-		}
-		target.Attempt = ""
-		clearOperationMetadata(&target)
-		target.revision = next
-		capability := clearAttemptLifecycle(
-			s.lifecycleCache[claim.targetLeaseUUID], claim.backendName, claim.operationID,
+		return true, s.clearRefusedAttemptLocked(
+			claim.targetLeaseUUID, target, claim.backendName, claim.operationID,
+			"refuse restore placement",
 		)
-		if err := s.putPlacementWithLifecycleLocked(
-			claim.targetLeaseUUID, target, capability, "refuse restore placement",
-		); err != nil {
-			return true, err
-		}
-		s.revision = next
-		return true, nil
 
 	default:
 		return true, ErrInvalidRestoreClaim
@@ -3029,23 +3016,56 @@ func (s *Store) refuseAttemptLocked(token AttemptToken) (bool, error) {
 		return true, nil
 	}
 
+	if err := s.clearRefusedAttemptLocked(
+		token.leaseUUID, p, token.backendName, token.operationID,
+		"refuse typed placement attempt",
+	); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// clearRefusedAttemptLocked clears a refused exact attempt from a placement
+// that keeps its confirmed owner, together with the attempt's lifecycle
+// marker. Caller holds s.mu and has matched the exact attempt.
+//
+// When inventory confirmed the owner while the capability held only that
+// attempt, the attempt was its only evidence: clearing it leaves a confirmed
+// placement whose capability names no owner and no attempt, written as the
+// evidence-free quarantine sentinel. Callbacks and maintenance for the lease
+// are then withheld until an exact operation or a repair establishes a
+// generation, so the transition is logged with what an operator needs to find
+// it.
+func (s *Store) clearRefusedAttemptLocked(
+	leaseUUID string,
+	p Placement,
+	backendName string,
+	operationID operation.OperationID,
+	mutation string,
+) error {
 	next, err := s.nextRevision()
 	if err != nil {
-		return false, err
+		return err
 	}
 	p.Attempt = ""
 	clearOperationMetadata(&p)
 	p.revision = next
-	capability := clearAttemptLifecycle(
-		s.lifecycleCache[token.leaseUUID], token.backendName, token.operationID,
-	)
-	if err := s.putPlacementWithLifecycleLocked(
-		token.leaseUUID, p, capability, "refuse typed placement attempt",
-	); err != nil {
-		return false, err
+	before := s.lifecycleCache[leaseUUID]
+	capability := clearAttemptLifecycle(before, backendName, operationID)
+	if err := s.putPlacementWithLifecycleLocked(leaseUUID, p, capability, mutation); err != nil {
+		return err
 	}
 	s.revision = next
-	return true, nil
+	if before.usable() && !capability.usable() {
+		slog.Warn("placement: refused attempt was the lifecycle capability's only evidence",
+			"lease_uuid", leaseUUID,
+			"backend", p.Backend,
+			"attempt_backend", backendName,
+			"operation_id", operationID.String(),
+			"mutation", mutation,
+		)
+	}
+	return nil
 }
 
 // matchAttemptTokenLocked checks every durable token component in one critical
@@ -3489,7 +3509,7 @@ func (s *Store) projectInventory(
 		mutation := mutations[leaseUUID]
 		s.cache[leaseUUID] = mutation.placement
 		if lifecycleMutation, ok := lifecycleMutations[leaseUUID]; ok {
-			s.lifecycleCache[leaseUUID] = lifecycleMutation.capability
+			s.cacheWrittenLifecycleLocked(leaseUUID, lifecycleMutation.capability)
 		}
 		delete(s.deleteRevisions, leaseUUID)
 	}
@@ -4561,7 +4581,7 @@ func (s *Store) deleteDurable(leaseUUID, operation string) error {
 		return mutationFailure(operation, err)
 	}
 	if capabilityExists && retainCapability {
-		s.lifecycleCache[leaseUUID] = capability
+		s.cacheWrittenLifecycleLocked(leaseUUID, capability)
 	} else {
 		delete(s.lifecycleCache, leaseUUID)
 	}

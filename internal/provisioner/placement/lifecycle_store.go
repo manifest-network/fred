@@ -307,6 +307,30 @@ func quarantinedLifecycle() lifecycleCapability {
 	return lifecycleCapability{quarantined: true}
 }
 
+// asWritten returns the capability in the form decodeLifecycleCapability
+// returns for the row encodeLifecycleCapability writes from it. The encoder
+// writes the unusable flag as !usable(), so a capability that may carry no
+// authority comes back quarantined, and nothing in it still awaits
+// persistence. Every other field is written and decoded as is.
+func (capability lifecycleCapability) asWritten() lifecycleCapability {
+	capability.quarantined = !capability.usable()
+	capability.needsPersistence = false
+	return capability
+}
+
+// cacheWrittenLifecycleLocked records a capability whose row the caller has
+// just committed. It is the only writer of a lifecycleCache entry after the
+// store loads (TestLifecycleCacheIsWrittenOnlyInItsWrittenForm), so an entry
+// always equals what reopening the store would decode: one in-memory form per
+// row, and a struct comparison with the cache agrees with a comparison of the
+// rows. Without it, an attempt-only capability whose attempt was cleared would
+// stay cached as the zero value while its row decodes to the quarantined
+// sentinel, and the next projection would rewrite identical bytes and bump the
+// placement revision. Caller holds s.mu.
+func (s *Store) cacheWrittenLifecycleLocked(leaseUUID string, capability lifecycleCapability) {
+	s.lifecycleCache[leaseUUID] = capability.asWritten()
+}
+
 type persistedLifecycleCapability struct {
 	Schema         int    `json:"schema"`
 	Backend        string `json:"backend,omitempty"`
@@ -899,7 +923,7 @@ func (s *Store) retireLifecycle(
 	}); err != nil {
 		return LifecycleAuthorization{}, mutationFailure("retire lifecycle capability", err)
 	}
-	s.lifecycleCache[leaseUUID] = capability
+	s.cacheWrittenLifecycleLocked(leaseUUID, capability)
 	return LifecycleAuthorization{
 		backend: capability.backend,
 		id:      capability.id,
@@ -1137,7 +1161,7 @@ func (s *Store) putPlacementWithLifecycleLocked(
 		return mutationFailure(operationName, err)
 	}
 	s.cache[leaseUUID] = placement
-	s.lifecycleCache[leaseUUID] = capability
+	s.cacheWrittenLifecycleLocked(leaseUUID, capability)
 	delete(s.deleteRevisions, leaseUUID)
 	return nil
 }
