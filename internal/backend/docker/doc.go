@@ -55,7 +55,8 @@
 // # Container hardening
 //
 // Every container is created with: dropped capabilities, no-new-privileges,
-// read-only rootfs, tmpfs for /tmp and /run, PID limits, no swap, restart
-// policy disabled (for crash detection), and per-tenant network isolation.
+// fred's tenant seccomp profile (derived from Docker's default), read-only
+// rootfs, tmpfs for /tmp and /run, PID limits, no swap, restart policy
+// disabled (for crash detection), and per-tenant network isolation.
 // See the README for the full list and operator-facing knobs.
 package docker

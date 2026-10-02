@@ -29,6 +29,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   carry a delete stage is reported separately (`DeleteHeld`) instead of as
   pending. The deploy coordinator decides whether that blocks an update.
   (ENG-1117, ENG-1109)
+- docker-backend reports which tenant containers run without its current
+  seccomp profile and audits managed XFS volumes for project-ID drift. The
+  audit only reports; it never changes a volume. New metrics:
+  `fred_docker_backend_tenant_containers_without_current_seccomp`,
+  `fred_docker_backend_seccomp_census_total{outcome}`,
+  `fred_docker_backend_tenant_seccomp_profile_ready`,
+  `fred_docker_backend_seccomp_profile_refusals_total{sink}`,
+  `fred_docker_backend_volume_projid_audit_total{outcome}` and
+  `fred_docker_backend_volumes_with_projid_drift`. See OPERATIONS.md,
+  "Tenant seccomp profile and project-ID audit". (ENG-1118)
 - `backends[].fenced: true` contains a backend the operator no longer trusts
   without removing it from the topology. providerd sends it nothing: its client
   holds no address, key or TLS material, so the backend's revoked certificate
@@ -1932,6 +1942,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- docker-backend applies a restricted seccomp profile to tenant containers and
+  reports containers created before it. (ENG-1118)
 - Exclude caller-abandoned backend calls from circuit-breaker health accounting
   without resetting real failure streaks. Encode expected close/state/capacity
   refusals as typed non-health failures (ENG-1052).

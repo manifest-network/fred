@@ -83,7 +83,7 @@ func TestIntegration_Docker_ReservedImageLabelsRejectedBeforeContainerCreation(t
 	defer cancel()
 	docker := newIntegrationDockerClient(t, ctx)
 	sdk := newImageSecurityFixtureClient(t)
-	compose, err := newComposeService(sdk.DaemonHost(), docker.images)
+	compose, err := newComposeService(sdk.DaemonHost(), docker.images, docker.tenantSeccomp)
 	require.NoError(t, err)
 	for _, key := range []string{"TrAeFiK.enable", "fred.managed", "com.docker.compose.oneoff"} {
 		t.Run(key, func(t *testing.T) {
@@ -197,7 +197,7 @@ func TestIntegration_Docker_ImmutableImageBindingSurvivesTagMovement(t *testing.
 	params.BackendName = "image-security"
 	docker.backendName = "image-security"
 	params.NetworkName = ""
-	compose, err := newComposeService(sdk.DaemonHost(), docker.images)
+	compose, err := newComposeService(sdk.DaemonHost(), docker.images, docker.tenantSeccomp)
 	require.NoError(t, err)
 	desired := buildTestComposeProject(t, params)
 	evidence := make(map[string]imageexec.Image, len(desired.Services))

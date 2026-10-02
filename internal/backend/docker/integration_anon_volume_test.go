@@ -85,7 +85,7 @@ func TestIntegration_Docker_ComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 	admitted, err := docker.AdmitImage(ctx, "busybox:latest")
 	require.NoError(t, err)
 
-	composeSvc, err := newComposeService("", docker.images)
+	composeSvc, err := newComposeService("", docker.images, docker.tenantSeccomp)
 	require.NoError(t, err)
 
 	// Build a valid project via the real builder, then force an anonymous
@@ -291,7 +291,7 @@ func TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFail
 	admitted, err := docker.AdmitImage(ctx, "busybox:latest")
 	require.NoError(t, err)
 
-	composeSvc, err := newComposeService("", docker.images)
+	composeSvc, err := newComposeService("", docker.images, docker.tenantSeccomp)
 	require.NoError(t, err)
 
 	// Tenant data lives in a bind mount, exactly as applyVolumeBinds produces.
