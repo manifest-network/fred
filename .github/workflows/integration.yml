@@ -57,15 +57,28 @@ concurrency:
 
 jobs:
   docker-btrfs:
-    name: docker + btrfs integration (root)
+    # The job id stays `docker-btrfs` so `needs:` references keep working. The
+    # display name (and therefore the status-check name) carries the store.
+    name: docker + btrfs integration (root, ${{ matrix.image_store }})
     # MUST be the full ubuntu image (not ubuntu-slim): we need passwordless
     # sudo→root, loop devices, and low-level mount — ubuntu-slim's job container
     # is unprivileged and cannot do any of that.
     # Keep the distribution aligned with the pinned Docker APT package below.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      # One store failing must not cancel the other: each leg is its own signal.
+      fail-fast: false
+      matrix:
+        # overlay2 is the classic store every deployed host runs
+        # (manifest-deploy roles/common/templates/daemon.json.j2); containerd
+        # keeps index/platform-manifest admission covered.
+        image_store: [overlay2, containerd]
     env:
       DOCKER_ENGINE_VERSION: "29.7.2"
+      # Read by the daemon.json step, the preflight, the run step and the
+      # in-suite guard TestIntegration_Docker_ImageStoreMatchesRunnerDeclaration.
+      FRED_TEST_IMAGE_STORE: ${{ matrix.image_store }}
       # Optional Docker Hub auth to dodge anonymous pull rate limits (ubuntu-24.04
       # ships zero preloaded images, so every workload image is pulled fresh).
       # Absent secrets evaluate to "" and the login step is skipped — anonymous
@@ -83,10 +96,12 @@ jobs:
 
       - name: Install supported Docker Engine
         # The stock runner can ship Docker 28.0/API 1.48. Admission needs API
-        # 1.49+, and the containerd image store must be exercised explicitly.
+        # 1.49+, and the leg's image store must be selected explicitly.
         # Upgrade the system service: SDK fixtures use /var/run/docker.sock,
         # so a separate Docker context/DOCKER_HOST would test another daemon.
         # Ubuntu's runner removes the Docker APT source after image creation.
+        # Switching stores hides images pulled under the other one; the
+        # pre-pull step below runs after the switch.
         run: |
           sudo install -m 0755 -d /etc/apt/keyrings
           sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
@@ -96,14 +111,34 @@ jobs:
           docker_package_version="5:${DOCKER_ENGINE_VERSION}-1~ubuntu.24.04~noble"
           sudo apt-get install -y --allow-downgrades --no-install-recommends \
             "docker-ce=$docker_package_version" "docker-ce-cli=$docker_package_version" containerd.io
-          sudo python3 - <<'PY'
+          # sudo resets the environment, so pass the leg's store through explicitly.
+          sudo env "FRED_TEST_IMAGE_STORE=$FRED_TEST_IMAGE_STORE" python3 - <<'PY'
           import json
+          import os
           from pathlib import Path
           path = Path("/etc/docker/daemon.json")
           config = json.loads(path.read_text()) if path.exists() else {}
-          config.setdefault("features", {})["containerd-snapshotter"] = True
+          store = os.environ["FRED_TEST_IMAGE_STORE"]
+          features = config.get("features", {})
+          if store == "containerd":
+              features["containerd-snapshotter"] = True
+              config.pop("storage-driver", None)
+          elif store == "overlay2":
+              # Mirror manifest-deploy roles/common/templates/daemon.json.j2:
+              # it pins "storage-driver": "overlay2" and sets no
+              # containerd-snapshotter feature, so Docker 29 selects the
+              # classic graphdriver store because a graphdriver is configured.
+              features.pop("containerd-snapshotter", None)
+              config["storage-driver"] = "overlay2"
+          else:
+              raise SystemExit(f"unknown FRED_TEST_IMAGE_STORE {store!r}")
+          if features:
+              config["features"] = features
+          else:
+              config.pop("features", None)
           path.parent.mkdir(parents=True, exist_ok=True)
           path.write_text(json.dumps(config) + "\n")
+          print(json.dumps(config, indent=2, sort_keys=True))
           PY
           sudo systemctl restart docker
           docker --host unix:///var/run/docker.sock version
@@ -141,9 +176,35 @@ jobs:
           if ! dpkg --compare-versions "$docker_api" ge 1.49; then
             echo "::error::Docker API 1.49+ is required for image admission (got $docker_api)"; fail=1
           fi
-          if ! docker --host unix:///var/run/docker.sock info --format '{{json .DriverStatus}}' | jq -e 'any(.[]; .[0] == "driver-type" and .[1] == "io.containerd.snapshotter.v1")' >/dev/null; then
-            echo "::error::The containerd image store is required to exercise platform-manifest admission"; fail=1
-          fi
+          # Assert the leg's declared store with the same predicates as
+          # daemonUsesContainerd / requireBoundedImageStore
+          # (internal/backend/docker/image_capacity.go): containerd means the
+          # driver name contains "snapshotter" or any two-element DriverStatus
+          # value contains "containerd".
+          driver="$(docker --host unix:///var/run/docker.sock info --format '{{.Driver}}')" || driver=""
+          driver_status="$(docker --host unix:///var/run/docker.sock info --format '{{json .DriverStatus}}')" || driver_status="null"
+          uses_containerd="$(printf '%s' "$driver_status" | jq -r --arg driver "$driver" \
+            '($driver | contains("snapshotter")) or ((. // []) | any(.[]; length == 2 and (.[1] | type == "string") and (.[1] | contains("containerd"))))')" || uses_containerd=""
+          echo "Docker image store: driver=$driver containerd=$uses_containerd status=$driver_status (declared $FRED_TEST_IMAGE_STORE)"
+          case "$FRED_TEST_IMAGE_STORE" in
+            containerd)
+              if [ "$driver" != overlayfs ] || [ "$uses_containerd" != true ]; then
+                echo "::error::The containerd overlayfs image store is required to exercise platform-manifest admission (driver=$driver, containerd=$uses_containerd)"; fail=1
+              fi
+              ;;
+            overlay2)
+              if [ "$driver" != overlay2 ] || [ "$uses_containerd" != false ]; then
+                echo "::error::The classic overlay2 image store deployed hosts run is required (driver=$driver, containerd=$uses_containerd)"; fail=1
+              fi
+              # overlay2 needs a backing filesystem with d_type support.
+              if ! printf '%s' "$driver_status" | jq -e '(. // []) | any(.[]; .[0] == "Supports d_type" and .[1] == "true")' >/dev/null; then
+                echo "::error::The overlay2 backing filesystem lacks d_type support"; fail=1
+              fi
+              ;;
+            *)
+              echo "::error::unknown FRED_TEST_IMAGE_STORE '$FRED_TEST_IMAGE_STORE'"; fail=1
+              ;;
+          esac
           command -v mkfs.btrfs >/dev/null 2>&1 || { echo "::error::mkfs.btrfs not installed"; fail=1; }
           command -v btrfs >/dev/null 2>&1 || { echo "::error::btrfs CLI not installed"; fail=1; }
           work="$(mktemp -d)"
@@ -183,7 +244,7 @@ jobs:
             echo "::error::zfs truncate failed"; fail=1
           fi
           rm -rf "$work" || true
-          [ "$fail" -eq 0 ] && echo "Preflight OK: docker + root + btrfs/xfs/zfs tooling + loopback + quota all available."
+          [ "$fail" -eq 0 ] && echo "Preflight OK: docker ($FRED_TEST_IMAGE_STORE image store) + root + btrfs/xfs/zfs tooling + loopback + quota all available."
           exit "$fail"
 
       - name: Docker Hub login (optional)
@@ -213,19 +274,32 @@ jobs:
           done
 
       - name: Run docker + btrfs integration suite (as root)
-        env:
-          # containerd.io uses this separately managed content root. Production
-          # requires image_data_path explicitly for snapshotter image stores.
-          FRED_TEST_IMAGE_DATA_PATH: /var/lib/containerd
         # `-run Integration` covers the ENTIRE docker package: core lifecycle,
         # stack, restart/update, reconciler, idempotency, image admission and
         # immutable platform binding, volume/quota, and the
         # ENG-325 retain/restore tests. 30m timeout: the restore tests are slow
         # (multi-minute provision waits) and the default 15m predates them.
         # `sudo -E env PATH=$PATH` preserves the actions/setup-go toolchain that
-        # sudo's secure_path would otherwise hide (the containerd idiom).
+        # sudo's secure_path would otherwise hide (the containerd idiom); -E
+        # also carries FRED_TEST_IMAGE_STORE and FRED_TEST_IMAGE_DATA_PATH.
         run: |
           set -o pipefail
+          case "$FRED_TEST_IMAGE_STORE" in
+            containerd)
+              # containerd.io uses this separately managed content root.
+              # Production requires image_data_path explicitly for snapshotter
+              # image stores.
+              export FRED_TEST_IMAGE_DATA_PATH=/var/lib/containerd
+              ;;
+            overlay2)
+              # Left unset, as in the deployed docker-backend config: the
+              # classic store keeps image data under Docker's data root.
+              unset FRED_TEST_IMAGE_DATA_PATH
+              ;;
+            *)
+              echo "::error::unknown FRED_TEST_IMAGE_STORE '$FRED_TEST_IMAGE_STORE'"; exit 1
+              ;;
+          esac
           sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m 2>&1 | tee integration.log
 
       - name: Guard — fail if any integration test was SKIPPED
