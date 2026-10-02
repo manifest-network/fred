@@ -366,6 +366,26 @@ var (
 		Help:      "Container launches refused because the tenant seccomp profile could not be applied, by sink",
 	}, []string{"sink"})
 
+	// tenantContainersWithoutCurrentSeccomp is the number of live tenant
+	// containers, from the last completed census, whose effective seccomp
+	// profile is not the current tenant profile. Restarting or updating a
+	// lease recreates its containers with the current profile.
+	tenantContainersWithoutCurrentSeccomp = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "tenant_containers_without_current_seccomp",
+		Help:      "Live tenant containers whose effective seccomp profile is not the current one, from the last completed census",
+	})
+
+	// tenantSeccompCensusTotal counts census passes by outcome: ok publishes
+	// a count, error keeps the previous one.
+	tenantSeccompCensusTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "seccomp_census_total",
+		Help:      "Tenant seccomp census passes by outcome (ok or error)",
+	}, []string{"outcome"})
+
 	// tenantSeccompProfileReady is 1 when the last request for the tenant
 	// seccomp profile, by any sink, found it and its sealed file usable.
 	tenantSeccompProfileReady = promauto.NewGauge(prometheus.GaugeOpts{
@@ -1207,6 +1227,9 @@ func init() {
 	}
 	for _, sink := range tenantSeccompSinks {
 		tenantSeccompProfileRefusalsTotal.WithLabelValues(sink.label()).Add(0)
+	}
+	for _, outcome := range tenantSeccompCensusOutcomes {
+		tenantSeccompCensusTotal.WithLabelValues(outcome).Add(0)
 	}
 	for _, outcome := range []string{"busy", "inhibited", "shared", "below_threshold", "removed", "error", "panic"} {
 		imageGCTotal.WithLabelValues(outcome).Add(0)

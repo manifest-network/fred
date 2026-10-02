@@ -45,6 +45,7 @@ type dockerReadClient interface {
 	ListVolumeWriters(context.Context) ([]ContainerInfo, error)
 	ListIdleManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error)
 	ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error)
+	TenantSeccompCensus(ctx context.Context) (tenantSeccompCensus, error)
 }
 
 // dockerMutationSink is captured only by settlement-bound Guards. Keeping it
@@ -2908,6 +2909,10 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Start real-time container event listener for instant crash detection.
 	// reconcileLoop stays as safety net for missed events.
 	b.wg.Go(b.containerEventLoop)
+
+	// Report containers that do not run under the current tenant seccomp
+	// profile. The first pass runs now, in the background, after recovery.
+	b.wg.Go(b.tenantSeccompCensusLoop)
 
 	// Sample actor inbox depth and stuck-seconds on a ticker for the
 	// fred_docker_backend_lease_actor_* observability gauges. Prime the durable

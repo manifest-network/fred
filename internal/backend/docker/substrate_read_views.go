@@ -24,6 +24,7 @@ type dockerReadView struct {
 	listVolumeWriters    func(context.Context) ([]ContainerInfo, error)
 	listNetworks         func(context.Context) ([]networktypes.Inspect, error)
 	containerEvents      func(context.Context) (<-chan ContainerEvent, <-chan error)
+	seccompCensus        func(context.Context) (tenantSeccompCensus, error)
 }
 
 func projectDockerRead(client dockerReadClient) dockerReadClient {
@@ -35,6 +36,7 @@ func projectDockerRead(client dockerReadClient) dockerReadClient {
 		listContainersStrict: client.ListManagedContainersStrict,
 		listVolumeWriters:    client.ListVolumeWriters,
 		listNetworks:         client.ListIdleManagedNetworks, containerEvents: client.ContainerEvents,
+		seccompCensus: client.TenantSeccompCensus,
 	}
 }
 
@@ -64,6 +66,9 @@ func (v dockerReadView) ListIdleManagedNetworks(ctx context.Context) ([]networkt
 }
 func (v dockerReadView) ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error) {
 	return v.containerEvents(ctx)
+}
+func (v dockerReadView) TenantSeccompCensus(ctx context.Context) (tenantSeccompCensus, error) {
+	return v.seccompCensus(ctx)
 }
 
 type composeReadView struct {
