@@ -408,6 +408,18 @@ var (
 		Help:      "Age in seconds of the oldest pending durable close intent; 0 when none are pending",
 	})
 
+	// oldestUnheldCloseIntentAgeSeconds is oldestCloseIntentAgeSeconds over
+	// the close intents that do NOT wait only on held volume deletions. A held
+	// close is expected to age while the hold executor finishes its deletion;
+	// close-age paging uses this gauge so that an old held close cannot page
+	// beside a young unheld one, nor be masked by it (ENG-1117).
+	oldestUnheldCloseIntentAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "oldest_unheld_close_intent_age_seconds",
+		Help:      "Age in seconds of the oldest pending durable close intent that is not waiting only on held volume deletions; 0 when none are pending",
+	})
+
 	// closeIntentsDeleteHeld counts pending close intents waiting on nothing
 	// but held volume deletions (every remaining managed volume of the close is
 	// held with its caller pending, and no container remains). The hold executor finishes

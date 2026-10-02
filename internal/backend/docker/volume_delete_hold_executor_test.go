@@ -735,6 +735,62 @@ func TestCloseIntentsDeleteHeldGauge(t *testing.T) {
 	closeCloseRecoveryBackend(t, b, stores)
 }
 
+// The unheld close-age gauge ages only the closes that do not wait on held
+// deletions, so a paging rule on it neither fires for an old held close beside
+// a young unheld one, nor is masked by it.
+func TestOldestUnheldCloseIntentAgeExcludesHeldCloses(t *testing.T) {
+	dir := t.TempDir()
+	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, &mockVolumeManager{})
+	const heldLease = "550e8400-e29b-41d4-a716-446655440701"
+	const unheldLease = "550e8400-e29b-41d4-a716-446655440702"
+	seedCloseLeaseFixture(t, b, stores, heldLease, "", 1)
+	seedCloseLeaseFixture(t, b, stores, unheldLease, "", 1)
+	heldName := canonicalVolumeName(heldLease, "app", 0)
+	unheldName := canonicalVolumeName(unheldLease, "app", 0)
+	var holds atomic.Value
+	holds.Store(pendingDeletes(heldName).withMapped(unheldName))
+	b.volumes = &mockVolumeManager{
+		ListFn:              func() ([]string, error) { return []string{heldName, unheldName}, nil },
+		VolumeDeleteHoldsFn: func() volumeDeleteHoldSnapshot { return holds.Load().(volumeDeleteHoldSnapshot) },
+		DestroyFn: func(_ context.Context, name string) error {
+			if name == heldName {
+				return heldDeleteErr(name)
+			}
+			return errors.New("injected unheld destroy failure")
+		},
+	}
+	installTestStorageMutationAdapters(b)
+	require.Error(t, b.doDeprovisionForTest(t, t.Context(), heldLease))
+	time.Sleep(20 * time.Millisecond) // the held close is the older one
+	require.Error(t, b.doDeprovisionForTest(t, t.Context(), unheldLease))
+	createdAt := func(lease string) time.Time {
+		claim, found, err := stores.callbacks.GetCloseIntent(lease)
+		require.NoError(t, err)
+		require.True(t, found)
+		return claim.CreatedAt()
+	}
+	now := createdAt(unheldLease).Add(time.Hour)
+
+	b.sampleCloseIntentMetrics(now)
+	assert.Equal(t, float64(2), testutil.ToFloat64(pendingCloseIntents))
+	assert.Equal(t, float64(1), testutil.ToFloat64(closeIntentsDeleteHeld))
+	assert.Equal(t, now.Sub(createdAt(heldLease)).Seconds(), testutil.ToFloat64(oldestCloseIntentAgeSeconds))
+	assert.Equal(t, now.Sub(createdAt(unheldLease)).Seconds(), testutil.ToFloat64(oldestUnheldCloseIntentAgeSeconds),
+		"the older held close does not age the unheld gauge")
+
+	holds.Store(pendingDeletes(heldName, unheldName))
+	b.sampleCloseIntentMetrics(now)
+	assert.Equal(t, float64(2), testutil.ToFloat64(closeIntentsDeleteHeld))
+	assert.Zero(t, testutil.ToFloat64(oldestUnheldCloseIntentAgeSeconds), "no unheld close: nothing to page on")
+
+	holds.Store(volumeDeleteHoldSnapshot{}.withMapped(heldName, unheldName))
+	b.sampleCloseIntentMetrics(now)
+	assert.Zero(t, testutil.ToFloat64(closeIntentsDeleteHeld))
+	assert.Equal(t, now.Sub(createdAt(heldLease)).Seconds(), testutil.ToFloat64(oldestUnheldCloseIntentAgeSeconds),
+		"a close whose hold is gone ages like any other")
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
 // A failed restore's rollback routes its destroy of a restore-created volume
 // through the same pre-lock check: a held deletion answers at once, with no
 // destroy and no lock wait, even while the executor holds the lease's
