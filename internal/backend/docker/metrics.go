@@ -5,6 +5,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 const (
@@ -406,6 +407,28 @@ var (
 		Help:      "Age in seconds of the oldest pending durable close intent; 0 when none are pending",
 	})
 
+	// closeIntentsDeleteHeld counts pending close intents waiting on nothing
+	// but held volume deletions (every managed volume of the close is held in
+	// the removal phase and no container remains). The hold executor finishes
+	// those on its own, so close-age alerting can exclude them (ENG-1117).
+	closeIntentsDeleteHeld = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "close_intents_delete_held",
+		Help:      "Pending close intents waiting only on held volume deletions",
+	})
+
+	// volumeDeleteHolds is the number of held volume deletions by phase,
+	// sampled by the Backend from its volume manager (ENG-1117). removal: tenant
+	// bytes may remain and the caller stays pending; residual: the volume is
+	// gone and only its quota project awaits the zero-usage proof.
+	volumeDeleteHolds = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_delete_holds",
+		Help:      "Volume deletions held per volume and retried in the background, by phase (removal|residual)",
+	}, []string{"phase"})
+
 	// leaseMutationUUIDSlots is the monotonically increasing number of lease
 	// identities whose callback aggregate has reserved permanent replay/close
 	// authority. It never falls when a lease closes; operators compare it with
@@ -560,8 +583,8 @@ var (
 
 	// volumeDeleteHeldResidualMB is the admission term for held deletions in
 	// their residual phase: the sum of their projects' footprints (each
-	// project's block hard limit), in MiB, already counted in the retained-disk
-	// projection (ENG-1117).
+	// project's block hard limit, or its used blocks when larger), in MiB,
+	// already counted in the retained-disk projection (ENG-1117).
 	volumeDeleteHeldResidualMB = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
@@ -1232,6 +1255,10 @@ func init() {
 	for _, outcome := range volumeDeleteOutcomes {
 		volumeDeleteOutcomesTotal.WithLabelValues(outcome).Add(0)
 	}
+	for _, phase := range []string{volumeDeleteHoldPhaseRemoval, volumeDeleteHoldPhaseResidual} {
+		volumeDeleteHolds.WithLabelValues(phase).Set(0)
+	}
+	background.CleanupPanicsTotal.WithLabelValues(volumeDeleteHoldComponent).Add(0)
 	// Pre-init the two unlabeled partition counters to 0 so a stamp/eviction-rate
 	// query reads 0, not no-data, before the first event. Their increments are
 	// wired at the close path (stamped) and the L2 eviction pass (evicted) in the

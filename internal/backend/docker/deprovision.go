@@ -263,6 +263,13 @@ func (b *Backend) doDeprovisionScoped(
 			if !pending.RetryableNow() {
 				return fmt.Errorf("recovered close remains ambiguous: %w", pending)
 			}
+			if b.closeAwaitsHeldDeletes(claim, b.volumes.VolumeDeleteHolds()) {
+				// Only held volume deletions remain, and the hold executor finishes
+				// them and resumes this close. Answer the observable pending (503
+				// lifecycle_pending) without advancing the durable generation or
+				// rewriting diagnostics (ENG-1117).
+				return pending
+			}
 			execution, retryErr := b.closeSettlement.RetryCloseExecution(pending)
 			if retryErr != nil {
 				return fmt.Errorf("start retryable close generation: %w", retryErr)
