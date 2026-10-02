@@ -376,6 +376,10 @@ type Backend struct {
 	// actor goroutine. Guarded by actorsMu with the registry itself.
 	actorRecoveryClaims map[string]*leaseActorRecoveryClaimState
 
+	// projidAudit is the detect-only project-ID audit of managed XFS
+	// volumes. It holds the read view and an attribute getter with no setter.
+	projidAudit *projidAuditor
+
 	// inspector / gatherer / provisionStore are the substrate-agnostic
 	// seams the lease state machine consumes via leaseActor.cfg. Wired
 	// at backend construction (NewBackend and the test helpers
@@ -2666,6 +2670,7 @@ func newBackend(
 	b.inspector = &dockerInstanceInspector{docker: b.docker}
 	b.gatherer = &dockerDiagnosticsGatherer{backend: b}
 	b.provisionStore = &backendProvisionStore{backend: b}
+	b.projidAudit = newProjidAuditor(b.volumes, xfsProjectAttributeGetter{}, b.logger)
 
 	// Gate custom-domain HTTP-01 issuance on the domain being resolvable
 	// (ENG-266): don't fire an ACME order while the name is still NXDOMAIN, or a
@@ -2913,6 +2918,9 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Report containers that do not run under the current tenant seccomp
 	// profile. The first pass runs now, in the background, after recovery.
 	b.wg.Go(b.tenantSeccompCensusLoop)
+	// Audit managed XFS volumes for project-ID drift, detect only. The first
+	// pass waits projidAuditFirstDelay so it never competes with startup.
+	b.wg.Go(b.projidAuditLoop)
 
 	// Sample actor inbox depth and stuck-seconds on a ticker for the
 	// fred_docker_backend_lease_actor_* observability gauges. Prime the durable

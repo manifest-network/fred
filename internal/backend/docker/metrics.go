@@ -386,6 +386,25 @@ var (
 		Help:      "Tenant seccomp census passes by outcome (ok or error)",
 	}, []string{"outcome"})
 
+	// volumeProjidAuditTotal counts audited volumes by outcome: clean, drift,
+	// too_deep, incomplete, changed, error, or skipped for a volume being
+	// deleted. The audit only reads; drift means investigate.
+	volumeProjidAuditTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_projid_audit_total",
+		Help:      "Managed XFS volumes audited for project-ID drift, by outcome",
+	}, []string{"outcome"})
+
+	// volumesWithProjidDrift is the number of managed volumes whose last
+	// audit found drift, recomputed after every audit pass.
+	volumesWithProjidDrift = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volumes_with_projid_drift",
+		Help:      "Managed XFS volumes whose last project-ID audit found drift",
+	})
+
 	// tenantSeccompProfileReady is 1 when the last request for the tenant
 	// seccomp profile, by any sink, found it and its sealed file usable.
 	tenantSeccompProfileReady = promauto.NewGauge(prometheus.GaugeOpts{
@@ -1230,6 +1249,9 @@ func init() {
 	}
 	for _, outcome := range tenantSeccompCensusOutcomes {
 		tenantSeccompCensusTotal.WithLabelValues(outcome).Add(0)
+	}
+	for _, outcome := range projidAuditOutcomes {
+		volumeProjidAuditTotal.WithLabelValues(outcome.label()).Add(0)
 	}
 	for _, outcome := range []string{"busy", "inhibited", "shared", "below_threshold", "removed", "error", "panic"} {
 		imageGCTotal.WithLabelValues(outcome).Add(0)

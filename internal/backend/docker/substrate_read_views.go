@@ -95,6 +95,7 @@ type volumeReadView struct {
 	pinNamespaceRoot     func(managedVolumeName) (*fsidentity.Directory, error)
 	usage                func(context.Context, string) (int64, error)
 	kind                 func() string
+	openProjectIDAudit   func(context.Context, managedVolumeName) (*projidAuditVolume, error)
 }
 
 type pinnedVolumeReadView struct {
@@ -114,6 +115,7 @@ func projectVolumeRead(volumes volumeReader) volumeReader {
 		validate:             volumes.Validate, hostPath: volumes.HostPath,
 		pinNamespaceRoot: volumes.PinNamespaceRoot,
 		usage:            volumes.Usage, kind: volumes.Kind,
+		openProjectIDAudit: volumes.OpenProjectIDAudit,
 	}
 	if pinner, ok := volumes.(identityRootPinner); ok {
 		return pinnedVolumeReadView{volumeReadView: view, pin: pinner.PinIdentityRoot, verify: pinner.VerifyIdentityRoot}
@@ -141,8 +143,11 @@ func (v volumeReadView) Validate() error                                     { r
 func (v volumeReadView) HostPath(name string) string                         { return v.hostPath(name) }
 func (v volumeReadView) Usage(ctx context.Context, id string) (int64, error) { return v.usage(ctx, id) }
 func (v volumeReadView) Kind() string                                        { return v.kind() }
-func (v pinnedVolumeReadView) PinIdentityRoot() error                        { return v.pin() }
-func (v pinnedVolumeReadView) VerifyIdentityRoot() error                     { return v.verify() }
+func (v volumeReadView) OpenProjectIDAudit(ctx context.Context, name managedVolumeName) (*projidAuditVolume, error) {
+	return v.openProjectIDAudit(ctx, name)
+}
+func (v pinnedVolumeReadView) PinIdentityRoot() error    { return v.pin() }
+func (v pinnedVolumeReadView) VerifyIdentityRoot() error { return v.verify() }
 
 func (v volumeReadView) PinNamespaceRoot(name managedVolumeName) (*fsidentity.Directory, error) {
 	return v.pinNamespaceRoot(name)
