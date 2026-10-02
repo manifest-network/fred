@@ -64,6 +64,12 @@ linters:
           msg: "managed-volume destruction must use the construction-bound substrate mutation executor"
         - pattern: 'volumes\.Create$'
           msg: "managed-volume creation must use the construction-bound substrate mutation executor"
+        # An on-chain lease close cannot be undone. The raw chain sink is
+        # called only from its typed wrappers, each one closing reason with its
+        # own evidence (the failure-budget close takes the sealed
+        # terminalverdict proof, ENG-799).
+        - pattern: '\.closeActiveLeaseOnChain$'
+          msg: "close a lease through a typed wrapper in internal/provisioner/reconcile_close.go"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -96,6 +102,12 @@ linters:
       - path: ^internal/backend/docker/storage_mutation_guard\.go$
         linters:
           - forbidigo
+      # The only file allowed to call the raw on-chain close; it holds the
+      # typed close wrappers.
+      - path: ^internal/provisioner/reconcile_close\.go$
+        linters:
+          - forbidigo
+        text: "closeActiveLeaseOnChain"
       # Exclude test files from strict linters
       - path: _test\.go
         linters:
