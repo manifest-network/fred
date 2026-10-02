@@ -178,9 +178,13 @@ type AuthorityReport struct {
 	// reading backend inventories but never durably projected them (a stop or
 	// crash mid-sweep).
 	PendingInventorySweepID uint64 `json:"pending_inventory_sweep_id,omitempty"`
-	// InventorySweepReporters is that sweep's reporter journal: the backends
-	// that answered it with at least one lease. When InventorySweepUntracked
-	// is set the chain cannot name them, and every active backend counts.
+	// InventorySweepReporters is the reporter journal of the whole unresolved
+	// sweep chain that sweep ends, not of that sweep alone: every backend that
+	// answered any sweep of the chain with at least one lease. A chain starts
+	// at a sweep that inherits nothing unresolved, and each sweep that begins
+	// while it is still unresolved inherits its journal. When
+	// InventorySweepUntracked is set the chain cannot name its reporters, and
+	// every active backend counts.
 	InventorySweepReporters        []string `json:"inventory_sweep_reporters,omitempty"`
 	InventorySweepReportersOmitted int      `json:"inventory_sweep_reporters_omitted,omitempty"`
 	InventorySweepUntracked        bool     `json:"inventory_sweep_untracked,omitempty"`
@@ -842,15 +846,25 @@ func inspectCurrentMetadata(
 
 // inspectPendingInventorySweep reports a sweep that began but never projected
 // and derives which active backends a restart with them fenced would record as
-// unprojected reporters. It applies sweepReporterJournal.mayHoldLostPositive,
-// the rule the store applies at open, to the validated metadata.
+// unprojected reporters. fenceRestartRecords, the function the store applies
+// at open, decides the set from the validated metadata.
 func inspectPendingInventorySweep(metadata topologyMetadata, assessment *authorityAssessment) {
-	if metadata.PendingInventorySweepID == 0 ||
-		validateCanonicalBackendNames(metadata.Topology, false) != nil ||
+	if validateCanonicalBackendNames(metadata.Topology, false) != nil ||
 		!authorityBackendNamesSafe(metadata.Topology) {
 		return
 	}
 	journal := sweepReporterJournalFromMetadata(metadata)
+	bounded, omitted := boundedAuthorityIdentities(
+		fenceRestartRecords(metadata.PendingInventorySweepID, journal, metadata.Topology),
+	)
+	if bounded == nil {
+		bounded = []string{}
+	}
+	assessment.report.FenceRestartWouldRecord = bounded
+	assessment.report.FenceRestartWouldRecordOmitted = omitted
+	if metadata.PendingInventorySweepID == 0 {
+		return
+	}
 	assessment.report.PendingInventorySweepID = metadata.PendingInventorySweepID
 	assessment.report.InventorySweepUntracked = !journal.tracked
 	if reporters := journal.names(); authorityBackendNamesSafe(reporters) {
@@ -858,18 +872,6 @@ func inspectPendingInventorySweep(metadata topologyMetadata, assessment *authori
 			assessment.report.InventorySweepReportersOmitted =
 			boundedAuthorityIdentities(reporters)
 	}
-	wouldRecord := make([]string, 0, len(metadata.Topology))
-	for _, backendName := range metadata.Topology {
-		if journal.mayHoldLostPositive(backendName) {
-			wouldRecord = append(wouldRecord, backendName)
-		}
-	}
-	bounded, omitted := boundedAuthorityIdentities(wouldRecord)
-	if bounded == nil {
-		bounded = []string{}
-	}
-	assessment.report.FenceRestartWouldRecord = bounded
-	assessment.report.FenceRestartWouldRecordOmitted = omitted
 }
 
 func inspectAuthorityStorageBindings(

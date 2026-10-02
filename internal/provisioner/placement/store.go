@@ -4225,17 +4225,15 @@ func nextUnprojectedFencedReporters(current, abandoned, answered []string) []str
 }
 
 // inheritedFencedReportersAtOpen names the fenced backends that may hold a
-// positive the pending chain lost: the journaled ones, or every fenced
-// backend when the chain is untracked and cannot name its reporters.
+// positive the pending chain lost. fenceRestartRecords decides, so offline
+// classification reports exactly this set before the fence is applied.
 func (s *Store) inheritedFencedReportersAtOpen() map[string]struct{} {
-	inherited := make(map[string]struct{})
-	if s.pendingInventorySweepID == 0 {
-		return inherited
-	}
-	for backendName := range s.fencedBackends {
-		if s.inventoryReporters.mayHoldLostPositive(backendName) {
-			inherited[backendName] = struct{}{}
-		}
+	records := fenceRestartRecords(
+		s.pendingInventorySweepID, s.inventoryReporters, slices.Sorted(maps.Keys(s.fencedBackends)),
+	)
+	inherited := make(map[string]struct{}, len(records))
+	for _, backendName := range records {
+		inherited[backendName] = struct{}{}
 	}
 	return inherited
 }

@@ -677,3 +677,30 @@ func TestInheritedFenceCoverageBindsReportersToTheirPins(t *testing.T) {
 			})
 	}
 }
+
+// TestFenceRestartRecordsIsGatedOnAPendingSweep pins the one gate store open
+// and offline classification share. Nothing is inherited once the marker
+// cleared, whatever the journal says; a pending tracked chain names only its
+// journaled reporters; a pending untracked chain names every candidate.
+func TestFenceRestartRecordsIsGatedOnAPendingSweep(t *testing.T) {
+	candidates := []string{"backend-a", "backend-b", "backend-c"}
+	tracked := trackedSweepReporters().with("backend-b")
+	for _, test := range []struct {
+		name    string
+		sweepID uint64
+		journal sweepReporterJournal
+		want    []string
+	}{
+		{"no sweep pending, untracked journal", 0, untrackedSweepReporters(), []string{}},
+		{"no sweep pending, tracked journal", 0, tracked, []string{}},
+		{"pending tracked chain", 7, tracked, []string{"backend-b"}},
+		{"pending tracked chain without reporters", 7, trackedSweepReporters(), []string{}},
+		{"pending untracked chain", 7, untrackedSweepReporters(), candidates},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := fenceRestartRecords(test.sweepID, test.journal, candidates)
+			require.NotNil(t, got, "classification renders it as a list, never null")
+			assert.Equal(t, test.want, got)
+		})
+	}
+}
