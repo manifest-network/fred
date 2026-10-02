@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 )
 
@@ -34,6 +35,14 @@ import (
 //
 // The verdict is exhausted only while the lease is Failed, and only if the
 // failure that made it Failed was itself counted.
+//
+// The Ready boundary is structural rather than wired into each transition by
+// hand: SetStatus is the only writer of ProvisionState.Status, and
+// InheritTerminalBudget the only way a budget moves onto a replacement
+// projection. Both apply crossStatus, so a transition into or out of Ready
+// that a future change adds gets the anchor and the reset without remembering
+// them. internal/testutil's guard rejects any other write to Status or
+// TerminalBudget, and to the budget's fields outside this file.
 
 const (
 	// terminalBudgetThreshold is the number of consecutive counted failures
@@ -46,9 +55,9 @@ const (
 )
 
 // TerminalBudget is one lease's consecutive-failure budget. It is opaque: a
-// substrate may carry it across projection rebuilds or replace it with the
-// zero value, but only the lease actor can advance it, so no off-actor path can
-// make a lease closable. The zero value is a fresh budget.
+// substrate may carry it onto a rebuilt projection only through
+// InheritTerminalBudget, and only the lease actor can advance it, so no
+// off-actor path can make a lease closable. The zero value is a fresh budget.
 type TerminalBudget struct {
 	// leaseUUID binds the budget to its lease. A copy carried onto another
 	// lease's projection reads, and is mutated, as a fresh budget.
@@ -57,12 +66,12 @@ type TerminalBudget struct {
 	// alone never decays it, so the wire observation changes only at
 	// transitions.
 	consecutive int
-	// readySince is when the lease last entered Ready. It is zero while the
-	// lease is not Ready; an off-actor Ready projection may leave an older,
-	// earlier anchor in place, which can only bring a reset forward.
+	// readySince is when the lease last entered Ready. crossStatus writes it
+	// on every Ready entry and clears it at every Ready exit; nothing else
+	// does.
 	readySince time.Time
-	// lastFailureCounted is true only from a counted failure until the next
-	// Provisioning or Ready entry or uncounted failure.
+	// lastFailureCounted is true only from a counted Ready -> Failing failure
+	// until the next status change other than Failing -> Failed.
 	lastFailureCounted bool
 }
 
@@ -80,9 +89,25 @@ type budgetOutcome struct {
 // for the verdict to read exhausted. It is an allowlist: every other declared
 // Reason, and any unrecognized value, is ineligible. It is never sufficient on
 // its own, because Reason is tenant-facing text that mixes causes (ENG-508).
+// At record time the death entry action has just written ContainerExited, so
+// the check there is defense in depth; it decides at observe time.
 func reasonEligibleForBudget(reason backend.Reason) bool {
 	switch reason {
 	case backend.ReasonContainerExited:
+		return true
+	default:
+		return false
+	}
+}
+
+// tenantInitiatedMaintenance is an allowlist of the accepted maintenance
+// commands a tenant starts, which reset the streak like `docker restart`
+// resets RestartCount. A custom-domain redeploy is started by the platform's
+// reconciler, and a restore admits a new lease whose budget is already fresh;
+// neither resets, nor does any kind added later until it is decided here.
+func tenantInitiatedMaintenance(kind shared.MaintenanceIntentKind) bool {
+	switch kind {
+	case shared.MaintenanceIntentRestart, shared.MaintenanceIntentUpdate:
 		return true
 	default:
 		return false
@@ -98,35 +123,82 @@ func (p *ProvisionState) boundBudget() *TerminalBudget {
 	return &p.TerminalBudget
 }
 
-// budgetEnterProvisioning: a new attempt is not the failure that preceded it.
-func (p *ProvisionState) budgetEnterProvisioning() {
-	p.boundBudget().lastFailureCounted = false
+// SetStatus is the only writer of ProvisionState.Status (ENG-799). The lease
+// state machine's entry actions and a substrate's own projection writes both
+// go through it, so the terminal budget's Ready boundary holds for every
+// present and future transition:
+//
+//   - entering Ready anchors the sustained-Ready period at now (R1);
+//   - leaving Ready resets the consecutive count when the lease was Ready for
+//     terminalBudgetResetAfter, then clears the anchor (R2);
+//   - a counted failure stays current only from Failing to Failed; any other
+//     change ends it.
+//
+// It never increments the count, so a substrate may call it outside the lease
+// actor: it can only move the budget toward a reset.
+func (p *ProvisionState) SetStatus(status backend.ProvisionStatus, now time.Time) {
+	p.boundBudget().crossStatus(p.Status, status, now)
+	p.Status = status
 }
 
-// budgetEnterReady anchors the sustained-Ready reset on this Ready entry.
-func (p *ProvisionState) budgetEnterReady(now time.Time) {
-	p.ObserveReadyProjection(now)
-}
-
-// budgetExitReady applies the sustained-Ready reset when the lease leaves
-// Ready, before the transition's own effect, then clears the anchor. It is a
-// no-op for a lease that is not Ready.
-func (p *ProvisionState) budgetExitReady(now time.Time) {
-	budget := p.boundBudget()
-	if readyLongEnough(budget, now) {
-		budget.consecutive = 0
+// InheritTerminalBudget carries predecessor's budget onto p, a rebuilt
+// projection that replaces it, such as a recovery rebuild or an awaited-Ready
+// promotion. The replacement is a status change from the predecessor's status
+// to p's own, so the Ready boundary applies exactly as SetStatus applies it;
+// re-observing the same status crosses nothing and changes nothing. A nil
+// predecessor, or one for another lease, leaves a fresh budget, anchored when
+// p is Ready. Call it after p's status is final. Like SetStatus it can only
+// move the budget toward a reset; it is the only way a budget moves from one
+// projection to another.
+func (p *ProvisionState) InheritTerminalBudget(predecessor *ProvisionState, now time.Time) {
+	from := backend.ProvisionStatus("")
+	p.TerminalBudget = TerminalBudget{}
+	if predecessor != nil && predecessor.LeaseUUID == p.LeaseUUID &&
+		predecessor.TerminalBudget.leaseUUID == p.LeaseUUID {
+		from = predecessor.Status
+		p.TerminalBudget = predecessor.TerminalBudget
 	}
-	budget.readySince = time.Time{}
+	budget := p.boundBudget()
+	if from != p.Status {
+		budget.crossStatus(from, p.Status, now)
+	}
 }
 
-// budgetRecordFailure records one failure that ends the current state. It
-// must run after the closure has written p.Reason. A failure from Ready is an
-// exit from Ready, so the sustained-Ready reset applies first.
-func (p *ProvisionState) budgetRecordFailure(cause failurecause.Cause, now time.Time) budgetOutcome {
-	p.budgetExitReady(now)
+// crossStatus is the one implementation of the Ready boundary. SetStatus and
+// InheritTerminalBudget are its only callers.
+func (b *TerminalBudget) crossStatus(from, to backend.ProvisionStatus, now time.Time) {
+	wasReady := from == backend.ProvisionStatusReady
+	isReady := to == backend.ProvisionStatusReady
+	switch {
+	case wasReady && !isReady:
+		if !b.readySince.IsZero() && now.Sub(b.readySince) >= terminalBudgetResetAfter {
+			b.consecutive = 0
+		}
+		b.readySince = time.Time{}
+	case !wasReady && isReady:
+		b.readySince = now
+	}
+	if from != backend.ProvisionStatusFailing || to != backend.ProvisionStatusFailed {
+		b.lastFailureCounted = false
+	}
+}
+
+// recordFailure is how the lease state machine records a failure: the status
+// change the failure caused, through SetStatus, and then the failure itself.
+// Fixing the order here means the sustained-Ready reset always applies before
+// a counted failure increments the streak. Only the death of a Ready lease's
+// workload (Ready -> Failing) can count, whatever cause a caller passes. It
+// must run after the closure has written p.Reason.
+func (p *ProvisionState) recordFailure(
+	to backend.ProvisionStatus,
+	cause failurecause.Cause,
+	now time.Time,
+) budgetOutcome {
+	from := p.Status
+	p.SetStatus(to, now)
 	budget := p.boundBudget()
-	if !cause.Counts() || !reasonEligibleForBudget(p.Reason) {
-		budget.lastFailureCounted = false
+	deathOfReadyWorkload := from == backend.ProvisionStatusReady && to == backend.ProvisionStatusFailing
+	if !deathOfReadyWorkload || !cause.Counts() || !reasonEligibleForBudget(p.Reason) {
 		return budgetOutcome{cause: cause, consecutive: budget.consecutive}
 	}
 	budget.consecutive++
@@ -139,22 +211,12 @@ func (p *ProvisionState) budgetRecordFailure(cause failurecause.Cause, now time.
 	}
 }
 
-// budgetResetByTenant: a tenant restart or update starts a fresh streak.
+// budgetResetByTenant: an accepted tenant restart or update starts a fresh
+// streak.
 func (p *ProvisionState) budgetResetByTenant() {
 	budget := p.boundBudget()
 	budget.consecutive = 0
 	budget.lastFailureCounted = false
-}
-
-// budgetClearCurrentFailure re-asserts, without recording anything new, that
-// the current failure is not a counted one. Recovery re-application uses it so
-// a replay can neither count nor emit a metric twice.
-func (p *ProvisionState) budgetClearCurrentFailure() {
-	p.boundBudget().lastFailureCounted = false
-}
-
-func readyLongEnough(budget *TerminalBudget, now time.Time) bool {
-	return !budget.readySince.IsZero() && now.Sub(budget.readySince) >= terminalBudgetResetAfter
 }
 
 // deathTermination maps the death guard's fresh substrate inspection to the
@@ -204,32 +266,6 @@ func (lsm *leaseSM) observeBudgetOutcome(
 		}
 	}
 	cfg.Logger.Warn("tenant workload failure counted", attrs...)
-}
-
-// ObserveReadyProjection records a Ready projection that a substrate wrote
-// outside the lease actor (a recovery rebuild or promotion). It can only move
-// the budget toward a reset: it anchors the Ready period only if none is
-// recorded, so an earlier anchor wins, and it marks the current failure as not
-// counted. It never increases the count.
-func (p *ProvisionState) ObserveReadyProjection(now time.Time) {
-	budget := p.boundBudget()
-	if budget.readySince.IsZero() {
-		budget.readySince = now
-	}
-	budget.lastFailureCounted = false
-}
-
-// ObserveUncountedFailureProjection records a failure that a substrate wrote
-// outside the lease actor, which never counts. It can only move the budget
-// toward a reset: it applies the sustained-Ready reset when one is due and
-// marks the current failure as not counted. It leaves the Ready anchor in
-// place, so a later reset can only come sooner.
-func (p *ProvisionState) ObserveUncountedFailureProjection(now time.Time) {
-	budget := p.boundBudget()
-	if readyLongEnough(budget, now) {
-		budget.consecutive = 0
-	}
-	budget.lastFailureCounted = false
 }
 
 // ObserveTerminalBudget is the single place a backend mints the wire

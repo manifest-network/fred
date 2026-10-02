@@ -18,9 +18,10 @@ import (
 // *provision (ENG-193, ENG-229 category B).
 //
 // It embeds leasesm.ProvisionState exactly as *provision does. The only methods
-// that promotes are the terminal-budget observers, which read the projection or
-// can only move its budget toward a reset, so materialize stays a trivial
-// struct copy. The construction literals carry a //exhaustruct:enforce
+// that promotes are SetStatus, InheritTerminalBudget and ObserveTerminalBudget,
+// which write the status through the terminal budget's Ready boundary, carry a
+// budget toward a reset, or read the projection (ENG-799), so materialize stays
+// a trivial struct copy. The construction literals carry a //exhaustruct:enforce
 // directive (exhaustruct runs in directive-only mode — exclude: ['.*'] in
 // .golangci.yml), so a newly-added ProvisionState/wrapper field forces the
 // ANNOTATED publish-input literals (the reservation, the recover build loop,

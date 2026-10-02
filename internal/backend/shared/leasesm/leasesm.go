@@ -118,10 +118,13 @@ type DiagnosticsGatherer interface {
 // though substrates translate them to substrate-specific shapes
 // (Docker compose-spec, K8s pod spec) at provision time.
 type ProvisionState struct {
-	LeaseUUID            string
-	Tenant               string
-	ProviderUUID         string
-	SKU                  string
+	LeaseUUID    string
+	Tenant       string
+	ProviderUUID string
+	SKU          string
+	// Status is written only through SetStatus, which applies the terminal
+	// budget's Ready boundary (ENG-799); a construction literal may name only
+	// a non-Ready constant. internal/testutil's guard enforces both.
 	Status               backend.ProvisionStatus
 	Quantity             int
 	CreatedAt            time.Time
@@ -152,9 +155,11 @@ type ProvisionState struct {
 	StackManifest     *manifest.StackManifest
 	ServiceContainers map[string][]string
 	// TerminalBudget is the consecutive tenant-workload failure budget
-	// (ENG-799). Only the lease actor advances it; substrates carry it across
-	// projection rebuilds and may only move it toward a reset (see
-	// terminal_budget.go).
+	// (ENG-799). Only the lease actor advances it. A substrate carries it onto
+	// a rebuilt projection only through InheritTerminalBudget, and SetStatus
+	// and InheritTerminalBudget can only move it toward a reset (see
+	// terminal_budget.go). A construction literal may only name the zero
+	// value.
 	TerminalBudget TerminalBudget
 }
 
@@ -192,8 +197,9 @@ type ProvisionState struct {
 // variables. The pattern:
 //
 //	var callbackURL string
+//	now := time.Now() // outside: the closure derives nothing from mutable outer state
 //	cfg.ProvisionStore.UpdateFn(uuid, func(p *ProvisionState) {
-//	    p.Status = backend.ProvisionStatusReady
+//	    p.SetStatus(backend.ProvisionStatusReady, now)
 //	    p.LastError = ""
 //	    callbackURL = p.CallbackURL // capture for post-Unlock use
 //	})

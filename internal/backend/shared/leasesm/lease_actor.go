@@ -1375,9 +1375,13 @@ func (a *LeaseActor) handleMaintenanceRecovered(msg maintenanceRecoveredMsg) err
 		case maintenanceRecoveredSuccess:
 			err = a.sm.applyMaintenanceRecoveredSuccess(msg.success)
 		case maintenanceRecoveredFailureReady, maintenanceRecoveredFailureFailed:
-			err = a.sm.applyMaintenanceRecoveredFailure(msg.success, msg.failure, desired)
+			err = a.sm.applyMaintenanceRecoveredFailure(
+				msg.success, msg.failure, desired, recoveredFailureRecord{},
+			)
 		case maintenanceRecoveredSuccessRuntimeFailed:
-			err = a.sm.applyMaintenanceRecoveredRuntimeFailure(msg.success, msg.failure)
+			err = a.sm.applyMaintenanceRecoveredRuntimeFailure(
+				msg.success, msg.failure, recoveredFailureRecord{},
+			)
 		default:
 			return errors.New("maintenance recovery message has invalid outcome")
 		}

@@ -9,8 +9,10 @@ import (
 	"go/token"
 	"maps"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -54,126 +56,239 @@ func tenantCause() failurecause.Cause {
 
 // --- unit tests: the budget rules ---------------------------------------------
 
+// readyAt returns a projection of the test lease with the given recorded
+// streak, which entered Ready at t0 through SetStatus.
+func readyAt(t0 time.Time, consecutive int) *ProvisionState {
+	p := &ProvisionState{
+		LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusProvisioning,
+		Reason:         backend.ReasonContainerExited,
+		TerminalBudget: TerminalBudget{leaseUUID: testActorLeaseUUID, consecutive: consecutive},
+	}
+	p.SetStatus(backend.ProvisionStatusReady, t0)
+	return p
+}
+
+// everyStatus is the declared status vocabulary plus values a projection must
+// tolerate without a special case.
+var everyStatus = []backend.ProvisionStatus{
+	backend.ProvisionStatusProvisioning, backend.ProvisionStatusReady, backend.ProvisionStatusFailing,
+	backend.ProvisionStatusFailed, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating,
+	backend.ProvisionStatusDeprovisioning, backend.ProvisionStatusRetained, backend.ProvisionStatusUnknown,
+	"", "bogus",
+}
+
+func uncountedCauses() []failurecause.Cause {
+	return []failurecause.Cause{
+		{}, failurecause.Platform(), failurecause.Maintenance(),
+		failurecause.ClassifyDeath(signaledRun(), failurecause.Exited()),
+	}
+}
+
 func TestTerminalBudget_ConsecutiveCountAndSustainedReadyReset(t *testing.T) {
 	t0 := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
-	newProjection := func() *ProvisionState {
-		return &ProvisionState{LeaseUUID: testActorLeaseUUID, Reason: backend.ReasonContainerExited}
-	}
 
-	t.Run("three counted failures inside the window exhaust", func(t *testing.T) {
-		p := newProjection()
+	t.Run("three counted deaths inside the window exhaust", func(t *testing.T) {
+		p := readyAt(t0, 0)
 		now := t0
 		for want := 1; want <= terminalBudgetThreshold; want++ {
-			p.budgetEnterProvisioning()
-			p.budgetEnterReady(now)
 			now = now.Add(time.Minute)
-			outcome := p.budgetRecordFailure(tenantCause(), now)
+			outcome := p.recordFailure(backend.ProvisionStatusFailing, tenantCause(), now)
 			require.True(t, outcome.counted)
 			assert.Equal(t, want, outcome.consecutive)
 			assert.Equal(t, want >= terminalBudgetThreshold, outcome.exhausted)
+			p.SetStatus(backend.ProvisionStatusFailed, now) // diagnostics gathered
+			assert.True(t, p.TerminalBudget.lastFailureCounted, "Failing -> Failed keeps the counted failure")
+			p.SetStatus(backend.ProvisionStatusProvisioning, now)
+			assert.False(t, p.TerminalBudget.lastFailureCounted, "a new attempt ends the counted failure")
+			p.SetStatus(backend.ProvisionStatusReady, now)
 		}
 	})
 
-	t.Run("a failure after the reset period starts a new streak", func(t *testing.T) {
+	t.Run("a death after the reset period starts a new streak", func(t *testing.T) {
 		for _, ready := range []time.Duration{terminalBudgetResetAfter, terminalBudgetResetAfter + time.Hour} {
-			p := newProjection()
-			p.TerminalBudget = TerminalBudget{leaseUUID: testActorLeaseUUID, consecutive: 2}
-			p.budgetEnterReady(t0)
-			outcome := p.budgetRecordFailure(tenantCause(), t0.Add(ready))
+			p := readyAt(t0, 2)
+			outcome := p.recordFailure(backend.ProvisionStatusFailing, tenantCause(), t0.Add(ready))
 			assert.Equal(t, 1, outcome.consecutive, "Ready for %s must reset the streak", ready)
 		}
-		p := newProjection()
-		p.TerminalBudget = TerminalBudget{leaseUUID: testActorLeaseUUID, consecutive: 2}
-		p.budgetEnterReady(t0)
-		outcome := p.budgetRecordFailure(tenantCause(), t0.Add(terminalBudgetResetAfter-time.Nanosecond))
+		p := readyAt(t0, 2)
+		outcome := p.recordFailure(backend.ProvisionStatusFailing, tenantCause(),
+			t0.Add(terminalBudgetResetAfter-time.Nanosecond))
 		assert.Equal(t, 3, outcome.consecutive, "just short of the reset period the streak continues")
 		assert.True(t, outcome.exhausted)
 	})
 
-	t.Run("a failure while not Ready never resets", func(t *testing.T) {
-		p := newProjection()
-		p.TerminalBudget = TerminalBudget{leaseUUID: testActorLeaseUUID, consecutive: 2}
-		outcome := p.budgetRecordFailure(tenantCause(), t0.Add(24*time.Hour))
-		assert.Equal(t, 3, outcome.consecutive)
+	t.Run("a counting cause counts only for the death of a Ready workload", func(t *testing.T) {
+		for _, from := range everyStatus {
+			for _, to := range everyStatus {
+				if from == backend.ProvisionStatusReady && to == backend.ProvisionStatusFailing {
+					continue
+				}
+				p := &ProvisionState{
+					LeaseUUID: testActorLeaseUUID, Status: from, Reason: backend.ReasonContainerExited,
+					TerminalBudget: TerminalBudget{leaseUUID: testActorLeaseUUID, consecutive: 2},
+				}
+				outcome := p.recordFailure(to, tenantCause(), t0)
+				assert.False(t, outcome.counted, "%s -> %s", from, to)
+				assert.Equal(t, 2, p.TerminalBudget.consecutive, "%s -> %s", from, to)
+				assert.False(t, p.TerminalBudget.lastFailureCounted, "%s -> %s", from, to)
+				assert.Equal(t, to, p.Status, "the failure is the status change")
+			}
+		}
 	})
 
-	t.Run("an uncounted failure neither increments nor resets", func(t *testing.T) {
-		for _, cause := range []failurecause.Cause{
-			{}, failurecause.Platform(), failurecause.Maintenance(),
-			failurecause.ClassifyDeath(signaledRun(), failurecause.Exited()),
-		} {
-			p := newProjection()
-			p.TerminalBudget = TerminalBudget{
-				leaseUUID: testActorLeaseUUID, consecutive: 2, lastFailureCounted: true,
-			}
-			p.budgetEnterReady(t0)
-			outcome := p.budgetRecordFailure(cause, t0.Add(time.Minute))
+	// BACKEND_GUIDE's normative rule: an uncounted failure never increments the
+	// streak, and as any exit from Ready it still applies the sustained-Ready
+	// reset; short of the reset period it leaves the streak unchanged.
+	t.Run("an uncounted failure never increments; leaving Ready applies the reset", func(t *testing.T) {
+		for _, cause := range uncountedCauses() {
+			short := readyAt(t0, 2)
+			outcome := short.recordFailure(backend.ProvisionStatusFailing, cause, t0.Add(time.Minute))
 			assert.False(t, outcome.counted, cause.Label())
-			assert.Equal(t, 2, p.TerminalBudget.consecutive, cause.Label())
-			assert.False(t, p.TerminalBudget.lastFailureCounted, cause.Label())
-			assert.True(t, p.TerminalBudget.readySince.IsZero(), "the failure ends the Ready period")
+			assert.Equal(t, 2, short.TerminalBudget.consecutive, cause.Label())
+			assert.False(t, short.TerminalBudget.lastFailureCounted, cause.Label())
+			assert.True(t, short.TerminalBudget.readySince.IsZero(), "the failure ends the Ready period")
+
+			sustained := readyAt(t0, 2)
+			outcome = sustained.recordFailure(backend.ProvisionStatusFailing, cause, t0.Add(11*time.Minute))
+			assert.False(t, outcome.counted, cause.Label())
+			assert.Zero(t, sustained.TerminalBudget.consecutive, "%s after a sustained Ready", cause.Label())
 		}
 	})
 
 	t.Run("an ineligible reason never counts", func(t *testing.T) {
 		for _, reason := range []backend.Reason{"", backend.ReasonInternal, backend.ReasonUnknown, "Bogus"} {
-			p := newProjection()
+			p := readyAt(t0, 0)
 			p.Reason = reason
-			outcome := p.budgetRecordFailure(tenantCause(), t0)
+			outcome := p.recordFailure(backend.ProvisionStatusFailing, tenantCause(), t0)
 			assert.False(t, outcome.counted, "reason %q", reason)
 			assert.Zero(t, p.TerminalBudget.consecutive)
 		}
 	})
 
 	t.Run("a budget carried onto another lease is fresh", func(t *testing.T) {
-		p := newProjection()
+		p := readyAt(t0, 0)
 		p.TerminalBudget = TerminalBudget{
 			leaseUUID: "22222222-2222-4222-8222-222222222222", consecutive: 2, lastFailureCounted: true,
 		}
 		assert.Equal(t, 0, p.ObserveTerminalBudget().ConsecutiveFailures)
-		outcome := p.budgetRecordFailure(tenantCause(), t0)
+		outcome := p.recordFailure(backend.ProvisionStatusFailing, tenantCause(), t0)
 		assert.Equal(t, 1, outcome.consecutive, "a foreign streak never contributes")
 		assert.Equal(t, testActorLeaseUUID, p.TerminalBudget.leaseUUID)
 	})
 
 	t.Run("a tenant reset clears the streak", func(t *testing.T) {
-		p := newProjection()
-		p.TerminalBudget = TerminalBudget{
-			leaseUUID: testActorLeaseUUID, consecutive: 2, lastFailureCounted: true,
-		}
+		p := readyAt(t0, 2)
+		p.TerminalBudget.lastFailureCounted = true
 		p.budgetResetByTenant()
 		assert.Zero(t, p.TerminalBudget.consecutive)
 		assert.False(t, p.TerminalBudget.lastFailureCounted)
 	})
+}
 
-	t.Run("provisioning and ready entries clear the counted failure, not the streak", func(t *testing.T) {
-		p := newProjection()
-		p.TerminalBudget = TerminalBudget{
-			leaseUUID: testActorLeaseUUID, consecutive: 2, lastFailureCounted: true,
+// SetStatus is the one Ready boundary. Every pair of statuses, from every
+// anchor and counted-failure state: entering Ready anchors at now, leaving
+// Ready resets after a sustained Ready and clears the anchor, nothing else
+// touches either, and a counted failure survives only Failing -> Failed.
+func TestSetStatus_ReadyBoundaryForEveryTransition(t *testing.T) {
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	anchors := []time.Time{{}, now.Add(-11 * time.Minute), now.Add(-time.Minute)}
+	for _, from := range everyStatus {
+		for _, to := range everyStatus {
+			for _, anchor := range anchors {
+				for _, counted := range []bool{false, true} {
+					p := &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: from}
+					p.TerminalBudget = TerminalBudget{
+						leaseUUID: testActorLeaseUUID, consecutive: 2, readySince: anchor, lastFailureCounted: counted,
+					}
+					p.SetStatus(to, now)
+					label := fmt.Sprintf("%q -> %q anchor=%v counted=%t", from, to, anchor, counted)
+					budget := p.TerminalBudget
+					require.Equal(t, to, p.Status, label)
+					switch {
+					case from == backend.ProvisionStatusReady && to != backend.ProvisionStatusReady:
+						want := 2
+						if !anchor.IsZero() && now.Sub(anchor) >= terminalBudgetResetAfter {
+							want = 0
+						}
+						assert.Equal(t, want, budget.consecutive, label)
+						assert.True(t, budget.readySince.IsZero(), label)
+					case from != backend.ProvisionStatusReady && to == backend.ProvisionStatusReady:
+						assert.Equal(t, 2, budget.consecutive, label)
+						assert.Equal(t, now, budget.readySince, label)
+					default:
+						assert.Equal(t, 2, budget.consecutive, label)
+						assert.Equal(t, anchor, budget.readySince, label)
+					}
+					keep := counted && from == backend.ProvisionStatusFailing && to == backend.ProvisionStatusFailed
+					assert.Equal(t, keep, budget.lastFailureCounted, label)
+				}
+			}
 		}
-		p.budgetEnterProvisioning()
-		assert.Equal(t, 2, p.TerminalBudget.consecutive)
-		assert.False(t, p.TerminalBudget.lastFailureCounted)
-		p.TerminalBudget.lastFailureCounted = true
-		p.budgetEnterReady(t0)
-		assert.Equal(t, 2, p.TerminalBudget.consecutive)
-		assert.False(t, p.TerminalBudget.lastFailureCounted)
-		p.budgetEnterReady(t0.Add(time.Hour))
-		assert.Equal(t, t0, p.TerminalBudget.readySince, "an existing Ready anchor is kept")
-	})
+	}
+}
+
+// A replacement projection inherits its predecessor's budget and crosses the
+// Ready boundary from the predecessor's status to its own; re-observing the
+// same status changes nothing. Without a predecessor of the same lease the
+// budget is fresh, anchored when the replacement is Ready.
+func TestInheritTerminalBudget_ReplacementCrossesTheReadyBoundary(t *testing.T) {
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	readySince := now.Add(-11 * time.Minute)
+	for _, from := range everyStatus {
+		for _, to := range everyStatus {
+			predecessor := &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: from}
+			predecessor.TerminalBudget = TerminalBudget{
+				leaseUUID: testActorLeaseUUID, consecutive: 2, lastFailureCounted: true,
+			}
+			if from == backend.ProvisionStatusReady {
+				predecessor.TerminalBudget.readySince = readySince
+				predecessor.TerminalBudget.lastFailureCounted = false
+			}
+			replacement := &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: to}
+			replacement.InheritTerminalBudget(predecessor, now)
+			label := fmt.Sprintf("%q -> %q", from, to)
+			if from == to {
+				assert.Equal(t, predecessor.TerminalBudget, replacement.TerminalBudget, label)
+				continue
+			}
+			want := predecessor.TerminalBudget
+			want.crossStatus(from, to, now)
+			assert.Equal(t, want, replacement.TerminalBudget, label)
+		}
+	}
+
+	fresh := map[string]*ProvisionState{
+		"none": nil,
+		"another lease": {
+			LeaseUUID: "22222222-2222-4222-8222-222222222222", Status: backend.ProvisionStatusFailed,
+			TerminalBudget: TerminalBudget{
+				leaseUUID: "22222222-2222-4222-8222-222222222222", consecutive: 3, lastFailureCounted: true,
+			},
+		},
+		"an unbound budget": {
+			LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusFailed,
+			TerminalBudget: TerminalBudget{consecutive: 3, lastFailureCounted: true},
+		},
+	}
+	for name, predecessor := range fresh {
+		for _, to := range everyStatus {
+			replacement := &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: to}
+			replacement.InheritTerminalBudget(predecessor, now)
+			want := TerminalBudget{leaseUUID: testActorLeaseUUID}
+			if to == backend.ProvisionStatusReady {
+				want.readySince = now
+			}
+			assert.Equal(t, want, replacement.TerminalBudget, "%s -> %q", name, to)
+		}
+	}
 }
 
 func TestTerminalBudget_ObserveVerdictMatrix(t *testing.T) {
-	statuses := []backend.ProvisionStatus{
-		backend.ProvisionStatusProvisioning, backend.ProvisionStatusReady, backend.ProvisionStatusFailing,
-		backend.ProvisionStatusFailed, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating,
-		backend.ProvisionStatusDeprovisioning, backend.ProvisionStatusRetained, backend.ProvisionStatusUnknown, "bogus",
-	}
 	reasons := []backend.Reason{backend.ReasonContainerExited, backend.ReasonInternal, backend.ReasonUnknown, "", "Bogus"}
 	bindings := map[string]string{
 		"same": testActorLeaseUUID, "other": "22222222-2222-4222-8222-222222222222", "unbound": "",
 	}
-	for _, status := range statuses {
+	for _, status := range everyStatus {
 		for _, reason := range reasons {
 			for bindingName, binding := range bindings {
 				for consecutive := range terminalBudgetThreshold + 2 {
@@ -220,43 +335,72 @@ func TestTerminalBudget_ObservationIgnoresElapsedTime(t *testing.T) {
 		"the observation is the recorded count: time alone never changes it")
 }
 
-// The exported helpers are the only budget mutators a substrate can reach.
-// Whatever the starting budget, they can only move it toward a reset: never
-// a higher count, never a counted failure, never an exhausted verdict, never
-// a later Ready anchor.
-func TestTerminalBudget_OffActorHelpersOnlyMoveTowardReset(t *testing.T) {
-	t0 := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
-	anchors := []time.Time{{}, t0.Add(-time.Hour), t0.Add(-time.Minute), t0}
-	helpers := map[string]func(*ProvisionState, time.Time){
-		"ready":            (*ProvisionState).ObserveReadyProjection,
-		"uncountedFailure": (*ProvisionState).ObserveUncountedFailureProjection,
+// The exported methods of *ProvisionState are the only budget mutators a
+// substrate can reach. The set is pinned, and every exported mutator in it is
+// driven below: whatever the starting budget and statuses, it can only move
+// the budget toward a reset. It never raises the count, never marks a failure
+// counted, and an exhausted verdict after it rests on a failure the actor had
+// already counted.
+func TestTerminalBudget_ExportedMutatorsOnlyMoveTowardReset(t *testing.T) {
+	var exported []string
+	methods := reflect.TypeFor[*ProvisionState]()
+	for index := range methods.NumMethod() {
+		exported = append(exported, methods.Method(index).Name)
 	}
-	for name, apply := range helpers {
+	require.Equal(t, []string{"InheritTerminalBudget", "ObserveTerminalBudget", "SetStatus"}, exported,
+		"a new exported *ProvisionState method needs a driver here")
+
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	mutators := map[string]func(p *ProvisionState, to backend.ProvisionStatus, predecessor *ProvisionState){
+		"SetStatus": func(p *ProvisionState, to backend.ProvisionStatus, _ *ProvisionState) {
+			p.SetStatus(to, now)
+		},
+		"InheritTerminalBudget": func(p *ProvisionState, to backend.ProvisionStatus, predecessor *ProvisionState) {
+			p.Status = to
+			p.InheritTerminalBudget(predecessor, now)
+		},
+	}
+	for _, name := range exported {
+		if name != "ObserveTerminalBudget" {
+			require.Contains(t, mutators, name)
+		}
+	}
+	anchors := []time.Time{{}, now.Add(-time.Hour), now.Add(-time.Minute), now}
+	for name, apply := range mutators {
 		for _, binding := range []string{testActorLeaseUUID, "22222222-2222-4222-8222-222222222222"} {
 			for consecutive := range terminalBudgetThreshold + 2 {
 				for _, counted := range []bool{false, true} {
 					for _, anchor := range anchors {
-						for _, status := range []backend.ProvisionStatus{backend.ProvisionStatusFailed, backend.ProvisionStatusReady} {
-							before := TerminalBudget{
-								leaseUUID: binding, consecutive: consecutive, readySince: anchor, lastFailureCounted: counted,
-							}
-							p := &ProvisionState{
-								LeaseUUID: testActorLeaseUUID, Status: status,
-								Reason: backend.ReasonContainerExited, TerminalBudget: before,
-							}
-							apply(p, t0)
-							after := p.TerminalBudget
-							label := fmt.Sprintf("%s %+v", name, before)
-							if binding == testActorLeaseUUID {
-								assert.LessOrEqual(t, after.consecutive, before.consecutive, label)
-								if !before.readySince.IsZero() {
-									assert.False(t, after.readySince.After(before.readySince), label)
+						for _, from := range everyStatus {
+							for _, to := range everyStatus {
+								before := TerminalBudget{
+									leaseUUID: binding, consecutive: consecutive, readySince: anchor, lastFailureCounted: counted,
 								}
-							} else {
-								assert.Zero(t, after.consecutive, label)
+								p := &ProvisionState{
+									LeaseUUID: testActorLeaseUUID, Status: from,
+									Reason: backend.ReasonContainerExited, TerminalBudget: before,
+								}
+								predecessor := &ProvisionState{
+									LeaseUUID: testActorLeaseUUID, Status: from,
+									Reason: backend.ReasonContainerExited, TerminalBudget: before,
+								}
+								apply(p, to, predecessor)
+								after := p.TerminalBudget
+								label := fmt.Sprintf("%s %q -> %q %+v", name, from, to, before)
+								bound := binding == testActorLeaseUUID
+								if bound {
+									assert.LessOrEqual(t, after.consecutive, before.consecutive, label)
+								} else {
+									assert.Zero(t, after.consecutive, label)
+								}
+								if after.lastFailureCounted {
+									assert.True(t, bound && before.lastFailureCounted, label)
+								}
+								if p.ObserveTerminalBudget().Verdict == backend.TerminalVerdictExhausted {
+									assert.True(t, bound && before.lastFailureCounted &&
+										before.consecutive >= terminalBudgetThreshold, label)
+								}
 							}
-							assert.False(t, after.lastFailureCounted, label)
-							assert.Equal(t, backend.TerminalVerdictRetry, p.ObserveTerminalBudget().Verdict, label)
 						}
 					}
 				}
@@ -281,10 +425,43 @@ func TestReasonEligibleForBudget_EveryDeclaredReason(t *testing.T) {
 		"ReasonBackendStorageLost":     false,
 		"ReasonUnknown":                false,
 	}
+	declared := declaredConstants(t, filepath.Join("..", "..", "reason.go"), "Reason")
+	require.Equal(t, slices.Sorted(maps.Keys(decisions)), slices.Sorted(maps.Keys(declared)),
+		"decide budget eligibility for every declared Reason")
+	for name, reason := range declared {
+		assert.Equal(t, decisions[name], reasonEligibleForBudget(backend.Reason(reason)), name)
+	}
+	assert.False(t, reasonEligibleForBudget(""))
+	assert.False(t, reasonEligibleForBudget("Bogus"))
+}
+
+// TestTenantInitiatedMaintenance_EveryDeclaredKind requires an explicit
+// decision for every maintenance kind declared in shared/maintenance_intent.go:
+// only a tenant's own restart or update resets the streak.
+func TestTenantInitiatedMaintenance_EveryDeclaredKind(t *testing.T) {
+	decisions := map[string]bool{
+		"MaintenanceIntentRestart":      true,
+		"MaintenanceIntentUpdate":       true,
+		"MaintenanceIntentCustomDomain": false,
+	}
+	declared := declaredConstants(t, filepath.Join("..", "maintenance_intent.go"), "MaintenanceIntentKind")
+	require.Equal(t, slices.Sorted(maps.Keys(decisions)), slices.Sorted(maps.Keys(declared)),
+		"decide whether every declared maintenance kind is tenant-initiated")
+	for name, kind := range declared {
+		assert.Equal(t, decisions[name], tenantInitiatedMaintenance(shared.MaintenanceIntentKind(kind)), name)
+	}
+	assert.False(t, tenantInitiatedMaintenance(""))
+	assert.False(t, tenantInitiatedMaintenance("bogus"))
+}
+
+// declaredConstants parses the string constants of one named type from a
+// source file.
+func declaredConstants(t *testing.T, path, typeName string) map[string]string {
+	t.Helper()
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filepath.Join("..", "..", "reason.go"), nil, parser.SkipObjectResolution)
+	file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
 	require.NoError(t, err)
-	declared := make(map[string]backend.Reason)
+	declared := make(map[string]string)
 	for _, decl := range file.Decls {
 		general, ok := decl.(*ast.GenDecl)
 		if !ok || general.Tok != token.CONST {
@@ -293,7 +470,7 @@ func TestReasonEligibleForBudget_EveryDeclaredReason(t *testing.T) {
 		for _, spec := range general.Specs {
 			value := spec.(*ast.ValueSpec)
 			typeIdent, typed := value.Type.(*ast.Ident)
-			if !typed || typeIdent.Name != "Reason" {
+			if !typed || typeIdent.Name != typeName {
 				continue
 			}
 			for index, name := range value.Names {
@@ -301,29 +478,34 @@ func TestReasonEligibleForBudget_EveryDeclaredReason(t *testing.T) {
 				require.True(t, ok, "%s must be a literal", name.Name)
 				text, err := strconv.Unquote(literal.Value)
 				require.NoError(t, err)
-				declared[name.Name] = backend.Reason(text)
+				declared[name.Name] = text
 			}
 		}
 	}
-	require.NotEmpty(t, declared)
-	require.Equal(t, slices.Sorted(maps.Keys(decisions)), slices.Sorted(maps.Keys(declared)),
-		"decide budget eligibility for every declared Reason")
-	for name, reason := range declared {
-		assert.Equal(t, decisions[name], reasonEligibleForBudget(reason), name)
-	}
-	assert.False(t, reasonEligibleForBudget(""))
-	assert.False(t, reasonEligibleForBudget("Bogus"))
+	require.NotEmpty(t, declared, "no %s constants in %s", typeName, path)
+	return declared
 }
 
 // TestEveryFailCountIncrementRecordsBudgetFailure pins the choke point: every
-// store closure in the state machine that increments the lifetime FailCount
-// must also record the failure in the terminal budget, so no failure path can
-// skip attribution.
+// store closure in this package's production code that mutates the lifetime
+// FailCount, in any spelling, must also record the failure through
+// recordFailure, so no failure path can skip attribution.
 func TestEveryFailCountIncrementRecordsBudgetFailure(t *testing.T) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "lease_sm.go", nil, parser.SkipObjectResolution)
+	files, err := filepath.Glob("*.go")
 	require.NoError(t, err)
-	increments, violations := failCountClosureViolations(fset, file)
+	fset := token.NewFileSet()
+	increments := 0
+	var violations []string
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		require.NoError(t, err)
+		found, fileViolations := failCountClosureViolations(fset, file)
+		increments += found
+		violations = append(violations, fileViolations...)
+	}
 	assert.GreaterOrEqual(t, increments, 5, "the guard must see every FailCount increment site")
 	assert.Empty(t, violations)
 }
@@ -332,53 +514,65 @@ func TestFailCountGuardFires(t *testing.T) {
 	const src = `package leasesm
 func a(store LeaseProvisionStore) {
 	store.UpdateFn("l", func(p *ProvisionState) { p.FailCount++ })
-	store.UpdateFn("l", func(p *ProvisionState) { p.FailCount++; _ = p.budgetRecordFailure(c, n) })
+	store.UpdateFn("l", func(p *ProvisionState) { p.FailCount++; _ = p.recordFailure(s, c, n) })
+	store.UpdateFn("l", func(p *ProvisionState) { p.FailCount += 1 })
+	store.UpdateFn("l", func(p *ProvisionState) { p.FailCount = p.FailCount + 1 })
+	record := func(p *ProvisionState) { p.FailCount++ }
+	store.UpdateFn("l", record)
 }
 `
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "synthetic.go", src, parser.SkipObjectResolution)
 	require.NoError(t, err)
 	increments, violations := failCountClosureViolations(fset, file)
-	assert.Equal(t, 2, increments)
-	require.Len(t, violations, 1)
-	assert.Contains(t, violations[0], "synthetic.go:3")
+	assert.Equal(t, 5, increments)
+	require.Len(t, violations, 4, "%v", violations)
+	for _, line := range []string{"synthetic.go:3", "synthetic.go:5", "synthetic.go:6", "synthetic.go:7"} {
+		assert.True(t, slices.ContainsFunc(violations, func(v string) bool { return strings.HasPrefix(v, line) }),
+			"missing %s in %v", line, violations)
+	}
 }
 
+// failCountClosureViolations finds every function literal that mutates a
+// FailCount (++, an op-assign or a plain assignment) and reports it unless the
+// same literal records the failure through recordFailure. Any function literal
+// counts, not only one passed inline to UpdateFn, so a named closure cannot
+// escape the rule.
 func failCountClosureViolations(fset *token.FileSet, file *ast.File) (int, []string) {
 	increments := 0
 	var violations []string
 	ast.Inspect(file, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
+		closure, ok := node.(*ast.FuncLit)
 		if !ok {
 			return true
 		}
-		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || selector.Sel.Name != "UpdateFn" || len(call.Args) != 2 {
-			return true
-		}
-		closure, ok := call.Args[1].(*ast.FuncLit)
-		if !ok {
-			return true
-		}
-		incrementsFailCount, records := false, false
+		mutatesFailCount, records := false, false
 		ast.Inspect(closure.Body, func(inner ast.Node) bool {
 			switch typed := inner.(type) {
+			case *ast.FuncLit:
+				return false // a nested literal is checked on its own
 			case *ast.IncDecStmt:
 				if target, ok := typed.X.(*ast.SelectorExpr); ok && target.Sel.Name == "FailCount" {
-					incrementsFailCount = true
+					mutatesFailCount = true
+				}
+			case *ast.AssignStmt:
+				for _, lhs := range typed.Lhs {
+					if target, ok := lhs.(*ast.SelectorExpr); ok && target.Sel.Name == "FailCount" {
+						mutatesFailCount = true
+					}
 				}
 			case *ast.CallExpr:
-				if target, ok := typed.Fun.(*ast.SelectorExpr); ok && target.Sel.Name == "budgetRecordFailure" {
+				if target, ok := typed.Fun.(*ast.SelectorExpr); ok && target.Sel.Name == "recordFailure" {
 					records = true
 				}
 			}
 			return true
 		})
-		if incrementsFailCount {
+		if mutatesFailCount {
 			increments++
 			if !records {
-				violations = append(violations, fset.Position(call.Pos()).String()+
-					": closure increments FailCount without recording the budget failure")
+				violations = append(violations, fset.Position(closure.Pos()).String()+
+					": closure mutates FailCount without recording the budget failure")
 			}
 		}
 		return true
