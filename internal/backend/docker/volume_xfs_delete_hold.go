@@ -735,15 +735,16 @@ func recoveredXFSDeleteHold(stage xfsDeleteStageName, now time.Time) (*xfsDelete
 	return newXFSDeleteHold(outcome, now)
 }
 
-// holdPhaseOf returns the phase of stage's hold, if it has one.
-func (x *xfsVolumeManager) holdPhaseOf(stage xfsDeleteStageName) (xfsDeleteHoldPhase, bool) {
+// heldDeletionOf returns a copy of stage's hold, if it has one. The zero hold
+// it returns otherwise is in the removal phase with no reason.
+func (x *xfsVolumeManager) heldDeletionOf(stage xfsDeleteStageName) (xfsDeleteHold, bool) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	hold, ok := x.deleteHolds[stage.volumeID.value()]
 	if !ok || hold.stage != stage {
-		return xfsDeleteHoldPhase{}, false
+		return xfsDeleteHold{}, false
 	}
-	return hold.phase, true
+	return *hold, true
 }
 
 // EnableInlineVolumeDeletes lets first-time deletions run inline under

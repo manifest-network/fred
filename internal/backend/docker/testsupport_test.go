@@ -2474,13 +2474,22 @@ type fakeVolumeBackend struct {
 	destroyed []string    // volume ids passed to Destroy, in call order
 }
 
+// The test doubles are reached through runtime type assertions; these make a
+// stale method signature a compile error instead of a silently missing sink.
+var (
+	_ volumeManager = (*fakeVolumeBackend)(nil)
+	_ volumeManager = (*mockVolumeManager)(nil)
+)
+
 // Create returns a deterministic path so any production code that calls it
 // during a test does not blow up; the migration tests do not assert on it.
 func (f *fakeVolumeBackend) Create(_ context.Context, id string, _ int64) (string, bool, error) {
 	return filepath.Join("/var/lib/fred/volumes", id), true, nil
 }
 
-func (f *fakeVolumeBackend) EnsureQuota(_ context.Context, _ string, _ int64) error { return nil }
+func (f *fakeVolumeBackend) EnsureQuota(_ context.Context, _ string, _ int64) (volumeQuotaOutcome, error) {
+	return volumeQuotaApplied, nil
+}
 
 func (f *fakeVolumeBackend) Destroy(_ context.Context, id string) error {
 	f.destroyed = append(f.destroyed, id)

@@ -50,7 +50,7 @@ func TestIntegration_XFS_QuotaRepairTouchesOnlyRoot(t *testing.T) {
 	}
 	require.Zero(t, readAttr(oldChild).ProjectID)
 
-	require.NoError(t, mgr.EnsureQuota(t.Context(), name, 100))
+	require.NoError(t, ensureQuotaErr(mgr.EnsureQuota(t.Context(), name, 100)))
 	rootAttr := readAttr(hostPath)
 	assert.Equal(t, projID, rootAttr.ProjectID)
 	assert.NotZero(t, rootAttr.XFlags&linuxFSXFlagProjInherit)

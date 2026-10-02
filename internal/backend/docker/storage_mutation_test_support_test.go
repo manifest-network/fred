@@ -181,10 +181,14 @@ func (m *testStorageMutationAdapter) renameVolume(
 	})
 }
 
-func (m *testStorageMutationAdapter) ensureVolumeQuota(ctx context.Context, id string, sizeMB int64) error {
-	return m.perform(ctx, "test ensure volume quota", func(ctx context.Context) error {
-		return m.ops.volumes.EnsureQuota(ctx, id, sizeMB)
+func (m *testStorageMutationAdapter) ensureVolumeQuota(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error) {
+	var outcome volumeQuotaOutcome
+	err := m.perform(ctx, "test ensure volume quota", func(ctx context.Context) error {
+		var err error
+		outcome, err = m.ops.volumes.EnsureQuota(ctx, id, sizeMB)
+		return err
 	})
+	return outcome, err
 }
 
 func (m *testStorageMutationAdapter) removeContainer(ctx context.Context, id string) error {
@@ -457,10 +461,10 @@ func (p testVolumeMutationProxy) Create(ctx context.Context, id string, sizeMB i
 	return sink.Create(ctx, id, sizeMB)
 }
 
-func (p testVolumeMutationProxy) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
+func (p testVolumeMutationProxy) EnsureQuota(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error) {
 	sink, err := p.sink()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	return sink.EnsureQuota(ctx, id, sizeMB)
 }

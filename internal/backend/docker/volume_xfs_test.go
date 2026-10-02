@@ -94,8 +94,9 @@ func TestXfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
 		activeIDs:  make(map[uint32]string),
 		volumeToID: make(map[string]uint32),
 	}
-	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100),
-		"EnsureQuota on a missing volume must be a no-op")
+	outcome, err := mgr.EnsureQuota(context.Background(), "fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100)
+	require.NoError(t, err, "EnsureQuota on a missing volume must be a no-op")
+	assert.Equal(t, volumeQuotaAbsent, outcome, "a missing volume is never reported as applied")
 }
 
 // TestBtrfsEnsureQuota_MissingVolumeIsNoop is the btrfs analogue: EnsureQuota on
@@ -103,8 +104,9 @@ func TestXfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
 // (root-free — the missing-path branch returns before any exec).
 func TestBtrfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
 	mgr := &btrfsVolumeManager{dataPath: t.TempDir(), logger: slog.Default()}
-	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100),
-		"btrfs EnsureQuota on a missing subvolume must be a no-op")
+	outcome, err := mgr.EnsureQuota(context.Background(), "fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100)
+	require.NoError(t, err, "btrfs EnsureQuota on a missing subvolume must be a no-op")
+	assert.Equal(t, volumeQuotaAbsent, outcome, "a missing subvolume is never reported as applied")
 }
 
 // TestNewVolumeManager_XFS_ResolvesMountpoint verifies that constructing the
@@ -293,7 +295,7 @@ func TestXFSQuotaTaggedRootSkipsTenantWalk(t *testing.T) {
 				return linuxFSXAttr{ProjectID: projID, XFlags: linuxFSXFlagProjInherit}, nil
 			})
 			if operation == "ensure" {
-				require.NoError(t, mgr.EnsureQuota(t.Context(), name, 100))
+				require.NoError(t, ensureQuotaErr(mgr.EnsureQuota(t.Context(), name, 100)))
 			} else {
 				hostPath, created, err := mgr.Create(t.Context(), name, 100)
 				require.NoError(t, err)
@@ -389,7 +391,7 @@ func TestXFSQuotaRootRepairFailsClosed(t *testing.T) {
 				}
 				var err error
 				if operation == "ensure" {
-					err = mgr.EnsureQuota(t.Context(), name, 100)
+					_, err = mgr.EnsureQuota(t.Context(), name, 100)
 				} else {
 					_, _, err = mgr.Create(t.Context(), name, 100)
 				}
@@ -583,7 +585,7 @@ func TestXFSVolumeManagerRejectsDefaultProjectMarkerBeforeMutation(t *testing.T)
 
 	_, _, err := mgr.Create(context.Background(), id, 100)
 	require.ErrorContains(t, err, "project ID 0 is reserved")
-	require.ErrorContains(t, mgr.EnsureQuota(context.Background(), id, 100), "project ID 0 is reserved")
+	require.ErrorContains(t, ensureQuotaErr(mgr.EnsureQuota(context.Background(), id, 100)), "project ID 0 is reserved")
 	require.ErrorContains(t, mgr.loadProjectIDs(), "project ID 0 is reserved")
 	assert.Empty(t, mgr.volumeToID)
 	assert.Empty(t, mgr.activeIDs)
@@ -766,7 +768,7 @@ func TestXFSRejectsForeignProjectIDAuthorityBeforeQuotaMutation(t *testing.T) {
 
 	_, _, err := mgr.Create(t.Context(), victimName, 100)
 	require.ErrorContains(t, err, "already registered to volume")
-	require.ErrorContains(t, mgr.EnsureQuota(t.Context(), victimName, 100), "already registered to volume")
+	require.ErrorContains(t, ensureQuotaErr(mgr.EnsureQuota(t.Context(), victimName, 100)), "already registered to volume")
 	require.ErrorContains(t, mgr.Destroy(t.Context(), victimName), "project ID authority conflicts")
 
 	assert.NoFileExists(t, logPath, "foreign project authority must be rejected before xfs_quota")

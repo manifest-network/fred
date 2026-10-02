@@ -113,7 +113,7 @@ func (c *backgroundMaintenanceCoordinator) runRetentionSweep(ctx context.Context
 // tree of one fixed workflow. Unlike the removed residual facade, no value of
 // these types is retained by Backend or returned to a caller.
 type backgroundVolumeRename func(context.Context, string, string) error
-type backgroundVolumeQuota func(context.Context, string, int64) error
+type backgroundVolumeQuota func(context.Context, string, int64) (volumeQuotaOutcome, error)
 type backgroundContainerRemove func(context.Context, string) error
 type backgroundTenantNetworkRemove func(context.Context, string) (tenantNetworkRemoval, error)
 

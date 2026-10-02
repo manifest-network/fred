@@ -851,7 +851,9 @@ func TestFilesystemVolumeManagers_RejectTraversalAtEveryPathBoundary(t *testing.
 			_, _, err := (&xfsVolumeManager{dataPath: root}).Create(context.Background(), invalid, 1)
 			return err
 		}},
-		{"xfs quota", func() error { return (&xfsVolumeManager{dataPath: root}).EnsureQuota(context.Background(), invalid, 1) }},
+		{"xfs quota", func() error {
+			return ensureQuotaErr((&xfsVolumeManager{dataPath: root}).EnsureQuota(context.Background(), invalid, 1))
+		}},
 		{"xfs destroy", func() error { return (&xfsVolumeManager{dataPath: root}).Destroy(context.Background(), invalid) }},
 		{"xfs rename old", func() error {
 			return (&xfsVolumeManager{dataPath: root}).RenameVolume(context.Background(), invalid, valid)
@@ -868,7 +870,7 @@ func TestFilesystemVolumeManagers_RejectTraversalAtEveryPathBoundary(t *testing.
 			return err
 		}},
 		{"btrfs quota", func() error {
-			return (&btrfsVolumeManager{dataPath: root}).EnsureQuota(context.Background(), invalid, 1)
+			return ensureQuotaErr((&btrfsVolumeManager{dataPath: root}).EnsureQuota(context.Background(), invalid, 1))
 		}},
 		{"btrfs destroy", func() error { return (&btrfsVolumeManager{dataPath: root}).Destroy(context.Background(), invalid) }},
 		{"btrfs rename old", func() error {

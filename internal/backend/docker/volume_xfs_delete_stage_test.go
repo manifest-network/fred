@@ -452,7 +452,7 @@ esac`, xfsInodeGCTriggerCmd()))
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 
-	err := mgr.cleanupXFSDeleteStage(ctx, stage).result(finalPathNotObserved)
+	err := mgr.cleanupXFSDeleteStageWith(ctx, stage, removeCondemnedXFSEntry, removeFromXFSRoot, removeFromXFSRoot).result(finalPathNotObserved)
 	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
 	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending)
 	require.ErrorContains(t, err, fmt.Sprintf("before project %d usage proof", stage.projID))
@@ -535,7 +535,7 @@ esac`,
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
 
-			err := mgr.cleanupXFSDeleteStage(ctx, stage).result(finalPathNotObserved)
+			err := mgr.cleanupXFSDeleteStageWith(ctx, stage, removeCondemnedXFSEntry, removeFromXFSRoot, removeFromXFSRoot).result(finalPathNotObserved)
 			require.ErrorContains(t, err, tc.want)
 			require.ErrorIs(t, err, ErrVolumeDeleteHeld)
 			require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending)
@@ -709,7 +709,7 @@ func TestXFSDeleteRecoveryHonorsEarlierParentDeadline(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
 
-	err := mgr.cleanupXFSDeleteStage(ctx, stage).result(finalPathNotObserved)
+	err := mgr.cleanupXFSDeleteStageWith(ctx, stage, removeCondemnedXFSEntry, removeFromXFSRoot, removeFromXFSRoot).result(finalPathNotObserved)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
 	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending)

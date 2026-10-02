@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -134,6 +135,7 @@ func TestRollbackRestoreAdoption_QuotaProofFailureFailsClosed(t *testing.T) {
 		usage           int64
 		usageErr        error
 		ensureErr       error
+		ensureOutcome   volumeQuotaOutcome
 		wantEnsureCalls int
 	}{
 		{
@@ -148,6 +150,19 @@ func TestRollbackRestoreAdoption_QuotaProofFailureFailsClosed(t *testing.T) {
 			name:            "old quota cannot be applied",
 			usage:           50 * bytesPerMiB,
 			ensureErr:       errors.New("quota subsystem unavailable"),
+			wantEnsureCalls: 1,
+		},
+		{
+			// A skipped quota is not a restored quota (ENG-1117).
+			name:            "the retained volume's deletion is pending",
+			usage:           50 * bytesPerMiB,
+			ensureOutcome:   volumeQuotaDeletePending,
+			wantEnsureCalls: 1,
+		},
+		{
+			name:            "the retained volume is gone",
+			usage:           50 * bytesPerMiB,
+			ensureOutcome:   volumeQuotaAbsent,
 			wantEnsureCalls: 1,
 		},
 		{
@@ -178,9 +193,12 @@ func TestRollbackRestoreAdoption_QuotaProofFailureFailsClosed(t *testing.T) {
 					UsageFn: func(context.Context, string) (int64, error) {
 						return tc.usage, tc.usageErr
 					},
-					EnsureQuotaFn: func(context.Context, string, int64) error {
+					EnsureQuotaOutcomeFn: func(context.Context, string, int64) (volumeQuotaOutcome, error) {
 						ensureCalls++
-						return tc.ensureErr
+						if tc.ensureErr != nil {
+							return 0, tc.ensureErr
+						}
+						return cmp.Or(tc.ensureOutcome, volumeQuotaApplied), nil
 					},
 				},
 			}

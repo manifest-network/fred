@@ -412,8 +412,8 @@ func TestStart_XFSQuotaTaggedRootIgnoresTenantChurn(t *testing.T) {
 	}}
 	logPath := installChurningXFSQuota(t)
 	b.volumes = &mockVolumeManager{
-		ListFn:        func() ([]string, error) { return []string{volumeName}, nil },
-		EnsureQuotaFn: manager.EnsureQuota,
+		ListFn:               func() ([]string, error) { return []string{volumeName}, nil },
+		EnsureQuotaOutcomeFn: manager.EnsureQuota,
 	}
 	bindRetentionOrphanPrunerForTest(t, b)
 

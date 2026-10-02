@@ -136,10 +136,13 @@ type volumeMutationSink interface {
 	// before the daemon could set quotas (ENG-454) gets its immutable effective
 	// cap (durable disk or pinned diskless scratch)
 	// enforced without a re-provision or data move. Unlike Create it NEVER
-	// creates: if the volume is absent it is a no-op (returns nil), so a
-	// concurrently-deprovisioning volume cannot be resurrected. Idempotent.
-	// Used by the startup backfill (reconcileVolumeQuotas).
-	EnsureQuota(ctx context.Context, id string, sizeMB int64) error
+	// creates: if the volume is absent it answers volumeQuotaAbsent, so a
+	// concurrently-deprovisioning volume cannot be resurrected, and a name
+	// whose deletion is pending answers volumeQuotaDeletePending without
+	// touching its limits. Only volumeQuotaApplied means limits were applied.
+	// Idempotent. Used by the startup backfill (reconcileVolumeQuotas) and by
+	// restore rollback.
+	EnsureQuota(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error)
 
 	// RecoverInterruptedVolumeMutations resolves manager-private mutation evidence
 	// after the identity-bound stores have been opened exclusively but before
@@ -176,6 +179,23 @@ type volumeMutationSink interface {
 	RenameVolume(ctx context.Context, oldName, newName string) error
 }
 
+// volumeQuotaOutcome is EnsureQuota's closed answer to a call that did not
+// fail. Its zero value is none of them, so an unset outcome never reads as
+// applied.
+type volumeQuotaOutcome uint8
+
+const (
+	// volumeQuotaApplied: the volume exists and its limits were applied.
+	volumeQuotaApplied volumeQuotaOutcome = iota + 1
+	// volumeQuotaAbsent: no volume at the name; nothing was enforced and
+	// nothing created.
+	volumeQuotaAbsent
+	// volumeQuotaDeletePending: the name's deletion is pending, and its delete
+	// authority owns its limits until the zero-usage proof clears them;
+	// nothing was touched (ENG-1117).
+	volumeQuotaDeletePending
+)
+
 // volumeManager is the concrete construction/test seam. Backend immediately
 // projects it into volumeReader plus its aggregate-only mutation sink.
 type volumeManager interface {
@@ -204,10 +224,10 @@ func (n *noopVolumeManager) Destroy(_ context.Context, _ string) error {
 	return nil
 }
 
-// EnsureQuota on the noop manager is a no-op: it manages no quota-enforced
+// EnsureQuota on the noop manager finds nothing: it manages no quota-enforced
 // volumes, so there is nothing to re-apply.
-func (n *noopVolumeManager) EnsureQuota(_ context.Context, _ string, _ int64) error {
-	return nil
+func (n *noopVolumeManager) EnsureQuota(_ context.Context, _ string, _ int64) (volumeQuotaOutcome, error) {
+	return volumeQuotaAbsent, nil
 }
 
 func (n *noopVolumeManager) List() ([]string, error) {

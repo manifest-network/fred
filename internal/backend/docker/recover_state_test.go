@@ -31,6 +31,7 @@ import (
 type mockVolumeManager struct {
 	CreateFn                              func(ctx context.Context, id string, sizeMB int64) (string, bool, error)
 	EnsureQuotaFn                         func(ctx context.Context, id string, sizeMB int64) error
+	EnsureQuotaOutcomeFn                  func(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error)
 	DestroyFn                             func(ctx context.Context, id string) error
 	ListFn                                func() ([]string, error)
 	ListForProofFn                        func(context.Context) ([]string, error)
@@ -59,12 +60,22 @@ func (m *mockVolumeManager) Create(ctx context.Context, id string, sizeMB int64)
 	return m.defaultDir, true, nil
 }
 
-func (m *mockVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
-	if m.EnsureQuotaFn != nil {
-		return m.EnsureQuotaFn(ctx, id, sizeMB)
+// EnsureQuota answers volumeQuotaApplied unless EnsureQuotaOutcomeFn chooses
+// the outcome, or EnsureQuotaFn fails the call.
+func (m *mockVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error) {
+	if m.EnsureQuotaOutcomeFn != nil {
+		return m.EnsureQuotaOutcomeFn(ctx, id, sizeMB)
 	}
-	return nil
+	if m.EnsureQuotaFn != nil {
+		if err := m.EnsureQuotaFn(ctx, id, sizeMB); err != nil {
+			return 0, err
+		}
+	}
+	return volumeQuotaApplied, nil
 }
+
+// ensureQuotaErr keeps only EnsureQuota's error, for tests that assert on it.
+func ensureQuotaErr(_ volumeQuotaOutcome, err error) error { return err }
 
 func (m *mockVolumeManager) Destroy(ctx context.Context, id string) error {
 	if m.DestroyFn != nil {
