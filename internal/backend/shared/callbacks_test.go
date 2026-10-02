@@ -1497,6 +1497,24 @@ func TestInspectPendingCallbacksReadOnlyCountsLegacyAndTypedRowsWithoutMutation(
 	assert.Equal(t, before, after)
 }
 
+// A pending operation head is described with its lease and its effective
+// items, which a substrate-aware drain classifier needs; a settled one is not
+// pending and is not described.
+func TestInspectCallbackStoreReadOnlyDescribesPendingOperationHeads(t *testing.T) {
+	stores := openOperationHandoffStores(t, "docker-a")
+	spec := testOperationIntentSpec(t, "inspect-pending-head")
+	beginHandoffOperation(t, stores.settlement, spec)
+	require.NoError(t, stores.callbacks.Close())
+	stores.callbacks = nil
+
+	inspection, err := InspectCallbackStoreReadOnly(stores.callbackPath)
+	require.NoError(t, err)
+	assert.Equal(t, 1, inspection.Pending)
+	assert.Equal(t, []PendingLeaseMutationHead{{
+		Kind: PendingOperationHead, LeaseUUID: spec.LeaseUUID, Items: spec.Items,
+	}}, inspection.PendingHeads)
+}
+
 func TestInspectPendingCallbacksReadOnlyDoesNotCreateMissingDatabase(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "missing.db")
 	inspection, err := InspectCallbackStoreReadOnly(dbPath)

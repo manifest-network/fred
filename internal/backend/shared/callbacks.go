@@ -225,7 +225,8 @@ type CallbackStoreConfig struct {
 }
 
 // CallbackStoreInspection is read-only schema/evidence used by explicit
-// storage-lineage initialization.
+// storage-lineage initialization and by the coordinated update's stopped
+// drain proof.
 type CallbackStoreInspection struct {
 	Exists                          bool
 	IdentityBound                   bool
@@ -236,6 +237,31 @@ type CallbackStoreInspection struct {
 	LeaseMutationUUIDSlotLimit      uint64
 	CallbackReceiptReservations     uint64
 	CallbackReceiptReservationLimit uint64
+	// PendingHeads describes each pending lease-mutation head that Pending
+	// counts (a pending operation, a maintenance, or a close), so a
+	// substrate-aware reader can classify it further. It adds nothing to
+	// Pending.
+	PendingHeads []PendingLeaseMutationHead
+}
+
+// PendingLeaseMutationHeadKind is the closed kind of a pending lease-mutation
+// head.
+type PendingLeaseMutationHeadKind uint8
+
+const (
+	PendingOperationHead PendingLeaseMutationHeadKind = iota + 1
+	PendingMaintenanceHead
+	PendingCloseHead
+)
+
+// PendingLeaseMutationHead is one pending lease-mutation head of a stopped
+// callback journal. Items is the volume topology the head owns on its lease:
+// the close's items, or the pending operation's effective items. A maintenance
+// head carries none.
+type PendingLeaseMutationHead struct {
+	Kind      PendingLeaseMutationHeadKind
+	LeaseUUID string
+	Items     []backend.LeaseItem
 }
 
 // InspectCallbackStoreReadOnly inspects durable v0.13 and v2 outbox rows
@@ -380,9 +406,22 @@ func inspectCallbackStoreReadOnlyFile(
 			case operationLeaseMutationHead:
 				if state.claim.entry.State == operationIntentPending {
 					inspection.Pending++
+					inspection.PendingHeads = append(inspection.PendingHeads, PendingLeaseMutationHead{
+						Kind: PendingOperationHead, LeaseUUID: state.leaseUUID(),
+						Items: slices.Clone(state.claim.EffectiveItems()),
+					})
 				}
-			case maintenanceLeaseMutationHead, closeLeaseMutationHead:
+			case maintenanceLeaseMutationHead:
 				inspection.Pending++
+				inspection.PendingHeads = append(inspection.PendingHeads, PendingLeaseMutationHead{
+					Kind: PendingMaintenanceHead, LeaseUUID: state.leaseUUID(),
+				})
+			case closeLeaseMutationHead:
+				inspection.Pending++
+				inspection.PendingHeads = append(inspection.PendingHeads, PendingLeaseMutationHead{
+					Kind: PendingCloseHead, LeaseUUID: state.leaseUUID(),
+					Items: slices.Clone(state.claim.Items()),
+				})
 			case closedLeaseMutationHead:
 			default:
 				return fmt.Errorf("callback lease mutation head %q decoded as %T", key, head)
