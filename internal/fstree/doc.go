@@ -27,12 +27,15 @@
 // detected; every descriptor-based remover, GNU fts and Go's own included,
 // shares this limitation.
 //
-// WalkBeneath tolerates concurrent writers. It is best effort: it may skip or
-// repeat entries that change while it runs, and it fails with ErrTreeChanged
-// when an ancestor moves or a directory it holds is removed. It never follows
-// a symlink or crosses a mount; as with RemoveBeneath, a directory moved out
-// of the tree while the walk holds it is still listed before the move is
-// detected.
+// WalkBeneath tolerates concurrent writers. It is best effort: it may pass
+// over or repeat entries that change while it runs, and it fails with
+// ErrTreeChanged when an ancestor moves or a directory it holds is removed.
+// Every listed entry it passes over, because it vanished or stopped being a
+// directory, is counted in its WalkReport, whose Complete method is false for
+// such a walk; a walk that is not complete must never be reported clean. It
+// never follows a symlink or crosses a mount; as with RemoveBeneath, a
+// directory moved out of the tree while the walk holds it is still listed
+// before the move is detected.
 //
 // # Algorithm
 //
@@ -72,9 +75,11 @@
 //     and mount, checked before anything in it is touched or BeforeFirstCut
 //     can run, and every directory entered must share the anchor's. The
 //     mount ID catches a bind mount of the same filesystem, which st_dev alone
-//     misses; kernels older than Linux 5.8 do not report it, and there only
-//     the device is compared. A mount point inside the tree cannot be removed
-//     (EBUSY), so RemoveBeneath stops there with ErrUndeletable.
+//     misses. Linux 5.8 or later is required: an identity is never made
+//     without a mount ID, so on an older kernel every traversal of a
+//     directory fails closed with ErrCrossDevice before anything in it is
+//     touched. A mount point inside the tree cannot be removed (EBUSY), so
+//     RemoveBeneath stops there with ErrUndeletable.
 //   - I4 Progress: every iteration removes an entry, descends, ascends or
 //     cuts. An iteration that does none of these is retried once and then
 //     fails with ErrTreeChanged, so a listing that disagrees with lookups
@@ -104,5 +109,28 @@
 //     ascent. An interrupted call leaves a consistent tree that a rerun
 //     finishes.
 //
-// The package is Linux-only.
+// # Construction
+//
+// The confinement rules are properties of types, not of review:
+//
+//   - Every syscall goes through the descriptor layer in internal/at. Its Dir
+//     owns a descriptor opened with fixed flags, and Close poisons it. An entry
+//     a directory lists is bound to that directory and converts to no Name, so
+//     a listed name cannot be resolved against another directory. Only
+//     OpenParent reaches a parent, and both traversals verify what it reached.
+//   - The walker holds only the read-only side of that layer, which has no
+//     method that changes anything, so WalkBeneath cannot change the tree.
+//   - BeforeFirstCut and Visitor methods receive a BorrowedDir, never a bare
+//     descriptor: it is reachable only inside its Control, and only during
+//     the call it was lent for.
+//   - The sentinel errors are constants, and a BeforeFirstCut error unwraps
+//     to ErrCutRefused alone, so a sentinel in a RemoveBeneath error is
+//     fstree's own verdict. WalkBeneath returns a visitor's error unchanged:
+//     its meaning belongs to whoever wrote the visitor.
+//
+// A guard test pins what the types cannot: raw syscalls only in the
+// descriptor layer, ".." only in OpenParent, nothing mutating reachable from
+// the walk, and Names made only from the caller's input.
+//
+// The package is Linux-only and needs Linux 5.8 or later.
 package fstree

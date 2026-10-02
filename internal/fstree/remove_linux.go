@@ -8,8 +8,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/manifest-network/fred/internal/fstree/internal/at"
 )
 
 const (
@@ -21,13 +24,112 @@ const (
 	cutAttempts = 8
 )
 
-// entryOutcome is what removing one listed entry achieved.
+// RemoveOptions configures RemoveBeneath.
+type RemoveOptions struct {
+	// BeforeFirstCut, when set, runs on the anchor (the opened top
+	// directory) immediately before the call's first cut, and at most once
+	// per call. A removal that needs no cut, because the tree is no deeper
+	// than the depth bound, never calls it. When it fails, that cut is
+	// refused: RemoveBeneath stops with an error wrapping ErrCutRefused, and
+	// keeps everything it has not yet removed.
+	//
+	// It exists so that XFS volume deletion can detach the condemned anchor
+	// from its quota project only when a cut makes that necessary, after
+	// which a cut into the anchor cannot fail with EXDEV or EDQUOT. It must
+	// be idempotent, because a rerun calls it again at its own first cut.
+	//
+	// The anchor is lent as a BorrowedDir backed by a duplicate of fstree's
+	// own descriptor, valid only during the call; the cuts rename into a
+	// descriptor that is never lent.
+	//
+	// Whatever the hook returns, it cannot pass for one of this package's
+	// verdicts. The error RemoveBeneath returns unwraps to ErrCutRefused and
+	// to nothing else: the hook's error appears in its text, and a caller
+	// that needs it reaches it through errors.As with an
+	// interface{ Cause() error }, never through errors.Is.
+	BeforeFirstCut func(anchor BorrowedDir) error
+}
+
+// RemoveReport counts what one RemoveBeneath call removed. A failed call
+// reports what it removed before it stopped.
+type RemoveReport struct {
+	// Entries counts the non-directory entries unlinked.
+	Entries uint64
+	// Dirs counts the directories removed, the anchor included.
+	Dirs uint64
+	// Cuts counts the subtrees moved into the anchor because they lay
+	// deeper than the depth bound. Any cut means the tree had more than
+	// 65,536 levels.
+	Cuts uint64
+	// MaxDepth is the deepest directory level entered; the anchor is
+	// level 0.
+	MaxDepth int
+}
+
+// RemoveBeneath removes the entry name inside the directory parent and, when
+// it is a directory, everything beneath it. It holds at most three
+// descriptors of its own, keeps at most 65,536 levels of ancestry (512 KiB)
+// plus one directory batch, and does not recurse; it never follows symlinks,
+// never crosses a mount, and never ascends above the entry. The package
+// documentation describes the algorithm, its invariants and its resource
+// bounds.
+//
+// Precondition: no other actor mutates the tree concurrently (its writers
+// are stopped). A concurrent rename is detected (ErrTreeChanged), not
+// prevented.
+//
+// An absent name counts as removed. A name that is not a directory,
+// including a symlink to one, is unlinked without being opened. On failure
+// RemoveBeneath stops and leaves in place everything it has not removed, and
+// a rerun continues from there. The error wraps ErrTreeChanged,
+// ErrCrossDevice, ErrCutRefused, ErrUndeletable, ErrInvalidName, the
+// context's error, or the failing syscall's errno.
+//
+// parent stays open for the whole call, even against a concurrent Close;
+// a parent closed before the call is refused.
+func RemoveBeneath(ctx context.Context, parent *os.File, name Name, opts RemoveOptions) (RemoveReport, error) {
+	return removeBeneath(ctx, parent, name, opts, maxDepth)
+}
+
+// removeBeneath is RemoveBeneath with the depth bound as a parameter, so a
+// white-box test can reach the cut path without building 65,536 levels.
+func removeBeneath(
+	ctx context.Context,
+	parent *os.File,
+	name Name,
+	opts RemoveOptions,
+	limit int,
+) (RemoveReport, error) {
+	if err := checkCall(ctx, parent, name, limit); err != nil {
+		return RemoveReport{}, err
+	}
+	var (
+		report RemoveReport
+		runErr error
+	)
+	err := at.Borrow(parent, func(p *at.Dir) {
+		r := newRemover(ctx, p, name, opts, limit)
+		defer r.release()
+		runErr = r.run()
+		report = r.report
+	})
+	if err != nil {
+		return report, parentError(err)
+	}
+	return report, runErr
+}
+
+// entryOutcome is what removing one listed entry achieved. Its zero value is
+// entryUnknown, which is no outcome at all: a forgotten or defaulted outcome
+// fails the removal instead of reading as progress.
 type entryOutcome uint8
 
 const (
+	// entryUnknown is the zero value and never a valid outcome.
+	entryUnknown entryOutcome = iota
 	// entryRemoved: this call unlinked the entry or removed the empty
 	// directory.
-	entryRemoved entryOutcome = iota
+	entryRemoved
 	// entryAbsent: the entry was already gone, or changed type between the
 	// listing and the removal; the next scan sees whatever is there now.
 	entryAbsent
@@ -35,44 +137,81 @@ const (
 	entryNonEmpty
 )
 
+// next says what an outcome means for the batch being drained: whether it
+// was progress, and whether the entry is a non-empty directory to enter (or
+// cut) next. It is total: entryUnknown, or any value outside the set, is an
+// error.
+func (o entryOutcome) next() (progress, enter bool, err error) {
+	switch o {
+	case entryRemoved:
+		return true, false, nil
+	case entryAbsent:
+		return false, false, nil
+	case entryNonEmpty:
+		return false, true, nil
+	default:
+		return false, false, fmt.Errorf("fstree: invalid removal outcome %d", o)
+	}
+}
+
+// hookError is a failed BeforeFirstCut. It unwraps to ErrCutRefused and to
+// nothing else, so an fstree sentinel in a removal's error is always
+// fstree's own verdict: a hook that returns, say, ErrCrossDevice does not
+// make the removal report one. Cause returns the hook's error.
+type hookError struct {
+	name  string // bounded by shortName
+	depth int
+	cause error
+}
+
+func (e *hookError) Error() string {
+	return fmt.Sprintf("%s: BeforeFirstCut refused the cut of %q at depth %d: %v",
+		ErrCutRefused, e.name, e.depth, e.cause)
+}
+
+// Unwrap returns ErrCutRefused, never the hook's error.
+func (e *hookError) Unwrap() error { return ErrCutRefused }
+
+// Cause returns the error BeforeFirstCut returned.
+func (e *hookError) Cause() error { return e.cause }
+
 // remover is one RemoveBeneath call. Its phases are separate methods that
 // run drives in order: begin opens the anchor, step runs one iteration, and
 // finish removes the emptied anchor. Keeping them apart lets a white-box test
 // change the tree between iterations without any hook in this file.
 //
 // It owns at most three descriptors: the anchor, the directory being emptied
-// and, while it descends or ascends, one transient descriptor.
+// and, while it descends, ascends or lends the anchor, one transient
+// descriptor. The parent is the caller's, borrowed for the call.
 type remover struct {
 	ctx            context.Context
-	pfd            int
-	name           string
+	parent         *at.Dir // borrowed; never closed here
+	name           Name
 	limit          int
-	beforeFirstCut func(anchorFD int) error
+	beforeFirstCut func(BorrowedDir) error
 
-	anchor identity // the anchor as opened through name
-	afd    int      // anchor descriptor; -1 when not open
-	cur    int      // descriptor of the directory being emptied; -1 when not open
-	curIno uint64
-	stack  []uint64 // inode of each ancestor of cur, from the anchor down
-	stalls int      // consecutive iterations without progress
+	anchorID at.Identity // the anchor as opened through name
+	anchor   *at.Dir     // nil when not open
+	cur      *at.Dir     // directory being emptied; nil when not open
+	curIno   uint64
+	stack    []uint64 // inode of each ancestor of cur, from the anchor down
+	stalls   int      // consecutive iterations without progress
 
 	cutsBegun bool   // the first cut was prepared: hook run, names seeded
 	cutNext   uint64 // next cut-name counter value
 
-	dir    dirReader
+	dir    at.Reader
 	report RemoveReport
 }
 
-func newRemover(ctx context.Context, pfd int, name Name, opts RemoveOptions, limit int) *remover {
+func newRemover(ctx context.Context, parent *at.Dir, name Name, opts RemoveOptions, limit int) *remover {
 	return &remover{
 		ctx:            ctx,
-		pfd:            pfd,
-		name:           name.s,
+		parent:         parent,
+		name:           name,
 		limit:          limit,
 		beforeFirstCut: opts.BeforeFirstCut,
-		afd:            -1,
-		cur:            -1,
-		dir:            newDirReader(),
+		dir:            at.NewReader(),
 	}
 }
 
@@ -97,21 +236,17 @@ func (r *remover) run() error {
 // release closes every descriptor the remover still holds. It is safe to
 // call more than once.
 func (r *remover) release() {
-	if r.cur >= 0 {
-		closeFD(r.cur)
-		r.cur = -1
-	}
-	if r.afd >= 0 {
-		closeFD(r.afd)
-		r.afd = -1
-	}
+	r.cur.Close()
+	r.cur = nil
+	r.anchor.Close()
+	r.anchor = nil
 }
 
 // depth is the level of the directory being emptied; the anchor is 0.
 func (r *remover) depth() int { return len(r.stack) }
 
 func (r *remover) canceled(err error) error {
-	return fmt.Errorf("fstree: removal of %q stopped at depth %d: %w", shortName(r.name), r.depth(), err)
+	return fmt.Errorf("fstree: removal of %q stopped at depth %d: %w", shortName(r.name.String()), r.depth(), err)
 }
 
 // begin unlinks the entry outright when it is not a directory, and reports
@@ -123,7 +258,8 @@ func (r *remover) begin() (opened bool, err error) {
 	if err := r.ctx.Err(); err != nil {
 		return false, r.canceled(err)
 	}
-	err = unlinkAt(r.pfd, r.name, 0)
+	name := r.name.String()
+	err = r.parent.Unlink(r.name)
 	switch {
 	case err == nil:
 		r.report.Entries++
@@ -131,19 +267,19 @@ func (r *remover) begin() (opened bool, err error) {
 	case errors.Is(err, unix.ENOENT):
 		return false, nil
 	case !errors.Is(err, unix.EISDIR):
-		return false, classify("unlink", r.name, 0, err)
+		return false, classify("unlink", name, 0, err)
 	}
 
-	afd, err := openDirAt(r.pfd, r.name)
+	anchor, err := r.parent.OpenChild(r.name)
 	switch {
 	case err == nil:
-		r.afd = afd
+		r.anchor = anchor
 	case errors.Is(err, unix.ENOENT):
 		return false, nil
 	case errors.Is(err, unix.ENOTDIR), errors.Is(err, unix.ELOOP):
 		// The name stopped being a directory after the unlink saw one.
 		// Unlink it once more, and report whatever that says.
-		err = unlinkAt(r.pfd, r.name, 0)
+		err = r.parent.Unlink(r.name)
 		switch {
 		case err == nil:
 			r.report.Entries++
@@ -151,29 +287,29 @@ func (r *remover) begin() (opened bool, err error) {
 		case errors.Is(err, unix.ENOENT):
 			return false, nil
 		default:
-			return false, classify("unlink", r.name, 0, err)
+			return false, classify("unlink", name, 0, err)
 		}
 	default:
-		return false, classify("open", r.name, 0, err)
+		return false, classify("open", name, 0, err)
 	}
 
-	parent, err := statFD(r.pfd)
+	parentID, err := r.parent.Stat()
 	if err != nil {
-		return false, opError("stat the parent of", r.name, 0, err)
+		return false, opError("stat the parent of", name, 0, err)
 	}
-	anchor, err := statFD(r.afd)
+	anchorID, err := r.anchor.Stat()
 	if err != nil {
-		return false, opError("stat", r.name, 0, err)
+		return false, opError("stat", name, 0, err)
 	}
-	if !parent.sameMount(anchor) {
-		return false, crossDevice(r.name, 0)
+	if !parentID.SameMount(anchorID) {
+		return false, crossDevice(name, 0)
 	}
-	r.anchor = anchor
-	cur, err := dupFD(r.afd)
+	r.anchorID = anchorID
+	cur, err := r.anchor.Dup()
 	if err != nil {
-		return false, opError("dup", r.name, 0, err)
+		return false, opError("duplicate", name, 0, err)
 	}
-	r.cur, r.curIno = cur, anchor.ino
+	r.cur, r.curIno = cur, anchorID.Ino()
 	return true, nil
 }
 
@@ -185,13 +321,9 @@ func (r *remover) step() (empty bool, err error) {
 	if err := r.ctx.Err(); err != nil {
 		return false, r.canceled(err)
 	}
-	entries, _, eof, err := r.dir.read(r.cur, 0)
-	switch {
-	case err == nil:
-	case errors.Is(err, unix.ENOENT):
-		return false, removedWhileHeld(r.depth())
-	default:
-		return false, dirError("read", r.depth(), err)
+	entries, _, eof, err := r.cur.ReadBatch(&r.dir, 0)
+	if err != nil {
+		return false, readError(r.depth(), err)
 	}
 	if eof {
 		if r.depth() == 0 {
@@ -211,30 +343,31 @@ func (r *remover) step() (empty bool, err error) {
 // the directory being emptied is already at the depth bound. Everything
 // listed before the child is gone by then, so a later scan from the start of
 // this directory meets the child again and, once it is empty, removes it.
-func (r *remover) drain(entries []dirent) (progressed bool, err error) {
+func (r *remover) drain(entries []at.Listed) (progressed bool, err error) {
 	for _, e := range entries {
 		if err := r.ctx.Err(); err != nil {
 			return progressed, r.canceled(err)
 		}
-		outcome, err := r.remove(e.name)
+		outcome, err := r.remove(e)
 		if err != nil {
 			return progressed, err
 		}
-		switch outcome {
-		case entryRemoved:
-			progressed = true
-		case entryAbsent:
-		case entryNonEmpty:
+		progress, enter, err := outcome.next()
+		if err != nil {
+			return progressed, err
+		}
+		progressed = progressed || progress
+		if enter {
 			var moved bool
 			if r.depth() >= r.limit {
-				moved, err = r.cut(e.name)
+				moved, err = r.cut(e)
 			} else {
-				moved, err = r.descend(e.name)
+				moved, err = r.descend(e)
 			}
 			return progressed || moved, err
 		}
 	}
-	r.dir.grow()
+	r.dir.Grow()
 	return progressed, nil
 }
 
@@ -254,12 +387,13 @@ func (r *remover) account(progressed bool) error {
 	return nil
 }
 
-// remove unlinks name from the directory being emptied. A directory is
-// removed only when empty; a non-empty one is reported so that it is emptied
-// first.
-func (r *remover) remove(name string) (entryOutcome, error) {
+// remove unlinks the listed entry e from the directory being emptied, the
+// directory it was listed from. A directory is removed only when empty; a
+// non-empty one is reported so that it is emptied first. Every error comes
+// with entryUnknown.
+func (r *remover) remove(e at.Listed) (entryOutcome, error) {
 	depth := r.depth() + 1
-	err := unlinkAt(r.cur, name, 0)
+	err := e.Unlink()
 	switch {
 	case err == nil:
 		r.report.Entries++
@@ -267,9 +401,9 @@ func (r *remover) remove(name string) (entryOutcome, error) {
 	case errors.Is(err, unix.ENOENT):
 		return entryAbsent, nil
 	case !errors.Is(err, unix.EISDIR):
-		return entryAbsent, classify("unlink", name, depth, err)
+		return entryUnknown, classify("unlink", e.String(), depth, err)
 	}
-	err = unlinkAt(r.cur, name, unix.AT_REMOVEDIR)
+	err = e.Rmdir()
 	switch {
 	case err == nil:
 		r.report.Dirs++
@@ -279,99 +413,103 @@ func (r *remover) remove(name string) (entryOutcome, error) {
 	case errors.Is(err, unix.ENOTEMPTY), errors.Is(err, unix.EEXIST):
 		return entryNonEmpty, nil
 	default:
-		return entryAbsent, classify("rmdir", name, depth, err)
+		return entryUnknown, classify("rmdir", e.String(), depth, err)
 	}
 }
 
-// descend enters the child directory name. A child that vanished or stopped
-// being a directory is skipped (moved=false), and the next scan sees what is
-// there now. A child on another device or mount fails with ErrCrossDevice.
-func (r *remover) descend(name string) (moved bool, err error) {
+// descend enters the listed child directory e. A child that vanished or
+// stopped being a directory is skipped (moved=false), and the next scan sees
+// what is there now. A child on another device or mount fails with
+// ErrCrossDevice.
+func (r *remover) descend(e at.Listed) (moved bool, err error) {
 	if err := r.ctx.Err(); err != nil {
 		return false, r.canceled(err)
 	}
 	depth := r.depth() + 1
-	fd, err := openDirAt(r.cur, name)
+	child, err := e.OpenDir()
 	switch {
 	case err == nil:
 	case errors.Is(err, unix.ENOENT), errors.Is(err, unix.ENOTDIR), errors.Is(err, unix.ELOOP):
 		return false, nil
 	default:
-		return false, classify("open", name, depth, err)
+		return false, classify("open", e.String(), depth, err)
 	}
-	child, err := statFD(fd)
+	childID, err := child.Stat()
 	if err != nil {
-		closeFD(fd)
-		return false, opError("stat", name, depth, err)
+		child.Close()
+		return false, opError("stat", e.String(), depth, err)
 	}
-	if !r.anchor.sameMount(child) {
-		closeFD(fd)
-		return false, crossDevice(name, depth)
+	if !r.anchorID.SameMount(childID) {
+		child.Close()
+		return false, crossDevice(e.String(), depth)
 	}
 	r.stack = append(r.stack, r.curIno)
-	closeFD(r.cur)
-	r.cur, r.curIno = fd, child.ino
+	r.cur.Close()
+	r.cur, r.curIno = child, childID.Ino()
 	r.report.MaxDepth = max(r.report.MaxDepth, depth)
-	r.dir.full()
+	r.dir.Full()
 	return true, nil
 }
 
-// ascend returns from an emptied directory to its parent through "..", and
-// only when that parent is the directory it was entered from: same device,
-// mount and inode. Anything else means the tree moved, and the remover stops
-// with ErrTreeChanged rather than continue somewhere it never descended.
+// ascend returns from an emptied directory to its parent, and only when that
+// parent is the directory it was entered from: same device, mount and inode.
+// Anything else means the tree moved, and the remover stops with
+// ErrTreeChanged rather than continue somewhere it never descended.
 func (r *remover) ascend() error {
 	if err := r.ctx.Err(); err != nil {
 		return r.canceled(err)
 	}
 	depth := r.depth()
 	want := r.stack[depth-1]
-	fd, err := openDirAt(r.cur, "..")
+	up, err := r.cur.OpenParent()
 	switch {
 	case err == nil:
 	case errors.Is(err, unix.ENOENT):
 		return removedWhileHeld(depth)
 	default:
-		return classify("open", "..", depth, err)
+		return classifyDir("open the parent of", depth, err)
 	}
-	up, err := statFD(fd)
+	upID, err := up.Stat()
 	if err != nil {
-		closeFD(fd)
-		return opError("stat", "..", depth, err)
+		up.Close()
+		return dirError("stat the parent of", depth, err)
 	}
-	if !r.anchor.sameMount(up) || up.ino != want {
-		closeFD(fd)
-		return fmt.Errorf("%w: the parent of the directory at depth %d is not the directory it was entered from",
-			ErrTreeChanged, depth)
+	if !r.anchorID.SameMount(upID) || upID.Ino() != want {
+		up.Close()
+		return movedError(depth)
 	}
-	closeFD(r.cur)
-	r.cur, r.curIno = fd, want
+	r.cur.Close()
+	r.cur, r.curIno = up, want
 	r.stack = r.stack[:depth-1]
 	r.stalls = 0
-	r.dir.shrink()
+	r.dir.Shrink()
 	return nil
 }
 
-// cut moves the non-empty child name of the directory being emptied, which
-// sits at the depth bound, into the anchor under a fresh name. The subtree
-// is then removed from the anchor like any other child, so the ancestor
-// stack never grows past the bound.
+// cut moves the non-empty listed child e of the directory being emptied,
+// which sits at the depth bound, into the anchor under a fresh name. The
+// subtree is then removed from the anchor like any other child, so the
+// ancestor stack never grows past the bound.
 //
 // The call's first cut runs beginCuts first. Cut names count up from a
 // random origin: names planted in the anchor beforehand cannot be predicted
 // to collide, and a rerun of an interrupted removal does not retry the names
 // it left behind.
-func (r *remover) cut(name string) (moved bool, err error) {
+func (r *remover) cut(e at.Listed) (moved bool, err error) {
 	depth := r.depth() + 1
 	if !r.cutsBegun {
-		if err := r.beginCuts(name, depth); err != nil {
+		if err := r.beginCuts(e.String(), depth); err != nil {
 			return false, err
 		}
 	}
 	for range cutAttempts {
-		target := fmt.Sprintf("%s%016x", cutPrefix, r.cutNext)
+		var target Name
+		target, err = cutName(r.cutNext)
+		if err != nil {
+			return false, err
+		}
 		r.cutNext++
-		err = renameNoReplace(r.cur, name, r.afd, target)
+		err = e.RenameNoReplaceInto(r.anchor, target)
 		switch {
 		case err == nil:
 			r.report.Cuts++
@@ -382,10 +520,10 @@ func (r *remover) cut(name string) (moved bool, err error) {
 			// The child vanished after rmdir saw it; the next scan decides.
 			return false, nil
 		default:
-			return false, cutError(name, depth, err)
+			return false, cutError(e.String(), depth, err)
 		}
 	}
-	return false, cutError(name, depth, err)
+	return false, cutError(e.String(), depth, err)
 }
 
 // beginCuts prepares the call's first cut, once: it runs BeforeFirstCut on
@@ -395,15 +533,41 @@ func (r *remover) cut(name string) (moved bool, err error) {
 func (r *remover) beginCuts(name string, depth int) error {
 	r.cutsBegun = true
 	if r.beforeFirstCut != nil {
-		if err := r.beforeFirstCut(r.afd); err != nil {
-			return fmt.Errorf("%w: before the first cut, of %q at depth %d: %w",
-				ErrCutRefused, shortName(name), depth, err)
+		if err := r.runBeforeFirstCut(name, depth); err != nil {
+			return err
 		}
 	}
 	var seed [8]byte
 	// crypto/rand.Read never fails since Go 1.24.
 	_, _ = rand.Read(seed[:])
 	r.cutNext = binary.NativeEndian.Uint64(seed[:])
+	return nil
+}
+
+// runBeforeFirstCut lends BeforeFirstCut a duplicate of the anchor's
+// descriptor for the duration of the call. Cuts rename into the anchor's own
+// descriptor, which is never lent, so a hook that mishandles what it was
+// lent, by closing it for example, cannot redirect a cut. The hook's error
+// becomes a hookError.
+func (r *remover) runBeforeFirstCut(name string, depth int) error {
+	lent, err := r.anchor.Dup()
+	if err != nil {
+		return opError("duplicate the anchor for the cut of", name, depth, err)
+	}
+	defer lent.Close()
+	var (
+		lender  at.Lender
+		hookErr error
+	)
+	if err := lender.Lend(lent.View(), func(anchor at.Borrowed) error {
+		hookErr = r.beforeFirstCut(BorrowedDir{lent: anchor})
+		return nil
+	}); err != nil {
+		return opError("lend the anchor for the cut of", name, depth, err)
+	}
+	if hookErr != nil {
+		return &hookError{name: shortName(name), depth: depth, cause: hookErr}
+	}
 	return nil
 }
 
@@ -423,22 +587,21 @@ func cutError(name string, depth int, err error) error {
 // left alone and reported as ErrTreeChanged; a name already gone counts as
 // removed.
 func (r *remover) finish() error {
-	if r.cur >= 0 {
-		closeFD(r.cur)
-		r.cur = -1
-	}
-	now, err := statEntry(r.pfd, r.name)
+	r.cur.Close()
+	r.cur = nil
+	name := r.name.String()
+	now, err := r.parent.StatChild(r.name)
 	switch {
 	case err == nil:
 	case errors.Is(err, unix.ENOENT):
 		return nil
 	default:
-		return opError("stat", r.name, 0, err)
+		return opError("stat", name, 0, err)
 	}
-	if !now.same(r.anchor) {
-		return fmt.Errorf("%w: %q no longer names the emptied directory", ErrTreeChanged, shortName(r.name))
+	if !now.Same(r.anchorID) {
+		return fmt.Errorf("%w: %q no longer names the emptied directory", ErrTreeChanged, shortName(name))
 	}
-	err = unlinkAt(r.pfd, r.name, unix.AT_REMOVEDIR)
+	err = r.parent.Rmdir(r.name)
 	switch {
 	case err == nil:
 		r.report.Dirs++
@@ -446,8 +609,8 @@ func (r *remover) finish() error {
 	case errors.Is(err, unix.ENOENT):
 		return nil
 	case errors.Is(err, unix.ENOTEMPTY), errors.Is(err, unix.EEXIST):
-		return fmt.Errorf("%w: %q gained entries after it was emptied: %w", ErrTreeChanged, shortName(r.name), err)
+		return fmt.Errorf("%w: %q gained entries after it was emptied: %w", ErrTreeChanged, shortName(name), err)
 	default:
-		return classify("rmdir", r.name, 0, err)
+		return classify("rmdir", name, 0, err)
 	}
 }
