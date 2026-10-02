@@ -769,11 +769,13 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 		if status == backend.ProvisionStatusFailed {
 			failCount++
 		}
+		// The converged status is set below, through SetStatus, like every
+		// other write; the placeholder is never published.
 		recovered := recoveredProvision{ //exhaustruct:enforce
 			ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
 				LeaseUUID: intent.LeaseUUID(), Tenant: authority.Tenant(), ProviderUUID: authority.ProviderUUID(),
 				SKU: release.Items[0].SKU, Quantity: quantity, CreatedAt: release.CreatedAt,
-				Status: status, FailCount: failCount, TerminalBudget: leasesm.TerminalBudget{},
+				Status: backend.ProvisionStatusUnknown, FailCount: failCount, TerminalBudget: leasesm.TerminalBudget{},
 				LastError: "", Reason: "", Message: "",
 				CallbackURL: authority.CallbackURL(), LifecycleCallbackURL: authority.LifecycleCallbackURL(),
 				ActiveReleaseVersion: release.Version, ActiveOperationID: authority.OperationID(),
@@ -794,7 +796,10 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 	provision.StackManifest = stack
 	provision.ContainerIDs = containerIDs
 	provision.ServiceContainers = serviceContainers
-	provision.Status = status
+	// A maintenance outcome converged without an actor never counts against the
+	// terminal budget (ENG-799): SetStatus only applies the Ready boundary and
+	// ends any counted failure, so it can only move the budget toward a reset.
+	provision.SetStatus(status, time.Now())
 	if failure == nil {
 		provision.LastError = ""
 		provision.Reason = ""
@@ -803,13 +808,6 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 		provision.LastError = failure.LastError()
 		provision.Reason = failure.Reason()
 		provision.Message = failure.CallbackError()
-	}
-	// A maintenance outcome converged without an actor never counts against the
-	// terminal budget (ENG-799). Both helpers can only move it toward a reset.
-	if status == backend.ProvisionStatusReady {
-		provision.ObserveReadyProjection(time.Now())
-	} else {
-		provision.ObserveUncountedFailureProjection(time.Now())
 	}
 	return true, nil
 }

@@ -650,12 +650,11 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	// the Ready→Failing mutation in the same critical section.
 	var outcome budgetOutcome
 	applied := lsm.actor.cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
-		p.Status = backend.ProvisionStatusFailing
 		p.FailCount++
 		p.LastError = errMsgContainerExited
 		p.Reason = backend.ReasonContainerExited
 		p.Message = errMsgContainerExited
-		outcome = p.budgetRecordFailure(cause, now)
+		outcome = p.recordFailure(backend.ProvisionStatusFailing, cause, now)
 	})
 	if applied {
 		lsm.observeBudgetOutcome(outcome, info, provenance)
@@ -685,12 +684,12 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 // reservation remain available to the Started executor, but its terminal
 // status and diagnostics no longer describe the in-flight operation.
 func (lsm *leaseSM) onEnterProvisioning(_ context.Context, _ ...any) error {
+	now := time.Now()
 	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
-		p.Status = backend.ProvisionStatusProvisioning
+		p.SetStatus(backend.ProvisionStatusProvisioning, now)
 		p.LastError = ""
 		p.Reason = ""
 		p.Message = ""
-		p.budgetEnterProvisioning()
 	})
 	return nil
 }
@@ -734,16 +733,18 @@ func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus
 	callbackKind := entry.CallbackKind
 	maintenance := entry.Maintenance
 	now := time.Now()
+	tenantReset := maintenance.Valid() && tenantInitiatedMaintenance(maintenance.Kind())
 	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
-		// Leaving Ready ends the current Ready period. An accepted tenant
-		// restart or update (lifecycle maintenance) then starts a fresh streak,
-		// as `docker restart` resets Docker's RestartCount; a restore admits a
-		// new lease whose budget is already fresh.
-		p.budgetExitReady(now)
-		if callbackKind == replaceCallbackLifecycle {
+		// Leaving Ready ends the current Ready period (SetStatus). An accepted
+		// tenant restart or update then starts a fresh streak, as `docker
+		// restart` resets Docker's RestartCount. The reset is keyed on the
+		// maintenance kind, not the callback kind: a custom-domain redeploy
+		// shares the lifecycle callback but is started by the platform, and a
+		// restore admits a new lease whose budget is already fresh.
+		p.SetStatus(status, now)
+		if tenantReset {
 			p.budgetResetByTenant()
 		}
-		p.Status = status
 		if callbackKind == replaceCallbackOperation && callbackURL != "" {
 			p.CallbackURL = callbackURL
 		}
@@ -774,17 +775,37 @@ type maintenanceRecoveryFailureArgs struct {
 	failure    ReplaceFailureInfo
 }
 
+// recoveredFailureRecord is the failure a maintenance-recovery entry action
+// records, exactly once, in the same critical section as the status change it
+// caused. Its zero value is an idempotent re-application, which records
+// nothing: a settlement retry must never record or emit a metric twice.
+type recoveredFailureRecord struct {
+	cause  failurecause.Cause
+	record bool
+}
+
+func recordRecoveredFailure(cause failurecause.Cause) recoveredFailureRecord {
+	return recoveredFailureRecord{cause: cause, record: true}
+}
+
 func (lsm *leaseSM) applyMaintenanceRecoveredProjection(
 	result ReplaceSuccessResult,
 	status backend.ProvisionStatus,
+	failure recoveredFailureRecord,
 ) error {
+	now := time.Now()
+	var outcome budgetOutcome
 	applied := lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
 		applyReplaceReleaseAuthority(p, result)
 		p.ContainerIDs = result.containerIDs
 		if result.serviceContainers != nil {
 			p.ServiceContainers = result.serviceContainers
 		}
-		p.Status = status
+		if failure.record {
+			outcome = p.recordFailure(status, failure.cause, now)
+		} else {
+			p.SetStatus(status, now)
+		}
 		if result.applyRecoveredRuntimeAuthority {
 			p.CallbackURL = result.recoveredCallbackURL
 			p.LifecycleCallbackURL = result.recoveredLifecycleCallbackURL
@@ -792,6 +813,9 @@ func (lsm *leaseSM) applyMaintenanceRecoveredProjection(
 	})
 	if !applied {
 		return errors.New("maintenance recovery provision no longer exists")
+	}
+	if failure.record {
+		lsm.observeBudgetOutcome(outcome, nil, failurecause.Provenance{})
 	}
 	return nil
 }
@@ -818,43 +842,36 @@ func applyReplaceReleaseAuthority(state *ProvisionState, result ReplaceSuccessRe
 // FSM already reached Ready but its ProvisionStore entry is stale because an
 // earlier entry action panicked.
 func (lsm *leaseSM) applyMaintenanceRecoveredSuccess(result ReplaceSuccessResult) error {
-	if err := lsm.applyMaintenanceRecoveredProjection(result, backend.ProvisionStatusReady); err != nil {
+	if err := lsm.applyMaintenanceRecoveredProjection(
+		result, backend.ProvisionStatusReady, recoveredFailureRecord{},
+	); err != nil {
 		return err
 	}
-	now := time.Now()
 	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
 		p.LastError = ""
 		p.Reason = ""
 		p.Message = ""
-		// Idempotent on re-application: an existing Ready anchor is kept.
-		p.budgetEnterReady(now)
 	})
 	return nil
 }
 
 // applyMaintenanceRecoveredFailure reapplies an exact durable projection. It is
-// shared by the entry actions and by idempotent recovery re-application, so it
-// records nothing new in the terminal budget: it only re-asserts that the
-// current failure is not counted (and, for Ready, that a Ready period is
-// anchored). Entry actions record the failure once, before calling it.
+// shared by the entry actions and by idempotent recovery re-application: only
+// an entry action passes a failure to record, once, together with the status
+// change; a re-application records nothing new in the terminal budget.
 func (lsm *leaseSM) applyMaintenanceRecoveredFailure(
 	projection ReplaceSuccessResult,
 	info ReplaceFailureInfo,
 	status backend.ProvisionStatus,
+	failure recoveredFailureRecord,
 ) error {
-	if err := lsm.applyMaintenanceRecoveredProjection(projection, status); err != nil {
+	if err := lsm.applyMaintenanceRecoveredProjection(projection, status, failure); err != nil {
 		return err
 	}
-	now := time.Now()
 	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
-		if status == backend.ProvisionStatusReady {
-			p.budgetEnterReady(now)
-		} else {
-			p.budgetClearCurrentFailure()
-		}
 	})
 	return nil
 }
@@ -862,25 +879,11 @@ func (lsm *leaseSM) applyMaintenanceRecoveredFailure(
 func (lsm *leaseSM) applyMaintenanceRecoveredRuntimeFailure(
 	projection ReplaceSuccessResult,
 	info ReplaceFailureInfo,
+	failure recoveredFailureRecord,
 ) error {
 	return lsm.applyMaintenanceRecoveredFailure(
-		projection, info, backend.ProvisionStatusFailed,
+		projection, info, backend.ProvisionStatusFailed, failure,
 	)
-}
-
-// recordMaintenanceRecoveredFailure records, exactly once per recovery entry
-// action, a failure that never counts. It runs before the projection is
-// reapplied so that leaving Ready applies the sustained-Ready reset against the
-// Ready period that is ending.
-func (lsm *leaseSM) recordMaintenanceRecoveredFailure(cause failurecause.Cause) {
-	now := time.Now()
-	var outcome budgetOutcome
-	applied := lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
-		outcome = p.budgetRecordFailure(cause, now)
-	})
-	if applied {
-		lsm.observeBudgetOutcome(outcome, nil, failurecause.Provenance{})
-	}
 }
 
 func (lsm *leaseSM) onEnterReadyFromMaintenanceRecoverySuccess(
@@ -919,9 +922,8 @@ func (lsm *leaseSM) onEnterFailedFromMaintenanceRuntimeFailure(
 	args ...any,
 ) error {
 	recovery := args[0].(maintenanceRecoveryFailureArgs)
-	lsm.recordMaintenanceRecoveredFailure(failurecause.Platform())
 	_ = lsm.applyMaintenanceRecoveredRuntimeFailure(
-		recovery.projection, recovery.failure,
+		recovery.projection, recovery.failure, recordRecoveredFailure(failurecause.Platform()),
 	)
 	return nil
 }
@@ -932,9 +934,8 @@ func (lsm *leaseSM) applyMaintenanceRecoveryFailureArgs(
 	cause failurecause.Cause,
 ) error {
 	recovery := args[0].(maintenanceRecoveryFailureArgs)
-	lsm.recordMaintenanceRecoveredFailure(cause)
 	_ = lsm.applyMaintenanceRecoveredFailure(
-		recovery.projection, recovery.failure, status,
+		recovery.projection, recovery.failure, status, recordRecoveredFailure(cause),
 	)
 	return nil
 }
@@ -1020,8 +1021,7 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 	release, _ := result.operationRelease.Release()
 	now := time.Now()
 	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
-		p.Status = backend.ProvisionStatusReady
-		p.budgetEnterReady(now)
+		p.SetStatus(backend.ProvisionStatusReady, now)
 		p.ContainerIDs = result.containerIDs
 		p.LastError = ""
 		// Clear any stale curated failure surface (ENG-508): a retried
@@ -1075,8 +1075,7 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 		if result.serviceContainers != nil {
 			p.ServiceContainers = result.serviceContainers
 		}
-		p.Status = backend.ProvisionStatusReady
-		p.budgetEnterReady(now)
+		p.SetStatus(backend.ProvisionStatusReady, now)
 		p.LastError = ""
 		// Clear any stale curated failure surface (ENG-508): a lease that
 		// failed (Reason/Message authored) and then successfully restarts
@@ -1122,9 +1121,7 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 		p.Message = info.callbackErr
 		p.FailCount++
 		// A restart or update outcome never counts, rolled back or not.
-		outcome = p.budgetRecordFailure(failurecause.Maintenance(), now)
-		p.Status = backend.ProvisionStatusReady
-		p.budgetEnterReady(now)
+		outcome = p.recordFailure(backend.ProvisionStatusReady, failurecause.Maintenance(), now)
 		// Restart: if we actually stopped old containers and then restored
 		// them, we're back to the exact same state — no persistent error.
 		// Update: keep LastError so the UI shows why the update failed.
@@ -1164,8 +1161,7 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 		p.FailCount++
 		// A restart, update or restore that ends Failed never counts. The
 		// re-provision that follows can still count its own crashes.
-		outcome = p.budgetRecordFailure(failurecause.Maintenance(), now)
-		p.Status = backend.ProvisionStatusFailed
+		outcome = p.recordFailure(backend.ProvisionStatusFailed, failurecause.Maintenance(), now)
 	})
 	if applied {
 		lsm.observeBudgetOutcome(outcome, nil, failurecause.Provenance{})
@@ -1202,14 +1198,13 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 	now := time.Now()
 	var outcome budgetOutcome
 	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
-		p.Status = backend.ProvisionStatusFailed
 		p.FailCount++
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
 		// Only a refusal before any substrate effect reaches this transition
 		// (image admission and pull included): a platform failure, never counted.
-		outcome = p.budgetRecordFailure(failurecause.Platform(), now)
+		outcome = p.recordFailure(backend.ProvisionStatusFailed, failurecause.Platform(), now)
 	})
 	if applied {
 		lsm.observeBudgetOutcome(outcome, nil, failurecause.Provenance{})
@@ -1249,8 +1244,10 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 	var diagSnap shared.DiagnosticEntry
 	var diagContainerIDs []string
 	var diagKeys map[string]string
+	now := time.Now()
 	cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
-		p.Status = backend.ProvisionStatusFailed
+		// Failing -> Failed keeps a counted failure current.
+		p.SetStatus(backend.ProvisionStatusFailed, now)
 		// Reason/Message authored unconditionally, matching the fixed
 		// errMsgContainerExited callback sent below. LastError keeps its
 		// existing conditional shape (only overwritten when diag is set).
@@ -1311,14 +1308,13 @@ func (lsm *leaseSM) onEnterFailedFromCohortDivergence(ctx context.Context, args 
 	now := time.Now()
 	var outcome budgetOutcome
 	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
-		p.Status = backend.ProvisionStatusFailed
 		p.FailCount++
 		p.LastError = errMsgCohortDiverged
 		p.Reason = backend.ReasonInternal
 		p.Message = errMsgCohortDiverged
 		// A cohort that diverged from its durable release is a platform
 		// failure. Leaving Ready still applies the sustained-Ready reset.
-		outcome = p.budgetRecordFailure(failurecause.Platform(), now)
+		outcome = p.recordFailure(backend.ProvisionStatusFailed, failurecause.Platform(), now)
 		failCount = p.FailCount
 		diagSnap = DiagnosticSnapshot(p)
 		diagInstanceIDs = append([]string(nil), p.ContainerIDs...)

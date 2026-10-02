@@ -1087,25 +1087,25 @@ func recoveredReadyProjection(
 		)
 	}
 	failCount := 0
-	// The promotion replaces the projection pointer, so it carries the
-	// actor-owned terminal budget (ENG-799) exactly as it carries FailCount.
-	var budget leasesm.TerminalBudget
+	var predecessor *leasesm.ProvisionState
 	if current != nil {
 		failCount = current.FailCount
-		budget = current.TerminalBudget
+		predecessor = &current.ProvisionState
 	}
 	profiles := claim.ResourceProfiles()
+	// Ready is entered below through SetStatus, like every other status write;
+	// the Provisioning placeholder is never published.
 	promoted := &recoveredProvision{ //exhaustruct:enforce
 		ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
 			LeaseUUID:            claim.LeaseUUID(),
 			Tenant:               claim.Tenant(),
 			ProviderUUID:         claim.ProviderUUID(),
 			SKU:                  items[0].SKU,
-			Status:               backend.ProvisionStatusReady,
+			Status:               backend.ProvisionStatusProvisioning,
 			Quantity:             quantity,
 			CreatedAt:            claim.CreatedAt(),
 			FailCount:            failCount,
-			TerminalBudget:       budget,
+			TerminalBudget:       leasesm.TerminalBudget{},
 			LastError:            "",
 			Reason:               "",
 			Message:              "",
@@ -1120,9 +1120,13 @@ func recoveredReadyProjection(
 			ServiceContainers:    cloneOperationServiceContainers(promotion.serviceContainers),
 		},
 	}
-	// A Ready projection written outside the actor: it can only move the budget
-	// toward a reset.
-	promoted.ObserveReadyProjection(time.Now())
+	// The promotion replaces the projection pointer, so it inherits the
+	// actor-owned terminal budget (ENG-799) exactly as it carries FailCount. The
+	// replacement crosses into Ready from the predecessor's status, which
+	// anchors the Ready period; it can only move the budget toward a reset.
+	promotedAt := time.Now()
+	promoted.SetStatus(backend.ProvisionStatusReady, promotedAt)
+	promoted.InheritTerminalBudget(predecessor, promotedAt)
 	return promoted.materialize(), nil
 }
 

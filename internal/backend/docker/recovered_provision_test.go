@@ -220,9 +220,10 @@ func TestProvisionStateMatches_CoversEveryField(t *testing.T) {
 			p.ServiceContainers["app"][0] = "changed"
 		},
 		"TerminalBudget": func(p *provision) {
-			// The budget is opaque; its only off-actor mutators are the
-			// reset-only helpers, which still change the stored value.
-			p.ObserveReadyProjection(time.Now())
+			// The budget is opaque; its only off-actor mutator that keeps the
+			// status is InheritTerminalBudget, which still changes the stored
+			// value: a fresh budget for this Ready lease anchors its Ready period.
+			p.InheritTerminalBudget(nil, time.Now())
 		},
 	}
 
