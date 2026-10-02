@@ -2027,6 +2027,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   supply an outbound callback destination. Its default listener is now
   loopback-only (`127.0.0.1:9000`); an explicit non-loopback
   `MOCK_BACKEND_ADDR` remains available for isolated E2E networks.
+- deps: bump `github.com/containerd/containerd/v2` to v2.3.6 (from v2.3.5) to
+  resolve GO-2026-6597, a denial of service through a crafted OCI index graph,
+  and the OpenTelemetry Go modules to v1.45.0 (from v1.44.0) to resolve
+  GO-2026-6505, exporter configuration disclosed through verbose internal
+  logging. Both are indirect dependencies, and both versions were already
+  selected at v0.13.0. The bump clears the release's govulncheck gate without
+  widening its allowlist. (ENG-1119, ENG-1120)
 
 ## [0.13.0] - 2026-08-20
 
