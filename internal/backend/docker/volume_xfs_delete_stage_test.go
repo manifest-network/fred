@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/fstree"
 )
 
 const xfsDeleteTestProjectID = uint32(4242)
@@ -384,9 +385,11 @@ func TestXFSDestroyMarkerFirstPartialDeleteRecoversAfterRestart(t *testing.T) {
 	injected := errors.New("injected recursive removal failure")
 	installXFSQuotaFixture(t, "")
 
-	err := mgr.destroyWith(t.Context(), stage.volumeID.value(), func(root *os.Root, name string) error {
-		if name == projectIDFile {
-			return root.RemoveAll(name)
+	err := mgr.destroyWith(t.Context(), stage.volumeID.value(), func(
+		ctx context.Context, volume condemnedXFSVolume, name fstree.Name,
+	) error {
+		if name.String() == projectIDFile {
+			return removeCondemnedXFSEntry(ctx, volume, name)
 		}
 		return injected
 	})
@@ -551,7 +554,7 @@ func TestXFSDeleteCrashAfterQuotaClearBeforeTombstoneRemovalRecovers(t *testing.
 	injected := errors.New("injected tombstone unlink failure after clear")
 
 	err := mgr.cleanupXFSDeleteStageWith(
-		t.Context(), stage, removeAllFromXFSRoot, removeFromXFSRoot,
+		t.Context(), stage, removeCondemnedXFSEntry, removeFromXFSRoot,
 		func(*os.Root, string) error { return injected },
 	)
 	require.ErrorIs(t, err, injected)
@@ -655,7 +658,7 @@ func TestXFSDeleteRecoveryDeadlineStopsBetweenEntriesBeforeQuotaClear(t *testing
 	err := mgr.cleanupXFSDeleteStageWith(
 		ctx,
 		stage,
-		func(*os.Root, string) error {
+		func(context.Context, condemnedXFSVolume, fstree.Name) error {
 			removeCalls++
 			expire(context.DeadlineExceeded)
 			return nil

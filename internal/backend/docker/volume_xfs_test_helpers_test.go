@@ -15,9 +15,14 @@ func (xfsProjectAttributeReaderFunc) SetProjectID(*os.Root, uint32) error {
 	return errors.New("unexpected project-ID write")
 }
 
+func (xfsProjectAttributeReaderFunc) DetachCondemnedAnchor(int, uint64) error {
+	return errors.New("unexpected cut-anchor detach")
+}
+
 type xfsProjectAttributeFuncs struct {
-	read func(*os.Root) (linuxFSXAttr, error)
-	set  func(*os.Root, uint32) error
+	read   func(*os.Root) (linuxFSXAttr, error)
+	set    func(*os.Root, uint32) error
+	detach func(anchorFD int, volumeRootDevice uint64) error
 }
 
 func (a xfsProjectAttributeFuncs) ReadProjectAttributes(root *os.Root) (linuxFSXAttr, error) {
@@ -28,10 +33,18 @@ func (a xfsProjectAttributeFuncs) SetProjectID(root *os.Root, projectID uint32) 
 	return a.set(root, projectID)
 }
 
+func (a xfsProjectAttributeFuncs) DetachCondemnedAnchor(anchorFD int, volumeRootDevice uint64) error {
+	if a.detach == nil {
+		return errors.New("unexpected cut-anchor detach")
+	}
+	return a.detach(anchorFD, volumeRootDevice)
+}
+
 type fixedXFSProjectAttributeReader struct {
-	attr   linuxFSXAttr
-	err    error
-	setErr error
+	attr      linuxFSXAttr
+	err       error
+	setErr    error
+	detachErr error
 }
 
 func (r fixedXFSProjectAttributeReader) ReadProjectAttributes(*os.Root) (linuxFSXAttr, error) {
@@ -40,6 +53,10 @@ func (r fixedXFSProjectAttributeReader) ReadProjectAttributes(*os.Root) (linuxFS
 
 func (r fixedXFSProjectAttributeReader) SetProjectID(*os.Root, uint32) error {
 	return r.setErr
+}
+
+func (r fixedXFSProjectAttributeReader) DetachCondemnedAnchor(int, uint64) error {
+	return r.detachErr
 }
 
 // The path-scoped wrappers below are test fixtures. Production code already
