@@ -1,5 +1,7 @@
 package docker
 
+import "github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
+
 // dockerSMMetrics implements leasesm.SMMetrics against the package-global
 // prometheus counters declared in metrics.go. The counters themselves stay
 // in this package — the adapter is a thin pass-through so the lifted
@@ -45,4 +47,10 @@ func (dockerSMMetrics) ActorPanic() {
 // identifying the dropped event type.
 func (dockerSMMetrics) TerminalEventDropped(event string) {
 	leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
+}
+
+// LeaseFailureRecorded records one failure the terminal budget recorded,
+// labeled by its sealed attribution (a closed set; ENG-799).
+func (dockerSMMetrics) LeaseFailureRecorded(cause failurecause.Cause) {
+	leaseFailuresTotal.WithLabelValues(cause.Label()).Inc()
 }

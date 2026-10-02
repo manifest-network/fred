@@ -773,7 +773,8 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 			ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
 				LeaseUUID: intent.LeaseUUID(), Tenant: authority.Tenant(), ProviderUUID: authority.ProviderUUID(),
 				SKU: release.Items[0].SKU, Quantity: quantity, CreatedAt: release.CreatedAt,
-				Status: status, FailCount: failCount, LastError: "", Reason: "", Message: "",
+				Status: status, FailCount: failCount, TerminalBudget: leasesm.TerminalBudget{},
+				LastError: "", Reason: "", Message: "",
 				CallbackURL: authority.CallbackURL(), LifecycleCallbackURL: authority.LifecycleCallbackURL(),
 				ActiveReleaseVersion: release.Version, ActiveOperationID: authority.OperationID(),
 				Items: nil, ResourceProfiles: nil, ContainerIDs: nil, StackManifest: nil, ServiceContainers: nil,
@@ -802,6 +803,13 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 		provision.LastError = failure.LastError()
 		provision.Reason = failure.Reason()
 		provision.Message = failure.CallbackError()
+	}
+	// A maintenance outcome converged without an actor never counts against the
+	// terminal budget (ENG-799). Both helpers can only move it toward a reset.
+	if status == backend.ProvisionStatusReady {
+		provision.ObserveReadyProjection(time.Now())
+	} else {
+		provision.ObserveUncountedFailureProjection(time.Now())
 	}
 	return true, nil
 }

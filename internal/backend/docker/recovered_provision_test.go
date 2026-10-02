@@ -219,6 +219,11 @@ func TestProvisionStateMatches_CoversEveryField(t *testing.T) {
 		"ServiceContainers": func(p *provision) {
 			p.ServiceContainers["app"][0] = "changed"
 		},
+		"TerminalBudget": func(p *provision) {
+			// The budget is opaque; its only off-actor mutators are the
+			// reset-only helpers, which still change the stored value.
+			p.ObserveReadyProjection(time.Now())
+		},
 	}
 
 	typeOfState := reflect.TypeFor[leasesm.ProvisionState]()

@@ -20,6 +20,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -124,7 +125,7 @@ type ProvisionState struct {
 	Status               backend.ProvisionStatus
 	Quantity             int
 	CreatedAt            time.Time
-	FailCount            int
+	FailCount            int // lifetime diagnostic; never decides a close (ENG-799)
 	LastError            string
 	Reason               backend.Reason // curated failure-category code (ENG-508), authored at source
 	Message              string         // curated human message (== on-chain CallbackErr)
@@ -150,6 +151,11 @@ type ProvisionState struct {
 	// post-migration; per-service refs go through StackManifest.Services.
 	StackManifest     *manifest.StackManifest
 	ServiceContainers map[string][]string
+	// TerminalBudget is the consecutive tenant-workload failure budget
+	// (ENG-799). Only the lease actor advances it; substrates carry it across
+	// projection rebuilds and may only move it toward a reset (see
+	// terminal_budget.go).
+	TerminalBudget TerminalBudget
 }
 
 // LeaseProvisionStore is the substrate-agnostic seam for the
@@ -298,12 +304,16 @@ type LeaseProvisionStore interface {
 // no label because the actor goroutine is a single category.
 // TerminalEventDropped's event is a short tag identifying the event
 // type that was dropped (e.g., "diag_gathered", "provision_completed").
+// LeaseFailureRecorded fires once for every failure the terminal budget
+// records, counted or not; the substrate labels it with cause.Label(), a closed
+// set (failurecause.Labels).
 type SMMetrics interface {
 	SMTransition(source, dest, trigger string)
 	ActorCreated()
 	WorkerPanic(workerType string)
 	ActorPanic()
 	TerminalEventDropped(event string)
+	LeaseFailureRecorded(cause failurecause.Cause)
 }
 
 // LeaseActorConfig groups the dependencies a lease actor receives at

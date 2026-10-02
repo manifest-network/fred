@@ -17,9 +17,10 @@ import (
 // publish a half-built pointer or hold a writable handle to a published
 // *provision (ENG-193, ENG-229 category B).
 //
-// It embeds leasesm.ProvisionState exactly as *provision does (no
-// method-promotion downside — ProvisionState has no methods), so materialize is
-// a trivial struct copy. The construction literals carry a //exhaustruct:enforce
+// It embeds leasesm.ProvisionState exactly as *provision does. The only methods
+// that promotes are the terminal-budget observers, which read the projection or
+// can only move its budget toward a reset, so materialize stays a trivial
+// struct copy. The construction literals carry a //exhaustruct:enforce
 // directive (exhaustruct runs in directive-only mode — exclude: ['.*'] in
 // .golangci.yml), so a newly-added ProvisionState/wrapper field forces the
 // ANNOTATED publish-input literals (the reservation, the recover build loop,
@@ -103,6 +104,9 @@ func provisionStateMatches(a, b leasesm.ProvisionState) bool {
 		//nolint:staticcheck
 		a.CreatedAt == b.CreatedAt &&
 		a.FailCount == b.FailCount &&
+		// The opaque budget is compared exactly, like CreatedAt: an actor that
+		// recorded a failure or a Ready entry during the sweep defers the lease.
+		a.TerminalBudget == b.TerminalBudget &&
 		a.LastError == b.LastError &&
 		a.Reason == b.Reason &&
 		a.Message == b.Message &&

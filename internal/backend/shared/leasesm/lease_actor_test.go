@@ -14,6 +14,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 )
 
 // Tests in this file exercise the LeaseActor's internal semantics
@@ -1994,6 +1995,9 @@ type countingMetrics struct {
 	workerPanic          atomic.Int64
 	actorPanic           atomic.Int64
 	terminalEventDropped atomic.Int64
+
+	failuresMu sync.Mutex
+	failures   []string
 }
 
 func (m *countingMetrics) SMTransition(_, _, _ string)   { m.smTransition.Add(1) }
@@ -2001,6 +2005,19 @@ func (m *countingMetrics) ActorCreated()                 { m.actorCreated.Add(1)
 func (m *countingMetrics) WorkerPanic(_ string)          { m.workerPanic.Add(1) }
 func (m *countingMetrics) ActorPanic()                   { m.actorPanic.Add(1) }
 func (m *countingMetrics) TerminalEventDropped(_ string) { m.terminalEventDropped.Add(1) }
+func (m *countingMetrics) LeaseFailureRecorded(cause failurecause.Cause) {
+	m.failuresMu.Lock()
+	defer m.failuresMu.Unlock()
+	m.failures = append(m.failures, cause.Label())
+}
+
+// recordedFailures returns the attribution label of every recorded failure,
+// in order.
+func (m *countingMetrics) recordedFailures() []string {
+	m.failuresMu.Lock()
+	defer m.failuresMu.Unlock()
+	return append([]string(nil), m.failures...)
+}
 
 var _ SMMetrics = (*countingMetrics)(nil)
 

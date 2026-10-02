@@ -1038,11 +1038,18 @@ A health check defined in the Dockerfile but not in the manifest does **not** tr
 
 When a provision has `status=failed` (e.g., a container crashed and was detected by the reconciler), a new `Provision` call for the same lease UUID is allowed. The re-provision flow:
 
-1. The existing `FailCount` is carried over from the failed provision record.
+1. The existing `FailCount` and terminal budget are carried over from the failed provision record.
 2. Resource allocations are released and old containers are removed. Managed volumes are **kept** — stateful data persists across re-provisions.
-3. A new provision record is created with `FailCount` preserved.
+3. A new provision record is created with `FailCount` and the terminal budget preserved.
 4. The full provisioning flow runs again (pinned image reuse or bounded image ingestion, image inspect, volume setup via idempotent Create, container create/start, startup verification). Existing volumes are reused with quota updated; only new volumes are created.
 5. On failure, `FailCount` is incremented. The `FailCount` is also persisted in the `fred.fail_count` container label. Only newly created volumes are cleaned up; reused volumes are preserved.
+
+`FailCount` is a lifetime diagnostic of every recorded failure and never decides whether a lease is closed. That is the **terminal budget** (ENG-799), kept on the actor-owned projection by the lease state machine:
+
+- Every failure is recorded with a sealed attribution (`shared/leasesm/failurecause`). Only `tenant_workload` counts: a `die` delivered by the live event stream whose subscription also saw that run's `start` and no `kill`, for a container that exited with any status (OOM kills included). The event loop subscribes to `start`, `kill` and `die` together and keeps one `EventSession` per connection, so a reconnect forgets everything it could have missed. A death after an observed `kill` (operator or daemon `docker kill`/`docker stop`) or of a vanished/`removing`/`dead` container is `disruption`; a death found only by the reconcile sweep, or of a run that started before the stream connected, is `unknown`; restart/update/restore outcomes are `maintenance`; pre-effect refusals, internal errors and cohort divergence are `platform`. None of those count.
+- Three consecutive counted failures exhaust the budget. Every exit from Ready resets the streak once the lease was Ready for ten minutes (anchored on Ready entry), and an accepted tenant restart or update resets it. An uncounted failure neither increments nor resets.
+- The budget is in memory: a backend restart resets it, like moby's daemon restore. `recoverState` carries it across every rebuild that keeps the lease, recording an off-actor Ready rebuild only with a helper that can move it toward a reset. A cold-recovered failed provision (host reboot) still bumps `FailCount` but starts with a fresh budget.
+- `provisionToInfo` publishes it as `terminal_budget {verdict, consecutive_failures}`: `exhausted` only while the lease is Failed by a counted failure with a streak of three. The diagnostics fallback and retained records omit it.
 
 ## Lease State Machine
 
@@ -1291,8 +1298,8 @@ select these production defaults.
    successful plain Restart reaches Ready and reconciliation consumes it, or
    close persists a full intent and takes ownership. Update and custom-domain
    redeploys stay fenced until finalizer consumption.
-8. **Detect ready-to-failed transitions** -- if a provision was in-memory as `ready` but Docker shows a container as exited/dead, or if its exact durable cohort diverges, the typed state-machine transition marks it `failed`, increments `FailCount`, and emits the lifecycle callback.
-9. **Cold-start FailCount correction** -- provisions recovered as `failed` with no prior in-memory state have their `FailCount` incremented by 1. The label value was written at creation time (before the crash), so the increment accounts for the observed failure.
+8. **Detect ready-to-failed transitions** -- if a provision was in-memory as `ready` but Docker shows a container as exited/dead, or if its exact durable cohort diverges, the typed state-machine transition marks it `failed`, increments `FailCount`, and emits the lifecycle callback. A death found this way has no live event provenance and never counts against the terminal budget. Every rebuilt entry that replaces a non-in-flight projection carries that projection's terminal budget.
+9. **Cold-start FailCount correction** -- provisions recovered as `failed` with no prior in-memory state have their `FailCount` incremented by 1. The label value was written at creation time (before the crash), so the increment accounts for the observed failure. Such a failure (typically a host reboot) never counts against the terminal budget, which starts fresh.
 10. **Preserve in-flight provisions** -- Pending operation state and its resource reservation survive an inventory rebuild. A Pending provision remains excluded from ordinary inference and is settled by the later startup operation phase. Succeeded/Failed operation rows are durable decisions, not in-flight work.
 11. **Reset resource accounting** -- allocations are rebuilt atomically from operation-intent, active-release, restore-finalizer, and close snapshots while reservations for every still-tracked lease are preserved. Docker uses durable `disk_mb` or its mutually exclusive pinned scratch allowance; mutable configuration is used only while explicitly upgrading supported v0.13 evidence.
 12. **Resume admitted closes** -- after conservative projections and reservations are visible and the recovery guard is released, retry every close under its per-lease command fence after re-reading the durable journal. Transient failures retain the journal and durable execution generation for the next level-triggered pass.
@@ -1748,10 +1755,13 @@ rely on the singular fallback.
   "status": "failed",
   "created_at": "2025-01-15T10:00:00Z",
   "fail_count": 2,
+  "terminal_budget": {"verdict": "retry", "consecutive_failures": 1},
   "reason": "ContainerExited",
   "message": "container exited unexpectedly"
 }
 ```
+
+`terminal_budget` (ENG-799) is present for a live lease and absent from the diagnostics fallback and retained records; see [Re-provisioning](#re-provisioning).
 
 `status` is one of: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, `deprovisioning`. `failing` marks the brief window between container-death detection and the Failed callback being emitted; a concurrent Deprovision arriving in this window transitions the lease straight to `deprovisioning` without ever reaching `failed`, preventing a stale Failed callback. On failure, `reason` (a stable machine code, e.g. `ContainerExited`) and `message` (a curated human summary) are present; the verbose diagnostics (exit codes, OOM status, container logs) stay operator-side in the diagnostics store and structured logs — they are never included in this response (ENG-508).
 
@@ -1769,7 +1779,8 @@ Returns provision records. `GET /provisions` is keyset-paginated. Query params: 
       "provider_uuid": "prov-1",
       "status": "ready",
       "created_at": "2025-01-15T10:00:00Z",
-      "fail_count": 0
+      "fail_count": 0,
+      "terminal_budget": {"verdict": "retry", "consecutive_failures": 0}
     },
     {
       "lease_uuid": "def-456",
@@ -1777,6 +1788,7 @@ Returns provision records. `GET /provisions` is keyset-paginated. Query params: 
       "status": "failed",
       "created_at": "2025-01-15T10:05:00Z",
       "fail_count": 3,
+      "terminal_budget": {"verdict": "exhausted", "consecutive_failures": 3},
       "reason": "ContainerExited",
       "message": "container exited unexpectedly"
     }
@@ -1929,7 +1941,7 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 | `fred.sku` | SKU identifier | SKU profile used for resource limits |
 | `fred.created_at` | RFC 3339 timestamp | When the container was created |
 | `fred.instance_index` | integer string | 0-based index within a multi-unit lease |
-| `fred.fail_count` | integer string | Number of provision failures for this lease at creation time |
+| `fred.fail_count` | integer string | Lifetime number of failures recorded for this lease at creation time (diagnostic; never decides a close) |
 | `fred.callback_url` | URL string | Exact completion URL with an operation capability for new provision/restore; inherited v0.13 lineage remains tokenless |
 | `fred.lifecycle_callback_url` | URL string | Paired endpoint for later maintenance, runtime-failure, and deprovision observations; typed for new provision/restore, tokenless for inherited v0.13 lineage; persisted across backend restarts |
 | `fred.service_name` | service name string | Service name within a stack (stack provisions only) |

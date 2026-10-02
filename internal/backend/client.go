@@ -293,13 +293,41 @@ type LifecycleGenerationObservation struct {
 	ID   string                  `json:"id,omitempty"`
 }
 
+// TerminalVerdict is a backend's decision about a lease's consecutive-failure
+// budget (ENG-799). It is a closed set: a consumer MUST treat any other value,
+// including "", as no verdict, and no verdict never closes a lease.
+type TerminalVerdict string
+
+const (
+	// TerminalVerdictRetry means the lease may be re-provisioned.
+	TerminalVerdictRetry TerminalVerdict = "retry"
+	// TerminalVerdictExhausted means the lease is Failed and its tenant
+	// workload has failed consecutively often enough that providerd closes
+	// the lease on-chain instead of re-provisioning it.
+	TerminalVerdictExhausted TerminalVerdict = "exhausted"
+)
+
+// TerminalBudgetObservation is the backend-authored state of one lease's
+// consecutive-failure budget. The backend authors it where each failure
+// happens and counts only failures its tenant's own workload caused; it is
+// never derived from FailCount. ConsecutiveFailures is the recorded count: time
+// alone never decays it, although the backend resets it at the next transition
+// once the lease has stayed Ready long enough (BACKEND_GUIDE.md).
+type TerminalBudgetObservation struct {
+	Verdict             TerminalVerdict `json:"verdict"`
+	ConsecutiveFailures int             `json:"consecutive_failures"`
+}
+
 // ProvisionInfo describes a single provisioned resource.
 type ProvisionInfo struct {
 	LeaseUUID    string          `json:"lease_uuid"`
 	ProviderUUID string          `json:"provider_uuid"`
 	Status       ProvisionStatus `json:"status"` // see ProvisionStatus* constants
 	CreatedAt    time.Time       `json:"created_at"`
-	FailCount    int             `json:"fail_count"`
+	// FailCount is a lifetime diagnostic: how many failures this lease has
+	// recorded, whoever caused them. It never decides whether a lease closes;
+	// TerminalBudget does (ENG-799).
+	FailCount int `json:"fail_count"`
 	// LastError (the verbose operator failure detail) is intentionally NOT on
 	// this wire type: it crosses to tenant-facing API responses, and verbose
 	// exec output / host paths must never leak there (ENG-508). The curated,
@@ -331,6 +359,15 @@ type ProvisionInfo struct {
 	// The field MUST NOT be copied into a tenant-facing response. Nil means that
 	// the backend did not report this upgraded internal observation.
 	LifecycleGeneration *LifecycleGenerationObservation `json:"lifecycle_generation,omitempty"`
+
+	// TerminalBudget is the backend's consecutive-failure budget for this lease
+	// (ENG-799). providerd closes an ACTIVE lease for repeated failure only when
+	// Status is failed, Verdict is exactly exhausted and ConsecutiveFailures is
+	// at least 1, read from complete ListProvisions inventory. Nil means the
+	// backend does not report a budget (an older or third-party backend), and
+	// providerd then never closes the lease for repeated failure. A point read
+	// served from diagnostics omits it.
+	TerminalBudget *TerminalBudgetObservation `json:"terminal_budget,omitempty"`
 
 	// Partition is the retained record's optional sub-tenant grouping key
 	// (retention partitioning). Unlike Tenant above, it MAY be copied into
