@@ -46,7 +46,7 @@ func adoptableQuarantine(
 	backendName, providerUUID string,
 ) error {
 	switch {
-	case !capability.unusable:
+	case capability.usable():
 		return errors.New("lifecycle authority is not quarantined")
 	case capability.rawCorrupt || capability.needsPersistence:
 		return errors.New("the quarantine is not durably recorded on a decodable row")
@@ -61,8 +61,10 @@ func adoptableQuarantine(
 	case placement.unusable || placement.Conflict || placement.lostBackend != "":
 		return errors.New("the placement itself is unusable")
 	}
+	// Past the checks above, the capability names a typed owner, so lifting the
+	// explicit quarantine is the only change that could make it usable.
 	cleared := capability
-	cleared.unusable = false
+	cleared.quarantined = false
 	if problem := lifecycleBindingProblem(placement, cleared); problem != "" {
 		return errors.New(problem)
 	}

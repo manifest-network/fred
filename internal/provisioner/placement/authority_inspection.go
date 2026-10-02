@@ -1123,7 +1123,7 @@ func inspectAuthorityLifecycleBindingForPlacement(
 		row.LifecycleVerdict = "corrupt"
 		return
 	}
-	if capability.unusable {
+	if !capability.usable() {
 		row.LifecycleVerdict = "unusable"
 		if adoptableQuarantine(
 			placement, capability, placement.Backend, assessment.report.ExpectedProviderUUID,
@@ -1310,7 +1310,7 @@ func inspectCurrentLifecycleRows(
 			assessment.setRow(row)
 			return nil
 		}
-		if capability.unusable {
+		if !capability.usable() {
 			assessment.report.Counts.UnusableLifecycleRows++
 		}
 		for _, backendName := range []string{capability.backend, capability.attemptBackend} {
@@ -1369,7 +1369,7 @@ func authorityLifecycleVerdict(
 	capability lifecycleCapability,
 	attached bool,
 ) string {
-	if capability.unusable {
+	if !capability.usable() {
 		return "unusable"
 	}
 	if capability.attemptBackend != "" {

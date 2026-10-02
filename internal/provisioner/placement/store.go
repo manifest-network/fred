@@ -3351,7 +3351,7 @@ func (s *Store) projectInventory(
 			// cross-row binding remains explicit rather than being rediscovered only
 			// in process memory after every restart.
 			capability, capabilityExists := s.lifecycleCache[leaseUUID]
-			if capabilityExists && capability.unusable && capability.needsPersistence {
+			if capabilityExists && !capability.usable() && capability.needsPersistence {
 				capability.needsPersistence = false
 				capabilityEncoded, capabilityErr := encodeLifecycleCapability(capability)
 				if capabilityErr != nil {
@@ -3683,7 +3683,7 @@ func (s *Store) trustedProvisionDurablyRepresentedLocked(
 	if !exists {
 		return false
 	}
-	if capability.unusable {
+	if !capability.usable() {
 		return true
 	}
 	generation := sealedLifecycleObservation(row.LifecycleGeneration())
@@ -3758,7 +3758,7 @@ func (s *Store) pairedOverlapPreservesOwnerLocked(snapshot inventory.Snapshot, l
 		return false
 	}
 	capability, exists := s.lifecycleCache[leaseUUID]
-	if !exists || capability.unusable || capability.backend != record.Backend || !capability.principal.valid() {
+	if !exists || !capability.usable() || capability.backend != record.Backend || !capability.principal.valid() {
 		return false
 	}
 	row := observation.Provision()

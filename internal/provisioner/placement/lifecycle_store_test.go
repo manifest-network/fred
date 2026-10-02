@@ -52,7 +52,7 @@ func requirePersistedUnusableLifecycle(
 		require.NotNil(t, encoded, "durable lifecycle quarantine must exist")
 		capability, err := decodeLifecycleCapability(encoded)
 		require.NoError(t, err)
-		require.True(t, capability.unusable)
+		require.True(t, capability.quarantined)
 		require.False(t, capability.rawCorrupt)
 		return nil
 	}))
@@ -669,7 +669,7 @@ func TestStore_InventoryGenerationMismatchQuarantinesWithoutErasingEvidence(t *t
 			tx.Bucket(lifecycleCapabilityBucketName).Get([]byte("lease")),
 		)
 		require.NoError(t, decodeErr)
-		assert.True(t, capability.unusable)
+		assert.True(t, capability.quarantined)
 		assert.Equal(t, "backend-a", capability.backend)
 		assert.Equal(t, currentID, capability.id,
 			"quarantine must preserve the exact conflicting durable generation")
@@ -703,7 +703,7 @@ func TestStore_RetentionOnlyProjectionCannotReactivateDetachedLifecycle(t *testi
 		"retained data remains routable for restore")
 	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictUnusable)
 	assert.Equal(t, LifecycleVerdictUnusable, s.CurrentLifecycle("lease").Verdict())
-	assert.True(t, s.lifecycleCache["lease"].unusable)
+	assert.True(t, s.lifecycleCache["lease"].quarantined)
 	assert.Equal(t, id, s.lifecycleCache["lease"].id,
 		"quarantine must retain the detached generation as operator evidence")
 }
@@ -897,7 +897,7 @@ func TestStore_ConflictBackendMismatchQuarantinePersistsAcrossReopen(t *testing.
 
 	reopened, err := newStoreForTest(dbPath)
 	require.NoError(t, err)
-	require.True(t, reopened.lifecycleCache["lease"].unusable,
+	require.True(t, reopened.lifecycleCache["lease"].quarantined,
 		"a conflict must not hide a mismatched lifecycle owner")
 	projectInventoryForTest(t, reopened, InventoryProjection{
 		Placements: map[string]string{"lease": "backend-b"},
@@ -1127,7 +1127,7 @@ func TestStore_ConflictInventoryKeepsMatchingRetainedTypedLifecycleGated(t *test
 	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictUnusable)
 	requireLifecycleVerdict(t, s, "lease", lifecycle.ID{}, LifecycleVerdictUnusable)
 	capability := s.lifecycleCache["lease"]
-	assert.False(t, capability.unusable,
+	assert.True(t, capability.usable(),
 		"the conflict gates valid lifecycle authority without destroying it")
 	assert.Equal(t, "backend-a", capability.backend)
 	assert.Equal(t, id, capability.id)
@@ -1171,7 +1171,7 @@ func TestStore_ConflictInventoryAfterReopenCannotResolveTypedLifecycle(t *testin
 			require.True(t, placement.Conflict)
 			requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictUnusable)
 			capability := reopened.lifecycleCache["lease"]
-			assert.False(t, capability.unusable,
+			assert.True(t, capability.usable(),
 				"placement quarantine must gate, not discard, valid lifecycle authority")
 			assert.Equal(t, "backend-a", capability.backend)
 			assert.Equal(t, id, capability.id)
@@ -1187,7 +1187,7 @@ func TestStore_ConflictInventoryAfterReopenCannotResolveTypedLifecycle(t *testin
 			require.True(t, placement.Conflict)
 			requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictUnusable)
 			persisted := reopened.lifecycleCache["lease"]
-			assert.False(t, persisted.unusable)
+			assert.True(t, persisted.usable())
 			assert.Equal(t, "backend-a", persisted.backend)
 			assert.Equal(t, id, persisted.id)
 			require.NoError(t, reopened.Close())
@@ -1199,7 +1199,7 @@ func TestStore_ConflictInventoryAfterReopenCannotResolveTypedLifecycle(t *testin
 				t, reopenedAgain, "lease", id, LifecycleVerdictUnusable,
 			)
 			persisted = reopenedAgain.lifecycleCache["lease"]
-			assert.False(t, persisted.unusable)
+			assert.True(t, persisted.usable())
 			assert.Equal(t, "backend-a", persisted.backend)
 			assert.Equal(t, id, persisted.id)
 		})
@@ -1256,7 +1256,7 @@ func TestStore_MatchingInventoryRepairsUnusablePlacementWithoutLosingTypedLifecy
 			assert.Equal(t, test.wantSetAt, !placement.SetAt.IsZero())
 			requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictUnusable)
 			capability := reopened.lifecycleCache["lease"]
-			assert.False(t, capability.unusable,
+			assert.True(t, capability.usable(),
 				"unusable placement must not flatten an independently valid capability")
 			assert.Equal(t, "backend-a", capability.backend)
 			assert.Equal(t, id, capability.id)
@@ -1310,13 +1310,13 @@ func TestStore_UnreadablePlacementWithOutstandingAttemptRemainsFailClosed(t *tes
 	require.Equal(t, StateUnusable, reopened.Lookup("lease").State())
 	requireLifecycleVerdict(t, reopened, "lease", currentID, LifecycleVerdictUnusable)
 	requireLifecycleVerdict(t, reopened, "lease", pendingID, LifecycleVerdictUnusable)
-	assert.True(t, reopened.lifecycleCache["lease"].unusable,
+	assert.True(t, reopened.lifecycleCache["lease"].quarantined,
 		"the lost placement attempt must quarantine the in-memory binding")
 	require.NoError(t, reopened.db.View(func(tx *bolt.Tx) error {
 		encoded := tx.Bucket(lifecycleCapabilityBucketName).Get([]byte("lease"))
 		capability, decodeErr := decodeLifecycleCapability(encoded)
 		require.NoError(t, decodeErr)
-		assert.False(t, capability.unusable,
+		assert.True(t, capability.usable(),
 			"opening must not overwrite recoverable durable evidence")
 		assert.Equal(t, "backend-a", capability.backend)
 		assert.Equal(t, currentID, capability.id)

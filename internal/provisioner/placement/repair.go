@@ -979,7 +979,7 @@ func (repair *AttemptRepair) matchAttempt(
 
 	capability, capabilityExists := store.lifecycleCache[leaseUUID]
 	wantLifecycleID, lifecycleErr := lifecycleIDForOperation(operationID)
-	if lifecycleErr != nil || !capabilityExists || capability.unusable || capability.rawCorrupt ||
+	if lifecycleErr != nil || !capabilityExists || !capability.usable() ||
 		capability.attemptBackend != backendName || capability.attemptID != wantLifecycleID ||
 		(placement.Backend != "" && capability.backend != placement.Backend) {
 		return AttemptRepairCandidate{}, fmt.Errorf(
@@ -1069,7 +1069,7 @@ func (candidate AttemptRepairCandidate) MatchesPreservedProvision(
 ) bool {
 	if candidate.issuer == nil || candidate.confirmedOwner == "" ||
 		backendName != candidate.confirmedOwner || !candidate.retainLifecycle ||
-		candidate.lifecycleAfter.unusable || candidate.lifecycleAfter.rawCorrupt ||
+		!candidate.lifecycleAfter.usable() ||
 		candidate.lifecycleAfter.retired ||
 		candidate.lifecycleAfter.backend != candidate.confirmedOwner ||
 		candidate.lifecycleAfter.attemptBackend != "" || candidate.lifecycleAfter.attemptID.Valid() ||
@@ -1689,8 +1689,8 @@ func (repair *AttemptRepair) ResolveConflictContext(
 		revision: next,
 	}
 	capability := lifecycleCapability{
-		backend:  candidate.selectedBackend,
-		unusable: true,
+		backend:     candidate.selectedBackend,
+		quarantined: true,
 	}
 	retained := plan.retained
 	if !plan.retained && plan.identityAuthoritative {

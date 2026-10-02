@@ -54,7 +54,7 @@ func createGenerationQuarantineFixtureWith(
 			repairLease: {Kind: LifecycleObservationTyped, ID: observed},
 		},
 	})
-	require.True(t, store.lifecycleCache[repairLease].unusable)
+	require.True(t, store.lifecycleCache[repairLease].quarantined)
 	then(store)
 	require.NoError(t, store.Close())
 	return dbPath, stored, observed
@@ -255,7 +255,7 @@ func TestMatchGenerationQuarantineRefusesAQuarantineItsRowsExplain(t *testing.T)
 	t.Run("a usable lease", func(t *testing.T) {
 		dbPath, _, _ := createGenerationQuarantineFixture(t)
 		rewriteLifecycleRowForTest(t, dbPath, func(capability *lifecycleCapability) {
-			capability.unusable = false
+			capability.quarantined = false
 		})
 		repair := openGenerationRepair(t, dbPath)
 		_, err := repair.MatchGenerationQuarantine(repairLease, "backend-a")
@@ -416,7 +416,7 @@ func TestClassifyCountsAnAdoptableQuarantine(t *testing.T) {
 func TestClassifyAndOpenAgreeOnAPrincipalContradiction(t *testing.T) {
 	dbPath, _, _ := createGenerationQuarantineFixture(t)
 	rewriteLifecycleRowForTest(t, dbPath, func(capability *lifecycleCapability) {
-		capability.unusable = false
+		capability.quarantined = false
 		capability.principal = runtimePrincipal{tenant: "tenant-other", providerUUID: freshTestProviderUUID}
 	})
 	expectation, err := NewAuthorityExpectation(freshTestProviderUUID, []string{"backend-a", "backend-b"})
@@ -462,7 +462,7 @@ func TestRepairListMarksOnlyAdoptionCandidates(t *testing.T) {
 
 	healthyPath, _, _ := createGenerationQuarantineFixture(t)
 	rewriteLifecycleRowForTest(t, healthyPath, func(capability *lifecycleCapability) {
-		capability.unusable = false
+		capability.quarantined = false
 	})
 	healthy, err := OpenRepairInspector(healthyPath, freshTestProviderUUID)
 	require.NoError(t, err)

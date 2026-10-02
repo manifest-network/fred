@@ -216,7 +216,7 @@ func TestQuarantineReaffirmationRequiresExactCompleteLineage(t *testing.T) {
 				case "unusable lifecycle", "missing attempt marker":
 					capability := fixture.store.lifecycleCache[reconciliationSweepLease]
 					if scenario == "unusable lifecycle" {
-						capability.unusable = true
+						capability.quarantined = true
 					} else {
 						capability.attemptBackend = ""
 					}

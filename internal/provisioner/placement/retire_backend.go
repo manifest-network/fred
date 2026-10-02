@@ -162,32 +162,19 @@ func verifyRetiredRow(
 	return nil
 }
 
-// retireLifecycle scrubs one capability. A lost lease keeps only the
+// retireLifecycle scrubs one decoded capability. A lost lease keeps only the
 // evidence-free quarantine sentinel; a surviving lease loses an attempt marker
 // on the retired backend. A capability whose owner was the retired backend
-// becomes the sentinel too, and so does an ownerless capability whose only
-// evidence was its attempt on the retired backend. deleteCapability reports a
-// detached row, which has no placement to keep it.
+// becomes the sentinel too, and so does one whose only evidence was its
+// attempt there. deleteCapability reports a detached row, which has no
+// placement to keep it.
 //
-// Every kept output passes through quarantineOwnerlessLifecycle, so no branch
-// of the scrub can hand the plan an ownerless usable capability.
+// Every output encodes: usable derives authority from evidence, so even a
+// capability left with neither an owner nor an attempt would be written as the
+// sentinel rather than refused, and could not make the whole retirement fail.
+// Returning the sentinel explicitly keeps the output in the form decoding its
+// row yields.
 func retireLifecycle(
-	capability lifecycleCapability,
-	retired string,
-	disposition retirementDisposition,
-	placementExists bool,
-) (next lifecycleCapability, changed, deleteCapability bool) {
-	scrubbed, changed, deleteCapability := scrubRetiredLifecycle(capability, retired, disposition, placementExists)
-	if deleteCapability {
-		return scrubbed, changed, true
-	}
-	next = quarantineOwnerlessLifecycle(scrubbed)
-	return next, changed || next != scrubbed, false
-}
-
-// scrubRetiredLifecycle removes every reference to the retired backend. Only
-// retireLifecycle calls it, and it normalizes the result.
-func scrubRetiredLifecycle(
 	capability lifecycleCapability,
 	retired string,
 	disposition retirementDisposition,
@@ -198,37 +185,23 @@ func scrubRetiredLifecycle(
 		return capability, names, names
 	}
 	if disposition == retirementLost {
-		sentinel := lifecycleCapability{unusable: true}
+		sentinel := quarantinedLifecycle()
 		return sentinel, capability != sentinel, false
 	}
 	if !names {
 		return capability, false, false
 	}
-	if capability.backend == retired {
-		sentinel := lifecycleCapability{unusable: true}
-		return sentinel, true, false
+	if capability.backend == retired || capability.backend == "" {
+		// The retired backend was the owner, or the attempt on it was the
+		// capability's only evidence. Authority is already withheld for the
+		// latter: the placement is a conflict or an uninterpretable row, and a
+		// capability that does not match its placement is quarantined whenever
+		// the store loads.
+		return quarantinedLifecycle(), true, false
 	}
-	// When the attempt on the retired backend was the capability's only
-	// evidence, stripping it leaves an ownerless usable capability, which
-	// retireLifecycle turns into the evidence-free quarantine sentinel (as for
-	// a lost lease). Authority is already withheld here: the placement is a
-	// conflict or an uninterpretable row, and a capability that does not match
-	// its placement is quarantined whenever the store loads.
 	capability.attemptBackend = ""
 	capability.attemptID = lifecycle.ID{}
 	return capability, true, false
-}
-
-// quarantineOwnerlessLifecycle returns the evidence-free quarantine sentinel
-// in place of a usable capability with neither a current owner nor an attempt,
-// the shape validateLifecycleCapability refuses. Every other capability is
-// returned unchanged. The encoder's refusal stays as defense in depth.
-func quarantineOwnerlessLifecycle(capability lifecycleCapability) lifecycleCapability {
-	if !capability.unusable && !capability.rawCorrupt &&
-		capability.backend == "" && capability.attemptBackend == "" {
-		return lifecycleCapability{unusable: true}
-	}
-	return capability
 }
 
 // BackendRetirementFacts renders a retirement plan for the operator.
