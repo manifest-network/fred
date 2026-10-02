@@ -3,11 +3,19 @@
 package docker
 
 import (
+	"context"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+// imageStoreGuardTimeout bounds the guard's two daemon queries, so a hung
+// daemon ends this test within the bound instead of holding the whole suite
+// until its overall timeout. A Ping that times out skips, which CI's SKIP
+// guard fails; an Info that times out fails the test.
+const imageStoreGuardTimeout = 30 * time.Second
 
 // TestIntegration_Docker_ImageStoreMatchesRunnerDeclaration proves the suite ran
 // against the image store the CI leg declares, using the same predicates
@@ -24,10 +32,12 @@ func TestIntegration_Docker_ImageStoreMatchesRunnerDeclaration(t *testing.T) {
 	require.Contains(t, []string{"overlay2", "containerd"}, want, "unknown FRED_TEST_IMAGE_STORE")
 
 	sdk := newImageSecurityFixtureClient(t)
-	if _, err := sdk.Ping(t.Context()); err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), imageStoreGuardTimeout)
+	defer cancel()
+	if _, err := sdk.Ping(ctx); err != nil {
 		t.Skipf("Docker daemon unavailable: %v", err)
 	}
-	info, err := sdk.Info(t.Context())
+	info, err := sdk.Info(ctx)
 	require.NoError(t, err)
 
 	require.NoError(t, requireBoundedImageStore(info), "the runner daemon must use a store bounded image import supports")
