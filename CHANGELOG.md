@@ -42,11 +42,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   binaries refuse a database that holds this record. See SECURITY.md,
   "Containing a compromised backend".
 - `placement-repair -classify` reports an interrupted reconciliation sweep:
-  `pending_inventory_sweep_id`, the sweep's `inventory_sweep_reporters` (or
-  `inventory_sweep_untracked`), and `fence_restart_would_record`, the backends
-  that a restart with them fenced would record as unprojected reporters. Check
-  it before applying a fence. providerd also logs a WARN at startup when a
-  fenced backend is about to be recorded. (ENG-1119)
+  `pending_inventory_sweep_id`, the reporters of its unresolved sweep chain in
+  `inventory_sweep_reporters` (or `inventory_sweep_untracked`), and
+  `fence_restart_would_record`, the backends that a restart with them fenced
+  would record as unprojected reporters. Check it before applying a fence.
+  providerd also logs a WARN at startup when a fenced backend is about to be
+  recorded. (ENG-1119)
 - `placement-repair -adopt-observed-generation -lease <uuid> -backend <name>`
   repairs a lease left quarantined after a placement restore because its
   backend re-provisioned it since the copy was taken. The backend must be the
@@ -1170,6 +1171,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   so restored workloads remain discoverable by Compose and can be deprovisioned.
   Other reserved labels remain rejected, and inherited build labels cannot
   grant container ownership or redirect helper cleanup. (ENG-1052, ENG-1119)
+  Rolling back to an earlier build that does not own the builder stamp (for
+  example #245) is not safe while an image-inspection helper receipt is
+  pending: that docker-backend reads the helper's empty
+  `com.docker.compose.image.builder` label as a foreign reserved label and can
+  neither recover nor remove the helper. Its receipt then stays unsettled, which
+  on the containerd image store blocks image ingestion and GC on that backend
+  until this build runs again. Before rolling back, confirm that
+  `fred_docker_backend_image_helpers_unsettled` is 0, or that
+  `docker-backend -inspect-unsettled-docker-effects` lists no helper receipt.
 
 - Custom-domain provision, restore and maintenance admission now derives durable
   effective items and Docker labels from one ingress plan. Disabled ingress,

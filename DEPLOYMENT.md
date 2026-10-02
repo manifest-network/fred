@@ -1373,6 +1373,16 @@ unknown Create result also fences the current storage authority. Use the
 [unsettled-effects runbook](OPERATIONS.md#unsettled-docker-effects) for unresolved
 helper requests. Classic `overlay2` deployments need no configuration change.
 
+Inspection helpers this build creates carry Compose's
+`com.docker.compose.image.builder` label, written empty. An earlier build that
+does not own that label (for example #245) reads it as a foreign reserved label
+and can neither recover nor remove such a helper, so its receipt would stay
+unsettled until this build runs again. Do not roll back to such a build while
+any helper receipt is pending:
+`fred_docker_backend_image_helpers_unsettled` must be 0, or
+`docker-backend -inspect-unsettled-docker-effects` must list no helper
+receipt.
+
 An admitted image is pinned by immutable identity for its lease and manifest.
 Replaying the same manifest reuses that identity even if a mutable tag has moved.
 To deploy new image content, change the manifest image reference, preferably to
@@ -1990,8 +2000,9 @@ provider/topology, sorted storage bindings, topology/baseline/inventory epochs,
 counts, and up to 128 lexicographically sorted per-lease state/revision,
 owner-or-attempt/lifecycle verdicts, and the always-present
 `untrusted_positive` quarantine flag (plus an omitted-row count). It also reports
-an interrupted reconciliation sweep (`pending_inventory_sweep_id`, with its
-`inventory_sweep_reporters` or `inventory_sweep_untracked`) and the
+an interrupted reconciliation sweep (`pending_inventory_sweep_id`, with the
+reporters of its unresolved sweep chain in `inventory_sweep_reporters`, or
+`inventory_sweep_untracked`) and the
 always-present `fence_restart_would_record` list; see SECURITY.md, "Containing
 a compromised backend". Each expected, observed, known, storage-binding,
 empty-inventory, sweep-reporter, and fence-record collection is capped at 64
