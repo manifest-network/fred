@@ -113,8 +113,11 @@ What to look at:
 - **`provision_status`** — present once provisioning has started (`provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, `retained`).
 - **`retained_until`**, **`items`**, and **`restore_hint`** — returned for retained data; `items` describes the source lease's shape, and `retained_until`, when present, gives its scheduled expiry. Retention depends on the provider's policy and available capacity; see [Restore](#restore--recover-a-soft-deleted-leases-data).
 - **`fail_count`** + **`reason`** + **`message`** — present after failures; `reason` is a stable machine
-  code (e.g. `ContainerExited`), `message` a short human summary. See [Step 6](#step-6-debug-failures)
+  code (e.g. `ContainerExited`), `message` a short human summary. `fail_count` counts every failure
+  over the lease's life and never decides whether the lease is closed. See [Step 6](#step-6-debug-failures)
   for the full `reason` enum and how to handle unrecognized values.
+- **`terminal_budget`** — `consecutive_failures` and a `verdict` (`retry` or `exhausted`); see
+  [Repeated failures](#repeated-failures-and-lease-closure).
 
 For richer diagnostics during failures, use `GET /v1/leases/{uuid}/provision` (see [Step 6](#step-6-debug-failures)).
 
@@ -248,6 +251,7 @@ curl -H "Authorization: Bearer $(fresh_token)" \
   "provider_uuid": "01234567-...",
   "status": "failed",
   "fail_count": 2,
+  "terminal_budget": {"verdict": "retry", "consecutive_failures": 1},
   "reason": "ContainerExited",
   "message": "container exited unexpectedly"
 }
@@ -281,6 +285,26 @@ curl -H "Authorization: Bearer $(fresh_token)" \
 ```
 
 `reason`/`message` and `logs` are kept for 7 days after the provision is gone (configurable by the operator). On-chain rejection messages are intentionally generic (`container exited unexpectedly`) so secrets in container logs cannot leak there — the rich diagnostics only flow through the authenticated API.
+
+### Repeated failures and lease closure
+
+A failed `ACTIVE` lease is re-provisioned automatically, with your volumes kept. The provider
+closes it on-chain (reason `workload failed repeatedly`) only after **three consecutive failures
+of your own workload**: your container exiting on its own (any exit code, including an
+out-of-memory kill at your SKU's limit) while the lease was ready. `terminal_budget` shows the
+count (`consecutive_failures`) and whether the lease will be closed (`verdict`: `retry` or
+`exhausted`).
+
+- The count resets once the lease has stayed ready for ten minutes; it is reset at the next
+  failure or restart, so a long-healthy lease may still show an old count until then.
+- A restart or update you request resets it, and its outcome never counts, even if it fails and
+  rolls back.
+- These never count: backend restarts, host reboots, an operator stopping or killing your
+  container, a container that vanished, platform and image-admission errors.
+- `fail_count` keeps counting every failure over the lease's life and never decides a close.
+
+A container that crashes during startup verification, before it ever becomes ready, does not
+reach this budget today.
 
 ---
 

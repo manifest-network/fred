@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Backends report `terminal_budget` (`verdict`, `consecutive_failures`) on
+  `GET /provisions` and `GET /provisions/{lease_uuid}`: the lease's
+  consecutive-failure budget, which alone decides whether providerd closes a
+  failing lease. Tenants see the same field on `GET /v1/leases/{uuid}/status`
+  and `/provision`, next to the unchanged `fail_count`. (ENG-799)
+- Metrics `fred_docker_backend_lease_failures_total{attribution}`
+  (`tenant_workload`, `disruption`, `platform`, `maintenance`, `unknown`) and
+  `fred_reconciler_terminal_verdicts_total{verdict}` (`exhausted`, `retry`,
+  `absent`, `unknown`). Alert on sustained `absent` or `unknown` verdicts, and
+  on `platform`, `disruption` or `unknown` failures of leases that stay failed;
+  never on `maintenance`, so ordinary tenant updates do not page. (ENG-799)
 - `backends[].fenced: true` contains a backend the operator no longer trusts
   without removing it from the topology. providerd sends it nothing: its client
   holds no address, key or TLS material, so the backend's revoked certificate
@@ -399,6 +410,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   a pending inventory marker, and restarting with a backend fenced then held
   new-lease admission until the fence ended. A sweep still reading when that
   grace expires is abandoned as before. (ENG-1119)
+- `fail_count` no longer decides whether a lease is closed; it keeps its
+  meaning as a lifetime diagnostic. providerd closes a failing ACTIVE lease
+  only when its backend reports `terminal_budget.verdict` `exhausted`, with the
+  fixed on-chain reason `workload failed repeatedly` (was `provision failed N
+  times`). A backend that does not report `terminal_budget` (an older or
+  third-party backend) never has a lease closed for repeated failure: the lease
+  is re-provisioned on every pass and counted as `verdict="absent"`. Upgrade
+  providerd and its backends together. Third-party backends: see
+  `BACKEND_GUIDE.md`, "Terminal failure budget". (ENG-799)
+- The docker-backend's container event subscription also receives `start` and
+  `kill` events, to attribute each container death to its cause. (ENG-799)
 - Restart and update no longer stop at 1,024 commands per lease. Fred and the
   docker-backend keep a rolling window of each lease's 1,024 most recent
   commands and evict the oldest settled one to admit a newer command; the
@@ -1051,6 +1073,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Removed
 
+- Removed the internal `ReconcilerConfig.MaxReprovisionAttempts` and
+  `DefaultMaxReprovisionAttempts`; they were never a configuration key.
+  (ENG-799)
 - Removed `migration_grace_period` and `migration_ready_timeout` and the online
   legacy migration path. The stopped v0.13 storage-identity adoption procedure
   is required before upgrade; it does not restart existing tenant containers.
@@ -1067,6 +1092,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   versions still decode for recovery and restore; any such out-of-range timing
   in them runs with the default. `docs/manifest-schema.json` and the manifest
   guide state the same bounds (ENG-1127).
+- A lease is closed for repeated failures only after three consecutive failures
+  of the tenant's own workload, and that count resets once the lease has been
+  Ready for ten minutes. Restarts, updates, rollbacks, host reboots, backend
+  restarts and platform failures no longer count. (ENG-799)
+  - Two updates that failed and rolled back no longer close a lease at its next
+    crash, and a host reboot no longer spends a strike.
+  - A death counts only when the docker-backend's event stream saw the
+    container's run start and end on its own, with any exit status. A death
+    after `docker kill` or `docker stop`, a vanished container, a death found
+    only by the periodic sweep, and image-admission or internal errors never
+    count. A host-wide OOM kill is indistinguishable from the workload's own
+    and still counts.
+  - Not covered: a workload that crashes during startup verification, before
+    it was ever ready, on a re-provision of an ACTIVE lease never reaches the
+    budget; the lease stays `provisioning` (pre-existing). The immediate close
+    of an ACTIVE lease whose re-provision is refused with a validation error is
+    unchanged.
 - A sweep canceled at shutdown between its provision and retention reads no
   longer widens the recovery its interrupted marker needs. It is abandoned
   before any response is disposed, so after the restart only the backends that

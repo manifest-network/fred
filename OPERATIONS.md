@@ -1708,7 +1708,28 @@ so measure before you set.
 
 ## Failed lease re-provisioning
 
-When a container crashes or fails health checks, the lease moves to `failed`. The reconciler detects the chain ↔ provision mismatch and decides whether to re-provision based on `FailCount`.
+When a container crashes or fails health checks, the lease moves to `failed`. The reconciler detects the chain ↔ provision mismatch and re-provisions the lease on its next pass. It closes the lease on-chain instead (reason `workload failed repeatedly`) only when the backend reports an exhausted consecutive-failure budget (`terminal_budget.verdict` = `exhausted`, ENG-799). `fail_count` is a lifetime diagnostic and never decides.
+
+**What counts.** The docker-backend counts a failure only when the Docker event stream saw the tenant's own container exit while the lease was ready: the same continuous subscription saw that run start and saw no API signal to it. Any exit status counts, including `137`, `143` and an OOM kill. Three consecutive counted failures exhaust the budget. The count resets once the lease has been ready for ten minutes, and an accepted tenant restart or update also resets it. These never count:
+
+- `docker kill`, `docker stop`, or the daemon stopping a container (a `kill` event precedes the death): attribution `disruption`;
+- a container that vanished or is `removing`/`dead`: `disruption`;
+- a death found only by the periodic reconcile sweep, or of a run that started before the event stream (re)connected: `unknown`;
+- a restart, update or restore outcome, whether it rolled back or not: `maintenance`;
+- a refusal before any substrate effect (image admission or pull), an internal error, a cohort that diverged from its release: `platform`;
+- a host reboot, or a backend restart (the budget lives in memory and resets; this can only delay a close).
+
+Every recorded failure increments `fred_docker_backend_lease_failures_total{attribution}`; providerd counts each Failed ACTIVE lease's verdict per sweep in `fred_reconciler_terminal_verdicts_total{verdict}`. A tenant sees the same budget as `terminal_budget` on `/status` and `/provision`.
+
+**Residuals to know.**
+- A host-wide OOM kill also sets Docker's `OOMKilled` (the cgroup's `oom_kill` counts kills by any OOM killer), so it counts like the workload exceeding its own limit. Correlate with the host OOM alert before blaming the tenant.
+- A workload that crashes during startup verification (or reports unhealthy before ever becoming healthy) on a re-provision of an ACTIVE lease does not reach the budget today: the attempt's outcome is ambiguous, recovery keeps the lease `provisioning`, and it is neither re-provisioned nor closed. Look for ACTIVE leases stuck in `provisioning`.
+- The immediate close of an ACTIVE lease whose re-provision the backend refuses with a validation error (`400`: unknown SKU, image not allowed, invalid manifest) is a separate path, unchanged by ENG-799.
+- With an older or third-party backend that does not report `terminal_budget`, providerd never closes a crash-looping lease: it is re-provisioned every pass and stays billed (`verdict="absent"`).
+
+**Alerts.**
+- `increase(fred_reconciler_terminal_verdicts_total{verdict=~"absent|unknown"}[30m]) > 0` sustained: a backend is not reporting a usable budget, so crash loops on it are never closed.
+- Failures attributed to `platform`, `disruption` or `unknown` (`fred_docker_backend_lease_failures_total`) on leases that stay `failed`: the platform, an operator or the event stream is failing tenants that will never be closed for it, and they keep paying. Never alert on `maintenance` or `tenant_workload`: failed tenant updates and the tenant's own crashes are ordinary work and must not page.
 
 **To investigate:**
 1. `curl http://providerd/v1/leases/{uuid}/provision` (with auth) — returns full diagnostics including `last_error` (exit codes, OOM status, truncated logs).

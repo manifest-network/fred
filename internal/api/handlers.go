@@ -32,6 +32,7 @@ import (
 	maintenanceapp "github.com/manifest-network/fred/internal/provisioner/maintenance"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	restoreapp "github.com/manifest-network/fred/internal/provisioner/restore"
+	"github.com/manifest-network/fred/internal/provisioner/terminalverdict"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -710,7 +711,15 @@ type LeaseStatusResponse struct {
 	PayloadReceived     bool   `json:"payload_received"`
 	ProvisioningStarted bool   `json:"provisioning_started"`
 	ProvisionStatus     string `json:"provision_status,omitempty"`
-	FailCount           int    `json:"fail_count,omitempty"`
+	// FailCount is a lifetime diagnostic of every recorded failure, whoever
+	// caused it. It never decides whether the lease is closed; TerminalBudget
+	// does (ENG-799).
+	FailCount int `json:"fail_count,omitempty"`
+	// TerminalBudget is the backend's consecutive-failure budget: how many
+	// consecutive failures of the tenant's own workload are recorded, and
+	// whether the lease will be closed for them ("exhausted") or re-provisioned
+	// ("retry"). Absent when the backend reports no budget.
+	TerminalBudget *backend.TerminalBudgetObservation `json:"terminal_budget,omitempty"`
 	// Reason/Message are the curated, tenant-safe failure signal (ENG-508): a
 	// stable machine-readable category code and a short human message. They
 	// REPLACE the former verbose last_error field, which leaked exec output and
@@ -812,6 +821,7 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 		if info != nil {
 			response.ProvisionStatus = string(info.Status)
 			response.FailCount = info.FailCount
+			response.TerminalBudget = terminalverdict.TenantView(*info)
 			response.Reason = provisionReason(info)
 			response.Message = info.Message
 			applyRetentionFields(&response, info)
@@ -913,7 +923,11 @@ type LeaseProvisionResponse struct {
 	Tenant       string `json:"tenant"`
 	ProviderUUID string `json:"provider_uuid"`
 	Status       string `json:"status"`
-	FailCount    int    `json:"fail_count"`
+	// FailCount is a lifetime diagnostic; see LeaseStatusResponse.FailCount.
+	FailCount int `json:"fail_count"`
+	// TerminalBudget is the consecutive-failure budget; see
+	// LeaseStatusResponse.TerminalBudget.
+	TerminalBudget *backend.TerminalBudgetObservation `json:"terminal_budget,omitempty"`
 	// Reason/Message are the curated, tenant-safe failure signal (ENG-508),
 	// replacing the former verbose last_error. See LeaseStatusResponse.
 	Reason  string `json:"reason,omitempty"`
@@ -1000,13 +1014,14 @@ func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := LeaseProvisionResponse{
-		LeaseUUID:    leaseUUID,
-		Tenant:       token.Tenant,
-		ProviderUUID: h.providerUUID,
-		Status:       string(info.Status),
-		FailCount:    info.FailCount,
-		Reason:       provisionReason(info),
-		Message:      info.Message,
+		LeaseUUID:      leaseUUID,
+		Tenant:         token.Tenant,
+		ProviderUUID:   h.providerUUID,
+		Status:         string(info.Status),
+		FailCount:      info.FailCount,
+		TerminalBudget: terminalverdict.TenantView(*info),
+		Reason:         provisionReason(info),
+		Message:        info.Message,
 	}
 	if info.Status == backend.ProvisionStatusRetained {
 		if !info.RetainedUntil.IsZero() {

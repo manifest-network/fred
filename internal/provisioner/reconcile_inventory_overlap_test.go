@@ -72,7 +72,12 @@ func TestReconcilerEndpointOverlapQuarantinesOnlyAmbiguousLease(t *testing.T) {
 
 				leases = overlapPendingLeases(ambiguousLease, healthyLease)
 				owner.provisions = []backend.ProvisionInfo{
-					{LeaseUUID: ambiguousLease, Status: status, FailCount: 100},
+					{
+						LeaseUUID: ambiguousLease, Status: status, FailCount: 100,
+						Reason: backend.ReasonContainerExited, TerminalBudget: &backend.TerminalBudgetObservation{
+							Verdict: backend.TerminalVerdictExhausted, ConsecutiveFailures: 3,
+						},
+					},
 					{LeaseUUID: healthyLease, Status: backend.ProvisionStatusReady},
 					{LeaseUUID: closedLease, Status: backend.ProvisionStatusReady},
 				}
@@ -267,6 +272,10 @@ func TestReconcilerPairedOverlapPreservesOwnerWithoutLifecycleActions(t *testing
 	before := store.Lookup(source)
 	owner.provisions[0].Status = backend.ProvisionStatusFailed
 	owner.provisions[0].FailCount = 100
+	owner.provisions[0].Reason = backend.ReasonContainerExited
+	owner.provisions[0].TerminalBudget = &backend.TerminalBudgetObservation{
+		Verdict: backend.TerminalVerdictExhausted, ConsecutiveFailures: 3,
+	}
 	owner.retentions = []backend.RetainedLease{{LeaseUUID: source}}
 	require.NoError(t, r.ReconcileAll(t.Context()))
 	assert.Equal(t, before, store.Lookup(source), "lifecycle overlap must preserve established owner affinity")

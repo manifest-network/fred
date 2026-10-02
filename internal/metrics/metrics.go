@@ -327,6 +327,22 @@ var (
 		Help:      "Per-backend provision-list attempts during reconciliation, by outcome",
 	}, []string{"backend", "outcome"})
 
+	// ReconcilerTerminalVerdictsTotal counts, once per ACTIVE lease whose
+	// provision is Failed per sweep, the backend's consecutive-failure verdict
+	// (ENG-799): exhausted (the lease is closed on-chain), retry (it is
+	// re-provisioned), absent (the backend reports no budget, so the lease is
+	// never closed for repeated failure: an older or third-party backend), or
+	// unknown (an unrecognized or contradictory verdict, which never closes).
+	// Alert on a sustained absent or unknown rate: crash-looping leases on that
+	// backend keep being re-provisioned and billed. The label set is
+	// terminalverdict.Labels, pre-initialized by the provisioner package.
+	ReconcilerTerminalVerdictsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "reconciler",
+		Name:      "terminal_verdicts_total",
+		Help:      "Consecutive-failure verdicts seen for ACTIVE leases with a Failed provision, per sweep, by verdict",
+	}, []string{"verdict"})
+
 	// ReconcilerSweepComplete reports current full-fleet mutation authority. It is
 	// set to 0 before every sweep's first external read and returns to 1 only after
 	// complete provision and retention inventory has been projected durably.

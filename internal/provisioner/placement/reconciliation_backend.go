@@ -136,6 +136,10 @@ func cloneProvisionInventory(input []backend.ProvisionInfo) []backend.ProvisionI
 			generation := *provision.LifecycleGeneration
 			output[index].LifecycleGeneration = &generation
 		}
+		if provision.TerminalBudget != nil {
+			budget := *provision.TerminalBudget
+			output[index].TerminalBudget = &budget
+		}
 	}
 	return output
 }

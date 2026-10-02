@@ -152,6 +152,12 @@ func cloneRepairProvisions(source []backend.ProvisionInfo) []backend.ProvisionIn
 			observation := *provision.LifecycleGeneration
 			cloned[index].LifecycleGeneration = &observation
 		}
+		if provision.TerminalBudget != nil {
+			// The budget observation is the backend's recorded count, which time
+			// alone never changes, so it is stable digest input (ENG-799).
+			budget := *provision.TerminalBudget
+			cloned[index].TerminalBudget = &budget
+		}
 	}
 	return cloned
 }
