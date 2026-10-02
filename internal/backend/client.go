@@ -317,8 +317,8 @@ type ProvisionInfo struct {
 	// Tenant is the owning tenant. It crosses the backend→providerd hop (an
 	// HMAC-signed, trusted internal hop, like RestoreRequest.Tenant) so a complete
 	// identity-bearing inventory can bind a live placement's runtime maintenance
-	// principal, and so the closed-lease authz fallback (when the chain has
-	// pruned the lease) can bind a retained record to its owner. It MUST NOT be
+	// principal, and so the closed-lease authz fallback (when the chain has no
+	// record of the lease) can bind a retained record to its owner. It MUST NOT be
 	// copied into tenant-facing API responses (LeaseStatusResponse/
 	// LeaseProvisionResponse), which would leak one tenant's address to another.
 	Tenant string `json:"tenant,omitempty"`
