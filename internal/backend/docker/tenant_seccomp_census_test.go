@@ -1,9 +1,11 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -114,26 +116,56 @@ func TestTenantSeccompCensusPublishesOnlyCompletedPasses(t *testing.T) {
 	ok := tenantSeccompCensusTotal.WithLabelValues(tenantSeccompCensusOK)
 	failed := tenantSeccompCensusTotal.WithLabelValues(tenantSeccompCensusError)
 	okBefore, failedBefore := testutil.ToFloat64(ok), testutil.ToFloat64(failed)
+	var reported tenantSeccompCensusReport
 
 	census = tenantSeccompCensus{withoutCurrent: 3}
-	b.runTenantSeccompCensus()
+	b.runTenantSeccompCensus(&reported)
 	require.Equal(t, 3.0, testutil.ToFloat64(tenantContainersWithoutCurrentSeccomp))
 	require.Equal(t, okBefore+1, testutil.ToFloat64(ok))
 
 	census, censusErr = tenantSeccompCensus{}, errors.New("daemon unreachable")
-	b.runTenantSeccompCensus()
+	b.runTenantSeccompCensus(&reported)
 	require.Equal(t, 3.0, testutil.ToFloat64(tenantContainersWithoutCurrentSeccomp), "a failed pass keeps the last completed count")
 	require.Equal(t, failedBefore+1, testutil.ToFloat64(failed))
+	require.Equal(t, 3, reported.count, "a failed pass reports no count")
 
 	census, censusErr = tenantSeccompCensus{withoutCurrent: 0}, nil
-	b.runTenantSeccompCensus()
+	b.runTenantSeccompCensus(&reported)
 	require.Equal(t, 0.0, testutil.ToFloat64(tenantContainersWithoutCurrentSeccomp))
 	require.Equal(t, okBefore+2, testutil.ToFloat64(ok))
 
 	// A pass cut short by shutdown is not an outcome.
 	b.stopCancel()
 	censusErr = context.Canceled
-	b.runTenantSeccompCensus()
+	b.runTenantSeccompCensus(&reported)
 	require.Equal(t, failedBefore+1, testutil.ToFloat64(failed))
 	require.Equal(t, okBefore+2, testutil.ToFloat64(ok))
+}
+
+// Containers created before an upgrade keep their profile until their lease
+// is recreated, so a count can hold for days: only a change warns.
+func TestTenantSeccompCensusWarnsOnlyWhenTheCountChanges(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	var reported tenantSeccompCensusReport
+	var levels []string
+	for _, count := range []int{0, 0, 3, 3, 3, 5, 0, 0} {
+		logs.Reset()
+		reported.log(logger, count)
+		if logs.Len() == 0 {
+			levels = append(levels, "-")
+			continue
+		}
+		var record struct {
+			Level      string `json:"level"`
+			Containers int    `json:"containers"`
+		}
+		require.NoError(t, json.Unmarshal(logs.Bytes(), &record))
+		require.Equal(t, 1, strings.Count(logs.String(), "\n"), "one line per pass at most")
+		if count > 0 {
+			require.Equal(t, count, record.Containers)
+		}
+		levels = append(levels, record.Level)
+	}
+	require.Equal(t, []string{"-", "-", "WARN", "INFO", "INFO", "WARN", "INFO", "-"}, levels)
 }

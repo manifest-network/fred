@@ -408,12 +408,13 @@ var (
 	})
 
 	// tenantSeccompProfileReady is 1 when the last request for the tenant
-	// seccomp profile, by any sink, found it and its sealed file usable.
+	// seccomp profile, by any sink, found it and its sealed file usable, and
+	// the Docker daemon did not last report itself without seccomp support.
 	tenantSeccompProfileReady = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "tenant_seccomp_profile_ready",
-		Help:      "1 when the tenant seccomp profile was usable at its last request, 0 otherwise",
+		Help:      "1 when the tenant seccomp profile was usable at its last request and the Docker daemon last reported seccomp support, 0 otherwise",
 	})
 
 	// imageHelpersUnsettled counts the image-inspection helper receipts that

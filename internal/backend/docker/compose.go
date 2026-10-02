@@ -97,7 +97,10 @@ func newComposeService(dockerHost string, images *imageexec.Admitter, profiles i
 	if err != nil {
 		return nil, err
 	}
-	backend, err := newComposeEngine(dockerHost, &http.Client{Transport: transport, CheckRedirect: mobyclient.CheckRedirect})
+	// The retained engine only lists and tears down. Its transport refuses
+	// every container create, so no create can leave this process without
+	// the per-invocation launch transport below and its profile check.
+	backend, err := newComposeEngine(dockerHost, newComposeReadHTTPClient(transport))
 	if err != nil {
 		transport.CloseIdleConnections()
 		return nil, err
@@ -132,6 +135,30 @@ func newComposeService(dockerHost string, images *imageexec.Admitter, profiles i
 			return scope.finish(executor.Up(ctx, project, opts.ForceRecreate))
 		},
 	}, nil
+}
+
+// newComposeReadHTTPClient is the HTTP client of the retained Compose engine,
+// which only lists and tears down projects.
+func newComposeReadHTTPClient(next http.RoundTripper) *http.Client {
+	return &http.Client{Transport: daemonNoCreateTransport{next: next}, CheckRedirect: mobyclient.CheckRedirect}
+}
+
+// errComposeReadEngineCreate is the refusal of a container create on the
+// Compose engine that only lists and tears down.
+var errComposeReadEngineCreate = errors.New("the Compose read and teardown engine never creates containers")
+
+// daemonNoCreateTransport carries a client that must never create a
+// container. It refuses every container create before dispatch, whatever the
+// request asks for, and passes every other request through unchanged.
+type daemonNoCreateTransport struct {
+	next http.RoundTripper
+}
+
+func (t daemonNoCreateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if daemonContainerCreateRequest(req) {
+		return refuseCreate(req, errComposeReadEngineCreate)
+	}
+	return t.next.RoundTrip(req)
 }
 
 func newComposeHTTPTransport(dockerHost string) (*http.Transport, error) {
