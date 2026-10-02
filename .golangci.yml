@@ -59,11 +59,28 @@ linters:
       # projections and fixed workflow services. The compiler prevents
       # b.volumes.Destroy; this lint rule also prevents a same-package type
       # assertion or a newly retained raw sink from bypassing the boundary.
+      #
+      # A held volume deletion is retried only by the hold executor, through
+      # the same construction-bound bracket (ENG-1117).
+      #
+      # Tenant-controlled directory trees can be arbitrarily deep or wide. The
+      # standard library's recursive removers and walkers recurse with one open
+      # descriptor or one stack frame per level and no work bound, so every
+      # recursive removal or traversal goes through internal/fstree, which
+      # bounds descriptors, depth and work (ENG-1117). These two rules are
+      # mirrored by internal/testutil/no_unbounded_tree_traversal_test.go,
+      # which also resolves aliased imports.
       forbid:
         - pattern: '\.Destroy$'
           msg: "managed-volume destruction must use the construction-bound substrate mutation executor"
         - pattern: 'volumes\.Create$'
           msg: "managed-volume creation must use the construction-bound substrate mutation executor"
+        - pattern: '\.RetryHeldVolumeDelete$'
+          msg: "held volume deletions are retried only by the hold executor through the construction-bound substrate mutation executor"
+        - pattern: '\.RemoveAll$'
+          msg: "recursive removal must use internal/fstree.RemoveBeneath, which bounds descriptors, depth and work"
+        - pattern: '^(filepath\.Walk|filepath\.WalkDir|fs\.WalkDir|os\.CopyFS)$'
+          msg: "recursive traversal must use internal/fstree.WalkBeneath, which bounds descriptors, depth and work"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -93,9 +110,12 @@ linters:
       # The only production file allowed to invoke the raw volume writer. It
       # captures that writer during composition and exposes only subject-bound
       # or fixed background workflows; no request handler receives the sink.
+      # Only the writer rules (Destroy, Create, RetryHeldVolumeDelete) are
+      # exempt here: the tree removal and traversal rules still apply.
       - path: ^internal/backend/docker/storage_mutation_guard\.go$
         linters:
           - forbidigo
+        text: "construction-bound substrate mutation executor"
       # Exclude test files from strict linters
       - path: _test\.go
         linters:
