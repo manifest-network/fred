@@ -659,6 +659,12 @@ func (z *zfsVolumeManager) HostPath(name string) string {
 // Kind identifies the zfs backend.
 func (z *zfsVolumeManager) Kind() string { return "zfs" }
 
+// OpenProjectIDAudit is unsupported: ZFS quotas are per dataset, not per
+// inode project ID.
+func (z *zfsVolumeManager) OpenProjectIDAudit(context.Context, managedVolumeName) (*projidAuditVolume, error) {
+	return nil, errProjectIDAuditUnsupported
+}
+
 // Usage returns the dataset's referenced bytes — its own data footprint,
 // excluding snapshots and descendant datasets. refquota is enforced against
 // exactly this value. `-Hp` yields tab-stripped exact bytes.

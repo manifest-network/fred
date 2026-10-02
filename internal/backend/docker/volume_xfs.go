@@ -1056,6 +1056,69 @@ func readXFSProjectAttributes(file *os.File) (linuxFSXAttr, error) {
 // suppresses descendant changes but still traverses the whole tree with nftw;
 // an ioctl on the pinned directory descriptor cannot inspect tenant entries or
 // re-resolve a replaced display path. Preserve unrelated flags and extent hints.
+// xfsProjectAttributeGetter is the project-ID audit's attribute reader:
+// FS_IOC_FSGETXATTR on an open descriptor. It deliberately has no setter.
+type xfsProjectAttributeGetter struct{}
+
+func (xfsProjectAttributeGetter) GetProjectAttributes(fd int) (linuxFSXAttr, error) {
+	var attr linuxFSXAttr
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		uintptr(fd),
+		linuxFSIOCFSGetXAttr,
+		uintptr(unsafe.Pointer(&attr)), // #nosec G103 -- stable Linux fsxattr UAPI buffer
+	)
+	if errno != 0 {
+		return linuxFSXAttr{}, errno
+	}
+	return attr, nil
+}
+
+// OpenProjectIDAudit opens one managed volume for the read-only project-ID
+// audit, the same way the manager opens volume roots: descriptor-relative from
+// the data root, refusing a symlinked or replaced volume entry. It returns the
+// volume directory, its device and the project ID its marker records. A
+// volume with a registered delete stage is not opened.
+func (x *xfsVolumeManager) OpenProjectIDAudit(ctx context.Context, name managedVolumeName) (*projidAuditVolume, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, deleting, err := x.deleteStage(name); err != nil {
+		return nil, err
+	} else if deleting {
+		return nil, errProjectIDAuditDeletePending
+	}
+	root, err := os.OpenRoot(x.dataPath)
+	if err != nil {
+		return nil, fmt.Errorf("open xfs volume root: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	volumeRoot, err := openAttestedManagedVolumeRoot(root, name)
+	if err != nil {
+		return nil, fmt.Errorf("open managed volume: %w", err)
+	}
+	defer func() { _ = volumeRoot.Close() }()
+	projID, err := readProjectIDFileInVolumeRoot(volumeRoot)
+	if err != nil {
+		return nil, fmt.Errorf("read the volume's project ID marker: %w", err)
+	}
+	directory, err := openXFSRootDirectory(volumeRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open the volume directory: %w", err)
+	}
+	info, err := directory.Stat()
+	if err != nil {
+		_ = directory.Close()
+		return nil, fmt.Errorf("stat the volume directory: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		_ = directory.Close()
+		return nil, errors.New("the volume directory has no device identity")
+	}
+	return &projidAuditVolume{root: directory, dev: stat.Dev, projID: projID}, nil
+}
+
 func (linuxXFSProjectAttributes) SetProjectID(root *os.Root, projectID uint32) error {
 	file, err := openXFSRootDirectory(root)
 	if err != nil {

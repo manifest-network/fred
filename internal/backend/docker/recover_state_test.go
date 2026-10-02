@@ -198,6 +198,10 @@ func (m *mockVolumeManager) Usage(ctx context.Context, id string) (int64, error)
 
 func (m *mockVolumeManager) Kind() string { return "mock" }
 
+func (m *mockVolumeManager) OpenProjectIDAudit(context.Context, managedVolumeName) (*projidAuditVolume, error) {
+	return nil, errProjectIDAuditUnsupported
+}
+
 // mockDockerClient implements dockerClient for testing. Each method delegates to
 // the corresponding Fn field; an unexpected call (nil Fn) panics so tests fail
 // loudly rather than silently returning zero values.
