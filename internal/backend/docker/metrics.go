@@ -540,6 +540,26 @@ var (
 		Help:      "Failed XFS quota-clear commands during create compensation or deletion; typed authority is retained for restart recovery — see ENG-459/ENG-632",
 	})
 
+	// treeRemovalsTotal counts fstree removals of tenant-shaped trees by site
+	// (delete_stage: XFS deletion of a condemned volume; writable_path: the
+	// writable-path wipe before reseeding) and outcome (ENG-1117).
+	treeRemovalsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "tree_removals_total",
+		Help:      "Removals of tenant directory trees by site (delete_stage|writable_path) and outcome",
+	}, []string{"site", "outcome"})
+
+	// treeRemovalCutsTotal counts subtrees fstree moved into the removal's
+	// anchor because they lay deeper than its ancestry bound. Any increase means
+	// a tree deeper than 65,536 levels was removed.
+	treeRemovalCutsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "tree_removal_cuts_total",
+		Help:      "Subtrees moved into the removal anchor because the tree was deeper than the removal's ancestry bound, by site",
+	}, []string{"site"})
+
 	// volumeBindSymlinkRejectedTotal counts stateful-volume bind sources refused
 	// because the declared VOLUME's leaf was a symlink (ENG-795). Only a tenant that
 	// planted the link inside its own read-write volume can produce one, so an
@@ -1160,6 +1180,12 @@ func init() {
 	}
 	for _, c := range capChecks {
 		retentionCapCheckFailedTotal.WithLabelValues(c).Add(0)
+	}
+	for _, site := range treeRemovalSites {
+		treeRemovalCutsTotal.WithLabelValues(site).Add(0)
+		for _, outcome := range treeRemovalOutcomes {
+			treeRemovalsTotal.WithLabelValues(site, outcome).Add(0)
+		}
 	}
 	// Pre-init the two unlabeled partition counters to 0 so a stamp/eviction-rate
 	// query reads 0, not no-data, before the first event. Their increments are

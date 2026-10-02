@@ -25,6 +25,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/fsidentity"
+	"github.com/manifest-network/fred/internal/fstree"
 )
 
 // projectIDFile is the marker file written inside each volume directory
@@ -62,10 +63,15 @@ func inodeHardLimit(sizeMB, minAvgFileBytes int64) int64 {
 	return ihard
 }
 
-// xfsVolumeManager creates directories with XFS project quotas.
+// xfsProjectAttributes is the descriptor-rooted XFS project-attribute seam.
 type xfsProjectAttributes interface {
 	ReadProjectAttributes(*os.Root) (linuxFSXAttr, error)
 	SetProjectID(*os.Root, uint32) error
+	// DetachCondemnedAnchor moves one top-level directory of a condemned
+	// volume to project 0 with PROJINHERIT cleared, so that fstree can cut a
+	// deeper subtree into it. Only condemnedXFSVolume calls it, and only
+	// cleanupXFSDeleteStageWith mints one of those.
+	DetachCondemnedAnchor(anchorFD int, volumeRootDevice uint64) error
 }
 
 type xfsVolumeManager struct {
@@ -1037,6 +1043,66 @@ func (linuxXFSProjectAttributes) SetProjectID(root *os.Root, projectID uint32) e
 	return nil
 }
 
+// DetachCondemnedAnchor runs on a directory fstree is about to cut a deeper
+// subtree into. XFS refuses a rename into a PROJINHERIT directory of another
+// project (EXDEV), and a cut must not depend on what project a tenant left a
+// subtree in. Project 0 without PROJINHERIT takes the moved entry without
+// charging anything to it; the tenant inodes inside keep their own project, so
+// the deletion's zero-usage proof still covers them.
+//
+// It acts only on a directory on the volume root's device and on XFS; any
+// other anchor is refused with fstree.ErrCrossDevice, which RemoveBeneath
+// reports as a refused cut (fstree.ErrCutRefused), like any hook error. EPERM
+// and ENOTTY skip the detach instead of failing it: the cut is then attempted
+// as is, and fails as ErrCutRefused if the kernel refuses it.
+//
+// Never apply this to a live volume: new inodes created under a detached
+// directory would be charged to no project. Only a condemned volume reaches it.
+func (linuxXFSProjectAttributes) DetachCondemnedAnchor(anchorFD int, volumeRootDevice uint64) error {
+	var stat unix.Stat_t
+	if err := unix.Fstat(anchorFD, &stat); err != nil {
+		return fmt.Errorf("stat cut anchor: %w", err)
+	}
+	if stat.Dev != volumeRootDevice {
+		return fmt.Errorf("%w: cut anchor is not on the volume root's device", fstree.ErrCrossDevice)
+	}
+	var filesystem unix.Statfs_t
+	if err := unix.Fstatfs(anchorFD, &filesystem); err != nil {
+		return fmt.Errorf("statfs cut anchor: %w", err)
+	}
+	if uint64(filesystem.Type) != linuxXFSFilesystemMagic {
+		return fmt.Errorf("%w: cut anchor is on filesystem type %#x, want XFS", fstree.ErrCrossDevice, filesystem.Type)
+	}
+	var attr linuxFSXAttr
+	if errno := xfsAttributeIoctl(anchorFD, linuxFSIOCFSGetXAttr, &attr); errno != 0 {
+		if errno == unix.EPERM || errno == unix.ENOTTY {
+			return nil
+		}
+		return fmt.Errorf("read cut anchor project attributes: %w", errno)
+	}
+	attr.ProjectID = 0
+	attr.XFlags &^= linuxFSXFlagProjInherit
+	if errno := xfsAttributeIoctl(anchorFD, linuxFSIOCFSSetXAttr, &attr); errno != 0 {
+		if errno == unix.EPERM || errno == unix.ENOTTY {
+			return nil
+		}
+		return fmt.Errorf("detach cut anchor from its project: %w", errno)
+	}
+	return nil
+}
+
+// xfsAttributeIoctl issues one fsxattr ioctl on a raw descriptor the caller
+// keeps open for the duration of the call.
+func xfsAttributeIoctl(fd int, request uintptr, attr *linuxFSXAttr) unix.Errno {
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		uintptr(fd),
+		request,
+		uintptr(unsafe.Pointer(attr)), // #nosec G103 -- stable Linux fsxattr UAPI buffer
+	)
+	return errno
+}
+
 func validateXFSDefaultProject(attr linuxFSXAttr) error {
 	if attr.ProjectID != 0 {
 		return fmt.Errorf("inode remains assigned to project %d, want default project 0", attr.ProjectID)
@@ -1345,7 +1411,46 @@ func (x *xfsVolumeManager) normalizeXFSDeleteStageProjectWith(
 	return nil
 }
 
-type xfsRemoveAll func(root *os.Root, name string) error
+// condemnedXFSVolume is the opened root directory of one managed volume whose
+// deletion a parent-durable delete stage authorizes. cleanupXFSDeleteStageWith
+// is the only code that mints one, after it has attested the stage, the
+// project-ID authority and the volume root. Nothing that holds a live volume
+// can therefore obtain one, nor the anchor detach that only it can build.
+type condemnedXFSVolume struct {
+	stage      xfsDeleteStageName
+	dir        *os.File
+	device     uint64
+	attributes xfsProjectAttributes
+}
+
+// removeOptions is the only constructor of the cut-anchor detach. The detach
+// is lazy: fstree runs it immediately before the call's first cut, so a tree
+// within fstree's depth bound is removed without touching any project
+// attribute. fstree lends the anchor only for the hook's call, and reports any
+// error the hook returns as fstree.ErrCutRefused.
+func (v condemnedXFSVolume) removeOptions() fstree.RemoveOptions {
+	return fstree.RemoveOptions{BeforeFirstCut: func(anchor fstree.BorrowedDir) error {
+		return anchor.Control(v.detachAnchor)
+	}}
+}
+
+// detachAnchor detaches the lent cut anchor against the device of the volume
+// root this deletion attested. It runs only inside the anchor's loan.
+func (v condemnedXFSVolume) detachAnchor(anchorFD int) error {
+	return v.attributes.DetachCondemnedAnchor(anchorFD, v.device)
+}
+
+// removeEntry removes one top-level entry of the condemned volume, and when it
+// is a directory everything beneath it, with fstree's bounded descriptors and
+// memory.
+func (v condemnedXFSVolume) removeEntry(ctx context.Context, name fstree.Name) (fstree.RemoveReport, error) {
+	return fstree.RemoveBeneath(ctx, v.dir, name, v.removeOptions())
+}
+
+// xfsRemoveTree removes one top-level entry of a condemned volume. The
+// production implementation is removeCondemnedXFSEntry; tests substitute it to
+// fail at chosen entries.
+type xfsRemoveTree func(ctx context.Context, volume condemnedXFSVolume, name fstree.Name) error
 
 type xfsRemove func(root *os.Root, name string) error
 
@@ -1363,8 +1468,23 @@ func xfsDeletePhaseDeadline(ctx context.Context) error {
 	return nil
 }
 
-func removeAllFromXFSRoot(root *os.Root, name string) error {
-	return root.RemoveAll(name)
+// xfsDeleteRemovalContext gives the tree remover the same contract as the
+// phase checks: it ignores caller cancellation but stops at the caller's
+// deadline, now also inside a single top-level entry.
+func xfsDeleteRemovalContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	base := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(base, deadline)
+	}
+	return context.WithCancel(base)
+}
+
+// removeCondemnedXFSEntry is the production xfsRemoveTree. Its errors carry at
+// most one bounded entry name and a depth, never a path.
+func removeCondemnedXFSEntry(ctx context.Context, volume condemnedXFSVolume, name fstree.Name) error {
+	report, err := volume.removeEntry(ctx, name)
+	observeTreeRemoval(treeRemovalSiteDeleteStage, report, err)
+	return err
 }
 
 func removeFromXFSRoot(root *os.Root, name string) error {
@@ -1379,14 +1499,14 @@ func (x *xfsVolumeManager) cleanupXFSDeleteStage(
 	stage xfsDeleteStageName,
 ) error {
 	return x.cleanupXFSDeleteStageWith(
-		ctx, stage, removeAllFromXFSRoot, removeFromXFSRoot, removeFromXFSRoot,
+		ctx, stage, removeCondemnedXFSEntry, removeFromXFSRoot, removeFromXFSRoot,
 	)
 }
 
 func (x *xfsVolumeManager) cleanupXFSDeleteStageWith(
 	ctx context.Context,
 	stage xfsDeleteStageName,
-	removeContent xfsRemoveAll,
+	removeContent xfsRemoveTree,
 	removeFinal xfsRemove,
 	removeStage xfsRemove,
 ) (err error) {
@@ -1496,19 +1616,57 @@ func (x *xfsVolumeManager) cleanupXFSDeleteStageWith(
 			return fmt.Errorf("list xfs volume %q under delete authority: %w", stage.volumeID.value(), readErr)
 		}
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+		volumeStat, ok := volumeInfo.Sys().(*syscall.Stat_t)
+		if !ok {
+			_ = volumeRoot.Close()
+			_ = stageRoot.Close()
+			return fmt.Errorf("stat xfs volume %q under delete authority: no device identity", stage.volumeID.value())
+		}
+		volumeDir, openErr := volumeRoot.Open(".")
+		if openErr != nil {
+			_ = volumeRoot.Close()
+			_ = stageRoot.Close()
+			return fmt.Errorf("open xfs volume %q directory under delete authority: %w", stage.volumeID.value(), openErr)
+		}
+		condemned := condemnedXFSVolume{
+			stage:      stage,
+			dir:        volumeDir,
+			device:     volumeStat.Dev,
+			attributes: x.projectAttributes,
+		}
+		removalCtx, cancelRemoval := xfsDeleteRemovalContext(ctx)
 		for _, entry := range entries {
 			if err := xfsDeletePhaseDeadline(ctx); err != nil {
+				cancelRemoval()
+				_ = volumeDir.Close()
 				_ = volumeRoot.Close()
 				_ = stageRoot.Close()
 				return fmt.Errorf("xfs delete-stage %q deadline exhausted before removing entry %q: %w",
 					stage.value(), entry.Name(), err)
 			}
-			if err := removeContent(volumeRoot, entry.Name()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			name, nameErr := fstree.ParseName(entry.Name())
+			if nameErr != nil {
+				cancelRemoval()
+				_ = volumeDir.Close()
 				_ = volumeRoot.Close()
 				_ = stageRoot.Close()
-				return fmt.Errorf("remove content %q from xfs volume %q under delete-stage %q: %w",
-					entry.Name(), stage.volumeID.value(), stage.value(), err)
+				return fmt.Errorf("xfs volume %q lists an entry that is not one path component: %w",
+					stage.volumeID.value(), nameErr)
 			}
+			if err := removeContent(removalCtx, condemned, name); err != nil {
+				cancelRemoval()
+				_ = volumeDir.Close()
+				_ = volumeRoot.Close()
+				_ = stageRoot.Close()
+				return fmt.Errorf("remove content of xfs volume %q under delete-stage %q: %w",
+					stage.volumeID.value(), stage.value(), err)
+			}
+		}
+		cancelRemoval()
+		if err := volumeDir.Close(); err != nil {
+			_ = volumeRoot.Close()
+			_ = stageRoot.Close()
+			return fmt.Errorf("close xfs volume %q directory after removal: %w", stage.volumeID.value(), err)
 		}
 		if err := xfsDeletePhaseDeadline(ctx); err != nil {
 			_ = volumeRoot.Close()
@@ -2046,10 +2204,10 @@ func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB in
 }
 
 func (x *xfsVolumeManager) Destroy(ctx context.Context, id string) error {
-	return x.destroyWith(ctx, id, removeAllFromXFSRoot)
+	return x.destroyWith(ctx, id, removeCondemnedXFSEntry)
 }
 
-func (x *xfsVolumeManager) destroyWith(ctx context.Context, id string, removeAll xfsRemoveAll) error {
+func (x *xfsVolumeManager) destroyWith(ctx context.Context, id string, removeAll xfsRemoveTree) error {
 	volumeID, err := parseManagedVolumeName(id)
 	if err != nil {
 		return fmt.Errorf("validate xfs volume ID for destroy: %w", err)

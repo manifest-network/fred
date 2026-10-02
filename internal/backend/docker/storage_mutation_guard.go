@@ -29,6 +29,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/fsidentity"
+	"github.com/manifest-network/fred/internal/fstree"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -510,7 +511,7 @@ func (v launchVolume) removeWritablePaths(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		return removeManagedVolumeSubtree(filepath.Dir(v.state.directory.Path()), v.state.name, wp)
+		return removeManagedVolumeSubtree(ctx, filepath.Dir(v.state.directory.Path()), v.state.name, wp)
 	})
 }
 
@@ -867,12 +868,27 @@ func openAttestedManagedVolumeRoot(root *os.Root, volumeID managedVolumeName) (*
 	return volumeRoot, nil
 }
 
-// removeManagedVolumeSubtree performs recursive deletion under an attested
-// managed-volume descriptor. Opening the volume first is load-bearing: rooting
-// one combined "volume/_wp" path at volume_data_path would still permit the
-// volume component to be an in-root symlink to another tenant's volume.
-func removeManagedVolumeSubtree(rootPath string, volumeID managedVolumeName, subtree storagePathComponent) error {
+// removeManagedVolumeSubtree removes one fixed subtree of a live managed
+// volume (the writable-path scaffolding) under an attested managed-volume
+// descriptor. Opening the volume first is load-bearing: rooting one combined
+// "volume/_wp" path at volume_data_path would still permit the volume
+// component to be an in-root symlink to another tenant's volume.
+//
+// The subtree is tenant-shaped, so it is removed with fstree's bounded
+// descriptors and memory. The volume is live, so no cut anchor is ever
+// detached from its quota project here; a cut the kernel refuses is reported
+// as fstree.ErrCutRefused like any other failed wipe.
+func removeManagedVolumeSubtree(
+	ctx context.Context,
+	rootPath string,
+	volumeID managedVolumeName,
+	subtree storagePathComponent,
+) error {
 	validatedSubtree, err := parseStoragePathComponent(string(subtree))
+	if err != nil {
+		return err
+	}
+	name, err := fstree.ParseName(string(validatedSubtree))
 	if err != nil {
 		return err
 	}
@@ -886,7 +902,14 @@ func removeManagedVolumeSubtree(rootPath string, volumeID managedVolumeName, sub
 		return fmt.Errorf("open managed volume %q: %w", volumeID.value(), err)
 	}
 	defer func() { _ = volumeRoot.Close() }()
-	if err := volumeRoot.RemoveAll(string(validatedSubtree)); err != nil {
+	volumeDir, err := volumeRoot.Open(".")
+	if err != nil {
+		return fmt.Errorf("open managed volume %q directory: %w", volumeID.value(), err)
+	}
+	defer func() { _ = volumeDir.Close() }()
+	report, err := fstree.RemoveBeneath(ctx, volumeDir, name, fstree.RemoveOptions{})
+	observeTreeRemoval(treeRemovalSiteWritablePath, report, err)
+	if err != nil {
 		return fmt.Errorf("remove subtree %q from managed volume %q: %w", validatedSubtree, volumeID.value(), err)
 	}
 	return nil

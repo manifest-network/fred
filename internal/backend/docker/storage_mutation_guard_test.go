@@ -185,7 +185,7 @@ func TestRemoveManagedVolumeSubtree_ConfinesRecursiveDeletion(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(wpPath, "tenant-data"), []byte("x"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(volumePath, "keep"), []byte("x"), 0o600))
 
-	require.NoError(t, removeManagedVolumeSubtree(volumeRoot, volumeName, wpName))
+	require.NoError(t, removeManagedVolumeSubtree(t.Context(), volumeRoot, volumeName, wpName))
 	assert.NoDirExists(t, wpPath)
 	assert.FileExists(t, filepath.Join(volumePath, "keep"), "only the fixed writable-path subtree may be removed")
 }
@@ -206,7 +206,7 @@ func TestRemoveManagedVolumeSubtree_RejectsEscapingSymlink(t *testing.T) {
 	require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
 	require.NoError(t, os.Symlink(outside, volumeName.hostPath(volumeRoot)))
 
-	require.Error(t, removeManagedVolumeSubtree(volumeRoot, volumeName, wpName))
+	require.Error(t, removeManagedVolumeSubtree(t.Context(), volumeRoot, volumeName, wpName))
 	assert.FileExists(t, victim, "descriptor-relative deletion must not follow a symlink outside the storage root")
 }
 
@@ -227,7 +227,7 @@ func TestRemoveManagedVolumeSubtree_RejectsCrossVolumeSymlink(t *testing.T) {
 	require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
 	require.NoError(t, os.Symlink(target.value(), source.hostPath(volumeRoot)))
 
-	require.Error(t, removeManagedVolumeSubtree(volumeRoot, source, wpName))
+	require.Error(t, removeManagedVolumeSubtree(t.Context(), volumeRoot, source, wpName))
 	assert.FileExists(t, victim, "one managed volume must never redirect cleanup into another volume")
 }
 
