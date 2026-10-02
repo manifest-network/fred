@@ -894,6 +894,21 @@ func (b *Backend) setupVolBinds(
 	return volBinds, createdVolumeIDs, nil
 }
 
+// leaseVolumesPendingDeletion returns the lease's canonical volume names whose
+// earlier deletion is still pending, from the manager's memory only.
+func (b *Backend) leaseVolumesPendingDeletion(leaseUUID string, items []backend.LeaseItem) []string {
+	deleting := b.volumes.VolumeDeleteHolds()
+	var pending []string
+	for _, item := range items {
+		for i := range item.Quantity {
+			if name := canonicalVolumeName(leaseUUID, item.ServiceName, i); deleting.deletePending(name) {
+				pending = append(pending, name)
+			}
+		}
+	}
+	return pending
+}
+
 // physicalOperationError keeps callback-safe diagnostics attached to a typed
 // Refused result without granting any terminal settlement authority.
 type physicalOperationError struct {
@@ -926,6 +941,18 @@ func (b *Backend) doProvisionPhysical(
 ) (finding acceptedStartupFailure, errRet error) {
 	if mutations == nil {
 		return acceptedStartupFailure{}, errors.New("started provision mutation capability is required")
+	}
+	// A volume name whose earlier deletion is still held cannot be created
+	// again until that deletion finishes (ENG-1117). Refuse here, before any
+	// Step, so the tenant sees a curated reason on an effect-free failure
+	// rather than an ambiguous launch; a writable-path-only service is refused
+	// too, rather than run without its seeded content.
+	if pending := b.leaseVolumesPendingDeletion(req.LeaseUUID, req.Items); len(pending) > 0 {
+		return &physicalOperationError{
+			callback: backend.MsgVolumeDeletePending,
+			reason:   backend.ReasonVolumeDeletePending,
+			cause:    fmt.Errorf("%w: lease volume(s) %v", ErrVolumeDeleteHeld, pending),
+		}
 	}
 	if err := b.prepareProvisionProjection(mutations, ctx, req, stack, resourceProfiles, logger); err != nil {
 		return acceptedStartupFailure{}, err

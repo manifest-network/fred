@@ -1,6 +1,8 @@
 package docker
 
 import (
+	"errors"
+	"fmt"
 	"math"
 	"slices"
 	"strings"
@@ -130,6 +132,19 @@ func (s volumeDeleteHoldSnapshot) dueInOrder(now time.Time) []volumeDeleteHoldVi
 		return strings.Compare(a.volume.value(), b.volume.value())
 	})
 	return due
+}
+
+// afterVolumeDestroy publishes, before a destroy's caller can act on its
+// answer, any held-deletion phase change the destroy made: a deletion that
+// just became residual settles its caller, so its project's footprint must
+// already be in the admission pool. Every destroy entry point in the
+// composition file calls it. A failed publication fails the destroy, so the
+// caller keeps its own accounting and retries.
+func (b *Backend) afterVolumeDestroy(destroyErr error) error {
+	if err := b.refreshHeldResidualAccounting(); err != nil {
+		return errors.Join(destroyErr, fmt.Errorf("account held volume deletions: %w", err))
+	}
+	return destroyErr
 }
 
 // destroyPrecheckVerdict is PrecheckDestroy's closed answer. Its zero value is

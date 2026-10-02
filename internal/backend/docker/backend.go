@@ -262,6 +262,13 @@ type Backend struct {
 	// recompute-from-store + SetRetainedDisk so a stale snapshot can never
 	// clobber a fresher one (which would under-count → over-admit).
 	retentionAccountingMu sync.Mutex
+	// retentionStoreDiskMB is the store-derived part of the retained-disk
+	// projection (active + reaping) last pushed to the pool, and
+	// retentionStoreDiskKnown whether one was pushed yet. A held-deletion
+	// transition re-adds the fresh residual term to it without re-reading the
+	// store. Both are guarded by retentionAccountingMu.
+	retentionStoreDiskMB    int64
+	retentionStoreDiskKnown bool
 
 	// callbackStore persists pending callbacks in bbolt
 	callbackStore *shared.CallbackStore

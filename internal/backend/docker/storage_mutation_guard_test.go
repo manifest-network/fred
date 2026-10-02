@@ -360,10 +360,14 @@ func TestStorageMutationGuard_ManagerAmbiguityLatchesBackendAfterSuccessfulPostc
 	}
 }
 
+// Only authority contradictions and ambiguous outcomes carry
+// ErrVolumeMutationRecoveryPending; a failure confined to one volume's deletion
+// is ErrVolumeDeleteHeld and never latches (see
+// TestStorageMutationGuard_VolumeDeleteHeldDoesNotLatch).
 func TestStorageMutationGuard_VolumeRecoveryPendingLatchesBackendAfterSuccessfulPostcheck(t *testing.T) {
 	t.Parallel()
 
-	mutationCause := errors.New("xfs delete-stage still has open-unlinked inodes")
+	mutationCause := errors.New("xfs delete-stage project-ID authority conflicts with the active map")
 	managerErr := fmt.Errorf("%w: %w", ErrVolumeMutationRecoveryPending, mutationCause)
 	stopCtx, stop := context.WithCancel(context.Background())
 	t.Cleanup(stop)

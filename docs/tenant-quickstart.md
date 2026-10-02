@@ -273,6 +273,7 @@ recognize as a generic failure and fall back to displaying `message`. The define
 | `RestoreFailed` | A tenant-initiated restore (redeploy from retained data) failed |
 | `VolumeCleanupExhausted` | Volume cleanup on deprovision failed after exhausting all retries |
 | `CleanupFailed` | Cleanup on deprovision failed (containers or volumes) |
+| `VolumeDeletePending` | A provision was refused because an earlier deletion of the lease's own volume has not finished yet; retry later |
 | `Unknown` | The lease is `failed` but no specific reason was recorded |
 
 `message` is a short, human-readable summary and may be empty; it never contains host filesystem

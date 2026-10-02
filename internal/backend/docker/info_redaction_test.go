@@ -16,7 +16,7 @@ func TestReasonMessages_NoHostPathText(t *testing.T) {
 	for _, m := range []string{
 		leasesm.ErrMsgContainerExited, leasesm.ErrMsgInternal,
 		backend.MsgRestartFailed, backend.MsgImagePullFailed, backend.MsgUpdateFailed,
-		backend.MsgVolumeCleanupExhausted, backend.MsgCleanupFailed,
+		backend.MsgVolumeCleanupExhausted, backend.MsgCleanupFailed, backend.MsgVolumeDeletePending,
 	} {
 		assert.False(t, strings.Contains(m, "/"), "message %q contains a path separator", m)
 	}

@@ -534,13 +534,15 @@ var (
 	// volumeQuotaBackfillTotal counts per-volume quota re-application attempts by
 	// the startup reconcile (reconcileVolumeQuotas), which re-tags + re-limits
 	// existing volumes so leases provisioned before the daemon held CAP_SYS_ADMIN
-	// get their disk_mb enforced without a re-provision. outcome ∈ {applied,failed}.
-	// (ENG-454)
+	// get their disk_mb enforced without a re-provision. outcome ∈
+	// {applied,failed,delete_pending}; delete_pending is a wanted volume whose
+	// deletion is held and whose limits its delete authority keeps (ENG-454,
+	// ENG-1117).
 	volumeQuotaBackfillTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "volume_quota_backfill_total",
-		Help:      "Startup quota-backfill per-volume re-application attempts by outcome",
+		Help:      "Startup quota-backfill per-volume re-application attempts by outcome (applied|failed|delete_pending)",
 	}, []string{"outcome"})
 
 	// volumeQuotaClearFailedTotal counts failed XFS quota-clear commands during
@@ -556,6 +558,17 @@ var (
 		Subsystem: metricsSubsystem,
 		Name:      "volume_quota_clear_failed_total",
 		Help:      "Failed XFS quota-clear commands during create compensation or deletion; the delete stage or create stage is kept and retried — see ENG-459/ENG-1117",
+	})
+
+	// volumeDeleteHeldResidualMB is the admission term for held deletions in
+	// their residual phase: the sum of their projects' footprints (each
+	// project's block hard limit), in MiB, already counted in the retained-disk
+	// projection (ENG-1117).
+	volumeDeleteHeldResidualMB = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_delete_held_residual_mb",
+		Help:      "Disk (MiB) counted in admission for held volume deletions whose volume is gone but whose quota project may still charge usage",
 	})
 
 	// volumeDeleteOutcomesTotal counts XFS delete-stage cleanup attempts by
@@ -1180,10 +1193,14 @@ var reindexTriggers = []string{"open", "manual"}
 // first restore completes (ENG-408). Values mirror provisionsTotal.
 var restoreOutcomes = []string{"success", "failure"}
 
+// quotaBackfillDeletePending counts a wanted volume skipped because its
+// deletion is pending: its delete authority owns its limits (ENG-1117).
+const quotaBackfillDeletePending = "delete_pending"
+
 // quotaBackfillOutcomes is the closed outcome set for volumeQuotaBackfillTotal,
 // pre-initialized to 0 so a backfill failure-ratio query returns 0, not no-data,
 // before the first startup reconcile (ENG-454).
-var quotaBackfillOutcomes = []string{"applied", "failed"}
+var quotaBackfillOutcomes = []string{"applied", "failed", quotaBackfillDeletePending}
 
 func init() {
 	// Pre-init every failure attribution (ENG-799) so an alert on a non-counted
