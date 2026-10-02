@@ -63,6 +63,7 @@ type registryFixture struct {
 	manifest, config, compressed, layer []byte
 	manifestID, configID, layerID       digest.Digest
 	requests                            int
+	layerRequests                       int
 	replaceBlob                         []byte
 	manifestResponse                    []byte
 	manifestType                        string
@@ -112,6 +113,7 @@ func newRegistry(t *testing.T, layer []byte) *registryFixture {
 		case strings.HasSuffix(r.URL.Path, f.configID.String()):
 			_, _ = w.Write(f.config)
 		case strings.HasSuffix(r.URL.Path, f.layerID.String()):
+			f.layerRequests++
 			if f.replaceBlob != nil {
 				_, _ = w.Write(f.replaceBlob)
 			} else {

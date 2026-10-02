@@ -124,6 +124,8 @@ func TestIntegration_Docker_ComposeBuiltImageCannotInheritForeignProject(t *test
 	tag, imageID := importImageSecurityFixture(t, ctx, sdk, map[string]string{
 		composeapi.ProjectLabel: foreignProject, composeapi.ServiceLabel: "foreign-service",
 		composeapi.VersionLabel: "foreign-version", "app.owner": "tenant",
+		// Compose's classic (non-BuildKit) builder adds this stamp.
+		composeapi.ImageBuilderLabel: "classic",
 	})
 	admitted, err := docker.AdmitImage(ctx, tag)
 	require.NoError(t, err)
@@ -140,9 +142,9 @@ func TestIntegration_Docker_ComposeBuiltImageCannotInheritForeignProject(t *test
 	actual, err := sdk.ContainerInspect(ctx, id)
 	require.NoError(t, err)
 	require.Equal(t, imageID, actual.Image)
-	for _, key := range []string{composeapi.ProjectLabel, composeapi.ServiceLabel, composeapi.VersionLabel} {
+	for _, key := range []string{composeapi.ProjectLabel, composeapi.ServiceLabel, composeapi.VersionLabel, composeapi.ImageBuilderLabel} {
 		value, present := actual.Config.Labels[key]
-		require.True(t, present)
+		require.True(t, present, "creation must write %s explicitly", key)
 		require.Empty(t, value, "Docker must overwrite image-inherited build stamps")
 	}
 	require.Equal(t, "tenant", actual.Config.Labels["app.owner"])

@@ -2636,6 +2636,10 @@ func testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t *testing.T, moun
 	for _, labels := range []map[string]string{frozen.Config.Labels, restored.Config.Labels} {
 		require.Contains(t, labels, composeapi.VersionLabel)
 		require.Equal(t, composeapi.ComposeVersion, labels[composeapi.VersionLabel])
+		// Compose up and compensation restore both clear the classic-builder
+		// stamp explicitly, so no image value can be inherited.
+		require.Contains(t, labels, composeapi.ImageBuilderLabel)
+		require.Empty(t, labels[composeapi.ImageBuilderLabel])
 	}
 	require.Equal(t, frozen.Config.Labels[LabelImageID], restored.Config.Labels[LabelImageID])
 	require.Equal(t, frozen.Config.Labels[LabelImageReference], restored.Config.Labels[LabelImageReference])

@@ -24,7 +24,8 @@ func TestImageInspectionComposeBuildLabelsRemainNeutralThroughRecovery(t *testin
 				if !oldHelper {
 					daemon.imageLabels = map[string]string{
 						composeapi.ProjectLabel: "foreign-project", composeapi.ServiceLabel: "foreign-service",
-						composeapi.VersionLabel: "foreign-version", "app.owner": "tenant",
+						composeapi.VersionLabel: "foreign-version", composeapi.ImageBuilderLabel: "classic",
+						"app.owner": "tenant",
 					}
 				}
 				return newImageSecurityDockerClient(t, func(request *http.Request) (*http.Response, error) {
@@ -40,9 +41,13 @@ func TestImageInspectionComposeBuildLabelsRemainNeutralThroughRecovery(t *testin
 			})
 			require.Len(t, h.daemon.containers, 1)
 			for _, actual := range h.daemon.containers {
-				for _, key := range []string{composeapi.ProjectLabel, composeapi.ServiceLabel, composeapi.VersionLabel} {
-					require.Empty(t, actual.Config.Labels[key], "helper must not inherit Compose ownership")
+				for _, key := range []string{composeapi.ProjectLabel, composeapi.ServiceLabel, composeapi.VersionLabel, composeapi.ImageBuilderLabel} {
+					value, present := actual.Config.Labels[key]
+					require.True(t, present, "helper must write %s explicitly", key)
+					require.Empty(t, value, "helper must not inherit Compose ownership")
 					if oldHelper {
+						// Helpers created before a key was owned carry no
+						// stamp at all; recovery must still accept them.
 						delete(actual.Config.Labels, key)
 					}
 				}

@@ -21,7 +21,7 @@ func TestComposeBuildLabelsCannotCarryGroupingAcrossCreationBoundaries(t *testin
 	response := classicImage()
 	response.Config.Labels = map[string]string{
 		composeapi.ProjectLabel: "foreign-project", composeapi.ServiceLabel: "foreign-service",
-		composeapi.VersionLabel: "foreign-version", "app.owner": "tenant",
+		composeapi.VersionLabel: "foreign-version", composeapi.ImageBuilderLabel: "classic", "app.owner": "tenant",
 	}
 	source := &fakeSource{version: "1.51", inspect: func(context.Context, string, ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
 		return response, nil
@@ -34,13 +34,14 @@ func TestComposeBuildLabelsCannotCarryGroupingAcrossCreationBoundaries(t *testin
 	require.NoError(t, err)
 	config := &container.Config{Labels: map[string]string{
 		composeapi.ProjectLabel: "caller-project", composeapi.ServiceLabel: "caller-service", composeapi.VersionLabel: "caller-version",
+		composeapi.ImageBuilderLabel: "caller-builder",
 	}}
 	source.create = func(_ context.Context, actual *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
 		// Model Docker inheritance: Config.Labels overlays the image map, while
 		// deleting a key from Config would preserve its attacker-supplied value.
 		inherited := maps.Clone(response.Config.Labels)
 		maps.Copy(inherited, actual.Labels)
-		for _, key := range []string{composeapi.ProjectLabel, composeapi.ServiceLabel, composeapi.VersionLabel} {
+		for _, key := range []string{composeapi.ProjectLabel, composeapi.ServiceLabel, composeapi.VersionLabel, composeapi.ImageBuilderLabel} {
 			value, present := actual.Labels[key]
 			require.True(t, present, "neutralization must overwrite inherited %s", key)
 			require.Empty(t, value)
@@ -64,10 +65,16 @@ func TestComposeBuildLabelsCannotCarryGroupingAcrossCreationBoundaries(t *testin
 	executor, err := a.NewComposeExecutor(func(_ context.Context, actual *composetypes.Project, _ composeapi.UpOptions) error {
 		service := actual.Services["app"]
 		require.Equal(t, "app", service.Name)
-		want := map[string]string{composeapi.ProjectLabel: actual.Name, composeapi.ServiceLabel: "app", composeapi.VersionLabel: composeapi.ComposeVersion}
+		want := map[string]string{
+			composeapi.ProjectLabel: actual.Name, composeapi.ServiceLabel: "app", composeapi.VersionLabel: composeapi.ComposeVersion,
+			// A compiled project never keeps the image's builder stamp.
+			composeapi.ImageBuilderLabel: "",
+		}
 		for _, labels := range []map[string]string{service.Labels, service.CustomLabels} {
 			for key, value := range want {
-				require.Equal(t, value, labels[key])
+				actualValue, present := labels[key]
+				require.True(t, present, "compiled service must write %s explicitly", key)
+				require.Equal(t, value, actualValue)
 			}
 		}
 		inherited := maps.Clone(response.Config.Labels)
@@ -82,6 +89,7 @@ func TestComposeBuildLabelsCannotCarryGroupingAcrossCreationBoundaries(t *testin
 	require.NoError(t, err)
 	require.NoError(t, executor.Up(t.Context(), prepared, false))
 	require.Equal(t, "foreign-project", response.Config.Labels[composeapi.ProjectLabel])
+	require.Equal(t, "classic", response.Config.Labels[composeapi.ImageBuilderLabel], "admission must not mutate the inspected image map")
 }
 
 func TestProjectContainerBindsImageAndGroupingWithoutRawLabelAuthority(t *testing.T) {
@@ -106,7 +114,8 @@ func TestProjectContainerBindsImageAndGroupingWithoutRawLabelAuthority(t *testin
 	config := &container.Config{Image: "caller-controlled:latest", Labels: map[string]string{
 		composeapi.ProjectLabel: "foreign-project", composeapi.ServiceLabel: "foreign-service", composeapi.VersionLabel: "foreign-version",
 		composeapi.ConfigHashLabel: "frozen-config-hash", composeapi.OneoffLabel: "False",
-		imageexec.LabelImageID: "forged-id",
+		composeapi.ImageBuilderLabel: "forged",
+		imageexec.LabelImageID:       "forged-id",
 	}}
 	creates := 0
 	source.create = func(_ context.Context, actual *container.Config, _ *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
@@ -116,6 +125,9 @@ func TestProjectContainerBindsImageAndGroupingWithoutRawLabelAuthority(t *testin
 		require.Equal(t, "owned-project", actual.Labels[composeapi.ProjectLabel])
 		require.Equal(t, "web-1", actual.Labels[composeapi.ServiceLabel])
 		require.Equal(t, composeapi.ComposeVersion, actual.Labels[composeapi.VersionLabel])
+		builder, present := actual.Labels[composeapi.ImageBuilderLabel]
+		require.True(t, present, "the builder stamp must be written explicitly")
+		require.Empty(t, builder, "a caller-supplied builder stamp is never retained")
 		require.Equal(t, "frozen-config-hash", actual.Labels[composeapi.ConfigHashLabel])
 		require.Equal(t, "False", actual.Labels[composeapi.OneoffLabel])
 		return container.CreateResponse{ID: "restored"}, nil

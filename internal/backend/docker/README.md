@@ -1941,11 +1941,13 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 
 Manifest labels may not use the `fred.*`, `traefik.*`, or
 `com.docker.compose.*` namespaces, matched case-insensitively. Image labels have
-three exact exceptions: `com.docker.compose.project`, `com.docker.compose.service`
-and `com.docker.compose.version`. Fred discards these automatic build-stamp
-values and supplies ownership from the compiled workload; direct helpers get
-neutral values. Other reserved keys and case variants remain refused. A
-Compose-built image containing only those three stamps needs no rebuild.
+four exact exceptions: `com.docker.compose.project`, `com.docker.compose.service`,
+`com.docker.compose.version`, and `com.docker.compose.image.builder`, which
+Compose's classic (non-BuildKit) builder adds. Fred discards these automatic
+build-stamp values and supplies ownership from the compiled workload; direct
+helpers get neutral values, and every creation path writes the builder stamp
+empty. Other reserved keys and case variants remain refused. A Compose-built
+image containing only those four stamps needs no rebuild.
 Newly fetched image metadata is checked before layer download or import; all
 images are admitted before creating workloads or inspection helpers. Execution
 uses the inspected immutable image ID. Existing containers are not rewritten.

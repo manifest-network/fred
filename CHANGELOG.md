@@ -1146,13 +1146,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   identity, including content above a subsequently lowered image size cap.
   (ENG-1052)
 
-- Images built by Docker Compose can retain its three standard build stamps.
-  Admitted metadata owns their replacements: compiled projects bind their own
-  project/service/version, and ordinary direct/helper creation writes neutral
+- Images built by Docker Compose can retain its standard build stamps: project,
+  service and version, plus the `com.docker.compose.image.builder` stamp of its
+  classic (non-BuildKit) builder. Admitted metadata owns their replacements:
+  compiled projects bind their own project/service/version, the builder stamp
+  is always cleared, and ordinary direct/helper creation writes neutral
   values. Frozen-source compensation carries a compiler-issued service binding
   so restored workloads remain discoverable by Compose and can be deprovisioned.
   Other reserved labels remain rejected, and inherited build labels cannot
-  grant container ownership or redirect helper cleanup. (ENG-1052)
+  grant container ownership or redirect helper cleanup. (ENG-1052, ENG-1119)
 
 - Custom-domain provision, restore and maintenance admission now derives durable
   effective items and Docker labels from one ingress plan. Disabled ingress,
@@ -1938,8 +1940,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Docker image admission rejects reserved `fred.*`, `traefik.*`, and
   `com.docker.compose.*` labels before any workload or inspection helper is
   created, preventing inherited labels from hijacking ingress or Compose
-  lifecycle ownership. The three exact Compose project/service/version build
-  stamps are admitted only as placeholders replaced by the owned creation plan.
+  lifecycle ownership. The exact Compose project/service/version build stamps,
+  and the `com.docker.compose.image.builder` stamp of Compose's classic builder,
+  are admitted only as placeholders replaced by the owned creation plan.
   Admission mints an opaque image capability; helpers
   and workloads require that capability, and Compose requires a complete prepared
   project with repulls disabled. Container creation and image setup use the exact inspected

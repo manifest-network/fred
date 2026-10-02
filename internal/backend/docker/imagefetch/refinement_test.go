@@ -13,6 +13,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	composeapi "github.com/docker/compose/v5/pkg/api"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
@@ -144,6 +145,39 @@ func TestMetadataAdmissionPrecedesLayerDownloadAndDaemonMutation(t *testing.T) {
 			require.Zero(t, pending)
 		})
 	}
+}
+
+// Compose's classic (non-BuildKit) builder stamps the image config with
+// com.docker.compose.image.builder. Pull-time admission owns that exact stamp,
+// so the selection is issued from manifest and config metadata alone, before
+// any layer is downloaded, and the pull then completes.
+func TestMetadataAdmissionAcceptsComposeBuildStampsBeforeLayerDownload(t *testing.T) {
+	f := newRegistry(t, layerTar(t, []byte("content")))
+	f.updateImage(t, func(cfg *ocispec.Image, _ *ocispec.Manifest) {
+		cfg.Config.Labels = map[string]string{
+			composeapi.ProjectLabel: "foreign-project", composeapi.ServiceLabel: "foreign-service",
+			composeapi.VersionLabel: "foreign-version", composeapi.ImageBuilderLabel: "classic",
+		}
+	})
+	daemon := &recordingImporter{}
+	loader, err := NewLoader(daemon, t.TempDir(), 1<<20, withRegistryTransportForTest(f.server.Client().Transport))
+	require.NoError(t, err)
+	resolved, err := loader.Resolve(t.Context(), f.ref(), testPlatform)
+	require.NoError(t, err, "a classic Compose build stamp must not refuse the image")
+	require.Equal(t, f.configID.String(), resolved.ConfigID())
+	f.mu.Lock()
+	require.Zero(t, f.layerRequests, "metadata admission precedes any layer download")
+	f.mu.Unlock()
+	prepared, err := loader.PrepareResolved(t.Context(), resolved)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, prepared.Close()) })
+	require.True(t, prepared.Metadata().Valid())
+	f.mu.Lock()
+	require.NotZero(t, f.layerRequests, "preparation downloads the admitted layers")
+	f.mu.Unlock()
+	_, err = loader.Import(t.Context(), prepared)
+	require.NoError(t, err)
+	require.Equal(t, 1, daemon.loads)
 }
 
 func TestImportAllowanceCapsFilesystemMetadataExpansion(t *testing.T) {
