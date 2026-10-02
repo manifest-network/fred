@@ -702,5 +702,5 @@ func (z *zfsVolumeManager) Validate() error {
 	// `zfs allow`, so the daemon may legitimately set quotas without the
 	// capability. A cap check would false-positive on a properly-delegated host.
 	// zfs privilege failures surface as a create/set error at provision time.
-	return nil
+	return requireTreeRemovalSupport(z.dataPath)
 }

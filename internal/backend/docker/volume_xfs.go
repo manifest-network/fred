@@ -3320,6 +3320,9 @@ func (x *xfsVolumeManager) Validate() error {
 	if err := requireCapSysAdmin(x.Kind(), x.logger); err != nil {
 		return err
 	}
+	if err := requireTreeRemovalSupport(x.dataPath); err != nil {
+		return err
+	}
 
 	// Populate activeIDs from existing volume marker files.
 	return x.loadProjectIDs()

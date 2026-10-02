@@ -68,6 +68,18 @@ func (beforeFirstCutError) Unwrap() error { return fstree.ErrCutRefused }
 
 func (e beforeFirstCutError) Cause() error { return e.cause }
 
+// Start's kernel probe passes on a kernel that reports mount IDs (this one),
+// and an unreadable root is an error, never a pass; fstree's own tests pin
+// that a kernel without mount IDs is ErrUnsupportedKernel.
+func TestRequireTreeRemovalSupport(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, requireTreeRemovalSupport(t.TempDir()))
+	err := requireTreeRemovalSupport(filepath.Join(t.TempDir(), "missing"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	assert.NotErrorIs(t, err, fstree.ErrUnsupportedKernel)
+}
+
 func TestTreeRemovalMetricsArePreinitialized(t *testing.T) {
 	t.Parallel()
 
