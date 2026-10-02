@@ -69,7 +69,7 @@ image.
 
 | Requirement | Recommendation |
 |---|---|
-| OS | Linux. cgroup v2 strongly recommended — under cgroup v2, tmpfs memory is counted against the container's memory limit; under v1 it is not, which makes the per-container memory budget less precise |
+| OS | Linux **5.8+**: tenant directory cleanup needs the mount IDs `statx` reports, and refuses to touch a tree without them. cgroup v2 strongly recommended — under cgroup v2, tmpfs memory is counted against the container's memory limit; under v1 it is not, which makes the per-container memory budget less precise |
 | Docker | Engine **28.1+ (API 1.49+)** is the image-admission compatibility floor for binding inspected metadata to a single immutable platform image. Production also requires a currently security-patched Engine (see below). iptables must be enabled (the default). `--iptables=false` disables cross-tenant network isolation; the docker-backend logs a daemon-warning at startup if it detects this |
 | CPU / RAM | Sized for the SKU pool you advertise; budget 10–20% overhead for the daemon |
 | Disk | Image cache + per-tenant volumes (see [Stateful workloads](#stateful-workloads-disk_mb--0-skus)) |

@@ -15,6 +15,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+
+	"github.com/manifest-network/fred/internal/fstree/internal/at"
 )
 
 // recorder is a Visitor that records every visit by path, read back from
@@ -32,10 +34,15 @@ func newRecorder(t *testing.T, root string) *recorder {
 	return &recorder{t: t, root: root, types: map[string]uint8{}, visits: map[string]int{}}
 }
 
-func fdPath(t *testing.T, fd int) string {
+// dirPath reads the path of a lent directory back from /proc/self/fd.
+func dirPath(t *testing.T, dir BorrowedDir) string {
 	t.Helper()
-	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
-	require.NoError(t, err)
+	var path string
+	require.NoError(t, dir.Control(func(fd int) error {
+		var err error
+		path, err = os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+		return err
+	}))
 	return path
 }
 
@@ -54,16 +61,16 @@ func (r *recorder) record(path string, dtype uint8, depth int) string {
 	return path
 }
 
-func (r *recorder) Directory(fd int, depth int) error {
-	path := r.record(fdPath(r.t, fd), unix.DT_DIR, depth)
+func (r *recorder) Directory(dir BorrowedDir, depth int) error {
+	path := r.record(dirPath(r.t, dir), unix.DT_DIR, depth)
 	if r.onDirectory != nil {
 		return r.onDirectory(path, depth)
 	}
 	return nil
 }
 
-func (r *recorder) Entry(parentFD int, name string, dtype uint8, depth int) error {
-	path := r.record(filepath.Join(fdPath(r.t, parentFD), name), dtype, depth)
+func (r *recorder) Entry(parent BorrowedDir, name string, dtype uint8, depth int) error {
+	path := r.record(filepath.Join(dirPath(r.t, parent), name), dtype, depth)
 	if r.onEntry != nil {
 		return r.onEntry(path, depth)
 	}
@@ -132,7 +139,7 @@ func TestWalkBeneathVisitsEveryEntryOnce(t *testing.T) {
 	mkdirAll(t, filepath.Join(anchor, "wide"))
 	mkdirAll(t, filepath.Join(anchor, "many"))
 	writeFile(t, filepath.Join(anchor, "nested", "deeper", "deepest", "file"), "x")
-	writeFile(t, filepath.Join(anchor, strings.Repeat("L", maxNameLen)), "long name")
+	writeFile(t, filepath.Join(anchor, strings.Repeat("L", at.MaxNameLen)), "long name")
 	writeFile(t, filepath.Join(anchor, "odd\nname\xff"), "odd name")
 	require.NoError(t, os.Symlink(filepath.Join(outside, "dir"), filepath.Join(anchor, "to-outside")))
 	require.NoError(t, os.Symlink("..", filepath.Join(anchor, "nested", "to-parent")))
@@ -170,6 +177,7 @@ func TestWalkBeneathVisitsEveryEntryOnce(t *testing.T) {
 		}
 	}
 	require.Equal(t, WalkReport{Dirs: dirs, Entries: entries, MaxDepth: 3}, report)
+	require.True(t, report.Complete(), "a static tree is walked whole")
 }
 
 // A tree deeper than the bound fails with ErrTooDeep; one exactly at the
@@ -193,22 +201,22 @@ func TestWalkBeneathStopsAtTheDepthBound(t *testing.T) {
 
 // funcVisitor adapts two functions to Visitor.
 type funcVisitor struct {
-	directory func(fd int, depth int) error
-	entry     func(parentFD int, name string, dtype uint8, depth int) error
+	directory func(dir BorrowedDir, depth int) error
+	entry     func(parent BorrowedDir, name string, dtype uint8, depth int) error
 }
 
-func (v funcVisitor) Directory(fd int, depth int) error {
+func (v funcVisitor) Directory(dir BorrowedDir, depth int) error {
 	if v.directory == nil {
 		return nil
 	}
-	return v.directory(fd, depth)
+	return v.directory(dir, depth)
 }
 
-func (v funcVisitor) Entry(parentFD int, name string, dtype uint8, depth int) error {
+func (v funcVisitor) Entry(parent BorrowedDir, name string, dtype uint8, depth int) error {
 	if v.entry == nil {
 		return nil
 	}
-	return v.entry(parentFD, name, dtype, depth)
+	return v.entry(parent, name, dtype, depth)
 }
 
 // A directory moved while the walk is inside it is detected when the walk
@@ -231,9 +239,9 @@ func TestWalkBeneathDetectsAMovedAncestor(t *testing.T) {
 			// The walk keeps listing the directory it holds after the move,
 			// as every descriptor-based walk does; it must stop when it climbs
 			// out of it.
-			moveHeld := funcVisitor{directory: func(fd int, depth int) error {
+			moveHeld := funcVisitor{directory: func(dir BorrowedDir, depth int) error {
 				if depth == 2 {
-					require.NoError(t, os.Rename(fdPath(t, fd), filepath.Join(base, destination)))
+					require.NoError(t, os.Rename(dirPath(t, dir), filepath.Join(base, destination)))
 				}
 				return nil
 			}}
@@ -261,9 +269,9 @@ func TestWalkBeneathDetectsARemovedDirectory(t *testing.T) {
 	mkdirAll(t, filepath.Join(anchor, "a", "b"))
 	parent := openDir(t, parentPath)
 
-	removeHeld := funcVisitor{directory: func(fd int, depth int) error {
+	removeHeld := funcVisitor{directory: func(dir BorrowedDir, depth int) error {
 		if depth == 2 {
-			require.NoError(t, os.Remove(fdPath(t, fd)))
+			require.NoError(t, os.Remove(dirPath(t, dir)))
 		}
 		return nil
 	}}
@@ -388,36 +396,122 @@ func TestWalkBeneathToleratesConcurrentWriters(t *testing.T) {
 	}
 }
 
-// A listing that does not say the type (DT_UNKNOWN, or a value this
-// package does not know) is resolved without following a symlink.
-func TestWalkBeneathResolvesUnknownTypes(t *testing.T) {
+// A listed directory that vanished, or stopped being a directory, before the
+// walk came to it is passed over and counted, so the report says the walk
+// did not observe the whole tree. Nothing behind a symlink is visited.
+func TestWalkBeneathCountsWhatItPassesOver(t *testing.T) {
+	cases := map[string]struct {
+		change            func(t *testing.T, path, outside string)
+		vanished, retyped uint64
+	}{
+		"vanished": {
+			change:   func(t *testing.T, path, _ string) { require.NoError(t, os.Remove(path)) },
+			vanished: 1,
+		},
+		"replaced by a file": {
+			change: func(t *testing.T, path, _ string) {
+				require.NoError(t, os.Remove(path))
+				writeFile(t, path, "now a file")
+			},
+			retyped: 1,
+		},
+		"replaced by a symlink": {
+			change: func(t *testing.T, path, outside string) {
+				require.NoError(t, os.Remove(path))
+				require.NoError(t, os.Symlink(filepath.Join(outside, "dir"), path))
+			},
+			retyped: 1,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			base := tempDir(t)
+			outside := makeOutside(t, base)
+			parentPath := filepath.Join(base, "parent")
+			anchor := filepath.Join(parentPath, "anchor")
+			mkdirAll(t, filepath.Join(anchor, "victim"))
+			parent := openDir(t, parentPath)
+			rec := newRecorder(t, anchor)
+
+			requireNoLeak(t, func() {
+				borrowParentView(t, parent, func(p at.View) {
+					w := newWalker(context.Background(), p, mustName("anchor"), rec, maxDepth)
+					defer w.release()
+					opened, err := w.begin()
+					require.NoError(t, err)
+					require.True(t, opened)
+					listed, _, eof, err := w.cur.ReadBatch(&w.dir, 0)
+					require.NoError(t, err)
+					require.False(t, eof)
+					require.Len(t, listed, 1)
+
+					tc.change(t, filepath.Join(anchor, "victim"), outside)
+					descended, err := w.visitEntry(listed[0])
+					require.NoError(t, err, "a passed-over entry does not fail the walk")
+					require.False(t, descended)
+					require.Equal(t, tc.vanished, w.report.Vanished)
+					require.Equal(t, tc.retyped, w.report.Retyped)
+					require.False(t, w.report.Complete())
+				})
+			})
+			require.Equal(t, map[string]int{".": 1}, rec.visits, "nothing but the anchor was visited")
+		})
+	}
+}
+
+// Complete holds only when nothing was passed over.
+func TestWalkReportComplete(t *testing.T) {
+	require.True(t, WalkReport{}.Complete())
+	require.True(t, WalkReport{Dirs: 3, Entries: 9, MaxDepth: 2}.Complete())
+	require.False(t, WalkReport{Vanished: 1}.Complete())
+	require.False(t, WalkReport{Retyped: 1}.Complete())
+}
+
+// A visitor's BorrowedDir is valid only during its call: one kept from an
+// earlier call is refused during a later one, and every kept one is refused
+// after the walk.
+func TestWalkBeneathLendsDirectoriesOnlyForTheCall(t *testing.T) {
 	parentPath := tempDir(t)
 	anchor := filepath.Join(parentPath, "anchor")
-	mkdirAll(t, filepath.Join(anchor, "dir"))
-	writeFile(t, filepath.Join(anchor, "file"), "x")
-	require.NoError(t, os.Symlink("dir", filepath.Join(anchor, "link")))
+	mkdirAll(t, filepath.Join(anchor, "sub"))
+	writeFile(t, filepath.Join(anchor, "sub", "f"), "")
 	parent := openDir(t, parentPath)
 
-	w := newWalker(context.Background(), int(parent.Fd()), mustName("anchor"), newRecorder(t, anchor), maxDepth)
-	defer w.release()
-	opened, err := w.begin()
-	require.NoError(t, err)
-	require.True(t, opened)
-	for name, want := range map[string]uint8{"dir": unix.DT_DIR, "file": unix.DT_REG, "link": unix.DT_LNK} {
-		for _, listed := range []uint8{unix.DT_UNKNOWN, 3, 0xff} {
-			typ, present, err := w.entryType(dirent{name: name, typ: listed})
-			require.NoError(t, err)
-			require.True(t, present)
-			require.Equal(t, want, typ, "%s listed as %d", name, listed)
-		}
+	var keptTop, keptParent BorrowedDir
+	var staleChecked bool
+	visitor := funcVisitor{
+		directory: func(dir BorrowedDir, depth int) error {
+			_, err := dir.Stat()
+			require.NoError(t, err, "a lent directory works during its call")
+			if depth == 0 {
+				keptTop = dir
+				return nil
+			}
+			ran := false
+			require.Error(t, keptTop.Control(func(int) error { ran = true; return nil }),
+				"a directory lent for an earlier call is refused")
+			require.False(t, ran)
+			staleChecked = true
+			return nil
+		},
+		entry: func(parent BorrowedDir, _ string, _ uint8, _ int) error {
+			keptParent = parent
+			return nil
+		},
 	}
-	_, present, err := w.entryType(dirent{name: "vanished", typ: unix.DT_UNKNOWN})
-	require.NoError(t, err)
-	require.False(t, present)
-	typ, present, err := w.entryType(dirent{name: "anything", typ: unix.DT_SOCK})
-	require.NoError(t, err)
-	require.True(t, present)
-	require.Equal(t, uint8(unix.DT_SOCK), typ, "a known listed type is taken as is")
+	requireNoLeak(t, func() {
+		report, err := walkBeneath(context.Background(), parent, mustName("anchor"), visitor, maxDepth)
+		require.NoError(t, err)
+		require.True(t, report.Complete())
+	})
+	require.True(t, staleChecked)
+	for _, kept := range []BorrowedDir{keptTop, keptParent} {
+		ran := false
+		require.Error(t, kept.Control(func(int) error { ran = true; return nil }))
+		require.False(t, ran, "nothing runs after the walk")
+		_, err := kept.Stat()
+		require.Error(t, err)
+	}
 }
 
 // A directory whose offsets do not advance would make the walk re-read the

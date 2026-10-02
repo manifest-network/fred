@@ -14,6 +14,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+
+	"github.com/manifest-network/fred/internal/fstree/internal/at"
 )
 
 // tempDir is t.TempDir with symlinks resolved, so that it matches the paths
@@ -212,6 +214,20 @@ func (c *cancelAfter) Err() error {
 		return context.Canceled
 	}
 	return nil
+}
+
+// borrowParent runs fn with parent borrowed as the *at.Dir a remover takes,
+// the way removeBeneath borrows it.
+func borrowParent(t *testing.T, parent *os.File, fn func(p *at.Dir)) {
+	t.Helper()
+	require.NoError(t, at.Borrow(parent, fn))
+}
+
+// borrowParentView runs fn with parent borrowed as the at.View a walker
+// takes, the way walkBeneath borrows it.
+func borrowParentView(t *testing.T, parent *os.File, fn func(p at.View)) {
+	t.Helper()
+	require.NoError(t, at.BorrowView(parent, fn))
 }
 
 // drive runs r the way run does, calling between after every step that

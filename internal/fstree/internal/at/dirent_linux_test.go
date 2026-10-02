@@ -1,6 +1,6 @@
 //go:build linux
 
-package fstree
+package at
 
 import (
 	"encoding/binary"
@@ -43,7 +43,7 @@ func withReclen(rec []byte, reclen uint16) []byte {
 }
 
 func TestParseDirents(t *testing.T) {
-	long := strings.Repeat("n", maxNameLen)
+	long := strings.Repeat("n", MaxNameLen)
 	t.Run("valid records in order, dots skipped", func(t *testing.T) {
 		buf := encodeDirents(".", "..", "a", long, "...", "\xff\n")
 		out, next, err := parseDirents(buf, batchSize, nil)
@@ -96,7 +96,7 @@ func TestParseDirents(t *testing.T) {
 	for name, buf := range malformed {
 		t.Run(name, func(t *testing.T) {
 			out, _, err := parseDirents(buf, batchSize, nil)
-			require.ErrorIs(t, err, errMalformedDirent)
+			require.ErrorIs(t, err, ErrMalformedDirent)
 			for _, entry := range out {
 				require.True(t, validName(entry.name))
 			}
@@ -108,7 +108,7 @@ func TestParseDirents(t *testing.T) {
 // comes back, and each entry's cookie resumes the listing right after it.
 func TestParseDirentsReadsRealGetdentsOutput(t *testing.T) {
 	dir := tempDir(t)
-	names := []string{"a", "b c", "line\nbreak", "\xff\xfe", ".hidden", "...", strings.Repeat("L", maxNameLen)}
+	names := []string{"a", "b c", "line\nbreak", "\xff\xfe", ".hidden", "...", strings.Repeat("L", MaxNameLen)}
 	for _, name := range names {
 		writeFile(t, filepath.Join(dir, name), "")
 	}
@@ -141,12 +141,12 @@ func TestParseDirentsReadsRealGetdentsOutput(t *testing.T) {
 
 // A read that returns only "." and ".." is followed by another; the reader
 // does not mistake it for an empty directory.
-func TestDirReaderReadsPastADotOnlyRead(t *testing.T) {
+func TestReaderReadsPastADotOnlyRead(t *testing.T) {
 	dir := tempDir(t)
 	writeFile(t, filepath.Join(dir, "a"), "")
 	writeFile(t, filepath.Join(dir, "b"), "")
 	d := openDir(t, dir)
-	reader := newDirReader()
+	reader := NewReader()
 	// Room for exactly the two 24-byte dot records.
 	reader.size = 2 * 24
 
@@ -173,26 +173,62 @@ func TestDirReaderReadsPastADotOnlyRead(t *testing.T) {
 	require.Empty(t, entries)
 }
 
-func TestDirReaderSizes(t *testing.T) {
-	reader := newDirReader()
+func TestReaderSizes(t *testing.T) {
+	reader := NewReader()
 	require.Equal(t, direntBufSize, reader.size)
-	reader.shrink()
+	reader.Shrink()
 	require.Equal(t, minDirentRead, reader.size)
 	for range 10 {
-		reader.grow()
+		reader.Grow()
 	}
 	require.Equal(t, direntBufSize, reader.size)
-	reader.shrink()
-	reader.full()
+	reader.Shrink()
+	reader.Full()
 	require.Equal(t, direntBufSize, reader.size)
 }
 
+// ReadBatch binds every entry to the directory it read, for both sides, and
+// reports a directory removed while held as ENOENT.
+func TestReadBatchBindsEntriesToTheirDirectory(t *testing.T) {
+	parentPath := tempDir(t)
+	require.NoError(t, os.Mkdir(filepath.Join(parentPath, "dir"), 0o755))
+	writeFile(t, filepath.Join(parentPath, "dir", "a"), "")
+	writeFile(t, filepath.Join(parentPath, "dir", "b"), "")
+	d := openOwned(t, parentPath, "dir")
+	reader := NewReader()
+
+	listed, _, eof, err := d.ReadBatch(&reader, 0)
+	require.NoError(t, err)
+	require.False(t, eof)
+	var names []string
+	for _, entry := range listed {
+		require.Same(t, d, entry.dir)
+		names = append(names, entry.String())
+	}
+	require.ElementsMatch(t, []string{"a", "b"}, names)
+
+	viewed, next, eof, err := d.View().ReadBatch(&reader, 0)
+	require.NoError(t, err)
+	require.False(t, eof)
+	require.Len(t, viewed, 2)
+	for _, entry := range viewed {
+		require.Same(t, d, entry.dir)
+	}
+	_, _, eof, err = d.View().ReadBatch(&reader, next)
+	require.NoError(t, err)
+	require.True(t, eof)
+
+	require.NoError(t, os.RemoveAll(filepath.Join(parentPath, "dir")))
+	_, _, _, err = d.ReadBatch(&reader, 0)
+	require.ErrorIs(t, err, unix.ENOENT)
+}
+
 func TestValidName(t *testing.T) {
-	for _, name := range []string{"a", "...", ".a", "a.", " ", "\xff", strings.Repeat("n", maxNameLen)} {
+	for _, name := range []string{"a", "...", ".a", "a.", " ", "\xff", strings.Repeat("n", MaxNameLen)} {
 		require.True(t, validName(name), "%q", name)
 		require.True(t, validName([]byte(name)), "%q", name)
 	}
-	for _, name := range []string{"", ".", "..", "/", "a/b", "a/", "/a", "a\x00", strings.Repeat("n", maxNameLen+1)} {
+	for _, name := range []string{"", ".", "..", "/", "a/b", "a/", "/a", "a\x00", strings.Repeat("n", MaxNameLen+1)} {
 		require.False(t, validName(name), "%q", name)
 		require.False(t, validName([]byte(name)), "%q", name)
 	}
@@ -203,7 +239,7 @@ func TestValidName(t *testing.T) {
 func FuzzParseDirents(f *testing.F) {
 	valid := encodeDirent(1, 1, unix.DT_REG, "name")
 	f.Add(encodeDirents(".", "..", "a", "b"), uint16(batchSize))
-	f.Add(encodeDirents("a", strings.Repeat("n", maxNameLen), "\xff"), uint16(1))
+	f.Add(encodeDirents("a", strings.Repeat("n", MaxNameLen), "\xff"), uint16(1))
 	f.Add(encodeDirents(".", ".."), uint16(batchSize))
 	f.Add(valid[:direntHeader-1], uint16(batchSize))
 	f.Add(withReclen(valid, 0), uint16(batchSize))
@@ -216,7 +252,7 @@ func FuzzParseDirents(f *testing.F) {
 
 	// Real kernel output for a directory with awkward names.
 	dir := f.TempDir()
-	for _, name := range []string{"a", "line\nbreak", "\xff", strings.Repeat("L", maxNameLen)} {
+	for _, name := range []string{"a", "line\nbreak", "\xff", strings.Repeat("L", MaxNameLen)} {
 		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
 			f.Fatal(err)
 		}
@@ -238,7 +274,7 @@ func FuzzParseDirents(f *testing.F) {
 		require.LessOrEqual(t, len(out), int(limit))
 		for _, entry := range out {
 			require.NotEmpty(t, entry.name)
-			require.LessOrEqual(t, len(entry.name), maxNameLen)
+			require.LessOrEqual(t, len(entry.name), MaxNameLen)
 			require.NotContains(t, entry.name, "/")
 			require.NotContains(t, entry.name, "\x00")
 			require.False(t, isDotName(entry.name))
