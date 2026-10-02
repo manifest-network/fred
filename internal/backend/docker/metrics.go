@@ -162,6 +162,21 @@ const (
 var refuseScopes = []string{refuseScopeGlobal, refuseScopeTenant, refuseScopePartition}
 var capChecks = []string{capCheckEvict, capCheckBreach, capCheckBound, capCheckRefuseGet}
 
+// Outcome labels for volumeDeleteOutcomesTotal, one per XFS delete-stage
+// cleanup attempt (ENG-1117).
+const (
+	volumeDeleteOutcomeCompleted    = "completed"
+	volumeDeleteOutcomeHeldRemoval  = "held_removal"
+	volumeDeleteOutcomeHeldResidual = "held_residual"
+	volumeDeleteOutcomeLatched      = "latched"
+)
+
+// volumeDeleteOutcomes is the closed outcome set, pre-initialized in init.
+var volumeDeleteOutcomes = []string{
+	volumeDeleteOutcomeCompleted, volumeDeleteOutcomeHeldRemoval,
+	volumeDeleteOutcomeHeldResidual, volumeDeleteOutcomeLatched,
+}
+
 const (
 	operationRecoveryTimeoutProvision = "provision_timeout"
 )
@@ -528,17 +543,27 @@ var (
 
 	// volumeQuotaClearFailedTotal counts failed XFS quota-clear commands during
 	// interrupted-create compensation and typed deletion (ENG-459/ENG-632). It
-	// does not count the preceding block/inode usage proofs. Current typed
-	// failures are propagated and retain their durable mutation authority, which
-	// fail-stops this backend process until a fresh Start recovers it. Only an
-	// already-absent historical volume without typed authority can require the
-	// classified manual cleanup described in OPERATIONS.md.
+	// does not count the preceding block/inode usage proofs. Both keep their
+	// typed authority: a failed clear during deletion holds that one volume's
+	// deletion (reason quota_clear_failed) and the hold executor retries it
+	// (ENG-1117); a failed create compensation keeps its stage for the next
+	// Start. Only an already-absent historical volume without typed authority
+	// can require the classified manual cleanup described in OPERATIONS.md.
 	volumeQuotaClearFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "volume_quota_clear_failed_total",
-		Help:      "Failed XFS quota-clear commands during create compensation or deletion; typed authority is retained for restart recovery — see ENG-459/ENG-632",
+		Help:      "Failed XFS quota-clear commands during create compensation or deletion; the delete stage or create stage is kept and retried — see ENG-459/ENG-1117",
 	})
+
+	// volumeDeleteOutcomesTotal counts XFS delete-stage cleanup attempts by
+	// outcome, whether inline, by the hold executor, or at startup (ENG-1117).
+	volumeDeleteOutcomesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_delete_outcomes_total",
+		Help:      "XFS volume deletion attempts by outcome (completed|held_removal|held_residual|latched)",
+	}, []string{"outcome"})
 
 	// treeRemovalsTotal counts fstree removals of tenant-shaped trees by site
 	// (delete_stage: XFS deletion of a condemned volume; writable_path: the
@@ -1186,6 +1211,9 @@ func init() {
 		for _, outcome := range treeRemovalOutcomes {
 			treeRemovalsTotal.WithLabelValues(site, outcome).Add(0)
 		}
+	}
+	for _, outcome := range volumeDeleteOutcomes {
+		volumeDeleteOutcomesTotal.WithLabelValues(outcome).Add(0)
 	}
 	// Pre-init the two unlabeled partition counters to 0 so a stamp/eviction-rate
 	// query reads 0, not no-data, before the first event. Their increments are

@@ -36,10 +36,16 @@ type mockVolumeManager struct {
 	ListForProofFn                        func(context.Context) ([]string, error)
 	AttestManagedVolumeFn                 func(context.Context, managedVolumeName) error
 	RequireNoInterruptedVolumeMutationsFn func(context.Context) error
+	RequireNoUnheldVolumeMutationsFn      func(context.Context) error
 	RecoverInterruptedVolumeMutationsFn   func(context.Context) error
+	VolumeDeleteHoldsFn                   func() volumeDeleteHoldSnapshot
+	PrecheckDestroyFn                     func(managedVolumeName) (destroyPrecheckVerdict, error)
+	RetryHeldVolumeDeleteFn               func(ctx context.Context, id string) error
 	ValidateFn                            func() error
 	RenameVolumeFn                        func(oldName, newName string) error
 	UsageFn                               func(ctx context.Context, id string) (int64, error)
+
+	inlineDeletes atomic.Bool
 
 	// defaultDir is returned by Create when CreateFn is nil.
 	// Set this to t.TempDir() in tests that need real paths.
@@ -104,6 +110,36 @@ func (m *mockVolumeManager) RecoverInterruptedVolumeMutations(ctx context.Contex
 	}
 	return nil
 }
+
+func (m *mockVolumeManager) RequireNoUnheldVolumeMutations(ctx context.Context) error {
+	if m.RequireNoUnheldVolumeMutationsFn != nil {
+		return m.RequireNoUnheldVolumeMutationsFn(ctx)
+	}
+	return nil
+}
+
+func (m *mockVolumeManager) VolumeDeleteHolds() volumeDeleteHoldSnapshot {
+	if m.VolumeDeleteHoldsFn != nil {
+		return m.VolumeDeleteHoldsFn()
+	}
+	return volumeDeleteHoldSnapshot{}
+}
+
+func (m *mockVolumeManager) PrecheckDestroy(name managedVolumeName) (destroyPrecheckVerdict, error) {
+	if m.PrecheckDestroyFn != nil {
+		return m.PrecheckDestroyFn(name)
+	}
+	return destroyPrecheckNeedsLock, nil
+}
+
+func (m *mockVolumeManager) RetryHeldVolumeDelete(ctx context.Context, id string) error {
+	if m.RetryHeldVolumeDeleteFn != nil {
+		return m.RetryHeldVolumeDeleteFn(ctx, id)
+	}
+	return nil
+}
+
+func (m *mockVolumeManager) EnableInlineVolumeDeletes() { m.inlineDeletes.Store(true) }
 
 func (m *mockVolumeManager) Validate() error {
 	if m.ValidateFn != nil {

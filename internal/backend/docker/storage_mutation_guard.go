@@ -173,6 +173,7 @@ func newBackgroundMaintenanceCoordinator(
 		runRetentionSweepFn: func(ctx context.Context) error {
 			return backend.runRetentionSweepUsing(ctx, renameVolume, teardown, destroyVolumes, ensureVolumeQuota)
 		},
+		enableInlineVolumeDeletesFn: func(context.Context) { ops.volumes.EnableInlineVolumeDeletes() },
 	}, nil
 }
 

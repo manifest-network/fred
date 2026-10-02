@@ -2498,7 +2498,16 @@ func (f *fakeVolumeBackend) AttestManagedVolume(context.Context, managedVolumeNa
 	return nil
 }
 func (f *fakeVolumeBackend) RequireNoInterruptedVolumeMutations(context.Context) error { return nil }
+func (f *fakeVolumeBackend) RequireNoUnheldVolumeMutations(context.Context) error      { return nil }
 func (f *fakeVolumeBackend) RecoverInterruptedVolumeMutations(context.Context) error   { return nil }
+func (f *fakeVolumeBackend) VolumeDeleteHolds() volumeDeleteHoldSnapshot {
+	return volumeDeleteHoldSnapshot{}
+}
+func (f *fakeVolumeBackend) PrecheckDestroy(managedVolumeName) (destroyPrecheckVerdict, error) {
+	return destroyPrecheckNeedsLock, nil
+}
+func (f *fakeVolumeBackend) RetryHeldVolumeDelete(context.Context, string) error { return nil }
+func (f *fakeVolumeBackend) EnableInlineVolumeDeletes()                          {}
 
 // RenameVolume captures the rename request. Returns nil unconditionally —
 // migration tests assert on the recorded renames slice rather than on a

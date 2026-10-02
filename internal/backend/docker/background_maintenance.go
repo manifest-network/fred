@@ -24,9 +24,19 @@ type backgroundMaintenanceCoordinator struct {
 	cleanupOrphanedNetworksFn   func(context.Context)
 	reapExpiredRetentionsFn     func(context.Context) (int, error)
 	runRetentionSweepFn         func(context.Context) error
+	enableInlineVolumeDeletesFn func(context.Context)
 }
 
 var errBackgroundMaintenanceUnavailable = errors.New("background maintenance coordinator is unavailable")
+
+// enableInlineVolumeDeletes switches the volume manager out of Start's
+// deferral: a first-time deletion may then run inline under its budget.
+func (c *backgroundMaintenanceCoordinator) enableInlineVolumeDeletes(ctx context.Context) {
+	if c == nil || c.enableInlineVolumeDeletesFn == nil {
+		return
+	}
+	c.enableInlineVolumeDeletesFn(ctx)
+}
 
 func (c *backgroundMaintenanceCoordinator) recoverInterruptedVolumes(ctx context.Context) error {
 	if c == nil || c.recoverInterruptedVolumesFn == nil {

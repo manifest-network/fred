@@ -196,7 +196,23 @@ func (b *btrfsVolumeManager) AttestManagedVolume(ctx context.Context, name manag
 // namespace to reject or recover here.
 func (b *btrfsVolumeManager) RequireNoInterruptedVolumeMutations(context.Context) error { return nil }
 
+func (b *btrfsVolumeManager) RequireNoUnheldVolumeMutations(context.Context) error { return nil }
+
 func (b *btrfsVolumeManager) RecoverInterruptedVolumeMutations(context.Context) error { return nil }
+
+// btrfs deletes a subvolume in the kernel with no delete stage, so a failed
+// Destroy is an ordinary error and nothing is ever held.
+func (b *btrfsVolumeManager) VolumeDeleteHolds() volumeDeleteHoldSnapshot {
+	return volumeDeleteHoldSnapshot{}
+}
+
+func (b *btrfsVolumeManager) PrecheckDestroy(managedVolumeName) (destroyPrecheckVerdict, error) {
+	return destroyPrecheckNeedsLock, nil
+}
+
+func (b *btrfsVolumeManager) RetryHeldVolumeDelete(context.Context, string) error { return nil }
+
+func (b *btrfsVolumeManager) EnableInlineVolumeDeletes() {}
 
 // RenameVolume renames a btrfs subvolume root through the descriptor-rooted
 // VFS rename path. The btrfs kernel module treats a subvolume root as a
