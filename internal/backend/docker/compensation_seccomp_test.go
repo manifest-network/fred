@@ -3,9 +3,13 @@ package docker
 import (
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -135,11 +139,126 @@ func TestCompensationPlanForTheLargestLeaseFitsTheJournal(t *testing.T) {
 	decoded, err := decodeCompensationSourceSnapshot(encoded)
 	require.NoError(t, err)
 	require.Len(t, decoded.Containers, backend.MaxOperationQuantity)
+	require.Greater(t, backend.MaxOperationQuantity*len(inline[len(inline)-1]), journalEntryLimit,
+		"kept per instance, the profile alone would not fit")
 
+	// Records whose host configuration names a profile anyway still encode
+	// to the same plan: the encoder strips before persisting.
 	for index := range plan.Containers {
 		plan.Containers[index].Host.SecurityOpt = inline
 	}
-	unstripped, err := encodeCompensationSourcePlan(plan)
+	restripped, err := encodeCompensationSourcePlan(plan)
 	require.NoError(t, err)
-	require.Greater(t, len(unstripped), journalEntryLimit, "without the strip the same plan would not fit")
+	require.Equal(t, encoded, restripped)
+}
+
+// The plan encoder is the one persistence sink: whatever a record holds,
+// including a record built without the constructor, no persisted instance
+// names a seccomp profile, and every other option survives.
+func TestCompensationPlanEncoderPersistsNoSeccompOption(t *testing.T) {
+	inline := tenantSeccompSecurityOpt(t, "no-new-privileges:true", "label=disable")
+	record := snapshotCompensationContainer(inspectedTenantContainer(t, 0, nil), nil)
+	require.NotNil(t, record)
+	record.Platform = ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	for name, securityOpt := range map[string][]string{
+		"inline profile":      inline,
+		"unconfined appended": append(slices.Clone(inline), "seccomp:unconfined"),
+		"builtin":             {"no-new-privileges:true", "label=disable", "seccomp=builtin"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bypassed := *record
+			host := *record.Host
+			host.SecurityOpt = securityOpt
+			bypassed.Host = &host
+			encoded, err := encodeCompensationSourcePlan(compensationSourcePlan{Version: 1, Containers: []compensationContainerRecord{bypassed}})
+			require.NoError(t, err)
+			var stored storedCompensationPlan
+			require.NoError(t, json.Unmarshal(encoded, &stored))
+			require.Len(t, stored.Containers, 1)
+			require.Equal(t, []string{"no-new-privileges:true", "label=disable"}, stored.Containers[0].Host.SecurityOpt)
+			require.NotContains(t, string(encoded), "SCMP_ACT", "no profile body is persisted")
+			require.Equal(t, securityOpt, host.SecurityOpt, "encoding must not change the record")
+			decoded, err := decodeCompensationSourceSnapshot(encoded)
+			require.NoError(t, err)
+			require.Equal(t, []string{"no-new-privileges:true", "label=disable"}, decoded.Containers[0].Host.SecurityOpt)
+		})
+	}
+}
+
+// compensationRecordLiterals returns every composite literal of
+// compensationContainerRecord in file outside newCompensationContainerRecord,
+// including a slice or array literal whose elements are records built in
+// place with their type elided.
+func compensationRecordLiterals(fset *token.FileSet, file *ast.File) []string {
+	isRecord := func(expr ast.Expr) bool {
+		if star, ok := expr.(*ast.StarExpr); ok {
+			expr = star.X
+		}
+		ident, ok := expr.(*ast.Ident)
+		return ok && ident.Name == "compensationContainerRecord"
+	}
+	var findings []string
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == "newCompensationContainerRecord" {
+			continue
+		}
+		ast.Inspect(decl, func(node ast.Node) bool {
+			literal, ok := node.(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+			switch typ := literal.Type.(type) {
+			case *ast.Ident:
+				if isRecord(typ) {
+					findings = append(findings, fset.Position(literal.Pos()).String())
+				}
+			case *ast.ArrayType:
+				if isRecord(typ.Elt) && len(literal.Elts) > 0 {
+					findings = append(findings, fset.Position(literal.Pos()).String())
+				}
+			}
+			return true
+		})
+	}
+	return findings
+}
+
+// Every production record comes from newCompensationContainerRecord, so no
+// writer can keep a captured or decoded profile.
+func TestCompensationRecordsComeOnlyFromTheConstructor(t *testing.T) {
+	paths, err := filepath.Glob("*.go")
+	require.NoError(t, err)
+	scanned, constructors := 0, 0
+	var findings []string
+	for _, path := range paths {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		require.NoError(t, err)
+		scanned++
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == "newCompensationContainerRecord" {
+				constructors++
+			}
+		}
+		findings = append(findings, compensationRecordLiterals(fset, file)...)
+	}
+	require.Greater(t, scanned, 50)
+	require.Equal(t, 1, constructors)
+	require.Empty(t, findings, "build compensation records with newCompensationContainerRecord")
+
+	// Positive control: a literal outside the constructor is found, whether a
+	// value, a pointer or the elided elements of a slice; the constructor's
+	// own is not, and neither is an empty slice.
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "positive.go", `package docker
+func newCompensationContainerRecord() compensationContainerRecord { return compensationContainerRecord{} }
+func capture() *compensationContainerRecord { return &compensationContainerRecord{Name: "x"} }
+func decode() []compensationContainerRecord { return []compensationContainerRecord{{Name: "y"}, compensationContainerRecord{}} }
+func empty() []*compensationContainerRecord { return []*compensationContainerRecord{} }
+`, parser.SkipObjectResolution)
+	require.NoError(t, err)
+	require.Len(t, compensationRecordLiterals(fset, file), 3)
 }
