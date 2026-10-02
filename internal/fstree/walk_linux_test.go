@@ -77,7 +77,7 @@ func walkTypes(t *testing.T, parent *os.File, anchorPath string) map[string]uint
 	t.Helper()
 	rec := newRecorder(t, anchorPath)
 	requireNoLeak(t, func() {
-		_, err := walkBeneath(context.Background(), parent, filepath.Base(anchorPath), rec, maxDepth)
+		_, err := walkBeneath(context.Background(), parent, mustName(filepath.Base(anchorPath)), rec, maxDepth)
 		require.NoError(t, err)
 	})
 	for path, n := range rec.visits {
@@ -158,7 +158,7 @@ func TestWalkBeneathVisitsEveryEntryOnce(t *testing.T) {
 	require.Equal(t, uint8(unix.DT_SOCK), got["nested/socket"])
 
 	rec := newRecorder(t, anchor)
-	report, err := walkBeneath(context.Background(), parent, "anchor", rec, maxDepth)
+	report, err := walkBeneath(context.Background(), parent, mustName("anchor"), rec, maxDepth)
 	require.NoError(t, err)
 	require.Equal(t, 3, report.MaxDepth)
 	var dirs, entries uint64
@@ -180,12 +180,12 @@ func TestWalkBeneathStopsAtTheDepthBound(t *testing.T) {
 	buildChain(t, parent, "anchor", 20)
 
 	requireNoLeak(t, func() {
-		report, err := walkBeneath(context.Background(), parent, "anchor", newRecorder(t, filepath.Join(parentPath, "anchor")), 8)
+		report, err := walkBeneath(context.Background(), parent, mustName("anchor"), newRecorder(t, filepath.Join(parentPath, "anchor")), 8)
 		require.ErrorIs(t, err, ErrTooDeep)
 		require.Equal(t, 8, report.MaxDepth)
 	})
 	requireNoLeak(t, func() {
-		report, err := walkBeneath(context.Background(), parent, "anchor", newRecorder(t, filepath.Join(parentPath, "anchor")), 20)
+		report, err := walkBeneath(context.Background(), parent, mustName("anchor"), newRecorder(t, filepath.Join(parentPath, "anchor")), 20)
 		require.NoError(t, err)
 		require.Equal(t, WalkReport{Dirs: 21, Entries: 1, MaxDepth: 20}, report)
 	})
@@ -238,7 +238,7 @@ func TestWalkBeneathDetectsAMovedAncestor(t *testing.T) {
 				return nil
 			}}
 			requireNoLeak(t, func() {
-				_, err := walkBeneath(context.Background(), parent, "anchor", moveHeld, maxDepth)
+				_, err := walkBeneath(context.Background(), parent, mustName("anchor"), moveHeld, maxDepth)
 				require.ErrorIs(t, err, ErrTreeChanged)
 			})
 			after := snapshot(t, outside)
@@ -268,7 +268,7 @@ func TestWalkBeneathDetectsARemovedDirectory(t *testing.T) {
 		return nil
 	}}
 	requireNoLeak(t, func() {
-		_, err := walkBeneath(context.Background(), parent, "anchor", removeHeld, maxDepth)
+		_, err := walkBeneath(context.Background(), parent, mustName("anchor"), removeHeld, maxDepth)
 		require.ErrorIs(t, err, ErrTreeChanged)
 	})
 }
@@ -288,14 +288,14 @@ func TestWalkBeneathTopEntryKinds(t *testing.T) {
 	for name, want := range map[string]uint8{"file": unix.DT_REG, "link": unix.DT_LNK, "fifo": unix.DT_FIFO} {
 		rec := newRecorder(t, filepath.Join(parentPath, name))
 		requireNoLeak(t, func() {
-			report, err := walkBeneath(context.Background(), parent, name, rec, maxDepth)
+			report, err := walkBeneath(context.Background(), parent, mustName(name), rec, maxDepth)
 			require.NoError(t, err)
 			require.Equal(t, WalkReport{Entries: 1}, report)
 		})
 		require.Equal(t, map[string]uint8{".": want}, rec.types, name)
 	}
 
-	_, err := WalkBeneath(context.Background(), parent, "absent", newRecorder(t, parentPath))
+	_, err := WalkBeneath(context.Background(), parent, mustName("absent"), newRecorder(t, parentPath))
 	require.ErrorIs(t, err, fs.ErrNotExist)
 }
 
@@ -316,14 +316,14 @@ func TestWalkBeneathReturnsTheVisitorsError(t *testing.T) {
 		return nil
 	}
 	requireNoLeak(t, func() {
-		_, err := walkBeneath(context.Background(), parent, "anchor", rec, maxDepth)
+		_, err := walkBeneath(context.Background(), parent, mustName("anchor"), rec, maxDepth)
 		require.Same(t, stop, err)
 	})
 
 	rec = newRecorder(t, anchor)
 	rec.onEntry = func(string, int) error { return stop }
 	requireNoLeak(t, func() {
-		_, err := walkBeneath(context.Background(), parent, "anchor", rec, maxDepth)
+		_, err := walkBeneath(context.Background(), parent, mustName("anchor"), rec, maxDepth)
 		require.Same(t, stop, err)
 	})
 }
@@ -334,7 +334,7 @@ func TestWalkBeneathHonorsCancellation(t *testing.T) {
 	parent := openDir(t, parentPath)
 	for _, checks := range []int64{0, 1, 5, 30} {
 		requireNoLeak(t, func() {
-			_, err := walkBeneath(newCancelAfter(checks), parent, "anchor", newRecorder(t, filepath.Join(parentPath, "anchor")), maxDepth)
+			_, err := walkBeneath(newCancelAfter(checks), parent, mustName("anchor"), newRecorder(t, filepath.Join(parentPath, "anchor")), maxDepth)
 			require.ErrorIs(t, err, context.Canceled)
 		})
 	}
@@ -343,13 +343,11 @@ func TestWalkBeneathHonorsCancellation(t *testing.T) {
 func TestWalkBeneathRejectsInvalidCalls(t *testing.T) {
 	parentPath := tempDir(t)
 	parent := openDir(t, parentPath)
-	_, err := WalkBeneath(context.Background(), parent, "x", nil)
+	_, err := WalkBeneath(context.Background(), parent, mustName("x"), nil)
 	require.Error(t, err)
-	for _, name := range []string{"", ".", "..", "a/b", "nul\x00"} {
-		_, err := WalkBeneath(context.Background(), parent, name, newRecorder(t, parentPath))
-		require.ErrorIs(t, err, ErrInvalidName, "%q", name)
-	}
-	_, err = walkBeneath(context.Background(), parent, "x", newRecorder(t, parentPath), 0)
+	_, err = WalkBeneath(context.Background(), parent, Name{}, newRecorder(t, parentPath))
+	require.ErrorIs(t, err, ErrInvalidName, "the zero Name is refused")
+	_, err = walkBeneath(context.Background(), parent, mustName("x"), newRecorder(t, parentPath), 0)
 	require.Error(t, err)
 }
 
@@ -384,7 +382,7 @@ func TestWalkBeneathToleratesConcurrentWriters(t *testing.T) {
 
 	for range 3 {
 		rec := newRecorder(t, anchor)
-		_, err := walkBeneath(context.Background(), parent, "anchor", rec, maxDepth)
+		_, err := walkBeneath(context.Background(), parent, mustName("anchor"), rec, maxDepth)
 		require.NoError(t, err)
 		require.Equal(t, uint8(unix.DT_DIR), rec.types["chain"])
 	}
@@ -400,7 +398,7 @@ func TestWalkBeneathResolvesUnknownTypes(t *testing.T) {
 	require.NoError(t, os.Symlink("dir", filepath.Join(anchor, "link")))
 	parent := openDir(t, parentPath)
 
-	w := newWalker(context.Background(), int(parent.Fd()), "anchor", newRecorder(t, anchor), maxDepth)
+	w := newWalker(context.Background(), int(parent.Fd()), mustName("anchor"), newRecorder(t, anchor), maxDepth)
 	defer w.release()
 	opened, err := w.begin()
 	require.NoError(t, err)

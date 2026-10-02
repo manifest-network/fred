@@ -81,27 +81,6 @@ func parseDirents(buf []byte, limit int, out []dirent) ([]dirent, int64, error) 
 	return out, next, nil
 }
 
-// isDotName reports whether name is "." or "..".
-func isDotName[T ~string | ~[]byte](name T) bool {
-	return (len(name) == 1 && name[0] == '.') ||
-		(len(name) == 2 && name[0] == '.' && name[1] == '.')
-}
-
-// validName reports whether name is one path component a *at syscall
-// resolves inside its directory descriptor: 1 to NAME_MAX bytes, free of '/'
-// and NUL, and neither "." nor "..".
-func validName[T ~string | ~[]byte](name T) bool {
-	if len(name) == 0 || len(name) > maxNameLen || isDotName(name) {
-		return false
-	}
-	for i := range len(name) {
-		if name[i] == '/' || name[i] == 0 {
-			return false
-		}
-	}
-	return true
-}
-
 // dirReader reads one directory batch at a time into a buffer it reuses. Its
 // read size adapts: full for a directory just entered, small after an
 // ascent, when usually only the emptied child and its next sibling matter,

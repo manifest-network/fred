@@ -11,10 +11,12 @@
 //     directory, everything beneath it.
 //   - WalkBeneath visits the same entries read-only, for audits.
 //
-// Both take the parent as an open directory and the entry as a single path
-// component, and act only through descriptor-relative syscalls. They never
-// build a path, so no path-length limit applies, and an error message carries
-// at most 64 bytes of one entry name plus its depth.
+// Both take the parent as an open directory and the entry as a Name, and act
+// only through descriptor-relative syscalls. A Name is a single path
+// component, and ParseName is the only way to build one, so a path cannot be
+// passed where an entry is expected. They never build a path, so no
+// path-length limit applies, and an error message carries at most 64 bytes of
+// one entry name plus its depth.
 //
 // # Precondition
 //
@@ -47,9 +49,11 @@
 // next scan of the parent removes it. When entering the child would take the
 // stack past 65,536 levels, RemoveBeneath instead moves the child into the
 // anchor under a fresh ".fred-cut-" name (a cut) and removes it later from the
-// top, so the stack never outgrows its bound. Last, it removes the anchor
-// itself, but only while the parent's name still binds the directory it
-// emptied.
+// top, so the stack never outgrows its bound. Immediately before the call's
+// first cut, and never in a call that needs none, it runs the caller's
+// RemoveOptions.BeforeFirstCut on the anchor; a failure there refuses the cut
+// (ErrCutRefused). Last, it removes the anchor itself, but only while the
+// parent's name still binds the directory it emptied.
 //
 // WalkBeneath resumes each directory at the getdents offset recorded on the
 // way down, and returns ErrTooDeep where RemoveBeneath would cut.
@@ -65,7 +69,8 @@
 //     every open uses O_NOFOLLOW, and the anchor's name is checked with
 //     AT_SYMLINK_NOFOLLOW.
 //   - I3 Mounts are never crossed: the anchor must share its parent's device
-//     and mount, and every directory entered must share the anchor's. The
+//     and mount, checked before anything in it is touched or BeforeFirstCut
+//     can run, and every directory entered must share the anchor's. The
 //     mount ID catches a bind mount of the same filesystem, which st_dev alone
 //     misses; kernels older than Linux 5.8 do not report it, and there only
 //     the device is compared. A mount point inside the tree cannot be removed
@@ -77,9 +82,11 @@
 //   - I5 Idempotence: a rerun continues from what is on disk. Cut subtrees are
 //     ordinary children of the anchor.
 //   - I6 Failure keeps bytes: an error stops the call at once with a typed,
-//     wrapped error, and nothing more is removed. Only an entry that vanished
-//     or changed type after it was listed is passed over, for the next scan
-//     to see as it is now.
+//     wrapped error, and nothing more is removed. A refused cut, whether the
+//     rename or BeforeFirstCut failed, is such an error: what was removed
+//     before the depth bound was reached stays removed, and nothing is cut.
+//     Only an entry that vanished or changed type after it was listed is
+//     passed over, for the next scan to see as it is now.
 //
 // # Resource bounds
 //
