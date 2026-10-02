@@ -58,7 +58,11 @@ func Labels() []string {
 }
 
 // Termination is the substrate's positive observation of how a dead instance
-// ended. The zero value is an unknown termination, which never counts.
+// ended. The substrate's own adapter mints it while translating its
+// inspection, because only the substrate knows which of its terminal states
+// is an observed workload exit (a Kubernetes container terminated with an exit
+// code is Exited even when its phase reads failed). The zero value is an
+// unknown termination, which never counts.
 type Termination struct{ kind terminationKind }
 
 type terminationKind uint8
@@ -82,11 +86,15 @@ func Exited() Termination { return Termination{kind: terminationExited} }
 // absent. Its end was not observed as a workload exit, so it never counts.
 func Gone() Termination { return Termination{kind: terminationGone} }
 
-// ClassifyDeath attributes one observed instance death. It is the only
+// ClassifyDeath attributes one observed death of instanceID. It is the only
 // constructor of a counting Cause: the death must have been delivered live by
 // an event stream that observed the whole run and no API signal to it, and the
-// substrate must have observed an exit with a status.
-func ClassifyDeath(provenance Provenance, termination Termination) Cause {
+// substrate must have observed an exit with a status. A provenance minted for
+// another instance is ignored, as if the death had no live event.
+func ClassifyDeath(instanceID string, provenance Provenance, termination Termination) Cause {
+	if instanceID == "" || provenance.instanceID != instanceID {
+		provenance = Provenance{}
+	}
 	switch {
 	case provenance.kind == provenanceSignaled, termination.kind == terminationGone:
 		return Cause{kind: causeDisruption}

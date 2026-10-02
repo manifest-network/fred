@@ -21,5 +21,10 @@
 // fields, so neither the state machine nor a substrate can mint a counting
 // Cause from an integer or a literal. ClassifyDeath is the only constructor of
 // a counting Cause, and it additionally requires a Provenance that only an
-// EventSession mints from one continuous event stream.
+// event session mints from one continuous event stream, bound to the instance
+// whose death it observed. The session type is unexported, so it cannot leave
+// the frame of the reader that consumes the stream; internal/testutil confines
+// its constructor and methods to the Docker event loop's reader, and
+// ClassifyDeath to the state machine's death entry action. Whether a dead
+// instance exited or is gone (Termination) is the substrate adapter's call.
 package failurecause

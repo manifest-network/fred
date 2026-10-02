@@ -219,21 +219,16 @@ func (p *ProvisionState) budgetResetByTenant() {
 	budget.lastFailureCounted = false
 }
 
-// deathTermination maps the death guard's fresh substrate inspection to the
-// classifier's input. Only an exited instance that reported a status is an
-// observed exit; removing, dead and positively absent instances are gone;
-// anything else is unknown and never counts.
+// deathTermination reads the substrate's own classification of a dead
+// instance from the death guard's fresh inspection. The substrate adapter
+// mints it (InstanceState.Termination) because only it knows which of its
+// terminal states is an observed workload exit; this package never infers it
+// from Phase. A missing inspection is unknown and never counts.
 func deathTermination(info *InstanceState) failurecause.Termination {
-	switch {
-	case info == nil:
-		return failurecause.Termination{}
-	case info.Phase == PhaseFailed || info.Phase == PhaseAbsent:
-		return failurecause.Gone()
-	case info.Phase == PhaseExited && info.ExitCode != nil:
-		return failurecause.Exited()
-	default:
+	if info == nil {
 		return failurecause.Termination{}
 	}
+	return info.Termination
 }
 
 // observeBudgetOutcome emits the side effects of one recorded failure after

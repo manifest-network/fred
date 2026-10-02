@@ -632,9 +632,10 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	leaseUUID := lsm.actor.leaseUUID
 	info := lsm.actor.pendingDeathInfo
 	// The only budget-counting site. The cause is attributed from the guard's
-	// fresh inspection and the death's provenance; FailCount stays a lifetime
-	// diagnostic of every death, counted or not.
-	cause := failurecause.ClassifyDeath(provenance, deathTermination(info))
+	// fresh inspection and the death's provenance, which counts only if it was
+	// minted for this very container; FailCount stays a lifetime diagnostic of
+	// every death, counted or not.
+	cause := failurecause.ClassifyDeath(containerID, provenance, deathTermination(info))
 	now := time.Now()
 
 	// No Status recheck needed (ENG-230). Off-actor Status writes for

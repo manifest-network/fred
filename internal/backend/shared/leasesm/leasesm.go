@@ -30,6 +30,13 @@ import (
 // Kubernetes pod status legitimately enters Unknown — defaulting to
 // any other phase would silently misclassify those cases as Running,
 // Exited, or Failed.
+//
+// Phase decides only whether an instance is terminal (the death guard). It
+// never decides whether a death counts against the terminal budget: that reads
+// InstanceState.Termination, which the substrate adapter mints itself, because
+// the mapping differs per substrate (Docker's PhaseFailed is a container being
+// removed or dead, while a Kubernetes container terminated with an exit code
+// reports PhaseFailed and is still the workload's own exit).
 type Phase int
 
 const (
@@ -85,6 +92,12 @@ type InstanceState struct {
 	FinishedAt  time.Time // zero value when still running
 	Reason      string    // substrate-specific termination reason ("OOMKilled", "Error", etc.)
 	ServiceName string    // per-instance service name in a multi-service deployment; "" when not applicable
+	// Termination is the substrate adapter's own classification of a dead
+	// instance for the terminal budget (ENG-799): failurecause.Exited for an
+	// exit that reported a status, failurecause.Gone for an instance being
+	// removed, dead or positively absent. Its zero value is unknown and never
+	// counts, so an adapter that does not classify can only delay a close.
+	Termination failurecause.Termination
 }
 
 // InstanceInspector wraps the substrate-specific "inspect this

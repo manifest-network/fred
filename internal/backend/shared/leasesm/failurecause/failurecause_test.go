@@ -5,8 +5,10 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -38,13 +40,16 @@ func TestCauseVocabularyIsClosed(t *testing.T) {
 }
 
 func TestClassifyDeath(t *testing.T) {
-	provenances := map[provenanceKind]Provenance{
-		provenanceUnobserved:  {},
-		provenancePartialRun:  {kind: provenancePartialRun},
-		provenanceSignaled:    {kind: provenanceSignaled},
-		provenanceObservedRun: {kind: provenanceObservedRun},
-		provenanceSentinel:    {kind: provenanceSentinel},
-		255:                   {kind: 255},
+	provenances := map[string]Provenance{
+		"unobserved":     {kind: provenanceUnobserved},
+		"partial_run":    {kind: provenancePartialRun, instanceID: "c1"},
+		"signaled":       {kind: provenanceSignaled, instanceID: "c1"},
+		"observed_run":   {kind: provenanceObservedRun, instanceID: "c1"},
+		"sentinel":       {kind: provenanceSentinel, instanceID: "c1"},
+		"kind255":        {kind: 255, instanceID: "c1"},
+		"other instance": {kind: provenanceObservedRun, instanceID: "c2"},
+		"other signaled": {kind: provenanceSignaled, instanceID: "c2"},
+		"unbound":        {kind: provenanceObservedRun},
 	}
 	terminations := map[string]Termination{
 		"unknown": {kind: terminationUnknown},
@@ -52,30 +57,28 @@ func TestClassifyDeath(t *testing.T) {
 		"gone":    Gone(),
 		"bogus":   {kind: 255},
 	}
-	for provenanceName, provenance := range provenances {
-		for terminationName, termination := range terminations {
-			name := fmt.Sprintf("%s/%s", provenance.Label(), terminationName)
-			if provenanceName >= provenanceSentinel {
-				name = fmt.Sprintf("kind%d/%s", provenanceName, terminationName)
+	for _, instance := range []string{"c1", ""} {
+		for provenanceName, provenance := range provenances {
+			for terminationName, termination := range terminations {
+				t.Run(fmt.Sprintf("%q/%s/%s", instance, provenanceName, terminationName), func(t *testing.T) {
+					got := ClassifyDeath(instance, provenance, termination)
+					bound := instance != "" && provenance.instanceID == instance
+					switch {
+					case (bound && provenanceName == "signaled") || terminationName == "gone":
+						assert.Equal(t, "disruption", got.Label())
+					case bound && provenanceName == "observed_run" && terminationName == "exited":
+						assert.Equal(t, "tenant_workload", got.Label())
+						assert.True(t, got.Counts())
+					default:
+						assert.Equal(t, "unknown", got.Label())
+					}
+					if got.Counts() {
+						assert.True(t, bound, "only a provenance minted for this instance may count")
+						assert.Equal(t, "observed_run", provenanceName)
+						assert.Equal(t, "exited", terminationName)
+					}
+				})
 			}
-			t.Run(name, func(t *testing.T) {
-				got := ClassifyDeath(provenance, termination)
-				switch {
-				case provenanceName == provenanceSignaled || terminationName == "gone":
-					assert.Equal(t, "disruption", got.Label())
-				case provenanceName == provenanceObservedRun && terminationName == "exited":
-					assert.Equal(t, "tenant_workload", got.Label())
-					assert.True(t, got.Counts())
-				default:
-					assert.Equal(t, "unknown", got.Label())
-				}
-				if got.Counts() {
-					assert.Equal(t, provenanceObservedRun, provenanceName,
-						"only a fully observed, unsignaled run may count")
-					assert.Equal(t, "exited", terminationName,
-						"only an observed exit may count")
-				}
-			})
 		}
 	}
 }
@@ -113,7 +116,9 @@ func TestEventSessionAttributesEachRun(t *testing.T) {
 				case "kill":
 					session.ObserveSignal("c1")
 				case "die":
-					got = append(got, session.ObserveExit("c1").Label())
+					provenance := session.ObserveExit("c1")
+					assert.Equal(t, "c1", provenance.InstanceID(), "minted for the instance that died")
+					got = append(got, provenance.Label())
 				}
 			}
 			assert.Equal(t, test.want, got)
@@ -131,7 +136,7 @@ func TestEventSessionIsOneContinuousStream(t *testing.T) {
 	after := NewEventSession()
 	assert.Equal(t, "partial_run", after.ObserveExit("c1").Label())
 
-	var missing *EventSession
+	var missing *eventSession
 	missing.ObserveStart("c1")
 	missing.ObserveSignal("c1")
 	assert.Equal(t, "partial_run", missing.ObserveExit("c1").Label(),
@@ -139,8 +144,20 @@ func TestEventSessionIsOneContinuousStream(t *testing.T) {
 
 	empty := NewEventSession()
 	empty.ObserveStart("")
-	assert.Equal(t, "partial_run", empty.ObserveExit("").Label())
+	assert.Equal(t, Provenance{}, empty.ObserveExit(""), "no instance, no provenance")
 	assert.Equal(t, "unobserved", Provenance{}.Label())
+	assert.Empty(t, Provenance{}.InstanceID())
+}
+
+// A session that did not come from NewEventSession tracks nothing, so it can
+// never vouch for a whole run.
+func TestZeroEventSessionIsInert(t *testing.T) {
+	assert.NotPanics(t, func() {
+		session := &eventSession{}
+		session.ObserveStart("c1")
+		session.ObserveSignal("c1")
+		assert.Equal(t, "partial_run", session.ObserveExit("c1").Label())
+	})
 }
 
 func TestEventSessionBoundsTrackedRuns(t *testing.T) {
@@ -159,7 +176,7 @@ func TestEventSessionBoundsTrackedRuns(t *testing.T) {
 }
 
 func TestSealedTypesExportNoFields(t *testing.T) {
-	for _, value := range []any{Cause{}, Provenance{}, Termination{}, EventSession{}} {
+	for _, value := range []any{Cause{}, Provenance{}, Termination{}, eventSession{}} {
 		typeOf := reflect.TypeOf(value)
 		for index := range typeOf.NumField() {
 			assert.Falsef(t, typeOf.Field(index).IsExported(),
@@ -169,62 +186,122 @@ func TestSealedTypesExportNoFields(t *testing.T) {
 }
 
 // The counting kinds may be named only by the functions allowed to mint or
-// read them. A package-external caller cannot name them at all; this pins the
-// in-package surface so a new helper cannot quietly mint a counting cause.
-// Methods are keyed by receiver type.
+// read them, and a non-empty Cause, Provenance or Termination literal may be
+// built only by its minters. A package-external caller cannot name any of
+// them at all; this pins the in-package surface, across every production file
+// and declaration, so a new helper cannot quietly mint a counting value, from
+// a constant, an integer or a package-level var. Methods are keyed by
+// receiver type.
 var countingKindReferences = map[string][]string{
 	"causeTenantWorkload":   {"ClassifyDeath", "Cause.Counts", "Cause.Label"},
-	"provenanceObservedRun": {"ClassifyDeath", "EventSession.ObserveExit", "Provenance.Label"},
+	"provenanceObservedRun": {"ClassifyDeath", "eventSession.ObserveExit", "Provenance.Label"},
+	"terminationExited":     {"Exited", "ClassifyDeath"},
 }
 
-func TestCountingKindsNamedOnlyByTheirMinters(t *testing.T) {
+var literalMinters = map[string][]string{
+	"Cause":       {"Platform", "Maintenance", "Labels", "ClassifyDeath"},
+	"Provenance":  {"eventSession.ObserveExit"},
+	"Termination": {"Exited", "Gone"},
+}
+
+func TestCountingValuesMintedOnlyByTheirMinters(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	require.NoError(t, err)
 	fset := token.NewFileSet()
 	var findings []string
-	for _, file := range []string{"failurecause.go", "provenance.go"} {
-		parsed, err := parser.ParseFile(fset, file, nil, parser.SkipObjectResolution)
+	checked := 0
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
 		require.NoError(t, err)
-		findings = append(findings, countingKindViolations(fset, parsed)...)
+		findings = append(findings, mintingViolations(fset, parsed)...)
+		checked++
 	}
+	require.GreaterOrEqual(t, checked, 3, "the guard must scan every production file")
 	assert.Empty(t, findings)
 }
 
-func TestCountingKindGuardFires(t *testing.T) {
+func TestMintingGuardFires(t *testing.T) {
 	const src = `package failurecause
+var forged = Cause{kind: 1}
 func helper() Cause { return Cause{kind: causeTenantWorkload} }
-func (s *EventSession) ObserveExit() Provenance { return Provenance{kind: provenanceObservedRun} }
+func (s *eventSession) ObserveExit() Provenance { return Provenance{kind: provenanceObservedRun} }
 func (c Cause) Label() string { _ = provenanceObservedRun; return "" }
 func ClassifyDeath() Cause { return Cause{kind: causeTenantWorkload} }
+func shift(c Cause) Cause { c.kind = causeUnknown + 1; return c }
+func rebind(p Provenance) Provenance { p.instanceID = "other"; return p }
+func exitedAgain() Termination { return Termination{terminationExited} }
+func zeroIsFine() Provenance { return Provenance{} }
 `
 	fset := token.NewFileSet()
 	parsed, err := parser.ParseFile(fset, "synthetic.go", src, parser.SkipObjectResolution)
 	require.NoError(t, err)
-	findings := countingKindViolations(fset, parsed)
-	require.Len(t, findings, 2, "both forged references must be reported: %v", findings)
-	assert.Contains(t, findings[0], "helper names causeTenantWorkload")
-	assert.Contains(t, findings[1], "Cause.Label names provenanceObservedRun",
-		"a method with an allowed name on the wrong receiver must still be reported")
+	findings := mintingViolations(fset, parsed)
+	for _, want := range []string{
+		"synthetic.go:2:14: package-level var builds a Cause",
+		"synthetic.go:3:30: helper builds a Cause",
+		"helper names causeTenantWorkload",
+		"Cause.Label names provenanceObservedRun",
+		"shift writes kind",
+		"rebind writes instanceID",
+		"exitedAgain builds a Termination",
+		"exitedAgain names terminationExited",
+	} {
+		assert.True(t, slices.ContainsFunc(findings, func(f string) bool { return strings.Contains(f, want) }),
+			"missing %q in %q", want, findings)
+	}
+	assert.Len(t, findings, 8, "the sanctioned shapes stay silent: %q", findings)
 }
 
-func countingKindViolations(fset *token.FileSet, file *ast.File) []string {
+func mintingViolations(fset *token.FileSet, file *ast.File) []string {
 	var findings []string
-	for _, decl := range file.Decls {
-		function, ok := decl.(*ast.FuncDecl)
-		if !ok {
-			continue // the const block declaring the kinds
-		}
-		key := functionKey(function)
-		ast.Inspect(function, func(node ast.Node) bool {
-			ident, ok := node.(*ast.Ident)
-			if !ok {
-				return true
-			}
-			allowed, tracked := countingKindReferences[ident.Name]
-			if tracked && !slices.Contains(allowed, key) {
-				findings = append(findings, fmt.Sprintf("%s: %s names %s",
-					fset.Position(ident.Pos()), key, ident.Name))
+	inspect := func(key string, root ast.Node) {
+		ast.Inspect(root, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.Ident:
+				allowed, tracked := countingKindReferences[typed.Name]
+				if tracked && !slices.Contains(allowed, key) {
+					findings = append(findings, fmt.Sprintf("%s: %s names %s",
+						fset.Position(typed.Pos()), key, typed.Name))
+				}
+			case *ast.CompositeLit:
+				typeName, ok := typed.Type.(*ast.Ident)
+				if !ok || len(typed.Elts) == 0 {
+					return true
+				}
+				if minters, sealed := literalMinters[typeName.Name]; sealed && !slices.Contains(minters, key) {
+					where := key
+					if where == "" {
+						where = "package-level var"
+					}
+					findings = append(findings, fmt.Sprintf("%s: %s builds a %s",
+						fset.Position(typed.Pos()), where, typeName.Name))
+				}
+			case *ast.AssignStmt:
+				for _, lhs := range typed.Lhs {
+					if selector, ok := lhs.(*ast.SelectorExpr); ok &&
+						(selector.Sel.Name == "kind" || selector.Sel.Name == "instanceID") {
+						findings = append(findings, fmt.Sprintf("%s: %s writes %s",
+							fset.Position(selector.Pos()), key, selector.Sel.Name))
+					}
+				}
 			}
 			return true
 		})
+	}
+	for _, decl := range file.Decls {
+		function, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			general, isGeneral := decl.(*ast.GenDecl)
+			if isGeneral && general.Tok == token.CONST {
+				continue // the const blocks declaring the kinds
+			}
+			inspect("", decl)
+			continue
+		}
+		inspect(functionKey(function), function)
 	}
 	return findings
 }
