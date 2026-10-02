@@ -66,6 +66,171 @@ func TestVolumeDeleteHoldPassRetriesDueHoldsInOrderWithinBudget(t *testing.T) {
 	})
 }
 
+// One pass runs attempts of different leases in parallel, up to its worker
+// bound, so one very large deletion cannot serialize every other lease's; two
+// holds of the same lease never run at once.
+func TestVolumeDeleteHoldPassRunsDifferentLeasesInParallel(t *testing.T) {
+	const leaseA = "550e8400-e29b-41d4-a716-446655440011"
+	const leaseB = "550e8400-e29b-41d4-a716-446655440012"
+	a0, a1 := canonicalVolumeName(leaseA, "app", 0), canonicalVolumeName(leaseA, "app", 1)
+	b0 := canonicalVolumeName(leaseB, "app", 0)
+	base := time.Now().Add(-time.Hour)
+	holds := volumeDeleteHoldSnapshot{holds: map[string]volumeDeleteHoldView{
+		a0: dueHold(t, a0, base), a1: dueHold(t, a1, base.Add(time.Minute)), b0: dueHold(t, b0, base.Add(2*time.Minute)),
+	}}
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.volumes = &mockVolumeManager{VolumeDeleteHoldsFn: func() volumeDeleteHoldSnapshot { return holds }}
+
+	var mu sync.Mutex
+	active := map[string]int{}
+	running, peak := 0, 0
+	sameLeaseOverlap := false
+	proceed := make(chan struct{})
+	retry := backgroundHeldVolumeDeleteRetry(func(ctx context.Context, name string) error {
+		parsed, err := parseManagedVolumeName(name)
+		require.NoError(t, err)
+		lease := managedVolumeLeaseUUID(parsed)
+		mu.Lock()
+		active[lease]++
+		sameLeaseOverlap = sameLeaseOverlap || active[lease] > 1
+		running++
+		peak = max(peak, running)
+		mu.Unlock()
+		select {
+		case <-proceed:
+		case <-ctx.Done():
+		}
+		mu.Lock()
+		active[lease]--
+		running--
+		mu.Unlock()
+		return nil
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), volumeDeleteHoldPassBudget)
+	defer cancel()
+	reports := make(chan volumeDeleteHoldPassReport, 1)
+	go func() { reports <- b.runVolumeDeleteHoldPass(ctx, time.Now(), retry) }()
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return peak >= 2
+	}, 10*time.Second, 5*time.Millisecond, "two leases' attempts run at once")
+	close(proceed)
+	report := <-reports
+	assert.Equal(t, 3, report.attempted)
+	assert.False(t, sameLeaseOverlap, "two holds of one lease never run at once")
+	assert.Equal(t, 2, peak, "no more attempts run at once than the worker bound")
+}
+
+// A pass that moved a hold forward is followed at once by the next; a pass
+// that did not waits for the executor's interval.
+func TestVolumeDeleteHoldLoopStartsTheNextPassAtOnceAfterProgress(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b := newBackendForTest(&mockDockerClient{}, nil)
+		var passes atomic.Int32
+		b.backgroundMaintenance = &backgroundMaintenanceCoordinator{
+			retryHeldVolumeDeletesFn: func(context.Context) volumeDeleteHoldPassReport {
+				return volumeDeleteHoldPassReport{progressed: passes.Add(1) <= 3}
+			},
+		}
+		b.wg.Go(b.volumeDeleteHoldLoop)
+		synctest.Wait()
+		require.Equal(t, int32(4), passes.Load(), "three progressing passes are followed at once, the fourth waits")
+		time.Sleep(volumeDeleteHoldInterval)
+		synctest.Wait()
+		require.Equal(t, int32(5), passes.Load())
+		b.stopCancel()
+		b.wg.Wait()
+	})
+}
+
+// A hold whose attempts never reach the manager keeps its stale lastAttempt,
+// yet still rotates behind the others: the executor orders by its own
+// dispatch record too, so the holds a pass could not fit go first next time.
+func TestVolumeDeleteHoldPassRotatesHoldsThatNeverReachTheManager(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		holds := volumeDeleteHoldSnapshot{holds: map[string]volumeDeleteHoldView{}}
+		names := make([]string, 10)
+		for i := range names {
+			names[i] = canonicalVolumeName(fmt.Sprintf("550e8400-e29b-41d4-a716-4466554%05d", 41000+i), "app", 0)
+			holds.holds[names[i]] = dueHold(t, names[i], time.Time{})
+		}
+		b := newBackendForTest(&mockDockerClient{}, nil)
+		b.volumes = &mockVolumeManager{VolumeDeleteHoldsFn: func() volumeDeleteHoldSnapshot { return holds }}
+		var mu sync.Mutex
+		var order []string
+		retry := backgroundHeldVolumeDeleteRetry(func(ctx context.Context, name string) error {
+			mu.Lock()
+			order = append(order, name)
+			mu.Unlock()
+			<-ctx.Done() // every attempt uses its whole slice and records nothing
+			return ctx.Err()
+		})
+		pass := func() volumeDeleteHoldPassReport {
+			ctx, cancel := context.WithTimeout(t.Context(), volumeDeleteHoldPassBudget)
+			defer cancel()
+			return b.runVolumeDeleteHoldPass(ctx, time.Now(), retry)
+		}
+		first := pass()
+		require.Equal(t, 8, first.attempted, "a 60 s pass fits four rounds of two 15 s attempts")
+		assert.False(t, first.progressed, "attempts that never reached the manager are no progress")
+		assert.ElementsMatch(t, names[:8], order)
+		order = nil
+		second := pass()
+		require.GreaterOrEqual(t, second.attempted, 2)
+		assert.ElementsMatch(t, names[8:], order[:2], "the holds the first pass could not fit go first")
+	})
+}
+
+// The executor classifies an attempt from the hold before and after it.
+func TestClassifyHeldDeleteAttempt(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	parsed, err := parseManagedVolumeName(xfsStageTestVolume)
+	require.NoError(t, err)
+	before := volumeDeleteHoldView{volume: parsed, stage: "stage", reason: holdReasonRecovered, attempts: 1}
+	with := func(edit func(*volumeDeleteHoldView)) volumeDeleteHoldView {
+		view := before
+		view.attempts = 2
+		edit(&view)
+		return view
+	}
+	for _, tc := range []struct {
+		name      string
+		after     volumeDeleteHoldView
+		stillHeld bool
+		want      heldDeleteAttempt
+	}{
+		{"completed", volumeDeleteHoldView{}, false, heldDeleteAttempt{progressed: true, releasedCaller: true}},
+		{"never reached the manager", before, true, heldDeleteAttempt{}},
+		{"slice ran out while progressing", with(func(v *volumeDeleteHoldView) {
+			v.reason, v.nextAttempt = holdReasonDeadline, now
+		}), true, heldDeleteAttempt{progressed: true}},
+		{"refused and backing off", with(func(v *volumeDeleteHoldView) {
+			v.reason, v.nextAttempt = holdReasonUndeletable, now.Add(time.Minute)
+		}), true, heldDeleteAttempt{}},
+		{"phase changed", with(func(v *volumeDeleteHoldView) {
+			v.phase, v.reason, v.nextAttempt = holdPhaseUnsized, holdReasonUsageUnprovable, now
+		}), true, heldDeleteAttempt{progressed: true}},
+		{"left the removal phase", with(func(v *volumeDeleteHoldView) {
+			v.phase, v.reason, v.nextAttempt = holdPhaseResidual, holdReasonUsageNonzero, now.Add(time.Minute)
+		}), true, heldDeleteAttempt{progressed: true, releasedCaller: true}},
+		{"a different stage", with(func(v *volumeDeleteHoldView) { v.stage = "other" }), true, heldDeleteAttempt{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, classifyHeldDeleteAttempt(before, tc.after, tc.stillHeld, now))
+		})
+	}
+	unsized := before
+	unsized.phase = holdPhaseUnsized
+	stillUnsized := unsized
+	stillUnsized.attempts, stillUnsized.reason, stillUnsized.nextAttempt = 2, holdReasonUsageUnprovable, now
+	assert.Equal(t, heldDeleteAttempt{}, classifyHeldDeleteAttempt(unsized, stillUnsized, true, now),
+		"an unsized hold that stays unsized is no progress, so a broken quota report cannot spin the executor")
+}
+
 // The executor's retry takes only its own lease's namespace, exclusively, and
 // never the global recovery gate: another lease mutates freely while a slice
 // runs, and the same lease waits.
@@ -218,6 +383,51 @@ func TestVolumeDeleteHoldExecutorResumesTheCloseWhenAHoldLeavesRemoval(t *testin
 	_, found, err = stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
 	require.NoError(t, err)
 	assert.False(t, found, "the executor resumed and completed the close")
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
+// A close resume that finds its lease's command fence busy is owed, not
+// dropped: the command holding the fence may have answered from the state
+// before the hold ended, so the next pass resumes the close.
+func TestVolumeDeleteHoldExecutorRetriesACloseResumeItFoundBusy(t *testing.T) {
+	dir := t.TempDir()
+	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, &mockVolumeManager{})
+	seedCloseDeprovisionLease(t, b, stores)
+	name := canonicalVolumeName(closeDeprovisionLeaseUUID, "app", 0)
+	var held atomic.Bool
+	held.Store(true)
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			if held.Load() {
+				return []string{name}, nil
+			}
+			return nil, nil
+		},
+		DestroyFn: func(context.Context, string) error {
+			if held.Load() {
+				return heldDeleteErr(name)
+			}
+			return nil
+		},
+	}
+	installTestStorageMutationAdapters(b)
+	require.Error(t, b.doDeprovisionForTest(t, t.Context(), closeDeprovisionLeaseUUID))
+	parsed, err := parseManagedVolumeName(name)
+	require.NoError(t, err)
+
+	held.Store(false) // the hold executor finished the deletion
+	unlock := b.commandFence.Lock(closeDeprovisionLeaseUUID)
+	b.resumeClosesAfterHeldDeletes([]managedVolumeName{parsed})
+	unlock()
+	_, found, err := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
+	require.NoError(t, err)
+	require.True(t, found, "a busy lease is not resumed")
+
+	b.resumeClosesAfterHeldDeletes(nil) // the next pass
+	_, found, err = stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
+	require.NoError(t, err)
+	assert.False(t, found, "the owed resume completed the close on the next pass")
+	assert.Empty(t, b.holdExecutor.takeResumes(), "a completed resume is no longer owed")
 	closeCloseRecoveryBackend(t, b, stores)
 }
 

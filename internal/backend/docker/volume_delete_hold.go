@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -58,6 +60,10 @@ const (
 	volumeDeleteHoldSlice = 15 * time.Second
 	// volumeDeleteHoldMinSlice is the least budget worth starting an attempt.
 	volumeDeleteHoldMinSlice = time.Second
+	// volumeDeleteHoldWorkers bounds how many attempts one pass runs at once.
+	// Two attempts never share a lease (they would contend for its namespace
+	// lock), so one very large deletion cannot serialize every other lease's.
+	volumeDeleteHoldWorkers = 2
 	// volumeDeleteHoldResumeBudget bounds the close resumes a pass enqueues
 	// for leases whose holds stopped holding their caller.
 	volumeDeleteHoldResumeBudget = 30 * time.Second
@@ -328,13 +334,142 @@ type volumeDeleteHoldPassReport struct {
 	// the pass (completed, or durably gone, sized and residual): their callers
 	// can now settle.
 	leftRemoval []managedVolumeName
+	// progressed is set when an attempt reached the manager and moved its
+	// hold forward: it completed, changed phase, or ran out of its slice
+	// while still progressing. The executor then starts its next pass at once
+	// instead of waiting for its interval.
+	progressed bool
 }
 
-// runVolumeDeleteHoldPass retries the due holds, least recently attempted
-// first, one bounded slice each, until ctx (the pass budget) runs out. Each
-// retry runs through retry, which the composition binds to the storage-mutation
-// bracket under the hold's lease namespace; it never takes the global
-// recovery gate, so one hold never stalls another lease.
+// volumeDeleteHoldExecutorState is the hold executor's own memory: when it
+// last dispatched each hold, so that a hold whose attempts fail before they
+// reach the manager (and so never update the hold's lastAttempt) still
+// rotates behind the others; and the leases whose close resume found the
+// lease busy, retried on the next pass.
+type volumeDeleteHoldExecutorState struct {
+	mu             sync.Mutex
+	lastDispatched map[string]time.Time
+	pendingResumes map[string]struct{}
+}
+
+// dispatched records that hold name was handed to an attempt at now.
+func (s *volumeDeleteHoldExecutorState) dispatched(name string, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastDispatched == nil {
+		s.lastDispatched = make(map[string]time.Time)
+	}
+	s.lastDispatched[name] = now
+}
+
+// order sorts due in place for dispatch: unsized holds first (they withhold
+// disk admission), then by the later of the manager's last attempt and this
+// executor's last dispatch, oldest first, then by name. It forgets the
+// dispatch times of names no longer held.
+func (s *volumeDeleteHoldExecutorState) order(due []volumeDeleteHoldView, held volumeDeleteHoldSnapshot) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for name := range s.lastDispatched {
+		if _, ok := held.holds[name]; !ok {
+			delete(s.lastDispatched, name)
+		}
+	}
+	last := func(hold volumeDeleteHoldView) time.Time {
+		if dispatched := s.lastDispatched[hold.volume.value()]; dispatched.After(hold.lastAttempt) {
+			return dispatched
+		}
+		return hold.lastAttempt
+	}
+	slices.SortStableFunc(due, func(a, b volumeDeleteHoldView) int {
+		if aUnsized, bUnsized := a.phase == holdPhaseUnsized, b.phase == holdPhaseUnsized; aUnsized != bUnsized {
+			if aUnsized {
+				return -1
+			}
+			return 1
+		}
+		if c := last(a).Compare(last(b)); c != 0 {
+			return c
+		}
+		return strings.Compare(a.volume.value(), b.volume.value())
+	})
+}
+
+// takeResumes returns, and forgets, the leases whose close resume is owed.
+func (s *volumeDeleteHoldExecutorState) takeResumes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	leases := slices.Sorted(maps.Keys(s.pendingResumes))
+	s.pendingResumes = nil
+	return leases
+}
+
+// oweResume records a lease whose close resume must be retried.
+func (s *volumeDeleteHoldExecutorState) oweResume(leaseUUID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingResumes == nil {
+		s.pendingResumes = make(map[string]struct{})
+	}
+	s.pendingResumes[leaseUUID] = struct{}{}
+}
+
+// holdDispatchQueue hands one pass's due holds to its workers in order, and
+// never two holds of the same lease at once.
+type holdDispatchQueue struct {
+	mu    sync.Mutex
+	ready *sync.Cond
+	queue []volumeDeleteHoldView
+	busy  map[string]struct{}
+}
+
+func newHoldDispatchQueue(due []volumeDeleteHoldView) *holdDispatchQueue {
+	q := &holdDispatchQueue{queue: due, busy: make(map[string]struct{})}
+	q.ready = sync.NewCond(&q.mu)
+	return q
+}
+
+// next returns the first queued hold whose lease no attempt is working on,
+// waiting while every queued hold's lease is busy. It reports false once the
+// queue is empty or ctx (the pass budget) can no longer fit an attempt.
+func (q *holdDispatchQueue) next(ctx context.Context) (volumeDeleteHoldView, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for {
+		if len(q.queue) == 0 || ctx.Err() != nil {
+			return volumeDeleteHoldView{}, false
+		}
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < volumeDeleteHoldMinSlice {
+			return volumeDeleteHoldView{}, false
+		}
+		for i, hold := range q.queue {
+			lease := managedVolumeLeaseUUID(hold.volume)
+			if _, busy := q.busy[lease]; busy {
+				continue
+			}
+			q.queue = slices.Delete(q.queue, i, i+1)
+			q.busy[lease] = struct{}{}
+			return hold, true
+		}
+		// Every queued hold's lease has an attempt running; each ends within
+		// its slice and wakes this worker.
+		q.ready.Wait()
+	}
+}
+
+// finish releases hold's lease to the next queued hold.
+func (q *holdDispatchQueue) finish(hold volumeDeleteHoldView) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	delete(q.busy, managedVolumeLeaseUUID(hold.volume))
+	q.ready.Broadcast()
+}
+
+// runVolumeDeleteHoldPass retries the due holds, one bounded slice each, until
+// ctx (the pass budget) runs out: unsized holds first, then least recently
+// tried first, up to volumeDeleteHoldWorkers at once on different leases. Each
+// retry runs through retry, which the composition binds to the
+// storage-mutation bracket under the hold's lease namespace; it never takes the
+// global recovery gate, so one hold never stalls another lease.
 func (b *Backend) runVolumeDeleteHoldPass(
 	ctx context.Context,
 	now time.Time,
@@ -344,36 +479,111 @@ func (b *Backend) runVolumeDeleteHoldPass(
 	if retry == nil {
 		return report
 	}
-	for _, hold := range b.volumes.VolumeDeleteHolds().dueInOrder(now) {
-		if ctx.Err() != nil {
-			break
-		}
-		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < volumeDeleteHoldMinSlice {
-			break
-		}
+	held := b.volumes.VolumeDeleteHolds()
+	due := held.dueInOrder(now)
+	b.holdExecutor.order(due, held)
+	queue := newHoldDispatchQueue(due)
+	var reportMu sync.Mutex
+	var workers sync.WaitGroup
+	for range volumeDeleteHoldWorkers {
+		workers.Go(func() {
+			for {
+				hold, ok := queue.next(ctx)
+				if !ok {
+					return
+				}
+				b.holdExecutor.dispatched(hold.volume.value(), time.Now())
+				attempt := b.attemptHeldVolumeDelete(ctx, hold, retry)
+				queue.finish(hold)
+				reportMu.Lock()
+				report.attempted++
+				report.progressed = report.progressed || attempt.progressed
+				if attempt.releasedCaller {
+					report.leftRemoval = append(report.leftRemoval, hold.volume)
+				}
+				reportMu.Unlock()
+			}
+		})
+	}
+	workers.Wait()
+	slices.SortFunc(report.leftRemoval, func(a, b managedVolumeName) int {
+		return strings.Compare(a.value(), b.value())
+	})
+	return report
+}
+
+// heldDeleteAttempt is what one attempt did to its hold.
+type heldDeleteAttempt struct {
+	// progressed: the manager recorded the attempt and the hold moved
+	// forward (see volumeDeleteHoldPassReport.progressed).
+	progressed bool
+	// releasedCaller: the hold held its caller before the attempt and no
+	// longer does.
+	releasedCaller bool
+}
+
+// attemptHeldVolumeDelete runs one bounded attempt of hold inside its own
+// panic boundary, since it runs on a pass worker goroutine, and classifies
+// what it did from the manager's hold table before and after.
+func (b *Backend) attemptHeldVolumeDelete(
+	ctx context.Context,
+	hold volumeDeleteHoldView,
+	retry backgroundHeldVolumeDeleteRetry,
+) heldDeleteAttempt {
+	var attempt heldDeleteAttempt
+	util.RunCleanupIteration(func() error {
 		slice, cancel := context.WithTimeout(ctx, volumeDeleteHoldSlice)
 		err := retry(slice, hold.volume.value())
 		cancel()
-		report.attempted++
 		if err != nil && !errors.Is(err, ErrVolumeDeleteHeld) {
 			b.logger.Warn("held volume delete retry failed",
 				"volume_id", hold.volume.value(), "delete_stage", hold.stage, "error", err)
 		}
-		if hold.holdsCaller() && !b.volumes.VolumeDeleteHolds().callerHeld(hold.volume.value()) {
-			report.leftRemoval = append(report.leftRemoval, hold.volume)
-		}
+		after, stillHeld := b.volumes.VolumeDeleteHolds().holds[hold.volume.value()]
+		attempt = classifyHeldDeleteAttempt(hold, after, stillHeld, time.Now())
+		return nil
+	}, volumeDeleteHoldComponent, func(any) {
+		background.CleanupPanicsTotal.WithLabelValues(volumeDeleteHoldComponent).Inc()
+	})
+	return attempt
+}
+
+// classifyHeldDeleteAttempt compares a hold before and after one attempt. An
+// attempt that never reached the manager leaves attempts unchanged and is no
+// progress, so an executor whose retries fail early waits for its interval
+// instead of spinning.
+func classifyHeldDeleteAttempt(
+	before, after volumeDeleteHoldView,
+	stillHeld bool,
+	now time.Time,
+) heldDeleteAttempt {
+	if !stillHeld {
+		return heldDeleteAttempt{progressed: true, releasedCaller: before.holdsCaller()}
 	}
-	return report
+	if after.stage != before.stage || after.attempts <= before.attempts {
+		return heldDeleteAttempt{}
+	}
+	return heldDeleteAttempt{
+		progressed: after.phase != before.phase ||
+			(after.reason.keepsProgressing() && !now.Before(after.nextAttempt)),
+		releasedCaller: before.holdsCaller() && !after.holdsCaller(),
+	}
 }
 
 // volumeDeleteHoldLoop is the hold executor, the only runner of held
-// deletion work. It runs on the Backend's lifetime, first as soon as it
-// starts, then on volumeDeleteHoldInterval.
+// deletion work. It runs on the Backend's lifetime: first as soon as it
+// starts, then on volumeDeleteHoldInterval, except that a pass which moved a
+// hold forward is followed at once by the next. It is work-conserving within
+// each pass's budget and each attempt's slice, and every pass rotates over all
+// due holds, so a large deletion gets consecutive slices without starving the
+// others.
 func (b *Backend) volumeDeleteHoldLoop() {
 	ticker := time.NewTicker(volumeDeleteHoldInterval)
 	defer ticker.Stop()
 	for b.stopCtx.Err() == nil {
-		b.runVolumeDeleteHoldIteration()
+		if b.runVolumeDeleteHoldIteration() {
+			continue
+		}
 		select {
 		case <-b.stopCtx.Done():
 			return
@@ -384,31 +594,30 @@ func (b *Backend) volumeDeleteHoldLoop() {
 
 // runVolumeDeleteHoldIteration is one executor pass inside the cleanup panic
 // boundary: retry the due holds under the pass budget, resume the closes whose
-// holds stopped holding their caller, and sample the gauges.
-func (b *Backend) runVolumeDeleteHoldIteration() {
+// holds stopped holding their caller, and sample the gauges. It reports
+// whether the pass moved a hold forward.
+func (b *Backend) runVolumeDeleteHoldIteration() (progressed bool) {
 	util.RunCleanupIteration(func() error {
 		passCtx, cancel := context.WithTimeout(b.stopCtx, volumeDeleteHoldPassBudget)
 		report := b.backgroundMaintenance.retryHeldVolumeDeletes(passCtx)
 		cancel()
 		b.resumeClosesAfterHeldDeletes(report.leftRemoval)
 		b.sampleVolumeDeleteHoldMetrics()
+		progressed = report.progressed
 		return nil
 	}, volumeDeleteHoldComponent, func(any) {
 		background.CleanupPanicsTotal.WithLabelValues(volumeDeleteHoldComponent).Inc()
 	})
+	return progressed
 }
 
-// resumeClosesAfterHeldDeletes enqueues a close resume for each lease whose
-// held deletion just stopped holding its caller, so the close settles now instead
-// of on the next reconcile. A lease whose command fence is busy is skipped:
-// the live command holding it observes the same state.
+// resumeClosesAfterHeldDeletes resumes the close of each lease whose held
+// deletion just stopped holding its caller, so the close settles now instead
+// of on the next reconcile, together with every resume an earlier pass owed.
+// A lease whose command fence is busy is owed again on the next pass: the
+// command holding it may have answered from the state before the hold ended.
 func (b *Backend) resumeClosesAfterHeldDeletes(names []managedVolumeName) {
-	if len(names) == 0 {
-		return
-	}
-	ctx, cancel := context.WithTimeout(b.stopCtx, volumeDeleteHoldResumeBudget)
-	defer cancel()
-	seen := make(map[string]struct{}, len(names))
+	leases := b.holdExecutor.takeResumes()
 	for _, name := range names {
 		// A retained name belongs to the lease it was retained from, as in
 		// closeAwaitsHeldDeletes.
@@ -416,20 +625,29 @@ func (b *Backend) resumeClosesAfterHeldDeletes(names []managedVolumeName) {
 		if isRetainedVolume(value) {
 			value = canonicalFromRetained(value)
 		}
-		leaseUUID, ok := leaseUUIDFromVolumeName(value)
-		if !ok {
-			continue
+		if leaseUUID, ok := leaseUUIDFromVolumeName(value); ok {
+			leases = append(leases, leaseUUID)
 		}
-		if _, dup := seen[leaseUUID]; dup {
-			continue
-		}
-		seen[leaseUUID] = struct{}{}
+	}
+	if len(leases) == 0 {
+		return
+	}
+	slices.Sort(leases)
+	leases = slices.Compact(leases)
+	ctx, cancel := context.WithTimeout(b.stopCtx, volumeDeleteHoldResumeBudget)
+	defer cancel()
+	for _, leaseUUID := range leases {
 		if ctx.Err() != nil {
-			return
+			b.holdExecutor.oweResume(leaseUUID)
+			continue
 		}
-		if _, err := b.tryResumeRecoveredClose(ctx, leaseUUID); err != nil {
+		resumed, err := b.tryResumeRecoveredClose(ctx, leaseUUID)
+		switch {
+		case err != nil:
 			b.logger.Warn("close resume after a held volume delete remains pending",
 				"lease_uuid", leaseUUID, "error", err)
+		case !resumed:
+			b.holdExecutor.oweResume(leaseUUID)
 		}
 	}
 }
