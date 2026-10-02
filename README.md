@@ -745,7 +745,8 @@ The set defined today:
 | `VolumeCleanupExhausted` | Volume cleanup on deprovision failed after exhausting all retry attempts |
 | `CleanupFailed` | Cleanup on deprovision failed (containers or volumes) |
 | `BackendStorageLost` | An operator retired the lease's backend because its storage was irrecoverably lost; the lease is closed (or, if pending, rejected) on chain |
-| `VolumeDeletePending` | A provision was refused because an earlier deletion of the lease's own volume has not finished yet; retry later |
+| `VolumeDeletePending` | A provision was refused because an earlier deletion of the lease's own volume is still finishing on the provider |
+| `VolumeDeletionInProgress` | The lease is closing and its volume is still being deleted by the provider; the close completes when the deletion does |
 | `Unknown` | Read-boundary default: the lease is `failed` but no specific reason was recorded |
 
 `message` is a short, human-readable string for display; it contains no host filesystem paths or

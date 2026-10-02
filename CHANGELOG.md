@@ -36,16 +36,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `maintenance` or `tenant_workload`, so ordinary tenant updates and crashes do
   not page. (ENG-799)
 - docker-backend metrics for held volume deletions:
-  `fred_docker_backend_volume_delete_holds{phase}`,
+  `fred_docker_backend_volume_delete_holds{phase="removal|unsized|residual"}`,
   `fred_docker_backend_volume_delete_outcomes_total{outcome}`,
-  `fred_docker_backend_volume_delete_held_residual_mb` and
-  `fred_docker_backend_close_intents_delete_held`; for tenant tree removal,
+  `fred_docker_backend_volume_delete_held_residual_mb`,
+  `fred_docker_backend_close_intents_delete_held` and
+  `fred_docker_backend_oldest_unheld_close_intent_age_seconds` (the oldest
+  pending close that is not waiting only on held deletions, for close-age
+  alerting); for tenant tree removal,
   `fred_docker_backend_tree_removals_total{site,outcome}` and
   `fred_docker_backend_tree_removal_cuts_total{site}`; and a `delete_pending`
   outcome on `fred_docker_backend_volume_quota_backfill_total`. (ENG-1117)
 - Tenant reason `VolumeDeletePending`: a provision is refused with it while an
-  earlier deletion of a volume it needs is still finishing, and can be retried
-  later. (ENG-1117)
+  earlier deletion of a volume it needs is still finishing on the provider.
+  Tenant reason `VolumeDeletionInProgress`: a closing lease whose volume is
+  still being deleted reports it instead of `CleanupFailed`; the close
+  completes when the deletion does. (ENG-1117)
+- The coordinated update's stopped drain proof can tell delete-held work from
+  other pending work: a pending close or operation whose remaining volumes all
+  carry a delete stage is reported separately (`DeleteHeld`) instead of as
+  pending. The deploy coordinator decides whether that blocks an update.
+  (ENG-1117, ENG-1109)
 - `backends[].fenced: true` contains a backend the operator no longer trusts
   without removing it from the topology. providerd sends it nothing: its client
   holds no address, key or TLS material, so the backend's revoked certificate
@@ -447,6 +457,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   container exited during startup` (or the matching startup cause) instead of
   `internal error`. The reason set stays open: a client must treat a reason it
   does not know as a generic failure and show `message`.
+- Upgrade note: docker-backend now requires Linux 5.8 or later on hosts with
+  a volume data path. Removing tenant directory trees relies on the mount ID
+  that `statx` reports from Linux 5.8 on; on an older kernel the XFS, btrfs
+  and ZFS volume managers now refuse to start with an error naming the
+  kernel requirement, instead of starting and then holding every volume
+  deletion. (ENG-1117)
+- Upgrade note: a held volume deletion no longer fails `Start`; the
+  background hold executor's first pass runs right after it. Deployment
+  automation that checks each host before moving on must wait at least about
+  90 seconds after a restart (manifest-deploy `docker_backend_settle_seconds`)
+  so that a storage-authority latch raised by that pass stops a rolling update
+  on the first host. (ENG-1117, ENG-1109)
+- docker-backend withholds disk admission while a held volume deletion's
+  footprint is unknown: a deletion recovered at startup whose volume is gone
+  may already have settled its caller, so until its quota row can be read,
+  every provision that needs disk is refused as insufficient resources, while
+  diskless work and `/health` are unaffected. (ENG-1117)
 - A graceful providerd stop now lets an in-flight reconciliation sweep finish
   reading backend inventories and commit its placement projection, for at most
   half of `shutdown_timeout`, instead of abandoning it. An abandoned sweep left
@@ -1231,8 +1258,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - docker-backend: a volume whose deletion cannot finish no longer stops the
   backend or blocks its startup. The deletion is held for that volume, keeps
   its delete stage and project ID, and is retried in the background, and the
-  closing lease stays pending until the volume is gone. Tenant directory trees
-  are removed with bounded resources. (ENG-1117)
+  closing lease stays pending until the volume is gone. Held deletions are
+  retried back to back while they make progress, up to two leases at once.
+  Tenant directory trees are removed with bounded resources. (ENG-1117)
 - A sweep canceled at shutdown between its provision and retention reads no
   longer widens the recovery its interrupted marker needs. It is abandoned
   before any response is disposed, so after the restart only the backends that

@@ -169,7 +169,7 @@ when later probes or recovery passes succeed.
 | `increase(fred_maintenance_admission_refusals_total{reason=~"count\|bytes"}[5m]) > 0` | New restart/update admission reached the provider pending-journal count/byte cap. Existing commands can still replay and settle | Correlate pending phase/oldest-age gauges with backend completion and callback health. Restore stalled completion rather than deleting pending rows. `reserved_count` and `reserved_bytes` are caller backpressure (`429`) while preserving room for a tenant without pending work; exclude those reasons from provider exhaustion alerts |
 | Backend X reports `callback store unhealthy` | `callbacks.db` is missing a delivery/intent bucket, contains malformed durable evidence, or gives one lease simultaneous operation, maintenance, or close rows. A terminal Succeeded/Failed operation row is history rather than active mutation authority; authorized successor admission retires it atomically instead of leaving simultaneous rows. Current deliveries live below a lease-identifying nested bucket. Operation identity/snapshot fields are immutable; maintenance advances through typed pre-append and append-started phases and then binds one exact target fence; close preserves its immutable snapshot while durably advancing a monotonic execution generation immediately before physical work. Every change uses an exact digest-bearing claim. Replay/TTL never silently deletes poison data, terminal operation rows remain after delivery until an authorized successor, and causal intents, close intents, and exact completions never age out | Stop that backend, take a copy of `callbacks.db` with the matching release store, storage markers, containers, and volumes. Inspect or restore the named lease offline (or the complete file when a root bucket is missing). Prefer exact repair/restore over deleting the database; wholesale deletion can lose accepted work, terminal decisions, replacement identity, destructive-cleanup authority, and pending completions. Keep the node out of new placement until `/health` is clean |
 | Backend latches after `post-mutation storage verification`, refuses startup with `recover interrupted operations`, or `fred_*_backend_callback_store_errors_total` increases | A raw mutation returned without a usable postcheck, callback persistence/store access failed on an instrumented path, operation-intent startup recovery failed, or another authoritative journal/substrate proof reached a terminal identity or outcome-unknown failure. The first cause is sticky for the backend lifetime: callback, release, and retention journals (where present), substrate mutation admission, and callback delivery all refuse through the same latch. A running docker-backend publishes that first cause to its main loop, closes the listener, drains workers, and exits status 1 so the supervisor must launch a fresh `Start`; a persistent fault therefore crash-loops closed instead of serving. An XFS volume deletion that cannot finish is not such a fault: it is held for that one volume and the backend keeps serving (see [Held volume deletions](#held-volume-deletions)). A valid but semantically indeterminate maintenance row is different: it need not make `/health` fail or increment this counter; use the Docker reconciliation signal below. A close intent already owns destruction, so recovery resumes it from its immutable snapshot before ordinary exact-cohort validation and reports retry errors in the lease-scoped close log below | Fence mutation ingress and preserve `callbacks.db`, `releases.db`, `retention.db` where present, the storage-identity marker pair, and the substrate as one evidence set. Do not treat one still-readable sibling journal or a queued callback as permission to continue; the shared latch intentionally withdrew the entire lineage. Let the supervised restart retry only after repairing the Docker/retention/SKU/store inconsistency or restoring the matching stopped-process snapshot. Restart only against that same set. Never delete an intent, finalizer, release fence, retained data, or callback evidence merely to make readiness green |
-| `fred_docker_backend_oldest_close_intent_age_seconds` remains above the normal close window, `fred_docker_backend_pending_close_intents` remains non-zero, or `durable close recovery remains pending` repeats for one lease | Docker admitted deprovision before teardown, then a transient container/volume/release/accounting/outbox failure prevented finalization. The aggregate gauges deliberately omit lease labels; the log's lease UUID and durable `execution_generation` identify the exact attempted run and survive restart. A full close keeps a conservative projection and capacity reservation; a cleanup-only close may have no tenant-visible projection but remains the sole non-expiring retry owner. An unresolved launch receipt can also prevent terminal close even when current container and volume inventories are empty | Correlate the recovery log's lease UUID with nearby teardown, retention, release-store, and callback-store errors. Restore the failed dependency and let the next docker-backend recovery tick independently classify the Started generation before authorizing another run. If offline inspection is required, stop the backend and inspect that lease's close-tagged head in `callback_lease_mutation_heads` together with the exact `releases.db` history and substrate; callback URLs contain causal identifiers, so do not paste raw row contents into tickets. Never delete the row merely because Docker reports zero containers. If the exact lease retains an unknown launch request, follow [Unsettled Docker effects](#unsettled-docker-effects). A timeout, restart or empty inventory cannot retire that receipt; preserve the close intent and launch evidence until exact completion or stopped-backend operator fencing and repair establishes quiescence |
+| `fred_docker_backend_oldest_unheld_close_intent_age_seconds` remains above the normal close window (it leaves out closes waiting only on held volume deletions, see [Held volume deletions](#held-volume-deletions)), `fred_docker_backend_pending_close_intents` remains non-zero, or `durable close recovery remains pending` repeats for one lease | Docker admitted deprovision before teardown, then a transient container/volume/release/accounting/outbox failure prevented finalization. The aggregate gauges deliberately omit lease labels; the log's lease UUID and durable `execution_generation` identify the exact attempted run and survive restart. A full close keeps a conservative projection and capacity reservation; a cleanup-only close may have no tenant-visible projection but remains the sole non-expiring retry owner. An unresolved launch receipt can also prevent terminal close even when current container and volume inventories are empty | Correlate the recovery log's lease UUID with nearby teardown, retention, release-store, and callback-store errors. Restore the failed dependency and let the next docker-backend recovery tick independently classify the Started generation before authorizing another run. If offline inspection is required, stop the backend and inspect that lease's close-tagged head in `callback_lease_mutation_heads` together with the exact `releases.db` history and substrate; callback URLs contain causal identifiers, so do not paste raw row contents into tickets. Never delete the row merely because Docker reports zero containers. If the exact lease retains an unknown launch request, follow [Unsettled Docker effects](#unsettled-docker-effects). A timeout, restart or empty inventory cannot retire that receipt; preserve the close intent and launch evidence until exact completion or stopped-backend operator fencing and repair establishes quiescence |
 | `fred_docker_backend_lease_mutation_uuid_slots / clamp_min(fred_docker_backend_lease_mutation_uuid_slot_limit, 1) > 0.8` | This backend storage lineage has consumed more than 80% of its permanent lease-UUID budget. The numerator is monotonic by design: operation/maintenance settlement and close do not reclaim a UUID because an arbitrarily late substrate effect or retry must remain fenced | Follow [Permanent callback UUID capacity](#permanent-callback-uuid-capacity). Forecast the durable UUID burn rate and ship a reviewed limit increase well before exhaustion; new nodes can absorb never-before-seen leases meanwhile. Never delete slots, closed receipts, or `callbacks.db` to reduce the gauge |
 | `fred_docker_backend_callback_receipt_reservations / clamp_min(fred_docker_backend_callback_receipt_reservation_limit, 1) > 0.8` | This backend has consumed more than 80% of its shared durable operation/maintenance receipt budget. Unlike UUID slots, successful close reclaims these reservations after installing the stronger closed-lease fence | Follow [Permanent callback UUID capacity](#permanent-callback-uuid-capacity). Forecast operation/maintenance churn and close convergence. Never delete history or `callbacks.db`; add capacity or ship a reviewed ceiling increase before admission reaches its definitive-refusal boundary |
 | `increase(fred_docker_backend_reconciliation_total{outcome="error"}[15m]) > 0` or `fred_docker_backend_reconciliation_last_success_timestamp_seconds` is stale beyond the expected Docker `reconcile_interval` | Docker's periodic recovery pass failed at a global storage, journal, transport, or unclassified observation boundary, or a durable restore finalizer could not complete source handback. Explicit lease-local maintenance conflicts and expected readiness waits preserve their intent and reservation while siblings continue; they use `fred_docker_backend_maintenance_recovery_deferred_total` and `fred_docker_backend_maintenance_readiness_pending_total{branch}` instead. Semantic recovery errors can leave `/health` green and `fred_docker_backend_callback_store_errors_total` unchanged. A global failure during cold start exits before periodic metrics begin | Inspect the backend's `reconciliation failed` log and its wrapped lease/error. `reconcile restoring operations:` identifies restore-finalizer debt (including a lease-local quota failure). This intentionally increments the pass error and freezes last-success until handback succeeds; independent finalizers still run. It is not evidence that all recovery has stopped. For lease-local deferrals, correlate the separate maintenance warning and counter with the exact workload; a committed target may remain pending while its healthcheck stays `starting`. For a persistent mismatch, stop the backend and preserve the exact `callbacks.db`, `releases.db`, marker pair, Docker metadata, and volumes before following [A pending or corrupt Docker maintenance intent](#a-pending-or-corrupt-docker-maintenance-intent). Do not delete the WAL or use `/health` success as permission to bypass it |
@@ -237,7 +237,7 @@ when later probes or recovery passes succeed.
 | `increase(fred_docker_backend_retention_sweep_total{outcome="error"}[6h]) > 0` | At least one sweep stage failed. Two distinct causes land here, so **read the log line before acting**: an unenumerable `retention.db` (the common one — the reaper and orphan pruner reclaim nothing and **every lease close skips volume teardown entirely**, leaving closes `Failed` and retrying, so the provider degrades toward refusing new work), or an unreadable **volume root**, which the orphan stage reports through the same outcome with a perfectly healthy store | **Start with the sweep's log line, not the database.** It prefixes each failure with its stage — `reap expired:` / `retry reaping:` / `list restoring:` are store reads, `reconcile orphans:` can be either (pair it with `retention_orphan_skips_total`: `reason="store_error"` vs `reason="list_error"` separates them exactly). Then fix whichever dependency it names; the parked work resumes on its own. Shares a root cause with the `claims_unreadable` row below |
 | `fred_docker_backend_retention_accounting_refresh_failed_total` rising | The retained-disk projection could not be recomputed, so the five retention gauges **and** the admission pool's retained input are frozen at their last values. That is the data-safe direction (a zeroed projection would over-admit), but it means those gauges are stale — do not read them as current while this is rising | Same root cause as the row above: fix the retention store. Until then, treat `retained_volume_bytes` / `retention_reaping_bytes` as last-known-good, not live |
 | `fred_docker_backend_volume_quota_clear_failed_total` rising | An XFS quota-clear command failed during interrupted-create compensation or typed deletion. The preceding block/inode proof failures do not increment this metric. Typed authority is retained either way. During a deletion, that one volume's deletion is held (reason `quota_clear_failed`) and retried in the background while the backend keeps serving. During create compensation, the current backend instance fail-stops and a fresh `Start` recovers the stage before readiness. A historical already-absent volume without typed authority can still leave an unowned table entry | [Held volume deletions](#held-volume-deletions); [XFS deletion recovery and legacy quota entries](#xfs-deletion-recovery-and-legacy-quota-entries) |
-| `fred_docker_backend_volume_delete_holds > 0` for 1h | At least one XFS volume deletion could not finish for a reason confined to that volume. Its delete stage and project ID are kept, the hold executor retries it, and the backend keeps serving; a removal-phase hold keeps its close or operation pending. Ticket, do not page | [Held volume deletions](#held-volume-deletions) |
+| `fred_docker_backend_volume_delete_holds > 0` for 1h | At least one XFS volume deletion could not finish for a reason confined to that volume. Its delete stage and project ID are kept, the hold executor retries it, and the backend keeps serving; a hold in the `removal` or `unsized` phase keeps its close or operation pending, and an `unsized` hold also withholds disk admission. Ticket, do not page | [Held volume deletions](#held-volume-deletions) |
 | `fred_docker_backend_volume_destroy_refused_total{reason="claims_unreadable"}` > 0 | The retention store could not be read, so an exact close or retained-data finalizer could not establish who owns a volume and **nothing was destroyed** — data-safe, but those operations are parked. Runtime closing leases stay `Failed` and retry; retained-data reaping retries on its next sweep. Unattributed managed volumes are preserved without attempting destruction and therefore do not emit this series | Fix `retention.db` health first; parked work resumes when its exact authority is readable. See the `store_error` row in [Partition collapse triage](#partition-collapse-triage) |
 | `fred_docker_backend_volume_destroy_refused_total{reason="claimed"}` sustained | An exact destroy path keeps meeting a volume another lease owns — normally an in-flight restore that is not converging, since a healthy restore clears its own claim on commit or rollback. Never data loss: the refusal is the guard working | Read with `restore_finalizer_pending_total` and `retention_reaping_leases`; the WARN log names the volume and its owning lease. [Reclaiming retained-data / stuck-reaping volumes](#reclaiming-retained-data--stuck-reaping-volumes) |
 | `fred_docker_backend_teardown_fallback_total{outcome="failed",operation=~"restore_reconcile\|deprovision"}` rising | Container teardown could not prove absence; exact durable authority and accounting remain held for retry | [Stuck teardown](#stuck-teardown-docker-backend) |
@@ -1056,35 +1056,51 @@ confined to that volume, it holds that deletion instead of stopping. The
 backend keeps serving every other lease, `/health` and readiness are unaffected,
 and a restart is safe: `Start` registers every delete stage it finds as a held
 deletion and serves. One background hold executor finishes held deletions. Its
-first pass runs as soon as `Start` returns, then every 30 seconds; each
-attempt is limited to 15 seconds and takes only that lease's volume namespace.
+first pass runs as soon as `Start` returns. A pass that moved a hold forward is
+followed at once by the next; otherwise the executor waits 30 seconds. A pass
+lasts at most 60 seconds and runs up to two attempts at once, never two of the
+same lease. Each attempt is limited to a 15-second slice and takes only that
+lease's volume namespace, which it can keep for up to about 10 seconds longer
+when the slice ends during the one quota-clear command.
 
 **Signal.** `fred_docker_backend_volume_delete_holds{phase}` is the number of
-held deletions. Each new or changed hold logs a WARN `volume delete held` with
+held deletions by phase. A new or changed hold logs `volume delete held` with
 `volume_id`, `delete_stage`, `project_id`, `phase`, `reason`, `attempts`,
-`next_attempt` and `error`. `fred_docker_backend_volume_delete_outcomes_total{outcome}`
-counts attempts (`completed`, `held_removal`, `held_residual`, `latched`), and
-`fred_docker_backend_tree_removals_total{site,outcome}` counts the removals of
-volume trees.
+`next_attempt` and `error`: at INFO while the deletion is merely still running
+(`recovered`, `deadline`, `stopped`), at WARN when it was refused or is
+unsized. `fred_docker_backend_volume_delete_outcomes_total{outcome}` counts
+attempts (`completed`, `held_removal`, `held_unsized`, `held_residual`,
+`latched`), and `fred_docker_backend_tree_removals_total{site,outcome}` counts
+the removals of volume trees.
 
 **Phases.**
 
 - `removal`: tenant bytes may remain at the final path, or its absence is not
   yet durable. The caller keeps its authority: a close stays pending (Deprovision
-  answers 503 `lifecycle_pending`, and
-  `fred_docker_backend_close_intents_delete_held` counts closes waiting only on
-  held deletions), a reaping retention record stays, and an operation intent
-  stays. The executor resumes a waiting close as soon as its hold leaves this
-  phase.
+  answers 503 `lifecycle_pending`, the lease reports reason
+  `VolumeDeletionInProgress`, and `fred_docker_backend_close_intents_delete_held`
+  counts closes waiting only on held deletions), a reaping retention record
+  stays, and an operation intent stays. A close waits only on held deletions when
+  every one of its volume slots is either held or done (destroyed, retained, or
+  never had a volume, like a stateless service). The executor resumes a waiting
+  close as soon as its hold stops holding it.
+- `unsized`: the volume directory was found gone at startup, so the deletion's
+  caller may already have settled in an earlier process, but the project's
+  footprint could not be read yet. A caller that is still pending stays pending,
+  as in `removal`, and the footprint is never counted as zero: while any hold is
+  unsized, docker-backend refuses every provision that needs disk as
+  insufficient resources (WARN `disk admission withheld`; diskless work and
+  `/health` are unaffected). The executor retries unsized holds first, on every
+  pass, until a quota read sizes them.
 - `residual`: the volume directory is durably gone; only the delete stage and
   the project ID remain while the zero-usage proof, the limit clear and the stage
   removal are retried. The caller settles. Until the hold completes, admission
   counts the project's block hard limit, or its block usage if larger
   (`fred_docker_backend_volume_delete_held_residual_mb`).
 
-In either phase the name cannot be created again: a provision of the same lease
-that needs that volume is refused with reason `VolumeDeletePending` and can be
-retried once the hold completes.
+In every phase the name cannot be created again: a provision of the same lease
+that needs that volume fails with reason `VolumeDeletePending` until the hold
+completes. That is provider-side; the tenant cannot hasten it.
 
 **What is kept.** The delete stage
 `<volume_data_path>/.fred-xfs-delete-<project-id>-<managed-volume>`, the
@@ -1094,8 +1110,9 @@ after `quota_clear_failed` they may already be partly or fully cleared.
 
 **Retry pacing.** `recovered`, `deadline` and `stopped` stay due on every pass:
 they mean the attempt did not run, ran out of its time slice, or was stopped,
-and the next attempt continues where it left off. Every other reason backs off
-from 30 seconds, doubling to at most 30 minutes.
+and the next attempt continues where it left off. An unsized hold stays due on
+every pass too. Every other reason backs off from 30 seconds, doubling to at
+most 30 minutes.
 
 **Triage by reason.**
 
@@ -1106,13 +1123,13 @@ from 30 seconds, doubling to at most 30 minutes.
 | `stopped` | The attempt's caller or the backend stopped | None |
 | `removal_failed` | An entry could not be removed (I/O error) | Check the kernel log and filesystem health |
 | `tree_changed` | The tree changed while it was being removed | Find and stop the process still writing under the volume path |
-| `cross_device` | Another filesystem is mounted inside the volume | Unmount it |
+| `cross_device` | Another filesystem is mounted inside the volume | Unmount it. (A kernel older than Linux 5.8 would cause this on every volume; docker-backend refuses to start on one.) |
 | `undeletable` | An entry refuses removal: an immutable or append-only attribute, or permissions | Inspect the entry named in `error` (`lsattr`); clear the attribute. The executor cannot finish this one alone |
 | `cut_refused` | The deepest part of a tree could not be detached for removal | Confirm docker-backend runs with `CAP_FOWNER` as [DEPLOYMENT.md](DEPLOYMENT.md) requires |
 | `writer_active` | Entries reappeared after removal | Find and stop the writer |
 | `final_removal_failed` | The emptied volume directory could not be removed | Check it for attributes or a mount |
-| `usage_unprovable` | The quota report could not prove the project's usage | Check `xfs_quota` and the `pquota` mount option |
-| `usage_nonzero` | The project still uses blocks or inodes, usually an open but unlinked file | Find the process holding it (`lsof +L1` on the mount) and close it |
+| `usage_unprovable` | The quota report could not prove the project's usage | Check `xfs_quota` and the `pquota` mount option. On an unsized hold this also keeps disk admission withheld |
+| `usage_nonzero` | The project still uses blocks or inodes, usually an open but unlinked file | Find the process holding it (`lsof +L1` on the mount) and close it. If none holds one, inodes elsewhere may still be charged to this project: check `fred_docker_backend_volumes_with_projid_drift` and the warnings of the XFS project-ID audit (ENG-1118), which name the volume and project ID. Until the hold clears, admission keeps counting the project's hard limit (`fred_docker_backend_volume_delete_held_residual_mb`) |
 | `quota_clear_failed` | The limit clear command failed | Check the quota control plane |
 | `stage_removal_failed` | The delete stage itself could not be removed | Check that it is an empty directory without attributes |
 
@@ -1142,11 +1159,23 @@ exists.
 
 **Upgrades and deploys.**
 
-- A coordinated update that waits for admitted lifecycle work to quiesce does
-  not proceed while a close or operation is removal-held: that close stays
-  pending. Check `fred_docker_backend_volume_delete_holds{phase="removal"}`,
-  `fred_docker_backend_close_intents_delete_held` and the `volume delete held`
-  lines, then resolve the hold by its reason or let it finish.
+- The coordinated update's native drain proof runs against the stopped
+  backend. It reports a pending close or operation whose remaining volume
+  slots all carry a delete stage as `delete_held`, separately from `pending`
+  (`docker.ClassifyStoppedDrain`, which reads the stopped volume root once,
+  read-only). manifest-deploy's `update.py` must emit that count and treat it as
+  non-blocking (ENG-1109): such work resumes by itself after the restart,
+  because `Start` registers every stage as a held deletion. That is safe only
+  when both the target and any rollback revision are hold-aware (this release
+  or later); a pre-hold binary stops at every start on such a stage. All other
+  pending work still blocks.
+- To check delete-held work before stopping a host:
+  `fred_docker_backend_close_intents_delete_held` and
+  `fred_docker_backend_volume_delete_holds{phase}` while it runs, and the
+  `volume delete held` lines for the volume, stage and reason. With the backend
+  stopped, each `<volume_data_path>/.fred-xfs-delete-<project-id>-<managed-volume>`
+  directory is one held deletion. A deletion in progress when the backend
+  stops is held, not abandoned, so it also shows up there.
 - A host whose backend stops at every start because of a deletion failure on an
   earlier build: stop the backend, install this release, and start it. `Start`
   registers the stage as a held deletion instead of failing.
@@ -1160,12 +1189,23 @@ exists.
   [Interrupted managed-volume mutation at startup](#interrupted-managed-volume-mutation-at-startup)
   for that stage.
 
-**Alerting.** Ticket on `fred_docker_backend_volume_delete_holds > 0` for one
-hour (`DockerBackendVolumeDeleteHeld`); do not page. A held close is expected to
-age, so close-age alerting (`DockerBackendCloseIntentAged`) should exclude the
-closes counted by `fred_docker_backend_close_intents_delete_held`. A hold does
-not join `/health` or readiness; a removal-phase hold only keeps its own close or
-operation pending, which drain checks count as pending work.
+**Alerting.**
+
+- Ticket on `sum(fred_docker_backend_volume_delete_holds) > 0` for one hour
+  (`DockerBackendVolumeDeleteHeld`); do not page.
+- A held close is expected to age while the executor finishes it. Page on the
+  close-age gauge that leaves those closes out:
+  `fred_docker_backend_oldest_unheld_close_intent_age_seconds > 900` for 5
+  minutes (`DockerBackendCloseIntentAged`). It ages only the closes not waiting
+  solely on held deletions and is 0 when there are none, so an old held close
+  neither pages beside a young unheld one nor hides it. The deploy rule change
+  from `oldest_close_intent_age_seconds` is part of ENG-1109.
+- `fred_docker_backend_volume_delete_holds{phase="unsized"} > 0` means this host
+  refuses disk-bearing provisions. Ticket if it lasts 15 minutes and check
+  `xfs_quota` (`usage_unprovable`).
+
+A hold does not join `/health` or readiness. A hold that keeps its caller
+pending only keeps its own close or operation pending.
 
 ---
 
