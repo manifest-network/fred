@@ -26,10 +26,14 @@ func heldDeleteErr(name string) error {
 	return fmt.Errorf("%w (phase=removal reason=undeletable): xfs volume %q is held", ErrVolumeDeleteHeld, name)
 }
 
+// pendingDeletes is a snapshot in which every name is held in the removal
+// phase, with its stage and project mapping, as the XFS manager reports one.
 func pendingDeletes(names ...string) volumeDeleteHoldSnapshot {
 	snapshot := volumeDeleteHoldSnapshot{
 		pending: make(map[string]struct{}, len(names)),
 		holds:   make(map[string]volumeDeleteHoldView, len(names)),
+		staged:  make(map[string]struct{}, len(names)),
+		mapped:  make(map[string]struct{}, len(names)),
 	}
 	for _, name := range names {
 		parsed, err := parseManagedVolumeName(name)
@@ -37,6 +41,8 @@ func pendingDeletes(names ...string) volumeDeleteHoldSnapshot {
 			panic(err)
 		}
 		snapshot.pending[name] = struct{}{}
+		snapshot.staged[name] = struct{}{}
+		snapshot.mapped[name] = struct{}{}
 		snapshot.holds[name] = volumeDeleteHoldView{volume: parsed, reason: holdReasonUndeletable}
 	}
 	return snapshot
@@ -45,10 +51,53 @@ func pendingDeletes(names ...string) volumeDeleteHoldSnapshot {
 func residualDeletes(footprintMB int64, names ...string) volumeDeleteHoldSnapshot {
 	snapshot := pendingDeletes(names...)
 	for name, hold := range snapshot.holds {
-		hold.residual, hold.footprintMB, hold.reason = true, footprintMB, holdReasonUsageNonzero
+		hold.phase, hold.footprintMB, hold.reason = holdPhaseResidual, footprintMB, holdReasonUsageNonzero
 		snapshot.holds[name] = hold
 	}
 	return snapshot
+}
+
+func unsizedDeletes(names ...string) volumeDeleteHoldSnapshot {
+	snapshot := pendingDeletes(names...)
+	for name, hold := range snapshot.holds {
+		hold.phase, hold.reason = holdPhaseUnsized, holdReasonRecovered
+		snapshot.holds[name] = hold
+	}
+	return snapshot
+}
+
+// withMapped adds names the manager's memory still maps: volumes that exist.
+func (s volumeDeleteHoldSnapshot) withMapped(names ...string) volumeDeleteHoldSnapshot {
+	if s.mapped == nil {
+		s.mapped = make(map[string]struct{}, len(names))
+	}
+	for _, name := range names {
+		s.mapped[name] = struct{}{}
+	}
+	return s
+}
+
+// merge unions two snapshots; b wins for a name held in both.
+func (s volumeDeleteHoldSnapshot) merge(b volumeDeleteHoldSnapshot) volumeDeleteHoldSnapshot {
+	out := volumeDeleteHoldSnapshot{
+		pending: map[string]struct{}{}, holds: map[string]volumeDeleteHoldView{},
+		staged: map[string]struct{}{}, mapped: map[string]struct{}{},
+	}
+	for _, from := range []volumeDeleteHoldSnapshot{s, b} {
+		for name := range from.pending {
+			out.pending[name] = struct{}{}
+		}
+		for name, hold := range from.holds {
+			out.holds[name] = hold
+		}
+		for name := range from.staged {
+			out.staged[name] = struct{}{}
+		}
+		for name := range from.mapped {
+			out.mapped[name] = struct{}{}
+		}
+	}
+	return out
 }
 
 // A held deletion is an ordinary failed destroy: the storage-mutation bracket
@@ -211,6 +260,40 @@ func TestHeldResidualFootprintCountsInAdmission(t *testing.T) {
 	require.ErrorIs(t, b.afterVolumeDestroy(heldDeleteErr(name)), ErrVolumeDeleteHeld,
 		"the destroy's own answer passes through")
 	assert.Equal(t, base, b.pool.Stats().RetainedDiskMB, "a removal-phase hold is its caller's to account")
+	assert.False(t, b.pool.Stats().DiskAccountingHeld)
+
+	// An unsized hold is never counted as zero: disk admission is withheld
+	// until a publication that counts it as residual.
+	snapshot.Store(unsizedDeletes(name))
+	require.NoError(t, b.afterVolumeDestroy(nil))
+	assert.True(t, b.pool.Stats().DiskAccountingHeld)
+	assert.Equal(t, base, b.pool.Stats().RetainedDiskMB)
+	snapshot.Store(residualDeletes(40, name))
+	require.NoError(t, b.afterVolumeDestroy(nil))
+	assert.False(t, b.pool.Stats().DiskAccountingHeld, "the sized footprint replaces the exclusion")
+	assert.Equal(t, base+40, b.pool.Stats().RetainedDiskMB)
+}
+
+// Before the first full accounting refresh no residual term can be published,
+// so an unsized hold acquires the disk exclusion but nothing releases it until
+// a publication counts the footprint.
+func TestUnsizedHoldWithholdsDiskBeforeTheFirstRefresh(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	attachRetentionStore(t, b)
+	const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	var snapshot atomic.Value
+	snapshot.Store(unsizedDeletes(name))
+	b.volumes = &mockVolumeManager{
+		VolumeDeleteHoldsFn: func() volumeDeleteHoldSnapshot { return snapshot.Load().(volumeDeleteHoldSnapshot) },
+	}
+	require.NoError(t, b.refreshHeldResidualAccounting())
+	assert.True(t, b.pool.Stats().DiskAccountingHeld)
+	snapshot.Store(residualDeletes(40, name))
+	require.NoError(t, b.refreshHeldResidualAccounting())
+	assert.True(t, b.pool.Stats().DiskAccountingHeld, "no publication yet counts the footprint")
+	require.NoError(t, b.refreshRetentionAccountingChecked())
+	assert.False(t, b.pool.Stats().DiskAccountingHeld)
+	assert.GreaterOrEqual(t, b.pool.Stats().RetainedDiskMB, int64(40))
 }
 
 // Re-provisioning a lease whose own volume is still being deleted is refused
@@ -295,7 +378,7 @@ func TestStartQuotaReconcileSkipsAHeldMarkerlessXFSVolume(t *testing.T) {
 	require.NoError(t, b.reconcileVolumeQuotas(t.Context()), "startup quota reconciliation succeeds")
 	assert.Equal(t, before+1, testutil.ToFloat64(pending))
 	assert.NoFileExists(t, logPath, "no limit is touched for a held deletion")
-	assert.True(t, mgr.VolumeDeleteHolds().removalHeld(stage.volumeID.value()))
+	assert.True(t, mgr.VolumeDeleteHolds().callerHeld(stage.volumeID.value()))
 }
 
 // The held twin of TestVolumeRecoveryPendingPreservesCloseFinalizersAndRejectsLiveRetry.

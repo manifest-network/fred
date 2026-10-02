@@ -269,6 +269,10 @@ type Backend struct {
 	// store. Both are guarded by retentionAccountingMu.
 	retentionStoreDiskMB    int64
 	retentionStoreDiskKnown bool
+	// unsizedDeleteDiskHold is the pool's disk exclusion while a held volume
+	// deletion's footprint is unknown (ENG-1117); nil when none is. Guarded by
+	// retentionAccountingMu.
+	unsizedDeleteDiskHold *shared.DiskAccountingHold
 
 	// callbackStore persists pending callbacks in bbolt
 	callbackStore *shared.CallbackStore

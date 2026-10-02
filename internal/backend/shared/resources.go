@@ -53,6 +53,12 @@ type ResourcePool struct {
 	// labels or overwrite the known, immutable resource ledger.
 	accountingHolds map[*resourceAccountingHoldState]struct{}
 
+	// diskAccountingHolds withhold disk capacity only: while one exists, a
+	// footprint of unknown size is on disk, so available disk is unknown and
+	// every disk-bearing allocation is refused. CPU and memory stay
+	// admissible. Like accountingHolds, each is released only by its owner.
+	diskAccountingHolds map[*diskAccountingHoldState]struct{}
+
 	// Per-lease tracking
 	allocations map[string]ResourceAllocation
 
@@ -99,6 +105,55 @@ func (h ResourceAccountingHold) Release() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.accountingHolds, h.state)
+}
+
+// ErrDiskAccountingIncomplete refuses a disk-bearing allocation while a
+// footprint whose size is not yet known remains on disk. It is a capacity
+// refusal, not a fault: allocations that need no disk stay admissible.
+var ErrDiskAccountingIncomplete = errors.New("disk capacity is withheld while a footprint of unknown size remains")
+
+// DiskAccountingHold is pool-issued ownership of one disk-capacity exclusion.
+// While any is held, available disk is unknown: every allocation, adoption or
+// provision reservation that needs disk is refused with
+// ErrDiskAccountingIncomplete, and the stats report no available disk.
+// SetRetainedDisk cannot clear it; only its owner's Release can. Copies share
+// one idempotent release, and the zero value grants none.
+type DiskAccountingHold struct {
+	state *diskAccountingHoldState
+}
+
+type diskAccountingHoldState struct{ pool *ResourcePool }
+
+// HoldUnsizedDiskFootprint atomically withholds disk capacity while a
+// footprint that cannot yet be sized remains on disk. The owner releases the
+// hold once that footprint is either sized and counted (for example through
+// SetRetainedDisk) or gone.
+func (p *ResourcePool) HoldUnsizedDiskFootprint() DiskAccountingHold {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	state := &diskAccountingHoldState{pool: p}
+	if p.diskAccountingHolds == nil {
+		p.diskAccountingHolds = make(map[*diskAccountingHoldState]struct{})
+	}
+	p.diskAccountingHolds[state] = struct{}{}
+	return DiskAccountingHold{state: state}
+}
+
+// Release returns only the disk exclusion owned by this hold.
+func (h DiskAccountingHold) Release() {
+	if h.state == nil {
+		return
+	}
+	p := h.state.pool
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.diskAccountingHolds, h.state)
+}
+
+// diskWithheldLocked reports whether a disk exclusion is held. The caller
+// MUST hold p.mu.
+func (p *ResourcePool) diskWithheldLocked() bool {
+	return len(p.diskAccountingHolds) != 0
 }
 
 // NewResourcePool creates a new resource pool with the given capacity.
@@ -267,7 +322,11 @@ func (p *ResourcePool) tryAllocateAdoptAllResolvedLocked(
 			return fmt.Errorf("restore disk requirement exceeds supported range")
 		}
 	}
-	if delta := newDiskMB - min(newDiskMB, oldRetainedDiskMB); delta > p.availableDiskLocked() {
+	delta := newDiskMB - min(newDiskMB, oldRetainedDiskMB)
+	if delta > 0 && p.diskWithheldLocked() {
+		return ErrDiskAccountingIncomplete
+	}
+	if delta > p.availableDiskLocked() {
 		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available",
 			delta, p.availableDiskLocked())
 	}
@@ -341,6 +400,9 @@ func (p *ResourcePool) tryAllocateProfileLocked(leaseUUID, sku, tenant string, p
 	if profile.MemoryMB > p.availableMemoryLocked() {
 		return fmt.Errorf("insufficient memory: need %d MB, have %d MB available",
 			profile.MemoryMB, p.availableMemoryLocked())
+	}
+	if gateDisk && profile.DiskMB > 0 && p.diskWithheldLocked() {
+		return ErrDiskAccountingIncomplete
 	}
 	if gateDisk && profile.DiskMB > p.availableDiskLocked() {
 		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available",
@@ -427,7 +489,13 @@ func (p *ResourcePool) availableMemoryLocked() int64 {
 	return availableInt64(p.totalMemory, p.allocatedMemory)
 }
 
+// availableDiskLocked is every disk gate's headroom. While a disk exclusion is
+// held it is zero, so a gate that does not check the exclusion itself still
+// refuses every disk-bearing request.
 func (p *ResourcePool) availableDiskLocked() int64 {
+	if p.diskWithheldLocked() {
+		return 0
+	}
 	return availableInt64(p.totalDisk, p.allocatedDisk, p.retainedDisk)
 }
 
@@ -572,15 +640,16 @@ func (p *ResourcePool) Stats() ResourceStats {
 	defer p.mu.Unlock()
 
 	return ResourceStats{
-		TotalCPU:          p.totalCPU,
-		TotalMemoryMB:     p.totalMemory,
-		TotalDiskMB:       p.totalDisk,
-		AllocatedCPU:      p.allocatedCPU,
-		AllocatedMemoryMB: p.allocatedMemory,
-		AllocatedDiskMB:   p.allocatedDisk,
-		RetainedDiskMB:    p.retainedDisk,
-		AllocationCount:   len(p.allocations),
-		AccountingHeld:    len(p.accountingHolds) != 0,
+		TotalCPU:           p.totalCPU,
+		TotalMemoryMB:      p.totalMemory,
+		TotalDiskMB:        p.totalDisk,
+		AllocatedCPU:       p.allocatedCPU,
+		AllocatedMemoryMB:  p.allocatedMemory,
+		AllocatedDiskMB:    p.allocatedDisk,
+		RetainedDiskMB:     p.retainedDisk,
+		AllocationCount:    len(p.allocations),
+		AccountingHeld:     len(p.accountingHolds) != 0,
+		DiskAccountingHeld: p.diskWithheldLocked(),
 	}
 }
 
@@ -617,6 +686,9 @@ type ResourceStats struct {
 	RetainedDiskMB    int64
 	AllocationCount   int
 	AccountingHeld    bool
+	// DiskAccountingHeld reports a disk-only exclusion: a footprint of unknown
+	// size remains on disk, so no disk-bearing allocation is admitted.
+	DiskAccountingHeld bool
 }
 
 // RoutingLoadStats projects a complete resource ledger into the load signal
@@ -657,7 +729,7 @@ func (s ResourceStats) AvailableMemoryMB() int64 {
 // total_disk_mb shrink or stale retained projection must not surface a negative
 // "available" via the /stats endpoints).
 func (s ResourceStats) AvailableDiskMB() int64 {
-	if s.AccountingHeld {
+	if s.AccountingHeld || s.DiskAccountingHeld {
 		return 0
 	}
 	return availableInt64(s.TotalDiskMB, s.AllocatedDiskMB, s.RetainedDiskMB)

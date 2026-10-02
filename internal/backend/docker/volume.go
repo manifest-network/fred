@@ -93,9 +93,10 @@ type volumeReader interface {
 	VolumeDeleteHolds() volumeDeleteHoldSnapshot
 
 	// PrecheckDestroy answers a destroy from the manager's own state without
-	// the caller's namespace lock: held (in the removal phase), gone (a residual
-	// hold, or a name with no stage and no project mapping, whose final path an
-	// identity-bound Lstat proved absent), or needs-lock for everything else.
+	// the caller's namespace lock: held (in the removal or unsized phase), gone
+	// (a residual hold, or a name with no stage and no project mapping, whose
+	// final path an identity-bound Lstat proved absent), or needs-lock for
+	// everything else.
 	PrecheckDestroy(managedVolumeName) (destroyPrecheckVerdict, error)
 
 	// Validate checks filesystem support and permissions, and rebuilds local

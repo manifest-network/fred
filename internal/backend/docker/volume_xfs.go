@@ -1659,11 +1659,12 @@ func (x *xfsVolumeManager) runXFSDeleteStageCleanup(
 	}
 	if finalExists {
 		attempt.finalSeen = true
-		if wasHeld && previous.residual {
-			// The final path's absence was durable when the hold entered its
-			// residual phase, and nothing in fred can publish the name while
-			// the stage exists. A directory there now is an authority
-			// contradiction, not tenant data this deletion may remove.
+		if wasHeld && previous.absenceObserved() {
+			// This process observed the final path absent when the hold
+			// entered its unsized or residual phase, and nothing in fred can
+			// publish the name while the stage exists. A directory there now
+			// is an authority contradiction, not tenant data this deletion may
+			// remove.
 			return fmt.Errorf("xfs volume %q exists again while delete-stage %q holds only its project",
 				stage.volumeID.value(), stage.value())
 		}
@@ -1707,7 +1708,7 @@ func (x *xfsVolumeManager) runXFSDeleteStageCleanup(
 	usage, usageErr := x.waitForZeroProjectQuotaUsage(ctx, stage.projID)
 	if usage.complete {
 		if footprint, ok := residualFootprintFromRow(usage.blockRow); ok {
-			attempt.footprint, attempt.footprintKnown = footprint, true
+			attempt.footprint = footprint
 		}
 	}
 	switch {
@@ -2301,8 +2302,8 @@ func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB in
 // ownership check happened before the stage was minted.
 //
 // A held name is answered from the hold, without any filesystem work: the
-// removal phase answers ErrVolumeDeleteHeld, and the residual phase answers
-// nil once an Lstat in this call proves the final path absent. Only the hold
+// removal and unsized phases answer ErrVolumeDeleteHeld, and the residual
+// phase answers nil once an Lstat in this call proves the final path absent. Only the hold
 // executor (RetryHeldVolumeDelete) runs held work. A first-time deletion runs
 // inline under liveXFSDeleteBudget, which ends early when the caller or the
 // Backend stops; before the executor runs (during Start) it is not attempted at
@@ -2465,8 +2466,8 @@ func (x *xfsVolumeManager) List() ([]string, error) {
 }
 
 // ListForProof is the on-disk listing united with every name whose deletion
-// has not yet made the final path's absence durable (an in-flight or
-// removal-phase delete stage), sorted and de-duplicated. The latch used to keep
+// has not settled its caller (an in-flight delete stage, or one held in the
+// removal or unsized phase), sorted and de-duplicated. The latch used to keep
 // consumers from reading such a name's absence as completion; this listing now
 // does (ENG-1117). The registry is read after the disk, so a stage minted
 // between the two reads cannot hide a name the listing missed.
@@ -2545,7 +2546,7 @@ func (x *xfsVolumeManager) AttestManagedVolume(ctx context.Context, name managed
 
 // attestAbsentDeletingVolume attests a name ListForProof lists although its
 // final directory is gone: a deletion whose stage is in flight or held in the
-// removal phase. The stage must still be the attested empty directory, and the
+// removal or unsized phase. The stage must still be the attested empty directory, and the
 // project-ID authority must still name it. Any other absent name is an error.
 func (x *xfsVolumeManager) attestAbsentDeletingVolume(root *os.Root, name managedVolumeName) error {
 	x.mu.Lock()
@@ -2903,7 +2904,7 @@ func parseXfsReportUsed(out string, projID uint32) (int64, bool, error) {
 // must be non-negative integers.
 func parseXfsReportRow(out string, projID uint32) (xfsProjectQuotaRow, error) {
 	want := strconv.FormatUint(uint64(projID), 10)
-	row := xfsProjectQuotaRow{projID: projID}
+	row := xfsProjectQuotaRow{projID: projID, parsedFromReport: true}
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
@@ -3263,10 +3264,11 @@ func (x *xfsVolumeManager) RequireNoInterruptedVolumeMutations(ctx context.Conte
 // no tenant data and cannot be reached by one.
 //
 // Delete stages are not cleaned here. Validate registered each as a hold, and
-// the hold executor deletes them after Start. This only sizes the holds whose
-// final path is already gone (one Lstat, one parent sync and one quota-row read
-// each, no removal and no waiting), so the admission pool counts their
-// projects before the Backend serves.
+// the hold executor deletes them after Start. This only classifies those holds
+// (classifyRecoveredDeleteHolds: no removal, quota reads bounded in aggregate),
+// so that a deletion whose caller may already have settled is counted in
+// admission, or withholds disk admission while unsized, before the Backend
+// serves.
 func (x *xfsVolumeManager) RecoverInterruptedVolumeMutations(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -3292,8 +3294,7 @@ func (x *xfsVolumeManager) RecoverInterruptedVolumeMutations(ctx context.Context
 			return fmt.Errorf("recover interrupted xfs create %q: %w", stage.value(), err)
 		}
 	}
-	x.promoteRecoveredResidualHolds(ctx)
-	return nil
+	return x.classifyRecoveredDeleteHolds(ctx)
 }
 
 func (x *xfsVolumeManager) Validate() error {

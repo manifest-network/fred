@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
@@ -33,7 +34,13 @@ import (
 //     the project remain, pending the zero-usage proof, the limit clear and
 //     the stage removal. Destroy answers nil after an Lstat proves the final
 //     path absent, the caller settles, and the admission pool counts the
-//     project's footprint instead (heldResidualMB).
+//     project's footprint instead (heldResidualMB);
+//   - unsized phase: the final path was observed gone, a caller may already
+//     have settled (a previous process could have answered it), and the
+//     project's footprint is not known. Destroy still answers
+//     ErrVolumeDeleteHeld and ListForProof still lists the name, and the
+//     admission pool withholds disk until the footprint is known: an unsized
+//     footprint is never counted as zero.
 //
 // Only the background hold executor runs held work, through
 // RetryHeldVolumeDelete in the storage-mutation bracket under the lease's
@@ -52,7 +59,7 @@ const (
 	// volumeDeleteHoldMinSlice is the least budget worth starting an attempt.
 	volumeDeleteHoldMinSlice = time.Second
 	// volumeDeleteHoldResumeBudget bounds the close resumes a pass enqueues
-	// for leases whose holds left the removal phase.
+	// for leases whose holds stopped holding their caller.
 	volumeDeleteHoldResumeBudget = 30 * time.Second
 	// volumeDeleteHoldComponent labels the executor's recovered panics.
 	volumeDeleteHoldComponent = "docker_volume_delete_hold"
@@ -64,7 +71,7 @@ type volumeDeleteHoldView struct {
 	volume      managedVolumeName
 	stage       string
 	projectID   uint32
-	residual    bool
+	phase       xfsDeleteHoldPhaseKind
 	footprintMB int64
 	reason      volumeDeleteHoldReason
 	attempts    int
@@ -74,27 +81,39 @@ type volumeDeleteHoldView struct {
 }
 
 // phaseLabel is the hold's phase as reported in logs and metrics.
-func (v volumeDeleteHoldView) phaseLabel() string {
-	if v.residual {
-		return volumeDeleteHoldPhaseResidual
-	}
-	return volumeDeleteHoldPhaseRemoval
-}
+func (v volumeDeleteHoldView) phaseLabel() string { return v.phase.label() }
+
+// holdsCaller reports whether a destroy of this hold's name answers
+// ErrVolumeDeleteHeld, keeping its caller pending: the removal and unsized
+// phases.
+func (v volumeDeleteHoldView) holdsCaller() bool { return v.phase != holdPhaseResidual }
 
 // Phase labels of a held deletion, in logs and metrics.
 const (
 	volumeDeleteHoldPhaseRemoval  = "removal"
+	volumeDeleteHoldPhaseUnsized  = "unsized"
 	volumeDeleteHoldPhaseResidual = "residual"
 )
 
+// volumeDeleteHoldPhases are every phase label, for metric pre-initialization.
+var volumeDeleteHoldPhases = []string{
+	volumeDeleteHoldPhaseRemoval, volumeDeleteHoldPhaseUnsized, volumeDeleteHoldPhaseResidual,
+}
+
 // volumeDeleteHoldSnapshot is one point-in-time view of a manager's pending
-// deletions. Managers that never stage a deletion return the zero value,
-// which reports nothing pending and nothing held.
+// deletions, and of the names its memory still tracks. Managers that never
+// stage a deletion return the zero value, which reports nothing pending and
+// nothing held.
 type volumeDeleteHoldSnapshot struct {
 	// pending holds every managed name with a delete stage, held or not.
 	pending map[string]struct{}
 	// holds holds the held subset, by managed name.
 	holds map[string]volumeDeleteHoldView
+	// staged holds every managed name with a create or delete stage.
+	staged map[string]struct{}
+	// mapped holds every managed name with a project mapping: a volume that
+	// exists, or whose deletion has not released its project yet.
+	mapped map[string]struct{}
 }
 
 // deletePending reports whether name has a delete stage, held or in flight.
@@ -104,42 +123,127 @@ func (s volumeDeleteHoldSnapshot) deletePending(name string) bool {
 	return ok
 }
 
-// removalHeld reports whether name is held in the removal phase, where a
-// destroy answers ErrVolumeDeleteHeld without any work.
-func (s volumeDeleteHoldSnapshot) removalHeld(name string) bool {
+// callerHeld reports whether name is held in a phase that keeps its caller
+// pending (removal or unsized), where a destroy answers ErrVolumeDeleteHeld
+// without any work.
+func (s volumeDeleteHoldSnapshot) callerHeld(name string) bool {
 	hold, ok := s.holds[name]
-	return ok && !hold.residual
+	return ok && hold.holdsCaller()
 }
 
-// residualFootprintMB is the admission term for residual holds: the sum of
-// their projects' footprints, saturating rather than wrapping.
-func (s volumeDeleteHoldSnapshot) residualFootprintMB() int64 {
-	var total int64
+// residualHeld reports whether name is held in the residual phase: its caller
+// has settled, and admission counts its project's footprint.
+func (s volumeDeleteHoldSnapshot) residualHeld(name string) bool {
+	hold, ok := s.holds[name]
+	return ok && hold.phase == holdPhaseResidual
+}
+
+// heldDeletionAccount is the admission pool's view of the held deletions
+// whose caller may have settled: the summed footprint of the residual ones,
+// and how many are unsized. An unsized hold is never counted as zero: while
+// any exists, disk admission is withheld.
+type heldDeletionAccount struct {
+	residualMB int64
+	unsized    int
+}
+
+// admissionAccount sums the residual footprints, saturating rather than
+// wrapping, and counts the unsized holds.
+func (s volumeDeleteHoldSnapshot) admissionAccount() heldDeletionAccount {
+	var account heldDeletionAccount
 	for _, hold := range s.holds {
-		if !hold.residual {
-			continue
+		switch hold.phase {
+		case holdPhaseUnsized:
+			account.unsized++
+		case holdPhaseResidual:
+			if hold.footprintMB > math.MaxInt64-account.residualMB {
+				account.residualMB = math.MaxInt64
+				continue
+			}
+			account.residualMB += hold.footprintMB
 		}
-		if hold.footprintMB > math.MaxInt64-total {
-			return math.MaxInt64
-		}
-		total += hold.footprintMB
 	}
-	return total
+	return account
 }
 
 // phaseCounts counts the holds in each phase.
-func (s volumeDeleteHoldSnapshot) phaseCounts() (removal, residual int) {
-	for _, hold := range s.holds {
-		if hold.residual {
-			residual++
-		} else {
-			removal++
-		}
+func (s volumeDeleteHoldSnapshot) phaseCounts() map[string]int {
+	counts := make(map[string]int, len(volumeDeleteHoldPhases))
+	for _, phase := range volumeDeleteHoldPhases {
+		counts[phase] = 0
 	}
-	return removal, residual
+	for _, hold := range s.holds {
+		counts[hold.phaseLabel()]++
+	}
+	return counts
 }
 
-// dueInOrder returns the holds due at now, least recently attempted first
+// closeSlotState is the state of one managed-volume slot of a close or an
+// operation, as far as held deletions are concerned.
+type closeSlotState uint8
+
+const (
+	// closeSlotDone: nothing of the slot remains to wait for. It was
+	// destroyed, its held deletion is residual (its caller settled), it was
+	// retained, or it never had a volume (a stateless service).
+	closeSlotDone closeSlotState = iota
+	// closeSlotHeld: its deletion is held with the caller pending; only the
+	// hold executor can finish it.
+	closeSlotHeld
+	// closeSlotRemaining: the volume still exists, or has a stage that no
+	// hold owns: work the close itself still has to do or observe.
+	closeSlotRemaining
+)
+
+// slotState classifies the slot whose canonical volume name is canonical,
+// from memory only. A slot can also be held under its retained name.
+func (s volumeDeleteHoldSnapshot) slotState(canonical string) closeSlotState {
+	retained := retainedName(canonical)
+	switch {
+	case s.callerHeld(canonical) || s.callerHeld(retained):
+		return closeSlotHeld
+	case s.residualHeld(canonical) || s.residualHeld(retained):
+		return closeSlotDone
+	case s.stagedName(canonical) || s.stagedName(retained):
+		return closeSlotRemaining
+	case s.mappedName(canonical):
+		return closeSlotRemaining
+	default:
+		// A retained name with a mapping is a retained volume: that slot is
+		// done for this close.
+		return closeSlotDone
+	}
+}
+
+func (s volumeDeleteHoldSnapshot) stagedName(name string) bool {
+	_, ok := s.staged[name]
+	return ok
+}
+
+func (s volumeDeleteHoldSnapshot) mappedName(name string) bool {
+	_, ok := s.mapped[name]
+	return ok
+}
+
+// awaitsOnlyHeldDeletes reports whether the slots named by their canonical
+// volume names wait on nothing but held deletions: at least one is held, and
+// every other is done. It is the one predicate behind the close-churn skip,
+// the HTTP short-circuit, the close-age gauges and the stopped drain proof.
+func (s volumeDeleteHoldSnapshot) awaitsOnlyHeldDeletes(canonical []string) bool {
+	held := 0
+	for _, name := range canonical {
+		switch s.slotState(name) {
+		case closeSlotRemaining:
+			return false
+		case closeSlotHeld:
+			held++
+		}
+	}
+	return held > 0
+}
+
+// dueInOrder returns the holds due at now: unsized holds first, since they
+// withhold disk admission, then least recently attempted first
 // (never-attempted first), then by name, so one pass's budget rotates over
 // every hold instead of starving the ones a busy hold keeps behind it.
 func (s volumeDeleteHoldSnapshot) dueInOrder(now time.Time) []volumeDeleteHoldView {
@@ -150,6 +254,12 @@ func (s volumeDeleteHoldSnapshot) dueInOrder(now time.Time) []volumeDeleteHoldVi
 		}
 	}
 	slices.SortFunc(due, func(a, b volumeDeleteHoldView) int {
+		if aUnsized, bUnsized := a.phase == holdPhaseUnsized, b.phase == holdPhaseUnsized; aUnsized != bUnsized {
+			if aUnsized {
+				return -1
+			}
+			return 1
+		}
 		if c := a.lastAttempt.Compare(b.lastAttempt); c != 0 {
 			return c
 		}
@@ -178,8 +288,9 @@ type destroyPrecheckVerdict uint8
 const (
 	// destroyPrecheckNeedsLock: the manager cannot answer from its own state.
 	destroyPrecheckNeedsLock destroyPrecheckVerdict = iota
-	// destroyPrecheckHeld: the name is held in the removal phase; the destroy
-	// answers ErrVolumeDeleteHeld without the lock and without any work.
+	// destroyPrecheckHeld: the name is held in a phase that keeps its caller
+	// pending (removal or unsized); the destroy answers ErrVolumeDeleteHeld
+	// without the lock and without any work.
 	destroyPrecheckHeld
 	// destroyPrecheckGone: an identity-bound Lstat proved the final path absent,
 	// and the name has either a residual hold or no stage and no project
@@ -188,8 +299,8 @@ const (
 )
 
 // precheckDestroy answers a destroy of id from the manager's own state,
-// without the lease's namespace lock (ENG-1117): a removal-phase hold answers
-// ErrVolumeDeleteHeld, and a positively absent name with nothing pending
+// without the lease's namespace lock (ENG-1117): a hold that keeps its caller
+// pending answers ErrVolumeDeleteHeld, and a positively absent name with nothing pending
 // answers nil. answered is false when the destroy must take the lock. It is
 // what keeps a close, the reaper, or HTTP Deprovision from waiting behind the
 // hold executor's slice on a name that needs no work. A malformed name is
@@ -213,8 +324,9 @@ func (b *Backend) precheckDestroy(id string) (answered bool, err error) {
 type volumeDeleteHoldPassReport struct {
 	// attempted counts the holds the pass retried.
 	attempted int
-	// leftRemoval names the holds that left the removal phase during the pass
-	// (completed, or durably gone and residual): their callers can now settle.
+	// leftRemoval names the holds that stopped holding their caller during
+	// the pass (completed, or durably gone, sized and residual): their callers
+	// can now settle.
 	leftRemoval []managedVolumeName
 }
 
@@ -247,7 +359,7 @@ func (b *Backend) runVolumeDeleteHoldPass(
 			b.logger.Warn("held volume delete retry failed",
 				"volume_id", hold.volume.value(), "delete_stage", hold.stage, "error", err)
 		}
-		if !hold.residual && !b.volumes.VolumeDeleteHolds().removalHeld(hold.volume.value()) {
+		if hold.holdsCaller() && !b.volumes.VolumeDeleteHolds().callerHeld(hold.volume.value()) {
 			report.leftRemoval = append(report.leftRemoval, hold.volume)
 		}
 	}
@@ -272,7 +384,7 @@ func (b *Backend) volumeDeleteHoldLoop() {
 
 // runVolumeDeleteHoldIteration is one executor pass inside the cleanup panic
 // boundary: retry the due holds under the pass budget, resume the closes whose
-// holds left the removal phase, and sample the gauges.
+// holds stopped holding their caller, and sample the gauges.
 func (b *Backend) runVolumeDeleteHoldIteration() {
 	util.RunCleanupIteration(func() error {
 		passCtx, cancel := context.WithTimeout(b.stopCtx, volumeDeleteHoldPassBudget)
@@ -287,7 +399,7 @@ func (b *Backend) runVolumeDeleteHoldIteration() {
 }
 
 // resumeClosesAfterHeldDeletes enqueues a close resume for each lease whose
-// held deletion just left the removal phase, so the close settles now instead
+// held deletion just stopped holding its caller, so the close settles now instead
 // of on the next reconcile. A lease whose command fence is busy is skipped:
 // the live command holding it observes the same state.
 func (b *Backend) resumeClosesAfterHeldDeletes(names []managedVolumeName) {
@@ -322,27 +434,31 @@ func (b *Backend) resumeClosesAfterHeldDeletes(names []managedVolumeName) {
 	}
 }
 
-// closeAwaitsHeldDeletes reports, from memory only, whether a pending close is
-// waiting on nothing but held deletions: every managed volume name of its
-// items is held in the removal phase, and its projection records no
-// container. Retrying such a close would only advance its durable generation
-// and rewrite its diagnostics; the hold executor resumes it when one of its
-// holds leaves the removal phase. Only a projection can vouch that no
-// container remains, so a close without one (cleanup-only) is never skipped:
-// a remaining container could be the very writer keeping a hold from
-// finishing.
-func (b *Backend) closeAwaitsHeldDeletes(claim shared.CloseIntentClaim, holds volumeDeleteHoldSnapshot) bool {
-	items := claim.Items()
-	if len(items) == 0 {
-		return false
-	}
+// leaseSlotNames returns the canonical volume name of every slot of a lease's
+// items, one per instance, whether or not that instance ever had a volume.
+func leaseSlotNames(leaseUUID string, items []backend.LeaseItem) []string {
+	var names []string
 	for _, item := range items {
 		for i := range item.Quantity {
-			name := canonicalVolumeName(claim.LeaseUUID(), item.ServiceName, i)
-			if !holds.removalHeld(name) && !holds.removalHeld(retainedName(name)) {
-				return false
-			}
+			names = append(names, canonicalVolumeName(leaseUUID, item.ServiceName, i))
 		}
+	}
+	return names
+}
+
+// closeAwaitsHeldDeletes reports, from memory only, whether a pending close is
+// waiting on nothing but held deletions: every REMAINING managed volume slot
+// of its items is held with its caller pending (awaitsOnlyHeldDeletes; a slot
+// already destroyed, residual, retained, or never created counts as done), and
+// its projection records no container. Retrying such a close would only
+// advance its durable generation and rewrite its diagnostics; the hold
+// executor resumes it when one of its holds stops holding its caller. Only a
+// projection can vouch that no container remains, so a close without one
+// (cleanup-only) is never skipped: a remaining container could be the very
+// writer keeping a hold from finishing.
+func (b *Backend) closeAwaitsHeldDeletes(claim shared.CloseIntentClaim, holds volumeDeleteHoldSnapshot) bool {
+	if !holds.awaitsOnlyHeldDeletes(leaseSlotNames(claim.LeaseUUID(), claim.Items())) {
+		return false
 	}
 	b.provisionsMu.RLock()
 	defer b.provisionsMu.RUnlock()
@@ -353,7 +469,7 @@ func (b *Backend) closeAwaitsHeldDeletes(claim shared.CloseIntentClaim, holds vo
 // sampleVolumeDeleteHoldMetrics projects the manager's holds into the
 // Backend-owned gauge.
 func (b *Backend) sampleVolumeDeleteHoldMetrics() {
-	removal, residual := b.volumes.VolumeDeleteHolds().phaseCounts()
-	volumeDeleteHolds.WithLabelValues(volumeDeleteHoldPhaseRemoval).Set(float64(removal))
-	volumeDeleteHolds.WithLabelValues(volumeDeleteHoldPhaseResidual).Set(float64(residual))
+	for phase, count := range b.volumes.VolumeDeleteHolds().phaseCounts() {
+		volumeDeleteHolds.WithLabelValues(phase).Set(float64(count))
+	}
 }
