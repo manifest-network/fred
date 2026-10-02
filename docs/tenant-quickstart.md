@@ -288,23 +288,31 @@ curl -H "Authorization: Bearer $(fresh_token)" \
 
 ### Repeated failures and lease closure
 
-A failed `ACTIVE` lease is re-provisioned automatically, with your volumes kept. The provider
-closes it on-chain (reason `workload failed repeatedly`) only after **three consecutive failures
-of your own workload**: your container exiting on its own (any exit code, including an
-out-of-memory kill at your SKU's limit) while the lease was ready. `terminal_budget` shows the
-count (`consecutive_failures`) and whether the lease will be closed (`verdict`: `retry` or
-`exhausted`).
+A failed `ACTIVE` lease is re-provisioned automatically, with your volumes kept. For repeated
+failures, the provider closes it on-chain (reason `workload failed repeatedly`) only after
+**three consecutive failures of your own workload**: your container exiting on its own (any exit
+code, including an out-of-memory kill at your SKU's limit) while the lease was ready.
+`terminal_budget` shows the recorded count (`consecutive_failures`) and whether the lease will be
+closed (`verdict`: `retry` or `exhausted`).
 
-- The count resets once the lease has stayed ready for ten minutes; it is reset at the next
-  failure or restart, so a long-healthy lease may still show an old count until then.
-- A restart or update you request resets it, and its outcome never counts, even if it fails and
-  rolls back.
+- Once the lease has stayed ready for ten minutes, its next failure, restart or update starts a
+  fresh streak. The count shown changes only at such a transition, so a lease that has been
+  healthy for a long time may still show an old count until then.
+- A restart or update you request resets the count, and its outcome never counts, even if it
+  fails and rolls back. A redeploy the provider starts on its own, for example after a
+  custom-domain change, does not reset it.
 - These never count: backend restarts, host reboots, an operator stopping or killing your
-  container, a container that vanished, platform and image-admission errors.
+  container through Docker, a container that vanished, platform and image-admission errors.
 - `fail_count` keeps counting every failure over the lease's life and never decides a close.
 
-A container that crashes during startup verification, before it ever becomes ready, does not
-reach this budget today.
+A separate rule still closes an `ACTIVE` lease at once: when its automatic re-provision is
+refused as invalid, for example because its image is no longer allowed.
+
+Known gap, fixed separately for the same release (ENG-1125): a container that crashes during
+startup verification, before it ever becomes ready, does not reach this budget. On an automatic
+re-provision such a lease stays `provisioning` and keeps billing; close it yourself or update the
+manifest. In a stack with several services, a service that dies while a later one is still
+starting can likewise keep the lease cycling through re-provisions without ever being closed.
 
 ---
 

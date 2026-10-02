@@ -1046,9 +1046,11 @@ When a provision has `status=failed` (e.g., a container crashed and was detected
 
 `FailCount` is a lifetime diagnostic of every recorded failure and never decides whether a lease is closed. That is the **terminal budget** (ENG-799), kept on the actor-owned projection by the lease state machine:
 
-- Every failure is recorded with a sealed attribution (`shared/leasesm/failurecause`). Only `tenant_workload` counts: a `die` delivered by the live event stream whose subscription also saw that run's `start` and no `kill`, for a container that exited with any status (OOM kills included). The event loop subscribes to `start`, `kill` and `die` together and keeps one `EventSession` per connection, so a reconnect forgets everything it could have missed. A death after an observed `kill` (operator or daemon `docker kill`/`docker stop`) or of a vanished/`removing`/`dead` container is `disruption`; a death found only by the reconcile sweep, or of a run that started before the stream connected, is `unknown`; restart/update/restore outcomes are `maintenance`; pre-effect refusals, internal errors and cohort divergence are `platform`. None of those count.
-- Three consecutive counted failures exhaust the budget. Every exit from Ready resets the streak once the lease was Ready for ten minutes (anchored on Ready entry), and an accepted tenant restart or update resets it. An uncounted failure neither increments nor resets.
-- The budget is in memory: a backend restart resets it, like moby's daemon restore. `recoverState` carries it across every rebuild that keeps the lease, recording an off-actor Ready rebuild only with a helper that can move it toward a reset. A cold-recovered failed provision (host reboot) still bumps `FailCount` but starts with a fresh budget.
+- Every failure is recorded with a sealed attribution (`shared/leasesm/failurecause`). Only `tenant_workload` counts: a `die` delivered by the live event stream whose subscription also saw that run's `start` and no `kill`, for a container that exited with any status (OOM kills included). A death after an observed `kill` (operator or daemon `docker kill`/`docker stop`) or of a vanished/`removing`/`dead` container is `disruption`; a death found only by the reconcile sweep, or of a run that started before the stream connected, is `unknown`; restart/update/restore outcomes are `maintenance`; pre-effect refusals, internal errors and cohort divergence are `platform`. None of those count. Whether a dead container `Exited` or is `Gone` is decided by this adapter (`containerInfoToInstanceState`): `exited` with a status is `Exited`; `removing`, `dead` and a positively absent container are `Gone`.
+- The event loop (`container_event_loop.go`) is the only code that can mint live provenance. Its reader subscribes to `start`, `kill` and `die` together and keeps one event session per connection, held in that function's frame alone, so a reconnect forgets everything it could have missed. The reader only does bookkeeping: each death goes to a bounded queue (4096) drained in order by one dispatcher, which re-verifies storage identity, resolves the lease and routes the observation, so a slow death never stalls the subscription. A full queue or an unverifiable identity drops that dispatch (`die_event_dropped_total{source="event_loop"}`); the sweep later finds the death as `unknown`. A stream error or a non-terminal verification failure backs off (1s doubling to 30s) and reconnects with a fresh session; only shutdown or withdrawn storage authority stops the loop. `fred_docker_backend_container_event_stream_total{outcome}` counts `connected`, `reconnect` and `exited`. Provenance is bound to the container it was minted for: a live death observation takes its container from it, and the classifier ignores a provenance minted for another container, so it never counts there.
+- Three consecutive counted failures exhaust the budget. Every exit from Ready resets the streak once the lease was Ready for ten minutes (anchored on Ready entry); an exit after a shorter Ready period leaves it unchanged. An uncounted failure never increments the streak, but it is an exit from Ready like any other. An accepted tenant restart or update also resets the streak; a custom-domain redeploy does not.
+- The Ready boundary is structural: `ProvisionState.SetStatus` is the only writer of a projection's status, on the actor and off it, and `InheritTerminalBudget` the only way a budget moves onto a rebuilt projection; both apply the same anchor-and-reset rule, so a new transition cannot skip it. `internal/testutil/projection_status_guard_test.go` rejects any other write, and `shared/leasesm/ready_boundary_test.go` pins every state-machine transition into or out of Ready to a driver.
+- The budget is in memory: a backend restart resets it, like moby's daemon restore. `recoverState` carries it across every rebuild that keeps the lease through `InheritTerminalBudget`, which can only move it toward a reset. A cold-recovered failed provision (host reboot) still bumps `FailCount` but starts with a fresh budget.
 - `provisionToInfo` publishes it as `terminal_budget {verdict, consecutive_failures}`: `exhausted` only while the lease is Failed by a counted failure with a streak of three. The diagnostics fallback and retained records omit it.
 
 ## Lease State Machine
@@ -1156,8 +1158,9 @@ The edges above are the complete set of allowed transitions; any event not liste
   the current runtime's death is already owned by an active actor-close scope.
   A deprovisioning status alone does not suppress the drop signal;
   cohort-divergence refusal is logged, and the reconciler re-detects both from
-  current state. One wedged actor cannot stall die-event delivery for other
-  leases.
+  current state. A re-detected death carries no live provenance, so it is
+  attributed `unknown` and never counts toward the terminal budget (ENG-799).
+  One wedged actor cannot stall die-event delivery for other leases.
 
 ### Observability
 
@@ -1184,10 +1187,20 @@ these phases do not measure the full wall time of a failed replacement.
 - `fred_docker_backend_die_event_dropped_total{source}` — container-death
   observations refused because their exact generation was stale, recovery held
   the actor key, the backend was shutting down, or the current actor's inbox was
-  unavailable. Deaths positively owned by the current actor's active close
-  callback are excluded. `source` is `event_loop` or `reconcile`. The reconciler
-  re-detects current failures; sustained growth flags churn, recovery contention,
-  a wedged actor, or chronic burst.
+  unavailable; for `event_loop`, also deaths the loop could not dispatch because
+  its queue was full or storage identity could not be re-verified. Deaths
+  positively owned by the current actor's active close callback are excluded.
+  `source` is `event_loop` or `reconcile`. The reconciler re-detects current
+  failures, but a re-detected death has no live provenance: it is `unknown` and
+  never counts toward the terminal budget. Sustained growth flags churn,
+  recovery contention, a wedged actor, or chronic burst.
+- `fred_docker_backend_container_event_stream_total{outcome}` — the container
+  event subscription's lifecycle (ENG-799): `connected` (a subscription opened
+  after storage re-verification), `reconnect` (the stream ended or could not be
+  opened, and the loop retries with backoff), `exited` (the loop stopped:
+  shutdown or withdrawn storage authority). Deaths during a gap, and the first
+  death of any run that started before the stream (re)connected, are
+  attributed `unknown`.
 - `fred_docker_backend_pending_close_intents` and `fred_docker_backend_oldest_close_intent_age_seconds` — unlabeled aggregate count and oldest age for the non-expiring destructive-close journal. A brief non-zero value is normal while a close runs; sustained age means a finalizer dependency is unavailable. Use the lease-scoped recovery log to identify the row without introducing an unbounded lease label.
 - `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}` — exact provision/restore intents classified past their durable admission deadline. Both kinds share this configured horizon. Cleanup remains periodic and retryable; there is no container-start recovery timer.
 - `fred_docker_backend_operation_intent_recovery_cleanup_retries_total` — Deferred exact operation cleanup (`provision`/`restore`); intent and reservation remain for periodic retry.
