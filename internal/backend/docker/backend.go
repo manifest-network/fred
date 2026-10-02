@@ -273,6 +273,9 @@ type Backend struct {
 	// deletion's footprint is unknown (ENG-1117); nil when none is. Guarded by
 	// retentionAccountingMu.
 	unsizedDeleteDiskHold *shared.DiskAccountingHold
+	// holdExecutor is the held-deletion executor's own rotation and owed
+	// close resumes (ENG-1117). Zero-value ready; it guards itself.
+	holdExecutor volumeDeleteHoldExecutorState
 
 	// callbackStore persists pending callbacks in bbolt
 	callbackStore *shared.CallbackStore
