@@ -735,6 +735,9 @@ credit_check_retry_interval: "30s"
 
 # Maximum time to wait for graceful shutdown. This includes:
 # - Draining in-flight provisions (waiting for backend callbacks)
+# - Letting an in-flight reconciliation sweep finish its backend inventory
+#   reads and placement projection (at most half of this budget; a stop
+#   during the startup reconciliation spends it before the rest begins)
 # - Closing HTTP connections gracefully
 # - Flushing pending acknowledgment batches
 # If exceeded, shutdown proceeds with warnings about incomplete work.

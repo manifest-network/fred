@@ -555,8 +555,11 @@ WantedBy=multi-user.target
 
 `TimeoutStopSec` should exceed the graceful-drain window so systemd does not
 SIGKILL mid-shutdown. For `providerd` this window is `shutdown_timeout` from your
-config (default 30s). The `docker-backend` command shares one 75-second deadline
-across HTTP shutdown and backend-worker drain. HTTP shutdown gets at most
+config (default 30s). A stop that arrives during the startup reconciliation can
+add up to half of `shutdown_timeout` before it, while an in-flight sweep
+finishes its inventory reads. The `docker-backend` command shares one
+75-second deadline across HTTP shutdown and backend-worker drain. HTTP
+shutdown gets at most
 30 seconds; backend drain uses the remaining budget. The common 90-second
 systemd default therefore leaves time to report a typed drain failure and exit
 nonzero, without a deployment change. A longer existing unit allowance remains
@@ -1028,11 +1031,16 @@ copy as an ordinary orphan, under its retention policy.
 `pending_inventory_sweep` is true when `providerd` stopped in the middle of a
 sweep, and the retirement then sets `recordless_unproven`. To avoid that, start
 `providerd`, stop it right after the next `reconciliation complete` log line,
-and plan again. If it stays true, the marker is waiting on an answer that
-cannot arrive, typically from the lost backend, and the retirement must set the
-flag. Fencing the lost backend lets the marker clear without that answer; the
-database then records the backend as an unprojected reporter, new leases wait
-until it is retired, and its retirement still sets the flag.
+and plan again. A SIGTERM lets an in-flight sweep finish for up to half of
+`shutdown_timeout`, so a sweep is left interrupted by a crash, a SIGKILL, or a
+sweep that outlasted that grace. `placement-repair -classify` shows the pending
+sweep (`pending_inventory_sweep_id`) and the backends it waits on
+(`fence_restart_would_record`). If `pending_inventory_sweep` stays true, the
+marker is waiting on an answer that cannot arrive, typically from the lost
+backend, and the retirement must set the flag. Fencing the lost backend lets
+the marker clear without that answer; the database then records the backend as
+an unprojected reporter, new leases wait until it is retired, and its
+retirement still sets the flag.
 
 `recordless_unproven` is true when the database had no current admission
 baseline: a sweep was interrupted, or the retirement follows another retirement

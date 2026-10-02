@@ -648,13 +648,18 @@ For runbook-style guidance on responding to active incidents — replay attempts
 ### Containing a compromised backend
 
 When a backend can no longer be trusted, set `fenced: true` on it in
-providerd's config and restart providerd. Stop providerd right after a
-`reconciliation complete` log line: a stop that interrupts a sweep in which the
-backend reported leases leaves it recorded as an unprojected reporter (below),
-which holds new-lease admission until the fence ends. Keep the backend in the config: a
-fence contains it without removing it, so its leases and placements stay
-accounted for. The fence lasts until it is removed and providerd restarts
-again.
+providerd's config and restart providerd. A SIGTERM lets an in-flight
+reconciliation sweep finish for up to half of `shutdown_timeout`. Before
+starting providerd with the fence, run `placement-repair -classify` against the
+stopped database. If `fence_restart_would_record` names the backend, a stop or
+crash interrupted a sweep in which it reported, or may have reported, leases,
+and starting with the fence records it as an unprojected reporter (below),
+which holds new-lease admission until the fence ends. To avoid that, start
+providerd once more without the fence, stop it after a `reconciliation
+complete` log line, and check again; otherwise accept the hold. Keep the
+backend in the config: a fence contains it without removing it, so its leases
+and placements stay accounted for. The fence lasts until it is removed and
+providerd restarts again.
 
 What the fence does:
 

@@ -2429,8 +2429,12 @@ While the pool is demoted, `fred_signer_balance{role="sub_signer"}` series stop 
 `providerd` and `docker-backend` both handle SIGINT and SIGTERM. The shutdown order is documented in [ARCHITECTURE.md](ARCHITECTURE.md#graceful-shutdown).
 
 `providerd`'s `shutdown_timeout` (default 30s) bounds only the provider process's
-admission, operation, HTTP, scheduler, and manager drain. It does not configure
-docker-backend.
+admission, operation, HTTP, scheduler, and manager drain. A reconciliation sweep
+already reading backend inventories when the stop arrives may finish those reads
+and commit its placement projection for up to half of `shutdown_timeout`; a
+sweep still reading then is abandoned with its inventory marker pending. That
+grace runs alongside the drain, except during the startup reconciliation, where
+it comes first. It does not configure docker-backend.
 
 Docker-backend shares one 75s process deadline across HTTP and backend drain.
 HTTP requests receive at most 30s; backend-owned work receives the remaining

@@ -70,6 +70,10 @@ const chainInventoryTimeout = 30 * time.Second
 // stalled candidates cannot multiply that bound by its size.
 const placementCleanupTimeout = 10 * time.Second
 
+// defaultShutdownSweepGrace is the ShutdownSweepGrace a zero config gets. It
+// matches half of providerd's default 30s shutdown_timeout.
+const defaultShutdownSweepGrace = 15 * time.Second
+
 // errLeaseAlreadyInFlight indicates the lease is already being provisioned.
 // This is not a real error - the caller should not treat it as a failure.
 var errLeaseAlreadyInFlight = errors.New("lease already in-flight")
@@ -121,6 +125,7 @@ type Reconciler struct {
 	maxReprovisionAttempts int           // Max re-provision attempts before rejecting
 	chainInventoryBudget   time.Duration // Whole-list timeout; fixed in production, shortened by tests.
 	placementCleanupBudget time.Duration // Whole-pass timeout; fixed in production, shortened by tests.
+	shutdownSweepGrace     time.Duration // How long an in-flight sweep may outlive shutdown; see sweepDrainContext.
 	reconciling            atomic.Bool   // Non-blocking flag to prevent concurrent reconciliation
 	placementSweepSeen     atomic.Bool   // True while a durable baseline matches the configured backend topology.
 }
@@ -135,6 +140,11 @@ type ReconcilerConfig struct {
 	MaxWorkers             int           // Maximum concurrent workers (default: 10)
 	MaxReprovisionAttempts int           // Max re-provision attempts before rejecting (default: 3)
 	Coordinator            *placement.ReconciliationCoordinator
+	// ShutdownSweepGrace bounds how long a sweep that has begun reading
+	// backend inventories may keep reading them and commit its placement
+	// projection after its context is canceled. providerd sets it to half of
+	// shutdown_timeout (default: 15s).
+	ShutdownSweepGrace time.Duration
 }
 
 // NewReconciler creates the production reconciler. Placement authority and the
@@ -163,6 +173,7 @@ func NewReconciler(
 	interval := cmp.Or(cfg.Interval, 5*time.Minute)
 	maxWorkers := cmp.Or(max(cfg.MaxWorkers, 0), DefaultReconcileWorkers)
 	maxReprovision := cmp.Or(max(cfg.MaxReprovisionAttempts, 0), DefaultMaxReprovisionAttempts)
+	shutdownSweepGrace := cmp.Or(max(cfg.ShutdownSweepGrace, 0), defaultShutdownSweepGrace)
 	reconciler := &Reconciler{
 		payloads:               payloads,
 		coordinator:            reconciliation,
@@ -172,6 +183,7 @@ func NewReconciler(
 		maxReprovisionAttempts: maxReprovision,
 		chainInventoryBudget:   chainInventoryTimeout,
 		placementCleanupBudget: placementCleanupTimeout,
+		shutdownSweepGrace:     shutdownSweepGrace,
 	}
 	reconciler.placementPruner = newPlacementPruner(
 		reconciliation, reconciler.attemptRecovery,
@@ -189,6 +201,30 @@ func (r *Reconciler) payloadStore() *payload.Store {
 		return nil
 	}
 	return r.payloads.PayloadStore()
+}
+
+// sweepDrainContext detaches an in-flight sweep from parent's cancellation for
+// at most grace. The returned context keeps parent's values. When parent is
+// canceled the sweep runs on; if it is still running once grace has passed, it
+// is canceled with parent's cause, so a sweep still reading backends is
+// abandoned unprojected exactly as before. The returned release cancels the
+// context and unhooks it from parent; call it when the sweep returns.
+func sweepDrainContext(parent context.Context, grace time.Duration) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(context.WithoutCancel(parent))
+	stop := context.AfterFunc(parent, func() {
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cancel(context.Cause(parent))
+		case <-ctx.Done():
+		}
+	})
+	release := func() {
+		stop()
+		cancel(nil)
+	}
+	return ctx, release
 }
 
 // ReconcileAll performs a full reconciliation between chain state and backend state.
@@ -267,10 +303,25 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	}
 	defer sweep.End()
 
+	// From here a canceled sweep leaves its durable marker pending and its
+	// reporters journaled. A restart with one of those reporters fenced then
+	// records it as unprojected and withholds new-lease admission until it
+	// answers both inventories again or is retired. Shutdown therefore lets the
+	// backend reads and the projection finish, for at most shutdownSweepGrace.
+	// Lifecycle work below still stops at cancellation.
+	sweepCtx, releaseSweep := sweepDrainContext(ctx, r.shutdownSweepGrace)
+	defer releaseSweep()
+
 	// Collection is read-only. Its facts become authority only after the atomic
 	// placement projection below commits successfully.
-	inventory, err := r.collectInventory(ctx, sweep, pendingLeases, activeLeases)
+	inventory, err := r.collectInventory(sweepCtx, sweep, pendingLeases, activeLeases)
 	if err != nil {
+		if ctx.Err() != nil {
+			slog.Warn("reconciliation sweep ended during shutdown before its placement projection; its inventory marker stays pending",
+				"shutdown_sweep_grace", r.shutdownSweepGrace,
+				"error", err,
+			)
+		}
 		return err
 	}
 	chainLeases := inventory.chainLeases
@@ -305,7 +356,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		"complete", retentionsAnswered.complete(),
 		"unanswered", retentionsAnswered.unanswered(),
 	)
-	projection, err := r.projectPlacementInventory(ctx, reconcileProjectionInput{
+	projection, err := r.projectPlacementInventory(sweepCtx, reconcileProjectionInput{
 		inventory: inventory,
 		sweep:     sweep,
 	})
@@ -356,8 +407,14 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		)
 	}
 
-	// Check for cancellation before reconciliation loop
+	// Check for cancellation before reconciliation loop. A sweep that shutdown
+	// let finish ends here: its projection is already durable (one that
+	// represents every reported positive also cleared the sweep marker), and no
+	// lifecycle action starts after cancellation.
 	if err := ctx.Err(); err != nil {
+		if projection.projected != nil {
+			slog.Info("reconciliation sweep stopped by shutdown after committing its placement projection")
+		}
 		return err
 	}
 

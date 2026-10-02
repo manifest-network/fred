@@ -392,6 +392,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- A graceful providerd stop now lets an in-flight reconciliation sweep finish
+  reading backend inventories and commit its placement projection, for at most
+  half of `shutdown_timeout`, instead of abandoning it. An abandoned sweep left
+  a pending inventory marker, and restarting with a backend fenced then held
+  new-lease admission until the fence ended. A sweep still reading when that
+  grace expires is abandoned as before. (ENG-1119)
 - Restart and update no longer stop at 1,024 commands per lease. Fred and the
   docker-backend keep a rolling window of each lease's 1,024 most recent
   commands and evict the oldest settled one to admit a newer command; the

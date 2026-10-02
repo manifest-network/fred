@@ -717,6 +717,11 @@ type fleetOptions struct {
 	// sweep's real wall-clock start, so back-dating is the only deterministic
 	// way to age a record past the grace window without sleeping.
 	placementAge time.Duration
+	// shutdownSweepGrace is how long a canceled sweep may keep reading
+	// backends and commit its projection (providerd: shutdown_timeout/2). It
+	// defaults to 50ms, so a test that cancels a sweep while a backend hangs
+	// still abandons it unprojected; a drain test sets it explicitly.
+	shutdownSweepGrace time.Duration
 }
 
 type fleet struct {
@@ -783,6 +788,9 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 	}
 	if opts.interval == 0 {
 		opts.interval = 1 * time.Hour
+	}
+	if opts.shutdownSweepGrace == 0 {
+		opts.shutdownSweepGrace = 50 * time.Millisecond
 	}
 
 	f := &fleet{
@@ -914,6 +922,7 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 		Interval:               opts.interval,
 		MaxReprovisionAttempts: 3,
 		Coordinator:            reconciliation,
+		ShutdownSweepGrace:     opts.shutdownSweepGrace,
 	}
 	f.reconcilerCfg = reconcilerConfig
 	rec, err := newTestReconciler(t, reconcilerConfig, f.chain, ack, router, f.tracker, f.placement)
