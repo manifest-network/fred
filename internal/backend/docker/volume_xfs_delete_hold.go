@@ -37,9 +37,10 @@ const (
 	// detached from cancellation so it is never killed half-way, and starts only
 	// while the attempt's budget remains.
 	xfsQuotaClearTimeout = 10 * time.Second
-	// xfsResidualRowReadTimeout bounds the one report-row read per recovered
-	// stage that Start makes to size a residual hold.
-	xfsResidualRowReadTimeout = 5 * time.Second
+	// xfsRecoveredSizingBudget bounds, in aggregate, the report-row reads
+	// Start makes to size recovered holds whose final path is gone. A hold it
+	// cannot size in time is unsized: disk admission waits for the executor.
+	xfsRecoveredSizingBudget = 5 * time.Second
 	// volumeDeleteHoldInitialBackoff and volumeDeleteHoldMaxBackoff space the
 	// executor's retries of a hold that is not making progress.
 	volumeDeleteHoldInitialBackoff = 30 * time.Second
@@ -198,9 +199,15 @@ var errDeleteStageRecovered = errors.New("delete stage recovered at startup")
 
 // xfsProjectQuotaRow is one strictly parsed numeric `xfs_quota report -p` row
 // for an exact project, in the report's units (1 KiB blocks, or inodes). Only
-// parseXfsReportRow builds one.
+// parseXfsReportRow builds one with parsedFromReport set; the zero row that
+// travels beside a read error has it clear and sizes nothing.
 type xfsProjectQuotaRow struct {
 	projID uint32
+	// parsedFromReport is set only by a successful parseXfsReportRow. A
+	// footprint is sized only from a row that carries it, so a failed read
+	// can never pass for an absent dquot. Pinned by
+	// TestDeleteHoldTypesHaveSingleConstructors.
+	parsedFromReport bool
 	// found is false when the report has no row: no initialized dquot, so no
 	// usage and no limit.
 	found bool
@@ -214,44 +221,102 @@ type xfsProjectQuotaRow struct {
 // residualFootprintMB bounds what a residual hold's project can still charge
 // to the disk: its block hard limit, or its used blocks when they are larger
 // or the project has no limit, in MiB rounded up. residualFootprintFromRow,
-// the only constructor, builds it only from a parsed block row, so a footprint
-// can never be a guess.
+// the only constructor, builds a sized one only from a parsed block row, so a
+// footprint can never be a guess. The zero value is unsized.
 type residualFootprintMB struct {
 	mb int64
+	// fromParsedRow is set only by residualFootprintFromRow (pinned by
+	// TestDeleteHoldTypesHaveSingleConstructors).
+	fromParsedRow bool
 }
 
+// sized reports whether the footprint came from a parsed quota row.
+func (f residualFootprintMB) sized() bool { return f.fromParsedRow }
+
 // residualFootprintFromRow sizes a residual hold from its project's block row.
-// It reports false when the row did not carry its limits.
+// It reports false for a row that was not parsed from a report (the zero row
+// beside a read error), and for one that did not carry its limits.
 func residualFootprintFromRow(row xfsProjectQuotaRow) (residualFootprintMB, bool) {
-	if !row.found {
-		return residualFootprintMB{mb: 0}, true
-	}
-	if !row.limitsKnown {
+	switch {
+	case !row.parsedFromReport:
+		return residualFootprintMB{}, false
+	case !row.found:
+		return residualFootprintMB{mb: 0, fromParsedRow: true}, true
+	case !row.limitsKnown:
 		return residualFootprintMB{}, false
 	}
 	kib := max(row.used, row.hard)
-	return residualFootprintMB{mb: (kib + 1023) / 1024}, true
+	return residualFootprintMB{mb: (kib + 1023) / 1024, fromParsedRow: true}, true
 }
 
-// xfsDeleteHoldPhase is the closed phase of a hold: removal, or residual with
-// the footprint the admission pool counts. A residual phase cannot exist
-// without a footprint built from a parsed quota row.
+// xfsDeleteHoldPhaseKind is the closed set of hold phases. Its zero value is
+// the removal phase, the one that keeps its caller pending.
+type xfsDeleteHoldPhaseKind uint8
+
+const (
+	// holdPhaseRemoval: tenant bytes may remain, or the final path's absence
+	// is not yet durable. Its caller has never been answered nil, so it keeps
+	// its own authority and accounting.
+	holdPhaseRemoval xfsDeleteHoldPhaseKind = iota
+	// holdPhaseUnsized: the final path was observed absent, a caller may
+	// already have settled (a previous process could have answered it), and
+	// the project's footprint is not known. A Destroy still answers held, and
+	// the admission pool withholds disk until the footprint is known: the
+	// bytes are never counted as zero.
+	holdPhaseUnsized
+	// holdPhaseResidual: the final path's absence is durable and the
+	// project's footprint was parsed from its quota row. A Destroy settles its
+	// caller, and the admission pool counts the footprint instead.
+	holdPhaseResidual
+)
+
+// xfsDeleteHoldPhase is the phase of a hold, with the footprint the admission
+// pool counts for a residual one. Only the three constructors below build a
+// non-zero one, and a residual phase cannot exist without a sized footprint
+// (pinned by TestDeleteHoldTypesHaveSingleConstructors).
 type xfsDeleteHoldPhase struct {
-	residual  bool
+	kind      xfsDeleteHoldPhaseKind
 	footprint residualFootprintMB
 }
 
-func removalHoldPhase() xfsDeleteHoldPhase { return xfsDeleteHoldPhase{} }
+func removalHoldPhase() xfsDeleteHoldPhase { return xfsDeleteHoldPhase{kind: holdPhaseRemoval} }
 
-func residualHoldPhase(footprint residualFootprintMB) xfsDeleteHoldPhase {
-	return xfsDeleteHoldPhase{residual: true, footprint: footprint}
+func unsizedHoldPhase() xfsDeleteHoldPhase { return xfsDeleteHoldPhase{kind: holdPhaseUnsized} }
+
+// residualHoldPhase is the residual phase for a sized footprint. An unsized
+// footprint yields false: there is no residual phase without one.
+func residualHoldPhase(footprint residualFootprintMB) (xfsDeleteHoldPhase, bool) {
+	if !footprint.sized() {
+		return xfsDeleteHoldPhase{}, false
+	}
+	return xfsDeleteHoldPhase{kind: holdPhaseResidual, footprint: footprint}, true
 }
 
-func (p xfsDeleteHoldPhase) label() string {
-	if p.residual {
+// residual reports whether the hold has settled its caller.
+func (p xfsDeleteHoldPhase) residual() bool { return p.kind == holdPhaseResidual }
+
+// holdsCaller reports whether a Destroy answers ErrVolumeDeleteHeld and the
+// caller stays pending: the removal and unsized phases.
+func (p xfsDeleteHoldPhase) holdsCaller() bool { return p.kind != holdPhaseResidual }
+
+// absenceObserved reports whether this process observed the final path
+// absent for this hold: the unsized and residual phases. Nothing in fred can
+// publish the name while its stage exists, so a final path there again is an
+// authority contradiction.
+func (p xfsDeleteHoldPhase) absenceObserved() bool { return p.kind != holdPhaseRemoval }
+
+func (p xfsDeleteHoldPhase) label() string { return p.kind.label() }
+
+// label is the phase's stable log and metric label.
+func (k xfsDeleteHoldPhaseKind) label() string {
+	switch k {
+	case holdPhaseUnsized:
+		return volumeDeleteHoldPhaseUnsized
+	case holdPhaseResidual:
 		return volumeDeleteHoldPhaseResidual
+	default:
+		return volumeDeleteHoldPhaseRemoval
 	}
-	return volumeDeleteHoldPhaseRemoval
 }
 
 // xfsDeleteHold is one held deletion, keyed by its volume in the manager's
@@ -287,7 +352,7 @@ func (h *xfsDeleteHold) view() volumeDeleteHoldView {
 		volume:      h.stage.volumeID,
 		stage:       h.stage.value(),
 		projectID:   h.stage.projID,
-		residual:    h.phase.residual,
+		phase:       h.phase.kind,
 		footprintMB: h.phase.footprint.mb,
 		reason:      h.reason,
 		attempts:    h.attempts,
@@ -318,9 +383,9 @@ type xfsDeleteAttempt struct {
 	// absenceDurable: the attempt observed the final path absent and synced
 	// the parent, so the absence is durable.
 	absenceDurable bool
-	// footprint is set once the attempt parsed the project's block row.
-	footprint      residualFootprintMB
-	footprintKnown bool
+	// footprint is sized once the attempt parsed the project's block row; it
+	// stays the unsized zero value otherwise.
+	footprint residualFootprintMB
 }
 
 // deleteStageOutcomeKind is the closed set of cleanup outcomes.
@@ -374,16 +439,18 @@ func classifyXFSDeleteStageCleanup(
 
 // holdPhaseAfter is the phase a hold has after an attempt. Residual needs both
 // a durable absence of the final path and a footprint parsed from the
-// project's report row; without a known footprint the hold stays in the
-// removal phase, where the caller keeps its own accounting, because settling
-// the caller while under-counting the project is never allowed.
+// project's report row. Without a sized footprint a hold whose caller this
+// process never answered stays in the removal phase, where the caller keeps
+// its own accounting; an unsized or residual hold keeps its phase, because a
+// caller may already have settled on it. Settling a caller while
+// under-counting the project is never allowed.
 func holdPhaseAfter(attempt xfsDeleteAttempt, previous *xfsDeleteHold) xfsDeleteHoldPhase {
 	switch {
 	case attempt.absenceDurable:
-		if attempt.footprintKnown {
-			return residualHoldPhase(attempt.footprint)
+		if phase, ok := residualHoldPhase(attempt.footprint); ok {
+			return phase
 		}
-		if previous != nil && previous.phase.residual {
+		if previous != nil && previous.phase.absenceObserved() {
 			return previous.phase
 		}
 		return removalHoldPhase()
@@ -394,6 +461,35 @@ func holdPhaseAfter(attempt xfsDeleteAttempt, previous *xfsDeleteHold) xfsDelete
 	default:
 		return removalHoldPhase()
 	}
+}
+
+// finalPathAtStart is what Start observed of a recovered stage's final path.
+type finalPathAtStart uint8
+
+const (
+	finalPresentAtStart finalPathAtStart = iota + 1
+	finalAbsentAtStart
+	finalAbsentDurableAtStart
+)
+
+// recoveredHoldPhase classifies a hold Start registered for a delete stage
+// found on disk, whose history (whether a previous process already settled
+// its caller) is unknown. A final path still present means no process ever
+// made its absence durable, so no caller can have settled: removal. An absent
+// one may have settled its caller: residual when its absence is durable and
+// its footprint is sized, and otherwise unsized, which withholds disk
+// admission until the executor sizes it. Never removal, which would leave the
+// footprint counted by nothing.
+func recoveredHoldPhase(final finalPathAtStart, footprint residualFootprintMB) xfsDeleteHoldPhase {
+	switch final {
+	case finalPresentAtStart:
+		return removalHoldPhase()
+	case finalAbsentDurableAtStart:
+		if phase, ok := residualHoldPhase(footprint); ok {
+			return phase
+		}
+	}
+	return unsizedHoldPhase()
 }
 
 // finalPathObservation is one Lstat of a volume's final path.
@@ -467,7 +563,7 @@ func (o deleteStageOutcome) result(final finalPathObservation) error {
 	case deleteStageCompleted:
 		return nil
 	case deleteStageHeld:
-		if o.phase.residual {
+		if o.phase.residual() {
 			switch final {
 			case finalPathAbsent:
 				return nil
@@ -491,7 +587,7 @@ func (o deleteStageOutcome) result(final finalPathObservation) error {
 // heldResidual reports whether the outcome is a residual hold, the only kind
 // whose Destroy result needs a fresh observation of the final path.
 func (o deleteStageOutcome) heldResidual() bool {
-	return o.kind == deleteStageHeld && o.phase.residual
+	return o.kind == deleteStageHeld && o.phase.residual()
 }
 
 // outcomeLabel is the volume_delete_outcomes_total label of the outcome.
@@ -499,8 +595,10 @@ func (o deleteStageOutcome) outcomeLabel() string {
 	switch {
 	case o.kind == deleteStageCompleted:
 		return volumeDeleteOutcomeCompleted
-	case o.kind == deleteStageHeld && o.phase.residual:
+	case o.kind == deleteStageHeld && o.phase.kind == holdPhaseResidual:
 		return volumeDeleteOutcomeHeldResidual
+	case o.kind == deleteStageHeld && o.phase.kind == holdPhaseUnsized:
+		return volumeDeleteOutcomeHeldUnsized
 	case o.kind == deleteStageHeld:
 		return volumeDeleteOutcomeHeldRemoval
 	default:
@@ -556,10 +654,16 @@ func (x *xfsVolumeManager) recordXFSDeleteStageOutcome(
 		if attempted {
 			current.attempts++
 			current.lastAttempt = now
-			if outcome.reason.keepsProgressing() {
+			switch {
+			case outcome.reason.keepsProgressing():
 				current.failures = 0
 				current.nextAttempt = now
-			} else {
+			case outcome.phase.kind == holdPhaseUnsized:
+				// An unsized hold withholds disk admission: the executor
+				// retries it on every pass until its footprint is known.
+				current.failures++
+				current.nextAttempt = now
+			default:
 				current.failures++
 				current.nextAttempt = now.Add(volumeDeleteHoldBackoff(current.failures))
 			}
@@ -583,8 +687,14 @@ func (x *xfsVolumeManager) recordXFSDeleteStageOutcome(
 				"attempts", previous.attempts+1)
 		}
 	case deleteStageHeld:
+		// A deletion that is merely still running (interrupted, deferred, or
+		// recovered and not yet retried) needs no operator: INFO. A refusal
+		// does: WARN. An unchanged hold is DEBUG.
 		level := x.logger.Debug
-		if changed {
+		switch {
+		case changed && hold.reason.keepsProgressing() && hold.phase != holdPhaseUnsized:
+			level = x.logger.Info
+		case changed:
 			level = x.logger.Warn
 		}
 		level("volume delete held",
@@ -666,22 +776,38 @@ func (x *xfsVolumeManager) RetryHeldVolumeDelete(ctx context.Context, id string)
 	return outcome.result(finalPathNotObserved)
 }
 
-// VolumeDeleteHolds returns the manager's pending deletions and holds.
+// VolumeDeleteHolds returns the manager's pending deletions and holds, and
+// which names its memory still tracks, in one consistent view under x.mu.
 func (x *xfsVolumeManager) VolumeDeleteHolds() volumeDeleteHoldSnapshot {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	snapshot := volumeDeleteHoldSnapshot{
 		pending: make(map[string]struct{}, len(x.durableDeleteStages)+len(x.recoveredDeleteStages)),
 		holds:   make(map[string]volumeDeleteHoldView, len(x.deleteHolds)),
+		staged: make(map[string]struct{},
+			len(x.durableDeleteStages)+len(x.recoveredDeleteStages)+len(x.durableStages)+len(x.recoveredStages)),
+		mapped: make(map[string]struct{}, len(x.volumeToID)),
 	}
 	for volume := range x.durableDeleteStages {
 		snapshot.pending[volume] = struct{}{}
+		snapshot.staged[volume] = struct{}{}
 	}
 	for volume := range x.recoveredDeleteStages {
 		snapshot.pending[volume] = struct{}{}
+		snapshot.staged[volume] = struct{}{}
+	}
+	for volume := range x.durableStages {
+		snapshot.staged[volume] = struct{}{}
+	}
+	for volume := range x.recoveredStages {
+		snapshot.staged[volume] = struct{}{}
+	}
+	for volume := range x.volumeToID {
+		snapshot.mapped[volume] = struct{}{}
 	}
 	for volume, hold := range x.deleteHolds {
 		snapshot.pending[volume] = struct{}{}
+		snapshot.staged[volume] = struct{}{}
 		snapshot.holds[volume] = hold.view()
 	}
 	return snapshot
@@ -691,7 +817,7 @@ func (x *xfsVolumeManager) VolumeDeleteHolds() volumeDeleteHoldSnapshot {
 // manager's own state is enough. See volumeReader.
 func (x *xfsVolumeManager) PrecheckDestroy(name managedVolumeName) (destroyPrecheckVerdict, error) {
 	if outcome, held := x.registeredHoldOutcome(name); held {
-		if !outcome.phase.residual {
+		if outcome.phase.holdsCaller() {
 			return destroyPrecheckHeld, outcome.result(finalPathNotObserved)
 		}
 		if x.observeFinalPathPinned(name).absent() {
@@ -757,15 +883,15 @@ func (x *xfsVolumeManager) RequireNoUnheldVolumeMutations(ctx context.Context) e
 	return fmt.Errorf("xfs volume root contains interrupted creates or unheld deletes: %s", strings.Join(names, ", "))
 }
 
-// removalVisibleDeleteNamesLocked returns every name with a delete stage whose
-// final path's absence is not yet durable: the stage is in flight, or held in
-// the removal phase. ListForProof unions them with the on-disk listing so that
+// removalVisibleDeleteNamesLocked returns every name with a delete stage that
+// has not settled its caller: the stage is in flight, or held in the removal
+// or unsized phase. ListForProof unions them with the on-disk listing so that
 // no consumer reads such a name's absence as completion. Residual names are
 // settled; the admission pool accounts for them instead. The caller holds x.mu.
 func (x *xfsVolumeManager) removalVisibleDeleteNamesLocked() []string {
 	var names []string
 	add := func(stage xfsDeleteStageName) {
-		if hold, ok := x.deleteHolds[stage.volumeID.value()]; ok && hold.stage == stage && hold.phase.residual {
+		if hold, ok := x.deleteHolds[stage.volumeID.value()]; ok && hold.stage == stage && hold.phase.residual() {
 			return
 		}
 		names = append(names, stage.volumeID.value())
@@ -814,65 +940,97 @@ func (x *xfsVolumeManager) rememberVerifiedDeleteStage(stage xfsDeleteStageName,
 	x.verifiedDeleteStages[stage] = info
 }
 
-// promoteRecoveredResidualHolds sizes the holds Start registered for recovered
-// stages whose final path is already gone, so that the admission pool counts
-// their projects before the Backend serves. It does no removal and no waiting:
-// one Lstat per stage, one parent sync that makes the observed absences
-// durable, and one report-row read per stage. A stage it cannot size stays in
-// the removal phase, and the hold executor sizes it on its first attempt.
-func (x *xfsVolumeManager) promoteRecoveredResidualHolds(ctx context.Context) {
+// classifyRecoveredDeleteHolds gives every hold Start registered for a
+// recovered delete stage the phase recoveredHoldPhase assigns, before the
+// Backend serves. Whether a previous process already settled such a hold's
+// caller is unknown, so a stage whose final path is gone is never left in the
+// removal phase, where its footprint would be counted by nothing: it becomes
+// residual when this pass can size it, and unsized otherwise, which withholds
+// disk admission until the hold executor sizes it.
+//
+// It does no removal: one Lstat per stage, one parent sync, and report-row
+// reads that share xfsRecoveredSizingBudget in aggregate, so a hung xfs_quota
+// delays Start by that budget at most, not once per stage. A root it cannot
+// open, or a final path it cannot observe, fails Start: that is a fault of the
+// shared root, not of one volume, and the startup scan fails on it as well.
+func (x *xfsVolumeManager) classifyRecoveredDeleteHolds(ctx context.Context) error {
+	return x.classifyRecoveredDeleteHoldsWithin(ctx, xfsRecoveredSizingBudget)
+}
+
+func (x *xfsVolumeManager) classifyRecoveredDeleteHoldsWithin(ctx context.Context, sizingBudget time.Duration) error {
 	x.mu.Lock()
 	var candidates []xfsDeleteStageName
 	for _, hold := range x.deleteHolds {
-		if hold.reason == holdReasonRecovered && !hold.phase.residual {
+		if hold.reason == holdReasonRecovered && hold.attempts == 0 && hold.phase.kind == holdPhaseRemoval {
 			candidates = append(candidates, hold.stage)
 		}
 	}
 	x.mu.Unlock()
 	if len(candidates) == 0 {
-		return
+		return nil
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].value() < candidates[j].value() })
 	root, parent, err := openXFSRootCapabilities(x.dataPath)
 	if err != nil {
-		x.logger.Warn("cannot size recovered volume delete holds at startup", "error", err)
-		return
+		return fmt.Errorf("open xfs root to classify recovered delete stages: %w", err)
 	}
 	defer func() { _ = root.Close() }()
 	defer func() { _ = parent.Close() }()
 	var absent []xfsDeleteStageName
 	for _, stage := range candidates {
-		if observeFinalPathAtRoot(root, stage.volumeID).absent() {
+		switch observeFinalPathAtRoot(root, stage.volumeID) {
+		case finalPathPresent:
+			x.setRecoveredHoldPhase(stage, recoveredHoldPhase(finalPresentAtStart, residualFootprintMB{}))
+		case finalPathAbsent:
 			absent = append(absent, stage)
+		default:
+			return fmt.Errorf("observe the final path of recovered xfs delete-stage %q", stage.value())
 		}
 	}
 	if len(absent) == 0 {
-		return
+		return nil
 	}
+	final := finalAbsentDurableAtStart
 	if err := parent.Sync(); err != nil {
-		x.logger.Warn("cannot make recovered volume deletions durable at startup; holds stay in the removal phase",
+		final = finalAbsentAtStart
+		x.logger.Warn("cannot make recovered volume deletions durable at startup; disk admission is withheld until they are sized",
 			"error", err)
+	}
+	sizingCtx, cancel := context.WithTimeout(ctx, sizingBudget)
+	defer cancel()
+	for _, stage := range absent {
+		var footprint residualFootprintMB
+		if final == finalAbsentDurableAtStart && sizingCtx.Err() == nil {
+			row, err := x.readProjectQuotaRow(sizingCtx, stage.projID, "b")
+			if err != nil {
+				x.logger.Warn("cannot size recovered volume delete hold at startup; disk admission is withheld until it is",
+					"volume_id", stage.volumeID.value(), "delete_stage", stage.value(), "project_id", stage.projID,
+					"error", err)
+			} else {
+				footprint, _ = residualFootprintFromRow(row)
+			}
+		}
+		x.setRecoveredHoldPhase(stage, recoveredHoldPhase(final, footprint))
+	}
+	return nil
+}
+
+// setRecoveredHoldPhase records Start's classification of a recovered hold
+// that has had no attempt yet. It counts no attempt and no outcome.
+func (x *xfsVolumeManager) setRecoveredHoldPhase(stage xfsDeleteStageName, phase xfsDeleteHoldPhase) {
+	x.mu.Lock()
+	hold, ok := x.deleteHolds[stage.volumeID.value()]
+	if !ok || hold.stage != stage || hold.attempts != 0 {
+		x.mu.Unlock()
 		return
 	}
-	for _, stage := range absent {
-		if ctx.Err() != nil {
-			return
-		}
-		readCtx, cancel := context.WithTimeout(ctx, xfsResidualRowReadTimeout)
-		row, err := x.readProjectQuotaRow(readCtx, stage.projID, "b")
-		cancel()
-		if err != nil {
-			x.logger.Warn("cannot size recovered volume delete hold at startup; it stays in the removal phase",
-				"volume_id", stage.volumeID.value(), "delete_stage", stage.value(), "project_id", stage.projID,
-				"error", err)
-			continue
-		}
-		footprint, ok := residualFootprintFromRow(row)
-		if !ok {
-			continue
-		}
-		sized := xfsDeleteAttempt{absenceDurable: true, footprint: footprint, footprintKnown: true}
-		x.recordXFSDeleteStageOutcome(stage, sized,
-			holdable(holdReasonRecovered, errDeleteStageRecovered), false)
+	hold.phase = phase
+	view := hold.view()
+	x.mu.Unlock()
+	if phase.kind == holdPhaseUnsized {
+		x.logger.Warn("volume delete held",
+			"volume_id", stage.volumeID.value(), "delete_stage", stage.value(), "project_id", stage.projID,
+			"phase", view.phaseLabel(), "reason", view.reason.String(), "attempts", view.attempts,
+			"next_attempt", view.nextAttempt, "error", errDeleteStageRecovered)
 	}
 }

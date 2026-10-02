@@ -1058,7 +1058,7 @@ func (b *Backend) destroyReapingVolumesUsing(
 		// A prior raw mutation met an authority contradiction or an ambiguous
 		// outcome and withdrew this Backend instance; a fresh process owns the
 		// next classification. A held XFS deletion never gets here (ENG-1117): in
-		// its removal phase ListForProof keeps listing the name, so the footprint
+		// its removal and unsized phases ListForProof keeps listing the name, so the footprint
 		// below is never empty while bytes may remain and the record stays; in its
 		// residual phase the name is durably gone, the record may go, and the
 		// project's remaining footprint is counted in admission as heldResidualMB.

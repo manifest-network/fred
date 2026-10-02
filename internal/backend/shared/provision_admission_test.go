@@ -16,7 +16,7 @@ func TestProvisionAdmissionAndExecutionCannotBeConverted(t *testing.T) {
 }
 
 func TestProvisionAdmissionRefusalIsAtomic(t *testing.T) {
-	for _, reason := range []string{"accounting hold", "CPU", "memory", "disk", "tenant quota"} {
+	for _, reason := range []string{"accounting hold", "disk accounting hold", "CPU", "memory", "disk", "tenant quota"} {
 		t.Run(reason, func(t *testing.T) {
 			stores := openOperationHandoffStores(t, "docker-a")
 			spec := testOperationIntentSpec(t, "resource-admission")
@@ -40,14 +40,21 @@ func TestProvisionAdmissionRefusalIsAtomic(t *testing.T) {
 			}, quota)
 			require.NoError(t, pool.TryAllocateResolved(spec.LeaseUUID+"-app-0", spec.Tenant, spec.ResourceProfiles[0]))
 			before := pool.ListAllocations()
-			if reason == "accounting hold" {
+			switch reason {
+			case "accounting hold":
 				hold := pool.HoldUnaccountedFootprint()
+				defer hold.Release()
+			case "disk accounting hold":
+				hold := pool.HoldUnsizedDiskFootprint()
 				defer hold.Release()
 			}
 			admission, err := stores.settlement.ReserveProvisionResources(pool, claim)
 			require.Error(t, err)
-			if reason == "accounting hold" {
+			switch reason {
+			case "accounting hold":
 				require.ErrorIs(t, err, ErrResourceAccountingIncomplete)
+			case "disk accounting hold":
+				require.ErrorIs(t, err, ErrDiskAccountingIncomplete)
 			}
 			require.False(t, admission.Valid())
 			assert.Equal(t, before, pool.ListAllocations(), "refusal must preserve the whole predecessor ledger")

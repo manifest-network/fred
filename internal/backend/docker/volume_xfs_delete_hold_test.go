@@ -83,9 +83,15 @@ func TestClassifyXFSDeleteStageCleanupIsTotalWithLatchDefault(t *testing.T) {
 func TestHoldPhaseAfterRequiresAParsedFootprintForResidual(t *testing.T) {
 	t.Parallel()
 
-	footprint, ok := residualFootprintFromRow(xfsProjectQuotaRow{found: true, used: 10, hard: 2048, limitsKnown: true})
+	row, err := parseXfsReportRow("#4242 10 0 2048 0\n", xfsDeleteTestProjectID)
+	require.NoError(t, err)
+	footprint, ok := residualFootprintFromRow(row)
 	require.True(t, ok)
-	residual := &xfsDeleteHold{phase: residualHoldPhase(footprint)}
+	residualPhase, ok := residualHoldPhase(footprint)
+	require.True(t, ok)
+	residual := &xfsDeleteHold{phase: residualPhase}
+	unsized := &xfsDeleteHold{phase: unsizedHoldPhase()}
+	removal := &xfsDeleteHold{phase: removalHoldPhase()}
 	for _, tc := range []struct {
 		name     string
 		attempt  xfsDeleteAttempt
@@ -94,15 +100,55 @@ func TestHoldPhaseAfterRequiresAParsedFootprintForResidual(t *testing.T) {
 	}{
 		{"nothing observed", xfsDeleteAttempt{}, nil, removalHoldPhase()},
 		{"nothing observed keeps residual", xfsDeleteAttempt{}, residual, residual.phase},
+		{"nothing observed keeps unsized", xfsDeleteAttempt{}, unsized, unsizedHoldPhase()},
 		{"final seen", xfsDeleteAttempt{finalSeen: true}, nil, removalHoldPhase()},
 		{"durable absence without footprint", xfsDeleteAttempt{absenceDurable: true}, nil, removalHoldPhase()},
+		{"durable absence without footprint keeps a pending caller pending",
+			xfsDeleteAttempt{absenceDurable: true}, removal, removalHoldPhase()},
 		{"durable absence keeps a known footprint", xfsDeleteAttempt{absenceDurable: true}, residual, residual.phase},
-		{"durable absence with footprint", xfsDeleteAttempt{absenceDurable: true, footprint: footprint,
-			footprintKnown: true}, nil, residualHoldPhase(footprint)},
+		{"durable absence never turns unsized into removal", xfsDeleteAttempt{absenceDurable: true}, unsized,
+			unsizedHoldPhase()},
+		{"durable absence with footprint", xfsDeleteAttempt{absenceDurable: true, footprint: footprint}, nil,
+			residualPhase},
+		{"durable absence sizes an unsized hold", xfsDeleteAttempt{absenceDurable: true, footprint: footprint},
+			unsized, residualPhase},
+		{"an unsized footprint is never residual", xfsDeleteAttempt{absenceDurable: true,
+			footprint: residualFootprintMB{}}, nil, removalHoldPhase()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			assert.Equal(t, tc.want, holdPhaseAfter(tc.attempt, tc.previous))
+		})
+	}
+}
+
+// Start classifies a recovered stage, whose history is unknown, from what it
+// observes: a final path still present cannot have settled a caller, while a
+// gone one may have, so it is never left in the removal phase.
+func TestRecoveredHoldPhaseNeverLeavesAGoneVolumeUncounted(t *testing.T) {
+	t.Parallel()
+
+	row, err := parseXfsReportRow("#4242 0 0 4096 0\n", xfsDeleteTestProjectID)
+	require.NoError(t, err)
+	footprint, ok := residualFootprintFromRow(row)
+	require.True(t, ok)
+	residualPhase, ok := residualHoldPhase(footprint)
+	require.True(t, ok)
+	for _, tc := range []struct {
+		name      string
+		final     finalPathAtStart
+		footprint residualFootprintMB
+		want      xfsDeleteHoldPhase
+	}{
+		{"present", finalPresentAtStart, footprint, removalHoldPhase()},
+		{"gone, durable and sized", finalAbsentDurableAtStart, footprint, residualPhase},
+		{"gone and durable, unsized", finalAbsentDurableAtStart, residualFootprintMB{}, unsizedHoldPhase()},
+		{"gone, not durable", finalAbsentAtStart, footprint, unsizedHoldPhase()},
+		{"unknown observation", 0, footprint, unsizedHoldPhase()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, recoveredHoldPhase(tc.final, tc.footprint))
 		})
 	}
 }
@@ -128,6 +174,7 @@ func TestResidualFootprintIsBuiltOnlyFromAParsedRow(t *testing.T) {
 			require.NoError(t, err)
 			footprint, ok := residualFootprintFromRow(row)
 			assert.Equal(t, tc.ok, ok)
+			assert.Equal(t, tc.ok, footprint.sized())
 			if ok {
 				assert.Equal(t, tc.mb, footprint.mb)
 			}
@@ -135,6 +182,16 @@ func TestResidualFootprintIsBuiltOnlyFromAParsedRow(t *testing.T) {
 	}
 	_, err := parseXfsReportRow("#4242 7 0 not-a-limit 0\n", xfsDeleteTestProjectID)
 	require.ErrorContains(t, err, "hard limit", "a malformed limit must never be guessed")
+
+	// The zero row that travels beside every read error is not a parsed
+	// report: it must never read as an absent dquot (0 MiB).
+	footprint, ok := residualFootprintFromRow(xfsProjectQuotaRow{})
+	assert.False(t, ok)
+	assert.False(t, footprint.sized())
+	_, ok = residualHoldPhase(footprint)
+	assert.False(t, ok, "there is no residual phase without a sized footprint")
+	_, readErr := (&xfsVolumeManager{}).readProjectQuotaRow(t.Context(), xfsDeleteTestProjectID, "x")
+	require.Error(t, readErr)
 }
 
 func TestVolumeDeleteHoldBackoffDoublesToItsCap(t *testing.T) {
@@ -172,21 +229,27 @@ func TestVolumeDeleteHoldSnapshotDueOrderRotates(t *testing.T) {
 		name(1).value(): {volume: name(1), nextAttempt: now},
 		name(2).value(): {volume: name(2), lastAttempt: now.Add(-time.Hour), nextAttempt: now.Add(-time.Second)},
 		name(3).value(): {volume: name(3), lastAttempt: now.Add(-time.Hour), nextAttempt: now.Add(time.Minute)},
-		name(4).value(): {volume: name(4), residual: true, footprintMB: 7, nextAttempt: now.Add(time.Hour)},
+		name(4).value(): {volume: name(4), phase: holdPhaseResidual, footprintMB: 7, nextAttempt: now.Add(time.Hour)},
+		name(5).value(): {volume: name(5), phase: holdPhaseUnsized, lastAttempt: now, nextAttempt: now},
 	}}
 	due := snapshot.dueInOrder(now)
 	var got []string
 	for _, hold := range due {
 		got = append(got, hold.volume.value())
 	}
-	assert.Equal(t, []string{name(1).value(), name(2).value(), name(0).value()}, got,
-		"never-attempted first, then least recently attempted; not-yet-due holds wait")
-	removal, residual := snapshot.phaseCounts()
-	assert.Equal(t, 4, removal)
-	assert.Equal(t, 1, residual)
-	assert.Equal(t, int64(7), snapshot.residualFootprintMB())
-	assert.True(t, snapshot.removalHeld(name(0).value()))
-	assert.False(t, snapshot.removalHeld(name(4).value()))
+	assert.Equal(t, []string{name(5).value(), name(1).value(), name(2).value(), name(0).value()}, got,
+		"unsized first, then never-attempted, then least recently attempted; not-yet-due holds wait")
+	assert.Equal(t, map[string]int{
+		volumeDeleteHoldPhaseRemoval: 4, volumeDeleteHoldPhaseUnsized: 1, volumeDeleteHoldPhaseResidual: 1,
+	}, snapshot.phaseCounts())
+	assert.Equal(t, heldDeletionAccount{residualMB: 7, unsized: 1}, snapshot.admissionAccount())
+	assert.True(t, snapshot.callerHeld(name(0).value()))
+	assert.True(t, snapshot.callerHeld(name(5).value()), "an unsized hold keeps its caller pending")
+	assert.False(t, snapshot.callerHeld(name(4).value()))
+	assert.True(t, snapshot.residualHeld(name(4).value()))
+	assert.Equal(t, map[string]int{
+		volumeDeleteHoldPhaseRemoval: 0, volumeDeleteHoldPhaseUnsized: 0, volumeDeleteHoldPhaseResidual: 0,
+	}, volumeDeleteHoldSnapshot{}.phaseCounts(), "every phase is reported, so a gauge drops to zero")
 }
 
 // xfsSiteCase drives one return site of the real delete-stage cleanup.
@@ -421,7 +484,7 @@ esac`,
 			require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending)
 			hold := heldForTest(t, mgr, stage.volumeID.value())
 			assert.Equal(t, tc.reason, hold.reason)
-			assert.Equal(t, tc.residual, hold.residual)
+			assert.Equal(t, tc.residual, hold.phase == holdPhaseResidual)
 			assert.DirExists(t, stage.hostPath(dataPath), "a hold always keeps its stage")
 			assert.Equal(t, stage.projID, mgr.volumeToID[stage.volumeID.value()], "a hold keeps the project ID")
 		})
@@ -471,7 +534,7 @@ esac`, stage.projID, stage.projID))
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	require.NoError(t, mgr.Destroy(ctx, stage.volumeID.value()))
-	require.True(t, heldForTest(t, mgr, stage.volumeID.value()).residual)
+	require.True(t, heldForTest(t, mgr, stage.volumeID.value()).phase == holdPhaseResidual)
 
 	require.NoError(t, os.Mkdir(stage.volumeID.hostPath(dataPath), 0o700))
 	err := mgr.Destroy(t.Context(), stage.volumeID.value())
@@ -579,9 +642,9 @@ esac`, xfsDeleteTestProjectID+1))
 	}
 
 	require.NoError(t, mgr.RecoverInterruptedVolumeMutations(t.Context()))
-	require.True(t, heldForTest(t, mgr, residual.volumeID.value()).residual,
+	require.True(t, heldForTest(t, mgr, residual.volumeID.value()).phase == holdPhaseResidual,
 		"Start sizes a recovered deletion whose final path is gone")
-	assert.Equal(t, int64(4), mgr.VolumeDeleteHolds().residualFootprintMB())
+	assert.Equal(t, int64(4), mgr.VolumeDeleteHolds().admissionAccount().residualMB)
 	names, err := mgr.ListForProof(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, []string{removing.volumeID.value(), live.value()}, names,
@@ -589,6 +652,141 @@ esac`, xfsDeleteTestProjectID+1))
 	require.ErrorContains(t, mgr.AttestManagedVolume(t.Context(), residual.volumeID), "does not exist")
 	require.NoError(t, mgr.RequireNoUnheldVolumeMutations(t.Context()))
 	require.Error(t, mgr.RequireNoInterruptedVolumeMutations(t.Context()))
+}
+
+// A recovered deletion whose final path is gone may already have settled its
+// caller in a previous process. When Start cannot size it, it is unsized:
+// never the removal phase, where its footprint would be counted by nothing.
+// It keeps its caller (if any) pending and stays listed, withholds disk
+// admission, and is retried on every executor pass, without backoff, until a
+// read sizes it.
+func TestXFSRecoveredGoneDeletionStaysUnsizedUntilARowSizesIt(t *testing.T) {
+	dataPath := t.TempDir()
+	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
+	require.NoError(t, os.Mkdir(stage.hostPath(dataPath), 0o700)) // the final path is already gone
+	sizable := filepath.Join(t.TempDir(), "sizable")
+	t.Setenv("FRED_TEST_XFS_SIZABLE", sizable)
+	installXFSQuotaFixture(t, fmt.Sprintf(`case "$*" in
+  *"report -p -b -n -N"*) [ -e "$FRED_TEST_XFS_SIZABLE" ] || exit 23; printf '#%d 5 0 2048 0\n' ;;
+  *"report -p -i -n -N"*) printf '#%d 1 0 0 0\n' ;;
+esac`, stage.projID, stage.projID))
+	mgr := newXfsManagerForTest(dataPath)
+	require.NoError(t, mgr.PinIdentityRoot())
+	require.NoError(t, mgr.loadProjectIDs())
+	require.NoError(t, mgr.RecoverInterruptedVolumeMutations(t.Context()))
+
+	hold := heldForTest(t, mgr, stage.volumeID.value())
+	assert.Equal(t, holdPhaseUnsized, hold.phase, "an unsized footprint is never counted as zero")
+	assert.Equal(t, heldDeletionAccount{unsized: 1}, mgr.VolumeDeleteHolds().admissionAccount())
+	require.ErrorIs(t, mgr.Destroy(t.Context(), stage.volumeID.value()), ErrVolumeDeleteHeld,
+		"a caller that is still pending stays pending")
+	verdict, err := mgr.PrecheckDestroy(stage.volumeID)
+	assert.Equal(t, destroyPrecheckHeld, verdict)
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
+	names, err := mgr.ListForProof(t.Context())
+	require.NoError(t, err)
+	assert.Contains(t, names, stage.volumeID.value(), "no consumer may read its absence as completion")
+
+	// The executor's retry cannot size it either: it stays unsized and due.
+	err = mgr.RetryHeldVolumeDelete(t.Context(), stage.volumeID.value())
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
+	hold = heldForTest(t, mgr, stage.volumeID.value())
+	assert.Equal(t, holdPhaseUnsized, hold.phase)
+	assert.Equal(t, holdReasonUsageUnprovable, hold.reason)
+	assert.False(t, time.Now().Before(hold.nextAttempt), "an unsized hold is retried on the next pass")
+
+	// Once a row can be read, the retry sizes it: residual, counted at its
+	// block hard limit (2048 KiB = 2 MiB), and no longer withholding disk.
+	require.NoError(t, os.WriteFile(sizable, []byte("x"), 0o600))
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	require.ErrorIs(t, mgr.RetryHeldVolumeDelete(ctx, stage.volumeID.value()), ErrVolumeDeleteHeld)
+	hold = heldForTest(t, mgr, stage.volumeID.value())
+	assert.Equal(t, holdPhaseResidual, hold.phase)
+	assert.Equal(t, heldDeletionAccount{residualMB: 2}, mgr.VolumeDeleteHolds().admissionAccount())
+	require.NoError(t, mgr.Destroy(t.Context(), stage.volumeID.value()), "a residual hold settles its caller")
+}
+
+// A recovered deletion whose final path is still there cannot have settled
+// any caller: Start leaves it in the removal phase without reading its quota.
+// One whose final path reappears after Start observed it gone is an authority
+// contradiction, never tenant data to remove.
+func TestXFSRecoveredDeletionsAreClassifiedByWhatStartObserves(t *testing.T) {
+	dataPath := t.TempDir()
+	present := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
+	gone := mustXFSDeleteStage(t, xfsDeleteTestProjectID+1, "fred-550e8400-e29b-41d4-a716-446655440001-app-0")
+	require.NoError(t, os.Mkdir(present.hostPath(dataPath), 0o700))
+	require.NoError(t, os.Mkdir(present.volumeID.hostPath(dataPath), 0o700)) // marker already removed
+	require.NoError(t, os.Mkdir(gone.hostPath(dataPath), 0o700))
+	logPath := installXFSQuotaFixture(t, `case "$*" in
+  *"report -p -b -n -N"*) exit 23 ;;
+esac`)
+	mgr := newXfsManagerForTest(dataPath)
+	require.NoError(t, mgr.loadProjectIDs())
+	require.NoError(t, mgr.RecoverInterruptedVolumeMutations(t.Context()))
+
+	assert.Equal(t, holdPhaseRemoval, heldForTest(t, mgr, present.volumeID.value()).phase)
+	assert.Equal(t, holdPhaseUnsized, heldForTest(t, mgr, gone.volumeID.value()).phase)
+	assert.NotContains(t, readQuotaLog(t, logPath), fmt.Sprintf("-L %d", present.projID),
+		"a present volume's quota is not read at Start")
+
+	require.NoError(t, os.Mkdir(gone.volumeID.hostPath(dataPath), 0o700))
+	err := mgr.RetryHeldVolumeDelete(t.Context(), gone.volumeID.value())
+	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending,
+		"a final path seen gone at Start and there again is a contradiction")
+	assert.DirExists(t, gone.volumeID.hostPath(dataPath), "it is never emptied as condemned data")
+}
+
+// Start's report-row reads share one aggregate budget: a hung xfs_quota delays
+// Start by that budget once, not once per recovered stage, and every stage it
+// could not size is unsized.
+func TestXFSRecoveredSizingIsBoundedInAggregate(t *testing.T) {
+	dataPath := t.TempDir()
+	var stages []xfsDeleteStageName
+	for i := range 4 {
+		stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID+uint32(i),
+			canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", i))
+		require.NoError(t, os.Mkdir(stage.hostPath(dataPath), 0o700))
+		stages = append(stages, stage)
+	}
+	// The fixture's PATH holds only xfs_quota itself: name sleep absolutely so
+	// the read really hangs instead of failing fast.
+	sleepPath, err := exec.LookPath("sleep")
+	require.NoError(t, err)
+	logPath := installXFSQuotaFixture(t, fmt.Sprintf(`case "$*" in
+  *"report -p -b -n -N"*) exec %s 5 ;;
+esac`, sleepPath))
+	mgr := newXfsManagerForTest(dataPath)
+	require.NoError(t, mgr.loadProjectIDs())
+
+	const budget = 300 * time.Millisecond
+	started := time.Now()
+	require.NoError(t, mgr.classifyRecoveredDeleteHoldsWithin(t.Context(), budget))
+	elapsed := time.Since(started)
+	assert.GreaterOrEqual(t, elapsed, budget, "the first read really hung until the budget ended")
+	assert.Less(t, elapsed, 3*time.Second, "four hung reads share one budget")
+	assert.Equal(t, 1, strings.Count(readQuotaLog(t, logPath), "report -p -b"),
+		"no read starts once the budget is spent")
+	for _, stage := range stages {
+		assert.Equal(t, holdPhaseUnsized, heldForTest(t, mgr, stage.volumeID.value()).phase)
+	}
+	assert.Equal(t, heldDeletionAccount{unsized: 4}, mgr.VolumeDeleteHolds().admissionAccount())
+}
+
+// A final path Start cannot observe is a fault of the shared root, as it is
+// for the startup scan: Start fails rather than guess.
+func TestXFSRecoveredClassificationFailsStartOnAnUnreadableRoot(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root bypasses directory search permission")
+	}
+	dataPath := t.TempDir()
+	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
+	require.NoError(t, os.Mkdir(stage.hostPath(dataPath), 0o700))
+	mgr := newXfsManagerForTest(dataPath)
+	require.NoError(t, mgr.loadProjectIDs())
+	require.NoError(t, os.Chmod(dataPath, 0o600))
+	t.Cleanup(func() { _ = os.Chmod(dataPath, 0o700) })
+	require.Error(t, mgr.RecoverInterruptedVolumeMutations(t.Context()))
 }
 
 // Start's gate accepts held deletions and refuses everything else, while the

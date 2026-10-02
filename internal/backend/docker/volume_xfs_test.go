@@ -696,7 +696,7 @@ esac
 		"a clear failure must be recorded on the leak counter")
 	assert.Equal(t, uint32(4242), mgr.volumeToID[id], "the project ID must remain reserved for retry")
 	hold := heldForTest(t, mgr, id)
-	assert.True(t, hold.residual)
+	assert.True(t, hold.phase == holdPhaseResidual)
 	assert.Equal(t, holdReasonQuotaClearFailed, hold.reason)
 
 	// A crash here loses every in-memory map after the tenant tree is gone but
@@ -733,7 +733,7 @@ func TestXFSDestroyStopsWithItsCallerAndTheRetryFinishes(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	hold := heldForTest(t, mgr, name)
 	assert.Equal(t, holdReasonStopped, hold.reason)
-	assert.False(t, hold.residual)
+	assert.False(t, hold.phase == holdPhaseResidual)
 	assert.False(t, time.Now().Before(hold.nextAttempt), "a stopped attempt stays due")
 	assert.DirExists(t, dirPath, "a stopped attempt removes nothing more")
 
@@ -828,7 +828,7 @@ func TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError(t *testing.T) {
 	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending, "a per-volume removal failure must never latch")
 	hold := heldForTest(t, mgr, id)
 	assert.Equal(t, holdReasonUndeletable, hold.reason)
-	assert.False(t, hold.residual)
+	assert.False(t, hold.phase == holdPhaseResidual)
 	assert.DirExists(t, dir, "a partial recursive removal retains the managed root for an exact retry")
 	volumeID, parseErr := parseManagedVolumeName(id)
 	require.NoError(t, parseErr)

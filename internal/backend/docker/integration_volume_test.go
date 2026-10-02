@@ -1448,7 +1448,7 @@ func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing
 	require.ErrorContains(t, err, "refuse to clear xfs project quota")
 	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending)
 	hold := restarted.VolumeDeleteHolds().holds[volumeName]
-	assert.True(t, hold.residual, "the namespace is durably gone; only the project remains")
+	assert.True(t, hold.phase == holdPhaseResidual, "the namespace is durably gone; only the project remains")
 	assert.Equal(t, holdReasonUsageNonzero, hold.reason)
 	assert.Positive(t, hold.footprintMB, "the residual hold accounts the project's hard limit")
 	assert.NoDirExists(t, volumePath, "namespace deletion may finish while the FD remains open")
@@ -1470,7 +1470,7 @@ func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing
 	require.NoError(t, err)
 	require.NoError(t, restartedAgain.Validate())
 	require.NoError(t, restartedAgain.RecoverInterruptedVolumeMutations(ctx))
-	require.True(t, restartedAgain.VolumeDeleteHolds().holds[volumeName].residual,
+	require.True(t, restartedAgain.VolumeDeleteHolds().holds[volumeName].phase == holdPhaseResidual,
 		"Start sizes a recovered deletion whose final path is gone")
 	retryCtx, cancelRetry = context.WithTimeout(ctx, 10*time.Second)
 	require.NoError(t, restartedAgain.RetryHeldVolumeDelete(retryCtx, volumeName))
@@ -1591,7 +1591,7 @@ func TestIntegration_XFS_DestroyHoldsForeignTaggedInodeUsage(t *testing.T) {
 		"the volume's namespace is durably gone, so its caller settles")
 	hold, held := mgr.VolumeDeleteHolds().holds[volumeName]
 	require.True(t, held)
-	assert.True(t, hold.residual)
+	assert.True(t, hold.phase == holdPhaseResidual)
 	assert.Equal(t, holdReasonUsageNonzero, hold.reason)
 	assert.Equal(t, int64(20), hold.footprintMB, "the hold accounts the project's 20 MiB hard limit")
 	assert.NoDirExists(t, volumePath)

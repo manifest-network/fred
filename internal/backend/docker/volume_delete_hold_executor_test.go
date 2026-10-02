@@ -290,7 +290,9 @@ func TestHeldLeaseDeprovisionAnswersWithinBudgetWhileTheExecutorHoldsItsNamespac
 
 // A periodic reconcile skips, from memory, every close that waits only on held
 // deletions: no Docker, disk or store I/O for them, so the tick's later
-// stages keep their budget however many such closes pile up.
+// stages keep their budget however many such closes pile up. Half the closes
+// are mixed: one held volume plus a slot whose volume is already destroyed or
+// never existed (a stateless service), which counts as done.
 func TestReconcileTickSkipsClosesWaitingOnlyOnHeldDeletes(t *testing.T) {
 	dir := t.TempDir()
 	mock := &mockDockerClient{}
@@ -301,7 +303,7 @@ func TestReconcileTickSkipsClosesWaitingOnlyOnHeldDeletes(t *testing.T) {
 	for i := range closes {
 		leases[i] = fmt.Sprintf("550e8400-e29b-41d4-a716-4466554%05d", 40000+i)
 		names[i] = canonicalVolumeName(leases[i], "app", 0)
-		seedCloseLeaseFixture(t, b, stores, leases[i], "", 1)
+		seedCloseLeaseFixture(t, b, stores, leases[i], "", 1+i%2)
 	}
 	var destroys atomic.Int32
 	b.volumes = &mockVolumeManager{
@@ -460,6 +462,81 @@ func TestStartServesWithHeldDeleteStage(t *testing.T) {
 	require.NoError(t, stop(), "Stop is clean with a hold outstanding")
 }
 
+// A recovered deletion whose final path is gone, whose caller a previous
+// process may already have settled (no close, reaping record or operation
+// remains to count it), and whose footprint Start cannot read, fails disk
+// admission closed: when Start returns, every disk-bearing allocation is
+// refused while diskless ones and /health are unaffected. Once the executor
+// sizes it, admission reopens with the footprint counted.
+func TestStartWithholdsDiskAdmissionForAnUnsizedRecoveredDeletion(t *testing.T) {
+	dockerClient := &mockDockerClient{
+		PingFn:  func(context.Context) error { return nil },
+		CloseFn: func() error { return nil },
+	}
+	b := newBackendForProvisionTest(t, dockerClient, nil)
+	bindTestStorageIdentity(t, b, dockerClient)
+	t.Cleanup(b.stopCancel)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	dataPath := t.TempDir()
+	gone := mustXFSDeleteStage(t, xfsDeleteTestProjectID, "fred-550e8400-e29b-41d4-a716-446655440001-app-0")
+	require.NoError(t, os.Mkdir(gone.hostPath(dataPath), 0o700))
+	sizable := filepath.Join(t.TempDir(), "sizable")
+	t.Setenv("FRED_TEST_XFS_SIZABLE", sizable)
+	installXFSQuotaFixture(t, fmt.Sprintf(`case "$*" in
+  *"report -p -b -n -N"*) [ -e "$FRED_TEST_XFS_SIZABLE" ] || exit 23; printf '#%d 5 0 2048 0\n' ;;
+  *"report -p -i -n -N"*) printf '#%d 1 0 0 0\n' ;;
+esac`, gone.projID, gone.projID))
+	mgr := newXfsManagerForTest(dataPath)
+	mgr.inlineDeletes.Store(false)
+	b.volumes = validatingXFSManager{mgr}
+	installTestStorageMutationAdapters(b)
+	bindRetentionOrphanPrunerForTest(t, b)
+	// The test drives the executor's passes itself.
+	pass := b.backgroundMaintenance.retryHeldVolumeDeletesFn
+	b.backgroundMaintenance.retryHeldVolumeDeletesFn = func(ctx context.Context) volumeDeleteHoldPassReport {
+		<-ctx.Done()
+		return volumeDeleteHoldPassReport{}
+	}
+	stop := sync.OnceValue(b.Stop)
+	t.Cleanup(func() { _ = stop() })
+
+	require.NoError(t, b.Start(context.Background()))
+	require.Equal(t, holdPhaseUnsized, heldForTest(t, mgr, gone.volumeID.value()).phase)
+	stats := b.pool.Stats()
+	assert.True(t, stats.DiskAccountingHeld, "Start returns with disk admission withheld")
+	assert.Zero(t, stats.AvailableDiskMB())
+	disk := shared.SKUResourceSnapshot{SKU: "disk", CPUCores: 0.1, MemoryMB: 16, DiskMB: 64}
+	diskless := shared.SKUResourceSnapshot{SKU: "diskless", CPUCores: 0.1, MemoryMB: 16}
+	require.ErrorIs(t, b.pool.TryAllocateResolved("550e8400-e29b-41d4-a716-446655449998-app-0", "tenant-b", disk),
+		shared.ErrDiskAccountingIncomplete)
+	require.NoError(t, b.pool.TryAllocateResolved("550e8400-e29b-41d4-a716-446655449997-app-0", "tenant-b", diskless))
+	require.NoError(t, b.Health(t.Context()), "an unsized hold withholds disk, not the backend")
+	b.sampleVolumeDeleteHoldMetrics()
+	assert.Equal(t, float64(1), testutil.ToFloat64(volumeDeleteHolds.WithLabelValues(volumeDeleteHoldPhaseUnsized)))
+
+	// A short pass: the nonzero usage this fixture reports keeps the zero-usage
+	// wait polling until the attempt's slice ends.
+	runPass := func() {
+		passCtx, cancelPass := context.WithTimeout(t.Context(), 2*volumeDeleteHoldMinSlice)
+		defer cancelPass()
+		pass(passCtx)
+	}
+	runPass()
+	assert.Equal(t, holdPhaseUnsized, heldForTest(t, mgr, gone.volumeID.value()).phase)
+	assert.True(t, b.pool.Stats().DiskAccountingHeld, "a pass that cannot size it keeps admission withheld")
+
+	retainedBefore := b.pool.Stats().RetainedDiskMB
+	require.NoError(t, os.WriteFile(sizable, []byte("x"), 0o600))
+	runPass()
+	assert.Equal(t, holdPhaseResidual, heldForTest(t, mgr, gone.volumeID.value()).phase)
+	stats = b.pool.Stats()
+	assert.False(t, stats.DiskAccountingHeld, "a sized hold releases the exclusion")
+	assert.Equal(t, retainedBefore+2, stats.RetainedDiskMB, "and is counted at its block hard limit instead")
+	require.NoError(t, b.pool.TryAllocateResolved("550e8400-e29b-41d4-a716-446655449998-app-0", "tenant-b", disk))
+	require.NoError(t, b.terminalStorageAuthorityError())
+	require.NoError(t, stop())
+}
+
 // Start never waits on a tenant tree: a deletion first requested during
 // Start is handed to the executor without an attempt, so several closes whose
 // volumes need long removals do not stretch Start.
@@ -479,7 +556,7 @@ func TestStartDefersFirstTimeDeletesToTheExecutor(t *testing.T) {
 		assert.DirExists(t, filepath.Join(volumePath, writablePathSubdir), "nothing is removed during Start")
 	}
 	assert.Less(t, time.Since(started), liveXFSDeleteBudget, "three deferrals take no removal time")
-	removal, _ := mgr.VolumeDeleteHolds().phaseCounts()
+	removal := mgr.VolumeDeleteHolds().phaseCounts()[volumeDeleteHoldPhaseRemoval]
 	assert.Equal(t, 3, removal)
 }
 
@@ -525,8 +602,58 @@ func TestDeprovisionOfADeleteHeldCloseAnswersPendingWithoutRetrying(t *testing.T
 	closeCloseRecoveryBackend(t, b, stores)
 }
 
-// The close predicate answers from memory, and only when every volume slot is
-// removal-held and a projection vouches that no container remains.
+// A close mixing one held volume with a slot that has no volume left (already
+// destroyed, or a stateless service that never had one) waits only on the
+// hold: HTTP Deprovision answers the observable pending without a new close
+// generation or any substrate call, and the close-age gauges exclude it.
+func TestDeprovisionOfAMixedDeleteHeldCloseAnswersPendingWithoutRetrying(t *testing.T) {
+	dir := t.TempDir()
+	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, &mockVolumeManager{})
+	seedCloseLeaseFixture(t, b, stores, closeDeprovisionLeaseUUID, "", 2)
+	held := canonicalVolumeName(closeDeprovisionLeaseUUID, "app", 0)
+	var destroys atomic.Int32
+	b.volumes = &mockVolumeManager{
+		ListFn:              func() ([]string, error) { return []string{held}, nil },
+		VolumeDeleteHoldsFn: func() volumeDeleteHoldSnapshot { return pendingDeletes(held) },
+		DestroyFn: func(_ context.Context, name string) error {
+			destroys.Add(1)
+			if name == held {
+				return heldDeleteErr(name)
+			}
+			return nil
+		},
+	}
+	installTestStorageMutationAdapters(b)
+	require.Error(t, b.doDeprovisionForTest(t, t.Context(), closeDeprovisionLeaseUUID))
+	before, found, err := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
+	require.NoError(t, err)
+	require.True(t, found)
+	destroysBefore := destroys.Load()
+	var downs atomic.Int32
+	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
+		downs.Add(1)
+		return nil
+	}}
+
+	err = b.Deprovision(t.Context(), closeDeprovisionLeaseUUID)
+	require.Error(t, err)
+	assert.True(t, shared.IsLifecyclePending(err), "the answer is the observable pending: %v", err)
+	after, found, err := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, before.ExecutionGeneration().Number(), after.ExecutionGeneration().Number(),
+		"no new close generation is started")
+	assert.Equal(t, destroysBefore, destroys.Load(), "nothing is destroyed again")
+	assert.Zero(t, downs.Load(), "the substrate is not touched again")
+
+	b.sampleCloseIntentMetrics(time.Now())
+	assert.Equal(t, float64(1), testutil.ToFloat64(closeIntentsDeleteHeld), "the mixed close counts as delete-held")
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
+// The close predicate answers from memory: every remaining volume slot must be
+// held with its caller pending, at least one must be, and a projection must
+// vouch that no container remains.
 func TestCloseAwaitsHeldDeletesPredicate(t *testing.T) {
 	dir := t.TempDir()
 	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, &mockVolumeManager{})
@@ -543,13 +670,29 @@ func TestCloseAwaitsHeldDeletesPredicate(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 
-	retained := pendingDeletes(retainedName(first))
-	retained.holds[second] = pendingDeletes(second).holds[second]
-	assert.True(t, b.closeAwaitsHeldDeletes(claim, pendingDeletes(first, second)))
-	assert.True(t, b.closeAwaitsHeldDeletes(claim, retained), "a slot held under its retained name counts")
-	assert.False(t, b.closeAwaitsHeldDeletes(claim, pendingDeletes(first)), "every slot must be held")
-	assert.False(t, b.closeAwaitsHeldDeletes(claim, residualDeletes(10, first, second)),
-		"a residual hold no longer keeps the close waiting")
+	inFlight := volumeDeleteHoldSnapshot{
+		pending: map[string]struct{}{second: {}}, staged: map[string]struct{}{second: {}},
+		mapped: map[string]struct{}{second: {}},
+	}
+	for _, tc := range []struct {
+		name  string
+		holds volumeDeleteHoldSnapshot
+		want  bool
+	}{
+		{"every slot held", pendingDeletes(first, second), true},
+		{"a slot held under its retained name counts", pendingDeletes(retainedName(first), second), true},
+		{"an unsized hold keeps its caller pending", unsizedDeletes(first, second), true},
+		{"held plus already destroyed", pendingDeletes(first), true},
+		{"held plus a slot that never had a volume (a stateless service)", pendingDeletes(second), true},
+		{"held plus residual: the residual slot is settled", pendingDeletes(first).merge(residualDeletes(10, second)), true},
+		{"held plus a retained volume", pendingDeletes(first).withMapped(retainedName(second)), true},
+		{"held plus an existing unheld volume", pendingDeletes(first).withMapped(second), false},
+		{"held plus a deletion still in flight", pendingDeletes(first).merge(inFlight), false},
+		{"every slot residual: nothing is held, the close can finish", residualDeletes(10, first, second), false},
+		{"nothing held and nothing left: the close must run to finish", volumeDeleteHoldSnapshot{}, false},
+	} {
+		assert.Equal(t, tc.want, b.closeAwaitsHeldDeletes(claim, tc.holds), tc.name)
+	}
 
 	b.provisionsMu.Lock()
 	projection := b.provisions[closeDeprovisionLeaseUUID]

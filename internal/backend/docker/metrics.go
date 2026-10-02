@@ -168,13 +168,14 @@ var capChecks = []string{capCheckEvict, capCheckBreach, capCheckBound, capCheckR
 const (
 	volumeDeleteOutcomeCompleted    = "completed"
 	volumeDeleteOutcomeHeldRemoval  = "held_removal"
+	volumeDeleteOutcomeHeldUnsized  = "held_unsized"
 	volumeDeleteOutcomeHeldResidual = "held_residual"
 	volumeDeleteOutcomeLatched      = "latched"
 )
 
 // volumeDeleteOutcomes is the closed outcome set, pre-initialized in init.
 var volumeDeleteOutcomes = []string{
-	volumeDeleteOutcomeCompleted, volumeDeleteOutcomeHeldRemoval,
+	volumeDeleteOutcomeCompleted, volumeDeleteOutcomeHeldRemoval, volumeDeleteOutcomeHeldUnsized,
 	volumeDeleteOutcomeHeldResidual, volumeDeleteOutcomeLatched,
 }
 
@@ -408,8 +409,8 @@ var (
 	})
 
 	// closeIntentsDeleteHeld counts pending close intents waiting on nothing
-	// but held volume deletions (every managed volume of the close is held in
-	// the removal phase and no container remains). The hold executor finishes
+	// but held volume deletions (every remaining managed volume of the close is
+	// held with its caller pending, and no container remains). The hold executor finishes
 	// those on its own, so close-age alerting can exclude them (ENG-1117).
 	closeIntentsDeleteHeld = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
@@ -420,13 +421,15 @@ var (
 
 	// volumeDeleteHolds is the number of held volume deletions by phase,
 	// sampled by the Backend from its volume manager (ENG-1117). removal: tenant
-	// bytes may remain and the caller stays pending; residual: the volume is
-	// gone and only its quota project awaits the zero-usage proof.
+	// bytes may remain and the caller stays pending; unsized: the volume is gone
+	// but its project's footprint is not known yet, so disk admission is
+	// withheld; residual: the volume is gone and only its quota project awaits
+	// the zero-usage proof.
 	volumeDeleteHolds = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "volume_delete_holds",
-		Help:      "Volume deletions held per volume and retried in the background, by phase (removal|residual)",
+		Help:      "Volume deletions held per volume and retried in the background, by phase (removal|unsized|residual); unsized withholds disk admission",
 	}, []string{"phase"})
 
 	// leaseMutationUUIDSlots is the monotonically increasing number of lease
@@ -598,7 +601,7 @@ var (
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "volume_delete_outcomes_total",
-		Help:      "XFS volume deletion attempts by outcome (completed|held_removal|held_residual|latched)",
+		Help:      "XFS volume deletion attempts by outcome (completed|held_removal|held_unsized|held_residual|latched)",
 	}, []string{"outcome"})
 
 	// treeRemovalsTotal counts fstree removals of tenant-shaped trees by site
@@ -1255,7 +1258,7 @@ func init() {
 	for _, outcome := range volumeDeleteOutcomes {
 		volumeDeleteOutcomesTotal.WithLabelValues(outcome).Add(0)
 	}
-	for _, phase := range []string{volumeDeleteHoldPhaseRemoval, volumeDeleteHoldPhaseResidual} {
+	for _, phase := range volumeDeleteHoldPhases {
 		volumeDeleteHolds.WithLabelValues(phase).Set(0)
 	}
 	background.CleanupPanicsTotal.WithLabelValues(volumeDeleteHoldComponent).Add(0)
