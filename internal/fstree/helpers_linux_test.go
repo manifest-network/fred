@@ -25,6 +25,15 @@ func tempDir(t *testing.T) string {
 	return dir
 }
 
+// mustName parses a name the test knows to be valid.
+func mustName(name string) Name {
+	parsed, err := ParseName(name)
+	if err != nil {
+		panic(err)
+	}
+	return parsed
+}
+
 // openDir opens path as a directory for the rest of the test.
 func openDir(t *testing.T, path string) *os.File {
 	t.Helper()

@@ -81,7 +81,7 @@ func runMountCases(t *testing.T) {
 		parent := openDir(t, parentPath)
 
 		requireNoLeak(t, func() {
-			_, err := removeBeneath(ctx, parent, "anchor", RemoveOptions{}, maxDepth)
+			_, err := removeBeneath(ctx, parent, mustName("anchor"), RemoveOptions{}, maxDepth)
 			require.ErrorIs(t, err, ErrUndeletable)
 			require.ErrorIs(t, err, unix.EBUSY)
 		})
@@ -98,26 +98,35 @@ func runMountCases(t *testing.T) {
 		parent := openDir(t, filepath.Join(base, "parent"))
 
 		requireNoLeak(t, func() {
-			_, err := removeBeneath(ctx, parent, "anchor", RemoveOptions{}, maxDepth)
+			_, err := removeBeneath(ctx, parent, mustName("anchor"), RemoveOptions{}, maxDepth)
 			require.ErrorIs(t, err, ErrUndeletable)
 			require.ErrorIs(t, err, unix.EBUSY)
 		})
 		requireContent(t, filepath.Join(outside, "file"), "sentinel")
 	})
 
+	// The parent-versus-anchor check runs before anything in the anchor is
+	// touched: even a tree deep enough to need a cut is left whole, and
+	// BeforeFirstCut never sees the mounted anchor.
 	t.Run("removal refuses an entry that is a mount point", func(t *testing.T) {
 		parentPath := tempDir(t)
 		anchor := filepath.Join(parentPath, "anchor")
 		mkdirAll(t, anchor)
 		mountTmpfs(t, anchor)
 		writeFile(t, filepath.Join(anchor, "sentinel"), "kept")
+		mkdirAll(t, filepath.Join(anchor, "a", "b", "c"))
+		writeFile(t, filepath.Join(anchor, "a", "b", "c", "deep"), "kept")
+		before := snapshot(t, anchor)
 		parent := openDir(t, parentPath)
 
 		requireNoLeak(t, func() {
-			_, err := removeBeneath(ctx, parent, "anchor", RemoveOptions{}, maxDepth)
+			report, err := removeBeneath(ctx, parent, mustName("anchor"), RemoveOptions{
+				BeforeFirstCut: func(int) error { t.Error("BeforeFirstCut ran on a mounted anchor"); return nil },
+			}, 1)
 			require.ErrorIs(t, err, ErrCrossDevice)
+			require.Equal(t, RemoveReport{}, report, "nothing is removed")
 		})
-		requireContent(t, filepath.Join(anchor, "sentinel"), "kept")
+		require.Equal(t, before, snapshot(t, anchor))
 	})
 
 	// A bind mount of the same filesystem keeps st_dev; only the mount ID
@@ -133,7 +142,7 @@ func runMountCases(t *testing.T) {
 		parent := openDir(t, filepath.Join(base, "parent"))
 
 		requireNoLeak(t, func() {
-			_, err := removeBeneath(ctx, parent, "anchor", RemoveOptions{}, maxDepth)
+			_, err := removeBeneath(ctx, parent, mustName("anchor"), RemoveOptions{}, maxDepth)
 			require.ErrorIs(t, err, ErrCrossDevice)
 		})
 		require.Equal(t, before, snapshot(t, outside))
@@ -148,7 +157,7 @@ func runMountCases(t *testing.T) {
 		parent := openDir(t, parentPath)
 
 		requireNoLeak(t, func() {
-			_, err := walkBeneath(ctx, parent, "anchor", newRecorder(t, anchor), maxDepth)
+			_, err := walkBeneath(ctx, parent, mustName("anchor"), newRecorder(t, anchor), maxDepth)
 			require.ErrorIs(t, err, ErrCrossDevice)
 		})
 	})
@@ -164,7 +173,7 @@ func runMountCases(t *testing.T) {
 		parent := openDir(t, parentPath)
 
 		requireNoLeak(t, func() {
-			_, err := walkBeneath(ctx, parent, "anchor", newRecorder(t, anchor), maxDepth)
+			_, err := walkBeneath(ctx, parent, mustName("anchor"), newRecorder(t, anchor), maxDepth)
 			require.ErrorIs(t, err, ErrCrossDevice)
 		})
 	})
@@ -177,7 +186,7 @@ func runMountCases(t *testing.T) {
 		parent := openDir(t, parentPath)
 
 		requireNoLeak(t, func() {
-			_, err := walkBeneath(ctx, parent, "anchor", newRecorder(t, anchor), maxDepth)
+			_, err := walkBeneath(ctx, parent, mustName("anchor"), newRecorder(t, anchor), maxDepth)
 			require.ErrorIs(t, err, ErrCrossDevice)
 		})
 	})

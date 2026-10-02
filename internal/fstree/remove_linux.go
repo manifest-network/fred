@@ -43,11 +43,11 @@ const (
 // It owns at most three descriptors: the anchor, the directory being emptied
 // and, while it descends or ascends, one transient descriptor.
 type remover struct {
-	ctx     context.Context
-	pfd     int
-	name    string
-	limit   int
-	prepare func(anchorFD int) error
+	ctx            context.Context
+	pfd            int
+	name           string
+	limit          int
+	beforeFirstCut func(anchorFD int) error
 
 	anchor identity // the anchor as opened through name
 	afd    int      // anchor descriptor; -1 when not open
@@ -56,23 +56,23 @@ type remover struct {
 	stack  []uint64 // inode of each ancestor of cur, from the anchor down
 	stalls int      // consecutive iterations without progress
 
-	cutSeeded bool
+	cutsBegun bool   // the first cut was prepared: hook run, names seeded
 	cutNext   uint64 // next cut-name counter value
 
 	dir    dirReader
 	report RemoveReport
 }
 
-func newRemover(ctx context.Context, pfd int, name string, opts RemoveOptions, limit int) *remover {
+func newRemover(ctx context.Context, pfd int, name Name, opts RemoveOptions, limit int) *remover {
 	return &remover{
-		ctx:     ctx,
-		pfd:     pfd,
-		name:    name,
-		limit:   limit,
-		prepare: opts.PrepareAnchor,
-		afd:     -1,
-		cur:     -1,
-		dir:     newDirReader(),
+		ctx:            ctx,
+		pfd:            pfd,
+		name:           name.s,
+		limit:          limit,
+		beforeFirstCut: opts.BeforeFirstCut,
+		afd:            -1,
+		cur:            -1,
+		dir:            newDirReader(),
 	}
 }
 
@@ -117,7 +117,8 @@ func (r *remover) canceled(err error) error {
 // begin unlinks the entry outright when it is not a directory, and reports
 // opened=false when nothing is left to do. Otherwise it opens the entry as
 // the anchor, requires the anchor to share its parent's device and mount,
-// runs PrepareAnchor, and reports opened.
+// and reports opened. A host mount at the entry is therefore refused with
+// ErrCrossDevice before anything in it is touched.
 func (r *remover) begin() (opened bool, err error) {
 	if err := r.ctx.Err(); err != nil {
 		return false, r.canceled(err)
@@ -168,11 +169,6 @@ func (r *remover) begin() (opened bool, err error) {
 		return false, crossDevice(r.name, 0)
 	}
 	r.anchor = anchor
-	if r.prepare != nil {
-		if err := r.prepare(r.afd); err != nil {
-			return false, fmt.Errorf("fstree: prepare anchor %q: %w", shortName(r.name), err)
-		}
-	}
 	cur, err := dupFD(r.afd)
 	if err != nil {
 		return false, opError("dup", r.name, 0, err)
@@ -361,17 +357,16 @@ func (r *remover) ascend() error {
 // is then removed from the anchor like any other child, so the ancestor
 // stack never grows past the bound.
 //
-// Cut names count up from a random origin: names planted in the anchor
-// beforehand cannot be predicted to collide, and a rerun of an interrupted
-// removal does not retry the names it left behind.
+// The call's first cut runs beginCuts first. Cut names count up from a
+// random origin: names planted in the anchor beforehand cannot be predicted
+// to collide, and a rerun of an interrupted removal does not retry the names
+// it left behind.
 func (r *remover) cut(name string) (moved bool, err error) {
 	depth := r.depth() + 1
-	if !r.cutSeeded {
-		var seed [8]byte
-		// crypto/rand.Read never fails since Go 1.24.
-		_, _ = rand.Read(seed[:])
-		r.cutNext = binary.NativeEndian.Uint64(seed[:])
-		r.cutSeeded = true
+	if !r.cutsBegun {
+		if err := r.beginCuts(name, depth); err != nil {
+			return false, err
+		}
 	}
 	for range cutAttempts {
 		target := fmt.Sprintf("%s%016x", cutPrefix, r.cutNext)
@@ -391,6 +386,25 @@ func (r *remover) cut(name string) (moved bool, err error) {
 		}
 	}
 	return false, cutError(name, depth, err)
+}
+
+// beginCuts prepares the call's first cut, once: it runs BeforeFirstCut on
+// the anchor and seeds the cut names. It marks the cuts begun before the
+// hook runs, so the hook runs at most once per call even when it fails; a
+// failure refuses the cut with ErrCutRefused, and the call stops there.
+func (r *remover) beginCuts(name string, depth int) error {
+	r.cutsBegun = true
+	if r.beforeFirstCut != nil {
+		if err := r.beforeFirstCut(r.afd); err != nil {
+			return fmt.Errorf("%w: before the first cut, of %q at depth %d: %w",
+				ErrCutRefused, shortName(name), depth, err)
+		}
+	}
+	var seed [8]byte
+	// crypto/rand.Read never fails since Go 1.24.
+	_, _ = rand.Read(seed[:])
+	r.cutNext = binary.NativeEndian.Uint64(seed[:])
+	return nil
 }
 
 // cutError classifies a failed cut. EXDEV, EDQUOT, ENOSPC and EMLINK mean

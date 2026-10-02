@@ -34,9 +34,9 @@ var (
 	// ErrCrossDevice means the entry, or a directory inside it, lies on
 	// another filesystem or mount than its parent.
 	ErrCrossDevice = errors.New("fstree: tree crosses a filesystem boundary")
-	// ErrCutRefused means RemoveBeneath reached its depth bound and moving
-	// the deeper subtree into the anchor failed with EXDEV, EDQUOT, ENOSPC
-	// or EMLINK.
+	// ErrCutRefused means RemoveBeneath reached its depth bound and could
+	// not move the deeper subtree into the anchor: BeforeFirstCut failed, or
+	// the rename failed with EXDEV, EDQUOT, ENOSPC or EMLINK.
 	ErrCutRefused = errors.New("fstree: depth bound reached and the subtree could not be moved")
 	// ErrUndeletable means an entry cannot be removed: an unlink, rmdir or
 	// cut rename, or the open of a directory to empty it, failed with EPERM,
@@ -44,21 +44,28 @@ var (
 	ErrUndeletable = errors.New("fstree: entry cannot be removed")
 	// ErrTooDeep means WalkBeneath met a directory deeper than its bound.
 	ErrTooDeep = errors.New("fstree: tree deeper than the walk bound")
-	// ErrInvalidName means name is not a single path component: 1 to 255
-	// bytes, free of '/' and NUL, and neither "." nor "..".
+	// ErrInvalidName means a name is not a single path component: 1 to 255
+	// bytes, free of '/' and NUL, and neither "." nor "..". ParseName returns
+	// it, and RemoveBeneath and WalkBeneath return it for the zero Name.
 	ErrInvalidName = errors.New("fstree: invalid entry name")
 )
 
 // RemoveOptions configures RemoveBeneath.
 type RemoveOptions struct {
-	// PrepareAnchor, when set, runs once on the opened top directory, the
-	// anchor, before anything beneath it is removed; its error stops the
-	// removal with nothing removed. It must be idempotent, because a rerun
-	// calls it again, and the descriptor is valid only during the call. It
-	// exists so that XFS volume deletion can first detach the condemned
-	// anchor from its quota project, after which cuts into the anchor cannot
-	// fail with EXDEV or EDQUOT.
-	PrepareAnchor func(anchorFD int) error
+	// BeforeFirstCut, when set, runs on the anchor (the opened top
+	// directory) immediately before the call's first cut, and at most once
+	// per call. A removal that needs no cut, because the tree is no deeper
+	// than the depth bound, never calls it. When it fails, that cut is
+	// refused: RemoveBeneath stops with an error wrapping both ErrCutRefused
+	// and the hook's error, and keeps everything it has not yet removed.
+	//
+	// It exists so that XFS volume deletion can detach the condemned anchor
+	// from its quota project only when a cut makes that necessary, after
+	// which a cut into the anchor cannot fail with EXDEV or EDQUOT. It must
+	// be idempotent, because a rerun calls it again at its own first cut. The
+	// descriptor is valid only during the call, which must neither close it
+	// nor rely on its file offset.
+	BeforeFirstCut func(anchorFD int) error
 }
 
 // RemoveReport counts what one RemoveBeneath call removed. A failed call
@@ -77,8 +84,8 @@ type RemoveReport struct {
 	MaxDepth int
 }
 
-// RemoveBeneath removes the entry name (one path component) inside the
-// directory parent and, when it is a directory, everything beneath it. It
+// RemoveBeneath removes the entry name inside the directory parent and, when
+// it is a directory, everything beneath it. It
 // holds at most three descriptors of its own, keeps at most 65,536 levels of
 // ancestry (512 KiB) plus one directory batch, and does not recurse; it never
 // follows symlinks, never crosses a mount, and never ascends above the entry.
@@ -93,12 +100,13 @@ type RemoveReport struct {
 // including a symlink to one, is unlinked without being opened. On failure
 // RemoveBeneath stops and leaves in place everything it has not removed, and
 // a rerun continues from there. The error wraps ErrTreeChanged,
-// ErrCrossDevice, ErrCutRefused, ErrUndeletable, ErrInvalidName, the
-// context's error, PrepareAnchor's error, or the failing syscall's errno.
+// ErrCrossDevice, ErrCutRefused (alone, or with BeforeFirstCut's error),
+// ErrUndeletable, ErrInvalidName, the context's error, or the failing
+// syscall's errno.
 //
-// parent must stay open for the duration of the call, and PrepareAnchor must
-// not close it.
-func RemoveBeneath(ctx context.Context, parent *os.File, name string, opts RemoveOptions) (RemoveReport, error) {
+// parent must stay open for the duration of the call, and BeforeFirstCut
+// must not close it.
+func RemoveBeneath(ctx context.Context, parent *os.File, name Name, opts RemoveOptions) (RemoveReport, error) {
 	return removeBeneath(ctx, parent, name, opts, maxDepth)
 }
 
@@ -107,7 +115,7 @@ func RemoveBeneath(ctx context.Context, parent *os.File, name string, opts Remov
 func removeBeneath(
 	ctx context.Context,
 	parent *os.File,
-	name string,
+	name Name,
 	opts RemoveOptions,
 	limit int,
 ) (RemoveReport, error) {
@@ -174,13 +182,13 @@ type WalkReport struct {
 //
 // parent must stay open for the duration of the call, and v must not close
 // it.
-func WalkBeneath(ctx context.Context, parent *os.File, name string, v Visitor) (WalkReport, error) {
+func WalkBeneath(ctx context.Context, parent *os.File, name Name, v Visitor) (WalkReport, error) {
 	return walkBeneath(ctx, parent, name, v, maxDepth)
 }
 
 // walkBeneath is WalkBeneath with the depth bound as a parameter, so a
 // white-box test can reach ErrTooDeep without building 65,536 levels.
-func walkBeneath(ctx context.Context, parent *os.File, name string, v Visitor, limit int) (WalkReport, error) {
+func walkBeneath(ctx context.Context, parent *os.File, name Name, v Visitor, limit int) (WalkReport, error) {
 	if err := checkCall(ctx, parent, name, limit); err != nil {
 		return WalkReport{}, err
 	}
@@ -203,14 +211,15 @@ func walkBeneath(ctx context.Context, parent *os.File, name string, v Visitor, l
 	return report, runErr
 }
 
-func checkCall(ctx context.Context, parent *os.File, name string, limit int) error {
+func checkCall(ctx context.Context, parent *os.File, name Name, limit int) error {
 	switch {
 	case ctx == nil:
 		return errors.New("fstree: nil context")
 	case parent == nil:
 		return errors.New("fstree: nil parent directory")
-	case !validName(name):
-		return fmt.Errorf("%w: %q", ErrInvalidName, shortName(name))
+	case !validName(name.s):
+		// Only the zero Name gets here: ParseName built every other one.
+		return fmt.Errorf("%w: the zero Name", ErrInvalidName)
 	case limit < 1:
 		return fmt.Errorf("fstree: depth bound %d is below 1", limit)
 	}

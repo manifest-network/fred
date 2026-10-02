@@ -36,11 +36,11 @@ type walker struct {
 	report WalkReport
 }
 
-func newWalker(ctx context.Context, pfd int, name string, v Visitor, limit int) *walker {
+func newWalker(ctx context.Context, pfd int, name Name, v Visitor, limit int) *walker {
 	return &walker{
 		ctx:   ctx,
 		pfd:   pfd,
-		name:  name,
+		name:  name.s,
 		limit: limit,
 		visit: v,
 		cur:   -1,

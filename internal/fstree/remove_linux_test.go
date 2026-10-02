@@ -59,7 +59,7 @@ func removeDeepChainUnderLowFDLimit(t *testing.T) {
 	require.ErrorIs(t, controlErr, syscall.EMFILE, "control: Go's RemoveAll needs one descriptor per level")
 
 	before := fdCount(t)
-	report, err := removeBeneath(context.Background(), parent, "anchor", RemoveOptions{}, maxDepth)
+	report, err := removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{}, maxDepth)
 	require.NoError(t, err)
 	require.Equal(t, before, fdCount(t), "descriptors leaked")
 	requireAbsent(t, filepath.Join(parentPath, "anchor"))
@@ -78,7 +78,7 @@ func TestRemoveBeneathCutsATreeDeeperThanTheBound(t *testing.T) {
 	var report RemoveReport
 	requireNoLeak(t, func() {
 		var err error
-		report, err = removeBeneath(context.Background(), parent, "anchor", RemoveOptions{}, limit)
+		report, err = removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{}, limit)
 		require.NoError(t, err)
 	})
 	require.GreaterOrEqual(t, report.Cuts, uint64(124))
@@ -100,7 +100,7 @@ func TestRemoveBeneathRerunFinishesACanceledRemoval(t *testing.T) {
 			parent := openDir(t, parentPath)
 
 			requireNoLeak(t, func() {
-				_, err := removeBeneath(newCancelAfter(checks), parent, "anchor", RemoveOptions{}, 8)
+				_, err := removeBeneath(newCancelAfter(checks), parent, mustName("anchor"), RemoveOptions{}, 8)
 				if err == nil {
 					completed++
 					return
@@ -116,7 +116,7 @@ func TestRemoveBeneathRerunFinishesACanceledRemoval(t *testing.T) {
 				}
 			})
 			requireNoLeak(t, func() {
-				_, err := removeBeneath(context.Background(), parent, "anchor", RemoveOptions{}, 8)
+				_, err := removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{}, 8)
 				require.NoError(t, err)
 			})
 			requireAbsent(t, anchor)
@@ -150,7 +150,7 @@ func TestRemoveBeneathNeverFollowsSymlinks(t *testing.T) {
 	var report RemoveReport
 	requireNoLeak(t, func() {
 		var err error
-		report, err = removeBeneath(context.Background(), parent, "anchor", RemoveOptions{}, maxDepth)
+		report, err = removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{}, maxDepth)
 		require.NoError(t, err)
 	})
 	requireAbsent(t, anchor)
@@ -170,14 +170,14 @@ func TestRemoveBeneathRemovesOnlyTheLinkWhenTheEntryIsASymlink(t *testing.T) {
 			mkdirAll(t, parentPath)
 			require.NoError(t, os.Symlink(filepath.Join(outside, target), filepath.Join(parentPath, "anchor")))
 			parent := openDir(t, parentPath)
-			var prepared bool
+			var called bool
 
-			report, err := removeBeneath(context.Background(), parent, "anchor", RemoveOptions{
-				PrepareAnchor: func(int) error { prepared = true; return nil },
-			}, maxDepth)
+			report, err := removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{
+				BeforeFirstCut: func(int) error { called = true; return nil },
+			}, 1)
 			require.NoError(t, err)
 			require.Equal(t, RemoveReport{Entries: 1}, report)
-			require.False(t, prepared, "a non-directory entry has no anchor to prepare")
+			require.False(t, called, "a non-directory entry has no anchor and needs no cut")
 			requireAbsent(t, filepath.Join(parentPath, "anchor"))
 			require.Equal(t, before, snapshot(t, outside))
 		})
@@ -201,7 +201,7 @@ func TestRemoveBeneathDetectsAHeldDirectoryMovedOutOfTheTree(t *testing.T) {
 	parent := openDir(t, parentPath)
 
 	requireNoLeak(t, func() {
-		r := newRemover(context.Background(), int(parent.Fd()), "anchor", RemoveOptions{}, maxDepth)
+		r := newRemover(context.Background(), int(parent.Fd()), mustName("anchor"), RemoveOptions{}, maxDepth)
 		defer r.release()
 		opened, err := r.begin()
 		require.NoError(t, err)
@@ -252,7 +252,7 @@ func TestRemoveBeneathLeavesASwappedAnchorAlone(t *testing.T) {
 			parent := openDir(t, parentPath)
 
 			requireNoLeak(t, func() {
-				r := newRemover(context.Background(), int(parent.Fd()), "anchor", RemoveOptions{}, maxDepth)
+				r := newRemover(context.Background(), int(parent.Fd()), mustName("anchor"), RemoveOptions{}, maxDepth)
 				defer r.release()
 				opened, err := r.begin()
 				require.NoError(t, err)
@@ -287,7 +287,7 @@ func TestRemoveBeneathDetectsAHeldDirectoryRemovedByAnother(t *testing.T) {
 	parent := openDir(t, parentPath)
 
 	requireNoLeak(t, func() {
-		r := newRemover(context.Background(), int(parent.Fd()), "anchor", RemoveOptions{}, maxDepth)
+		r := newRemover(context.Background(), int(parent.Fd()), mustName("anchor"), RemoveOptions{}, maxDepth)
 		defer r.release()
 		opened, err := r.begin()
 		require.NoError(t, err)
@@ -312,7 +312,7 @@ func TestRemoveBeneathKeepsAnAnchorThatGainsEntries(t *testing.T) {
 	parent := openDir(t, parentPath)
 
 	requireNoLeak(t, func() {
-		r := newRemover(context.Background(), int(parent.Fd()), "anchor", RemoveOptions{}, maxDepth)
+		r := newRemover(context.Background(), int(parent.Fd()), mustName("anchor"), RemoveOptions{}, maxDepth)
 		defer r.release()
 		opened, err := r.begin()
 		require.NoError(t, err)
@@ -343,7 +343,7 @@ func TestRemoveBeneathCutRetriesTakenNames(t *testing.T) {
 			writeFile(t, filepath.Join(anchor, "a", "b", "f"), "moved, never lost")
 			parent := openDir(t, parentPath)
 
-			r := newRemover(context.Background(), int(parent.Fd()), "anchor", RemoveOptions{}, 1)
+			r := newRemover(context.Background(), int(parent.Fd()), mustName("anchor"), RemoveOptions{}, 1)
 			defer r.release()
 			opened, err := r.begin()
 			require.NoError(t, err)
@@ -352,7 +352,7 @@ func TestRemoveBeneathCutRetriesTakenNames(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, 1, r.depth(), "the remover holds a, at the depth bound")
 
-			r.cutSeeded, r.cutNext = true, 0x10
+			r.cutsBegun, r.cutNext = true, 0x10
 			for i := range taken {
 				mkdirAll(t, filepath.Join(anchor, fmt.Sprintf("%s%016x", cutPrefix, 0x10+i)))
 			}
@@ -387,7 +387,7 @@ func TestRemoveBeneathTreatsAVanishedAnchorAsRemoved(t *testing.T) {
 	mkdirAll(t, filepath.Join(anchor, "x"))
 	parent := openDir(t, parentPath)
 
-	r := newRemover(context.Background(), int(parent.Fd()), "anchor", RemoveOptions{}, maxDepth)
+	r := newRemover(context.Background(), int(parent.Fd()), mustName("anchor"), RemoveOptions{}, maxDepth)
 	defer r.release()
 	err := drive(r, func() {
 		if _, err := os.Lstat(anchor); err == nil {
@@ -423,7 +423,7 @@ func TestRemoveBeneathRemovesWideTreesInBoundedMemory(t *testing.T) {
 	require.NoError(t, wide.Close())
 	parent := openDir(t, parentPath)
 
-	r := newRemover(context.Background(), int(parent.Fd()), "anchor", RemoveOptions{}, maxDepth)
+	r := newRemover(context.Background(), int(parent.Fd()), mustName("anchor"), RemoveOptions{}, maxDepth)
 	defer r.release()
 	runtime.GC()
 	var base runtime.MemStats
@@ -484,14 +484,14 @@ func TestRemoveBeneathStopsAtAnEntryItCannotRemove(t *testing.T) {
 			parent := openDir(t, parentPath)
 
 			requireNoLeak(t, func() {
-				_, err := removeBeneath(context.Background(), parent, "anchor", RemoveOptions{}, maxDepth)
+				_, err := removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{}, maxDepth)
 				require.ErrorIs(t, err, ErrUndeletable)
 				require.ErrorIs(t, err, unix.EACCES)
 			})
 			require.NoError(t, os.Chmod(locked, 0o700))
 			requireContent(t, kept, "kept")
 			requireNoLeak(t, func() {
-				_, err := removeBeneath(context.Background(), parent, "anchor", RemoveOptions{}, maxDepth)
+				_, err := removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{}, maxDepth)
 				require.NoError(t, err)
 			})
 			requireAbsent(t, anchor)
@@ -509,7 +509,7 @@ func TestRemoveBeneathRemovesAnEmptyInaccessibleDirectory(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
 	parent := openDir(t, parentPath)
 
-	report, err := removeBeneath(context.Background(), parent, "anchor", RemoveOptions{}, maxDepth)
+	report, err := removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{}, maxDepth)
 	require.NoError(t, err)
 	require.Equal(t, RemoveReport{Dirs: 2}, report)
 	requireAbsent(t, filepath.Join(parentPath, "anchor"))
@@ -540,7 +540,7 @@ func TestRemoveBeneathTopEntryKinds(t *testing.T) {
 			tc.create(t, filepath.Join(parentPath, "entry"))
 			parent := openDir(t, parentPath)
 			requireNoLeak(t, func() {
-				report, err := removeBeneath(context.Background(), parent, "entry", RemoveOptions{}, maxDepth)
+				report, err := removeBeneath(context.Background(), parent, mustName("entry"), RemoveOptions{}, maxDepth)
 				require.NoError(t, err)
 				require.Equal(t, tc.want, report)
 			})
@@ -555,64 +555,169 @@ func TestRemoveBeneathRejectsInvalidCalls(t *testing.T) {
 	parent := openDir(t, parentPath)
 	ctx := context.Background()
 
-	for _, name := range []string{"", ".", "..", "a/b", "/", "/abs", "trailing/", "nul\x00byte", strings.Repeat("n", 256)} {
-		_, err := RemoveBeneath(ctx, parent, name, RemoveOptions{})
-		require.ErrorIs(t, err, ErrInvalidName, "%q", name)
-		require.LessOrEqual(t, len(err.Error()), 120, "error text is bounded")
-	}
-	_, err := RemoveBeneath(nil, parent, "keep", RemoveOptions{}) //nolint:staticcheck // the nil context is the case under test
+	_, err := RemoveBeneath(ctx, parent, Name{}, RemoveOptions{})
+	require.ErrorIs(t, err, ErrInvalidName, "the zero Name is refused")
+	_, err = RemoveBeneath(nil, parent, mustName("keep"), RemoveOptions{}) //nolint:staticcheck // the nil context is the case under test
 	require.Error(t, err)
-	_, err = RemoveBeneath(ctx, nil, "keep", RemoveOptions{})
+	_, err = RemoveBeneath(ctx, nil, mustName("keep"), RemoveOptions{})
 	require.Error(t, err)
-	_, err = removeBeneath(ctx, parent, "keep", RemoveOptions{}, 0)
+	_, err = removeBeneath(ctx, parent, mustName("keep"), RemoveOptions{}, 0)
 	require.Error(t, err)
 
 	closed, err := os.Open(parentPath)
 	require.NoError(t, err)
 	require.NoError(t, closed.Close())
-	_, err = RemoveBeneath(ctx, closed, "keep", RemoveOptions{})
+	_, err = RemoveBeneath(ctx, closed, mustName("keep"), RemoveOptions{})
 	require.Error(t, err, "a closed parent is refused, never used by number")
 	require.Equal(t, []string{"keep"}, listNames(t, parentPath))
 }
 
-// PrepareAnchor runs once, on the anchor, before anything is removed; its
-// error stops the removal with nothing removed.
-func TestRemoveBeneathPrepareAnchor(t *testing.T) {
+// ParseName accepts exactly the single path components, and its error names
+// at most a bounded prefix of what it refused.
+func TestParseName(t *testing.T) {
+	for _, name := range []string{"a", "anchor", "...", ".a", "a.", " ", "\xff", strings.Repeat("n", maxNameLen)} {
+		parsed, err := ParseName(name)
+		require.NoError(t, err, "%q", name)
+		require.Equal(t, name, parsed.String())
+	}
+	for _, name := range []string{
+		"", ".", "..", "a/b", "/", "/abs", "trailing/", "../up", "nul\x00byte", strings.Repeat("n", maxNameLen+1),
+	} {
+		parsed, err := ParseName(name)
+		require.ErrorIs(t, err, ErrInvalidName, "%q", name)
+		require.Equal(t, Name{}, parsed, "a refused name yields the zero Name")
+		require.LessOrEqual(t, len(err.Error()), 120, "error text is bounded")
+	}
+	require.Empty(t, Name{}.String())
+}
+
+// A tree no deeper than the depth bound needs no cut, so BeforeFirstCut is
+// never called; one level more needs a cut and calls it once.
+func TestRemoveBeneathBeforeFirstCutOnlyWhenACutIsNeeded(t *testing.T) {
+	const limit = 4
+	for _, tc := range []struct {
+		depth     int
+		wantCalls int
+	}{
+		{depth: 0},
+		{depth: 1},
+		{depth: limit},
+		{depth: limit + 1, wantCalls: 1},
+		{depth: 10 * limit, wantCalls: 1},
+	} {
+		t.Run(fmt.Sprintf("depth_%d", tc.depth), func(t *testing.T) {
+			parentPath := tempDir(t)
+			parent := openDir(t, parentPath)
+			buildChain(t, parent, "anchor", tc.depth)
+			var calls int
+			var report RemoveReport
+			requireNoLeak(t, func() {
+				var err error
+				report, err = removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{
+					BeforeFirstCut: func(int) error { calls++; return nil },
+				}, limit)
+				require.NoError(t, err)
+			})
+			require.Equal(t, tc.wantCalls, calls)
+			require.Equal(t, tc.wantCalls > 0, report.Cuts > 0, "the hook runs exactly when a cut happens")
+			requireAbsent(t, filepath.Join(parentPath, "anchor"))
+		})
+	}
+
+	// A bushy tree within the bound never calls it either.
 	parentPath := tempDir(t)
-	anchor := filepath.Join(parentPath, "anchor")
-	mkdirAll(t, filepath.Join(anchor, "sub"))
-	writeFile(t, filepath.Join(anchor, "sub", "f"), "x")
-	anchorIno := inode(t, anchor)
-	before := snapshot(t, parentPath)
+	buildBushyChain(t, parentPath, "anchor", limit, 3)
 	parent := openDir(t, parentPath)
+	report, err := removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{
+		BeforeFirstCut: func(int) error { t.Fatal("BeforeFirstCut called for a tree within the bound"); return nil },
+	}, limit+1)
+	require.NoError(t, err)
+	require.Zero(t, report.Cuts)
+	requireAbsent(t, filepath.Join(parentPath, "anchor"))
+}
+
+// BeforeFirstCut runs on the anchor, once per call, at the depth bound and
+// before the first cut; every later cut proceeds without it.
+func TestRemoveBeneathBeforeFirstCutRunsOnceBeforeTheFirstCut(t *testing.T) {
+	const depth, limit = 200, 8
+	parentPath := tempDir(t)
+	parent := openDir(t, parentPath)
+	buildChain(t, parent, "anchor", depth)
+	anchorIno := inode(t, filepath.Join(parentPath, "anchor"))
+
+	var calls int
+	var r *remover
+	r = newRemover(context.Background(), int(parent.Fd()), mustName("anchor"), RemoveOptions{
+		BeforeFirstCut: func(fd int) error {
+			calls++
+			var st unix.Stat_t
+			require.NoError(t, unix.Fstat(fd, &st))
+			require.Equal(t, anchorIno, st.Ino, "the hook receives the anchor")
+			require.Equal(t, limit, r.depth(), "the remover is at the depth bound")
+			require.Zero(t, r.report.Cuts, "nothing was cut before the hook")
+			return nil
+		},
+	}, limit)
+	requireNoLeak(t, func() {
+		defer r.release()
+		require.NoError(t, drive(r, nil))
+	})
+	require.Equal(t, 1, calls)
+	require.Greater(t, r.report.Cuts, uint64(1), "later cuts do not call the hook again")
+	requireAbsent(t, filepath.Join(parentPath, "anchor"))
+}
+
+// A failing BeforeFirstCut refuses the cut: the call stops with an error
+// wrapping ErrCutRefused and the hook's error, having removed what lay
+// within the bound and cut nothing, and a rerun calls the hook again.
+func TestRemoveBeneathBeforeFirstCutErrorRefusesTheCut(t *testing.T) {
+	const depth, limit = 50, 4
+	parentPath := tempDir(t)
+	parent := openDir(t, parentPath)
+	buildChain(t, parent, "anchor", depth)
+	anchor := filepath.Join(parentPath, "anchor")
 	refuse := errors.New("refused")
 
 	var calls int
+	var report RemoveReport
 	requireNoLeak(t, func() {
-		_, err := removeBeneath(context.Background(), parent, "anchor", RemoveOptions{
-			PrepareAnchor: func(fd int) error {
-				calls++
-				var st unix.Stat_t
-				require.NoError(t, unix.Fstat(fd, &st))
-				require.Equal(t, anchorIno, st.Ino)
-				require.Equal(t, before, snapshot(t, parentPath), "nothing is removed before PrepareAnchor")
-				return refuse
-			},
-		}, maxDepth)
+		var err error
+		report, err = removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{
+			BeforeFirstCut: func(int) error { calls++; return refuse },
+		}, limit)
+		require.ErrorIs(t, err, ErrCutRefused)
 		require.ErrorIs(t, err, refuse)
+		require.Less(t, len(err.Error()), 400, "error text stays bounded: %s", err)
 	})
 	require.Equal(t, 1, calls)
-	require.Equal(t, before, snapshot(t, parentPath))
+	require.Zero(t, report.Cuts)
+	require.Equal(t, limit, report.MaxDepth, "removal proceeded down to the bound")
+	for _, name := range listNames(t, anchor) {
+		require.False(t, strings.HasPrefix(name, cutPrefix), "nothing was cut: %q", name)
+	}
+	require.FileExists(t, filepath.Join(anchor, strings.Repeat("d/", depth)+"leaf"), "the deep subtree is kept")
 
 	calls = 0
 	requireNoLeak(t, func() {
-		_, err := removeBeneath(context.Background(), parent, "anchor", RemoveOptions{
-			PrepareAnchor: func(int) error { calls++; return nil },
-		}, 1)
+		_, err := removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{
+			BeforeFirstCut: func(int) error { calls++; return nil },
+		}, limit)
 		require.NoError(t, err)
 	})
-	require.Equal(t, 1, calls)
+	require.Equal(t, 1, calls, "a rerun calls the hook at its own first cut")
 	requireAbsent(t, anchor)
+}
+
+// A non-directory entry has no anchor and needs no cut.
+func TestRemoveBeneathBeforeFirstCutNotCalledForANonDirectory(t *testing.T) {
+	parentPath := tempDir(t)
+	writeFile(t, filepath.Join(parentPath, "entry"), "x")
+	parent := openDir(t, parentPath)
+	report, err := removeBeneath(context.Background(), parent, mustName("entry"), RemoveOptions{
+		BeforeFirstCut: func(int) error { t.Fatal("BeforeFirstCut called for a file"); return nil },
+	}, 1)
+	require.NoError(t, err)
+	require.Equal(t, RemoveReport{Entries: 1}, report)
 }
 
 // A listing that keeps naming entries lookups cannot find fails with
@@ -622,7 +727,7 @@ func TestRemoveBeneathFailsInsteadOfSpinning(t *testing.T) {
 	parentPath := tempDir(t)
 	mkdirAll(t, filepath.Join(parentPath, "anchor"))
 	parent := openDir(t, parentPath)
-	r := newRemover(context.Background(), int(parent.Fd()), "anchor", RemoveOptions{}, maxDepth)
+	r := newRemover(context.Background(), int(parent.Fd()), mustName("anchor"), RemoveOptions{}, maxDepth)
 	defer r.release()
 	opened, err := r.begin()
 	require.NoError(t, err)
@@ -663,6 +768,15 @@ func TestClassifyAndCutErrors(t *testing.T) {
 	err := cutError("x", 9, unix.EEXIST)
 	require.NotErrorIs(t, err, ErrCutRefused)
 	require.ErrorIs(t, err, unix.EEXIST)
+	// The default arm: an error that is no errno at all keeps its identity
+	// and joins no sentinel.
+	other := errors.New("not an errno")
+	for _, err := range []error{classify("open", "x", 1, other), cutError("x", 1, other)} {
+		require.ErrorIs(t, err, other)
+		for _, sentinel := range []error{ErrUndeletable, ErrCutRefused, ErrTreeChanged, ErrCrossDevice} {
+			require.NotErrorIs(t, err, sentinel)
+		}
+	}
 
 	long := strings.Repeat("\xff", maxNameLen)
 	for _, err := range []error{
@@ -687,7 +801,7 @@ func TestRemoveBeneathConcurrentRemovalsOfDisjointTrees(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range trees {
 		wg.Go(func() {
-			_, errs[i] = removeBeneath(context.Background(), parent, fmt.Sprintf("anchor-%d", i), RemoveOptions{}, 4)
+			_, errs[i] = removeBeneath(context.Background(), parent, mustName(fmt.Sprintf("anchor-%d", i)), RemoveOptions{}, 4)
 		})
 	}
 	wg.Wait()
@@ -720,7 +834,7 @@ func TestRemoveBeneathRandomTrees(t *testing.T) {
 			var report RemoveReport
 			requireNoLeak(t, func() {
 				var err error
-				report, err = removeBeneath(context.Background(), parent, "anchor", RemoveOptions{}, limit)
+				report, err = removeBeneath(context.Background(), parent, mustName("anchor"), RemoveOptions{}, limit)
 				require.NoError(t, err)
 			})
 			t.Logf("%d objects, depth bound %d: %+v", len(gen.want), limit, report)
