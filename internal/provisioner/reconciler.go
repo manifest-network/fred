@@ -1179,62 +1179,12 @@ func (r *Reconciler) rejectLease(
 	return nil
 }
 
-// closeLease closes an ACTIVE lease on chain with a reason.
-func (r *Reconciler) closeLease(
-	ctx context.Context,
-	action placement.ObservedReconciliationAction,
-	reason string,
-) error {
-	leaseUUID := action.Lease().Uuid
-	closed, txHashes, err := r.coordinator.CloseObserved(ctx, action, reason)
-	if err != nil {
-		return err
-	}
-
-	r.cleanupTerminalLease(leaseUUID)
-
-	slog.Info("reconcile: closed lease",
-		"lease_uuid", leaseUUID,
-		"closed", closed,
-		"tx_hashes", txHashes,
-		"reason", reason,
-	)
-
-	return nil
-}
-
-// lostBackendChainReason is the fixed on-chain reason for a lease whose data
-// lived on a retired backend's lost storage. It names no backend.
-const lostBackendChainReason = "backend storage lost"
-
 // Pre-initialize every terminal verdict label (ENG-799) so an alert on a
 // verdict that never closes reads 0, not no-data, before the first failure.
 func init() {
 	for _, verdict := range terminalverdict.Labels() {
 		metrics.ReconcilerTerminalVerdictsTotal.WithLabelValues(verdict).Add(0)
 	}
-}
-
-// failureBudgetChainReason is the fixed on-chain reason for closing a lease
-// whose own workload failed consecutively (ENG-799). It names no backend and
-// embeds no count, so nothing backend-authored reaches the chain.
-const failureBudgetChainReason = "workload failed repeatedly"
-
-// closeExhaustedLease is the failure-budget close. It accepts only the sealed
-// proof that complete inventory reported an exhausted verdict for this exact
-// lease; the planner mints none from FailCount or any other count. The proof is
-// re-checked here as defense in depth before the irreversible close.
-func (r *Reconciler) closeExhaustedLease(
-	ctx context.Context,
-	action placement.ObservedReconciliationAction,
-	exhaustion terminalverdict.Exhaustion,
-) error {
-	leaseUUID := action.Lease().Uuid
-	if !exhaustion.Valid() || exhaustion.LeaseUUID() != leaseUUID ||
-		action.Lease().State != billingtypes.LEASE_STATE_ACTIVE {
-		return fmt.Errorf("refusing failure-budget close of lease %q without its exhausted verdict", leaseUUID)
-	}
-	return r.closeLease(ctx, action, failureBudgetChainReason)
 }
 
 // resolveLostLease closes an ACTIVE or rejects a PENDING lease whose placement
@@ -1262,7 +1212,7 @@ func (r *Reconciler) resolveLostLease(
 	outcome := ""
 	switch observed.Lease().State {
 	case billingtypes.LEASE_STATE_ACTIVE:
-		outcome, err = "closed", r.closeLease(ctx, observed, lostBackendChainReason)
+		outcome, err = "closed", r.closeLostLease(ctx, observed)
 	case billingtypes.LEASE_STATE_PENDING:
 		outcome, err = "rejected", r.rejectLease(ctx, observed, lostBackendChainReason)
 	default:
@@ -2026,7 +1976,7 @@ func (r *Reconciler) handleProvisionResult(
 			"reason", reason,
 			"error", err,
 		)
-		if closeErr := r.closeLease(ctx, action, reason); closeErr != nil {
+		if closeErr := r.closeRefusedLease(ctx, action, reason); closeErr != nil {
 			slog.Error("reconcile: failed to close lease",
 				"lease_uuid", leaseUUID,
 				"error", closeErr,
@@ -2220,7 +2170,7 @@ func (r *Reconciler) processLease(
 	case reconcileActionCloseLost:
 		slog.Error("reconcile: closing a live lease with no placement row that may have lived on a retired backend",
 			"lease_uuid", leaseUUID, "tenant", lease.Tenant)
-		if err := r.closeLease(ctx, authority.action, lostBackendChainReason); err != nil {
+		if err := r.closeLostLease(ctx, authority.action); err != nil {
 			metrics.ReconcilerLostLeasesTotal.WithLabelValues("error").Inc()
 			slog.Error("reconcile: failed to close possibly lost lease", "lease_uuid", leaseUUID, "error", err)
 			hadError = true
