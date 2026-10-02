@@ -82,6 +82,9 @@ type volumeReadView struct {
 	listForProof         func(context.Context) ([]string, error)
 	attest               func(context.Context, managedVolumeName) error
 	requireNoInterrupted func(context.Context) error
+	requireNoUnheld      func(context.Context) error
+	deleteHolds          func() volumeDeleteHoldSnapshot
+	precheckDestroy      func(managedVolumeName) (destroyPrecheckVerdict, error)
 	validate             func() error
 	hostPath             func(string) string
 	pinNamespaceRoot     func(managedVolumeName) (*fsidentity.Directory, error)
@@ -100,6 +103,9 @@ func projectVolumeRead(volumes volumeReader) volumeReader {
 		listForProof:         volumes.ListForProof,
 		attest:               volumes.AttestManagedVolume,
 		requireNoInterrupted: volumes.RequireNoInterruptedVolumeMutations,
+		requireNoUnheld:      volumes.RequireNoUnheldVolumeMutations,
+		deleteHolds:          volumes.VolumeDeleteHolds,
+		precheckDestroy:      volumes.PrecheckDestroy,
 		validate:             volumes.Validate, hostPath: volumes.HostPath,
 		pinNamespaceRoot: volumes.PinNamespaceRoot,
 		usage:            volumes.Usage, kind: volumes.Kind,
@@ -118,6 +124,13 @@ func (v volumeReadView) AttestManagedVolume(ctx context.Context, name managedVol
 }
 func (v volumeReadView) RequireNoInterruptedVolumeMutations(ctx context.Context) error {
 	return v.requireNoInterrupted(ctx)
+}
+func (v volumeReadView) RequireNoUnheldVolumeMutations(ctx context.Context) error {
+	return v.requireNoUnheld(ctx)
+}
+func (v volumeReadView) VolumeDeleteHolds() volumeDeleteHoldSnapshot { return v.deleteHolds() }
+func (v volumeReadView) PrecheckDestroy(name managedVolumeName) (destroyPrecheckVerdict, error) {
+	return v.precheckDestroy(name)
 }
 func (v volumeReadView) Validate() error                                     { return v.validate() }
 func (v volumeReadView) HostPath(name string) string                         { return v.hostPath(name) }

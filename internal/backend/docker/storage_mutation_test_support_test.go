@@ -473,6 +473,20 @@ func (p testVolumeMutationProxy) RecoverInterruptedVolumeMutations(ctx context.C
 	return sink.RecoverInterruptedVolumeMutations(ctx)
 }
 
+func (p testVolumeMutationProxy) RetryHeldVolumeDelete(ctx context.Context, id string) error {
+	sink, err := p.sink()
+	if err != nil {
+		return err
+	}
+	return sink.RetryHeldVolumeDelete(ctx, id)
+}
+
+func (p testVolumeMutationProxy) EnableInlineVolumeDeletes() {
+	if sink, err := p.sink(); err == nil {
+		sink.EnableInlineVolumeDeletes()
+	}
+}
+
 func (p testVolumeMutationProxy) RenameVolume(ctx context.Context, oldName, newName string) error {
 	sink, err := p.sink()
 	if err != nil {

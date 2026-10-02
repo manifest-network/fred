@@ -30,7 +30,7 @@ func TestStartInterruptedVolumeRecoveryFailurePreventsPublicationChecks(t *testi
 			recoveryCalls++
 			return recoveryErr
 		},
-		RequireNoInterruptedVolumeMutationsFn: func(context.Context) error {
+		RequireNoUnheldVolumeMutationsFn: func(context.Context) error {
 			t.Fatal("postcondition must not run after failed recovery")
 			return nil
 		},
@@ -55,7 +55,7 @@ func TestStartInterruptedVolumeRecoveryRequiresCleanPostcondition(t *testing.T) 
 			calls = append(calls, "recover")
 			return nil
 		},
-		RequireNoInterruptedVolumeMutationsFn: func(context.Context) error {
+		RequireNoUnheldVolumeMutationsFn: func(context.Context) error {
 			calls = append(calls, "postcondition")
 			return remainingErr
 		},
@@ -79,7 +79,7 @@ func TestStartInterruptedVolumeRecoveryPrecedesManagedInventory(t *testing.T) {
 			calls = append(calls, "recover")
 			return nil
 		},
-		RequireNoInterruptedVolumeMutationsFn: func(context.Context) error {
+		RequireNoUnheldVolumeMutationsFn: func(context.Context) error {
 			calls = append(calls, "postcondition")
 			return nil
 		},
@@ -104,8 +104,8 @@ func TestStartPreservesUnattributedManagedVolume(t *testing.T) {
 		0,
 	)
 	b.volumes = &mockVolumeManager{
-		RecoverInterruptedVolumeMutationsFn:   func(context.Context) error { return nil },
-		RequireNoInterruptedVolumeMutationsFn: func(context.Context) error { return nil },
+		RecoverInterruptedVolumeMutationsFn: func(context.Context) error { return nil },
+		RequireNoUnheldVolumeMutationsFn:    func(context.Context) error { return nil },
 		ListFn: func() ([]string, error) {
 			return []string{stray}, nil
 		},

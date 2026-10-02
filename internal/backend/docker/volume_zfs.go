@@ -462,6 +462,26 @@ func (z *zfsVolumeManager) RequireNoInterruptedVolumeMutations(ctx context.Conte
 	return nil
 }
 
+// RequireNoUnheldVolumeMutations gives Start the same answer as the strict
+// gate: ZFS destroys a dataset in the kernel with no delete stage, so nothing is
+// ever held, and an unmounted child is an interrupted create.
+func (z *zfsVolumeManager) RequireNoUnheldVolumeMutations(ctx context.Context) error {
+	return z.RequireNoInterruptedVolumeMutations(ctx)
+}
+
+// ZFS never holds a deletion; see RequireNoUnheldVolumeMutations.
+func (z *zfsVolumeManager) VolumeDeleteHolds() volumeDeleteHoldSnapshot {
+	return volumeDeleteHoldSnapshot{}
+}
+
+func (z *zfsVolumeManager) PrecheckDestroy(managedVolumeName) (destroyPrecheckVerdict, error) {
+	return destroyPrecheckNeedsLock, nil
+}
+
+func (z *zfsVolumeManager) RetryHeldVolumeDelete(context.Context, string) error { return nil }
+
+func (z *zfsVolumeManager) EnableInlineVolumeDeletes() {}
+
 // RecoverInterruptedVolumeMutations mounts exact unmounted managed children before
 // ordinary operation-intent recovery. The dataset already carries both its
 // typed final identity and exact mountpoint property, so mounting publishes no

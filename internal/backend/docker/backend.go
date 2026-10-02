@@ -2747,8 +2747,10 @@ func (b *Backend) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("recover interrupted managed-volume mutations: %w", err)
 	}
+	// Held volume deletions do not block Start: the hold executor finishes them
+	// after Start (ENG-1117). Every other interrupted mutation still does.
 	volumeProofCtx, cancelVolumeProof := context.WithTimeout(startupCtx, b.startupVolumeProofBudget())
-	interruptedErr := b.volumes.RequireNoInterruptedVolumeMutations(volumeProofCtx)
+	interruptedErr := b.volumes.RequireNoUnheldVolumeMutations(volumeProofCtx)
 	var volumeProofErr error
 	if interruptedErr == nil {
 		_, volumeProofErr = attestManagedVolumeInventory(volumeProofCtx, b.volumes)
@@ -2869,6 +2871,9 @@ func (b *Backend) Start(ctx context.Context) error {
 	b.callbackStore.StartMaintenance()
 	b.releaseStore.StartMaintenance()
 	b.startRetentionReaper()
+	// From here on a first-time volume deletion may run inline under its short
+	// budget; until now every deletion was handed to the hold executor at once.
+	b.backgroundMaintenance.enableInlineVolumeDeletes(startupCtx)
 
 	// Replay callbacks on the tracked lifecycle goroutine. A Fred outage can
 	// consume the full delivery retry budget, so replay must not delay backend
