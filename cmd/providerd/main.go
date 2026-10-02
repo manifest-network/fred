@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -547,8 +548,10 @@ func run(cmd *cobra.Command, args []string) error {
 		Coordinator: reconciliationCoordinator,
 		// A sweep already reading backend inventories when shutdown begins
 		// may finish them and its projection for up to half of
-		// shutdown_timeout, alongside the provision drain below.
-		ShutdownSweepGrace: cfg.ShutdownTimeout / 2,
+		// shutdown_timeout, alongside the provision drain below. A timeout
+		// too short to halve keeps its whole value rather than falling back
+		// to the reconciler's default, which would exceed it.
+		ShutdownSweepGrace: cmp.Or(cfg.ShutdownTimeout/2, cfg.ShutdownTimeout),
 	}, provisionMgr)
 	if err != nil {
 		return fmt.Errorf("failed to create reconciler: %w", err)

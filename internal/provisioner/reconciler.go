@@ -70,9 +70,21 @@ const chainInventoryTimeout = 30 * time.Second
 // stalled candidates cannot multiply that bound by its size.
 const placementCleanupTimeout = 10 * time.Second
 
-// defaultShutdownSweepGrace is the ShutdownSweepGrace a zero config gets. It
-// matches half of providerd's default 30s shutdown_timeout.
+// defaultShutdownSweepGrace is the grace a zero or negative ShutdownSweepGrace
+// gets. It matches half of providerd's default 30s shutdown_timeout.
 const defaultShutdownSweepGrace = 15 * time.Second
+
+// sweepGrace is how long a sweep that has begun reading backend inventories
+// may outlive its context's cancellation; see sweepDrainContext. Its zero
+// value, like any non-positive configured duration, means
+// defaultShutdownSweepGrace, so no value of this type disables the drain.
+type sweepGrace struct {
+	configured time.Duration
+}
+
+func (grace sweepGrace) duration() time.Duration {
+	return cmp.Or(max(grace.configured, 0), defaultShutdownSweepGrace)
+}
 
 // errLeaseAlreadyInFlight indicates the lease is already being provisioned.
 // This is not a real error - the caller should not treat it as a failure.
@@ -125,7 +137,7 @@ type Reconciler struct {
 	maxReprovisionAttempts int           // Max re-provision attempts before rejecting
 	chainInventoryBudget   time.Duration // Whole-list timeout; fixed in production, shortened by tests.
 	placementCleanupBudget time.Duration // Whole-pass timeout; fixed in production, shortened by tests.
-	shutdownSweepGrace     time.Duration // How long an in-flight sweep may outlive shutdown; see sweepDrainContext.
+	shutdownSweepGrace     sweepGrace    // How long an in-flight sweep may outlive shutdown; see sweepDrainContext.
 	reconciling            atomic.Bool   // Non-blocking flag to prevent concurrent reconciliation
 	placementSweepSeen     atomic.Bool   // True while a durable baseline matches the configured backend topology.
 }
@@ -143,7 +155,7 @@ type ReconcilerConfig struct {
 	// ShutdownSweepGrace bounds how long a sweep that has begun reading
 	// backend inventories may keep reading them and commit its placement
 	// projection after its context is canceled. providerd sets it to half of
-	// shutdown_timeout (default: 15s).
+	// shutdown_timeout. Zero or negative means 15s; nothing disables it.
 	ShutdownSweepGrace time.Duration
 }
 
@@ -173,7 +185,6 @@ func NewReconciler(
 	interval := cmp.Or(cfg.Interval, 5*time.Minute)
 	maxWorkers := cmp.Or(max(cfg.MaxWorkers, 0), DefaultReconcileWorkers)
 	maxReprovision := cmp.Or(max(cfg.MaxReprovisionAttempts, 0), DefaultMaxReprovisionAttempts)
-	shutdownSweepGrace := cmp.Or(max(cfg.ShutdownSweepGrace, 0), defaultShutdownSweepGrace)
 	reconciler := &Reconciler{
 		payloads:               payloads,
 		coordinator:            reconciliation,
@@ -183,7 +194,7 @@ func NewReconciler(
 		maxReprovisionAttempts: maxReprovision,
 		chainInventoryBudget:   chainInventoryTimeout,
 		placementCleanupBudget: placementCleanupTimeout,
-		shutdownSweepGrace:     shutdownSweepGrace,
+		shutdownSweepGrace:     sweepGrace{configured: cfg.ShutdownSweepGrace},
 	}
 	reconciler.placementPruner = newPlacementPruner(
 		reconciliation, reconciler.attemptRecovery,
@@ -208,11 +219,13 @@ func (r *Reconciler) payloadStore() *payload.Store {
 // canceled the sweep runs on; if it is still running once grace has passed, it
 // is canceled with parent's cause, so a sweep still reading backends is
 // abandoned unprojected exactly as before. The returned release cancels the
-// context and unhooks it from parent; call it when the sweep returns.
-func sweepDrainContext(parent context.Context, grace time.Duration) (context.Context, func()) {
+// context and unhooks it from parent; call it when the sweep returns. grace is
+// a sweepGrace, whose zero value is the default, so no caller can pass a zero
+// duration that would cancel the sweep the moment parent is.
+func sweepDrainContext(parent context.Context, grace sweepGrace) (context.Context, func()) {
 	ctx, cancel := context.WithCancelCause(context.WithoutCancel(parent))
 	stop := context.AfterFunc(parent, func() {
-		timer := time.NewTimer(grace)
+		timer := time.NewTimer(grace.duration())
 		defer timer.Stop()
 		select {
 		case <-timer.C:
@@ -318,7 +331,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	if err != nil {
 		if ctx.Err() != nil {
 			slog.Warn("reconciliation sweep ended during shutdown before its placement projection; its inventory marker stays pending",
-				"shutdown_sweep_grace", r.shutdownSweepGrace,
+				"shutdown_sweep_grace", r.shutdownSweepGrace.duration(),
 				"error", err,
 			)
 		}
