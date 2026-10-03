@@ -168,11 +168,12 @@ type ProvisionState struct {
 	StackManifest     *manifest.StackManifest
 	ServiceContainers map[string][]string
 	// TerminalBudget is the consecutive tenant-workload failure budget
-	// (ENG-799). Only the lease actor advances it. A substrate carries it onto
-	// a rebuilt projection only through InheritTerminalBudget, and SetStatus
-	// and InheritTerminalBudget can only move it toward a reset (see
-	// terminal_budget.go). A construction literal may only name the zero
-	// value.
+	// (ENG-799). Only the lease actor counts a failure on it. A substrate
+	// carries it onto a rebuilt projection only through InheritTerminalBudget;
+	// SetStatus and InheritTerminalBudget never count a failure: they can only
+	// complete a counted Failing -> Failed, leave the budget unchanged, or move
+	// it toward a reset (see terminal_budget.go). A construction literal may
+	// only name the zero value.
 	TerminalBudget TerminalBudget
 }
 

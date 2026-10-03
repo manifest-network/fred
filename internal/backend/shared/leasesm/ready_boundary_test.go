@@ -155,6 +155,9 @@ var readyBoundaryCases = map[string]readyBoundaryCase{
 		require.NoError(h.t, h.actor.sm.requestDeprovision(h.ctx))
 		// Deprovisioning has no entry action: the substrate's close writes the
 		// status (docker: doClosePhysical), through SetStatus like every writer.
+		// This driver calls SetStatus itself, so it exercises SetStatus, not the
+		// substrate's close path; that the close goes through SetStatus is held
+		// by internal/testutil's projection-status guard, not by this case.
 		now := time.Now()
 		h.store.UpdateFn(testActorLeaseUUID, func(p *ProvisionState) {
 			p.SetStatus(backend.ProvisionStatusDeprovisioning, now)
