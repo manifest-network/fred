@@ -225,10 +225,27 @@ func TestTerminalBudget_ConsecutiveCountAndSustainedReadyReset(t *testing.T) {
 		assert.True(t, outcome.exhausted)
 	})
 
-	t.Run("a counting cause counts only for the death of a Ready workload", func(t *testing.T) {
+	t.Run("a counting cause counts only at a counting transition", func(t *testing.T) {
+		// The closed set: the death of a Ready workload, and a provision's
+		// definite startup failure (ENG-1125).
+		counting := map[[2]backend.ProvisionStatus]bool{
+			{backend.ProvisionStatusReady, backend.ProvisionStatusFailing}:       true,
+			{backend.ProvisionStatusProvisioning, backend.ProvisionStatusFailed}: true,
+		}
+		for transition := range counting {
+			p := &ProvisionState{
+				LeaseUUID: testActorLeaseUUID, Status: transition[0], Reason: backend.ReasonContainerExited,
+				TerminalBudget: TerminalBudget{
+					leaseUUID: testActorLeaseUUID, consecutive: 2, streakStartedAt: t0.Add(-time.Hour),
+				},
+			}
+			outcome := p.recordFailure(transition[1], tenantCause(), t0)
+			assert.True(t, outcome.counted, "%s -> %s", transition[0], transition[1])
+			assert.Equal(t, 3, p.TerminalBudget.consecutive, "%s -> %s", transition[0], transition[1])
+		}
 		for _, from := range everyStatus {
 			for _, to := range everyStatus {
-				if from == backend.ProvisionStatusReady && to == backend.ProvisionStatusFailing {
+				if counting[[2]backend.ProvisionStatus{from, to}] {
 					continue
 				}
 				p := &ProvisionState{

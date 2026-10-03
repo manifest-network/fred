@@ -175,6 +175,8 @@ const (
 	operationPhysicalEvidenceTargetReady
 	operationPhysicalEvidenceExactAbsent
 	operationPhysicalEvidenceFailedReceiptAbsent
+	// operationPhysicalEvidenceStartupFailed is live-only (ENG-1125).
+	operationPhysicalEvidenceStartupFailed
 )
 
 // OperationPhysicalEvidence is an opaque closed value algebra. Keeping its tag
@@ -186,6 +188,7 @@ type OperationPhysicalEvidence struct {
 	targetReady         OperationTargetReady
 	exactAbsent         OperationExactAbsent
 	failedReceiptAbsent OperationFailedReceiptAbsent
+	startupFailed       OperationStartupFailed
 }
 
 type operationTargetReadyState struct {
@@ -907,6 +910,10 @@ func validateOperationPhysicalEvidence(
 		}
 	case operationPhysicalEvidenceFailedReceiptAbsent:
 		if evidence.failedReceiptAbsent.validForOperation(subject) {
+			return nil
+		}
+	case operationPhysicalEvidenceStartupFailed:
+		if evidence.startupFailed.validForOperation(subject) {
 			return nil
 		}
 	default:

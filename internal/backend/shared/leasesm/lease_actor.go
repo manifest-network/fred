@@ -645,6 +645,7 @@ type provisionErroredMsg struct {
 	reason           backend.Reason // ENG-508
 	lastError        string
 	operationFailure shared.OperationReleaseUncommitted
+	startup          shared.OperationStartupFailure // ENG-1125; zero unless a definite startup failure
 }
 
 func (provisionErroredMsg) isleaseMessage()          {}
@@ -1305,9 +1306,7 @@ func (a *LeaseActor) handle(msg leaseMessage) {
 	case provisionCompletedMsg:
 		a.handleProvisionCompleted(m.result)
 	case provisionErroredMsg:
-		a.handleProvisionErrored(
-			m.callbackErr, m.reason, m.lastError, m.operationFailure,
-		)
+		a.handleProvisionErrored(m)
 	case operationAmbiguousMsg:
 		a.handleOperationAmbiguous(m)
 	case replaceCompletedMsg:
@@ -1613,6 +1612,7 @@ func (a *LeaseActor) spawnProvisionWorker(
 				reason:           typed.reason,
 				lastError:        typed.err.Error(),
 				operationFailure: typed.proof,
+				startup:          typed.startup,
 			}
 			event = "provision_errored"
 		case provisionWorkAmbiguous:
@@ -1628,18 +1628,8 @@ func (a *LeaseActor) handleProvisionCompleted(result ProvisionSuccessResult) {
 	_ = a.sm.provisionCompleted(a.cfg.StopCtx, result)
 }
 
-func (a *LeaseActor) handleProvisionErrored(
-	callbackErr string,
-	reason backend.Reason,
-	lastError string,
-	operationFailure shared.OperationReleaseUncommitted,
-) {
-	_ = a.sm.provisionErrored(a.cfg.StopCtx, provisionErrorInfo{
-		callbackErr:      callbackErr,
-		reason:           reason,
-		lastError:        lastError,
-		operationFailure: operationFailure,
-	})
+func (a *LeaseActor) handleProvisionErrored(msg provisionErroredMsg) {
+	_ = a.sm.provisionErrored(a.cfg.StopCtx, provisionErrorInfo(msg))
 }
 
 func (a *LeaseActor) handleRestartRequested(msg restartRequestedMsg) {

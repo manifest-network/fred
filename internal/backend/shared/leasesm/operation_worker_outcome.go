@@ -27,6 +27,9 @@ type provisionWorkFailure struct {
 	reason      backend.Reason
 	err         error
 	proof       shared.OperationReleaseUncommitted
+	// startup is the sealed account of a definite startup failure (ENG-1125);
+	// zero for every other provision failure.
+	startup shared.OperationStartupFailure
 }
 
 type provisionWorkAmbiguous struct {
@@ -80,6 +83,35 @@ func NewProvisionWorkFailure(
 		reason:      reason,
 		err:         err,
 		proof:       proof,
+	}, nil
+}
+
+// NewProvisionWorkStartupFailure is the worker outcome of a definite startup
+// failure (ENG-1125). Its curated surface and its attribution facts come only
+// from the sealed account the settlement carried out of the guarded execution,
+// so a worker cannot forge either; proof must settle that same operation.
+func NewProvisionWorkStartupFailure(
+	outcome shared.OperationExecutionFailure,
+	proof shared.OperationReleaseUncommitted,
+) (ProvisionWorkOutcome, error) {
+	startup, ok := outcome.StartupFailure()
+	if !ok {
+		return nil, errors.New("startup failure outcome carries no sealed startup failure")
+	}
+	if !proof.Valid() || proof.Kind() != shared.OperationIntentProvision ||
+		!outcome.OperationID().Valid() || proof.OperationID() != outcome.OperationID() {
+		return nil, errors.New("startup failure requires the exact provision failure proof of its operation")
+	}
+	detail := startup.Detail()
+	if detail == "" {
+		detail = startup.Message()
+	}
+	return provisionWorkFailure{
+		callbackErr: startup.Message(),
+		reason:      startup.Reason(),
+		err:         errors.New(detail),
+		proof:       proof,
+		startup:     startup,
 	}, nil
 }
 

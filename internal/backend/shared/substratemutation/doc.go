@@ -19,7 +19,11 @@
 // refusal into an ambiguous tenant outcome. Every error remains aggregated, so
 // an ignored preparation failure still poisons any later Step. A live result is
 // Attested only after all entered tenant steps succeed and the construction-bound
-// classifier proves one exact Evidence variant. Recovery uses the same
+// classifier proves one exact Evidence variant. A workflow may report a typed
+// Finding (a definite outcome it observed after its effects); only a wholly
+// successful session hands it to the classifier, any error discards it, and
+// recovery never sees one, so an unmarked post-effect failure stays Ambiguous.
+// NewExecutor binds a workflow without findings. Recovery uses the same
 // classifier after re-reading durable Started authority, but its distinct
 // execution type cannot replay live work. RunStep exposes the same panic-safe
 // authorization/action/completion/release bracket for construction-bound,

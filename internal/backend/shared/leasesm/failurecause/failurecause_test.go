@@ -31,12 +31,14 @@ func TestCauseVocabularyIsClosed(t *testing.T) {
 		assert.False(t, duplicate, "label %q shared by kinds %d and %d", label, prior, kind)
 		seen[label] = kind
 	}
-	assert.Equal(t, []string{"unknown", "tenant_workload", "disruption", "platform", "maintenance"}, Labels())
+	assert.Equal(t, []string{"unknown", "tenant_workload", "disruption", "platform", "maintenance", "unhealthy"}, Labels())
 	assert.False(t, Cause{}.Counts(), "the zero cause is unknown and never counts")
 	assert.False(t, Platform().Counts())
 	assert.False(t, Maintenance().Counts())
+	assert.False(t, Unhealthy().Counts(), "a health check that never passed never counts (ENG-1125)")
 	assert.Equal(t, "platform", Platform().Label())
 	assert.Equal(t, "maintenance", Maintenance().Label())
+	assert.Equal(t, "unhealthy", Unhealthy().Label())
 }
 
 func TestClassifyDeath(t *testing.T) {
@@ -199,7 +201,7 @@ var countingKindReferences = map[string][]string{
 }
 
 var literalMinters = map[string][]string{
-	"Cause":       {"Platform", "Maintenance", "Labels", "ClassifyDeath"},
+	"Cause":       {"Platform", "Maintenance", "Unhealthy", "Labels", "ClassifyDeath"},
 	"Provenance":  {"eventSession.ObserveExit"},
 	"Termination": {"Exited", "Gone"},
 }

@@ -20,7 +20,9 @@ package testutil
 //   - In internal/provisioner, FailCount is read only as a log argument: it
 //     never decides a close.
 //   - failurecause.ClassifyDeath, the only constructor of a counting cause, is
-//     named only in the state machine's death entry action.
+//     named only in the state machine's two counting entry actions: the death
+//     of a Ready workload, and a provision's definite startup failure
+//     (ENG-1125).
 //   - failurecause.NewEventSession and the session's Observe methods, the only
 //     minters of live provenance, are named only in the Docker event loop's
 //     reader, and leasesm.NewLiveContainerDiedObservation only in its
@@ -63,9 +65,13 @@ var terminalVerdictAuthorityFiles = []string{
 type attributionSite struct{ file, function string }
 
 var (
-	classifyDeathSite = attributionSite{terminalBudgetDeathFile, "leaseSM.onEnterFailing"}
-	eventReaderSite   = attributionSite{terminalBudgetReaderFile, "containerEventReader.consume"}
-	liveDeathSite     = attributionSite{terminalBudgetEventsFile, "Backend.dispatchLiveContainerDeath"}
+	// classifyDeathSites are the state machine's two counting entry actions.
+	classifyDeathSites = []attributionSite{
+		{terminalBudgetDeathFile, "leaseSM.onEnterFailing"},
+		{terminalBudgetDeathFile, "leaseSM.onEnterFailedFromProvision"},
+	}
+	eventReaderSite = attributionSite{terminalBudgetReaderFile, "containerEventReader.consume"}
+	liveDeathSite   = attributionSite{terminalBudgetEventsFile, "Backend.dispatchLiveContainerDeath"}
 )
 
 // sessionMethods are the event session's methods. Only the reader holding the
@@ -137,6 +143,14 @@ func f(p struct{ FailCount int }) facts { return facts{n: p.FailCount} }`, "read
 		{"death classified elsewhere in the state machine", terminalBudgetDeathFile,
 			"package leasesm\n" + failurecauseImport +
 				`func (lsm *leaseSM) other() { _ = failurecause.ClassifyDeath("c", failurecause.Provenance{}, failurecause.Exited()) }`,
+			"names failurecause.ClassifyDeath"},
+		{"death classified in a non-counting failure entry action", terminalBudgetDeathFile,
+			"package leasesm\n" + failurecauseImport +
+				`func (lsm *leaseSM) onEnterFailedFromReplace() { _ = failurecause.ClassifyDeath("c", failurecause.Provenance{}, failurecause.Exited()) }`,
+			"names failurecause.ClassifyDeath"},
+		{"startup failure classified in the substrate", "internal/backend/docker/startup_observation.go",
+			"package docker\n" + failurecauseImport +
+				`func (b *Backend) newStartupFailure() { _ = failurecause.ClassifyDeath("c", failurecause.Provenance{}, failurecause.Exited()) }`,
 			"names failurecause.ClassifyDeath"},
 		{"event session minted outside the event loop", "internal/backend/docker/info.go",
 			"package p\n" + failurecauseImport + `var s = failurecause.NewEventSession()`,
@@ -212,6 +226,8 @@ func f(p struct{ FailCount int }) { slog.Warn("x", "fail_count", p.FailCount) }`
 		{"internal/backend/docker/info.go", "package p\n" + backendImport + `var v = backend.TerminalBudgetObservation{}`},
 		{terminalBudgetDeathFile, "package leasesm\n" + failurecauseImport +
 			`func (lsm *leaseSM) onEnterFailing() { _ = failurecause.ClassifyDeath("c", failurecause.Provenance{}, failurecause.Exited()) }`},
+		{terminalBudgetDeathFile, "package leasesm\n" + failurecauseImport +
+			`func (lsm *leaseSM) onEnterFailedFromProvision() { _ = failurecause.ClassifyDeath("c", failurecause.Provenance{}, failurecause.Exited()) }`},
 		{terminalBudgetReaderFile, "package docker\n" + failurecauseImport +
 			`func (r containerEventReader) consume() { s := failurecause.NewEventSession(); s.ObserveStart("c"); s.ObserveSignal("c"); _ = s.ObserveExit("c") }`},
 		{terminalBudgetEventsFile, "package docker\n" + leasesmImport +
@@ -325,6 +341,9 @@ func attributionFindings(rel string, file *ast.File, fset *token.FileSet, author
 	allowedAt := func(site attributionSite, function string) bool {
 		return rel == site.file && function == site.function
 	}
+	allowedAtAny := func(sites []attributionSite, function string) bool {
+		return slices.ContainsFunc(sites, func(site attributionSite) bool { return allowedAt(site, function) })
+	}
 	inspect := func(function string, root ast.Node, skip *ast.Ident) {
 		selected := make(map[*ast.Ident]bool)
 		ast.Inspect(root, func(node ast.Node) bool {
@@ -342,8 +361,8 @@ func attributionFindings(rel string, file *ast.File, fset *token.FileSet, author
 				}
 				name := typed.Sel.Name
 				switch {
-				case qualifier == failurecauseImportPath && name == "ClassifyDeath" && !allowedAt(classifyDeathSite, function):
-					report(typed, "names failurecause.ClassifyDeath outside the death entry action")
+				case qualifier == failurecauseImportPath && name == "ClassifyDeath" && !allowedAtAny(classifyDeathSites, function):
+					report(typed, "names failurecause.ClassifyDeath outside the state machine's counting entry actions")
 				case qualifier == failurecauseImportPath && name == "NewEventSession" && !allowedAt(eventReaderSite, function):
 					report(typed, "names failurecause.NewEventSession outside the event loop's reader")
 				case qualifier == leasesmImportPath && name == "NewLiveContainerDiedObservation" &&

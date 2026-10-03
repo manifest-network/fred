@@ -262,6 +262,12 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	// DeprovisionRequested (→ Deprovisioning, OnExit cancels goroutine — the
 	// structural suppression for Provision+Deprovision races, analogous to
 	// Failing's cancel-on-exit mechanism).
+	//
+	// A container death is ignored here: a candidate container is in no Ready
+	// projection yet, so the substrate cannot even route it. The substrate
+	// keeps its live provenance instead (ENG-1125): the worker's startup
+	// verification reads it for a definite startup failure, and the store's
+	// Ready entry re-dispatches a death that raced the Ready transition.
 	sm.Configure(backend.ProvisionStatusProvisioning).
 		OnEntryFrom(evProvisionRequested, lsm.onEnterProvisioning).
 		Permit(evProvisionCompleted, backend.ProvisionStatusReady).
@@ -634,10 +640,11 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	provenance := args[2].(failurecause.Provenance)
 	leaseUUID := lsm.actor.leaseUUID
 	info := lsm.actor.pendingDeathInfo
-	// The only budget-counting site. The cause is attributed from the guard's
-	// fresh inspection and the death's provenance, which counts only if it was
-	// minted for this very container; FailCount stays a lifetime diagnostic of
-	// every death, counted or not.
+	// One of the two budget-counting sites (the other is a definite startup
+	// failure, onEnterFailedFromProvision). The cause is attributed from the
+	// guard's fresh inspection and the death's provenance, which counts only if
+	// it was minted for this very container; FailCount stays a lifetime
+	// diagnostic of every death, counted or not.
 	cause := failurecause.ClassifyDeath(containerID, provenance, deathTermination(info))
 	now := time.Now()
 
@@ -1211,6 +1218,31 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
+	// Attribution, the state machine's second counting site (ENG-1125). A
+	// refusal before any substrate effect (image admission and pull included) is
+	// a platform failure. A definite startup failure is attributed from the
+	// substrate's own sealed account of it: only an observed exit (the
+	// substrate's Exited termination, never an exit code) of a launch the
+	// platform completed reaches ClassifyDeath, which counts it only when the
+	// live event stream observed that container's whole run with no signal to
+	// it. A health check that never passed is a running workload and never
+	// counts; a launch the platform degraded is the platform's failure.
+	cause := failurecause.Platform()
+	var death *InstanceState
+	var provenance failurecause.Provenance
+	if startup := info.startup; startup.Valid() {
+		death = startupInstanceState(startup)
+		switch {
+		case startup.Degraded():
+			cause = failurecause.Platform()
+		case startup.Termination() == failurecause.Exited():
+			provenance = startup.Provenance()
+			cause = failurecause.ClassifyDeath(startup.InstanceID(), provenance, startup.Termination())
+		default:
+			cause = failurecause.Unhealthy()
+		}
+	}
+
 	now := time.Now()
 	var outcome budgetOutcome
 	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
@@ -1218,12 +1250,10 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
-		// Only a refusal before any substrate effect reaches this transition
-		// (image admission and pull included): a platform failure, never counted.
-		outcome = p.recordFailure(backend.ProvisionStatusFailed, failurecause.Platform(), now)
+		outcome = p.recordFailure(backend.ProvisionStatusFailed, cause, now)
 	})
 	if applied {
-		lsm.observeBudgetOutcome(outcome, nil, failurecause.Provenance{})
+		lsm.observeBudgetOutcome(outcome, death, provenance)
 	}
 
 	// ORDERING CONTRACT: SendOperationFailureFn MUST remain the last statement of
@@ -1517,6 +1547,21 @@ type provisionErrorInfo struct {
 	reason           backend.Reason // ENG-508
 	lastError        string
 	operationFailure shared.OperationReleaseUncommitted
+	// startup is the sealed account of a definite startup failure (ENG-1125),
+	// from which onEnterFailedFromProvision attributes it; zero otherwise.
+	startup shared.OperationStartupFailure
+}
+
+// startupInstanceState is the failed container's state as the startup
+// failure observed it, for the counted-failure log line.
+func startupInstanceState(startup shared.OperationStartupFailure) *InstanceState {
+	state := &InstanceState{Phase: PhaseRunning, ServiceName: startup.Service(), Termination: startup.Termination()}
+	if code, oomKilled, exited := startup.ExitStatus(); exited {
+		state.Phase = PhaseExited
+		state.ExitCode = &code
+		state.OOMKilled = oomKilled
+	}
+	return state
 }
 
 // replaceEntryArgs carries the new exact-completion and lifecycle callback

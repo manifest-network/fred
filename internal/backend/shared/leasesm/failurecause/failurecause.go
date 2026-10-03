@@ -12,19 +12,27 @@ const (
 	causeDisruption
 	causePlatform
 	causeMaintenance
+	causeUnhealthy
 	// causeSentinel bounds the closed set. It is never a valid cause.
 	causeSentinel
 )
 
 // Platform attributes a failure to the platform: an internal error, a running
-// cohort that diverged from its durable release, or a refusal before any
-// substrate effect (image admission or pull included). It never counts.
+// cohort that diverged from its durable release, a refusal before any substrate
+// effect (image admission or pull included), or a startup failure of a launch
+// the platform degraded. It never counts.
 func Platform() Cause { return Cause{kind: causePlatform} }
 
 // Maintenance attributes the outcome of a restart, update or restore, whether
 // it rolled back or not. It never counts, just as a failed Kubernetes rollout
 // only sets a condition.
 func Maintenance() Cause { return Cause{kind: causeMaintenance} }
+
+// Unhealthy attributes a startup failure whose health check never passed: the
+// workload is still running, so no exit of the tenant's process was observed.
+// It never counts (ENG-1125), although Kubernetes would restart such a
+// container under its own policy.
+func Unhealthy() Cause { return Cause{kind: causeUnhealthy} }
 
 // Counts reports whether this failure consumes the terminal budget. It is an
 // allowlist: only an observed exit of the tenant's own workload counts.
@@ -42,6 +50,8 @@ func (c Cause) Label() string {
 		return "platform"
 	case causeMaintenance:
 		return "maintenance"
+	case causeUnhealthy:
+		return "unhealthy"
 	default:
 		return "unknown"
 	}

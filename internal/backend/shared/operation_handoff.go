@@ -69,15 +69,16 @@ type OperationExecutionFailure struct {
 	authority  OperationReleaseCandidate
 	subject    OperationPhysicalSubject
 	absent     OperationExactAbsent
+	startup    OperationStartupFailed
 	kind       operationExecutionFailureKind
 	cause      error
 }
 
-// operationExecutionFailureKind keeps the three causally different failure
-// proofs disjoint even though callback settlement intentionally consumes one
-// exported capability type. Every value is minted inside this package:
-// callers cannot turn a post-Started failure into a pre-effect refusal or
-// replace strict absence evidence with a boolean.
+// operationExecutionFailureKind keeps the causally different failure proofs
+// disjoint even though callback settlement intentionally consumes one exported
+// capability type. Every value is minted inside this package: callers cannot
+// turn a post-Started failure into a pre-effect refusal or replace strict
+// absence evidence with a boolean.
 type operationExecutionFailureKind uint8
 
 const (
@@ -85,6 +86,10 @@ const (
 	operationExecutionRefusedBeforeStart
 	operationExecutionRefusedAfterStart
 	operationExecutionAttestedAbsent
+	// operationExecutionAttestedStartupFailure is a live provision whose
+	// startup failed definitely and was rolled back exactly (ENG-1125). Only
+	// ExecuteOperation mints it, from the classifier's StartupFailed evidence.
+	operationExecutionAttestedStartupFailure
 )
 
 // OperationExecutionAmbiguous records that a guarded worker panicked or
@@ -121,9 +126,31 @@ func (outcome OperationExecutionFailure) Valid() bool {
 			outcome.subject.validFor(outcome.settlement) &&
 			outcome.subject.matchesCandidate(outcome.authority) &&
 			outcome.absent.Valid() && outcome.absent.validForOperation(outcome.subject)
+	case operationExecutionAttestedStartupFailure:
+		return !outcome.authority.authority.entry.EffectNotStarted &&
+			outcome.subject.validFor(outcome.settlement) &&
+			outcome.subject.matchesCandidate(outcome.authority) &&
+			!outcome.absent.Valid() && outcome.startup.validForOperation(outcome.subject)
 	default:
 		return false
 	}
+}
+
+// StartupFailure returns the sealed account of a definite live startup failure
+// (ENG-1125); every other failure has none.
+func (outcome OperationExecutionFailure) StartupFailure() (OperationStartupFailure, bool) {
+	if outcome.kind != operationExecutionAttestedStartupFailure || !outcome.Valid() {
+		return OperationStartupFailure{}, false
+	}
+	return outcome.startup.state.failure, true
+}
+
+// OperationID is the exact operation this failure settles.
+func (outcome OperationExecutionFailure) OperationID() OperationID {
+	if outcome.authority.authority.entry == nil {
+		return OperationID{}
+	}
+	return outcome.authority.authority.OperationID()
 }
 
 func (outcome OperationExecutionAmbiguous) Valid() bool {
@@ -227,6 +254,36 @@ func BindOperationSubstrateExecutor[T any](
 	run func(context.Context, T, OperationPhysicalSubject) error,
 	classify func(context.Context, OperationPhysicalSubject) (OperationPhysicalEvidence, error),
 ) error {
+	// Check before wrapping: a wrapper closure is never nil.
+	if run == nil {
+		return errors.New("substrate mutation workflow is required")
+	}
+	if classify == nil {
+		return errors.New("strict exhaustive substrate classifier is required")
+	}
+	return BindOperationFindingExecutor(s, authorize, complete, build,
+		func(ctx context.Context, capability T, subject OperationPhysicalSubject) (substratemutation.NoFinding, error) {
+			return substratemutation.NoFinding{}, run(ctx, capability, subject)
+		},
+		func(ctx context.Context, subject OperationPhysicalSubject, _ substratemutation.NoFinding) (OperationPhysicalEvidence, error) {
+			return classify(ctx, subject)
+		},
+	)
+}
+
+// BindOperationFindingExecutor binds a facade whose live workflow may report a
+// typed Finding: a definite outcome it observed after its effects. The
+// construction-bound classifier receives the Finding only from a wholly
+// successful session and alone decides whether it becomes evidence (ENG-1125).
+// Recovery never sees one.
+func BindOperationFindingExecutor[T any, F any](
+	s *OperationSettlement,
+	authorize substratemutation.Authorize,
+	complete substratemutation.Complete,
+	build func(substratemutation.Runner, OperationPhysicalSubject) T,
+	run func(context.Context, T, OperationPhysicalSubject) (F, error),
+	classify func(context.Context, OperationPhysicalSubject, F) (OperationPhysicalEvidence, error),
+) error {
 	if s == nil || s.mutation == nil {
 		return errors.New("operation settlement is invalid")
 	}
@@ -234,7 +291,7 @@ func BindOperationSubstrateExecutor[T any](
 	if err != nil {
 		return err
 	}
-	guard, recovery, err := substratemutation.NewExecutor(
+	guard, recovery, err := substratemutation.NewFindingExecutor(
 		binding, authorize, complete, build, run, classify,
 	)
 	if err != nil {
@@ -665,6 +722,12 @@ func (s *OperationSettlement) ExecuteOperation(
 				subject: execution.subject, absent: evidence.exactAbsent,
 				kind: operationExecutionAttestedAbsent,
 			}
+		case operationPhysicalEvidenceStartupFailed:
+			return OperationExecutionFailure{
+				settlement: s, authority: execution.candidate,
+				subject: execution.subject, startup: evidence.startupFailed,
+				kind: operationExecutionAttestedStartupFailure,
+			}
 		default:
 			return OperationExecutionAmbiguous{settlement: s, execution: execution,
 				cause: errors.New("unknown operation evidence")}
@@ -777,6 +840,8 @@ func (s *OperationSettlement) RecoverOperationExecution(
 				subject: subject, absent: evidence.exactAbsent,
 				kind: operationExecutionAttestedAbsent,
 			}, nil
+		case operationPhysicalEvidenceStartupFailed:
+			return nil, errors.New("startup failure evidence is live-only; recovery cannot consume it")
 		default:
 			return nil, errors.New("unknown operation recovery evidence")
 		}
@@ -879,6 +944,8 @@ func (s *OperationSettlement) CleanupRecoveredOperation(
 				settlement: s, authority: candidate, subject: subject, absent: evidence.exactAbsent,
 				kind: operationExecutionAttestedAbsent,
 			}, nil
+		case operationPhysicalEvidenceStartupFailed:
+			return nil, errors.New("startup failure evidence is live-only; recovery cleanup cannot consume it")
 		default:
 			return nil, errors.New("unknown operation cleanup evidence")
 		}
