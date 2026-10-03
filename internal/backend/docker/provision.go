@@ -731,7 +731,7 @@ func (b *Backend) setupWritablePathBinds(volume launchVolume, ctx context.Contex
 // (ENG-1125). The empty set means every writable path was seeded afresh.
 func (b *Backend) seedWritablePathBinds(volume launchVolume, ctx context.Context, image imageexec.Image, writablePaths []string, maxBytes, maxEntries int64) (binds map[string]string, skipped launchDegradations) {
 	if len(writablePaths) == 0 {
-		return nil, 0
+		return nil, skipped
 	}
 	hostVolumePath, err := volume.rootPath()
 	if err != nil {

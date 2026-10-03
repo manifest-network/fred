@@ -29,7 +29,12 @@ package testutil
 //   - the startup health ledger behind the sticky health rule: written
 //     (recordPassedHealth) only by a startup watch's memory
 //     (startupMemory.remember), from a pass it inspected; its fields are named
-//     only in its own file.
+//     only in its own file;
+//   - a launch's degradation sets (quiescedVolumes.degradations,
+//     imageSetup.Degradations) only grow: no assignment to either field, no
+//     literal keying one outside the receipt's constructor, and the set's bits
+//     named only in its own file, so a marked degradation cannot be reset
+//     before the receipt reads it.
 //
 // A zero receipt, finding or plan is invalid (a nil state), but a valid one
 // could still be forged in its package from a state value. So the state types
@@ -183,6 +188,16 @@ var liveDeathLedgerInternals = []string{
 // own file.
 var startupHealthLedgerInternals = []string{"healthyByID", "healthyRing", "healthyNext"}
 
+// launchDegradationFields hold a launch's degradation set (quiescedVolumes and
+// imageSetup). The set only grows: a field of it is never assigned, only
+// added to through add or addAll, and only the receipt's constructor keys one
+// in a literal (to copy it into the receipt). launchDegradationInternals are
+// the set's bits, named only in its own file.
+var (
+	launchDegradationFields    = []string{"degradations", "Degradations"}
+	launchDegradationInternals = []string{"degradationBits"}
+)
+
 // sealedInternalOwner reports the one file that may name an internal of a
 // sealed docker type, and what that type is.
 func sealedInternalOwner(name string) (file, what string, sealed bool) {
@@ -191,6 +206,8 @@ func sealedInternalOwner(name string) (file, what string, sealed bool) {
 		return liveDeathLedgerFile, "live-death ledger", true
 	case slices.Contains(startupHealthLedgerInternals, name):
 		return startupHealthLedgerFile, "startup health ledger", true
+	case slices.Contains(launchDegradationInternals, name):
+		return settledLaunchFile, "launch degradation set", true
 	default:
 		return "", "", false
 	}
@@ -354,6 +371,24 @@ func (b *Backend) observeRejectedLaunch() { m.health.recordPassedHealth(pass) }`
 		{"health ledger facts set outside the ledger", "internal/backend/docker/recover.go",
 			`package docker
 func (b *Backend) recoverState() { b.startupHealth.healthyByID["c"] = struct{}{} }`, "names healthyByID"},
+		{"launch degradations reset", "internal/backend/docker/volume_launch.go",
+			`package docker
+func (m *storageMutations) launch() { q.degradations = launchDegradations{} }`, "assigns degradations"},
+		{"image setup degradations reset", provisionFile,
+			`package docker
+func (b *Backend) inspectImagesForSetup() { result.Degradations = launchDegradations{} }`, "assigns Degradations"},
+		{"launch degradations reset in a multiple assignment", provisionFile,
+			`package docker
+func (b *Backend) doProvisionPhysical() { x, mutations.degradations = 1, launchDegradations{} }`, "assigns degradations"},
+		{"image setup keyed with degradations", provisionFile,
+			`package docker
+func (b *Backend) inspectImagesForSetup() { _ = imageSetup{Degradations: launchDegradations{}} }`, "keys Degradations"},
+		{"quiesced volumes keyed with degradations", "internal/backend/docker/volume_launch.go",
+			`package docker
+func (m *storageMutations) quiesce() { _ = &quiescedVolumes{degradations: d} }`, "keys degradations"},
+		{"degradation bits cleared outside the set", "internal/backend/docker/volume_launch.go",
+			`package docker
+func (m *storageMutations) quiesce() { q.degradations.degradationBits = 0 }`, "names degradationBits"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -408,6 +443,13 @@ func (b *Backend) admitStartupRollback() { _ = startupRollback{state: &startupRo
 			`func (b *Backend) confirmStartupFailure() { _, _ = shared.NewOperationStartupFailed(s, f) }`},
 		{startupObservationFile, `package docker
 func (m *startupMemory) remember(pass startupPass) { m.health.recordPassedHealth(pass) }`},
+		{provisionFile, `package docker
+func (b *Backend) inspectImagesForSetup() { result.Degradations.add(launchVolumeOwnerUndetected); var skipped launchDegradations; skipped.add(d); _ = skipped }`},
+		{settledLaunchFile, `package docker
+func newSettledLaunch(q *quiescedVolumes, o daemonLaunchOutcome) settledLaunch {
+	return settledLaunch{state: &settledLaunchState{degradations: q.degradations}}
+}
+func (d *launchDegradations) add(degradation launchDegradation) { d.degradationBits |= uint8(degradation) }`},
 		{startupHealthLedgerFile, `package docker
 func (l *startupHealthLedger) recordPassedHealth(pass startupPass) { l.healthyByID["c"] = struct{}{}; l.healthyNext++ }`},
 		{terminalBudgetEventsFile, `package docker
@@ -546,6 +588,15 @@ func startupFailureAuthorityFindings(rel string, file *ast.File, fset *token.Fil
 					}
 					sealedIdent(dockerSealedStateIdents, typed, function)
 				}
+			case *ast.AssignStmt:
+				if dir != dockerDir {
+					return true
+				}
+				for _, lhs := range typed.Lhs {
+					if selector, ok := lhs.(*ast.SelectorExpr); ok && slices.Contains(launchDegradationFields, selector.Sel.Name) {
+						report(selector, "assigns %s, a launch degradation set, other than through add or addAll", selector.Sel.Name)
+					}
+				}
 			case *ast.CompositeLit:
 				if dir != dockerDir || len(typed.Elts) == 0 {
 					return true
@@ -553,6 +604,16 @@ func startupFailureAuthorityFindings(rel string, file *ast.File, fset *token.Fil
 				name, _ := calleeName(typed.Type)
 				if site, sealed := startupLiteralSites[name]; sealed && !allowedAtAny([]attributionSite{site}, function) {
 					report(typed, "builds a %s outside its constructor", name)
+				}
+				for _, element := range typed.Elts {
+					keyed, ok := element.(*ast.KeyValueExpr)
+					if !ok {
+						continue
+					}
+					if key, ok := keyed.Key.(*ast.Ident); ok && slices.Contains(launchDegradationFields, key.Name) &&
+						!allowedAtAny([]attributionSite{{settledLaunchFile, settledLaunchMintSite}}, function) {
+						report(keyed, "keys %s, a launch degradation set, in a literal outside the receipt's constructor", key.Name)
+					}
 				}
 			}
 			return true

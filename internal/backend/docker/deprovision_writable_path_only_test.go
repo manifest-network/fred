@@ -717,7 +717,7 @@ func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
 		require.NoError(t, err)
 		binds, skipped := b.seedWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "img"),
 			[]string{"/var/lib/grafana"}, 64<<20, 1<<30)
-		assert.Equal(t, launchDegradations(launchWritablePathsUnseeded), skipped, "a skipped writable path degrades the launch (ENG-1125)")
+		assert.Equal(t, "writable_paths_unseeded", skipped.String(), "a skipped writable path degrades the launch (ENG-1125)")
 		return binds
 	})
 
@@ -755,7 +755,7 @@ func TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable(t *testing.T) {
 		require.NoError(t, err)
 		binds, skipped := b.seedWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "img"),
 			[]string{"/var/lib/grafana"}, 64<<20, 1<<30)
-		assert.Equal(t, launchDegradations(launchWritablePathsUnseeded), skipped, "a skipped writable path degrades the launch (ENG-1125)")
+		assert.Equal(t, "writable_paths_unseeded", skipped.String(), "a skipped writable path degrades the launch (ENG-1125)")
 		return binds
 	})
 

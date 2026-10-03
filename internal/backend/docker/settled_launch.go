@@ -43,15 +43,27 @@ const (
 
 // launchDegradations is a set of launchDegradation values. The zero value is
 // the empty set: a complete preparation.
-type launchDegradations uint8
+//
+// The set only grows. add and addAll are its only writers and its bits are
+// named only in this file, so no arithmetic can clear a member; and
+// internal/testutil forbids assigning a set to a degradations field, or keying
+// one in a literal, anywhere but the receipt's constructor, so a marked
+// degradation can never be reset before the launch receipt reads it.
+type launchDegradations struct{ degradationBits uint8 }
 
 func (d *launchDegradations) add(degradation launchDegradation) {
-	*d |= launchDegradations(degradation)
+	d.degradationBits |= uint8(degradation)
 }
 
-func (d *launchDegradations) addAll(other launchDegradations) { *d |= other }
+func (d *launchDegradations) addAll(other launchDegradations) {
+	d.degradationBits |= other.degradationBits
+}
 
-func (d launchDegradations) empty() bool { return d == 0 }
+func (d launchDegradations) empty() bool { return d.degradationBits == 0 }
+
+func (d launchDegradations) has(degradation launchDegradation) bool {
+	return d.degradationBits&uint8(degradation) != 0
+}
 
 // String names the set's members, for logs.
 func (d launchDegradations) String() string {
@@ -67,7 +79,7 @@ func (d launchDegradations) String() string {
 	}
 	var members []string
 	for _, entry := range names {
-		if d&launchDegradations(entry.degradation) != 0 {
+		if d.has(entry.degradation) {
 			members = append(members, entry.name)
 		}
 	}
@@ -223,7 +235,7 @@ func (l settledLaunch) uncounted() bool {
 // degradations names what the launch's preparation skipped, for logs.
 func (l settledLaunch) degradations() launchDegradations {
 	if l.state == nil {
-		return 0
+		return launchDegradations{}
 	}
 	return l.state.degradations
 }
