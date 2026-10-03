@@ -24,7 +24,7 @@ type backgroundMaintenanceCoordinator struct {
 	cleanupOrphanedNetworksFn   func(context.Context)
 	reapExpiredRetentionsFn     func(context.Context) (int, error)
 	runRetentionSweepFn         func(context.Context) error
-	enableInlineVolumeDeletesFn func(context.Context)
+	deferVolumeDeletesFn        func() volumeDeleteDeferral
 	retryHeldVolumeDeletesFn    func(context.Context) volumeDeleteHoldPassReport
 }
 
@@ -40,13 +40,14 @@ func (c *backgroundMaintenanceCoordinator) retryHeldVolumeDeletes(ctx context.Co
 
 var errBackgroundMaintenanceUnavailable = errors.New("background maintenance coordinator is unavailable")
 
-// enableInlineVolumeDeletes switches the volume manager out of Start's
-// deferral: a first-time deletion may then run inline under its budget.
-func (c *backgroundMaintenanceCoordinator) enableInlineVolumeDeletes(ctx context.Context) {
-	if c == nil || c.enableInlineVolumeDeletesFn == nil {
-		return
+// deferVolumeDeletesUntilExecutorRuns opens Start's deferral of the volume
+// manager's first-time deletions (see volumeDeleteDeferral). Backend.Start is
+// its only caller. A coordinator without the workflow defers nothing.
+func (c *backgroundMaintenanceCoordinator) deferVolumeDeletesUntilExecutorRuns() volumeDeleteDeferral {
+	if c == nil || c.deferVolumeDeletesFn == nil {
+		return volumeDeleteDeferral{}
 	}
-	c.enableInlineVolumeDeletesFn(ctx)
+	return c.deferVolumeDeletesFn()
 }
 
 func (c *backgroundMaintenanceCoordinator) recoverInterruptedVolumes(ctx context.Context) error {

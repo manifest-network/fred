@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -29,9 +30,10 @@ import (
 
 const (
 	// liveXFSDeleteBudget bounds the inline cleanup of a first-time Destroy
-	// once the hold executor runs. A deletion that needs longer is held and the
-	// executor finishes it. The budget also honors caller cancellation and the
-	// Backend's lifetime (the storage-mutation bracket joins both).
+	// whenever no starting Backend defers it. A deletion that needs longer is
+	// held and the hold executor finishes it. The budget also honors caller
+	// cancellation and the Backend's lifetime (the storage-mutation bracket
+	// joins both).
 	liveXFSDeleteBudget = 10 * time.Second
 	// xfsQuotaClearTimeout bounds the single limit-clear quotactl. It runs
 	// detached from cancellation so it is never killed half-way, and starts only
@@ -784,10 +786,23 @@ func (x *xfsVolumeManager) heldDeletionOf(stage xfsDeleteStageName) (xfsDeleteHo
 	return *hold, true
 }
 
-// EnableInlineVolumeDeletes lets first-time deletions run inline under
-// liveXFSDeleteBudget. The Backend calls it once its hold executor runs.
-func (x *xfsVolumeManager) EnableInlineVolumeDeletes() {
-	x.inlineDeletes.Store(true)
+// DeferDeletesUntilExecutorRuns opens a deferral of first-time deletions;
+// see volumeDeleteDeferral. Deletions stay deferred while any deferral is
+// open, and each deferral is ended at most once and ends only itself, so a
+// repeated End can never reopen inline deletion under a Start whose own
+// deferral is still open.
+func (x *xfsVolumeManager) DeferDeletesUntilExecutorRuns() volumeDeleteDeferral {
+	x.openDeleteDeferrals.Add(1)
+	var once sync.Once
+	return volumeDeleteDeferral{release: func() {
+		once.Do(func() { x.openDeleteDeferrals.Add(-1) })
+	}}
+}
+
+// deletesDeferred reports whether a starting Backend defers this manager's
+// first-time deletions to its hold executor.
+func (x *xfsVolumeManager) deletesDeferred() bool {
+	return x.openDeleteDeferrals.Load() > 0
 }
 
 // RetryHeldVolumeDelete runs one attempt of the held deletion of id under the

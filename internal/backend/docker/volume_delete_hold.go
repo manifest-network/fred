@@ -48,6 +48,30 @@ import (
 // RetryHeldVolumeDelete in the storage-mutation bracket under the lease's
 // namespace lock.
 
+// volumeDeleteDeferral is Backend.Start's deferral of a volume manager's
+// first-time deletions. While one is open, a first-time Destroy mints its
+// delete stage and hands the deletion to the hold executor without attempting
+// it, so that Start never waits on a tenant tree. Start opens it at its entry
+// and ends it when the executor starts, or when Start returns before that.
+//
+// A manager is constructed with no deferral open, so a manager that no
+// Backend is starting (an offline tool, or a test driving a manager directly)
+// deletes inline under its short budget and never depends on an executor it
+// does not have. Only DeferDeletesUntilExecutorRuns opens a deferral, and the
+// composition file is its only production caller (forbidigo); only the
+// returned value ends it. The zero value defers nothing.
+type volumeDeleteDeferral struct {
+	release func()
+}
+
+// End ends the deferral. Ending it again, or ending the zero value, does
+// nothing.
+func (d volumeDeleteDeferral) End() {
+	if d.release != nil {
+		d.release()
+	}
+}
+
 const (
 	// volumeDeleteHoldInterval paces the hold executor. Its first pass runs as
 	// soon as Start returns.

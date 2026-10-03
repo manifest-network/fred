@@ -164,20 +164,15 @@ func TestXfsQuotaArgs_TrailingArgIsMountpoint(t *testing.T) {
 	assert.Equal(t, "report -p -b -n -N -L 1501154529 -U 1501154529", xfsProjectReportCmd("b", projID))
 }
 
-// newXfsManagerForTest builds a bare xfsVolumeManager over dataPath with empty
-// maps — enough to exercise the marker/map logic (resolveProjectID) and the
-// Destroy teardown path without any live XFS mount or xfs_quota tooling. It is
-// in the post-Start mode: a first-time Destroy runs inline under its budget.
+// newXfsManagerForTest builds an xfsVolumeManager over dataPath through the
+// production constructor, with a fake attribute reader in place of the kernel
+// ioctls — enough to exercise the marker/map logic (resolveProjectID) and the
+// Destroy teardown path without any live XFS mount or xfs_quota tooling. Like
+// every manager no Backend is starting, a first-time Destroy runs inline under
+// its budget.
 func newXfsManagerForTest(dataPath string) *xfsVolumeManager {
-	mgr := &xfsVolumeManager{
-		dataPath:          dataPath,
-		mountPoint:        dataPath,
-		logger:            slog.Default(),
-		projectAttributes: fixedXFSProjectAttributeReader{attr: linuxFSXAttr{XFlags: linuxFSXFlagProjInherit}},
-		activeIDs:         make(map[uint32]string),
-		volumeToID:        make(map[string]uint32),
-	}
-	mgr.EnableInlineVolumeDeletes()
+	mgr := newXFSVolumeManager(dataPath, dataPath, 0, slog.Default())
+	mgr.projectAttributes = fixedXFSProjectAttributeReader{attr: linuxFSXAttr{XFlags: linuxFSXFlagProjInherit}}
 	return mgr
 }
 

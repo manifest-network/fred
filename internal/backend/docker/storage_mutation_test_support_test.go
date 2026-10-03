@@ -485,10 +485,12 @@ func (p testVolumeMutationProxy) RetryHeldVolumeDelete(ctx context.Context, id s
 	return sink.RetryHeldVolumeDelete(ctx, id)
 }
 
-func (p testVolumeMutationProxy) EnableInlineVolumeDeletes() {
-	if sink, err := p.sink(); err == nil {
-		sink.EnableInlineVolumeDeletes()
+func (p testVolumeMutationProxy) DeferDeletesUntilExecutorRuns() volumeDeleteDeferral {
+	sink, err := p.sink()
+	if err != nil {
+		return volumeDeleteDeferral{}
 	}
+	return sink.DeferDeletesUntilExecutorRuns()
 }
 
 func (p testVolumeMutationProxy) RenameVolume(ctx context.Context, oldName, newName string) error {

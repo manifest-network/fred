@@ -2688,6 +2688,12 @@ func newBackend(
 
 // Start initializes the backend, recovers state, and starts background tasks.
 func (b *Backend) Start(ctx context.Context) error {
+	// Until the hold executor runs, a first-time volume deletion is handed to
+	// it without an attempt, so Start never waits on a tenant tree (ENG-1117).
+	// The deferral is Start's own: it ends when the executor starts below, or
+	// when Start returns before that.
+	deleteDeferral := b.backgroundMaintenance.deferVolumeDeletesUntilExecutorRuns()
+	defer deleteDeferral.End()
 	initialCtx, cancelInitial := b.recoveryDockerReadContext(ctx)
 	defer cancelInitial()
 	if err := b.VerifyStorageIdentity(initialCtx); err != nil {
@@ -2872,11 +2878,11 @@ func (b *Backend) Start(ctx context.Context) error {
 	b.releaseStore.StartMaintenance()
 	b.startRetentionReaper()
 	// Start the hold executor, the only runner of held volume deletions; its
-	// first pass runs at once. From here on a first-time deletion may also run
-	// inline under its short budget: until now every deletion was handed to the
-	// executor without an attempt, so Start never waited on a tenant tree
-	// (ENG-1117).
-	b.backgroundMaintenance.enableInlineVolumeDeletes(startupCtx)
+	// first pass runs at once. Ending Start's deferral lets a first-time
+	// deletion run inline under its short budget again: until now every
+	// deletion was handed to the executor without an attempt, so Start never
+	// waited on a tenant tree (ENG-1117).
+	deleteDeferral.End()
 	b.sampleVolumeDeleteHoldMetrics()
 	b.wg.Go(b.volumeDeleteHoldLoop)
 
