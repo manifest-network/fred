@@ -767,6 +767,22 @@ var (
 		Help:      "Container event subscription lifecycle: connected (opened after storage re-verification), reconnect (ended or could not open; retried with backoff), exited (stopped at shutdown or after storage authority was withdrawn)",
 	}, []string{"outcome"})
 
+	// containerDeathQueueDepth is the number of live container deaths waiting
+	// for the event loop's dispatcher (ENG-799), sampled at each enqueue and
+	// dequeue and reset to 0 when the loop exits. A death only counts toward
+	// the terminal budget if it is dispatched before the reconcile sweep finds
+	// it; a dispatcher held up (by a slow storage verification, or by another
+	// verifier holding the storage-verification lock) turns live deaths into
+	// sweep-found unknown ones without moving die_event_dropped_total until
+	// the queue is full. A sustained non-zero depth is that signal. A gauge of
+	// current depth, not a last-success timestamp.
+	containerDeathQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "container_death_queue_depth",
+		Help:      "Live container deaths waiting for the event loop's dispatcher (capacity 4096), sampled at each enqueue and dequeue; sustained non-zero means deaths reach the reconcile sweep, unattributed, before dispatch",
+	})
+
 	// leaseFailuresTotal counts every failure the lease state machine records
 	// in a lease's consecutive-failure terminal budget (ENG-799), by who caused
 	// it. Only tenant_workload consumes the budget that can close a lease

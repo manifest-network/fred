@@ -43,6 +43,10 @@ const (
 	containerDeathQueueCapacity = 4096
 	// containerEventVerifyTimeout bounds each storage re-verification the loop
 	// makes, so a daemon that stops answering "docker info" cannot wedge it.
+	// It bounds the verification only: a death's wait in the queue, and the
+	// dispatcher's wait for the backend's storage-verification lock while
+	// another verifier holds it with a longer deadline, come on top. That wait
+	// shows as fred_docker_backend_container_death_queue_depth.
 	containerEventVerifyTimeout = 10 * time.Second
 	// containerEventRetryInitial and containerEventRetryMax bound the backoff
 	// between reconnect attempts. The backoff resets once a subscription
@@ -81,6 +85,7 @@ func (b *Backend) runContainerEventLoop(retryInitial, retryMax time.Duration) {
 	defer func() {
 		close(deaths)
 		dispatcher.Wait()
+		containerDeathQueueDepth.Set(0)
 		containerEventStreamTotal.WithLabelValues(containerEventStreamExited).Inc()
 	}()
 
@@ -171,6 +176,7 @@ func (b *Backend) consumeContainerEventStream(deaths chan<- failurecause.Provena
 func (b *Backend) enqueueLiveContainerDeath(deaths chan<- failurecause.Provenance, death failurecause.Provenance) {
 	select {
 	case deaths <- death:
+		containerDeathQueueDepth.Set(float64(len(deaths)))
 	default:
 		dieEventDroppedTotal.WithLabelValues(dieEventSourceEventLoop).Inc()
 		b.logger.Warn("container death dropped: dispatch queue full; the reconcile sweep will find it, unattributed",
@@ -179,9 +185,12 @@ func (b *Backend) enqueueLiveContainerDeath(deaths chan<- failurecause.Provenanc
 }
 
 // dispatchLiveContainerDeaths routes queued deaths in arrival order until the
-// reader closes the queue.
+// reader closes the queue. The queue depth is sampled at each enqueue and each
+// dequeue, so a dispatcher that falls behind shows as a rising depth before
+// any death is dropped.
 func (b *Backend) dispatchLiveContainerDeaths(deaths <-chan failurecause.Provenance) {
 	for death := range deaths {
+		containerDeathQueueDepth.Set(float64(len(deaths)))
 		b.dispatchLiveContainerDeath(death)
 	}
 }

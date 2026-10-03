@@ -19,7 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Metrics `fred_docker_backend_lease_failures_total{attribution}`
   (`tenant_workload`, `disruption`, `platform`, `maintenance`, `unknown`),
   `fred_docker_backend_container_event_stream_total{outcome}` (`connected`,
-  `reconnect`, `exited`) and `fred_reconciler_terminal_verdicts_total{verdict}`
+  `reconnect`, `exited`), the gauge
+  `fred_docker_backend_container_death_queue_depth` (live deaths waiting for
+  dispatch; a backlog turns them `unknown` before any is dropped) and
+  `fred_reconciler_terminal_verdicts_total{verdict}`
   (`exhausted`, `retry`, `absent`, `unknown`). OPERATIONS.md ("Failed lease
   re-provisioning") lists the alerts: sustained `absent` or `unknown` verdicts,
   a flapping event stream, sustained `platform` failures. Never alert on

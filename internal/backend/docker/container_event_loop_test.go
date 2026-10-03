@@ -185,6 +185,8 @@ func TestContainerEventLoop_ReaderNeverWaitsOnDeathDispatch(t *testing.T) {
 	send(ContainerEvent{ContainerID: "sentinel", Action: containerEventStart})
 	assert.Equal(t, 10.0, eventLoopDrops()-drops,
 		"the queue holds its capacity; every death past it is dropped, counted, and never blocks")
+	assert.Equal(t, float64(containerDeathQueueCapacity), testutil.ToFloat64(containerDeathQueueDepth),
+		"the depth gauge shows the backlog of a stuck dispatcher before and while deaths are dropped")
 
 	stuck.Store(false)
 	releaseOnce()
@@ -194,6 +196,8 @@ func TestContainerEventLoop_ReaderNeverWaitsOnDeathDispatch(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the loop did not stop")
 	}
+	assert.Zero(t, testutil.ToFloat64(containerDeathQueueDepth),
+		"an exited loop leaves no stale depth behind (it read the full capacity above)")
 }
 
 func TestContainerEventStreamOutcomesArePreinitialized(t *testing.T) {
