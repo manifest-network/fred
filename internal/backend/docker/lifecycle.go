@@ -1110,12 +1110,17 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 
 	// Set health check if provided
 	if params.Manifest.HealthCheck != nil {
+		// Docker reads a zero timing as "inherit the default", which is what
+		// Override reports for an unset (or stored, now-invalid) value.
+		interval, _ := params.Manifest.HealthCheck.Interval.Override()
+		timeout, _ := params.Manifest.HealthCheck.Timeout.Override()
+		startPeriod, _ := params.Manifest.HealthCheck.StartPeriod.Override()
 		config.Healthcheck = &container.HealthConfig{
 			Test:        params.Manifest.HealthCheck.Test,
-			Interval:    params.Manifest.HealthCheck.Interval.Duration(),
-			Timeout:     params.Manifest.HealthCheck.Timeout.Duration(),
+			Interval:    interval,
+			Timeout:     timeout,
 			Retries:     params.Manifest.HealthCheck.Retries,
-			StartPeriod: params.Manifest.HealthCheck.StartPeriod.Duration(),
+			StartPeriod: startPeriod,
 		}
 	}
 

@@ -46,7 +46,9 @@ func TestParseManifest(t *testing.T) {
 		assert.Len(t, m.Ports, 2)
 		assert.Equal(t, 8443, m.Ports["443/tcp"].HostPort)
 		assert.Equal(t, "example.com", m.Env["NGINX_HOST"])
-		assert.Equal(t, 30*time.Second, m.HealthCheck.Interval.Duration())
+		interval, set := m.HealthCheck.Interval.Override()
+		assert.True(t, set)
+		assert.Equal(t, 30*time.Second, interval)
 	})
 
 	t.Run("minimal manifest", func(t *testing.T) {

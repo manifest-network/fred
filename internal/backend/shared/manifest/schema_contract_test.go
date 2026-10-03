@@ -63,6 +63,20 @@ func TestPublishedSchemaMatchesRuntimeFieldBoundaries(t *testing.T) {
 			})
 		}
 	}
+	// Health check timing (ENG-1127): the schema range-checks integer
+	// nanoseconds and integer single-unit strings exactly; fractional and
+	// compound strings are documented as admission-validated and so are not
+	// part of this agreement corpus.
+	for _, field := range []string{"interval", "timeout", "start_period"} {
+		for _, tc := range healthTimingCases() {
+			var value any
+			require.NoError(t, json.Unmarshal([]byte(tc.wire), &value))
+			cases = append(cases, example{
+				"health_check " + field + " " + tc.name, "health_check",
+				map[string]any{"test": []string{"CMD", "true"}, field: value}, tc.admitted,
+			})
+		}
+	}
 	for _, tc := range cases {
 		for _, stack := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/stack=%t", tc.name, stack), func(t *testing.T) {

@@ -1,6 +1,8 @@
 package docker
 
 import (
+	"encoding/json"
+	"strconv"
 	"testing"
 	"time"
 
@@ -131,10 +133,10 @@ func TestBuildComposeProject_HealthCheck(t *testing.T) {
 	params := baseProjectParams()
 	params.Stack.Services["web"].HealthCheck = &manifest.HealthCheckConfig{
 		Test:        []string{"CMD-SHELL", "curl -f http://localhost/"},
-		Interval:    manifest.Duration(10 * time.Second),
-		Timeout:     manifest.Duration(5 * time.Second),
+		Interval:    testHealthDuration(10 * time.Second),
+		Timeout:     testHealthDuration(5 * time.Second),
 		Retries:     3,
-		StartPeriod: manifest.Duration(30 * time.Second),
+		StartPeriod: testHealthDuration(30 * time.Second),
 	}
 
 	project := buildTestComposeProject(t, params)
@@ -146,6 +148,60 @@ func TestBuildComposeProject_HealthCheck(t *testing.T) {
 	assert.Equal(t, 5*time.Second, time.Duration(*svc.HealthCheck.Timeout))
 	assert.Equal(t, uint64(3), *svc.HealthCheck.Retries)
 	assert.Equal(t, 30*time.Second, time.Duration(*svc.HealthCheck.StartPeriod))
+}
+
+// testHealthDuration decodes d as a manifest carries it: HealthDuration has
+// no exported constructor by design (ENG-1127).
+func testHealthDuration(d time.Duration) manifest.HealthDuration {
+	var timing manifest.HealthDuration
+	if err := json.Unmarshal([]byte(strconv.Quote(d.String())), &timing); err != nil {
+		panic(err)
+	}
+	return timing
+}
+
+// Timing that passes tenant admission reaches Compose exactly as admitted,
+// in both wire forms, including Docker's 1ms floor itself (ENG-1127).
+func TestBuildComposeProject_AdmittedHealthTimingSurvivesTranslation(t *testing.T) {
+	stack, err := manifest.ParsePayload([]byte(`{"services":{"web":{"image":"nginx:latest","health_check":{` +
+		`"test":["CMD","true"],"interval":"1ms","timeout":1500000,"start_period":"2m30s"}}}}`))
+	require.NoError(t, err)
+	params := baseProjectParams()
+	params.Stack = stack
+
+	project := buildTestComposeProject(t, params)
+
+	hc := project.Services["web"].HealthCheck
+	require.NotNil(t, hc)
+	require.NotNil(t, hc.Interval)
+	require.NotNil(t, hc.Timeout)
+	require.NotNil(t, hc.StartPeriod)
+	assert.Equal(t, time.Millisecond, time.Duration(*hc.Interval))
+	assert.Equal(t, 1500*time.Microsecond, time.Duration(*hc.Timeout))
+	assert.Equal(t, 150*time.Second, time.Duration(*hc.StartPeriod))
+}
+
+// A release persisted before ENG-1127 can carry timing admission now rejects.
+// Recovery must still decode it, and translation must map it to the
+// image/daemon default rather than hand Docker a value it refuses.
+func TestBuildComposeProject_StoredInvalidHealthTimingUsesDefault(t *testing.T) {
+	payload := []byte(`{"services":{"web":{"image":"nginx:latest","health_check":{` +
+		`"test":["CMD","true"],"interval":"-5s","timeout":"999us","start_period":1}}}}`)
+	_, err := manifest.ParsePayload(payload)
+	require.Error(t, err, "tenant admission rejects the timing")
+	stack, err := manifest.ParseStoredPayload(payload)
+	require.NoError(t, err, "stored history still decodes")
+	params := baseProjectParams()
+	params.Stack = stack
+
+	project := buildTestComposeProject(t, params)
+
+	hc := project.Services["web"].HealthCheck
+	require.NotNil(t, hc)
+	assert.Equal(t, []string{"CMD", "true"}, []string(hc.Test))
+	assert.Nil(t, hc.Interval)
+	assert.Nil(t, hc.Timeout)
+	assert.Nil(t, hc.StartPeriod)
 }
 
 func TestBuildComposeProject_NoHealthCheck(t *testing.T) {

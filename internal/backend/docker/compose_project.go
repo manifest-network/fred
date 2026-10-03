@@ -317,22 +317,15 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 		svc.HealthCheck = &composetypes.HealthCheckConfig{
 			Test: composetypes.HealthCheckTest(hc.Test),
 		}
-		if hc.Interval > 0 {
-			d := composetypes.Duration(hc.Interval.Duration())
-			svc.HealthCheck.Interval = &d
-		}
-		if hc.Timeout > 0 {
-			d := composetypes.Duration(hc.Timeout.Duration())
-			svc.HealthCheck.Timeout = &d
-		}
+		// Override is the only reader of a manifest health timing: it yields a
+		// value Docker accepts, or false so the image/daemon default applies.
+		svc.HealthCheck.Interval = composeHealthDuration(hc.Interval)
+		svc.HealthCheck.Timeout = composeHealthDuration(hc.Timeout)
 		if hc.Retries > 0 {
 			r := uint64(hc.Retries)
 			svc.HealthCheck.Retries = &r
 		}
-		if hc.StartPeriod > 0 {
-			d := composetypes.Duration(hc.StartPeriod.Duration())
-			svc.HealthCheck.StartPeriod = &d
-		}
+		svc.HealthCheck.StartPeriod = composeHealthDuration(hc.StartPeriod)
 	}
 
 	// Stop grace period.
@@ -438,6 +431,18 @@ func applyVolumeBinds(svc *composetypes.ServiceConfig, binds serviceVolBinds) {
 			Target: containerPath,
 		})
 	}
+}
+
+// composeHealthDuration translates one manifest health timing. nil leaves the
+// image's/daemon's default in place; a non-nil value is always one Docker
+// accepts, because manifest.HealthDuration exposes nothing else (ENG-1127).
+func composeHealthDuration(timing manifest.HealthDuration) *composetypes.Duration {
+	value, ok := timing.Override()
+	if !ok {
+		return nil
+	}
+	d := composetypes.Duration(value)
+	return &d
 }
 
 // composeProjectImages maps expanded instance services to the one image admitted

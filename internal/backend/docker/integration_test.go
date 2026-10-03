@@ -1040,8 +1040,8 @@ func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
 		Command: []string{"sleep", "3600"},
 		HealthCheck: &manifest.HealthCheckConfig{
 			Test:     []string{"CMD", "false"},
-			Interval: manifest.Duration(1 * time.Second),
-			Timeout:  manifest.Duration(1 * time.Second),
+			Interval: testHealthDuration(1 * time.Second),
+			Timeout:  testHealthDuration(1 * time.Second),
 			Retries:  1,
 		},
 	}
@@ -2591,8 +2591,8 @@ func testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t *testing.T, moun
 		Env:     map[string]string{"PR240_POLICY": "failed-target"},
 		Command: []string{"sh", "-c", "echo pr240-target-started-and-failed; exec sleep 3600"},
 		HealthCheck: &manifest.HealthCheckConfig{
-			Test: []string{"CMD", "false"}, Interval: manifest.Duration(time.Second),
-			Timeout: manifest.Duration(time.Second), Retries: 1,
+			Test: []string{"CMD", "false"}, Interval: testHealthDuration(time.Second),
+			Timeout: testHealthDuration(time.Second), Retries: 1,
 		},
 	}
 	badPayload, err := json.Marshal(target)
@@ -3041,8 +3041,8 @@ func TestIntegration_Stack_HealthCheck(t *testing.T) {
 				Command: []string{"sleep", "3600"},
 				HealthCheck: &manifest.HealthCheckConfig{
 					Test:     []string{"CMD", "true"},
-					Interval: manifest.Duration(1 * time.Second),
-					Timeout:  manifest.Duration(1 * time.Second),
+					Interval: testHealthDuration(1 * time.Second),
+					Timeout:  testHealthDuration(1 * time.Second),
 					Retries:  3,
 				},
 			},
@@ -3100,8 +3100,8 @@ func TestIntegration_Stack_HealthCheckFailure(t *testing.T) {
 				Command: []string{"sleep", "3600"},
 				HealthCheck: &manifest.HealthCheckConfig{
 					Test:     []string{"CMD", "false"},
-					Interval: manifest.Duration(1 * time.Second),
-					Timeout:  manifest.Duration(1 * time.Second),
+					Interval: testHealthDuration(1 * time.Second),
+					Timeout:  testHealthDuration(1 * time.Second),
 					Retries:  1,
 				},
 			},
@@ -3207,8 +3207,8 @@ func TestIntegration_Stack_DependsOnHealthy(t *testing.T) {
 				Command: []string{"sleep", "3600"},
 				HealthCheck: &manifest.HealthCheckConfig{
 					Test:     []string{"CMD", "true"},
-					Interval: manifest.Duration(1 * time.Second),
-					Timeout:  manifest.Duration(1 * time.Second),
+					Interval: testHealthDuration(1 * time.Second),
+					Timeout:  testHealthDuration(1 * time.Second),
 					Retries:  3,
 				},
 			},
