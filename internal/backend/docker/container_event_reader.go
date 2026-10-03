@@ -27,11 +27,13 @@ import (
 // the event type, declared anywhere else.
 
 // containerEventReader reads the container event subscriptions. Its only
-// capabilities are the backend's stop signal, the dispatcher's queue and the
-// overflow record: nothing it can reach logs or waits.
+// capabilities are the backend's stop signal, the dispatcher's queue, the
+// live-death recorder's queue and the overflow record: nothing it can reach
+// logs or waits.
 type containerEventReader struct {
 	stop     <-chan struct{}
 	deaths   chan<- failurecause.Provenance
+	ledger   chan<- failurecause.Provenance
 	overflow *containerDeathOverflow
 }
 
@@ -63,8 +65,12 @@ func (r containerEventReader) consume(events <-chan ContainerEvent, errs <-chan 
 			case containerEventDie:
 				// Consume the run's record first, so a death of an untracked
 				// container still frees its entry. The provenance is bound to
-				// this container and is all the dispatcher needs.
-				r.enqueue(session.ObserveExit(event.ContainerID))
+				// this container and is all the dispatcher needs. The
+				// live-death ledger keeps it too, for a container that is in
+				// no Ready projection yet and so cannot be routed (ENG-1125).
+				death := session.ObserveExit(event.ContainerID)
+				r.remember(death)
+				r.enqueue(death)
 			}
 		case err, ok := <-errs:
 			if !ok {
@@ -84,6 +90,19 @@ func (r containerEventReader) enqueue(death failurecause.Provenance) {
 		containerDeathQueueDepth.Set(float64(len(r.deaths)))
 	default:
 		r.overflow.record()
+	}
+}
+
+// remember hands one death to the live-death recorder without ever blocking.
+// The ledger takes a lock, so the reader never writes it directly: the event
+// loop's recorder does, on its own goroutine. A full queue drops the record,
+// toward unobserved: a startup failure that finds no provenance is not
+// counted, and a death that raced a Ready transition is left to the sweep,
+// unattributed. Either loss errs toward not closing a lease.
+func (r containerEventReader) remember(death failurecause.Provenance) {
+	select {
+	case r.ledger <- death:
+	default:
 	}
 }
 

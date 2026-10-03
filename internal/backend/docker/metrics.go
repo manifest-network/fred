@@ -82,6 +82,7 @@ const (
 	destroySiteDeprovisionReclaim = "deprovision_reclaim" // doDeprovision's writable-path-only reclaim (ENG-406)
 	destroySiteRetentionRefused   = "retention_refused"   // destroyOnRefuseToRetain, a breached retained-disk cap
 	destroySiteReaping            = "reaping"             // destroyReapingVolumes, the retention finalizer
+	destroySiteStartupRollback    = "startup_rollback"    // rollbackStartupFailure, a definite startup failure's own volumes (ENG-1125)
 )
 
 // Reasons a destroy was refused. Both mean "the bytes are still on disk", but they
@@ -103,7 +104,7 @@ const (
 var (
 	destroySites = []string{
 		destroySiteDeprovisionDestroy, destroySiteDeprovisionReclaim, destroySiteRetentionRefused,
-		destroySiteReaping,
+		destroySiteReaping, destroySiteStartupRollback,
 	}
 	destroyRefusedReasons = []string{destroyRefusedClaimed, destroyRefusedUnreadable, destroyRefusedNoDestroyer}
 )

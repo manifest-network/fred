@@ -91,22 +91,29 @@ func TestBackendRetainsOnlyReadViewsAndExplicitSettlementCapabilities(t *testing
 
 	// Live execution receives only a purpose-specific invocation closure. The
 	// exact opaque subject, mutation facade, target names and action selection
-	// are captured by its builder and cannot be changed by run*Substrate.
+	// are captured by its builder and cannot be changed by run*Substrate. Only
+	// the operation workflow reports a typed finding (ENG-1125), and only as an
+	// output.
 	errorType := reflect.TypeFor[error]()
-	assertInvocationOnly := func(name string, capability reflect.Type) {
+	assertInvocationOnly := func(name string, capability reflect.Type, outputs ...reflect.Type) {
 		t.Helper()
 		if capability.Kind() != reflect.Func || capability.IsVariadic() ||
 			capability.NumIn() != 1 || capability.In(0) != contextType ||
-			capability.NumOut() != 1 || capability.Out(0) != errorType {
+			capability.NumOut() != len(outputs) {
 			t.Fatalf("%s exposes a targetable execution surface %v", name, capability)
+		}
+		for index, output := range outputs {
+			if capability.Out(index) != output {
+				t.Fatalf("%s exposes a targetable execution surface %v", name, capability)
+			}
 		}
 	}
 	operationCapability := reflect.TypeFor[operationSubstrate]()
 	maintenanceCapability := reflect.TypeFor[maintenanceSubstrate]()
 	closeCapability := reflect.TypeFor[closeSubstrate]()
-	assertInvocationOnly("operationSubstrate", operationCapability)
-	assertInvocationOnly("maintenanceSubstrate", maintenanceCapability)
-	assertInvocationOnly("closeSubstrate", closeCapability)
+	assertInvocationOnly("operationSubstrate", operationCapability, reflect.TypeFor[startupFailure](), errorType)
+	assertInvocationOnly("maintenanceSubstrate", maintenanceCapability, errorType)
+	assertInvocationOnly("closeSubstrate", closeCapability, errorType)
 	if operationCapability.AssignableTo(maintenanceCapability) ||
 		operationCapability.AssignableTo(closeCapability) ||
 		maintenanceCapability.AssignableTo(closeCapability) {

@@ -85,6 +85,13 @@ linters:
           msg: "[placement-lease-close] close a lease through ReconciliationCoordinator.CloseObserved"
         - pattern: '\.CloseLeases$'
           msg: "[chain-lease-close] close a lease through a typed wrapper in internal/provisioner/reconcile_close.go"
+        # A definite startup failure ends a durable provision attempt and its
+        # attribution can count toward closing a lease (ENG-1125). Its
+        # evidence is minted only by the classifier's confirmation, after its
+        # own positive reads; internal/testutil pins the same rule through
+        # aliases.
+        - pattern: '\.NewOperationStartupFailed$'
+          msg: "[startup-evidence] mint startup failure evidence only in confirmStartupFailure (internal/backend/docker/startup_failure.go)"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -135,6 +142,11 @@ linters:
         linters:
           - forbidigo
         text: '\[chain-lease-close\]'
+      # The only file allowed to mint startup failure evidence (ENG-1125).
+      - path: ^internal/backend/docker/startup_failure\.go$
+        linters:
+          - forbidigo
+        text: '\[startup-evidence\]'
       # Exclude test files from strict linters
       - path: _test\.go
         linters:

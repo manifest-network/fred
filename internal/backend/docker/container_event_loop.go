@@ -30,6 +30,10 @@ import (
 //     re-verification, the lease lookup, the runtime-generation proof and
 //     actor routing. A death it cannot deliver is dropped and counted; the
 //     sweep later finds it, unattributed.
+//   - One recorder writes every death the reader hands it, through its own
+//     bounded queue, into the live-death ledger (live_death_ledger.go), for a
+//     container that is in no Ready projection yet and so cannot be routed
+//     (ENG-1125). The ledger takes a lock, so the reader never writes it.
 //   - One reporter logs the deaths the reader dropped, at most once per
 //     containerDeathOverflowReportInterval, so a stalled log sink stalls only
 //     the reporter.
@@ -101,21 +105,24 @@ func (b *Backend) containerEventLoop() {
 // dispatcher and the overflow reporter, and stops both before it returns.
 func (b *Backend) runContainerEventLoop(retryInitial, retryMax time.Duration) {
 	deaths := make(chan failurecause.Provenance, containerDeathQueueCapacity)
+	ledger := make(chan failurecause.Provenance, liveDeathLedgerCapacity)
 	overflow := newContainerDeathOverflow()
 	reporting, stopReporting := context.WithCancel(b.stopCtx)
 	var workers sync.WaitGroup
 	workers.Go(func() { b.dispatchLiveContainerDeaths(deaths) })
+	workers.Go(func() { b.recordLiveContainerDeaths(ledger) })
 	workers.Go(func() {
 		b.reportContainerDeathOverflow(reporting, overflow, containerDeathOverflowReportInterval)
 	})
 	defer func() {
 		close(deaths)
+		close(ledger)
 		stopReporting()
 		workers.Wait()
 		containerDeathQueueDepth.Set(0)
 		containerEventStreamTotal.WithLabelValues(containerEventStreamExited).Inc()
 	}()
-	reader := containerEventReader{stop: b.stopCtx.Done(), deaths: deaths, overflow: overflow}
+	reader := containerEventReader{stop: b.stopCtx.Done(), deaths: deaths, ledger: ledger, overflow: overflow}
 
 	retry := retryInitial
 	for b.containerEventLoopMayRun() {
@@ -128,7 +135,11 @@ func (b *Backend) runContainerEventLoop(retryInitial, retryMax time.Duration) {
 		} else {
 			containerEventStreamTotal.WithLabelValues(containerEventStreamConnected).Inc()
 			events, errs := b.docker.ContainerEvents(b.stopCtx)
+			// While no subscription is held, no death can be recorded, so a
+			// startup failure does not wait for one (ENG-1125).
+			b.liveDeaths.markLiveDeathStream(true)
 			delivered, err := reader.consume(events, errs)
+			b.liveDeaths.markLiveDeathStream(false)
 			if delivered {
 				retry = retryInitial
 			}
@@ -208,6 +219,17 @@ func (b *Backend) logContainerDeathOverflow(dropped uint64) {
 	b.logger.Warn(containerDeathOverflowMessage, "dropped", dropped)
 }
 
+// recordLiveContainerDeaths writes the deaths the reader handed over into the
+// live-death ledger until the loop closes the queue. It is the ledger's only
+// writer of deaths, on its own goroutine because the ledger takes a lock the
+// reader must never wait on (ENG-799, ENG-1125). It does no other work, so it
+// keeps up with the reader far ahead of the dispatcher.
+func (b *Backend) recordLiveContainerDeaths(ledger <-chan failurecause.Provenance) {
+	for death := range ledger {
+		b.liveDeaths.recordLiveDeath(death)
+	}
+}
+
 // dispatchLiveContainerDeaths routes queued deaths in arrival order until the
 // loop closes the queue. The queue depth is sampled at each enqueue and each
 // dequeue, so a dispatcher that falls behind shows as a rising depth before
@@ -255,6 +277,25 @@ func (b *Backend) dispatchLiveContainerDeath(death failurecause.Provenance) {
 		return
 	}
 	b.dispatchContainerDeathObservation(observation, containerID, dieEventSourceEventLoop)
+}
+
+// redispatchStartupDeaths hands the recorded live deaths of a new Ready
+// cohort's containers back to the dispatch path. Such a death raced the
+// provision's Ready transition: its die event came while the container was in
+// no Ready projection, and the event loop could not route it (ENG-1125). It
+// runs at the provision store's Ready entry, under the projection lock, so it
+// never blocks: the routing happens on a worker, after the Ready projection
+// is visible, and the actor handles the death after its Ready transition.
+func (b *Backend) redispatchStartupDeaths(containerIDs []string) {
+	deaths := b.liveDeaths.takeLiveDeaths(containerIDs)
+	if len(deaths) == 0 || b.stopCtx.Err() != nil {
+		return
+	}
+	b.wg.Go(func() {
+		for _, death := range deaths {
+			b.dispatchLiveContainerDeath(death)
+		}
+	})
 }
 
 // findLeaseByContainerID returns the lease UUID and true if a provision

@@ -2152,6 +2152,9 @@ func (d *DockerClient) ContainerEvents(ctx context.Context) (<-chan ContainerEve
 }
 
 // containerStatusToProvisionStatus converts Docker status to provision status.
+// It is the recovery table. A live provision's startup observation uses its
+// own table, classifyStartupInstance, which differs on purpose in exactly two
+// places (removing/dead, and paused); its comment says why.
 func containerStatusToProvisionStatus(status string) backend.ProvisionStatus {
 	status = strings.ToLower(status)
 	switch status {

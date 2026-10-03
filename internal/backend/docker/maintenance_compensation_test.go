@@ -249,7 +249,7 @@ func TestCompensationStartupOrdersDependenciesAndWaitsForEveryHealthyReplica(t *
 		b := newBackendForTest(mock, nil)
 		defer b.stopCancel()
 		require.NoError(t, b.waitForCompensationDependencies(t.Context(), schedule, "app", map[string][]string{"db": {"db-first", "db-second"}}, "lease"))
-		require.Equal(t, 1, observations["db-first"])
+		require.Equal(t, 2, observations["db-first"], "every pass observes the whole dependency cohort")
 		require.Equal(t, 2, observations["db-second"], "all dependency replicas must be healthy before the dependent starts")
 	})
 }

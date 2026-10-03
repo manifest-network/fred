@@ -727,13 +727,18 @@ func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchC
 		check:          journal.Check,
 		checkNamespace: journal.CheckNamespace,
 		pendingCount:   journal.PendingCount,
-		compose: func(ctx context.Context, q *quiescedVolumes, prepared imageexec.PreparedProject, opts composeUpOpts) error {
+		compose: func(ctx context.Context, q *quiescedVolumes, prepared imageexec.PreparedProject, opts composeUpOpts) (settledLaunch, error) {
 			if q == nil || q.mutations == nil || q.mutations.compensationSubject.Valid() {
-				return errors.New("compose launch requires an operation or maintenance target")
+				return settledLaunch{}, errors.New("compose launch requires an operation or maintenance target")
 			}
-			return dispatch(ctx, q, shared.MaintenanceTargetLaunchStep, func(ctx context.Context) daemonLaunchOutcome {
+			if err := dispatch(ctx, q, shared.MaintenanceTargetLaunchStep, func(ctx context.Context) daemonLaunchOutcome {
 				return q.mutations.ops.compose.launch(ctx, prepared, opts)
-			})
+			}); err != nil {
+				return settledLaunch{}, err
+			}
+			// The exchange settled with no business error and its debt row was
+			// cleared through the step's own receipt: the launch is settled.
+			return newSettledLaunch(q), nil
 		},
 		source: func(ctx context.Context, q *quiescedVolumes, schedule compensationStartup) error {
 			if q == nil || q.mutations == nil || !q.mutations.compensationSubject.Valid() || len(schedule.containers) == 0 {

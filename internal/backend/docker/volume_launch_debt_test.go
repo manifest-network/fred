@@ -124,13 +124,13 @@ func TestVolumeLaunchDebtRefusedDispatchAllocatesNothing(t *testing.T) {
 					copied.mutations = &mutations
 					q = &copied
 				}
-				err := h.backend.volumeLaunches.compose(ctx, q, h.prepared, composeUpOpts{})
+				_, err := h.backend.volumeLaunches.compose(ctx, q, h.prepared, composeUpOpts{})
 				require.Error(t, err)
 				require.NoError(t, h.backend.volumeLaunches.checkNamespace(q.mutations.leaseUUID))
 				return err
 			})
 			require.Zero(t, calls)
-			err := h.backend.volumeLaunches.compose(t.Context(), h.q, h.prepared, composeUpOpts{})
+			_, err := h.backend.volumeLaunches.compose(t.Context(), h.q, h.prepared, composeUpOpts{})
 			require.ErrorIs(t, err, substratemutation.ErrCapabilityUnavailable, "retained facade cannot allocate after its Runner expires")
 			require.NoError(t, h.backend.volumeLaunches.checkNamespace(h.q.mutations.leaseUUID))
 			require.Zero(t, calls)
@@ -158,7 +158,7 @@ func TestVolumeLaunchDebtDispatchOwnsWriteAheadAndExactCompletion(t *testing.T) 
 						return errors.New("optional preparation unavailable")
 					}))
 				}
-				err := h.backend.volumeLaunches.compose(ctx, q, h.prepared, composeUpOpts{})
+				_, err := h.backend.volumeLaunches.compose(ctx, q, h.prepared, composeUpOpts{})
 				if scenario == "reply lost" {
 					require.ErrorContains(t, err, "reply lost")
 					require.ErrorIs(t, h.backend.volumeLaunches.checkNamespace(q.mutations.leaseUUID), shared.ErrVolumeLaunchUnsettled)
@@ -183,7 +183,7 @@ func TestVolumeLaunchCompletedDaemonFailureCannotBypassStoragePostAttestation(t 
 		return daemonLaunchOutcome{settled: true, err: cause}
 	}
 	outcome := h.execute(t, func(ctx context.Context, q *quiescedVolumes) error {
-		err := h.backend.volumeLaunches.compose(ctx, q, h.prepared, composeUpOpts{})
+		_, err := h.backend.volumeLaunches.compose(ctx, q, h.prepared, composeUpOpts{})
 		require.ErrorIs(t, err, cause)
 		require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
 		return err
@@ -212,7 +212,7 @@ func TestStopDrainsAdmittedVolumeLaunchBeforeClosingJournal(t *testing.T) {
 	}
 	h.backend.wg.Go(func() {
 		h.execute(t, func(ctx context.Context, q *quiescedVolumes) error {
-			err := h.backend.volumeLaunches.compose(ctx, q, h.prepared, composeUpOpts{})
+			_, err := h.backend.volumeLaunches.compose(ctx, q, h.prepared, composeUpOpts{})
 			require.ErrorIs(t, err, context.Canceled, "the caller still sees its cancellation")
 			require.NoError(t, h.backend.volumeLaunches.checkNamespace(q.mutations.leaseUUID),
 				"an admitted response must settle debt even when Stop canceled the worker")

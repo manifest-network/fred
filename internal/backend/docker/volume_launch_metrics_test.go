@@ -47,7 +47,8 @@ func TestHealthSamplesDurableVolumeLaunchDebt(t *testing.T) {
 				return nil
 			}
 			h.execute(t, func(ctx context.Context, q *quiescedVolumes) error {
-				return h.backend.volumeLaunches.compose(ctx, q, h.prepared, composeUpOpts{})
+				_, err := h.backend.volumeLaunches.compose(ctx, q, h.prepared, composeUpOpts{})
+				return err
 			})
 			require.NoError(t, h.backend.Health(t.Context()))
 			if replyLost {

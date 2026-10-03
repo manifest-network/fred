@@ -320,6 +320,11 @@ type Backend struct {
 	// subject, including root's any-non-root-owner query. Zero-value ready.
 	writablePathCache writablePathCache
 
+	// liveDeaths remembers the live provenance of recent container deaths for
+	// containers in no Ready projection yet (ENG-1125). Only the event loop's
+	// reader writes it. Zero-value ready.
+	liveDeaths liveDeathLedger
+
 	// stopCtx is canceled on shutdown; stopCancel triggers it.
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
@@ -2556,13 +2561,13 @@ func newBackend(
 	if err != nil {
 		return nil, fmt.Errorf("bind background substrate maintenance: %w", err)
 	}
-	err = shared.BindOperationSubstrateExecutor(
+	err = shared.BindOperationFindingExecutor(
 		operationSettlement,
 		b.authorizeStorageMutation,
 		b.completeStorageMutation,
 		buildOperationSubstrate(b, mutationOperations),
 		runOperationSubstrate,
-		b.classifyOperationPhysical,
+		b.classifyOperationFinding,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("bind operation substrate mutation authority: %w", err)

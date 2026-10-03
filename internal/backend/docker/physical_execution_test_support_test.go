@@ -220,14 +220,14 @@ func bindBackendTestPhysicalExecutors(
 	state := newOperationSeedExecutor()
 	operationSeedExecutors.Store(operations, state)
 	buildOperation := buildOperationSubstrate(b, ops)
-	err = shared.BindOperationSubstrateExecutor(
+	err = shared.BindOperationFindingExecutor(
 		operations,
 		b.authorizeStorageMutation,
 		b.completeStorageMutation,
 		func(runner substratemutation.Runner, subject shared.OperationPhysicalSubject) operationSubstrate {
 			if _, seeded := state.projection(subject.OperationID()); seeded {
-				return func(ctx context.Context) error {
-					return runner.Step(
+				return func(ctx context.Context) (startupFailure, error) {
+					return startupFailure{}, runner.Step(
 						ctx, "seed exact running substrate", func(context.Context) error { return nil },
 					)
 				}
@@ -235,13 +235,13 @@ func bindBackendTestPhysicalExecutors(
 			return buildOperation(runner, subject)
 		},
 		runOperationSubstrate,
-		func(ctx context.Context, subject shared.OperationPhysicalSubject) (shared.OperationPhysicalEvidence, error) {
+		func(ctx context.Context, subject shared.OperationPhysicalSubject, finding startupFailure) (shared.OperationPhysicalEvidence, error) {
 			if projection, seeded := state.projection(subject.OperationID()); seeded {
 				return shared.NewOperationTargetReady(
 					subject, projection.containerIDs, projection.serviceContainers,
 				)
 			}
-			return b.classifyOperationPhysical(ctx, subject)
+			return b.classifyOperationFinding(ctx, subject, finding)
 		},
 	)
 	if err != nil {

@@ -25,7 +25,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
@@ -334,58 +333,36 @@ func claimLeaseActorRecoveryQuiescence(
 	return claim
 }
 
-// recoverStartedProvisionFailure proves the operation-scoped ambiguity
-// contract before waiting for the production periodic recovery lane. The
-// command fence and actor recovery claim are the causal barrier: a missing
-// callback and durable Started intent cannot be observed ahead of the worker's
-// terminal handoff or consumed concurrently by the scheduler.
-func recoverStartedProvisionFailure(
+// awaitDefiniteStartupFailure waits for the definite startup failure the
+// provision worker publishes itself (ENG-1125): no recovery pass and no
+// operation deadline are involved. The operation settles, the attempt leaves
+// no container, and the projection is Failed with the curated surface.
+func awaitDefiniteStartupFailure(
 	t *testing.T,
 	b *Backend,
 	callbackCh <-chan backend.CallbackPayload,
 	leaseUUID string,
-	callbackURL string,
+	wantReason backend.Reason,
+	wantMessage string,
 ) backend.CallbackPayload {
 	t.Helper()
-	// Provision has returned after admission, while the mutation worker remains
-	// asynchronous. Reserve this exact lease from periodic recovery before
-	// waiting for that worker's terminal handoff.
-	unlockCommand := b.commandFence.Lock(leaseUUID)
-	defer unlockCommand()
-	quiescence := claimLeaseActorRecoveryQuiescence(t, b, leaseUUID, provisionFlowTimeout)
-	defer quiescence.Release()
-
-	intents, err := b.operationSettlement.ListOperationIntents()
+	cb := waitForCallback(t, callbackCh, leaseUUID, 90*time.Second)
+	require.Equal(t, backend.CallbackStatusFailed, cb.Status)
+	require.Equal(t, wantMessage, cb.Error)
+	require.Eventually(t, func() bool {
+		intents, err := b.operationSettlement.ListOperationIntents()
+		return err == nil && len(intents) == 0
+	}, 30*time.Second, 100*time.Millisecond, "the failed operation settles durably")
+	containers, err := b.docker.ListManagedContainers(context.Background())
 	require.NoError(t, err)
-	require.Len(t, intents, 1, "the ambiguous operation must retain exact recovery evidence")
-	intent := intents[0]
-	require.Equal(t, leaseUUID, intent.LeaseUUID())
-	require.Equal(t, callbackURL, intent.CallbackURL())
-	require.Equal(t, shared.OperationExecutionStarted, intent.ExecutionPhase())
-	require.NoError(t, b.terminalStorageAuthorityError(),
-		"operation-local ambiguity must not withdraw the whole backend")
-	select {
-	case callback := <-callbackCh:
-		t.Fatalf("unexpected callback before exact recovery: %+v", callback)
-	default:
+	for _, container := range containers {
+		require.NotEqual(t, leaseUUID, container.LeaseUUID, "the attempt was rolled back exactly")
 	}
-
-	// Release both capabilities and let the backend's ordinary scheduler observe
-	// the durable operation. The computed visibility deadline bounds how long
-	// that production lane may conservatively defer an ambiguous Started intent;
-	// unit coverage pins the precise before/after-deadline classification.
-	deadline := provisionIntentRecoveryDeadline(intent.CreatedAt(), time.Now(), b.cfg.ProvisionTimeout)
-	wait := time.Until(deadline) + 2*b.cfg.ReconcileInterval + 30*time.Second
-	if wait < 30*time.Second {
-		wait = 30 * time.Second
-	}
-	quiescence.Release()
-	unlockCommand()
-	callback := waitForCallback(t, callbackCh, leaseUUID, wait)
-	intents, err = b.operationSettlement.ListOperationIntents()
-	require.NoError(t, err)
-	require.Empty(t, intents, "exact recovery must settle the durable operation intent")
-	return callback
+	prov := getProvisionInfo(t, b, leaseUUID)
+	require.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	require.Equal(t, wantReason, prov.Reason)
+	require.Equal(t, wantMessage, prov.Message)
+	return cb
 }
 
 func TestIntegration_Docker_ProvisionLifecycle(t *testing.T) {
@@ -984,11 +961,9 @@ func TestIntegration_Docker_ImmediateExit(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.ContainerReadonlyRootfs = ptrBool(false) // busybox "false" needs no tmpfs
-		// A startup failure after Compose has run is deliberately ambiguous until
-		// the operation visibility horizon expires. Keep that production policy
-		// bounded in this integration fixture.
-		cfg.ProvisionTimeout = 5 * time.Second
-		cfg.ReconcileInterval = time.Second
+		// The worker settles a startup exit definitely (ENG-1125): no
+		// operation deadline or recovery pass is needed.
+		cfg.ProvisionTimeout = 10 * time.Minute
 	})
 
 	ctx := context.Background()
@@ -1014,12 +989,11 @@ func TestIntegration_Docker_ImmediateExit(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// The worker detects the exit and cleans up, then exact recovery proves
-	// exact absence after the visibility horizon and publishes the failure.
-	cb := recoverStartedProvisionFailure(t, b, callbackCh, leaseUUID, callbacks.operationURL)
+	// The worker detects the exit, rolls the attempt back exactly, and the
+	// actor publishes the definite failure.
+	cb := awaitDefiniteStartupFailure(t, b, callbackCh, leaseUUID,
+		backend.ReasonContainerExited, backend.MsgContainerExitedDuringStartup)
 	assert.Equal(t, leaseUUID, cb.LeaseUUID)
-	assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
-	assert.NotEmpty(t, cb.Error)
 }
 
 func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
@@ -1028,7 +1002,6 @@ func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.ProvisionTimeout = 15 * time.Second // short, to avoid slow test
-		cfg.ReconcileInterval = time.Second
 	})
 
 	ctx := context.Background()
@@ -1060,10 +1033,14 @@ func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	cb := recoverStartedProvisionFailure(t, b, callbackCh, leaseUUID, callbacks.operationURL)
+	// Docker reports the container unhealthy after one failed check: a
+	// definite failure that never counts (ENG-1125).
+	cb := awaitDefiniteStartupFailure(t, b, callbackCh, leaseUUID,
+		backend.ReasonHealthCheckFailed, backend.MsgContainerUnhealthy)
 	assert.Equal(t, leaseUUID, cb.LeaseUUID)
-	assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
-	assert.NotEmpty(t, cb.Error)
+	budget := getProvisionInfo(t, b, leaseUUID).TerminalBudget
+	require.NotNil(t, budget)
+	assert.Zero(t, budget.ConsecutiveFailures, "a health check that never passed never counts")
 }
 
 func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
@@ -3086,7 +3063,6 @@ func TestIntegration_Stack_HealthCheckFailure(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.ProvisionTimeout = 15 * time.Second
-		cfg.ReconcileInterval = time.Second
 	})
 
 	ctx := context.Background()
@@ -3125,8 +3101,8 @@ func TestIntegration_Stack_HealthCheckFailure(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	cb := recoverStartedProvisionFailure(t, b, callbackCh, leaseUUID, callbacks.operationURL)
-	assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
+	awaitDefiniteStartupFailure(t, b, callbackCh, leaseUUID,
+		backend.ReasonHealthCheckFailed, backend.MsgContainerUnhealthy)
 }
 
 func TestIntegration_Stack_DependsOn(t *testing.T) {

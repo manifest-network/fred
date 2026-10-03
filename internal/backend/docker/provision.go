@@ -485,12 +485,12 @@ type volumeOwnerEntry struct {
 // detectVolumeOwnerCached returns the detected volume owner for an image,
 // using the cache keyed by image ID. On error, logs a warning and returns
 // (0, 0) without caching so the next call retries (transient errors
-// self-heal). Successful results are cached permanently since image IDs
-// are immutable content-addressable digests.
-func (b *Backend) detectVolumeOwnerCached(mutations *storageMutations, ctx context.Context, imageName imageexec.Image, volumePaths []string) (uid, gid int) {
+// self-heal); detected is then false. Successful results are cached
+// permanently since image IDs are immutable content-addressable digests.
+func (b *Backend) detectVolumeOwnerCached(mutations *storageMutations, ctx context.Context, imageName imageexec.Image, volumePaths []string) (uid, gid int, detected bool) {
 	if v, ok := b.volumeOwnerCache.Load(imageName.ID()); ok {
 		if entry, ok := v.(volumeOwnerEntry); ok {
-			return entry.UID, entry.GID
+			return entry.UID, entry.GID, true
 		}
 	}
 
@@ -498,29 +498,30 @@ func (b *Backend) detectVolumeOwnerCached(mutations *storageMutations, ctx conte
 	if err != nil {
 		b.logger.Warn("failed to detect volume owner, defaulting to root (not cached)",
 			"image", imageName.Reference(), "error", err)
-		return 0, 0
+		return 0, 0, false
 	}
 
 	b.volumeOwnerCache.Store(imageName.ID(), volumeOwnerEntry{UID: detectedUID, GID: detectedGID})
-	return detectedUID, detectedGID
+	return detectedUID, detectedGID, true
 }
 
 // detectWritablePathsCached reuses detection only for the same immutable image
-// and runtime UID. Errors remain uncached so the next setup can retry.
-func (b *Backend) detectWritablePathsCached(mutations *storageMutations, ctx context.Context, detection writablePathDetection) []string {
+// and runtime UID. Errors remain uncached so the next setup can retry;
+// detected is then false.
+func (b *Backend) detectWritablePathsCached(mutations *storageMutations, ctx context.Context, detection writablePathDetection) (paths []string, detected bool) {
 	if paths, found := b.writablePathCache.load(detection); found {
-		return paths
+		return paths, true
 	}
 
 	paths, err := mutations.detectWritablePaths(ctx, detection)
 	if err != nil {
 		b.logger.Warn("failed to detect writable paths, skipping (not cached)",
 			"image", detection.image.Reference(), "error", err)
-		return nil
+		return nil, false
 	}
 
 	b.writablePathCache.store(detection, paths)
-	return paths
+	return paths, true
 }
 
 // imageSetup holds the results of image inspection needed for container creation.
@@ -531,6 +532,10 @@ type imageSetup struct {
 	VolumeUID     int             // UID for volume ownership
 	VolumeGID     int             // GID for volume ownership
 	WritablePaths []string        // auto-detected writable paths for non-root images
+	// Degraded records that a detection failed and setup fell back (root
+	// volume ownership, or no writable-path mounts). The launch is then
+	// degraded: a startup failure after it never counts (ENG-1125).
+	Degraded bool
 }
 
 // setupAdmittedImage resolves users and writable paths only after the complete
@@ -556,7 +561,8 @@ func (b *Backend) setupAdmittedImage(mutations *storageMutations, ctx context.Co
 		// detecting the owner lets us pre-chown host volumes and run as that
 		// user, bypassing the entrypoint's chown+gosu (which requires
 		// CAP_CHOWN that we drop).
-		uid, gid := b.detectVolumeOwnerCached(mutations, ctx, admitted, volumes)
+		uid, gid, detected := b.detectVolumeOwnerCached(mutations, ctx, admitted, volumes)
+		result.Degraded = result.Degraded || !detected
 		if uid != 0 || gid != 0 {
 			result.VolumeUID = uid
 			result.VolumeGID = gid
@@ -573,8 +579,9 @@ func (b *Backend) setupAdmittedImage(mutations *storageMutations, ctx context.Co
 	// container and the results are only used for writable path mounting.
 	if b.cfg.IsReadonlyRootfs() {
 		detection := newWritablePathDetection(admitted, result.VolumeUID)
-		result.WritablePaths = b.detectWritablePathsCached(mutations, ctx, detection)
-		result.WritablePaths = filterSubpaths(result.WritablePaths, result.Volumes)
+		paths, detected := b.detectWritablePathsCached(mutations, ctx, detection)
+		result.Degraded = result.Degraded || !detected
+		result.WritablePaths = filterSubpaths(paths, result.Volumes)
 	}
 
 	return result, nil
@@ -709,13 +716,22 @@ const writablePathSubdir = "_wp"
 // Extraction failures are logged but don't fail the overall operation;
 // paths that fail are simply omitted from the bind map.
 func (b *Backend) setupWritablePathBinds(volume launchVolume, ctx context.Context, image imageexec.Image, writablePaths []string, maxBytes, maxEntries int64) map[string]string {
+	binds, _ := b.seedWritablePathBinds(volume, ctx, image, writablePaths, maxBytes, maxEntries)
+	return binds
+}
+
+// seedWritablePathBinds is setupWritablePathBinds that also reports whether
+// every writable path was seeded. A skipped path leaves the workload on its
+// tmpfs fallback without the image's content there, so the launch is
+// degraded: a startup failure after it never counts (ENG-1125).
+func (b *Backend) seedWritablePathBinds(volume launchVolume, ctx context.Context, image imageexec.Image, writablePaths []string, maxBytes, maxEntries int64) (binds map[string]string, complete bool) {
 	if len(writablePaths) == 0 {
-		return nil
+		return nil, true
 	}
 	hostVolumePath, err := volume.rootPath()
 	if err != nil {
 		b.logger.Warn("writable path volume authority is unavailable", "error", err)
-		return nil
+		return nil, false
 	}
 
 	wpDir := filepath.Join(hostVolumePath, writablePathSubdir)
@@ -728,7 +744,7 @@ func (b *Backend) setupWritablePathBinds(volume launchVolume, ctx context.Contex
 	failures, authErr := volume.extractImageContent(ctx, image, writablePaths, maxBytes, maxEntries)
 	if authErr != nil {
 		b.logger.Warn("failed to authorize writable path extraction", "error", authErr)
-		return nil
+		return nil, false
 	}
 
 	// The bind Source below is mounted read-write into the container and Docker
@@ -745,24 +761,27 @@ func (b *Backend) setupWritablePathBinds(volume launchVolume, ctx context.Contex
 		// is safe — nothing was extracted, so no Source exists to be a symlink.
 		b.logger.Warn("cannot open writable-path root for confinement checks; skipping all writable-path binds",
 			"path", wpDir, "image", image.Reference(), "error", rootErr)
-		return nil
+		return nil, false
 	}
 	if wpRoot != nil {
 		defer func() { _ = wpRoot.Close() }()
 	}
 
-	binds := make(map[string]string, len(writablePaths))
+	binds = make(map[string]string, len(writablePaths))
+	complete = true
 	for _, wp := range writablePaths {
 		if failures != nil {
 			if pathErr, ok := failures[wp]; ok {
 				b.logger.Warn("failed to extract writable path content",
 					"path", wp, "image", image.Reference(), "error", pathErr)
+				complete = false
 				continue
 			}
 		}
 		sanitized := sanitizeVolumePath(wp)
 		if sanitized == "" {
 			b.logger.Warn("writable path rejected by sanitization", "path", wp, "image", image.Reference())
+			complete = false
 			continue
 		}
 		if wpRoot != nil {
@@ -775,17 +794,19 @@ func (b *Backend) setupWritablePathBinds(volume launchVolume, ctx context.Contex
 			case lerr == nil && info.Mode()&fs.ModeSymlink != 0:
 				b.logger.Warn("writable-path bind source is a symlink; skipping to prevent host escape",
 					"path", wp, "image", image.Reference())
+				complete = false
 				continue
 			case lerr != nil && !errors.Is(lerr, fs.ErrNotExist):
 				b.logger.Warn("writable-path bind source failed confinement check; skipping",
 					"path", wp, "image", image.Reference(), "error", lerr)
+				complete = false
 				continue
 			}
 		}
 		binds[filepath.Join(wpDir, sanitized)] = wp
 	}
 
-	return binds
+	return binds, complete
 }
 
 // setupVolBinds creates volume bind mounts for all services/instances of a stack.
@@ -835,6 +856,7 @@ func (b *Backend) setupVolBinds(
 						return nil, createdVolumeIDs, fmt.Errorf("volume creation failed (service %s, instance %d): %w", svcName, i, volErr)
 					}
 					logger.Warn("writable path content seeding unavailable (volume creation failed)", "service", svcName, "error", volErr)
+					mutations.degraded = true
 					continue
 				}
 				if volume.wasCreated() {
@@ -849,7 +871,12 @@ func (b *Backend) setupVolBinds(
 					}
 				}
 				if needsWritableVolume {
-					binds.WritableBinds = b.setupWritablePathBinds(volume, ctx, imgSetup.Image, imgSetup.WritablePaths, sizeMB*1024*1024, inodeHardLimit(sizeMB, b.cfg.GetMinAvgFileBytes()))
+					var seeded bool
+					binds.WritableBinds, seeded = b.seedWritablePathBinds(volume, ctx, imgSetup.Image, imgSetup.WritablePaths, sizeMB*1024*1024, inodeHardLimit(sizeMB, b.cfg.GetMinAvgFileBytes()))
+					if !seeded {
+						// The launch proceeds on the tmpfs fallback (ENG-1125).
+						mutations.degraded = true
+					}
 				}
 				if volBinds[svcName] == nil {
 					volBinds[svcName] = make(map[int]serviceVolBinds)
@@ -876,6 +903,12 @@ func (e *physicalOperationError) Unwrap() error { return e.cause }
 // operation settlement. It never writes release/callback state; the exhaustive
 // classifier mints evidence and the actor-facing handler consumes that evidence
 // through CommitOperationSuccess/Failure after this function returns.
+//
+// A container that positively fails startup after a settled launch ends the
+// attempt definitely (ENG-1125): the attempt is rolled back exactly and the
+// workflow reports the failure as its finding with a nil error. Every other
+// failure returns its error, which leaves the attempt Ambiguous for recovery
+// once any effect was entered.
 func (b *Backend) doProvisionPhysical(
 	mutations *storageMutations,
 	ctx context.Context,
@@ -883,31 +916,39 @@ func (b *Backend) doProvisionPhysical(
 	stack *manifest.StackManifest,
 	resourceProfiles []shared.SKUResourceSnapshot,
 	logger *slog.Logger,
-) (errRet error) {
+) (finding startupFailure, errRet error) {
 	if mutations == nil {
-		return errors.New("started provision mutation capability is required")
+		return startupFailure{}, errors.New("started provision mutation capability is required")
 	}
 	if err := b.prepareProvisionProjection(mutations, ctx, req, stack, resourceProfiles, logger); err != nil {
-		return err
+		return startupFailure{}, err
 	}
 	profiles, profileErr := resourceProfileMap(req.Items, resourceProfiles)
 	if profileErr != nil {
-		return &physicalOperationError{callback: "validate resource profiles", reason: backend.ReasonInternal,
+		return startupFailure{}, &physicalOperationError{callback: "validate resource profiles", reason: backend.ReasonInternal,
 			cause: fmt.Errorf("validate provision resource profiles: %w", profileErr)}
 	}
 	// failure is the attempt's failure with its curated surface, authored at the
 	// failure site (ENG-508). No site inherits another's reason: an unset
 	// surface is Internal, and only an observed exit is ContainerExited.
 	var failure *physicalOperationError
-	// launchSettled records that every Compose Create and Start got a final
+	// launch is the receipt that every Compose Create and Start got a final
 	// daemon response and the launch journal settled: no container of this
 	// attempt can still appear late.
-	launchSettled := false
+	var launch settledLaunch
 	provisionStart := time.Now()
 	projectName := composeProjectName(req.LeaseUUID)
 	defer func() {
 		provisionDurationSeconds.Observe(time.Since(provisionStart).Seconds())
-		if failure == nil {
+		switch {
+		case finding.present():
+			// Rolled back exactly; the classifier decides whether it is definite.
+			logger.Error("stack provision failed during startup and was rolled back",
+				"lease_uuid", req.LeaseUUID, "container_id", leasesm.ShortID(finding.state.container.id))
+			provisionsTotal.WithLabelValues("failure").Inc()
+			updateResourceMetrics(b.pool.Stats())
+			return
+		case failure == nil:
 			provisionsTotal.WithLabelValues("success").Inc()
 			if b.diagnosticsStore != nil {
 				if delErr := b.diagnosticsStore.Delete(req.LeaseUUID); delErr != nil {
@@ -919,8 +960,8 @@ func (b *Backend) doProvisionPhysical(
 		}
 		logger.Error("stack provision failed", "lease_uuid", req.LeaseUUID, "error", failure)
 		provisionsTotal.WithLabelValues("failure").Inc()
-		errRet = failure
-		if mutations.effectEntered() && !launchSettled {
+		errRet = errors.Join(failure, errRet)
+		if mutations.effectEntered() && !launch.boundTo(mutations) {
 			// Once any tenant Step was entered, a same-turn cleanup cannot prove a
 			// remote call will not land late. Container cleanup is best effort only;
 			// volumes are deliberately untouched. A late Compose/Create may still
@@ -929,14 +970,14 @@ func (b *Backend) doProvisionPhysical(
 			// Preserve the intent and pool authority for that recovery.
 			cleanupCtx, cleanupCancel := context.WithTimeout(b.stopCtx, 30*time.Second)
 			defer cleanupCancel()
-			errRet = errors.Join(failure, b.cleanupFailedOperationTargets(cleanupCtx, mutations, mutations.operationSubject, failure))
+			errRet = errors.Join(errRet, b.cleanupFailedOperationTargets(cleanupCtx, mutations, mutations.operationSubject, failure))
 		}
-		// After a settled launch the attempt's cohort is kept as it is. A
-		// container that exited or is unhealthy is positive evidence, and
-		// recovery settles the operation from it in one pass (ENG-1125); removing
-		// it would leave only an empty inventory, which recovery must wait out to
-		// the operation's deadline. The outer failure observer still captures its
-		// logs and this attempt's curated surface.
+		// After a settled launch, an attempt that is not definite keeps its
+		// cohort as it is. A container that exited or is unhealthy is positive
+		// evidence, and recovery settles the operation from it in one pass;
+		// removing it would leave only an empty inventory, which recovery must
+		// wait out to the operation's deadline. The outer failure observer still
+		// captures its logs and this attempt's curated surface.
 		updateResourceMetrics(b.pool.Stats())
 	}()
 
@@ -1012,12 +1053,13 @@ func (b *Backend) doProvisionPhysical(
 	}
 
 	logger.Info("compose up", "project", projectName, "services", len(stack.Services))
-	if upErr := b.launchCompose(ctx, mutations, params, resourceProfiles, composeUpOpts{}); upErr != nil {
+	settled, upErr := b.launchCompose(ctx, mutations, params, resourceProfiles, composeUpOpts{})
+	if upErr != nil {
 		failure = &physicalOperationError{callback: "container creation failed", reason: backend.ReasonInternal,
 			cause: fmt.Errorf("compose up failed: %w", upErr)}
 		return
 	}
-	launchSettled = true
+	launch = settled
 
 	// Discover container IDs via Compose PS.
 	containers, psErr := b.compose.PS(ctx, projectName)
@@ -1039,13 +1081,25 @@ func (b *Backend) doProvisionPhysical(
 		return
 	}
 
-	// Verify startup per-service so each service uses its own health check config.
-	for svcName, svcCIDs := range serviceContainers {
-		svc := stack.Services[svcName]
-		if startupFailure := b.verifyServiceStartup(ctx, svc, svcCIDs, logger.With("service", svcName)); startupFailure != nil {
-			failure = startupFailure
+	// Observe the whole cohort's startup, each service under its own contract.
+	cohort, cohortErr := newStartupCohort(stack, serviceContainers)
+	if cohortErr != nil {
+		failure = startupUnverifiedFailure(cohortErr)
+		return
+	}
+	observation := b.observeStartup(ctx, mutations, launch, cohort, logger)
+	switch observation.kind {
+	case startupObservedReady:
+	case startupObservedFailure:
+		if rollbackErr := b.rollbackStartupFailure(ctx, mutations, observation.failure, logger); rollbackErr != nil {
+			failure, errRet = observation.failure.state.surface, rollbackErr
 			return
 		}
+		finding = observation.failure
+		return
+	default:
+		failure = observation.unverified
+		return
 	}
 
 	logger.Info("all stack containers provisioned and verified", "count", len(containerIDs), "services", len(stack.Services))

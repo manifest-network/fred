@@ -19,8 +19,8 @@ func emptyVolumeLaunchCoordinatorForTest() *volumeLaunchCoordinator {
 		checkNamespace: func(string) error { return nil },
 		pendingCount:   func() (int, error) { return 0, nil },
 		check:          func(shared.VolumeLaunchOrigin, []fsidentity.Identity) error { return nil },
-		compose: func(context.Context, *quiescedVolumes, imageexec.PreparedProject, composeUpOpts) error {
-			return errors.New("full launch requires a real fixture journal")
+		compose: func(context.Context, *quiescedVolumes, imageexec.PreparedProject, composeUpOpts) (settledLaunch, error) {
+			return settledLaunch{}, errors.New("full launch requires a real fixture journal")
 		},
 		source: func(context.Context, *quiescedVolumes, compensationStartup) error {
 			return errors.New("full source launch requires a real fixture journal")

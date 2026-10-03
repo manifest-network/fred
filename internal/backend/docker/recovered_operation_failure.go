@@ -118,14 +118,6 @@ func (b *Backend) publishRecoveredOperationFailure(
 // Failed. Cleanup proved the operation's exact absence before settlement, so no
 // container of the attempt survives and none is published.
 //
-// The durable runtime of a re-provision with an active predecessor Release is
-// that predecessor: its exact runtime identity and topology. Provision
-// admission refuses to replace a lease whose projection's callback pair
-// differs from its active Release, so a Failed projection carrying the failed
-// candidate's pair would refuse every re-provision until the next recovery
-// sweep rebuilt it. Without a predecessor (a first provision, or a restore
-// destination) the durable runtime is the failed claim itself.
-//
 // The failure is never counted against the terminal budget: SetStatus only
 // applies the Ready boundary. FailCount stays a lifetime diagnostic.
 func applyFailedOperationProjection(
@@ -135,6 +127,30 @@ func applyFailedOperationProjection(
 	surface operationFailureSurface,
 	now time.Time,
 ) error {
+	if err := restoreDurableRuntime(p, claim, predecessor); err != nil {
+		return err
+	}
+	p.FailCount++
+	p.SetStatus(backend.ProvisionStatusFailed, now)
+	p.LastError = surface.lastError
+	p.Reason = surface.reason
+	p.Message = surface.message
+	return nil
+}
+
+// restoreDurableRuntime reduces p's runtime identity and topology to the
+// lease's durable runtime once claim failed with no substrate of it left, and
+// publishes no container.
+//
+// The durable runtime of a re-provision with an active predecessor Release is
+// that predecessor: its exact runtime identity and topology. Provision
+// admission refuses to replace a lease whose projection's callback pair
+// differs from its active Release, and recoverState keeps a Failed projection
+// with no containers whole, so a Failed projection carrying the failed
+// candidate's pair would refuse every later re-provision. Without a
+// predecessor (a first provision, or a restore destination) the durable
+// runtime is the failed claim itself.
+func restoreDurableRuntime(p *leasesm.ProvisionState, claim shared.OperationIntentClaim, predecessor *shared.Release) error {
 	if identity, ok := runtimeIdentityForRelease(predecessor); ok && len(predecessor.Items) != 0 {
 		stack, err := manifest.ParseStoredPayload(predecessor.Manifest)
 		if err != nil {
@@ -161,10 +177,5 @@ func applyFailedOperationProjection(
 	}
 	p.ContainerIDs = nil
 	p.ServiceContainers = nil
-	p.FailCount++
-	p.SetStatus(backend.ProvisionStatusFailed, now)
-	p.LastError = surface.lastError
-	p.Reason = surface.reason
-	p.Message = surface.message
 	return nil
 }

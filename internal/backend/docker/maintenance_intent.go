@@ -988,6 +988,18 @@ func maintenanceFailureReason(kind shared.MaintenanceIntentKind) backend.Reason 
 	return backend.ReasonRestartFailed
 }
 
+// maintenanceFailureDetails is a failed replacement's tenant surface: its own
+// reason (RestartFailed, UpdateFailed), unless a failure source authored a
+// more specific one (an update's image pull). A startup observation never
+// does: the replacement path flattens it to a plain error (ENG-1125).
+func maintenanceFailureDetails(kind shared.MaintenanceIntentKind, cause error) (backend.Reason, string) {
+	var physical *physicalOperationError
+	if errors.As(cause, &physical) {
+		return physical.reason, physical.callback
+	}
+	return maintenanceFailureReason(kind), string(kind) + " failed"
+}
+
 func (b *Backend) verifyMaintenanceSourceActive(intent shared.MaintenanceIntentClaim) error {
 	_, current, err := b.maintenanceSettlement.ClaimLatestActive(intent.LeaseUUID())
 	if err != nil {
