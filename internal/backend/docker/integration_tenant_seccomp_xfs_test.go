@@ -19,6 +19,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
+	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/google/uuid"
@@ -153,6 +154,17 @@ func TestIntegration_Docker_XFS_TenantCannotChangeProjectID(t *testing.T) {
 	require.NoError(t, err)
 	args := []string{fmt.Sprint(volume.projID), fmt.Sprint(other.projID)}
 
+	// The probe needs no network. Attach the direct creates to an internal
+	// user-defined network, as fred's own creates do, instead of the default
+	// bridge, which CI runners do not provide.
+	netName := "fred-xfs-probe-" + uuid.NewString()
+	createdNet, err := sdk.NetworkCreate(ctx, netName, networktypes.CreateOptions{Internal: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sdk.NetworkRemove(context.Background(), createdNet.ID) })
+	probeNetwork := func() *networktypes.NetworkingConfig {
+		return &networktypes.NetworkingConfig{EndpointsConfig: map[string]*networktypes.EndpointSettings{netName: {}}}
+	}
+
 	for _, launch := range []string{"default-profile-control", "sdk", "compose"} {
 		t.Run(launch, func(t *testing.T) {
 			dataPath := filepath.Join(volume.path, launch)
@@ -171,7 +183,7 @@ func TestIntegration_Docker_XFS_TenantCannotChangeProjectID(t *testing.T) {
 					CapDrop: []string{"ALL"}, ReadonlyRootfs: true,
 					SecurityOpt: []string{"no-new-privileges:true", "seccomp=" + string(profile)},
 					Mounts:      []mount.Mount{{Type: mount.TypeBind, Source: dataPath, Target: "/data"}},
-				}, nil, nil, "fred-xfs-control-"+uuid.NewString())
+				}, probeNetwork(), nil, "fred-xfs-control-"+uuid.NewString())
 				require.NoError(t, err)
 				id = created.ID
 			case "sdk":
@@ -179,6 +191,7 @@ func TestIntegration_Docker_XFS_TenantCannotChangeProjectID(t *testing.T) {
 					Image: admitted, LeaseUUID: uuid.NewString(), ServiceName: "app", User: "10000:10000",
 					Manifest:       &manifest.Manifest{Image: tag, Command: []string{"/probe"}, Args: args},
 					ReadonlyRootfs: true, TmpfsSizeMB: 1, VolumeBinds: map[string]string{dataPath: "/data"},
+					NetworkConfig: probeNetwork(),
 				}, 30*time.Second)
 				require.NoError(t, err)
 			case "compose":
