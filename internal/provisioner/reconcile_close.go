@@ -12,12 +12,22 @@ import (
 )
 
 // Closing an ACTIVE lease on chain cannot be undone and stops a paying
-// tenant. closeActiveLeaseOnChain, the raw chain sink, is called only from
-// this file: a forbidigo rule (`\.closeActiveLeaseOnChain$`) excludes this
-// file alone. Each wrapper below is one closing reason with its own evidence,
-// so a new code path cannot close a lease with an arbitrary reason or without
-// that evidence. The failure-budget close takes the sealed terminalverdict
-// proof end to end (ENG-799).
+// tenant. The reconciler's close sinks, closeActiveLeaseOnChain and the
+// reconciliation authority's CloseObserved below it, are called only from this
+// file: the forbidigo rules tagged [raw-lease-close] exclude this file alone,
+// and the hops below CloseObserved (the bound control plane's closeLease and
+// the chain client's CloseLeases) are pinned to their own adapters
+// ([placement-lease-close], [chain-lease-close]). Package provisioner can
+// therefore close a lease only through one of the wrappers below, one per
+// closing reason:
+//
+//   - closeExhaustedLease takes the sealed terminalverdict proof end to end
+//     (ENG-799);
+//   - closeLostLease takes no proof of its own: its fixed reason names no
+//     backend, and its callers hold the action observed under the lost-lease
+//     lifecycle claim;
+//   - closeRefusedLease still forwards the reason its caller derived from the
+//     backend's sealed refusal; typing that proof is ENG-800.
 
 // closeActiveLeaseOnChain closes an ACTIVE lease on chain with a reason. Only
 // the typed wrappers in this file may call it.
