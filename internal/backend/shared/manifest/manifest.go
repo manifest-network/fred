@@ -207,6 +207,26 @@ type HealthCheckConfig struct {
 	StartPeriod HealthDuration `json:"start_period,omitzero"`
 }
 
+// healthTiming is one HealthDuration field of HealthCheckConfig, named by its
+// JSON tag.
+type healthTiming struct {
+	field string
+	value HealthDuration
+}
+
+// timings lists every HealthDuration field of h. It is the single source
+// Validate bounds at admission; TestHealthCheckTimingsCoverEveryHealthDuration
+// fails if a HealthDuration field is added to HealthCheckConfig without being
+// listed here, so no timing can reach translation's Override mapping without
+// first being rejected at admission when out of range (ENG-1127).
+func (h *HealthCheckConfig) timings() []healthTiming {
+	return []healthTiming{
+		{"interval", h.Interval},
+		{"timeout", h.Timeout},
+		{"start_period", h.StartPeriod},
+	}
+}
+
 // HealthDuration is one health_check timing field (interval, timeout,
 // start_period). It has no exported constructor: only JSON decoding produces
 // one, and the zero value means "not set".
@@ -222,8 +242,8 @@ type HealthCheckConfig struct {
 type HealthDuration struct {
 	// wire is the value as decoded. It is kept so a stored manifest re-encodes
 	// byte-identically (historical replay compares canonical JSON, ENG-1050) and
-	// so admission can name the rejected input. Only Override, MarshalJSON and
-	// admissionError read it.
+	// so admission can name the rejected input. Only UnmarshalJSON sets it;
+	// Override, IsZero, MarshalJSON and admissionError read it.
 	wire time.Duration
 }
 
@@ -1070,12 +1090,7 @@ func (h *HealthCheckConfig) Validate() error {
 		return fmt.Errorf("retries cannot be negative")
 	}
 
-	for _, timing := range []struct {
-		field string
-		value HealthDuration
-	}{
-		{"interval", h.Interval}, {"timeout", h.Timeout}, {"start_period", h.StartPeriod},
-	} {
+	for _, timing := range h.timings() {
 		if err := timing.value.admissionError(timing.field); err != nil {
 			return err
 		}

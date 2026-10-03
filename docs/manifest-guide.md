@@ -574,7 +574,7 @@ Submits a new manifest for an already-provisioned lease. The body is a JSON obje
 
 Duration fields accept two formats:
 
-1. **Go duration strings** — human-readable: `"30s"`, `"1m30s"`, `"500ms"`, `"2h"`, `"100us"`
+1. **Go duration strings** — human-readable: `"30s"`, `"1m30s"`, `"500ms"`, `"2h"`, `"1500us"`
 2. **Integer nanoseconds** — e.g., `30000000000` for 30 seconds
 
 Go duration strings support these units: `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`.

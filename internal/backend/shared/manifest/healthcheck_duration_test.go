@@ -3,6 +3,10 @@ package manifest
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
+	"reflect"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,13 +44,73 @@ func healthTimingCases() []healthTimingCase {
 	}
 }
 
+// healthDurationValues returns every HealthDuration field of hc keyed by its
+// JSON name, found by reflection rather than by HealthCheckConfig.timings, so
+// a field missing from timings is still seen here.
+func healthDurationValues(t *testing.T, hc *HealthCheckConfig) map[string]HealthDuration {
+	t.Helper()
+	timingType := reflect.TypeFor[HealthDuration]()
+	v := reflect.ValueOf(hc).Elem()
+	values := map[string]HealthDuration{}
+	for i := range v.NumField() {
+		f := v.Type().Field(i)
+		if f.Type != timingType {
+			require.NotContains(t, f.Type.String(), timingType.Name(),
+				"field %s wraps HealthDuration; extend HealthCheckConfig.timings and this helper", f.Name)
+			continue
+		}
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		require.NotEmpty(t, name, "field %s needs a JSON name", f.Name)
+		values[name] = v.Field(i).Interface().(HealthDuration)
+	}
+	require.NotEmpty(t, values)
+	return values
+}
+
+// healthDurationFields returns the JSON name of every HealthDuration field of
+// HealthCheckConfig, so the bound tests cover a new timing without a list edit.
+func healthDurationFields(t *testing.T) []string {
+	t.Helper()
+	return slices.Sorted(maps.Keys(healthDurationValues(t, &HealthCheckConfig{})))
+}
+
+// Admission's timing bound reads HealthCheckConfig.timings. Every
+// HealthDuration field must be listed there under its JSON name and paired with
+// its own value; otherwise a new timing would get Override's default mapping in
+// translation without being rejected at admission (ENG-1127).
+func TestHealthCheckTimingsCoverEveryHealthDuration(t *testing.T) {
+	fields := healthDurationFields(t)
+	wire := map[string]any{"test": []string{"CMD", "true"}}
+	for i, field := range fields {
+		wire[field] = fmt.Sprintf("%ds", i+1) // distinct, so a crossed pairing shows
+	}
+	encoded, err := json.Marshal(wire)
+	require.NoError(t, err)
+	var hc HealthCheckConfig
+	require.NoError(t, json.Unmarshal(encoded, &hc))
+
+	listed := map[string]HealthDuration{}
+	for _, timing := range hc.timings() {
+		_, dup := listed[timing.field]
+		require.False(t, dup, "%s listed twice", timing.field)
+		listed[timing.field] = timing.value
+	}
+	assert.Equal(t, healthDurationValues(t, &hc), listed)
+
+	for _, field := range fields {
+		_, err := ParsePayload(healthTimingPayload(field, `"-1s"`))
+		require.Error(t, err, "%s must be bounded at admission", field)
+		assert.ErrorContains(t, err, "invalid health_check: "+field+" must")
+	}
+}
+
 func healthTimingPayload(field, wire string) []byte {
 	return fmt.Appendf(nil, `{"services":{"web":{"image":"nginx:1","health_check":{"test":["CMD","true"],%q:%s}}}}`, field, wire)
 }
 
 func TestHealthDurationAdmissionBounds(t *testing.T) {
 	require.Equal(t, time.Millisecond, container.MinimumDuration, "the bound is Docker's own constant")
-	for _, field := range []string{"interval", "timeout", "start_period"} {
+	for _, field := range healthDurationFields(t) {
 		for _, tc := range healthTimingCases() {
 			t.Run(field+"/"+tc.name, func(t *testing.T) {
 				payload := healthTimingPayload(field, tc.wire)
@@ -71,15 +135,13 @@ func TestHealthDurationAdmissionBounds(t *testing.T) {
 // compares canonical JSON), and reads them only through Override, which never
 // yields a value Docker would refuse.
 func TestHealthDurationStoredHistoryDecodesAndMapsSafely(t *testing.T) {
-	for _, field := range []string{"interval", "timeout", "start_period"} {
+	for _, field := range healthDurationFields(t) {
 		for _, tc := range healthTimingCases() {
 			t.Run(field+"/"+tc.name, func(t *testing.T) {
 				stack, err := ParseStoredPayload(healthTimingPayload(field, tc.wire))
 				require.NoError(t, err, "stored history must not reapply current admission")
 				hc := stack.Services["web"].HealthCheck
-				timing := map[string]HealthDuration{
-					"interval": hc.Interval, "timeout": hc.Timeout, "start_period": hc.StartPeriod,
-				}[field]
+				timing := healthDurationValues(t, hc)[field]
 
 				value, ok := timing.Override()
 				assert.Equal(t, tc.override, value)

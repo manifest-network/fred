@@ -261,7 +261,7 @@
       }
     },
     "HealthCheckDuration": {
-      "description": "Health check timing: 0 (or omitted) uses the image's or Docker's default; any other value must be at least 1ms (Docker's minimum). Negative values are rejected. Integer nanoseconds and integer single-unit strings are range-checked exactly by the schema. Fractional and compound forms (e.g., \"1.5ms\", \"1m30s\") pass the schema and are range-validated at admission.",
+      "description": "Health check timing: 0 (or omitted) uses the image's or Docker's default; any other value must be at least 1ms (Docker's minimum). Negative values are rejected. For integer nanoseconds and integer single-unit strings the schema checks only that lower bound; admission also rejects values that overflow a 64-bit nanosecond count and number literals that are not plain integers (e.g., 1e6). Fractional and compound forms (e.g., \"1.5ms\", \"1m30s\") pass the schema and are range-validated at admission.",
       "anyOf": [
         {
           "type": "string",
