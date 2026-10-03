@@ -249,6 +249,195 @@ func TestActiveReprovisionStartupCrashSettlesFailed(t *testing.T) {
 	assert.Equal(t, 1, rebuilt.ObserveTerminalBudget().ConsecutiveFailures)
 }
 
+// A first provision (a PENDING lease, no predecessor) whose container exits
+// during startup verification fails definitely too: the failure callback,
+// which providerd turns into a rejection, carries the curated reason at once,
+// and nothing of the attempt is left.
+func TestFirstProvisionStartupCrashFailsDefinitely(t *testing.T) {
+	const leaseUUID = "0192f1a0-1125-4abc-8def-00000000f1a0"
+	var removed sync.Map
+	mock := &mockDockerClient{
+		PullImageFn: func(context.Context, string, time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 3}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			removed.Store(containerID, true)
+			return nil
+		},
+		ContainerLogsFn: func(context.Context, string, int) (string, error) { return "boom", nil },
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	list := mock.ListManagedContainersFn
+	mock.ListManagedContainersFn = func(ctx context.Context) ([]ContainerInfo, error) {
+		all, err := list(ctx)
+		kept := all[:0]
+		for _, container := range all {
+			if _, gone := removed.Load(container.ContainerID); !gone {
+				kept = append(kept, container)
+			}
+		}
+		return kept, err
+	}
+
+	var mu sync.Mutex
+	var failures []backend.CallbackPayload
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload backend.CallbackPayload
+		if json.Unmarshal(body, &payload) == nil && payload.Status == backend.CallbackStatusFailed {
+			mu.Lock()
+			failures = append(failures, payload)
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(callbackServer.Close)
+	rebuildCallbackSender(b, callbackServer.Client())
+	b.wg.Go(b.callbackSender.RunReplayLoop)
+
+	req := newProvisionRequest(leaseUUID, "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	req.CallbackURL = testOperationCallbackURL(callbackServer.URL + "/callbacks/provision")
+	require.NoError(t, b.Provision(context.Background(), req))
+	awaitProvisionWorkerQuiescence(t, b, leaseUUID)
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(failures) == 1
+	}, 5*time.Second, 10*time.Millisecond, "the definite failure is published once")
+	mu.Lock()
+	assert.Equal(t, backend.MsgContainerExitedDuringStartup, failures[0].Error)
+	mu.Unlock()
+
+	b.provisionsMu.RLock()
+	failed := recoveredFromProvision(b.provisions[leaseUUID])
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusFailed, failed.Status)
+	assert.Equal(t, backend.ReasonContainerExited, failed.Reason)
+	assert.Empty(t, failed.ContainerIDs)
+	inventory, err := mock.ListManagedContainers(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, inventory, "the attempt was rolled back exactly")
+	require.Eventually(t, func() bool {
+		intents, err := b.operationSettlement.ListOperationIntents()
+		return err == nil && len(intents) == 0
+	}, 5*time.Second, 10*time.Millisecond, "the failed operation settles durably")
+}
+
+// The multi-service window (ENG-1125 added scope), end to end through the
+// provision worker: a service that passed its own startup check and exits
+// while another service still waits for its health check fails the
+// provision definitely, instead of reaching Ready with a dead container.
+func TestStackSiblingExitDuringHealthWaitFailsDefinitely(t *testing.T) {
+	const leaseUUID = "0192f1a0-1125-4abc-8def-00000000f1a1"
+	stack := manifest.StackManifest{Services: map[string]*manifest.Manifest{
+		"web": {Image: "nginx:latest"},
+		"db": {Image: "postgres:16", HealthCheck: &manifest.HealthCheckConfig{
+			Test: []string{"CMD-SHELL", "true"}, Retries: 1,
+		}},
+	}}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+
+	var removed sync.Map
+	var webInspections sync.Map
+	mock := &mockDockerClient{
+		PullImageFn:     func(context.Context, string, time.Duration) error { return nil },
+		ContainerLogsFn: func(context.Context, string, int) (string, error) { return "", nil },
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			removed.Store(containerID, true)
+			return nil
+		},
+	}
+	mock.InspectContainerFn = func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+		inventory, err := mock.ListManagedContainersFn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, listed := range inventory {
+			if listed.ContainerID != containerID {
+				continue
+			}
+			if listed.ServiceName == "db" {
+				return &ContainerInfo{ContainerID: containerID, Status: "running", Health: HealthStatusStarting}, nil
+			}
+			calls, _ := webInspections.LoadOrStore(containerID, new(int))
+			count := calls.(*int)
+			*count++
+			if *count >= 2 {
+				return &ContainerInfo{ContainerID: containerID, Status: "exited", ExitCode: 1}, nil
+			}
+			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+		}
+		return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	list := mock.ListManagedContainersFn
+	mock.ListManagedContainersFn = func(ctx context.Context) ([]ContainerInfo, error) {
+		all, err := list(ctx)
+		kept := all[:0]
+		for _, container := range all {
+			if _, gone := removed.Load(container.ContainerID); !gone {
+				kept = append(kept, container)
+			}
+		}
+		return kept, err
+	}
+	var mu sync.Mutex
+	var failures []backend.CallbackPayload
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload backend.CallbackPayload
+		if json.Unmarshal(body, &payload) == nil && payload.Status == backend.CallbackStatusFailed {
+			mu.Lock()
+			failures = append(failures, payload)
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(callbackServer.Close)
+	rebuildCallbackSender(b, callbackServer.Client())
+	b.wg.Go(b.callbackSender.RunReplayLoop)
+
+	req := backend.ProvisionRequest{
+		LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+		Items: []backend.LeaseItem{
+			{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: testOperationCallbackURL(callbackServer.URL + "/callbacks/provision"),
+		Payload:     payload,
+	}
+	require.NoError(t, b.Provision(context.Background(), req))
+	awaitProvisionWorkerQuiescence(t, b, leaseUUID)
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(failures) == 1
+	}, 10*time.Second, 10*time.Millisecond, "the sibling's exit fails the provision definitely")
+	mu.Lock()
+	assert.Equal(t, backend.MsgContainerExitedDuringStartup, failures[0].Error, "web has no health check of its own")
+	mu.Unlock()
+	b.provisionsMu.RLock()
+	failed := recoveredFromProvision(b.provisions[leaseUUID])
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusFailed, failed.Status, "never Ready with a dead container")
+	assert.Equal(t, backend.ReasonContainerExited, failed.Reason)
+	inventory, err := mock.ListManagedContainers(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, inventory, "both services' containers were removed")
+}
+
 // A startup crash counts only when the live event stream observed the
 // container's whole run with no signal to it, and even then the streak can
 // exhaust only behind the 30-minute floor: a fast outage loop of counted
