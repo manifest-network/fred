@@ -30,6 +30,11 @@ type provisionWorkFailure struct {
 	// startup is the sealed account of a definite startup failure (ENG-1125);
 	// zero for every other provision failure.
 	startup shared.OperationStartupFailure
+	// runtime is the durable runtime the actor restores while it publishes
+	// that startup failure: the attempt moved the projection to its candidate
+	// before launching. Zero for every other provision failure, which never
+	// moved it.
+	runtime DurableRuntime
 }
 
 type provisionWorkAmbiguous struct {
@@ -89,10 +94,14 @@ func NewProvisionWorkFailure(
 // NewProvisionWorkStartupFailure is the worker outcome of a definite startup
 // failure (ENG-1125). Its curated surface and its attribution facts come only
 // from the sealed account the settlement carried out of the guarded execution,
-// so a worker cannot forge either; proof must settle that same operation.
+// so a worker cannot forge either; proof must settle that same operation, and
+// runtime, the lease's durable runtime that the actor restores while it
+// publishes Failed, must have been derived for it too. The worker itself
+// writes nothing to the projection.
 func NewProvisionWorkStartupFailure(
 	outcome shared.OperationExecutionFailure,
 	proof shared.OperationReleaseUncommitted,
+	runtime DurableRuntime,
 ) (ProvisionWorkOutcome, error) {
 	startup, ok := outcome.StartupFailure()
 	if !ok {
@@ -101,6 +110,9 @@ func NewProvisionWorkStartupFailure(
 	if !proof.Valid() || proof.Kind() != shared.OperationIntentProvision ||
 		!outcome.OperationID().Valid() || proof.OperationID() != outcome.OperationID() {
 		return nil, errors.New("startup failure requires the exact provision failure proof of its operation")
+	}
+	if !runtime.awaitedBy(outcome.OperationID()) {
+		return nil, errors.New("startup failure requires the durable runtime of its own operation")
 	}
 	detail := startup.Detail()
 	if detail == "" {
@@ -112,6 +124,7 @@ func NewProvisionWorkStartupFailure(
 		err:         errors.New(detail),
 		proof:       proof,
 		startup:     startup,
+		runtime:     runtime,
 	}, nil
 }
 

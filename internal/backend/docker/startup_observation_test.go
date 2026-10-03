@@ -23,18 +23,20 @@ var (
 	startupPlainService = &manifest.Manifest{Image: "nginx:latest"}
 )
 
-// The live startup state table is total: every Docker status and health value,
-// including empty and unknown ones, has exactly one verdict, and only the
-// workload's own account (an exit, a health verdict) is a failure.
+// The live startup state table is total: every Docker status, health value
+// and member fact, including empty and unknown statuses, has exactly one
+// verdict. Only the workload's own account (an exit, a health verdict) or the
+// daemon's refusal of a Start it was sent is a failure; a member that passed
+// its health check is watched only for its exit.
 func TestClassifyStartupInstance_IsTotal(t *testing.T) {
 	healths := []HealthStatus{HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, HealthStatusNone, "bogus"}
-	want := func(status string, gated bool, health HealthStatus) startupInstanceVerdict {
+	want := func(status string, facts startupMemberFacts, health HealthStatus) startupInstanceVerdict {
 		switch status {
 		case "exited", "EXITED":
 			return startupInstanceExited
 		case "running":
 			switch {
-			case !gated, health == HealthStatusHealthy:
+			case !facts.healthGated, facts.passedHealth, health == HealthStatusHealthy:
 				return startupInstanceReady
 			case health == HealthStatusUnhealthy:
 				return startupInstanceUnhealthy
@@ -42,7 +44,10 @@ func TestClassifyStartupInstance_IsTotal(t *testing.T) {
 				return startupInstancePending
 			}
 		case "created", "restarting", "paused":
-			if gated {
+			if status == "created" && facts.startRefused {
+				return startupInstanceStartRefused
+			}
+			if facts.healthGated {
 				return startupInstancePending
 			}
 			return startupInstanceUnverified
@@ -52,14 +57,20 @@ func TestClassifyStartupInstance_IsTotal(t *testing.T) {
 	}
 	for _, status := range []string{"exited", "EXITED", "running", "created", "restarting", "paused", "removing", "dead", "", "bogus"} {
 		for _, gated := range []bool{false, true} {
-			for _, health := range healths {
-				got := classifyStartupInstance(&ContainerInfo{Status: status, Health: health, ExitCode: 3}, gated)
-				assert.Equal(t, want(status, gated, health), got, "status=%q gated=%v health=%q", status, gated, health)
-				assert.NotZero(t, got)
+			for _, passed := range []bool{false, true} {
+				for _, refused := range []bool{false, true} {
+					facts := startupMemberFacts{healthGated: gated, passedHealth: passed, startRefused: refused}
+					for _, health := range healths {
+						got := classifyStartupInstance(&ContainerInfo{Status: status, Health: health, ExitCode: 3}, facts)
+						assert.Equal(t, want(status, facts, health), got, "status=%q facts=%+v health=%q", status, facts, health)
+						assert.NotZero(t, got)
+					}
+				}
 			}
 		}
 	}
-	assert.Equal(t, startupInstanceUnverified, classifyStartupInstance(nil, true), "no inspection is no fact")
+	assert.Equal(t, startupInstanceUnverified, classifyStartupInstance(nil, startupMemberFacts{healthGated: true}),
+		"no inspection is no fact")
 }
 
 func startupState(status string, health HealthStatus) func(context.Context, string) (*ContainerInfo, error) {
@@ -147,7 +158,7 @@ func TestWatchStartup_AuthorsCuratedSurface(t *testing.T) {
 				}, map[string][]string{"app": {"c1"}})
 				require.NoError(t, err)
 
-				watch := b.watchStartup(ctx, cohort, observeUntil, b.logger)
+				watch := b.watchStartup(ctx, cohort, newStartupMemory(settledLaunch{}), observeUntil, b.logger)
 				assert.Equal(t, tt.wantVerdict, watch.verdict)
 				require.NotNil(t, watch.surface)
 				assert.Equal(t, tt.wantCallback, watch.surface.callback)
@@ -210,7 +221,7 @@ func TestWatchStartup_SiblingExitDuringLaterHealthWait(t *testing.T) {
 		}}, map[string][]string{"db": {"db-1"}, "web": {"web-1"}})
 		require.NoError(t, err)
 
-		watch := b.watchStartup(t.Context(), cohort, time.Time{}, b.logger)
+		watch := b.watchStartup(t.Context(), cohort, newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
 		require.Equal(t, startupVerdictExited, watch.verdict)
 		assert.Equal(t, startupContainer{id: "web-1", service: "web"}, watch.container)
 		assert.Equal(t, backend.MsgContainerExitedDuringStartup, watch.surface.callback)
@@ -236,7 +247,7 @@ func TestWatchStartup_ReadyRequiresOneWholeCohortPass(t *testing.T) {
 		}}, map[string][]string{"svc": {"a", "b"}})
 		require.NoError(t, err)
 
-		watch := b.watchStartup(t.Context(), cohort, time.Time{}, b.logger)
+		watch := b.watchStartup(t.Context(), cohort, newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
 		require.Equal(t, startupVerdictExited, watch.verdict)
 		assert.Equal(t, "a", watch.container.id)
 		assert.Equal(t, backend.MsgContainerExitedDuringHealthCheck, watch.surface.callback)
@@ -255,7 +266,7 @@ func TestWatchStartup_ReadyRequiresOneWholeCohortPass(t *testing.T) {
 		require.NoError(t, err)
 
 		start := time.Now()
-		watch := b.watchStartup(t.Context(), cohort, time.Time{}, b.logger)
+		watch := b.watchStartup(t.Context(), cohort, newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
 		require.Equal(t, startupVerdictReady, watch.verdict)
 		assert.GreaterOrEqual(t, time.Since(start), 3*time.Second,
 			"a fixed-wait container is ready only after its settle period")
@@ -263,6 +274,160 @@ func TestWatchStartup_ReadyRequiresOneWholeCohortPass(t *testing.T) {
 		defer script.mu.Unlock()
 		assert.Equal(t, script.calls["a"], script.calls["b"], "every pass inspects the whole cohort")
 	})
+}
+
+// A health-gated member that reported healthy once is from then on watched
+// only for its exit: a later unhealthy report while a sibling is still
+// starting is a flap, as steady state treats it, not a startup failure. The
+// replacement path shares the rule. An exit after healthy still fails.
+func TestWatchStartup_HealthIsStickyOnceAMemberPassed(t *testing.T) {
+	stack := &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+		"api": startupGatedService, "db": startupGatedService,
+	}}
+	services := map[string][]string{"api": {"api-1"}, "db": {"db-1"}}
+	for _, flap := range []struct {
+		name string
+		api  []ContainerInfo
+	}{
+		{"healthy, unhealthy, healthy", []ContainerInfo{
+			{Status: "running", Health: HealthStatusHealthy},
+			{Status: "running", Health: HealthStatusUnhealthy},
+			{Status: "running", Health: HealthStatusHealthy},
+		}},
+		{"healthy, then unhealthy for good", []ContainerInfo{
+			{Status: "running", Health: HealthStatusHealthy},
+			{Status: "running", Health: HealthStatusUnhealthy},
+		}},
+	} {
+		flapping := func() *Backend {
+			script := &startupScript{calls: make(map[string]int), states: map[string][]ContainerInfo{
+				"api-1": flap.api,
+				"db-1": {
+					{Status: "running", Health: HealthStatusStarting},
+					{Status: "running", Health: HealthStatusStarting},
+					{Status: "running", Health: HealthStatusStarting},
+					{Status: "running", Health: HealthStatusHealthy},
+				},
+			}}
+			return newBackendForTest(&mockDockerClient{
+				InspectContainerFn: script.inspect,
+				ContainerLogsFn:    func(context.Context, string, int) (string, error) { return "", nil },
+			}, nil)
+		}
+		t.Run(flap.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				b := flapping()
+				cohort, err := newStartupCohort(stack, services)
+				require.NoError(t, err)
+				watch := b.watchStartup(t.Context(), cohort, newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
+				require.Equal(t, startupVerdictReady, watch.verdict, "a flap after healthy is not a startup failure")
+			})
+			synctest.Test(t, func(t *testing.T) {
+				b := flapping()
+				require.NoError(t, b.observeReplacementStartup(t.Context(), stack, services, b.logger),
+					"a replacement's watch applies the same rule")
+			})
+		})
+	}
+
+	synctest.Test(t, func(t *testing.T) {
+		script := &startupScript{calls: make(map[string]int), states: map[string][]ContainerInfo{
+			"api-1": {{Status: "running", Health: HealthStatusHealthy}, {Status: "exited", ExitCode: 1}},
+			"db-1":  {{Status: "running", Health: HealthStatusStarting}},
+		}}
+		b := newBackendForTest(&mockDockerClient{
+			InspectContainerFn: script.inspect,
+			ContainerLogsFn:    func(context.Context, string, int) (string, error) { return "", nil },
+		}, nil)
+		cohort, err := newStartupCohort(stack, services)
+		require.NoError(t, err)
+		watch := b.watchStartup(t.Context(), cohort, newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
+		require.Equal(t, startupVerdictExited, watch.verdict, "an exit after healthy still fails")
+		assert.Equal(t, "api-1", watch.container.id)
+	})
+
+	// Without an earlier healthy report, unhealthy fails at once.
+	synctest.Test(t, func(t *testing.T) {
+		script := &startupScript{calls: make(map[string]int), states: map[string][]ContainerInfo{
+			"api-1": {{Status: "running", Health: HealthStatusUnhealthy}},
+			"db-1":  {{Status: "running", Health: HealthStatusStarting}},
+		}}
+		b := newBackendForTest(&mockDockerClient{
+			InspectContainerFn: script.inspect,
+			ContainerLogsFn:    func(context.Context, string, int) (string, error) { return "", nil },
+		}, nil)
+		cohort, err := newStartupCohort(stack, services)
+		require.NoError(t, err)
+		watch := b.watchStartup(t.Context(), cohort, newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
+		require.Equal(t, startupVerdictUnhealthy, watch.verdict)
+	})
+}
+
+// A rejected launch exchange is observed once and fails definitely only on a
+// positive account of one container: an exit wins over an unhealthy report,
+// which wins over a Start the daemon refused on a container that never ran.
+// A created container whose Start the daemon did not refuse, and a running
+// one, show nothing.
+func TestDecideStartupFailure_PrefersTheMostSpecificPositiveFact(t *testing.T) {
+	member := func(id string, gated bool) startupContainer {
+		return startupContainer{id: id, service: id, healthGated: gated}
+	}
+	pass := func(entries ...struct {
+		member startupContainer
+		info   ContainerInfo
+		facts  startupMemberFacts
+	}) startupPass {
+		var p startupPass
+		for _, entry := range entries {
+			info := entry.info
+			info.ContainerID = entry.member.id
+			p.members = append(p.members, entry.member)
+			p.infos = append(p.infos, &info)
+			p.verdicts = append(p.verdicts, classifyStartupInstance(&info, entry.facts))
+		}
+		return p
+	}
+	type entry = struct {
+		member startupContainer
+		info   ContainerInfo
+		facts  startupMemberFacts
+	}
+	refused := entry{member("refused", false), ContainerInfo{Status: "created"}, startupMemberFacts{startRefused: true}}
+	created := entry{member("created", false), ContainerInfo{Status: "created"}, startupMemberFacts{}}
+	running := entry{member("running", false), ContainerInfo{Status: "running"}, startupMemberFacts{}}
+	unhealthy := entry{member("unhealthy", true), ContainerInfo{Status: "running", Health: HealthStatusUnhealthy},
+		startupMemberFacts{healthGated: true}}
+	exited := entry{member("exited", false), ContainerInfo{Status: "exited", ExitCode: 1}, startupMemberFacts{}}
+
+	b := newBackendForTest(&mockDockerClient{
+		ContainerLogsFn: func(context.Context, string, int) (string, error) { return "", nil },
+	}, nil)
+	for _, tt := range []struct {
+		name    string
+		pass    startupPass
+		want    startupVerdict
+		id      string
+		reason  backend.Reason
+		message string
+	}{
+		{"exit wins", pass(refused, unhealthy, exited, running), startupVerdictExited, "exited",
+			backend.ReasonContainerExited, backend.MsgContainerExitedDuringStartup},
+		{"unhealthy over a refused start", pass(refused, unhealthy, running), startupVerdictUnhealthy, "unhealthy",
+			backend.ReasonHealthCheckFailed, backend.MsgContainerUnhealthy},
+		{"a refused start", pass(created, refused, running), startupVerdictStartRefused, "refused",
+			backend.ReasonContainerStartFailed, backend.MsgContainerStartRefused},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			watch, failed := b.decideStartupFailure(t.Context(), tt.pass)
+			require.True(t, failed)
+			assert.Equal(t, tt.want, watch.verdict)
+			assert.Equal(t, tt.id, watch.container.id)
+			assert.Equal(t, tt.reason, watch.surface.reason)
+			assert.Equal(t, tt.message, watch.surface.callback)
+		})
+	}
+	_, failed := b.decideStartupFailure(t.Context(), pass(created, running))
+	assert.False(t, failed, "a created container whose Start was not refused shows nothing")
 }
 
 // A restart or update whose new cohort fails startup keeps its own reason:

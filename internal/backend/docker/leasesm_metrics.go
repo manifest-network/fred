@@ -54,3 +54,9 @@ func (dockerSMMetrics) TerminalEventDropped(event string) {
 func (dockerSMMetrics) LeaseFailureRecorded(cause failurecause.Cause) {
 	leaseFailuresTotal.WithLabelValues(cause.Label()).Inc()
 }
+
+// PendingOperationUnstamped records a provision or restore whose projection
+// could not await its operation (ENG-1125).
+func (dockerSMMetrics) PendingOperationUnstamped() {
+	leasePendingOperationUnstampedTotal.Inc()
+}

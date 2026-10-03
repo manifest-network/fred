@@ -1,16 +1,19 @@
 package testutil
 
 // This repository-level guard pins who may mint the facts that turn a startup
-// crash into a definite provision failure (ENG-1125). The definite path ends
+// failure into a definite provision failure (ENG-1125). The definite path ends
 // a durable attempt, and its attribution can count toward closing a paying
 // lease, so every link of the chain has exactly one producer:
 //
-//   - the settled-launch receipt (newSettledLaunch, and any non-empty
-//     settledLaunch/settledLaunchState literal) only in the launch dispatch,
-//     after the launch's exchange and journal row settled;
-//   - the startup finding (newStartupFailure, and any non-empty
-//     startupFailure/startupFailureState literal) only in observeStartup, from
-//     a failed whole-cohort watch;
+//   - the settled-launch receipt (newSettledLaunch) only in the launch
+//     dispatch, after the launch's exchange and journal row settled;
+//   - the startup finding (newStartupFailure) only where an observation seals
+//     its watch (startupObservationOf), and the two observations only in the
+//     provision workflow;
+//   - the conclusion (concludeStartupFailure) only in the provision workflow,
+//     and it alone accepts a finding (acceptStartupFailure), admits a rollback
+//     (admitStartupRollback) and rolls back (rollbackStartupFailure), in that
+//     order;
 //   - the sealed shared account (shared.NewOperationStartupFailure) only in
 //     newStartupFailure, and the classifier evidence
 //     (shared.NewOperationStartupFailed) only in confirmStartupFailure, after
@@ -20,11 +23,19 @@ package testutil
 //     (markLiveDeathStream) by the loop around its reader, never by the reader
 //     itself, which may wait on nothing but its stream (ENG-799); read only
 //     by newStartupFailure (awaitLiveDeath) and the Ready-entry re-dispatch
-//     (takeLiveDeaths); and its fields named only in its own file.
+//     (takeLiveDeaths); reached through b.liveDeaths only by those four entry
+//     points; and its fields and unexported helpers named only in its own
+//     file.
 //
-// The zero values of these types are invalid by construction (a nil state),
-// so only the constructors and literals above need confining. Every rule is
-// proven to fire by TestStartupFailureAuthorityGuardsFire.
+// A zero receipt, finding or plan is invalid (a nil state), but a valid one
+// could still be forged in its package from a state value. So the state types
+// themselves (settledLaunchState, startupFailureState, startupRollbackState,
+// and package shared's operationStartupFailureState and
+// operationStartupFailedState) are named only at their declaration and in
+// their one constructor, which rules out a literal, new(), a type alias or an
+// elided literal anywhere else. Package shared's startup evidence and failure
+// kinds are named only where they are declared, minted and matched. Every rule
+// is proven to fire by TestStartupFailureAuthorityGuardsFire.
 
 import (
 	"fmt"
@@ -45,18 +56,29 @@ const (
 	startupFailureFile         = "internal/backend/docker/startup_failure.go"
 	startupObservationFile     = "internal/backend/docker/startup_observation.go"
 	settledLaunchFile          = "internal/backend/docker/settled_launch.go"
+	provisionFile              = "internal/backend/docker/provision.go"
 	launchDispatchFile         = "internal/backend/docker/storage_mutation_guard.go"
 	liveDeathLedgerFile        = "internal/backend/docker/live_death_ledger.go"
 	sharedStartupFailureFile   = "internal/backend/shared/operation_startup_failure.go"
+	sharedHandoffFile          = "internal/backend/shared/operation_handoff.go"
+	sharedPhysicalOutcomeFile  = "internal/backend/shared/physical_outcome.go"
 	startupFailureConfirmSite  = "Backend.confirmStartupFailure"
 	startupFailureMintSite     = "Backend.newStartupFailure"
-	startupObservationSite     = "Backend.observeStartup"
+	startupObservationSealSite = "Backend.startupObservationOf"
+	startupConclusionSite      = "Backend.concludeStartupFailure"
+	startupRollbackAdmitSite   = "Backend.admitStartupRollback"
+	provisionWorkflowSite      = "Backend.doProvisionPhysical"
 	settledLaunchMintSite      = "newSettledLaunch"
 	launchDispatchSite         = "newVolumeLaunchCoordinator"
 	startupDeathRedispatchSite = "Backend.redispatchStartupDeaths"
 	liveDeathRecorderSite      = "Backend.recordLiveContainerDeaths"
 	liveDeathStreamMarkSite    = "Backend.runContainerEventLoop"
 )
+
+// typeSite and valueSite name one top-level declaration as a site: a type
+// declaration by its type, and a const or var declaration by its first name.
+func typeSite(file, name string) attributionSite  { return attributionSite{file, "type " + name} }
+func valueSite(file, name string) attributionSite { return attributionSite{file, "value " + name} }
 
 // startupAuthorityRule confines one name to its sites. A name declared by a
 // function is also allowed at its own declaration.
@@ -69,7 +91,13 @@ type startupAuthorityRule struct {
 // Unqualified names inside internal/backend/docker.
 var dockerStartupRules = []startupAuthorityRule{
 	{"newSettledLaunch", []attributionSite{{launchDispatchFile, launchDispatchSite}}, "the settled-launch receipt"},
-	{"newStartupFailure", []attributionSite{{startupObservationFile, startupObservationSite}}, "the startup finding"},
+	{"newStartupFailure", []attributionSite{{startupObservationFile, startupObservationSealSite}}, "the startup finding"},
+	{"observeStartup", []attributionSite{{provisionFile, provisionWorkflowSite}}, "a provision's startup observation"},
+	{"observeRejectedLaunch", []attributionSite{{provisionFile, provisionWorkflowSite}}, "a provision's startup observation"},
+	{"concludeStartupFailure", []attributionSite{{provisionFile, provisionWorkflowSite}}, "the startup conclusion"},
+	{"acceptStartupFailure", []attributionSite{{startupFailureFile, startupConclusionSite}}, "a startup finding's acceptance"},
+	{"admitStartupRollback", []attributionSite{{startupFailureFile, startupConclusionSite}}, "a startup rollback's admission"},
+	{"rollbackStartupFailure", []attributionSite{{startupFailureFile, startupConclusionSite}}, "a startup rollback"},
 	{"recordLiveDeath", []attributionSite{{terminalBudgetEventsFile, liveDeathRecorderSite}}, "a live-death ledger write"},
 	{"markLiveDeathStream", []attributionSite{{terminalBudgetEventsFile, liveDeathStreamMarkSite}}, "a live-death ledger write"},
 	{"awaitLiveDeath", []attributionSite{{startupFailureFile, startupFailureMintSite}}, "a live-death ledger read"},
@@ -85,14 +113,64 @@ var sharedStartupRules = []startupAuthorityRule{
 // Non-empty literals of these docker types are minted only by their
 // constructors.
 var startupLiteralSites = map[string]attributionSite{
-	"settledLaunch":       {settledLaunchFile, settledLaunchMintSite},
-	"settledLaunchState":  {settledLaunchFile, settledLaunchMintSite},
-	"startupFailure":      {startupFailureFile, startupFailureMintSite},
-	"startupFailureState": {startupFailureFile, startupFailureMintSite},
+	"settledLaunch":   {settledLaunchFile, settledLaunchMintSite},
+	"startupFailure":  {startupFailureFile, startupFailureMintSite},
+	"startupRollback": {startupFailureFile, startupRollbackAdmitSite},
 }
 
-// liveDeathLedgerFields are named only in the ledger's own file.
-var liveDeathLedgerFields = []string{"deathsByID", "deathOrder", "deathRecorded", "streamConnected"}
+// Sealed state types are named only in their own type declaration, the
+// declaration of the value type that wraps them, and their one constructor:
+// in package docker and in package shared respectively. Package shared's
+// startup kinds are named only where they are declared, minted and matched.
+var dockerSealedStateIdents = []startupAuthorityRule{
+	{"settledLaunchState", []attributionSite{
+		typeSite(settledLaunchFile, "settledLaunch"), typeSite(settledLaunchFile, "settledLaunchState"),
+		{settledLaunchFile, settledLaunchMintSite},
+	}, "the settled-launch receipt's state"},
+	{"startupFailureState", []attributionSite{
+		typeSite(startupFailureFile, "startupFailure"), typeSite(startupFailureFile, "startupFailureState"),
+		{startupFailureFile, startupFailureMintSite},
+	}, "the startup finding's state"},
+	{"startupRollbackState", []attributionSite{
+		typeSite(startupFailureFile, "startupRollback"), typeSite(startupFailureFile, "startupRollbackState"),
+		{startupFailureFile, startupRollbackAdmitSite},
+	}, "the startup rollback plan's state"},
+}
+
+var sharedSealedIdents = []startupAuthorityRule{
+	{"operationStartupFailureState", []attributionSite{
+		typeSite(sharedStartupFailureFile, "OperationStartupFailure"),
+		typeSite(sharedStartupFailureFile, "operationStartupFailureState"),
+		{sharedStartupFailureFile, "NewOperationStartupFailure"},
+	}, "the sealed startup failure's state"},
+	{"operationStartupFailedState", []attributionSite{
+		typeSite(sharedStartupFailureFile, "OperationStartupFailed"),
+		typeSite(sharedStartupFailureFile, "operationStartupFailedState"),
+		{sharedStartupFailureFile, "NewOperationStartupFailed"},
+	}, "startup failure evidence's state"},
+	{"operationPhysicalEvidenceStartupFailed", []attributionSite{
+		valueSite(sharedPhysicalOutcomeFile, "operationPhysicalEvidenceStartupFailed"),
+		{sharedStartupFailureFile, "NewOperationStartupFailed"},
+		{sharedPhysicalOutcomeFile, "validateOperationPhysicalEvidence"},
+		{sharedHandoffFile, "OperationSettlement.ExecuteOperation"},
+		{sharedHandoffFile, "OperationSettlement.RecoverOperationExecution"},
+		{sharedHandoffFile, "OperationSettlement.CleanupRecoveredOperation"},
+	}, "the startup failure evidence kind"},
+	{"operationExecutionAttestedStartupFailure", []attributionSite{
+		valueSite(sharedHandoffFile, "operationExecutionAttestedStartupFailure"),
+		{sharedHandoffFile, "OperationSettlement.ExecuteOperation"},
+		{sharedHandoffFile, "OperationExecutionFailure.Valid"},
+		{sharedHandoffFile, "OperationExecutionFailure.StartupFailure"},
+	}, "the startup failure outcome kind"},
+}
+
+// liveDeathLedgerEntryPoints are the only names that may follow b.liveDeaths.
+var liveDeathLedgerEntryPoints = []string{"recordLiveDeath", "markLiveDeathStream", "awaitLiveDeath", "takeLiveDeaths"}
+
+// liveDeathLedgerInternals are named only in the ledger's own file.
+var liveDeathLedgerInternals = []string{
+	"deathsByID", "deathOrder", "deathRecorded", "streamConnected", "takeLocked", "notifyLocked",
+}
 
 func TestStartupFailureAuthorityIsSealed(t *testing.T) {
 	root := repoRoot(t)
@@ -117,31 +195,66 @@ func TestStartupFailureAuthorityGuardsFire(t *testing.T) {
 		src  string
 		want string
 	}{
-		{"receipt minted outside the launch dispatch", "internal/backend/docker/provision.go",
+		{"receipt minted outside the launch dispatch", provisionFile,
 			`package docker
-func (b *Backend) doProvisionPhysical() { _ = newSettledLaunch(nil) }`, "names newSettledLaunch"},
+func (b *Backend) doProvisionPhysical() { _ = newSettledLaunch(nil, o) }`, "names newSettledLaunch"},
 		{"receipt minted elsewhere in the dispatch file", launchDispatchFile,
 			`package docker
-func (m *storageMutations) launch() { _ = newSettledLaunch(nil) }`, "names newSettledLaunch"},
+func (m *storageMutations) launch() { _ = newSettledLaunch(nil, o) }`, "names newSettledLaunch"},
 		{"receipt constructor as a value", "internal/backend/docker/volume_launch.go",
 			`package docker
 var mint = newSettledLaunch`, "names newSettledLaunch"},
-		{"receipt forged by a literal", "internal/backend/docker/provision.go",
+		{"receipt forged by a literal", provisionFile,
 			`package docker
 var l = settledLaunch{state: nil}`, "builds a settledLaunch"},
 		{"receipt state built outside its constructor", launchDispatchFile,
 			`package docker
-func newVolumeLaunchCoordinator() { _ = &settledLaunchState{} }`, "builds a settledLaunchState"},
-		{"finding minted outside the observation", "internal/backend/docker/provision.go",
+func newVolumeLaunchCoordinator() { _ = &settledLaunchState{} }`, "names settledLaunchState"},
+		{"receipt state allocated by new", provisionFile,
 			`package docker
-func (b *Backend) doProvisionPhysical() { _, _ = b.newStartupFailure(nil, nil, settledLaunch{}, nil, startupWatch{}) }`,
+func (b *Backend) doProvisionPhysical() { var l settledLaunch; l.state = new(settledLaunchState) }`,
+			"names settledLaunchState"},
+		{"receipt state through a type alias", settledLaunchFile,
+			`package docker
+type forged = settledLaunchState`, "names settledLaunchState"},
+		{"finding minted outside the observation seal", startupObservationFile,
+			`package docker
+func (b *Backend) observeStartup() { _, _ = b.newStartupFailure(nil, nil, settledLaunch{}, nil, startupWatch{}) }`,
 			"names newStartupFailure"},
 		{"finding forged by a literal", startupObservationFile,
 			`package docker
-func (b *Backend) observeStartup() { _ = startupFailure{state: nil} }`, "builds a startupFailure"},
+func (b *Backend) startupObservationOf() { _ = startupFailure{state: nil} }`, "builds a startupFailure"},
 		{"finding state built outside its constructor", startupFailureFile,
 			`package docker
-func (b *Backend) rollbackStartupFailure() { _ = &startupFailureState{} }`, "builds a startupFailureState"},
+func (b *Backend) rollbackStartupFailure() { _ = &startupFailureState{} }`, "names startupFailureState"},
+		{"finding state in an elided literal", startupFailureFile,
+			`package docker
+func (b *Backend) concludeStartupFailure() { _ = []*startupFailureState{{}} }`, "names startupFailureState"},
+		{"observation outside the provision workflow", "internal/backend/docker/restore.go",
+			`package docker
+func (b *Backend) doRestorePhysical() { _ = b.observeStartup(ctx, m, l, c, nil) }`, "names observeStartup"},
+		{"rejected launch observed outside the provision workflow", startupObservationFile,
+			`package docker
+func (b *Backend) watchStartup() { _ = b.observeRejectedLaunch(ctx, m, l, c, e, nil) }`, "names observeRejectedLaunch"},
+		{"conclusion outside the provision workflow", "internal/backend/docker/physical_execution.go",
+			`package docker
+func (b *Backend) executeProvisionWork() { _, _ = b.concludeStartupFailure(ctx, m, f, nil) }`,
+			"names concludeStartupFailure"},
+		{"finding accepted outside the conclusion", provisionFile,
+			`package docker
+func (b *Backend) doProvisionPhysical() { _, _ = mutations.acceptStartupFailure(f) }`, "names acceptStartupFailure"},
+		{"rollback admitted outside the conclusion", provisionFile,
+			`package docker
+func (b *Backend) doProvisionPhysical() { _, _ = b.admitStartupRollback(ctx, m, a) }`, "names admitStartupRollback"},
+		{"rollback run outside the conclusion", provisionFile,
+			`package docker
+func (b *Backend) doProvisionPhysical() { _ = b.rollbackStartupFailure(ctx, m, r, nil) }`, "names rollbackStartupFailure"},
+		{"rollback plan forged by a literal", startupFailureFile,
+			`package docker
+func (b *Backend) concludeStartupFailure() { _ = startupRollback{state: nil} }`, "builds a startupRollback"},
+		{"rollback plan state built outside its admission", startupFailureFile,
+			`package docker
+func (b *Backend) rollbackStartupFailure() { _ = &startupRollbackState{} }`, "names startupRollbackState"},
 		{"sealed account minted outside the finding constructor", "internal/backend/docker/recover.go",
 			"package docker\n" + sharedImport + `var f, _ = shared.NewOperationStartupFailure(shared.OperationStartupFailureTerms{})`,
 			"names shared.NewOperationStartupFailure"},
@@ -154,9 +267,25 @@ func (b *Backend) rollbackStartupFailure() { _ = &startupFailureState{} }`, "bui
 import sh "github.com/manifest-network/fred/internal/backend/shared"
 func (b *Backend) rollbackStartupFailure() { _, _ = sh.NewOperationStartupFailed(s, f) }`,
 			"names shared.NewOperationStartupFailed"},
-		{"evidence minted inside package shared", "internal/backend/shared/operation_handoff.go",
+		{"evidence minted inside package shared", sharedHandoffFile,
 			`package shared
 func f() { _, _ = NewOperationStartupFailed(s, x) }`, "names shared.NewOperationStartupFailed"},
+		{"shared account state forged in package shared", sharedHandoffFile,
+			`package shared
+func f() { _ = OperationStartupFailure{state: &operationStartupFailureState{}} }`,
+			"names operationStartupFailureState"},
+		{"shared evidence state forged in its own file", sharedStartupFailureFile,
+			`package shared
+func (f OperationStartupFailure) Kind() { _ = new(operationStartupFailedState) }`,
+			"names operationStartupFailedState"},
+		{"startup evidence kind minted outside its constructor", sharedPhysicalOutcomeFile,
+			`package shared
+func NewOperationExactAbsent() { _ = OperationPhysicalEvidence{kind: operationPhysicalEvidenceStartupFailed} }`,
+			"names operationPhysicalEvidenceStartupFailed"},
+		{"startup outcome kind minted outside ExecuteOperation", sharedHandoffFile,
+			`package shared
+func (s *OperationSettlement) RefuseOperationExecution() { _ = OperationExecutionFailure{kind: operationExecutionAttestedStartupFailure} }`,
+			"names operationExecutionAttestedStartupFailure"},
 		{"ledger written by the reader", terminalBudgetReaderFile,
 			`package docker
 func (r containerEventReader) consume() { r.ledger.recordLiveDeath(p) }`, "names recordLiveDeath"},
@@ -178,7 +307,19 @@ func (b *Backend) recoverState() { _ = b.liveDeaths.takeLiveDeaths(nil) }`, "nam
 func (b *Backend) observeStartup() { _, _ = b.liveDeaths.awaitLiveDeath(ctx, "c", 0) }`, "names awaitLiveDeath"},
 		{"ledger fields read outside the ledger", "internal/backend/docker/recover.go",
 			`package docker
-func (b *Backend) recoverState() { _ = b.liveDeaths.deathsByID }`, "names deathsByID"},
+func (b *Backend) recoverState() { _ = len(deathsByID) }`, "names deathsByID"},
+		{"ledger entry taken through its unexported helper", "internal/backend/docker/recover.go",
+			`package docker
+func (b *Backend) recoverState() { _, _ = ledger.takeLocked("c") }`, "names takeLocked"},
+		{"ledger waiters woken outside the ledger", "internal/backend/docker/recover.go",
+			`package docker
+func (b *Backend) recoverState() { notifyLocked() }`, "names notifyLocked"},
+		{"ledger lock taken from outside", "internal/backend/docker/recover.go",
+			`package docker
+func (b *Backend) recoverState() { b.liveDeaths.mu.Lock() }`, "reaches the live-death ledger"},
+		{"ledger aliased from outside", "internal/backend/docker/recover.go",
+			`package docker
+func (b *Backend) recoverState() { ledger := &b.liveDeaths; _ = ledger }`, "reaches the live-death ledger"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -188,8 +329,10 @@ func (b *Backend) recoverState() { _ = b.liveDeaths.deathsByID }`, "names deaths
 				t.Fatalf("parse synthetic source: %v", err)
 			}
 			findings := startupFailureAuthorityFindings(test.rel, file, fset)
-			if len(findings) != 1 || !strings.Contains(findings[0], test.want) {
-				t.Fatalf("want exactly one finding containing %q, got %q", test.want, findings)
+			if len(findings) == 0 || !slices.ContainsFunc(findings, func(finding string) bool {
+				return strings.Contains(finding, test.want)
+			}) {
+				t.Fatalf("want a finding containing %q, got %q", test.want, findings)
 			}
 		})
 	}
@@ -200,19 +343,33 @@ func (b *Backend) recoverState() { _ = b.liveDeaths.deathsByID }`, "names deaths
 		src string
 	}{
 		{launchDispatchFile, `package docker
-func newVolumeLaunchCoordinator() { _ = func() settledLaunch { return newSettledLaunch(q) } }`},
+func newVolumeLaunchCoordinator() { _ = func() settledLaunch { return newSettledLaunch(q, o) } }`},
 		{settledLaunchFile, `package docker
 type settledLaunch struct{ state *settledLaunchState }
-func newSettledLaunch(q *quiescedVolumes) settledLaunch { return settledLaunch{state: &settledLaunchState{}} }`},
-		{"internal/backend/docker/provision.go", `package docker
-func (b *Backend) doProvisionPhysical() (startupFailure, error) { return startupFailure{}, nil }`},
+type settledLaunchState struct{ created []string }
+func newSettledLaunch(q *quiescedVolumes, o daemonLaunchOutcome) settledLaunch {
+	return settledLaunch{state: &settledLaunchState{}}
+}`},
+		{provisionFile, `package docker
+func (b *Backend) doProvisionPhysical() (acceptedStartupFailure, error) {
+	_ = b.observeStartup(ctx, m, l, c, nil)
+	_ = b.observeRejectedLaunch(ctx, m, l, c, e, nil)
+	return b.concludeStartupFailure(ctx, m, f, nil)
+}`},
 		{startupObservationFile, `package docker
-func (b *Backend) observeStartup() { _, _ = b.newStartupFailure(ctx, m, l, c, w) }`},
+func (b *Backend) startupObservationOf() { _, _ = b.newStartupFailure(ctx, m, l, c, w) }`},
 		{startupFailureFile, "package docker\n" + sharedImport + `func (b *Backend) newStartupFailure() {
 	_, _ = shared.NewOperationStartupFailure(shared.OperationStartupFailureTerms{})
 	_, _ = b.liveDeaths.awaitLiveDeath(ctx, "c", 0)
 	_ = startupFailure{state: &startupFailureState{}}
 }`},
+		{startupFailureFile, `package docker
+func (b *Backend) concludeStartupFailure() {
+	_, _ = mutations.acceptStartupFailure(f)
+	_, _ = b.admitStartupRollback(ctx, m, a)
+	_ = b.rollbackStartupFailure(ctx, m, r, nil)
+}
+func (b *Backend) admitStartupRollback() { _ = startupRollback{state: &startupRollbackState{}} }`},
 		{startupFailureFile, "package docker\n" + sharedImport +
 			`func (b *Backend) confirmStartupFailure() { _, _ = shared.NewOperationStartupFailed(s, f) }`},
 		{terminalBudgetEventsFile, `package docker
@@ -221,11 +378,28 @@ func (b *Backend) recordLiveContainerDeaths() { b.liveDeaths.recordLiveDeath(p) 
 func (b *Backend) redispatchStartupDeaths() { _ = b.liveDeaths.takeLiveDeaths(nil) }`},
 		{liveDeathLedgerFile, `package docker
 type liveDeathLedger struct{ deathsByID map[string]int }
-func (l *liveDeathLedger) recordLiveDeath(p int) { l.deathsByID["c"] = p }
-func (l *liveDeathLedger) takeLiveDeaths(ids []string) []int { return nil }`},
+func (l *liveDeathLedger) recordLiveDeath(p int) { l.deathsByID["c"] = p; l.notifyLocked() }
+func (l *liveDeathLedger) takeLiveDeaths(ids []string) []int { _, _ = l.takeLocked("c"); return nil }`},
 		{sharedStartupFailureFile, `package shared
-func NewOperationStartupFailed(s, f int) (int, error) { return 0, nil }
-func NewOperationStartupFailure(t int) (int, error) { return 0, nil }`},
+type OperationStartupFailure struct{ state *operationStartupFailureState }
+type operationStartupFailureState struct{ kind int }
+func NewOperationStartupFailed(s, f int) (OperationPhysicalEvidence, error) {
+	_ = &operationStartupFailedState{}
+	return OperationPhysicalEvidence{kind: operationPhysicalEvidenceStartupFailed}, nil
+}
+func NewOperationStartupFailure(t int) (int, error) { _ = &operationStartupFailureState{}; return 0, nil }`},
+		{sharedHandoffFile, `package shared
+const (
+	operationExecutionRefusedBeforeStart operationExecutionFailureKind = iota
+	operationExecutionAttestedStartupFailure
+)
+func (s *OperationSettlement) ExecuteOperation() {
+	switch evidence.kind {
+	case operationPhysicalEvidenceStartupFailed:
+		_ = OperationExecutionFailure{kind: operationExecutionAttestedStartupFailure}
+	}
+}
+func (outcome OperationExecutionFailure) Valid() bool { return outcome.kind == operationExecutionAttestedStartupFailure }`},
 	}
 	for _, control := range allowed {
 		fset := token.NewFileSet()
@@ -255,7 +429,31 @@ func startupFailureAuthorityFindings(rel string, file *ast.File, fset *token.Fil
 			return rel == site.file && function == site.function
 		})
 	}
+	// sealedIdent reports ident if it names a sealed state type or kind outside
+	// its sites.
+	sealedIdent := func(rules []startupAuthorityRule, ident *ast.Ident, function string) {
+		for _, rule := range rules {
+			if ident.Name == rule.name && !allowedAtAny(rule.sites, function) {
+				report(ident, "names %s, %s, outside its declaration and constructor", ident.Name, rule.what)
+			}
+		}
+	}
 	inspect := func(function string, root ast.Node, declared *ast.Ident) {
+		// One pre-pass: the selectors that reach the ledger through one of its
+		// entry points, and every selected name, which the selector case
+		// already judges.
+		sanctionedLedger := make(map[*ast.SelectorExpr]bool)
+		selectedName := make(map[*ast.Ident]bool)
+		ast.Inspect(root, func(node ast.Node) bool {
+			if outer, ok := node.(*ast.SelectorExpr); ok {
+				selectedName[outer.Sel] = true
+				if inner, ok := outer.X.(*ast.SelectorExpr); ok && inner.Sel.Name == "liveDeaths" &&
+					slices.Contains(liveDeathLedgerEntryPoints, outer.Sel.Name) {
+					sanctionedLedger[inner] = true
+				}
+			}
+			return true
+		})
 		ast.Inspect(root, func(node ast.Node) bool {
 			switch typed := node.(type) {
 			case *ast.SelectorExpr:
@@ -278,8 +476,11 @@ func startupFailureAuthorityFindings(rel string, file *ast.File, fset *token.Fil
 							report(typed, "names %s, %s, outside its one site", name, rule.what)
 						}
 					}
-					if slices.Contains(liveDeathLedgerFields, name) && rel != liveDeathLedgerFile {
-						report(typed, "names %s, a live-death ledger field, outside the ledger", name)
+					if slices.Contains(liveDeathLedgerInternals, name) && rel != liveDeathLedgerFile {
+						report(typed, "names %s, a live-death ledger internal, outside the ledger", name)
+					}
+					if name == "liveDeaths" && !sanctionedLedger[typed] && rel != liveDeathLedgerFile {
+						report(typed, "reaches the live-death ledger other than through its four entry points")
 					}
 				}
 				return true
@@ -294,12 +495,18 @@ func startupFailureAuthorityFindings(rel string, file *ast.File, fset *token.Fil
 							report(typed, "names shared.%s, %s, inside package shared", typed.Name, rule.what)
 						}
 					}
+					sealedIdent(sharedSealedIdents, typed, function)
 				case dockerDir:
+					selected := selectedName[typed]
 					for _, rule := range dockerStartupRules {
-						if typed.Name == rule.name && !allowedAtAny(rule.sites, function) && !isSelectorName(root, typed) {
+						if typed.Name == rule.name && !allowedAtAny(rule.sites, function) && !selected {
 							report(typed, "names %s, %s, outside its one site", typed.Name, rule.what)
 						}
 					}
+					if slices.Contains(liveDeathLedgerInternals, typed.Name) && rel != liveDeathLedgerFile && !selected {
+						report(typed, "names %s, a live-death ledger internal, outside the ledger", typed.Name)
+					}
+					sealedIdent(dockerSealedStateIdents, typed, function)
 				}
 			case *ast.CompositeLit:
 				if dir != dockerDir || len(typed.Elts) == 0 {
@@ -309,41 +516,35 @@ func startupFailureAuthorityFindings(rel string, file *ast.File, fset *token.Fil
 				if site, sealed := startupLiteralSites[name]; sealed && !allowedAtAny([]attributionSite{site}, function) {
 					report(typed, "builds a %s outside its constructor", name)
 				}
-			case *ast.UnaryExpr:
-				// &settledLaunchState{} and friends are composite literals too,
-				// including empty ones: a state pointer is never the zero value.
-				literal, ok := typed.X.(*ast.CompositeLit)
-				if !ok || dir != dockerDir || len(literal.Elts) != 0 {
-					return true
-				}
-				name, _ := calleeName(literal.Type)
-				if site, sealed := startupLiteralSites[name]; sealed && strings.HasSuffix(name, "State") &&
-					!allowedAtAny([]attributionSite{site}, function) {
-					report(typed, "builds a %s outside its constructor", name)
-				}
 			}
 			return true
 		})
 	}
 	for _, decl := range file.Decls {
-		if function, ok := decl.(*ast.FuncDecl); ok {
-			inspect(functionKey(function), function, function.Name)
-			continue
+		switch typed := decl.(type) {
+		case *ast.FuncDecl:
+			inspect(functionKey(typed), typed, typed.Name)
+		case *ast.GenDecl:
+			for _, spec := range typed.Specs {
+				inspect(declarationKey(spec), spec, nil)
+			}
+		default:
+			inspect("", decl, nil)
 		}
-		inspect("", decl, nil)
 	}
 	return findings
 }
 
-// isSelectorName reports whether ident is the selected name of a selector in
-// root, which the selector case already judged.
-func isSelectorName(root ast.Node, ident *ast.Ident) bool {
-	selected := false
-	ast.Inspect(root, func(node ast.Node) bool {
-		if selector, ok := node.(*ast.SelectorExpr); ok && selector.Sel == ident {
-			selected = true
+// declarationKey names one top-level declaration the way typeSite and
+// valueSite do.
+func declarationKey(spec ast.Spec) string {
+	switch typed := spec.(type) {
+	case *ast.TypeSpec:
+		return "type " + typed.Name.Name
+	case *ast.ValueSpec:
+		if len(typed.Names) > 0 {
+			return "value " + typed.Names[0].Name
 		}
-		return !selected
-	})
-	return selected
+	}
+	return ""
 }

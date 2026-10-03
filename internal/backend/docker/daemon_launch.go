@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,10 @@ import (
 type daemonLaunchOutcome struct {
 	settled bool
 	err     error
+	// refusedStarts are the containers whose Start request the daemon answered
+	// with a final error response (ENG-1125): the daemon's own account that it
+	// refused to start them. It is read only from a settled exchange.
+	refusedStarts []string
 }
 
 func (o daemonLaunchOutcome) completionError() error {
@@ -40,14 +45,15 @@ const daemonLaunchCompletionGrace = 30 * time.Second
 type daemonLaunchScope struct{ state *daemonLaunchScopeState }
 
 type daemonLaunchScopeState struct {
-	mu         sync.Mutex
-	ctx        context.Context
-	closed     bool
-	pending    int
-	unknown    bool
-	drained    chan struct{}
-	observer   *daemonLaunchObserver
-	completion completion.Lifetime
+	mu            sync.Mutex
+	ctx           context.Context
+	closed        bool
+	pending       int
+	unknown       bool
+	refusedStarts []string
+	drained       chan struct{}
+	observer      *daemonLaunchObserver
+	completion    completion.Lifetime
 }
 
 func newDaemonLaunchScope(ctx context.Context, observer *daemonLaunchObserver) *daemonLaunchScope {
@@ -99,7 +105,9 @@ func (scope *daemonLaunchScope) finish(err error) daemonLaunchOutcome {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return daemonLaunchOutcome{settled: !s.unknown && s.pending == 0, err: err}
+	return daemonLaunchOutcome{
+		settled: !s.unknown && s.pending == 0, err: err, refusedStarts: slices.Clone(s.refusedStarts),
+	}
 }
 
 func daemonContainerLaunchRequest(req *http.Request) bool {
@@ -132,10 +140,14 @@ func (scope *daemonLaunchScope) roundTrip(next http.RoundTripper, req *http.Requ
 	s.pending++
 	s.mu.Unlock()
 	var responded bool
+	var refusedStart string
 	defer func() {
 		s.mu.Lock()
 		s.pending--
 		s.unknown = s.unknown || !responded
+		if refusedStart != "" {
+			s.refusedStarts = append(s.refusedStarts, refusedStart)
+		}
 		if s.closed && s.pending == 0 {
 			close(s.drained)
 			s.completion.Close()
@@ -148,7 +160,36 @@ func (scope *daemonLaunchScope) roundTrip(next http.RoundTripper, req *http.Requ
 	// follows the handler's operation even when decoding the response body or
 	// the returned business status subsequently fails in the SDK.
 	responded = err == nil && daemonCompletedLaunchResponse(req, response)
+	if responded {
+		refusedStart = daemonRefusedStartTarget(req, response)
+	}
 	return response, err
+}
+
+// daemonRefusedStartTarget returns the container a final Start response
+// refused, or "" for any other exchange. The daemon's handler ended with an
+// error status, so it did not start the container (ENG-1125); whether the
+// container exists and never ran is the caller's own inspection to make. The
+// target is the path's container reference, never parsed from an error.
+func daemonRefusedStartTarget(req *http.Request, response *http.Response) string {
+	if response == nil || req.Method != http.MethodPost {
+		return ""
+	}
+	switch response.StatusCode {
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound, http.StatusConflict,
+		http.StatusInternalServerError:
+	default:
+		return ""
+	}
+	_, endpoint, found := strings.Cut(req.URL.Path, "/containers/")
+	if !found {
+		return ""
+	}
+	target, isStart := strings.CutSuffix(endpoint, "/start")
+	if !isStart || target == "" || strings.Contains(target, "/") {
+		return ""
+	}
+	return target
 }
 
 // admittedDaemonRequest owns the detached context until its transport returns.

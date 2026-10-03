@@ -661,9 +661,9 @@ func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 		defer protected.release()
 		volume, err := protected.lookup(filepath.Base(hostVol))
 		require.NoError(t, err)
-		binds, complete := b.seedWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "grafana/grafana:11.1.0"),
+		binds, skipped := b.seedWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "grafana/grafana:11.1.0"),
 			[]string{"/var/lib/grafana"}, 64<<20, 1<<30)
-		assert.True(t, complete, "every writable path was seeded: the launch is complete")
+		assert.True(t, skipped.empty(), "every writable path was seeded: the launch is complete")
 		return binds
 	})
 
@@ -715,9 +715,9 @@ func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
 		defer protected.release()
 		volume, err := protected.lookup(filepath.Base(hostVol))
 		require.NoError(t, err)
-		binds, complete := b.seedWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "img"),
+		binds, skipped := b.seedWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "img"),
 			[]string{"/var/lib/grafana"}, 64<<20, 1<<30)
-		assert.False(t, complete, "a skipped writable path degrades the launch (ENG-1125)")
+		assert.Equal(t, launchDegradations(launchWritablePathsUnseeded), skipped, "a skipped writable path degrades the launch (ENG-1125)")
 		return binds
 	})
 
@@ -753,9 +753,9 @@ func TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable(t *testing.T) {
 		defer protected.release()
 		volume, err := protected.lookup(filepath.Base(hostVol))
 		require.NoError(t, err)
-		binds, complete := b.seedWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "img"),
+		binds, skipped := b.seedWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "img"),
 			[]string{"/var/lib/grafana"}, 64<<20, 1<<30)
-		assert.False(t, complete, "a skipped writable path degrades the launch (ENG-1125)")
+		assert.Equal(t, launchDegradations(launchWritablePathsUnseeded), skipped, "a skipped writable path degrades the launch (ENG-1125)")
 		return binds
 	})
 

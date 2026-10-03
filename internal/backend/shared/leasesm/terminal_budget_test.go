@@ -639,7 +639,10 @@ func TestReasonEligibleForBudget_EveryDeclaredReason(t *testing.T) {
 		"ReasonContainerExited": true,
 		// A health check that never passed is a definite failure that never
 		// counts (ENG-1125).
-		"ReasonHealthCheckFailed":      false,
+		"ReasonHealthCheckFailed": false,
+		// A start the container runtime refused ran no tenant process; it is a
+		// definite failure that never counts (ENG-1125).
+		"ReasonContainerStartFailed":   false,
 		"ReasonImagePullFailed":        false,
 		"ReasonInternal":               false,
 		"ReasonRestartFailed":          false,

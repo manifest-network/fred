@@ -798,6 +798,19 @@ var (
 		Help:      "Lease failures recorded by the consecutive-failure budget, by attribution; only tenant_workload counts toward closing a lease",
 	}, []string{"attribution"})
 
+	// leasePendingOperationUnstampedTotal counts provisions and restores that
+	// entered their in-flight state with a projection that could not be
+	// stamped with the operation it awaits (ENG-1125). Live recovery matches a
+	// failed operation to its projection only by that stamp, so such a lease
+	// can stay in flight until the backend restarts. Admission refuses an
+	// unstampable provision first; any non-zero value is a bug.
+	leasePendingOperationUnstampedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_pending_operation_unstamped_total",
+		Help:      "Provisions and restores whose projection could not await their operation, so live recovery cannot match a failure to them; any non-zero value is a bug",
+	})
+
 	// leaseWorkerPanicsTotal counts panics recovered in lease worker
 	// goroutines (provision, replace, diag), labeled by worker type.
 	// Workers are Docker-interaction code that is NOT expected to panic;

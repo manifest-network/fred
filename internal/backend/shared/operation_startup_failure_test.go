@@ -35,37 +35,52 @@ func TestOperationStartupFailureTermsAreValidatedAsAWhole(t *testing.T) {
 		Reason: backend.ReasonHealthCheckFailed, Message: backend.MsgContainerUnhealthy,
 		InstanceID: "c1", Service: "app",
 	}
+	refused := OperationStartupFailureTerms{
+		Reason: backend.ReasonContainerStartFailed, Message: backend.MsgContainerStartRefused,
+		InstanceID: "c1", Service: "app",
+	}
 	tests := []struct {
 		name  string
 		edit  func(*OperationStartupFailureTerms)
 		base  OperationStartupFailureTerms
 		valid bool
+		kind  OperationStartupFailureKind
 	}{
-		{"exit", func(*OperationStartupFailureTerms) {}, exitedStartupTerms("c1"), true},
+		{"exit", func(*OperationStartupFailureTerms) {}, exitedStartupTerms("c1"), true, OperationStartupExited},
 		{"exit with its own provenance", func(terms *OperationStartupFailureTerms) {
 			terms.Provenance = liveProvenanceFor("c1")
-		}, exitedStartupTerms("c1"), true},
-		{"unhealthy", func(*OperationStartupFailureTerms) {}, unhealthy, true},
-		{"no container", func(terms *OperationStartupFailureTerms) { terms.InstanceID = "" }, exitedStartupTerms("c1"), false},
-		{"no message", func(terms *OperationStartupFailureTerms) { terms.Message = "" }, exitedStartupTerms("c1"), false},
+		}, exitedStartupTerms("c1"), true, OperationStartupExited},
+		{"unhealthy", func(*OperationStartupFailureTerms) {}, unhealthy, true, OperationStartupUnhealthy},
+		{"refused start", func(*OperationStartupFailureTerms) {}, refused, true, OperationStartupRefused},
+		{"refused start with a termination", func(terms *OperationStartupFailureTerms) {
+			terms.Termination = failurecause.Exited()
+		}, refused, false, 0},
+		{"refused start with a death", func(terms *OperationStartupFailureTerms) {
+			terms.Provenance = liveProvenanceFor("c1")
+		}, refused, false, 0},
+		{"refused start with an exit status", func(terms *OperationStartupFailureTerms) {
+			terms.ExitCode = 127
+		}, refused, false, 0},
+		{"no container", func(terms *OperationStartupFailureTerms) { terms.InstanceID = "" }, exitedStartupTerms("c1"), false, 0},
+		{"no message", func(terms *OperationStartupFailureTerms) { terms.Message = "" }, exitedStartupTerms("c1"), false, 0},
 		{"exit code without an observed exit", func(terms *OperationStartupFailureTerms) {
 			terms.Termination = failurecause.Termination{}
-		}, exitedStartupTerms("c1"), false},
+		}, exitedStartupTerms("c1"), false, 0},
 		{"gone is not an exit", func(terms *OperationStartupFailureTerms) {
 			terms.Termination = failurecause.Gone()
-		}, exitedStartupTerms("c1"), false},
+		}, exitedStartupTerms("c1"), false, 0},
 		{"provenance of another container", func(terms *OperationStartupFailureTerms) {
 			terms.Provenance = liveProvenanceFor("c2")
-		}, exitedStartupTerms("c1"), false},
+		}, exitedStartupTerms("c1"), false, 0},
 		{"unhealthy with a termination", func(terms *OperationStartupFailureTerms) {
 			terms.Termination = failurecause.Exited()
-		}, unhealthy, false},
+		}, unhealthy, false, 0},
 		{"unhealthy with a death", func(terms *OperationStartupFailureTerms) {
 			terms.Provenance = liveProvenanceFor("c1")
-		}, unhealthy, false},
+		}, unhealthy, false, 0},
 		{"any other reason", func(terms *OperationStartupFailureTerms) {
 			terms.Reason = backend.ReasonInternal
-		}, exitedStartupTerms("c1"), false},
+		}, exitedStartupTerms("c1"), false, 0},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -79,6 +94,7 @@ func TestOperationStartupFailureTermsAreValidatedAsAWhole(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.True(t, failure.Valid())
+			assert.Equal(t, test.kind, failure.Kind())
 			assert.Equal(t, terms.Reason, failure.Reason())
 			assert.Equal(t, terms.Termination, failure.Termination())
 			assert.Equal(t, terms.Provenance, failure.Provenance())
@@ -86,13 +102,33 @@ func TestOperationStartupFailureTermsAreValidatedAsAWhole(t *testing.T) {
 	}
 	var zero OperationStartupFailure
 	assert.False(t, zero.Valid(), "the zero startup failure is invalid")
+	assert.Zero(t, zero.Kind())
 	_, _, exited := zero.ExitStatus()
 	assert.False(t, exited)
 }
 
-// bindStartupFindingMutation binds a live workflow that enters one clean Step
-// and reports finding, with a classifier that mints StartupFailed evidence
-// exactly when it receives a valid finding. A hostile classifier mints it
+// startupFindingCapability is a test facade: one rollback Step and the
+// session's Accept.
+type startupFindingCapability struct {
+	rollback func(context.Context) error
+	accept   func(OperationStartupFailure) (substratemutation.Accepted[OperationStartupFailure], error)
+}
+
+func newStartupFindingCapability(runner substratemutation.Runner, _ OperationPhysicalSubject) startupFindingCapability {
+	return startupFindingCapability{
+		rollback: func(ctx context.Context) error {
+			return runner.Step(ctx, "remove failed cohort", func(context.Context) error { return nil })
+		},
+		accept: func(finding OperationStartupFailure) (substratemutation.Accepted[OperationStartupFailure], error) {
+			return substratemutation.Accept(runner, finding)
+		},
+	}
+}
+
+// bindStartupFindingMutation binds a workflow that accepts a valid finding
+// when its session allows it (a recovery session never does), then enters one
+// clean rollback Step, with a classifier that mints StartupFailed evidence
+// exactly when it receives an accepted finding. A hostile classifier mints it
 // whatever it receives, to prove the evidence's own validity rules.
 func bindStartupFindingMutation(
 	t *testing.T,
@@ -105,19 +141,23 @@ func bindStartupFindingMutation(
 		settlement,
 		func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil },
 		func(context.Context, string, error) error { return nil },
-		func(runner substratemutation.Runner, _ OperationPhysicalSubject) func(context.Context) error {
-			return func(ctx context.Context) error {
-				return runner.Step(ctx, "remove failed cohort", func(context.Context) error { return nil })
+		newStartupFindingCapability,
+		func(ctx context.Context, capability startupFindingCapability, _ OperationPhysicalSubject) (
+			substratemutation.Accepted[OperationStartupFailure], error,
+		) {
+			var accepted substratemutation.Accepted[OperationStartupFailure]
+			if finding.Valid() {
+				// A refusal leaves the finding absent; the hostile classifier
+				// below is then the only barrier left to prove.
+				accepted, _ = capability.accept(finding)
 			}
+			return accepted, capability.rollback(ctx)
 		},
-		func(ctx context.Context, rollback func(context.Context) error, _ OperationPhysicalSubject) (OperationStartupFailure, error) {
-			return finding, rollback(ctx)
-		},
-		func(_ context.Context, subject OperationPhysicalSubject, observed OperationStartupFailure) (OperationPhysicalEvidence, error) {
+		func(_ context.Context, subject OperationPhysicalSubject, accepted substratemutation.Accepted[OperationStartupFailure]) (OperationPhysicalEvidence, error) {
 			if hostile {
 				return NewOperationStartupFailed(subject, finding)
 			}
-			if observed.Valid() {
+			if observed, present := accepted.Finding(); present {
 				return NewOperationStartupFailed(subject, observed)
 			}
 			return NewOperationExactAbsent(subject)
@@ -185,13 +225,18 @@ func TestStartupFailedEvidenceIsLiveProvisionOnly(t *testing.T) {
 			stores.settlement,
 			func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil },
 			func(context.Context, string, error) error { return nil },
-			func(runner substratemutation.Runner, _ OperationPhysicalSubject) substratemutation.Runner {
-				return runner
+			newStartupFindingCapability,
+			func(ctx context.Context, capability startupFindingCapability, _ OperationPhysicalSubject) (
+				substratemutation.Accepted[OperationStartupFailure], error,
+			) {
+				accepted, err := capability.accept(failure)
+				if err != nil {
+					return accepted, err
+				}
+				return accepted, capability.rollback(ctx)
 			},
-			func(ctx context.Context, runner substratemutation.Runner, _ OperationPhysicalSubject) (OperationStartupFailure, error) {
-				return failure, runner.Step(ctx, "step", func(context.Context) error { return nil })
-			},
-			func(_ context.Context, subject OperationPhysicalSubject, observed OperationStartupFailure) (OperationPhysicalEvidence, error) {
+			func(_ context.Context, subject OperationPhysicalSubject, accepted substratemutation.Accepted[OperationStartupFailure]) (OperationPhysicalEvidence, error) {
+				observed, _ := accepted.Finding()
 				evidence, err := NewOperationStartupFailed(subject, observed)
 				minted = err
 				return evidence, err

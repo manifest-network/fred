@@ -262,27 +262,28 @@ func BindOperationSubstrateExecutor[T any](
 		return errors.New("strict exhaustive substrate classifier is required")
 	}
 	return BindOperationFindingExecutor(s, authorize, complete, build,
-		func(ctx context.Context, capability T, subject OperationPhysicalSubject) (substratemutation.NoFinding, error) {
-			return substratemutation.NoFinding{}, run(ctx, capability, subject)
+		func(ctx context.Context, capability T, subject OperationPhysicalSubject) (substratemutation.Accepted[substratemutation.NoFinding], error) {
+			return substratemutation.Accepted[substratemutation.NoFinding]{}, run(ctx, capability, subject)
 		},
-		func(ctx context.Context, subject OperationPhysicalSubject, _ substratemutation.NoFinding) (OperationPhysicalEvidence, error) {
+		func(ctx context.Context, subject OperationPhysicalSubject, _ substratemutation.Accepted[substratemutation.NoFinding]) (OperationPhysicalEvidence, error) {
 			return classify(ctx, subject)
 		},
 	)
 }
 
 // BindOperationFindingExecutor binds a facade whose live workflow may report a
-// typed Finding: a definite outcome it observed after its effects. The
-// construction-bound classifier receives the Finding only from a wholly
-// successful session and alone decides whether it becomes evidence (ENG-1125).
-// Recovery never sees one.
+// typed Finding: a definite outcome it observed after its effects, accepted by
+// its own session before any work that depends on it. The construction-bound
+// classifier receives the Finding only from a wholly successful session and
+// alone decides whether it becomes evidence (ENG-1125). Recovery never sees
+// one.
 func BindOperationFindingExecutor[T any, F any](
 	s *OperationSettlement,
 	authorize substratemutation.Authorize,
 	complete substratemutation.Complete,
 	build func(substratemutation.Runner, OperationPhysicalSubject) T,
-	run func(context.Context, T, OperationPhysicalSubject) (F, error),
-	classify func(context.Context, OperationPhysicalSubject, F) (OperationPhysicalEvidence, error),
+	run func(context.Context, T, OperationPhysicalSubject) (substratemutation.Accepted[F], error),
+	classify func(context.Context, OperationPhysicalSubject, substratemutation.Accepted[F]) (OperationPhysicalEvidence, error),
 ) error {
 	if s == nil || s.mutation == nil {
 		return errors.New("operation settlement is invalid")

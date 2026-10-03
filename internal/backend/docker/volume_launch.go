@@ -44,10 +44,10 @@ type quiescedVolumes struct {
 	reserved         *reservedVolumeSet
 	releaseNamespace func()
 	active           *atomic.Bool
-	// degraded records that the launch skipped part of the platform's own
-	// preparation (writable-path seeding, or an image detection it depends
+	// degradations records each part of the platform's own preparation the
+	// launch skipped (writable-path seeding, or an image detection it depends
 	// on). The launch's settled receipt carries it (ENG-1125).
-	degraded bool
+	degradations launchDegradations
 }
 
 func (q *quiescedVolumes) requireReservation() error {
@@ -160,7 +160,9 @@ func (q *quiescedVolumes) releaseResources() {
 // be rearranged by a lifecycle caller: materialize roots, reserve their physical
 // identities, stop writers, prepare every bind, validate the complete graph,
 // freeze the image-bound project, then hold exclusion through Compose Start.
-// A nil error comes with the launch's settled receipt (ENG-1125).
+// A settled launch exchange returns its receipt (ENG-1125), together with the
+// exchange's own error when Compose or the daemon rejected it; any other
+// error comes with no receipt.
 func (b *Backend) launchCompose(ctx context.Context, mutations *storageMutations, params composeProjectParams, resources []shared.SKUResourceSnapshot, opts composeUpOpts) (settledLaunch, error) {
 	if mutations == nil || params.LeaseUUID != mutations.leaseUUID || params.VolBinds != nil {
 		return settledLaunch{}, errors.New("compose launch inputs differ from the physical subject")
@@ -182,8 +184,8 @@ func (b *Backend) launchCompose(ctx context.Context, mutations *storageMutations
 	}
 	defer volumes.release()
 	for _, setup := range params.ImageSetups {
-		if setup != nil && setup.Degraded {
-			volumes.degraded = true
+		if setup != nil {
+			volumes.degradations.addAll(setup.Degradations)
 		}
 	}
 	binds, _, err := b.setupVolBinds(volumes, ctx, params.LeaseUUID, params.Items,
@@ -231,7 +233,7 @@ func (b *Backend) prepareLaunchVolumes(ctx context.Context, mutations *storageMu
 	}
 	created := make(map[string]bool)
 	paths := make(map[string]string)
-	seedingSkipped := false
+	var skipped launchDegradations
 	for _, item := range params.Items {
 		setup := params.ImageSetups[item.ServiceName]
 		profile, ok := params.Profiles[item.SKU]
@@ -254,7 +256,7 @@ func (b *Backend) prepareLaunchVolumes(ctx context.Context, mutations *storageMu
 					// Writable-path seeding remains best effort. No path capability
 					// is issued for this volume; Compose retains its tmpfs fallback,
 					// and the launch is degraded (ENG-1125).
-					seedingSkipped = true
+					skipped.add(launchWritableVolumeUnavailable)
 					continue
 				}
 				return nil, fmt.Errorf("prepare launch volume %q: %w", name, err)
@@ -266,7 +268,7 @@ func (b *Backend) prepareLaunchVolumes(ctx context.Context, mutations *storageMu
 	if err != nil {
 		return nil, err
 	}
-	volumes.degraded = seedingSkipped
+	volumes.degradations.addAll(skipped)
 	return volumes, nil
 }
 

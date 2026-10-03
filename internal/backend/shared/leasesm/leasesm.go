@@ -331,7 +331,9 @@ type LeaseProvisionStore interface {
 // type that was dropped (e.g., "diag_gathered", "provision_completed").
 // LeaseFailureRecorded fires once for every failure the terminal budget
 // records, counted or not; the substrate labels it with cause.Label(), a closed
-// set (failurecause.Labels).
+// set (failurecause.Labels). PendingOperationUnstamped fires when a provision
+// or restore entered its in-flight state but its projection could not be
+// stamped with the operation it awaits (ENG-1125); any non-zero value is a bug.
 type SMMetrics interface {
 	SMTransition(source, dest, trigger string)
 	ActorCreated()
@@ -339,6 +341,7 @@ type SMMetrics interface {
 	ActorPanic()
 	TerminalEventDropped(event string)
 	LeaseFailureRecorded(cause failurecause.Cause)
+	PendingOperationUnstamped()
 }
 
 // LeaseActorConfig groups the dependencies a lease actor receives at

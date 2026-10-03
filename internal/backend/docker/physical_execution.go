@@ -20,8 +20,9 @@ import (
 // operation subject. The subject and its storageMutations never escape the
 // builder: the generic executor can invoke this capability, but cannot select
 // a lease, operation, project, or mutation after construction. Only a live
-// provision can report a finding (ENG-1125).
-type operationSubstrate func(context.Context) (startupFailure, error)
+// provision can report a finding, and only one its own session accepted
+// (ENG-1125).
+type operationSubstrate func(context.Context) (acceptedStartupFailure, error)
 
 func buildOperationSubstrate(
 	b *Backend,
@@ -29,7 +30,7 @@ func buildOperationSubstrate(
 ) func(substratemutation.Runner, shared.OperationPhysicalSubject) operationSubstrate {
 	return func(runner substratemutation.Runner, subject shared.OperationPhysicalSubject) operationSubstrate {
 		mutations := newOperationStorageMutations(runner, subject, ops)
-		return func(ctx context.Context) (finding startupFailure, runErr error) {
+		return func(ctx context.Context) (finding acceptedStartupFailure, runErr error) {
 			defer func() {
 				_, historical := subject.FailedReceiptCleanup()
 				if runErr != nil && !historical && !subject.RecoveryCleanup() {
@@ -37,17 +38,17 @@ func buildOperationSubstrate(
 				}
 			}()
 			if receipt, historical := subject.FailedReceiptCleanup(); historical {
-				return startupFailure{}, b.doFailedOperationReceiptCleanup(mutations, ctx, subject, receipt)
+				return acceptedStartupFailure{}, b.doFailedOperationReceiptCleanup(mutations, ctx, subject, receipt)
 			}
 			intent := subject.Intent()
 			if subject.RecoveryCleanup() {
-				return startupFailure{}, b.doOperationRecoveryCleanup(mutations, ctx, subject)
+				return acceptedStartupFailure{}, b.doOperationRecoveryCleanup(mutations, ctx, subject)
 			}
 			switch intent.Kind() {
 			case shared.OperationIntentProvision:
 				stack, err := manifest.ParseStoredPayload(intent.Manifest())
 				if err != nil {
-					return startupFailure{}, fmt.Errorf("parse Started provision manifest: %w", err)
+					return acceptedStartupFailure{}, fmt.Errorf("parse Started provision manifest: %w", err)
 				}
 				req := backend.ProvisionRequest{
 					LeaseUUID: intent.LeaseUUID(), Tenant: intent.Tenant(),
@@ -63,9 +64,9 @@ func buildOperationSubstrate(
 					),
 				)
 			case shared.OperationIntentRestore:
-				return startupFailure{}, b.doRestorePhysical(mutations, ctx, subject)
+				return acceptedStartupFailure{}, b.doRestorePhysical(mutations, ctx, subject)
 			default:
-				return startupFailure{}, fmt.Errorf("unsupported operation kind %q", intent.Kind())
+				return acceptedStartupFailure{}, fmt.Errorf("unsupported operation kind %q", intent.Kind())
 			}
 		}
 	}
@@ -75,9 +76,9 @@ func runOperationSubstrate(
 	ctx context.Context,
 	capability operationSubstrate,
 	_ shared.OperationPhysicalSubject,
-) (startupFailure, error) {
+) (acceptedStartupFailure, error) {
 	if capability == nil {
-		return startupFailure{}, errors.New("operation substrate capability is unavailable")
+		return acceptedStartupFailure{}, errors.New("operation substrate capability is unavailable")
 	}
 	return capability(ctx)
 }
@@ -410,12 +411,14 @@ func (b *Backend) executeProvisionWork(
 		}
 		if _, startup := outcome.StartupFailure(); startup {
 			// A definite startup failure (ENG-1125): the attempt was rolled
-			// back after its effects, so the projection returns to the lease's
-			// durable runtime before the actor publishes Failed.
-			if err := b.restoreFailedProvisionRuntime(claim); err != nil {
+			// back after its effects. The worker only derives the lease's
+			// durable runtime; the actor restores the projection to it inside
+			// its own Provisioning -> Failed transition.
+			runtime, err := b.failedProvisionDurableRuntime(claim)
+			if err != nil {
 				return mustProvisionAmbiguous(err, claim)
 			}
-			result, err := leasesm.NewProvisionWorkStartupFailure(outcome, proof)
+			result, err := leasesm.NewProvisionWorkStartupFailure(outcome, proof, runtime)
 			if err != nil {
 				return mustProvisionAmbiguous(err, claim)
 			}

@@ -118,6 +118,10 @@ func TestBudgetSequence_StartupFailureAttribution(t *testing.T) {
 		Reason: backend.ReasonHealthCheckFailed, Message: backend.MsgContainerUnhealthy,
 		InstanceID: startupContainer, Service: "app",
 	}
+	refused := shared.OperationStartupFailureTerms{
+		Reason: backend.ReasonContainerStartFailed, Message: backend.MsgContainerStartRefused,
+		InstanceID: startupContainer, Service: "app",
+	}
 	tests := []struct {
 		name  string
 		terms shared.OperationStartupFailureTerms
@@ -129,6 +133,7 @@ func TestBudgetSequence_StartupFailureAttribution(t *testing.T) {
 		{"no live event", startupExitTerms(unobserved), "unknown"},
 		{"degraded launch", degraded, "platform"},
 		{"health check never passed", unhealthy, "unhealthy"},
+		{"start refused by the container runtime", refused, "platform"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

@@ -5,11 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -241,12 +246,36 @@ func TestActiveReprovisionStartupCrashSettlesFailed(t *testing.T) {
 	}
 	assert.Equal(t, 2.0, failureCount("unknown")-unknownBefore)
 
-	// A later recovery sweep keeps the curated failure and the budget.
+	// A later recovery sweep keeps the curated failure and the budget. The
+	// active Release has no container until providerd re-provisions the
+	// lease, which is expected for a settled failure: it is not reported as a
+	// cohort divergence at ERROR on every pass.
+	logs := &lockedLog{}
+	b.logger = slog.New(slog.NewTextHandler(logs, nil))
 	require.NoError(t, b.recoverState(context.Background()))
 	rebuilt := f.projection(t)
 	assert.Equal(t, backend.ProvisionStatusFailed, rebuilt.Status)
 	assert.Equal(t, backend.ReasonContainerExited, rebuilt.Reason)
 	assert.Equal(t, 1, rebuilt.ObserveTerminalBudget().ConsecutiveFailures)
+	assert.NotContains(t, logs.String(), "recovered container cohort differs from durable release")
+}
+
+// lockedLog is a log sink safe for concurrent writers.
+type lockedLog struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
 }
 
 // A first provision (a PENDING lease, no predecessor) whose container exits
@@ -501,21 +530,192 @@ func TestActiveReprovisionUnhealthyStartupIsDefiniteAndUncounted(t *testing.T) {
 	}
 }
 
-// The classifier mints a definite startup failure only from its own positive
-// reads after the rollback. A canonical volume of the lease that is neither
-// the predecessor's nor created by this attempt is volume state the rollback
-// may not destroy, so the attempt stays Ambiguous.
-func TestStartupFailureWithUnattributedVolumeStateStaysAmbiguous(t *testing.T) {
+// A canonical volume of the lease that is neither the predecessor's nor
+// created by this attempt is volume state the live rollback may not destroy,
+// so the classifier's absence proof could never hold. The rollback is refused
+// before anything is removed (P2-1): the attempt stays Ambiguous with its
+// exited cohort kept, and one live recovery pass settles the failure, never
+// counted, instead of waiting out provision_timeout behind an empty inventory.
+func TestStartupFailureWithUnattributedVolumeStateKeepsTheCohortForRecovery(t *testing.T) {
 	f := newStartupCrashFixture(t, budgetTestLease, countedBudget(t))
+	f.death = observedRunDeath
 	leftover := canonicalVolumeName(budgetTestLease, manifest.DefaultServiceName, 7)
-	f.b.volumes = &mockVolumeManager{ListForProofFn: func(context.Context) ([]string, error) {
-		return []string{leftover}, nil
-	}}
+	inventory := newVolumeSet(leftover)
+	f.b.volumes = &mockVolumeManager{ListFn: inventory.list, DestroyFn: inventory.destroy}
 	f.provision(t)
 	awaitProvisionWorkerQuiescence(t, f.b, budgetTestLease)
 	assert.Equal(t, backend.ProvisionStatusProvisioning, f.projection(t).Status,
-		"unattributed volume state is not exact absence")
+		"unattributed volume state refuses the live rollback")
 	assert.Empty(t, f.failureCallbacks(), "nothing is published for an ambiguous attempt")
+	assert.NotEmpty(t, f.leaseContainers(t), "nothing was removed before the refusal: the exited cohort is kept")
+
+	f.requireOneRecoveryPassSettles(t)
+}
+
+// A startup failure whose execution already holds an issue cannot settle
+// live: the Guard would discard its finding, so the session refuses it before
+// anything is removed (P2-1). A failed detection is such an issue (the launch
+// proceeds degraded, and the crash it may have caused is the platform's).
+// The exited cohort is kept, and one live recovery pass settles the failure,
+// never counted.
+func TestStartupFailureAfterAnEarlierIssueKeepsTheCohortForRecovery(t *testing.T) {
+	f := newStartupCrashFixture(t, budgetTestLease, countedBudget(t))
+	f.death = observedRunDeath
+	f.mock.DetectWritablePathsFn = func(context.Context, string, int, []string) ([]string, error) {
+		return nil, errors.New("writable-path detection helper failed")
+	}
+	f.provision(t)
+	awaitProvisionWorkerQuiescence(t, f.b, budgetTestLease)
+	assert.Equal(t, backend.ProvisionStatusProvisioning, f.projection(t).Status,
+		"the session refused the finding: the outcome is ambiguous")
+	assert.Empty(t, f.failureCallbacks(), "nothing is published for an ambiguous attempt")
+	assert.NotEmpty(t, f.leaseContainers(t), "nothing was rolled back: the exited cohort is kept")
+
+	f.requireOneRecoveryPassSettles(t)
+}
+
+// requireOneRecoveryPassSettles runs one live operation recovery pass and
+// requires it to settle the lease's failed attempt: Failed, with the attempt's
+// own curated surface, and never counted.
+func (f *startupCrashFixture) requireOneRecoveryPassSettles(t *testing.T) {
+	t.Helper()
+	pending := f.projection(t)
+	before := pending.ObserveTerminalBudget()
+	require.NoError(t, f.b.recoverLiveOperationIntents(context.Background()))
+	intents, err := f.b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	assert.Empty(t, intents, "one live recovery pass settles the failed operation")
+	failed := f.projection(t)
+	assert.Equal(t, backend.ProvisionStatusFailed, failed.Status)
+	assert.Equal(t, backend.ReasonContainerExited, failed.Reason, "the curated surface captured first wins")
+	assert.Equal(t, before, failed.ObserveTerminalBudget(), "recovery never counts")
+	assert.Empty(t, f.leaseContainers(t), "recovery removed the kept cohort")
+}
+
+// rejectLaunch makes the fixture's Compose launch settle its exchange and then
+// fail, as `compose up` does when a depends_on dependency exits or turns
+// unhealthy, or when the daemon refuses a Start. refused names the containers
+// whose Start the daemon answered with a final error.
+func (f *startupCrashFixture) rejectLaunch(t *testing.T, refused ...string) {
+	t.Helper()
+	compose, ok := f.b.compose.(*mockComposeExecutor)
+	require.True(t, ok)
+	up := compose.UpFn
+	compose.LaunchFn = func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) daemonLaunchOutcome {
+		if err := up(ctx, project, opts); err != nil {
+			return daemonLaunchOutcome{settled: true, err: err}
+		}
+		return daemonLaunchOutcome{
+			settled: true, err: errors.New("compose up: dependency failed to start"), refusedStarts: refused,
+		}
+	}
+}
+
+// A launch exchange that settled with an error fails definitely from what its
+// cohort shows (P2-2): a container that exited is a positive fact, attributed
+// like any startup exit, so a live exit of the tenant process counts. Compose's
+// error text is never read; the attempt is rolled back at once.
+func TestRejectedLaunchWithAnExitedContainerFailsDefinitely(t *testing.T) {
+	f := newStartupCrashFixture(t, budgetTestLease, countedBudget(t))
+	f.death = observedRunDeath
+	f.rejectLaunch(t)
+	tenantBefore := failureCount("tenant_workload")
+	failed := f.settleAttempt(t, 1)
+	assert.Equal(t, backend.ProvisionStatusFailed, failed.Status)
+	assert.Equal(t, backend.ReasonContainerExited, failed.Reason)
+	assert.Empty(t, f.leaseContainers(t), "the attempt was rolled back exactly")
+	assert.Equal(t, 2, failed.ObserveTerminalBudget().ConsecutiveFailures, "a live exit of the tenant process counts")
+	assert.Equal(t, 1.0, failureCount("tenant_workload")-tenantBefore)
+}
+
+// A Start the daemon refused with a final response, on a container that never
+// ran (an OCI runtime error, such as an entrypoint missing from the image),
+// fails the provision definitely with ContainerStartFailed (P2-2). No tenant
+// process ran, so it never counts.
+func TestRejectedLaunchRefusedStartFailsDefinitelyAndNeverCounts(t *testing.T) {
+	f := newStartupCrashFixture(t, budgetTestLease, countedBudget(t))
+	f.candidate = func(info ContainerInfo) ContainerInfo {
+		info.Status, info.ExitCode = "created", 127
+		return info
+	}
+	f.rejectLaunch(t, "container-1")
+	platformBefore := failureCount("platform")
+	failed := f.settleAttempt(t, 1)
+	assert.Equal(t, backend.ProvisionStatusFailed, failed.Status)
+	assert.Equal(t, backend.ReasonContainerStartFailed, failed.Reason)
+	assert.Equal(t, backend.MsgContainerStartRefused, failed.Message)
+	assert.Equal(t, backend.MsgContainerStartRefused, f.failureCallbacks()[0].Error)
+	assert.Empty(t, f.leaseContainers(t), "the attempt was rolled back exactly")
+	assert.Equal(t, 1, failed.ObserveTerminalBudget().ConsecutiveFailures, "never counted")
+	assert.Equal(t, 1.0, failureCount("platform")-platformBefore)
+}
+
+// A rejected exchange whose cohort shows no positive failure is not definite
+// (P2-2): a created container whose Start the daemon never refused says
+// nothing about why the launch failed. The worker publishes nothing and keeps
+// the settled exchange's cohort for recovery.
+func TestRejectedLaunchWithoutAPositiveFactStaysAmbiguous(t *testing.T) {
+	f := newStartupCrashFixture(t, budgetTestLease, countedBudget(t))
+	f.candidate = func(info ContainerInfo) ContainerInfo {
+		info.Status = "created"
+		return info
+	}
+	f.rejectLaunch(t)
+	f.provision(t)
+	awaitProvisionWorkerQuiescence(t, f.b, budgetTestLease)
+	assert.Equal(t, backend.ProvisionStatusProvisioning, f.projection(t).Status)
+	assert.Empty(t, f.failureCallbacks(), "nothing is published for an ambiguous attempt")
+	assert.NotEmpty(t, f.leaseContainers(t), "a settled exchange keeps its cohort for recovery")
+}
+
+// A degraded launch through the docker backend's own preparation path:
+// writable-path seeding skipped a path without any failed Step (the
+// extraction helper reported that path's failure), so the launch proceeds on
+// the tmpfs fallback, degraded. A startup crash after it fails definitely but
+// never counts, even with an observed run: the platform skipped part of its
+// own preparation.
+func TestDegradedLaunchStartupCrashIsDefiniteAndNeverCounts(t *testing.T) {
+	f := newStartupCrashFixture(t, budgetTestLease, countedBudget(t))
+	f.death = observedRunDeath
+	volumeRoot := t.TempDir()
+	inventory := newVolumeSet()
+	f.b.cfg.VolumeDataPath = volumeRoot
+	f.b.volumes = &mockVolumeManager{
+		defaultDir: volumeRoot,
+		CreateFn: func(_ context.Context, id string, _ int64) (string, bool, error) {
+			path := filepath.Join(volumeRoot, id)
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				return "", false, err
+			}
+			inventory.mu.Lock()
+			inventory.present[id] = true
+			inventory.mu.Unlock()
+			return path, true, nil
+		},
+		ListFn:    inventory.list,
+		DestroyFn: inventory.destroy,
+	}
+	f.mock.DetectWritablePathsFn = func(context.Context, string, int, []string) ([]string, error) {
+		return []string{"/var/lib/app"}, nil
+	}
+	f.mock.ExtractImageContentFn = func(_ context.Context, _ string, paths []string, _ string, _, _ int64) map[string]error {
+		failures := make(map[string]error, len(paths))
+		for _, path := range paths {
+			failures[path] = errors.New("image layer read failed")
+		}
+		return failures
+	}
+	platformBefore := failureCount("platform")
+	tenantBefore := failureCount("tenant_workload")
+	failed := f.settleAttempt(t, 1)
+	assert.Equal(t, backend.ProvisionStatusFailed, failed.Status, "a degraded launch's startup crash is definite")
+	assert.Equal(t, backend.ReasonContainerExited, failed.Reason)
+	assert.Equal(t, &backend.TerminalBudgetObservation{
+		Verdict: backend.TerminalVerdictRetry, ConsecutiveFailures: 1,
+	}, failed.ObserveTerminalBudget(), "an observed run after a degraded launch never counts")
+	assert.Equal(t, 1.0, failureCount("platform")-platformBefore)
+	assert.Zero(t, failureCount("tenant_workload")-tenantBefore)
+	assert.Empty(t, f.leaseContainers(t), "the attempt was rolled back exactly")
 }
 
 // A rollback that cannot complete leaves the attempt Ambiguous: the worker

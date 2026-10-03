@@ -646,6 +646,7 @@ type provisionErroredMsg struct {
 	lastError        string
 	operationFailure shared.OperationReleaseUncommitted
 	startup          shared.OperationStartupFailure // ENG-1125; zero unless a definite startup failure
+	runtime          DurableRuntime                 // ENG-1125; zero unless a definite startup failure
 }
 
 func (provisionErroredMsg) isleaseMessage()          {}
@@ -1613,6 +1614,7 @@ func (a *LeaseActor) spawnProvisionWorker(
 				lastError:        typed.err.Error(),
 				operationFailure: typed.proof,
 				startup:          typed.startup,
+				runtime:          typed.runtime,
 			}
 			event = "provision_errored"
 		case provisionWorkAmbiguous:

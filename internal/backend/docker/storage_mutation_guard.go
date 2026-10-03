@@ -387,6 +387,17 @@ func (m *storageMutations) effectEntered() bool {
 	return m != nil && m.runner.EffectEntered()
 }
 
+// acceptStartupFailure asks this execution's session to accept a startup
+// finding minted for it (ENG-1125). The session refuses when any earlier Step
+// or Prepare failed, because the Guard would then discard the finding anyway:
+// the caller must not roll the attempt back for it.
+func (m *storageMutations) acceptStartupFailure(failure startupFailure) (acceptedStartupFailure, error) {
+	if m == nil || !failure.boundTo(m) {
+		return acceptedStartupFailure{}, errors.New("startup finding belongs to another execution")
+	}
+	return substratemutation.Accept(m.runner, failure)
+}
+
 func (m *storageMutations) composeDown(ctx context.Context, leaseUUID string, timeout time.Duration) error {
 	if err := m.requireLease(leaseUUID, "compose down"); err != nil {
 		return err
@@ -690,9 +701,12 @@ func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchC
 	// only the two finite launch workflows below, never an action-injection
 	// facade or a journal writer. Allocation happens after dispatch admission,
 	// so a refused/canceled Runner cannot leave false permanent launch debt.
-	dispatch := func(ctx context.Context, q *quiescedVolumes, operation string, action func(context.Context) daemonLaunchOutcome) error {
+	// A nil error means the exchange settled and its debt row was cleared
+	// through the step's own receipt; the outcome then carries the exchange's
+	// business result, which may still be an error.
+	dispatch := func(ctx context.Context, q *quiescedVolumes, operation string, action func(context.Context) daemonLaunchOutcome) (daemonLaunchOutcome, error) {
 		if q == nil || q.mutations == nil {
-			return errors.New("volume launch requires its protected volume set")
+			return daemonLaunchOutcome{}, errors.New("volume launch requires its protected volume set")
 		}
 		var debt shared.VolumeLaunchDebt
 		var outcome daemonLaunchOutcome
@@ -716,12 +730,12 @@ func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchC
 			return outcome.completionError()
 		})
 		if err := stepResult.Err(); err != nil {
-			return errors.Join(outcome.err, err)
+			return daemonLaunchOutcome{}, errors.Join(outcome.err, err)
 		}
 		if err := journal.Complete(debt, completed); err != nil {
-			return errors.Join(outcome.err, err)
+			return daemonLaunchOutcome{}, errors.Join(outcome.err, err)
 		}
-		return outcome.err
+		return outcome, nil
 	}
 	return &volumeLaunchCoordinator{
 		check:          journal.Check,
@@ -731,14 +745,17 @@ func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchC
 			if q == nil || q.mutations == nil || q.mutations.compensationSubject.Valid() {
 				return settledLaunch{}, errors.New("compose launch requires an operation or maintenance target")
 			}
-			if err := dispatch(ctx, q, shared.MaintenanceTargetLaunchStep, func(ctx context.Context) daemonLaunchOutcome {
+			outcome, err := dispatch(ctx, q, shared.MaintenanceTargetLaunchStep, func(ctx context.Context) daemonLaunchOutcome {
 				return q.mutations.ops.compose.launch(ctx, prepared, opts)
-			}); err != nil {
+			})
+			if err != nil {
 				return settledLaunch{}, err
 			}
-			// The exchange settled with no business error and its debt row was
-			// cleared through the step's own receipt: the launch is settled.
-			return newSettledLaunch(q), nil
+			// The exchange settled and its debt row was cleared through the
+			// step's own receipt: the launch is settled, whether every Create
+			// and Start succeeded or the exchange was rejected (ENG-1125). A
+			// rejection keeps its business error next to the receipt.
+			return newSettledLaunch(q, outcome), outcome.err
 		},
 		source: func(ctx context.Context, q *quiescedVolumes, schedule compensationStartup) error {
 			if q == nil || q.mutations == nil || !q.mutations.compensationSubject.Valid() || len(schedule.containers) == 0 {
@@ -747,7 +764,7 @@ func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchC
 			// The complete source sequence and its final receipt are lexical to
 			// one workflow. There is no first-create capability or reusable last
 			// successful step which could hide a later failed/unknown request.
-			return dispatch(ctx, q, shared.MaintenanceSourceLaunchStep, func(ctx context.Context) daemonLaunchOutcome {
+			outcome, err := dispatch(ctx, q, shared.MaintenanceSourceLaunchStep, func(ctx context.Context) daemonLaunchOutcome {
 				m := q.mutations
 				created := make(map[string][]string)
 				byName := make(map[string]string)
@@ -788,6 +805,10 @@ func newVolumeLaunchCoordinator(callbacks *shared.CallbackStore) (*volumeLaunchC
 				}
 				return daemonLaunchOutcome{settled: true}
 			})
+			if err != nil {
+				return err
+			}
+			return outcome.err
 		},
 	}, nil
 }

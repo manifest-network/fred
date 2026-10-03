@@ -109,27 +109,31 @@ func (r Runner) EffectEntered() bool {
 //
 // A workflow may also report a Finding: a typed, domain-sealed account of a
 // definite outcome it observed after its effects (for example, a container that
-// positively failed startup verification and was rolled back exactly). Only a
-// wholly successful session hands the Finding to the classifier, which alone
-// decides whether it becomes Attested evidence. Any build, workflow, Step or
-// Prepare error, or a panic, discards it, so a post-effect error that carries no
-// finding stays Ambiguous by construction. A domain's Finding zero value must
-// mean "no finding".
+// positively failed startup verification and was rolled back exactly). It
+// reports one only as an Accepted value, which Accept mints solely while the
+// live session is still free of issues, so work that depends on the finding can
+// run after acceptance and never for a finding the Guard is already bound to
+// discard. Only a wholly successful session hands the accepted finding to the
+// classifier, which alone decides whether it becomes Attested evidence. Any
+// build, workflow, Step or Prepare error, or a panic, discards it, so a
+// post-effect error that carries no finding stays Ambiguous by construction.
+// Absence is structural: the classifier receives the zero Accepted value, never
+// a domain zero value it would have to interpret.
 type Guard[T any, Subject comparable, Finding any, Evidence any] struct {
 	protocol  *Protocol[Subject]
 	executor  *executorLineage
 	authorize Authorize
 	complete  Complete
 	build     func(Runner, Subject) T
-	run       func(context.Context, T, Subject) (Finding, error)
-	classify  func(context.Context, Subject, Finding) (Evidence, error)
+	run       func(context.Context, T, Subject) (Accepted[Finding], error)
+	classify  func(context.Context, Subject, Accepted[Finding]) (Evidence, error)
 }
 
 // NoFinding is the Finding of a workflow that never reports one.
 type NoFinding struct{}
 
 // NewExecutor binds a workflow that reports no Finding. It is NewFindingExecutor
-// with a workflow and classifier that ignore the (always empty) finding.
+// with a workflow and classifier that ignore the (always absent) finding.
 func NewExecutor[T any, Subject comparable, Evidence any](
 	binding GuardBinding[Subject],
 	authorize Authorize,
@@ -147,10 +151,10 @@ func NewExecutor[T any, Subject comparable, Evidence any](
 		return nil, nil, errors.New("strict exhaustive substrate classifier is required")
 	}
 	return NewFindingExecutor(binding, authorize, complete, build,
-		func(ctx context.Context, capability T, subject Subject) (NoFinding, error) {
-			return NoFinding{}, run(ctx, capability, subject)
+		func(ctx context.Context, capability T, subject Subject) (Accepted[NoFinding], error) {
+			return Accepted[NoFinding]{}, run(ctx, capability, subject)
 		},
-		func(ctx context.Context, subject Subject, _ NoFinding) (Evidence, error) {
+		func(ctx context.Context, subject Subject, _ Accepted[NoFinding]) (Evidence, error) {
 			return classify(ctx, subject)
 		},
 	)
@@ -161,14 +165,14 @@ func NewExecutor[T any, Subject comparable, Evidence any](
 // checked before the one-shot binding is consumed. Live workflows and restart
 // recovery therefore cannot be wired to independently swappable physical
 // authorities. Recovery never sees a Finding: its classifier always receives
-// the zero value.
+// the zero (absent) Accepted value.
 func NewFindingExecutor[T any, Subject comparable, Finding any, Evidence any](
 	binding GuardBinding[Subject],
 	authorize Authorize,
 	complete Complete,
 	build func(Runner, Subject) T,
-	run func(context.Context, T, Subject) (Finding, error),
-	classify func(context.Context, Subject, Finding) (Evidence, error),
+	run func(context.Context, T, Subject) (Accepted[Finding], error),
+	classify func(context.Context, Subject, Accepted[Finding]) (Evidence, error),
 ) (*Guard[T, Subject, Finding, Evidence], *RecoveryAttestor[Subject, Evidence], error) {
 	protocol := binding.protocol
 	if protocol == nil || protocol.lineage == nil {
@@ -205,10 +209,9 @@ func NewFindingExecutor[T any, Subject comparable, Finding any, Evidence any](
 }
 
 // classifyWithout is the classifier as every recovery path, and every
-// unsuccessful live session, sees it: with no Finding.
+// unsuccessful live session, sees it: with the absent Finding.
 func (g *Guard[T, Subject, Finding, Evidence]) classifyWithout(ctx context.Context, subject Subject) (Evidence, error) {
-	var none Finding
-	return g.classify(ctx, subject, none)
+	return g.classify(ctx, subject, Accepted[Finding]{})
 }
 
 // session aggregates the complete workflow history. A caller cannot launder
@@ -216,9 +219,12 @@ func (g *Guard[T, Subject, Finding, Evidence]) classifyWithout(ctx context.Conte
 // refused step: once any action is entered, every error makes the workflow
 // Ambiguous.
 type session struct {
-	subject         any // always the Guard's comparable, opaque subject
-	mu              sync.Mutex
-	active          bool
+	subject any // always the Guard's comparable, opaque subject
+	mu      sync.Mutex
+	active  bool
+	// live marks a live Execute session, the only kind that may accept a
+	// Finding; a recovery session never carries one.
+	live            bool
 	effectEntered   bool
 	issues          error
 	issueGeneration uint64
@@ -382,15 +388,14 @@ func callBuild[T any, Subject comparable](
 }
 
 func callWorkflow[T any, Subject comparable, Finding any](
-	workflow func(context.Context, T, Subject) (Finding, error),
+	workflow func(context.Context, T, Subject) (Accepted[Finding], error),
 	ctx context.Context,
 	capability T,
 	subject Subject,
-) (finding Finding, err error) {
+) (finding Accepted[Finding], err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			var none Finding
-			finding = none
+			finding = Accepted[Finding]{}
 			err = fmt.Errorf("physical mutation workflow panicked: %v", recovered)
 		}
 	}()
@@ -415,9 +420,9 @@ func (g *Guard[T, Subject, Finding, Evidence]) Execute(
 	if err := proof.consume(); err != nil {
 		return invalidResult[Subject, Evidence](err)
 	}
-	s := &session{active: true, authorize: g.authorize, complete: g.complete, subject: subject}
+	s := &session{active: true, live: true, authorize: g.authorize, complete: g.complete, subject: subject}
 	capability, buildErr := callBuild(g.build, Runner{session: s}, subject)
-	var finding Finding
+	var finding Accepted[Finding]
 	var workflowErr error
 	if buildErr == nil {
 		finding, workflowErr = callWorkflow(g.run, ctx, capability, subject)
@@ -430,6 +435,9 @@ func (g *Guard[T, Subject, Finding, Evidence]) Execute(
 	s.mu.Unlock()
 
 	causalErr := errors.Join(buildErr, workflowErr, issues)
+	if !finding.acceptedBy(s) {
+		causalErr = errors.Join(causalErr, errors.New("physical mutation finding was accepted by another execution"))
+	}
 	if !entered {
 		if causalErr == nil {
 			causalErr = errors.New("physical mutation workflow performed no mutation")
@@ -439,8 +447,8 @@ func (g *Guard[T, Subject, Finding, Evidence]) Execute(
 
 	// Only a wholly successful session may hand its Finding to the classifier.
 	// Any build, workflow, Step or Prepare error discards it, even one the
-	// workflow swallowed, so an error after an effect stays Ambiguous whatever
-	// the workflow reported.
+	// workflow swallowed or one after its acceptance, so an error after an
+	// effect stays Ambiguous whatever the workflow reported.
 	classify := g.classifyWithout
 	if causalErr == nil {
 		classify = func(ctx context.Context, subject Subject) (Evidence, error) {
@@ -469,8 +477,8 @@ func (g *Guard[T, Subject, Finding, Evidence]) Execute(
 // idempotent, so an already-absent target is a successful recovery postcondition,
 // not a new synchronous refusal. A workflow error before the first Step remains
 // Refused, while any error after a Step remains Ambiguous. Recovery never
-// carries a Finding to the classifier: whatever the workflow reports is
-// discarded.
+// carries a Finding to the classifier: its session refuses Accept, and the
+// classifier always receives the absent value.
 func (g *Guard[T, Subject, Finding, Evidence]) ExecuteRecovery(
 	execution RecoveryExecution[Subject],
 	ctx context.Context,

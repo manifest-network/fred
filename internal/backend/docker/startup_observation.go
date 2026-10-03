@@ -20,16 +20,25 @@ import (
 // cohort started. It watches EVERY container of the cohort on every pass, so a
 // service that exits while another service still waits for its health check
 // is seen, and it reports Ready only from one whole-cohort pass in which every
-// container is ready.
+// container is ready. A health-gated container that reported healthy once is
+// from then on watched only for its exit: a later unhealthy report is a flap,
+// which steady state ignores too, never a startup failure.
+//
+// A launch exchange that settled with an error (Compose reported a dependency
+// that exited or turned unhealthy, or the daemon refused a Start) is observed
+// once, and fails definitely only on a positive account of one container: an
+// exit, an unhealthy report, or a Start the daemon refused on a container that
+// never ran. Anything else stays unverified.
 //
 // Startup failures carry their curated tenant surface, authored here where the
 // failure is observed (ENG-508): no caller derives a message or a reason from
 // an error's text. Only an observed exit is ContainerExited, the one reason
 // the terminal budget can count (ENG-799). A health check that reported
 // unhealthy, or that never passed before the startup deadline, is
-// HealthCheckFailed, which never counts. A failed read, a cancellation, or a
-// container in a state that says nothing about the tenant's workload is
-// unverified: Internal, and never a definite failure.
+// HealthCheckFailed, and a refused start is ContainerStartFailed; neither ever
+// counts. A failed read, a cancellation, or a container in a state that says
+// nothing about the tenant's workload is unverified: Internal, and never a
+// definite failure.
 
 // healthPollInterval is the interval between whole-cohort passes while a
 // health-gated service is starting.
@@ -58,6 +67,18 @@ func startupHealthDeadlineFailure(cause error) *physicalOperationError {
 	return &physicalOperationError{callback: backend.MsgHealthCheckDeadline, reason: backend.ReasonHealthCheckFailed, cause: cause}
 }
 
+func startupStartRefusedFailure(cause error) *physicalOperationError {
+	return &physicalOperationError{callback: backend.MsgContainerStartRefused, reason: backend.ReasonContainerStartFailed, cause: cause}
+}
+
+// launchRejectedFailure is the surface of a launch exchange that settled with
+// an error but showed no positive failure of any container. Compose's error
+// is operator detail only.
+func launchRejectedFailure(cause error) *physicalOperationError {
+	return &physicalOperationError{callback: "container creation failed", reason: backend.ReasonInternal,
+		cause: fmt.Errorf("compose up failed: %w", cause)}
+}
+
 func startupUnverifiedFailure(cause error) *physicalOperationError {
 	return &physicalOperationError{callback: backend.MsgStartupUnverified, reason: backend.ReasonInternal, cause: cause}
 }
@@ -79,41 +100,61 @@ const (
 	startupInstanceExited
 	// startupInstanceUnhealthy: running, and its health check reported unhealthy.
 	startupInstanceUnhealthy
+	// startupInstanceStartRefused: created, and the daemon refused its Start.
+	startupInstanceStartRefused
 	// startupInstanceUnverified: a state that says nothing about the workload.
 	startupInstanceUnverified
 )
 
+// startupMemberFacts is what a watch knows about one member beyond its latest
+// inspection.
+type startupMemberFacts struct {
+	healthGated bool
+	// passedHealth: the member reported healthy in an earlier pass of this
+	// watch, so from then on only its exit is observed.
+	passedHealth bool
+	// startRefused: the launch's settled exchange recorded the daemon's final
+	// refusal of this member's Start.
+	startRefused bool
+}
+
 // classifyStartupInstance is the live startup state table, total over every
-// Docker status and health value:
+// Docker status, health value and member fact:
 //
-//	exited                                  -> exited
-//	running, not health-gated               -> ready
-//	running, health-gated, healthy          -> ready
-//	running, health-gated, unhealthy        -> unhealthy
-//	running, health-gated, starting/none/?  -> pending
-//	created/restarting/paused, health-gated -> pending
-//	created/restarting/paused, fixed wait   -> unverified
-//	removing/dead/empty/anything else       -> unverified
+//	exited                                       -> exited
+//	running, not health-gated                    -> ready
+//	running, health-gated, healthy before        -> ready (whatever its health now)
+//	running, health-gated, healthy               -> ready
+//	running, health-gated, unhealthy             -> unhealthy
+//	running, health-gated, starting/none/?       -> pending
+//	created, its Start refused by the daemon     -> start refused
+//	created/restarting/paused, health-gated      -> pending
+//	created/restarting/paused, fixed wait        -> unverified
+//	removing/dead/empty/anything else            -> unverified
 //
 // It differs from the recovery table (containerStatusToProvisionStatus) on
-// purpose, and only in two places. Recovery maps removing and dead to Failed:
-// it fails an attempt whose worker is gone and attributes nothing, so any
-// cohort that can no longer become Ready is enough. This table decides
-// whether a live attempt failed DEFINITELY, with an attribution, so it accepts
-// only the workload's own account (an exit, a health verdict): removing and
-// dead are the daemon's states, and stay unverified. Recovery maps paused to
-// Ready because it re-adopts an existing cohort; a paused container cannot be
-// verified as a started workload, so here it is pending behind a health check
-// and unverified otherwise.
-func classifyStartupInstance(info *ContainerInfo, healthGated bool) startupInstanceVerdict {
+// purpose. Recovery maps removing and dead to Failed: it fails an attempt
+// whose worker is gone and attributes nothing, so any cohort that can no
+// longer become Ready is enough. This table decides whether a live attempt
+// failed DEFINITELY, with an attribution, so it accepts only the workload's
+// own account (an exit, a health verdict) or the daemon's final refusal of a
+// Start it was sent: removing and dead are the daemon's states, and stay
+// unverified. Recovery maps paused to Ready because it re-adopts an existing
+// cohort; a paused container cannot be verified as a started workload, so
+// here it is pending behind a health check and unverified otherwise. Recovery
+// waits on a created container, because it cannot know whether its Start was
+// ever sent; this table knows that only from the launch's own exchange. And
+// recovery reads health afresh, while a live watch stops reading a member's
+// health once it passed, as the steady state does after Ready.
+func classifyStartupInstance(info *ContainerInfo, facts startupMemberFacts) startupInstanceVerdict {
 	if info == nil {
 		return startupInstanceUnverified
 	}
-	switch strings.ToLower(info.Status) {
+	switch status := strings.ToLower(info.Status); status {
 	case "exited":
 		return startupInstanceExited
 	case "running":
-		if !healthGated {
+		if !facts.healthGated || facts.passedHealth {
 			return startupInstanceReady
 		}
 		switch info.Health {
@@ -125,7 +166,10 @@ func classifyStartupInstance(info *ContainerInfo, healthGated bool) startupInsta
 			return startupInstancePending
 		}
 	case "created", "restarting", "paused":
-		if healthGated {
+		if status == "created" && facts.startRefused {
+			return startupInstanceStartRefused
+		}
+		if facts.healthGated {
 			return startupInstancePending
 		}
 		return startupInstanceUnverified
@@ -134,11 +178,41 @@ func classifyStartupInstance(info *ContainerInfo, healthGated bool) startupInsta
 	}
 }
 
-// startupContainer is one member of a launch's exact Compose PS cohort.
+// startupContainer is one member of a launch's Compose PS cohort.
 type startupContainer struct {
 	id          string
 	service     string
 	healthGated bool
+}
+
+// startupMemory is what one watch remembers across its passes: the members
+// whose Start the launch's exchange recorded as refused, and the health-gated
+// members that already reported healthy.
+type startupMemory struct {
+	launch       settledLaunch
+	passedHealth map[string]struct{}
+}
+
+func newStartupMemory(launch settledLaunch) *startupMemory {
+	return &startupMemory{launch: launch, passedHealth: make(map[string]struct{})}
+}
+
+func (m *startupMemory) facts(member startupContainer) startupMemberFacts {
+	_, passed := m.passedHealth[member.id]
+	return startupMemberFacts{
+		healthGated: member.healthGated, passedHealth: passed, startRefused: m.launch.startRefused(member.id),
+	}
+}
+
+// remember records every health-gated member this pass saw running and healthy.
+func (m *startupMemory) remember(pass startupPass) {
+	for i, member := range pass.members {
+		info := pass.infos[i]
+		if member.healthGated && info != nil && strings.EqualFold(info.Status, "running") &&
+			info.Health == HealthStatusHealthy {
+			m.passedHealth[member.id] = struct{}{}
+		}
+	}
 }
 
 // startupCohort is a launch's exact cohort in a deterministic order.
@@ -191,6 +265,7 @@ const (
 	startupVerdictExited
 	startupVerdictUnhealthy
 	startupVerdictNeverHealthy
+	startupVerdictStartRefused
 	startupVerdictUnverified
 )
 
@@ -206,7 +281,7 @@ type startupWatch struct {
 
 func (w startupWatch) failed() bool {
 	switch w.verdict {
-	case startupVerdictExited, startupVerdictUnhealthy, startupVerdictNeverHealthy:
+	case startupVerdictExited, startupVerdictUnhealthy, startupVerdictNeverHealthy, startupVerdictStartRefused:
 		return true
 	default:
 		return false
@@ -224,9 +299,10 @@ type startupPass struct {
 	verdicts []startupInstanceVerdict
 }
 
-// inspectStartupCohort inspects every container of the cohort once. A failed
-// read ends the pass unverified: a failed read is never a fact.
-func (b *Backend) inspectStartupCohort(ctx context.Context, cohort startupCohort) (startupPass, *physicalOperationError) {
+// inspectStartupCohort inspects every container of the cohort once and
+// classifies each against what the watch remembers of it. A failed read ends
+// the pass unverified: a failed read is never a fact.
+func (b *Backend) inspectStartupCohort(ctx context.Context, cohort startupCohort, memory *startupMemory) (startupPass, *physicalOperationError) {
 	pass := startupPass{
 		members:  slices.Clone(cohort),
 		infos:    make([]*ContainerInfo, len(cohort)),
@@ -239,7 +315,7 @@ func (b *Backend) inspectStartupCohort(ctx context.Context, cohort startupCohort
 				"failed to inspect %s during startup: %w", member, err))
 		}
 		pass.infos[i] = info
-		pass.verdicts[i] = classifyStartupInstance(info, member.healthGated)
+		pass.verdicts[i] = classifyStartupInstance(info, memory.facts(member))
 	}
 	return pass, nil
 }
@@ -251,13 +327,12 @@ func (m startupContainer) String() string {
 	return "container " + leasesm.ShortID(m.id) + " of service " + m.service
 }
 
-// decideStartupPass turns one pass into a verdict. A positively observed exit
-// is the most specific fact and wins over every other container's state; then
-// an unhealthy report; then any unverifiable state. settled reports whether
-// the fixed-wait containers' settle period has passed.
-func (b *Backend) decideStartupPass(ctx context.Context, pass startupPass, settled bool) (startupWatch, bool) {
+// decideStartupFailure returns the pass's most specific positive failure, if
+// any. A positively observed exit wins over every other container's state;
+// then an unhealthy report; then a Start the daemon refused.
+func (b *Backend) decideStartupFailure(ctx context.Context, pass startupPass) (startupWatch, bool) {
 	for _, wanted := range []startupInstanceVerdict{
-		startupInstanceExited, startupInstanceUnhealthy, startupInstanceUnverified,
+		startupInstanceExited, startupInstanceUnhealthy, startupInstanceStartRefused,
 	} {
 		for i, verdict := range pass.verdicts {
 			if verdict != wanted {
@@ -279,9 +354,29 @@ func (b *Backend) decideStartupPass(ctx context.Context, pass startupPass, settl
 					surface: startupUnhealthyFailure(fmt.Errorf("%s reported unhealthy: %s", member, diag)),
 				}, true
 			default:
-				return unverifiedStartup(startupUnverifiedFailure(fmt.Errorf(
-					"%s is in an unverifiable startup state (status: %s)", member, info.Status))), true
+				return startupWatch{
+					verdict: startupVerdictStartRefused, container: member, info: info,
+					surface: startupStartRefusedFailure(fmt.Errorf(
+						"the daemon refused to start %s (status: %s)", member, info.Status)),
+				}, true
 			}
+		}
+	}
+	return startupWatch{}, false
+}
+
+// decideStartupPass turns one pass into a verdict: a positive failure first
+// (decideStartupFailure), then any unverifiable state. settled reports
+// whether the fixed-wait containers' settle period has passed.
+func (b *Backend) decideStartupPass(ctx context.Context, pass startupPass, settled bool) (startupWatch, bool) {
+	if watch, failed := b.decideStartupFailure(ctx, pass); failed {
+		return watch, true
+	}
+	for i, verdict := range pass.verdicts {
+		if verdict == startupInstanceUnverified {
+			member, info := pass.members[i], pass.infos[i]
+			return unverifiedStartup(startupUnverifiedFailure(fmt.Errorf(
+				"%s is in an unverifiable startup state (status: %s)", member, info.Status))), true
 		}
 	}
 	if !settled {
@@ -332,9 +427,10 @@ func (b *Backend) decideStartupDeadline(ctx context.Context, pass startupPass, s
 // watchStartup observes cohort until every container is ready, one fails, or
 // the observation can no longer be trusted. Fixed-wait containers must stay
 // running for the configured settle period; health-gated containers must
-// report healthy. Every pass inspects the whole cohort, so a container that
-// exits after passing its own check is still seen, and Ready is reported only
-// from one pass in which every container is ready.
+// report healthy once, and are then watched only for their exit (memory). Every
+// pass inspects the whole cohort, so a container that exits after passing its
+// own check is still seen, and Ready is reported only from one pass in which
+// every container is ready.
 //
 // observeUntil, when set, is the observation's own deadline: a last pass then
 // decides between a health check that never passed (definite) and an
@@ -343,6 +439,7 @@ func (b *Backend) decideStartupDeadline(ctx context.Context, pass startupPass, s
 func (b *Backend) watchStartup(
 	ctx context.Context,
 	cohort startupCohort,
+	memory *startupMemory,
 	observeUntil time.Time,
 	logger *slog.Logger,
 ) startupWatch {
@@ -383,17 +480,18 @@ func (b *Backend) watchStartup(
 				"canceled during startup verification: %w", ctx.Err())))
 		case <-deadline:
 			wake.Stop()
-			pass, failure := b.inspectStartupCohort(ctx, cohort)
+			pass, failure := b.inspectStartupCohort(ctx, cohort, memory)
 			if failure != nil {
 				return unverifiedStartup(failure)
 			}
 			return b.decideStartupDeadline(ctx, pass, !time.Now().Before(settleEnd))
 		case <-wake.C:
 		}
-		pass, failure := b.inspectStartupCohort(ctx, cohort)
+		pass, failure := b.inspectStartupCohort(ctx, cohort, memory)
 		if failure != nil {
 			return unverifiedStartup(failure)
 		}
+		memory.remember(pass)
 		if watch, decided := b.decideStartupPass(ctx, pass, !time.Now().Before(settleEnd)); decided {
 			if watch.verdict == startupVerdictReady {
 				logger.Info("startup cohort verified", "containers", len(cohort))
@@ -433,9 +531,10 @@ type startupObservation struct {
 	unverified *physicalOperationError
 }
 
-// observeStartup observes a provision's settled launch. A failure becomes a
-// finding only through newStartupFailure, which re-checks every fact it needs;
-// when it cannot, the failure stays unverified and the attempt Ambiguous.
+// observeStartup observes the startup of a provision's launch that settled with
+// every Create and Start successful. A failure becomes a finding only through
+// newStartupFailure, which re-checks every fact it needs; when it cannot, the
+// failure stays unverified and the attempt Ambiguous.
 func (b *Backend) observeStartup(
 	ctx context.Context,
 	mutations *storageMutations,
@@ -443,7 +542,54 @@ func (b *Backend) observeStartup(
 	cohort startupCohort,
 	logger *slog.Logger,
 ) startupObservation {
-	watch := b.watchStartup(ctx, cohort, startupObservationDeadline(ctx, time.Now()), logger)
+	if launch.rejected() {
+		return startupObservation{kind: startupObservedUnverified,
+			unverified: startupUnverifiedFailure(errors.New("startup observation requires a launched exchange"))}
+	}
+	watch := b.watchStartup(ctx, cohort, newStartupMemory(launch), startupObservationDeadline(ctx, time.Now()), logger)
+	return b.startupObservationOf(ctx, mutations, launch, cohort, watch, logger)
+}
+
+// observeRejectedLaunch observes, once, the cohort of a provision's launch
+// whose exchange settled but was rejected: Compose reported an error, such as
+// a depends_on dependency that exited or turned unhealthy, or the daemon
+// refused a Start. Only a positive account of one container is a definite
+// failure: an exit, an unhealthy report, or a Start the daemon refused on a
+// container that never ran. Compose's error itself is never read for a
+// verdict. Anything else, Ready included, stays unverified with an Internal
+// surface: the launch failed for a reason no container shows.
+func (b *Backend) observeRejectedLaunch(
+	ctx context.Context,
+	mutations *storageMutations,
+	launch settledLaunch,
+	cohort startupCohort,
+	rejection error,
+	logger *slog.Logger,
+) startupObservation {
+	if !launch.rejected() || rejection == nil {
+		return startupObservation{kind: startupObservedUnverified,
+			unverified: startupUnverifiedFailure(errors.New("rejected-launch observation requires a rejected exchange"))}
+	}
+	pass, failure := b.inspectStartupCohort(ctx, cohort, newStartupMemory(launch))
+	if failure != nil {
+		return startupObservation{kind: startupObservedUnverified, unverified: failure}
+	}
+	watch, failed := b.decideStartupFailure(ctx, pass)
+	if !failed {
+		return startupObservation{kind: startupObservedUnverified, unverified: launchRejectedFailure(rejection)}
+	}
+	return b.startupObservationOf(ctx, mutations, launch, cohort, watch, logger)
+}
+
+// startupObservationOf seals a finished watch into an observation.
+func (b *Backend) startupObservationOf(
+	ctx context.Context,
+	mutations *storageMutations,
+	launch settledLaunch,
+	cohort startupCohort,
+	watch startupWatch,
+	logger *slog.Logger,
+) startupObservation {
 	switch {
 	case watch.verdict == startupVerdictReady:
 		return startupObservation{kind: startupObservedReady}
@@ -453,6 +599,10 @@ func (b *Backend) observeStartup(
 			logger.Warn("startup failure observed but not provable; leaving the attempt to recovery",
 				"container_id", leasesm.ShortID(watch.container.id), "error", err)
 			return startupObservation{kind: startupObservedUnverified, unverified: watch.surface}
+		}
+		if launch.degraded() {
+			logger.Warn("startup failed after a degraded launch; it never counts",
+				"container_id", leasesm.ShortID(watch.container.id), "degradations", launch.degradations().String())
 		}
 		return startupObservation{kind: startupObservedFailure, failure: failure}
 	default:
@@ -503,7 +653,7 @@ func (b *Backend) observeReplacementStartup(
 	if err != nil {
 		return err
 	}
-	return flattenStartupWatch(b.watchStartup(ctx, cohort, time.Time{}, logger))
+	return flattenStartupWatch(b.watchStartup(ctx, cohort, newStartupMemory(settledLaunch{}), time.Time{}, logger))
 }
 
 // verifyStartup is the error-only check of one service's containers that a
@@ -516,7 +666,7 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 	for _, id := range containerIDs {
 		cohort = append(cohort, startupContainer{id: id, healthGated: m.HasActiveHealthCheck()})
 	}
-	return flattenStartupWatch(b.watchStartup(ctx, cohort, time.Time{}, logger))
+	return flattenStartupWatch(b.watchStartup(ctx, cohort, newStartupMemory(settledLaunch{}), time.Time{}, logger))
 }
 
 // waitForHealthy is the error-only wait for a compensating relaunch's health
@@ -526,5 +676,5 @@ func (b *Backend) waitForHealthy(ctx context.Context, containerIDs []string, log
 	for _, id := range containerIDs {
 		cohort = append(cohort, startupContainer{id: id, healthGated: true})
 	}
-	return flattenStartupWatch(b.watchStartup(ctx, cohort, time.Time{}, logger))
+	return flattenStartupWatch(b.watchStartup(ctx, cohort, newStartupMemory(settledLaunch{}), time.Time{}, logger))
 }

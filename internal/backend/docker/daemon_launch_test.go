@@ -41,6 +41,69 @@ func TestDaemonLaunchResponsesSeparateBusinessFailureFromCompletion(t *testing.T
 	}
 }
 
+// A settled exchange records the containers whose Start the daemon answered
+// with a final error, by the request path's container reference (ENG-1125).
+// A successful or not-modified Start, a Create, and an unknown transport
+// outcome record nothing.
+func TestDaemonLaunchRecordsStartsTheDaemonRefused(t *testing.T) {
+	statuses := map[string]int{
+		"refused-500":   http.StatusInternalServerError,
+		"refused-400":   http.StatusBadRequest,
+		"refused-409":   http.StatusConflict,
+		"started":       http.StatusNoContent,
+		"already-start": http.StatusNotModified,
+	}
+	scope := newDaemonLaunchScope(t.Context(), nil)
+	transport := daemonLaunchTransport{scope: scope, next: dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/containers/create") {
+			return imageSecurityResponse(http.StatusInternalServerError, `{}`), nil
+		}
+		reference := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/v1.51/containers/"), "/start")
+		return imageSecurityResponse(statuses[reference], `{}`), nil
+	})}
+	for _, path := range []string{
+		"/v1.51/containers/refused-500/start", "/v1.51/containers/refused-400/start",
+		"/v1.51/containers/refused-409/start", "/v1.51/containers/started/start",
+		"/v1.51/containers/already-start/start", "/v1.51/containers/create",
+	} {
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://docker.invalid"+path, nil)
+		require.NoError(t, err)
+		response, err := transport.RoundTrip(request)
+		require.NoError(t, err)
+		require.NoError(t, response.Body.Close())
+	}
+	outcome := scope.finish(errors.New("compose up failed"))
+	require.True(t, outcome.settled)
+	require.ElementsMatch(t, []string{"refused-500", "refused-400", "refused-409"}, outcome.refusedStarts)
+
+	unknown := newDaemonLaunchScope(t.Context(), nil)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://docker.invalid/v1.51/containers/lost/start", nil)
+	require.NoError(t, err)
+	_, err = (daemonLaunchTransport{scope: unknown, next: dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, context.DeadlineExceeded
+	})}).RoundTrip(request)
+	require.Error(t, err)
+	lost := unknown.finish(err)
+	require.False(t, lost.settled)
+	require.Empty(t, lost.refusedStarts, "a Start with no final response is never a refusal")
+
+	for _, target := range []struct {
+		path string
+		want string
+	}{
+		{"/v1.51/containers/abc/start", "abc"},
+		{"/containers/abc/start", "abc"},
+		{"/v1.51/containers/abc/stop", ""},
+		{"/v1.51/containers/abc/exec/start", ""},
+		{"/v1.51/containers//start", ""},
+	} {
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://docker.invalid"+target.path, nil)
+		require.NoError(t, err)
+		require.Equal(t, target.want, daemonRefusedStartTarget(request, imageSecurityResponse(http.StatusInternalServerError, `{}`)),
+			target.path)
+	}
+}
+
 func TestCompensationSDKAuthorizationDenialRetainsFailureAndCompletesRequest(t *testing.T) {
 	observer := new(daemonLaunchObserver)
 	requests := 0

@@ -449,7 +449,9 @@ func (lsm *leaseSM) requestDeprovision(ctx context.Context) error {
 }
 
 // requestProvision accepts the provision whose exact claim the projection then
-// awaits (ENG-1125).
+// awaits (ENG-1125). handleProvisionRequested has already checked that the
+// store-issued claim belongs to this lease; onEnterProvisioning reports a stamp
+// that still fails.
 func (lsm *leaseSM) requestProvision(ctx context.Context, operation shared.OperationIntentClaim) error {
 	return lsm.fireAndExpect(ctx, evProvisionRequested, backend.ProvisionStatusProvisioning, operation)
 }
@@ -701,14 +703,33 @@ func (lsm *leaseSM) onEnterProvisioning(_ context.Context, args ...any) error {
 	// state; requestProvision is its only sender.
 	operation := args[0].(shared.OperationIntentClaim)
 	now := time.Now()
-	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
+	stamped := false
+	applied := lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
 		p.SetStatus(backend.ProvisionStatusProvisioning, now)
-		p.AwaitOperation(operation)
+		// Never leave an earlier operation's stamp behind a refused one.
+		p.awaitNoOperation()
+		stamped = p.AwaitOperation(operation)
 		p.LastError = ""
 		p.Reason = ""
 		p.Message = ""
 	})
+	if applied && !stamped {
+		lsm.reportUnstampedOperation(operation, "provision")
+	}
 	return nil
+}
+
+// reportUnstampedOperation reports a Provisioning or restore entry whose
+// projection could not be stamped with the operation it awaits. Live recovery
+// matches a failed operation to its projection only by that stamp, so such a
+// lease can stay in flight until the backend restarts. The actor checks a
+// store-issued claim's lease before it fires either transition, so this is
+// the defense behind that check, never a silent skip.
+func (lsm *leaseSM) reportUnstampedOperation(operation shared.OperationIntentClaim, kind string) {
+	lsm.actor.cfg.Metrics.PendingOperationUnstamped()
+	lsm.actor.cfg.Logger.Error("projection could not await its operation; live recovery cannot match a failure to it",
+		"lease_uuid", lsm.actor.leaseUUID, "operation_kind", kind,
+		"operation_fingerprint", operation.OperationID().Fingerprint())
 }
 
 // onEnterRestarting / onEnterUpdating are the Ready|Failed|Failing →
@@ -752,7 +773,9 @@ func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus
 	operation := entry.Operation
 	now := time.Now()
 	tenantReset := maintenance.Valid() && tenantInitiatedMaintenance(maintenance.Kind())
-	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
+	restore := callbackKind == replaceCallbackOperation
+	stamped := false
+	applied := lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
 		// Leaving Ready ends the current Ready period (SetStatus). An accepted
 		// tenant restart or update then starts a fresh streak, as `docker
 		// restart` resets Docker's RestartCount. The reset is keyed on the
@@ -765,8 +788,9 @@ func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus
 		}
 		// A restore awaits its exact operation, like a provision (ENG-1125);
 		// a maintenance replacement awaits none.
-		if !p.AwaitOperation(operation) {
-			p.awaitNoOperation()
+		p.awaitNoOperation()
+		if restore {
+			stamped = p.AwaitOperation(operation)
 		}
 		if callbackKind == replaceCallbackOperation && callbackURL != "" {
 			p.CallbackURL = callbackURL
@@ -775,6 +799,9 @@ func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus
 			p.LifecycleCallbackURL = lifecycleCallbackURL
 		}
 	})
+	if applied && restore && !stamped {
+		lsm.reportUnstampedOperation(operation, "restore")
+	}
 	lsm.actor.replaceCallbackKind = callbackKind
 	lsm.actor.pendingReplaceCallbackURL = callbackURL
 	lsm.actor.pendingReplaceLifecycleCallbackURL = lifecycleCallbackURL
@@ -1226,26 +1253,35 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 	// platform completed reaches ClassifyDeath, which counts it only when the
 	// live event stream observed that container's whole run with no signal to
 	// it. A health check that never passed is a running workload and never
-	// counts; a launch the platform degraded is the platform's failure.
+	// counts; a start the container runtime refused ran no tenant process, and
+	// a launch the platform degraded is the platform's failure.
 	cause := failurecause.Platform()
 	var death *InstanceState
 	var provenance failurecause.Provenance
 	if startup := info.startup; startup.Valid() {
 		death = startupInstanceState(startup)
-		switch {
+		switch kind := startup.Kind(); {
 		case startup.Degraded():
 			cause = failurecause.Platform()
-		case startup.Termination() == failurecause.Exited():
+		case kind == shared.OperationStartupExited:
 			provenance = startup.Provenance()
 			cause = failurecause.ClassifyDeath(startup.InstanceID(), provenance, startup.Termination())
-		default:
+		case kind == shared.OperationStartupUnhealthy:
 			cause = failurecause.Unhealthy()
+		default:
+			// OperationStartupRefused, and any kind added later until it is
+			// decided here: never counted.
+			cause = failurecause.Platform()
 		}
 	}
 
 	now := time.Now()
 	var outcome budgetOutcome
 	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+		// A definite startup failure moved the projection to its candidate
+		// before launching; it returns to the lease's durable runtime here, in
+		// the actor's own transition, never from the worker (ENG-229).
+		info.runtime.Apply(p)
 		p.FailCount++
 		p.LastError = info.lastError
 		p.Reason = info.reason
@@ -1550,16 +1586,23 @@ type provisionErrorInfo struct {
 	// startup is the sealed account of a definite startup failure (ENG-1125),
 	// from which onEnterFailedFromProvision attributes it; zero otherwise.
 	startup shared.OperationStartupFailure
+	// runtime is the lease's durable runtime, which the same entry action
+	// restores for a definite startup failure (ENG-1125); zero otherwise.
+	runtime DurableRuntime
 }
 
 // startupInstanceState is the failed container's state as the startup
 // failure observed it, for the counted-failure log line.
 func startupInstanceState(startup shared.OperationStartupFailure) *InstanceState {
-	state := &InstanceState{Phase: PhaseRunning, ServiceName: startup.Service(), Termination: startup.Termination()}
-	if code, oomKilled, exited := startup.ExitStatus(); exited {
+	state := &InstanceState{Phase: PhaseUnknown, ServiceName: startup.Service(), Termination: startup.Termination()}
+	switch startup.Kind() {
+	case shared.OperationStartupExited:
+		code, oomKilled, _ := startup.ExitStatus()
 		state.Phase = PhaseExited
 		state.ExitCode = &code
 		state.OOMKilled = oomKilled
+	case shared.OperationStartupUnhealthy:
+		state.Phase = PhaseRunning
 	}
 	return state
 }

@@ -1995,6 +1995,7 @@ type countingMetrics struct {
 	workerPanic          atomic.Int64
 	actorPanic           atomic.Int64
 	terminalEventDropped atomic.Int64
+	unstamped            atomic.Int64
 
 	failuresMu sync.Mutex
 	failures   []string
@@ -2005,6 +2006,7 @@ func (m *countingMetrics) ActorCreated()                 { m.actorCreated.Add(1)
 func (m *countingMetrics) WorkerPanic(_ string)          { m.workerPanic.Add(1) }
 func (m *countingMetrics) ActorPanic()                   { m.actorPanic.Add(1) }
 func (m *countingMetrics) TerminalEventDropped(_ string) { m.terminalEventDropped.Add(1) }
+func (m *countingMetrics) PendingOperationUnstamped()    { m.unstamped.Add(1) }
 func (m *countingMetrics) LeaseFailureRecorded(cause failurecause.Cause) {
 	m.failuresMu.Lock()
 	defer m.failuresMu.Unlock()

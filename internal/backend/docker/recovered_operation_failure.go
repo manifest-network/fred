@@ -4,13 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // settleRecoveredOperationFailure is the one place operation recovery turns a
@@ -85,6 +83,10 @@ func (b *Backend) publishRecoveredOperationFailure(
 		}
 		predecessor = active
 	}
+	runtime, err := leasesm.NewDurableRuntime(claim, predecessor)
+	if err != nil {
+		return err
+	}
 	now := time.Now()
 
 	b.actorsMu.Lock()
@@ -104,78 +106,30 @@ func (b *Backend) publishRecoveredOperationFailure(
 		return nil
 	}
 	failed := recoveredFromProvision(current)
-	if err := applyFailedOperationProjection(&failed.ProvisionState, claim, predecessor, surface, now); err != nil {
-		return err
-	}
+	applyFailedOperationProjection(&failed.ProvisionState, runtime, surface, now)
 	// A fresh pointer, as for an awaited success: recoverState detects the
 	// replacement and preserves it while the intent is still pending.
 	b.provisions[claim.LeaseUUID()] = failed.materialize()
 	return nil
 }
 
-// applyFailedOperationProjection reduces p, a projection that awaited claim, to
-// the lease's durable runtime after claim settled as failed, and marks it
-// Failed. Cleanup proved the operation's exact absence before settlement, so no
-// container of the attempt survives and none is published.
+// applyFailedOperationProjection reduces p, a projection that awaited the
+// failed operation, to the lease's durable runtime (leasesm.DurableRuntime)
+// and marks it Failed. Cleanup proved the operation's exact absence before
+// settlement, so no container of the attempt survives and none is published.
 //
 // The failure is never counted against the terminal budget: SetStatus only
 // applies the Ready boundary. FailCount stays a lifetime diagnostic.
 func applyFailedOperationProjection(
 	p *leasesm.ProvisionState,
-	claim shared.OperationIntentClaim,
-	predecessor *shared.Release,
+	runtime leasesm.DurableRuntime,
 	surface operationFailureSurface,
 	now time.Time,
-) error {
-	if err := restoreDurableRuntime(p, claim, predecessor); err != nil {
-		return err
-	}
+) {
+	runtime.Apply(p)
 	p.FailCount++
 	p.SetStatus(backend.ProvisionStatusFailed, now)
 	p.LastError = surface.lastError
 	p.Reason = surface.reason
 	p.Message = surface.message
-	return nil
-}
-
-// restoreDurableRuntime reduces p's runtime identity and topology to the
-// lease's durable runtime once claim failed with no substrate of it left, and
-// publishes no container.
-//
-// The durable runtime of a re-provision with an active predecessor Release is
-// that predecessor: its exact runtime identity and topology. Provision
-// admission refuses to replace a lease whose projection's callback pair
-// differs from its active Release, and recoverState keeps a Failed projection
-// with no containers whole, so a Failed projection carrying the failed
-// candidate's pair would refuse every later re-provision. Without a
-// predecessor (a first provision, or a restore destination) the durable
-// runtime is the failed claim itself.
-func restoreDurableRuntime(p *leasesm.ProvisionState, claim shared.OperationIntentClaim, predecessor *shared.Release) error {
-	if identity, ok := runtimeIdentityForRelease(predecessor); ok && len(predecessor.Items) != 0 {
-		stack, err := manifest.ParseStoredPayload(predecessor.Manifest)
-		if err != nil {
-			return fmt.Errorf("parse failed provision predecessor manifest: %w", err)
-		}
-		quantity, err := backend.ValidateOperationQuantities(predecessor.Items)
-		if err != nil {
-			return fmt.Errorf("validate failed provision predecessor quantities: %w", err)
-		}
-		p.Tenant = identity.Tenant()
-		p.ProviderUUID = identity.ProviderUUID()
-		p.CallbackURL = identity.CallbackURL()
-		p.LifecycleCallbackURL = identity.LifecycleCallbackURL()
-		p.ActiveReleaseVersion = predecessor.Version
-		p.ActiveOperationID = identity.OperationID()
-		p.SKU = predecessor.Items[0].SKU
-		p.Quantity = quantity
-		p.Items = slices.Clone(predecessor.Items)
-		p.ResourceProfiles = shared.CloneSKUResourceSnapshot(predecessor.ResourceProfiles)
-		p.StackManifest = stack
-	} else {
-		p.CallbackURL = claim.CallbackURL()
-		p.LifecycleCallbackURL = claim.LifecycleCallbackURL()
-	}
-	p.ContainerIDs = nil
-	p.ServiceContainers = nil
-	return nil
 }

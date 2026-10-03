@@ -71,3 +71,91 @@ func TestIntegration_Docker_StartupExitSettlesFailedAndReprovisions(t *testing.T
 		}, *info.TerminalBudget, "attempt %d: an observed self-exit counts, behind the floor", attempt)
 	}
 }
+
+// TestIntegration_Stack_HealthyDependencyExitFailsDefinitely pins ENG-1125's
+// rejected-launch path against a real daemon and Compose: a depends_on
+// dependency gated by service_healthy exits before it becomes healthy, so
+// `compose up` itself fails, after its exchange settled, and leaves the
+// dependent service created but never started. The backend decides from the
+// cohort, never from Compose's error: the exited dependency is a positive
+// fact, so the provision fails definitely within seconds, with nothing left.
+func TestIntegration_Stack_HealthyDependencyExitFailsDefinitely(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		cfg.ContainerReadonlyRootfs = ptrBool(false)
+		cfg.ProvisionTimeout = 10 * time.Minute
+	})
+	leaseUUID := newIntegrationLeaseUUID()
+	stack := manifest.StackManifest{Services: map[string]*manifest.Manifest{
+		"web": {
+			Image:     "busybox:latest",
+			Command:   []string{"sleep", "3600"},
+			DependsOn: map[string]manifest.DependsOnCondition{"db": {Condition: "service_healthy"}},
+		},
+		"db": {
+			Image:   "busybox:latest",
+			Command: []string{"sh", "-c", "sleep 1; exit 3"},
+			HealthCheck: &manifest.HealthCheckConfig{
+				Test:     []string{"CMD-SHELL", "test -f /tmp/never"},
+				Interval: manifest.Duration(10 * time.Second),
+				Timeout:  manifest.Duration(time.Second),
+				Retries:  3,
+			},
+		},
+	}}
+	payload, err := json.Marshal(stack)
+	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
+	started := time.Now()
+	require.NoError(t, b.Provision(context.Background(), backend.ProvisionRequest{
+		LeaseUUID: leaseUUID, Tenant: "test-tenant", ProviderUUID: testProviderUUID,
+		Items: []backend.LeaseItem{
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+			{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+		},
+		CallbackURL: callbacks.operationURL, LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload: payload,
+	}))
+
+	awaitDefiniteStartupFailure(t, b, callbackCh, leaseUUID,
+		backend.ReasonContainerExited, backend.MsgContainerExitedDuringHealthCheck)
+	assert.Less(t, time.Since(started), time.Minute, "settled by the worker, not a deadline")
+}
+
+// TestIntegration_Docker_RefusedStartFailsDefinitelyAndNeverCounts pins the
+// daemon behavior ENG-1125's refused-start path rests on: a container whose
+// entrypoint does not exist is rejected by the runtime at Start with a final
+// error response, and stays "created". The provision fails definitely with
+// ContainerStartFailed, nothing of it is left, and no tenant process ran, so
+// it never counts.
+func TestIntegration_Docker_RefusedStartFailsDefinitelyAndNeverCounts(t *testing.T) {
+	callbackServer, callbackCh := startCallbackServer(t)
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		cfg.ContainerReadonlyRootfs = ptrBool(false)
+		cfg.ProvisionTimeout = 10 * time.Minute
+	})
+	leaseUUID := newIntegrationLeaseUUID()
+	payload, err := json.Marshal(manifest.Manifest{
+		Image:   "busybox:latest",
+		Command: []string{"/fred-integration-no-such-entrypoint"},
+	})
+	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
+	started := time.Now()
+	require.NoError(t, b.Provision(context.Background(), backend.ProvisionRequest{
+		LeaseUUID: leaseUUID, Tenant: "test-tenant", ProviderUUID: testProviderUUID,
+		Items:       []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL: callbacks.operationURL, LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload: payload,
+	}))
+
+	awaitDefiniteStartupFailure(t, b, callbackCh, leaseUUID,
+		backend.ReasonContainerStartFailed, backend.MsgContainerStartRefused)
+	assert.Less(t, time.Since(started), time.Minute, "settled by the worker, not a deadline")
+	info := getProvisionInfo(t, b, leaseUUID)
+	if info.TerminalBudget != nil {
+		assert.Zero(t, info.TerminalBudget.ConsecutiveFailures, "a refused start never counts")
+	}
+}

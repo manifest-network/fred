@@ -20,9 +20,12 @@
 // an ignored preparation failure still poisons any later Step. A live result is
 // Attested only after all entered tenant steps succeed and the construction-bound
 // classifier proves one exact Evidence variant. A workflow may report a typed
-// Finding (a definite outcome it observed after its effects); only a wholly
-// successful session hands it to the classifier, any error discards it, and
-// recovery never sees one, so an unmarked post-effect failure stays Ambiguous.
+// Finding (a definite outcome it observed after its effects) only as an
+// Accepted value, which Accept mints solely while its live session is still
+// free of issues; work that depends on the finding runs after acceptance. Only
+// a wholly successful session hands it to the classifier, any error discards
+// it, and recovery never sees one, so an unmarked post-effect failure stays
+// Ambiguous. Absence is the zero Accepted value, never a domain zero value.
 // NewExecutor binds a workflow without findings. Recovery uses the same
 // classifier after re-reading durable Started authority, but its distinct
 // execution type cannot replay live work. RunStep exposes the same panic-safe

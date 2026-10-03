@@ -6,21 +6,23 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 )
 
 // startupFailure is the provision workflow's typed finding (ENG-1125): a
-// container of a settled launch's exact cohort positively failed startup
-// verification. It is the Finding the substratemutation Guard hands to the
-// classifier from a wholly successful session, and only after the workflow
-// rolled the attempt back exactly; the classifier alone decides whether it
-// becomes evidence.
+// container of a settled launch's cohort positively failed startup. It is the
+// Finding the substratemutation Guard hands to the classifier from a wholly
+// successful session; the workflow reports it only as an
+// acceptedStartupFailure, after its session accepted it and the attempt was
+// rolled back exactly. The classifier alone decides whether it becomes
+// evidence.
 //
 // Only newStartupFailure mints one, and internal/testutil confines its calls
-// to observeStartup. The zero value means "no finding" and is never valid.
+// to the two startup observations. The zero value is never valid.
 type startupFailure struct{ state *startupFailureState }
 
 type startupFailureState struct {
@@ -31,12 +33,20 @@ type startupFailureState struct {
 	sealed    shared.OperationStartupFailure
 }
 
+// acceptedStartupFailure is a startup finding this execution's session
+// accepted: the only form the provision workflow reports, and the only input
+// from which a live rollback may be admitted.
+type acceptedStartupFailure = substratemutation.Accepted[startupFailure]
+
 // newStartupFailure proves a failed startup watch into a finding. Every input
-// must be positive: a receipt that this exact execution's launch settled, a
-// failed container that belongs to the launch's exact PS cohort, and that
-// container's own inspection carrying the Started operation's identity. Its
-// death's live provenance is taken from the event ledger, waiting briefly for
-// the die event; a missing event only leaves the death unattributed.
+// must be positive: a receipt that this exact execution's launch exchange
+// settled, a failed container that belongs to the launch's PS cohort, and that
+// container's own inspection carrying the Started operation's identity. A
+// refused start must also be one the receipt recorded, on a container that is
+// still only created. An exit's termination is the substrate adapter's own
+// (containerInfoToInstanceState), and its death's live provenance is taken
+// from the event ledger, waiting briefly for the die event; a missing event
+// only leaves the death unattributed.
 func (b *Backend) newStartupFailure(
 	ctx context.Context,
 	mutations *storageMutations,
@@ -57,7 +67,7 @@ func (b *Backend) newStartupFailure(
 		return startupFailure{}, errors.New("startup failure requires a failed startup observation")
 	}
 	if !cohort.contains(watch.container) {
-		return startupFailure{}, errors.New("failed startup container is not in the launch's exact cohort")
+		return startupFailure{}, errors.New("failed startup container is not in the launch's cohort")
 	}
 	info := watch.info
 	if info.ContainerID != watch.container.id || info.LeaseUUID != intent.LeaseUUID() ||
@@ -70,11 +80,17 @@ func (b *Backend) newStartupFailure(
 		Reason: watch.surface.reason, Message: watch.surface.callback, Detail: watch.surface.cause.Error(),
 		InstanceID: info.ContainerID, Service: watch.container.service, Degraded: launch.degraded(),
 	}
-	if watch.verdict == startupVerdictExited {
-		terms.Termination = failurecause.Exited()
+	switch watch.verdict {
+	case startupVerdictExited:
+		// One adapter decides termination for every counting site.
+		terms.Termination = containerInfoToInstanceState(info).Termination
 		terms.ExitCode, terms.OOMKilled = info.ExitCode, info.OOMKilled
 		if death, observed := b.liveDeaths.awaitLiveDeath(ctx, info.ContainerID, liveDeathAwait); observed {
 			terms.Provenance = death
+		}
+	case startupVerdictStartRefused:
+		if !launch.startRefused(info.ContainerID) || !strings.EqualFold(info.Status, "created") {
+			return startupFailure{}, errors.New("a refused start requires the daemon's refusal of a container that never ran")
 		}
 	}
 	sealed, err := shared.NewOperationStartupFailure(terms)
@@ -87,38 +103,126 @@ func (b *Backend) newStartupFailure(
 	}}, nil
 }
 
-// present reports whether the workflow reported a finding at all. Whether it
-// is valid for a subject is boundTo's question.
-func (f startupFailure) present() bool { return f.state != nil }
-
 // boundTo reports whether the finding was minted for this exact execution.
 func (f startupFailure) boundTo(mutations *storageMutations) bool {
 	return f.state != nil && mutations != nil && f.state.mutations == mutations &&
 		f.state.launch.boundTo(mutations) && f.state.sealed.Valid() && f.state.surface != nil
 }
 
-// rollbackStartupFailure undoes a provision whose startup failed definitely,
-// in the worker that observed it, on the worker's context: a Deprovision that
+// concludeStartupFailure is the provision workflow's only path from a startup
+// finding to its report, and it keeps the order that recovery depends on: the
+// execution's session must accept the finding, then the rollback's storage
+// precondition must hold, and only then is anything removed. When either
+// refuses, the Guard could never have settled the finding live, so nothing of
+// the attempt is touched: the exited or unhealthy cohort stays, and operation
+// recovery settles the failure from it in one pass instead of waiting out
+// provision_timeout behind an empty inventory.
+func (b *Backend) concludeStartupFailure(
+	ctx context.Context,
+	mutations *storageMutations,
+	failure startupFailure,
+	logger *slog.Logger,
+) (acceptedStartupFailure, error) {
+	accepted, err := mutations.acceptStartupFailure(failure)
+	if err != nil {
+		return acceptedStartupFailure{}, fmt.Errorf("startup failure cannot settle live; its cohort is kept for recovery: %w", err)
+	}
+	rollback, err := b.admitStartupRollback(ctx, mutations, accepted)
+	if err != nil {
+		return acceptedStartupFailure{}, fmt.Errorf("startup failure cannot settle live; its cohort is kept for recovery: %w", err)
+	}
+	if err := b.rollbackStartupFailure(ctx, mutations, rollback, logger); err != nil {
+		return acceptedStartupFailure{}, err
+	}
+	return accepted, nil
+}
+
+// startupRollback is an admitted plan to undo one accepted startup failure:
+// the accepted finding, and the volumes its launch reported created that the
+// predecessor does not name. Only admitStartupRollback mints one, after
+// checking every precondition of the live definite outcome that the rollback
+// itself cannot repair. The zero value is invalid.
+type startupRollback struct{ state *startupRollbackState }
+
+type startupRollbackState struct {
+	mutations *storageMutations
+	failure   startupFailure
+	destroy   []string
+}
+
+// admitStartupRollback admits the rollback of an accepted finding only when
+// its storage precondition holds, read positively before anything is removed:
+// no retained volume of the lease exists, and every canonical volume of the
+// lease was either created by this launch or named by the predecessor Release.
+// A volume outside both can be destroyed by nothing the live path owns, so the
+// classifier's absence proof could never hold; the attempt is then left as it
+// is for recovery. A failed read is no fact and refuses too.
+func (b *Backend) admitStartupRollback(
+	ctx context.Context,
+	mutations *storageMutations,
+	accepted acceptedStartupFailure,
+) (startupRollback, error) {
+	failure, present := accepted.Finding()
+	if !present || !failure.boundTo(mutations) {
+		return startupRollback{}, errors.New("startup rollback requires this execution's accepted finding")
+	}
+	subject := mutations.operationSubject
+	preserve := make(map[string]struct{})
+	if predecessor, ok := subject.PredecessorRelease(); ok {
+		preserve = releaseCanonicalVolumeNames(subject.LeaseUUID(), predecessor)
+	}
+	created := failure.state.launch.createdVolumes()
+	volumes, err := b.volumes.ListForProof(ctx)
+	if err != nil {
+		return startupRollback{}, fmt.Errorf("list managed volumes before startup rollback: %w", err)
+	}
+	canonicalPrefix := leaseVolumePrefix(subject.LeaseUUID())
+	retainedPrefix := retainedVolumePrefix + subject.LeaseUUID() + "-"
+	for _, name := range volumes {
+		if strings.HasPrefix(name, retainedPrefix) {
+			return startupRollback{}, fmt.Errorf("retained volume %q of the lease exists", name)
+		}
+		if !strings.HasPrefix(name, canonicalPrefix) {
+			continue
+		}
+		if _, kept := preserve[name]; kept {
+			continue
+		}
+		if !slices.Contains(created, name) {
+			return startupRollback{}, fmt.Errorf("volume %q of the lease is neither this launch's nor the predecessor's", name)
+		}
+	}
+	var destroy []string
+	for _, name := range created {
+		if _, kept := preserve[name]; !kept {
+			destroy = append(destroy, name)
+		}
+	}
+	return startupRollback{state: &startupRollbackState{mutations: mutations, failure: failure, destroy: destroy}}, nil
+}
+
+// rollbackStartupFailure undoes an admitted startup rollback, in the worker
+// that observed the failure, on the worker's context: a Deprovision that
 // preempts the attempt cancels it, every Step then fails, and the outcome
 // stays Ambiguous for close to own. It removes exactly the attempt's cohort,
 // proves that no container of the lease remains, and destroys only the
-// volumes this launch's Create reported as created, minus the predecessor's
-// names, through the ownership choke point (ENG-658). Anything it cannot
-// prove returns an error, which leaves the attempt Ambiguous.
+// admitted volumes through the ownership choke point (ENG-658). Anything it
+// cannot prove returns an error, which leaves the attempt Ambiguous.
 func (b *Backend) rollbackStartupFailure(
 	ctx context.Context,
 	mutations *storageMutations,
-	finding startupFailure,
+	rollback startupRollback,
 	logger *slog.Logger,
 ) error {
-	if !finding.boundTo(mutations) {
-		return errors.New("startup rollback requires this execution's finding")
+	if rollback.state == nil || rollback.state.mutations != mutations || !rollback.state.failure.boundTo(mutations) {
+		return errors.New("startup rollback requires this execution's admitted plan")
 	}
+	surface := rollback.state.failure.state.surface
 	subject := mutations.operationSubject
 	intent := subject.Intent()
 	// Capture the attempt's diagnostics under its curated surface, then remove
 	// the captured cohort; each removal is a Step that re-checks identity.
-	if err := b.cleanupFailedOperationTargets(ctx, mutations, subject, finding.state.surface); err != nil {
+	if err := b.cleanupFailedOperationTargets(ctx, mutations, subject, surface); err != nil {
 		return err
 	}
 	for observation := range 3 {
@@ -136,21 +240,11 @@ func (b *Backend) rollbackStartupFailure(
 		if observation == 2 {
 			return errors.New("startup rollback substrate remained after two exact cleanup passes")
 		}
-		if err := b.cleanupFailedOperationTargets(ctx, mutations, subject, finding.state.surface); err != nil {
+		if err := b.cleanupFailedOperationTargets(ctx, mutations, subject, surface); err != nil {
 			return err
 		}
 	}
-	preserve := make(map[string]struct{})
-	if predecessor, ok := subject.PredecessorRelease(); ok {
-		preserve = releaseCanonicalVolumeNames(subject.LeaseUUID(), predecessor)
-	}
-	var destroy []string
-	for _, name := range finding.state.launch.createdVolumes() {
-		if _, kept := preserve[name]; !kept {
-			destroy = append(destroy, name)
-		}
-	}
-	report := b.volumeOp(subject.LeaseUUID(), logger).destroy(mutations, ctx, destroySiteStartupRollback, destroy...)
+	report := b.volumeOp(subject.LeaseUUID(), logger).destroy(mutations, ctx, destroySiteStartupRollback, rollback.state.destroy...)
 	if report.leftOnDisk() {
 		return fmt.Errorf("startup rollback could not destroy the attempt's volumes: %w",
 			errors.Join(report.err(), fmt.Errorf("%d volume(s) refused", report.refused())))
@@ -197,39 +291,31 @@ func (b *Backend) confirmStartupFailure(
 	return shared.NewOperationStartupFailed(subject, finding.state.sealed)
 }
 
-// restoreFailedProvisionRuntime returns the projection of a provision whose
-// startup failed definitely to the lease's durable runtime before the actor
-// publishes Failed: the inverse of prepareProvisionProjection, which moved it
-// to the candidate for the attempt. Like that preparation, the worker writes
-// it under the projection lock while the actor awaits this exact operation;
-// a projection that awaits another operation, or none, is left alone.
-func (b *Backend) restoreFailedProvisionRuntime(claim shared.OperationIntentClaim) error {
+// failedProvisionDurableRuntime derives the runtime the lease returns to when
+// claim's startup failed definitely (ENG-1125): its active Release, or the
+// claim's own callback pair for a first provision. The worker only derives it;
+// the lease actor applies it while it publishes Failed, so no worker writes the
+// actor-owned projection.
+func (b *Backend) failedProvisionDurableRuntime(claim shared.OperationIntentClaim) (leasesm.DurableRuntime, error) {
 	if b.releaseStore == nil {
-		return errors.New("release store is required to restore a failed provision's runtime")
+		return leasesm.DurableRuntime{}, errors.New("release store is required to derive a failed provision's runtime")
 	}
 	active, err := b.releaseStore.LatestActive(claim.LeaseUUID())
 	if err != nil {
-		return fmt.Errorf("read failed provision predecessor release: %w", err)
+		return leasesm.DurableRuntime{}, fmt.Errorf("read failed provision predecessor release: %w", err)
 	}
-	b.provisionsMu.Lock()
-	defer b.provisionsMu.Unlock()
-	current := b.provisions[claim.LeaseUUID()]
-	if current == nil || current.Status != backend.ProvisionStatusProvisioning ||
-		!current.PendingOperation.Names(claim.OperationID()) {
-		return nil
-	}
-	return restoreDurableRuntime(&current.ProvisionState, claim, active)
+	return leasesm.NewDurableRuntime(claim, active)
 }
 
 // classifyOperationFinding is the operation classifier as the Guard binds it:
-// a workflow's finding goes to confirmStartupFailure, and everything else,
+// an accepted finding goes to confirmStartupFailure, and everything else,
 // recovery included, to the shared exhaustive classifier.
 func (b *Backend) classifyOperationFinding(
 	ctx context.Context,
 	subject shared.OperationPhysicalSubject,
-	finding startupFailure,
+	accepted acceptedStartupFailure,
 ) (shared.OperationPhysicalEvidence, error) {
-	if finding.present() {
+	if finding, present := accepted.Finding(); present {
 		return b.confirmStartupFailure(ctx, subject, finding)
 	}
 	return b.classifyOperationPhysical(ctx, subject)
