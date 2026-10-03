@@ -1098,10 +1098,41 @@ func TestOldestUnheldCloseIntentAgeExcludesHeldCloses(t *testing.T) {
 // through the same pre-lock check: a held deletion answers at once, with no
 // destroy and no lock wait, even while the executor holds the lease's
 // namespace, and the rollback stays pending until the deletion finishes.
+// While it is pending the rollback keeps every authority it holds: the
+// operation intent (the destination's recovery fence), the source record in
+// Restoring under this destination and generation, which the restoring
+// finalizer cannot overtake, and the destination's reservations; no terminal
+// callback is published.
 func TestRestoreRollbackAnswersAHeldCreatedVolumeWithoutTheLock(t *testing.T) {
 	f := newInterruptedRestoreRecoveryFixture(
 		t, 2, []string{"exited"}, backend.ProvisionStatusFailed, true,
 	)
+	// Every pass after the first finds the operation's containers gone. Expire
+	// the window in which an empty generation may still become visible, as the
+	// sibling restore-recovery tests do, so that each pass reaches the rollback
+	// instead of deferring it for as long as the host happens to be fast.
+	f.b.cfg.ProvisionTimeout = time.Nanosecond
+	requirePending := func() {
+		t.Helper()
+		intents, err := f.b.operationSettlement.ListOperationIntents()
+		require.NoError(t, err)
+		require.Len(t, intents, 1, "the operation intent stays")
+		require.NoError(t, f.b.reconcileRestoringWithAuthority(t.Context(), *f.source))
+		record, err := f.retentions.Get(f.spec.SourceLeaseUUID)
+		require.NoError(t, err)
+		require.NotNil(t, record)
+		assert.Equal(t, shared.RetentionStatusRestoring, record.Status, "the finalizer cannot overtake the rollback")
+		assert.Equal(t, f.spec.LeaseUUID, record.NewLeaseUUID)
+		assert.Equal(t, f.source.Generation, record.Generation)
+		for _, allocationID := range f.allocation {
+			assert.NotNil(t, f.b.pool.GetAllocation(allocationID), "the destination keeps its reservation")
+		}
+		callbacks, err := f.callbacks.ListPending()
+		require.NoError(t, err)
+		for _, callback := range callbacks {
+			assert.NotEqual(t, f.spec.LeaseUUID, callback.LeaseUUID, "no terminal callback while the rollback is pending")
+		}
+	}
 	volumes, ok := f.b.volumes.(*mockVolumeManager)
 	require.True(t, ok)
 	created := canonicalVolumeName(f.spec.LeaseUUID, f.spec.Items[0].ServiceName, 1)
@@ -1143,9 +1174,7 @@ func TestRestoreRollbackAnswersAHeldCreatedVolumeWithoutTheLock(t *testing.T) {
 	assert.Equal(t, before+1, testutil.ToFloat64(retries), "the rollback remains pending for the next pass")
 	assert.Equal(t, []string{"remove:restore-container-0", "re-quarantine"}, f.snapshotEvents())
 	require.NoError(t, f.b.terminalStorageAuthorityError(), "a held deletion never latches")
-	intents, err := f.b.operationSettlement.ListOperationIntents()
-	require.NoError(t, err)
-	require.Len(t, intents, 1, "the rollback stays pending")
+	requirePending()
 
 	// Second pass while the executor holds the lease's namespace: the held
 	// name answers without waiting for the lock.
@@ -1169,9 +1198,10 @@ func TestRestoreRollbackAnswersAHeldCreatedVolumeWithoutTheLock(t *testing.T) {
 	cancel()
 	assert.Less(t, time.Since(started), 5*time.Second, "the rollback must not wait behind the executor's slice")
 	require.NoError(t, err)
-	assert.Equal(t, before+2, testutil.ToFloat64(retries))
+	assert.Equal(t, before+2, testutil.ToFloat64(retries), "the second pass reaches the held answer too")
 	close(release)
 	wg.Wait()
+	requirePending()
 
 	// The deletion finishes: the rollback completes without destroying anything.
 	held.Store(false)
