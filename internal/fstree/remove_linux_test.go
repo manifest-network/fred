@@ -196,7 +196,6 @@ func TestRemoveBeneathDetectsAHeldDirectoryMovedOutOfTheTree(t *testing.T) {
 	anchor := filepath.Join(parentPath, "anchor")
 	mkdirAll(t, filepath.Join(anchor, "a", "b", "c"))
 	writeFile(t, filepath.Join(anchor, "a", "b", "c", "f"), "doomed")
-	writeFile(t, filepath.Join(anchor, "a", "sibling"), "kept: a is never re-entered")
 	held := filepath.Join(anchor, "a", "b")
 	heldIno := inode(t, held)
 	before := snapshot(t, outside)
@@ -215,6 +214,11 @@ func TestRemoveBeneathDetectsAHeldDirectoryMovedOutOfTheTree(t *testing.T) {
 				require.False(t, empty)
 			}
 			require.Equal(t, heldIno, r.curIno, "the remover holds a/b")
+			// The sibling appears only now. Created up front, it would be
+			// removed before the descent whenever the directory listing
+			// happens to name it before b (hash-ordered on ext4, for
+			// example), so only re-entering a could remove it here.
+			writeFile(t, filepath.Join(anchor, "a", "sibling"), "kept: a is never re-entered")
 
 			require.NoError(t, os.Rename(held, filepath.Join(outside, "b")))
 			var stepErr error
