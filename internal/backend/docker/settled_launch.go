@@ -14,10 +14,12 @@ import (
 //
 // The set is still a list of known fallbacks, not a proof that every step
 // completed: a future fallback that forgets to mark itself would leave the
-// launch complete. Two things bound that. Every Step or Prepare error poisons
+// launch complete. One thing bounds that: every Step or Prepare error poisons
 // the execution's session, so a fallback taken because a guarded call failed
 // can never become a definite outcome (substratemutation.Accept refuses it).
-// And only the fallbacks below proceed without such an error.
+// Only a fallback that swallows no guarded error, such as a per-path
+// extraction failure the helper reports in its result, depends on being
+// marked here.
 type launchDegradation uint8
 
 const (

@@ -111,12 +111,12 @@ func (f startupFailure) boundTo(mutations *storageMutations) bool {
 
 // concludeStartupFailure is the provision workflow's only path from a startup
 // finding to its report, and it keeps the order that recovery depends on: the
-// execution's session must accept the finding, then the rollback's storage
-// precondition must hold, and only then is anything removed. When either
-// refuses, the Guard could never have settled the finding live, so nothing of
-// the attempt is touched: the exited or unhealthy cohort stays, and operation
-// recovery settles the failure from it in one pass instead of waiting out
-// provision_timeout behind an empty inventory.
+// execution's session must accept the finding, then the rollback's
+// preconditions must hold, and only then is anything removed. When either
+// refuses, the finding could not have settled live, so nothing of the attempt
+// is touched: the cohort stays, and operation recovery settles the failure
+// from it, in one pass when a container of it exited or reported unhealthy,
+// instead of waiting out provision_timeout behind an empty inventory.
 func (b *Backend) concludeStartupFailure(
 	ctx context.Context,
 	mutations *storageMutations,

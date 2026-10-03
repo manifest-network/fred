@@ -21,8 +21,9 @@ type daemonLaunchOutcome struct {
 	settled bool
 	err     error
 	// refusedStarts are the containers whose Start request the daemon answered
-	// with a final error response (ENG-1125): the daemon's own account that it
-	// refused to start them. It is read only from a settled exchange.
+	// with a final error response (ENG-1125). It is read only from a settled
+	// exchange, and only together with an inspection showing that the
+	// container never ran.
 	refusedStarts []string
 }
 
@@ -166,11 +167,13 @@ func (scope *daemonLaunchScope) roundTrip(next http.RoundTripper, req *http.Requ
 	return response, err
 }
 
-// daemonRefusedStartTarget returns the container a final Start response
-// refused, or "" for any other exchange. The daemon's handler ended with an
-// error status, so it did not start the container (ENG-1125); whether the
-// container exists and never ran is the caller's own inspection to make. The
-// target is the path's container reference, never parsed from an error.
+// daemonRefusedStartTarget returns the container whose Start got a final error
+// response, or "" for any other exchange (ENG-1125). An error status alone
+// does not prove that nothing started: an authorization plugin can deny the
+// response after the handler ran. So it only names a candidate, and the
+// caller's own inspection must still show the container never ran
+// ("created"). The target is the path's container reference, never parsed
+// from an error.
 func daemonRefusedStartTarget(req *http.Request, response *http.Response) string {
 	if response == nil || req.Method != http.MethodPost {
 		return ""

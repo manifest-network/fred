@@ -802,8 +802,9 @@ var (
 	// entered their in-flight state with a projection that could not be
 	// stamped with the operation it awaits (ENG-1125). Live recovery matches a
 	// failed operation to its projection only by that stamp, so such a lease
-	// can stay in flight until the backend restarts. Admission refuses an
-	// unstampable provision first; any non-zero value is a bug.
+	// can stay in flight until the backend restarts. The lease actor refuses
+	// an invalid or foreign claim before either transition; any non-zero value
+	// is a bug.
 	leasePendingOperationUnstampedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
