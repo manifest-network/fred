@@ -265,6 +265,7 @@ recognize as a generic failure and fall back to displaying `message`. The define
 |---|---|
 | `ContainerExited` | A container exited unexpectedly (crash, non-zero exit, OOM kill) |
 | `HealthCheckFailed` | A container's health check never passed during startup: it reported unhealthy, or was still not healthy at the startup deadline |
+| `ContainerStartFailed` | The container runtime refused to start a container, which never ran (for example, its entrypoint does not exist in the image) |
 | `ImagePullFailed` | The container image could not be pulled |
 | `Internal` | An internal fred/backend error (not attributable to the tenant's workload) |
 | `RestartFailed` | A tenant-initiated restart failed |
@@ -313,12 +314,22 @@ A separate rule still closes an `ACTIVE` lease at once: when its automatic re-pr
 refused as invalid, for example because its image is no longer allowed.
 
 A container that crashes while it starts, before it ever becomes ready, counts the same way:
-the lease reports `failed` with reason `ContainerExited` within seconds and is re-provisioned, and
-a crash loop is closed by the same three-failures-over-30-minutes rule. In a stack with several
-services, a service that crashes while another one is still starting fails the deployment too.
-A health check that never passes reports `HealthCheckFailed` and never counts: such a lease keeps
-being re-provisioned, billed, until you fix the health check, update the manifest or close the
-lease.
+the lease reports `failed` with reason `ContainerExited`, usually within seconds, and is
+re-provisioned, and a crash loop is closed by the same three-failures-over-30-minutes rule. In a
+stack with several services, a service that crashes while another one is still starting fails the
+deployment too, including a `depends_on` dependency gated by `service_healthy`. A service whose
+health check passed once is then watched only for crashes, so a brief unhealthy report while the
+rest of the stack starts does not fail the deployment. These never count, and such a lease keeps
+being re-provisioned, billed, until you fix the manifest or close the lease:
+
+- A health check that never passes reports `HealthCheckFailed`. It is reported only when the
+  startup deadline is near (the provider's provision timeout, minus a minute), so a `PENDING`
+  lease is usually rejected first with `callback timeout`.
+- A container the runtime refuses to start, for example because its entrypoint does not exist in
+  the image, reports `ContainerStartFailed`.
+
+A failure the provider cannot attribute to your container at once is settled later, and never
+counts.
 
 ---
 
