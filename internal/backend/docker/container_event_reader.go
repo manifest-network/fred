@@ -20,8 +20,11 @@ import (
 // this file imports only failurecause and sync/atomic; names nothing else
 // from package docker but the event type, its actions and the two metrics the
 // reader updates; declares no function or interface type and no function
-// literal, so no caller can hand the reader a logger; and sends only from a
-// select that has a default case.
+// literal, so no caller can hand the reader a logger; sends only from a
+// select that has a default case; and waits only in consume's select over
+// its two streams and its stop signal. Because any file of the package could
+// add methods to these types, the guard also rejects a method on them, or on
+// the event type, declared anywhere else.
 
 // containerEventReader reads the container event subscriptions. Its only
 // capabilities are the backend's stop signal, the dispatcher's queue and the
