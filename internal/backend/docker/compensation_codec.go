@@ -74,9 +74,11 @@ func encodeCompensationSourcePlan(plan compensationSourcePlan) ([]byte, error) {
 			return nil, err
 		}
 		stored.Configs[key] = config
+		// The encoder is the one persistence sink: whatever a record holds, a
+		// persisted plan never carries a seccomp profile.
 		instance := storedCompensationContainer{Name: snapshot.Name, ImageID: snapshot.ImageID, Platform: snapshot.Platform,
 			Config: key, Hostname: snapshot.Config.Hostname, Labels: make(map[string]string), LabelRefs: make(map[string]string),
-			Host: snapshot.Host, Networks: snapshot.Networks, Mounts: snapshot.Mounts}
+			Host: compensationHostConfig(snapshot.Host), Networks: snapshot.Networks, Mounts: snapshot.Mounts}
 		for label, value := range snapshot.Config.Labels {
 			if _, common := stored.CommonLabels[label]; common {
 				continue
@@ -146,8 +148,10 @@ func decodeCompensationSourceSnapshot(encoded []byte) (compensationSourcePlan, e
 			usedLabels[key] = true
 			config.Labels[label] = value
 		}
-		plan.Containers = append(plan.Containers, compensationContainerRecord{Name: instance.Name, ImageID: instance.ImageID, Platform: instance.Platform,
-			Config: &config, Host: instance.Host, Networks: instance.Networks, Mounts: instance.Mounts})
+		// A plan persisted before the profile existed may name a seccomp
+		// profile; the record constructor drops it.
+		plan.Containers = append(plan.Containers, newCompensationContainerRecord(instance.Name, instance.ImageID, instance.Platform,
+			&config, instance.Host, instance.Networks, instance.Mounts))
 	}
 	if len(usedConfigs) != len(stored.Configs) || len(usedLabels) != len(stored.LabelValues) {
 		return compensationSourcePlan{}, errors.New("source execution plan contains unreferenced interned content")

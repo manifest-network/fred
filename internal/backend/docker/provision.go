@@ -940,6 +940,10 @@ func (b *Backend) doProvisionPhysical(
 			cause:    fmt.Errorf("%w: lease volume(s) %v", ErrVolumeDeleteHeld, pending),
 		}
 	}
+	// Refuse before tearing down a failed predecessor or preparing anything.
+	if err := mutations.requireTenantSeccomp(); err != nil {
+		return err
+	}
 	if err := b.prepareProvisionProjection(mutations, ctx, req, stack, resourceProfiles, logger); err != nil {
 		return err
 	}
@@ -961,6 +965,12 @@ func (b *Backend) doProvisionPhysical(
 	defer func() {
 		provisionDurationSeconds.Observe(time.Since(provisionStart).Seconds())
 		if err != nil {
+			// A failure authored where it was raised, such as a launch refused
+			// for the tenant seccomp profile, keeps its own reason and message.
+			var authored *physicalOperationError
+			if errors.As(err, &authored) {
+				callbackErr, failReason = authored.callback, authored.reason
+			}
 			logger.Error("stack provision failed", "lease_uuid", req.LeaseUUID, "error", err)
 			provisionsTotal.WithLabelValues("failure").Inc()
 			if !mutations.effectEntered() {

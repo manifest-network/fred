@@ -27,7 +27,9 @@ func TestDockerCreatorOwnsExecutionIdentity(t *testing.T) {
 			actual.Labels[imageexec.LabelImageID] != admitted.ID() || actual.Labels["tenant"] != "value" {
 			t.Fatalf("unbound execution config: %+v", actual)
 		}
-		if actualHost != host || actualNetworks != networks || name != "workload" || platform.OS != "linux" || platform.Architecture != "amd64" {
+		// The host configuration is a private copy that carries the tenant
+		// profile; everything else reaches the SDK unchanged.
+		if actualHost == host || len(actualHost.SecurityOpt) != 1 || actualNetworks != networks || name != "workload" || platform.OS != "linux" || platform.Architecture != "amd64" {
 			t.Fatalf("create options changed: host=%p networks=%p name=%s platform=%+v", actualHost, actualNetworks, name, platform)
 		}
 		actual.Image = "changed-by-sdk"
@@ -41,6 +43,9 @@ func TestDockerCreatorOwnsExecutionIdentity(t *testing.T) {
 	}
 	if config.Image != "attacker:latest" || config.Labels[imageexec.LabelImageReference] != "attacker:latest" || config.Labels[imageexec.LabelImageID] != "forged" || admitted.Platform().OS != "linux" {
 		t.Fatalf("creation mutated caller config or image: %+v", config)
+	}
+	if host.SecurityOpt != nil {
+		t.Fatalf("creation mutated caller host configuration: %+v", host.SecurityOpt)
 	}
 }
 

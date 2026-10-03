@@ -262,7 +262,7 @@ func (c *imageInspectionCoordinator) openFor(ctx context.Context, image imageexe
 					outcome = c.observer.run(ctx, func(ctx context.Context) error {
 						var createErr error
 						response, createErr = c.creator.Create(ctx, image, inspectionLabels(receipt), receipt.Name())
-						return createErr
+						return refuseWithoutTenantSeccomp(tenantSeccompSinkInspection, createErr)
 					})
 					if purpose == imageUnpackInspection && !outcome.settled {
 						return c.fence("image unpack probe completion", outcome.completionError())

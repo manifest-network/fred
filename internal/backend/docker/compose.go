@@ -3,6 +3,7 @@ package docker
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // composeReader is the only Compose surface retained by Backend.
@@ -79,8 +81,13 @@ type composeService struct {
 }
 
 // newComposeService creates a composeService that uses the Docker daemon at
-// the given host for Compose operations.
-func newComposeService(dockerHost string, images *imageexec.Admitter) (*composeService, error) {
+// the given host for Compose operations. Every invocation-bound launch
+// transport checks container creates against profiles, the same source the
+// admitter compiles projects with.
+func newComposeService(dockerHost string, images *imageexec.Admitter, profiles imageexec.TenantSeccompSource) (*composeService, error) {
+	if util.IsNilInterface(profiles) {
+		return nil, errors.New("compose service requires a tenant seccomp profile source")
+	}
 	// Silence the Compose library's logrus logger. Compose emits noisy
 	// warnings (e.g., "No resource found to remove") via its own global
 	// logrus instance. Operational information is already logged by the
@@ -90,7 +97,10 @@ func newComposeService(dockerHost string, images *imageexec.Admitter) (*composeS
 	if err != nil {
 		return nil, err
 	}
-	backend, err := newComposeEngine(dockerHost, &http.Client{Transport: transport, CheckRedirect: mobyclient.CheckRedirect})
+	// The retained engine only lists and tears down. Its transport refuses
+	// every container create, so no create can leave this process without
+	// the per-invocation launch transport below and its profile check.
+	backend, err := newComposeEngine(dockerHost, newComposeReadHTTPClient(transport))
 	if err != nil {
 		transport.CloseIdleConnections()
 		return nil, err
@@ -113,7 +123,7 @@ func newComposeService(dockerHost string, images *imageexec.Admitter) (*composeS
 			defer transport.CloseIdleConnections()
 			// This client belongs exclusively to this invocation. Even Compose
 			// work which detaches its context still crosses the same closed scope.
-			httpClient := &http.Client{Transport: daemonLaunchTransport{next: transport, scope: scope}, CheckRedirect: mobyclient.CheckRedirect}
+			httpClient := &http.Client{Transport: daemonLaunchTransport{next: transport, scope: scope, profiles: profiles}, CheckRedirect: mobyclient.CheckRedirect}
 			engine, err := newComposeEngine(dockerHost, httpClient)
 			if err != nil {
 				return scope.finish(err)
@@ -125,6 +135,30 @@ func newComposeService(dockerHost string, images *imageexec.Admitter) (*composeS
 			return scope.finish(executor.Up(ctx, project, opts.ForceRecreate))
 		},
 	}, nil
+}
+
+// newComposeReadHTTPClient is the HTTP client of the retained Compose engine,
+// which only lists and tears down projects.
+func newComposeReadHTTPClient(next http.RoundTripper) *http.Client {
+	return &http.Client{Transport: daemonNoCreateTransport{next: next}, CheckRedirect: mobyclient.CheckRedirect}
+}
+
+// errComposeReadEngineCreate is the refusal of a container create on the
+// Compose engine that only lists and tears down.
+var errComposeReadEngineCreate = errors.New("the Compose read and teardown engine never creates containers")
+
+// daemonNoCreateTransport carries a client that must never create a
+// container. It refuses every container create before dispatch, whatever the
+// request asks for, and passes every other request through unchanged.
+type daemonNoCreateTransport struct {
+	next http.RoundTripper
+}
+
+func (t daemonNoCreateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if daemonContainerCreateRequest(req) {
+		return refuseCreate(req, errComposeReadEngineCreate)
+	}
+	return t.next.RoundTrip(req)
 }
 
 func newComposeHTTPTransport(dockerHost string) (*http.Transport, error) {

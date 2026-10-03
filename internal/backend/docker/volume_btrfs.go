@@ -278,6 +278,12 @@ func (b *btrfsVolumeManager) HostPath(name string) string {
 // Kind identifies the btrfs backend.
 func (b *btrfsVolumeManager) Kind() string { return "btrfs" }
 
+// OpenProjectIDAudit is unsupported: btrfs quotas are per subvolume, not per
+// inode project ID.
+func (b *btrfsVolumeManager) OpenProjectIDAudit(context.Context, managedVolumeName) (*projidAuditVolume, error) {
+	return nil, errProjectIDAuditUnsupported
+}
+
 // Usage returns the subvolume's referenced bytes (rfer) via its qgroup.
 // rfer is the column `btrfs qgroup limit` enforces (max_rfer) and is the
 // safe over-count (it also accounts the subvolume's own fs-tree metadata).

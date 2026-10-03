@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/docker/tenantseccomp"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
@@ -47,11 +48,12 @@ func imageSecurityClientFromSDK(t *testing.T, cli *client.Client) *DockerClient 
 	t.Helper()
 	httpClient := cli.HTTPClient()
 	observer := new(daemonLaunchObserver)
-	httpClient.Transport = daemonContextTransport{next: httpClient.Transport, observer: observer}
+	profiles := observedTenantSeccomp{source: tenantseccomp.Process()}
+	httpClient.Transport = daemonContextTransport{next: httpClient.Transport, observer: observer, profiles: profiles}
 	require.NoError(t, client.WithHTTPClient(httpClient)(cli))
-	images, creator, err := imageexec.NewDockerRuntime(t.Context(), cli)
+	images, creator, err := imageexec.NewDockerRuntime(t.Context(), cli, profiles)
 	require.NoError(t, err)
-	return &DockerClient{client: newDockerSDKView(cli), images: images, creator: creator, launchObserver: observer, backendName: "image-security"}
+	return &DockerClient{client: newDockerSDKView(cli), images: images, creator: creator, launchObserver: observer, backendName: "image-security", tenantSeccomp: profiles}
 }
 
 func imageSecurityResponse(status int, body string) *http.Response {

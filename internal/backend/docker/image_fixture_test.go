@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
+	"github.com/manifest-network/fred/internal/backend/docker/tenantseccomp"
 )
 
 // ImageInfo is only a convenient metadata DTO for existing backend test doubles.
@@ -45,9 +46,21 @@ func (s mockImageSource) ImageInspect(ctx context.Context, reference string, _ .
 	}
 	return dockerimage.InspectResponse{ID: id, Os: "linux", Architecture: "amd64", Config: &dockerspec.DockerOCIImageConfig{ImageConfig: ocispec.ImageConfig{User: info.User, Volumes: info.Volumes}}}, nil
 }
+func (m *mockDockerClient) seccompProfiles() imageexec.TenantSeccompSource {
+	if m.SeccompProfiles != nil {
+		return m.SeccompProfiles
+	}
+	return tenantseccomp.Process()
+}
+
+func (m *mockDockerClient) requireTenantSeccompProfile() error {
+	_, err := m.seccompProfiles().TenantSeccompProfile()
+	return err
+}
+
 func (m *mockDockerClient) imageAdmitter() *imageexec.Admitter {
 	m.imageOnce.Do(func() {
-		images, _, err := imageexec.NewDockerRuntime(context.Background(), mockImageSource{mock: m})
+		images, _, err := imageexec.NewDockerRuntime(context.Background(), mockImageSource{mock: m}, m.seccompProfiles())
 		if err != nil {
 			panic(err)
 		}

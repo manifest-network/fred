@@ -190,6 +190,10 @@ func (m *mockVolumeManager) Usage(ctx context.Context, id string) (int64, error)
 
 func (m *mockVolumeManager) Kind() string { return "mock" }
 
+func (m *mockVolumeManager) OpenProjectIDAudit(context.Context, managedVolumeName) (*projidAuditVolume, error) {
+	return nil, errProjectIDAuditUnsupported
+}
+
 // mockDockerClient implements dockerClient for testing. Each method delegates to
 // the corresponding Fn field; an unexpected call (nil Fn) panics so tests fail
 // loudly rather than silently returning zero values.
@@ -237,6 +241,18 @@ type mockDockerClient struct {
 	DetectWritablePathsFn         func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error)
 	ExtractImageContentFn         func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error
 	ContainerEventsFn             func(ctx context.Context) (<-chan ContainerEvent, <-chan error)
+	// SeccompProfiles replaces the process tenant seccomp profile source for
+	// the mock's image runtime and its pre-launch check.
+	SeccompProfiles       imageexec.TenantSeccompSource
+	TenantSeccompCensusFn func(context.Context) (tenantSeccompCensus, error)
+}
+
+// TenantSeccompCensus reports an empty census unless a test supplies one.
+func (m *mockDockerClient) TenantSeccompCensus(ctx context.Context) (tenantSeccompCensus, error) {
+	if m.TenantSeccompCensusFn != nil {
+		return m.TenantSeccompCensusFn(ctx)
+	}
+	return tenantSeccompCensus{}, nil
 }
 
 func (m *mockDockerClient) Ping(ctx context.Context) error {

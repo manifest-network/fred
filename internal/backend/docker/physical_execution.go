@@ -645,6 +645,10 @@ func (b *Backend) doRestorePhysical(
 	if mutations == nil || !intent.Valid() || intent.Kind() != shared.OperationIntentRestore {
 		return errors.New("started restore authority is invalid")
 	}
+	// Refuse before adopting any retained volume.
+	if err := mutations.requireTenantSeccomp(); err != nil {
+		return err
+	}
 	record, err := b.retentionStore.Get(intent.SourceLeaseUUID())
 	if err != nil {
 		return fmt.Errorf("read Started restore source: %w", err)
@@ -680,6 +684,10 @@ func (b *Backend) doMaintenancePhysical(
 	target, ok := subject.TargetRelease()
 	if mutations == nil || !intent.Valid() || !ok {
 		return errors.New("started maintenance authority is invalid")
+	}
+	// Refuse before pulling images or retiring the running source.
+	if err := mutations.requireTenantSeccomp(); err != nil {
+		return err
 	}
 	stack, err := manifest.ParseStoredPayload(target.Manifest)
 	if err != nil {
@@ -817,8 +825,13 @@ func (b *Backend) executeRestorePhysicalOutcome(
 		if cause == nil {
 			cause = errors.New("restore substrate is exactly absent")
 		}
+		reason, callbackErr := backend.ReasonRestoreFailed, "restore failed"
+		var physical *physicalOperationError
+		if errors.As(cause, &physical) {
+			reason, callbackErr = physical.reason, physical.callback
+		}
 		result, err := leasesm.NewRestoreReplaceFailure(cause, leasesm.ReplaceFailureDetails{
-			Reason: backend.ReasonRestoreFailed, CallbackErr: "restore failed", LastError: cause.Error(),
+			Reason: reason, CallbackErr: callbackErr, LastError: cause.Error(),
 		}, proof)
 		if err != nil {
 			return mustRestoreAmbiguous(err, claim)

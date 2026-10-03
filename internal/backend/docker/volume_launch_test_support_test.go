@@ -120,6 +120,14 @@ func (p testDockerMutationProxy) startCompensationContainer(ctx context.Context,
 	return sink.startCompensationContainer(ctx, id, timeout)
 }
 
+func (p testDockerMutationProxy) requireTenantSeccompProfile() error {
+	sink, err := p.sink()
+	if err != nil {
+		return err
+	}
+	return sink.requireTenantSeccompProfile()
+}
+
 func (p testDockerMutationProxy) prepareCompensationContainer(ctx context.Context, subject shared.MaintenanceCompensationSubject, snapshot compensationContainerRecord) (compensationContainer, error) {
 	sink, err := p.sink()
 	if err != nil {

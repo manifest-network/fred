@@ -43,7 +43,8 @@ func TestImageUnpackProbeOwnsStoppedSafeContainer(t *testing.T) {
 	assert.Empty(t, host.Binds)
 	assert.Empty(t, host.Mounts)
 	assert.Equal(t, []string{"ALL"}, []string(host.CapDrop))
-	assert.Equal(t, []string{"no-new-privileges:true"}, host.SecurityOpt)
+	assert.Equal(t, tenantSeccompSecurityOpt(t, "no-new-privileges:true"), host.SecurityOpt,
+		"the never-started helper is created through the same sink and carries the tenant profile")
 	assert.Equal(t, container.RestartPolicyDisabled, host.RestartPolicy.Name)
 	require.NoError(t, h.client.requireImageInspectionsSettled(t.Context()))
 }

@@ -117,6 +117,12 @@ type volumeReader interface {
 
 	// Kind returns the backend filesystem name.
 	Kind() string
+
+	// OpenProjectIDAudit opens one managed volume for the read-only
+	// project-ID audit. Managers without XFS project quotas return
+	// errProjectIDAuditUnsupported; a volume with a registered delete stage
+	// returns errProjectIDAuditDeletePending.
+	OpenProjectIDAudit(context.Context, managedVolumeName) (*projidAuditVolume, error)
 }
 
 // volumeMutationSink is captured only by settlement-bound Guards. Destruction
@@ -298,6 +304,11 @@ func (n *noopVolumeManager) Usage(_ context.Context, _ string) (int64, error) {
 
 // Kind identifies the noop backend.
 func (n *noopVolumeManager) Kind() string { return "noop" }
+
+// OpenProjectIDAudit is unsupported: the noop manager has no project quotas.
+func (n *noopVolumeManager) OpenProjectIDAudit(context.Context, managedVolumeName) (*projidAuditVolume, error) {
+	return nil, errProjectIDAuditUnsupported
+}
 
 // Filesystem magic numbers from statfs(2).
 const (

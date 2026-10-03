@@ -45,6 +45,7 @@ type dockerReadClient interface {
 	ListVolumeWriters(context.Context) ([]ContainerInfo, error)
 	ListIdleManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error)
 	ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error)
+	TenantSeccompCensus(ctx context.Context) (tenantSeccompCensus, error)
 }
 
 // dockerMutationSink is captured only by settlement-bound Guards. Keeping it
@@ -65,6 +66,9 @@ type dockerMutationSink interface {
 	createCompensationContainer(context.Context, compensationContainer) (string, daemonLaunchOutcome)
 	startCompensationContainer(context.Context, string, time.Duration) daemonLaunchOutcome
 	prepareCompensationContainer(context.Context, shared.MaintenanceCompensationSubject, compensationContainerRecord) (compensationContainer, error)
+	// requireTenantSeccompProfile reports whether creations can carry the
+	// tenant seccomp profile now. Every error wraps tenantseccomp.ErrRefused.
+	requireTenantSeccompProfile() error
 }
 
 // dockerClient is the construction boundary implemented by DockerClient and
@@ -371,6 +375,10 @@ type Backend struct {
 	// actor and the important absent-actor case without constructing a dormant
 	// actor goroutine. Guarded by actorsMu with the registry itself.
 	actorRecoveryClaims map[string]*leaseActorRecoveryClaimState
+
+	// projidAudit is the detect-only project-ID audit of managed XFS
+	// volumes. It holds the read view and an attribute getter with no setter.
+	projidAudit *projidAuditor
 
 	// inspector / gatherer / provisionStore are the substrate-agnostic
 	// seams the lease state machine consumes via leaseActor.cfg. Wired
@@ -2476,7 +2484,7 @@ func newBackend(
 		return nil, fmt.Errorf("bind close journals: %w", err)
 	}
 
-	composeSvc, err := newComposeService(cfg.DockerHost, docker.images)
+	composeSvc, err := newComposeService(cfg.DockerHost, docker.images, docker.tenantSeccomp)
 	if err != nil {
 		_ = cbStore.Close()
 		_ = diagStore.Close()
@@ -2662,6 +2670,7 @@ func newBackend(
 	b.inspector = &dockerInstanceInspector{docker: b.docker}
 	b.gatherer = &dockerDiagnosticsGatherer{backend: b}
 	b.provisionStore = &backendProvisionStore{backend: b}
+	b.projidAudit = newProjidAuditor(b.volumes, xfsProjectAttributeGetter{}, b.logger)
 
 	// Gate custom-domain HTTP-01 issuance on the domain being resolvable
 	// (ENG-266): don't fire an ACME order while the name is still NXDOMAIN, or a
@@ -2906,6 +2915,13 @@ func (b *Backend) Start(ctx context.Context) error {
 	// reconcileLoop stays as safety net for missed events.
 	b.wg.Go(b.containerEventLoop)
 
+	// Report containers that do not run under the current tenant seccomp
+	// profile. The first pass runs now, in the background, after recovery.
+	b.wg.Go(b.tenantSeccompCensusLoop)
+	// Audit managed XFS volumes for project-ID drift, detect only. The first
+	// pass waits projidAuditFirstDelay so it never competes with startup.
+	b.wg.Go(b.projidAuditLoop)
+
 	// Sample actor inbox depth and stuck-seconds on a ticker for the
 	// fred_docker_backend_lease_actor_* observability gauges. Prime the durable
 	// close and aggregate-capacity gauges synchronously so durable startup state
@@ -2932,16 +2948,11 @@ func (b *Backend) checkDaemonCapabilities(ctx context.Context) {
 		return
 	}
 
-	// Check seccomp availability
-	hasSeccomp := false
-	for _, opt := range info.SecurityOptions {
-		if strings.HasPrefix(opt, "name=seccomp") {
-			hasSeccomp = true
-			break
-		}
-	}
-	if !hasSeccomp {
-		b.logger.Warn("Docker daemon has seccomp disabled; containers will not have syscall filtering")
+	// Every tenant container runs under fred's seccomp profile, and a daemon
+	// without seccomp refuses a custom profile. This stays advisory: the daemon
+	// is the authority, and the readiness gauge already reports 0.
+	if !daemonReportsSeccomp(info.SecurityOptions) {
+		b.logger.Error("Docker daemon reports no seccomp support; it will refuse to run tenant containers, which all run under fred's seccomp profile")
 	}
 
 	// Check IPv4 forwarding — required for container networking (outbound
