@@ -735,7 +735,7 @@ The set defined today:
 | Reason | Meaning |
 |---|---|
 | `ContainerExited` | A container exited unexpectedly (crash, non-zero exit, OOM kill) |
-| `HealthCheckFailed` | A container's health check never passed during startup: it reported unhealthy, or was still not healthy at the provision deadline |
+| `HealthCheckFailed` | A container's health check never passed during startup: it reported unhealthy, or was still not healthy at the startup deadline |
 | `ImagePullFailed` | The container image could not be pulled |
 | `Internal` | An internal fred/backend error occurred (not attributable to the tenant's workload) |
 | `RestartFailed` | A tenant-initiated restart failed |

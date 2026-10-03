@@ -10,8 +10,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Failure reason `HealthCheckFailed`: a container's health check never passed
   during startup verification, either because Docker reported it `unhealthy`
-  or because it was still not healthy at the provision deadline. It never
-  counts toward the terminal failure budget. (ENG-1125)
+  or because it was still not healthy at the startup deadline. The provision
+  fails definitely, and the failure never counts toward the terminal failure
+  budget. (ENG-1125)
+- Attribution `unhealthy` on `fred_docker_backend_lease_failures_total`: a
+  provision whose health check never passed. It never counts toward the
+  terminal failure budget; do not alert on it. (ENG-1125)
 - Backends report `terminal_budget` (`verdict`, `consecutive_failures`) on
   `GET /provisions` and `GET /provisions/{lease_uuid}`: the lease's
   consecutive-failure budget, which decides whether providerd closes a failing
@@ -1133,22 +1137,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
     (host `kill`, `ctr`, a shim crash), and an operator stop whose `kill` event
     dockerd dropped for a lagging subscriber are indistinguishable from the
     workload's own exit and count.
-  - Not covered: a workload that crashes during startup verification, before
-    it was ever ready, never reaches the budget. In a multi-service stack, a
-    service that dies while a later service is still being verified leaves
-    the lease re-provisioned every pass, never closed. Both are being fixed in
-    ENG-1125. The immediate close of an ACTIVE lease whose re-provision is
-    refused with a validation error is unchanged (ENG-800).
+  - Not covered: the immediate close of an ACTIVE lease whose re-provision is
+    refused with a validation error is unchanged (ENG-800). Startup crashes
+    count through ENG-1125, below.
+- A container that crashes during startup verification now fails the
+  provision definitely instead of leaving the lease `provisioning`, and the
+  tenant sees a curated reason (`ContainerExited`, `container exited during
+  startup` or `container exited during health check`). The docker-backend
+  removes the attempt's containers and the volumes that attempt created, and
+  reports the failure at once, so providerd re-provisions an ACTIVE lease or
+  rejects a PENDING one without waiting for `provision_timeout`. Every service
+  of a stack is watched until the whole stack is ready, so a service that
+  exits while another one is still starting fails the provision too, and a
+  container that dies just before the lease is reported `ready` is still
+  attributed from the live event stream. Startup crash loops count toward the
+  terminal budget only after the 30-minute floor, and only when the live event
+  stream observed the container's whole run with no signal to it; a crash
+  after a launch the platform degraded (writable-path seeding skipped) never
+  counts. A health check that never passes fails definitely but does not
+  count. (ENG-1125)
 - A provision or restore whose outcome the docker-backend could not settle
-  live, such as a container that crashed during startup verification after it
-  was launched, no longer leaves the lease `provisioning` for as long as the
-  backend runs. Once the backend's periodic recovery has proven the attempt
-  failed, it publishes the lease `failed` with that attempt's reason and
-  message, so providerd re-provisions an ACTIVE lease or rejects a PENDING one.
-  A container that exited during startup verification is kept until recovery
-  removes it, so recovery settles such an attempt within one
-  `reconcile_interval` instead of waiting out `provision_timeout`. These
-  failures never count toward the terminal failure budget. (ENG-1125)
+  live, such as a failed inspection during startup verification or a failed
+  startup whose cleanup could not finish, no longer leaves the lease
+  `provisioning` for as long as the backend runs. Once the backend's periodic
+  recovery has proven the attempt failed, it publishes the lease `failed` with
+  that attempt's reason and message. The attempt's containers are kept for
+  recovery, which settles it within one `reconcile_interval` instead of
+  waiting out `provision_timeout` when one of them has exited. These failures
+  never count toward the terminal failure budget. (ENG-1125)
 - A provision failure's reason names what was observed. Only a container that
   exited is `ContainerExited`; a health check that never passed is
   `HealthCheckFailed`; a failed inspection, a canceled verification, a

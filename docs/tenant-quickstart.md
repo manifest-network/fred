@@ -264,7 +264,7 @@ recognize as a generic failure and fall back to displaying `message`. The define
 | Reason | Meaning |
 |---|---|
 | `ContainerExited` | A container exited unexpectedly (crash, non-zero exit, OOM kill) |
-| `HealthCheckFailed` | A container's health check never passed during startup: it reported unhealthy, or was still not healthy at the provision deadline |
+| `HealthCheckFailed` | A container's health check never passed during startup: it reported unhealthy, or was still not healthy at the startup deadline |
 | `ImagePullFailed` | The container image could not be pulled |
 | `Internal` | An internal fred/backend error (not attributable to the tenant's workload) |
 | `RestartFailed` | A tenant-initiated restart failed |
@@ -312,12 +312,13 @@ closed (`verdict`: `retry` or `exhausted`).
 A separate rule still closes an `ACTIVE` lease at once: when its automatic re-provision is
 refused as invalid, for example because its image is no longer allowed.
 
-Known gap, fixed separately for the same release (ENG-1125): a container that crashes during
-startup verification, before it ever becomes ready, does not count toward this budget. The lease
-reports `failed` with the crash's reason within a few minutes and is re-provisioned, so a broken
-image keeps cycling, billed, until you close the lease or update the manifest. In a stack with
-several services, a service that dies while a later one is still starting can likewise keep the
-lease cycling through re-provisions without ever being closed.
+A container that crashes while it starts, before it ever becomes ready, counts the same way:
+the lease reports `failed` with reason `ContainerExited` within seconds and is re-provisioned, and
+a crash loop is closed by the same three-failures-over-30-minutes rule. In a stack with several
+services, a service that crashes while another one is still starting fails the deployment too.
+A health check that never passes reports `HealthCheckFailed` and never counts: such a lease keeps
+being re-provisioned, billed, until you fix the health check, update the manifest or close the
+lease.
 
 ---
 
