@@ -18,6 +18,13 @@ package docker
 //     authority and the volume root were attested; DetachCondemnedAnchor is
 //     called only from its detachAnchor, which only its removeOptions lends,
 //     which only its removeEntry passes to fstree.
+//  3. Only a starting Backend defers first-time deletions to its hold
+//     executor: Backend.Start is the only caller of the coordinator's
+//     deferVolumeDeletesUntilExecutorRuns, the coordinator's constructor is
+//     the only caller of a manager's DeferDeletesUntilExecutorRuns, and only
+//     the XFS manager's DeferDeletesUntilExecutorRuns builds a deferral that
+//     defers anything. A manager no Backend is starting therefore deletes
+//     inline and never waits for an executor that does not exist.
 //
 // The older single-constructor rules (cause, outcome, hold record), the only
 // callers of the cleanup attempt, the allowlisted holdable sites, and the
@@ -152,6 +159,11 @@ var deleteHoldPins = []deleteHoldPin{
 		"xfsVolumeManager.runXFSDeleteStageCleanup", "xfsVolumeManager.emptyAndRemoveCondemnedXFSVolume",
 		"xfsVolumeManager.firstDeleteAttempt", "xfsVolumeManager.registeredHoldOutcome",
 	}},
+	{"start's delete deferral", selectorNamed("deferVolumeDeletesUntilExecutorRuns"), []string{"Backend.Start"}},
+	{"manager delete deferral", selectorNamed("DeferDeletesUntilExecutorRuns"),
+		[]string{"newBackgroundMaintenanceCoordinator"}},
+	{"delete deferral literal", typedLiteral("volumeDeleteDeferral"),
+		[]string{"xfsVolumeManager.DeferDeletesUntilExecutorRuns"}},
 }
 
 // funcKey names a function "Func", or a method "Recv.Method".
@@ -260,6 +272,9 @@ func misuse(v condemnedXFSVolume, x *xfsVolumeManager, row xfsProjectQuotaRow, f
 	_, _ = v.removeEntry(nil, fstree.Name{})
 	_ = x.cleanupXFSDeleteStageWith(nil, xfsDeleteStageName{}, nil, nil, nil)
 	_ = holdable(holdReasonDeadline, nil)
+	_ = x.deferVolumeDeletesUntilExecutorRuns()
+	_ = x.DeferDeletesUntilExecutorRuns()
+	_ = volumeDeleteDeferral{release: func() {}}
 	_ = view
 }
 `

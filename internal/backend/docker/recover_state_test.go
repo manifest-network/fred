@@ -46,7 +46,9 @@ type mockVolumeManager struct {
 	RenameVolumeFn                        func(oldName, newName string) error
 	UsageFn                               func(ctx context.Context, id string) (int64, error)
 
-	inlineDeletes atomic.Bool
+	// openDeleteDeferrals counts the open DeferDeletesUntilExecutorRuns
+	// deferrals, as the XFS manager does.
+	openDeleteDeferrals atomic.Int32
 
 	// defaultDir is returned by Create when CreateFn is nil.
 	// Set this to t.TempDir() in tests that need real paths.
@@ -150,7 +152,13 @@ func (m *mockVolumeManager) RetryHeldVolumeDelete(ctx context.Context, id string
 	return nil
 }
 
-func (m *mockVolumeManager) EnableInlineVolumeDeletes() { m.inlineDeletes.Store(true) }
+func (m *mockVolumeManager) DeferDeletesUntilExecutorRuns() volumeDeleteDeferral {
+	m.openDeleteDeferrals.Add(1)
+	var once sync.Once
+	return volumeDeleteDeferral{release: func() {
+		once.Do(func() { m.openDeleteDeferrals.Add(-1) })
+	}}
+}
 
 func (m *mockVolumeManager) Validate() error {
 	if m.ValidateFn != nil {

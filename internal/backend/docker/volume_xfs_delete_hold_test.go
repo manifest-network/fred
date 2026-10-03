@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -591,12 +592,13 @@ esac`, stage.projID, stage.projID))
 	assert.DirExists(t, stage.volumeID.hostPath(dataPath))
 }
 
-// Before the hold executor runs (during Start), a first-time Destroy mints its
-// stage and is held at once, removing nothing, so Start never waits on a tree.
+// Before the hold executor runs (during Start, under the deferral Start
+// holds), a first-time Destroy mints its stage and is held at once, removing
+// nothing, so Start never waits on a tree.
 func TestXFSDestroyBeforeTheExecutorRunsIsHeldWithoutAnAttempt(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
-	mgr.inlineDeletes.Store(false)
+	t.Cleanup(mgr.DeferDeletesUntilExecutorRuns().End)
 	const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
 	volumePath := filepath.Join(dataPath, name)
 	require.NoError(t, os.Mkdir(volumePath, 0o700))
@@ -616,6 +618,82 @@ func TestXFSDestroyBeforeTheExecutorRunsIsHeldWithoutAnAttempt(t *testing.T) {
 	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, name)
 	assert.DirExists(t, stage.hostPath(dataPath), "the stage is minted and durable")
 	assert.NoFileExists(t, logPath)
+}
+
+// A manager no Backend is starting (an offline tool, a test driving a manager
+// directly) deletes inline. Built by the production constructor and never
+// started, its first-time Destroy removes the volume, the stage and the
+// project mapping in the same call, and leaves no hold for an executor it
+// does not have.
+func TestXFSStandaloneManagerDestroysInline(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+	require.False(t, mgr.deletesDeferred(), "a manager is constructed with no deferral open")
+	const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	volumePath := filepath.Join(dataPath, name)
+	require.NoError(t, os.MkdirAll(filepath.Join(volumePath, writablePathSubdir, "nested"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(volumePath, writablePathSubdir, "nested", "data"), []byte("x"), 0o600))
+	require.NoError(t, writeProjectIDFile(volumePath, xfsDeleteTestProjectID))
+	installXFSQuotaFixture(t, "")
+	completed := volumeDeleteOutcomesTotal.WithLabelValues(volumeDeleteOutcomeCompleted)
+	before := testutil.ToFloat64(completed)
+
+	require.NoError(t, mgr.Destroy(t.Context(), name))
+	assert.NoDirExists(t, volumePath)
+	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, name)
+	assert.NoDirExists(t, stage.hostPath(dataPath), "the stage is removed in the same call")
+	assert.Empty(t, mgr.VolumeDeleteHolds().holds, "nothing is left for an executor")
+	mgr.mu.Lock()
+	_, mapped := mgr.volumeToID[name]
+	_, reserved := mgr.activeIDs[xfsDeleteTestProjectID]
+	mgr.mu.Unlock()
+	assert.False(t, mapped, "the volume's project mapping is released")
+	assert.False(t, reserved, "the project ID is released")
+	assert.Equal(t, before+1, testutil.ToFloat64(completed), "the deletion ran inline and completed")
+}
+
+// Deletions are deferred exactly while a deferral is open. The zero value
+// defers nothing; ending a deferral twice cannot end another one still open;
+// once every deferral has ended, a first-time Destroy runs inline again.
+func TestXFSDeleteDeferralLastsOnlyWhileOpen(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+	installXFSQuotaFixture(t, "")
+	volume := func(index int) string {
+		t.Helper()
+		name := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", index)
+		volumePath := filepath.Join(dataPath, name)
+		require.NoError(t, os.Mkdir(volumePath, 0o700))
+		require.NoError(t, writeProjectIDFile(volumePath, xfsDeleteTestProjectID+uint32(index)))
+		return name
+	}
+	requireDeferred := func(name string) {
+		t.Helper()
+		require.ErrorIs(t, mgr.Destroy(t.Context(), name), ErrVolumeDeleteHeld)
+		hold := heldForTest(t, mgr, name)
+		assert.Equal(t, holdReasonDeadline, hold.reason)
+		assert.Zero(t, hold.attempts, "%s is handed to the executor without an attempt", name)
+		assert.DirExists(t, filepath.Join(dataPath, name))
+	}
+	requireInline := func(name string) {
+		t.Helper()
+		require.NoError(t, mgr.Destroy(t.Context(), name))
+		assert.NoDirExists(t, filepath.Join(dataPath, name))
+		assert.NotContains(t, mgr.VolumeDeleteHolds().holds, name)
+	}
+
+	volumeDeleteDeferral{}.End()
+	requireInline(volume(0))
+
+	first := mgr.DeferDeletesUntilExecutorRuns()
+	second := mgr.DeferDeletesUntilExecutorRuns()
+	requireDeferred(volume(1))
+	second.End()
+	second.End()
+	requireDeferred(volume(2))
+	first.End()
+	assert.False(t, mgr.deletesDeferred())
+	requireInline(volume(3))
 }
 
 // A retry of a held deletion reads the stage's attributes instead of

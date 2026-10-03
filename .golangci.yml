@@ -61,7 +61,10 @@ linters:
       # assertion or a newly retained raw sink from bypassing the boundary.
       #
       # A held volume deletion is retried only by the hold executor, through
-      # the same construction-bound bracket (ENG-1117).
+      # the same construction-bound bracket (ENG-1117). Only Backend.Start,
+      # through the same composition, defers first-time deletions to that
+      # executor; any other deferral would hold deletions for an executor
+      # that may never run.
       #
       # Tenant-controlled directory trees can be arbitrarily deep or wide. The
       # standard library's recursive removers and walkers recurse with one open
@@ -86,6 +89,8 @@ linters:
           msg: "[composition-writer] managed-volume creation must use the construction-bound substrate mutation executor"
         - pattern: '\.RetryHeldVolumeDelete$'
           msg: "[composition-writer] held volume deletions are retried only by the hold executor through the construction-bound substrate mutation executor"
+        - pattern: '\.DeferDeletesUntilExecutorRuns$'
+          msg: "[composition-writer] only Backend.Start defers volume deletions to the hold executor, through the construction-bound background maintenance coordinator"
         - pattern: '\.RemoveAll$'
           msg: "recursive removal must use internal/fstree.RemoveBeneath, which bounds descriptors, depth and work"
         - pattern: '^(filepath\.Walk|filepath\.WalkDir|fs\.WalkDir|os\.CopyFS)$'
@@ -150,7 +155,8 @@ linters:
       # captures that writer during composition and exposes only subject-bound
       # or fixed background workflows; no request handler receives the sink.
       # Only the [composition-writer] rules (Destroy, Create,
-      # RetryHeldVolumeDelete) are exempt here: every other rule still applies.
+      # RetryHeldVolumeDelete, DeferDeletesUntilExecutorRuns) are exempt here:
+      # every other rule still applies.
       - path: ^internal/backend/docker/storage_mutation_guard\.go$
         linters:
           - forbidigo

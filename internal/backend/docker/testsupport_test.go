@@ -2516,7 +2516,9 @@ func (f *fakeVolumeBackend) PrecheckDestroy(managedVolumeName) (destroyPrecheckV
 	return destroyPrecheckNeedsLock, nil
 }
 func (f *fakeVolumeBackend) RetryHeldVolumeDelete(context.Context, string) error { return nil }
-func (f *fakeVolumeBackend) EnableInlineVolumeDeletes()                          {}
+func (f *fakeVolumeBackend) DeferDeletesUntilExecutorRuns() volumeDeleteDeferral {
+	return volumeDeleteDeferral{}
+}
 
 // RenameVolume captures the rename request. Returns nil unconditionally —
 // migration tests assert on the recorded renames slice rather than on a

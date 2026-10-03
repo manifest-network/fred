@@ -212,7 +212,10 @@ func (b *btrfsVolumeManager) PrecheckDestroy(managedVolumeName) (destroyPrecheck
 
 func (b *btrfsVolumeManager) RetryHeldVolumeDelete(context.Context, string) error { return nil }
 
-func (b *btrfsVolumeManager) EnableInlineVolumeDeletes() {}
+// btrfs never stages a deletion, so it has none to defer.
+func (b *btrfsVolumeManager) DeferDeletesUntilExecutorRuns() volumeDeleteDeferral {
+	return volumeDeleteDeferral{}
+}
 
 // RenameVolume renames a btrfs subvolume root through the descriptor-rooted
 // VFS rename path. The btrfs kernel module treats a subvolume root as a

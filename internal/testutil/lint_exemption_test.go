@@ -57,8 +57,10 @@ var forbidigoExemptions = map[string]struct {
 	files    []string
 }{
 	"[composition-writer]": {
-		patterns: []string{`\.Destroy$`, `volumes\.Create$`, `\.RetryHeldVolumeDelete$`},
-		files:    []string{"internal/backend/docker/storage_mutation_guard.go"},
+		patterns: []string{
+			`\.Destroy$`, `volumes\.Create$`, `\.RetryHeldVolumeDelete$`, `\.DeferDeletesUntilExecutorRuns$`,
+		},
+		files: []string{"internal/backend/docker/storage_mutation_guard.go"},
 	},
 	"[tree-removal-wiring]": {
 		patterns: []string{`fstree\.RemoveBeneath$`},

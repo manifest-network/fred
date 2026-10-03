@@ -480,7 +480,10 @@ func (z *zfsVolumeManager) PrecheckDestroy(managedVolumeName) (destroyPrecheckVe
 
 func (z *zfsVolumeManager) RetryHeldVolumeDelete(context.Context, string) error { return nil }
 
-func (z *zfsVolumeManager) EnableInlineVolumeDeletes() {}
+// ZFS never stages a deletion, so it has none to defer.
+func (z *zfsVolumeManager) DeferDeletesUntilExecutorRuns() volumeDeleteDeferral {
+	return volumeDeleteDeferral{}
+}
 
 // RecoverInterruptedVolumeMutations mounts exact unmounted managed children before
 // ordinary operation-intent recovery. The dataset already carries both its

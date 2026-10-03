@@ -125,10 +125,31 @@ type xfsVolumeManager struct {
 	// project 0 and fsynced, with the directory it verified, so a retry reads
 	// the attributes instead of rewriting and re-syncing them.
 	verifiedDeleteStages map[xfsDeleteStageName]os.FileInfo
-	// inlineDeletes is set once the Backend's hold executor runs. Until then a
-	// first-time Destroy mints its stage and hands the deletion to the
-	// executor without attempting it, so Start never waits on a tenant tree.
-	inlineDeletes atomic.Bool
+	// openDeleteDeferrals counts the open deferrals of
+	// DeferDeletesUntilExecutorRuns: Backend.Start holds one from its entry
+	// until its hold executor runs. While one is open, a first-time Destroy
+	// mints its stage and hands the deletion to the executor without
+	// attempting it, so Start never waits on a tenant tree. Its zero value,
+	// in which every manager is constructed, deletes inline: a manager that
+	// no Backend is starting (an offline tool, a test) never depends on an
+	// executor it does not have.
+	openDeleteDeferrals atomic.Int32
+}
+
+// newXFSVolumeManager builds the manager for the XFS volume root dataPath,
+// whose filesystem is mounted at mountPoint. It opens no delete deferral: a
+// first-time Destroy runs inline under liveXFSDeleteBudget unless a starting
+// Backend defers it.
+func newXFSVolumeManager(dataPath, mountPoint string, minAvgFileBytes int64, logger *slog.Logger) *xfsVolumeManager {
+	return &xfsVolumeManager{
+		dataPath:          dataPath,
+		mountPoint:        mountPoint,
+		logger:            logger,
+		minAvgFileBytes:   minAvgFileBytes,
+		projectAttributes: linuxXFSProjectAttributes{},
+		activeIDs:         make(map[uint32]string),
+		volumeToID:        make(map[string]uint32),
+	}
 }
 
 func (x *xfsVolumeManager) PinIdentityRoot() error { return x.rootWatch.pin(x.dataPath) }
@@ -2321,8 +2342,9 @@ func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB in
 // phase answers nil once an Lstat in this call proves the final path absent. Only the hold
 // executor (RetryHeldVolumeDelete) runs held work. A first-time deletion runs
 // inline under liveXFSDeleteBudget, which ends early when the caller or the
-// Backend stops; before the executor runs (during Start) it is not attempted at
-// all and is held at once.
+// Backend stops. Only while a starting Backend defers deletions (from Start's
+// entry until its hold executor runs) is it not attempted at all and held at
+// once.
 func (x *xfsVolumeManager) Destroy(ctx context.Context, id string) error {
 	return x.destroyWith(ctx, id, removeCondemnedXFSEntry)
 }
@@ -2438,16 +2460,16 @@ func (x *xfsVolumeManager) destroyWith(ctx context.Context, id string, removeAll
 }
 
 // firstDeleteAttempt runs the first cleanup attempt of a freshly durable
-// stage inline under liveXFSDeleteBudget, or, before the hold executor runs,
-// holds it at once without attempting it so that Start never waits on a
-// tenant tree.
+// stage inline under liveXFSDeleteBudget, or, while a starting Backend defers
+// deletions, holds it at once without attempting it so that Start never waits
+// on a tenant tree.
 func (x *xfsVolumeManager) firstDeleteAttempt(
 	ctx context.Context,
 	volumeID managedVolumeName,
 	stage xfsDeleteStageName,
 	removeContent xfsRemoveTree,
 ) error {
-	if !x.inlineDeletes.Load() {
+	if x.deletesDeferred() {
 		outcome := x.recordXFSDeleteStageOutcome(stage, xfsDeleteAttempt{},
 			holdable(holdReasonDeadline, errInlineDeleteDeferred), false)
 		return x.destroyResult(volumeID, outcome)

@@ -159,11 +159,13 @@ type volumeMutationSink interface {
 	// composition file (forbidigo).
 	RetryHeldVolumeDelete(ctx context.Context, id string) error
 
-	// EnableInlineVolumeDeletes lets a first-time Destroy run its cleanup inline
-	// under a short budget. Until it is called (during Start, before the hold
-	// executor runs) a Destroy mints the delete stage and hands the work to the
-	// executor at once.
-	EnableInlineVolumeDeletes()
+	// DeferDeletesUntilExecutorRuns opens Backend.Start's deferral of
+	// first-time deletions (see volumeDeleteDeferral): until the returned
+	// deferral is ended, a first-time Destroy mints its delete stage and hands
+	// the deletion to the hold executor without attempting it. A manager is
+	// constructed with no deferral open and deletes inline under its short
+	// budget. Only the composition file reaches it (forbidigo).
+	DeferDeletesUntilExecutorRuns() volumeDeleteDeferral
 
 	// RenameVolume atomically renames a managed volume from oldName to
 	// newName, preserving data and per-volume metadata (xfs project ID,
@@ -262,7 +264,10 @@ func (n *noopVolumeManager) PrecheckDestroy(managedVolumeName) (destroyPrecheckV
 
 func (n *noopVolumeManager) RetryHeldVolumeDelete(context.Context, string) error { return nil }
 
-func (n *noopVolumeManager) EnableInlineVolumeDeletes() {}
+// The noop manager never stages a deletion, so it has none to defer.
+func (n *noopVolumeManager) DeferDeletesUntilExecutorRuns() volumeDeleteDeferral {
+	return volumeDeleteDeferral{}
+}
 
 func (n *noopVolumeManager) Validate() error {
 	return nil
@@ -367,15 +372,7 @@ func newVolumeManager(dataPath, filesystem string, minAvgFileBytes int64, logger
 		if err != nil {
 			return nil, fmt.Errorf("resolve xfs mount point for volume_data_path %q: %w", dataPath, err)
 		}
-		return &xfsVolumeManager{
-			dataPath:          dataPath,
-			mountPoint:        mountPoint,
-			logger:            logger,
-			minAvgFileBytes:   minAvgFileBytes,
-			projectAttributes: linuxXFSProjectAttributes{},
-			activeIDs:         make(map[uint32]string),
-			volumeToID:        make(map[string]uint32),
-		}, nil
+		return newXFSVolumeManager(dataPath, mountPoint, minAvgFileBytes, logger), nil
 	case "zfs":
 		return &zfsVolumeManager{dataPath: dataPath, logger: logger}, nil
 	default:

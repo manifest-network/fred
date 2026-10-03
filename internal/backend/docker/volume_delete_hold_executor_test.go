@@ -627,7 +627,6 @@ func TestStartServesWithHeldDeleteStage(t *testing.T) {
 	require.NoError(t, os.Mkdir(gone.hostPath(dataPath), 0o700))
 	installXFSQuotaFixture(t, "")
 	mgr := newXfsManagerForTest(dataPath)
-	mgr.inlineDeletes.Store(false) // a fresh process: Start enables inline deletes
 	b.volumes = validatingXFSManager{mgr}
 	installTestStorageMutationAdapters(b)
 	bindRetentionOrphanPrunerForTest(t, b)
@@ -645,7 +644,7 @@ func TestStartServesWithHeldDeleteStage(t *testing.T) {
 	require.NoError(t, b.Start(context.Background()))
 	require.NoError(t, b.terminalStorageAuthorityError(), "a held deletion never latches")
 	require.NoError(t, b.Health(t.Context()), "the Backend reports healthy")
-	assert.True(t, mgr.inlineDeletes.Load(), "Start enables inline deletes once the executor runs")
+	assert.False(t, mgr.deletesDeferred(), "Start ends its deferral once the executor runs")
 	require.Eventually(t, func() bool {
 		hold, held := mgr.VolumeDeleteHolds().holds[stage.volumeID.value()]
 		return held && hold.attempts >= 1
@@ -705,7 +704,6 @@ func TestStartWithholdsDiskAdmissionForAnUnsizedRecoveredDeletion(t *testing.T) 
   *"report -p -i -n -N"*) printf '#%d 1 0 0 0\n' ;;
 esac`, gone.projID, gone.projID))
 	mgr := newXfsManagerForTest(dataPath)
-	mgr.inlineDeletes.Store(false)
 	b.volumes = validatingXFSManager{mgr}
 	installTestStorageMutationAdapters(b)
 	bindRetentionOrphanPrunerForTest(t, b)
@@ -756,12 +754,13 @@ esac`, gone.projID, gone.projID))
 }
 
 // Start never waits on a tenant tree: a deletion first requested during
-// Start is handed to the executor without an attempt, so several closes whose
-// volumes need long removals do not stretch Start.
+// Start, under the deferral Start holds, is handed to the executor without an
+// attempt, so several closes whose volumes need long removals do not stretch
+// Start.
 func TestStartDefersFirstTimeDeletesToTheExecutor(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
-	mgr.inlineDeletes.Store(false)
+	t.Cleanup(mgr.DeferDeletesUntilExecutorRuns().End)
 	installLoggingXFSQuota(t)
 	started := time.Now()
 	for i := range 3 {
@@ -776,6 +775,41 @@ func TestStartDefersFirstTimeDeletesToTheExecutor(t *testing.T) {
 	assert.Less(t, time.Since(started), liveXFSDeleteBudget, "three deferrals take no removal time")
 	removal := mgr.VolumeDeleteHolds().phaseCounts()[volumeDeleteHoldPhaseRemoval]
 	assert.Equal(t, 3, removal)
+}
+
+// Start's deferral lasts only while Start runs: it is open from Start's entry,
+// and a Start that fails before its hold executor runs ends it as well, so the
+// manager deletes inline again instead of handing deletions to an executor
+// that never started.
+func TestStartEndsItsDeleteDeferralWhenItFails(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+	installXFSQuotaFixture(t, "")
+	unavailable := errors.New("docker daemon unavailable")
+	var deferredDuringStart atomic.Bool
+	dockerClient := &mockDockerClient{
+		PingFn: func(context.Context) error {
+			deferredDuringStart.Store(mgr.deletesDeferred())
+			return unavailable
+		},
+		CloseFn: func() error { return nil },
+	}
+	b := newBackendForProvisionTest(t, dockerClient, nil)
+	bindTestStorageIdentity(t, b, dockerClient)
+	t.Cleanup(b.stopCancel)
+	b.volumes = validatingXFSManager{mgr}
+
+	require.ErrorIs(t, b.Start(context.Background()), unavailable)
+	assert.True(t, deferredDuringStart.Load(), "Start defers first-time deletions from its entry")
+	assert.False(t, mgr.deletesDeferred(), "a failed Start ends its deferral")
+
+	const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	volumePath := filepath.Join(dataPath, name)
+	require.NoError(t, os.Mkdir(volumePath, 0o700))
+	require.NoError(t, writeProjectIDFile(volumePath, xfsDeleteTestProjectID))
+	require.NoError(t, mgr.Destroy(t.Context(), name), "the manager deletes inline again")
+	assert.NoDirExists(t, volumePath)
+	assert.Empty(t, mgr.VolumeDeleteHolds().holds)
 }
 
 // HTTP Deprovision of a close waiting only on held deletions answers the
@@ -1240,7 +1274,6 @@ func TestStartWithPendingClosesDefersTheirDeletesToTheExecutor(t *testing.T) {
 	}
 	installLoggingXFSQuota(t)
 	mgr := newXfsManagerForTest(dataPath)
-	mgr.inlineDeletes.Store(false) // a fresh process: Start enables inline deletes
 	b.volumes = validatingXFSManager{mgr}
 	bindRetentionOrphanPrunerForTest(t, b)
 	// Hold the executor's first pass until the test has observed Start's work.
