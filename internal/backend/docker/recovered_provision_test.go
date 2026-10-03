@@ -219,6 +219,12 @@ func TestProvisionStateMatches_CoversEveryField(t *testing.T) {
 		"ServiceContainers": func(p *provision) {
 			p.ServiceContainers["app"][0] = "changed"
 		},
+		"TerminalBudget": func(p *provision) {
+			// The budget is opaque; its only off-actor mutator that keeps the
+			// status is InheritTerminalBudget, which still changes the stored
+			// value: a fresh budget for this Ready lease anchors its Ready period.
+			p.InheritTerminalBudget(nil, time.Now())
+		},
 	}
 
 	typeOfState := reflect.TypeFor[leasesm.ProvisionState]()

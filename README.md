@@ -666,7 +666,8 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 - `payload_received` - True if payload has been uploaded
 - `provisioning_started` - True if provisioning is in progress
 - `provision_status` - Backend provision status (omitted if not provisioned). May be `retained` for a closed/expired lease whose data was soft-deleted and is restorable (see [retention](internal/backend/docker/README.md#soft-delete--restore))
-- `fail_count` - Number of provisioning failures (omitted if zero)
+- `fail_count` - Lifetime count of recorded failures, whoever caused them (omitted if zero). A diagnostic only: it never decides whether the lease is closed
+- `terminal_budget` - The backend's consecutive-failure budget (omitted when the backend reports none): `consecutive_failures` is the recorded count of consecutive failures of your own workload, and `verdict` is `exhausted` when the provider will close the lease for repeated failure, otherwise `retry`. It is exhausted only by a third or later consecutive failure that comes at least 30 minutes after the first failure of the streak, so a quick burst of failures (an outage) never closes the lease by itself. Restarts, updates and platform failures never count, and a restart or update you request resets the count. Once the lease has stayed ready for ten minutes, its next failure, restart or update starts a fresh streak. The count and verdict shown are the recorded ones and do not change with time, so a lease that has been healthy for a long time can still show its old count until then. See [Repeated failures](#state-matrix)
 - `reason` - Stable, machine-readable failure category; present whenever a failure has been recorded — including a `ready` lease whose last update failed and rolled back to the previous version — and omitted (`omitempty`) when empty; see [Failure Reason Codes](#failure-reason-codes)
 - `message` - Curated, human-readable failure summary (omitted if empty); no host paths or raw command output
 - `retained_until` - RFC3339 retention deadline; present only for retained data with a configured age limit. Omitted when age-based expiry is disabled; other retention policy and capacity limits still apply.
@@ -692,6 +693,7 @@ Returns provision diagnostics for a lease, including status, failure reason, and
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "status": "failed",
   "fail_count": 3,
+  "terminal_budget": {"verdict": "retry", "consecutive_failures": 1},
   "reason": "ContainerExited",
   "message": "container exited unexpectedly"
 }
@@ -699,7 +701,8 @@ Returns provision diagnostics for a lease, including status, failure reason, and
 
 **Fields:**
 - `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, `retained`, or `unknown`. `failing` is a transient state between container-death detection and the Failed callback; `deprovisioning` covers the container-removal window; `retained` marks a closed/expired lease whose data was soft-deleted and is restorable
-- `fail_count` - Number of provision attempts that failed
+- `fail_count` - Lifetime count of recorded failures (diagnostic only; it never decides a close)
+- `terminal_budget` - The consecutive-failure budget, as in [Get Lease Status](#get-lease-status); omitted when the backend reports none or the answer comes from persisted diagnostics
 - `reason` - Stable, machine-readable failure category, always present when `status` is `failed` (defaults to `Unknown` if no specific cause was recorded); see [Failure Reason Codes](#failure-reason-codes)
 - `message` - Curated, human-readable failure summary; may be empty
 - `items`, `restore_hint` - Present only when `status` is `retained` (restore shape and next-step hint); see [Get Lease Status](#get-lease-status)
@@ -1494,11 +1497,14 @@ Get provision diagnostics for a specific lease.
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "status": "failed",
   "fail_count": 3,
+  "terminal_budget": {"verdict": "retry", "consecutive_failures": 1},
   "reason": "ContainerExited",
   "message": "container exited unexpectedly",
   "created_at": "2024-01-15T10:30:00Z"
 }
 ```
+
+`terminal_budget` is the backend's consecutive-failure verdict; see [BACKEND_GUIDE.md](BACKEND_GUIDE.md#terminal-failure-budget-eng-799).
 
 **Response:** `404 Not Found` if not provisioned.
 
@@ -2034,7 +2040,7 @@ Chain state       Backend inventory       Durable placement/attempts
 | ACTIVE | Provisioned + ready | Healthy - no action |
 | ACTIVE | Provisioned + restarting | In-flight restart - no action |
 | ACTIVE | Provisioned + updating | In-flight update - no action |
-| ACTIVE | Provisioned + failed | Anomaly: re-provision below the attempt limit; otherwise close on-chain and deprovision |
+| ACTIVE | Provisioned + failed | Anomaly: re-provision, unless the backend reports an exhausted consecutive-failure budget (`terminal_budget.verdict` = `exhausted`); then close on-chain (`workload failed repeatedly`) and deprovision. `fail_count` never decides |
 | ACTIVE | Not provisioned | Anomaly: provision |
 | CLOSED/REJECTED/EXPIRED | Provisioned | Orphan candidate: bounded exact chain re-read, then deprovision only if still terminal |
 | Not found in the PENDING/ACTIVE sweep | Provisioned | Orphan candidate: exact chain re-read; absence, query failure, `UNSPECIFIED`, or a future state defers cleanup |

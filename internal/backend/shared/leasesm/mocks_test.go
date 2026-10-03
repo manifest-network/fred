@@ -15,6 +15,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 	"github.com/manifest-network/fred/internal/backend/shared/workbarrier"
 	"github.com/manifest-network/fred/internal/backendidentity"
@@ -423,6 +424,8 @@ func (mockSMMetrics) ActorCreated()                 {}
 func (mockSMMetrics) WorkerPanic(_ string)          {}
 func (mockSMMetrics) ActorPanic()                   {}
 func (mockSMMetrics) TerminalEventDropped(_ string) {}
+
+func (mockSMMetrics) LeaseFailureRecorded(failurecause.Cause) {}
 
 // mockInstanceInspector implements InstanceInspector with a function-
 // field stub. Tests set InspectInstanceFn to control the inspect

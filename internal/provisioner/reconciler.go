@@ -23,6 +23,7 @@ import (
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	"github.com/manifest-network/fred/internal/provisioner/terminalverdict"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -134,7 +135,6 @@ type Reconciler struct {
 
 	interval               time.Duration
 	maxWorkers             int           // Maximum concurrent workers for lease processing
-	maxReprovisionAttempts int           // Max re-provision attempts before rejecting
 	chainInventoryBudget   time.Duration // Whole-list timeout; fixed in production, shortened by tests.
 	placementCleanupBudget time.Duration // Whole-pass timeout; fixed in production, shortened by tests.
 	shutdownSweepGrace     sweepGrace    // How long an in-flight sweep may outlive shutdown; see sweepDrainContext.
@@ -142,16 +142,13 @@ type Reconciler struct {
 	placementSweepSeen     atomic.Bool   // True while a durable baseline matches the configured backend topology.
 }
 
-// DefaultMaxReprovisionAttempts is the default number of re-provision attempts
-// before rejecting a lease whose containers keep failing.
-const DefaultMaxReprovisionAttempts = 3
-
-// ReconcilerConfig configures the reconciler.
+// ReconcilerConfig configures the reconciler. There is deliberately no
+// re-provision attempt limit: whether a failing ACTIVE lease is closed is the
+// backend's consecutive-failure verdict (ENG-799), never a providerd count.
 type ReconcilerConfig struct {
-	Interval               time.Duration // How often to run periodic reconciliation
-	MaxWorkers             int           // Maximum concurrent workers (default: 10)
-	MaxReprovisionAttempts int           // Max re-provision attempts before rejecting (default: 3)
-	Coordinator            *placement.ReconciliationCoordinator
+	Interval    time.Duration // How often to run periodic reconciliation
+	MaxWorkers  int           // Maximum concurrent workers (default: 10)
+	Coordinator *placement.ReconciliationCoordinator
 	// ShutdownSweepGrace bounds how long a sweep that has begun reading
 	// backend inventories may keep reading them and commit its placement
 	// projection after its context is canceled. providerd sets it to half of
@@ -184,14 +181,12 @@ func NewReconciler(
 	// Apply defaults using cmp.Or (returns first non-zero value).
 	interval := cmp.Or(cfg.Interval, 5*time.Minute)
 	maxWorkers := cmp.Or(max(cfg.MaxWorkers, 0), DefaultReconcileWorkers)
-	maxReprovision := cmp.Or(max(cfg.MaxReprovisionAttempts, 0), DefaultMaxReprovisionAttempts)
 	reconciler := &Reconciler{
 		payloads:               payloads,
 		coordinator:            reconciliation,
 		attemptRecovery:        attemptRecovery,
 		interval:               interval,
 		maxWorkers:             maxWorkers,
-		maxReprovisionAttempts: maxReprovision,
 		chainInventoryBudget:   chainInventoryTimeout,
 		placementCleanupBudget: placementCleanupTimeout,
 		shutdownSweepGrace:     sweepGrace{configured: cfg.ShutdownSweepGrace},
@@ -1184,33 +1179,13 @@ func (r *Reconciler) rejectLease(
 	return nil
 }
 
-// closeLease closes an ACTIVE lease on chain with a reason.
-func (r *Reconciler) closeLease(
-	ctx context.Context,
-	action placement.ObservedReconciliationAction,
-	reason string,
-) error {
-	leaseUUID := action.Lease().Uuid
-	closed, txHashes, err := r.coordinator.CloseObserved(ctx, action, reason)
-	if err != nil {
-		return err
+// Pre-initialize every terminal verdict label (ENG-799) so an alert on a
+// verdict that never closes reads 0, not no-data, before the first failure.
+func init() {
+	for _, verdict := range terminalverdict.Labels() {
+		metrics.ReconcilerTerminalVerdictsTotal.WithLabelValues(verdict).Add(0)
 	}
-
-	r.cleanupTerminalLease(leaseUUID)
-
-	slog.Info("reconcile: closed lease",
-		"lease_uuid", leaseUUID,
-		"closed", closed,
-		"tx_hashes", txHashes,
-		"reason", reason,
-	)
-
-	return nil
 }
-
-// lostBackendChainReason is the fixed on-chain reason for a lease whose data
-// lived on a retired backend's lost storage. It names no backend.
-const lostBackendChainReason = "backend storage lost"
 
 // resolveLostLease closes an ACTIVE or rejects a PENDING lease whose placement
 // was lost with its retired backend's storage; a terminal lease needs nothing
@@ -1237,7 +1212,7 @@ func (r *Reconciler) resolveLostLease(
 	outcome := ""
 	switch observed.Lease().State {
 	case billingtypes.LEASE_STATE_ACTIVE:
-		outcome, err = "closed", r.closeLease(ctx, observed, lostBackendChainReason)
+		outcome, err = "closed", r.closeLostLease(ctx, observed)
 	case billingtypes.LEASE_STATE_PENDING:
 		outcome, err = "rejected", r.rejectLease(ctx, observed, lostBackendChainReason)
 	default:
@@ -2001,7 +1976,7 @@ func (r *Reconciler) handleProvisionResult(
 			"reason", reason,
 			"error", err,
 		)
-		if closeErr := r.closeLease(ctx, action, reason); closeErr != nil {
+		if closeErr := r.closeRefusedLease(ctx, action, reason); closeErr != nil {
 			slog.Error("reconcile: failed to close lease",
 				"lease_uuid", leaseUUID,
 				"error", closeErr,
@@ -2073,13 +2048,19 @@ func (r *Reconciler) processLease(
 	// operation that crossed the sweep boundary, so a competing in-flight
 	// lifecycle operation is unrepresentable in this scope.
 	inFlight := false
+	// The backend's consecutive-failure verdict, read from this sweep's complete
+	// inventory, is the only input that can close a failing ACTIVE lease.
+	terminal := terminalverdict.FromProvision(provision)
+	if lease.State == billingtypes.LEASE_STATE_ACTIVE && isProvisioned &&
+		provision.Status == backend.ProvisionStatusFailed {
+		metrics.ReconcilerTerminalVerdictsTotal.WithLabelValues(terminal.Label()).Inc()
+	}
 	plan := planLease(leaseFacts{
 		authority:       lifecycleAuthorityDurable,
 		chain:           lease.State,
 		hasProvision:    isProvisioned,
 		provisionStatus: provision.Status,
-		failCount:       provision.FailCount,
-		maxFailures:     r.maxReprovisionAttempts,
+		terminal:        terminal,
 		hasMetaHash:     len(lease.MetaHash) > 0,
 		payload:         payload,
 		inFlight:        inFlight,
@@ -2122,7 +2103,8 @@ func (r *Reconciler) processLease(
 				"tenant", lease.Tenant,
 				"backend", provision.BackendName,
 				"fail_count", provision.FailCount,
-				"max_attempts", r.maxReprovisionAttempts,
+				"terminal_verdict", terminal.Label(),
+				"consecutive_failures", terminal.ConsecutiveFailures(),
 				"reason", plan.reason,
 			)
 		}
@@ -2163,14 +2145,14 @@ func (r *Reconciler) processLease(
 		}
 
 	case reconcileActionCloseAndDeprovision:
-		slog.Error("reconcile: provision failed too many times, closing lease",
+		slog.Error("reconcile: workload failure budget exhausted, closing lease",
 			"lease_uuid", leaseUUID,
 			"tenant", lease.Tenant,
 			"backend", provision.BackendName,
+			"consecutive_failures", plan.exhaustion.ConsecutiveFailures(),
 			"fail_count", provision.FailCount,
-			"max_attempts", r.maxReprovisionAttempts,
 		)
-		if err := r.closeLease(ctx, authority.action, fmt.Sprintf("provision failed %d times", provision.FailCount)); err != nil {
+		if err := r.closeExhaustedLease(ctx, authority.action, plan.exhaustion); err != nil {
 			slog.Error("reconcile: failed to close exhausted lease",
 				"lease_uuid", leaseUUID,
 				"error", err,
@@ -2188,7 +2170,7 @@ func (r *Reconciler) processLease(
 	case reconcileActionCloseLost:
 		slog.Error("reconcile: closing a live lease with no placement row that may have lived on a retired backend",
 			"lease_uuid", leaseUUID, "tenant", lease.Tenant)
-		if err := r.closeLease(ctx, authority.action, lostBackendChainReason); err != nil {
+		if err := r.closeLostLease(ctx, authority.action); err != nil {
 			metrics.ReconcilerLostLeasesTotal.WithLabelValues("error").Inc()
 			slog.Error("reconcile: failed to close possibly lost lease", "lease_uuid", leaseUUID, "error", err)
 			hadError = true

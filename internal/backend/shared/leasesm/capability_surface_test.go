@@ -19,6 +19,8 @@ func TestActorBoundaryDoesNotExportWritableMessageOrResultShapes(t *testing.T) {
 	for _, value := range []any{
 		ActorCloseScope{}, ActorReply{}, ActorCommand{}, ActorObservation{}, RecoveryCommand{}, ProvisionSuccessResult{},
 		ReplaceSuccessResult{}, ReplaceFailureInfo{}, ReplaceResult{},
+		// Only the actor may advance the terminal budget (ENG-799).
+		TerminalBudget{},
 	} {
 		typeOf := reflect.TypeOf(value)
 		for index := range typeOf.NumField() {

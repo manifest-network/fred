@@ -1921,6 +1921,7 @@ func (b *Backend) Restore(ctx context.Context, request backend.RestoreRequest) e
 			Quantity:             restoreQuantity,
 			CreatedAt:            time.Now(),
 			FailCount:            0,
+			TerminalBudget:       leasesm.TerminalBudget{}, // a new lease UUID starts fresh
 			LastError:            "",
 			Reason:               "", // fresh reservation, no failure
 			Message:              "",

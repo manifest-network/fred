@@ -8,6 +8,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 )
 
 // containerInfoToInstanceState converts the Docker-shaped ContainerInfo
@@ -18,6 +19,12 @@ import (
 // (Phase is Exited or Failed). Docker's ContainerJSON reports
 // ExitCode=0 for still-running containers, which would otherwise be
 // indistinguishable from a successful clean exit.
+//
+// Termination is this adapter's own call for the terminal budget (ENG-799):
+// an "exited" container reported its exit status, so it is an observed exit
+// whatever the code; "removing" and "dead" containers are gone, their end not
+// observed as a workload exit. Anything else is left unknown. A positively
+// absent container is gone too (physical_instance_inspection.go).
 func containerInfoToInstanceState(info *ContainerInfo) *leasesm.InstanceState {
 	if info == nil {
 		return nil
@@ -30,6 +37,12 @@ func containerInfoToInstanceState(info *ContainerInfo) *leasesm.InstanceState {
 	if state.Phase == leasesm.PhaseExited || state.Phase == leasesm.PhaseFailed {
 		ec := info.ExitCode
 		state.ExitCode = &ec
+	}
+	switch state.Phase {
+	case leasesm.PhaseExited:
+		state.Termination = failurecause.Exited()
+	case leasesm.PhaseFailed:
+		state.Termination = failurecause.Gone()
 	}
 	return state
 }

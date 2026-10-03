@@ -113,8 +113,11 @@ What to look at:
 - **`provision_status`** — present once provisioning has started (`provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, `retained`).
 - **`retained_until`**, **`items`**, and **`restore_hint`** — returned for retained data; `items` describes the source lease's shape, and `retained_until`, when present, gives its scheduled expiry. Retention depends on the provider's policy and available capacity; see [Restore](#restore--recover-a-soft-deleted-leases-data).
 - **`fail_count`** + **`reason`** + **`message`** — present after failures; `reason` is a stable machine
-  code (e.g. `ContainerExited`), `message` a short human summary. See [Step 6](#step-6-debug-failures)
+  code (e.g. `ContainerExited`), `message` a short human summary. `fail_count` counts every failure
+  over the lease's life and never decides whether the lease is closed. See [Step 6](#step-6-debug-failures)
   for the full `reason` enum and how to handle unrecognized values.
+- **`terminal_budget`** — `consecutive_failures` and a `verdict` (`retry` or `exhausted`); see
+  [Repeated failures](#repeated-failures-and-lease-closure).
 
 For richer diagnostics during failures, use `GET /v1/leases/{uuid}/provision` (see [Step 6](#step-6-debug-failures)).
 
@@ -248,6 +251,7 @@ curl -H "Authorization: Bearer $(fresh_token)" \
   "provider_uuid": "01234567-...",
   "status": "failed",
   "fail_count": 2,
+  "terminal_budget": {"verdict": "retry", "consecutive_failures": 1},
   "reason": "ContainerExited",
   "message": "container exited unexpectedly"
 }
@@ -281,6 +285,37 @@ curl -H "Authorization: Bearer $(fresh_token)" \
 ```
 
 `reason`/`message` and `logs` are kept for 7 days after the provision is gone (configurable by the operator). On-chain rejection messages are intentionally generic (`container exited unexpectedly`) so secrets in container logs cannot leak there — the rich diagnostics only flow through the authenticated API.
+
+### Repeated failures and lease closure
+
+A failed `ACTIVE` lease is re-provisioned automatically, with your volumes kept. For repeated
+failures, the provider closes it on-chain (reason `workload failed repeatedly`) only after
+**three or more consecutive failures of your own workload spanning at least 30 minutes**: your
+container exiting on its own (any exit code, including an out-of-memory kill at your SKU's limit)
+while the lease was ready, with the closing failure at least 30 minutes after the first one in the
+streak. A quick burst of failures, such as during an outage, never closes the lease by itself.
+`terminal_budget` shows the recorded count (`consecutive_failures`) and whether the lease will be
+closed (`verdict`: `retry` or `exhausted`).
+
+- Once the lease has stayed ready for ten minutes, its next failure, restart or update starts a
+  fresh streak, and the 30 minutes are counted again from that streak's first failure. The count
+  and verdict shown change only at such transitions, so a lease that has been healthy for a long
+  time may still show an old count until then.
+- A restart or update you request resets the count, and its outcome never counts, even if it
+  fails and rolls back. A redeploy the provider starts on its own, for example after a
+  custom-domain change, does not reset it.
+- These never count: backend restarts, host reboots, an operator stopping or killing your
+  container through Docker, a container that vanished, platform and image-admission errors.
+- `fail_count` keeps counting every failure over the lease's life and never decides a close.
+
+A separate rule still closes an `ACTIVE` lease at once: when its automatic re-provision is
+refused as invalid, for example because its image is no longer allowed.
+
+Known gap, fixed separately for the same release (ENG-1125): a container that crashes during
+startup verification, before it ever becomes ready, does not reach this budget. On an automatic
+re-provision such a lease stays `provisioning` and keeps billing; close it yourself or update the
+manifest. In a stack with several services, a service that dies while a later one is still
+starting can likewise keep the lease cycling through re-provisions without ever being closed.
 
 ---
 

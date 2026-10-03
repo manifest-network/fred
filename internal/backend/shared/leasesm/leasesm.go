@@ -20,6 +20,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -29,6 +30,13 @@ import (
 // Kubernetes pod status legitimately enters Unknown — defaulting to
 // any other phase would silently misclassify those cases as Running,
 // Exited, or Failed.
+//
+// Phase decides only whether an instance is terminal (the death guard). It
+// never decides whether a death counts against the terminal budget: that reads
+// InstanceState.Termination, which the substrate adapter mints itself, because
+// the mapping differs per substrate (Docker's PhaseFailed is a container being
+// removed or dead, while a Kubernetes container terminated with an exit code
+// reports PhaseFailed and is still the workload's own exit).
 type Phase int
 
 const (
@@ -84,6 +92,12 @@ type InstanceState struct {
 	FinishedAt  time.Time // zero value when still running
 	Reason      string    // substrate-specific termination reason ("OOMKilled", "Error", etc.)
 	ServiceName string    // per-instance service name in a multi-service deployment; "" when not applicable
+	// Termination is the substrate adapter's own classification of a dead
+	// instance for the terminal budget (ENG-799): failurecause.Exited for an
+	// exit that reported a status, failurecause.Gone for an instance being
+	// removed, dead or positively absent. Its zero value is unknown and never
+	// counts, so an adapter that does not classify can only delay a close.
+	Termination failurecause.Termination
 }
 
 // InstanceInspector wraps the substrate-specific "inspect this
@@ -117,14 +131,17 @@ type DiagnosticsGatherer interface {
 // though substrates translate them to substrate-specific shapes
 // (Docker compose-spec, K8s pod spec) at provision time.
 type ProvisionState struct {
-	LeaseUUID            string
-	Tenant               string
-	ProviderUUID         string
-	SKU                  string
+	LeaseUUID    string
+	Tenant       string
+	ProviderUUID string
+	SKU          string
+	// Status is written only through SetStatus, which applies the terminal
+	// budget's Ready boundary (ENG-799); a construction literal may name only
+	// a non-Ready constant. internal/testutil's guard enforces both.
 	Status               backend.ProvisionStatus
 	Quantity             int
 	CreatedAt            time.Time
-	FailCount            int
+	FailCount            int // lifetime diagnostic; never decides a close (ENG-799)
 	LastError            string
 	Reason               backend.Reason // curated failure-category code (ENG-508), authored at source
 	Message              string         // curated human message (== on-chain CallbackErr)
@@ -150,6 +167,14 @@ type ProvisionState struct {
 	// post-migration; per-service refs go through StackManifest.Services.
 	StackManifest     *manifest.StackManifest
 	ServiceContainers map[string][]string
+	// TerminalBudget is the consecutive tenant-workload failure budget
+	// (ENG-799). Only the lease actor counts a failure on it. A substrate
+	// carries it onto a rebuilt projection only through InheritTerminalBudget;
+	// SetStatus and InheritTerminalBudget never count a failure: they can only
+	// complete a counted Failing -> Failed, leave the budget unchanged, or move
+	// it toward a reset (see terminal_budget.go). A construction literal may
+	// only name the zero value.
+	TerminalBudget TerminalBudget
 }
 
 // LeaseProvisionStore is the substrate-agnostic seam for the
@@ -186,8 +211,9 @@ type ProvisionState struct {
 // variables. The pattern:
 //
 //	var callbackURL string
+//	now := time.Now() // outside: the closure derives nothing from mutable outer state
 //	cfg.ProvisionStore.UpdateFn(uuid, func(p *ProvisionState) {
-//	    p.Status = backend.ProvisionStatusReady
+//	    p.SetStatus(backend.ProvisionStatusReady, now)
 //	    p.LastError = ""
 //	    callbackURL = p.CallbackURL // capture for post-Unlock use
 //	})
@@ -298,12 +324,16 @@ type LeaseProvisionStore interface {
 // no label because the actor goroutine is a single category.
 // TerminalEventDropped's event is a short tag identifying the event
 // type that was dropped (e.g., "diag_gathered", "provision_completed").
+// LeaseFailureRecorded fires once for every failure the terminal budget
+// records, counted or not; the substrate labels it with cause.Label(), a closed
+// set (failurecause.Labels).
 type SMMetrics interface {
 	SMTransition(source, dest, trigger string)
 	ActorCreated()
 	WorkerPanic(workerType string)
 	ActorPanic()
 	TerminalEventDropped(event string)
+	LeaseFailureRecorded(cause failurecause.Cause)
 }
 
 // LeaseActorConfig groups the dependencies a lease actor receives at

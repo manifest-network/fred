@@ -93,6 +93,7 @@ func TestContainerEventLoopDaemonAbsentInstancePublishesFailure(t *testing.T) {
 		t.Fatal("event stream did not connect")
 	}
 	droppedBefore := testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues("event_loop"))
+	disruptionBefore := failureCount("disruption")
 	close(sendEvent)
 	select {
 	case payload := <-callbacks:
@@ -101,6 +102,9 @@ func TestContainerEventLoopDaemonAbsentInstancePublishesFailure(t *testing.T) {
 	case <-time.After(asyncTestResultTimeout):
 		t.Fatal("daemon die event followed by exact 404 did not publish failure without reconciliation")
 	}
+	// The adapter's exact 404 classifies the container as gone (ENG-799): a
+	// disruption, which never counts toward the terminal budget.
+	assert.Equal(t, 1.0, failureCount("disruption")-disruptionBefore)
 	provisions, err := b.LookupProvisions(t.Context(), []string{leaseUUID})
 	require.NoError(t, err)
 	require.Len(t, provisions, 1)
