@@ -937,7 +937,9 @@ func (b *Backend) classifyRecoveredMaintenanceReadiness(
 		if container.Status != "running" {
 			return maintenanceReadinessUnready, nil
 		}
-		if container.Health == HealthStatusUnhealthy {
+		// A running member a startup watch saw pass its check stays healthy
+		// (the sticky health rule, gatedHealth), here as in the watch.
+		if b.gatedHealth(container.ContainerID, container.Health) == HealthStatusUnhealthy {
 			return maintenanceReadinessUnready, nil
 		}
 		service := stack.Services[container.ServiceName]
@@ -962,11 +964,12 @@ func (b *Backend) classifyRecoveredMaintenanceReadiness(
 		if inspected.Status != "running" {
 			return maintenanceReadinessUnready, nil
 		}
-		if inspected.Health == HealthStatusUnhealthy {
+		health := b.gatedHealth(container.ContainerID, inspected.Health)
+		if health == HealthStatusUnhealthy {
 			return maintenanceReadinessUnready, nil
 		}
 		if service.HasActiveHealthCheck() {
-			switch inspected.Health {
+			switch health {
 			case HealthStatusHealthy:
 			case HealthStatusUnhealthy:
 				return maintenanceReadinessUnready, nil

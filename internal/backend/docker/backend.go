@@ -325,6 +325,12 @@ type Backend struct {
 	// reader writes it. Zero-value ready.
 	liveDeaths liveDeathLedger
 
+	// startupHealth remembers the health-gated containers a startup watch saw
+	// pass their health check, the one memory behind the sticky health rule
+	// every startup outcome authority applies (ENG-1125). Only a startup pass
+	// writes it. Zero-value ready.
+	startupHealth startupHealthLedger
+
 	// stopCtx is canceled on shutdown; stopCancel triggers it.
 	stopCtx    context.Context
 	stopCancel context.CancelFunc

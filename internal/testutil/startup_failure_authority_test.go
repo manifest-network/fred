@@ -25,7 +25,11 @@ package testutil
 //     by newStartupFailure (awaitLiveDeath) and the Ready-entry re-dispatch
 //     (takeLiveDeaths); reached through b.liveDeaths only by those four entry
 //     points; and its fields and unexported helpers named only in its own
-//     file.
+//     file;
+//   - the startup health ledger behind the sticky health rule: written
+//     (recordPassedHealth) only by a startup watch's memory
+//     (startupMemory.remember), from a pass it inspected; its fields are named
+//     only in its own file.
 //
 // A zero receipt, finding or plan is invalid (a nil state), but a valid one
 // could still be forged in its package from a state value. So the state types
@@ -59,6 +63,7 @@ const (
 	provisionFile              = "internal/backend/docker/provision.go"
 	launchDispatchFile         = "internal/backend/docker/storage_mutation_guard.go"
 	liveDeathLedgerFile        = "internal/backend/docker/live_death_ledger.go"
+	startupHealthLedgerFile    = "internal/backend/docker/startup_health_ledger.go"
 	sharedStartupFailureFile   = "internal/backend/shared/operation_startup_failure.go"
 	sharedHandoffFile          = "internal/backend/shared/operation_handoff.go"
 	sharedPhysicalOutcomeFile  = "internal/backend/shared/physical_outcome.go"
@@ -73,6 +78,7 @@ const (
 	startupDeathRedispatchSite = "Backend.redispatchStartupDeaths"
 	liveDeathRecorderSite      = "Backend.recordLiveContainerDeaths"
 	liveDeathStreamMarkSite    = "Backend.runContainerEventLoop"
+	startupMemoryRememberSite  = "startupMemory.remember"
 )
 
 // typeSite and valueSite name one top-level declaration as a site: a type
@@ -102,6 +108,7 @@ var dockerStartupRules = []startupAuthorityRule{
 	{"markLiveDeathStream", []attributionSite{{terminalBudgetEventsFile, liveDeathStreamMarkSite}}, "a live-death ledger write"},
 	{"awaitLiveDeath", []attributionSite{{startupFailureFile, startupFailureMintSite}}, "a live-death ledger read"},
 	{"takeLiveDeaths", []attributionSite{{terminalBudgetEventsFile, startupDeathRedispatchSite}}, "a live-death ledger read"},
+	{"recordPassedHealth", []attributionSite{{startupObservationFile, startupMemoryRememberSite}}, "a startup health ledger write"},
 }
 
 // Package-qualified names of package shared, and their one docker site.
@@ -170,6 +177,23 @@ var liveDeathLedgerEntryPoints = []string{"recordLiveDeath", "markLiveDeathStrea
 // liveDeathLedgerInternals are named only in the ledger's own file.
 var liveDeathLedgerInternals = []string{
 	"deathsByID", "deathOrder", "deathRecorded", "streamConnected", "takeLocked", "notifyLocked",
+}
+
+// startupHealthLedgerInternals are named only in the startup health ledger's
+// own file.
+var startupHealthLedgerInternals = []string{"healthyByID", "healthyRing", "healthyNext"}
+
+// sealedInternalOwner reports the one file that may name an internal of a
+// sealed docker type, and what that type is.
+func sealedInternalOwner(name string) (file, what string, sealed bool) {
+	switch {
+	case slices.Contains(liveDeathLedgerInternals, name):
+		return liveDeathLedgerFile, "live-death ledger", true
+	case slices.Contains(startupHealthLedgerInternals, name):
+		return startupHealthLedgerFile, "startup health ledger", true
+	default:
+		return "", "", false
+	}
 }
 
 func TestStartupFailureAuthorityIsSealed(t *testing.T) {
@@ -320,6 +344,16 @@ func (b *Backend) recoverState() { b.liveDeaths.mu.Lock() }`, "reaches the live-
 		{"ledger aliased from outside", "internal/backend/docker/recover.go",
 			`package docker
 func (b *Backend) recoverState() { ledger := &b.liveDeaths; _ = ledger }`, "reaches the live-death ledger"},
+		{"health ledger written outside the watch's memory", "internal/backend/docker/operation_intent.go",
+			`package docker
+func (b *Backend) classifyOperationIntentSubstrate() { b.startupHealth.recordPassedHealth(pass) }`,
+			"names recordPassedHealth"},
+		{"health ledger written elsewhere in the observation file", startupObservationFile,
+			`package docker
+func (b *Backend) observeRejectedLaunch() { m.health.recordPassedHealth(pass) }`, "names recordPassedHealth"},
+		{"health ledger facts set outside the ledger", "internal/backend/docker/recover.go",
+			`package docker
+func (b *Backend) recoverState() { b.startupHealth.healthyByID["c"] = struct{}{} }`, "names healthyByID"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -372,6 +406,10 @@ func (b *Backend) concludeStartupFailure() {
 func (b *Backend) admitStartupRollback() { _ = startupRollback{state: &startupRollbackState{}} }`},
 		{startupFailureFile, "package docker\n" + sharedImport +
 			`func (b *Backend) confirmStartupFailure() { _, _ = shared.NewOperationStartupFailed(s, f) }`},
+		{startupObservationFile, `package docker
+func (m *startupMemory) remember(pass startupPass) { m.health.recordPassedHealth(pass) }`},
+		{startupHealthLedgerFile, `package docker
+func (l *startupHealthLedger) recordPassedHealth(pass startupPass) { l.healthyByID["c"] = struct{}{}; l.healthyNext++ }`},
 		{terminalBudgetEventsFile, `package docker
 func (b *Backend) runContainerEventLoop() { b.liveDeaths.markLiveDeathStream(true) }
 func (b *Backend) recordLiveContainerDeaths() { b.liveDeaths.recordLiveDeath(p) }
@@ -476,8 +514,8 @@ func startupFailureAuthorityFindings(rel string, file *ast.File, fset *token.Fil
 							report(typed, "names %s, %s, outside its one site", name, rule.what)
 						}
 					}
-					if slices.Contains(liveDeathLedgerInternals, name) && rel != liveDeathLedgerFile {
-						report(typed, "names %s, a live-death ledger internal, outside the ledger", name)
+					if owner, what, sealed := sealedInternalOwner(name); sealed && rel != owner {
+						report(typed, "names %s, a %s internal, outside its own file", name, what)
 					}
 					if name == "liveDeaths" && !sanctionedLedger[typed] && rel != liveDeathLedgerFile {
 						report(typed, "reaches the live-death ledger other than through its four entry points")
@@ -503,8 +541,8 @@ func startupFailureAuthorityFindings(rel string, file *ast.File, fset *token.Fil
 							report(typed, "names %s, %s, outside its one site", typed.Name, rule.what)
 						}
 					}
-					if slices.Contains(liveDeathLedgerInternals, typed.Name) && rel != liveDeathLedgerFile && !selected {
-						report(typed, "names %s, a live-death ledger internal, outside the ledger", typed.Name)
+					if owner, what, sealed := sealedInternalOwner(typed.Name); sealed && rel != owner && !selected {
+						report(typed, "names %s, a %s internal, outside its own file", typed.Name, what)
 					}
 					sealedIdent(dockerSealedStateIdents, typed, function)
 				}

@@ -22,7 +22,12 @@ import (
 // is seen, and it reports Ready only from one whole-cohort pass in which every
 // container is ready. A health-gated container that reported healthy once is
 // from then on watched only for its exit: a later unhealthy report is a flap,
-// which steady state ignores too, never a startup failure.
+// which steady state ignores too, never a startup failure. Every other startup
+// outcome authority (the classifier that confirms the watch's Ready, operation
+// recovery, maintenance readiness) applies the same rule through the backend's
+// startup health ledger (gatedHealth). A depends_on service_healthy dependency
+// is the exception: Compose judges its health itself during `compose up`, so a
+// flap there still rejects the launch.
 //
 // A launch exchange that settled with an error (Compose reported a dependency
 // that exited or turned unhealthy, or the daemon refused a Start) is observed
@@ -143,9 +148,11 @@ type startupMemberFacts struct {
 // cohort; a paused container cannot be verified as a started workload, so
 // here it is pending behind a health check and unverified otherwise. Recovery
 // waits on a created container, because it cannot know whether its Start was
-// ever sent; this table knows that only from the launch's own exchange. And
-// recovery reads health afresh, while a live watch stops reading a member's
-// health once it passed, as the steady state does after Ready.
+// ever sent; this table knows that only from the launch's own exchange. Both
+// apply the same sticky health rule: a running member a startup watch saw pass
+// its check is judged healthy from then on, through the backend's startup
+// health ledger (gatedHealth), as the steady state does after Ready. Recovery
+// after a restart has no such memory and reads health afresh.
 func classifyStartupInstance(info *ContainerInfo, facts startupMemberFacts) startupInstanceVerdict {
 	if info == nil {
 		return startupInstanceUnverified
@@ -185,34 +192,31 @@ type startupContainer struct {
 	healthGated bool
 }
 
-// startupMemory is what one watch remembers across its passes: the members
-// whose Start the launch's exchange recorded as refused, and the health-gated
-// members that already reported healthy.
+// startupMemory is what one watch knows across its passes: the members whose
+// Start the launch's exchange recorded as refused, and, through the backend's
+// startup health ledger, the health-gated members that already reported
+// healthy. The ledger is the same memory every other startup outcome authority
+// reads (gatedHealth), so the watch and they apply one sticky health rule.
 type startupMemory struct {
-	launch       settledLaunch
-	passedHealth map[string]struct{}
+	launch settledLaunch
+	health *startupHealthLedger
 }
 
-func newStartupMemory(launch settledLaunch) *startupMemory {
-	return &startupMemory{launch: launch, passedHealth: make(map[string]struct{})}
+func (b *Backend) newStartupMemory(launch settledLaunch) *startupMemory {
+	return &startupMemory{launch: launch, health: &b.startupHealth}
 }
 
 func (m *startupMemory) facts(member startupContainer) startupMemberFacts {
-	_, passed := m.passedHealth[member.id]
 	return startupMemberFacts{
-		healthGated: member.healthGated, passedHealth: passed, startRefused: m.launch.startRefused(member.id),
+		healthGated: member.healthGated, passedHealth: m.health.passedHealth(member.id),
+		startRefused: m.launch.startRefused(member.id),
 	}
 }
 
-// remember records every health-gated member this pass saw running and healthy.
+// remember records every health-gated member this pass saw running and
+// healthy, in the backend's startup health ledger.
 func (m *startupMemory) remember(pass startupPass) {
-	for i, member := range pass.members {
-		info := pass.infos[i]
-		if member.healthGated && info != nil && strings.EqualFold(info.Status, "running") &&
-			info.Health == HealthStatusHealthy {
-			m.passedHealth[member.id] = struct{}{}
-		}
-	}
+	m.health.recordPassedHealth(pass)
 }
 
 // startupCohort is a launch's exact cohort in a deterministic order.
@@ -546,7 +550,7 @@ func (b *Backend) observeStartup(
 		return startupObservation{kind: startupObservedUnverified,
 			unverified: startupUnverifiedFailure(errors.New("startup observation requires a launched exchange"))}
 	}
-	watch := b.watchStartup(ctx, cohort, newStartupMemory(launch), startupObservationDeadline(ctx, time.Now()), logger)
+	watch := b.watchStartup(ctx, cohort, b.newStartupMemory(launch), startupObservationDeadline(ctx, time.Now()), logger)
 	return b.startupObservationOf(ctx, mutations, launch, cohort, watch, logger)
 }
 
@@ -570,7 +574,7 @@ func (b *Backend) observeRejectedLaunch(
 		return startupObservation{kind: startupObservedUnverified,
 			unverified: startupUnverifiedFailure(errors.New("rejected-launch observation requires a rejected exchange"))}
 	}
-	pass, failure := b.inspectStartupCohort(ctx, cohort, newStartupMemory(launch))
+	pass, failure := b.inspectStartupCohort(ctx, cohort, b.newStartupMemory(launch))
 	if failure != nil {
 		return startupObservation{kind: startupObservedUnverified, unverified: failure}
 	}
@@ -654,7 +658,7 @@ func (b *Backend) observeReplacementStartup(
 	if err != nil {
 		return err
 	}
-	return flattenStartupWatch(b.watchStartup(ctx, cohort, newStartupMemory(settledLaunch{}), time.Time{}, logger))
+	return flattenStartupWatch(b.watchStartup(ctx, cohort, b.newStartupMemory(settledLaunch{}), time.Time{}, logger))
 }
 
 // verifyStartup is the error-only check of one service's containers that a
@@ -667,7 +671,7 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 	for _, id := range containerIDs {
 		cohort = append(cohort, startupContainer{id: id, healthGated: m.HasActiveHealthCheck()})
 	}
-	return flattenStartupWatch(b.watchStartup(ctx, cohort, newStartupMemory(settledLaunch{}), time.Time{}, logger))
+	return flattenStartupWatch(b.watchStartup(ctx, cohort, b.newStartupMemory(settledLaunch{}), time.Time{}, logger))
 }
 
 // waitForHealthy is the error-only wait for a compensating relaunch's health
@@ -677,5 +681,5 @@ func (b *Backend) waitForHealthy(ctx context.Context, containerIDs []string, log
 	for _, id := range containerIDs {
 		cohort = append(cohort, startupContainer{id: id, healthGated: true})
 	}
-	return flattenStartupWatch(b.watchStartup(ctx, cohort, newStartupMemory(settledLaunch{}), time.Time{}, logger))
+	return flattenStartupWatch(b.watchStartup(ctx, cohort, b.newStartupMemory(settledLaunch{}), time.Time{}, logger))
 }

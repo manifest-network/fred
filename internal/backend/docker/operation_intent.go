@@ -2037,9 +2037,13 @@ func (b *Backend) classifyOperationIntentSubstrate(
 		}
 		switch containerStatusToProvisionStatus(runtimeStatus) {
 		case backend.ProvisionStatusReady:
+			// A running member a startup watch saw pass its check stays healthy
+			// (the sticky health rule, gatedHealth), so the classifier that
+			// confirms the watch's Ready, and recovery, judge it as the watch did.
+			health := b.gatedHealth(listed.ContainerID, container.Health)
 			if _, required := healthRequired[container.ServiceName]; required &&
-				container.Health != HealthStatusHealthy {
-				if container.Health == HealthStatusUnhealthy {
+				health != HealthStatusHealthy {
+				if health == HealthStatusUnhealthy {
 					failed++
 					continue
 				}

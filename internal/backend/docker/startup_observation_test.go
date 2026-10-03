@@ -158,7 +158,7 @@ func TestWatchStartup_AuthorsCuratedSurface(t *testing.T) {
 				}, map[string][]string{"app": {"c1"}})
 				require.NoError(t, err)
 
-				watch := b.watchStartup(ctx, cohort, newStartupMemory(settledLaunch{}), observeUntil, b.logger)
+				watch := b.watchStartup(ctx, cohort, b.newStartupMemory(settledLaunch{}), observeUntil, b.logger)
 				assert.Equal(t, tt.wantVerdict, watch.verdict)
 				require.NotNil(t, watch.surface)
 				assert.Equal(t, tt.wantCallback, watch.surface.callback)
@@ -221,7 +221,7 @@ func TestWatchStartup_SiblingExitDuringLaterHealthWait(t *testing.T) {
 		}}, map[string][]string{"db": {"db-1"}, "web": {"web-1"}})
 		require.NoError(t, err)
 
-		watch := b.watchStartup(t.Context(), cohort, newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
+		watch := b.watchStartup(t.Context(), cohort, b.newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
 		require.Equal(t, startupVerdictExited, watch.verdict)
 		assert.Equal(t, startupContainer{id: "web-1", service: "web"}, watch.container)
 		assert.Equal(t, backend.MsgContainerExitedDuringStartup, watch.surface.callback)
@@ -247,7 +247,7 @@ func TestWatchStartup_ReadyRequiresOneWholeCohortPass(t *testing.T) {
 		}}, map[string][]string{"svc": {"a", "b"}})
 		require.NoError(t, err)
 
-		watch := b.watchStartup(t.Context(), cohort, newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
+		watch := b.watchStartup(t.Context(), cohort, b.newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
 		require.Equal(t, startupVerdictExited, watch.verdict)
 		assert.Equal(t, "a", watch.container.id)
 		assert.Equal(t, backend.MsgContainerExitedDuringHealthCheck, watch.surface.callback)
@@ -266,7 +266,7 @@ func TestWatchStartup_ReadyRequiresOneWholeCohortPass(t *testing.T) {
 		require.NoError(t, err)
 
 		start := time.Now()
-		watch := b.watchStartup(t.Context(), cohort, newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
+		watch := b.watchStartup(t.Context(), cohort, b.newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
 		require.Equal(t, startupVerdictReady, watch.verdict)
 		assert.GreaterOrEqual(t, time.Since(start), 3*time.Second,
 			"a fixed-wait container is ready only after its settle period")
@@ -319,7 +319,7 @@ func TestWatchStartup_HealthIsStickyOnceAMemberPassed(t *testing.T) {
 				b := flapping()
 				cohort, err := newStartupCohort(stack, services)
 				require.NoError(t, err)
-				watch := b.watchStartup(t.Context(), cohort, newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
+				watch := b.watchStartup(t.Context(), cohort, b.newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
 				require.Equal(t, startupVerdictReady, watch.verdict, "a flap after healthy is not a startup failure")
 			})
 			synctest.Test(t, func(t *testing.T) {
@@ -341,7 +341,7 @@ func TestWatchStartup_HealthIsStickyOnceAMemberPassed(t *testing.T) {
 		}, nil)
 		cohort, err := newStartupCohort(stack, services)
 		require.NoError(t, err)
-		watch := b.watchStartup(t.Context(), cohort, newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
+		watch := b.watchStartup(t.Context(), cohort, b.newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
 		require.Equal(t, startupVerdictExited, watch.verdict, "an exit after healthy still fails")
 		assert.Equal(t, "api-1", watch.container.id)
 	})
@@ -358,7 +358,7 @@ func TestWatchStartup_HealthIsStickyOnceAMemberPassed(t *testing.T) {
 		}, nil)
 		cohort, err := newStartupCohort(stack, services)
 		require.NoError(t, err)
-		watch := b.watchStartup(t.Context(), cohort, newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
+		watch := b.watchStartup(t.Context(), cohort, b.newStartupMemory(settledLaunch{}), time.Time{}, b.logger)
 		require.Equal(t, startupVerdictUnhealthy, watch.verdict)
 	})
 }
