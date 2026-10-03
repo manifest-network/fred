@@ -108,7 +108,7 @@ func newStartupCrashFixtureWithPayload(t *testing.T, leaseUUID string, budget le
 		defer f.mu.Unlock()
 		observed := f.candidate(info)
 		if observed.Status == "exited" && f.death != nil && !f.recorded[info.ContainerID] {
-			// The event reader records the death it observed as it happens.
+			// The event loop records the death it observed as it happens.
 			f.recorded[info.ContainerID] = true
 			b.liveDeaths.recordLiveDeath(f.death(info.ContainerID))
 		}
