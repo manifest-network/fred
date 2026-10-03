@@ -105,8 +105,11 @@ func streakVerdict(consecutive int, streakStartedAt, now time.Time) standingFail
 
 // TerminalBudget is one lease's consecutive-failure budget. It is opaque: a
 // substrate may carry it onto a rebuilt projection only through
-// InheritTerminalBudget, and only the lease actor can advance it, so no
-// off-actor path can make a lease closable. The zero value is a fresh budget.
+// InheritTerminalBudget. Only the lease actor can count a failure
+// (recordFailure); an off-actor write through SetStatus or
+// InheritTerminalBudget can only complete a counted Failing -> Failed, leave
+// the budget as it is, or move it toward a reset. The zero value is a fresh
+// budget.
 type TerminalBudget struct {
 	// leaseUUID binds the budget to its lease. A copy carried onto another
 	// lease's projection reads, and is mutated, as a fresh budget.
@@ -211,10 +214,14 @@ func (p *ProvisionState) boundBudget() *TerminalBudget {
 //   - leaving Ready resets the consecutive count when the lease was Ready for
 //     terminalBudgetResetAfter, then clears the anchor (R2);
 //   - a counted failure stays current only from Failing to Failed; any other
-//     change ends it.
+//     change ends it;
+//   - re-asserting the current status is not a change: it crosses nothing and
+//     leaves the budget exactly as it was, so a defensive re-write of Failed
+//     can never turn an exhausted verdict back into retry.
 //
 // It never increments the count, so a substrate may call it outside the lease
-// actor: it can only move the budget toward a reset.
+// actor: it can only complete a counted Failing -> Failed, leave the budget
+// unchanged, or move it toward a reset.
 func (p *ProvisionState) SetStatus(status backend.ProvisionStatus, now time.Time) {
 	p.boundBudget().crossStatus(p.Status, status, now)
 	p.Status = status
@@ -223,12 +230,20 @@ func (p *ProvisionState) SetStatus(status backend.ProvisionStatus, now time.Time
 // InheritTerminalBudget carries predecessor's budget onto p, a rebuilt
 // projection that replaces it, such as a recovery rebuild or an awaited-Ready
 // promotion. The replacement is a status change from the predecessor's status
-// to p's own, so the Ready boundary applies exactly as SetStatus applies it;
-// re-observing the same status crosses nothing and changes nothing. A nil
-// predecessor, or one for another lease, leaves a fresh budget, anchored when
-// p is Ready. Call it after p's status is final. Like SetStatus it can only
-// move the budget toward a reset; it is the only way a budget moves from one
-// projection to another.
+// to p's own, so the Ready boundary applies exactly as SetStatus applies it:
+// both go through crossStatus, which treats re-observing the same status as no
+// crossing and changes nothing. A nil predecessor, or one for another lease,
+// leaves a fresh budget, anchored when p is Ready. Call it after p's status is
+// final. Like SetStatus it can only complete a counted Failing -> Failed, keep
+// the predecessor's budget, or move it toward a reset; it is the only way a
+// budget moves from one projection to another.
+//
+// "Toward a reset" is relative to predecessor, so the predecessor's freshness
+// is the caller's responsibility: a stale snapshot would carry back a count
+// that a later reset on the live projection cleared. The docker substrate
+// passes the live map entry under provisionsMu, and its recovery
+// compare-and-swap (which compares TerminalBudget exactly) defers a lease
+// whose live budget moved during the sweep.
 func (p *ProvisionState) InheritTerminalBudget(predecessor *ProvisionState, now time.Time) {
 	from := backend.ProvisionStatus("")
 	p.TerminalBudget = TerminalBudget{}
@@ -237,15 +252,17 @@ func (p *ProvisionState) InheritTerminalBudget(predecessor *ProvisionState, now 
 		from = predecessor.Status
 		p.TerminalBudget = predecessor.TerminalBudget
 	}
-	budget := p.boundBudget()
-	if from != p.Status {
-		budget.crossStatus(from, p.Status, now)
-	}
+	p.boundBudget().crossStatus(from, p.Status, now)
 }
 
 // crossStatus is the one implementation of the Ready boundary. SetStatus and
-// InheritTerminalBudget are its only callers.
+// InheritTerminalBudget are its only callers. A same-status write is not a
+// crossing and changes nothing; deciding that here, once, keeps the two
+// callers from disagreeing about it.
 func (b *TerminalBudget) crossStatus(from, to backend.ProvisionStatus, now time.Time) {
+	if from == to {
+		return
+	}
 	wasReady := from == backend.ProvisionStatusReady
 	isReady := to == backend.ProvisionStatusReady
 	switch {

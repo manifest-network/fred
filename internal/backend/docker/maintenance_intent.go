@@ -798,7 +798,7 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 	provision.ServiceContainers = serviceContainers
 	// A maintenance outcome converged without an actor never counts against the
 	// terminal budget (ENG-799): SetStatus only applies the Ready boundary and
-	// ends any counted failure, so it can only move the budget toward a reset.
+	// never counts a failure.
 	provision.SetStatus(status, time.Now())
 	if failure == nil {
 		provision.LastError = ""

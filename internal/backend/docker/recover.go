@@ -1818,7 +1818,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// records, so a rebuild that dropped it would silently restart every
 		// streak. InheritTerminalBudget carries it and applies the Ready
 		// boundary between the existing status and the rebuilt one, so a
-		// rebuild can only move the budget toward a reset. A rebuilt entry with
+		// rebuild never counts a failure: it keeps the budget, completes a
+		// counted Failing -> Failed, or moves it toward a reset. A rebuilt entry with
 		// no existing projection keeps its fresh budget: a backend restart
 		// resets every streak, as moby's daemon restore resets RestartCount.
 		for uuid, rec := range building {

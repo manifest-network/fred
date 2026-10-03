@@ -342,14 +342,51 @@ func TestSetStatus_ReadyBoundaryForEveryTransition(t *testing.T) {
 						assert.Equal(t, anchor, budget.readySince, label)
 					}
 					want := noCountedFailure
-					if from == backend.ProvisionStatusFailing && to == backend.ProvisionStatusFailed {
+					if from == to || (from == backend.ProvisionStatusFailing && to == backend.ProvisionStatusFailed) {
 						want = standing
 					}
 					assert.Equal(t, want, budget.standing, label)
+					if from == to {
+						assert.Equal(t, TerminalBudget{
+							leaseUUID: testActorLeaseUUID, consecutive: 2, streakStartedAt: streakStart,
+							readySince: anchor, standing: standing,
+						}, budget, "%s: re-asserting the status changes nothing", label)
+					}
 				}
 			}
 		}
 	}
+}
+
+// A defensive re-write of Failed onto a lease that is already Failed and
+// exhausted must not turn its verdict back into retry: the lease would then be
+// re-provisioned every pass and never closed (ENG-799 review). SetStatus and
+// InheritTerminalBudget agree on it.
+func TestSetStatus_SameStatusKeepsAnExhaustedVerdict(t *testing.T) {
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	exhausted := func() *ProvisionState {
+		return &ProvisionState{
+			LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusFailed,
+			Reason: backend.ReasonContainerExited,
+			TerminalBudget: TerminalBudget{
+				leaseUUID: testActorLeaseUUID, consecutive: terminalBudgetThreshold,
+				streakStartedAt: now.Add(-time.Hour), standing: countedExhausting,
+			},
+		}
+	}
+	p := exhausted()
+	require.Equal(t, backend.TerminalVerdictExhausted, p.ObserveTerminalBudget().Verdict)
+	p.SetStatus(backend.ProvisionStatusFailed, now)
+	assert.Equal(t, exhausted().TerminalBudget, p.TerminalBudget)
+	assert.Equal(t, backend.TerminalVerdictExhausted, p.ObserveTerminalBudget().Verdict)
+
+	rebuilt := &ProvisionState{
+		LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusFailed,
+		Reason: backend.ReasonContainerExited,
+	}
+	rebuilt.InheritTerminalBudget(exhausted(), now)
+	assert.Equal(t, exhausted().TerminalBudget, rebuilt.TerminalBudget)
+	assert.Equal(t, backend.TerminalVerdictExhausted, rebuilt.ObserveTerminalBudget().Verdict)
 }
 
 // A replacement projection inherits its predecessor's budget and crosses the
@@ -545,6 +582,9 @@ func TestTerminalBudget_ExportedMutatorsOnlyMoveTowardReset(t *testing.T) {
 								}
 								if after.standing != noCountedFailure {
 									assert.True(t, bound && after.standing == before.standing, label)
+								}
+								if bound && from == to {
+									assert.Equal(t, before, after, "%s: a same-status write is not a crossing", label)
 								}
 								if p.ObserveTerminalBudget().Verdict == backend.TerminalVerdictExhausted {
 									assert.True(t, bound && before.standing == countedExhausting &&
