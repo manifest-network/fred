@@ -64,12 +64,27 @@ linters:
           msg: "managed-volume destruction must use the construction-bound substrate mutation executor"
         - pattern: 'volumes\.Create$'
           msg: "managed-volume creation must use the construction-bound substrate mutation executor"
-        # An on-chain lease close cannot be undone. The raw chain sink is
-        # called only from its typed wrappers, each one closing reason with its
-        # own evidence (the failure-budget close takes the sealed
-        # terminalverdict proof, ENG-799).
+        # An on-chain lease close cannot be undone. Every hop of the
+        # reconciler's close is pinned to the one file that may call it, and
+        # each message carries a bracketed tag that its exclusion below
+        # matches, so excluding one hop never excuses another (ENG-799):
+        #   - [raw-lease-close]: the reconciler's raw close and the
+        #     reconciliation authority's CloseObserved are called only from
+        #     internal/provisioner/reconcile_close.go, which holds one typed
+        #     wrapper per closing reason;
+        #   - [placement-lease-close]: the bound control plane's closeLease is
+        #     called only by CloseObserved;
+        #   - [chain-lease-close]: the chain client's CloseLeases is called only
+        #     by the two control-plane adapters and the withdraw scheduler's
+        #     credit-exhausted close.
         - pattern: '\.closeActiveLeaseOnChain$'
-          msg: "close a lease through a typed wrapper in internal/provisioner/reconcile_close.go"
+          msg: "[raw-lease-close] close a lease through a typed wrapper in internal/provisioner/reconcile_close.go"
+        - pattern: '\.CloseObserved$'
+          msg: "[raw-lease-close] close a lease through a typed wrapper in internal/provisioner/reconcile_close.go"
+        - pattern: '\.closeLease$'
+          msg: "[placement-lease-close] close a lease through ReconciliationCoordinator.CloseObserved"
+        - pattern: '\.CloseLeases$'
+          msg: "[chain-lease-close] close a lease through a typed wrapper in internal/provisioner/reconcile_close.go"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -102,12 +117,24 @@ linters:
       - path: ^internal/backend/docker/storage_mutation_guard\.go$
         linters:
           - forbidigo
-      # The only file allowed to call the raw on-chain close; it holds the
-      # typed close wrappers.
+      # The on-chain close hops (see the forbidigo rules). Each exclusion
+      # matches one bracketed tag, so it excuses only its own hop.
       - path: ^internal/provisioner/reconcile_close\.go$
         linters:
           - forbidigo
-        text: "closeActiveLeaseOnChain"
+        text: '\[raw-lease-close\]'
+      - path: ^internal/provisioner/placement/reconciliation_chain\.go$
+        linters:
+          - forbidigo
+        text: '\[placement-lease-close\]'
+      - path: ^internal/provisioner/(manager|placement/provider_control_plane)\.go$
+        linters:
+          - forbidigo
+        text: '\[chain-lease-close\]'
+      - path: ^internal/scheduler/withdraw\.go$
+        linters:
+          - forbidigo
+        text: '\[chain-lease-close\]'
       # Exclude test files from strict linters
       - path: _test\.go
         linters:
