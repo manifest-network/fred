@@ -204,9 +204,17 @@ func TestClassifyHeldDeleteAttempt(t *testing.T) {
 	}{
 		{"completed", volumeDeleteHoldView{}, false, heldDeleteAttempt{progressed: true, releasedCaller: true}},
 		{"never reached the manager", before, true, heldDeleteAttempt{}},
-		{"slice ran out while progressing", with(func(v *volumeDeleteHoldView) {
-			v.reason, v.nextAttempt = holdReasonDeadline, now
+		{"slice ran out after removing content", with(func(v *volumeDeleteHoldView) {
+			v.reason, v.nextAttempt, v.contentRemoved = holdReasonDeadline, now, true
 		}), true, heldDeleteAttempt{progressed: true}},
+		// A slice spent in a hung quota command (the zero-usage proof) ends in
+		// the same reason but removed nothing: no immediate next pass.
+		{"slice ran out without removing content", with(func(v *volumeDeleteHoldView) {
+			v.reason, v.nextAttempt = holdReasonDeadline, now
+		}), true, heldDeleteAttempt{}},
+		{"stopped without removing content", with(func(v *volumeDeleteHoldView) {
+			v.reason, v.nextAttempt = holdReasonStopped, now
+		}), true, heldDeleteAttempt{}},
 		{"refused and backing off", with(func(v *volumeDeleteHoldView) {
 			v.reason, v.nextAttempt = holdReasonUndeletable, now.Add(time.Minute)
 		}), true, heldDeleteAttempt{}},
@@ -917,6 +925,57 @@ func TestCloseAwaitsHeldDeletesPredicate(t *testing.T) {
 	b.provisionsMu.Unlock()
 	assert.False(t, b.closeAwaitsHeldDeletes(claim, pendingDeletes(first, second)),
 		"without a projection nothing vouches that no container remains")
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
+// A cleanup-only close has no projection to vouch for its containers. Once
+// this process's attempt of the close completed its container teardown and
+// left only held deletions, periodic recovery skips it and close-age paging
+// leaves it out, as for a projected close; before that, and after a failed
+// teardown, it runs.
+func TestCleanupOnlyCloseAwaitsHeldDeletesAfterItsTeardown(t *testing.T) {
+	dir := t.TempDir()
+	name := canonicalVolumeName(closeRecoveryLeaseUUID, "app", 0)
+	var destroyCalls atomic.Int32
+	volumes := &mockVolumeManager{
+		ListFn:              func() ([]string, error) { return []string{name}, nil },
+		VolumeDeleteHoldsFn: func() volumeDeleteHoldSnapshot { return pendingDeletes(name) },
+		DestroyFn: func(context.Context, string) error {
+			destroyCalls.Add(1)
+			return heldDeleteErr(name)
+		},
+	}
+	docker := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
+	}
+	b, stores := openCloseRecoveryBackend(t, dir, docker, volumes)
+	begun := beginCloseRecoveryIntent(t, b, stores, true, "")
+	require.True(t, begun.CleanupOnly())
+	require.False(t, b.closeAwaitsHeldDeletes(begun, pendingDeletes(name)),
+		"no attempt of this close has torn its containers down yet")
+
+	require.NoError(t, b.recoverState(t.Context()))
+	claim, found, err := stores.callbacks.GetCloseIntent(closeRecoveryLeaseUUID)
+	require.NoError(t, err)
+	require.True(t, found, "the held deletion keeps the close pending")
+	require.Equal(t, 1, claim.ExecutionGeneration().Number())
+	require.Equal(t, int32(1), destroyCalls.Load())
+	assert.True(t, b.closeAwaitsHeldDeletes(claim, pendingDeletes(name)))
+
+	require.NoError(t, b.recoverState(t.Context()))
+	claim, found, err = stores.callbacks.GetCloseIntent(closeRecoveryLeaseUUID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, 1, claim.ExecutionGeneration().Number(), "the skipped close advances no generation")
+	assert.Equal(t, int32(1), destroyCalls.Load(), "the skipped close does no volume work")
+
+	b.sampleCloseIntentMetrics(time.Now())
+	assert.Equal(t, float64(1), testutil.ToFloat64(closeIntentsDeleteHeld))
+	assert.Zero(t, testutil.ToFloat64(oldestUnheldCloseIntentAgeSeconds), "a held close does not page")
+
+	b.closeTeardowns.record(claim, false)
+	assert.False(t, b.closeAwaitsHeldDeletes(claim, pendingDeletes(name)),
+		"a failed teardown forgets the evidence, so the close runs again")
 	closeCloseRecoveryBackend(t, b, stores)
 }
 

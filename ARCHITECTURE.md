@@ -647,7 +647,7 @@ under the process shutdown budget before exiting 1.
 
 ### Router Design
 
-The backend router matches leases to backends by exact SKU UUID. When multiple backends share the same SKU list, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. A placement store (bbolt) records which backend serves each lease so that read operations always reach the correct machine.
+The backend router matches leases to backends by exact SKU UUID. When multiple backends share the same SKU list, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318), preferring backends that do not report `disk_withheld`. Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. A placement store (bbolt) records which backend serves each lease so that read operations always reach the correct machine.
 
 ```go
 type Router struct {
@@ -664,7 +664,7 @@ func (r *Router) RouteForProvision(ctx, sku, inFlight) Backend // least-loaded a
 
 **Routing strategies:**
 - `Route` — returns the first matching backend (used for deprovision fallback and read-path when no placement exists)
-- `RouteForProvision` — routes a new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats
+- `RouteForProvision` — routes a new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318), preferring backends that do not report `disk_withheld`. Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats
 - **Placement lookup** — stores a confirmed backend plus an optional unresolved attempt, or a durable quarantine containing every known conflicting owner. Only a confirmed backend pins mutating/provision routing. Read-only provision discovery safely queries every configured confirmed, attempted, or conflicting candidate before SKU fan-out; an unresolved all-miss returns 503 rather than a false 404. Attempts and conflicts gate destructive reconciliation and positively target deprovision.
 
 When a single backend matches a SKU, all strategies behave identically.
@@ -1570,9 +1570,11 @@ per-volume slices under each lease's namespace lock, up to two leases at once,
 and starts its next pass at once while holds make progress. A destroy answers
 a held or already-absent name before taking that lock, so a close or reaper
 never waits behind the executor. A close waits only on held deletions when
-each of its volume slots is held or done; such closes are skipped by periodic
-recovery, answered from memory by Deprovision, and left out of the close-age
-gauge that pages.
+each of its volume slots is held or done and no container of the lease remains:
+its projection records none, or, for a cleanup-only close, this process's own
+attempt of it completed the container teardown (so such a close runs once after
+every start). Such closes are skipped by periodic recovery, answered from
+memory by Deprovision, and left out of the close-age gauge that pages.
 
 ZFS instead retains an exact unmounted child and normal sealed startup remounts
 and re-attests it without destruction. Any ambiguous recovery preserves evidence

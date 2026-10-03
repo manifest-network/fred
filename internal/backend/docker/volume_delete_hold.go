@@ -81,9 +81,13 @@ type volumeDeleteHoldView struct {
 	footprintMB int64
 	reason      volumeDeleteHoldReason
 	attempts    int
-	since       time.Time
-	lastAttempt time.Time
-	nextAttempt time.Time
+	// contentRemoved: the last attempt removed content of the volume. It is
+	// the only evidence that an interrupted attempt moved the deletion
+	// forward without changing its phase.
+	contentRemoved bool
+	since          time.Time
+	lastAttempt    time.Time
+	nextAttempt    time.Time
 }
 
 // phaseLabel is the hold's phase as reported in logs and metrics.
@@ -342,7 +346,7 @@ type volumeDeleteHoldPassReport struct {
 	leftRemoval []managedVolumeName
 	// progressed is set when an attempt reached the manager and moved its
 	// hold forward: it completed, changed phase, or ran out of its slice
-	// while still progressing. The executor then starts its next pass at once
+	// after removing content. The executor then starts its next pass at once
 	// instead of waiting for its interval.
 	progressed bool
 }
@@ -557,7 +561,10 @@ func (b *Backend) attemptHeldVolumeDelete(
 // classifyHeldDeleteAttempt compares a hold before and after one attempt. An
 // attempt that never reached the manager leaves attempts unchanged and is no
 // progress, so an executor whose retries fail early waits for its interval
-// instead of spinning.
+// instead of spinning. Within a phase, an interrupted attempt is progress only
+// when it removed content: a slice spent waiting on the quota subsystem (the
+// zero-usage proof, the limit clear) moved nothing forward, so the next pass
+// waits for the interval too.
 func classifyHeldDeleteAttempt(
 	before, after volumeDeleteHoldView,
 	stillHeld bool,
@@ -571,7 +578,7 @@ func classifyHeldDeleteAttempt(
 	}
 	return heldDeleteAttempt{
 		progressed: after.phase != before.phase ||
-			(after.reason.keepsProgressing() && !now.Before(after.nextAttempt)),
+			(after.reason.keepsProgressing() && after.contentRemoved && !now.Before(after.nextAttempt)),
 		releasedCaller: before.holdsCaller() && !after.holdsCaller(),
 	}
 }
@@ -674,20 +681,70 @@ func leaseSlotNames(leaseUUID string, items []backend.LeaseItem) []string {
 // waiting on nothing but held deletions: every REMAINING managed volume slot
 // of its items is held with its caller pending (awaitsOnlyHeldDeletes; a slot
 // already destroyed, residual, retained, or never created counts as done), and
-// its projection records no container. Retrying such a close would only
-// advance its durable generation and rewrite its diagnostics; the hold
-// executor resumes it when one of its holds stops holding its caller. Only a
-// projection can vouch that no container remains, so a close without one
-// (cleanup-only) is never skipped: a remaining container could be the very
-// writer keeping a hold from finishing.
+// no container of the lease remains. Retrying such a close would only advance
+// its durable generation and rewrite its diagnostics; the hold executor
+// resumes it when one of its holds stops holding its caller.
+//
+// A remaining container could be the very writer keeping a hold from
+// finishing, and only a close retry removes it, so the container half needs
+// positive evidence: the projection records no container, or, for a
+// cleanup-only close (which has no projection), this process's own attempt of
+// this close intent completed its container teardown (closeTeardownFacts). A
+// cleanup-only close is therefore retried once after every start before it
+// can be skipped. A projected close whose projection is missing is never
+// skipped.
 func (b *Backend) closeAwaitsHeldDeletes(claim shared.CloseIntentClaim, holds volumeDeleteHoldSnapshot) bool {
 	if !holds.awaitsOnlyHeldDeletes(leaseSlotNames(claim.LeaseUUID(), claim.Items())) {
 		return false
+	}
+	if claim.CleanupOnly() {
+		return b.closeTeardowns.completed(claim)
 	}
 	b.provisionsMu.RLock()
 	defer b.provisionsMu.RUnlock()
 	projection := b.provisions[claim.LeaseUUID()]
 	return projection != nil && len(projection.ContainerIDs) == 0
+}
+
+// closeTeardownFacts is the memory of which close intents this process tore
+// down: the last attempt of the intent removed every container it observed
+// for the lease. It is keyed by lease and bound to the intent's creation time,
+// so a fact can only vouch for the intent it was recorded under. A restart
+// forgets every fact.
+type closeTeardownFacts struct {
+	mu      sync.Mutex
+	cleared map[string]time.Time
+}
+
+// record stores whether this attempt of claim completed its container
+// teardown; a failed teardown forgets an earlier success.
+func (f *closeTeardownFacts) record(claim shared.CloseIntentClaim, completed bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !completed {
+		delete(f.cleared, claim.LeaseUUID())
+		return
+	}
+	if f.cleared == nil {
+		f.cleared = make(map[string]time.Time)
+	}
+	f.cleared[claim.LeaseUUID()] = claim.CreatedAt()
+}
+
+// completed reports whether this process's last attempt of exactly claim
+// completed its container teardown.
+func (f *closeTeardownFacts) completed(claim shared.CloseIntentClaim) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	created, ok := f.cleared[claim.LeaseUUID()]
+	return ok && created.Equal(claim.CreatedAt())
+}
+
+// forget drops the fact of a lease whose close completed.
+func (f *closeTeardownFacts) forget(leaseUUID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.cleared, leaseUUID)
 }
 
 // sampleVolumeDeleteHoldMetrics projects the manager's holds into the

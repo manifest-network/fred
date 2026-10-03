@@ -22,26 +22,38 @@ type StoppedDrainReport struct {
 	// heads: every row InspectCallbackStoreReadOnly counted as pending, less
 	// DeleteHeld.
 	Pending int
-	// DeleteHeld counts the close and operation heads that wait only on held
-	// volume deletions: every remaining volume slot of the head has a delete
-	// stage on disk, and at least one does. A restart registers each such
-	// stage as a held deletion and finishes it in the background, so these
-	// heads resume by themselves under a hold-aware target.
+	// DeleteHeld counts the close and operation heads whose own lease's
+	// remaining volume slots all have a delete stage on disk, at least one
+	// of them. A restart registers each such stage as a held deletion and
+	// finishes it in the background. It is a reading of the volume root
+	// only: see ClassifyStoppedDrain for what it does not check.
 	DeleteHeld int
 }
 
 // ClassifyStoppedDrain splits a stopped backend's pending work into ordinary
-// pending work and heads waiting only on held volume deletions. It is the
-// native classifier of the coordinated-update drain proof, which manifest-deploy
-// builds from this source and runs against a STOPPED backend: it reads the
-// journal inspection it is given and makes one read-only listing of
-// volumeDataPath's top level, with the same predicate the running backend uses
-// for its close-churn skip (awaitsOnlyHeldDeletes). An empty volumeDataPath
-// (no managed volumes) holds nothing.
+// pending work and delete-held heads. It is the native classifier of the
+// coordinated-update drain proof, which manifest-deploy builds from this
+// source and runs against a STOPPED backend: it reads the journal inspection
+// it is given and makes one read-only listing of volumeDataPath's top level.
+// An empty volumeDataPath (no managed volumes) holds nothing.
 //
-// A head is delete-held only from on-disk delete stages; a stage's phase is
-// memory-only and is not known here, and whether a container still runs is
-// not checked: a restarted backend re-checks both before it skips the close.
+// A close or operation head is delete-held when awaitsOnlyHeldDeletes holds
+// over its own lease's volume slots, read from on-disk delete stages. That is
+// only the volume-slot half of the running backend's close-churn skip
+// (closeAwaitsHeldDeletes), and it excuses more than that skip does:
+//
+//   - operation heads: the running backend applies the predicate to closes
+//     only, and retries a pending operation as usual;
+//   - every close, without the container half: whether a container of the
+//     lease remains is not checked, and a stage's phase is memory-only and
+//     not known here;
+//   - its own lease's slots only: work an operation still owes in another
+//     lease's namespace (a restore returning its source volumes to
+//     retention, which can wait on a source container) is not seen.
+//
+// DeleteHeld therefore does not prove that held deletions are the only work
+// left. A restarted hold-aware backend re-checks all of it before it skips a
+// close, and retries everything else.
 func ClassifyStoppedDrain(inspection shared.CallbackStoreInspection, volumeDataPath string) (StoppedDrainReport, error) {
 	report := StoppedDrainReport{Pending: inspection.Pending}
 	if volumeDataPath == "" {

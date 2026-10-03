@@ -328,6 +328,7 @@ func (b *Backend) completeCloseOutcome(
 		return fmt.Errorf("complete durable close: %w", err)
 	}
 	b.provisionStore.Delete(outcome.LeaseUUID())
+	b.closeTeardowns.forget(outcome.LeaseUUID())
 	b.releaseLeaseAllocations(outcome.LeaseUUID(), outcome.Items())
 	if b.callbackSender != nil {
 		b.callbackSender.NotifyPendingCallbacks()
@@ -336,9 +337,11 @@ func (b *Backend) completeCloseOutcome(
 }
 
 // closeVolumeFailure is the tenant-facing reason, message and log level of a
-// close whose volume step left errors. Only when every error is a held volume
-// deletion is it a deletion in progress (INFO); anything else is a cleanup
-// failure (WARN).
+// close whose volume step left errors. Each element is one volume name's error
+// (destroyReport.failures) or one non-destroy failure, never a joined batch:
+// errors.Is over a batch is true when any one name was held. Only when every
+// element is a held volume deletion is it a deletion in progress (INFO);
+// anything else is a cleanup failure (WARN).
 func closeVolumeFailure(
 	volumeErrs []error,
 	logger *slog.Logger,
@@ -413,6 +416,9 @@ func (b *Backend) doClosePhysical(
 	if teardownErr != nil {
 		errs = append(errs, teardownErr)
 	}
+	// The container evidence closeAwaitsHeldDeletes needs for a close with
+	// no projection (ENG-1117).
+	b.closeTeardowns.record(closeClaim, teardownErr == nil && len(failedIDs) == 0)
 
 	retaining := closeClaim.RetainOnClose() && b.retentionStore != nil
 	// A teardown that only partially succeeds keeps resources counted for the
@@ -530,8 +536,10 @@ func (b *Backend) doClosePhysical(
 		// name. A held deletion answers at once and keeps the close pending.
 		redriveDeletion := func(c string) {
 			if rep := op.destroy(mutations, ctx, destroySiteDeprovisionDestroy, c); rep.leftOnDisk() {
-				if err := rep.err(); err != nil {
-					volumeErrs = append(volumeErrs, fmt.Errorf("finish pending deletion of volume %s: %w", c, err))
+				if failures := rep.failures(); len(failures) > 0 {
+					for _, err := range failures {
+						volumeErrs = append(volumeErrs, fmt.Errorf("finish pending deletion of volume %s: %w", c, err))
+					}
 				} else {
 					claimedLeftBehind = true
 				}
@@ -567,8 +575,10 @@ func (b *Backend) doClosePhysical(
 					// The volume is still canonical on disk. Record the error so the
 					// lease stays Failed and retries (re-detecting and re-destroying it);
 					// do NOT add it to retainCanonical — it must never be retained.
-					if err := rep.err(); err != nil {
-						volumeErrs = append(volumeErrs, fmt.Errorf("reclaim writable-path-only volume %s: %w", c, err))
+					if failures := rep.failures(); len(failures) > 0 {
+						for _, err := range failures {
+							volumeErrs = append(volumeErrs, fmt.Errorf("reclaim writable-path-only volume %s: %w", c, err))
+						}
 					} else {
 						claimedLeftBehind = true
 					}
@@ -696,9 +706,7 @@ func (b *Backend) doClosePhysical(
 				leaseUUID, tenant, partition, durableItems, resourceProfiles, budget,
 			); refuse {
 				rep := b.destroyOnRefuseToRetain(mutations, ctx, op, retainCanonical, leaseUUID, tenant, partition, scope, logger)
-				if err := rep.err(); err != nil {
-					volumeErrs = append(volumeErrs, err)
-				}
+				volumeErrs = append(volumeErrs, rep.failures()...)
 				claimedLeftBehind = claimedLeftBehind || len(rep.Claimed) > 0
 				break
 			}
@@ -761,11 +769,11 @@ func (b *Backend) doClosePhysical(
 		// One call, one ownership resolution. A refused name is another lease's data
 		// adopted under ours by an in-flight restore: reconcileRestoring re-quarantines
 		// it once its rollback can complete, so we leave it (ENG-647). An unprovable
-		// table surfaces through rep.err() and keeps the lease Failed for retry.
+		// table surfaces through rep.failures() and keeps the lease Failed for
+		// retry. Each name's error stays its own element, so closeVolumeFailure
+		// classifies the names one by one.
 		rep := op.destroy(mutations, ctx, destroySiteDeprovisionDestroy, names...)
-		if err := rep.err(); err != nil {
-			volumeErrs = append(volumeErrs, err)
-		}
+		volumeErrs = append(volumeErrs, rep.failures()...)
 		claimedLeftBehind = claimedLeftBehind || len(rep.Claimed) > 0
 	}
 

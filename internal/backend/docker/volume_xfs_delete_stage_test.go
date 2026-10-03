@@ -144,7 +144,7 @@ func TestReadProjectQuotaUsageAcceptsExactRowWithSuccessfulDiagnosticStderr(t *t
     ;;
 esac`, xfsProjectReportCmd("b", xfsDeleteTestProjectID), xfsDeleteTestProjectID))
 
-	used, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, "b")
+	used, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, xfsQuotaBlocks)
 	require.NoError(t, err)
 	assert.Zero(t, used)
 }
@@ -157,7 +157,7 @@ func TestReadProjectQuotaUsageRejectsDiagnosticWhenProjectRowIsAbsent(t *testing
     ;;
 esac`, xfsProjectReportCmd("b", xfsDeleteTestProjectID)))
 
-	_, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, "b")
+	_, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, xfsQuotaBlocks)
 	require.ErrorContains(t, err, "cannot prove")
 }
 
@@ -170,7 +170,7 @@ func TestReadProjectQuotaUsageReportsNonzeroExitStderrSeparately(t *testing.T) {
     ;;
 esac`, xfsProjectReportCmd("b", xfsDeleteTestProjectID)))
 
-	_, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, "b")
+	_, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, xfsQuotaBlocks)
 	require.ErrorContains(t, err, "stderr: quota device unavailable")
 }
 
@@ -390,11 +390,11 @@ func TestXFSDestroyMarkerFirstPartialDeleteRecoversAfterRestart(t *testing.T) {
 
 	err := mgr.destroyWith(t.Context(), stage.volumeID.value(), func(
 		ctx context.Context, volume condemnedXFSVolume, name fstree.Name,
-	) error {
+	) (fstree.RemoveReport, error) {
 		if name.String() == projectIDFile {
 			return removeCondemnedXFSEntry(ctx, volume, name)
 		}
-		return injected
+		return fstree.RemoveReport{}, injected
 	})
 	require.ErrorIs(t, err, injected)
 	require.ErrorIs(t, err, ErrVolumeDeleteHeld, "a removal failure confined to the volume is held")
@@ -752,10 +752,10 @@ func TestXFSDeleteRecoveryDeadlineStopsBetweenEntriesBeforeQuotaClear(t *testing
 	err := mgr.cleanupXFSDeleteStageWith(
 		ctx,
 		stage,
-		func(context.Context, condemnedXFSVolume, fstree.Name) error {
+		func(context.Context, condemnedXFSVolume, fstree.Name) (fstree.RemoveReport, error) {
 			removeCalls++
 			expire(context.DeadlineExceeded)
-			return nil
+			return fstree.RemoveReport{}, nil
 		},
 		removeFromXFSRoot,
 		removeFromXFSRoot,

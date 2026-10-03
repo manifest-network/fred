@@ -889,13 +889,19 @@ type ReleaseInfo struct {
 
 // LoadStats is the backend load snapshot fred consumes for least-loaded
 // provision routing. It is decoded from the backend's GET /stats response.
-// Only the CPU-related fields are needed for routing — CPU is the binding
-// resource on current configurations, so memory/disk are intentionally ignored.
-// Unknown JSON fields in the response are discarded by the decoder.
+// Only the CPU-related fields and DiskWithheld are needed for routing — CPU is
+// the binding resource on current configurations, so memory and disk sizes are
+// intentionally ignored. Unknown JSON fields in the response are discarded by
+// the decoder.
 type LoadStats struct {
 	TotalCPUCores     float64 `json:"total_cpu_cores"`
 	AllocatedCPUCores float64 `json:"allocated_cpu_cores"`
 	ActiveContainers  int     `json:"active_containers"`
+	// DiskWithheld: the backend currently admits no disk-bearing allocation,
+	// because a footprint of unknown size remains on its disk. Routing prefers
+	// any candidate that does not withhold disk. Absent (false) from a backend
+	// that never withholds disk.
+	DiskWithheld bool `json:"disk_withheld,omitempty"`
 }
 
 // CPUAllocatedRatio returns the fraction of CPU allocated (allocated/total) and

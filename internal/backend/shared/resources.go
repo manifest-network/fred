@@ -695,7 +695,10 @@ type ResourceStats struct {
 // used for provision routing. An unaccounted footprint invalidates that
 // projection: returning a deceptively low allocation would keep routing new
 // leases to a backend whose pool correctly refuses them. Stats remains
-// available for diagnostics without fabricating usage for that footprint.
+// available for diagnostics without fabricating usage for that footprint. A
+// disk-only exclusion (DiskAccountingHeld) keeps the CPU signal valid but
+// reports DiskWithheld, so routing prefers a backend that still admits disk
+// instead of choosing this one, which refuses every disk-bearing provision.
 func (s ResourceStats) RoutingLoadStats() (*backend.LoadStats, error) {
 	if s.AccountingHeld {
 		return nil, ErrResourceAccountingIncomplete
@@ -704,6 +707,7 @@ func (s ResourceStats) RoutingLoadStats() (*backend.LoadStats, error) {
 		TotalCPUCores:     s.TotalCPU,
 		AllocatedCPUCores: s.AllocatedCPU,
 		ActiveContainers:  s.AllocationCount,
+		DiskWithheld:      s.DiskAccountingHeld,
 	}, nil
 }
 

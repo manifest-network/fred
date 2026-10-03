@@ -489,6 +489,31 @@ func TestCloseVolumeFailureAuthorsTheInProgressReasonOnlyForHolds(t *testing.T) 
 	reason, message, _ = closeVolumeFailure([]error{held, errors.New("rename failed")}, slog.Default())
 	assert.Equal(t, backend.ReasonCleanupFailed, reason)
 	assert.Equal(t, backend.MsgCleanupFailed, message)
+
+	// One destroy batch with a held name and a name that failed for a real
+	// reason: its joined error matches ErrVolumeDeleteHeld, so the close
+	// classifies the batch's per-name failures instead.
+	heldName := "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	failedName := "fred-550e8400-e29b-41d4-a716-446655440000-app-1"
+	mixed := destroyReport{Errs: []error{
+		fmt.Errorf("volume %s: %w", heldName, heldDeleteErr(heldName)),
+		fmt.Errorf("volume %s: %w", failedName, errors.New("attest xfs volume for destroy: EIO")),
+	}}
+	require.ErrorIs(t, mixed.err(), ErrVolumeDeleteHeld, "the joined batch matches when any name is held")
+	reason, message, _ = closeVolumeFailure(mixed.failures(), slog.Default())
+	assert.Equal(t, backend.ReasonCleanupFailed, reason, "a real failure beside a hold is a cleanup failure")
+	assert.Equal(t, backend.MsgCleanupFailed, message)
+
+	allHeld := destroyReport{Errs: []error{
+		fmt.Errorf("volume %s: %w", heldName, heldDeleteErr(heldName)),
+		fmt.Errorf("volume %s: %w", failedName, heldDeleteErr(failedName)),
+	}}
+	reason, _, _ = closeVolumeFailure(allHeld.failures(), slog.Default())
+	assert.Equal(t, backend.ReasonVolumeDeletionInProgress, reason)
+
+	unproven := destroyReport{Errs: allHeld.Errs, Unproven: []string{failedName}}
+	reason, _, _ = closeVolumeFailure(unproven.failures(), slog.Default())
+	assert.Equal(t, backend.ReasonCleanupFailed, reason, "an unprovable ownership read is not a hold")
 }
 
 // A retaining close never retains a name whose deletion is pending (finding

@@ -197,12 +197,40 @@ var errInlineDeleteDeferred = errors.New("deletion deferred to the hold executor
 // found at startup.
 var errDeleteStageRecovered = errors.New("delete stage recovered at startup")
 
+// xfsQuotaResource is the closed set of resources a project quota report
+// measures. The type is unexported and only these constants exist.
+type xfsQuotaResource uint8
+
+const (
+	// xfsQuotaBlocks: 1 KiB blocks (`report -b`).
+	xfsQuotaBlocks xfsQuotaResource = iota + 1
+	// xfsQuotaInodes: inodes (`report -i`).
+	xfsQuotaInodes
+)
+
+// flag is the resource's xfs_quota report flag, "" for a value outside the
+// set.
+func (r xfsQuotaResource) flag() string {
+	switch r {
+	case xfsQuotaBlocks:
+		return "b"
+	case xfsQuotaInodes:
+		return "i"
+	default:
+		return ""
+	}
+}
+
 // xfsProjectQuotaRow is one strictly parsed numeric `xfs_quota report -p` row
-// for an exact project, in the report's units (1 KiB blocks, or inodes). Only
-// parseXfsReportRow builds one with parsedFromReport set; the zero row that
-// travels beside a read error has it clear and sizes nothing.
+// for an exact project, in the units of its quotaResource (1 KiB blocks, or
+// inodes). Only parseXfsReportRow builds one with parsedFromReport set; the
+// zero row that travels beside a read error has it clear and sizes nothing.
 type xfsProjectQuotaRow struct {
 	projID uint32
+	// quotaResource is the resource the report measured, set only by
+	// parseXfsReportRow (pinned by TestDeleteHoldTypesHaveSingleConstructors),
+	// so an inode row can never size a footprint in blocks.
+	quotaResource xfsQuotaResource
 	// parsedFromReport is set only by a successful parseXfsReportRow. A
 	// footprint is sized only from a row that carries it, so a failed read
 	// can never pass for an absent dquot. Pinned by
@@ -235,10 +263,11 @@ func (f residualFootprintMB) sized() bool { return f.fromParsedRow }
 
 // residualFootprintFromRow sizes a residual hold from its project's block row.
 // It reports false for a row that was not parsed from a report (the zero row
-// beside a read error), and for one that did not carry its limits.
+// beside a read error), for a row of another resource (inodes), and for one
+// that did not carry its limits.
 func residualFootprintFromRow(row xfsProjectQuotaRow) (residualFootprintMB, bool) {
 	switch {
-	case !row.parsedFromReport:
+	case !row.parsedFromReport, row.quotaResource != xfsQuotaBlocks:
 		return residualFootprintMB{}, false
 	case !row.found:
 		return residualFootprintMB{mb: 0, fromParsedRow: true}, true
@@ -328,10 +357,13 @@ type xfsDeleteHold struct {
 	attempts int
 	// failures counts consecutive attempts that ended with a reason that backs
 	// off; an interrupted attempt resets it.
-	failures    int
-	since       time.Time
-	lastAttempt time.Time
-	nextAttempt time.Time
+	failures int
+	// contentRemoved: the last attempt removed content of the condemned
+	// volume (xfsDeleteAttempt.contentRemoved).
+	contentRemoved bool
+	since          time.Time
+	lastAttempt    time.Time
+	nextAttempt    time.Time
 }
 
 // newXFSDeleteHold is the only constructor of a hold record, and it accepts
@@ -349,16 +381,17 @@ func newXFSDeleteHold(outcome deleteStageOutcome, now time.Time) (*xfsDeleteHold
 
 func (h *xfsDeleteHold) view() volumeDeleteHoldView {
 	return volumeDeleteHoldView{
-		volume:      h.stage.volumeID,
-		stage:       h.stage.value(),
-		projectID:   h.stage.projID,
-		phase:       h.phase.kind,
-		footprintMB: h.phase.footprint.mb,
-		reason:      h.reason,
-		attempts:    h.attempts,
-		since:       h.since,
-		lastAttempt: h.lastAttempt,
-		nextAttempt: h.nextAttempt,
+		volume:         h.stage.volumeID,
+		stage:          h.stage.value(),
+		projectID:      h.stage.projID,
+		phase:          h.phase.kind,
+		footprintMB:    h.phase.footprint.mb,
+		reason:         h.reason,
+		attempts:       h.attempts,
+		contentRemoved: h.contentRemoved,
+		since:          h.since,
+		lastAttempt:    h.lastAttempt,
+		nextAttempt:    h.nextAttempt,
 	}
 }
 
@@ -380,6 +413,9 @@ func volumeDeleteHoldBackoff(failures int) time.Duration {
 type xfsDeleteAttempt struct {
 	// finalSeen: the attempt observed the final volume directory present.
 	finalSeen bool
+	// contentRemoved: the attempt's tree removal unlinked at least one entry
+	// or directory of the condemned volume.
+	contentRemoved bool
 	// absenceDurable: the attempt observed the final path absent and synced
 	// the parent, so the absence is durable.
 	absenceDurable bool
@@ -654,6 +690,7 @@ func (x *xfsVolumeManager) recordXFSDeleteStageOutcome(
 		if attempted {
 			current.attempts++
 			current.lastAttempt = now
+			current.contentRemoved = attempt.contentRemoved
 			switch {
 			case outcome.reason.keepsProgressing():
 				current.failures = 0
@@ -1002,7 +1039,7 @@ func (x *xfsVolumeManager) classifyRecoveredDeleteHoldsWithin(ctx context.Contex
 	for _, stage := range absent {
 		var footprint residualFootprintMB
 		if final == finalAbsentDurableAtStart && sizingCtx.Err() == nil {
-			row, err := x.readProjectQuotaRow(sizingCtx, stage.projID, "b")
+			row, err := x.readProjectQuotaRow(sizingCtx, stage.projID, xfsQuotaBlocks)
 			if err != nil {
 				x.logger.Warn("cannot size recovered volume delete hold at startup; disk admission is withheld until it is",
 					"volume_id", stage.volumeID.value(), "delete_stage", stage.value(), "project_id", stage.projID,

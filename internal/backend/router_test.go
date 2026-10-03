@@ -730,6 +730,22 @@ func TestRouter_RouteForProvision_LeastLoaded(t *testing.T) {
 	assert.Equal(t, "b2", got.Name())
 }
 
+// A backend that withholds disk refuses every disk-bearing provision, so it is
+// chosen only when every candidate withholds disk.
+func TestRouter_RouteForProvision_PrefersBackendsThatAdmitDisk(t *testing.T) {
+	router, backends := newLeastLoadedRouter(t, map[string]float64{"b1": 0.8, "b2": 0.2, "b3": 0.5})
+	backends["b2"].SetLoadStats(&LoadStats{TotalCPUCores: 100, AllocatedCPUCores: 20, DiskWithheld: true})
+	for range 20 {
+		assert.Equal(t, "b3", router.RouteForProvision(context.Background(), "s", nil).Name(),
+			"the least-loaded backend that admits disk wins")
+	}
+
+	backends["b1"].SetLoadStats(&LoadStats{TotalCPUCores: 100, AllocatedCPUCores: 80, DiskWithheld: true})
+	backends["b3"].SetLoadStats(&LoadStats{TotalCPUCores: 100, AllocatedCPUCores: 50, DiskWithheld: true})
+	assert.Equal(t, "b2", router.RouteForProvision(context.Background(), "s", nil).Name(),
+		"when every candidate withholds disk, the least-loaded one still serves")
+}
+
 func TestRouter_RouteForProvision_TieBrokenByInFlight(t *testing.T) {
 	router, _ := newLeastLoadedRouter(t, map[string]float64{"b1": 0.5, "b2": 0.5})
 	got := router.RouteForProvision(context.Background(), "s", map[string]int{"b1": 3, "b2": 0})

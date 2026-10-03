@@ -1495,10 +1495,10 @@ func (v condemnedXFSVolume) removeEntry(ctx context.Context, name fstree.Name) (
 	return fstree.RemoveBeneath(ctx, v.dir, name, v.removeOptions())
 }
 
-// xfsRemoveTree removes one top-level entry of a condemned volume. The
-// production implementation is removeCondemnedXFSEntry; tests substitute it to
-// fail at chosen entries.
-type xfsRemoveTree func(ctx context.Context, volume condemnedXFSVolume, name fstree.Name) error
+// xfsRemoveTree removes one top-level entry of a condemned volume and reports
+// what it removed, even when it fails part-way. The production implementation
+// is removeCondemnedXFSEntry; tests substitute it to fail at chosen entries.
+type xfsRemoveTree func(ctx context.Context, volume condemnedXFSVolume, name fstree.Name) (fstree.RemoveReport, error)
 
 type xfsRemove func(root *os.Root, name string) error
 
@@ -1531,10 +1531,10 @@ func usageFailureReason(ctx context.Context, err error) volumeDeleteHoldReason {
 
 // removeCondemnedXFSEntry is the production xfsRemoveTree. Its errors carry at
 // most one bounded entry name and a depth, never a path.
-func removeCondemnedXFSEntry(ctx context.Context, volume condemnedXFSVolume, name fstree.Name) error {
+func removeCondemnedXFSEntry(ctx context.Context, volume condemnedXFSVolume, name fstree.Name) (fstree.RemoveReport, error) {
 	report, err := volume.removeEntry(ctx, name)
 	observeTreeRemoval(treeRemovalSiteDeleteStage, report, err)
-	return err
+	return report, err
 }
 
 func removeFromXFSRoot(root *os.Root, name string) error {
@@ -1644,7 +1644,7 @@ func (x *xfsVolumeManager) runXFSDeleteStageCleanup(
 			return fmt.Errorf("xfs volume %q exists again while delete-stage %q holds only its project",
 				stage.volumeID.value(), stage.value())
 		}
-		if err := x.emptyAndRemoveCondemnedXFSVolume(ctx, root, stage, removeContent, removeFinal); err != nil {
+		if err := x.emptyAndRemoveCondemnedXFSVolume(ctx, root, stage, removeContent, removeFinal, attempt); err != nil {
 			return err
 		}
 	}
@@ -1795,13 +1795,15 @@ func (x *xfsVolumeManager) commitVanishedDeleteStage(
 
 // emptyAndRemoveCondemnedXFSVolume is the removal phase of one attempt: it
 // empties the final volume with fstree, proves it empty and unchanged, and
-// removes it. The final path's absence is not yet durable when it returns.
+// removes it. The final path's absence is not yet durable when it returns. It
+// records in attempt whether it removed any content, even when it then fails.
 func (x *xfsVolumeManager) emptyAndRemoveCondemnedXFSVolume(
 	ctx context.Context,
 	root *os.Root,
 	stage xfsDeleteStageName,
 	removeContent xfsRemoveTree,
 	removeFinal xfsRemove,
+	attempt *xfsDeleteAttempt,
 ) error {
 	volumeRoot, err := openAttestedManagedVolumeRoot(root, stage.volumeID)
 	if err != nil {
@@ -1860,7 +1862,11 @@ func (x *xfsVolumeManager) emptyAndRemoveCondemnedXFSVolume(
 			return fmt.Errorf("xfs volume %q lists an entry that is not one path component: %w",
 				stage.volumeID.value(), err)
 		}
-		if err := removeContent(ctx, condemned, name); err != nil {
+		report, err := removeContent(ctx, condemned, name)
+		if report.Entries > 0 || report.Dirs > 0 {
+			attempt.contentRemoved = true
+		}
+		if err != nil {
 			_ = volumeDir.Close()
 			return holdable(holdReasonForTreeRemoval(classifyTreeRemoval(err)), fmt.Errorf(
 				"remove content of xfs volume %q under delete-stage %q: %w",
@@ -2907,7 +2913,7 @@ func parseXfsReportUsedBlocks(out string, projID uint32) (int64, error) {
 }
 
 func parseXfsReportUsed(out string, projID uint32) (int64, bool, error) {
-	row, err := parseXfsReportRow(out, projID)
+	row, err := parseXfsReportRow(out, projID, xfsQuotaBlocks)
 	if err != nil {
 		return 0, false, err
 	}
@@ -2915,16 +2921,20 @@ func parseXfsReportUsed(out string, projID uint32) (int64, bool, error) {
 }
 
 // parseXfsReportRow is the only constructor of xfsProjectQuotaRow. It parses
-// the numeric row of exactly projID from `report -p -n -N` output:
+// the numeric row of exactly projID from `report -p -n -N` output of
+// resource, and records that resource on the row:
 //
 //	#<projid>   <used>   <soft>   <hard>   <warn/grace>
 //
 // Every row's project ID must be numeric, projID may appear at most once, and
 // its used value, and its hard limit when the row carries the limit columns,
 // must be non-negative integers.
-func parseXfsReportRow(out string, projID uint32) (xfsProjectQuotaRow, error) {
+func parseXfsReportRow(out string, projID uint32, resource xfsQuotaResource) (xfsProjectQuotaRow, error) {
+	if resource.flag() == "" {
+		return xfsProjectQuotaRow{}, fmt.Errorf("unsupported xfs project quota resource %d", resource)
+	}
 	want := strconv.FormatUint(uint64(projID), 10)
-	row := xfsProjectQuotaRow{projID: projID, parsedFromReport: true}
+	row := xfsProjectQuotaRow{projID: projID, quotaResource: resource, parsedFromReport: true}
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
@@ -2986,7 +2996,7 @@ func runXFSQuotaReport(ctx context.Context, command, mountPoint string) (xfsQuot
 	return xfsQuotaReport{stdout: stdout, diagnostic: diagnostic}, nil
 }
 
-func (x *xfsVolumeManager) readProjectQuotaUsage(ctx context.Context, projID uint32, resource string) (int64, error) {
+func (x *xfsVolumeManager) readProjectQuotaUsage(ctx context.Context, projID uint32, resource xfsQuotaResource) (int64, error) {
 	row, err := x.readProjectQuotaRow(ctx, projID, resource)
 	if err != nil {
 		return 0, err
@@ -2994,20 +3004,21 @@ func (x *xfsVolumeManager) readProjectQuotaUsage(ctx context.Context, projID uin
 	return row.used, nil
 }
 
-// readProjectQuotaRow reads projID's exact report row for resource: "b"
-// (1 KiB blocks) or "i" (inodes). A missing row is an authoritative absence
-// (no initialized dquot, so neither usage nor a limit) only when xfs_quota
-// emitted no diagnostic.
-func (x *xfsVolumeManager) readProjectQuotaRow(ctx context.Context, projID uint32, resource string) (xfsProjectQuotaRow, error) {
-	if resource != "b" && resource != "i" {
-		return xfsProjectQuotaRow{}, fmt.Errorf("unsupported xfs project quota resource %q", resource)
+// readProjectQuotaRow reads projID's exact report row for resource. A
+// missing row is an authoritative absence (no initialized dquot, so neither
+// usage nor a limit) only when xfs_quota emitted no diagnostic.
+func (x *xfsVolumeManager) readProjectQuotaRow(
+	ctx context.Context, projID uint32, resource xfsQuotaResource,
+) (xfsProjectQuotaRow, error) {
+	if resource.flag() == "" {
+		return xfsProjectQuotaRow{}, fmt.Errorf("unsupported xfs project quota resource %d", resource)
 	}
-	command := xfsProjectReportCmd(resource, projID)
+	command := xfsProjectReportCmd(resource.flag(), projID)
 	report, err := runXFSQuotaReport(ctx, command, x.mountPoint)
 	if err != nil {
 		return xfsProjectQuotaRow{}, fmt.Errorf("xfs_quota %s for project %d: %w", command, projID, err)
 	}
-	row, err := parseXfsReportRow(string(report.stdout), projID)
+	row, err := parseXfsReportRow(string(report.stdout), projID, resource)
 	if err != nil {
 		return xfsProjectQuotaRow{}, err
 	}
@@ -3058,11 +3069,11 @@ func (x *xfsVolumeManager) waitForZeroProjectQuotaUsage(
 	}
 
 	for {
-		blockRow, err := x.readProjectQuotaRow(ctx, projID, "b")
+		blockRow, err := x.readProjectQuotaRow(ctx, projID, xfsQuotaBlocks)
 		if err != nil {
 			return last, err
 		}
-		inodes, err := x.readProjectQuotaUsage(ctx, projID, "i")
+		inodes, err := x.readProjectQuotaUsage(ctx, projID, xfsQuotaInodes)
 		if err != nil {
 			return last, err
 		}

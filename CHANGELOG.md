@@ -473,7 +473,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   footprint is unknown: a deletion recovered at startup whose volume is gone
   may already have settled its caller, so until its quota row can be read,
   every provision that needs disk is refused as insufficient resources, while
-  diskless work and `/health` are unaffected. (ENG-1117)
+  diskless work and `/health` are unaffected. Its `/stats` then reports
+  `"disk_withheld": true`, and providerd's least-loaded routing prefers a
+  backend serving the same SKU that does not report it. (ENG-1117)
 - A graceful providerd stop now lets an in-flight reconciliation sweep finish
   reading backend inventories and commit its placement projection, for at most
   half of `shutdown_timeout`, instead of abandoning it. An abandoned sweep left
@@ -1259,8 +1261,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   backend or blocks its startup. The deletion is held for that volume, keeps
   its delete stage and project ID, and is retried in the background, and the
   closing lease stays pending until the volume is gone. Held deletions are
-  retried back to back while they make progress, up to two leases at once.
-  Tenant directory trees are removed with bounded resources. (ENG-1117)
+  retried back to back while they make progress (complete, change phase or
+  remove volume content), up to two leases at once; time spent waiting on the
+  quota subsystem is not progress. A close whose only failures are held
+  deletions reports `VolumeDeletionInProgress`; one with any other volume
+  failure reports `CleanupFailed`. A close with no provision record that waits
+  only on held deletions is, after its own container teardown, skipped and left
+  out of close-age paging like any other held close. Tenant directory trees are
+  removed with bounded resources. (ENG-1117)
 - A sweep canceled at shutdown between its provision and retention reads no
   longer widens the recovery its interrupted marker needs. It is abandoned
   before any response is disposed, so after the restart only the backends that

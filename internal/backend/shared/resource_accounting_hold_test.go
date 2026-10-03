@@ -78,8 +78,9 @@ func TestDiskAccountingHoldRefusesOnlyDiskBearingAllocations(t *testing.T) {
 	require.False(t, stats.AccountingHeld, "only disk is withheld")
 	require.Zero(t, stats.AvailableDiskMB())
 	require.Positive(t, stats.AvailableCPU())
-	_, err := stats.RoutingLoadStats()
-	require.NoError(t, err, "routing load does not depend on disk")
+	load, err := stats.RoutingLoadStats()
+	require.NoError(t, err, "the CPU routing signal stays valid while only disk is withheld")
+	require.True(t, load.DiskWithheld, "routing learns that this backend admits no disk")
 
 	first.Release()
 	copyOfFirst.Release()
@@ -87,6 +88,9 @@ func TestDiskAccountingHoldRefusesOnlyDiskBearingAllocations(t *testing.T) {
 	require.ErrorIs(t, pool.TryAllocate("disk-0", "stateful", "tenant"), ErrDiskAccountingIncomplete)
 	second.Release()
 	require.False(t, pool.Stats().DiskAccountingHeld)
+	load, err = pool.Stats().RoutingLoadStats()
+	require.NoError(t, err)
+	require.False(t, load.DiskWithheld)
 	require.NoError(t, pool.TryAllocate("disk-0", "stateful", "tenant"))
 	require.Equal(t, int64(16384-256-256-512), pool.Stats().AvailableDiskMB())
 	DiskAccountingHold{}.Release() // the zero value grants nothing and is harmless

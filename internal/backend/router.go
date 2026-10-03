@@ -177,7 +177,8 @@ const statsFetchTimeout = 2 * time.Second
 const cpuRatioEpsilon = 1e-9
 
 // RouteForProvision selects the SKU-matching backend with the lowest observed
-// allocated-CPU ratio for a new provision. Ties (equal ratio within
+// allocated-CPU ratio for a new provision, preferring candidates that do not
+// report DiskWithheld. Ties (equal ratio within
 // cpuRatioEpsilon — the burst case, where concurrent provisions read the same
 // /stats snapshot) are broken by the fewest in-flight provisions, then by the
 // round-robin counter so a burst of identical-state provisions spreads across
@@ -291,9 +292,10 @@ func (r *Router) routeForProvision(
 	defer cancel()
 
 	type candidateLoad struct {
-		backend Backend
-		ratio   float64
-		ok      bool
+		backend      Backend
+		ratio        float64
+		ok           bool
+		diskWithheld bool
 	}
 	// Each goroutine writes only its own loads[i] slot (disjoint indices, no
 	// shared-write race); wg.Wait() establishes happens-before for the reads below.
@@ -315,6 +317,7 @@ func (r *Router) routeForProvision(
 			}
 			loads[i].ratio = ratio
 			loads[i].ok = true
+			loads[i].diskWithheld = stats.DiskWithheld
 			if r.allocatedCPURatio != nil {
 				r.allocatedCPURatio.WithLabelValues(b.Name()).Set(ratio)
 			}
@@ -334,6 +337,14 @@ func (r *Router) routeForProvision(
 			r.routingFallback.Inc()
 		}
 		return r.routeRoundRobin(candidates, fallback)
+	}
+	// 0) A backend that withholds disk refuses every disk-bearing provision,
+	// and fred cannot tell which SKUs carry disk: prefer the candidates that
+	// admit disk, and compare withheld ones only when every candidate is.
+	if admitsDisk := slices.DeleteFunc(slices.Clone(usable), func(l candidateLoad) bool {
+		return l.diskWithheld
+	}); len(admitsDisk) > 0 {
+		usable = admitsDisk
 	}
 
 	// 1) Lowest CPU ratio.

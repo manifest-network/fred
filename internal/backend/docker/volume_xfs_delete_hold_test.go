@@ -80,7 +80,7 @@ func TestClassifyXFSDeleteStageCleanupIsTotalWithLatchDefault(t *testing.T) {
 func TestHoldPhaseAfterRequiresAParsedFootprintForResidual(t *testing.T) {
 	t.Parallel()
 
-	row, err := parseXfsReportRow("#4242 10 0 2048 0\n", xfsDeleteTestProjectID)
+	row, err := parseXfsReportRow("#4242 10 0 2048 0\n", xfsDeleteTestProjectID, xfsQuotaBlocks)
 	require.NoError(t, err)
 	footprint, ok := residualFootprintFromRow(row)
 	require.True(t, ok)
@@ -125,7 +125,7 @@ func TestHoldPhaseAfterRequiresAParsedFootprintForResidual(t *testing.T) {
 func TestRecoveredHoldPhaseNeverLeavesAGoneVolumeUncounted(t *testing.T) {
 	t.Parallel()
 
-	row, err := parseXfsReportRow("#4242 0 0 4096 0\n", xfsDeleteTestProjectID)
+	row, err := parseXfsReportRow("#4242 0 0 4096 0\n", xfsDeleteTestProjectID, xfsQuotaBlocks)
 	require.NoError(t, err)
 	footprint, ok := residualFootprintFromRow(row)
 	require.True(t, ok)
@@ -167,7 +167,7 @@ func TestResidualFootprintIsBuiltOnlyFromAParsedRow(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			row, err := parseXfsReportRow(tc.out, xfsDeleteTestProjectID)
+			row, err := parseXfsReportRow(tc.out, xfsDeleteTestProjectID, xfsQuotaBlocks)
 			require.NoError(t, err)
 			footprint, ok := residualFootprintFromRow(row)
 			assert.Equal(t, tc.ok, ok)
@@ -177,7 +177,7 @@ func TestResidualFootprintIsBuiltOnlyFromAParsedRow(t *testing.T) {
 			}
 		})
 	}
-	_, err := parseXfsReportRow("#4242 7 0 not-a-limit 0\n", xfsDeleteTestProjectID)
+	_, err := parseXfsReportRow("#4242 7 0 not-a-limit 0\n", xfsDeleteTestProjectID, xfsQuotaBlocks)
 	require.ErrorContains(t, err, "hard limit", "a malformed limit must never be guessed")
 
 	// The zero row that travels beside every read error is not a parsed
@@ -187,8 +187,19 @@ func TestResidualFootprintIsBuiltOnlyFromAParsedRow(t *testing.T) {
 	assert.False(t, footprint.sized())
 	_, ok = residualHoldPhase(footprint)
 	assert.False(t, ok, "there is no residual phase without a sized footprint")
-	_, readErr := (&xfsVolumeManager{}).readProjectQuotaRow(t.Context(), xfsDeleteTestProjectID, "x")
-	require.Error(t, readErr)
+	_, readErr := (&xfsVolumeManager{}).readProjectQuotaRow(t.Context(), xfsDeleteTestProjectID, xfsQuotaResource(0))
+	require.Error(t, readErr, "a resource outside the closed set is refused")
+
+	// An inode row is parsed from a report and carries limits, but it is
+	// counted in inodes: it never sizes a footprint in blocks.
+	inodeRow, err := parseXfsReportRow("#4242 10 0 2048 0\n", xfsDeleteTestProjectID, xfsQuotaInodes)
+	require.NoError(t, err)
+	require.True(t, inodeRow.found)
+	footprint, ok = residualFootprintFromRow(inodeRow)
+	assert.False(t, ok, "an inode row never sizes a residual footprint")
+	assert.False(t, footprint.sized())
+	_, err = parseXfsReportRow("#4242 10 0 2048 0\n", xfsDeleteTestProjectID, xfsQuotaResource(0))
+	require.Error(t, err, "a row cannot be parsed for a resource outside the closed set")
 }
 
 func TestVolumeDeleteHoldBackoffDoublesToItsCap(t *testing.T) {
@@ -273,7 +284,9 @@ func withVolume(t *testing.T, mgr *xfsVolumeManager, stage xfsDeleteStageName, m
 }
 
 func failingRemoval(err error) xfsRemoveTree {
-	return func(context.Context, condemnedXFSVolume, fstree.Name) error { return err }
+	return func(context.Context, condemnedXFSVolume, fstree.Name) (fstree.RemoveReport, error) {
+		return fstree.RemoveReport{}, err
+	}
 }
 
 // TestXFSDeleteCleanupClassifiesEveryFailureSite drives every allowlisted
@@ -325,11 +338,14 @@ func TestXFSDeleteCleanupClassifiesEveryFailureSite(t *testing.T) {
 			setup: func(t *testing.T, mgr *xfsVolumeManager, stage xfsDeleteStageName) (
 				context.Context, xfsRemoveTree, xfsRemove, xfsRemove) {
 				volumePath := withVolume(t, mgr, stage, true)
-				return t.Context(), func(ctx context.Context, volume condemnedXFSVolume, name fstree.Name) error {
-					if err := removeCondemnedXFSEntry(ctx, volume, name); err != nil {
-						return err
+				return t.Context(), func(
+					ctx context.Context, volume condemnedXFSVolume, name fstree.Name,
+				) (fstree.RemoveReport, error) {
+					report, err := removeCondemnedXFSEntry(ctx, volume, name)
+					if err != nil {
+						return report, err
 					}
-					return os.WriteFile(filepath.Join(volumePath, "late-writer"), []byte("x"), 0o600)
+					return report, os.WriteFile(filepath.Join(volumePath, "late-writer"), []byte("x"), 0o600)
 				}, removeFromXFSRoot, removeFromXFSRoot
 			},
 			held: true, reason: holdReasonWriterActive,
@@ -488,6 +504,39 @@ esac`,
 	}
 }
 
+// The hold records whether its last attempt removed content, from the tree
+// removal's own report even when the removal then ran out of its slice. The
+// executor counts an interrupted attempt as progress only on that fact.
+func TestXFSDeleteHoldRecordsWhetherTheAttemptRemovedContent(t *testing.T) {
+	deadline := fmt.Errorf("x: %w", context.DeadlineExceeded)
+	for _, tc := range []struct {
+		name   string
+		report fstree.RemoveReport
+		want   bool
+	}{
+		{"removed entries before the deadline", fstree.RemoveReport{Entries: 3}, true},
+		{"removed a directory before the deadline", fstree.RemoveReport{Dirs: 1}, true},
+		{"removed nothing before the deadline", fstree.RemoveReport{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := newXfsManagerForTest(t.TempDir())
+			stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
+			prepareDeleteStageForTest(t, mgr, stage)
+			installXFSQuotaFixture(t, "")
+			withVolume(t, mgr, stage, true)
+			removeContent := func(context.Context, condemnedXFSVolume, fstree.Name) (fstree.RemoveReport, error) {
+				return tc.report, deadline
+			}
+
+			outcome := mgr.cleanupXFSDeleteStageWith(t.Context(), stage, removeContent, removeFromXFSRoot, removeFromXFSRoot)
+			require.Equal(t, deleteStageHeld, outcome.kind, "%v", outcome.err)
+			hold := heldForTest(t, mgr, stage.volumeID.value())
+			assert.Equal(t, holdReasonDeadline, hold.reason)
+			assert.Equal(t, tc.want, hold.contentRemoved)
+		})
+	}
+}
+
 // A held deletion is answered from the hold without touching the filesystem;
 // only the hold executor's retry runs held work. A residual hold settles a
 // Destroy caller after an Lstat proves the final path absent, and latches if
@@ -503,9 +552,9 @@ func TestXFSDestroyAnswersAHoldWithoutWork(t *testing.T) {
 	err := mgr.destroyWith(t.Context(), stage.volumeID.value(), failingRemoval(injected))
 	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
 
-	mustNotRun := func(context.Context, condemnedXFSVolume, fstree.Name) error {
+	mustNotRun := func(context.Context, condemnedXFSVolume, fstree.Name) (fstree.RemoveReport, error) {
 		t.Fatal("a held deletion must not run its cleanup outside the hold executor")
-		return nil
+		return fstree.RemoveReport{}, nil
 	}
 	err = mgr.destroyWith(t.Context(), stage.volumeID.value(), mustNotRun)
 	require.ErrorIs(t, err, ErrVolumeDeleteHeld, "a removal-phase hold answers held")
@@ -554,9 +603,9 @@ func TestXFSDestroyBeforeTheExecutorRunsIsHeldWithoutAnAttempt(t *testing.T) {
 	require.NoError(t, writeProjectIDFile(volumePath, xfsDeleteTestProjectID))
 	logPath := installLoggingXFSQuota(t)
 
-	err := mgr.destroyWith(t.Context(), name, func(context.Context, condemnedXFSVolume, fstree.Name) error {
+	err := mgr.destroyWith(t.Context(), name, func(context.Context, condemnedXFSVolume, fstree.Name) (fstree.RemoveReport, error) {
 		t.Fatal("Start must never remove inline")
-		return nil
+		return fstree.RemoveReport{}, nil
 	})
 	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
 	hold := heldForTest(t, mgr, name)
