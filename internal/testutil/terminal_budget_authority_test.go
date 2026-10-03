@@ -48,6 +48,7 @@ const (
 	terminalBudgetDecodeFile = "internal/provisioner/terminalverdict/verdict.go"
 	terminalBudgetDeathFile  = "internal/backend/shared/leasesm/lease_sm.go"
 	terminalBudgetEventsFile = "internal/backend/docker/container_event_loop.go"
+	terminalBudgetReaderFile = "internal/backend/docker/container_event_reader.go"
 	failurecauseImportPath   = "github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 	failurecauseDir          = "internal/backend/shared/leasesm/failurecause"
 	backendDir               = "internal/backend"
@@ -63,7 +64,7 @@ type attributionSite struct{ file, function string }
 
 var (
 	classifyDeathSite = attributionSite{terminalBudgetDeathFile, "leaseSM.onEnterFailing"}
-	eventReaderSite   = attributionSite{terminalBudgetEventsFile, "Backend.consumeContainerEventStream"}
+	eventReaderSite   = attributionSite{terminalBudgetReaderFile, "containerEventReader.consume"}
 	liveDeathSite     = attributionSite{terminalBudgetEventsFile, "Backend.dispatchLiveContainerDeath"}
 )
 
@@ -155,6 +156,14 @@ func (b *Backend) recoverState() { _ = fc.NewEventSession() }`, "names failureca
 			"package docker\n" + failurecauseImport +
 				`func (b *Backend) dispatchLiveContainerDeath() { _ = failurecause.NewEventSession() }`,
 			"names failurecause.NewEventSession"},
+		{"event session minted by the loop around the reader", terminalBudgetEventsFile,
+			"package docker\n" + failurecauseImport +
+				`func (b *Backend) runContainerEventLoop() { _ = failurecause.NewEventSession() }`,
+			"names failurecause.NewEventSession"},
+		{"event session minted elsewhere in the reader's file", terminalBudgetReaderFile,
+			"package docker\n" + failurecauseImport +
+				`func (r containerEventReader) enqueue() { _ = failurecause.NewEventSession() }`,
+			"names failurecause.NewEventSession"},
 		{"session observed outside the reader", "internal/backend/docker/recover.go",
 			"package docker\n" + failurecauseImport +
 				`func f(s interface{ ObserveExit(string) failurecause.Provenance }) { _ = s.ObserveExit("c") }`,
@@ -203,8 +212,8 @@ func f(p struct{ FailCount int }) { slog.Warn("x", "fail_count", p.FailCount) }`
 		{"internal/backend/docker/info.go", "package p\n" + backendImport + `var v = backend.TerminalBudgetObservation{}`},
 		{terminalBudgetDeathFile, "package leasesm\n" + failurecauseImport +
 			`func (lsm *leaseSM) onEnterFailing() { _ = failurecause.ClassifyDeath("c", failurecause.Provenance{}, failurecause.Exited()) }`},
-		{terminalBudgetEventsFile, "package docker\n" + failurecauseImport +
-			`func (b *Backend) consumeContainerEventStream() { s := failurecause.NewEventSession(); s.ObserveStart("c"); s.ObserveSignal("c"); _ = s.ObserveExit("c") }`},
+		{terminalBudgetReaderFile, "package docker\n" + failurecauseImport +
+			`func (r containerEventReader) consume() { s := failurecause.NewEventSession(); s.ObserveStart("c"); s.ObserveSignal("c"); _ = s.ObserveExit("c") }`},
 		{terminalBudgetEventsFile, "package docker\n" + leasesmImport +
 			`func (b *Backend) dispatchLiveContainerDeath() { _, _ = leasesm.NewLiveContainerDiedObservation(r, p) }`},
 		{"internal/backend/shared/leasesm/lease_actor.go", `package leasesm

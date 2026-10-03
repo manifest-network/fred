@@ -430,8 +430,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `BACKEND_GUIDE.md`, "Terminal failure budget". (ENG-799)
 - The docker-backend's container event subscription also receives `start` and
   `kill` events, to attribute each container death to its cause. Its reader no
-  longer waits on death processing: deaths are dispatched in order from a
-  bounded queue, so a slow death cannot stall the subscription. (ENG-799)
+  longer waits on death processing or on log output: deaths are dispatched in
+  order from a bounded queue, so a slow death cannot stall the subscription,
+  and deaths dropped from a full queue are logged by a separate reporter as a
+  `container deaths dropped` line with their count, at most once every 10s.
+  (ENG-799)
 - Restart and update no longer stop at 1,024 commands per lease. Fred and the
   docker-backend keep a rolling window of each lease's 1,024 most recent
   commands and evict the oldest settled one to admit a newer command; the

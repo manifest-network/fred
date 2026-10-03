@@ -7,6 +7,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
+	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 // The container event loop delivers container deaths to their lease actors
@@ -16,17 +17,22 @@ import (
 // counts. It therefore lives apart from recover.go's sweep, and is built to
 // stay subscribed:
 //
-//   - The reader owns one subscription and its failurecause event session,
-//     which never leaves the reader's frame. Its per-event work is bookkeeping
-//     only; each death goes to a bounded queue. dockerd skips events for a
-//     subscriber that falls behind (a 1,024-event buffer, then 100ms per
-//     event), and a skipped "kill" would let the following "die" count, so the
-//     reader never waits on death processing.
+//   - The reader (container_event_reader.go) reads one subscription at a time
+//     and owns its failurecause event session, which never leaves the
+//     reader's frame. Its per-event work is bookkeeping only; each death goes
+//     to a bounded queue. dockerd skips events for a subscriber that falls
+//     behind (a 1,024-event buffer, then 100ms per event), and a skipped
+//     "kill" would let the following "die" count, so the reader waits on
+//     nothing but its stream: not on death processing, and not on log output.
+//     It has no logger; a death it drops from a full queue is only counted.
 //   - One dispatcher drains the queue in arrival order, which also keeps each
 //     container's deaths in order. It does the blocking work: storage identity
 //     re-verification, the lease lookup, the runtime-generation proof and
 //     actor routing. A death it cannot deliver is dropped and counted; the
 //     sweep later finds it, unattributed.
+//   - One reporter logs the deaths the reader dropped, at most once per
+//     containerDeathOverflowReportInterval, so a stalled log sink stalls only
+//     the reporter.
 //   - A stream error, a closed stream or a non-terminal verification failure
 //     backs off and reconnects with a fresh session; only shutdown or a
 //     latched terminal storage-authority failure stops the loop.
@@ -53,6 +59,16 @@ const (
 	// delivers an event.
 	containerEventRetryInitial = time.Second
 	containerEventRetryMax     = 30 * time.Second
+	// containerDeathOverflowReportInterval spaces the reporter's log lines. The
+	// first death dropped after a quiet interval is logged at once; later drops
+	// are summed into the next line.
+	containerDeathOverflowReportInterval = 10 * time.Second
+	// containerDeathOverflowMessage is the reporter's summary of the deaths the
+	// reader dropped, with their count as "dropped".
+	containerDeathOverflowMessage = "container deaths dropped: dispatch queue full; the reconcile sweep will find them, unattributed"
+	// containerDeathOverflowReporter labels the reporter's contained panics in
+	// fred_background_goroutine_panics_total.
+	containerDeathOverflowReporter = "container_death_overflow_reporter"
 )
 
 // Outcomes of fred_docker_backend_container_event_stream_total, a closed set.
@@ -70,6 +86,10 @@ var containerEventStreamOutcomes = []string{
 // fred_docker_backend_die_event_dropped_total.
 const dieEventSourceEventLoop = "event_loop"
 
+// eventLoopDeathsDropped is the event loop's series of that counter, resolved
+// once so that counting a drop is one atomic add, with no label lookup.
+var eventLoopDeathsDropped = dieEventDroppedTotal.WithLabelValues(dieEventSourceEventLoop)
+
 // containerEventLoop subscribes to the Docker container events that matter to
 // leases and dispatches every death to its lease actor; see the file comment.
 func (b *Backend) containerEventLoop() {
@@ -77,17 +97,25 @@ func (b *Backend) containerEventLoop() {
 }
 
 // runContainerEventLoop is containerEventLoop with its reconnect backoff as
-// parameters, so a test can drive many reconnects quickly.
+// parameters, so a test can drive many reconnects quickly. It owns the
+// dispatcher and the overflow reporter, and stops both before it returns.
 func (b *Backend) runContainerEventLoop(retryInitial, retryMax time.Duration) {
 	deaths := make(chan failurecause.Provenance, containerDeathQueueCapacity)
-	var dispatcher sync.WaitGroup
-	dispatcher.Go(func() { b.dispatchLiveContainerDeaths(deaths) })
+	overflow := newContainerDeathOverflow()
+	reporting, stopReporting := context.WithCancel(b.stopCtx)
+	var workers sync.WaitGroup
+	workers.Go(func() { b.dispatchLiveContainerDeaths(deaths) })
+	workers.Go(func() {
+		b.reportContainerDeathOverflow(reporting, overflow, containerDeathOverflowReportInterval)
+	})
 	defer func() {
 		close(deaths)
-		dispatcher.Wait()
+		stopReporting()
+		workers.Wait()
 		containerDeathQueueDepth.Set(0)
 		containerEventStreamTotal.WithLabelValues(containerEventStreamExited).Inc()
 	}()
+	reader := containerEventReader{stop: b.stopCtx.Done(), deaths: deaths, overflow: overflow}
 
 	retry := retryInitial
 	for b.containerEventLoopMayRun() {
@@ -99,8 +127,14 @@ func (b *Backend) runContainerEventLoop(retryInitial, retryMax time.Duration) {
 				"error", err, "retry_in", retry)
 		} else {
 			containerEventStreamTotal.WithLabelValues(containerEventStreamConnected).Inc()
-			if b.consumeContainerEventStream(deaths) {
+			events, errs := b.docker.ContainerEvents(b.stopCtx)
+			delivered, err := reader.consume(events, errs)
+			if delivered {
 				retry = retryInitial
+			}
+			// Logged here, after the subscription is gone, never by the reader.
+			if err != nil {
+				b.logger.Warn("container event stream error, reconnecting", "error", err)
 			}
 			if !b.containerEventLoopMayRun() {
 				break
@@ -130,62 +164,52 @@ func (b *Backend) verifyContainerEventAuthority() error {
 	return b.requireStorageIdentity(ctx)
 }
 
-// consumeContainerEventStream reads one subscription until it ends or the
-// backend stops, and reports whether it delivered any event. It owns that
-// subscription's event session: one per connection, because events missed in
-// a reconnect gap are unknowable. The session is the only minter of live
-// provenance and never leaves this frame (its type cannot even be named
-// here); internal/testutil confines failurecause.NewEventSession and the
-// session's Observe methods to this function.
-func (b *Backend) consumeContainerEventStream(deaths chan<- failurecause.Provenance) bool {
-	eventCh, errCh := b.docker.ContainerEvents(b.stopCtx)
-	session := failurecause.NewEventSession()
-	delivered := false
+// reportContainerDeathOverflow logs the deaths the reader dropped from a full
+// queue, on this goroutine rather than the reader's: a stalled log sink holds
+// only the reporter, and the reader keeps counting. The first drop after a
+// quiet interval is logged at once, later ones are summed into at most one
+// line per interval, and any still unreported when ctx ends are logged then.
+func (b *Backend) reportContainerDeathOverflow(ctx context.Context, overflow *containerDeathOverflow, interval time.Duration) {
+	defer func() { b.logContainerDeathOverflow(overflow.takeUnreported()) }()
 	for {
 		select {
-		case <-b.stopCtx.Done():
-			return delivered
-		case event, ok := <-eventCh:
-			if !ok {
-				return delivered
-			}
-			delivered = true
-			switch event.Action {
-			case containerEventStart:
-				session.ObserveStart(event.ContainerID)
-			case containerEventKill:
-				session.ObserveSignal(event.ContainerID)
-			case containerEventDie:
-				// Consume the run's record first, so a death of an untracked
-				// container still frees its entry. The provenance is bound to
-				// this container and is all the dispatcher needs.
-				b.enqueueLiveContainerDeath(deaths, session.ObserveExit(event.ContainerID))
-			}
-		case err, ok := <-errCh:
-			if !ok {
-				return delivered
-			}
-			b.logger.Warn("container event stream error, reconnecting", "error", err)
-			return delivered
+		case <-ctx.Done():
+			return
+		case <-overflow.wakeups():
+		}
+		b.logContainerDeathOverflow(overflow.takeUnreported())
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
 		}
 	}
 }
 
-// enqueueLiveContainerDeath hands one death to the dispatcher without ever
-// blocking the reader. A full queue drops the dispatch, toward unknown.
-func (b *Backend) enqueueLiveContainerDeath(deaths chan<- failurecause.Provenance, death failurecause.Provenance) {
-	select {
-	case deaths <- death:
-		containerDeathQueueDepth.Set(float64(len(deaths)))
-	default:
-		dieEventDroppedTotal.WithLabelValues(dieEventSourceEventLoop).Inc()
-		b.logger.Warn("container death dropped: dispatch queue full; the reconcile sweep will find it, unattributed",
-			"container_id", leasesm.ShortID(death.InstanceID()))
+// logContainerDeathOverflow logs one summary of dropped deaths. The log
+// handler is foreign code, so a panic in it is contained and counted: the
+// reporter keeps running, and the drops stay counted in
+// die_event_dropped_total either way.
+func (b *Backend) logContainerDeathOverflow(dropped uint64) {
+	if dropped == 0 {
+		return
 	}
+	defer func() {
+		value := recover()
+		if value == nil {
+			return
+		}
+		background.GoroutinePanicsTotal.WithLabelValues(containerDeathOverflowReporter).Inc()
+		// The handler most likely panicked itself, so reporting the panic
+		// through it is best effort: a second panic ends here.
+		defer func() { _ = recover() }()
+		b.logger.Error("container death overflow report panicked", "dropped", dropped, "panic", value)
+	}()
+	b.logger.Warn(containerDeathOverflowMessage, "dropped", dropped)
 }
 
 // dispatchLiveContainerDeaths routes queued deaths in arrival order until the
-// reader closes the queue. The queue depth is sampled at each enqueue and each
+// loop closes the queue. The queue depth is sampled at each enqueue and each
 // dequeue, so a dispatcher that falls behind shows as a rising depth before
 // any death is dropped.
 func (b *Backend) dispatchLiveContainerDeaths(deaths <-chan failurecause.Provenance) {
@@ -205,7 +229,7 @@ func (b *Backend) dispatchLiveContainerDeath(death failurecause.Provenance) {
 		return
 	}
 	if err := b.verifyContainerEventAuthority(); err != nil {
-		dieEventDroppedTotal.WithLabelValues(dieEventSourceEventLoop).Inc()
+		eventLoopDeathsDropped.Inc()
 		b.logger.Error("container death dropped: backend storage identity unverified; the reconcile sweep will find it, unattributed",
 			"container_id", leasesm.ShortID(containerID), "error", err)
 		return
