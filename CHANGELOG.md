@@ -1164,25 +1164,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   rejects a PENDING one without waiting for `provision_timeout`. Every service
   of a stack is watched until the whole stack is ready, so a service that
   exits while another one is still starting fails the provision too (a
-  service whose health check passed once is then watched only for its exit),
-  and a container that dies just before the lease is reported `ready` is
-  still attributed from the live event stream. A `compose up` that fails
-  after all its requests completed is decided the same way, from what its
-  containers show and never from Compose's error: a `depends_on` dependency
-  that exited or turned unhealthy fails the provision definitely, and so does
-  a container Docker refused to start (`ContainerStartFailed`). Startup crash
-  loops count toward the terminal budget only after the 30-minute floor, and
-  only when the live event stream observed the container's whole run with no
-  signal to it. A health check that never passes and a refused start fail
-  definitely but never count, nor does a crash after a degraded launch: one
-  where the platform skipped part of its own preparation, namely seeding a
-  writable path with the image's content (a path it could not extract, a bind
-  source that failed its confinement check, stale content it could not clear,
-  a writable-path volume it could not create) or detecting the image's volume
-  owner or writable paths. A health check that never passes is reported only
-  at `provision_timeout` minus one minute, so a PENDING lease is usually
-  rejected first by providerd's 10-minute callback timeout, with `callback
-  timeout`. (ENG-1125)
+  service whose health check passed once is then judged healthy while it
+  runs, by the watch and by every later check of the attempt's outcome, so a
+  brief `unhealthy` flap no longer fails it), and a container that dies just
+  before the lease is reported `ready` is still attributed from the live
+  event stream. A `compose up` that fails after all its requests completed is
+  decided the same way, from what its containers show and never from
+  Compose's error: a `depends_on` dependency that exited or turned unhealthy
+  fails the provision definitely, and so does a container Docker refused to
+  start (`ContainerStartFailed`); such a launch was not completed, so its
+  failure never counts, not even an exit next to a refused start. A rejected
+  launch whose containers are all running is adopted `ready` by the next
+  recovery pass. Startup crash loops count toward the terminal budget only
+  after the 30-minute floor, and only when the live event stream observed the
+  container's whole run with no signal to it. A health check that never
+  passes and a refused start fail definitely but never count, nor does a
+  crash after a degraded launch: one where the platform skipped part of its
+  own preparation, namely seeding a writable path with the image's content (a
+  path it could not extract, a bind source that failed its confinement check,
+  stale content it could not clear, a writable-path volume it could not
+  create) or detecting the image's volume owner or writable paths. A health
+  check that never passes is reported only at `provision_timeout` minus one
+  minute, so a PENDING lease is usually rejected first by providerd's
+  10-minute callback timeout, with `callback timeout`. Neither health rule
+  covers a `depends_on` dependency gated by `service_healthy`, whose health
+  Compose judges itself while the stack starts: a flap there still fails the
+  deployment, and one that never becomes healthy ends `Internal` at
+  `provision_timeout`. (ENG-1125)
 - A provision or restore whose outcome the docker-backend could not settle
   live no longer leaves the lease `provisioning` for as long as the backend
   runs. That covers a failed inspection during startup verification, a
@@ -1193,8 +1201,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   it publishes the lease `failed` with that attempt's reason and message. The
   attempt's containers are kept for recovery, which settles it within one
   `reconcile_interval` instead of waiting out `provision_timeout` when one of
-  them has exited or the cohort is partial. These failures never count toward
-  the terminal failure budget. (ENG-1125)
+  them has exited or the cohort is partial. A startup rollback step that
+  fails after the attempt's containers were removed leaves nothing to
+  inspect, so that attempt still settles only at `provision_timeout`. These
+  failures never count toward the terminal failure budget. (ENG-1125)
   - Upgrading: ACTIVE leases that this bug left in `provisioning` are settled
     `failed` by the docker-backend's recovery when it first starts on this
     version, because their admission deadline has long passed, and providerd

@@ -317,16 +317,24 @@ A container that crashes while it starts, before it ever becomes ready, counts t
 the lease reports `failed` with reason `ContainerExited`, usually within seconds, and is
 re-provisioned, and a crash loop is closed by the same three-failures-over-30-minutes rule. In a
 stack with several services, a service that crashes while another one is still starting fails the
-deployment too, including a `depends_on` dependency gated by `service_healthy`. A service whose
-health check passed once is then watched only for crashes, so a brief unhealthy report while the
-rest of the stack starts does not fail the deployment. These never count, and such a lease keeps
-being re-provisioned, billed, until you fix the manifest or close the lease:
+deployment too. A service whose health check passed once is then treated as healthy for as long as
+it runs, so a brief unhealthy report while the rest of the stack starts does not fail the
+deployment. These never count, and such a lease keeps being re-provisioned, billed, until you fix
+the manifest or close the lease:
 
 - A health check that never passes reports `HealthCheckFailed`. It is reported only when the
   startup deadline is near (the provider's provision timeout, minus a minute), so a `PENDING`
   lease is usually rejected first with `callback timeout`.
 - A container the runtime refuses to start, for example because its entrypoint does not exist in
   the image, reports `ContainerStartFailed`.
+- A crash while the deployment itself is failing to start, for example a service that exits
+  because another service was refused, or a `depends_on` dependency gated by `service_healthy`
+  that crashes or reports unhealthy. It still reports `ContainerExited` (or `HealthCheckFailed`).
+
+A `depends_on` dependency gated by `service_healthy` is checked by Docker Compose while the
+deployment starts, not by the rule above: a brief unhealthy report from it still fails the
+deployment, and a dependency that never becomes healthy fails it only at the provision timeout,
+with an internal error.
 
 A failure the provider cannot attribute to your container at once is settled later, and never
 counts.
