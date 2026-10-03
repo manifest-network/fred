@@ -10,6 +10,8 @@ package docker
 //     xfsProjectQuotaRow that only a successful parseXfsReportRow marks
 //     parsed. No other code writes the parsed bits or the residual phase
 //     constant.
+//     The row also records its resource, so an inode row cannot size a
+//     footprint in blocks; only parseXfsReportRow writes it.
 //  2. The anchor detach (project 0, PROJINHERIT cleared) is reachable only
 //     from the condemned-volume type: condemnedXFSVolume is built only in
 //     emptyAndRemoveCondemnedXFSVolume, after the delete stage, the project
@@ -18,8 +20,10 @@ package docker
 //     which only its removeEntry passes to fstree.
 //
 // The older single-constructor rules (cause, outcome, hold record), the only
-// callers of the cleanup attempt, and the allowlisted holdable sites are
-// pinned here too. A literal's elided type cannot be resolved without type
+// callers of the cleanup attempt, the allowlisted holdable sites, and the
+// only caller of the live-volume subtree removal (removeManagedVolumeSubtree,
+// which wraps fstree.RemoveBeneath inside a tenant's live volume) are pinned
+// here too. A literal's elided type cannot be resolved without type
 // checking, so the parsed bits are pinned by their unique field names
 // instead, which also catches an elided literal. Each rule has a violating
 // fixture below, and each production scan must see the rule's allowed use.
@@ -129,6 +133,9 @@ var deleteHoldPins = []deleteHoldPin{
 	{"quota row literal", typedLiteral("xfsProjectQuotaRow"), []string{"parseXfsReportRow"}},
 	{"quota row parsed bit set", keyedField("parsedFromReport"), []string{"parseXfsReportRow"}},
 	{"quota row parsed bit assigned", assignedField("parsedFromReport"), nil},
+	{"quota row resource set", keyedField("quotaResource"), []string{"parseXfsReportRow"}},
+	{"quota row resource assigned", assignedField("quotaResource"), nil},
+	{"live subtree removal", callOf("removeManagedVolumeSubtree"), []string{"launchVolume.removeWritablePaths"}},
 	{"hold phase literal", typedLiteral("xfsDeleteHoldPhase"),
 		[]string{"removalHoldPhase", "unsizedHoldPhase", "residualHoldPhase"}},
 	{"residual phase written", writtenIdent("holdPhaseResidual"), []string{"residualHoldPhase"}},
@@ -240,8 +247,10 @@ func misuse(v condemnedXFSVolume, x *xfsVolumeManager, row xfsProjectQuotaRow, f
 	_ = xfsDeleteHold{reason: holdReasonDeadline}
 	_ = []residualFootprintMB{{mb: 1, fromParsedRow: true}}
 	f.fromParsedRow = true
-	_ = xfsProjectQuotaRow{parsedFromReport: true}
+	_ = xfsProjectQuotaRow{parsedFromReport: true, quotaResource: xfsQuotaBlocks}
 	row.parsedFromReport = true
+	row.quotaResource = xfsQuotaBlocks
+	_ = removeManagedVolumeSubtree(nil, "", "", "")
 	_ = xfsDeleteHoldPhase{kind: holdPhaseUnsized}
 	view := volumeDeleteHoldView{phase: holdPhaseResidual}
 	_ = condemnedXFSVolume{device: 1}

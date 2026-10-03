@@ -1056,8 +1056,10 @@ confined to that volume, it holds that deletion instead of stopping. The
 backend keeps serving every other lease, `/health` and readiness are unaffected,
 and a restart is safe: `Start` registers every delete stage it finds as a held
 deletion and serves. One background hold executor finishes held deletions. Its
-first pass runs as soon as `Start` returns. A pass that moved a hold forward is
-followed at once by the next; otherwise the executor waits 30 seconds. A pass
+first pass runs as soon as `Start` returns. A pass that moved a hold forward (completed
+it, changed its phase, or removed volume content) is followed at once by the
+next; otherwise the executor waits 30 seconds. A slice spent waiting on the
+quota subsystem is not progress. A pass
 lasts at most 60 seconds and runs up to two attempts at once, never two of the
 same lease. Each attempt is limited to a 15-second slice and takes only that
 lease's volume namespace, which it can keep for up to about 10 seconds longer
@@ -1082,15 +1084,20 @@ the removals of volume trees.
   counts closes waiting only on held deletions), a reaping retention record
   stays, and an operation intent stays. A close waits only on held deletions when
   every one of its volume slots is either held or done (destroyed, retained, or
-  never had a volume, like a stateless service). The executor resumes a waiting
-  close as soon as its hold stops holding it.
+  never had a volume, like a stateless service) and no container of the lease
+  remains. A close with no provision record (cleanup-only) proves the latter by
+  its own container teardown, so it runs once after every start before it
+  counts as waiting. The executor resumes a waiting close as soon as its hold
+  stops holding it.
 - `unsized`: the volume directory was found gone at startup, so the deletion's
   caller may already have settled in an earlier process, but the project's
   footprint could not be read yet. A caller that is still pending stays pending,
   as in `removal`, and the footprint is never counted as zero: while any hold is
   unsized, docker-backend refuses every provision that needs disk as
   insufficient resources (WARN `disk admission withheld`; diskless work and
-  `/health` are unaffected). The executor retries unsized holds first, on every
+  `/health` are unaffected), and `/stats` reports `disk_withheld`, so
+  providerd routes new provisions to a sibling backend serving the same SKU
+  when there is one. The executor retries unsized holds first, on every
   pass, until a quota read sizes them.
 - `residual`: the volume directory is durably gone; only the delete stage and
   the project ID remain while the zero-usage proof, the limit clear and the stage
@@ -1168,7 +1175,10 @@ exists.
   because `Start` registers every stage as a held deletion. That is safe only
   when both the target and any rollback revision are hold-aware (this release
   or later); a pre-hold binary stops at every start on such a stage. All other
-  pending work still blocks.
+  pending work still blocks. The proof reads only the volume root: it does not
+  check for remaining containers, and for a restore operation it sees only the
+  destination lease's volumes, so a `delete_held` head may also owe other work
+  that the restarted backend then retries.
 - To check delete-held work before stopping a host:
   `fred_docker_backend_close_intents_delete_held` and
   `fred_docker_backend_volume_delete_holds{phase}` while it runs, and the

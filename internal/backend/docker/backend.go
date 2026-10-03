@@ -268,6 +268,11 @@ type Backend struct {
 	// holdExecutor is the held-deletion executor's own rotation and owed
 	// close resumes (ENG-1117). Zero-value ready; it guards itself.
 	holdExecutor volumeDeleteHoldExecutorState
+	// closeTeardowns records the closes whose container teardown this process
+	// completed, the container evidence closeAwaitsHeldDeletes needs for a
+	// close without a projection (ENG-1117). Zero-value ready; it guards
+	// itself.
+	closeTeardowns closeTeardownFacts
 
 	// callbackStore persists pending callbacks in bbolt
 	callbackStore *shared.CallbackStore

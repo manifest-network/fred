@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
@@ -271,11 +272,19 @@ func (r destroyReport) leftOnDisk() bool { return r.refused() > 0 || len(r.Errs)
 // not do the job it was asked to do, and must retry rather than report success.
 // Claimed is deliberately excluded — nothing went wrong, another owner has it.
 func (r destroyReport) err() error {
-	errs := r.Errs
+	return errors.Join(r.failures()...)
+}
+
+// failures is err's members, one per failed name plus one for the unproven
+// set, never joined. A caller that classifies the failures (a close's
+// tenant-facing reason) must classify these: errors.Is over the joined err is
+// true when any single name's error matches.
+func (r destroyReport) failures() []error {
+	errs := slices.Clone(r.Errs)
 	if len(r.Unproven) > 0 {
 		errs = append(errs, fmt.Errorf("ownership unprovable for %d volume(s): %v", len(r.Unproven), r.Unproven))
 	}
-	return errors.Join(errs...)
+	return errs
 }
 
 // volumeOp is one logical operation's guarded access to volume destruction.
