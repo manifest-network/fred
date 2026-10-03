@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -93,8 +94,9 @@ func TestXfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
 		activeIDs:  make(map[uint32]string),
 		volumeToID: make(map[string]uint32),
 	}
-	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100),
-		"EnsureQuota on a missing volume must be a no-op")
+	outcome, err := mgr.EnsureQuota(context.Background(), "fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100)
+	require.NoError(t, err, "EnsureQuota on a missing volume must be a no-op")
+	assert.Equal(t, volumeQuotaAbsent, outcome, "a missing volume is never reported as applied")
 }
 
 // TestBtrfsEnsureQuota_MissingVolumeIsNoop is the btrfs analogue: EnsureQuota on
@@ -102,8 +104,9 @@ func TestXfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
 // (root-free — the missing-path branch returns before any exec).
 func TestBtrfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
 	mgr := &btrfsVolumeManager{dataPath: t.TempDir(), logger: slog.Default()}
-	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100),
-		"btrfs EnsureQuota on a missing subvolume must be a no-op")
+	outcome, err := mgr.EnsureQuota(context.Background(), "fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100)
+	require.NoError(t, err, "btrfs EnsureQuota on a missing subvolume must be a no-op")
+	assert.Equal(t, volumeQuotaAbsent, outcome, "a missing subvolume is never reported as applied")
 }
 
 // TestNewVolumeManager_XFS_ResolvesMountpoint verifies that constructing the
@@ -161,18 +164,25 @@ func TestXfsQuotaArgs_TrailingArgIsMountpoint(t *testing.T) {
 	assert.Equal(t, "report -p -b -n -N -L 1501154529 -U 1501154529", xfsProjectReportCmd("b", projID))
 }
 
-// newXfsManagerForTest builds a bare xfsVolumeManager over dataPath with empty
-// maps — enough to exercise the marker/map logic (resolveProjectID) and the
-// Destroy teardown path without any live XFS mount or xfs_quota tooling.
+// newXfsManagerForTest builds an xfsVolumeManager over dataPath through the
+// production constructor, with a fake attribute reader in place of the kernel
+// ioctls — enough to exercise the marker/map logic (resolveProjectID) and the
+// Destroy teardown path without any live XFS mount or xfs_quota tooling. Like
+// every manager no Backend is starting, a first-time Destroy runs inline under
+// its budget.
 func newXfsManagerForTest(dataPath string) *xfsVolumeManager {
-	return &xfsVolumeManager{
-		dataPath:          dataPath,
-		mountPoint:        dataPath,
-		logger:            slog.Default(),
-		projectAttributes: fixedXFSProjectAttributeReader{attr: linuxFSXAttr{XFlags: linuxFSXFlagProjInherit}},
-		activeIDs:         make(map[uint32]string),
-		volumeToID:        make(map[string]uint32),
-	}
+	mgr := newXFSVolumeManager(dataPath, dataPath, 0, slog.Default())
+	mgr.projectAttributes = fixedXFSProjectAttributeReader{attr: linuxFSXAttr{XFlags: linuxFSXFlagProjInherit}}
+	return mgr
+}
+
+// heldForTest returns the hold registered for volume, failing the test when
+// there is none.
+func heldForTest(t *testing.T, mgr *xfsVolumeManager, volume string) volumeDeleteHoldView {
+	t.Helper()
+	hold, ok := mgr.VolumeDeleteHolds().holds[volume]
+	require.True(t, ok, "volume %s must be held", volume)
+	return hold
 }
 
 func installLoggingXFSQuota(t *testing.T) string {
@@ -280,7 +290,7 @@ func TestXFSQuotaTaggedRootSkipsTenantWalk(t *testing.T) {
 				return linuxFSXAttr{ProjectID: projID, XFlags: linuxFSXFlagProjInherit}, nil
 			})
 			if operation == "ensure" {
-				require.NoError(t, mgr.EnsureQuota(t.Context(), name, 100))
+				require.NoError(t, ensureQuotaErr(mgr.EnsureQuota(t.Context(), name, 100)))
 			} else {
 				hostPath, created, err := mgr.Create(t.Context(), name, 100)
 				require.NoError(t, err)
@@ -376,7 +386,7 @@ func TestXFSQuotaRootRepairFailsClosed(t *testing.T) {
 				}
 				var err error
 				if operation == "ensure" {
-					err = mgr.EnsureQuota(t.Context(), name, 100)
+					_, err = mgr.EnsureQuota(t.Context(), name, 100)
 				} else {
 					_, _, err = mgr.Create(t.Context(), name, 100)
 				}
@@ -570,7 +580,7 @@ func TestXFSVolumeManagerRejectsDefaultProjectMarkerBeforeMutation(t *testing.T)
 
 	_, _, err := mgr.Create(context.Background(), id, 100)
 	require.ErrorContains(t, err, "project ID 0 is reserved")
-	require.ErrorContains(t, mgr.EnsureQuota(context.Background(), id, 100), "project ID 0 is reserved")
+	require.ErrorContains(t, ensureQuotaErr(mgr.EnsureQuota(context.Background(), id, 100)), "project ID 0 is reserved")
 	require.ErrorContains(t, mgr.loadProjectIDs(), "project ID 0 is reserved")
 	assert.Empty(t, mgr.volumeToID)
 	assert.Empty(t, mgr.activeIDs)
@@ -666,9 +676,9 @@ esac
 	t.Setenv("PATH", binDir)
 
 	before := testutil.ToFloat64(volumeQuotaClearFailedTotal)
-	err := mgr.Destroy(context.Background(), id)
-	require.ErrorContains(t, err, "clear xfs project quota for delete-stage")
-	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	// The final path is durably gone, so the failed clear is a residual hold
+	// and settles the caller; the stage keeps the project ID reserved.
+	require.NoError(t, mgr.Destroy(context.Background(), id))
 
 	assert.NoDirExists(t, dir, "tenant bytes must no longer remain under the live volume name")
 	volumeID, parseErr := parseManagedVolumeName(id)
@@ -682,6 +692,9 @@ esac
 	assert.Equal(t, before+1, testutil.ToFloat64(volumeQuotaClearFailedTotal),
 		"a clear failure must be recorded on the leak counter")
 	assert.Equal(t, uint32(4242), mgr.volumeToID[id], "the project ID must remain reserved for retry")
+	hold := heldForTest(t, mgr, id)
+	assert.True(t, hold.phase == holdPhaseResidual)
+	assert.Equal(t, holdReasonQuotaClearFailed, hold.reason)
 
 	// A crash here loses every in-memory map after the tenant tree is gone but
 	// before quota clear. The sibling must independently rebuild authority and
@@ -690,11 +703,15 @@ esac
 	require.NoError(t, restarted.loadProjectIDs())
 	installLoggingXFSQuota(t)
 	require.NoError(t, restarted.RecoverInterruptedVolumeMutations(t.Context()))
+	require.NoError(t, restarted.RetryHeldVolumeDelete(t.Context(), id))
 	assert.NoDirExists(t, stage.hostPath(dataPath))
 	assert.Empty(t, restarted.volumeToID)
 }
 
-func TestXFSDestroyQuotaClearSurvivesCanceledCaller(t *testing.T) {
+// A Destroy no longer finishes after its caller stops: the hold makes the
+// partial state safe, and the hold executor's retry finishes it, quota clear
+// included.
+func TestXFSDestroyStopsWithItsCallerAndTheRetryFinishes(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 	const (
@@ -708,11 +725,21 @@ func TestXFSDestroyQuotaClearSurvivesCanceledCaller(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	require.NoError(t, mgr.Destroy(ctx, name))
+	err := mgr.Destroy(ctx, name)
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
+	require.ErrorIs(t, err, context.Canceled)
+	hold := heldForTest(t, mgr, name)
+	assert.Equal(t, holdReasonStopped, hold.reason)
+	assert.False(t, hold.phase == holdPhaseResidual)
+	assert.False(t, time.Now().Before(hold.nextAttempt), "a stopped attempt stays due")
+	assert.DirExists(t, dirPath, "a stopped attempt removes nothing more")
+
+	require.NoError(t, mgr.RetryHeldVolumeDelete(t.Context(), name))
 	assert.NoDirExists(t, dirPath)
 	commands, err := os.ReadFile(logPath)
-	require.NoError(t, err, "the detached quota clear must execute despite caller cancellation")
+	require.NoError(t, err)
 	assert.Contains(t, string(commands), xfsLimitClearCmd(projID))
+	assert.Empty(t, mgr.VolumeDeleteHolds().holds)
 }
 
 func TestXFSRejectsForeignProjectIDAuthorityBeforeQuotaMutation(t *testing.T) {
@@ -736,7 +763,7 @@ func TestXFSRejectsForeignProjectIDAuthorityBeforeQuotaMutation(t *testing.T) {
 
 	_, _, err := mgr.Create(t.Context(), victimName, 100)
 	require.ErrorContains(t, err, "already registered to volume")
-	require.ErrorContains(t, mgr.EnsureQuota(t.Context(), victimName, 100), "already registered to volume")
+	require.ErrorContains(t, ensureQuotaErr(mgr.EnsureQuota(t.Context(), victimName, 100)), "already registered to volume")
 	require.ErrorContains(t, mgr.Destroy(t.Context(), victimName), "project ID authority conflicts")
 
 	assert.NoFileExists(t, logPath, "foreign project authority must be rejected before xfs_quota")
@@ -793,8 +820,12 @@ func TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError(t *testing.T) {
 	before := testutil.ToFloat64(volumeQuotaClearFailedTotal)
 
 	err := mgr.Destroy(context.Background(), id)
-	require.Error(t, err, "a RemoveAll failure must surface (bytes still on disk -> caller retries)")
-	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	require.Error(t, err, "a removal failure must surface (bytes still on disk -> caller retries)")
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
+	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending, "a per-volume removal failure must never latch")
+	hold := heldForTest(t, mgr, id)
+	assert.Equal(t, holdReasonUndeletable, hold.reason)
+	assert.False(t, hold.phase == holdPhaseResidual)
 	assert.DirExists(t, dir, "a partial recursive removal retains the managed root for an exact retry")
 	volumeID, parseErr := parseManagedVolumeName(id)
 	require.NoError(t, parseErr)

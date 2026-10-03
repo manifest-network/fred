@@ -24,6 +24,14 @@ const (
 	// ReasonBackendStorageLost marks a lease whose backend an operator
 	// retired as irrecoverably lost; it is authored by the placement store.
 	ReasonBackendStorageLost Reason = "BackendStorageLost"
+	// ReasonVolumeDeletePending marks a provision refused because an earlier
+	// deletion of the lease's own volume is still finishing on the provider.
+	// It is transient on the provider side; the tenant has nothing to retry.
+	ReasonVolumeDeletePending Reason = "VolumeDeletePending"
+	// ReasonVolumeDeletionInProgress marks a closing lease whose volume is
+	// still being deleted by the provider. It is progress, not a failure: the
+	// close completes when the deletion does.
+	ReasonVolumeDeletionInProgress Reason = "VolumeDeletionInProgress"
 	// ReasonUnknown is the read-boundary default for a FAILED lease with no
 	// authored reason (a legacy pre-upgrade record or a future-unmapped
 	// path). gRPC-UNKNOWN-equivalent: "failed, cause unclassified".
@@ -42,4 +50,7 @@ const (
 	MsgVolumeCleanupExhausted = "volume cleanup exhausted"
 	MsgCleanupFailed          = "cleanup failed"
 	MsgBackendStorageLost     = "the backend storage holding this lease was irrecoverably lost"
+	MsgVolumeDeletePending    = "an earlier deletion of this lease's volume is still finishing on the provider"
+	// MsgVolumeDeletionInProgress is ReasonVolumeDeletionInProgress's message.
+	MsgVolumeDeletionInProgress = "this lease's volume is still being deleted; the close completes when it finishes"
 )

@@ -165,14 +165,20 @@ func (b *Backend) reconcileVolumeQuotasUsing(
 		}
 	}
 
-	var applied, failed, absent int
+	// A name with a pending deletion keeps the limits its delete authority set
+	// until the zero-usage proof clears them, and its marker is usually
+	// already gone (ENG-1117): EnsureQuota answers volumeQuotaDeletePending
+	// for it, its own outcome, never "applied".
+	var applied, failed, absent, deletePending int
 	for _, name := range slices.Sorted(maps.Keys(want)) {
 		sizeMB := want[name]
 		if _, ok := existing[name]; !ok {
 			absent++ // expected but not on disk (stateless instance, or already gone)
 			continue
 		}
-		if cerr := ensureQuota(ctx, name, sizeMB); cerr != nil {
+		outcome, cerr := ensureQuota(ctx, name, sizeMB)
+		switch {
+		case cerr != nil:
 			failed++
 			volumeQuotaBackfillTotal.WithLabelValues("failed").Inc()
 			b.logger.Warn("quota backfill: failed to re-apply quota",
@@ -180,14 +186,25 @@ func (b *Backend) reconcileVolumeQuotasUsing(
 			reconcileErrs = append(reconcileErrs, fmt.Errorf(
 				"enforce %s quota for managed volume %q: %w", b.volumes.Kind(), name, cerr,
 			))
-			continue
+		case outcome == volumeQuotaApplied:
+			applied++
+			volumeQuotaBackfillTotal.WithLabelValues("applied").Inc()
+		case outcome == volumeQuotaDeletePending:
+			deletePending++
+			volumeQuotaBackfillTotal.WithLabelValues(quotaBackfillDeletePending).Inc()
+		case outcome == volumeQuotaAbsent:
+			absent++ // listed a moment ago, gone now (e.g. a concurrent deprovision)
+		default:
+			failed++
+			volumeQuotaBackfillTotal.WithLabelValues("failed").Inc()
+			reconcileErrs = append(reconcileErrs, fmt.Errorf(
+				"enforce %s quota for managed volume %q: no quota outcome", b.volumes.Kind(), name,
+			))
 		}
-		applied++
-		volumeQuotaBackfillTotal.WithLabelValues("applied").Inc()
 	}
-	if applied > 0 || failed > 0 {
+	if applied > 0 || failed > 0 || deletePending > 0 {
 		b.logger.Info("volume quota backfill complete", "backend", b.volumes.Kind(),
-			"applied", applied, "failed", failed, "expected_absent", absent)
+			"applied", applied, "failed", failed, "delete_pending", deletePending, "expected_absent", absent)
 	}
 	return errors.Join(reconcileErrs...)
 }

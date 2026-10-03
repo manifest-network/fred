@@ -236,6 +236,9 @@ func (s *OperationSettlement) ReserveProvisionResources(
 	if err != nil {
 		return ProvisionAdmission{}, err
 	}
+	if disk-p.allocatedDisk > 0 && p.diskWithheldLocked() {
+		return ProvisionAdmission{}, ErrDiskAccountingIncomplete
+	}
 	if cpu-p.allocatedCPU > p.availableCPULocked() ||
 		memory-p.allocatedMemory > p.availableMemoryLocked() ||
 		disk-p.allocatedDisk > p.availableDiskLocked() {

@@ -195,7 +195,7 @@ The currently deployed and production-validated execution envelope is
 and ZFS volume implementations have automated coverage but are experimental and
 not deployed; use XFS for production. See [Deployment](DEPLOYMENT.md#filesystem-setup).
 
-Leases are routed to backends using the **`skus`** field — an exact list of on-chain SKU UUIDs. A backend with no `skus` matches nothing (use `default: true` for fallback). When multiple backends match the same SKU, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats.
+Leases are routed to backends using the **`skus`** field — an exact list of on-chain SKU UUIDs. A backend with no `skus` matches nothing (use `default: true` for fallback). When multiple backends match the same SKU, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318), preferring backends that do not report `disk_withheld`. Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats.
 
 ```yaml
 backends:
@@ -740,6 +740,8 @@ The set defined today:
 | `VolumeCleanupExhausted` | Volume cleanup on deprovision failed after exhausting all retry attempts |
 | `CleanupFailed` | Cleanup on deprovision failed (containers or volumes) |
 | `BackendStorageLost` | An operator retired the lease's backend because its storage was irrecoverably lost; the lease is closed (or, if pending, rejected) on chain |
+| `VolumeDeletePending` | A provision was refused because an earlier deletion of the lease's own volume is still finishing on the provider |
+| `VolumeDeletionInProgress` | The lease is closing and its volume is still being deleted by the provider; the close completes when the deletion does |
 | `Unknown` | Read-boundary default: the lease is `failed` but no specific reason was recorded |
 
 `message` is a short, human-readable string for display; it contains no host filesystem paths or

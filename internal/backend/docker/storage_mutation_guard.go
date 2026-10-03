@@ -29,6 +29,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/fsidentity"
+	"github.com/manifest-network/fred/internal/fstree"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -107,20 +108,39 @@ func newBackgroundMaintenanceCoordinator(
 			return ops.volumes.RenameVolume(ctx, oldName, newName)
 		})
 	})
-	ensureVolumeQuota := backgroundVolumeQuota(func(ctx context.Context, id string, sizeMB int64) error {
-		return backend.withManagedVolumeQuota(ctx, id, func(ctx context.Context) error {
+	ensureVolumeQuota := backgroundVolumeQuota(func(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error) {
+		var outcome volumeQuotaOutcome
+		err := backend.withManagedVolumeQuota(ctx, id, func(ctx context.Context) error {
 			return perform(ctx, "background ensure volume quota", func(ctx context.Context) error {
-				return ops.volumes.EnsureQuota(ctx, id, sizeMB)
+				var err error
+				outcome, err = ops.volumes.EnsureQuota(ctx, id, sizeMB)
+				return err
 			})
 		})
+		if err != nil {
+			return 0, err
+		}
+		return outcome, nil
 	})
 	destroyVolumes := backgroundVolumeDestroyCapability{
 		destroyFn: func(ctx context.Context, id string) error {
-			return performVolume(ctx, []string{id}, "background destroy volume", func(ctx context.Context) error {
-				return ops.volumes.Destroy(ctx, id)
-			})
+			if answered, err := backend.precheckDestroy(id); answered {
+				return backend.afterVolumeDestroy(err)
+			}
+			return backend.afterVolumeDestroy(performVolume(ctx, []string{id}, "background destroy volume",
+				func(ctx context.Context) error {
+					return ops.volumes.Destroy(ctx, id)
+				}))
 		},
 	}
+	// The hold executor's retry: the per-lease namespace lock and the
+	// authorize/complete bracket, never the global recovery gate.
+	retryHeldVolumeDelete := backgroundHeldVolumeDeleteRetry(func(ctx context.Context, id string) error {
+		return backend.afterVolumeDestroy(performVolume(ctx, []string{id}, "retry held volume delete",
+			func(ctx context.Context) error {
+				return ops.volumes.RetryHeldVolumeDelete(ctx, id)
+			}))
+	})
 	teardown := backgroundTeardownCapability{
 		downFn: func(ctx context.Context, leaseUUID string, timeout time.Duration) error {
 			return perform(ctx, "background compose down", func(ctx context.Context) error {
@@ -171,6 +191,12 @@ func newBackgroundMaintenanceCoordinator(
 		},
 		runRetentionSweepFn: func(ctx context.Context) error {
 			return backend.runRetentionSweepUsing(ctx, renameVolume, teardown, destroyVolumes, ensureVolumeQuota)
+		},
+		deferVolumeDeletesFn: func(context.Context) volumeDeleteDeferral {
+			return ops.volumes.DeferDeletesUntilExecutorRuns()
+		},
+		retryHeldVolumeDeletesFn: func(ctx context.Context) volumeDeleteHoldPassReport {
+			return backend.runVolumeDeleteHoldPass(ctx, time.Now(), retryHeldVolumeDelete)
 		},
 	}, nil
 }
@@ -475,11 +501,15 @@ func (m *storageMutations) destroyVolume(ctx context.Context, id string) error {
 	if err != nil || !m.volumeNameInScope(name) {
 		return fmt.Errorf("destroy volume target %q differs from Started subject", id)
 	}
-	return m.ops.backend.mutateManagedVolumeNamespace(ctx, []string{id}, func(ctx context.Context) error {
-		return m.runner.Step(ctx, "destroy volume", func(ctx context.Context) error {
-			return m.ops.volumes.Destroy(ctx, id)
-		})
-	})
+	if answered, err := m.ops.backend.precheckDestroy(id); answered {
+		return m.ops.backend.afterVolumeDestroy(err)
+	}
+	return m.ops.backend.afterVolumeDestroy(m.ops.backend.mutateManagedVolumeNamespace(ctx, []string{id},
+		func(ctx context.Context) error {
+			return m.runner.Step(ctx, "destroy volume", func(ctx context.Context) error {
+				return m.ops.volumes.Destroy(ctx, id)
+			})
+		}))
 }
 
 func (m *storageMutations) canDestroyVolumes() bool { return m != nil && m.ops.volumes != nil }
@@ -510,7 +540,7 @@ func (v launchVolume) removeWritablePaths(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		return removeManagedVolumeSubtree(filepath.Dir(v.state.directory.Path()), v.state.name, wp)
+		return removeManagedVolumeSubtree(ctx, filepath.Dir(v.state.directory.Path()), v.state.name, wp)
 	})
 }
 
@@ -867,12 +897,27 @@ func openAttestedManagedVolumeRoot(root *os.Root, volumeID managedVolumeName) (*
 	return volumeRoot, nil
 }
 
-// removeManagedVolumeSubtree performs recursive deletion under an attested
-// managed-volume descriptor. Opening the volume first is load-bearing: rooting
-// one combined "volume/_wp" path at volume_data_path would still permit the
-// volume component to be an in-root symlink to another tenant's volume.
-func removeManagedVolumeSubtree(rootPath string, volumeID managedVolumeName, subtree storagePathComponent) error {
+// removeManagedVolumeSubtree removes one fixed subtree of a live managed
+// volume (the writable-path scaffolding) under an attested managed-volume
+// descriptor. Opening the volume first is load-bearing: rooting one combined
+// "volume/_wp" path at volume_data_path would still permit the volume
+// component to be an in-root symlink to another tenant's volume.
+//
+// The subtree is tenant-shaped, so it is removed with fstree's bounded
+// descriptors and memory. The volume is live, so no cut anchor is ever
+// detached from its quota project here; a cut the kernel refuses is reported
+// as fstree.ErrCutRefused like any other failed wipe.
+func removeManagedVolumeSubtree(
+	ctx context.Context,
+	rootPath string,
+	volumeID managedVolumeName,
+	subtree storagePathComponent,
+) error {
 	validatedSubtree, err := parseStoragePathComponent(string(subtree))
+	if err != nil {
+		return err
+	}
+	name, err := fstree.ParseName(string(validatedSubtree))
 	if err != nil {
 		return err
 	}
@@ -886,7 +931,14 @@ func removeManagedVolumeSubtree(rootPath string, volumeID managedVolumeName, sub
 		return fmt.Errorf("open managed volume %q: %w", volumeID.value(), err)
 	}
 	defer func() { _ = volumeRoot.Close() }()
-	if err := volumeRoot.RemoveAll(string(validatedSubtree)); err != nil {
+	volumeDir, err := volumeRoot.Open(".")
+	if err != nil {
+		return fmt.Errorf("open managed volume %q directory: %w", volumeID.value(), err)
+	}
+	defer func() { _ = volumeDir.Close() }()
+	report, err := fstree.RemoveBeneath(ctx, volumeDir, name, fstree.RemoveOptions{})
+	observeTreeRemoval(treeRemovalSiteWritablePath, report, err)
+	if err != nil {
 		return fmt.Errorf("remove subtree %q from managed volume %q: %w", validatedSubtree, volumeID.value(), err)
 	}
 	return nil
@@ -1279,9 +1331,47 @@ func (m *storageMutations) recoverRestoreNamespaces(ctx context.Context) error {
 			return fmt.Errorf("re-quarantine recovered restore volume %q: %w", volume.canonical, err)
 		}
 	}
-	if len(original) == 0 && len(created) == 0 {
-		return nil
+	// A restore-created volume whose deletion is held answers without the
+	// namespace lock, which the hold executor may be holding; one already gone
+	// needs no destroy (ENG-1117). A held answer keeps the rollback pending,
+	// but only after the locked step below has still returned the interrupted
+	// source's volumes to retention and destroyed every other created volume:
+	// one held scratch volume must not stall either.
+	var deferred []error
+	stillCreated := created[:0]
+	for _, name := range created {
+		answered, err := b.precheckDestroy(name)
+		if !answered {
+			stillCreated = append(stillCreated, name)
+			continue
+		}
+		if err := b.afterVolumeDestroy(err); err != nil {
+			deferred = append(deferred, fmt.Errorf("destroy restore-created volume %q: %w", name, err))
+		}
 	}
+	created = stillCreated
+	if len(original) == 0 && len(created) == 0 {
+		return errors.Join(deferred...)
+	}
+	if err := b.recoverRestoreNamespacesLocked(ctx, m, subject, retention, source, original, created); err != nil {
+		deferred = append(deferred, err)
+	}
+	return errors.Join(deferred...)
+}
+
+// recoverRestoreNamespacesLocked is recoverRestoreNamespaces' locked step:
+// under the namespace and physical exclusion of every name involved, it
+// returns the interrupted source's original volumes to retention and destroys
+// the restore-created volumes that need the lock.
+func (b *Backend) recoverRestoreNamespacesLocked(
+	ctx context.Context,
+	m *storageMutations,
+	subject shared.OperationPhysicalSubject,
+	retention shared.RestoringRetentionProof,
+	source shared.InterruptedRestoreSource,
+	original []restoreVolumeReturn,
+	created []string,
+) error {
 	names := slices.Clone(created)
 	for _, volume := range original {
 		if !slices.Contains(source.RetainedVolumeNames(), volume.retained) ||
@@ -1297,7 +1387,7 @@ func (m *storageMutations) recoverRestoreNamespaces(ctx context.Context) error {
 			return fmt.Errorf("restore namespace recovery target %q differs from Started subject", raw)
 		}
 	}
-	return b.mutateManagedVolumeNamespace(ctx, names, func(ctx context.Context) error {
+	return b.afterVolumeDestroy(b.mutateManagedVolumeNamespace(ctx, names, func(ctx context.Context) error {
 		return m.runner.Step(ctx, "recover exact restore volume namespaces", func(ctx context.Context) error {
 			if _, err := b.retentionStore.ProveRestoringSnapshot(retention.Entry()); err != nil {
 				return fmt.Errorf("re-attest restore source before namespace recovery: %w", err)
@@ -1385,5 +1475,5 @@ func (m *storageMutations) recoverRestoreNamespaces(ctx context.Context) error {
 			}
 			return nil
 		})
-	})
+	}))
 }

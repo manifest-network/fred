@@ -40,11 +40,26 @@ func seedCloseDeprovisionLeaseWithCallback(
 	callbackURL string,
 ) {
 	t.Helper()
+	seedCloseLeaseFixture(t, b, stores, closeDeprovisionLeaseUUID, callbackURL, 1)
+}
+
+// seedCloseLeaseFixture seeds a Ready lease with one "app" service of
+// quantity instances, its projection and its active release, ready for a
+// close.
+func seedCloseLeaseFixture(
+	t *testing.T,
+	b *Backend,
+	stores closeRecoveryStores,
+	leaseUUID string,
+	callbackURL string,
+	quantity int,
+) {
+	t.Helper()
 	if callbackURL == "" {
 		callbackURL = testOperationCallbackURL("https://callbacks.invalid/callbacks/provision")
 	}
 	items := []backend.LeaseItem{{
-		SKU: "docker-small", ServiceName: "app", Quantity: 1,
+		SKU: "docker-small", ServiceName: "app", Quantity: quantity,
 	}}
 	payload := validStackManifestJSON(map[string]string{
 		"app": "docker.io/library/nginx:1.27",
@@ -68,13 +83,13 @@ func seedCloseDeprovisionLeaseWithCallback(
 	require.NoError(t, authorityErr)
 	runtimeAuthority = &authority
 	b.provisionsMu.Lock()
-	b.provisions[closeDeprovisionLeaseUUID] = &provision{
+	b.provisions[leaseUUID] = &provision{
 		ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:            closeDeprovisionLeaseUUID,
+			LeaseUUID:            leaseUUID,
 			Tenant:               "tenant-a",
 			ProviderUUID:         closeDeprovisionProviderUUID,
 			Items:                items,
-			Quantity:             1,
+			Quantity:             quantity,
 			StackManifest:        stack,
 			Status:               backend.ProvisionStatusReady,
 			CallbackURL:          callbackURL,
@@ -96,7 +111,7 @@ func seedCloseDeprovisionLeaseWithCallback(
 	}
 	seedProvisionReleaseForLeaseTest(
 		t, stores.callbacks, stores.releases, stores.operations,
-		closeDeprovisionLeaseUUID, release,
+		leaseUUID, release,
 	)
 }
 

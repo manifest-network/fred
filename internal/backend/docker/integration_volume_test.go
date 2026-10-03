@@ -1379,10 +1379,11 @@ func TestIntegration_XFS_InterruptedCreateStageRecoveryClearsQuota(t *testing.T)
 
 // TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode exercises
 // the kernel behavior behind the durable delete protocol. An open descriptor
-// keeps an unlinked project-tagged inode (and its usage) alive. Recovery must
-// normalize a replayed pre-reset tombstone to project 0, remove the namespace,
-// refuse to clear the old dquot while that inode remains, then converge after a
-// process restart once the descriptor is closed.
+// keeps an unlinked project-tagged inode (and its usage) alive. Startup
+// registers the replayed pre-reset tombstone as a hold without touching it;
+// the hold executor's retry normalizes it to project 0, removes the namespace,
+// refuses to clear the old dquot while that inode remains (a residual hold),
+// and converges once the descriptor is closed, also across a restart.
 func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing.T) {
 	mount := setupXFSLoopback(t)
 	dataPath := filepath.Join(mount, "volumes")
@@ -1423,7 +1424,7 @@ func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing
 	require.NoError(t, parent.Sync())
 	require.NoError(t, parent.Close())
 
-	// Reproduce marker-first partial RemoveAll while tenant data and its open FD
+	// Reproduce marker-first partial removal while tenant data and its open FD
 	// remain. Only the typed sibling carries the collision-probed project ID.
 	require.NoError(t, os.Remove(filepath.Join(volumePath, projectIDFile)))
 	volumeDir, err := os.Open(volumePath)
@@ -1434,14 +1435,27 @@ func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing
 	restarted, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, restarted.Validate())
-	require.ErrorContains(t, restarted.RequireNoInterruptedVolumeMutations(ctx), deleteStage.value())
-	err = restarted.RecoverInterruptedVolumeMutations(ctx)
+	require.ErrorContains(t, restarted.RequireNoInterruptedVolumeMutations(ctx), deleteStage.value(),
+		"the exclusive commands still refuse a held deletion")
+	require.NoError(t, restarted.RequireNoUnheldVolumeMutations(ctx), "Start accepts a held deletion")
+	require.NoError(t, restarted.RecoverInterruptedVolumeMutations(ctx))
+	assert.DirExists(t, volumePath, "Start never removes tenant data itself")
+
+	retryCtx, cancelRetry := context.WithTimeout(ctx, 5*time.Second)
+	err = restarted.RetryHeldVolumeDelete(retryCtx, volumeName)
+	cancelRetry()
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
 	require.ErrorContains(t, err, "refuse to clear xfs project quota")
+	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	hold := restarted.VolumeDeleteHolds().holds[volumeName]
+	assert.True(t, hold.phase == holdPhaseResidual, "the namespace is durably gone; only the project remains")
+	assert.Equal(t, holdReasonUsageNonzero, hold.reason)
+	assert.Positive(t, hold.footprintMB, "the residual hold accounts the project's hard limit")
 	assert.NoDirExists(t, volumePath, "namespace deletion may finish while the FD remains open")
 	assert.DirExists(t, deleteStagePath, "nonzero kernel usage must retain durable cleanup authority")
 	assert.True(t, xfsReportListsProject(t, mount, projID), "nonzero open-inode usage must retain the dquot")
 
-	// Recovery must have repaired the replayed pre-reset sibling before its zero
+	// The retry must have repaired the replayed pre-reset sibling before its zero
 	// proof. Read the typed kernel attribute rather than xfsprogs report prose.
 	deleteStageRoot, err := os.OpenRoot(deleteStagePath)
 	require.NoError(t, err)
@@ -1456,10 +1470,178 @@ func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing
 	require.NoError(t, err)
 	require.NoError(t, restartedAgain.Validate())
 	require.NoError(t, restartedAgain.RecoverInterruptedVolumeMutations(ctx))
+	require.True(t, restartedAgain.VolumeDeleteHolds().holds[volumeName].phase == holdPhaseResidual,
+		"Start sizes a recovered deletion whose final path is gone")
+	retryCtx, cancelRetry = context.WithTimeout(ctx, 10*time.Second)
+	require.NoError(t, restartedAgain.RetryHeldVolumeDelete(retryCtx, volumeName))
+	cancelRetry()
 	require.NoError(t, restartedAgain.RequireNoInterruptedVolumeMutations(ctx))
 	assert.NoDirExists(t, deleteStagePath)
 	assert.False(t, xfsReportListsProject(t, mount, projID),
-		"last-close recovery must clear the dquot and tombstone")
+		"the retry after the last close must clear the dquot and tombstone")
+}
+
+const xfsDeepChainChildEnv = "FRED_INTEGRATION_XFS_DEEP_CHAIN_CHILD"
+
+// TestIntegration_XFS_DestroyDeletesChainDeeperThanFDLimit pins ENG-1117 on a
+// real XFS project-quota volume: a tenant chain deeper than RLIMIT_NOFILE used
+// to fail every deletion with EMFILE. The chain is built and the volume
+// destroyed in a child process whose soft RLIMIT_NOFILE is 512.
+func TestIntegration_XFS_DestroyDeletesChainDeeperThanFDLimit(t *testing.T) {
+	if os.Getenv(xfsDeepChainChildEnv) == "1" {
+		destroyDeepXFSChainUnderLowFDLimit(t)
+		return
+	}
+	if os.Getuid() != 0 {
+		t.Skip("xfs loopback requires root")
+	}
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	command := exec.CommandContext(t.Context(), executable,
+		"-test.run=^TestIntegration_XFS_DestroyDeletesChainDeeperThanFDLimit$", "-test.v")
+	command.Env = append(os.Environ(), xfsDeepChainChildEnv+"=1")
+	output, err := command.CombinedOutput()
+	if strings.Contains(string(output), "--- SKIP: TestIntegration_XFS_DestroyDeletesChainDeeperThanFDLimit") {
+		t.Skipf("child skipped:\n%s", output)
+	}
+	require.NoError(t, err, "%s", output)
+	require.Contains(t, string(output), "--- PASS: TestIntegration_XFS_DestroyDeletesChainDeeperThanFDLimit (")
+}
+
+func destroyDeepXFSChainUnderLowFDLimit(t *testing.T) {
+	const depth = 4096
+	mount := setupXFSLoopback(t)
+	dataPath := filepath.Join(mount, "volumes")
+	require.NoError(t, os.MkdirAll(dataPath, 0o700))
+	ctx := context.Background()
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.Validate())
+	volumeName := canonicalVolumeName("550e8400-e29b-41d4-a716-44665544010c", "app", 0)
+	volumePath, _, err := mgr.Create(ctx, volumeName, 64)
+	require.NoError(t, err)
+	projID, err := readProjectIDFile(volumePath)
+	require.NoError(t, err)
+	buildDirectoryChain(t, volumePath, writablePathSubdir, depth)
+	controlPath := filepath.Join(mount, "control")
+	require.NoError(t, os.Mkdir(controlPath, 0o700))
+	buildDirectoryChain(t, controlPath, "chain", depth)
+
+	var limit syscall.Rlimit
+	require.NoError(t, syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit))
+	require.NoError(t, syscall.Setrlimit(syscall.RLIMIT_NOFILE, &syscall.Rlimit{Cur: 512, Max: limit.Max}))
+	t.Cleanup(func() { _ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &limit) })
+
+	controlRoot, err := os.OpenRoot(controlPath)
+	require.NoError(t, err)
+	// Control: the unbounded remover ENG-1117 replaced.
+	controlErr := controlRoot.RemoveAll("chain")
+	require.NoError(t, controlRoot.Close())
+	require.ErrorIs(t, controlErr, syscall.EMFILE, "control: Go's RemoveAll needs one descriptor per level")
+
+	destroyCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	require.NoError(t, volDestroyer(t, mgr).Destroy(destroyCtx, volumeName))
+	assert.NoDirExists(t, volumePath)
+	assert.Empty(t, mgr.VolumeDeleteHolds().holds)
+	requireXFSProjectEventuallyAbsent(t, mount, projID)
+}
+
+// setXFSFileProjectID tags one file with projID through the fsxattr ioctl, as
+// a tenant could before ENG-1118: an inode outside the volume charged to it.
+func setXFSFileProjectID(t *testing.T, path string, projID uint32) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer func() { _ = file.Close() }()
+	var attr linuxFSXAttr
+	require.Zero(t, xfsAttributeIoctl(int(file.Fd()), linuxFSIOCFSGetXAttr, &attr))
+	attr.ProjectID = projID
+	require.Zero(t, xfsAttributeIoctl(int(file.Fd()), linuxFSIOCFSSetXAttr, &attr))
+}
+
+// TestIntegration_XFS_DestroyHoldsForeignTaggedInodeUsage pins the residual
+// hold on the real kernel: an inode outside the volume charged to its project
+// keeps the project's usage nonzero after the volume is gone. Destroy settles
+// its caller, the hold keeps the stage, the project ID and its limits, the name
+// cannot be recreated, and once the planted inode is deleted the retry clears
+// everything.
+func TestIntegration_XFS_DestroyHoldsForeignTaggedInodeUsage(t *testing.T) {
+	mount := setupXFSLoopback(t)
+	dataPath := filepath.Join(mount, "volumes")
+	require.NoError(t, os.MkdirAll(dataPath, 0o700))
+	ctx := context.Background()
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.Validate())
+	volumeName := canonicalVolumeName("550e8400-e29b-41d4-a716-44665544010d", "app", 0)
+	volumePath, _, err := mgr.Create(ctx, volumeName, 20)
+	require.NoError(t, err)
+	projID, err := readProjectIDFile(volumePath)
+	require.NoError(t, err)
+	stage := mustXFSDeleteStage(t, projID, volumeName)
+
+	planted := filepath.Join(mount, "planted")
+	writeIncompressibleMiB(t, planted, 1)
+	setXFSFileProjectID(t, planted, projID)
+
+	require.NoError(t, volDestroyer(t, mgr).Destroy(ctx, volumeName),
+		"the volume's namespace is durably gone, so its caller settles")
+	hold, held := mgr.VolumeDeleteHolds().holds[volumeName]
+	require.True(t, held)
+	assert.True(t, hold.phase == holdPhaseResidual)
+	assert.Equal(t, holdReasonUsageNonzero, hold.reason)
+	assert.Equal(t, int64(20), hold.footprintMB, "the hold accounts the project's 20 MiB hard limit")
+	assert.NoDirExists(t, volumePath)
+	assert.DirExists(t, stage.hostPath(dataPath))
+	assert.True(t, xfsReportListsProject(t, mount, projID), "the limits stay while the project still charges usage")
+	_, _, err = mgr.Create(ctx, volumeName, 20)
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld, "the held name cannot be recreated")
+
+	require.NoError(t, os.Remove(planted))
+	retryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	require.NoError(t, mgr.RetryHeldVolumeDelete(retryCtx, volumeName))
+	assert.NoDirExists(t, stage.hostPath(dataPath))
+	assert.Empty(t, mgr.VolumeDeleteHolds().holds)
+	requireXFSProjectEventuallyAbsent(t, mount, projID)
+}
+
+// TestIntegration_XFS_DestroyCutsChainDeeperThanMaxDepth removes a chain deeper
+// than fstree's ancestry bound (65,536 levels) from a PROJINHERIT volume on
+// real XFS: fstree cuts the deeper subtree into the anchor, which the condemned
+// volume first detaches from its project, and the deletion completes and clears
+// the dquot. 70,000 levels fit the 262,144-inode floor.
+func TestIntegration_XFS_DestroyCutsChainDeeperThanMaxDepth(t *testing.T) {
+	mount := setupXFSLoopback(t)
+	dataPath := filepath.Join(mount, "volumes")
+	require.NoError(t, os.MkdirAll(dataPath, 0o700))
+	ctx := context.Background()
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.Validate())
+	volumeName := canonicalVolumeName("550e8400-e29b-41d4-a716-44665544010e", "app", 0)
+	volumePath, _, err := mgr.Create(ctx, volumeName, 64)
+	require.NoError(t, err)
+	projID, err := readProjectIDFile(volumePath)
+	require.NoError(t, err)
+	buildDirectoryChain(t, volumePath, writablePathSubdir, 70_000)
+
+	cuts := treeRemovalCutsTotal.WithLabelValues(treeRemovalSiteDeleteStage)
+	before := testutil.ToFloat64(cuts)
+	// A chain this deep can outlast the inline budget; the executor's retries
+	// then finish it, exactly as in production.
+	destroyErr := volDestroyer(t, mgr).Destroy(ctx, volumeName)
+	for attempt := 0; errors.Is(destroyErr, ErrVolumeDeleteHeld) && attempt < 40; attempt++ {
+		retryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		destroyErr = mgr.RetryHeldVolumeDelete(retryCtx, volumeName)
+		cancel()
+	}
+	require.NoError(t, destroyErr)
+	assert.Greater(t, testutil.ToFloat64(cuts), before, "a chain past the bound must be cut, not refused")
+	assert.NoDirExists(t, volumePath)
+	assert.Empty(t, mgr.VolumeDeleteHolds().holds)
+	requireXFSProjectEventuallyAbsent(t, mount, projID)
 }
 
 // TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin is the ENG-454 regression.
@@ -1602,7 +1784,7 @@ func TestIntegration_XFS_EnsureQuota_RepairsRootForNewWrites(t *testing.T) {
 	require.Error(t, uerr, "an untagged volume must not be measurable before backfill")
 
 	// Repair only the root via EnsureQuota (what reconcileVolumeQuotas invokes).
-	require.NoError(t, mgr.EnsureQuota(ctx, volName, capMiB))
+	require.NoError(t, ensureQuotaErr(mgr.EnsureQuota(ctx, volName, capMiB)))
 
 	// Historical bytes must not be recursively charged to the repaired root.
 	used, err := mgr.Usage(ctx, volName)

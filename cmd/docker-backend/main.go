@@ -1170,6 +1170,9 @@ type StatsResponse struct {
 	AvailableMemoryMB int64   `json:"available_memory_mb"`
 	AvailableDiskMB   int64   `json:"available_disk_mb"`
 	ActiveContainers  int     `json:"active_containers"`
+	// DiskWithheld mirrors backend.LoadStats.DiskWithheld: no disk-bearing
+	// allocation is admitted while it is set.
+	DiskWithheld bool `json:"disk_withheld,omitempty"`
 }
 
 // StatusResponse is a simple status response.
@@ -1280,6 +1283,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		AvailableMemoryMB: stats.AvailableMemoryMB(),
 		AvailableDiskMB:   stats.AvailableDiskMB(),
 		ActiveContainers:  load.ActiveContainers,
+		DiskWithheld:      load.DiskWithheld,
 	})
 }
 

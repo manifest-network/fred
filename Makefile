@@ -110,10 +110,11 @@ test-volume:
 	@echo "Running volume unit tests..."
 	$(GOTEST) -v ./internal/backend/docker/ -run "TestDoProvision_Stateful|TestDoProvision_Volume|TestDoProvision_Cleanup|TestProvision_ReProvisionKeeps|TestDeprovision_Destroys|TestDeprovision_Volume|TestCleanupOrphaned"
 
-# Run Docker integration tests (requires Docker daemon)
+# Run Docker integration tests (requires Docker daemon), plus fstree's mount
+# boundary tests (requires root), so CI's SKIP guard covers both.
 test-integration:
 	@echo "Running Docker integration tests..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run Integration -timeout $(INTEGRATION_TIMEOUT)
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ ./internal/fstree/ -run Integration -timeout $(INTEGRATION_TIMEOUT)
 
 # Run stack integration tests (requires Docker daemon)
 test-integration-stack:

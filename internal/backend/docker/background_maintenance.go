@@ -24,9 +24,31 @@ type backgroundMaintenanceCoordinator struct {
 	cleanupOrphanedNetworksFn   func(context.Context)
 	reapExpiredRetentionsFn     func(context.Context) (int, error)
 	runRetentionSweepFn         func(context.Context) error
+	deferVolumeDeletesFn        func(context.Context) volumeDeleteDeferral
+	retryHeldVolumeDeletesFn    func(context.Context) volumeDeleteHoldPassReport
+}
+
+// retryHeldVolumeDeletes runs one hold-executor pass over the manager's due
+// held deletions. The targets come from the manager's own hold table, never
+// from the caller.
+func (c *backgroundMaintenanceCoordinator) retryHeldVolumeDeletes(ctx context.Context) volumeDeleteHoldPassReport {
+	if c == nil || c.retryHeldVolumeDeletesFn == nil {
+		return volumeDeleteHoldPassReport{}
+	}
+	return c.retryHeldVolumeDeletesFn(ctx)
 }
 
 var errBackgroundMaintenanceUnavailable = errors.New("background maintenance coordinator is unavailable")
+
+// deferVolumeDeletesUntilExecutorRuns opens Start's deferral of the volume
+// manager's first-time deletions (see volumeDeleteDeferral). Backend.Start is
+// its only caller. A coordinator without the workflow defers nothing.
+func (c *backgroundMaintenanceCoordinator) deferVolumeDeletesUntilExecutorRuns(ctx context.Context) volumeDeleteDeferral {
+	if c == nil || c.deferVolumeDeletesFn == nil {
+		return volumeDeleteDeferral{}
+	}
+	return c.deferVolumeDeletesFn(ctx)
+}
 
 func (c *backgroundMaintenanceCoordinator) recoverInterruptedVolumes(ctx context.Context) error {
 	if c == nil || c.recoverInterruptedVolumesFn == nil {
@@ -92,9 +114,13 @@ func (c *backgroundMaintenanceCoordinator) runRetentionSweep(ctx context.Context
 // tree of one fixed workflow. Unlike the removed residual facade, no value of
 // these types is retained by Backend or returned to a caller.
 type backgroundVolumeRename func(context.Context, string, string) error
-type backgroundVolumeQuota func(context.Context, string, int64) error
+type backgroundVolumeQuota func(context.Context, string, int64) (volumeQuotaOutcome, error)
 type backgroundContainerRemove func(context.Context, string) error
 type backgroundTenantNetworkRemove func(context.Context, string) (tenantNetworkRemoval, error)
+
+// backgroundHeldVolumeDeleteRetry retries one held deletion through the
+// storage-mutation bracket. Only the hold executor's pass receives one.
+type backgroundHeldVolumeDeleteRetry func(context.Context, string) error
 
 // backgroundTeardownCapability is captured privately by the retention
 // reconciliation closure. It satisfies teardownMutationCapability without

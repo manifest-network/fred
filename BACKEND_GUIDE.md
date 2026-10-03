@@ -87,7 +87,7 @@ new work is admitted. An unchanged topology retains its established baseline
 through a transient node outage. Never bind replacement storage to a historical
 name—give every replacement a new unique name.
 
-**Load-balanced placement:** Multiple backends can share the same `skus` list. When this happens, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. Fred records a placement (lease->backend) so that subsequent read operations (connection details, logs, diagnostics) reach the correct machine. `providerd` requires `placement_store_db_path` in every mode, including single-backend development, because ambiguous responses and restart recovery still require durable ownership evidence.
+**Load-balanced placement:** Multiple backends can share the same `skus` list. When this happens, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318), preferring backends that do not report `disk_withheld`. Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. Fred records a placement (lease->backend) so that subsequent read operations (connection details, logs, diagnostics) reach the correct machine. `providerd` requires `placement_store_db_path` in every mode, including single-backend development, because ambiguous responses and restart recovery still require durable ownership evidence.
 
 ### Level 2: Backend Interprets Full SKU
 
@@ -994,6 +994,13 @@ operation's resource authority, and document whether the reservation is
 conservative. The Docker backend implements this (durable `disk_mb` or its
 mutually exclusive pinned diskless scratch). The mock backend returns its
 configured in-memory snapshot, or a zero-valued snapshot when none is set.
+
+Optional `"disk_withheld": true` reports that the backend currently admits no
+disk-bearing allocation (the Docker backend sets it while a footprint of unknown
+size remains on its disk). Fred cannot tell which SKUs carry disk, so its
+least-loaded routing prefers any candidate that does not report it, and
+compares withheld candidates only when every candidate is withheld. Omit the
+field, or send `false`, when disk is admitted.
 
 ## Exact maintenance completion
 

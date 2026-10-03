@@ -699,14 +699,18 @@ func (b *Backend) sampleActorMetrics() {
 	}
 }
 
-// sampleCloseIntentMetrics projects the non-expiring close journal into two
-// low-cardinality gauges. A read failure preserves the last known values: zeroing
-// them would falsely report that destructive work completed. The callback-store
-// error counter and health check carry the read failure itself.
+// sampleCloseIntentMetrics projects the non-expiring close journal into
+// low-cardinality gauges: the count, the oldest age, how many closes wait only
+// on held volume deletions, and the oldest age among those that do not. A read
+// failure preserves the last known values: zeroing them would falsely report
+// that destructive work completed. The callback-store error counter and health
+// check carry the read failure itself.
 func (b *Backend) sampleCloseIntentMetrics(now time.Time) {
 	if b.callbackStore == nil {
 		pendingCloseIntents.Set(0)
 		oldestCloseIntentAgeSeconds.Set(0)
+		oldestUnheldCloseIntentAgeSeconds.Set(0)
+		closeIntentsDeleteHeld.Set(0)
 		return
 	}
 	claims, err := b.closeSettlement.ListCloseIntents()
@@ -716,21 +720,34 @@ func (b *Backend) sampleCloseIntentMetrics(now time.Time) {
 	}
 
 	pendingCloseIntents.Set(float64(len(claims)))
-	if len(claims) == 0 {
-		oldestCloseIntentAgeSeconds.Set(0)
-		return
-	}
-	oldest := claims[0].CreatedAt()
-	for _, claim := range claims[1:] {
-		if claim.CreatedAt().Before(oldest) {
-			oldest = claim.CreatedAt()
+	holds := b.volumes.VolumeDeleteHolds()
+	deleteHeld := 0
+	var oldest, oldestUnheld time.Time
+	for _, claim := range claims {
+		created := claim.CreatedAt()
+		if oldest.IsZero() || created.Before(oldest) {
+			oldest = created
+		}
+		if b.closeAwaitsHeldDeletes(claim, holds) {
+			deleteHeld++
+			continue
+		}
+		if oldestUnheld.IsZero() || created.Before(oldestUnheld) {
+			oldestUnheld = created
 		}
 	}
-	age := now.Sub(oldest)
-	if age < 0 {
-		age = 0
+	closeIntentsDeleteHeld.Set(float64(deleteHeld))
+	oldestCloseIntentAgeSeconds.Set(closeIntentAgeSeconds(now, oldest))
+	oldestUnheldCloseIntentAgeSeconds.Set(closeIntentAgeSeconds(now, oldestUnheld))
+}
+
+// closeIntentAgeSeconds is now - created in seconds, 0 for no close (the zero
+// time) and never negative.
+func closeIntentAgeSeconds(now, created time.Time) float64 {
+	if created.IsZero() {
+		return 0
 	}
-	oldestCloseIntentAgeSeconds.Set(age.Seconds())
+	return max(now.Sub(created), 0).Seconds()
 }
 
 // sampleLeaseMutationCapacityMetrics projects both O(1) durable callback
@@ -774,6 +791,7 @@ func (b *Backend) actorMetricsSampleLoop() {
 			b.sampleActorMetrics()
 			b.sampleCloseIntentMetrics(time.Now())
 			b.sampleLeaseMutationCapacityMetrics()
+			b.sampleVolumeDeleteHoldMetrics()
 		}
 	}
 }

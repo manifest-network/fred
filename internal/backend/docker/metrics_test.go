@@ -41,11 +41,14 @@ func TestSampleCloseIntentMetrics_ReportsAggregateCountAndOldestAge(t *testing.T
 	b.sampleCloseIntentMetrics(claim.CreatedAt().Add(2 * time.Minute))
 	assert.Equal(t, float64(1), testutil.ToFloat64(pendingCloseIntents))
 	assert.InDelta(t, 120, testutil.ToFloat64(oldestCloseIntentAgeSeconds), 0.1)
+	assert.InDelta(t, 120, testutil.ToFloat64(oldestUnheldCloseIntentAgeSeconds), 0.1,
+		"a close with no held deletion ages the unheld gauge too")
 
 	completeDestroyedCloseForTest(t, b, stores.close, claim)
 	b.sampleCloseIntentMetrics(time.Now())
 	assert.Equal(t, float64(0), testutil.ToFloat64(pendingCloseIntents))
 	assert.Equal(t, float64(0), testutil.ToFloat64(oldestCloseIntentAgeSeconds))
+	assert.Equal(t, float64(0), testutil.ToFloat64(oldestUnheldCloseIntentAgeSeconds))
 }
 
 func TestSampleLeaseMutationCapacityMetricsIncludesPermanentClosedUUID(t *testing.T) {
