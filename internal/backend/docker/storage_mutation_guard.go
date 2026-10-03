@@ -192,7 +192,7 @@ func newBackgroundMaintenanceCoordinator(
 		runRetentionSweepFn: func(ctx context.Context) error {
 			return backend.runRetentionSweepUsing(ctx, renameVolume, teardown, destroyVolumes, ensureVolumeQuota)
 		},
-		deferVolumeDeletesFn: func() volumeDeleteDeferral {
+		deferVolumeDeletesFn: func(context.Context) volumeDeleteDeferral {
 			return ops.volumes.DeferDeletesUntilExecutorRuns()
 		},
 		retryHeldVolumeDeletesFn: func(ctx context.Context) volumeDeleteHoldPassReport {

@@ -2711,7 +2711,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	// it without an attempt, so Start never waits on a tenant tree (ENG-1117).
 	// The deferral is Start's own: it ends when the executor starts below, or
 	// when Start returns before that.
-	deleteDeferral := b.backgroundMaintenance.deferVolumeDeletesUntilExecutorRuns()
+	deleteDeferral := b.backgroundMaintenance.deferVolumeDeletesUntilExecutorRuns(ctx)
 	defer deleteDeferral.End()
 	initialCtx, cancelInitial := b.recoveryDockerReadContext(ctx)
 	defer cancelInitial()
