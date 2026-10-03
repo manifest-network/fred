@@ -260,7 +260,7 @@ Rules:
 - `retries` must be ≥ 0.
 - Duration fields (`interval`, `timeout`, `start_period`) accept Go duration strings (`"30s"`, `"1m30s"`, `"500ms"`) or integer nanoseconds.
 - Each duration must be `0` (or omitted), which uses the image's or Docker's default, or at least `1ms` (Docker's minimum). Negative values and nonzero values below `1ms` (for example `"500us"` or `999999`) are rejected when the manifest is submitted.
-- When a health check is present, the backend waits for all containers to report `healthy` before sending a success callback.
+- When a health check is present, the backend waits for all containers to report `healthy` before sending a success callback. A container that reports `unhealthy` before it ever passed fails the deployment (`HealthCheckFailed`); once it has passed, it is watched only for crashes while the rest of the stack starts.
 - A health check defined in the Dockerfile but **not** in the manifest does not trigger health-aware startup verification — the manifest is the contract.
 
 ```json
