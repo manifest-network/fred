@@ -78,7 +78,9 @@ func (b *Backend) newStartupFailure(
 	}
 	terms := shared.OperationStartupFailureTerms{
 		Reason: watch.surface.reason, Message: watch.surface.callback, Detail: watch.surface.cause.Error(),
-		InstanceID: info.ContainerID, Service: watch.container.service, Degraded: launch.degraded(),
+		// The receipt alone decides whether the finding may count: a degraded
+		// preparation or a rejected exchange never does.
+		InstanceID: info.ContainerID, Service: watch.container.service, Degraded: launch.uncounted(),
 	}
 	switch watch.verdict {
 	case startupVerdictExited:

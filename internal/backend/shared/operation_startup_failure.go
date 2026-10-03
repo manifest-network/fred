@@ -13,7 +13,7 @@ import (
 // rolled back exactly. It carries what the lease state machine needs to
 // attribute the failure (what was observed, the substrate's termination of the
 // container, the live provenance of its death, and whether the platform
-// degraded the launch), never a cause: attribution happens in the state
+// degraded or did not complete the launch), never a cause: attribution happens in the state
 // machine's provision-failure entry action. The zero value is invalid.
 type OperationStartupFailure struct{ state *operationStartupFailureState }
 
@@ -70,8 +70,10 @@ type OperationStartupFailureTerms struct {
 	Provenance failurecause.Provenance
 	ExitCode   int
 	OOMKilled  bool
-	// Degraded marks a launch the platform did not complete as planned (for
-	// example, writable-path seeding skipped): its failure never counts.
+	// Degraded marks a launch the platform did not complete as planned: part
+	// of its preparation was skipped (for example, writable-path seeding), or
+	// its launch exchange was rejected (Compose reported a failure, or the
+	// container runtime refused a Start). Its failure never counts.
 	Degraded bool
 }
 

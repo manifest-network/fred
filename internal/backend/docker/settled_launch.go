@@ -77,14 +77,27 @@ func (d launchDegradations) String() string {
 	return strings.Join(members, ",")
 }
 
-// launchCompletion is the closed account of how completely a launch was
-// prepared. A degraded launch skipped part of the platform's own preparation,
-// so its startup failure never counts (ENG-1125). The zero value is invalid.
+// launchCompletion is the closed account of how completely the platform
+// carried a launch out. Only a complete launch can produce a startup failure
+// that counts (ENG-1125): a degraded launch skipped part of the platform's own
+// preparation, and a rejected launch is one whose exchange the platform did
+// not complete. newSettledLaunch derives it once from the preparation and the
+// exchange, so a rejected exchange is never complete. The zero value is
+// invalid.
 type launchCompletion uint8
 
 const (
+	// launchComplete: every preparation step completed and every Create and
+	// Start succeeded.
 	launchComplete launchCompletion = iota + 1
+	// launchDegraded: the exchange launched everything, but part of the
+	// platform's own preparation was skipped.
 	launchDegraded
+	// launchRejected: the exchange settled with an error (Compose reported a
+	// failure, or the daemon refused the Start of a member). Some of the stack
+	// may never have run, so an exit seen next to it may be a consequence of
+	// what the platform did not start.
+	launchRejected
 )
 
 // launchExchange is the closed account of how a settled launch exchange
@@ -107,8 +120,9 @@ const (
 // or was rejected. It is bound to the exact per-execution mutation facade that
 // launched, and carries the positive facts of that launch: how the exchange
 // ended, the containers whose Start the daemon refused with a final response,
-// the canonical volumes its Create reported created, and whether its
-// preparation completed.
+// the canonical volumes its Create reported created, and whether the platform
+// completed the launch (launchCompletion). A rejected receipt is never
+// complete, so no startup finding minted from it can count.
 //
 // Only the launch dispatch mints one (newSettledLaunch, confined by
 // internal/testutil). The zero value is invalid: no startup finding can be
@@ -135,17 +149,21 @@ func newSettledLaunch(q *quiescedVolumes, outcome daemonLaunchOutcome) settledLa
 		}
 	}
 	slices.Sort(created)
-	completion := launchComplete
-	if !q.degradations.empty() {
-		completion = launchDegraded
-	}
 	exchange := launchExchangeLaunched
 	var refused []string
-	if outcome.err != nil {
+	if outcome.err != nil || len(outcome.refusedStarts) != 0 {
+		// A refused Start rejects the exchange even if Compose reported none.
 		exchange = launchExchangeRejected
 		refused = slices.Clone(outcome.refusedStarts)
 		slices.Sort(refused)
 		refused = slices.Compact(refused)
+	}
+	completion := launchComplete
+	switch {
+	case exchange != launchExchangeLaunched:
+		completion = launchRejected
+	case !q.degradations.empty():
+		completion = launchDegraded
 	}
 	return settledLaunch{state: &settledLaunchState{
 		mutations: q.mutations, exchange: exchange, refusedStarts: refused,
@@ -155,9 +173,17 @@ func newSettledLaunch(q *quiescedVolumes, outcome daemonLaunchOutcome) settledLa
 
 // boundTo reports whether the receipt is real and was minted for mutations.
 func (l settledLaunch) boundTo(mutations *storageMutations) bool {
-	return l.state != nil && mutations != nil && l.state.mutations == mutations &&
-		(l.state.completion == launchComplete || l.state.completion == launchDegraded) &&
-		(l.state.exchange == launchExchangeLaunched || l.state.exchange == launchExchangeRejected)
+	if l.state == nil || mutations == nil || l.state.mutations != mutations {
+		return false
+	}
+	switch l.state.exchange {
+	case launchExchangeLaunched:
+		return l.state.completion == launchComplete || l.state.completion == launchDegraded
+	case launchExchangeRejected:
+		return l.state.completion == launchRejected
+	default:
+		return false
+	}
 }
 
 // rejected reports whether the settled exchange ended in an error. An invalid
@@ -185,10 +211,13 @@ func (l settledLaunch) createdVolumes() []string {
 	return slices.Clone(l.state.created)
 }
 
-// degraded reports whether the launch's preparation was incomplete. An
-// invalid receipt reads as degraded, which never counts.
-func (l settledLaunch) degraded() bool {
-	return l.state == nil || l.state.completion != launchComplete
+// uncounted reports whether a startup failure of this launch must never
+// count: its preparation was degraded, or its exchange was rejected. Only a
+// launch the platform completed can count. An invalid receipt reads as
+// uncounted.
+func (l settledLaunch) uncounted() bool {
+	return l.state == nil || l.state.completion != launchComplete ||
+		l.state.exchange != launchExchangeLaunched
 }
 
 // degradations names what the launch's preparation skipped, for logs.

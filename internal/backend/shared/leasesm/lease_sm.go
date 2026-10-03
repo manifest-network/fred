@@ -1254,7 +1254,8 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 	// live event stream observed that container's whole run with no signal to
 	// it. A health check that never passed is a running workload and never
 	// counts; a start the container runtime refused ran no tenant process, and
-	// a launch the platform degraded is the platform's failure.
+	// a launch the platform degraded, or whose launch exchange was rejected, is
+	// the platform's failure.
 	cause := failurecause.Platform()
 	var death *InstanceState
 	var provenance failurecause.Provenance

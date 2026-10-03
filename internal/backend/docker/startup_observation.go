@@ -600,9 +600,10 @@ func (b *Backend) startupObservationOf(
 				"container_id", leasesm.ShortID(watch.container.id), "error", err)
 			return startupObservation{kind: startupObservedUnverified, unverified: watch.surface}
 		}
-		if launch.degraded() {
-			logger.Warn("startup failed after a degraded launch; it never counts",
-				"container_id", leasesm.ShortID(watch.container.id), "degradations", launch.degradations().String())
+		if launch.uncounted() {
+			logger.Warn("startup failed after a launch the platform did not complete; it never counts",
+				"container_id", leasesm.ShortID(watch.container.id), "rejected", launch.rejected(),
+				"degradations", launch.degradations().String())
 		}
 		return startupObservation{kind: startupObservedFailure, failure: failure}
 	default:
