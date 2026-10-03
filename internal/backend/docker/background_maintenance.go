@@ -24,7 +24,7 @@ type backgroundMaintenanceCoordinator struct {
 	cleanupOrphanedNetworksFn   func(context.Context)
 	reapExpiredRetentionsFn     func(context.Context) (int, error)
 	runRetentionSweepFn         func(context.Context) error
-	deferVolumeDeletesFn        func() volumeDeleteDeferral
+	deferVolumeDeletesFn        func(context.Context) volumeDeleteDeferral
 	retryHeldVolumeDeletesFn    func(context.Context) volumeDeleteHoldPassReport
 }
 
@@ -43,11 +43,11 @@ var errBackgroundMaintenanceUnavailable = errors.New("background maintenance coo
 // deferVolumeDeletesUntilExecutorRuns opens Start's deferral of the volume
 // manager's first-time deletions (see volumeDeleteDeferral). Backend.Start is
 // its only caller. A coordinator without the workflow defers nothing.
-func (c *backgroundMaintenanceCoordinator) deferVolumeDeletesUntilExecutorRuns() volumeDeleteDeferral {
+func (c *backgroundMaintenanceCoordinator) deferVolumeDeletesUntilExecutorRuns(ctx context.Context) volumeDeleteDeferral {
 	if c == nil || c.deferVolumeDeletesFn == nil {
 		return volumeDeleteDeferral{}
 	}
-	return c.deferVolumeDeletesFn()
+	return c.deferVolumeDeletesFn(ctx)
 }
 
 func (c *backgroundMaintenanceCoordinator) recoverInterruptedVolumes(ctx context.Context) error {
