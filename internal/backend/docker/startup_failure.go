@@ -151,12 +151,15 @@ type startupRollbackState struct {
 }
 
 // admitStartupRollback admits the rollback of an accepted finding only when
-// its storage precondition holds, read positively before anything is removed:
-// no retained volume of the lease exists, and every canonical volume of the
-// lease was either created by this launch or named by the predecessor Release.
-// A volume outside both can be destroyed by nothing the live path owns, so the
-// classifier's absence proof could never hold; the attempt is then left as it
-// is for recovery. A failed read is no fact and refuses too.
+// every precondition of the classifier's confirmation that the rollback
+// cannot repair holds, read positively before anything is removed: the
+// launch-debt journal holds nothing for the lease (this launch's own row was
+// cleared with its receipt), no retained volume of the lease exists, and every
+// canonical volume of the lease was either created by this launch or named by
+// the predecessor Release. A volume outside both can be destroyed by nothing
+// the live path owns, so the classifier's absence proof could never hold; the
+// attempt is then left as it is for recovery. A failed read is no fact and
+// refuses too.
 func (b *Backend) admitStartupRollback(
 	ctx context.Context,
 	mutations *storageMutations,
@@ -167,6 +170,9 @@ func (b *Backend) admitStartupRollback(
 		return startupRollback{}, errors.New("startup rollback requires this execution's accepted finding")
 	}
 	subject := mutations.operationSubject
+	if err := b.volumeLaunches.checkNamespace(subject.LeaseUUID()); err != nil {
+		return startupRollback{}, fmt.Errorf("launch debt of the lease remains: %w", err)
+	}
 	preserve := make(map[string]struct{})
 	if predecessor, ok := subject.PredecessorRelease(); ok {
 		preserve = releaseCanonicalVolumeNames(subject.LeaseUUID(), predecessor)

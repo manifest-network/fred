@@ -574,6 +574,29 @@ func TestStartupFailureAfterAnEarlierIssueKeepsTheCohortForRecovery(t *testing.T
 	f.requireOneRecoveryPassSettles(t)
 }
 
+// Launch debt of the lease that this launch's receipt did not clear would fail
+// the classifier's confirmation after any rollback, so the rollback is refused
+// before anything is removed, and recovery settles the kept cohort.
+func TestStartupFailureWithLaunchDebtKeepsTheCohortForRecovery(t *testing.T) {
+	f := newStartupCrashFixture(t, budgetTestLease, countedBudget(t))
+	f.death = observedRunDeath
+	check := f.b.volumeLaunches.checkNamespace
+	f.b.volumeLaunches.checkNamespace = func(leaseUUID string) error {
+		if leaseUUID == budgetTestLease {
+			return errors.New("another launch of the lease is unsettled")
+		}
+		return check(leaseUUID)
+	}
+	f.provision(t)
+	awaitProvisionWorkerQuiescence(t, f.b, budgetTestLease)
+	assert.Equal(t, backend.ProvisionStatusProvisioning, f.projection(t).Status)
+	assert.Empty(t, f.failureCallbacks(), "nothing is published for an ambiguous attempt")
+	assert.NotEmpty(t, f.leaseContainers(t), "nothing was removed before the refusal: the exited cohort is kept")
+
+	f.b.volumeLaunches.checkNamespace = check
+	f.requireOneRecoveryPassSettles(t)
+}
+
 // requireOneRecoveryPassSettles runs one live operation recovery pass and
 // requires it to settle the lease's failed attempt: Failed, with the attempt's
 // own curated surface, and never counted.
