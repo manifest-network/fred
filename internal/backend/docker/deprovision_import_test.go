@@ -39,14 +39,19 @@ func deprovisionAfterWorkerDrain(t *testing.T, ctx context.Context, b *Backend, 
 	return result
 }
 
-// imageFlightAccounting is one lock-consistent view of what the image manager
-// still owns for its flights: flight workers and registry entries, live
-// members, collection exclusions, staging bytes and staging slots.
+// imageFlightAccounting is what the image manager still owns for its flights:
+// flight workers and registry entries, live members, collection exclusions,
+// staging bytes and staging slots.
 type imageFlightAccounting struct {
 	workers, flights, members, exclusions, slots int
 	staging                                      int64
 }
 
+// observeImageFlightAccounting reads the flight registry, the tenant shares and
+// the manager gate in three separate critical sections, so the fields are not
+// one atomic snapshot. Call it only while the flights are quiescent (the flight
+// worker parked in the daemon exchange, or joined by shutdown); a mid-transition
+// read can mix values from before and after one step.
 func observeImageFlightAccounting(t *testing.T, m *imageCapacityManager) imageFlightAccounting {
 	t.Helper()
 	var observed imageFlightAccounting
@@ -63,6 +68,37 @@ func observeImageFlightAccounting(t *testing.T, m *imageCapacityManager) imageFl
 	observed.exclusions, observed.staging = m.active, m.staging
 	m.unlock()
 	return observed
+}
+
+// closeBesideHeldFlightRegistry makes one bounded close attempt while the caller
+// holds m.flights.mu, and release gives that lock back. The close path must
+// never take the flight registry. A sync.Mutex ignores the attempt's deadline,
+// so the attempt runs on its own goroutine: if it has not returned well past its
+// deadline, it is blocked behind the held registry. The helper then releases
+// the registry so the attempt and the backend can unwind, and fails with that
+// cause rather than hanging until the test binary's timeout.
+func closeBesideHeldFlightRegistry(t *testing.T, b *Backend, lease string, release func()) error {
+	t.Helper()
+	const deadline, watchdog = time.Second, 5 * time.Second
+	ctx, cancel := context.WithTimeout(t.Context(), deadline)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- b.Deprovision(ctx, lease) }()
+	select {
+	case err := <-result:
+		require.NotErrorIs(t, err, context.DeadlineExceeded,
+			"close waited out its deadline while the test held the image flight registry: the close path must not wait on m.flights.mu")
+		return err
+	case <-time.After(watchdog):
+	}
+	release()
+	select {
+	case <-result:
+		t.Fatal("close blocked on the image flight registry the test held: the close path must not take m.flights.mu")
+	case <-time.After(watchdog):
+		t.Fatal("close stayed blocked after the test released the image flight registry: the hang has another cause")
+	}
+	return nil
 }
 
 // A dispatched daemon import belongs to the manager-owned image flight and the
@@ -138,14 +174,15 @@ func TestDeprovisionDuringOwnedImageImportReturnsPendingBeforeHTTPDeadline(t *te
 	// While the test holds the flight registry, the canceled lease worker cannot
 	// leave the flight, so it provably has not drained. Every retry must receive
 	// the same typed availability observation well before providerd's 30-second
-	// HTTP deadline, without canceling the import or settling its debit.
+	// HTTP deadline, without canceling the import or settling its debit. The close
+	// path must stay free of the flight registry; closeBesideHeldFlightRegistry
+	// turns a violation into a named failure instead of a hung test.
 	func() {
 		m.flights.mu.Lock()
-		defer m.flights.mu.Unlock()
+		release := sync.OnceFunc(m.flights.mu.Unlock)
+		defer release()
 		for range 6 {
-			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-			err := b.Deprovision(ctx, request.LeaseUUID)
-			cancel()
+			err := closeBesideHeldFlightRegistry(t, b, request.LeaseUUID, release)
 			require.True(t, leasesm.IsLifecyclePending(err), "close must observe the exact undrained worker: %v", err)
 			require.NoError(t, work.Err())
 			pending, err := m.loader.PendingBytes()
