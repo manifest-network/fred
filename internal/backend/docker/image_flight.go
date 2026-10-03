@@ -166,6 +166,10 @@ func (l *imageFlightLeader) complete(outcome imageFlightOutcome) {
 	})
 }
 
+// wait returns the flight's outcome, or the member's own context error. A
+// canceled member stops waiting at once and must retire. It never owned the
+// staging, a dispatched import or its accounting: the flight worker keeps those
+// until completion, and Backend.Stop joins that worker before closing stores.
 func (m *imageFlightMembership) wait(ctx context.Context) (imageFlightOutcome, error) {
 	select {
 	case <-ctx.Done():

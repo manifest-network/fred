@@ -280,8 +280,11 @@ may return `503` with `{"error":"admitted lifecycle work remains pending","code"
 after observing validated journal contention or an admitted close whose physical
 result remains pending. The bundled Docker backend also responds immediately
 with this envelope when close cancels a workflow whose exact worker is still
-draining, including a loader-owned image import; it does not wait for the import
-inside the HTTP request. Teardown can proceed after the worker exits. Fred
+draining. An image import that was already dispatched belongs to the backend's
+shared image flight and loader, not to that worker: the canceled worker leaves
+it, and close neither waits for nor cancels it. Teardown can proceed after the
+worker exits, while the import keeps its own staging and allocation until it
+completes. Fred
 treats this exact envelope as a successful
 availability observation while preserving the unresolved request. It grants no
 refusal, no-dispatch, immediate replay, or completed-cleanup authority. Generic
