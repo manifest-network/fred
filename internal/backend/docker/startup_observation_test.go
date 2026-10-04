@@ -487,3 +487,38 @@ func TestStartupObservationDeadline_KeepsTheRollbackReserve(t *testing.T) {
 
 	assert.True(t, startupObservationDeadline(t.Context(), now).IsZero(), "no deadline, no observation deadline")
 }
+
+// A health check that first passes in the observation deadline's final pass is
+// remembered like any other pass, so a flap the outcome classifier sees later
+// cannot turn the Ready startup into a failure (ENG-1125, #255 review).
+func TestWatchStartup_DeadlinePassRemembersAPassedHealthCheck(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var inspections int
+		var mu sync.Mutex
+		b := newBackendForTest(&mockDockerClient{
+			InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
+				mu.Lock()
+				inspections++
+				mu.Unlock()
+				return &ContainerInfo{Status: "running", Health: HealthStatusHealthy}, nil
+			},
+			ContainerLogsFn: func(context.Context, string, int) (string, error) { return "", nil },
+		}, nil)
+		cohort, err := newStartupCohort(&manifest.StackManifest{
+			Services: map[string]*manifest.Manifest{"app": startupGatedService},
+		}, map[string][]string{"app": {"c1"}})
+		require.NoError(t, err)
+		require.False(t, b.startupHealth.passedHealth("c1"))
+
+		// The observation deadline fires before the first poll, so the
+		// deadline's pass is the watch's only pass.
+		watch := b.watchStartup(t.Context(), cohort, b.newStartupMemory(settledLaunch{}),
+			time.Now().Add(time.Millisecond), b.logger)
+		require.Equal(t, startupVerdictReady, watch.verdict)
+		mu.Lock()
+		require.Equal(t, 1, inspections, "the deadline pass must be the only pass")
+		mu.Unlock()
+		assert.True(t, b.startupHealth.passedHealth("c1"),
+			"the deadline pass must remember the health check it saw pass")
+	})
+}

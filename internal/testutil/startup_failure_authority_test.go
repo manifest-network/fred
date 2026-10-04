@@ -91,6 +91,7 @@ const (
 	liveDeathDispatcherSite    = "Backend.dispatchLiveContainerDeaths"
 	containerEventLoopSite     = "Backend.runContainerEventLoop"
 	startupMemoryRememberSite  = "startupMemory.remember"
+	startupPassInspectionSite  = "Backend.inspectStartupCohort"
 )
 
 // typeSite and valueSite name one top-level declaration as a site: a type
@@ -126,6 +127,7 @@ var dockerStartupRules = []startupAuthorityRule{
 		{terminalBudgetEventsFile, liveDeathDispatcherSite}, {terminalBudgetEventsFile, startupDeathRedispatchSite},
 	}, "a live death's dispatch"},
 	{"recordPassedHealth", []attributionSite{{startupObservationFile, startupMemoryRememberSite}}, "a startup health ledger write"},
+	{"remember", []attributionSite{{startupObservationFile, startupPassInspectionSite}}, "a startup pass record"},
 }
 
 // Package-qualified names of package shared, and their one docker site.
@@ -406,6 +408,9 @@ func (b *Backend) classifyOperationIntentSubstrate() { b.startupHealth.recordPas
 		{"health ledger written elsewhere in the observation file", startupObservationFile,
 			`package docker
 func (b *Backend) observeRejectedLaunch() { m.health.recordPassedHealth(pass) }`, "names recordPassedHealth"},
+		{"startup pass remembered outside its inspection", startupObservationFile,
+			`package docker
+func (b *Backend) watchStartup() { memory.remember(pass) }`, "names remember"},
 		{"health ledger facts set outside the ledger", "internal/backend/docker/recover.go",
 			`package docker
 func (b *Backend) recoverState() { b.startupHealth.healthyByID["c"] = struct{}{} }`, "names healthyByID"},

@@ -305,7 +305,10 @@ type startupPass struct {
 
 // inspectStartupCohort inspects every container of the cohort once and
 // classifies each against what the watch remembers of it. A failed read ends
-// the pass unverified: a failed read is never a fact.
+// the pass unverified: a failed read is never a fact. A completed pass is
+// remembered here, before any caller decides on it, so every pass (polling,
+// the observation deadline, a rejected launch) records the health checks it
+// saw pass and no later flap can erase them.
 func (b *Backend) inspectStartupCohort(ctx context.Context, cohort startupCohort, memory *startupMemory) (startupPass, *physicalOperationError) {
 	pass := startupPass{
 		members:  slices.Clone(cohort),
@@ -321,6 +324,7 @@ func (b *Backend) inspectStartupCohort(ctx context.Context, cohort startupCohort
 		pass.infos[i] = info
 		pass.verdicts[i] = classifyStartupInstance(info, memory.facts(member))
 	}
+	memory.remember(pass)
 	return pass, nil
 }
 
@@ -495,7 +499,6 @@ func (b *Backend) watchStartup(
 		if failure != nil {
 			return unverifiedStartup(failure)
 		}
-		memory.remember(pass)
 		if watch, decided := b.decideStartupPass(ctx, pass, !time.Now().Before(settleEnd)); decided {
 			if watch.verdict == startupVerdictReady {
 				logger.Info("startup cohort verified", "containers", len(cohort))
