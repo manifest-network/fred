@@ -1058,6 +1058,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Health check `interval`, `timeout` and `start_period` are now bounded when a
+  manifest is submitted: each must be `0` (or omitted) for the image's or
+  Docker's default, or at least `1ms` (Docker's minimum), in both string and
+  integer-nanosecond form. A negative value was silently dropped (the container
+  ran with default timing), and a positive value below `1ms` was admitted but
+  then refused by Docker at container create. Releases stored by earlier
+  versions still decode for recovery and restore; any such out-of-range timing
+  in them runs with the default. `docs/manifest-schema.json` and the manifest
+  guide state the same bounds (ENG-1127).
 - A sweep canceled at shutdown between its provision and retention reads no
   longer widens the recovery its interrupted marker needs. It is abandoned
   before any response is disposed, so after the restart only the backends that

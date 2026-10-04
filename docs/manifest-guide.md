@@ -159,10 +159,10 @@ A JSON object with a top-level `services` key containing a map of service names 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `test` | string[] | **Yes** | — | Command array. First element: `CMD`, `CMD-SHELL`, or `NONE`. |
-| `interval` | duration | No | — | Time between checks. |
-| `timeout` | duration | No | — | Per-check timeout. |
+| `interval` | duration | No | image/Docker default | Time between checks. `0` or at least `1ms`. |
+| `timeout` | duration | No | image/Docker default | Per-check timeout. `0` or at least `1ms`. |
 | `retries` | integer | No | `0` | Failures before marking unhealthy. Must be ≥ 0. |
-| `start_period` | duration | No | — | Initial grace period. |
+| `start_period` | duration | No | image/Docker default | Initial grace period. `0` or at least `1ms`. |
 
 ### DependsOnCondition Fields
 
@@ -259,6 +259,7 @@ Rules:
 - `CMD` and `CMD-SHELL` require at least one argument after the type prefix.
 - `retries` must be ≥ 0.
 - Duration fields (`interval`, `timeout`, `start_period`) accept Go duration strings (`"30s"`, `"1m30s"`, `"500ms"`) or integer nanoseconds.
+- Each duration must be `0` (or omitted), which uses the image's or Docker's default, or at least `1ms` (Docker's minimum). Negative values and nonzero values below `1ms` (for example `"500us"` or `999999`) are rejected when the manifest is submitted.
 - When a health check is present, the backend waits for all containers to report `healthy` before sending a success callback.
 - A health check defined in the Dockerfile but **not** in the manifest does not trigger health-aware startup verification — the manifest is the contract.
 
@@ -573,10 +574,12 @@ Submits a new manifest for an already-provisioned lease. The body is a JSON obje
 
 Duration fields accept two formats:
 
-1. **Go duration strings** — human-readable: `"30s"`, `"1m30s"`, `"500ms"`, `"2h"`, `"100us"`
+1. **Go duration strings** — human-readable: `"30s"`, `"1m30s"`, `"500ms"`, `"2h"`, `"1500us"`
 2. **Integer nanoseconds** — e.g., `30000000000` for 30 seconds
 
 Go duration strings support these units: `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`.
+
+Each field also has its own range: health check timings are `0` (use the default) or at least `1ms`; `stop_grace_period` is `1s`–`120s`.
 
 ## Examples
 

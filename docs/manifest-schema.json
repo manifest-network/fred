@@ -229,11 +229,11 @@
           ]
         },
         "interval": {
-          "$ref": "#/$defs/Duration",
+          "$ref": "#/$defs/HealthCheckDuration",
           "description": "Time between health checks."
         },
         "timeout": {
-          "$ref": "#/$defs/Duration",
+          "$ref": "#/$defs/HealthCheckDuration",
           "description": "Timeout for each health check execution."
         },
         "retries": {
@@ -242,7 +242,7 @@
           "description": "Number of consecutive failures before marking unhealthy."
         },
         "start_period": {
-          "$ref": "#/$defs/Duration",
+          "$ref": "#/$defs/HealthCheckDuration",
           "description": "Initial grace period during which health check failures are not counted."
         }
       }
@@ -260,19 +260,50 @@
         }
       }
     },
-    "Duration": {
-      "oneOf": [
+    "HealthCheckDuration": {
+      "description": "Health check timing: 0 (or omitted) uses the image's or Docker's default; any other value must be at least 1ms (Docker's minimum). Negative values are rejected. For integer nanoseconds and integer single-unit strings the schema checks only that lower bound; admission also rejects values that overflow a 64-bit nanosecond count and number literals that are not plain integers (e.g., 1e6). Fractional and compound forms (e.g., \"1.5ms\", \"1m30s\") pass the schema and are range-validated at admission.",
+      "anyOf": [
         {
           "type": "string",
-          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
-          "description": "Go duration string (e.g., \"30s\", \"1m30s\", \"500ms\")."
+          "pattern": "^0$",
+          "description": "Zero: use the default."
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s|m|h)$",
+          "description": "Integer milliseconds, seconds, minutes or hours (zero uses the default)."
+        },
+        {
+          "type": "string",
+          "pattern": "^(0+|0*[1-9][0-9]{3,})(us|µs)$",
+          "description": "Integer microseconds: zero, or at least 1000us."
+        },
+        {
+          "type": "string",
+          "pattern": "^(0+|0*[1-9][0-9]{6,})ns$",
+          "description": "Integer nanoseconds as a string: zero, or at least 1000000ns."
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+(ns|us|µs|ms|s|m|h)$",
+          "description": "Fractional single-unit duration. Range validated at admission."
+        },
+        {
+          "type": "string",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)){2,}$",
+          "description": "Compound duration (e.g., \"1m30s\"). Range validated at admission."
         },
         {
           "type": "integer",
-          "description": "Duration in nanoseconds."
+          "const": 0,
+          "description": "Zero nanoseconds: use the default."
+        },
+        {
+          "type": "integer",
+          "minimum": 1000000,
+          "description": "Duration in nanoseconds, at least 1000000 (1ms)."
         }
-      ],
-      "description": "A time duration. Accepts Go duration strings (\"30s\", \"1m\") or integer nanoseconds."
+      ]
     },
     "StopGracePeriod": {
       "description": "Duration bounded to 1s–120s. Integer nanoseconds are range-checked exactly. For strings, integer seconds (1s–120s), milliseconds (1000ms–120000ms), and minutes (1m–2m) are enforced by the schema. Fractional and compound forms (e.g., \"1.5s\", \"1m30s\") pass the schema and are range-validated at runtime.",

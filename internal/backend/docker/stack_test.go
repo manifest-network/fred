@@ -458,8 +458,8 @@ func TestStackProvision_PerServiceHealthCheck(t *testing.T) {
 				Image: "nginx:latest",
 				HealthCheck: &manifest.HealthCheckConfig{
 					Test:     []string{"CMD-SHELL", "curl -f http://localhost/"},
-					Interval: manifest.Duration(1 * time.Second),
-					Timeout:  manifest.Duration(1 * time.Second),
+					Interval: testHealthDuration(1 * time.Second),
+					Timeout:  testHealthDuration(1 * time.Second),
 					Retries:  2,
 				},
 			},

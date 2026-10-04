@@ -14,7 +14,8 @@
 //     (["CMD", cmd, args...], ["CMD-SHELL", "shell-string"], ["NONE"]).
 //     A K3s/K8s backend must translate this to exec / httpGet /
 //     tcpSocket probes substrate-side; that translation is out of
-//     scope for this package.
+//     scope for this package. Its timings are HealthDuration values
+//     bounded by Docker's own container.MinimumDuration.
 //   - validateUserSpec accepts Docker's USER-directive format
 //     (uid, uid:gid, username, username:group). Generic enough to
 //     remain here as the wire format; backends translate to
@@ -36,6 +37,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/docker/docker/api/types/container"
 
 	"github.com/manifest-network/fred/internal/backend"
 )
@@ -192,16 +195,104 @@ type HealthCheckConfig struct {
 	Test []string `json:"test"`
 
 	// Interval between health checks.
-	Interval Duration `json:"interval,omitempty"`
+	Interval HealthDuration `json:"interval,omitzero"`
 
 	// Timeout for each health check.
-	Timeout Duration `json:"timeout,omitempty"`
+	Timeout HealthDuration `json:"timeout,omitzero"`
 
 	// Retries before marking unhealthy.
 	Retries int `json:"retries,omitempty"`
 
 	// StartPeriod is the initial grace period.
-	StartPeriod Duration `json:"start_period,omitempty"`
+	StartPeriod HealthDuration `json:"start_period,omitzero"`
+}
+
+// healthTiming is one HealthDuration field of HealthCheckConfig, named by its
+// JSON tag.
+type healthTiming struct {
+	field string
+	value HealthDuration
+}
+
+// timings lists every HealthDuration field of h. It is the single source
+// Validate bounds at admission; TestHealthCheckTimingsCoverEveryHealthDuration
+// fails if a HealthDuration field is added to HealthCheckConfig without being
+// listed here, so no timing can reach translation's Override mapping without
+// first being rejected at admission when out of range (ENG-1127).
+func (h *HealthCheckConfig) timings() []healthTiming {
+	return []healthTiming{
+		{"interval", h.Interval},
+		{"timeout", h.Timeout},
+		{"start_period", h.StartPeriod},
+	}
+}
+
+// HealthDuration is one health_check timing field (interval, timeout,
+// start_period). It has no exported constructor: only JSON decoding produces
+// one, and the zero value means "not set".
+//
+// Consumers can read it only through Override, which yields a value Docker
+// accepts or reports that the image's/daemon's default applies. That holds
+// for every decoded value, including history persisted before admission
+// bounded these fields (ENG-1127): a negative or sub-minimum duration in a
+// stored release is mapped to "use the default" (exactly what translation did
+// for negatives before), never handed to the substrate. Tenant admission
+// (HealthCheckConfig.Validate) rejects those values outright, so a new
+// manifest can never rely on the mapping.
+type HealthDuration struct {
+	// wire is the value as decoded. It is kept so a stored manifest re-encodes
+	// byte-identically (historical replay compares canonical JSON, ENG-1050) and
+	// so admission can name the rejected input. Only UnmarshalJSON sets it;
+	// Override, IsZero, MarshalJSON and admissionError read it.
+	wire time.Duration
+}
+
+// UnmarshalJSON accepts the same wire forms as Duration: a Go duration string
+// or integer nanoseconds. Range policy is admission's job (see Validate); the
+// decoder must also serve stored history, so it records the value as sent.
+func (d *HealthDuration) UnmarshalJSON(b []byte) error {
+	var raw Duration
+	if err := raw.UnmarshalJSON(b); err != nil {
+		return err
+	}
+	d.wire = raw.Duration()
+	return nil
+}
+
+// MarshalJSON re-encodes the decoded value exactly as Duration did, so
+// canonical JSON of stored manifests is unchanged.
+func (d HealthDuration) MarshalJSON() ([]byte, error) {
+	return Duration(d.wire).MarshalJSON()
+}
+
+// IsZero reports whether the field was absent or zero (omitzero support).
+func (d HealthDuration) IsZero() bool { return d.wire == 0 }
+
+// Override returns the tenant's timing and true when it is one Docker accepts
+// (at least container.MinimumDuration). Otherwise it returns (0, false): the
+// field is unset, or it is a value only stored pre-ENG-1127 history can carry,
+// and the image's/daemon's default applies. It is the only way to read the
+// duration, so a negative or sub-minimum value cannot reach a substrate.
+func (d HealthDuration) Override() (time.Duration, bool) {
+	if d.wire < container.MinimumDuration {
+		return 0, false
+	}
+	return d.wire, true
+}
+
+// admissionError rejects what Docker would refuse at container create
+// (daemon validateHealthCheck): any negative value and any nonzero value below
+// container.MinimumDuration. Zero stays valid and means "use the default".
+func (d HealthDuration) admissionError(field string) error {
+	switch {
+	case d.wire < 0:
+		return fmt.Errorf("%s must not be negative, got %s; use a duration of at least %s, or omit it (or 0) for the default",
+			field, d.wire, container.MinimumDuration)
+	case d.wire > 0 && d.wire < container.MinimumDuration:
+		return fmt.Errorf("%s must be at least %s, got %s; omit it (or 0) for the default",
+			field, container.MinimumDuration, d.wire)
+	}
+	return nil
 }
 
 // Duration wraps time.Duration for JSON unmarshaling from strings like "30s".
@@ -997,6 +1088,12 @@ func (h *HealthCheckConfig) Validate() error {
 
 	if h.Retries < 0 {
 		return fmt.Errorf("retries cannot be negative")
+	}
+
+	for _, timing := range h.timings() {
+		if err := timing.value.admissionError(timing.field); err != nil {
+			return err
+		}
 	}
 
 	return nil
