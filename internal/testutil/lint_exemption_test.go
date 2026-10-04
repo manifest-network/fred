@@ -1,11 +1,11 @@
 package testutil
 
 // This file pins the per-file forbidigo exemptions of .golangci.yml
-// (ENG-1117). An exemption names the rules it lifts by a bracketed tag that
+// (ENG-1117, ENG-799, ENG-1125). An exemption names the rules it lifts by a bracketed tag that
 // starts their messages, and golangci-lint matches an exclusion's text against
 // the whole issue text. Keyed on prose instead, a new rule that reused the
 // phrase would silently be exempt too; keyed on the wrong tag, or widened to
-// more files, a writer or tree-removal rule would stop firing where it must.
+// more files, a guarded call would stop being refused where it must be.
 // This test fails on either drift: every tag is carried by exactly its rules,
 // every exemption lifts exactly one tag in exactly its files, and nothing else
 // outside test files lifts forbidigo.
@@ -68,6 +68,28 @@ var forbidigoExemptions = map[string]struct {
 			"internal/backend/docker/storage_mutation_guard.go",
 			"internal/backend/docker/volume_xfs.go",
 		},
+	},
+	// The on-chain lease close hops (ENG-799).
+	"[raw-lease-close]": {
+		patterns: []string{`\.closeActiveLeaseOnChain$`, `\.CloseObserved$`},
+		files:    []string{"internal/provisioner/reconcile_close.go"},
+	},
+	"[placement-lease-close]": {
+		patterns: []string{`\.closeLease$`},
+		files:    []string{"internal/provisioner/placement/reconciliation_chain.go"},
+	},
+	"[chain-lease-close]": {
+		patterns: []string{`\.CloseLeases$`},
+		files: []string{
+			"internal/provisioner/manager.go",
+			"internal/provisioner/placement/provider_control_plane.go",
+			"internal/scheduler/withdraw.go",
+		},
+	},
+	// Startup failure evidence (ENG-1125).
+	"[startup-evidence]": {
+		patterns: []string{`\.NewOperationStartupFailed$`},
+		files:    []string{"internal/backend/docker/startup_failure.go"},
 	},
 }
 

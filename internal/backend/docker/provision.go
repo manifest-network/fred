@@ -948,7 +948,7 @@ func (b *Backend) doProvisionPhysical(
 	// rather than an ambiguous launch; a writable-path-only service is refused
 	// too, rather than run without its seeded content.
 	if pending := b.leaseVolumesPendingDeletion(req.LeaseUUID, req.Items); len(pending) > 0 {
-		return &physicalOperationError{
+		return acceptedStartupFailure{}, &physicalOperationError{
 			callback: backend.MsgVolumeDeletePending,
 			reason:   backend.ReasonVolumeDeletePending,
 			cause:    fmt.Errorf("%w: lease volume(s) %v", ErrVolumeDeleteHeld, pending),

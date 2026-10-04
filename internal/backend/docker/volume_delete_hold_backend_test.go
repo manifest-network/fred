@@ -340,8 +340,10 @@ func TestProvisionRefusesDeletePendingVolumeWithCuratedReason(t *testing.T) {
 	req := backend.ProvisionRequest{LeaseUUID: leaseUUID, Tenant: "tenant-a",
 		Items: []backend.LeaseItem{{SKU: "docker-small", ServiceName: "web", Quantity: 2}}}
 
-	err := b.doProvisionPhysical(&storageMutations{}, t.Context(), req, nil, nil, b.logger)
+	finding, err := b.doProvisionPhysical(&storageMutations{}, t.Context(), req, nil, nil, b.logger)
 	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
+	_, found := finding.Finding()
+	assert.False(t, found, "an effect-free refusal carries no startup failure")
 	callback, reason := operationFailureDetails(err)
 	assert.Equal(t, backend.ReasonVolumeDeletePending, reason)
 	assert.Equal(t, backend.MsgVolumeDeletePending, callback)

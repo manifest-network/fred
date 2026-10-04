@@ -76,12 +76,12 @@ linters:
       # internal/testutil/no_unbounded_tree_traversal_test.go, which also
       # resolves aliased imports.
       #
-      # COUPLING: a per-file exemption below is keyed on a bracketed tag that
-      # starts its rules' messages ([composition-writer], [tree-removal-wiring]),
-      # never on prose another rule could reuse. Only the rules that carry a
-      # tag are exempt in its files; every other rule still fires there.
-      # internal/testutil/lint_exemption_test.go pins exactly which rules
-      # carry each tag and which files exempt it.
+      # COUPLING: every per-file exemption below is keyed on a bracketed tag
+      # that starts its rules' messages, never on prose another rule could
+      # reuse, and each tag has exactly one exemption. Only the rules that
+      # carry a tag are exempt in its files; every other rule still fires
+      # there. internal/testutil/lint_exemption_test.go pins exactly which
+      # rules carry each tag and which files exempt it.
       forbid:
         - pattern: '\.Destroy$'
           msg: "[composition-writer] managed-volume destruction must use the construction-bound substrate mutation executor"
@@ -171,11 +171,7 @@ linters:
         linters:
           - forbidigo
         text: '\[placement-lease-close\]'
-      - path: ^internal/provisioner/(manager|placement/provider_control_plane)\.go$
-        linters:
-          - forbidigo
-        text: '\[chain-lease-close\]'
-      - path: ^internal/scheduler/withdraw\.go$
+      - path: ^internal/(provisioner/(manager|placement/provider_control_plane)|scheduler/withdraw)\.go$
         linters:
           - forbidigo
         text: '\[chain-lease-close\]'

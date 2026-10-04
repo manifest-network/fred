@@ -652,6 +652,12 @@ func TestReasonEligibleForBudget_EveryDeclaredReason(t *testing.T) {
 		"ReasonCleanupFailed":          false,
 		"ReasonBackendStorageLost":     false,
 		"ReasonUnknown":                false,
+		// A provision refused, before any Step, while the provider still
+		// deletes one of the lease's volumes ran no tenant process, and a
+		// close waiting on such a deletion is not a failure of the workload;
+		// neither counts (ENG-1117).
+		"ReasonVolumeDeletePending":      false,
+		"ReasonVolumeDeletionInProgress": false,
 	}
 	declared := declaredConstants(t, filepath.Join("..", "..", "reason.go"), "Reason")
 	require.Equal(t, slices.Sorted(maps.Keys(decisions)), slices.Sorted(maps.Keys(declared)),
