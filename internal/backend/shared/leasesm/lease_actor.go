@@ -2247,9 +2247,12 @@ func (a *LeaseActor) handleDeprovision(ctx context.Context) error {
 		a.closeSettlement = newActorCloseSettlement(a)
 	}
 	// Cancellation asks the exact actor-owned worker to stop; only its barrier
-	// proves that it has stopped. In particular, an admitted image import keeps
-	// its loader-owned lifetime after cancellation. Return an observation now
-	// instead of occupying the actor and the HTTP caller while that owner drains.
+	// proves that it has stopped. Return an observation now instead of
+	// occupying the actor and the HTTP caller while the worker unwinds. The
+	// barrier covers only this lease's worker. Work that the substrate owns
+	// independently of the lease, such as an image import already dispatched
+	// for a shared flight, keeps its own owner after the worker leaves it;
+	// close neither waits for nor cancels that work.
 	if a.workCancel != nil {
 		a.workCancel()
 		// Keep this actor-owned cancellation capability until OnExit consumes
