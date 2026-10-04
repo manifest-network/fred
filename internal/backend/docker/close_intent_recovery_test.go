@@ -247,6 +247,7 @@ func seedCloseRecoveryProjection(
 			Quantity:             1,
 			CreatedAt:            time.Now(),
 			FailCount:            0,
+			TerminalBudget:       leasesm.TerminalBudget{},
 			LastError:            "",
 			Reason:               "",
 			Message:              "",

@@ -2976,6 +2976,99 @@ func TestGetLeaseStatus_RedactsVerboseError_SurfacesReasonMessage(t *testing.T) 
 	assert.Contains(t, body, `"message":"container exited unexpectedly"`)
 }
 
+// TestLeaseResponses_SurfaceRecognizedTerminalBudget pins the tenant-facing
+// consecutive-failure budget (ENG-799) on /status and /provision: a recognized
+// backend observation is copied through next to the unchanged lifetime
+// fail_count; an absent or unrecognized one is omitted from the wire.
+func TestLeaseResponses_SurfaceRecognizedTerminalBudget(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid: leaseUUID, Tenant: kp.Address, ProviderUuid: providerUUID,
+					State: billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+	tests := []struct {
+		name   string
+		budget *backend.TerminalBudgetObservation
+		want   *backend.TerminalBudgetObservation
+	}{
+		{
+			name:   "exhausted",
+			budget: &backend.TerminalBudgetObservation{Verdict: backend.TerminalVerdictExhausted, ConsecutiveFailures: 3},
+			want:   &backend.TerminalBudgetObservation{Verdict: backend.TerminalVerdictExhausted, ConsecutiveFailures: 3},
+		},
+		{
+			name:   "retry",
+			budget: &backend.TerminalBudgetObservation{Verdict: backend.TerminalVerdictRetry, ConsecutiveFailures: 1},
+			want:   &backend.TerminalBudgetObservation{Verdict: backend.TerminalVerdictRetry, ConsecutiveFailures: 1},
+		},
+		{name: "absent", budget: nil, want: nil},
+		{
+			name:   "unrecognized",
+			budget: &backend.TerminalBudgetObservation{Verdict: "close-now", ConsecutiveFailures: 9},
+			want:   nil,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/provisions/"+leaseUUID && r.Method == "GET" {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(backend.ProvisionInfo{
+						LeaseUUID: leaseUUID, ProviderUUID: providerUUID,
+						Status: backend.ProvisionStatusFailed, FailCount: 7,
+						Reason: backend.ReasonContainerExited, TerminalBudget: test.budget,
+					})
+					return
+				}
+				t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}))
+			defer backendServer.Close()
+			backendClient := newBackendHTTPClientForTest(t, backendHTTPClientConfig{
+				Name: "test-backend", BaseURL: backendServer.URL, Timeout: 5 * time.Second,
+			})
+			router, err := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+			})
+			require.NoError(t, err)
+			h := &Handlers{client: chainClient, backendRouter: router, providerUUID: providerUUID, bech32Prefix: "manifest"}
+
+			for _, endpoint := range []string{"status", "provision"} {
+				req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/"+endpoint, nil)
+				req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+				req.SetPathValue("lease_uuid", leaseUUID)
+				rec := httptest.NewRecorder()
+				if endpoint == "status" {
+					h.GetLeaseStatus(rec, req)
+				} else {
+					h.GetLeaseProvision(rec, req)
+				}
+				require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+				body := rec.Body.String()
+				var response struct {
+					FailCount      int                                `json:"fail_count"`
+					TerminalBudget *backend.TerminalBudgetObservation `json:"terminal_budget"`
+				}
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+				assert.Equal(t, 7, response.FailCount, "%s: fail_count keeps its lifetime meaning", endpoint)
+				assert.Equal(t, test.want, response.TerminalBudget, endpoint)
+				if test.want == nil {
+					assert.NotContains(t, body, "terminal_budget", "%s: an unusable budget is omitted", endpoint)
+					assert.NotContains(t, body, "close-now", "%s: unrecognized backend text never reaches a tenant", endpoint)
+				}
+			}
+		})
+	}
+}
+
 // TestGetLeaseStatus_FailedEmptyReason_DefaultsUnknown pins the read-boundary
 // Unknown default: a FAILED provision that reaches the API with no authored
 // reason (legacy/pre-ENG-508 backend) must still surface a machine reason to the

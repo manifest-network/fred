@@ -2680,14 +2680,23 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	assert.Equal(t, 2, payloadStore.Count())
 }
 
-// TestReconciler_ConcurrentReconcileAll tests that concurrent ReconcileAll calls
-// are properly serialized by the atomic flag.
+// exhaustedBudget is a backend's exhausted consecutive-failure verdict: the only
+// observation that may close a failing ACTIVE lease (ENG-799).
+func exhaustedBudget() *backend.TerminalBudgetObservation {
+	return &backend.TerminalBudgetObservation{
+		Verdict: backend.TerminalVerdictExhausted, ConsecutiveFailures: 3,
+	}
+}
+
 func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
-	// Setup: Active lease on chain, failed provision with FailCount >= maxReprovisionAttempts
-	// Expected: Close the lease and deprovision the backend resources
+	// Setup: Active lease on chain, failed provision whose backend reports an
+	// exhausted consecutive-failure budget.
+	// Expected: Close the lease with the fixed reason and deprovision it.
 	var closedLeases []string
 	var closedReason string
 	var mu sync.Mutex
+	exhaustedVerdicts := metrics.ReconcilerTerminalVerdictsTotal.WithLabelValues("exhausted")
+	exhaustedBefore := promtestutil.ToFloat64(exhaustedVerdicts)
 
 	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
@@ -2710,10 +2719,12 @@ func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
 		name: "test",
 		provisions: []backend.ProvisionInfo{
 			{
-				LeaseUUID:   "lease-1",
-				Status:      backend.ProvisionStatusFailed,
-				FailCount:   3, // >= DefaultMaxReprovisionAttempts (3)
-				BackendName: "test",
+				LeaseUUID:      "lease-1",
+				Status:         backend.ProvisionStatusFailed,
+				FailCount:      3,
+				Reason:         backend.ReasonContainerExited,
+				TerminalBudget: exhaustedBudget(),
+				BackendName:    "test",
 			},
 		},
 	}
@@ -2732,7 +2743,9 @@ func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
 	defer mu.Unlock()
 	require.Len(t, closedLeases, 1)
 	assert.Equal(t, "lease-1", closedLeases[0])
-	assert.Contains(t, closedReason, "failed 3 times")
+	assert.Equal(t, failureBudgetChainReason, closedReason,
+		"the on-chain reason is fixed and carries nothing backend-authored")
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(exhaustedVerdicts)-exhaustedBefore)
 
 	// Verify backend resources were released immediately
 	mockBackend.mu.Lock()
@@ -2820,7 +2833,8 @@ func TestReconciler_ReconcileAll_UnresolvablePlacement_RefusesWithoutTerminating
 }
 
 func TestReconciler_ReconcileAll_ActiveFailedBelowMax(t *testing.T) {
-	// Setup: Active lease on chain, failed provision with FailCount < maxReprovisionAttempts
+	// Setup: Active lease on chain, failed provision whose backend reports no
+	// exhausted budget.
 	// Expected: Attempt re-provisioning (not close)
 	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
@@ -2842,7 +2856,7 @@ func TestReconciler_ReconcileAll_ActiveFailedBelowMax(t *testing.T) {
 			{
 				LeaseUUID:   "lease-1",
 				Status:      backend.ProvisionStatusFailed,
-				FailCount:   1, // < DefaultMaxReprovisionAttempts (3)
+				FailCount:   1,
 				BackendName: "test",
 			},
 		},
@@ -2865,6 +2879,76 @@ func TestReconciler_ReconcileAll_ActiveFailedBelowMax(t *testing.T) {
 
 	// No deprovisions (that happens after close, not re-provision)
 	assert.Empty(t, mockBackend.deprovisionCalls)
+}
+
+// TestReconciler_FailCountAloneNeverCloses is the core ENG-799 regression: a
+// lifetime FailCount, however high, never closes a paying lease. Only the
+// backend's exhausted verdict does. An absent verdict (an older or third-party
+// backend), a retry verdict, an unrecognized verdict and an exhausted verdict
+// with no recorded failure all re-provision, and each is counted.
+func TestReconciler_FailCountAloneNeverCloses(t *testing.T) {
+	tests := []struct {
+		name   string
+		budget *backend.TerminalBudgetObservation
+		label  string
+	}{
+		{name: "absent verdict", budget: nil, label: "absent"},
+		{name: "retry verdict", budget: &backend.TerminalBudgetObservation{
+			Verdict: backend.TerminalVerdictRetry, ConsecutiveFailures: 2,
+		}, label: "retry"},
+		{name: "unrecognized verdict", budget: &backend.TerminalBudgetObservation{
+			Verdict: "close-now", ConsecutiveFailures: 100,
+		}, label: "unknown"},
+		{name: "exhausted with no recorded failure", budget: &backend.TerminalBudgetObservation{
+			Verdict: backend.TerminalVerdictExhausted,
+		}, label: "unknown"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var closed []string
+			var mu sync.Mutex
+			mockChain := &chaintest.MockClient{
+				GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+					return []billingtypes.Lease{{
+						Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE,
+						Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+					}}, nil
+				},
+				CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					closed = append(closed, leaseUUIDs...)
+					return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+				},
+			}
+			mockBackend := &mockReconcilerBackend{
+				name: "test",
+				provisions: []backend.ProvisionInfo{{
+					LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailed,
+					FailCount: 100, Reason: backend.ReasonContainerExited,
+					TerminalBudget: test.budget, BackendName: "test",
+				}},
+			}
+			router, _ := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+			})
+			reconciler, err := newTestReconciler(t, ReconcilerConfig{}, mockChain, noopAck, router, nil, nil)
+			require.NoError(t, err)
+			verdicts := metrics.ReconcilerTerminalVerdictsTotal.WithLabelValues(test.label)
+			before := promtestutil.ToFloat64(verdicts)
+
+			assert.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+			mu.Lock()
+			assert.Empty(t, closed, "FailCount must never close a lease on chain")
+			mu.Unlock()
+			mockBackend.mu.Lock()
+			defer mockBackend.mu.Unlock()
+			assert.Len(t, mockBackend.provisionCalls, 1, "the failed lease is re-provisioned instead")
+			assert.Empty(t, mockBackend.deprovisionCalls)
+			assert.Equal(t, 1.0, promtestutil.ToFloat64(verdicts)-before, "the verdict is counted once per sweep")
+		})
+	}
 }
 
 func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
@@ -3262,8 +3346,10 @@ func TestReconciler_ReconcileAll_ActiveNotProvisionedValidationError_Closes(t *t
 }
 
 func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T) {
-	// Setup: Active lease, failed provision with FailCount < max, re-provision returns ErrValidation
-	// Expected: Close the lease immediately (not keep retrying)
+	// Setup: Active lease, failed provision without an exhausted budget,
+	// re-provision returns ErrValidation.
+	// Expected: Close the lease immediately (not keep retrying). This sync-400
+	// close is a separate writer, unchanged by ENG-799 (ENG-800's scope).
 	var closedLeases []string
 	var closedReason string
 	var mu sync.Mutex
@@ -4610,7 +4696,8 @@ func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.
 }
 
 func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
-	// Setup: Active lease, failed provision exhausted retries. closeLease is called.
+	// Setup: Active lease, failed provision whose backend reports an exhausted
+	// consecutive-failure budget. closeLease is called.
 	//
 	// ENG-333: cleanupTerminalLease (called by closeLease) no longer eagerly
 	// deletes placement. The gated pruner is the sole owner. In this sweep:
@@ -4621,6 +4708,7 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 	// reports the lease as closed/terminal and the backend no longer lists it.
 	// See TestReconciler_ReconcileAll_RetainedOrphan_KeepsPlacement for the
 	// retained-lease case that ENG-333 was specifically designed to protect.
+	var closes atomic.Int32
 	mockChain := &chaintest.MockClient{
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
@@ -4628,6 +4716,7 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 			}, nil
 		},
 		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			closes.Add(1)
 			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
 		},
 	}
@@ -4635,10 +4724,12 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 		name: "test",
 		provisions: []backend.ProvisionInfo{
 			{
-				LeaseUUID:   "lease-1",
-				Status:      backend.ProvisionStatusFailed,
-				FailCount:   3,
-				BackendName: "test",
+				LeaseUUID:      "lease-1",
+				Status:         backend.ProvisionStatusFailed,
+				FailCount:      3,
+				Reason:         backend.ReasonContainerExited,
+				TerminalBudget: exhaustedBudget(),
+				BackendName:    "test",
 			},
 		},
 	}
@@ -4654,6 +4745,7 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 
 	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
+	require.Equal(t, int32(1), closes.Load(), "the exhausted lease must actually be closed in this sweep")
 
 	// ENG-333: placement is NOT eagerly deleted by cleanupTerminalLease anymore.
 	// It survives this sweep because the pre-sweep snapshots (backend inventory from
@@ -5757,10 +5849,13 @@ func TestReconciler_PartialInventoryCannotReplaceSilentConfirmedOwner(t *testing
 		name:    "backend-a",
 		listErr: errors.New("backend-a unavailable"),
 	}
+	// The exhausted verdict makes this a lease that WOULD close if its silent
+	// confirmed owner were wrongly replaced (ENG-799 keeps the guard non-vacuous).
 	backendB := &mockReconcilerBackend{
 		name: "backend-b",
 		provisions: []backend.ProvisionInfo{{
 			LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailed, FailCount: 100,
+			Reason: backend.ReasonContainerExited, TerminalBudget: exhaustedBudget(),
 		}},
 	}
 	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
@@ -5881,6 +5976,9 @@ func TestReconciler_RefreshFailureCannotActOnStaleFailedStatus(t *testing.T) {
 					LeaseUUID: "lease-1",
 					Status:    backend.ProvisionStatusFailed,
 					FailCount: 100,
+					// Would close on a fresh status; the stale one must not.
+					Reason:         backend.ReasonContainerExited,
+					TerminalBudget: exhaustedBudget(),
 				}},
 			}
 			router, err := backend.NewRouter(backend.RouterConfig{
@@ -5922,6 +6020,7 @@ func TestReconciler_DuplicateBackendOwnersDeferAndPersistQuarantine(t *testing.T
 	}}}
 	backendB := &mockReconcilerBackend{name: "backend-b", provisions: []backend.ProvisionInfo{{
 		LeaseUUID: "lease-1", Status: backend.ProvisionStatusFailed, FailCount: 100,
+		Reason: backend.ReasonContainerExited, TerminalBudget: exhaustedBudget(),
 	}}}
 	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
 		{Backend: backendA, IsDefault: true}, {Backend: backendB},
@@ -6044,6 +6143,8 @@ func TestReconciler_DurableDuplicateQuarantineSurvivesRestart(t *testing.T) {
 	backendA.mu.Lock()
 	backendA.provisions[0].Status = backend.ProvisionStatusFailed
 	backendA.provisions[0].FailCount = 100
+	backendA.provisions[0].Reason = backend.ReasonContainerExited
+	backendA.provisions[0].TerminalBudget = exhaustedBudget()
 	backendA.mu.Unlock()
 	backendB.mu.Lock()
 	backendB.listErr = errors.New("backend-b unavailable")

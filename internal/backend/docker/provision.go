@@ -291,6 +291,9 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 				ContainerIDs:         make([]string, 0, totalQuantity),
 				StackManifest:        nil, // set by enrichReserved
 				ServiceContainers:    nil,
+				// A fresh reservation starts a fresh budget (ENG-799). A re-provision
+				// of a Failed predecessor keeps that projection, and its budget.
+				TerminalBudget: leasesm.TerminalBudget{},
 			},
 		}.materialize()
 		b.provisions[req.LeaseUUID] = candidate

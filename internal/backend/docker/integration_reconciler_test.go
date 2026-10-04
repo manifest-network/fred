@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -399,9 +400,8 @@ func testReconcilerSetupWithRuntime(
 
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
-			Interval:               1 * time.Hour, // manual RunOnce only
-			MaxReprovisionAttempts: 3,
-			Coordinator:            reconciliation,
+			Interval:    1 * time.Hour, // manual RunOnce only
+			Coordinator: reconciliation,
 		},
 		tracker,
 	)
@@ -467,9 +467,8 @@ func newIntegrationReconcilerAfterProviderRestart(
 	require.NoError(t, err)
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
-			Interval:               time.Hour,
-			MaxReprovisionAttempts: 3,
-			Coordinator:            reconciliation,
+			Interval:    time.Hour,
+			Coordinator: reconciliation,
 		},
 		tracker,
 	)
@@ -616,111 +615,186 @@ func TestIntegration_Reconciler_ContainerDied_ReProvisions(t *testing.T) {
 	require.NotNil(t, info)
 }
 
-func TestIntegration_Reconciler_CrashLoop_ClosesLease(t *testing.T) {
-	leaseUUID := newIntegrationLeaseUUID()
-	tenant := "test-tenant"
-	sku := "docker-micro"
+// crashLoopChain is a mock chain for one lease that moves PENDING -> ACTIVE on
+// demand and records CloseLeases calls with their reasons.
+type crashLoopChain struct {
+	mu           sync.Mutex
+	active       bool
+	closedLeases []string
+	closeReasons []string
+}
 
-	manifest := manifest.Manifest{
-		Image:   "busybox:latest",
-		Command: []string{"sleep", "3600"},
+func (c *crashLoopChain) activate() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.active = true
+}
+
+func (c *crashLoopChain) closed() ([]string, []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.closedLeases), slices.Clone(c.closeReasons)
+}
+
+func (c *crashLoopChain) client(leaseUUID, tenant, sku string, metaHash []byte) *chaintest.MockClient {
+	lease := func(providerUUID string, state billingtypes.LeaseState) []billingtypes.Lease {
+		l := makeLease(leaseUUID, tenant, providerUUID, sku, 1, metaHash)
+		l.State = state
+		return []billingtypes.Lease{l}
 	}
-	payload, err := json.Marshal(manifest)
-	require.NoError(t, err)
-
-	hash := sha256.Sum256(payload)
-
-	var mu sync.Mutex
-	leaseState := billingtypes.LEASE_STATE_PENDING
-	var closedLeases []string
-
-	mockChain := &chaintest.MockClient{
+	return &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			if leaseState == billingtypes.LEASE_STATE_PENDING {
-				lease := makeLease(leaseUUID, tenant, providerUUID, sku, 1, hash[:])
-				lease.State = billingtypes.LEASE_STATE_PENDING
-				return []billingtypes.Lease{lease}, nil
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if c.active {
+				return nil, nil
 			}
-			return nil, nil
+			return lease(providerUUID, billingtypes.LEASE_STATE_PENDING), nil
 		},
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			if leaseState == billingtypes.LEASE_STATE_ACTIVE {
-				lease := makeLease(leaseUUID, tenant, providerUUID, sku, 1, hash[:])
-				lease.State = billingtypes.LEASE_STATE_ACTIVE
-				return []billingtypes.Lease{lease}, nil
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if !c.active {
+				return nil, nil
 			}
-			return nil, nil
+			return lease(providerUUID, billingtypes.LEASE_STATE_ACTIVE), nil
 		},
 		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 			return 1, []string{"txhash1"}, nil
 		},
 		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
-			mu.Lock()
-			closedLeases = append(closedLeases, leaseUUIDs...)
-			mu.Unlock()
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.closedLeases = append(c.closedLeases, leaseUUIDs...)
+			c.closeReasons = append(c.closeReasons, reason)
 			return 1, []string{"txhash-close"}, nil
 		},
 	}
+}
 
-	env := testReconcilerSetup(t, mockChain)
+// provisionedTerminalBudget is the budget the backend serves for one lease.
+func provisionedTerminalBudget(t *testing.T, b *Backend, leaseUUID string) *backend.TerminalBudgetObservation {
+	t.Helper()
+	provisions, err := b.ListProvisions(context.Background())
+	require.NoError(t, err)
+	for _, p := range provisions {
+		if p.LeaseUUID == leaseUUID {
+			return p.TerminalBudget
+		}
+	}
+	t.Fatalf("lease %s is not provisioned", leaseUUID)
+	return nil
+}
 
-	stored := env.tracker.store.Store(leaseUUID, payload)
-	require.True(t, stored)
+// drainFailureCallback consumes the lifecycle failure callback of a death when
+// one arrives promptly.
+func drainFailureCallback(env *reconcilerTestEnv) {
+	select {
+	case <-env.callbackCh:
+	case <-time.After(10 * time.Second):
+	}
+}
 
+// TestIntegration_Reconciler_CrashLoop_CountsButRespectsTheMinimumSpan runs a
+// workload that exits on its own a few seconds after every start: a real crash
+// loop of the tenant's own process, observed live by the Docker event stream.
+// Every exit counts against the backend's terminal budget (ENG-799), but three
+// exits inside the 30-minute minimum streak span only retry: providerd
+// re-provisions the lease and never closes it. The exit is the container's
+// own, never docker kill: an API kill is a disruption and never counts (see
+// the external-kill test). Exhaustion past the span is pinned on the synctest
+// clock by leasesm's sequence tests and the docker-backend's real-death tests.
+func TestIntegration_Reconciler_CrashLoop_CountsButRespectsTheMinimumSpan(t *testing.T) {
+	leaseUUID := newIntegrationLeaseUUID()
+	tenant := "test-tenant"
+	sku := "docker-micro"
+
+	payload, err := json.Marshal(manifest.Manifest{
+		Image:   "busybox:latest",
+		Command: []string{"sh", "-c", "sleep 8; exit 3"},
+	})
+	require.NoError(t, err)
+	hash := sha256.Sum256(payload)
+	chain := &crashLoopChain{}
+
+	// Keep the periodic sweep out of the way: only the live event stream gives
+	// a death the provenance that lets it count.
+	env := testReconcilerSetup(t, chain.client(leaseUUID, tenant, sku, hash[:]), func(cfg *Config) {
+		cfg.ReconcileInterval = time.Hour
+	})
+	require.True(t, env.tracker.store.Store(leaseUUID, payload))
 	ctx := context.Background()
 
-	// Initial provision
-	err = env.reconciler.RunOnce(ctx)
-	require.NoError(t, err)
-
+	require.NoError(t, env.reconciler.RunOnce(ctx))
 	initialDelivery := waitForCallbackDelivery(t, env.callbackCh, leaseUUID, 2*time.Minute)
 	require.Equal(t, backend.CallbackStatusSuccess, initialDelivery.Status)
 	require.True(t, env.tracker.finishProvisionCallback(initialDelivery))
+	chain.activate()
 
-	// Transition to ACTIVE
-	mu.Lock()
-	leaseState = billingtypes.LEASE_STATE_ACTIVE
-	mu.Unlock()
+	for crash := 1; crash <= 3; crash++ {
+		waitForProvisionStatus(t, env.backend, leaseUUID, backend.ProvisionStatusFailed, time.Minute)
+		drainFailureCallback(env)
+		budget := provisionedTerminalBudget(t, env.backend, leaseUUID)
+		require.NotNil(t, budget)
+		assert.Equal(t, crash, budget.ConsecutiveFailures, "crash %d", crash)
+		assert.Equal(t, backend.TerminalVerdictRetry, budget.Verdict,
+			"crash %d lands inside the minimum streak span", crash)
 
-	// Kill → FailCount=1 → re-provision → Kill → FailCount=2 → re-provision → Kill → FailCount=3 → close
-	for i := 1; i <= 3; i++ {
-		// Kill the container
-		containers := inspectProvisionContainers(t, leaseUUID)
-		require.NotEmpty(t, containers, "expected running container for iteration %d", i)
-		killContainer(t, containers[0].ID)
-
-		// Wait for backend to detect failure
-		waitForProvisionStatus(t, env.backend, leaseUUID, backend.ProvisionStatusFailed, 30*time.Second)
-
-		// Drain the failure callback from recoverState
-		select {
-		case <-env.callbackCh:
-		case <-time.After(10 * time.Second):
-			// may not always get it if backend already detected
-		}
-
-		// RunOnce → reconciler sees ACTIVE + Failed
-		err = env.reconciler.RunOnce(ctx)
-		require.NoError(t, err)
-
-		if i < 3 {
-			// Should re-provision (FailCount < 3)
-			delivery := waitForCallbackDelivery(t, env.callbackCh, leaseUUID, 2*time.Minute)
-			assert.Equal(t, backend.CallbackStatusSuccess, delivery.Status,
-				"re-provision %d should succeed", i)
-			require.True(t, env.tracker.finishProvisionCallback(delivery))
-		}
+		require.NoError(t, env.reconciler.RunOnce(ctx))
+		delivery := waitForCallbackDelivery(t, env.callbackCh, leaseUUID, 2*time.Minute)
+		assert.Equal(t, backend.CallbackStatusSuccess, delivery.Status, "re-provision %d should succeed", crash)
+		require.True(t, env.tracker.finishProvisionCallback(delivery))
 	}
 
-	// After the 3rd kill, reconciler should have called CloseLeases
-	mu.Lock()
-	closed := closedLeases
-	mu.Unlock()
-	assert.Contains(t, closed, leaseUUID, "CloseLeases should have been called with the lease UUID")
+	closed, _ := chain.closed()
+	assert.Empty(t, closed, "a crash loop younger than the minimum streak span never closes the lease")
+}
+
+// TestIntegration_Reconciler_ExternalKillsDoNotCloseLease pins the Docker
+// behavior the attribution relies on: an API kill is logged as a "kill" event
+// before the container's "die" on the same stream, so a container killed from
+// outside is a disruption that never counts, however often it happens.
+func TestIntegration_Reconciler_ExternalKillsDoNotCloseLease(t *testing.T) {
+	leaseUUID := newIntegrationLeaseUUID()
+	tenant := "test-tenant"
+	sku := "docker-micro"
+
+	payload, err := json.Marshal(manifest.Manifest{
+		Image:   "busybox:latest",
+		Command: []string{"sleep", "3600"},
+	})
+	require.NoError(t, err)
+	hash := sha256.Sum256(payload)
+	chain := &crashLoopChain{}
+	env := testReconcilerSetup(t, chain.client(leaseUUID, tenant, sku, hash[:]), func(cfg *Config) {
+		cfg.ReconcileInterval = time.Hour
+	})
+	require.True(t, env.tracker.store.Store(leaseUUID, payload))
+	ctx := context.Background()
+
+	require.NoError(t, env.reconciler.RunOnce(ctx))
+	initialDelivery := waitForCallbackDelivery(t, env.callbackCh, leaseUUID, 2*time.Minute)
+	require.Equal(t, backend.CallbackStatusSuccess, initialDelivery.Status)
+	require.True(t, env.tracker.finishProvisionCallback(initialDelivery))
+	chain.activate()
+
+	for kill := 1; kill <= 3; kill++ {
+		containers := inspectProvisionContainers(t, leaseUUID)
+		require.NotEmpty(t, containers, "expected a running container before kill %d", kill)
+		killContainer(t, containers[0].ID)
+		waitForProvisionStatus(t, env.backend, leaseUUID, backend.ProvisionStatusFailed, 30*time.Second)
+		drainFailureCallback(env)
+		assert.Equal(t, &backend.TerminalBudgetObservation{Verdict: backend.TerminalVerdictRetry},
+			provisionedTerminalBudget(t, env.backend, leaseUUID), "kill %d must not count", kill)
+
+		require.NoError(t, env.reconciler.RunOnce(ctx))
+		delivery := waitForCallbackDelivery(t, env.callbackCh, leaseUUID, 2*time.Minute)
+		assert.Equal(t, backend.CallbackStatusSuccess, delivery.Status, "re-provision after kill %d", kill)
+		require.True(t, env.tracker.finishProvisionCallback(delivery))
+	}
+
+	closed, _ := chain.closed()
+	assert.Empty(t, closed, "external kills never close a lease")
 }
 
 func TestIntegration_Reconciler_OrphanCleanup(t *testing.T) {
@@ -1115,9 +1189,8 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	configureEmptyPlacement(t, reconciliation, b)
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
-			Interval:               1 * time.Hour,
-			MaxReprovisionAttempts: 3,
-			Coordinator:            reconciliation,
+			Interval:    1 * time.Hour,
+			Coordinator: reconciliation,
 		},
 		tracker,
 	)

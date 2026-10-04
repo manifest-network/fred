@@ -8,10 +8,30 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/provisioner/terminalverdict"
 )
+
+const planTestLease = "11111111-1111-4111-8111-111111111111"
+
+// planVerdict reads a Failed lease's budget observation exactly as the
+// reconciler does. A nil observation is an absent verdict.
+func planVerdict(observation *backend.TerminalBudgetObservation) terminalverdict.Verdict {
+	return terminalverdict.FromProvision(backend.ProvisionInfo{
+		LeaseUUID: planTestLease, Status: backend.ProvisionStatusFailed, TerminalBudget: observation,
+	})
+}
+
+func exhaustedVerdict() terminalverdict.Verdict {
+	return planVerdict(&backend.TerminalBudgetObservation{
+		Verdict: backend.TerminalVerdictExhausted, ConsecutiveFailures: 3,
+	})
+}
 
 func TestPlanLease_DecisionTable(t *testing.T) {
 	t.Parallel()
+
+	exhaustion, ok := exhaustedVerdict().Exhausted()
+	require.True(t, ok)
 
 	tests := []struct {
 		name  string
@@ -131,14 +151,15 @@ func TestPlanLease_DecisionTable(t *testing.T) {
 			},
 		},
 		{
-			name: "active failure retries",
+			name: "active failure with a retry verdict re-provisions",
 			facts: leaseFacts{
 				authority:       lifecycleAuthorityDurable,
 				chain:           billingtypes.LEASE_STATE_ACTIVE,
 				hasProvision:    true,
 				provisionStatus: backend.ProvisionStatusFailed,
-				failCount:       1,
-				maxFailures:     3,
+				terminal: planVerdict(&backend.TerminalBudgetObservation{
+					Verdict: backend.TerminalVerdictRetry, ConsecutiveFailures: 2,
+				}),
 			},
 			want: leasePlan{
 				action:      reconcileActionStart,
@@ -148,20 +169,76 @@ func TestPlanLease_DecisionTable(t *testing.T) {
 			},
 		},
 		{
-			name: "active failure exhaustion closes and deprovisions",
+			name: "active failure with an absent verdict re-provisions",
 			facts: leaseFacts{
 				authority:       lifecycleAuthorityDurable,
 				chain:           billingtypes.LEASE_STATE_ACTIVE,
 				hasProvision:    true,
 				provisionStatus: backend.ProvisionStatusFailed,
-				failCount:       3,
-				maxFailures:     3,
+				terminal:        planVerdict(nil),
 			},
 			want: leasePlan{
-				action:  reconcileActionCloseAndDeprovision,
-				anomaly: true,
-				reason:  "reprovision attempts exhausted",
+				action:      reconcileActionStart,
+				withPayload: true,
+				anomaly:     true,
+				reason:      "active provision failed",
 			},
+		},
+		{
+			name: "active failure with an unrecognized verdict re-provisions",
+			facts: leaseFacts{
+				authority:       lifecycleAuthorityDurable,
+				chain:           billingtypes.LEASE_STATE_ACTIVE,
+				hasProvision:    true,
+				provisionStatus: backend.ProvisionStatusFailed,
+				terminal: planVerdict(&backend.TerminalBudgetObservation{
+					Verdict: "closed", ConsecutiveFailures: 3,
+				}),
+			},
+			want: leasePlan{
+				action:      reconcileActionStart,
+				withPayload: true,
+				anomaly:     true,
+				reason:      "active provision failed",
+			},
+		},
+		{
+			name: "active failure with an exhausted verdict closes and deprovisions",
+			facts: leaseFacts{
+				authority:       lifecycleAuthorityDurable,
+				chain:           billingtypes.LEASE_STATE_ACTIVE,
+				hasProvision:    true,
+				provisionStatus: backend.ProvisionStatusFailed,
+				terminal:        exhaustedVerdict(),
+			},
+			want: leasePlan{
+				action:     reconcileActionCloseAndDeprovision,
+				anomaly:    true,
+				reason:     "workload failure budget exhausted",
+				exhaustion: exhaustion,
+			},
+		},
+		{
+			name: "an exhausted verdict never closes a lease that is not Failed",
+			facts: leaseFacts{
+				authority:       lifecycleAuthorityDurable,
+				chain:           billingtypes.LEASE_STATE_ACTIVE,
+				hasProvision:    true,
+				provisionStatus: backend.ProvisionStatusReady,
+				terminal:        exhaustedVerdict(),
+			},
+			want: leasePlan{action: reconcileActionReconcileCustomDomain},
+		},
+		{
+			name: "a pending failure rejects whatever the verdict",
+			facts: leaseFacts{
+				authority:       lifecycleAuthorityDurable,
+				chain:           billingtypes.LEASE_STATE_PENDING,
+				hasProvision:    true,
+				provisionStatus: backend.ProvisionStatusFailed,
+				terminal:        exhaustedVerdict(),
+			},
+			want: leasePlan{action: reconcileActionReject, reason: "provisioning failed"},
 		},
 		{
 			name: "active healthy reconciles custom domain",
@@ -211,10 +288,9 @@ func TestPlanLease_MissingAuthorityAlwaysDefers(t *testing.T) {
 					chain:           chainState,
 					hasProvision:    hasProvision,
 					provisionStatus: status,
+					terminal:        exhaustedVerdict(),
 					hasMetaHash:     true,
 					payload:         payloadEvidencePresent,
-					failCount:       99,
-					maxFailures:     1,
 				})
 				require.Equalf(t, reconcileActionDefer, plan.action,
 					"chain=%s status=%s hasProvision=%t", chainState, status, hasProvision)
@@ -234,23 +310,35 @@ func TestLeasePlan_ZeroValueDefers(t *testing.T) {
 
 func FuzzPlanLease_SafetyInvariants(f *testing.F) {
 	f.Add(uint8(lifecycleAuthorityNone), uint8(billingtypes.LEASE_STATE_PENDING),
-		false, string(backend.ProvisionStatusUnknown), 0, 3, true,
+		false, string(backend.ProvisionStatusUnknown), true,
+		string(backend.TerminalVerdictRetry), 0, true,
 		uint8(payloadEvidencePresent), false)
 	f.Add(uint8(lifecycleAuthorityDurable), uint8(billingtypes.LEASE_STATE_ACTIVE),
-		true, string(backend.ProvisionStatusFailed), 3, 3, false,
+		true, string(backend.ProvisionStatusFailed), true,
+		string(backend.TerminalVerdictExhausted), 3, false,
+		uint8(payloadEvidenceUnknown), false)
+	f.Add(uint8(lifecycleAuthorityDurable), uint8(billingtypes.LEASE_STATE_ACTIVE),
+		true, string(backend.ProvisionStatusFailed), false,
+		"", 100, false,
 		uint8(payloadEvidenceUnknown), false)
 
 	f.Fuzz(func(t *testing.T, authority, chain uint8, hasProvision bool,
-		status string, failCount, maxFailures int, hasMetaHash bool,
+		status string, hasBudget bool, verdict string, consecutive int, hasMetaHash bool,
 		payload uint8, inFlight bool,
 	) {
+		info := backend.ProvisionInfo{LeaseUUID: planTestLease, Status: backend.ProvisionStatus(status)}
+		if hasBudget {
+			info.TerminalBudget = &backend.TerminalBudgetObservation{
+				Verdict: backend.TerminalVerdict(verdict), ConsecutiveFailures: consecutive,
+			}
+		}
+		terminal := terminalverdict.FromProvision(info)
 		facts := leaseFacts{
 			authority:       lifecycleAuthority(authority),
 			chain:           billingtypes.LeaseState(chain),
 			hasProvision:    hasProvision,
-			provisionStatus: backend.ProvisionStatus(status),
-			failCount:       failCount,
-			maxFailures:     maxFailures,
+			provisionStatus: info.Status,
+			terminal:        terminal,
 			hasMetaHash:     hasMetaHash,
 			payload:         payloadEvidence(payload),
 			inFlight:        inFlight,
@@ -267,6 +355,24 @@ func FuzzPlanLease_SafetyInvariants(f *testing.F) {
 		}
 		if plan.action > reconcileActionReconcileCustomDomain {
 			t.Fatalf("planner returned unknown action %d", plan.action)
+		}
+		// ENG-799: the failure-budget close requires an ACTIVE, provisioned,
+		// Failed lease with an exhausted verdict, and carries its proof.
+		_, exhausted := terminal.Exhausted()
+		if plan.action == reconcileActionCloseAndDeprovision {
+			assert.Equal(t, lifecycleAuthorityDurable, facts.authority)
+			assert.Equal(t, billingtypes.LEASE_STATE_ACTIVE, facts.chain)
+			assert.True(t, facts.hasProvision)
+			assert.Equal(t, backend.ProvisionStatusFailed, facts.provisionStatus)
+			assert.True(t, exhausted, "a close without an exhausted verdict")
+			assert.True(t, plan.exhaustion.Valid())
+			assert.Equal(t, planTestLease, plan.exhaustion.LeaseUUID())
+		} else {
+			assert.False(t, plan.exhaustion.Valid(), "only the close carries a close proof")
+		}
+		if !hasBudget || verdict != string(backend.TerminalVerdictExhausted) || consecutive < 1 {
+			assert.NotEqual(t, reconcileActionCloseAndDeprovision, plan.action,
+				"an absent, unrecognized or zero-count verdict closed a lease")
 		}
 	})
 }

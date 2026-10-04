@@ -284,6 +284,75 @@ func TestProvisionInfoRetentionDeadlineWireCompatibility(t *testing.T) {
 	assert.True(t, legacy.RetainedUntil.IsZero())
 }
 
+// TestProvisionInfoTerminalBudgetWireCompatibility pins the ENG-799 wire shape
+// in both directions. An older backend's response carries no terminal_budget
+// and must decode as an absent observation (which never closes a lease), a
+// backend with nothing to report must omit the field rather than send null, and
+// a verdict this providerd does not recognize must survive decoding verbatim
+// so that terminalverdict, not the decoder, refuses it.
+func TestProvisionInfoTerminalBudgetWireCompatibility(t *testing.T) {
+	var legacy ProvisionInfo
+	require.NoError(t, json.Unmarshal(
+		[]byte(`{"lease_uuid":"lease-1","status":"failed","fail_count":7}`), &legacy))
+	assert.Nil(t, legacy.TerminalBudget,
+		"a response from an older backend must decode as an absent budget")
+	assert.Equal(t, 7, legacy.FailCount, "fail_count keeps its meaning")
+
+	encodedLegacy, err := json.Marshal(legacy)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encodedLegacy), "terminal_budget",
+		"an absent budget is omitted, never sent as null")
+
+	for _, tc := range []struct {
+		name        string
+		observation TerminalBudgetObservation
+		wire        string
+	}{
+		{
+			name:        "retry",
+			observation: TerminalBudgetObservation{Verdict: TerminalVerdictRetry, ConsecutiveFailures: 1},
+			wire:        `{"verdict":"retry","consecutive_failures":1}`,
+		},
+		{
+			name:        "exhausted",
+			observation: TerminalBudgetObservation{Verdict: TerminalVerdictExhausted, ConsecutiveFailures: 3},
+			wire:        `{"verdict":"exhausted","consecutive_failures":3}`,
+		},
+		{
+			// A zero count is a real observation (a fresh budget), so it must
+			// be sent rather than dropped by omitempty.
+			name:        "fresh budget",
+			observation: TerminalBudgetObservation{Verdict: TerminalVerdictRetry},
+			wire:        `{"verdict":"retry","consecutive_failures":0}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observation := tc.observation
+			encoded, err := json.Marshal(ProvisionInfo{
+				LeaseUUID: "lease-1", Status: ProvisionStatusFailed, TerminalBudget: &observation,
+			})
+			require.NoError(t, err)
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(encoded, &fields))
+			assert.JSONEq(t, tc.wire, string(fields["terminal_budget"]))
+
+			var decoded ProvisionInfo
+			require.NoError(t, json.Unmarshal(encoded, &decoded))
+			require.NotNil(t, decoded.TerminalBudget)
+			assert.Equal(t, tc.observation, *decoded.TerminalBudget)
+		})
+	}
+
+	var future ProvisionInfo
+	require.NoError(t, json.Unmarshal([]byte(
+		`{"lease_uuid":"lease-1","status":"failed","terminal_budget":{"verdict":"close-now","consecutive_failures":9,"threshold":3}}`,
+	), &future))
+	require.NotNil(t, future.TerminalBudget)
+	assert.Equal(t, TerminalVerdict("close-now"), future.TerminalBudget.Verdict,
+		"an unrecognized verdict decodes verbatim; terminalverdict refuses it")
+	assert.Equal(t, 9, future.TerminalBudget.ConsecutiveFailures)
+}
+
 func TestResolveMaintenanceCallbackURLs(t *testing.T) {
 	const (
 		currentID = "550e8400-e29b-41d4-a716-446655440000"

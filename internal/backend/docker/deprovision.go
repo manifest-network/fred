@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -328,8 +329,9 @@ func (b *Backend) completeCloseOutcome(
 
 func (b *Backend) markClosePending(leaseUUID string, cause error) {
 	var diagSnap shared.DiagnosticEntry
+	now := time.Now()
 	b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
-		p.Status = backend.ProvisionStatusFailed
+		p.SetStatus(backend.ProvisionStatusFailed, now)
 		p.LastError = fmt.Sprintf("close execution remains pending: %v", cause)
 		p.Reason = backend.ReasonCleanupFailed
 		p.Message = backend.MsgCleanupFailed
@@ -354,8 +356,9 @@ func (b *Backend) doClosePhysical(
 	// identity/topology input. The projection contributes only recorded IDs to
 	// the rediscovering teardown fallback.
 	var containerIDs []string
+	deprovisionStarted := time.Now()
 	b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
-		p.Status = backend.ProvisionStatusDeprovisioning
+		p.SetStatus(backend.ProvisionStatusDeprovisioning, deprovisionStarted)
 		containerIDs = append([]string(nil), p.ContainerIDs...)
 	})
 	items := closeClaim.Items()
@@ -408,8 +411,9 @@ func (b *Backend) doClosePhysical(
 	if len(errs) > 0 {
 		// Partial failure: keep provision visible with only the stuck containers.
 		var diagSnap shared.DiagnosticEntry
+		failedAt := time.Now()
 		b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
-			p.Status = backend.ProvisionStatusFailed
+			p.SetStatus(backend.ProvisionStatusFailed, failedAt)
 			p.ContainerIDs = failedIDs
 			p.LastError = fmt.Sprintf("deprovision partially failed: %s", errors.Join(errs...))
 			p.Reason = backend.ReasonCleanupFailed
@@ -703,9 +707,10 @@ func (b *Backend) doClosePhysical(
 	if len(volumeErrs) > 0 {
 		joinedVolumeErr := errors.Join(volumeErrs...)
 		var diagSnap shared.DiagnosticEntry
+		failedAt := time.Now()
 		b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 			p.ContainerIDs = nil // containers are gone
-			p.Status = backend.ProvisionStatusFailed
+			p.SetStatus(backend.ProvisionStatusFailed, failedAt)
 			p.LastError = fmt.Sprintf("volume cleanup failed: %s", errors.Join(volumeErrs...))
 			p.Reason = backend.ReasonCleanupFailed
 			p.Message = backend.MsgCleanupFailed

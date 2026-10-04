@@ -98,6 +98,7 @@ var labelledMetricNames = []string{
 	"fred_provisioner_reconciler_lost_leases_total",
 	"fred_reconciler_actions_total",
 	"fred_reconciler_backend_fetch_total",
+	"fred_reconciler_terminal_verdicts_total",
 	"fred_reconciler_backend_inventory_total",
 	"fred_api_callback_signature_key_total",
 	"fred_api_callback_auth_failures_total",
@@ -146,6 +147,7 @@ func allCollectors() []prometheus.Collector {
 		ReconcilerLastSuccessTimestamp,
 		ReconciliationActions,
 		ReconcilerBackendFetchTotal,
+		ReconcilerTerminalVerdictsTotal,
 		ReconcilerBackendInventoryTotal,
 		ReconcilerBackendInventoryAnswered,
 		ReconcilerSweepComplete,
@@ -340,6 +342,11 @@ func TestCounterVecLabels(t *testing.T) {
 		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeOK)
 		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeError)
 		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeCircuitOpen)
+	})
+	assert.NotPanics(t, func() {
+		for _, verdict := range []string{"exhausted", "retry", "absent", "unknown"} {
+			ReconcilerTerminalVerdictsTotal.WithLabelValues(verdict)
+		}
 	})
 	assert.NotPanics(t, func() {
 		for _, outcome := range []string{

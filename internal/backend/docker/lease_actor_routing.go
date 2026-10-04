@@ -50,7 +50,8 @@ func (b *Backend) actorForLocked(leaseUUID string) *leasesm.LeaseActor {
 // enqueue is non-blocking to avoid holding the registry mutex across a
 // potentially-slow channel send). Fire-and-forget callers
 // (containerEventLoop, reconcile) treat refusal as "reconciler will
-// re-detect". Caller-facing API paths that need backpressure-retry
+// re-detect" (a re-detected death is unattributed and never counts toward
+// the terminal budget). Caller-facing API paths that need backpressure-retry
 // semantics should use routeToLeaseBlocking instead.
 func (b *Backend) routeToLease(leaseUUID string, msg leasesm.ActorCommand) bool {
 	b.actorsMu.Lock()
@@ -133,7 +134,9 @@ func (b *Backend) dispatchContainerDeathObservation(
 		return
 	}
 	dieEventDroppedTotal.WithLabelValues(source).Inc()
-	b.logger.Warn("die event dropped at dispatch; reconciler will re-detect",
+	// The sweep re-detects a current death, but without live provenance: it is
+	// attributed unknown and never counts toward the terminal budget (ENG-799).
+	b.logger.Warn("die event dropped at dispatch; the reconcile sweep will re-detect it, unattributed",
 		"source", source, "lease_uuid", observation.LeaseUUID(),
 		"container_id", leasesm.ShortID(containerID))
 }

@@ -79,8 +79,16 @@ type dockerClient interface {
 // This keeps Docker SDK types out of the interface boundary.
 type ContainerEvent struct {
 	ContainerID string
-	Action      string // "die", "stop", etc.
+	Action      string // one of the containerEvent* actions below
 }
+
+// The container lifecycle actions the event loop subscribes to. "start" and
+// "kill" exist only to attribute a "die" to its cause (ENG-799).
+const (
+	containerEventStart = "start"
+	containerEventKill  = "kill"
+	containerEventDie   = "die"
+)
 
 // releaseHistoryCapacityPlanner is the read-only admission half of the release
 // journal. Production uses the ReleaseStore itself. Keeping the capability

@@ -876,6 +876,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 
 	durableAllocsByLease := make(map[string]durableRecoveryAllocationCohort)
 	building := make(map[string]*recoveredProvision)
+	// recoveredAt stamps every status this pass writes through SetStatus and
+	// every budget it carries across a rebuild (ENG-799).
+	recoveredAt := time.Now()
 	// firstExitedByLease[uuid] is the container ID of the first container we
 	// observed in an exited state for that lease. Used to fire containerDiedMsg
 	// into the actor for Ready→Failed transitions so the SM handles the
@@ -974,8 +977,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Tenant:               c.Tenant,
 					ProviderUUID:         c.ProviderUUID,
 					SKU:                  c.SKU,
-					Status:               containerStatusToProvisionStatus(c.Status),
-					Quantity:             0, // set from ContainerIDs below
+					Status:               backend.ProvisionStatusUnknown, // set through SetStatus below
+					Quantity:             0,                              // set from ContainerIDs below
 					CreatedAt:            c.CreatedAt,
 					FailCount:            c.FailCount,
 					LastError:            "", // populated by cold-start/transition logic below
@@ -990,8 +993,10 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					ContainerIDs:         make([]string, 0),
 					StackManifest:        nil, // restored below
 					ServiceContainers:    nil, // rebuilt from labels below
+					TerminalBudget:       leasesm.TerminalBudget{},
 				},
 			}
+			prov.SetStatus(containerStatusToProvisionStatus(c.Status), recoveredAt)
 
 			// Restore manifest from the last successful (active) release so
 			// restart/update work after a cold start (manifest is not stored
@@ -1078,7 +1083,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// SM's Failing state handles the callback emission.
 		status := containerStatusToProvisionStatus(c.Status)
 		if status != backend.ProvisionStatusReady && prov.Status == backend.ProvisionStatusReady {
-			prov.Status = status
+			prov.SetStatus(status, recoveredAt)
 		}
 		if status == backend.ProvisionStatusFailed {
 			if _, already := firstExitedByLease[c.LeaseUUID]; !already {
@@ -1133,6 +1138,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Quantity:             quantity,
 					CreatedAt:            claim.CreatedAt(),
 					FailCount:            0,
+					TerminalBudget:       leasesm.TerminalBudget{},
 					LastError:            "",
 					Reason:               "",
 					Message:              "",
@@ -1267,6 +1273,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Quantity:             quantity,
 					CreatedAt:            release.CreatedAt,
 					FailCount:            0,
+					TerminalBudget:       leasesm.TerminalBudget{},
 					LastError:            "",
 					Reason:               "",
 					Message:              "",
@@ -1358,6 +1365,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				Quantity:             quantity,
 				CreatedAt:            claim.CreatedAt(),
 				FailCount:            0,
+				TerminalBudget:       leasesm.TerminalBudget{},
 				LastError:            "",
 				Reason:               "",
 				Message:              "",
@@ -1504,6 +1512,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Quantity:             quantity,
 					CreatedAt:            createdAt,
 					FailCount:            0,
+					TerminalBudget:       leasesm.TerminalBudget{},
 					LastError:            "",
 					Reason:               "",
 					Message:              "",
@@ -1672,10 +1681,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			if recovered == nil {
 				continue
 			}
-			recovered.Status = backend.ProvisionStatusRestarting
+			pendingStatus := backend.ProvisionStatusRestarting
 			if generation.maintenanceKind == shared.MaintenanceIntentUpdate {
-				recovered.Status = backend.ProvisionStatusUpdating
+				pendingStatus = backend.ProvisionStatusUpdating
 			}
+			recovered.SetStatus(pendingStatus, recoveredAt)
 			recovered.LastError = ""
 			recovered.Reason = ""
 			recovered.Message = ""
@@ -1711,7 +1721,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			if recovered.Status == backend.ProvisionStatusReady && !divergent && maintenanceReadiness[leaseUUID] {
 				continue
 			}
-			recovered.Status = backend.ProvisionStatusFailed
+			recovered.SetStatus(backend.ProvisionStatusFailed, recoveredAt)
 			recovered.LastError = existing.LastError
 			recovered.Reason = existing.Reason
 			recovered.Message = existing.Message
@@ -1727,7 +1737,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				// Preserve the actor-visible source state. A typed event after the map
 				// swap performs the Ready→Failed transition serially with every other
 				// command for this lease.
-				recovered.Status = backend.ProvisionStatusReady
+				recovered.SetStatus(backend.ProvisionStatusReady, recoveredAt)
 				recovered.FailCount = existing.FailCount
 				recovered.LastError = existing.LastError
 				recovered.Reason = existing.Reason
@@ -1737,7 +1747,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			}
 			// On cold start there is no actor to synchronize. Materialize Failed
 			// directly; any subsequently created actor initializes from that state.
-			recovered.Status = backend.ProvisionStatusFailed
+			recovered.SetStatus(backend.ProvisionStatusFailed, recoveredAt)
 			if existed {
 				recovered.FailCount = max(recovered.FailCount, existing.FailCount)
 			} else {
@@ -1761,7 +1771,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					continue
 				}
 				if rec, ok := building[uuid]; ok && rec.Status == backend.ProvisionStatusFailed {
-					rec.Status = backend.ProvisionStatusReady
+					rec.SetStatus(backend.ProvisionStatusReady, recoveredAt)
 					rec.FailCount = existing.FailCount
 					rec.LastError = existing.LastError
 					rec.Reason = existing.Reason
@@ -1802,6 +1812,16 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// increment would otherwise regress FailCount to the stale label. Preserve
 		// the higher in-memory value. Skipped for in-flight statuses (preserved
 		// wholesale below).
+		//
+		// The terminal budget (ENG-799) is carried by the same single loop. It
+		// lives only on the actor-owned projection, which no container label
+		// records, so a rebuild that dropped it would silently restart every
+		// streak. InheritTerminalBudget carries it and applies the Ready
+		// boundary between the existing status and the rebuilt one, so a
+		// rebuild never counts a failure: it keeps the budget, completes a
+		// counted Failing -> Failed, or moves it toward a reset. A rebuilt entry with
+		// no existing projection keeps its fresh budget: a backend restart
+		// resets every streak, as moby's daemon restore resets RestartCount.
 		for uuid, rec := range building {
 			existing, ok := b.provisions[uuid]
 			if !ok {
@@ -1814,6 +1834,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				if existing.FailCount > rec.FailCount {
 					rec.FailCount = existing.FailCount
 				}
+				rec.InheritTerminalBudget(&existing.ProvisionState, recoveredAt)
 				// Re-observing the same failed runtime does not replace its original
 				// actor-authored cause with a generic cohort diagnosis. A different
 				// release/operation or an actual transition to Ready is independent.
@@ -1900,8 +1921,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				// yet fired DiagGathered). Normalize to Failed so retry paths (which
 				// require Status == Failed) can proceed. Build the kept entry as a
 				// value — no in-place mutation of the published struct.
+				// Failing -> Failed keeps a counted failure current (ENG-799).
 				rec := recoveredFromProvision(existing)
-				rec.Status = backend.ProvisionStatusFailed
+				rec.SetStatus(backend.ProvisionStatusFailed, recoveredAt)
 				final[uuid] = rec.materialize()
 			case backend.ProvisionStatusFailed:
 				// Failed provision whose containers are gone — preserve so the
@@ -2241,7 +2263,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// (same code path as a live container-death event) and emits the
 	// terminal Failed callback from Failed.OnEntryFrom(evDiagGathered).
 	// Callback suppression on concurrent Deprovision is handled
-	// structurally by Failing.OnExit.
+	// structurally by Failing.OnExit. A death found by this sweep has no live
+	// event provenance, so it never counts against the terminal budget.
 	for _, generation := range failedGenerations {
 		containerID, ok := firstExitedByLease[generation.LeaseUUID()]
 		if !ok {
@@ -2427,99 +2450,4 @@ func (b *Backend) reconcileStateAndOperations(ctx context.Context) error {
 		finalizerErr = fmt.Errorf("reconcile restoring operations: %w", finalizerErr)
 	}
 	return errors.Join(operationErr, finalizerErr)
-}
-
-// containerEventLoop subscribes to Docker container "die" events and triggers
-// immediate failure handling. This provides near-instant detection of container
-// crashes, complementing the 5-minute reconcileLoop safety net.
-func (b *Backend) containerEventLoop() {
-	for {
-		select {
-		case <-b.stopCtx.Done():
-			return
-		default:
-		}
-		if err := b.requireStorageIdentity(b.stopCtx); err != nil {
-			b.logger.Error("container event listener stopped by backend identity verification", "error", err)
-			return
-		}
-
-		eventCh, errCh := b.docker.ContainerEvents(b.stopCtx)
-
-	consume:
-		for {
-			select {
-			case <-b.stopCtx.Done():
-				return
-			case event, ok := <-eventCh:
-				if !ok {
-					break consume
-				}
-				if event.Action == "die" {
-					if err := b.requireStorageIdentity(b.stopCtx); err != nil {
-						b.logger.Error("container event ignored after backend identity verification failed", "error", err)
-						return
-					}
-					if leaseUUID, found := b.findLeaseByContainerID(event.ContainerID); found {
-						if b.releaseStore == nil {
-							b.logger.Error("container event ignored without durable release authority",
-								"lease_uuid", leaseUUID)
-							continue
-						}
-						generation, generationErr := b.releaseStore.ProveRuntimeGeneration(leaseUUID)
-						if generationErr != nil {
-							b.logger.Warn("container event ignored without current runtime generation",
-								"lease_uuid", leaseUUID, "error", generationErr)
-							continue
-						}
-						observation, observationErr := leasesm.NewContainerDiedObservation(event.ContainerID, generation)
-						if observationErr != nil {
-							b.logger.Error("invalid container event ignored", "error", observationErr)
-							continue
-						}
-						b.dispatchContainerDeathObservation(observation, event.ContainerID, "event_loop")
-					}
-				}
-			case err, ok := <-errCh:
-				if !ok {
-					break consume
-				}
-				b.logger.Warn("container event stream error, reconnecting", "error", err)
-				break consume
-			}
-		}
-
-		// Backoff before reconnecting to avoid tight loop on persistent errors.
-		select {
-		case <-b.stopCtx.Done():
-			return
-		case <-time.After(time.Second):
-		}
-	}
-}
-
-// findLeaseByContainerID returns the lease UUID and true if a provision
-// containing the given container ID is found. Returns ("", false) otherwise.
-// Called under no lock; acquires read lock internally.
-//
-// O(N*M) linear scan over all leases and their containers. A reverse index
-// would be O(1) but adds sync overhead across provision/deprovision/restart/
-// update/recover. Fine at expected scale (hundreds of leases, 1-10 containers).
-func (b *Backend) findLeaseByContainerID(containerID string) (string, bool) {
-	b.provisionsMu.RLock()
-	defer b.provisionsMu.RUnlock()
-
-	leaseUUID := ""
-	for uuid, prov := range b.provisions {
-		for _, cid := range prov.ContainerIDs {
-			if cid == containerID {
-				if leaseUUID != "" && leaseUUID != uuid {
-					// A duplicate substrate identity has no unique actor owner.
-					return "", false
-				}
-				leaseUUID = uuid
-			}
-		}
-	}
-	return leaseUUID, leaseUUID != ""
 }
