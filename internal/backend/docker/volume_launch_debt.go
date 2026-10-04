@@ -14,6 +14,6 @@ type volumeLaunchCoordinator struct {
 	check          func(shared.VolumeLaunchOrigin, []fsidentity.Identity) error
 	checkNamespace func(string) error
 	pendingCount   func() (int, error)
-	compose        func(context.Context, *quiescedVolumes, imageexec.PreparedProject, composeUpOpts) error
+	compose        func(context.Context, *quiescedVolumes, imageexec.PreparedProject, composeUpOpts) (settledLaunch, error)
 	source         func(context.Context, *quiescedVolumes, compensationStartup) error
 }

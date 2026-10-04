@@ -255,6 +255,7 @@ func seedCloseRecoveryProjection(
 			LifecycleCallbackURL: lifecycleCallbackURL,
 			ActiveReleaseVersion: 0,
 			ActiveOperationID:    shared.OperationID{},
+			PendingOperation:     leasesm.PendingOperation{},
 			Items:                items,
 			ResourceProfiles:     testResourceProfiles(t, items),
 			ContainerIDs:         nil,

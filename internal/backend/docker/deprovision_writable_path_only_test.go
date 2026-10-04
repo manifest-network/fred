@@ -661,8 +661,10 @@ func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 		defer protected.release()
 		volume, err := protected.lookup(filepath.Base(hostVol))
 		require.NoError(t, err)
-		return b.setupWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "grafana/grafana:11.1.0"),
+		binds, skipped := b.seedWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "grafana/grafana:11.1.0"),
 			[]string{"/var/lib/grafana"}, 64<<20, 1<<30)
+		assert.True(t, skipped.empty(), "every writable path was seeded: the launch is complete")
+		return binds
 	})
 
 	// Stale tenant content is wiped; fresh image content is reseeded.
@@ -713,8 +715,10 @@ func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
 		defer protected.release()
 		volume, err := protected.lookup(filepath.Base(hostVol))
 		require.NoError(t, err)
-		return b.setupWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "img"),
+		binds, skipped := b.seedWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "img"),
 			[]string{"/var/lib/grafana"}, 64<<20, 1<<30)
+		assert.Equal(t, "writable_paths_unseeded", skipped.String(), "a skipped writable path degrades the launch (ENG-1125)")
+		return binds
 	})
 
 	assert.NotContains(t, binds, filepath.Join(wpDir, "var", "lib", "grafana"),
@@ -749,8 +753,10 @@ func TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable(t *testing.T) {
 		defer protected.release()
 		volume, err := protected.lookup(filepath.Base(hostVol))
 		require.NoError(t, err)
-		return b.setupWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "img"),
+		binds, skipped := b.seedWritablePathBinds(volume, context.Background(), admittedFixtureImage(t, "img"),
 			[]string{"/var/lib/grafana"}, 64<<20, 1<<30)
+		assert.Equal(t, "writable_paths_unseeded", skipped.String(), "a skipped writable path degrades the launch (ENG-1125)")
+		return binds
 	})
 
 	assert.Empty(t, binds,

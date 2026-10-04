@@ -434,6 +434,25 @@ func startPendingOperationForRecoveryTest(t *testing.T, b *Backend) shared.Opera
 	return started[0]
 }
 
+// pendingOperationStampForTest returns a PendingOperation naming a real
+// store-issued provision claim: AwaitOperation is the stamp's only minter.
+func pendingOperationStampForTest(t *testing.T) leasesm.PendingOperation {
+	t.Helper()
+	store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	spec := dockerOperationIntentSpec(t, backendidentity.ID{})
+	admission, err := beginDockerTestOperationIntent(t, store, spec, backendidentity.ID{})
+	require.NoError(t, err)
+	claim, created := admission.CreatedClaim()
+	require.True(t, created)
+	state := leasesm.ProvisionState{LeaseUUID: spec.LeaseUUID}
+	require.True(t, state.AwaitOperation(claim))
+	return state.PendingOperation
+}
+
 func readyIntentProjection(spec shared.OperationIntentSpec, containerIDs ...string) map[string]*provision {
 	effectiveItems := spec.EffectiveItems
 	if len(effectiveItems) == 0 {
@@ -826,7 +845,12 @@ func TestRecoverLiveOperationIntent_RetriesFailedActorSettlementWithoutDroppingP
 	projections[spec.LeaseUUID].Status = backend.ProvisionStatusFailed
 	projections[spec.LeaseUUID].Message = "image startup failed"
 	b := newOperationIntentRecoveryBackend(t, store, storageID, nil, projections)
-	startPendingOperationForRecoveryTest(t, b)
+	started := startPendingOperationForRecoveryTest(t, b)
+	// The actor's Provisioning entry stamped the projection with this exact
+	// operation; recovery proves the actor's failure by operation (ENG-1125).
+	b.provisionsMu.Lock()
+	require.True(t, b.provisions[spec.LeaseUUID].AwaitOperation(started))
+	b.provisionsMu.Unlock()
 	journal := &transientResolveOperationIntentJournal{
 		callbackPublicationService: b.callbackPublisher, failures: 1,
 	}

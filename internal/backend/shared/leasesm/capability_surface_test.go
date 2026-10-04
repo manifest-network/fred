@@ -21,6 +21,8 @@ func TestActorBoundaryDoesNotExportWritableMessageOrResultShapes(t *testing.T) {
 		ReplaceSuccessResult{}, ReplaceFailureInfo{}, ReplaceResult{},
 		// Only the actor may advance the terminal budget (ENG-799).
 		TerminalBudget{},
+		// Only a store-issued claim may stamp the awaited operation (ENG-1125).
+		PendingOperation{},
 	} {
 		typeOf := reflect.TypeOf(value)
 		for index := range typeOf.NumField() {

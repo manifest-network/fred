@@ -13,7 +13,18 @@ package backend
 type Reason string
 
 const (
-	ReasonContainerExited        Reason = "ContainerExited"
+	ReasonContainerExited Reason = "ContainerExited"
+	// ReasonHealthCheckFailed marks a container whose health check never passed
+	// during startup verification: Docker reported it unhealthy, or it was still
+	// not healthy at the startup deadline. It is never counted toward the
+	// terminal failure budget (ENG-1125).
+	ReasonHealthCheckFailed Reason = "HealthCheckFailed"
+	// ReasonContainerStartFailed marks a provision container that the
+	// container runtime refused to start: Docker answered its start request
+	// with an error and the container never ran (for example, an entrypoint
+	// that does not exist in the image). It is never counted toward the
+	// terminal failure budget (ENG-1125).
+	ReasonContainerStartFailed   Reason = "ContainerStartFailed"
 	ReasonImagePullFailed        Reason = "ImagePullFailed"
 	ReasonInternal               Reason = "Internal"
 	ReasonRestartFailed          Reason = "RestartFailed"
@@ -39,7 +50,27 @@ const (
 	MsgImagePullFailed        = "image pull failed"
 	MsgRestartFailed          = "restart failed"
 	MsgUpdateFailed           = "update failed"
+	MsgRestoreFailed          = "restore failed"
 	MsgVolumeCleanupExhausted = "volume cleanup exhausted"
 	MsgCleanupFailed          = "cleanup failed"
 	MsgBackendStorageLost     = "the backend storage holding this lease was irrecoverably lost"
+)
+
+// Curated messages for a failed startup verification (ENG-1125). Each one is
+// paired with its reason where the failure is observed; only an observed exit
+// is ContainerExited.
+const (
+	// MsgContainerExitedDuringStartup / MsgContainerExitedDuringHealthCheck:
+	// ReasonContainerExited.
+	MsgContainerExitedDuringStartup     = "container exited during startup"
+	MsgContainerExitedDuringHealthCheck = "container exited during health check"
+	// MsgContainerUnhealthy / MsgHealthCheckDeadline: ReasonHealthCheckFailed.
+	MsgContainerUnhealthy  = "container reported unhealthy"
+	MsgHealthCheckDeadline = "container did not become healthy before the startup deadline"
+	// MsgContainerStartRefused: ReasonContainerStartFailed.
+	MsgContainerStartRefused = "container runtime refused to start the container"
+	// MsgStartupUnverified / MsgStartupCanceled: ReasonInternal. Neither is an
+	// observation of the tenant's workload.
+	MsgStartupUnverified = "container startup could not be verified"
+	MsgStartupCanceled   = "container startup verification canceled"
 )

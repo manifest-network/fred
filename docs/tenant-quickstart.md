@@ -264,6 +264,8 @@ recognize as a generic failure and fall back to displaying `message`. The define
 | Reason | Meaning |
 |---|---|
 | `ContainerExited` | A container exited unexpectedly (crash, non-zero exit, OOM kill) |
+| `HealthCheckFailed` | A container's health check never passed during startup: it reported unhealthy, or was still not healthy at the startup deadline |
+| `ContainerStartFailed` | The container runtime refused to start a container, which never ran (for example, its entrypoint does not exist in the image) |
 | `ImagePullFailed` | The container image could not be pulled |
 | `Internal` | An internal fred/backend error (not attributable to the tenant's workload) |
 | `RestartFailed` | A tenant-initiated restart failed |
@@ -311,11 +313,31 @@ closed (`verdict`: `retry` or `exhausted`).
 A separate rule still closes an `ACTIVE` lease at once: when its automatic re-provision is
 refused as invalid, for example because its image is no longer allowed.
 
-Known gap, fixed separately for the same release (ENG-1125): a container that crashes during
-startup verification, before it ever becomes ready, does not reach this budget. On an automatic
-re-provision such a lease stays `provisioning` and keeps billing; close it yourself or update the
-manifest. In a stack with several services, a service that dies while a later one is still
-starting can likewise keep the lease cycling through re-provisions without ever being closed.
+A container that crashes while it starts, before it ever becomes ready, counts the same way:
+the lease reports `failed` with reason `ContainerExited`, usually within seconds, and is
+re-provisioned, and a crash loop is closed by the same three-failures-over-30-minutes rule. In a
+stack with several services, a service that crashes while another one is still starting fails the
+deployment too. A service whose health check passed once is then treated as healthy for as long as
+it runs, so a brief unhealthy report while the rest of the stack starts does not fail the
+deployment. These never count, and such a lease keeps being re-provisioned, billed, until you fix
+the manifest or close the lease:
+
+- A health check that never passes reports `HealthCheckFailed`. It is reported only when the
+  startup deadline is near (the provider's provision timeout, minus a minute), so a `PENDING`
+  lease is usually rejected first with `callback timeout`.
+- A container the runtime refuses to start, for example because its entrypoint does not exist in
+  the image, reports `ContainerStartFailed`.
+- A crash while the deployment itself is failing to start, for example a service that exits
+  because another service was refused, or a `depends_on` dependency gated by `service_healthy`
+  that crashes or reports unhealthy. It still reports `ContainerExited` (or `HealthCheckFailed`).
+
+A `depends_on` dependency gated by `service_healthy` is checked by Docker Compose while the
+deployment starts, not by the rule above: a brief unhealthy report from it still fails the
+deployment, and a dependency that never becomes healthy fails it only at the provision timeout,
+with an internal error.
+
+A failure the provider cannot attribute to your container at once is settled later, and never
+counts.
 
 ---
 

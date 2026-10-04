@@ -20,7 +20,7 @@ package testutil
 //   - it declares no function type, interface type or function literal, the
 //     shapes through which a caller could still hand it a logger;
 //   - it sends on a channel only as a case of a select that has a default
-//     case, so it never waits on the dispatcher or the reporter;
+//     case, so it never waits on the recorder or the reporter;
 //   - it receives only as a case of a select in consume, and only from the
 //     subscription's two streams (consume's <-chan ContainerEvent and
 //     <-chan error parameters) and its own stop field, none of which consume
@@ -35,9 +35,9 @@ package testutil
 // the closure is checked package-wide too (readerPackageFindings): no other
 // production file declares a method on, or an alias of, a type the reader
 // file declares or the reader's event type; the event type is a plain struct
-// of predeclared values; its action names are literal constants; and the two
-// metrics are client_golang collectors that no other code reassigns, so every
-// method the reader calls on them is client_golang's. The reader's one
+// of predeclared values; its action names are literal constants; and its one
+// metric is a client_golang collector that no other code reassigns, so every
+// method the reader calls on it is client_golang's. The reader's one
 // in-repo import, failurecause, imports nothing, prints nothing and declares
 // no channel, so no method of its event session can log or wait
 // (readerDependencyFindings).
@@ -92,12 +92,13 @@ var (
 		"_", "bool", "error", "false", "float64", "int", "len", "make", "nil", "string", "true", "uint64",
 	}
 	// readerPackageNames are the only names from the rest of package docker
-	// the reader's file may use: the event type and its actions, and the two
-	// metric series it updates, both client_golang collectors whose updates
-	// are atomic.
+	// the reader's file may use: the event type and its actions, and the drop
+	// counter it updates, a client_golang collector whose updates are atomic.
+	// The queue depth is sampled by the recorder and the dispatcher, on the
+	// dispatcher's queue.
 	readerPackageNames = []string{
 		"ContainerEvent", "containerEventStart", "containerEventKill", "containerEventDie",
-		"containerDeathQueueDepth", "eventLoopDeathsDropped",
+		"eventLoopDeathsDropped",
 	}
 	// readerStreamElements are the element types of consume's channel
 	// parameters that are the subscription's streams.
@@ -422,7 +423,6 @@ func (r containerEventReader) consume(events <-chan ContainerEvent, errs <-chan 
 func (r containerEventReader) enqueue(death fc.Provenance) {
 	select {
 	case r.deaths <- death:
-		containerDeathQueueDepth.Set(float64(len(r.deaths)))
 	default:
 		r.overflow.record()
 	}

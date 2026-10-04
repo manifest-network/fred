@@ -645,6 +645,8 @@ type provisionErroredMsg struct {
 	reason           backend.Reason // ENG-508
 	lastError        string
 	operationFailure shared.OperationReleaseUncommitted
+	startup          shared.OperationStartupFailure // ENG-1125; zero unless a definite startup failure
+	runtime          DurableRuntime                 // ENG-1125; zero unless a definite startup failure
 }
 
 func (provisionErroredMsg) isleaseMessage()          {}
@@ -1305,9 +1307,7 @@ func (a *LeaseActor) handle(msg leaseMessage) {
 	case provisionCompletedMsg:
 		a.handleProvisionCompleted(m.result)
 	case provisionErroredMsg:
-		a.handleProvisionErrored(
-			m.callbackErr, m.reason, m.lastError, m.operationFailure,
-		)
+		a.handleProvisionErrored(m)
 	case operationAmbiguousMsg:
 		a.handleOperationAmbiguous(m)
 	case replaceCompletedMsg:
@@ -1503,7 +1503,7 @@ func (a *LeaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 		msg.onPanic(errors.New("provision operation belongs to another lease"))
 		return
 	}
-	if err := a.sm.requestProvision(a.cfg.StopCtx); err != nil {
+	if err := a.sm.requestProvision(a.cfg.StopCtx, msg.Admission.Operation()); err != nil {
 		msg.onPanic(err)
 		return
 	}
@@ -1613,6 +1613,8 @@ func (a *LeaseActor) spawnProvisionWorker(
 				reason:           typed.reason,
 				lastError:        typed.err.Error(),
 				operationFailure: typed.proof,
+				startup:          typed.startup,
+				runtime:          typed.runtime,
 			}
 			event = "provision_errored"
 		case provisionWorkAmbiguous:
@@ -1628,18 +1630,8 @@ func (a *LeaseActor) handleProvisionCompleted(result ProvisionSuccessResult) {
 	_ = a.sm.provisionCompleted(a.cfg.StopCtx, result)
 }
 
-func (a *LeaseActor) handleProvisionErrored(
-	callbackErr string,
-	reason backend.Reason,
-	lastError string,
-	operationFailure shared.OperationReleaseUncommitted,
-) {
-	_ = a.sm.provisionErrored(a.cfg.StopCtx, provisionErrorInfo{
-		callbackErr:      callbackErr,
-		reason:           reason,
-		lastError:        lastError,
-		operationFailure: operationFailure,
-	})
+func (a *LeaseActor) handleProvisionErrored(msg provisionErroredMsg) {
+	_ = a.sm.provisionErrored(a.cfg.StopCtx, provisionErrorInfo(msg))
 }
 
 func (a *LeaseActor) handleRestartRequested(msg restartRequestedMsg) {
@@ -1709,7 +1701,7 @@ func (a *LeaseActor) handleRestoreRequested(msg restoreRequestedMsg) {
 	// this Fire, before the ack — preserving the handler-publish contract.
 	if err := a.sm.requestRestore(a.cfg.StopCtx, replaceEntryArgs{
 		CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
-		CallbackKind: replaceCallbackOperation,
+		CallbackKind: replaceCallbackOperation, Operation: msg.Operation,
 	}); err != nil {
 		// Restore is permitted only from Provisioning; from any other state
 		// (e.g. a duplicate after the SM already left Provisioning, or a

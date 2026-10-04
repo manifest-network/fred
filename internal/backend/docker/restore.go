@@ -1929,6 +1929,7 @@ func (b *Backend) Restore(ctx context.Context, request backend.RestoreRequest) e
 			LifecycleCallbackURL: req.LifecycleCallbackURL,
 			ActiveReleaseVersion: 0,
 			ActiveOperationID:    shared.OperationID{},
+			PendingOperation:     leasesm.PendingOperation{},
 			Items:                ingress.effectiveItems(),
 			ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 			ContainerIDs:         make([]string, 0),

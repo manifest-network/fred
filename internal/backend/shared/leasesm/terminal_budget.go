@@ -16,10 +16,13 @@ import (
 // the resulting typed verdict:
 //
 //   - Only consecutive failures of the tenant's own workload count
-//     (failurecause.Cause.Counts). Restarts, updates, rollbacks, restores,
-//     platform failures, signaled or vanished containers, host reboots and
-//     unknown causes are recorded but never counted, as Kubernetes
-//     podFailurePolicy keeps disruptions out of backoffLimit (KEP-3329).
+//     (failurecause.Cause.Counts): the observed death of a Ready lease's
+//     container, and the observed exit of a provision's container during
+//     startup verification (ENG-1125). Restarts, updates, rollbacks, restores,
+//     platform failures, signaled or vanished containers, health checks that
+//     never passed, host reboots and unknown causes are recorded but never
+//     counted, as Kubernetes podFailurePolicy keeps disruptions out of
+//     backoffLimit (KEP-3329).
 //   - The count resets once the lease has been Ready for
 //     terminalBudgetResetAfter. The reset is anchored on entering Ready and is
 //     checked at every exit from Ready, the way the kubelet resets crash-loop
@@ -126,9 +129,10 @@ type TerminalBudget struct {
 	// on every Ready entry and clears it at every Ready exit; nothing else
 	// does.
 	readySince time.Time
-	// standing is the decision recorded at the last counted Ready -> Failing
-	// failure. It holds until the next status change other than
-	// Failing -> Failed, which returns it to noCountedFailure.
+	// standing is the decision recorded at the last counted failure (a Ready
+	// -> Failing death, or a Provisioning -> Failed startup failure). It holds
+	// until the next status change other than Failing -> Failed, which returns
+	// it to noCountedFailure.
 	standing standingFailure
 }
 
@@ -219,12 +223,20 @@ func (p *ProvisionState) boundBudget() *TerminalBudget {
 //     leaves the budget exactly as it was, so a defensive re-write of Failed
 //     can never turn an exhausted verdict back into retry.
 //
+// Entering Ready also clears the projection's PendingOperation: a Ready
+// lease awaits no provision or restore (ENG-1125).
+//
 // It never increments the count, so a substrate may call it outside the lease
 // actor: it can only complete a counted Failing -> Failed, leave the budget
 // unchanged, or move it toward a reset.
 func (p *ProvisionState) SetStatus(status backend.ProvisionStatus, now time.Time) {
 	p.boundBudget().crossStatus(p.Status, status, now)
 	p.Status = status
+	if status == backend.ProvisionStatusReady {
+		// A Ready projection has no operation in flight (ENG-1125): whichever
+		// provision or restore it awaited has committed.
+		p.awaitNoOperation()
+	}
 }
 
 // InheritTerminalBudget carries predecessor's budget onto p, a rebuilt
@@ -279,12 +291,29 @@ func (b *TerminalBudget) crossStatus(from, to backend.ProvisionStatus, now time.
 	}
 }
 
+// countingTransition is the closed set of status changes a counted failure can
+// cause: the death of a Ready lease's workload (Ready -> Failing), and a
+// provision's definite startup failure (Provisioning -> Failed, ENG-1125). Any
+// other transition records its failure uncounted, whatever cause a caller
+// passes. Both members still need a counting cause, which only
+// failurecause.ClassifyDeath can mint, and the streak floors still apply.
+func countingTransition(from, to backend.ProvisionStatus) bool {
+	switch {
+	case from == backend.ProvisionStatusReady && to == backend.ProvisionStatusFailing:
+		return true
+	case from == backend.ProvisionStatusProvisioning && to == backend.ProvisionStatusFailed:
+		return true
+	default:
+		return false
+	}
+}
+
 // recordFailure is how the lease state machine records a failure: the status
 // change the failure caused, through SetStatus, and then the failure itself.
 // Fixing the order here means the sustained-Ready reset always applies before
-// a counted failure increments the streak. Only the death of a Ready lease's
-// workload (Ready -> Failing) can count, whatever cause a caller passes. It
-// must run after the closure has written p.Reason.
+// a counted failure increments the streak. Only a counting transition can
+// count (countingTransition). It must run after the closure has written
+// p.Reason.
 func (p *ProvisionState) recordFailure(
 	to backend.ProvisionStatus,
 	cause failurecause.Cause,
@@ -293,8 +322,7 @@ func (p *ProvisionState) recordFailure(
 	from := p.Status
 	p.SetStatus(to, now)
 	budget := p.boundBudget()
-	deathOfReadyWorkload := from == backend.ProvisionStatusReady && to == backend.ProvisionStatusFailing
-	if !deathOfReadyWorkload || !cause.Counts() || !reasonEligibleForBudget(p.Reason) {
+	if !countingTransition(from, to) || !cause.Counts() || !reasonEligibleForBudget(p.Reason) {
 		return budgetOutcome{cause: cause, consecutive: budget.consecutive}
 	}
 	standing := budget.countFailure(now)

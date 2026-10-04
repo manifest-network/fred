@@ -735,6 +735,8 @@ The set defined today:
 | Reason | Meaning |
 |---|---|
 | `ContainerExited` | A container exited unexpectedly (crash, non-zero exit, OOM kill) |
+| `HealthCheckFailed` | A container's health check never passed during startup: it reported unhealthy, or was still not healthy at the startup deadline |
+| `ContainerStartFailed` | The container runtime refused to start a container, which never ran (for example, its entrypoint does not exist in the image) |
 | `ImagePullFailed` | The container image could not be pulled |
 | `Internal` | An internal fred/backend error occurred (not attributable to the tenant's workload) |
 | `RestartFailed` | A tenant-initiated restart failed |
@@ -2037,6 +2039,8 @@ Chain state       Backend inventory       Durable placement/attempts
 | PENDING + meta_hash | Not provisioned | Await payload upload |
 | PENDING (no hash) | Not provisioned | Start provisioning |
 | PENDING | Provisioned + ready | Acknowledge lease |
+| PENDING | Provisioned + failed | Reject on chain. The backend's failure callback usually rejects it first, with the curated message (a startup crash reports it within seconds); a sweep that finds it rejects with `provisioning failed` |
+| ACTIVE | Provisioned + provisioning | In-flight re-provision - no action. The backend bounds it: a definite startup failure reports `failed` at once, and an attempt the backend could not settle live is settled `failed` by its periodic recovery, within one `reconcile_interval` when one of its containers exited or its cohort is partial, otherwise at `provision_timeout` |
 | ACTIVE | Provisioned + ready | Healthy - no action |
 | ACTIVE | Provisioned + restarting | In-flight restart - no action |
 | ACTIVE | Provisioned + updating | In-flight update - no action |

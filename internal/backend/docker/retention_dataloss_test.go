@@ -152,6 +152,7 @@ func projectReadyRestoredLease(b *Backend, entry shared.RetentionEntry) {
 			LifecycleCallbackURL: entry.DestinationLifecycleCallbackURL,
 			ActiveReleaseVersion: 0,
 			ActiveOperationID:    entry.DestinationOperationID,
+			PendingOperation:     leasesm.PendingOperation{},
 			Items:                slices.Clone(entry.DestinationItems),
 			ResourceProfiles:     shared.CloneSKUResourceSnapshot(entry.DestinationResourceProfiles),
 			ContainerIDs:         nil,

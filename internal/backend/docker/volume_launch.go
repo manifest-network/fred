@@ -44,6 +44,10 @@ type quiescedVolumes struct {
 	reserved         *reservedVolumeSet
 	releaseNamespace func()
 	active           *atomic.Bool
+	// degradations records each part of the platform's own preparation the
+	// launch skipped (writable-path seeding, or an image detection it depends
+	// on). The launch's settled receipt carries it (ENG-1125).
+	degradations launchDegradations
 }
 
 func (q *quiescedVolumes) requireReservation() error {
@@ -156,45 +160,53 @@ func (q *quiescedVolumes) releaseResources() {
 // be rearranged by a lifecycle caller: materialize roots, reserve their physical
 // identities, stop writers, prepare every bind, validate the complete graph,
 // freeze the image-bound project, then hold exclusion through Compose Start.
-func (b *Backend) launchCompose(ctx context.Context, mutations *storageMutations, params composeProjectParams, resources []shared.SKUResourceSnapshot, opts composeUpOpts) error {
+// A settled launch exchange returns its receipt (ENG-1125), together with the
+// exchange's own error when Compose or the daemon rejected it; any other
+// error comes with no receipt.
+func (b *Backend) launchCompose(ctx context.Context, mutations *storageMutations, params composeProjectParams, resources []shared.SKUResourceSnapshot, opts composeUpOpts) (settledLaunch, error) {
 	if mutations == nil || params.LeaseUUID != mutations.leaseUUID || params.VolBinds != nil {
-		return errors.New("compose launch inputs differ from the physical subject")
+		return settledLaunch{}, errors.New("compose launch inputs differ from the physical subject")
 	}
 	ingress, err := restoreIngressPlan(params.Ingress, params.Stack, params.Items)
 	if err != nil {
-		return err
+		return settledLaunch{}, err
 	}
 	profiles, err := resourceProfileMap(params.Items, resources)
 	if err != nil {
-		return err
+		return settledLaunch{}, err
 	}
 	params.Profiles = profiles
 	volumeSetupStartedAt := time.Now()
 	volumes, err := b.prepareLaunchVolumes(ctx, mutations, params, resources)
 	if err != nil {
 		mutations.observeReplacementPhase(phaseVolumeSetup, volumeSetupStartedAt)
-		return err
+		return settledLaunch{}, err
 	}
 	defer volumes.release()
+	for _, setup := range params.ImageSetups {
+		if setup != nil {
+			volumes.degradations.addAll(setup.Degradations)
+		}
+	}
 	binds, _, err := b.setupVolBinds(volumes, ctx, params.LeaseUUID, params.Items,
 		resources, params.ImageSetups, b.logger)
 	mutations.observeReplacementPhase(phaseVolumeSetup, volumeSetupStartedAt)
 	if err != nil {
-		return err
+		return settledLaunch{}, err
 	}
 	params.VolBinds = binds
 	project := buildPlannedComposeProject(params, ingress)
 	if err := volumes.validateProject(project); err != nil {
-		return err
+		return settledLaunch{}, err
 	}
 	prepared, err := mutations.ops.compose.PrepareProject(project, composeProjectImages(project, params.ImageSetups))
 	if err != nil {
-		return err
+		return settledLaunch{}, err
 	}
 	composeStartedAt := time.Now()
-	err = b.volumeLaunches.compose(ctx, volumes, prepared, opts)
+	launch, err := b.volumeLaunches.compose(ctx, volumes, prepared, opts)
 	mutations.observeReplacementPhase(phaseComposeUp, composeStartedAt)
-	return err
+	return launch, err
 }
 
 // The complete launch owns the phase boundaries, while the exact physical
@@ -221,6 +233,7 @@ func (b *Backend) prepareLaunchVolumes(ctx context.Context, mutations *storageMu
 	}
 	created := make(map[string]bool)
 	paths := make(map[string]string)
+	var skipped launchDegradations
 	for _, item := range params.Items {
 		setup := params.ImageSetups[item.ServiceName]
 		profile, ok := params.Profiles[item.SKU]
@@ -241,7 +254,9 @@ func (b *Backend) prepareLaunchVolumes(ctx context.Context, mutations *storageMu
 			if err != nil {
 				if !stateful {
 					// Writable-path seeding remains best effort. No path capability
-					// is issued for this volume; Compose retains its tmpfs fallback.
+					// is issued for this volume; Compose retains its tmpfs fallback,
+					// and the launch is degraded (ENG-1125).
+					skipped.add(launchWritableVolumeUnavailable)
 					continue
 				}
 				return nil, fmt.Errorf("prepare launch volume %q: %w", name, err)
@@ -249,7 +264,12 @@ func (b *Backend) prepareLaunchVolumes(ctx context.Context, mutations *storageMu
 			paths[name], created[name] = path, wasCreated
 		}
 	}
-	return b.quiesceLaunchVolumes(ctx, mutations, paths, created, nil)
+	volumes, err := b.quiesceLaunchVolumes(ctx, mutations, paths, created, nil)
+	if err != nil {
+		return nil, err
+	}
+	volumes.degradations.addAll(skipped)
+	return volumes, nil
 }
 
 func (b *Backend) quiesceLaunchVolumes(ctx context.Context, mutations *storageMutations, paths map[string]string, created map[string]bool, expected map[string]fsidentity.Identity) (*quiescedVolumes, error) {

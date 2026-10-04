@@ -28,7 +28,7 @@ func newTestExecutor(
 	action func(context.Context, string) error,
 	classify func(context.Context, string) (string, error),
 	workflows ...func(context.Context, testCapability, string) error,
-) (*Guard[testCapability, string, string], *RecoveryAttestor[string, string]) {
+) (*Guard[testCapability, string, NoFinding, string], *RecoveryAttestor[string, string]) {
 	t.Helper()
 	binding, err := protocol.NewGuardBinding()
 	if err != nil {
@@ -64,7 +64,7 @@ func newTestExecutor(
 	return guard, attestor
 }
 
-func defaultExecutor(t *testing.T, protocol *Protocol[string]) (*Guard[testCapability, string, string], *RecoveryAttestor[string, string]) {
+func defaultExecutor(t *testing.T, protocol *Protocol[string]) (*Guard[testCapability, string, NoFinding, string], *RecoveryAttestor[string, string]) {
 	t.Helper()
 	return newTestExecutor(
 		t, protocol, allow, completeOK,
@@ -92,7 +92,7 @@ func recoverStarted(t *testing.T, protocol *Protocol[string], subject string) Re
 }
 
 func executeDown(
-	guard *Guard[testCapability, string, string],
+	guard *Guard[testCapability, string, NoFinding, string],
 	started LiveExecution[string],
 ) Result[string, string] {
 	return guard.Execute(started, context.Background())
@@ -194,7 +194,7 @@ func TestLiveAndRecoveryAuthoritiesHaveDisjointAPIs(t *testing.T) {
 	if live == recovery || live.ConvertibleTo(recovery) || recovery.ConvertibleTo(live) {
 		t.Fatal("live and recovery authority types are interchangeable")
 	}
-	execute, ok := reflect.TypeFor[*Guard[testCapability, string, string]]().MethodByName("Execute")
+	execute, ok := reflect.TypeFor[*Guard[testCapability, string, NoFinding, string]]().MethodByName("Execute")
 	if !ok || execute.Type.In(1) != live {
 		t.Fatalf("Guard.Execute authority = %v, want %v", execute.Type.In(1), live)
 	}

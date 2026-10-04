@@ -124,12 +124,48 @@ func (h *budgetEventHarness) setContainer(status string, exitCode int, oomKilled
 
 func (h *budgetEventHarness) send(actions ...string) {
 	h.t.Helper()
+	h.sendFor("c1", actions...)
+}
+
+// sendFor delivers the given events of containerID on the current stream.
+func (h *budgetEventHarness) sendFor(containerID string, actions ...string) {
+	h.t.Helper()
 	h.mu.Lock()
 	events := h.events
 	h.mu.Unlock()
 	for _, action := range actions {
-		events <- ContainerEvent{ContainerID: "c1", Action: action}
+		select {
+		case events <- ContainerEvent{ContainerID: containerID, Action: action}:
+		case <-time.After(5 * time.Second):
+			h.t.Fatalf("the event loop stopped taking events at %s %s", containerID, action)
+		}
 	}
+}
+
+// awaitSubscriptions waits until the event loop has subscribed n times.
+func (h *budgetEventHarness) awaitSubscriptions(n int) {
+	h.t.Helper()
+	require.Eventually(h.t, func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.subscriptions >= n
+	}, 5*time.Second, time.Millisecond, "the event loop never subscribed %d times", n)
+}
+
+// countStorageVerifications makes b's storage verifier count its calls. The
+// event loop verifies once before each subscription, and its dispatch path
+// first of all for every death it handles, so the count shows how far the
+// dispatcher got.
+func countStorageVerifications(b *Backend) *atomic.Int32 {
+	calls := new(atomic.Int32)
+	b.storageVerifier = testDockerRuntimeStorageVerifier{
+		identity: func() backendidentity.ID { return b.storageIdentity },
+		verify: func(context.Context) error {
+			calls.Add(1)
+			return nil
+		},
+	}
+	return calls
 }
 
 // reconnectStream ends the current subscription and makes the next one a

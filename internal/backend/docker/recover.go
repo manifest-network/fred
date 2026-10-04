@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
 	"strings"
@@ -44,6 +45,25 @@ func newDurableRecoveryAllocationCohort(
 	allocations []shared.ResourceAllocation,
 ) durableRecoveryAllocationCohort {
 	return durableRecoveryAllocationCohort{allocations: allocations}
+}
+
+// awaitsReprovisionOfItsRelease reports whether the live projection of
+// leaseUUID is a settled provision failure of the very runtime recovery
+// rebuilt: Failed with an authored reason, no container, and the same active
+// Release generation. A live definite startup failure and a recovery-settled
+// failure both leave an ACTIVE lease that way until providerd re-provisions
+// it (ENG-1125), so its empty cohort is expected, not a divergence. It only
+// reads the projection, to choose a log level.
+func (b *Backend) awaitsReprovisionOfItsRelease(leaseUUID string, rebuilt *recoveredProvision) bool {
+	if rebuilt == nil || len(rebuilt.ContainerIDs) != 0 {
+		return false
+	}
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+	existing := b.provisions[leaseUUID]
+	return existing != nil && existing.Status == backend.ProvisionStatusFailed && existing.Reason != "" &&
+		len(existing.ContainerIDs) == 0 && existing.ActiveReleaseVersion == rebuilt.ActiveReleaseVersion &&
+		existing.ActiveOperationID == rebuilt.ActiveOperationID
 }
 
 func runtimeIdentityForRelease(release *shared.Release) (shared.ReleaseRuntimeIdentity, bool) {
@@ -988,6 +1008,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					LifecycleCallbackURL: callbackPair.lifecycleCallbackURL,
 					ActiveReleaseVersion: 0,
 					ActiveOperationID:    shared.OperationID{},
+					PendingOperation:     leasesm.PendingOperation{},
 					Items:                nil, // rebuilt from labels below
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 					ContainerIDs:         make([]string, 0),
@@ -1146,6 +1167,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					LifecycleCallbackURL: claim.LifecycleCallbackURL(),
 					ActiveReleaseVersion: 0,
 					ActiveOperationID:    shared.OperationID{},
+					PendingOperation:     leasesm.PendingOperation{},
 					Items:                items,
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 					ContainerIDs:         nil,
@@ -1170,6 +1192,10 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			recovered.ResourceProfiles = shared.CloneSKUResourceSnapshot(resourceProfiles)
 			recovered.StackManifest = stackManifest
 		}
+		// The overlay awaits exactly this durable operation, as an actor's
+		// Provisioning entry does, so live recovery can later publish its failure
+		// on this projection (ENG-1125).
+		recovered.AwaitOperation(claim)
 		allocations, allocationErr := recoveredSnapshotAllocations(
 			leaseUUID, claim.Tenant(), items, resourceProfiles,
 		)
@@ -1281,6 +1307,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					LifecycleCallbackURL: authority.LifecycleCallbackURL(),
 					ActiveReleaseVersion: release.Version,
 					ActiveOperationID:    authority.OperationID(),
+					PendingOperation:     leasesm.PendingOperation{},
 					Items:                items,
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 					ContainerIDs:         nil,
@@ -1373,6 +1400,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				LifecycleCallbackURL: claim.LifecycleCallbackURL(),
 				ActiveReleaseVersion: claim.ActiveReleaseVersion(),
 				ActiveOperationID:    claim.ActiveReleaseOperationID(),
+				PendingOperation:     leasesm.PendingOperation{},
 				Items:                items,
 				ResourceProfiles:     claim.ResourceProfiles(),
 				ContainerIDs:         containerIDs,
@@ -1520,6 +1548,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					LifecycleCallbackURL: lifecycleCallbackURL,
 					ActiveReleaseVersion: release.Version,
 					ActiveOperationID:    release.OperationID,
+					PendingOperation:     leasesm.PendingOperation{},
 					Items:                items,
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 					ContainerIDs:         nil,
@@ -1600,7 +1629,16 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if release := releasesByLease[leaseUUID]; release != nil {
 			desiredItems = release.Items
 		}
-		b.logger.Error("recovered container cohort differs from durable release",
+		level := slog.LevelError
+		if b.awaitsReprovisionOfItsRelease(leaseUUID, recovered) {
+			// Expected, not a divergence: the lease's last provision attempt
+			// failed and was settled, which left its active Release with no
+			// container until providerd re-provisions it (ENG-1125). The
+			// projection keeps its own cause below; logging it as an error on
+			// every pass would only repeat that failure.
+			level = slog.LevelDebug
+		}
+		b.logger.Log(ctx, level, "recovered container cohort differs from durable release",
 			"lease_uuid", leaseUUID,
 			"observed_containers", len(recovered.ContainerIDs),
 			"desired_containers", expectedIntentQuantity(desiredItems),

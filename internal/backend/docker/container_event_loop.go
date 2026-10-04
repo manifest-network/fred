@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 	"github.com/manifest-network/fred/internal/metrics/background"
@@ -20,19 +21,31 @@ import (
 //   - The reader (container_event_reader.go) reads one subscription at a time
 //     and owns its failurecause event session, which never leaves the
 //     reader's frame. Its per-event work is bookkeeping only; each death goes
-//     to a bounded queue. dockerd skips events for a subscriber that falls
-//     behind (a 1,024-event buffer, then 100ms per event), and a skipped
-//     "kill" would let the following "die" count, so the reader waits on
-//     nothing but its stream: not on death processing, and not on log output.
-//     It has no logger; a death it drops from a full queue is only counted.
-//   - One dispatcher drains the queue in arrival order, which also keeps each
+//     to the subscription's bounded queue. dockerd skips events for a
+//     subscriber that falls behind (a 1,024-event buffer, then 100ms per
+//     event), and a skipped "kill" would let the following "die" count, so
+//     the reader waits on nothing but its stream: not on death processing,
+//     and not on log output. It has no logger; a death it drops from a full
+//     queue is only counted.
+//   - One recorder is the reader's only consumer. The loop hands it each
+//     subscription's queue before the subscription opens and closes the queue
+//     once the reader has returned. The recorder writes every death into the
+//     live-death ledger (live_death_ledger.go) and only then forwards it to
+//     the dispatcher, without waiting, so a death the dispatcher cannot route
+//     yet is already recorded when a provision's Ready entry looks for it
+//     (ENG-1125). It marks the stream in the ledger in the same order: up
+//     before the first death of a subscription, down after the last one. The
+//     ledger takes a lock, so the reader never writes it.
+//   - One dispatcher drains its queue in arrival order, which also keeps each
 //     container's deaths in order. It does the blocking work: storage identity
 //     re-verification, the lease lookup, the runtime-generation proof and
-//     actor routing. A death it cannot deliver is dropped and counted; the
-//     sweep later finds it, unattributed.
-//   - One reporter logs the deaths the reader dropped, at most once per
-//     containerDeathOverflowReportInterval, so a stalled log sink stalls only
-//     the reporter.
+//     actor routing. A death whose container is in no projection, or only in
+//     a provision that is not Ready yet, is left to the ledger's readers; any
+//     other death it cannot deliver is dropped and counted, and the sweep
+//     later finds it, unattributed.
+//   - One reporter logs the deaths the reader or the recorder dropped, at most
+//     once per containerDeathOverflowReportInterval, so a stalled log sink
+//     stalls only the reporter.
 //   - A stream error, a closed stream or a non-terminal verification failure
 //     backs off and reconnects with a fresh session; only shutdown or a
 //     latched terminal storage-authority failure stops the loop.
@@ -42,10 +55,12 @@ import (
 // started before the stream (re)connected, are attributed unknown.
 
 const (
-	// containerDeathQueueCapacity bounds the deaths waiting for dispatch. Only
-	// deaths queue; start and kill never wait. Generous next to the hundreds of
-	// leases a host runs, it absorbs a death storm while one verification is
-	// slow. A death that finds it full is dropped toward unknown, never blocks.
+	// containerDeathQueueCapacity bounds each of the loop's death queues: a
+	// subscription's, which the recorder drains, and the dispatcher's. Only
+	// deaths queue; start and kill never wait. Generous next to the hundreds
+	// of leases a host runs, it absorbs a death storm while one verification
+	// is slow. A death that finds a queue full is dropped toward unknown,
+	// never blocks.
 	containerDeathQueueCapacity = 4096
 	// containerEventVerifyTimeout bounds each storage re-verification the loop
 	// makes, so a daemon that stops answering "docker info" cannot wedge it.
@@ -64,7 +79,7 @@ const (
 	// are summed into the next line.
 	containerDeathOverflowReportInterval = 10 * time.Second
 	// containerDeathOverflowMessage is the reporter's summary of the deaths the
-	// reader dropped, with their count as "dropped".
+	// loop dropped, with their count as "dropped".
 	containerDeathOverflowMessage = "container deaths dropped: dispatch queue full; the reconcile sweep will find them, unattributed"
 	// containerDeathOverflowReporter labels the reporter's contained panics in
 	// fred_background_goroutine_panics_total.
@@ -98,24 +113,30 @@ func (b *Backend) containerEventLoop() {
 
 // runContainerEventLoop is containerEventLoop with its reconnect backoff as
 // parameters, so a test can drive many reconnects quickly. It owns the
-// dispatcher and the overflow reporter, and stops both before it returns.
+// recorder, the dispatcher and the overflow reporter, and stops them in that
+// order before it returns: the recorder once it has recorded and forwarded
+// the last death, the dispatcher once it has drained its queue, and the
+// reporter last, so that it logs every drop either of the others counted.
 func (b *Backend) runContainerEventLoop(retryInitial, retryMax time.Duration) {
-	deaths := make(chan failurecause.Provenance, containerDeathQueueCapacity)
+	subscriptions := make(chan (<-chan failurecause.Provenance))
+	dispatch := make(chan failurecause.Provenance, containerDeathQueueCapacity)
 	overflow := newContainerDeathOverflow()
 	reporting, stopReporting := context.WithCancel(b.stopCtx)
-	var workers sync.WaitGroup
-	workers.Go(func() { b.dispatchLiveContainerDeaths(deaths) })
-	workers.Go(func() {
+	var pipeline, reporter sync.WaitGroup
+	pipeline.Go(func() { b.recordLiveContainerDeaths(subscriptions, dispatch, overflow) })
+	pipeline.Go(func() { b.dispatchLiveContainerDeaths(dispatch) })
+	reporter.Go(func() {
 		b.reportContainerDeathOverflow(reporting, overflow, containerDeathOverflowReportInterval)
 	})
 	defer func() {
-		close(deaths)
+		// The recorder closes the dispatcher's queue once this closes its own.
+		close(subscriptions)
+		pipeline.Wait()
 		stopReporting()
-		workers.Wait()
+		reporter.Wait()
 		containerDeathQueueDepth.Set(0)
 		containerEventStreamTotal.WithLabelValues(containerEventStreamExited).Inc()
 	}()
-	reader := containerEventReader{stop: b.stopCtx.Done(), deaths: deaths, overflow: overflow}
 
 	retry := retryInitial
 	for b.containerEventLoopMayRun() {
@@ -127,8 +148,7 @@ func (b *Backend) runContainerEventLoop(retryInitial, retryMax time.Duration) {
 				"error", err, "retry_in", retry)
 		} else {
 			containerEventStreamTotal.WithLabelValues(containerEventStreamConnected).Inc()
-			events, errs := b.docker.ContainerEvents(b.stopCtx)
-			delivered, err := reader.consume(events, errs)
+			delivered, err := b.consumeContainerEventSubscription(subscriptions, overflow)
 			if delivered {
 				retry = retryInitial
 			}
@@ -149,6 +169,24 @@ func (b *Backend) runContainerEventLoop(retryInitial, retryMax time.Duration) {
 	}
 }
 
+// consumeContainerEventSubscription opens one subscription and reads it until
+// it ends, reporting what the reader reports. The subscription's death queue
+// goes to the recorder before the subscription opens, so the loop never waits
+// while one is open: the hand-over waits only for the recorder to finish the
+// previous subscription's deaths. Closing the queue once the reader has
+// returned is how the recorder learns that the reader handed over its last
+// death.
+func (b *Backend) consumeContainerEventSubscription(
+	subscriptions chan<- (<-chan failurecause.Provenance), overflow *containerDeathOverflow,
+) (delivered bool, err error) {
+	deaths := make(chan failurecause.Provenance, containerDeathQueueCapacity)
+	subscriptions <- deaths
+	defer close(deaths)
+	events, errs := b.docker.ContainerEvents(b.stopCtx)
+	reader := containerEventReader{stop: b.stopCtx.Done(), deaths: deaths, overflow: overflow}
+	return reader.consume(events, errs)
+}
+
 // containerEventLoopMayRun is false once the backend is stopping or its
 // storage authority has latched a terminal failure; anything else is retried.
 func (b *Backend) containerEventLoopMayRun() bool {
@@ -164,11 +202,12 @@ func (b *Backend) verifyContainerEventAuthority() error {
 	return b.requireStorageIdentity(ctx)
 }
 
-// reportContainerDeathOverflow logs the deaths the reader dropped from a full
-// queue, on this goroutine rather than the reader's: a stalled log sink holds
-// only the reporter, and the reader keeps counting. The first drop after a
-// quiet interval is logged at once, later ones are summed into at most one
-// line per interval, and any still unreported when ctx ends are logged then.
+// reportContainerDeathOverflow logs the deaths the loop dropped from a full
+// queue, on this goroutine rather than the reader's or the recorder's: a
+// stalled log sink holds only the reporter, and the drops keep being counted.
+// The first drop after a quiet interval is logged at once, later ones are
+// summed into at most one line per interval, and any still unreported when
+// ctx ends are logged then.
 func (b *Backend) reportContainerDeathOverflow(ctx context.Context, overflow *containerDeathOverflow, interval time.Duration) {
 	defer func() { b.logContainerDeathOverflow(overflow.takeUnreported()) }()
 	for {
@@ -208,20 +247,54 @@ func (b *Backend) logContainerDeathOverflow(dropped uint64) {
 	b.logger.Warn(containerDeathOverflowMessage, "dropped", dropped)
 }
 
-// dispatchLiveContainerDeaths routes queued deaths in arrival order until the
-// loop closes the queue. The queue depth is sampled at each enqueue and each
-// dequeue, so a dispatcher that falls behind shows as a rising depth before
-// any death is dropped.
-func (b *Backend) dispatchLiveContainerDeaths(deaths <-chan failurecause.Provenance) {
-	for death := range deaths {
-		containerDeathQueueDepth.Set(float64(len(deaths)))
+// recordLiveContainerDeaths is the reader's only consumer and the live-death
+// ledger's only writer. It takes the subscriptions' queues from the loop in
+// order. For each one it marks the stream up, then records every death the
+// reader handed over and only after that forwards it to the dispatcher, and
+// once the loop has closed the queue it marks the stream down. So a death is
+// in the ledger before the dispatcher can look it up (ENG-1125), and the
+// stream reads down only after every death the reader observed on it is
+// recorded. The forward never waits: a full dispatcher queue drops the
+// dispatch, counted like the reader's drops, and the death stays recorded. It
+// runs on its own goroutine because the ledger takes a lock the reader must
+// never wait on (ENG-799). It closes the dispatcher's queue when the loop
+// closes its own.
+func (b *Backend) recordLiveContainerDeaths(
+	subscriptions <-chan (<-chan failurecause.Provenance),
+	dispatch chan<- failurecause.Provenance,
+	overflow *containerDeathOverflow,
+) {
+	defer close(dispatch)
+	for deaths := range subscriptions {
+		b.liveDeaths.markLiveDeathStream(true)
+		for death := range deaths {
+			b.liveDeaths.recordLiveDeath(death)
+			select {
+			case dispatch <- death:
+				containerDeathQueueDepth.Set(float64(len(dispatch)))
+			default:
+				overflow.record()
+			}
+		}
+		b.liveDeaths.markLiveDeathStream(false)
+	}
+}
+
+// dispatchLiveContainerDeaths routes the recorded deaths in arrival order
+// until the recorder closes the queue. The queue depth is sampled at each
+// enqueue and each dequeue, so a dispatcher that falls behind shows as a
+// rising depth before any death is dropped.
+func (b *Backend) dispatchLiveContainerDeaths(dispatch <-chan failurecause.Provenance) {
+	for death := range dispatch {
+		containerDeathQueueDepth.Set(float64(len(dispatch)))
 		b.dispatchLiveContainerDeath(death)
 	}
 }
 
 // dispatchLiveContainerDeath routes one live death. The provenance names the
 // container it was minted for, so the observation is built for exactly that
-// container. This is the only caller of leasesm.NewLiveContainerDiedObservation
+// container. This is the only caller of leasesm.NewLiveContainerDiedObservation,
+// and only the dispatcher and the Ready-entry re-dispatch call it
 // (internal/testutil).
 func (b *Backend) dispatchLiveContainerDeath(death failurecause.Provenance) {
 	containerID := death.InstanceID()
@@ -234,8 +307,15 @@ func (b *Backend) dispatchLiveContainerDeath(death failurecause.Provenance) {
 			"container_id", leasesm.ShortID(containerID), "error", err)
 		return
 	}
-	leaseUUID, found := b.findLeaseByContainerID(containerID)
-	if !found {
+	leaseUUID, status, found := b.findLeaseByContainerID(containerID)
+	if !found || status == backend.ProvisionStatusProvisioning {
+		// No actor can take this death now: no projection names the
+		// container, or only a provision that is not Ready yet, which routing
+		// refuses. The recorder wrote the death into the live-death ledger
+		// before forwarding it here, so when the container is in the
+		// provision's Ready cohort, the Ready entry takes it from there
+		// (redispatchStartupDeaths), and a startup failure takes its own
+		// container's. A refusal here would count it as a lost death.
 		return
 	}
 	if b.releaseStore == nil {
@@ -257,28 +337,51 @@ func (b *Backend) dispatchLiveContainerDeath(death failurecause.Provenance) {
 	b.dispatchContainerDeathObservation(observation, containerID, dieEventSourceEventLoop)
 }
 
-// findLeaseByContainerID returns the lease UUID and true if a provision
-// containing the given container ID is found. Returns ("", false) otherwise.
-// Called under no lock; acquires read lock internally.
+// redispatchStartupDeaths hands the recorded live deaths of a new Ready
+// cohort's containers back to the dispatch path. Such a death raced the
+// provision's Ready transition: its die event came while the container was in
+// no Ready projection, and the event loop could not route it (ENG-1125). The
+// recorder writes every death into the ledger before the dispatcher can look
+// it up, and this runs at the provision store's Ready entry, under the same
+// projection lock that the lookup reads: a lookup that missed the Ready
+// projection came before this entry, so the death it looked up was recorded
+// before this reads the ledger. It never blocks: the routing happens on a
+// worker, after the Ready projection is visible, and the actor handles the
+// death after its Ready transition.
+func (b *Backend) redispatchStartupDeaths(containerIDs []string) {
+	deaths := b.liveDeaths.takeLiveDeaths(containerIDs)
+	if len(deaths) == 0 || b.stopCtx.Err() != nil {
+		return
+	}
+	b.wg.Go(func() {
+		for _, death := range deaths {
+			b.dispatchLiveContainerDeath(death)
+		}
+	})
+}
+
+// findLeaseByContainerID returns the UUID and the projection status of the
+// one provision whose containers include containerID, both read under one
+// read lock. found is false when no provision, or more than one, includes it.
+// Called under no lock.
 //
 // O(N*M) linear scan over all leases and their containers. A reverse index
 // would be O(1) but adds sync overhead across provision/deprovision/restart/
 // update/recover. Fine at expected scale (hundreds of leases, 1-10 containers).
-func (b *Backend) findLeaseByContainerID(containerID string) (string, bool) {
+func (b *Backend) findLeaseByContainerID(containerID string) (leaseUUID string, status backend.ProvisionStatus, found bool) {
 	b.provisionsMu.RLock()
 	defer b.provisionsMu.RUnlock()
 
-	leaseUUID := ""
 	for uuid, prov := range b.provisions {
 		for _, cid := range prov.ContainerIDs {
 			if cid == containerID {
 				if leaseUUID != "" && leaseUUID != uuid {
 					// A duplicate substrate identity has no unique actor owner.
-					return "", false
+					return "", "", false
 				}
-				leaseUUID = uuid
+				leaseUUID, status = uuid, prov.Status
 			}
 		}
 	}
-	return leaseUUID, leaseUUID != ""
+	return leaseUUID, status, leaseUUID != ""
 }

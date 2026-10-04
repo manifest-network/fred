@@ -225,10 +225,27 @@ func TestTerminalBudget_ConsecutiveCountAndSustainedReadyReset(t *testing.T) {
 		assert.True(t, outcome.exhausted)
 	})
 
-	t.Run("a counting cause counts only for the death of a Ready workload", func(t *testing.T) {
+	t.Run("a counting cause counts only at a counting transition", func(t *testing.T) {
+		// The closed set: the death of a Ready workload, and a provision's
+		// definite startup failure (ENG-1125).
+		counting := map[[2]backend.ProvisionStatus]bool{
+			{backend.ProvisionStatusReady, backend.ProvisionStatusFailing}:       true,
+			{backend.ProvisionStatusProvisioning, backend.ProvisionStatusFailed}: true,
+		}
+		for transition := range counting {
+			p := &ProvisionState{
+				LeaseUUID: testActorLeaseUUID, Status: transition[0], Reason: backend.ReasonContainerExited,
+				TerminalBudget: TerminalBudget{
+					leaseUUID: testActorLeaseUUID, consecutive: 2, streakStartedAt: t0.Add(-time.Hour),
+				},
+			}
+			outcome := p.recordFailure(transition[1], tenantCause(), t0)
+			assert.True(t, outcome.counted, "%s -> %s", transition[0], transition[1])
+			assert.Equal(t, 3, p.TerminalBudget.consecutive, "%s -> %s", transition[0], transition[1])
+		}
 		for _, from := range everyStatus {
 			for _, to := range everyStatus {
-				if from == backend.ProvisionStatusReady && to == backend.ProvisionStatusFailing {
+				if counting[[2]backend.ProvisionStatus{from, to}] {
 					continue
 				}
 				p := &ProvisionState{
@@ -527,7 +544,7 @@ func TestTerminalBudget_ExportedMutatorsOnlyMoveTowardReset(t *testing.T) {
 	for index := range methods.NumMethod() {
 		exported = append(exported, methods.Method(index).Name)
 	}
-	require.Equal(t, []string{"InheritTerminalBudget", "ObserveTerminalBudget", "SetStatus"}, exported,
+	require.Equal(t, []string{"AwaitOperation", "InheritTerminalBudget", "ObserveTerminalBudget", "SetStatus"}, exported,
 		"a new exported *ProvisionState method needs a driver here")
 
 	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
@@ -540,13 +557,28 @@ func TestTerminalBudget_ExportedMutatorsOnlyMoveTowardReset(t *testing.T) {
 			p.InheritTerminalBudget(predecessor, now)
 		},
 	}
+	// AwaitOperation (ENG-1125) stamps the awaited operation and never reads or
+	// writes the budget at all: driven separately below.
 	for _, name := range exported {
-		if name != "ObserveTerminalBudget" {
+		if name != "ObserveTerminalBudget" && name != "AwaitOperation" {
 			require.Contains(t, mutators, name)
 		}
 	}
 	anchors := []time.Time{{}, now.Add(-time.Hour), now.Add(-time.Minute), now}
 	streakStart := now.Add(-2 * time.Hour)
+	operation := newTestOperationFixture(t, testActorLeaseUUID, shared.OperationIntentProvision).admission.Operation()
+	for _, binding := range []string{testActorLeaseUUID, "22222222-2222-4222-8222-222222222222"} {
+		for consecutive := range terminalBudgetThreshold + 2 {
+			for _, standing := range everyStanding {
+				before := TerminalBudget{
+					leaseUUID: binding, consecutive: consecutive, streakStartedAt: streakStart, standing: standing,
+				}
+				p := &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusFailed, TerminalBudget: before}
+				require.True(t, p.AwaitOperation(operation))
+				assert.Equal(t, before, p.TerminalBudget, "AwaitOperation leaves the budget byte-identical")
+			}
+		}
+	}
 	for name, apply := range mutators {
 		for _, binding := range []string{testActorLeaseUUID, "22222222-2222-4222-8222-222222222222"} {
 			for consecutive := range terminalBudgetThreshold + 2 {
@@ -604,7 +636,13 @@ func TestTerminalBudget_ExportedMutatorsOnlyMoveTowardReset(t *testing.T) {
 // without deciding whether it may count fails here.
 func TestReasonEligibleForBudget_EveryDeclaredReason(t *testing.T) {
 	decisions := map[string]bool{
-		"ReasonContainerExited":        true,
+		"ReasonContainerExited": true,
+		// A health check that never passed is a definite failure that never
+		// counts (ENG-1125).
+		"ReasonHealthCheckFailed": false,
+		// A start the container runtime refused ran no tenant process; it is a
+		// definite failure that never counts (ENG-1125).
+		"ReasonContainerStartFailed":   false,
 		"ReasonImagePullFailed":        false,
 		"ReasonInternal":               false,
 		"ReasonRestartFailed":          false,
@@ -823,7 +861,7 @@ func newBudgetHarness(t *testing.T) *budgetHarness {
 // startProvision enters Provisioning from the reserved or Failed state.
 func (h *budgetHarness) startProvision() {
 	h.t.Helper()
-	require.NoError(h.t, h.actor.sm.requestProvision(h.ctx))
+	require.NoError(h.t, h.actor.sm.requestProvision(h.ctx, shared.OperationIntentClaim{}))
 	require.Equal(h.t, backend.ProvisionStatusProvisioning, h.actor.sm.State())
 }
 

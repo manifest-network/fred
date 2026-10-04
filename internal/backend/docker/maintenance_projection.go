@@ -42,10 +42,16 @@ func (b *Backend) inspectMaintenanceFailureReadiness(
 			continue
 		}
 		inspected, err := b.inspectContainerForRecovery(ctx, listed.ContainerID)
-		ready[listed.LeaseUUID] = err == nil && inspected != nil &&
-			inspected.ContainerID == listed.ContainerID && inspected.Status == "running" &&
-			inspected.Health != HealthStatusUnhealthy &&
-			(!service.HasActiveHealthCheck() || inspected.Health == HealthStatusHealthy)
+		if err != nil || inspected == nil {
+			ready[listed.LeaseUUID] = false
+			continue
+		}
+		// A running member a startup watch saw pass its check stays healthy
+		// (the sticky health rule, gatedHealth).
+		health := b.gatedHealth(listed.ContainerID, inspected.Health)
+		ready[listed.LeaseUUID] = inspected.ContainerID == listed.ContainerID && inspected.Status == "running" &&
+			health != HealthStatusUnhealthy &&
+			(!service.HasActiveHealthCheck() || health == HealthStatusHealthy)
 	}
 	return ready
 }

@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Attribution `unhealthy` on `fred_docker_backend_lease_failures_total`: a
+  provision whose health check never passed. It never counts toward the
+  terminal failure budget; do not alert on it. (ENG-1125)
+- Metric `fred_docker_backend_lease_pending_operation_unstamped_total`: a
+  provision or restore whose projection could not await its exact operation,
+  so live recovery could not match a failure to it. Any non-zero value is a
+  bug. (ENG-1125)
 - Backends report `terminal_budget` (`verdict`, `consecutive_failures`) on
   `GET /provisions` and `GET /provisions/{lease_uuid}`: the lease's
   consecutive-failure budget, which decides whether providerd closes a failing
@@ -413,6 +420,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- The tenant-visible failure reasons of a provision changed (ENG-1125). Two
+  reasons are new, and neither ever counts toward the terminal failure
+  budget: `HealthCheckFailed`, a container's health check never passed during
+  startup (Docker reported it `unhealthy`, or it was still not healthy at the
+  startup deadline), and `ContainerStartFailed`, the container runtime refused
+  to start a container, which never ran (for example, an entrypoint missing
+  from the image). Only a container that exited is `ContainerExited` now: a
+  failed inspection, a canceled verification, a container that never stayed
+  running, and a failure before any container started (image inspection,
+  tenant network, container creation) are `Internal`. All of these used to
+  report `ContainerExited`, and a health check that timed out or an inspection
+  error was reported as `container exited during startup`. A restore that
+  fails startup verification reports `RestoreFailed` with `restore failed:
+  container exited during startup` (or the matching startup cause) instead of
+  `internal error`. The reason set stays open: a client must treat a reason it
+  does not know as a generic failure and show `message`.
 - A graceful providerd stop now lets an in-flight reconciliation sweep finish
   reading backend inventories and commit its placement projection, for at most
   half of `shutdown_timeout`, instead of abandoning it. An abandoned sweep left
@@ -1129,13 +1152,66 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
     (host `kill`, `ctr`, a shim crash), and an operator stop whose `kill` event
     dockerd dropped for a lagging subscriber are indistinguishable from the
     workload's own exit and count.
-  - Not covered: a workload that crashes during startup verification, before
-    it was ever ready, on a re-provision of an ACTIVE lease never reaches the
-    budget; the lease stays `provisioning` (pre-existing). In a multi-service
-    stack, a service that dies while a later service is still being verified
-    leaves the lease re-provisioned every pass, never closed. Both are being
-    fixed in ENG-1125. The immediate close of an ACTIVE lease whose
-    re-provision is refused with a validation error is unchanged (ENG-800).
+  - Not covered: the immediate close of an ACTIVE lease whose re-provision is
+    refused with a validation error is unchanged (ENG-800). Startup crashes
+    count through ENG-1125, below.
+- A container that crashes during startup verification now fails the
+  provision definitely instead of leaving the lease `provisioning`, and the
+  tenant sees a curated reason (`ContainerExited`, `container exited during
+  startup` or `container exited during health check`). The docker-backend
+  removes the attempt's containers and the volumes that attempt created, and
+  reports the failure at once, so providerd re-provisions an ACTIVE lease or
+  rejects a PENDING one without waiting for `provision_timeout`. Every service
+  of a stack is watched until the whole stack is ready, so a service that
+  exits while another one is still starting fails the provision too (a
+  service whose health check passed once is then judged healthy while it
+  runs, by the watch and by every later check of the attempt's outcome, so a
+  brief `unhealthy` flap no longer fails it), and a container that dies just
+  before the lease is reported `ready` is still attributed from the live
+  event stream. A `compose up` that fails after all its requests completed is
+  decided the same way, from what its containers show and never from
+  Compose's error: a `depends_on` dependency that exited or turned unhealthy
+  fails the provision definitely, and so does a container Docker refused to
+  start (`ContainerStartFailed`); such a launch was not completed, so its
+  failure never counts, not even an exit next to a refused start. A rejected
+  launch whose containers are all running is adopted `ready` by the next
+  recovery pass. Startup crash loops count toward the terminal budget only
+  after the 30-minute floor, and only when the live event stream observed the
+  container's whole run with no signal to it. A health check that never
+  passes and a refused start fail definitely but never count, nor does a
+  crash after a degraded launch: one where the platform skipped part of its
+  own preparation, namely seeding a writable path with the image's content (a
+  path it could not extract, a bind source that failed its confinement check,
+  stale content it could not clear, a writable-path volume it could not
+  create) or detecting the image's volume owner or writable paths. A health
+  check that never passes is reported only at `provision_timeout` minus one
+  minute, so a PENDING lease is usually rejected first by providerd's
+  10-minute callback timeout, with `callback timeout`. Neither health rule
+  covers a `depends_on` dependency gated by `service_healthy`, whose health
+  Compose judges itself while the stack starts: a flap there still fails the
+  deployment, and one that never becomes healthy ends `Internal` at
+  `provision_timeout`. (ENG-1125)
+- A provision or restore whose outcome the docker-backend could not settle
+  live no longer leaves the lease `provisioning` for as long as the backend
+  runs. That covers a failed inspection during startup verification, a
+  startup failure whose cleanup could not finish, a startup failure that
+  followed an earlier failed step of the same attempt (such as a failed image
+  detection), and one next to volume state of the lease the attempt did not
+  create. Once the backend's periodic recovery has proven the attempt failed,
+  it publishes the lease `failed` with that attempt's reason and message. The
+  attempt's containers are kept for recovery, which settles it within one
+  `reconcile_interval` instead of waiting out `provision_timeout` when one of
+  them has exited or the cohort is partial. A startup rollback step that
+  fails after the attempt's containers were removed leaves nothing to
+  inspect, so that attempt still settles only at `provision_timeout`. These
+  failures never count toward the terminal failure budget. (ENG-1125)
+  - Upgrading: ACTIVE leases that this bug left in `provisioning` are settled
+    `failed` by the docker-backend's recovery when it first starts on this
+    version, because their admission deadline has long passed, and providerd
+    re-provisions all of them on its first sweep. Any that still crash at
+    startup count from zero (the budget resets with the backend restart) and
+    are closed only behind the 30-minute floor. To know which leases this
+    affects, list the ACTIVE leases in `provisioning` before the upgrade.
 - The docker-backend's container event listener no longer stops for good after
   a transient storage-identity verification error, such as a failed
   `docker info`: it backs off and reconnects with a fresh event session. It

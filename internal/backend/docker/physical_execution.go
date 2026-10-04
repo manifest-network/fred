@@ -19,8 +19,10 @@ import (
 // operationSubstrate is the complete physical workflow for one exact opaque
 // operation subject. The subject and its storageMutations never escape the
 // builder: the generic executor can invoke this capability, but cannot select
-// a lease, operation, project, or mutation after construction.
-type operationSubstrate func(context.Context) error
+// a lease, operation, project, or mutation after construction. Only a live
+// provision can report a finding, and only one its own session accepted
+// (ENG-1125).
+type operationSubstrate func(context.Context) (acceptedStartupFailure, error)
 
 func buildOperationSubstrate(
 	b *Backend,
@@ -28,7 +30,7 @@ func buildOperationSubstrate(
 ) func(substratemutation.Runner, shared.OperationPhysicalSubject) operationSubstrate {
 	return func(runner substratemutation.Runner, subject shared.OperationPhysicalSubject) operationSubstrate {
 		mutations := newOperationStorageMutations(runner, subject, ops)
-		return func(ctx context.Context) (runErr error) {
+		return func(ctx context.Context) (finding acceptedStartupFailure, runErr error) {
 			defer func() {
 				_, historical := subject.FailedReceiptCleanup()
 				if runErr != nil && !historical && !subject.RecoveryCleanup() {
@@ -36,17 +38,17 @@ func buildOperationSubstrate(
 				}
 			}()
 			if receipt, historical := subject.FailedReceiptCleanup(); historical {
-				return b.doFailedOperationReceiptCleanup(mutations, ctx, subject, receipt)
+				return acceptedStartupFailure{}, b.doFailedOperationReceiptCleanup(mutations, ctx, subject, receipt)
 			}
 			intent := subject.Intent()
 			if subject.RecoveryCleanup() {
-				return b.doOperationRecoveryCleanup(mutations, ctx, subject)
+				return acceptedStartupFailure{}, b.doOperationRecoveryCleanup(mutations, ctx, subject)
 			}
 			switch intent.Kind() {
 			case shared.OperationIntentProvision:
 				stack, err := manifest.ParseStoredPayload(intent.Manifest())
 				if err != nil {
-					return fmt.Errorf("parse Started provision manifest: %w", err)
+					return acceptedStartupFailure{}, fmt.Errorf("parse Started provision manifest: %w", err)
 				}
 				req := backend.ProvisionRequest{
 					LeaseUUID: intent.LeaseUUID(), Tenant: intent.Tenant(),
@@ -62,9 +64,9 @@ func buildOperationSubstrate(
 					),
 				)
 			case shared.OperationIntentRestore:
-				return b.doRestorePhysical(mutations, ctx, subject)
+				return acceptedStartupFailure{}, b.doRestorePhysical(mutations, ctx, subject)
 			default:
-				return fmt.Errorf("unsupported operation kind %q", intent.Kind())
+				return acceptedStartupFailure{}, fmt.Errorf("unsupported operation kind %q", intent.Kind())
 			}
 		}
 	}
@@ -74,9 +76,9 @@ func runOperationSubstrate(
 	ctx context.Context,
 	capability operationSubstrate,
 	_ shared.OperationPhysicalSubject,
-) error {
+) (acceptedStartupFailure, error) {
 	if capability == nil {
-		return errors.New("operation substrate capability is unavailable")
+		return acceptedStartupFailure{}, errors.New("operation substrate capability is unavailable")
 	}
 	return capability(ctx)
 }
@@ -407,6 +409,21 @@ func (b *Backend) executeProvisionWork(
 		if err := admission.CompleteFailure(proof); err != nil {
 			return mustProvisionAmbiguous(err, claim)
 		}
+		if _, startup := outcome.StartupFailure(); startup {
+			// A definite startup failure (ENG-1125): the attempt was rolled
+			// back after its effects. The worker only derives the lease's
+			// durable runtime; the actor restores the projection to it inside
+			// its own Provisioning -> Failed transition.
+			runtime, err := b.failedProvisionDurableRuntime(claim)
+			if err != nil {
+				return mustProvisionAmbiguous(err, claim)
+			}
+			result, err := leasesm.NewProvisionWorkStartupFailure(outcome, proof, runtime)
+			if err != nil {
+				return mustProvisionAmbiguous(err, claim)
+			}
+			return result
+		}
 		cause := outcome.Cause()
 		if cause == nil {
 			cause = errors.New("provision substrate is exactly absent")
@@ -663,12 +680,26 @@ func (b *Backend) doRestorePhysical(
 		}
 	}
 	replacePhaseDurationSeconds.WithLabelValues("restore", phaseAdopt).Observe(time.Since(adoptStart).Seconds())
-	return b.doReplacePhysical(ctx, mutations, replaceContainersOp{
+	err = b.doReplacePhysical(ctx, mutations, replaceContainersOp{
 		LeaseUUID: subject.LeaseUUID(), Stack: record.StackManifest,
 		Items: intent.EffectiveItems(), ResourceProfiles: intent.ResourceProfiles(),
 		Operation: "restore",
 		Logger:    physicalLogger(b, subject.LeaseUUID()),
 	})
+	// A restore's startup failure is the restore's own: author its surface
+	// here, at the source, so the attempt's first capture (which recovery
+	// later publishes) names the restore and its startup cause rather than an
+	// internal error (ENG-1125). The live outcome stays ambiguous; recovery
+	// settles it from the kept, exited cohort.
+	var startup *replacementStartupError
+	if errors.As(err, &startup) {
+		return &physicalOperationError{
+			callback: backend.MsgRestoreFailed + ": " + startup.message,
+			reason:   backend.ReasonRestoreFailed,
+			cause:    err,
+		}
+	}
+	return err
 }
 
 func (b *Backend) doMaintenancePhysical(
@@ -752,7 +783,7 @@ func (b *Backend) doReplacePhysical(
 		Stack: op.Stack, Items: op.Items, Profiles: profiles, ImageSetups: imageSetups,
 		NetworkName: networkName, Cfg: &b.cfg, Ingress: b.cfg.Ingress,
 	}
-	composeUpErr := b.launchCompose(ctx, mutations, params, op.ResourceProfiles, composeUpOpts{ForceRecreate: op.Operation == "restart"})
+	_, composeUpErr := b.launchCompose(ctx, mutations, params, op.ResourceProfiles, composeUpOpts{ForceRecreate: op.Operation == "restart"})
 	if composeUpErr != nil {
 		return fmt.Errorf("compose up for %s: %w", op.Operation, composeUpErr)
 	}
@@ -768,11 +799,12 @@ func (b *Backend) doReplacePhysical(
 	if !exactServiceContainerCohort(op.Items, ids, byService) {
 		return fmt.Errorf("compose returned a non-exact %s cohort", op.Operation)
 	}
+	// The whole cohort is observed at once, as for a provision, and the outcome
+	// is flattened into a plain error: the replacement's own operation authors
+	// its tenant-facing reason.
 	verifyStartedAt := time.Now()
-	for service, serviceIDs := range byService {
-		if err := b.verifyStartup(ctx, op.Stack.Services[service], serviceIDs, op.Logger.With("service", service)); err != nil {
-			return err
-		}
+	if err := b.observeReplacementStartup(ctx, op.Stack, byService, op.Logger); err != nil {
+		return err
 	}
 	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseVerifyStartup).
 		Observe(time.Since(verifyStartedAt).Seconds())
@@ -818,7 +850,7 @@ func (b *Backend) executeRestorePhysicalOutcome(
 			cause = errors.New("restore substrate is exactly absent")
 		}
 		result, err := leasesm.NewRestoreReplaceFailure(cause, leasesm.ReplaceFailureDetails{
-			Reason: backend.ReasonRestoreFailed, CallbackErr: "restore failed", LastError: cause.Error(),
+			Reason: backend.ReasonRestoreFailed, CallbackErr: backend.MsgRestoreFailed, LastError: cause.Error(),
 		}, proof)
 		if err != nil {
 			return mustRestoreAmbiguous(err, claim)
@@ -887,13 +919,7 @@ func (b *Backend) executeMaintenancePhysicalOutcome(
 		if cause == nil {
 			cause = fmt.Errorf("%s substrate did not commit the target", intent.Kind())
 		}
-		reason := maintenanceFailureReason(intent.Kind())
-		callbackErr := string(intent.Kind()) + " failed"
-		var physical *physicalOperationError
-		if errors.As(cause, &physical) {
-			reason = physical.reason
-			callbackErr = physical.callback
-		}
+		reason, callbackErr := maintenanceFailureDetails(intent.Kind(), cause)
 		failed, err := b.maintenanceSettlement.FailMaintenance(
 			outcome, reason, callbackErr,
 		)

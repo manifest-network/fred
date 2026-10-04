@@ -176,7 +176,7 @@ func TestProtectedVolumeDispatchReattestsWholeSetBeforeJournalAndDaemon(t *testi
 					_, err := q.lookup(first)
 					require.NoError(t, err)
 				}
-				err = h.backend.volumeLaunches.compose(ctx, q, prepared, composeUpOpts{})
+				_, err = h.backend.volumeLaunches.compose(ctx, q, prepared, composeUpOpts{})
 				pending, countErr := h.backend.volumeLaunches.pendingCount()
 				require.NoError(t, countErr)
 				require.Zero(t, pending, "root refusal must precede journal.Begin; a successful launch must settle")

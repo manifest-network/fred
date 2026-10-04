@@ -779,7 +779,8 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 				LastError: "", Reason: "", Message: "",
 				CallbackURL: authority.CallbackURL(), LifecycleCallbackURL: authority.LifecycleCallbackURL(),
 				ActiveReleaseVersion: release.Version, ActiveOperationID: authority.OperationID(),
-				Items: nil, ResourceProfiles: nil, ContainerIDs: nil, StackManifest: nil, ServiceContainers: nil,
+				PendingOperation: leasesm.PendingOperation{},
+				Items:            nil, ResourceProfiles: nil, ContainerIDs: nil, StackManifest: nil, ServiceContainers: nil,
 			},
 		}
 		provision = recovered.materialize()
@@ -936,7 +937,9 @@ func (b *Backend) classifyRecoveredMaintenanceReadiness(
 		if container.Status != "running" {
 			return maintenanceReadinessUnready, nil
 		}
-		if container.Health == HealthStatusUnhealthy {
+		// A running member a startup watch saw pass its check stays healthy
+		// (the sticky health rule, gatedHealth), here as in the watch.
+		if b.gatedHealth(container.ContainerID, container.Health) == HealthStatusUnhealthy {
 			return maintenanceReadinessUnready, nil
 		}
 		service := stack.Services[container.ServiceName]
@@ -961,11 +964,12 @@ func (b *Backend) classifyRecoveredMaintenanceReadiness(
 		if inspected.Status != "running" {
 			return maintenanceReadinessUnready, nil
 		}
-		if inspected.Health == HealthStatusUnhealthy {
+		health := b.gatedHealth(container.ContainerID, inspected.Health)
+		if health == HealthStatusUnhealthy {
 			return maintenanceReadinessUnready, nil
 		}
 		if service.HasActiveHealthCheck() {
-			switch inspected.Health {
+			switch health {
 			case HealthStatusHealthy:
 			case HealthStatusUnhealthy:
 				return maintenanceReadinessUnready, nil
@@ -985,6 +989,18 @@ func maintenanceFailureReason(kind shared.MaintenanceIntentKind) backend.Reason 
 		return backend.ReasonUpdateFailed
 	}
 	return backend.ReasonRestartFailed
+}
+
+// maintenanceFailureDetails is a failed replacement's tenant surface: its own
+// reason (RestartFailed, UpdateFailed), unless a failure source authored a
+// more specific one (an update's image pull). A startup observation never
+// does: the replacement path flattens it to a plain error (ENG-1125).
+func maintenanceFailureDetails(kind shared.MaintenanceIntentKind, cause error) (backend.Reason, string) {
+	var physical *physicalOperationError
+	if errors.As(cause, &physical) {
+		return physical.reason, physical.callback
+	}
+	return maintenanceFailureReason(kind), string(kind) + " failed"
 }
 
 func (b *Backend) verifyMaintenanceSourceActive(intent shared.MaintenanceIntentClaim) error {

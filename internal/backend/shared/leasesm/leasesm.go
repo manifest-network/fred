@@ -156,7 +156,12 @@ type ProvisionState struct {
 	// Autonomous observations must return this exact identity to the callback
 	// publisher; zero deliberately cannot authorize lifecycle publication.
 	ActiveOperationID shared.OperationID
-	Items             []backend.LeaseItem
+	// PendingOperation is the provision or restore this projection is waiting
+	// for, stamped on entry and matched exactly by live recovery (ENG-1125).
+	// It is opaque: only AwaitOperation stamps it, from a store-issued claim. A
+	// construction literal may only name the zero value.
+	PendingOperation PendingOperation
+	Items            []backend.LeaseItem
 	// ResourceProfiles is the immutable capacity authority paired with Items.
 	// It belongs in the actor-owned projection so a recovered maintenance
 	// target cannot publish new topology while retaining source-generation
@@ -326,7 +331,9 @@ type LeaseProvisionStore interface {
 // type that was dropped (e.g., "diag_gathered", "provision_completed").
 // LeaseFailureRecorded fires once for every failure the terminal budget
 // records, counted or not; the substrate labels it with cause.Label(), a closed
-// set (failurecause.Labels).
+// set (failurecause.Labels). PendingOperationUnstamped fires when a provision
+// or restore entered its in-flight state but its projection could not be
+// stamped with the operation it awaits (ENG-1125); any non-zero value is a bug.
 type SMMetrics interface {
 	SMTransition(source, dest, trigger string)
 	ActorCreated()
@@ -334,6 +341,7 @@ type SMMetrics interface {
 	ActorPanic()
 	TerminalEventDropped(event string)
 	LeaseFailureRecorded(cause failurecause.Cause)
+	PendingOperationUnstamped()
 }
 
 // LeaseActorConfig groups the dependencies a lease actor receives at

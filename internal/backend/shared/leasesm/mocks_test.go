@@ -426,6 +426,7 @@ func (mockSMMetrics) ActorPanic()                   {}
 func (mockSMMetrics) TerminalEventDropped(_ string) {}
 
 func (mockSMMetrics) LeaseFailureRecorded(failurecause.Cause) {}
+func (mockSMMetrics) PendingOperationUnstamped()              {}
 
 // mockInstanceInspector implements InstanceInspector with a function-
 // field stub. Tests set InspectInstanceFn to control the inspect

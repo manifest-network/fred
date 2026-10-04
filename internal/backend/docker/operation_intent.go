@@ -389,16 +389,39 @@ type recoveredOperationReadyPromotion struct {
 }
 
 type recoveredIntentDecision struct {
-	claim              shared.OperationIntentClaim
-	status             backend.CallbackStatus
-	errMsg             string
-	readyProjection    *recoveredOperationReadyPromotion
-	allocationIDs      []string
-	legacyPredecessor  *shared.Release
-	legacyAuthority    *shared.LegacyRuntimeAuthority
-	preserveProjection bool
-	failureOutcome     shared.OperationExecutionFailure
+	claim             shared.OperationIntentClaim
+	status            backend.CallbackStatus
+	errMsg            string
+	readyProjection   *recoveredOperationReadyPromotion
+	allocationIDs     []string
+	legacyPredecessor *shared.Release
+	legacyAuthority   *shared.LegacyRuntimeAuthority
+	projection        recoveredFailureProjection
+	failureOutcome    shared.OperationExecutionFailure
 }
+
+// recoveredFailureProjection is what settling one recovered operation failure
+// does to the lease's projection. It is decided once per pass from the
+// recovery mode and from whether the actor already published this exact
+// operation's failure; a Failed status alone never decides it. The zero value
+// is invalid and fails settlement closed.
+type recoveredFailureProjection uint8
+
+const (
+	// recoveredFailureRebuildsProjection: startup recovery owns no actor
+	// generation. Settlement deletes the intent-owned projection and its
+	// candidate reservation, and recoverState rebuilds the lease from durable
+	// state.
+	recoveredFailureRebuildsProjection recoveredFailureProjection = iota + 1
+	// recoveredFailureKeepsProjection: the quiescent actor already published
+	// this exact operation's Failed projection; only the journal remains.
+	recoveredFailureKeepsProjection
+	// recoveredFailurePublishesProjection: a live projection may still await
+	// this operation. settleRecoveredOperationFailure publishes Failed on it
+	// before settling, so no settled failure leaves a lease Provisioning
+	// (ENG-1125).
+	recoveredFailurePublishesProjection
+)
 
 // operationIntentWaitEvidence is the closed causal vocabulary for an exact
 // non-terminal operation substrate. The classifier alone can mint these value
@@ -448,10 +471,10 @@ type operationIntentSubstrate struct {
 // durable claims for the next periodic sweep; there is deliberately no
 // goroutine, timer, or independently fetched fleet inventory per operation.
 type classifiedOperationIntent struct {
-	claim              shared.OperationIntentClaim
-	classification     operationIntentSubstrate
-	deferred           bool
-	preserveProjection bool
+	claim          shared.OperationIntentClaim
+	classification operationIntentSubstrate
+	deferred       bool
+	projection     recoveredFailureProjection
 }
 
 type operationIntentRecoveryMode uint8
@@ -601,11 +624,11 @@ func (b *Backend) recoverLiveOperationIntents(ctx context.Context) error {
 			b.provisionsMu.RLock()
 			provision := b.provisions[claim.LeaseUUID()]
 			var status backend.ProvisionStatus
-			var callbackURL, lifecycleCallbackURL, errMsg string
+			var awaitsClaim bool
+			var errMsg string
 			if provision != nil {
 				status = provision.Status
-				callbackURL = provision.CallbackURL
-				lifecycleCallbackURL = provision.LifecycleCallbackURL
+				awaitsClaim = provision.PendingOperation.Names(claim.OperationID())
 				errMsg = provision.Message
 			}
 			b.provisionsMu.RUnlock()
@@ -614,11 +637,13 @@ func (b *Backend) recoverLiveOperationIntents(ctx context.Context) error {
 			// operation inherited from another process. Docker may still publish an
 			// accepted Create after the first empty startup inventory; only the
 			// construction-bound classifier and its durable visibility window may
-			// resolve that generation. An exact Failed projection, by contrast, was
-			// published by the quiescent actor from a typed terminal worker outcome.
-			if status == backend.ProvisionStatusFailed &&
-				callbackURL == claim.CallbackURL() &&
-				lifecycleCallbackURL == claim.LifecycleCallbackURL() {
+			// resolve that generation. A Failed projection that awaits this exact
+			// operation, by contrast, was published either by the quiescent actor
+			// from a typed terminal worker outcome or by an earlier recovery pass
+			// whose settlement did not complete. It is matched by operation, never
+			// by callback pair: a re-provision whose predecessor teardown failed
+			// still carries the predecessor's pair (ENG-1125).
+			if status == backend.ProvisionStatusFailed && awaitsClaim {
 				// Actor quiescence proves its worker and terminal transition completed.
 				// A Failed receipt remains the durable cleanup authority for any Docker
 				// Create that becomes visible after the worker's best-effort teardown.
@@ -637,10 +662,13 @@ func (b *Backend) recoverLiveOperationIntents(ctx context.Context) error {
 // recoverOperationIntentClaims owns classification and settlement for an
 // already-authoritative claim snapshot. Both modes take one bounded observation
 // and defer young transitional work so neither backend startup nor a periodic
-// sweep waits out a tenant operation's full deadline. Startup may rebuild a
-// projection after terminal settlement; the live lane already owns a quiescent
-// actor generation and conservatively leaves projection rebuilding to the next
-// ordinary recovery sweep after releasing that capability.
+// sweep waits out a tenant operation's full deadline. Startup rebuilds a failed
+// provision's projection from durable state after terminal settlement. The
+// live lane owns a quiescent, detached actor generation instead: it publishes
+// Failed on a projection that still awaits the failed operation before it
+// settles the journal (settleRecoveredOperationFailure). recoverState keeps an
+// in-flight Provisioning or Restarting projection whole, so no later sweep would
+// otherwise move it (ENG-1125).
 func (b *Backend) recoverOperationIntentClaims(
 	ctx context.Context,
 	claims []shared.OperationIntentClaim,
@@ -696,8 +724,8 @@ func (b *Backend) recoverOperationIntentClaims(
 		}
 		if errMsg, proven := provenFailures[keyForOperationIntent(claim)]; proven {
 			classified = append(classified, classifiedOperationIntent{
-				claim:              claim,
-				preserveProjection: true,
+				claim:      claim,
+				projection: recoveredFailureKeepsProjection,
 				classification: operationIntentSubstrate{
 					status: backend.CallbackStatusFailed,
 					errMsg: errMsg,
@@ -768,8 +796,16 @@ func (b *Backend) recoverOperationIntentClaims(
 
 	for index := range classified {
 		entry := &classified[index]
-		if mode == operationIntentRecoveryLive {
-			entry.preserveProjection = true
+		switch {
+		case entry.projection == recoveredFailureKeepsProjection:
+			// The quiescent actor already published this exact failure.
+		case mode == operationIntentRecoveryStartup:
+			entry.projection = recoveredFailureRebuildsProjection
+		default:
+			// The live lane owns a quiescent, detached actor generation. A
+			// projection still awaiting this operation is published Failed by the
+			// settlement choke point, never preserved as Provisioning (ENG-1125).
+			entry.projection = recoveredFailurePublishesProjection
 		}
 	}
 
@@ -781,10 +817,10 @@ func (b *Backend) recoverOperationIntentClaims(
 		claim := entry.claim
 		classification := entry.classification
 		decision := recoveredIntentDecision{
-			claim:              claim,
-			status:             classification.status,
-			errMsg:             classification.errMsg,
-			preserveProjection: entry.preserveProjection,
+			claim:      claim,
+			status:     classification.status,
+			errMsg:     classification.errMsg,
+			projection: entry.projection,
 		}
 		// A Ready exact substrate may have converged between recoverState's
 		// projection snapshot and the very first operation classification. A
@@ -800,7 +836,7 @@ func (b *Backend) recoverOperationIntentClaims(
 		}
 		decision.legacyPredecessor = classification.legacyPredecessor
 		decision.legacyAuthority = classification.legacyAuthority
-		if !decision.preserveProjection &&
+		if decision.projection == recoveredFailureRebuildsProjection &&
 			claim.Kind() == shared.OperationIntentProvision &&
 			classification.status == backend.CallbackStatusFailed {
 			allocationIDs, _, allocationErr := resolvedProvisionAllocations(
@@ -914,21 +950,13 @@ func (b *Backend) recoverOperationIntentClaims(
 				err = b.callbackPublisher.PublishOperationSuccessContext(ctx, committed)
 			}
 		} else {
-			var uncommitted shared.OperationReleaseUncommitted
-			uncommitted, err = b.operationSettlement.CommitOperationFailure(decision.failureOutcome)
-			if err == nil {
-				if b.callbackPublisher == nil {
-					err = errors.New("callback publisher is required")
-				} else {
-					err = b.callbackPublisher.PublishOperationFailureContext(ctx, uncommitted, decision.errMsg)
-				}
-			}
+			err = b.settleRecoveredOperationFailure(ctx, decision)
 		}
 		if err != nil {
 			return fmt.Errorf("settle recovered %s operation intent for lease %q: %w",
 				decision.claim.Kind(), decision.claim.LeaseUUID(), err)
 		}
-		if !decision.preserveProjection &&
+		if decision.projection == recoveredFailureRebuildsProjection &&
 			decision.claim.Kind() == shared.OperationIntentProvision &&
 			decision.status == backend.CallbackStatusFailed {
 			rebuildAfterSettlement = true
@@ -946,7 +974,7 @@ func (b *Backend) recoverOperationIntentClaims(
 		// loses its claim and becomes eligible for the ordinary startup orphan pass.
 		b.provisionsMu.Lock()
 		for _, decision := range decisions {
-			if !decision.preserveProjection &&
+			if decision.projection == recoveredFailureRebuildsProjection &&
 				decision.claim.Kind() == shared.OperationIntentProvision &&
 				decision.status == backend.CallbackStatusFailed {
 				b.deleteProvisionLocked(decision.claim.LeaseUUID())
@@ -1113,6 +1141,7 @@ func recoveredReadyProjection(
 			LifecycleCallbackURL: claim.LifecycleCallbackURL(),
 			ActiveReleaseVersion: 0,
 			ActiveOperationID:    claim.OperationID(),
+			PendingOperation:     leasesm.PendingOperation{},
 			Items:                slices.Clone(items),
 			ResourceProfiles:     shared.CloneSKUResourceSnapshot(profiles),
 			ContainerIDs:         slices.Clone(promotion.containerIDs),
@@ -2008,9 +2037,13 @@ func (b *Backend) classifyOperationIntentSubstrate(
 		}
 		switch containerStatusToProvisionStatus(runtimeStatus) {
 		case backend.ProvisionStatusReady:
+			// A running member a startup watch saw pass its check stays healthy
+			// (the sticky health rule, gatedHealth), so the classifier that
+			// confirms the watch's Ready, and recovery, judge it as the watch did.
+			health := b.gatedHealth(listed.ContainerID, container.Health)
 			if _, required := healthRequired[container.ServiceName]; required &&
-				container.Health != HealthStatusHealthy {
-				if container.Health == HealthStatusUnhealthy {
+				health != HealthStatusHealthy {
+				if health == HealthStatusUnhealthy {
 					failed++
 					continue
 				}

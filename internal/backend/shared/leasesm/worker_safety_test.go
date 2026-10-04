@@ -37,7 +37,7 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 			return nil
 		},
 	})
-	require.NoError(t, actor.sm.requestProvision(context.Background()),
+	require.NoError(t, actor.sm.requestProvision(context.Background(), shared.OperationIntentClaim{}),
 		"test must model an admitted worker-owning Provisioning state, not a reservation")
 
 	// Model a Docker mutation that ignores cancellation and remains capable of

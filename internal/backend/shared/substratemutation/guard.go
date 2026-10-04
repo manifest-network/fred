@@ -106,20 +106,34 @@ func (r Runner) EffectEntered() bool {
 // builder and workflow are fixed when the executor is constructed. Callers can
 // therefore neither select a different handler nor inject physical targets at
 // Execute time.
-type Guard[T any, Subject comparable, Evidence any] struct {
+//
+// A workflow may also report a Finding: a typed, domain-sealed account of a
+// definite outcome it observed after its effects (for example, a container that
+// positively failed startup verification and was rolled back exactly). It
+// reports one only as an Accepted value, which Accept mints solely while the
+// live session is still free of issues, so work that depends on the finding can
+// run after acceptance and never for a finding the Guard is already bound to
+// discard. Only a wholly successful session hands the accepted finding to the
+// classifier, which alone decides whether it becomes Attested evidence. Any
+// build, workflow, Step or Prepare error, or a panic, discards it, so a
+// post-effect error that carries no finding stays Ambiguous by construction.
+// Absence is structural: the classifier receives the zero Accepted value, never
+// a domain zero value it would have to interpret.
+type Guard[T any, Subject comparable, Finding any, Evidence any] struct {
 	protocol  *Protocol[Subject]
 	executor  *executorLineage
 	authorize Authorize
 	complete  Complete
 	build     func(Runner, Subject) T
-	run       func(context.Context, T, Subject) error
-	classify  func(context.Context, Subject) (Evidence, error)
+	run       func(context.Context, T, Subject) (Accepted[Finding], error)
+	classify  func(context.Context, Subject, Accepted[Finding]) (Evidence, error)
 }
 
-// NewExecutor atomically binds the live Guard, its workflow, and its recovery
-// attestor to the same Protocol executor lineage. All configuration is checked
-// before the one-shot binding is consumed. Live workflows and restart recovery
-// therefore cannot be wired to independently swappable physical authorities.
+// NoFinding is the Finding of a workflow that never reports one.
+type NoFinding struct{}
+
+// NewExecutor binds a workflow that reports no Finding. It is NewFindingExecutor
+// with a workflow and classifier that ignore the (always absent) finding.
 func NewExecutor[T any, Subject comparable, Evidence any](
 	binding GuardBinding[Subject],
 	authorize Authorize,
@@ -127,7 +141,39 @@ func NewExecutor[T any, Subject comparable, Evidence any](
 	build func(Runner, Subject) T,
 	run func(context.Context, T, Subject) error,
 	classify func(context.Context, Subject) (Evidence, error),
-) (*Guard[T, Subject, Evidence], *RecoveryAttestor[Subject, Evidence], error) {
+) (*Guard[T, Subject, NoFinding, Evidence], *RecoveryAttestor[Subject, Evidence], error) {
+	// Check before wrapping: a wrapper closure is never nil, and an invalid
+	// configuration must not consume the one-shot binding.
+	if run == nil {
+		return nil, nil, errors.New("substrate mutation workflow is required")
+	}
+	if classify == nil {
+		return nil, nil, errors.New("strict exhaustive substrate classifier is required")
+	}
+	return NewFindingExecutor(binding, authorize, complete, build,
+		func(ctx context.Context, capability T, subject Subject) (Accepted[NoFinding], error) {
+			return Accepted[NoFinding]{}, run(ctx, capability, subject)
+		},
+		func(ctx context.Context, subject Subject, _ Accepted[NoFinding]) (Evidence, error) {
+			return classify(ctx, subject)
+		},
+	)
+}
+
+// NewFindingExecutor atomically binds the live Guard, its workflow, and its
+// recovery attestor to the same Protocol executor lineage. All configuration is
+// checked before the one-shot binding is consumed. Live workflows and restart
+// recovery therefore cannot be wired to independently swappable physical
+// authorities. Recovery never sees a Finding: its classifier always receives
+// the zero (absent) Accepted value.
+func NewFindingExecutor[T any, Subject comparable, Finding any, Evidence any](
+	binding GuardBinding[Subject],
+	authorize Authorize,
+	complete Complete,
+	build func(Runner, Subject) T,
+	run func(context.Context, T, Subject) (Accepted[Finding], error),
+	classify func(context.Context, Subject, Accepted[Finding]) (Evidence, error),
+) (*Guard[T, Subject, Finding, Evidence], *RecoveryAttestor[Subject, Evidence], error) {
 	protocol := binding.protocol
 	if protocol == nil || protocol.lineage == nil {
 		return nil, nil, errors.New("substrate mutation protocol is required")
@@ -151,15 +197,21 @@ func NewExecutor[T any, Subject comparable, Evidence any](
 	if !protocol.executor.CompareAndSwap(nil, executor) {
 		return nil, nil, errors.New("substrate mutation protocol already has a bound executor")
 	}
-	guard := &Guard[T, Subject, Evidence]{
+	guard := &Guard[T, Subject, Finding, Evidence]{
 		protocol: protocol, executor: executor, authorize: authorize,
 		complete: complete, build: build, run: run, classify: classify,
 	}
 	attestor := &RecoveryAttestor[Subject, Evidence]{
 		protocol: protocol, executor: executor,
-		authorize: authorize, complete: complete, classify: classify,
+		authorize: authorize, complete: complete, classify: guard.classifyWithout,
 	}
 	return guard, attestor, nil
+}
+
+// classifyWithout is the classifier as every recovery path, and every
+// unsuccessful live session, sees it: with the absent Finding.
+func (g *Guard[T, Subject, Finding, Evidence]) classifyWithout(ctx context.Context, subject Subject) (Evidence, error) {
+	return g.classify(ctx, subject, Accepted[Finding]{})
 }
 
 // session aggregates the complete workflow history. A caller cannot launder
@@ -167,9 +219,12 @@ func NewExecutor[T any, Subject comparable, Evidence any](
 // refused step: once any action is entered, every error makes the workflow
 // Ambiguous.
 type session struct {
-	subject         any // always the Guard's comparable, opaque subject
-	mu              sync.Mutex
-	active          bool
+	subject any // always the Guard's comparable, opaque subject
+	mu      sync.Mutex
+	active  bool
+	// live marks a live Execute session, the only kind that may accept a
+	// Finding; a recovery session never carries one.
+	live            bool
 	effectEntered   bool
 	issues          error
 	issueGeneration uint64
@@ -332,14 +387,15 @@ func callBuild[T any, Subject comparable](
 	return build(runner, subject), nil
 }
 
-func callWorkflow[T any, Subject comparable](
-	workflow func(context.Context, T, Subject) error,
+func callWorkflow[T any, Subject comparable, Finding any](
+	workflow func(context.Context, T, Subject) (Accepted[Finding], error),
 	ctx context.Context,
 	capability T,
 	subject Subject,
-) (err error) {
+) (finding Accepted[Finding], err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			finding = Accepted[Finding]{}
 			err = fmt.Errorf("physical mutation workflow panicked: %v", recovered)
 		}
 	}()
@@ -351,7 +407,7 @@ func callWorkflow[T any, Subject comparable](
 // invoked through it. Attested requires an entered mutation, a nil workflow
 // result, and a strict final classification. Any failure after entry is
 // Ambiguous.
-func (g *Guard[T, Subject, Evidence]) Execute(
+func (g *Guard[T, Subject, Finding, Evidence]) Execute(
 	execution LiveExecution[Subject],
 	ctx context.Context,
 ) Result[Subject, Evidence] {
@@ -364,11 +420,12 @@ func (g *Guard[T, Subject, Evidence]) Execute(
 	if err := proof.consume(); err != nil {
 		return invalidResult[Subject, Evidence](err)
 	}
-	s := &session{active: true, authorize: g.authorize, complete: g.complete, subject: subject}
+	s := &session{active: true, live: true, authorize: g.authorize, complete: g.complete, subject: subject}
 	capability, buildErr := callBuild(g.build, Runner{session: s}, subject)
+	var finding Accepted[Finding]
 	var workflowErr error
 	if buildErr == nil {
-		workflowErr = callWorkflow(g.run, ctx, capability, subject)
+		finding, workflowErr = callWorkflow(g.run, ctx, capability, subject)
 	}
 
 	s.mu.Lock()
@@ -378,6 +435,9 @@ func (g *Guard[T, Subject, Evidence]) Execute(
 	s.mu.Unlock()
 
 	causalErr := errors.Join(buildErr, workflowErr, issues)
+	if !finding.acceptedBy(s) {
+		causalErr = errors.Join(causalErr, errors.New("physical mutation finding was accepted by another execution"))
+	}
 	if !entered {
 		if causalErr == nil {
 			causalErr = errors.New("physical mutation workflow performed no mutation")
@@ -385,15 +445,26 @@ func (g *Guard[T, Subject, Evidence]) Execute(
 		return refusedResult[Subject, Evidence](proof, subject, causalErr)
 	}
 
+	// Only a wholly successful session may hand its Finding to the classifier.
+	// Any build, workflow, Step or Prepare error discards it, even one the
+	// workflow swallowed or one after its acceptance, so an error after an
+	// effect stays Ambiguous whatever the workflow reported.
+	classify := g.classifyWithout
+	if causalErr == nil {
+		classify = func(ctx context.Context, subject Subject) (Evidence, error) {
+			return g.classify(ctx, subject, finding)
+		}
+	}
 	evidence, classificationErr := classifyBracket(
-		g.authorize, g.complete, g.classify, ctx, subject,
+		g.authorize, g.complete, classify, ctx, subject,
 		"live workflow final substrate classification",
 	)
 	// A same-turn observation cannot prove absence after an uncertain remote
 	// call: the delayed call may commit after the read. The classifier still
 	// runs to detect identity withdrawal and aid diagnosis, but only a wholly
 	// successful workflow can mint Attested evidence. A successful rollback is
-	// represented by an Evidence variant and a nil workflow result.
+	// represented by an Evidence variant and a nil workflow result; a definite
+	// failure reaches it as the workflow's Finding.
 	if err := errors.Join(causalErr, classificationErr); err != nil {
 		return ambiguousResult[Subject, Evidence](proof, subject, err)
 	}
@@ -405,8 +476,10 @@ func (g *Guard[T, Subject, Evidence]) Execute(
 // enters no Step is allowed to complete from classifier evidence: cleanup is
 // idempotent, so an already-absent target is a successful recovery postcondition,
 // not a new synchronous refusal. A workflow error before the first Step remains
-// Refused, while any error after a Step remains Ambiguous.
-func (g *Guard[T, Subject, Evidence]) ExecuteRecovery(
+// Refused, while any error after a Step remains Ambiguous. Recovery never
+// carries a Finding to the classifier: its session refuses Accept, and the
+// classifier always receives the absent value.
+func (g *Guard[T, Subject, Finding, Evidence]) ExecuteRecovery(
 	execution RecoveryExecution[Subject],
 	ctx context.Context,
 ) Result[Subject, Evidence] {
@@ -423,7 +496,7 @@ func (g *Guard[T, Subject, Evidence]) ExecuteRecovery(
 	capability, buildErr := callBuild(g.build, Runner{session: s}, subject)
 	var workflowErr error
 	if buildErr == nil {
-		workflowErr = callWorkflow(g.run, ctx, capability, subject)
+		_, workflowErr = callWorkflow(g.run, ctx, capability, subject)
 	}
 
 	s.mu.Lock()
@@ -437,7 +510,7 @@ func (g *Guard[T, Subject, Evidence]) ExecuteRecovery(
 		return refusedResult[Subject, Evidence](proof, subject, causalErr)
 	}
 	evidence, classificationErr := classifyBracket(
-		g.authorize, g.complete, g.classify, ctx, subject,
+		g.authorize, g.complete, g.classifyWithout, ctx, subject,
 		"recovery workflow final substrate classification",
 	)
 	if err := errors.Join(causalErr, classificationErr); err != nil {

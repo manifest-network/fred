@@ -82,6 +82,7 @@ const (
 	destroySiteDeprovisionReclaim = "deprovision_reclaim" // doDeprovision's writable-path-only reclaim (ENG-406)
 	destroySiteRetentionRefused   = "retention_refused"   // destroyOnRefuseToRetain, a breached retained-disk cap
 	destroySiteReaping            = "reaping"             // destroyReapingVolumes, the retention finalizer
+	destroySiteStartupRollback    = "startup_rollback"    // rollbackStartupFailure, a definite startup failure's own volumes (ENG-1125)
 )
 
 // Reasons a destroy was refused. Both mean "the bytes are still on disk", but they
@@ -103,7 +104,7 @@ const (
 var (
 	destroySites = []string{
 		destroySiteDeprovisionDestroy, destroySiteDeprovisionReclaim, destroySiteRetentionRefused,
-		destroySiteReaping,
+		destroySiteReaping, destroySiteStartupRollback,
 	}
 	destroyRefusedReasons = []string{destroyRefusedClaimed, destroyRefusedUnreadable, destroyRefusedNoDestroyer}
 )
@@ -796,6 +797,20 @@ var (
 		Name:      "lease_failures_total",
 		Help:      "Lease failures recorded by the consecutive-failure budget, by attribution; only tenant_workload counts toward closing a lease",
 	}, []string{"attribution"})
+
+	// leasePendingOperationUnstampedTotal counts provisions and restores that
+	// entered their in-flight state with a projection that could not be
+	// stamped with the operation it awaits (ENG-1125). Live recovery matches a
+	// failed operation to its projection only by that stamp, so such a lease
+	// can stay in flight until the backend restarts. The lease actor refuses
+	// an invalid or foreign claim before either transition; any non-zero value
+	// is a bug.
+	leasePendingOperationUnstampedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "lease_pending_operation_unstamped_total",
+		Help:      "Provisions and restores whose projection could not await their operation, so live recovery cannot match a failure to them; any non-zero value is a bug",
+	})
 
 	// leaseWorkerPanicsTotal counts panics recovered in lease worker
 	// goroutines (provision, replace, diag), labeled by worker type.

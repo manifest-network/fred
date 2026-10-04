@@ -115,6 +115,7 @@ func provisionStateMatches(a, b leasesm.ProvisionState) bool {
 		a.LifecycleCallbackURL == b.LifecycleCallbackURL &&
 		a.ActiveReleaseVersion == b.ActiveReleaseVersion &&
 		a.ActiveOperationID == b.ActiveOperationID &&
+		a.PendingOperation == b.PendingOperation &&
 		exactSliceEqual(a.Items, b.Items) &&
 		exactSliceEqual(a.ResourceProfiles, b.ResourceProfiles) &&
 		exactSliceEqual(a.ContainerIDs, b.ContainerIDs) &&
