@@ -122,14 +122,23 @@ func refuseWithoutTenantSeccomp(sink tenantSeccompSink, err error) error {
 	if !errors.Is(err, tenantseccomp.ErrRefused) {
 		return err
 	}
-	var authored *physicalOperationError
-	if errors.As(err, &authored) && errors.Is(authored.cause, tenantseccomp.ErrRefused) {
+	if _, authored := tenantSeccompRefusal(err); authored {
 		return err
 	}
 	if label := sink.label(); label != "" {
 		tenantSeccompProfileRefusalsTotal.WithLabelValues(label).Inc()
 	}
 	return &physicalOperationError{callback: msgTenantSeccompUnavailable, reason: backend.ReasonInternal, cause: err}
+}
+
+// tenantSeccompRefusal returns the provider fault that refuseWithoutTenantSeccomp
+// authored, if err carries one. No other authored failure matches.
+func tenantSeccompRefusal(err error) (*physicalOperationError, bool) {
+	var authored *physicalOperationError
+	if errors.As(err, &authored) && errors.Is(authored.cause, tenantseccomp.ErrRefused) {
+		return authored, true
+	}
+	return nil, false
 }
 
 // requireTenantSeccomp refuses a launch before it touches any substrate when

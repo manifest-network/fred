@@ -53,7 +53,7 @@ func TestDaemonLaunchRecordsStartsTheDaemonRefused(t *testing.T) {
 		"already-start": http.StatusNotModified,
 	}
 	scope := newDaemonLaunchScope(t.Context(), nil)
-	transport := daemonLaunchTransport{scope: scope, next: dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+	transport := daemonLaunchTransport{scope: scope, profiles: tenantSeccompTestProfiles(), next: dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if strings.HasSuffix(req.URL.Path, "/containers/create") {
 			return imageSecurityResponse(http.StatusInternalServerError, `{}`), nil
 		}
@@ -67,6 +67,10 @@ func TestDaemonLaunchRecordsStartsTheDaemonRefused(t *testing.T) {
 	} {
 		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://docker.invalid"+path, nil)
 		require.NoError(t, err)
+		if strings.HasSuffix(path, "/containers/create") {
+			// Every create crosses the tenant seccomp wire check (ENG-1118).
+			request = tenantSeccompCreateRequest(t, t.Context(), nil)
+		}
 		response, err := transport.RoundTrip(request)
 		require.NoError(t, err)
 		require.NoError(t, response.Body.Close())

@@ -198,6 +198,38 @@ func TestRefuseWithoutTenantSeccompAuthorsOneProviderFault(t *testing.T) {
 	require.Equal(t, before+1, testutil.ToFloat64(counter))
 }
 
+// A launch that fails without a positive container failure reports a generic
+// creation failure, except for a creation refused for the tenant seccomp
+// profile, which keeps the provider fault authored where it was raised
+// (ENG-1118 with ENG-1125). No other authored failure is inherited.
+func TestLaunchRejectedFailureKeepsOnlyATenantSeccompRefusal(t *testing.T) {
+	refusal := refuseWithoutTenantSeccomp(tenantSeccompSinkInvalid,
+		fmt.Errorf("%w: test", tenantseccomp.ErrRefused))
+	kept := launchRejectedFailure(fmt.Errorf("compose: %w", refusal))
+	require.Equal(t, msgTenantSeccompUnavailable, kept.callback)
+	require.Equal(t, backend.ReasonInternal, kept.reason)
+	require.ErrorIs(t, kept, tenantseccomp.ErrRefused, "the refusal stays in the operator detail")
+	// The attempt's failure capture, which recovery publishes for an
+	// ambiguous attempt, reads the same surface.
+	captured := failureObservation(errors.Join(kept, errors.New("cleanup detail")))
+	require.Equal(t, msgTenantSeccompUnavailable, captured.Message)
+	require.Equal(t, backend.ReasonInternal, captured.Reason)
+
+	generic := launchRejectedFailure(errors.New("daemon rejected the create"))
+	require.Equal(t, "container creation failed", generic.callback)
+	require.Equal(t, backend.ReasonInternal, generic.reason)
+
+	exited := &physicalOperationError{callback: "container exited during startup",
+		reason: backend.ReasonContainerExited, cause: errors.New("exit 1")}
+	notInherited := launchRejectedFailure(fmt.Errorf("compose: %w", exited))
+	require.Equal(t, "container creation failed", notInherited.callback)
+	require.Equal(t, backend.ReasonInternal, notInherited.reason, "a launch never inherits another authored reason")
+
+	bare := launchRejectedFailure(fmt.Errorf("%w: not authored", tenantseccomp.ErrRefused))
+	require.Equal(t, "container creation failed", bare.callback,
+		"only the authored refusal carries the provider-fault surface")
+}
+
 func TestObservedTenantSeccompReportsReadiness(t *testing.T) {
 	_, err := observedTenantSeccomp{source: &failingTenantSeccomp{}}.TenantSeccompProfile()
 	require.ErrorIs(t, err, tenantseccomp.ErrRefused)
