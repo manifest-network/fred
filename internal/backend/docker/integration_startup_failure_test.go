@@ -98,8 +98,8 @@ func TestIntegration_Stack_HealthyDependencyExitFailsDefinitely(t *testing.T) {
 			Command: []string{"sh", "-c", "sleep 1; exit 3"},
 			HealthCheck: &manifest.HealthCheckConfig{
 				Test:     []string{"CMD-SHELL", "test -f /tmp/never"},
-				Interval: manifest.Duration(10 * time.Second),
-				Timeout:  manifest.Duration(time.Second),
+				Interval: testHealthDuration(10 * time.Second),
+				Timeout:  testHealthDuration(time.Second),
 				Retries:  3,
 			},
 		},
