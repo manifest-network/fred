@@ -10,26 +10,34 @@ import (
 
 // liveDeathLedger remembers the live provenance of recent container deaths,
 // keyed by the container each provenance was minted for
-// (failurecause.Provenance.InstanceID). The event loop is its only writer:
-// the reader hands every die event, without waiting, to the loop's recorder
-// (recordLiveContainerDeaths) as well as to the dispatcher, and the loop marks
-// whether a subscription is held, so a death the dispatcher cannot route keeps
-// its provenance. The reader never writes the ledger itself, because the
-// ledger takes a lock and the reader may wait on nothing but its stream
-// (ENG-799). A death the dispatcher cannot route arrives while the container
-// is in no Ready projection yet: during a provision's startup verification,
-// and in the moment between the provision worker's last inspection and the
-// lease actor's Ready transition (ENG-1125).
+// (failurecause.Provenance.InstanceID). The event loop's recorder
+// (recordLiveContainerDeaths) is its only writer. The reader hands every
+// death to the recorder alone, and the recorder records it before it forwards
+// it to the dispatcher. A death the dispatcher cannot route arrives while the
+// container is in no Ready projection yet: during a provision's startup
+// verification, and in the moment between the provision worker's last
+// inspection and the lease actor's Ready transition (ENG-1125). Because the
+// dispatcher looks a death up only after it is recorded, and the Ready entry
+// reads this ledger under the projection lock that lookup takes, either the
+// lookup sees the Ready projection and routes the death, or the Ready entry
+// comes after the lookup, and so after the record, and takes the death from
+// here, unless the bound below evicted it first. The recorder also marks
+// whether a subscription is held, in order with its deaths: up before it
+// records the first death of a subscription, down only after it recorded the
+// last one the reader handed over. The reader never writes the ledger itself,
+// because the ledger takes a lock and the reader may wait on nothing but its
+// stream (ENG-799).
 //
-// Two readers consult it, each taking the entry it reads so a death is
-// attributed at most once: a startup failure's minting (newStartupFailure) and
-// the re-dispatch at a provision's Ready entry (redispatchStartupDeaths).
-// internal/testutil confines the writer and both readers to those functions.
+// Two readers consult it, each taking the entry it reads, so the ledger hands
+// a death out at most once: a startup failure's minting (newStartupFailure)
+// and the re-dispatch at a provision's Ready entry (redispatchStartupDeaths).
+// internal/testutil confines the writer, both readers, and the functions that
+// feed the recorder or dispatch a death, to their sites.
 //
-// The ledger is bounded and forgets the oldest entry first. A death that was
-// never recorded, was evicted, or was read while the stream was down reads as
-// unobserved, which never counts: every loss errs toward not closing a lease.
-// The zero value is ready to use.
+// The ledger is bounded and forgets the oldest entry first. A death the
+// reader dropped from a full queue, or one evicted here, reads as unobserved,
+// which never counts: every loss errs toward not closing a lease. The zero
+// value is ready to use.
 type liveDeathLedger struct {
 	mu              sync.Mutex
 	deathsByID      map[string]failurecause.Provenance
@@ -49,7 +57,7 @@ const liveDeathLedgerCapacity = containerDeathQueueCapacity
 const liveDeathAwait = time.Second
 
 // recordLiveDeath remembers one death's provenance. Only the event loop's
-// recorder may call it.
+// recorder may call it, before it forwards the death to the dispatcher.
 func (l *liveDeathLedger) recordLiveDeath(death failurecause.Provenance) {
 	id := death.InstanceID()
 	if id == "" {
@@ -83,8 +91,10 @@ func (l *liveDeathLedger) recordLiveDeath(death failurecause.Provenance) {
 }
 
 // markLiveDeathStream records whether the reader holds a subscription. Only
-// the event loop may call it, around the reader. While the reader holds none,
-// no new death can arrive, so a startup failure does not wait for one.
+// the event loop's recorder may call it, in order with the deaths: up before
+// it records the first death of a subscription, and down only after it
+// recorded the last death the reader handed over. Once the stream reads down,
+// no new death can be observed, so a startup failure does not wait for one.
 func (l *liveDeathLedger) markLiveDeathStream(connected bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

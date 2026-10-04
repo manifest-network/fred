@@ -124,8 +124,9 @@ func TestContainerEventLoop_StopsOnLatchedStorageAuthority(t *testing.T) {
 // The reader never waits on a death (ENG-799 review): dockerd skips events
 // for a subscriber that falls behind, and a skipped kill would let the next
 // die count. With the dispatcher stuck on one death, the reader keeps taking
-// every event from an unbuffered stream; past the queue's capacity a death is
-// dropped and counted rather than blocking it.
+// every event from an unbuffered stream, and the recorder keeps taking every
+// death from the reader; past the dispatcher queue's capacity the recorder
+// drops a death and counts it rather than blocking either of them.
 func TestContainerEventLoop_ReaderNeverWaitsOnDeathDispatch(t *testing.T) {
 	events := make(chan ContainerEvent)
 	b := newBackendForTest(&mockDockerClient{
@@ -184,8 +185,11 @@ func TestContainerEventLoop_ReaderNeverWaitsOnDeathDispatch(t *testing.T) {
 		send(ContainerEvent{ContainerID: id, Action: containerEventDie})
 	}
 	// The reader finishes one event before it takes the next, so taking this
-	// sentinel proves the last death above was queued or dropped.
+	// sentinel proves it handed the last death above to the recorder, which
+	// forwards each death after recording it.
 	send(ContainerEvent{ContainerID: "sentinel", Action: containerEventStart})
+	require.Eventually(t, func() bool { return eventLoopDrops()-drops >= 10 }, 5*time.Second, time.Millisecond,
+		"the recorder never dropped the deaths past the dispatcher queue's capacity")
 	assert.Equal(t, 10.0, eventLoopDrops()-drops,
 		"the queue holds its capacity; every death past it is dropped, counted, and never blocks")
 	assert.Equal(t, float64(containerDeathQueueCapacity), testutil.ToFloat64(containerDeathQueueDepth),

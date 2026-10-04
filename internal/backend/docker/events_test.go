@@ -266,21 +266,23 @@ func TestHandleContainerDeath_SkipsDeprovisioning(t *testing.T) {
 func TestFindLeaseByContainerID(t *testing.T) {
 	b := newBackendForTest(nil, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			ContainerIDs: []string{"c1", "c2"}},
+			ContainerIDs: []string{"c1", "c2"}, Status: backend.ProvisionStatusReady},
 		},
 		"lease-2": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-2",
-			ContainerIDs: []string{"c3"}},
+			ContainerIDs: []string{"c3"}, Status: backend.ProvisionStatusProvisioning},
 		},
 	})
 
-	uuid, found := b.findLeaseByContainerID("c2")
+	uuid, status, found := b.findLeaseByContainerID("c2")
 	assert.True(t, found)
 	assert.Equal(t, "lease-1", uuid)
+	assert.Equal(t, backend.ProvisionStatusReady, status)
 
-	uuid, found = b.findLeaseByContainerID("c3")
+	uuid, status, found = b.findLeaseByContainerID("c3")
 	assert.True(t, found)
 	assert.Equal(t, "lease-2", uuid)
+	assert.Equal(t, backend.ProvisionStatusProvisioning, status, "the status is read with the lease")
 
-	_, found = b.findLeaseByContainerID("nonexistent")
+	_, _, found = b.findLeaseByContainerID("nonexistent")
 	assert.False(t, found)
 }

@@ -2227,7 +2227,7 @@ func (b *Backend) actorOwnsMaintenance(leaseUUID string, id shared.MaintenanceID
 // production event path. Tests synchronize on the resulting state, callback,
 // or quiescence claim instead of a test-only message acknowledgement.
 func (b *Backend) handleContainerDeath(containerID string) {
-	leaseUUID, found := b.findLeaseByContainerID(containerID)
+	leaseUUID, _, found := b.findLeaseByContainerID(containerID)
 	if !found {
 		return
 	}

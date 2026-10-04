@@ -18,14 +18,20 @@ package testutil
 //     newStartupFailure, and the classifier evidence
 //     (shared.NewOperationStartupFailed) only in confirmStartupFailure, after
 //     the classifier's own positive reads;
-//   - the live-death ledger: written only by the event loop, deaths
-//     (recordLiveDeath) by its recorder and the stream mark
-//     (markLiveDeathStream) by the loop around its reader, never by the reader
-//     itself, which may wait on nothing but its stream (ENG-799); read only
-//     by newStartupFailure (awaitLiveDeath) and the Ready-entry re-dispatch
-//     (takeLiveDeaths); reached through b.liveDeaths only by those four entry
-//     points; and its fields and unexported helpers named only in its own
-//     file;
+//   - the live-death ledger: written only by the event loop's recorder, both
+//     the deaths (recordLiveDeath) and the stream marks
+//     (markLiveDeathStream), never by the reader itself, which may wait on
+//     nothing but its stream (ENG-799); read only by newStartupFailure
+//     (awaitLiveDeath) and the Ready-entry re-dispatch (takeLiveDeaths);
+//     reached through b.liveDeaths only by those four entry points; and its
+//     fields and unexported helpers named only in its own file;
+//   - the paths a live provenance travels: the recorder
+//     (recordLiveContainerDeaths) and the dispatcher
+//     (dispatchLiveContainerDeaths) are started only by the event loop, which
+//     alone hands them their queues, and one death is dispatched
+//     (dispatchLiveContainerDeath) only by the dispatcher and the Ready-entry
+//     re-dispatch, so a provenance that left the loop, through a sealed
+//     startup failure or a ledger read, cannot be fed back in;
 //   - the startup health ledger behind the sticky health rule: written
 //     (recordPassedHealth) only by a startup watch's memory
 //     (startupMemory.remember), from a pass it inspected; its fields are named
@@ -82,7 +88,8 @@ const (
 	launchDispatchSite         = "newVolumeLaunchCoordinator"
 	startupDeathRedispatchSite = "Backend.redispatchStartupDeaths"
 	liveDeathRecorderSite      = "Backend.recordLiveContainerDeaths"
-	liveDeathStreamMarkSite    = "Backend.runContainerEventLoop"
+	liveDeathDispatcherSite    = "Backend.dispatchLiveContainerDeaths"
+	containerEventLoopSite     = "Backend.runContainerEventLoop"
 	startupMemoryRememberSite  = "startupMemory.remember"
 )
 
@@ -110,9 +117,14 @@ var dockerStartupRules = []startupAuthorityRule{
 	{"admitStartupRollback", []attributionSite{{startupFailureFile, startupConclusionSite}}, "a startup rollback's admission"},
 	{"rollbackStartupFailure", []attributionSite{{startupFailureFile, startupConclusionSite}}, "a startup rollback"},
 	{"recordLiveDeath", []attributionSite{{terminalBudgetEventsFile, liveDeathRecorderSite}}, "a live-death ledger write"},
-	{"markLiveDeathStream", []attributionSite{{terminalBudgetEventsFile, liveDeathStreamMarkSite}}, "a live-death ledger write"},
+	{"markLiveDeathStream", []attributionSite{{terminalBudgetEventsFile, liveDeathRecorderSite}}, "a live-death ledger write"},
 	{"awaitLiveDeath", []attributionSite{{startupFailureFile, startupFailureMintSite}}, "a live-death ledger read"},
 	{"takeLiveDeaths", []attributionSite{{terminalBudgetEventsFile, startupDeathRedispatchSite}}, "a live-death ledger read"},
+	{"recordLiveContainerDeaths", []attributionSite{{terminalBudgetEventsFile, containerEventLoopSite}}, "the live-death recorder"},
+	{"dispatchLiveContainerDeaths", []attributionSite{{terminalBudgetEventsFile, containerEventLoopSite}}, "the live-death dispatcher"},
+	{"dispatchLiveContainerDeath", []attributionSite{
+		{terminalBudgetEventsFile, liveDeathDispatcherSite}, {terminalBudgetEventsFile, startupDeathRedispatchSite},
+	}, "a live death's dispatch"},
 	{"recordPassedHealth", []attributionSite{{startupObservationFile, startupMemoryRememberSite}}, "a startup health ledger write"},
 }
 
@@ -340,6 +352,32 @@ func (b *Backend) recoverState() { b.liveDeaths.recordLiveDeath(p) }`, "names re
 			`package docker
 func (b *Backend) dispatchLiveContainerDeath() { b.liveDeaths.markLiveDeathStream(true) }`,
 			"names markLiveDeathStream"},
+		{"ledger stream marked by the loop, out of order with the deaths", terminalBudgetEventsFile,
+			`package docker
+func (b *Backend) runContainerEventLoop() { b.liveDeaths.markLiveDeathStream(false) }`,
+			"names markLiveDeathStream"},
+		{"recorder fed outside the loop", "internal/backend/docker/recover.go",
+			`package docker
+func (b *Backend) recoverState() { b.recordLiveContainerDeaths(replayed, dispatch, overflow) }`,
+			"names recordLiveContainerDeaths"},
+		{"recorder fed elsewhere in the loop's file", terminalBudgetEventsFile,
+			`package docker
+func (b *Backend) redispatchStartupDeaths() { go b.recordLiveContainerDeaths(replayed, dispatch, overflow) }`,
+			"names recordLiveContainerDeaths"},
+		{"dispatcher fed outside the loop", "internal/backend/docker/recover.go",
+			`package docker
+func (b *Backend) recoverState() { b.dispatchLiveContainerDeaths(replayed) }`, "names dispatchLiveContainerDeaths"},
+		{"a sealed startup failure's provenance dispatched again", startupFailureFile,
+			`package docker
+func (b *Backend) concludeStartupFailure() { b.dispatchLiveContainerDeath(sealed.Provenance()) }`,
+			"names dispatchLiveContainerDeath"},
+		{"a death dispatched by the recorder, past the dispatcher's queue", terminalBudgetEventsFile,
+			`package docker
+func (b *Backend) recordLiveContainerDeaths() { b.dispatchLiveContainerDeath(death) }`,
+			"names dispatchLiveContainerDeath"},
+		{"a death's dispatch as a method value", "internal/backend/docker/recover.go",
+			`package docker
+var dispatch = (*Backend).dispatchLiveContainerDeath`, "names dispatchLiveContainerDeath"},
 		{"ledger read by the sweep", "internal/backend/docker/recover.go",
 			`package docker
 func (b *Backend) recoverState() { _ = b.liveDeaths.takeLiveDeaths(nil) }`, "names takeLiveDeaths"},
@@ -453,9 +491,18 @@ func (d *launchDegradations) add(degradation launchDegradation) { d.degradationB
 		{startupHealthLedgerFile, `package docker
 func (l *startupHealthLedger) recordPassedHealth(pass startupPass) { l.healthyByID["c"] = struct{}{}; l.healthyNext++ }`},
 		{terminalBudgetEventsFile, `package docker
-func (b *Backend) runContainerEventLoop() { b.liveDeaths.markLiveDeathStream(true) }
-func (b *Backend) recordLiveContainerDeaths() { b.liveDeaths.recordLiveDeath(p) }
-func (b *Backend) redispatchStartupDeaths() { _ = b.liveDeaths.takeLiveDeaths(nil) }`},
+func (b *Backend) runContainerEventLoop() {
+	pipeline.Go(func() { b.recordLiveContainerDeaths(subscriptions, dispatch, overflow) })
+	pipeline.Go(func() { b.dispatchLiveContainerDeaths(dispatch) })
+}
+func (b *Backend) recordLiveContainerDeaths() {
+	b.liveDeaths.markLiveDeathStream(true)
+	b.liveDeaths.recordLiveDeath(p)
+	b.liveDeaths.markLiveDeathStream(false)
+}
+func (b *Backend) dispatchLiveContainerDeaths() { b.dispatchLiveContainerDeath(p) }
+func (b *Backend) dispatchLiveContainerDeath(p int) {}
+func (b *Backend) redispatchStartupDeaths() { _ = b.liveDeaths.takeLiveDeaths(nil); b.dispatchLiveContainerDeath(p) }`},
 		{liveDeathLedgerFile, `package docker
 type liveDeathLedger struct{ deathsByID map[string]int }
 func (l *liveDeathLedger) recordLiveDeath(p int) { l.deathsByID["c"] = p; l.notifyLocked() }

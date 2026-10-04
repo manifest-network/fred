@@ -214,8 +214,10 @@ func (s *backendProvisionStore) UpdateFn(leaseUUID string, fn func(*leasesm.Prov
 	if wasProvisioning && isReady {
 		// A provision's Ready entry: a container that died after the worker's
 		// last inspection was in no Ready projection when its die event came,
-		// so it could not be routed. Hand its recorded death back to the
-		// dispatcher now that the projection names it (ENG-1125).
+		// so it could not be routed. The event loop records a death before
+		// its dispatcher looks it up under this lock, so such a death was
+		// recorded before this entry. Hand it back to the dispatcher now that
+		// the projection names it (ENG-1125).
 		s.backend.redispatchStartupDeaths(p.ContainerIDs)
 	}
 	return true

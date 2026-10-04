@@ -10,30 +10,30 @@ import (
 // this file alone, and the file is a closed world. dockerd skips events for a
 // subscriber that falls behind, and a skipped "kill" would make the following
 // "die" count against the tenant's terminal budget, so the reader may wait on
-// nothing but its own stream: not on death dispatch, and not on log output,
-// which production writes synchronously to stdout (ENG-799). It holds no
-// logger and no backend. A death it drops from a full queue is counted and
-// handed through containerDeathOverflow to the event loop's reporter, which
-// logs it on its own goroutine.
+// nothing but its own stream: not on recording or dispatching a death, and
+// not on log output, which production writes synchronously to stdout
+// (ENG-799). It holds no logger and no backend. A death it drops from a full
+// queue is counted and handed through containerDeathOverflow to the event
+// loop's reporter, which logs it on its own goroutine.
 //
 // internal/testutil/container_event_reader_guard_test.go keeps it that way:
 // this file imports only failurecause and sync/atomic; names nothing else
-// from package docker but the event type, its actions and the two metrics the
-// reader updates; declares no function or interface type and no function
+// from package docker but the event type, its actions and the drop counter
+// the reader updates; declares no function or interface type and no function
 // literal, so no caller can hand the reader a logger; sends only from a
 // select that has a default case; and waits only in consume's select over
 // its two streams and its stop signal. Because any file of the package could
 // add methods to these types, the guard also rejects a method on them, or on
 // the event type, declared anywhere else.
 
-// containerEventReader reads the container event subscriptions. Its only
-// capabilities are the backend's stop signal, the dispatcher's queue, the
-// live-death recorder's queue and the overflow record: nothing it can reach
-// logs or waits.
+// containerEventReader reads one container event subscription. Its only
+// capabilities are the backend's stop signal, the subscription's death queue
+// and the overflow record: nothing it can reach logs or waits. The queue has
+// one consumer, the event loop's recorder, which writes each death into the
+// live-death ledger before it hands it to the dispatcher (ENG-1125).
 type containerEventReader struct {
 	stop     <-chan struct{}
 	deaths   chan<- failurecause.Provenance
-	ledger   chan<- failurecause.Provenance
 	overflow *containerDeathOverflow
 }
 
@@ -65,12 +65,9 @@ func (r containerEventReader) consume(events <-chan ContainerEvent, errs <-chan 
 			case containerEventDie:
 				// Consume the run's record first, so a death of an untracked
 				// container still frees its entry. The provenance is bound to
-				// this container and is all the dispatcher needs. The
-				// live-death ledger keeps it too, for a container that is in
-				// no Ready projection yet and so cannot be routed (ENG-1125).
-				death := session.ObserveExit(event.ContainerID)
-				r.remember(death)
-				r.enqueue(death)
+				// this container and is all the recorder and the dispatcher
+				// need.
+				r.enqueue(session.ObserveExit(event.ContainerID))
 			}
 		case err, ok := <-errs:
 			if !ok {
@@ -81,35 +78,24 @@ func (r containerEventReader) consume(events <-chan ContainerEvent, errs <-chan 
 	}
 }
 
-// enqueue hands one death to the dispatcher without ever blocking. A full
-// queue drops the dispatch, toward unknown: the reconcile sweep finds that
-// death later, unattributed. The reader only counts the drop.
+// enqueue hands one death to the recorder without ever blocking. A full queue
+// drops the death, toward unknown: it is neither recorded nor dispatched, so a
+// startup failure finds no live provenance for it, and the reconcile sweep
+// finds a Ready workload's death later, unattributed. The reader only counts
+// the drop.
 func (r containerEventReader) enqueue(death failurecause.Provenance) {
 	select {
 	case r.deaths <- death:
-		containerDeathQueueDepth.Set(float64(len(r.deaths)))
 	default:
 		r.overflow.record()
 	}
 }
 
-// remember hands one death to the live-death recorder without ever blocking.
-// The ledger takes a lock, so the reader never writes it directly: the event
-// loop's recorder does, on its own goroutine. A full queue drops the record,
-// toward unobserved: a startup failure that finds no provenance is not
-// counted, and a death that raced a Ready transition is left to the sweep,
-// unattributed. Either loss errs toward not closing a lease.
-func (r containerEventReader) remember(death failurecause.Provenance) {
-	select {
-	case r.ledger <- death:
-	default:
-	}
-}
-
-// containerDeathOverflow carries the deaths the reader drops to the reporter
-// that logs them. The reader's side, record, is two atomic adds and a send
-// that never waits. Wakeups coalesce in a one-slot channel, so a burst of
-// drops wakes the reporter once, and it reads the accumulated count.
+// containerDeathOverflow carries the deaths the event loop drops from a full
+// queue, the reader's and the recorder's, to the reporter that logs them. Its
+// recording side, record, is two atomic adds and a send that never waits.
+// Wakeups coalesce in a one-slot channel, so a burst of drops wakes the
+// reporter once, and it reads the accumulated count.
 type containerDeathOverflow struct {
 	unreported atomic.Uint64
 	wake       chan struct{}
