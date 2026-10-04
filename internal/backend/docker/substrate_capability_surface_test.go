@@ -92,8 +92,8 @@ func TestBackendRetainsOnlyReadViewsAndExplicitSettlementCapabilities(t *testing
 	// Live execution receives only a purpose-specific invocation closure. The
 	// exact opaque subject, mutation facade, target names and action selection
 	// are captured by its builder and cannot be changed by run*Substrate. Only
-	// the operation workflow reports a typed finding (ENG-1125), and only as an
-	// output.
+	// the operation workflow reports a typed finding, one its execution's
+	// session accepted (ENG-1125), and only as an output.
 	errorType := reflect.TypeFor[error]()
 	assertInvocationOnly := func(name string, capability reflect.Type, outputs ...reflect.Type) {
 		t.Helper()
@@ -111,7 +111,7 @@ func TestBackendRetainsOnlyReadViewsAndExplicitSettlementCapabilities(t *testing
 	operationCapability := reflect.TypeFor[operationSubstrate]()
 	maintenanceCapability := reflect.TypeFor[maintenanceSubstrate]()
 	closeCapability := reflect.TypeFor[closeSubstrate]()
-	assertInvocationOnly("operationSubstrate", operationCapability, reflect.TypeFor[startupFailure](), errorType)
+	assertInvocationOnly("operationSubstrate", operationCapability, reflect.TypeFor[acceptedStartupFailure](), errorType)
 	assertInvocationOnly("maintenanceSubstrate", maintenanceCapability, errorType)
 	assertInvocationOnly("closeSubstrate", closeCapability, errorType)
 	if operationCapability.AssignableTo(maintenanceCapability) ||
