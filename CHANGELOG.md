@@ -1170,6 +1170,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Clarify the current tenant-token scope, signed expiry, and endpoint-specific
+  replay behavior in the security guide and tenant quickstart. Audience and
+  operation binding remains a separate breaking protocol change after v0.14
+  (ENG-925, ENG-1213).
 - Health check `interval`, `timeout` and `start_period` are now bounded when a
   manifest is submitted: each must be `0` (or omitted) for the image's or
   Docker's default, or at least `1ms` (Docker's minimum), in both string and

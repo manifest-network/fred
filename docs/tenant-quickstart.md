@@ -50,17 +50,38 @@ For example: `manifest1abc...:550e8400-e29b-41d4-a716-446655440000:1735689600`
 
 This message is signed using **ADR-036** (Cosmos's standard for off-chain message signing), which wraps the message in a sign-doc structure before signing with secp256k1. The resulting signature is then **normalized to low-S** canonical form to prevent malleability — most secp256k1 libraries do this by default, but verify before going to production.
 
+### Token scope
+
+This token grants access to the named lease; it does not distinguish reading
+status from requesting a restart or update. It also does not bind the chain,
+provider, or intended API address into the signed message. Fred checks
+tenant/provider ownership separately, but a wallet's selected chain does not
+make the token specific to that environment.
+
+Send the token only to the intended trusted HTTPS provider API and keep it
+out of logs. Use dedicated test wallets and leases in non-production
+environments. The payload-upload token in Step 3 uses a separate signed
+message that also binds the payload hash. See
+[SECURITY.md § Token scope and deployment boundaries](../SECURITY.md#token-scope-and-deployment-boundaries)
+for the current guarantees and limitations. These formats remain unchanged
+for v0.14; stronger binding requires a coordinated future protocol upgrade.
+
 ### Validity window
 
 | Constraint | Limit |
 |---|---|
 | Maximum age | 30 seconds |
 | Maximum future skew | 10 seconds |
-| Replay (mutating endpoints + `/connection`) | One-time use |
+| Replay (`/restart`, `/update`, `/restore`, `/connection`) | One-time use |
 
 `/connection` is included because it returns sensitive endpoint details; the other read endpoints (`/status`, `/provision`, `/logs`, `/releases`, `/events`) are idempotent and skip the replay check. See [SECURITY.md § Token Replay (Tenant API)](../SECURITY.md#token-replay-tenant-api) for the full table.
 
-Tokens are short-lived. Generate a fresh one for each request, or batch requests within a 30-second window.
+Tokens expire at their signed timestamp plus 30 seconds. A timestamp up to
+10 seconds ahead is accepted, so a future-dated token can remain valid for up
+to 40 seconds after first acceptance. Generate a fresh token for each request.
+Read-only requests may reuse an unexpired token, but requests to endpoints
+with replay protection require a fresh token for every HTTP attempt.
+Payload uploads use their separate token format and idempotency guard.
 
 ### Mint a token with the `lease-token` CLI
 

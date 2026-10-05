@@ -36,6 +36,42 @@ Tenants authenticate to Fred's API using signed bearer tokens. Each token is a b
 
 **Implementation:** `internal/api/auth.go`, `internal/adr036/adr036.go`
 
+#### Token scope and deployment boundaries
+
+The regular token is a short-lived credential for access to one tenant's
+lease. Its signed message does not include the chain ID, provider UUID, API
+address (audience), HTTP method, or operation. The payload-upload format is
+separate and binds `meta_hash`, but also omits the chain, provider, and API
+audience. ADR-036's outer sign document has an empty `chain_id`; selecting a
+chain in a wallet does not add that chain ID to Fred's signed message.
+
+Endpoints still enforce tenant/provider ownership and their lease-state
+requirements. These authorization checks do not establish which API address
+or operation the signer intended. For example, a regular token used for
+`GET /status` can authenticate `POST /restart` for the same lease while it is
+fresh and unconsumed by the replay tracker, subject to the restart endpoint's
+other requirements. A token minted for a read request therefore must be
+protected like a credential that can also authorize mutations. See
+[Token Replay](#token-replay-tenant-api) for the endpoints that consume tokens.
+
+Different deployments have separate replay databases. If another deployment
+accepts the same tenant/lease identity and its provider-ownership checks also
+pass, such as after cloning chain state and provider identity, a captured
+token can be accepted there before expiry. This requires a valid token and
+matching authorization state; the missing binding does not bypass ordinary
+tenant or provider ownership checks. Expiry remains signed timestamp plus
+30 seconds, with at most 10 seconds of accepted future clock skew.
+
+Clients must send tokens only to the intended trusted HTTPS API, keep them
+out of logs and diagnostics, and use dedicated test wallets and leases in
+non-production environments. Treat a service receiving a regular token as
+receiving lease access, even if the immediate request only reads status.
+
+The v0.14 release retains these signed-message formats. Versioned audience
+and operation binding is a separate post-v0.14 protocol change requiring
+coordinated updates to Fred and its token-minting clients, tracked in
+[ENG-1213](https://linear.app/liftedinit/issue/ENG-1213).
+
 ### Callback Authentication (HMAC-SHA256)
 
 Backends authenticate callbacks to Fred using HMAC-SHA256 with a four-field canonical string that binds the timestamp, HTTP method, request URI, and body hash. Binding the method and URI prevents cross-endpoint replay; hashing the body keeps the canonical string binary-safe.
