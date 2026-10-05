@@ -252,10 +252,12 @@ func (b *Backend) prepareLaunchVolumes(ctx context.Context, mutations *storageMu
 			}
 			path, wasCreated, err := b.createManagedVolume(mutations, ctx, name, size)
 			if err != nil {
-				if !stateful {
+				if !stateful && !errors.Is(err, ErrVolumeDeleteHeld) {
 					// Writable-path seeding remains best effort. No path capability
 					// is issued for this volume; Compose retains its tmpfs fallback,
-					// and the launch is degraded (ENG-1125).
+					// and the launch is degraded (ENG-1125). A name whose earlier
+					// deletion is still held is not best effort: the launch fails
+					// rather than run unseeded (ENG-1117).
 					skipped.add(launchWritableVolumeUnavailable)
 					continue
 				}

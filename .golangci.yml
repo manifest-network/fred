@@ -59,11 +59,44 @@ linters:
       # projections and fixed workflow services. The compiler prevents
       # b.volumes.Destroy; this lint rule also prevents a same-package type
       # assertion or a newly retained raw sink from bypassing the boundary.
+      #
+      # A held volume deletion is retried only by the hold executor, through
+      # the same construction-bound bracket (ENG-1117). Only Backend.Start,
+      # through the same composition, defers first-time deletions to that
+      # executor; any other deferral would hold deletions for an executor
+      # that may never run.
+      #
+      # Tenant-controlled directory trees can be arbitrarily deep or wide. The
+      # standard library's recursive removers and walkers recurse with one open
+      # descriptor or one stack frame per level and no work bound, so every
+      # recursive removal or traversal goes through internal/fstree, which
+      # bounds descriptors, depth and work (ENG-1117). fstree.RemoveBeneath is
+      # itself an unrestricted recursive delete, so only its two reviewed
+      # wiring sites may call it. These rules are mirrored by
+      # internal/testutil/no_unbounded_tree_traversal_test.go, which also
+      # resolves aliased imports.
+      #
+      # COUPLING: every per-file exemption below is keyed on a bracketed tag
+      # that starts its rules' messages, never on prose another rule could
+      # reuse, and each tag has exactly one exemption. Only the rules that
+      # carry a tag are exempt in its files; every other rule still fires
+      # there. internal/testutil/lint_exemption_test.go pins exactly which
+      # rules carry each tag and which files exempt it.
       forbid:
         - pattern: '\.Destroy$'
-          msg: "managed-volume destruction must use the construction-bound substrate mutation executor"
+          msg: "[composition-writer] managed-volume destruction must use the construction-bound substrate mutation executor"
         - pattern: 'volumes\.Create$'
-          msg: "managed-volume creation must use the construction-bound substrate mutation executor"
+          msg: "[composition-writer] managed-volume creation must use the construction-bound substrate mutation executor"
+        - pattern: '\.RetryHeldVolumeDelete$'
+          msg: "[composition-writer] held volume deletions are retried only by the hold executor through the construction-bound substrate mutation executor"
+        - pattern: '\.DeferDeletesUntilExecutorRuns$'
+          msg: "[composition-writer] only Backend.Start defers volume deletions to the hold executor, through the construction-bound background maintenance coordinator"
+        - pattern: '\.RemoveAll$'
+          msg: "recursive removal must use internal/fstree.RemoveBeneath, which bounds descriptors, depth and work"
+        - pattern: '^(filepath\.Walk|filepath\.WalkDir|fs\.WalkDir|os\.CopyFS)$'
+          msg: "recursive traversal must use internal/fstree.WalkBeneath, which bounds descriptors, depth and work"
+        - pattern: 'fstree\.RemoveBeneath$'
+          msg: "[tree-removal-wiring] tenant trees are removed only at the two reviewed wiring sites: a condemned XFS volume (volume_xfs.go) and the writable-path wipe (storage_mutation_guard.go)"
         # An on-chain lease close cannot be undone. Every hop of the
         # reconciler's close is pinned to the one file that may call it, and
         # each message carries a bracketed tag that its exclusion below
@@ -121,9 +154,13 @@ linters:
       # The only production file allowed to invoke the raw volume writer. It
       # captures that writer during composition and exposes only subject-bound
       # or fixed background workflows; no request handler receives the sink.
+      # Only the [composition-writer] rules (Destroy, Create,
+      # RetryHeldVolumeDelete, DeferDeletesUntilExecutorRuns) are exempt here:
+      # every other rule still applies.
       - path: ^internal/backend/docker/storage_mutation_guard\.go$
         linters:
           - forbidigo
+        text: '\[composition-writer\]'
       # The on-chain close hops (see the forbidigo rules). Each exclusion
       # matches one bracketed tag, so it excuses only its own hop.
       - path: ^internal/provisioner/reconcile_close\.go$
@@ -134,11 +171,7 @@ linters:
         linters:
           - forbidigo
         text: '\[placement-lease-close\]'
-      - path: ^internal/provisioner/(manager|placement/provider_control_plane)\.go$
-        linters:
-          - forbidigo
-        text: '\[chain-lease-close\]'
-      - path: ^internal/scheduler/withdraw\.go$
+      - path: ^internal/(provisioner/(manager|placement/provider_control_plane)|scheduler/withdraw)\.go$
         linters:
           - forbidigo
         text: '\[chain-lease-close\]'
@@ -147,6 +180,12 @@ linters:
         linters:
           - forbidigo
         text: '\[startup-evidence\]'
+      # The two reviewed wiring sites of fstree.RemoveBeneath: the condemned
+      # XFS volume's removal and the live writable-path wipe.
+      - path: ^internal/backend/docker/(volume_xfs|storage_mutation_guard)\.go$
+        linters:
+          - forbidigo
+        text: '\[tree-removal-wiring\]'
       # Exclude test files from strict linters
       - path: _test\.go
         linters:

@@ -6,6 +6,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
+	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 const (
@@ -163,6 +164,22 @@ const (
 // CounterVec series to 0 so absence/ratio alert queries return 0, not no-data.
 var refuseScopes = []string{refuseScopeGlobal, refuseScopeTenant, refuseScopePartition}
 var capChecks = []string{capCheckEvict, capCheckBreach, capCheckBound, capCheckRefuseGet}
+
+// Outcome labels for volumeDeleteOutcomesTotal, one per XFS delete-stage
+// cleanup attempt (ENG-1117).
+const (
+	volumeDeleteOutcomeCompleted    = "completed"
+	volumeDeleteOutcomeHeldRemoval  = "held_removal"
+	volumeDeleteOutcomeHeldUnsized  = "held_unsized"
+	volumeDeleteOutcomeHeldResidual = "held_residual"
+	volumeDeleteOutcomeLatched      = "latched"
+)
+
+// volumeDeleteOutcomes is the closed outcome set, pre-initialized in init.
+var volumeDeleteOutcomes = []string{
+	volumeDeleteOutcomeCompleted, volumeDeleteOutcomeHeldRemoval, volumeDeleteOutcomeHeldUnsized,
+	volumeDeleteOutcomeHeldResidual, volumeDeleteOutcomeLatched,
+}
 
 const (
 	operationRecoveryTimeoutProvision = "provision_timeout"
@@ -393,6 +410,42 @@ var (
 		Help:      "Age in seconds of the oldest pending durable close intent; 0 when none are pending",
 	})
 
+	// oldestUnheldCloseIntentAgeSeconds is oldestCloseIntentAgeSeconds over
+	// the close intents that do NOT wait only on held volume deletions. A held
+	// close is expected to age while the hold executor finishes its deletion;
+	// close-age paging uses this gauge so that an old held close cannot page
+	// beside a young unheld one, nor be masked by it (ENG-1117).
+	oldestUnheldCloseIntentAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "oldest_unheld_close_intent_age_seconds",
+		Help:      "Age in seconds of the oldest pending durable close intent that is not waiting only on held volume deletions; 0 when none are pending",
+	})
+
+	// closeIntentsDeleteHeld counts pending close intents waiting on nothing
+	// but held volume deletions (every remaining managed volume of the close is
+	// held with its caller pending, and no container remains). The hold executor finishes
+	// those on its own, so close-age alerting can exclude them (ENG-1117).
+	closeIntentsDeleteHeld = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "close_intents_delete_held",
+		Help:      "Pending close intents waiting only on held volume deletions",
+	})
+
+	// volumeDeleteHolds is the number of held volume deletions by phase,
+	// sampled by the Backend from its volume manager (ENG-1117). removal: tenant
+	// bytes may remain and the caller stays pending; unsized: the volume is gone
+	// but its project's footprint is not known yet, so disk admission is
+	// withheld; residual: the volume is gone and only its quota project awaits
+	// the zero-usage proof.
+	volumeDeleteHolds = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_delete_holds",
+		Help:      "Volume deletions held per volume and retried in the background, by phase (removal|unsized|residual); unsized withholds disk admission",
+	}, []string{"phase"})
+
 	// leaseMutationUUIDSlots is the monotonically increasing number of lease
 	// identities whose callback aggregate has reserved permanent replay/close
 	// authority. It never falls when a lease closes; operators compare it with
@@ -519,28 +572,71 @@ var (
 	// volumeQuotaBackfillTotal counts per-volume quota re-application attempts by
 	// the startup reconcile (reconcileVolumeQuotas), which re-tags + re-limits
 	// existing volumes so leases provisioned before the daemon held CAP_SYS_ADMIN
-	// get their disk_mb enforced without a re-provision. outcome ∈ {applied,failed}.
-	// (ENG-454)
+	// get their disk_mb enforced without a re-provision. outcome ∈
+	// {applied,failed,delete_pending}; delete_pending is a wanted volume whose
+	// deletion is held and whose limits its delete authority keeps (ENG-454,
+	// ENG-1117).
 	volumeQuotaBackfillTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "volume_quota_backfill_total",
-		Help:      "Startup quota-backfill per-volume re-application attempts by outcome",
+		Help:      "Startup quota-backfill per-volume re-application attempts by outcome (applied|failed|delete_pending)",
 	}, []string{"outcome"})
 
 	// volumeQuotaClearFailedTotal counts failed XFS quota-clear commands during
 	// interrupted-create compensation and typed deletion (ENG-459/ENG-632). It
-	// does not count the preceding block/inode usage proofs. Current typed
-	// failures are propagated and retain their durable mutation authority, which
-	// fail-stops this backend process until a fresh Start recovers it. Only an
-	// already-absent historical volume without typed authority can require the
-	// classified manual cleanup described in OPERATIONS.md.
+	// does not count the preceding block/inode usage proofs. Both keep their
+	// typed authority: a failed clear during deletion holds that one volume's
+	// deletion (reason quota_clear_failed) and the hold executor retries it
+	// (ENG-1117); a failed create compensation keeps its stage for the next
+	// Start. Only an already-absent historical volume without typed authority
+	// can require the classified manual cleanup described in OPERATIONS.md.
 	volumeQuotaClearFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "volume_quota_clear_failed_total",
-		Help:      "Failed XFS quota-clear commands during create compensation or deletion; typed authority is retained for restart recovery — see ENG-459/ENG-632",
+		Help:      "Failed XFS quota-clear commands during create compensation or deletion; the delete stage or create stage is kept and retried — see ENG-459/ENG-1117",
 	})
+
+	// volumeDeleteHeldResidualMB is the admission term for held deletions in
+	// their residual phase: the sum of their projects' footprints (each
+	// project's block hard limit, or its used blocks when larger), in MiB,
+	// already counted in the retained-disk projection (ENG-1117).
+	volumeDeleteHeldResidualMB = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_delete_held_residual_mb",
+		Help:      "Disk (MiB) counted in admission for held volume deletions whose volume is gone but whose quota project may still charge usage",
+	})
+
+	// volumeDeleteOutcomesTotal counts XFS delete-stage cleanup attempts by
+	// outcome, whether inline, by the hold executor, or at startup (ENG-1117).
+	volumeDeleteOutcomesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_delete_outcomes_total",
+		Help:      "XFS volume deletion attempts by outcome (completed|held_removal|held_unsized|held_residual|latched)",
+	}, []string{"outcome"})
+
+	// treeRemovalsTotal counts fstree removals of tenant-shaped trees by site
+	// (delete_stage: XFS deletion of a condemned volume; writable_path: the
+	// writable-path wipe before reseeding) and outcome (ENG-1117).
+	treeRemovalsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "tree_removals_total",
+		Help:      "Removals of tenant directory trees by site (delete_stage|writable_path) and outcome",
+	}, []string{"site", "outcome"})
+
+	// treeRemovalCutsTotal counts subtrees fstree moved into the removal's
+	// anchor because they lay deeper than its ancestry bound. Any increase means
+	// a tree deeper than 65,536 levels was removed.
+	treeRemovalCutsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "tree_removal_cuts_total",
+		Help:      "Subtrees moved into the removal anchor because the tree was deeper than the removal's ancestry bound, by site",
+	}, []string{"site"})
 
 	// volumeBindSymlinkRejectedTotal counts stateful-volume bind sources refused
 	// because the declared VOLUME's leaf was a symlink (ENG-795). Only a tenant that
@@ -1135,10 +1231,14 @@ var reindexTriggers = []string{"open", "manual"}
 // first restore completes (ENG-408). Values mirror provisionsTotal.
 var restoreOutcomes = []string{"success", "failure"}
 
+// quotaBackfillDeletePending counts a wanted volume skipped because its
+// deletion is pending: its delete authority owns its limits (ENG-1117).
+const quotaBackfillDeletePending = "delete_pending"
+
 // quotaBackfillOutcomes is the closed outcome set for volumeQuotaBackfillTotal,
 // pre-initialized to 0 so a backfill failure-ratio query returns 0, not no-data,
 // before the first startup reconcile (ENG-454).
-var quotaBackfillOutcomes = []string{"applied", "failed"}
+var quotaBackfillOutcomes = []string{"applied", "failed", quotaBackfillDeletePending}
 
 func init() {
 	// Pre-init every failure attribution (ENG-799) so an alert on a non-counted
@@ -1234,6 +1334,19 @@ func init() {
 	for _, c := range capChecks {
 		retentionCapCheckFailedTotal.WithLabelValues(c).Add(0)
 	}
+	for _, site := range treeRemovalSites {
+		treeRemovalCutsTotal.WithLabelValues(site).Add(0)
+		for _, outcome := range treeRemovalOutcomes {
+			treeRemovalsTotal.WithLabelValues(site, outcome).Add(0)
+		}
+	}
+	for _, outcome := range volumeDeleteOutcomes {
+		volumeDeleteOutcomesTotal.WithLabelValues(outcome).Add(0)
+	}
+	for _, phase := range volumeDeleteHoldPhases {
+		volumeDeleteHolds.WithLabelValues(phase).Set(0)
+	}
+	background.CleanupPanicsTotal.WithLabelValues(volumeDeleteHoldComponent).Add(0)
 	// Pre-init the two unlabeled partition counters to 0 so a stamp/eviction-rate
 	// query reads 0, not no-data, before the first event. Their increments are
 	// wired at the close path (stamped) and the L2 eviction pass (evicted) in the

@@ -262,6 +262,25 @@ type Backend struct {
 	// recompute-from-store + SetRetainedDisk so a stale snapshot can never
 	// clobber a fresher one (which would under-count → over-admit).
 	retentionAccountingMu sync.Mutex
+	// retentionStoreDiskMB is the store-derived part of the retained-disk
+	// projection (active + reaping) last pushed to the pool, and
+	// retentionStoreDiskKnown whether one was pushed yet. A held-deletion
+	// transition re-adds the fresh residual term to it without re-reading the
+	// store. Both are guarded by retentionAccountingMu.
+	retentionStoreDiskMB    int64
+	retentionStoreDiskKnown bool
+	// unsizedDeleteDiskHold is the pool's disk exclusion while a held volume
+	// deletion's footprint is unknown (ENG-1117); nil when none is. Guarded by
+	// retentionAccountingMu.
+	unsizedDeleteDiskHold *shared.DiskAccountingHold
+	// holdExecutor is the held-deletion executor's own rotation and owed
+	// close resumes (ENG-1117). Zero-value ready; it guards itself.
+	holdExecutor volumeDeleteHoldExecutorState
+	// closeTeardowns records the closes whose container teardown this process
+	// completed, the container evidence closeAwaitsHeldDeletes needs for a
+	// close without a projection (ENG-1117). Zero-value ready; it guards
+	// itself.
+	closeTeardowns closeTeardownFacts
 
 	// callbackStore persists pending callbacks in bbolt
 	callbackStore *shared.CallbackStore
@@ -2688,6 +2707,12 @@ func newBackend(
 
 // Start initializes the backend, recovers state, and starts background tasks.
 func (b *Backend) Start(ctx context.Context) error {
+	// Until the hold executor runs, a first-time volume deletion is handed to
+	// it without an attempt, so Start never waits on a tenant tree (ENG-1117).
+	// The deferral is Start's own: it ends when the executor starts below, or
+	// when Start returns before that.
+	deleteDeferral := b.backgroundMaintenance.deferVolumeDeletesUntilExecutorRuns(ctx)
+	defer deleteDeferral.End()
 	initialCtx, cancelInitial := b.recoveryDockerReadContext(ctx)
 	defer cancelInitial()
 	if err := b.VerifyStorageIdentity(initialCtx); err != nil {
@@ -2747,8 +2772,10 @@ func (b *Backend) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("recover interrupted managed-volume mutations: %w", err)
 	}
+	// Held volume deletions do not block Start: the hold executor finishes them
+	// after Start (ENG-1117). Every other interrupted mutation still does.
 	volumeProofCtx, cancelVolumeProof := context.WithTimeout(startupCtx, b.startupVolumeProofBudget())
-	interruptedErr := b.volumes.RequireNoInterruptedVolumeMutations(volumeProofCtx)
+	interruptedErr := b.volumes.RequireNoUnheldVolumeMutations(volumeProofCtx)
 	var volumeProofErr error
 	if interruptedErr == nil {
 		_, volumeProofErr = attestManagedVolumeInventory(volumeProofCtx, b.volumes)
@@ -2869,6 +2896,14 @@ func (b *Backend) Start(ctx context.Context) error {
 	b.callbackStore.StartMaintenance()
 	b.releaseStore.StartMaintenance()
 	b.startRetentionReaper()
+	// Start the hold executor, the only runner of held volume deletions; its
+	// first pass runs at once. Ending Start's deferral lets a first-time
+	// deletion run inline under its short budget again: until now every
+	// deletion was handed to the executor without an attempt, so Start never
+	// waited on a tenant tree (ENG-1117).
+	deleteDeferral.End()
+	b.sampleVolumeDeleteHoldMetrics()
+	b.wg.Go(b.volumeDeleteHoldLoop)
 
 	// Replay callbacks on the tracked lifecycle goroutine. A Fred outage can
 	// consume the full delivery retry budget, so replay must not delay backend

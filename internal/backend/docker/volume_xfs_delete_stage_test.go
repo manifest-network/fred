@@ -7,14 +7,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/fstree"
 )
 
 const xfsDeleteTestProjectID = uint32(4242)
@@ -116,10 +119,11 @@ esac`,
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 
-	blocks, inodes, err := mgr.waitForZeroProjectQuotaUsage(ctx, xfsDeleteTestProjectID)
+	usage, err := mgr.waitForZeroProjectQuotaUsage(ctx, xfsDeleteTestProjectID)
 	require.NoError(t, err)
-	assert.Zero(t, blocks)
-	assert.Zero(t, inodes)
+	assert.True(t, usage.complete)
+	assert.Zero(t, usage.blocks)
+	assert.Zero(t, usage.inodes)
 	commands, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	commandText := string(commands)
@@ -140,7 +144,7 @@ func TestReadProjectQuotaUsageAcceptsExactRowWithSuccessfulDiagnosticStderr(t *t
     ;;
 esac`, xfsProjectReportCmd("b", xfsDeleteTestProjectID), xfsDeleteTestProjectID))
 
-	used, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, "b")
+	used, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, xfsQuotaBlocks)
 	require.NoError(t, err)
 	assert.Zero(t, used)
 }
@@ -153,7 +157,7 @@ func TestReadProjectQuotaUsageRejectsDiagnosticWhenProjectRowIsAbsent(t *testing
     ;;
 esac`, xfsProjectReportCmd("b", xfsDeleteTestProjectID)))
 
-	_, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, "b")
+	_, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, xfsQuotaBlocks)
 	require.ErrorContains(t, err, "cannot prove")
 }
 
@@ -166,7 +170,7 @@ func TestReadProjectQuotaUsageReportsNonzeroExitStderrSeparately(t *testing.T) {
     ;;
 esac`, xfsProjectReportCmd("b", xfsDeleteTestProjectID)))
 
-	_, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, "b")
+	_, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, xfsQuotaBlocks)
 	require.ErrorContains(t, err, "stderr: quota device unavailable")
 }
 
@@ -384,14 +388,20 @@ func TestXFSDestroyMarkerFirstPartialDeleteRecoversAfterRestart(t *testing.T) {
 	injected := errors.New("injected recursive removal failure")
 	installXFSQuotaFixture(t, "")
 
-	err := mgr.destroyWith(t.Context(), stage.volumeID.value(), func(root *os.Root, name string) error {
-		if name == projectIDFile {
-			return root.RemoveAll(name)
+	err := mgr.destroyWith(t.Context(), stage.volumeID.value(), func(
+		ctx context.Context, volume condemnedXFSVolume, name fstree.Name,
+	) (fstree.RemoveReport, error) {
+		if name.String() == projectIDFile {
+			return removeCondemnedXFSEntry(ctx, volume, name)
 		}
-		return injected
+		return fstree.RemoveReport{}, injected
 	})
 	require.ErrorIs(t, err, injected)
-	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld, "a removal failure confined to the volume is held")
+	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending, "a held deletion must never latch")
+	hold := heldForTest(t, mgr, stage.volumeID.value())
+	assert.False(t, hold.phase == holdPhaseResidual)
+	assert.Equal(t, holdReasonRemovalFailed, hold.reason)
 	assert.FileExists(t, survivor)
 	assert.NoFileExists(t, filepath.Join(volumePath, projectIDFile),
 		"the fault must reproduce marker-first partial recursive deletion")
@@ -406,17 +416,24 @@ func TestXFSDestroyMarkerFirstPartialDeleteRecoversAfterRestart(t *testing.T) {
 	assert.Equal(t, stage.projID, restarted.volumeToID[stage.volumeID.value()])
 	_, recovered := restarted.recoveredDeleteStages[stage.volumeID.value()]
 	require.True(t, recovered)
+	recoveredHold := heldForTest(t, restarted, stage.volumeID.value())
+	assert.Equal(t, holdReasonRecovered, recoveredHold.reason, "startup registers every recovered stage as a hold")
 	_, err = attestManagedVolumeInventory(t.Context(), restarted)
-	require.NoError(t, err, "existing-identity construction must reach explicit startup recovery")
+	require.NoError(t, err, "existing-identity construction must reach startup")
 	require.ErrorContains(t, restarted.RequireNoInterruptedVolumeMutations(t.Context()), stage.value(),
 		"new/adopt/preflight must still reject cleanup-owned evidence")
+	require.NoError(t, restarted.RequireNoUnheldVolumeMutations(t.Context()),
+		"Start's gate accepts a held deletion")
 
 	logPath := installXFSQuotaFixture(t, "")
 	require.NoError(t, restarted.RecoverInterruptedVolumeMutations(t.Context()))
+	assert.DirExists(t, volumePath, "Start never removes tenant data itself")
+	require.NoError(t, restarted.RetryHeldVolumeDelete(t.Context(), stage.volumeID.value()))
 	assert.NoDirExists(t, volumePath)
 	assert.NoDirExists(t, stage.hostPath(dataPath))
 	assert.Empty(t, restarted.volumeToID)
 	assert.Empty(t, restarted.activeIDs)
+	assert.Empty(t, restarted.VolumeDeleteHolds().holds)
 	commands, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	assert.Contains(t, string(commands), "report -p -b -n -N")
@@ -435,9 +452,13 @@ esac`, xfsInodeGCTriggerCmd()))
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 
-	err := mgr.cleanupXFSDeleteStage(ctx, stage)
-	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	err := mgr.cleanupXFSDeleteStageWith(ctx, stage, removeCondemnedXFSEntry, removeFromXFSRoot, removeFromXFSRoot).result(finalPathNotObserved)
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
+	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending)
 	require.ErrorContains(t, err, fmt.Sprintf("before project %d usage proof", stage.projID))
+	hold := heldForTest(t, mgr, stage.volumeID.value())
+	assert.Equal(t, holdReasonUsageUnprovable, hold.reason)
+	assert.False(t, hold.phase == holdPhaseResidual, "an unread footprint keeps the hold in the removal phase")
 	assert.DirExists(t, stage.hostPath(dataPath),
 		"a failed inode-GC trigger must retain the typed cleanup tombstone")
 	assert.Equal(t, stage, mgr.durableDeleteStages[stage.volumeID.value()])
@@ -456,17 +477,23 @@ esac`, xfsInodeGCTriggerCmd()))
 
 func TestXFSDeleteUsageProofFailureRetainsTombstone(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		body string
-		want string
+		name        string
+		body        string
+		want        string
+		reason      volumeDeleteHoldReason
+		residual    bool
+		footprintMB int64
 	}{
 		{
+			// The block row's hard limit (20480 KiB) bounds what the leftover
+			// inodes can still charge, so the residual hold accounts 20 MiB.
 			name: "nonzero blocks",
 			body: fmt.Sprintf(`case "$*" in
-  *"report -p -b -n -N"*) printf '#%d 7 0 0 0\\n' ;;
+  *"report -p -b -n -N"*) printf '#%d 7 0 20480 0\\n' ;;
   *"report -p -i -n -N"*) printf '#%d 0 0 0 0\\n' ;;
 esac`, xfsDeleteTestProjectID, xfsDeleteTestProjectID),
-			want: "still uses 7 blocks and 0 inodes",
+			want: "still uses 7 blocks and 0 inodes", reason: holdReasonUsageNonzero,
+			residual: true, footprintMB: 20,
 		},
 		{
 			name: "open zero-length inode",
@@ -474,28 +501,29 @@ esac`, xfsDeleteTestProjectID, xfsDeleteTestProjectID),
   *"report -p -b -n -N"*) printf '#%d 0 0 0 0\\n' ;;
   *"report -p -i -n -N"*) printf '#%d 1 0 0 0\\n' ;;
 esac`, xfsDeleteTestProjectID, xfsDeleteTestProjectID),
-			want: "still uses 0 blocks and 1 inodes",
+			want: "still uses 0 blocks and 1 inodes", reason: holdReasonUsageNonzero,
+			residual: true, footprintMB: 0,
 		},
 		{
 			name: "malformed report",
 			body: fmt.Sprintf(`case "$*" in
   *"report -p -b -n -N"*) printf '#%d not-a-number 0 0 0\\n' ;;
 esac`, xfsDeleteTestProjectID),
-			want: "parse project 4242 used value",
+			want: "parse project 4242 used value", reason: holdReasonUsageUnprovable,
 		},
 		{
 			name: "named project despite numeric flag",
 			body: `case "$*" in
   *"report -p -b -n -N"*) printf 'tenant-project 0 0 0 0\n' ;;
 esac`,
-			want: "nonnumeric project ID",
+			want: "nonnumeric project ID", reason: holdReasonUsageUnprovable,
 		},
 		{
 			name: "report command fails",
 			body: `case "$*" in
   *"report -p -b -n -N"*) exit 23 ;;
 esac`,
-			want: "xfs_quota report -p -b -n -N",
+			want: "xfs_quota report -p -b -n -N", reason: holdReasonUsageUnprovable,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -507,9 +535,15 @@ esac`,
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
 
-			err := mgr.cleanupXFSDeleteStage(ctx, stage)
+			err := mgr.cleanupXFSDeleteStageWith(ctx, stage, removeCondemnedXFSEntry, removeFromXFSRoot, removeFromXFSRoot).result(finalPathNotObserved)
 			require.ErrorContains(t, err, tc.want)
-			require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+			require.ErrorIs(t, err, ErrVolumeDeleteHeld)
+			require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+			hold := heldForTest(t, mgr, stage.volumeID.value())
+			assert.Equal(t, tc.reason, hold.reason)
+			assert.Equal(t, tc.residual, hold.phase == holdPhaseResidual,
+				"only a parsed footprint may move the hold to the residual phase")
+			assert.Equal(t, tc.footprintMB, hold.footprintMB)
 			assert.DirExists(t, stage.hostPath(dataPath))
 			assert.Equal(t, stage.projID, mgr.volumeToID[stage.volumeID.value()])
 			assert.Equal(t, stage.volumeID.value(), mgr.activeIDs[stage.projID])
@@ -517,7 +551,12 @@ esac`,
 	}
 }
 
-func TestXFSDestroyAbsentMappedVolumePersistsAuthorityBeforeUsageProof(t *testing.T) {
+// Acceptance (ENG-1117): residual project usage is held per volume. Destroy
+// settles its caller once the final path is durably gone, while the stage, the
+// project ID and its limits stay with the hold; the name cannot be recreated
+// and the project ID is never handed out again; once usage reaches zero, one
+// retry clears the limits exactly once and releases the project ID.
+func TestXFSDestroyHoldsResidualProjectUsage(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
@@ -526,20 +565,69 @@ func TestXFSDestroyAbsentMappedVolumePersistsAuthorityBeforeUsageProof(t *testin
 	// authority, but the inner marker is necessarily gone with the directory.
 	mgr.activeIDs[stage.projID] = stage.volumeID.value()
 	mgr.volumeToID[stage.volumeID.value()] = stage.projID
-	installXFSQuotaFixture(t, fmt.Sprintf(`case "$*" in
-  *"report -p -b -n -N"*) printf '#%d 9 0 0 0\n' ;;
-  *"report -p -i -n -N"*) printf '#%d 1 0 0 0\n' ;;
-esac`, stage.projID, stage.projID))
+	usageGone := filepath.Join(t.TempDir(), "usage-gone")
+	t.Setenv("FRED_TEST_XFS_USAGE_GONE", usageGone)
+	logPath := installXFSQuotaFixture(t, fmt.Sprintf(`case "$*" in
+  *"report -p -b -n -N"*)
+    if [ -e "$FRED_TEST_XFS_USAGE_GONE" ]; then printf '#%d 0 0 20480 0\n'; else printf '#%d 9 0 20480 0\n'; fi ;;
+  *"report -p -i -n -N"*)
+    if [ -e "$FRED_TEST_XFS_USAGE_GONE" ]; then printf '#%d 0 0 0 0\n'; else printf '#%d 1 0 0 0\n'; fi ;;
+esac`, stage.projID, stage.projID, stage.projID, stage.projID))
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 
-	err := mgr.Destroy(ctx, stage.volumeID.value())
-	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
-	require.ErrorContains(t, err, "still uses 9 blocks and 1 inodes")
+	outcomes := func(outcome string) float64 {
+		return testutil.ToFloat64(volumeDeleteOutcomesTotal.WithLabelValues(outcome))
+	}
+	heldResidualBefore := outcomes(volumeDeleteOutcomeHeldResidual)
+	require.NoError(t, mgr.Destroy(ctx, stage.volumeID.value()),
+		"a residual hold settles its caller once the final path is durably gone")
+	assert.Equal(t, heldResidualBefore+1, outcomes(volumeDeleteOutcomeHeldResidual))
+	hold := heldForTest(t, mgr, stage.volumeID.value())
+	assert.True(t, hold.phase == holdPhaseResidual)
+	assert.Equal(t, holdReasonUsageNonzero, hold.reason)
+	assert.Equal(t, int64(20), hold.footprintMB, "the footprint is the project's block hard limit")
+	assert.Equal(t, int64(20), mgr.VolumeDeleteHolds().admissionAccount().residualMB)
 	assert.DirExists(t, stage.hostPath(dataPath),
 		"usage must be proven under durable typed authority even when the final name was already absent")
 	assert.Equal(t, stage.projID, mgr.volumeToID[stage.volumeID.value()])
 	assert.Equal(t, stage.volumeID.value(), mgr.activeIDs[stage.projID])
+	assert.NotContains(t, readQuotaLog(t, logPath), xfsLimitClearCmd(stage.projID),
+		"limits stay while the project still charges usage")
+
+	// A second Destroy answers from the hold: nil, after an Lstat.
+	require.NoError(t, mgr.Destroy(ctx, stage.volumeID.value()))
+
+	_, _, err := mgr.Create(t.Context(), stage.volumeID.value(), 20)
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld, "the held name cannot be recreated")
+	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending, "the refusal must never latch")
+	for i := range 4 {
+		other := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", i+1)
+		projID, _, reserveErr := mgr.reserveProjectID(other)
+		require.NoError(t, reserveErr)
+		assert.NotEqual(t, stage.projID, projID, "a held project ID is never handed out again")
+	}
+
+	require.NoError(t, os.WriteFile(usageGone, []byte("gone"), 0o600))
+	completedBefore := outcomes(volumeDeleteOutcomeCompleted)
+	require.NoError(t, mgr.RetryHeldVolumeDelete(t.Context(), stage.volumeID.value()))
+	assert.Equal(t, completedBefore+1, outcomes(volumeDeleteOutcomeCompleted))
+	assert.Equal(t, 1, strings.Count(readQuotaLog(t, logPath), xfsLimitClearCmd(stage.projID)),
+		"the limits are cleared exactly once")
+	assert.NoDirExists(t, stage.hostPath(dataPath))
+	assert.NotContains(t, mgr.volumeToID, stage.volumeID.value())
+	assert.NotContains(t, mgr.activeIDs, stage.projID)
+	assert.Empty(t, mgr.VolumeDeleteHolds().holds)
+}
+
+func readQuotaLog(t *testing.T, logPath string) string {
+	t.Helper()
+	commands, err := os.ReadFile(logPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return ""
+	}
+	require.NoError(t, err)
+	return string(commands)
 }
 
 func TestXFSDeleteCrashAfterQuotaClearBeforeTombstoneRemovalRecovers(t *testing.T) {
@@ -551,27 +639,30 @@ func TestXFSDeleteCrashAfterQuotaClearBeforeTombstoneRemovalRecovers(t *testing.
 	injected := errors.New("injected tombstone unlink failure after clear")
 
 	err := mgr.cleanupXFSDeleteStageWith(
-		t.Context(), stage, removeAllFromXFSRoot, removeFromXFSRoot,
+		t.Context(), stage, removeCondemnedXFSEntry, removeFromXFSRoot,
 		func(*os.Root, string) error { return injected },
-	)
+	).result(finalPathNotObserved)
 	require.ErrorIs(t, err, injected)
-	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld, "a stage that positively remains after its rmdir is held")
+	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	hold := heldForTest(t, mgr, stage.volumeID.value())
+	assert.Equal(t, holdReasonStageRemovalFailed, hold.reason)
+	assert.True(t, hold.phase == holdPhaseResidual)
 	assert.DirExists(t, stage.hostPath(dataPath), "post-clear failure must retain restart authority")
 	assert.Equal(t, stage.projID, mgr.volumeToID[stage.volumeID.value()])
-	beforeRestart, err := os.ReadFile(logPath)
-	require.NoError(t, err)
-	assert.Contains(t, string(beforeRestart), xfsLimitClearCmd(stage.projID),
+	assert.Contains(t, readQuotaLog(t, logPath), xfsLimitClearCmd(stage.projID),
 		"the injected failure must occur after dquot clear")
 
 	restarted := newXfsManagerForTest(dataPath)
 	require.NoError(t, restarted.loadProjectIDs())
-	require.NoError(t, restarted.RecoverInterruptedVolumeMutations(t.Context()),
+	require.NoError(t, restarted.RecoverInterruptedVolumeMutations(t.Context()))
+	sized := heldForTest(t, restarted, stage.volumeID.value())
+	assert.True(t, sized.phase == holdPhaseResidual, "Start sizes a recovered stage whose final path is gone")
+	require.NoError(t, restarted.RetryHeldVolumeDelete(t.Context(), stage.volumeID.value()),
 		"repeating the zero proof and dquot clear is idempotent")
 	assert.NoDirExists(t, stage.hostPath(dataPath))
 	assert.Empty(t, restarted.volumeToID)
-	afterRestart, err := os.ReadFile(logPath)
-	require.NoError(t, err)
-	assert.Equal(t, 2, strings.Count(string(afterRestart), xfsLimitClearCmd(stage.projID)))
+	assert.Equal(t, 2, strings.Count(readQuotaLog(t, logPath), xfsLimitClearCmd(stage.projID)))
 }
 
 func TestXFSRecoveredPreResetDeleteStageIsNormalizedBeforeCleanup(t *testing.T) {
@@ -579,7 +670,8 @@ func TestXFSRecoveredPreResetDeleteStageIsNormalizedBeforeCleanup(t *testing.T) 
 	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
 	// Models power loss after mkdir reached the journal but before the first
 	// project-0 reset/fsync. The startup scanner is read-only and mints only a
-	// cleanup capability; recovery must reapply normalization before progressing.
+	// cleanup capability; the retry must reapply normalization before it proves
+	// usage. Start's sizing only reads the project's report row.
 	require.NoError(t, os.Mkdir(stage.hostPath(dataPath), 0o700))
 	restarted := newXfsManagerForTest(dataPath)
 	require.NoError(t, restarted.loadProjectIDs())
@@ -592,15 +684,16 @@ func TestXFSRecoveredPreResetDeleteStageIsNormalizedBeforeCleanup(t *testing.T) 
 		},
 		set: func(*os.Root, uint32) error {
 			resets++
-			require.NoFileExists(t, logPath, "recovery must normalize before querying usage")
+			require.NotContains(t, readQuotaLog(t, logPath), xfsInodeGCTriggerCmd(),
+				"the retry must normalize before it starts the usage proof")
 			return nil
 		},
 	}
 
 	require.NoError(t, restarted.RecoverInterruptedVolumeMutations(t.Context()))
-	commands, err := os.ReadFile(logPath)
-	require.NoError(t, err)
-	logText := string(commands)
+	require.Zero(t, resets, "Start never cleans a delete stage")
+	require.NoError(t, restarted.RetryHeldVolumeDelete(t.Context(), stage.volumeID.value()))
+	logText := readQuotaLog(t, logPath)
 	require.Positive(t, resets)
 	assert.Contains(t, logText, "report -p -b -n -N")
 	assert.NotContains(t, logText, "project -s")
@@ -616,10 +709,14 @@ func TestXFSDeleteRecoveryHonorsEarlierParentDeadline(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
 
-	err := mgr.cleanupXFSDeleteStage(ctx, stage)
+	err := mgr.cleanupXFSDeleteStageWith(ctx, stage, removeCondemnedXFSEntry, removeFromXFSRoot, removeFromXFSRoot).result(finalPathNotObserved)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
-	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
-	assert.DirExists(t, stage.hostPath(dataPath), "expired startup budget must retain exact recovery evidence")
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
+	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	hold := heldForTest(t, mgr, stage.volumeID.value())
+	assert.Equal(t, holdReasonDeadline, hold.reason)
+	assert.False(t, time.Now().Before(hold.nextAttempt), "an interrupted attempt stays due")
+	assert.DirExists(t, stage.hostPath(dataPath), "an expired budget must retain exact recovery evidence")
 	_, statErr := os.Stat(logPath)
 	assert.ErrorIs(t, statErr, os.ErrNotExist, "an expired parent budget must not start a fresh quota subprocess")
 }
@@ -655,20 +752,71 @@ func TestXFSDeleteRecoveryDeadlineStopsBetweenEntriesBeforeQuotaClear(t *testing
 	err := mgr.cleanupXFSDeleteStageWith(
 		ctx,
 		stage,
-		func(*os.Root, string) error {
+		func(context.Context, condemnedXFSVolume, fstree.Name) (fstree.RemoveReport, error) {
 			removeCalls++
 			expire(context.DeadlineExceeded)
-			return nil
+			return fstree.RemoveReport{}, nil
 		},
 		removeFromXFSRoot,
 		removeFromXFSRoot,
-	)
+	).result(finalPathNotObserved)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
-	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
+	require.NotErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	hold := heldForTest(t, mgr, stage.volumeID.value())
+	assert.Equal(t, holdReasonDeadline, hold.reason)
+	assert.False(t, hold.phase == holdPhaseResidual)
 	assert.Equal(t, 1, removeCalls, "expired aggregate budget must stop before the next recursive entry syscall")
 	assert.DirExists(t, stage.hostPath(dataPath))
 	assert.DirExists(t, volumePath)
 	assert.NoFileExists(t, logPath, "deadline expiry must stop before quota proof or clear")
+}
+
+// expiresAfterChecks is a context whose Err reports DeadlineExceeded from its
+// n+1th call on, so a removal can be stopped in the middle of a walk.
+type expiresAfterChecks struct {
+	context.Context
+	left atomic.Int64
+}
+
+func (c *expiresAfterChecks) Err() error {
+	if c.left.Add(-1) < 0 {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// A slice that expires inside fstree's walk leaves a due hold with reason
+// deadline (not a refusal that backs off), and the next attempt finishes.
+func TestXFSDeleteSliceExpiringMidWalkLeavesADueDeadlineHold(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
+	prepareDeleteStageForTest(t, mgr, stage)
+	volumePath := stage.volumeID.hostPath(dataPath)
+	require.NoError(t, os.MkdirAll(filepath.Join(volumePath, writablePathSubdir, "a", "b", "c"), 0o700))
+	for i := range 64 {
+		require.NoError(t, os.WriteFile(filepath.Join(volumePath, writablePathSubdir, "a", fmt.Sprintf("f%d", i)),
+			[]byte("x"), 0o600))
+	}
+	installXFSQuotaFixture(t, "")
+	ctx := &expiresAfterChecks{Context: t.Context()}
+	// Enough checks to pass the attempt's own checkpoints and start the walk,
+	// too few to finish 64 files and three levels.
+	ctx.left.Store(12)
+
+	outcome := mgr.cleanupXFSDeleteStageWith(ctx, stage, removeCondemnedXFSEntry, removeFromXFSRoot, removeFromXFSRoot)
+	err := outcome.result(finalPathNotObserved)
+	require.ErrorIs(t, err, ErrVolumeDeleteHeld)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	hold := heldForTest(t, mgr, stage.volumeID.value())
+	assert.Equal(t, holdReasonDeadline, hold.reason)
+	assert.False(t, time.Now().Before(hold.nextAttempt), "a deadline hold stays due, without backoff")
+	assert.DirExists(t, filepath.Join(volumePath, writablePathSubdir), "the walk stopped part-way")
+
+	require.NoError(t, mgr.RetryHeldVolumeDelete(t.Context(), stage.volumeID.value()))
+	assert.NoDirExists(t, volumePath)
+	assert.NoDirExists(t, stage.hostPath(dataPath))
 }
 
 func TestXFSLoadProjectIDsRejectsNonemptyDeleteAuthorityAtomically(t *testing.T) {

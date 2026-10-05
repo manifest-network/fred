@@ -140,7 +140,7 @@ func TestZFSVolumeManagerRejectsInvalidNameAtEveryDatasetBoundary(t *testing.T) 
 
 	_, _, err := mgr.Create(context.Background(), invalid, 10)
 	require.ErrorContains(t, err, "storage path component")
-	require.ErrorContains(t, mgr.EnsureQuota(context.Background(), invalid, 10), "storage path component")
+	require.ErrorContains(t, ensureQuotaErr(mgr.EnsureQuota(context.Background(), invalid, 10)), "storage path component")
 	require.ErrorContains(t, mgr.Destroy(context.Background(), invalid), "storage path component")
 	_, err = mgr.Usage(context.Background(), invalid)
 	require.ErrorContains(t, err, "storage path component")

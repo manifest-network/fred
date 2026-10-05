@@ -18,12 +18,23 @@ import (
 
 const volumeCleanupTimeout = 10 * time.Second
 
-// ErrVolumeMutationRecoveryPending means a volume manager has already made an
-// irreversible mutation decision durable, but could not finish consuming its
-// typed recovery evidence. The mutation adapter fail-stops the live Backend on
-// this class so no later close, restore, or collector can infer completion from
-// a partially removed namespace. A fresh process must run startup recovery.
+// ErrVolumeMutationRecoveryPending means a volume manager met an authority
+// contradiction or an ambiguous outcome while consuming durable mutation
+// evidence: a project-ID, stage or marker authority that disagrees with the
+// manager's records, or a namespace change whose durability is unknown. Only
+// those classes carry it. The mutation adapter fail-stops the live Backend on
+// it, and a fresh process must run startup recovery. A failure confined to one
+// volume's deletion is ErrVolumeDeleteHeld instead and never stops the Backend.
 var ErrVolumeMutationRecoveryPending = errors.New("volume mutation recovery pending")
+
+// ErrVolumeDeleteHeld means a volume's deletion could not finish for a reason
+// confined to that one volume, and the manager holds it. The delete stage and
+// the volume's reserved project ID are kept, so are its quota limits unless the
+// deletion had already reached them, the name cannot be created again, and the
+// manager's hold executor retries the deletion in the background. It never
+// stops the Backend: a caller keeps its own durable authority, exactly as for
+// any failed destroy, and retries later. (ENG-1117)
+var ErrVolumeDeleteHeld = errors.New("volume delete held")
 
 // newDetachedBoundedContext lets compensation finish after request
 // cancellation, while still honoring an earlier aggregate phase deadline. A
@@ -64,9 +75,37 @@ type volumeReader interface {
 	// out of the proof boundary; the context bounds any filesystem CLI probe.
 	AttestManagedVolume(context.Context, managedVolumeName) error
 
-	// RequireNoInterruptedVolumeMutations is the read-only publication boundary
-	// for first-time storage-lineage initialization and post-recovery startup.
+	// RequireNoInterruptedVolumeMutations is the strict, read-only publication
+	// boundary of the exclusive one-shot commands: first-time storage-lineage
+	// initialization, adoption and preflight. It refuses every interrupted
+	// create or delete. Its only caller is acquireDockerStorageIdentityProof.
 	RequireNoInterruptedVolumeMutations(context.Context) error
+
+	// RequireNoUnheldVolumeMutations is Start's post-recovery gate. It refuses
+	// interrupted creates and any delete stage the manager does not hold, but
+	// accepts held deletes: the hold executor owns them, and one volume's
+	// deletion must never block Start. Its only caller is Backend.Start.
+	RequireNoUnheldVolumeMutations(context.Context) error
+
+	// VolumeDeleteHolds returns a point-in-time view of the manager's pending
+	// deletions: every name that has a delete stage, and the held ones with
+	// their phase. It reads only the manager's memory.
+	VolumeDeleteHolds() volumeDeleteHoldSnapshot
+
+	// PrecheckDestroy answers a destroy from the manager's own state without
+	// the caller's namespace lock: held (in the removal or unsized phase, or
+	// residual and not yet counted by an admission publication), gone (a
+	// counted residual hold, or a name with no stage and no project mapping,
+	// whose final path an identity-bound Lstat proved absent), or needs-lock
+	// for everything else.
+	PrecheckDestroy(managedVolumeName) (destroyPrecheckVerdict, error)
+
+	// AcknowledgeResidualAccounting records that an admission publication
+	// counted the residual held deletions the tokens name, so that their
+	// callers may settle, and returns the holds it acknowledged (ENG-1117). It
+	// changes only the manager's memory. Its only caller is the retained-disk
+	// publication, publishRetainedDiskLocked.
+	AcknowledgeResidualAccounting([]residualAccountingToken) []managedVolumeName
 
 	// Validate checks filesystem support and permissions, and rebuilds local
 	// manager indexes from on-disk volumes. Called at startup.
@@ -105,10 +144,13 @@ type volumeMutationSink interface {
 	// before the daemon could set quotas (ENG-454) gets its immutable effective
 	// cap (durable disk or pinned diskless scratch)
 	// enforced without a re-provision or data move. Unlike Create it NEVER
-	// creates: if the volume is absent it is a no-op (returns nil), so a
-	// concurrently-deprovisioning volume cannot be resurrected. Idempotent.
-	// Used by the startup backfill (reconcileVolumeQuotas).
-	EnsureQuota(ctx context.Context, id string, sizeMB int64) error
+	// creates: if the volume is absent it answers volumeQuotaAbsent, so a
+	// concurrently-deprovisioning volume cannot be resurrected, and a name
+	// whose deletion is pending answers volumeQuotaDeletePending without
+	// touching its limits. Only volumeQuotaApplied means limits were applied.
+	// Idempotent. Used by the startup backfill (reconcileVolumeQuotas) and by
+	// restore rollback.
+	EnsureQuota(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error)
 
 	// RecoverInterruptedVolumeMutations resolves manager-private mutation evidence
 	// after the identity-bound stores have been opened exclusively but before
@@ -117,6 +159,21 @@ type volumeMutationSink interface {
 	// cleanup. The storage mutation adapter surrounds this method with before/after
 	// lineage verification.
 	RecoverInterruptedVolumeMutations(context.Context) error
+
+	// RetryHeldVolumeDelete runs one cleanup attempt of the held deletion of
+	// id, if it is still held. It is the only way held deletion work runs: the
+	// hold executor calls it through the storage-mutation bracket, under the
+	// lease's namespace lock. A destructive sink, it is reachable only from the
+	// composition file (forbidigo).
+	RetryHeldVolumeDelete(ctx context.Context, id string) error
+
+	// DeferDeletesUntilExecutorRuns opens Backend.Start's deferral of
+	// first-time deletions (see volumeDeleteDeferral): until the returned
+	// deferral is ended, a first-time Destroy mints its delete stage and hands
+	// the deletion to the hold executor without attempting it. A manager is
+	// constructed with no deferral open and deletes inline under its short
+	// budget. Only the composition file reaches it (forbidigo).
+	DeferDeletesUntilExecutorRuns() volumeDeleteDeferral
 
 	// RenameVolume atomically renames a managed volume from oldName to
 	// newName, preserving data and per-volume metadata (xfs project ID,
@@ -131,6 +188,23 @@ type volumeMutationSink interface {
 	// data.
 	RenameVolume(ctx context.Context, oldName, newName string) error
 }
+
+// volumeQuotaOutcome is EnsureQuota's closed answer to a call that did not
+// fail. Its zero value is none of them, so an unset outcome never reads as
+// applied.
+type volumeQuotaOutcome uint8
+
+const (
+	// volumeQuotaApplied: the volume exists and its limits were applied.
+	volumeQuotaApplied volumeQuotaOutcome = iota + 1
+	// volumeQuotaAbsent: no volume at the name; nothing was enforced and
+	// nothing created.
+	volumeQuotaAbsent
+	// volumeQuotaDeletePending: the name's deletion is pending, and its delete
+	// authority owns its limits until the zero-usage proof clears them;
+	// nothing was touched (ENG-1117).
+	volumeQuotaDeletePending
+)
 
 // volumeManager is the concrete construction/test seam. Backend immediately
 // projects it into volumeReader plus its aggregate-only mutation sink.
@@ -160,10 +234,10 @@ func (n *noopVolumeManager) Destroy(_ context.Context, _ string) error {
 	return nil
 }
 
-// EnsureQuota on the noop manager is a no-op: it manages no quota-enforced
+// EnsureQuota on the noop manager finds nothing: it manages no quota-enforced
 // volumes, so there is nothing to re-apply.
-func (n *noopVolumeManager) EnsureQuota(_ context.Context, _ string, _ int64) error {
-	return nil
+func (n *noopVolumeManager) EnsureQuota(_ context.Context, _ string, _ int64) (volumeQuotaOutcome, error) {
+	return volumeQuotaAbsent, nil
 }
 
 func (n *noopVolumeManager) List() ([]string, error) {
@@ -183,7 +257,29 @@ func (n *noopVolumeManager) AttestManagedVolume(_ context.Context, name managedV
 
 func (n *noopVolumeManager) RequireNoInterruptedVolumeMutations(context.Context) error { return nil }
 
+func (n *noopVolumeManager) RequireNoUnheldVolumeMutations(context.Context) error { return nil }
+
 func (n *noopVolumeManager) RecoverInterruptedVolumeMutations(context.Context) error { return nil }
+
+// The noop manager never stages a deletion, so it never holds one.
+func (n *noopVolumeManager) VolumeDeleteHolds() volumeDeleteHoldSnapshot {
+	return volumeDeleteHoldSnapshot{}
+}
+
+func (n *noopVolumeManager) PrecheckDestroy(managedVolumeName) (destroyPrecheckVerdict, error) {
+	return destroyPrecheckNeedsLock, nil
+}
+
+func (n *noopVolumeManager) AcknowledgeResidualAccounting([]residualAccountingToken) []managedVolumeName {
+	return nil
+}
+
+func (n *noopVolumeManager) RetryHeldVolumeDelete(context.Context, string) error { return nil }
+
+// The noop manager never stages a deletion, so it has none to defer.
+func (n *noopVolumeManager) DeferDeletesUntilExecutorRuns() volumeDeleteDeferral {
+	return volumeDeleteDeferral{}
+}
 
 func (n *noopVolumeManager) Validate() error {
 	return nil
@@ -288,15 +384,7 @@ func newVolumeManager(dataPath, filesystem string, minAvgFileBytes int64, logger
 		if err != nil {
 			return nil, fmt.Errorf("resolve xfs mount point for volume_data_path %q: %w", dataPath, err)
 		}
-		return &xfsVolumeManager{
-			dataPath:          dataPath,
-			mountPoint:        mountPoint,
-			logger:            logger,
-			minAvgFileBytes:   minAvgFileBytes,
-			projectAttributes: linuxXFSProjectAttributes{},
-			activeIDs:         make(map[uint32]string),
-			volumeToID:        make(map[string]uint32),
-		}, nil
+		return newXFSVolumeManager(dataPath, mountPoint, minAvgFileBytes, logger), nil
 	case "zfs":
 		return &zfsVolumeManager{dataPath: dataPath, logger: logger}, nil
 	default:
@@ -394,6 +482,15 @@ func (w *volumeRootWatch) verify(dataPath string) error {
 			dataPath, identity.dev, identity.ino, w.dev, w.ino)
 	}
 	return nil
+}
+
+// pinnedTo reports whether the watch is pinned to exactly this directory.
+// A read outside the storage-mutation bracket uses it to bind an observation
+// to the pinned root without the bracket's identity checks.
+func (w *volumeRootWatch) pinnedTo(dev, ino uint64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pinned && w.seen && w.dev == dev && w.ino == ino
 }
 
 // list enumerates dataPath and refuses to report emptiness it cannot vouch for.

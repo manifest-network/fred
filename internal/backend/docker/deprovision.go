@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
@@ -264,6 +265,13 @@ func (b *Backend) doDeprovisionScoped(
 			if !pending.RetryableNow() {
 				return fmt.Errorf("recovered close remains ambiguous: %w", pending)
 			}
+			if b.closeAwaitsHeldDeletes(claim, b.volumes.VolumeDeleteHolds()) {
+				// Only held volume deletions remain, and the hold executor finishes
+				// them and resumes this close. Answer the observable pending (503
+				// lifecycle_pending) without advancing the durable generation or
+				// rewriting diagnostics (ENG-1117).
+				return pending
+			}
 			execution, retryErr := b.closeSettlement.RetryCloseExecution(pending)
 			if retryErr != nil {
 				return fmt.Errorf("start retryable close generation: %w", retryErr)
@@ -286,13 +294,13 @@ func (b *Backend) doDeprovisionScoped(
 		err = b.completeCloseOutcome(terminal)
 	case shared.CloseExecutionPending:
 		err = terminal
-		b.markClosePending(leaseUUID, err)
+		b.markClosePending(claim, err)
 		return err
 	default:
 		return fmt.Errorf("unknown close execution outcome %T", outcome)
 	}
 	if err != nil {
-		b.markClosePending(leaseUUID, err)
+		b.markClosePending(claim, err)
 		return err
 	}
 
@@ -320,6 +328,7 @@ func (b *Backend) completeCloseOutcome(
 		return fmt.Errorf("complete durable close: %w", err)
 	}
 	b.provisionStore.Delete(outcome.LeaseUUID())
+	b.closeTeardowns.forget(outcome.LeaseUUID())
 	b.releaseLeaseAllocations(outcome.LeaseUUID(), outcome.Items())
 	if b.callbackSender != nil {
 		b.callbackSender.NotifyPendingCallbacks()
@@ -327,14 +336,39 @@ func (b *Backend) completeCloseOutcome(
 	return nil
 }
 
-func (b *Backend) markClosePending(leaseUUID string, cause error) {
+// closeVolumeFailure is the tenant-facing reason, message and log level of a
+// close whose volume step left errors. Each element is one volume name's error
+// (destroyReport.failures) or one non-destroy failure, never a joined batch:
+// errors.Is over a batch is true when any one name was held. Only when every
+// element is a held volume deletion is it a deletion in progress (INFO);
+// anything else is a cleanup failure (WARN).
+func closeVolumeFailure(
+	volumeErrs []error,
+	logger *slog.Logger,
+) (backend.Reason, string, func(string, ...any)) {
+	for _, err := range volumeErrs {
+		if !errors.Is(err, ErrVolumeDeleteHeld) {
+			return backend.ReasonCleanupFailed, backend.MsgCleanupFailed, logger.Warn
+		}
+	}
+	return backend.ReasonVolumeDeletionInProgress, backend.MsgVolumeDeletionInProgress, logger.Info
+}
+
+// markClosePending records a close that remains pending. A close waiting only
+// on held volume deletions (the same predicate as the close-churn skip) is a
+// deletion in progress, not a failed cleanup.
+func (b *Backend) markClosePending(claim shared.CloseIntentClaim, cause error) {
+	reason, message := backend.ReasonCleanupFailed, backend.MsgCleanupFailed
+	if b.closeAwaitsHeldDeletes(claim, b.volumes.VolumeDeleteHolds()) {
+		reason, message = backend.ReasonVolumeDeletionInProgress, backend.MsgVolumeDeletionInProgress
+	}
 	var diagSnap shared.DiagnosticEntry
 	now := time.Now()
-	b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+	b.provisionStore.UpdateFn(claim.LeaseUUID(), func(p *leasesm.ProvisionState) {
 		p.SetStatus(backend.ProvisionStatusFailed, now)
 		p.LastError = fmt.Sprintf("close execution remains pending: %v", cause)
-		p.Reason = backend.ReasonCleanupFailed
-		p.Message = backend.MsgCleanupFailed
+		p.Reason = reason
+		p.Message = message
 		diagSnap = leasesm.DiagnosticSnapshot(p)
 	})
 	b.persistDiagnostics(diagSnap, nil)
@@ -382,6 +416,9 @@ func (b *Backend) doClosePhysical(
 	if teardownErr != nil {
 		errs = append(errs, teardownErr)
 	}
+	// The container evidence closeAwaitsHeldDeletes needs for a close with
+	// no projection (ENG-1117).
+	b.closeTeardowns.record(closeClaim, teardownErr == nil && len(failedIDs) == 0)
 
 	retaining := closeClaim.RetainOnClose() && b.retentionStore != nil
 	// A teardown that only partially succeeds keeps resources counted for the
@@ -443,6 +480,11 @@ func (b *Backend) doClosePhysical(
 	op := b.volumeOp(leaseUUID, logger)
 	switch {
 	case retaining:
+		// A name with a pending deletion is never retained: its delete stage owns
+		// it, and a retention record naming it would outlive the bytes it names
+		// (ENG-1117). Read the pending set once, BEFORE the listing, so every
+		// listed name whose deletion began earlier is routed to destroy below.
+		deleting := b.volumes.VolumeDeleteHolds()
 		// Enumerate the lease's ACTUAL managed volumes (ground truth — no SKU guess).
 		all, listErr := b.volumes.ListForProof(ctx)
 		if listErr != nil {
@@ -490,8 +532,39 @@ func (b *Backend) doClosePhysical(
 		// never destroyed) and retain the rest. Only the VOLUME NAMES are narrowed
 		// (retainCanonical → RetainedVolumeNames); the record's Items and
 		// StackManifest MUST stay the FULL set (see the record write below).
+		// redriveDeletion finishes a pending deletion instead of retaining the
+		// name. A held deletion answers at once and keeps the close pending.
+		redriveDeletion := func(c string) {
+			if rep := op.destroy(mutations, ctx, destroySiteDeprovisionDestroy, c); rep.leftOnDisk() {
+				if failures := rep.failures(); len(failures) > 0 {
+					for _, err := range failures {
+						volumeErrs = append(volumeErrs, fmt.Errorf("finish pending deletion of volume %s: %w", c, err))
+					}
+				} else {
+					claimedLeftBehind = true
+				}
+			}
+		}
 		retainCanonical := make([]string, 0, len(canonical))
 		for _, c := range canonical {
+			if deleting.deletePending(c) {
+				redriveDeletion(c)
+				continue
+			}
+			// A listed name can be gone by now (a deletion finished after the
+			// listing). Only a positive, identity-bound absence skips it, neither
+			// retained nor an error: an absent name must never reach
+			// retainCanonical through isWritablePathOnly's read-error default.
+			if name, parseErr := parseManagedVolumeName(c); parseErr == nil {
+				switch verdict, _ := b.volumes.PrecheckDestroy(name); verdict {
+				case destroyPrecheckGone:
+					continue
+				case destroyPrecheckHeld:
+					// Its deletion began after the pending set was read.
+					redriveDeletion(c)
+					continue
+				}
+			}
 			if b.isWritablePathOnly(c) {
 				// Routed through the choke point like every other destroy. `c` came from
 				// partition against the same cached table, so the re-check is free and
@@ -502,8 +575,10 @@ func (b *Backend) doClosePhysical(
 					// The volume is still canonical on disk. Record the error so the
 					// lease stays Failed and retries (re-detecting and re-destroying it);
 					// do NOT add it to retainCanonical — it must never be retained.
-					if err := rep.err(); err != nil {
-						volumeErrs = append(volumeErrs, fmt.Errorf("reclaim writable-path-only volume %s: %w", c, err))
+					if failures := rep.failures(); len(failures) > 0 {
+						for _, err := range failures {
+							volumeErrs = append(volumeErrs, fmt.Errorf("reclaim writable-path-only volume %s: %w", c, err))
+						}
 					} else {
 						claimedLeftBehind = true
 					}
@@ -631,9 +706,7 @@ func (b *Backend) doClosePhysical(
 				leaseUUID, tenant, partition, durableItems, resourceProfiles, budget,
 			); refuse {
 				rep := b.destroyOnRefuseToRetain(mutations, ctx, op, retainCanonical, leaseUUID, tenant, partition, scope, logger)
-				if err := rep.err(); err != nil {
-					volumeErrs = append(volumeErrs, err)
-				}
+				volumeErrs = append(volumeErrs, rep.failures()...)
 				claimedLeftBehind = claimedLeftBehind || len(rep.Claimed) > 0
 				break
 			}
@@ -696,30 +769,34 @@ func (b *Backend) doClosePhysical(
 		// One call, one ownership resolution. A refused name is another lease's data
 		// adopted under ours by an in-flight restore: reconcileRestoring re-quarantines
 		// it once its rollback can complete, so we leave it (ENG-647). An unprovable
-		// table surfaces through rep.err() and keeps the lease Failed for retry.
+		// table surfaces through rep.failures() and keeps the lease Failed for
+		// retry. Each name's error stays its own element, so closeVolumeFailure
+		// classifies the names one by one.
 		rep := op.destroy(mutations, ctx, destroySiteDeprovisionDestroy, names...)
-		if err := rep.err(); err != nil {
-			volumeErrs = append(volumeErrs, err)
-		}
+		volumeErrs = append(volumeErrs, rep.failures()...)
 		claimedLeftBehind = claimedLeftBehind || len(rep.Claimed) > 0
 	}
 
 	if len(volumeErrs) > 0 {
 		joinedVolumeErr := errors.Join(volumeErrs...)
+		// A held deletion is a deletion still in progress on the provider, not
+		// a failed cleanup: author that reason here, at its source, and log it
+		// at INFO. Any other volume error is a cleanup failure (ENG-1117).
+		reason, message, log := closeVolumeFailure(volumeErrs, logger)
 		var diagSnap shared.DiagnosticEntry
 		failedAt := time.Now()
 		b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 			p.ContainerIDs = nil // containers are gone
 			p.SetStatus(backend.ProvisionStatusFailed, failedAt)
 			p.LastError = fmt.Sprintf("volume cleanup failed: %s", errors.Join(volumeErrs...))
-			p.Reason = backend.ReasonCleanupFailed
-			p.Message = backend.MsgCleanupFailed
+			p.Reason = reason
+			p.Message = message
 			diagSnap = leasesm.DiagnosticSnapshot(p)
 		})
 		// Correlation log so operators can still find the verbose detail (redacted
 		// from the tenant-facing Message) by lease_uuid (ENG-508).
-		logger.Warn("provision failed (verbose detail retained operator-side)",
-			"lease_uuid", leaseUUID, "reason", backend.ReasonCleanupFailed, "detail", errors.Join(volumeErrs...))
+		log("provision failed (verbose detail retained operator-side)",
+			"lease_uuid", leaseUUID, "reason", reason, "detail", errors.Join(volumeErrs...))
 		// Persist diagnostics outside the lock so failure state survives
 		// a process restart (no containers remain to recover from).
 		b.persistDiagnostics(diagSnap, nil)

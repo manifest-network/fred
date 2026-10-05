@@ -69,7 +69,7 @@ image.
 
 | Requirement | Recommendation |
 |---|---|
-| OS | Linux. cgroup v2 strongly recommended — under cgroup v2, tmpfs memory is counted against the container's memory limit; under v1 it is not, which makes the per-container memory budget less precise |
+| OS | Linux **5.8+**: tenant directory cleanup needs the mount IDs `statx` reports, and refuses to touch a tree without them; with a volume data path configured, docker-backend refuses to start on an older kernel and says so. cgroup v2 strongly recommended — under cgroup v2, tmpfs memory is counted against the container's memory limit; under v1 it is not, which makes the per-container memory budget less precise |
 | Docker | Engine **28.1+ (API 1.49+)** is the image-admission compatibility floor for binding inspected metadata to a single immutable platform image. Production also requires a currently security-patched Engine (see below). iptables must be enabled (the default). `--iptables=false` disables cross-tenant network isolation; the docker-backend logs a daemon-warning at startup if it detects this |
 | CPU / RAM | Sized for the SKU pool you advertise; budget 10–20% overhead for the daemon |
 | Disk | Image cache + per-tenant volumes (see [Stateful workloads](#stateful-workloads-disk_mb--0-skus)) |
@@ -394,12 +394,15 @@ not resolve them.
 Consequently, a wedged Docker API fails startup or defers a best-effort phase
 instead of blocking process lifetime, while a large fleet cannot multiply a
 per-object daemon timeout without bound. These budgets are cooperative around
-local filesystem work: Go cannot forcibly interrupt one blocking kernel call,
-and a very large recursive top-level removal can cross its nominal deadline.
-Recovery checks cancellation between top-level entries and phases and makes no
-further mutations afterward. An overall recovery deadline is a typed startup
-failure: systemd may restart the backend, and the next launch resumes from the
-same operation, maintenance, and close intents and substrate evidence.
+local filesystem work: Go cannot forcibly interrupt one blocking kernel call.
+Tenant directory trees are removed with bounded descriptors, depth and work,
+and the remover checks cancellation between entries, so a large tree stops near
+its deadline and is resumed later. A volume deletion found or requested while
+`Start` runs is handed to the background hold executor instead. Recovery makes
+no further mutations after its deadline. An overall recovery deadline is a
+typed startup failure: systemd may restart the backend, and the next launch
+resumes from the same operation, maintenance, and close intents and substrate
+evidence.
 
 For Go embedders, `docker.New` installs the finite 30-second construction bound;
 `docker.NewWithContext` adds no fallback, so pass a finite caller deadline. It
@@ -1844,17 +1847,16 @@ before taking any manual action.
 
 An XFS delete authority instead names an already-admitted destructive
 operation. It is an empty, parent-synced sibling normalized to project ID zero.
-Startup re-normalizes and syncs it before resuming in-place removal of the exact
-final volume, then parent-syncs the final name's absence. It requires numeric
-XFS reports to prove both block and inode usage for the encoded project ID are
-zero before clearing all quota limits; an open-but-unlinked tenant file keeps
-usage nonzero and readiness stays closed until the handle is released and
-startup is retried. A failure discovered during `Start` refuses listener bind
-and exits status 1 immediately; a runtime failure closes the listener and drains
-before exiting 1. In either case the supervisor's fresh `Start` must complete
-recovery. The authority is removed
-and the parent synced only after the quota clear succeeds. Never edit or delete
-it manually to make readiness green, and never create its final name while it
+The exact final volume is removed in place and the final name's absence is
+parent-synced; numeric XFS reports must then prove both block and inode usage
+for the encoded project ID are zero before all quota limits are cleared. The
+authority is removed and the parent synced only after the quota clear succeeds.
+`Start` registers each authority it finds as a held deletion and serves; one
+background hold executor finishes it. A failure confined to that volume, such
+as an open-but-unlinked tenant file keeping usage nonzero, keeps the deletion
+held and retried while the backend serves; see
+[Held volume deletions](OPERATIONS.md#held-volume-deletions). Never edit or
+delete the authority manually, and never create its final name while it
 remains.
 
 After configuring every backend key, set the same `K_i` only on that backend's

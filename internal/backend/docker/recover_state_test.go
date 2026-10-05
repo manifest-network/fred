@@ -31,15 +31,25 @@ import (
 type mockVolumeManager struct {
 	CreateFn                              func(ctx context.Context, id string, sizeMB int64) (string, bool, error)
 	EnsureQuotaFn                         func(ctx context.Context, id string, sizeMB int64) error
+	EnsureQuotaOutcomeFn                  func(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error)
 	DestroyFn                             func(ctx context.Context, id string) error
 	ListFn                                func() ([]string, error)
 	ListForProofFn                        func(context.Context) ([]string, error)
 	AttestManagedVolumeFn                 func(context.Context, managedVolumeName) error
 	RequireNoInterruptedVolumeMutationsFn func(context.Context) error
+	RequireNoUnheldVolumeMutationsFn      func(context.Context) error
 	RecoverInterruptedVolumeMutationsFn   func(context.Context) error
+	VolumeDeleteHoldsFn                   func() volumeDeleteHoldSnapshot
+	PrecheckDestroyFn                     func(managedVolumeName) (destroyPrecheckVerdict, error)
+	AcknowledgeResidualAccountingFn       func([]residualAccountingToken) []managedVolumeName
+	RetryHeldVolumeDeleteFn               func(ctx context.Context, id string) error
 	ValidateFn                            func() error
 	RenameVolumeFn                        func(oldName, newName string) error
 	UsageFn                               func(ctx context.Context, id string) (int64, error)
+
+	// openDeleteDeferrals counts the open DeferDeletesUntilExecutorRuns
+	// deferrals, as the XFS manager does.
+	openDeleteDeferrals atomic.Int32
 
 	// defaultDir is returned by Create when CreateFn is nil.
 	// Set this to t.TempDir() in tests that need real paths.
@@ -53,12 +63,22 @@ func (m *mockVolumeManager) Create(ctx context.Context, id string, sizeMB int64)
 	return m.defaultDir, true, nil
 }
 
-func (m *mockVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
-	if m.EnsureQuotaFn != nil {
-		return m.EnsureQuotaFn(ctx, id, sizeMB)
+// EnsureQuota answers volumeQuotaApplied unless EnsureQuotaOutcomeFn chooses
+// the outcome, or EnsureQuotaFn fails the call.
+func (m *mockVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error) {
+	if m.EnsureQuotaOutcomeFn != nil {
+		return m.EnsureQuotaOutcomeFn(ctx, id, sizeMB)
 	}
-	return nil
+	if m.EnsureQuotaFn != nil {
+		if err := m.EnsureQuotaFn(ctx, id, sizeMB); err != nil {
+			return 0, err
+		}
+	}
+	return volumeQuotaApplied, nil
 }
+
+// ensureQuotaErr keeps only EnsureQuota's error, for tests that assert on it.
+func ensureQuotaErr(_ volumeQuotaOutcome, err error) error { return err }
 
 func (m *mockVolumeManager) Destroy(ctx context.Context, id string) error {
 	if m.DestroyFn != nil {
@@ -103,6 +123,49 @@ func (m *mockVolumeManager) RecoverInterruptedVolumeMutations(ctx context.Contex
 		return m.RecoverInterruptedVolumeMutationsFn(ctx)
 	}
 	return nil
+}
+
+func (m *mockVolumeManager) RequireNoUnheldVolumeMutations(ctx context.Context) error {
+	if m.RequireNoUnheldVolumeMutationsFn != nil {
+		return m.RequireNoUnheldVolumeMutationsFn(ctx)
+	}
+	return nil
+}
+
+func (m *mockVolumeManager) VolumeDeleteHolds() volumeDeleteHoldSnapshot {
+	if m.VolumeDeleteHoldsFn != nil {
+		return m.VolumeDeleteHoldsFn()
+	}
+	return volumeDeleteHoldSnapshot{}
+}
+
+func (m *mockVolumeManager) PrecheckDestroy(name managedVolumeName) (destroyPrecheckVerdict, error) {
+	if m.PrecheckDestroyFn != nil {
+		return m.PrecheckDestroyFn(name)
+	}
+	return destroyPrecheckNeedsLock, nil
+}
+
+func (m *mockVolumeManager) AcknowledgeResidualAccounting(tokens []residualAccountingToken) []managedVolumeName {
+	if m.AcknowledgeResidualAccountingFn != nil {
+		return m.AcknowledgeResidualAccountingFn(tokens)
+	}
+	return nil
+}
+
+func (m *mockVolumeManager) RetryHeldVolumeDelete(ctx context.Context, id string) error {
+	if m.RetryHeldVolumeDeleteFn != nil {
+		return m.RetryHeldVolumeDeleteFn(ctx, id)
+	}
+	return nil
+}
+
+func (m *mockVolumeManager) DeferDeletesUntilExecutorRuns() volumeDeleteDeferral {
+	m.openDeleteDeferrals.Add(1)
+	var once sync.Once
+	return volumeDeleteDeferral{release: func() {
+		once.Do(func() { m.openDeleteDeferrals.Add(-1) })
+	}}
 }
 
 func (m *mockVolumeManager) Validate() error {

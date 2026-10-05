@@ -489,15 +489,95 @@ func (b *Backend) refreshRetentionAccountingCheckedLocked() error {
 		retentionAccountingRefreshFailedTotal.Inc()
 		return fmt.Errorf("combine active and reaping retention accounting: %w", err)
 	}
+	if err := b.publishRetainedDiskLocked(totalMB); err != nil {
+		return err
+	}
+	updateRetentionMetrics(totalMB, activeCount, reapingMB, reapingCount, partitionCount)
+	return nil
+}
+
+// publishRetainedDiskLocked pushes the retained-disk projection to the pool:
+// the store-derived storeMB plus heldResidualMB, the footprint of every held
+// volume deletion in its residual phase. A residual hold settles its caller
+// (the close completes, the reaping record goes, the reservation is released)
+// while its project can still charge up to that footprint, so this term is
+// what keeps those bytes counted (ENG-1117). A residual hold settles its
+// caller only after a publication that counted it acknowledges it, here,
+// after the pool accepted the total: make before break.
+//
+// An unsized hold may also have settled its caller, but its footprint is not
+// known. It is never counted as zero: while any exists the pool withholds
+// disk admission, and only once every one is sized (and therefore in the term
+// just published) or gone is that exclusion released. The caller MUST hold
+// retentionAccountingMu.
+func (b *Backend) publishRetainedDiskLocked(storeMB int64) error {
+	account := b.volumes.VolumeDeleteHolds().admissionAccount()
+	totalMB, err := addLeaseDiskMB(storeMB, account.residualMB, 1)
+	if err != nil {
+		retentionAccountingRefreshFailedTotal.Inc()
+		// Never release the exclusion on a failed publication.
+		b.observeUnsizedHeldDeletesLocked(account.unsized, false)
+		return fmt.Errorf("combine retained and held-deletion accounting: %w", err)
+	}
 	if err := b.pool.SetRetainedDisk(totalMB); err != nil {
 		// totalMB was produced exclusively by checked non-negative additions, so
 		// this is a defensive boundary assertion. Preserve the previous projection
 		// and surface the same stale-accounting signal as every other refresh error.
 		retentionAccountingRefreshFailedTotal.Inc()
+		b.observeUnsizedHeldDeletesLocked(account.unsized, false)
 		return fmt.Errorf("publish retained disk accounting: %w", err)
 	}
-	updateRetentionMetrics(totalMB, activeCount, reapingMB, reapingCount, partitionCount)
+	b.retentionStoreDiskMB, b.retentionStoreDiskKnown = storeMB, true
+	volumeDeleteHeldResidualMB.Set(float64(account.residualMB))
+	b.observeUnsizedHeldDeletesLocked(account.unsized, true)
+	// Only now, with their footprints in the published total, may the
+	// residual holds this account counted settle their callers. A close that
+	// waited on one is owed a resume: no executor attempt may observe this
+	// release, since it can happen in any publication.
+	for _, released := range b.volumes.AcknowledgeResidualAccounting(account.unacknowledged) {
+		if leaseUUID, ok := heldDeletionLease(released); ok {
+			b.holdExecutor.oweResume(leaseUUID)
+		}
+	}
 	return nil
+}
+
+// observeUnsizedHeldDeletesLocked holds the pool's disk exclusion while any
+// held deletion is unsized. It releases the exclusion only when published is
+// true: the residual footprints were just published with the same snapshot,
+// so a hold that left the unsized phase by being sized is already counted.
+// The caller MUST hold retentionAccountingMu, which guards
+// unsizedDeleteDiskHold.
+func (b *Backend) observeUnsizedHeldDeletesLocked(unsized int, published bool) {
+	switch {
+	case unsized > 0 && b.unsizedDeleteDiskHold == nil:
+		hold := b.pool.HoldUnsizedDiskFootprint()
+		b.unsizedDeleteDiskHold = &hold
+		b.logger.Warn("disk admission withheld: a held volume deletion's footprint is not known yet",
+			"unsized_holds", unsized)
+	case unsized == 0 && published && b.unsizedDeleteDiskHold != nil:
+		b.unsizedDeleteDiskHold.Release()
+		b.unsizedDeleteDiskHold = nil
+		b.logger.Info("disk admission restored: every held volume deletion's footprint is counted")
+	}
+}
+
+// refreshHeldResidualAccounting re-publishes the retained-disk projection
+// with a fresh residual term, reusing the store-derived part of the last
+// refresh. Every destroy entry point calls it after the manager may have moved
+// a hold into or out of its residual phase, before the destroy's caller can
+// settle on the answer. It reads no store, so it fails only on the pool's
+// defensive bound. Before the first full refresh it publishes no term, which
+// that refresh includes itself, but it still withholds disk admission for an
+// unsized hold.
+func (b *Backend) refreshHeldResidualAccounting() error {
+	b.retentionAccountingMu.Lock()
+	defer b.retentionAccountingMu.Unlock()
+	if !b.retentionStoreDiskKnown {
+		b.observeUnsizedHeldDeletesLocked(b.volumes.VolumeDeleteHolds().admissionAccount().unsized, false)
+		return nil
+	}
+	return b.publishRetainedDiskLocked(b.retentionStoreDiskMB)
 }
 
 // logRetentionBudgetSanity reports, per configured budget, the tenant's current

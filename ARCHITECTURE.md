@@ -647,7 +647,7 @@ under the process shutdown budget before exiting 1.
 
 ### Router Design
 
-The backend router matches leases to backends by exact SKU UUID. When multiple backends share the same SKU list, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. A placement store (bbolt) records which backend serves each lease so that read operations always reach the correct machine.
+The backend router matches leases to backends by exact SKU UUID. When multiple backends share the same SKU list, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318), preferring backends that do not report `disk_withheld`. Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. A placement store (bbolt) records which backend serves each lease so that read operations always reach the correct machine.
 
 ```go
 type Router struct {
@@ -664,7 +664,7 @@ func (r *Router) RouteForProvision(ctx, sku, inFlight) Backend // least-loaded a
 
 **Routing strategies:**
 - `Route` — returns the first matching backend (used for deprovision fallback and read-path when no placement exists)
-- `RouteForProvision` — routes a new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats
+- `RouteForProvision` — routes a new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318), preferring backends that do not report `disk_withheld`. Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats
 - **Placement lookup** — stores a confirmed backend plus an optional unresolved attempt, or a durable quarantine containing every known conflicting owner. Only a confirmed backend pins mutating/provision routing. Read-only provision discovery safely queries every configured confirmed, attempted, or conflicting candidate before SKU fan-out; an unresolved all-miss returns 503 rather than a false 404. Attempts and conflicts gate destructive reconciliation and positively target deprovision.
 
 When a single backend matches a SKU, all strategies behave identically.
@@ -1537,17 +1537,49 @@ recovered stage evidence.
 XFS destruction uses a separate typed, parent-synced authority named
 `.fred-xfs-delete-<project-id>-<managed-volume>`. It is an empty sibling that is
 normalized to project ID zero and synced before the final volume is changed; the
-final name remains in place while its contents are removed. This lets a restart
-recognize the exact deletion even if the tenant volume's marker was already
-unlinked. Recovery re-normalizes and re-attests the authority before touching
-the final tree, requires the final name's absence to be parent-synced, and then
-proves both block and inode usage for the encoded project ID are zero. An
-open-but-unlinked file therefore keeps the operation pending. Only after that
-proof does recovery clear all block and inode limits, remove the delete
-authority, and sync the parent again. Any failure preserves the authority and
-rejects creation of the same final name. A runtime failure takes the graceful
-nonzero latch path; a failure found by `Start` exits 1 before binding a listener.
-The supervisor's fresh `Start` must resume the exact cleanup before readiness.
+final name remains in place while its contents are removed with
+`internal/fstree`, which bounds descriptors, depth and work however the tenant
+shaped the tree. This lets a restart recognize the exact deletion even if the
+tenant volume's marker was already unlinked. Cleanup re-normalizes and
+re-attests the authority before touching the final tree, requires the final
+name's absence to be parent-synced, and then proves both block and inode usage
+for the encoded project ID are zero. An open-but-unlinked file therefore keeps
+the operation pending. Only after that proof does cleanup clear all block and
+inode limits, remove the delete authority, and sync the parent again.
+
+A failure confined to that one volume holds the deletion instead of stopping
+the backend (ENG-1117). The hold reasons are a closed set, and only a cause
+built for one of them can become a hold; any other error, an authority
+contradiction, or an ambiguous outcome still takes the graceful nonzero latch
+path. A held deletion keeps its authority and project ID and rejects creation of
+the same final name. In the removal phase the final path's absence is not yet
+durable, so `Destroy` keeps answering `ErrVolumeDeleteHeld` and every caller
+keeps its own durable authority: the close stays pending, the reaping record
+stays, the operation intent stays, and proof listings keep the name. In the
+residual phase the final path is durably gone and admission counts the
+project's block hard limit (or its block usage, if larger) until the zero-usage
+proof, the clear and the stage removal finish. `Destroy` answers success after
+observing the final path's absence, and its caller settles only after the
+publication that follows every destroy has counted that footprint. Every reader
+that infers completion without a destroy of its own (proof listings, the
+lock-free precheck, the close-wait predicates) keeps treating the hold like the
+removal phase until a publication that counted it acknowledges it (make before
+break); a close that waited on it is then resumed. `Start` registers every
+authority it finds as a held deletion and serves. A recovered authority whose
+final path is already gone may have settled its caller in an earlier process;
+if `Start` cannot size it from its quota row, it is unsized: callers still see
+it held, and admission refuses every disk-bearing provision until a later
+read sizes it, so its footprint is never counted as zero. One background hold
+executor, the only runner of held work, retries due holds in bounded
+per-volume slices under each lease's namespace lock, up to two leases at once,
+and starts its next pass at once while holds make progress. A destroy answers
+a held or already-absent name before taking that lock, so a close or reaper
+never waits behind the executor. A close waits only on held deletions when
+each of its volume slots is held or done and no container of the lease remains:
+its projection records none, or, for a cleanup-only close, this process's own
+attempt of it completed the container teardown (so such a close runs once after
+every start). Such closes are skipped by periodic recovery, answered from
+memory by Deprovision, and left out of the close-age gauge that pages.
 
 ZFS instead retains an exact unmounted child and normal sealed startup remounts
 and re-attests it without destruction. Any ambiguous recovery preserves evidence
@@ -1935,8 +1967,15 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_image_tag_resolutions_total` | counter | `source` | Tag resolutions past their manifest HEAD, by where the manifest came from: `cache` (the announced digest was already verified, no manifest GET), `registry` (one GET of the uncached announced digest), `fallback_unsupported` (HEAD answered 405/501) or `fallback_incomplete` (a 2xx without a usable digest, type or length); both fallbacks GET the tag on every preparation. A sustained high `registry` or fallback share predicts metered pulls |
 | `fred_docker_backend_image_unpinned_generations` | gauge | `kind` | Active (including required compensation ancestry) versus retained generations with incomplete image pins at the latest successful inventory |
 | `fred_docker_backend_restore_demote_refused_total` | counter | `backend, reason` | Restores refused by the demote fit-gate (`checkDemoteFit`) because the retained data does not fit the requested smaller SKU tier. `reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`. Synchronous-prelude refusals — NOT counted by `restore_total` (worker-scoped); surfaced to the tenant as HTTP 422 — the `demote_exceeds_tier` string discriminator rides only the backend→fred hop (ENG-438) |
-| `fred_docker_backend_volume_quota_backfill_total` | counter | `outcome` | Startup quota reconciliation (XFS root-attribute verification/repair plus limits), `outcome` ∈ `applied`/`failed`; `applied` confirms root attributes and limits, not historical descendant tagging. Re-applies the immutable effective quota (`disk_mb` for stateful volumes or pinned scratch for a present diskless writable-path volume) without a re-provision or a recursive XFS tenant-tree walk. The complete inventory is attempted, then any failed application, inventory error, or durable-profile error fails startup/readiness before the normal metrics endpoint serves requests (ENG-454) |
-| `fred_docker_backend_volume_quota_clear_failed_total` | counter | — | Failed XFS quota-clear commands during interrupted-create compensation or typed deletion; preceding block/inode proof failures are not counted. Typed authority is retained and the current backend instance fail-stops for recovery by a fresh `Start`; only historical already-absent/no-authority leaks need classified one-time manual cleanup (ENG-459/ENG-632) |
+| `fred_docker_backend_volume_quota_backfill_total` | counter | `outcome` | Startup quota reconciliation (XFS root-attribute verification/repair plus limits), `outcome` ∈ `applied`/`failed`/`delete_pending`; `delete_pending` is a name whose deletion is pending, whose limits its delete authority keeps (ENG-1117); `applied` confirms root attributes and limits, not historical descendant tagging. Re-applies the immutable effective quota (`disk_mb` for stateful volumes or pinned scratch for a present diskless writable-path volume) without a re-provision or a recursive XFS tenant-tree walk. The complete inventory is attempted, then any failed application, inventory error, or durable-profile error fails startup/readiness before the normal metrics endpoint serves requests (ENG-454) |
+| `fred_docker_backend_volume_quota_clear_failed_total` | counter | — | Failed XFS quota-clear commands during interrupted-create compensation or typed deletion; preceding block/inode proof failures are not counted. Typed authority is retained either way: a deletion is held for that volume and retried by the hold executor, while a failed create compensation fail-stops the current backend instance for recovery by a fresh `Start`; only historical already-absent/no-authority leaks need classified one-time manual cleanup (ENG-459/ENG-632/ENG-1117) |
+| `fred_docker_backend_volume_delete_holds` | gauge | `phase` | XFS volume deletions held per volume and retried by the hold executor. `removal`: tenant bytes may remain and the caller stays pending; `unsized`: the volume is gone, a caller may have settled, and the footprint is not known yet, so disk admission is withheld; `residual`: the volume is durably gone and only its quota project remains (ENG-1117) |
+| `fred_docker_backend_volume_delete_outcomes_total` | counter | `outcome` | XFS volume deletion attempts, inline or by the hold executor: `completed`, `held_removal`, `held_unsized`, `held_residual`, `latched` (ENG-1117) |
+| `fred_docker_backend_volume_delete_held_residual_mb` | gauge | — | Disk (MiB) that admission counts for residual held deletions, each its project's block hard limit or block usage, whichever is larger; included in the retained-disk projection (ENG-1117) |
+| `fred_docker_backend_close_intents_delete_held` | gauge | — | Pending close intents waiting only on held volume deletions: every remaining volume slot held, the rest done (ENG-1117) |
+| `fred_docker_backend_oldest_unheld_close_intent_age_seconds` | gauge | — | Age of the oldest pending close that is not waiting only on held volume deletions; zero when there is none. Close-age paging uses it, so a held close neither pages nor hides another (ENG-1117) |
+| `fred_docker_backend_tree_removals_total` | counter | `site, outcome` | Removals of tenant directory trees. `site` ∈ `delete_stage`, `writable_path`; `outcome` ∈ `removed`, `canceled`, `cut_refused`, `tree_changed`, `cross_device`, `undeletable`, `error` (ENG-1117) |
+| `fred_docker_backend_tree_removal_cuts_total` | counter | `site` | Subtrees moved into the removal anchor because the tree was deeper than the remover's ancestry bound (ENG-1117) |
 
 **Retention:**
 

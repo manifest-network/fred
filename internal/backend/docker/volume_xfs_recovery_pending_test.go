@@ -14,10 +14,14 @@ import (
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
-// Once an XFS delete-stage survives a failed Destroy, the final managed name
-// may already be absent. The Backend-lifetime latch must prevent a subsequent
-// reaper inventory from reading that absence as completion and deleting the
-// record that still accounts for the pending project quota/open inode.
+// The recovery-pending class (an authority contradiction or an ambiguous
+// outcome) still latches the Backend for its lifetime: a subsequent reaper
+// inventory must not read the namespace that latched generation can no longer
+// vouch for as completion, nor delete the record that still accounts for it.
+// A held deletion does not latch; the manager keeps its name visible instead
+// (TestVolumeDeleteHeldKeepsReapingRecordWithoutLatch) or, once the name is
+// durably gone, counts its project in admission
+// (TestVolumeDeleteResidualSettlesReapingRecordAndCountsInAdmission).
 func TestVolumeRecoveryPendingPreventsHiddenDeleteStageReaperBypass(t *testing.T) {
 	t.Parallel()
 

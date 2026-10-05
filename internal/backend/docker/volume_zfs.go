@@ -159,30 +159,30 @@ func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 // EnsureQuota re-applies refquota (and clears any legacy quota=) to an existing
 // dataset. No-op if the dataset is absent (never creates). ZFS quota is inherent
 // to the dataset, so there is no separate "tag" step. See ENG-454.
-func (z *zfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
+func (z *zfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) (volumeQuotaOutcome, error) {
 	name, err := parseManagedVolumeName(id)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	dataset, err := z.volumeDataset(name)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	exists, err := z.datasetExists(ctx, name)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !exists {
-		return nil
+		return volumeQuotaAbsent, nil
 	}
 	if err := z.requireMountedManagedVolume(ctx, name); err != nil {
-		return fmt.Errorf("attest existing zfs volume %s before quota: %w", dataset, err)
+		return 0, fmt.Errorf("attest existing zfs volume %s before quota: %w", dataset, err)
 	}
 	quota := fmt.Sprintf("%dM", sizeMB)
 	if out, err := exec.CommandContext(ctx, "zfs", "set", "refquota="+quota, "quota=none", dataset).CombinedOutput(); err != nil {
-		return fmt.Errorf("zfs set refquota on %s: %w: %s", dataset, err, out)
+		return 0, fmt.Errorf("zfs set refquota on %s: %w: %s", dataset, err, out)
 	}
-	return nil
+	return volumeQuotaApplied, nil
 }
 
 func (z *zfsVolumeManager) Destroy(ctx context.Context, id string) error {
@@ -462,6 +462,33 @@ func (z *zfsVolumeManager) RequireNoInterruptedVolumeMutations(ctx context.Conte
 	return nil
 }
 
+// RequireNoUnheldVolumeMutations gives Start the same answer as the strict
+// gate: ZFS destroys a dataset in the kernel with no delete stage, so nothing is
+// ever held, and an unmounted child is an interrupted create.
+func (z *zfsVolumeManager) RequireNoUnheldVolumeMutations(ctx context.Context) error {
+	return z.RequireNoInterruptedVolumeMutations(ctx)
+}
+
+// ZFS never holds a deletion; see RequireNoUnheldVolumeMutations.
+func (z *zfsVolumeManager) VolumeDeleteHolds() volumeDeleteHoldSnapshot {
+	return volumeDeleteHoldSnapshot{}
+}
+
+func (z *zfsVolumeManager) PrecheckDestroy(managedVolumeName) (destroyPrecheckVerdict, error) {
+	return destroyPrecheckNeedsLock, nil
+}
+
+func (*zfsVolumeManager) AcknowledgeResidualAccounting([]residualAccountingToken) []managedVolumeName {
+	return nil
+}
+
+func (z *zfsVolumeManager) RetryHeldVolumeDelete(context.Context, string) error { return nil }
+
+// ZFS never stages a deletion, so it has none to defer.
+func (z *zfsVolumeManager) DeferDeletesUntilExecutorRuns() volumeDeleteDeferral {
+	return volumeDeleteDeferral{}
+}
+
 // RecoverInterruptedVolumeMutations mounts exact unmounted managed children before
 // ordinary operation-intent recovery. The dataset already carries both its
 // typed final identity and exact mountpoint property, so mounting publishes no
@@ -682,5 +709,5 @@ func (z *zfsVolumeManager) Validate() error {
 	// `zfs allow`, so the daemon may legitimately set quotas without the
 	// capability. A cap check would false-positive on a properly-delegated host.
 	// zfs privilege failures surface as a create/set error at provision time.
-	return nil
+	return requireTreeRemovalSupport(z.dataPath)
 }

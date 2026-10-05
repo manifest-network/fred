@@ -1055,11 +1055,15 @@ func (b *Backend) destroyReapingVolumesUsing(
 	orig := reapingProof.Entry().OriginalLeaseUUID
 	logger := b.logger.With("lease_uuid", orig)
 	if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
-		// A prior raw mutation retained typed recovery evidence and withdrew this
-		// Backend instance. In particular, do not let a fresh inventory hide an
-		// XFS delete-stage and turn "final name absent" into permission to delete
-		// the reaping record. Startup recovery in a fresh process owns the next
-		// classification.
+		// A prior raw mutation met an authority contradiction or an ambiguous
+		// outcome and withdrew this Backend instance; a fresh process owns the
+		// next classification. A held XFS deletion never gets here (ENG-1117):
+		// while it holds its caller (the removal and unsized phases, and a
+		// residual one no publication has counted yet) ListForProof keeps listing
+		// the name, so the footprint below is never empty while bytes may remain
+		// and the record stays; once residual and counted, the name is durably
+		// gone, the record may go, and the project's remaining footprint is
+		// counted in admission as heldResidualMB.
 		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
 		logger.Error("reaping: backend storage recovery is pending; keeping the record", "error", authorityErr)
 		return false
@@ -1140,7 +1144,7 @@ func (b *Backend) destroyReapingVolumesUsing(
 		return false
 	}
 	// CONFIRM BEFORE DROPPING THE RECORD. Every destroy above reported success, but a
-	// destroy is an os.RemoveAll that deliberately treats an already-absent path as done —
+	// destroy deliberately treats an already-absent path as done —
 	// so "all succeeded" is also what a vanished mount looks like. If the root went away
 	// after the enumeration, each name was removed from a filesystem that is no longer
 	// there, and deleting the record here would drop the only accounting for volumes that
@@ -2449,7 +2453,14 @@ func (b *Backend) restoreRetainedVolumeQuotasUsing(
 	}
 
 	for _, target := range targets {
-		if err := ensureQuota(ctx, target.name, target.diskMB); err != nil {
+		// Only an applied limit restores the source quota: a volume that is
+		// absent, or whose deletion is pending, carries no cap this rollback
+		// applied (ENG-1117), so the record stays Restoring and live-counted.
+		outcome, err := ensureQuota(ctx, target.name, target.diskMB)
+		if err == nil && outcome != volumeQuotaApplied {
+			err = fmt.Errorf("quota outcome %d is not an applied limit", outcome)
+		}
+		if err != nil {
 			b.logger.Error("restore rollback cannot apply immutable source quota",
 				"lease_uuid", rec.OriginalLeaseUUID,
 				"volume", target.name,
@@ -2496,9 +2507,17 @@ func (b *Backend) revertRestoreSourceWithAccounting(
 	if err != nil {
 		return false, fmt.Errorf("reserve restore rollback retained accounting: %w", err)
 	}
+	// The store-derived part of the projection grows by the same handoff, so a
+	// later held-deletion refresh that reuses it keeps the conservative add.
+	previousStoreMB, previousStoreKnown := b.retentionStoreDiskMB, b.retentionStoreDiskKnown
+	conservativeStoreMB, err := addLeaseDiskMB(previousStoreMB, handoffMB, 1)
+	if err != nil {
+		return false, fmt.Errorf("reserve restore rollback retained accounting: %w", err)
+	}
 	if err := b.pool.SetRetainedDisk(conservativeRetainedMB); err != nil {
 		return false, fmt.Errorf("reserve restore rollback retained accounting: %w", err)
 	}
+	b.retentionStoreDiskMB = conservativeStoreMB
 
 	if rec.NewLeaseUUID != newLeaseUUID {
 		return false, fmt.Errorf("restore finalizer belongs to destination %q", rec.NewLeaseUUID)
@@ -2517,6 +2536,8 @@ func (b *Backend) revertRestoreSourceWithAccounting(
 			commitErr = errors.Join(commitErr, fmt.Errorf(
 				"restore prior retained accounting after failed ownership CAS: %w", rollbackErr,
 			))
+		} else {
+			b.retentionStoreDiskMB, b.retentionStoreDiskKnown = previousStoreMB, previousStoreKnown
 		}
 		return false, commitErr
 	}

@@ -852,6 +852,9 @@ func TestCloseIntentsNeverExpireAndReadOnlyInspectionCountsThem(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, inspection.UpgradedSchema)
 	assert.Equal(t, 1, inspection.Pending)
+	assert.Equal(t, []PendingLeaseMutationHead{{
+		Kind: PendingCloseHead, LeaseUUID: spec.LeaseUUID, Items: spec.Items,
+	}}, inspection.PendingHeads, "the close head is described with its own volume topology")
 }
 
 func TestCloseIntentNestedBucketCorruptionFailsHealth(t *testing.T) {
