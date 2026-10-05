@@ -2115,9 +2115,14 @@ Race-detector runs and integration tests catch most concurrency bugs. The patter
    - Public key derives to tenant address
    - Timestamp not expired (max 30 seconds old)
    - Timestamp not too far in future (max 10 seconds clock skew)
-   - Token not previously used (replay protection)
-   - Lease belongs to tenant and this provider
+   - Token not previously used, for endpoints with replay protection
+   - Lease belongs to tenant and this provider (retained-read exception below)
 ```
+
+See [SECURITY.md's replay table](SECURITY.md#token-replay-tenant-api) for the
+endpoint-specific replay rules and
+[token scope](SECURITY.md#token-scope-and-deployment-boundaries) for the
+retained-read authorization exception and unsigned operation/body limitations.
 
 ### Callback Authentication
 
