@@ -85,6 +85,9 @@ continue applying subsequent security updates. As of 2026-09-16, the committed
 [manifest-deploy package policy](https://github.com/manifest-network/manifest-deploy/blob/eaedbf62d9e139e4d849043c34b4948c7c6f3d63/inventory/base/group_vars/all/main.yml#L240)
 pins Engine **29.7.2**. Verify the running daemon's version during deployment;
 Fred's dependency vulnerability scan does not check the host installation.
+The tenant seccomp profile is derived from this Engine's default profile
+(`github.com/moby/profiles/seccomp` v0.2.3); see OPERATIONS.md, "Docker Engine
+upgrades and the profile", before changing the Engine version.
 
 ---
 

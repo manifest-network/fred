@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared/completion"
 )
 
@@ -111,12 +112,21 @@ func (scope *daemonLaunchScope) finish(err error) daemonLaunchOutcome {
 	}
 }
 
-func daemonContainerLaunchRequest(req *http.Request) bool {
+// daemonContainerLaunchEndpoint returns "create" or "<id>/start" for a
+// container launch request, and "" for every other request.
+func daemonContainerLaunchEndpoint(req *http.Request) string {
 	if req.Method != http.MethodPost {
-		return false
+		return ""
 	}
 	_, endpoint, found := strings.Cut(req.URL.Path, "/containers/")
-	return found && (endpoint == "create" || strings.HasSuffix(endpoint, "/start"))
+	if !found || (endpoint != "create" && !strings.HasSuffix(endpoint, "/start")) {
+		return ""
+	}
+	return endpoint
+}
+
+func daemonContainerLaunchRequest(req *http.Request) bool {
+	return daemonContainerLaunchEndpoint(req) != ""
 }
 
 func (scope *daemonLaunchScope) roundTrip(next http.RoundTripper, req *http.Request) (*http.Response, error) {
@@ -262,12 +272,19 @@ func daemonCompletedLaunchResponse(req *http.Request, response *http.Response) b
 	}
 }
 
+// daemonLaunchTransport binds one Compose invocation to its launch scope. It
+// checks every container create against the tenant profile before the scope
+// admits it.
 type daemonLaunchTransport struct {
-	next  http.RoundTripper
-	scope *daemonLaunchScope
+	next     http.RoundTripper
+	scope    *daemonLaunchScope
+	profiles imageexec.TenantSeccompSource
 }
 
 func (t daemonLaunchTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := refuseUnconfinedCreate(t.profiles, req); err != nil {
+		return refuseCreate(req, err)
+	}
 	return t.scope.roundTrip(t.next, req)
 }
 
@@ -276,15 +293,22 @@ type daemonLaunchContextKey struct{}
 // The direct SDK adapter installs this once before image admission/creation is
 // bound to the client. Its synchronous Create/Start implementations preserve the
 // supplied context; Compose instead uses the instance-bound transport above.
+//
+// Every container create crosses its wire check first, before the launch-scope
+// branch, so a create made outside any scope is checked as well.
 type daemonContextTransport struct {
 	next     http.RoundTripper
 	observer *daemonLaunchObserver
+	profiles imageexec.TenantSeccompSource
 }
 
 func (t daemonContextTransport) RoundTrip(req *http.Request) (response *http.Response, err error) {
 	defer func() { response, err = boundImageInspectResponse(req, response, err) }()
 	if scope, ok := req.Context().Value(instanceInspectionContextKey{}).(*instanceInspectionScope); ok {
 		defer func() { scope.observe(t.observer, req, response, err) }()
+	}
+	if err := refuseUnconfinedCreate(t.profiles, req); err != nil {
+		return refuseCreate(req, err)
 	}
 	if scope, ok := req.Context().Value(daemonLaunchContextKey{}).(*daemonLaunchScope); ok {
 		if t.observer == nil || scope.state == nil || scope.state.observer != t.observer {

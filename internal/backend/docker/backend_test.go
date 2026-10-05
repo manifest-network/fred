@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -939,7 +940,7 @@ func TestTenantNetworkName(t *testing.T) {
 }
 
 func TestCheckDaemonCapabilities(t *testing.T) {
-	t.Run("seccomp warning when missing", func(t *testing.T) {
+	t.Run("seccomp error when missing", func(t *testing.T) {
 		mock := &mockDockerClient{
 			DaemonInfoFn: func(ctx context.Context) (DaemonSecurityInfo, error) {
 				return DaemonSecurityInfo{
@@ -951,7 +952,13 @@ func TestCheckDaemonCapabilities(t *testing.T) {
 			},
 		}
 		b := newBackendForTest(mock, nil)
+		var logs bytes.Buffer
+		b.logger = slog.New(slog.NewTextHandler(&logs, nil))
 		b.checkDaemonCapabilities(context.Background())
+		// Tenant containers all run under fred's profile, which such a daemon
+		// refuses: that is an error, not a hardening warning.
+		assert.Contains(t, logs.String(), "level=ERROR")
+		assert.Contains(t, logs.String(), "refuse to run tenant containers")
 	})
 
 	t.Run("no warnings when everything is correct", func(t *testing.T) {

@@ -1286,6 +1286,40 @@ below.
 
 ---
 
+## Tenant seccomp profile
+
+docker-backend creates every tenant container under fred's own seccomp
+profile, derived from Docker's default profile. Provision, restore, restart,
+update, the redeploy that applies a custom domain, and the compensation that
+rolls back a failed restart or update all use it. A container keeps the
+profile it was created with, so containers created before an upgrade keep the
+earlier one until they are recreated.
+
+| Metric | Meaning | Action |
+|---|---|---|
+| `fred_docker_backend_tenant_containers_without_current_seccomp` | Running, restarting or paused tenant containers whose effective profile is not the current one, from the last completed census. The census runs after startup recovery and then every 10 minutes; it only reads. It logs a warning when the count changes and an info line while a nonzero count holds. | Restarting or updating a lease recreates its containers with the current profile. Expect a nonzero value after an upgrade until every lease has been recreated. |
+| `fred_docker_backend_seccomp_census_total{outcome}` | Census passes. `error` leaves the gauge at its last completed value. | Investigate sustained errors; they usually mean the Docker API is unreachable or slow. |
+| `fred_docker_backend_tenant_seccomp_profile_ready` | 1 when the profile was usable at its last request and the Docker daemon last reported seccomp support, 0 otherwise. | 0 means tenant launches fail: fred refuses them when it cannot build the profile, and a daemon without seccomp support refuses the profile (the backend then logs an error at startup). Startup and serving continue. Page. |
+| `fred_docker_backend_seccomp_profile_refusals_total{sink}` | Launches refused because the profile could not be applied, by `provision`, `restore`, `restart`, `update`, `custom_domain`, `compensation` or `inspection`. A provision, restore, restart, update or custom-domain redeploy refused before it starts reports reason `Internal` to the tenant. | Any increase is a provider fault. Check the backend log; the profile is retried on every launch. |
+
+Suggested alerts:
+
+- `fred_docker_backend_tenant_seccomp_profile_ready == 0` for 5m: page.
+- `increase(fred_docker_backend_seccomp_profile_refusals_total[15m]) > 0`: page.
+- `fred_docker_backend_tenant_containers_without_current_seccomp > 0` for
+  longer than the planned restart window after an upgrade: ticket.
+- `increase(fred_docker_backend_seccomp_census_total{outcome="error"}[1h]) > 3`: ticket.
+
+### Docker Engine upgrades and the profile
+
+The profile is built from `github.com/moby/profiles/seccomp` v0.2.3, the
+default profile of the supported Docker Engine, 29.7.2 (see DEPLOYMENT.md).
+An Engine upgrade whose default profile differs needs a fred release that
+regenerates the tenant profile from the matching version; until then tenant
+containers keep the v0.2.3-derived profile.
+
+---
+
 ## Tenant hits its inode quota (`EDQUOT`)
 
 XFS project quotas enforce block (`bhard`) and inode (`ihard`) limits
@@ -1306,6 +1340,26 @@ inode usage.
 **Remediation:** there is no fred-side alert or auto-remediation for a single tenant's inode ceiling. Two levers:
 1. Raise the SKU's `disk_mb` — `ihard` scales with it (`disk_mb × 1 MiB / min_avg_file_bytes`), so a bigger disk budget raises the inode ceiling too.
 2. Lower `min_avg_file_bytes` provider-wide (denser ratio, more inodes per MB) — restart required; values below 512 are rejected at config validation.
+
+---
+
+## XFS project-ID audit
+
+docker-backend audits managed XFS volumes once a day and reports inodes whose
+project attributes differ from their volume's. The audit only reads: it never
+changes a volume, and fred does not repair what it reports. It skips volumes
+being deleted. It opens tenant directories and regular files read-only, at
+most 10,000 per second; tenants can observe those opens.
+
+| Metric | Meaning | Action |
+|---|---|---|
+| `fred_docker_backend_volume_projid_audit_total{outcome}` | Volumes audited, by `clean`, `drift`, `too_deep`, `incomplete`, `changed`, `error` or `skipped` (a volume being deleted). The first pass runs 10 minutes after startup, then daily, one volume at a time; a pass stops after 30 minutes and the next resumes after the last volume audited. Each volume gets 2 minutes. | `drift`: investigate the volume named in the warning log, which carries its project ID and the drifted directory and file counts. `too_deep`: part of the volume lies deeper than the audit walks and was not audited; investigate. `incomplete` (out of time, or a file another holder kept from opening) and `changed` (the tree changed during the walk) are audited again on later passes; a volume that is `incomplete` on every pass is never fully audited, so investigate it too. |
+| `fred_docker_backend_volumes_with_projid_drift` | Volumes with recorded drift. A recorded drift stays until a later audit of the volume finishes undisturbed and finds it clean, or the volume is deleted; an audit that does not finish, or a skip, keeps it. The record is in memory, so after a restart the gauge counts again as the audit revisits each volume. | Investigate each volume. |
+
+Suggested alerts:
+
+- `fred_docker_backend_volumes_with_projid_drift > 0`: ticket.
+- `increase(fred_docker_backend_volume_projid_audit_total{outcome="too_deep"}[1d]) > 0`: ticket.
 
 ---
 

@@ -357,6 +357,68 @@ var (
 		Help:      "1 while a verify-only next request key is configured, 0 otherwise",
 	})
 
+	// tenantSeccompProfileRefusalsTotal counts launches refused because the
+	// tenant seccomp profile could not be applied, by the creation sink that
+	// refused. Any increase is a provider fault: no tenant container starts
+	// without the profile.
+	tenantSeccompProfileRefusalsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "seccomp_profile_refusals_total",
+		Help:      "Container launches refused because the tenant seccomp profile could not be applied, by sink",
+	}, []string{"sink"})
+
+	// tenantContainersWithoutCurrentSeccomp is the number of live tenant
+	// containers, from the last completed census, whose effective seccomp
+	// profile is not the current tenant profile. Restarting or updating a
+	// lease recreates its containers with the current profile.
+	tenantContainersWithoutCurrentSeccomp = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "tenant_containers_without_current_seccomp",
+		Help:      "Live tenant containers whose effective seccomp profile is not the current one, from the last completed census",
+	})
+
+	// tenantSeccompCensusTotal counts census passes by outcome: ok publishes
+	// a count, error keeps the previous one.
+	tenantSeccompCensusTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "seccomp_census_total",
+		Help:      "Tenant seccomp census passes by outcome (ok or error)",
+	}, []string{"outcome"})
+
+	// volumeProjidAuditTotal counts audited volumes by outcome: clean, drift,
+	// too_deep, incomplete, changed, error, or skipped for a volume being
+	// deleted. The audit only reads; drift means investigate.
+	volumeProjidAuditTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_projid_audit_total",
+		Help:      "Managed XFS volumes audited for project-ID drift, by outcome",
+	}, []string{"outcome"})
+
+	// volumesWithProjidDrift is the number of managed volumes with recorded
+	// drift, recomputed after every audit pass. A recorded drift stays until a
+	// later audit of the volume finishes undisturbed and clean, or the volume
+	// leaves the inventory.
+	volumesWithProjidDrift = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volumes_with_projid_drift",
+		Help:      "Managed XFS volumes with project-ID drift recorded by the audit and not since found clean",
+	})
+
+	// tenantSeccompProfileReady is 1 when the last request for the tenant
+	// seccomp profile, by any sink, found it and its sealed file usable, and
+	// the Docker daemon did not last report itself without seccomp support.
+	tenantSeccompProfileReady = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "tenant_seccomp_profile_ready",
+		Help:      "1 when the tenant seccomp profile was usable at its last request and the Docker daemon last reported seccomp support, 0 otherwise",
+	})
+
 	// imageHelpersUnsettled counts the image-inspection helper receipts that
 	// survived the latest recovery pass and no live inspection owns, by reason.
 	// "unknown_create" means the helper's Create response was never durably
@@ -1257,6 +1319,15 @@ func init() {
 	}
 	for _, failure := range requestAuthFailures {
 		requestAuthFailuresTotal.WithLabelValues(failure.label())
+	}
+	for _, sink := range tenantSeccompSinks {
+		tenantSeccompProfileRefusalsTotal.WithLabelValues(sink.label()).Add(0)
+	}
+	for _, outcome := range tenantSeccompCensusOutcomes {
+		tenantSeccompCensusTotal.WithLabelValues(outcome).Add(0)
+	}
+	for _, outcome := range projidAuditOutcomes {
+		volumeProjidAuditTotal.WithLabelValues(outcome.label()).Add(0)
 	}
 	for _, outcome := range []string{"busy", "inhibited", "shared", "below_threshold", "removed", "error", "panic"} {
 		imageGCTotal.WithLabelValues(outcome).Add(0)

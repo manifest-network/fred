@@ -76,12 +76,18 @@ func startupStartRefusedFailure(cause error) *physicalOperationError {
 	return &physicalOperationError{callback: backend.MsgContainerStartRefused, reason: backend.ReasonContainerStartFailed, cause: cause}
 }
 
-// launchRejectedFailure is the surface of a launch exchange that settled with
-// an error but showed no positive failure of any container. Compose's error
-// is operator detail only.
+// launchRejectedFailure is the surface of a launch that failed without a
+// positive failure of any container: an exchange that settled with an error,
+// or one that returned no receipt. Compose's error is operator detail only.
+// The one exception is a creation refused for the tenant seccomp profile, a
+// provider fault authored where it was raised (ENG-1118), which keeps its own
+// surface; no other authored failure is inherited.
 func launchRejectedFailure(cause error) *physicalOperationError {
-	return &physicalOperationError{callback: "container creation failed", reason: backend.ReasonInternal,
-		cause: fmt.Errorf("compose up failed: %w", cause)}
+	wrapped := fmt.Errorf("compose up failed: %w", cause)
+	if refusal, ok := tenantSeccompRefusal(cause); ok {
+		return &physicalOperationError{callback: refusal.callback, reason: refusal.reason, cause: wrapped}
+	}
+	return &physicalOperationError{callback: "container creation failed", reason: backend.ReasonInternal, cause: wrapped}
 }
 
 func startupUnverifiedFailure(cause error) *physicalOperationError {

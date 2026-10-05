@@ -2554,6 +2554,10 @@ func (f *fakeVolumeBackend) Usage(_ context.Context, _ string) (int64, error) {
 
 func (f *fakeVolumeBackend) Kind() string { return "fake" }
 
+func (f *fakeVolumeBackend) OpenProjectIDAudit(context.Context, managedVolumeName) (*projidAuditVolume, error) {
+	return nil, errProjectIDAuditUnsupported
+}
+
 // fakeReleaseStore wraps a real *shared.ReleaseStore with the test-side
 // helpers expected by the migration tests. The wrapped store is real so the
 // production code path (which talks to *shared.ReleaseStore directly) is
