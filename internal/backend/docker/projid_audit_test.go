@@ -229,7 +229,8 @@ func TestProjidAuditReportsATreeChangedMidWalk(t *testing.T) {
 // listedFirst returns a file and a directory name, both absent from dir,
 // such that a listing of dir holding just the two lists the file first.
 // Directory order is the filesystem's (os.ReadDir would sort it, so the
-// listing is read unsorted); candidates are tried until one fits.
+// listing is read unsorted): hashed on ext4 and btrfs, newest first on
+// tmpfs. Candidates are tried in both creation orders until one fits.
 func listedFirst(t *testing.T, dir string) (file, sub string) {
 	t.Helper()
 	listing := func() []os.DirEntry {
@@ -242,15 +243,19 @@ func listedFirst(t *testing.T, dir string) (file, sub string) {
 	}
 	for i := range 64 {
 		file, sub = fmt.Sprintf("f%02d", i), fmt.Sprintf("d%02d", i)
-		require.NoError(t, os.WriteFile(filepath.Join(dir, file), []byte("z"), 0o600))
-		require.NoError(t, os.Mkdir(filepath.Join(dir, sub), 0o700))
-		entries := listing()
-		require.Len(t, entries, 2)
-		if entries[0].Name() == file {
-			return file, sub
+		createFile := func() { require.NoError(t, os.WriteFile(filepath.Join(dir, file), []byte("z"), 0o600)) }
+		createDir := func() { require.NoError(t, os.Mkdir(filepath.Join(dir, sub), 0o700)) }
+		for _, order := range [][2]func(){{createFile, createDir}, {createDir, createFile}} {
+			order[0]()
+			order[1]()
+			entries := listing()
+			require.Len(t, entries, 2)
+			if entries[0].Name() == file {
+				return file, sub
+			}
+			require.NoError(t, os.Remove(filepath.Join(dir, file)))
+			require.NoError(t, os.Remove(filepath.Join(dir, sub)))
 		}
-		require.NoError(t, os.Remove(filepath.Join(dir, file)))
-		require.NoError(t, os.Remove(filepath.Join(dir, sub)))
 	}
 	t.Fatalf("no candidate pair lists its file first in %s", dir)
 	return "", ""
