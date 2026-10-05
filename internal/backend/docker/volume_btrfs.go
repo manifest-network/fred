@@ -210,6 +210,10 @@ func (b *btrfsVolumeManager) PrecheckDestroy(managedVolumeName) (destroyPrecheck
 	return destroyPrecheckNeedsLock, nil
 }
 
+func (*btrfsVolumeManager) AcknowledgeResidualAccounting([]residualAccountingToken) []managedVolumeName {
+	return nil
+}
+
 func (b *btrfsVolumeManager) RetryHeldVolumeDelete(context.Context, string) error { return nil }
 
 // btrfs never stages a deletion, so it has none to defer.

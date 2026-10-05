@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -50,10 +52,27 @@ func pendingDeletes(names ...string) volumeDeleteHoldSnapshot {
 	return snapshot
 }
 
+// residualDeletes is a snapshot of residual holds an admission publication
+// already counted: their callers settle.
 func residualDeletes(footprintMB int64, names ...string) volumeDeleteHoldSnapshot {
-	snapshot := pendingDeletes(names...)
+	snapshot := uncountedResidualDeletes(footprintMB, names...)
 	for name, hold := range snapshot.holds {
+		hold.callerSettled = true
+		snapshot.holds[name] = hold
+	}
+	return snapshot
+}
+
+// uncountedResidualDeletes is a snapshot of residual holds no admission
+// publication has counted yet: they still hold their callers.
+func uncountedResidualDeletes(footprintMB int64, names ...string) volumeDeleteHoldSnapshot {
+	snapshot := pendingDeletes(names...)
+	seq := uint64(0)
+	for _, name := range slices.Sorted(maps.Keys(snapshot.holds)) {
+		hold := snapshot.holds[name]
+		seq++
 		hold.phase, hold.footprintMB, hold.reason = holdPhaseResidual, footprintMB, holdReasonUsageNonzero
+		hold.residualSeq = seq
 		snapshot.holds[name] = hold
 	}
 	return snapshot

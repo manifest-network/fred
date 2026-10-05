@@ -78,14 +78,16 @@ func keyedField(field string) func(ast.Node) bool {
 
 func assignedField(field string) func(ast.Node) bool {
 	return func(node ast.Node) bool {
-		assign, ok := node.(*ast.AssignStmt)
-		if !ok {
-			return false
-		}
-		for _, lhs := range assign.Lhs {
-			if selector, ok := lhs.(*ast.SelectorExpr); ok && selector.Sel.Name == field {
-				return true
+		switch n := node.(type) {
+		case *ast.AssignStmt:
+			for _, lhs := range n.Lhs {
+				if selector, ok := lhs.(*ast.SelectorExpr); ok && selector.Sel.Name == field {
+					return true
+				}
 			}
+		case *ast.IncDecStmt:
+			selector, ok := n.X.(*ast.SelectorExpr)
+			return ok && selector.Sel.Name == field
 		}
 		return false
 	}
@@ -164,6 +166,22 @@ var deleteHoldPins = []deleteHoldPin{
 		[]string{"newBackgroundMaintenanceCoordinator"}},
 	{"delete deferral literal", typedLiteral("volumeDeleteDeferral"),
 		[]string{"xfsVolumeManager.DeferDeletesUntilExecutorRuns"}},
+	// A residual hold settles its caller only after an admission publication
+	// counted it (make before break): every phase write goes through the one
+	// setter that starts a residual entry unacknowledged, and only the
+	// publication may acknowledge one.
+	{"hold phase assigned", assignedField("phase"), []string{"xfsVolumeManager.setHoldPhaseLocked"}},
+	{"residual sequence assigned", assignedField("residualSeq"), []string{"xfsVolumeManager.setHoldPhaseLocked"}},
+	{"residual acknowledgment assigned", assignedField("residualAcknowledged"),
+		[]string{"xfsVolumeManager.setHoldPhaseLocked", "xfsVolumeManager.AcknowledgeResidualAccounting"}},
+	{"residual acknowledgment set", keyedField("residualAcknowledged"), nil},
+	{"residual accounting acknowledged", selectorNamed("AcknowledgeResidualAccounting"),
+		[]string{"Backend.publishRetainedDiskLocked", "projectVolumeRead"}},
+	// The derived settlement bit every settlement reader consumes is built
+	// only from the hold, by the classifier and the hold's view.
+	{"settlement bit set", keyedField("callerSettled"),
+		[]string{"classifyXFSDeleteStageCleanup", "xfsDeleteHold.view"}},
+	{"settlement bit assigned", assignedField("callerSettled"), nil},
 }
 
 // funcKey names a function "Func", or a method "Recv.Method".
@@ -276,6 +294,15 @@ func misuse(v condemnedXFSVolume, x *xfsVolumeManager, row xfsProjectQuotaRow, f
 	_ = x.DeferDeletesUntilExecutorRuns()
 	_ = volumeDeleteDeferral{release: func() {}}
 	_ = view
+	hold := &xfsDeleteHold{}
+	hold.phase = xfsDeleteHoldPhase{}
+	hold.residualSeq++
+	hold.residualAcknowledged = true
+	_ = struct{ residualAcknowledged bool }{residualAcknowledged: true}
+	_ = x.AcknowledgeResidualAccounting(nil)
+	settled := volumeDeleteHoldView{callerSettled: true}
+	settled.callerSettled = true
+	_ = settled
 }
 `
 

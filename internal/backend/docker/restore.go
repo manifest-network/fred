@@ -1057,11 +1057,13 @@ func (b *Backend) destroyReapingVolumesUsing(
 	if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
 		// A prior raw mutation met an authority contradiction or an ambiguous
 		// outcome and withdrew this Backend instance; a fresh process owns the
-		// next classification. A held XFS deletion never gets here (ENG-1117): in
-		// its removal and unsized phases ListForProof keeps listing the name, so the footprint
-		// below is never empty while bytes may remain and the record stays; in its
-		// residual phase the name is durably gone, the record may go, and the
-		// project's remaining footprint is counted in admission as heldResidualMB.
+		// next classification. A held XFS deletion never gets here (ENG-1117):
+		// while it holds its caller (the removal and unsized phases, and a
+		// residual one no publication has counted yet) ListForProof keeps listing
+		// the name, so the footprint below is never empty while bytes may remain
+		// and the record stays; once residual and counted, the name is durably
+		// gone, the record may go, and the project's remaining footprint is
+		// counted in admission as heldResidualMB.
 		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
 		logger.Error("reaping: backend storage recovery is pending; keeping the record", "error", authorityErr)
 		return false

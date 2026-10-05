@@ -641,9 +641,11 @@ When provisioning `redis:latest` on this SKU:
 > and one background hold executor retries it while the backend serves.
 > `Start` registers every stage it finds as a held deletion. In the removal
 > phase the caller stays pending (a close answers 503 `lifecycle_pending`); in
-> the residual phase the volume is durably gone, the caller settles, and
-> admission counts the project's block hard limit (or its block usage, if
-> larger) until the hold completes. A stage found at startup whose volume is
+> the residual phase the volume is durably gone and admission counts the
+> project's block hard limit (or its block usage, if larger) until the hold
+> completes. The caller settles only once that count has been published, so
+> no close releases its allocation before the pool counts the project
+> instead. A stage found at startup whose volume is
 > gone but whose footprint cannot be read is unsized: the caller stays pending
 > and disk admission is withheld until the footprint is known. Only a
 > contradiction of the stage's own

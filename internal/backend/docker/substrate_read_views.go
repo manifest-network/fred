@@ -85,6 +85,7 @@ type volumeReadView struct {
 	requireNoUnheld      func(context.Context) error
 	deleteHolds          func() volumeDeleteHoldSnapshot
 	precheckDestroy      func(managedVolumeName) (destroyPrecheckVerdict, error)
+	acknowledgeResidual  func([]residualAccountingToken) []managedVolumeName
 	validate             func() error
 	hostPath             func(string) string
 	pinNamespaceRoot     func(managedVolumeName) (*fsidentity.Directory, error)
@@ -106,6 +107,7 @@ func projectVolumeRead(volumes volumeReader) volumeReader {
 		requireNoUnheld:      volumes.RequireNoUnheldVolumeMutations,
 		deleteHolds:          volumes.VolumeDeleteHolds,
 		precheckDestroy:      volumes.PrecheckDestroy,
+		acknowledgeResidual:  volumes.AcknowledgeResidualAccounting,
 		validate:             volumes.Validate, hostPath: volumes.HostPath,
 		pinNamespaceRoot: volumes.PinNamespaceRoot,
 		usage:            volumes.Usage, kind: volumes.Kind,
@@ -131,6 +133,9 @@ func (v volumeReadView) RequireNoUnheldVolumeMutations(ctx context.Context) erro
 func (v volumeReadView) VolumeDeleteHolds() volumeDeleteHoldSnapshot { return v.deleteHolds() }
 func (v volumeReadView) PrecheckDestroy(name managedVolumeName) (destroyPrecheckVerdict, error) {
 	return v.precheckDestroy(name)
+}
+func (v volumeReadView) AcknowledgeResidualAccounting(tokens []residualAccountingToken) []managedVolumeName {
+	return v.acknowledgeResidual(tokens)
 }
 func (v volumeReadView) Validate() error                                     { return v.validate() }
 func (v volumeReadView) HostPath(name string) string                         { return v.hostPath(name) }

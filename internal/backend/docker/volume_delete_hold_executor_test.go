@@ -221,9 +221,15 @@ func TestClassifyHeldDeleteAttempt(t *testing.T) {
 		{"phase changed", with(func(v *volumeDeleteHoldView) {
 			v.phase, v.reason, v.nextAttempt = holdPhaseUnsized, holdReasonUsageUnprovable, now
 		}), true, heldDeleteAttempt{progressed: true}},
-		{"left the removal phase", with(func(v *volumeDeleteHoldView) {
+		{"left the removal phase, counted", with(func(v *volumeDeleteHoldView) {
 			v.phase, v.reason, v.nextAttempt = holdPhaseResidual, holdReasonUsageNonzero, now.Add(time.Minute)
+			v.callerSettled = true
 		}), true, heldDeleteAttempt{progressed: true, releasedCaller: true}},
+		// Residual but not yet counted by an admission publication: the
+		// caller must not settle until the footprint is in the pool.
+		{"left the removal phase, not yet counted", with(func(v *volumeDeleteHoldView) {
+			v.phase, v.reason, v.nextAttempt = holdPhaseResidual, holdReasonUsageNonzero, now.Add(time.Minute)
+		}), true, heldDeleteAttempt{progressed: true}},
 		{"a different stage", with(func(v *volumeDeleteHoldView) { v.stage = "other" }), true, heldDeleteAttempt{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -345,6 +351,123 @@ func TestVolumeDeleteHoldIterationCountsPanics(t *testing.T) {
 	b.runVolumeDeleteHoldIteration()
 	assert.Equal(t, int32(2), calls.Load(), "a panic cannot kill the executor")
 	assert.Equal(t, before+1, testutil.ToFloat64(panics))
+}
+
+// A residual hold settles its close only after an admission publication
+// counted its footprint (#250 review, P1). While a concurrent refresh holds
+// the accounting lock, the executor has finished a deletion's removal (its
+// project still charges 64 MiB) but cannot publish the footprint yet. A
+// Deprovision in that window must leave the close pending: settling it would
+// release the lease's live allocation while the pool counts the project
+// nowhere. Once the publication counts it, the executor resumes the close.
+// The volume mock follows the manager's contract: an uncounted residual hold
+// stays listed and answers held, like the removal phase.
+func TestCloseSettlesOnAResidualHoldOnlyAfterItsFootprintIsCounted(t *testing.T) {
+	dir := t.TempDir()
+	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, &mockVolumeManager{})
+	seedCloseDeprovisionLease(t, b, stores)
+	name := canonicalVolumeName(closeDeprovisionLeaseUUID, "app", 0)
+	const footprintMB = 64
+	const (
+		removal = iota
+		residualUncounted
+		residualCounted
+	)
+	var state atomic.Int32
+	var retainedAtAcknowledgment atomic.Int64
+	settles := func() bool { return state.Load() == residualCounted }
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			if settles() {
+				return nil, nil
+			}
+			return []string{name}, nil
+		},
+		VolumeDeleteHoldsFn: func() volumeDeleteHoldSnapshot {
+			var snapshot volumeDeleteHoldSnapshot
+			switch state.Load() {
+			case removal:
+				return pendingDeletes(name)
+			case residualUncounted:
+				snapshot = uncountedResidualDeletes(footprintMB, name)
+			default:
+				snapshot = residualDeletes(footprintMB, name)
+			}
+			hold := snapshot.holds[name]
+			hold.attempts = 1 // the executor's attempt made it residual
+			snapshot.holds[name] = hold
+			return snapshot
+		},
+		PrecheckDestroyFn: func(managedVolumeName) (destroyPrecheckVerdict, error) {
+			if settles() {
+				return destroyPrecheckGone, nil
+			}
+			return destroyPrecheckHeld, heldDeleteErr(name)
+		},
+		// Destroy's own answer is not gated: it reaches its caller only after
+		// afterVolumeDestroy published, and so acknowledged, the footprint.
+		DestroyFn: func(context.Context, string) error {
+			if state.Load() == removal {
+				return heldDeleteErr(name)
+			}
+			return nil
+		},
+		RetryHeldVolumeDeleteFn: func(context.Context, string) error {
+			state.CompareAndSwap(removal, residualUncounted) // only the project remains
+			return heldDeleteErr(name)
+		},
+		AcknowledgeResidualAccountingFn: func(tokens []residualAccountingToken) []managedVolumeName {
+			if len(tokens) == 1 && tokens[0].volume == name && state.CompareAndSwap(residualUncounted, residualCounted) {
+				retainedAtAcknowledgment.Store(b.pool.Stats().RetainedDiskMB)
+				parsed, err := parseManagedVolumeName(name)
+				require.NoError(t, err)
+				return []managedVolumeName{parsed}
+			}
+			return nil
+		},
+	}
+	installTestStorageMutationAdapters(b)
+	require.NoError(t, b.refreshRetentionAccountingChecked())
+	base := b.pool.Stats().RetainedDiskMB
+	require.Error(t, b.doDeprovisionForTest(t, t.Context(), closeDeprovisionLeaseUUID))
+	closePending := func() bool {
+		_, found, err := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
+		require.NoError(t, err)
+		return found
+	}
+	require.True(t, closePending(), "the close is pending on the removal-phase hold")
+
+	b.retentionAccountingMu.Lock() // a concurrent refresh
+	executorDone := make(chan struct{})
+	go func() {
+		defer close(executorDone)
+		b.runVolumeDeleteHoldIteration()
+	}()
+	require.Eventually(t, func() bool { return state.Load() == residualUncounted }, 5*time.Second, time.Millisecond)
+
+	deprovisioned := make(chan error, 1)
+	go func() { deprovisioned <- b.doDeprovisionForTest(t, t.Context(), closeDeprovisionLeaseUUID) }()
+	select {
+	case err := <-deprovisioned:
+		require.Error(t, err, "an uncounted residual hold keeps the close pending")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Deprovision of a close waiting only on a held deletion must answer without the accounting lock")
+	}
+	require.True(t, closePending(), "the close must not settle before the residual footprint is counted")
+	require.Equal(t, int32(residualUncounted), state.Load())
+
+	b.retentionAccountingMu.Unlock()
+	select {
+	case <-executorDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the executor's pass did not finish")
+	}
+	assert.Equal(t, int32(residualCounted), state.Load(), "the executor's publication acknowledged the hold")
+	assert.Equal(t, base+footprintMB, retainedAtAcknowledgment.Load(),
+		"the hold was acknowledged only once the published total counted its footprint")
+	assert.False(t, closePending(), "the executor resumed the close once the hold was counted")
+	assert.Equal(t, base+footprintMB, b.pool.Stats().RetainedDiskMB)
+	closeCloseRecoveryBackend(t, b, stores)
 }
 
 // When a hold leaves the removal phase, the executor resumes its lease's close

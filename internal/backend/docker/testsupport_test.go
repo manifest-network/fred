@@ -2515,6 +2515,9 @@ func (f *fakeVolumeBackend) VolumeDeleteHolds() volumeDeleteHoldSnapshot {
 func (f *fakeVolumeBackend) PrecheckDestroy(managedVolumeName) (destroyPrecheckVerdict, error) {
 	return destroyPrecheckNeedsLock, nil
 }
+func (f *fakeVolumeBackend) AcknowledgeResidualAccounting([]residualAccountingToken) []managedVolumeName {
+	return nil
+}
 func (f *fakeVolumeBackend) RetryHeldVolumeDelete(context.Context, string) error { return nil }
 func (f *fakeVolumeBackend) DeferDeletesUntilExecutorRuns() volumeDeleteDeferral {
 	return volumeDeleteDeferral{}

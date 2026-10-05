@@ -323,12 +323,10 @@ func residualHoldPhase(footprint residualFootprintMB) (xfsDeleteHoldPhase, bool)
 	return xfsDeleteHoldPhase{kind: holdPhaseResidual, footprint: footprint}, true
 }
 
-// residual reports whether the hold has settled its caller.
+// residual reports whether the hold is in the residual phase. A residual
+// hold settles its caller only once an admission publication counted its
+// footprint (xfsDeleteHold.settlesCaller); the phase alone never answers that.
 func (p xfsDeleteHoldPhase) residual() bool { return p.kind == holdPhaseResidual }
-
-// holdsCaller reports whether a Destroy answers ErrVolumeDeleteHeld and the
-// caller stays pending: the removal and unsized phases.
-func (p xfsDeleteHoldPhase) holdsCaller() bool { return p.kind != holdPhaseResidual }
 
 // absenceObserved reports whether this process observed the final path
 // absent for this hold: the unsized and residual phases. Nothing in fred can
@@ -366,19 +364,79 @@ type xfsDeleteHold struct {
 	since          time.Time
 	lastAttempt    time.Time
 	nextAttempt    time.Time
+	// residualSeq numbers this hold's current entry into the residual phase,
+	// and residualAcknowledged records that an admission publication counted
+	// its footprint. Only setHoldPhaseLocked and
+	// AcknowledgeResidualAccounting write them.
+	residualSeq          uint64
+	residualAcknowledged bool
 }
 
 // newXFSDeleteHold is the only constructor of a hold record, and it accepts
 // only a held outcome, which only classifyXFSDeleteStageCleanup produces from a
-// holdable cause. Every hold therefore traces back to an allowlisted site.
+// holdable cause. Every hold therefore traces back to an allowlisted site. The
+// record starts in the removal phase; its caller sets the outcome's phase
+// through setHoldPhaseLocked, the only writer of a hold's phase.
 func newXFSDeleteHold(outcome deleteStageOutcome, now time.Time) (*xfsDeleteHold, bool) {
 	if outcome.kind != deleteStageHeld {
 		return nil, false
 	}
 	return &xfsDeleteHold{
-		stage: outcome.stage, phase: outcome.phase, reason: outcome.reason,
+		stage: outcome.stage, reason: outcome.reason,
 		since: now, nextAttempt: now,
 	}, true
+}
+
+// settlesCaller reports whether the readers that infer a deletion's
+// completion without a destroy of their own (ListForProof, PrecheckDestroy,
+// the hold snapshot's close-wait predicates) may treat the hold as settled: a
+// residual hold whose footprint an admission publication already counted.
+// Until then those readers see it exactly like the removal phase, so nothing
+// releases a caller's accounting before the pool counts the project instead
+// (make before break). Destroy's own answer is not gated: it reaches its
+// caller only through afterVolumeDestroy, which publishes, and so
+// acknowledges, the footprint first.
+func (h *xfsDeleteHold) settlesCaller() bool { return h.phase.residual() && h.residualAcknowledged }
+
+// setHoldPhaseLocked is the only writer of a hold's phase. A hold entering
+// the residual phase starts unacknowledged under a fresh sequence: its
+// footprint counts toward admission from then on, but it keeps holding its
+// caller until AcknowledgeResidualAccounting. A hold that stays residual keeps
+// its sequence and acknowledgment; one that leaves the phase drops both. The
+// caller holds x.mu.
+func (x *xfsVolumeManager) setHoldPhaseLocked(hold *xfsDeleteHold, phase xfsDeleteHoldPhase) {
+	switch {
+	case !phase.residual():
+		hold.residualSeq, hold.residualAcknowledged = 0, false
+	case !hold.phase.residual():
+		x.lastResidualSeq++
+		hold.residualSeq, hold.residualAcknowledged = x.lastResidualSeq, false
+	}
+	hold.phase = phase
+}
+
+// AcknowledgeResidualAccounting records that an admission publication counted
+// the residual holds the tokens name, so their callers may settle, and
+// returns the holds it acknowledged now. A token names one entry into the
+// residual phase: a hold that left the phase, or entered it again, since the
+// publication's snapshot is not acknowledged. It changes only the manager's
+// memory.
+func (x *xfsVolumeManager) AcknowledgeResidualAccounting(tokens []residualAccountingToken) []managedVolumeName {
+	if len(tokens) == 0 {
+		return nil
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	var acknowledged []managedVolumeName
+	for _, token := range tokens {
+		hold, ok := x.deleteHolds[token.volume]
+		if !ok || !hold.phase.residual() || hold.residualSeq != token.seq || hold.residualAcknowledged {
+			continue
+		}
+		hold.residualAcknowledged = true
+		acknowledged = append(acknowledged, hold.stage.volumeID)
+	}
+	return acknowledged
 }
 
 func (h *xfsDeleteHold) view() volumeDeleteHoldView {
@@ -394,6 +452,8 @@ func (h *xfsDeleteHold) view() volumeDeleteHoldView {
 		since:          h.since,
 		lastAttempt:    h.lastAttempt,
 		nextAttempt:    h.nextAttempt,
+		callerSettled:  h.settlesCaller(),
+		residualSeq:    h.residualSeq,
 	}
 }
 
@@ -444,6 +504,10 @@ type deleteStageOutcome struct {
 	phase  xfsDeleteHoldPhase
 	reason volumeDeleteHoldReason
 	err    error
+	// callerSettled: the hold is residual and stays acknowledged as counted
+	// (xfsDeleteHold.settlesCaller after setHoldPhaseLocked records it). Only
+	// PrecheckDestroy reads it; Destroy's own answer does not.
+	callerSettled bool
 }
 
 // classifyXFSDeleteStageCleanup is the total classification of one attempt's
@@ -466,12 +530,16 @@ func classifyXFSDeleteStageCleanup(
 	if !errors.As(err, &cause) {
 		return deleteStageOutcome{kind: deleteStageLatched, stage: stage, err: err}
 	}
+	phase := holdPhaseAfter(attempt, previous)
 	return deleteStageOutcome{
 		kind:   deleteStageHeld,
 		stage:  stage,
-		phase:  holdPhaseAfter(attempt, previous),
+		phase:  phase,
 		reason: cause.reason,
 		err:    err,
+		// setHoldPhaseLocked keeps an acknowledged residual hold acknowledged
+		// only while it stays residual; any other hold settles no caller yet.
+		callerSettled: phase.residual() && previous != nil && previous.settlesCaller(),
 	}
 }
 
@@ -687,7 +755,7 @@ func (x *xfsVolumeManager) recordXFSDeleteStageOutcome(
 			current, _ = newXFSDeleteHold(outcome, now)
 		}
 		changed = previous == nil || previous.phase != outcome.phase || previous.reason != outcome.reason
-		current.phase = outcome.phase
+		x.setHoldPhaseLocked(current, outcome.phase)
 		current.reason = outcome.reason
 		if attempted {
 			current.attempts++
@@ -870,7 +938,7 @@ func (x *xfsVolumeManager) VolumeDeleteHolds() volumeDeleteHoldSnapshot {
 // manager's own state is enough. See volumeReader.
 func (x *xfsVolumeManager) PrecheckDestroy(name managedVolumeName) (destroyPrecheckVerdict, error) {
 	if outcome, held := x.registeredHoldOutcome(name); held {
-		if outcome.phase.holdsCaller() {
+		if !outcome.callerSettled {
 			return destroyPrecheckHeld, outcome.result(finalPathNotObserved)
 		}
 		if x.observeFinalPathPinned(name).absent() {
@@ -937,14 +1005,15 @@ func (x *xfsVolumeManager) RequireNoUnheldVolumeMutations(ctx context.Context) e
 }
 
 // removalVisibleDeleteNamesLocked returns every name with a delete stage that
-// has not settled its caller: the stage is in flight, or held in the removal
-// or unsized phase. ListForProof unions them with the on-disk listing so that
-// no consumer reads such a name's absence as completion. Residual names are
-// settled; the admission pool accounts for them instead. The caller holds x.mu.
+// has not settled its caller: the stage is in flight, held in the removal or
+// unsized phase, or residual and not yet acknowledged as counted. ListForProof
+// unions them with the on-disk listing so that no consumer reads such a name's
+// absence as completion. An acknowledged residual name is settled; the
+// admission pool accounts for it instead. The caller holds x.mu.
 func (x *xfsVolumeManager) removalVisibleDeleteNamesLocked() []string {
 	var names []string
 	add := func(stage xfsDeleteStageName) {
-		if hold, ok := x.deleteHolds[stage.volumeID.value()]; ok && hold.stage == stage && hold.phase.residual() {
+		if hold, ok := x.deleteHolds[stage.volumeID.value()]; ok && hold.stage == stage && hold.settlesCaller() {
 			return
 		}
 		names = append(names, stage.volumeID.value())
@@ -1077,7 +1146,7 @@ func (x *xfsVolumeManager) setRecoveredHoldPhase(stage xfsDeleteStageName, phase
 		x.mu.Unlock()
 		return
 	}
-	hold.phase = phase
+	x.setHoldPhaseLocked(hold, phase)
 	view := hold.view()
 	x.mu.Unlock()
 	if phase.kind == holdPhaseUnsized {

@@ -93,11 +93,19 @@ type volumeReader interface {
 	VolumeDeleteHolds() volumeDeleteHoldSnapshot
 
 	// PrecheckDestroy answers a destroy from the manager's own state without
-	// the caller's namespace lock: held (in the removal or unsized phase), gone
-	// (a residual hold, or a name with no stage and no project mapping, whose
-	// final path an identity-bound Lstat proved absent), or needs-lock for
-	// everything else.
+	// the caller's namespace lock: held (in the removal or unsized phase, or
+	// residual and not yet counted by an admission publication), gone (a
+	// counted residual hold, or a name with no stage and no project mapping,
+	// whose final path an identity-bound Lstat proved absent), or needs-lock
+	// for everything else.
 	PrecheckDestroy(managedVolumeName) (destroyPrecheckVerdict, error)
+
+	// AcknowledgeResidualAccounting records that an admission publication
+	// counted the residual held deletions the tokens name, so that their
+	// callers may settle, and returns the holds it acknowledged (ENG-1117). It
+	// changes only the manager's memory. Its only caller is the retained-disk
+	// publication, publishRetainedDiskLocked.
+	AcknowledgeResidualAccounting([]residualAccountingToken) []managedVolumeName
 
 	// Validate checks filesystem support and permissions, and rebuilds local
 	// manager indexes from on-disk volumes. Called at startup.
@@ -260,6 +268,10 @@ func (n *noopVolumeManager) VolumeDeleteHolds() volumeDeleteHoldSnapshot {
 
 func (n *noopVolumeManager) PrecheckDestroy(managedVolumeName) (destroyPrecheckVerdict, error) {
 	return destroyPrecheckNeedsLock, nil
+}
+
+func (n *noopVolumeManager) AcknowledgeResidualAccounting([]residualAccountingToken) []managedVolumeName {
+	return nil
 }
 
 func (n *noopVolumeManager) RetryHeldVolumeDelete(context.Context, string) error { return nil }

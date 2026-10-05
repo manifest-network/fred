@@ -238,8 +238,11 @@ func TestVolumeDeleteHoldSnapshotDueOrderRotates(t *testing.T) {
 		name(1).value(): {volume: name(1), nextAttempt: now},
 		name(2).value(): {volume: name(2), lastAttempt: now.Add(-time.Hour), nextAttempt: now.Add(-time.Second)},
 		name(3).value(): {volume: name(3), lastAttempt: now.Add(-time.Hour), nextAttempt: now.Add(time.Minute)},
-		name(4).value(): {volume: name(4), phase: holdPhaseResidual, footprintMB: 7, nextAttempt: now.Add(time.Hour)},
+		name(4).value(): {volume: name(4), phase: holdPhaseResidual, footprintMB: 7, residualSeq: 3,
+			nextAttempt: now.Add(time.Hour)},
 		name(5).value(): {volume: name(5), phase: holdPhaseUnsized, lastAttempt: now, nextAttempt: now},
+		name(6).value(): {volume: name(6), phase: holdPhaseResidual, footprintMB: 5, residualSeq: 2,
+			callerSettled: true, nextAttempt: now.Add(time.Hour)},
 	}}
 	due := snapshot.dueInOrder(now)
 	var got []string
@@ -247,15 +250,20 @@ func TestVolumeDeleteHoldSnapshotDueOrderRotates(t *testing.T) {
 		got = append(got, hold.volume.value())
 	}
 	assert.Equal(t, []string{name(5).value(), name(1).value(), name(2).value(), name(0).value()}, got,
-		"unsized first, then never-attempted, then least recently attempted; not-yet-due holds wait")
+		"an unsized hold leads, then never-attempted, then least recently attempted; not-yet-due holds wait")
 	assert.Equal(t, map[string]int{
-		volumeDeleteHoldPhaseRemoval: 4, volumeDeleteHoldPhaseUnsized: 1, volumeDeleteHoldPhaseResidual: 1,
+		volumeDeleteHoldPhaseRemoval: 4, volumeDeleteHoldPhaseUnsized: 1, volumeDeleteHoldPhaseResidual: 2,
 	}, snapshot.phaseCounts())
-	assert.Equal(t, heldDeletionAccount{residualMB: 7, unsized: 1}, snapshot.admissionAccount())
+	assert.Equal(t, heldDeletionAccount{residualMB: 12, unsized: 1,
+		unacknowledged: []residualAccountingToken{{volume: name(4).value(), seq: 3}}}, snapshot.admissionAccount(),
+		"every residual footprint counts; only the unacknowledged one is named for acknowledgment")
 	assert.True(t, snapshot.callerHeld(name(0).value()))
 	assert.True(t, snapshot.callerHeld(name(5).value()), "an unsized hold keeps its caller pending")
-	assert.False(t, snapshot.callerHeld(name(4).value()))
-	assert.True(t, snapshot.residualHeld(name(4).value()))
+	assert.True(t, snapshot.callerHeld(name(4).value()),
+		"a residual hold no publication has counted yet keeps its caller pending")
+	assert.False(t, snapshot.settledResidual(name(4).value()))
+	assert.False(t, snapshot.callerHeld(name(6).value()))
+	assert.True(t, snapshot.settledResidual(name(6).value()))
 	assert.Equal(t, map[string]int{
 		volumeDeleteHoldPhaseRemoval: 0, volumeDeleteHoldPhaseUnsized: 0, volumeDeleteHoldPhaseResidual: 0,
 	}, volumeDeleteHoldSnapshot{}.phaseCounts(), "every phase is reported, so a gauge drops to zero")
@@ -569,6 +577,12 @@ func TestXFSDestroyAnswersAHoldWithoutWork(t *testing.T) {
 		"a completed deletion leaves nothing to destroy")
 }
 
+// acknowledgeResidualsForTest acknowledges every residual hold of mgr, as the
+// Backend's admission publication does once it counted them.
+func acknowledgeResidualsForTest(mgr volumeReader) {
+	mgr.AcknowledgeResidualAccounting(mgr.VolumeDeleteHolds().admissionAccount().unacknowledged)
+}
+
 func TestXFSResidualHoldLatchesWhenTheFinalPathExistsAgain(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
@@ -771,8 +785,14 @@ esac`, xfsDeleteTestProjectID+1))
 	assert.Equal(t, int64(4), mgr.VolumeDeleteHolds().admissionAccount().residualMB)
 	names, err := mgr.ListForProof(t.Context())
 	require.NoError(t, err)
+	assert.Equal(t, []string{removing.volumeID.value(), residual.volumeID.value(), live.value()}, names,
+		"a residual deletion stays listed until a publication counts it")
+	require.NoError(t, mgr.AttestManagedVolume(t.Context(), residual.volumeID))
+	acknowledgeResidualsForTest(mgr)
+	names, err = mgr.ListForProof(t.Context())
+	require.NoError(t, err)
 	assert.Equal(t, []string{removing.volumeID.value(), live.value()}, names,
-		"a residual deletion is settled and accounted in admission instead")
+		"a counted residual deletion is settled and accounted in admission instead")
 	require.ErrorContains(t, mgr.AttestManagedVolume(t.Context(), residual.volumeID), "does not exist")
 	require.NoError(t, mgr.RequireNoUnheldVolumeMutations(t.Context()))
 	require.Error(t, mgr.RequireNoInterruptedVolumeMutations(t.Context()))
@@ -827,7 +847,11 @@ esac`, stage.projID, stage.projID))
 	require.ErrorIs(t, mgr.RetryHeldVolumeDelete(ctx, stage.volumeID.value()), ErrVolumeDeleteHeld)
 	hold = heldForTest(t, mgr, stage.volumeID.value())
 	assert.Equal(t, holdPhaseResidual, hold.phase)
-	assert.Equal(t, heldDeletionAccount{residualMB: 2}, mgr.VolumeDeleteHolds().admissionAccount())
+	account := mgr.VolumeDeleteHolds().admissionAccount()
+	assert.Equal(t, int64(2), account.residualMB)
+	assert.Zero(t, account.unsized)
+	assert.Equal(t, []residualAccountingToken{{volume: stage.volumeID.value(), seq: hold.residualSeq}},
+		account.unacknowledged)
 	require.NoError(t, mgr.Destroy(t.Context(), stage.volumeID.value()), "a residual hold settles its caller")
 }
 

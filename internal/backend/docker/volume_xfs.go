@@ -121,6 +121,10 @@ type xfsVolumeManager struct {
 	// volume name (ENG-1117). It is memory only: the delete stage is the durable
 	// record, and loadProjectIDs re-registers every stage it finds as a hold.
 	deleteHolds map[string]*xfsDeleteHold
+	// lastResidualSeq numbers each entry of a hold into the residual phase, so
+	// an admission publication acknowledges exactly the residual holds it
+	// counted (AcknowledgeResidualAccounting). Guarded by mu.
+	lastResidualSeq uint64
 	// verifiedDeleteStages records the stages this process normalized to
 	// project 0 and fsynced, with the directory it verified, so a retry reads
 	// the attributes instead of rewriting and re-syncing them.
@@ -2339,7 +2343,9 @@ func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB in
 //
 // A held name is answered from the hold, without any filesystem work: the
 // removal and unsized phases answer ErrVolumeDeleteHeld, and the residual
-// phase answers nil once an Lstat in this call proves the final path absent. Only the hold
+// phase answers nil once an Lstat in this call proves the final path absent;
+// that answer reaches its caller only through afterVolumeDestroy, which
+// publishes the residual footprint first. Only the hold
 // executor (RetryHeldVolumeDelete) runs held work. A first-time deletion runs
 // inline under liveXFSDeleteBudget, which ends early when the caller or the
 // Backend stops. Only while a starting Backend defers deletions (from Start's
@@ -2504,7 +2510,8 @@ func (x *xfsVolumeManager) List() ([]string, error) {
 
 // ListForProof is the on-disk listing united with every name whose deletion
 // has not settled its caller (an in-flight delete stage, or one held in the
-// removal or unsized phase), sorted and de-duplicated. The latch used to keep
+// removal or unsized phase, or residual and not yet acknowledged as
+// counted), sorted and de-duplicated. The latch used to keep
 // consumers from reading such a name's absence as completion; this listing now
 // does (ENG-1117). The registry is read after the disk, so a stage minted
 // between the two reads cannot hide a name the listing missed.
@@ -2593,8 +2600,9 @@ func (x *xfsVolumeManager) AttestManagedVolume(ctx context.Context, name managed
 }
 
 // attestAbsentDeletingVolume attests a name ListForProof lists although its
-// final directory is gone: a deletion whose stage is in flight or held in the
-// removal or unsized phase. The stage must still be the attested empty directory, and the
+// final directory is gone: a deletion whose stage is in flight, or held with
+// its caller pending (removal, unsized, or residual and not yet counted). The
+// stage must still be the attested empty directory, and the
 // project-ID authority must still name it. Any other absent name is an error.
 func (x *xfsVolumeManager) attestAbsentDeletingVolume(root *os.Root, name managedVolumeName) error {
 	x.mu.Lock()

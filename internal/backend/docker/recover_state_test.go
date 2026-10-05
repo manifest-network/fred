@@ -41,6 +41,7 @@ type mockVolumeManager struct {
 	RecoverInterruptedVolumeMutationsFn   func(context.Context) error
 	VolumeDeleteHoldsFn                   func() volumeDeleteHoldSnapshot
 	PrecheckDestroyFn                     func(managedVolumeName) (destroyPrecheckVerdict, error)
+	AcknowledgeResidualAccountingFn       func([]residualAccountingToken) []managedVolumeName
 	RetryHeldVolumeDeleteFn               func(ctx context.Context, id string) error
 	ValidateFn                            func() error
 	RenameVolumeFn                        func(oldName, newName string) error
@@ -143,6 +144,13 @@ func (m *mockVolumeManager) PrecheckDestroy(name managedVolumeName) (destroyPrec
 		return m.PrecheckDestroyFn(name)
 	}
 	return destroyPrecheckNeedsLock, nil
+}
+
+func (m *mockVolumeManager) AcknowledgeResidualAccounting(tokens []residualAccountingToken) []managedVolumeName {
+	if m.AcknowledgeResidualAccountingFn != nil {
+		return m.AcknowledgeResidualAccountingFn(tokens)
+	}
+	return nil
 }
 
 func (m *mockVolumeManager) RetryHeldVolumeDelete(ctx context.Context, id string) error {

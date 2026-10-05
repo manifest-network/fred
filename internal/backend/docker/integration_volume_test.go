@@ -1587,6 +1587,9 @@ func TestIntegration_XFS_DestroyHoldsForeignTaggedInodeUsage(t *testing.T) {
 
 	require.NoError(t, volDestroyer(t, mgr).Destroy(ctx, volumeName),
 		"the volume's namespace is durably gone, so its caller settles")
+	listed, err := mgr.ListForProof(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, listed, volumeName, "until a publication counts it, proof listings keep the residual name")
 	hold, held := mgr.VolumeDeleteHolds().holds[volumeName]
 	require.True(t, held)
 	assert.True(t, hold.phase == holdPhaseResidual)

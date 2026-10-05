@@ -498,10 +498,12 @@ func (b *Backend) refreshRetentionAccountingCheckedLocked() error {
 
 // publishRetainedDiskLocked pushes the retained-disk projection to the pool:
 // the store-derived storeMB plus heldResidualMB, the footprint of every held
-// volume deletion in its residual phase. A residual hold has settled its
-// caller (the close completed, the reaping record went, the reservation was
-// released) while its project can still charge up to that footprint, so this
-// term is what keeps those bytes counted (ENG-1117).
+// volume deletion in its residual phase. A residual hold settles its caller
+// (the close completes, the reaping record goes, the reservation is released)
+// while its project can still charge up to that footprint, so this term is
+// what keeps those bytes counted (ENG-1117). A residual hold settles its
+// caller only after a publication that counted it acknowledges it, here,
+// after the pool accepted the total: make before break.
 //
 // An unsized hold may also have settled its caller, but its footprint is not
 // known. It is never counted as zero: while any exists the pool withholds
@@ -528,6 +530,15 @@ func (b *Backend) publishRetainedDiskLocked(storeMB int64) error {
 	b.retentionStoreDiskMB, b.retentionStoreDiskKnown = storeMB, true
 	volumeDeleteHeldResidualMB.Set(float64(account.residualMB))
 	b.observeUnsizedHeldDeletesLocked(account.unsized, true)
+	// Only now, with their footprints in the published total, may the
+	// residual holds this account counted settle their callers. A close that
+	// waited on one is owed a resume: no executor attempt may observe this
+	// release, since it can happen in any publication.
+	for _, released := range b.volumes.AcknowledgeResidualAccounting(account.unacknowledged) {
+		if leaseUUID, ok := heldDeletionLease(released); ok {
+			b.holdExecutor.oweResume(leaseUUID)
+		}
+	}
 	return nil
 }
 

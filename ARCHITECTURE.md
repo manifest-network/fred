@@ -1556,10 +1556,15 @@ the same final name. In the removal phase the final path's absence is not yet
 durable, so `Destroy` keeps answering `ErrVolumeDeleteHeld` and every caller
 keeps its own durable authority: the close stays pending, the reaping record
 stays, the operation intent stays, and proof listings keep the name. In the
-residual phase the final path is durably gone; `Destroy` answers success only
-after observing its absence, the caller settles, and admission counts the
+residual phase the final path is durably gone and admission counts the
 project's block hard limit (or its block usage, if larger) until the zero-usage
-proof, the clear and the stage removal finish. `Start` registers every
+proof, the clear and the stage removal finish. `Destroy` answers success after
+observing the final path's absence, and its caller settles only after the
+publication that follows every destroy has counted that footprint. Every reader
+that infers completion without a destroy of its own (proof listings, the
+lock-free precheck, the close-wait predicates) keeps treating the hold like the
+removal phase until a publication that counted it acknowledges it (make before
+break); a close that waited on it is then resumed. `Start` registers every
 authority it finds as a held deletion and serves. A recovered authority whose
 final path is already gone may have settled its caller in an earlier process;
 if `Start` cannot size it from its quota row, it is unsized: callers still see

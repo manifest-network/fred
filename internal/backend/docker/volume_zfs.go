@@ -478,6 +478,10 @@ func (z *zfsVolumeManager) PrecheckDestroy(managedVolumeName) (destroyPrecheckVe
 	return destroyPrecheckNeedsLock, nil
 }
 
+func (*zfsVolumeManager) AcknowledgeResidualAccounting([]residualAccountingToken) []managedVolumeName {
+	return nil
+}
+
 func (z *zfsVolumeManager) RetryHeldVolumeDelete(context.Context, string) error { return nil }
 
 // ZFS never stages a deletion, so it has none to defer.

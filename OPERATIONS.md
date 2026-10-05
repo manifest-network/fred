@@ -1097,13 +1097,15 @@ the removals of volume trees.
   insufficient resources (WARN `disk admission withheld`; diskless work and
   `/health` are unaffected), and `/stats` reports `disk_withheld`, so
   providerd routes new provisions to a sibling backend serving the same SKU
-  when there is one. The executor retries unsized holds first, on every
-  pass, until a quota read sizes them.
+  when there is one. The executor retries unsized holds on every pass, ahead
+  of the other holds but alternating with them, so they never starve a removal
+  whose close is pending, until a quota read sizes them.
 - `residual`: the volume directory is durably gone; only the delete stage and
   the project ID remain while the zero-usage proof, the limit clear and the stage
-  removal are retried. The caller settles. Until the hold completes, admission
-  counts the project's block hard limit, or its block usage if larger
-  (`fred_docker_backend_volume_delete_held_residual_mb`).
+  removal are retried. Until the hold completes, admission counts the
+  project's block hard limit, or its block usage if larger
+  (`fred_docker_backend_volume_delete_held_residual_mb`). The caller settles
+  once that count has been published.
 
 In every phase the name cannot be created again: a provision of the same lease
 that needs that volume fails with reason `VolumeDeletePending` until the hold
