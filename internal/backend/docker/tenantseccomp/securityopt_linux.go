@@ -33,11 +33,13 @@ func isSeccompOption(option string) bool {
 	return ok && key == seccompKey
 }
 
-// WithoutSeccomp returns a new slice holding, in order, every option that
-// does not name a seccomp profile. Captured container configuration passes
-// through it, so a replayed snapshot never carries a profile of its own.
+// WithoutSeccomp returns a new, non-nil slice holding, in order, every option
+// that does not name a seccomp profile. Captured container configuration
+// passes through it, so a replayed snapshot never carries a profile of its
+// own. Its capacity is exactly len(options): a caller's length is never
+// grown by arithmetic before the allocation.
 func WithoutSeccomp(options []string) []string {
-	kept := make([]string, 0, len(options)+1)
+	kept := make([]string, 0, len(options))
 	for _, option := range options {
 		if !isSeccompOption(option) {
 			kept = append(kept, option)

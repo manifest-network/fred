@@ -73,6 +73,7 @@ func TestFinalSecurityOptReplacesEverySeccompEntry(t *testing.T) {
 
 	require.Equal(t, []string{"no-new-privileges:true", "label=disable"}, WithoutSeccomp(callerOptions))
 	require.Empty(t, WithoutSeccomp(nil))
+	require.NotNil(t, WithoutSeccomp(nil), "a captured snapshot stores an empty list, never null")
 }
 
 func TestVerifyCreateRequest(t *testing.T) {
