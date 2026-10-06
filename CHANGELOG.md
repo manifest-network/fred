@@ -1172,7 +1172,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Clarify tenant-token scope, same-second retry constraints, endpoint-specific
   replay behavior, WebSocket session lifetime, and safe token handling. Align
-  the security, tenant, architecture, deployment, and package documentation,
+  the security, tenant, API, architecture, deployment, and package documentation,
   including replay persistence across restarts. Audience and operation binding
   remains a separate breaking protocol change after v0.14 (ENG-925, ENG-1213).
 - Health check `interval`, `timeout` and `start_period` are now bounded when a
