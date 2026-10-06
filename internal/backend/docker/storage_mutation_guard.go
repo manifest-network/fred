@@ -452,7 +452,16 @@ func (m *storageMutations) requireContainer(ctx context.Context, id string) erro
 	if m.cleanupOnly {
 		return nil
 	}
-	if info.Tenant == m.tenant && info.ProviderUUID == m.providerUUID &&
+	if source, ok := m.compensationSubject.SourceRelease(); ok {
+		// Compensation acts for the source release, whose containers can carry
+		// the labels v0.13 wrote, without a lifecycle route; replay recreates
+		// them from the frozen plan (ENG-1253). Compare through that release's
+		// authority class.
+		if authority, valid := runtimeIdentityForRelease(&source); valid &&
+			containerMatchesReleaseRuntimeIdentity(*info, authority) {
+			return nil
+		}
+	} else if info.Tenant == m.tenant && info.ProviderUUID == m.providerUUID &&
 		info.CallbackURL == m.callbackURL && info.LifecycleCallbackURL == m.lifecycleURL {
 		return nil
 	}

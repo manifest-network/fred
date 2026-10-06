@@ -37,7 +37,14 @@ func newWriterRetirementHarness(t *testing.T) *writerRetirementHarness {
 	t.Helper()
 	h := newMaintenanceRecoveryHarness(t)
 	h.appendTarget(true)
-	f := &writerRetirementHarness{h: h, docker: h.b.docker.(*mockDockerClient), sources: h.containersFor(h.source, 2, "running", "")}
+	return newWriterRetirementHarnessFor(t, h, h.containersFor(h.source, 2, "running", ""))
+}
+
+// newWriterRetirementHarnessFor runs the harness over a given source cohort of
+// a bound maintenance target.
+func newWriterRetirementHarnessFor(t *testing.T, h *maintenanceRecoveryHarness, sources []ContainerInfo) *writerRetirementHarness {
+	t.Helper()
+	f := &writerRetirementHarness{h: h, docker: h.b.docker.(*mockDockerClient), sources: sources}
 	root := t.TempDir()
 	h.b.cfg.VolumeDataPath = root
 	h.b.cfg.ContainerReadonlyRootfs = ptrBool(false)
