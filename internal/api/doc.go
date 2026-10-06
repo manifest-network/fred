@@ -19,16 +19,18 @@
 //   - The public key derives to the tenant address
 //   - The timestamp is at most 30 seconds in the past and at most 10 seconds
 //     in the future (clock-skew tolerance)
-//   - Replay protection (TokenTracker): required for connection, restart, and
-//     update — where a replayed token would re-leak sensitive data or re-run a
-//     mutating operation. Idempotent reads (status, provision, logs, releases,
-//     events) skip this check. The data upload endpoint skips it too and
+//   - Replay protection (TokenTracker): required for connection, restart,
+//     update, and restore — where a replayed token would re-leak sensitive data
+//     or re-run a mutating operation. Idempotent reads (status, provision, logs,
+//     releases, events) skip this check. The data upload endpoint skips it too and
 //     relies on its own idempotency (409 on a duplicate upload for the lease).
 //
 // The token tracker uses fail-closed semantics: if the database is unavailable,
 // requests are rejected with 503 Service Unavailable rather than proceeding
-// without replay protection. Since token lifetime is short (30 seconds), clients
-// can safely retry with a fresh token.
+// without replay protection. Retries need a fresh token; deterministic signing
+// with the same tenant, lease, and whole-second timestamp reproduces the same
+// token. Wait for a later Unix timestamp before minting a retry token. Restart
+// and update retries also retain the original command's Idempotency-Key.
 //
 // Backend callbacks use HMAC-SHA256 authentication. Production selects a
 // distinct per-backend key by the callback's HMAC-covered immutable storage
@@ -66,5 +68,6 @@
 //	POST /v1/leases/{lease_uuid}/data           - Upload deployment payload (authenticated)
 //	POST /v1/leases/{lease_uuid}/restart        - Restart a provisioned lease (authenticated)
 //	POST /v1/leases/{lease_uuid}/update         - Update a provisioned lease (authenticated)
+//	POST /v1/leases/{lease_uuid}/restore        - Restore retained data into a pending lease (authenticated)
 //	POST /callbacks/provision                   - Backend provisioning callback (HMAC auth)
 package api

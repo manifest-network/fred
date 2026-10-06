@@ -14,7 +14,7 @@ To exercise the API end-to-end you need:
 
 1. **A wallet with a secp256k1 key** registered on the Manifest chain (the standard Cosmos keyring is fine). The wallet's bech32 address (with the chain's configured prefix, typically `manifest1...`) is the **tenant address**.
 2. **An active or pending lease** on the chain that names a provider whose Fred you want to talk to. The lease has a UUID — that's the `lease_uuid`.
-3. **The provider's Fred URL**, e.g. `https://fred.example-provider.com:8080`.
+3. **The provider's Fred URL**, e.g. `https://fred.example-provider.com:8080`. Read the lease's `provider_uuid` from the intended chain, then query that provider's on-chain `Provider.api_url` through a trusted chain endpoint. Use that HTTPS URL with certificate verification enabled and preserve any path prefix when appending the routes below.
 
 If the lease was created with a `meta_hash` set, the chain expects you to upload a deployment manifest before provisioning starts (see [Step 3](#step-3-upload-the-deployment-manifest)).
 
@@ -50,17 +50,49 @@ For example: `manifest1abc...:550e8400-e29b-41d4-a716-446655440000:1735689600`
 
 This message is signed using **ADR-036** (Cosmos's standard for off-chain message signing), which wraps the message in a sign-doc structure before signing with secp256k1. The resulting signature is then **normalized to low-S** canonical form to prevent malleability — most secp256k1 libraries do this by default, but verify before going to production.
 
+### Token scope
+
+This token authenticates requests for the named lease; it does not distinguish
+reading status from requesting a restart or update. A token for a `PENDING`
+target also authorizes [restore](#restore--recover-a-soft-deleted-leases-data)
+from an eligible retained source belonging to the same tenant and provider,
+without a separate source token. Neither the operation nor its request body
+is signed. The token also does not bind the chain, provider, or intended API
+address. Fred authorizes requests separately, but a wallet's selected chain
+does not make the token specific to that environment.
+
+Send the token only to the intended trusted HTTPS provider API and keep it
+out of logs. Use dedicated test wallets and leases in non-production
+environments. The payload-upload token in Step 3 uses a separate signed
+message that also binds the payload hash for `POST /data` only. Approving a
+third-party wallet integration's request to sign the regular message hands
+it lease access, even if it describes the request as a read or identity check.
+See
+[SECURITY.md § Token scope and deployment boundaries](../SECURITY.md#token-scope-and-deployment-boundaries)
+for the current guarantees and limitations. These formats remain unchanged
+for v0.14; stronger binding requires a coordinated future protocol upgrade.
+
 ### Validity window
 
 | Constraint | Limit |
 |---|---|
 | Maximum age | 30 seconds |
 | Maximum future skew | 10 seconds |
-| Replay (mutating endpoints + `/connection`) | One-time use |
 
-`/connection` is included because it returns sensitive endpoint details; the other read endpoints (`/status`, `/provision`, `/logs`, `/releases`, `/events`) are idempotent and skip the replay check. See [SECURITY.md § Token Replay (Tenant API)](../SECURITY.md#token-replay-tenant-api) for the full table.
+Tokens expire at their signed timestamp plus 30 seconds. A timestamp up to
+10 seconds ahead is accepted, so a future-dated token can remain valid for up
+to 40 seconds after first acceptance. Replay behavior depends on the endpoint;
+see the canonical [Token Replay table](../SECURITY.md#token-replay-tenant-api).
+Endpoints without replay checks can reuse an unexpired token. Replay-protected
+endpoints require a fresh token for every HTTP attempt.
 
-Tokens are short-lived. Generate a fresh one for each request, or batch requests within a 30-second window.
+The CLI uses whole Unix seconds, and deterministic signing produces the same
+token for the same tenant, lease, and timestamp. After a replay-protected
+attempt, wait until the current Unix timestamp is later than the previous
+token's timestamp before minting another token for that tenant and lease.
+Calling the mint function again in the same second is not enough. The
+`fresh_token` placeholder used below must account for this retry constraint.
+Payload uploads use their separate token format and idempotency guard.
 
 ### Mint a token with the `lease-token` CLI
 
@@ -150,7 +182,10 @@ The token JSON envelope adds a `meta_hash` field:
 
 Reference: `internal/testutil/fixtures.go::CreateTestPayloadToken`.
 
-This binding prevents a stolen access token from being used to upload a different manifest.
+For `POST /data`, an ordinary access token is rejected, and the payload token's
+hash binding prevents substituting a different manifest. This protection does
+not apply to `POST /update`, which accepts a replacement manifest with an
+ordinary token, subject to ownership, lease-state, and manifest validation.
 
 ### Send the manifest
 
@@ -205,9 +240,21 @@ done
 ### WebSocket events stream
 
 ```bash
-# Connect with the token in the query string (WebSocket can't set custom headers)
-wscat -c "wss://fred.example-provider.com:8080/v1/leases/$LEASE_UUID/events?token=$TOKEN"
+# Use the Authorization header with clients that support it, such as wscat.
+wscat -H "Authorization: Bearer $TOKEN" \
+  -c "wss://fred.example-provider.com:8080/v1/leases/$LEASE_UUID/events"
 ```
+
+Browser WebSocket clients cannot set this header and may use `?token=` as a
+fallback. Proxies can log the original URL before Fred strips the token, so
+configure query-token redaction or suppress query strings in access logs and
+traces before using that fallback. Keep authorization headers out of logs too.
+
+Token expiry does not close an established stream. Authentication happens at
+the handshake; clients must reconnect with a valid token when the connection's
+separate lifetime limit is reached. See
+[WebSocket authentication and lifetime](../SECURITY.md#websocket-authentication-and-lifetime)
+for the limits and subscription-slot implications.
 
 Each frame is JSON:
 
@@ -231,7 +278,7 @@ curl -H "Authorization: Bearer $(fresh_token)" \
 
 The response contains the host (or FQDN if ingress is configured), per-port host bindings, and any backend-specific metadata. Multi-instance leases include an `instances` array; stack leases include a `services` map. See the [API reference](../README.md#get-lease-connection) for full shape.
 
-> **Replay protection**: `/connection` returns sensitive endpoint details, so it does enforce one-time-use replay protection. Each call needs a fresh token.
+> **Replay protection**: `/connection` returns sensitive endpoint details, so it does enforce one-time-use replay protection. Each call needs a fresh token; see the [same-second retry constraint](#validity-window).
 
 ---
 
@@ -382,6 +429,9 @@ Before creating a restore target, query [`GET /v1/leases/{uuid}/status`](#step-2
 
 `POST /v1/leases/{lease_uuid}/restore` adopts the retained data into a fresh `PENDING` lease belonging to the same tenant and provider. Request body: `{"from_lease_uuid": "<source lease UUID>"}`. The target must match the source's service names and quantities, though its SKU (disk tier) may differ. The call uses a fresh ADR-036 bearer token for the target lease and is replay-protected. Restore runs on the backend that holds the source data.
 
+The source must be `CLOSED` or `EXPIRED` with eligible retained data. Its UUID
+is selected by the unsigned request body; it needs no token of its own.
+
 ```bash
 # $LEASE_UUID is the NEW, freshly PENDING lease (also the token's -lease-uuid).
 # from_lease_uuid is the original (now retained) lease whose data you want back.
@@ -406,7 +456,8 @@ A missing or unfamiliar `reason` does not justify automatically cancelling the
 target. Keep its UUID and check its status before taking another action.
 
 All three mutations require a fresh bearer token for every HTTP attempt (hence
-`$(fresh_token)` rather than a stored `$TOKEN` variable). Restart and update
+`$(fresh_token)` rather than a stored `$TOKEN` variable), with a later timestamp
+as explained in [Validity window](#validity-window). Restart and update
 also require exactly one canonical UUIDv4 `Idempotency-Key`: create it once for
 one logical command and reuse that same value for every retry. A new logical
 restart/update needs a new UUID. Reusing one UUID for a different kind or
@@ -430,6 +481,10 @@ curl -H "Authorization: Bearer $(fresh_token)" \
 | Per-tenant | 5 RPS, burst 10 |
 
 The per-IP layer is a single bucket shared across **all** routes, so your [restore](#restore--recover-a-soft-deleted-leases-data), update, restart, and `/data` upload calls from the same IP draw from one budget — pace bursts of one operation so they don't `429` the others. Rate-limited responses include a `Retry-After` header (seconds). Tokens are validated cryptographically **before** the per-tenant bucket is consumed, so attackers cannot burn your quota with forged tokens.
+
+A captured, unexpired token can still consume the tenant-wide budget, even
+after a replay-protected request has used it. See
+[SECURITY.md § Per-Tenant](../SECURITY.md#per-tenant) for the scope of this limit.
 
 ---
 

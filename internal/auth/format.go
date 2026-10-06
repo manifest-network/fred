@@ -8,8 +8,9 @@
 //     "manifest lease data {lease_uuid} {meta_hash_hex} {unix_timestamp}"
 //
 // The payload variant binds the token to a specific deployment payload via
-// meta_hash, preventing a stolen access token from being used to upload a
-// different payload to the same lease.
+// meta_hash for POST /data. Ordinary access tokens cannot authenticate that
+// endpoint, but they can authorize POST /update with an unsigned replacement
+// payload, subject to the endpoint's other authorization and validation checks.
 //
 // Both formats are then signed using ADR-036 (see internal/adr036) and
 // wrapped in a base64-encoded JSON envelope; see internal/api/auth.go and

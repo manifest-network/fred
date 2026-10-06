@@ -32,9 +32,68 @@ Tenants authenticate to Fred's API using signed bearer tokens. Each token is a b
 4. Verify ADR-036 secp256k1 signature over the signed message
 5. Derive bech32 address from public key, confirm it matches the `tenant` field
 6. Normalize signature to low-S canonical form (prevents malleability)
-7. Query chain to verify the lease exists, belongs to this tenant, and is served by this provider
+7. Query chain to verify the lease exists, belongs to this tenant, and is served by this provider, with the retained-read exception described below
 
 **Implementation:** `internal/api/auth.go`, `internal/adr036/adr036.go`
+
+#### Token scope and deployment boundaries
+
+The regular token authenticates requests for the named lease. Its signed
+message does not include the chain ID, provider UUID, API address (audience),
+HTTP method, operation, or request body. The payload-upload format is
+separate and binds `meta_hash`, but also omits the chain, provider, and API
+audience. ADR-036's outer sign document has an empty `chain_id`; selecting a
+chain in a wallet does not add that chain ID to Fred's signed message.
+
+Chain-backed authorization checks tenant/provider ownership and lease-state
+requirements. These checks do not establish which API address or operation
+the signer intended. For example, a regular token used for `GET /status` can
+authenticate `POST /update` for the same lease while it is fresh and
+unconsumed by the replay tracker, subject to the update endpoint's other
+requirements. The replacement manifest is not bound to that token's signature;
+the payload-hash binding applies only to `POST /data`. A token minted for a
+read request must therefore be protected like a credential that can also
+authorize mutations. See
+[Token Replay](#token-replay-tenant-api) for the endpoints that consume tokens.
+
+For `POST /restore`, the token names the `PENDING` target lease, while the
+unsigned request body selects a retained source lease. No separate source
+token is required: the source must belong to the same tenant and provider,
+be `CLOSED` or `EXPIRED`, and satisfy the restore eligibility checks. Access
+to the target can therefore authorize moving another eligible lease's
+retained data into it.
+
+**Retained-read exception:** If the chain reports a lease as not found,
+`GET /status` and `GET /provision` may serve metadata from a backend record
+whose status is `retained` and whose nonempty tenant matches the caller.
+This fallback does not compare the record's `ProviderUUID` to Fred's
+configured provider. It relies on the configured backend's retained
+metadata; it does not grant mutation or restore authority. A reset, lagging,
+or wrong chain endpoint can expose this exception. Other chain errors do
+not enable the fallback. Adding the provider comparison is tracked in
+[ENG-1231](https://linear.app/liftedinit/issue/ENG-1231).
+
+Different deployments have separate replay databases. If another deployment
+accepts the same tenant/lease identity and its provider-ownership checks also
+pass, such as after cloning chain state and provider identity, a captured
+token can be accepted there before expiry. This requires a valid token and
+matching authorization state; missing audience binding does not itself
+bypass the endpoint's authorization checks.
+
+Clients must send tokens only to the intended trusted HTTPS API, keep them
+out of logs and diagnostics, and use dedicated test wallets and leases in
+non-production environments. Resolve that API from the on-chain
+`Provider.api_url` for the provider named by the lease, using a trusted chain
+endpoint for the intended network. Preserve any URL path prefix and verify
+TLS certificates. Treat a service receiving a regular token as receiving
+lease access, even if the immediate request only reads status. The regular
+message has no purpose tag: approving a third-party wallet integration's
+request to sign `{tenant}:{lease_uuid}:{timestamp}` hands it that access.
+
+The v0.14 release retains these signed-message formats. Versioned audience
+and operation binding is a separate post-v0.14 protocol change requiring
+coordinated updates to Fred and its token-minting clients, tracked in
+[ENG-1213](https://linear.app/liftedinit/issue/ENG-1213).
 
 ### Callback Authentication (HMAC-SHA256)
 
@@ -136,6 +195,14 @@ signed validity: validation and consumption both reject at or after signed
 expiry. A normal restart retains consumed tokens; losing the cache can reopen
 replay until those tokens expire.
 
+**Fresh tokens and retries:** The CLI uses whole Unix seconds, and deterministic
+signers produce the same signature for the same tenant, lease, and timestamp.
+Re-minting in the same second does not make a consumed token usable again.
+After a replay-protected attempt, wait until the current Unix timestamp is
+later than the previous token's timestamp before minting another token for
+that tenant and lease. This retry limitation is tracked in
+[ENG-733](https://linear.app/liftedinit/issue/ENG-733).
+
 **Which endpoints check replay:**
 
 | Endpoint | Replay | Rationale |
@@ -160,6 +227,23 @@ already-admitted container replacement; divergent reuse is rejected.
 **Configuration:** Requires `token_tracker_db_path`. Mandatory when `production_mode: true`. When not configured (non-production), replay protection is disabled entirely — tokens can be replayed until signed timestamp + 30 seconds, including the accepted future-clock-skew window. This is acceptable for development but **must not be used in production**.
 
 **Implementation:** `internal/api/token_tracker.go`
+
+#### WebSocket authentication and lifetime
+
+`GET /events` authenticates only at the opening handshake and does not consume
+the token. An accepted connection is not re-authenticated when its token
+expires; its separate maximum lifetime defaults to one hour. Fred then closes
+it with code `1013`, and the client must reconnect with a valid token. The
+default subscription limits are 10 per lease and 1,000 globally. A captured,
+unexpired token can open multiple subscriptions and occupy the lease's
+available slots until those connections close or reach their lifetime limit.
+
+Use the `Authorization` header when the client supports it. The `?token=`
+fallback is for browser WebSocket clients that cannot set this header.
+Reverse proxies and other upstream infrastructure see the original URL before
+Fred's `WSTokenPromoter` removes the query token. Deployments using the fallback
+must redact that parameter or suppress query strings in access logs and
+traces; never log the authorization header either.
 
 ### Callback Replay (Backend -> Fred)
 
@@ -464,6 +548,12 @@ Separate token bucket per tenant, applied after token extraction.
 
 **Design note:** Tokens are cryptographically validated (signature + timestamp + address) in the rate-limit middleware **before** consuming from the tenant's bucket. This prevents attackers from burning a victim's quota with forged tokens. The validated token is stored in request context so downstream handlers skip redundant ECDSA verification.
 
+Bucket consumption precedes replay, lease-UUID matching, and lease-ownership
+checks. A captured token can therefore consume the tenant's shared budget
+until signed expiry even after replay protection has consumed it, throttling
+requests for all of that tenant's leases. See
+[Token Replay](#token-replay-tenant-api) for the validity window.
+
 ### Response Headers
 
 Rate-limited responses include `Retry-After` with a conservative per-token refill
@@ -611,7 +701,7 @@ enforcement errors. See [DEPLOYMENT.md](DEPLOYMENT.md) for the systemd
 | `backends[].hmac_secret_previous` (providerd) / a backend's `callback_secret_next` | 32 bytes; verify-only, never signs. By HMAC equivalence, providerd checks `hmac_secret_previous` against every key it holds; a backend checks `callback_secret_next` only against its own `callback_secret`, so never reuse another backend's key | Yes (`hmac.Equal`, both keys always computed) | Never; non-secret key IDs only on request (`-print-hmac-key-ids`) |
 | Callback `operation_id` / `lifecycle_id` capability | Canonical random UUIDv4 | Exact typed comparison after HMAC authentication | Never; only a domain-separated fingerprint |
 | Payload `meta_hash` | 64 hex chars | Yes (`subtle.ConstantTimeCompare`) | Never |
-| ADR-036 signatures | N/A | secp256k1 library verify | Signature logged in debug (public data) |
+| ADR-036 signatures | N/A | secp256k1 library verify | Never in Fred's application logs; treat as bearer credentials |
 
 **Secret rotation:** Each backend key can rotate without a coordinated stop.
 During the rotation each side accepts one extra verify-only key (providerd's

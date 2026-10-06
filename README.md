@@ -2125,7 +2125,7 @@ such case keeps the state and increments
 ## Security
 
 - **Tenant Authentication**: ADR-036 secp256k1 signatures with 30-second token expiry and low-S normalization
-- **Replay Protection**: Persistent token tracking (bbolt) with fail-closed semantics on mutating endpoints
+- **Replay Protection**: Persistent token tracking (bbolt) with fail-closed semantics on [selected tenant endpoints](SECURITY.md#token-replay-tenant-api), including the `/connection` read; `/data` uploads use a separate idempotency guard
 - **Callback Authentication**: Per-backend HMAC-SHA256 keys; timestamps bound same-endpoint replay to a 5-minute window, while method/URI binding prevents cross-endpoint replay
 - **Rate Limiting**: Tenant routes use a shared per-IP bucket (10 RPS) and a per-tenant bucket (5 RPS). Callbacks have independent pre-authentication ingress and authenticated storage-lineage budgets, so tenant traffic cannot consume callback capacity. Behind a proxy, set `trusted_proxies` so ingress keys on the real client IP
 - **Container Hardening**: Drop all capabilities, no-new-privileges, read-only rootfs, PID limits, network isolation

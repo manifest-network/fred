@@ -691,8 +691,9 @@ func callbackTimeoutMiddleware(timeout time.Duration) func(http.Handler) http.Ha
 }
 
 // WSTokenPromoter is middleware that promotes a WebSocket "token" query
-// parameter to the Authorization header and strips it from the URL so it
-// does not leak into proxy access logs.
+// parameter to the Authorization header and strips it from r.URL. Upstream
+// proxies have already seen the original URL, and r.RequestURI is unchanged;
+// deployments must redact query tokens in access logs and traces separately.
 func WSTokenPromoter(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if token := r.URL.Query().Get("token"); token != "" {
