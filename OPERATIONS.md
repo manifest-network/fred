@@ -2532,9 +2532,10 @@ including its resource limits and callback route. It does not pull a mutable tag
 or undo application/database writes made by the failed replacement. An already
 activated target release cannot be compensated.
 
-**To diagnose a failed update:**
+**To diagnose a failed restart or update:**
 1. `GET /v1/leases/{uuid}/releases` — the failed release has `status: "failed"` and curated `reason` and `message` fields.
 2. `GET /v1/leases/{uuid}/logs` — the diagnostics store retains the failed attempt's captured logs for the configured retention (7 days by default), including under `failed/<service>/<instance>` keys alongside live logs when the restored source is Ready. An unavailable diagnostics store delays failed-target removal and terminal failure publication.
+3. A restart or update that failed while the docker-backend ran it logs `maintenance failed (verbose detail retained operator-side)` at WARN, with the cause in `detail` and `lease_uuid`, `maintenance_id`, `operation` and `reason`. One interrupted by a backend restart and settled by recovery logs no such line. The attempt's diagnostic in `diagnostics.db` keeps the first cause observed for it in `error`. For a failure before any container is touched, such as capturing the source, that is the logged cause, and no logs were captured.
 
 **Phase timing:** `fred_docker_backend_replace_phase_duration_seconds{operation,phase}`
 now charges root materialization, reservation waits, writer drain/stop and bind

@@ -1071,10 +1071,9 @@ func validateMaintenanceGenerationContainer(
 	if !ok {
 		return errors.New("maintenance target release has no runtime authority")
 	}
-	if container.Tenant != authority.Tenant() ||
-		container.ProviderUUID != authority.ProviderUUID() ||
-		container.CallbackURL != authority.CallbackURL() ||
-		container.LifecycleCallbackURL != authority.LifecycleCallbackURL() {
+	// The release's authority class decides the comparison: a container v0.13
+	// created for a legacy release has no lifecycle label (ENG-1253).
+	if !containerMatchesReleaseRuntimeIdentity(container, authority) {
 		return &maintenanceObservationDeferred{cause: fmt.Errorf("container %q diverges from target runtime authority", container.ContainerID)}
 	}
 	stack, err := manifest.ParseStoredPayload(target.Manifest)

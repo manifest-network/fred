@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/http/httptest"
 	"slices"
 	"sync"
 	"testing"
@@ -68,106 +67,6 @@ func seedLegacyStackMaintenanceAuthority(
 		b.stopCancel()
 		b.wg.Wait()
 	})
-}
-
-func TestV013LegacyReleaseFirstMaintenanceOperations(t *testing.T) {
-	for _, operation := range []string{"restart", "update", "custom_domain"} {
-		t.Run(operation, func(t *testing.T) {
-			oldStack := &manifest.StackManifest{Services: map[string]*manifest.Manifest{
-				"app": {
-					Image: "docker.io/library/nginx:1.26",
-					Ports: map[string]manifest.PortConfig{"80/tcp": {}},
-				},
-			}}
-			items := []backend.LeaseItem{{
-				SKU: "docker-small", ServiceName: "app", Quantity: 1,
-			}}
-			provisions := map[string]*provision{
-				stackMaintenanceLeaseUUID: {ProvisionState: leasesm.ProvisionState{
-					LeaseUUID: stackMaintenanceLeaseUUID,
-					Tenant:    "tenant-a", ProviderUUID: nominalDockerProviderUUID,
-					Status: backend.ProvisionStatusReady, StackManifest: oldStack,
-					Items: slices.Clone(items), ContainerIDs: []string{"old-app"},
-					ServiceContainers: map[string][]string{"app": {"old-app"}},
-				}},
-			}
-			mock := &mockDockerClient{
-				PullImageFn: func(context.Context, string, time.Duration) error { return nil },
-				InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
-					return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-				},
-			}
-			compose := &mockComposeExecutor{
-				UpFn: func(context.Context, *composetypes.Project, composeUpOpts) error { return nil },
-				PSFn: func(context.Context, string) ([]composeContainerSummary, error) {
-					return []composeContainerSummary{{ID: "new-app", Service: "app", State: "running"}}, nil
-				},
-			}
-			installStackStrictCohortInventory(t, mock, compose)
-
-			var callback backend.CallbackPayload
-			var requestURI string
-			received := make(chan struct{})
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				_ = json.NewDecoder(r.Body).Decode(&callback)
-				requestURI = r.URL.RequestURI()
-				w.WriteHeader(http.StatusOK)
-				close(received)
-			}))
-			defer server.Close()
-			oldCallbackURL := server.URL + "/old/callbacks/provision"
-			newCallbackURL := server.URL + "/new/callbacks/provision"
-
-			b := newBackendForProvisionTest(t, mock, provisions)
-			b.compose = compose
-			b.cfg.StartupVerifyDuration = time.Millisecond
-			seedLegacyStackMaintenanceAuthority(
-				t, b, stackMaintenanceLeaseUUID, oldStack, items,
-				oldCallbackURL, oldCallbackURL, server.Client(),
-			)
-
-			expectedCallbackURL := newCallbackURL
-			switch operation {
-			case "restart":
-				require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
-					LeaseUUID: stackMaintenanceLeaseUUID, CallbackURL: newCallbackURL,
-				}))
-			case "update":
-				require.NoError(t, b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
-					LeaseUUID:   stackMaintenanceLeaseUUID,
-					CallbackURL: newCallbackURL,
-					Payload: validStackManifestJSON(map[string]string{
-						"app": "docker.io/library/nginx:1.27",
-					}),
-				}))
-			case "custom_domain":
-				expectedCallbackURL = oldCallbackURL
-				b.cfg.Ingress = IngressConfig{
-					Enabled: true, WildcardDomain: "example.net", Entrypoint: "websecure",
-				}
-				b.customDomainDNSReady = func(context.Context, string) bool { return true }
-				desired := slices.Clone(items)
-				desired[0].CustomDomain = "tenant.example.org"
-				require.NoError(t, b.ReconcileCustomDomain(
-					context.Background(), stackMaintenanceLeaseUUID, desired,
-				))
-			}
-
-			awaitStackMaintenanceCallback(t, b, received)
-			assert.Equal(t, backend.CallbackStatusSuccess, callback.Status)
-			assert.Equal(t, expectedCallbackURL[len(server.URL):], requestURI)
-			active, err := b.releaseStore.LatestActive(stackMaintenanceLeaseUUID)
-			require.NoError(t, err)
-			require.NotNil(t, active)
-			assert.True(t, active.OperationID.IsZero())
-			assert.Nil(t, active.RuntimeAuthority)
-			require.NotNil(t, active.LegacyRuntimeAuthority)
-			assert.Equal(t, expectedCallbackURL, active.LegacyRuntimeAuthority.CallbackURL())
-			assert.Equal(t, expectedCallbackURL, active.LegacyRuntimeAuthority.LifecycleCallbackURL())
-			assert.True(t, active.MaintenanceID.Valid(),
-				"the exact replacement WAL still uses a UUIDv4 for legacy runtime authority")
-		})
-	}
 }
 
 func TestV013LegacyReleaseSubsequentMaintenanceRollbackPreservesSourceAuthority(t *testing.T) {

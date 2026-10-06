@@ -939,6 +939,7 @@ func (b *Backend) executeMaintenancePhysicalOutcome(
 		if err != nil {
 			return mustMaintenanceAmbiguous(err, intent)
 		}
+		b.recordMaintenanceFailureCause(failed, intent.Kind(), reason, callbackErr, cause)
 		result, err := leasesm.NewMaintenanceReplaceFailure(cause,
 			leasesm.ReplaceFailureDetails{Reason: reason,
 				CallbackErr: callbackErr, LastError: cause.Error()}, failed)
@@ -954,6 +955,31 @@ func (b *Backend) executeMaintenancePhysicalOutcome(
 		return mustMaintenanceAmbiguous(outcome.Cause(), intent)
 	default:
 		return mustMaintenanceAmbiguous(fmt.Errorf("unknown maintenance outcome %T", outcome), intent)
+	}
+}
+
+// recordMaintenanceFailureCause keeps the operator's account of a failed
+// restart or update, whose tenant surface is only the curated reason
+// (ENG-508). The cause goes to a log line correlated by lease and maintenance
+// ID, and to the attempt's diagnostic record before its callback publishes
+// that record. A failure before any substrate effect, such as source capture,
+// has no other operator-visible record (ENG-1253); an attempt's first observed
+// cause wins, so a cause the substrate already captured is kept.
+func (b *Backend) recordMaintenanceFailureCause(
+	failed shared.MaintenanceReleaseFailure,
+	kind shared.MaintenanceIntentKind,
+	reason backend.Reason,
+	message string,
+	cause error,
+) {
+	b.logger.Warn("maintenance failed (verbose detail retained operator-side)",
+		"lease_uuid", failed.LeaseUUID(), "maintenance_id", failed.MaintenanceID(),
+		"operation", kind, "reason", reason, "detail", cause)
+	if _, err := b.failureDiagnostics.MaintenanceFailureContext(b.stopCtx, failed, shared.FailureDiagnosticObservation{
+		Error: cause.Error(), Reason: reason, Message: message, Status: shared.DiagnosticCaptureUnavailable,
+	}); err != nil {
+		b.logger.Warn("failed to record maintenance failure diagnostic",
+			"lease_uuid", failed.LeaseUUID(), "maintenance_id", failed.MaintenanceID(), "error", err)
 	}
 }
 

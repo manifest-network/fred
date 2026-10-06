@@ -222,13 +222,15 @@ func decodeCompensationSourcePlan(subject shared.MaintenancePhysicalSubject, enc
 			return plan, errors.New("source execution snapshot has unexpected or duplicate instance")
 		}
 		delete(expected, identity)
-		authority, ok := runtimeIdentityForRelease(&source)
-		if !ok || labels[LabelLeaseUUID] != subject.LeaseUUID() || labels[LabelTenant] != authority.Tenant() || labels[LabelProviderUUID] != authority.ProviderUUID() || labels[LabelBackendName] != subject.Intent().Backend() || labels[LabelCallbackURL] != authority.CallbackURL() || labels[LabelLifecycleCallbackURL] != authority.LifecycleCallbackURL() || labels[LabelMaintenanceID] != source.MaintenanceID.String() {
-			return plan, errors.New("source execution snapshot has divergent runtime authority")
+		maintenanceID, err := parseContainerMaintenanceID(labels[LabelMaintenanceID])
+		if err != nil {
+			return plan, fmt.Errorf("source execution snapshot has an invalid maintenance generation: %w", err)
 		}
+		// Replay recreates these labels, so they pass the same check as a live
+		// source container.
 		if err := validateMaintenanceGenerationContainer(subject.LeaseUUID(), source.MaintenanceID, subject.Intent().Backend(), source, ContainerInfo{
 			ContainerID: snapshot.Name, LeaseUUID: labels[LabelLeaseUUID], BackendName: labels[LabelBackendName],
-			MaintenanceID: source.MaintenanceID, Tenant: labels[LabelTenant], ProviderUUID: labels[LabelProviderUUID],
+			MaintenanceID: maintenanceID, Tenant: labels[LabelTenant], ProviderUUID: labels[LabelProviderUUID],
 			CallbackURL: labels[LabelCallbackURL], LifecycleCallbackURL: labels[LabelLifecycleCallbackURL],
 			ServiceName: labels[LabelServiceName], SKU: labels[LabelSKU], InstanceIndex: meta.InstanceIndex,
 			CustomDomain: labels[LabelCustomDomain], Image: labels[LabelImageReference],

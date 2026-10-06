@@ -1170,6 +1170,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A lease adopted from v0.13 can be restarted, updated and given a custom
+  domain. Its first restart or update failed about a second after it was
+  accepted, with `RestartFailed` or `UpdateFailed`, and left the lease on its
+  old containers. Before touching them, the docker-backend compared their
+  callback labels with the lease's upgraded authority, which derives a
+  lifecycle route that v0.13 never labeled. Capturing those containers before
+  a replacement, retiring them as volume writers and restoring them after a
+  failed replacement now compare them by the authority's class, as recovery
+  already did. A lease re-provisioned since the upgrade was not affected.
+  A restart or update that fails while the docker-backend runs it now also
+  logs `maintenance failed (verbose detail retained operator-side)` at WARN,
+  with `lease_uuid`, `maintenance_id` and the cause in `detail`. A failure
+  before any container is touched now keeps that cause in the attempt's
+  failure diagnostic too, where later failures already kept theirs; tenants
+  still see only the curated reason. (ENG-1253)
 - Clarify tenant-token scope, same-second retry constraints, endpoint-specific
   replay behavior, WebSocket session lifetime, and safe token handling. Align
   the security, tenant, API, architecture, deployment, and package documentation,
