@@ -168,7 +168,7 @@ need to correlate one operation across components.
 
 ### Backend Authentication (HMAC-SHA256)
 
-Fred authenticates requests to backends using the same HMAC-SHA256 scheme. The docker-backend verifies these signatures via auth middleware on all contract endpoints: `POST /provision`, `POST /deprovision`, `POST /restart`, `POST /update`, `POST /restore`, `POST /reconcile_custom_domain`, `GET /info/{lease_uuid}`, `GET /logs/{lease_uuid}`, `GET /provisions`, `GET /provisions/{lease_uuid}`, `GET /retentions`, `GET /releases/{lease_uuid}`. The monitoring endpoints `GET /health`, `GET /stats`, and `GET /metrics` are unauthenticated.
+Fred authenticates requests to backends using the same HMAC-SHA256 scheme. The docker-backend verifies these signatures via auth middleware on all contract endpoints: the storage-identity-bound mutation routes `POST /_fred/storage/{storage-id}/{provision|deprovision|restart|update|restore|reconcile_custom_domain}`, which are the only mutation paths providerd calls; their unbound v0.13 compatibility forms (`POST /provision` and so on); and `GET /info/{lease_uuid}`, `GET /logs/{lease_uuid}`, `GET /provisions`, `GET /provisions/{lease_uuid}`, `GET /retentions`, `GET /releases/{lease_uuid}`. The monitoring endpoints `GET /health`, `GET /stats`, and `GET /metrics` are unauthenticated: providerd signs its `/health` and `/stats` requests, but the backend does not verify them.
 
 **Implementation:** `cmd/docker-backend/main.go` (auth middleware), `internal/hmacauth/`
 
@@ -333,10 +333,10 @@ restore it only while `providerd` is stopped.
 
 Fred durably pins every configured backend name to one canonical UUIDv4 storage
 identity. Identity-bearing inventory responses must agree on that UUID across
-all pages and both `/provisions` and `/retentions`. Once pinned, reads include
-the HMAC-covered `backend_storage_id` query, and all side effects use only
-`/_fred/storage/{uuid}/...`; upgraded backends validate that path before body
-decode or mutation. The client never follows redirects. A trusted proxy must
+all pages and both `/provisions` and `/retentions`. Once pinned, every request
+includes the HMAC-covered `backend_storage_id` query, and all side effects use
+only `/_fred/storage/{uuid}/...`; upgraded backends validate that path before
+body decode or mutation. The client never follows redirects. A trusted proxy must
 not internally rewrite that upgraded-only namespace onto a legacy mutating
 route, because an internal rewrite is not an HTTP redirect Fred can reject.
 
@@ -583,7 +583,7 @@ configuration guard—it refuses a future `true` value for the skip flag—but i
 does not create verification on another process's behalf. Providerd production
 mode likewise cannot substitute for enabling the backend process's guard.
 
-**Server side (docker-backend YAML, `internal/backend/docker/config.go:65-81`):**
+**Server side (docker-backend YAML, `internal/backend/docker/config.go:68-84`):**
 
 | Field | Effect |
 |-------|--------|
@@ -591,9 +591,9 @@ mode likewise cannot substitute for enabling the backend process's guard.
 | `tls_client_ca_file` | Require and verify a client certificate signed by this CA (mutual TLS); requires the cert/key pair above |
 | `tls_client_allowed_names` | Pin the client's identity (see below); requires `tls_client_ca_file` |
 
-Wired via `tlsconfig.ServerConfig` (`cmd/docker-backend/main.go:108-115`).
+Wired via `tlsconfig.ServerConfig` (`cmd/docker-backend/main.go:197-203`).
 
-**Client side (providerd `backends[]`, `internal/config/config.go:144-147`):**
+**Client side (providerd `backends[]`, `internal/config/config.go:193-196`):**
 
 | Field | Effect |
 |-------|--------|
@@ -601,7 +601,7 @@ Wired via `tlsconfig.ServerConfig` (`cmd/docker-backend/main.go:108-115`).
 | `tls_client_cert_file`, `tls_client_key_file` | Client cert/key presented for mutual TLS (both or neither) |
 | `tls_skip_verify` | Disable server cert verification (dev only; blocked in production mode) |
 
-Wired via `tlsconfig.ClientConfig` (`cmd/providerd/main.go:263`).
+Wired via `tlsconfig.ClientConfig` (`internal/backend/connection_policy.go:71`).
 
 **Client-identity pinning.** `tls.Config.RequireAndVerifyClientCert` only proves the client's certificate chains to the configured CA — it does not check *who* the client is. Without `tls_client_allowed_names`, any certificate signed by the configured client CA is accepted. When `tls_client_allowed_names` is set, the verified client leaf's CommonName or one of its DNS SANs must appear in the list. The check is implemented as a `tls.Config.VerifyConnection` callback, **not** `VerifyPeerCertificate` — a `VerifyPeerCertificate` callback is skipped on resumed TLS sessions, so using it would let a previously-authenticated client resume a session and bypass the name pin. `VerifyConnection` runs on every handshake, including resumptions, closing that bypass (`internal/tlsconfig/tlsconfig.go:24-27,47-49,84-113`).
 
@@ -663,6 +663,7 @@ Every container created by the Docker backend runs with these security measures:
 |---------|---------------|-------|
 | Drop all capabilities | `CapDrop: ["ALL"]` | No Linux capabilities granted |
 | No new privileges | `SecurityOpt: ["no-new-privileges:true"]` | Prevents escalation via setuid/setgid |
+| Seccomp profile | `SecurityOpt` entry `seccomp=<profile JSON>` (`internal/backend/docker/tenantseccomp`) | Docker's default profile (`github.com/moby/profiles/seccomp` v0.2.3) with the `FS_IOC_SETFLAGS` and `FS_IOC_FSSETXATTR` ioctls and the `file_setattr`/`file_getattr` syscalls denied (`EPERM`), so a tenant cannot change its files' inode attributes, such as the XFS project ID that charges them to a quota. A launch is refused when the profile cannot be applied |
 | Read-only root filesystem | `ReadonlyRootfs: true` | Configurable via `container_readonly_rootfs` |
 | Tmpfs for writable paths | `/tmp` and `/run` mounted as tmpfs | Size from `container_tmpfs_size_mb` (default 64MB) |
 | PID limit | `PidsLimit: 256` | Configurable via `container_pids_limit` |
@@ -690,7 +691,7 @@ enforcement errors. See [DEPLOYMENT.md](DEPLOYMENT.md) for the systemd
 
 - **Client responses:** Generic error messages (`"internal server error"`) for 500-class errors. Validation errors (400) include specific messages since these describe client input problems.
 - **Server-side logging:** Full error details logged via `slog` including stack context, lease UUIDs, and backend names.
-- **Error truncation:** Callback error messages (on-chain rejection reasons) are truncated to 256 characters. `LastError` in provision diagnostics retains the full untruncated error for authenticated API access.
+- **Error truncation:** On-chain rejection reasons, including a backend callback's `error` text, are truncated to 256 bytes at a UTF-8 boundary. Tenant-facing provision diagnostics carry only the backend's curated `reason` and `message`; the verbose error stays on the backend (the Docker backend keeps it in its diagnostics store).
 - **Auth errors:** Generic `"unauthorized"` message — does not distinguish between missing token, invalid signature, or expired token.
 
 ## Secrets Management
@@ -723,12 +724,13 @@ When `production_mode: true`, Fred enforces security requirements at startup:
 | Every backend has a distinct `backends[].hmac_secret`; top-level `callback_secret` rejected | A compromised backend must not authenticate another backend's commands or callbacks |
 | `grpc_tls_skip_verify` blocked (when TLS enabled) | Prevent MITM on chain connection |
 | Every `backends[].url` uses `https://` | Authenticate storage-identity observations, inventory, and synchronous backend verdicts |
+| `callback_base_url` uses `https://` | Protect the integrity and confidentiality of callback operation/lifecycle tokens and their signatures in transit |
 | `backends[].tls_skip_verify` blocked | Prevent MITM on the providerd → backend connection |
 | SSRF checks on all URLs | Block loopback, link-local, unspecified addresses |
 
 The daemon refuses to start if any check fails.
 
-**Docker/k3s backend.** Each backend is a separate process with its own config and its own `production_mode` flag. When set, the backend rejects `callback_insecure_skip_verify` (which would disable TLS verification on the backend → Fred callback hop) and refuses to start. This mirrors the `backends[].tls_skip_verify` gate above, closing the same MITM exposure on the reverse (backend → Fred) direction.
+**Docker/k3s backend.** Each backend is a separate process with its own config and its own `production_mode` flag. When set, the backend rejects `callback_insecure_skip_verify` (which would disable TLS verification on the backend → Fred callback hop) and refuses to start. This mirrors the `backends[].tls_skip_verify` gate above, closing the same MITM exposure on the reverse (backend → Fred) direction. The Docker backend's production mode also requires `docker_host` to be a canonical absolute local Unix socket URL (`unix:///absolute/path`) and refuses to start otherwise.
 
 ## Known Limitations
 
