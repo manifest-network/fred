@@ -128,18 +128,18 @@ A JSON object with a top-level `services` key containing a map of service names 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `image` | string | **Yes** | — | Container image to run (e.g., `nginx:latest`). |
-| `ports` | object | No | `{}` | Port mappings. Keys: `"port/protocol"`. Values: `PortConfig`. |
-| `env` | object | No | `{}` | Environment variables (string→string map). |
+| `ports` | object | No | `{}` | Port mappings. Keys: `"port/protocol"`. Values: `PortConfig`. At most 64 entries. |
+| `env` | object | No | `{}` | Environment variables (string→string map). At most 256 entries. |
 | `command` | string[] | No | `[]` | Overrides the container entrypoint. |
 | `args` | string[] | No | `[]` | Arguments passed to the command. |
-| `labels` | object | No | `{}` | Custom container labels (string→string map). Keys may not start with `fred.`, `traefik.`, or `com.docker.compose.` (case-insensitive reserved namespaces). |
+| `labels` | object | No | `{}` | Custom container labels (string→string map). At most 128 entries. Keys may not start with `fred.`, `traefik.`, or `com.docker.compose.` (case-insensitive reserved namespaces). |
 | `health_check` | object | No | `null` | Health check configuration. See [Health Check](#health-check). |
-| `tmpfs` | string[] | No | `[]` | Additional tmpfs mount paths. See [Tmpfs Mounts](#tmpfs-mounts). |
+| `tmpfs` | string[] | No | `[]` | Additional tmpfs mount paths, at most 4. See [Tmpfs Mounts](#tmpfs-mounts). |
 | `user` | string | No | `""` | Container runtime user (`"uid"`, `"uid:gid"`, `"name"`, `"name:group"`). |
 | `depends_on` | object | No | `{}` | Startup dependencies. **Stack manifests only.** See [depends_on](#depends_on). |
-| `stop_grace_period` | duration | No | `null` | Time after SIGTERM before SIGKILL. Range: `1s`–`120s`. |
+| `stop_grace_period` | duration | No | `null` | Time after SIGTERM before SIGKILL. Range: `1s`–`120s`. See [stop_grace_period](#stop_grace_period). |
 | `init` | boolean | No | `null` | Run tini as PID 1 for zombie reaping and signal forwarding. |
-| `expose` | string[] | No | `[]` | Inter-service ports (no host binding). Values are port number strings. |
+| `expose` | string[] | No | `[]` | Inter-service ports (no host binding). Values are port number strings. At most 64 entries. |
 
 ### StackManifest Fields
 
@@ -152,7 +152,7 @@ A JSON object with a top-level `services` key containing a map of service names 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `host_port` | integer | No | `0` | Must be `0` or omitted. The host port is always auto-assigned; pinning a fixed `host_port > 0` is rejected at provision/update. |
-| `ingress` | boolean | No | `false` | Mark this port as the preferred ingress route. TCP only; at most one port per manifest may set this. Overrides the default `80 > 8080 > lowest TCP` preference. |
+| `ingress` | boolean | No | `false` | Mark this port as the preferred ingress route. TCP only; at most one port per service may set this. Overrides the default `80 > 8080 > lowest TCP` preference. |
 
 ### HealthCheckConfig Fields
 
@@ -161,7 +161,7 @@ A JSON object with a top-level `services` key containing a map of service names 
 | `test` | string[] | **Yes** | — | Command array. First element: `CMD`, `CMD-SHELL`, or `NONE`. |
 | `interval` | duration | No | image/Docker default | Time between checks. `0` or at least `1ms`. |
 | `timeout` | duration | No | image/Docker default | Per-check timeout. `0` or at least `1ms`. |
-| `retries` | integer | No | `0` | Failures before marking unhealthy. Must be ≥ 0. |
+| `retries` | integer | No | image/Docker default | Consecutive failures before marking unhealthy. Must be ≥ 0; `0` uses the image's value, or Docker's default of 3. |
 | `start_period` | duration | No | image/Docker default | Initial grace period. `0` or at least `1ms`. |
 
 ### DependsOnCondition Fields
@@ -202,6 +202,8 @@ Port map keys must be in `"port/protocol"` format:
 > **Note:** The Go runtime normalizes protocol case (e.g., `"80/TCP"` is accepted), but the canonical form is lowercase. Always use lowercase `tcp` or `udp` in manifests.
 
 Host port (`host_port`) must be `0` or omitted — the host port is always auto-assigned. A manifest that pins a fixed `host_port > 0` is rejected at provision and update time (fixed host ports would let a tenant squat well-known ports on the shared host or collide with another lease). Reach the service through ingress, or use `GET /v1/leases/{lease_uuid}/connection` after provisioning to discover the assigned host port.
+
+Only a TCP port may set `ingress: true`, and at most one port per service. A manifest that sets it on a UDP port, or on more than one port of a service, is rejected.
 
 ### Environment Variables
 
@@ -294,12 +296,12 @@ Rules:
 
 ### Tmpfs Mounts
 
-Containers run with a read-only root filesystem by default (operator-configurable via the docker-backend `container_readonly_rootfs` setting). `/tmp` and `/run` are mounted as tmpfs automatically. Use the `tmpfs` field for additional writable directories.
+Containers run with a read-only root filesystem by default (operator-configurable via the docker-backend `container_readonly_rootfs` setting). `/tmp` and `/run` are then mounted as tmpfs automatically. Use the `tmpfs` field for additional writable directories. If the provider turns `container_readonly_rootfs` off, the root filesystem is writable and none of these tmpfs mounts are created; the `tmpfs` entries are still validated.
 
 **Rules:**
 - Maximum **4** additional mounts.
 - Paths must be **absolute** (start with `/`).
-- Paths are normalized (trailing slashes, `..` components resolved).
+- Paths are normalized with Go's `path.Clean` (repeated slashes, `.` and `..` elements, and trailing slashes resolved) before the checks below, so `/tmp/` counts as `/tmp`. The [JSON Schema](manifest-schema.json) accepts only paths that are already in this form.
 - No duplicate paths (after normalization).
 - Cannot mount `/` (root filesystem).
 
@@ -323,14 +325,18 @@ Containers run with a read-only root filesystem by default (operator-configurabl
 
 // Invalid — blocked paths
 { "tmpfs": ["/tmp"] }
+{ "tmpfs": ["/tmp/"] }
 { "tmpfs": ["/proc/something"] }
 { "tmpfs": ["/sys/fs/cgroup"] }
+
+// Invalid — duplicate after normalization
+{ "tmpfs": ["/var/cache", "/var/cache/"] }
 
 // Invalid — relative path
 { "tmpfs": ["var/cache"] }
 ```
 
-Each tmpfs mount uses the operator-configured size limit (default 64MB). Combined with the automatic `/tmp` and `/run` mounts, the maximum total tmpfs memory is 6 × 64MB = 384MB.
+Each tmpfs mount is capped at the provider's `container_tmpfs_size_mb` (default 64 MB). Besides `/tmp`, `/run` and up to 4 `tmpfs` entries, the backend mounts a tmpfs at each of the image's `VOLUME` paths when the SKU has no disk (`disk_mb` is 0), whatever the root filesystem setting; image admission allows up to 16 `VOLUME` paths. A container can therefore have up to 22 tmpfs mounts, 1,408 MB at the default size.
 
 ### User
 
@@ -367,13 +373,13 @@ Overrides the container's runtime user. Useful for images like `postgres` whose 
 
 ### stop_grace_period
 
-Time to wait after sending SIGTERM before sending SIGKILL on container stop.
+Sets the container's own stop timeout: the time Docker waits after sending SIGTERM before sending SIGKILL when a stop request does not set its own timeout.
 
 - Minimum: **1s**
 - Maximum: **120s**
 - Accepts Go duration strings or integer nanoseconds.
 
-If not set, Docker's default (10s) is used.
+On the Docker backend, this applies when Compose replaces a container during a restart or update; if it is not set, Docker's default (10s) applies there. The backend's other stops set their own timeout and ignore this field: closing a lease, and stopping the containers that write to the lease's volumes before a restart or update, use the provider's `container_stop_timeout` (default 30s).
 
 ```json
 { "stop_grace_period": "10s" }
@@ -402,6 +408,20 @@ Documents inter-service ports without creating host bindings. Unlike `ports`, ex
 { "expose": ["0"] }
 { "expose": ["3000", "3000"] }
 ```
+
+### Per-Service Limits
+
+Each service's collections have fixed maximum sizes, which providers cannot change:
+
+| Field | Maximum entries |
+|---|---|
+| `ports` | 64 |
+| `expose` | 64 |
+| `env` | 256 |
+| `labels` | 128 |
+| `tmpfs` | 4 |
+
+A service over a limit is rejected (for example, `too many ports (65), maximum is 64`). The number of services is set by the lease: a stack has exactly one service per lease item (see [Service Name ↔ Lease Item Matching](#service-name--lease-item-matching)).
 
 ### Unknown Fields
 
@@ -435,6 +455,10 @@ Rules:
   identifiers belong in the partition value only.
 - An `/update` that changes the value re-homes the lease's **future** retention
   (last-writer-wins at close); already-retained records keep their bucket.
+- For a retained lease, `GET /v1/leases/{uuid}/status` and
+  `GET /v1/leases/{uuid}/provision` return the record's partition in
+  `partition`, to the lease's owner only. The field is absent when the record
+  is in the shared bucket.
 - Declaring keys **never raises any cap**: partitions only sub-divide the budget
   your provider granted, and invalid/conflicting keys harmlessly collapse to the
   shared bucket (a WARN + counter on the provider side — closes are never
@@ -507,7 +531,7 @@ Fred performs DFS-based cycle detection on the `depends_on` graph with a maximum
 
 - Direct cycles: A → B → A
 - Transitive cycles: A → B → C → A
-- Excessively deep (but acyclic) chains that exceed depth 10
+- Acyclic chains longer than 10 links (12 or more services in a row), but only when the search starts at the head of the chain; it visits services in an unspecified order and skips those already explored, so such a chain can also be accepted. Keep chains to 10 links or fewer.
 
 Diamond dependencies (A → B, A → C, B → D, C → D) are valid and not considered cycles.
 
@@ -533,7 +557,7 @@ Diamond dependencies (A → B, A → C, B → D, C → D) are valid and not cons
 
 ## Payload Constraints
 
-- **Maximum size:** 1 MiB (1,048,576 bytes) by default, enforced by the API's `MaxRequestBodySize` limit. Configurable by the operator.
+- **Maximum size:** the provider's `max_request_body_size` (default 1 MiB, 1,048,576 bytes) caps the whole HTTP request body. For `/data` that body is the manifest itself. For `/update` it is the JSON wrapper around the base64-encoded manifest, so at the default limit the manifest can be at most 786,420 bytes (just under 768 KiB). An oversized body is rejected with `400 Bad Request`.
 - **Content type:** Raw JSON. For the `/data` endpoint the manifest bytes are the raw HTTP body; for `/update` the manifest is base64-encoded inside a JSON wrapper (`{"payload": "<base64>"}`).
 - **Hash verification (deploy):** The SHA-256 hash of the payload body must match the `meta_hash` recorded on-chain in the lease.
 - **Empty payloads** are rejected.
@@ -551,6 +575,8 @@ Uploads the initial deployment manifest for a pending lease. The raw HTTP body i
 - SHA-256 hash of the body must match the lease's `meta_hash`.
 - Bearer token authentication (ADR-036 signature).
 - Returns `202 Accepted` on success.
+
+The upload checks the body's size and hash but does not parse the manifest. The manifest is validated when Fred provisions the lease, and one that fails validation gets the lease rejected on chain. Check it against the [JSON Schema](manifest-schema.json) before creating the lease, since its `meta_hash` fixes the manifest you can upload.
 
 ### POST /v1/leases/{uuid}/update — Update
 
@@ -701,6 +727,9 @@ Requires a stateful SKU with `disk_mb > 0`. The backend auto-detects the volume 
 | Mistake | Error | Fix |
 |---|---|---|
 | Missing protocol in port key | `must be in format 'port/protocol'` | Use `"80/tcp"` not `"80"` |
+| `ingress` on a UDP port | `ingress hint requires TCP protocol` | Set `ingress` on a TCP port |
+| `ingress` on more than one port of a service | `at most one port may have ingress set to true` | Keep `ingress` on one port per service |
+| Too many `ports`, `expose`, `env` or `labels` entries | `too many ports (N), maximum is 64` (and similar) | Stay within the [per-service limits](#per-service-limits) |
 | Using `depends_on` in single manifest | `depends_on is only allowed in stack manifests` | Wrap in `{"services": {...}}` |
 | `service_healthy` without health check | `requires ... to have a health_check` | Add `health_check` to the dependency |
 | `NONE` health check with `service_healthy` | Same as above | Use `CMD` or `CMD-SHELL` instead |

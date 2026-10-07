@@ -28,9 +28,19 @@
         "ports": {
           "type": "object",
           "maxProperties": 64,
-          "description": "Port mappings. Keys are \"port/protocol\" strings; values configure optional host port binding.",
+          "description": "Port mappings. Keys are \"port/protocol\" strings; values are PortConfig objects. Host ports are always assigned dynamically. Only a TCP port may set ingress, and at most one port per service.",
+          "$comment": "The schema enforces the TCP-only ingress rule. The at-most-one-ingress-port rule is enforced server-side at admission: JSON Schema 2020-12 cannot count the properties of an object that match a subschema.",
           "propertyNames": {
             "$ref": "#/$defs/PortSpec"
+          },
+          "patternProperties": {
+            "/[uU][dD][pP]$": {
+              "$ref": "#/$defs/PortConfig",
+              "description": "UDP port: ingress must be false or omitted.",
+              "properties": {
+                "ingress": { "const": false }
+              }
+            }
           },
           "additionalProperties": {
             "$ref": "#/$defs/PortConfig"
@@ -85,7 +95,8 @@
         },
         "tmpfs": {
           "type": "array",
-          "description": "Additional writable tmpfs mount paths for containers with read-only root filesystems. /tmp and /run are always mounted automatically.",
+          "description": "Additional writable tmpfs mount paths. They are mounted only while the provider runs containers with a read-only root filesystem (the default), which also mounts /tmp and /run automatically.",
+          "$comment": "The runtime cleans each path (Go path.Clean) before its blocked-path and duplicate checks. JSON Schema cannot clean a path, so the schema accepts only paths that are already clean; uniqueItems and the blocked patterns then match the runtime exactly.",
           "maxItems": 4,
           "uniqueItems": true,
           "items": {
@@ -93,7 +104,9 @@
             "pattern": "^/",
             "not": {
               "anyOf": [
-                { "pattern": "^/$" },
+                { "pattern": "/$" },
+                { "pattern": "//" },
+                { "pattern": "/\\.\\.?(/|$)" },
                 { "pattern": "^/tmp$" },
                 { "pattern": "^/run$" },
                 { "pattern": "^/proc($|/)" },
@@ -101,7 +114,7 @@
                 { "pattern": "^/dev($|/)" }
               ]
             },
-            "description": "Absolute path. Must not be /, /tmp, /run, /proc, /sys, /dev, or any sub-path of /proc, /sys, /dev."
+            "description": "Clean absolute path: starts with /, with no trailing slash, empty element (//), or . or .. element. Must not be /, /tmp, /run, /proc, /sys, /dev, or any sub-path of /proc, /sys, /dev."
           }
         },
         "user": {
@@ -119,7 +132,7 @@
         },
         "stop_grace_period": {
           "$ref": "#/$defs/StopGracePeriod",
-          "description": "Time to wait after SIGTERM before SIGKILL. Must be between 1s and 120s inclusive."
+          "description": "The container's own stop timeout: the time Docker waits after SIGTERM before SIGKILL when a stop request does not set its own timeout. Must be between 1s and 120s inclusive."
         },
         "init": {
           "type": "boolean",
@@ -192,7 +205,7 @@
         "ingress": {
           "type": "boolean",
           "default": false,
-          "description": "Marks this port as the preferred ingress port for FQDN routing. At most one TCP port per manifest may set this. When set, overrides the default selection order (80 > 8080 > lowest)."
+          "description": "Marks this port as the preferred ingress port for FQDN routing. Only a TCP port may set this, and at most one port per service. When set, overrides the default selection order (80 > 8080 > lowest TCP port)."
         }
       }
     },
@@ -239,7 +252,7 @@
         "retries": {
           "type": "integer",
           "minimum": 0,
-          "description": "Number of consecutive failures before marking unhealthy."
+          "description": "Number of consecutive failures before marking unhealthy. 0 (or omitted) uses the image's value, or Docker's default of 3."
         },
         "start_period": {
           "$ref": "#/$defs/HealthCheckDuration",
@@ -307,7 +320,7 @@
     },
     "StopGracePeriod": {
       "description": "Duration bounded to 1s–120s. Integer nanoseconds are range-checked exactly. For strings, integer seconds (1s–120s), milliseconds (1000ms–120000ms), and minutes (1m–2m) are enforced by the schema. Fractional and compound forms (e.g., \"1.5s\", \"1m30s\") pass the schema and are range-validated at runtime.",
-      "$comment": "When stop_grace_period is omitted from the manifest, the backend applies Docker's default of 10s (see docs/manifest-guide.md → stop_grace_period).",
+      "$comment": "On the Docker backend, the container's own stop timeout applies when Compose replaces a container during a restart or update; if stop_grace_period is omitted, Docker's default of 10s applies there. Closing a lease, and stopping containers that write to the lease's volumes before a restart or update, use the provider's container_stop_timeout instead (see docs/manifest-guide.md → stop_grace_period).",
       "oneOf": [
         {
           "type": "string",
