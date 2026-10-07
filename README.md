@@ -195,7 +195,7 @@ The currently deployed and production-validated execution envelope is
 and ZFS volume implementations have automated coverage but are experimental and
 not deployed; use XFS for production. See [Deployment](DEPLOYMENT.md#filesystem-setup).
 
-Leases are routed to backends using the **`skus`** field — an exact list of on-chain SKU UUIDs. A backend with no `skus` matches nothing (use `default: true` for fallback). When multiple backends match the same SKU, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318), preferring backends that do not report `disk_withheld`. Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats.
+Leases are routed to backends using the **`skus`** field — an exact list of on-chain SKU UUIDs. A backend with no `skus` matches nothing. A SKU that no backend lists goes to the fallback backend: the one with `default: true` (at most one may set it), or the first configured backend when none does. A fenced fallback receives no new provisions. When multiple backends match the same SKU, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318), preferring backends that do not report `disk_withheld`. Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats.
 
 ```yaml
 backends:
@@ -232,9 +232,14 @@ placement_store_db_path: "/var/lib/fred/placements.db"
 | `name` | Stable, case-sensitive durable backend identity; must be non-blank and unique | (required) |
 | `url` | Absolute `http://` or `https://` origin with a usable ASCII hostname (punycode for IDNs); an explicit port must be 1–65535 | (required) |
 | `hmac_secret` | Bidirectional HMAC key for this backend; set the backend process's `callback_secret` to the same value. Selecting per-backend authentication requires at least 32 bytes per key and pairwise uniqueness in every mode. | (required in production; all backends or none in development) |
+| `hmac_secret_previous` | Verify-only key accepted on this backend's callbacks during a key rotation; providerd never signs with it. Requires `hmac_secret` on the same backend and at least 32 bytes, and must not duplicate any other configured key. See [Rotating a backend's HMAC key](DEPLOYMENT.md#rotating-a-backends-hmac-key) | `""` |
 | `skus` | Exact list of on-chain SKU UUIDs this backend serves | `[]` |
-| `default` | Use as fallback when no SKU match | `false` |
+| `default` | Fallback for SKUs no backend lists. At most one backend may set it; without one, the first configured backend is the fallback | `false` |
 | `timeout` | HTTP request timeout for calls to this backend | `30s` |
+| `tls_ca_file` | PEM CA that signed the backend's server certificate; empty uses the system roots. Requires an `https://` `url` | `""` |
+| `tls_skip_verify` | Skip backend certificate verification (development only; rejected when `production_mode: true`). Requires an `https://` `url` | `false` |
+| `tls_client_cert_file`, `tls_client_key_file` | Client certificate and key for mTLS to the backend; set both or neither. Require an `https://` `url` | `""` |
+| `fenced` | Keep a backend you no longer trust in the topology: providerd sends it nothing, refuses its callbacks, routes no new lease to it, and ignores its inventory, while its leases keep their placement and wait. Requires `hmac_secret` on every backend and at least one unfenced backend. See [Containing a compromised backend](SECURITY.md#containing-a-compromised-backend) | `false` |
 
 **Validation rules:**
 - Backend names must be valid printable UTF-8 with no leading/trailing
@@ -293,8 +298,8 @@ placement_store_db_path: "/var/lib/fred/placements.db"
 | `bech32_prefix` | Address prefix for validation | `manifest` |
 | `rate_limit_rps` | Per-IP tenant API rate limit (req/s); callbacks use separate buckets | `10` |
 | `rate_limit_burst` | Per-IP rate limit burst size | `20` |
-| `tenant_rate_limit_rps` | Per-tenant rate limit (requests/second) | `5` |
-| `tenant_rate_limit_burst` | Per-tenant burst size | `10` |
+| `tenant_rate_limit_rps` | Per-tenant rate limit (requests/second). `0` disables per-tenant limiting | `5` |
+| `tenant_rate_limit_burst` | Per-tenant burst size. While per-tenant limiting is enabled, `0` passes validation but rejects every authenticated tenant request with `429` | `10` |
 | `trusted_proxies` | CIDR blocks of trusted proxies for X-Forwarded-For | `[]` |
 | `cors_origins` | Allowed CORS origins for browser clients. `["*"]` allows all; `[]` disables CORS. | `["*"]` |
 | `backends` | List of backend configurations | (required) |
@@ -303,8 +308,12 @@ placement_store_db_path: "/var/lib/fred/placements.db"
 | `callback_canonical_path_prefix` | Path prefix prepended to inbound callback URIs before HMAC verification. It must exactly equal the normalized escaped path in `callback_base_url` and the prefix stripped by the trusted proxy (e.g., `/api/fred`). Both values are empty for a root/direct URL. See [SECURITY.md](SECURITY.md) and [docs/security-callback-auth.md](docs/security-callback-auth.md). | `""` |
 | `reconciliation_interval` | How often to run reconciliation | `5m` |
 | `token_tracker_db_path` | Path to bbolt database for token replay protection | (optional; required if `production_mode`) |
-| `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |
+| `payload_store_db_path` | Path to bbolt database for payload storage. Without it, `/data` uploads are refused with `409` and updates with `503` | (optional) |
 | `placement_store_db_path` | Path to the critical provider-bound durable lease→backend placement authority used for write-ahead placement, routing, restore, and restart recovery. Normal startup opens only an existing prepared, unsymlinked, single-link regular file with exact mode `0600` and never creates or migrates it. Never replace, unlink, rename, or restore the path while `providerd` is running | (required) |
+| `placement_snapshot_dir` | Directory for online snapshots of `placements.db` and `payloads.db`; empty disables them. Must be an absolute, clean path that is not the directory of either live database, and requires `payload_store_db_path`. See [Online snapshots](DEPLOYMENT.md#online-snapshots) | `""` |
+| `placement_snapshot_interval` | How often to snapshot; at least `5m`. Validated only when `placement_snapshot_dir` is set | `1h` |
+| `placement_snapshot_retain` | Number of complete snapshot sets to keep, `1`–`1000`. Validated only when `placement_snapshot_dir` is set | `24` |
+| `maintenance_legacy_idempotency_tenants` | Tenant addresses whose restart/update requests may omit `Idempotency-Key` (see [Restart Lease](#restart-lease)). Entries must be distinct canonical bech32 account addresses with `bech32_prefix` | `[]` |
 | `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
 
 > **Note:** The Docker backend has additional configuration (`releases_db_path`, `releases_max_age`, `container_stop_timeout`, etc.) documented in `docker-backend.example.yaml`.
@@ -348,17 +357,17 @@ These options have sensible defaults but can be tuned for specific environments:
 | `max_withdraw_iterations` | Max pages per provider-wide withdrawal cycle (cursor pagination) | `100` |
 | `withdraw_limit` | Leases settled per provider-wide withdrawal tx (`MsgWithdraw.Limit`); trades tx count vs per-tx gas. Must be 1..the chain's max batch size (currently 100) | `100` |
 | `gas_limit` | Fallback gas used only when a per-tx gas simulation fails or is unavailable; every tx is otherwise gas-simulated per-tx. | `1500000` |
-| `gas_adjustment` | Multiplier applied to the simulated gas estimate (Cosmos `--gas-adjustment` convention), giving headroom above the estimate. Matches the Cosmos CLI flag. Range: 1.0–3.0. | `1.2` |
+| `gas_adjustment` | Multiplier applied to the simulated gas estimate (Cosmos `--gas-adjustment` convention), giving headroom above the estimate, and to `gas_limit` on the fallback path. Matches the Cosmos CLI flag. Range: 1.0–3.0. | `1.2` |
 | `max_gas_limit` | Absolute reject-cap: a tx whose adjusted simulated estimate exceeds it is terminally rejected before broadcast (never sent); it also clamps the out-of-gas retry ladder. `0` = uncapped. Must be ≥ `gas_limit` when set. | `0` |
-| `gas_price` | Gas price (micro-units of `fee_denom` per gas unit; fee = ceil(gas_limit × gas_price / 1_000_000)) | `25` |
+| `gas_price` | Gas price (micro-units of `fee_denom` per gas unit). Each tx pays fee = ceil(gas × gas_price / 1_000_000), at least 1, where gas is the limit declared on that tx: normally the simulated estimate × `gas_adjustment`, otherwise the adjusted `gas_limit` fallback or an out-of-gas retry value | `25` |
 | `fee_denom` | Fee denomination | `umfx` |
 | `sub_signer_count` | Number of authz sub-signers for parallel tx signing. `0` = single-signer mode. | `0` |
 | `sub_signer_min_balance` | Minimum balance before a sub-signer is topped up. | `10000000umfx` |
 | `sub_signer_top_up_amount` | Amount transferred per top-up. | `50000000umfx` |
 | `sub_signer_fund_check_interval` | How often balances are checked. | `1h` |
 | `credit_check_interval` | How often the scheduler wakes to run the credit check, independent of `withdraw_interval`. `0s` couples it to `withdraw_interval`; when set >0 it must be ≤ `withdraw_interval`. A smaller value polls credit faster while the paid withdrawal stays rate-limited to `withdraw_interval` (the ENG-524 withdraw-cadence guard). | `0s` |
-| `credit_check_error_threshold` | Errors before disabling credit monitoring | `3` |
-| `credit_check_retry_interval` | Delay before an earlier follow-up credit check. Applies in two cases: after credit-check errors exceed `credit_check_error_threshold`, and while a zero-balance closure is being deferred inside its `credit_check_zero_grace_period` window (so the empty balance is re-confirmed promptly rather than at the next full `credit_check_interval`). | `30s` |
+| `credit_check_error_threshold` | Consecutive failed credit reads for one tenant after which the scheduler schedules an earlier re-check (after `credit_check_retry_interval`). Read errors never close leases or disable monitoring | `3` |
+| `credit_check_retry_interval` | Delay before an earlier follow-up credit check. Applies in two cases: once a tenant's consecutive credit-check errors reach `credit_check_error_threshold`, and while a zero-balance closure is being deferred inside its `credit_check_zero_grace_period` window (so the empty balance is re-confirmed promptly rather than at the next full `credit_check_interval`). | `30s` |
 | `credit_check_zero_grace_period` | How long a tenant's credit must stay empty before its leases are auto-closed. A single stale zero read (e.g. the chain node briefly lagging a top-up) is absorbed: closure only fires once the empty balance persists for this whole window, and any non-zero read clears it. Lower = faster reclaim of unpaid leases; higher = more tolerance for transient chain-node lag before soft-deleting tenant data. `0s` uses the 5m default. | `5m` |
 | `shutdown_timeout` | Maximum time for graceful shutdown (drain + cleanup) | `30s` |
 
@@ -388,22 +397,20 @@ See [SECURITY.md](SECURITY.md#transport-security) for TLS configuration details 
 
 ### Environment Variables
 
-All options can be set via environment variables with the `PROVIDER_` prefix:
+An environment variable named `PROVIDER_` plus the upper-cased key overrides that key, but only when the key has a built-in default or appears in the config file. These keys have no default and must therefore appear in the config file: `provider_uuid`, `provider_address`, `keyring_dir`, `key_name`, `tls_cert_file`, `tls_key_file`, `trusted_proxies`, `backends`, `callback_base_url`, `callback_secret`, `callback_canonical_path_prefix`, `maintenance_legacy_idempotency_tenants`, `token_tracker_db_path`, `payload_store_db_path`, and `placement_store_db_path`. providerd cannot start from environment variables alone.
 
 ```bash
-export PROVIDER_CHAIN_ID=manifest-1
-export PROVIDER_PROVIDER_UUID=01234567-89ab-cdef-0123-456789abcdef
-export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
+export PROVIDER_CHAIN_ID=manifest-1                            # has a default
+export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080 # only if the config file sets callback_base_url
 ```
+
+`FRED_KEYRING_PASSPHRASE` and `FRED_MNEMONIC` are separate secrets, not config keys; see [Deployment](DEPLOYMENT.md#required-field-checklist).
 
 ## Usage
 
 ```bash
 # Run with config file
 ./build/providerd -c config.yaml
-
-# Or use environment variables
-./build/providerd
 
 # Print version (providerd, backend binaries, and placement tools support --version)
 ./build/providerd --version
@@ -437,7 +444,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
 | `GET` | `/health` | None | Liveness. Probes chain, backends and DBs, but **no verdict ever makes it 503** — poll this from a load balancer |
-| `GET` | `/readyz` | None | Deep readiness. Same body; 503 when local bbolt authority is unreadable/withdrawn or no durable inventory baseline matches the configured backend topology. **Not** for load balancers |
+| `GET` | `/readyz` | None | Deep readiness. Same body; 503 when local bbolt authority is unreadable/withdrawn, no durable inventory baseline matches the configured backend topology, an interrupted inventory sweep still awaits its reporters, or a fenced backend may hold a lease with no placement row. **Not** for load balancers |
 | `GET` | `/metrics` | None | Prometheus metrics |
 | `GET` | `/workloads?lease_uuid=<u1>&lease_uuid=<u2>...` | None | Bulk workload metadata lookup by lease UUID (1..MaxLookupUUIDs). Confirmed leases without an unresolved attempt query only their recorded owner; unresolved leases use fleet discovery. Unavailable relevant backends produce warnings. Used by the manifest-admin SPA. |
 | `POST` | `/callbacks/provision` | HMAC-SHA256 | Backend → Fred callback (5-min replay window) |
@@ -448,7 +455,7 @@ See [SECURITY.md](SECURITY.md) for replay protection rationale per endpoint.
 
 ```
 GET /health     # liveness — no verdict returns 503
-GET /readyz     # deep readiness — also 503 until placement inventory bootstraps
+GET /readyz     # deep readiness — also 503 while placement inventory is not ready
 ```
 
 Both probe the same things — chain connectivity, every registered backend, and
@@ -458,8 +465,8 @@ same body. They differ only in how the verdict maps onto the status code:
 | `status` | Meaning | `/health` | `/readyz` |
 |---|---|---|---|
 | `healthy` | Every configured probe passed | 200 | 200 |
-| `degraded` | A remote, shared dependency is impaired (chain, or one or more backends). Existing workloads keep serving and exact callbacks plus safely evidenced reconciliation work continue. After inventory bootstrap, the reconciler may place genuinely new recordless `PENDING` work only on backends that answered both inventories; work pinned to a silent owner, `ACTIVE` recordless work, unresolved attempts, and conflicts remain deferred. A chain outage halts reconciliation and lease-resolving calls. Both conditions still accept backend callbacks | 200 | 200 |
-| `unhealthy` | A local, process-owned bbolt store is unreadable, placement authority was permanently withdrawn after a path/inode or outcome-unknown commit failure, or no durable inventory baseline matches the configured backend topology | 200 | 503 |
+| `degraded` | A remote, shared dependency is impaired (chain, or one or more backends). Existing workloads keep serving and exact callbacks plus safely evidenced reconciliation work continue. After inventory bootstrap, the reconciler may place genuinely new recordless `PENDING` work only on backends that answered both inventories; work pinned to a silent owner, `ACTIVE` recordless work, and conflicts remain deferred, and an unresolved attempt is only redelivered to its attempted backend. A chain outage halts reconciliation and lease-resolving calls. Both conditions still accept backend callbacks | 200 | 200 |
+| `unhealthy` | A local, process-owned bbolt store is unreadable, placement authority was permanently withdrawn after a path/inode or outcome-unknown commit failure, or `placement_inventory` is not ready: no durable inventory baseline matches the configured backend topology, an interrupted sweep still awaits both inventories from every backend that could have reported a lost positive, or a fenced backend may hold a lease with no placement row | 200 | 503 |
 
 `checks.placement_inventory` reports a durable baseline bound to the exact set of
 configured backend storage identities. A complete `/provisions` plus
@@ -496,7 +503,7 @@ operator acknowledgement includes the target parent's physical device/inode;
 the initializer rejects a rename/recreation between print and initialize and
 publishes descriptor-relatively with `renameat2(RENAME_NOREPLACE)`.
 
-Mutation modes (`placement-preflight --prepare` / `--initialize-fresh`, and `placement-repair --apply`, including conflict repair) require certificate-verified HTTPS for every configured backend, independently of `production_mode`. Use `tls_ca_file` for a private CA or system roots; existing mTLS credentials remain supported. HTTP and `tls_skip_verify` cannot authorize durable changes because request HMAC does not authenticate inventory responses. Read-only inspection and repair dry-runs may observe development HTTP endpoints; there is no insecure-backend-evidence override.
+Mutation modes that read backend inventory (`placement-preflight --prepare` / `--initialize-fresh`, and `placement-repair --apply`, including conflict repair) require certificate-verified HTTPS for every configured backend, independently of `production_mode`, and refuse to run while any configured backend is fenced. `placement-repair --apply` with `-attest-restored-backup` or `-retire-lost-backend` reads no backend inventory and has neither requirement. Use `tls_ca_file` for a private CA or system roots; existing mTLS credentials remain supported. HTTP and `tls_skip_verify` cannot authorize durable changes because request HMAC does not authenticate inventory responses. Read-only inspection and repair dry-runs may observe development HTTP endpoints; there is no insecure-backend-evidence override.
 
 It is also bound at runtime to the exact regular-file inode opened at
 `placement_store_db_path`. Never copy over, unlink, rename, rotate, or restore
@@ -550,9 +557,13 @@ that it passed. `placement_store` and `placement_inventory` are mandatory in
     "placement_store": {"status": "healthy"},
     "placement_inventory": {"status": "healthy"},
     "payload_store": {"status": "healthy"}
-  }
+  },
+  "stats": {"in_flight_provisions": 2}
 }
 ```
+
+`stats.in_flight_provisions` is the number of provision and restore operations
+this process is currently tracking.
 
 ### Get Lease Connection
 
@@ -628,11 +639,13 @@ Returns connection details for an active lease from the backend. Requires ADR-03
 - `200 OK` - Connection details found
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
-- `404 Not Found` - Lease not provisioned
-- `500 Internal Server Error` - The backend failed while reading connection details
-- `503 Service Unavailable` - A required authentication or routing service is
-  unavailable, durable placement is unusable or unresolved, or the bounded
-  provider/backend idempotency journal refused admission before side effects
+- `404 Not Found` - Lease not found or not `ACTIVE` on chain, or not provisioned
+  on its backend
+- `500 Internal Server Error` - The chain query failed, or the backend returned
+  any error other than not-provisioned while reading connection details
+- `503 Service Unavailable` - The replay-protection store is unavailable, or
+  durable placement is unusable or unresolved or names a backend Fred no longer
+  knows
 
 ### Get Lease Status
 
@@ -649,7 +662,7 @@ Returns the current provisioning status of a lease. Useful for checking if provi
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
-  "state": "PENDING",
+  "state": "LEASE_STATE_PENDING",
   "requires_payload": true,
   "meta_hash_hex": "a1b2c3...",
   "payload_received": false,
@@ -660,7 +673,7 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 **Fields:**
 - `tenant` - Tenant address from the authenticated token
 - `provider_uuid` - Provider UUID
-- `state` - Chain lease state (`PENDING`, `ACTIVE`, `CLOSED`, `REJECTED`, or `EXPIRED`). `UNSPECIFIED` and unrecognized future values are non-actionable safety states: reconciliation preserves backend state and retries rather than inferring cleanup authority.
+- `state` - Chain lease state as its protobuf enum name: `LEASE_STATE_PENDING`, `LEASE_STATE_ACTIVE`, `LEASE_STATE_CLOSED`, `LEASE_STATE_REJECTED`, or `LEASE_STATE_EXPIRED`. A value this build does not recognize is reported as its number, and an answer from the retained record (see below) reports `LEASE_STATE_UNSPECIFIED`. `UNSPECIFIED` and unrecognized future values are non-actionable safety states: reconciliation preserves backend state and retries rather than inferring cleanup authority.
 - `requires_payload` - True if lease has meta_hash (expects payload upload)
 - `meta_hash_hex` - Expected payload hash in hex (omitted if no meta_hash)
 - `payload_received` - True if payload has been uploaded
@@ -673,8 +686,17 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 - `retained_until` - RFC3339 retention deadline; present only for retained data with a configured age limit. Omitted when age-based expiry is disabled; other retention policy and capacity limits still apply.
 - `items` - Restore shape (`service_name`, `sku`, `quantity`) to request when opening the fresh lease to restore into; present only when `retained`
 - `restore_hint` - Short human-readable next step for restoring; present only when `retained`
+- `partition` - The [retention partition](docs/manifest-guide.md#retention-partitioning-aggregator-platforms) key recorded with the retained data; present only when `retained` and a partition was recorded
 
-> **Leases the chain cannot find:** `x/billing` never deletes a lease, so a closed lease normally answers through the chain path above, with its chain `state`. If the chain query returns not-found (a lagging or reset RPC node, or a provider pointed at the wrong chain), this endpoint still answers from the retained record. Authorization is then by the retained record's tenant (the signed caller must own it); a cross-tenant caller or an absent record gets `404`.
+> **Leases the chain cannot find:** `x/billing` never deletes a lease, so a closed lease normally answers through the chain path above, with its chain `state`. If the chain query returns not-found (a lagging or reset RPC node, or a provider pointed at the wrong chain), this endpoint still answers from the retained record, with `state` set to `LEASE_STATE_UNSPECIFIED`. Authorization is then by the retained record's tenant (the signed caller must own it); a cross-tenant caller, or a record that is absent or not retained, gets `404`.
+
+**Response Codes:**
+- `200 OK` - Status returned
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant or provider
+- `404 Not Found` - The chain has no record of the lease, and no backend returned
+  a retained record owned by the caller
+- `500 Internal Server Error` - The chain query failed
 
 ### Get Provision Diagnostics
 
@@ -705,7 +727,7 @@ Returns provision diagnostics for a lease, including status, failure reason, and
 - `terminal_budget` - The consecutive-failure budget, as in [Get Lease Status](#get-lease-status); omitted when the backend reports none or the answer comes from persisted diagnostics
 - `reason` - Stable, machine-readable failure category, always present when `status` is `failed` (defaults to `Unknown` if no specific cause was recorded); see [Failure Reason Codes](#failure-reason-codes)
 - `message` - Curated, human-readable failure summary; may be empty
-- `items`, `restore_hint` - Present only when `status` is `retained` (restore shape and next-step hint); see [Get Lease Status](#get-lease-status)
+- `items`, `restore_hint`, `partition` - Present only when `status` is `retained` (restore shape, next-step hint, and recorded retention partition); see [Get Lease Status](#get-lease-status)
 - `retained_until` - RFC3339 retention deadline for retained data with a configured age limit. Omitted when age-based expiry is disabled; other retention policy and capacity limits still apply.
 
 **Response Codes:**
@@ -713,6 +735,8 @@ Returns provision diagnostics for a lease, including status, failure reason, and
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Provision not found (never provisioned or diagnostics expired)
+- `500 Internal Server Error` - The chain query failed, or a backend returned an
+  error other than not-provisioned and no backend reported the provision
 - `503 Service Unavailable` - Durable placement is unresolved, so absence cannot be reported safely
 
 #### Failure Reason Codes
@@ -827,6 +851,8 @@ delivery of a fully escaped response over an arbitrarily slow link.
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Provision not found (never provisioned or logs expired)
+- `500 Internal Server Error` - The chain query failed, or the backend returned
+  another error or an invalid log response
 - `503 Service Unavailable` - The log queue is full, the admission wait expires,
   or read capacity is exhausted (`Retry-After: 1`); backend routing is unavailable,
   or durable placement is unusable or unresolved
@@ -843,14 +869,26 @@ Content-Type: application/octet-stream
 <raw payload bytes>
 ```
 
-Upload deployment configuration for a lease that was created with a `meta_hash`. The payload is validated against the on-chain hash before provisioning starts. Requires a payload-specific ADR-036 token that includes the `meta_hash` field. See [SECURITY.md](SECURITY.md#tenant-authentication-adr-036) for token details.
+Upload deployment configuration for a lease that was created with a `meta_hash`. The payload's SHA-256 is checked against the on-chain hash before provisioning starts. Fred does not parse the manifest at upload: a malformed manifest whose hash matches is accepted and fails later, when the backend validates it during provisioning. Requires a payload-specific ADR-036 token that includes the `meta_hash` field. See [SECURITY.md](SECURITY.md#tenant-authentication-adr-036) for token details.
 
 **Response Codes:**
 - `202 Accepted` - Payload received, provisioning started
-- `400 Bad Request` - Invalid payload or hash mismatch
-- `401 Unauthorized` - Invalid signature or token
+- `400 Bad Request` - Invalid lease UUID, the lease has no `meta_hash`, the body
+  could not be read (including a body over `max_request_body_size`), the body is
+  empty, or its SHA-256 does not match `meta_hash`
+- `401 Unauthorized` - Invalid signature or token, or the token's lease UUID or
+  `meta_hash` does not match the lease
+- `403 Forbidden` - Lease does not belong to this tenant or provider
 - `404 Not Found` - Lease not found or not PENDING
-- `409 Conflict` - Payload already received
+- `409 Conflict` - The payload was not stored: a payload is already stored for
+  this lease, or the payload store is not configured, is closed, or failed the
+  write. A store failure is therefore also reported as `409`
+- `500 Internal Server Error` - The chain query failed, or publishing the
+  payload event failed; the stored payload is removed so the upload can be
+  retried
+- `503 Service Unavailable` (rarely `504 Gateway Timeout`) - The request,
+  including the body upload, did not complete within the provider's request
+  timeout
 
 ### Restart Lease
 
@@ -892,8 +930,8 @@ token. Each accepted token is one command, as before keys existed, and a
 replayed token is refused with `401`; a retry therefore needs a new token and is
 a new command. Every such request logs a WARN and increments
 `fred_api_maintenance_legacy_key_total`. A malformed or repeated header is still
-refused with `400` before authentication, and an unlisted tenant that omits the
-header receives `400`.
+refused with `400`, after the token's signature is validated but before the
+token is consumed, and an unlisted tenant that omits the header receives `400`.
 
 The provider shares a separate budget of 1,024 pending commands and 64 MiB of
 journal content, including 512 bytes of phase-growth allowance per command.
@@ -935,9 +973,10 @@ Once established, an unrelated backend outage does not revoke it.
   retries
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
-- `404 Not Found` - Lease not provisioned
-- `409 Conflict` - The key conflicts with a prior command, another command is
-  pending, or the lease is in a state that cannot be restarted
+- `404 Not Found` - The backend reports that the lease is not provisioned
+- `409 Conflict` - The key conflicts with a prior command, another command or
+  lifecycle operation is in progress for the lease, the lease is not `ACTIVE` on
+  chain, or the backend reports a state that cannot be restarted
 - `410 Gone` with `reason: backend_storage_lost` - The lease's backend was
   retired because its storage was lost; the lease is being ended on chain
 - `410 Gone` with `reason: maintenance_expired` - The command is older than the
@@ -946,10 +985,15 @@ Once established, an unrelated backend outage does not revoke it.
 - `429 Too Many Requests` with `reason: maintenance_capacity_reserved` - Shared
   capacity is reserved for a tenant without pending work; this new command was
   not recorded. Retry after your pending work completes (`Retry-After: 1`)
+- `500 Internal Server Error` - The backend accepted the command but Fred could
+  not yet durably record that acceptance (the pending command remains
+  recoverable), or Fred hit an internal error
 - `503 Service Unavailable` - Backend dispatch is blocked (for example by an
-  open circuit) or its outcome is uncertain, authentication/routing authority
-  is temporarily unavailable, or a bounded idempotency journal refused admission
-  before side effects.
+  open circuit) or its outcome is uncertain, the backend refused it for
+  capacity, the chain lease could not be read or was not found, the lease has
+  no usable confirmed placement here or its backend is fenced,
+  authentication/routing authority is temporarily unavailable, or a bounded
+  idempotency journal refused admission before side effects.
   An admitted command can remain pending for automatic recovery as described above
 
 ### Update Lease
@@ -1006,9 +1050,11 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
   curated backend validation diagnostics are preserved for exact retries
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
-- `404 Not Found` - Lease not provisioned
-- `409 Conflict` - The key conflicts with a prior command, another command is
-  pending, or the lease is in a state that cannot be updated
+- `404 Not Found` - The backend reports that the lease is not provisioned
+- `409 Conflict` - The key conflicts with a prior command, another command or
+  lifecycle operation is in progress for the lease, the lease is not `ACTIVE` on
+  chain, or the backend reports a state that cannot be updated. An exact retry
+  of an update whose deployment failed also returns `409`
 - `410 Gone` with `reason: backend_storage_lost` - The lease's backend was
   retired because its storage was lost; the lease is being ended on chain
 - `410 Gone` with `reason: maintenance_expired` - The command is older than the
@@ -1017,13 +1063,17 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
 - `429 Too Many Requests` with `reason: maintenance_capacity_reserved` - Shared
   capacity is reserved for a tenant without pending work; this new command was
   not recorded. Retry after your pending work completes (`Retry-After: 1`)
-- `500 Internal Server Error` - An accepted update could not yet be persisted
-  to the provider payload store; the durable pending command remains recoverable
+- `500 Internal Server Error` - The backend accepted the update but Fred could
+  not yet durably record that acceptance or write the confirmed manifest to the
+  provider payload store (the durable pending command remains recoverable), or
+  Fred hit an internal error
 - `503 Service Unavailable` - Backend dispatch is blocked (for example by an
-  open circuit) or its outcome is uncertain, no payload store is configured,
-  routing/authority is temporarily unavailable, or the bounded provider/backend
-  idempotency journal refused admission before side effects. An admitted command
-  can remain pending for automatic recovery
+  open circuit) or its outcome is uncertain, the backend refused it for
+  capacity, no payload store is configured, the chain lease could not be read or
+  was not found, the lease has no usable confirmed placement here or its backend
+  is fenced, routing/authority is temporarily unavailable, or the bounded
+  provider/backend idempotency journal refused admission before side effects. An
+  admitted command can remain pending for automatic recovery
 
 ### Restore Lease
 
@@ -1182,7 +1232,9 @@ Returns the release (deployment) history for a lease, showing each version that 
 - `200 OK` - Releases found (may be an empty array)
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
-- `404 Not Found` - Lease not provisioned
+- `404 Not Found` - Lease not found on chain, or not provisioned on its backend
+- `500 Internal Server Error` - The chain query failed, or the backend returned
+  an error other than not-provisioned
 - `503 Service Unavailable` - Backend routing is unavailable, or durable placement is unusable or unresolved
 
 ### Stream Lease Events (WebSocket)
@@ -1192,7 +1244,7 @@ GET /v1/leases/{lease_uuid}/events
 Authorization: Bearer <token>
 ```
 
-Opens a WebSocket connection for real-time lease status updates. Events are pushed as JSON frames when the lease transitions between provisioning states (e.g., `provisioning`, `ready`, `failed`, `restarting`, `updating`). A `retained` event is pushed when a closed/expired lease's data is soft-deleted (best-effort, only to currently-connected clients), signalling that the data may be restorable within the grace window. For that event the `status` field is the enum `retained`, and the human-readable restore instruction is carried in the `error` field.
+Opens a WebSocket connection for real-time lease status updates. Events are pushed as JSON frames when the lease transitions between provisioning states (e.g., `provisioning`, `ready`, `failed`, `restarting`, `updating`). A `retained` event is pushed when a closed/expired lease's data is soft-deleted (best-effort, only to currently-connected clients), signalling that the data may be restorable within the grace window. For that event the `status` field is the enum `retained`, and the human-readable restore instruction is carried in the `error` field. A `failed` event can also carry a failure description in `error`; other events omit the field.
 
 **Authentication:** Bearer token via the `Authorization` header or the `?token=` query parameter (since the WebSocket API cannot set custom headers during upgrade). Auth is verified before the WebSocket upgrade, so failures return standard HTTP error responses.
 
@@ -1220,13 +1272,20 @@ Opens a WebSocket connection for real-time lease status updates. Events are push
   carry a global sequence; use the REST status endpoints for current state.
 - The server sends WebSocket ping frames every 30 seconds; the client must respond with pong within 40 seconds or the connection is closed
 - Slow clients that fall behind have events dropped — use the REST endpoints (`/status`, `/releases`) to catch up
-- The stream ends when the client disconnects or the server shuts down (clean close frame)
+- The stream is push-only. The server reads at most 512 bytes per client message; any client data message closes the connection with `1008`, and a larger message closes it with `1009`
+- The token is checked only at the handshake. Each connection lasts at most one hour, then closes with `1013` ("max connection lifetime reached"); reconnect with a fresh token
+- A lease accepts at most 10 concurrent subscriptions and the server 1,000 in total. Past either limit the upgrade still succeeds (`101`), then the connection closes at once with `1013` ("too many connections")
+- The stream also ends when the client disconnects or the server shuts down (`1001`)
 
 **Response Codes (before upgrade):**
 - `101 Switching Protocols` - WebSocket connection established
+- `400 Bad Request` - Invalid lease UUID, or the request is not a valid
+  WebSocket handshake
 - `401 Unauthorized` - Invalid signature or token
-- `403 Forbidden` - Lease does not belong to this tenant
-- `501 Not Implemented` - Events not enabled on this deployment
+- `403 Forbidden` - Lease does not belong to this tenant or provider
+- `404 Not Found` - Lease not found on chain
+- `429 Too Many Requests` - Rate limit exceeded
+- `500 Internal Server Error` - The chain query failed
 
 ### Provision Callback (Backend -> Fred)
 
@@ -1257,11 +1316,12 @@ request URI, including its query. Requires HMAC-SHA256 authentication via the
 }
 ```
 
-Status must be one of `"success"`, `"failed"`, or `"deprovisioned"` (the third is used by backends that perform autonomous deprovisioning, e.g. after a failed provision rollback).
+Status must be one of `"success"`, `"failed"`, or `"deprovisioned"`. `deprovisioned` reports a completed teardown and is accepted only on a `lifecycle_id` URL or the tokenless v0.13 route; on an `operation_id` URL it is rejected with `400`. The bundled backends send it when a lease's close completes.
 
 - `backend` (optional string) — legacy sender metadata used only for bounded metrics when no current operation exists. It need not equal Fred's configured router name and cannot authorize or redirect a typed callback; the HMAC-covered callback URL plus Fred's exact-operation registry or durable lifecycle record select the authoritative backend.
-- `maintenance_id` (optional canonical UUIDv4 string) — included only on the exact durable restart/update completion. Successful update completion authorizes promotion of that command's pending manifest; failed completion discards its promotion. Later runtime-failure observations omit this field. It is HMAC-covered and must match the command under the authorized lifecycle and storage identity.
-- `retained` (optional bool) — set `true` on a `deprovisioned` callback when the backend soft-deleted (retained) the lease's volumes instead of destroying them. Fred uses this to push the optimistic `retained` notice to the tenant; the queryable retained status (`GET /v1/leases/{uuid}/status`) is the durable backstop. Omitted/`false` means the volumes were destroyed.
+- `maintenance_id` (optional canonical UUIDv4 string) — included only on the exact durable restart/update completion. Successful update completion authorizes promotion of that command's pending manifest; failed completion discards its promotion. Later runtime-failure observations omit this field. It is HMAC-covered and must match the command under the authorized lifecycle and storage identity. Sending it on an `operation_id` URL or with `deprovisioned` status is rejected with `400`.
+- `maintenance_admitted_at` (optional RFC 3339 UTC timestamp) — echoes the `admitted_at` Fred sent with that restart/update. Sending it without `maintenance_id` is rejected with `400`. A stamp that differs from the command Fred admitted under that `maintenance_id` cannot settle the command.
+- `retained` (optional bool) — set `true` on a `deprovisioned` callback when the backend soft-deleted (retained) the lease's volumes instead of destroying them; with any other status it is rejected with `400`. Fred uses this to push the optimistic `retained` notice to the tenant; the queryable retained status (`GET /v1/leases/{uuid}/status`) is the durable backstop. Omitted/`false` means the volumes were destroyed.
 - `operation_id` in the JSON body, if sent by an older or custom backend, is untrusted metadata and is overwritten at ingress. Only the HMAC-authenticated URL query grants exact-operation authority.
 - `lifecycle_id` in the JSON body is likewise overwritten. Fred authorizes the authenticated query only when it matches the current durable per-lease lifecycle capability and backend.
 
@@ -1269,7 +1329,7 @@ Status must be one of `"success"`, `"failed"`, or `"deprovisioned"` (the third i
 - `200 OK` - Callback synchronously reached a terminal application result, or
   was terminally ignored as a duplicate/stale exact-operation callback; the
   backend may advance this lease's durable callback queue
-- `400 Bad Request` - Malformed JSON, lease UUID, status, or callback capability query. `operation_id` and `lifecycle_id` are mutually exclusive; a present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected
+- `400 Bad Request` - Malformed JSON, lease UUID, status, or callback capability query, or a field combination rejected above. `operation_id` and `lifecycle_id` are mutually exclusive; a present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected
 - `401 Unauthorized` - Missing or invalid signature
 - `429 Too Many Requests` - Callback ingress or verified-storage rate limit exceeded
 - `503 Service Unavailable` - Callback application is unavailable, not yet
@@ -1374,7 +1434,7 @@ code as the source of truth.
 
 ## Backend API Specification
 
-Any backend must implement these HTTP endpoints. For a comprehensive implementation guide including SKU handling, callback signing, state management, and reconciliation, see [BACKEND_GUIDE.md](BACKEND_GUIDE.md).
+Any backend must implement these HTTP endpoints. This section summarizes the contract; [BACKEND_GUIDE.md](BACKEND_GUIDE.md) is the complete implementation guide, including SKU handling, callback signing, storage identity, state management, and reconciliation.
 
 ### Endpoint Reference
 
@@ -1385,31 +1445,44 @@ are not signed; machine-readable response codes are contract signals trusted
 under the configured transport. TLS or an equivalently trusted private network
 is required if response forgery by an on-path actor is in scope.
 
+Requests and responses are bound to the backend's sealed storage identity (see
+[Durable Backend Storage Identity](BACKEND_GUIDE.md#durable-backend-storage-identity)):
+
+- Mutating `POST`s go to `/_fred/storage/{storage-id}/{operation}`; the paths
+  below are their short operation names. Reads and inventories keep the paths
+  below.
+- Once Fred has pinned the identity, every request also carries it as the
+  HMAC-covered `backend_storage_id` query parameter.
+- Every response must carry exactly one `X-Fred-Backend-Storage-ID` header
+  naming that storage UUID. Fred rejects a response whose header is missing,
+  duplicated, or different from the pinned identity.
+
 #### Required
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `POST` | `/provision` | HMAC | Create resource (async, callback on completion) |
 | `POST` | `/deprovision` | HMAC | Remove resource (idempotent) |
+| `POST` | `/restart` | HMAC | Restart containers (async, callback on completion) |
+| `POST` | `/update` | HMAC | Deploy new manifest (async, callback on completion) |
+| `POST` | `/reconcile_custom_domain` | HMAC | Apply a lease's custom domains (idempotent; called every reconciliation sweep) |
 | `GET` | `/info/{uuid}` | HMAC | Connection details (host, ports) |
 | `GET` | `/provisions` | HMAC | List all provisions (reconciliation) |
 | `GET` | `/provisions/{uuid}` | HMAC | Provision diagnostics (status, errors) |
+| `GET` | `/retentions` | HMAC | List leases whose data this backend currently retains (reconciliation, restore affinity) |
 | `GET` | `/logs/{uuid}` | HMAC | Container logs |
+| `GET` | `/releases/{uuid}` | HMAC | Release history |
 | `GET` | `/health` | None | Health check |
 
 #### Optional
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `POST` | `/restart` | HMAC | Restart containers (async, callback on completion) |
-| `POST` | `/update` | HMAC | Deploy new manifest (async, callback on completion) |
-| `POST` | `/restore` | HMAC | Restore a retained lease's data into a new lease (async, callback on completion) |
-| `GET` | `/retentions` | HMAC | List leases whose data this backend currently retains (restore affinity) |
-| `GET` | `/releases/{uuid}` | HMAC | Release history |
-| `GET` | `/stats` | None | Resource capacity and usage |
+| `POST` | `/restore` | HMAC | Restore a retained lease's data into a new lease (async, callback on completion; retention support) |
+| `GET` | `/stats` | None | Resource capacity and usage (least-loaded routing) |
 | `GET` | `/metrics` | None | Prometheus metrics |
 
-Backends without soft-delete/retention support still serve `/restore` and `/retentions`: `/restore` returns `422` (no retained data) and `/retentions` returns an empty list.
+A backend without soft-delete/retention support returns an empty list from `/retentions` and, if it serves `/restore`, `422` (no retained data). A backend that does not answer `/retentions` is treated as not having answered the sweep.
 
 ### POST /provision
 
@@ -1422,8 +1495,8 @@ Start provisioning a resource (async).
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "items": [
-    {"sku": "k8s-small", "quantity": 2},
-    {"sku": "k8s-large", "quantity": 1}
+    {"sku": "a1b2c3d4-e5f6-7890-abcd-1234567890ab", "quantity": 2, "service_name": "web"},
+    {"sku": "b2c3d4e5-f6a7-8901-bcde-2345678901bc", "quantity": 1, "service_name": "db"}
   ],
   "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
   "lifecycle_callback_url": "http://fred.example.com:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
@@ -1433,11 +1506,11 @@ Start provisioning a resource (async).
 ```
 
 **Fields:**
-- `items` - Array of lease items with SKU and quantity. All items belong to the same provider.
+- `items` - Array of lease items: the on-chain SKU UUID (`sku`), `quantity`, and the optional `service_name` and `custom_domain`, as recorded on chain. All items belong to the same provider.
 - `callback_url` - Exact operation-completion URL containing one canonical UUIDv4 `operation_id`; preserve it byte-for-byte and use it only for this provision result. New tokenless provision and restore operations are rejected before durable admission.
 - `lifecycle_callback_url` - Typed URL for exact restart/update/custom-domain completion plus autonomous failure and deprovision observations. If omitted, bundled backends derive it from the typed operation URL; if supplied, it must match that derivation exactly. Bundled backends keep maintenance completion non-coalescible even though it uses this lifecycle route.
-- `payload` - Optional base64-encoded deployment payload (only present if lease has meta_hash)
-- `payload_hash` - Optional hex-encoded SHA-256 hash of payload (only present with payload)
+- `payload` - Optional base64-encoded deployment payload: the payload Fred stores for the lease (uploaded for its `meta_hash`, or written by a later confirmed update). Absent for a lease without one
+- `payload_hash` - Optional hex-encoded SHA-256 hash of `payload` (only present with payload)
 
 **Response:** `202 Accepted`
 ```json
@@ -1459,12 +1532,11 @@ Get lease information for a provisioned resource.
     "443/tcp": {"host_ip": "0.0.0.0", "host_port": "32769"}
   },
   "protocol": "https",
-  "metadata": {"region": "us-east-1"},
-  "custom_field": "any additional backend-specific data"
+  "metadata": {"region": "us-east-1"}
 }
 ```
 
-**Known Fields** (extracted by fred into structured response):
+**Fields** (Fred decodes only these and drops any other field):
 - `host` - Hostname or IP for connecting to the resource
 - `fqdn` - Fully qualified domain name for ingress routing (omitted when not set)
 - `ports` - Map of container ports to host bindings
@@ -1473,7 +1545,7 @@ Get lease information for a provisioned resource.
 - `protocol` - Connection protocol (e.g., "https", "ssh")
 - `metadata` - Additional key-value metadata
 
-Backends should use the `metadata` field for any custom key-value data to surface to tenants.
+Put any custom key-value data for tenants in `metadata` (string values).
 
 **Response:** `404 Not Found` if not provisioned.
 
@@ -1566,9 +1638,14 @@ Restart containers for a lease without changing the manifest (async).
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "maintenance_id": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
-  "callback_url": "http://fred.example.com:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
+  "callback_url": "http://fred.example.com:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
+  "admitted_at": "2024-01-16T14:00:00.000001Z"
 }
 ```
+
+`admitted_at` is Fred's admission time for the command (RFC 3339, UTC); every
+replay of the command sends the same value. Echo it as
+`maintenance_admitted_at` on the completion callback.
 
 **Response:** `202 Accepted`
 ```json
@@ -1581,7 +1658,8 @@ Restart containers for a lease without changing the manifest (async).
 - `400 Bad Request` - Invalid request or validation refusal (`validation_code` identifies a validation refusal; `error` carries its detail)
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for restart (e.g., already restarting or updating)
-- `503 Service Unavailable` - Capacity refusal (`code: "insufficient_resources"`); an uncoded 503 is an availability failure and does not prove refusal
+- `409 Conflict` with `code: "maintenance_expired"` - The command is older than the lease's retained maintenance history and was not run; Fred settles it as expired
+- `503 Service Unavailable` - Capacity refusal (`code: "insufficient_resources"`); any other 503 is an availability failure and does not prove refusal
 
 ### POST /update
 
@@ -1593,9 +1671,12 @@ Deploy a new manifest for a lease, replacing containers (async).
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "maintenance_id": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
   "callback_url": "http://fred.example.com:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
-  "payload": "<base64-encoded-manifest>"
+  "payload": "<base64-encoded-manifest>",
+  "admitted_at": "2024-01-16T14:00:00.000001Z"
 }
 ```
+
+`admitted_at` is as for [`/restart`](#post-restart).
 
 **Response:** `202 Accepted`
 ```json
@@ -1608,7 +1689,8 @@ Deploy a new manifest for a lease, replacing containers (async).
 - `400 Bad Request` - Invalid request/manifest or validation refusal (`validation_code` identifies a validation refusal; `error` carries its detail)
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for update
-- `503 Service Unavailable` - Capacity refusal (`code: "insufficient_resources"`); an uncoded 503 does not prove refusal
+- `409 Conflict` with `code: "maintenance_expired"` - The command is older than the lease's retained maintenance history and was not run; Fred settles it as expired
+- `503 Service Unavailable` - Capacity refusal (`code: "insufficient_resources"`); any other 503 does not prove refusal
 
 ### POST /restore
 
@@ -1621,7 +1703,7 @@ Adopt a soft-deleted lease's retained volumes into a new lease and re-deploy its
   "from_lease_uuid": "<original-retained-lease-uuid>",
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
-  "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
+  "items": [{"sku": "a1b2c3d4-e5f6-7890-abcd-1234567890ab", "quantity": 1, "service_name": "app"}],
   "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
   "lifecycle_callback_url": "http://fred.example.com:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
 }
@@ -1656,6 +1738,24 @@ List the leases whose data this backend currently retains (soft-deleted, awaitin
 ```
 
 The `retentions` array is always present (`[]` when empty, never `null`).
+
+### POST /reconcile_custom_domain
+
+Apply the custom domains currently set on a lease's items (idempotent). Fred
+calls it on every reconciliation sweep for each `ACTIVE` lease whose provision
+is not `failed`, so a backend with nothing to change, or without custom-domain
+support, must still return success rather than `404`. See
+[BACKEND_GUIDE.md](BACKEND_GUIDE.md#post-reconcile_custom_domain).
+
+**Request:**
+```json
+{
+  "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "items": [{"sku": "a1b2c3d4-e5f6-7890-abcd-1234567890ab", "quantity": 1, "service_name": "web", "custom_domain": "app.example.com"}]
+}
+```
+
+**Response:** `204 No Content` (Fred also accepts `202 Accepted`)
 
 ### GET /releases/{lease_uuid}
 
@@ -1832,10 +1932,11 @@ appropriate for a production deployment.
 
 ### 5. Test the Flow
 
-Check the mock backend health without mutating it:
+Check the mock backend health without mutating it. With the TLS files exported
+in step 1 it serves HTTPS, so verify it against the development certificate:
 
 ```bash
-curl http://localhost:9000/health
+curl --cacert .fred-dev/mock-tls.crt https://localhost:9000/health
 ```
 
 For a real Fred flow, create a `PENDING` lease on the local chain for this exact
@@ -2038,22 +2139,26 @@ Chain state       Backend inventory       Durable placement/attempts
 
 | Chain State | Backend State | Action |
 |-------------|---------------|--------|
-| PENDING + meta_hash | Not provisioned | Await payload upload |
+| PENDING + meta_hash | Not provisioned, payload not uploaded | Await payload upload |
+| PENDING + meta_hash | Not provisioned, payload stored | Start provisioning with the stored payload |
 | PENDING (no hash) | Not provisioned | Start provisioning |
 | PENDING | Provisioned + ready | Acknowledge lease |
+| PENDING | Provisioned + provisioning, restarting, updating, or any other status except ready or failed | Wait - no action |
 | PENDING | Provisioned + failed | Reject on chain. The backend's failure callback usually rejects it first, with the curated message (a startup crash reports it within seconds); a sweep that finds it rejects with `provisioning failed` |
-| ACTIVE | Provisioned + provisioning | In-flight re-provision - no action. The backend bounds it: a definite startup failure reports `failed` at once, and an attempt the backend could not settle live is settled `failed` by its periodic recovery, within one `reconcile_interval` when one of its containers exited or its cohort is partial, otherwise at `provision_timeout` |
-| ACTIVE | Provisioned + ready | Healthy - no action |
-| ACTIVE | Provisioned + restarting | In-flight restart - no action |
-| ACTIVE | Provisioned + updating | In-flight update - no action |
+| ACTIVE | Provisioned + provisioning | In-flight re-provision - no lifecycle action; reconcile custom domains. The backend bounds it: a definite startup failure reports `failed` at once, and an attempt the backend could not settle live is settled `failed` by its periodic recovery, within one `reconcile_interval` when one of its containers exited or its cohort is partial, otherwise at `provision_timeout` |
+| ACTIVE | Provisioned + ready | Healthy - no lifecycle action; reconcile custom domains |
+| ACTIVE | Provisioned + restarting | In-flight restart - no lifecycle action; reconcile custom domains |
+| ACTIVE | Provisioned + updating | In-flight update - no lifecycle action; reconcile custom domains |
 | ACTIVE | Provisioned + failed | Anomaly: re-provision, unless the backend reports an exhausted consecutive-failure budget (`terminal_budget.verdict` = `exhausted`); then close on-chain (`workload failed repeatedly`) and deprovision. `fail_count` never decides |
 | ACTIVE | Not provisioned | Anomaly: provision |
 | CLOSED/REJECTED/EXPIRED | Provisioned | Orphan candidate: bounded exact chain re-read, then deprovision only if still terminal |
 | Not found in the PENDING/ACTIVE sweep | Provisioned | Orphan candidate: exact chain re-read; absence, query failure, `UNSPECIFIED`, or a future state defers cleanup |
 | UNSPECIFIED or unknown future state | Any | **Defer — no action; never infer terminality** |
 | ACTIVE / PENDING | Placement lost with a retired backend | Close / reject on chain (`backend storage lost`); never provision |
-| ACTIVE | No placement row, and a retirement could not prove every live lease had one | Close on chain as lost; never provision |
-| PENDING/ACTIVE | Placement conflict/unusable, or unresolved attempt | **Defer — no action this sweep** |
+| ACTIVE | Not provisioned, no placement row, and a retirement could not prove every live lease had one | Close on chain as lost; never provision |
+| PENDING/ACTIVE | Placement conflict/unusable, or an attempt without valid operation metadata | **Defer — no action this sweep** |
+| PENDING/ACTIVE | Any other unresolved attempt | Redeliver the exact recorded operation to the attempted backend (deferred while that backend is fenced); a definitive refusal clears the attempt for the next sweep |
+| PENDING/ACTIVE | Reported by a backend's `/retentions` | **Defer — provisioning would lay a fresh volume over retained data** |
 | PENDING/ACTIVE | Positive membership from a rejected inventory endpoint (`untrusted_positive`) | **Durably quarantine — do not treat the rejected payload as ownership or its removal as absence** |
 | PENDING/ACTIVE | Positive report disagrees with confirmed placement | **Defer — no action this sweep** |
 | PENDING/ACTIVE | Confirmed owner is not configured | **Defer and emit an operator-visible lease error** |
@@ -2071,6 +2176,18 @@ else is deferred and retried, because acting on a lease Fred cannot place
 unambiguously risks re-provisioning it onto a healthy peer and laying an empty
 volume over live data. Terminal and not-found provisions are handled by the
 separately gated destructive passes below.
+
+A provision the reconciler starts sends the lease's stored payload when it has
+one; an `ACTIVE` lease with a `meta_hash` whose payload is missing is retried on
+the next sweep, never closed for it. If the backend definitively refuses that provision
+as invalid, Fred rejects a `PENDING` lease, or closes an `ACTIVE` one, on chain
+with the refusal's reason.
+
+"Reconcile custom domains" means the sweep sends `POST /reconcile_custom_domain`
+to the owning backend of each `ACTIVE` lease whose provision is not `failed`. A
+failure counts as a lease error
+(`fred_reconciler_actions_total{action="lease_error"}`) and is retried on the
+next sweep.
 
 When both the placement record and positive backend report are absent, a durable
 baseline for the configured topology proves only that Fred completed its initial
