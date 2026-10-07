@@ -5,9 +5,17 @@
 # This file contains all configuration options for providerd.
 #
 # ENVIRONMENT VARIABLES:
-#   All settings can be overridden via environment variables with PROVIDER_ prefix.
-#   Example: PROVIDER_CHAIN_ID=manifest-1
-#   Nested keys use underscores: PROVIDER_GRPC_TLS_ENABLED=true
+#   A top-level key can be overridden by PROVIDER_ plus the upper-cased key.
+#   Example: PROVIDER_CHAIN_ID=manifest-1, PROVIDER_GRPC_TLS_ENABLED=true
+#   An override applies only to a key that has a built-in default or is set in
+#   this file; an empty variable is ignored. Keys without a default can
+#   therefore be overridden only when this file sets them: provider_uuid,
+#   provider_address, keyring_dir, key_name, tls_cert_file, tls_key_file,
+#   trusted_proxies, callback_base_url, callback_secret,
+#   callback_canonical_path_prefix, maintenance_legacy_idempotency_tenants,
+#   token_tracker_db_path, payload_store_db_path, placement_store_db_path.
+#   backends[] entries have no environment form. List values are
+#   comma-separated: PROVIDER_CORS_ORIGINS=https://a.example,https://b.example
 #
 # DURATION FORMAT:
 #   Duration values use Go's duration format: "1h", "30m", "5s", "500ms"
@@ -111,6 +119,10 @@ keyring_backend: "file"
 # Directory containing the keyring files.
 # For "file" backend, this contains encrypted key files.
 # Typically ~/.manifest/ or the directory where you ran `manifestd keys add`.
+# Startup fails if the key cannot be read from here. Sub-signer key derivation
+# (sub_signer_count > 0) writes new keys here, so it must also be writable.
+# The hardened systemd unit in DEPLOYMENT.md sets ProtectHome=true, which hides
+# /home: there, use a directory such as /var/lib/fred/keyring instead.
 keyring_dir: "/home/provider/.manifest"
 
 # Name of the key to use for signing transactions.
@@ -201,6 +213,9 @@ rate_limit_burst: 20
 # the bearer token is cryptographically validated — so one tenant cannot
 # monopolize API resources, and forged tokens cannot burn a victim's quota.
 # Reported as fred_api_rate_limit_rejections_total{limiter="tenant"}.
+# tenant_rate_limit_rps: 0 disables per-tenant limiting. With a positive rps,
+# tenant_rate_limit_burst: 0 rejects every authenticated tenant request with
+# HTTP 429. Negative values are rejected.
 tenant_rate_limit_rps: 5
 tenant_rate_limit_burst: 10
 
@@ -265,14 +280,15 @@ tenant_rate_limit_burst: 10
 # ROUTING:
 #   Leases are routed to backends using the skus field — an exact list of
 #   on-chain SKU UUIDs. Empty criteria matches nothing.
-#   If no backend matches, the backend with default: true is used.
+#   If no backend matches, the fallback backend above is used (default: true,
+#   or the first configured backend).
 #   When multiple backends match, provisions go to the backend with the lowest
 #   allocated-CPU ratio (queried live from each backend's /stats endpoint).
 #   Backends without usable load stats are excluded; if no matching backend
 #   has usable stats, routing falls back to round-robin.
 #
 # BACKEND API:
-#   Backends must implement the Provider Backend API.
+#   Backends must implement the Provider Backend API (BACKEND_GUIDE.md).
 #   Required:
 #   - POST /provision          - Start provisioning a resource
 #   - POST /deprovision        - Remove a provisioned resource
@@ -280,8 +296,11 @@ tenant_rate_limit_burst: 10
 #   - GET  /provisions         - List all provisioned resources (for reconciliation)
 #   - GET  /provisions/{uuid}  - Get provision status for a single resource
 #   - GET  /logs/{uuid}        - Get container logs for a provisioned resource
+#   - GET  /retentions         - List retained leases (empty without retention)
+#   - POST /reconcile_custom_domain - Re-apply custom-domain routing (each sweep)
 #   - GET  /health             - Health check
 #   Optional:
+#   - POST /restore            - Restore retained data into a new lease
 #   - POST /restart            - Restart a provisioned resource
 #   - POST /update             - Update a provisioned resource with a new manifest
 #   - GET  /releases/{uuid}    - Get release history for a provisioned resource
@@ -321,7 +340,7 @@ backends:
   #     - "{{ sku_mapping['docker-large'] }}"
   #
   # - name: docker-1
-  #   url: "http://10.0.0.1:9000"
+  #   url: "http://10.0.0.1:9001"
   #   hmac_secret: "docker-1-unique-secret-change-me-0123456789"
   #   skus:
   #     - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
@@ -329,14 +348,14 @@ backends:
   #   default: true
   #
   # - name: docker-2
-  #   url: "http://10.0.0.2:9000"
+  #   url: "http://10.0.0.2:9001"
   #   hmac_secret: "docker-2-unique-secret-change-me-0123456789"
   #   skus:
   #     - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
   #     - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
   #
   # - name: docker-3
-  #   url: "http://10.0.0.3:9000"
+  #   url: "http://10.0.0.3:9001"
   #   hmac_secret: "docker-3-unique-secret-change-me-0123456789"
   #   skus:
   #     - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
@@ -345,11 +364,12 @@ backends:
   # ---------------------------------------------------------------------------
   # Mixed substrate example: docker-backend + k3s-backend side-by-side
   # ---------------------------------------------------------------------------
-  # Fred's router is SKU-string-based and treats any HTTP backend identically,
-  # so a docker-backend and a k3s-backend can run side-by-side on the same
-  # provider, each handling distinct SKU UUIDs. k3s-backend defaults to
-  # listen_addr :9002 so it doesn't collide with docker-backend's :9001 when
-  # both run on the same host.
+  # k3s-backend is a non-functional scaffold (ENG-133): it serves the backend
+  # API but reports every provision as failed ("not implemented"), so leases
+  # whose SKUs route to it fail. This only shows the shape: Fred's router
+  # matches exact SKU UUIDs and treats any HTTP backend identically.
+  # k3s-backend defaults to listen_addr :9002 so it doesn't collide with
+  # docker-backend's :9001 when both run on the same host.
   #
   # - name: docker-1
   #   url: "http://10.0.0.1:9001"
@@ -481,10 +501,14 @@ withdraw_interval: "1h"
 
 # How often to run full reconciliation.
 # Reconciliation compares chain state (leases) vs backend state (provisions) and:
-#   - Provisions resources for PENDING leases not yet provisioned
+#   - Provisions resources for PENDING leases not yet provisioned (once any
+#     required payload has been uploaded)
 #   - Acknowledges leases that are provisioned but not yet acknowledged
+#   - Rejects PENDING leases whose provision failed
+#   - Re-provisions ACTIVE leases that are failed or missing from their backend
 #   - Deprovisions orphaned resources (provisioned but lease closed/expired)
-#   - Logs anomalies (active lease but not provisioned)
+# Leases whose backend did not answer are deferred. README.md, "State Matrix",
+# has the full table.
 #
 # This provides crash recovery - if fred restarts, reconciliation catches up.
 # Shorter intervals = faster recovery but more chain/backend queries.
@@ -495,8 +519,9 @@ reconciliation_interval: "5m"
 # =============================================================================
 
 # Bech32 prefix for validating tenant addresses in authentication tokens.
-# Must match the chain's address prefix (check genesis or manifestd config).
-# Common values: "manifest", "cosmos", "osmo", "akash"
+# Must be "manifest": providerd fixes the Cosmos SDK address prefix to
+# manifest, and a tenant token must match the manifest1... tenant address the
+# chain reports for the lease, so any other value fails tenant requests.
 bech32_prefix: "manifest"
 
 # =============================================================================
@@ -606,8 +631,13 @@ http_write_timeout: "15s"
 http_idle_timeout: "60s"
 
 # Maximum allowed request body size in bytes.
-# Requests exceeding this receive HTTP 413 (Payload Too Large).
+# A request whose body exceeds it is rejected with HTTP 400.
 # Default 1MB is suitable for most deployment manifests.
+# providerd forwards a manifest to its backend base64-encoded inside a JSON
+# body, so raising this cap means raising every backend's
+# max_request_body_size (default 2 MiB) to match. POST /update sends its
+# manifest base64-encoded in JSON under this cap, so an /update manifest can
+# be at most about 3/4 of it.
 max_request_body_size: 1048576  # 1MB = 1024 * 1024 bytes
 
 # =============================================================================
@@ -650,9 +680,10 @@ tx_timeout: "30s"
 # gas-simulated per-tx: the declared gas is floor(gas_adjustment * simulated
 # GasUsed). gas_limit is used ONLY when Simulate is unavailable (Simulate RPC
 # error or the simulation circuit-breaker is open); on that fallback path the
-# signed gas is floor(gas_limit * gas_adjustment). On out-of-gas errors at
-# broadcast time, Fred additionally retries with 1.5x of the previous attempt's
-# gas (compounding), bounded by max_gas_limit if set.
+# signed gas is floor(gas_limit * gas_adjustment), capped at max_gas_limit if
+# set. On out-of-gas errors at broadcast time, Fred additionally retries with
+# 1.5x of the previous attempt's gas (compounding), bounded by max_gas_limit
+# if set.
 gas_limit: 1500000
 
 # Multiplier applied to the simulated GasUsed at sign time (and, on the
@@ -662,8 +693,12 @@ gas_limit: 1500000
 # Default: 1.2.
 gas_adjustment: 1.2
 
-# Maximum gas limit for out-of-gas retries. Set to 0 for no cap.
-# If set, must be >= gas_limit. Prevents runaway gas costs during retries.
+# Absolute gas cap for every transaction. Set to 0 for no cap.
+# If set, must be >= gas_limit. A transaction whose simulated gas (after
+# gas_adjustment) exceeds it is refused before broadcast, with no fallback.
+# The Simulate-failure fallback and out-of-gas retries are clamped to it.
+# Below 5000000, providerd warns at startup that large withdrawals and
+# batches may be permanently refused while small acknowledgements pass.
 # max_gas_limit: 5000000
 
 # Gas price in micro-units of the fee denomination per gas unit.
@@ -686,9 +721,10 @@ fee_denom: "umfx"
 # Higher values = fewer requests but larger responses.
 query_page_limit: 100
 
-# Maximum withdrawal iterations per withdrawal cycle.
-# Limits how many leases are processed in a single withdrawal run.
-# Prevents very long withdrawal operations if you have many active leases.
+# Maximum withdrawal pages (one transaction each) per withdrawal cycle.
+# Each page settles up to withdraw_limit leases, so one cycle settles at most
+# max_withdraw_iterations * withdraw_limit leases. A cycle that stops at this
+# bound with leases left is counted in fred_withdraw_incomplete_cycles_total.
 max_withdraw_iterations: 100
 
 # Leases settled per provider-wide withdrawal transaction (MsgWithdraw.Limit).
@@ -720,12 +756,15 @@ credit_check_interval: "0s"
 # "0s" uses the scheduler default of 5m; negative durations are invalid.
 credit_check_zero_grace_period: "5m"
 
-# Number of consecutive credit check errors before taking action.
-# Prevents premature lease termination due to transient RPC errors.
+# Number of consecutive credit-check errors for a tenant before the next
+# credit check is moved earlier (to credit_check_retry_interval). Errors never
+# close leases.
 credit_check_error_threshold: 3
 
-# How long to wait before retrying after a credit check error.
-# Applies when errors occur, not between normal checks.
+# Delay before an earlier follow-up credit check. Applies after
+# credit_check_error_threshold consecutive errors, and while an empty balance
+# is inside its credit_check_zero_grace_period, so it is re-confirmed promptly
+# rather than at the next full credit check.
 credit_check_retry_interval: "30s"
 
 # =============================================================================

@@ -12,7 +12,7 @@ For an overview of what Fred does and how it's structured, start with [README.md
 - **Docker Engine 28.1+ (API 1.49+)** with iptables enabled — required for `make test-integration` and the docker-backend's immutable image admission.
 - **(Optional) `manifestd`** — only needed if you want to run end-to-end against a local chain via `scripts/dev-init.sh`.
 - **`golangci-lint`**, at the version pinned in `.golangci-lint-version` — required by `make lint`, which now fails rather than skipping when it's absent or mismatched. See [Linting](#linting) for the install command.
-- **(Optional) `btrfs-progs` + root** — only for `make test-integration-volume`, which exercises filesystem quotas.
+- **(Optional) root, `btrfs-progs`, `xfsprogs`, `zfsutils-linux` and `capsh` (`libcap2-bin`)** — for the privileged integration tests, which exercise filesystem quotas. The full `make test-integration` needs all of them; `make test-integration-volume` and `make test-integration-restore` need only root + `btrfs-progs`.
 
 ---
 
@@ -32,7 +32,7 @@ For an end-to-end local environment against a running chain, follow [Local Devel
 
 To exercise the provisioner without Docker, follow [Local Fred Development with the Mock Backend](README.md#local-fred-development-with-the-mock-backend). That recipe persists `MOCK_BACKEND_STORAGE_ID`, starts the mock, initializes fresh placement authority, and starts `providerd` with the matching configuration. Reuse the stored identity on mock restarts. The mock ignores SKUs and simulates provisioning.
 
-The experimental K3s backend can be built with `make build-k3s` and run with `make run-k3s` (override its config via `K3S_BACKEND_CONFIG=...`). It is a non-functional scaffold (see *Project layout*) — the provisioner is a stub.
+The experimental K3s backend can be built with `make build-k3s` and run with `make run-k3s`, which reads `config.k3s.yaml` (override via `K3S_BACKEND_CONFIG=...`). That file is not tracked: copy `config.k3s.yaml.example` and follow its quick start. Startup refuses an unsealed storage identity, so first seal it once against a reachable cluster with `./build/k3s-backend -config config.k3s.yaml -initialize-storage-identity new`. It is a non-functional scaffold (see *Project layout*) — the provisioner is a stub.
 
 ---
 
@@ -133,16 +133,16 @@ regression, not a test that needs updating.
 Integration tests require a running Docker Engine 28.1+ daemon and use the `integration` build tag. CI pins Docker Engine 29.7.2 on Ubuntu 24.04 and runs the suite once per image store: the classic `overlay2` store every deployed host uses, and the containerd image store, which exercises immutable platform selection and preparation of a platform manifest that is not yet independently addressable. Each leg declares its store in `FRED_TEST_IMAGE_STORE` (`overlay2` or `containerd`), and `TestIntegration_Docker_ImageStoreMatchesRunnerDeclaration` fails if the daemon disagrees; it skips when the variable is unset. The containerd leg also sets `FRED_TEST_IMAGE_DATA_PATH=/var/lib/containerd`, because the containerd store requires an explicit `image_data_path`; leave it unset for overlay2. The suite connects to the local system socket (`/var/run/docker.sock`); selecting another Docker CLI context does not redirect those SDK fixtures.
 
 ```bash
-make test-integration              # full Docker integration suite (now also sweeps the slower retain/restore tests; ~15-25 min — override the ceiling with `INTEGRATION_TIMEOUT=30m`)
+sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m  # full Docker integration suite (also sweeps the slower retain/restore tests; ~15-25 min, so raise the 15m default ceiling)
 make test-integration-stack        # stack/compose-based provisions
 make test-integration-restart-update   # restart, update, release-history flows
 make test-integration-k3s          # k3s-backend integration tests (self-builds the binary)
-sudo make test-integration-volume  # filesystem quota tests (root + btrfs-progs)
+sudo -E env "PATH=$PATH" make test-integration-volume  # btrfs quota subset (root + btrfs-progs)
 ```
 
-Volume tests need root because they create loopback filesystems, set filesystem quotas, and manage ZFS pools. The full suite covers btrfs, XFS project quotas, and ZFS; `make test-integration-volume` selects only the btrfs subset.
+Volume tests need root because they create loopback filesystems, set filesystem quotas, and manage ZFS pools. The full suite covers btrfs, XFS project quotas, and ZFS, and needs every tool listed under [Prerequisites](#prerequisites); `make test-integration-volume` selects only the btrfs subset. Run them through `sudo -E env "PATH=$PATH"`: plain `sudo` resets `PATH` (`secure_path`) and can fail with `go: command not found`. A test whose prerequisite is missing skips rather than fails.
 
-**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on privileged `ubuntu-24.04` runners (root + a btrfs loopback + Docker), one per image store (`overlay2` and `containerd`): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore) plus `make test-integration-k3s`. It triggers on PRs/pushes touching runtime code (`internal/**`, `cmd/**`), `Makefile`, `go.mod`/`go.sum`, or the integration workflow itself; markdown-only changes are excluded. It also runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` runs build, short unit tests, the bounded race shards, lint, action-pin validation, and vulnerability scanning; it does not use the `integration` tag.
+**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on privileged `ubuntu-24.04` runners (root, Docker, loop devices, and the btrfs, XFS and ZFS tools), one per image store (`overlay2` and `containerd`): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore). A separate unprivileged job runs `make test-integration-k3s`. The workflow triggers on PRs/pushes touching runtime code (`internal/**`, `cmd/**`), `Makefile`, `go.mod`/`go.sum`, or the integration workflow itself; markdown-only changes are excluded. It also runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` runs build, short unit tests, the bounded race shards, lint, action-pin validation, and vulnerability scanning; it does not use the `integration` tag.
 
 Running the suites locally is still the fastest iteration loop, and required for changes outside the path filter.
 
@@ -163,7 +163,7 @@ See [PERFORMANCE.md](PERFORMANCE.md) for the methodology and reference numbers.
 
 ```bash
 make test-coverage          # generates coverage.html (open it manually); runs with -tags integration, so it needs a Docker daemon
-sudo make test-coverage-all # includes volume tests
+sudo -E env "PATH=$PATH" make test-coverage-all # includes volume tests
 ```
 
 CI enforces the measured 76.0% aggregate statement-coverage floor in `.coverage-threshold`. PRs that add code should add tests. Ratchet up coverage when touching a poorly-covered area.
@@ -209,7 +209,7 @@ Make sure `$(go env GOPATH)/bin` is on your `PATH`. Matching the pin matters mor
 
 - **Interfaces are defined where they're consumed**, not where they're implemented. So `BackendRouter` lives in `internal/provisioner/interfaces.go`, not in `internal/backend/`. This keeps consumer packages testable without circular imports.
 - **`safeGo()` for long-lived goroutines** — wraps in `recover()` so panics surface as errors instead of crashing the daemon. Increment `fred_background_goroutine_panics_total{component=...}` when panicking; the recovery should never be silent.
-- **`cmp.Or` for runtime defaults** — used in several places (e.g. `internal/backend/client.go`, `cmd/mock-backend/main.go`) to fold in zero-value defaults at use sites. Not enforced project-wide; explicit zero checks are also fine.
+- **`cmp.Or` for runtime defaults** — used in several places (e.g. `internal/backend/client.go`, `internal/api/server.go`) to fold in zero-value defaults at use sites. Not enforced project-wide; explicit zero checks are also fine.
 - **Structured logging** — `slog` with consistent field names (`lease_uuid`, `tenant`, `backend`, `error`). Don't `fmt.Sprintf` into log messages; use key-value fields so logs are queryable.
 - **Errors at boundaries, panics never** — return errors from public APIs. `recover()` is for actor handlers and long-lived goroutines only, where a single panic must not take out the process.
 - **No test-only declarations in production files** — no nil-in-prod hook fields, no `testMode` flags, no accessors whose only callers are tests. Enforced by `internal/testutil/no_test_only_code_test.go`, which walks every non-`_test.go` file under `internal/` and `cmd/` and fails CI on a declaration whose name or doc comment advertises it as scaffolding (struct fields included). A build tag is **not** an escape hatch: the guard parses with `go/parser` and never evaluates `//go:build`. The remedies, in order of preference: move it to an in-package `export_test.go`; inject through a dependency interface production already uses; or split the function so a white-box test can drive the pieces in a controlled order. Chain mocks live in `internal/chain/chaintest/`, shared fixtures in `internal/testutil/fixtures.go`.
@@ -272,7 +272,7 @@ Update [BACKEND_GUIDE.md](BACKEND_GUIDE.md) to document the new endpoint for thi
 
 - [ ] `make fmt && make lint && make test` pass cleanly
 - [ ] `go test -race -short ./...` passes
-- [ ] If touching the docker-backend, `sudo -E env "PATH=$PATH" make test-integration` passes locally (the `-E env "PATH=$PATH"` keeps `sudo`'s `secure_path` from hiding the Go toolchain — a plain `sudo make` can fail with `go: command not found`; requires root + Docker + btrfs-progs). CI runs the same invocation via `integration.yml`, but local is the fast loop and the only signal for changes outside that workflow's path filter
+- [ ] If touching the docker-backend, `sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m` passes locally (the `-E env "PATH=$PATH"` keeps `sudo`'s `secure_path` from hiding the Go toolchain — a plain `sudo make` can fail with `go: command not found`; requires root, Docker, the filesystem tools under [Prerequisites](#prerequisites), and `FRED_TEST_IMAGE_STORE`). CI runs the same invocation via `integration.yml`, but local is the fast loop and the only signal for changes outside that workflow's path filter
 - [ ] New code has tests
 - [ ] Public APIs / config / metrics that are user-visible are documented in the relevant `.md`
 - [ ] Commit messages are descriptive (we follow [Conventional Commits](https://www.conventionalcommits.org/) loosely: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`)
