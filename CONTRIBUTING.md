@@ -295,9 +295,15 @@ PRs go through code review. Expect comments on test coverage, error handling, an
 
 ## Releases
 
-Releases are tagged on GitHub. CI builds binaries via `goreleaser` and pushes Docker images.
+A release is cut from `main` by a pull request that stamps `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) with the version and date and opens a fresh empty `## [Unreleased]` above it. After it merges, a maintainer tags the merge commit. The tag runs `.github/workflows/release.yml`:
 
-User-visible changes are tracked in the in-tree [CHANGELOG.md](CHANGELOG.md), which follows [Keep a Changelog](https://keepachangelog.com/). Add your change to the `## [Unreleased]` section under the appropriate heading (Added, Changed, Deprecated, Removed, Fixed, Security) as part of the PR that introduces it. On release, the maintainers stamp `## [Unreleased]` to the new version with the release date and open a fresh empty `## [Unreleased]` above it.
+1. `provenance` refuses a tag whose commit is not in `main` history (`scripts/check-release-source.sh`). A branch that merely descends from `main` does not pass.
+2. `verify`, `integration` and `secret-scan` rerun the full CI workflow (race, lint and govulncheck included), the privileged integration suites and gitleaks on the tagged commit. A green run of the same commit on `main` does not count.
+3. `release` runs only after all three pass. GoReleaser builds the archives and the `ghcr.io/manifest-network/fred` image, generates SBOMs and signs with cosign.
+
+Tag a release candidate (`vX.Y.Z-rc.N`) first. GoReleaser publishes it as a prerelease and pushes only the `X.Y.Z-rc.N` image tag, never `latest`, `X.Y` or `X`. Once the candidate is validated, tag `vX.Y.Z` on the same commit.
+
+User-visible changes are tracked in the in-tree [CHANGELOG.md](CHANGELOG.md), which follows [Keep a Changelog](https://keepachangelog.com/). Add your change to the `## [Unreleased]` section under the appropriate heading (Added, Changed, Deprecated, Removed, Fixed, Security) as part of the PR that introduces it.
 
 If you're contributing to a release, the maintainers will tag and publish. If you maintain a fork, follow the existing tag convention (`vMAJOR.MINOR.PATCH`) so `goreleaser` recognizes it.
 
