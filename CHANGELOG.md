@@ -8,6 +8,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.14.0] - 2026-10-07
+
+**Upgrading from v0.13.0.** This release cannot be installed in place. Follow
+[Upgrading from v0.13.0](DEPLOYMENT.md#upgrading-from-v0130) before replacing
+any binary:
+
+- **Stopped cutover.** Quiesce the fleet, drain every v0.13 callback outbox,
+  and stop providerd and every backend. providerd starts again only after the
+  offline `placement-preflight -prepare` step reports `PREPARED_FOR_CUTOVER:`.
+  Upgraded startup refuses an unprepared placement database instead of
+  migrating it, and the online migration path and its `migration_grace_period`
+  and `migration_ready_timeout` keys are removed.
+- **One key per backend in production.** Each `backends[]` entry needs its own
+  `hmac_secret` of at least 32 bytes, matching only that backend's
+  `callback_secret`. The provider's top-level `callback_secret` is accepted
+  only outside production mode.
+- **Strict configuration.** Provider, Docker and K3s loaders reject unknown
+  keys and extra YAML documents, so a v0.13 file that still carries a removed
+  or never-consumed key fails to load. Validate the rendered files with this
+  release's loaders first.
+- **One-way.** `-prepare` writes the new placement schema. Going back to v0.13
+  means restoring the pre-upgrade backup, which is safe only if no chain or
+  backend lifecycle state changed after it was taken; otherwise fix forward.
+
+### Added
+
 - Attribution `unhealthy` on `fred_docker_backend_lease_failures_total`: a
   provision whose health check never passed. It never counts toward the
   terminal failure budget; do not alert on it. (ENG-1125)
