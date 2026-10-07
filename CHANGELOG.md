@@ -1174,6 +1174,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- providerd exports `fred_reconciler_actions_total` for all five actions at
+  zero from startup. Each series used to appear only with its first action, so
+  a quiet providerd showed no series at all, and an `increase()` alert could
+  not see the first `lease_error` after a restart. (ENG-1116)
 - A lease adopted from v0.13 is re-provisioned after its container dies, even
   if it was restarted, updated or given a custom domain before. Any of these,
   failed or successful, adds a maintenance release to the lease's history, and

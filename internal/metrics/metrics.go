@@ -301,13 +301,15 @@ var (
 		Help:      "Unix timestamp of the last successful reconciliation run",
 	})
 
-	// ReconciliationActions tracks actions taken during reconciliation.
+	// ReconciliationActions tracks actions taken during reconciliation. Its
+	// action label is the closed set of Action constants, each exported at zero
+	// from package init.
 	ReconciliationActions = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "reconciler",
 		Name:      "actions_total",
 		Help:      "Total number of actions taken during reconciliation",
-	}, []string{"action"}) // action: provisioned, acknowledged, deprovisioned, anomaly
+	}, []string{"action"})
 
 	// ReconcilerBackendFetchTotal counts per-backend provision-list attempts by
 	// outcome. This is the signal that replaces the loud symptom ENG-356
@@ -1099,3 +1101,13 @@ const (
 	ActionAnomaly       = "anomaly"
 	ActionLeaseError    = "lease_error"
 )
+
+// Export every reconciliation action at zero before the first sweep. A missing
+// series cannot tell a quiet sweep from missing instrumentation, and increase()
+// never sees the increment that creates a series, so an alert would miss the
+// first lease_error after each restart (ENG-1116).
+func init() {
+	for _, action := range []string{ActionProvisioned, ActionAcknowledged, ActionDeprovisioned, ActionAnomaly, ActionLeaseError} {
+		ReconciliationActions.WithLabelValues(action)
+	}
+}
