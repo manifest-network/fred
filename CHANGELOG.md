@@ -619,11 +619,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   budget while preserving results already committed by earlier sub-batches.
   (ENG-632)
 - Release publication requires the tagged commit to be in `main` history and
-  reruns CI and integration for that tag. Pull requests validate release
-  configuration and build a non-publishing snapshot. CI reports statement
+  reruns CI, integration and the gitleaks secret scan for that tag. Pull
+  requests validate release configuration and build a non-publishing snapshot
+  with the same pinned GoReleaser version the release uses. CI reports statement
   coverage and enforces a 76% regression floor. Repository release-tag and
   publication permissions remain a separate administrative requirement.
-  (ENG-951)
+  (ENG-951, ENG-516)
 - Deployment documentation now identifies native systemd with XFS project quotas
   as the supported stateful production setup; the local Docker backend image is
   documented for stateless development only.
