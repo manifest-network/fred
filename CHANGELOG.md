@@ -2555,14 +2555,13 @@ any binary:
   ownership-checked primitive** (ENG-658). Six call sites each derived their own set
   of volumes to destroy — three from a name prefix, which does not prove ownership:
   while a restore is in flight, the original lease's data physically wears the new
-  lease's canonical name, so a close, a cap-refusal, or a reaping
+  lease's canonical name, so a close, a cap-refusal, an orphan sweep or a reaping
   tombstone could all reach data belonging to another lease. Each site carried (or
   forgot) its own guard, and the recurring result was a data-loss ticket per site
   (ENG-505, ENG-501, ENG-523, ENG-647, ENG-659). Ownership is now resolved once, from
   the live provision map plus the retention store, and a volume is destroyed only when
-  the lease asking owns the bytes. Unattributed managed volumes have no such exact
-  authority and are preserved for operator attribution rather than garbage-collected
-  from inventory inference. The two hand-written derivations of
+  the lease asking owns the bytes; the orphan sweep is the same rule asked with no
+  lease ("destroy only what nothing claims"). The two hand-written derivations of
   "which volumes a restore has claimed" are gone, and `Destroy` has been removed from
   the internal volume-manager interface so reaching it any other way does not compile.
   No configuration or API change; a refusal is visible as
@@ -2710,12 +2709,10 @@ any binary:
 
   `/health` is now a liveness contract: **it returns 200 whenever the process can
   answer, and never 503s because a dependency is impaired.** No probe here justifies
-  de-registration — there is no peer to shed load onto. Exact callback application
-  may itself need the chain or placement store; keeping the route reachable lets
-  providerd return a deliberate retryable 503 so the backend preserves its durable
-  FIFO head, whereas load-balancer removal severs that recovery protocol entirely.
-  The reconciler's behaviour is unchanged; it was already correct throughout both
-  incidents.
+  de-registration — there is no peer to shed load onto, and accepting a callback
+  touches neither the chain, nor a backend, nor any store, so a 503 severs a working
+  path in order to report a broken one. The reconciler's behaviour is unchanged; it
+  was already correct throughout both incidents.
 
   Two things had to change for "never 503" to be literally true rather than merely
   true of the verdict. Both endpoints are wrapped in `requestTimeoutMiddleware`, which
@@ -2754,9 +2751,8 @@ any binary:
   every consumer reads that as "nothing here". The consequence was not cosmetic: the orphan
   reconcile treats an absent volume as evidence its retention record is orphaned, so an
   empty enumeration made *every* active record look orphaned, pruned them after the
-  confirmation streak, and left their volumes with no record naming them. The
-  destructive risk is now removed at both boundaries: uncertain inventory preserves
-  the record, and there is no automatic unattributed-volume garbage collector.
+  confirmation streak, and left their volumes with no record naming them — so the next
+  boot's orphan sweep destroyed retained tenant data.
 
   Two guards, both in the enumeration primitive so every caller inherits them. At startup
   the configured `volume_filesystem` is now verified against the filesystem actually at
@@ -2788,8 +2784,9 @@ any binary:
   of there being nothing to recount from. The change is "uncounted permanently" →
   "uncounted until the store is repaired"; both halves are pinned by tests.
   The finalizer re-derives the volumes to reclaim on every sweep from the lease's
-  namespace on disk intersected with the ownership table, under the exact reaping
-  tombstone's lease-scoped authority. A reaping record with an empty volume list is therefore normal
+  namespace on disk intersected with the ownership table, which is the same
+  "destroy only what nothing claims" rule the startup orphan sweep already applies,
+  scoped to one lease. A reaping record with an empty volume list is therefore normal
   and not corruption. This also removes the last way a tombstone written by an older
   build could name another lease's adopted data: those stored names are no longer read
   by anything.
@@ -2817,12 +2814,14 @@ any binary:
   No configuration, API or metric change: a refusal from the re-check is counted as the
   same `fred_docker_backend_volume_destroy_refused_total{reason="claimed"}` as any other,
   and reaches the finalizer's existing `retention_reap_skips_total{reason="owner_claimed"}`.
-  The WARN names the live provision hold and explicitly says not to reclaim it by hand.
+  The WARN a kept reaping record emits now names *which* hold it is — a restore's, which
+  clears on that restore's rollback, or a live provision's, which does not and must not be
+  reclaimed by hand. It previously told operators to wait for a rollback in both cases.
 
 - **A reaping tombstone can no longer destroy a re-provisioned lease's live data**
-  (ENG-658). ENG-659 makes a tombstone/restore-destination collision unrepresentable at
-  admission, but a different collision remains possible for historical rows: a
-  deprovision give-up writes a
+  (ENG-658). ENG-659 stopped the retention finalizer from executing a tombstone that
+  named a volume an in-flight *restore* had adopted, but it asked a question scoped to
+  restores only. A second collision was left open: a deprovision give-up writes a
   tombstone naming `fred-{lease}-*` and deletes the provision, while the lease is still
   ACTIVE on chain — so the reconciler re-provisions it, a fresh volume appears under
   exactly the name the tombstone carries, and the next sweep reaped the running lease's
@@ -2832,7 +2831,9 @@ any binary:
   reached through the finalizer rather than the orphan reaper.
 
   **Operators:** this hold is counted as a new
-  `fred_docker_backend_retention_reap_skips_total{reason="owner_claimed"}`. It clears only
+  `fred_docker_backend_retention_reap_skips_total{reason="owner_claimed"}`, kept
+  distinct from `restore_claimed` because the two resolve differently — a
+  restore-held name clears when that restore rolls back, whereas this one clears only
   when the owning lease is next closed cleanly, so the record can legitimately sit
   `reaping` for as long as that lease lives. On a provider carrying such a tombstone
   from an older build, expect `BackendRetentionVolumeStuckReaping` to start firing
@@ -2873,17 +2874,25 @@ any binary:
   but which fred never populated, leaving third-party backends unable to verify
   a payload the contract said was verifiable.
 
-- **A reaping tombstone and an in-flight restore destination are mutually
-  exclusive by construction** (ENG-659). Both transitions consume the same
-  per-lease mutation head: a pending restore prevents close admission, while the
-  permanent close boundary behind every current retention row prevents a later
-  restore operation from targeting that lease. Rejection happens before the
-  source retention can move to `restoring`, eliminating the dangerous state
-  instead of detecting it in each cleanup branch. The finalizer still refuses
-  destruction when live ownership is present and fails closed when ownership is
-  unreadable. `fred_docker_backend_retention_reap_skips_total{reason}` therefore
-  exposes only the reachable `owner_claimed` and `claim_unreadable` cases; see the
-  updated "Reclaiming retained-data / stuck-reaping volumes" runbook.
+- **A reaping tombstone can no longer destroy an in-flight restore's data**
+  (ENG-659). The retention finalizer destroyed every volume name a `reaping`
+  record carried, with no ownership check — the only volume-destroy path in the
+  docker backend without one. ENG-647 stopped a deprovision give-up from
+  *writing* an adopted volume's name into such a record, but tombstones are
+  persisted and outlive the binary: a provider upgrading from an older build
+  still carries records written before that guard existed, and the next sweep
+  executed them, permanently destroying the data a restoring lease had adopted.
+  The finalizer now re-checks ownership at destroy time — a name an in-flight
+  restore claims is skipped and logged, and an unreadable retention store means
+  nothing is destroyed that pass, mirroring the orphan reaper's fail-safe. A
+  skipped name leaves the record `reaping`, so its footprint stays counted and
+  the next sweep retries once that restore's rollback re-quarantines the volume
+  (the only resolution reachable for a tombstoned lease, which has already lost
+  its provision); it is deliberately **not** counted as a leak. New
+  `fred_docker_backend_retention_reap_skips_total{reason}` counts both cases
+  (`restore_claimed`, `claim_unreadable`); see the updated
+  "Reclaiming leaked / stuck-reaping orphan volumes" runbook, since a
+  deliberately-held tombstone must **not** be reclaimed by hand.
 
 - **A failed container teardown is no longer treated as a completed one**
   (ENG-647). When `compose down` failed, the docker backend logged the error and
@@ -3848,11 +3857,11 @@ any binary:
   reaches `doDeprovision` for a lease with no live container / in-flight op (the
   idempotent no-provision short-circuit), it now still deletes the lease's `releases.db`
   history before returning, instead of short-circuiting before the terminal
-  release retirement. This stops a `lease_closed` event delivered after the container
+  `releaseStore.Delete`. This stops a `lease_closed` event delivered after the container
   was already gone from stranding a stale `status=active` record (an `audit-lease-status`
-  false positive) until the 90-day `RemoveOlderThan` TTL. Release retirement now occurs
-  only through the exact `CloseSettlement` claim, in the same terminal transaction as
-  close completion; sibling packages cannot delete release authority directly. (ENG-410)
+  false positive) until the 90-day `RemoveOlderThan` TTL. Best-effort and chain-driven;
+  the three release-history deletes in `doDeprovision` are consolidated behind one helper.
+  Purely cosmetic (no pool/admission/routing impact). (ENG-410)
 
 ### Security
 
@@ -3968,8 +3977,8 @@ restored into a fresh lease, instead of being destroyed on close.
   disables reaping), `retention_reap_interval` (reaper cadence, default `1h`),
   and `max_retained_leases_per_tenant` (per-tenant cap, default `0` = unlimited).
   (ENG-325, #114)
-- **Queryable retention status.** `GET /v1/leases/{uuid}/status` now reports
-  `provision_status: retained` for soft-deleted leases, with
+- **Queryable retention status.** `GET /v1/leases/{uuid}` and the status
+  endpoint now report `provision_status: retained` for soft-deleted leases, with
   `retained_until` (RFC3339 grace deadline), `items` (the restore shape: service
   name / SKU / quantity), and a `restore_hint`. The status is served from the
   durable retention record even after the chain prunes the closed lease, under
