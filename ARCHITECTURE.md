@@ -1142,7 +1142,13 @@ rejected before mutation; an already stack-form cohort is checked against its
 active manifest and exact
 dense Docker labels, then its ordered items and canonical profiles are frozen by
 a whole-release compare-and-swap. Transitional items-only active releases are
-compare-and-swap backfilled against their exact version and items. Local Docker
+compare-and-swap backfilled against their exact version and items. Every
+backfill of an active Release (items and profiles, profiles alone, or the
+legacy runtime authority) writes through one store function, which orders its
+maintenance checks: a deploying maintenance target refuses every backfill, a
+backfill that would change nothing returns before any other check, and a
+backfill that would change the row is refused while the history holds any
+maintenance row, because re-encoding the history can compact one away. Local Docker
 evidence cannot prove that v0.13's requested highest instance index was not
 already missing, because the old release row omitted desired items. The provider
 therefore remains stopped until the placement preflight exactly compares the
@@ -1268,13 +1274,15 @@ cohort. Runtime readiness is tri-state: observed terminal unready evidence may
 fail a generation, while an inspect error, timeout, or still-starting workload
 is indeterminate and preserves the intent for another bounded sweep. A target
 whose Release is already active is durable maintenance success even when its
-runtime has subsequently disappeared; that case atomically replaces the intent
-with two FIFO facts—maintenance Success followed by lifecycle Failed—and uses
-one idempotent actor transition to install the target authority directly in
-Failed. Both rows are classified as exact maintenance-derived barriers, so
-delivering only the Success head cannot admit a newer generation ahead of the
-paired runtime failure. If the per-lease callback FIFO is busy, recovery changes neither the
-intent nor ordinary inventory and retries level-triggered. Unreadable,
+runtime has subsequently disappeared. Recovery first writes the lease
+projection directly (`applyMaintenanceProjectionWithoutActor`, never through an
+actor; if one has appeared for the lease, the pass fails and retries) to install
+the target authority in Failed, and then atomically replaces the intent with two
+FIFO facts—maintenance Success followed by lifecycle Failed. Both rows are
+classified as exact maintenance-derived barriers, so delivering only the Success
+head cannot admit a newer generation ahead of the paired runtime failure. If
+the per-lease callback FIFO is busy, the intent stays, the projection already
+shows Failed, and the pass fails and retries level-triggered. Unreadable,
 divergent, removal-ambiguous, or callback-lock-busy evidence therefore preserves
 the intent and keeps recovery fail closed.
 
@@ -1363,14 +1371,15 @@ fails and docker-backend exits 1 before it serves HTTP. A cleanup-only close is
 used when the volatile projection is
 already absent but a fenced release still authorizes substrate cleanup: it
 publishes no tenant-visible provision, never retains data, and remains the
-non-expiring retry owner rather than giving up without a safe tombstone. Its
-terminal receipt has an explicit sealed authority kind. A principal-bound
-receipt retains the complete tenant/provider pair frozen from typed Release or
-exact substrate authority and requires both labels to match before cleanup. A
-true-orphan receipt is permitted only when neither principal witness exists; it
-authorizes cleanup through the provider-authenticated close, reserved `fred.*`
-managed labels, exact retired lease UUID, and the attested backend/storage pair.
-Half-present principal authority is invalid on admission and decode.
+non-expiring retry owner rather than giving up without a safe tombstone. A
+close's terminal receipt records a complete tenant/provider pair or none, and
+its authority kind follows from that. A principal-bound receipt requires both
+container labels to match before cleanup. An orphan receipt authorizes cleanup
+through the provider-authenticated close, reserved `fred.*` managed labels,
+exact retired lease UUID, and the attested backend/storage pair. A cleanup-only
+close records no principal even when its Release had a typed one, so its
+receipt is always an orphan receipt (tracked in ENG-1119). Half-present
+principal authority is invalid on admission and decode.
 
 Successful finalization has one required order: retire `releases.db` under the
 exact fence; atomically enqueue the lifecycle result and replace the close row
@@ -1432,8 +1441,18 @@ fleet-wide substrate snapshot. Under the recovery mutex it first decodes the
 complete maintenance-intent journal, then classifies each row under that lease's
 command fence from its exact Release and a fresh bounded strict Docker
 inventory. A live actor that owns the same `maintenance_id` remains the serial
-owner; otherwise an unclassifiable row fails that recovery pass before ordinary
-projection can interpret a mixed source/target cohort. Recovery then takes its
+owner. Otherwise any recovery error fails that pass (an unreadable or
+uninterpretable row, a failed Docker inspect or strict inventory, target
+substrate without a durable target Release, an actor that appears mid-recovery,
+or a busy callback FIFO). The one exception is a row whose containers merely
+contradict it (a
+container without the exact maintenance identity, one that diverges from the
+target's runtime or instance authority, one outside the target instance set, or
+one that disappears during inspection) is deferred for that lease alone: the
+pass continues, the lease stays out of ordinary projection so nothing interprets
+a mixed source/target cohort, and the deferral increments
+`fred_docker_backend_maintenance_recovery_deferred_total` and logs a WARN that
+becomes an ERROR once the row's recovery deadline passes. Recovery then takes its
 ordinary managed-container snapshot, loads close authority before validating
 ordinary callback labels or release cohorts, and excludes close-owned cohorts
 whose disappearance is intentional. During startup, operation-intent preflight
@@ -1445,10 +1464,15 @@ before its durable admission horizon and is re-observed by periodic sweeps witho
 blocking startup. A terminal sibling or exhausted horizon enters failed-operation
 cleanup; settlement requires exact candidate absence. Restore cleanup additionally
 requires destination-fenced rollback authority; a committed destination Release
-cannot be rolled back. Partial or mixed callback identities, unavailable SKUs,
-unreadable retention state, and
-other identity, topology, or read uncertainty preserve the Pending row and fail
-startup closed. A pre-existing terminal row is an immutable recovery decision;
+cannot be rolled back. A journal read or strict Docker inventory that fails,
+invalid resource profiles, restore-source finalizer authority that is missing,
+unreadable, or does not exactly own the destination, or a row that belongs to
+another backend or storage identity fails startup closed.
+Container evidence that contradicts the row (partial or mixed callback
+identities, an identity or topology mismatch, an inspection error) preserves the
+Pending row and its lease fence and defers that lease: startup continues, and
+the only signal is the WARN `operation recovery retained unresolved lease
+authority`. A pre-existing terminal row is an immutable recovery decision;
 without a committed Release, its absence where a restore finalizer names that
 operation is invalid. The k3s scaffold
 creates no cluster objects, so its only valid operation-intent recovery is the
@@ -1494,11 +1518,20 @@ provision or restore operation can rotate it to operation-scoped typed callback
 authority.
 
 This is an anti-corruption boundary, not a tokenless mode in current lifecycle
-code. Stopped adoption converts validated v0.13 evidence into the distinct,
-zero-invalid `LegacyRuntimeAuthority` variant; authenticated callback ingress
-recognizes an absent query capability only when it matches that migrated owner.
-Current operation constructors reject missing IDs, and no ordinary provision,
-restore, reconciliation, or maintenance path can mint tokenless authority.
+code. Stopped adoption only proves that each active v0.13 cohort's callback
+authority resolves and that its backfill fits; it persists no authority. The
+running docker-backend freezes that authority from a validated complete v0.13
+cohort into the distinct, zero-invalid `LegacyRuntimeAuthority` variant, during
+state recovery, at provision admission, or while classifying a failed
+provision's predecessor. Each of those mints a `LegacyRuntimeAuthorityFreeze`, which can
+exist only while the active Release has no runtime authority and is the only
+input the backfill accepts, so a recorded authority is never persisted again
+(ENG-1313). A restart, update, or custom-domain replacement of that lineage
+carries a legacy authority forward at its request's callback base.
+Authenticated callback ingress recognizes an absent query capability only when
+it matches that migrated owner. Current operation constructors reject missing
+IDs, and no provision, restore, or reconciliation path can mint tokenless
+authority for a lease without v0.13 evidence.
 Current identities are also distinct types rather than contextual strings:
 `operationid.ID` is the neutral provision/restore identity shared across the
 provider/backend wire and durable layers, `lifecycle.ID` is observation authority
@@ -1545,10 +1578,15 @@ change a principal. Once established it survives provider restart, so a later
 outage of an unrelated backend does not disable maintenance on the available
 confirmed owner.
 
-Update acceptance is a three-part boundary: the backend must accept (including
-an exact idempotent replay), the exact payload must be durable in the payload
-store, and only then may the provider replace Pending with a compact terminal
-receipt and release the lease claim. Transport uncertainty retains Pending.
+Update acceptance needs the backend's exact successful completion callback, not
+only its HTTP acceptance. HTTP acceptance (including an exact idempotent replay)
+moves Pending to `completion_outstanding`. The completion, matched by lease,
+`maintenance_id`, the backend's lifecycle lineage and, when present,
+`maintenance_admitted_at`, moves it to `confirmed_payload_outstanding`; the two
+may arrive in either order. A failed completion settles the command
+`execution_failed` and stores no payload. Only after a confirmed success is the
+exact payload made durable in the payload store, and only then may the provider
+replace Pending with a compact terminal receipt and release the lease claim. Transport uncertainty retains Pending.
 Authoritative chain evidence that the lease ended or its authority was revoked
 instead writes a terminal cancellation, preventing an immortal command from
 deadlocking close. Terminal provider receipts omit payload bytes and retain the
@@ -1582,10 +1620,14 @@ whose substrate outcome is still indeterminate remains healthy evidence rather
 than corrupt storage. Likewise, `callback_store_errors_total` covers instrumented
 callback persistence/store failures and fail-closed operation-intent startup
 recovery; it is not a generic counter for every semantic maintenance-recovery
-refusal. A periodic maintenance refusal logs the lease, increments
+refusal. A periodic maintenance refusal that fails the pass (any error other
+than a lease-local deferral) logs the lease, increments
 `reconciliation_total{outcome="error"}`, and leaves
 `reconciliation_last_success_timestamp_seconds` stale; the same refusal during
-startup prevents the backend from starting. `/health` can remain green during a
+startup prevents the backend from starting. A lease-local deferral does
+neither: the pass succeeds, so alert on
+`fred_docker_backend_maintenance_recovery_deferred_total` and the deferral's
+ERROR log, not on last-success staleness. `/health` can remain green during a
 periodic semantic refusal. Close-finalizer retries instead log the lease and
 durable execution generation. There is intentionally no gauge for pending
 operation or maintenance intents, because a short-lived one is normal, and no
@@ -1876,7 +1918,15 @@ Tracks which backend serves each lease (bbolt + in-memory cache):
   other name can claim its pinned storage identity
 - Required in every deployment for write-ahead safety, restore ownership,
   restart recovery, and correct routing. It is backup-critical rather than a
-  derived cache: restore it after loss, only while `providerd` is stopped. The
+  derived cache: restore it after loss, only while `providerd` is stopped,
+  together with `payloads.db` from the same moment. A restored copy still
+  carries the admission baseline and empty-backend evidence of the fleet it was
+  copied from, and startup cannot tell it is older, so recordless admission
+  could read a lease dispatched after the copy as never placed and provision it
+  twice. Run `placement-repair -attest-restored-backup` on every restored copy
+  before the first start (dry run, then `-apply` when it reports `required:
+  true`): it forgets that evidence, so
+  admission waits for one complete inventory of the running fleet. The
   built-in live backup is providerd's online snapshot loop: when
   `placement_snapshot_dir` is set (it requires `payload_store_db_path`), it
   copies `placements.db` and `payloads.db` as one consistent cut every

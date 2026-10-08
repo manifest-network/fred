@@ -1,7 +1,11 @@
 // Command placement-repair provides read-only offline placement discovery and
-// deliberately narrow mutation paths for one exact attempt or conflict. It
-// never infers causal non-execution from inventory absence: mutation also
-// requires an exact operator drain attestation and target-bound confirmation.
+// deliberately narrow, target-bound mutation modes: refusing one exact attempt,
+// resolving one exact conflict, adopting an observed lifecycle generation,
+// attesting a restored backup, and retiring a lost backend. It never infers
+// causal non-execution from inventory absence: attempt refusal and conflict
+// resolution also require an exact operator drain attestation. Every apply
+// requires the -confirm value its dry run printed; the other modes take their
+// own attestation instead (-attest-generation, -attest-lost) or none.
 package main
 
 import (

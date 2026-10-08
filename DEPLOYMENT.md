@@ -892,7 +892,8 @@ forget (`baseline_topology_id`, `inventory_topology_id`,
 `empty_inventory_backends`), `pending_inventory_sweep`, and `required`. When
 `required` is true it also prints `confirm`, which binds the provider, the
 canonical database path, and every byte of the placement metadata record, so a
-database that changes between the dry run and the apply is refused. When
+metadata change between the dry run and the apply is refused. Placement rows
+are not part of it. When
 `required` is false there is nothing to forget and no apply is needed.
 
 The apply publishes an exact no-overwrite backup of the restored copy, then
@@ -2333,11 +2334,15 @@ use it merely because a lease is absent from inventory: absence is only a
 point-in-time cross-check and cannot prove that a delayed request will not
 commit later.
 
-First obtain the exact `lease_uuid`, attempted `backend`, and `operation_id`
-from the immediate ambiguous provision/restore WARN or ERROR log. Current logs
-emit all three fields together. Correlate that operation with the backend's
-durable callback queue and transport logs; if the exact UUID cannot be
-recovered, do not guess and do not repair the row. Then:
+First obtain the exact `lease_uuid` and attempted `backend` from the immediate
+ambiguous provision/restore WARN or ERROR log (for example `reconcile: provision
+returned an ambiguous outcome; retaining exact durable attempt`). The logs do
+not carry the `operation_id`: once step 1 has stopped `providerd`, read it from
+the durable row with `placement-repair -inspect -lease <lease_uuid>`, where it
+is printed next to `attempt`. Correlate that operation with the backend's
+durable callback queue (its callback URLs carry the same `operation_id` query
+parameter) and transport logs; if the exact UUID cannot be recovered, do not
+guess and do not repair the row. Then:
 
 1. Remove tenant and chain-event ingress, stop `providerd`, and leave it stopped.
    The tool opens the existing placement database exclusively and refuses to
@@ -2439,8 +2444,10 @@ operator procedure below; point-in-time inventory absence alone is insufficient.
 
 1. Stop ingress and `providerd`, then use `-inspect` to record the exact revision
    and complete candidate set. All candidates must still belong to the durable
-   and configured topology; unknown-owner legacy/corrupt conflicts are not
-   eligible for this repair.
+   and configured topology. Unknown-owner legacy/corrupt conflicts and a sole
+   `untrusted_positive` candidate are not eligible for this repair: it needs at
+   least two recorded candidates. A sole candidate resolves only through the
+   two proofs above; until then it stays quarantined.
 2. Probe and drain every candidate's delayed request/effect paths and callback
    replay. This causal proof is mandatory even when fresh inventory currently
    shows only one owner.

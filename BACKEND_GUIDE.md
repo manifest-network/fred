@@ -1444,8 +1444,10 @@ names; require a canonical, non-nil lowercase UUID lease identity; require a
 UUIDv4 delivery identity and positive sequence; reject a callback URL whose
 authority, canonical callback path, or raw query is unsafe, or whose query
 carries mixed, malformed, duplicate, or opposite-class authority; accept
-only the status/success/retained combinations defined by that kind; and reject
-missing, pre-epoch, or more than five-minutes-in-the-future creation times. A
+only the status/retained combinations defined by that kind; and reject missing
+or pre-epoch creation times. Reject a creation time more than five minutes in
+the future only when storing a new row: never re-check a stored row against
+the clock, or a backward clock step quarantines work already accepted. A
 tokenless URL remains valid in an identity-bearing current row only when it was
 inherited from a migrated v0.13 workload: its delivery kind records the
 backend's causal ordering intent even though old Fred supplied no typed
@@ -1490,8 +1492,11 @@ response is ambiguous and must retain it.
 
 Replacement commands need a separate typed **maintenance intent** rather than a
 generic lifecycle enqueue. Commit it before appending the target generation or
-mutating substrate; allocate one canonical UUIDv4 and persist it on the intent,
-exact target Release, and every target resource. Fence the exact active source
+mutating substrate; persist one canonical UUIDv4 on the intent, exact target
+Release, and every target resource. For a restart or update it is the
+`maintenance_id` Fred sent: an update completion carrying any other ID never
+settles Fred's command. Only a replacement the backend starts on its own, such as
+Docker's custom-domain redeploy, allocates its own ID. Fence the exact active source
 and store-assigned target version plus immutable digests, preserving tenant,
 provider, and operation/lifecycle identity. Keep that identity and request
 snapshot immutable, but model progress explicitly: a cancel-only pre-append

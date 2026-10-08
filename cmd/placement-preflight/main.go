@@ -3,8 +3,10 @@
 // binds complete backend evidence to a height-pinned signer-free chain snapshot.
 // Its default mode is read-only. Explicit --prepare mode holds an exclusive
 // lock, publishes a required backup, then seals the verified database atomically.
-// Explicit --initialize-fresh mode instead proves that chain and every backend
-// are quiescent and empty before publishing a new placement authority.
+// Explicit --initialize-fresh mode instead proves that the provider has no chain
+// lease history and every backend reports empty inventories, and takes the
+// operator's attestation that the provider and every backend are quiesced,
+// before publishing a new placement authority.
 package main
 
 import (
