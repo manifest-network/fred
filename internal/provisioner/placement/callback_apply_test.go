@@ -307,3 +307,55 @@ func TestAuthenticatedCallbackCoordinatorRejectsForeignProofBoundaryBeforeSettle
 	require.Equal(t, before, fixture.store.Lookup(leaseUUID))
 	require.True(t, fixture.coordinator.RuntimeController().Contains(leaseUUID))
 }
+
+// TestLifecycleCallbackIsRetriedWhileRuntimeAuthorityIsWithdrawn keeps a
+// lifecycle callback durable at the backend while this process cannot prove
+// its placement authority. The callback itself is not at fault, so answering
+// it as dropped would delete an exact update completion for good.
+func TestLifecycleCallbackIsRetriedWhileRuntimeAuthorityIsWithdrawn(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440001"
+	store := newTestStore(t)
+	requireAdmissionBaseline(t, store, "backend-a")
+	operationID := requireOperationID(t, "8701")
+	confirmed, err := confirmAttemptForTest(store, requireTypedAttempt(t, store, leaseUUID, "backend-a", operationID))
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	id := lifecycleIDFromOperation(t, operationID)
+	requireLifecycleVerdict(t, store, leaseUUID, id, LifecycleVerdictAuthorized)
+
+	coordinator, err := NewOperationCoordinator(store, operation.NewRegistry())
+	require.NoError(t, err)
+	execution := bindExecutionForTest(t, coordinator, executionRuntime("backend-a"))
+	setProviderControlPlaneForTest(t, execution, callbackApplyControlPlane{})
+	verifier, consumer := hmacauth.NewCallbackProofBoundary()
+	callbacks, err := execution.AuthenticatedCallbackCoordinator(consumer)
+	require.NoError(t, err)
+	storageID, ok := coordinator.ExpectedBackendStorageIdentity("backend-a")
+	require.True(t, ok)
+
+	commitErr := fmt.Errorf("%w: %w", errBoltCommitOutcomeUnknown, errors.New("synthetic commit failure"))
+	require.ErrorIs(t, store.runtimeAuthorityGate.Run(func() error {
+		return store.classifyRuntimeAuthorityUpdateError(commitErr)
+	}), ErrRuntimeAuthorityUnavailable)
+	require.ErrorIs(t, store.Healthy(), ErrRuntimeAuthorityUnavailable)
+
+	body := []byte(fmt.Sprintf(
+		`{"lease_uuid":%q,"status":"success","backend_storage_id":%q}`,
+		leaseUUID, storageID.String(),
+	))
+	uri := "/callbacks/provision?lifecycle_id=" + id.String()
+	now := time.Unix(1700000000, 0)
+	secret := "callback-apply-test-secret-0123456789"
+	proof, err := verifier.VerifyRoutedWithTime(
+		secret, http.MethodPost, uri, body,
+		hmacauth.SignWithTime(secret, http.MethodPost, uri, body, now),
+		storageID.String(), "/callbacks/provision", 5*time.Minute, time.Minute, now,
+	)
+	require.NoError(t, err)
+
+	result, err := callbacks.Apply(t.Context(), proof)
+	require.ErrorIs(t, err, ErrRuntimeAuthorityUnavailable,
+		"an error is what makes the callback endpoint answer 503")
+	assert.Equal(t, CallbackLifecycleRetryable, result.LifecycleOutcome())
+	assert.Equal(t, LifecycleVerdictUnusable, result.LifecycleVerdict())
+}

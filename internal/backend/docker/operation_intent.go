@@ -769,6 +769,7 @@ func (b *Backend) recoverOperationIntentClaims(
 			// reservation. Unlike a positively classified transitional cohort,
 			// contradictory evidence grants no deadline-based teardown authority.
 			entry.deferred = true
+			operationRecoveryDeferredTotal.Inc()
 			b.logger.Warn("operation recovery retained unresolved lease authority",
 				"lease_uuid", claim.LeaseUUID(), "operation", claim.Kind(),
 				"operation_fingerprint", claim.OperationID().Fingerprint(), "error", classifyErr)

@@ -42,11 +42,15 @@ func lifecycleViewOf(t *testing.T, s *Store, leaseUUID string, id lifecycle.ID) 
 	cached, cachedSet := s.lifecycleCache[leaseUUID]
 	s.mu.RUnlock()
 	placement := s.Lookup(leaseUUID)
+	byID, err := s.authorizeLifecycle(leaseUUID, id)
+	require.NoError(t, err)
+	byZeroID, err := s.authorizeLifecycle(leaseUUID, lifecycle.ID{})
+	require.NoError(t, err)
 	return lifecycleViewForTest{
 		cached:     cached,
 		cachedSet:  cachedSet,
-		byID:       s.authorizeLifecycle(leaseUUID, id).Verdict(),
-		byZeroID:   s.authorizeLifecycle(leaseUUID, lifecycle.ID{}).Verdict(),
+		byID:       byID.Verdict(),
+		byZeroID:   byZeroID.Verdict(),
 		current:    s.CurrentLifecycle(leaseUUID),
 		revision:   placement.Revision(),
 		attempt:    placement.Attempt,

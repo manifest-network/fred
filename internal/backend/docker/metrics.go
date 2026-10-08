@@ -296,6 +296,12 @@ var (
 		Name:      "maintenance_recovery_deferred_total",
 		Help:      "Maintenance recovery attempts deferred by lease-local observation conflicts while retaining exact intent authority",
 	})
+	operationRecoveryDeferredTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "operation_recovery_deferred_total",
+		Help:      "Provision and restore recovery attempts deferred because the lease's evidence could not be classified; the journal row keeps the lease fenced and the next pass retries it",
+	})
 	maintenanceReadinessPendingTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
