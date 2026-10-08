@@ -1473,9 +1473,14 @@ interprets a mixed source/target cohort.
   age or health is not yet conclusive. The wait increments
   `fred_docker_backend_maintenance_readiness_pending_total{branch}` on every
   pass and logs the WARN `maintenance recovery is waiting for readiness
-  evidence` once per intent and branch. It has no deadline and never becomes an
-  ERROR: a committed target whose health check stays `starting` stays pending,
-  and readiness uncertainty never grants rollback authority.
+  evidence` once per intent and branch; it never becomes an ERROR. Only the
+  `deploying_target` wait has a deadline: a target whose execution started is
+  waited for until its admission time plus `provision_timeout`. After that,
+  recovery removes the target and settles the maintenance as Failed, even if
+  its health check is still `starting`. The `committed_target`,
+  `cleanup_source` and `source_only` waits have no deadline: a committed target
+  whose health check stays `starting` stays pending, because readiness
+  uncertainty never rolls back a committed Release.
 
 Recovery then takes its
 ordinary managed-container snapshot, loads close authority before validating
