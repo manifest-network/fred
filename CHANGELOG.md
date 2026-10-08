@@ -1160,6 +1160,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Removed
 
+- Removed the metrics `fred_provisioner_callback_placement_semantic_conflicts_total`
+  and `fred_payload_persist_failures_total`. Nothing has incremented either since
+  ENG-632 replaced the code paths they counted, so alerts on them could never
+  fire. Remove any alert or dashboard panel that still reads them.
 - Removed the internal `ReconcilerConfig.MaxReprovisionAttempts` and
   `DefaultMaxReprovisionAttempts`; they were never a configuration key.
   (ENG-799)

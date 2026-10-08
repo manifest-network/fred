@@ -550,12 +550,12 @@ var (
 		Buckets:   prometheus.ExponentialBuckets(0.5, 2, 12), // 0.5s to ~17min
 	})
 
-	// restoreDurationSeconds tracks the restore re-deploy worker span — the async
-	// re-deploy of a retained lease via the replace machinery, recorded only on
-	// success. It measures doRestore (compose up + verify startup) and therefore
-	// EXCLUDES the synchronous adopt prelude (the volume rename, tracked separately
-	// as replace_phase_duration_seconds{phase=adopt}) and stops when the worker
-	// returns, before the actor flips the lease to ACTIVE. Buckets mirror
+	// restoreDurationSeconds tracks the restore worker span, recorded only on
+	// success. executeRestorePhysicalOutcome times volume adoption (also tracked
+	// alone as replace_phase_duration_seconds{phase=adopt}), compose up, startup
+	// verification, the release commit and source finalization; it EXCLUDES the
+	// synchronous Restore() prelude and stops when the worker returns, before the
+	// actor flips the lease to ACTIVE. Buckets mirror
 	// provisionDurationSeconds (itself the doProvision worker span) so the two can
 	// be overlaid on the dashboard for the restore-vs-fresh-provision question
 	// ENG-357 targets. Caveat: the overlay is approximate, not like-for-like —
@@ -568,7 +568,7 @@ var (
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "restore_duration_seconds",
-		Help:      "Restore re-deploy worker duration in seconds (success only; excludes the synchronous adopt prelude)",
+		Help:      "Restore worker duration in seconds, including volume adoption (success only; excludes the synchronous Restore() prelude)",
 		Buckets:   prometheus.ExponentialBuckets(0.5, 2, 12), // 0.5s to ~17min
 	})
 
@@ -601,8 +601,8 @@ var (
 	// recovery, so they increment neither outcome rather than being mislabeled as
 	// failures. This mirrors provisionsTotal's terminal-outcome semantics.
 	//
-	// Worker-scoped like restore_duration_seconds: a restore that fails in the
-	// SYNCHRONOUS adopt prelude (claim/rename/route/ack) before the worker spawns
+	// Worker-scoped like restore_duration_seconds: a restore refused in the
+	// SYNCHRONOUS Restore() prelude (validation, intent, reservation, source claim)
 	// returns a synchronous error to the caller and is counted by NEITHER outcome
 	// here — exactly as provisionsTotal omits synchronous provision failures. Such
 	// failures surface to the tenant as the Restore() error / HTTP status. Note
@@ -773,8 +773,9 @@ var (
 	})
 
 	// retentionOrphanSkipsTotal counts orphan-reconcile skips by reason, at TWO
-	// granularities: whole-sweep bailouts (list_error/root_unverifiable/store_error/
-	// disabled — one per skipped sweep) AND per-record prune attempts skipped (raced
+	// granularities: whole-sweep bailouts (list_error, which includes an unverifiable
+	// volume root, store_error and disabled — one per skipped sweep) AND per-record
+	// prune attempts skipped (raced
 	// — one per record). Filter by reason rather than summing across (the units
 	// differ); the name says "skips", not "sweeps", deliberately. Without it, a sweep
 	// that skips forever (e.g. a mis-mounted volume root) is indistinguishable from a
@@ -878,9 +879,10 @@ var (
 
 	// leaseTerminalEventDroppedTotal counts terminal SM events that sendTerminal
 	// refused to deliver. Delivery is refused on three distinct conditions:
-	// the actor has exited (hasExited), the actor is mid-exit past the
-	// drainInbox point (isExiting), or the inbox is wedged (the buffered send
-	// times out after terminalSendTimeout). The work has already happened on
+	// the actor has exited (hasExited), retirement has closed terminal
+	// admission for the actor's final drain (terminalAdmissionClosed), or the
+	// inbox is wedged (the buffered send times out after terminalSendTimeout).
+	// The work has already happened on
 	// the host (container swap complete, provision succeeded, etc.) but the SM
 	// never recorded it, so the release store / provision struct may be out of
 	// sync with Docker. Recovery on next startup should re-reconcile; sustained

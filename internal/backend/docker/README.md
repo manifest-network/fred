@@ -619,7 +619,7 @@ sku_profiles:
 
 When provisioning `redis:latest` on this SKU:
 1. Image inspected — discovers `VOLUME /data`
-2. Host directory created: `/var/lib/fred/volumes/fred-<lease>-0/` with 2048 MB quota
+2. Host directory created: `/var/lib/fred/volumes/fred-<lease>-app-0/` (service `app`, instance 0) with 2048 MB quota
 3. Subdirectory `data/` bind-mounted to container `/data`
 4. Redis writes to `/data` — quota enforced by kernel
 5. On deprovision: an XFS delete authority is synced first, the host directory
@@ -712,7 +712,7 @@ Restore-specific re-deploy behavior worth knowing:
   availability. Containerd admission proves extraction with a stopped helper
   before the image can authorize workload creation.
 - **Image and configuration are fixed.** Restore deploys strictly from the retained `StackManifest` and items; the request carries no manifest. The new lease's requested service names and quantities must shape-match the retained set exactly (otherwise the restore is rejected with a validation error).
-- **The SKU tier may change (promote/demote).** Only the item *shape* must match (service names + quantities); the SKU's resource (disk) tier **may** differ from the source lease. A **promote** (same-or-larger `disk_mb` tier) is admitted only when its aggregate growth above the retained footprint fits disk capacity, then the larger cap is applied. A **demote** (smaller `disk_mb` tier) is allowed only if the retained volume's **measured** data fits the new tier's `disk_mb` cap — the backend runs `checkDemoteFit` before adopting (restoring durable stateful data into an ephemeral `disk_mb=0` tier is always refused). The conservative exact-name exception above may restore scratch only into another diskless row, after measuring it against that destination's pinned scratch allowance. A refused demote returns HTTP `422` with body `{"code":"demote_exceeds_tier"}` (`backend.ErrDemoteDataExceedsTier`) and is counted by `fred_docker_backend_restore_demote_refused_total{backend,reason}` (`reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`); it is **not** counted by `restore_total`.
+- **The SKU tier may change (promote/demote).** Only the item *shape* must match (service names + quantities); the SKU's resource (disk) tier **may** differ from the source lease. A **promote** (same-or-larger `disk_mb` tier) is admitted only when its aggregate growth above the retained footprint fits disk capacity, then the larger cap is applied. A **demote** (smaller `disk_mb` tier) is allowed only if the retained volume's **measured** data fits the new tier's `disk_mb` cap — the backend runs `checkDemoteFitWithResourceProfiles` before adopting (restoring durable stateful data into an ephemeral `disk_mb=0` tier is always refused). The conservative exact-name exception above may restore scratch only into another diskless row, after measuring it against that destination's pinned scratch allowance. A refused demote returns HTTP `422` with body `{"code":"demote_exceeds_tier"}` (`backend.ErrDemoteDataExceedsTier`) and is counted by `fred_docker_backend_restore_demote_refused_total{backend,reason}` (`reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`); it is **not** counted by `restore_total`.
 - **Containers are recreated, ownership is not rewritten.** Restore does not force-recreate beyond the normal replace, and the volume chown is non-recursive (it sets ownership on the VOLUME mount point only), so existing files keep their on-disk ownership.
 
 ### Limitations
@@ -827,22 +827,24 @@ record stays `reaping`.
      pinned scratch allowance before image inspection, whether or not a host
      scratch directory is later required
 
-2. **Asynchronous provisioning** -- runs in a goroutine tracked by a `WaitGroup`:
-   - Admits the immutable image (shared across all containers in the lease)
-   - Inspects the image to discover Dockerfile `VOLUME` declarations
+2. **Asynchronous provisioning** -- runs in a goroutine tracked by a `WaitGroup`.
+   Every lease is deployed as one Compose project (see
+   [Stack Provisioning](#stack-provisioning)):
+   - Admits each distinct service image
+   - Inspects each image to discover Dockerfile `VOLUME` declarations, the user, and writable paths
    - Creates/ensures the per-tenant network (if `NetworkIsolation` is enabled)
    - For each item in the lease (supports multi-SKU), for each unit (supports multi-unit):
      - For stateful SKUs (`disk_mb > 0`): creates a quota-enforced host directory and bind-mounts image VOLUME paths into it
      - For ephemeral SKUs (`disk_mb == 0`): overrides image `VOLUME` paths with
        tmpfs; when managed volumes are configured and a non-`VOLUME` writable
-       path is detected, creates a quota-capped scratch bind instead
-     - Creates a container with the appropriate SKU profile, hardening settings, and labels
-     - Starts the container
+       path is detected, also creates a quota-capped scratch bind for it
+     - Adds a Compose service with the appropriate SKU profile, hardening settings, and labels
+   - Launches the project through the protected launch (`compose up` creates and starts every container), then discovers the containers with `compose ps`
    - Verifies startup (see [Startup Verification](#startup-verification) for the two paths)
 
 3. **Callback** -- on success or failure, sends an HMAC-signed callback to the URL provided in the provision request.
 
-Multi-unit leases create multiple containers from the same manifest. Multi-SKU leases create containers with different resource profiles per SKU. Instance indices are 0-based across all items.
+Multi-unit leases create multiple containers from the same manifest. Multi-SKU leases create containers with different resource profiles per SKU. Instance indices are 0-based within each item (service).
 
 `ProvisionTimeout` and backend shutdown cancel the async workflow. Already
 admitted Docker effects retain their completion owners while they drain. Create
@@ -980,10 +982,10 @@ pins only from an exact recovered active cohort, never from a moved tag.
 
 ### Stack Provisioning
 
-When lease items carry `service_name` fields (and the payload is a [stack manifest](../../../docs/manifest-guide.md#stack-manifest)), the backend provisions a multi-service stack:
+Every lease is provisioned as a Compose stack. A flat single-service manifest is wrapped as a one-service [stack manifest](../../../docs/manifest-guide.md#stack-manifest) named `app`, and a lone lease item without `service_name` is normalized to `app`:
 
-1. **Synchronous validation** — same as single-container, plus:
-   - Detects stack vs single mode via `IsStack(items)`
+1. **Synchronous validation** — as above, plus:
+   - Normalizes the items and wraps a flat manifest before reservation
    - Validates 1:1 mapping between manifest service names and lease item service names
    - Proves that quantity expansion produces unique Compose keys (for example,
      `web` quantity 2 cannot coexist with an unscaled `web-0`); Compose PS output
@@ -996,12 +998,12 @@ When lease items carry `service_name` fields (and the payload is a [stack manife
      `VOLUME`s) and for detected writable-path scratch when available
      - Resource allocation ID: `{leaseUUID}-{serviceName}-{instanceIndex}`
      - Volume ID: `fred-{leaseUUID}-{serviceName}-{instanceIndex}`
-   - A Compose project is built in-memory from the stack manifest via `buildComposeProject`
+   - A Compose project is built in-memory from the stack manifest via `buildPlannedComposeProject`
    - Service startup ordering is controlled by `depends_on` declarations in the manifest (supports `service_started` and `service_healthy` conditions with cycle detection)
    - `compose.Up` atomically creates, starts, and network-attaches all service containers
    - `compose.PS` discovers the resulting container IDs per service
    - Startup verification runs per-service, each using its own health check config
-   - Restart/update uses `compose.Up` with the updated project; on failure, the previous manifest is rebuilt and rolled back via another `compose.Up`
+   - Restart/update uses `compose.Up` with the target project; on failure, the source containers are recreated from the configuration captured before the replacement (`createCompensationContainer`), not rebuilt from the previous manifest (see [Protected launches and failed replacements](#protected-launches-and-failed-replacements))
    - Deprovision uses `compose.Down` for atomic cleanup, with fallback to individual container removal
 
 3. **Callback** — single callback for the entire stack (success only when all services are healthy/running).
@@ -1016,7 +1018,7 @@ Every container is created with the following security measures:
 | No new privileges | `SecurityOpt: ["no-new-privileges:true"]` | Prevents privilege escalation via setuid/setgid |
 | Seccomp profile | fred's tenant profile, one entry in `SecurityOpt` | Derived from Docker's default profile; see OPERATIONS.md, "Tenant seccomp profile" |
 | Read-only root filesystem | `ReadonlyRootfs: true` | Configurable via `container_readonly_rootfs` |
-| Tmpfs for `/tmp` and `/run` | `Tmpfs: {"/tmp": "size=64M", "/run": "size=64M"}` | Only when readonly rootfs is enabled; size from `container_tmpfs_size_mb`. Tenants may request up to 4 additional tmpfs mounts via manifest, for a maximum of 6 total (384MB at default size). **Note:** On cgroup v1, tmpfs memory is not counted against the container's cgroup memory limit. On cgroup v2 (default on modern systems), it is. |
+| Tmpfs for `/tmp` and `/run` | Compose `tmpfs` volumes on `/tmp` and `/run`, 64 MB each by default | Only when readonly rootfs is enabled; size from `container_tmpfs_size_mb`. Tenants may request up to 4 additional tmpfs mounts via manifest. On a diskless SKU (`disk_mb == 0`), each image `VOLUME` (at most 16) is also a tmpfs of that size whether or not the rootfs is read-only, so one container can mount up to 22 (1408MB at default size). **Note:** On cgroup v1, tmpfs memory is not counted against the container's cgroup memory limit. On cgroup v2 (default on modern systems), it is. |
 | PID limit | `PidsLimit: 256` | Configurable via `container_pids_limit` |
 | Memory (no swap) | `MemorySwap == Memory` | Prevents swap usage entirely |
 | Restart policy disabled | `RestartPolicyDisabled` | Failed containers stay dead for crash detection |
@@ -1083,16 +1085,16 @@ When a provision has `status=failed` (e.g., a container crashed and was detected
 **One concept: the lease actor is the scope of atomicity for its messages and its workers.** Everything else falls out of that invariant:
 
 - **Typed registry atomicity** — the actor registry (`b.actors`) is guarded by
-  a mutex. The closed `ActorCommandMessage` set may resolve-or-create through
-  `routeToLease`; the closed `ActorObservationMessage` set must instead carry an
-  exact provision pointer plus deep immutable generation snapshot.
+  a mutex. An `ActorCommand` may resolve-or-create through `routeToLease`; an
+  `ActorObservation` must instead carry a store-issued `RuntimeGenerationProof`
+  of the lease's active release.
   `routeActorObservation` revalidates that claim, the recovery reservation,
   actor resolution, and enqueue under the same registry critical section. Its
   bound validator runs again immediately before serial actor handling, closing
   the enqueue-to-handle window. Delayed die/cohort observations therefore cannot
   materialize an actor after rollback or target a replacement actor, and callers
   never retain an actor pointer.
-- **Worker ownership** — every worker goroutine (provision, restart, update, diag) is spawned by the actor and tracked by its per-actor `workers` barrier (a channel-signaled reference counter; see `work_barrier.go`). Normal actor exit waits for `workers.Zero()` before registry deletion and inbox drain. The wait is bounded: a stuck worker aborts a preempting state transition (so deprovision cannot tear down underneath it), while shutdown eventually returns `ErrShutdownDrainTimeout`, leaves dependencies open, and makes the process exit non-zero. The barrier's channel-based wait means a wedged worker adds no leaked waiter on top of itself.
+- **Worker ownership** — every worker goroutine (provision, restart, update, diag) is spawned by the actor and tracked by its per-actor `workers` barrier (a channel-signaled reference counter; see `internal/backend/shared/workbarrier/barrier.go`). Normal actor exit waits for `workers.Zero()` before registry deletion and inbox drain. The wait is bounded: a stuck worker aborts a preempting state transition (so deprovision cannot tear down underneath it), while shutdown eventually returns `ErrShutdownDrainTimeout`, leaves dependencies open, and makes the process exit non-zero. The barrier's channel-based wait means a wedged worker adds no leaked waiter on top of itself.
 - **Typed recovery quiescence** — restore reconciliation must acquire an opaque `QuiescenceClaim` from the exact registry actor before reading mutable recovery inputs. One activity count overlaps queued/handling messages, worker execution, and worker-to-terminal-message handoff. The claim holds admission and activity gates and pins the actor against retirement/replacement until release; routing refuses without blocking while it is held. A missing claim defers that lease. Recovery never composes racy inbox-depth and worker-idleness snapshots into authority.
 - **Provision capacity ownership** — fresh provisions and retries both require
   an operation-bound `ProvisionAdmission`. The pool reserves the conservative
@@ -1119,10 +1121,14 @@ from the missing container. A transport error, permission denial or arbitrary
 not-found error does not prove absence. Periodic reconciliation remains the
 fallback for missed events.
 
-Every lease is owned by a per-lease actor goroutine with a bounded inbox (16 messages). All transitions flow through a state machine, one per actor, which serializes transitions and owns the side effects (callback emission, diagnostics persistence, gauge updates). The SM's initial state is the lease's current `Status` at actor creation — new leases start in `Provisioning`, recovered leases start in whatever state they were in.
+Every lease is owned by a per-lease actor goroutine with a bounded inbox (16 messages). All transitions flow through a state machine, one per actor, which serializes transitions and owns the side effects (callback emission, diagnostics persistence, gauge updates). The SM's initial state comes from the lease's projected status at actor creation (`readProvisionStatus`): a lease with no projection, or one projected as `Provisioning` (a new or recovered provision or restore awaiting actor admission), starts in the private `Reserved` state; any other lease starts in its projected status.
 
 ```mermaid
 stateDiagram-v2
+    Reserved --> Provisioning: ProvisionRequested
+    Reserved --> Restarting: RestoreRequested
+    Reserved --> Deprovisioning: DeprovisionRequested
+
     Provisioning --> Ready: ProvisionCompleted
     Provisioning --> Failed: ProvisionErrored
     Provisioning --> Deprovisioning: DeprovisionRequested
@@ -1134,6 +1140,9 @@ stateDiagram-v2
     Ready --> Updating: UpdateRequested
 
     Failing --> Failed: DiagGathered
+    Failing --> Provisioning: ProvisionRequested
+    Failing --> Restarting: RestartRequested
+    Failing --> Updating: UpdateRequested
     Failing --> Deprovisioning: DeprovisionRequested
 
     Failed --> Provisioning: ProvisionRequested
@@ -1151,10 +1160,12 @@ stateDiagram-v2
     Updating --> Failed: ReplaceFailed
     Updating --> Deprovisioning: DeprovisionRequested
 
+    Unknown --> Deprovisioning: DeprovisionRequested
+
     Deprovisioning --> [*]
 ```
 
-The edges above are the complete set of allowed transitions; any event not listed against a source state is either ignored (see below) or rejected as an invalid trigger. The authoritative source is `internal/backend/shared/leasesm/lease_sm.go`.
+The edges above are the complete `Permit` set except twelve recovery-only edges on the `MaintenanceRecovered*` events (two each from `Ready` and `Failed`, four each from `Restarting` and `Updating`). Only the `NewMaintenanceRecovered*Msg` constructors can fire those, and no production code calls them: maintenance recovery instead rewrites the projection without an actor (see [State Recovery](#state-recovery)). `Deprovisioning` has no outgoing transition; the actor exits once teardown completes. Any other event against a source state is either ignored (see below) or rejected as an invalid trigger. The authoritative source is `internal/backend/shared/leasesm/lease_sm.go`.
 
 ### Key behaviors
 
@@ -1208,7 +1219,7 @@ these phases do not measure the full wall time of a failed replacement.
 - `fred_docker_backend_lease_actor_stuck_seconds` — age of the oldest in-flight actor handler. Alert threshold should exceed the longest legitimate operation (Deprovision can hold an actor for minutes during container/volume cleanup).
 - `fred_docker_backend_lease_actor_inbox_depth` — histogram of per-actor inbox depth; p99 near 0 is healthy.
 - `fred_docker_backend_lease_actor_panics_total` — counts panics recovered inside actor handlers. Any non-zero is a bug; the actor survives and keeps processing, but the message that panicked did not drive its transition.
-- `fred_docker_backend_lease_terminal_event_dropped_total{event}` — worker terminal sends refused because the actor had exited (pathological `waitForWorkers` timeout). Should be zero in normal operation.
+- `fred_docker_backend_lease_terminal_event_dropped_total{event}` — worker terminal sends refused because the actor had exited or was in its final drain (normally only after a `waitForWorkers` timeout), or because the inbox stayed full for `terminalSendTimeout` (10s). Should be zero in normal operation.
 - `fred_docker_backend_die_event_dropped_total{source}` — container-death
   observations refused because their exact generation was stale, recovery held
   the actor key, the backend was shutting down, or the current actor's inbox was
@@ -1224,9 +1235,11 @@ these phases do not measure the full wall time of a failed replacement.
   never counts toward the terminal budget. Sustained growth flags churn,
   recovery contention, a wedged actor, or chronic burst.
 - `fred_docker_backend_container_event_stream_total{outcome}` — the container
-  event subscription's lifecycle (ENG-799): `connected` (a subscription opened
-  after storage re-verification), `reconnect` (the stream ended or could not be
-  opened, and the loop retries with backoff), `exited` (the loop stopped:
+  event subscription's lifecycle (ENG-799): `connected` (storage was
+  re-verified and a subscription attempt starts; counted before the
+  subscription opens), `reconnect` (the stream ended, could not be opened, or
+  storage identity could not be re-verified, and the loop retries with
+  backoff), `exited` (the loop stopped:
   shutdown or withdrawn storage authority). Deaths during a gap, and the first
   death of any run that started before the stream (re)connected, are
   attributed `unknown`.
@@ -1238,15 +1251,15 @@ these phases do not measure the full wall time of a failed replacement.
 - `fred_docker_backend_volume_delete_holds{phase}` — XFS volume deletions held per volume and retried by the hold executor, by phase (`removal`: the caller stays pending; `unsized`: the volume is gone, a caller may have settled, and the footprint is not known yet, so disk admission is withheld; `residual`: the volume is gone and only its quota project remains). `fred_docker_backend_volume_delete_outcomes_total{outcome}` counts deletion attempts (`completed`, `held_removal`, `held_unsized`, `held_residual`, `latched`), and `fred_docker_backend_volume_delete_held_residual_mb` is the disk (MiB) that admission counts for residual holds (ENG-1117).
 - `fred_docker_backend_close_intents_delete_held` — pending close intents waiting only on held volume deletions (every remaining volume slot held, the rest done); the hold executor resumes them. `fred_docker_backend_oldest_unheld_close_intent_age_seconds` is the oldest age among the other pending closes, the gauge close-age paging uses (ENG-1117).
 - `fred_docker_backend_tree_removals_total{site,outcome}` and `fred_docker_backend_tree_removal_cuts_total{site}` — removals of tenant directory trees (`site` ∈ `delete_stage`, `writable_path`) by outcome, and the subtrees moved into the removal anchor because the tree was deeper than the remover's ancestry bound (ENG-1117).
-- `fred_docker_backend_pending_close_intents` and `fred_docker_backend_oldest_close_intent_age_seconds` — unlabeled aggregate count and oldest age for the non-expiring destructive-close journal. A brief non-zero value is normal while a close runs; sustained age means a finalizer dependency is unavailable. Use the lease-scoped recovery log to identify the row without introducing an unbounded lease label.
+- `fred_docker_backend_pending_close_intents` and `fred_docker_backend_oldest_close_intent_age_seconds` — unlabeled aggregate count and oldest age for the non-expiring destructive-close journal. A brief non-zero value is normal while a close runs. This age includes closes waiting only on held volume deletions, which are expected to age, so page on `fred_docker_backend_oldest_unheld_close_intent_age_seconds` instead: its sustained age means a finalizer dependency is unavailable. Use the lease-scoped recovery log to identify the row without introducing an unbounded lease label.
 - `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}` — exact provision/restore intents classified past their durable admission deadline. Both kinds share this configured horizon. Cleanup remains periodic and retryable; there is no container-start recovery timer.
 - `fred_docker_backend_operation_intent_recovery_cleanup_retries_total` — Deferred exact operation cleanup (`provision`/`restore`); intent and reservation remain for periodic retry.
 - `fred_docker_backend_terminal_substrate_pending_containers` — Last late-container count for permanent `closed`/`failed_operation` receipts; nonzero withholds this backend’s pool capacity/readiness until strict absence.
 - `fred_docker_backend_terminal_substrate_cleanup_retries_total` — Transient late-container cleanup retries; daemon stays alive and exact terminal receipts remain.
 - `fred_docker_backend_unaccounted_managed_volumes` — Attested managed volumes absent from current live, admitted-operation, and all retention projections; diagnostic only, never deletion or admission authority.
 - `fred_docker_backend_unaccounted_managed_volume_observation_failures_total` — Failed diagnostic inventory/footprint observations; last unaccounted-volume gauge is retained, not reset to zero.
-- `fred_docker_backend_reconciliation_total{outcome}` and `fred_docker_backend_reconciliation_last_success_timestamp_seconds` — the runtime signal for state and live-operation recovery, including maintenance-WAL convergence. Global storage, journal, transport or unclassified observation failures can report `outcome="error"` and leave last-success stale while `/health` remains green; health does not validate every substrate classification. Explicit lease-local maintenance deferrals use their own counter and preserve sibling progress. Durable restore-finalizer failures, including a lease-local source quota handback failure, intentionally count as pass errors and freeze last-success until settled. The `reconcile restoring operations:` prefix identifies this debt; independent finalizers still progress. This escalation can trigger reconciliation alerts even though recovery continues. Network reclamation has an independent budget and outcome counter. During startup, unresolved failures at a global recovery boundary still exit before periodic recovery starts.
-- `fred_docker_backend_retention_sweep_total{outcome}` — one increment per periodic retention-sweep pass, `success` or `error`. The sum across outcomes is a liveness heartbeat (it advances every tick regardless of result); `{outcome="error"}` means a sweep stage failed — usually an unenumerable retention store, but the orphan stage reports a failed volume-root enumeration here too, so the joined stage error is what identifies the actual failing dependency. Every stage runs on every pass and the stage errors are joined, so the log line names all of them rather than only the first.
+- `fred_docker_backend_reconciliation_total{outcome}` and `fred_docker_backend_reconciliation_last_success_timestamp_seconds` — the runtime signal for state and live-operation recovery, including maintenance-WAL convergence. Only the periodic `reconcile_interval` loop records them; startup recovery and `RefreshState` do not, so the timestamp is 0 until the first periodic pass succeeds. Global storage, journal, transport or unclassified observation failures can report `outcome="error"` and leave last-success stale while `/health` remains green; health does not validate every substrate classification. Explicit lease-local maintenance deferrals use their own counter and preserve sibling progress. Durable restore-finalizer failures, including a lease-local source quota handback failure, intentionally count as pass errors and freeze last-success until settled. The `reconcile restoring operations:` prefix identifies this debt; independent finalizers still progress. This escalation can trigger reconciliation alerts even though recovery continues. Network reclamation has an independent budget and outcome counter. During startup, unresolved failures at a global recovery boundary still exit before periodic recovery starts.
+- `fred_docker_backend_retention_sweep_total{outcome}` — one increment per periodic retention-sweep pass that runs its stages, `success` or `error`; a pass that fails storage-identity verification first, or panics, records none. The sum across outcomes is a liveness heartbeat (it advances every such pass regardless of result); `{outcome="error"}` means a sweep stage failed — usually an unenumerable retention store, but the orphan stage reports a failed volume-root enumeration here too, as does a restore finalizer that cannot finish, so the joined stage error is what identifies the actual failing dependency. Every stage runs on every pass and the stage errors are joined, so the log line names all of them rather than only the first.
 - `fred_docker_backend_retention_accounting_refresh_failed_total` — the retained-disk projection could not be recomputed and the previous value was kept. Safe (a zeroed projection would over-admit) but it means the five retention gauges and the pool's retained input are stale while this rises.
 - `fred_docker_backend_maintenance_readiness_pending_total{branch}` — readiness deferrals, including retries, for `committed_target`, `deploying_target`, `cleanup_source`, or `source_only`. The matching warning is emitted once per exact pending intent and branch in a backend lifetime. A committed target can remain pending indefinitely while its healthcheck is starting; inspect that workload rather than treating the metric as permission to roll it back.
 - `fred_docker_backend_maintenance_recovery_deferred_total` — explicitly lease-local observation conflicts deferred with their exact intent and reservation retained. Sibling recovery continues; storage/journal authority failures and global transport/cancellation errors still fail the recovery boundary.
@@ -1330,7 +1343,7 @@ select these production defaults.
 
 `recoverState` proceeds in this order:
 
-1. **Classify maintenance WALs lease by lease** -- decode the complete maintenance-intent journal, then re-read and classify each exact row under that lease's command fence. A live actor that owns the same `maintenance_id` remains the serial owner. Otherwise recovery joins the exact source/target Release with a fresh bounded strict Docker inventory; it never relies on one fleet-wide point-in-time snapshot and never reruns Compose. Expected readiness waits and known lease-local observation conflicts retain the exact WAL and transitional projection while sibling recovery proceeds. Global or unclassified failures abort the pass before ordinary projection can reinterpret a mixed source/target cohort. Partial-target cleanup revalidates and removes immutable Docker IDs individually, so an error on a later sibling may leave safe idempotent progress while the WAL remains for the next pass; reusable names are never cleanup authority.
+1. **Classify maintenance WALs lease by lease** -- decode the complete maintenance-intent journal, then re-read and classify each exact row under that lease's command fence. A live actor that owns the same `maintenance_id` remains the serial owner: recovery takes a lease only while its actor is idle. Recovery then joins the exact source/target Release with a fresh bounded strict Docker inventory; it never relies on one fleet-wide point-in-time snapshot and never reruns Compose. It retires the idle actor first and writes the converged projection directly (`applyMaintenanceProjectionWithoutActor`), so the next live command builds a fresh actor from it. Expected readiness waits and known lease-local observation conflicts retain the exact WAL and transitional projection while sibling recovery proceeds. Global or unclassified failures abort the pass before ordinary projection can reinterpret a mixed source/target cohort. Partial-target cleanup revalidates and removes immutable Docker IDs individually, so an error on a later sibling may leave safe idempotent progress while the WAL remains for the next pass; reusable names are never cleanup authority.
 2. **List managed containers** -- filters by `fred.managed=true` label for the ordinary projection.
 3. **Stabilize lifecycle authority** -- recovery holds the exclusive side of a backend-local snapshot guard from ordinary managed-container inventory through close/restore durable-authority reads and matching provision/pool publication. Live Deprovision and Restore paths hold the shared side only for authority capture and durable handoffs, not destructive substrate work. Load every close intent before ordinary callback-label or release-cohort validation. Containers owned by a close are deliberately excluded from those exact-cohort checks because teardown may already have removed some or all siblings. Provision validation remains available, but its short accepted-intent-to-projection handoff can wait for the current snapshot publication; Restore admission or final rollback may wait at its corresponding handoff.
 4. **Validate ordinary callback and release cohorts** -- every sibling must carry one coherent callback pair. Current releases must carry complete matching typed runtime authority. A complete callback-bearing stack-form v0.13 cohort is CAS-fenced with a distinct `LegacyRuntimeAuthority` that freezes its canonical principal and tokenless pair without manufacturing an operation ID; a pre-stack or callbackless cohort is rejected because provider callback authority cannot be minted safely. Either authority's exact `Items` and resource profiles must match the observed service/SKU/index/domain/image set; a mismatch fails the lease closed. With no survivors, it reconstructs the exact identity, callback route, topology, and conservative allocation as Failed. A still-unbackfilled v0.13 stack row is derived only from a complete, identity-consistent, dense cohort and exact active manifest, then receives the whole-release and runtime-authority backfills before any operation may erase its last container. The first and every subsequent restart, update, or custom-domain replacement stays tokenless; its independent UUIDv4 `maintenance_id` is exact replacement journal/cohort identity, not provider callback authority. Only a later genuine provision or restore rotates callback authority to typed. A pending operation intent owns its own generation transition and resource snapshot and is classified separately during startup.
@@ -1884,11 +1897,11 @@ default failure reason that was absent from the stored representation.
 
 ### `POST /reconcile_custom_domain` (authenticated)
 
-Reconciles a lease's custom-domain ingress labels to match the supplied items. Body carries `lease_uuid` and `items`. Returns `204 No Content`; `404` if not provisioned, `409` for an invalid state.
+Reconciles a lease's custom-domain ingress labels to match the supplied items. Body carries `lease_uuid` and `items`. Returns `204 No Content` when there is nothing to do (ingress disabled, the lease not provisioned or not Ready, no drift) and once a drift redeploy is admitted. `404` and `409` mean the lease was deprovisioned or left Ready between that check and the redeploy; `503` carries code `lifecycle_pending` or `insufficient_resources`; `400` rejects a malformed body or lease UUID.
 
 ### `GET /health` (unauthenticated)
 
-Docker daemon reachability check. Also probes the callback, diagnostics, release, and retention bbolt stores — a locked, corrupt, or read-only store surfaces as unhealthy instead of the backend reporting healthy while soft-delete/restore silently fail (ENG-448).
+Verifies the backend's storage identity, then checks Docker daemon reachability. Also probes the callback, diagnostics, release, and retention bbolt stores — a locked, corrupt, or read-only store surfaces as unhealthy instead of the backend reporting healthy while soft-delete/restore silently fail (ENG-448) — and reads the launch journal's pending count.
 
 Late containers covered by permanent closed/failed receipts also make this
 backend unready while their resource footprint cannot be accounted. The pool
@@ -1906,7 +1919,7 @@ authorize cleanup; a sustained value calls for operator attribution.
 }
 ```
 
-Returns `503` if the Docker daemon is unreachable **or** any of those stores is unhealthy.
+Returns `503` if storage identity verification fails (in the route's middleware or inside `Backend.Health`), the Docker daemon is unreachable, a resource-accounting hold is in place, any of those stores is unhealthy, **or** the launch journal cannot be read.
 
 ### `GET /stats` (unauthenticated)
 
@@ -1951,7 +1964,7 @@ Prometheus metrics in exposition format. Served by `promhttp.Handler()`.
 
 The resource pool tracks CPU, memory, and effective physical disk allocations.
 
-- **Allocation IDs** are per-instance: `<lease-uuid>-<instance-index>` for single-container leases (e.g., `abc123-0`, `abc123-1`), or `<lease-uuid>-<service-name>-<instance-index>` for stack leases (e.g., `abc123-web-0`, `abc123-db-0`).
+- **Allocation IDs** are per-instance: `<lease-uuid>-<service-name>-<instance-index>`, with the index 0-based within each service (e.g., `abc123-app-0` for a single-service lease, or `abc123-web-0`, `abc123-db-0` for a stack).
 - **TryAllocate** atomically checks capacity and reserves resources for a SKU. Durable workflows use the exact profile already captured by their intent/release/restore-finalizer/close snapshot, so accounting and substrate limits cannot resolve different values. Docker effective disk is `disk_mb + scratch_disk_mb`, with validation making the two mutually exclusive. On insufficient resources, it returns an error and the caller rolls back any partial allocations.
 - **Release** is idempotent -- releasing a non-existent allocation is a no-op.
 - **Stats** returns total, allocated, and available CPU/memory/effective disk.
@@ -1990,11 +2003,12 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 | `fred.provider_uuid` | provider UUID | Provider that fulfills the lease |
 | `fred.sku` | SKU identifier | SKU profile used for resource limits |
 | `fred.created_at` | RFC 3339 timestamp | When the container was created |
-| `fred.instance_index` | integer string | 0-based index within a multi-unit lease |
+| `fred.instance_index` | integer string | 0-based instance index within the container's service |
 | `fred.fail_count` | integer string | Lifetime number of failures recorded for this lease at creation time (diagnostic; never decides a close) |
 | `fred.callback_url` | URL string | Exact completion URL with an operation capability for new provision/restore; inherited v0.13 lineage remains tokenless |
 | `fred.lifecycle_callback_url` | URL string | Paired endpoint for later maintenance, runtime-failure, and deprovision observations; typed for new provision/restore, tokenless for inherited v0.13 lineage; persisted across backend restarts |
-| `fred.service_name` | service name string | Service name within a stack (stack provisions only) |
+| `fred.maintenance_id` | UUIDv4 string, or empty | Exact `maintenance_id` of the restart, update or custom-domain redeploy that created the container; empty for a provision or restore launch. Identifies the replacement cohort during recovery |
+| `fred.service_name` | service name string | Service name within the lease's stack (`app` for a single-service lease). Every managed container carries it; a strict inventory fails on a managed container without it |
 | `fred.backend_name` | backend name string | Name of the backend managing the container; set on every managed container |
 | `fred.fqdn` | FQDN string | Assigned ingress FQDN; set on the ingress / custom-domain path |
 | `fred.custom_domain` | domain string | Tenant custom domain; set on the custom-domain path |

@@ -65,7 +65,7 @@ def main():
     expect_valid("single-service with ports", {
         "image": "nginx:latest",
         "ports": {
-            "80/tcp": {"host_port": 8080},
+            "80/tcp": {"ingress": True},
             "53/udp": {}
         }
     })
@@ -165,7 +165,7 @@ def main():
 
     expect_valid("single-service all fields", {
         "image": "nginx:latest",
-        "ports": {"80/tcp": {"host_port": 8080}},
+        "ports": {"80/tcp": {"host_port": 0}},
         "env": {"APP": "test"},
         "command": ["/entrypoint.sh"],
         "args": ["--debug"],
@@ -228,6 +228,33 @@ def main():
     expect_invalid("host_port negative", {
         "image": "nginx",
         "ports": {"80/tcp": {"host_port": -1}}
+    })
+
+    expect_invalid("fixed host_port (host ports are always dynamic)", {
+        "image": "nginx",
+        "ports": {"80/tcp": {"host_port": 8080}}
+    })
+
+    # Ingress applies only to a TCP port.
+    expect_invalid("ingress on a UDP port", {
+        "image": "nginx",
+        "ports": {"53/udp": {"ingress": True}}
+    })
+
+    expect_invalid("ingress on an uppercase UDP port", {
+        "image": "nginx",
+        "ports": {"53/UDP": {"ingress": True}}
+    })
+
+    expect_valid("UDP port with ingress false", {
+        "image": "nginx",
+        "ports": {"53/udp": {"ingress": False}}
+    })
+
+    expect_invalid("stack service with ingress on a UDP port", {
+        "services": {
+            "web": {"image": "nginx", "ports": {"53/udp": {"ingress": True}}}
+        }
     })
 
     expect_invalid("env blocked PATH", {
@@ -717,6 +744,43 @@ def main():
     expect_invalid("tmpfs /dev exact", {
         "image": "nginx",
         "tmpfs": ["/dev"]
+    })
+
+    # The runtime cleans each path (Go path.Clean) before its checks; the
+    # schema accepts only paths that are already clean.
+    expect_invalid("tmpfs /tmp/ (trailing slash)", {
+        "image": "nginx",
+        "tmpfs": ["/tmp/"]
+    })
+
+    expect_invalid("tmpfs /var/cache/ (trailing slash)", {
+        "image": "nginx",
+        "tmpfs": ["/var/cache/"]
+    })
+
+    expect_invalid("tmpfs //var/cache (empty element)", {
+        "image": "nginx",
+        "tmpfs": ["//var/cache"]
+    })
+
+    expect_invalid("tmpfs /var/./cache (dot element)", {
+        "image": "nginx",
+        "tmpfs": ["/var/./cache"]
+    })
+
+    expect_invalid("tmpfs /var/../proc (dot-dot element)", {
+        "image": "nginx",
+        "tmpfs": ["/var/../proc"]
+    })
+
+    expect_invalid("tmpfs duplicate after normalization", {
+        "image": "nginx",
+        "tmpfs": ["/data", "/data/"]
+    })
+
+    expect_valid("tmpfs dotted file-like name (not a dot element)", {
+        "image": "nginx",
+        "tmpfs": ["/var/.cache", "/opt/app..d"]
     })
 
     expect_valid("tmpfs /var/log (allowed path)", {

@@ -8,7 +8,8 @@ This guide explains how to implement a backend for Fred. A backend is an HTTP se
 ┌────────────────────────────────────────────────────────────────┐
 │                            FRED                                 │
 │                                                                │
-│  Lease: {items: [{sku: "docker-nginx", quantity: 1}], ...}     │
+│  Lease: {items: [{sku: "a1b2c3d4-...-1234567890ab",            │
+│                   quantity: 1}], ...}                          │
 │              │                                                 │
 │              ▼                                                 │
 │  ┌─────────────────────────────────────────────────────────┐   │
@@ -33,9 +34,10 @@ This guide explains how to implement a backend for Fred. A backend is an HTTP se
                 │       Your Backend            │
                 │       (HTTP server)           │
                 │                               │
-                │  Receives full SKU, decides:  │
-                │  "docker-nginx" → nginx:latest│
-                │  "docker-redis" → redis:7     │
+                │  Maps the SKU UUID to its own │
+                │  profile (e.g. sku_mapping):  │
+                │  a1b2c3d4-... → docker-small  │
+                │  b2c3d4e5-... → docker-large  │
                 └───────────────────────────────┘
 ```
 
@@ -91,19 +93,24 @@ name—give every replacement a new unique name.
 
 ### Level 2: Backend Interprets Full SKU
 
-Your backend receives the full SKU and decides what to do with it. This is entirely up to you:
+Your backend receives each item's on-chain SKU UUID in its `sku` field and
+decides what to do with it. This is entirely up to you. A backend typically maps
+each UUID it serves to a profile of its own. The bundled Docker backend does this
+with its `sku_mapping` config (SKU UUID → profile name): each `sku_profiles`
+entry sets CPU, memory and disk limits, the image comes from the tenant's
+manifest, and a UUID that maps to no profile is refused as `unknown_sku`.
 
-| SKU | Backend Interpretation |
-|-----|----------------------|
-| `docker-nginx` | Create nginx:latest container |
-| `docker-redis` | Create redis:7-alpine container |
-| `k8s-small` | Create deployment with 1 CPU, 512MB (illustrative — see k3s note below) |
-| `k8s-large` | Create deployment with 4 CPU, 4GB (illustrative — see k3s note below) |
-| `gpu-a100` | Allocate A100 GPU node |
+| SKU UUID | Profile | Backend Interpretation |
+|-----|-----|----------------------|
+| `a1b2c3d4-...-1234567890ab` | `docker-small` | Run each instance with 0.5 CPU, 512 MB memory and a 1 GB disk quota (Docker backend) |
+| `b2c3d4e5-...-2345678901bc` | `docker-large` | Run each instance with 2 CPU, 2 GB memory and a 4 GB disk quota (Docker backend) |
+| `d4e5f6a7-...-5678901234ef` | `k8s-small` | Create deployment with 1 CPU, 512MB (illustrative — see k3s note below) |
+| `e5f6a7b8-...-6789012345f0` | `k8s-large` | Create deployment with 4 CPU, 4GB (illustrative — see k3s note below) |
+| `c3d4e5f6-...-4567890123de` | `gpu-a100` | Allocate A100 GPU node |
 
 **Note:** The `mock-backend` included with Fred ignores the SKU entirely - it provisions the same fake resource regardless of SKU. This is intentional for testing purposes.
 
-**Note on `k8s-*` / k3s:** The `k8s-small`/`k8s-large` rows above are illustrative only. The bundled `k3s-backend` is an **experimental, non-functional scaffold (ENG-133)**: it serves the full HTTP contract except the optional `POST /restore` retention route (retention/restore is docker-only today), but its provisioner returns `status=failed, error="not implemented"` and returns `ErrNotProvisioned` for info/logs/restart/update. It is **not for production use**; real Kubernetes provisioning lands in ENG-134+.
+**Note on `k8s-*` / k3s:** The `k8s-small`/`k8s-large` rows above are illustrative only. The bundled `k3s-backend` is an **experimental, non-functional scaffold (ENG-133)**: it serves the HTTP contract except `POST /restore`, for which it registers no route, so a restore request gets a `404` rather than the bare `422` that the `POST /restore` section requires of a backend without retention support (retention/restore is docker-only today). Its provisioner returns `status=failed, error="not implemented"`, and it returns `ErrNotProvisioned` for info/logs/restart/update/releases. It is **not for production use**; real Kubernetes provisioning lands in ENG-134+.
 
 ## Inbound Authentication
 
@@ -124,12 +131,13 @@ Read the body, then verify before dispatching to the handler. Backends inside th
 To support rotating a key without a coordinated stop, a backend SHOULD accept
 one extra verify-only key while a rotation is in progress (docker-backend's
 `callback_secret_next`) and MUST keep signing callbacks with its main key only.
-Try the second key only when the signature does not match the first; format and
-timestamp failures do not depend on the key. Backends inside this repository use
+Compute the MAC with both keys on every request and accept a match with either,
+so the time taken does not reveal which key matched; format and timestamp
+failures do not depend on the key. Backends inside this repository use
 `hmacauth.VerifyKeys` and `hmacauth.VerifyRequestKeys`. The bundled k3s and mock
 backends accept one key only.
 
-**Unauthenticated endpoints:** only the operational endpoints `GET /health`, `GET /stats`, and `GET /metrics` are exempt. Every other (contract) endpoint below must be authenticated.
+**Unauthenticated endpoints:** only the operational endpoints `GET /health`, `GET /stats`, and `GET /metrics` are exempt. Fred still signs its `/health` and `/stats` requests, but a backend need not verify those signatures (the bundled backends do not); both responses must carry the storage-identity header described below. Fred never calls `/metrics`. Every other (contract) endpoint below must be authenticated.
 
 ## Durable Backend Storage Identity
 
@@ -143,9 +151,13 @@ regenerate it merely because the backend is empty.
 
 The HTTP contract is:
 
-- Every identity-bearing contract response, including application errors and
-  inventory pages, carries exactly one
-  `X-Fred-Backend-Storage-ID: <canonical-uuidv4>` header. A response produced
+- Every response to a Fred request, including application errors, inventory
+  pages, `GET /health` and `GET /stats`, carries exactly one
+  `X-Fred-Backend-Storage-ID: <canonical-uuidv4>` header. Fred rejects a
+  response whose header is missing, empty, repeated, malformed, or different
+  from its pin. The one exception is a `404` without the header on an
+  identity-bound mutation path, which Fred reads as a backend that predates
+  those paths and therefore never dispatched the request. A response produced
   after lineage re-attestation fails must omit the header and fail with `503`;
   it must not assert a cached identity for a known-unverified substrate. The
   outer protocol wrapper may include the process's sealed ID on cheap
@@ -157,10 +169,11 @@ The HTTP contract is:
   Missing, malformed, duplicate, changing, or cross-endpoint-different values
   make that backend unanswered; they never establish absence authority.
 - When Fred has a durable pin, it sends exactly one
-  `backend_storage_id=<canonical-uuidv4>` query parameter on reads and
-  inventories. Parse `RawQuery` fail-closed: malformed escaping, a duplicate
-  key, a noncanonical UUID, or a present mismatch is a protocol error. This
-  query is part of `RequestURI` and therefore covered by request HMAC.
+  `backend_storage_id=<canonical-uuidv4>` query parameter on every request,
+  including mutations, `GET /health` and `GET /stats`. Parse `RawQuery`
+  fail-closed: malformed escaping, a duplicate key, a noncanonical UUID, or a
+  present mismatch is a protocol error. This query is part of `RequestURI` and
+  therefore covered by request HMAC.
 - Side effects use only the upgraded namespace
   `/_fred/storage/{storage-id}/{operation}`. The current operations are
   `provision`, `deprovision`, `restart`, `update`, `restore`, and
@@ -267,13 +280,24 @@ Every non-2xx response **MUST** be JSON in this envelope:
 {
   "error": "human-readable description of what went wrong",
   "validation_code": "unknown_sku | invalid_manifest | image_not_allowed",
-  "code": "already_provisioned | demote_exceeds_tier | insufficient_resources | lifecycle_pending"
+  "code": "already_provisioned | invalid_state | operation_completion_pending | maintenance_expired | close_deferred | demote_exceeds_tier | insufficient_resources | lifecycle_pending"
 }
 ```
 
 - `error` **(required)** — a human-readable description. See the curation rule below.
 - `validation_code` (omitempty) — on a `400`, the sub-category of the validation failure. Fred parses it to reconstruct a precise sentinel error, which is what gives the on-chain rejection reason its precision; omit it and fred falls back to a generic validation failure.
-- `code` (omitempty) — a machine-readable discriminator. Today: `already_provisioned` on `/restore`'s `409`, `demote_exceeds_tier` on `/restore`'s `422`, and `insufficient_resources` on capacity-refused mutation requests or busy log reads (`503`). See those endpoints. A read-capacity response supplies retry guidance only; it cannot settle a durable mutation attempt.
+- `code` (omitempty) — a machine-readable discriminator. Today's codes are listed below; see each endpoint for its meaning. A read-capacity response supplies retry guidance only; it cannot settle a durable mutation attempt.
+
+| `code` | Status | Endpoints |
+|---|---|---|
+| `already_provisioned` | `409` | `/restore` |
+| `invalid_state` | `409` | `/provision` |
+| `operation_completion_pending` | `409` | `/provision`, `/restore` |
+| `maintenance_expired` | `409` | `/restart`, `/update` |
+| `close_deferred` | `409` | `/deprovision` |
+| `demote_exceeds_tier` | `422` | `/restore` |
+| `insufficient_resources` | `503` | Capacity refusal on `/provision`, `/restore`, `/restart`, `/update` and `/reconcile_custom_domain`; read capacity on `/info`, `/logs`, `/provisions/{lease_uuid}`, `/releases`, `/stats` and the filtered `/provisions` lookup |
+| `lifecycle_pending` | `503` | `/restart`, `/update`, `/deprovision`, `/reconcile_custom_domain` |
 
 `POST /restart`, `/update`, `/deprovision` and `/reconcile_custom_domain`
 may return `503` with `{"error":"admitted lifecycle work remains pending","code":"lifecycle_pending"}`
@@ -307,9 +331,9 @@ enforces peer-verified HTTPS using a configured private CA or system roots. The 
 separates bundled/backend-contract responses from ordinary proxy HTML, foreign
 JSON, legacy code-less envelopes, and unknown codes.
 
-The one exception fred tolerates is an **empty** body: a backend that answers a `409`/`422` with nothing at all is read as the plain meaning of that status. An empty or code-less v0.13 `503` still produces the `ErrInsufficientResources` diagnostic sentinel for API compatibility, but its typed causal outcome is **ambiguous**, not refused; fred therefore retains the write-ahead attempt. (Note that *bare*, everywhere else in this guide and in README/ARCHITECTURE/OPERATIONS, means a response carrying **no `code` discriminator** — a different thing, and one that still owes an `error` body.) Anything that is not empty must be the envelope with a non-empty `error`: an unparseable body, and a body that is valid JSON but omits `error` (`{}`, `null`, `{"message": "..."}`, or even `{"code": "..."}`), are contract violations. A discriminator alone does not substitute for `error` — send both.
+The one exception fred tolerates is an **empty** body: a backend that answers a `409`/`422` with nothing at all is read as the plain meaning of that status. An empty or code-less v0.13 `503` from a mutation other than `/deprovision` still produces the `ErrInsufficientResources` diagnostic sentinel for API compatibility, but its typed causal outcome is **ambiguous**, not refused; fred therefore retains the write-ahead attempt. (Note that *bare*, everywhere else in this guide and in README/ARCHITECTURE/OPERATIONS, means a response carrying **no `code` discriminator** — a different thing, and one that still owes an `error` body.) Anything that is not empty must be the envelope with a non-empty `error`: an unparseable body, and a body that is valid JSON but omits `error` (`{}`, `null`, `{"message": "..."}`, or even `{"code": "..."}`), are contract violations. A discriminator alone does not substitute for `error` — send both.
 
-The `code` set is **open and add-only**. If fred receives a `code` it does not recognize for that status — including one that is valid for a *different* status — it does not guess. It preserves the exact write-ahead attempt, keeps the declared `error` only for operator diagnostics, and returns a generic failure rather than asserting a tenant-visible backend or lease-state fact. That is not treated as a malformed body; breaker classification remains endpoint-specific as described below. An unknown discriminator never grants mutation settlement authority. The precise mapping (and any tenant-facing status remap, e.g. a code-less `422` → `404`) appears only once `providerd` learns the code, so ship the fred side first if the mapping matters.
+The `code` set is **open and add-only**. If fred receives a `code` it does not recognize for that status — including one that is valid for a *different* status — it does not guess. It preserves the exact write-ahead attempt, keeps the declared `error` only for operator diagnostics, and returns a generic failure rather than asserting a tenant-visible backend or lease-state fact. That is not treated as a malformed body; breaker classification remains endpoint-specific as described below. An unknown discriminator never grants mutation settlement authority, with one exception: Fred reads a `409` from `/restart` or `/update` as the invalid-state refusal unless its body is exactly the `maintenance_expired` envelope, so an unknown or different code there settles the command as refused. The precise mapping (and any tenant-facing status remap, e.g. a code-less `422` → `404`) appears only once `providerd` learns the code, so ship the fred side first if the mapping matters.
 
 Settlement is type-enforced after this parse. Package-owned `backend.Invoke*`
 functions grant causal classification only to the exact identity-bound HTTP
@@ -323,14 +347,15 @@ Circuit-breaker classification is separate from mutation settlement:
 |---|---|---|
 | Caller context ended during a failed invocation | Excluded; preserves failure streak and releases a half-open probe slot | Preserve the invocation's original causal result, including ambiguity |
 | Successful response | Success | Only the endpoint's exact contract grants acceptance |
-| Valid not-found, validation, invalid-state, already-provisioned or restore refusal | Success | Endpoint-specific refusal or ambiguity; never inferred from breaker classification |
+| Valid not-found, validation, invalid-state, maintenance-expired, already-provisioned or restore refusal | Success | Endpoint-specific refusal or ambiguity; never inferred from breaker classification |
 | `/deprovision` `409` with `code: close_deferred` | Success | Retry close; cleanup has not completed |
 | Lifecycle mutation `503` with `code: lifecycle_pending` | Success | Preserve the unresolved request; no refusal, no-dispatch or completed-cleanup authority |
 | `/provision` `409` with `code: invalid_state` | Success | Retain the attempt as ambiguous; does not prove existing ownership |
 | Capacity refusal (`503`, `code: insufficient_resources`), including custom-domain reconciliation | Success | Mutation refusal only where the endpoint supports that exact verdict |
+| `503` with an empty body, or an envelope with no or an unknown `code`, from `/provision`, `/restore`, `/restart`, `/update` or `/reconcile_custom_domain` | Success | Ambiguous; grants no refusal and keeps any write-ahead attempt |
 | `/stats` accounting hold or busy read (`503`, `code: insufficient_resources`) | Success | Retry/read admission only; no mutation authority |
 | Local storage identity unbound, upgrade required, or exact completion-pending response | Success | Preserve the endpoint's no-dispatch/ambiguous result |
-| Backend timeout while caller remains live, connection failure, malformed response or other server error | Failure | Preserve uncertainty; may open the breaker |
+| Backend timeout while caller remains live, connection failure, missing or mismatched storage-identity header, malformed response or other server error | Failure | Preserve uncertainty; may open the breaker |
 | Complete inventory recovery walk | Outside the tenant breaker | Requires complete, identity-consistent inventory |
 
 The caller-cancellation exclusion is applied inside the transport invocation;
@@ -347,15 +372,16 @@ HTTP client and therefore retain the full typed protocol behavior.
 
 Do include what lets a tenant *fix* the request — the offending manifest field, the rejected image reference, the registry allowlist, the byte counts of a tier that does not fit. Those are the tenant's own input and your published policy, and suppressing them only makes the error unactionable.
 
-**A non-envelope body is a contract violation.** If a 4xx body does not parse as the JSON above — including a body that is valid JSON but omits the required `error` field, such as `{}` or a proxy's own `{"message": "..."}` — fred does **not** forward it: it answers the tenant with a generic message, records the raw body in its own logs, and counts it in `fred_backend_malformed_error_body_total{backend,operation}`. It also declines to treat that response as a permanent tenant-side failure — an unparseable `400` could have come from an intermediary rather than from your backend, and fred will not reject or close a lease on-chain on that basis. Emit the envelope and you keep both the tenant's diagnostic and the permanent classification.
+**A non-envelope body is a contract violation.** Where Fred reads an error body to classify the response and it does not parse as the JSON above — including a body that is valid JSON but omits the required `error` field, such as `{}` or a proxy's own `{"message": "..."}` — fred does **not** forward it: it answers the tenant with a generic message, records the raw body in its own logs, and counts it in `fred_backend_malformed_error_body_total{backend,operation}`. It also declines to treat that response as a permanent tenant-side failure — an unparseable `400` could have come from an intermediary rather than from your backend, and fred will not reject or close a lease on-chain on that basis. Fred classifies some responses by status alone: a `404` from `/info`, `/logs`, `/provisions/{lease_uuid}`, `/releases`, `/restart`, `/update` or `/reconcile_custom_domain` means not provisioned, and a `409` from `/reconcile_custom_domain` means invalid state. A `409` from `/restart` or `/update` is the invalid-state refusal unless its body is exactly the `maintenance_expired` envelope; Fred neither forwards nor counts any other body there. Emit the envelope and you keep both the tenant's diagnostic and the permanent classification.
 
 The endpoint headings below use the short operation names to keep the payload
 contract readable. On the current protocol, `providerd` sends every mutating
 `POST` to `/_fred/storage/{storage-id}/{operation}`: `provision`, `deprovision`,
 `restart`, `update`, `restore`, and `reconcile_custom_domain`. The unbound
 `/{operation}` forms are v0.13 compatibility routes only; a current `providerd`
-never calls them. Read endpoints keep their unbound paths and receive the pinned
-identity as the HMAC-covered `backend_storage_id` query parameter.
+never calls them. Read endpoints keep their unbound paths. Every request, mutating
+or not, carries the pinned identity as the HMAC-covered `backend_storage_id`
+query parameter.
 
 ### POST /provision
 
@@ -378,8 +404,8 @@ enqueue or explicit actor rejection can authorize the existing refusal path.
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "items": [
-    {"sku": "docker-nginx", "quantity": 1, "service_name": "web", "custom_domain": "app.example.com"},
-    {"sku": "docker-redis", "quantity": 2, "service_name": "cache"}
+    {"sku": "a1b2c3d4-e5f6-7890-abcd-1234567890ab", "quantity": 1, "service_name": "web", "custom_domain": "app.example.com"},
+    {"sku": "b2c3d4e5-f6a7-8901-bcde-2345678901bc", "quantity": 2, "service_name": "cache"}
   ],
   "callback_url": "http://fred:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
   "lifecycle_callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
@@ -389,7 +415,7 @@ enqueue or explicit actor rejection can authorize the existing refusal path.
 ```
 
 **Item fields:**
-- `sku` - The full SKU (your backend interprets it; see Two Levels of SKU Handling)
+- `sku` - The on-chain SKU UUID (your backend interprets it; see Two Levels of SKU Handling)
 - `quantity` - Number of instances to provision for this item
 - `service_name` (omitempty) - Service name in a stack lease. **Fred forwards this verbatim from the chain**, so a legacy single-item lease arrives with an **empty** `service_name`. Your backend must treat an empty `service_name` as the synthetic default `"app"` itself — the in-repo backends do this at handler entry via `backend.NormalizeProvisionRequest` (which also rejects mixed-presence and multi-unnamed item sets). The same applies to items in `/update` and `/reconcile_custom_domain`.
 - `custom_domain` (omitempty) - Optional FQDN the tenant assigned to this item. When non-empty (and the service has a routable HTTP port), the backend should route `Host(<custom_domain>)` to this item's instances (see `POST /reconcile_custom_domain`)
@@ -420,11 +446,13 @@ enqueue or explicit actor rejection can authorize the existing refusal path.
 
 **Error Responses:**
 - `400 Bad Request` - Invalid request body
-- `409 Conflict` - Lease already provisioned, or `code: "operation_completion_pending"`
-  when an earlier operation completion still occupies this lease's durable
-  callback FIFO. The latter is an expected availability condition, but the
-  current provision remains ambiguous: Fred preserves its exact attempt and
-  cannot infer acceptance, refusal or permission to substitute another backend.
+- `409 Conflict` - Lease already provisioned (no `code`); `code: "invalid_state"`
+  when the lease's existing state on the backend cannot accept this provision;
+  or `code: "operation_completion_pending"` when an earlier operation completion
+  still occupies this lease's durable callback FIFO, an expected availability
+  condition. Fred treats every provision `409` as ambiguous: it preserves the
+  exact attempt and cannot infer acceptance, refusal, existing ownership or
+  permission to substitute another backend.
 - `503 Service Unavailable` - Insufficient resources. A backend that synchronously refuses before starting work MUST return `{"error":"...","code":"insufficient_resources"}`. Under the configured transport's trust boundary, Fred can then clear only that request's exact write-ahead attempt and may route a retry to another backend. A code-less, malformed, or unknown-code 503 remains ambiguous and blocks substitution because an intermediary could have emitted it after backend acceptance.
 
 ### GET /info/{lease_uuid}
@@ -460,11 +488,12 @@ Get connection details for a provisioned resource.
 }
 ```
 
-The response format is flexible - return whatever fields are relevant to your resource type. Fred passes this directly to tenants. The `ports` field maps container ports (e.g., `80/tcp`) to host bindings. Per-instance details (`container_id`, `image`, `status`, `fqdn`, `ports`) are nested under `instances[]`, not at the top level.
+Fred decodes the response into the known fields below and passes only those to tenants; it drops any other field. Put other backend-specific values in `metadata`, an object of string values. The `ports` field maps container ports (e.g., `80/tcp`) to host bindings; `host_port` is a string on the wire, and Fred serves it to tenants as an integer. Per-instance details (`container_id`, `image`, `status`, `fqdn`, `ports`) are nested under `instances[]`, not at the top level.
 
 **Known fields** that Fred extracts into the structured `ConnectionResponse`:
 - Top level: `host`, `fqdn`, `protocol`, `ports`, `instances`, `services`, `metadata`
 - Per `instances[]` entry: `instance_index`, `container_id`, `image`, `status`, `fqdn`, `ports`
+- Per `services` entry (keyed by service name): `fqdn`, `instances`
 
 When ingress is enabled, instances may include an `fqdn` field. If no top-level `fqdn` is present in the response, Fred propagates the first instance's `fqdn` to `connection.fqdn` automatically. The same propagation applies per-service in stack leases.
 
@@ -494,6 +523,18 @@ Release resources for a lease. **Must be idempotent** - calling multiple times s
 - Clean up any associated state
 - Return 200 even if the resource doesn't exist (idempotent)
 
+**Error Responses:**
+- `400 Bad Request` - Invalid request body or lease UUID
+- `409 Conflict` with `code: "close_deferred"` - The close must wait for the
+  lease's current lifecycle work to settle. Cleanup has not completed; Fred
+  retries the close.
+- `503 Service Unavailable` with `code: "lifecycle_pending"` - Admitted
+  lifecycle work remains pending; Fred defers the close (see Error responses
+  above).
+
+Fred reads only `200` as completed cleanup. Any other status, including `404`,
+and a `409` or `503` with a different code or none, is a failed deprovision.
+
 ### GET /provisions
 
 List currently provisioned resources. Used by Fred for reconciliation. Keyset-paginated (see **Pagination** below).
@@ -505,6 +546,7 @@ List currently provisioned resources. Used by Fred for reconciliation. Keyset-pa
     {
       "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
       "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+      "tenant": "manifest1abc...",
       "status": "ready",
       "created_at": "2024-01-15T10:30:00Z",
       "fail_count": 0,
@@ -513,10 +555,10 @@ List currently provisioned resources. Used by Fred for reconciliation. Keyset-pa
       "lifecycle_generation": {"kind": "typed", "id": "550e8400-e29b-41d4-a716-446655440001"},
       "terminal_budget": {"verdict": "retry", "consecutive_failures": 0},
       "image": "nginx:latest",
-      "sku": "docker-nginx",
+      "sku": "a1b2c3d4-e5f6-7890-abcd-1234567890ab",
       "quantity": 1,
       "items": [
-        {"sku": "docker-nginx", "quantity": 1, "service_name": "web"}
+        {"sku": "a1b2c3d4-e5f6-7890-abcd-1234567890ab", "quantity": 1, "service_name": "web"}
       ],
       "service_images": {"web": "nginx:latest"}
     }
@@ -527,6 +569,8 @@ List currently provisioned resources. Used by Fred for reconciliation. Keyset-pa
 
 **Pagination:** `GET /provisions` is keyset-paginated. Query params: `limit` (max page size) and `continue` (a lease UUID — the `continue` cursor returned by the previous page). The JSON response carries a top-level `continue` field set to the last record's lease UUID, omitted once the list is exhausted. An invalid `limit` or a non-UUID `continue` returns 400, as does a `continue` cursor supplied without a positive `limit`. A `limit` above the server maximum (5000) is coerced down to it rather than rejected. With no params it returns the full list unpaginated (back-compat). One or more `lease_uuid` query params return just those records. (ENG-380)
 
+**Inventory shape:** Every page must carry a `provisions` array; send `[]`, never `null` or no field, for an empty page. A non-empty `continue` must sort after the cursor Fred sent for that page. Across the complete walk, every `lease_uuid` must be a canonical lowercase, non-nil UUID and appear only once. Fred fails the whole walk otherwise.
+
 **Filtered workload lookup:** Fred groups confirmed leases without an unresolved
 attempt by recorded owner; uncertain placement still uses fleet discovery. Each
 response must contain only UUIDs assigned to that backend's request. An
@@ -536,6 +580,7 @@ replace a confirmed owner's result. These reads grant no placement authority.
 **Complete-inventory limits:** Fred accepts at most 100,000 items and 128 MiB of cumulative response-body bytes (including whitespace) for each complete `/provisions` or `/retentions` inventory, independently of page size. Complete `/provisions` and `/retentions` walks share one per-client recovery slot, independent of the tenant circuit breaker. The configured backend HTTP timeout bounds queueing and the entire walk, including every page and body read. Inventory neither trips nor resets the tenant breaker; filtered workload lookups and other tenant calls still use it. Exceeding a count, byte or time limit fails the whole walk; no partial result is usable as ownership, settlement or repair evidence.
 
 **Fields:**
+- `tenant` - The owning tenant's address; Fred never copies it into a tenant-facing response. From a complete inventory, Fred pairs it with `provider_uuid` (which must equal Fred's provider UUID) to establish the lease's runtime maintenance principal when it has none, which restart and update require (see `lifecycle_generation`). A row with an empty `tenant` still counts toward placement but cannot establish the principal; a pair that contradicts the principal Fred already holds quarantines the lease's lifecycle authority.
 - `fail_count` - Lifetime count of failures recorded for this lease, whoever caused them. Diagnostic only: Fred never closes a lease because of it (see `terminal_budget`).
 - `terminal_budget` (optional) - The lease's consecutive-failure budget: `verdict` (`retry` or `exhausted`) and `consecutive_failures`. Fred closes an ACTIVE lease for repeated failure only on an `exhausted` verdict; see [Terminal failure budget](#terminal-failure-budget-eng-799). Omission is backward-compatible and means Fred never closes the lease for repeated failure.
 - `reason` (omitempty) - Stable machine-readable failure category (CamelCase, e.g. `ContainerExited`, `HealthCheckFailed`, `ContainerStartFailed`, `ImagePullFailed`, `Internal`, `Unknown`). Open/add-only set; consumers must tolerate unknown values.
@@ -565,6 +610,7 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "tenant": "manifest1abc...",
   "status": "failed",
   "fail_count": 3,
   "terminal_budget": {"verdict": "retry", "consecutive_failures": 1},
@@ -577,6 +623,8 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
 **Fields:**
 - `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, or `deprovisioning`. A backend that implements soft-delete/retention (see `/restore` below) also returns `retained` for a closed or expired lease whose data is retained, alongside `items` (the restore shape).
 - `retained_until` (optional) - RFC3339 retention deadline for retained data with a configured age limit. Omit it when age-based expiry is disabled; do not encode a zero timestamp as a deadline. Other retention policy and capacity limits still apply.
+- `tenant` - The owning tenant's address; Fred never copies it into a tenant-facing response. A `retained` record needs it: when the chain has no record of the lease, Fred serves the tenant's status and provision reads from a `retained` record only if its `tenant` is nonempty and equals the caller's.
+- `partition` (omitempty) - Retained records only: the tenant's own retention-partition key, which Fred shows to that tenant with the retained record.
 - `fail_count` - Lifetime count of recorded failures (diagnostic only, as for `GET /provisions`)
 - `terminal_budget` (optional) - A live record reports the same budget as `GET /provisions`, which Fred also shows tenants. A diagnostics fallback or a retained record MUST omit it.
 - `reason` (omitempty) - Stable machine-readable failure category (CamelCase, e.g. `ContainerExited`, `HealthCheckFailed`, `ContainerStartFailed`, `ImagePullFailed`, `Internal`, `Unknown`). Open/add-only set; consumers must tolerate unknown values.
@@ -752,6 +800,13 @@ the same value on every replay. Older providers omit it.
 - `503 Service Unavailable` with `code: "insufficient_resources"` - The
   backend refused admission before side effects because its durable live-lease
   maintenance receipt capacity is exhausted
+- `503 Service Unavailable` with `code: "lifecycle_pending"` - Admitted
+  lifecycle work remains pending (see Error responses above); Fred keeps the
+  command pending
+
+Fred settles the command as an invalid-state refusal on any `409` whose body is
+not exactly the `maintenance_expired` envelope, including one with another
+`code` or a non-envelope body.
 
 ### POST /update
 
@@ -807,6 +862,12 @@ are not reversed by recreating the source.
 - `503 Service Unavailable` with `code: "insufficient_resources"` - The
   backend refused admission before side effects because its durable live-lease
   maintenance receipt capacity is exhausted
+- `503 Service Unavailable` with `code: "lifecycle_pending"` - Admitted
+  lifecycle work remains pending (see Error responses above); Fred keeps the
+  command pending
+
+As for `/restart`, Fred settles the command as an invalid-state refusal on any
+`409` that is not exactly the `maintenance_expired` envelope.
 
 ### POST /restore (optional — retention support)
 
@@ -819,7 +880,7 @@ Restore a soft-deleted lease's retained data into a **new** lease (async, callba
   "from_lease_uuid": "<original-retained-lease-uuid>",
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
-  "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
+  "items": [{"sku": "b2c3d4e5-f6a7-8901-bcde-2345678901bc", "quantity": 1, "service_name": "app"}],
   "callback_url": "http://fred:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
   "lifecycle_callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
 }
@@ -910,13 +971,21 @@ List the leases whose data this backend currently retains. Fred's reconciler pol
 ```json
 {
   "retentions": [
-    {"lease_uuid": "550e8400-e29b-41d4-a716-446655440000"}
+    {
+      "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+      "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+      "tenant": "manifest1abc..."
+    }
   ],
   "continue": "5a1e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
-Always return `{"retentions": []}` (never `null`) when nothing is retained.
+Every page must carry a `retentions` array: return `{"retentions": []}` (never `null`) when nothing is retained. The `continue`, canonical-UUID and no-duplicate rules of the `GET /provisions` inventory shape apply here too.
+
+**Fields:**
+- `lease_uuid` - The closed or expired lease whose data is retained.
+- `provider_uuid`, `tenant` (optional) - The retained lease's provider and owning tenant. Fred uses them only as evidence in offline placement repair (`placement-repair`), never in a tenant-facing response: a missing value is routing-only evidence, and a nonempty value that contradicts Fred's durable record is refused as a conflict.
 
 **Pagination:** `GET /retentions` is keyset-paginated, mirroring `GET /provisions`. Query params: `limit` (max page size) and `continue` (a lease UUID — the `continue` cursor returned by the previous page). The JSON response carries a top-level `continue` field set to the last record's lease UUID, omitted once the list is exhausted. Fred's client walks the pages requesting `limit` = `RetentionsPageLimit` (default 1000) and fail-closes each page body at 1 MiB, reassembling the complete set (complete-or-error) so the reconciler never routes off partial retention data. (ENG-451)
 
@@ -929,8 +998,8 @@ Reconcile the custom-domain routing for a lease's items. Fred calls this on **ev
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "items": [
-    {"sku": "docker-nginx", "quantity": 1, "service_name": "web", "custom_domain": "app.example.com"},
-    {"sku": "docker-redis", "quantity": 2, "service_name": "cache"}
+    {"sku": "a1b2c3d4-e5f6-7890-abcd-1234567890ab", "quantity": 1, "service_name": "web", "custom_domain": "app.example.com"},
+    {"sku": "b2c3d4e5-f6a7-8901-bcde-2345678901bc", "quantity": 2, "service_name": "cache"}
   ]
 }
 ```
@@ -945,6 +1014,10 @@ Reconcile the custom-domain routing for a lease's items. Fred calls this on **ev
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Invalid state for reconcile (e.g., currently restarting, updating, or provisioning)
+- `503 Service Unavailable` with `code: "insufficient_resources"` - Capacity
+  refusal
+- `503 Service Unavailable` with `code: "lifecycle_pending"` - Admitted
+  lifecycle work remains pending (see Error responses above)
 
 ### GET /releases/{lease_uuid}
 
@@ -974,8 +1047,12 @@ Get the release (deployment) history for a lease. Each provision, update, or res
 - `version` - Monotonically increasing version number (starting at 1)
 - `image` - Container image used in this release
 - `status` - Release status: `deploying`, `active`, `superseded`, or `failed`
-- `error` - Error message (only present for failed releases)
-- `manifest` - The raw manifest payload used for this release
+- `created_at` - When the release was created (RFC 3339)
+- `reason` (omitempty) - Stable machine-readable failure category of a `failed` release, as for `GET /provisions`. Fred reports `Unknown` to the tenant for a `failed` release without one.
+- `message` (omitempty) - Curated human-readable failure message. Fred relays it to the tenant, so it MUST NOT contain host paths or raw command output (those stay in the backend's own logs).
+- `manifest` - The raw manifest payload used for this release (base64-encoded in JSON)
+
+Fred decodes only these fields and relays them to the tenant; it drops any other field, such as an `error` string.
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned
@@ -984,6 +1061,13 @@ Get the release (deployment) history for a lease. Each provision, update, or res
 
 Simple health check endpoint. This endpoint is **not** authenticated (see Inbound Authentication above).
 
+**Request:** `GET /health?backend_storage_id=<pinned-uuid>` with an
+`X-Fred-Signature` header, which the backend need not verify, and an
+`X-Fred-Health-Probe` header. `X-Fred-Health-Probe` carries a fresh canonical
+UUIDv4 for each probe. It is a diagnostic correlation ID only, not a credential:
+Fred logs it with slow or failed probes, and the bundled Docker backend logs it
+with each probe it serves and echoes it on its response, which Fred ignores.
+
 **Response:** `200 OK`
 ```json
 {
@@ -991,7 +1075,16 @@ Simple health check endpoint. This endpoint is **not** authenticated (see Inboun
 }
 ```
 
-Return 200 if your backend can accept requests. Fred uses this for health monitoring.
+Return 200 if your backend can accept requests. Fred uses this for health
+monitoring, outside the circuit breaker. It reports the backend unhealthy on any
+other status, and on a response whose `X-Fred-Backend-Storage-ID` header is
+missing, empty, repeated, malformed or different from the pin. When the
+configured backend set is unchanged, providerd's startup also probes `/health`
+on every unfenced backend: a missing header on a non-`5xx` response, or an
+empty, repeated, malformed or different one, stops startup, while an
+unreachable backend, another status, or a `5xx` without the header only leaves
+that backend degraded. The bundled Docker and k3s backends re-attest storage
+lineage on each probe and answer `503` without the header when that fails.
 
 ### RefreshState (Backend interface method, optional for in-process backends)
 
@@ -1004,6 +1097,16 @@ If your HTTP backend keeps an internal cache and you want an external trigger, y
 ### GET /stats (Optional)
 
 Return resource capacity and usage statistics. Useful for UI display and monitoring.
+
+Fred calls `GET /stats?backend_storage_id=<pinned-uuid>`, signed like every
+request, only to choose among two or more unfenced backends that serve a new
+provision's SKU (see Load-balanced placement). It reads `total_cpu_cores`,
+`allocated_cpu_cores` and `disk_withheld` and ignores the other fields; a failed
+request or a non-positive `total_cpu_cores` gives that backend no usable load
+signal. The call goes through the backend's circuit breaker, which also gates
+tenant requests: a response without the storage-identity header, like other
+backend failures, counts toward opening it, while a `404` or a coded `503`
+`insufficient_resources` does not.
 
 **Response:** `200 OK`
 ```json
@@ -1146,8 +1249,11 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 **Note:** The timestamp must be the current Unix time when sending the request. Callbacks with timestamps older than 5 minutes or more than 1 minute in the future are rejected.
 
 **Fields:**
-- `status`: One of `"success"`, `"failed"`, or `"deprovisioned"`. Use `"deprovisioned"` when the backend has autonomously torn down a lease (e.g. after a failed provision rollback) so Fred records the lease as deprovisioned without firing failure-callback side effects.
-- `error`: Error message if status is `"failed"`, empty otherwise
+- `lease_uuid`: The lease's canonical lowercase, non-nil UUID.
+- `status`: One of `"success"`, `"failed"`, or `"deprovisioned"`. Send `"deprovisioned"` only to report that close has torn down (or retained) the lease's resources, and only on the lifecycle (or legacy tokenless) callback URL; on an operation URL Fred answers `400`. The bundled Docker backend sends it only when a close completes. Fred records the teardown without firing failure-callback side effects.
+- `error`: For `"failed"`, a curated, human-readable reason; empty otherwise. **It is public.** When a provision or restore operation callback reports `"failed"` for a lease that is still `PENDING`, Fred rejects the lease on chain with this text as the rejection reason (truncated to 256 bytes; Fred writes `provisioning failed` when it is empty). Fred also sends it as the `error` of the `failed` event on the tenant's lease event stream. Author it like the `message` field on `/provisions` (the bundled Docker backend sends that same message): never raw errors, command output, host paths or secrets.
+- `retained` (omitempty): `true` on a `"deprovisioned"` callback when close retained the lease's data instead of destroying it; Fred then publishes a `retained` status. Fred answers `400` to `retained` with any other status.
+- `maintenance_id`, `maintenance_admitted_at` (omitempty): The exact restart/update completion identity described in [Exact maintenance completion](#exact-maintenance-completion). Fred answers `400` to a `maintenance_id` that is not a canonical UUIDv4 or that arrives on an operation URL or with `"deprovisioned"`, and to a `maintenance_admitted_at` without `maintenance_id` or that is not an RFC 3339 UTC time.
 - `backend` (omitempty): Optional legacy sender metadata used only for bounded metrics when no current operation exists. It may be empty or differ from Fred's configured router name. It never authorizes or redirects a typed callback; the HMAC-covered callback URL plus Fred's current exact-operation or durable lifecycle record select the authoritative backend.
 - `backend_storage_id`: Canonical UUIDv4 captured with the durable callback row
   when the backend effect occurred. It is HMAC-covered and must be preserved on
@@ -1172,8 +1278,8 @@ consume the storage lineage's independent callback budget.
 - `200 OK` — synchronously applied to a terminal application result, or
   terminally ignored as a duplicate/stale exact-operation callback. A backend
   may advance that lease's durable callback queue only after this response.
-- `400 Bad Request` — malformed JSON, lease UUID, status, or callback capability query. `operation_id` and `lifecycle_id` are mutually exclusive; a present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected.
-- `401 Unauthorized` — missing or invalid HMAC signature, or a callback envelope that cannot pass the bounded pre-authentication parser (including excessive size, token count or nesting).
+- `400 Bad Request` — malformed JSON (including a duplicate or case-variant field name), a field value the list above rejects, or a malformed callback capability query. `operation_id` and `lifecycle_id` are mutually exclusive; a present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected.
+- `401 Unauthorized` — missing or invalid HMAC signature, a `backend_storage_id` that names no configured backend or a fenced one, or a callback envelope that cannot pass the bounded pre-authentication parser (including excessive size, token count or nesting).
 - `429 Too Many Requests` — callback ingress rate limit exceeded; retry with backoff.
 - `503 Service Unavailable` — callback application is unavailable, has not
   started, is shutting down, or failed/timed out; keep the callback durable and
@@ -1610,7 +1716,7 @@ func main() {
     mux := http.NewServeMux()
 
     // Contract routes — all wrapped in inbound HMAC verification. The response
-    // middleware also checks an optional backend_storage_id query on reads.
+    // middleware also checks an optional backend_storage_id query on every route.
     auth := hmacAuthMiddleware(callbackSecret) // 401s missing/invalid X-Fred-Signature
     bind := func(handler http.Handler) http.Handler {
         return requireBoundStorageIdentityPath(storageID, auth(handler))
@@ -1771,13 +1877,13 @@ The payload below encodes `{"services":{"app":{"image":"nginx:alpine"}}}`.
 
 ```bash
 storage_id=550e8400-e29b-41d4-a716-446655440000
-curl -X POST "http://localhost:9001/_fred/storage/${storage_id}/provision" \
+curl -X POST "http://localhost:9001/_fred/storage/${storage_id}/provision?backend_storage_id=${storage_id}" \
   -H "Content-Type: application/json" \
   -d '{
     "lease_uuid": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
     "tenant": "manifest1test",
     "provider_uuid": "7b1b8908-3e56-481a-917e-4e9586642323",
-    "items": [{"sku": "550e8400-e29b-41d4-a716-446655440001", "quantity": 1, "service_name": "app"}],
+    "items": [{"sku": "a1b2c3d4-e5f6-7890-abcd-1234567890ab", "quantity": 1, "service_name": "app"}],
     "payload": "eyJzZXJ2aWNlcyI6eyJhcHAiOnsiaW1hZ2UiOiJuZ2lueDphbHBpbmUifX19",
     "callback_url": "http://localhost:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
     "lifecycle_callback_url": "http://localhost:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
@@ -1796,7 +1902,7 @@ curl "http://localhost:9001/info/6ba7b811-9dad-41d1-80b4-00c04fd430c8?backend_st
 
 ### 5. Deprovision
 ```bash
-curl -X POST "http://localhost:9001/_fred/storage/${storage_id}/deprovision" \
+curl -X POST "http://localhost:9001/_fred/storage/${storage_id}/deprovision?backend_storage_id=${storage_id}" \
   -H "Content-Type: application/json" \
   -d '{"lease_uuid": "6ba7b811-9dad-41d1-80b4-00c04fd430c8"}'
 ```
@@ -1836,7 +1942,7 @@ Before deploying your backend:
 - [ ] ListProvisions returns all managed resources
 - [ ] `/reconcile_custom_domain` is idempotent and returns 204 on no-change (never 404 just because custom domains are unsupported — that pollutes Fred's reconciler every tick)
 - [ ] State protected with mutex for concurrent access
-- [ ] Health endpoint returns 200 when operational
+- [ ] Health endpoint returns 200 when operational, and every response, including `/health` and `/stats`, carries the storage-identity header
 - [ ] Graceful shutdown (finish in-flight provisions)
 - [ ] (Optional) `/stats` endpoint for resource monitoring
 

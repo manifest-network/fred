@@ -130,7 +130,7 @@ curl -H "Authorization: Bearer $TOKEN" \
   "lease_uuid": "550e8400-...",
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-...",
-  "state": "PENDING",
+  "state": "LEASE_STATE_PENDING",
   "requires_payload": true,
   "meta_hash_hex": "a1b2c3...",
   "payload_received": false,
@@ -140,10 +140,10 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 What to look at:
 
-- **`state`** — `PENDING` (waiting for provisioning), `ACTIVE` (running), `CLOSED`, `EXPIRED`.
+- **`state`** — the chain's lease state: `LEASE_STATE_PENDING` (waiting for provisioning), `LEASE_STATE_ACTIVE` (running), `LEASE_STATE_CLOSED`, `LEASE_STATE_REJECTED` or `LEASE_STATE_EXPIRED`. `LEASE_STATE_UNSPECIFIED` is returned when the chain has no record of the lease and the provider answered from its retained data. A state the provider does not recognize is returned as its number.
 - **`requires_payload`** — if `true` and `payload_received` is `false`, you need to upload a manifest before provisioning can start.
-- **`provision_status`** — present once provisioning has started (`provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, `retained`).
-- **`retained_until`**, **`items`**, and **`restore_hint`** — returned for retained data; `items` describes the source lease's shape, and `retained_until`, when present, gives its scheduled expiry. Retention depends on the provider's policy and available capacity; see [Restore](#restore--recover-a-soft-deleted-leases-data).
+- **`provision_status`** — present once provisioning has started (`provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, `retained`, `unknown`).
+- **`retained_until`**, **`items`**, **`restore_hint`**, and **`partition`** — returned for retained data; `items` describes the source lease's shape, `retained_until`, when present, gives its scheduled expiry, and `partition`, when present, is its [retention partition](manifest-guide.md#retention-partitioning-aggregator-platforms). Retention depends on the provider's policy and available capacity; see [Restore](#restore--recover-a-soft-deleted-leases-data).
 - **`fail_count`** + **`reason`** + **`message`** — present after failures; `reason` is a stable machine
   code (e.g. `ContainerExited`), `message` a short human summary. `fail_count` counts every failure
   over the lease's life and never decides whether the lease is closed. See [Step 6](#step-6-debug-failures)
@@ -209,12 +209,18 @@ Possible responses:
 | Code | Meaning |
 |---|---|
 | `202 Accepted` | Payload accepted, provisioning will start |
-| `400 Bad Request` | Manifest is malformed or hash doesn't match `meta_hash` |
+| `400 Bad Request` | The lease UUID is malformed, the lease has no `meta_hash`, or the body is empty, unreadable, larger than the provider's request size limit, or its hash doesn't match `meta_hash` |
 | `401 Unauthorized` | Invalid token / signature / wrong meta_hash field |
+| `403 Forbidden` | The lease belongs to another tenant or provider |
 | `404 Not Found` | Lease doesn't exist or isn't `PENDING` |
-| `409 Conflict` | A payload was already uploaded for this lease (per-lease idempotency) |
+| `409 Conflict` | The payload was not stored: usually one was already received for this lease, but the provider also returns `409` when it cannot store the payload |
+| `429 Too Many Requests` | Rate limited; see [Rate limits](#rate-limits) |
+| `500 Internal Server Error` | The provider could not read the lease from the chain, or could not hand the stored payload to provisioning (it then discards the payload, so you can retry) |
+| `503 Service Unavailable` (rarely `504 Gateway Timeout`) | The request, including the body upload, did not complete within the provider's request timeout |
 
-The `409 Conflict` is your idempotency guard — if your upload retried successfully but the response was lost, the second attempt safely returns 409.
+A `409 Conflict` usually means an earlier attempt succeeded, for example when its response was lost. Because a provider that cannot store the payload also returns `409`, confirm with [`GET /status`](#step-2-check-lease-status): `payload_received: true` means the provider holds your payload; if it is `false`, you can retry the upload.
+
+The upload checks only the body's size and hash; it does not parse the manifest. A malformed or invalid manifest is accepted here and fails when the provider provisions the lease, which rejects the lease on chain. Since the lease's `meta_hash` fixes the manifest you can upload, check the manifest against the [JSON Schema](manifest-schema.json) before you create the lease.
 
 ---
 
@@ -320,6 +326,7 @@ recognize as a generic failure and fall back to displaying `message`. The define
 | `RestoreFailed` | A tenant-initiated restore (redeploy from retained data) failed |
 | `VolumeCleanupExhausted` | Volume cleanup on deprovision failed after exhausting all retries |
 | `CleanupFailed` | Cleanup on deprovision failed (containers or volumes) |
+| `BackendStorageLost` | An operator retired the lease's backend because its storage was irrecoverably lost; the lease is closed (or, if pending, rejected) on chain, and `/provision` answers `410 Gone` |
 | `VolumeDeletePending` | A provision was refused because an earlier deletion of the lease's own volume is still finishing on the provider |
 | `VolumeDeletionInProgress` | The lease is closing and its volume is still being deleted by the provider; the close completes when the deletion does |
 | `Unknown` | The lease is `failed` but no specific reason was recorded |

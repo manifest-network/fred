@@ -82,7 +82,7 @@ type ContainerInfo struct {
 	ProviderUUID         string
 	BackendName          string
 	SKU                  string
-	ServiceName          string // Stack service name (empty for single-container leases)
+	ServiceName          string // fred.service_name label: every current launch sets it ("app" for a single-service lease); only a legacy container may lack it
 	InstanceIndex        int
 	FailCount            int
 	CallbackURL          string

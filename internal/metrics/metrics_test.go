@@ -31,7 +31,6 @@ var unlabelledMetricNames = []string{
 	"fred_api_maintenance_legacy_key_total",
 	"fred_placement_write_failures_total",
 	"fred_provisioner_callback_deprovision_owned_success_total",
-	"fred_provisioner_callback_placement_semantic_conflicts_total",
 	"fred_provisioner_callback_settlement_claim_wait_timeouts_total",
 	"fred_provisioner_callback_timeouts_total",
 	"fred_provisioner_deferred_closes_pending",
@@ -83,7 +82,6 @@ var labelledMetricNames = []string{
 	"fred_health_check_healthy",
 	"fred_health_check_duration_seconds",
 	"fred_messages_malformed_total",
-	"fred_payload_persist_failures_total",
 	"fred_payload_uploads_total",
 	"fred_provisioner_ack_batch_fee_gas_errors_total",
 	"fred_provisioner_ack_batch_individual_fallbacks_total",
@@ -156,7 +154,6 @@ func allCollectors() []prometheus.Collector {
 		// Payload
 		PayloadUploadsTotal,
 		PayloadStoredCount,
-		PayloadPersistFailuresTotal,
 		PayloadSizeBytes,
 		LeasesAwaitingPayload,
 		// Backend
@@ -192,7 +189,6 @@ func allCollectors() []prometheus.Collector {
 		ReconciliationConflictsTotal,
 		// Callback
 		CallbackDeprovisionOwnedSuccessTotal,
-		CallbackPlacementSemanticConflictsTotal,
 		CallbackSettlementClaimWaitTimeoutsTotal,
 		CallbackTimeoutsTotal,
 		LifecycleCallbackOutcomesTotal,
@@ -428,9 +424,6 @@ func TestCounterVecLabels(t *testing.T) {
 	})
 	assert.NotPanics(t, func() {
 		RateLimitRejectionsTotal.WithLabelValues("global")
-	})
-	assert.NotPanics(t, func() {
-		PayloadPersistFailuresTotal.WithLabelValues("update")
 	})
 	assert.NotPanics(t, func() {
 		BackendInsufficientResourcesTotal.WithLabelValues("docker", CapacityVerdictCodedRefusal)

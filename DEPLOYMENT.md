@@ -272,12 +272,13 @@ Reference: [config.example.yaml](config.example.yaml), [docker-backend.example.y
 - `provider_address` — chain address for management messages
 - `keyring_dir` + `key_name` — Cosmos keyring with the provider's signing key
 - `callback_base_url` — URL where backends reach providerd (e.g. `https://fred.example.com:8443`)
-- `backends` — at least one entry with `name`, `url`, a unique
-  `hmac_secret` of at least 32 bytes, and either `skus` or `default: true`.
-  Production rejects a missing or duplicate per-backend secret; the top-level
-  `callback_secret` compatibility fallback is for non-production deployments
-  only
-- `placement_store_db_path` — required durable placement database; providerd refuses to start without it because supported deployments always use multiple backends
+- `backends` — at least one entry with `name`, `url`, and a unique
+  `hmac_secret` of at least 32 bytes. Production rejects a missing or
+  duplicate per-backend secret; the top-level `callback_secret` compatibility
+  fallback is for non-production deployments only. `skus` and `default` are
+  optional: a lease whose SKU no backend lists goes to the backend marked
+  `default: true`, or to the first backend when none is marked
+- `placement_store_db_path` — required durable placement database, as an absolute, clean path; providerd refuses to start without it because supported deployments always use multiple backends
 - `production_mode: true` — required on providerd and every bundled backend in production (forces replay protection, blocks SSRF and insecure TLS settings, requires peer-verified `https://` backend URLs using the configured private CA or system roots, and requires an `https://` `callback_base_url` whose peer the backend verifies)
 - `token_tracker_db_path` — required when `production_mode: true`
 
@@ -320,14 +321,15 @@ Reference: [config.example.yaml](config.example.yaml), [docker-backend.example.y
   on the same root filesystem. Storage-lineage initialization and runtime
   re-attestation fail closed if this mount or the pinned data-root inode changes
 
-**Environment variables** (docker-backend / k3s-backend) — each overrides the corresponding YAML field:
+**Environment variables** (docker-backend / k3s-backend) — each one set to a non-empty value overrides the corresponding YAML field; an unset or empty variable leaves the YAML value in place. No other field has an environment form:
 
 - `DOCKER_BACKEND_ADDR` / `K3S_BACKEND_ADDR` — override `listen_addr`
 - `DOCKER_BACKEND_CALLBACK_SECRET` / `K3S_BACKEND_CALLBACK_SECRET` — override `callback_secret` (lets you keep the secret out of the on-disk YAML)
+- `DOCKER_BACKEND_CALLBACK_SECRET_NEXT` (docker-backend) — override `callback_secret_next` (see [Rotating a backend's HMAC key](#rotating-a-backends-hmac-key))
 - `DOCKER_BACKEND_HOST_ADDRESS` / `K3S_BACKEND_HOST_ADDRESS` — override `host_address`
-- `DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE` / `K3S_BACKEND_MAX_REQUEST_BODY_SIZE` — override the 2 MiB request-body cap (a non-positive value is ignored)
-- `DOCKER_HOST` (docker-backend) — Docker daemon endpoint, per the standard Docker convention
-- `KUBECONFIG` (k3s-backend) — path to the kubeconfig
+- `DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE` / `K3S_BACKEND_MAX_REQUEST_BODY_SIZE` — override the 2 MiB request-body cap (a value that is not a positive integer is ignored)
+- `DOCKER_HOST` (docker-backend) — override `docker_host`, the Docker daemon endpoint
+- `KUBECONFIG` (k3s-backend) — used only when `kubeconfig_path` is empty in the YAML; `config.k3s.yaml.example` sets it, so remove that value to use the variable. A colon-separated list is merged by client-go
 
 **Deployment-automation prerequisite.** Before rolling this release, verify the
 rendered configuration on every host, not only the source template. Production
@@ -536,37 +538,49 @@ EnvironmentFile=/etc/fred/providerd.env
 ExecStart=/usr/local/bin/providerd -c /etc/fred/config.yaml
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=45s
+TimeoutStopSec=60s
 LimitNOFILE=65536
 
 # Hardening (the daemon does not need root)
 NoNewPrivileges=true
 ProtectSystem=strict
+# Hides /home: keep keyring_dir elsewhere, e.g. /var/lib/fred/keyring.
 ProtectHome=true
 PrivateTmp=true
 # ReadWritePaths must include the directories holding any *_db_path values
 # from your config (token_tracker_db_path, payload_store_db_path,
-# placement_store_db_path), and placement_snapshot_dir when it is set. Adjust
-# this line to match.
+# placement_store_db_path), keyring_dir (sub-signer key derivation writes to
+# it), and placement_snapshot_dir when it is set. Adjust this line to match.
 ReadWritePaths=/var/lib/fred
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-`docker-backend.service` is the same shape with three differences:
+`providerd` fails to start when it cannot read its signing key from
+`keyring_dir`. With `sub_signer_count > 0`, first-boot derivation writes the
+sub-signer keys into the same directory; if it cannot, providerd only logs a
+warning and runs with fewer sub-signers.
+
+`docker-backend.service` follows the same pattern, with these differences:
+- `ExecStart=/usr/local/bin/docker-backend -config /etc/fred/docker-backend.yaml`.
+  It takes Go-style flags and has no `-c`; an unknown flag exits with status 2.
+- Do not copy `TimeoutStopSec=60s`: its shutdown takes up to 75 seconds (see
+  below), so keep the 90-second systemd default or a longer value.
 - It needs Docker socket access. Either add `SupplementaryGroups=docker` to the unit (so the service user inherits the `docker` group), add the service user to the `docker` group out of band, or run as root. Note this makes the docker-backend effectively host-root-equivalent regardless of `User=` (access to a rootful Docker socket can launch a privileged container) — so unlike `providerd`, its minimal-capability hardening is partly cosmetic. The real lever for de-privileging it is rootless Docker.
 - **Native XFS volume management needs `CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN CAP_FOWNER`.** Ownership changes require `CAP_CHOWN`; managing restrictive tenant-owned trees requires `CAP_DAC_OVERRIDE`. XFS quota limits require `CAP_SYS_ADMIN`, and repairing a tenant-owned root project ID requires `CAP_FOWNER`. Set both `AmbientCapabilities=` and `CapabilityBoundingSet=` to these four capabilities, as the manifest-deploy unit does. Ambient capabilities are compatible with `NoNewPrivileges=true` and propagate to the quota subprocesses. A capability grant on the Fred executable alone does not provide this subprocess contract. Scope these capabilities to `docker-backend`; `providerd` does not need them.
-- `ReadWritePaths` should cover the directories holding `callback_db_path`, `diagnostics_db_path`, `releases_db_path`, `retention_db_path`, and `volume_data_path`. The authoritative retention database is required even when `retain_on_close` is false.
+- `ReadWritePaths` should cover the directories holding `callback_db_path`, `diagnostics_db_path`, `releases_db_path`, `retention_db_path`, and `volume_data_path`. The authoritative retention database is required even when `retain_on_close` is false. These database paths default to relative names (`callbacks.db`, `diagnostics.db`, `releases.db`, `retention.db`), which resolve against the working directory: `/` for a systemd service. Set them to absolute paths, or set `WorkingDirectory=` to a directory in `ReadWritePaths`.
 
 `TimeoutStopSec` should exceed the graceful-drain window so systemd does not
 SIGKILL mid-shutdown. For `providerd` this window is `shutdown_timeout` from your
-config (default 30s). A stop that arrives during the startup reconciliation can
-add up to half of `shutdown_timeout` before it, while an in-flight sweep
-finishes its inventory reads. The `docker-backend` command shares one
-75-second deadline across HTTP shutdown and backend-worker drain. HTTP
-shutdown gets at most
-30 seconds; backend drain uses the remaining budget. The common 90-second
+config (default 30s), plus a 2-second grace when it runs out. A stop that
+arrives during the startup reconciliation can add up to half of
+`shutdown_timeout` before that window starts, while an in-flight sweep
+finishes its inventory reads. The worst case is therefore about
+1.5 × `shutdown_timeout` + 2s (47 seconds by default), which the unit's `60s`
+covers. The `docker-backend` command shares one 75-second deadline across HTTP
+shutdown and backend-worker drain. HTTP shutdown gets at most 30 seconds;
+backend drain uses the remaining budget. The common 90-second
 systemd default therefore leaves time to report a typed drain failure and exit
 nonzero, without a deployment change. A longer existing unit allowance remains
 compatible. Direct Go callers of `Backend.Stop` retain its 90-second default;
@@ -1470,6 +1484,12 @@ provider must instead use a unique `backends[].hmac_secret` for each backend,
 matching only that backend's `callback_secret`.
 Compare the complete rendered configurations with the target revision's
 examples and run that revision's real loaders, including every backend.
+The provider configuration must also reach the chain over certificate-verified
+gRPC TLS (`grpc_tls_enabled: true`, `grpc_tls_skip_verify: false`): the
+mandatory `placement-preflight` steps below refuse plaintext or unverified
+chain gRPC. `grpc_tls_enabled` defaults to false and `production_mode: true`
+does not require it, so confirm the chain endpoint serves verifiable TLS
+before the fence.
 [The deployment compatibility gate](https://github.com/manifest-network/manifest-deploy/pull/185)
 provides validation of the exact rendered files without starting services.
 Complete this check while the old fleet remains available, then use the stopped
@@ -1930,7 +1950,8 @@ stopped and its placement file offline. First classify that exact file; a normal
 first cutover must report `pristine_v0_13`. Then run the read-only
 `placement-preflight` inspection from the new release against the exact
 configuration intended for the cutover, followed by mandatory preparation with
-a new backup destination:
+a new backup destination. Both read the chain and require the
+certificate-verified chain gRPC described at the start of this section:
 
 ```bash
 placement-repair -config /etc/fred/config.yaml -classify
@@ -1957,7 +1978,7 @@ configured backend. Every page must carry one stable storage ID and the two
 inventory endpoints must agree. Under that same lock, the tool uses a
 signer-free gRPC client to fetch the configured provider's complete all-state
 lease index at one pinned positive block height; it has no keyring or transaction
-surface. Certificate-verified gRPC TLS is the deployment default because this
+surface. Certificate-verified gRPC TLS is required because this
 membership is provider-binding authority. An intentionally local development
 chain may use the exact `-confirm-insecure-chain` operator attestation documented
 above, including with a shared `production_mode: true` template; the tool rejects
@@ -2114,10 +2135,14 @@ exit status names the same outcome:
 | 12 | `outcome_unknown` | The commit returned an error | Keep providerd stopped; `placement-repair -classify` |
 | 13 | `prepared_unverified` | Committed, but a later sync, close, verification, or report failed | Keep providerd stopped; `placement-repair -classify` |
 
-Any other status (1) is a failure outside `-prepare`, such as a usage error. A
-failure before the preparation capability is consumed writes nothing, so it is
-always `not_mutated`; a disagreement between the command's durable status and
-the preparer's error classes resolves toward the more severe outcome.
+Once `-prepare` is accepted, every failure uses this table, including a missing
+`-config` or `-backup`, a wrong `-attest-drained`, and a configuration that
+fails to load (all `not_mutated`). Status 1 means the command line was rejected
+first (an unknown flag, a bad flag value, or a positional argument), or the run
+did not use `-prepare`. A failure before the preparation capability is consumed
+writes nothing, so it is always `not_mutated`; a disagreement between the
+command's durable status and the preparer's error classes resolves toward the
+more severe outcome.
 
 `PREPARED_FOR_CUTOVER` is the final verdict line and the complete verdict is issued in one write after
 the prepared database closes. If the command instead exits with a `PREPARED:`
@@ -2694,18 +2719,26 @@ docker run -d --name docker-backend \
   fred-docker-backend --config /data/docker-backend.yaml
 ```
 
-**`providerd`** — has no built-in volume; mount the config and (if needed) keyring directory wherever you like:
+**`providerd`** — has no built-in volume; mount the config, the keyring directory, and a data directory wherever you like:
 
 ```bash
 docker run -d --name providerd \
+  --env-file ./providerd.env \
   -v $(pwd)/config.yaml:/config.yaml:ro \
-  -v $(pwd)/keyring:/keyring:ro \
+  -v $(pwd)/keyring:/keyring \
+  -v $(pwd)/fred-data:/var/lib/fred \
   -p 8080:8080 \
   fred-providerd --config /config.yaml
 ```
 
-Configure `keyring_dir: /keyring` in `config.yaml`. Set
-`placement_store_db_path` and mount its writable host directory; providerd will
-not start without it. Do the same for any configured `token_tracker_db_path` or
-`payload_store_db_path`; the providerd image does not declare a default data
-volume.
+`providerd.env` holds `FRED_KEYRING_PASSPHRASE`, which the default
+`keyring_backend: file` requires, plus `FRED_MNEMONIC` on first boot when
+`sub_signer_count > 0`. Configure `keyring_dir: /keyring` in `config.yaml`. The
+keyring mount is writable because first-boot sub-signer derivation writes to
+it. Set `placement_store_db_path` (for example `/var/lib/fred/placements.db`)
+inside the mounted data directory; providerd will not start without it, and the
+database must first be prepared or initialized with `placement-preflight`,
+which the image also contains (`--entrypoint /placement-preflight`). Put any
+configured `token_tracker_db_path` or `payload_store_db_path` there too; the
+providerd image does not declare a default data volume. The image runs as UID
+65532, which must be able to read the keyring and write the data directory.

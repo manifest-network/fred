@@ -13,15 +13,15 @@ implemented behavior, not to grant production support.
 
 ## Health checks
 
-Both `providerd` and `docker-backend` expose `GET /health`. **`providerd /health` is a liveness contract: no dependency verdict makes it 503, and no dependency can make it slow enough for a prober to give up either.** Point load-balancer health checks at it. `providerd` additionally exposes `GET /readyz` — the same body, but the verdict reaches the status code. **Do not point a load balancer at `/readyz`.**
+Both `providerd` and `docker-backend` expose `GET /health`. **`providerd /health` is a liveness contract: no dependency verdict makes it 503, and its remote probes share one three-second budget.** Synchronous local store checks run outside that budget, so stalled local storage can still slow a request past a prober's timeout (see below). Point load-balancer health checks at it. `providerd` additionally exposes `GET /readyz` — the same body, but the verdict reaches the status code. **Do not point a load balancer at `/readyz`.**
 
 | Endpoint | Probes | 503 when |
 |---|---|---|
 | `providerd /health` | Chain gRPC and all backends start concurrently under one three-second remote budget. Mandatory placement-store and inventory checks, plus optional token/payload-store validation, remain synchronous; their filesystem/lock waits can exceed that budget. Stage histograms distinguish these costs | Never from a health verdict; the outer request timeout can still fail a stalled request |
-| `providerd /readyz` | Same probes, same budget | A configured bbolt store is unreadable, or no durable inventory baseline matches the configured backend topology (verdict `unhealthy`) |
-| `docker-backend /health` | Docker daemon reachable, plus the callback, diagnostics, release, and retention bbolt stores open and carry their expected buckets. Callback health validates delivery rows, durable operation and maintenance intents, non-expiring close intents, and that no lease simultaneously owns incompatible intent classes | Any of them is unhealthy |
+| `providerd /readyz` | Same probes, same budget | A configured bbolt store is unreadable, or the placement inventory does not admit fresh lease side effects: no durable inventory baseline matches the configured backend topology, an interrupted inventory sweep awaits its reporters, a fenced backend may hold a lease with no placement row, or placement authority was withdrawn (verdict `unhealthy`) |
+| `docker-backend /health` | Storage identity verified (by the route's middleware, then again inside `Backend.Health`), Docker daemon reachable, no resource-accounting hold (late containers of a permanent closed/failed receipt), the callback, diagnostics, release, and retention bbolt stores open and carry their expected buckets, and the launch journal readable. Callback health validates delivery rows, durable operation and maintenance intents, non-expiring close intents, and that no lease simultaneously owns incompatible intent classes. Release health validates every row of the release journal | Any of them is unhealthy |
 
-All bbolt probes are read-only opens: they prove the database is present and structurally intact, **not** that a write would succeed. A full or read-only filesystem passes them.
+All bbolt probes are read transactions on the database the process opened at startup: they prove the database is present and structurally intact, **not** that a write would succeed. A full or read-only filesystem passes them. The placement, payload, callback, release and retention probes also re-check the configured path and inode. The token tracker and Docker diagnostics probes do not, so an unlinked or replaced `tokens.db` or `diagnostics.db` stays healthy until restart.
 
 Both `providerd` endpoints return the same JSON body, whose `status` is one of three verdicts:
 
@@ -29,7 +29,7 @@ Both `providerd` endpoints return the same JSON body, whose `status` is one of t
 |---|---|---|---|
 | `healthy` | Every configured probe passed | 200 | 200 |
 | `degraded` | A **remote, shared** dependency is impaired — the chain, or one or more backends. Existing workloads keep serving. After inventory bootstrap, exact callbacks and safely evidenced reconciliation continue, and the reconciler may place genuinely new recordless `PENDING` work only on nodes that answered both inventories. Work pinned to a silent owner, recordless `ACTIVE` work, attempts, and conflicts remain deferred. A chain outage halts reconciliation entirely and fails every lease-resolving tenant call. Either way providerd still accepts backend callbacks, which is why it must stay in rotation | 200 | 200 |
-| `unhealthy` | A **local, process-owned** bbolt store is unreadable, or no durable inventory baseline matches the configured backend topology. Restart a broken store; let an incomplete bootstrap inventory retry | 200 | 503 |
+| `unhealthy` | A **local, process-owned** bbolt store is unreadable, or the placement inventory does not admit fresh lease side effects (no durable baseline matches the configured backend topology, an interrupted sweep awaits its reporters, or a fenced backend may hold a lease with no placement row). A failed `placement_store` check can mean the placement authority was withdrawn; a restart then can lose the open inode that is the best surviving copy, so preserve the evidence first ([Placement runtime authority was withdrawn](#placement-runtime-authority-was-withdrawn)). Repair a token or payload store as its row in [Common alerts](#common-alerts-and-what-they-mean) says; let an incomplete bootstrap inventory retry | 200 | 503 |
 
 A check absent from `checks` means an optional dependency is **not configured**,
 not that it passed. Every `providerd`, including development instances, reports
@@ -74,7 +74,7 @@ It used to, on any failing probe, and that is the direct cause of two outages. `
 - **mainnet-morpheus, 2026-07-13** (ENG-522): a ~1-minute upstream chain-RPC blip failed a single `Ping`. `/health` flipped 200→503 for one 30s probe interval, the load balancer dropped the only server, and a backend's provision-success callback got `no available server` three times in 6s and was dropped. The workload ran; providerd never learned; the lease was rejected 10 minutes later with `reason="callback timeout"`.
 - **dev, 2026-08-17**: one docker backend of three was stopped. The tenant API returned 503 for 15 minutes (38 × 503 vs 9 × 200), four tenant provisions failed, and one workload was orphaned — while providerd itself was serving fine when reached directly.
 
-The dependency signal did not disappear, it moved: the per-check map is still in the body, and every probe now has a metric (`fred_health_check_healthy` and `fred_backend_healthy`). **Alert on those, not on the status code.** A broken bbolt store is fixed by restarting the process, which a supervisor can do and a load balancer cannot — that is why even `unhealthy` keeps `/health` at 200.
+The dependency signal did not disappear, it moved: the per-check map is still in the body, and every probe now has a metric (`fred_health_check_healthy` and `fred_backend_healthy`). **Alert on those, not on the status code.** A broken local store needs an operator, and often a restart once its evidence is preserved; a load balancer can do neither — that is why even `unhealthy` keeps `/health` at 200. Never restart a provider whose placement authority was withdrawn before following [Placement runtime authority was withdrawn](#placement-runtime-authority-was-withdrawn).
 
 **The remote probe budget and total response latency differ.** Chain Ping and
 all backend probes start together under the same three-second deadline. A slow
@@ -121,9 +121,12 @@ stages are not started after cancellation. The remote three-second budget and
 readiness requirements are unchanged.
 
 `fred_docker_backend_storage_identity_check_duration_seconds{check}` measures
-production identity-verifier invocations, including HTTP admission and callback
-delivery. Outer prevalidation or terminal rejection can finish before invoking
-the verifier and contributes no sample. Its stages are `total`, `lock_wait`,
+production identity-verifier invocations, including HTTP admission, callback
+delivery, and a periodic check every 30 seconds (10-second timeout). A failed
+periodic check logs `periodic backend storage identity verification failed`;
+identity drift or an outcome-unknown mutation found there latches the backend
+like any other identity failure. Outer prevalidation or terminal rejection can
+finish before invoking the verifier and contributes no sample. Its stages are `total`, `lock_wait`,
 `substrate`, `daemon_info` and `stores`. These timings
 overlap: `total` includes the other stages, `substrate` includes `daemon_info`,
 and the health `storage_identity` check includes its own identity verification.
@@ -140,8 +143,9 @@ stage. Do not attribute their combined timing to that stage alone.
 Callback receipt validation traverses each head and its histories once within
 the immutable health read transaction. Compensation, effect-debt and queue
 validation remain separate. Retention health uses the committed schema's strict decoder.
-Both still scan all current authoritative rows on every probe; neither caches a
-health verdict. Permanent callback history therefore still contributes to cost.
+Callback, release and retention health each scan all current authoritative rows
+on every probe; none caches a health verdict. Permanent callback history
+therefore still contributes to cost.
 Use the callback and retention benchmarks for controlled before/after
 measurements, then verify the unchanged readiness gates on the deployment pin.
 `fred_chain_health_probe_panics_total` and
@@ -155,7 +159,7 @@ when later probes or recovery passes succeed.
 
 | Signal | Likely cause | First step |
 |---|---|---|
-| `fred_backend_circuit_breaker_state{backend="X"} == 2` (open) | Backend X has been unhealthy long enough to trip the breaker | `curl backendX/health`, check backend logs |
+| `fred_backend_circuit_breaker_state{backend="X"} == 2` (open) | Five consecutive failed providerd calls to backend X (provision, deprovision, restart, update, restore, custom-domain and read calls) tripped its breaker. Calls are refused for 60s, then one trial call decides whether it closes. `/health` probes and complete inventory walks do not go through the breaker, so this can disagree with `fred_backend_healthy` | `curl backendX/health`, check backend logs |
 | `fred_backend_healthy{backend="X"} == 0 unless on(backend) fred_backend_fenced == 1` for >1 min | Backend health probe failing | Same as above. Note this no longer affects the tenant API's availability — the provider reports `degraded` and keeps serving. A fenced backend is unhealthy by configuration (`/health` names it `backend is fenced`); gate every per-backend availability alert on `fred_backend_fenced` |
 | `fred_backend_fenced{backend="X"} == 1` | The operator fenced backend X (see SECURITY.md, "Containing a compromised backend"). Its leases wait, and a lost admission baseline cannot be rebuilt while it is fenced | Informational while the incident is handled. A fence is a holding state: end it by lifting it after replacing the key, or by retiring the backend |
 | `fred_placement_unprojected_fenced_reporter{backend="X"} == 1` | Backend X reported a positive in an interrupted sweep whose recovery cleared while X was fenced, so a lease with no placement row may live on X. No lease without a placement row is admitted, so new leases wait; `/readyz` reports `placement inventory waits on a fenced backend` | Page. It clears when X answers both inventories again, after the fence is lifted. Otherwise retire X, which sets `recordless_unproven` and resumes admission after one sweep in which every surviving backend answers. Removing X from the topology is refused while it is 1. Before a later fence, run `placement-repair -classify` on the stopped database: `pending_inventory_sweep_id` marks an interrupted sweep, and `fence_restart_would_record` names the backends a restart with them fenced would record (SECURITY.md, "Containing a compromised backend") |
@@ -166,61 +170,64 @@ when later probes or recovery passes succeed.
 | `increase(fred_docker_backend_image_import_total{outcome="deadline"}[15m]) > 0` | An import owner reached its dispatch ceiling; Docker may still be unwinding | Correlate with pending import bytes and daemon logs. Before planned stops, fence new mutations, quiesce work and wait for pending bytes to reach zero. Owner cancellation is not completion proof |
 | `fred_docker_backend_image_import_pending_bytes > 0` beyond the normal import window | The gauge includes both live owned imports and allocation whose completion is unknown. A persistent value after the backend becomes idle can be durable import debt; restarting does not clear it | Correlate imports, Docker response failures and shutdown logs. Alert with a site-specific `for` duration longer than a normal import; investigate sustained debt using [Recovering outstanding image import allocation](#recovering-outstanding-image-import-allocation). Never clear the debit while the runtime can still allocate |
 | `increase(fred_docker_backend_image_gc_total{outcome="inhibited"}[15m]) > 0` together with sustained image-filesystem disk pressure | Incomplete pin authority or unresolved inspection evidence prevents safe deletion. This counter is diagnostic, not a standalone paging condition: pre-upgrade retained generations can legitimately lack pins for their remaining retention period | Check legacy pin-backfill warnings, retained rows and inspection receipts. Unpinned retained generations remain conservative until restored or safely reaped; the default grace is 90 days, plus the reaper interval, and unresolved reaping can extend it. Do not page on this expected upgrade condition while disk headroom is healthy. Docker inventory failures increment `outcome="error"`; ordinary live admissions increment `outcome="busy"`. Preserve authoritative evidence; import debt alone does not inhibit collection |
+| `increase(fred_docker_backend_image_gc_total{outcome="panic"}[15m]) > 0` | Bug — the periodic image collector panicked. That pass removes no further images and also counts `outcome="error"`; the next pass runs a minute later. No `fred_background_*` counter or stack trace is recorded | Find the WARN `image garbage collection deferred` whose error starts `image collection panicked:` and file an issue. Watch image-filesystem headroom while passes keep panicking |
 | `increase(fred_maintenance_admission_refusals_total{reason=~"count\|bytes"}[5m]) > 0` | New restart/update admission reached the provider pending-journal count/byte cap. Existing commands can still replay and settle | Correlate pending phase/oldest-age gauges with backend completion and callback health. Restore stalled completion rather than deleting pending rows. `reserved_count` and `reserved_bytes` are caller backpressure (`429`) while preserving room for a tenant without pending work; exclude those reasons from provider exhaustion alerts |
 | Backend X reports `callback store unhealthy` | `callbacks.db` is missing a delivery/intent bucket, contains malformed durable evidence, or gives one lease simultaneous operation, maintenance, or close rows. A terminal Succeeded/Failed operation row is history rather than active mutation authority; authorized successor admission retires it atomically instead of leaving simultaneous rows. Current deliveries live below a lease-identifying nested bucket. Operation identity/snapshot fields are immutable; maintenance advances through typed pre-append and append-started phases and then binds one exact target fence; close preserves its immutable snapshot while durably advancing a monotonic execution generation immediately before physical work. Every change uses an exact digest-bearing claim. Replay/TTL never silently deletes poison data, terminal operation rows remain after delivery until an authorized successor, and causal intents, close intents, and exact completions never age out | Stop that backend, take a copy of `callbacks.db` with the matching release store, storage markers, containers, and volumes. Inspect or restore the named lease offline (or the complete file when a root bucket is missing). Prefer exact repair/restore over deleting the database; wholesale deletion can lose accepted work, terminal decisions, replacement identity, destructive-cleanup authority, and pending completions. Keep the node out of new placement until `/health` is clean |
 | Backend latches after `post-mutation storage verification`, refuses startup with `recover interrupted operations`, or `fred_*_backend_callback_store_errors_total` increases | A raw mutation returned without a usable postcheck, callback persistence/store access failed on an instrumented path, operation-intent startup recovery failed, or another authoritative journal/substrate proof reached a terminal identity or outcome-unknown failure. The first cause is sticky for the backend lifetime: callback, release, and retention journals (where present), substrate mutation admission, and callback delivery all refuse through the same latch. A running docker-backend publishes that first cause to its main loop, closes the listener, drains workers, and exits status 1 so the supervisor must launch a fresh `Start`; a persistent fault therefore crash-loops closed instead of serving. An XFS volume deletion that cannot finish is not such a fault: it is held for that one volume and the backend keeps serving (see [Held volume deletions](#held-volume-deletions)). A valid but semantically indeterminate maintenance row is different: it need not make `/health` fail or increment this counter; use the Docker reconciliation signal below. A close intent already owns destruction, so recovery resumes it from its immutable snapshot before ordinary exact-cohort validation and reports retry errors in the lease-scoped close log below | Fence mutation ingress and preserve `callbacks.db`, `releases.db`, `retention.db` where present, the storage-identity marker pair, and the substrate as one evidence set. Do not treat one still-readable sibling journal or a queued callback as permission to continue; the shared latch intentionally withdrew the entire lineage. Let the supervised restart retry only after repairing the Docker/retention/SKU/store inconsistency or restoring the matching stopped-process snapshot. Restart only against that same set. Never delete an intent, finalizer, release fence, retained data, or callback evidence merely to make readiness green |
 | `fred_docker_backend_oldest_unheld_close_intent_age_seconds` remains above the normal close window (it leaves out closes waiting only on held volume deletions, see [Held volume deletions](#held-volume-deletions)), `fred_docker_backend_pending_close_intents` remains non-zero, or `durable close recovery remains pending` repeats for one lease | Docker admitted deprovision before teardown, then a transient container/volume/release/accounting/outbox failure prevented finalization. The aggregate gauges deliberately omit lease labels; the log's lease UUID and durable `execution_generation` identify the exact attempted run and survive restart. A full close keeps a conservative projection and capacity reservation; a cleanup-only close may have no tenant-visible projection but remains the sole non-expiring retry owner. An unresolved launch receipt can also prevent terminal close even when current container and volume inventories are empty | Correlate the recovery log's lease UUID with nearby teardown, retention, release-store, and callback-store errors. Restore the failed dependency and let the next docker-backend recovery tick independently classify the Started generation before authorizing another run. If offline inspection is required, stop the backend and inspect that lease's close-tagged head in `callback_lease_mutation_heads` together with the exact `releases.db` history and substrate; callback URLs contain causal identifiers, so do not paste raw row contents into tickets. Never delete the row merely because Docker reports zero containers. If the exact lease retains an unknown launch request, follow [Unsettled Docker effects](#unsettled-docker-effects). A timeout, restart or empty inventory cannot retire that receipt; preserve the close intent and launch evidence until exact completion or stopped-backend operator fencing and repair establishes quiescence |
 | `fred_docker_backend_lease_mutation_uuid_slots / clamp_min(fred_docker_backend_lease_mutation_uuid_slot_limit, 1) > 0.8` | This backend storage lineage has consumed more than 80% of its permanent lease-UUID budget. The numerator is monotonic by design: operation/maintenance settlement and close do not reclaim a UUID because an arbitrarily late substrate effect or retry must remain fenced | Follow [Permanent callback UUID capacity](#permanent-callback-uuid-capacity). Forecast the durable UUID burn rate and ship a reviewed limit increase well before exhaustion; new nodes can absorb never-before-seen leases meanwhile. Never delete slots, closed receipts, or `callbacks.db` to reduce the gauge |
 | `fred_docker_backend_callback_receipt_reservations / clamp_min(fred_docker_backend_callback_receipt_reservation_limit, 1) > 0.8` | This backend has consumed more than 80% of its shared durable operation/maintenance receipt budget. Unlike UUID slots, successful close reclaims these reservations after installing the stronger closed-lease fence | Follow [Permanent callback UUID capacity](#permanent-callback-uuid-capacity). Forecast operation/maintenance churn and close convergence. Never delete history or `callbacks.db`; add capacity or ship a reviewed ceiling increase before admission reaches its definitive-refusal boundary |
-| `increase(fred_docker_backend_reconciliation_total{outcome="error"}[15m]) > 0` or `fred_docker_backend_reconciliation_last_success_timestamp_seconds` is stale beyond the expected Docker `reconcile_interval` | Docker's periodic recovery pass failed at a global storage, journal, transport, or unclassified observation boundary, or a durable restore finalizer could not complete source handback. Explicit lease-local maintenance conflicts and expected readiness waits preserve their intent and reservation while siblings continue; they use `fred_docker_backend_maintenance_recovery_deferred_total` and `fred_docker_backend_maintenance_readiness_pending_total{branch}` instead. Semantic recovery errors can leave `/health` green and `fred_docker_backend_callback_store_errors_total` unchanged. A global failure during cold start exits before periodic metrics begin | Inspect the backend's `reconciliation failed` log and its wrapped lease/error. `reconcile restoring operations:` identifies restore-finalizer debt (including a lease-local quota failure). This intentionally increments the pass error and freezes last-success until handback succeeds; independent finalizers still run. It is not evidence that all recovery has stopped. For lease-local deferrals, correlate the separate maintenance warning and counter with the exact workload; a committed target may remain pending while its healthcheck stays `starting`. For a persistent mismatch, stop the backend and preserve the exact `callbacks.db`, `releases.db`, marker pair, Docker metadata, and volumes before following [A pending or corrupt Docker maintenance intent](#a-pending-or-corrupt-docker-maintenance-intent). Do not delete the WAL or use `/health` success as permission to bypass it |
-| `increase(fred_docker_backend_restore_finalizer_pending_total[15m]) > 0` | A restore reached Ready, but the backend could not durably commit or verify its exact active Release, so it deliberately did not delete the source `restoring` finalizer. The source remains non-restorable and all new Provision/Restore/Restart/Update work for the destination is fenced. Reconcile retries do not increment this counter again | Correlate the WARN by destination and original lease UUID, repair the release-store dependency, and let the periodic retention sweep retry. Confirm the source row and destination Release together; do not delete the source row, because it is protecting adopted data and exact destination accounting |
+| `increase(fred_docker_backend_reconciliation_total{outcome="error"}[15m]) > 0` or `fred_docker_backend_reconciliation_last_success_timestamp_seconds` is stale beyond the expected Docker `reconcile_interval` | Docker's periodic recovery pass failed at a global storage, journal, transport, or unclassified observation boundary, or a durable restore finalizer could not complete source handback. Explicit lease-local maintenance conflicts and expected readiness waits preserve their intent and reservation while siblings continue; they use `fred_docker_backend_maintenance_recovery_deferred_total` and `fred_docker_backend_maintenance_readiness_pending_total{branch}` instead. Semantic recovery errors can leave `/health` green and `fred_docker_backend_callback_store_errors_total` unchanged. A global failure during cold start exits before periodic metrics begin, and the timestamp reads 0 until the first periodic pass succeeds, one `reconcile_interval` after start | Inspect the backend's `reconciliation failed` log and its wrapped lease/error (a panicking pass logs `docker_reconciliation cleanup panic` instead and also counts as `error`). `reconcile restoring operations:` identifies restore-finalizer debt (including a lease-local quota failure). This intentionally increments the pass error and freezes last-success until handback succeeds; independent finalizers still run. It is not evidence that all recovery has stopped. For lease-local deferrals, correlate the separate maintenance warning and counter with the exact workload; a committed target may remain pending while its healthcheck stays `starting`. For a persistent mismatch, stop the backend and preserve the exact `callbacks.db`, `releases.db`, marker pair, Docker metadata, and volumes before following [A pending or corrupt Docker maintenance intent](#a-pending-or-corrupt-docker-maintenance-intent). Do not delete the WAL or use `/health` success as permission to bypass it |
 | `fred_health_check_healthy{check="chain"} == 0` | providerd cannot reach the chain gRPC endpoint (or it answered slower than the health probe's budget). Every tenant endpoint that resolves a lease fails, **and reconciliation stops entirely** — a sweep reads the complete paginated `PENDING` and `ACTIVE` inventories concurrently with independent 30s contexts, then returns an error if either failed because everything downstream treats "absent from chain" as ground truth. The bound also prevents startup reconciliation from indefinitely delaying the subscriber and schedulers. Callback HTTP ingress remains reachable, but exact application that needs the chain returns 503; the originating backend keeps that lease's FIFO head durable and periodically retries without blocking other leases | Check the node and `grpc_endpoint`. This is the ENG-522 trigger, and it is now a metric rather than a liveness 503 — providerd deliberately stays in rotation, because dropping out would sever even the retryable callback path without restoring anything |
 | `fred_health_check_healthy{check=~"token_tracker\|payload_store"} == 0` | That bbolt store could not be opened, or is missing the buckets it should have. The payload check additionally fails permanently for that process when its retained parent/path/inode, exact `0600` mode, or single-link proof drifts. `/readyz` is 503 and `/health` reports `unhealthy` while still answering 200 | Check the store's `*_db_path` — that it exists, is the intended unsymlinked file, and is readable. For payload authority drift, fence payload-dependent mutation, preserve the file and any unexpected alias, stop `providerd`, restore exact `0600` mode and one link from understood evidence, then restart. A load balancer cannot fix this. The token probe is read-only, so a full or read-only filesystem can pass it and still break writes: check disk space too even when this gauge reads 1 |
 | `fred_health_check_healthy{check="placement_store"} == 0`, or log `placement runtime authority withdrawn` | The provider can no longer prove that the configured placement pathname names the exact single-link regular-file inode it opened with mode `0600`, or a bbolt `Commit` returned an outcome-unknown error. The failure is process-sticky: all later placement authority reads and writes fail closed even if the pathname or permissions are restored | Fence tenant and chain-event mutation ingress immediately. If the pathname or file metadata changed, **do not restart or overwrite either file before preserving both the still-open inode and the current pathname/aliases**; the running process may hold the best surviving copy. Follow [Placement runtime authority was withdrawn](#placement-runtime-authority-was-withdrawn), then stop, classify the preserved authority offline, and restart only with the exact private provider-bound file chosen from that evidence |
-| `fred_health_check_healthy{check="placement_inventory"} == 0` | The placement database has no complete inventory baseline for the configured backend identities. `/readyz` is 503, but `/health` and the callback route remain available | Restore every configured backend's `/provisions` and `/retentions` responses and let reconciliation commit the bootstrap projection. Do not admit new tenant lifecycle traffic until the check becomes 1 |
+| `fred_health_check_healthy{check="placement_inventory"} == 0` | The placement inventory does not admit fresh lease side effects. The check's message names the cause: `placement inventory recovery pending` (an interrupted sweep waits for its reporters; `fred_placement_inventory_recovery_pending` is 1), `placement inventory waits on a fenced backend` (see the `fred_placement_unprojected_fenced_reporter` row), or `placement inventory not ready` (no complete inventory baseline for the configured backend identities, or placement authority was withdrawn). `/readyz` is 503, but `/health` and the callback route remain available | For a missing baseline or pending recovery, restore every configured backend's `/provisions` and `/retentions` responses and let reconciliation commit the projection. If `placement_store` is also 0, follow its row. Do not admit new tenant lifecycle traffic until the check becomes 1 |
 | `increase(fred_placement_write_failures_total[5m]) > 0` | providerd could not durably record or verify a placement-store synchronization point. A write-ahead failure blocks a new provision, re-provision, or restore before the backend is contacted; a later confirm/cleanup failure preserves conservative authority rather than silently claiming no backend was contacted. An error before bbolt `Commit` is definitely uncommitted and may be retried; a `Commit` error is outcome-unknown and permanently withdraws this process's placement authority | Check the `failed to ... placement`, `placement runtime authority withdrawn`, or placement-sync verification log, then check free space, filesystem permissions and I/O errors at `placement_store_db_path`. If authority was **not** withdrawn, restore access and let reconciliation retry safe work. If it was withdrawn, do not rely on a retry or restart: preserve and classify the exact file as described below. Page on every increase — do not alert on the raw counter being non-zero, because counters remain non-zero after recovery |
-| `fred_backend_health_probe_panics_total > 0` | Bug — a backend health probe panicked. The probe is an HTTP call that should return an error, not panic. It is recovered (the probe runs on its own goroutine, where net/http's recovery does not reach it) and counts as unhealthy, so nothing crashes | Check logs for `backend health probe panicked` and the stack trace, then file an issue |
+| `fred_backend_health_probe_panics_total > 0` | Bug — a backend health probe panicked. The probe is an HTTP call that should return an error, not panic. It is recovered (the probe runs on its own goroutine, where net/http's recovery does not reach it) and counts as unhealthy, so nothing crashes | Check logs for `backend health probe panicked`, which names the backend and the panic value but logs no stack trace, then file an issue |
 | `fred_health_check_healthy` series absent, or frozen while nothing changes | Nothing is polling `/health`. Both this gauge and `fred_backend_healthy` are written **only** from inside the health handler, so with no prober they latch at their last value instead of going absent | Confirm the load balancer's health check on `/health` still exists and its interval (30s in the reference deployment). A latched 1 masks a real outage |
 | `fred_backend_insufficient_resources_total{backend="X",verdict="coded_refusal"}` rising | Backend X is returning contract-conforming capacity refusals; the matching attempt is normally clearable | Reduce SKU sizes, add backend hosts, or check `docker-backend /stats` |
 | `fred_backend_insufficient_resources_total{backend="X",verdict="ambiguous"}` rising | Backend X or an intermediary is returning legacy/code-less/unknown-code capacity 503s; Fred retains the write-ahead attempt | Fix the responder to emit the declared coded envelope, then settle the retained attempt from its exact callback or an upgraded inventory report carrying the same paired typed generation; otherwise perform explicit operator repair. Malformed envelopes appear in `fred_backend_malformed_error_body_total` instead |
-| `fred_backend_malformed_error_body_total` rising on a backend | That backend answers 4xx with a body that is not the declared `{"error": ...}` envelope, so its tenants get a generic message instead of a diagnostic | Find the raw body in the `backend returned a malformed error body` log line and fix the backend to emit the envelope (BACKEND_GUIDE.md). If the backend looks correct, suspect an intermediary answering on its behalf |
+| `fred_backend_malformed_error_body_total` rising on a backend | That backend answers a 4xx, or a 503 whose `code` fred reads (capacity, lifecycle-pending, read capacity), with a body that is not the declared `{"error": ...}` envelope, so its tenants get a generic message instead of a diagnostic | Find the raw body in the `backend returned a malformed error body` log line and fix the backend to emit the envelope (BACKEND_GUIDE.md). If the backend looks correct, suspect an intermediary answering on its behalf |
 | `fred_provisioner_callback_timeouts_total` rising | Backend accepted provision but never called back | Backend logs; verify `callback_base_url` is reachable from backend; check HMAC secret match |
-| `increase(fred_provisioner_callback_settlement_claim_wait_timeouts_total[5m]) > 0` | A callback waited 30 seconds while another callback or the timeout checker retained the same operation ID's terminal-settlement claim. The actor may be blocked on a slow chain call, or a bug may have leaked its claim | Find the `callback settlement claim is contended` and timeout logs for the lease/operation fingerprint; correlate concurrent callback, timeout, acknowledge/reject, and downstream chain-latency logs. A deprovision-owned claim returns immediately and cannot increment this counter. If no actor completes and the counter repeats, restart providerd to clear the process-local claim, then file an issue with the logs |
-| `increase(fred_provisioner_callback_placement_semantic_conflicts_total[5m]) > 0` | A backend reported successful provisioning, but its authenticated callback contradicted the durable backend, attempt, or conflict record. Fred preserved that record for repair and continued toward chain acknowledgement | Find `failed to confirm placement from authenticated success callback; continuing chain acknowledgement` with `permanent_semantic_verdict=true`, then reconcile the logged `lease_uuid`, `backend`, `operation_fingerprint`, and `error` against backend inventory and the placement store before changing or deleting the record. Page on every increase. A later acknowledgement failure can retry and increment this attempt counter again, so correlate by lease and fingerprint rather than treating the value as unique leases |
-| `increase(fred_provisioner_callback_deprovision_owned_success_total[5m]) > 0` | A backend completed provisioning while close/deprovision owned the same operation ID. Fred consumed the success without acknowledging the closing lease and continued teardown | Correlate `ignoring success callback emitted while deprovision owns the operation` with close/deprovision logs for the same lease, backend, and operation fingerprint. A one-off race is safe; sustained increases suggest slow provisioning or unusually fast lease closure |
-| `fred_provisioner_lifecycle_callback_outcomes_total` | Every authenticated lifecycle callback receives exactly one terminal `outcome`: `applied`, `dropped`, or `retryable`. `verdict` is bounded to `authorized`, `legacy`, `teardown_only`, `retired`, `invalid`, `missing`, `stale`, `unusable`, or defensive `unknown`; `status` is exactly one of the closed callback protocol values `success`, `failed`, or `deprovisioned` (anything else is rejected with 400 before application). Summing across `outcome` is the lifecycle-specific received count. The older `fred_api_non_in_flight_callbacks_total` deliberately remains a received-at-ingress compatibility counter and increments even for a later drop | `verdict="legacy"` is expected for v0.13 placements during one-upgrade adoption. `teardown_only` means its matching confirmed placement authority is gone: runtime observations are dropped and only the exact terminal deprovision observation can consume the residual authority. Occasional `outcome="dropped",verdict=~"stale|retired"` is expected after a lost 2xx or lifecycle rotation. Sustained `missing`/`unusable` drops mean the backend is presenting an authority Fred cannot use; correlate the authorization log with placement inventory. After restoring an older `placements.db`, `placement-repair -classify` counts repair candidates (`counts.unusable_adoption_candidates`) and `-list` marks each with `adoption_candidate`; see DEPLOYMENT.md, "Adopting a lifecycle generation after a restore". Any `outcome="retryable"` means Fred returned non-2xx and the backend must retain its FIFO head; check placement-store health and callback application errors |
-| `fred_provisioner_lifecycle_event_sink_panics_total{event=~"provision_starting|restore_restarting|restore_refused|callback"} > 0` | Fred recovered a panic from a best-effort pre-dispatch, restore-refusal, or post-settlement callback event sink. Recovery deliberately lets backend dispatch or callback settlement continue; `event="callback"` means the durable callback is still acknowledged so it cannot wedge that lease's FIFO | Correlate the provision, restore, or callback log by lease and operation fingerprint, use `event` to identify the affected sink, and file a bug with the panic stack; this should never occur |
+| `increase(fred_provisioner_callback_settlement_claim_wait_timeouts_total[5m]) > 0` | A callback waited 30 seconds while another callback or the timeout checker retained the same operation ID's terminal-settlement claim. The actor may be blocked on a slow chain call, or a bug may have leaked its claim | Find `failed to apply callback` logs whose error contains `timed out waiting for callback settlement claim`; the error names the lease. Correlate concurrent callback, timeout, acknowledge/reject, and downstream chain-latency logs for that lease. A deprovision-owned claim returns immediately and cannot increment this counter. If no actor completes and the counter repeats, restart providerd to clear the process-local claim, then file an issue with the logs |
+| `increase(fred_provisioner_callback_deprovision_owned_success_total[5m]) > 0` | A backend completed provisioning while close/deprovision owned the same operation ID. Fred consumed the success without acknowledging the closing lease and continued teardown | This path logs nothing of its own: correlate the lease's `received provision callback` log with `status=success` against close/deprovision logs for the same lease. A one-off race is safe; sustained increases suggest slow provisioning or unusually fast lease closure |
+| `fred_provisioner_lifecycle_callback_outcomes_total` | Every authenticated lifecycle callback receives exactly one terminal `outcome`: `applied`, `dropped`, or `retryable`. `verdict` is bounded to `authorized`, `legacy`, `teardown_only`, `retired`, `invalid`, `missing`, `stale`, `unusable`, or defensive `unknown`; `status` is exactly one of the closed callback protocol values `success`, `failed`, or `deprovisioned` (anything else is rejected with 400 before application). Summing across `outcome` is the lifecycle-specific received count. The older `fred_api_non_in_flight_callbacks_total` deliberately remains a received-at-ingress compatibility counter and increments even for a later drop | `verdict="legacy"` is expected for v0.13 placements during one-upgrade adoption. `teardown_only` means its matching confirmed placement authority is gone: runtime observations are dropped and only the exact terminal deprovision observation can consume the residual authority. Occasional `outcome="dropped",verdict=~"stale\|retired"` is expected after a lost 2xx or lifecycle rotation. Sustained `missing`/`unusable` drops mean the backend is presenting an authority Fred cannot use; correlate the authorization log with placement inventory. After restoring an older `placements.db`, `placement-repair -classify` counts repair candidates (`counts.unusable_adoption_candidates`) and `-list` marks each with `adoption_candidate`; see DEPLOYMENT.md, "Adopting a lifecycle generation after a restore". Any `outcome="retryable"` means Fred returned non-2xx and the backend must retain its FIFO head; check placement-store health and callback application errors |
+| `fred_provisioner_lifecycle_event_sink_panics_total{event=~"provision_starting\|restore_restarting\|restore_refused\|callback"} > 0` | Fred recovered a panic from a best-effort pre-dispatch, restore-refusal, or post-settlement callback event sink. Recovery deliberately lets backend dispatch or callback settlement continue; `event="callback"` means the durable callback is still acknowledged so it cannot wedge that lease's FIFO | Correlate the provision, restore, or callback log by lease and operation fingerprint, use `event` to identify the affected sink, and file a bug with the panic stack; this should never occur |
 | `fred_provisioner_backend_invocation_panics_total > 0` | A backend implementation panicked behind providerd's execution boundary. Mutation calls remain durably ambiguous because the side effect may have crossed the boundary before the panic | Use the bounded `operation` label and panic stack to identify the path; repair the backend and let callback/inventory recovery resolve the retained attempt rather than clearing placement state manually |
-| `fred_provisioner_ack_batch_fee_gas_errors_total` rising | Out-of-gas on lease acknowledgment txs | See [Out-of-gas tuning](#out-of-gas-tuning) |
-| `fred_chain_signer_oog_retries_total{result="exhausted"}` rising | Same; the broadcast retry loop hit `max_gas_limit` | Same as above |
+| `fred_provisioner_ack_batch_fee_gas_errors_total` rising | Insufficient-fee or out-of-gas failures on lease acknowledgment txs | Read the `batch acknowledgment failed with fee/gas error` WARN. For an insufficient fee, check `gas_price` and `fee_denom` against the chain's minimum gas price; gas limits do not fix it. For out-of-gas, see [Out-of-gas tuning](#out-of-gas-tuning) |
+| `fred_chain_signer_oog_retries_total{result="exhausted"}` rising | A tx ran out of gas with its gas already at `max_gas_limit`, so it was not retried and failed. Only possible when `max_gas_limit` is set; with the default `0` a persistent out-of-gas failure never reaches `exhausted` | See [Out-of-gas tuning](#out-of-gas-tuning) |
+| `increase(fred_provisioner_ack_batcher_lane_restarts_total[15m]) > 0` | Bug — an ack-batcher lane's flush panicked. The panic was recovered, the requests in that batch failed back to their callers, and the lane was respawned after one batch interval. A lane that keeps panicking stays crash-looping at that pace; `lane` names it | Check providerd logs for `ack batcher lane panic — recovering to keep fred alive` and its stack trace, and correlate `fred_background_goroutine_panics_total{component="ack_batcher"}`. File an issue with the stack |
 | `increase(fred_docker_backend_die_event_dropped_total[15m]) > 0` sustained | Container-death observations are repeatedly refused because their exact provision generation became stale, restore recovery reserved the actor key, the backend is stopping, or the current actor cannot accept another message; for `source="event_loop"`, also deaths the event loop could not dispatch (its queue was full, or storage identity could not be re-verified). Deaths positively owned by an active actor close are excluded. A one-off stale-generation refusal is safe because reconciliation uses current state, but a death it re-detects is attributed `unknown` and never counts toward the terminal budget (ENG-799); repeated refusal for one unchanged generation can indicate a wedged actor | Correlate `source` with the lease-scoped dropped-event warning and recovery/replacement logs. If the same current generation repeats without recovery or replacement churn, see [Wedged lease actor](#wedged-lease-actor-docker-backend) |
 | `fred_docker_backend_lease_actor_stuck_seconds > 900` | Some actor's `handle()` has been running for >15 min | See [Wedged lease actor](#wedged-lease-actor-docker-backend) |
 | `fred_docker_backend_lease_actor_panics_total > 0` | Bug — actor handler panicked | Check logs for stack trace, file an issue |
+| `fred_docker_backend_lease_worker_panics_total{worker_type} > 0` | Bug — a lease worker goroutine panicked and was recovered. For `provision` and `replace` (restart, update, custom-domain replacement, restore) the outcome stays ambiguous: the lease keeps its non-terminal state for durable recovery to settle (ERROR `substrate mutation outcome is ambiguous; preserving non-terminal state for durable recovery`). A `diag` panic moves the lease to failed without diagnostics. An `image_flight` panic fails the shared image preparation for every lease waiting on it | Find `provision worker panic — recovering to keep fred alive` (or the `replace`/`diag` variant), which carries the stack, or `image preparation worker panicked`, which does not, and file an issue. Let recovery settle the ambiguous operation; do not delete its intent |
+| `fred_docker_backend_lease_pending_operation_unstamped_total > 0` | Bug — a provision or restore entered its in-flight state without the stamp that live recovery uses to match a failure to it, so the lease can stay in flight until docker-backend restarts | Find `projection could not await its operation; live recovery cannot match a failure to it`, which names the lease and operation fingerprint. Restart docker-backend and file an issue |
 | `fred_docker_backend_maintenance_readiness_pending_total` rising with long-lived pending maintenance | Exact maintenance remains pending while startup age or health readiness is uncertain; retries count again | Correlate the once-per-intent/branch warning with container health. A committed target is not rolled back solely because readiness stays uncertain |
 | `fred_docker_backend_maintenance_expired_total` rising | A provider sent restarts or updates older than their lease's retained history, typically after a placement database was restored from an older copy and replayed its pending commands. If the provider's clock also stepped back, its new commands expire until the clock passes the newest stamp it issued before the restore | Each command was refused before mutation and settles for the tenant as `410 maintenance_expired`. Check for a recent placement database restore and the provider host's clock. Nothing needs repair |
 | `fred_docker_backend_maintenance_receipts_unverifiable_total` rising | A failed maintenance receipt's target release row is gone or divergent, typically compacted away by the lease's later large updates. The receipt no longer authorizes cleanup, so a late container from that failed generation would be kept rather than removed | Inspect the `failed maintenance receipt target cannot be verified` log for the lease and maintenance ID. Nothing is blocked; if a stray container for that maintenance ID appears, remove it only after confirming it is not the lease's active cohort |
 | `fred_docker_backend_maintenance_recovery_deferred_total` rising | A lease-local observation conflict retains its intent while sibling recovery proceeds | Inspect the lease-scoped recovery warning and substrate identity; do not delete the intent or release its reserved capacity manually |
-| `fred_docker_backend_network_reclamation_total{outcome=~"error|list_error|budget_exhausted"}` sustained | The separate bounded network worker cannot drain its backlog in a pass | Check Docker errors, idle network count and address-pool headroom. Only `outcome="removed"` counts actual removals; active, connected or busy tenants are safe deferrals. This worker does not spend the operation-recovery budget |
+| `fred_docker_backend_network_reclamation_total{outcome=~"error\|list_error\|budget_exhausted"}` sustained | The separate bounded network worker cannot drain its backlog in a pass | Check Docker errors, idle network count and address-pool headroom. Only `outcome="removed"` counts actual removals; active, connected or busy tenants are safe deferrals. This worker does not spend the operation-recovery budget |
 | `fred_docker_backend_lease_terminal_event_dropped_total` rising under clean shutdown | Real data loss pattern | The release store / provision struct may be out of sync with Docker — reconciler will re-detect on next cycle, but root-cause the wedged actor |
 | `fred_provisioner_reconciler_panics_total > 0` | Bug — a reconciler worker panicked. A `stage="placement_cleanup"` panic preserves that exact durable candidate while the bounded healthy lanes continue | File an issue with the stack trace. The next sweep retries preserved work; do not delete placement evidence |
 | `fred_chain_health_probe_panics_total > 0` | The chain client panicked during a providerd health probe; that probe is reported unhealthy | Correlate `chain health probe panicked` in providerd logs, verify subsequent chain probes recover, and file an issue. A healthy later response does not erase the panic counter |
-| `fred_background_cleanup_panics_total > 0` | Bug in a cleanup loop. **Emitted by every fred binary**, so read `job` alongside `component`: `token` is providerd; `callback`, `diagnostics` and `releases` are a backend; `retention`, `docker_reconciliation` and `docker_network_reclamation` are docker-backend components | Inspect the recovered panic stack, verify the next iteration makes progress, and file an issue. Go to the journal of the host the `job`/`server` labels name, not to providerd by default |
+| `fred_background_cleanup_panics_total > 0` | Bug in a cleanup loop. **Emitted by every fred binary**, so read `job` alongside `component`: `token` is providerd; `callback`, `diagnostics` and `releases` are a backend; `retention`, `docker_reconciliation`, `docker_network_reclamation`, `docker_projid_audit`, `docker_seccomp_census` and `docker_volume_delete_hold` are docker-backend components | Inspect the recovered panic stack, verify the next iteration makes progress, and file an issue. Go to the journal of the host the `job`/`server` labels name, not to providerd by default |
 | `fred_background_goroutine_panics_total{component="callback_replay"} > 0` | A bundled backend recovered a panic while replaying one lease's durable callback FIFO. That lease remains queued for a later pass; the bounded worker pool continues with unrelated leases | Check the backend log for `panic while replaying callback outbox` and its lease UUID/stack, then file an issue. Do not delete `callbacks.db`; replay is the recovery owner |
-| `fred_background_goroutine_panics_total{component=~"timeout_checker_(sweep|candidate)"} > 0` | The timeout checker recovered a bug at its periodic boundary. Exact operation/placement evidence remains durable; candidate isolation lets unrelated timeout settlements continue, and the next cadence retries preserved work | Check the providerd stack trace and file an issue. Do not repair the placement DB merely to clear the alert |
+| `fred_background_goroutine_panics_total{component!~"callback_replay\|timeout_checker_(sweep\|candidate)"} > 0` | Bug — another long-lived goroutine recovered a panic: providerd's `payload_writer`, `ack_batcher` or `withdraw_scheduler`, or docker-backend's `container_death_overflow_reporter` | Find the stack in the journal of the host the `job`/`server` labels name and file an issue. For `ack_batcher`, also see the lane-restart row above |
+| `fred_background_goroutine_panics_total{component=~"timeout_checker_(sweep\|candidate)"} > 0` | The timeout checker recovered a bug at its periodic boundary. Exact operation/placement evidence remains durable; candidate isolation lets unrelated timeout settlements continue, and the next cadence retries preserved work | Check the providerd stack trace and file an issue. Do not repair the placement DB merely to clear the alert |
 | `fred_api_rate_limit_rejections_total{limiter="tenant"}` spike | Specific tenant exceeded their bucket | Expected if a tenant is bursting; sustained spikes indicate a misbehaving client |
-| `fred_payload_leases_awaiting > 0` for >5 min | Tenant created lease with `meta_hash` but never uploaded payload | Tenant-side issue; the lease will eventually expire |
-| `fred_payload_persist_failures_total > 0` | A tenant `/update` reached the backend but could not yet be written to `payloads.db`. The provider keeps the exact update Pending and retains its per-lease mutation fence until the payload is durable or exact terminal chain evidence retires the command | Check disk space and permissions on `payload_store_db_path`, then confirm the store is healthy. Recovery redispatches the same typed ID only until backend acceptance is durably recorded; afterward it retries local payload persistence independently of backend availability. The tenant may also retry with the same `Idempotency-Key` |
-| `fred_reconciler_last_success_timestamp_seconds` stalled | Reconciler is stuck, panicking, running with incomplete inventory, or failing an external read/durable projection — only a complete successful projection advances this. A fenced backend is never asked, so while any backend is fenced every sweep is incomplete and this never advances: gate the alert with `unless on() max(fred_backend_fenced) == 1` and watch `fred_reconciler_sweep_projection_committed` plus `fred_reconciler_backend_inventory_answered` for the unfenced backends instead | Check `fred_reconciler_sweep_complete` first: 0 means a sweep is in progress or the latest sweep did not complete a durable full-fleet projection, not that the durable topology baseline was revoked. Then inspect `fred_reconciler_backend_fetch_total{outcome!="ok"}`, chain health, placement-write logs, and `fred_reconciler_runs_total{outcome="error"}` |
-| `fred_reconciler_backend_fetch_total{outcome!~"ok|fenced"}` sustained for one backend across ≥3 sweeps (~6 min at a 2m interval) | That backend is unreachable from providerd. Its owner-affine leases are deferred and inventory silence changes no attempt or conflict. With an established baseline, safe callbacks/status/cleanup can continue and the reconciler may use nodes that answered both inventories for genuinely new recordless `PENDING` work | [Backend unreachable during reconciliation](#backend-unreachable-during-reconciliation) |
+| `increase(fred_api_rate_limit_rejections_total{limiter=~"callback_ingress\|callback_storage"}[5m]) > 0` | Backend callbacks are being throttled. Both buckets are fixed at 100 requests/s with a burst of 200 and are not configurable. `callback_storage` is per verified backend storage identity. `callback_ingress` is per source IP and refuses only a request that fails HMAC verification once that IP's bucket is empty. A throttled callback gets `429`; the backend keeps it queued and retries, so settlement is delayed, not lost | For `callback_storage`, look in that backend's log for `callback returned error status` with `status=429` and for what is sending so many callbacks. For `callback_ingress`, look for unauthenticated traffic to `/callbacks/provision` from the same address |
+| `fred_payload_leases_awaiting > 0` for >5 min | Tenant created lease with `meta_hash` but never uploaded payload. The gauge is an in-memory set: a lease enters it on its create event (`lease requires payload, awaiting upload`) and leaves on payload upload or a close or expiry event. A missed event keeps it above 0 until providerd restarts, and a restart resets it to 0 while leases may still be waiting | Tenant-side issue; the lease will eventually expire. Check the lease on chain before acting on the gauge alone |
+| `fred_reconciler_last_success_timestamp_seconds` stalled | Reconciler is stuck, panicking, running with incomplete inventory, or failing an external read/durable projection — or a single lease erred. Only a complete sweep with no lease error advances this: one lease error makes the sweep `partial` and freezes it even while `fred_reconciler_sweep_complete == 1`. A fenced backend is never asked, so while any backend is fenced every sweep is incomplete and this never advances: gate the alert with `unless on() max(fred_backend_fenced) == 1` and watch `fred_reconciler_sweep_projection_committed` plus `fred_reconciler_backend_inventory_answered` for the unfenced backends instead | Check `fred_reconciler_runs_total{outcome=~"partial\|degraded\|error"}` first: `partial` means lease errors (count them in `fred_reconciler_actions_total{action="lease_error"}` and the `errors=N` field of the WARN `reconciliation complete`, then find each lease's own error log), `degraded` an incomplete fleet inventory, `error` a sweep that ended early on an error, such as a failed chain read or placement projection. For `degraded` and `error`, inspect `fred_reconciler_backend_fetch_total{outcome!="ok"}`, chain health and placement-write logs; `fred_reconciler_sweep_complete == 0` then means a sweep is in progress or the latest sweep did not complete a durable full-fleet projection, not that the durable topology baseline was revoked |
+| `fred_reconciler_backend_fetch_total{outcome!~"ok\|fenced"}` sustained for one backend across ≥3 sweeps (~6 min at a 2m interval) | That backend is unreachable from providerd. Its owner-affine leases are deferred and inventory silence changes no attempt or conflict. With an established baseline, safe callbacks/status/cleanup can continue and the reconciler may use nodes that answered both inventories for genuinely new recordless `PENDING` work | [Backend unreachable during reconciliation](#backend-unreachable-during-reconciliation) |
 | `fred_reconciler_sweep_complete == 0` sustained (gate with `unless on() max(fred_backend_fenced) == 1`: a fence keeps it 0 for as long as it lasts) | The last fleet observation was incomplete. The gauge becomes 0 before every sweep and remains there while it is in progress or after any chain read, provision/retention inventory, or durable projection failure. It is observability, not a fleet-wide authority switch: a matching durable baseline may remain healthy, while the reconciler narrows recordless `PENDING` admission to the exact answering-node scope and defers lease-specific unsafe work | Inspect backend fetch outcomes, chain health, reconciliation errors, placement-write failures, and deferred lease logs. Do not infer that all mutations are blocked or that absence on a silent node is evidence |
-| `fred_reconciler_backend_inventory_total{outcome!~"authoritative|fenced"}` rising for one backend across ≥3 sweeps | That backend's inventory is not usable as authority: unreachable (`unanswered`), half-answered (`provisions_only`/`retentions_only`), an identity or refresh failure (`untrusted`), or some ambiguous leases (`partial`, which still counts as answered). `fenced` means the operator fenced it, so it was not asked | Triage as for `backend_fetch_total`. For `untrusted`, check the backend's storage identity and pin before anything else; never repoint its address to make it answer |
-| `increase(fred_api_callback_auth_failures_total[15m]) > 0` or `increase(fred_docker_backend_request_auth_failures_total[15m]) > 0` | Signatures are being refused. `mismatch` usually means a misordered key rotation or a wrong key; `expired`/`future` mean clock skew between providerd and the backend; `unknown_storage` means a callback named a storage identity providerd has no key for; `fenced` is a fenced backend still calling back, which is expected until its host is stopped | During a rotation, compare `-print-hmac-key-ids` on both sides and restore the previous configuration. Otherwise check clocks (NTP) and that both sides hold the key pair from the same secret mapping |
+| `fred_reconciler_backend_inventory_total{outcome!~"authoritative\|fenced"}` rising for one backend across ≥3 sweeps | That backend's inventory is not usable as authority: unreachable (`unanswered`), half-answered (`provisions_only`/`retentions_only`), an identity or refresh failure (`untrusted`), or some ambiguous leases (`partial`, which still counts as answered). `fenced` means the operator fenced it, so it was not asked | Triage as for `backend_fetch_total`. For `untrusted`, check the backend's storage identity and pin before anything else; never repoint its address to make it answer |
+| `increase(fred_api_callback_auth_failures_total[15m]) > 0` or `increase(fred_docker_backend_request_auth_failures_total[15m]) > 0` | Signatures are being refused. `mismatch` usually means a misordered key rotation or a wrong key; `expired`/`future` mean clock skew between providerd and the backend; `unknown_storage` means a callback named a storage identity providerd has no key for; `fenced` is a fenced backend still calling back, which is expected until its host is stopped | During a rotation, compare `providerd --print-hmac-key-ids` with `docker-backend -print-hmac-key-ids` and restore the previous configuration. Otherwise check clocks (NTP) and that both sides hold the key pair from the same secret mapping |
 | `sum(increase(fred_placement_snapshots_total{outcome="success"}[2h])) == 0` (use a window of at least twice `placement_snapshot_interval`) | No online snapshot of `placements.db` and `payloads.db` was published in two intervals. The series exist only when `placement_snapshot_dir` is set | Look at the other outcomes and the `placement snapshot` WARN logs. `insufficient_space`: free space on the snapshot filesystem, which needs twice the databases' size plus 256 MiB. Each attempt first removes staged files left by a crash (`.fred-snapshot-tmp-*`), so that space is already counted. `error`: the log names the step. A copy past its 30s deadline means a slow snapshot disk. A re-read that does not match the streamed digest means the snapshot disk returned different bytes. A copy that matches its digest but fails bbolt's consistency check means the live database itself is damaged: stop providerd and run `placement-repair -classify`. A capture failure means a live store refused the read: check both stores' authority (see [Placement runtime authority was withdrawn](#placement-runtime-authority-was-withdrawn)) |
 | `increase(fred_placement_snapshot_prune_failures_total[1h]) > 0` | Pruning kept a snapshot file it could not prove safe to delete, or failed to delete one. `not_owned` or `live_database`: something other than providerd put a file under a snapshot name, such as a symlink or a hard link to a live database. `inspect`, `remove`, `sync`: an I/O or permission problem. `list`: the directory cannot be listed or holds at least 8192 entries | Kept files are never lost; the directory grows until the cause is fixed. Move the offending file out of the snapshot directory, or fix its permissions so it is a regular file owned by the providerd user. Keep the directory for snapshots only |
 | `fred_api_callback_previous_key_configured == 1` for longer than a rotation takes | A rotation was not finished: the old key is still accepted on that backend's callbacks | Finish step 4 of the rolling rotation (DEPLOYMENT.md, "Rotating a backend's HMAC key") once `fred_api_callback_signature_key_total{slot="previous"}` has stopped rising |
 | `fred_provisioner_reconciler_lost_leases_total{outcome="error"}` sustained | The reconciler cannot end a lease that was lost with a retired backend: the chain transaction or the lease re-read keeps failing | Check the `failed to end lost lease on chain` log and the signer and chain health. Each failure is a lease error, so the sweep reports `partial` and `fred_reconciler_last_success_timestamp_seconds` stops advancing until the close succeeds; each sweep retries. `closed`/`rejected` rise as each lost lease is ended after a retirement (see DEPLOYMENT.md, "Retiring a backend whose storage is lost") |
 | `fred_provisioner_reconciler_deferred_leases_total` rising while `fred_reconciler_sweep_complete == 1` | Every backend answered, but one or more leases still lacked a safe, current lifecycle decision: ownership was ambiguous, placement was unusable or unresolved, or an operation/placement change crossed the inventory boundary. A low rate during provisioning, restore, or other lease churn is expected | Correlate the lease-level `reconcile: deferring lease` logs with operation Registry and placement changes. Investigate a sustained rate or the same lease repeating without concurrent work; it can indicate a stuck unresolved record or unusually slow sweeps |
-| `fred_reconciler_cleanup_skips_total{reason="chain_unknown"}` rising | Fred is declining to clean up state for a lease **the chain has no record of**, and will decline again every sweep — this one does not self-heal. Either providerd is pointed at the wrong or a reset chain (check the `pass` label spread: fleet-wide means config, one lease means a phantom), or a provision exists that no lease ever created | Confirm the chain endpoint and provider UUID first. If the chain is right, the resource is genuinely unowned: deprovision it by hand once you have confirmed the tenant is gone |
+| `fred_reconciler_cleanup_skips_total{reason="chain_unknown"}` rising | Fred is declining to clean up state for a lease **the chain has no record of**, and will decline again every sweep — this one does not self-heal. Either providerd is pointed at the wrong or a reset chain, or a provision exists that no lease ever created. Count the distinct `lease_uuid` values in the WARN `reconcile: chain has no record of this lease`: many leases point to config, one lease to a phantom (the `pass` label only names the cleanup pass: `orphan`, `payload` or `placement`) | Confirm the chain endpoint and provider UUID first. If the chain is right, the resource is genuinely unowned: deprovision it by hand once you have confirmed the tenant is gone |
 | `fred_reconciler_cleanup_skips_total{reason="chain_unknown_state"}` rising | The chain reports a lease state this providerd build cannot classify — either the zero `UNSPECIFIED`, or a state added to the ledger after this binary shipped. Cleanup is withheld, which is data-safe but permanent for those leases | **Upgrade fred** to a build whose `manifest-ledger` pin knows the new state. Unlike `chain_unknown` the chain is fine and providerd is behind it, so do not go looking for a phantom provision |
 | `fred_reconciler_cleanup_skips_total{reason="chain_error"}` sustained | The per-candidate chain re-check is failing, so cleanup is paused (data-safe). Usually the same cause as any other chain-query failure, or a lookup that blew its 10s budget — that budget exists so a stalled query cannot wedge the sweep, and it reports as an error rather than as evidence | Check `fred_chain_query_duration_seconds{query="get_lease"}` and the node's health; self-heals |
 | `fred_reconciler_cleanup_skips_total{reason="chain_live"}` rising steadily | The sweep's lease snapshot is often stale by the time cleanup runs — expected at a low rate, but a high one means sweeps are slow relative to lease churn | Compare `fred_reconciler_duration_seconds` against the reconcile interval; no action if the rate is low |
@@ -230,16 +237,17 @@ when later probes or recovery passes succeed.
 | `fred_provisioner_deferred_closes_pending` remains elevated | Queued or executing close retries await inventory projection, lifecycle ownership, or local backend circuit admission | Correlate `lease close deferred` with the bounded `reason` in `fred_provisioner_deferred_closes_total`. Restore the named dependency; never remove an inventory fence or durable attempt to accelerate a close |
 | `fred_provisioner_deferred_closes_oldest_age_seconds` keeps increasing | The oldest queued or executing lease entry has not left the provider scheduler. Its first-enqueue age survives coalescing and retries, so repeated hints do not hide an extended wait | Correlate the oldest affected lease in deferred-close logs with inventory, lifecycle ownership or the named backend circuit. The gauge refreshes approximately once per second and on queue mutations and is zero when empty or stopped; it is not durable close-intent age. Restore the dependency instead of deleting attempts or relaxing fences |
 | `fred_provisioner_deferred_closes_oldest_age_seconds > 2100` or `fred_provisioner_deferred_closes_total{outcome="overdue"}` increases | A retained close has waited beyond the 30-minute import ceiling plus five minutes. The scheduler emits an Error and increments `overdue` once per queued entry; retries and ownership continue | Inspect the named lease and backend dependency. Escalation never authorizes abandoning the close, releasing import allocation or deleting durable receipts |
-| `increase(fred_provisioner_deferred_closes_total{outcome=~"failed|full|unavailable"}[5m]) > 0` | A retry encountered an actual failure, all 1,024 slots were occupied, or scheduler admission was closed | Inspect `deferred lease close failed` and event errors. `dispatched` means the call returned successfully, not physical completion; verify the exact deprovision callback or backend retention status. A newer hint can remain queued after the older attempt increments `dispatched` or `failed`. No tenant or lease identifiers appear in metric labels |
+| `increase(fred_provisioner_deferred_closes_total{outcome=~"failed\|full\|unavailable"}[5m]) > 0` | A retry encountered an actual failure, all 1,024 slots were occupied, or scheduler admission was closed | Inspect `deferred lease close failed` and event errors. `dispatched` means the call returned successfully, not physical completion; verify the exact deprovision callback or backend retention status. A newer hint can remain queued after the older attempt increments `dispatched` or `failed`. No tenant or lease identifiers appear in metric labels |
 | `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
 | `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps | A volume owned by an exact retained-data tombstone cannot be destroyed — its footprint **is** counted in the admission pool (no over-admit) but pins capacity and likely needs manual repair. A rising `..._retention_leaked_total` with `reaping_bytes` flat is instead the self-healing rollback store-error case (no action). This is not unattributed-volume GC. | [Reclaiming retained-data / stuck-reaping volumes](#reclaiming-retained-data--stuck-reaping-volumes) |
-| `sum without (outcome) (increase(fred_docker_backend_retention_sweep_total[3h])) == 0` (with retention enabled) | The periodic retention sweep has stopped iterating entirely — the loop goroutine is gone, the ticker is starved, or the process is wedged. The sum advances on **every** pass regardless of outcome, so a flat sum is absence, not failure. Nothing is being reaped, no interrupted restore is being reconciled, and no orphan record is being pruned | Check the docker-backend process and its logs for `retention cleanup panic`; `fred_background_cleanup_panics_total{component="retention"}` distinguishes a panicking sweep from a dead one |
-| `increase(fred_docker_backend_retention_sweep_total{outcome="error"}[6h]) > 0` | At least one sweep stage failed. Two distinct causes land here, so **read the log line before acting**: an unenumerable `retention.db` (the common one — the reaper and orphan pruner reclaim nothing and **every lease close skips volume teardown entirely**, leaving closes `Failed` and retrying, so the provider degrades toward refusing new work), or an unreadable **volume root**, which the orphan stage reports through the same outcome with a perfectly healthy store | **Start with the sweep's log line, not the database.** It prefixes each failure with its stage — `reap expired:` / `retry reaping:` / `list restoring:` are store reads, `reconcile orphans:` can be either (pair it with `retention_orphan_skips_total`: `reason="store_error"` vs `reason="list_error"` separates them exactly). Then fix whichever dependency it names; the parked work resumes on its own. Shares a root cause with the `claims_unreadable` row below |
+| `sum without (outcome) (increase(fred_docker_backend_retention_sweep_total[3h])) == 0` (with retention enabled) | The periodic retention sweep is not completing passes — the loop goroutine is gone, the ticker is starved, the process is wedged, or every pass panics or fails storage-identity verification before its stages (such a pass records no outcome). Any other pass advances the sum whatever its outcome, so a flat sum is not a stage failure. Nothing is being reaped, no interrupted restore is being reconciled, and no orphan record is being pruned | Check the docker-backend process and its logs for `retention cleanup panic` and `retention cleanup failed` (an error starting `backend storage identity verification failed` means storage identity could not be verified); `fred_background_cleanup_panics_total{component="retention"}` distinguishes a panicking sweep from a dead one |
+| `increase(fred_docker_backend_retention_sweep_total{outcome="error"}[6h]) > 0` | At least one sweep stage failed. Distinct causes land here, so **read the log line before acting**: an unenumerable `retention.db` (the common one — the reaper and orphan pruner reclaim nothing and **every lease close skips volume teardown entirely**, leaving closes `Failed` and retrying, so the provider degrades toward refusing new work), an unreadable **volume root**, which the orphan stage reports through the same outcome with a perfectly healthy store, or a restore finalizer that cannot finish | **Start with the sweep's `retention cleanup failed` log line, not the database.** It prefixes each failure with its stage — `reap expired:` / `retry reaping:` / `list restoring:` are store reads, `reconcile orphans:` can be either (pair it with `retention_orphan_skips_total`: `reason="store_error"` vs `reason="list_error"` separates them exactly), and `reconcile restoring source "…" destination "…":` is one restore finalizer. Then fix whichever dependency it names; the parked work resumes on its own. Shares a root cause with the `claims_unreadable` row below |
 | `fred_docker_backend_retention_accounting_refresh_failed_total` rising | The retained-disk projection could not be recomputed, so the five retention gauges **and** the admission pool's retained input are frozen at their last values. That is the data-safe direction (a zeroed projection would over-admit), but it means those gauges are stale — do not read them as current while this is rising | Same root cause as the row above: fix the retention store. Until then, treat `retained_volume_bytes` / `retention_reaping_bytes` as last-known-good, not live |
 | `fred_docker_backend_volume_quota_clear_failed_total` rising | An XFS quota-clear command failed during interrupted-create compensation or typed deletion. The preceding block/inode proof failures do not increment this metric. Typed authority is retained either way. During a deletion, that one volume's deletion is held (reason `quota_clear_failed`) and retried in the background while the backend keeps serving. During create compensation, the current backend instance fail-stops and a fresh `Start` recovers the stage before readiness. A historical already-absent volume without typed authority can still leave an unowned table entry | [Held volume deletions](#held-volume-deletions); [XFS deletion recovery and legacy quota entries](#xfs-deletion-recovery-and-legacy-quota-entries) |
-| `fred_docker_backend_volume_delete_holds > 0` for 1h | At least one XFS volume deletion could not finish for a reason confined to that volume. Its delete stage and project ID are kept, the hold executor retries it, and the backend keeps serving; a hold in the `removal` or `unsized` phase keeps its close or operation pending, and an `unsized` hold also withholds disk admission. Ticket, do not page | [Held volume deletions](#held-volume-deletions) |
+| `fred_docker_backend_volume_delete_holds > 0` for 1h | At least one XFS volume deletion could not finish for a reason confined to that volume. Its delete stage and project ID are kept, the hold executor retries it, and the backend keeps serving; a hold in the `removal` or `unsized` phase keeps its close or operation pending, and an `unsized` hold also withholds disk admission, which refuses every new provision, diskless ones included. Ticket, do not page | [Held volume deletions](#held-volume-deletions) |
 | `fred_docker_backend_volume_destroy_refused_total{reason="claims_unreadable"}` > 0 | The retention store could not be read, so an exact close or retained-data finalizer could not establish who owns a volume and **nothing was destroyed** — data-safe, but those operations are parked. Runtime closing leases stay `Failed` and retry; retained-data reaping retries on its next sweep. Unattributed managed volumes are preserved without attempting destruction and therefore do not emit this series | Fix `retention.db` health first; parked work resumes when its exact authority is readable. See the `store_error` row in [Partition collapse triage](#partition-collapse-triage) |
-| `fred_docker_backend_volume_destroy_refused_total{reason="claimed"}` sustained | An exact destroy path keeps meeting a volume another lease owns — normally an in-flight restore that is not converging, since a healthy restore clears its own claim on commit or rollback. Never data loss: the refusal is the guard working | Read with `restore_finalizer_pending_total` and `retention_reaping_leases`; the WARN log names the volume and its owning lease. [Reclaiming retained-data / stuck-reaping volumes](#reclaiming-retained-data--stuck-reaping-volumes) |
+| `fred_docker_backend_volume_destroy_refused_total{reason="claimed"}` sustained | An exact destroy path keeps meeting a volume another lease owns — normally an in-flight restore that is not converging, since a healthy restore clears its own claim on commit or rollback. Never data loss: the refusal is the guard working | Read with `reconcile restoring operations:` errors (see the `fred_docker_backend_reconciliation_total` row) and `retention_reaping_leases`; the WARN log names the volume and its owning lease. [Reclaiming retained-data / stuck-reaping volumes](#reclaiming-retained-data--stuck-reaping-volumes) |
+| `increase(fred_docker_backend_volume_bind_symlink_rejected_total[1h]) > 0` | A launch was refused because a path the image declares as a VOLUME is a symlink inside the lease's own managed volume (ENG-795). Only that tenant could have planted the link, so this is a tenant attempt, not a fred fault. It counts attempts: the volume is not wedged, and a repeated count is the tenant retrying | Informational; no operator cleanup is needed. An image that does not declare that path still launches on the volume and can remove the link |
 | `fred_docker_backend_teardown_fallback_total{outcome="failed",operation=~"restore_reconcile\|deprovision"}` rising | Container teardown could not prove absence; exact durable authority and accounting remain held for retry | [Stuck teardown](#stuck-teardown-docker-backend) |
 | `fred_docker_backend_teardown_fallback_total{outcome="failed",operation="provision_cleanup"}` rising | Candidate cleanup remains incomplete. The exact operation intent, pool reservation, and volume claims remain. A live worker with an ambiguous side effect can still fail-stop; cold/live recovery retries ordinary cleanup failures without re-latching the process | [Stuck teardown](#stuck-teardown-docker-backend) |
 | `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}` rising | An exact interrupted provision or restore exceeded its durable admission horizon and entered failed-operation cleanup; both use the configured provision timeout, with no separate container-start recovery window | Correlate with lease-scoped warnings and cleanup retry counters. A pending cleanup retains authority and reservation for the next sweep |
@@ -249,26 +257,27 @@ when later probes or recovery passes succeed.
 | `fred_docker_backend_unaccounted_managed_volume_observation_failures_total` rising | Failed diagnostic inventory/footprint observations; last unaccounted-volume gauge is retained, not reset to zero | Correlate lease-scoped recovery/observation warnings. Restore the failed substrate or journal dependency; never erase authority to clear the signal. Diagnostic volume counts may be transient during create/rename; investigate a sustained value |
 | `fred_docker_backend_terminal_substrate_pending_containers{receipt}` > 0 | Late containers remain for permanent `closed` or `failed_operation` receipts; the compact receipts cannot reconstruct their resource profiles, so pool capacity and readiness are withheld on this backend | Restore Docker/storage responsiveness. The daemon keeps retrying exact cleanup; confirm the gauge clears. Never delete the receipts to restore readiness |
 | `fred_docker_backend_image_helpers_unsettled > 0` sustained | Image-inspection helpers survived recovery. `cleanup_pending` ones are retried every pass; `unknown_create` ones are kept until offline repair settles them, even after recovery finds and removes a late helper container. On the containerd image store, either blocks image ingestion and image GC on that backend | Restore Docker responsiveness and confirm `cleanup_pending` clears. If `unknown_create` persists, stop the backend and use `docker-backend -inspect-unsettled-docker-effects`, then `-repair-unsettled-docker-effects` |
-| `fred_docker_backend_retention_partition_collapsed_total` increasing | Partition declarations collapsing to the default bucket — harmless (closes are never blocked, data is never destroyed), but check the `reason` label first: `invalid` / `divergent` / `over_limit` signal an integrator-side key bug, while `no_input` / `store_error` signal a backend hydration or store-health issue | [Partition collapse triage](#partition-collapse-triage) |
+| `fred_docker_backend_retention_partition_collapsed_total` increasing | Partition declarations collapsing to the default bucket — harmless (closes are never blocked, data is never destroyed), but check the `reason` label first: `invalid` / `divergent` signal an integrator-side key bug, `over_limit` means the tenant already has its configured `max_partitions` distinct partitions, while `no_input` / `store_error` signal a backend hydration or store-health issue | [Partition collapse triage](#partition-collapse-triage) |
 | `fred_docker_backend_retention_cap_check_failed_total` increasing | Retention cap checks are failing OPEN on store-read errors — quotas are silently unenforced (data-safe, but the gates are off) | Check `retention.db` health; see the `store_error` row in [Partition collapse triage](#partition-collapse-triage) |
 
 ---
 
 ## Out-of-gas tuning
 
-Lease acknowledgments and withdrawals are submitted as Cosmos SDK transactions. Since ENG-431 the daemon **simulates gas per transaction**: the declared gas is `gas_adjustment × simulated GasUsed` (default `gas_adjustment` 1.2), and a simulated estimate exceeding `max_gas_limit` (default `0` = uncapped) is rejected before broadcast. `gas_limit` (default 1,500,000) is now only the **Simulate-failure fallback ceiling** — used when the Simulate RPC errors or the simulation circuit-breaker is open, not on the steady-state path. When the chain still rejects a broadcast with `out of gas`, the broadcast layer retries with `1.5×` more gas, compounding up to `max_gas_limit`.
+Lease acknowledgments and withdrawals are submitted as Cosmos SDK transactions. Since ENG-431 the daemon **simulates gas per transaction**: the declared gas is `gas_adjustment × simulated GasUsed` (default `gas_adjustment` 1.2), and a simulated estimate exceeding `max_gas_limit` (default `0` = uncapped) is rejected before broadcast. `gas_limit` (default 1,500,000) is now only the **Simulate-failure fallback** — used when the Simulate RPC errors or the simulation circuit-breaker is open, not on the steady-state path. The fallback declares `gas_limit × gas_adjustment`, capped at `max_gas_limit` when set. When the chain still rejects a broadcast with `out of gas`, the broadcast layer retries with `1.5×` more gas, compounding up to `max_gas_limit`.
 
 **Diagnosing:**
 - `fred_chain_gas_simulation_total{result}`: a rising `fallback` rate means Simulate is unavailable and the daemon is on the fixed `gas_limit` ceiling (so `gas_limit` tuning below becomes relevant); `refused` means a simulated estimate exceeded `max_gas_limit` and the tx was rejected before broadcast.
-- `fred_chain_gas_simulated`: histogram of the declared-gas magnitude per broadcast — watch it to observe steady-state gas draw and to size `max_gas_limit`.
-- Spikes in `fred_chain_signer_oog_retries_total{result="retried"}`: retries are working — the estimate was tight but eventually succeeded.
-- Spikes in `fred_chain_signer_oog_retries_total{result="exhausted"}` or `fred_provisioner_ack_batch_fee_gas_errors_total`: the cap is too low or the underlying tx genuinely needs more gas (e.g. a large authz batch).
+- `fred_chain_gas_simulated`: histogram of the declared-gas magnitude per broadcast, which already includes `gas_adjustment` — watch it to observe steady-state gas draw and to size `max_gas_limit`.
+- `fred_chain_signer_oog_retries_total{result="retried"}` counts out-of-gas failures after which the gas was raised by `1.5×`. It does not mean the tx later succeeded: the last allowed attempt counts too (most txs get three attempts; the sub-signer grant and funding txs get one), so look for logged errors containing `transaction failed:` to see whether the tx finally failed.
+- `fred_chain_signer_oog_retries_total{result="exhausted"}`: a tx ran out of gas with its gas already at `max_gas_limit`. With the default `max_gas_limit: 0` this never happens, and a persistent out-of-gas failure shows only as `retried` plus failed txs.
+- `fred_provisioner_ack_batch_fee_gas_errors_total` counts acknowledgment batches that failed on out-of-gas **or** an insufficient fee. Its WARN, `batch acknowledgment failed with fee/gas error`, carries the chain error; an insufficient fee is fixed through `gas_price` and `fee_denom`, not gas limits.
 
 **Tuning:**
 1. Steady-state gas self-tunes via per-tx simulation — you normally do **not** set `gas_limit`; it only affects the Simulate-failure fallback path.
-2. If `fred_chain_gas_simulation_total{result="fallback"}` is non-trivial, set `gas_limit` to `1.2 × p99 gas_used` (from chain logs or `fred_chain_gas_simulated`) so the fallback still covers a real tx.
+2. If `fred_chain_gas_simulation_total{result="fallback"}` is non-trivial, set `gas_limit` to the p99 `gas_used` from chain logs, so that the fallback's `gas_limit × gas_adjustment` covers a real tx with headroom. `fred_chain_gas_simulated` already includes `gas_adjustment`: divide its p99 by `gas_adjustment` before using it here.
 3. If using authz sub-signers (`sub_signer_count > 0`), each lane has its own gas budget; the total chain cost scales with `sub_signer_count`.
-4. Set `max_gas_limit` to a safety cap (e.g. `4 × gas_limit`) so a runaway tx doesn't consume an entire fee budget on retries; note it also bounds the pre-broadcast reject (`result="refused"`).
+4. Set `max_gas_limit` to a safety cap (e.g. `4 × gas_limit`, and at least 5,000,000: below that providerd warns at startup that large withdrawals and batches may be permanently refused). The cap is absolute: a tx whose simulated gas exceeds it is refused before broadcast with no fallback (`result="refused"`), and it also bounds out-of-gas retries.
 
 ---
 
@@ -277,20 +286,20 @@ Lease acknowledgments and withdrawals are submitted as Cosmos SDK transactions. 
 If `lease_actor_stuck_seconds` exceeds your alert threshold, one specific lease's actor goroutine has been mid-handler for too long.
 
 **Investigation:**
-1. The metric is unlabeled (gauge of the *oldest* in-flight actor across all leases), so identifying which lease is stuck requires a goroutine dump. Send SIGQUIT to the docker-backend process — the Go runtime dumps every goroutine's stack to stderr and exits. Capture stderr first:
+1. The metric is unlabeled (gauge of the *oldest* in-flight actor `handle()` across all leases). Long work inside `handle()` is teardown: deprovision runs synchronously there, while provision, restart, update and restore, including their image pulls, run in worker goroutines and do not raise this gauge. To see where it is blocked, take a goroutine dump. Send SIGQUIT to the docker-backend process — the Go runtime dumps every goroutine's stack to stderr and exits. Capture stderr first:
    ```
-   journalctl -u docker-backend -f &     # or `docker logs -f docker-backend`
-   kill -SIGQUIT $(pgrep -f docker-backend)
+   journalctl -u docker-backend -f &     # fred-docker-backend under manifest-deploy; or `docker logs -f docker-backend`
+   kill -SIGQUIT $(pgrep -x docker-backend)   # -x: exact name; -f would also match the journalctl
    ```
-   (Fred does not expose `net/http/pprof` by default. If you need non-fatal goroutine dumps, build with pprof enabled or use `delve` against the running process.)
-2. In the dump, look for goroutines in `leaseActor.handle()` and `leaseActor.run()`. The actor's `leaseUUID` is on the receiver — visible as the `*leaseActor` argument in the stack frame.
-3. Check what handler it's in — typically `provision.go`, `deprovision.go`, or `restart_update.go`.
+   (Fred does not include `net/http/pprof`. For a non-fatal goroutine dump, attach `delve` to the running process.)
+2. In the dump, look for goroutines in `leasesm.(*LeaseActor).handle`; the frames below it show what it waits on, for a teardown under `docker.(*Backend).doDeprovision`. Go prints the `*LeaseActor` receiver as a pointer, so the dump does not name the lease. Find it among the leases being closed: providerd's `processing lease close` and `deferred lease close failed; reconciliation will retry` logs, and containers stuck in removal (`docker ps -a --filter label=fred.lease_uuid`).
 
 **Common causes and remedies:**
-- **Image pull stuck or failing**: the registry is rate-limiting or unreachable. docker-backend makes these registry requests itself, so dockerd logs and a manual `docker pull` show neither the requests nor their errors. Search the docker-backend log for `resolve immutable image:` (a Docker Hub quota refusal contains `TOOMANYREQUESTS` or `429`), check `fred_docker_backend_image_registry_requests_total{status=~"429|5xx|error"}`, and follow [Registry rate limits](#registry-rate-limits). Reduce `image_pull_timeout` so the actor errors out sooner.
 - **`docker stop` hanging**: a container is ignoring SIGTERM and the grace period is long. Lower `container_stop_timeout`.
 - **Volume cleanup hanging on btrfs/zfs**: a quota or subvolume operation is blocked in the kernel. Inspect the filesystem state directly.
-- **Genuine deadlock**: file an issue with the goroutine dump. The actor will not unblock; the reconciler will re-detect the lease on its next cycle and retry, but the wedged goroutine leaks until restart.
+- **Genuine deadlock**: file an issue with the goroutine dump. The actor will not unblock. Later messages for the lease queue behind it, or are refused once its 16-message inbox is full, so retries from the reconciler or providerd reach the same wedged actor: nothing moves for that lease until docker-backend restarts.
+
+A stalled or failing image pull is not a cause: image preparation runs in a worker goroutine, so it delays provisions without raising this gauge. docker-backend makes these registry requests itself, so dockerd logs and a manual `docker pull` show neither the requests nor their errors. Search the docker-backend log for `resolve immutable image:` (a Docker Hub quota refusal contains `TOOMANYREQUESTS` or `429`), check `fred_docker_backend_image_registry_requests_total{status=~"429|5xx|error"}`, and follow [Registry rate limits](#registry-rate-limits).
 
 **Last resort:** restarting the docker-backend recovers cleanly. State is rebuilt from Docker labels and bbolt stores on startup.
 
@@ -299,6 +308,14 @@ If `lease_actor_stuck_seconds` exceeds your alert threshold, one specific lease'
 ## Stuck teardown (docker-backend)
 
 **Symptom:** `fred_docker_backend_teardown_fallback_total{outcome="failed"}` is rising.
+
+A close that preempted an in-flight provision, restore, restart, update or
+custom-domain replacement does not use this path or move this counter: it stops
+and removes the lease's containers one by one, logging
+`graceful captured close stop failed; removing container` when a graceful stop
+fails. A stuck teardown there shows only in the close-intent signals:
+`fred_docker_backend_pending_close_intents` and
+`durable close recovery remains pending`.
 
 **What it means:** per-container teardown recovery could not prove absence. For
 `restore_reconcile`, this is exact failed-attempt cleanup before source handback;
@@ -374,11 +391,11 @@ for failure. A Succeeded row plus the immutable finalizer reconstructs a missing
 active Release; Failed plus an exact committed Release is contradictory authority
 and fails closed.
 
-`outcome="recovered"` is the benign twin — `down` failed but the fallback removed everything it found — with one caveat: on an advisory operation it can be vacuous, recording success after finding zero containers.
+`outcome="recovered"` is the benign twin: absence was proved. For `deprovision` and `provision_cleanup`, `down` failed but the fallback removed every container a fresh inventory found for the lease; for `restore_reconcile`, exact failed-attempt cleanup was followed by a strict inventory with no destination container.
 
 **Triage:**
 
-1. Find the lease and the operation from the `operation` label and the warning logs (`compose down failed, falling back to individual removal`, then `failed to remove container`).
+1. Find the lease and the operation from the `operation` label and the warning logs (`compose down failed, falling back to individual removal`, then `failed to remove container`). Neither log appears when `compose down` was canceled, timed out, or hit storage-identity drift or an outcome-unknown mutation, and `restore_reconcile` never emits them. Look instead for `reconcile restoring source "…" destination "…"` in the `retention cleanup failed` or `reconciliation failed` logs, and for `durable close recovery remains pending` on a close.
 2. Check the daemon: `docker ps -a --filter label=fred.lease_uuid=<uuid>`.
    - **Nothing returned**: a later strict recovery inventory can prove container absence; remaining volume/source finalization may still need retry.
    - A container stuck in `Removal In Progress`, or one whose `docker rm -f` hangs, usually means a wedged storage driver or a mount the kernel still holds.
@@ -405,9 +422,12 @@ to start so per-volume disk_mb limits are enforced, not silently skipped
 ```
 
 This is deliberate: a missing capability would otherwise silently drop every
-`disk_mb` cap. Grant `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` on the
-docker-backend systemd unit — `CAP_SYS_ADMIN` to set the block limit, and
-`CAP_FOWNER` so startup can repair the root inode of a pre-existing tenant-owned volume.
+`disk_mb` cap. Set both `AmbientCapabilities=` and `CapabilityBoundingSet=` to
+`CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN CAP_FOWNER` on the docker-backend
+systemd unit, as the manifest-deploy unit does: `CAP_CHOWN` to set volume
+ownership for launches, `CAP_DAC_OVERRIDE` to manage restrictive tenant-owned
+trees, `CAP_SYS_ADMIN` to set the block limit, and `CAP_FOWNER` so startup can
+repair the root inode of a pre-existing tenant-owned volume.
 A plain `setcap …+ep` on the binary is insufficient for CLI quota operations —
 `CAP_SYS_ADMIN` must reach the exec'd `xfs_quota`/`btrfs` children. XFS root repair
 uses descriptor-bound kernel ioctls in the backend process and never walks tenant
@@ -450,8 +470,10 @@ fail before the command-line HTTP/metrics server is created. The process never
 serves a known volume uncapped.
 
 `fred_docker_backend_volume_quota_backfill_total{outcome}` (`outcome ∈
-{applied, failed}`) counts the individual attempts, but do not depend on scraping
-it from this failure mode: the normal binary has not bound its metrics endpoint.
+{applied, failed, delete_pending}`, where `delete_pending` is a volume whose
+deletion is held and whose delete authority keeps its limits) counts the
+individual attempts, but do not depend on scraping it from this failure mode:
+the normal binary has not bound its metrics endpoint.
 Use the nested `reconcile startup volume quotas` startup error to identify every
 affected name. On XFS, repairing a tenant-owned root can require `CAP_FOWNER`.
 Grant it or repair the reported substrate/authority error, then restart.
@@ -466,8 +488,16 @@ Docker image storage is accounted separately from per-volume project quotas.
 Shared image, journal and tenant-volume filesystems are supported with the
 existing deployment layout. Containerd image storage requires `image_data_path`
 naming its actual content directory; it may differ from Docker's data root.
-Inspect free space there, in the Docker data root and beside the callback journal
-when image admission is refused.
+Image admission and every container launch check free space on each of: the
+image content directory (`image_data_path`, or Docker's data root), Docker's
+data root, `<callback_db_path>.image-staging`, the directories holding
+`callback_db_path`, `releases_db_path`, `retention_db_path` and
+`diagnostics_db_path`, and `volume_data_path`. Each must keep
+`image_disk_min_free_mb` (default 2048) free, plus any import allocation whose
+completion is unknown; staging an image also needs room for its staging
+allowance (bounded by `image_max_size_mb` for a new image) on the staging
+filesystem. One filesystem below that floor refuses every launch, not only
+image pulls. Inspect all of them when admission is refused.
 Ingestion supports classic `overlay2` and containerd's `overlayfs` snapshotter;
 other drivers prevent backend startup. A driver that copies full parent
 filesystems needs a different space model. Existing `overlay2` deployments keep
@@ -532,7 +562,8 @@ registry cost is described under [Registry rate limits](#registry-rate-limits).
 
 Before staging, admission checks the maximum staging allowance above the
 free-space floor. Before Docker import, it checks the verified image's
-conservative import footprint plus the floor again. Launches require the floor.
+conservative import footprint plus the floor again. Every launch requires the
+floor on all of the paths listed above.
 Staging, import and extraction owners account for each other without holding a
 provider-wide lock during network or daemon I/O. A Started journal subject grants
 an image preparation its immutable tenant identity. Only an actual staging miss
@@ -631,8 +662,11 @@ without automatic expiry. Positive debit records written with the older
 `FREDIMG1` accounting are preserved and refuse startup because their allowance
 omits part of Docker's retained metadata. Follow the offline recovery procedure
 below before clearing such a record. An empty old record upgrades automatically;
-the new `FREDIMG2` record retains the same filename. A corrupt debit record or foreign staging content
-prevents startup; preserve it for investigation instead of deleting it. The
+the new `FREDIMG2` record retains the same filename. A corrupt debit record, or
+anything inside a `.fred-image-<N>` staging directory other than an empty
+`blob-<N>` file (`image staging directory contains unrecognized content`),
+prevents startup; preserve it for investigation instead of deleting it. Other
+entries in the staging directory are left alone. The
 `fred_docker_backend_image_import_pending_bytes` gauge reports outstanding
 allocation, including unknown completion.
 `fred_docker_backend_image_import_total{outcome}` counts each dispatched import
@@ -660,8 +694,11 @@ receipts through [unsettled Docker effects](#unsettled-docker-effects).
 The collector runs each minute and before image admission. The periodic pass
 prunes obsolete manifest pins even while image work is active and below its disk
 threshold. Image deletion still waits for active preparations to finish publishing
-their pins. Collection removes unreferenced images
-between the high and low thresholds. It uses Docker's non-force removal and
+their pins. Collection starts when the image content filesystem reaches
+`image_gc_high_percent` (default 85) or when the free-space check above fails,
+and removes unused, unpinned images until usage is at or below
+`image_gc_low_percent` (default 75) and the check passes. It uses Docker's
+non-force removal and
 keeps every container-referenced or durably pinned image. Missing legacy pins
 or incomplete journal/container inventories prevent destructive collection,
 while unrelated admissions may continue if their own checks succeed. Startup
@@ -682,8 +719,8 @@ the last observation. Use these gauges with inventory errors and disk pressure
 to distinguish expected retention inhibition from incomplete active authority.
 `fred_docker_backend_image_gc_total{outcome}` distinguishes `busy`
 (ordinary live admission or helper work) from `inhibited` (incomplete pin authority or
-unresolved inspection evidence). It also reports shared, below-threshold, removed, error and
-panic decisions. Unknown import allocation alone does not inhibit collection of
+unresolved inspection evidence). It also reports `shared`, `below_threshold`, `removed`, `error` and
+`panic` decisions. Unknown import allocation alone does not inhibit collection of
 unused, unpinned images; it still raises the headroom needed for admission.
 Removal conflicts keep their images; resolve them during fenced maintenance,
 without deleting pins or authoritative release history. Until real free space
@@ -840,8 +877,10 @@ payload; preserve that pending record for recovery.
 
 Ingress admission records only a domain that its typed route can emit. A lease
 may request a domain while ingress is disabled, while its service has no
-routable port, or while DNS is deferred; the workload still provisions without
-a custom-domain label. Desired chain metadata remains separate.
+routable port, while DNS is deferred, or with a domain that fails local
+validation (not a valid FQDN, or under the provider's `wildcard_domain`); the
+workload still provisions without a custom-domain label. Desired chain metadata
+remains separate.
 
 A pre-fix ENG-1055 intent may already contain contradictory effective metadata.
 Recovery keeps that exact operation pending, preserves its reservation and lease
@@ -907,7 +946,8 @@ backend. Do not rename or delete a create/delete stage, synthesize a marker,
 change a ZFS
 mountpoint, or destroy a dataset merely to make readiness green. If retry still
 fails, do not leave `Restart=on-failure` probing the lineage every few seconds:
-run `systemctl stop fred-docker-backend`, verify the unit and process are fully
+run `systemctl stop docker-backend` (`fred-docker-backend` under
+manifest-deploy), verify the unit and process are fully
 inactive, then snapshot the complete marker/journal/Docker/volume lineage and
 inspect the exact error before any proof-bearing repair. A runtime terminal
 latch closes the listener and drains before exiting 1; a recovery error found by
@@ -1093,13 +1133,14 @@ the removals of volume trees.
   caller may already have settled in an earlier process, but the project's
   footprint could not be read yet. A caller that is still pending stays pending,
   as in `removal`, and the footprint is never counted as zero: while any hold is
-  unsized, docker-backend refuses every provision that needs disk as
-  insufficient resources (WARN `disk admission withheld`; diskless work and
-  `/health` are unaffected), and `/stats` reports `disk_withheld`, so
-  providerd routes new provisions to a sibling backend serving the same SKU
-  when there is one. The executor retries unsized holds on every pass, ahead
-  of the other holds but alternating with them, so they never starve a removal
-  whose close is pending, until a quota read sizes them.
+  unsized, docker-backend refuses every new provision as insufficient
+  resources, `disk_mb: 0` SKUs included, because each diskless instance is
+  charged a scratch allowance (WARN `disk admission withheld`). Workloads
+  already running and `/health` are unaffected, and `/stats` reports
+  `disk_withheld`, so providerd routes new provisions to a sibling backend
+  serving the same SKU when there is one. The executor retries unsized holds
+  on every pass, ahead of the other holds but alternating with them, so they
+  never starve a removal whose close is pending, until a quota read sizes them.
 - `residual`: the volume directory is durably gone; only the delete stage and
   the project ID remain while the zero-usage proof, the limit clear and the stage
   removal are retried. Until the hold completes, admission counts the
@@ -1138,7 +1179,7 @@ most 30 minutes.
 | `writer_active` | Entries reappeared after removal | Find and stop the writer |
 | `final_removal_failed` | The emptied volume directory could not be removed | Check it for attributes or a mount |
 | `usage_unprovable` | The quota report could not prove the project's usage | Check `xfs_quota` and the `pquota` mount option. On an unsized hold this also keeps disk admission withheld |
-| `usage_nonzero` | The project still uses blocks or inodes, usually an open but unlinked file | Find the process holding it (`lsof +L1` on the mount) and close it. If none holds one, inodes elsewhere may still be charged to this project: check `fred_docker_backend_volumes_with_projid_drift` and the warnings of the XFS project-ID audit (ENG-1118), which name the volume and project ID. Until the hold clears, admission keeps counting the project's hard limit (`fred_docker_backend_volume_delete_held_residual_mb`) |
+| `usage_nonzero` | The project still uses blocks or inodes, usually an open but unlinked file | Find the process holding it (`lsof +L1` on the mount) and close it. If none holds one, inodes elsewhere may still be charged to this project. The XFS project-ID audit (ENG-1118) can only point at candidates: its warning `managed volume has inodes outside its project` names a volume that holds another project's inodes, with that volume's own `project_id`, not the drifted inodes' project, and it skips volumes being deleted, so it never names the held one. Check the volumes it names and `fred_docker_backend_volumes_with_projid_drift`. Until the hold clears, admission keeps counting the project's hard limit (`fred_docker_backend_volume_delete_held_residual_mb`) |
 | `quota_clear_failed` | The limit clear command failed | Check the quota control plane |
 | `stage_removal_failed` | The delete stage itself could not be removed | Check that it is an empty directory without attributes |
 
@@ -1152,12 +1193,14 @@ stage is the only record that makes the deletion safe to finish.
 held (a `volume delete held` line names it): a delete stage condemns its
 volume. Stop docker-backend, recreate the stage with the project ID from that
 line (`project_id`), which matches the volume's `.fred-project-id` if it still
-has one, then start the backend:
+has one, then start the backend. Create the stage only once the stop has
+succeeded; the `&&` chain ends at the first failing step (the unit is
+`fred-docker-backend` under manifest-deploy):
 
 ```bash
-systemctl stop fred-docker-backend
-mkdir -m 0700 <volume_data_path>/.fred-xfs-delete-<project-id>-<managed-volume>
-systemctl start fred-docker-backend
+systemctl stop docker-backend &&
+  mkdir -m 0700 <volume_data_path>/.fred-xfs-delete-<project-id>-<managed-volume> &&
+  systemctl start docker-backend
 ```
 
 `Start` registers it as a held deletion and the executor finishes it.
@@ -1213,8 +1256,8 @@ exists.
   neither pages beside a young unheld one nor hides it. The deploy rule change
   from `oldest_close_intent_age_seconds` is part of ENG-1109.
 - `fred_docker_backend_volume_delete_holds{phase="unsized"} > 0` means this host
-  refuses disk-bearing provisions. Ticket if it lasts 15 minutes and check
-  `xfs_quota` (`usage_unprovable`).
+  refuses every new provision, diskless ones included. Ticket if it lasts 15
+  minutes and check `xfs_quota` (`usage_unprovable`).
 
 A hold does not join `/health` or readiness. A hold that keeps its caller
 pending only keeps its own close or operation pending.
@@ -1281,7 +1324,7 @@ retries while the backend serves. Since ENG-548,
 `Destroy` also clears the inode limits
 (`ihard`/`isoft`) alongside the block limits — a backend running a pre-ENG-548
 build clears only `bhard`/`bsoft` and leaves `ihard` behind on downgrade; see
-[Tenant hits its inode quota (`EDQUOT`)](#tenant-hits-its-inode-quota-edquot)
+[Tenant hits its inode quota](#tenant-hits-its-inode-quota)
 below.
 
 ---
@@ -1320,7 +1363,7 @@ containers keep the v0.2.3-derived profile.
 
 ---
 
-## Tenant hits its inode quota (`EDQUOT`)
+## Tenant hits its inode quota
 
 XFS project quotas enforce block (`bhard`) and inode (`ihard`) limits
 independently, so a workload writing many small/zero-byte files can hit its
@@ -1330,16 +1373,30 @@ the standard `FilesystemInodesLow` alert on the underlying filesystem's global
 inode usage.
 
 **Symptoms:**
-- Tenant reports `EDQUOT` or "no space left on device" from its container
-- `df -h` on the tenant's volume still shows free bytes
+- Tenant reports "No space left on device" from its container: XFS reports an
+  exceeded project quota as `ENOSPC`, not `EDQUOT`
+- `df -h <volume-path>` still shows free bytes
 
 **Confirm:**
-1. `df -i <volume-path>` reports **filesystem-wide** inode usage, not the per-tenant quota — for an `ihard` hit it still shows ample free inodes (`IUse%` well below 100%). That is the tell that it's the per-project inode cap, not global exhaustion (global exhaustion would instead fire `FilesystemInodesLow`).
+1. On the `pquota` mount, XFS answers `statfs` for a directory carrying the
+   project-inherit flag, which every fred volume root has, with that project's
+   quota instead of the filesystem's. `df -i <volume-path>` therefore shows the
+   volume's own inode limit, and an `ihard` hit reads about 100% `IUse%`.
+   `df -i <mountpoint>` shows the filesystem as a whole; global exhaustion
+   there would instead fire `FilesystemInodesLow`.
 2. `xfs_quota -x -c 'report -p -i' <mountpoint>` filtered to the tenant's project ID confirms inode count is pinned at the hard limit.
 
-**Remediation:** there is no fred-side alert or auto-remediation for a single tenant's inode ceiling. Two levers:
-1. Raise the SKU's `disk_mb` — `ihard` scales with it (`disk_mb × 1 MiB / min_avg_file_bytes`), so a bigger disk budget raises the inode ceiling too.
-2. Lower `min_avg_file_bytes` provider-wide (denser ratio, more inodes per MB) — restart required; values below 512 are rejected at config validation.
+**Remediation:** there is no fred-side alert or auto-remediation for a single
+tenant's inode ceiling. `ihard` is `disk_mb × 1 MiB / min_avg_file_bytes`, never
+below 262,144 inodes, where `disk_mb` is the value pinned in the lease's
+resource profile. Two levers:
+1. Lower `min_avg_file_bytes` provider-wide (denser ratio, more inodes per MB)
+   and restart docker-backend: startup quota reconciliation re-applies every
+   existing volume's limits with the new value. Values below 512 are rejected
+   at config validation.
+2. Raise the SKU's `disk_mb`. This reaches only leases provisioned after the
+   change, and every new lease of that SKU: an existing lease keeps the
+   resource profile pinned when it was admitted, across restarts and updates.
 
 ---
 
@@ -1578,7 +1635,9 @@ depends on the unavailable backend, not every healthy node.
    placement revision under lease exclusion. Missing or unknown owners remain
    fenced; inventory absence alone is insufficient.
 3. If it is gone for good, that is a **removal**, not an outage — see the next
-   section. Do not leave it configured-but-absent indefinitely: PENDING leases on
+   section. If its storage is irrecoverably lost, it can never answer again:
+   retire it instead (DEPLOYMENT.md, "Retiring a backend whose storage is
+   lost"). Do not leave it configured-but-absent indefinitely: PENDING leases on
    it are on a ~30-minute chain expiry clock the whole time.
 
 A healthy endpoint or complete inventory is not proof that every lease has
@@ -1621,18 +1680,16 @@ or silently reinterpret another machine as their owner.
 | Recordless `ACTIVE`, unresolved attempt, or conflict | Deferred; inventory silence cannot clear or resolve it |
 | Leases safely owned by other answering backends | Unaffected |
 
-Two ERROR log lines cover the two paths, and the reconciler one is the one you
-will actually see, since it fires unattended on every cycle:
+The reconciler logs this ERROR, unattended, on every cycle:
 
 ```
-reconcile: refusing to provision, lease is placed on a backend the router does not know   # reconciler
-refusing to provision: lease is placed on a backend the router does not know              # event path
+reconcile: refusing to provision, lease is placed on a backend the router does not know
 ```
 
-These log lines are defensive checks for legacy/corrupt composition; normal
-startup now rejects a topology that omits a referenced name. The reconciler line
-carries `lease_uuid`, `placement_backend`, and `placement_state`. The event-path
-line carries `lease_uuid`, `sku`, and the recorded backend name.
+The line is a defensive check for legacy/corrupt composition; normal startup
+now rejects a topology that omits a referenced name. It is logged from two
+places: one carries `lease_uuid`, `placement_backend` and `placement_state`,
+the other `lease_uuid`, `tenant`, `placement_backend` and `error`.
 
 This is deliberate (ENG-635). Substituting a healthy peer would provision a
 brand-new **empty volume** while the tenant's real data sits intact on the
@@ -1658,7 +1715,8 @@ replacement storage system must receive a new globally unique name and complete
 a full inventory bootstrap for the changed topology before degraded admission
 resumes.
 
-Do not remove a merely silent name. Fred permits removal only when the latest
+Do not remove a merely silent name. Fred permits removing a name from the
+configuration only when the latest
 complete inventory for the still-current topology recorded that backend's raw
 `/provisions` **and** `/retentions` responses as concretely empty, and neither
 the placement nor lifecycle buckets retain a reference to it. This drain
@@ -1667,6 +1725,13 @@ and is bound to that topology generation. If it is missing, restore the backend,
 let one complete sweep prove it empty, then change configuration. The proposed
 topology must also be fully reachable for the identity probe; one healthy node
 cannot authorize a membership change on behalf of another.
+
+A backend whose storage is irrecoverably lost can never prove that. Retire it
+instead, offline, with `placement-repair -retire-lost-backend` (DEPLOYMENT.md,
+"Retiring a backend whose storage is lost"): it removes the backend from the
+topology and its leases are closed (ACTIVE) or rejected (PENDING) on chain as
+`backend storage lost`. Retirement cannot be undone, and the retired name can
+never rejoin.
 
 Its **placement records outlive an outage**, deliberately. The pruner deletes a
 record only under its lease-local positive guards; a silent backend contributes
@@ -1714,10 +1779,17 @@ crowds out new provisioning, reclaim it least-destructive-first:
 2. **Shorten the grace window.** Lower `retention_max_age` so the reaper sweeps
    sooner. Duration values use Go syntax (`h`/`m`/`s`) — `336h` = 14 days, not
    `14d`.
-3. **Bound the tier.** Set/lower `max_retained_disk_mb` (per-provider) and/or
-   `max_retained_leases_per_tenant` (per-tenant). New closes over the cap
-   refuse-to-retain (destroy immediately); existing in-grace data is never
-   evicted to admit another tenant.
+3. **Bound the tier.** Set/lower `max_retained_disk_mb` (per-provider disk). A
+   close that would exceed it is refused retention: its volumes are destroyed
+   immediately, and existing in-grace data is never evicted for it. The count
+   caps work the other way and **destroy existing data**:
+   `max_retained_leases_per_tenant` (and a budget's `max_retained_leases` or
+   `per_partition_max_leases`) never refuses; it evicts. Lowering it hands the
+   tenant's oldest in-grace retained leases to the reaper for destruction at
+   that tenant's next retaining close, up to 32 per cap per close, until the
+   tenant is under the new cap. Each eviction logs the WARN
+   `evicting tenant's oldest retained lease to honor cap`. Check each tenant's
+   holdings before lowering it (see [Budget lifecycle](#budget-lifecycle)).
 4. **Force a sweep.** Restart the backend to trigger the boot-eager reaper.
 
 `max_retained_disk_mb` directly trades retained-grace capacity against
@@ -1794,8 +1866,12 @@ startup and periodic maintenance do not infer that it is disposable.
   `leaked_total` with `reaping_bytes`/`reaping_leases` flat needs no action; only sustained
   `reaping_bytes` is actionable here.
 - **Diagnose.** Find the volume(s): `ls <volume_data_path> | grep -E 'fred-retained-|fred-'`.
-  Check why destroy fails — a container still bind-mounting it (`docker ps`, then stop it), or a
-  filesystem error (`dmesg`).
+  The WARN
+  `reaping: volume(s) still on disk; record left reaping for retry (footprint stays counted)`
+  names the lease, and the ERROR `failed to destroy volume` names each volume. On XFS a
+  failed destroy becomes a held deletion: read its `reason` in the `volume delete held` log and
+  follow [Held volume deletions](#held-volume-deletions). Otherwise check why destroy fails — a
+  container still bind-mounting it (`docker ps`, then stop it), or a filesystem error (`dmesg`).
 - **Unattributed canonical volume.** If a `fred-*` path has no matching
   container and no exact durable operation, close, active release, or retention
   row, leave it untouched until its lineage is established from backups/audit
@@ -1804,8 +1880,11 @@ startup and periodic maintenance do not infer that it is disposable.
   lease and volume generation are terminal; a name or an empty current
   inventory is not such proof.
 - **First check whether the reaper can prove ownership.**
-  `..._retention_reap_skips_total{reason="claim_unreadable"}` means the retention store is
-  unreadable, which stops the reaper (and blocks the close path too); fix the store first.
+  `..._retention_reap_skips_total{reason="claim_unreadable"}` means the reaper could not prove
+  what it may destroy, or that its destroys finished: the retention store or the volume root is
+  unreadable, the backend's storage authority was withdrawn, the tombstone authority is
+  unavailable, or a fresh read after the destroys failed or still found volumes. Its `reaping:`
+  ERROR log names which; fix that first. An unreadable store also blocks the close path.
   `reason="owner_claimed"` is the deliberate live-lease hold described below. A restore is not a
   possible cause: the permanent close boundary that creates a retention row prevents operation
   admission from targeting that lease for restore (ENG-659).
@@ -1858,9 +1937,12 @@ startup and periodic maintenance do not infer that it is disposable.
   cleanly. See ENG-658.
 - **Reclaim (only after confirming no live/restoring lease references it).** Once the blocker is
   cleared the next sweep reclaims it automatically. To force it sooner, restart the backend
-  (boot runs the reaping reconcile). If the volume is genuinely unrecoverable, remove it
-  manually (`docker volume rm <name>` or `rm -rf <volume_data_path>/<name>`) — the next sweep
-  then deletes the now-dangling tombstone (its destroy is an idempotent no-op).
+  (boot runs the reaping reconcile). Do not remove the volume by hand. Managed volumes are host
+  directories, not Docker volumes, so `docker volume rm` does not apply, and an `rm -rf` of the
+  directory skips the typed deletion: on XFS it can leave the project's quota limits behind with
+  nothing recording them (see
+  [XFS deletion recovery and legacy quota entries](#xfs-deletion-recovery-and-legacy-quota-entries)).
+  Fix what the hold's `reason` names and let the executor or the sweep finish.
 
 ---
 
@@ -1962,11 +2044,12 @@ Every failure the lease actor records increments `fred_docker_backend_lease_fail
 - **Dropped events.** dockerd gives each event subscriber a 1,024-event buffer and silently skips any event the subscriber has not taken within 100ms once that buffer is full; moby exposes no drop signal. If a `kill` is skipped and the following `die` is delivered, an operator stop counts as the tenant's failure. The reader never blocks on a death or on log output, so this needs a sustained event burst, and a close still needs three such misattributions in one streak spanning at least 30 minutes.
 - **Stream gaps.** Deaths while the stream is down, and the first death of any run that started before it (re)connected, are `unknown` and never count. A backend whose stream keeps reconnecting can therefore re-provision a crash-looping lease indefinitely, billed; watch the `reconnect` rate below.
 - **Startup crashes (ENG-1125).** A container that exits during startup verification fails the provision at once: the docker-backend removes the attempt's containers and the volumes it created and publishes `failed` with `ContainerExited`. An exit of a launch the platform completed counts like the death of a ready workload (an observed run with no signal), so a broken image that keeps crashing at startup is closed once its streak is three crashes long and 30 minutes old. When `compose up` itself fails after its requests completed (a `depends_on` dependency gated by `service_healthy` exits or turns unhealthy, or Docker refuses to start a container, for example an entrypoint missing from the image: `ContainerStartFailed`), the backend decides from what the containers show, never from Compose's error, but the launch was not completed, so its outcome never counts (attribution `platform`): an exit there, even an observed run, may follow from a service the platform never started. A health check that never passes (`HealthCheckFailed`, attribution `unhealthy`), a refused start, a crash in a launch `compose up` reported failed and a crash after a degraded launch (attribution `platform`) fail definitely but never count, so such a lease is re-provisioned every pass, billed, until the tenant acts; never alert on `unhealthy`.
-  - *Health timing.* A health check that never passes is reported only at `provision_timeout` minus one minute, so with the deployed `provision_timeout` a PENDING lease is rejected first by providerd's 10-minute callback timeout (`callback timeout`), and an ACTIVE one stays `provisioning` until then on every attempt. A health-gated container that reported healthy once is from then on judged healthy while it runs, by the startup watch and by every later outcome check of the attempt (and by recovery in the same backend process), so a brief `unhealthy` flap while the rest of the stack starts no longer fails a provision. Neither rule covers a `depends_on` dependency gated by `service_healthy`: Compose judges that dependency's health itself during `compose up`, so a flap there still fails the deployment (`HealthCheckFailed` when it is still unhealthy as the backend looks, otherwise it is left to recovery), and a dependency that never becomes healthy ends `Internal` (`container creation failed`) at `provision_timeout`.
+  - *Health timing.* A health check Docker reports `unhealthy` fails the provision at the next startup check; Docker marks it so once `retries` consecutive probes fail after its `start_period`. Only a check still `starting` is reported at `provision_timeout` minus one minute, so with the deployed `provision_timeout` a PENDING lease in that state is rejected first by providerd's 10-minute callback timeout (`callback timeout`), and an ACTIVE one stays `provisioning` until then on every attempt. A health-gated container that reported healthy once is from then on judged healthy while it runs, by the startup watch and by every later outcome check of the attempt (and by recovery in the same backend process), so a brief `unhealthy` flap while the rest of the stack starts no longer fails a provision. Neither rule covers a `depends_on` dependency gated by `service_healthy`: Compose judges that dependency's health itself during `compose up`, so a flap there still fails the deployment (`HealthCheckFailed` when it is still unhealthy as the backend looks, otherwise it is left to recovery), and a dependency that never becomes healthy ends `Internal` (`container creation failed`) at `provision_timeout`.
   - *Left to recovery.* When the backend cannot settle the attempt live (an earlier step of the attempt failed, including a failed image detection; leftover volume state of the lease; a failed inspection; a rejected launch whose containers show no failure), it removes nothing and the attempt stays `provisioning` until its periodic recovery settles it: within one `reconcile_interval` when one of its containers exited or its cohort is partial, otherwise at `provision_timeout`. A rejected launch whose containers are all running (and healthy where a health check gates them) is adopted `ready` by the next recovery pass, under the checks recovery applies to any interrupted provision. A rollback step that fails after the containers were removed (a volume it could not destroy, a failed re-list or re-read) leaves no container, so recovery cannot tell the attempt from one whose containers have not appeared yet: it settles `failed` only at `provision_timeout`, and a PENDING lease is rejected first with `callback timeout`. None of these count. A lease left `failed` this way, or by a definite startup failure, has no container until providerd re-provisions it; recovery logs its empty cohort (`recovered container cohort differs from durable release`) only at debug.
 - **Restores.** A restore whose containers fail startup verification is settled by periodic recovery, never live, and never counts.
 - **Validation refusals.** The immediate close of an ACTIVE lease whose re-provision the backend refuses with a validation error (`400`: unknown SKU, image not allowed, invalid manifest) is a separate path, unchanged by ENG-799 (ENG-800).
 - **Older or third-party backends.** A backend that does not report `terminal_budget` never has a crash-looping lease closed: it is re-provisioned every pass and stays billed (`verdict="absent"`).
+- **Unstamped operation (bug).** `fred_docker_backend_lease_pending_operation_unstamped_total` above 0 means a provision or restore entered its in-flight state without the stamp that live recovery uses to match a failure to it, so that lease can stay in flight until docker-backend restarts. Restart docker-backend and file an issue; see its row in [Common alerts](#common-alerts-and-what-they-mean).
 
 **Alerts.** Write them from these series; none of them should page on a tenant's own crashes or updates.
 - `increase(fred_reconciler_terminal_verdicts_total{verdict=~"absent|unknown"}[30m]) > 0` for 1h (ticket): a backend reports no usable budget, so crash loops on it are never closed.
@@ -2267,11 +2350,11 @@ labels differ. The explicitly weaker orphan receipt exists only when no
 principal witness survived; its cleanup trust boundary is the authenticated
 provider close, reserved `fred.*` managed labels, exact retired UUID, and the
 attested backend/storage identity. A half-present principal is corrupt. In both
-cases the durable
-`execution_generation` field and the `durable close recovery remains pending`
-log identify progress. The wire field retains its historical JSON name for
-upgrade compatibility; it is a generation, not a retry budget, and no value
-causes give-up.
+cases the durable execution generation and the
+`durable close recovery remains pending` log (field `execution_generation`)
+identify progress. In the stored row the generation keeps its historical JSON
+key, `cleanup_attempts`, for upgrade compatibility; despite that name it is a
+generation, not a retry budget, and no value causes give-up.
 
 A failed restore of a legacy retention row resolves the current source profile
 once, proves actual usage fits, reapplies that exact physical quota, and persists
@@ -2363,18 +2446,27 @@ Treat either case as an evidence-preservation incident:
    record hashes and filesystem metadata. Stopping first can release and lose an
    unlinked inode that is the best surviving authority.
 3. Stop `providerd`. Do not restart it merely because the configured path now
-   exists. Run `placement-repair -config /etc/fred/config.yaml -classify` against
-   each preserved candidate while it is offline; inspect affected lease rows as
-   well when a write's commit outcome is unknown.
+   exists. Classify each preserved candidate offline with `placement-repair
+   -classify`, and inspect affected lease rows as well (`-list`, `-inspect
+   -lease`) when a write's commit outcome is unknown. The tool has no
+   database-path flag; it reads the file `placement_store_db_path` names. Point
+   that key at the candidate in a copy of the stopped config, or override it:
+   `PROVIDER_PLACEMENT_STORE_DB_PATH=<candidate> placement-repair -config
+   /etc/fred/config.yaml -classify` (the override applies because the key is in
+   the YAML). The candidate path must be absolute and clean, and the file a
+   regular file with exact mode `0600` and a single hard link.
 4. Select or reconstruct the exact provider-bound authority only from that
-   evidence and a known-good stopped-process or atomic filesystem snapshot. Keep
-   every rejected candidate. Restart once, against the chosen file at the
-   configured path, then require clean `placement_store` and
+   evidence and a known-good stopped-process or atomic filesystem snapshot, or
+   a complete online snapshot set from `placement_snapshot_dir` (DEPLOYMENT.md,
+   "Online snapshots"). Keep every rejected candidate. Restart once, against
+   the chosen file at the configured path, then require clean `placement_store` and
    `placement_inventory` checks before reopening ingress.
 
 Never copy, overwrite, unlink, rename, or restore the live pathname underneath
-`providerd`. A backup taken while it runs must be an atomic filesystem snapshot;
-restore is always a stopped-process operation. A stopped restore may naturally
+`providerd`. A backup taken while it runs must be an atomic filesystem snapshot
+or one of providerd's own online snapshot sets (`placement_snapshot_dir`, which
+copies `placements.db` and `payloads.db` together); restore is always a
+stopped-process operation. A stopped restore may naturally
 publish a new inode: the next strict open validates and binds that file before
 using it.
 
@@ -2390,7 +2482,9 @@ or hard-linked—stop and preserve both database paths. A
 publication boundary and no mutation committed; a later backup verification
 may have failed, so inspect it read-only before treating it as a rollback
 image. `PREPARED:`/`COMMITTED:` means mutation committed before a later
-verification failed; `OUTCOME UNKNOWN` means the commit result cannot be
+verification failed; `INITIALIZED:`, from `placement-preflight -initialize-fresh`,
+means the new database was published before a later check failed, so do not
+rerun the initializer; `OUTCOME UNKNOWN` means the commit result cannot be
 inferred. Never retry any of those classifications with the same backup path.
 
 ### A logically corrupt placement row
@@ -2421,10 +2515,13 @@ of a delayed backend call or retained tenant data. Recover it as follows:
    chain-terminal proof, with no unresolved attempt, maintenance, or restore
    claim and with the current revision protected by lease exclusion. Unknown
    owners, missing evidence, and chain absence do not authorize pruning.
-3. Prefer restoring a known-good stopped-process backup. If no backup exists,
-   preserve the row and escalate for operator repair unless the collected
-   evidence explicitly proves that it represents no owner, retained data, or
-   unresolved attempt.
+3. Prefer restoring a known-good stopped-process backup or a complete online
+   snapshot set from `placement_snapshot_dir`, verified against its manifest
+   (DEPLOYMENT.md, "Online snapshots"); either way, attest the restored copy
+   with `placement-repair -attest-restored-backup` before the first start. If
+   no backup exists, preserve the row and escalate for operator repair unless
+   the collected evidence explicitly proves that it represents no owner,
+   retained data, or unresolved attempt.
 4. Only with that proof, remove the one quoted key using reviewed offline bbolt
    tooling; never edit the live database. Restart with the unchanged backend
    identities and require a complete inventory projection before reopening
@@ -2444,7 +2541,7 @@ open, or known bad magic):
 1. **Stop the service**.
 2. **Move the file aside** rather than deleting (`mv X.db X.db.broken`) so you can inspect it later if needed.
 3. **Restore the file according to its authority class before restarting.** Some caches may be recreated, but release/retention/callback state should be restored whenever possible.
-4. **For `placement_store_db_path`, restore the exact provider-bound database before starting providerd.** Normal startup never creates, initializes, or migrates a missing/unprepared file. Current chain/backend silence cannot recover a lost authority: if the provider has any chain lease history, including terminal history, restore the database. The explicit fresh initializer is only for a genuinely new provider with zero total lease history, and additionally requires an independently supplied exact fleet roster, complete identity-consistent empty provision and retention inventories from every configured backend, and continuous fencing of providerd plus tenant/chain mutation ingress. Each backend stays running so the tool can authenticate its inventories, but must be empty and drained with no in-flight mutation and an idle callback/outbox queue. Its print-time acknowledgement binds the target parent's physical device/inode; do not rename, unmount, or recreate that parent between print and initialize. Publication is descriptor-relative and no-overwrite. Follow [Initializing a genuinely fresh placement authority](DEPLOYMENT.md#initializing-a-genuinely-fresh-placement-authority) for that first-boot workflow. A restored placement database is older than the one it replaces: run `placement-repair -attest-restored-backup` on it before starting providerd ([Restoring an older placement backup](DEPLOYMENT.md#restoring-an-older-placement-backup)), or a lease dispatched after the backup can be provisioned twice. Restore the payload store from the same moment as the placement database: without it, ACTIVE leases that need re-provisioning stay deferred, because tenants can re-upload only a PENDING lease's original manifest. The token tracker may start empty (acceptable, see above); restore each backend callback store whenever any exact delivery could remain.
+4. **For `placement_store_db_path`, restore the exact provider-bound database before starting providerd.** Normal startup never creates, initializes, or migrates a missing/unprepared file. Current chain/backend silence cannot recover a lost authority: if the provider has any chain lease history, including terminal history, restore the database. The explicit fresh initializer is only for a genuinely new provider with zero total lease history, and additionally requires an independently supplied exact fleet roster, complete identity-consistent empty provision and retention inventories from every configured backend, and continuous fencing of providerd plus tenant/chain mutation ingress. Each backend stays running so the tool can authenticate its inventories, but must be empty and drained with no in-flight mutation and an idle callback/outbox queue. Its print-time acknowledgement binds the target parent's physical device/inode; do not rename, unmount, or recreate that parent between print and initialize. Publication is descriptor-relative and no-overwrite. Follow [Initializing a genuinely fresh placement authority](DEPLOYMENT.md#initializing-a-genuinely-fresh-placement-authority) for that first-boot workflow. A restored placement database is older than the one it replaces: run `placement-repair -attest-restored-backup` on it before starting providerd ([Restoring an older placement backup](DEPLOYMENT.md#restoring-an-older-placement-backup)), or a lease dispatched after the backup can be provisioned twice. A complete online snapshot set from `placement_snapshot_dir` holds both databases from one moment; verify it against its manifest before installing it ([Online snapshots](DEPLOYMENT.md#online-snapshots)), then attest it the same way. Restore the payload store from the same moment as the placement database: without it, ACTIVE leases that need re-provisioning stay deferred, because tenants can re-upload only a PENDING lease's original manifest. The token tracker may start empty (acceptable, see above); restore each backend callback store whenever any exact delivery could remain.
 
 Never run two `providerd` or `docker-backend` instances against the same bbolt files — bbolt enforces single-writer with a file lock and the second process will fail to start. If it doesn't fail, you have data corruption coming.
 
@@ -2454,7 +2551,10 @@ Never run two `providerd` or `docker-backend` instances against the same bbolt f
 
 `POST /v1/leases/{uuid}/restart` and `POST /v1/leases/{uuid}/update` are tenant-initiated, asynchronous. Each captures its source, creates a replacement under volume exclusion, and verifies startup before activating the new release.
 
-Both endpoints require exactly one canonical UUIDv4 `Idempotency-Key`. Fred
+Both endpoints require exactly one canonical UUIDv4 `Idempotency-Key`, except
+for a tenant listed in `maintenance_legacy_idempotency_tenants`: its request may
+omit the header and is then keyed by its single-use signed token, so a retry
+with a new token is a new command. Fred
 writes the authenticated tenant, lease-scoped key, command kind, update payload
 fingerprint and exact placement/storage/lifecycle route to the required
 placement database before dispatch. Pending commands retain the same
@@ -2595,8 +2695,8 @@ must match; the disk (`disk_mb`) tier may differ. A **promote** (same-or-larger
 `disk_mb`) is admitted only when its aggregate growth above the retained
 footprint fits disk capacity, then applies the larger cap. A **demote** (smaller
 `disk_mb`) is allowed only if the retained volume's *measured* data fits the new
-tier — the backend runs `checkDemoteFit` before adopting. A demote that does not
-fit is refused: the docker-backend returns HTTP 422 with body
+tier — the backend runs `checkDemoteFitWithResourceProfiles` before adopting. A
+demote that does not fit is refused: the docker-backend returns HTTP 422 with body
 `{"code":"demote_exceeds_tier"}`, which fred-api forwards to the tenant as a 422
 with the message `retained data exceeds the requested smaller tier`. (This is
 distinct from a *bare* 422 with no code — `ErrNotRetained`, no retained data —
@@ -2652,9 +2752,9 @@ tenant/provider identity. Close instead persists a complete close intent before
 deleting the row and starting teardown. Never delete the Release or return its
 data to the source merely because the live cohort is gone.
 
-**Success-rate signal.** `fred_docker_backend_restore_total{outcome}` (`outcome ∈ {success, failure}`) is the docker-backend's own restore success rate, mirroring `provisions_total`. Both outcome series are pre-initialized to 0, so a failure ratio reads 0 (not no-data) before the first restore. **Worker-scoped caveat:** a restore that fails in the synchronous adopt prelude (claim/rename/route/ack) before the worker spawns returns a synchronous error to the caller and is counted by **neither** outcome bucket — exactly as `provisions_total` omits synchronous provision failures. Such failures surface to the tenant as the restore HTTP status; providerd's `fred_provisioner_provisioning_total{operation="restore"}` counts the async callback/timeout outcomes, not these synchronous backend errors, so it does not backfill the gap.
+**Success-rate signal.** `fred_docker_backend_restore_total{outcome}` (`outcome ∈ {success, failure}`) is the docker-backend's own restore success rate. Both outcome series are pre-initialized to 0, so a failure ratio reads 0 (not no-data) before the first restore. `failure` counts only a definite execution failure whose settlement committed; an ambiguous worker result (a post-effect error, a commit error or a panic) counts neither outcome, even after recovery settles it. **Worker-scoped caveat:** a restore refused in the synchronous `Restore()` prelude (validation, intent, reservation, source claim) returns a synchronous error to the caller and is counted by **neither** outcome bucket, as `provisions_total` omits synchronous provision failures. Such failures surface to the tenant as the restore HTTP status; providerd's `fred_provisioner_provisioning_total{operation="restore"}` counts the async callback/timeout outcomes, not these synchronous backend errors, so it does not backfill the gap.
 
-**Latency.** `fred_docker_backend_restore_duration_seconds` measures the async re-deploy worker span (compose up + verify startup, success only) and **excludes** the synchronous adopt prelude. Its buckets mirror `provision_duration_seconds` so the two can be overlaid for the restore-vs-fresh-provision question — but the overlay is approximate: `provision_duration_seconds` is observed on both success and failure and carries no outcome label, so the comparison is robust at the median but tail-biased. Read it as indicative.
+**Latency.** `fred_docker_backend_restore_duration_seconds` measures the restore worker span on success only (volume adoption, compose up, verify startup, release commit and source finalization) and **excludes** the synchronous `Restore()` prelude. Its buckets mirror `provision_duration_seconds` so the two can be overlaid for the restore-vs-fresh-provision question — but the overlay is approximate: `provision_duration_seconds` is observed on both success and failure and carries no outcome label, so the comparison is robust at the median but tail-biased. Read it as indicative.
 
 **Slow-phase diagnosis.** `fred_docker_backend_replace_phase_duration_seconds{operation="restore",phase}` breaks the re-deploy into per-phase timings (`adopt`, `image_setup`, `volume_setup`, `compose_up`, `verify_startup`). When a restore is slow, query this to see which phase dominates — `adopt` (volume rename), `compose_up`, or `verify_startup` are the usual suspects.
 
@@ -2770,7 +2870,7 @@ Per the benchmarks in [PERFORMANCE.md](PERFORMANCE.md), Fred itself sustains 56,
 
 ## Logging
 
-All logs are structured JSON via `slog`. Key fields:
+All logs are structured `slog` text: one record per line, as `key=value` pairs. Key fields:
 
 | Field | Meaning |
 |---|---|

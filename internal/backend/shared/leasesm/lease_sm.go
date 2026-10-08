@@ -31,9 +31,9 @@ const (
 	evUpdateRequested
 	// evRestoreRequested rides the EXISTING replace machinery (same as
 	// evRestartRequested/evUpdateRequested) but is permitted ONLY from
-	// Provisioning → Restarting: a restore's NEW lease is reserved at
-	// Status=Provisioning (it was never running), whereas a restart/update
-	// fire from Ready/Failed. Entering Restarting via evRestoreRequested
+	// Reserved → Restarting: a restore's NEW lease starts in the private
+	// Reserved state (it was never running), whereas a restart/update fire
+	// from Ready, Failing or Failed. Entering Restarting via evRestoreRequested
 	// reuses onEnterRestarting; the provision store derives active counts
 	// directly from the resulting status transitions.
 	evRestoreRequested

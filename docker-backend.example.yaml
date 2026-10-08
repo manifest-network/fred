@@ -12,11 +12,25 @@
 #   docker-backend -config docker-backend.yaml -initialize-storage-identity new
 # Existing v0.13 storage uses the stopped-and-drained `adopt` cutover documented
 # in DEPLOYMENT.md; never use `new` to replace or recover a committed lineage.
+#
+# ENVIRONMENT VARIABLES: only these override YAML values, and only when set to
+# a non-empty value (an empty variable cannot clear a YAML value):
+#   DOCKER_BACKEND_ADDR                  -> listen_addr
+#   DOCKER_BACKEND_CALLBACK_SECRET       -> callback_secret
+#   DOCKER_BACKEND_CALLBACK_SECRET_NEXT  -> callback_secret_next
+#   DOCKER_BACKEND_HOST_ADDRESS          -> host_address
+#   DOCKER_HOST                          -> docker_host
+#   DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE -> max_request_body_size (ignored
+#                                           unless a positive integer)
 
 # Log verbosity. Valid values: debug, info, warn, error. Default: info.
 # log_level: "info"
 
-# Backend name (used in Fred configuration)
+# Backend name. -initialize-storage-identity seals it into the storage-identity
+# marker, and startup fails if it changes afterwards. providerd identifies this
+# backend by its own backends[].name and the storage ID, not by this value.
+# Use the same name there anyway: otherwise providerd's
+# fred_api_non_in_flight_callbacks_total labels this backend "invalid".
 name: docker
 
 # HTTP server listen address
@@ -26,7 +40,8 @@ listen_addr: ":9001"
 # deliberately larger than providerd's 1 MiB cap so a manifest that cleared
 # providerd is not rejected on the backend hop after envelope wrapping. A
 # non-positive value falls back to the default. Also settable via the
-# DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE env var (ENG-448).
+# DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE env var (ENG-448). Raise it whenever
+# providerd's max_request_body_size is raised.
 # max_request_body_size: 2097152
 
 # ---------------------------------------------------------------------------
@@ -218,7 +233,8 @@ allowed_registries:
 # Settings for callbacks to Fred reporting provisioning results.
 
 # HMAC secret for signing callbacks to Fred (minimum 32 characters).
-# REQUIRED — docker-backend refuses to start with an empty value.
+# REQUIRED — docker-backend refuses to start with an empty value, unless
+# DOCKER_BACKEND_CALLBACK_SECRET supplies it.
 # Generate with: openssl rand -hex 32
 # Must match this backend's own providerd backends[].hmac_secret.
 callback_secret: ""
@@ -246,6 +262,8 @@ callback_secret: ""
 # files are created with 0600. callbacks.db, releases.db, and retention.db are
 # also identity-bound authority and are re-attested while running;
 # diagnostics.db is recreatable and has only the open-time filesystem checks.
+# Relative paths resolve against the process's working directory, which is /
+# for a systemd service without WorkingDirectory=.
 
 # Path to bbolt database for persisting accepted provision/restore intents and
 # pending callbacks. An intent is committed before the first substrate mutation
@@ -358,17 +376,22 @@ releases_max_age: 2160h
 # retention_partition_source: ""
 #
 # Default per-tenant retained-disk cap (MB); refuse-to-retain semantics like
-# max_retained_disk_mb but per tenant. 0 = unlimited (default).
+# max_retained_disk_mb but per tenant. 0 = unlimited (default). When set, it
+# must be <= total_disk_mb, <= max_retained_disk_mb (if set), and >= the
+# largest stateful SKU's disk_mb.
 # max_retained_disk_mb_per_tenant: 0
 #
 # Aggregator allowlist: per-tenant budget overrides, keyed by on-chain tenant
 # address (verify the key carefully — a typo silently never matches; the
 # startup budget-sanity log is your check). Aggregates are REQUIRED positive.
 # Only tenants listed here with max_partitions > 0 ever get partitions.
+# Each disk value must be <= total_disk_mb and >= the largest stateful SKU's
+# disk_mb; max_retained_disk_mb must also be <= the global max_retained_disk_mb
+# (if set), and per_partition_max_disk_mb <= this budget's max_retained_disk_mb.
 # retention_tenant_budgets:
 #   manifest1exampleaggregatoraddr:
 #     max_retained_leases: 200         # REQUIRED > 0 (never "unlimited")
-#     max_retained_disk_mb: 500000     # REQUIRED > 0
+#     max_retained_disk_mb: 51200      # REQUIRED > 0
 #     max_partitions: 64               # 0 = elevation-only (labels collapse)
 #     per_partition_max_leases: 5      # 0 = no per-partition count sub-cap
 #     per_partition_max_disk_mb: 30720 # 0 = no per-partition disk sub-cap
@@ -498,6 +521,8 @@ container_stop_timeout: 30s
 # running. Catches containers that crash immediately on startup. The success
 # callback is only sent after verification passes. Default: 5s.
 # Note: Setting to 0 uses the default (5s), verification cannot be disabled.
+# Use a positive value: a negative one is not rejected, and ends the wait at
+# the first 2-second status check.
 startup_verify_duration: 5s
 
 # How often to reconcile in-memory state with Docker. Detects crashed

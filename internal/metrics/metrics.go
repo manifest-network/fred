@@ -477,20 +477,6 @@ var (
 		Help:      "Number of payloads currently stored awaiting provisioning",
 	})
 
-	// PayloadPersistFailuresTotal counts payloads that were applied to a backend
-	// but could not be written to the payload store (ENG-619).
-	//
-	// Worth alerting on rather than merely graphing: every increment is a lease
-	// whose running deployment fred has no durable record of, which the next
-	// reprovision will silently revert to its as-created manifest. The tenant
-	// receives a 500 and can retry, but nothing in fred retries on their behalf.
-	PayloadPersistFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: "payload",
-		Name:      "persist_failures_total",
-		Help:      "Payloads applied to a backend but not persisted to the payload store, by operation",
-	}, []string{"operation"}) // operation: update
-
 	// PayloadSizeBytes tracks the size of uploaded payloads.
 	PayloadSizeBytes = promauto.NewHistogram(prometheus.HistogramOpts{
 		Namespace: namespace,
@@ -882,23 +868,6 @@ var (
 		Subsystem: "provisioner",
 		Name:      "callback_settlement_claim_wait_timeouts_total",
 		Help:      "Total callback waits that timed out while an in-flight settlement claim remained contended",
-	})
-
-	// CallbackPlacementSemanticConflictsTotal counts authenticated success-
-	// callback settlement attempts whose positive backend evidence could not be
-	// merged into the durable placement record because that record contained a
-	// conflicting or otherwise unusable semantic fact. Processing continues
-	// toward chain acknowledgement; a retry can increment this again. The
-	// preserved placement record and accompanying ERROR log require operator
-	// reconciliation.
-	//
-	// Deliberately unlabelled. The log carries the lease, backend, generation and
-	// concrete verdict without turning any of them into an unbounded metric label.
-	CallbackPlacementSemanticConflictsTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: "provisioner",
-		Name:      "callback_placement_semantic_conflicts_total",
-		Help:      "Total success-callback settlement attempts that continued toward chain acknowledgement after a conflicting durable placement verdict",
 	})
 
 	// CallbackDeprovisionOwnedSuccessTotal counts provision-success callbacks

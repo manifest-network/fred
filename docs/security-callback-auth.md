@@ -18,13 +18,15 @@ The signer's view of the URI and the verifier's view of the URI agree on the out
 ## 2. TLS and proxy posture
 
 Production deployments use certificate-verified TLS/mTLS on the fred ↔
-backend channel, and `providerd` now rejects an `http://` backend URL when
-`production_mode: true` (see [SECURITY.md § TLS (providerd → backend,
-ENG-103)](../SECURITY.md#tls-providerd--backend-eng-103)). This is required
-because request HMAC does not authenticate the backend's response headers or
-body. Development mode still permits plaintext, so the HMAC scheme must remain
-robust independent of TLS: an observer of such a network can read every byte,
-which is why ENG-191 must bind method + URI into the canonical string.
+backend channel, and `providerd` rejects an `http://` backend URL or
+`callback_base_url` when `production_mode: true` (see [SECURITY.md § TLS
+(providerd → backend, ENG-103)](../SECURITY.md#tls-providerd--backend-eng-103)).
+HTTPS to the backend is required because request HMAC does not authenticate the
+backend's response headers or body; HTTPS on the callback leg keeps the callback
+URL's operation and lifecycle tokens confidential. Development mode still
+permits plaintext, so the HMAC scheme must remain robust independent of TLS: an
+observer of such a network can read every byte, which is why ENG-191 must bind
+method + URI into the canonical string.
 
 ## 3. ENG-191's role on the call leg
 
@@ -34,10 +36,14 @@ ENG-191 is doing real work. Do not propose reverting it as a "simpler" fix for t
 
 Production gives every backend a distinct bidirectional key. Configure it as
 `providerd`'s `backends[].hmac_secret` and as that backend process's existing
-`callback_secret`. Provider startup binds each configured backend name to its
-prepared immutable storage UUID. Inbound callback JSON carries that UUID in the
-HMAC-covered `backend_storage_id`; Fred treats it only as a key selector until
-the signature verifies, then checks the same signed identity against durable
+`callback_secret`. During a key rotation each side also accepts one verify-only
+key (`providerd`'s `backends[].hmac_secret_previous`, the Docker backend's
+`callback_secret_next`) and still signs only with its main key; see
+[SECURITY.md § Secrets Management](../SECURITY.md#secrets-management). Provider
+startup binds each configured backend name to its prepared immutable storage
+UUID. Inbound callback JSON carries that UUID in the HMAC-covered
+`backend_storage_id`; Fred treats it only as a key selector until the signature
+verifies, then checks the same signed identity against durable
 operation/lifecycle authority. Missing, malformed, unknown, duplicate, or
 case-ambiguous selectors fail closed. A key for backend A cannot authenticate a
 callback selecting backend B or a provider command sent to B.

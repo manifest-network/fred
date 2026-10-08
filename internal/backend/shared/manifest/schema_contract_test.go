@@ -34,6 +34,20 @@ func TestPublishedSchemaMatchesRuntimeFieldBoundaries(t *testing.T) {
 		{"form feed user", "user", "a\fb", false},
 		{"vertical tab user", "user", "a\vb", false},
 		{"non-ASCII user", "user", "a\u00a0b", true},
+		// Ingress requires TCP; the protocol is case-insensitive in both forms.
+		{"tcp ingress", "ports", map[string]any{"80/tcp": map[string]any{"ingress": true}}, true},
+		{"udp ingress", "ports", map[string]any{"53/udp": map[string]any{"ingress": true}}, false},
+		{"mixed-case udp ingress", "ports", map[string]any{"53/Udp": map[string]any{"ingress": true}}, false},
+		{"udp ingress false", "ports", map[string]any{"53/udp": map[string]any{"ingress": false}}, true},
+		// The runtime checks path.Clean(p), and the schema accepts only clean
+		// paths so its blocked-path and duplicate checks see the same path. A
+		// non-clean path to an allowed location (/var/cache/) is therefore
+		// refused by the schema but admitted by the runtime, and is not part of
+		// this agreement corpus.
+		{"clean tmpfs", "tmpfs", []string{"/var/cache", "/var/.cache", "/opt/app..d"}, true},
+		{"tmpfs trailing slash on a blocked path", "tmpfs", []string{"/tmp/"}, false},
+		{"tmpfs dot-dot into a blocked path", "tmpfs", []string{"/var/../proc"}, false},
+		{"tmpfs duplicate after cleaning", "tmpfs", []string{"/data", "/data/"}, false},
 	}
 	for _, field := range []struct {
 		name string

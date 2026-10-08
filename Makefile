@@ -110,8 +110,10 @@ test-volume:
 	@echo "Running volume unit tests..."
 	$(GOTEST) -v ./internal/backend/docker/ -run "TestDoProvision_Stateful|TestDoProvision_Volume|TestDoProvision_Cleanup|TestProvision_ReProvisionKeeps|TestDeprovision_Destroys|TestDeprovision_Volume|TestCleanupOrphaned"
 
-# Run Docker integration tests (requires Docker daemon), plus fstree's mount
-# boundary tests (requires root), so CI's SKIP guard covers both.
+# Run Docker integration tests, plus fstree's mount boundary tests, so CI's
+# SKIP guard covers both. Requires root, Docker, btrfs-progs, xfsprogs,
+# zfsutils and capsh, plus FRED_TEST_IMAGE_STORE (see CONTRIBUTING.md).
+# Usage: sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m
 test-integration:
 	@echo "Running Docker integration tests..."
 	$(GOTEST) -tags integration -v ./internal/backend/docker/ ./internal/fstree/ -run Integration -timeout $(INTEGRATION_TIMEOUT)
@@ -127,13 +129,13 @@ test-integration-restart-update:
 	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(RestartLifecycle|UpdateLifecycle|GetReleases_History|UpdateFromFailed|RestartFromFailed|FullLifecycle|MultiContainer(Restart|Update)|UpdateBadImage|SequentialUpdates)" -timeout 10m
 
 # Run volume integration tests (requires root + Docker + btrfs-progs)
-# Usage: sudo make test-integration-volume
+# Usage: sudo -E env "PATH=$PATH" make test-integration-volume
 test-integration-volume:
 	@echo "Running volume integration tests (requires root + Docker + btrfs-progs)..."
 	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(Stateful|VolumePersists|EphemeralVolume|MultiInstanceVolume|OrphanedVolume|VolumeQuota|RestartPreservesVolumes|UpdatePreservesVolumes)" -timeout 10m
 
 # Run retain/restore integration tests (requires root + Docker + btrfs-progs)
-# Usage: sudo make test-integration-restore
+# Usage: sudo -E env "PATH=$PATH" make test-integration-restore
 test-integration-restore:
 	@echo "Running retain/restore integration tests (requires root + Docker + btrfs-progs)..."
 	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_(Docker_Retain|Docker_BtrfsRenameVolume_PreservesNestedMetadata|Reconciler_RetainRestore|Manager_CloseEvent)" -timeout 20m
@@ -152,7 +154,7 @@ test-coverage:
 	$(GOCMD) tool cover -html=coverage.out -o coverage.html
 
 # Run all tests with coverage including volume integration tests
-# Usage: sudo make test-coverage-all
+# Usage: sudo -E env "PATH=$PATH" make test-coverage-all
 test-coverage-all:
 	@echo "Running all tests with coverage (requires root + Docker + btrfs-progs)..."
 	$(GOTEST) -tags integration -v -coverprofile=coverage.out -timeout 10m ./...
@@ -192,12 +194,15 @@ run: build
 	@echo "Running $(BINARY_NAME)..."
 	@exec $(BUILD_DIR)/$(BINARY_NAME) --config config.example.yaml
 
-# Run the mock backend
+# Run the mock backend. It exits unless the environment provides
+# MOCK_BACKEND_STORAGE_ID (a stable canonical UUIDv4) and
+# MOCK_BACKEND_CALLBACK_SECRET (at least 32 bytes); export both first.
 run-mock: build-mock
 	@echo "Running $(MOCK_BINARY_NAME)..."
 	@exec $(BUILD_DIR)/$(MOCK_BINARY_NAME)
 
-# Run mock backend with delay (for testing async provisioning)
+# Run mock backend with delay (for testing async provisioning); needs the same
+# environment as run-mock
 run-mock-delay: build-mock
 	@echo "Running $(MOCK_BINARY_NAME) with 2s delay..."
 	@MOCK_BACKEND_DELAY=2s exec $(BUILD_DIR)/$(MOCK_BINARY_NAME)
@@ -245,7 +250,7 @@ help:
 	@echo "  deps             - Download and tidy dependencies"
 	@echo "  test                    - Run tests"
 	@echo "  test-volume             - Run volume unit tests"
-	@echo "  test-integration               - Run Docker integration tests (requires Docker)"
+	@echo "  test-integration               - Run Docker integration tests (sudo, Docker, btrfs/xfs/zfs tools)"
 	@echo "  test-integration-stack         - Run stack integration tests (requires Docker)"
 	@echo "  test-integration-restart-update - Run restart/update/releases integration tests (requires Docker)"
 	@echo "  test-integration-volume        - Run volume integration tests (sudo, Docker, btrfs-progs)"
@@ -255,8 +260,8 @@ help:
 	@echo "  test-coverage-all       - Full coverage including volume tests (sudo)"
 	@echo "  lint             - Run linter"
 	@echo "  run              - Build and run providerd with example config"
-	@echo "  run-mock         - Build and run mock-backend"
-	@echo "  run-mock-delay   - Run mock-backend with 2s provisioning delay"
+	@echo "  run-mock         - Build and run mock-backend (export MOCK_BACKEND_STORAGE_ID and MOCK_BACKEND_CALLBACK_SECRET)"
+	@echo "  run-mock-delay   - Run mock-backend with 2s provisioning delay (same variables as run-mock)"
 	@echo "  run-docker       - Build and run docker-backend (DOCKER_BACKEND_CONFIG=path to override)"
 	@echo "  run-k3s          - Build and run k3s-backend (K3S_BACKEND_CONFIG=path to override)"
 	@echo "  fmt              - Format code"

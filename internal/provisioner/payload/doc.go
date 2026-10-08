@@ -7,8 +7,13 @@
 // It is REPLACED when the tenant updates the deployment via
 // POST /v1/leases/{uuid}/update (Put). It is removed when:
 //
-//   - The lease is closed/expired (reconciler-driven cleanup), or
-//   - The TTL expires (background cleanup loop)
+//   - The lease is terminal: a failure callback rejects it, its close event
+//     arrives, a provision is refused on a terminal chain state, or the
+//     reconciler cleans up a terminal lease,
+//   - Publishing the upload event fails, so the tenant can retry, or
+//   - The stored payload no longer matches its recorded hash.
+//
+// There is no TTL.
 //
 // The store is persistent (bbolt) so payloads survive restarts. This matters
 // both before initial provisioning and throughout the lease lifetime: the

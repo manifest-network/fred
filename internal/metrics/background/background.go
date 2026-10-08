@@ -1,11 +1,14 @@
 // Package background holds the Prometheus collectors for background-goroutine
 // health — the whole `fred_background_*` family. CleanupPanicsTotal is written
 // by every fred binary: providerd for its token-tracker cleanup loop, the docker
-// backend for its callback, diagnostics, releases and retention loops, the k3s
-// backend for callback, diagnostics and releases (it has no retention store —
-// retention is docker-only, ENG-325). GoroutinePanicsTotal is written by
-// providerd for its payload-writer, ack-batcher and withdraw goroutines and by
-// both bundled backends for the shared callback-replay workers.
+// backend for its callback, diagnostics, releases and retention loops and its
+// docker_reconciliation, docker_network_reclamation, docker_projid_audit,
+// docker_seccomp_census and docker_volume_delete_hold workers, the k3s backend
+// for callback, diagnostics and releases (it has no retention store — retention
+// is docker-only, ENG-325). GoroutinePanicsTotal is written by providerd for its
+// payload-writer, ack-batcher, withdraw-scheduler and timeout-checker
+// goroutines, by both bundled backends for the shared callback-replay workers,
+// and by the docker backend for its container-death overflow reporter.
 //
 // It exists as a package of its own because its parent, internal/metrics, is
 // providerd's. Those collectors are registered on the default registerer at
@@ -28,7 +31,8 @@
 // Being written by more than one binary is the reason to put a collector here,
 // not a requirement of membership. Both collectors now cross the process
 // boundary; their label-bearing shape still means a healthy process exports no
-// child series.
+// child series, except the docker_volume_delete_hold series the docker backend
+// pre-initializes at 0.
 //
 // What does NOT belong here: a providerd-only collector unrelated to this family
 // (internal/metrics), and one only a single backend writes (that backend's

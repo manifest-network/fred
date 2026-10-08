@@ -16,11 +16,23 @@
 #        k3s-backend -config config.k3s.yaml -initialize-storage-identity new
 #      Normal startup is verification-only and will not create or repair the
 #      marker pair or authoritative callback/release journals.
+#
+# ENVIRONMENT VARIABLES: only these override YAML values, and only when set to
+# a non-empty value (an empty variable cannot clear a YAML value):
+#   K3S_BACKEND_ADDR                  -> listen_addr
+#   K3S_BACKEND_CALLBACK_SECRET       -> callback_secret
+#   K3S_BACKEND_HOST_ADDRESS          -> host_address
+#   K3S_BACKEND_MAX_REQUEST_BODY_SIZE -> max_request_body_size (ignored unless
+#                                        a positive integer)
+#   KUBECONFIG                        -> used only when kubeconfig_path is
+#                                        empty (see KUBECONFIG below)
 
 # Log verbosity. Valid values: debug, info, warn, error. Default: info.
 # log_level: "info"
 
-# Backend name (used in Fred configuration to route by SKU).
+# Backend name. -initialize-storage-identity seals it into the storage-identity
+# marker, and startup fails if it changes afterwards. providerd routes by its
+# own backends[].name and skus, not by this value.
 name: k3s
 
 # HTTP server listen address. Use :9002 to avoid colliding with the
@@ -58,6 +70,7 @@ listen_addr: ":9002"
 # Step 1 sits ABOVE in-cluster so an operator who deliberately points
 # `$KUBECONFIG` at an external cluster isn't silently overridden by the
 # Pod's in-cluster service-account when the binary runs inside K8s.
+# With kubeconfig_path set as below, `$KUBECONFIG` is ignored.
 
 kubeconfig_path: "/etc/rancher/k3s/k3s.yaml"
 
@@ -170,7 +183,8 @@ allowed_registries:
 # Settings for callbacks to Fred reporting provisioning results.
 
 # HMAC secret for signing callbacks to Fred (minimum 32 characters).
-# REQUIRED — k3s-backend refuses to start with an empty value.
+# REQUIRED — k3s-backend refuses to start with an empty value, unless
+# K3S_BACKEND_CALLBACK_SECRET supplies it.
 # Generate with: openssl rand -hex 32
 # Must match this backend's own providerd backends[].hmac_secret.
 callback_secret: ""
