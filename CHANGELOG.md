@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
-## [0.14.0] - 2026-10-07
+## [0.14.0] - 2026-10-08
 
 **Upgrading from v0.13.0.** This release cannot be installed in place. Follow
 [Upgrading from v0.13.0](DEPLOYMENT.md#upgrading-from-v0130) before replacing
@@ -454,11 +454,6 @@ any binary:
 - `fred_provisioner_callback_settlement_claim_wait_timeouts_total` exposes
   callbacks that exhaust the bounded wait for another terminal settlement actor,
   making stuck or unusually slow claim holders actionable. (ENG-632)
-- `fred_provisioner_callback_placement_semantic_conflicts_total` exposes
-  authenticated success-callback settlement attempts that encounter a permanent
-  semantic placement verdict and continue toward chain acknowledgement while
-  preserving the durable record for operator repair. Retries may increment the
-  counter more than once. (ENG-632)
 - `fred_provisioner_callback_deprovision_owned_success_total` exposes successful
   provision callbacks that overlap close/deprovision ownership of the same
   operation ID. Fred consumes these without acknowledging the closing
@@ -1197,10 +1192,10 @@ any binary:
 
 ### Removed
 
-- Removed the metrics `fred_provisioner_callback_placement_semantic_conflicts_total`
-  and `fred_payload_persist_failures_total`. Nothing has incremented either since
-  ENG-632 replaced the code paths they counted, so alerts on them could never
-  fire. Remove any alert or dashboard panel that still reads them.
+- Removed the metric `fred_payload_persist_failures_total`. It counted updates
+  applied to a backend but not saved to the payload store. An update is now
+  journaled with its payload and accepted only after the payload store commits
+  it. Remove any alert or dashboard panel that reads it. (ENG-632)
 - Removed the internal `ReconcilerConfig.MaxReprovisionAttempts` and
   `DefaultMaxReprovisionAttempts`; they were never a configuration key.
   (ENG-799)
