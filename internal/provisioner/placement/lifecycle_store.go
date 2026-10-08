@@ -32,9 +32,12 @@ const (
 	LifecycleVerdictLegacy
 	LifecycleVerdictStale
 	LifecycleVerdictUnusable
-	// LifecycleVerdictTeardownOnly means the placement has been deleted but its
-	// exact current capability is deliberately retained long enough to consume
-	// one delayed terminal deprovision observation. It grants no runtime status
+	// LifecycleVerdictTeardownOnly means the capability's backend is no longer
+	// the lease's runtime owner (the placement was deleted, holds only an
+	// attempt, or is owned by another backend), so its exact current capability
+	// is retained only long enough to consume one delayed terminal deprovision
+	// observation. CurrentLifecycle also reports it while an attempt is
+	// unresolved. It grants no runtime status
 	// publication and cannot be reissued for maintenance.
 	LifecycleVerdictTeardownOnly
 	LifecycleVerdictAuthorized
@@ -706,35 +709,39 @@ func lifecycleIDForOperation(operationID operation.OperationID) (lifecycle.ID, e
 // selector for a provenance-gated legacy owner, without consulting
 // payload-supplied backend metadata. Pending attempt markers never grant
 // authority.
+//
+// A non-nil error means this process can no longer prove its placement
+// authority. That says nothing about the callback, so callers must retry it
+// rather than drop it; the returned Unusable verdict is for metrics only.
 func (s *Store) authorizeLifecycle(
 	leaseUUID string,
 	id lifecycle.ID,
-) LifecycleAuthorization {
+) (LifecycleAuthorization, error) {
 	if leaseUUID == "" {
-		return LifecycleAuthorization{verdict: LifecycleVerdictInvalid}
+		return LifecycleAuthorization{verdict: LifecycleVerdictInvalid}, nil
 	}
 	if err := s.reattestRuntimeAuthority(); err != nil {
-		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}
+		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}, err
 	}
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.lifecyclePlacementUnusableLocked(leaseUUID) {
-		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}
+		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}, nil
 	}
 	capability, exists := s.lifecycleCache[leaseUUID]
 	if !exists {
-		return LifecycleAuthorization{verdict: LifecycleVerdictMissing}
+		return LifecycleAuthorization{verdict: LifecycleVerdictMissing}, nil
 	}
 	if !capability.usable() {
-		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}
+		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}, nil
 	}
 	result := authorizeLifecycleCapability(capability, id)
 	if !s.lifecycleHasRuntimeOwnerLocked(leaseUUID, capability.backend) &&
 		(result.Authorized() || result.verdict == LifecycleVerdictLegacy) {
 		result.verdict = LifecycleVerdictTeardownOnly
 	}
-	return result
+	return result, nil
 }
 
 // CurrentLifecycle returns the store-authoritative callback capability for a

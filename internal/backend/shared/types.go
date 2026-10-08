@@ -3,24 +3,35 @@
 //
 // # What lives here
 //
-//   - SKUProfile, ResourceStats, ResourceAllocator (resources.go) — the
-//     resource pool primitives used by every backend that tracks CPU/memory/disk
+//   - SKUProfile and the shared SKU types (types.go), and ResourcePool and
+//     ResourceStats (resources.go) — the resource pool primitives used by
+//     every backend that tracks CPU/memory/disk
 //   - Registry helpers (registry.go) — image-registry parsing + allowlist
 //     validation (ParseRegistry, IsImageAllowed, ValidateImage) used by
-//     substrate adapters to enforce per-tenant image policy
-//   - CallbackSender (callback_sender.go) — HMAC-signed callback delivery
-//     with bbolt-backed persistence so failure callbacks survive restarts
-//   - BoltStore (bolt_store.go) — small wrapper around bbolt used by the
-//     callback, diagnostics, and release stores
-//   - Diagnostics (diagnostics.go) — persisted failure diagnostics with
-//     fallback for "lease no longer in memory" reads
-//   - Releases (releases.go) — release/deployment history with TTL cleanup
-//   - Types (types.go) — shared SKU and resource types
+//     substrate adapters to enforce the backend's configured registry allowlist
+//   - The identity-bound authoritative journals, each embedding the private
+//     boltStore (bolt_store.go): CallbackStore (callbacks.go) holds the
+//     operation, maintenance and close intents, the per-lease callback outbox
+//     and the compact terminal receipts; ReleaseStore (releases.go) holds
+//     release history with typed or legacy runtime authority; RetentionStore
+//     (retention.go) holds retained-volume records. DiagnosticsStore
+//     (diagnostics.go) persists failure diagnostics for leases no longer in
+//     memory.
+//   - Settlement capabilities bound to one exact journal pair, the only way to
+//     change that authority: OperationSettlement, MaintenanceSettlement,
+//     CloseSettlement, RestoreSettlement and ReleaseBackfiller, plus
+//     RecoveryCoordinator for lease-scoped recovery
+//   - CallbackPublisher (callback_publisher.go) — commits each operation and
+//     maintenance result and its outbox entry in one transaction (close
+//     results commit through CloseSettlement); CallbackSender
+//     (callback_sender.go) only signs, delivers and replays rows that are
+//     already durable
 //
 // All of these are consumed by the docker backend and are usable by any
-// future in-process backend (Kubernetes, Nomad, etc.). HTTP-only backends
-// running in a separate process should reuse callback_sender and the
-// HMAC types but typically maintain their own registry.
+// future in-process backend (Kubernetes, Nomad, etc.). An HTTP-only backend in
+// a separate process implements the same callback contract (BACKEND_GUIDE.md)
+// with its own durable outbox; CallbackSender requires an identity-bound
+// CallbackStore, so it cannot be reused on its own.
 package shared
 
 import (

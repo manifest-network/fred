@@ -1,6 +1,3 @@
-// Package docker implements a Docker backend for Fred that provisions ephemeral
-// containers with SKU-based resource profiles, registry allowlisting, and port
-// mapping for tenant connectivity.
 package docker
 
 import (

@@ -44,6 +44,10 @@ any binary:
 
 ### Added
 
+- Metric `fred_docker_backend_operation_recovery_deferred_total`: a provision
+  or restore whose recovery evidence could not be classified, so the lease
+  stays fenced and the next pass retries it. Before, a warning log was the
+  only signal. (ENG-1119)
 - Attribution `unhealthy` on `fred_docker_backend_lease_failures_total`: a
   provision whose health check never passed. It never counts toward the
   terminal failure budget; do not alert on it. (ENG-1125)
@@ -1206,6 +1210,30 @@ any binary:
 
 ### Fixed
 
+- providerd answers a lifecycle callback with 503 when it has lost placement
+  runtime authority, so the backend keeps it and retries. It used to answer
+  200 and drop it; a dropped update completion left the lease's later restart
+  and update requests conflicting until the lease ended. (ENG-1119)
+- providerd starts after a backend roster change when a lease is quarantined
+  as an untrusted positive with one candidate backend. It used to read that
+  valid quarantine as corrupt and stop with `conflict owner set is unknown`.
+  (ENG-1119)
+- A callback body that repeats `maintenance_admitted_at` under another letter
+  case is rejected as ambiguous, like every other callback field. (ENG-1119)
+- Three OPERATIONS.md runbooks could lose placement data.
+  - "A structurally unreadable bbolt file" listed lock errors as corruption. A
+    lock timeout means another process still holds the file: stop that process
+    and never move the file aside.
+  - "Placement runtime authority was withdrawn" restarted on an older copy
+    without `placement-repair -attest-restored-backup`, which risks provisioning
+    a lease twice. It now attests the copy and restores `payloads.db` from the
+    same moment.
+  - The `uninterpretable durable placement` startup error appears only when the
+    backend roster changes. Its runbook now starts by restoring the stored
+    roster instead of a backup.
+
+  The architecture, backend-guide and package docs for placement, callbacks,
+  receipts and journals were corrected to match the code.
 - providerd exports `fred_reconciler_actions_total` for all five actions at
   zero from startup. Each series used to appear only with its first action, so
   a quiet providerd showed no series at all, and an `increase()` alert could

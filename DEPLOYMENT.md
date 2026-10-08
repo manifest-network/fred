@@ -768,7 +768,7 @@ and preserve that safety evidence.
 | `<docker>/retention.db` | High — retained ownership, restore generation/finalizer, destination operation ID/callback pair/manifest/items/profiles, volume names, and source resource profiles are not reconstructible | Lost on disk failure → retained volumes can no longer be safely restored or reaped (orphaned on disk), and a committed or rolled-back restore cannot be classified or observed safely. The empty identity-bound file is always present and required, including when `retain_on_close` is false |
 | `<docker>/diagnostics.db` | Medium — failure diagnostics for past 7 days, but no lifecycle authority | May be recreated after loss while the backend is stopped; only historical diagnostics are lost. Open/create still refuses a symlink, hard link, non-regular file, or mode other than exact `0600`, but the file is not identity-bound or continuously re-attested |
 | `<docker>/callbacks.db` | Critical — write-ahead provision/restore operation rows (Pending/Succeeded/Failed), replacement intents, immutable resource/target authority, non-expiring destructive-close finalizers, durable exact/lifecycle deliveries, and per-lease FIFO evidence. Terminal operation rows remain after callback delivery as exact retry and restore-recovery authority until an authorized successor atomically retires them. Causal/close rows and exact operation/maintenance completions do not age out; typed lifecycle observations are retained up to `callback_max_age`. Pre-identity v0.13 outbox rows must be drained while the old backend is still running and are never admitted into the current runtime queue | Accepted or terminal operation state, partial-replacement/close authority, immutable sizing, and queued callback evidence are not recreated. Normal startup refuses a missing file instead of rebuilding its schema. Losing a terminal restore result can make a safe source handback unknowable; absence is invalid rather than Failed. Losing a maintenance row can make an exact replacement cohort unclassifiable; losing a close row after teardown starts can turn an intentional zero-survivor cohort into unexplained release divergence. Restore this file with the matching `releases.db`, `retention.db`, marker pair, and substrate |
-| Backend storage-lineage seal | Critical — the marker pair plus every identity-bound authoritative store bind a backend name to one substrate generation | Docker's set is `callbacks.db`, `releases.db`, `retention.db`, both markers, and the substrate; k3s uses `callbacks.db`, `releases.db`, both markers, and the cluster. Every authoritative database must remain an unsymlinked, single-link regular file with exact mode `0600`; startup and runtime re-attestation fail closed on drift. Restore the complete matching set. One missing, corrupt, foreign, cross-kind, or path/inode-replaced member intentionally prevents startup. Never copy markers onto replacement storage or rerun initialization to repair a committed seal. Whenever Docker has `volume_data_path`, the primary is `volume_data_path/.fred-backend-storage-identity.json` and the anchor is `callback_db_path.storage-identity-anchor.json`; Docker without a managed volume root and k3s keep both adjacent to `callback_db_path`. If all paths share one mount, the set detects partial deletion/torn initialization but is not an independent backup—protect and snapshot the whole mount |
+| Backend storage-lineage seal | Critical — the marker pair plus every identity-bound authoritative store bind a backend name to one substrate generation | Docker's set is `callbacks.db`, `releases.db`, `retention.db`, both markers, and the substrate; k3s uses its callback and release databases (by default `k3s-callbacks.db` and `k3s-releases.db`), both markers, and the cluster. Every authoritative database must remain an unsymlinked, single-link regular file with exact mode `0600`; startup and runtime re-attestation fail closed on drift. Restore the complete matching set. One missing, corrupt, foreign, cross-kind, or path/inode-replaced member intentionally prevents startup. Never copy markers onto replacement storage or rerun initialization to repair a committed seal. Whenever Docker has `volume_data_path`, the primary is `volume_data_path/.fred-backend-storage-identity.json` and the anchor is `callback_db_path.storage-identity-anchor.json`; Docker without a managed volume root and k3s keep both adjacent to `callback_db_path`. If all paths share one mount, the set detects partial deletion/torn initialization but is not an independent backup—protect and snapshot the whole mount |
 | `placement_store_db_path` | Critical — provider binding, unresolved attempts, ordinary and rejected-positive (`untrusted_positive`) quarantine, immutable backend-name/storage pins, topology history, and the durable inventory baseline are non-derivable safety authority | Restore the exact file only while `providerd` is stopped, then [attest it](#restoring-an-older-placement-backup) before the first start. It must be an unsymlinked, single-link regular file with exact mode `0600`. Normal startup never creates, initializes, or migrates an absent/empty/unprepared replacement, and rejects a file bound to another provider. The fresh initializer is only for a genuinely new provider with zero total chain lease history; it is never recovery for a lost database |
 | `payload_store_db_path` | High — the manifest of every PENDING lease, the current manifest of every ACTIVE lease (Fred re-provisions from it after a crash or host reboot, including manifests a tenant `/update` replaced), and the exact bytes an in-flight provision attempt must re-send | Back it up and restore it together with `placement_store_db_path`, from the same moment, and only while `providerd` is stopped, as an unsymlinked, single-link regular file with exact mode `0600`. Tenants can re-upload only a PENDING lease's original manifest, which must match its on-chain hash. Without the file, an ACTIVE lease that needs re-provisioning stays deferred (`payload not available`) and an in-flight attempt stays unresolved. See [Restoring an older placement backup](#restoring-an-older-placement-backup) |
 | `token_tracker_db_path` | Preserve for replay protection; not durable lease authority | Persists across normal restarts. Losing, replacing, or restoring an older copy can reopen replay for consumed tokens until their signed expiry; see the [token validity window](SECURITY.md#token-replay-tenant-api). bbolt creates a missing file with mode `0600`, but this cache is not lineage/path identity-bound like placement or payload authority; replace it only while providerd is stopped |
@@ -892,7 +892,8 @@ forget (`baseline_topology_id`, `inventory_topology_id`,
 `empty_inventory_backends`), `pending_inventory_sweep`, and `required`. When
 `required` is true it also prints `confirm`, which binds the provider, the
 canonical database path, and every byte of the placement metadata record, so a
-database that changes between the dry run and the apply is refused. When
+metadata change between the dry run and the apply is refused. Placement rows
+are not part of it. When
 `required` is false there is nothing to forget and no apply is needed.
 
 The apply publishes an exact no-overwrite backup of the restored copy, then
@@ -900,7 +901,8 @@ forgets the admission baseline and drain evidence in one transaction. Every
 placement row, storage pin, pending-sweep marker, and reporter journal is kept.
 It contacts no backend and takes no drain attestation, because it only removes
 authority. On the next start `/readyz` reports `placement inventory not ready`
-until one sweep in which every configured backend answers both inventory
+(or `placement inventory recovery pending`, while the copy still carries an
+interrupted sweep's marker) until one sweep in which every configured backend answers both inventory
 endpoints; until then new admission and backend removal wait, and existing
 leases keep running. That sweep adopts every lease its owner reports.
 
@@ -1156,8 +1158,11 @@ The tool reuses the configured HMAC and peer-verified TLS settings, verifies
 that the invocation's parent identity matches the printed acknowledgement,
 collects the complete empty fleet, and takes the pinned zero-history chain
 snapshot. It then reopens and re-attests that proof-bound physical parent before
-constructing a deadline-bound, one-shot capability whose evidence age is capped
-at two minutes even when `-proof-timeout` is larger. The capability is bound to
+constructing a deadline-bound, one-shot capability that expires two minutes
+after it is constructed at the latest, even when `-proof-timeout` is larger.
+The clock starts at construction, after the evidence was collected, so with a
+long `-proof-timeout` the evidence itself can be older than two minutes when
+the authority is published. The capability is bound to
 the resolved target path and parent device/inode, provider UUID, independently
 supplied exact roster, configured topology, and unique storage IDs. It creates
 and verifies the candidate through the retained parent descriptor, then
@@ -1173,8 +1178,8 @@ initializer as successful only when it exits zero and that final line begins
 exactly `INITIALIZED_FOR_CUTOVER:`. Any missing,
 nonempty, malformed, identity-inconsistent, or timed-out response leaves the
 destination absent.
-The earlier of `-proof-timeout` and the two-minute package limit is the
-capability's publication deadline. File
+The earlier of the `-proof-timeout` deadline and two minutes after construction
+is the capability's publication deadline. File
 open/fsync/close calls are not themselves interruptible, but cancellation or
 expiry observed before the no-replace rename leaves the destination absent. If
 it is observed after the rename, the command returns `INITIALIZED:` because the
@@ -2333,11 +2338,15 @@ use it merely because a lease is absent from inventory: absence is only a
 point-in-time cross-check and cannot prove that a delayed request will not
 commit later.
 
-First obtain the exact `lease_uuid`, attempted `backend`, and `operation_id`
-from the immediate ambiguous provision/restore WARN or ERROR log. Current logs
-emit all three fields together. Correlate that operation with the backend's
-durable callback queue and transport logs; if the exact UUID cannot be
-recovered, do not guess and do not repair the row. Then:
+First obtain the exact `lease_uuid` and attempted `backend` from the immediate
+ambiguous provision/restore WARN or ERROR log (for example `reconcile: provision
+returned an ambiguous outcome; retaining exact durable attempt`). The logs do
+not carry the `operation_id`: once step 1 has stopped `providerd`, read it from
+the durable row with `placement-repair -inspect -lease <lease_uuid>`, where it
+is printed next to `attempt`. Correlate that operation with the backend's
+durable callback queue (its callback URLs carry the same `operation_id` query
+parameter) and transport logs; if the exact UUID cannot be recovered, do not
+guess and do not repair the row. Then:
 
 1. Remove tenant and chain-event ingress, stop `providerd`, and leave it stopped.
    The tool opens the existing placement database exclusively and refuses to
@@ -2439,8 +2448,10 @@ operator procedure below; point-in-time inventory absence alone is insufficient.
 
 1. Stop ingress and `providerd`, then use `-inspect` to record the exact revision
    and complete candidate set. All candidates must still belong to the durable
-   and configured topology; unknown-owner legacy/corrupt conflicts are not
-   eligible for this repair.
+   and configured topology. Unknown-owner legacy/corrupt conflicts and a sole
+   `untrusted_positive` candidate are not eligible for this repair: it needs at
+   least two recorded candidates. A sole candidate resolves only through the
+   two proofs above; until then it stays quarantined.
 2. Probe and drain every candidate's delayed request/effect paths and callback
    replay. This causal proof is mandatory even when fresh inventory currently
    shows only one owner.

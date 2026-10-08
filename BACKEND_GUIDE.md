@@ -191,8 +191,9 @@ The HTTP contract is:
   precheck alone is a refusal because the raw mutator never ran.
 - Keep any legacy side-effect paths isolated from the identity-bound namespace;
   they are not a supported mixed-version rollout route. The documented v0.13
-  cutover stops the old provider and every backend, drains pending work, rotates
-  to unique per-backend keys, seals storage identity, starts the upgraded
+  cutover drains pending work, including every legacy callback outbox, while
+  the old provider still runs, then stops the old provider and every backend,
+  rotates to unique per-backend keys, seals storage identity, starts the upgraded
   backends, and only then starts the upgraded provider. A new provider never
   chooses the old paths. Do not configure a proxy to rewrite or fan out the
   upgraded namespace to a legacy mutation path. Fred also refuses HTTP
@@ -1145,9 +1146,10 @@ field, or send `false`, when disk is admitted.
 A terminal restart/update callback carries `maintenance_id` equal to the
 canonical UUIDv4 from its durable request, and `maintenance_admitted_at` equal
 to the request's `admitted_at` when it had one. Persist both with the outbox
-entry and include them in the HMAC-covered body. Fred ignores a completion whose
-`maintenance_admitted_at` differs from its pending command, so a late completion
-of an earlier command that reused the key cannot settle the newer one. It accompanies the existing lifecycle URL
+entry and include them in the HMAC-covered body. Fred does not settle its
+pending command from a completion whose `maintenance_admitted_at` differs, so a
+late completion of an earlier command that reused the key cannot settle the
+newer one; it still publishes that completion's result to the tenant. It accompanies the existing lifecycle URL
 and backend storage identity; it cannot replace either authority. Include it on
 the exact `success` or `failed` completion only. A later autonomous runtime
 failure must omit it, including the separate runtime observation paired with a
@@ -1197,8 +1199,11 @@ no-op and only the exact `deprovisioned` observation can retire it and publish a
 retained notice. That consume is durable before the best-effort notice is
 published, so a process crash can lose the push but cannot resurrect its
 authority; the queryable retention status remains the backstop. A lifecycle
-callback never settles an operation or mutates placement/chain state: it may
-publish only `ready`, `failed`, or `retained` status. Never use it for the
+callback never settles a provision or restore operation or touches chain state,
+and it may publish only `ready`, `failed`, or `retained` status. Its placement
+effects are limited to two: an exact update completion settles that update
+command, and the exact `deprovisioned` observation retires the lifecycle
+capability. Never use it for the
 original provision/restore result, which must go to the operation-scoped
 `callback_url`.
 
@@ -1220,8 +1225,10 @@ provision/restore requests are rejected. A new backend can recover the
 operationless route already embedded by v0.13.0 and continue using
 it after Fred migrates that owner as legacy. Starting a new provider against an
 old backend is not lifecycle-compatible: a v0.13.0 backend ignores
-`lifecycle_callback_url` and later reuses the expired operation-scoped URL,
-whose `operation_id` a new Fred intentionally treats as a 200 no-op.
+`lifecycle_callback_url` and later reuses the expired operation-scoped URL. A
+new providerd refuses those callbacks with `400` (or `429` once the
+pre-authentication budget is exhausted): they carry no `backend_storage_id`,
+which selects the HMAC key.
 
 Fred repeats the current lifecycle route as `callback_url` on `/restart` and
 `/update`. A backend with persisted state must require the same authority class
@@ -1253,7 +1260,8 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 - `status`: One of `"success"`, `"failed"`, or `"deprovisioned"`. Send `"deprovisioned"` only to report that close has torn down (or retained) the lease's resources, and only on the lifecycle (or legacy tokenless) callback URL; on an operation URL Fred answers `400`. The bundled Docker backend sends it only when a close completes. Fred records the teardown without firing failure-callback side effects.
 - `error`: For `"failed"`, a curated, human-readable reason; empty otherwise. **It is public.** When a provision or restore operation callback reports `"failed"` for a lease that is still `PENDING`, Fred rejects the lease on chain with this text as the rejection reason (truncated to 256 bytes; Fred writes `provisioning failed` when it is empty). Fred also sends it as the `error` of the `failed` event on the tenant's lease event stream. Author it like the `message` field on `/provisions` (the bundled Docker backend sends that same message): never raw errors, command output, host paths or secrets.
 - `retained` (omitempty): `true` on a `"deprovisioned"` callback when close retained the lease's data instead of destroying it; Fred then publishes a `retained` status. Fred answers `400` to `retained` with any other status.
-- `maintenance_id`, `maintenance_admitted_at` (omitempty): The exact restart/update completion identity described in [Exact maintenance completion](#exact-maintenance-completion). Fred answers `400` to a `maintenance_id` that is not a canonical UUIDv4 or that arrives on an operation URL or with `"deprovisioned"`, and to a `maintenance_admitted_at` without `maintenance_id` or that is not an RFC 3339 UTC time.
+- `maintenance_id`, `maintenance_admitted_at` (omitempty): The exact restart/update completion identity described in [Exact maintenance completion](#exact-maintenance-completion). Fred answers `400` to a `maintenance_id` that is not a canonical UUIDv4 or that arrives on an operation URL or with `"deprovisioned"`, and to a `maintenance_admitted_at` without `maintenance_id` or that is not an RFC 3339 time in UTC written with `Z` (a `+00:00` offset is rejected). Fred compares the instant, so any `Z` form of
+its `admitted_at` matches.
 - `backend` (omitempty): Optional legacy sender metadata used only for bounded metrics when no current operation exists. It may be empty or differ from Fred's configured router name. It never authorizes or redirects a typed callback; the HMAC-covered callback URL plus Fred's current exact-operation or durable lifecycle record select the authoritative backend.
 - `backend_storage_id`: Canonical UUIDv4 captured with the durable callback row
   when the backend effect occurred. It is HMAC-covered and must be preserved on
@@ -1267,7 +1275,9 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 
 Before HMAC verification, the callback reader accepts at most **1 MiB** of exact
 wire bytes, **256 JSON structural tokens**, and **16 nesting levels**. These are
-fixed protocol limits, including unknown fields. Exceeding them returns `401`
+fixed protocol limits, including unknown fields; the provider-wide
+`max_request_body_size` also wraps the callback route, so a smaller configured
+value lowers the byte limit. Exceeding them returns `401`
 while the unauthenticated ingress budget remains available, or `429` once that
 budget is exhausted. A valid signature does not bypass envelope limits. The
 reader preserves the received bytes for HMAC verification; senders must sign the
@@ -1444,14 +1454,16 @@ names; require a canonical, non-nil lowercase UUID lease identity; require a
 UUIDv4 delivery identity and positive sequence; reject a callback URL whose
 authority, canonical callback path, or raw query is unsafe, or whose query
 carries mixed, malformed, duplicate, or opposite-class authority; accept
-only the status/success/retained combinations defined by that kind; and reject
-missing, pre-epoch, or more than five-minutes-in-the-future creation times. A
+only the status/retained combinations defined by that kind; and reject missing
+or pre-epoch creation times. Reject a creation time more than five minutes in
+the future only when storing a new row: never re-check a stored row against
+the clock, or a backward clock step quarantines work already accepted. A
 tokenless URL remains valid in an identity-bearing current row only when it was
 inherited from a migrated v0.13 workload: its delivery kind records the
 backend's causal ordering intent even though old Fred supplied no typed
-selector. Keep a separate compatibility decoder for offline inspection,
-explicit cleanup, and quarantine of rows written by v0.13 itself; current
-startup requires that legacy bucket to be empty. Unknown fields may remain
+selector. Rows written by v0.13 itself must be drained before the cutover:
+current startup requires that legacy bucket to be empty. Never decode them in
+the current runtime; the bundled backend's stopped inspector only counts them. Unknown fields may remain
 accepted for forward-compatible additions, but known authority fields must have
 exactly one value.
 
@@ -1490,8 +1502,11 @@ response is ambiguous and must retain it.
 
 Replacement commands need a separate typed **maintenance intent** rather than a
 generic lifecycle enqueue. Commit it before appending the target generation or
-mutating substrate; allocate one canonical UUIDv4 and persist it on the intent,
-exact target Release, and every target resource. Fence the exact active source
+mutating substrate; persist one canonical UUIDv4 on the intent, exact target
+Release, and every target resource. For a restart or update it is the
+`maintenance_id` Fred sent: an update completion carrying any other ID never
+settles Fred's command. Only a replacement the backend starts on its own, such as
+Docker's custom-domain redeploy, allocates its own ID. Fence the exact active source
 and store-assigned target version plus immutable digests, preserving tenant,
 provider, and operation/lifecycle identity. Keep that identity and request
 snapshot immutable, but model progress explicitly: a cancel-only pre-append
@@ -1610,7 +1625,7 @@ destructive cleanup:
 ```go
 func (b *DockerBackend) recoverState(ctx context.Context) error {
     // List all containers with fred.managed=true label
-    containers, err := b.docker.ContainerList(ctx, types.ContainerListOptions{
+    containers, err := b.docker.ContainerList(ctx, container.ListOptions{
         Filters: filters.NewArgs(filters.Arg("label", "fred.managed=true")),
     })
 

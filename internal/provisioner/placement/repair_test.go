@@ -860,7 +860,8 @@ func TestAttemptRepairRefusePreservesPriorDetachedLifecycleAuthority(t *testing.
 	assert.Equal(t, StateAbsent, reopened.Lookup(repairLease).State())
 	ownerLifecycle, err := lifecycle.FromOperationID(ownerOperation)
 	require.NoError(t, err)
-	authorization := reopened.authorizeLifecycle(repairLease, ownerLifecycle)
+	authorization, err := reopened.authorizeLifecycle(repairLease, ownerLifecycle)
+	require.NoError(t, err)
 	assert.Equal(t, LifecycleVerdictTeardownOnly, authorization.Verdict(),
 		"repairing a newer recordless attempt must not erase older teardown authority")
 }

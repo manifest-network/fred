@@ -593,8 +593,14 @@ func (coordinator *AuthenticatedCallbackCoordinator) observeLifecycle(
 ) (CallbackResult, error) {
 	result.nonInFlight = true
 	result.lifecycleOutcome = CallbackLifecycleRetryable
-	authorization := coordinator.coordinator.authorizeLifecycle(callback.LeaseUUID(), callback.LifecycleID())
+	authorization, err := coordinator.coordinator.authorizeLifecycle(callback.LeaseUUID(), callback.LifecycleID())
 	result.lifecycleVerdict = authorization.Verdict()
+	if err != nil {
+		// Without placement authority this process cannot judge the callback.
+		// The backend keeps it durable and retries; dropping it would lose an
+		// exact update completion for good.
+		return result, fmt.Errorf("authorize lifecycle callback: %w", err)
+	}
 	switch authorization.Verdict() {
 	case LifecycleVerdictAuthorized:
 		result.authoritativeBackend = authorization.Backend()

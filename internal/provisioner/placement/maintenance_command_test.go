@@ -596,7 +596,8 @@ func TestMaintenanceReceiptReclamationFailureRollsBackFinalAuthorityRemoval(t *t
 
 	_, err = store.retireLifecycle(maintenanceLease, authority.lifecycleID)
 	require.ErrorIs(t, err, ErrMaintenanceJournalCorrupt)
-	authorization := store.authorizeLifecycle(maintenanceLease, authority.lifecycleID)
+	authorization, err := store.authorizeLifecycle(maintenanceLease, authority.lifecycleID)
+	require.NoError(t, err)
 	assert.Equal(t, LifecycleVerdictTeardownOnly, authorization.Verdict(),
 		"a reclamation failure must roll back deletion of the last callback authority")
 	require.NoError(t, store.db.View(func(tx *bolt.Tx) error {

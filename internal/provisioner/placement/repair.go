@@ -216,9 +216,11 @@ func newRepairRecord(leaseUUID string, p Placement) RepairRecord {
 }
 
 // AttemptRepair holds an exclusive bbolt lock on an existing placement
-// database. Opening it performs only read transactions; the only exposed
-// mutation is Refuse, which consumes an opaque exact claimed generation
-// returned by MatchAttempt.
+// database. Opening it performs only read transactions. Its mutations are
+// RefuseContext (one attempt matched by MatchAttempt), ResolveConflictContext,
+// AdoptObservedGenerationContext, AttestRestoredBackup and RetireBackend; each
+// consumes an opaque plan or candidate minted by this session, and
+// CreateExactBackup publishes the backup an apply requires first.
 type AttemptRepair struct {
 	store                 *Store
 	sourceInfo            os.FileInfo

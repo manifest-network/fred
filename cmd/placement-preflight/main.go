@@ -3,8 +3,10 @@
 // binds complete backend evidence to a height-pinned signer-free chain snapshot.
 // Its default mode is read-only. Explicit --prepare mode holds an exclusive
 // lock, publishes a required backup, then seals the verified database atomically.
-// Explicit --initialize-fresh mode instead proves that chain and every backend
-// are quiescent and empty before publishing a new placement authority.
+// Explicit --initialize-fresh mode instead proves that the provider has no chain
+// lease history and every backend reports empty inventories, and takes the
+// operator's attestation that the provider and every backend are quiesced,
+// before publishing a new placement authority.
 package main
 
 import (
@@ -374,7 +376,7 @@ func runWithDependencies(
 		defaultProofTimeout,
 		"remote inventory/chain proof and cancellable validation timeout; fresh/legacy capabilities are hard-capped at two minutes; excludes file open/copy/fsync/commit/close and output",
 	)
-	prepare := flags.Bool("prepare", false, "atomically back up and seal the verified v0.13 database for the identity-bound upgrade")
+	prepare := flags.Bool("prepare", false, "publish a required backup, then atomically seal the verified v0.13 database for the identity-bound upgrade")
 	backupPath := flags.String("backup", "", "new backup path required with -prepare (must not already exist)")
 	attestDrained := flags.String(
 		"attest-drained",

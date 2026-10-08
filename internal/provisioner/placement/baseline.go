@@ -1048,7 +1048,10 @@ func durableBackendNames(leaseUUID string, value []byte) ([]string, error) {
 	}
 	names = append(names, persisted.ConflictBackends...)
 	names = normalizeBackendNames(names)
-	if persisted.Conflict && (persisted.ConflictOwnersUnknown || len(names) < 2) {
+	// Decoding already marks a conflict's owners unknown when its candidate
+	// set is incomplete. An untrusted positive's single candidate is complete,
+	// so counting names here would refuse a valid quarantine.
+	if persisted.Conflict && persisted.ConflictOwnersUnknown {
 		return nil, errors.New("conflict owner set is unknown")
 	}
 	if len(names) == 0 {
