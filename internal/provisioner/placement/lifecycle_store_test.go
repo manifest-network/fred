@@ -36,7 +36,8 @@ func requireLifecycleVerdict(
 	want LifecycleVerdict,
 ) LifecycleAuthorization {
 	t.Helper()
-	result := s.authorizeLifecycle(leaseUUID, id)
+	result, err := s.authorizeLifecycle(leaseUUID, id)
+	require.NoError(t, err)
 	require.Equal(t, want, result.Verdict())
 	return result
 }

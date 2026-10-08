@@ -2,12 +2,16 @@ package callbackwire
 
 import (
 	"net/http"
+	"reflect"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
@@ -61,6 +65,36 @@ func TestSelectUntrustedStorageRouteSharesStrictPayloadGrammar(t *testing.T) {
 	require.ErrorContains(t, err, "ambiguous field")
 	_, err = SelectUntrustedStorageRoute([]byte(`{"backend_storage_id":"` + testStorageID + `"}{}`))
 	require.ErrorContains(t, err, "trailing JSON data")
+}
+
+// TestPayloadFieldsCoverEveryCallbackPayloadField ties the decoder's table to
+// the wire struct: a new CallbackPayload field must be added to the table, and
+// so to the alias guard, before it can be decoded at all.
+func TestPayloadFieldsCoverEveryCallbackPayloadField(t *testing.T) {
+	payloadType := reflect.TypeFor[backend.CallbackPayload]()
+	var tagged []string
+	for i := range payloadType.NumField() {
+		field := payloadType.Field(i)
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		require.NotEmpty(t, name, "CallbackPayload.%s needs an explicit JSON name", field.Name)
+		tagged = append(tagged, name)
+	}
+	var table []string
+	for name := range payloadFields {
+		table = append(table, name)
+	}
+	slices.Sort(tagged)
+	slices.Sort(table)
+	assert.Equal(t, tagged, table)
+}
+
+func TestDecodePayloadRejectsEveryCaseAliasedField(t *testing.T) {
+	for name := range payloadFields {
+		t.Run(name, func(t *testing.T) {
+			_, err := decodePayload([]byte(`{"` + name + `":null,"` + strings.ToUpper(name) + `":null}`))
+			require.ErrorContains(t, err, "ambiguous field")
+		})
+	}
 }
 
 func TestCallbackProofCannotBeMintedForAnotherPath(t *testing.T) {

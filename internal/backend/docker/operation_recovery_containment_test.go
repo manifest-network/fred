@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -121,7 +123,10 @@ func TestStartPreservesUnresolvedOperationWithoutBlockingBackend(t *testing.T) {
 	pending, err := b.callbackStore.ListPending()
 	require.NoError(t, err)
 	require.Empty(t, pending)
+	deferredBefore := testutil.ToFloat64(operationRecoveryDeferredTotal)
 	require.NoError(t, b.recoverLiveOperationIntents(t.Context()))
+	assert.Equal(t, deferredBefore+1, testutil.ToFloat64(operationRecoveryDeferredTotal),
+		"an unclassifiable lease is counted once per recovery pass")
 	after, err = listOperationIntentsForCallbackTest(t, b.callbackStore)
 	require.NoError(t, err)
 	require.Equal(t, before, after)

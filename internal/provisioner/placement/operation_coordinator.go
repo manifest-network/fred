@@ -642,9 +642,9 @@ func (coordinator *OperationCoordinator) ExpectedBackendStorageIdentity(
 func (coordinator *OperationCoordinator) authorizeLifecycle(
 	leaseUUID string,
 	id lifecycle.ID,
-) LifecycleAuthorization {
+) (LifecycleAuthorization, error) {
 	if !coordinator.Valid() {
-		return LifecycleAuthorization{}
+		return LifecycleAuthorization{}, errors.New("operation coordinator is invalid")
 	}
 	return coordinator.store.authorizeLifecycle(leaseUUID, id)
 }
@@ -1632,8 +1632,8 @@ func (coordinator *OperationCoordinator) restoreTargetPositivelyConfirmed(
 	if err != nil {
 		return false
 	}
-	authorization := coordinator.store.authorizeLifecycle(dispatch.restore.targetLeaseUUID, id)
-	return authorization.Authorized() && authorization.Backend() == dispatch.restore.backendName
+	authorization, err := coordinator.store.authorizeLifecycle(dispatch.restore.targetLeaseUUID, id)
+	return err == nil && authorization.Authorized() && authorization.Backend() == dispatch.restore.backendName
 }
 
 // completeRestoreRefused consumes the Store's source reservation and clears

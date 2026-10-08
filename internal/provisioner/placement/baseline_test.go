@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -655,6 +656,26 @@ func TestStore_ConfigureBackendTopologyRejectsRemovedDurableReferences(t *testin
 			configureBackendTopologyForTest(s, []string{"backend-a"}),
 			ErrBackendTopologyInUse,
 		)
+	})
+
+	t.Run("single-candidate untrusted positive", func(t *testing.T) {
+		// projectUntrustedPositive keeps one candidate as a complete owner set,
+		// so a roster change must read it as owned by that backend rather than
+		// refuse it as uninterpretable.
+		row, err := encodePlacement(Placement{
+			SetAt: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC), Conflict: true,
+			ConflictBackends: []string{"backend-b"}, untrustedPositive: true,
+		})
+		require.NoError(t, err)
+		dbPath := filepath.Join(t.TempDir(), "placements.db")
+		writeRawRecords(t, dbPath, map[string][]byte{"lease": row})
+		s, err := newStore(dbPath, true)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = s.Close() })
+		require.NoError(t, configureBackendTopologyForTest(s, []string{"backend-a", "backend-b"}))
+		err = configureBackendTopologyForTest(s, []string{"backend-a"})
+		require.ErrorIs(t, err, ErrBackendTopologyInUse)
+		require.NotContains(t, err.Error(), "uninterpretable")
 	})
 
 	for name, value := range map[string][]byte{

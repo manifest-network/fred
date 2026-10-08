@@ -232,9 +232,20 @@ func SelectUntrustedStorageRoute(body []byte) (backendidentity.ID, error) {
 	return storageID, nil
 }
 
-var payloadFields = [...]string{
-	"lease_uuid", "status", "error", "backend_storage_id", "backend",
-	"operation_id", "lifecycle_id", "retained", "maintenance_id",
+// payloadFields is the one table of CallbackPayload's wire names. The alias
+// guard and the decoder both read it, so no field can be decoded without also
+// being guarded against a case-aliased duplicate.
+var payloadFields = map[string]func(*backend.CallbackPayload) any{
+	"lease_uuid":              func(p *backend.CallbackPayload) any { return &p.LeaseUUID },
+	"status":                  func(p *backend.CallbackPayload) any { return &p.Status },
+	"error":                   func(p *backend.CallbackPayload) any { return &p.Error },
+	"backend_storage_id":      func(p *backend.CallbackPayload) any { return &p.BackendStorageID },
+	"backend":                 func(p *backend.CallbackPayload) any { return &p.Backend },
+	"operation_id":            func(p *backend.CallbackPayload) any { return &p.OperationID },
+	"lifecycle_id":            func(p *backend.CallbackPayload) any { return &p.LifecycleID },
+	"retained":                func(p *backend.CallbackPayload) any { return &p.Retained },
+	"maintenance_id":          func(p *backend.CallbackPayload) any { return &p.MaintenanceID },
+	"maintenance_admitted_at": func(p *backend.CallbackPayload) any { return &p.MaintenanceAdmittedAt },
 }
 
 // decodePayload keeps unknown fields forward compatible while rejecting
@@ -268,7 +279,7 @@ func decodePayload(body []byte) (backend.CallbackPayload, error) {
 			return backend.CallbackPayload{}, fmt.Errorf("payload contains duplicate field %q", field)
 		}
 		seen[field] = struct{}{}
-		for _, canonical := range payloadFields {
+		for canonical := range payloadFields {
 			if strings.EqualFold(field, canonical) && field != canonical {
 				return backend.CallbackPayload{}, fmt.Errorf(
 					"payload contains ambiguous field %q; use %q", field, canonical,
@@ -276,30 +287,9 @@ func decodePayload(body []byte) (backend.CallbackPayload, error) {
 			}
 		}
 
-		var target any
-		switch field {
-		case "lease_uuid":
-			target = &payload.LeaseUUID
-		case "status":
-			target = &payload.Status
-		case "error":
-			target = &payload.Error
-		case "backend_storage_id":
-			target = &payload.BackendStorageID
-		case "backend":
-			target = &payload.Backend
-		case "operation_id":
-			target = &payload.OperationID
-		case "lifecycle_id":
-			target = &payload.LifecycleID
-		case "retained":
-			target = &payload.Retained
-		case "maintenance_id":
-			target = &payload.MaintenanceID
-		case "maintenance_admitted_at":
-			target = &payload.MaintenanceAdmittedAt
-		default:
-			target = new(json.RawMessage)
+		var target any = new(json.RawMessage)
+		if fieldTarget, known := payloadFields[field]; known {
+			target = fieldTarget(&payload)
 		}
 		if err := decoder.Decode(target); err != nil {
 			return backend.CallbackPayload{}, fmt.Errorf("decode field %q: %w", field, err)

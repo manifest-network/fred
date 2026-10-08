@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Metric `fred_docker_backend_operation_recovery_deferred_total`: a provision
+  or restore whose recovery evidence could not be classified, so the lease
+  stays fenced and the next pass retries it. Before, a warning log was the
+  only signal. (ENG-1119)
 - Attribution `unhealthy` on `fred_docker_backend_lease_failures_total`: a
   provision whose health check never passed. It never counts toward the
   terminal failure budget; do not alert on it. (ENG-1125)
@@ -1174,6 +1178,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- providerd answers a lifecycle callback with 503 when it has lost placement
+  runtime authority, so the backend keeps it and retries. It used to answer
+  200 and drop it; a dropped update completion left the lease's later restart
+  and update requests conflicting until the lease ended. (ENG-1119)
+- providerd starts after a backend roster change when a lease is quarantined
+  as an untrusted positive with one candidate backend. It used to read that
+  valid quarantine as corrupt and stop with `conflict owner set is unknown`.
+  (ENG-1119)
+- A callback body that repeats `maintenance_admitted_at` under another letter
+  case is rejected as ambiguous, like every other callback field. (ENG-1119)
 - Three OPERATIONS.md runbooks could lose placement data.
   - "A structurally unreadable bbolt file" listed lock errors as corruption. A
     lock timeout means another process still holds the file: stop that process

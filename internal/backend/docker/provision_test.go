@@ -3468,7 +3468,7 @@ func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
 	b.wg.Wait()
 }
 
-func TestDoProvision_StatefulSKUChownsVolumeSubdirs(t *testing.T) {
+func TestIntegration_DoProvision_StatefulSKUChownsVolumeSubdirs(t *testing.T) {
 	const leaseUUID = durableCallbackTestLeaseUUID2
 	// Verify that doProvision chowns volume subdirectories to the image's
 	// runtime UID/GID when ResolveImageUser returns a non-root user.
@@ -4261,24 +4261,6 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 		assert.Equal(t, "real.conf", target)
 	})
 
-	t.Run("preserves ownership", func(t *testing.T) {
-		if os.Getuid() != 0 {
-			t.Skip("chown requires root")
-		}
-		destDir := t.TempDir()
-		buf := createTestTar(t, []testTarEntry{
-			{Name: "owned.txt", Typeflag: tar.TypeReg, Mode: 0o644, Uid: 1000, Gid: 1000, Content: "data"},
-		})
-		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
-		require.NoError(t, err)
-
-		info, statErr := os.Stat(filepath.Join(destDir, "owned.txt"))
-		require.NoError(t, statErr)
-		stat := info.Sys().(*syscall.Stat_t)
-		assert.Equal(t, uint32(1000), stat.Uid)
-		assert.Equal(t, uint32(1000), stat.Gid)
-	})
-
 	t.Run("refuses to write a file through a symlinked ancestor", func(t *testing.T) {
 		destDir := t.TempDir()
 		// A directory OUTSIDE destDir that a malicious symlink will point at.
@@ -4356,10 +4338,32 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 		assert.Equal(t, "payload", string(content))
 	})
 
+}
+
+// TestIntegration_SanitizeAndExtractTarOwnership holds the extraction cases
+// that need root to chown. The Integration name puts them in the root CI job;
+// in the unprivileged unit job they skip.
+func TestIntegration_SanitizeAndExtractTarOwnership(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("chown requires root")
+	}
+
+	t.Run("preserves ownership", func(t *testing.T) {
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "owned.txt", Typeflag: tar.TypeReg, Mode: 0o644, Uid: 1000, Gid: 1000, Content: "data"},
+		})
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
+		require.NoError(t, err)
+
+		info, statErr := os.Stat(filepath.Join(destDir, "owned.txt"))
+		require.NoError(t, statErr)
+		stat := info.Sys().(*syscall.Stat_t)
+		assert.Equal(t, uint32(1000), stat.Uid)
+		assert.Equal(t, uint32(1000), stat.Gid)
+	})
+
 	t.Run("does not chown the destination root via a '.' entry", func(t *testing.T) {
-		if os.Getuid() != 0 {
-			t.Skip("chown requires root")
-		}
 		destDir := t.TempDir()
 		beforeUID := mustStatUID(t, destDir)
 
