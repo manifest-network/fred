@@ -376,7 +376,7 @@ func runWithDependencies(
 		defaultProofTimeout,
 		"remote inventory/chain proof and cancellable validation timeout; fresh/legacy capabilities are hard-capped at two minutes; excludes file open/copy/fsync/commit/close and output",
 	)
-	prepare := flags.Bool("prepare", false, "atomically back up and seal the verified v0.13 database for the identity-bound upgrade")
+	prepare := flags.Bool("prepare", false, "publish a required backup, then atomically seal the verified v0.13 database for the identity-bound upgrade")
 	backupPath := flags.String("backup", "", "new backup path required with -prepare (must not already exist)")
 	attestDrained := flags.String(
 		"attest-drained",

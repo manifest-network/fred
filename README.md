@@ -1319,8 +1319,8 @@ request URI, including its query. Requires HMAC-SHA256 authentication via the
 Status must be one of `"success"`, `"failed"`, or `"deprovisioned"`. `deprovisioned` reports a completed teardown and is accepted only on a `lifecycle_id` URL or the tokenless v0.13 route; on an `operation_id` URL it is rejected with `400`. The bundled backends send it when a lease's close completes.
 
 - `backend` (optional string) — legacy sender metadata used only for bounded metrics when no current operation exists. It need not equal Fred's configured router name and cannot authorize or redirect a typed callback; the HMAC-covered callback URL plus Fred's exact-operation registry or durable lifecycle record select the authoritative backend.
-- `maintenance_id` (optional canonical UUIDv4 string) — included only on the exact durable restart/update completion. Successful update completion authorizes promotion of that command's pending manifest; failed completion discards its promotion. Later runtime-failure observations omit this field. It is HMAC-covered and must match the command under the authorized lifecycle and storage identity. Sending it on an `operation_id` URL or with `deprovisioned` status is rejected with `400`.
-- `maintenance_admitted_at` (optional RFC 3339 UTC timestamp) — echoes the `admitted_at` Fred sent with that restart/update. Sending it without `maintenance_id` is rejected with `400`. A stamp that differs from the command Fred admitted under that `maintenance_id` cannot settle the command.
+- `maintenance_id` (optional canonical UUIDv4 string) — included on the exact durable restart/update completion. The docker-backend also sends one on a custom-domain completion; it names no Fred command, so it settles nothing. Successful update completion authorizes promotion of that command's pending manifest; failed completion discards its promotion. Later runtime-failure observations omit this field. It is HMAC-covered and must match the command under the authorized lifecycle and storage identity. Sending it on an `operation_id` URL or with `deprovisioned` status is rejected with `400`.
+- `maintenance_admitted_at` (optional RFC 3339 timestamp in UTC, written with `Z`; a `+00:00` offset is rejected with `400`) — echoes the `admitted_at` Fred sent with that restart/update; Fred compares the instant. Sending it without `maintenance_id` is rejected with `400`. A stamp that differs from the command Fred admitted under that `maintenance_id` cannot settle the command.
 - `retained` (optional bool) — set `true` on a `deprovisioned` callback when the backend soft-deleted (retained) the lease's volumes instead of destroying them; with any other status it is rejected with `400`. Fred uses this to push the optimistic `retained` notice to the tenant; the queryable retained status (`GET /v1/leases/{uuid}/status`) is the durable backstop. Omitted/`false` means the volumes were destroyed.
 - `operation_id` in the JSON body, if sent by an older or custom backend, is untrusted metadata and is overwritten at ingress. Only the HMAC-authenticated URL query grants exact-operation authority.
 - `lifecycle_id` in the JSON body is likewise overwritten. Fred authorizes the authenticated query only when it matches the current durable per-lease lifecycle capability and backend.
@@ -1357,9 +1357,9 @@ of holding that lease's FIFO lock for consecutive application budgets.
 
 The v0.13.0 upgrade is a stopped cutover, not a rolling upgrade. Drain every old
 callback outbox, stop providerd and all backends, install the upgraded binaries
-without starting them, and run each Docker backend's mandatory read-only
-`-preflight-storage-identity-adoption` proof before taking the cutover backup or
-sealing storage identity. Then rotate to unique per-backend keys and restart
+without starting them, rotate to unique per-backend keys, and run each Docker
+backend's mandatory read-only `-preflight-storage-identity-adoption` proof
+before taking the cutover backup or sealing storage identity. Then restart
 every upgraded backend before the new providerd. Stack-form v0.13 Docker
 workloads stay in place; service-name-less pre-stack cohorts are unsupported and
 must be resolved before sealing. New backends recover the old operationless callback shape already
@@ -1371,8 +1371,9 @@ it is not carried across the cutover. An absent or rebuilt placement database is
 never a recovery path for those workloads. The reverse binary order is not
 lifecycle-compatible:
 an old backend ignores `lifecycle_callback_url` and reuses the expired
-operation-scoped URL for later observations, which the new provider safely
-ignores.
+operation-scoped URL for later observations. The new provider refuses those
+with `400` (or `429` once the pre-authentication budget is exhausted), because
+they carry no `backend_storage_id` to select the HMAC key.
 
 The seal covers more than the substrate marker. Docker always binds
 `callbacks.db`, `releases.db`, and `retention.db` to the same storage UUID and
@@ -1413,10 +1414,11 @@ If a callback is received for a lease that has already been processed (no longer
 the server still returns `200 OK`. A callback carrying an
 `operation_id` that is no longer current is ignored completely: it cannot publish
 status, acknowledge or reject the lease, retire teardown state, or mutate placement.
-The current `lifecycle_id` is observation-only: it may publish successful
-maintenance (`ready`), runtime failure (`failed`), or retained teardown status,
-but cannot settle an exact operation or mutate chain/placement state. A
-deprovisioned observation atomically retires that capability. If no matching
+The current `lifecycle_id` may publish successful maintenance (`ready`),
+runtime failure (`failed`), or retained teardown status. It cannot settle a
+provision or restore operation or touch chain state, and its placement effects
+are limited to two: an exact update completion settles that update command, and
+a deprovisioned observation atomically retires the capability. If no matching
 confirmed placement owner remains, the capability is teardown-only:
 success/failure is a 200 no-op, it cannot be reissued for maintenance, and only
 the exact deprovisioned observation may retire it and publish retained status.
@@ -1424,10 +1426,11 @@ Retirement is durable before that best-effort push, so a process crash can lose
 the event but cannot resurrect authority; retention status remains queryable.
 A stale, missing,
 or retired ID is a 200 no-op. Tokenless callbacks are accepted only for durable
-owners migrated from v0.13.0 and retain the same observation-only limits.
-This is an explicit compatibility boundary: stopped adoption represents the old
-route as a distinct `LegacyRuntimeAuthority`, callback ingress matches it to that
-owner, and no current provision, restore, maintenance, or reconciliation path
+owners migrated from v0.13.0 and keep the same limits.
+This is an explicit compatibility boundary: the stopped placement preparation
+records the old route as a legacy lifecycle capability with no ID, callback
+ingress matches a tokenless callback to that owner (the backend keeps its side
+as a `LegacyRuntimeAuthority` in `releases.db`), and no current provision, restore, maintenance, or reconciliation path
 can mint a tokenless operation or lifecycle authority.
 Response bodies are not guaranteed for this path, so callers should treat the HTTP status
 code as the source of truth.

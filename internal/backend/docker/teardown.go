@@ -148,9 +148,10 @@ func (b *Backend) teardownLeaseContainersUsing(mutations teardownMutationCapabil
 // ListManagedContainers filters on fred.managed=true plus this backend's name, and
 // compose-created containers carry both (compose_project.go), so the LeaseUUID match
 // below is the same identity recoverState rebuilds state from. Migration `-prev`
-// remnants ARE included: recoverState skips them because it is reconstructing live
-// state, whereas every caller here is tearing the lease down in full, so a remnant
-// holding an anonymous volume is exactly what we came to remove.
+// remnants ARE included: recoverState refuses a pre-stack remnant (no service
+// name) rather than reconstruct live state from it, whereas every caller here is
+// tearing the lease down in full, so a remnant holding an anonymous volume is
+// exactly what we came to remove.
 func (b *Backend) discoverLeaseContainers(ctx context.Context, leaseUUID string, recordedIDs []string) ([]string, error) {
 	all, err := b.docker.ListManagedContainers(ctx)
 	if err != nil {

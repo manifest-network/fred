@@ -58,9 +58,10 @@ func applyCustomDomainOverrides(items []backend.LeaseItem, overrides map[string]
 // ErrNotProvisioned / ErrInvalidState under provisionsMu, snapshots the
 // fields the worker needs, then does pure work (manifest marshal +
 // release-store Append). It performs NO write to prov.Status or either
-// callback URL — the lease actor's onEnterRestarting entry action is
-// the sole writer of those fields, firing inside handleRestartRequested
-// BEFORE the ack. Because Restart() returns only after observing that
+// callback URL. The lease actor's onEnterRestarting entry action is the
+// sole writer of prov.Status, firing inside handleRestartRequested BEFORE
+// the ack; a moved callback route stays pending actor state until the
+// target generation activates. Because Restart() returns only after observing that
 // ack, the "Restart() returns => prov.Status == Restarting" invariant
 // the HTTP handler's event-broker publish depends on (api/handlers.go:
 // RestartLease) is preserved without an off-actor write.

@@ -1326,9 +1326,13 @@ The bounds are nested and aggregate where cardinality matters:
 - `Start` shares the shorter of its caller context and 30 seconds across initial
   identity/connectivity reads, then uses the backend lifecycle context with one
   finite overall crash-recovery budget. Production derives it as the saturating
-  sum of every sequential phase's local maximum (51m10s with defaults), reserving
-  the shared operation-classification and cleanup phase even if every earlier
-  phase consumes its cap. Transitional operations are deferred to periodic
+  sum of the local maxima of its sequential recovery phases (51m10s with
+  defaults), reserving the shared operation-classification and cleanup phase
+  even if every earlier phase consumes its cap. Three steps share that budget
+  without being counted in it: image-helper recovery (capped at 10s) first, the
+  unaccounted managed-volume observation (capped by the storage attestation
+  budget, 30s by default), and the best-effort legacy image-pin backfill last
+  (capped at one startup phase, or whatever remains if that is less). Transitional operations are deferred to periodic
   sweeps, not waited out during startup.
 - Within that overall budget, interrupted-volume recovery uses a fixed
   two-minute child deadline. Its complete clean-inventory proof uses

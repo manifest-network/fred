@@ -248,7 +248,7 @@ traces; never log the authorization header either.
 ### Callback Replay (Backend -> Fred)
 
 Callback timestamps older than 5 minutes are rejected, so an identical signed
-request can be replayed only within the configured freshness window. The
+request can be replayed only within that fixed five-minute window. The
 protocol intentionally has no callback nonce cache because durable backend
 delivery retries the exact request after ambiguous network outcomes. Method and
 complete-URI binding prevent moving a captured signature to another endpoint,

@@ -1100,8 +1100,9 @@ from the reopened coordinator.
 
 Durable `Started` and physical execution are joined by
 `internal/backend/shared/substratemutation`, not by convention. Each settlement
-owns one `Protocol[Subject]`. At backend construction, `NewExecutor` binds that
-protocol exactly once to a narrow substrate facade, one workflow, one strict
+owns one `Protocol[Subject]`. At backend construction, `NewExecutor` (or, for
+operation settlement, `NewFindingExecutor`, whose workflow may also report a
+finding that recovery never sees) binds that protocol exactly once to a narrow substrate facade, one workflow, one strict
 classifier, and the storage-lineage authorizer; no request or recovery caller
 can replace any of them. The journal's exact not-started-to-started CAS returns
 the immutable subject that mints a one-shot `LiveExecution`. Restart recovery
@@ -1113,8 +1114,12 @@ effect and `Runner.Prepare` is reserved for auxiliary work such as pulling an
 image. The runner becomes inert when its single execution returns. Before the
 first Step, failure is a definitive refusal; after any Step is entered, any
 error, panic, cancellation, or storage post-attestation failure is ambiguous.
-Only a wholly successful workflow followed by the construction-bound exhaustive
-classifier can return sealed Ready/Absent/Retained/Destroyed evidence. Terminal
+Only a workflow that returns successfully, followed by the construction-bound
+exhaustive classifier, can return sealed evidence: for an operation, target
+ready, exact absence, failed-receipt absence, or (live only) startup failure;
+for maintenance, target ready, source ready, target divergent, target absent,
+failed-receipt absence, or source failure; for a close, destroyed, retained, or
+incomplete. Terminal
 settlement accepts that execution-bound evidence rather than booleans, IDs, or
 caller-selected status. Raw Docker, Compose, and volume writers exist only as
 constructor inputs and cannot be recovered from `Backend` by an operation
@@ -1151,8 +1156,9 @@ backfill that would change the row is refused while the history holds any
 maintenance row, because re-encoding the history can compact one away. Local Docker
 evidence cannot prove that v0.13's requested highest instance index was not
 already missing, because the old release row omitted desired items. The provider
-therefore remains stopped until the placement preflight exactly compares the
-backend's frozen workload with the height-pinned chain items. Operators must
+therefore remains stopped until the placement preflight compares the backend's
+frozen workload with the height-pinned chain items (a custom domain the backend
+reports empty is accepted against any chain domain). Operators must
 keep the deployed v0.13 SKU mapping, numeric profiles, and Docker
 `container_tmpfs_size_mb` unchanged through that first successful upgraded
 startup.
@@ -1293,8 +1299,11 @@ generation and CAS-deletes that row. Failure returns before teardown; success
 leaves the close intent as the sole durable cleanup and identity owner.
 
 Historical v0.13 release histories can contain the duplicate-Active shape
-written by `RecordMigration`; the decoder retains a narrowly scoped read-only
-normalization for that deployed wire history. This release does not write a
+written by `RecordMigration`. Only the stopped adoption path accepts it: the
+binding transaction rewrites the redundant active rows, and equivalent
+deploying retries after the latest active row, to `superseded` before a current
+store opens the history. The runtime decoder rejects any history with more than
+one active row. This release does not write a
 migration marker or attempt a live single-container-to-Compose conversion.
 Only an already stack-form v0.13 cohort can be adopted: strict inventory and
 the active manifest must prove its complete dense topology before exact items,
@@ -1394,8 +1403,10 @@ no aggregate head. A fixed 100,000-slot limit per backend storage lineage bounds
 the aggregate identity set and head scan. A separate 100,000-entry counter on
 that aggregate is shared by operation and maintenance receipt reservations.
 Each admission reserves its receipt before substrate mutation; settlement turns
-the reservation into its permanent replay row without a second capacity
-decision. Canceling an unstarted maintenance intent releases its unused
+the reservation into its replay row without a second capacity decision. An
+operation's row is permanent. A maintenance receipt leaves the lease's rolling
+window (below) when a newer command evicts it, which releases its
+reservation. Canceling an unstarted maintenance intent releases its unused
 reservation, and successful close releases both receipt classes behind the
 stronger lease-wide tombstone. At either limit, only work needing new capacity
 is definitively refused before side effects; already-reserved transitions
@@ -1415,9 +1426,10 @@ other leases; a stronger handoff wake transfers work when a canceled drainer
 releases ownership. The durable row is the authority, while the periodic
 30-second sweep discovers startup work and retries dormant failed heads. Current outbox rows
 and compact terminal receipts carry a required wire version and reject duplicate,
-unknown, or future-schema fields recursively. The versionless v0.13 decoder is
-confined to the stopped upgrade inspector: current runtime requires
-`pending_callbacks` to be empty and never decodes or replays those rows. An
+unknown, or future-schema fields recursively. Nothing decodes versionless v0.13
+callback rows: the stopped upgrade inspector only counts the rows in
+`pending_callbacks`, and current runtime requires that bucket to be empty and
+never decodes or replays it. An
 unknown top-level `callbacks.db` bucket refuses current startup so a downgrade
 cannot write through future authority. No callback network
 I/O runs inside a lease actor, API handler, or startup recovery. A failure at any
@@ -1427,8 +1439,9 @@ level-triggered recovery pass; no restart has to infer whether teardown happened
 Release histories and retention entries have the same explicit current-row
 boundary: each is wrapped in a `schema_version: 1` envelope and rejects unknown,
 case-aliased, duplicate, future, or trailing data recursively. Their exact
-versionless v0.13 wire shapes are accepted only by the stopped
-`InitializationProfileExisting` adoption transaction, which validates every row
+versionless v0.13 wire shapes are accepted only by stopped-process code: the
+read-only upgrade inspectors decode them, and the
+`InitializationProfileExisting` adoption transaction validates every row
 before rewriting any row or publishing the storage binding. A versionless
 identity-bound shape from an interrupted upgrade of an earlier development build
 is handled only while replaying that same pending marker transaction. Ordinary
@@ -1437,8 +1450,10 @@ reinterpret a versionless authority row as legacy data. Unknown top-level releas
 or retention buckets likewise refuse startup.
 
 Docker recovery deliberately uses lease-isolated evidence rather than one
-fleet-wide substrate snapshot. Under the recovery mutex it first decodes the
-complete maintenance-intent journal, then classifies each row under that lease's
+fleet-wide substrate snapshot. Under the recovery mutex it first removes late
+containers of failed operations and failed maintenance generations that their
+compact receipts authorize, then decodes the complete maintenance-intent
+journal and classifies each row under that lease's
 command fence from its exact Release and a fresh bounded strict Docker
 inventory. A live actor that owns the same `maintenance_id` remains the serial
 owner. Otherwise any recovery error fails that pass (an unreadable or
@@ -1549,7 +1564,9 @@ and requires an explicit checked conversion from an operation identity, and
 `maintenanceid.ID` identifies a caller-issued restart/update command. Their
 representations are private, their zero values are invalid, and construction
 either validates one canonical UUIDv4 spelling or returns cryptographic-random
-generation failure to the caller. Operation and lifecycle UUIDs are also causal
+generation failure to the caller. The one exception is `maintenanceid.Derive`,
+which shapes a digest of single-use authenticated input into a UUIDv4 for a
+keyless restart or update from a tenant allowed legacy keys. Operation and lifecycle UUIDs are also causal
 capabilities: their typed values implement `slog.LogValuer` and `fmt.Formatter`
 with domain-separated, non-reversible fingerprints. Generic structured logging,
 error wrapping, and formatting therefore cannot reveal the canonical token;
@@ -1602,8 +1619,10 @@ instead writes a terminal cancellation, preventing an immortal command from
 deadlocking close. Terminal provider receipts omit payload bytes and retain the
 SHA-256 fingerprint. Each side keeps a rolling window of the lease's 1,024 most
 recent restart and update receipts: admitting a newer command evicts the oldest
-settled one (the backend keeps custom-domain reconciles in a separate window of
-64, and keeps a failed update whose late-container cleanup is unconfirmed).
+settled one. The backend keeps custom-domain reconciles in a separate window of
+64, and never evicts a failed restart, update or custom-domain receipt that
+started an effect until its late-container cleanup is confirmed; when nothing
+in a full window can be evicted, it refuses the new command.
 Ordering does not depend on what is retained. The provider stamps each command
 with its admission time, strictly increasing per lease, and the backend keeps
 the newest stamp it ever accepted for the lease; a command it has no head or
@@ -1746,8 +1765,11 @@ normalized to project ID zero and synced before the final volume is changed; the
 final name remains in place while its contents are removed with
 `internal/fstree`, which bounds descriptors, depth and work however the tenant
 shaped the tree. This lets a restart recognize the exact deletion even if the
-tenant volume's marker was already unlinked. Cleanup re-normalizes and
-re-attests the authority before touching the final tree, requires the final
+tenant volume's marker was already unlinked. Before touching the final tree,
+cleanup re-checks the authority: a retry in the process that already verified
+this exact stage only re-reads its project attributes, and anything else (a
+stage recovered from disk, a replaced directory, or wrong or unreadable
+attributes) is normalized and synced again. Cleanup then requires the final
 name's absence to be parent-synced, and then proves both block and inode usage
 for the encoded project ID are zero. An open-but-unlinked file therefore keeps
 the operation pending. Only after that proof does cleanup clear all block and
@@ -1809,8 +1831,9 @@ drift and fail-stops the backend rather than silently creating a new authority.
 The shared write primitive also distinguishes a
 definitely rolled-back pre-commit rejection from a bbolt `Commit` error. The
 latter may already be durable, so it latches mutation-outcome ambiguity instead
-of retrying against an assumed rollback. Both cases publish the first terminal
-cause into one backend-lifetime authority latch. Every sibling journal consults
+of retrying against an assumed rollback; a pre-commit rejection is returned
+without latching. Identity drift and mutation-outcome ambiguity publish the
+first terminal cause into one backend-lifetime authority latch. Every sibling journal consults
 that latch at its transaction boundaries. Authoritative writes hold the shared
 gate through bbolt `Commit` and post-commit path proof: withdrawal waits for an
 already admitted write to finish, becomes visible before another write can
@@ -1853,9 +1876,11 @@ Tracks which backend serves each lease (bbolt + in-memory cache):
   backend inventory (including each provision's reported provider), and exact
   membership in a signer-free all-state provider query pinned to one block
   height. Retention-only survivors must be present in that chain snapshot too.
-  Because membership mints durable provider authority, the offline tool defaults
-  to certificate-verified gRPC TLS. Only an exact operator attestation for an
-  intentionally local development chain can consume plaintext or skip-verify
+  Because membership mints durable provider authority, the offline tool refuses
+  chain evidence that did not come over certificate-verified gRPC TLS. The
+  `grpc_tls_enabled` key defaults to false, so a provider config must enable it.
+  Only `-confirm-insecure-chain`, an exact operator attestation for an
+  intentionally local development chain, can consume plaintext or skip-verify
   evidence, even when a shared template sets `production_mode: true`; verified
   TLS rejects that stale override. Before collecting any remote proof, mutating
   preflight/repair modes bind the mandatory backup target's physical parent
@@ -1907,8 +1932,11 @@ Tracks which backend serves each lease (bbolt + in-memory cache):
   silence, a different or second reporter, unknown ownership, and ordinary
   conflicts cannot resolve it. Global completeness still gates a new admission
   baseline and empty-backend evidence.
-  Inventory absence never clears an attempt or operator-only quarantine, even
-  after every backend answers
+  Inventory absence alone never clears anything. With an exact terminal chain
+  read (CLOSED, REJECTED, or EXPIRED), a known-candidate conflict, including a
+  sole `untrusted_positive` candidate, is pruned after paired absence from every
+  candidate; an attempt or a conflict with unknown owners never is, even after
+  every backend answers
 - Stores the immutable backend-identity history and the topology-bound admission
   baseline. A later partial sweep attenuates that baseline to a typed scope for
   recordless `PENDING` reconciliation on nodes that answered both inventories.
@@ -1924,10 +1952,15 @@ Tracks which backend serves each lease (bbolt + in-memory cache):
   operator-attested retirement of a backend whose storage is irrecoverably lost
   (`placement-repair -retire-lost-backend -backend <name> -storage-id <id>`; its
   dry run prints the plan, and `-apply` needs the printed `-confirm` value, the
-  exact `-attest-lost` statement and a backup): leases that backend owned become
-  terminal lost placements, rows that only named it as an attempt or conflict
-  candidate forget it, the retired name can never rejoin the topology, and no
-  other name can claim its pinned storage identity
+  exact `-attest-lost` statement and a backup): every lease that backend owned
+  becomes a terminal lost placement, even when a surviving backend also reported
+  a copy; so does a row whose only evidence was an attempt on it, and a conflict
+  left with a single surviving candidate that is not an owner. Rows that only
+  named it as an attempt or conflict candidate otherwise forget it, and a
+  conflict whose remaining candidate is its owner returns to an uncontested row.
+  Rows that are already lost, uninterpretable, or a conflict with unknown owners
+  are left exactly as they are. The retired name can never rejoin the topology, and no other name can
+  claim its pinned storage identity
 - Required in every deployment for write-ahead safety, restore ownership,
   restart recovery, and correct routing. It is backup-critical rather than a
   derived cache: restore it after loss, only while `providerd` is stopped,

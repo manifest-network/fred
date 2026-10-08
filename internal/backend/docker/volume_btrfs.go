@@ -192,8 +192,8 @@ func (b *btrfsVolumeManager) AttestManagedVolume(ctx context.Context, name manag
 // crash in that window leaves an ordinary, structurally attested managed
 // subvolume. Durable operation recovery classifies it and the fatal startup
 // quota gate repairs every claimed live/retained volume before readiness;
-// unclaimed subvolumes are collected as orphans. There is no private create
-// namespace to reject or recover here.
+// nothing collects an unclaimed subvolume automatically. There is no private
+// create namespace to reject or recover here.
 func (b *btrfsVolumeManager) RequireNoInterruptedVolumeMutations(context.Context) error { return nil }
 
 func (b *btrfsVolumeManager) RequireNoUnheldVolumeMutations(context.Context) error { return nil }

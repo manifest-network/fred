@@ -36,7 +36,8 @@
 // # Major components
 //
 //   - internal/backend/shared/leasesm: per-lease actor + state machine
-//     (substrate-agnostic; consumed by every backend, not just Docker)
+//     (substrate-agnostic; Docker is its only consumer today, since the k3s
+//     scaffold deliberately does not use it)
 //   - lease_actor_factory.go, lease_actor_routing.go: factory wiring
 //     Docker dependencies into leasesm.NewLeaseActor, plus Backend-side
 //     routing/dispatch around the actor inbox (b.actors map, routeToLease,
@@ -47,7 +48,7 @@
 //   - internal/backend/shared/workbarrier: per-actor worker reference counter
 //     (used by OnExit to wait for canceled goroutines before completing the
 //     transition)
-//   - provision.go, deprovision.go, restart_update.go: the lifecycle
+//   - provision.go, deprovision.go, restart_update.go, restore.go: the lifecycle
 //     workers that the actor spawns for each long-running operation
 //   - recover.go: state recovery from Docker labels on startup and on each
 //     pass of the backend's own periodic reconcile loop

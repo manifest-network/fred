@@ -2215,8 +2215,10 @@ func (b *Backend) ensureRestoredReleaseStrict(
 	// Release is sufficient ownership authority. Otherwise append only from the
 	// destination snapshot atomically bound into the source retention claim —
 	// never from live state or mutable SKU configuration. This is the crash-safe
-	// bridge when the restore succeeded and its first Release append failed. The
-	// durable successful operation outcome authorizes this branch independently.
+	// bridge when the restore succeeded but its first Release append failed while
+	// the operation was still Pending: the append needs that Pending operation's
+	// sealed release candidate. A Succeeded operation without its Release never
+	// reaches here; recovery planning refuses it.
 	existing, err := b.releaseStore.LatestActive(leaseUUID)
 	if err != nil {
 		return shared.OperationReleaseCommitted{}, fmt.Errorf("read restored active release: %w", err)

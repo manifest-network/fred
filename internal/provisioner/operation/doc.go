@@ -8,6 +8,8 @@
 // capabilities: callers can pass them back to the registry that issued them
 // but cannot manufacture a valid value themselves.
 //
-// All exported types have invalid zero values. In particular, a registry must
-// explicitly issue a TrackerSnapshot even when its mutation revision is zero.
+// All exported capability types have invalid zero values; the one exception is
+// SettlementKind, whose zero value SettlementUnclaimed is a valid record state.
+// In particular, a registry must explicitly issue a TrackerSnapshot even when
+// its mutation revision is zero.
 package operation
