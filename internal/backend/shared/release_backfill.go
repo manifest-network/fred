@@ -95,15 +95,69 @@ func (backfiller *ReleaseBackfiller) BackfillLegacyActiveAuthorityContext(
 	)
 }
 
-// BackfillLegacyRuntimeAuthorityContext freezes the tokenless v0.13 callback
-// principal through the exact callback/release journal pair. It cannot race a
-// phase-qualified lifecycle publication between release re-attestation and
-// callback enqueue because both transitions require this same lease gate.
+// LegacyRuntimeAuthorityFreeze is the only input that can persist a v0.13
+// callback principal. It pairs an observation, the tokenless identity read
+// from a validated surviving cohort, with the exact active release it was made
+// against, and it can exist only while that release has no durable runtime
+// authority. Once recorded, the authority is a fact that nothing re-persists:
+// replaying it against a history that has since gained maintenance rows is
+// what left every maintained v0.13 lease unable to re-provision (ENG-1313).
+// The zero value is invalid.
+type LegacyRuntimeAuthorityFreeze struct {
+	leaseUUID string
+	expected  Release
+	authority LegacyRuntimeAuthority
+}
+
+// FreezeLegacyRuntimeAuthority mints the freeze for an authority observed on
+// the complete cohort of an active, fully backfilled v0.13 release that has no
+// durable runtime authority yet. A release that already carries one is
+// refused: its recorded authority needs no freeze.
+func FreezeLegacyRuntimeAuthority(
+	leaseUUID string,
+	active Release,
+	observed LegacyRuntimeAuthority,
+) (LegacyRuntimeAuthorityFreeze, error) {
+	if leaseUUID == "" {
+		return LegacyRuntimeAuthorityFreeze{}, errors.New("legacy runtime authority freeze requires a lease")
+	}
+	if active.Version <= 0 || active.Status != "active" {
+		return LegacyRuntimeAuthorityFreeze{}, errors.New(
+			"legacy runtime authority freeze must name a positive active version",
+		)
+	}
+	if !active.OperationID.IsZero() || active.RuntimeAuthority != nil {
+		return LegacyRuntimeAuthorityFreeze{}, errors.New("typed release authority cannot be frozen as legacy")
+	}
+	if active.LegacyRuntimeAuthority != nil {
+		return LegacyRuntimeAuthorityFreeze{}, errors.New("legacy runtime authority is already durable")
+	}
+	if len(active.Items) == 0 || len(active.ResourceProfiles) == 0 {
+		return LegacyRuntimeAuthorityFreeze{}, errors.New(
+			"legacy runtime authority freeze requires a fully backfilled v0.13 release",
+		)
+	}
+	if !observed.valid {
+		return LegacyRuntimeAuthorityFreeze{}, errors.New("legacy runtime authority is invalid")
+	}
+	return LegacyRuntimeAuthorityFreeze{
+		leaseUUID: leaseUUID,
+		expected:  cloneRelease(active),
+		authority: observed,
+	}, nil
+}
+
+func (freeze LegacyRuntimeAuthorityFreeze) valid() bool {
+	return freeze.leaseUUID != "" && freeze.authority.valid
+}
+
+// BackfillLegacyRuntimeAuthorityContext persists one frozen tokenless v0.13
+// callback principal through the exact callback/release journal pair. It cannot
+// race a phase-qualified lifecycle publication between release re-attestation
+// and callback enqueue because both transitions require this same lease gate.
 func (backfiller *ReleaseBackfiller) BackfillLegacyRuntimeAuthorityContext(
 	ctx context.Context,
-	leaseUUID string,
-	expected Release,
-	authority LegacyRuntimeAuthority,
+	freeze LegacyRuntimeAuthorityFreeze,
 ) error {
 	if ctx == nil {
 		return errors.New("legacy runtime authority backfill ownership context is required")
@@ -111,7 +165,10 @@ func (backfiller *ReleaseBackfiller) BackfillLegacyRuntimeAuthorityContext(
 	if !backfiller.valid() {
 		return errors.New("legacy runtime authority backfill requires an open journal pair")
 	}
-	unlock, err := backfiller.lockLeaseContext(ctx, leaseUUID)
+	if !freeze.valid() {
+		return errors.New("legacy runtime authority freeze is invalid")
+	}
+	unlock, err := backfiller.lockLeaseContext(ctx, freeze.leaseUUID)
 	if err != nil {
 		return fmt.Errorf("acquire legacy runtime authority backfill: %w", err)
 	}
@@ -119,5 +176,5 @@ func (backfiller *ReleaseBackfiller) BackfillLegacyRuntimeAuthorityContext(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return backfiller.releases.backfillLegacyRuntimeAuthority(leaseUUID, expected, authority)
+	return backfiller.releases.backfillLegacyRuntimeAuthority(freeze)
 }

@@ -70,6 +70,7 @@ func TestAuthorityBearingTypesExposeNoWritableFields(t *testing.T) {
 		ReleaseRuntimeIdentity{},
 		RecoveryLineage{},
 		LegacyRuntimeAuthority{},
+		LegacyRuntimeAuthorityFreeze{},
 		RestoreClaimCandidate{},
 		RestoringRetentionProof{},
 		RestoreSettlement{},

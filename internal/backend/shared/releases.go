@@ -2087,6 +2087,68 @@ func (s *ReleaseStore) List(leaseUUID string) ([]Release, error) {
 	return releases, err
 }
 
+// backfillActiveRelease is the single write path of the backfills, which
+// enrich the existing active release in place. Each supplies its
+// compare-and-swap as apply, which reports whether it changed the row. The
+// order of the maintenance fences is the point of this function:
+//
+//   - An unresolved maintenance target refuses every backfill: the generation
+//     it may activate is not this row.
+//   - apply decides next. Replaying authority that is already durable writes
+//     nothing, so maintenance rows recorded after that authority cannot
+//     refuse the replay (ENG-1313).
+//   - Only a write crosses the all-history fence, because re-encoding the
+//     history may compact a maintenance row away.
+func (s *ReleaseStore) backfillActiveRelease(
+	leaseUUID string,
+	limitBytes int,
+	apply func(active *Release) (changed bool, err error),
+) error {
+	return s.update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(releasesBucketName)
+		if bucket == nil {
+			return errors.New("releases bucket missing")
+		}
+		data := bucket.Get([]byte(leaseUUID))
+		if data == nil {
+			return fmt.Errorf("release history for %s no longer exists", leaseUUID)
+		}
+		releases, err := decodeReleaseHistory(data)
+		if err != nil {
+			return fmt.Errorf("corrupted release data for %s: %w", leaseUUID, err)
+		}
+		if err := validateReleaseHistory(releases); err != nil {
+			return fmt.Errorf("invalid release data for %s: %w", leaseUUID, err)
+		}
+		if err := rejectUnresolvedMaintenanceHistoryMutation(releases); err != nil {
+			return err
+		}
+		activeIndex := latestActiveReleaseIndex(releases)
+		if activeIndex < 0 {
+			return fmt.Errorf("active release for %s no longer exists", leaseUUID)
+		}
+		changed, err := apply(&releases[activeIndex])
+		if err != nil || !changed {
+			return err
+		}
+		if err := rejectRawMaintenanceHistoryMutation(releases); err != nil {
+			return err
+		}
+		if err := validateReleaseHistory(releases); err != nil {
+			return fmt.Errorf("invalid backfilled release data for %s: %w", leaseUUID, err)
+		}
+		encoded, err := compactAndEncodeReleaseHistory(
+			releases,
+			releaseHistoryCapacityCutoff(s.maxAge, time.Now()),
+			limitBytes,
+		)
+		if err != nil {
+			return fmt.Errorf("marshal release backfill for %s: %w", leaseUUID, err)
+		}
+		return bucket.Put([]byte(leaseUUID), encoded)
+	})
+}
+
 // backfillActiveResourceProfiles freezes the current resource authority onto a
 // pre-v0.14 active release. The expected version and items form a compare-and-
 // swap fence: a concurrent update cannot receive profiles belonging to an
@@ -2125,63 +2187,21 @@ func (s *ReleaseStore) backfillActiveResourceProfilesWithinLimit(
 	}
 	durableItems := slices.Clone(items)
 	durableProfiles := CloneSKUResourceSnapshot(resourceProfiles)
-	return s.update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(releasesBucketName)
-		if bucket == nil {
-			return fmt.Errorf("releases bucket missing")
-		}
-		data := bucket.Get([]byte(leaseUUID))
-		if data == nil {
-			return fmt.Errorf("release history for %s no longer exists", leaseUUID)
-		}
-		var releases []Release
-		var err error
-		releases, err = decodeReleaseHistory(data)
-		if err != nil {
-			return fmt.Errorf("corrupted release data for %s: %w", leaseUUID, err)
-		}
-		if err := validateReleaseHistory(releases); err != nil {
-			return fmt.Errorf("invalid release data for %s: %w", leaseUUID, err)
-		}
-		if err := rejectRawMaintenanceHistoryMutation(releases); err != nil {
-			return err
-		}
-		activeIndex := -1
-		for index := len(releases) - 1; index >= 0; index-- {
-			if releases[index].Status == "active" {
-				activeIndex = index
-				break
-			}
-		}
-		if activeIndex < 0 {
-			return fmt.Errorf("active release for %s no longer exists", leaseUUID)
-		}
-		active := &releases[activeIndex]
+	return s.backfillActiveRelease(leaseUUID, limitBytes, func(active *Release) (bool, error) {
 		if active.Version != version || !slices.Equal(active.Items, durableItems) {
-			return fmt.Errorf("active release for %s changed before resource profile backfill", leaseUUID)
+			return false, fmt.Errorf("active release for %s changed before resource profile backfill", leaseUUID)
 		}
 		if len(active.ResourceProfiles) > 0 {
 			if err := ValidateSKUResourceSnapshot(active.Items, active.ResourceProfiles); err != nil {
-				return fmt.Errorf("active release for %s has invalid resource profiles: %w", leaseUUID, err)
+				return false, fmt.Errorf("active release for %s has invalid resource profiles: %w", leaseUUID, err)
 			}
 			if !slices.Equal(active.ResourceProfiles, durableProfiles) {
-				return fmt.Errorf("active release for %s has divergent resource profiles", leaseUUID)
+				return false, fmt.Errorf("active release for %s has divergent resource profiles", leaseUUID)
 			}
-			return nil
+			return false, nil
 		}
 		active.ResourceProfiles = durableProfiles
-		if err := validateReleaseHistory(releases); err != nil {
-			return fmt.Errorf("invalid backfilled release data for %s: %w", leaseUUID, err)
-		}
-		encoded, err := compactAndEncodeReleaseHistory(
-			releases,
-			releaseHistoryCapacityCutoff(s.maxAge, time.Now()),
-			limitBytes,
-		)
-		if err != nil {
-			return fmt.Errorf("marshal release resource profile backfill: %w", err)
-		}
-		return bucket.Put([]byte(leaseUUID), encoded)
+		return true, nil
 	})
 }
 
@@ -2238,117 +2258,47 @@ func (s *ReleaseStore) backfillLegacyActiveAuthorityWithinLimit(
 	expected = cloneRelease(expected)
 	durableItems := slices.Clone(items)
 	durableProfiles := CloneSKUResourceSnapshot(resourceProfiles)
-	return s.update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(releasesBucketName)
-		if bucket == nil {
-			return errors.New("releases bucket missing")
-		}
-		data := bucket.Get([]byte(leaseUUID))
-		if data == nil {
-			return fmt.Errorf("release history for %s no longer exists", leaseUUID)
-		}
-		var releases []Release
-		var err error
-		releases, err = decodeReleaseHistory(data)
-		if err != nil {
-			return fmt.Errorf("corrupted release data for %s: %w", leaseUUID, err)
-		}
-		if err := validateReleaseHistory(releases); err != nil {
-			return fmt.Errorf("invalid release data for %s: %w", leaseUUID, err)
-		}
-		if err := rejectRawMaintenanceHistoryMutation(releases); err != nil {
-			return err
-		}
-		activeIndex := latestActiveReleaseIndex(releases)
-		if activeIndex < 0 {
-			return fmt.Errorf("active release for %s no longer exists", leaseUUID)
-		}
-		active := &releases[activeIndex]
+	return s.backfillActiveRelease(leaseUUID, limitBytes, func(active *Release) (bool, error) {
 		if active.Version != expected.Version || active.Status != expected.Status ||
 			!bytes.Equal(active.Manifest, expected.Manifest) || active.Image != expected.Image ||
 			!active.CreatedAt.Equal(expected.CreatedAt) || active.Error != expected.Error ||
 			active.Reason != expected.Reason || active.Message != expected.Message ||
 			active.OperationID != expected.OperationID {
-			return fmt.Errorf("active release for %s changed before legacy authority backfill", leaseUUID)
+			return false, fmt.Errorf("active release for %s changed before legacy authority backfill", leaseUUID)
 		}
 		if len(active.Items) > 0 || len(active.ResourceProfiles) > 0 {
 			if slices.Equal(active.Items, durableItems) &&
 				slices.Equal(active.ResourceProfiles, durableProfiles) {
-				return nil
+				return false, nil
 			}
-			return fmt.Errorf("active release for %s has divergent backfilled authority", leaseUUID)
+			return false, fmt.Errorf("active release for %s has divergent backfilled authority", leaseUUID)
 		}
 		active.Items = durableItems
 		active.ResourceProfiles = durableProfiles
-		if err := validateReleaseHistory(releases); err != nil {
-			return fmt.Errorf("invalid backfilled release data for %s: %w", leaseUUID, err)
-		}
-		encoded, err := compactAndEncodeReleaseHistory(
-			releases,
-			releaseHistoryCapacityCutoff(s.maxAge, time.Now()),
-			limitBytes,
-		)
-		if err != nil {
-			return fmt.Errorf("marshal legacy active authority backfill: %w", err)
-		}
-		return bucket.Put([]byte(leaseUUID), encoded)
+		return true, nil
 	})
 }
 
 // backfillLegacyRuntimeAuthority CAS-persists the exact tokenless principal
-// and callback pair observed on a validated v0.13 active cohort. Callers must
-// complete whole-cohort validation before invoking this method. Once durable,
-// the authority permits recovery to materialize the same active Release after
-// its last container has been safely removed during a replacement attempt.
+// and callback pair observed on a validated v0.13 active cohort. The freeze
+// carries that observation together with the authority-less release it was
+// made against. Once durable, the authority permits recovery to materialize
+// the same active Release after its last container has been safely removed
+// during a replacement attempt.
 //
 // This intentionally does not manufacture an OperationID: the two authority
 // classes remain disjoint on disk and in the type system.
-func (s *ReleaseStore) backfillLegacyRuntimeAuthority(
-	leaseUUID string,
-	expected Release,
-	authority LegacyRuntimeAuthority,
-) error {
+func (s *ReleaseStore) backfillLegacyRuntimeAuthority(freeze LegacyRuntimeAuthorityFreeze) error {
+	if !freeze.valid() {
+		return errors.New("legacy runtime authority freeze is invalid")
+	}
+	leaseUUID := freeze.leaseUUID
 	if err := s.requireCanonicalLeaseUUID(leaseUUID); err != nil {
 		return err
 	}
-	if expected.Version <= 0 || expected.Status != "active" {
-		return errors.New("legacy runtime authority fence must name a positive active version")
-	}
-	if !expected.OperationID.IsZero() || expected.RuntimeAuthority != nil ||
-		len(expected.Items) == 0 || len(expected.ResourceProfiles) == 0 {
-		return errors.New("legacy runtime authority fence is not a fully backfilled v0.13 release")
-	}
-	if !authority.valid {
-		return errors.New("legacy runtime authority is invalid")
-	}
-	expected = cloneRelease(expected)
-	durableAuthority := authority
-	return s.update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(releasesBucketName)
-		if bucket == nil {
-			return errors.New("releases bucket missing")
-		}
-		data := bucket.Get([]byte(leaseUUID))
-		if data == nil {
-			return fmt.Errorf("release history for %s no longer exists", leaseUUID)
-		}
-		var releases []Release
-		var err error
-		releases, err = decodeReleaseHistory(data)
-		if err != nil {
-			return fmt.Errorf("corrupted release data for %s: %w", leaseUUID, err)
-		}
-		if err := validateReleaseHistory(releases); err != nil {
-			return fmt.Errorf("invalid release data for %s: %w", leaseUUID, err)
-		}
-		if err := rejectRawMaintenanceHistoryMutation(releases); err != nil {
-			return err
-		}
-		activeIndex := latestActiveReleaseIndex(releases)
-		if activeIndex < 0 {
-			return fmt.Errorf("active release for %s no longer exists", leaseUUID)
-		}
-		active := &releases[activeIndex]
+	expected := cloneRelease(freeze.expected)
+	durableAuthority := freeze.authority
+	return s.backfillActiveRelease(leaseUUID, backend.MaxStoredReleaseHistoryBytes, func(active *Release) (bool, error) {
 		if active.Version != expected.Version || active.Status != expected.Status ||
 			!bytes.Equal(active.Manifest, expected.Manifest) || active.Image != expected.Image ||
 			!active.CreatedAt.Equal(expected.CreatedAt) || active.Error != expected.Error ||
@@ -2357,27 +2307,16 @@ func (s *ReleaseStore) backfillLegacyRuntimeAuthority(
 			active.MaintenanceID != expected.MaintenanceID ||
 			!slices.Equal(active.Items, expected.Items) ||
 			!slices.Equal(active.ResourceProfiles, expected.ResourceProfiles) {
-			return fmt.Errorf("active release for %s changed before legacy runtime authority backfill", leaseUUID)
+			return false, fmt.Errorf("active release for %s changed before legacy runtime authority backfill", leaseUUID)
 		}
 		if active.LegacyRuntimeAuthority != nil {
 			if *active.LegacyRuntimeAuthority == durableAuthority {
-				return nil
+				return false, nil
 			}
-			return fmt.Errorf("active release for %s has divergent legacy runtime authority", leaseUUID)
+			return false, fmt.Errorf("active release for %s has divergent legacy runtime authority", leaseUUID)
 		}
 		active.LegacyRuntimeAuthority = &durableAuthority
-		if err := validateReleaseHistory(releases); err != nil {
-			return fmt.Errorf("invalid legacy runtime authority for %s: %w", leaseUUID, err)
-		}
-		encoded, err := compactAndEncodeReleaseHistory(
-			releases,
-			releaseHistoryCapacityCutoff(s.maxAge, time.Now()),
-			backend.MaxStoredReleaseHistoryBytes,
-		)
-		if err != nil {
-			return fmt.Errorf("marshal legacy runtime authority backfill: %w", err)
-		}
-		return bucket.Put([]byte(leaseUUID), encoded)
+		return true, nil
 	})
 }
 

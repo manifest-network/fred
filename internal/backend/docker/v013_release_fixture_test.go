@@ -56,9 +56,9 @@ func seedUpgradedV013ReleaseForBackendTest(
 	backfilled, err := fixture.Store.LatestActive(leaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, backfilled)
-	require.NoError(t, backfiller.BackfillLegacyRuntimeAuthorityContext(
-		context.Background(), leaseUUID, *backfilled, authority,
-	))
+	freeze, err := shared.FreezeLegacyRuntimeAuthority(leaseUUID, *backfilled, authority)
+	require.NoError(t, err)
+	require.NoError(t, backfiller.BackfillLegacyRuntimeAuthorityContext(context.Background(), freeze))
 	upgraded, err := fixture.Store.LatestActive(leaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, upgraded)

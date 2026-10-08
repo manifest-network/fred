@@ -389,15 +389,14 @@ type recoveredOperationReadyPromotion struct {
 }
 
 type recoveredIntentDecision struct {
-	claim             shared.OperationIntentClaim
-	status            backend.CallbackStatus
-	errMsg            string
-	readyProjection   *recoveredOperationReadyPromotion
-	allocationIDs     []string
-	legacyPredecessor *shared.Release
-	legacyAuthority   *shared.LegacyRuntimeAuthority
-	projection        recoveredFailureProjection
-	failureOutcome    shared.OperationExecutionFailure
+	claim           shared.OperationIntentClaim
+	status          backend.CallbackStatus
+	errMsg          string
+	readyProjection *recoveredOperationReadyPromotion
+	allocationIDs   []string
+	legacyFreeze    *shared.LegacyRuntimeAuthorityFreeze
+	projection      recoveredFailureProjection
+	failureOutcome  shared.OperationExecutionFailure
 }
 
 // recoveredFailureProjection is what settling one recovered operation failure
@@ -462,8 +461,9 @@ type operationIntentSubstrate struct {
 	currentIDs        []string
 	serviceContainers map[string][]string
 	stackManifest     *manifest.StackManifest
-	legacyPredecessor *shared.Release
-	legacyAuthority   *shared.LegacyRuntimeAuthority
+	// legacyFreeze is set only when this observation found a v0.13
+	// predecessor whose callback principal is not yet durable.
+	legacyFreeze *shared.LegacyRuntimeAuthorityFreeze
 }
 
 // classifiedOperationIntent is one durable operation together with the latest
@@ -834,8 +834,7 @@ func (b *Backend) recoverOperationIntentClaims(
 				stackManifest:     classification.stackManifest,
 			}
 		}
-		decision.legacyPredecessor = classification.legacyPredecessor
-		decision.legacyAuthority = classification.legacyAuthority
+		decision.legacyFreeze = classification.legacyFreeze
 		if decision.projection == recoveredFailureRebuildsProjection &&
 			claim.Kind() == shared.OperationIntentProvision &&
 			classification.status == backend.CallbackStatusFailed {
@@ -874,17 +873,11 @@ func (b *Backend) recoverOperationIntentClaims(
 	// The CAS is durable but non-destructive; a failure leaves every operation
 	// intent and substrate object untouched for a later startup retry.
 	for _, decision := range decisions {
-		if decision.legacyAuthority == nil {
+		if decision.legacyFreeze == nil {
 			continue
 		}
-		if decision.legacyPredecessor == nil {
-			return fmt.Errorf("legacy predecessor authority for lease %q has no release fence",
-				decision.claim.LeaseUUID())
-		}
 		if err := b.releaseBackfiller.BackfillLegacyRuntimeAuthorityContext(
-			ctx, decision.claim.LeaseUUID(),
-			*decision.legacyPredecessor,
-			*decision.legacyAuthority,
+			ctx, *decision.legacyFreeze,
 		); err != nil {
 			return fmt.Errorf("persist legacy predecessor runtime authority for lease %q: %w",
 				decision.claim.LeaseUUID(), err)
@@ -1640,7 +1633,7 @@ func (b *Backend) classifyProvisionIntentSubstrate(
 		}
 		return classification, nil
 	}
-	predecessorIDs, legacyAuthority, err := b.validatePredecessorProvisionSubset(
+	predecessorIDs, legacyFreeze, err := b.validatePredecessorProvisionSubset(
 		ctx, claim, predecessor, older,
 	)
 	if err != nil {
@@ -1650,20 +1643,21 @@ func (b *Backend) classifyProvisionIntentSubstrate(
 	classification.errMsg = interruptedOperationFailure
 	classification.hasCurrent = len(current) != 0
 	classification.currentIDs = append(classification.currentIDs, predecessorIDs...)
-	if legacyAuthority != nil {
-		predecessorCopy := *predecessor
-		classification.legacyPredecessor = &predecessorCopy
-		classification.legacyAuthority = legacyAuthority
-	}
+	classification.legacyFreeze = legacyFreeze
 	return classification, nil
 }
 
+// validatePredecessorProvisionSubset proves every listed survivor belongs to the
+// exact predecessor release. A v0.13 predecessor whose callback principal is
+// not durable yet also yields the freeze that must persist it before teardown
+// erases the last witness; a recorded principal is the fact the survivors were
+// just validated against, so it yields none.
 func (b *Backend) validatePredecessorProvisionSubset(
 	ctx context.Context,
 	claim shared.OperationIntentClaim,
 	release *shared.Release,
 	listed []ContainerInfo,
-) ([]string, *shared.LegacyRuntimeAuthority, error) {
+) ([]string, *shared.LegacyRuntimeAuthorityFreeze, error) {
 	if release == nil {
 		return nil, nil, errors.New("predecessor active release is absent")
 	}
@@ -1788,19 +1782,23 @@ func (b *Backend) validatePredecessorProvisionSubset(
 		seen[key] = struct{}{}
 		ids = append(ids, summary.ContainerID)
 	}
-	if legacy && legacyAuthority == nil {
-		frozen, freezeErr := shared.NewLegacyRuntimeAuthority(
-			claim.Tenant(),
-			claim.ProviderUUID(),
-			legacyCallbackURL,
-			legacyLifecycleCallbackURL,
-		)
-		if freezeErr != nil {
-			return nil, nil, fmt.Errorf("freeze legacy predecessor runtime authority: %w", freezeErr)
-		}
-		legacyAuthority = &frozen
+	if !legacy || legacyAuthority != nil {
+		return ids, nil, nil
 	}
-	return ids, legacyAuthority, nil
+	observed, freezeErr := shared.NewLegacyRuntimeAuthority(
+		claim.Tenant(),
+		claim.ProviderUUID(),
+		legacyCallbackURL,
+		legacyLifecycleCallbackURL,
+	)
+	if freezeErr != nil {
+		return nil, nil, fmt.Errorf("freeze legacy predecessor runtime authority: %w", freezeErr)
+	}
+	freeze, freezeErr := shared.FreezeLegacyRuntimeAuthority(claim.LeaseUUID(), *release, observed)
+	if freezeErr != nil {
+		return nil, nil, fmt.Errorf("freeze legacy predecessor runtime authority: %w", freezeErr)
+	}
+	return ids, &freeze, nil
 }
 
 // operationIntentHasCommittedRelease recognizes the durable success boundary
