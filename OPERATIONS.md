@@ -2458,9 +2458,19 @@ Treat either case as an evidence-preservation incident:
 4. Select or reconstruct the exact provider-bound authority only from that
    evidence and a known-good stopped-process or atomic filesystem snapshot, or
    a complete online snapshot set from `placement_snapshot_dir` (DEPLOYMENT.md,
-   "Online snapshots"). Keep every rejected candidate. Restart once, against
-   the chosen file at the configured path, then require clean `placement_store` and
-   `placement_inventory` checks before reopening ingress.
+   "Online snapshots"). Keep every rejected candidate. Unless the chosen file is
+   the inode `providerd` itself had open when authority was withdrawn, it is
+   older than that authority: install `payloads.db` from the same moment and
+   attest the chosen file with `placement-repair -attest-restored-backup`
+   before the restart; its `-apply` is needed only when the dry run reports
+   `required: true` ([Restoring an older placement backup](DEPLOYMENT.md#restoring-an-older-placement-backup)).
+   Startup cannot tell an older copy from the current one, and an unattested
+   copy can provision a lease dispatched after it was taken a second time.
+5. Restart once, against the chosen file at the configured path, then require
+   clean `placement_store` and `placement_inventory` checks before reopening
+   ingress. After an attestation, `placement_inventory` stays not ready until
+   one sweep in which every configured backend answers both inventory
+   endpoints.
 
 Never copy, overwrite, unlink, rename, or restore the live pathname underneath
 `providerd`. A backup taken while it runs must be an atomic filesystem snapshot
@@ -2487,45 +2497,59 @@ means the new database was published before a later check failed, so do not
 rerun the initializer; `OUTCOME UNKNOWN` means the commit result cannot be
 inferred. Never retry any of those classifications with the same backup path.
 
-### A logically corrupt placement row
+### A placement row blocks a backend roster change
 
-If `providerd` startup reports `lease "<key>" has uninterpretable durable
-placement`, the bbolt file opened successfully but that exact placement value
-cannot prove which backend may own, retain, or still be attempting the lease.
-The startup error quotes the exact bucket key and the decode reason; raw value
-bytes are deliberately not logged. This is different from a structurally
-unreadable bbolt file, and repeated restarts cannot repair it.
+If `providerd` startup fails with `placement backend topology is still in use:
+lease "<key>" has uninterpretable durable placement: <reason>`, the configured
+backend roster differs from the one stored in the placement database, and that
+row cannot prove which backends it names. Startup checks every row against the
+roster only when the roster changes: a backend added, removed or renamed. With
+the stored roster, the same row loads quarantined and startup proceeds. Restarting with the changed roster fails the same way every time.
 
-Do not bypass the topology check, silently discard the row, or immediately
-replace the whole placement database. Any of those can erase the only evidence
-of a delayed backend call or retained tenant data. Recover it as follows:
+The `<reason>` says which kind of row it is:
 
-1. Stop `providerd` and take a byte-for-byte backup of the database before
-   inspecting or changing it.
-2. Record the quoted key and decode reason. Check that lease on chain and query
-   `/provisions` and `/retentions` on every configured backend plus every
-   historical backend that could have owned it. `placement-repair -inspect`
-   always emits `untrusted_positive`: `true` means the candidate set came from
-   positive membership in a rejected inventory response, not an authoritative
-   owner. A sole such candidate can regain its owner from a later matching
-   trusted reporter with paired, identity-valid coverage of every configured
-   backend and absence on every peer. An unrelated lease's ambiguity does not
-   block this proof. Separately, a fully known candidate set can be pruned by
-   reconciliation after exact dual-endpoint absence from every candidate plus
-   chain-terminal proof, with no unresolved attempt, maintenance, or restore
-   claim and with the current revision protected by lease exclusion. Unknown
-   owners, missing evidence, and chain absence do not authorize pruning.
-3. Prefer restoring a known-good stopped-process backup or a complete online
-   snapshot set from `placement_snapshot_dir`, verified against its manifest
-   (DEPLOYMENT.md, "Online snapshots"); either way, attest the restored copy
-   with `placement-repair -attest-restored-backup` before the first start. If
-   no backup exists, preserve the row and escalate for operator repair unless
-   the collected evidence explicitly proves that it represents no owner,
-   retained data, or unresolved attempt.
-4. Only with that proof, remove the one quoted key using reviewed offline bbolt
-   tooling; never edit the live database. Restart with the unchanged backend
-   identities and require a complete inventory projection before reopening
-   tenant lifecycle ingress.
+- `record failed placement decoding or structural validation`: the value is
+  corrupt, or names no backend, attempt or conflict. When it opens the
+  database, providerd logs a WARN for the key: `placement: loaded unparseable
+  record` with the decode error, or `placement: loaded record with no backend
+  or attempt`.
+- `conflict owner set is unknown`: a conflict whose owner set is unknown, or a
+  conflict with only one candidate. A single candidate whose `untrusted_positive`
+  is `true` is a valid quarantine, not corruption; the roster check misreads it
+  (tracked in ENG-1119).
+- `empty record`: the value is empty.
+
+Do not bypass the topology check, silently discard the row, or replace the whole
+placement database. Any of those can erase the only evidence of a delayed
+backend call or retained tenant data. A backup is no fix either: it loses
+everything placed after it was taken, and it usually holds the same row.
+Recover it as follows:
+
+1. Start `providerd` with the stored roster: undo the configuration change and
+   keep it until the row is resolved. Existing leases run; the row stays
+   quarantined.
+2. Resolve the row. Check that lease on chain and query `/provisions` and
+   `/retentions` on every configured backend plus every historical backend that
+   could have owned it. To read the row, stop `providerd` (the tool takes the
+   database lock), run `placement-repair -inspect -lease <key>`, and start
+   `providerd` again with the stored roster. The row's
+   `untrusted_positive`: `true` means the candidate set came from positive
+   membership in a rejected inventory response, not an authoritative owner. A
+   sole such candidate regains its owner from a later matching trusted reporter
+   with paired, identity-valid coverage of every configured backend and absence
+   on every peer. An unrelated lease's ambiguity does not block this proof.
+   Separately, a fully known candidate set can be pruned by reconciliation after
+   exact dual-endpoint absence from every candidate plus chain-terminal proof,
+   with no unresolved attempt, maintenance, or restore claim and with the current
+   revision protected by lease exclusion. Unknown owners, missing evidence, and
+   chain absence do not authorize pruning.
+3. If the row cannot resolve itself and the collected evidence explicitly proves
+   that it represents no owner, retained data, or unresolved attempt, stop
+   `providerd`, take a byte-for-byte backup of the database, and remove the one
+   quoted key using reviewed offline bbolt tooling; never edit the live
+   database. Without that proof, preserve the row and escalate.
+4. Apply the roster change again once the row is gone or resolved, and require a
+   complete inventory projection before reopening tenant lifecycle ingress.
 
 Moving the entire placement database aside is a last resort that also loses
 attempts, conflict candidates, backend identity history, and the durable admission
@@ -2535,12 +2559,21 @@ its absence-invisible safety facts.
 
 ### A structurally unreadable bbolt file
 
-**If a bbolt file is structurally corrupted** (file lock errors, bbolt panic on
-open, or known bad magic):
+**A lock timeout is not corruption.** Every Fred bbolt open waits a few
+seconds for bbolt's exclusive file lock and then fails with bbolt's `timeout`
+error; the offline placement tools report a lock error ending in `(is
+providerd still running?)`. Another process still holds the file: a second
+`providerd` or `docker-backend`, or a placement tool. Find and stop that
+process, then start again. Never move or replace a locked file: the process
+holding it keeps writing to the moved inode, and the copy you restore is older.
+
+**If a bbolt file is structurally corrupted** while no other process holds it
+(bbolt panic on open, an `invalid database` or checksum error, or known bad
+magic):
 
 1. **Stop the service**.
 2. **Move the file aside** rather than deleting (`mv X.db X.db.broken`) so you can inspect it later if needed.
-3. **Restore the file according to its authority class before restarting.** Some caches may be recreated, but release/retention/callback state should be restored whenever possible.
+3. **Restore the file according to its authority class before restarting.** Some caches may be recreated. docker-backend's callback, release and retention stores are not caches: it refuses to start with any of them missing, so restore each one from a stopped-process or atomic filesystem snapshot.
 4. **For `placement_store_db_path`, restore the exact provider-bound database before starting providerd.** Normal startup never creates, initializes, or migrates a missing/unprepared file. Current chain/backend silence cannot recover a lost authority: if the provider has any chain lease history, including terminal history, restore the database. The explicit fresh initializer is only for a genuinely new provider with zero total lease history, and additionally requires an independently supplied exact fleet roster, complete identity-consistent empty provision and retention inventories from every configured backend, and continuous fencing of providerd plus tenant/chain mutation ingress. Each backend stays running so the tool can authenticate its inventories, but must be empty and drained with no in-flight mutation and an idle callback/outbox queue. Its print-time acknowledgement binds the target parent's physical device/inode; do not rename, unmount, or recreate that parent between print and initialize. Publication is descriptor-relative and no-overwrite. Follow [Initializing a genuinely fresh placement authority](DEPLOYMENT.md#initializing-a-genuinely-fresh-placement-authority) for that first-boot workflow. A restored placement database is older than the one it replaces: run `placement-repair -attest-restored-backup` on it before starting providerd ([Restoring an older placement backup](DEPLOYMENT.md#restoring-an-older-placement-backup)), or a lease dispatched after the backup can be provisioned twice. A complete online snapshot set from `placement_snapshot_dir` holds both databases from one moment; verify it against its manifest before installing it ([Online snapshots](DEPLOYMENT.md#online-snapshots)), then attest it the same way. Restore the payload store from the same moment as the placement database: without it, ACTIVE leases that need re-provisioning stay deferred, because tenants can re-upload only a PENDING lease's original manifest. The token tracker may start empty (acceptable, see above); restore each backend callback store whenever any exact delivery could remain.
 
 Never run two `providerd` or `docker-backend` instances against the same bbolt files — bbolt enforces single-writer with a file lock and the second process will fail to start. If it doesn't fail, you have data corruption coming.

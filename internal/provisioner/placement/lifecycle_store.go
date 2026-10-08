@@ -32,9 +32,12 @@ const (
 	LifecycleVerdictLegacy
 	LifecycleVerdictStale
 	LifecycleVerdictUnusable
-	// LifecycleVerdictTeardownOnly means the placement has been deleted but its
-	// exact current capability is deliberately retained long enough to consume
-	// one delayed terminal deprovision observation. It grants no runtime status
+	// LifecycleVerdictTeardownOnly means the capability's backend is no longer
+	// the lease's runtime owner (the placement was deleted, holds only an
+	// attempt, or is owned by another backend), so its exact current capability
+	// is retained only long enough to consume one delayed terminal deprovision
+	// observation. CurrentLifecycle also reports it while an attempt is
+	// unresolved. It grants no runtime status
 	// publication and cannot be reissued for maintenance.
 	LifecycleVerdictTeardownOnly
 	LifecycleVerdictAuthorized

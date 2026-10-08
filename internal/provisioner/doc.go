@@ -23,8 +23,10 @@
 // ExecutionCoordinator; no backend-only intermediate is published.
 // Purpose-specific placement coordinators then own complete provision, restore,
 // maintenance, callback, timeout, and reconciliation sequences. After
-// composition, Manager retains operation.RuntimeController, which can observe and drain work
-// but cannot claim, initiate, route, dispatch, or settle it.
+// composition, Manager retains operation.RuntimeController, which can observe
+// and drain work but cannot claim, initiate, route, dispatch, or settle it, and
+// the ExecutionCoordinator, from which it mints the restore, maintenance, and
+// reconciliation coordinators that cmd/providerd wires after construction.
 //
 // The placement store is the durable authority for write-ahead attempts,
 // confirmed owners, conflict quarantine, and inventory revisions. Consumer ports
@@ -44,8 +46,9 @@
 //	TopicPayloadReceived  - Tenant uploaded payload, start provisioning
 //	TopicLeaseEvent       - Real-time lease status events for WebSocket delivery
 //
-// TopicBackendCallback remains only for the legacy message-shaped adapter;
-// production callbacks are not published through Watermill.
+// Backend callbacks are not published through Watermill: they are applied
+// synchronously by HandleBackendCallbackEvidence, and TopicBackendCallback
+// survives only as that handler's metrics label.
 //
 // # Acknowledgment Batching
 //
@@ -66,8 +69,10 @@
 // configured immutable backend identities. That baseline survives restart and
 // transient incomplete sweeps. Each later sweep attenuates it to a typed scope
 // containing only backends that answered both inventories; only genuinely new
-// recordless PENDING reconciliation may use that scope. Recordless ACTIVE work,
-// work pinned to a silent owner, attempts, and conflicts remain deferred.
+// recordless PENDING reconciliation may use that scope. In such a partial sweep,
+// recordless ACTIVE work, work pinned to a silent owner, attempts, and conflicts
+// remain deferred. A complete sweep has heard every backend and may re-provision
+// a recordless ACTIVE lease that every backend reports absent.
 //
 // The tenant event path has no per-sweep witness. It requires the same durable
 // topology baseline, live-routes within the configured topology, and persists an
@@ -87,11 +92,13 @@
 // process loss, not edge events that can be replayed reliably.
 //
 // Tokenless v0.13 compatibility exists only at explicit migration and callback
-// boundaries. Offline adoption may preserve an already-distributed tokenless
-// route as LegacyRuntimeAuthority, and authenticated callback ingress may observe
-// it only for the matching migrated owner. New provision/restore authority uses
-// distinct typed operation and lifecycle UUIDv4 identities, while every new
-// maintenance command has its own typed UUIDv4 identity. Ordinary runtime code
+// boundaries. The offline placement preparation writes an already-distributed
+// tokenless route as a legacy lifecycle capability, and authenticated callback
+// ingress may observe it only for the matching migrated owner. (The backend
+// keeps its own side of that route as a LegacyRuntimeAuthority in releases.db.)
+// New provision/restore authority uses one UUIDv4 under two distinct types: the
+// operation ID and the lifecycle ID derived from it, while every new maintenance
+// command has its own typed UUIDv4 identity. Ordinary runtime code
 // never mints tokenless authority; maintenance on a legacy owner can only
 // preserve the already-adopted legacy authority class.
 //
@@ -136,8 +143,10 @@
 // reports a supported live or terminal state.
 // A positive report from another backend is unioned with every existing owner
 // and attempt into durable conflict quarantine. Complete or partial inventory
-// silence never clears an ambiguous attempt or conflict: an old request can
-// commit after the list response. Exact same-operation redelivery, the exact
+// silence alone never clears an ambiguous attempt or conflict: an old request
+// can commit after the list response. A conflict with known candidates is
+// pruned only after paired absence from every candidate plus an exact terminal
+// chain read; an attempt never is. Exact same-operation redelivery, the exact
 // callback, matching paired-generation inventory, a contract-conforming
 // refusal trusted under the configured backend transport, or explicit operator
 // proof may settle an attempt. This makes timeout, panic, transport failure, generic

@@ -7,7 +7,8 @@
 // is positively observed exiting. Every other failure is recorded with a cause
 // that never counts: a death after an observed operator or daemon signal, a
 // container that is gone (removing, dead or absent), a platform or maintenance
-// failure, and anything unclassified.
+// failure, a startup whose health check never passed (Unhealthy), and anything
+// unclassified.
 //
 // This mirrors the Kubernetes Job podFailurePolicy split (KEP-3329), which
 // keeps infrastructure disruptions out of backoffLimit. KEP-3329 also found

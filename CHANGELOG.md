@@ -1174,6 +1174,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Three OPERATIONS.md runbooks could lose placement data.
+  - "A structurally unreadable bbolt file" listed lock errors as corruption. A
+    lock timeout means another process still holds the file: stop that process
+    and never move the file aside.
+  - "Placement runtime authority was withdrawn" restarted on an older copy
+    without `placement-repair -attest-restored-backup`, which risks provisioning
+    a lease twice. It now attests the copy and restores `payloads.db` from the
+    same moment.
+  - The `uninterpretable durable placement` startup error appears only when the
+    backend roster changes. Its runbook now starts by restoring the stored
+    roster instead of a backup.
+
+  The architecture, backend-guide and package docs for placement, callbacks,
+  receipts and journals were corrected to match the code.
 - A lease adopted from v0.13 is re-provisioned after its container dies, even
   if it was restarted, updated or given a custom domain before. Any of these,
   failed or successful, adds a maintenance release to the lease's history, and

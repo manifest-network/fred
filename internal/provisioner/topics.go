@@ -53,7 +53,7 @@ const (
 	TopicLeaseCreated    = "events.lease.created"
 	TopicLeaseClosed     = "events.lease.closed"
 	TopicLeaseExpired    = "events.lease.expired"
-	TopicBackendCallback = "events.backend.callback" // legacy message-adapter label
+	TopicBackendCallback = "events.backend.callback" // metrics label for synchronous callback application
 	TopicPayloadReceived = "events.payload.received"
 	TopicLeaseEvent      = "events.lease.event"
 )
