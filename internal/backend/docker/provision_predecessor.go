@@ -137,7 +137,11 @@ func (b *Backend) prepareProvisionPredecessor(ctx context.Context, request provi
 	if b.releaseBackfiller == nil {
 		return fmt.Errorf("legacy provision admission requires the release backfiller")
 	}
-	if err := b.releaseBackfiller.BackfillLegacyRuntimeAuthorityContext(inventoryCtx, request.LeaseUUID, *active, authority); err != nil {
+	freeze, err := shared.FreezeLegacyRuntimeAuthority(request.LeaseUUID, *active, authority)
+	if err != nil {
+		return fmt.Errorf("%w: freeze legacy provision admission predecessor: %w", backend.ErrInvalidState, err)
+	}
+	if err := b.releaseBackfiller.BackfillLegacyRuntimeAuthorityContext(inventoryCtx, freeze); err != nil {
 		return fmt.Errorf("freeze legacy provision admission predecessor: %w", err)
 	}
 	return nil

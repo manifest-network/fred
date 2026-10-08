@@ -518,7 +518,7 @@ func TestJournalPairConstructionRejectsClosedStores(t *testing.T) {
 		_, err = NewReleaseBackfiller(fixture.stores.callbacks, fixture.stores.releases)
 		require.ErrorContains(t, err, "exact identity-bound")
 		require.ErrorContains(t, backfiller.BackfillLegacyRuntimeAuthorityContext(
-			context.Background(), testLeaseUUID("closed-release-backfiller"), Release{}, LegacyRuntimeAuthority{},
+			context.Background(), LegacyRuntimeAuthorityFreeze{},
 		), "open journal pair")
 	})
 }

@@ -385,18 +385,10 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 				"failed provision predecessor changed during read-only validation",
 			))
 		}
-		if classification.legacyAuthority != nil {
-			if classification.legacyPredecessor == nil || b.releaseStore == nil {
-				return b.latchAmbiguousOperationOutcome(
-					"persist replacement provision predecessor authority",
-					errors.New("legacy predecessor classification has no durable release store fence"),
-				)
-			}
+		if classification.legacyFreeze != nil {
 			backfillCtx, cancelBackfill := b.recoveryDockerReadContext(b.stopCtx)
 			persistErr := b.releaseBackfiller.BackfillLegacyRuntimeAuthorityContext(
-				backfillCtx, req.LeaseUUID,
-				*classification.legacyPredecessor,
-				*classification.legacyAuthority,
+				backfillCtx, *classification.legacyFreeze,
 			)
 			cancelBackfill()
 			if persistErr != nil {

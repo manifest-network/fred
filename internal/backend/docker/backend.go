@@ -136,7 +136,7 @@ type operationSettlementService interface {
 type releaseBackfillService interface {
 	BackfillActiveResourceProfilesContext(context.Context, string, int, []backend.LeaseItem, []shared.SKUResourceSnapshot) error
 	BackfillLegacyActiveAuthorityContext(context.Context, string, shared.Release, []backend.LeaseItem, []shared.SKUResourceSnapshot) error
-	BackfillLegacyRuntimeAuthorityContext(context.Context, string, shared.Release, shared.LegacyRuntimeAuthority) error
+	BackfillLegacyRuntimeAuthorityContext(context.Context, shared.LegacyRuntimeAuthorityFreeze) error
 }
 
 // callbackPublicationService is the semantic publication boundary consumed by

@@ -70,9 +70,9 @@ func TestMaintenanceRecoveryProjectionAcceptsLegacyRuntimeAuthority(t *testing.T
 	backfilled, err := releases.LatestActive(leaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, backfilled)
-	require.NoError(t, backfiller.BackfillLegacyRuntimeAuthorityContext(
-		context.Background(), leaseUUID, *backfilled, oldAuthority,
-	))
+	freeze, err := shared.FreezeLegacyRuntimeAuthority(leaseUUID, *backfilled, oldAuthority)
+	require.NoError(t, err)
+	require.NoError(t, backfiller.BackfillLegacyRuntimeAuthorityContext(context.Background(), freeze))
 	settlement, err := shared.NewMaintenanceSettlement(callbacks, releases)
 	require.NoError(t, err)
 	active, sourceClaim, err := settlement.ClaimLatestActive(leaseUUID)

@@ -901,8 +901,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 						return fmt.Errorf("freeze v0.13 runtime authority for lease %q: %w",
 							leaseUUID, authorityErr)
 					}
+					freeze, freezeErr := shared.FreezeLegacyRuntimeAuthority(leaseUUID, *release, legacyAuthority)
+					if freezeErr != nil {
+						return fmt.Errorf("freeze v0.13 runtime authority for lease %q: %w",
+							leaseUUID, freezeErr)
+					}
 					if backfillErr := b.releaseBackfiller.BackfillLegacyRuntimeAuthorityContext(
-						ctx, leaseUUID, *release, legacyAuthority,
+						ctx, freeze,
 					); backfillErr != nil {
 						return fmt.Errorf("persist v0.13 runtime authority for lease %q: %w",
 							leaseUUID, backfillErr)

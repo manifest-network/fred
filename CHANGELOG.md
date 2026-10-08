@@ -1174,6 +1174,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A lease adopted from v0.13 is re-provisioned after its container dies, even
+  if it was restarted, updated or given a custom domain before. Any of these,
+  failed or successful, adds a maintenance release to the lease's history, and
+  every re-provision after that was refused before acceptance with
+  `persist failed provision predecessor runtime authority: maintenance release
+  requires exact claim`: the lease stayed Failed, and billed, until the tenant
+  closed it. Each re-provision recorded the lease's v0.13 callback authority
+  again although it was already recorded, and the release journal refused that
+  backfill because the history held a maintenance release, even though it
+  would change nothing. The authority is now recorded only while the release
+  has none, and a backfill that changes nothing is never refused. Leases
+  already in this state re-provision at providerd's next reconcile pass after
+  the upgrade; no repair is needed. Leases provisioned or re-provisioned since
+  the upgrade were not affected. (ENG-1313)
 - A lease adopted from v0.13 can be restarted, updated and given a custom
   domain. Its first restart or update failed about a second after it was
   accepted, with `RestartFailed` or `UpdateFailed`, and left the lease on its
