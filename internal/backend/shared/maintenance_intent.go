@@ -1454,11 +1454,11 @@ func (s *CallbackStore) requireCurrentMaintenanceClaim(claim MaintenanceIntentCl
 
 // rejectPendingMaintenanceCompletionTx prevents a newer replacement from
 // overtaking the subscriber-visible result of an older one. Maintenance
-// completions use the lease's stable lifecycle route, so the provider cannot
-// distinguish generations from the wire payload. Requiring the older durable
-// completion to receive a synchronous 2xx and be precisely removed before a
-// successor is admitted preserves subscriber order without changing the
-// callback protocol.
+// completions use the lease's stable lifecycle route. They carry maintenance_id
+// and maintenance_admitted_at, so the provider settles an exact update command,
+// but it publishes each completion's result to subscribers in arrival order. Requiring
+// the older durable completion to receive a synchronous 2xx and be precisely
+// removed before a successor is admitted preserves that order.
 //
 // BeginMaintenanceIntent calls this in the same bbolt transaction and under
 // the same per-lease journal-mutation lock as intent publication. Resolution of

@@ -7,14 +7,17 @@
 //
 // # Architecture overview (for developers)
 //
-// The package is organized around a single concurrency primitive: the
-// per-lease actor. Every active lease owns one goroutine that serializes
-// all state-mutating operations for that lease through a stateless state
+// The package is organized around one main concurrency primitive: the
+// per-lease actor. A lease's actor is created on its first message and
+// serializes that lease's lifecycle commands through a stateless state
 // machine. The actor and SM implementations are substrate-agnostic and
 // live in internal/backend/shared/leasesm; this package supplies the
 // Docker-specific seams via the closure-builder factory in
-// lease_actor_factory.go. All Docker calls happen outside any shared
-// mutex; linearization comes from the actor's inbox.
+// lease_actor_factory.go. Some work is serialized differently: recoverState
+// holds the recovery mutexes across its Docker inventory read, tenant
+// networks and managed volumes are created under per-tenant and per-volume
+// stripe locks, and operation-intent and maintenance recovery replace lease
+// projections directly instead of through an actor.
 //
 // The actor model is what gives the backend its key properties:
 //
@@ -23,13 +26,18 @@
 //     cancels the in-flight worker via OnExit and transitions cleanly
 //   - Blast-radius-contained panics — recover() in each handler keeps
 //     unrelated leases unaffected
-//   - One terminal callback per lease — emission lives only in SM entry
-//     actions, never in worker goroutines
+//   - One durable terminal result per operation — each result is committed
+//     together with its outbox entry in one bbolt transaction under the
+//     per-lease journal gate: operation and maintenance results through
+//     shared.CallbackPublisher, whether they come from an SM entry action,
+//     admission, recovery or maintenance settlement, and close results through
+//     shared.CloseSettlement. Delivery then replays until acknowledged
 //
 // # Major components
 //
 //   - internal/backend/shared/leasesm: per-lease actor + state machine
-//     (substrate-agnostic; consumed by every backend, not just Docker)
+//     (substrate-agnostic; Docker is its only consumer today, since the k3s
+//     scaffold deliberately does not use it)
 //   - lease_actor_factory.go, lease_actor_routing.go: factory wiring
 //     Docker dependencies into leasesm.NewLeaseActor, plus Backend-side
 //     routing/dispatch around the actor inbox (b.actors map, routeToLease,
@@ -40,10 +48,10 @@
 //   - internal/backend/shared/workbarrier: per-actor worker reference counter
 //     (used by OnExit to wait for canceled goroutines before completing the
 //     transition)
-//   - provision.go, deprovision.go, restart_update.go: the lifecycle
+//   - provision.go, deprovision.go, restart_update.go, restore.go: the lifecycle
 //     workers that the actor spawns for each long-running operation
-//   - recover.go: state recovery from Docker labels on startup and during
-//     each reconciliation cycle (via RefreshState)
+//   - recover.go: state recovery from Docker labels on startup and on each
+//     pass of the backend's own periodic reconcile loop
 //   - compose.go, compose_project.go: Compose-based stack provisioning
 //   - reconcile_custom_domain.go: Traefik label sync for tenant custom domains
 //   - volume.go (+ volume_btrfs.go, volume_xfs.go, volume_zfs.go):

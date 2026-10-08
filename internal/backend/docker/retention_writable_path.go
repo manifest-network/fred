@@ -25,9 +25,10 @@ import "os"
 // The "a stateful volume always has its VOLUME subdir under the root" invariant
 // holds because buildStatefulVolumeBinds runs whenever needsStatefulVolume
 // (profile.DiskMB > 0 && the image declares a VOLUME). For a DiskMB<=0 SKU the
-// declared VOLUME is NOT backed by this managed volume at all (it falls to an
-// anonymous docker volume, reaped on teardown), so the managed volume genuinely
-// holds only _wp and reclaiming it loses no durable data either way.
+// declared VOLUME is NOT backed by this managed volume at all (it is mounted
+// as a size-capped tmpfs, which holds nothing after the container stops), so
+// the managed volume genuinely holds only _wp and reclaiming it loses no
+// durable data either way.
 func (b *Backend) isWritablePathOnly(name string) bool {
 	hostPath := b.volumes.HostPath(name)
 	if hostPath == "" {

@@ -21,10 +21,13 @@
 //
 // # Concurrency
 //
-// Reads are served entirely from the in-memory cache (RWMutex-protected) and
-// never block on bbolt. Writes go to bbolt first, then update the cache.
-// This keeps the read path fast (it's on every authenticated tenant call)
-// while preserving durability.
+// Reads are served from the in-memory cache under an RWMutex, without a bbolt
+// transaction. Each read first re-attests the database file's identity (two
+// stat calls) and returns an unusable placement once authority has been
+// withdrawn. Writes go to bbolt first, then update the cache; a writer holds
+// the mutex across its bbolt commit, so a read can wait behind an in-flight
+// commit or inventory projection. This keeps the read path cheap (it's on every
+// authenticated tenant call) while preserving durability.
 //
 // # Recovery
 //
@@ -38,7 +41,11 @@
 // transient incomplete sweeps. A topology change invalidates it until another
 // complete projection commits. A later sweep can attenuate the baseline to an
 // AdmissionScope containing exactly the backends that answered both inventories;
-// only a genuinely recordless PENDING reconciliation may use that scope.
+// only a genuinely recordless PENDING reconciliation may use that scope. A
+// complete sweep has heard every backend, so it may also admit a recordless
+// ACTIVE lease that every backend reports absent. After a backend retirement
+// that left recordless admission unproven, such a lease is closed as lost
+// instead.
 //
 // ReconciliationSweep.Project applies positive observations at its inseparable
 // causal fence. An exact

@@ -12,7 +12,7 @@
 // and every refusal wraps ErrRefused. The zero Profile and the zero Source are
 // unusable.
 //
-// securityopt.go is the only production file that reads or writes a seccomp
+// securityopt_linux.go is the only production file that reads or writes a seccomp
 // security option. It parses options exactly as dockerd does, produces the
 // one final entry every creation carries, removes such entries from captured
 // configuration, and judges create requests and inspected containers. A test

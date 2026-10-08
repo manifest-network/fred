@@ -54,7 +54,9 @@ const (
 	// StateConfirmed means Backend is the last positively observed owner. A
 	// confirmed placement may also carry an unresolved Attempt.
 	StateConfirmed
-	// StateUnusable means a record exists but cannot safely be interpreted.
+	// StateUnusable means a record exists but grants no ordinary authority: it
+	// cannot safely be interpreted, it is a conflict quarantine, or it is a
+	// terminal lost placement.
 	StateUnusable
 )
 

@@ -1254,7 +1254,7 @@ func TestRun_PostCommitVerdictFailureReportsCommittedAndRequiresInspection(t *te
 	require.ErrorContains(t, err, "COMMITTED:")
 	require.ErrorContains(t, err, "PASS verdict reporting")
 	require.ErrorContains(t, err, "database was synced and closed; only command reporting is indeterminate")
-	require.ErrorContains(t, err, "run placement-repair -inspect immediately")
+	require.ErrorContains(t, err, "run placement-repair -classify (and -inspect -lease for a single-lease repair) immediately")
 
 	backup, readErr := os.ReadFile(backupPath)
 	require.NoError(t, readErr)

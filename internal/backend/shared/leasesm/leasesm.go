@@ -8,7 +8,8 @@
 //
 // This package exports no test scaffolding. Substrate code and tests obtain
 // sealed actor messages only from validating constructors, route them through
-// LeaseActor.TryEnqueue, and synchronize through receive-only reply handles or
+// LeaseActor.TryEnqueueCommand, TryEnqueueObservation or TryEnqueueRecovery,
+// and synchronize through receive-only reply handles or
 // terminal observables. Helpers private to leasesm itself live in *_test.go.
 package leasesm
 
@@ -345,9 +346,9 @@ type SMMetrics interface {
 }
 
 // LeaseActorConfig groups the dependencies a lease actor receives at
-// construction. Substrate-private concerns (compose project access,
-// container lifecycle calls, etc.) stay on the actor's substrate
-// pointer; only the listed dependencies move here.
+// construction. The actor holds no substrate pointer: substrate-private
+// concerns (compose project access, container lifecycle calls, etc.)
+// reach it only through these dependencies.
 //
 // OnTerminated is invoked by the actor's exit path so substrate code
 // can clean up the actor registry without the actor reaching back

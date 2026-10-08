@@ -1,7 +1,11 @@
 // Command placement-repair provides read-only offline placement discovery and
-// deliberately narrow mutation paths for one exact attempt or conflict. It
-// never infers causal non-execution from inventory absence: mutation also
-// requires an exact operator drain attestation and target-bound confirmation.
+// deliberately narrow, target-bound mutation modes: refusing one exact attempt,
+// resolving one exact conflict, adopting an observed lifecycle generation,
+// attesting a restored backup, and retiring a lost backend. It never infers
+// causal non-execution from inventory absence: attempt refusal and conflict
+// resolution also require an exact operator drain attestation. Every apply
+// requires the -confirm value its dry run printed; the other modes take their
+// own attestation instead (-attest-generation, -attest-lost) or none.
 package main
 
 import (
@@ -96,7 +100,8 @@ func (failure *committedRepairFailure) Error() string {
 	return fmt.Sprintf(
 		"COMMITTED: the placement repair transaction succeeded before %s failed; %s. "+
 			"Keep providerd stopped and "+
-			"run placement-repair -inspect immediately before any retry or restore: %v",
+			"run placement-repair -classify (and -inspect -lease for a single-lease repair) "+
+			"immediately before any retry or restore: %v",
 		failure.stage,
 		consequence,
 		failure.cause,
@@ -128,7 +133,8 @@ func (failure *outcomeUnknownRepairFailure) Error() string {
 	return fmt.Sprintf(
 		"OUTCOME UNKNOWN: bbolt Commit returned an error while %s; the placement repair "+
 			"may or may not be visible. Keep providerd stopped, preserve the live database "+
-			"and exact backup, and run placement-repair -inspect immediately. Do not retry "+
+			"and exact backup, and run placement-repair -classify (and -inspect -lease for a "+
+			"single-lease repair) immediately. Do not retry "+
 			"or restore blindly: %v",
 		failure.stage,
 		failure.cause,
@@ -235,7 +241,7 @@ func runWithDependencies(
 	retireLostBackend := flags.Bool(
 		"retire-lost-backend",
 		false,
-		"retire -backend, whose storage -storage-id is irrecoverably lost; its leases are closed as lost (offline)",
+		"retire -backend, whose storage -storage-id is irrecoverably lost; leases it owned become lost placements, which providerd then closes or rejects on chain (offline)",
 	)
 	storageIDText := flags.String("storage-id", "", "exact pinned storage identity of the -backend being retired")
 	lostAttestation := flags.String("attest-lost", "", "exact lost-storage attestation required with -apply -retire-lost-backend")
@@ -247,7 +253,7 @@ func runWithDependencies(
 	apply := flags.Bool("apply", false, "apply the exact repair; default is dry-run")
 	backupPath := flags.String("backup", "", "new exact pre-mutation backup path required with -apply (must not already exist)")
 	confirmation := flags.String("confirm", "", "exact tuple-bound confirmation value required with -apply")
-	attestation := flags.String("attest-drained", "", "exact delayed-effects/callback drain attestation required with -apply")
+	attestation := flags.String("attest-drained", "", "exact delayed-effects/callback drain attestation required with -apply for attempt refusal and -resolve-conflict")
 	showVersion := flags.Bool("version", false, "print version and exit")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
