@@ -1444,15 +1444,25 @@ inventory. A live actor that owns the same `maintenance_id` remains the serial
 owner. Otherwise any recovery error fails that pass (an unreadable or
 uninterpretable row, a failed Docker inspect or strict inventory, target
 substrate without a durable target Release, an actor that appears mid-recovery,
-or a busy callback FIFO). The one exception is a row whose containers merely
-contradict it (a
-container without the exact maintenance identity, one that diverges from the
-target's runtime or instance authority, one outside the target instance set, or
-one that disappears during inspection) is deferred for that lease alone: the
-pass continues, the lease stays out of ordinary projection so nothing interprets
-a mixed source/target cohort, and the deferral increments
-`fred_docker_backend_maintenance_recovery_deferred_total` and logs a WARN that
-becomes an ERROR once the row's recovery deadline passes. Recovery then takes its
+or a busy callback FIFO). Two cases are deferred for that lease alone instead:
+the pass continues, and the lease stays out of ordinary projection so nothing
+interprets a mixed source/target cohort.
+
+- A row whose containers contradict it (a container without the exact
+  maintenance identity, one that diverges from the target's runtime or instance
+  authority, one outside the target instance set, or one that disappears during
+  inspection). The deferral increments
+  `fred_docker_backend_maintenance_recovery_deferred_total` and logs a WARN that
+  becomes an ERROR once the row's recovery deadline passes.
+- A row still waiting for readiness evidence: a target or source whose startup
+  age or health is not yet conclusive. The wait increments
+  `fred_docker_backend_maintenance_readiness_pending_total{branch}` on every
+  pass and logs the WARN `maintenance recovery is waiting for readiness
+  evidence` once per intent and branch. It has no deadline and never becomes an
+  ERROR: a committed target whose health check stays `starting` stays pending,
+  and readiness uncertainty never grants rollback authority.
+
+Recovery then takes its
 ordinary managed-container snapshot, loads close authority before validating
 ordinary callback labels or release cohorts, and excludes close-owned cohorts
 whose disappearance is intentional. During startup, operation-intent preflight
@@ -1621,13 +1631,15 @@ than corrupt storage. Likewise, `callback_store_errors_total` covers instrumente
 callback persistence/store failures and fail-closed operation-intent startup
 recovery; it is not a generic counter for every semantic maintenance-recovery
 refusal. A periodic maintenance refusal that fails the pass (any error other
-than a lease-local deferral) logs the lease, increments
+than a lease-local deferral or readiness wait) logs the lease, increments
 `reconciliation_total{outcome="error"}`, and leaves
 `reconciliation_last_success_timestamp_seconds` stale; the same refusal during
-startup prevents the backend from starting. A lease-local deferral does
-neither: the pass succeeds, so alert on
-`fred_docker_backend_maintenance_recovery_deferred_total` and the deferral's
-ERROR log, not on last-success staleness. `/health` can remain green during a
+startup prevents the backend from starting. A lease-local deferral or readiness
+wait does neither: the pass succeeds, so last-success staleness never shows
+it. Alert on `fred_docker_backend_maintenance_recovery_deferred_total` and the
+deferral's ERROR log, and separately on a sustained rise of
+`fred_docker_backend_maintenance_readiness_pending_total{branch}`, which never
+produces an ERROR log. `/health` can remain green during a
 periodic semantic refusal. Close-finalizer retries instead log the lease and
 durable execution generation. There is intentionally no gauge for pending
 operation or maintenance intents, because a short-lived one is normal, and no
