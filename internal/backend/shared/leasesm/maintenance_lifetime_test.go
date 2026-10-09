@@ -63,7 +63,9 @@ func TestMaintenanceLifetimeIsReleasedOnEveryExit(t *testing.T) {
 			h1, discard1 := shared.NewMaintenanceWorkerHandoff(context.Background(), time.Hour)
 			defer discard1()
 			ack1 := make(chan error, 1)
-			require.True(t, actor.tryEnqueue(maintenanceMessageForLifetimeTest(op, h1, firstClaim, testMaintenanceTarget(t, firstClaim), ack1)))
+			requireAccepted(t, func() bool {
+				return actor.tryEnqueue(maintenanceMessageForLifetimeTest(op, h1, firstClaim, testMaintenanceTarget(t, firstClaim), ack1))
+			})
 			require.NoError(t, <-ack1)
 			discard1() // a lost HTTP reply must not revoke the claimed worker
 			require.NoError(t, h1.TargetContext().Err(), "accepted worker lifetime must survive caller discard")
@@ -71,7 +73,9 @@ func TestMaintenanceLifetimeIsReleasedOnEveryExit(t *testing.T) {
 			h2, discard2 := shared.NewMaintenanceWorkerHandoff(context.Background(), time.Hour)
 			defer discard2()
 			ack2 := make(chan error, 1)
-			require.True(t, actor.tryEnqueue(maintenanceMessageForLifetimeTest(op, h2, secondClaim, testMaintenanceTarget(t, secondClaim), ack2)))
+			requireAccepted(t, func() bool {
+				return actor.tryEnqueue(maintenanceMessageForLifetimeTest(op, h2, secondClaim, testMaintenanceTarget(t, secondClaim), ack2))
+			})
 			require.ErrorIs(t, <-ack2, backend.ErrInvalidState)
 			require.Eventually(t, func() bool { return h2.TargetContext().Err() == context.Canceled }, time.Second, time.Millisecond, "claimed-then-rejected lifetime must be released by the actor")
 

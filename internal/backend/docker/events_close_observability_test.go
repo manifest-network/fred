@@ -176,7 +176,7 @@ func TestContainerDeathDispatchCountsFullInbox(t *testing.T) {
 			return nil, ctx.Err()
 		},
 	})
-	require.True(t, b.routeActorObservation(mustContainerDiedObservation(t, "close-container", proof)))
+	requireAccepted(t, func() bool { return b.routeActorObservation(mustContainerDiedObservation(t, "close-container", proof)) })
 	select {
 	case <-inspecting:
 	case <-time.After(asyncTestResultTimeout):
@@ -184,7 +184,7 @@ func TestContainerDeathDispatchCountsFullInbox(t *testing.T) {
 	}
 	claim := actorOperationClaimForTest(t, eventCloseLeaseUUID)
 	for range b.actorFor(eventCloseLeaseUUID).InboxCap() {
-		require.True(t, b.routeToLease(eventCloseLeaseUUID, actorBackpressureCommand(t, claim)))
+		requireAccepted(t, func() bool { return b.routeToLease(eventCloseLeaseUUID, actorBackpressureCommand(t, claim)) })
 	}
 	before := testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues("event_loop"))
 	b.dispatchContainerDeathObservation(mustContainerDiedObservation(t, "close-container", proof), "close-container", "event_loop")

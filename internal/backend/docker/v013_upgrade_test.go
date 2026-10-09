@@ -175,7 +175,7 @@ func TestRecoveredV013ContainerDeathPublishesTokenlessLifecycleObservation(t *te
 	}
 	observation, err := leasesm.NewContainerDiedObservation("app-0", runtime)
 	require.NoError(t, err)
-	require.True(t, b.routeActorObservation(observation))
+	requireAccepted(t, func() bool { return b.routeActorObservation(observation) })
 
 	require.Eventually(t, func() bool {
 		pending, listErr := b.callbackStore.ListPending()

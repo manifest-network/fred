@@ -134,7 +134,7 @@ func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
 	// First send: panics inside the SM guard.
 	first, err := NewContainerDiedObservation("c1", runtime)
 	require.NoError(t, err)
-	require.True(t, actor.TryEnqueueObservation(first))
+	requireAccepted(t, func() bool { return actor.TryEnqueueObservation(first) })
 	require.Eventually(t, func() bool {
 		return metrics.actorPanic.Load() > actorPanicsBefore
 	}, 2*time.Second, 10*time.Millisecond,
@@ -143,7 +143,7 @@ func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
 	// Second send: must be processed — the actor survived the panic.
 	second, err := NewContainerDiedObservation("c1", runtime)
 	require.NoError(t, err)
-	require.True(t, actor.TryEnqueueObservation(second))
+	requireAccepted(t, func() bool { return actor.TryEnqueueObservation(second) })
 	require.Eventually(t, func() bool { return inspectCalls.Load() == 2 },
 		2*time.Second, time.Millisecond, "actor did not process a message after recovering from panic")
 }
@@ -276,9 +276,11 @@ func TestLeaseActor_QuiescenceClaimSpansWorkerTerminalHandoff(t *testing.T) {
 			return provisionWorkSuccess{result: provisionSuccess}
 		},
 	})
-	require.True(t, actor.tryEnqueue(provisionRequestedMsg{
-		Ctx: context.Background(), Ack: ack, Admission: operation,
-	}))
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(provisionRequestedMsg{
+			Ctx: context.Background(), Ack: ack, Admission: operation,
+		})
+	})
 	require.NoError(t, <-ack)
 	<-workerStarted
 	assert.Nil(t, actor.TryClaimQuiescence(),
@@ -457,7 +459,7 @@ func TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains(t *testing
 	// actor cancels the worker and answers pending. Only a later request may
 	// transition and run DoDeprovisionFn once the worker actually exits.
 	reply := make(chan error, 1)
-	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
 		"OnExit must call workCancel before waiting for the worker (Restart path)")
@@ -473,7 +475,7 @@ func TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains(t *testing
 	require.True(t, IsLifecyclePending(<-reply), "the caller must receive pending before the worker is released")
 	close(workerRelease)
 	<-actor.workers.Zero()
-	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
 
 	select {
 	case err := <-reply:
@@ -529,15 +531,19 @@ func TestLeaseActor_RestoreDeprovisionDefersUntilTerminalDeferDrains(t *testing.
 	})
 
 	restoreAck := make(chan error, 1)
-	require.True(t, actor.tryEnqueue(restoreRequestedMsg{
-		Ctx: context.Background(), Ack: restoreAck, Operation: operation,
-	}))
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(restoreRequestedMsg{
+			Ctx: context.Background(), Ack: restoreAck, Operation: operation,
+		})
+	})
 	require.NoError(t, <-restoreAck)
 
 	deprovisionReply := make(chan error, 1)
-	require.True(t, actor.tryEnqueue(deprovisionMsg{
-		Ctx: context.Background(), Reply: deprovisionReply,
-	}))
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(deprovisionMsg{
+			Ctx: context.Background(), Reply: deprovisionReply,
+		})
+	})
 	close(restoreWorkMayReturn)
 	select {
 	case <-terminalDeferEntered:
@@ -553,7 +559,9 @@ func TestLeaseActor_RestoreDeprovisionDefersUntilTerminalDeferDrains(t *testing.
 	require.True(t, IsLifecyclePending(<-deprovisionReply))
 	close(allowTerminalDefer)
 	<-actor.workers.Zero()
-	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: deprovisionReply}))
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: deprovisionReply})
+	})
 	select {
 	case err := <-deprovisionReply:
 		require.NoError(t, err)
@@ -647,7 +655,7 @@ func TestProvisionAdmission_AbandonedWaiterDoesNotOwnRejectedCapacity(t *testing
 			})
 			command, reply, err := NewProvisionCommand(t.Context(), fixture.admission)
 			require.NoError(t, err)
-			require.True(t, actor.TryEnqueueCommand(command))
+			requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
 			waitCtx, abandonWait := context.WithCancel(t.Context())
 			abandonWait()
 			require.ErrorIs(t, reply.Wait(waitCtx), context.Canceled)
@@ -758,7 +766,7 @@ func TestSpawnProvisionWorker_PanicRecovery(t *testing.T) {
 	// Actor is still alive and responsive — a caller command is acknowledged.
 	command, reply, err := NewDeprovisionCommand(context.Background())
 	require.NoError(t, err)
-	require.True(t, actor.TryEnqueueCommand(command))
+	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
 	require.NoError(t, reply.Wait(context.Background()))
 }
 
@@ -802,7 +810,7 @@ func TestSpawnReplaceWorker_PanicRecovery(t *testing.T) {
 
 	command, reply, err := NewDeprovisionCommand(context.Background())
 	require.NoError(t, err)
-	require.True(t, actor.TryEnqueueCommand(command))
+	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
 	require.NoError(t, reply.Wait(context.Background()))
 }
 
@@ -1096,7 +1104,7 @@ func TestRestartRedeliveryFromDurableStartedStateCannotSpawnSecondWorker(t *test
 		target,
 	)
 	require.NoError(t, err)
-	require.True(t, actor.TryEnqueueCommand(command))
+	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
 	require.ErrorIs(t, reply.Wait(t.Context()), backend.ErrInvalidState)
 	assert.Equal(t, int32(0), workerCalls.Load(),
 		"redelivery after durable Started must not duplicate physical restart work")
@@ -1169,7 +1177,7 @@ func TestProvision_DeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 	// Route Deprovision through the actor. Its pending response keeps teardown
 	// fenced until a retry independently observes the drained barrier.
 	reply := make(chan error, 1)
-	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
 		"OnExit must call workCancel before waitForWorkers")
@@ -1185,7 +1193,7 @@ func TestProvision_DeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 	require.True(t, IsLifecyclePending(<-reply), "the caller must receive pending before the worker is released")
 	close(workerRelease)
 	<-actor.workers.Zero()
-	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
 
 	select {
 	case err := <-reply:
@@ -1234,14 +1242,16 @@ func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
 	// Block the worker so the lease stays in Restarting while we assert —
 	// otherwise the replace worker could flip it to Ready before we read.
 	ack := make(chan error, 1)
-	require.True(t, actor.tryEnqueue(restartRequestedMsg{
-		Lifetime:             testMaintenanceHandoff(t, context.Background()),
-		CallbackURL:          claim.CallbackURL(),
-		LifecycleCallbackURL: claim.LifecycleCallbackURL(),
-		Maintenance:          claim,
-		Target:               testMaintenanceTarget(t, claim),
-		Ack:                  ack,
-	}))
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(restartRequestedMsg{
+			Lifetime:             testMaintenanceHandoff(t, context.Background()),
+			CallbackURL:          claim.CallbackURL(),
+			LifecycleCallbackURL: claim.LifecycleCallbackURL(),
+			Maintenance:          claim,
+			Target:               testMaintenanceTarget(t, claim),
+			Ack:                  ack,
+		})
+	})
 
 	select {
 	case err := <-ack:
@@ -1297,14 +1307,16 @@ func TestUpdateRequested_WritesStatusBeforeAck(t *testing.T) {
 	})
 
 	ack := make(chan error, 1)
-	require.True(t, actor.tryEnqueue(updateRequestedMsg{
-		Lifetime:             testMaintenanceHandoff(t, context.Background()),
-		CallbackURL:          claim.CallbackURL(),
-		LifecycleCallbackURL: claim.LifecycleCallbackURL(),
-		Maintenance:          claim,
-		Target:               testMaintenanceTarget(t, claim),
-		Ack:                  ack,
-	}))
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(updateRequestedMsg{
+			Lifetime:             testMaintenanceHandoff(t, context.Background()),
+			CallbackURL:          claim.CallbackURL(),
+			LifecycleCallbackURL: claim.LifecycleCallbackURL(),
+			Maintenance:          claim,
+			Target:               testMaintenanceTarget(t, claim),
+			Ack:                  ack,
+		})
+	})
 
 	select {
 	case err := <-ack:
@@ -1424,7 +1436,7 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 
 	// Request #1 wins: SM → busy, worker #1 spawned and blocks.
 	ack1 := make(chan error, 1)
-	require.True(t, routeReplace(t, actor, op, firstTarget, ack1))
+	requireAccepted(t, func() bool { return routeReplace(t, actor, op, firstTarget, ack1) })
 	select {
 	case err := <-ack1:
 		require.NoError(t, err, "first %s must be accepted", op)
@@ -1435,7 +1447,7 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 
 	// Request #2 loses the race: SM already busy → rejected with 409.
 	ack2 := make(chan error, 1)
-	require.True(t, routeReplace(t, actor, op, secondTarget, ack2))
+	requireAccepted(t, func() bool { return routeReplace(t, actor, op, secondTarget, ack2) })
 	select {
 	case err := <-ack2:
 		require.ErrorIs(t, err, backend.ErrInvalidState,
@@ -1447,7 +1459,7 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 	// Deprovision preempts the in-flight worker (whose workCancel must still
 	// be request #1's), returning pending while it drains.
 	reply := make(chan error, 1)
-	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
 
 	require.Eventually(t, firstCancelObserved.Load, 1*time.Second, 5*time.Millisecond,
 		"onExitProvisioning must cancel the FIRST (in-flight) %s worker", op)
@@ -1458,7 +1470,7 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 	require.True(t, IsLifecyclePending(<-reply))
 	close(worker1Release)
 	<-actor.workers.Zero()
-	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
 	select {
 	case err := <-reply:
 		require.NoError(t, err)
@@ -1584,7 +1596,7 @@ func runReplaceFromFailedSucceedsTest(t *testing.T, op string) {
 	})
 
 	ack := make(chan error, 1)
-	require.True(t, routeReplace(t, actor, op, target, ack))
+	requireAccepted(t, func() bool { return routeReplace(t, actor, op, target, ack) })
 	select {
 	case err := <-ack:
 		require.NoError(t, err, "%s from Failed must be accepted (fresh-actor-init-in-Failed path)", op)
@@ -1680,7 +1692,7 @@ func TestMaintenanceFailurePublishesExactSourceBeforeCallback(t *testing.T) {
 				},
 			})
 			ack := make(chan error, 1)
-			require.True(t, routeReplace(t, actor, tt.op, target, ack))
+			requireAccepted(t, func() bool { return routeReplace(t, actor, tt.op, target, ack) })
 			require.NoError(t, <-ack)
 			select {
 			case callbackURL := <-callback:
@@ -1743,7 +1755,7 @@ func TestFailedCompensationPublishesSourceProjectionBeforeCallback(t *testing.T)
 				},
 			})
 			ack := make(chan error, 1)
-			require.True(t, routeReplace(t, actor, "update", testMaintenanceTarget(t, claim), ack))
+			requireAccepted(t, func() bool { return routeReplace(t, actor, "update", testMaintenanceTarget(t, claim), ack) })
 			require.NoError(t, <-ack)
 			select {
 			case visible := <-callback:
@@ -1814,13 +1826,15 @@ func TestRestoreRequestedMsg_FiresEventAndSpawnsWorker(t *testing.T) {
 	// Block the worker so we can observe Restarting + CallbackURL before it
 	// flips the lease to Ready.
 	ack := make(chan error, 1)
-	require.True(t, actor.tryEnqueue(restoreRequestedMsg{
-		Ctx:                  context.Background(),
-		CallbackURL:          operation.CallbackURL(),
-		LifecycleCallbackURL: operation.LifecycleCallbackURL(),
-		Ack:                  ack,
-		Operation:            operation,
-	}))
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(restoreRequestedMsg{
+			Ctx:                  context.Background(),
+			CallbackURL:          operation.CallbackURL(),
+			LifecycleCallbackURL: operation.LifecycleCallbackURL(),
+			Ack:                  ack,
+			Operation:            operation,
+		})
+	})
 
 	select {
 	case err := <-ack:
@@ -1963,7 +1977,7 @@ func TestSpawnReplaceWorker_RestorePanicRecovery(t *testing.T) {
 	operation := newTestOperationFixture(t, leaseUUID, shared.OperationIntentRestore).claim
 	command, reply, err := NewRestoreCommand(context.Background(), operation)
 	require.NoError(t, err)
-	require.True(t, actor.TryEnqueueCommand(command))
+	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
 
 	select {
 	case err := <-reply.Result():

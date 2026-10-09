@@ -603,7 +603,7 @@ func (b *Backend) dispatchProvisionForTest(t *testing.T, ctx context.Context, re
 	b.provisionsMu.Unlock()
 	command, reply, err := leasesm.NewProvisionCommand(workCtx, reserveProvisionAdmissionForTest(t, b, claim))
 	require.NoError(t, err)
-	require.True(t, b.routeToLease(req.LeaseUUID, command), "lease actor refused the provision message")
+	requireAccepted(t, func() bool { return b.routeToLease(req.LeaseUUID, command) }, "lease actor refused the provision message")
 
 	select {
 	case err := <-reply.Result():

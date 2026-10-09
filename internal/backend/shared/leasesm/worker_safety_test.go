@@ -47,7 +47,7 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	actor.workers.Add()
 
 	reply := make(chan error, 1)
-	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
 	select {
 	case err := <-reply:
 		require.True(t, IsLifecyclePending(err), "the exact live worker must issue a pending observation: %v", err)
@@ -67,7 +67,7 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	// immediate observation cannot strand the actor in Deprovisioning.
 	actor.workers.Done()
 	retryReply := make(chan error, 1)
-	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: retryReply}))
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: retryReply}) })
 	select {
 	case err := <-retryReply:
 		require.NoError(t, err)
@@ -161,7 +161,7 @@ func TestDeprovisionAbsentProjectionStillRunsSubstrateFinalizer(t *testing.T) {
 	})
 
 	reply := make(chan error, 1)
-	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
 	select {
 	case err := <-reply:
 		require.NoError(t, err)
@@ -219,7 +219,7 @@ func TestCohortDivergenceFailsReadyLeaseIdempotently(t *testing.T) {
 
 	observation, reply, err := NewCohortDivergedObservation(context.Background(), runtime)
 	require.NoError(t, err)
-	require.True(t, actor.TryEnqueueObservation(observation))
+	requireAccepted(t, func() bool { return actor.TryEnqueueObservation(observation) })
 	require.NoError(t, reply.Wait(context.Background()))
 
 	got, exists := store.Get(leaseUUID)
@@ -241,7 +241,7 @@ func TestCohortDivergenceFailsReadyLeaseIdempotently(t *testing.T) {
 	// SM Ignore: no count inflation, duplicate callback, or gauge movement.
 	second, secondReply, err := NewCohortDivergedObservation(context.Background(), runtime)
 	require.NoError(t, err)
-	require.True(t, actor.TryEnqueueObservation(second))
+	requireAccepted(t, func() bool { return actor.TryEnqueueObservation(second) })
 	require.NoError(t, secondReply.Wait(context.Background()))
 	got, exists = store.Get(leaseUUID)
 	require.True(t, exists)

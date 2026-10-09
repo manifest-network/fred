@@ -2988,3 +2988,20 @@ func (b *Backend) rollbackRestoreAdoption(
 		leaseUUID, allocatedIDs, rec, resourceProfiles, dropProvision, logger,
 	)
 }
+
+// requireAccepted retries a non-blocking actor enqueue until it is accepted.
+// The actor refuses an enqueue, with no side effect, whenever its admission or
+// activity lock is momentarily held, for example by the run loop finishing its
+// bookkeeping right after it replies. Production callers retry or rely on
+// reconciliation, so a test that asserts a single attempt only flakes, most
+// often under -race.
+func requireAccepted(t testing.TB, enqueue func() bool, msgAndArgs ...any) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !enqueue() {
+		if !time.Now().Before(deadline) {
+			require.FailNow(t, "the actor refused the message for 2s", msgAndArgs...)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
