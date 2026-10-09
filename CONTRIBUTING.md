@@ -8,7 +8,7 @@ For an overview of what Fred does and how it's structured, start with [README.md
 
 ## Prerequisites
 
-- **Go 1.26.8** (per `go.mod`) — the `go 1.26.8` directive sets the toolchain floor. Fred also uses `sync.WaitGroup.Go()` (Go 1.25) and `testing.B.Loop()` (Go 1.24).
+- **Go 1.26.9** (per `go.mod`) — the `go 1.26.9` directive sets the toolchain floor. Fred also uses `sync.WaitGroup.Go()` (Go 1.25) and `testing.B.Loop()` (Go 1.24).
 - **Docker Engine 28.1+ (API 1.49+)** with iptables enabled — required for `make test-integration` and the docker-backend's immutable image admission.
 - **(Optional) `manifestd`** — only needed if you want to run end-to-end against a local chain via `scripts/dev-init.sh`.
 - **`golangci-lint`**, at the version pinned in `.golangci-lint-version` — required by `make lint`, which now fails rather than skipping when it's absent or mismatched. See [Linting](#linting) for the install command.

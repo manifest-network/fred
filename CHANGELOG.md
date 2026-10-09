@@ -2203,6 +2203,21 @@ any binary:
 
 ### Security
 
+- deps: build with Go 1.26.9 (from 1.26.8) and bump `golang.org/x/net` to
+  v0.60.0 (from v0.58.0). This resolves twelve advisories that Fred's code
+  reaches:
+  - HTTP/2 server crash, memory exhaustion and CPU exhaustion (GO-2026-6617,
+    GO-2026-6612, GO-2026-6611, GO-2026-6603);
+  - HTTP/1 and HTTP/2 connection desynchronization and malformed framing
+    (GO-2026-6613, GO-2026-6605, GO-2026-6610);
+  - a MIME header memory-limit bypass (GO-2026-6608);
+  - malformed ECH extensions accepted by `crypto/tls` (GO-2026-6607);
+  - `html/template` escaping (GO-2026-6599, GO-2026-6600);
+  - a Windows-only `os.Root` escape (GO-2026-6604).
+
+  The `go` directive and the Dockerfile builder image move to 1.26.9, so
+  building Fred from source now needs Go 1.26.9 or later. The bump clears the
+  release's govulncheck gate without widening its allowlist.
 - docker-backend applies a restricted seccomp profile to tenant containers and
   reports containers created before it. (ENG-1118)
 - Exclude caller-abandoned backend calls from circuit-breaker health accounting

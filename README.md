@@ -2286,7 +2286,7 @@ See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks, stress test result
 
 ## Dependencies
 
-- Go 1.26.8+ (per the `go 1.26.8` directive in `go.mod`; also uses `sync.WaitGroup.Go()`, `testing.B.Loop()`, `range` over integers)
+- Go 1.26.9+ (per the `go 1.26.9` directive in `go.mod`; also uses `sync.WaitGroup.Go()`, `testing.B.Loop()`, `range` over integers)
 - Watermill (event routing)
 - Cosmos SDK v0.50.14
 - CometBFT v0.38.x
