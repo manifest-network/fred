@@ -56,7 +56,7 @@ func TestLeaseActor_DirectDispatch(t *testing.T) {
 	startCallbackReplayForTest(b)
 	defer b.stopCancel()
 
-	require.True(t, b.routeActorObservation(mustContainerDiedObservation(t, "c1", runtime)))
+	requireAccepted(t, func() bool { return b.routeActorObservation(mustContainerDiedObservation(t, "c1", runtime)) })
 
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
@@ -441,8 +441,7 @@ func TestLeaseActor_FailingWedgeRecovery(t *testing.T) {
 	claim := actorOperationClaimForTest(t, leaseUUID)
 	command, ack, err := leasesm.NewProvisionCommand(context.Background(), claim)
 	require.NoError(t, err)
-	ok := b.routeToLease(leaseUUID, command)
-	require.True(t, ok)
+	requireAccepted(t, func() bool { return b.routeToLease(leaseUUID, command) })
 	select {
 	case err := <-ack.Result():
 		require.NoError(t, err, "Failing must Permit evProvisionRequested so stuck leases can recover")
@@ -519,14 +518,14 @@ func TestRouteToLease_DropsOnFullInbox(t *testing.T) {
 	// loop via NewLeaseActor) and enqueues. The actor consumes it,
 	// invokes handle() → handleContainerDied → sm.Fire → guard →
 	// Inspector.InspectInstance, which wedges on the hung mock above.
-	require.True(t, b.routeActorObservation(mustContainerDiedObservation(t, "c1", runtime)))
+	requireAccepted(t, func() bool { return b.routeActorObservation(mustContainerDiedObservation(t, "c1", runtime)) })
 	<-firstInspected
 	claim := actorOperationClaimForTest(t, leaseUUID)
 
 	// Actor is now blocked in the SM guard. Fill the remaining 16 inbox
 	// slots — none of these get consumed because the actor is wedged.
 	for i := 0; i < 16; i++ {
-		require.True(t, b.routeToLease(leaseUUID, actorBackpressureCommand(t, claim)),
+		requireAccepted(t, func() bool { return b.routeToLease(leaseUUID, actorBackpressureCommand(t, claim)) },
 			"message %d should enqueue while actor is wedged", i)
 	}
 
@@ -590,11 +589,11 @@ func TestRouteToLeaseBlocking_RetriesOnFullInbox(t *testing.T) {
 
 	// Fill inbox: first message wedges the actor in the SM guard;
 	// next 16 queue.
-	require.True(t, b.routeActorObservation(mustContainerDiedObservation(t, "c0", runtime)))
+	requireAccepted(t, func() bool { return b.routeActorObservation(mustContainerDiedObservation(t, "c0", runtime)) })
 	<-firstInspected
 	claim := actorOperationClaimForTest(t, leaseUUID)
 	for i := 0; i < 16; i++ {
-		require.True(t, b.routeToLease(leaseUUID, actorBackpressureCommand(t, claim)))
+		requireAccepted(t, func() bool { return b.routeToLease(leaseUUID, actorBackpressureCommand(t, claim)) })
 	}
 
 	// routeToLeaseBlocking should not return false immediately — it
@@ -642,11 +641,11 @@ func TestRouteToLeaseBlocking_ReturnsCtxErr(t *testing.T) {
 	runtime := installReadyRuntimeProofForTest(t, b, leaseUUID)
 
 	// Saturate: first message wedges actor; next 16 queue.
-	require.True(t, b.routeActorObservation(mustContainerDiedObservation(t, "c0", runtime)))
+	requireAccepted(t, func() bool { return b.routeActorObservation(mustContainerDiedObservation(t, "c0", runtime)) })
 	<-firstInspected
 	claim := actorOperationClaimForTest(t, leaseUUID)
 	for i := 0; i < 16; i++ {
-		require.True(t, b.routeToLease(leaseUUID, actorBackpressureCommand(t, claim)))
+		requireAccepted(t, func() bool { return b.routeToLease(leaseUUID, actorBackpressureCommand(t, claim)) })
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -677,8 +676,8 @@ func TestLeaseActor_ProvisionRequestedSMRejection(t *testing.T) {
 	claim := actorOperationClaimForTest(t, leaseUUID)
 	command, ack, err := leasesm.NewProvisionCommand(context.Background(), claim)
 	require.NoError(t, err)
-	ok := b.routeToLease(leaseUUID, command)
-	require.True(t, ok, "routeToLease itself must succeed; rejection is at SM-fire time")
+	requireAccepted(t, func() bool { return b.routeToLease(leaseUUID, command) },
+		"routeToLease itself must succeed; rejection is at SM-fire time")
 
 	select {
 	case err := <-ack.Result():

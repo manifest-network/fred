@@ -870,7 +870,7 @@ func TestRecoverState_RetiresIdleActorBeforeRemovingProjection(t *testing.T) {
 	claim := actorOperationClaimForTest(t, leaseUUID)
 	command, reply, err := leasesm.NewProvisionCommand(t.Context(), claim)
 	require.NoError(t, err)
-	require.True(t, b.routeToLease(leaseUUID, command))
+	requireAccepted(t, func() bool { return b.routeToLease(leaseUUID, command) })
 	require.NoError(t, <-reply.Result())
 	require.NotSame(t, oldActor, b.actorFor(leaseUUID),
 		"the fresh command must resolve a new actor generation")
@@ -907,7 +907,7 @@ func TestRecoverState_DefersProjectionReplacementWhileActorIsActive(t *testing.T
 	allocationID := leaseUUID + "-app-0"
 	require.NoError(t, b.pool.TryAllocate(allocationID, "docker-small", "tenant-a"))
 	observation := mustContainerDiedObservation(t, "container-1", runtime)
-	require.True(t, b.routeActorObservation(observation))
+	requireAccepted(t, func() bool { return b.routeActorObservation(observation) })
 	<-inspectionStarted
 
 	recoveryDone := make(chan error, 1)
