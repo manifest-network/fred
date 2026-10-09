@@ -258,7 +258,7 @@ func TestLifecycleObservationCarriesExactActiveOperationGeneration(t *testing.T)
 	})
 	message, reply, err := NewCohortDivergedObservation(context.Background(), runtime)
 	require.NoError(t, err)
-	require.True(t, actor.TryEnqueueObservation(message))
+	requireAccepted(t, func() bool { return actor.TryEnqueueObservation(message) })
 	require.NoError(t, reply.Wait(context.Background()))
 	select {
 	case got := <-observed:
@@ -276,7 +276,7 @@ func TestOpaqueMessageCapabilitiesAreCopySafeAndAcceptedOnce(t *testing.T) {
 	command, _, err := NewDeprovisionCommand(t.Context())
 	require.NoError(t, err)
 	copyOfCommand := command
-	require.True(t, actor.TryEnqueueCommand(command))
+	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
 	assert.False(t, actor.TryEnqueueCommand(copyOfCommand), "a copied command must share one-shot admission")
 	assert.False(t, actor.TryEnqueueCommand(ActorCommand{}), "zero command must fail closed")
 
@@ -284,7 +284,7 @@ func TestOpaqueMessageCapabilitiesAreCopySafeAndAcceptedOnce(t *testing.T) {
 	observation, err := NewContainerDiedObservation("c1", runtime)
 	require.NoError(t, err)
 	copyOfObservation := observation
-	require.True(t, actor.TryEnqueueObservation(observation))
+	requireAccepted(t, func() bool { return actor.TryEnqueueObservation(observation) })
 	assert.False(t, actor.TryEnqueueObservation(copyOfObservation), "a copied observation must share one-shot admission")
 	assert.False(t, actor.TryEnqueueObservation(ActorObservation{}), "zero observation must fail closed")
 	assert.False(t, actor.TryEnqueueRecovery(RecoveryCommand{}), "zero recovery command must fail closed")

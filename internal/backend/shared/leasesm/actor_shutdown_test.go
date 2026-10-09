@@ -220,10 +220,12 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 	})
 
 	firstReply := make(chan error, 1)
-	require.True(t, actor.tryEnqueue(deprovisionMsg{
-		Ctx:   context.Background(),
-		Reply: firstReply,
-	}))
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(deprovisionMsg{
+			Ctx:   context.Background(),
+			Reply: firstReply,
+		})
+	})
 	select {
 	case <-finalizerEntered:
 	case <-time.After(2 * time.Second):
@@ -231,14 +233,18 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 	}
 
 	var queuedWorkRan atomic.Bool
-	require.True(t, actor.tryEnqueue(provisionRequestedMsg{
-		Ctx: context.Background(),
-		Ack: queuedProvisionAck,
-	}))
-	require.True(t, actor.tryEnqueue(deprovisionMsg{
-		Ctx:   context.Background(),
-		Reply: queuedDeprovisionReply,
-	}))
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(provisionRequestedMsg{
+			Ctx: context.Background(),
+			Ack: queuedProvisionAck,
+		})
+	})
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(deprovisionMsg{
+			Ctx:   context.Background(),
+			Reply: queuedDeprovisionReply,
+		})
+	})
 
 	releaseFinalizerOnce.Do(func() { close(releaseFinalizer) })
 	require.NoError(t, <-firstReply)

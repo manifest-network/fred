@@ -14,7 +14,7 @@ import (
 
 func handleRecoveryCommand(t *testing.T, actor *LeaseActor, command RecoveryCommand) {
 	t.Helper()
-	require.True(t, actor.TryEnqueueRecovery(command))
+	requireAccepted(t, func() bool { return actor.TryEnqueueRecovery(command) })
 	actor.handleAcceptedMessage(<-actor.inbox)
 }
 

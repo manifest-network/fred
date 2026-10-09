@@ -712,7 +712,7 @@ func TestDoReplace_ActivationPersistenceFailurePreservesTargetForRecovery(t *tes
 				command, reply, err = leasesm.NewUpdateCommand(testMaintenanceHandoff(t, t.Context()), targetClaim)
 			}
 			require.NoError(t, err)
-			require.True(t, b.routeToLease(leaseUUID, command))
+			requireAccepted(t, func() bool { return b.routeToLease(leaseUUID, command) })
 			require.NoError(t, <-reply.Result())
 			select {
 			case <-upStarted:
@@ -1241,7 +1241,7 @@ func TestContainerDiedThenRestart_Succeeds(t *testing.T) {
 	defer cleanup()
 	command, reply, err := leasesm.NewRestartCommand(testMaintenanceHandoff(t, t.Context()), target)
 	require.NoError(t, err)
-	require.True(t, b.routeToLease(leaseUUID, command))
+	requireAccepted(t, func() bool { return b.routeToLease(leaseUUID, command) })
 
 	select {
 	case err := <-reply.Result():
@@ -1385,7 +1385,7 @@ func routeRestartFailure(
 	t.Cleanup(cleanup)
 	command, reply, err := leasesm.NewRestartCommand(testMaintenanceHandoff(t, t.Context()), target)
 	require.NoError(t, err)
-	require.True(t, b.routeToLease(durableCallbackTestLeaseUUID, command))
+	requireAccepted(t, func() bool { return b.routeToLease(durableCallbackTestLeaseUUID, command) })
 	require.NoError(t, <-reply.Result(), "restart must be accepted by the SM")
 }
 
@@ -1437,7 +1437,7 @@ func TestUpdatePreflight_StaysFailed(t *testing.T) {
 	defer cleanup()
 	command, reply, err := leasesm.NewUpdateCommand(testMaintenanceHandoff(t, t.Context()), target)
 	require.NoError(t, err)
-	require.True(t, b.routeToLease(durableCallbackTestLeaseUUID, command))
+	requireAccepted(t, func() bool { return b.routeToLease(durableCallbackTestLeaseUUID, command) })
 	require.NoError(t, <-reply.Result(), "update must be accepted by the SM")
 	awaitSettled(t, b, backend.ProvisionStatusFailed, 1,
 		"update preflight must stay Failed regardless of source (no flag; intentional asymmetry)")
@@ -1580,7 +1580,7 @@ func TestDoUpdate_PreflightFailure_ReasonIsImagePullFailed(t *testing.T) {
 	b.provisionsMu.Unlock()
 	command, reply, err := leasesm.NewUpdateCommand(testMaintenanceHandoff(t, t.Context()), admission.target)
 	require.NoError(t, err)
-	require.True(t, b.routeToLease(leaseUUID, command))
+	requireAccepted(t, func() bool { return b.routeToLease(leaseUUID, command) })
 	require.NoError(t, <-reply.Result())
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
