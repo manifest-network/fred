@@ -21,7 +21,8 @@ jobs:
           bash scripts/check-release-source.sh
 
   # Reuse the complete gates on the exact tagged commit. A prior main/PR run
-  # does not establish that this tag passed integration, race or vulnerability checks.
+  # does not establish that this tag passed integration, race, vulnerability
+  # or secret checks.
   verify:
     needs: provenance
     uses: ./.github/workflows/ci.yml
@@ -31,8 +32,12 @@ jobs:
     uses: ./.github/workflows/integration.yml
     secrets: inherit
 
+  secret-scan:
+    needs: provenance
+    uses: ./.github/workflows/secret-scan.yml
+
   release:
-    needs: [verify, integration]
+    needs: [verify, integration, secret-scan]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub release + upload artifacts
@@ -61,7 +66,9 @@ jobs:
 
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "~> v2"
+          # Exact pin, kept equal to ci.yml's snapshot jobs so a release runs the
+          # GoReleaser that CI validated against .goreleaser.yaml.
+          version: "v2.18.2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

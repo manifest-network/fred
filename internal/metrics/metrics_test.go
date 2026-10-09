@@ -280,6 +280,32 @@ func knownMetricNames() map[string]bool {
 	return known
 }
 
+// TestReconciliationActionsExportedAtInit pins ENG-1116: every action series
+// exists before the reconciler records one, so a fresh providerd exports the
+// family at zero. No test in this package writes acknowledged, deprovisioned,
+// anomaly or lease_error, so those four can only come from package init.
+func TestReconciliationActionsExportedAtInit(t *testing.T) {
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+
+	var actions []string
+	for _, f := range families {
+		if f.GetName() != "fred_reconciler_actions_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, label := range m.GetLabel() {
+				if label.GetName() == "action" {
+					actions = append(actions, label.GetValue())
+				}
+			}
+		}
+	}
+	assert.ElementsMatch(t,
+		[]string{ActionProvisioned, ActionAcknowledged, ActionDeprovisioned, ActionAnomaly, ActionLeaseError},
+		actions)
+}
+
 func TestCounterVecLabels(t *testing.T) {
 	// Verify each Vec metric accepts its documented labels without panic.
 	assert.NotPanics(t, func() {
