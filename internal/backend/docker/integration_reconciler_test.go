@@ -1404,6 +1404,160 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 	require.NoError(t, env.backend.Deprovision(ctx, newLease))
 }
 
+// TestIntegration_Reconciler_RestoredLeaseReprovisionsAfterContainerLoss is the
+// ENG-1442 regression. A restored lease has no payload in providerd: the backend
+// re-deployed the retained manifest, which providerd never received. When its
+// container is lost, the reconciler must rebuild the payload from the backend's
+// active release and re-provision the lease onto the same data, instead of
+// retrying "payload not available" forever.
+func TestIntegration_Reconciler_RestoredLeaseReprovisionsAfterContainerLoss(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+	sourceLease := newIntegrationLeaseUUID()
+	restoredLease := newIntegrationLeaseUUID()
+	tenant := "test-tenant"
+	const sku = "docker-small" // stateful: DiskMB=1024
+
+	created, err := json.Marshal(manifest.Manifest{Image: "redis:7", Command: []string{"sleep", "3600"}})
+	require.NoError(t, err)
+	// Both leases carry the hash of the manifest the tenant created the source
+	// with, as the MCP client's restore does; the restored manifest differs.
+	createdHash := sha256.Sum256(created)
+
+	var mu sync.Mutex
+	sourceVisible := true
+	restoredActive := false
+	mockChain := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(_ context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if !sourceVisible {
+				return nil, nil
+			}
+			l := makeLease(sourceLease, tenant, providerUUID, sku, 1, createdHash[:])
+			l.State = billingtypes.LEASE_STATE_PENDING
+			return []billingtypes.Lease{l}, nil
+		},
+		GetActiveLeasesByProviderFunc: func(_ context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if !restoredActive {
+				return nil, nil
+			}
+			l := makeLease(restoredLease, tenant, providerUUID, sku, 1, createdHash[:])
+			l.State = billingtypes.LEASE_STATE_ACTIVE
+			return []billingtypes.Lease{l}, nil
+		},
+		AcknowledgeLeasesFunc: func(_ context.Context, _ []string) (uint64, []string, error) { return 1, []string{"tx"}, nil },
+		GetLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			l := makeLease(uuid, tenant, testProviderUUID, sku, 1, createdHash[:])
+			switch {
+			case uuid == restoredLease && restoredActive:
+				l.State = billingtypes.LEASE_STATE_ACTIVE
+			case uuid == restoredLease:
+				l.State = billingtypes.LEASE_STATE_PENDING
+			case sourceVisible:
+				l.State = billingtypes.LEASE_STATE_PENDING
+			default:
+				// Closed, not erased: x/billing never deletes a lease (ENG-654).
+				l.State = billingtypes.LEASE_STATE_CLOSED
+			}
+			return &l, nil
+		},
+	}
+
+	env := testReconcilerSetup(t, mockChain, func(cfg *Config) {
+		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
+		cfg.VolumeFilesystem = "btrfs"
+		cfg.RetainOnClose = true
+		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
+		cfg.RetentionMaxAge = 0
+		cfg.RetentionReapInterval = 0
+	})
+	require.True(t, env.tracker.store.Store(sourceLease, created))
+	ctx := context.Background()
+
+	// 1. Provision the source lease and write a sentinel into its volume.
+	require.NoError(t, env.reconciler.RunOnce(ctx))
+	initial := waitForCallbackDelivery(t, env.callbackCh, sourceLease, 3*time.Minute)
+	require.Equal(t, backend.CallbackStatusSuccess, initial.Status)
+	require.True(t, env.tracker.finishProvisionCallback(initial))
+	execInContainer(t, getContainerID(t, sourceLease),
+		[]string{"sh", "-c", "echo eng-1442-sentinel > /data/sentinel.txt"})
+
+	// 2. The source closes on chain; the orphan sweep retains its data.
+	mu.Lock()
+	sourceVisible = false
+	mu.Unlock()
+	require.NoError(t, env.reconciler.RunOnce(ctx))
+	require.Eventually(t, func() bool {
+		rec, _ := env.backend.retentionStore.Get(sourceLease)
+		return rec != nil
+	}, 60*time.Second, 500*time.Millisecond, "the closed source lease must be retained")
+
+	// 3. Restore into a new lease, which becomes ACTIVE with no stored payload.
+	mu.Lock()
+	restoredActive = true
+	mu.Unlock()
+	restoreCallbacks := newIntegrationCallbackAuthority(t, env.callbackURL)
+	require.NoError(t, env.backend.Restore(ctx, backend.RestoreRequest{
+		LeaseUUID: restoredLease, FromLeaseUUID: sourceLease, Tenant: tenant, ProviderUUID: env.providerUUID,
+		Items:                []backend.LeaseItem{{SKU: sku, Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		CallbackURL:          restoreCallbacks.operationURL,
+		LifecycleCallbackURL: restoreCallbacks.lifecycleURL,
+	}))
+	require.Equal(t, backend.CallbackStatusSuccess,
+		waitForCallbackDelivery(t, env.callbackCh, restoredLease, 3*time.Minute).Status)
+	finalizeRestoreRetentionForTest(t, env.backend, env.backend.retentionStore, sourceLease)
+	releases, err := env.backend.GetReleases(ctx, restoredLease)
+	require.NoError(t, err)
+	var restoredManifest []byte
+	for _, release := range releases {
+		if release.Status == backend.ReleaseStatusActive {
+			restoredManifest = release.Manifest
+		}
+	}
+	require.NotEmpty(t, restoredManifest, "restore records the destination's active release")
+	has, err := env.tracker.store.Has(restoredLease)
+	require.NoError(t, err)
+	require.False(t, has, "the restored lease starts with no providerd payload")
+	// One sweep while it is healthy confirms its placement from inventory.
+	require.NoError(t, env.reconciler.RunOnce(ctx))
+
+	// 4. The restored lease loses its container.
+	containers := inspectProvisionContainers(t, restoredLease)
+	require.NotEmpty(t, containers)
+	killContainer(t, containers[0].ID)
+	waitForProvisionStatus(t, env.backend, restoredLease, backend.ProvisionStatusFailed, 30*time.Second)
+
+	// 5. The reconciler rebuilds the payload and re-provisions the lease.
+	require.NoError(t, env.reconciler.RunOnce(ctx))
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		delivery := waitForCallbackDelivery(t, env.callbackCh, restoredLease, time.Until(deadline))
+		if delivery.Status == backend.CallbackStatusSuccess {
+			require.True(t, env.tracker.finishProvisionCallback(delivery),
+				"the re-provision's exact operation must settle")
+			break
+		}
+		t.Logf("skipping %s callback for the restored lease", delivery.Status)
+	}
+
+	// 6. Same data, and the rebuilt payload is now the lease's stored payload.
+	out := execInContainer(t, getContainerID(t, restoredLease), []string{"cat", "/data/sentinel.txt"})
+	assert.Contains(t, out, "eng-1442-sentinel")
+	stored, recordedHash, err := env.tracker.store.GetWithHash(restoredLease)
+	require.NoError(t, err)
+	assert.Equal(t, restoredManifest, stored)
+	storedHash := sha256.Sum256(stored)
+	assert.Equal(t, storedHash[:], recordedHash)
+
+	env.backend.cfg.RetainOnClose = false
+	require.NoError(t, env.backend.Deprovision(ctx, restoredLease))
+}
+
 // testManagerSetup wires a real provisioner.Manager to the real docker backend +
 // mock chain, for exercising the event-driven close/expiry deprovision path.
 //

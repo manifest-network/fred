@@ -1055,6 +1055,16 @@ Get the release (deployment) history for a lease. Each provision, update, or res
 
 Fred decodes only these fields and relays them to the tenant; it drops any other field, such as an `error` string.
 
+Fred's reconciler also reads this endpoint when it must re-provision an `ACTIVE`
+lease with a `meta_hash` that it holds no payload for, such as a lease created
+by `/restore`, whose manifest your backend chose. It stores the `manifest` of the highest-`version`
+release whose `status` is `active` as the lease's payload and sends it on the
+next `/provision` (ENG-1442). That manifest must therefore be the one the lease
+currently runs, in a form your `/provision` accepts for the same lease, tenant
+and items. A refusal as invalid closes the lease on chain. With no `active`
+release, an empty `manifest`, or an error, Fred retries on the next sweep and
+never closes the lease for it.
+
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned
 
@@ -1970,8 +1980,10 @@ backend with no work should return success, not 404 (e.g. the k3s scaffold
 returns `nil` from `ReconcileCustomDomain`). `restart`, `update`, and
 `/releases/{lease_uuid}` are invoked **on demand** when a tenant calls the
 corresponding API operation (`RestartLease`/`UpdateLease`/`GetLeaseReleases` in
-`internal/api/handlers.go`); they must still be implemented, but returning 404
-when a lease isn't provisioned is correct for these.
+`internal/api/handlers.go`); the reconciler also reads `/releases/{lease_uuid}`
+to rebuild a missing payload (see [GET /releases](#get-releaseslease_uuid)).
+They must still be implemented, but returning 404 when a lease isn't
+provisioned is correct for these.
 
 ## Further reading
 
