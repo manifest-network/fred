@@ -412,8 +412,18 @@ func (coordinator *AuthenticatedCallbackCoordinator) settleClaimed(
 		case callbackLeaseUnknown:
 			return result, fmt.Errorf("lease %s has unknown state %s after failure callback", callback.LeaseUUID(), callbackObservationState(observation))
 		}
+		pending, _ := exactLeaseFromObservation(observation)
+		endable, endErr := coordinator.controlPlane.mayEnd(&pending)
+		if errors.Is(endErr, errBillingOnlyLeaseNotEnded) {
+			// A billing-only lease is not Fred's to end: settle the failure as
+			// for an ACTIVE lease and leave the lease to be acknowledged.
+			return completedFailure(reason, true, false)
+		}
+		if endErr != nil {
+			return result, endErr
+		}
 		_, _, rejectErr := coordinator.controlPlane.rejectLease(
-			ctx, callback.LeaseUUID(), callbackRejectReason(reason),
+			ctx, endable, callbackRejectReason(reason),
 		)
 		if rejectErr == nil {
 			return completedFailure(reason, true, true)
@@ -563,8 +573,19 @@ func (coordinator *AuthenticatedCallbackCoordinator) settleDurable(
 		case callbackLeaseUnknown:
 			return true, result, fmt.Errorf("recovered lease %s has unknown state %s after failure callback", callback.LeaseUUID(), callbackObservationState(observation))
 		}
+		pending, _ := exactLeaseFromObservation(observation)
+		endable, endErr := coordinator.controlPlane.mayEnd(&pending)
+		if errors.Is(endErr, errBillingOnlyLeaseNotEnded) {
+			// The attempt predates the policy that made this lease billing-only,
+			// and the lease is not Fred's to end: settle the failure as for an
+			// ACTIVE lease and leave the lease to be acknowledged.
+			return completedFailure(reason, !claim.HasSameBackendOwner(), false)
+		}
+		if endErr != nil {
+			return true, result, endErr
+		}
 		_, _, rejectErr := coordinator.controlPlane.rejectLease(
-			ctx, callback.LeaseUUID(), callbackRejectReason(reason),
+			ctx, endable, callbackRejectReason(reason),
 		)
 		if rejectErr == nil {
 			return completedFailure(reason, true, true)

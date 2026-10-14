@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -268,20 +270,24 @@ func redeliveryReconcilerWithPayload(
 	payloadStore *payload.Store,
 ) *Reconciler {
 	t.Helper()
-	return redeliveryReconcilerWithPolicy(t, store, router, chainClient, registry, payloadStore, placement.NoBillingOnlySKUs())
+	return redeliveryReconcilerWithPolicy(t, store, router, chainClient, payloadStore, placement.NoBillingOnlySKUs(), nil)
 }
 
+// redeliveryReconcilerWithPolicy binds a fresh store's runtime with policy and,
+// when ack is set, routes chain acknowledgements to it. A store that already
+// has a bound runtime keeps that runtime's policy, so it takes neither.
 func redeliveryReconcilerWithPolicy(
 	t *testing.T,
 	store *placement.Store,
 	router *backend.Router,
 	chainClient ReconcilerChainClient,
-	_ *operation.Registry,
 	payloadStore *payload.Store,
 	policy *placement.BillingPolicy,
+	ack Acknowledger,
 ) *Reconciler {
 	t.Helper()
 	if bound, ok := redeliveryExecutions.Load(store); ok {
+		require.Nil(t, ack, "a store with a bound runtime keeps its acknowledger")
 		execution := bound.(*placement.ExecutionCoordinator)
 		coordinator := bindTestReconciliationCoordinator(
 			t, store, execution, chainClient, payloadStore, nil,
@@ -299,6 +305,9 @@ func redeliveryReconcilerWithPolicy(
 	reconciliation := bindTestReconciliationCoordinator(
 		t, store, execution, chainClient, payloadStore, nil,
 	)
+	if ack != nil {
+		setTestProviderControlPlane(t, execution, canonicalReconciliationTestChain{ReconciliationChain: chainClient}, ack)
+	}
 	reconciler, err := NewReconciler(
 		ReconcilerConfig{Coordinator: reconciliation}, newMockInFlightTracker(payloadStore),
 	)
@@ -1376,12 +1385,30 @@ func billingOnlyRedeliveryLease(uuid string, state billingtypes.LeaseState) bill
 	return lease
 }
 
-// TestReconciler_RedeliveryRefusesAProvisionTheCurrentPolicyMakesBillingOnly
+// recordingAcknowledger records the leases acknowledged on chain.
+type recordingAcknowledger struct {
+	mu    sync.Mutex
+	acked []string
+}
+
+func (ack *recordingAcknowledger) Acknowledge(_ context.Context, leaseUUID string) (bool, string, error) {
+	ack.mu.Lock()
+	defer ack.mu.Unlock()
+	ack.acked = append(ack.acked, leaseUUID)
+	return true, "tx-ack", nil
+}
+
+func (ack *recordingAcknowledger) leases() []string {
+	ack.mu.Lock()
+	defer ack.mu.Unlock()
+	return slices.Clone(ack.acked)
+}
+
+// TestReconciler_BillingOnlyLeaseKeepsItsProvisionAttemptAndIsAcknowledged
 // persists an ambiguous provision while its SKU is deployable, then reopens
-// the store with the SKU billing-only. The request rebuilt from the durable
-// snapshot is judged by the current policy: it is never sent, and the
-// unresolved attempt is kept as evidence.
-func TestReconciler_RedeliveryRefusesAProvisionTheCurrentPolicyMakesBillingOnly(t *testing.T) {
+// the store with the SKU billing-only. The attempt is never redelivered and
+// stays as evidence, and the lease is still acknowledged so billing starts.
+func TestReconciler_BillingOnlyLeaseKeepsItsProvisionAttemptAndIsAcknowledged(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	backendA := &mockReconcilerBackend{name: "backend-a"}
 	router := redeliveryRouter(t, backendA)
@@ -1400,25 +1427,27 @@ func TestReconciler_RedeliveryRefusesAProvisionTheCurrentPolicyMakesBillingOnly(
 	t.Cleanup(func() { require.NoError(t, store2.Close()) })
 	policy, err := placement.NewBillingPolicy([]string{redeliveryBillingOnlySKU})
 	require.NoError(t, err)
+	ack := &recordingAcknowledger{}
 	reconciler := redeliveryReconcilerWithPolicy(
-		t, store2, router, redeliveryChain([]billingtypes.Lease{target}, nil),
-		operation.NewRegistry(), nil, policy,
+		t, store2, router, redeliveryChain([]billingtypes.Lease{target}, nil), nil, policy, ack,
 	)
 
 	require.NoError(t, reconciler.ReconcileAll(t.Context()))
 
+	assert.Equal(t, []string{redeliveryTarget}, ack.leases(),
+		"the lease is acknowledged although its attempt is unresolved")
 	backendA.mu.Lock()
-	defer backendA.mu.Unlock()
-	assert.Empty(t, backendA.provisionCalls, "the current policy refuses the persisted provision")
+	assert.Empty(t, backendA.provisionCalls, "the attempt is never redelivered")
+	backendA.mu.Unlock()
 	metadata := store2.Lookup(redeliveryTarget).AttemptMetadata()
 	require.True(t, metadata.Valid(), "the unresolved attempt is kept as evidence")
 	assert.Equal(t, operation.KindProvision, metadata.Kind())
 	assert.Equal(t, operationID, metadata.OperationID())
 }
 
-// TestReconciler_RedeliveryRefusesARestoreTheCurrentPolicyMakesBillingOnly is
-// the restore variant: a restore deploys a workload exactly as a provision does.
-func TestReconciler_RedeliveryRefusesARestoreTheCurrentPolicyMakesBillingOnly(t *testing.T) {
+// TestReconciler_BillingOnlyLeaseKeepsItsRestoreAttemptAndIsAcknowledged is the
+// restore variant: a restore deploys a workload exactly as a provision does.
+func TestReconciler_BillingOnlyLeaseKeepsItsRestoreAttemptAndIsAcknowledged(t *testing.T) {
 	backendA := &mockReconcilerBackend{
 		name:          "backend-a",
 		restoreAccept: true,
@@ -1438,19 +1467,73 @@ func TestReconciler_RedeliveryRefusesARestoreTheCurrentPolicyMakesBillingOnly(t 
 	policy, err := placement.NewBillingPolicy([]string{redeliveryBillingOnlySKU})
 	require.NoError(t, err)
 	source := redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_CLOSED)
+	ack := &recordingAcknowledger{}
 	reconciler := redeliveryReconcilerWithPolicy(
 		t, store, router,
 		redeliveryChain([]billingtypes.Lease{target}, map[string]billingtypes.Lease{redeliverySource: source}),
-		operation.NewRegistry(), nil, policy,
+		nil, policy, ack,
 	)
 
 	require.NoError(t, reconciler.ReconcileAll(t.Context()))
 
+	assert.Equal(t, []string{redeliveryTarget}, ack.leases(),
+		"the lease is acknowledged although its attempt is unresolved")
 	backendA.mu.Lock()
-	defer backendA.mu.Unlock()
-	assert.Empty(t, backendA.restoreCalls, "the current policy refuses the persisted restore")
+	assert.Empty(t, backendA.restoreCalls, "the attempt is never redelivered")
+	backendA.mu.Unlock()
 	metadata := store.Lookup(redeliveryTarget).AttemptMetadata()
 	require.True(t, metadata.Valid(), "the unresolved attempt is kept as evidence")
 	assert.Equal(t, operation.KindRestore, metadata.Kind())
 	assert.Equal(t, operationID, metadata.OperationID())
+}
+
+// TestCallbackService_RecoveredFailureNeverRejectsABillingOnlyLease delivers
+// the failure callback of an attempt made while the SKU was deployable, after
+// a restart with the SKU billing-only. The failure settles the attempt, and the
+// lease is left to be acknowledged rather than rejected.
+func TestCallbackService_RecoveredFailureNeverRejectsABillingOnlyLease(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	backendA := &mockReconcilerBackend{name: "backend-a"}
+	router := redeliveryRouter(t, backendA)
+	store1 := openRedeliveryStore(t, dbPath)
+	armTestPlacementTopology(t, store1, backendTopologyNames(router))
+	target := billingOnlyRedeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
+	operationID := persistAmbiguousProvisionOnStore(
+		t, store1, operation.NewRegistry(), router, backendA, target, nil,
+	)
+	require.NoError(t, store1.Close())
+
+	store2 := openRedeliveryStore(t, dbPath)
+	t.Cleanup(func() { require.NoError(t, store2.Close()) })
+	policy, err := placement.NewBillingPolicy([]string{redeliveryBillingOnlySKU})
+	require.NoError(t, err)
+	coordinator := bindTestOperationCoordinator(t, store2)
+	bindTestBackendRuntimeWithPolicy(t, coordinator, router, policy)
+	var rejects atomic.Int32
+	service, err := newCallbackServiceForTest(callbackServiceTestConfig{
+		Coordinator: coordinator,
+		Chain: &callbackChainStub{
+			getLease: func(context.Context, string) (*billingtypes.Lease, error) {
+				lease := target
+				return &lease, nil
+			},
+			reject: func(context.Context, []string, string) (uint64, []string, error) {
+				rejects.Add(1)
+				return 1, []string{"tx-reject"}, nil
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, service.HandleCallback(t.Context(), callbackCommand(t, backend.CallbackPayload{
+		LeaseUUID:   redeliveryTarget,
+		Status:      backend.CallbackStatusFailed,
+		Error:       "backend refused",
+		OperationID: operationID.String(),
+	})))
+
+	assert.Zero(t, rejects.Load(), "a failure callback never rejects a billing-only lease")
+	current := store2.Lookup(redeliveryTarget)
+	assert.Equal(t, placement.StateAbsent, current.State(), "the definitive failure settles the attempt")
+	assert.False(t, current.AttemptMetadata().Valid())
 }

@@ -24,9 +24,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `PROVIDER_BILLING_ONLY_SKUS` sets the list from the environment
   (comma-separated). The policy is bound into the placement backend runtime,
   and a provision or restore request can be minted only from a lease it
-  classified as deployable. It is checked again when a request is sent, so a
-  deployment retried from a durable attempt minted under an earlier policy is
-  never sent for a billing-only lease; the attempt is kept unresolved. A
+  classified as deployable, and is checked again when it is sent. A SKU can
+  be made billing-only while leases already use it: a deployment still in
+  flight is never retried, the lease is still acknowledged, and no failure
+  callback, timeout or lost backend ends it, because every chain rejection and
+  close the placement layer issues needs the policy's consent. Whatever the
+  earlier deployment left on a backend is torn down when the lease ends. A
   billing-only lease that lost its placement with a retired backend is counted
   as `fred_provisioner_reconciler_lost_leases_total{outcome="billing_only"}`.
   (ENG-1453)

@@ -2163,6 +2163,10 @@ all use them is billing-only:
   provisioning reason, including as lost after a backend retirement.
   `POST /v1/leases/{lease_uuid}/data` refuses its payload with `400`, and
   `POST /v1/leases/{lease_uuid}/restore` refuses to restore into it with `400`.
+- A SKU can be made billing-only while leases already use it. Fred never
+  retries a deployment still in flight for such a lease, and no failure
+  callback, timeout or lost backend ends the lease. Whatever the earlier
+  deployment left on a backend is torn down when the lease ends.
 - Billing applies as for any lease: the provider-wide withdrawal settles it,
   and the credit check closes it once its tenant's credit is exhausted.
 

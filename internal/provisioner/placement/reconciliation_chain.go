@@ -114,7 +114,11 @@ func (authority *ReconciliationCoordinator) RejectObserved(
 	if err := authority.coordinator.store.leaseSideEffectError(action.lease.Uuid); err != nil {
 		return 0, nil, err
 	}
-	return authority.controlPlane.rejectLease(ctx, action.lease.Uuid, reason)
+	endable, err := authority.controlPlane.mayEnd(&action.lease)
+	if err != nil {
+		return 0, nil, err
+	}
+	return authority.controlPlane.rejectLease(ctx, endable, reason)
 }
 
 // CloseObserved closes the exact ACTIVE lease carried by action. A caller
@@ -132,7 +136,11 @@ func (authority *ReconciliationCoordinator) CloseObserved(
 	if err := authority.coordinator.store.leaseSideEffectError(action.lease.Uuid); err != nil {
 		return 0, nil, err
 	}
-	return authority.controlPlane.closeLease(ctx, action.lease.Uuid, reason)
+	endable, err := authority.controlPlane.mayEnd(&action.lease)
+	if err != nil {
+		return 0, nil, err
+	}
+	return authority.controlPlane.closeLease(ctx, endable, reason)
 }
 
 // AcknowledgeObserved acknowledges only the exact PENDING action minted by the

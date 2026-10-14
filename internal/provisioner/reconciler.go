@@ -571,7 +571,15 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				deferForSnapshotBoundary("inventory_projection_unavailable")
 				return nil
 			}
-			if metadata := placementRecord.AttemptMetadata(); metadata.Valid() {
+			// A billing-only lease's plan never reads backend inventory: it is
+			// acknowledged while PENDING and otherwise left alone. Neither
+			// action can lay a workload over data, so absence evidence that
+			// cannot be trusted does not defer it. Nor is a deployment attempt
+			// left from before its SKU became billing-only ever redelivered:
+			// the attempt stays as evidence until the lease ends, when terminal
+			// convergence tears it down.
+			billingOnly := r.coordinator.ClassifyLease(&lease).BillingOnly()
+			if metadata := placementRecord.AttemptMetadata(); metadata.Valid() && !billingOnly {
 				if _, attemptFenced := inventory.fenced[placementRecord.Attempt]; attemptFenced {
 					// Redelivery to a fenced backend is refused locally every
 					// time. The attempt is preserved and waits for the fence.
@@ -605,11 +613,6 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				}
 				return nil
 			}
-			// A billing-only lease's plan never reads backend inventory: it is
-			// acknowledged while PENDING and otherwise left alone. Neither
-			// action can lay a workload over data, so absence evidence that
-			// cannot be trusted does not defer it.
-			billingOnly := r.coordinator.ClassifyLease(&lease).BillingOnly()
 			if !billingOnly && r.coordinator.AbsenceUntrusted(leaseUUID) {
 				deferForSnapshotBoundary("placement_observation_excluded")
 				return nil

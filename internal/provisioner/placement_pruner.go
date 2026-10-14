@@ -177,7 +177,8 @@ schedule:
 					break
 				}
 				// A live lease's ambiguous effect is handled by exact same-operation
-				// redelivery in the main pass. For a lease absent from that PENDING/ACTIVE
+				// redelivery in the main pass, or kept as evidence there while the
+				// lease is billing-only. For a lease absent from that PENDING/ACTIVE
 				// snapshot, exact terminal convergence first proves its current chain state
 				// and idempotently tears down only the durable candidate backend(s). Every
 				// uncertainty preserves the Attempt; inventory silence alone never clears it.

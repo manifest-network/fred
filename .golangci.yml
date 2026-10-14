@@ -148,6 +148,12 @@ linters:
         #     may build one.
         - pattern: '^(provisionDelivery|restoreDelivery)$'
           msg: "[deployment-delivery] build a delivery only through attestProvision or attestRestore in internal/provisioner/placement/backend_execution.go (ENG-1453)"
+        #   - [lease-end]: the bound control plane's rejectLease and closeLease
+        #     take only an endableLease, and only provider_control_plane.go,
+        #     where mayEnd and mayEndOperation refuse a billing-only lease, may
+        #     build one.
+        - pattern: '^endableLease$'
+          msg: "[lease-end] build an endableLease only through mayEnd or mayEndOperation in internal/provisioner/placement/provider_control_plane.go (ENG-1453)"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -225,6 +231,12 @@ linters:
         linters:
           - forbidigo
         text: '\[deployment-delivery\]'
+      # [lease-end] (ENG-1453): the billing policy's check before a lease is
+      # ended on chain.
+      - path: ^internal/provisioner/placement/provider_control_plane\.go$
+        linters:
+          - forbidigo
+        text: '\[lease-end\]'
       # Exclude test files from strict linters
       - path: _test\.go
         linters:

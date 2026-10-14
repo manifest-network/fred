@@ -247,26 +247,34 @@ type restoreDelivery struct{ request backend.RestoreRequest }
 var errNotDeployable = errors.New("the billing policy classifies this request as billing-only; it is not deployed")
 
 func (coordinator *OperationCoordinator) attestProvision(request backend.ProvisionRequest) (provisionDelivery, error) {
-	if !coordinator.permits(request.Items) {
+	policy, err := coordinator.boundPolicy()
+	if err != nil {
+		return provisionDelivery{}, err
+	}
+	if !policy.permits(request.Items) {
 		return provisionDelivery{}, fmt.Errorf("provision lease %s: %w", request.LeaseUUID, errNotDeployable)
 	}
 	return provisionDelivery{request: request}, nil
 }
 
 func (coordinator *OperationCoordinator) attestRestore(request backend.RestoreRequest) (restoreDelivery, error) {
-	if !coordinator.permits(request.Items) {
+	policy, err := coordinator.boundPolicy()
+	if err != nil {
+		return restoreDelivery{}, err
+	}
+	if !policy.permits(request.Items) {
 		return restoreDelivery{}, fmt.Errorf("restore into lease %s: %w", request.LeaseUUID, errNotDeployable)
 	}
 	return restoreDelivery{request: request}, nil
 }
 
-// permits asks the billing policy bound with the backend runtime. Before a
-// runtime is bound nothing is permitted.
-func (coordinator *OperationCoordinator) permits(items []backend.LeaseItem) bool {
-	if coordinator == nil || coordinator.execution == nil {
-		return false
+// boundPolicy returns the billing policy bound with the backend runtime.
+// Before a runtime is bound there is none, and nothing is attested.
+func (coordinator *OperationCoordinator) boundPolicy() (*BillingPolicy, error) {
+	if coordinator == nil || coordinator.execution == nil || !coordinator.execution.policy.valid() {
+		return nil, errors.New("no billing policy is bound to attest a backend request")
 	}
-	return coordinator.execution.policy.permits(items)
+	return coordinator.execution.policy, nil
 }
 
 func invokeProvision(

@@ -345,3 +345,67 @@ func TestRestoreApplication_RefusesBillingOnlyTarget(t *testing.T) {
 	assert.Zero(t, calls.Load(), "a billing-only lease never reaches the backend")
 	assert.Equal(t, StateAbsent, store.Lookup(targetLease).State(), "nothing is admitted for the target")
 }
+
+func TestBillingPolicy_PermitsRequestItems(t *testing.T) {
+	item := func(sku string) backend.LeaseItem { return backend.LeaseItem{SKU: sku, Quantity: 1} }
+	policy := testBillingOnlyPolicy(t)
+	assert.False(t, policy.permits([]backend.LeaseItem{item(testBillingOnlySKU)}), "every SKU is billing-only")
+	assert.True(t, policy.permits([]backend.LeaseItem{item(testBillingOnlySKU), item("sku-deployable")}), "a mixed request")
+	assert.True(t, policy.permits(nil), "request validation, not the policy, refuses a request without items")
+	assert.True(t, NoBillingOnlySKUs().permits([]backend.LeaseItem{item(testBillingOnlySKU)}))
+	var unbound *BillingPolicy
+	assert.False(t, unbound.permits([]backend.LeaseItem{item("sku-deployable")}), "a nil policy permits nothing")
+	assert.False(t, (&BillingPolicy{}).permits([]backend.LeaseItem{item("sku-deployable")}), "a zero policy permits nothing")
+}
+
+// TestAttestation_RefusesRequestsTheCurrentPolicyMakesBillingOnly pins the
+// send-time check that invokeProvision and invokeRestore depend on: a request
+// is judged by the policy bound now, whatever policy minted its snapshot.
+func TestAttestation_RefusesRequestsTheCurrentPolicyMakesBillingOnly(t *testing.T) {
+	store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
+	base, err := newOperationCoordinator(store, operation.NewRegistry())
+	require.NoError(t, err)
+	billingOnly := []backend.LeaseItem{{SKU: testBillingOnlySKU, Quantity: 1}}
+	deployable := []backend.LeaseItem{{SKU: "sku-deployable", Quantity: 1}}
+
+	_, err = base.attestProvision(backend.ProvisionRequest{LeaseUUID: testBillingOnlyLease, Items: deployable})
+	require.ErrorContains(t, err, "no billing policy is bound", "nothing is attested before a runtime is bound")
+
+	bindExecutionWithPolicyForTest(t, base,
+		newExecutionTestRuntime(&executionTestBackend{name: "backend-a"}), testBillingOnlyPolicy(t))
+	_, err = base.attestProvision(backend.ProvisionRequest{LeaseUUID: testBillingOnlyLease, Items: billingOnly})
+	require.ErrorIs(t, err, errNotDeployable)
+	_, err = base.attestRestore(backend.RestoreRequest{LeaseUUID: testBillingOnlyLease, Items: billingOnly})
+	require.ErrorIs(t, err, errNotDeployable)
+	provision, err := base.attestProvision(backend.ProvisionRequest{LeaseUUID: testBillingOnlyLease, Items: deployable})
+	require.NoError(t, err)
+	assert.Equal(t, testBillingOnlyLease, provision.request.LeaseUUID)
+	restore, err := base.attestRestore(backend.RestoreRequest{LeaseUUID: testBillingOnlyLease, Items: deployable})
+	require.NoError(t, err)
+	assert.Equal(t, testBillingOnlyLease, restore.request.LeaseUUID)
+}
+
+// TestProviderControlPlane_NeverEndsABillingOnlyLease pins the choke point
+// every placement rejection and close goes through.
+func TestProviderControlPlane_NeverEndsABillingOnlyLease(t *testing.T) {
+	store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
+	base, err := newOperationCoordinator(store, operation.NewRegistry())
+	require.NoError(t, err)
+	execution := bindExecutionWithPolicyForTest(t, base,
+		newExecutionTestRuntime(&executionTestBackend{name: "backend-a"}), testBillingOnlyPolicy(t))
+	control := execution.controlPlane
+
+	_, err = control.mayEnd(billingTestLease(testBillingOnlySKU))
+	require.ErrorIs(t, err, errBillingOnlyLeaseNotEnded)
+	mixed, err := control.mayEnd(billingTestLease(testBillingOnlySKU, "sku-deployable"))
+	require.NoError(t, err, "a lease with a deployable SKU is Fred's to end")
+	assert.Equal(t, testBillingOnlyLease, mixed.uuid)
+	_, err = control.mayEnd(billingTestLease())
+	require.NoError(t, err, "a lease without items is ended as before")
+	_, err = control.mayEnd(nil)
+	require.Error(t, err)
+	_, _, err = control.rejectLease(t.Context(), endableLease{}, "reason")
+	require.Error(t, err, "the zero value ends nothing")
+	_, _, err = control.closeLease(t.Context(), endableLease{}, "reason")
+	require.Error(t, err, "the zero value ends nothing")
+}

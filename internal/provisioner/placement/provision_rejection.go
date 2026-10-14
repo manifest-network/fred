@@ -71,12 +71,16 @@ func (authority *ProvisionCoordinator) rejectInvalidProvision(
 	if err := authority.coordinator.store.leaseSideEffectError(lease.Uuid); err != nil {
 		return uncertain(err)
 	}
+	endable, err := authority.controlPlane.mayEnd(&exact.lease)
+	if err != nil {
+		return uncertain(err)
+	}
 	reason := provisionRejectionReason(invalid)
 	slog.WarnContext(ctx, "provision validation failed, rejecting lease",
 		"lease_uuid", lease.Uuid, "tenant", lease.Tenant,
 		"reason", reason, "error", invalid.Err(),
 	)
-	rejected, _, err := authority.controlPlane.rejectLease(ctx, lease.Uuid, reason)
+	rejected, _, err := authority.controlPlane.rejectLease(ctx, endable, reason)
 	if err != nil || rejected != 1 {
 		// An RPC error can follow a committed rejection. Only a fresh exact
 		// terminal observation permits cleanup; Pending, Active and unknown
