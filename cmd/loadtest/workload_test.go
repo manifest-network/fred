@@ -27,6 +27,7 @@ import (
 	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/provisioner/callbackwire"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 type fixtureChain map[string]*billingtypes.Lease
@@ -125,6 +126,7 @@ func TestAuthenticatedFixturesReachRealAPI(t *testing.T) {
 		Addr: address, ProviderUUID: providerID, Bech32Prefix: "manifest",
 		RateLimitRPS: 100, RateLimitBurst: 100, MaxRequestBodySize: 1 << 20,
 		TokenTrackerDBPath: filepath.Join(t.TempDir(), "tokens.db"),
+		BillingPolicy:      placement.NoBillingOnlySKUs(),
 		CallbackKeys: map[backendidentity.ID]api.CallbackKey{
 			storageID: {Backend: "loadtest", Keys: callbackKeys},
 		},
