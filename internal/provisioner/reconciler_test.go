@@ -349,10 +349,15 @@ type mockReconcilerBackend struct {
 	listErr                   error
 	retentionErr              error
 	refreshErr                error
-	onListProvisions          func()
-	onListRetentions          func()
-	onProvision               func()
-	onDeprovision             func()
+	// releases is the per-lease history GetReleases returns. A lease without
+	// an entry answers ErrNotProvisioned, the historical behavior of this mock.
+	releases         map[string][]backend.ReleaseInfo
+	releasesErr      error
+	getReleasesCalls []string
+	onListProvisions func()
+	onListRetentions func()
+	onProvision      func()
+	onDeprovision    func()
 }
 
 func testBackendStorageID(name string) backendidentity.ID {
@@ -525,7 +530,21 @@ func (m *mockReconcilerBackend) ReconcileCustomDomain(ctx context.Context, lease
 	return m.reconcileCustomDomainErr
 }
 func (m *mockReconcilerBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
-	return nil, backend.ErrNotProvisioned
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getReleasesCalls = append(m.getReleasesCalls, leaseUUID)
+	if m.releasesErr != nil {
+		return nil, m.releasesErr
+	}
+	releases, ok := m.releases[leaseUUID]
+	if !ok {
+		return nil, backend.ErrNotProvisioned
+	}
+	cloned := slices.Clone(releases)
+	for index := range cloned {
+		cloned[index].Manifest = slices.Clone(cloned[index].Manifest)
+	}
+	return cloned, nil
 }
 
 func (m *mockReconcilerBackend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
@@ -5325,8 +5344,10 @@ func TestReconciler_ReconcileAll_ListProvisionError_DefersWithoutAborting(t *tes
 
 func TestReconciler_ReconcileAll_ActiveFailedPayloadNotAvailable_Defers(t *testing.T) {
 	// ACTIVE lease with failed provision (FailCount < max). Re-provisioning
-	// requires a payload (MetaHash is set), but the payload store is empty.
-	// Missing local durable input is not chain proof that the lease is invalid.
+	// requires a payload (MetaHash is set), but the payload store is empty and
+	// the owner reports no release to rebuild it from (this mock answers
+	// GetReleases with ErrNotProvisioned). Missing local durable input is not
+	// chain proof that the lease is invalid.
 	var closedLeases []string
 	var closedReason string
 	var mu sync.Mutex
@@ -5395,6 +5416,207 @@ func TestReconciler_ReconcileAll_ActiveFailedPayloadNotAvailable_Defers(t *testi
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
 	assert.Empty(t, mockBackend.provisionCalls)
+	assert.Equal(t, []string{"lease-1"}, mockBackend.getReleasesCalls,
+		"the owner was asked for a release to rebuild the payload from")
+}
+
+// payloadRebuildFixture is the ENG-1442 shape: an ACTIVE lease whose on-chain
+// meta_hash names the manifest its tenant created it with, whose backend reports
+// it failed, and for which fred holds no payload — a restored lease, whose
+// backend re-deployed a retained manifest fred never received.
+type payloadRebuildFixture struct {
+	reconciler *Reconciler
+	backend    *mockReconcilerBackend
+	payloads   *payload.Store
+
+	mu     sync.Mutex
+	closed []string
+}
+
+func newPayloadRebuildFixture(
+	t *testing.T,
+	configure func(*mockReconcilerBackend),
+) *payloadRebuildFixture {
+	t.Helper()
+	fixture := &payloadRebuildFixture{}
+	metaHash := sha256.Sum256([]byte("manifest the tenant created the lease with"))
+	mockChain := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{{
+				Uuid:     "lease-1",
+				Tenant:   "tenant-1",
+				State:    billingtypes.LEASE_STATE_ACTIVE,
+				MetaHash: metaHash[:],
+				Items:    []billingtypes.LeaseItem{{SkuUuid: "docker-micro", Quantity: 1}},
+			}}, nil
+		},
+		CloseLeasesFunc: func(_ context.Context, leaseUUIDs []string, _ string) (uint64, []string, error) {
+			fixture.mu.Lock()
+			defer fixture.mu.Unlock()
+			fixture.closed = append(fixture.closed, leaseUUIDs...)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	fixture.backend = &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{{
+			LeaseUUID:   "lease-1",
+			Status:      backend.ProvisionStatusFailed,
+			FailCount:   1,
+			BackendName: "test",
+		}},
+	}
+	if configure != nil {
+		configure(fixture.backend)
+	}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: fixture.backend, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	fixture.payloads, err = payload.NewStore(payload.StoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "payloads.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = fixture.payloads.Close() })
+	fixture.reconciler, err = newTestReconciler(
+		t, ReconcilerConfig{}, mockChain, noopAck, router,
+		newMockInFlightTracker(fixture.payloads), nil,
+	)
+	require.NoError(t, err)
+	return fixture
+}
+
+func (fixture *payloadRebuildFixture) closedLeases() []string {
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	return slices.Clone(fixture.closed)
+}
+
+func (fixture *payloadRebuildFixture) provisionCalls() []backend.ProvisionRequest {
+	fixture.backend.mu.Lock()
+	defer fixture.backend.mu.Unlock()
+	return slices.Clone(fixture.backend.provisionCalls)
+}
+
+func (fixture *payloadRebuildFixture) releaseReads() []string {
+	fixture.backend.mu.Lock()
+	defer fixture.backend.mu.Unlock()
+	return slices.Clone(fixture.backend.getReleasesCalls)
+}
+
+func TestReconciler_ReconcileAll_ActiveFailedNoPayload_RebuildsFromActiveRelease(t *testing.T) {
+	// ENG-1442: the payload is rebuilt from the owner's latest active release,
+	// stored as the lease's request authority under its own recorded hash, and
+	// the lease is re-provisioned from it instead of staying down forever.
+	restored := []byte(`{"services":{"app":{"image":"example.invalid/app:restored"}}}`)
+	restoredHash := sha256.Sum256(restored)
+	fixture := newPayloadRebuildFixture(t, func(b *mockReconcilerBackend) {
+		b.releases = map[string][]backend.ReleaseInfo{"lease-1": {
+			{Version: 1, Status: "superseded", Manifest: []byte(`{"version":"older"}`)},
+			{Version: 2, Status: "active", Manifest: restored},
+			{Version: 3, Status: "failed", Manifest: []byte(`{"version":"failed-update"}`)},
+		}}
+	})
+
+	require.NoError(t, fixture.reconciler.ReconcileAll(t.Context()))
+
+	calls := fixture.provisionCalls()
+	require.Len(t, calls, 1, "the lease must be re-provisioned from its rebuilt payload")
+	assert.Equal(t, restored, calls[0].Payload)
+	assert.Equal(t, hex.EncodeToString(restoredHash[:]), calls[0].PayloadHash)
+	stored, recordedHash, err := fixture.payloads.GetWithHash("lease-1")
+	require.NoError(t, err)
+	assert.Equal(t, restored, stored, "the rebuilt payload becomes the lease's stored payload")
+	assert.Equal(t, restoredHash[:], recordedHash)
+	assert.Equal(t, []string{"lease-1"}, fixture.releaseReads())
+	assert.Empty(t, fixture.closedLeases())
+}
+
+func TestReconciler_ReconcileAll_RebuiltPayloadSurvivesAmbiguousProvision(t *testing.T) {
+	// The rebuilt payload is stored before the call, so an ambiguous outcome's
+	// durable attempt is redelivered with the exact same bytes from the payload
+	// store on the next sweep, without reading the release history again.
+	restored := []byte(`{"services":{"app":{"image":"example.invalid/app:restored"}}}`)
+	restoredHash := sha256.Sum256(restored)
+	fixture := newPayloadRebuildFixture(t, func(b *mockReconcilerBackend) {
+		b.releases = map[string][]backend.ReleaseInfo{"lease-1": {
+			{Version: 1, Status: "active", Manifest: restored},
+		}}
+		b.provisionErr = errors.New("connection reset after the request was sent")
+	})
+
+	require.NoError(t, fixture.reconciler.ReconcileAll(t.Context()))
+	fixture.backend.mu.Lock()
+	fixture.backend.provisionErr = nil
+	fixture.backend.mu.Unlock()
+	require.NoError(t, fixture.reconciler.ReconcileAll(t.Context()))
+
+	calls := fixture.provisionCalls()
+	require.Len(t, calls, 2, "the ambiguous attempt must be redelivered")
+	for _, call := range calls {
+		assert.Equal(t, restored, call.Payload)
+		assert.Equal(t, hex.EncodeToString(restoredHash[:]), call.PayloadHash)
+	}
+	assert.Equal(t, calls[0].CallbackURL, calls[1].CallbackURL,
+		"redelivery repeats the exact recorded operation")
+	assert.Equal(t, []string{"lease-1"}, fixture.releaseReads(),
+		"once stored, the payload store is the only source")
+	assert.Empty(t, fixture.closedLeases())
+}
+
+func TestReconciler_ReconcileAll_ActiveFailedNoPayload_DefersWithoutActiveRelease(t *testing.T) {
+	tests := map[string]func(*mockReconcilerBackend){
+		"no active release": func(b *mockReconcilerBackend) {
+			b.releases = map[string][]backend.ReleaseInfo{"lease-1": {
+				{Version: 1, Status: "superseded", Manifest: []byte(`{"version":"older"}`)},
+				{Version: 2, Status: "failed", Manifest: []byte(`{"version":"failed"}`)},
+			}}
+		},
+		"active release without a manifest": func(b *mockReconcilerBackend) {
+			b.releases = map[string][]backend.ReleaseInfo{"lease-1": {
+				{Version: 1, Status: "active"},
+			}}
+		},
+		"release read fails": func(b *mockReconcilerBackend) {
+			b.releasesErr = errors.New("backend unavailable")
+		},
+	}
+	for name, configure := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture := newPayloadRebuildFixture(t, configure)
+
+			require.NoError(t, fixture.reconciler.ReconcileAll(t.Context()))
+
+			assert.Equal(t, []string{"lease-1"}, fixture.releaseReads())
+			assert.Empty(t, fixture.provisionCalls(),
+				"a lease without a rebuildable payload must not be provisioned")
+			has, err := fixture.payloads.Has("lease-1")
+			require.NoError(t, err)
+			assert.False(t, has, "nothing may be stored without an active release manifest")
+			assert.Empty(t, fixture.closedLeases(), "missing payload input never closes a live lease")
+		})
+	}
+}
+
+func TestReconciler_ReconcileAll_StoredPayloadIsNotRebuilt(t *testing.T) {
+	// A stored payload is the lease's request authority (it may hold a tenant
+	// update); the owner's release history is consulted only in its absence.
+	stored := []byte("manifest stored for the lease")
+	storedHash := sha256.Sum256(stored)
+	fixture := newPayloadRebuildFixture(t, func(b *mockReconcilerBackend) {
+		b.releases = map[string][]backend.ReleaseInfo{"lease-1": {
+			{Version: 1, Status: "active", Manifest: []byte(`{"version":"release"}`)},
+		}}
+	})
+	require.True(t, fixture.payloads.Store("lease-1", stored))
+
+	require.NoError(t, fixture.reconciler.ReconcileAll(t.Context()))
+
+	calls := fixture.provisionCalls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, stored, calls[0].Payload)
+	assert.Equal(t, hex.EncodeToString(storedHash[:]), calls[0].PayloadHash)
+	assert.Empty(t, fixture.releaseReads())
 }
 
 func TestReconciler_ReconcileAll_PendingWithMetaHash_NoPayload_Waits(t *testing.T) {
@@ -5457,6 +5679,8 @@ func TestReconciler_ReconcileAll_PendingWithMetaHash_NoPayload_Waits(t *testing.
 	defer mockBackend.mu.Unlock()
 	assert.Empty(t, mockBackend.provisionCalls, "should not provision without payload")
 	assert.Empty(t, mockBackend.deprovisionCalls, "should not deprovision")
+	assert.Empty(t, mockBackend.getReleasesCalls,
+		"a PENDING lease's payload comes only from its tenant's upload")
 
 	mu.Lock()
 	defer mu.Unlock()

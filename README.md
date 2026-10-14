@@ -676,7 +676,7 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 - `state` - Chain lease state as its protobuf enum name: `LEASE_STATE_PENDING`, `LEASE_STATE_ACTIVE`, `LEASE_STATE_CLOSED`, `LEASE_STATE_REJECTED`, or `LEASE_STATE_EXPIRED`. A value this build does not recognize is reported as its number, and an answer from the retained record (see below) reports `LEASE_STATE_UNSPECIFIED`. `UNSPECIFIED` and unrecognized future values are non-actionable safety states: reconciliation preserves backend state and retries rather than inferring cleanup authority.
 - `requires_payload` - True if lease has meta_hash (expects payload upload)
 - `meta_hash_hex` - Expected payload hash in hex (omitted if no meta_hash)
-- `payload_received` - True if payload has been uploaded
+- `payload_received` - True if Fred holds a payload for the lease: uploaded, stored by a confirmed update, or rebuilt from the backend's active release (see [Restore Lease](#restore-lease))
 - `provisioning_started` - True if provisioning is in progress
 - `provision_status` - Backend provision status (omitted if not provisioned). May be `retained` for a closed/expired lease whose data was soft-deleted and is restorable (see [retention](internal/backend/docker/README.md#soft-delete--restore))
 - `fail_count` - Lifetime count of recorded failures, whoever caused them (omitted if zero). A diagnostic only: it never decides whether the lease is closed
@@ -1088,6 +1088,15 @@ Content-Type: application/json
 ```
 
 Restore a soft-deleted lease's retained data into a **new** lease. The path `lease_uuid` is the new, fresh `PENDING` lease the data is adopted into; `from_lease_uuid` in the body names the original closed/expired lease whose volumes were retained (see [retention](internal/backend/docker/README.md#soft-delete--restore)). Fred resolves the backend that holds the source lease's retained data (restore is same-backend, ENG-333), then re-deploys the retained manifest onto the adopted volumes. Only the item **shape** must match: the new lease's requested service names and quantities must equal the original's, but its SKU/disk tier MAY differ. A promote (same-or-larger disk tier) satisfies the tier-size check but still requires sufficient backend capacity and the other admission checks; on success, the new `disk_mb` cap is applied; a demote (smaller disk tier) is allowed only if the retained volume's measured data still fits the new tier's `disk_mb` cap (the backend runs `checkDemoteFit` before adopting). A refused demote returns `422 Unprocessable Entity`; the JSON body's `error` message begins `retained data exceeds the requested smaller tier` (the body's `code` field is the numeric HTTP status, not a string discriminator).
+
+Fred never receives the retained manifest, so it holds no payload for the new
+lease. If the new lease has a `meta_hash` and later has to be re-provisioned
+(for example after a host reboot loses its containers), the reconciler stores
+the manifest of the latest `active` release the owning backend reports on
+`GET /releases/{lease_uuid}` as the lease's payload and re-provisions from it,
+onto the same data (ENG-1442). Create the new lease with a `meta_hash`, as
+restore clients do by reusing the source lease's: Fred provisions a lease
+without one, with no payload, as soon as it is created.
 
 Admission is safe by construction. Fred acquires ordered lifecycle claims for the
 source and target, then obtains a store-issued reservation of the exact confirmed
@@ -1512,7 +1521,7 @@ Start provisioning a resource (async).
 - `items` - Array of lease items: the on-chain SKU UUID (`sku`), `quantity`, and the optional `service_name` and `custom_domain`, as recorded on chain. All items belong to the same provider.
 - `callback_url` - Exact operation-completion URL containing one canonical UUIDv4 `operation_id`; preserve it byte-for-byte and use it only for this provision result. New tokenless provision and restore operations are rejected before durable admission.
 - `lifecycle_callback_url` - Typed URL for exact restart/update/custom-domain completion plus autonomous failure and deprovision observations. If omitted, bundled backends derive it from the typed operation URL; if supplied, it must match that derivation exactly. Bundled backends keep maintenance completion non-coalescible even though it uses this lifecycle route.
-- `payload` - Optional base64-encoded deployment payload: the payload Fred stores for the lease (uploaded for its `meta_hash`, or written by a later confirmed update). Absent for a lease without one
+- `payload` - Optional base64-encoded deployment payload: the payload Fred stores for the lease (uploaded for its `meta_hash`, written by a later confirmed update, or, for an `ACTIVE` lease with a `meta_hash` that Fred holds none for, the `manifest` of the latest `active` release from `GET /releases/{lease_uuid}`). Absent for a lease without one
 - `payload_hash` - Optional hex-encoded SHA-256 hash of `payload` (only present with payload)
 
 **Response:** `202 Accepted`
@@ -2181,8 +2190,12 @@ volume over live data. Terminal and not-found provisions are handled by the
 separately gated destructive passes below.
 
 A provision the reconciler starts sends the lease's stored payload when it has
-one; an `ACTIVE` lease with a `meta_hash` whose payload is missing is retried on
-the next sweep, never closed for it. If the backend definitively refuses that provision
+one. An `ACTIVE` lease with a `meta_hash` whose payload is missing, such as a
+restored lease, first gets one: the reconciler stores the manifest of the latest
+`active` release its confirmed owner reports on `GET /releases/{lease_uuid}`.
+If the owner reports none or cannot be read, the lease is retried on the next
+sweep, never closed for it. A `PENDING` lease only ever waits for its tenant's
+upload. If the backend definitively refuses that provision
 as invalid, Fred rejects a `PENDING` lease, or closes an `ACTIVE` one, on chain
 with the refusal's reason.
 

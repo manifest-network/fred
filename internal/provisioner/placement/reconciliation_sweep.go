@@ -1057,6 +1057,11 @@ func (authority *ReconciliationCoordinator) Provision(
 		return invalid(errors.New("payload bytes require a typed fingerprint"))
 	}
 	lease := action.lease
+	if len(lease.MetaHash) > 0 && !fingerprint.Valid() {
+		// The docker backend refuses a payloadless provision as an invalid
+		// manifest, and a validation refusal closes an ACTIVE lease.
+		return invalid(errors.New("payload-bearing lease requires its exact payload"))
+	}
 	if len(lease.Items) == 0 || lease.Items[0].SkuUuid == "" {
 		return invalid(errors.New("reconciliation lease has no routable SKU"))
 	}
@@ -1193,6 +1198,36 @@ func (authority *ReconciliationCoordinator) DeprovisionObserved(
 		return err
 	}
 	return authority.deprovisionExact(ctx, action.record.Backend, action.lease.Uuid)
+}
+
+// ObservedActiveReleaseManifest reads the manifest of the latest active release
+// the action's confirmed owner holds for an ACTIVE lease. Reconciliation uses it
+// only to rebuild the payload of a live lease providerd holds none for, such as
+// a lease created by restore, whose backend re-deployed a retained manifest
+// providerd never received (ENG-1442), or one missing from a restored payload
+// database.
+// The owner is the live confirmed placement record, never a SKU route
+// (ENG-635). A PENDING lease is refused: its only request authority is its
+// tenant's upload, verified against the on-chain MetaHash.
+func (authority *ReconciliationCoordinator) ObservedActiveReleaseManifest(
+	ctx context.Context,
+	action ObservedReconciliationAction,
+) ([]byte, int, error) {
+	if !authority.Valid() || ctx == nil || !action.validFor(authority) ||
+		action.record.State() != StateConfirmed ||
+		action.lease.State != billingtypes.LEASE_STATE_ACTIVE {
+		return nil, 0, errors.New("invalid observed active-release read")
+	}
+	leaseUUID := action.lease.Uuid
+	if err := authority.coordinator.store.leaseSideEffectError(leaseUUID); err != nil {
+		return nil, 0, err
+	}
+	current := authority.coordinator.store.Lookup(leaseUUID)
+	if current.Revision() != action.record.Revision() || current.State() != StateConfirmed ||
+		current.Backend != action.record.Backend || current.Attempt != action.record.Attempt {
+		return nil, 0, ErrReconciliationBoundaryStale
+	}
+	return authority.activeReleaseManifest(ctx, action.record.Backend, leaseUUID)
 }
 
 // ObservedOrphanAction binds one provision row from this sweep to a positive

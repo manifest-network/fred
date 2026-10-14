@@ -85,6 +85,7 @@ type executionTestBackend struct {
 	restart     func(context.Context, backend.RestartRequest) error
 	update      func(context.Context, backend.UpdateRequest) error
 	get         func(context.Context, string) (*backend.ProvisionInfo, error)
+	releases    func(context.Context, string) ([]backend.ReleaseInfo, error)
 }
 
 func (client *executionTestBackend) Name() string { return client.name }
@@ -141,7 +142,10 @@ func (*executionTestBackend) GetLogs(context.Context, string, int) (map[string]s
 func (*executionTestBackend) ReconcileCustomDomain(context.Context, string, []backend.LeaseItem) error {
 	return nil
 }
-func (*executionTestBackend) GetReleases(context.Context, string) ([]backend.ReleaseInfo, error) {
+func (client *executionTestBackend) GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error) {
+	if client.releases != nil {
+		return client.releases(ctx, leaseUUID)
+	}
 	return nil, nil
 }
 func (*executionTestBackend) GetLoadStats(context.Context) (*backend.LoadStats, error) {

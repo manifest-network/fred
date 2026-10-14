@@ -108,9 +108,11 @@ type writeResult struct {
 	err     error
 }
 
-// Store stores pending payloads for leases awaiting provisioning.
-// Payloads are persisted to bbolt to survive restarts.
-// The chain's MetaHash remains the source of truth for validation.
+// Store keeps the deployment payload of each live lease that has one: the
+// manifest its first provision sends and every re-provision replays. Payloads
+// are persisted to bbolt to survive restarts, each with a recorded hash for
+// readers to verify; the package doc lists where they come from and when they
+// are removed.
 //
 // Write operations are batched through a dedicated writer goroutine to reduce
 // bbolt lock contention under high concurrency.

@@ -106,6 +106,9 @@
 //
 // The PayloadStore provides lease-lifetime storage for tenant deployment payloads:
 //   - Stores payloads uploaded via API and replacements accepted by update
+//   - Stores, for an ACTIVE lease with a meta_hash that the reconciler must
+//     re-provision without one (a restored lease, ENG-1442), the manifest of
+//     its owner's active release
 //   - Retains the current payload so reconciliation can safely re-provision
 //   - Uses write batching for efficiency under load
 //   - Reconciler-driven cleanup when leases are no longer active

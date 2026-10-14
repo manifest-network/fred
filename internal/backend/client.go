@@ -872,6 +872,10 @@ type RestoreRequest struct {
 // ErrNotProvisioned (which concerns live provisions).
 var ErrNotRetained = errors.New("no retained data for lease")
 
+// ReleaseStatusActive is the status of the release whose manifest a lease
+// currently runs (BACKEND_GUIDE.md, GET /releases/{lease_uuid}).
+const ReleaseStatusActive = "active"
+
 // ReleaseInfo describes a single release in the history.
 type ReleaseInfo struct {
 	Version   int       `json:"version"`

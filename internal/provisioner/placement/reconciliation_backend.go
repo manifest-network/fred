@@ -254,6 +254,50 @@ func (authority *ReconciliationCoordinator) reconcileCustomDomain(
 	return client.ReconcileCustomDomain(ctx, leaseUUID, append([]backend.LeaseItem(nil), items...))
 }
 
+// errNoActiveRelease reports that the owner answered but holds no active
+// release with a manifest for the lease.
+var errNoActiveRelease = errors.New("owner backend holds no active release with a manifest")
+
+// activeReleaseManifest returns a copy of the manifest of the highest-version
+// active release backendName reports for leaseUUID. An empty manifest (a legacy
+// status-only row) counts as none: re-sent as a provision payload it would be
+// refused as invalid, and that refusal closes an ACTIVE lease.
+func (authority *ReconciliationCoordinator) activeReleaseManifest(
+	ctx context.Context,
+	backendName, leaseUUID string,
+) (manifest []byte, version int, err error) {
+	client, err := exactBackend(authority.backends, backendName)
+	if err != nil {
+		return nil, 0, err
+	}
+	if backend.IsFenced(client) {
+		return nil, 0, fmt.Errorf("backend %q: %w", backendName, backend.ErrBackendFenced)
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_releases").Inc()
+			manifest, version = nil, 0
+			err = fmt.Errorf("read releases from %q panicked: %v\n%s",
+				backendName, recovered, debug.Stack())
+		}
+	}()
+	releases, err := client.GetReleases(ctx, leaseUUID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read releases from %q: %w", backendName, err)
+	}
+	latest := -1
+	for index, release := range releases {
+		if release.Status == backend.ReleaseStatusActive &&
+			(latest < 0 || release.Version > releases[latest].Version) {
+			latest = index
+		}
+	}
+	if latest < 0 || len(releases[latest].Manifest) == 0 {
+		return nil, 0, errNoActiveRelease
+	}
+	return slices.Clone(releases[latest].Manifest), releases[latest].Version, nil
+}
+
 func (authority *ReconciliationCoordinator) deprovisionExact(
 	ctx context.Context,
 	backendName, leaseUUID string,
