@@ -128,6 +128,11 @@ type Config struct {
 	CallbackSecret              Secret          `mapstructure:"callback_secret"`                // HMAC secret for callback authentication
 	CallbackCanonicalPathPrefix string          `mapstructure:"callback_canonical_path_prefix"` // Path prefix prepended to inbound URIs before HMAC verification (set when fred is behind a path-stripping reverse proxy)
 
+	// Billing-only SKUs: on-chain SKU UUIDs the provider bills for but never
+	// deploys. Fred acknowledges a lease that uses only these SKUs so billing
+	// starts, and never provisions it.
+	BillingOnlySKUs []string `mapstructure:"billing_only_skus"`
+
 	// Parallel signing (authz sub-signers)
 	SubSignerCount             int           `mapstructure:"sub_signer_count"`               // 0 = single signer (default)
 	SubSignerMinBalance        string        `mapstructure:"sub_signer_min_balance"`         // Top-up when below this (default: "10000000umfx")
@@ -270,6 +275,10 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("tenant_rate_limit_rps", 5.0)  // 5 requests per second per tenant
 	v.SetDefault("tenant_rate_limit_burst", 10) // burst of 10 requests per tenant
 	v.SetDefault("cors_origins", []string{"*"}) // Allow all origins by default
+	// Viper binds an environment variable only to a key it already knows, so
+	// without this default PROVIDER_BILLING_ONLY_SKUS would be ignored whenever
+	// the file omits the key, and its leases would be provisioned.
+	v.SetDefault("billing_only_skus", []string{})
 	v.SetDefault("grpc_tls_enabled", false)
 	v.SetDefault("grpc_tls_ca_file", "")
 	v.SetDefault("grpc_tls_skip_verify", false)
@@ -616,6 +625,10 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if err := c.validateBillingOnlySKUs(); err != nil {
+		return err
+	}
+
 	// callback_base_url is required for backend callbacks
 	if c.CallbackBaseURL == "" {
 		return fmt.Errorf("callback_base_url is required")
@@ -832,6 +845,35 @@ func (c *Config) validatePlacementSnapshots() error {
 	if c.PlacementSnapshotRetain < 1 || c.PlacementSnapshotRetain > MaxPlacementSnapshotRetain {
 		return fmt.Errorf("placement_snapshot_retain must be between 1 and %d, got %d",
 			MaxPlacementSnapshotRetain, c.PlacementSnapshotRetain)
+	}
+	return nil
+}
+
+// validateBillingOnlySKUs checks billing_only_skus. Leases are matched by exact
+// string equality against the chain's lowercase canonical SKU UUIDs, so any
+// other spelling of a valid UUID would silently match nothing. A SKU that a
+// backend also serves would be both deployed and acknowledged without
+// deployment, so the two lists must not overlap.
+func (c *Config) validateBillingOnlySKUs() error {
+	served := make(map[string]string)
+	for _, b := range c.Backends {
+		for _, sku := range b.SKUs {
+			served[sku] = b.Name
+		}
+	}
+	seen := make(map[string]bool, len(c.BillingOnlySKUs))
+	for i, sku := range c.BillingOnlySKUs {
+		parsed, err := uuid.Parse(sku)
+		if err != nil || parsed.String() != sku {
+			return fmt.Errorf("billing_only_skus[%d]: %q is not a lowercase canonical UUID", i, sku)
+		}
+		if seen[sku] {
+			return fmt.Errorf("billing_only_skus[%d]: duplicate SKU %s", i, sku)
+		}
+		seen[sku] = true
+		if backendName, ok := served[sku]; ok {
+			return fmt.Errorf("billing_only_skus[%d]: SKU %s is also served by backend %q; a SKU is either deployed or billing-only", i, sku, backendName)
+		}
 	}
 	return nil
 }

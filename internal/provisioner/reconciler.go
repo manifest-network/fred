@@ -450,6 +450,40 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	recordlessUnproven := r.coordinator.RecordlessLeasesUnproven()
 
 	for leaseUUID, lease := range chainLeases {
+		// A billing-only lease is billed but never deployed, so nothing a
+		// backend reports, or fails to report, bears on it. It is decided from
+		// the chain alone, ahead of every inventory gate below: acknowledged
+		// while PENDING and otherwise left alone. Placement or attempt evidence
+		// from before its SKU became billing-only stays as it is, for terminal
+		// convergence once the lease ends.
+		if r.coordinator.ClassifyLease(&lease).BillingOnly() {
+			if lease.State == billingtypes.LEASE_STATE_PENDING {
+				g.Go(func() error {
+					defer func() {
+						if rec := recover(); rec != nil {
+							slog.Error("reconciler billing-only acknowledgment panic — recovering to keep fred alive",
+								"lease_uuid", leaseUUID, "panic", rec, "stack", string(debug.Stack()))
+							metrics.ReconcilerPanicsTotal.WithLabelValues("process_lease").Inc()
+							leaseErrors.Add(1)
+						}
+					}()
+					switch outcome, err := r.coordinator.AcknowledgeBillingOnly(gctx, leaseUUID); outcome {
+					case placement.BillingOnlyAcknowledged:
+						acknowledged.Add(1)
+					case placement.BillingOnlyAckSettled:
+					case placement.BillingOnlyAckBusy:
+						deferred.Add(1)
+						metrics.ReconcilerDeferredLeasesTotal.Inc()
+					default:
+						leaseErrors.Add(1)
+						slog.Error("reconcile: failed to acknowledge billing-only lease",
+							"lease_uuid", leaseUUID, "error", err)
+					}
+					return nil
+				})
+			}
+			continue
+		}
 		provision, isProvisioned := allProvisions[leaseUUID]
 		// A lost placement is terminal and waits on no backend's answer, so it
 		// runs ahead of the per-lease gates below. ObserveLiveAction still

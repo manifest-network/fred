@@ -676,6 +676,7 @@ func TestServer_HealthNeverReturns503ThroughTheStack(t *testing.T) {
 
 	addr := freePort(t)
 	srv, err := NewServer(ServerConfig{
+		BillingPolicy:  placement.NoBillingOnlySKUs(),
 		Addr:           addr,
 		ProviderUUID:   testutil.ValidUUID1,
 		Bech32Prefix:   "manifest",
@@ -5216,8 +5217,13 @@ func newRestoreAuthorityForTest(
 	router *backend.Router,
 	_ *operation.Registry,
 	leaseReader placement.PruneLeaseReader,
+	policies ...*placement.BillingPolicy,
 ) (*placement.Store, *placement.ExecutionCoordinator) {
 	t.Helper()
+	policy := placement.NoBillingOnlySKUs()
+	if len(policies) != 0 {
+		policy = policies[0]
+	}
 	routes, err := placement.NewCallbackRouteFactory("https://fred.example.test")
 	require.NoError(t, err)
 	storePath := filepath.Join(t.TempDir(), "restore-placements.db")
@@ -5281,6 +5287,7 @@ func newRestoreAuthorityForTest(
 	execution, err = coordinator.BindBackendRuntime(
 		router,
 		apiProviderControlPlane{ReconciliationChain: chain},
+		policy,
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
@@ -5294,6 +5301,7 @@ func newRestoreServiceForTest(
 	router *backend.Router,
 	sourcePlacements PlacementLookup,
 	events restoreapp.EventSink,
+	policies ...*placement.BillingPolicy,
 ) RestoreService {
 	t.Helper()
 	if sourcePlacements == nil || leases == nil || router == nil {
@@ -5307,7 +5315,7 @@ func newRestoreServiceForTest(
 	}
 	registry := operation.NewRegistry()
 	_, execution := newRestoreAuthorityForTest(
-		t, providerUUID, sourcePlacements, router, registry, leases,
+		t, providerUUID, sourcePlacements, router, registry, leases, policies...,
 	)
 	restoreCoordinator, err := execution.RestoreCoordinator(nil)
 	require.NoError(t, err)
@@ -6126,6 +6134,7 @@ func TestRestoreAuthority_UnresolvableSourcePlacementCannotBeConstructed(t *test
 	_, err = coordinator.BindBackendRuntime(
 		router,
 		apiProviderControlPlane{ReconciliationChain: apiReconciliationChain{}},
+		placement.NoBillingOnlySKUs(),
 	)
 	require.ErrorContains(t, err, "does not match durable topology")
 }

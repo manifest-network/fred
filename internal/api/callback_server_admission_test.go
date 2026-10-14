@@ -13,6 +13,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 const callbackAdmissionClientIP = "192.0.2.5"
@@ -21,8 +22,9 @@ func newCallbackAdmissionServer(t *testing.T) *Server {
 	t.Helper()
 	verifier, _ := hmacauth.NewCallbackProofBoundary()
 	server, err := NewServer(ServerConfig{
-		ProviderUUID: "01234567-89ab-cdef-0123-456789abcdef",
-		Bech32Prefix: "manifest", RateLimitRPS: 0.001, RateLimitBurst: 1,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "01234567-89ab-cdef-0123-456789abcdef",
+		Bech32Prefix:  "manifest", RateLimitRPS: 0.001, RateLimitBurst: 1,
 		TrustedProxies: []string{"127.0.0.1/32"},
 		CallbackKeys: callbackKeysForTest(t, map[backendidentity.ID]string{
 			callbackKeyringID(t, callbackKeyringStorageA): callbackKeyringSecretA,

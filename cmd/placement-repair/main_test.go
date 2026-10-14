@@ -1667,6 +1667,7 @@ func createRepairCommandDatabase(t *testing.T, confirmed bool) string {
 	}
 	execution, err := coordinator.BindBackendRuntime(
 		repairAttemptRuntime{backend: inventoryClient}, repairAttemptLeaseReader{},
+		placement.NoBillingOnlySKUs(),
 	)
 	require.NoError(t, err)
 	reconciliation, err := execution.ReconciliationCoordinator(nil, nil)
@@ -1881,7 +1882,7 @@ func newRepairReconciliation(
 	require.NoError(t, err)
 	coordinator, err := store.BindOperationCoordinator(nil)
 	require.NoError(t, err)
-	execution, err := coordinator.BindBackendRuntime(router, repairAttemptLeaseReader{})
+	execution, err := coordinator.BindBackendRuntime(router, repairAttemptLeaseReader{}, placement.NoBillingOnlySKUs())
 	require.NoError(t, err)
 	reconciliation, err := execution.ReconciliationCoordinator(nil, nil)
 	require.NoError(t, err)

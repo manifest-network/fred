@@ -9,6 +9,8 @@ import (
 	"runtime/debug"
 	"slices"
 
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/util"
@@ -52,16 +54,26 @@ type ExecutionCoordinator struct {
 	controlPlane *boundProviderControlPlane
 	deprovision  *deprovisionCoordinator
 	issuer       *operationCoordinatorMarker
+	policy       *BillingPolicy
 }
 
+// BindBackendRuntime binds the physical backend runtime, the provider control
+// plane and the billing policy. The policy is required, and NoBillingOnlySKUs
+// is the explicit empty one: every purpose facet derived from this
+// coordinator classifies leases through it before it can mint a backend
+// request.
 func (coordinator *OperationCoordinator) BindBackendRuntime(
 	backends backendRuntime,
 	control ProviderControlPlane,
+	policy *BillingPolicy,
 ) (*ExecutionCoordinator, error) {
 	if !coordinator.Valid() || util.IsNilInterface(backends) ||
 		util.IsNilInterface(control) ||
 		coordinator.store.callbackRoutes == nil || !coordinator.store.callbackRoutes.Valid() {
 		return nil, errors.New("valid operation coordinator, backend runtime, provider control plane, and callback routes are required")
+	}
+	if !policy.valid() {
+		return nil, errors.New("billing policy is required")
 	}
 	names, err := backendNames(backends)
 	if err != nil {
@@ -79,6 +91,7 @@ func (coordinator *OperationCoordinator) BindBackendRuntime(
 		coordinator: coordinator, backends: backends,
 		callbacks: coordinator.store.callbackRoutes,
 		issuer:    coordinator.marker,
+		policy:    policy,
 	}
 	execution.controlPlane = &boundProviderControlPlane{
 		execution: execution, providerUUID: coordinator.store.providerUUID, control: control,
@@ -97,7 +110,17 @@ func (authority *ExecutionCoordinator) Valid() bool {
 		authority.coordinator.execution == authority && !util.IsNilInterface(authority.backends) &&
 		authority.callbacks.Valid() && authority.deprovision != nil &&
 		authority.deprovision.execution == authority && authority.controlPlane != nil &&
-		authority.controlPlane.validFor(authority)
+		authority.controlPlane.validFor(authority) && authority.policy.valid()
+}
+
+// classify sorts a lease through the billing policy bound with the backend
+// runtime. Before a runtime is bound nothing is classified, so nothing can be
+// deployed or acknowledged.
+func (coordinator *OperationCoordinator) classify(lease *billingtypes.Lease) LeaseClass {
+	if coordinator == nil || coordinator.execution == nil {
+		return LeaseClass{}
+	}
+	return coordinator.execution.policy.Classify(lease)
 }
 
 func backendNames(runtime backendRuntime) (names []string, err error) {
@@ -183,10 +206,6 @@ func executeProvision(
 	if err != nil {
 		return abort(err)
 	}
-	call, calling := coordinator.beginProvisionCall(dispatch)
-	if !calling {
-		return abort(errors.New("provision dispatch did not enter calling phase"))
-	}
 	request := backend.ProvisionRequest{
 		LeaseUUID: attempt.leaseUUID,
 		Tenant:    requestSnapshot.Tenant(), ProviderUUID: requestSnapshot.ProviderUUID(),
@@ -198,15 +217,72 @@ func executeProvision(
 		request.Payload = append([]byte(nil), payload...)
 		request.PayloadHash = attempt.payloadFingerprint.String()
 	}
+	// Attest before the calling phase, so a refusal aborts the dispatch as
+	// never sent.
+	delivery, err := coordinator.attestProvision(request)
+	if err != nil {
+		return abort(err)
+	}
+	call, calling := coordinator.beginProvisionCall(dispatch)
+	if !calling {
+		return abort(errors.New("provision dispatch did not enter calling phase"))
+	}
 	observeProvisionStart(observer, attempt.leaseUUID, attempt.backendName)
-	return coordinator.completeProvision(call, invokeProvision(ctx, backendClient, request))
+	return coordinator.completeProvision(call, invokeProvision(ctx, backendClient, delivery))
+}
+
+// provisionDelivery and restoreDelivery are backend requests the current
+// billing policy attested immediately before they are sent. attestProvision
+// and attestRestore build the only ones, and invokeProvision and invokeRestore
+// accept nothing else. A request is rebuilt from a durable snapshot that an
+// earlier process may have minted under an earlier policy, so the check at
+// send time is what keeps a lease the current policy classifies as
+// billing-only from ever being deployed, on redelivery too.
+type provisionDelivery struct{ request backend.ProvisionRequest }
+
+type restoreDelivery struct{ request backend.RestoreRequest }
+
+// errNotDeployable reports a request whose every SKU the current billing
+// policy classifies as billing-only.
+var errNotDeployable = errors.New("the billing policy classifies this request as billing-only; it is not deployed")
+
+func (coordinator *OperationCoordinator) attestProvision(request backend.ProvisionRequest) (provisionDelivery, error) {
+	policy, err := coordinator.boundPolicy()
+	if err != nil {
+		return provisionDelivery{}, err
+	}
+	if !policy.permits(request.Items) {
+		return provisionDelivery{}, fmt.Errorf("provision lease %s: %w", request.LeaseUUID, errNotDeployable)
+	}
+	return provisionDelivery{request: request}, nil
+}
+
+func (coordinator *OperationCoordinator) attestRestore(request backend.RestoreRequest) (restoreDelivery, error) {
+	policy, err := coordinator.boundPolicy()
+	if err != nil {
+		return restoreDelivery{}, err
+	}
+	if !policy.permits(request.Items) {
+		return restoreDelivery{}, fmt.Errorf("restore into lease %s: %w", request.LeaseUUID, errNotDeployable)
+	}
+	return restoreDelivery{request: request}, nil
+}
+
+// boundPolicy returns the billing policy bound with the backend runtime.
+// Before a runtime is bound there is none, and nothing is attested.
+func (coordinator *OperationCoordinator) boundPolicy() (*BillingPolicy, error) {
+	if coordinator == nil || coordinator.execution == nil || !coordinator.execution.policy.valid() {
+		return nil, errors.New("no billing policy is bound to attest a backend request")
+	}
+	return coordinator.execution.policy, nil
 }
 
 func invokeProvision(
 	ctx context.Context,
 	client backend.Backend,
-	request backend.ProvisionRequest,
+	delivery provisionDelivery,
 ) (outcome backend.ProvisionCallOutcome) {
+	request := delivery.request
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			metrics.BackendInvocationPanicsTotal.WithLabelValues(metrics.OperationProvision).Inc()
@@ -232,8 +308,9 @@ func invokeProvision(
 func invokeRestore(
 	ctx context.Context,
 	client backend.Backend,
-	request backend.RestoreRequest,
+	delivery restoreDelivery,
 ) (outcome backend.RestoreCallOutcome) {
+	request := delivery.request
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			metrics.BackendInvocationPanicsTotal.WithLabelValues(metrics.OperationRestore).Inc()

@@ -8,6 +8,7 @@ import (
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -177,26 +178,68 @@ func exactLeaseFromObservation(
 	return exact.lease, ok
 }
 
+// endableLease is a lease the current billing policy lets Fred end on chain.
+// Every rejection and close issued here ends a lease on a workload signal: a
+// failed, timed-out or invalid deployment, or a lost backend. A billing-only
+// lease has no Fred workload, so no such signal may end it, including one left
+// by a deployment attempted before its SKU became billing-only. Only mayEnd
+// and mayEndOperation build one, and rejectLease and closeLease accept nothing
+// else.
+type endableLease struct{ uuid string }
+
+// errBillingOnlyLeaseNotEnded reports a lease the current billing policy
+// classifies as billing-only.
+var errBillingOnlyLeaseNotEnded = errors.New("the billing policy classifies this lease as billing-only; Fred does not end it")
+
+// mayEnd judges an exactly observed lease by its items.
+func (control *boundProviderControlPlane) mayEnd(lease *billingtypes.Lease) (endableLease, error) {
+	if !control.validFor(control.execution) || !control.execution.policy.valid() {
+		return endableLease{}, errors.New("invalid provider lease-end authority")
+	}
+	class := control.execution.policy.Classify(lease)
+	if class.BillingOnly() {
+		return endableLease{}, fmt.Errorf("lease %s: %w", lease.Uuid, errBillingOnlyLeaseNotEnded)
+	}
+	if _, deployable := class.Deployable(); !deployable {
+		return endableLease{}, errors.New("a lease that cannot be classified is not ended")
+	}
+	return endableLease{uuid: lease.Uuid}, nil
+}
+
+// mayEndOperation judges the lease of an operation by the items it was started
+// with, so settling a timed-out operation needs no chain read.
+func (control *boundProviderControlPlane) mayEndOperation(
+	metadata operation.SettlementMetadata,
+) (endableLease, error) {
+	if !control.validFor(control.execution) || !control.execution.policy.valid() || !metadata.Valid() {
+		return endableLease{}, errors.New("invalid provider lease-end authority")
+	}
+	if !control.execution.policy.permits(metadata.Items()) {
+		return endableLease{}, fmt.Errorf("lease %s: %w", metadata.LeaseUUID(), errBillingOnlyLeaseNotEnded)
+	}
+	return endableLease{uuid: metadata.LeaseUUID()}, nil
+}
+
 func (control *boundProviderControlPlane) rejectLease(
 	ctx context.Context,
-	leaseUUID string,
+	lease endableLease,
 	reason string,
 ) (uint64, []string, error) {
-	if !control.validFor(control.execution) || ctx == nil || leaseUUID == "" {
+	if !control.validFor(control.execution) || ctx == nil || lease.uuid == "" {
 		return 0, nil, errors.New("invalid provider rejection authority")
 	}
-	return control.control.RejectLeases(ctx, []string{leaseUUID}, reason)
+	return control.control.RejectLeases(ctx, []string{lease.uuid}, reason)
 }
 
 func (control *boundProviderControlPlane) closeLease(
 	ctx context.Context,
-	leaseUUID string,
+	lease endableLease,
 	reason string,
 ) (uint64, []string, error) {
-	if !control.validFor(control.execution) || ctx == nil || leaseUUID == "" {
+	if !control.validFor(control.execution) || ctx == nil || lease.uuid == "" {
 		return 0, nil, errors.New("invalid provider close authority")
 	}
-	return control.control.CloseLeases(ctx, []string{leaseUUID}, reason)
+	return control.control.CloseLeases(ctx, []string{lease.uuid}, reason)
 }
 
 func (control *boundProviderControlPlane) acknowledgeLease(

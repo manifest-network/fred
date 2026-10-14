@@ -14,6 +14,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 // Lifecycle tests for the ack batcher's ownership (ENG-723).
@@ -43,6 +44,7 @@ func newLifecycleTestManagerWithPayloadStore(t *testing.T, payloadStore *payload
 	require.NoError(t, err)
 
 	m, err := newTestManager(t, ManagerConfig{
+		BillingPolicy:    placement.NoBillingOnlySKUs(),
 		ProviderUUID:     "provider-1",
 		PayloadStore:     payloadStore,
 		AckBatchInterval: 20 * time.Millisecond,

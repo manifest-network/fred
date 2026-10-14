@@ -8,6 +8,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `billing_only_skus` lists SKUs the provider bills for but delivers outside
+  Fred. Fred acknowledges a lease whose items all use these SKUs as soon as it
+  sees it, so billing starts at once, and the reconciler retries the
+  acknowledgment on its next sweep. The acknowledgment reads only the chain,
+  so no backend answer, or anything a backend still reports, holds it back.
+  Fred never provisions such a lease, never rejects it, and never closes it
+  for a provisioning reason, including as lost after a backend retirement. Before
+  this, an unattached SKU fell through to the default backend, whose
+  unknown-SKU refusal got the lease rejected on chain within seconds. Payload
+  uploads for a billing-only lease are refused with `400` and counted as
+  `fred_payload_uploads_total{outcome="billing_only"}`, and so are restores
+  into one. Withdrawals and the credit check apply as before. A lease that
+  mixes billing-only and deployable SKUs keeps the normal path. Each entry must
+  be a lowercase canonical UUID that no backend serves;
+  `PROVIDER_BILLING_ONLY_SKUS` sets the list from the environment
+  (comma-separated). The policy is bound into the placement backend runtime,
+  and a provision or restore request can be minted only from a lease it
+  classified as deployable, and is checked again when it is sent. A SKU can
+  be made billing-only while leases already use it: a deployment still in
+  flight is never retried, the lease is still acknowledged, and no failure
+  callback, timeout or lost backend ends it, because every chain rejection and
+  close the placement layer issues needs the policy's consent. Whatever the
+  earlier deployment left on a backend is torn down when the lease ends.
+  (ENG-1453)
+
 - Metric `fred_docker_backend_operation_recovery_deferred_total`: a provision
   or restore whose recovery evidence could not be classified, so the lease
   stays fenced and the next pass retries it. Before, a warning log was the

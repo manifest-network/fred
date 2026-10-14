@@ -124,7 +124,7 @@ func newOverlapRestoreFixture(t *testing.T, sourceUUID, targetUUID string) *fixt
 	require.NoError(t, err)
 	result.runtime = result.coordinator.RuntimeController()
 	result.execution, err = result.coordinator.BindBackendRuntime(result.backends,
-		restoreReconciliationChain{targetReader: result.targets})
+		restoreReconciliationChain{targetReader: result.targets}, placement.NoBillingOnlySKUs())
 	require.NoError(t, err)
 	result.reconciliation, err = result.execution.ReconciliationCoordinator(nil, nil)
 	require.NoError(t, err)

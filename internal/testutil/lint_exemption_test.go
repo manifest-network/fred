@@ -1,7 +1,7 @@
 package testutil
 
 // This file pins the per-file forbidigo exemptions of .golangci.yml
-// (ENG-1117, ENG-799, ENG-1125). An exemption names the rules it lifts by a bracketed tag that
+// (ENG-1117, ENG-799, ENG-1125, ENG-1453). An exemption names the rules it lifts by a bracketed tag that
 // starts their messages, and golangci-lint matches an exclusion's text against
 // the whole issue text. Keyed on prose instead, a new rule that reused the
 // phrase would silently be exempt too; keyed on the wrong tag, or widened to
@@ -90,6 +90,28 @@ var forbidigoExemptions = map[string]struct {
 	"[startup-evidence]": {
 		patterns: []string{`\.NewOperationStartupFailed$`},
 		files:    []string{"internal/backend/docker/startup_failure.go"},
+	},
+	// The billing-only deployment boundary (ENG-1453): a backend request is
+	// minted only from a DeployableLease, and sent only where it is built.
+	"[request-snapshot]": {
+		patterns: []string{`^newBackendRequestSnapshot$`},
+		files:    []string{"internal/provisioner/placement/store.go"},
+	},
+	"[deployment-call]": {
+		patterns: []string{`^backend\.(InvokeProvision|InvokeRestore)$`, `^invoke(Provision|Restore)$`},
+		files: []string{
+			"internal/provisioner/placement/attempt_recovery_execution.go",
+			"internal/provisioner/placement/backend_execution.go",
+			"internal/provisioner/placement/restore_coordinator.go",
+		},
+	},
+	"[deployment-delivery]": {
+		patterns: []string{`^(provisionDelivery|restoreDelivery)$`},
+		files:    []string{"internal/provisioner/placement/backend_execution.go"},
+	},
+	"[lease-end]": {
+		patterns: []string{`^endableLease$`},
+		files:    []string{"internal/provisioner/placement/provider_control_plane.go"},
 	},
 }
 

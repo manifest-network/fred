@@ -103,6 +103,16 @@ func (authority *ReconciliationCoordinator) RecordlessLeasesUnproven() bool {
 	return authority.coordinator.store.RecordlessLeasesUnproven()
 }
 
+// ClassifyLease sorts a lease through the billing policy bound with the
+// backend runtime, so the reconciler plans with the same policy that gates
+// the request mint. An invalid coordinator classifies nothing.
+func (authority *ReconciliationCoordinator) ClassifyLease(lease *billingtypes.Lease) LeaseClass {
+	if !authority.Valid() {
+		return LeaseClass{}
+	}
+	return authority.coordinator.classify(lease)
+}
+
 // ProviderUUID returns the provider identity permanently bound to the Store.
 // It is observational only; reconciliation cannot be constructed with an
 // independently supplied provider identity.
