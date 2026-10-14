@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 func TestResolveCallbackApplicationTimeout_PreservesDeliveryDeadline(t *testing.T) {
@@ -64,6 +65,7 @@ func TestResolveCallbackApplicationTimeout_PreservesDeliveryDeadline(t *testing.
 
 func TestNewServer_RejectsCallbackApplicationTimeoutAtDeliveryDeadline(t *testing.T) {
 	server, err := NewServer(ServerConfig{
+		BillingPolicy:              placement.NoBillingOnlySKUs(),
 		ProviderUUID:               "provider-1",
 		Bech32Prefix:               "manifest",
 		RateLimitRPS:               100,

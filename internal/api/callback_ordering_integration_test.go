@@ -472,6 +472,7 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 
 	eventSink := &callbackOrderingSink{}
 	manager, err := provisioner.NewManager(provisioner.ManagerConfig{
+		BillingPolicy:         placement.NoBillingOnlySKUs(),
 		ProviderUUID:          providerUUID,
 		PlacementStore:        placementStore,
 		LeaseEventSink:        eventSink,
@@ -500,6 +501,7 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 
 	callbackPublisher := &callbackOrderingPublisher{next: manager}
 	callbackServer, err := NewServer(ServerConfig{
+		BillingPolicy:              placement.NoBillingOnlySKUs(),
 		Addr:                       apiAddr,
 		ProviderUUID:               providerUUID,
 		Bech32Prefix:               "manifest",
@@ -789,6 +791,7 @@ func TestCallbackOutboxReplay_SettlesDurableAttemptAcrossBothProcessRestarts(t *
 	}})
 	require.NoError(t, err)
 	manager, err := provisioner.NewManager(provisioner.ManagerConfig{
+		BillingPolicy:         placement.NoBillingOnlySKUs(),
 		ProviderUUID:          providerUUID,
 		PlacementStore:        placementStore2,
 		CallbackProofConsumer: proofConsumer,
@@ -814,7 +817,8 @@ func TestCallbackOutboxReplay_SettlesDurableAttemptAcrossBothProcessRestarts(t *
 	assert.Zero(t, manager.InFlightCount(), "replacement Registry must start empty")
 
 	callbackServer, err := NewServer(ServerConfig{
-		Addr: apiAddr, ProviderUUID: providerUUID, Bech32Prefix: "manifest",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		Addr:          apiAddr, ProviderUUID: providerUUID, Bech32Prefix: "manifest",
 		RateLimitRPS: 100, RateLimitBurst: 200,
 		ReadTimeout: time.Second, WriteTimeout: time.Second, IdleTimeout: time.Second,
 		RequestTimeout: time.Second, CallbackApplicationTimeout: 2 * time.Second,
@@ -926,6 +930,7 @@ func TestCallbackOrdering_ProviderDeadlineKeepsDurableHead(t *testing.T) {
 	proofVerifier, _ := hmacauth.NewCallbackProofBoundary()
 	apiAddr := freePort(t)
 	server, err := NewServer(ServerConfig{
+		BillingPolicy:              placement.NoBillingOnlySKUs(),
 		Addr:                       apiAddr,
 		ProviderUUID:               "provider-1",
 		Bech32Prefix:               "manifest",

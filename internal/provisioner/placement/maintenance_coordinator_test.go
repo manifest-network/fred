@@ -80,7 +80,7 @@ func TestMaintenanceCoordinatorIsFullyBoundAndZeroInvalid(t *testing.T) {
 	otherBase, err := otherStore.BindOperationCoordinator(nil)
 	require.NoError(t, err)
 	var typedNilControlPlane *testProviderControlPlane
-	otherExecution, err := otherBase.BindBackendRuntime(runtime, typedNilControlPlane)
+	otherExecution, err := otherBase.BindBackendRuntime(runtime, typedNilControlPlane, NoBillingOnlySKUs())
 	require.Error(t, err)
 	require.Nil(t, otherExecution)
 	require.Nil(t, otherBase.execution)

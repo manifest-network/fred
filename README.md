@@ -185,6 +185,7 @@ All required fields are validated at startup. The daemon will fail to start with
 | `backends` | At least one backend must be configured (multiple backends may share `skus` for load-based routing); production requires a distinct `hmac_secret` on every entry |
 | `callback_base_url` | URL where backends send callbacks (absolute HTTP(S); HTTPS is required in production mode) |
 | `placement_store_db_path` | Critical provider-bound lease-to-backend authority. It must be an existing prepared database at startup and is not hot-swappable |
+| `billing_only_skus` | Optional. Every entry must be a lowercase canonical UUID, listed once, and served by no backend |
 
 ### Backend Configuration
 
@@ -303,6 +304,7 @@ placement_store_db_path: "/var/lib/fred/placements.db"
 | `trusted_proxies` | CIDR blocks of trusted proxies for X-Forwarded-For | `[]` |
 | `cors_origins` | Allowed CORS origins for browser clients. `["*"]` allows all; `[]` disables CORS. | `["*"]` |
 | `backends` | List of backend configurations | (required) |
+| `billing_only_skus` | On-chain SKU UUIDs the provider bills for but never deploys. Fred acknowledges a lease whose items all use these SKUs, which starts its billing, and never provisions, rejects, or closes it for a provisioning reason. Withdrawals and the credit check still apply. From the environment, `PROVIDER_BILLING_ONLY_SKUS` takes a comma-separated list. See [Billing-only leases](#billing-only-leases). | `[]` |
 | `callback_base_url` | Base URL for backend callbacks | (required) |
 | `callback_secret` | Legacy fleet-wide HMAC key accepted only outside production; do not combine with `backends[].hmac_secret` | `""` |
 | `callback_canonical_path_prefix` | Path prefix prepended to inbound callback URIs before HMAC verification. It must exactly equal the normalized escaped path in `callback_base_url` and the prefix stripped by the trusted proxy (e.g., `/api/fred`). Both values are empty for a root/direct URL. See [SECURITY.md](SECURITY.md) and [docs/security-callback-auth.md](docs/security-callback-auth.md). | `""` |
@@ -873,9 +875,10 @@ Upload deployment configuration for a lease that was created with a `meta_hash`.
 
 **Response Codes:**
 - `202 Accepted` - Payload received, provisioning started
-- `400 Bad Request` - Invalid lease UUID, the lease has no `meta_hash`, the body
-  could not be read (including a body over `max_request_body_size`), the body is
-  empty, or its SHA-256 does not match `meta_hash`
+- `400 Bad Request` - Invalid lease UUID, the lease is [billing-only](#billing-only-leases),
+  the lease has no `meta_hash`, the body could not be read (including a body
+  over `max_request_body_size`), the body is empty, or its SHA-256 does not
+  match `meta_hash`
 - `401 Unauthorized` - Invalid signature or token, or the token's lease UUID or
   `meta_hash` does not match the lease
 - `403 Forbidden` - Lease does not belong to this tenant or provider
@@ -1164,7 +1167,7 @@ off to a complete durable close intent before teardown.
 
 **Response Codes:**
 - `202 Accepted` - Restore initiated (the lease then transitions through `restarting` to `ready`/`failed`)
-- `400 Bad Request` - Missing/invalid `from_lease_uuid`, source and target UUIDs are equal, or items don't match the retained set
+- `400 Bad Request` - Missing/invalid `from_lease_uuid`, source and target UUIDs are equal, items don't match the retained set, or the target lease is [billing-only](#billing-only-leases)
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - The source has no placement record, is not `CLOSED` or `EXPIRED`, belongs to another tenant/provider, or its configured backend reports no retained data (including retention that has expired)
@@ -2147,6 +2150,26 @@ Chain state       Backend inventory       Durable placement/attempts
 2. **Periodic**: Runs every `reconciliation_interval` (default: 5 minutes)
 3. **Cross-provider credit depletion**: Triggers withdrawal which may close leases
 
+### Billing-only leases
+
+A provider can register a SKU purely for on-chain billing and deliver its
+service outside Fred. List such SKUs in `billing_only_skus`. A lease whose items
+all use them is billing-only:
+
+- Fred acknowledges it as soon as the lease-created event arrives, and the
+  reconciler retries on its next sweep if that fails, even when no backend
+  answers. Acknowledgment makes the lease ACTIVE, so billing starts at once.
+- Fred never provisions it, never rejects it, and never closes it for a
+  provisioning reason, including as lost after a backend retirement.
+  `POST /v1/leases/{lease_uuid}/data` refuses its payload with `400`, and
+  `POST /v1/leases/{lease_uuid}/restore` refuses to restore into it with `400`.
+- Billing applies as for any lease: the provider-wide withdrawal settles it,
+  and the credit check closes it once its tenant's credit is exhausted.
+
+A lease that mixes billing-only and deployable SKUs is not billing-only. It
+takes the normal path, where the backend refuses the SKU it cannot serve and
+Fred rejects the lease.
+
 ### State Matrix
 
 | Chain State | Backend State | Action |
@@ -2175,9 +2198,13 @@ Chain state       Backend inventory       Durable placement/attempts
 | PENDING/ACTIVE | Positive report disagrees with confirmed placement | **Defer — no action this sweep** |
 | PENDING/ACTIVE | Confirmed owner is not configured | **Defer and emit an operator-visible lease error** |
 | PENDING/ACTIVE | Owning backend did not answer | **Defer — no action this sweep** |
+| PENDING, [billing-only](#billing-only-leases) | *any* | Acknowledge lease; never provision |
+| ACTIVE, billing-only | *any* | No action |
 
-For live (`PENDING`/`ACTIVE`) chain leases, the placement-safety rows take
-precedence over every normal state row. A placement lost with a retired
+A billing-only lease is decided ahead of every other row and needs no
+backend's answer: acknowledging it or leaving it alone cannot lay a workload
+over data. For other live (`PENDING`/`ACTIVE`) chain leases, the
+placement-safety rows take precedence over every normal state row. A placement lost with a retired
 backend (see DEPLOYMENT.md, "Retiring a backend whose storage is lost") is
 terminal, needs no backend's answer, and is decided ahead of them all; the
 sweep-wide safety gates can still defer the close to a later sweep. A positive backend report is not

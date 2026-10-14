@@ -17,6 +17,7 @@ import (
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/testsupport/placementstore"
 )
 
@@ -82,6 +83,7 @@ func TestIntegration_FullProvisionAcknowledge(t *testing.T) {
 	}
 
 	manager := startTestManager(t, ManagerConfig{
+		BillingPolicy:    placement.NoBillingOnlySKUs(),
 		ProviderUUID:     providerUUID,
 		AckBatchInterval: 50 * time.Millisecond,
 		AckBatchSize:     1,
@@ -162,6 +164,7 @@ func TestIntegration_ProvisionFailure_RejectsLease(t *testing.T) {
 	}
 
 	manager := startTestManager(t, ManagerConfig{
+		BillingPolicy:    placement.NoBillingOnlySKUs(),
 		ProviderUUID:     providerUUID,
 		AckBatchInterval: 50 * time.Millisecond,
 		AckBatchSize:     1,
@@ -237,6 +240,7 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 	}
 
 	manager := startTestManager(t, ManagerConfig{
+		BillingPolicy:    placement.NoBillingOnlySKUs(),
 		ProviderUUID:     providerUUID,
 		AckBatchInterval: 50 * time.Millisecond,
 		AckBatchSize:     1,
@@ -347,6 +351,7 @@ func TestIntegration_PayloadFlow(t *testing.T) {
 	require.NoError(t, err)
 
 	manager := startTestManager(t, ManagerConfig{
+		BillingPolicy:    placement.NoBillingOnlySKUs(),
 		ProviderUUID:     providerUUID,
 		PayloadStore:     payloadStore,
 		AckBatchInterval: 50 * time.Millisecond,

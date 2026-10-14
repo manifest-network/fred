@@ -2173,7 +2173,7 @@ database acquisition and filesystem waits remain synchronous. See
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `fred_payload_uploads_total` | counter | `outcome` | Uploads (`success`, `invalid_auth`, `hash_mismatch`, `conflict`, `error`) |
+| `fred_payload_uploads_total` | counter | `outcome` | Uploads (`success`, `invalid_auth`, `billing_only`, `hash_mismatch`, `conflict`, `error`) |
 | `fred_payload_stored_count` | gauge | — | Payloads currently stored |
 | `fred_payload_size_bytes` | histogram | — | Upload size distribution |
 | `fred_payload_leases_awaiting` | gauge | — | Leases waiting for payload upload |

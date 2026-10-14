@@ -139,7 +139,7 @@ func newMaintenanceAPIStack(
 	require.NoError(t, err)
 	execution, err := coordinator.BindBackendRuntime(router, apiProviderControlPlane{
 		ReconciliationChain: apiReconciliationChain{PruneLeaseReader: chain},
-	})
+	}, placement.NoBillingOnlySKUs())
 	require.NoError(t, err)
 	reconciliation, err := execution.ReconciliationCoordinator(nil, nil)
 	require.NoError(t, err)

@@ -146,8 +146,13 @@ func newTestReconciler(
 	backendRouter BackendRouter,
 	tracker ReconcilerPayloads,
 	placementStore any,
+	policies ...*placement.BillingPolicy,
 ) (*Reconciler, error) {
 	t.Helper()
+	policy := placement.NoBillingOnlySKUs()
+	if len(policies) != 0 {
+		policy = policies[0]
+	}
 	if manager, ok := tracker.(*Manager); ok && placementStore == nil {
 		// Manager already owns the only valid Registry/Store composition. Reusing
 		// it is part of the production invariant, not merely test convenience.
@@ -179,8 +184,8 @@ func newTestReconciler(
 	if registryFixture == nil {
 		return nil, errors.New("test reconciler tracker must expose a one-shot registry fixture")
 	}
-	authority, _, execution := testReconcilerPlacement(
-		t, placementStore, backendRouter, registryFixture, nil,
+	authority, _, execution := testReconcilerPlacementWithPolicy(
+		t, placementStore, backendRouter, registryFixture, nil, policy,
 	)
 	seeds := registryFixture.operationSeeds()
 	seedReader := newTestOperationSeedReader(seeds)
@@ -6431,7 +6436,7 @@ func TestNewReconciler_RejectsReducedConfigurationWithDurableConflict(t *testing
 	require.NoError(t, err)
 	coordinator, err := placements.BindOperationCoordinator(nil)
 	require.NoError(t, err)
-	_, err = coordinator.BindBackendRuntime(reducedRouter, &testProviderControlPlane{})
+	_, err = coordinator.BindBackendRuntime(reducedRouter, &testProviderControlPlane{}, placement.NoBillingOnlySKUs())
 	require.ErrorIs(t, err, placement.ErrInvalidBackendTopology)
 
 	p = placements.Lookup("lease-1")
@@ -8303,4 +8308,103 @@ func TestReconciler_ReconcileAll_MalformedRecordedHash_KeepsPayload(t *testing.T
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
 	assert.Empty(t, mockBackend.provisionCalls, "must not provision against an unverifiable payload")
+}
+
+const testBillingOnlySKU = "01a126cc-7edd-700d-9ac6-02ed34fa4bff"
+
+func TestReconciler_ReconcileAll_BillingOnlyLease(t *testing.T) {
+	// For a deployable lease every shape below is acted on: started, awaited,
+	// or provisioned as an anomaly, and the backend's refusal of the SKU then
+	// rejects or closes it on chain. A billing-only lease is only acknowledged
+	// while PENDING, even when a backend does not answer.
+	cases := map[string]struct {
+		state       billingtypes.LeaseState
+		metaHash    []byte
+		backendDown bool
+		allDown     bool
+		wantAck     bool
+	}{
+		"pending without meta_hash":             {state: billingtypes.LEASE_STATE_PENDING, wantAck: true},
+		"pending with meta_hash":                {state: billingtypes.LEASE_STATE_PENDING, metaHash: []byte{0x01}, wantAck: true},
+		"pending while a backend is unanswered": {state: billingtypes.LEASE_STATE_PENDING, backendDown: true, wantAck: true},
+		// With no backend answering, absence proves nothing and a deployable
+		// lease defers; a billing-only lease needs no backend answer.
+		"pending while every backend is unanswered": {state: billingtypes.LEASE_STATE_PENDING, allDown: true, wantAck: true},
+		"active without meta_hash":                  {state: billingtypes.LEASE_STATE_ACTIVE},
+		"active with meta_hash":                     {state: billingtypes.LEASE_STATE_ACTIVE, metaHash: []byte{0x01}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			lease := billingtypes.Lease{
+				Uuid: "lease-billing-only", Tenant: "tenant-1", State: tc.state, MetaHash: tc.metaHash,
+				Items: []billingtypes.LeaseItem{{SkuUuid: testBillingOnlySKU, Quantity: 1}},
+			}
+			mockChain := &chaintest.MockClient{
+				GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+					if lease.State == billingtypes.LEASE_STATE_PENDING {
+						return []billingtypes.Lease{lease}, nil
+					}
+					return nil, nil
+				},
+				GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+					if lease.State == billingtypes.LEASE_STATE_ACTIVE {
+						return []billingtypes.Lease{lease}, nil
+					}
+					return nil, nil
+				},
+				RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+					t.Errorf("billing-only lease rejected on chain: %v (%s)", leaseUUIDs, reason)
+					return 0, nil, nil
+				},
+				CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+					t.Errorf("billing-only lease closed on chain: %v (%s)", leaseUUIDs, reason)
+					return 0, nil, nil
+				},
+			}
+			var (
+				ackMu sync.Mutex
+				acked []string
+			)
+			ack := &mockAcknowledger{acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+				ackMu.Lock()
+				defer ackMu.Unlock()
+				acked = append(acked, leaseUUID)
+				return true, "tx-ack", nil
+			}}
+			answering := &mockReconcilerBackend{
+				name:         "answering",
+				provisions:   []backend.ProvisionInfo{},
+				provisionErr: fmt.Errorf("%w: %w: %s", backend.ErrValidation, backend.ErrUnknownSKU, testBillingOnlySKU),
+			}
+			if tc.allDown {
+				answering.listErr = errors.New("connection refused")
+			}
+			entries := []backend.BackendEntry{{Backend: answering, IsDefault: true}}
+			if tc.backendDown {
+				entries = append(entries, backend.BackendEntry{Backend: &mockReconcilerBackend{
+					name: "silent", listErr: errors.New("connection refused"),
+				}})
+			}
+			router, err := backend.NewRouter(backend.RouterConfig{Backends: entries})
+			require.NoError(t, err)
+
+			policy, err := placement.NewBillingPolicy([]string{testBillingOnlySKU})
+			require.NoError(t, err)
+			reconciler, err := newTestReconciler(t, ReconcilerConfig{}, mockChain, ack, router, nil, nil, policy)
+			require.NoError(t, err)
+
+			require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+			ackMu.Lock()
+			if tc.wantAck {
+				assert.Equal(t, []string{"lease-billing-only"}, acked, "a PENDING billing-only lease is acknowledged")
+			} else {
+				assert.Empty(t, acked, "only a PENDING lease is acknowledged")
+			}
+			ackMu.Unlock()
+			answering.mu.Lock()
+			defer answering.mu.Unlock()
+			assert.Empty(t, answering.provisionCalls, "a billing-only lease is never provisioned")
+		})
+	}
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 // suppressLogs replaces the default logger with a no-op logger for the duration of the test.
@@ -108,7 +109,8 @@ func runManagerStressTest(t *testing.T, numEvents, numGoroutines int) {
 	}
 
 	mgr, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-uuid",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-uuid",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -240,7 +242,8 @@ func TestManager_SustainedLoad(t *testing.T) {
 	}
 
 	mgr, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-uuid",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-uuid",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -385,7 +388,8 @@ func TestManager_WithBackendLatency(t *testing.T) {
 			}
 
 			mgr, err := newTestManager(t, ManagerConfig{
-				ProviderUUID: "provider-uuid",
+				BillingPolicy: placement.NoBillingOnlySKUs(),
+				ProviderUUID:  "provider-uuid",
 			}, router, mockChain)
 			require.NoError(t, err)
 
@@ -543,7 +547,8 @@ func TestManager_HighConcurrencySustained(t *testing.T) {
 	}
 
 	mgr, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-uuid",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-uuid",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -690,7 +695,8 @@ func BenchmarkManager_EndToEnd(b *testing.B) {
 	}
 
 	mgr, err := newTestManager(b, ManagerConfig{
-		ProviderUUID: "provider-uuid",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-uuid",
 	}, router, mockChain)
 	if err != nil {
 		b.Fatal(err)

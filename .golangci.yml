@@ -125,6 +125,23 @@ linters:
         # aliases.
         - pattern: '\.NewOperationStartupFailed$'
           msg: "[startup-evidence] mint startup failure evidence only in confirmStartupFailure (internal/backend/docker/startup_failure.go)"
+        # A provision or a restore is the only way a workload reaches a backend.
+        # Both requests are rebuilt from a BackendRequestSnapshot, fresh or from
+        # a durable attempt, and Store.MintBackendRequestSnapshot accepts only a
+        # DeployableLease that BillingPolicy.Classify issued, so a billing-only
+        # lease is never deployed (ENG-1453):
+        #   - [request-snapshot]: newBackendRequestSnapshot is called only in
+        #     internal/provisioner/placement/store.go, by the mint and by the
+        #     durable decoder;
+        #   - [deployment-call]: provisions and restores are sent only from the
+        #     three placement execution files, which build each request from a
+        #     snapshot and send it in the same function.
+        - pattern: '^newBackendRequestSnapshot$'
+          msg: "[request-snapshot] mint backend requests through Store.MintBackendRequestSnapshot, which takes a DeployableLease (ENG-1453)"
+        - pattern: '^backend\.(InvokeProvision|InvokeRestore)$'
+          msg: "[deployment-call] send provisions and restores only from the placement execution files, from a request snapshot (ENG-1453)"
+        - pattern: '^invoke(Provision|Restore)$'
+          msg: "[deployment-call] send provisions and restores only from the placement execution files, from a request snapshot (ENG-1453)"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -186,6 +203,17 @@ linters:
         linters:
           - forbidigo
         text: '\[tree-removal-wiring\]'
+      # [request-snapshot] (ENG-1453): the mint and the durable decoder.
+      - path: ^internal/provisioner/placement/store\.go$
+        linters:
+          - forbidigo
+        text: '\[request-snapshot\]'
+      # [deployment-call] (ENG-1453): the placement execution files that build a
+      # provision or restore request from a snapshot and send it.
+      - path: ^internal/provisioner/placement/(backend_execution|attempt_recovery_execution|restore_coordinator)\.go$
+        linters:
+          - forbidigo
+        text: '\[deployment-call\]'
       # Exclude test files from strict linters
       - path: _test\.go
         linters:

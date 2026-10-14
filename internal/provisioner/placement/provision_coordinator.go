@@ -40,6 +40,9 @@ const (
 	ProvisionEventNoBackend
 	ProvisionEventUncertain
 	ProvisionEventRejected
+	// ProvisionEventBillingOnlyAcknowledged: the lease uses only billing-only
+	// SKUs and is now ACTIVE. Nothing was routed or provisioned.
+	ProvisionEventBillingOnlyAcknowledged
 )
 
 type provisionEventKind uint8
@@ -319,6 +322,19 @@ func (authority *ProvisionCoordinator) executeObservedCurrentLease(
 			fmt.Errorf("cannot confirm lease %s state %s", event.leaseUUID, lease.State))
 	}
 
+	// A billing-only lease has nothing to deploy: acknowledge it so billing
+	// starts. Every other path below needs the classifier-issued capability,
+	// because the backend request is minted only from a DeployableLease.
+	class := authority.coordinator.classify(lease)
+	if class.BillingOnly() {
+		return authority.acknowledgeBillingOnly(ctx, *lease, leaseClaim)
+	}
+	deployable, isDeployable := class.Deployable()
+	if !isDeployable {
+		return newProvisionEventResult(ProvisionEventUncertain, lease,
+			fmt.Errorf("lease %s cannot be classified for deployment", event.leaseUUID))
+	}
+
 	payloadBytes := []byte(nil)
 	payloadFingerprint := PayloadFingerprint{}
 	var err error
@@ -398,9 +414,7 @@ func (authority *ProvisionCoordinator) executeObservedCurrentLease(
 	if err != nil {
 		return abort(err)
 	}
-	requestSnapshot, err := authority.coordinator.store.MintBackendRequestSnapshot(
-		lease.Tenant, items,
-	)
+	requestSnapshot, err := authority.coordinator.store.MintBackendRequestSnapshot(deployable)
 	if err != nil {
 		return abort(err)
 	}
@@ -474,6 +488,38 @@ func (authority *ProvisionCoordinator) executeObservedCurrentLease(
 		return newProvisionEventResult(ProvisionEventValidationRefused, lease, callErr)
 	}
 	return newProvisionEventResult(ProvisionEventUncertain, lease, callErr)
+}
+
+// acknowledgeBillingOnly acknowledges a PENDING billing-only lease, which
+// starts its billing. Nothing is routed, admitted, or provisioned for it: the
+// backend could only refuse its SKU, and that refusal would reject the lease.
+// It runs under the exact lease claim, so the reconciler cannot act on the
+// lease meanwhile. An acknowledgement error is settled by a fresh read: an
+// ACTIVE or terminal lease needs nothing more, and anything else stays
+// uncertain so the event is retried, as the next reconcile sweep also does.
+func (authority *ProvisionCoordinator) acknowledgeBillingOnly(
+	ctx context.Context, lease billingtypes.Lease, claim operation.LeaseClaim,
+) ProvisionEventResult {
+	if err := authority.coordinator.store.leaseSideEffectError(lease.Uuid); err != nil {
+		return newProvisionEventResult(ProvisionEventUncertain, &lease, err)
+	}
+	_, txHash, ackErr := authority.controlPlane.acknowledgeLease(ctx, lease.Uuid)
+	if ackErr == nil {
+		slog.InfoContext(ctx, "acknowledged billing-only lease; it is billed but never deployed",
+			"lease_uuid", lease.Uuid, "tenant", lease.Tenant, "tx_hash", txHash)
+		lease.State = billingtypes.LEASE_STATE_ACTIVE
+		return newProvisionEventResult(ProvisionEventBillingOnlyAcknowledged, &lease, nil)
+	}
+	if current, ok := authority.readLease(ctx, lease.Uuid, lease.Tenant).(observedExactLease); ok {
+		switch current.lease.State {
+		case billingtypes.LEASE_STATE_ACTIVE:
+			return newProvisionEventResult(ProvisionEventBillingOnlyAcknowledged, &current.lease, nil)
+		case billingtypes.LEASE_STATE_CLOSED, billingtypes.LEASE_STATE_REJECTED, billingtypes.LEASE_STATE_EXPIRED:
+			return authority.finishTerminalProvision(current.lease, claim)
+		}
+	}
+	return newProvisionEventResult(ProvisionEventUncertain, &lease,
+		fmt.Errorf("acknowledge billing-only lease %s: %w", lease.Uuid, ackErr))
 }
 
 // provisionRoute is a read-only routing decision minted by the exact runtime

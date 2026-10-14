@@ -1229,6 +1229,8 @@ func (h *Handlers) writeRestoreResult(
 		writeJSON(w, map[string]string{"status": "provisioning"}, http.StatusAccepted)
 	case restoreapp.OutcomeTargetNotPending:
 		writeRestoreConflict(w, "lease is not pending; only a fresh lease can be restored into", "target_not_pending")
+	case restoreapp.OutcomeTargetBillingOnly:
+		writeError(w, "lease is billing-only and cannot be restored into", http.StatusBadRequest)
 	case restoreapp.OutcomeSourceNotFound, restoreapp.OutcomeNotRetained:
 		writeError(w, "no retained data found for that lease", http.StatusNotFound)
 	case restoreapp.OutcomeSourceUnavailable:

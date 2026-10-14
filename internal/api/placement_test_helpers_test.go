@@ -128,7 +128,7 @@ func bindAPIInventoryRuntime(
 	t.Helper()
 	inventoryRuntime := newAPIInventoryRuntime(runtime)
 	execution, err := coordinator.BindBackendRuntime(inventoryRuntime,
-		apiProviderControlPlane{ReconciliationChain: chain})
+		apiProviderControlPlane{ReconciliationChain: chain}, placement.NoBillingOnlySKUs())
 	require.NoError(t, err)
 	return execution, inventoryRuntime
 }

@@ -415,14 +415,14 @@ func TestBackendRuntimeBindingIsOneShotAndPurposeFacetsHideBackendClients(t *tes
 	var typedNilRuntime *executionTestRuntime
 	execution, err := base.BindBackendRuntime(typedNilRuntime, &testProviderControlPlane{
 		provider: freshTestProviderUUID,
-	})
+	}, NoBillingOnlySKUs())
 	require.Error(t, err)
 	require.Nil(t, execution)
 	require.Nil(t, base.execution,
 		"failed runtime validation must not publish a partial execution coordinator")
 
 	var typedNilControlPlane *testProviderControlPlane
-	execution, err = base.BindBackendRuntime(first, typedNilControlPlane)
+	execution, err = base.BindBackendRuntime(first, typedNilControlPlane, NoBillingOnlySKUs())
 	require.Error(t, err)
 	require.Nil(t, execution)
 	require.Nil(t, base.execution,
@@ -430,7 +430,7 @@ func TestBackendRuntimeBindingIsOneShotAndPurposeFacetsHideBackendClients(t *tes
 
 	execution, err = base.BindBackendRuntime(first, &testProviderControlPlane{
 		provider: freshTestProviderUUID,
-	})
+	}, NoBillingOnlySKUs())
 	require.NoError(t, err)
 	require.True(t, execution.Valid())
 	assert.Same(t, routes, execution.callbacks,
@@ -438,7 +438,7 @@ func TestBackendRuntimeBindingIsOneShotAndPurposeFacetsHideBackendClients(t *tes
 
 	_, err = base.BindBackendRuntime(executionRuntime("backend-a"), &testProviderControlPlane{
 		provider: freshTestProviderUUID,
-	})
+	}, NoBillingOnlySKUs())
 	require.ErrorContains(t, err, "already bound")
 
 	for _, facet := range []reflect.Type{
@@ -493,13 +493,13 @@ func TestBackendRuntimeBindingRejectsStoreTopologyMismatchBeforePublication(t *t
 	require.NoError(t, err)
 	control := &testProviderControlPlane{provider: freshTestProviderUUID}
 
-	execution, err := base.BindBackendRuntime(executionRuntime("backend-b"), control)
+	execution, err := base.BindBackendRuntime(executionRuntime("backend-b"), control, NoBillingOnlySKUs())
 	require.ErrorIs(t, err, ErrInvalidBackendTopology)
 	require.Nil(t, execution)
 	require.Nil(t, base.execution,
 		"a mismatched runtime must not publish any executable purpose facet")
 
-	execution, err = base.BindBackendRuntime(executionRuntime("backend-a"), control)
+	execution, err = base.BindBackendRuntime(executionRuntime("backend-a"), control, NoBillingOnlySKUs())
 	require.NoError(t, err)
 	require.True(t, execution.Valid(),
 		"failed validation must leave the one-shot binding available for the exact topology")

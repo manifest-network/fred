@@ -371,6 +371,18 @@ func bindExecutionForTest(
 	runtime backendRuntime,
 ) *ExecutionCoordinator {
 	t.Helper()
+	return bindExecutionWithPolicyForTest(t, coordinator, runtime, NoBillingOnlySKUs())
+}
+
+// bindExecutionWithPolicyForTest binds the runtime with an explicit billing
+// policy, for tests that exercise billing-only leases.
+func bindExecutionWithPolicyForTest(
+	t testing.TB,
+	coordinator *OperationCoordinator,
+	runtime backendRuntime,
+	policy *BillingPolicy,
+) *ExecutionCoordinator {
+	t.Helper()
 	names, err := backendNames(runtime)
 	require.NoError(t, err)
 	coordinator.store.mu.RLock()
@@ -386,7 +398,7 @@ func bindExecutionForTest(
 	}
 	execution, err := coordinator.BindBackendRuntime(runtime, &testProviderControlPlane{
 		provider: coordinator.store.providerUUID,
-	})
+	}, policy)
 	require.NoError(t, err)
 	return execution
 }

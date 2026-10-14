@@ -1128,9 +1128,13 @@ func (authority *ReconciliationCoordinator) Provision(
 		authority.coordinator.operations.AbortInitiation(initiation)
 		return invalid(err)
 	}
-	request, err := authority.coordinator.store.MintBackendRequestSnapshot(
-		lease.Tenant, items,
-	)
+	// The reconciler never plans a provision for a billing-only lease; the
+	// request is still minted only from the classifier-issued capability.
+	deployable, isDeployable := authority.coordinator.classify(&lease).Deployable()
+	if !isDeployable {
+		return abort(fmt.Errorf("lease %s is not deployable", lease.Uuid))
+	}
+	request, err := authority.coordinator.store.MintBackendRequestSnapshot(deployable)
 	if err != nil {
 		return abort(err)
 	}

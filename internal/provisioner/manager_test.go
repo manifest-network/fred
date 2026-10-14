@@ -294,28 +294,28 @@ func TestNewManager_Validation(t *testing.T) {
 	}{
 		{
 			name:        "missing router",
-			cfg:         ManagerConfig{ProviderUUID: "test-uuid"},
+			cfg:         ManagerConfig{BillingPolicy: placement.NoBillingOnlySKUs(), ProviderUUID: "test-uuid"},
 			router:      nil,
 			chainClient: mockChain,
 			wantErr:     "backend router is required",
 		},
 		{
 			name:        "missing chain client",
-			cfg:         ManagerConfig{ProviderUUID: "test-uuid"},
+			cfg:         ManagerConfig{BillingPolicy: placement.NoBillingOnlySKUs(), ProviderUUID: "test-uuid"},
 			router:      router,
 			chainClient: nil,
 			wantErr:     "chain client is required",
 		},
 		{
 			name:        "typed nil chain client",
-			cfg:         ManagerConfig{ProviderUUID: "test-uuid"},
+			cfg:         ManagerConfig{BillingPolicy: placement.NoBillingOnlySKUs(), ProviderUUID: "test-uuid"},
 			router:      router,
 			chainClient: typedNilChainClient,
 			wantErr:     "chain client is required",
 		},
 		{
 			name:        "missing provider UUID",
-			cfg:         ManagerConfig{},
+			cfg:         ManagerConfig{BillingPolicy: placement.NoBillingOnlySKUs()},
 			router:      router,
 			chainClient: mockChain,
 			wantErr:     "provider UUID is required",
@@ -323,7 +323,8 @@ func TestNewManager_Validation(t *testing.T) {
 		{
 			name: "missing placement authority",
 			cfg: ManagerConfig{
-				ProviderUUID: "test-uuid",
+				BillingPolicy: placement.NoBillingOnlySKUs(),
+				ProviderUUID:  "test-uuid",
 			},
 			router:      router,
 			chainClient: mockChain,
@@ -332,6 +333,7 @@ func TestNewManager_Validation(t *testing.T) {
 		{
 			name: "typed nil placement authority",
 			cfg: ManagerConfig{
+				BillingPolicy:  placement.NoBillingOnlySKUs(),
 				ProviderUUID:   "test-uuid",
 				PlacementStore: typedNilAuthority,
 			},
@@ -342,6 +344,7 @@ func TestNewManager_Validation(t *testing.T) {
 		{
 			name: "missing callback proof consumer",
 			cfg: ManagerConfig{
+				BillingPolicy:  placement.NoBillingOnlySKUs(),
 				ProviderUUID:   placementstore.ProviderUUID,
 				PlacementStore: validPlacement,
 			},
@@ -352,6 +355,7 @@ func TestNewManager_Validation(t *testing.T) {
 		{
 			name: "valid config",
 			cfg: ManagerConfig{
+				BillingPolicy:         placement.NoBillingOnlySKUs(),
 				ProviderUUID:          placementstore.ProviderUUID,
 				PlacementStore:        validPlacement,
 				CallbackProofConsumer: callbackTestProofConsumer,
@@ -385,6 +389,7 @@ func TestNewManager_RejectsPlacementAuthorityForDifferentProviderBeforeTopologyU
 	store := newTestPlacementAuthority(t)
 	configureTestPlacementTopology(t, store, []string{backendClient.Name()})
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:  placement.NoBillingOnlySKUs(),
 		ProviderUUID:   "e58ed763-928c-4e03-bfac-67a92a99de90",
 		PlacementStore: store,
 	}, router, &chaintest.MockClient{})
@@ -419,6 +424,7 @@ func TestNewManager_RejectsUncommittedRouterTopologyWithoutMutatingAuthority(t *
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:  placement.NoBillingOnlySKUs(),
 		ProviderUUID:   placementstore.ProviderUUID,
 		PlacementStore: store,
 	}, currentRouter, &chaintest.MockClient{})
@@ -430,6 +436,7 @@ func TestNewManager_RejectsUncommittedRouterTopologyWithoutMutatingAuthority(t *
 
 	configureTestPlacementTopology(t, store, []string{"backend-a", "backend-b"})
 	manager, err = NewManager(ManagerConfig{
+		BillingPolicy:         placement.NoBillingOnlySKUs(),
 		ProviderUUID:          placementstore.ProviderUUID,
 		PlacementStore:        store,
 		CallbackProofConsumer: callbackTestProofConsumer,
@@ -460,6 +467,7 @@ func TestNewManager_BackendConfigRevertSurvivesPlacementStoreReopen(t *testing.T
 		require.NoError(t, err)
 		configureTestPlacementTopology(t, store, names)
 		manager, err := NewManager(ManagerConfig{
+			BillingPolicy:         placement.NoBillingOnlySKUs(),
 			ProviderUUID:          placementstore.ProviderUUID,
 			PlacementStore:        store,
 			CallbackProofConsumer: callbackTestProofConsumer,
@@ -494,6 +502,7 @@ func TestNewManager_RejectsTopologyThatWouldRemoveDurableOwner(t *testing.T) {
 	), placement.ErrBackendTopologyInUse)
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:  placement.NoBillingOnlySKUs(),
 		ProviderUUID:   placementstore.ProviderUUID,
 		PlacementStore: store,
 	}, router, &chaintest.MockClient{})
@@ -523,7 +532,8 @@ func TestManager_HandleLeaseCreated(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -577,7 +587,8 @@ func TestManager_HandleLeaseCreated_ProvisionError(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -610,7 +621,8 @@ func TestManager_HandleLeaseCreated_MalformedMessage(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -635,7 +647,8 @@ func TestManager_HandleLeaseClosed(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -668,7 +681,8 @@ func TestManager_HandleLeaseClosed_DeprovisionError(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -708,7 +722,8 @@ func TestManager_HandleBackendCallback_Success(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 	// The batcher's lanes belong to Manager.Start (ENG-723); this test drives
@@ -759,7 +774,8 @@ func TestManager_HandleBackendCallback_Failed(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -794,7 +810,8 @@ func TestManager_HandleBackendCallback_UnknownLease(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 	// The batcher's lanes belong to Manager.Start (ENG-723); this test drives
@@ -834,7 +851,8 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 	// The batcher's lanes belong to Manager.Start (ENG-723); this test drives
@@ -897,7 +915,8 @@ func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 	// The batcher's lanes belong to Manager.Start (ENG-723); this test drives
@@ -935,7 +954,8 @@ func TestManager_HandleBackendCallback_UnknownStatus(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -971,7 +991,8 @@ func TestManager_PublishLeaseEvent(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1012,7 +1033,8 @@ func TestManager_PublishCallbackRequiresRunningRuntime(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1034,7 +1056,8 @@ func TestManager_HandleLeaseExpired(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1067,7 +1090,8 @@ func TestManager_StartAndClose(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1124,6 +1148,7 @@ func TestManager_CloseCancelsAndJoinsTimeoutChecker(t *testing.T) {
 	}}
 	placementStore := newTestPlacementAuthority(t)
 	manager, err := newTestManager(t, ManagerConfig{
+		BillingPolicy:   placement.NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackTimeout: time.Nanosecond, TimeoutCheckInterval: time.Millisecond,
 		PlacementStore: placementStore,
@@ -1206,7 +1231,8 @@ func TestManager_HandleLeaseCreated_SKUBasedRouting(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1280,7 +1306,8 @@ func TestManager_HandleBackendCallback_FailedRejectsLease(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1342,7 +1369,8 @@ func TestManager_HandleBackendCallback_FailedDefaultReason(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1423,7 +1451,8 @@ func TestManager_WaitForDrain_AlreadyEmpty(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1506,8 +1535,9 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1554,8 +1584,9 @@ func TestManager_HandlePayloadReceived_NoPayloadStore(t *testing.T) {
 
 	// Create manager WITHOUT payload store
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: nil, // No payload store
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  nil, // No payload store
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1591,8 +1622,9 @@ func TestManager_HandlePayloadReceived_MalformedMessage(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1627,8 +1659,9 @@ func TestManager_HandlePayloadReceived_UnknownLeasePreservesPayload(t *testing.T
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1682,8 +1715,9 @@ func TestManager_HandlePayloadReceived_ActiveLeasePreservesPayload(t *testing.T)
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1733,8 +1767,9 @@ func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1775,8 +1810,9 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1830,8 +1866,9 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1888,8 +1925,9 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -1943,8 +1981,9 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -2006,6 +2045,7 @@ func TestManager_RunTimeoutChecker(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
+		BillingPolicy:        placement.NoBillingOnlySKUs(),
 		ProviderUUID:         "provider-1",
 		CallbackTimeout:      50 * time.Millisecond, // Short for testing
 		TimeoutCheckInterval: 25 * time.Millisecond, // Check frequently
@@ -2081,8 +2121,9 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 	// The batcher's lanes belong to Manager.Start (ENG-723); this test drives
@@ -2177,8 +2218,9 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -2257,8 +2299,9 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	require.NoError(t, err)
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -2337,7 +2380,8 @@ func TestCallbacksRequireRunningManager(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -2441,6 +2485,7 @@ func TestManager_CloseCancelsAndDrainsActiveCallback(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
+		BillingPolicy:    placement.NoBillingOnlySKUs(),
 		ProviderUUID:     "provider-1",
 		AckBatchInterval: 50 * time.Millisecond, // Flush quickly
 	}, router, mockChain)
@@ -2531,7 +2576,8 @@ func TestManager_PoisonQueue_BreaksInfiniteLoop(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -2711,8 +2757,9 @@ func TestManager_OverwritePayload_ReplacesStoredPayload(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, &chaintest.MockClient{})
 	require.NoError(t, err)
 
@@ -2740,7 +2787,8 @@ func TestManager_OverwritePayload_NoStoreReturnsSentinel(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: &mockManagerBackend{name: "test"}, IsDefault: true}},
 	})
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 		// PayloadStore deliberately omitted
 	}, router, &chaintest.MockClient{})
 	require.NoError(t, err)

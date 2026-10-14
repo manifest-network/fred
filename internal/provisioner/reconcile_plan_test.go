@@ -39,6 +39,47 @@ func TestPlanLease_DecisionTable(t *testing.T) {
 		want  leasePlan
 	}{
 		{
+			name: "billing-only pending lease is acknowledged without a provision",
+			facts: leaseFacts{
+				authority:   lifecycleAuthorityDurable,
+				billingOnly: true,
+				chain:       billingtypes.LEASE_STATE_PENDING,
+				hasMetaHash: true,
+				payload:     payloadEvidenceAbsent,
+			},
+			want: leasePlan{action: reconcileActionAcknowledge, reason: "billing-only lease"},
+		},
+		{
+			name: "billing-only active lease absent from inventory is not provisioned",
+			facts: leaseFacts{
+				authority:   lifecycleAuthorityDurable,
+				billingOnly: true,
+				chain:       billingtypes.LEASE_STATE_ACTIVE,
+			},
+			want: leasePlan{action: reconcileActionWait, reason: "billing-only lease is billed but never deployed"},
+		},
+		{
+			name: "billing-only active lease is never closed as lost",
+			facts: leaseFacts{
+				authority:          lifecycleAuthorityDurable,
+				billingOnly:        true,
+				chain:              billingtypes.LEASE_STATE_ACTIVE,
+				recordlessUnproven: true,
+			},
+			want: leasePlan{action: reconcileActionWait, reason: "billing-only lease is billed but never deployed"},
+		},
+		{
+			name: "billing-only pending lease with a failed provision is acknowledged, not rejected",
+			facts: leaseFacts{
+				authority:       lifecycleAuthorityDurable,
+				billingOnly:     true,
+				chain:           billingtypes.LEASE_STATE_PENDING,
+				hasProvision:    true,
+				provisionStatus: backend.ProvisionStatusFailed,
+			},
+			want: leasePlan{action: reconcileActionAcknowledge, reason: "billing-only lease"},
+		},
+		{
 			name: "recordless active lease a retired backend may have held closes as lost",
 			facts: leaseFacts{
 				authority:          lifecycleAuthorityDurable,
@@ -284,16 +325,20 @@ func TestPlanLease_MissingAuthorityAlwaysDefers(t *testing.T) {
 	for _, chainState := range chainStates {
 		for _, status := range statuses {
 			for _, hasProvision := range []bool{false, true} {
-				plan := planLease(leaseFacts{
-					chain:           chainState,
-					hasProvision:    hasProvision,
-					provisionStatus: status,
-					terminal:        exhaustedVerdict(),
-					hasMetaHash:     true,
-					payload:         payloadEvidencePresent,
-				})
-				require.Equalf(t, reconcileActionDefer, plan.action,
-					"chain=%s status=%s hasProvision=%t", chainState, status, hasProvision)
+				for _, billingOnly := range []bool{false, true} {
+					plan := planLease(leaseFacts{
+						billingOnly:     billingOnly,
+						chain:           chainState,
+						hasProvision:    hasProvision,
+						provisionStatus: status,
+						terminal:        exhaustedVerdict(),
+						hasMetaHash:     true,
+						payload:         payloadEvidencePresent,
+					})
+					require.Equalf(t, reconcileActionDefer, plan.action,
+						"chain=%s status=%s hasProvision=%t billingOnly=%t",
+						chainState, status, hasProvision, billingOnly)
+				}
 			}
 		}
 	}

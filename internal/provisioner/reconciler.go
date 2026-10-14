@@ -605,7 +605,12 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				}
 				return nil
 			}
-			if r.coordinator.AbsenceUntrusted(leaseUUID) {
+			// A billing-only lease's plan never reads backend inventory: it is
+			// acknowledged while PENDING and otherwise left alone. Neither
+			// action can lay a workload over data, so absence evidence that
+			// cannot be trusted does not defer it.
+			billingOnly := r.coordinator.ClassifyLease(&lease).BillingOnly()
+			if !billingOnly && r.coordinator.AbsenceUntrusted(leaseUUID) {
 				deferForSnapshotBoundary("placement_observation_excluded")
 				return nil
 			}
@@ -629,7 +634,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				)
 				return nil
 			}
-			if deferLease(
+			if !billingOnly && deferLease(
 				snapshot, retentionsAnswered,
 				isProvisioned, provision.BackendName, placementRecord, absenceTrusted,
 			) {
@@ -2114,6 +2119,7 @@ func (r *Reconciler) processLease(
 	}
 	plan := planLease(leaseFacts{
 		authority:       lifecycleAuthorityDurable,
+		billingOnly:     r.coordinator.ClassifyLease(&lease).BillingOnly(),
 		chain:           lease.State,
 		hasProvision:    isProvisioned,
 		provisionStatus: provision.Status,

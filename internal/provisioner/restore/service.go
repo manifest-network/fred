@@ -42,6 +42,9 @@ const (
 	OutcomeBackendMalformedResponse
 	OutcomeInternalFailure
 	OutcomeSourceLost
+	// OutcomeTargetBillingOnly: the target lease is billed but never deployed,
+	// so nothing may be restored into it.
+	OutcomeTargetBillingOnly
 )
 
 // Result is the typed result contract returned by Service. Detail contains
@@ -147,6 +150,8 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 		result.Outcome = OutcomeInvalid
 	case placement.RestoreApplicationTargetNotPending:
 		result.Outcome = OutcomeTargetNotPending
+	case placement.RestoreApplicationTargetBillingOnly:
+		result.Outcome = OutcomeTargetBillingOnly
 	case placement.RestoreApplicationSourceNotFound:
 		result.Outcome = OutcomeSourceNotFound
 	case placement.RestoreApplicationSourceUnavailable:

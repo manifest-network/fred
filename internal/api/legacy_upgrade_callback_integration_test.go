@@ -141,6 +141,7 @@ func TestV013Upgrade_LegacyCallbackCrossesSignedHTTPAndManager(t *testing.T) {
 	require.NoError(t, err)
 
 	manager, err := provisioner.NewManager(provisioner.ManagerConfig{
+		BillingPolicy:         placement.NoBillingOnlySKUs(),
 		ProviderUUID:          providerUUID,
 		PlacementStore:        placements,
 		LeaseEventSink:        events,

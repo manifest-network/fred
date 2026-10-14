@@ -20,6 +20,7 @@ import (
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 // mockBenchBackend implements backend.Backend for benchmarks.
@@ -225,7 +226,8 @@ func TestManager_HighThroughput(t *testing.T) {
 	}
 
 	mgr, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-uuid",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-uuid",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -318,7 +320,8 @@ func TestManager_BurstTraffic(t *testing.T) {
 	}
 
 	mgr, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-uuid",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-uuid",
 	}, router, mockChain)
 	require.NoError(t, err)
 

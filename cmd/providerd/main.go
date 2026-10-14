@@ -396,6 +396,21 @@ func run(cmd *cobra.Command, args []string) error {
 	// Create event broker for real-time lease event delivery
 	eventBroker := api.NewEventBroker()
 
+	// Every placement facet that could deploy or acknowledge a lease classifies
+	// it through this one policy, bound into the backend runtime by the
+	// provision manager. Leases that use only billing_only_skus are billed on
+	// chain but never deployed: they are acknowledged without provisioning,
+	// and their payload uploads and restores are refused.
+	billingPolicy, err := placement.NewBillingPolicy(cfg.BillingOnlySKUs)
+	if err != nil {
+		return fmt.Errorf("invalid billing_only_skus: %w", err)
+	}
+	if len(cfg.BillingOnlySKUs) > 0 {
+		slog.Info("billing-only SKUs configured; their leases are acknowledged but never deployed",
+			"skus", cfg.BillingOnlySKUs,
+		)
+	}
+
 	// Create provision manager
 	provisionMgr, err := provisioner.NewManager(provisioner.ManagerConfig{
 		ProviderUUID:          cfg.ProviderUUID,
@@ -405,6 +420,7 @@ func run(cmd *cobra.Command, args []string) error {
 		AckLaneCount:          signerPool.LaneCount(),
 		AckFlushTimeout:       cfg.TxTimeout,
 		CallbackProofConsumer: callbackProofConsumer,
+		BillingPolicy:         billingPolicy,
 	}, backendRouter, chainClient)
 	if err != nil {
 		return fmt.Errorf("failed to create provision manager: %w", err)
@@ -500,6 +516,7 @@ func run(cmd *cobra.Command, args []string) error {
 		CallbackCanonicalPathPrefix: cfg.CallbackCanonicalPathPrefix,
 		TokenTrackerDBPath:          cfg.TokenTrackerDBPath,
 		CallbackBaseURL:             cfg.CallbackBaseURL,
+		BillingPolicy:               billingPolicy,
 
 		MaintenanceLegacyIdempotencyTenants: cfg.MaintenanceLegacyIdempotencyTenants,
 	}, api.ServerDeps{

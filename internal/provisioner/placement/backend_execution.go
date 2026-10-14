@@ -9,6 +9,8 @@ import (
 	"runtime/debug"
 	"slices"
 
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/util"
@@ -52,16 +54,26 @@ type ExecutionCoordinator struct {
 	controlPlane *boundProviderControlPlane
 	deprovision  *deprovisionCoordinator
 	issuer       *operationCoordinatorMarker
+	policy       *BillingPolicy
 }
 
+// BindBackendRuntime binds the physical backend runtime, the provider control
+// plane and the billing policy. The policy is required, and NoBillingOnlySKUs
+// is the explicit empty one: every purpose facet derived from this
+// coordinator classifies leases through it before it can mint a backend
+// request.
 func (coordinator *OperationCoordinator) BindBackendRuntime(
 	backends backendRuntime,
 	control ProviderControlPlane,
+	policy *BillingPolicy,
 ) (*ExecutionCoordinator, error) {
 	if !coordinator.Valid() || util.IsNilInterface(backends) ||
 		util.IsNilInterface(control) ||
 		coordinator.store.callbackRoutes == nil || !coordinator.store.callbackRoutes.Valid() {
 		return nil, errors.New("valid operation coordinator, backend runtime, provider control plane, and callback routes are required")
+	}
+	if !policy.valid() {
+		return nil, errors.New("billing policy is required")
 	}
 	names, err := backendNames(backends)
 	if err != nil {
@@ -79,6 +91,7 @@ func (coordinator *OperationCoordinator) BindBackendRuntime(
 		coordinator: coordinator, backends: backends,
 		callbacks: coordinator.store.callbackRoutes,
 		issuer:    coordinator.marker,
+		policy:    policy,
 	}
 	execution.controlPlane = &boundProviderControlPlane{
 		execution: execution, providerUUID: coordinator.store.providerUUID, control: control,
@@ -97,7 +110,17 @@ func (authority *ExecutionCoordinator) Valid() bool {
 		authority.coordinator.execution == authority && !util.IsNilInterface(authority.backends) &&
 		authority.callbacks.Valid() && authority.deprovision != nil &&
 		authority.deprovision.execution == authority && authority.controlPlane != nil &&
-		authority.controlPlane.validFor(authority)
+		authority.controlPlane.validFor(authority) && authority.policy.valid()
+}
+
+// classify sorts a lease through the billing policy bound with the backend
+// runtime. Before a runtime is bound nothing is classified, so nothing can be
+// deployed or acknowledged.
+func (coordinator *OperationCoordinator) classify(lease *billingtypes.Lease) LeaseClass {
+	if coordinator == nil || coordinator.execution == nil {
+		return LeaseClass{}
+	}
+	return coordinator.execution.policy.Classify(lease)
 }
 
 func backendNames(runtime backendRuntime) (names []string, err error) {

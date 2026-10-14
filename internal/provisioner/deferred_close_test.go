@@ -49,7 +49,7 @@ func newDeferredCloseFixture(t *testing.T, count int, closeCall func(context.Con
 	client := &deferredCloseBackend{mockManagerBackend: &mockManagerBackend{name: "backend-a"}, close: closeCall}
 	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}}})
 	require.NoError(t, err)
-	manager, err := newTestManager(t, ManagerConfig{}, router, &chaintest.MockClient{})
+	manager, err := newTestManager(t, ManagerConfig{BillingPolicy: placement.NoBillingOnlySKUs()}, router, &chaintest.MockClient{})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -157,7 +157,7 @@ func TestManagerCloseEventDefersTransportLifecyclePendingWithoutPoisoning(t *tes
 	})
 	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}}})
 	require.NoError(t, err)
-	manager, err := newTestManager(t, ManagerConfig{}, router, &chaintest.MockClient{})
+	manager, err := newTestManager(t, ManagerConfig{BillingPolicy: placement.NoBillingOnlySKUs()}, router, &chaintest.MockClient{})
 	require.NoError(t, err)
 	inventoryReady.Store(true)
 	ctx, cancel := context.WithCancel(t.Context())

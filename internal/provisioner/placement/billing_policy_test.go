@@ -1,0 +1,347 @@
+package placement
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
+	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
+)
+
+const (
+	testBillingOnlySKU   = "01a126cc-7edd-700d-9ac6-02ed34fa4bff"
+	testBillingOnlyLease = "4c0b4a3e-6a1f-4f86-9d6b-2f6f1d3b9a10"
+)
+
+func testBillingOnlyPolicy(t testing.TB) *BillingPolicy {
+	t.Helper()
+	policy, err := NewBillingPolicy([]string{testBillingOnlySKU})
+	require.NoError(t, err)
+	return policy
+}
+
+func billingTestLease(skus ...string) *billingtypes.Lease {
+	lease := &billingtypes.Lease{Uuid: testBillingOnlyLease, Tenant: "tenant-test", State: billingtypes.LEASE_STATE_PENDING}
+	for _, sku := range skus {
+		lease.Items = append(lease.Items, billingtypes.LeaseItem{SkuUuid: sku, Quantity: 1})
+	}
+	return lease
+}
+
+func TestNewBillingPolicy_Validation(t *testing.T) {
+	_, err := NewBillingPolicy([]string{testBillingOnlySKU})
+	require.NoError(t, err)
+
+	empty, err := NewBillingPolicy(nil)
+	require.NoError(t, err)
+	_, deployable := empty.Classify(billingTestLease(testBillingOnlySKU)).Deployable()
+	assert.True(t, deployable, "an empty list builds the explicit empty policy")
+
+	for name, sku := range map[string]string{
+		"uppercase":  "01A126CC-7EDD-700D-9AC6-02ED34FA4BFF",
+		"braced":     "{" + testBillingOnlySKU + "}",
+		"urn prefix": "urn:uuid:" + testBillingOnlySKU,
+		"not a UUID": "casper-aoraki",
+	} {
+		t.Run(name+" is rejected", func(t *testing.T) {
+			policy, err := NewBillingPolicy([]string{sku})
+			require.ErrorContains(t, err, "lowercase canonical UUID")
+			assert.Nil(t, policy)
+		})
+	}
+	policy, err := NewBillingPolicy([]string{testBillingOnlySKU, testBillingOnlySKU})
+	require.ErrorContains(t, err, "duplicate SKU")
+	assert.Nil(t, policy)
+}
+
+func TestBillingPolicy_Classify(t *testing.T) {
+	const deployableSKU = "01a08b4f-fe71-7008-a853-c34efec3dc74"
+	policy := testBillingOnlyPolicy(t)
+
+	billingOnly := policy.Classify(billingTestLease(testBillingOnlySKU, testBillingOnlySKU))
+	assert.True(t, billingOnly.BillingOnly(), "every item is billing-only")
+	_, ok := billingOnly.Deployable()
+	assert.False(t, ok, "a billing-only lease is never deployable")
+
+	for name, lease := range map[string]*billingtypes.Lease{
+		"deployable":    billingTestLease(deployableSKU),
+		"mixed":         billingTestLease(testBillingOnlySKU, deployableSKU),
+		"without items": billingTestLease(),
+	} {
+		t.Run(name+" lease is deployable", func(t *testing.T) {
+			class := policy.Classify(lease)
+			assert.False(t, class.BillingOnly())
+			deployable, ok := class.Deployable()
+			require.True(t, ok)
+			assert.Equal(t, lease.Uuid, deployable.Lease().Uuid)
+		})
+	}
+
+	var none *BillingPolicy
+	for name, class := range map[string]LeaseClass{
+		"nil policy":         none.Classify(billingTestLease(deployableSKU)),
+		"zero policy":        (&BillingPolicy{}).Classify(billingTestLease(deployableSKU)),
+		"nil lease":          policy.Classify(nil),
+		"lease without uuid": policy.Classify(&billingtypes.Lease{Items: billingTestLease(deployableSKU).Items}),
+	} {
+		t.Run(name+" is neither", func(t *testing.T) {
+			assert.False(t, class.BillingOnly(), "nothing unclassified is acknowledged")
+			_, ok := class.Deployable()
+			assert.False(t, ok, "nothing unclassified is deployed")
+		})
+	}
+}
+
+func TestDeployableLease_IsDetachedFromTheCallersLease(t *testing.T) {
+	lease := billingTestLease("sku-test")
+	deployable, ok := NoBillingOnlySKUs().Classify(lease).Deployable()
+	require.True(t, ok)
+
+	lease.Items[0].SkuUuid = testBillingOnlySKU
+	lease.Uuid = "lease-edited"
+
+	got := deployable.Lease()
+	assert.Equal(t, testBillingOnlyLease, got.Uuid)
+	assert.Equal(t, "sku-test", got.Items[0].SkuUuid, "editing the caller's lease cannot change what was classified")
+	got.Items[0].SkuUuid = "edited"
+	assert.Equal(t, "sku-test", deployable.Lease().Items[0].SkuUuid, "the accessor returns a copy")
+}
+
+func TestBindBackendRuntime_RequiresBillingPolicy(t *testing.T) {
+	store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
+	require.NoError(t, store.ConfigureBackendTopologyWithStorageIdentities(
+		[]string{"backend-a"}, testBackendStorageIDs("backend-a"),
+	))
+	base, err := newOperationCoordinator(store, operation.NewRegistry())
+	require.NoError(t, err)
+	runtime := newExecutionTestRuntime(&executionTestBackend{name: "backend-a"})
+	control := &testProviderControlPlane{provider: store.providerUUID}
+
+	// No implicit default: a provider without billing-only SKUs binds
+	// NoBillingOnlySKUs() explicitly.
+	_, err = base.BindBackendRuntime(runtime, control, nil)
+	require.ErrorContains(t, err, "billing policy is required")
+	_, err = base.BindBackendRuntime(runtime, control, &BillingPolicy{})
+	require.ErrorContains(t, err, "billing policy is required")
+	execution, err := base.BindBackendRuntime(runtime, control, NoBillingOnlySKUs())
+	require.NoError(t, err)
+	assert.True(t, execution.Valid())
+}
+
+// billingOnlyTestControl is the provider control plane for the billing-only
+// event tests. It serves one lease, records acknowledgements, and fails the
+// test on any rejection.
+type billingOnlyTestControl struct {
+	t *testing.T
+
+	mu       sync.Mutex
+	state    billingtypes.LeaseState
+	metaHash []byte
+	skus     []string
+	acked    []string
+	// ackErr fails Acknowledge; activateOnError still makes the lease ACTIVE,
+	// modeling an RPC error after a committed acknowledgement.
+	ackErr          error
+	activateOnError bool
+}
+
+func (control *billingOnlyTestControl) GetLease(_ context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	lease := &billingtypes.Lease{
+		Uuid: leaseUUID, Tenant: "tenant-test", ProviderUuid: freshTestProviderUUID,
+		State: control.state, MetaHash: control.metaHash,
+	}
+	for _, sku := range control.skus {
+		lease.Items = append(lease.Items, billingtypes.LeaseItem{SkuUuid: sku, Quantity: 1})
+	}
+	return lease, nil
+}
+
+func (control *billingOnlyTestControl) Acknowledge(_ context.Context, leaseUUID string) (bool, string, error) {
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	control.acked = append(control.acked, leaseUUID)
+	if control.ackErr != nil {
+		if control.activateOnError {
+			control.state = billingtypes.LEASE_STATE_ACTIVE
+		}
+		return false, "", control.ackErr
+	}
+	control.state = billingtypes.LEASE_STATE_ACTIVE
+	return true, "tx-ack", nil
+}
+
+func (control *billingOnlyTestControl) RejectLeases(_ context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+	control.t.Errorf("billing-only lease rejected on chain: %v (%s)", leaseUUIDs, reason)
+	return 0, nil, nil
+}
+
+func (control *billingOnlyTestControl) acknowledged() []string {
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	return append([]string(nil), control.acked...)
+}
+
+// newBillingOnlyTestCoordinator binds a provision coordinator whose backend
+// counts provision calls; the backend refuses nothing, so a billing-only
+// lease reaching it would be visible as a call.
+func newBillingOnlyTestCoordinator(
+	t *testing.T, control *billingOnlyTestControl,
+) (*ProvisionCoordinator, *Store, *int32) {
+	t.Helper()
+	routes, err := NewCallbackRouteFactory("https://callbacks.provider.test")
+	require.NoError(t, err)
+	store := newTestStore(t, WithCallbackRouteFactory(routes))
+	requireAdmissionBaseline(t, store, "backend-a")
+	registry := operation.NewRegistry()
+	base, err := newOperationCoordinator(store, registry)
+	require.NoError(t, err)
+	var mu sync.Mutex
+	calls := new(int32)
+	client := &executionTestBackend{name: "backend-a", provision: func(context.Context, backend.ProvisionRequest) error {
+		mu.Lock()
+		defer mu.Unlock()
+		*calls++
+		return nil
+	}}
+	execution := bindExecutionWithPolicyForTest(t, base, newExecutionTestRuntime(client), testBillingOnlyPolicy(t))
+	setProviderControlPlaneForTest(t, execution, control)
+	authority, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
+	require.NoError(t, err)
+	return authority, store, calls
+}
+
+// requireLeaseClaimReleased proves the event left no lifecycle claim behind.
+func requireLeaseClaimReleased(t *testing.T, authority *ProvisionCoordinator, leaseUUID string) {
+	t.Helper()
+	claim := authority.coordinator.operations.TryClaimLeaseNow(leaseUUID)
+	require.True(t, claim.Acquired(), "the lease claim is released")
+	require.True(t, authority.coordinator.operations.ReleaseLease(claim.Claim()))
+}
+
+func TestExecuteCurrentLease_BillingOnlyLeaseIsAcknowledgedNotProvisioned(t *testing.T) {
+	for name, metaHash := range map[string][]byte{
+		"without meta_hash": nil,
+		"with meta_hash":    {0x01, 0x02},
+	} {
+		t.Run(name, func(t *testing.T) {
+			control := &billingOnlyTestControl{
+				t: t, state: billingtypes.LEASE_STATE_PENDING, metaHash: metaHash,
+				skus: []string{testBillingOnlySKU},
+			}
+			authority, store, calls := newBillingOnlyTestCoordinator(t, control)
+			request, err := NewProvisionEventRequest(testBillingOnlyLease, "tenant-test")
+			require.NoError(t, err)
+
+			result := authority.ExecuteCurrentLease(t.Context(), request)
+
+			require.Equal(t, ProvisionEventBillingOnlyAcknowledged, result.Disposition(), result.Err())
+			state, ok := result.LeaseState()
+			require.True(t, ok)
+			assert.Equal(t, billingtypes.LEASE_STATE_ACTIVE, state)
+			assert.Equal(t, []string{testBillingOnlyLease}, control.acknowledged(), "acknowledged once so billing starts")
+			assert.Zero(t, *calls, "a billing-only lease is never provisioned")
+			assert.Equal(t, StateAbsent, store.Lookup(testBillingOnlyLease).State(), "a billing-only lease is never placed")
+			requireLeaseClaimReleased(t, authority, testBillingOnlyLease)
+		})
+	}
+}
+
+func TestExecuteCurrentLease_BillingOnlyAcknowledgeError(t *testing.T) {
+	t.Run("a committed acknowledgement is confirmed by a fresh read", func(t *testing.T) {
+		control := &billingOnlyTestControl{
+			t: t, state: billingtypes.LEASE_STATE_PENDING, skus: []string{testBillingOnlySKU},
+			ackErr: errors.New("rpc timeout after broadcast"), activateOnError: true,
+		}
+		authority, _, calls := newBillingOnlyTestCoordinator(t, control)
+		request, err := NewProvisionEventRequest(testBillingOnlyLease, "tenant-test")
+		require.NoError(t, err)
+
+		result := authority.ExecuteCurrentLease(t.Context(), request)
+
+		assert.Equal(t, ProvisionEventBillingOnlyAcknowledged, result.Disposition(), result.Err())
+		assert.Zero(t, *calls)
+	})
+
+	t.Run("a lease still pending stays uncertain for a retry", func(t *testing.T) {
+		control := &billingOnlyTestControl{
+			t: t, state: billingtypes.LEASE_STATE_PENDING, skus: []string{testBillingOnlySKU},
+			ackErr: errors.New("sequence mismatch"),
+		}
+		authority, _, calls := newBillingOnlyTestCoordinator(t, control)
+		request, err := NewProvisionEventRequest(testBillingOnlyLease, "tenant-test")
+		require.NoError(t, err)
+
+		result := authority.ExecuteCurrentLease(t.Context(), request)
+
+		assert.Equal(t, ProvisionEventUncertain, result.Disposition())
+		require.ErrorContains(t, result.Err(), "sequence mismatch")
+		assert.Zero(t, *calls, "an acknowledgement failure never falls through to provisioning")
+		requireLeaseClaimReleased(t, authority, testBillingOnlyLease)
+	})
+}
+
+func TestExecuteCurrentLease_MixedLeaseIsProvisioned(t *testing.T) {
+	control := &billingOnlyTestControl{
+		t: t, state: billingtypes.LEASE_STATE_PENDING,
+		skus: []string{"sku-test", testBillingOnlySKU},
+	}
+	authority, _, calls := newBillingOnlyTestCoordinator(t, control)
+	request, err := NewProvisionEventRequest(testBillingOnlyLease, "tenant-test")
+	require.NoError(t, err)
+
+	result := authority.ExecuteCurrentLease(t.Context(), request)
+
+	assert.Equal(t, ProvisionEventStarted, result.Disposition(), result.Err())
+	assert.Equal(t, int32(1), *calls, "one deployable item makes the lease deployable")
+	assert.Empty(t, control.acknowledged(), "a mixed lease is acknowledged only after it is provisioned")
+}
+
+func TestRestoreApplication_RefusesBillingOnlyTarget(t *testing.T) {
+	const sourceLease = "71638ef8-1401-4f14-a355-1ae02afeb35b"
+	const targetLease = "81638ef8-1401-4f14-a355-1ae02afeb35b"
+	store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
+	requireAdmissionBaseline(t, store, "backend-a")
+	projectInventoryForTest(t, store, InventoryProjection{
+		Placements: map[string]string{sourceLease: "backend-a"},
+	})
+	base, err := newOperationCoordinator(store, operation.NewRegistry())
+	require.NoError(t, err)
+	var calls atomic.Int32
+	// The backend would accept the restore: the billing-only refusal is
+	// Fred's own, never left to the backend.
+	client := &executionTestBackend{name: "backend-a", restore: func(context.Context, backend.RestoreRequest) error {
+		calls.Add(1)
+		return nil
+	}}
+	execution := bindExecutionWithPolicyForTest(t, base, newExecutionTestRuntime(client), testBillingOnlyPolicy(t))
+	setProviderControlPlaneForTest(t, execution, executionLeaseReaderFunc(func(_ context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+		state := billingtypes.LEASE_STATE_PENDING
+		if leaseUUID == sourceLease {
+			state = billingtypes.LEASE_STATE_CLOSED
+		}
+		return &billingtypes.Lease{
+			Uuid: leaseUUID, Tenant: "tenant-test", ProviderUuid: freshTestProviderUUID, State: state,
+			Items: []billingtypes.LeaseItem{{SkuUuid: testBillingOnlySKU, Quantity: 1}},
+		}, nil
+	}))
+	authority, err := execution.RestoreCoordinator(nil)
+	require.NoError(t, err)
+	request, err := NewRestoreApplicationRequest(targetLease, "tenant-test", sourceLease)
+	require.NoError(t, err)
+
+	result := authority.ExecuteApplication(t.Context(), request)
+
+	assert.Equal(t, RestoreApplicationTargetBillingOnly, result.Disposition(), result.Err())
+	assert.Zero(t, calls.Load(), "a billing-only lease never reaches the backend")
+	assert.Equal(t, StateAbsent, store.Lookup(targetLease).State(), "nothing is admitted for the target")
+}

@@ -99,7 +99,8 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	switch result.Disposition() {
 	case placement.ProvisionEventStarted, placement.ProvisionEventDuplicate,
 		placement.ProvisionEventLeaseActive,
-		placement.ProvisionEventLeaseTerminal:
+		placement.ProvisionEventLeaseTerminal,
+		placement.ProvisionEventBillingOnlyAcknowledged:
 		return nil
 	case placement.ProvisionEventAwaitingPayload:
 		hash, ok := result.MetaHashHex()
@@ -241,7 +242,8 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	result := h.events.startFromCurrentLease(msg.Context(), request)
 	switch result.Disposition() {
 	case placement.ProvisionEventStarted, placement.ProvisionEventDuplicate,
-		placement.ProvisionEventLeaseActive:
+		placement.ProvisionEventLeaseActive,
+		placement.ProvisionEventBillingOnlyAcknowledged:
 		return nil
 	case placement.ProvisionEventLeaseTerminal:
 		state, _ := result.LeaseState()

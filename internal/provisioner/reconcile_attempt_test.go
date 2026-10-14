@@ -50,7 +50,9 @@ func redeliveryRequestSnapshot(
 	lease billingtypes.Lease,
 ) placement.BackendRequestSnapshot {
 	t.Helper()
-	snapshot, err := store.MintBackendRequestSnapshot(lease.Tenant, ExtractLeaseItems(&lease))
+	deployable, ok := placement.NoBillingOnlySKUs().Classify(&lease).Deployable()
+	require.True(t, ok)
+	snapshot, err := store.MintBackendRequestSnapshot(deployable)
 	require.NoError(t, err)
 	return snapshot
 }
