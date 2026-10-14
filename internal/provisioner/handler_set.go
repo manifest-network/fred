@@ -29,7 +29,9 @@ type HandlerDeps struct {
 	PayloadStore  *payload.Store
 	Publisher     message.Publisher // For publishing to TopicLeaseEvent (optional)
 	BackendRouter BackendRouter     // Used to allowlist backend names on non-in-flight callback metrics
-	BillingOnly   BillingOnlySKUs   // Leases covered by these SKUs are acknowledged, never deployed
+	// Policy classifies each lease before it is provisioned or acknowledged.
+	// Without one nothing is classified, so nothing is deployed.
+	Policy *BillingPolicy
 }
 
 // HandlerSet contains the Watermill message handlers for the provisioner.
@@ -98,8 +100,13 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	// A billing-only lease has nothing to deploy: acknowledge it so billing
 	// starts. Provisioning it would only earn an unknown-SKU refusal and an
 	// on-chain rejection.
-	if h.deps.BillingOnly.Covers(lease) {
+	class := h.deps.Policy.Classify(lease)
+	if class.BillingOnly() {
 		return h.acknowledgeBillingOnly(msg.Context(), lease)
+	}
+	deployable, ok := class.Deployable()
+	if !ok {
+		return fmt.Errorf("lease %s cannot be classified for deployment", event.LeaseUUID)
 	}
 
 	// Check if lease requires a payload (has MetaHash)
@@ -118,7 +125,7 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	}
 
 	// Start provisioning without payload
-	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{})
+	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), deployable, ProvisionOpts{})
 	if err != nil {
 		if errors.Is(err, backend.ErrValidation) {
 			return h.rejectOnValidationError(msg.Context(), lease, err)
@@ -489,12 +496,17 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	// The upload endpoint already refuses billing-only leases; this keeps a
 	// payload event for one from starting a provision regardless. The payload,
 	// if any, stays in the store and is deleted with the lease.
-	if h.deps.BillingOnly.Covers(lease) {
+	class := h.deps.Policy.Classify(lease)
+	if class.BillingOnly() {
 		slog.Warn("payload received for a billing-only lease, not provisioning",
 			"lease_uuid", event.LeaseUUID,
 			"tenant", event.Tenant,
 		)
 		return nil
+	}
+	deployable, ok := class.Deployable()
+	if !ok {
+		return fmt.Errorf("lease %s cannot be classified for deployment", event.LeaseUUID)
 	}
 
 	// Verify lease is still pending
@@ -557,7 +569,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	}
 
 	// Start provisioning with payload
-	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{
+	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), deployable, ProvisionOpts{
 		Payload:     payloadData,
 		PayloadHash: event.MetaHashHex,
 	})

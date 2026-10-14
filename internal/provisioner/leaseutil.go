@@ -68,46 +68,6 @@ func isTerminalAcknowledgeError(err error) bool {
 		errors.Is(err, billingtypes.ErrLeaseNotFound)
 }
 
-// BillingOnlySKUs is the set of on-chain SKU UUIDs the provider bills for but
-// never deploys (config billing_only_skus). The service behind such a SKU is
-// delivered outside Fred, so a lease that uses only these SKUs is acknowledged
-// as soon as providerd sees it, which starts its billing, and is never
-// provisioned, rejected, or closed for a provisioning reason. Billing applies
-// to it like any other lease: provider-wide withdrawals collect what it
-// accrues, and the credit check closes it once its tenant's credit is
-// exhausted.
-//
-// The nil set is empty: no lease is billing-only.
-type BillingOnlySKUs map[string]struct{}
-
-// NewBillingOnlySKUs builds the set from the validated config list.
-func NewBillingOnlySKUs(skuUUIDs []string) BillingOnlySKUs {
-	if len(skuUUIDs) == 0 {
-		return nil
-	}
-	set := make(BillingOnlySKUs, len(skuUUIDs))
-	for _, skuUUID := range skuUUIDs {
-		set[skuUUID] = struct{}{}
-	}
-	return set
-}
-
-// Covers reports whether every item of the lease uses a billing-only SKU. A
-// lease with no items is not billing-only. A lease that mixes billing-only and
-// deployable SKUs is not billing-only either: it takes the normal provisioning
-// path, where the backend refuses the SKU it cannot serve.
-func (s BillingOnlySKUs) Covers(lease *billingtypes.Lease) bool {
-	if len(s) == 0 || lease == nil || len(lease.Items) == 0 {
-		return false
-	}
-	for _, item := range lease.Items {
-		if _, ok := s[item.SkuUuid]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
 // ExtractRoutingSKU returns a SKU UUID from the lease for backend routing.
 //
 // Why this exists: A lease may contain multiple items with different SKUs,

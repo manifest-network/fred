@@ -184,6 +184,10 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("tenant_rate_limit_rps", 5.0)  // 5 requests per second per tenant
 	v.SetDefault("tenant_rate_limit_burst", 10) // burst of 10 requests per tenant
 	v.SetDefault("cors_origins", []string{"*"}) // Allow all origins by default
+	// Viper binds an environment variable only to a key it already knows, so
+	// without this default PROVIDER_BILLING_ONLY_SKUS would be ignored whenever
+	// the file omits the key, and its leases would be provisioned.
+	v.SetDefault("billing_only_skus", []string{})
 	v.SetDefault("grpc_tls_enabled", false)
 	v.SetDefault("grpc_tls_ca_file", "")
 	v.SetDefault("grpc_tls_skip_verify", false)

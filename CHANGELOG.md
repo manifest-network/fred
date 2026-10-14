@@ -17,10 +17,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   default backend, whose unknown-SKU refusal got the lease rejected on chain
   within seconds; an ACTIVE lease acknowledged by hand was closed on the next
   sweep. Payload uploads for a billing-only lease are refused with `400` and
-  counted as `fred_payload_uploads_total{outcome="billing_only"}`. Withdrawals
-  and the credit check apply as before. A lease that mixes billing-only and
-  deployable SKUs keeps the normal path. Each entry must be a lowercase
-  canonical UUID that no backend serves. (ENG-1453)
+  counted as `fred_payload_uploads_total{outcome="billing_only"}`, and so are
+  restores into one. Withdrawals and the credit check apply as before. A lease
+  that mixes billing-only and deployable SKUs keeps the normal path. Each entry
+  must be a lowercase canonical UUID that no backend serves;
+  `PROVIDER_BILLING_ONLY_SKUS` sets the list from the environment
+  (comma-separated). (ENG-1453)
 
 ### Changed
 

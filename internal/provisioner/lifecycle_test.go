@@ -43,6 +43,7 @@ func newLifecycleTestManagerWithPayloadStore(t *testing.T, payloadStore *payload
 	require.NoError(t, err)
 
 	m, err := NewManager(ManagerConfig{
+		BillingPolicy:    NoBillingOnlySKUs(),
 		ProviderUUID:     "provider-1",
 		CallbackBaseURL:  "http://localhost:8080",
 		PayloadStore:     payloadStore,

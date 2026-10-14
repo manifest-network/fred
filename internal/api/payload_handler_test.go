@@ -102,6 +102,7 @@ func TestPayloadHandler_InvalidUUID(t *testing.T) {
 		newMockPayloadPublisher(),
 		testutil.ValidUUID1,
 		"manifest",
+		provisioner.NoBillingOnlySKUs(),
 	)
 
 	req := createPayloadRequest(t, "POST", "/v1/leases/invalid-uuid/data", "invalid-uuid", []byte("test"), "")
@@ -118,6 +119,7 @@ func TestPayloadHandler_MissingAuth(t *testing.T) {
 		newMockPayloadPublisher(),
 		testutil.ValidUUID1,
 		"manifest",
+		provisioner.NoBillingOnlySKUs(),
 	)
 
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, []byte("test"), "")
@@ -134,6 +136,7 @@ func TestPayloadHandler_InvalidAuthFormat(t *testing.T) {
 		newMockPayloadPublisher(),
 		testutil.ValidUUID1,
 		"manifest",
+		provisioner.NoBillingOnlySKUs(),
 	)
 
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, []byte("test"), "Basic abc123")
@@ -155,7 +158,7 @@ func TestPayloadHandler_LeaseNotFound(t *testing.T) {
 		},
 	}
 
-	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
@@ -184,7 +187,7 @@ func TestPayloadHandler_LeaseNotPending(t *testing.T) {
 		},
 	}
 
-	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
@@ -214,7 +217,7 @@ func TestPayloadHandler_TenantMismatch(t *testing.T) {
 		},
 	}
 
-	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
@@ -243,7 +246,7 @@ func TestPayloadHandler_ProviderMismatch(t *testing.T) {
 		},
 	}
 
-	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
@@ -271,7 +274,7 @@ func TestPayloadHandler_LeaseNoMetaHash(t *testing.T) {
 		},
 	}
 
-	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
@@ -301,7 +304,7 @@ func TestPayloadHandler_MetaHashMismatch(t *testing.T) {
 		},
 	}
 
-	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
@@ -331,7 +334,7 @@ func TestPayloadHandler_PayloadHashMismatch(t *testing.T) {
 		},
 	}
 
-	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	// Token has correct meta_hash, but we send different payload
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
@@ -360,7 +363,7 @@ func TestPayloadHandler_EmptyPayload(t *testing.T) {
 		},
 	}
 
-	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, []byte{}, "Bearer "+tokenStr)
@@ -393,7 +396,7 @@ func TestPayloadHandler_PayloadConflict(t *testing.T) {
 	// Pre-store a payload to simulate conflict
 	publisher.storedPayloads[testutil.ValidUUID1] = []byte("existing payload")
 
-	handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
@@ -423,7 +426,7 @@ func TestPayloadHandler_Success(t *testing.T) {
 	}
 
 	publisher := newMockPayloadPublisher()
-	handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
@@ -469,7 +472,7 @@ func TestPayloadHandler_PublishFailureRollback(t *testing.T) {
 		return http.ErrAbortHandler // Simulate publish failure
 	}
 
-	handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payloadData, "Bearer "+tokenStr)
@@ -502,7 +505,7 @@ func TestPayloadHandler_LeaseUUIDMismatch(t *testing.T) {
 		},
 	}
 
-	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	// Token signed for a different lease UUID
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID2, metaHash, time.Now())
@@ -532,7 +535,7 @@ func TestPayloadHandler_ExpiredToken(t *testing.T) {
 		},
 	}
 
-	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest")
+	handler := NewPayloadHandler(client, newMockPayloadPublisher(), testutil.ValidUUID1, "manifest", provisioner.NoBillingOnlySKUs())
 
 	// Create expired token
 	tokenStr := testutil.CreateExpiredPayloadToken(kp, testutil.ValidUUID1, metaHash)
@@ -564,9 +567,10 @@ func TestPayloadHandler_BillingOnlyLeaseRefused(t *testing.T) {
 		},
 	}
 
+	policy, err := provisioner.NewBillingPolicy([]string{billingOnlySKU})
+	require.NoError(t, err)
 	publisher := newMockPayloadPublisher()
-	handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest").
-		WithBillingOnlySKUs(provisioner.NewBillingOnlySKUs([]string{billingOnlySKU}))
+	handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest", policy)
 
 	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
 	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)

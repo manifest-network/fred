@@ -26,6 +26,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
@@ -40,8 +41,9 @@ import (
 // the fallback stays reserved for genuinely misconfigured callers.
 func TestNewHandlers_AppliesWebSocketDefaults(t *testing.T) {
 	h := NewHandlers(HandlersConfig{
-		ProviderUUID: testutil.ValidUUID1,
-		Bech32Prefix: "manifest",
+		BillingPolicy: provisioner.NoBillingOnlySKUs(),
+		ProviderUUID:  testutil.ValidUUID1,
+		Bech32Prefix:  "manifest",
 	})
 
 	assert.Equal(t, wsDefaultMaxMessageSize, h.wsMaxMessageSize,
@@ -609,6 +611,7 @@ func TestServer_HealthNeverReturns503ThroughTheStack(t *testing.T) {
 
 	addr := freePort(t)
 	srv, err := NewServer(ServerConfig{
+		BillingPolicy:  provisioner.NoBillingOnlySKUs(),
 		Addr:           addr,
 		ProviderUUID:   testutil.ValidUUID1,
 		Bech32Prefix:   "manifest",
@@ -5634,6 +5637,7 @@ func TestRestoreLease_ForwardsAnd202(t *testing.T) {
 	}
 
 	h := &Handlers{
+		billingPolicy:   provisioner.NoBillingOnlySKUs(),
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
@@ -5710,6 +5714,7 @@ func TestRestoreLease_RejectsNonPendingLease(t *testing.T) {
 			require.NoError(t, err)
 
 			h := &Handlers{
+				billingPolicy: provisioner.NoBillingOnlySKUs(),
 				client:        chainClient,
 				backendRouter: router,
 				providerUUID:  providerUUID,
@@ -5783,6 +5788,7 @@ func TestRestoreLease_NoRetention404(t *testing.T) {
 	}
 
 	h := &Handlers{
+		billingPolicy:   provisioner.NoBillingOnlySKUs(),
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
@@ -5861,6 +5867,7 @@ func TestRestoreLease_InsufficientResources503(t *testing.T) {
 	}
 
 	h := &Handlers{
+		billingPolicy:   provisioner.NoBillingOnlySKUs(),
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
@@ -5944,6 +5951,7 @@ func TestRestoreLease_PendingLeaseAuthenticates(t *testing.T) {
 	}
 
 	h := &Handlers{
+		billingPolicy:   provisioner.NoBillingOnlySKUs(),
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
@@ -6003,6 +6011,7 @@ func TestRestoreLease_MalformedFromLease400(t *testing.T) {
 	require.NoError(t, err)
 
 	h := &Handlers{
+		billingPolicy: provisioner.NoBillingOnlySKUs(),
 		client:        chainClient,
 		backendRouter: router,
 		providerUUID:  providerUUID,
@@ -6067,6 +6076,7 @@ func TestRestoreLease_MissingFromLease400(t *testing.T) {
 	require.NoError(t, err)
 
 	h := &Handlers{
+		billingPolicy: provisioner.NoBillingOnlySKUs(),
 		client:        chainClient,
 		backendRouter: router,
 		providerUUID:  providerUUID,
@@ -6177,6 +6187,7 @@ func TestRestoreLease_RoutesToSourcePlacementBackend(t *testing.T) {
 	}
 
 	h := &Handlers{
+		billingPolicy:   provisioner.NoBillingOnlySKUs(),
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
@@ -6241,6 +6252,7 @@ func TestRestoreLease_NoSourcePlacement_Returns404(t *testing.T) {
 	}
 
 	h := &Handlers{
+		billingPolicy:   provisioner.NoBillingOnlySKUs(),
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
@@ -6314,6 +6326,7 @@ func TestRestoreLease_UnresolvableSourcePlacement_Returns503(t *testing.T) {
 	}
 
 	h := &Handlers{
+		billingPolicy:   provisioner.NoBillingOnlySKUs(),
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
@@ -6381,6 +6394,7 @@ func TestRestoreLease_PlacementDisabled_Returns503(t *testing.T) {
 	// backendRouter is non-nil so authenticateLease passes; the nil placement
 	// lookup must then surface as 503, not 404.
 	h := &Handlers{
+		billingPolicy: provisioner.NoBillingOnlySKUs(),
 		client:        chainClient,
 		backendRouter: router,
 		providerUUID:  providerUUID,
@@ -6496,6 +6510,7 @@ func TestRestoreLease_RecorderCalledOnSuccess(t *testing.T) {
 	recorder := &fakeRestoreRecorder{}
 
 	h := NewHandlers(HandlersConfig{
+		BillingPolicy:   provisioner.NoBillingOnlySKUs(),
 		Client:          chainClient,
 		BackendRouter:   router,
 		PlacementLookup: placement,
@@ -6565,6 +6580,7 @@ func TestRestoreLease_RecorderNotCalledOnMissingSourcePlacement(t *testing.T) {
 	recorder := &fakeRestoreRecorder{}
 
 	h := NewHandlers(HandlersConfig{
+		BillingPolicy:   provisioner.NoBillingOnlySKUs(),
 		Client:          chainClient,
 		BackendRouter:   router,
 		PlacementLookup: placement,
@@ -6632,6 +6648,7 @@ func restoreTrackerTestSetup(t *testing.T, tracker RestoreInFlightTracker, backe
 	}
 
 	h := NewHandlers(HandlersConfig{
+		BillingPolicy:   provisioner.NoBillingOnlySKUs(),
 		Client:          chainClient,
 		BackendRouter:   router,
 		PlacementLookup: placement,
@@ -6758,9 +6775,10 @@ func TestRestoreLease_RejectsUnauthenticated(t *testing.T) {
 			// client is nil and no backend is wired: auth must fail before either is
 			// touched. A regression that reached them would nil-deref and fail loudly.
 			h := &Handlers{
-				client:       nil,
-				providerUUID: providerUUID,
-				bech32Prefix: "manifest",
+				billingPolicy: provisioner.NoBillingOnlySKUs(),
+				client:        nil,
+				providerUUID:  providerUUID,
+				bech32Prefix:  "manifest",
 			}
 
 			reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
@@ -6838,6 +6856,7 @@ func TestRestoreLease_RejectsNonOwnedTarget(t *testing.T) {
 			require.NoError(t, err)
 
 			h := &Handlers{
+				billingPolicy: provisioner.NoBillingOnlySKUs(),
 				client:        chainClient,
 				backendRouter: router,
 				providerUUID:  providerUUID,
@@ -6923,6 +6942,7 @@ func TestRestoreLease_ForwardsSignerTenantOnCrossTenantSource(t *testing.T) {
 	}
 
 	h := &Handlers{
+		billingPolicy:   provisioner.NoBillingOnlySKUs(),
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
@@ -7013,6 +7033,7 @@ func TestRestoreLease_DemoteExceedsTier422(t *testing.T) {
 	}
 
 	h := &Handlers{
+		billingPolicy:   provisioner.NoBillingOnlySKUs(),
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
@@ -7108,6 +7129,7 @@ func TestRestoreLease_MalformedBackendErrorBodyIsNotForwarded(t *testing.T) {
 			}
 
 			h := &Handlers{
+				billingPolicy:   provisioner.NoBillingOnlySKUs(),
 				client:          chainClient,
 				backendRouter:   router,
 				placementLookup: placement,
@@ -7279,6 +7301,7 @@ func TestRestoreLease_422KeepsLoadtestContract(t *testing.T) {
 			require.NoError(t, rerr)
 
 			h := &Handlers{
+				billingPolicy: provisioner.NoBillingOnlySKUs(),
 				client:        chainClient,
 				backendRouter: router,
 				placementLookup: &mockPlacementLookup{getFunc: func(uuid string) string {
@@ -7437,6 +7460,7 @@ func TestRestoreLease_UnrecognizedBackendCodeRelays422(t *testing.T) {
 	require.NoError(t, err)
 
 	h := &Handlers{
+		billingPolicy: provisioner.NoBillingOnlySKUs(),
 		client:        chainClient,
 		backendRouter: router,
 		placementLookup: &mockPlacementLookup{getFunc: func(uuid string) string {

@@ -168,6 +168,7 @@ func newTestHandlerSet(
 
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 	hs := NewHandlerSet(HandlerDeps{
+		Policy:       NoBillingOnlySKUs(),
 		ChainClient:  chainClient,
 		Orchestrator: orch,
 		Tracker:      tracker,
@@ -783,6 +784,7 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 	pub := newMockPublisher()
 
 	hs := NewHandlerSet(HandlerDeps{
+		Policy:    NoBillingOnlySKUs(),
 		Tracker:   NewInFlightTracker(),
 		Publisher: pub,
 	})
@@ -1348,6 +1350,7 @@ func newPlacementTestFixture(chainClient *chaintest.MockClient, ack *mockAcknowl
 	}
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, ps)
 	hs := NewHandlerSet(HandlerDeps{
+		Policy:       NoBillingOnlySKUs(),
 		ChainClient:  chainClient,
 		Orchestrator: orch,
 		Tracker:      tracker,
@@ -1489,6 +1492,7 @@ func (p *mockPublisher) Close() error { return nil }
 func TestPublishLeaseEvent_PublishesToTopic(t *testing.T) {
 	pub := newMockPublisher()
 	hs := NewHandlerSet(HandlerDeps{
+		Policy:    NoBillingOnlySKUs(),
 		Publisher: pub,
 	})
 
@@ -1511,6 +1515,7 @@ func TestPublishLeaseEvent_PublishesToTopic(t *testing.T) {
 func TestPublishLeaseEvent_IncludesError(t *testing.T) {
 	pub := newMockPublisher()
 	hs := NewHandlerSet(HandlerDeps{
+		Policy:    NoBillingOnlySKUs(),
 		Publisher: pub,
 	})
 
@@ -1531,6 +1536,7 @@ func TestPublishLeaseEvent_IncludesError(t *testing.T) {
 
 func TestPublishLeaseEvent_NilPublisher(t *testing.T) {
 	hs := NewHandlerSet(HandlerDeps{
+		Policy:    NoBillingOnlySKUs(),
 		Publisher: nil,
 	})
 
@@ -1542,6 +1548,7 @@ func TestPublishLeaseEvent_PublishError(t *testing.T) {
 	pub := newMockPublisher()
 	pub.publishErr = errors.New("pubsub down")
 	hs := NewHandlerSet(HandlerDeps{
+		Policy:    NoBillingOnlySKUs(),
 		Publisher: pub,
 	})
 
@@ -1558,6 +1565,7 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_IncrementsNonInFlightCallb
 	before := promtestutil.ToFloat64(labeled)
 
 	hs := NewHandlerSet(HandlerDeps{
+		Policy:  NoBillingOnlySKUs(),
 		Tracker: NewInFlightTracker(),
 	})
 
@@ -1592,6 +1600,7 @@ func TestHandleBackendCallback_DeprovisionedNonInFlight(t *testing.T) {
 	}
 	pub := newMockPublisher()
 	hs := NewHandlerSet(HandlerDeps{
+		Policy:        NoBillingOnlySKUs(),
 		Tracker:       NewInFlightTracker(),
 		Publisher:     pub,
 		BackendRouter: router,
@@ -1646,6 +1655,7 @@ func TestHandleBackendCallback_SanitizesLabels(t *testing.T) {
 			before := promtestutil.ToFloat64(labeled)
 
 			hs := NewHandlerSet(HandlerDeps{
+				Policy:        NoBillingOnlySKUs(),
 				Tracker:       NewInFlightTracker(),
 				Publisher:     newMockPublisher(),
 				BackendRouter: router,
@@ -1867,7 +1877,7 @@ func TestHandlerSet_HandleLeaseCreated_BillingOnlyLeaseIsAcknowledgedNotProvisio
 				return true, "tx-ack", nil
 			}}
 			hs, tracker := newTestHandlerSet(billingOnlyLeaseChain(t, metaHash), mb, ack, nil)
-			hs.deps.BillingOnly = NewBillingOnlySKUs([]string{testBillingOnlySKU})
+			hs.deps.Policy = testBillingOnlyPolicy(t)
 
 			err := hs.HandleLeaseCreated(newLeaseEventMsg(t, chain.LeaseEvent{
 				Type:      chain.LeaseCreated,
@@ -1894,7 +1904,7 @@ func TestHandlerSet_HandleLeaseCreated_BillingOnlyAcknowledgeFailure(t *testing.
 			return false, "", errors.New("sequence mismatch")
 		}}
 		hs, _ := newTestHandlerSet(billingOnlyLeaseChain(t, nil), &mockManagerBackend{name: "test-backend"}, ack, nil)
-		hs.deps.BillingOnly = NewBillingOnlySKUs([]string{testBillingOnlySKU})
+		hs.deps.Policy = testBillingOnlyPolicy(t)
 
 		err := hs.HandleLeaseCreated(newLeaseEventMsg(t, chain.LeaseEvent{
 			Type:      chain.LeaseCreated,
@@ -1909,7 +1919,7 @@ func TestHandlerSet_HandleLeaseCreated_BillingOnlyAcknowledgeFailure(t *testing.
 			return false, "", billingtypes.ErrLeaseNotPending
 		}}
 		hs, _ := newTestHandlerSet(billingOnlyLeaseChain(t, nil), &mockManagerBackend{name: "test-backend"}, ack, nil)
-		hs.deps.BillingOnly = NewBillingOnlySKUs([]string{testBillingOnlySKU})
+		hs.deps.Policy = testBillingOnlyPolicy(t)
 
 		err := hs.HandleLeaseCreated(newLeaseEventMsg(t, chain.LeaseEvent{
 			Type:      chain.LeaseCreated,
@@ -1951,7 +1961,7 @@ func TestHandlerSet_HandleLeaseCreated_MixedLeaseTakesTheNormalPath(t *testing.T
 		return false, "", nil
 	}}
 	hs, _ := newTestHandlerSet(mockChain, mb, ack, nil)
-	hs.deps.BillingOnly = NewBillingOnlySKUs([]string{testBillingOnlySKU})
+	hs.deps.Policy = testBillingOnlyPolicy(t)
 
 	err := hs.HandleLeaseCreated(newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseCreated,
@@ -1978,7 +1988,7 @@ func TestHandlerSet_HandlePayloadReceived_BillingOnlyLeaseIsNotProvisioned(t *te
 	ps.Store("lease-billing-only", payloadData)
 
 	hs, tracker := newTestHandlerSet(billingOnlyLeaseChain(t, []byte{0x01}), mb, &mockAcknowledger{}, ps)
-	hs.deps.BillingOnly = NewBillingOnlySKUs([]string{testBillingOnlySKU})
+	hs.deps.Policy = testBillingOnlyPolicy(t)
 
 	// A mismatched hash would otherwise take the corrupted-payload path, which
 	// rejects the lease on chain: the billing-only check must come first.

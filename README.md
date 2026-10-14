@@ -250,7 +250,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `trusted_proxies` | CIDR blocks of trusted proxies for X-Forwarded-For | `[]` |
 | `cors_origins` | Allowed CORS origins for browser clients. `["*"]` allows all; `[]` disables CORS. | `["*"]` |
 | `backends` | List of backend configurations | (required) |
-| `billing_only_skus` | On-chain SKU UUIDs the provider bills for but never deploys. Fred acknowledges a lease whose items all use these SKUs, which starts its billing, and never provisions, rejects, or closes it for a provisioning reason. Withdrawals and the credit check still apply. See [Billing-only leases](#billing-only-leases). | `[]` |
+| `billing_only_skus` | On-chain SKU UUIDs the provider bills for but never deploys. Fred acknowledges a lease whose items all use these SKUs, which starts its billing, and never provisions, rejects, or closes it for a provisioning reason. Withdrawals and the credit check still apply. From the environment, `PROVIDER_BILLING_ONLY_SKUS` takes a comma-separated list. See [Billing-only leases](#billing-only-leases). | `[]` |
 | `callback_base_url` | Base URL for backend callbacks | (required) |
 | `callback_secret` | HMAC secret for callback authentication (min 32 chars) | (required) |
 | `callback_canonical_path_prefix` | Path prefix prepended to inbound callback URIs before HMAC verification. Set this when fred is behind a path-stripping reverse proxy (e.g., Traefik `stripPrefix` mapping `/api/fred/*` → `/*`); must match the prefix the proxy strips. Leave empty for direct-call deployments. See [SECURITY.md](SECURITY.md) and [docs/security-callback-auth.md](docs/security-callback-auth.md). | `""` |
@@ -716,7 +716,7 @@ Restore a soft-deleted lease's retained data into a **new** lease. The path `lea
 
 **Response Codes:**
 - `202 Accepted` - Restore initiated (the lease then transitions through `restarting` to `ready`/`failed`)
-- `400 Bad Request` - Missing/invalid `from_lease_uuid`, or items don't match the retained set
+- `400 Bad Request` - Missing/invalid `from_lease_uuid`, items don't match the retained set, or the target lease is [billing-only](#billing-only-leases)
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - No retained data found for `from_lease_uuid` (absent, expired, cross-tenant, or its backend is gone)
@@ -1371,7 +1371,8 @@ all use them is billing-only:
   lease ACTIVE, so billing starts at once.
 - Fred never provisions it, never rejects it, and never closes it for a
   provisioning reason. `POST /v1/leases/{lease_uuid}/data` refuses its payload
-  with `400`.
+  with `400`, and `POST /v1/leases/{lease_uuid}/restore` refuses to restore
+  into it with `400`.
 - Billing applies as for any lease: the provider-wide withdrawal settles it,
   and the credit check closes it once its tenant's credit is exhausted.
 

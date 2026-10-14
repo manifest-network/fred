@@ -1737,3 +1737,31 @@ billing_only_skus:
 	require.NoError(t, err)
 	assert.Equal(t, []string{"01a126cc-7edd-700d-9ac6-02ed34fa4bff"}, cfg.BillingOnlySKUs)
 }
+
+func TestLoad_BillingOnlySKUsFromEnvironment(t *testing.T) {
+	// The file omits billing_only_skus entirely. The environment alone must
+	// still configure it, or its leases would be provisioned and rejected.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	configContent := `
+provider_uuid: "01234567-89ab-cdef-0123-456789abcdef"
+provider_address: "manifest1abc"
+key_name: "provider"
+keyring_dir: "/home/provider/.manifest"
+callback_base_url: "http://localhost:8080"
+callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+backends:
+  - name: "docker-1"
+    url: "http://10.0.0.1:9000"
+    default: true
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644))
+	t.Setenv("PROVIDER_BILLING_ONLY_SKUS", "01a126cc-7edd-700d-9ac6-02ed34fa4bff,01a08b4f-fe71-7008-a853-c34efec3dc74")
+
+	cfg, err := Load(configPath)
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"01a126cc-7edd-700d-9ac6-02ed34fa4bff",
+		"01a08b4f-fe71-7008-a853-c34efec3dc74",
+	}, cfg.BillingOnlySKUs)
+}

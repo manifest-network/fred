@@ -357,6 +357,8 @@ backends:
 #
 # billing_only_skus:
 #   - "01a126cc-7edd-700d-9ac6-02ed34fa4bff"
+#
+# From the environment: PROVIDER_BILLING_ONLY_SKUS="<uuid>,<uuid>"
 
 # =============================================================================
 # CALLBACK CONFIGURATION (required)

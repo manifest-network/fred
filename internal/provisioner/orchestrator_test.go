@@ -72,7 +72,7 @@ func TestOrchestrator_StartProvisioning_Success(t *testing.T) {
 		},
 	}
 
-	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+	err := orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{})
 	require.NoError(t, err)
 
 	// Verify backend was called
@@ -109,7 +109,7 @@ func TestOrchestrator_StartProvisioning_WithPayload(t *testing.T) {
 	payload := []byte(`{"image":"nginx"}`)
 	hash := hashPayload(payload)
 
-	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{
+	err := orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{
 		Payload:     payload,
 		PayloadHash: hash,
 	})
@@ -138,7 +138,7 @@ func TestOrchestrator_StartProvisioning_PayloadHashRequiresBothFields(t *testing
 	}
 
 	// PayloadHash set but no Payload => hash should not be included
-	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{
+	err := orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{
 		PayloadHash: "abc123",
 	})
 	require.NoError(t, err)
@@ -163,7 +163,7 @@ func TestOrchestrator_StartProvisioning_NoBackend(t *testing.T) {
 		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 	}
 
-	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+	err := orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrNoBackendAvailable)
 	assert.False(t, tracker.IsInFlight("lease-1"))
@@ -185,7 +185,7 @@ func TestOrchestrator_StartProvisioning_AlreadyInFlight(t *testing.T) {
 		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 	}
 
-	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+	err := orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{})
 	assert.NoError(t, err, "should return nil for idempotent skip")
 
 	// Backend should not have been called
@@ -208,7 +208,7 @@ func TestOrchestrator_StartProvisioning_BackendFails(t *testing.T) {
 		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 	}
 
-	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+	err := orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrProvisioningFailed)
 
@@ -354,7 +354,7 @@ func TestOrchestrator_StartProvisioning_RecordsPlacement(t *testing.T) {
 		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 	}
 
-	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+	err := orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{})
 	require.NoError(t, err)
 
 	assert.Equal(t, "test-backend", ps.Get("lease-1"), "placement should be recorded after successful provisioning")
@@ -378,7 +378,7 @@ func TestOrchestrator_StartProvisioning_PlacementErrorNonFatal(t *testing.T) {
 		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 	}
 
-	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+	err := orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{})
 	assert.NoError(t, err, "placement Set error should not fail provisioning")
 	assert.True(t, tracker.IsInFlight("lease-1"))
 }
@@ -398,7 +398,7 @@ func TestOrchestrator_StartProvisioning_BackendFails_NoPlacement(t *testing.T) {
 		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 	}
 
-	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+	err := orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{})
 	require.Error(t, err)
 
 	assert.Empty(t, ps.Get("lease-1"), "placement should not be recorded when backend fails")
@@ -629,11 +629,11 @@ func TestOrchestrator_TypedNilPlacementStore_Panics(t *testing.T) {
 
 	// StartProvisioning passes the != nil check and calls Set on a nil receiver → panic
 	assert.Panics(t, func() {
-		_ = orch.StartProvisioning(context.Background(), &billingtypes.Lease{
+		_ = orch.StartProvisioning(context.Background(), mustDeployable(t, &billingtypes.Lease{
 			Uuid:   "lease-typed-nil",
 			Tenant: "tenant-a",
 			Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
-		}, ProvisionOpts{})
+		}), ProvisionOpts{})
 	})
 }
 
@@ -687,7 +687,7 @@ func TestOrchestrator_StartProvisioning_HonorsPlacement(t *testing.T) {
 		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 	}
 
-	require.NoError(t, orch.StartProvisioning(context.Background(), lease, ProvisionOpts{}))
+	require.NoError(t, orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{}))
 
 	// The placement-pinned backend must have received the Provision call.
 	pinned.mu.Lock()
@@ -734,7 +734,7 @@ func TestOrchestrator_StartProvisioning_UnresolvablePlacement_ProvisionsNoBacken
 		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 	}
 
-	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+	err := orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{})
 
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrPlacementUnresolvable)
@@ -778,7 +778,7 @@ func TestOrchestrator_StartProvisioning_NoPlacementRecord_RoutesFreely(t *testin
 		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 	}
 
-	require.NoError(t, orch.StartProvisioning(context.Background(), lease, ProvisionOpts{}))
+	require.NoError(t, orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{}))
 
 	target.mu.Lock()
 	calls := len(target.provisionCalls)
@@ -805,7 +805,7 @@ func TestOrchestrator_StartProvisioning_IncrementsInsufficientResources(t *testi
 		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 	}
 
-	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+	err := orch.StartProvisioning(context.Background(), mustDeployable(t, lease), ProvisionOpts{})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrInsufficientResources)
 

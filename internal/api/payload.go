@@ -32,24 +32,20 @@ type PayloadHandler struct {
 	publisher    PayloadPublisher
 	providerUUID string
 	bech32Prefix string
-	billingOnly  provisioner.BillingOnlySKUs
+	policy       *provisioner.BillingPolicy
 }
 
-// NewPayloadHandler creates a new payload handler.
-func NewPayloadHandler(client ChainClient, publisher PayloadPublisher, providerUUID, bech32Prefix string) *PayloadHandler {
+// NewPayloadHandler creates a new payload handler. The billing policy decides
+// which leases accept a payload: a billing-only lease is never deployed, and
+// without a policy no lease is accepted.
+func NewPayloadHandler(client ChainClient, publisher PayloadPublisher, providerUUID, bech32Prefix string, policy *provisioner.BillingPolicy) *PayloadHandler {
 	return &PayloadHandler{
 		client:       client,
 		publisher:    publisher,
 		providerUUID: providerUUID,
 		bech32Prefix: bech32Prefix,
+		policy:       policy,
 	}
-}
-
-// WithBillingOnlySKUs makes the handler refuse uploads for leases that use only
-// these SKUs: Fred never deploys them, so a payload has nothing to configure.
-func (h *PayloadHandler) WithBillingOnlySKUs(skus provisioner.BillingOnlySKUs) *PayloadHandler {
-	h.billingOnly = skus
-	return h
 }
 
 // HandlePayloadUpload handles POST /v1/leases/{lease_uuid}/data
@@ -110,12 +106,20 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// A billing-only lease is never deployed. Storing its payload would only
-	// queue a provision attempt that ends in an on-chain rejection.
-	if h.billingOnly.Covers(lease) {
+	// A billing-only lease is never deployed, so a payload has nothing to
+	// configure. A lease the policy cannot classify is refused as well: only a
+	// deployable lease is ever provisioned from a payload.
+	class := h.policy.Classify(lease)
+	if class.BillingOnly() {
 		slog.Warn("payload upload refused for a billing-only lease", "lease_uuid", leaseUUID)
 		metrics.PayloadUploadsTotal.WithLabelValues("billing_only").Inc()
 		writeError(w, "lease is billing-only and does not accept a payload", http.StatusBadRequest)
+		return
+	}
+	if _, deployable := class.Deployable(); !deployable {
+		slog.Error("payload upload refused: lease cannot be classified for deployment", "lease_uuid", leaseUUID)
+		metrics.PayloadUploadsTotal.WithLabelValues("error").Inc()
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
 		return
 	}
 

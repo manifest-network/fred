@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
@@ -299,10 +300,11 @@ func newTestHandlers(broker *EventBroker, chainClient ChainClient, providerUUID 
 	// need to override the WS tunables do so by assigning to the returned
 	// Handlers' fields after construction.
 	return NewHandlers(HandlersConfig{
-		Client:       chainClient,
-		EventBroker:  broker,
-		ProviderUUID: providerUUID,
-		Bech32Prefix: "manifest",
+		BillingPolicy: provisioner.NoBillingOnlySKUs(),
+		Client:        chainClient,
+		EventBroker:   broker,
+		ProviderUUID:  providerUUID,
+		Bech32Prefix:  "manifest",
 	})
 }
 

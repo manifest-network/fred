@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/provisioner"
 )
 
 // newCORSTestServer builds a Server with the given allowed origins.
@@ -18,6 +20,7 @@ func newCORSTestServer(t *testing.T, addr string, origins []string) *Server {
 
 	s, err := NewServer(
 		ServerConfig{
+			BillingPolicy:  provisioner.NoBillingOnlySKUs(),
 			Addr:           addr,
 			ProviderUUID:   "01234567-89ab-cdef-0123-456789abcdef",
 			Bech32Prefix:   "manifest",

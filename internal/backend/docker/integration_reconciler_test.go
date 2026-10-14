@@ -112,6 +112,7 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraC
 
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
+			BillingPolicy:          provisioner.NoBillingOnlySKUs(),
 			ProviderUUID:           providerUUID,
 			CallbackBaseURL:        callbackServer.URL,
 			Interval:               1 * time.Hour, // manual RunOnce only
@@ -759,6 +760,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	integrationAck2 := &integrationAcknowledger{chainClient: mockChain}
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
+			BillingPolicy:          provisioner.NoBillingOnlySKUs(),
 			ProviderUUID:           providerUUID,
 			CallbackBaseURL:        callbackServer.URL,
 			Interval:               1 * time.Hour,
@@ -999,6 +1001,7 @@ func testManagerSetup(t *testing.T, mockChain *chaintest.MockClient, extraCfg ..
 	})
 	require.NoError(t, err)
 	mgr, err := provisioner.NewManager(provisioner.ManagerConfig{
+		BillingPolicy:   provisioner.NoBillingOnlySKUs(),
 		ProviderUUID:    "test-provider",
 		CallbackBaseURL: callbackServer.URL,
 	}, router, mockChain)

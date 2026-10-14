@@ -212,6 +212,7 @@ func TestManager_HighThroughput(t *testing.T) {
 	}
 
 	mgr, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -306,6 +307,7 @@ func TestManager_BurstTraffic(t *testing.T) {
 	}
 
 	mgr, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)

@@ -68,6 +68,12 @@ linters:
           msg: "managed-volume destruction must go through volumeOp.destroy (internal/backend/docker/volume_destroy.go): it is the only site that establishes ownership before an irreversible delete (ENG-658)"
         - pattern: 'volumes\.Create$'
           msg: "managed-volume creation must go through Backend.createManagedVolume (internal/backend/docker/volume_lock.go): it holds the volume-name stripe that serializes create-or-reuse against an in-flight destroy (ENG-681)"
+        # A provision or a restore is the only way a workload reaches a backend, and
+        # each needs one of these requests. Building them only in deployment.go,
+        # from a DeployableLease that BillingPolicy.Classify issued, keeps a
+        # billing-only lease from ever being deployed (ENG-1453).
+        - pattern: '^backend\.(ProvisionRequest|RestoreRequest)$'
+          msg: "providerd builds backend provision and restore requests only in internal/provisioner/deployment.go, from a DeployableLease issued by BillingPolicy.Classify, so a billing-only lease is never deployed (ENG-1453)"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -104,6 +110,14 @@ linters:
       - path: ^internal/backend/docker/volume_lock\.go$
         linters:
           - forbidigo
+      # The deployment boundary (ENG-1453): the one providerd file that builds a
+      # backend provision or restore request. Backends and their servers implement
+      # and decode that contract. Matched by text, so the ENG-658/681 rules above
+      # still apply on these paths.
+      - path: ^(internal/provisioner/deployment\.go|internal/backend/|cmd/(docker|k3s|mock)-backend/)
+        linters:
+          - forbidigo
+        text: ENG-1453
       # Exclude test files from strict linters
       - path: _test\.go
         linters:
