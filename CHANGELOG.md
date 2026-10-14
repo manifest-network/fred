@@ -18,6 +18,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- deps: build with Go 1.26.9 (from 1.26.6) and move the affected modules to the
+  versions main already ships: `golang.org/x/net` v0.60.0 (from v0.57.0),
+  `google.golang.org/grpc` v1.83.2 (from v1.82.1),
+  `github.com/containerd/containerd/v2` v2.3.6 (from v2.3.3) and OpenTelemetry
+  v1.45.0 (from v1.44.0), with their required transitive updates. This resolves
+  sixteen advisories that Fred's code reaches:
+  - HTTP/2 server crash, memory exhaustion and CPU exhaustion (GO-2026-6617,
+    GO-2026-6612, GO-2026-6611, GO-2026-6603);
+  - HTTP/1 and HTTP/2 connection desynchronization and malformed framing
+    (GO-2026-6613, GO-2026-6605, GO-2026-6610);
+  - a MIME header memory-limit bypass (GO-2026-6608);
+  - malformed ECH extensions accepted by `crypto/tls` (GO-2026-6607);
+  - `html/template` escaping (GO-2026-6599, GO-2026-6600);
+  - a Windows-only `os.Root` escape (GO-2026-6604);
+  - gRPC heap exhaustion from fragmented HTTP/2 DATA frames, reachable through
+    the chain client (GO-2026-6348);
+  - containerd image-pull amplification and a CRI ExecSync goroutine leak
+    (GO-2026-6597, GO-2026-6444);
+  - OpenTelemetry exporter configuration logging that can leak endpoint URLs
+    (GO-2026-6505).
+
+  The `go` directive and the Dockerfile builder image move to 1.26.9, so
+  building Fred from source now needs Go 1.26.9 or later. govulncheck now
+  reports only the three allowlisted advisories, so the vulncheck gate passes
+  without widening the allowlist.
+
 ## [0.13.0] - 2026-08-20
 
 ### Added
