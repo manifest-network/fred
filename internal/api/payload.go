@@ -15,6 +15,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
@@ -31,6 +32,7 @@ type PayloadHandler struct {
 	publisher    PayloadPublisher
 	providerUUID string
 	bech32Prefix string
+	billingOnly  provisioner.BillingOnlySKUs
 }
 
 // NewPayloadHandler creates a new payload handler.
@@ -41,6 +43,13 @@ func NewPayloadHandler(client ChainClient, publisher PayloadPublisher, providerU
 		providerUUID: providerUUID,
 		bech32Prefix: bech32Prefix,
 	}
+}
+
+// WithBillingOnlySKUs makes the handler refuse uploads for leases that use only
+// these SKUs: Fred never deploys them, so a payload has nothing to configure.
+func (h *PayloadHandler) WithBillingOnlySKUs(skus provisioner.BillingOnlySKUs) *PayloadHandler {
+	h.billingOnly = skus
+	return h
 }
 
 // HandlePayloadUpload handles POST /v1/leases/{lease_uuid}/data
@@ -98,6 +107,15 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"state", lease.State.String(),
 		)
 		writeError(w, "lease not pending", http.StatusNotFound)
+		return
+	}
+
+	// A billing-only lease is never deployed. Storing its payload would only
+	// queue a provision attempt that ends in an on-chain rejection.
+	if h.billingOnly.Covers(lease) {
+		slog.Warn("payload upload refused for a billing-only lease", "lease_uuid", leaseUUID)
+		metrics.PayloadUploadsTotal.WithLabelValues("billing_only").Inc()
+		writeError(w, "lease is billing-only and does not accept a payload", http.StatusBadRequest)
 		return
 	}
 

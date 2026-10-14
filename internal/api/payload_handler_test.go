@@ -15,6 +15,7 @@ import (
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
+	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/testutil"
 )
@@ -541,4 +542,40 @@ func TestPayloadHandler_ExpiredToken(t *testing.T) {
 	handler.HandlePayloadUpload(rr, req)
 
 	assert.Equal(t, http.StatusUnauthorized, rr.Code)
+}
+
+func TestPayloadHandler_BillingOnlyLeaseRefused(t *testing.T) {
+	const billingOnlySKU = "01a126cc-7edd-700d-9ac6-02ed34fa4bff"
+	kp := testutil.NewTestKeyPair("payload-handler-test-billing-only")
+	payload := []byte("test payload")
+	metaHash := testutil.ComputePayloadHash(payload)
+	metaHashBytes, _ := hex.DecodeString(metaHash)
+
+	client := &mockPayloadChainClient{
+		getLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:         leaseUUID,
+				State:        billingtypes.LEASE_STATE_PENDING,
+				Tenant:       kp.Address,
+				ProviderUuid: testutil.ValidUUID1,
+				MetaHash:     metaHashBytes,
+				Items:        []billingtypes.LeaseItem{{SkuUuid: billingOnlySKU, Quantity: 1}},
+			}, nil
+		},
+	}
+
+	publisher := newMockPayloadPublisher()
+	handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest").
+		WithBillingOnlySKUs(provisioner.NewBillingOnlySKUs([]string{billingOnlySKU}))
+
+	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
+	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
+	rr := httptest.NewRecorder()
+
+	handler.HandlePayloadUpload(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+	assert.Contains(t, rr.Body.String(), "billing-only")
+	assert.Empty(t, publisher.storedPayloads, "a billing-only lease's payload is never stored")
+	assert.Empty(t, publisher.publishedEvents, "nothing is queued for provisioning")
 }

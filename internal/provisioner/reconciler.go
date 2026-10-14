@@ -82,6 +82,7 @@ type Reconciler struct {
 	backendRouter   BackendRouter
 	tracker         ReconcilerTracker // For tracking in-flight provisions (shared state with event-driven path)
 	placementStore  PlacementStore    // Optional placement store for backend routing
+	billingOnly     BillingOnlySKUs   // Leases covered by these SKUs are acknowledged, never deployed
 
 	interval               time.Duration
 	maxWorkers             int         // Maximum concurrent workers for lease processing
@@ -97,9 +98,10 @@ const DefaultMaxReprovisionAttempts = 3
 type ReconcilerConfig struct {
 	ProviderUUID           string
 	CallbackBaseURL        string
-	Interval               time.Duration // How often to run periodic reconciliation
-	MaxWorkers             int           // Maximum concurrent workers (default: 10)
-	MaxReprovisionAttempts int           // Max re-provision attempts before rejecting (default: 3)
+	Interval               time.Duration   // How often to run periodic reconciliation
+	MaxWorkers             int             // Maximum concurrent workers (default: 10)
+	MaxReprovisionAttempts int             // Max re-provision attempts before rejecting (default: 3)
+	BillingOnlySKUs        BillingOnlySKUs // Leases covered by these SKUs are acknowledged, never deployed
 }
 
 // NewReconciler creates a new reconciler.
@@ -136,6 +138,7 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, ackn
 		backendRouter:          backendRouter,
 		tracker:                tracker,
 		placementStore:         placementStore,
+		billingOnly:            cfg.BillingOnlySKUs,
 		interval:               interval,
 		maxWorkers:             maxWorkers,
 		maxReprovisionAttempts: maxReprovision,
@@ -336,11 +339,19 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		deferred     atomic.Int32
 	)
 
+	billingOnlyCount := 0
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(r.maxWorkers)
 
 	for leaseUUID, lease := range chainLeases {
 		provision, isProvisioned := allProvisions[leaseUUID]
+
+		// A billing-only lease needs no backend answer (processLease only
+		// acknowledges it), so it is never deferred.
+		billingOnly := r.billingOnly.Covers(&lease)
+		if billingOnly {
+			billingOnlyCount++
+		}
 
 		// Skip a lease whose owning backend did not report this sweep (ENG-356).
 		//
@@ -354,7 +365,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		// healthy ACTIVE lease on chain. Skip the goroutine body; leave the maps
 		// alone.
 		placedBackend := r.placementFor(leaseUUID)
-		if deferLease(snapshot, isProvisioned, placedBackend) {
+		if !billingOnly && deferLease(snapshot, isProvisioned, placedBackend) {
 			deferred.Add(1)
 			metrics.ReconcilerDeferredLeasesTotal.Inc()
 			slog.Debug("reconcile: deferring lease, owning backend did not report",
@@ -514,6 +525,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		"orphans", orphansCount,
 		"errors", leaseErrorCount,
 		"deferred", deferredCount,
+		"billing_only", billingOnlyCount,
 		"sweep_complete", snapshot.complete,
 		"orphaned_payloads_cleaned", orphanedPayloads,
 		"orphaned_placements_pruned", prunedPlacements,
@@ -1340,6 +1352,29 @@ func (r *Reconciler) processLease(
 			leaseErrors.Add(1)
 		}
 	}()
+
+	// A billing-only lease is billed but never deployed, whatever the backends
+	// report: acknowledge it while it is PENDING so billing starts, and never
+	// provision, reject or close it. The event path normally acknowledges it
+	// first; a lease that is no longer PENDING by now needs nothing more.
+	if r.billingOnly.Covers(&lease) {
+		if lease.State != billingtypes.LEASE_STATE_PENDING {
+			return
+		}
+		if err := r.acknowledgeLease(ctx, leaseUUID); err != nil {
+			if isTerminalAcknowledgeError(err) {
+				return
+			}
+			slog.Error("reconcile: failed to acknowledge billing-only lease",
+				"lease_uuid", leaseUUID,
+				"error", err,
+			)
+			hadError = true
+			return
+		}
+		acknowledged.Add(1)
+		return
+	}
 
 	switch {
 	case lease.State == billingtypes.LEASE_STATE_PENDING && !isProvisioned:

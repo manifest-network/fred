@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `billing_only_skus` lists SKUs the provider bills for but delivers outside
+  Fred. Fred acknowledges a lease whose items all use these SKUs as soon as it
+  sees it, so billing starts at once, and the reconciler retries the
+  acknowledgment on its next sweep, even when no backend answers. Fred never
+  provisions such a lease, never rejects it, and never closes it for a
+  provisioning reason. Before this, an unattached SKU fell through to the
+  default backend, whose unknown-SKU refusal got the lease rejected on chain
+  within seconds; an ACTIVE lease acknowledged by hand was closed on the next
+  sweep. Payload uploads for a billing-only lease are refused with `400` and
+  counted as `fred_payload_uploads_total{outcome="billing_only"}`. Withdrawals
+  and the credit check apply as before. A lease that mixes billing-only and
+  deployable SKUs keeps the normal path. Each entry must be a lowercase
+  canonical UUID that no backend serves. (ENG-1453)
+
 ### Changed
 
 ### Deprecated

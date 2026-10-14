@@ -4946,3 +4946,93 @@ func TestReconciler_ReconcileAll_MalformedRecordedHash_KeepsPayload(t *testing.T
 	defer mockBackend.mu.Unlock()
 	assert.Empty(t, mockBackend.provisionCalls, "must not provision against an unverifiable payload")
 }
+
+func TestReconciler_ReconcileAll_BillingOnlyLease(t *testing.T) {
+	// For a deployable lease every shape below is acted on: started, awaited,
+	// or provisioned as an anomaly, and the backend's refusal of the SKU then
+	// rejects or closes it on chain. A billing-only lease is only acknowledged
+	// while PENDING, even when its backend does not answer.
+	cases := map[string]struct {
+		lease       billingtypes.Lease
+		backendDown bool
+		wantAck     bool
+	}{
+		"pending without meta_hash":       {lease: billingtypes.Lease{State: billingtypes.LEASE_STATE_PENDING}, wantAck: true},
+		"pending with meta_hash":          {lease: billingtypes.Lease{State: billingtypes.LEASE_STATE_PENDING, MetaHash: []byte{0x01}}, wantAck: true},
+		"pending, backend did not answer": {lease: billingtypes.Lease{State: billingtypes.LEASE_STATE_PENDING}, backendDown: true, wantAck: true},
+		"active without meta_hash":        {lease: billingtypes.Lease{State: billingtypes.LEASE_STATE_ACTIVE}},
+		"active with meta_hash":           {lease: billingtypes.Lease{State: billingtypes.LEASE_STATE_ACTIVE, MetaHash: []byte{0x01}}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			lease := tc.lease
+			lease.Uuid = "lease-billing-only"
+			lease.Tenant = "tenant-1"
+			lease.Items = []billingtypes.LeaseItem{{SkuUuid: testBillingOnlySKU, Quantity: 1}}
+
+			mockChain := &chaintest.MockClient{
+				GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+					if lease.State == billingtypes.LEASE_STATE_PENDING {
+						return []billingtypes.Lease{lease}, nil
+					}
+					return nil, nil
+				},
+				GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+					if lease.State == billingtypes.LEASE_STATE_ACTIVE {
+						return []billingtypes.Lease{lease}, nil
+					}
+					return nil, nil
+				},
+				RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+					t.Errorf("billing-only lease rejected on chain: %v (%s)", leaseUUIDs, reason)
+					return 0, nil, nil
+				},
+				CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+					t.Errorf("billing-only lease closed on chain: %v (%s)", leaseUUIDs, reason)
+					return 0, nil, nil
+				},
+			}
+			var (
+				ackMu sync.Mutex
+				acked []string
+			)
+			ack := &mockAcknowledger{acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+				ackMu.Lock()
+				defer ackMu.Unlock()
+				acked = append(acked, leaseUUID)
+				return true, "tx-ack", nil
+			}}
+			mockBackend := &mockReconcilerBackend{
+				name:         "test",
+				provisions:   []backend.ProvisionInfo{},
+				provisionErr: fmt.Errorf("%w: %w: %s", backend.ErrValidation, backend.ErrUnknownSKU, testBillingOnlySKU),
+			}
+			if tc.backendDown {
+				mockBackend.listErr = errors.New("connection refused")
+			}
+			router, _ := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+			})
+
+			reconciler, err := NewReconciler(ReconcilerConfig{
+				ProviderUUID:    "provider-1",
+				CallbackBaseURL: "http://localhost:8080",
+				BillingOnlySKUs: NewBillingOnlySKUs([]string{testBillingOnlySKU}),
+			}, mockChain, ack, router, nil, nil)
+			require.NoError(t, err)
+
+			require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+			ackMu.Lock()
+			if tc.wantAck {
+				assert.Equal(t, []string{"lease-billing-only"}, acked, "a PENDING billing-only lease is acknowledged")
+			} else {
+				assert.Empty(t, acked, "only a PENDING lease is acknowledged")
+			}
+			ackMu.Unlock()
+			mockBackend.mu.Lock()
+			defer mockBackend.mu.Unlock()
+			assert.Empty(t, mockBackend.provisionCalls, "a billing-only lease is never provisioned")
+		})
+	}
+}

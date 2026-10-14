@@ -47,3 +47,29 @@ func TestExtractLeaseItems_ServiceName(t *testing.T) {
 		assert.Nil(t, ExtractLeaseItems(lease))
 	})
 }
+
+func TestBillingOnlySKUs_Covers(t *testing.T) {
+	const billingOnly = "01a126cc-7edd-700d-9ac6-02ed34fa4bff"
+	const deployable = "01a08b4f-fe71-7008-a853-c34efec3dc74"
+	set := NewBillingOnlySKUs([]string{billingOnly})
+
+	lease := func(skus ...string) *billingtypes.Lease {
+		l := &billingtypes.Lease{}
+		for _, sku := range skus {
+			l.Items = append(l.Items, billingtypes.LeaseItem{SkuUuid: sku, Quantity: 1})
+		}
+		return l
+	}
+
+	assert.True(t, set.Covers(lease(billingOnly)), "a lease of billing-only items is billing-only")
+	assert.True(t, set.Covers(lease(billingOnly, billingOnly)), "every item is billing-only")
+	assert.False(t, set.Covers(lease(deployable)), "a deployable lease is not billing-only")
+	assert.False(t, set.Covers(lease(billingOnly, deployable)),
+		"a mixed lease takes the normal path, where the backend refuses the SKU it cannot serve")
+	assert.False(t, set.Covers(lease()), "a lease with no items is not billing-only")
+	assert.False(t, set.Covers(nil), "a missing lease is not billing-only")
+
+	var none BillingOnlySKUs
+	assert.False(t, none.Covers(lease(billingOnly)), "an unconfigured set covers nothing")
+	assert.Nil(t, NewBillingOnlySKUs(nil), "an empty config list builds the empty set")
+}

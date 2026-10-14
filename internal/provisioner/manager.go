@@ -76,15 +76,16 @@ type LeaseEventSink interface {
 // ManagerConfig configures the provision manager.
 type ManagerConfig struct {
 	ProviderUUID         string
-	CallbackBaseURL      string         // Base URL for backend callbacks (e.g., "http://fred.example.com:8080")
-	PayloadStore         *payload.Store // Optional external payload store (if nil, manager won't handle payloads)
-	PlacementStore       PlacementStore // Optional placement store for round-robin routing (nil = disabled)
-	LeaseEventSink       LeaseEventSink // Optional sink for real-time lease events (nil = disabled)
-	CallbackTimeout      time.Duration  // Timeout for backend callbacks (default: 10 minutes, 0 = disabled)
-	TimeoutCheckInterval time.Duration  // How often to check for timeouts (default: 1 minute)
-	AckBatchInterval     time.Duration  // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
-	AckBatchSize         int            // Maximum acks to batch before flushing (default: DefaultAckBatchSize)
-	AckLaneCount         int            // Number of parallel ack lanes (default: 1)
+	CallbackBaseURL      string          // Base URL for backend callbacks (e.g., "http://fred.example.com:8080")
+	PayloadStore         *payload.Store  // Optional external payload store (if nil, manager won't handle payloads)
+	PlacementStore       PlacementStore  // Optional placement store for round-robin routing (nil = disabled)
+	LeaseEventSink       LeaseEventSink  // Optional sink for real-time lease events (nil = disabled)
+	CallbackTimeout      time.Duration   // Timeout for backend callbacks (default: 10 minutes, 0 = disabled)
+	TimeoutCheckInterval time.Duration   // How often to check for timeouts (default: 1 minute)
+	AckBatchInterval     time.Duration   // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
+	AckBatchSize         int             // Maximum acks to batch before flushing (default: DefaultAckBatchSize)
+	AckLaneCount         int             // Number of parallel ack lanes (default: 1)
+	BillingOnlySKUs      BillingOnlySKUs // Leases covered by these SKUs are acknowledged, never deployed
 }
 
 // NewManager creates a new provision manager with Watermill routing.
@@ -164,6 +165,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		PayloadStore:  cfg.PayloadStore,
 		Publisher:     pubSub,
 		BackendRouter: router,
+		BillingOnly:   cfg.BillingOnlySKUs,
 	})
 	timeoutChecker := NewTimeoutChecker(TimeoutCheckerConfig{
 		Tracker:       tracker,

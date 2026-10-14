@@ -1823,3 +1823,177 @@ func newLeaseEventMsg_raw(t *testing.T, v any) *message.Message {
 	require.NoError(t, err)
 	return message.NewMessage(watermill.NewUUID(), data)
 }
+
+// --- billing-only leases ---
+
+const testBillingOnlySKU = "01a126cc-7edd-700d-9ac6-02ed34fa4bff"
+
+// billingOnlyLeaseChain returns a chain whose GetLease reports a PENDING lease
+// of one billing-only item, and that fails the test on any rejection.
+func billingOnlyLeaseChain(t *testing.T, metaHash []byte) *chaintest.MockClient {
+	t.Helper()
+	return &chaintest.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:     leaseUUID,
+				Tenant:   "tenant-a",
+				State:    billingtypes.LEASE_STATE_PENDING,
+				MetaHash: metaHash,
+				Items:    []billingtypes.LeaseItem{{SkuUuid: testBillingOnlySKU, Quantity: 1}},
+			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			t.Errorf("billing-only lease rejected on chain: %v (%s)", leaseUUIDs, reason)
+			return 0, nil, nil
+		},
+	}
+}
+
+func TestHandlerSet_HandleLeaseCreated_BillingOnlyLeaseIsAcknowledgedNotProvisioned(t *testing.T) {
+	for name, metaHash := range map[string][]byte{
+		"without meta_hash": nil,
+		"with meta_hash":    {0x01, 0x02},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// The backend cannot serve the SKU, and its refusal rejects the lease
+			// on chain. A billing-only lease must never get that far.
+			mb := &mockManagerBackend{
+				name:         "test-backend",
+				provisionErr: fmt.Errorf("%w: %w: %s", backend.ErrValidation, backend.ErrUnknownSKU, testBillingOnlySKU),
+			}
+			var acked []string
+			ack := &mockAcknowledger{acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+				acked = append(acked, leaseUUID)
+				return true, "tx-ack", nil
+			}}
+			hs, tracker := newTestHandlerSet(billingOnlyLeaseChain(t, metaHash), mb, ack, nil)
+			hs.deps.BillingOnly = NewBillingOnlySKUs([]string{testBillingOnlySKU})
+
+			err := hs.HandleLeaseCreated(newLeaseEventMsg(t, chain.LeaseEvent{
+				Type:      chain.LeaseCreated,
+				LeaseUUID: "lease-billing-only",
+				Tenant:    "tenant-a",
+			}))
+			require.NoError(t, err)
+
+			assert.Equal(t, []string{"lease-billing-only"}, acked, "a billing-only lease is acknowledged so billing starts")
+			mb.mu.Lock()
+			assert.Empty(t, mb.provisionCalls, "a billing-only lease is never provisioned")
+			mb.mu.Unlock()
+			assert.False(t, tracker.IsInFlight("lease-billing-only"))
+			hs.awaitingMu.Lock()
+			assert.NotContains(t, hs.awaitingPayload, "lease-billing-only", "a billing-only lease awaits no payload")
+			hs.awaitingMu.Unlock()
+		})
+	}
+}
+
+func TestHandlerSet_HandleLeaseCreated_BillingOnlyAcknowledgeFailure(t *testing.T) {
+	t.Run("a transient failure is returned so the event is retried", func(t *testing.T) {
+		ack := &mockAcknowledger{acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+			return false, "", errors.New("sequence mismatch")
+		}}
+		hs, _ := newTestHandlerSet(billingOnlyLeaseChain(t, nil), &mockManagerBackend{name: "test-backend"}, ack, nil)
+		hs.deps.BillingOnly = NewBillingOnlySKUs([]string{testBillingOnlySKU})
+
+		err := hs.HandleLeaseCreated(newLeaseEventMsg(t, chain.LeaseEvent{
+			Type:      chain.LeaseCreated,
+			LeaseUUID: "lease-billing-only",
+			Tenant:    "tenant-a",
+		}))
+		require.ErrorIs(t, err, ErrAcknowledgeFailed)
+	})
+
+	t.Run("a lease that is no longer pending needs nothing more", func(t *testing.T) {
+		ack := &mockAcknowledger{acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+			return false, "", billingtypes.ErrLeaseNotPending
+		}}
+		hs, _ := newTestHandlerSet(billingOnlyLeaseChain(t, nil), &mockManagerBackend{name: "test-backend"}, ack, nil)
+		hs.deps.BillingOnly = NewBillingOnlySKUs([]string{testBillingOnlySKU})
+
+		err := hs.HandleLeaseCreated(newLeaseEventMsg(t, chain.LeaseEvent{
+			Type:      chain.LeaseCreated,
+			LeaseUUID: "lease-billing-only",
+			Tenant:    "tenant-a",
+		}))
+		require.NoError(t, err)
+	})
+}
+
+func TestHandlerSet_HandleLeaseCreated_MixedLeaseTakesTheNormalPath(t *testing.T) {
+	// One deployable item makes the lease deployable: it is provisioned, and the
+	// backend's refusal of the billing-only item rejects it as before.
+	mb := &mockManagerBackend{
+		name:         "test-backend",
+		provisionErr: fmt.Errorf("%w: %w: %s", backend.ErrValidation, backend.ErrUnknownSKU, testBillingOnlySKU),
+	}
+	rejected := false
+	mockChain := &chaintest.MockClient{
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid:   leaseUUID,
+				Tenant: "tenant-a",
+				State:  billingtypes.LEASE_STATE_PENDING,
+				Items: []billingtypes.LeaseItem{
+					{SkuUuid: "sku-1", Quantity: 1, ServiceName: "web"},
+					{SkuUuid: testBillingOnlySKU, Quantity: 1, ServiceName: "node"},
+				},
+			}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			rejected = true
+			assert.Equal(t, "invalid SKU", reason)
+			return 1, []string{"tx-rej"}, nil
+		},
+	}
+	ack := &mockAcknowledger{acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+		t.Errorf("a mixed lease is acknowledged only after it is provisioned: %s", leaseUUID)
+		return false, "", nil
+	}}
+	hs, _ := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs.deps.BillingOnly = NewBillingOnlySKUs([]string{testBillingOnlySKU})
+
+	err := hs.HandleLeaseCreated(newLeaseEventMsg(t, chain.LeaseEvent{
+		Type:      chain.LeaseCreated,
+		LeaseUUID: "lease-mixed",
+		Tenant:    "tenant-a",
+	}))
+	require.NoError(t, err)
+
+	mb.mu.Lock()
+	assert.Len(t, mb.provisionCalls, 1, "a mixed lease is provisioned")
+	mb.mu.Unlock()
+	assert.True(t, rejected, "the backend's refusal still rejects a mixed lease")
+}
+
+func TestHandlerSet_HandlePayloadReceived_BillingOnlyLeaseIsNotProvisioned(t *testing.T) {
+	mb := &mockManagerBackend{name: "test-backend"}
+
+	ps, err := payload.NewStore(payload.StoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "payloads.db"),
+	})
+	require.NoError(t, err)
+	defer ps.Close()
+	payloadData := []byte(`{"image":"nginx:latest"}`)
+	ps.Store("lease-billing-only", payloadData)
+
+	hs, tracker := newTestHandlerSet(billingOnlyLeaseChain(t, []byte{0x01}), mb, &mockAcknowledger{}, ps)
+	hs.deps.BillingOnly = NewBillingOnlySKUs([]string{testBillingOnlySKU})
+
+	// A mismatched hash would otherwise take the corrupted-payload path, which
+	// rejects the lease on chain: the billing-only check must come first.
+	err = hs.HandlePayloadReceived(newPayloadEventMsg(t, payload.Event{
+		LeaseUUID:   "lease-billing-only",
+		Tenant:      "tenant-a",
+		MetaHashHex: hashPayload([]byte("a different payload")),
+	}))
+	require.NoError(t, err)
+
+	mb.mu.Lock()
+	assert.Empty(t, mb.provisionCalls, "a billing-only lease is never provisioned")
+	mb.mu.Unlock()
+	assert.False(t, tracker.IsInFlight("lease-billing-only"))
+	stored, err := ps.Has("lease-billing-only")
+	require.NoError(t, err)
+	assert.True(t, stored, "the payload is kept until the lease ends")
+}
