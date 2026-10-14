@@ -1178,6 +1178,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A lease created by `POST /v1/leases/{uuid}/restore` now recovers on its own
+  after losing its container (host reboot, crash, kill). providerd held no
+  payload for it, because the backend re-deployed the retained manifest, so it
+  retried `payload not available` every sweep while the lease stayed ACTIVE,
+  billed and down; only a tenant `/update` repaired it. When an ACTIVE lease
+  with a `meta_hash` that needs re-provisioning has no stored payload, the
+  reconciler now stores the manifest of the latest `active` release its owning
+  backend reports on `GET /releases/{lease_uuid}` and re-provisions from it.
+  This also covers leases restored before the upgrade, including under v0.13,
+  and leases missing from a restored `payloads.db`. A backend must therefore
+  return a manifest its `/provision` accepts as that release's `manifest`
+  (BACKEND_GUIDE.md). A restored manifest that `/provision` now refuses, such
+  as a fixed `host_port` rejected since ENG-605, closes the lease on chain like
+  any other lease's refused manifest; its data is retained if `retain_on_close`
+  is enabled. (ENG-1442)
 - providerd answers a lifecycle callback with 503 when it has lost placement
   runtime authority, so the backend keeps it and retries. It used to answer
   200 and drop it; a dropped update completion left the lease's later restart

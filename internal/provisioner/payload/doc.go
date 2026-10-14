@@ -5,7 +5,13 @@
 //
 // A payload enters the store when a tenant uploads it via POST /v1/leases/{uuid}/data.
 // It is REPLACED when the tenant updates the deployment via
-// POST /v1/leases/{uuid}/update (Put). It is removed when:
+// POST /v1/leases/{uuid}/update (Put). The reconciler also writes one (Store)
+// for an ACTIVE lease with a MetaHash that must be re-provisioned without one,
+// such as a lease created by restore, whose backend re-deployed a retained
+// manifest providerd never received (ENG-1442), or one missing from a restored
+// database. It writes the manifest of the latest active release the lease's
+// owning backend reports.
+// It is removed when:
 //
 //   - The lease is terminal: a failure callback rejects it, its close event
 //     arrives, a provision is refused on a terminal chain state, or the
@@ -34,9 +40,11 @@
 // inside the data it describes rots along with it, so the split is what makes
 // bit-rot detectable at all. It is an integrity reference and not a
 // tamper-evidence one — anything that can rewrite the payload can rewrite the
-// hash — so the on-chain MetaHash remains the cross-trust-boundary commitment.
-// A payload with no recorded hash predates this bucket and falls back to
-// MetaHash.
+// hash — so the on-chain MetaHash remains the cross-trust-boundary commitment
+// for an upload. A payload rebuilt from a backend's release carries no such
+// commitment: providerd trusts the owning backend's report, which only the
+// transport authenticates, and logs whether it matches MetaHash. A payload with
+// no recorded hash predates this bucket and falls back to MetaHash.
 //
 // # Write batching
 //

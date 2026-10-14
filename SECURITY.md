@@ -344,7 +344,11 @@ route, because an internal rewrite is not an HTTP redirect Fred can reject.
 authenticates Fred to a backend; it does not sign the backend's response.
 Production deployments rely on peer-verified HTTPS using the configured
 private CA or system roots, optionally mTLS, to authenticate response headers,
-inventory, and refusal verdicts. Storage identity detects accidental
+inventory, and refusal verdicts. The same transport authenticates
+`GET /releases`: when an `ACTIVE` lease with a `meta_hash` must be
+re-provisioned and Fred holds no payload for it (a restored lease), Fred stores
+the owner's latest active release `manifest` as the payload and signs it into
+the next `/provision` (ENG-1442). Storage identity detects accidental
 same-name replacement under that authenticated transport boundary; it is not a
 defense against an intermediary that can forge the backend's authenticated
 response. A header on a cheap pre-dispatch error identifies only the process's

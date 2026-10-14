@@ -1,8 +1,10 @@
 package provisioner
 
 import (
+	"bytes"
 	"cmp"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -107,9 +109,11 @@ type reconcileActionAuthority struct {
 }
 
 // errPayloadNotAvailable indicates that the payload required for provisioning
-// is not currently available from the durable payload store. Absence is not
+// is not currently available from the durable payload store, nor, for an
+// ACTIVE lease, rebuildable from its owner's active release. Absence is not
 // tenant-invalidity evidence: reconciliation preserves the lease and retries
-// after an upload or database repair.
+// until an upload (PENDING) or update (ACTIVE), a database repair, or the
+// owner reporting an active release supplies one.
 var errPayloadNotAvailable = errors.New("payload not available")
 
 // ReconcilerPayloads is the payload capability consumed by reconciliation.
@@ -523,9 +527,10 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		// filtering them here would be silently destructive: a deferred lease
 		// missing from processedLeases becomes an orphan candidate, and one
 		// missing from chainLeases makes cleanupOrphanedPayloads delete a live
-		// lease's payload — after which the NEXT sweep sees
+		// lease's payload — after which its next re-provision depends on
+		// rebuilding it from the owner's active release, and otherwise sees
 		// errPayloadNotAvailable. That condition is deliberately retriable, but
-		// deleting the only local request authority would still strand a healthy
+		// deleting the only local request authority could still strand a healthy
 		// ACTIVE lease indefinitely. Skip the goroutine body; leave the maps alone.
 		g.Go(func() error {
 			// Recover any panic inside this per-lease worker so ONE bad lease
@@ -962,11 +967,21 @@ func (r *Reconciler) doStartProvisioning(
 			}
 			if requestPayload == nil && len(lease.MetaHash) > 0 {
 				// Payload is required (lease has MetaHash) but not in the store.
-				// This can happen if the payload DB was lost or fred restarted
-				// without its data. We cannot re-provision without the manifest.
-				return uncertainProvisionStart(fmt.Errorf(
-					"%w: lease %s", errPayloadNotAvailable, lease.Uuid,
-				))
+				// For example, a lease created by restore never had one: its backend
+				// re-deployed a retained manifest fred never received (ENG-1442).
+				// A PENDING lease waits for its tenant's upload; an ACTIVE one
+				// rebuilds it from its owner's active release.
+				if lease.State != billingtypes.LEASE_STATE_ACTIVE {
+					return uncertainProvisionStart(fmt.Errorf(
+						"%w: lease %s", errPayloadNotAvailable, lease.Uuid,
+					))
+				}
+				requestPayload, recordedHash, getErr = r.rebuildPayloadFromActiveRelease(
+					ctx, payloadStore, lease, authority,
+				)
+				if getErr != nil {
+					return uncertainProvisionStart(getErr)
+				}
 			}
 			if requestPayload != nil {
 				// Re-verify the payload before provisioning to catch corruption.
@@ -977,8 +992,8 @@ func (r *Reconciler) doStartProvisioning(
 				// lease was CREATED with — while a tenant /update legitimately
 				// replaces the stored manifest without changing it (ENG-619).
 				// Checking an updated payload against MetaHash would read a
-				// successful update as corruption, delete the payload, and then
-				// strand the ACTIVE lease behind errPayloadNotAvailable.
+				// successful update as corruption and delete the payload it had
+				// just persisted.
 				//
 				// A payload with no recorded hash was written by a build that
 				// predates the hash bucket; MetaHash remains the right reference for
@@ -1124,6 +1139,47 @@ func (r *Reconciler) doStartProvisioning(
 	}
 
 	return acceptedProvisionStart()
+}
+
+// rebuildPayloadFromActiveRelease stores the manifest of the owner's latest
+// active release as an ACTIVE lease's payload, then returns the stored payload
+// with its recorded hash, read back from one snapshot like any other payload.
+// The write must precede Provision: attempt recovery re-sends exactly the bytes
+// the payload store holds for the attempt's fingerprint. Store never
+// overwrites, so a payload written since the caller's read wins. Every failure
+// is retried on a later sweep and never closes the lease.
+func (r *Reconciler) rebuildPayloadFromActiveRelease(
+	ctx context.Context,
+	payloadStore *payload.Store,
+	lease billingtypes.Lease,
+	authority reconcileActionAuthority,
+) ([]byte, []byte, error) {
+	owner := authority.action.Placement().Backend
+	manifest, version, err := r.coordinator.ObservedActiveReleaseManifest(ctx, authority.action)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: lease %s: no payload to rebuild from owner %q: %w",
+			errPayloadNotAvailable, lease.Uuid, owner, err)
+	}
+	inserted := payloadStore.Store(lease.Uuid, manifest)
+	stored, recordedHash, err := payloadStore.GetWithHash(lease.Uuid)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read rebuilt payload for lease %s: %w", lease.Uuid, err)
+	}
+	if stored == nil {
+		return nil, nil, fmt.Errorf("%w: lease %s: rebuilt payload was not stored",
+			errPayloadNotAvailable, lease.Uuid)
+	}
+	if inserted {
+		slog.Warn("reconcile: rebuilt missing payload from the owner's active release",
+			"lease_uuid", lease.Uuid,
+			"tenant", lease.Tenant,
+			"backend", owner,
+			"release_version", version,
+			"payload_sha256", hex.EncodeToString(recordedHash),
+			"matches_meta_hash", bytes.Equal(recordedHash, lease.MetaHash),
+		)
+	}
+	return stored, recordedHash, nil
 }
 
 // acknowledgeLease acknowledges the exact lease carried by the projected
@@ -1839,7 +1895,7 @@ func (r *Reconciler) fetchAllRetentions(
 // It determines the appropriate action based on result and error type:
 //   - errLeaseAlreadyInFlight: skip (not a real error)
 //   - backend.ErrAlreadyProvisioned: transient (an unvalidated HTTP 409 is ambiguous)
-//   - errPayloadNotAvailable: transient; retain the lease and retry after repair/upload
+//   - errPayloadNotAvailable: transient; retain the lease and retry after repair, upload, update, or an owner release to rebuild from
 //   - provisionStartValidationRefused: reject (PENDING) or close (ACTIVE)
 //   - backend.ErrMalformedErrorBody: transient (backend answered off-contract) — flag for retry, never terminate
 //   - ErrPlacementUnresolvable: transient (backend absent from config) — flag for retry, never terminate
@@ -1930,8 +1986,9 @@ func (r *Reconciler) handleProvisionResult(
 	if errors.Is(err, errPayloadNotAvailable) {
 		// The payload database is durable request authority. Its absence is not
 		// proof that a tenant request is invalid and must never reject or close a
-		// live lease. Keep reconciliation level-triggered so an upload or database
-		// restore repairs the condition without reallocating an operation.
+		// live lease. Keep reconciliation level-triggered so an upload, an
+		// update, a database restore, or an active release reported by the
+		// owner repairs the condition without reallocating an operation.
 		slog.Error("reconcile: exact payload unavailable, will retry next cycle",
 			"lease_uuid", leaseUUID,
 			"tenant", lease.Tenant,
@@ -2300,9 +2357,10 @@ func (r *Reconciler) cleanupOrphanedPayloads(ctx context.Context, chainLeases ma
 			// Absent from the snapshot — which is two non-atomic, state-filtered
 			// list queries, so it means terminal OR never-known OR created
 			// moments ago. Re-read the lease before deleting (ENG-654): a
-			// payload deleted out from under a live lease makes the NEXT sweep
-			// see errPayloadNotAvailable and remain unable to reconstruct the
-			// tenant's exact request.
+			// payload deleted out from under a live lease loses the tenant's
+			// exact request. A PENDING lease then waits for a new upload, and an
+			// ACTIVE one for a rebuild from its owner's active release or a
+			// tenant update.
 			if !r.confirmTerminal(ctx, metrics.CleanupPassPayload, leaseUUID) {
 				continue
 			}
