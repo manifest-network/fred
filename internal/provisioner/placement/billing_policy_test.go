@@ -198,6 +198,17 @@ func newBillingOnlyTestCoordinator(
 	t *testing.T, control *billingOnlyTestControl,
 ) (*ProvisionCoordinator, *Store, *int32) {
 	t.Helper()
+	execution, store, calls := newBillingOnlyTestExecution(t, control)
+	authority, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
+	require.NoError(t, err)
+	return authority, store, calls
+}
+
+// newBillingOnlyTestExecution binds the billing-only test runtime and control.
+func newBillingOnlyTestExecution(
+	t *testing.T, control *billingOnlyTestControl,
+) (*ExecutionCoordinator, *Store, *int32) {
+	t.Helper()
 	routes, err := NewCallbackRouteFactory("https://callbacks.provider.test")
 	require.NoError(t, err)
 	store := newTestStore(t, WithCallbackRouteFactory(routes))
@@ -215,9 +226,7 @@ func newBillingOnlyTestCoordinator(
 	}}
 	execution := bindExecutionWithPolicyForTest(t, base, newExecutionTestRuntime(client), testBillingOnlyPolicy(t))
 	setProviderControlPlaneForTest(t, execution, control)
-	authority, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
-	require.NoError(t, err)
-	return authority, store, calls
+	return execution, store, calls
 }
 
 // requireLeaseClaimReleased proves the event left no lifecycle claim behind.
@@ -408,4 +417,137 @@ func TestProviderControlPlane_NeverEndsABillingOnlyLease(t *testing.T) {
 	require.Error(t, err, "the zero value ends nothing")
 	_, _, err = control.closeLease(t.Context(), endableLease{}, "reason")
 	require.Error(t, err, "the zero value ends nothing")
+}
+
+// requireInventoryRecoveryPending leaves the store with inventory evidence
+// that no sweep has projected yet, the state that holds back every action
+// gated on backend inventory.
+func requireInventoryRecoveryPending(t *testing.T, store *Store) {
+	t.Helper()
+	store.mu.Lock()
+	store.setInventoryRecoveryRequiredLocked(true)
+	store.mu.Unlock()
+	t.Cleanup(func() {
+		store.mu.Lock()
+		store.setInventoryRecoveryRequiredLocked(false)
+		store.mu.Unlock()
+	})
+	require.ErrorIs(t, store.leaseSideEffectError(testBillingOnlyLease), ErrUnprojectedInventoryPositive,
+		"an inventory-gated action would be held back")
+}
+
+// TestAcknowledgeBillingOnly pins the reconciler's billing-only acknowledgment:
+// it acts on an authoritative chain read alone, never on backend inventory,
+// and only for a lease that read shows PENDING and billing-only.
+func TestAcknowledgeBillingOnly(t *testing.T) {
+	pending := func(t *testing.T, skus ...string) *billingOnlyTestControl {
+		return &billingOnlyTestControl{t: t, state: billingtypes.LEASE_STATE_PENDING, skus: skus}
+	}
+	bind := func(t *testing.T, control *billingOnlyTestControl) (*ReconciliationCoordinator, *Store) {
+		t.Helper()
+		execution, store, calls := newBillingOnlyTestExecution(t, control)
+		t.Cleanup(func() { assert.Zero(t, *calls, "a billing-only lease is never provisioned") })
+		authority, err := execution.ReconciliationCoordinator(nil, nil)
+		require.NoError(t, err)
+		return authority, store
+	}
+	requireReleased := func(t *testing.T, authority *ReconciliationCoordinator) {
+		t.Helper()
+		claim := authority.coordinator.operations.TryClaimLeaseNow(testBillingOnlyLease)
+		require.True(t, claim.Acquired(), "the lease claim is released")
+		require.True(t, authority.coordinator.operations.ReleaseLease(claim.Claim()))
+	}
+
+	t.Run("a pending billing-only lease is acknowledged despite unprojected inventory", func(t *testing.T) {
+		control := pending(t, testBillingOnlySKU)
+		authority, store := bind(t, control)
+		requireInventoryRecoveryPending(t, store)
+
+		outcome, err := authority.AcknowledgeBillingOnly(t.Context(), testBillingOnlyLease)
+
+		require.NoError(t, err)
+		assert.Equal(t, BillingOnlyAcknowledged, outcome)
+		assert.Equal(t, []string{testBillingOnlyLease}, control.acknowledged())
+		requireReleased(t, authority)
+	})
+
+	t.Run("a deployable lease is never acknowledged ahead of its workload", func(t *testing.T) {
+		control := pending(t, testBillingOnlySKU, "sku-test")
+		authority, _ := bind(t, control)
+
+		outcome, err := authority.AcknowledgeBillingOnly(t.Context(), testBillingOnlyLease)
+
+		require.ErrorContains(t, err, "not billing-only")
+		assert.Equal(t, BillingOnlyAckFailed, outcome)
+		assert.Empty(t, control.acknowledged())
+		requireReleased(t, authority)
+	})
+
+	t.Run("a lease no longer pending is settled", func(t *testing.T) {
+		control := &billingOnlyTestControl{t: t, state: billingtypes.LEASE_STATE_ACTIVE, skus: []string{testBillingOnlySKU}}
+		authority, _ := bind(t, control)
+
+		outcome, err := authority.AcknowledgeBillingOnly(t.Context(), testBillingOnlyLease)
+
+		require.NoError(t, err)
+		assert.Equal(t, BillingOnlyAckSettled, outcome)
+		assert.Empty(t, control.acknowledged())
+	})
+
+	t.Run("a held lifecycle claim defers it", func(t *testing.T) {
+		control := pending(t, testBillingOnlySKU)
+		authority, _ := bind(t, control)
+		held := authority.coordinator.operations.TryClaimLeaseNow(testBillingOnlyLease)
+		require.True(t, held.Acquired())
+
+		outcome, err := authority.AcknowledgeBillingOnly(t.Context(), testBillingOnlyLease)
+
+		require.NoError(t, err)
+		assert.Equal(t, BillingOnlyAckBusy, outcome)
+		assert.Empty(t, control.acknowledged())
+		require.True(t, authority.coordinator.operations.ReleaseLease(held.Claim()))
+	})
+
+	t.Run("a committed acknowledgment is confirmed by a fresh read", func(t *testing.T) {
+		control := pending(t, testBillingOnlySKU)
+		control.ackErr, control.activateOnError = errors.New("rpc timeout after broadcast"), true
+		authority, _ := bind(t, control)
+
+		outcome, err := authority.AcknowledgeBillingOnly(t.Context(), testBillingOnlyLease)
+
+		require.NoError(t, err)
+		assert.Equal(t, BillingOnlyAcknowledged, outcome)
+	})
+
+	t.Run("an acknowledgment that did not commit fails for a retry", func(t *testing.T) {
+		control := pending(t, testBillingOnlySKU)
+		control.ackErr = errors.New("sequence mismatch")
+		authority, _ := bind(t, control)
+
+		outcome, err := authority.AcknowledgeBillingOnly(t.Context(), testBillingOnlyLease)
+
+		require.ErrorContains(t, err, "sequence mismatch")
+		assert.Equal(t, BillingOnlyAckFailed, outcome)
+		requireReleased(t, authority)
+	})
+}
+
+// TestExecuteCurrentLease_BillingOnlyIgnoresUnprojectedInventory pins the event
+// path to the same rule: no inventory evidence holds a billing-only
+// acknowledgment back.
+func TestExecuteCurrentLease_BillingOnlyIgnoresUnprojectedInventory(t *testing.T) {
+	control := &billingOnlyTestControl{
+		t: t, state: billingtypes.LEASE_STATE_PENDING, skus: []string{testBillingOnlySKU},
+	}
+	authority, store, calls := newBillingOnlyTestCoordinator(t, control)
+	requireInventoryRecoveryPending(t, store)
+	request, err := NewProvisionEventRequest(testBillingOnlyLease, "tenant-test")
+	require.NoError(t, err)
+
+	result := authority.ExecuteCurrentLease(t.Context(), request)
+
+	require.Equal(t, ProvisionEventBillingOnlyAcknowledged, result.Disposition(), result.Err())
+	assert.Equal(t, []string{testBillingOnlyLease}, control.acknowledged())
+	assert.Zero(t, *calls)
+	requireLeaseClaimReleased(t, authority, testBillingOnlyLease)
 }

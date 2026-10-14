@@ -49,10 +49,7 @@ const (
 // for deriving these facts; the planner never reads stores or calls a backend.
 type leaseFacts struct {
 	authority lifecycleAuthority
-	// billingOnly: every item uses a billing-only SKU, so the lease is billed
-	// but never deployed and no backend fact applies to it.
-	billingOnly bool
-	chain       billingtypes.LeaseState
+	chain     billingtypes.LeaseState
 
 	hasProvision    bool
 	provisionStatus backend.ProvisionStatus
@@ -88,17 +85,6 @@ type leasePlan struct {
 func planLease(f leaseFacts) leasePlan {
 	if f.authority != lifecycleAuthorityDurable {
 		return leasePlan{reason: "lifecycle authority unavailable"}
-	}
-
-	// A billing-only lease is billed but never deployed. Acknowledging it
-	// starts its billing; nothing else applies, whatever the backends report.
-	// In particular it never starts, never rejects, and is never closed as
-	// lost, because it never had a workload to lose.
-	if f.billingOnly {
-		if f.chain == billingtypes.LEASE_STATE_PENDING {
-			return leasePlan{action: reconcileActionAcknowledge, reason: "billing-only lease"}
-		}
-		return leasePlan{action: reconcileActionWait, reason: "billing-only lease is billed but never deployed"}
 	}
 
 	switch f.chain {

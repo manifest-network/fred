@@ -500,26 +500,15 @@ func (authority *ProvisionCoordinator) executeObservedCurrentLease(
 func (authority *ProvisionCoordinator) acknowledgeBillingOnly(
 	ctx context.Context, lease billingtypes.Lease, claim operation.LeaseClaim,
 ) ProvisionEventResult {
-	if err := authority.coordinator.store.leaseSideEffectError(lease.Uuid); err != nil {
+	current, acknowledged, err := authority.coordinator.acknowledgeBillingOnly(ctx, claim, lease)
+	switch {
+	case acknowledged:
+		return newProvisionEventResult(ProvisionEventBillingOnlyAcknowledged, &current, nil)
+	case err == nil:
+		return authority.finishTerminalProvision(current, claim)
+	default:
 		return newProvisionEventResult(ProvisionEventUncertain, &lease, err)
 	}
-	_, txHash, ackErr := authority.controlPlane.acknowledgeLease(ctx, lease.Uuid)
-	if ackErr == nil {
-		slog.InfoContext(ctx, "acknowledged billing-only lease; it is billed but never deployed",
-			"lease_uuid", lease.Uuid, "tenant", lease.Tenant, "tx_hash", txHash)
-		lease.State = billingtypes.LEASE_STATE_ACTIVE
-		return newProvisionEventResult(ProvisionEventBillingOnlyAcknowledged, &lease, nil)
-	}
-	if current, ok := authority.readLease(ctx, lease.Uuid, lease.Tenant).(observedExactLease); ok {
-		switch current.lease.State {
-		case billingtypes.LEASE_STATE_ACTIVE:
-			return newProvisionEventResult(ProvisionEventBillingOnlyAcknowledged, &current.lease, nil)
-		case billingtypes.LEASE_STATE_CLOSED, billingtypes.LEASE_STATE_REJECTED, billingtypes.LEASE_STATE_EXPIRED:
-			return authority.finishTerminalProvision(current.lease, claim)
-		}
-	}
-	return newProvisionEventResult(ProvisionEventUncertain, &lease,
-		fmt.Errorf("acknowledge billing-only lease %s: %w", lease.Uuid, ackErr))
 }
 
 // provisionRoute is a read-only routing decision minted by the exact runtime

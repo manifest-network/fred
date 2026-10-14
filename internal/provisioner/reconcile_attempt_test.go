@@ -1537,3 +1537,60 @@ func TestCallbackService_RecoveredFailureNeverRejectsABillingOnlyLease(t *testin
 	assert.Equal(t, placement.StateAbsent, current.State(), "the definitive failure settles the attempt")
 	assert.False(t, current.AttemptMetadata().Valid())
 }
+
+// TestReconciler_BillingOnlyAcknowledgmentNeedsNoBackendInventory pins that a
+// billing-only lease is acknowledged from the chain alone. Whatever an earlier
+// deployment left in backend inventory, retained data or a provision whose
+// status could not be refreshed, never holds its billing back, and the
+// placement and attempt evidence stay for terminal convergence.
+func TestReconciler_BillingOnlyAcknowledgmentNeedsNoBackendInventory(t *testing.T) {
+	for name, report := range map[string]func(*mockReconcilerBackend){
+		"retained data": func(b *mockReconcilerBackend) {
+			b.retentions = []backend.RetainedLease{{LeaseUUID: redeliveryTarget}}
+		},
+		"a provision whose status cannot be refreshed": func(b *mockReconcilerBackend) {
+			b.provisions = []backend.ProvisionInfo{{
+				LeaseUUID: redeliveryTarget, ProviderUUID: placementstore.ProviderUUID,
+				Status: backend.ProvisionStatusReady, BackendName: "backend-a",
+			}}
+			b.refreshErr = errors.New("docker daemon unavailable")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "placements.db")
+			backendA := &mockReconcilerBackend{name: "backend-a"}
+			router := redeliveryRouter(t, backendA)
+			store1 := openRedeliveryStore(t, dbPath)
+			armTestPlacementTopology(t, store1, backendTopologyNames(router))
+			target := billingOnlyRedeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
+			persistAmbiguousProvisionOnStore(t, store1, operation.NewRegistry(), router, backendA, target, nil)
+			require.NoError(t, store1.Close())
+			backendA.mu.Lock()
+			backendA.provisionCalls = nil
+			report(backendA)
+			backendA.mu.Unlock()
+
+			store2 := openRedeliveryStore(t, dbPath)
+			t.Cleanup(func() { require.NoError(t, store2.Close()) })
+			policy, err := placement.NewBillingPolicy([]string{redeliveryBillingOnlySKU})
+			require.NoError(t, err)
+			ack := &recordingAcknowledger{}
+			reconciler := redeliveryReconcilerWithPolicy(
+				t, store2, router, redeliveryChain([]billingtypes.Lease{target}, nil), nil, policy, ack,
+			)
+
+			require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+			assert.Equal(t, []string{redeliveryTarget}, ack.leases(),
+				"backend inventory never holds a billing-only lease's acknowledgment back")
+			backendA.mu.Lock()
+			assert.Empty(t, backendA.provisionCalls)
+			backendA.mu.Unlock()
+			// The sweep's inventory projection may confirm or quarantine the
+			// record; either way the evidence of the earlier attempt stays.
+			record := store2.Lookup(redeliveryTarget)
+			assert.NotEqual(t, placement.StateAbsent, record.State(), "the placement evidence is kept")
+			assert.Equal(t, "backend-a", record.Attempt, "the attempt evidence is kept")
+		})
+	}
+}

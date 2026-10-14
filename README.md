@@ -2157,8 +2157,10 @@ service outside Fred. List such SKUs in `billing_only_skus`. A lease whose items
 all use them is billing-only:
 
 - Fred acknowledges it as soon as the lease-created event arrives, and the
-  reconciler retries on its next sweep if that fails, even when no backend
-  answers. Acknowledgment makes the lease ACTIVE, so billing starts at once.
+  reconciler retries on its next sweep if that fails. The acknowledgment reads
+  only the chain: no backend needs to answer, and nothing a backend reports,
+  such as data or a workload an earlier deployment left, holds it back.
+  Acknowledgment makes the lease ACTIVE, so billing starts at once.
 - Fred never provisions it, never rejects it, and never closes it for a
   provisioning reason, including as lost after a backend retirement.
   `POST /v1/leases/{lease_uuid}/data` refuses its payload with `400`, and

@@ -450,6 +450,40 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	recordlessUnproven := r.coordinator.RecordlessLeasesUnproven()
 
 	for leaseUUID, lease := range chainLeases {
+		// A billing-only lease is billed but never deployed, so nothing a
+		// backend reports, or fails to report, bears on it. It is decided from
+		// the chain alone, ahead of every inventory gate below: acknowledged
+		// while PENDING and otherwise left alone. Placement or attempt evidence
+		// from before its SKU became billing-only stays as it is, for terminal
+		// convergence once the lease ends.
+		if r.coordinator.ClassifyLease(&lease).BillingOnly() {
+			if lease.State == billingtypes.LEASE_STATE_PENDING {
+				g.Go(func() error {
+					defer func() {
+						if rec := recover(); rec != nil {
+							slog.Error("reconciler billing-only acknowledgment panic — recovering to keep fred alive",
+								"lease_uuid", leaseUUID, "panic", rec, "stack", string(debug.Stack()))
+							metrics.ReconcilerPanicsTotal.WithLabelValues("process_lease").Inc()
+							leaseErrors.Add(1)
+						}
+					}()
+					switch outcome, err := r.coordinator.AcknowledgeBillingOnly(gctx, leaseUUID); outcome {
+					case placement.BillingOnlyAcknowledged:
+						acknowledged.Add(1)
+					case placement.BillingOnlyAckSettled:
+					case placement.BillingOnlyAckBusy:
+						deferred.Add(1)
+						metrics.ReconcilerDeferredLeasesTotal.Inc()
+					default:
+						leaseErrors.Add(1)
+						slog.Error("reconcile: failed to acknowledge billing-only lease",
+							"lease_uuid", leaseUUID, "error", err)
+					}
+					return nil
+				})
+			}
+			continue
+		}
 		provision, isProvisioned := allProvisions[leaseUUID]
 		// A lost placement is terminal and waits on no backend's answer, so it
 		// runs ahead of the per-lease gates below. ObserveLiveAction still
@@ -571,15 +605,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				deferForSnapshotBoundary("inventory_projection_unavailable")
 				return nil
 			}
-			// A billing-only lease's plan never reads backend inventory: it is
-			// acknowledged while PENDING and otherwise left alone. Neither
-			// action can lay a workload over data, so absence evidence that
-			// cannot be trusted does not defer it. Nor is a deployment attempt
-			// left from before its SKU became billing-only ever redelivered:
-			// the attempt stays as evidence until the lease ends, when terminal
-			// convergence tears it down.
-			billingOnly := r.coordinator.ClassifyLease(&lease).BillingOnly()
-			if metadata := placementRecord.AttemptMetadata(); metadata.Valid() && !billingOnly {
+			if metadata := placementRecord.AttemptMetadata(); metadata.Valid() {
 				if _, attemptFenced := inventory.fenced[placementRecord.Attempt]; attemptFenced {
 					// Redelivery to a fenced backend is refused locally every
 					// time. The attempt is preserved and waits for the fence.
@@ -613,7 +639,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				}
 				return nil
 			}
-			if !billingOnly && r.coordinator.AbsenceUntrusted(leaseUUID) {
+			if r.coordinator.AbsenceUntrusted(leaseUUID) {
 				deferForSnapshotBoundary("placement_observation_excluded")
 				return nil
 			}
@@ -637,7 +663,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				)
 				return nil
 			}
-			if !billingOnly && deferLease(
+			if deferLease(
 				snapshot, retentionsAnswered,
 				isProvisioned, provision.BackendName, placementRecord, absenceTrusted,
 			) {
@@ -1273,25 +1299,8 @@ func (r *Reconciler) resolveLostLease(
 		return true, nil
 	}
 	defer r.coordinator.ReleaseAction(observed)
-	// A billing-only lease is billed but never deployed, so losing a workload
-	// is no reason to end it. Classified on the authoritative reread: it is
-	// acknowledged while PENDING and otherwise left alone, and its lost
-	// placement stays until the lease ends.
-	lease := observed.Lease()
-	if r.coordinator.ClassifyLease(&lease).BillingOnly() {
-		if lease.State == billingtypes.LEASE_STATE_PENDING {
-			if err := r.acknowledgeLease(ctx, observed); err != nil {
-				metrics.ReconcilerLostLeasesTotal.WithLabelValues("error").Inc()
-				slog.Error("reconcile: failed to acknowledge billing-only lease with a lost placement",
-					"lease_uuid", leaseUUID, "error", err)
-				return false, err
-			}
-		}
-		metrics.ReconcilerLostLeasesTotal.WithLabelValues("billing_only").Inc()
-		return false, nil
-	}
 	outcome := ""
-	switch lease.State {
+	switch observed.Lease().State {
 	case billingtypes.LEASE_STATE_ACTIVE:
 		outcome, err = "closed", r.closeLostLease(ctx, observed)
 	case billingtypes.LEASE_STATE_PENDING:
@@ -2139,7 +2148,6 @@ func (r *Reconciler) processLease(
 	}
 	plan := planLease(leaseFacts{
 		authority:       lifecycleAuthorityDurable,
-		billingOnly:     r.coordinator.ClassifyLease(&lease).BillingOnly(),
 		chain:           lease.State,
 		hasProvision:    isProvisioned,
 		provisionStatus: provision.Status,
