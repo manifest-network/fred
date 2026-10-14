@@ -48,9 +48,8 @@ func NewProvisionOrchestrator(providerUUID, callbackBaseURL string, router Backe
 // Returns nil if provisioning was started successfully or the lease is already in-flight.
 // Returns an error if routing fails or the backend call fails.
 func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, deployable DeployableLease, opts ProvisionOpts) error {
-	req, err := provisionRequestFor(deployable, o.providerUUID, BuildCallbackURL(o.callbackBaseURL), opts.Payload, opts.PayloadHash)
-	if err != nil {
-		return err
+	if !deployable.valid() {
+		return errNotDeployable
 	}
 	leaseCopy := deployable.Lease()
 	lease := &leaseCopy
@@ -93,7 +92,8 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, deployabl
 	}
 
 	// Start provisioning (async - backend will call back)
-	if err := backendClient.Provision(ctx, req); err != nil {
+	if err := provisionDeployable(ctx, backendClient, deployable, o.providerUUID,
+		BuildCallbackURL(o.callbackBaseURL), opts.Payload, opts.PayloadHash); err != nil {
 		if errors.Is(err, backend.ErrInsufficientResources) {
 			metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendClient.Name()).Inc()
 		}

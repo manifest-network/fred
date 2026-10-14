@@ -1,12 +1,15 @@
 package provisioner
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 // testBillingOnlyPolicy builds the policy under which testBillingOnlySKU is
@@ -117,24 +120,42 @@ func TestDeployableLease_IsDetachedFromTheCallersLease(t *testing.T) {
 	assert.Equal(t, "sku-1", deployable.Lease().Items[0].SkuUuid, "the accessor returns a copy")
 }
 
-func TestDeploymentRequestsRequireAClassifiedLease(t *testing.T) {
-	_, err := provisionRequestFor(DeployableLease{}, "provider-1", "http://cb", nil, "")
-	require.ErrorIs(t, err, errNotDeployable)
-	_, err = RestoreRequestFor(DeployableLease{}, "provider-1", "source-lease", "http://cb")
-	require.ErrorIs(t, err, errNotDeployable)
+// recordingRestoreBackend records restore requests instead of refusing them.
+type recordingRestoreBackend struct {
+	*mockManagerBackend
+	restoreCalls []backend.RestoreRequest
+}
+
+func (b *recordingRestoreBackend) Restore(_ context.Context, req backend.RestoreRequest) error {
+	b.restoreCalls = append(b.restoreCalls, req)
+	return nil
+}
+
+func TestDeploymentOperationsSendOnlyTheClassifiedLease(t *testing.T) {
+	client := &recordingRestoreBackend{mockManagerBackend: &mockManagerBackend{name: "b1"}}
+
+	// The zero value deploys nothing, and nothing reaches the backend.
+	require.ErrorIs(t, provisionDeployable(t.Context(), client, DeployableLease{}, "provider-1", "http://cb", nil, ""), errNotDeployable)
+	require.ErrorIs(t, RestoreDeployable(t.Context(), client, DeployableLease{}, "provider-1", "source-lease", "http://cb"), errNotDeployable)
+	assert.Empty(t, client.provisionCalls)
+	assert.Empty(t, client.restoreCalls)
 
 	deployable := mustDeployable(t, testLease("sku-1"))
-	provision, err := provisionRequestFor(deployable, "provider-1", "http://cb", []byte("payload"), "abc")
-	require.NoError(t, err)
-	assert.Equal(t, "lease-1", provision.LeaseUUID)
-	assert.Equal(t, "tenant-a", provision.Tenant)
-	assert.Equal(t, "abc", provision.PayloadHash)
-	noPayload, err := provisionRequestFor(deployable, "provider-1", "http://cb", nil, "abc")
-	require.NoError(t, err)
-	assert.Empty(t, noPayload.PayloadHash, "a hash is never sent without its payload")
+	require.NoError(t, provisionDeployable(t.Context(), client, deployable, "provider-1", "http://cb", []byte("payload"), "abc"))
+	require.NoError(t, provisionDeployable(t.Context(), client, deployable, "provider-1", "http://cb", nil, "abc"))
+	require.Len(t, client.provisionCalls, 2)
+	sent := client.provisionCalls[0]
+	assert.Equal(t, "lease-1", sent.LeaseUUID)
+	assert.Equal(t, "tenant-a", sent.Tenant)
+	assert.Equal(t, "provider-1", sent.ProviderUUID)
+	require.Len(t, sent.Items, 1)
+	assert.Equal(t, "sku-1", sent.Items[0].SKU)
+	assert.Equal(t, "abc", sent.PayloadHash)
+	assert.Empty(t, client.provisionCalls[1].PayloadHash, "a hash is never sent without its payload")
 
-	restore, err := RestoreRequestFor(deployable, "provider-1", "source-lease", "http://cb")
-	require.NoError(t, err)
+	require.NoError(t, RestoreDeployable(t.Context(), client, deployable, "provider-1", "source-lease", "http://cb"))
+	require.Len(t, client.restoreCalls, 1)
+	restore := client.restoreCalls[0]
 	assert.Equal(t, "lease-1", restore.LeaseUUID)
 	assert.Equal(t, "source-lease", restore.FromLeaseUUID)
 	assert.Equal(t, "tenant-a", restore.Tenant)

@@ -1149,15 +1149,8 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	restoreReq, err := provisioner.RestoreRequestFor(
-		deployable, h.providerUUID, body.FromLeaseUUID, provisioner.BuildCallbackURL(h.callbackBaseURL),
-	)
-	if err != nil {
-		slog.Error("restore refused: cannot build the restore request", "lease_uuid", leaseUUID, "error", err)
-		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
-		return
-	}
-	items := restoreReq.Items
+	target := deployable.Lease()
+	items := provisioner.ExtractLeaseItems(&target)
 
 	// Register the NEW lease in-flight as a restore BEFORE calling the backend, so
 	// the restore's provision callback is acknowledged inline rather than ~one
@@ -1177,7 +1170,8 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		tracked = true
 	}
 
-	err = backendClient.Restore(r.Context(), restoreReq)
+	err = provisioner.RestoreDeployable(r.Context(), backendClient, deployable,
+		h.providerUUID, body.FromLeaseUUID, provisioner.BuildCallbackURL(h.callbackBaseURL))
 	if err != nil {
 		// Undo the in-flight registration on a synchronous restore failure so it
 		// does not leave a phantom entry the TimeoutChecker would later reject.

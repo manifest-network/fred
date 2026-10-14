@@ -1,6 +1,7 @@
 package provisioner
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -11,12 +12,14 @@ import (
 )
 
 // This file is providerd's deployment boundary. A workload reaches a backend
-// only through a provision or a restore, and both backend requests are built
-// here, from a DeployableLease. Only BillingPolicy.Classify issues one, so
-// every path that would deploy a lease must first prove the lease is not
-// billing-only. Go has no file-level visibility, so a forbidigo rule in
-// .golangci.yml keeps the backend request types out of every other providerd
-// file: the boundary cannot be skipped by building a request directly.
+// only through a provision or a restore. Both are sent from here, by an
+// operation that takes a DeployableLease and builds the backend request
+// internally, so no caller ever holds a request it could re-target. Only
+// BillingPolicy.Classify issues a DeployableLease, so every path that would
+// deploy a lease must first prove the lease is not billing-only. Go has no
+// file-level visibility, so forbidigo rules in .golangci.yml keep both the
+// backend request types and the raw Provision and Restore calls out of every
+// other providerd file.
 
 // BillingPolicy classifies leases by the SKUs they bill. A billing-only SKU
 // (config billing_only_skus) is billed on chain but never deployed: its
@@ -121,17 +124,20 @@ func detachLease(lease *billingtypes.Lease) billingtypes.Lease {
 	return detached
 }
 
-// errNotDeployable reports a deployment request for a lease the billing
-// policy never classified as deployable.
+// errNotDeployable reports a deployment for a lease the billing policy never
+// classified as deployable.
 var errNotDeployable = errors.New("lease was not classified as deployable")
 
-// provisionRequestFor builds the backend request that provisions a deployable
-// lease. The payload hash is sent only with the payload it describes.
-func provisionRequestFor(
-	lease DeployableLease, providerUUID, callbackURL string, payload []byte, payloadHash string,
-) (backend.ProvisionRequest, error) {
+// provisionDeployable sends a deployable lease's provision request to the
+// backend. The request is built and sent here and never leaves this function,
+// so the lease the backend receives is exactly the lease the policy
+// classified. The payload hash is sent only with the payload it describes.
+func provisionDeployable(
+	ctx context.Context, client backend.Backend, lease DeployableLease,
+	providerUUID, callbackURL string, payload []byte, payloadHash string,
+) error {
 	if !lease.valid() {
-		return backend.ProvisionRequest{}, errNotDeployable
+		return errNotDeployable
 	}
 	req := backend.ProvisionRequest{
 		LeaseUUID:    lease.lease.Uuid,
@@ -144,24 +150,26 @@ func provisionRequestFor(
 	if payload != nil && payloadHash != "" {
 		req.PayloadHash = payloadHash
 	}
-	return req, nil
+	return client.Provision(ctx, req)
 }
 
-// RestoreRequestFor builds the backend request that restores the retained data
-// of fromLeaseUUID into a deployable lease. A restore deploys a workload just
-// as a provision does, so it takes the same capability.
-func RestoreRequestFor(
-	lease DeployableLease, providerUUID, fromLeaseUUID, callbackURL string,
-) (backend.RestoreRequest, error) {
+// RestoreDeployable sends the request that restores the retained data of
+// fromLeaseUUID into a deployable lease. A restore deploys a workload just as
+// a provision does, so it takes the same capability, and its request likewise
+// never leaves this function.
+func RestoreDeployable(
+	ctx context.Context, client backend.Backend, lease DeployableLease,
+	providerUUID, fromLeaseUUID, callbackURL string,
+) error {
 	if !lease.valid() {
-		return backend.RestoreRequest{}, errNotDeployable
+		return errNotDeployable
 	}
-	return backend.RestoreRequest{
+	return client.Restore(ctx, backend.RestoreRequest{
 		LeaseUUID:     lease.lease.Uuid,
 		FromLeaseUUID: fromLeaseUUID,
 		Tenant:        lease.lease.Tenant,
 		ProviderUUID:  providerUUID,
 		Items:         ExtractLeaseItems(&lease.lease),
 		CallbackURL:   callbackURL,
-	}, nil
+	})
 }

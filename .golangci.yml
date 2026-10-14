@@ -68,12 +68,16 @@ linters:
           msg: "managed-volume destruction must go through volumeOp.destroy (internal/backend/docker/volume_destroy.go): it is the only site that establishes ownership before an irreversible delete (ENG-658)"
         - pattern: 'volumes\.Create$'
           msg: "managed-volume creation must go through Backend.createManagedVolume (internal/backend/docker/volume_lock.go): it holds the volume-name stripe that serializes create-or-reuse against an in-flight destroy (ENG-681)"
-        # A provision or a restore is the only way a workload reaches a backend, and
-        # each needs one of these requests. Building them only in deployment.go,
-        # from a DeployableLease that BillingPolicy.Classify issued, keeps a
-        # billing-only lease from ever being deployed (ENG-1453).
+        # A provision or a restore is the only way a workload reaches a backend.
+        # Both are sent only from deployment.go, by operations that take a
+        # DeployableLease issued by BillingPolicy.Classify and build the request
+        # internally, so no caller holds a request it could re-target. These two
+        # rules keep both the request types and the raw calls there, so a
+        # billing-only lease is never deployed (ENG-1453).
         - pattern: '^backend\.(ProvisionRequest|RestoreRequest)$'
           msg: "providerd builds backend provision and restore requests only in internal/provisioner/deployment.go, from a DeployableLease issued by BillingPolicy.Classify, so a billing-only lease is never deployed (ENG-1453)"
+        - pattern: '\.(Provision|Restore)$'
+          msg: "providerd sends provisions and restores only through provisionDeployable and RestoreDeployable in internal/provisioner/deployment.go, which take a DeployableLease issued by BillingPolicy.Classify (ENG-1453)"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:

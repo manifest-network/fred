@@ -553,13 +553,14 @@ func (r *Reconciler) startProvisioningWithPayload(ctx context.Context, lease Dep
 // doStartProvisioning is the common implementation for provisioning with or without payload.
 // It takes a DeployableLease, so a billing-only lease can never be provisioned.
 func (r *Reconciler) doStartProvisioning(ctx context.Context, deployable DeployableLease, withPayload bool) error {
-	// The request is built first, from the classified lease; the payload is
-	// attached below once it has been read and verified.
-	req, err := provisionRequestFor(deployable, r.providerUUID, BuildCallbackURL(r.callbackBaseURL), nil, "")
-	if err != nil {
-		return err
+	if !deployable.valid() {
+		return errNotDeployable
 	}
 	lease := deployable.Lease()
+	// The payload and its hash are read and verified below, then sent with the
+	// classified lease by provisionDeployable.
+	var payloadBytes []byte
+	payloadHash := ""
 
 	// Extract SKU for routing
 	sku := ExtractRoutingSKU(&lease)
@@ -605,7 +606,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, deployable Deploya
 		// reconciler re-provisions it while the backend still accepts /update
 		// for it, and nothing serializes the two.
 		recordedHash, getErr := []byte(nil), error(nil)
-		req.Payload, recordedHash, getErr = r.tracker.PayloadStore().GetWithHash(lease.Uuid)
+		payloadBytes, recordedHash, getErr = r.tracker.PayloadStore().GetWithHash(lease.Uuid)
 		if getErr != nil {
 			// Database error, or a recorded hash that is not a SHA-256 — do NOT
 			// treat either as "payload missing". Abort this provision attempt so
@@ -613,14 +614,14 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, deployable Deploya
 			r.tracker.UntrackInFlight(lease.Uuid)
 			return fmt.Errorf("failed to read payload for lease %s: %w", lease.Uuid, getErr)
 		}
-		if req.Payload == nil && len(lease.MetaHash) > 0 {
+		if payloadBytes == nil && len(lease.MetaHash) > 0 {
 			// Payload is required (lease has MetaHash) but not in the store.
 			// This can happen if the payload DB was lost or fred restarted
 			// without its data. We cannot re-provision without the manifest.
 			r.tracker.UntrackInFlight(lease.Uuid)
 			return fmt.Errorf("%w: lease %s", errPayloadNotAvailable, lease.Uuid)
 		}
-		if req.Payload != nil && len(lease.MetaHash) > 0 {
+		if payloadBytes != nil && len(lease.MetaHash) > 0 {
 			// Re-verify the payload before provisioning to catch corruption.
 			//
 			// Verify against the hash recorded when the payload was written, not
@@ -644,7 +645,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, deployable Deploya
 				verifiedAgainst = "meta_hash"
 			}
 
-			if err := payload.VerifyHash(req.Payload, expectedHash); err != nil {
+			if err := payload.VerifyHash(payloadBytes, expectedHash); err != nil {
 				// Payload is corrupted - delete it and fail
 				r.tracker.PayloadStore().Delete(lease.Uuid)
 				r.tracker.UntrackInFlight(lease.Uuid)
@@ -657,11 +658,12 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, deployable Deploya
 			}
 			// The hash sent to the backend describes the payload actually being
 			// sent, which after an update is no longer MetaHash.
-			req.PayloadHash = hex.EncodeToString(expectedHash)
+			payloadHash = hex.EncodeToString(expectedHash)
 		}
 	}
 
-	err = backendClient.Provision(ctx, req)
+	err = provisionDeployable(ctx, backendClient, deployable, r.providerUUID,
+		BuildCallbackURL(r.callbackBaseURL), payloadBytes, payloadHash)
 	if err != nil {
 		if errors.Is(err, backend.ErrInsufficientResources) {
 			metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendClient.Name()).Inc()
@@ -699,7 +701,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, deployable Deploya
 			"tenant", lease.Tenant,
 			"sku", sku,
 			"backend", backendClient.Name(),
-			"payload_size", len(req.Payload),
+			"payload_size", len(payloadBytes),
 		)
 	} else {
 		slog.Info("reconcile: started provisioning",
