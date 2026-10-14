@@ -21,6 +21,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner"
 )
 
 const (
@@ -92,6 +93,9 @@ type ServerConfig struct {
 	CallbackCanonicalPathPrefix string // Path prefix prepended to inbound URIs before HMAC verification (proxy stripPrefix compensation)
 	TokenTrackerDBPath          string // Path to token tracker database (enables replay protection)
 	CallbackBaseURL             string // Base URL for backend callbacks (used by restart/update)
+	// BillingPolicy is required: payload uploads and restores are refused for a
+	// lease it classifies as billing-only, which Fred never deploys.
+	BillingPolicy *provisioner.BillingPolicy
 }
 
 // ServerDeps holds the runtime dependencies for the API server.
@@ -113,6 +117,9 @@ type ServerDeps struct {
 // NewServer creates a new API server.
 // Returns an error if token tracker initialization fails.
 func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
+	if cfg.BillingPolicy == nil {
+		return nil, errors.New("billing policy is required")
+	}
 	client := deps.ChainClient
 	backendRouter := deps.BackendRouter
 	callbackPublisher := deps.CallbackPublisher
@@ -156,6 +163,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		ProviderUUID:       cfg.ProviderUUID,
 		Bech32Prefix:       cfg.Bech32Prefix,
 		CallbackBaseURL:    cfg.CallbackBaseURL,
+		BillingPolicy:      cfg.BillingPolicy,
 	})
 
 	// Parse trusted proxies for secure X-Forwarded-For handling
@@ -195,7 +203,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	// Create payload handler if publisher is provided
 	var payloadHandler *PayloadHandler
 	if payloadPublisher != nil {
-		payloadHandler = NewPayloadHandler(client, payloadPublisher, cfg.ProviderUUID, cfg.Bech32Prefix)
+		payloadHandler = NewPayloadHandler(client, payloadPublisher, cfg.ProviderUUID, cfg.Bech32Prefix, cfg.BillingPolicy)
 	}
 
 	s := &Server{

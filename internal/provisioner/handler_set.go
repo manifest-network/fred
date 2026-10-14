@@ -29,6 +29,9 @@ type HandlerDeps struct {
 	PayloadStore  *payload.Store
 	Publisher     message.Publisher // For publishing to TopicLeaseEvent (optional)
 	BackendRouter BackendRouter     // Used to allowlist backend names on non-in-flight callback metrics
+	// Policy classifies each lease before it is provisioned or acknowledged.
+	// Without one nothing is classified, so nothing is deployed.
+	Policy *BillingPolicy
 }
 
 // HandlerSet contains the Watermill message handlers for the provisioner.
@@ -94,6 +97,18 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 		return nil
 	}
 
+	// A billing-only lease has nothing to deploy: acknowledge it so billing
+	// starts. Provisioning it would only earn an unknown-SKU refusal and an
+	// on-chain rejection.
+	class := h.deps.Policy.Classify(lease)
+	if class.BillingOnly() {
+		return h.acknowledgeBillingOnly(msg.Context(), lease)
+	}
+	deployable, ok := class.Deployable()
+	if !ok {
+		return fmt.Errorf("lease %s cannot be classified for deployment", event.LeaseUUID)
+	}
+
 	// Check if lease requires a payload (has MetaHash)
 	// If so, skip immediate provisioning - wait for payload upload
 	if len(lease.MetaHash) > 0 {
@@ -110,7 +125,7 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	}
 
 	// Start provisioning without payload
-	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{})
+	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), deployable, ProvisionOpts{})
 	if err != nil {
 		if errors.Is(err, backend.ErrValidation) {
 			return h.rejectOnValidationError(msg.Context(), lease, err)
@@ -119,6 +134,39 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	}
 
 	h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusProvisioning, "")
+	return nil
+}
+
+// acknowledgeBillingOnly acknowledges a billing-only lease so its billing
+// starts; nothing is provisioned for it. A lease that is no longer PENDING
+// needs nothing more. Any other failure is returned so Watermill retries, and
+// the reconciler retries it on its next sweep regardless.
+func (h *HandlerSet) acknowledgeBillingOnly(ctx context.Context, lease *billingtypes.Lease) error {
+	if lease.State != billingtypes.LEASE_STATE_PENDING {
+		return nil
+	}
+	acknowledged, txHash, err := h.deps.Acknowledger.Acknowledge(ctx, lease.Uuid)
+	if err != nil {
+		if isTerminalAcknowledgeError(err) {
+			slog.Info("billing-only lease is no longer pending, nothing to acknowledge",
+				"lease_uuid", lease.Uuid,
+				"tenant", lease.Tenant,
+			)
+			return nil
+		}
+		slog.Error("failed to acknowledge billing-only lease",
+			"lease_uuid", lease.Uuid,
+			"tenant", lease.Tenant,
+			"error", err,
+		)
+		return fmt.Errorf("%w: billing-only lease %s: %w", ErrAcknowledgeFailed, lease.Uuid, err)
+	}
+	slog.Info("acknowledged billing-only lease; it is billed but never deployed",
+		"lease_uuid", lease.Uuid,
+		"tenant", lease.Tenant,
+		"acknowledged", acknowledged,
+		"tx_hash", txHash,
+	)
 	return nil
 }
 
@@ -445,6 +493,22 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		return nil
 	}
 
+	// The upload endpoint already refuses billing-only leases; this keeps a
+	// payload event for one from starting a provision regardless. The payload,
+	// if any, stays in the store and is deleted with the lease.
+	class := h.deps.Policy.Classify(lease)
+	if class.BillingOnly() {
+		slog.Warn("payload received for a billing-only lease, not provisioning",
+			"lease_uuid", event.LeaseUUID,
+			"tenant", event.Tenant,
+		)
+		return nil
+	}
+	deployable, ok := class.Deployable()
+	if !ok {
+		return fmt.Errorf("lease %s cannot be classified for deployment", event.LeaseUUID)
+	}
+
 	// Verify lease is still pending
 	if lease.State != billingtypes.LEASE_STATE_PENDING {
 		slog.Warn("lease is no longer pending, skipping provisioning",
@@ -505,7 +569,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	}
 
 	// Start provisioning with payload
-	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{
+	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), deployable, ProvisionOpts{
 		Payload:     payloadData,
 		PayloadHash: event.MetaHashHex,
 	})

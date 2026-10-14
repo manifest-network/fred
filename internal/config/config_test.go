@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1656,4 +1657,111 @@ func TestConfig_Validate_CreditCheckZeroGracePeriod(t *testing.T) {
 		c.CreditCheckZeroGracePeriod = -1 * time.Second
 		require.ErrorContains(t, c.Validate(), "credit_check_zero_grace_period cannot be negative")
 	})
+}
+
+func TestConfig_Validate_BillingOnlySKUs(t *testing.T) {
+	const billingOnly = "01a126cc-7edd-700d-9ac6-02ed34fa4bff"
+	const served = "01a08b4f-fe71-7008-a853-c34efec3dc74"
+
+	t.Run("canonical UUIDs are accepted", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Backends[0].SKUs = []string{served}
+		cfg.BillingOnlySKUs = []string{billingOnly}
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("an empty list is accepted", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.BillingOnlySKUs = nil
+		assert.NoError(t, cfg.Validate())
+	})
+
+	// The chain reports lowercase canonical UUIDs and leases match by exact
+	// string, so any other spelling of a valid UUID would match nothing.
+	for name, sku := range map[string]string{
+		"uppercase":  strings.ToUpper(billingOnly),
+		"braced":     "{" + billingOnly + "}",
+		"urn prefix": "urn:uuid:" + billingOnly,
+		"not a UUID": "casper-aoraki",
+	} {
+		t.Run(name+" is rejected", func(t *testing.T) {
+			cfg := validConfig()
+			cfg.BillingOnlySKUs = []string{sku}
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "billing_only_skus[0]")
+			assert.Contains(t, err.Error(), "lowercase canonical UUID")
+		})
+	}
+
+	t.Run("a duplicate is rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.BillingOnlySKUs = []string{billingOnly, billingOnly}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "billing_only_skus[1]: duplicate SKU")
+	})
+
+	t.Run("a SKU a backend also serves is rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Backends[0].SKUs = []string{served}
+		cfg.BillingOnlySKUs = []string{served}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `also served by backend "mock"`)
+	})
+}
+
+func TestLoad_BillingOnlySKUs(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	configContent := `
+provider_uuid: "01234567-89ab-cdef-0123-456789abcdef"
+provider_address: "manifest1abc"
+key_name: "provider"
+keyring_dir: "/home/provider/.manifest"
+callback_base_url: "http://localhost:8080"
+callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+backends:
+  - name: "docker-1"
+    url: "http://10.0.0.1:9000"
+    skus:
+      - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
+    default: true
+billing_only_skus:
+  - "01a126cc-7edd-700d-9ac6-02ed34fa4bff"
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644))
+
+	cfg, err := Load(configPath)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"01a126cc-7edd-700d-9ac6-02ed34fa4bff"}, cfg.BillingOnlySKUs)
+}
+
+func TestLoad_BillingOnlySKUsFromEnvironment(t *testing.T) {
+	// The file omits billing_only_skus entirely. The environment alone must
+	// still configure it, or its leases would be provisioned and rejected.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	configContent := `
+provider_uuid: "01234567-89ab-cdef-0123-456789abcdef"
+provider_address: "manifest1abc"
+key_name: "provider"
+keyring_dir: "/home/provider/.manifest"
+callback_base_url: "http://localhost:8080"
+callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+backends:
+  - name: "docker-1"
+    url: "http://10.0.0.1:9000"
+    default: true
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644))
+	t.Setenv("PROVIDER_BILLING_ONLY_SKUS", "01a126cc-7edd-700d-9ac6-02ed34fa4bff,01a08b4f-fe71-7008-a853-c34efec3dc74")
+
+	cfg, err := Load(configPath)
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"01a126cc-7edd-700d-9ac6-02ed34fa4bff",
+		"01a08b4f-fe71-7008-a853-c34efec3dc74",
+	}, cfg.BillingOnlySKUs)
 }

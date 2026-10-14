@@ -85,6 +85,7 @@ type ManagerConfig struct {
 	AckBatchInterval     time.Duration  // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
 	AckBatchSize         int            // Maximum acks to batch before flushing (default: DefaultAckBatchSize)
 	AckLaneCount         int            // Number of parallel ack lanes (default: 1)
+	BillingPolicy        *BillingPolicy // Required: classifies each lease before any deployment or acknowledgment
 }
 
 // NewManager creates a new provision manager with Watermill routing.
@@ -100,6 +101,9 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	}
 	if cfg.CallbackBaseURL == "" {
 		return nil, errors.New("callback base URL is required")
+	}
+	if cfg.BillingPolicy == nil {
+		return nil, errors.New("billing policy is required")
 	}
 
 	// Apply defaults for callback timeout using cmp.Or
@@ -164,6 +168,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		PayloadStore:  cfg.PayloadStore,
 		Publisher:     pubSub,
 		BackendRouter: router,
+		Policy:        cfg.BillingPolicy,
 	})
 	timeoutChecker := NewTimeoutChecker(TimeoutCheckerConfig{
 		Tracker:       tracker,

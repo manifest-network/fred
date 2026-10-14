@@ -176,7 +176,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 	}{
 		{
 			name:        "missing chain client",
-			cfg:         ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+			cfg:         ReconcilerConfig{BillingPolicy: NoBillingOnlySKUs(), ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 			chainClient: nil,
 			ack:         noopAck,
 			router:      router,
@@ -184,7 +184,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 		},
 		{
 			name:        "missing acknowledger",
-			cfg:         ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+			cfg:         ReconcilerConfig{BillingPolicy: NoBillingOnlySKUs(), ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 			chainClient: mockChain,
 			ack:         nil,
 			router:      router,
@@ -192,7 +192,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 		},
 		{
 			name:        "missing router",
-			cfg:         ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+			cfg:         ReconcilerConfig{BillingPolicy: NoBillingOnlySKUs(), ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 			chainClient: mockChain,
 			ack:         noopAck,
 			router:      nil,
@@ -200,7 +200,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 		},
 		{
 			name:        "missing provider UUID",
-			cfg:         ReconcilerConfig{CallbackBaseURL: "http://localhost"},
+			cfg:         ReconcilerConfig{BillingPolicy: NoBillingOnlySKUs(), CallbackBaseURL: "http://localhost"},
 			chainClient: mockChain,
 			ack:         noopAck,
 			router:      router,
@@ -208,15 +208,23 @@ func TestNewReconciler_Validation(t *testing.T) {
 		},
 		{
 			name:        "missing callback URL",
-			cfg:         ReconcilerConfig{ProviderUUID: "test-uuid"},
+			cfg:         ReconcilerConfig{BillingPolicy: NoBillingOnlySKUs(), ProviderUUID: "test-uuid"},
 			chainClient: mockChain,
 			ack:         noopAck,
 			router:      router,
 			wantErr:     "callback base URL is required",
 		},
 		{
-			name:        "valid config",
+			name:        "missing billing policy",
 			cfg:         ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+			chainClient: mockChain,
+			ack:         noopAck,
+			router:      router,
+			wantErr:     "billing policy is required",
+		},
+		{
+			name:        "valid config",
+			cfg:         ReconcilerConfig{BillingPolicy: NoBillingOnlySKUs(), ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 			chainClient: mockChain,
 			ack:         noopAck,
 			router:      router,
@@ -250,7 +258,7 @@ func TestHandleProvisionError_AlreadyProvisionedBenign(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	r, err := NewReconciler(
-		ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+		ReconcilerConfig{BillingPolicy: NoBillingOnlySKUs(), ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 		mockChain, noopAck, router, nil, nil,
 	)
 	require.NoError(t, err)
@@ -311,7 +319,7 @@ func TestHandleProvisionError_MalformedErrorBodyIsTransient(t *testing.T) {
 				Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 			})
 			r, err := NewReconciler(
-				ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+				ReconcilerConfig{BillingPolicy: NoBillingOnlySKUs(), ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 				mockChain, noopAck, router, nil, nil,
 			)
 			require.NoError(t, err)
@@ -354,7 +362,7 @@ func TestHandleProvisionError_CircuitOpenIsTransient(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	r, err := NewReconciler(
-		ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+		ReconcilerConfig{BillingPolicy: NoBillingOnlySKUs(), ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 		mockChain, noopAck, router, nil, nil,
 	)
 	require.NoError(t, err)
@@ -394,6 +402,7 @@ func TestReconciler_ReconcileAll_PendingNotProvisioned(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -441,6 +450,7 @@ func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, ack, router, nil, nil)
@@ -492,6 +502,7 @@ func TestReconciler_SkipsInFlightReadyLease(t *testing.T) {
 	mockTracker.TrackInFlight("lease-1", "tenant-1", nil, "test")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, ack, router, mockTracker, nil)
@@ -542,6 +553,7 @@ func TestReconciler_AcksNotInFlightReadyLease(t *testing.T) {
 	mockTracker := newMockInFlightTracker(nil) // empty — lease is NOT in-flight
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, ack, router, mockTracker, nil)
@@ -589,6 +601,7 @@ func TestReconciler_FreshFailedLeaseStillRejects(t *testing.T) {
 	mockTracker.TrackInFlight("lease-1", "tenant-1", nil, "test")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, mockTracker, nil)
@@ -622,6 +635,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisioned(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -666,6 +680,7 @@ func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -716,6 +731,7 @@ func TestReconciler_ReconcileAll_ActiveProvisioned_CallsReconcileCustomDomain(t 
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -758,6 +774,7 @@ func TestReconciler_ReconcileAll_ReconcileCustomDomainErrorDoesNotAbortTick(t *t
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -792,6 +809,7 @@ func TestReconciler_ReconcileAll_OrphanProvision(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -833,6 +851,7 @@ func TestReconciler_ReconcileAll_SkipsInFlightOrphan(t *testing.T) {
 	mockTracker.TrackInFlight("inflight-orphan", "tenant-1", nil, "test")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, mockTracker, nil)
@@ -890,6 +909,7 @@ func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
 			mockChain := tt.setup()
 
 			reconciler, err := NewReconciler(ReconcilerConfig{
+				BillingPolicy:   NoBillingOnlySKUs(),
 				ProviderUUID:    "provider-1",
 				CallbackBaseURL: "http://localhost:8080",
 			}, mockChain, noopAck, router, nil, nil)
@@ -918,6 +938,7 @@ func TestReconciler_ReconcileAll_ContextCancellation(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -940,6 +961,7 @@ func TestReconciler_Start_ContextCancellation(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		Interval:        100 * time.Millisecond, // Short interval for test
@@ -976,6 +998,7 @@ func TestReconciler_DefaultInterval(t *testing.T) {
 
 	// Create with no interval specified
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		// Interval not set
@@ -1004,6 +1027,7 @@ func TestReconciler_RunOnce(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1037,12 +1061,14 @@ func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
 
 	// Create a manager and mark the lease as in-flight
 	manager, _ := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, &chaintest.MockClient{})
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, manager, nil)
@@ -1082,6 +1108,7 @@ func TestReconciler_MultipleBackends(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1133,6 +1160,7 @@ func TestReconciler_ReconcileAll_PendingProvisioning(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1188,6 +1216,7 @@ func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1244,6 +1273,7 @@ func TestReconciler_ReconcileAll_AcknowledgeFailure(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, failingAck, router, nil, nil)
@@ -1277,6 +1307,7 @@ func TestReconciler_ReconcileAll_DeprovisionFailure(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1319,6 +1350,7 @@ func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1369,12 +1401,14 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 
 	// Create manager (shared between reconciler and simulated event handler)
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, &chaintest.MockClient{})
 	require.NoError(t, err)
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, manager, nil)
@@ -1463,6 +1497,7 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1539,6 +1574,7 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
 
 	// Use MaxWorkers=1 to ensure sequential processing for this cancellation test
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      1,
@@ -1595,6 +1631,7 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) 
 
 	// Use MaxWorkers=1 to ensure sequential processing for this cancellation test
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      1,
@@ -1733,6 +1770,7 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1778,6 +1816,7 @@ func TestReconciler_MaxWorkers_Default(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		// MaxWorkers not set - should use default
@@ -1797,6 +1836,7 @@ func TestReconciler_MaxWorkers_Custom(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      5,
@@ -1856,6 +1896,7 @@ func TestReconciler_ParallelProcessing(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      5, // Limit to 5 concurrent workers
@@ -1927,6 +1968,7 @@ func TestReconciler_ParallelOrphanProcessing(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      4, // Limit to 4 concurrent workers
@@ -2028,6 +2070,7 @@ func TestReconciler_ParallelBackendFetching(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -2318,6 +2361,7 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	mockTracker := newMockInFlightTracker(payloadStore)
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, mockTracker, nil)
@@ -2388,6 +2432,7 @@ func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -2462,6 +2507,7 @@ func TestReconciler_ReconcileAll_UnresolvablePlacement_RefusesWithoutTerminating
 	require.NoError(t, ps.Set("lease-1", "removed-backend"))
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, ps)
@@ -2513,6 +2559,7 @@ func TestReconciler_ReconcileAll_ActiveFailedBelowMax(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -2560,6 +2607,7 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080/callbacks",
 		MaxWorkers:      2,
@@ -2641,6 +2689,7 @@ func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -2688,6 +2737,7 @@ func TestReconciler_ReconcileAll_PendingCircuitOpen_Retries(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -2752,6 +2802,7 @@ func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *te
 	mockTracker := newMockInFlightTracker(payloadStore)
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, mockTracker, nil)
@@ -2799,6 +2850,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisionedValidationError_Closes(t *t
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -2853,6 +2905,7 @@ func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -2906,6 +2959,7 @@ func TestReconciler_ReconcileAll_SyncsPlacementsFromBackends(t *testing.T) {
 	ps := &mockPlacementStore{}
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, ps)
@@ -2940,6 +2994,7 @@ func TestReconciler_ReconcileAll_StartProvisioning_RecordsPlacement(t *testing.T
 	ps := &mockPlacementStore{}
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, ps)
@@ -2978,6 +3033,7 @@ func TestReconciler_ReconcileAll_RejectLease_CleansUpPlacement(t *testing.T) {
 	ps.Set("lease-1", "test")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, ps)
@@ -3017,6 +3073,7 @@ func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.
 	ps.Set("orphan-1", "test")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, ps)
@@ -3074,6 +3131,7 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 	ps.Set("lease-1", "test")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, ps)
@@ -3128,6 +3186,7 @@ func TestReconciler_ReconcileAll_RetainedOrphan_KeepsPlacement(t *testing.T) {
 	ps.Set("lease-ret", "backend-a")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, ps)
@@ -3398,6 +3457,7 @@ func TestReconciler_ReconcileAll_OrphanRecheck(t *testing.T) {
 			})
 
 			reconciler, err := NewReconciler(ReconcilerConfig{
+				BillingPolicy:   NoBillingOnlySKUs(),
 				ProviderUUID:    "provider-1",
 				CallbackBaseURL: "http://localhost:8080",
 			}, mockChain, noopAck, router, nil, nil)
@@ -3462,6 +3522,7 @@ func TestReconciler_ConfirmTerminal_BoundsTheChainLookup(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -3511,6 +3572,7 @@ func TestReconciler_CleanupOrphanedPayloads_ChainErrorKeepsPayload(t *testing.T)
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, newMockInFlightTracker(payloadStore), nil)
@@ -3553,6 +3615,7 @@ func TestReconciler_ReconcileAll_ListProvisionError_DefersWithoutAborting(t *tes
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -3626,6 +3689,7 @@ func TestReconciler_ReconcileAll_ActiveFailedPayloadNotAvailable_Closes(t *testi
 	tracker := newMockInFlightTracker(payloadStore)
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -3697,6 +3761,7 @@ func TestReconciler_ReconcileAll_PendingWithMetaHash_NoPayload_Waits(t *testing.
 	tracker := newMockInFlightTracker(payloadStore)
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -3797,6 +3862,7 @@ func TestReconciler_ReconcileAll_PayloadCorruption_DeletesCorruptPayload(t *test
 	tracker := newMockInFlightTracker(payloadStore)
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -3855,6 +3921,7 @@ func TestReconciler_ReconcileAll_UpdatedPayload_ProvisionsAndKeepsIt(t *testing.
 	tracker := newMockInFlightTracker(payloadStore)
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -3915,6 +3982,7 @@ func TestReconciler_ReconcileAll_LegacyPayloadWithoutRecordedHash_UsesMetaHash(t
 
 	tracker := newMockInFlightTracker(payloadStore)
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -3969,6 +4037,7 @@ func TestReconciler_ReconcileAll_LegacyPayloadMismatchingMetaHash_IsDeleted(t *t
 
 	tracker := newMockInFlightTracker(payloadStore)
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -4035,6 +4104,7 @@ func TestReconciler_ReconcileAll_PayloadStoreGetError_TransientError(t *testing.
 	tracker := newMockInFlightTracker(payloadStore)
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -4078,6 +4148,7 @@ func TestReconciler_ReconcileAll_RefreshStateError_ContinuesWithStaleData(t *tes
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -4134,6 +4205,7 @@ func TestReconciler_ReconcileAll_HasPayloadError_CountsAsError(t *testing.T) {
 	tracker.hasPayloadErr = errors.New("disk I/O error")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -4172,6 +4244,7 @@ func TestReconciler_ReconcileAll_SetsLastSuccessTimestamp(t *testing.T) {
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -4210,6 +4283,7 @@ func TestReconciler_InsufficientResources_IncrementsMetric(t *testing.T) {
 
 	tracker := newMockInFlightTracker(nil)
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -4248,6 +4322,7 @@ func TestReconciler_ReconcileAll_PartialFailureDoesNotUpdateTimestamp(t *testing
 
 	tracker := newMockInFlightTracker(nil)
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -4310,6 +4385,7 @@ func TestReconciler_FetchPanicDoesNotCrashFred(t *testing.T) {
 	}
 	mockTracker := newMockInFlightTracker(nil)
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, ack, router, mockTracker, nil)
@@ -4379,6 +4455,7 @@ func TestReconciler_ProcessLeasePanicDoesNotCrashFred(t *testing.T) {
 	}
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, ack, router, mockTracker, nil)
@@ -4434,6 +4511,7 @@ func TestReconciler_doStartProvisioning_HonorsPlacement(t *testing.T) {
 	ps.Set("lease-1", "backend-pinned")
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, ps)
@@ -4573,6 +4651,7 @@ func TestReconciler_PrunesOrphanedPlacement(t *testing.T) {
 
 	// Chain returns no leases → gone-lease is chain-terminal (absent).
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, &chaintest.MockClient{}, noopAck, router, nil, ps)
@@ -4636,6 +4715,7 @@ func TestReconciler_DoesNotPruneOnIncompleteRetentions(t *testing.T) {
 	// Chain returns no leases → gone-lease would be chain-terminal, but its
 	// backend not answering /retentions must block the prune.
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, &chaintest.MockClient{}, noopAck, router, nil, ps)
@@ -4690,6 +4770,7 @@ func TestReconciler_DoesNotPruneActiveOrInFlight(t *testing.T) {
 	}
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, ps)
@@ -4722,6 +4803,7 @@ func TestReconciler_SyncsPlacementFromRetentions(t *testing.T) {
 	ps := &mockPlacementStore{}
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, &chaintest.MockClient{}, noopAck, router, nil, ps)
@@ -4762,6 +4844,7 @@ func TestReconciler_SkipsRetentionFetch_WhenPlacementDisabled(t *testing.T) {
 
 	// nil tracker AND nil placementStore => placement subsystem disabled.
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, &chaintest.MockClient{}, noopAck, router, nil, nil)
@@ -4797,6 +4880,7 @@ func TestReconciler_RetentionFetchPanic_RecordsMetric(t *testing.T) {
 
 	// Non-nil placementStore so the retentions fetch actually runs.
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, &chaintest.MockClient{}, noopAck, router, nil, &mockPlacementStore{})
@@ -4838,6 +4922,7 @@ func TestRestoreAffinity_EndToEnd_MultiBackend(t *testing.T) {
 	// Chain returns no leases — the reconciler must derive placement[source]
 	// purely from b2's /retentions response, not from active-provision syncing.
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, &chaintest.MockClient{}, noopAck, router, nil, ps)
@@ -4870,6 +4955,7 @@ func TestReconciler_ReconcileAll_OmittedProvisionNotDeprovisioned(t *testing.T) 
 	})
 
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -4930,6 +5016,7 @@ func TestReconciler_ReconcileAll_MalformedRecordedHash_KeepsPayload(t *testing.T
 
 	tracker := newMockInFlightTracker(payloadStore)
 	reconciler, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -4945,4 +5032,94 @@ func TestReconciler_ReconcileAll_MalformedRecordedHash_KeepsPayload(t *testing.T
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
 	assert.Empty(t, mockBackend.provisionCalls, "must not provision against an unverifiable payload")
+}
+
+func TestReconciler_ReconcileAll_BillingOnlyLease(t *testing.T) {
+	// For a deployable lease every shape below is acted on: started, awaited,
+	// or provisioned as an anomaly, and the backend's refusal of the SKU then
+	// rejects or closes it on chain. A billing-only lease is only acknowledged
+	// while PENDING, even when its backend does not answer.
+	cases := map[string]struct {
+		lease       billingtypes.Lease
+		backendDown bool
+		wantAck     bool
+	}{
+		"pending without meta_hash":       {lease: billingtypes.Lease{State: billingtypes.LEASE_STATE_PENDING}, wantAck: true},
+		"pending with meta_hash":          {lease: billingtypes.Lease{State: billingtypes.LEASE_STATE_PENDING, MetaHash: []byte{0x01}}, wantAck: true},
+		"pending, backend did not answer": {lease: billingtypes.Lease{State: billingtypes.LEASE_STATE_PENDING}, backendDown: true, wantAck: true},
+		"active without meta_hash":        {lease: billingtypes.Lease{State: billingtypes.LEASE_STATE_ACTIVE}},
+		"active with meta_hash":           {lease: billingtypes.Lease{State: billingtypes.LEASE_STATE_ACTIVE, MetaHash: []byte{0x01}}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			lease := tc.lease
+			lease.Uuid = "lease-billing-only"
+			lease.Tenant = "tenant-1"
+			lease.Items = []billingtypes.LeaseItem{{SkuUuid: testBillingOnlySKU, Quantity: 1}}
+
+			mockChain := &chaintest.MockClient{
+				GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+					if lease.State == billingtypes.LEASE_STATE_PENDING {
+						return []billingtypes.Lease{lease}, nil
+					}
+					return nil, nil
+				},
+				GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+					if lease.State == billingtypes.LEASE_STATE_ACTIVE {
+						return []billingtypes.Lease{lease}, nil
+					}
+					return nil, nil
+				},
+				RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+					t.Errorf("billing-only lease rejected on chain: %v (%s)", leaseUUIDs, reason)
+					return 0, nil, nil
+				},
+				CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+					t.Errorf("billing-only lease closed on chain: %v (%s)", leaseUUIDs, reason)
+					return 0, nil, nil
+				},
+			}
+			var (
+				ackMu sync.Mutex
+				acked []string
+			)
+			ack := &mockAcknowledger{acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
+				ackMu.Lock()
+				defer ackMu.Unlock()
+				acked = append(acked, leaseUUID)
+				return true, "tx-ack", nil
+			}}
+			mockBackend := &mockReconcilerBackend{
+				name:         "test",
+				provisions:   []backend.ProvisionInfo{},
+				provisionErr: fmt.Errorf("%w: %w: %s", backend.ErrValidation, backend.ErrUnknownSKU, testBillingOnlySKU),
+			}
+			if tc.backendDown {
+				mockBackend.listErr = errors.New("connection refused")
+			}
+			router, _ := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+			})
+
+			reconciler, err := NewReconciler(ReconcilerConfig{
+				ProviderUUID:    "provider-1",
+				CallbackBaseURL: "http://localhost:8080",
+				BillingPolicy:   testBillingOnlyPolicy(t),
+			}, mockChain, ack, router, nil, nil)
+			require.NoError(t, err)
+
+			require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+			ackMu.Lock()
+			if tc.wantAck {
+				assert.Equal(t, []string{"lease-billing-only"}, acked, "a PENDING billing-only lease is acknowledged")
+			} else {
+				assert.Empty(t, acked, "only a PENDING lease is acknowledged")
+			}
+			ackMu.Unlock()
+			mockBackend.mu.Lock()
+			defer mockBackend.mu.Unlock()
+			assert.Empty(t, mockBackend.provisionCalls, "a billing-only lease is never provisioned")
+		})
+	}
 }

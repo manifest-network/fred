@@ -81,6 +81,7 @@ func TestIntegration_FullProvisionAcknowledge(t *testing.T) {
 	}
 
 	manager := startTestManager(t, ManagerConfig{
+		BillingPolicy:    NoBillingOnlySKUs(),
 		ProviderUUID:     providerUUID,
 		CallbackBaseURL:  "http://localhost:8080",
 		AckBatchInterval: 50 * time.Millisecond,
@@ -160,6 +161,7 @@ func TestIntegration_ProvisionFailure_RejectsLease(t *testing.T) {
 	}
 
 	manager := startTestManager(t, ManagerConfig{
+		BillingPolicy:    NoBillingOnlySKUs(),
 		ProviderUUID:     providerUUID,
 		CallbackBaseURL:  "http://localhost:8080",
 		AckBatchInterval: 50 * time.Millisecond,
@@ -234,6 +236,7 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 	}
 
 	manager := startTestManager(t, ManagerConfig{
+		BillingPolicy:    NoBillingOnlySKUs(),
 		ProviderUUID:     providerUUID,
 		CallbackBaseURL:  "http://localhost:8080",
 		AckBatchInterval: 50 * time.Millisecond,
@@ -343,6 +346,7 @@ func TestIntegration_PayloadFlow(t *testing.T) {
 	require.NoError(t, err)
 
 	manager := startTestManager(t, ManagerConfig{
+		BillingPolicy:    NoBillingOnlySKUs(),
 		ProviderUUID:     providerUUID,
 		CallbackBaseURL:  "http://localhost:8080",
 		PayloadStore:     payloadStore,

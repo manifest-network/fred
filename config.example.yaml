@@ -342,6 +342,25 @@ backends:
   #     - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
 
 # =============================================================================
+# BILLING-ONLY SKUS (optional)
+# =============================================================================
+# On-chain SKU UUIDs the provider bills for but never deploys; their service is
+# delivered outside Fred. A lease whose items all use these SKUs is
+# acknowledged as soon as Fred sees it, which starts its billing, and is never
+# provisioned, rejected, or closed for a provisioning reason. Withdrawals and
+# the credit check apply as for any lease. Payload uploads for such a lease are
+# refused.
+#
+# Each entry must be a lowercase canonical UUID and must not appear in any
+# backend's skus list. A lease that mixes billing-only and deployable SKUs takes
+# the normal provisioning path.
+#
+# billing_only_skus:
+#   - "01a126cc-7edd-700d-9ac6-02ed34fa4bff"
+#
+# From the environment: PROVIDER_BILLING_ONLY_SKUS="<uuid>,<uuid>"
+
+# =============================================================================
 # CALLBACK CONFIGURATION (required)
 # =============================================================================
 # Backends call back to fred to report provisioning results.

@@ -124,6 +124,7 @@ type Handlers struct {
 	providerUUID       string
 	bech32Prefix       string
 	callbackBaseURL    string
+	billingPolicy      *provisioner.BillingPolicy
 }
 
 // HandlersConfig configures a Handlers instance.
@@ -141,6 +142,9 @@ type HandlersConfig struct {
 	ProviderUUID       string
 	Bech32Prefix       string
 	CallbackBaseURL    string // used for restart/update callbacks to the backend
+	// BillingPolicy classifies a restore's target lease. A billing-only lease
+	// is never restored into, and without a policy no lease is.
+	BillingPolicy *provisioner.BillingPolicy
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -168,6 +172,7 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		providerUUID:      cfg.ProviderUUID,
 		bech32Prefix:      cfg.Bech32Prefix,
 		callbackBaseURL:   cfg.CallbackBaseURL,
+		billingPolicy:     cfg.BillingPolicy,
 	}
 }
 
@@ -1075,6 +1080,21 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A restore deploys a workload into the target lease, so it needs the same
+	// classifier-issued capability as a provision. A billing-only lease is
+	// billed but never deployed.
+	class := h.billingPolicy.Classify(auth.Lease)
+	if class.BillingOnly() {
+		writeError(w, "lease is billing-only and cannot be restored into", http.StatusBadRequest)
+		return
+	}
+	deployable, ok := class.Deployable()
+	if !ok {
+		slog.Error("restore refused: lease cannot be classified for deployment", "lease_uuid", leaseUUID)
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
 	var body struct {
 		FromLeaseUUID string `json:"from_lease_uuid"`
 	}
@@ -1129,7 +1149,8 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items := provisioner.ExtractLeaseItems(auth.Lease)
+	target := deployable.Lease()
+	items := provisioner.ExtractLeaseItems(&target)
 
 	// Register the NEW lease in-flight as a restore BEFORE calling the backend, so
 	// the restore's provision callback is acknowledged inline rather than ~one
@@ -1149,14 +1170,8 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		tracked = true
 	}
 
-	err = backendClient.Restore(r.Context(), backend.RestoreRequest{
-		LeaseUUID:     leaseUUID,
-		FromLeaseUUID: body.FromLeaseUUID,
-		Tenant:        auth.Token.Tenant,
-		ProviderUUID:  h.providerUUID,
-		Items:         items,
-		CallbackURL:   provisioner.BuildCallbackURL(h.callbackBaseURL),
-	})
+	err = provisioner.RestoreDeployable(r.Context(), backendClient, deployable,
+		h.providerUUID, body.FromLeaseUUID, provisioner.BuildCallbackURL(h.callbackBaseURL))
 	if err != nil {
 		// Undo the in-flight registration on a synchronous restore failure so it
 		// does not leave a phantom entry the TimeoutChecker would later reject.

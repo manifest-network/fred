@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 
-	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
-
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
 )
@@ -44,9 +42,18 @@ func NewProvisionOrchestrator(providerUUID, callbackBaseURL string, router Backe
 // and payload-triggered provisioning. It routes to the appropriate backend,
 // tracks the provision in-flight, and initiates the async provisioning call.
 //
+// It takes a DeployableLease, which only BillingPolicy.Classify issues, so a
+// billing-only lease can never be provisioned.
+//
 // Returns nil if provisioning was started successfully or the lease is already in-flight.
 // Returns an error if routing fails or the backend call fails.
-func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *billingtypes.Lease, opts ProvisionOpts) error {
+func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, deployable DeployableLease, opts ProvisionOpts) error {
+	if !deployable.valid() {
+		return errNotDeployable
+	}
+	leaseCopy := deployable.Lease()
+	lease := &leaseCopy
+
 	// Extract lease items and primary SKU for routing
 	items := ExtractLeaseItems(lease)
 	sku := ExtractRoutingSKU(lease)
@@ -84,22 +91,9 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 		return nil
 	}
 
-	// Build provision request
-	req := backend.ProvisionRequest{
-		LeaseUUID:    lease.Uuid,
-		Tenant:       lease.Tenant,
-		ProviderUUID: o.providerUUID,
-		Items:        items,
-		CallbackURL:  BuildCallbackURL(o.callbackBaseURL),
-		Payload:      opts.Payload,
-	}
-	// Only include PayloadHash when we have the actual payload
-	if opts.Payload != nil && opts.PayloadHash != "" {
-		req.PayloadHash = opts.PayloadHash
-	}
-
 	// Start provisioning (async - backend will call back)
-	if err := backendClient.Provision(ctx, req); err != nil {
+	if err := provisionDeployable(ctx, backendClient, deployable, o.providerUUID,
+		BuildCallbackURL(o.callbackBaseURL), opts.Payload, opts.PayloadHash); err != nil {
 		if errors.Is(err, backend.ErrInsufficientResources) {
 			metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendClient.Name()).Inc()
 		}

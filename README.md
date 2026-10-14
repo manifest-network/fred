@@ -219,6 +219,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 - `callback_base_url` must be an absolute `http://` or `https://` URL
 - Trailing slashes on `callback_base_url` are automatically stripped
 - `callback_canonical_path_prefix`, when set, must start with `/` and must not end with `/`
+- Every `billing_only_skus` entry must be a lowercase canonical UUID, listed once, and served by no backend
 
 ### Full Configuration Reference
 
@@ -249,6 +250,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `trusted_proxies` | CIDR blocks of trusted proxies for X-Forwarded-For | `[]` |
 | `cors_origins` | Allowed CORS origins for browser clients. `["*"]` allows all; `[]` disables CORS. | `["*"]` |
 | `backends` | List of backend configurations | (required) |
+| `billing_only_skus` | On-chain SKU UUIDs the provider bills for but never deploys. Fred acknowledges a lease whose items all use these SKUs, which starts its billing, and never provisions, rejects, or closes it for a provisioning reason. Withdrawals and the credit check still apply. From the environment, `PROVIDER_BILLING_ONLY_SKUS` takes a comma-separated list. See [Billing-only leases](#billing-only-leases). | `[]` |
 | `callback_base_url` | Base URL for backend callbacks | (required) |
 | `callback_secret` | HMAC secret for callback authentication (min 32 chars) | (required) |
 | `callback_canonical_path_prefix` | Path prefix prepended to inbound callback URIs before HMAC verification. Set this when fred is behind a path-stripping reverse proxy (e.g., Traefik `stripPrefix` mapping `/api/fred/*` → `/*`); must match the prefix the proxy strips. Leave empty for direct-call deployments. See [SECURITY.md](SECURITY.md) and [docs/security-callback-auth.md](docs/security-callback-auth.md). | `""` |
@@ -629,7 +631,7 @@ Upload deployment configuration for a lease that was created with a `meta_hash`.
 
 **Response Codes:**
 - `202 Accepted` - Payload received, provisioning started
-- `400 Bad Request` - Invalid payload or hash mismatch
+- `400 Bad Request` - Invalid payload or hash mismatch, or the lease is [billing-only](#billing-only-leases)
 - `401 Unauthorized` - Invalid signature or token
 - `404 Not Found` - Lease not found or not PENDING
 - `409 Conflict` - Payload already received
@@ -714,7 +716,7 @@ Restore a soft-deleted lease's retained data into a **new** lease. The path `lea
 
 **Response Codes:**
 - `202 Accepted` - Restore initiated (the lease then transitions through `restarting` to `ready`/`failed`)
-- `400 Bad Request` - Missing/invalid `from_lease_uuid`, or items don't match the retained set
+- `400 Bad Request` - Missing/invalid `from_lease_uuid`, items don't match the retained set, or the target lease is [billing-only](#billing-only-leases)
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - No retained data found for `from_lease_uuid` (absent, expired, cross-tenant, or its backend is gone)
@@ -1358,6 +1360,26 @@ Chain State (leases)     Backend State (provisions)
 2. **Periodic**: Runs every `reconciliation_interval` (default: 5 minutes)
 3. **Cross-provider credit depletion**: Triggers withdrawal which may close leases
 
+### Billing-only leases
+
+A provider can register a SKU purely for on-chain billing and deliver its
+service outside Fred. List such SKUs in `billing_only_skus`. A lease whose items
+all use them is billing-only:
+
+- Fred acknowledges it as soon as the lease-created event arrives, and the
+  reconciler retries on its next sweep if that fails. Acknowledgment makes the
+  lease ACTIVE, so billing starts at once.
+- Fred never provisions it, never rejects it, and never closes it for a
+  provisioning reason. `POST /v1/leases/{lease_uuid}/data` refuses its payload
+  with `400`, and `POST /v1/leases/{lease_uuid}/restore` refuses to restore
+  into it with `400`.
+- Billing applies as for any lease: the provider-wide withdrawal settles it,
+  and the credit check closes it once its tenant's credit is exhausted.
+
+A lease that mixes billing-only and deployable SKUs is not billing-only. It
+takes the normal path, where the backend refuses the SKU it cannot serve and
+Fred rejects the lease.
+
 ### State Matrix
 
 | Chain State | Backend State | Action |
@@ -1373,8 +1395,11 @@ Chain State (leases)     Backend State (provisions)
 | CLOSED/EXPIRED | Provisioned | Orphan: deprovision |
 | Not found | Provisioned | Orphan: deprovision |
 | *any* | Owning backend did not answer | **Defer — no action this sweep** |
+| PENDING, [billing-only](#billing-only-leases) | *any* | Acknowledge lease; never provision |
+| ACTIVE, billing-only | *any* | No action |
 
-The last row takes precedence over every other. A sweep applies the matrix only
+The defer row takes precedence over every other except the billing-only rows,
+which need no backend answer. A sweep applies the matrix only
 to leases whose owning backend reported: one present in the backend data, or one
 whose placement record names a backend that answered. Anything else is deferred
 and retried on the next sweep, because acting on a lease fred cannot see risks

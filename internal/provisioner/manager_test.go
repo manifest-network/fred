@@ -138,35 +138,44 @@ func TestNewManager_Validation(t *testing.T) {
 	}{
 		{
 			name:        "missing router",
-			cfg:         ManagerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+			cfg:         ManagerConfig{BillingPolicy: NoBillingOnlySKUs(), ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 			router:      nil,
 			chainClient: mockChain,
 			wantErr:     "backend router is required",
 		},
 		{
 			name:        "missing chain client",
-			cfg:         ManagerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+			cfg:         ManagerConfig{BillingPolicy: NoBillingOnlySKUs(), ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 			router:      router,
 			chainClient: nil,
 			wantErr:     "chain client is required",
 		},
 		{
 			name:        "missing provider UUID",
-			cfg:         ManagerConfig{CallbackBaseURL: "http://localhost"},
+			cfg:         ManagerConfig{BillingPolicy: NoBillingOnlySKUs(), CallbackBaseURL: "http://localhost"},
 			router:      router,
 			chainClient: mockChain,
 			wantErr:     "provider UUID is required",
 		},
 		{
 			name:        "missing callback URL",
-			cfg:         ManagerConfig{ProviderUUID: "test-uuid"},
+			cfg:         ManagerConfig{BillingPolicy: NoBillingOnlySKUs(), ProviderUUID: "test-uuid"},
 			router:      router,
 			chainClient: mockChain,
 			wantErr:     "callback base URL is required",
 		},
 		{
-			name:        "valid config",
+			// No implicit default: a provider without billing-only SKUs passes
+			// NoBillingOnlySKUs() explicitly.
+			name:        "missing billing policy",
 			cfg:         ManagerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+			router:      router,
+			chainClient: mockChain,
+			wantErr:     "billing policy is required",
+		},
+		{
+			name:        "valid config",
+			cfg:         ManagerConfig{BillingPolicy: NoBillingOnlySKUs(), ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 			router:      router,
 			chainClient: mockChain,
 			wantErr:     "",
@@ -194,6 +203,7 @@ func TestManager_InFlightTracking(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -238,6 +248,7 @@ func TestManager_TryTrackInFlight(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -275,6 +286,7 @@ func TestManager_TryTrackInFlight_RaceCondition(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -331,6 +343,7 @@ func TestManager_PopInFlight(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -377,6 +390,7 @@ func TestManager_HandleLeaseCreated(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -427,6 +441,7 @@ func TestManager_HandleLeaseCreated_ProvisionError(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -457,6 +472,7 @@ func TestManager_HandleLeaseCreated_MalformedMessage(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -483,6 +499,7 @@ func TestManager_HandleLeaseClosed(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -520,6 +537,7 @@ func TestManager_HandleLeaseClosed_DeprovisionError(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -561,6 +579,7 @@ func TestManager_HandleBackendCallback_Success(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -600,6 +619,7 @@ func TestManager_HandleBackendCallback_Failed(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -631,6 +651,7 @@ func TestManager_HandleBackendCallback_UnknownLease(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -672,6 +693,7 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -724,6 +746,7 @@ func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -804,6 +827,7 @@ func TestManager_HandleBackendCallback_UnknownStatus(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -836,6 +860,7 @@ func TestManager_PublishLeaseEvent(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -878,6 +903,7 @@ func TestManager_PublishCallback(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -901,6 +927,7 @@ func TestManager_HandleLeaseExpired(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -943,6 +970,7 @@ func TestManager_StartAndClose(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -989,6 +1017,7 @@ func TestManager_HandleLeaseClosed_BackendNameNotFound(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1040,6 +1069,7 @@ func TestManager_HandleLeaseCreated_SKUBasedRouting(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1102,6 +1132,7 @@ func TestManager_HandleBackendCallback_FailedRejectsLease(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1152,6 +1183,7 @@ func TestManager_HandleBackendCallback_FailedDefaultReason(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1229,6 +1261,7 @@ func TestManager_GetInFlightLeases(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1267,6 +1300,7 @@ func TestManager_WaitForDrain_AlreadyEmpty(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1285,6 +1319,7 @@ func TestManager_WaitForDrain_DrainCompletes(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1314,6 +1349,7 @@ func TestManager_WaitForDrain_TimeoutExpires(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1340,6 +1376,7 @@ func TestManager_WaitForDrain_ContextCancelled(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1373,6 +1410,7 @@ func TestManager_InFlightCount(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1467,6 +1505,7 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1518,6 +1557,7 @@ func TestManager_HandlePayloadReceived_NoPayloadStore(t *testing.T) {
 
 	// Create manager WITHOUT payload store
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    nil, // No payload store
@@ -1556,6 +1596,7 @@ func TestManager_HandlePayloadReceived_MalformedMessage(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1593,6 +1634,7 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1648,6 +1690,7 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1699,6 +1742,7 @@ func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1742,6 +1786,7 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1798,6 +1843,7 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1848,6 +1894,7 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1907,6 +1954,7 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1972,6 +2020,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:        NoBillingOnlySKUs(),
 		ProviderUUID:         "provider-1",
 		CallbackBaseURL:      "http://localhost:8080",
 		CallbackTimeout:      100 * time.Millisecond, // Short timeout for testing
@@ -2069,6 +2118,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		}
 
 		failManager, err := NewManager(ManagerConfig{
+			BillingPolicy:        NoBillingOnlySKUs(),
 			ProviderUUID:         "provider-1",
 			CallbackBaseURL:      "http://localhost:8080",
 			CallbackTimeout:      100 * time.Millisecond,
@@ -2113,6 +2163,7 @@ func TestManager_RunTimeoutChecker(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:        NoBillingOnlySKUs(),
 		ProviderUUID:         "provider-1",
 		CallbackBaseURL:      "http://localhost:8080",
 		CallbackTimeout:      50 * time.Millisecond, // Short for testing
@@ -2188,6 +2239,7 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -2282,6 +2334,7 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -2360,6 +2413,7 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	require.NoError(t, err)
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -2436,6 +2490,7 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -2549,6 +2604,7 @@ func TestManager_Close_NoPanicWithActiveHandler(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:    NoBillingOnlySKUs(),
 		ProviderUUID:     "provider-1",
 		CallbackBaseURL:  "http://localhost:8080",
 		AckBatchInterval: 50 * time.Millisecond, // Flush quickly
@@ -2620,6 +2676,7 @@ func TestManager_PoisonQueue_BreaksInfiniteLoop(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -2756,6 +2813,7 @@ func TestManager_OverwritePayload_ReplacesStoredPayload(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -2786,6 +2844,7 @@ func TestManager_OverwritePayload_NoStoreReturnsSentinel(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: &mockManagerBackend{name: "test"}, IsDefault: true}},
 	})
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		// PayloadStore deliberately omitted

@@ -32,6 +32,7 @@ import (
 // invocations in a test that spans more than one.
 func handlersOf(m *Manager) *HandlerSet {
 	return NewHandlerSet(HandlerDeps{
+		Policy:        NoBillingOnlySKUs(),
 		ChainClient:   m.chainClient,
 		Orchestrator:  m.orchestrator,
 		Tracker:       m.tracker,

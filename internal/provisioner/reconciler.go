@@ -82,6 +82,7 @@ type Reconciler struct {
 	backendRouter   BackendRouter
 	tracker         ReconcilerTracker // For tracking in-flight provisions (shared state with event-driven path)
 	placementStore  PlacementStore    // Optional placement store for backend routing
+	policy          *BillingPolicy    // Classifies each lease: deployable, or billing-only (acknowledged, never deployed)
 
 	interval               time.Duration
 	maxWorkers             int         // Maximum concurrent workers for lease processing
@@ -97,9 +98,10 @@ const DefaultMaxReprovisionAttempts = 3
 type ReconcilerConfig struct {
 	ProviderUUID           string
 	CallbackBaseURL        string
-	Interval               time.Duration // How often to run periodic reconciliation
-	MaxWorkers             int           // Maximum concurrent workers (default: 10)
-	MaxReprovisionAttempts int           // Max re-provision attempts before rejecting (default: 3)
+	Interval               time.Duration  // How often to run periodic reconciliation
+	MaxWorkers             int            // Maximum concurrent workers (default: 10)
+	MaxReprovisionAttempts int            // Max re-provision attempts before rejecting (default: 3)
+	BillingPolicy          *BillingPolicy // Required: classifies each lease before any deployment or acknowledgment
 }
 
 // NewReconciler creates a new reconciler.
@@ -122,6 +124,9 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, ackn
 	if cfg.CallbackBaseURL == "" {
 		return nil, errors.New("callback base URL is required")
 	}
+	if cfg.BillingPolicy == nil {
+		return nil, errors.New("billing policy is required")
+	}
 
 	// Apply defaults using cmp.Or (returns first non-zero value)
 	interval := cmp.Or(cfg.Interval, 5*time.Minute)
@@ -136,6 +141,7 @@ func NewReconciler(cfg ReconcilerConfig, chainClient ReconcilerChainClient, ackn
 		backendRouter:          backendRouter,
 		tracker:                tracker,
 		placementStore:         placementStore,
+		policy:                 cfg.BillingPolicy,
 		interval:               interval,
 		maxWorkers:             maxWorkers,
 		maxReprovisionAttempts: maxReprovision,
@@ -336,11 +342,19 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		deferred     atomic.Int32
 	)
 
+	billingOnlyCount := 0
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(r.maxWorkers)
 
 	for leaseUUID, lease := range chainLeases {
 		provision, isProvisioned := allProvisions[leaseUUID]
+
+		// A billing-only lease needs no backend answer (processLease only
+		// acknowledges it), so it is never deferred.
+		billingOnly := r.policy.Classify(&lease).BillingOnly()
+		if billingOnly {
+			billingOnlyCount++
+		}
 
 		// Skip a lease whose owning backend did not report this sweep (ENG-356).
 		//
@@ -354,7 +368,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		// healthy ACTIVE lease on chain. Skip the goroutine body; leave the maps
 		// alone.
 		placedBackend := r.placementFor(leaseUUID)
-		if deferLease(snapshot, isProvisioned, placedBackend) {
+		if !billingOnly && deferLease(snapshot, isProvisioned, placedBackend) {
 			deferred.Add(1)
 			metrics.ReconcilerDeferredLeasesTotal.Inc()
 			slog.Debug("reconcile: deferring lease, owning backend did not report",
@@ -514,6 +528,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		"orphans", orphansCount,
 		"errors", leaseErrorCount,
 		"deferred", deferredCount,
+		"billing_only", billingOnlyCount,
 		"sweep_complete", snapshot.complete,
 		"orphaned_payloads_cleaned", orphanedPayloads,
 		"orphaned_placements_pruned", prunedPlacements,
@@ -525,18 +540,28 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 // startProvisioning initiates provisioning for a lease without a payload.
 // Returns errLeaseAlreadyInFlight if the lease is already being provisioned by
 // the event-driven path (this is not a real error, just a signal to skip).
-func (r *Reconciler) startProvisioning(ctx context.Context, lease billingtypes.Lease) error {
+func (r *Reconciler) startProvisioning(ctx context.Context, lease DeployableLease) error {
 	return r.doStartProvisioning(ctx, lease, false)
 }
 
 // startProvisioningWithPayload initiates provisioning for a lease that requires a payload.
 // Returns errLeaseAlreadyInFlight if the lease is already being provisioned.
-func (r *Reconciler) startProvisioningWithPayload(ctx context.Context, lease billingtypes.Lease) error {
+func (r *Reconciler) startProvisioningWithPayload(ctx context.Context, lease DeployableLease) error {
 	return r.doStartProvisioning(ctx, lease, true)
 }
 
 // doStartProvisioning is the common implementation for provisioning with or without payload.
-func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes.Lease, withPayload bool) error {
+// It takes a DeployableLease, so a billing-only lease can never be provisioned.
+func (r *Reconciler) doStartProvisioning(ctx context.Context, deployable DeployableLease, withPayload bool) error {
+	if !deployable.valid() {
+		return errNotDeployable
+	}
+	lease := deployable.Lease()
+	// The payload and its hash are read and verified below, then sent with the
+	// classified lease by provisionDeployable.
+	var payloadBytes []byte
+	payloadHash := ""
+
 	// Extract SKU for routing
 	sku := ExtractRoutingSKU(&lease)
 
@@ -568,15 +593,6 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 		}
 	}
 
-	// Build provision request
-	req := backend.ProvisionRequest{
-		LeaseUUID:    lease.Uuid,
-		Tenant:       lease.Tenant,
-		ProviderUUID: r.providerUUID,
-		Items:        items,
-		CallbackURL:  BuildCallbackURL(r.callbackBaseURL),
-	}
-
 	// Get the payload from the store WITHOUT removing it yet.
 	// We only delete after Provision() succeeds to allow retries.
 	// Only include PayloadHash when we have the actual payload - this ensures
@@ -590,7 +606,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 		// reconciler re-provisions it while the backend still accepts /update
 		// for it, and nothing serializes the two.
 		recordedHash, getErr := []byte(nil), error(nil)
-		req.Payload, recordedHash, getErr = r.tracker.PayloadStore().GetWithHash(lease.Uuid)
+		payloadBytes, recordedHash, getErr = r.tracker.PayloadStore().GetWithHash(lease.Uuid)
 		if getErr != nil {
 			// Database error, or a recorded hash that is not a SHA-256 — do NOT
 			// treat either as "payload missing". Abort this provision attempt so
@@ -598,14 +614,14 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 			r.tracker.UntrackInFlight(lease.Uuid)
 			return fmt.Errorf("failed to read payload for lease %s: %w", lease.Uuid, getErr)
 		}
-		if req.Payload == nil && len(lease.MetaHash) > 0 {
+		if payloadBytes == nil && len(lease.MetaHash) > 0 {
 			// Payload is required (lease has MetaHash) but not in the store.
 			// This can happen if the payload DB was lost or fred restarted
 			// without its data. We cannot re-provision without the manifest.
 			r.tracker.UntrackInFlight(lease.Uuid)
 			return fmt.Errorf("%w: lease %s", errPayloadNotAvailable, lease.Uuid)
 		}
-		if req.Payload != nil && len(lease.MetaHash) > 0 {
+		if payloadBytes != nil && len(lease.MetaHash) > 0 {
 			// Re-verify the payload before provisioning to catch corruption.
 			//
 			// Verify against the hash recorded when the payload was written, not
@@ -629,7 +645,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 				verifiedAgainst = "meta_hash"
 			}
 
-			if err := payload.VerifyHash(req.Payload, expectedHash); err != nil {
+			if err := payload.VerifyHash(payloadBytes, expectedHash); err != nil {
 				// Payload is corrupted - delete it and fail
 				r.tracker.PayloadStore().Delete(lease.Uuid)
 				r.tracker.UntrackInFlight(lease.Uuid)
@@ -642,11 +658,12 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 			}
 			// The hash sent to the backend describes the payload actually being
 			// sent, which after an update is no longer MetaHash.
-			req.PayloadHash = hex.EncodeToString(expectedHash)
+			payloadHash = hex.EncodeToString(expectedHash)
 		}
 	}
 
-	err = backendClient.Provision(ctx, req)
+	err = provisionDeployable(ctx, backendClient, deployable, r.providerUUID,
+		BuildCallbackURL(r.callbackBaseURL), payloadBytes, payloadHash)
 	if err != nil {
 		if errors.Is(err, backend.ErrInsufficientResources) {
 			metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendClient.Name()).Inc()
@@ -684,7 +701,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 			"tenant", lease.Tenant,
 			"sku", sku,
 			"backend", backendClient.Name(),
-			"payload_size", len(req.Payload),
+			"payload_size", len(payloadBytes),
 		)
 	} else {
 		slog.Info("reconcile: started provisioning",
@@ -1341,6 +1358,39 @@ func (r *Reconciler) processLease(
 		}
 	}()
 
+	// A billing-only lease is billed but never deployed, whatever the backends
+	// report: acknowledge it while it is PENDING so billing starts, and never
+	// provision, reject or close it. The event path normally acknowledges it
+	// first; a lease that is no longer PENDING by now needs nothing more.
+	class := r.policy.Classify(&lease)
+	if class.BillingOnly() {
+		if lease.State != billingtypes.LEASE_STATE_PENDING {
+			return
+		}
+		if err := r.acknowledgeLease(ctx, leaseUUID); err != nil {
+			if isTerminalAcknowledgeError(err) {
+				return
+			}
+			slog.Error("reconcile: failed to acknowledge billing-only lease",
+				"lease_uuid", leaseUUID,
+				"error", err,
+			)
+			hadError = true
+			return
+		}
+		acknowledged.Add(1)
+		return
+	}
+	// Every provisioning branch below needs the classifier-issued capability.
+	deployable, ok := class.Deployable()
+	if !ok {
+		slog.Error("reconcile: lease cannot be classified for deployment",
+			"lease_uuid", leaseUUID,
+		)
+		hadError = true
+		return
+	}
+
 	switch {
 	case lease.State == billingtypes.LEASE_STATE_PENDING && !isProvisioned:
 		// Check if lease requires a payload (has MetaHash)
@@ -1360,7 +1410,7 @@ func (r *Reconciler) processLease(
 			}
 			if hasPayload {
 				// We have the payload - start provisioning with it
-				if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
+				if err := r.startProvisioningWithPayload(ctx, deployable); err != nil {
 					r.handleProvisionError(ctx, err, leaseUUID, lease, &hadError)
 				} else {
 					provisioned.Add(1)
@@ -1375,7 +1425,7 @@ func (r *Reconciler) processLease(
 			}
 		} else {
 			// No MetaHash - start provisioning immediately
-			if err := r.startProvisioning(ctx, lease); err != nil {
+			if err := r.startProvisioning(ctx, deployable); err != nil {
 				r.handleProvisionError(ctx, err, leaseUUID, lease, &hadError)
 			} else {
 				provisioned.Add(1)
@@ -1435,7 +1485,7 @@ func (r *Reconciler) processLease(
 		)
 		anomalies.Add(1)
 		// Attempt to provision (with payload — Docker backend needs the manifest)
-		if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
+		if err := r.startProvisioningWithPayload(ctx, deployable); err != nil {
 			r.handleProvisionError(ctx, err, leaseUUID, lease, &hadError)
 		}
 
@@ -1483,7 +1533,7 @@ func (r *Reconciler) processLease(
 			"fail_count", provision.FailCount,
 			"max_attempts", r.maxReprovisionAttempts,
 		)
-		if err := r.startProvisioningWithPayload(ctx, lease); err != nil {
+		if err := r.startProvisioningWithPayload(ctx, deployable); err != nil {
 			r.handleProvisionError(ctx, err, leaseUUID, lease, &hadError)
 		}
 

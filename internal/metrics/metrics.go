@@ -295,7 +295,7 @@ var (
 		Subsystem: "payload",
 		Name:      "uploads_total",
 		Help:      "Total number of payload uploads by outcome",
-	}, []string{"outcome"}) // outcome: success, invalid_auth, hash_mismatch, conflict, error
+	}, []string{"outcome"}) // outcome: success, invalid_auth, billing_only, hash_mismatch, conflict, error
 
 	// PayloadStoredCount tracks the number of payloads currently stored.
 	PayloadStoredCount = promauto.NewGauge(prometheus.GaugeOpts{

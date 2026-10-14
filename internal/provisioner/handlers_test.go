@@ -77,6 +77,7 @@ func TestHandleLeaseCreated_WithMetaHash(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -109,6 +110,7 @@ func TestHandleLeaseCreated_LeaseNotFound(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -138,6 +140,7 @@ func TestHandleLeaseCreated_ChainError(t *testing.T) {
 	}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -174,6 +177,7 @@ func TestHandleLeaseClosed_NoPlacement_SweepsAllBackends(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -216,6 +220,7 @@ func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -258,6 +263,7 @@ func TestHandleLeaseClosed_AllBackendsFail(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -288,6 +294,7 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -344,6 +351,7 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := NewManager(ManagerConfig{
+		BillingPolicy:   NoBillingOnlySKUs(),
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,

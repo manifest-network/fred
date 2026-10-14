@@ -393,6 +393,20 @@ func run(cmd *cobra.Command, args []string) error {
 	// Create event broker for real-time lease event delivery
 	eventBroker := api.NewEventBroker()
 
+	// Every component that could deploy or acknowledge a lease classifies it
+	// through this one policy. Leases that use only billing_only_skus are billed
+	// on chain but never deployed: they are acknowledged without provisioning,
+	// and their payload uploads and restores are refused.
+	billingPolicy, err := provisioner.NewBillingPolicy(cfg.BillingOnlySKUs)
+	if err != nil {
+		return fmt.Errorf("invalid billing_only_skus: %w", err)
+	}
+	if len(cfg.BillingOnlySKUs) > 0 {
+		slog.Info("billing-only SKUs configured; their leases are acknowledged but never deployed",
+			"skus", cfg.BillingOnlySKUs,
+		)
+	}
+
 	// Create provision manager
 	provisionMgr, err := provisioner.NewManager(provisioner.ManagerConfig{
 		ProviderUUID:    cfg.ProviderUUID,
@@ -401,6 +415,7 @@ func run(cmd *cobra.Command, args []string) error {
 		PlacementStore:  placementStore,
 		LeaseEventSink:  eventBroker,
 		AckLaneCount:    signerPool.LaneCount(),
+		BillingPolicy:   billingPolicy,
 	}, backendRouter, chainClient)
 	if err != nil {
 		return fmt.Errorf("failed to create provision manager: %w", err)
@@ -461,6 +476,7 @@ func run(cmd *cobra.Command, args []string) error {
 		CallbackCanonicalPathPrefix: cfg.CallbackCanonicalPathPrefix,
 		TokenTrackerDBPath:          cfg.TokenTrackerDBPath,
 		CallbackBaseURL:             cfg.CallbackBaseURL,
+		BillingPolicy:               billingPolicy,
 	}, api.ServerDeps{
 		ChainClient:        chainClient,
 		BackendRouter:      backendRouter,
@@ -494,6 +510,7 @@ func run(cmd *cobra.Command, args []string) error {
 		ProviderUUID:    cfg.ProviderUUID,
 		CallbackBaseURL: cfg.CallbackBaseURL,
 		Interval:        cfg.ReconciliationInterval,
+		BillingPolicy:   billingPolicy,
 	}, chainClient, provisionMgr.AckBatcher(), backendRouter, provisionMgr, placementStore)
 	if err != nil {
 		return fmt.Errorf("failed to create reconciler: %w", err)

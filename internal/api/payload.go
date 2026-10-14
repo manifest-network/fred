@@ -15,6 +15,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
@@ -31,15 +32,19 @@ type PayloadHandler struct {
 	publisher    PayloadPublisher
 	providerUUID string
 	bech32Prefix string
+	policy       *provisioner.BillingPolicy
 }
 
-// NewPayloadHandler creates a new payload handler.
-func NewPayloadHandler(client ChainClient, publisher PayloadPublisher, providerUUID, bech32Prefix string) *PayloadHandler {
+// NewPayloadHandler creates a new payload handler. The billing policy decides
+// which leases accept a payload: a billing-only lease is never deployed, and
+// without a policy no lease is accepted.
+func NewPayloadHandler(client ChainClient, publisher PayloadPublisher, providerUUID, bech32Prefix string, policy *provisioner.BillingPolicy) *PayloadHandler {
 	return &PayloadHandler{
 		client:       client,
 		publisher:    publisher,
 		providerUUID: providerUUID,
 		bech32Prefix: bech32Prefix,
+		policy:       policy,
 	}
 }
 
@@ -98,6 +103,23 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"state", lease.State.String(),
 		)
 		writeError(w, "lease not pending", http.StatusNotFound)
+		return
+	}
+
+	// A billing-only lease is never deployed, so a payload has nothing to
+	// configure. A lease the policy cannot classify is refused as well: only a
+	// deployable lease is ever provisioned from a payload.
+	class := h.policy.Classify(lease)
+	if class.BillingOnly() {
+		slog.Warn("payload upload refused for a billing-only lease", "lease_uuid", leaseUUID)
+		metrics.PayloadUploadsTotal.WithLabelValues("billing_only").Inc()
+		writeError(w, "lease is billing-only and does not accept a payload", http.StatusBadRequest)
+		return
+	}
+	if _, deployable := class.Deployable(); !deployable {
+		slog.Error("payload upload refused: lease cannot be classified for deployment", "lease_uuid", leaseUUID)
+		metrics.PayloadUploadsTotal.WithLabelValues("error").Inc()
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
 		return
 	}
 

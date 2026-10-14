@@ -641,6 +641,7 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 	}
 
 	rec, err := NewReconciler(ReconcilerConfig{
+		BillingPolicy:          NoBillingOnlySKUs(),
 		ProviderUUID:           f.providerUUID,
 		CallbackBaseURL:        "http://fred.invalid",
 		Interval:               opts.interval,

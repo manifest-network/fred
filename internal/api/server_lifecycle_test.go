@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
@@ -32,6 +33,7 @@ func newTestServer(t *testing.T, addr string) *Server {
 
 	s, err := NewServer(
 		ServerConfig{
+			BillingPolicy:  provisioner.NoBillingOnlySKUs(),
 			Addr:           addr,
 			ProviderUUID:   "01234567-89ab-cdef-0123-456789abcdef",
 			Bech32Prefix:   "manifest",
@@ -152,6 +154,7 @@ func TestServer_ShutdownClosesTokenTracker(t *testing.T) {
 
 	s, err := NewServer(
 		ServerConfig{
+			BillingPolicy:      provisioner.NoBillingOnlySKUs(),
 			Addr:               addr,
 			ProviderUUID:       "01234567-89ab-cdef-0123-456789abcdef",
 			Bech32Prefix:       "manifest",
@@ -196,6 +199,7 @@ func TestServer_HandlePayloadUpload(t *testing.T) {
 		addr := freePort(t)
 		s, err := NewServer(
 			ServerConfig{
+				BillingPolicy:  provisioner.NoBillingOnlySKUs(),
 				Addr:           addr,
 				ProviderUUID:   "01234567-89ab-cdef-0123-456789abcdef",
 				Bech32Prefix:   "manifest",
@@ -233,6 +237,7 @@ func TestServer_HandlePayloadUpload(t *testing.T) {
 
 		s, err := NewServer(
 			ServerConfig{
+				BillingPolicy:  provisioner.NoBillingOnlySKUs(),
 				Addr:           addr,
 				ProviderUUID:   "01234567-89ab-cdef-0123-456789abcdef",
 				Bech32Prefix:   "manifest",
@@ -392,6 +397,7 @@ func TestServer_StartBackground(t *testing.T) {
 
 		s, err := NewServer(
 			ServerConfig{
+				BillingPolicy:  provisioner.NoBillingOnlySKUs(),
 				Addr:           addr,
 				ProviderUUID:   "01234567-89ab-cdef-0123-456789abcdef",
 				Bech32Prefix:   "manifest",
