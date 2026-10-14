@@ -191,7 +191,7 @@ var (
 	// ReconcilerLostLeasesTotal counts reconciliation of leases whose data
 	// lived on a backend an operator retired as lost, and of ACTIVE leases with
 	// no placement row that an unproven retirement closes. outcome: closed,
-	// rejected, deferred, error.
+	// rejected, billing_only (kept: billed but never deployed), deferred, error.
 	ReconcilerLostLeasesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",

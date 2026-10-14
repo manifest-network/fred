@@ -173,3 +173,43 @@ func TestUnprovenRetirementClosesARecordlessActiveLease(t *testing.T) {
 	require.Contains(t, closed, fleetLeaseUUID(recordless))
 	require.Zero(t, f.backendAt(1).provisionCount(recordless), "never provisioned empty on a survivor")
 }
+
+// TestRetiredBackendBillingOnlyLeasesAreKeptNotEnded pins that a lease the
+// current policy classifies as billing-only is never ended as lost: losing a
+// workload is no reason to stop billing a service now delivered outside Fred.
+// The leases were deployable when placed; their SKU is reclassified, and its
+// only backend retired as lost, across one restart.
+func TestRetiredBackendBillingOnlyLeasesAreKeptNotEnded(t *testing.T) {
+	const billingSKU = "01a126cc-7edd-700d-9ac6-02ed34fa4bff"
+	f := newFleet(t, fleetOptions{
+		interval:     time.Second,
+		placementAge: time.Hour,
+		backendSKUs:  map[int][]string{3: {billingSKU}},
+	})
+	require.NoError(t, f.sweep(), "establish baseline")
+	const (
+		active  = "lease-active-reclassified"
+		pending = "lease-pending-reclassified"
+	)
+	provisionAndActivateOn(t, f, active, 3, billingSKU)
+	f.addLease(pending, billingtypes.LEASE_STATE_PENDING, billingSKU)
+	require.NoError(t, f.sweep())
+	require.Equal(t, 1, f.backendAt(3).provisionCount(pending))
+	ackedBefore, _, _ := f.chainCalls()
+
+	policy, err := placement.NewBillingPolicy([]string{billingSKU})
+	require.NoError(t, err)
+	f.billingPolicy = policy
+	f.retireBackend("backend-3")
+	require.NoError(t, f.sweepN(3))
+
+	acked, rejected, closed := f.chainCalls()
+	require.NotContains(t, closed, fleetLeaseUUID(active), "a billing-only lease is never closed as lost")
+	require.NotContains(t, rejected, fleetLeaseUUID(pending), "a billing-only lease is never rejected as lost")
+	require.Contains(t, acked[len(ackedBefore):], fleetLeaseUUID(pending),
+		"a PENDING billing-only lease is acknowledged so billing starts")
+	for _, alias := range []string{active, pending} {
+		_, lost := f.placement.Lookup(fleetLeaseUUID(alias)).LostBackend()
+		require.True(t, lost, "%s keeps its lost placement until the lease ends", alias)
+	}
+}

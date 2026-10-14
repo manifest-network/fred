@@ -397,14 +397,6 @@ func (authority *RestoreCoordinator) execute(
 	if err != nil {
 		return authority.abortInvalidRestore(dispatch, err)
 	}
-	bound, boundOK := authority.coordinator.bindRestoreBackend(dispatch)
-	if !boundOK {
-		return authority.abortInvalidRestore(dispatch, errors.New("restore dispatch did not bind its backend"))
-	}
-	call, calling := authority.coordinator.beginRestoreCall(bound)
-	if !calling {
-		return authority.abortInvalidRestore(dispatch, errors.New("restore dispatch did not enter calling phase"))
-	}
 	requestSnapshot := claim.requestSnapshot
 	request := backend.RestoreRequest{
 		LeaseUUID: claim.targetLeaseUUID, FromLeaseUUID: claim.sourceLeaseUUID,
@@ -413,8 +405,22 @@ func (authority *RestoreCoordinator) execute(
 		CallbackURL:          claim.callbackPair.OperationURL(),
 		LifecycleCallbackURL: claim.callbackPair.LifecycleURL(),
 	}
+	// Attest before the calling phase, so a refusal aborts the dispatch as
+	// never sent.
+	delivery, err := authority.coordinator.attestRestore(request)
+	if err != nil {
+		return authority.abortInvalidRestore(dispatch, err)
+	}
+	bound, boundOK := authority.coordinator.bindRestoreBackend(dispatch)
+	if !boundOK {
+		return authority.abortInvalidRestore(dispatch, errors.New("restore dispatch did not bind its backend"))
+	}
+	call, calling := authority.coordinator.beginRestoreCall(bound)
+	if !calling {
+		return authority.abortInvalidRestore(dispatch, errors.New("restore dispatch did not enter calling phase"))
+	}
 	observeRestoreStart(authority.observe, claim.targetLeaseUUID, claim.backendName)
-	return authority.coordinator.completeRestore(call, invokeRestore(ctx, backendClient, request))
+	return authority.coordinator.completeRestore(call, invokeRestore(ctx, backendClient, delivery))
 }
 
 func (authority *RestoreCoordinator) abortInvalidRestore(

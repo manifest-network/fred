@@ -142,6 +142,12 @@ linters:
           msg: "[deployment-call] send provisions and restores only from the placement execution files, from a request snapshot (ENG-1453)"
         - pattern: '^invoke(Provision|Restore)$'
           msg: "[deployment-call] send provisions and restores only from the placement execution files, from a request snapshot (ENG-1453)"
+        #   - [deployment-delivery]: invokeProvision and invokeRestore take only
+        #     a delivery the current policy attested at send time, and only
+        #     backend_execution.go, where attestProvision and attestRestore live,
+        #     may build one.
+        - pattern: '^(provisionDelivery|restoreDelivery)$'
+          msg: "[deployment-delivery] build a delivery only through attestProvision or attestRestore in internal/provisioner/placement/backend_execution.go (ENG-1453)"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -214,6 +220,11 @@ linters:
         linters:
           - forbidigo
         text: '\[deployment-call\]'
+      # [deployment-delivery] (ENG-1453): the send-time policy attestation.
+      - path: ^internal/provisioner/placement/backend_execution\.go$
+        linters:
+          - forbidigo
+        text: '\[deployment-delivery\]'
       # Exclude test files from strict linters
       - path: _test\.go
         linters:

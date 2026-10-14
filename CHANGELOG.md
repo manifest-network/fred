@@ -24,7 +24,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `PROVIDER_BILLING_ONLY_SKUS` sets the list from the environment
   (comma-separated). The policy is bound into the placement backend runtime,
   and a provision or restore request can be minted only from a lease it
-  classified as deployable. (ENG-1453)
+  classified as deployable. It is checked again when a request is sent, so a
+  deployment retried from a durable attempt minted under an earlier policy is
+  never sent for a billing-only lease; the attempt is kept unresolved. A
+  billing-only lease that lost its placement with a retired backend is counted
+  as `fred_provisioner_reconciler_lost_leases_total{outcome="billing_only"}`.
+  (ENG-1453)
 
 - Metric `fred_docker_backend_operation_recovery_deferred_total`: a provision
   or restore whose recovery evidence could not be classified, so the lease

@@ -268,6 +268,19 @@ func redeliveryReconcilerWithPayload(
 	payloadStore *payload.Store,
 ) *Reconciler {
 	t.Helper()
+	return redeliveryReconcilerWithPolicy(t, store, router, chainClient, registry, payloadStore, placement.NoBillingOnlySKUs())
+}
+
+func redeliveryReconcilerWithPolicy(
+	t *testing.T,
+	store *placement.Store,
+	router *backend.Router,
+	chainClient ReconcilerChainClient,
+	_ *operation.Registry,
+	payloadStore *payload.Store,
+	policy *placement.BillingPolicy,
+) *Reconciler {
+	t.Helper()
 	if bound, ok := redeliveryExecutions.Load(store); ok {
 		execution := bound.(*placement.ExecutionCoordinator)
 		coordinator := bindTestReconciliationCoordinator(
@@ -282,7 +295,7 @@ func redeliveryReconcilerWithPayload(
 	coordinator := bindTestOperationCoordinator(t, store)
 	redeliveryCoordinators.Store(store, coordinator)
 	t.Cleanup(func() { redeliveryCoordinators.Delete(store) })
-	execution := bindTestBackendRuntime(t, coordinator, router)
+	execution := bindTestBackendRuntimeWithPolicy(t, coordinator, router, policy)
 	reconciliation := bindTestReconciliationCoordinator(
 		t, store, execution, chainClient, payloadStore, nil,
 	)
@@ -1351,4 +1364,93 @@ func TestReconciler_ConflictedAttemptCannotAuthorizeBackendCall(t *testing.T) {
 	assert.Empty(t, backendA.deprovisionCalls)
 	assert.Empty(t, backendB.deprovisionCalls)
 	assert.Equal(t, placement.StateUnusable, store.Lookup(redeliveryTarget).State())
+}
+
+const redeliveryBillingOnlySKU = "01a126cc-7edd-700d-9ac6-02ed34fa4bff"
+
+// billingOnlyRedeliveryLease is a redelivery target whose SKU a later billing
+// policy reclassifies as billing-only.
+func billingOnlyRedeliveryLease(uuid string, state billingtypes.LeaseState) billingtypes.Lease {
+	lease := redeliveryLease(uuid, state)
+	lease.Items[0].SkuUuid = redeliveryBillingOnlySKU
+	return lease
+}
+
+// TestReconciler_RedeliveryRefusesAProvisionTheCurrentPolicyMakesBillingOnly
+// persists an ambiguous provision while its SKU is deployable, then reopens
+// the store with the SKU billing-only. The request rebuilt from the durable
+// snapshot is judged by the current policy: it is never sent, and the
+// unresolved attempt is kept as evidence.
+func TestReconciler_RedeliveryRefusesAProvisionTheCurrentPolicyMakesBillingOnly(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	backendA := &mockReconcilerBackend{name: "backend-a"}
+	router := redeliveryRouter(t, backendA)
+	store1 := openRedeliveryStore(t, dbPath)
+	armTestPlacementTopology(t, store1, backendTopologyNames(router))
+	target := billingOnlyRedeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
+	operationID := persistAmbiguousProvisionOnStore(
+		t, store1, operation.NewRegistry(), router, backendA, target, nil,
+	)
+	require.NoError(t, store1.Close())
+	backendA.mu.Lock()
+	backendA.provisionCalls = nil
+	backendA.mu.Unlock()
+
+	store2 := openRedeliveryStore(t, dbPath)
+	t.Cleanup(func() { require.NoError(t, store2.Close()) })
+	policy, err := placement.NewBillingPolicy([]string{redeliveryBillingOnlySKU})
+	require.NoError(t, err)
+	reconciler := redeliveryReconcilerWithPolicy(
+		t, store2, router, redeliveryChain([]billingtypes.Lease{target}, nil),
+		operation.NewRegistry(), nil, policy,
+	)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	backendA.mu.Lock()
+	defer backendA.mu.Unlock()
+	assert.Empty(t, backendA.provisionCalls, "the current policy refuses the persisted provision")
+	metadata := store2.Lookup(redeliveryTarget).AttemptMetadata()
+	require.True(t, metadata.Valid(), "the unresolved attempt is kept as evidence")
+	assert.Equal(t, operation.KindProvision, metadata.Kind())
+	assert.Equal(t, operationID, metadata.OperationID())
+}
+
+// TestReconciler_RedeliveryRefusesARestoreTheCurrentPolicyMakesBillingOnly is
+// the restore variant: a restore deploys a workload exactly as a provision does.
+func TestReconciler_RedeliveryRefusesARestoreTheCurrentPolicyMakesBillingOnly(t *testing.T) {
+	backendA := &mockReconcilerBackend{
+		name:          "backend-a",
+		restoreAccept: true,
+		retentions:    []backend.RetainedLease{{LeaseUUID: redeliverySource}},
+	}
+	router := redeliveryRouter(t, backendA)
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	target := billingOnlyRedeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
+	operationID := persistAmbiguousRestoreAttempt(t, dbPath, router, backendA, target)
+	backendA.mu.Lock()
+	backendA.restoreCalls = nil
+	backendA.restoreErr = nil
+	backendA.mu.Unlock()
+
+	store := openRedeliveryStore(t, dbPath)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	policy, err := placement.NewBillingPolicy([]string{redeliveryBillingOnlySKU})
+	require.NoError(t, err)
+	source := redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_CLOSED)
+	reconciler := redeliveryReconcilerWithPolicy(
+		t, store, router,
+		redeliveryChain([]billingtypes.Lease{target}, map[string]billingtypes.Lease{redeliverySource: source}),
+		operation.NewRegistry(), nil, policy,
+	)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	backendA.mu.Lock()
+	defer backendA.mu.Unlock()
+	assert.Empty(t, backendA.restoreCalls, "the current policy refuses the persisted restore")
+	metadata := store.Lookup(redeliveryTarget).AttemptMetadata()
+	require.True(t, metadata.Valid(), "the unresolved attempt is kept as evidence")
+	assert.Equal(t, operation.KindRestore, metadata.Kind())
+	assert.Equal(t, operationID, metadata.OperationID())
 }

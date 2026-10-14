@@ -788,6 +788,9 @@ type fleet struct {
 	placementAge  time.Duration
 	acknowledger  Acknowledger
 	reconcilerCfg ReconcilerConfig
+	// billingPolicy is bound with the backend runtime at the next restart; nil
+	// binds the explicit empty policy.
+	billingPolicy *placement.BillingPolicy
 
 	chainMu  sync.Mutex
 	acked    []string
@@ -1009,7 +1012,11 @@ func (f *fleet) restartReconciler() {
 	f.tracker.testOperationRegistry = newTestOperationRegistry()
 	f.coordinator, err = f.tracker.bindPlacementStore(store)
 	require.NoError(f.t, err)
-	f.execution = bindTestBackendRuntime(f.t, f.coordinator, f.router)
+	policy := f.billingPolicy
+	if policy == nil {
+		policy = placement.NoBillingOnlySKUs()
+	}
+	f.execution = bindTestBackendRuntimeWithPolicy(f.t, f.coordinator, f.router, policy)
 	f.tracker.callbackStore = store
 	f.reconcilerCfg.Coordinator = bindTestReconciliationCoordinator(
 		f.t, f.placement, f.execution, f.chain, f.payloads, nil,

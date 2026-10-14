@@ -129,12 +129,12 @@ func TestBackendPanicRecoveryDoesNotExposeCallbackCapabilities(t *testing.T) {
 			panic(request)
 		},
 	}
-	provisionErr := invokeProvision(t.Context(), client, backend.ProvisionRequest{
+	provisionErr := invokeProvision(t.Context(), client, provisionDelivery{request: backend.ProvisionRequest{
 		LeaseUUID: leaseUUID, CallbackURL: operationURL, LifecycleCallbackURL: lifecycleURL,
-	})
-	restoreErr := invokeRestore(t.Context(), client, backend.RestoreRequest{
+	}})
+	restoreErr := invokeRestore(t.Context(), client, restoreDelivery{request: backend.RestoreRequest{
 		LeaseUUID: leaseUUID, CallbackURL: operationURL, LifecycleCallbackURL: lifecycleURL,
-	})
+	}})
 	maintenanceID, err := maintenanceid.Parse(operationID)
 	require.NoError(t, err)
 	maintenanceErr := invokeMaintenance(t.Context(), client, MaintenanceCommand{

@@ -105,6 +105,10 @@ var forbidigoExemptions = map[string]struct {
 			"internal/provisioner/placement/restore_coordinator.go",
 		},
 	},
+	"[deployment-delivery]": {
+		patterns: []string{`^(provisionDelivery|restoreDelivery)$`},
+		files:    []string{"internal/provisioner/placement/backend_execution.go"},
+	},
 }
 
 // forbidigoIssueText renders an issue the way golangci-lint's forbidigo

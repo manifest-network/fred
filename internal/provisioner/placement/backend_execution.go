@@ -206,10 +206,6 @@ func executeProvision(
 	if err != nil {
 		return abort(err)
 	}
-	call, calling := coordinator.beginProvisionCall(dispatch)
-	if !calling {
-		return abort(errors.New("provision dispatch did not enter calling phase"))
-	}
 	request := backend.ProvisionRequest{
 		LeaseUUID: attempt.leaseUUID,
 		Tenant:    requestSnapshot.Tenant(), ProviderUUID: requestSnapshot.ProviderUUID(),
@@ -221,15 +217,64 @@ func executeProvision(
 		request.Payload = append([]byte(nil), payload...)
 		request.PayloadHash = attempt.payloadFingerprint.String()
 	}
+	// Attest before the calling phase, so a refusal aborts the dispatch as
+	// never sent.
+	delivery, err := coordinator.attestProvision(request)
+	if err != nil {
+		return abort(err)
+	}
+	call, calling := coordinator.beginProvisionCall(dispatch)
+	if !calling {
+		return abort(errors.New("provision dispatch did not enter calling phase"))
+	}
 	observeProvisionStart(observer, attempt.leaseUUID, attempt.backendName)
-	return coordinator.completeProvision(call, invokeProvision(ctx, backendClient, request))
+	return coordinator.completeProvision(call, invokeProvision(ctx, backendClient, delivery))
+}
+
+// provisionDelivery and restoreDelivery are backend requests the current
+// billing policy attested immediately before they are sent. attestProvision
+// and attestRestore build the only ones, and invokeProvision and invokeRestore
+// accept nothing else. A request is rebuilt from a durable snapshot that an
+// earlier process may have minted under an earlier policy, so the check at
+// send time is what keeps a lease the current policy classifies as
+// billing-only from ever being deployed, on redelivery too.
+type provisionDelivery struct{ request backend.ProvisionRequest }
+
+type restoreDelivery struct{ request backend.RestoreRequest }
+
+// errNotDeployable reports a request whose every SKU the current billing
+// policy classifies as billing-only.
+var errNotDeployable = errors.New("the billing policy classifies this request as billing-only; it is not deployed")
+
+func (coordinator *OperationCoordinator) attestProvision(request backend.ProvisionRequest) (provisionDelivery, error) {
+	if !coordinator.permits(request.Items) {
+		return provisionDelivery{}, fmt.Errorf("provision lease %s: %w", request.LeaseUUID, errNotDeployable)
+	}
+	return provisionDelivery{request: request}, nil
+}
+
+func (coordinator *OperationCoordinator) attestRestore(request backend.RestoreRequest) (restoreDelivery, error) {
+	if !coordinator.permits(request.Items) {
+		return restoreDelivery{}, fmt.Errorf("restore into lease %s: %w", request.LeaseUUID, errNotDeployable)
+	}
+	return restoreDelivery{request: request}, nil
+}
+
+// permits asks the billing policy bound with the backend runtime. Before a
+// runtime is bound nothing is permitted.
+func (coordinator *OperationCoordinator) permits(items []backend.LeaseItem) bool {
+	if coordinator == nil || coordinator.execution == nil {
+		return false
+	}
+	return coordinator.execution.policy.permits(items)
 }
 
 func invokeProvision(
 	ctx context.Context,
 	client backend.Backend,
-	request backend.ProvisionRequest,
+	delivery provisionDelivery,
 ) (outcome backend.ProvisionCallOutcome) {
+	request := delivery.request
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			metrics.BackendInvocationPanicsTotal.WithLabelValues(metrics.OperationProvision).Inc()
@@ -255,8 +300,9 @@ func invokeProvision(
 func invokeRestore(
 	ctx context.Context,
 	client backend.Backend,
-	request backend.RestoreRequest,
+	delivery restoreDelivery,
 ) (outcome backend.RestoreCallOutcome) {
+	request := delivery.request
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			metrics.BackendInvocationPanicsTotal.WithLabelValues(metrics.OperationRestore).Inc()

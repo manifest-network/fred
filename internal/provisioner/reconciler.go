@@ -1270,8 +1270,25 @@ func (r *Reconciler) resolveLostLease(
 		return true, nil
 	}
 	defer r.coordinator.ReleaseAction(observed)
+	// A billing-only lease is billed but never deployed, so losing a workload
+	// is no reason to end it. Classified on the authoritative reread: it is
+	// acknowledged while PENDING and otherwise left alone, and its lost
+	// placement stays until the lease ends.
+	lease := observed.Lease()
+	if r.coordinator.ClassifyLease(&lease).BillingOnly() {
+		if lease.State == billingtypes.LEASE_STATE_PENDING {
+			if err := r.acknowledgeLease(ctx, observed); err != nil {
+				metrics.ReconcilerLostLeasesTotal.WithLabelValues("error").Inc()
+				slog.Error("reconcile: failed to acknowledge billing-only lease with a lost placement",
+					"lease_uuid", leaseUUID, "error", err)
+				return false, err
+			}
+		}
+		metrics.ReconcilerLostLeasesTotal.WithLabelValues("billing_only").Inc()
+		return false, nil
+	}
 	outcome := ""
-	switch observed.Lease().State {
+	switch lease.State {
 	case billingtypes.LEASE_STATE_ACTIVE:
 		outcome, err = "closed", r.closeLostLease(ctx, observed)
 	case billingtypes.LEASE_STATE_PENDING:

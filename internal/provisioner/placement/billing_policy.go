@@ -5,6 +5,8 @@ import (
 
 	"github.com/google/uuid"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 // BillingPolicy classifies leases by the SKUs they bill. A billing-only SKU
@@ -74,15 +76,44 @@ func (p *BillingPolicy) Classify(lease *billingtypes.Lease) LeaseClass {
 	if !p.valid() || lease == nil || lease.Uuid == "" {
 		return LeaseClass{}
 	}
-	if len(lease.Items) == 0 {
-		return LeaseClass{kind: leaseKindDeployable, deployable: DeployableLease{lease: detachLease(lease)}}
-	}
+	skus := make([]string, 0, len(lease.Items))
 	for _, item := range lease.Items {
-		if _, billingOnly := p.billingOnly[item.SkuUuid]; !billingOnly {
-			return LeaseClass{kind: leaseKindDeployable, deployable: DeployableLease{lease: detachLease(lease)}}
+		skus = append(skus, item.SkuUuid)
+	}
+	if p.coversAll(skus) {
+		return LeaseClass{kind: leaseKindBillingOnly}
+	}
+	return LeaseClass{kind: leaseKindDeployable, deployable: DeployableLease{lease: detachLease(lease)}}
+}
+
+// permits reports whether a backend request with these items may be sent. It
+// applies Classify's rule to the request itself, so a request rebuilt from a
+// durable snapshot is judged by the current policy rather than by the one it
+// was minted under. An invalid policy permits nothing.
+func (p *BillingPolicy) permits(items []backend.LeaseItem) bool {
+	if !p.valid() {
+		return false
+	}
+	skus := make([]string, 0, len(items))
+	for _, item := range items {
+		skus = append(skus, item.SKU)
+	}
+	return !p.coversAll(skus)
+}
+
+// coversAll reports whether there is at least one SKU and every one is
+// billing-only. A request without items is never billing-only, so the
+// validation that refuses it stays as before.
+func (p *BillingPolicy) coversAll(skus []string) bool {
+	if len(skus) == 0 {
+		return false
+	}
+	for _, sku := range skus {
+		if _, billingOnly := p.billingOnly[sku]; !billingOnly {
+			return false
 		}
 	}
-	return LeaseClass{kind: leaseKindBillingOnly}
+	return true
 }
 
 // BillingOnly reports whether the lease is billed but never deployed.

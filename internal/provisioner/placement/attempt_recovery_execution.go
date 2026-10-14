@@ -49,7 +49,7 @@ func (recovery *AttemptRecoveryCoordinator) redeliverProvision(
 				errors.New("payload-bearing provision recovery has no durable fingerprint"),
 			)
 		}
-		return invokeProvision(ctx, client, request)
+		return recovery.redeliverProvisionRequest(ctx, client, request)
 	}
 	if recovery.payloads == nil {
 		return backend.ConservativeProvisionCallOutcome(
@@ -81,7 +81,22 @@ func (recovery *AttemptRecoveryCoordinator) redeliverProvision(
 	}
 	request.Payload = append([]byte(nil), payloadBytes...)
 	request.PayloadHash = fingerprint.String()
-	return invokeProvision(ctx, client, request)
+	return recovery.redeliverProvisionRequest(ctx, client, request)
+}
+
+// redeliverProvisionRequest sends a provision rebuilt from a durable attempt
+// only if the current billing policy still permits it. A refused request is
+// never sent, and the conservative outcome leaves the attempt unresolved: the
+// earlier delivery may have reached the backend, so its evidence is kept for
+// inventory to settle.
+func (recovery *AttemptRecoveryCoordinator) redeliverProvisionRequest(
+	ctx context.Context, client backend.Backend, request backend.ProvisionRequest,
+) backend.ProvisionCallOutcome {
+	delivery, err := recovery.coordinator.attestProvision(request)
+	if err != nil {
+		return backend.ConservativeProvisionCallOutcome(err)
+	}
+	return invokeProvision(ctx, client, delivery)
 }
 
 func (recovery *AttemptRecoveryCoordinator) redeliverRestore(
@@ -97,13 +112,19 @@ func (recovery *AttemptRecoveryCoordinator) redeliverRestore(
 	if err != nil {
 		return backend.ConservativeRestoreCallOutcome(err)
 	}
-	return invokeRestore(ctx, client, backend.RestoreRequest{
+	// A refused restore is never sent; the conservative outcome keeps the
+	// attempt unresolved, as for a refused provision redelivery.
+	delivery, err := recovery.coordinator.attestRestore(backend.RestoreRequest{
 		LeaseUUID: leaseUUID, FromLeaseUUID: metadata.RestoreSourceLeaseUUID(),
 		Tenant: requestSnapshot.Tenant(), ProviderUUID: requestSnapshot.ProviderUUID(),
 		Items:                requestSnapshot.Items(),
 		CallbackURL:          callbacks.OperationURL(),
 		LifecycleCallbackURL: callbacks.LifecycleURL(),
 	})
+	if err != nil {
+		return backend.ConservativeRestoreCallOutcome(err)
+	}
+	return invokeRestore(ctx, client, delivery)
 }
 
 func (recovery *AttemptRecoveryCoordinator) teardownTerminal(
