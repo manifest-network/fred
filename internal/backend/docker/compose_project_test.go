@@ -532,6 +532,17 @@ func TestBuildComposeProject_LeaseNetworkChangesEveryServiceHash(t *testing.T) {
 	assert.NotEqual(t, legacyHash, currentHash)
 }
 
+func TestBuildComposeProject_StampsRuntimeContract(t *testing.T) {
+	params := baseProjectParams()
+	params.Items = []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "web"}}
+
+	project := buildTestComposeProject(t, params)
+
+	for name, svc := range project.Services {
+		assert.Equal(t, strconv.Itoa(currentRuntimeContract), svc.Labels[LabelRuntimeContract], name)
+	}
+}
+
 func TestBuildComposeProject_NoNetworkWhenIsolationDisabled(t *testing.T) {
 	params := baseProjectParams()
 	params.Networking = leaseNetworkingNone

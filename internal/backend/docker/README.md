@@ -2045,6 +2045,7 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 | `fred.fail_count` | integer string | Lifetime number of failures recorded for this lease at creation time (diagnostic; never decides a close) |
 | `fred.callback_url` | URL string | Exact completion URL with an operation capability for new provision/restore; inherited v0.13 lineage remains tokenless |
 | `fred.lifecycle_callback_url` | URL string | Paired endpoint for later maintenance, runtime-failure, and deprovision observations; typed for new provision/restore, tokenless for inherited v0.13 lineage; persisted across backend restarts |
+| `fred.runtime_contract` | integer string | Runtime contract the container was created under (network shape, security profile). A container without it predates the contract; a provider-driven refresh recreates such containers |
 | `fred.maintenance_id` | UUIDv4 string, or empty | Exact `maintenance_id` of the restart, update or custom-domain redeploy that created the container; empty for a provision or restore launch. Identifies the replacement cohort during recovery |
 | `fred.service_name` | service name string | Service name within the lease's stack (`app` for a single-service lease). Every managed container carries it; a strict inventory fails on a managed container without it |
 | `fred.backend_name` | backend name string | Name of the backend managing the container; set on every managed container |

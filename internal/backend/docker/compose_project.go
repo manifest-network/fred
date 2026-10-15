@@ -57,6 +57,16 @@ type serviceVolBinds struct {
 	WritableBinds map[string]string // hostPath → containerPath
 }
 
+// currentRuntimeContract versions the container-level runtime every launch
+// produces: its network shape, security profile and other properties a
+// running container keeps until it is recreated. Each container records the
+// version it was created under in LabelRuntimeContract, so a container created
+// under an older contract is a recorded fact rather than an inference. Bump it
+// whenever such a property changes.
+//
+//   - 1: the lease's own network (no shared per-tenant network).
+const currentRuntimeContract = 1
+
 // leaseNetworkKey is the project and service key of the lease network. It is
 // not Compose's implicit "default": Compose hashes each service's network map,
 // so the key change makes the first Up after an upgrade recreate every service
@@ -418,6 +428,7 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 		LabelCallbackURL:          p.CallbackURL,
 		LabelLifecycleCallbackURL: p.LifecycleCallbackURL,
 		LabelMaintenanceID:        p.MaintenanceID.String(),
+		LabelRuntimeContract:      strconv.Itoa(currentRuntimeContract),
 		LabelBackendName:          p.BackendName,
 		LabelServiceName:          p.ServiceName,
 	}

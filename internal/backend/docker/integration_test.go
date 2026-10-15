@@ -1599,9 +1599,17 @@ func TestIntegration_Docker_SameTenantLeasesAreIsolated(t *testing.T) {
 			Payload:              payload,
 		}))
 	}
-	for _, lease := range []string{leaseA, leaseB} {
-		cb := waitForCallback(t, callbackCh, lease, 2*time.Minute)
-		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	// Both callbacks, in whichever order they arrive.
+	pending := map[string]bool{leaseA: true, leaseB: true}
+	for len(pending) > 0 {
+		select {
+		case cb := <-callbackCh:
+			require.True(t, pending[cb.LeaseUUID], "unexpected callback for lease %s", cb.LeaseUUID)
+			require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+			delete(pending, cb.LeaseUUID)
+		case <-time.After(2 * time.Minute):
+			t.Fatalf("timeout waiting for provision callbacks; still pending: %v", pending)
+		}
 	}
 
 	// containerOn returns a lease service's container and its address on the
@@ -1626,13 +1634,19 @@ func TestIntegration_Docker_SameTenantLeasesAreIsolated(t *testing.T) {
 	require.NotEmpty(t, dbA)
 	require.NotEmpty(t, dbB)
 
+	// Names are queried absolute (trailing dot): busybox nslookup otherwise
+	// appends the host's search domain to a bare name and never asks Docker's
+	// resolver for the name itself.
+	//
 	// "db" resolves to this lease's db only.
-	resolved := execInContainer(t, webA, []string{"nslookup", "db"})
+	resolved := execInContainer(t, webA, []string{"nslookup", "db."})
 	assert.Contains(t, resolved, dbA)
 	assert.NotContains(t, resolved, dbB, "a same-tenant lease's service must not resolve")
 
-	// The other lease's container name does not resolve either.
-	otherName := fmt.Sprintf("fred-%s-db-0", leaseB)
+	// A container name resolves within the lease, so the negative check below
+	// is not vacuous: the other lease's container name does not resolve.
+	execInContainer(t, webA, []string{"nslookup", fmt.Sprintf("fred-%s-db-0.", leaseA)})
+	otherName := fmt.Sprintf("fred-%s-db-0.", leaseB)
 	out, execErr := exec.Command("docker", "exec", webA, "nslookup", otherName).CombinedOutput()
 	assert.Error(t, execErr, "another lease's container name must not resolve: %s", out)
 

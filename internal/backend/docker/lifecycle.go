@@ -58,9 +58,13 @@ const (
 	LabelCustomDomain         = "fred.custom_domain"
 	// LabelNetworkScope marks a network Fred owns per lease. Legacy per-tenant
 	// networks carry LabelTenant instead.
-	LabelNetworkScope   = "fred.network_scope"
-	LabelImageReference = imageexec.LabelImageReference
-	LabelImageID        = imageexec.LabelImageID
+	LabelNetworkScope = "fred.network_scope"
+	// LabelRuntimeContract records the runtime contract a container was created
+	// under (see currentRuntimeContract). A container without it predates the
+	// contract.
+	LabelRuntimeContract = "fred.runtime_contract"
+	LabelImageReference  = imageexec.LabelImageReference
+	LabelImageID         = imageexec.LabelImageID
 )
 
 // DaemonSecurityInfo contains Docker daemon capabilities relevant to
