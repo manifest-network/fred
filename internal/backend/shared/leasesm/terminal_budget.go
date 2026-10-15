@@ -189,8 +189,9 @@ func reasonEligibleForBudget(reason backend.Reason) bool {
 // tenantInitiatedMaintenance is an allowlist of the accepted maintenance
 // commands a tenant starts, which reset the streak like `docker restart`
 // resets RestartCount. A custom-domain redeploy is started by the platform's
-// reconciler, and a restore admits a new lease whose budget is already fresh;
-// neither resets, nor does any kind added later until it is decided here.
+// reconciler, a runtime refresh by the provider's operator, and a restore
+// admits a new lease whose budget is already fresh; none of them resets, nor
+// does any kind added later until it is decided here.
 func tenantInitiatedMaintenance(kind shared.MaintenanceIntentKind) bool {
 	switch kind {
 	case shared.MaintenanceIntentRestart, shared.MaintenanceIntentUpdate:

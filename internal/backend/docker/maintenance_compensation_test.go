@@ -189,7 +189,9 @@ func testFrozenDockerCompensation(t *testing.T, h *maintenanceRecoveryHarness, c
 	// Converge through the production dropped-worker projection path, then
 	// publish the attempt-owned failure while the exact source remains Ready.
 	h.b.provisions[h.leaseUUID] = &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: h.leaseUUID}}
-	require.NoError(t, h.b.convergeMaintenanceFailure(t.Context(), proof.Intent(), h.source, h.inventory.containers, true, recoveredMaintenanceFailureInfo(proof.Intent(), &h.targetRelease)))
+	failureInfo, err := recoveredMaintenanceFailureInfo(proof.Intent(), &h.targetRelease)
+	require.NoError(t, err)
+	require.NoError(t, h.b.convergeMaintenanceFailure(t.Context(), proof.Intent(), h.source, h.inventory.containers, true, failureInfo))
 	require.NoError(t, h.b.resolveMaintenanceFailure(proof, "target startup failed"))
 	mock.ContainerLogsFn = func(_ context.Context, id string, _ int) (string, error) {
 		if strings.HasPrefix(id, "restored-source-") {

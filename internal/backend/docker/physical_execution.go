@@ -745,8 +745,23 @@ func (b *Backend) doMaintenancePhysical(
 		LeaseUUID: subject.LeaseUUID(), Stack: stack, Items: target.Items,
 		ResourceProfiles: target.ResourceProfiles, Operation: operation,
 		TargetMaintenanceID: subject.MaintenanceID(),
+		ForceRecreate:       maintenanceForcesRecreate(intent.Kind()),
 		Logger:              physicalLogger(b, subject.LeaseUUID()),
 	})
+}
+
+// maintenanceForcesRecreate reports whether a maintenance kind recreates every
+// container even when Compose sees no configuration change. A restart exists
+// to recreate them, and a runtime refresh exists to put them under the current
+// runtime contract. An update or custom-domain redeploy recreates only what
+// changed.
+func maintenanceForcesRecreate(kind shared.MaintenanceIntentKind) bool {
+	switch kind {
+	case shared.MaintenanceIntentRestart, shared.MaintenanceIntentRuntimeRefresh:
+		return true
+	default:
+		return false
+	}
 }
 
 // doReplacePhysical contains only substrate work. It cannot activate/fail a
@@ -795,7 +810,7 @@ func (b *Backend) doReplacePhysical(
 		Stack: op.Stack, Items: op.Items, Profiles: profiles, ImageSetups: imageSetups,
 		Network: leaseNetwork, Cfg: &b.cfg, Ingress: b.cfg.Ingress,
 	}
-	_, composeUpErr := b.launchCompose(ctx, mutations, params, op.ResourceProfiles, composeUpOpts{ForceRecreate: op.Operation == "restart"})
+	_, composeUpErr := b.launchCompose(ctx, mutations, params, op.ResourceProfiles, composeUpOpts{ForceRecreate: op.ForceRecreate})
 	if composeUpErr != nil {
 		return fmt.Errorf("compose up for %s: %w", op.Operation, composeUpErr)
 	}

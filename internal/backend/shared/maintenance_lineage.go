@@ -27,6 +27,11 @@ const (
 	// custom-domain reconciler leaves behind. They live in their own window so
 	// reconciler churn can never evict a tenant's restart or update receipt.
 	maxCustomDomainMaintenanceWindow = 64
+	// maxRuntimeRefreshMaintenanceWindow bounds the receipts operator-started
+	// runtime refreshes leave behind. A lease is refreshed about once per
+	// runtime contract change, so a small window suffices; it is separate so a
+	// refresh never evicts a tenant's or the custom-domain reconciler's receipt.
+	maxRuntimeRefreshMaintenanceWindow = 16
 )
 
 // ErrMaintenanceExpired is a pre-side-effect refusal: a provider restart or
@@ -185,35 +190,26 @@ func deleteMaintenanceLineageTx(tx *bolt.Tx, leaseUUID string) error {
 
 // validateMaintenanceWindowCounts bounds one lease's retained receipts per
 // window; head is the kind of a live maintenance head, if any. Each window is
-// checked on its own, as admission fills it. The custom-domain bound is the
-// old lifetime limit of 1,024 so that a journal written before the windows
-// existed, when one limit covered every kind, still validates; a newer
-// custom-domain publish trims that window to 64.
+// checked on its own, as admission fills it, against storedLimit.
 func validateMaintenanceWindowCounts(
 	leaseUUID string,
 	records []maintenanceCompletionRecord,
 	head *MaintenanceIntentKind,
 ) error {
-	provider, custom := 0, 0
+	counts := make(map[maintenanceWindowKind]int, 3)
 	for _, record := range records {
-		switch maintenanceWindowFor(record.Kind) {
-		case maintenanceWindowProvider:
-			provider++
-		case maintenanceWindowCustomDomain:
-			custom++
-		}
+		counts[maintenanceWindowFor(record.Kind)]++
 	}
-	if provider > maxProviderMaintenanceWindow || custom > maxProviderMaintenanceWindow {
-		return fmt.Errorf("maintenance receipt capacity exceeded for lease %q", leaseUUID)
+	for window, count := range counts {
+		if count > window.storedLimit() {
+			return fmt.Errorf("maintenance receipt capacity exceeded for lease %q", leaseUUID)
+		}
 	}
 	if head == nil {
 		return nil
 	}
-	inWindow := provider
-	if maintenanceWindowFor(*head) == maintenanceWindowCustomDomain {
-		inWindow = custom
-	}
-	if inWindow >= maxProviderMaintenanceWindow {
+	window := maintenanceWindowFor(*head)
+	if counts[window] >= window.storedLimit() {
 		return fmt.Errorf("maintenance head for lease %q has no reserved receipt capacity", leaseUUID)
 	}
 	return nil
@@ -226,6 +222,7 @@ const (
 	maintenanceWindowInvalid maintenanceWindowKind = iota
 	maintenanceWindowProvider
 	maintenanceWindowCustomDomain
+	maintenanceWindowRuntimeRefresh
 )
 
 func maintenanceWindowFor(kind MaintenanceIntentKind) maintenanceWindowKind {
@@ -234,8 +231,26 @@ func maintenanceWindowFor(kind MaintenanceIntentKind) maintenanceWindowKind {
 		return maintenanceWindowProvider
 	case MaintenanceIntentCustomDomain:
 		return maintenanceWindowCustomDomain
+	case MaintenanceIntentRuntimeRefresh:
+		return maintenanceWindowRuntimeRefresh
 	default:
 		return maintenanceWindowInvalid
+	}
+}
+
+// storedLimit is the most receipts a stored journal may retain in the window.
+// The custom-domain bound is the old lifetime limit of 1,024 so that a journal
+// written before the windows existed, when one limit covered every kind,
+// still validates; a newer custom-domain publish trims that window to 64.
+// Runtime-refresh receipts never shared that lifetime limit.
+func (window maintenanceWindowKind) storedLimit() int {
+	switch window {
+	case maintenanceWindowProvider, maintenanceWindowCustomDomain:
+		return maxProviderMaintenanceWindow
+	case maintenanceWindowRuntimeRefresh:
+		return maxRuntimeRefreshMaintenanceWindow
+	default:
+		return 0
 	}
 }
 
@@ -245,6 +260,8 @@ func (window maintenanceWindowKind) limit() int {
 		return maxProviderMaintenanceWindow
 	case maintenanceWindowCustomDomain:
 		return maxCustomDomainMaintenanceWindow
+	case maintenanceWindowRuntimeRefresh:
+		return maxRuntimeRefreshMaintenanceWindow
 	default:
 		return 0
 	}

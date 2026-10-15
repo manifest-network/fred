@@ -677,6 +677,8 @@ func TestTenantInitiatedMaintenance_EveryDeclaredKind(t *testing.T) {
 		"MaintenanceIntentRestart":      true,
 		"MaintenanceIntentUpdate":       true,
 		"MaintenanceIntentCustomDomain": false,
+		// The provider's operator starts a runtime refresh, not the tenant.
+		"MaintenanceIntentRuntimeRefresh": false,
 	}
 	declared := declaredConstants(t, filepath.Join("..", "maintenance_intent.go"), "MaintenanceIntentKind")
 	require.Equal(t, slices.Sorted(maps.Keys(decisions)), slices.Sorted(maps.Keys(declared)),

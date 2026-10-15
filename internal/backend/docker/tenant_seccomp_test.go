@@ -95,7 +95,7 @@ func TestTenantSeccompSinkLabelsAreClosed(t *testing.T) {
 	}
 	require.Empty(t, tenantSeccompSinkInvalid.label())
 	require.Empty(t, tenantSeccompSink(255).label())
-	require.Len(t, seen, 7)
+	require.Len(t, seen, 8)
 }
 
 // Every intent that recreates tenant containers has its own counted sink,
@@ -103,9 +103,10 @@ func TestTenantSeccompSinkLabelsAreClosed(t *testing.T) {
 func TestTenantSeccompSinksCoverEveryRecreatingIntent(t *testing.T) {
 	sinks := map[tenantSeccompSink]bool{}
 	for kind, want := range map[shared.MaintenanceIntentKind]string{
-		shared.MaintenanceIntentRestart:      "restart",
-		shared.MaintenanceIntentUpdate:       "update",
-		shared.MaintenanceIntentCustomDomain: "custom_domain",
+		shared.MaintenanceIntentRestart:        "restart",
+		shared.MaintenanceIntentUpdate:         "update",
+		shared.MaintenanceIntentCustomDomain:   "custom_domain",
+		shared.MaintenanceIntentRuntimeRefresh: "runtime_refresh",
 	} {
 		sink := tenantSeccompMaintenanceSink(kind)
 		require.Equal(t, want, sink.label(), string(kind))
@@ -119,7 +120,7 @@ func TestTenantSeccompSinksCoverEveryRecreatingIntent(t *testing.T) {
 		require.Equal(t, want, sink.label(), string(kind))
 		sinks[sink] = true
 	}
-	require.Len(t, sinks, 5)
+	require.Len(t, sinks, 6)
 	require.Equal(t, tenantSeccompSinkInvalid, tenantSeccompMaintenanceSink("unknown"))
 	require.Equal(t, tenantSeccompSinkInvalid, tenantSeccompOperationSink("unknown"))
 	require.Equal(t, tenantSeccompSinkInvalid, (*storageMutations)(nil).tenantSeccompSink())

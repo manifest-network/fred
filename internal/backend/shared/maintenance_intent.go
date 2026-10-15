@@ -31,7 +31,18 @@ const (
 	MaintenanceIntentRestart      MaintenanceIntentKind = "restart"
 	MaintenanceIntentUpdate       MaintenanceIntentKind = "update"
 	MaintenanceIntentCustomDomain MaintenanceIntentKind = "custom_domain"
+	// MaintenanceIntentRuntimeRefresh is the provider's own redeploy of a
+	// healthy lease, unchanged, so its containers are recreated under the
+	// current container runtime contract. Only an operator starts one.
+	MaintenanceIntentRuntimeRefresh MaintenanceIntentKind = "runtime_refresh"
 )
+
+// Valid reports whether k is a maintenance kind this journal records. Every
+// journal validator consults it, so a kind is accepted everywhere or nowhere:
+// the receipt window that bounds it is the single list of known kinds.
+func (k MaintenanceIntentKind) Valid() bool {
+	return maintenanceWindowFor(k) != maintenanceWindowInvalid
+}
 
 var ErrMaintenanceIntentConflict = errors.New("unresolved callback maintenance intent")
 
@@ -1267,8 +1278,7 @@ func validateMaintenanceIntentEntry(entry maintenanceIntentEntry, leaseUUID stri
 	if !storageID.Valid() {
 		return errors.New("maintenance intent storage identity is invalid")
 	}
-	if entry.Kind != MaintenanceIntentRestart && entry.Kind != MaintenanceIntentUpdate &&
-		entry.Kind != MaintenanceIntentCustomDomain {
+	if !entry.Kind.Valid() {
 		return fmt.Errorf("invalid maintenance intent kind %q", entry.Kind)
 	}
 	if err := validateStoredCallbackCreatedAt(entry.CreatedAt); err != nil {

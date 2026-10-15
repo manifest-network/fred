@@ -207,8 +207,7 @@ func validateMaintenanceRequestAuthority(authority MaintenanceRequestAuthority) 
 	if !authority.id.Valid() {
 		return errors.New("maintenance request authority requires a UUIDv4 identity")
 	}
-	if authority.kind != MaintenanceIntentRestart && authority.kind != MaintenanceIntentUpdate &&
-		authority.kind != MaintenanceIntentCustomDomain {
+	if !authority.kind.Valid() {
 		return fmt.Errorf("maintenance request authority has invalid kind %q", authority.kind)
 	}
 	if err := validateCanonicalLeaseUUID(authority.leaseUUID); err != nil {
@@ -370,8 +369,7 @@ func validateMaintenanceCompletionRecord(record maintenanceCompletionRecord, lea
 	if record.LeaseUUID != leaseUUID {
 		return fmt.Errorf("maintenance receipt lease mismatch: key %q contains %q", leaseUUID, record.LeaseUUID)
 	}
-	if record.Kind != MaintenanceIntentRestart && record.Kind != MaintenanceIntentUpdate &&
-		record.Kind != MaintenanceIntentCustomDomain {
+	if !record.Kind.Valid() {
 		return fmt.Errorf("maintenance receipt has invalid kind %q", record.Kind)
 	}
 	if _, err := parseMaintenanceDigest(record.RequestDigest, false); err != nil {

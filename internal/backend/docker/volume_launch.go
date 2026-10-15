@@ -222,7 +222,7 @@ func (m *storageMutations) observeReplacementPhase(phase string, started time.Ti
 	operation := ""
 	if m.maintenanceSubject.Valid() {
 		switch kind := m.maintenanceSubject.Intent().Kind(); kind {
-		case shared.MaintenanceIntentRestart, shared.MaintenanceIntentUpdate:
+		case shared.MaintenanceIntentRestart, shared.MaintenanceIntentUpdate, shared.MaintenanceIntentRuntimeRefresh:
 			operation = string(kind)
 		}
 	} else if m.operationSubject.Valid() && m.operationSubject.Intent().Kind() == shared.OperationIntentRestore {

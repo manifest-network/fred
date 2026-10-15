@@ -37,12 +37,13 @@ const (
 	tenantSeccompSinkCustomDomain
 	tenantSeccompSinkCompensation
 	tenantSeccompSinkInspection
+	tenantSeccompSinkRuntimeRefresh
 )
 
 var tenantSeccompSinks = [...]tenantSeccompSink{
 	tenantSeccompSinkProvision, tenantSeccompSinkRestore, tenantSeccompSinkRestart,
 	tenantSeccompSinkUpdate, tenantSeccompSinkCustomDomain, tenantSeccompSinkCompensation,
-	tenantSeccompSinkInspection,
+	tenantSeccompSinkInspection, tenantSeccompSinkRuntimeRefresh,
 }
 
 func (sink tenantSeccompSink) label() string {
@@ -61,6 +62,8 @@ func (sink tenantSeccompSink) label() string {
 		return "compensation"
 	case tenantSeccompSinkInspection:
 		return "inspection"
+	case tenantSeccompSinkRuntimeRefresh:
+		return "runtime_refresh"
 	default:
 		return ""
 	}
@@ -82,8 +85,8 @@ func (m *storageMutations) tenantSeccompSink() tenantSeccompSink {
 }
 
 // tenantSeccompMaintenanceSink names the sink of each maintenance intent that
-// recreates containers: a restart, an update, and the redeploy that applies a
-// custom domain.
+// recreates containers: a restart, an update, the redeploy that applies a
+// custom domain, and the provider's runtime refresh.
 func tenantSeccompMaintenanceSink(kind shared.MaintenanceIntentKind) tenantSeccompSink {
 	switch kind {
 	case shared.MaintenanceIntentRestart:
@@ -92,6 +95,8 @@ func tenantSeccompMaintenanceSink(kind shared.MaintenanceIntentKind) tenantSecco
 		return tenantSeccompSinkUpdate
 	case shared.MaintenanceIntentCustomDomain:
 		return tenantSeccompSinkCustomDomain
+	case shared.MaintenanceIntentRuntimeRefresh:
+		return tenantSeccompSinkRuntimeRefresh
 	default:
 		return tenantSeccompSinkInvalid
 	}

@@ -107,10 +107,7 @@ func NewAmbiguousMaintenanceWork(
 	err error,
 	maintenance shared.MaintenanceIntentClaim,
 ) (ReplaceWorkOutcome, error) {
-	if err == nil || !maintenance.Valid() ||
-		(maintenance.Kind() != shared.MaintenanceIntentRestart &&
-			maintenance.Kind() != shared.MaintenanceIntentUpdate &&
-			maintenance.Kind() != shared.MaintenanceIntentCustomDomain) {
+	if err == nil || !maintenance.Valid() || !maintenance.Kind().Valid() {
 		return nil, errors.New("ambiguous maintenance requires an error and exact pending maintenance")
 	}
 	return replaceWorkAmbiguous{err: err, maintenance: maintenance}, nil

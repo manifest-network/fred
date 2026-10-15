@@ -1164,18 +1164,24 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 
 	now := time.Now()
 	var outcome budgetOutcome
+	unchanged := info.LeavesLeaseUnchanged()
 	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		applyFailedReplaceSource(p, info)
 		p.LastError = info.lastError
 		p.Reason = info.reason
 		p.Message = info.callbackErr
-		p.FailCount++
+		// A rolled-back runtime refresh is the provider's own attempt on a
+		// healthy lease that it left unchanged: it is not a failure of the
+		// lease, so it neither counts nor leaves an error behind.
+		if !unchanged {
+			p.FailCount++
+		}
 		// A restart or update outcome never counts, rolled back or not.
 		outcome = p.recordFailure(backend.ProvisionStatusReady, failurecause.Maintenance(), now)
 		// Restart: if we actually stopped old containers and then restored
 		// them, we're back to the exact same state — no persistent error.
 		// Update: keep LastError so the UI shows why the update failed.
-		if info.oldStopped && info.operation == "restart" {
+		if (info.oldStopped && info.operation == "restart") || unchanged {
 			p.LastError = ""
 			p.Reason = ""
 			p.Message = ""
@@ -1735,8 +1741,8 @@ func NewMaintenanceRecoveryFailureInfo(
 		return ReplaceFailureInfo{}, errors.New("replace failure requires an exact maintenance intent")
 	}
 	kind := intent.Kind()
-	if kind != shared.MaintenanceIntentRestart && kind != shared.MaintenanceIntentUpdate {
-		return ReplaceFailureInfo{}, errors.New("replace failure requires restart or update kind")
+	if !kind.Valid() {
+		return ReplaceFailureInfo{}, fmt.Errorf("replace failure has invalid maintenance kind %q", kind)
 	}
 	return ReplaceFailureInfo{
 		operation: string(kind), oldStopped: details.OldStopped,
@@ -1749,6 +1755,14 @@ func NewMaintenanceRecoveryFailureInfo(
 func (i ReplaceFailureInfo) WithOldStopped(oldStopped bool) ReplaceFailureInfo {
 	i.oldStopped = oldStopped
 	return i
+}
+
+// LeavesLeaseUnchanged reports whether this failure, rolled back to Ready,
+// left the lease exactly as it was before the replacement: a runtime refresh
+// recreates a healthy lease unchanged, so a rolled-back refresh records no
+// failure. A rollback that fails is still a failure.
+func (i ReplaceFailureInfo) LeavesLeaseUnchanged() bool {
+	return i.maintenance.Valid() && i.maintenance.Kind() == shared.MaintenanceIntentRuntimeRefresh
 }
 
 func (i ReplaceFailureInfo) CallbackError() string  { return i.callbackErr }
