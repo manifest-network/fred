@@ -41,9 +41,9 @@ func TestConcurrentDeprovisionsDoNotWaitForFleetNetworkInventory(t *testing.T) {
 					Name: TenantNetworkName("tenant-a"), Labels: map[string]string{LabelTenant: "tenant-a"},
 				}}, nil
 			},
-			RemoveTenantNetworkIfEmptyFn: func(context.Context, string) (tenantNetworkRemoval, error) {
+			RemoveTenantNetworkIfEmptyFn: func(context.Context, string) (networkRemoval, error) {
 				removals.Add(1)
-				return tenantNetworkRemoved, nil
+				return networkRemoved, nil
 			},
 		}
 		leases := make([]string, closeCount)
@@ -157,14 +157,14 @@ func TestNetworkBacklogDoesNotStarvePendingOperationRecovery(t *testing.T) {
 			}
 			return networks, nil
 		}
-		mock.RemoveTenantNetworkIfEmptyFn = func(ctx context.Context, _ string) (tenantNetworkRemoval, error) {
+		mock.RemoveTenantNetworkIfEmptyFn = func(ctx context.Context, _ string) (networkRemoval, error) {
 			attempts.Add(1)
 			select {
 			case <-time.After(250 * time.Millisecond):
 				removals.Add(1)
-				return tenantNetworkRemoved, nil
+				return networkRemoved, nil
 			case <-ctx.Done():
-				return tenantNetworkRemovalUnknown, ctx.Err()
+				return networkRemovalUnknown, ctx.Err()
 			}
 		}
 		b.wg.Go(b.networkCleanupLoop)
@@ -198,9 +198,9 @@ func TestNetworkCleanupRechecksTenantAfterFleetInventory(t *testing.T) {
 					Name: TenantNetworkName("tenant-a"), Labels: map[string]string{LabelTenant: "tenant-a"},
 				}}, nil
 			},
-			RemoveTenantNetworkIfEmptyFn: func(context.Context, string) (tenantNetworkRemoval, error) {
+			RemoveTenantNetworkIfEmptyFn: func(context.Context, string) (networkRemoval, error) {
 				removals.Add(1)
-				return tenantNetworkRemoved, nil
+				return networkRemoved, nil
 			},
 		}
 		b := newBackendForTest(mock, nil)
@@ -226,11 +226,11 @@ func TestNetworkCleanupRechecksTenantAfterFleetInventory(t *testing.T) {
 }
 
 func TestNetworkCleanupCountsReclamationOutcomes(t *testing.T) {
-	outcomes := map[string]tenantNetworkRemoval{
-		"removed": tenantNetworkRemoved,
-		"absent":  tenantNetworkAbsent,
-		"in_use":  tenantNetworkInUse,
-		"error":   tenantNetworkRemovalUnknown,
+	outcomes := map[string]networkRemoval{
+		"removed": networkRemoved,
+		"absent":  networkAbsent,
+		"in_use":  networkInUse,
+		"error":   networkRemovalUnknown,
 	}
 	before := make(map[string]float64)
 	networks := make([]networktypes.Inspect, 0, len(outcomes)+1)
@@ -240,9 +240,9 @@ func TestNetworkCleanupCountsReclamationOutcomes(t *testing.T) {
 	}
 	mock := &mockDockerClient{
 		ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) { return networks, nil },
-		RemoveTenantNetworkIfEmptyFn: func(_ context.Context, tenant string) (tenantNetworkRemoval, error) {
+		RemoveTenantNetworkIfEmptyFn: func(_ context.Context, tenant string) (networkRemoval, error) {
 			if tenant == "error" {
-				return tenantNetworkRemovalUnknown, errors.New("daemon removal refused")
+				return networkRemovalUnknown, errors.New("daemon removal refused")
 			}
 			outcome, ok := outcomes[tenant]
 			require.True(t, ok, "an owned tenant must never reach the mutation sink")
@@ -265,46 +265,80 @@ func TestNetworkCleanupCountsReclamationOutcomes(t *testing.T) {
 	require.Equal(t, listErrorsBefore+1, testutil.ToFloat64(networkReclamationTotal.WithLabelValues("list_error")))
 }
 
-func TestNetworkCleanupBusyTenantDoesNotBlockShutdownAndRetries(t *testing.T) {
+func TestNetworkCleanupBusyLeaseDoesNotBlockShutdownAndRetries(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
+		const lease = "55555555-5555-4555-8555-555555555555"
 		var removals atomic.Int32
 		mock := &mockDockerClient{
 			ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
-				return []networktypes.Inspect{{Name: TenantNetworkName("tenant-a"), Labels: map[string]string{LabelTenant: "tenant-a"}}}, nil
+				return []networktypes.Inspect{{Name: leaseNetworkName(lease), Labels: leaseNetworkLabels(lease, "")}}, nil
 			},
-			RemoveTenantNetworkIfEmptyFn: func(context.Context, string) (tenantNetworkRemoval, error) {
+			RemoveLeaseNetworkIfEmptyFn: func(context.Context, string) (networkRemoval, error) {
 				removals.Add(1)
-				return tenantNetworkRemoved, nil
+				return networkRemoved, nil
 			},
 		}
 		b := newBackendForTest(mock, nil)
 		b.cfg.ReconcileInterval = time.Minute
 		defer func() { b.stopCancel(); b.wg.Wait() }()
-		stripe := b.tenantNetworkMu("tenant-a")
-		stripe.Lock()
+		// A lifecycle command holds the lease's fence, for example an admission
+		// that has not yet published its provision.
+		unlock := b.commandFence.Lock(lease)
 		locked := true
 		defer func() {
 			if locked {
-				stripe.Unlock()
+				unlock()
 			}
 		}()
-		busyBefore := testutil.ToFloat64(networkReclamationTotal.WithLabelValues("tenant_busy"))
+		busyBefore := testutil.ToFloat64(networkReclamationTotal.WithLabelValues("lease_busy"))
 		b.wg.Go(b.networkCleanupLoop)
 		synctest.Wait()
-		require.Zero(t, removals.Load(), "a busy tenant stripe must never reach the removal sink")
-		require.Equal(t, busyBefore+1, testutil.ToFloat64(networkReclamationTotal.WithLabelValues("tenant_busy")))
-		stripe.Unlock()
+		require.Zero(t, removals.Load(), "a held lease fence must never reach the removal sink")
+		require.Equal(t, busyBefore+1, testutil.ToFloat64(networkReclamationTotal.WithLabelValues("lease_busy")))
+		unlock()
 		locked = false
 		time.Sleep(time.Minute)
 		synctest.Wait()
-		require.Equal(t, int32(1), removals.Load(), "a previously busy tenant remains eligible on the next pass")
-		stripe.Lock()
+		require.Equal(t, int32(1), removals.Load(), "a previously busy lease remains eligible on the next pass")
+		unlock = b.commandFence.Lock(lease)
 		locked = true
 		time.Sleep(time.Minute)
 		synctest.Wait()
-		require.Equal(t, busyBefore+2, testutil.ToFloat64(networkReclamationTotal.WithLabelValues("tenant_busy")))
+		require.Equal(t, busyBefore+2, testutil.ToFloat64(networkReclamationTotal.WithLabelValues("lease_busy")))
 		b.stopCancel()
 		b.wg.Wait()
-		require.Equal(t, int32(1), removals.Load(), "shutdown must drain the network worker while the foreground stripe remains held")
+		require.Equal(t, int32(1), removals.Load(), "shutdown must drain the network worker while the lease fence remains held")
 	})
+}
+
+func TestNetworkCleanupKeepsTrackedLeaseNetworkAndRemovesOrphan(t *testing.T) {
+	const (
+		tracked = "66666666-6666-4666-8666-666666666666"
+		orphan  = "77777777-7777-4777-8777-777777777777"
+	)
+	var removed []string
+	mock := &mockDockerClient{
+		ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
+			return []networktypes.Inspect{
+				{Name: leaseNetworkName(tracked), Labels: leaseNetworkLabels(tracked, "")},
+				{Name: leaseNetworkName(orphan), Labels: leaseNetworkLabels(orphan, "")},
+				// A lease network with a container attached is never a candidate.
+				{Name: "attached", Labels: leaseNetworkLabels(orphan, ""), Containers: map[string]networktypes.EndpointResource{"c": {}}},
+				// A lease-scoped network without a lease label names no owner to check.
+				{Name: "unowned", Labels: map[string]string{LabelManaged: "true", LabelNetworkScope: networkScopeLease}},
+			}, nil
+		},
+		RemoveLeaseNetworkIfEmptyFn: func(_ context.Context, lease string) (networkRemoval, error) {
+			removed = append(removed, lease)
+			return networkRemoved, nil
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		tracked: {ProvisionState: leasesm.ProvisionState{LeaseUUID: tracked, Tenant: "tenant-a", Status: backend.ProvisionStatusReady}},
+	})
+	defer b.stopCancel()
+	activeBefore := testutil.ToFloat64(networkReclamationTotal.WithLabelValues("lease_active"))
+	b.cleanupOrphanedNetworks(t.Context())
+	require.Equal(t, []string{orphan}, removed, "only an untracked lease's idle network is removed")
+	require.Equal(t, activeBefore+1, testutil.ToFloat64(networkReclamationTotal.WithLabelValues("lease_active")))
 }

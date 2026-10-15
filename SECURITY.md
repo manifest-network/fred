@@ -675,7 +675,7 @@ Every container created by the Docker backend runs with these security measures:
 | Per-volume disk quota | `bhard` block limit (xfs project quota / btrfs qgroup) | Enforces the SKU `disk_mb` cap on stateful volumes; requires the daemon capability noted below |
 | Per-volume inode quota | `ihard` limit (xfs project quota) | Bounds host inode exhaustion from zero-byte file floods; same `xfs_quota` call and `CAP_SYS_ADMIN` requirement as the disk quota above (ENG-548) |
 | Restart policy disabled | `RestartPolicyDisabled` | Failed containers stay dead for crash detection |
-| Network isolation | Per-tenant bridge network | Configurable via `network_isolation` |
+| Network isolation | Per-lease bridge network; leases of the same tenant cannot reach each other | Configurable via `network_isolation` |
 
 Network isolation places each tenant's containers in a dedicated Docker bridge network. Docker's `DOCKER-ISOLATION` iptables chains drop forwarded traffic between different bridge networks, preventing cross-tenant communication.
 

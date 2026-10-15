@@ -99,7 +99,7 @@ func TestIntegration_Docker_ReservedImageLabelsRejectedBeforeContainerCreation(t
 			params := baseProjectParams()
 			params.LeaseUUID = uuid.NewString()
 			params.Stack.Services["web"].Image = tag
-			params.NetworkName = ""
+			params.Networking = leaseNetworkingNone
 			desired := buildTestComposeProject(t, params)
 			evidence := make(map[string]imageexec.Image, len(desired.Services))
 			for name := range desired.Services {
@@ -196,7 +196,7 @@ func TestIntegration_Docker_ImmutableImageBindingSurvivesTagMovement(t *testing.
 	params.ImageSetups["web"].Image = admitted
 	params.BackendName = "image-security"
 	docker.backendName = "image-security"
-	params.NetworkName = ""
+	params.Networking = leaseNetworkingNone
 	compose, err := newComposeService(sdk.DaemonHost(), docker.images, docker.tenantSeccomp)
 	require.NoError(t, err)
 	desired := buildTestComposeProject(t, params)

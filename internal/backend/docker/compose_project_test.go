@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/compose/v5/pkg/compose"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -43,8 +45,8 @@ func baseProjectParams() composeProjectParams {
 		ImageSetups: map[string]*imageSetup{
 			"web": {},
 		},
-		NetworkName: "fred-tenant-abc123",
-		Cfg:         testConfig(),
+		Networking: leaseNetworkingIsolated,
+		Cfg:        testConfig(),
 	}
 }
 
@@ -429,8 +431,8 @@ func TestBuildComposeProject_FanOutDNSAlias(t *testing.T) {
 
 	for _, svcName := range []string{"web-0", "web-1"} {
 		svc := project.Services[svcName]
-		require.NotNil(t, svc.Networks["default"], "service %s should have default network config", svcName)
-		assert.Contains(t, svc.Networks["default"].Aliases, "web",
+		require.NotNil(t, svc.Networks[leaseNetworkKey], "service %s should have lease network config", svcName)
+		assert.Contains(t, svc.Networks[leaseNetworkKey].Aliases, "web",
 			"service %s should have 'web' as DNS alias", svcName)
 	}
 }
@@ -448,31 +450,91 @@ func TestBuildComposeProject_ContainerNaming(t *testing.T) {
 	assert.Equal(t, "fred-lease-1-web-1", project.Services["web-1"].ContainerName)
 }
 
-func TestBuildComposeProject_ExternalNetwork(t *testing.T) {
+func TestBuildComposeProject_LeaseOwnedNetwork(t *testing.T) {
 	params := baseProjectParams()
-	params.NetworkName = "fred-tenant-abc123"
+	params.BackendName = "docker-a"
 
 	project := buildTestComposeProject(t, params)
 
-	require.Contains(t, project.Networks, "default")
-	net := project.Networks["default"]
-	assert.Equal(t, "fred-tenant-abc123", net.Name)
-	assert.True(t, bool(net.External))
+	// The only network is the lease's own, owned (created and removed) by
+	// Compose rather than shared with other leases of the tenant.
+	require.Len(t, project.Networks, 1)
+	require.Contains(t, project.Networks, leaseNetworkKey)
+	net := project.Networks[leaseNetworkKey]
+	assert.Equal(t, "fred-lease-1", net.Name)
+	assert.Equal(t, "bridge", net.Driver)
+	assert.False(t, bool(net.External), "Compose must own the lease network so Down removes it")
+	assert.Equal(t, map[string]string{
+		LabelManaged:      "true",
+		LabelLeaseUUID:    "lease-1",
+		LabelBackendName:  "docker-a",
+		LabelNetworkScope: networkScopeLease,
+	}, map[string]string(net.Labels))
+	assert.NotContains(t, net.Labels, LabelTenant, "the tenant network sweep must never select a lease network")
 }
 
-func TestBuildComposeProject_NoExtraNetworks(t *testing.T) {
+func TestBuildComposeProject_TenantLeasesGetDistinctNetworks(t *testing.T) {
+	first := baseProjectParams()
+	second := baseProjectParams()
+	second.LeaseUUID = "lease-2"
+	require.Equal(t, first.Tenant, second.Tenant)
+
+	a := buildTestComposeProject(t, first)
+	b := buildTestComposeProject(t, second)
+
+	assert.NotEqual(t, a.Networks[leaseNetworkKey].Name, b.Networks[leaseNetworkKey].Name,
+		"two leases of one tenant must not share the network their service aliases live on")
+}
+
+func TestBuildComposeProject_StackServicesShareTheirLeaseNetwork(t *testing.T) {
 	params := baseProjectParams()
+	params.Stack = &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+		"web": {Image: "nginx:latest", DependsOn: map[string]manifest.DependsOnCondition{
+			"db": {Condition: "service_started"},
+		}},
+		"db": {Image: "postgres:16"},
+	}}
+	params.Items = []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 2, ServiceName: "web"},
+		{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+	}
+	params.ImageSetups = map[string]*imageSetup{"web": {}, "db": {}}
 
 	project := buildTestComposeProject(t, params)
 
-	// Only "default" network should be present.
-	assert.Len(t, project.Networks, 1)
-	assert.Contains(t, project.Networks, "default")
+	// Every service of the stack, fan-out instances included, joins the one
+	// lease network under its bare service name, so "web" reaches "db:5432".
+	for composeName, alias := range map[string]string{"web-0": "web", "web-1": "web", "db": "db"} {
+		svc, ok := project.Services[composeName]
+		require.True(t, ok, composeName)
+		require.Len(t, svc.Networks, 1, composeName)
+		require.NotNil(t, svc.Networks[leaseNetworkKey], composeName)
+		assert.Equal(t, []string{alias}, svc.Networks[leaseNetworkKey].Aliases, composeName)
+	}
+}
+
+func TestBuildComposeProject_LeaseNetworkChangesEveryServiceHash(t *testing.T) {
+	// A service with no ingress label has no other configuration that names
+	// the network. Its Compose hash must still change when a lease moves off
+	// its tenant network, or a stopped container of that service would be
+	// restarted in place on the old network instead of recreated.
+	params := baseProjectParams()
+	project := buildTestComposeProject(t, params)
+	current := project.Services["web"]
+	legacy := current
+	legacy.Networks = map[string]*composetypes.ServiceNetworkConfig{
+		"default": {Aliases: []string{"web"}},
+	}
+	currentHash, err := compose.ServiceHash(current)
+	require.NoError(t, err)
+	legacyHash, err := compose.ServiceHash(legacy)
+	require.NoError(t, err)
+	assert.NotEqual(t, legacyHash, currentHash)
 }
 
 func TestBuildComposeProject_NoNetworkWhenIsolationDisabled(t *testing.T) {
 	params := baseProjectParams()
-	params.NetworkName = ""
+	params.Networking = leaseNetworkingNone
 
 	project := buildTestComposeProject(t, params)
 
@@ -807,18 +869,18 @@ func TestBuildComposeProject_IngressEnabled(t *testing.T) {
 
 		project := buildTestComposeProject(t, params)
 
-		// Project should only have the "default" (tenant) network — no shared ingress network.
-		require.Contains(t, project.Networks, "default")
+		// Project should only have the lease network — no shared ingress network.
+		require.Contains(t, project.Networks, leaseNetworkKey)
 		assert.NotContains(t, project.Networks, "ingress")
 
-		// Service should only be on the default network.
+		// Service should only be on the lease network.
 		svc := project.Services["web"]
-		require.NotNil(t, svc.Networks["default"])
+		require.NotNil(t, svc.Networks[leaseNetworkKey])
 		assert.Nil(t, svc.Networks["ingress"])
 
-		// Traefik labels should point to the tenant network.
+		// Traefik labels should point to the lease network.
 		assert.Equal(t, "true", svc.Labels["traefik.enable"])
-		assert.Equal(t, params.NetworkName, svc.Labels["traefik.docker.network"])
+		assert.Equal(t, leaseNetworkName(params.LeaseUUID), svc.Labels["traefik.docker.network"])
 		assert.NotEmpty(t, svc.Labels[LabelFQDN])
 		assert.Contains(t, svc.Labels[LabelFQDN], "barney8.manifest0.net")
 

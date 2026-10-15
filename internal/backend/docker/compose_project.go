@@ -17,6 +17,20 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
+// leaseNetworking selects whether a lease's containers join their own bridge
+// network. No value names another network: the only network a lease can join
+// is the one derived from its own UUID, so one lease can never be attached to
+// a network another lease shares.
+type leaseNetworking uint8
+
+const (
+	// leaseNetworkingNone leaves containers on Docker's default bridge
+	// (network_isolation disabled).
+	leaseNetworkingNone leaseNetworking = iota
+	// leaseNetworkingIsolated gives the lease its own Compose-owned network.
+	leaseNetworkingIsolated
+)
+
 // composeProjectParams holds all inputs for building a Compose project.
 type composeProjectParams struct {
 	LeaseUUID            string
@@ -31,7 +45,7 @@ type composeProjectParams struct {
 	Items                []backend.LeaseItem
 	Profiles             map[string]SKUProfile
 	ImageSetups          map[string]*imageSetup
-	NetworkName          string                             // pre-created tenant network name (empty if isolation disabled)
+	Networking           leaseNetworking
 	VolBinds             map[string]map[int]serviceVolBinds // svc → instance → binds
 	Cfg                  *Config
 	Ingress              IngressConfig
@@ -43,12 +57,23 @@ type serviceVolBinds struct {
 	WritableBinds map[string]string // hostPath → containerPath
 }
 
+// leaseNetworkKey is the project and service key of the lease network. It is
+// not Compose's implicit "default": Compose hashes each service's network map,
+// so the key change makes the first Up after an upgrade recreate every service
+// of a lease that still runs on its tenant network, including a stopped one
+// that a network-attachment check alone would restart in place.
+const leaseNetworkKey = "lease"
+
 // buildPlannedComposeProject generates a compose-go Project from the parameters
 // and the exact ingress decision that owns emitted item metadata.
 // The project is fully in-memory — no YAML files or project directories.
 func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIngressPlan) *composetypes.Project {
 	projectName := composeProjectName(params.LeaseUUID)
 	services := make(composetypes.Services)
+	var networkName string
+	if params.Networking == leaseNetworkingIsolated {
+		networkName = leaseNetworkName(params.LeaseUUID)
+	}
 
 	for _, item := range ingress.items {
 		svcName := item.ServiceName
@@ -74,7 +99,7 @@ func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIn
 				Manifest:             svc,
 				Profile:              profile,
 				ImgSetup:             imgSetup,
-				NetworkName:          params.NetworkName,
+				NetworkName:          networkName,
 				Cfg:                  params.Cfg,
 				Ingress:              ingress.routes[svcName],
 				Quantity:             item.Quantity,
@@ -131,9 +156,11 @@ func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIn
 			svcConfig.ContainerName = fmt.Sprintf("fred-%s-%s-%d", params.LeaseUUID, svcName, i)
 
 			// Set network alias so all instances of the same service share the base name.
-			if params.NetworkName != "" {
+			// The alias lives on the lease's own network, so it resolves only to
+			// this lease's containers.
+			if networkName != "" {
 				svcConfig.Networks = map[string]*composetypes.ServiceNetworkConfig{
-					"default": {
+					leaseNetworkKey: {
 						Aliases: []string{svcName},
 					},
 				}
@@ -151,12 +178,14 @@ func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIn
 		Services: services,
 	}
 
-	// External network configuration.
-	if params.NetworkName != "" {
+	// The lease's own bridge network. Compose creates it on Up and removes it
+	// on Down, so it lives exactly as long as the lease's containers.
+	if networkName != "" {
 		project.Networks = composetypes.Networks{
-			"default": composetypes.NetworkConfig{
-				Name:     params.NetworkName,
-				External: true,
+			leaseNetworkKey: composetypes.NetworkConfig{
+				Name:   networkName,
+				Driver: "bridge",
+				Labels: leaseNetworkLabels(params.LeaseUUID, params.BackendName),
 			},
 		}
 	}

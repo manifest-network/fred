@@ -172,9 +172,10 @@ type Config struct {
 	// Defaults to "0.0.0.0" (all interfaces).
 	HostBindIP string `yaml:"host_bind_ip"`
 
-	// NetworkIsolation enables per-tenant Docker network isolation.
-	// When true, each tenant's containers are placed in a separate bridge network.
-	// Provides inter-tenant isolation. The network is created with Internal:false
+	// NetworkIsolation enables per-lease Docker network isolation.
+	// When true, each lease's containers are placed in the lease's own bridge
+	// network, isolated from every other lease, including leases of the same
+	// tenant. The network is created with Internal:false
 	// — required for port publishing (moby#36174) — so containers retain outbound
 	// internet access as a side effect. Defaults to true.
 	NetworkIsolation *bool `yaml:"network_isolation"`
@@ -333,7 +334,7 @@ type Config struct {
 
 	// Ingress configures optional reverse proxy integration.
 	// When enabled, containers with routable TCP ports get proxy labels
-	// pointing Traefik at the per-tenant network for HTTPS auto-discovery.
+	// pointing Traefik at the lease's own network for HTTPS auto-discovery.
 	// Requires network_isolation to be enabled.
 	Ingress IngressConfig `yaml:"ingress"`
 }
@@ -374,7 +375,7 @@ func (c *Config) GetHostBindIP() string {
 	return "0.0.0.0"
 }
 
-// IsNetworkIsolation returns whether per-tenant network isolation is enabled.
+// IsNetworkIsolation returns whether per-lease network isolation is enabled.
 // Defaults to true (secure by default).
 func (c *Config) IsNetworkIsolation() bool {
 	if c.NetworkIsolation != nil {

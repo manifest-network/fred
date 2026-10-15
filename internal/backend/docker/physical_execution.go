@@ -200,11 +200,11 @@ func (b *Backend) operationAbsenceObservationIsTerminal(
 // one retained->canonical rename therefore stays ambiguous until recovery
 // rolls the adoption back or completes it.
 //
-// Tenant networks are intentionally outside this operation-owned absence
-// proof. They are shared, idempotent infrastructure for every lease of the
-// tenant, carry no operation generation, and are removed only by the separate
-// remove-if-empty lifecycle path. Creating one is nevertheless a Step: an
-// uncertain Docker result still makes the current execution ambiguous.
+// Networks are intentionally outside this operation-owned absence proof. A
+// lease network holds no data and carries no operation generation: Compose
+// creates it as part of Up, Compose Down removes it, and the separate
+// remove-if-empty lifecycle path reclaims one left behind. Legacy tenant
+// networks are likewise removed only by that path.
 func (b *Backend) operationStorageExactlyAbsent(
 	ctx context.Context,
 	subject shared.OperationPhysicalSubject,
@@ -771,13 +771,6 @@ func (b *Backend) doReplacePhysical(
 	}
 	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseImageSetup).
 		Observe(time.Since(imageSetupStartedAt).Seconds())
-	var networkName string
-	if b.cfg.IsNetworkIsolation() {
-		if err := b.ensureTenantNetworkWith(mutations, ctx, mutations.tenant); err != nil {
-			return fmt.Errorf("ensure %s tenant network: %w", op.Operation, err)
-		}
-		networkName = TenantNetworkName(mutations.tenant)
-	}
 	b.provisionsMu.RLock()
 	failCount := 0
 	if provision := b.provisions[op.LeaseUUID]; provision != nil {
@@ -789,7 +782,7 @@ func (b *Backend) doReplacePhysical(
 		CallbackURL: mutations.callbackURL, LifecycleCallbackURL: mutations.lifecycleURL,
 		MaintenanceID: op.TargetMaintenanceID, BackendName: b.cfg.Name, FailCount: failCount,
 		Stack: op.Stack, Items: op.Items, Profiles: profiles, ImageSetups: imageSetups,
-		NetworkName: networkName, Cfg: &b.cfg, Ingress: b.cfg.Ingress,
+		Networking: b.leaseNetworking(), Cfg: &b.cfg, Ingress: b.cfg.Ingress,
 	}
 	_, composeUpErr := b.launchCompose(ctx, mutations, params, op.ResourceProfiles, composeUpOpts{ForceRecreate: op.Operation == "restart"})
 	if composeUpErr != nil {

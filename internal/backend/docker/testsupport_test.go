@@ -2448,12 +2448,6 @@ type fakeDocker struct {
 	containers []ContainerInfo             // returned by ListManagedContainers
 	mounts     map[string][]ContainerMount // containerID → mounts (test-only)
 
-	// EnsureTenantNetwork hook. Default is a silent-success no-op so tests
-	// that flip cfg.NetworkIsolation on (e.g. the migration-network test)
-	// don't have to wire the mock directly. Tests that need to *capture*
-	// the call can override this with a closure.
-	ensureTenantNetwork func(ctx context.Context, tenant string) (string, error)
-
 	// RemoveContainer hook. Default (nil) is silent success. Tests that need
 	// to *capture* removals (e.g. the -prev grace-cleanup test) override this.
 	removeContainer func(ctx context.Context, name string) error
@@ -2722,15 +2716,6 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 				return state.removeContainer(ctx, name)
 			}
 			return nil
-		},
-		EnsureTenantNetworkFn: func(ctx context.Context, tenant string) (string, error) {
-			if state.ensureTenantNetwork != nil {
-				return state.ensureTenantNetwork(ctx, tenant)
-			}
-			// Default: silent success. Mirrors production's idempotency:
-			// a network create on an existing network returns the existing
-			// ID without error.
-			return "net-id-" + tenant, nil
 		},
 		// The independent network sweep runs when isolation is enabled.
 		// Default to a clean network list so migration tests

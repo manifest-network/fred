@@ -271,7 +271,7 @@ func rawSubstrateMethod(name string) bool {
 	switch name {
 	case "PullImage", "AdmitImage", "ResolveImageUser", "CreateContainer", "StartContainer",
 		"createCompensationContainer", "startCompensationContainer", "launch",
-		"StopContainer", "RenameContainer", "RemoveContainer", "EnsureTenantNetwork",
+		"StopContainer", "RenameContainer", "RemoveContainer", "RemoveLeaseNetworkIfEmpty",
 		"RemoveTenantNetworkIfEmpty", "DetectVolumeOwner", "DetectWritablePaths",
 		"ExtractImageContent", "EnsureQuota", "RenameVolume", "Up", "Down":
 		return true

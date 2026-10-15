@@ -1046,18 +1046,6 @@ func (b *Backend) doProvisionPhysical(
 		return
 	}
 
-	// Resolve tenant network name (not Docker network ID — Compose needs the name).
-	var networkName string
-	if b.cfg.IsNetworkIsolation() {
-		netErr := b.ensureTenantNetworkWith(mutations, ctx, req.Tenant)
-		if netErr != nil {
-			logger.Error("failed to create tenant network", "error", netErr)
-			failure = &physicalOperationError{callback: "tenant network setup failed", reason: backend.ReasonInternal, cause: netErr}
-			return
-		}
-		networkName = TenantNetworkName(req.Tenant)
-	}
-
 	// Pre-create volumes and build volume binds per service/instance.
 	b.provisionsMu.RLock()
 	failCount := 0
@@ -1079,7 +1067,7 @@ func (b *Backend) doProvisionPhysical(
 		Items:                req.Items,
 		Profiles:             profiles,
 		ImageSetups:          imageSetups,
-		NetworkName:          networkName,
+		Networking:           b.leaseNetworking(),
 		Cfg:                  &b.cfg,
 		Ingress:              b.cfg.Ingress,
 	}

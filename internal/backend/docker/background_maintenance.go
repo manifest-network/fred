@@ -116,7 +116,8 @@ func (c *backgroundMaintenanceCoordinator) runRetentionSweep(ctx context.Context
 type backgroundVolumeRename func(context.Context, string, string) error
 type backgroundVolumeQuota func(context.Context, string, int64) (volumeQuotaOutcome, error)
 type backgroundContainerRemove func(context.Context, string) error
-type backgroundTenantNetworkRemove func(context.Context, string) (tenantNetworkRemoval, error)
+type backgroundTenantNetworkRemove func(context.Context, string) (networkRemoval, error)
+type backgroundLeaseNetworkRemove func(context.Context, string) (networkRemoval, error)
 
 // backgroundHeldVolumeDeleteRetry retries one held deletion through the
 // storage-mutation bracket. Only the hold executor's pass receives one.

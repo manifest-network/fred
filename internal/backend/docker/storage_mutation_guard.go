@@ -149,11 +149,20 @@ func newBackgroundMaintenanceCoordinator(
 		},
 		removeFn: removeContainer,
 	}
-	removeTenantNetwork := backgroundTenantNetworkRemove(func(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
-		var outcome tenantNetworkRemoval
+	removeTenantNetwork := backgroundTenantNetworkRemove(func(ctx context.Context, tenant string) (networkRemoval, error) {
+		var outcome networkRemoval
 		err := perform(ctx, "background remove tenant network", func(ctx context.Context) error {
 			var err error
 			outcome, err = ops.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
+			return err
+		})
+		return outcome, err
+	})
+	removeLeaseNetwork := backgroundLeaseNetworkRemove(func(ctx context.Context, leaseUUID string) (networkRemoval, error) {
+		var outcome networkRemoval
+		err := perform(ctx, "background remove lease network", func(ctx context.Context) error {
+			var err error
+			outcome, err = ops.docker.RemoveLeaseNetworkIfEmpty(ctx, leaseUUID)
 			return err
 		})
 		return outcome, err
@@ -184,7 +193,7 @@ func newBackgroundMaintenanceCoordinator(
 			if ctx.Err() != nil {
 				return
 			}
-			backend.cleanupOrphanedNetworksUsing(ctx, removeTenantNetwork)
+			backend.cleanupOrphanedNetworksUsing(ctx, removeTenantNetwork, removeLeaseNetwork)
 		},
 		reapExpiredRetentionsFn: func(ctx context.Context) (int, error) {
 			return backend.reapExpiredRetentionsUsing(ctx, destroyVolumes)
@@ -481,17 +490,6 @@ func (m *storageMutations) removeContainer(ctx context.Context, id string) error
 	return m.runner.Step(ctx, "remove container", func(ctx context.Context) error {
 		return m.ops.docker.RemoveContainer(ctx, id)
 	})
-}
-
-func (m *storageMutations) ensureTenantNetwork(ctx context.Context, tenant string) (networkID string, err error) {
-	if m == nil || tenant == "" || tenant != m.tenant {
-		return "", fmt.Errorf("tenant network target %q differs from Started subject", tenant)
-	}
-	err = m.runner.Step(ctx, "ensure tenant network", func(ctx context.Context) error {
-		networkID, err = m.ops.docker.EnsureTenantNetwork(ctx, tenant)
-		return err
-	})
-	return networkID, err
 }
 
 func (m *storageMutations) createVolume(ctx context.Context, id string, sizeMB int64) (path string, created bool, err error) {

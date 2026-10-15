@@ -480,6 +480,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- `fred_docker_backend_network_reclamation_total{outcome}` gains
+  `lease_active` and `lease_busy` for per-lease networks; `tenant_busy` is no
+  longer emitted, because nothing creates tenant networks any more. Size
+  Docker's address pools for active leases rather than active tenants.
 - The tenant-visible failure reasons of a provision changed (ENG-1125). Two
   reasons are new, and neither ever counts toward the terminal failure
   budget: `HealthCheckFailed`, a container's health check never passed during
@@ -2217,6 +2221,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- docker-backend: every lease now runs on its own Docker network, `fred-<lease_uuid>`,
+  instead of one network shared by all leases of a tenant. On the shared
+  network each service name resolved to that service in every lease of the
+  tenant, so two leases running the same stack answered each other's `db`, and
+  any lease could reach another by address or container name. A tenant that
+  hosts several customers under one address therefore exposed those customers
+  to each other. Service names now resolve only within the lease, and leases
+  cannot reach each other, including leases of the same tenant. The lease's
+  Compose project owns the network: Compose creates it on Up and removes it
+  on Down, and the network worker reclaims one that a failed Down left behind,
+  only once the backend tracks no provision for the lease and no command holds
+  its fence. Fred no longer creates per-tenant networks. A running lease
+  stays on its tenant network until its containers are next recreated
+  (restart, update, custom-domain change, restore or re-provision); that
+  recreate moves every service of the lease, including stopped ones.
 - deps: build with Go 1.26.9 (from 1.26.8) and bump `golang.org/x/net` to
   v0.60.0 (from v0.58.0). This resolves twelve advisories that Fred's code
   reaches:
