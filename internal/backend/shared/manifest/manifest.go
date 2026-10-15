@@ -779,6 +779,9 @@ func (s *StackManifest) Validate() error {
 	if err := s.ValidateStored(); err != nil {
 		return err
 	}
+	if err := s.validateDependsOnDepth(); err != nil {
+		return err
+	}
 	for name, svc := range s.Services {
 		if err := svc.ValidateInStack(); err != nil {
 			return fmt.Errorf("service %q: %w", name, err)
@@ -823,15 +826,19 @@ func (s *StackManifest) ValidateStored() error {
 	return nil
 }
 
-// dependsOnMaxDepth is the maximum dependency chain depth for cycle detection.
+// dependsOnMaxDepth is the maximum number of links in a depends_on chain that
+// tenant admission accepts.
 const dependsOnMaxDepth = 10
 
-// validateDependsOn checks cross-service dependency constraints:
+// validateDependsOn checks the cross-service dependency constraints recovery
+// relies on:
 // - Referenced services must exist in the stack.
 // - No self-dependencies.
 // - Only "service_started" and "service_healthy" conditions allowed.
 // - "service_healthy" requires the referenced service to have an active health check.
-// - No cycles (DFS with max depth 10).
+// - No cycles.
+//
+// The chain-length limit is admission policy, so Validate applies it separately.
 func (s *StackManifest) validateDependsOn() error {
 	for name, svc := range s.Services {
 		for dep, cond := range svc.DependsOn {
@@ -869,8 +876,8 @@ func (s *StackManifest) validateDependsOn() error {
 }
 
 // detectDependsOnCycles performs DFS-based cycle detection across the
-// depends_on graph. Returns an error if any cycle is found or if the
-// dependency chain exceeds dependsOnMaxDepth.
+// depends_on graph. Services and their dependencies are visited in sorted
+// order, so the same manifest always names the same service in the error.
 func (s *StackManifest) detectDependsOnCycles() error {
 	const (
 		white = 0 // unvisited
@@ -880,22 +887,19 @@ func (s *StackManifest) detectDependsOnCycles() error {
 
 	color := make(map[string]int, len(s.Services))
 
-	var dfs func(name string, depth int) error
-	dfs = func(name string, depth int) error {
-		if depth > dependsOnMaxDepth {
-			return fmt.Errorf("depends_on: dependency chain exceeds maximum depth of %d", dependsOnMaxDepth)
-		}
+	var dfs func(name string) error
+	dfs = func(name string) error {
 		color[name] = gray
 		svc := s.Services[name]
 		if svc == nil {
 			return nil
 		}
-		for dep := range svc.DependsOn {
+		for _, dep := range slices.Sorted(maps.Keys(svc.DependsOn)) {
 			switch color[dep] {
 			case gray:
 				return fmt.Errorf("depends_on: cycle detected involving service %q", dep)
 			case white:
-				if err := dfs(dep, depth+1); err != nil {
+				if err := dfs(dep); err != nil {
 					return err
 				}
 			}
@@ -904,11 +908,40 @@ func (s *StackManifest) detectDependsOnCycles() error {
 		return nil
 	}
 
-	for name := range s.Services {
+	for _, name := range slices.Sorted(maps.Keys(s.Services)) {
 		if color[name] == white {
-			if err := dfs(name, 0); err != nil {
+			if err := dfs(name); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+// validateDependsOnDepth rejects a stack whose longest depends_on chain has
+// more than dependsOnMaxDepth links. The length of a service's chain is
+// memoized, so the result does not depend on the order services are visited.
+// It requires an acyclic graph, so callers run validateDependsOn first.
+func (s *StackManifest) validateDependsOnDepth() error {
+	links := make(map[string]int, len(s.Services))
+	var longest func(name string) int
+	longest = func(name string) int {
+		if n, done := links[name]; done {
+			return n
+		}
+		n := 0
+		if svc := s.Services[name]; svc != nil {
+			for dep := range svc.DependsOn {
+				n = max(n, longest(dep)+1)
+			}
+		}
+		links[name] = n
+		return n
+	}
+	for _, name := range slices.Sorted(maps.Keys(s.Services)) {
+		if n := longest(name); n > dependsOnMaxDepth {
+			return fmt.Errorf("depends_on: dependency chain exceeds maximum depth of %d (service %q starts a chain of %d links)",
+				dependsOnMaxDepth, name, n)
 		}
 	}
 	return nil

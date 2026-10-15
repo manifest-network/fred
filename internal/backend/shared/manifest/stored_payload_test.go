@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -23,6 +24,22 @@ func TestStoredPayloadSeparatesAdmissionPolicy(t *testing.T) {
 	}
 }
 
+func TestStoredPayloadDoesNotReapplyDependsOnDepth(t *testing.T) {
+	// A stored manifest is re-validated when the backend opens its stores, on
+	// every /health probe, in recovery, close and maintenance. The chain-length
+	// limit is admission policy: re-checking it there let one tenant's history
+	// fail those paths (ENG-1515).
+	chain := dependsOnChain(20)
+	payload, err := json.Marshal(chain)
+	require.NoError(t, err)
+	for range 200 {
+		_, err := ParsePayload(payload)
+		require.ErrorContains(t, err, "dependency chain exceeds maximum depth", "tenant admission keeps the limit")
+		_, err = ParseStoredPayload(payload)
+		require.NoError(t, err, "stored history must not reapply the admission chain limit")
+	}
+}
+
 func TestStoredPayloadRejectsCorruptRecoveryTopology(t *testing.T) {
 	for _, payload := range []string{
 		``, `{`, `null`, `{"services":{}}`, `{"services":{"web":null}}`,
@@ -31,6 +48,7 @@ func TestStoredPayloadRejectsCorruptRecoveryTopology(t *testing.T) {
 		`{"image":"nginx","depends_on":{"peer":{"condition":"service_started"}}}`,
 		`{"services":{"web":{"image":"nginx","depends_on":{"missing":{"condition":"service_started"}}}}}`,
 		`{"services":{"web":{"image":"nginx","depends_on":{"web":{"condition":"service_started"}}}}}`,
+		`{"services":{"a":{"image":"nginx","depends_on":{"b":{"condition":"service_started"}}},"b":{"image":"nginx","depends_on":{"a":{"condition":"service_started"}}}}}`,
 	} {
 		t.Run(payload, func(t *testing.T) {
 			_, err := ParseStoredPayload([]byte(payload))
