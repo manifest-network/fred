@@ -2436,9 +2436,12 @@ func (b *Backend) cleanupOrphanedNetworksUsing(
 			err     error
 			scope   string
 		)
-		if lease := n.Labels[LabelLeaseUUID]; n.Labels[LabelNetworkScope] == networkScopeLease && lease != "" {
+		if n.Labels[LabelNetworkScope] == networkScopeLease {
 			scope = "lease"
-			outcome, err = b.removeOrphanedLeaseNetworkUsing(ctx, lease, removeLeaseNetwork)
+			var authority leaseNetworkAuthority
+			if authority, err = leaseNetworkCandidate(n, b.cfg.Name); err == nil {
+				outcome, err = b.removeOrphanedLeaseNetworkUsing(ctx, authority, removeLeaseNetwork)
+			}
 		} else if tenant := n.Labels[LabelTenant]; tenant != "" {
 			scope = "tenant"
 			outcome, err = b.removeOrphanedTenantNetworkUsing(ctx, tenant, removeTenantNetwork)

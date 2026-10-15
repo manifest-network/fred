@@ -242,7 +242,9 @@ type mockDockerClient struct {
 	StartCompensationOutcomeFn    func(context.Context, string, time.Duration) daemonLaunchOutcome
 	ReadmitCompensationImageFn    func(context.Context, compensationContainerRecord) (imageexec.Image, error)
 	RemoveTenantNetworkIfEmptyFn  func(ctx context.Context, tenant string) (networkRemoval, error)
-	RemoveLeaseNetworkIfEmptyFn   func(ctx context.Context, leaseUUID string) (networkRemoval, error)
+	InspectLeaseNetworkFn         func(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, bool, error)
+	CreateLeaseNetworkFn          func(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, error)
+	RemoveLeaseNetworkIfEmptyFn   func(ctx context.Context, authority leaseNetworkAuthority) (networkRemoval, error)
 	ListIdleManagedNetworksFn     func(ctx context.Context) ([]networktypes.Inspect, error)
 	ResolveImageUserFn            func(ctx context.Context, imageName string, userOverride string) (int, int, error)
 	DetectVolumeOwnerFn           func(ctx context.Context, imageName string, volumePaths []string) (int, int, error)
@@ -383,9 +385,23 @@ func (m *mockDockerClient) ListManagedContainersStrict(ctx context.Context) ([]C
 	panic("unexpected call to ListManagedContainersStrict")
 }
 
-func (m *mockDockerClient) RemoveLeaseNetworkIfEmpty(ctx context.Context, leaseUUID string) (networkRemoval, error) {
+func (m *mockDockerClient) InspectLeaseNetwork(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, bool, error) {
+	if m.InspectLeaseNetworkFn != nil {
+		return m.InspectLeaseNetworkFn(ctx, leaseUUID)
+	}
+	panic("unexpected call to InspectLeaseNetwork")
+}
+
+func (m *mockDockerClient) CreateLeaseNetwork(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, error) {
+	if m.CreateLeaseNetworkFn != nil {
+		return m.CreateLeaseNetworkFn(ctx, leaseUUID)
+	}
+	panic("unexpected call to CreateLeaseNetwork")
+}
+
+func (m *mockDockerClient) RemoveLeaseNetworkIfEmpty(ctx context.Context, authority leaseNetworkAuthority) (networkRemoval, error) {
 	if m.RemoveLeaseNetworkIfEmptyFn != nil {
-		return m.RemoveLeaseNetworkIfEmptyFn(ctx, leaseUUID)
+		return m.RemoveLeaseNetworkIfEmptyFn(ctx, authority)
 	}
 	panic("unexpected call to RemoveLeaseNetworkIfEmpty")
 }

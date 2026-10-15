@@ -1197,11 +1197,19 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	}))
 	defer callbackServer.Close()
 
-	// No Docker network call is wired: Fred no longer creates a network
-	// itself. Compose creates the lease's own network from the project.
+	// The launch creates or verifies the lease's own network through the
+	// guarded client, then attaches to it by its verified ID.
+	ensured := 0
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
+		},
+		InspectLeaseNetworkFn: func(context.Context, string) (leaseNetworkAuthority, bool, error) {
+			return leaseNetworkAuthority{}, false, nil
+		},
+		CreateLeaseNetworkFn: func(_ context.Context, leaseUUID string) (leaseNetworkAuthority, error) {
+			ensured++
+			return testLeaseNetworkAuthority(leaseUUID, "docker"), nil
 		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
@@ -1234,9 +1242,11 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	b.doProvisionAndFire(t, context.Background(), req, manifest, profiles, b.logger)
 
 	require.NotNil(t, launched)
+	require.Equal(t, 1, ensured)
 	require.Contains(t, launched.Networks, leaseNetworkKey)
-	assert.Equal(t, leaseNetworkName(durableCallbackTestLeaseUUID), launched.Networks[leaseNetworkKey].Name)
-	assert.False(t, bool(launched.Networks[leaseNetworkKey].External))
+	assert.Equal(t, testLeaseNetworkID(durableCallbackTestLeaseUUID), launched.Networks[leaseNetworkKey].Name,
+		"the project names the lease network by its verified ID")
+	assert.True(t, bool(launched.Networks[leaseNetworkKey].External), "Compose must neither create nor remove it")
 	for name, svc := range launched.Services {
 		require.Contains(t, svc.Networks, leaseNetworkKey, name)
 	}
@@ -1492,24 +1502,22 @@ func TestDeprovision_Idempotent(t *testing.T) {
 }
 
 func TestDeprovision_WithNetworkIsolation(t *testing.T) {
-	// Compose Down removes the lease network on close. When it is left behind
-	// anyway, the independent network sweep reclaims it once the lease is gone.
+	// Close leaves the lease network in place; the independent,
+	// ownership-checked network sweep reclaims it once the lease is gone.
 	networkCleanupCalled := false
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
 			return nil
 		},
-		RemoveLeaseNetworkIfEmptyFn: func(ctx context.Context, leaseUUID string) (networkRemoval, error) {
+		RemoveLeaseNetworkIfEmptyFn: func(ctx context.Context, authority leaseNetworkAuthority) (networkRemoval, error) {
 			networkCleanupCalled = true
-			assert.Equal(t, durableCallbackTestLeaseUUID, leaseUUID)
+			assert.Equal(t, testLeaseNetworkAuthority(durableCallbackTestLeaseUUID, "docker"), authority)
 			return networkRemoved, nil
 		},
 		ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
-			return []networktypes.Inspect{{
-				Name:       leaseNetworkName(durableCallbackTestLeaseUUID),
-				Labels:     leaseNetworkLabels(durableCallbackTestLeaseUUID, ""),
-				Containers: map[string]networktypes.EndpointResource{},
-			}}, nil
+			network := testListedLeaseNetwork(durableCallbackTestLeaseUUID)
+			network.Containers = map[string]networktypes.EndpointResource{}
+			return []networktypes.Inspect{network}, nil
 		},
 	}
 

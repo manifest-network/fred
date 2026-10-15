@@ -94,7 +94,8 @@ func TestIntegration_Docker_ComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 	// a crashed prior run can't collide on the project/container names.
 	params := baseProjectParams()
 	params.LeaseUUID = fmt.Sprintf("eng372-anonvol-%d", time.Now().UnixNano())
-	params.Networking = leaseNetworkingNone
+	params.Network = leaseNetworkAuthority{}
+	params.Cfg.NetworkIsolation = ptrBool(false)
 	params.Stack.Services["web"] = &manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
@@ -301,7 +302,8 @@ func TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFail
 
 	params := baseProjectParams()
 	params.LeaseUUID = fmt.Sprintf("eng647-teardown-%d", time.Now().UnixNano())
-	params.Networking = leaseNetworkingNone
+	params.Network = leaseNetworkAuthority{}
+	params.Cfg.NetworkIsolation = ptrBool(false)
 	params.Stack.Services["web"] = &manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},

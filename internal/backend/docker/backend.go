@@ -59,7 +59,9 @@ type dockerMutationSink interface {
 	StopContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	RemoveContainer(ctx context.Context, containerID string) error
 	RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (networkRemoval, error)
-	RemoveLeaseNetworkIfEmpty(ctx context.Context, leaseUUID string) (networkRemoval, error)
+	InspectLeaseNetwork(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, bool, error)
+	CreateLeaseNetwork(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, error)
+	RemoveLeaseNetworkIfEmpty(ctx context.Context, authority leaseNetworkAuthority) (networkRemoval, error)
 	DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string, origin shared.ImageInspectionOrigin) (uid, gid int, err error)
 	DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string, origin shared.ImageInspectionOrigin) ([]string, error)
 	ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64, origin shared.ImageInspectionOrigin) map[string]error

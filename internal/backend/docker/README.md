@@ -851,7 +851,7 @@ record stays `reaping`.
    [Stack Provisioning](#stack-provisioning)):
    - Admits each distinct service image
    - Inspects each image to discover Dockerfile `VOLUME` declarations, the user, and writable paths
-   - Declares the lease's own network (if `NetworkIsolation` is enabled); Compose creates it on Up
+   - Creates or verifies the lease's own network (if `NetworkIsolation` is enabled) and attaches by its verified ID
    - For each item in the lease (supports multi-SKU), for each unit (supports multi-unit):
      - For stateful SKUs (`disk_mb > 0`): creates a quota-enforced host directory and bind-mounts image VOLUME paths into it
      - For ephemeral SKUs (`disk_mb == 0`): overrides image `VOLUME` paths with
@@ -1295,10 +1295,9 @@ sweep reads the last backend projection and does not force an extra Docker
 recovery pass. Runtime WAL retry cadence is therefore the docker-backend's own
 `reconcile_interval` (default `5m`), not providerd's sweep interval.
 
-Orphaned networks are cleaned up by one separate lifecycle worker. Compose Down
-removes a lease's network when the lease closes, so the worker only reclaims a
-lease network that a failed Down or a per-container fallback teardown left
-behind, and legacy tenant networks once no lease of the tenant uses them. It
+Networks are reclaimed by one separate lifecycle worker: a lease's network once
+the lease is gone, and legacy tenant networks once no lease of the tenant uses
+them. It
 starts an asynchronous pass after successful backend startup, then runs at
 `reconcile_interval` (default `5m`). Each serial pass has its own 30-second
 budget, independent of state and operation recovery. A successful close does
@@ -1316,8 +1315,9 @@ not populated before filtering. A lease network is removed only when this
 backend tracks no provision for the lease and no lifecycle command holds the
 lease's fence (`lease_busy` defers it; the fence is held across the removal).
 A legacy tenant network is removed only when the tenant has no provision. The
-exact network is inspected immediately before removal, and a lease network
-must carry that lease's and this backend's labels. Candidate counts and the
+exact listed ID is inspected immediately before removal and removed by that
+ID, and the network must carry the lease's (or tenant's) and this backend's
+labels; a candidate that does not counts as `error` and is left in place. Candidate counts and the
 `*_active`/`in_use` outcomes can therefore include connected networks and must
 not be interpreted as orphan counts. State and network worker
 iterations contain panics, increment the corresponding
@@ -2023,10 +2023,10 @@ When `network_isolation` is enabled (default), each lease's containers are place
 
 ### Network lifecycle
 
-- **Naming**: `fred-<lease_uuid>`, the lease's Compose project name. The compose project is the only place that names it, and only from the lease's own UUID, so no lease can be attached to another lease's network.
-- **Creation**: the lease's Compose project declares the network, and Compose creates it on Up. Fred makes no network call of its own.
-- **Removal**: Compose Down removes it when the lease closes. The network worker reclaims one a failed Down left behind, only when this backend tracks no provision for the lease and no lifecycle command holds the lease's fence; Docker must also confirm that no containers are connected.
-- **Labels**: `fred.managed=true`, `fred.lease_uuid`, `fred.backend_name` and `fred.network_scope=lease`, plus Compose's own project labels. The labels are fixed: Compose recreates a network whose configuration hash changes.
+- **Naming**: `fred-<lease_uuid>`, the lease's Compose project name. The name is for operators and Traefik only; nothing attaches to or removes the network by name.
+- **Ownership**: before any launch, Fred inspects the network of that name. It uses an existing network only when it carries `fred.managed=true`, `fred.network_scope=lease`, this lease's `fred.lease_uuid` and this backend's `fred.backend_name`. Any other network of that name, foreign or unlabeled, fails the launch as a backend error and is never attached to, adopted, relabeled or removed. When no network exists, Fred creates it with those labels and verifies the ID the daemon returned. Only that verification mints the lease's network authority, which names the network by its full ID.
+- **Attachment**: the Compose project names the network by that verified ID, as an external network, so Compose neither creates nor removes it and Docker attaches to that exact network. The launch transport refuses any container create that does not attach to exactly that ID, and every network create, removal, connect and disconnect. Compensation recreates a source container on networks re-verified at that moment and named by ID.
+- **Removal**: the network stays through every re-deploy and is not removed when the lease closes. The network worker reclaims it once this backend tracks no provision for the lease and no lifecycle command holds the lease's fence, re-verifying the exact ID and its labels; Docker must also confirm that no containers are connected. Compose teardown never removes a network: it rebuilds a project's networks from Compose labels alone, which do not prove ownership, and the teardown transport refuses those removals.
 - **Upgrading from per-tenant networks**: releases before per-lease networks attached every lease of a tenant to one `fred-tenant-<hex(sha256(tenant)[:8])>` network. A running lease stays there until Compose next recreates its containers (restart, update, custom-domain change, restore or re-provision); the new network key changes every service's Compose hash, so that recreate moves all of its services, including stopped ones. Fred no longer creates tenant networks; the worker removes one once the tenant has no provision on this backend.
 
 ## Container Labels

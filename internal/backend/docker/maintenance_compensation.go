@@ -275,7 +275,40 @@ func (d *DockerClient) prepareCompensationContainer(ctx context.Context, subject
 		return compensationContainer{}, err
 	}
 	prepared, err := bindCompensationContainer(d.images, subject, snapshot, image)
-	return prepared, refuseWithoutTenantSeccomp(tenantSeccompSinkCompensation, err)
+	if err != nil {
+		return compensationContainer{}, refuseWithoutTenantSeccomp(tenantSeccompSinkCompensation, err)
+	}
+	return d.bindPreparedCompensationNetworks(ctx, subject, prepared)
+}
+
+// bindPreparedCompensationNetworks replaces the network names a source
+// container was captured with by the IDs of networks verified now as this
+// lease's or this tenant's on this backend. The recreated container attaches
+// to those exact IDs, so a network replaced under the same name cannot
+// receive it.
+func (d *DockerClient) bindPreparedCompensationNetworks(ctx context.Context, subject shared.MaintenanceCompensationSubject, prepared compensationContainer) (compensationContainer, error) {
+	source, ok := subject.SourceRelease()
+	if !ok || prepared.Host == nil {
+		return compensationContainer{}, errors.New("compensation network authority is unavailable")
+	}
+	identity, ok := source.RuntimeIdentity()
+	if !ok {
+		return compensationContainer{}, errors.New("compensation source has no runtime identity")
+	}
+	var endpoints map[string]*network.EndpointSettings
+	if prepared.Networks != nil {
+		endpoints = prepared.Networks.EndpointsConfig
+	}
+	bound, err := d.bindCompensationNetworks(ctx, subject.Intent().LeaseUUID(), identity.Tenant(),
+		compensationNetworks{mode: string(prepared.Host.NetworkMode), endpoints: endpoints})
+	if err != nil {
+		return compensationContainer{}, err
+	}
+	host := *prepared.Host
+	host.NetworkMode = container.NetworkMode(bound.mode)
+	prepared.Host = &host
+	prepared.Networks = &network.NetworkingConfig{EndpointsConfig: bound.endpoints}
+	return prepared, nil
 }
 
 // bindCompensationContainer joins the exact source topology and immutable image

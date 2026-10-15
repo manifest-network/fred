@@ -45,8 +45,8 @@ func baseProjectParams() composeProjectParams {
 		ImageSetups: map[string]*imageSetup{
 			"web": {},
 		},
-		Networking: leaseNetworkingIsolated,
-		Cfg:        testConfig(),
+		Network: testLeaseNetworkAuthority("lease-1", "docker"),
+		Cfg:     testConfig(),
 	}
 }
 
@@ -450,33 +450,27 @@ func TestBuildComposeProject_ContainerNaming(t *testing.T) {
 	assert.Equal(t, "fred-lease-1-web-1", project.Services["web-1"].ContainerName)
 }
 
-func TestBuildComposeProject_LeaseOwnedNetwork(t *testing.T) {
+func TestBuildComposeProject_AttachesToTheVerifiedLeaseNetworkByID(t *testing.T) {
 	params := baseProjectParams()
-	params.BackendName = "docker-a"
 
 	project := buildTestComposeProject(t, params)
 
-	// The only network is the lease's own, owned (created and removed) by
-	// Compose rather than shared with other leases of the tenant.
+	// The only network is the lease's own, named by the ID Fred verified.
+	// External: Compose neither creates nor removes it, and Docker attaches to
+	// exactly that network whatever now holds the lease network's name.
 	require.Len(t, project.Networks, 1)
 	require.Contains(t, project.Networks, leaseNetworkKey)
 	net := project.Networks[leaseNetworkKey]
-	assert.Equal(t, "fred-lease-1", net.Name)
-	assert.Equal(t, "bridge", net.Driver)
-	assert.False(t, bool(net.External), "Compose must own the lease network so Down removes it")
-	assert.Equal(t, map[string]string{
-		LabelManaged:      "true",
-		LabelLeaseUUID:    "lease-1",
-		LabelBackendName:  "docker-a",
-		LabelNetworkScope: networkScopeLease,
-	}, map[string]string(net.Labels))
-	assert.NotContains(t, net.Labels, LabelTenant, "the tenant network sweep must never select a lease network")
+	assert.Equal(t, testLeaseNetworkID("lease-1"), net.Name)
+	assert.True(t, bool(net.External))
+	assert.Empty(t, net.Labels, "ownership labels belong to the network Fred created, not to Compose")
 }
 
 func TestBuildComposeProject_TenantLeasesGetDistinctNetworks(t *testing.T) {
 	first := baseProjectParams()
 	second := baseProjectParams()
 	second.LeaseUUID = "lease-2"
+	second.Network = testLeaseNetworkAuthority("lease-2", "docker")
 	require.Equal(t, first.Tenant, second.Tenant)
 
 	a := buildTestComposeProject(t, first)
@@ -545,7 +539,8 @@ func TestBuildComposeProject_StampsRuntimeContract(t *testing.T) {
 
 func TestBuildComposeProject_NoNetworkWhenIsolationDisabled(t *testing.T) {
 	params := baseProjectParams()
-	params.Networking = leaseNetworkingNone
+	params.Network = leaseNetworkAuthority{}
+	params.Cfg.NetworkIsolation = ptrBool(false)
 
 	project := buildTestComposeProject(t, params)
 

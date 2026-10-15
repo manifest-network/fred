@@ -201,10 +201,10 @@ func (b *Backend) operationAbsenceObservationIsTerminal(
 // rolls the adoption back or completes it.
 //
 // Networks are intentionally outside this operation-owned absence proof. A
-// lease network holds no data and carries no operation generation: Compose
-// creates it as part of Up, Compose Down removes it, and the separate
-// remove-if-empty lifecycle path reclaims one left behind. Legacy tenant
-// networks are likewise removed only by that path.
+// lease network holds no data and carries no operation generation: Fred
+// creates it once for the lease and keeps it through every re-deploy, and the
+// separate ownership-checked remove-if-empty path reclaims it after the lease
+// is gone. Legacy tenant networks are likewise removed only by that path.
 func (b *Backend) operationStorageExactlyAbsent(
 	ctx context.Context,
 	subject shared.OperationPhysicalSubject,
@@ -764,6 +764,17 @@ func (b *Backend) doReplacePhysical(
 	if err != nil {
 		return fmt.Errorf("validate %s resource profiles: %w", op.Operation, err)
 	}
+	// The lease's own network, created or verified as this lease's on this
+	// backend, before any image-setup Step, so a same-named network Fred does
+	// not own refuses the replacement with no substrate effect. A lease still
+	// on its legacy tenant network moves to it when this Up recreates its
+	// containers.
+	var leaseNetwork leaseNetworkAuthority
+	if b.cfg.IsNetworkIsolation() {
+		if leaseNetwork, err = mutations.ensureLeaseNetwork(ctx); err != nil {
+			return fmt.Errorf("ensure %s lease network: %w", op.Operation, err)
+		}
+	}
 	imageSetupStartedAt := time.Now()
 	imageSetups, err := b.inspectImagesForSetup(mutations, ctx, op.Stack, op.Items)
 	if err != nil {
@@ -782,7 +793,7 @@ func (b *Backend) doReplacePhysical(
 		CallbackURL: mutations.callbackURL, LifecycleCallbackURL: mutations.lifecycleURL,
 		MaintenanceID: op.TargetMaintenanceID, BackendName: b.cfg.Name, FailCount: failCount,
 		Stack: op.Stack, Items: op.Items, Profiles: profiles, ImageSetups: imageSetups,
-		Networking: b.leaseNetworking(), Cfg: &b.cfg, Ingress: b.cfg.Ingress,
+		Network: leaseNetwork, Cfg: &b.cfg, Ingress: b.cfg.Ingress,
 	}
 	_, composeUpErr := b.launchCompose(ctx, mutations, params, op.ResourceProfiles, composeUpOpts{ForceRecreate: op.Operation == "restart"})
 	if composeUpErr != nil {

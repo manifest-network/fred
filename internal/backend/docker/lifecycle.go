@@ -1933,41 +1933,6 @@ func TenantNetworkName(tenant string) string {
 	return "fred-tenant-" + hex.EncodeToString(h[:8])
 }
 
-// leaseNetworkName returns the name of the lease's own bridge network. It is
-// the Compose project name, so the network sorts with the lease's containers.
-// Compose creates the network on Up and removes it on Down.
-func leaseNetworkName(leaseUUID string) string {
-	return composeProjectName(leaseUUID)
-}
-
-// leaseNetworking reports how this backend attaches a lease's containers. A
-// lease still on its legacy tenant network moves to its own network when the
-// next Compose Up recreates its containers.
-func (b *Backend) leaseNetworking() leaseNetworking {
-	if b.cfg.IsNetworkIsolation() {
-		return leaseNetworkingIsolated
-	}
-	return leaseNetworkingNone
-}
-
-// networkScopeLease is the LabelNetworkScope value of a per-lease network.
-const networkScopeLease = "lease"
-
-// leaseNetworkLabels are the fixed labels of a lease's network. They must stay
-// byte-stable across releases: Compose hashes the network config and recreates
-// the network, disconnecting every container, when the hash changes.
-func leaseNetworkLabels(leaseUUID, backendName string) map[string]string {
-	labels := map[string]string{
-		LabelManaged:      "true",
-		LabelLeaseUUID:    leaseUUID,
-		LabelNetworkScope: networkScopeLease,
-	}
-	if backendName != "" {
-		labels[LabelBackendName] = backendName
-	}
-	return labels
-}
-
 // networkRemoval is a diagnostic result, never mutation authority.
 type networkRemoval uint8
 
@@ -1979,52 +1944,6 @@ const (
 	networkOwned
 	networkBusy
 )
-
-// RemoveTenantNetworkIfEmpty removes the tenant's legacy network if no
-// containers are connected, distinguishing an actual deletion from idempotent
-// absence or use.
-func (d *DockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (networkRemoval, error) {
-	return d.removeNetworkIfEmpty(ctx, TenantNetworkName(tenant), nil)
-}
-
-// RemoveLeaseNetworkIfEmpty removes the lease's network if no containers are
-// connected. The network must carry this lease's and this backend's labels: a
-// same-named network Fred did not create for this lease is never removed.
-func (d *DockerClient) RemoveLeaseNetworkIfEmpty(ctx context.Context, leaseUUID string) (networkRemoval, error) {
-	return d.removeNetworkIfEmpty(ctx, leaseNetworkName(leaseUUID), func(labels map[string]string) bool {
-		if labels[LabelManaged] != "true" || labels[LabelNetworkScope] != networkScopeLease ||
-			labels[LabelLeaseUUID] != leaseUUID {
-			return false
-		}
-		return d.backendName == "" || labels[LabelBackendName] == d.backendName
-	})
-}
-
-func (d *DockerClient) removeNetworkIfEmpty(ctx context.Context, name string, owned func(map[string]string) bool) (networkRemoval, error) {
-	// Inspect to check connected containers
-	resp, err := d.client.NetworkInspect(ctx, name, networktypes.InspectOptions{})
-	if err != nil {
-		if client.IsErrNotFound(err) {
-			return networkAbsent, nil
-		}
-		return networkRemovalUnknown, fmt.Errorf("failed to inspect network: %w", err)
-	}
-	if owned != nil && !owned(resp.Labels) {
-		return networkRemovalUnknown, fmt.Errorf("network %q does not carry the expected ownership labels", name)
-	}
-
-	if len(resp.Containers) > 0 {
-		return networkInUse, nil
-	}
-
-	if err := d.client.NetworkRemove(ctx, resp.ID); err != nil {
-		if client.IsErrNotFound(err) {
-			return networkAbsent, nil
-		}
-		return networkRemovalUnknown, fmt.Errorf("failed to remove network: %w", err)
-	}
-	return networkRemoved, nil
-}
 
 // ListIdleManagedNetworks selects managed network cleanup candidates in one
 // daemon query. A list result never grants removal authority: current
@@ -2076,16 +1995,18 @@ func (b *Backend) removeOrphanedTenantNetworkUsing(
 	return removeNetwork(ctx, tenant)
 }
 
-// removeOrphanedLeaseNetworkUsing consumes a lease whose network the sweep
-// found idle. Compose Down removes a lease network on close, so this only
-// reclaims one a failed Down or a per-container fallback teardown left behind.
+// removeOrphanedLeaseNetworkUsing consumes a lease network the sweep found
+// idle, as authority minted from the inventory's verified labels and ID. Fred
+// creates a lease network on the lease's first launch and leaves it in place
+// through every later re-deploy, so this reclaims it once the lease is gone.
 // It removes the network only on a positive fact: this backend tracks no
 // provision for the lease, and no command holds the lease's fence. The fence
 // is held across the removal, so an admission for the same lease waits for it.
-// A busy fence is retried by the next pass instead of waited on.
+// A busy fence is retried by the next pass instead of waited on. The removal
+// itself re-verifies the exact network ID before deleting it.
 func (b *Backend) removeOrphanedLeaseNetworkUsing(
 	ctx context.Context,
-	leaseUUID string,
+	authority leaseNetworkAuthority,
 	removeNetwork backgroundLeaseNetworkRemove,
 ) (networkRemoval, error) {
 	if removeNetwork == nil {
@@ -2094,20 +2015,23 @@ func (b *Backend) removeOrphanedLeaseNetworkUsing(
 	if err := ctx.Err(); err != nil {
 		return networkRemovalUnknown, err
 	}
-	unlock, acquired := b.commandFence.TryLock(leaseUUID)
+	if err := authority.authorizes(authority.leaseUUID, b.cfg.Name); err != nil {
+		return networkRemovalUnknown, err
+	}
+	unlock, acquired := b.commandFence.TryLock(authority.leaseUUID)
 	if !acquired {
 		return networkBusy, nil
 	}
 	defer unlock()
 
 	b.provisionsMu.RLock()
-	_, tracked := b.provisions[leaseUUID]
+	_, tracked := b.provisions[authority.leaseUUID]
 	b.provisionsMu.RUnlock()
 	if tracked {
 		return networkOwned, nil
 	}
 
-	return removeNetwork(ctx, leaseUUID)
+	return removeNetwork(ctx, authority)
 }
 
 // HealthStatus represents the health check status of a Docker container.

@@ -195,7 +195,10 @@ func (b *Backend) launchCompose(ctx context.Context, mutations *storageMutations
 		return settledLaunch{}, err
 	}
 	params.VolBinds = binds
-	project := buildPlannedComposeProject(params, ingress)
+	project, err := buildPlannedComposeProject(params, ingress)
+	if err != nil {
+		return settledLaunch{}, err
+	}
 	if err := volumes.validateProject(project); err != nil {
 		return settledLaunch{}, err
 	}
@@ -203,6 +206,10 @@ func (b *Backend) launchCompose(ctx context.Context, mutations *storageMutations
 	if err != nil {
 		return settledLaunch{}, refuseWithoutTenantSeccomp(mutations.tenantSeccompSink(), err)
 	}
+	// The launch transport holds the same authority the project was built from
+	// and refuses any container create that does not attach to exactly that
+	// network ID, and every network mutation.
+	opts.network = launchNetworkPolicy{authority: params.Network}
 	composeStartedAt := time.Now()
 	launch, err := b.volumeLaunches.compose(ctx, volumes, prepared, opts)
 	mutations.observeReplacementPhase(phaseComposeUp, composeStartedAt)

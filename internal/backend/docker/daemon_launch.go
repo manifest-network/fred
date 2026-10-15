@@ -273,15 +273,20 @@ func daemonCompletedLaunchResponse(req *http.Request, response *http.Response) b
 }
 
 // daemonLaunchTransport binds one Compose invocation to its launch scope. It
-// checks every container create against the tenant profile before the scope
-// admits it.
+// refuses every network mutation and every container create that does not
+// attach to exactly the launch's verified network, then checks each create
+// against the tenant profile, all before the scope admits the request.
 type daemonLaunchTransport struct {
 	next     http.RoundTripper
 	scope    *daemonLaunchScope
 	profiles imageexec.TenantSeccompSource
+	network  launchNetworkPolicy
 }
 
 func (t daemonLaunchTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := t.network.refuse(req); err != nil {
+		return refuseCreate(req, err)
+	}
 	if err := refuseUnconfinedCreate(t.profiles, req); err != nil {
 		return refuseCreate(req, err)
 	}
