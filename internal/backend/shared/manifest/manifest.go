@@ -29,6 +29,7 @@ package manifest
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"path"
@@ -776,10 +777,11 @@ type StackManifest struct {
 
 // Validate checks that the stack manifest is valid.
 func (s *StackManifest) Validate() error {
-	if err := s.ValidateStored(); err != nil {
+	topology, err := s.validateStoredTopology()
+	if err != nil {
 		return err
 	}
-	if err := s.validateDependsOnDepth(); err != nil {
+	if err := topology.requireAdmissionChainLimit(); err != nil {
 		return err
 	}
 	for name, svc := range s.Services {
@@ -794,43 +796,74 @@ func (s *StackManifest) Validate() error {
 // evolving admission policy to manifests accepted by an earlier release.
 // Tenant admission must use Validate instead.
 func (s *StackManifest) ValidateStored() error {
+	_, err := s.validateStoredTopology()
+	return err
+}
+
+// validateStoredTopology checks the structure recovery relies on and returns
+// the dependency analysis only when the whole topology is valid.
+func (s *StackManifest) validateStoredTopology() (dependsOnAnalysis, error) {
 	if len(s.Services) == 0 {
-		return fmt.Errorf("stack manifest must have at least one service")
+		return dependsOnAnalysis{}, fmt.Errorf("stack manifest must have at least one service")
 	}
 	for name, svc := range s.Services {
 		if name == "" {
-			return fmt.Errorf("service name cannot be empty")
+			return dependsOnAnalysis{}, fmt.Errorf("service name cannot be empty")
 		}
 		if len(name) > 63 {
-			return fmt.Errorf("service name %q exceeds 63 characters", name)
+			return dependsOnAnalysis{}, fmt.Errorf("service name %q exceeds 63 characters", name)
 		}
 		if !serviceNameRe.MatchString(name) {
-			return fmt.Errorf("service name %q must match [a-z0-9]([a-z0-9-]*[a-z0-9])?", name)
+			return dependsOnAnalysis{}, fmt.Errorf("service name %q must match [a-z0-9]([a-z0-9-]*[a-z0-9])?", name)
 		}
 		if svc == nil {
-			return fmt.Errorf("service %q has nil manifest", name)
+			return dependsOnAnalysis{}, fmt.Errorf("service %q has nil manifest", name)
 		}
 		if svc.Image == "" {
-			return fmt.Errorf("service %q: image is required", name)
+			return dependsOnAnalysis{}, fmt.Errorf("service %q: image is required", name)
 		}
 		if err := validatePortEncoding(svc.Ports); err != nil {
-			return fmt.Errorf("service %q: %w", name, err)
+			return dependsOnAnalysis{}, fmt.Errorf("service %q: %w", name, err)
 		}
 	}
 
 	// Cross-service depends_on validation.
-	if err := s.validateDependsOn(); err != nil {
-		return err
-	}
-
-	return nil
+	return s.analyzeDependsOn()
 }
 
 // dependsOnMaxDepth is the maximum number of links in a depends_on chain that
 // tenant admission accepts.
 const dependsOnMaxDepth = 10
 
-// validateDependsOn checks the cross-service dependency constraints recovery
+// dependsOnAnalysis is the result of a depends_on graph that passed every
+// structural check. Only analyzeDependsOn constructs a usable one, so holding
+// it is evidence that the graph is acyclic and every reference resolves. It
+// owns a private copy of each service's longest chain, so a later change to
+// the manifest cannot alter a completed analysis. The zero value authorizes
+// nothing.
+type dependsOnAnalysis struct {
+	analyzed bool
+	// links maps each service to the number of links in its longest chain.
+	links map[string]int
+}
+
+// requireAdmissionChainLimit is the admission chain-length policy. It reports
+// the first service, in name order, whose longest chain exceeds
+// dependsOnMaxDepth links.
+func (a dependsOnAnalysis) requireAdmissionChainLimit() error {
+	if !a.analyzed {
+		return errors.New("depends_on: chain length requires a completed dependency analysis")
+	}
+	for _, name := range slices.Sorted(maps.Keys(a.links)) {
+		if n := a.links[name]; n > dependsOnMaxDepth {
+			return fmt.Errorf("depends_on: dependency chain exceeds maximum depth of %d (service %q starts a chain of %d links)",
+				dependsOnMaxDepth, name, n)
+		}
+	}
+	return nil
+}
+
+// analyzeDependsOn checks the cross-service dependency constraints recovery
 // relies on:
 // - Referenced services must exist in the stack.
 // - No self-dependencies.
@@ -838,19 +871,27 @@ const dependsOnMaxDepth = 10
 // - "service_healthy" requires the referenced service to have an active health check.
 // - No cycles.
 //
-// The chain-length limit is admission policy, so Validate applies it separately.
-func (s *StackManifest) validateDependsOn() error {
+// The same depth-first walk that detects cycles records each service's
+// longest chain once all of its dependencies are done, so the lengths never
+// depend on the order services are visited. Services and dependencies are
+// visited in sorted order, so a given manifest always reports the same error.
+// The chain-length limit is admission policy; Validate applies it to the
+// returned analysis.
+func (s *StackManifest) analyzeDependsOn() (dependsOnAnalysis, error) {
 	for name, svc := range s.Services {
+		if svc == nil {
+			return dependsOnAnalysis{}, fmt.Errorf("service %q has nil manifest", name)
+		}
 		for dep, cond := range svc.DependsOn {
 			// Self-dependency.
 			if dep == name {
-				return fmt.Errorf("service %q: depends_on cannot reference itself", name)
+				return dependsOnAnalysis{}, fmt.Errorf("service %q: depends_on cannot reference itself", name)
 			}
 
 			// Referenced service must exist.
 			depSvc, ok := s.Services[dep]
-			if !ok {
-				return fmt.Errorf("service %q: depends_on references unknown service %q", name, dep)
+			if !ok || depSvc == nil {
+				return dependsOnAnalysis{}, fmt.Errorf("service %q: depends_on references unknown service %q", name, dep)
 			}
 
 			// Validate condition.
@@ -859,42 +900,32 @@ func (s *StackManifest) validateDependsOn() error {
 				// Always valid.
 			case "service_healthy":
 				if !depSvc.HasActiveHealthCheck() {
-					return fmt.Errorf("service %q: depends_on %q with condition %q requires %q to have a health_check",
+					return dependsOnAnalysis{}, fmt.Errorf("service %q: depends_on %q with condition %q requires %q to have a health_check",
 						name, dep, cond.Condition, dep)
 				}
 			case "":
-				return fmt.Errorf("service %q: depends_on %q has empty condition", name, dep)
+				return dependsOnAnalysis{}, fmt.Errorf("service %q: depends_on %q has empty condition", name, dep)
 			default:
-				return fmt.Errorf("service %q: depends_on %q has invalid condition %q (must be service_started or service_healthy)",
+				return dependsOnAnalysis{}, fmt.Errorf("service %q: depends_on %q has invalid condition %q (must be service_started or service_healthy)",
 					name, dep, cond.Condition)
 			}
 		}
 	}
 
-	// Cycle detection via DFS.
-	return s.detectDependsOnCycles()
-}
-
-// detectDependsOnCycles performs DFS-based cycle detection across the
-// depends_on graph. Services and their dependencies are visited in sorted
-// order, so the same manifest always names the same service in the error.
-func (s *StackManifest) detectDependsOnCycles() error {
 	const (
 		white = 0 // unvisited
 		gray  = 1 // in current path
-		black = 2 // fully explored
+		black = 2 // fully explored; links[name] is final
 	)
 
 	color := make(map[string]int, len(s.Services))
+	links := make(map[string]int, len(s.Services))
 
 	var dfs func(name string) error
 	dfs = func(name string) error {
 		color[name] = gray
-		svc := s.Services[name]
-		if svc == nil {
-			return nil
-		}
-		for _, dep := range slices.Sorted(maps.Keys(svc.DependsOn)) {
+		longest := 0
+		for _, dep := range slices.Sorted(maps.Keys(s.Services[name].DependsOn)) {
 			switch color[dep] {
 			case gray:
 				return fmt.Errorf("depends_on: cycle detected involving service %q", dep)
@@ -903,7 +934,9 @@ func (s *StackManifest) detectDependsOnCycles() error {
 					return err
 				}
 			}
+			longest = max(longest, links[dep]+1)
 		}
+		links[name] = longest
 		color[name] = black
 		return nil
 	}
@@ -911,40 +944,11 @@ func (s *StackManifest) detectDependsOnCycles() error {
 	for _, name := range slices.Sorted(maps.Keys(s.Services)) {
 		if color[name] == white {
 			if err := dfs(name); err != nil {
-				return err
+				return dependsOnAnalysis{}, err
 			}
 		}
 	}
-	return nil
-}
-
-// validateDependsOnDepth rejects a stack whose longest depends_on chain has
-// more than dependsOnMaxDepth links. The length of a service's chain is
-// memoized, so the result does not depend on the order services are visited.
-// It requires an acyclic graph, so callers run validateDependsOn first.
-func (s *StackManifest) validateDependsOnDepth() error {
-	links := make(map[string]int, len(s.Services))
-	var longest func(name string) int
-	longest = func(name string) int {
-		if n, done := links[name]; done {
-			return n
-		}
-		n := 0
-		if svc := s.Services[name]; svc != nil {
-			for dep := range svc.DependsOn {
-				n = max(n, longest(dep)+1)
-			}
-		}
-		links[name] = n
-		return n
-	}
-	for _, name := range slices.Sorted(maps.Keys(s.Services)) {
-		if n := longest(name); n > dependsOnMaxDepth {
-			return fmt.Errorf("depends_on: dependency chain exceeds maximum depth of %d (service %q starts a chain of %d links)",
-				dependsOnMaxDepth, name, n)
-		}
-	}
-	return nil
+	return dependsOnAnalysis{analyzed: true, links: links}, nil
 }
 
 // ParsePayload parses a deployment manifest payload and always returns the
