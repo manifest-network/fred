@@ -1496,6 +1496,7 @@ Requests and responses are bound to the backend's sealed storage identity (see
 | `POST` | `/restore` | HMAC | Restore a retained lease's data into a new lease (async, callback on completion; retention support) |
 | `GET` | `/stats` | None | Resource capacity and usage (least-loaded routing) |
 | `GET` | `/metrics` | None | Prometheus metrics |
+| `POST`, `GET` | `/runtime_refresh` | HMAC | docker-backend only, operator-facing: recreate leases created under an older runtime contract, and read progress. Fred never calls it ([docker-backend README](internal/backend/docker/README.md#post-runtime_refresh-authenticated)) |
 
 A backend without soft-delete/retention support returns an empty list from `/retentions` and, if it serves `/restore`, `422` (no retained data). A backend that does not answer `/retentions` is treated as not having answered the sweep.
 
