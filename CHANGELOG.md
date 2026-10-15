@@ -1203,6 +1203,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A stack whose `depends_on` chain is longer than 10 links is now always
+  rejected at submission. The check used to measure the chain from whichever
+  service it happened to visit first, so the same manifest was accepted or
+  rejected at random (about one time in five for 12 services in a row, three
+  in five for 20). Stored manifests are no longer re-checked against the
+  limit. The docker backend re-parses them when it opens its release and
+  retention stores, on every `/health`, and during recovery, close and
+  maintenance, so one tenant's long chain could make backend startup and
+  `/health` fail at random. Cycles are still rejected in stored manifests.
+  (ENG-1515)
 - A lease created by `POST /v1/leases/{uuid}/restore` now recovers on its own
   after losing its container (host reboot, crash, kill). providerd held no
   payload for it, because the backend re-deployed the retained manifest, so it
