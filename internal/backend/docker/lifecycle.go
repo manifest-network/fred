@@ -93,15 +93,18 @@ type ContainerInfo struct {
 	CallbackURL          string
 	LifecycleCallbackURL string
 	MaintenanceID        shared.MaintenanceID
-	Image                string
-	Status               string
-	Health               HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
-	ExitCode             int          // Process exit code (meaningful when Status is "exited"/"dead")
-	OOMKilled            bool         // True if container was killed by the OOM killer
-	CreatedAt            time.Time
-	Ports                map[string]PortBinding
-	FQDN                 string
-	CustomDomain         string // Tenant-supplied custom FQDN (empty when not set)
+	// RuntimeContract is the runtime contract recorded at creation; zero when
+	// the container predates the contract.
+	RuntimeContract runtimeContract
+	Image           string
+	Status          string
+	Health          HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
+	ExitCode        int          // Process exit code (meaningful when Status is "exited"/"dead")
+	OOMKilled       bool         // True if container was killed by the OOM killer
+	CreatedAt       time.Time
+	Ports           map[string]PortBinding
+	FQDN            string
+	CustomDomain    string // Tenant-supplied custom FQDN (empty when not set)
 
 	// Name is the human-readable container name (without the leading "/"
 	// the Docker API prepends). Populated by both InspectContainer and
@@ -1690,6 +1693,7 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		CallbackURL:          resp.Config.Labels[LabelCallbackURL],
 		LifecycleCallbackURL: resp.Config.Labels[LabelLifecycleCallbackURL],
 		MaintenanceID:        maintenanceID,
+		RuntimeContract:      parseRuntimeContract(resp.Config.Labels),
 		Image:                imageReference,
 		Status:               resp.State.Status,
 		Health:               health,
@@ -1821,6 +1825,7 @@ func (d *DockerClient) listManagedContainers(
 			CallbackURL:          c.Labels[LabelCallbackURL],
 			LifecycleCallbackURL: c.Labels[LabelLifecycleCallbackURL],
 			MaintenanceID:        maintenanceID,
+			RuntimeContract:      parseRuntimeContract(c.Labels),
 			Image:                imageReference,
 			Status:               c.State,
 			InstanceIndex:        meta.InstanceIndex,

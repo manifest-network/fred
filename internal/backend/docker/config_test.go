@@ -1092,3 +1092,21 @@ func TestValidate_RetentionPartitioning(t *testing.T) {
 	require.False(t, retentionPartitionWindowCannotRoll(retainOffCfg),
 		"window-roll warn must be gated on retain_on_close")
 }
+
+func TestConfig_RuntimeRefreshMaxConcurrency(t *testing.T) {
+	cfg := validConfig()
+	require.NoError(t, cfg.Validate())
+	assert.Equal(t, defaultRuntimeRefreshMaxConcurrency, cfg.GetRuntimeRefreshMaxConcurrency(), "unset uses the default")
+
+	for _, value := range []int{0, 1, maxRuntimeRefreshConcurrency} {
+		cfg := validConfig()
+		cfg.RuntimeRefreshMaxConcurrency = &value
+		require.NoError(t, cfg.Validate(), value)
+		assert.Equal(t, value, cfg.GetRuntimeRefreshMaxConcurrency())
+	}
+	for _, value := range []int{-1, maxRuntimeRefreshConcurrency + 1} {
+		cfg := validConfig()
+		cfg.RuntimeRefreshMaxConcurrency = &value
+		require.ErrorContains(t, cfg.Validate(), "runtime_refresh_max_concurrency", value)
+	}
+}

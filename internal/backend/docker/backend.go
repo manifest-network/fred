@@ -225,7 +225,10 @@ type Backend struct {
 	// tenant-network rule above. Neither holder takes provisionsMu on entry,
 	// and a volume stripe is never held across a tenant-network acquisition.
 	volumeNameStripes [volumeNameStripeCount]sync.Mutex
-	volumeAccess      volumeAccessCoordinator
+
+	// runtimeRefresh owns the operator-started runtime refresh run.
+	runtimeRefresh runtimeRefreshController
+	volumeAccess   volumeAccessCoordinator
 
 	// recoverMu serializes recoverState calls. The reconcile loop and
 	// external RefreshState (called by Fred's reconciler) both invoke

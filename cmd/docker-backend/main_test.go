@@ -694,6 +694,8 @@ type mockBackend struct {
 	ListRetentionsFunc        func(ctx context.Context) ([]backend.RetainedLease, error)
 	ListRetentionsPageFunc    func(ctx context.Context, after string, limit int) ([]backend.RetainedLease, string, error)
 	ReconcileCustomDomainFunc func(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
+	StartRuntimeRefreshFunc   func(ctx context.Context) (docker.RuntimeRefreshStatus, error)
+	RuntimeRefreshStatusFunc  func(ctx context.Context) (docker.RuntimeRefreshStatus, error)
 	GetReleasesFunc           func(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
 	VerifyStorageIdentityFunc func(context.Context) error
 	HealthFunc                func(ctx context.Context) error
@@ -805,6 +807,20 @@ func (m *mockBackend) ListRetentions(ctx context.Context) ([]backend.RetainedLea
 		panic("mockBackend.ListRetentions called but not configured")
 	}
 	return m.ListRetentionsFunc(ctx)
+}
+
+func (m *mockBackend) StartRuntimeRefresh(ctx context.Context) (docker.RuntimeRefreshStatus, error) {
+	if m.StartRuntimeRefreshFunc == nil {
+		panic("mockBackend.StartRuntimeRefresh called but not configured")
+	}
+	return m.StartRuntimeRefreshFunc(ctx)
+}
+
+func (m *mockBackend) RuntimeRefreshStatus(ctx context.Context) (docker.RuntimeRefreshStatus, error) {
+	if m.RuntimeRefreshStatusFunc == nil {
+		panic("mockBackend.RuntimeRefreshStatus called but not configured")
+	}
+	return m.RuntimeRefreshStatusFunc(ctx)
 }
 
 func (m *mockBackend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error {
