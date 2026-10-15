@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -491,14 +492,14 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 		}
 	}
 
-	// Verify separate tenant networks were created
+	// Verify each lease got its own network
 	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
-	net1Name := TenantNetworkName(tenant1)
-	net2Name := TenantNetworkName(tenant2)
-	assert.NotEqual(t, net1Name, net2Name, "tenants should have different network names")
+	net1Name := leaseNetworkName(leaseUUID1)
+	net2Name := leaseNetworkName(leaseUUID2)
+	assert.NotEqual(t, net1Name, net2Name, "leases should have different network names")
 
 	for _, name := range []string{net1Name, net2Name} {
 		network, inspectErr := docker.client.NetworkInspect(ctx, name, networktypes.InspectOptions{})
@@ -513,16 +514,16 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	err = b.Deprovision(ctx, leaseUUID2)
 	require.NoError(t, err)
 
-	// The fixture disables the periodic cadence, so drive network reclamation
-	// after both close replies. Its asynchronous initial pass may still own a
-	// tenant stripe: retry bounded passes until both networks are gone.
+	// Compose Down removes each lease network on close; the bounded network
+	// sweep reclaims one a failed Down left behind. Retry passes until both
+	// networks are gone.
 	cleanupCtx, cancelCleanup := b.recoveryDockerReadContext(ctx)
 	defer cancelCleanup()
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		b.cleanupOrphanedNetworks(cleanupCtx)
 		for _, name := range []string{net1Name, net2Name} {
 			_, inspectErr := docker.client.NetworkInspect(cleanupCtx, name, networktypes.InspectOptions{})
-			assert.True(collect, client.IsErrNotFound(inspectErr), "tenant network %s must actually be absent: %v", name, inspectErr)
+			assert.True(collect, client.IsErrNotFound(inspectErr), "lease network %s must actually be absent: %v", name, inspectErr)
 		}
 	}, 30*time.Second, 100*time.Millisecond)
 }
@@ -1242,62 +1243,6 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 // deterministically collide. Admission rejection is covered by the unit/wiring
 // tests (TestProvision_RejectsFixedHostPort, TestUpdate_RejectsFixedHostPort).
 
-// TestIntegration_EnsureTenantNetwork_ConcurrentRace verifies that two
-// concurrent calls to EnsureTenantNetwork for the same tenant both succeed,
-// even when the second call races with the first's NetworkCreate.
-func TestIntegration_EnsureTenantNetwork_ConcurrentRace(t *testing.T) {
-	docker, err := NewDockerClient(t.Context(), "", "")
-	require.NoError(t, err)
-
-	ctx := context.Background()
-	if err := docker.Ping(ctx); err != nil {
-		t.Skip("Docker not available:", err)
-	}
-
-	tenant := fmt.Sprintf("race-test-%d", time.Now().UnixNano())
-
-	t.Cleanup(func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if _, err := docker.RemoveTenantNetworkIfEmpty(cleanupCtx, tenant); err != nil {
-			t.Logf("cleanup: failed to remove test network for tenant %s: %v", tenant, err)
-		}
-	})
-
-	const goroutines = 5
-	results := make(chan string, goroutines)
-	errs := make(chan error, goroutines)
-
-	for range goroutines {
-		go func() {
-			id, err := docker.EnsureTenantNetwork(ctx, tenant)
-			if err != nil {
-				errs <- err
-				return
-			}
-			results <- id
-		}()
-	}
-
-	var networkIDs []string
-	for range goroutines {
-		select {
-		case id := <-results:
-			networkIDs = append(networkIDs, id)
-		case err := <-errs:
-			t.Fatalf("EnsureTenantNetwork failed: %v", err)
-		case <-time.After(30 * time.Second):
-			t.Fatal("timeout waiting for goroutines")
-		}
-	}
-
-	// All goroutines must return the same network ID.
-	require.Len(t, networkIDs, goroutines)
-	for _, id := range networkIDs[1:] {
-		assert.Equal(t, networkIDs[0], id, "all goroutines should return the same network ID")
-	}
-}
-
 // TestIntegration_Docker_UnknownSKU_Rejected verifies that a provision request
 // with an unknown SKU is rejected synchronously with ErrValidation, and no
 // containers or resources are leaked.
@@ -1614,10 +1559,11 @@ func TestIntegration_Docker_ResourceExhaustion_Rejected(t *testing.T) {
 	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
 }
 
-// TestIntegration_Docker_SameTenantNetwork_Shared verifies that two leases
-// belonging to the same tenant share a single Docker network, while different
-// tenants get separate networks.
-func TestIntegration_Docker_SameTenantNetwork_Shared(t *testing.T) {
+// TestIntegration_Docker_SameTenantLeasesAreIsolated verifies that two leases
+// of one tenant each get their own network. A service name resolves only to
+// the lease's own containers, another lease's container name does not resolve
+// at all, and closing a lease removes its network (ENG-1516).
+func TestIntegration_Docker_SameTenantLeasesAreIsolated(t *testing.T) {
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
@@ -1625,92 +1571,94 @@ func TestIntegration_Docker_SameTenantNetwork_Shared(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	tenant := fmt.Sprintf("shared-net-%d", time.Now().UnixNano())
-	otherTenant := fmt.Sprintf("other-net-%d", time.Now().UnixNano())
-	leaseUUID1 := newIntegrationLeaseUUID()
-	leaseUUID2 := newIntegrationLeaseUUID()
-	leaseUUID3 := newIntegrationLeaseUUID()
+	tenant := fmt.Sprintf("isolated-net-%d", time.Now().UnixNano())
+	leaseA := newIntegrationLeaseUUID()
+	leaseB := newIntegrationLeaseUUID()
 
-	appManifest := manifest.Manifest{
-		Image:   "busybox:latest",
-		Command: []string{"sleep", "3600"},
+	// Both leases run the same stack, so both have a "db" service.
+	stack := manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
+			"web": {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+			"db":  {Image: "busybox:latest", Command: []string{"sleep", "3600"}},
+		},
 	}
-	payload, err := json.Marshal(appManifest)
+	payload, err := json.Marshal(stack)
 	require.NoError(t, err)
-
-	// Provision two leases for the same tenant
-	for _, uuid := range []string{leaseUUID1, leaseUUID2} {
+	for _, lease := range []string{leaseA, leaseB} {
 		callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
-		err = b.Provision(ctx, backend.ProvisionRequest{
-			LeaseUUID:            uuid,
-			Tenant:               tenant,
-			ProviderUUID:         testProviderUUID,
-			Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
+			LeaseUUID:    lease,
+			Tenant:       tenant,
+			ProviderUUID: testProviderUUID,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+				{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
+			},
 			CallbackURL:          callbacks.operationURL,
 			LifecycleCallbackURL: callbacks.lifecycleURL,
 			Payload:              payload,
-		})
-		require.NoError(t, err)
+		}))
 	}
-
-	// Provision one lease for a different tenant
-	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
-	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:            leaseUUID3,
-		Tenant:               otherTenant,
-		ProviderUUID:         testProviderUUID,
-		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:          callbacks.operationURL,
-		LifecycleCallbackURL: callbacks.lifecycleURL,
-		Payload:              payload,
-	})
-	require.NoError(t, err)
-
-	// Wait for all 3 callbacks
-	received := 0
-	for received < 3 {
+	// Both callbacks, in whichever order they arrive.
+	pending := map[string]bool{leaseA: true, leaseB: true}
+	for len(pending) > 0 {
 		select {
 		case cb := <-callbackCh:
-			assert.Equal(t, backend.CallbackStatusSuccess, cb.Status)
-			received++
+			require.True(t, pending[cb.LeaseUUID], "unexpected callback for lease %s", cb.LeaseUUID)
+			require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+			delete(pending, cb.LeaseUUID)
 		case <-time.After(2 * time.Minute):
-			t.Fatalf("timeout waiting for callbacks, got %d/3", received)
+			t.Fatalf("timeout waiting for provision callbacks; still pending: %v", pending)
 		}
 	}
 
-	// Inspect container networks via Docker API
+	// containerOn returns a lease service's container and its address on the
+	// lease network, asserting the container joined no other network.
+	containerOn := func(lease, service string) (string, string) {
+		t.Helper()
+		for _, c := range inspectProvisionContainers(t, lease) {
+			if c.Labels[LabelServiceName] != service {
+				continue
+			}
+			require.Len(t, c.NetworkSettings.Networks, 1, "lease %s service %s must join only its lease network", lease, service)
+			endpoint, ok := c.NetworkSettings.Networks[leaseNetworkName(lease)]
+			require.True(t, ok, "lease %s service %s must be on %s", lease, service, leaseNetworkName(lease))
+			return c.ID, endpoint.IPAddress
+		}
+		t.Fatalf("lease %s has no %s container", lease, service)
+		return "", ""
+	}
+	webA, _ := containerOn(leaseA, "web")
+	_, dbA := containerOn(leaseA, "db")
+	_, dbB := containerOn(leaseB, "db")
+	require.NotEmpty(t, dbA)
+	require.NotEmpty(t, dbB)
+
+	// Names are queried absolute (trailing dot): busybox nslookup otherwise
+	// appends the host's search domain to a bare name and never asks Docker's
+	// resolver for the name itself.
+	//
+	// "db" resolves to this lease's db only.
+	resolved := execInContainer(t, webA, []string{"nslookup", "db."})
+	assert.Contains(t, resolved, dbA)
+	assert.NotContains(t, resolved, dbB, "a same-tenant lease's service must not resolve")
+
+	// A container name resolves within the lease, so the negative check below
+	// is not vacuous: the other lease's container name does not resolve.
+	execInContainer(t, webA, []string{"nslookup", fmt.Sprintf("fred-%s-db-0.", leaseA)})
+	otherName := fmt.Sprintf("fred-%s-db-0.", leaseB)
+	out, execErr := exec.Command("docker", "exec", webA, "nslookup", otherName).CombinedOutput()
+	assert.Error(t, execErr, "another lease's container name must not resolve: %s", out)
+
+	// Closing a lease removes its network.
 	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
-
-	getContainerNetwork := func(leaseUUID string) string {
-		t.Helper()
-		containers := inspectProvisionContainers(t, leaseUUID)
-		require.Len(t, containers, 1, "expected 1 container for lease %s", leaseUUID)
-		// Container's NetworkSettings.Networks is a map of network names
-		for netName := range containers[0].NetworkSettings.Networks {
-			return netName
-		}
-		t.Fatalf("container for lease %s has no network", leaseUUID)
-		return ""
+	for _, lease := range []string{leaseA, leaseB} {
+		require.NoError(t, b.Deprovision(ctx, lease))
+		_, inspectErr := docker.client.NetworkInspect(ctx, leaseNetworkName(lease), networktypes.InspectOptions{})
+		assert.True(t, client.IsErrNotFound(inspectErr), "close must remove %s: %v", leaseNetworkName(lease), inspectErr)
 	}
-
-	net1 := getContainerNetwork(leaseUUID1)
-	net2 := getContainerNetwork(leaseUUID2)
-	net3 := getContainerNetwork(leaseUUID3)
-
-	// Same tenant leases should share the same network
-	assert.Equal(t, net1, net2, "same-tenant leases should share a network")
-
-	// Different tenant should have a different network
-	assert.NotEqual(t, net1, net3, "different-tenant leases should have separate networks")
-
-	// Verify the network names follow the expected naming convention
-	expectedTenantNet := TenantNetworkName(tenant)
-	assert.Equal(t, expectedTenantNet, net1, "network name should match TenantNetworkName convention")
-
-	expectedOtherNet := TenantNetworkName(otherTenant)
-	assert.Equal(t, expectedOtherNet, net3, "other tenant network should match convention")
 }
 
 // --- Restart, Update, and GetReleases integration tests ---
@@ -3269,16 +3217,16 @@ func TestIntegration_Stack_NetworkIsolation(t *testing.T) {
 	containers := inspectProvisionContainers(t, leaseUUID)
 	assert.Len(t, containers, 2, "expected 2 containers")
 
-	// Verify tenant network was created
+	// Verify the lease network was created
 	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
-	netName := TenantNetworkName(tenant)
+	netName := leaseNetworkName(leaseUUID)
 	network, err := docker.client.NetworkInspect(ctx, netName, networktypes.InspectOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, netName, network.Name)
-	assert.Len(t, network.Containers, 2, "both tenant services must remain attached")
+	assert.Len(t, network.Containers, 2, "both stack services must be attached")
 
 	err = b.Deprovision(ctx, leaseUUID)
 	require.NoError(t, err)

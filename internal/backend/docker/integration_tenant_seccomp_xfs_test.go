@@ -199,7 +199,7 @@ func TestIntegration_Docker_XFS_TenantCannotChangeProjectID(t *testing.T) {
 				require.NoError(t, err)
 				params := baseProjectParams()
 				params.LeaseUUID = uuid.NewString()
-				params.NetworkName = ""
+				params.Networking = leaseNetworkingNone
 				params.Stack.Services["web"] = &manifest.Manifest{Image: tag, Command: []string{"/probe"}, Args: args}
 				params.ImageSetups["web"] = &imageSetup{Image: admitted, ContainerUser: "10000:10000"}
 				params.VolBinds = map[string]map[int]serviceVolBinds{

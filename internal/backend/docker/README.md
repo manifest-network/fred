@@ -533,7 +533,7 @@ durations must remain positive. Durations use Go syntax (`h`, `m`, `s`); `d` and
 
 | Field | YAML Key | Type | Default | Description |
 |---|---|---|---|---|
-| NetworkIsolation | `network_isolation` | *bool | `true` | Per-tenant Docker network isolation |
+| NetworkIsolation | `network_isolation` | *bool | `true` | Per-lease Docker network isolation |
 | ContainerReadonlyRootfs | `container_readonly_rootfs` | *bool | `true` | Read-only root filesystem |
 | ContainerPidsLimit | `container_pids_limit` | *int64 | `256` | Maximum PIDs per container |
 | ContainerTmpfsSizeMB | `container_tmpfs_size_mb` | int | `64` | Size (MB) for each `/tmp`/`/run`/image-`VOLUME` tmpfs and, separately, the conservative on-disk scratch allowance pinned for every `disk_mb: 0` instance. Tenant-declared tmpfs uses the same per-mount ceiling; memory tmpfs is not charged as disk |
@@ -551,7 +551,7 @@ durations must remain positive. Durations use Go syntax (`h`, `m`, `s`); `d` and
 | Ingress.CustomDomainDNSQuorum | `ingress.custom_domain_dns_quorum` | int | `0` (majority) | How many resolvers must independently see the domain at this host before the readiness gate opens. `0` = majority; clamped to `[1, len(resolvers)]` |
 | Ingress.CustomDomainDNSCheckDisabled | `ingress.custom_domain_dns_check_disabled` | bool | `false` | Turns OFF the custom-domain DNS readiness gate, emitting the custom-domain router immediately (ENG-266) |
 
-When enabled, containers with routable TCP ports receive Traefik Docker labels for automatic HTTPS routing. Each container gets a unique subdomain under `wildcard_domain` derived from lease UUID and service metadata (guaranteed ≤63 chars per RFC 1035). Port selection: explicit manifest `ingress` hint > 80 > 8080 > lowest TCP port. Requires `network_isolation` to be enabled — Traefik routes traffic via the per-tenant Docker network.
+When enabled, containers with routable TCP ports receive Traefik Docker labels for automatic HTTPS routing. Each container gets a unique subdomain under `wildcard_domain` derived from lease UUID and service metadata (guaranteed ≤63 chars per RFC 1035). Port selection: explicit manifest `ingress` hint > 80 > 8080 > lowest TCP port. Requires `network_isolation` to be enabled — Traefik routes traffic via the lease's own Docker network.
 
 Routers are generated with `tls=true` but no `certresolver`. The wildcard certificate for `wildcard_domain` must be provisioned at the Traefik level — typically via a DNS-01 ACME resolver with `domains` set in Traefik's static config, or via a default certificate in `tls.stores`. Fred does not drive per-domain ACME challenges.
 
@@ -851,7 +851,7 @@ record stays `reaping`.
    [Stack Provisioning](#stack-provisioning)):
    - Admits each distinct service image
    - Inspects each image to discover Dockerfile `VOLUME` declarations, the user, and writable paths
-   - Creates/ensures the per-tenant network (if `NetworkIsolation` is enabled)
+   - Declares the lease's own network (if `NetworkIsolation` is enabled); Compose creates it on Up
    - For each item in the lease (supports multi-SKU), for each unit (supports multi-unit):
      - For stateful SKUs (`disk_mb > 0`): creates a quota-enforced host directory and bind-mounts image VOLUME paths into it
      - For ephemeral SKUs (`disk_mb == 0`): overrides image `VOLUME` paths with
@@ -1041,7 +1041,7 @@ Every container is created with the following security measures:
 | PID limit | `PidsLimit: 256` | Configurable via `container_pids_limit` |
 | Memory (no swap) | `MemorySwap == Memory` | Prevents swap usage entirely |
 | Restart policy disabled | `RestartPolicyDisabled` | Failed containers stay dead for crash detection |
-| Network isolation | Per-tenant bridge network | Configurable via `network_isolation` |
+| Network isolation | Per-lease bridge network | Configurable via `network_isolation` |
 
 ## Startup Verification
 
@@ -1283,7 +1283,7 @@ these phases do not measure the full wall time of a failed replacement.
 - `fred_docker_backend_maintenance_readiness_pending_total{branch}` — readiness deferrals, including retries, for `committed_target`, `deploying_target`, `cleanup_source`, or `source_only`. The matching warning is emitted once per exact pending intent and branch in a backend lifetime. A committed target can remain pending indefinitely while its healthcheck is starting; inspect that workload rather than treating the metric as permission to roll it back.
 - `fred_docker_backend_maintenance_recovery_deferred_total` — explicitly lease-local observation conflicts deferred with their exact intent and reservation retained. Sibling recovery continues; storage/journal authority failures and global transport/cancellation errors still fail the recovery boundary.
 - `fred_docker_backend_operation_recovery_deferred_total` — provision and restore recoveries whose container evidence could not be classified (partial or mixed callback identities, an identity or topology mismatch, an inspection error). The Pending journal row and its lease fence stay; each pass counts the lease again. The same failures as above still fail the recovery boundary.
-- `fred_docker_backend_network_reclamation_total{outcome}` — network candidates classified as `removed`, `absent`, `in_use`, `tenant_active`, or `tenant_busy`, plus candidate `error`, pass `list_error`, and pass `budget_exhausted` outcomes. Only `removed` counts a successful Docker removal. A bounded pass can leave a backlog for later passes without failing state or operation recovery; shutdown cancellation does not count as an operational error.
+- `fred_docker_backend_network_reclamation_total{outcome}` — network candidates classified as `removed`, `absent`, `in_use`, `lease_active`, `lease_busy`, or `tenant_active`, plus candidate `error`, pass `list_error`, and pass `budget_exhausted` outcomes. Only `removed` counts a successful Docker removal. A bounded pass can leave a backlog for later passes without failing state or operation recovery; shutdown cancellation does not count as an operational error.
 
 ## State Recovery
 
@@ -1295,24 +1295,31 @@ sweep reads the last backend projection and does not force an extra Docker
 recovery pass. Runtime WAL retry cadence is therefore the docker-backend's own
 `reconcile_interval` (default `5m`), not providerd's sweep interval.
 
-Orphaned tenant networks are cleaned up by one separate lifecycle worker. It
+Orphaned networks are cleaned up by one separate lifecycle worker. Compose Down
+removes a lease's network when the lease closes, so the worker only reclaims a
+lease network that a failed Down or a per-container fallback teardown left
+behind, and legacy tenant networks once no lease of the tenant uses them. It
 starts an asynchronous pass after successful backend startup, then runs at
 `reconcile_interval` (default `5m`). Each serial pass has its own 30-second
 budget, independent of state and operation recovery. A successful close does
 not run a fleet-wide sweep or wait for network cleanup. A backlog may need
 several passes to drain; cancellation or budget exhaustion leaves the remaining
-networks for a later pass. Size Docker's address pools for active tenants and
-tenant churn between passes; close completion does not imply immediate subnet
-reuse. Backend shutdown cancels and waits for the worker.
+networks for a later pass. Every lease uses one network, so size Docker's
+address pools for active leases plus lease churn between passes (the deployed
+`10.0.0.0/8` pool split into /24s holds about 65k). Backend shutdown cancels and
+waits for the worker.
 
 Candidate collection uses one Docker list with managed/backend labels and
 `dangling=true`; it does not inspect every active network. On Engine 28.x,
 the list filter can include connected networks because attachment details are
-not populated before filtering. Each selected tenant still reacquires its
-network stripe and checks current workload ownership, skipping active tenants.
-The exact network is inspected immediately before removal. Candidate counts and
-`tenant_active`/`in_use` outcomes can therefore include connected networks and
-must not be interpreted as orphan counts. State and network worker
+not populated before filtering. A lease network is removed only when this
+backend tracks no provision for the lease and no lifecycle command holds the
+lease's fence (`lease_busy` defers it; the fence is held across the removal).
+A legacy tenant network is removed only when the tenant has no provision. The
+exact network is inspected immediately before removal, and a lease network
+must carry that lease's and this backend's labels. Candidate counts and the
+`*_active`/`in_use` outcomes can therefore include connected networks and must
+not be interpreted as orphan counts. State and network worker
 iterations contain panics, increment the corresponding
 `fred_background_cleanup_panics_total` component, and retry on the next tick.
 
@@ -2001,26 +2008,26 @@ The resource pool tracks CPU, memory, and effective physical disk allocations.
 - **Stats** returns total, allocated, and available CPU/memory/effective disk.
 - **Reset** atomically validates and replaces all allocations from durable intent, active-release, and close snapshots during recovery. Invalid or overflowing input returns an error without changing the previous projection.
 
-## Tenant Network Isolation
+## Lease Network Isolation
 
-When `network_isolation` is enabled (default), each tenant's containers are placed in a dedicated Docker bridge network. This provides:
+When `network_isolation` is enabled (default), each lease's containers are placed in the lease's own Docker bridge network. This provides:
 
-- **Same-tenant communication**: containers on the same tenant bridge can reach each other directly.
-- **Cross-tenant isolation**: Docker's `DOCKER-ISOLATION` iptables chains DROP forwarded traffic between different bridge networks. Containers from different tenants cannot communicate directly.
+- **In-lease communication**: every service of a stack, fan-out instances included, joins the lease network under its bare service name, so `web` reaches `db:5432`.
+- **Lease isolation**: a lease cannot reach another lease by name or address, even one of the same tenant. A service name resolves only to the lease's own containers. Docker's `DOCKER-ISOLATION` iptables chains drop forwarded traffic between bridge networks, so tenants that host several customers under one address do not expose those customers to each other.
 - **Outbound internet**: containers can reach the internet (required for port bindings).
-- **Port bindings**: inbound traffic to published ports works normally. Cross-tenant communication is only possible through public-facing endpoints (published ports on the host).
+- **Port bindings**: inbound traffic to published ports works normally. Communication between leases is only possible through public-facing endpoints (published ports or ingress).
 
-> **Prerequisite**: Docker must have iptables enabled (the default). If the daemon runs with `--iptables=false`, cross-tenant isolation is lost. Fred logs daemon warnings at startup to help detect this.
+> **Prerequisite**: Docker must have iptables enabled (the default). If the daemon runs with `--iptables=false`, isolation is lost. Fred logs daemon warnings at startup to help detect this.
 
 > **Why not `Internal: true`?** Docker's `Internal` network flag prevents port publishing entirely ([moby#36174](https://github.com/moby/moby/issues/36174)), which would make tenant services unreachable.
 
 ### Network lifecycle
 
-- **Naming**: `fred-tenant-<hex(sha256(tenant)[:8])>` -- first 8 bytes of the SHA-256 hash, hex-encoded to 16 characters. Deterministic, derived from the tenant address.
-- **Creation**: `EnsureTenantNetwork` creates the network on first use, or returns the existing one.
-- **Removal**: the network worker calls `RemoveTenantNetworkIfEmpty` after rechecking that the tenant has no active provisions; Docker must also confirm that no containers are connected. A busy tenant stripe defers that candidate.
-- **Orphan cleanup**: successful close leaves reclamation to the independent worker. Passes run serially with a finite budget; a backlog may require multiple passes. Close completion does not imply immediate subnet reuse.
-- Networks carry `fred.managed=true` and `fred.tenant` labels.
+- **Naming**: `fred-<lease_uuid>`, the lease's Compose project name. The compose project is the only place that names it, and only from the lease's own UUID, so no lease can be attached to another lease's network.
+- **Creation**: the lease's Compose project declares the network, and Compose creates it on Up. Fred makes no network call of its own.
+- **Removal**: Compose Down removes it when the lease closes. The network worker reclaims one a failed Down left behind, only when this backend tracks no provision for the lease and no lifecycle command holds the lease's fence; Docker must also confirm that no containers are connected.
+- **Labels**: `fred.managed=true`, `fred.lease_uuid`, `fred.backend_name` and `fred.network_scope=lease`, plus Compose's own project labels. The labels are fixed: Compose recreates a network whose configuration hash changes.
+- **Upgrading from per-tenant networks**: releases before per-lease networks attached every lease of a tenant to one `fred-tenant-<hex(sha256(tenant)[:8])>` network. A running lease stays there until Compose next recreates its containers (restart, update, custom-domain change, restore or re-provision); the new network key changes every service's Compose hash, so that recreate moves all of its services, including stopped ones. Fred no longer creates tenant networks; the worker removes one once the tenant has no provision on this backend.
 
 ## Container Labels
 
@@ -2038,6 +2045,7 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 | `fred.fail_count` | integer string | Lifetime number of failures recorded for this lease at creation time (diagnostic; never decides a close) |
 | `fred.callback_url` | URL string | Exact completion URL with an operation capability for new provision/restore; inherited v0.13 lineage remains tokenless |
 | `fred.lifecycle_callback_url` | URL string | Paired endpoint for later maintenance, runtime-failure, and deprovision observations; typed for new provision/restore, tokenless for inherited v0.13 lineage; persisted across backend restarts |
+| `fred.runtime_contract` | integer string | Runtime contract the container was created under (network shape, security profile). A container without it predates the contract; a provider-driven refresh recreates such containers |
 | `fred.maintenance_id` | UUIDv4 string, or empty | Exact `maintenance_id` of the restart, update or custom-domain redeploy that created the container; empty for a provision or restore launch. Identifies the replacement cohort during recovery |
 | `fred.service_name` | service name string | Service name within the lease's stack (`app` for a single-service lease). Every managed container carries it; a strict inventory fails on a managed container without it |
 | `fred.backend_name` | backend name string | Name of the backend managing the container; set on every managed container |

@@ -4,10 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/docker/docker/client"
 	"github.com/stretchr/testify/assert"
@@ -23,15 +20,15 @@ func TestRemoveTenantNetworkReportsActualDockerOutcome(t *testing.T) {
 		inspectStatus int
 		inspectBody   string
 		removeStatus  int
-		want          tenantNetworkRemoval
+		want          networkRemoval
 		wantError     bool
 	}{
-		{name: "removed", inspectStatus: http.StatusOK, inspectBody: `{"Id":"network-id","Containers":{}}`, removeStatus: http.StatusNoContent, want: tenantNetworkRemoved},
-		{name: "already absent", inspectStatus: http.StatusNotFound, inspectBody: `{"message":"network not found"}`, want: tenantNetworkAbsent},
-		{name: "in use", inspectStatus: http.StatusOK, inspectBody: `{"Id":"network-id","Containers":{"container-id":{"Name":"active"}}}`, want: tenantNetworkInUse},
-		{name: "removed concurrently", inspectStatus: http.StatusOK, inspectBody: `{"Id":"network-id","Containers":{}}`, removeStatus: http.StatusNotFound, want: tenantNetworkAbsent},
-		{name: "inspect failed", inspectStatus: http.StatusInternalServerError, inspectBody: `{"message":"inspect failed"}`, want: tenantNetworkRemovalUnknown, wantError: true},
-		{name: "remove failed", inspectStatus: http.StatusOK, inspectBody: `{"Id":"network-id","Containers":{}}`, removeStatus: http.StatusConflict, want: tenantNetworkRemovalUnknown, wantError: true},
+		{name: "removed", inspectStatus: http.StatusOK, inspectBody: `{"Id":"network-id","Containers":{}}`, removeStatus: http.StatusNoContent, want: networkRemoved},
+		{name: "already absent", inspectStatus: http.StatusNotFound, inspectBody: `{"message":"network not found"}`, want: networkAbsent},
+		{name: "in use", inspectStatus: http.StatusOK, inspectBody: `{"Id":"network-id","Containers":{"container-id":{"Name":"active"}}}`, want: networkInUse},
+		{name: "removed concurrently", inspectStatus: http.StatusOK, inspectBody: `{"Id":"network-id","Containers":{}}`, removeStatus: http.StatusNotFound, want: networkAbsent},
+		{name: "inspect failed", inspectStatus: http.StatusInternalServerError, inspectBody: `{"message":"inspect failed"}`, want: networkRemovalUnknown, wantError: true},
+		{name: "remove failed", inspectStatus: http.StatusOK, inspectBody: `{"Id":"network-id","Containers":{}}`, removeStatus: http.StatusConflict, want: networkRemovalUnknown, wantError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			removals := 0
@@ -119,9 +116,9 @@ func TestListIdleManagedNetworksRejectsCanceledInventory(t *testing.T) {
 func TestReleaseTenantNetwork_SkipsWhenOtherLeaseActive(t *testing.T) {
 	removeCalled := false
 	mock := &mockDockerClient{
-		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
+		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) (networkRemoval, error) {
 			removeCalled = true
-			return tenantNetworkRemoved, nil
+			return networkRemoved, nil
 		},
 	}
 
@@ -140,9 +137,9 @@ func TestReleaseTenantNetwork_SkipsWhenOtherLeaseActive(t *testing.T) {
 func TestReleaseTenantNetwork_RemovesWhenNoActiveLease(t *testing.T) {
 	var removedTenants []string
 	mock := &mockDockerClient{
-		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
+		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) (networkRemoval, error) {
 			removedTenants = append(removedTenants, tenant)
-			return tenantNetworkRemoved, nil
+			return networkRemoved, nil
 		},
 	}
 
@@ -159,9 +156,9 @@ func TestReleaseTenantNetwork_RemovesWhenNoActiveLease(t *testing.T) {
 func TestReleaseTenantNetwork_DifferentTenantsDoNotBlock(t *testing.T) {
 	var removedTenants []string
 	mock := &mockDockerClient{
-		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
+		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) (networkRemoval, error) {
 			removedTenants = append(removedTenants, tenant)
-			return tenantNetworkRemoved, nil
+			return networkRemoved, nil
 		},
 	}
 
@@ -174,142 +171,98 @@ func TestReleaseTenantNetwork_DifferentTenantsDoNotBlock(t *testing.T) {
 	assert.Equal(t, []string{"tenant-x"}, removedTenants)
 }
 
-// TestTenantNetwork_SerializesEnsureAndRelease verifies that for a given
-// tenant, EnsureTenantNetwork and RemoveTenantNetworkIfEmpty are never in
-// flight at the same time. This is the property that prevents the race.
-func TestTenantNetwork_SerializesEnsureAndRelease(t *testing.T) {
-	var inFlight atomic.Int32
-	var overlap atomic.Bool
-
-	observe := func() {
-		if inFlight.Add(1) > 1 {
-			overlap.Store(true)
-		}
-		// Keep the fake op long enough to produce observable overlap
-		// if serialization ever broke.
-		time.Sleep(2 * time.Millisecond)
-		inFlight.Add(-1)
-	}
-
-	mock := &mockDockerClient{
-		EnsureTenantNetworkFn: func(ctx context.Context, tenant string) (string, error) {
-			observe()
-			return "net-id", nil
-		},
-		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
-			observe()
-			return tenantNetworkRemoved, nil
-		},
-	}
-
-	b := newBackendForTest(mock, nil)
-
-	var wg sync.WaitGroup
-	ctx := context.Background()
-	for range 20 {
-		wg.Go(func() {
-			_ = runTenantStorageMutationForTest(t, b, stackFixtureLeaseUUID, "tenant-x",
-				func(mutations *storageMutations) error {
-					return b.ensureTenantNetworkWith(mutations, ctx, "tenant-x")
-				})
-		})
-		wg.Go(func() {
-			_ = b.releaseTenantNetwork(ctx, "tenant-x")
-		})
-	}
-	wg.Wait()
-
-	assert.False(t, overlap.Load(), "ensure and release must never overlap for the same tenant")
-}
-
-// TestTenantNetwork_DifferentTenantsRunInParallel verifies that the
-// per-tenant mutex does NOT serialize operations across different
-// tenants — that would regress throughput.
-func TestTenantNetwork_DifferentTenantsRunInParallel(t *testing.T) {
-	var inFlight atomic.Int32
-	var maxInFlight atomic.Int32
-
-	mock := &mockDockerClient{
-		EnsureTenantNetworkFn: func(ctx context.Context, tenant string) (string, error) {
-			n := inFlight.Add(1)
-			for {
-				cur := maxInFlight.Load()
-				if n <= cur || maxInFlight.CompareAndSwap(cur, n) {
-					break
+func TestRemoveLeaseNetworkRequiresOwnershipLabels(t *testing.T) {
+	const lease = "88888888-8888-4888-8888-888888888888"
+	owned := `{"Id":"network-id","Containers":{},"Labels":{"fred.managed":"true","fred.lease_uuid":"` + lease +
+		`","fred.network_scope":"lease","fred.backend_name":"backend-a"}}`
+	for _, tc := range []struct {
+		name        string
+		inspectBody string
+		want        networkRemoval
+		wantRemove  bool
+		wantError   bool
+	}{
+		{name: "owned and empty", inspectBody: owned, want: networkRemoved, wantRemove: true},
+		{name: "another lease's labels", inspectBody: `{"Id":"network-id","Containers":{},"Labels":{"fred.managed":"true","fred.lease_uuid":"other","fred.network_scope":"lease","fred.backend_name":"backend-a"}}`, want: networkRemovalUnknown, wantError: true},
+		{name: "another backend's network", inspectBody: `{"Id":"network-id","Containers":{},"Labels":{"fred.managed":"true","fred.lease_uuid":"` + lease + `","fred.network_scope":"lease","fred.backend_name":"backend-b"}}`, want: networkRemovalUnknown, wantError: true},
+		{name: "unlabeled same-named network", inspectBody: `{"Id":"network-id","Containers":{}}`, want: networkRemovalUnknown, wantError: true},
+		{name: "connected", inspectBody: `{"Id":"network-id","Containers":{"c":{"Name":"x"}},"Labels":{"fred.managed":"true","fred.lease_uuid":"` + lease + `","fred.network_scope":"lease","fred.backend_name":"backend-a"}}`, want: networkInUse},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			removals := 0
+			transport := dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.Method {
+				case http.MethodGet:
+					require.Equal(t, "/v1.51/networks/"+leaseNetworkName(lease), req.URL.Path)
+					return imageSecurityResponse(http.StatusOK, tc.inspectBody), nil
+				case http.MethodDelete:
+					removals++
+					require.Equal(t, "/v1.51/networks/network-id", req.URL.Path)
+					return imageSecurityResponse(http.StatusNoContent, ``), nil
+				default:
+					t.Fatalf("unexpected Docker request: %s %s", req.Method, req.URL.Path)
+					return nil, nil
 				}
+			})
+			sdk, err := client.NewClientWithOpts(client.WithHost("http://docker.invalid"), client.WithVersion("1.51"), client.WithHTTPClient(&http.Client{Transport: transport}))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, sdk.Close()) })
+			docker := &DockerClient{client: newDockerSDKView(sdk), backendName: "backend-a"}
+			outcome, err := docker.RemoveLeaseNetworkIfEmpty(t.Context(), lease)
+			if tc.wantError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
 			}
-			time.Sleep(5 * time.Millisecond)
-			inFlight.Add(-1)
-			return "net-id", nil
-		},
-	}
-
-	b := newBackendForTest(mock, nil)
-
-	var wg sync.WaitGroup
-	ctx := context.Background()
-	for i := range 10 {
-		tenant := string(rune('a'+i)) + "-tenant"
-		wg.Go(func() {
-			_ = runTenantStorageMutationForTest(t, b, stackFixtureLeaseUUID, tenant,
-				func(mutations *storageMutations) error {
-					return b.ensureTenantNetworkWith(mutations, ctx, tenant)
-				})
+			require.Equal(t, tc.want, outcome)
+			if tc.wantRemove {
+				require.Equal(t, 1, removals)
+			} else {
+				require.Zero(t, removals, "only an empty network carrying this lease's and backend's labels may be removed")
+			}
 		})
 	}
-	wg.Wait()
-
-	assert.Greater(t, maxInFlight.Load(), int32(1),
-		"different tenants should run in parallel; got max_in_flight=%d", maxInFlight.Load())
 }
 
-// TestTenantNetwork_RaceScenario pins the tenant-network removal
-// invariant: when lease A deprovisions while lease B provisions on
-// the same tenant, A must observe B's entry in b.provisions and skip
-// network removal, so B's ContainerCreate doesn't fail on a missing
-// network between Ensure and Create.
-func TestTenantNetwork_RaceScenario(t *testing.T) {
-	var removeCalled atomic.Bool
+func TestReleaseLeaseNetwork_KeepsTrackedLease(t *testing.T) {
+	const lease = "99999999-9999-4999-8999-999999999999"
+	removeCalled := false
 	mock := &mockDockerClient{
-		EnsureTenantNetworkFn: func(ctx context.Context, tenant string) (string, error) {
-			// Widen the window between Ensure and ContainerCreate so
-			// a concurrent Deprovision can race through the removal path.
-			time.Sleep(5 * time.Millisecond)
-			return "net-id", nil
-		},
-		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
-			removeCalled.Store(true)
-			return tenantNetworkRemoved, nil
+		RemoveLeaseNetworkIfEmptyFn: func(context.Context, string) (networkRemoval, error) {
+			removeCalled = true
+			return networkRemoved, nil
 		},
 	}
-
-	// Lease B exists in b.provisions (as it would after Provision()'s
-	// synchronous reservation phase) while its doProvision is running.
+	// A failed or still-provisioning lease keeps its network: compensation and
+	// re-provision reattach containers to it by name.
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-b", Tenant: "tenant-x", Status: backend.ProvisionStatusProvisioning}},
+		lease: {ProvisionState: leasesm.ProvisionState{LeaseUUID: lease, Tenant: "tenant-x", Status: backend.ProvisionStatusFailed}},
 	})
+	outcome, err := b.releaseLeaseNetwork(t.Context(), lease)
+	require.NoError(t, err)
+	assert.Equal(t, networkOwned, outcome)
+	assert.False(t, removeCalled)
+}
 
-	ctx := context.Background()
-	var wg sync.WaitGroup
+func TestReleaseLeaseNetwork_KeepsWhileFenceHeld(t *testing.T) {
+	const lease = "99999999-9999-4999-8999-999999999998"
+	removeCalled := false
+	mock := &mockDockerClient{
+		RemoveLeaseNetworkIfEmptyFn: func(context.Context, string) (networkRemoval, error) {
+			removeCalled = true
+			return networkRemoved, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	unlock := b.commandFence.Lock(lease)
+	outcome, err := b.releaseLeaseNetwork(t.Context(), lease)
+	unlock()
+	require.NoError(t, err)
+	assert.Equal(t, networkBusy, outcome)
+	assert.False(t, removeCalled, "an admission holding the fence may be about to use the network")
 
-	// Lease B's doProvision-style ensure call.
-	wg.Go(func() {
-		err := runTenantStorageMutationForTest(t, b, stackFixtureLeaseUUID, "tenant-x",
-			func(mutations *storageMutations) error {
-				return b.ensureTenantNetworkWith(mutations, ctx, "tenant-x")
-			})
-		require.NoError(t, err)
-	})
-
-	// Lease A's deprovision has already removed its own entry and now
-	// tries to release the tenant network. B's entry is still present,
-	// so release must be skipped.
-	wg.Go(func() {
-		err := b.releaseTenantNetwork(ctx, "tenant-x")
-		require.NoError(t, err)
-	})
-
-	wg.Wait()
-	assert.False(t, removeCalled.Load(),
-		"with lease-b still present in b.provisions, release must not remove the network")
+	outcome, err = b.releaseLeaseNetwork(t.Context(), lease)
+	require.NoError(t, err)
+	assert.Equal(t, networkRemoved, outcome)
+	assert.True(t, removeCalled)
 }

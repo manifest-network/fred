@@ -1197,21 +1197,10 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	}))
 	defer callbackServer.Close()
 
-	networkCreated := false
+	// No Docker network call is wired: Fred no longer creates a network
+	// itself. Compose creates the lease's own network from the project.
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
-			return nil
-		},
-		EnsureTenantNetworkFn: func(ctx context.Context, tenant string) (string, error) {
-			networkCreated = true
-			assert.Equal(t, "tenant-a", tenant)
-			return "net-123", nil
-		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			assert.NotNil(t, params.NetworkConfig, "network config should be set")
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
 			return nil
 		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
@@ -1229,6 +1218,13 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	b.provisions[durableCallbackTestLeaseUUID].CallbackURL = callbackServer.URL
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	compose := b.compose.(*mockComposeExecutor)
+	nominalUp := compose.UpFn
+	var launched *composetypes.Project
+	compose.UpFn = func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+		launched = project
+		return nominalUp(ctx, project, opts)
+	}
 
 	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
@@ -1237,7 +1233,13 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	req.CallbackURL = testOperationCallbackURL(callbackServer.URL)
 	b.doProvisionAndFire(t, context.Background(), req, manifest, profiles, b.logger)
 
-	assert.True(t, networkCreated)
+	require.NotNil(t, launched)
+	require.Contains(t, launched.Networks, leaseNetworkKey)
+	assert.Equal(t, leaseNetworkName(durableCallbackTestLeaseUUID), launched.Networks[leaseNetworkKey].Name)
+	assert.False(t, bool(launched.Networks[leaseNetworkKey].External))
+	for name, svc := range launched.Services {
+		require.Contains(t, svc.Networks, leaseNetworkKey, name)
+	}
 
 	b.provisionsMu.RLock()
 	prov := b.provisions[durableCallbackTestLeaseUUID]
@@ -1490,20 +1492,22 @@ func TestDeprovision_Idempotent(t *testing.T) {
 }
 
 func TestDeprovision_WithNetworkIsolation(t *testing.T) {
+	// Compose Down removes the lease network on close. When it is left behind
+	// anyway, the independent network sweep reclaims it once the lease is gone.
 	networkCleanupCalled := false
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
 			return nil
 		},
-		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
+		RemoveLeaseNetworkIfEmptyFn: func(ctx context.Context, leaseUUID string) (networkRemoval, error) {
 			networkCleanupCalled = true
-			assert.Equal(t, "tenant-a", tenant)
-			return tenantNetworkRemoved, nil
+			assert.Equal(t, durableCallbackTestLeaseUUID, leaseUUID)
+			return networkRemoved, nil
 		},
 		ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
 			return []networktypes.Inspect{{
-				Name:       TenantNetworkName("tenant-a"),
-				Labels:     map[string]string{LabelTenant: "tenant-a"},
+				Name:       leaseNetworkName(durableCallbackTestLeaseUUID),
+				Labels:     leaseNetworkLabels(durableCallbackTestLeaseUUID, ""),
 				Containers: map[string]networktypes.EndpointResource{},
 			}}, nil
 		},

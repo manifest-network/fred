@@ -523,7 +523,7 @@ Declares startup ordering between services in a stack.
 
 ### Inter-Service DNS
 
-When network isolation is enabled, all services in a stack share the same tenant network. Each service's containers are created with the service name as a network alias, allowing services to reach each other by name (e.g., the `web` service can connect to `db:5432`).
+When network isolation is enabled, all services in a stack share the lease's own network. Each service's containers are created with the service name as a network alias, allowing services to reach each other by name (e.g., the `web` service can connect to `db:5432`). A service name resolves only within its lease: other leases, including your own, cannot be reached by name or address over this network.
 
 ### Cycle Detection
 

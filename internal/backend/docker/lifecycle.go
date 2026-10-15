@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,7 +15,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -58,8 +56,15 @@ const (
 	LabelServiceName          = "fred.service_name"
 	LabelFQDN                 = "fred.fqdn"
 	LabelCustomDomain         = "fred.custom_domain"
-	LabelImageReference       = imageexec.LabelImageReference
-	LabelImageID              = imageexec.LabelImageID
+	// LabelNetworkScope marks a network Fred owns per lease. Legacy per-tenant
+	// networks carry LabelTenant instead.
+	LabelNetworkScope = "fred.network_scope"
+	// LabelRuntimeContract records the runtime contract a container was created
+	// under (see currentRuntimeContract). A container without it predates the
+	// contract.
+	LabelRuntimeContract = "fred.runtime_contract"
+	LabelImageReference  = imageexec.LabelImageReference
+	LabelImageID         = imageexec.LabelImageID
 )
 
 // DaemonSecurityInfo contains Docker daemon capabilities relevant to
@@ -1008,7 +1013,7 @@ type CreateContainerParams struct {
 	// NetworkName must be non-empty when Ingress is enabled (enforced by
 	// Config.Validate requiring network_isolation).
 	Ingress     IngressConfig
-	NetworkName string // Per-tenant network name for traefik.docker.network label
+	NetworkName string // Network name for the traefik.docker.network label
 	Quantity    int    // Total quantity for this service (used in subdomain computation)
 
 	// CustomDomain is the optional tenant-supplied FQDN for this LeaseItem.
@@ -1919,116 +1924,112 @@ func parseContainerMaintenanceID(raw string) (shared.MaintenanceID, error) {
 	return maintenanceid.Parse(raw)
 }
 
-// TenantNetworkName returns a deterministic network name for a tenant address.
+// TenantNetworkName returns the deterministic name of the per-tenant network
+// that releases before per-lease networks attached every lease of a tenant to.
+// Fred no longer creates it; the network reclamation worker removes it once
+// the tenant has no provisions on this backend.
 func TenantNetworkName(tenant string) string {
 	h := sha256.Sum256([]byte(tenant))
 	return "fred-tenant-" + hex.EncodeToString(h[:8])
 }
 
-// EnsureTenantNetwork creates or returns the existing network for a tenant.
-// The network is a per-tenant bridge that provides inter-tenant isolation.
-// Note: Internal must be false because Docker internal networks do not
-// support port publishing (moby/moby#36174). Outbound internet access
-// from containers is a side effect.
-func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (string, error) {
-	name := TenantNetworkName(tenant)
-
-	// Check if network already exists. The backend_name filter is safe here:
-	// every network Fred creates has this label set (see netLabels below),
-	// so there are no pre-existing networks without it to miss.
-	nf := filters.NewArgs(
-		filters.Arg("name", name),
-		filters.Arg("label", LabelManaged+"=true"),
-	)
-	if d.backendName != "" {
-		nf.Add("label", LabelBackendName+"="+d.backendName)
-	}
-	networks, err := d.client.NetworkList(ctx, networktypes.ListOptions{
-		Filters: nf,
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to list networks: %w", err)
-	}
-	if len(networks) > 0 {
-		return networks[0].ID, nil
-	}
-
-	// Create the network. If a concurrent caller already created it, the
-	// Docker API returns a conflict error. Handle this by re-listing.
-	netLabels := map[string]string{
-		LabelManaged: "true",
-		LabelTenant:  tenant,
-	}
-	if d.backendName != "" {
-		netLabels[LabelBackendName] = d.backendName
-	}
-	resp, err := d.client.NetworkCreate(ctx, name, networktypes.CreateOptions{
-		Driver:   "bridge",
-		Internal: false, // Must be false: Internal:true prevents port publishing (moby#36174)
-		Labels:   netLabels,
-	})
-	if err != nil {
-		if errdefs.IsConflict(err) {
-			// Another goroutine created the network between our list and create.
-			networks, listErr := d.client.NetworkList(ctx, networktypes.ListOptions{
-				Filters: nf,
-			})
-			if listErr != nil {
-				return "", fmt.Errorf("failed to list networks after conflict: %w", listErr)
-			}
-			if len(networks) > 0 {
-				return networks[0].ID, nil
-			}
-			return "", fmt.Errorf("network conflict but not found on retry: %w", err)
-		}
-		return "", fmt.Errorf("failed to create tenant network: %w", err)
-	}
-	return resp.ID, nil
+// leaseNetworkName returns the name of the lease's own bridge network. It is
+// the Compose project name, so the network sorts with the lease's containers.
+// Compose creates the network on Up and removes it on Down.
+func leaseNetworkName(leaseUUID string) string {
+	return composeProjectName(leaseUUID)
 }
 
-// tenantNetworkRemoval is a diagnostic result, never mutation authority.
-type tenantNetworkRemoval uint8
+// leaseNetworking reports how this backend attaches a lease's containers. A
+// lease still on its legacy tenant network moves to its own network when the
+// next Compose Up recreates its containers.
+func (b *Backend) leaseNetworking() leaseNetworking {
+	if b.cfg.IsNetworkIsolation() {
+		return leaseNetworkingIsolated
+	}
+	return leaseNetworkingNone
+}
+
+// networkScopeLease is the LabelNetworkScope value of a per-lease network.
+const networkScopeLease = "lease"
+
+// leaseNetworkLabels are the fixed labels of a lease's network. They must stay
+// byte-stable across releases: Compose hashes the network config and recreates
+// the network, disconnecting every container, when the hash changes.
+func leaseNetworkLabels(leaseUUID, backendName string) map[string]string {
+	labels := map[string]string{
+		LabelManaged:      "true",
+		LabelLeaseUUID:    leaseUUID,
+		LabelNetworkScope: networkScopeLease,
+	}
+	if backendName != "" {
+		labels[LabelBackendName] = backendName
+	}
+	return labels
+}
+
+// networkRemoval is a diagnostic result, never mutation authority.
+type networkRemoval uint8
 
 const (
-	tenantNetworkRemovalUnknown tenantNetworkRemoval = iota
-	tenantNetworkRemoved
-	tenantNetworkAbsent
-	tenantNetworkInUse
-	tenantNetworkOwned
-	tenantNetworkBusy
+	networkRemovalUnknown networkRemoval = iota
+	networkRemoved
+	networkAbsent
+	networkInUse
+	networkOwned
+	networkBusy
 )
 
-// RemoveTenantNetworkIfEmpty removes the tenant's network if no containers are
-// connected, distinguishing an actual deletion from idempotent absence or use.
-func (d *DockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
-	name := TenantNetworkName(tenant)
+// RemoveTenantNetworkIfEmpty removes the tenant's legacy network if no
+// containers are connected, distinguishing an actual deletion from idempotent
+// absence or use.
+func (d *DockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (networkRemoval, error) {
+	return d.removeNetworkIfEmpty(ctx, TenantNetworkName(tenant), nil)
+}
 
+// RemoveLeaseNetworkIfEmpty removes the lease's network if no containers are
+// connected. The network must carry this lease's and this backend's labels: a
+// same-named network Fred did not create for this lease is never removed.
+func (d *DockerClient) RemoveLeaseNetworkIfEmpty(ctx context.Context, leaseUUID string) (networkRemoval, error) {
+	return d.removeNetworkIfEmpty(ctx, leaseNetworkName(leaseUUID), func(labels map[string]string) bool {
+		if labels[LabelManaged] != "true" || labels[LabelNetworkScope] != networkScopeLease ||
+			labels[LabelLeaseUUID] != leaseUUID {
+			return false
+		}
+		return d.backendName == "" || labels[LabelBackendName] == d.backendName
+	})
+}
+
+func (d *DockerClient) removeNetworkIfEmpty(ctx context.Context, name string, owned func(map[string]string) bool) (networkRemoval, error) {
 	// Inspect to check connected containers
 	resp, err := d.client.NetworkInspect(ctx, name, networktypes.InspectOptions{})
 	if err != nil {
 		if client.IsErrNotFound(err) {
-			return tenantNetworkAbsent, nil
+			return networkAbsent, nil
 		}
-		return tenantNetworkRemovalUnknown, fmt.Errorf("failed to inspect network: %w", err)
+		return networkRemovalUnknown, fmt.Errorf("failed to inspect network: %w", err)
+	}
+	if owned != nil && !owned(resp.Labels) {
+		return networkRemovalUnknown, fmt.Errorf("network %q does not carry the expected ownership labels", name)
 	}
 
 	if len(resp.Containers) > 0 {
-		return tenantNetworkInUse, nil
+		return networkInUse, nil
 	}
 
 	if err := d.client.NetworkRemove(ctx, resp.ID); err != nil {
 		if client.IsErrNotFound(err) {
-			return tenantNetworkAbsent, nil
+			return networkAbsent, nil
 		}
-		return tenantNetworkRemovalUnknown, fmt.Errorf("failed to remove network: %w", err)
+		return networkRemovalUnknown, fmt.Errorf("failed to remove network: %w", err)
 	}
-	return tenantNetworkRemoved, nil
+	return networkRemoved, nil
 }
 
 // ListIdleManagedNetworks selects managed network cleanup candidates in one
-// daemon query. A list result never grants removal authority: the tenant stripe,
-// current provision ownership and exact network inspect are rechecked by
-// RemoveTenantNetworkIfEmpty immediately before removal.
+// daemon query. A list result never grants removal authority: current
+// provision ownership and an exact network inspect are rechecked immediately
+// before removal.
 func (d *DockerClient) ListIdleManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error) {
 	f := filters.NewArgs(
 		filters.Arg("label", LabelManaged+"=true"),
@@ -2047,66 +2048,66 @@ func (d *DockerClient) ListIdleManagedNetworks(ctx context.Context) ([]networkty
 	return summaries, nil
 }
 
-// tenantNetworkStripeCount is the number of per-tenant stripe mutexes.
-// Tenants hash into this fixed-size array; two tenants share a stripe
-// with probability 1/tenantNetworkStripeCount. Chosen to keep collision
-// probability negligible for realistic tenant counts while keeping
-// memory bounded (256 * ~24 bytes = ~6 KB, constant).
-const tenantNetworkStripeCount = 256
-
-// tenantNetworkMu returns the stripe mutex that serializes
-// EnsureTenantNetwork and RemoveTenantNetworkIfEmpty for a given
-// tenant. FNV-1a hash → modulo gives an even distribution; two
-// unrelated tenants colliding just serialize their (infrequent)
-// network ops with each other, which is benign.
-func (b *Backend) tenantNetworkMu(tenant string) *sync.Mutex {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(tenant))
-	return &b.tenantNetworkStripes[h.Sum32()%tenantNetworkStripeCount]
-}
-
-func (b *Backend) ensureTenantNetworkWith(mutations *storageMutations, ctx context.Context, tenant string) error {
-	mu := b.tenantNetworkMu(tenant)
-	mu.Lock()
-	defer mu.Unlock()
-	_, err := mutations.ensureTenantNetwork(ctx, tenant)
-	return err
-}
-
 // removeOrphanedTenantNetworkUsing consumes a tenant selected by the fixed
-// managed-network sweep and revalidates it under the same stripe used by
-// EnsureTenantNetwork. No caller-retained service can invoke removeNetwork or
-// select an arbitrary tenant.
+// managed-network sweep. Nothing creates tenant networks any more, so the only
+// reason to keep one is a lease of that tenant still running on it: any
+// provision of the tenant keeps the network.
 func (b *Backend) removeOrphanedTenantNetworkUsing(
 	ctx context.Context,
 	tenant string,
 	removeNetwork backgroundTenantNetworkRemove,
-) (tenantNetworkRemoval, error) {
+) (networkRemoval, error) {
 	if removeNetwork == nil {
-		return tenantNetworkRemovalUnknown, errBackgroundMaintenanceUnavailable
+		return networkRemovalUnknown, errBackgroundMaintenanceUnavailable
 	}
 	if err := ctx.Err(); err != nil {
-		return tenantNetworkRemovalUnknown, err
+		return networkRemovalUnknown, err
 	}
-	mu := b.tenantNetworkMu(tenant)
-	// Reclamation is best-effort. Never wait behind foreground network work:
-	// a contended stripe is retried by the next bounded network pass, keeping
-	// shutdown responsive even while another tenant sharing the stripe is busy.
-	if !mu.TryLock() {
-		return tenantNetworkBusy, nil
-	}
-	defer mu.Unlock()
 
 	b.provisionsMu.RLock()
 	for _, p := range b.provisions {
 		if p.Tenant == tenant {
 			b.provisionsMu.RUnlock()
-			return tenantNetworkOwned, nil
+			return networkOwned, nil
 		}
 	}
 	b.provisionsMu.RUnlock()
 
 	return removeNetwork(ctx, tenant)
+}
+
+// removeOrphanedLeaseNetworkUsing consumes a lease whose network the sweep
+// found idle. Compose Down removes a lease network on close, so this only
+// reclaims one a failed Down or a per-container fallback teardown left behind.
+// It removes the network only on a positive fact: this backend tracks no
+// provision for the lease, and no command holds the lease's fence. The fence
+// is held across the removal, so an admission for the same lease waits for it.
+// A busy fence is retried by the next pass instead of waited on.
+func (b *Backend) removeOrphanedLeaseNetworkUsing(
+	ctx context.Context,
+	leaseUUID string,
+	removeNetwork backgroundLeaseNetworkRemove,
+) (networkRemoval, error) {
+	if removeNetwork == nil {
+		return networkRemovalUnknown, errBackgroundMaintenanceUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return networkRemovalUnknown, err
+	}
+	unlock, acquired := b.commandFence.TryLock(leaseUUID)
+	if !acquired {
+		return networkBusy, nil
+	}
+	defer unlock()
+
+	b.provisionsMu.RLock()
+	_, tracked := b.provisions[leaseUUID]
+	b.provisionsMu.RUnlock()
+	if tracked {
+		return networkOwned, nil
+	}
+
+	return removeNetwork(ctx, leaseUUID)
 }
 
 // HealthStatus represents the health check status of a Docker container.

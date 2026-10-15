@@ -26,18 +26,16 @@ import (
 	"sync"
 )
 
-// volumeNameStripeCount is the number of per-volume-name stripe mutexes. Sized and
-// justified exactly like tenantNetworkStripeCount (lifecycle.go): a fixed array keeps
-// memory constant against attacker-creatable keys — volume names embed lease UUIDs, so a
+// volumeNameStripeCount is the number of per-volume-name stripe mutexes. A fixed array
+// keeps memory constant against attacker-creatable keys — volume names embed lease UUIDs, so a
 // map[name]*Mutex would grow with every lease the node has ever seen — and a collision
 // only serializes two unrelated volumes' (infrequent) create/destroy with each other.
 const volumeNameStripeCount = 256
 
 // volumeNameMu returns the stripe mutex for a managed volume name.
 //
-// Lock ordering: volume-name stripe -> provisionsMu (RLock), matching the tenant-network
-// rule documented on Backend. Neither holder takes provisionsMu on entry, and a volume
-// stripe is never held across a tenant-network acquisition.
+// Lock ordering: volume-name stripe -> provisionsMu (RLock). Neither holder takes
+// provisionsMu on entry.
 func (b *Backend) volumeNameMu(name string) *sync.Mutex {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(name))
