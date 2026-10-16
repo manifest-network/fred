@@ -274,8 +274,10 @@ func daemonCompletedLaunchResponse(req *http.Request, response *http.Response) b
 
 // daemonLaunchTransport binds one Compose invocation to its launch scope. It
 // refuses every network mutation and every container create that does not
-// attach to exactly the launch's verified network, then checks each create
-// against the tenant profile, all before the scope admits the request.
+// attach to exactly the launch's verified network, confirms before each
+// create and start that the verified network ID still resolves to that
+// network, and checks each create against the tenant profile, all before the
+// scope admits the request.
 type daemonLaunchTransport struct {
 	next     http.RoundTripper
 	scope    *daemonLaunchScope
@@ -287,10 +289,24 @@ func (t daemonLaunchTransport) RoundTrip(req *http.Request) (*http.Response, err
 	if err := t.network.refuse(req); err != nil {
 		return refuseCreate(req, err)
 	}
+	if err := t.network.confirm(req, scopedDaemon{scope: t.scope, next: t.next}); err != nil {
+		return refuseCreate(req, err)
+	}
 	if err := refuseUnconfinedCreate(t.profiles, req); err != nil {
 		return refuseCreate(req, err)
 	}
 	return t.scope.roundTrip(t.next, req)
+}
+
+// scopedDaemon sends a launch's own read through its scope, so a scope that
+// has ended or been canceled sends nothing.
+type scopedDaemon struct {
+	scope *daemonLaunchScope
+	next  http.RoundTripper
+}
+
+func (d scopedDaemon) RoundTrip(req *http.Request) (*http.Response, error) {
+	return d.scope.roundTrip(d.next, req)
 }
 
 type daemonLaunchContextKey struct{}

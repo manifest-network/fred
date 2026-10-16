@@ -412,3 +412,56 @@ func (p launchNetworkPolicy) verifyCreateBody(data []byte) error {
 	}
 	return nil
 }
+
+// maxLaunchNetworkInspectBody bounds the network inspection read before a
+// launch request. Its Containers map lists only this lease's containers.
+const maxLaunchNetworkInspectBody = 4 << 20
+
+// confirm runs before a container create or start under an established
+// authority. Docker resolves a network reference by exact ID and then by exact
+// name, at create and again at start, so the full ID protects the attachment
+// only while the verified network exists: once it is gone, a network named
+// with that ID would receive the container. The daemon is asked what the ID
+// resolves to now, through the launch's own transport, and the request goes
+// ahead only when that is the authority's network itself.
+func (p launchNetworkPolicy) confirm(req *http.Request, daemon http.RoundTripper) error {
+	if !p.authority.established() || !daemonContainerLaunchRequest(req) {
+		return nil
+	}
+	prefix, _, _ := strings.Cut(req.URL.Path, "/containers/")
+	// The parsed URL is reused rather than re-parsed: a Docker client on a
+	// unix socket escapes the socket path into the URL host.
+	target := *req.URL
+	target.Path, target.RawPath, target.RawQuery = prefix+"/networks/"+p.authority.networkID, "", ""
+	inspect, err := http.NewRequestWithContext(req.Context(), http.MethodGet, "/", nil)
+	if err != nil {
+		return fmt.Errorf("%w: build the lease network inspection: %w", errLeaseNetworkOwnership, err)
+	}
+	inspect.URL, inspect.Host = &target, req.Host
+	if agent := req.Header.Get("User-Agent"); agent != "" {
+		inspect.Header.Set("User-Agent", agent)
+	}
+	response, err := daemon.RoundTrip(inspect)
+	if err != nil {
+		return fmt.Errorf("%w: inspect the verified lease network: %w", errLeaseNetworkOwnership, err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("%w: the verified lease network does not resolve (status %d)", errLeaseNetworkOwnership, response.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxLaunchNetworkInspectBody+1))
+	if err != nil {
+		return fmt.Errorf("%w: read the lease network inspection: %w", errLeaseNetworkOwnership, err)
+	}
+	if len(data) > maxLaunchNetworkInspectBody {
+		return fmt.Errorf("%w: the lease network inspection exceeds %d bytes", errLeaseNetworkOwnership, maxLaunchNetworkInspectBody)
+	}
+	var resolved networktypes.Inspect
+	if err := json.Unmarshal(data, &resolved); err != nil {
+		return fmt.Errorf("%w: decode the lease network inspection: %w", errLeaseNetworkOwnership, err)
+	}
+	if resolved.ID != p.authority.networkID {
+		return fmt.Errorf("%w: the verified lease network ID now resolves to another network", errLeaseNetworkOwnership)
+	}
+	return verifyLeaseNetwork(resolved, p.authority.leaseUUID, p.authority.backendName)
+}

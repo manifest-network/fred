@@ -2233,8 +2233,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   verified ID: an existing network of that name is used only when it carries
   this lease's and backend's ownership labels, and any other, foreign or
   unlabeled, fails the launch as a backend error without being attached to,
-  adopted, relabeled or removed. Compose never creates, removes or reconnects
-  a network. The network stays through re-deploys and is reclaimed by the
+  adopted, relabeled or removed. Before each container create and start, Fred
+  confirms that the verified ID still resolves to that network, since Docker
+  falls back to a network named with the ID once the original is gone. Compose
+  never creates, removes or reconnects a network. The network stays through re-deploys and is reclaimed by the
   network worker after the lease is gone, only once the backend tracks no
   provision for the lease and no command holds its fence, and only by its
   verified ID. The worker likewise removes a legacy per-tenant network only

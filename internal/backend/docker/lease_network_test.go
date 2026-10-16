@@ -115,9 +115,12 @@ func (d *networkDaemon) RoundTrip(r *http.Request) (*http.Response, error) {
 		d.mu.Lock()
 		body = fmt.Sprintf(`{"Id":%q}`, id)
 	case strings.HasPrefix(path, "/networks/") && r.Method == http.MethodGet:
+		// Docker resolves a reference by exact ID, then by exact name.
 		ref := strings.TrimPrefix(path, "/networks/")
-		if id, ok := d.byName[ref]; ok {
-			ref = id
+		if _, isID := d.networks[ref]; !isID {
+			if id, ok := d.byName[ref]; ok {
+				ref = id
+			}
 		}
 		if network, ok := d.networks[ref]; ok {
 			body = network
@@ -399,23 +402,23 @@ func ownershipProject(t *testing.T, network leaseNetworkAuthority) *composetypes
 }
 
 // 1 and 5, through the pinned Compose execution path: the lease attaches to
-// exactly the verified network ID. A foreign network that holds the lease's
-// name is never named, created, or attached to, so replacing the network under
-// that name cannot redirect the launch.
+// exactly the verified network ID, which the launch confirms still resolves to
+// that network. The lease network is never resolved by name, and a foreign
+// network named with the verified ID does not shadow it while it exists.
 func TestComposeLaunchAttachesOnlyToTheVerifiedNetworkID(t *testing.T) {
 	authority := testLeaseNetworkAuthority(ownershipLease, ownershipBackend)
 	daemon := newNetworkDaemon(t)
-	daemon.put("verified", authority.networkID, leaseNetworkLabels(ownershipLease, ownershipBackend), nil)
-	// The name now resolves to a foreign network with an unrelated container.
-	daemon.put(leaseNetworkName(ownershipLease), testLeaseNetworkID("foreign"), foreignLeaseNetworkLabels(),
+	daemon.put(leaseNetworkName(ownershipLease), authority.networkID, leaseNetworkLabels(ownershipLease, ownershipBackend), nil)
+	daemon.put(authority.networkID, testLeaseNetworkID("foreign"), foreignLeaseNetworkLabels(),
 		map[string]string{"unrelated": "other-tenant-db"})
 
 	engine, recorder := newOwnershipLaunchEngine(t, daemon, authority)
 	err := engine.Create(t.Context(), ownershipProject(t, authority), composeapi.CreateOptions{})
-	// The network policy admits the create; the tenant seccomp wire check,
+	// The network checks admit the create; the tenant seccomp wire check,
 	// which this synthetic project does not satisfy, refuses it next.
 	require.ErrorIs(t, err, tenantseccomp.ErrRefused)
 	require.NotErrorIs(t, err, errLeaseNetworkOwnership)
+	require.Contains(t, daemon.seen(), "GET /networks/"+authority.networkID, "the launch confirmed the ID's network")
 
 	recorder.mu.Lock()
 	creates := append([][]byte(nil), recorder.bodies...)
@@ -439,6 +442,71 @@ func TestComposeLaunchAttachesOnlyToTheVerifiedNetworkID(t *testing.T) {
 	for _, request := range daemon.seen() {
 		require.NotEqual(t, "GET /networks/"+leaseNetworkName(ownershipLease), request, "the lease network is never resolved by name")
 	}
+}
+
+// 5, through the pinned Compose execution path: Docker resolves a network
+// reference by exact ID and then by exact name, so once the verified network is
+// gone, a network named with its ID, or a new network under the lease's name,
+// must not receive the lease. The launch refuses every create first.
+func TestComposeLaunchRefusesWhenTheVerifiedNetworkIsGone(t *testing.T) {
+	authority := testLeaseNetworkAuthority(ownershipLease, ownershipBackend)
+	for label, setup := range map[string]func(*networkDaemon){
+		"a foreign network named with the verified ID": func(d *networkDaemon) {
+			d.put(authority.networkID, testLeaseNetworkID("foreign"), foreignLeaseNetworkLabels(), map[string]string{"unrelated": "other-tenant-db"})
+		},
+		"a network named with the verified ID and this lease's labels": func(d *networkDaemon) {
+			d.put(authority.networkID, testLeaseNetworkID("impostor"), leaseNetworkLabels(ownershipLease, ownershipBackend), nil)
+		},
+		"a new network under the lease's name": func(d *networkDaemon) {
+			d.put(leaseNetworkName(ownershipLease), testLeaseNetworkID("recreated"), leaseNetworkLabels(ownershipLease, ownershipBackend), nil)
+		},
+		"no network at all": func(*networkDaemon) {},
+	} {
+		t.Run(label, func(t *testing.T) {
+			daemon := newNetworkDaemon(t)
+			setup(daemon)
+			engine, recorder := newOwnershipLaunchEngine(t, daemon, authority)
+			err := engine.Create(t.Context(), ownershipProject(t, authority), composeapi.CreateOptions{})
+			require.ErrorIs(t, err, errLeaseNetworkOwnership)
+			recorder.mu.Lock()
+			require.NotEmpty(t, recorder.bodies, "Compose did emit a create")
+			recorder.mu.Unlock()
+			require.Empty(t, daemon.createBodies(), "no create reaches the daemon")
+			requireNoNetworkMutation(t, daemon.seen())
+		})
+	}
+}
+
+// The same confirmation guards every container start, where Docker resolves
+// the stored reference again; without authority there is nothing to confirm.
+func TestLaunchNetworkPolicyConfirmsTheVerifiedNetworkBeforeAStart(t *testing.T) {
+	authority := testLeaseNetworkAuthority(ownershipLease, ownershipBackend)
+	start := func(t *testing.T) *http.Request {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://docker.invalid/v1.51/containers/abc/start", nil)
+		require.NoError(t, err)
+		return req
+	}
+	policy := launchNetworkPolicy{authority: authority}
+
+	present := newNetworkDaemon(t)
+	present.put(leaseNetworkName(ownershipLease), authority.networkID, leaseNetworkLabels(ownershipLease, ownershipBackend), nil)
+	require.NoError(t, policy.confirm(start(t), present))
+	require.Equal(t, []string{"GET /networks/" + authority.networkID}, present.seen())
+
+	shadowed := newNetworkDaemon(t)
+	shadowed.put(authority.networkID, testLeaseNetworkID("foreign"), foreignLeaseNetworkLabels(), nil)
+	require.ErrorIs(t, policy.confirm(start(t), shadowed), errLeaseNetworkOwnership)
+
+	relabeled := newNetworkDaemon(t)
+	relabeled.put(leaseNetworkName(ownershipLease), authority.networkID, leaseNetworkLabels(ownershipLease, "other-backend"), nil)
+	require.ErrorIs(t, policy.confirm(start(t), relabeled), errLeaseNetworkOwnership)
+
+	unused := newNetworkDaemon(t)
+	require.NoError(t, launchNetworkPolicy{}.confirm(start(t), unused))
+	other, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://docker.invalid/v1.51/containers/json", nil)
+	require.NoError(t, err)
+	require.NoError(t, policy.confirm(other, unused))
+	require.Empty(t, unused.seen(), "only a create or start under authority is confirmed")
 }
 
 // 1, through the pinned Compose execution path: even a project that names the
