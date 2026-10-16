@@ -31,7 +31,18 @@ const (
 	MaintenanceIntentRestart      MaintenanceIntentKind = "restart"
 	MaintenanceIntentUpdate       MaintenanceIntentKind = "update"
 	MaintenanceIntentCustomDomain MaintenanceIntentKind = "custom_domain"
+	// MaintenanceIntentRuntimeRefresh is the provider's own redeploy of a
+	// healthy lease, unchanged, so its containers are recreated under the
+	// current container runtime contract. Only an operator starts one.
+	MaintenanceIntentRuntimeRefresh MaintenanceIntentKind = "runtime_refresh"
 )
+
+// Valid reports whether k is a maintenance kind this journal records. Every
+// journal validator consults it, so a kind is accepted everywhere or nowhere:
+// the receipt window that bounds it is the single list of known kinds.
+func (k MaintenanceIntentKind) Valid() bool {
+	return maintenanceWindowFor(k) != maintenanceWindowInvalid
+}
 
 var ErrMaintenanceIntentConflict = errors.New("unresolved callback maintenance intent")
 
@@ -69,6 +80,49 @@ func (candidate MaintenanceIntentCandidate) Request() MaintenanceRequestAuthorit
 // redelivery is intentionally handled by ProbeMaintenanceIntent, so a replay
 // never needs to manufacture a partial candidate from mutable release state.
 func (s *MaintenanceSettlement) NewMaintenanceIntentCandidate(
+	request MaintenanceRequestAuthority,
+	source MaintenanceSourceClaim,
+	targetRelease Release,
+) (MaintenanceIntentCandidate, error) {
+	if request.Kind() == MaintenanceIntentRuntimeRefresh {
+		return MaintenanceIntentCandidate{}, errors.New(
+			"a runtime refresh target is derived from its source; use NewRuntimeRefreshIntentCandidate",
+		)
+	}
+	return s.newMaintenanceIntentCandidate(request, source, targetRelease)
+}
+
+// NewRuntimeRefreshIntentCandidate is the only constructor of a runtime_refresh
+// candidate. A refresh recreates the source's exact workload, so its target is
+// derived from the sealed source release itself: the same payload, and so the
+// same image pins, the same items, resource profiles, lineage and runtime
+// authority. Only the version-zero deploying shape and its creation time are
+// new; no caller supplies any part of the target.
+func (s *MaintenanceSettlement) NewRuntimeRefreshIntentCandidate(
+	request MaintenanceRequestAuthority,
+	source MaintenanceSourceClaim,
+) (MaintenanceIntentCandidate, error) {
+	if request.Kind() != MaintenanceIntentRuntimeRefresh {
+		return MaintenanceIntentCandidate{}, fmt.Errorf("a %q request is not a runtime refresh", request.Kind())
+	}
+	if source.settlement != s {
+		return MaintenanceIntentCandidate{}, errors.New(
+			"maintenance source release was not claimed by this journal pair",
+		)
+	}
+	target, err := source.sealedRelease()
+	if err != nil {
+		return MaintenanceIntentCandidate{}, err
+	}
+	target.Version = 0
+	target.MaintenanceID = MaintenanceID{}
+	target.Status = "deploying"
+	target.Error, target.Reason, target.Message = "", "", ""
+	target.CreatedAt = time.Now()
+	return s.newMaintenanceIntentCandidate(request, source, target)
+}
+
+func (s *MaintenanceSettlement) newMaintenanceIntentCandidate(
 	request MaintenanceRequestAuthority,
 	source MaintenanceSourceClaim,
 	targetRelease Release,
@@ -1037,7 +1091,7 @@ func (s *MaintenanceSettlement) resolveSuccessLocked(
 	if err != nil {
 		return CallbackEntry{}, err
 	}
-	return s.callbacks.resolveMaintenanceIntentLocked(claim, entry)
+	return s.callbacks.resolveMaintenanceIntentLocked(claim, entry, MaintenanceSourceReady{})
 }
 
 func (s *MaintenanceSettlement) resolveFailureLocked(
@@ -1057,7 +1111,10 @@ func (s *MaintenanceSettlement) resolveFailureLocked(
 	if err != nil {
 		return CallbackEntry{}, err
 	}
-	return s.callbacks.resolveMaintenanceIntentLocked(claim, entry)
+	// Only the bound classifier mints SourceReady, for the exact source cohort
+	// of this failed generation.
+	ready, _ := failed.SourceReady()
+	return s.callbacks.resolveMaintenanceIntentLocked(claim, entry, ready)
 }
 
 func prepareDivergedMaintenanceCompletions(
@@ -1124,17 +1181,22 @@ func prepareMaintenanceIntentCompletion(
 func (s *CallbackStore) resolveMaintenanceIntentLocked(
 	claim MaintenanceIntentClaim,
 	entry CallbackEntry,
+	ready MaintenanceSourceReady,
 ) (CallbackEntry, error) {
-	entries, err := s.resolveMaintenanceIntentEntriesLocked(claim, []CallbackEntry{entry})
+	entries, err := s.resolveMaintenanceIntentEntriesLocked(claim, []CallbackEntry{entry}, ready)
 	if err != nil {
 		return CallbackEntry{}, err
 	}
 	return entries[0], nil
 }
 
+// resolveMaintenanceIntentEntriesLocked settles claim with entries. ready is a
+// failed settlement's classifier-minted proof that its source is the ready
+// cohort; the zero value proves nothing.
 func (s *CallbackStore) resolveMaintenanceIntentEntriesLocked(
 	claim MaintenanceIntentClaim,
 	entries []CallbackEntry,
+	ready MaintenanceSourceReady,
 ) ([]CallbackEntry, error) {
 	if len(entries) == 0 {
 		return nil, errors.New("maintenance settlement requires at least one callback")
@@ -1151,9 +1213,15 @@ func (s *CallbackStore) resolveMaintenanceIntentEntriesLocked(
 				return putErr
 			}
 		}
+		// The receipt keeps the positive fact that the source is the ready
+		// cohort only from the settlement's own proof of it. A compensation
+		// journal's earlier source-ready phase is not that proof: the source
+		// can be lost before the failure settles.
+		sourceReady := entries[0].Status == backend.CallbackStatusFailed && ready.Valid() &&
+			ready.LeaseUUID() == claim.LeaseUUID() && ready.MaintenanceID() == claim.MaintenanceID()
 		receipt := maintenanceCompletionRecordFor(
 			claim, entries[0].Status, entries[0].Error, entries[0].CreatedAt,
-			entries[0].Sequence,
+			entries[0].Sequence, sourceReady,
 		)
 		transition, err := newResolveMaintenanceLeaseMutation(claim, receipt)
 		if err != nil {
@@ -1267,8 +1335,7 @@ func validateMaintenanceIntentEntry(entry maintenanceIntentEntry, leaseUUID stri
 	if !storageID.Valid() {
 		return errors.New("maintenance intent storage identity is invalid")
 	}
-	if entry.Kind != MaintenanceIntentRestart && entry.Kind != MaintenanceIntentUpdate &&
-		entry.Kind != MaintenanceIntentCustomDomain {
+	if !entry.Kind.Valid() {
 		return fmt.Errorf("invalid maintenance intent kind %q", entry.Kind)
 	}
 	if err := validateStoredCallbackCreatedAt(entry.CreatedAt); err != nil {

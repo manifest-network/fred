@@ -536,6 +536,7 @@ durations must remain positive. Durations use Go syntax (`h`, `m`, `s`); `d` and
 | NetworkIsolation | `network_isolation` | *bool | `true` | Per-lease Docker network isolation |
 | ContainerReadonlyRootfs | `container_readonly_rootfs` | *bool | `true` | Read-only root filesystem |
 | ContainerPidsLimit | `container_pids_limit` | *int64 | `256` | Maximum PIDs per container |
+| RuntimeRefreshMaxConcurrency | `runtime_refresh_max_concurrency` | *int | `4` | Leases one operator-started runtime refresh recreates at once (0–64); `0` disables `POST /runtime_refresh` |
 | ContainerTmpfsSizeMB | `container_tmpfs_size_mb` | int | `64` | Size (MB) for each `/tmp`/`/run`/image-`VOLUME` tmpfs and, separately, the conservative on-disk scratch allowance pinned for every `disk_mb: 0` instance. Tenant-declared tmpfs uses the same per-mount ceiling; memory tmpfs is not charged as disk |
 
 ### Ingress (Traefik Integration)
@@ -1283,6 +1284,10 @@ these phases do not measure the full wall time of a failed replacement.
 - `fred_docker_backend_maintenance_readiness_pending_total{branch}` — readiness deferrals, including retries, for `committed_target`, `deploying_target`, `cleanup_source`, or `source_only`. The matching warning is emitted once per exact pending intent and branch in a backend lifetime. A committed target can remain pending indefinitely while its healthcheck is starting; inspect that workload rather than treating the metric as permission to roll it back.
 - `fred_docker_backend_maintenance_recovery_deferred_total` — explicitly lease-local observation conflicts deferred with their exact intent and reservation retained. Sibling recovery continues; storage/journal authority failures and global transport/cancellation errors still fail the recovery boundary.
 - `fred_docker_backend_operation_recovery_deferred_total` — provision and restore recoveries whose container evidence could not be classified (partial or mixed callback identities, an identity or topology mismatch, an inspection error). The Pending journal row and its lease fence stay; each pass counts the lease again. The same failures as above still fail the recovery boundary.
+- `fred_docker_backend_runtime_stale_leases` — Ready leases with a container created under an older runtime contract, from the last read: every `reconcile_interval` and every runtime refresh request
+- `fred_docker_backend_runtime_shared_network_leases` — leases with a container on a Docker network shared with another lease's container, from the same reads
+- `fred_docker_backend_runtime_inventory_total{outcome}` — periodic inventory passes behind those two gauges, `ok` or `error`; a failed pass keeps the last completed values pass.
+- `fred_docker_backend_runtime_refresh_total{outcome}` — final per-lease outcome of each runtime refresh run: `refreshed`, `failed`, or `skipped`.
 - `fred_docker_backend_network_reclamation_total{outcome}` — network candidates classified as `removed`, `absent`, `in_use`, `lease_active`, `lease_busy`, or `tenant_active`, plus candidate `error`, pass `list_error`, and pass `budget_exhausted` outcomes. Only `removed` counts a successful Docker removal. A bounded pass can leave a backlog for later passes without failing state or operation recovery; shutdown cancellation does not count as an operational error.
 
 ## State Recovery
@@ -1937,6 +1942,116 @@ default failure reason that was absent from the stored representation.
 
 Reconciles a lease's custom-domain ingress labels to match the supplied items. Body carries `lease_uuid` and `items`. Returns `204 No Content` when there is nothing to do (ingress disabled, the lease not provisioned or not Ready, no drift) and once a drift redeploy is admitted. `404` and `409` mean the lease was deprovisioned or left Ready between that check and the redeploy; `503` carries code `lifecycle_pending` or `insufficient_resources`; `400` rejects a malformed body or lease UUID.
 
+### `POST /runtime_refresh` (authenticated)
+
+Operator-facing; providerd never calls it. Starts one run that recreates every
+Ready lease with a container created under an older
+[runtime contract](#runtime-contract), with the same release, volumes and
+lease, so the lease runs under the current one. Nothing starts a run
+automatically. Protected like `/restart` (HMAC, runtime storage-identity
+verification, `backend_storage_id` query and `X-Fred-Backend-Storage-ID`
+response header); the storage-bound form is
+`POST /_fred/storage/{storage_id}/runtime_refresh`. The body must be empty or
+`{}`: concurrency is the `runtime_refresh_max_concurrency` configuration
+(default 4; `0` disables the endpoint).
+
+| Status | Meaning |
+|---|---|
+| `202` | A run started; the body is the status below, with `stale` read when it started |
+| `409` | A run is already active; poll `GET /runtime_refresh` |
+| `403` | Disabled (`runtime_refresh_max_concurrency: 0`) |
+| `503` | The Docker inventory or storage identity could not be verified; no run started |
+
+Each lease is refreshed through the same journaled, restart-shaped maintenance
+a custom-domain change uses, under its own `runtime_refresh` maintenance kind
+and receipt window. Its target is derived from the lease's active release
+itself, unchanged: the settlement constructs it from the sealed source, and no
+caller supplies any part of it. Every container is recreated (force-recreate)
+from the exact image the source runs, never from a tag that may since name
+other content, and nothing is pulled. Before anything is journaled, every pin
+of the active release must record exactly the image its running containers
+execute, read by the startup backfill's observer; a missing pin is minted from
+that observation. At execution, before any substrate effect, each image is
+admitted only as the image the refresh's own source capture recorded, through
+that pin. A pin that names other content, as after a restart that pinned what
+a moved tag named and then failed before replacing the containers, is never
+followed or replaced: the lease is refused and reported as `failed`, with
+nothing journaled. The refresh is FailCount-neutral: a failure
+that rolls back leaves the lease Ready on its pre-refresh release, with no
+error and no failure-budget effect, and is reported as `failed` with
+`restored`. A rollback that recreated the release runs copies of its
+containers with new container IDs; a target that failed before displacing the
+release leaves its containers unchanged. The tenant sees
+`restarting`, then `ready`, a maintenance callback, and one new `/releases`
+entry with the same manifest. Under the lease's command fence, just before
+anything is journaled, the refresh checks again that the lease still has a
+container under an older contract. A lease whose fence is busy (another command
+in progress), that stops being Ready, that a tenant restart or update already
+brought under the current contract, whose containers could not be read, or
+whose images could not be proved is retried on a later pass and, if never
+refreshed, reported as `skipped`. A lease holds its slot until its admitted
+maintenance settles, however long a rollback takes: only the receipt completes
+it. A run retries skipped leases every 10 seconds, never retries a lease that
+failed, stops starting leases after one hour, ends once every admitted lease
+has settled, and a new POST starts a new run.
+
+### `GET /runtime_refresh` (authenticated)
+
+Returns what Docker shows now (the stale count and the leases sharing a
+network), every lease's durable refresh outcome, and the current or most
+recent run. `503` means the inventory or the receipts could not be read: an
+unreadable inventory is never reported as zero.
+
+A lease's `refreshed` or `failed` row is read from its latest retained
+`runtime_refresh` completion receipt, so it survives a backend restart and
+later runs; receipts are deleted when a lease closes. A `skipped` row, or a
+failure with no receipt (refused before admission, or a settlement this run
+could not read), comes from the current or most recent run in this process.
+
+```json
+{
+  "contract": 1,
+  "active": false,
+  "stale": 1,
+  "stale_leases": ["650e8400-e29b-41d4-a716-446655440000"],
+  "in_flight": 0,
+  "refreshed": 1,
+  "failed": 1,
+  "restored": 1,
+  "skipped": 0,
+  "shared_network_leases": [],
+  "leases": [
+    {"lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+     "maintenance_id": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
+     "outcome": "refreshed"},
+    {"lease_uuid": "650e8400-e29b-41d4-a716-446655440000",
+     "maintenance_id": "7ba7b811-9dad-41d1-80b4-00c04fd430c8",
+     "outcome": "failed",
+     "restored": {"release_version": 3,
+                  "release_digest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}}
+  ]
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `contract` | integer ≥ 1 | The runtime contract this release creates containers under |
+| `active` | boolean | True from the POST that starts a run until that run has finished every lease, including while it waits between leases and passes |
+| `stale` | integer | The length of `stale_leases` |
+| `stale_leases` | array of strings | Sorted UUIDs of the Ready leases with at least one container created under an older contract, read from Docker for this response. A lease whose refresh failed and was restored stays listed. Never `null` |
+| `in_flight` | integer | Leases the run is refreshing now |
+| `refreshed`, `failed`, `skipped` | integer | Rows by outcome; always equal to the per-outcome row counts of `leases` |
+| `restored` | integer | `failed` rows that carry `restored` |
+| `shared_network_leases` | array of strings | Sorted lease UUIDs with a container, in any state, on a Docker network that a container of another lease is also on, read from Docker for this response. A lease on its own network never appears. Never `null` |
+| `leases` | array | One row per lease, sorted and unique by `lease_uuid`; bounded by the backend's live leases. Never `null` |
+| `leases[].lease_uuid` | string | The lease |
+| `leases[].maintenance_id` | string | The `runtime_refresh` maintenance. Always present on `refreshed` rows and on rows with `restored`; omitted when no refresh was admitted. A `refreshed` lease's containers carry it in `fred.maintenance_id` |
+| `leases[].outcome` | `refreshed` \| `failed` \| `skipped` | `refreshed`: the receipt records that the target became the active release. `failed`: it did not. `skipped`: this run did not attempt it to completion |
+| `leases[].restored` | object, only on `failed` rows | The failed refresh settled with the lease's pre-refresh release as its running, ready cohort, proved by the settlement and recorded on the receipt: `release_version` (integer ≥ 1) and `release_digest` (64 lowercase hex). Absent when that was not proved, for example when the restore itself failed |
+
+A cutover waits until `stale == 0 && in_flight == 0 && !active` (see
+OPERATIONS.md, Runtime refresh).
+
 ### `GET /health` (unauthenticated)
 
 Verifies the backend's storage identity, then checks Docker daemon reachability. Also probes the callback, diagnostics, release, and retention bbolt stores — a locked, corrupt, or read-only store surfaces as unhealthy instead of the backend reporting healthy while soft-delete/restore silently fail (ENG-448) — and reads the launch journal's pending count.
@@ -2027,7 +2142,26 @@ When `network_isolation` is enabled (default), each lease's containers are place
 - **Ownership**: before any launch, Fred inspects the network of that name. It uses an existing network only when it carries `fred.managed=true`, `fred.network_scope=lease`, this lease's `fred.lease_uuid` and this backend's `fred.backend_name`. Any other network of that name, foreign or unlabeled, fails the launch as a backend error and is never attached to, adopted, relabeled or removed. When no network exists, Fred creates it with those labels and verifies the ID the daemon returned. Only that verification mints the lease's network authority, which names the network by its full ID.
 - **Attachment**: the Compose project names the network by that verified ID, as an external network, so Compose neither creates nor removes it and Docker attaches to that exact network. The launch transport refuses any container create that does not attach to exactly that ID, and every network create, removal, connect and disconnect. Docker resolves a network reference by exact ID and then by exact name, so before each container create and start the transport also asks the daemon what the ID resolves to now, and proceeds only when it is still the verified network with its ownership labels: once that network is gone, a network named with its ID would otherwise receive the container. Compensation recreates a source container on networks re-verified at that moment and named by ID.
 - **Removal**: the network stays through every re-deploy and is not removed when the lease closes. The network worker reclaims it once this backend tracks no provision for the lease and no lifecycle command holds the lease's fence, re-verifying the exact ID and its labels; Docker must also confirm that no containers are connected. Compose teardown never removes a network: it rebuilds a project's networks from Compose labels alone, which do not prove ownership, and the teardown transport refuses those removals.
-- **Upgrading from per-tenant networks**: releases before per-lease networks attached every lease of a tenant to one `fred-tenant-<hex(sha256(tenant)[:8])>` network. A running lease stays there until Compose next recreates its containers (restart, update, custom-domain change, restore or re-provision); the new network key changes every service's Compose hash, so that recreate moves all of its services, including stopped ones. Fred no longer creates tenant networks; the worker removes one once the tenant has no provision on this backend.
+- **Upgrading from per-tenant networks**: releases before per-lease networks attached every lease of a tenant to one `fred-tenant-<hex(sha256(tenant)[:8])>` network. A running lease stays there until Compose next recreates its containers (restart, update, custom-domain change, restore, re-provision, or an operator's [runtime refresh](#post-runtime_refresh-authenticated)); the new network key changes every service's Compose hash, so that recreate moves all of its services, including stopped ones. Fred no longer creates tenant networks; the worker removes one once the tenant has no provision on this backend.
+
+## Runtime Contract
+
+A running container keeps the properties it was created with (its network,
+seccomp profile and other hardening) until it is recreated. The runtime
+contract versions those properties: every container records the contract it
+was created under in `fred.runtime_contract`, and a container without the
+label predates the contract. The fact is recorded at creation, never inferred
+from a container's network or profile.
+
+| Contract | Introduced |
+|---|---|
+| `1` | Each lease on its own network (no shared per-tenant network) |
+
+A release that changes such a property bumps the contract. `GET
+/runtime_refresh` counts the Ready leases with a container under an older
+contract (`fred_docker_backend_runtime_stale_leases`), and an operator's
+`POST /runtime_refresh` recreates them. A container recorded under a newer
+contract, by a newer release, is never recreated by an older one.
 
 ## Container Labels
 

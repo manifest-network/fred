@@ -691,7 +691,9 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 		leaseUUID, lifecycleURL, requestPayload,
 	)
 	require.NoError(t, err)
-	require.NoError(t, b.routeReplaceRestart(context.Background(), request, overrides))
+	route, err := customDomainRoute(overrides)
+	require.NoError(t, err)
+	require.NoError(t, b.routeReplaceRestart(context.Background(), request, route))
 
 	// 4. Wait for the async redeploy to complete.
 	select {

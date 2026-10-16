@@ -485,7 +485,7 @@ func (p *CallbackPublisher) TryPublishMaintenanceRuntimeFailureContext(
 		return true, p.finishMaintenancePublication(err)
 	}
 	_, err = p.store.resolveMaintenanceIntentEntriesLocked(
-		claim, []CallbackEntry{maintenance, runtimeFailure},
+		claim, []CallbackEntry{maintenance, runtimeFailure}, MaintenanceSourceReady{},
 	)
 	return true, p.finishMaintenancePublication(err)
 }

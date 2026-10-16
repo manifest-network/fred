@@ -840,7 +840,13 @@ func newTestMaintenanceClaimWithID(
 		maintenanceID, kind, leaseUUID, lifecycleURL, payload,
 	)
 	require.NoError(t, err)
-	candidate, err := settlement.NewMaintenanceIntentCandidate(request, sourceClaim, active)
+	var candidate shared.MaintenanceIntentCandidate
+	if kind == shared.MaintenanceIntentRuntimeRefresh {
+		// A refresh target is always derived from its sealed source.
+		candidate, err = settlement.NewRuntimeRefreshIntentCandidate(request, sourceClaim)
+	} else {
+		candidate, err = settlement.NewMaintenanceIntentCandidate(request, sourceClaim, active)
+	}
 	require.NoError(t, err)
 	admission, err := settlement.BeginMaintenanceIntent(candidate)
 	require.NoError(t, err)

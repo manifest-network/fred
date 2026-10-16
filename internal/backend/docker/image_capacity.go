@@ -286,7 +286,24 @@ func (m *imageCapacityManager) selectedPin(mutations *storageMutations, ref stri
 	return m.pins.Lookup(lease, payload, ref)
 }
 
+// errUnpinnedSourceImage refuses an image a runtime refresh would admit other
+// than as the exact image its source ran: a refresh recreates the running
+// workload unchanged, so it may never resolve a mutable tag that may since
+// name other content, nor follow a pin that names it.
+var errUnpinnedSourceImage = errors.New("a runtime refresh admits only the image its source ran, through that image's pin")
+
 func (m *imageCapacityManager) prepare(ctx context.Context, mutations *storageMutations, ref string, pull bool) (imageexec.Image, error) {
+	return m.prepareImage(ctx, mutations, ref, pull, nil)
+}
+
+// prepareSourceImage admits ref only as source: the exact image the source
+// cohort ran, through an existing pin that records that same image. It never
+// pulls and never resolves the tag.
+func (m *imageCapacityManager) prepareSourceImage(ctx context.Context, mutations *storageMutations, ref string, source capturedSourceImage) (imageexec.Image, error) {
+	return m.prepareImage(ctx, mutations, ref, false, &source)
+}
+
+func (m *imageCapacityManager) prepareImage(ctx context.Context, mutations *storageMutations, ref string, pull bool, source *capturedSourceImage) (imageexec.Image, error) {
 	tenantPreparation, err := m.beginTenantPreparation(ctx, mutations)
 	if err != nil {
 		return imageexec.Image{}, err
@@ -298,6 +315,9 @@ func (m *imageCapacityManager) prepare(ctx context.Context, mutations *storageMu
 	}
 	defer admission.close()
 	pin := admission.state.pin
+	if source != nil && (pin == nil || pin.ImageID != source.id) {
+		return imageexec.Image{}, fmt.Errorf("%w: %s", errUnpinnedSourceImage, ref)
+	}
 	info, err := m.daemon.Info(ctx)
 	if err != nil {
 		return imageexec.Image{}, err
@@ -310,6 +330,9 @@ func (m *imageCapacityManager) prepare(ctx context.Context, mutations *storageMu
 	resolved, err := m.resolveImage(ctx, tenantPreparation, ref, pin, pull)
 	if err != nil {
 		return imageexec.Image{}, err
+	}
+	if source != nil && resolved.image.ID() != source.id {
+		return imageexec.Image{}, fmt.Errorf("%w: %s resolved to other content", errUnpinnedSourceImage, ref)
 	}
 	if daemonUsesContainerd(info) {
 		if err := m.verifyUnpacked(ctx, mutations.inspectionOrigin, resolved); err != nil {

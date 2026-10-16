@@ -368,8 +368,64 @@ func (m *storageMutations) requireLease(leaseUUID, operation string) error {
 	return nil
 }
 
+// recreatesRunningWorkload reports a runtime refresh, which recreates the
+// source's exact workload: its images are only the ones the source ran.
+func (m *storageMutations) recreatesRunningWorkload() bool {
+	return m.maintenanceSubject.Valid() && m.maintenanceSubject.Intent().Kind() == shared.MaintenanceIntentRuntimeRefresh
+}
+
+// capturedSourceImage is the exact image a source cohort ran for one
+// reference, as its maintenance captured it before any target effect. Only
+// capturedSourceImageFor mints one.
+type capturedSourceImage struct{ id string }
+
+// capturedSourceImageFor reads reference's image from the source plan this
+// execution captured: every source container created from reference ran it.
+func (m *storageMutations) capturedSourceImageFor(reference string) (capturedSourceImage, error) {
+	encoded, err := m.ops.backend.maintenanceSettlement.CapturedMaintenanceSource(m.maintenanceSubject)
+	if err != nil {
+		return capturedSourceImage{}, fmt.Errorf("%w: %w", errUnpinnedSourceImage, err)
+	}
+	plan, err := decodeCompensationSourcePlan(m.maintenanceSubject, encoded)
+	if err != nil {
+		return capturedSourceImage{}, fmt.Errorf("%w: %w", errUnpinnedSourceImage, err)
+	}
+	var id string
+	for _, container := range plan.Containers {
+		if container.Config.Labels[LabelImageReference] != reference {
+			continue
+		}
+		if id != "" && id != container.ImageID {
+			return capturedSourceImage{}, fmt.Errorf("%w: the source ran several images for %s", errUnpinnedSourceImage, reference)
+		}
+		id = container.ImageID
+	}
+	if id == "" {
+		return capturedSourceImage{}, fmt.Errorf("%w: the source ran no container of %s", errUnpinnedSourceImage, reference)
+	}
+	return capturedSourceImage{id: id}, nil
+}
+
+// admitSourceImage admits reference only as the exact image the source ran,
+// through the pin that records that image.
+func (m *storageMutations) admitSourceImage(ctx context.Context, reference string) (imageexec.Image, error) {
+	capacity := m.ops.backend.imageCapacity
+	if capacity == nil {
+		return imageexec.Image{}, fmt.Errorf("%w: no image pin journal", errUnpinnedSourceImage)
+	}
+	source, err := m.capturedSourceImageFor(reference)
+	if err != nil {
+		return imageexec.Image{}, err
+	}
+	return capacity.prepareSourceImage(ctx, m, reference, source)
+}
+
 func (m *storageMutations) pullImage(ctx context.Context, image string, timeout time.Duration) error {
 	return m.runner.Prepare(ctx, "pull image", func(ctx context.Context) error {
+		if m.recreatesRunningWorkload() {
+			_, err := m.admitSourceImage(ctx, image)
+			return err
+		}
 		if capacity := m.ops.backend.imageCapacity; capacity != nil {
 			ctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
@@ -384,6 +440,10 @@ func (m *storageMutations) admitImage(ctx context.Context, reference string) (ad
 	err = m.runner.Prepare(ctx, "admit image", func(ctx context.Context) error {
 		ctx, cancel := context.WithTimeout(ctx, m.ops.backend.cfg.ImagePullTimeout)
 		defer cancel()
+		if m.recreatesRunningWorkload() {
+			admitted, err = m.admitSourceImage(ctx, reference)
+			return err
+		}
 		if capacity := m.ops.backend.imageCapacity; capacity != nil {
 			admitted, err = capacity.prepare(ctx, m, reference, false)
 			return err

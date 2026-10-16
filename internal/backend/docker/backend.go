@@ -225,7 +225,10 @@ type Backend struct {
 	// tenant-network rule above. Neither holder takes provisionsMu on entry,
 	// and a volume stripe is never held across a tenant-network acquisition.
 	volumeNameStripes [volumeNameStripeCount]sync.Mutex
-	volumeAccess      volumeAccessCoordinator
+
+	// runtimeRefresh owns the operator-started runtime refresh run.
+	runtimeRefresh runtimeRefreshController
+	volumeAccess   volumeAccessCoordinator
 
 	// recoverMu serializes recoverState calls. The reconcile loop and
 	// external RefreshState (called by Fred's reconciler) both invoke
@@ -2917,6 +2920,9 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Report containers that do not run under the current tenant seccomp
 	// profile. The first pass runs now, in the background, after recovery.
 	b.wg.Go(b.tenantSeccompCensusLoop)
+	// Keep the runtime stale and shared-network gauges current, from one
+	// reconcile_interval after startup.
+	b.wg.Go(b.runtimeInventoryLoop)
 	// Audit managed XFS volumes for project-ID drift, detect only. The first
 	// pass waits projidAuditFirstDelay so it never competes with startup.
 	b.wg.Go(b.projidAuditLoop)

@@ -431,6 +431,14 @@ host_address: ""
 # Default: 256.
 # container_pids_limit: 256
 
+# Most leases one operator-started runtime refresh (POST /runtime_refresh)
+# recreates at once. A refresh recreates every healthy lease whose containers
+# were created under an older runtime contract, with the same release and
+# data, so it runs under the current one (for example, on its own network).
+# Nothing starts a refresh automatically. 0 disables the endpoint. Default: 4;
+# maximum 64.
+# runtime_refresh_max_concurrency: 4
+
 # Size in MB for tmpfs mounts (/tmp, /run, image VOLUME overrides and tenant
 # tmpfs) and, separately, the quota/pool scratch allowance pinned for every
 # disk_mb: 0 instance. Scratch is non-retainable host disk authority; the tmpfs

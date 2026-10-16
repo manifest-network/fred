@@ -184,6 +184,11 @@ type Config struct {
 	// When true, /tmp and /run are mounted as tmpfs. Defaults to true.
 	ContainerReadonlyRootfs *bool `yaml:"container_readonly_rootfs"`
 
+	// RuntimeRefreshMaxConcurrency bounds how many leases one operator-started
+	// runtime refresh recreates at once (POST /runtime_refresh). Unset uses
+	// the default of 4; 0 disables the endpoint.
+	RuntimeRefreshMaxConcurrency *int `yaml:"runtime_refresh_max_concurrency"`
+
 	// ContainerPidsLimit limits the number of PIDs in each container.
 	// Defaults to 256.
 	ContainerPidsLimit *int64 `yaml:"container_pids_limit"`
@@ -366,6 +371,22 @@ const (
 
 func ptrBool(b bool) *bool    { return &b }
 func ptrInt64(i int64) *int64 { return &i }
+
+// defaultRuntimeRefreshMaxConcurrency is runtime_refresh_max_concurrency when
+// unset; maxRuntimeRefreshConcurrency is its upper bound.
+const (
+	defaultRuntimeRefreshMaxConcurrency = 4
+	maxRuntimeRefreshConcurrency        = 64
+)
+
+// GetRuntimeRefreshMaxConcurrency returns how many leases a runtime refresh
+// recreates at once; 0 means the endpoint is disabled.
+func (c *Config) GetRuntimeRefreshMaxConcurrency() int {
+	if c.RuntimeRefreshMaxConcurrency != nil {
+		return *c.RuntimeRefreshMaxConcurrency
+	}
+	return defaultRuntimeRefreshMaxConcurrency
+}
 
 // GetHostBindIP returns the configured bind IP, defaulting to "0.0.0.0".
 func (c *Config) GetHostBindIP() string {
@@ -668,6 +689,10 @@ func (c *Config) Validate() error {
 
 	if c.ContainerPidsLimit != nil && *c.ContainerPidsLimit < 1 {
 		return fmt.Errorf("container_pids_limit must be >= 1")
+	}
+
+	if n := c.RuntimeRefreshMaxConcurrency; n != nil && (*n < 0 || *n > maxRuntimeRefreshConcurrency) {
+		return fmt.Errorf("runtime_refresh_max_concurrency must be between 0 (disabled) and %d", maxRuntimeRefreshConcurrency)
 	}
 
 	if c.ContainerTmpfsSizeMB < 0 {

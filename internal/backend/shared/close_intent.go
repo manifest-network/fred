@@ -582,9 +582,11 @@ func (s *CallbackStore) beginCloseIntentWithAuthorityLocked(
 			if err != nil {
 				return err
 			}
+			// A close preempts the maintenance; whatever its compensation
+			// reached, the lease is leaving, so no source is attested restored.
 			receipt := maintenanceCompletionRecordFor(
 				maintenanceClaim, callback.Status, callback.Error, callback.CreatedAt,
-				storedCallback.Sequence,
+				storedCallback.Sequence, false,
 			)
 			transition, transitionErr = newReplaceMaintenanceWithCloseLeaseMutation(
 				maintenanceClaim, receipt, claim,

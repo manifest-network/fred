@@ -8,6 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- docker-backend: an operator-started runtime refresh. Every container now
+  records the runtime contract it was created under in `fred.runtime_contract`
+  (contract 1: the lease's own network). `POST /runtime_refresh` recreates
+  every Ready lease with a container created under an older contract, with
+  the same release, volumes and lease, at most
+  `runtime_refresh_max_concurrency` (default 4; 0 disables) at a time, through
+  a journaled `runtime_refresh` maintenance that never counts as a failure.
+  `GET /runtime_refresh` reports the stale leases, whether a run is `active`,
+  the leases still sharing a Docker network with another lease, and one
+  attestation per lease: `refreshed` (with the maintenance ID its new
+  containers carry), `failed`, or `skipped`. A `failed` refresh that settled
+  with the lease's pre-refresh release as its running, ready cohort carries
+  `restored` with that release's version and digest. A refresh's target is
+  the lease's active release itself, derived from the sealed source, and each
+  image is admitted only as the image its running containers execute: matched
+  against its pin before anything is journaled, and against the refresh's own
+  source capture before any substrate effect. A lease whose pins name other
+  content is refused as `failed`; one whose images cannot be proved is
+  skipped. Attestations are read from each lease's maintenance receipt, so
+  they survive a backend restart and later runs; the receipt now records, from
+  the settlement's own proof, that a failed maintenance left its source as the
+  ready cohort. Nothing starts a refresh automatically. New metrics:
+  `fred_docker_backend_runtime_stale_leases` and
+  `fred_docker_backend_runtime_shared_network_leases`, read every
+  `reconcile_interval`, `fred_docker_backend_runtime_inventory_total{outcome}`
+  and `fred_docker_backend_runtime_refresh_total{outcome}`. See
+  OPERATIONS.md, Runtime refresh.
 - `billing_only_skus` lists SKUs the provider bills for but delivers outside
   Fred. Fred acknowledges a lease whose items all use these SKUs as soon as it
   sees it, so billing starts at once, and the reconciler retries the
@@ -1207,6 +1234,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- docker-backend: a custom-domain redeploy that fails, or that a crash
+  interrupts, settles again. Its failure details were refused for any
+  maintenance kind but restart and update, so a definitive failure became an
+  ambiguous outcome and recovery of the interrupted maintenance could never
+  converge, leaving the lease's maintenance head unsettled.
 - A stack whose `depends_on` chain is longer than 10 links is now always
   rejected at submission. The check used to measure the chain from whichever
   service it happened to visit first, so the same manifest was accepted or

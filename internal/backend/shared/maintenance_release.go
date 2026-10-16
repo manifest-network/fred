@@ -268,6 +268,24 @@ type MaintenanceSourceClaim struct {
 	settlement *MaintenanceSettlement
 	releases   *ReleaseStore
 	claim      ReleaseClaim
+	// release is the exact active release the claim seals.
+	release Release
+}
+
+// sealedRelease returns the exact release this claim seals, verified against
+// the claim's digest.
+func (source MaintenanceSourceClaim) sealedRelease() (Release, error) {
+	if !source.Valid() {
+		return Release{}, errors.New("maintenance source release was not claimed")
+	}
+	encoded, err := json.Marshal(source.release)
+	if err != nil {
+		return Release{}, fmt.Errorf("marshal sealed source release: %w", err)
+	}
+	if source.release.Version != source.claim.Version() || sha256.Sum256(encoded) != source.claim.Digest() {
+		return Release{}, errors.New("maintenance source claim does not seal its release")
+	}
+	return cloneRelease(source.release), nil
 }
 
 func (source MaintenanceSourceClaim) Valid() bool {
@@ -566,7 +584,7 @@ func (s *MaintenanceSettlement) ClaimLatestActive(
 	if err != nil {
 		return Release{}, MaintenanceSourceClaim{}, err
 	}
-	return release, MaintenanceSourceClaim{settlement: s, releases: s.releases, claim: claim}, nil
+	return release, MaintenanceSourceClaim{settlement: s, releases: s.releases, claim: claim, release: cloneRelease(release)}, nil
 }
 
 // CheckAppendMaintenanceCapacity proves that the exact source is still active
@@ -1287,7 +1305,8 @@ func (s *MaintenanceSettlement) ActivateMaintenance(
 
 // FailMaintenance records a terminal failure against one exact target and
 // returns the only capability that can settle its maintenance callback as
-// failed. Replaying the same failed target is idempotent.
+// failed. Replaying an already-failed target transitions nothing: it re-proves
+// that target with the replay's own physical evidence.
 func (s *MaintenanceSettlement) FailMaintenance(
 	outcome MaintenanceExecutionFailure,
 	reason backend.Reason,
@@ -1310,11 +1329,27 @@ func (s *MaintenanceSettlement) FailMaintenance(
 	if err != nil {
 		return MaintenanceReleaseFailure{}, err
 	}
-	if err := s.requireCompensationTerminal(intent, false, outcome.SourceRecovered(), outcome.refused); err != nil {
+	status, err := s.exactMaintenanceTargetStatus(target)
+	if err != nil {
 		return MaintenanceReleaseFailure{}, err
 	}
-	if err := s.releases.transitionMaintenance(target, "failed", reason, message); err != nil {
-		return MaintenanceReleaseFailure{}, err
+	switch status {
+	case "deploying":
+		// The first transition to failed must not outrun an unresolved
+		// compensation.
+		if err := s.requireCompensationTerminal(intent, false, outcome.SourceRecovered(), outcome.refused); err != nil {
+			return MaintenanceReleaseFailure{}, err
+		}
+		if err := s.releases.transitionMaintenance(target, "failed", reason, message); err != nil {
+			return MaintenanceReleaseFailure{}, err
+		}
+	case "failed":
+		// A replay, as after a restart, re-proves the exact already-failed
+		// target with the physical evidence just re-established. The guard
+		// governed the transition it already passed; the fresh evidence may
+		// now show a source lost after the compensation restored it.
+	default:
+		return MaintenanceReleaseFailure{}, fmt.Errorf("maintenance release is already terminal with status %q", status)
 	}
 	proof, err := s.proveFailureLocked(intent)
 	if err != nil {
@@ -1592,6 +1627,43 @@ func (s *ReleaseStore) hasMaintenanceRelease(
 	return found, err
 }
 
+// exactMaintenanceTargetStatus reads the durable status of exactly target.
+func (s *MaintenanceSettlement) exactMaintenanceTargetStatus(target MaintenanceReleaseClaim) (string, error) {
+	if !target.validFor(s) {
+		return "", errors.New("maintenance target claim has no durable capability")
+	}
+	var status string
+	err := s.releases.view(func(tx *bolt.Tx) error {
+		release, err := readExactMaintenanceTargetTx(tx, target)
+		status = release.Status
+		return err
+	})
+	return status, err
+}
+
+func readExactMaintenanceTargetTx(tx *bolt.Tx, target MaintenanceReleaseClaim) (Release, error) {
+	history, err := readReleaseHistoryTx(tx, target.LeaseUUID())
+	if err != nil {
+		return Release{}, err
+	}
+	index := maintenanceReleaseIndex(history, target.MaintenanceID())
+	if index < 0 {
+		return Release{}, errors.New("exact maintenance target release no longer exists")
+	}
+	release := history[index]
+	if release.Version != target.Version() {
+		return Release{}, errors.New("maintenance target version changed before terminal proof")
+	}
+	immutable, err := maintenanceReleaseDigest(release)
+	if err != nil {
+		return Release{}, err
+	}
+	if immutable != target.Digest() {
+		return Release{}, errors.New("maintenance target changed before terminal proof")
+	}
+	return release, nil
+}
+
 func (s *MaintenanceSettlement) requireMaintenanceTerminal(
 	target MaintenanceReleaseClaim,
 	status string,
@@ -1601,24 +1673,9 @@ func (s *MaintenanceSettlement) requireMaintenanceTerminal(
 	}
 	var terminal ReleaseClaim
 	err := s.releases.view(func(tx *bolt.Tx) error {
-		history, err := readReleaseHistoryTx(tx, target.LeaseUUID())
+		release, err := readExactMaintenanceTargetTx(tx, target)
 		if err != nil {
 			return err
-		}
-		index := maintenanceReleaseIndex(history, target.MaintenanceID())
-		if index < 0 {
-			return errors.New("exact maintenance target release no longer exists")
-		}
-		release := history[index]
-		if release.Version != target.Version() {
-			return errors.New("maintenance target version changed before terminal proof")
-		}
-		immutable, err := maintenanceReleaseDigest(release)
-		if err != nil {
-			return err
-		}
-		if immutable != target.Digest() {
-			return errors.New("maintenance target changed before terminal proof")
 		}
 		if release.Status != status {
 			return fmt.Errorf("maintenance target is %q, not %q", release.Status, status)

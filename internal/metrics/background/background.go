@@ -3,7 +3,8 @@
 // by every fred binary: providerd for its token-tracker cleanup loop, the docker
 // backend for its callback, diagnostics, releases and retention loops and its
 // docker_reconciliation, docker_network_reclamation, docker_projid_audit,
-// docker_seccomp_census and docker_volume_delete_hold workers, the k3s backend
+// docker_seccomp_census, docker_runtime_inventory, docker_runtime_refresh and
+// docker_volume_delete_hold workers, the k3s backend
 // for callback, diagnostics and releases (it has no retention store — retention
 // is docker-only, ENG-325). GoroutinePanicsTotal is written by providerd for its
 // payload-writer, ack-batcher, withdraw-scheduler and timeout-checker

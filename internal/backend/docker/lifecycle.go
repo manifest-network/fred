@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -93,15 +95,21 @@ type ContainerInfo struct {
 	CallbackURL          string
 	LifecycleCallbackURL string
 	MaintenanceID        shared.MaintenanceID
-	Image                string
-	Status               string
-	Health               HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
-	ExitCode             int          // Process exit code (meaningful when Status is "exited"/"dead")
-	OOMKilled            bool         // True if container was killed by the OOM killer
-	CreatedAt            time.Time
-	Ports                map[string]PortBinding
-	FQDN                 string
-	CustomDomain         string // Tenant-supplied custom FQDN (empty when not set)
+	// RuntimeContract is the runtime contract recorded at creation; zero when
+	// the container predates the contract.
+	RuntimeContract runtimeContract
+	// Networks names the Docker networks the container is attached to, sorted,
+	// as the daemon reports them.
+	Networks     []string
+	Image        string
+	Status       string
+	Health       HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
+	ExitCode     int          // Process exit code (meaningful when Status is "exited"/"dead")
+	OOMKilled    bool         // True if container was killed by the OOM killer
+	CreatedAt    time.Time
+	Ports        map[string]PortBinding
+	FQDN         string
+	CustomDomain string // Tenant-supplied custom FQDN (empty when not set)
 
 	// Name is the human-readable container name (without the leading "/"
 	// the Docker API prepends). Populated by both InspectContainer and
@@ -1690,6 +1698,8 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		CallbackURL:          resp.Config.Labels[LabelCallbackURL],
 		LifecycleCallbackURL: resp.Config.Labels[LabelLifecycleCallbackURL],
 		MaintenanceID:        maintenanceID,
+		RuntimeContract:      parseRuntimeContract(resp.Config.Labels),
+		Networks:             attachedNetworkNames(resp.NetworkSettings),
 		Image:                imageReference,
 		Status:               resp.State.Status,
 		Health:               health,
@@ -1734,6 +1744,24 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 // When backendName is set, only containers belonging to this backend are returned.
 func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerInfo, error) {
 	return d.listManagedContainers(ctx, false)
+}
+
+// attachedNetworkNames lists, sorted, the networks an inspected container is
+// attached to.
+func attachedNetworkNames(settings *container.NetworkSettings) []string {
+	if settings == nil {
+		return nil
+	}
+	return slices.Sorted(maps.Keys(settings.Networks))
+}
+
+// summaryNetworkNames lists, sorted, the networks a listed container is
+// attached to.
+func summaryNetworkNames(settings *container.NetworkSettingsSummary) []string {
+	if settings == nil {
+		return nil
+	}
+	return slices.Sorted(maps.Keys(settings.Networks))
 }
 
 // ListManagedContainersStrict is the identity-initialization variant. It
@@ -1821,6 +1849,8 @@ func (d *DockerClient) listManagedContainers(
 			CallbackURL:          c.Labels[LabelCallbackURL],
 			LifecycleCallbackURL: c.Labels[LabelLifecycleCallbackURL],
 			MaintenanceID:        maintenanceID,
+			RuntimeContract:      parseRuntimeContract(c.Labels),
+			Networks:             summaryNetworkNames(c.NetworkSettings),
 			Image:                imageReference,
 			Status:               c.State,
 			InstanceIndex:        meta.InstanceIndex,

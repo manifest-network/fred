@@ -70,6 +70,31 @@ func (b *Backend) admitMaintenance(
 		return maintenanceAdmission{},
 			fmt.Errorf("construct %s maintenance authority: %w", request.Kind(), err)
 	}
+	return b.admitMaintenanceCandidate(request, candidate)
+}
+
+// admitRuntimeRefresh admits a runtime refresh whose target the settlement
+// derives from the sealed source release; the caller supplies no target.
+func (b *Backend) admitRuntimeRefresh(
+	request shared.MaintenanceRequestAuthority,
+	source shared.MaintenanceSourceClaim,
+) (maintenanceAdmission, error) {
+	if b.callbackStore == nil || b.releaseStore == nil {
+		return maintenanceAdmission{},
+			errors.New("durable callback and release stores are required for maintenance")
+	}
+	candidate, err := b.maintenanceSettlement.NewRuntimeRefreshIntentCandidate(request, source)
+	if err != nil {
+		return maintenanceAdmission{},
+			fmt.Errorf("construct %s maintenance authority: %w", request.Kind(), err)
+	}
+	return b.admitMaintenanceCandidate(request, candidate)
+}
+
+func (b *Backend) admitMaintenanceCandidate(
+	request shared.MaintenanceRequestAuthority,
+	candidate shared.MaintenanceIntentCandidate,
+) (maintenanceAdmission, error) {
 	admission, err := b.maintenanceSettlement.BeginMaintenanceIntent(candidate)
 	if err != nil {
 		if errors.Is(err, shared.ErrMaintenanceIntentConflict) {
@@ -453,16 +478,15 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 						}
 						return fmt.Errorf("maintenance cleanup lacks definitive failure evidence (%T)", physical)
 					}
-					if targetRelease.Status == "deploying" {
-						if _, failErr := b.maintenanceSettlement.FailMaintenance(
-							failure, maintenanceFailureReason(intent.Kind()), string(intent.Kind())+" interrupted",
-						); failErr != nil {
-							return fmt.Errorf("fail interrupted maintenance target: %w", failErr)
-						}
-					}
-					failed, proofErr := b.maintenanceSettlement.ProveMaintenanceFailure(intent)
-					if proofErr != nil {
-						return fmt.Errorf("prove failed maintenance target: %w", proofErr)
+					// FailMaintenance is idempotent for a target already failed before
+					// a crash, and its proof carries the physical evidence this cleanup
+					// just re-established: a source the classifier proved ready
+					// reaches the receipt even when the original proof was lost.
+					failed, failErr := b.maintenanceSettlement.FailMaintenance(
+						failure, maintenanceFailureReason(intent.Kind()), string(intent.Kind())+" interrupted",
+					)
+					if failErr != nil {
+						return fmt.Errorf("fail interrupted maintenance target: %w", failErr)
 					}
 					after, listErr := b.listManagedContainersStrictForRecovery(ctx)
 					if listErr != nil {
@@ -472,7 +496,10 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 					if readyErr != nil {
 						return readyErr
 					}
-					failureInfo := recoveredMaintenanceFailureInfo(intent, &targetRelease)
+					failureInfo, infoErr := recoveredMaintenanceFailureInfo(intent, &targetRelease)
+					if infoErr != nil {
+						return infoErr
+					}
 					if convergeErr := b.convergeMaintenanceFailure(
 						ctx, intent, sourceRelease, sourceContainers, sourceReady, failureInfo,
 					); convergeErr != nil {
@@ -504,9 +531,12 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 					if readyErr != nil {
 						return readyErr
 					}
+					failureInfo, infoErr := recoveredMaintenanceFailureInfo(intent, nil)
+					if infoErr != nil {
+						return infoErr
+					}
 					if convergeErr := b.convergeMaintenanceFailure(
-						ctx, intent, sourceRelease, sourceContainers, sourceReady,
-						recoveredMaintenanceFailureInfo(intent, nil),
+						ctx, intent, sourceRelease, sourceContainers, sourceReady, failureInfo,
 					); convergeErr != nil {
 						return convergeErr
 					}
@@ -640,25 +670,26 @@ func (b *Backend) convergeMaintenanceFailure(
 func recoveredMaintenanceFailureInfo(
 	intent shared.MaintenanceIntentClaim,
 	target *shared.Release,
-) leasesm.ReplaceFailureInfo {
+) (leasesm.ReplaceFailureInfo, error) {
 	details := leasesm.ReplaceFailureDetails{
 		CallbackErr: interruptedMaintenanceFailure,
 		Reason:      maintenanceFailureReason(intent.Kind()),
 		LastError:   interruptedMaintenanceFailure,
 	}
-	if target == nil || target.Status != "failed" {
-		info, _ := leasesm.NewMaintenanceRecoveryFailureInfo(intent, details)
-		return info
+	if target != nil && target.Status == "failed" {
+		if target.Reason != "" {
+			details.Reason = target.Reason
+		}
+		if target.Message != "" {
+			details.CallbackErr = target.Message
+			details.LastError = target.Message
+		}
 	}
-	if target.Reason != "" {
-		details.Reason = target.Reason
+	info, err := leasesm.NewMaintenanceRecoveryFailureInfo(intent, details)
+	if err != nil {
+		return leasesm.ReplaceFailureInfo{}, fmt.Errorf("construct recovered %s failure: %w", intent.Kind(), err)
 	}
-	if target.Message != "" {
-		details.CallbackErr = target.Message
-		details.LastError = target.Message
-	}
-	info, _ := leasesm.NewMaintenanceRecoveryFailureInfo(intent, details)
-	return info
+	return info, nil
 }
 
 func (b *Backend) convergeMaintenanceRuntimeFailure(
@@ -801,7 +832,9 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 	// terminal budget (ENG-799): SetStatus only applies the Ready boundary and
 	// never counts a failure.
 	provision.SetStatus(status, time.Now())
-	if failure == nil {
+	// A runtime refresh rolled back to Ready left the lease unchanged, so it
+	// leaves no error behind; one that ends Failed is still a failure.
+	if failure == nil || (status == backend.ProvisionStatusReady && failure.LeavesLeaseUnchanged()) {
 		provision.LastError = ""
 		provision.Reason = ""
 		provision.Message = ""

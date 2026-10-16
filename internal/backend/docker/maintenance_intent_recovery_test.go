@@ -304,7 +304,13 @@ func newMaintenanceRecoveryHarnessForAuthorityAtCallbackOptions(
 		payload,
 	)
 	require.NoError(t, err)
-	candidate, err := b.maintenanceSettlement.NewMaintenanceIntentCandidate(request, sourceClaim, target)
+	var candidate shared.MaintenanceIntentCandidate
+	if kind == shared.MaintenanceIntentRuntimeRefresh {
+		// A refresh target is always derived from its sealed source.
+		candidate, err = b.maintenanceSettlement.NewRuntimeRefreshIntentCandidate(request, sourceClaim)
+	} else {
+		candidate, err = b.maintenanceSettlement.NewMaintenanceIntentCandidate(request, sourceClaim, target)
+	}
 	require.NoError(t, err)
 	admission, err := b.maintenanceSettlement.BeginMaintenanceIntent(candidate)
 	require.NoError(t, err)

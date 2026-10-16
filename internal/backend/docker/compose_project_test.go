@@ -533,7 +533,8 @@ func TestBuildComposeProject_StampsRuntimeContract(t *testing.T) {
 	project := buildTestComposeProject(t, params)
 
 	for name, svc := range project.Services {
-		assert.Equal(t, strconv.Itoa(currentRuntimeContract), svc.Labels[LabelRuntimeContract], name)
+		assert.Equal(t, currentRuntimeContract.label(), svc.Labels[LabelRuntimeContract], name)
+		assert.Equal(t, currentRuntimeContract, parseRuntimeContract(svc.Labels), name)
 	}
 }
 
