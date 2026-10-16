@@ -307,6 +307,13 @@ func (d *DockerClient) bindCompensationNetworks(ctx context.Context, leaseUUID, 
 		bound.mode = id
 	}
 	for _, name := range slices.Sorted(maps.Keys(target.endpoints)) {
+		if nonAttachingNetworkMode(name) {
+			// Docker's predefined networks: a container in network mode none
+			// lists its "none" endpoint. No other network can hold these
+			// reserved names, and they reach no lease's or tenant's network.
+			bound.endpoints[name] = target.endpoints[name]
+			continue
+		}
 		id, err := resolve(name)
 		if err != nil {
 			return compensationNetworks{}, err

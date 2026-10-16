@@ -585,6 +585,16 @@ func TestBindCompensationNetworksAttachesOnlyToVerifiedIDs(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, compensationNetworks{mode: id, endpoints: map[string]*networktypes.EndpointSettings{id: {Aliases: []string{"web"}}}}, bound)
 	})
+	t.Run("network mode none", func(t *testing.T) {
+		// Without isolation a container runs in network mode none, which
+		// Docker also lists as its one endpoint.
+		daemon := newNetworkDaemon(t)
+		source := compensationNetworks{mode: "none", endpoints: map[string]*networktypes.EndpointSettings{"none": {}}}
+		bound, err := daemon.dockerClient(t, ownershipBackend).bindCompensationNetworks(t.Context(), ownershipLease, tenant, source)
+		require.NoError(t, err)
+		require.Equal(t, source, bound)
+		require.Empty(t, daemon.seen(), "a predefined network needs no ownership check")
+	})
 	t.Run("an ID that resolves to another lease's network", func(t *testing.T) {
 		daemon := newNetworkDaemon(t)
 		other := "00000000-0000-4000-8000-000000000999"
