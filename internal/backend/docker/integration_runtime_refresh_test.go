@@ -31,18 +31,19 @@ func replaceWithLegacyRuntimeContainer(t *testing.T, ctx context.Context, leaseU
 	defer func() { _ = sdk.Close() }()
 
 	tenantNetwork := TenantNetworkName(tenant)
-	_, err = sdk.NetworkCreate(ctx, tenantNetwork, networktypes.CreateOptions{
-		Driver: "bridge",
-		Labels: map[string]string{LabelManaged: "true", LabelTenant: tenant},
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = sdk.NetworkRemove(context.Background(), tenantNetwork) })
 
 	containerID := getContainerID(t, leaseUUID)
 	current, err := sdk.ContainerInspect(ctx, containerID)
 	require.NoError(t, err)
 	labels := maps.Clone(current.Config.Labels)
 	delete(labels, LabelRuntimeContract)
+	// The labels v0.13 put on a tenant network of a named backend.
+	_, err = sdk.NetworkCreate(ctx, tenantNetwork, networktypes.CreateOptions{
+		Driver: "bridge",
+		Labels: map[string]string{LabelManaged: "true", LabelTenant: tenant, LabelBackendName: labels[LabelBackendName]},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sdk.NetworkRemove(context.Background(), tenantNetwork) })
 	config := *current.Config
 	config.Labels = labels
 	hostConfig := *current.HostConfig

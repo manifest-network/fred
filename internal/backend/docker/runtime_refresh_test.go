@@ -111,6 +111,8 @@ type runtimeRefreshHarness struct {
 	upOpts    []composeUpOpts
 	project   *composetypes.Project
 	callbacks []backend.CallbackPayload
+	// leaseNetwork is the lease's own network once a refresh created it.
+	leaseNetwork leaseNetworkAuthority
 }
 
 func newRuntimeRefreshHarness(t *testing.T, status backend.ProvisionStatus) *runtimeRefreshHarness {
@@ -151,6 +153,19 @@ func newRuntimeRefreshHarness(t *testing.T, status backend.ProvisionStatus) *run
 			copied := h.substrate
 			copied.ContainerID = containerID
 			return &copied, nil
+		},
+		// A legacy lease ran on its tenant's network, so its own network
+		// does not exist yet: the refresh creates and verifies it.
+		InspectLeaseNetworkFn: func(context.Context, string) (leaseNetworkAuthority, bool, error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.leaseNetwork, h.leaseNetwork.established(), nil
+		},
+		CreateLeaseNetworkFn: func(_ context.Context, leaseUUID string) (leaseNetworkAuthority, error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			h.leaseNetwork = testLeaseNetworkAuthority(leaseUUID, "docker")
+			return h.leaseNetwork, nil
 		},
 	}
 	composeMock := &mockComposeExecutor{
@@ -227,7 +242,8 @@ func TestRuntimeRefreshRecreatesAStaleLeaseAndAttestsTheActiveRelease(t *testing
 	assert.True(t, upOpts[0].ForceRecreate, "a refresh recreates every container")
 	require.NotNil(t, project)
 	assert.Equal(t, currentRuntimeContract.label(), project.Services["app"].Labels[LabelRuntimeContract])
-	assert.Contains(t, project.Networks, leaseNetworkKey, "the refreshed lease runs on its own network")
+	require.Contains(t, project.Networks, leaseNetworkKey, "the refreshed lease runs on its own network")
+	assert.Equal(t, testLeaseNetworkID(h.leaseUUID), project.Networks[leaseNetworkKey].Name, "attached by the verified ID")
 
 	assert.Equal(t, 0, status.Stale)
 	assert.Equal(t, 1, status.Refreshed)
