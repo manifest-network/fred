@@ -265,15 +265,21 @@ func TestNetworkCleanupCountsReclamationOutcomes(t *testing.T) {
 	require.Equal(t, listErrorsBefore+1, testutil.ToFloat64(networkReclamationTotal.WithLabelValues("list_error")))
 }
 
+// testListedLeaseNetwork is a lease network as the fleet inventory lists it on
+// the default test backend ("docker").
+func testListedLeaseNetwork(lease string) networktypes.Inspect {
+	return networktypes.Inspect{Name: leaseNetworkName(lease), ID: testLeaseNetworkID(lease), Labels: leaseNetworkLabels(lease, "docker")}
+}
+
 func TestNetworkCleanupBusyLeaseDoesNotBlockShutdownAndRetries(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const lease = "55555555-5555-4555-8555-555555555555"
 		var removals atomic.Int32
 		mock := &mockDockerClient{
 			ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
-				return []networktypes.Inspect{{Name: leaseNetworkName(lease), Labels: leaseNetworkLabels(lease, "")}}, nil
+				return []networktypes.Inspect{testListedLeaseNetwork(lease)}, nil
 			},
-			RemoveLeaseNetworkIfEmptyFn: func(context.Context, string) (networkRemoval, error) {
+			RemoveLeaseNetworkIfEmptyFn: func(context.Context, leaseNetworkAuthority) (networkRemoval, error) {
 				removals.Add(1)
 				return networkRemoved, nil
 			},
@@ -311,25 +317,32 @@ func TestNetworkCleanupBusyLeaseDoesNotBlockShutdownAndRetries(t *testing.T) {
 	})
 }
 
-func TestNetworkCleanupKeepsTrackedLeaseNetworkAndRemovesOrphan(t *testing.T) {
+func TestNetworkCleanupKeepsTrackedAndForeignLeaseNetworksAndRemovesOrphan(t *testing.T) {
 	const (
 		tracked = "66666666-6666-4666-8666-666666666666"
 		orphan  = "77777777-7777-4777-8777-777777777777"
+		foreign = "88888888-8888-4888-8888-888888888888"
 	)
-	var removed []string
+	foreignNetwork := testListedLeaseNetwork(foreign)
+	foreignNetwork.Labels = leaseNetworkLabels(foreign, "other-backend")
+	attached := testListedLeaseNetwork(orphan)
+	attached.Containers = map[string]networktypes.EndpointResource{"c": {}}
+	var removed []leaseNetworkAuthority
 	mock := &mockDockerClient{
 		ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
 			return []networktypes.Inspect{
-				{Name: leaseNetworkName(tracked), Labels: leaseNetworkLabels(tracked, "")},
-				{Name: leaseNetworkName(orphan), Labels: leaseNetworkLabels(orphan, "")},
+				testListedLeaseNetwork(tracked),
+				testListedLeaseNetwork(orphan),
 				// A lease network with a container attached is never a candidate.
-				{Name: "attached", Labels: leaseNetworkLabels(orphan, ""), Containers: map[string]networktypes.EndpointResource{"c": {}}},
-				// A lease-scoped network without a lease label names no owner to check.
-				{Name: "unowned", Labels: map[string]string{LabelManaged: "true", LabelNetworkScope: networkScopeLease}},
+				attached,
+				// A lease-scoped network without a lease label names no owner.
+				{Name: "unowned", ID: testLeaseNetworkID("unowned"), Labels: map[string]string{LabelManaged: "true", LabelNetworkScope: networkScopeLease, LabelBackendName: "docker"}},
+				// Another backend's labels: never this backend's to remove.
+				foreignNetwork,
 			}, nil
 		},
-		RemoveLeaseNetworkIfEmptyFn: func(_ context.Context, lease string) (networkRemoval, error) {
-			removed = append(removed, lease)
+		RemoveLeaseNetworkIfEmptyFn: func(_ context.Context, authority leaseNetworkAuthority) (networkRemoval, error) {
+			removed = append(removed, authority)
 			return networkRemoved, nil
 		},
 	}
@@ -338,7 +351,11 @@ func TestNetworkCleanupKeepsTrackedLeaseNetworkAndRemovesOrphan(t *testing.T) {
 	})
 	defer b.stopCancel()
 	activeBefore := testutil.ToFloat64(networkReclamationTotal.WithLabelValues("lease_active"))
+	errorsBefore := testutil.ToFloat64(networkReclamationTotal.WithLabelValues("error"))
 	b.cleanupOrphanedNetworks(t.Context())
-	require.Equal(t, []string{orphan}, removed, "only an untracked lease's idle network is removed")
+	require.Equal(t, []leaseNetworkAuthority{testLeaseNetworkAuthority(orphan, "docker")}, removed,
+		"only an untracked lease's own idle network is removed, by its verified ID")
 	require.Equal(t, activeBefore+1, testutil.ToFloat64(networkReclamationTotal.WithLabelValues("lease_active")))
+	require.Equal(t, errorsBefore+2, testutil.ToFloat64(networkReclamationTotal.WithLabelValues("error")),
+		"an unowned and a foreign lease network are refused, never removed")
 }

@@ -2228,11 +2228,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   any lease could reach another by address or container name. A tenant that
   hosts several customers under one address therefore exposed those customers
   to each other. Service names now resolve only within the lease, and leases
-  cannot reach each other, including leases of the same tenant. The lease's
-  Compose project owns the network: Compose creates it on Up and removes it
-  on Down, and the network worker reclaims one that a failed Down left behind,
-  only once the backend tracks no provision for the lease and no command holds
-  its fence. Fred no longer creates per-tenant networks. A running lease
+  cannot reach each other, including leases of the same tenant. Fred creates
+  the lease's network itself and attaches containers only to that network's
+  verified ID: an existing network of that name is used only when it carries
+  this lease's and backend's ownership labels, and any other, foreign or
+  unlabeled, fails the launch as a backend error without being attached to,
+  adopted, relabeled or removed. Before each container create and start, Fred
+  confirms that the verified ID still resolves to that network, since Docker
+  falls back to a network named with the ID once the original is gone. Compose
+  never creates, removes or reconnects a network. The network stays through re-deploys and is reclaimed by the
+  network worker after the lease is gone, only once the backend tracks no
+  provision for the lease and no command holds its fence, and only by its
+  verified ID. The worker likewise removes a legacy per-tenant network only
+  when it carries that tenant's and this backend's labels, by its verified
+  ID. Fred no longer creates per-tenant networks. A running lease
   stays on its tenant network until its containers are next recreated
   (restart, update, custom-domain change, restore or re-provision); that
   recreate moves every service of the lease, including stopped ones.

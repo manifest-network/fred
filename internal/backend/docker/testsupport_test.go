@@ -3,6 +3,8 @@ package docker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2721,6 +2723,9 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 		// Default to a clean network list so migration tests
 		// that enable isolation don't crash; tests that need a non-empty
 		// list can override on the mock directly.
+		InspectLeaseNetworkFn: func(_ context.Context, leaseUUID string) (leaseNetworkAuthority, bool, error) {
+			return testLeaseNetworkAuthority(leaseUUID, "docker"), true, nil
+		},
 		ListIdleManagedNetworksFn: func(_ context.Context) ([]networktypes.Inspect, error) {
 			return nil, nil
 		},
@@ -2989,4 +2994,17 @@ func requireAccepted(t testing.TB, enqueue func() bool, msgAndArgs ...any) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// testLeaseNetworkID is the deterministic full network ID a test lease network
+// gets: a full 64-hex ID, so it is a valid authority target.
+func testLeaseNetworkID(leaseUUID string) string {
+	sum := sha256.Sum256([]byte("lease-network/" + leaseUUID))
+	return hex.EncodeToString(sum[:])
+}
+
+// testLeaseNetworkAuthority is authority over the test lease network, as
+// DockerClient would mint it after verifying the network.
+func testLeaseNetworkAuthority(leaseUUID, backendName string) leaseNetworkAuthority {
+	return leaseNetworkAuthority{leaseUUID: leaseUUID, backendName: backendName, networkID: testLeaseNetworkID(leaseUUID)}
 }

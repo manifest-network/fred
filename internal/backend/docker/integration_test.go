@@ -514,9 +514,8 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	err = b.Deprovision(ctx, leaseUUID2)
 	require.NoError(t, err)
 
-	// Compose Down removes each lease network on close; the bounded network
-	// sweep reclaims one a failed Down left behind. Retry passes until both
-	// networks are gone.
+	// Closing leaves each lease network to the bounded, ownership-checked
+	// network sweep. Retry passes until both networks are gone.
 	cleanupCtx, cancelCleanup := b.recoveryDockerReadContext(ctx)
 	defer cancelCleanup()
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
@@ -1650,15 +1649,23 @@ func TestIntegration_Docker_SameTenantLeasesAreIsolated(t *testing.T) {
 	out, execErr := exec.Command("docker", "exec", webA, "nslookup", otherName).CombinedOutput()
 	assert.Error(t, execErr, "another lease's container name must not resolve: %s", out)
 
-	// Closing a lease removes its network.
+	// Closing a lease leaves its network to Fred's ownership-checked
+	// reclamation, which removes it once the lease is gone.
 	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 	for _, lease := range []string{leaseA, leaseB} {
 		require.NoError(t, b.Deprovision(ctx, lease))
-		_, inspectErr := docker.client.NetworkInspect(ctx, leaseNetworkName(lease), networktypes.InspectOptions{})
-		assert.True(t, client.IsErrNotFound(inspectErr), "close must remove %s: %v", leaseNetworkName(lease), inspectErr)
 	}
+	cleanupCtx, cancelCleanup := b.recoveryDockerReadContext(ctx)
+	defer cancelCleanup()
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		b.cleanupOrphanedNetworks(cleanupCtx)
+		for _, lease := range []string{leaseA, leaseB} {
+			_, inspectErr := docker.client.NetworkInspect(cleanupCtx, leaseNetworkName(lease), networktypes.InspectOptions{})
+			assert.True(collect, client.IsErrNotFound(inspectErr), "reclamation must remove %s: %v", leaseNetworkName(lease), inspectErr)
+		}
+	}, 30*time.Second, 100*time.Millisecond)
 }
 
 // --- Restart, Update, and GetReleases integration tests ---

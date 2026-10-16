@@ -17,20 +17,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
-// leaseNetworking selects whether a lease's containers join their own bridge
-// network. No value names another network: the only network a lease can join
-// is the one derived from its own UUID, so one lease can never be attached to
-// a network another lease shares.
-type leaseNetworking uint8
-
-const (
-	// leaseNetworkingNone leaves containers on Docker's default bridge
-	// (network_isolation disabled).
-	leaseNetworkingNone leaseNetworking = iota
-	// leaseNetworkingIsolated gives the lease its own Compose-owned network.
-	leaseNetworkingIsolated
-)
-
 // composeProjectParams holds all inputs for building a Compose project.
 type composeProjectParams struct {
 	LeaseUUID            string
@@ -45,10 +31,13 @@ type composeProjectParams struct {
 	Items                []backend.LeaseItem
 	Profiles             map[string]SKUProfile
 	ImageSetups          map[string]*imageSetup
-	Networking           leaseNetworking
-	VolBinds             map[string]map[int]serviceVolBinds // svc → instance → binds
-	Cfg                  *Config
-	Ingress              IngressConfig
+	// Network is the verified authority over the lease's own network. It is
+	// required when network isolation is enabled and the project attaches by
+	// its ID; with isolation disabled it must be the zero value.
+	Network  leaseNetworkAuthority
+	VolBinds map[string]map[int]serviceVolBinds // svc → instance → binds
+	Cfg      *Config
+	Ingress  IngressConfig
 }
 
 // serviceVolBinds holds volume binds for a single service instance.
@@ -74,15 +63,34 @@ const currentRuntimeContract = 1
 // that a network-attachment check alone would restart in place.
 const leaseNetworkKey = "lease"
 
+// projectNetwork resolves the network a lease's project attaches to. With
+// isolation enabled the authority must be this lease's and this backend's; the
+// project then names the network by its verified ID as an external network,
+// so Compose neither creates nor removes it and Docker attaches to that exact
+// network. The returned name is the network's human-readable name, which
+// Traefik matches against a container's attached networks.
+func projectNetwork(params composeProjectParams) (id, name string, err error) {
+	if params.Cfg == nil || !params.Cfg.IsNetworkIsolation() {
+		if params.Network.established() {
+			return "", "", fmt.Errorf("%w: network isolation is disabled", errLeaseNetworkOwnership)
+		}
+		return "", "", nil
+	}
+	if err := params.Network.authorizes(params.LeaseUUID, params.BackendName); err != nil {
+		return "", "", err
+	}
+	return params.Network.networkID, leaseNetworkName(params.LeaseUUID), nil
+}
+
 // buildPlannedComposeProject generates a compose-go Project from the parameters
 // and the exact ingress decision that owns emitted item metadata.
 // The project is fully in-memory — no YAML files or project directories.
-func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIngressPlan) *composetypes.Project {
+func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIngressPlan) (*composetypes.Project, error) {
 	projectName := composeProjectName(params.LeaseUUID)
 	services := make(composetypes.Services)
-	var networkName string
-	if params.Networking == leaseNetworkingIsolated {
-		networkName = leaseNetworkName(params.LeaseUUID)
+	networkID, networkName, err := projectNetwork(params)
+	if err != nil {
+		return nil, err
 	}
 
 	for _, item := range ingress.items {
@@ -188,19 +196,18 @@ func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIn
 		Services: services,
 	}
 
-	// The lease's own bridge network. Compose creates it on Up and removes it
-	// on Down, so it lives exactly as long as the lease's containers.
-	if networkName != "" {
+	// The lease's own bridge network, named by its verified ID. External: Fred
+	// created or verified it, and Compose must neither create nor remove it.
+	if networkID != "" {
 		project.Networks = composetypes.Networks{
 			leaseNetworkKey: composetypes.NetworkConfig{
-				Name:   networkName,
-				Driver: "bridge",
-				Labels: leaseNetworkLabels(params.LeaseUUID, params.BackendName),
+				Name:     networkID,
+				External: true,
 			},
 		}
 	}
 
-	return project
+	return project, nil
 }
 
 // applyDependsOn maps manifest-level depends_on to Compose DependsOnConfig.

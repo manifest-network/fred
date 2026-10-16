@@ -304,9 +304,9 @@ func (b *Backend) doDeprovisionScoped(
 		return err
 	}
 
-	// Compose Down removed the lease network; one it left behind, and legacy
-	// tenant networks, converge in the periodic fleet sweep. A completed close
-	// must not wait for unrelated network inventory or network mutations.
+	// The lease network, and legacy tenant networks, converge in the periodic
+	// ownership-checked fleet sweep. A completed close must not wait for
+	// unrelated network inventory or network mutations.
 	deprovisionsTotal.Inc()
 	logger.Info("deprovisioned")
 	return nil

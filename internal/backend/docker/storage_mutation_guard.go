@@ -158,11 +158,11 @@ func newBackgroundMaintenanceCoordinator(
 		})
 		return outcome, err
 	})
-	removeLeaseNetwork := backgroundLeaseNetworkRemove(func(ctx context.Context, leaseUUID string) (networkRemoval, error) {
+	removeLeaseNetwork := backgroundLeaseNetworkRemove(func(ctx context.Context, authority leaseNetworkAuthority) (networkRemoval, error) {
 		var outcome networkRemoval
 		err := perform(ctx, "background remove lease network", func(ctx context.Context) error {
 			var err error
-			outcome, err = ops.docker.RemoveLeaseNetworkIfEmpty(ctx, leaseUUID)
+			outcome, err = ops.docker.RemoveLeaseNetworkIfEmpty(ctx, authority)
 			return err
 		})
 		return outcome, err
@@ -490,6 +490,40 @@ func (m *storageMutations) removeContainer(ctx context.Context, id string) error
 	return m.runner.Step(ctx, "remove container", func(ctx context.Context) error {
 		return m.ops.docker.RemoveContainer(ctx, id)
 	})
+}
+
+// ensureLeaseNetwork returns authority over the Started subject's own lease
+// network. Inspecting an existing network changes nothing, so it is a Prepare:
+// a same-named network that is not this lease's on this backend refuses the
+// execution without entering any Step, and is never used. Only creating an
+// absent network is a Step, where an uncertain Docker result makes the
+// execution ambiguous like any other substrate mutation.
+func (m *storageMutations) ensureLeaseNetwork(ctx context.Context) (leaseNetworkAuthority, error) {
+	if m == nil || m.leaseUUID == "" {
+		return leaseNetworkAuthority{}, errors.New("lease network target differs from Started subject")
+	}
+	var (
+		authority leaseNetworkAuthority
+		present   bool
+	)
+	if err := m.runner.Prepare(ctx, "inspect lease network", func(ctx context.Context) error {
+		var err error
+		authority, present, err = m.ops.docker.InspectLeaseNetwork(ctx, m.leaseUUID)
+		return err
+	}); err != nil {
+		return leaseNetworkAuthority{}, err
+	}
+	if present {
+		return authority, nil
+	}
+	if err := m.runner.Step(ctx, "create lease network", func(ctx context.Context) error {
+		var err error
+		authority, err = m.ops.docker.CreateLeaseNetwork(ctx, m.leaseUUID)
+		return err
+	}); err != nil {
+		return leaseNetworkAuthority{}, err
+	}
+	return authority, nil
 }
 
 func (m *storageMutations) createVolume(ctx context.Context, id string, sizeMB int64) (path string, created bool, err error) {
