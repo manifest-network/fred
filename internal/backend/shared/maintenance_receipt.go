@@ -262,9 +262,19 @@ type maintenanceCompletionRecord struct {
 	// long as the receipt is retained; it stays in the window until that
 	// cleanup is confirmed. Older receipts omit these fields and therefore
 	// cannot authorize destruction.
-	EffectStarted        bool      `json:"effect_started,omitempty"`
-	TargetReleaseVersion int       `json:"target_release_version,omitempty"`
-	TargetReleaseDigest  string    `json:"target_release_digest,omitempty"`
+	EffectStarted        bool   `json:"effect_started,omitempty"`
+	TargetReleaseVersion int    `json:"target_release_version,omitempty"`
+	TargetReleaseDigest  string `json:"target_release_digest,omitempty"`
+	// SourceReady records that, when this failed maintenance settled, its
+	// source release was the lease's running, ready cohort: either the bound
+	// classifier proved it (the source was never displaced, or was recreated),
+	// or the compensation journal had reached source-ready, read in the same
+	// transaction that consumed the intent. The source release identity is the
+	// intent's own. It is never inferred from release statuses afterwards: the
+	// source row stays active even when compensation fails.
+	SourceReady          bool      `json:"source_ready,omitempty"`
+	SourceReleaseVersion int       `json:"source_release_version,omitempty"`
+	SourceReleaseDigest  string    `json:"source_release_digest,omitempty"`
 	SettledAt            time.Time `json:"settled_at"`
 	// AdmittedAt is the provider's admission stamp; zero for an unstamped or
 	// backend-minted command.
@@ -327,15 +337,19 @@ func maintenanceEntryRequestDigest(entry maintenanceIntentEntry) ([sha256.Size]b
 	return digestMaintenanceRequestAuthority(authority)
 }
 
+// maintenanceCompletionRecordFor builds the receipt of claim's settlement.
+// sourceReady is the settling transaction's proof that the source release is
+// the running, ready cohort; it adds the intent's own source release identity.
 func maintenanceCompletionRecordFor(
 	claim MaintenanceIntentClaim,
 	status backend.CallbackStatus,
 	errMsg string,
 	settledAt time.Time,
 	completionSequence uint64,
+	sourceReady bool,
 ) maintenanceCompletionRecord {
 	authority, _ := releaseRuntimeIdentityFor(claim.entry.TargetRelease)
-	return maintenanceCompletionRecord{
+	record := maintenanceCompletionRecord{
 		Version:              maintenanceCompletionRecordV1,
 		MaintenanceID:        claim.MaintenanceID(),
 		Kind:                 claim.Kind(),
@@ -354,6 +368,12 @@ func maintenanceCompletionRecordFor(
 		SettledAt:            settledAt,
 		AdmittedAt:           claim.entry.AdmittedAt,
 	}
+	if sourceReady {
+		record.SourceReady = true
+		record.SourceReleaseVersion = claim.entry.SourceReleaseVersion
+		record.SourceReleaseDigest = claim.entry.SourceReleaseDigest
+	}
+	return record
 }
 
 func validateMaintenanceCompletionRecord(record maintenanceCompletionRecord, leaseUUID string) error {
@@ -408,6 +428,18 @@ func validateMaintenanceCompletionRecord(record maintenanceCompletionRecord, lea
 	case backend.CallbackStatusFailed:
 	default:
 		return fmt.Errorf("maintenance receipt has invalid status %q", record.Status)
+	}
+	if record.SourceReady {
+		// Only a failed, bound generation settles back onto its source.
+		if record.Status != backend.CallbackStatusFailed ||
+			record.TargetReleaseVersion == 0 || record.SourceReleaseVersion <= 0 {
+			return errors.New("maintenance receipt names a ready source without a bound failure")
+		}
+		if _, err := parseMaintenanceDigest(record.SourceReleaseDigest, false); err != nil {
+			return fmt.Errorf("maintenance receipt source release digest: %w", err)
+		}
+	} else if record.SourceReleaseVersion != 0 || record.SourceReleaseDigest != "" {
+		return errors.New("maintenance receipt names a source release it did not prove ready")
 	}
 	if err := validateMaintenanceStampForKind(record.Kind, record.AdmittedAt); err != nil {
 		return fmt.Errorf("maintenance receipt: %w", err)
@@ -524,6 +556,108 @@ func (s *CallbackStore) listFailedMaintenanceCompletionRecords() (
 		})
 	})
 	return records, err
+}
+
+// SettledMaintenance is one retained maintenance completion receipt, read back
+// as the durable outcome of that exact maintenance. Only the store mints one,
+// from a validated receipt, so its outcome and source fact cannot disagree.
+type SettledMaintenance struct {
+	leaseUUID     string
+	maintenanceID MaintenanceID
+	succeeded     bool
+	sourceReady   bool
+	source        SettledSourceRelease
+}
+
+// SettledSourceRelease identifies the release a failed maintenance settled
+// back onto.
+type SettledSourceRelease struct {
+	Version int
+	Digest  string
+}
+
+func settledMaintenanceFrom(record maintenanceCompletionRecord) SettledMaintenance {
+	settled := SettledMaintenance{
+		leaseUUID:     record.LeaseUUID,
+		maintenanceID: record.MaintenanceID,
+		succeeded:     record.Status == backend.CallbackStatusSuccess,
+	}
+	if record.SourceReady {
+		settled.sourceReady = true
+		settled.source = SettledSourceRelease{Version: record.SourceReleaseVersion, Digest: record.SourceReleaseDigest}
+	}
+	return settled
+}
+
+func (m SettledMaintenance) LeaseUUID() string            { return m.leaseUUID }
+func (m SettledMaintenance) MaintenanceID() MaintenanceID { return m.maintenanceID }
+
+// Succeeded reports that the maintenance's target became the active release.
+func (m SettledMaintenance) Succeeded() bool { return m.succeeded }
+
+// SourceReady returns the release a failed maintenance settled back onto, when
+// the settlement proved it was the lease's running, ready cohort. A successful
+// maintenance never has one.
+func (m SettledMaintenance) SourceReady() (SettledSourceRelease, bool) {
+	return m.source, m.sourceReady
+}
+
+// LatestSettledMaintenance returns, for every lease with a retained receipt of
+// kind, the receipt that settled last. Receipts are deleted when a lease
+// closes, so only live leases appear.
+func (s *MaintenanceSettlement) LatestSettledMaintenance(kind MaintenanceIntentKind) ([]SettledMaintenance, error) {
+	if s == nil || s.callbacks == nil {
+		return nil, errors.New("maintenance settlement is invalid")
+	}
+	if !kind.Valid() {
+		return nil, fmt.Errorf("invalid maintenance kind %q", kind)
+	}
+	var latest []SettledMaintenance
+	err := s.callbacks.view(func(tx *bolt.Tx) error {
+		root := tx.Bucket(callbackMaintenanceHistoryBucketName)
+		if root == nil {
+			return errors.New("completed maintenance history bucket missing")
+		}
+		return root.ForEach(func(leaseKey, value []byte) error {
+			if value != nil {
+				return fmt.Errorf("completed maintenance history %q is not a nested bucket", leaseKey)
+			}
+			records, err := listMaintenanceReceiptsTx(tx, string(leaseKey))
+			if err != nil {
+				return err
+			}
+			var last *maintenanceCompletionRecord
+			for i := range records {
+				if records[i].Kind == kind && (last == nil || records[i].CompletionSequence > last.CompletionSequence) {
+					last = &records[i]
+				}
+			}
+			if last != nil {
+				latest = append(latest, settledMaintenanceFrom(*last))
+			}
+			return nil
+		})
+	})
+	return latest, err
+}
+
+// SettledMaintenanceByID returns the retained receipt of maintenance id on
+// leaseUUID, or found=false while it is unsettled or no longer retained.
+func (s *MaintenanceSettlement) SettledMaintenanceByID(leaseUUID string, id MaintenanceID) (SettledMaintenance, bool, error) {
+	if s == nil || s.callbacks == nil {
+		return SettledMaintenance{}, false, errors.New("maintenance settlement is invalid")
+	}
+	var settled SettledMaintenance
+	var found bool
+	err := s.callbacks.view(func(tx *bolt.Tx) error {
+		record, ok, err := findMaintenanceReceiptTx(tx, leaseUUID, id)
+		if err != nil || !ok {
+			return err
+		}
+		settled, found = settledMaintenanceFrom(record), true
+		return nil
+	})
+	return settled, found, err
 }
 
 // UnverifiableMaintenanceReceipt is a failed, effect-started receipt whose

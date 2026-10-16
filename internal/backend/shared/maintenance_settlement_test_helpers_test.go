@@ -377,7 +377,7 @@ func tryResolveMaintenanceRuntimeFailureForTest(
 		return true, err
 	}
 	_, err = settlement.callbacks.resolveMaintenanceIntentEntriesLocked(
-		claim, []CallbackEntry{maintenance, runtimeFailure},
+		claim, []CallbackEntry{maintenance, runtimeFailure}, false,
 	)
 	return true, err
 }

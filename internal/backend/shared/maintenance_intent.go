@@ -1048,7 +1048,7 @@ func (s *MaintenanceSettlement) resolveSuccessLocked(
 	if err != nil {
 		return CallbackEntry{}, err
 	}
-	return s.callbacks.resolveMaintenanceIntentLocked(claim, entry)
+	return s.callbacks.resolveMaintenanceIntentLocked(claim, entry, false)
 }
 
 func (s *MaintenanceSettlement) resolveFailureLocked(
@@ -1068,7 +1068,10 @@ func (s *MaintenanceSettlement) resolveFailureLocked(
 	if err != nil {
 		return CallbackEntry{}, err
 	}
-	return s.callbacks.resolveMaintenanceIntentLocked(claim, entry)
+	// Only the bound classifier mints SourceReady, for the exact source cohort
+	// of this failed generation.
+	_, sourceReady := failed.SourceReady()
+	return s.callbacks.resolveMaintenanceIntentLocked(claim, entry, sourceReady)
 }
 
 func prepareDivergedMaintenanceCompletions(
@@ -1135,17 +1138,21 @@ func prepareMaintenanceIntentCompletion(
 func (s *CallbackStore) resolveMaintenanceIntentLocked(
 	claim MaintenanceIntentClaim,
 	entry CallbackEntry,
+	sourceReady bool,
 ) (CallbackEntry, error) {
-	entries, err := s.resolveMaintenanceIntentEntriesLocked(claim, []CallbackEntry{entry})
+	entries, err := s.resolveMaintenanceIntentEntriesLocked(claim, []CallbackEntry{entry}, sourceReady)
 	if err != nil {
 		return CallbackEntry{}, err
 	}
 	return entries[0], nil
 }
 
+// resolveMaintenanceIntentEntriesLocked settles claim with entries. sourceReady
+// is a failed settlement's typed proof that its source is the ready cohort.
 func (s *CallbackStore) resolveMaintenanceIntentEntriesLocked(
 	claim MaintenanceIntentClaim,
 	entries []CallbackEntry,
+	sourceReady bool,
 ) ([]CallbackEntry, error) {
 	if len(entries) == 0 {
 		return nil, errors.New("maintenance settlement requires at least one callback")
@@ -1162,9 +1169,19 @@ func (s *CallbackStore) resolveMaintenanceIntentEntriesLocked(
 				return putErr
 			}
 		}
+		// The receipt keeps the positive fact that the source is the ready
+		// cohort: the caller's typed proof, or the compensation journal's
+		// source-ready phase, read before this transaction deletes that journal
+		// (a failure reconstructed after a restart carries no proof).
+		compensation, err := readCompensationTx(tx, claim)
+		if err != nil {
+			return err
+		}
+		sourceReady = entries[0].Status == backend.CallbackStatusFailed && (sourceReady ||
+			(compensation != nil && compensation.Phase == compensationSourceReady))
 		receipt := maintenanceCompletionRecordFor(
 			claim, entries[0].Status, entries[0].Error, entries[0].CreatedAt,
-			entries[0].Sequence,
+			entries[0].Sequence, sourceReady,
 		)
 		transition, err := newResolveMaintenanceLeaseMutation(claim, receipt)
 		if err != nil {
