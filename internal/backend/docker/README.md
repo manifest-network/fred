@@ -1996,6 +1996,7 @@ could not read), comes from the current or most recent run in this process.
   "contract": 1,
   "active": false,
   "stale": 1,
+  "stale_leases": ["650e8400-e29b-41d4-a716-446655440000"],
   "in_flight": 0,
   "refreshed": 1,
   "failed": 1,
@@ -2019,7 +2020,8 @@ could not read), comes from the current or most recent run in this process.
 |---|---|---|
 | `contract` | integer ≥ 1 | The runtime contract this release creates containers under |
 | `active` | boolean | True from the POST that starts a run until that run has finished every lease, including while it waits between leases and passes |
-| `stale` | integer | Ready leases with at least one container created under an older contract. A lease whose refresh failed and was restored stays counted |
+| `stale` | integer | The length of `stale_leases` |
+| `stale_leases` | array of strings | Sorted UUIDs of the Ready leases with at least one container created under an older contract, read from Docker for this response. A lease whose refresh failed and was restored stays listed. Never `null` |
 | `in_flight` | integer | Leases the run is refreshing now |
 | `refreshed`, `failed`, `skipped` | integer | Rows by outcome; always equal to the per-outcome row counts of `leases` |
 | `restored` | integer | `failed` rows that carry `restored` |

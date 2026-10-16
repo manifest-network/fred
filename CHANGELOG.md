@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   the same release, volumes and lease, at most
   `runtime_refresh_max_concurrency` (default 4; 0 disables) at a time, through
   a journaled `runtime_refresh` maintenance that never counts as a failure.
-  `GET /runtime_refresh` reports the stale count, whether a run is `active`,
+  `GET /runtime_refresh` reports the stale leases, whether a run is `active`,
   the leases still sharing a Docker network with another lease, and one
   attestation per lease: `refreshed` (with the maintenance ID its new
   containers carry), `failed`, or `skipped`. A `failed` refresh that settled

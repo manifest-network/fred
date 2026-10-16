@@ -79,7 +79,8 @@ func TestRuntimeRefreshStatusReportsInventoryErrors(t *testing.T) {
 
 func TestRuntimeRefreshStatusJSONContract(t *testing.T) {
 	status := RuntimeRefreshStatus{
-		Contract: 1, Active: true, Stale: 2, InFlight: 1, Refreshed: 1, Failed: 2, Restored: 1, Skipped: 1,
+		Contract: 1, Active: true, Stale: 2, StaleLeases: []string{"c", "e"}, InFlight: 1,
+		Refreshed: 1, Failed: 2, Restored: 1, Skipped: 1,
 		SharedNetworkLeases: []string{"c", "d"},
 		Leases: []RuntimeRefreshLease{
 			{LeaseUUID: "a", MaintenanceID: "m-1", Outcome: RuntimeRefreshRefreshed},
@@ -92,7 +93,7 @@ func TestRuntimeRefreshStatusJSONContract(t *testing.T) {
 	encoded, err := json.Marshal(status)
 	require.NoError(t, err)
 	assert.JSONEq(t, `{
-		"contract": 1, "active": true, "stale": 2, "in_flight": 1,
+		"contract": 1, "active": true, "stale": 2, "stale_leases": ["c", "e"], "in_flight": 1,
 		"refreshed": 1, "failed": 2, "restored": 1, "skipped": 1,
 		"shared_network_leases": ["c", "d"],
 		"leases": [
@@ -105,7 +106,7 @@ func TestRuntimeRefreshStatusJSONContract(t *testing.T) {
 	}`, string(encoded))
 	empty, err := json.Marshal(RuntimeRefreshStatus{})
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"contract":0,"active":false,"stale":0,"in_flight":0,"refreshed":0,"failed":0,"restored":0,"skipped":0,
+	assert.JSONEq(t, `{"contract":0,"active":false,"stale":0,"stale_leases":[],"in_flight":0,"refreshed":0,"failed":0,"restored":0,"skipped":0,
 		"shared_network_leases":[],"leases":[]}`, string(empty), "lists are never null on the wire")
 }
 
@@ -234,6 +235,7 @@ func TestRuntimeRefreshRecreatesAStaleLeaseAndAttestsTheActiveRelease(t *testing
 	before, err := h.b.RuntimeRefreshStatus(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, 1, before.Stale)
+	assert.Equal(t, []string{h.leaseUUID}, before.StaleLeases)
 	assert.False(t, before.Active)
 
 	started, err := h.b.StartRuntimeRefresh(t.Context())

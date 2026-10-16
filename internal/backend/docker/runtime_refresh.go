@@ -117,11 +117,12 @@ func runtimeRefreshUnsettledFailureRow(lease, id string) RuntimeRefreshLease {
 
 // RuntimeRefreshStatus is the GET /runtime_refresh response.
 //
-// Stale and SharedNetworkLeases are read from Docker for each response. Stale
-// counts the Ready leases with a container under an older contract; a lease
-// whose refresh failed and was restored stays counted. SharedNetworkLeases
-// lists, sorted, the leases with a container on a Docker network that a
-// container of another lease is also on, in any state.
+// Stale, StaleLeases and SharedNetworkLeases are read from Docker for each
+// response. StaleLeases lists, sorted, the Ready leases with a container under
+// an older contract, and Stale is its length; a lease whose refresh failed and
+// was restored stays listed. SharedNetworkLeases lists, sorted, the leases
+// with a container on a Docker network that a container of another lease is
+// also on, in any state.
 //
 // Leases holds one row per lease, sorted and unique by lease_uuid. A lease's
 // refreshed or failed row comes from its latest retained runtime_refresh
@@ -134,6 +135,7 @@ type RuntimeRefreshStatus struct {
 	Contract            uint32                `json:"contract"`
 	Active              bool                  `json:"active"`
 	Stale               int                   `json:"stale"`
+	StaleLeases         []string              `json:"stale_leases"`
 	InFlight            int                   `json:"in_flight"`
 	Refreshed           int                   `json:"refreshed"`
 	Failed              int                   `json:"failed"`
@@ -240,6 +242,7 @@ func (c *runtimeRefreshController) snapshot(inventory runtimeRefreshInventory, s
 		Active:              c.active,
 		InFlight:            len(c.inFlight),
 		Stale:               len(inventory.stale),
+		StaleLeases:         slices.Clone(inventory.stale),
 		SharedNetworkLeases: slices.Clone(inventory.sharedNetwork),
 	}
 	for lease, row := range c.leases {
@@ -273,6 +276,9 @@ func (c *runtimeRefreshController) snapshot(inventory runtimeRefreshInventory, s
 func (s RuntimeRefreshStatus) MarshalJSON() ([]byte, error) {
 	type wire RuntimeRefreshStatus
 	w := wire(s)
+	if w.StaleLeases == nil {
+		w.StaleLeases = []string{}
+	}
 	if w.SharedNetworkLeases == nil {
 		w.SharedNetworkLeases = []string{}
 	}
