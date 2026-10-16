@@ -305,9 +305,9 @@ func (b *Backend) routeReplaceRestart(
 		return fmt.Errorf("construct restart source authority: %w", sourceErr)
 	}
 	if route.kind == shared.MaintenanceIntentRuntimeRefresh {
-		// The target is the sealed source release itself; its images must be
-		// the exact ones the source runs, pinned before anything is journaled.
-		if err := b.requireRuntimeRefreshSourcePins(ctx, leaseUUID, active); err != nil {
+		// The target is the sealed source release itself; its pins must record
+		// exactly the images the source runs before anything is journaled.
+		if err := b.requireRuntimeRefreshSourceImages(ctx, leaseUUID); err != nil {
 			return err
 		}
 		admission, admitErr := b.admitRuntimeRefresh(request, sourceClaim)

@@ -1967,11 +1967,16 @@ a custom-domain change uses, under its own `runtime_refresh` maintenance kind
 and receipt window. Its target is derived from the lease's active release
 itself, unchanged: the settlement constructs it from the sealed source, and no
 caller supplies any part of it. Every container is recreated (force-recreate)
-from the exact image the source runs: the refresh admits images only through
-their pins, never through a tag that may since name other content, and nothing
-is pulled. A missing pin is first established from the running containers, as
-the startup backfill does; a lease whose images still cannot be pinned is not
-refreshed. The refresh is FailCount-neutral: a failure
+from the exact image the source runs, never from a tag that may since name
+other content, and nothing is pulled. Before anything is journaled, every pin
+of the active release must record exactly the image its running containers
+execute, read by the startup backfill's observer; a missing pin is minted from
+that observation. At execution, before any substrate effect, each image is
+admitted only as the image the refresh's own source capture recorded, through
+that pin. A pin that names other content, as after a restart that pinned what
+a moved tag named and then failed before replacing the containers, is never
+followed or replaced: the lease is refused and reported as `failed`, with
+nothing journaled. The refresh is FailCount-neutral: a failure
 that rolls back leaves the lease Ready on its pre-refresh release, with no
 error and no failure-budget effect, and is reported as `failed` with
 `restored`. A rollback that recreated the release runs copies of its
@@ -1983,7 +1988,7 @@ anything is journaled, the refresh checks again that the lease still has a
 container under an older contract. A lease whose fence is busy (another command
 in progress), that stops being Ready, that a tenant restart or update already
 brought under the current contract, whose containers could not be read, or
-whose images could not be pinned is retried on a later pass and, if never
+whose images could not be proved is retried on a later pass and, if never
 refreshed, reported as `skipped`. A lease holds its slot until its admitted
 maintenance settles, however long a rollback takes: only the receipt completes
 it. A run retries skipped leases every 10 seconds, never retries a lease that

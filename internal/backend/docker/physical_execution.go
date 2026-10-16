@@ -741,6 +741,16 @@ func (b *Backend) doMaintenancePhysical(
 			pulled[spec.Image] = struct{}{}
 		}
 	}
+	if intent.Kind() == shared.MaintenanceIntentRuntimeRefresh {
+		// Admit every image as exactly what the source ran before any
+		// substrate effect: a refresh that cannot prove one is refused with
+		// nothing changed, not left ambiguous behind its network Step.
+		for service, spec := range stack.Services {
+			if _, err := mutations.admitImage(ctx, spec.Image); err != nil {
+				return fmt.Errorf("admit source image for service %q: %w", service, err)
+			}
+		}
+	}
 	return b.doReplacePhysical(ctx, mutations, replaceContainersOp{
 		LeaseUUID: subject.LeaseUUID(), Stack: stack, Items: target.Items,
 		ResourceProfiles: target.ResourceProfiles, Operation: operation,

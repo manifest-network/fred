@@ -213,6 +213,7 @@ func newRuntimeRefreshHarness(t *testing.T, status backend.ProvisionStatus) *run
 	t.Helper()
 	h := &runtimeRefreshHarness{leaseUUID: "550e8400-e29b-41d4-a716-446655440077"}
 	stack := &manifest.StackManifest{Services: map[string]*manifest.Manifest{"app": {Image: "nginx:latest"}}}
+	sourceImage := fixtureImageID("refresh source image")
 	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var payload backend.CallbackPayload
 		_ = json.NewDecoder(r.Body).Decode(&payload)
@@ -246,6 +247,7 @@ func newRuntimeRefreshHarness(t *testing.T, status backend.ProvisionStatus) *run
 			defer h.mu.Unlock()
 			copied := h.substrate
 			copied.ContainerID = containerID
+			copied.execution = frozenCompensationFixture(copied, sourceImage)
 			return &copied, nil
 		},
 		// A legacy lease ran on its tenant's network, so its own network
@@ -298,7 +300,12 @@ func newRuntimeRefreshHarness(t *testing.T, status backend.ProvisionStatus) *run
 		t, h.b, h.leaseUUID, stack, items, operationID, operationURL, lifecycleURL, callbackServer.Client(),
 	)
 	h.b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	h.imageCapacity = attachObservedImageCapacity(t, h.b, "nginx:latest", fixtureImageID("refresh source image"))
+	h.imageCapacity = attachObservedImageCapacity(t, h.b, "nginx:latest", sourceImage)
+	// The refresh captures its source, as in production, and binds its images
+	// to what that capture recorded.
+	ops, err := storageMutationOperationsForTest(h.b)
+	require.NoError(t, err)
+	require.NoError(t, bindDockerMaintenanceCompensation(h.b, ops))
 	h.b.cfg.NetworkIsolation = ptrBool(true)
 	return h
 }
@@ -642,6 +649,69 @@ func TestRuntimeRefreshRequiresTheSourcesPinnedImages(t *testing.T) {
 	h.mu.Lock()
 	assert.Empty(t, h.upOpts)
 	h.mu.Unlock()
+}
+
+// A pin that names other content than the source runs, as after a failed
+// restart that pinned what a moved tag named, is never followed: the refresh
+// is refused before anything is journaled, and nothing is recreated.
+func TestRuntimeRefreshRefusesASourceRunningOtherImagesThanItsPins(t *testing.T) {
+	h := newRuntimeRefreshHarness(t, backend.ProvisionStatusReady)
+	h.b.runtimeRefresh.inFlight = map[string]struct{}{}
+	pins, err := shared.NewImagePinJournal(h.b.callbackStore, h.b.releaseStore, h.b.retentionStore)
+	require.NoError(t, err)
+	observed := &observedImagePins{ref: "nginx:latest", id: fixtureImageID("content a failed restart pinned")}
+	h.imageCapacity.backfiller, err = shared.NewImagePinBackfiller(pins, observed)
+	require.NoError(t, err)
+	_, err = h.imageCapacity.backfiller.Sweep(t.Context())
+	require.NoError(t, err)
+	observed.id = fixtureImageID("refresh source image")
+
+	outcome := refreshWithin(t, h.b, h.leaseUUID)
+	assert.Equal(t, runtimeRefreshRunOutcome{row: runtimeRefreshUnsettledFailureRow(h.leaseUUID, "")}, outcome,
+		"a divergence never heals, so the refusal is a failure, not a skip")
+	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
+	require.NoError(t, err)
+	assert.Empty(t, intents, "a refused refresh journals nothing")
+	h.mu.Lock()
+	assert.Empty(t, h.upOpts)
+	h.mu.Unlock()
+}
+
+// Execution binds a refresh's images to the source its own capture recorded:
+// a pin that does not record the image that captured source ran is refused
+// before any substrate effect, and the source is left running.
+func TestRuntimeRefreshAdmitsOnlyTheImageItsCaptureRecorded(t *testing.T) {
+	h := newRuntimeRefreshHarness(t, backend.ProvisionStatusReady)
+	h.b.runtimeRefresh.inFlight = map[string]struct{}{}
+	captured := fixtureImageID("image the capture recorded")
+	mock := h.b.docker.(*mockDockerClient)
+	inspectImage := mock.InspectImageFn
+	mock.InspectImageFn = func(ctx context.Context, reference string) (*ImageInfo, error) {
+		if reference == captured {
+			return &ImageInfo{ID: captured}, nil
+		}
+		return inspectImage(ctx, reference)
+	}
+	inspectContainer := mock.InspectContainerFn
+	mock.InspectContainerFn = func(ctx context.Context, id string) (*ContainerInfo, error) {
+		info, err := inspectContainer(ctx, id)
+		if info != nil {
+			info.execution = frozenCompensationFixture(*info, captured)
+		}
+		return info, err
+	}
+
+	outcome := refreshWithin(t, h.b, h.leaseUUID)
+	require.True(t, outcome.settled)
+	assert.Equal(t, RuntimeRefreshFailed, outcome.row.Outcome)
+	h.mu.Lock()
+	assert.Empty(t, h.upOpts, "nothing was launched")
+	assert.Equal(t, "old-app", h.substrate.ContainerID, "the source was never displaced")
+	h.mu.Unlock()
+	active, err := h.b.releaseStore.LatestActive(h.leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, outcome.row.Restored, "the lease runs its pre-refresh release")
+	assert.Equal(t, active.Version, outcome.row.Restored.ReleaseVersion)
 }
 
 // refreshWithin refreshes lease and fails, rather than hangs, when an admitted

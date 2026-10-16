@@ -21,12 +21,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   containers carry), `failed`, or `skipped`. A `failed` refresh that settled
   with the lease's pre-refresh release as its running, ready cohort carries
   `restored` with that release's version and digest. A refresh's target is
-  the lease's active release itself, derived from the sealed source, and its
-  images are admitted only through their pins, so it recreates exactly what
-  runs; a lease whose images cannot be pinned is skipped. Attestations are read
-  from each lease's maintenance receipt, so they survive a backend restart
-  and later runs; the receipt now records that fact when a failed
-  maintenance settles. Nothing starts a refresh automatically. New metrics:
+  the lease's active release itself, derived from the sealed source, and each
+  image is admitted only as the image its running containers execute: matched
+  against its pin before anything is journaled, and against the refresh's own
+  source capture before any substrate effect. A lease whose pins name other
+  content is refused as `failed`; one whose images cannot be proved is
+  skipped. Attestations are read from each lease's maintenance receipt, so
+  they survive a backend restart and later runs; the receipt now records, from
+  the settlement's own proof, that a failed maintenance left its source as the
+  ready cohort. Nothing starts a refresh automatically. New metrics:
   `fred_docker_backend_runtime_stale_leases` and
   `fred_docker_backend_runtime_shared_network_leases`, read every
   `reconcile_interval`, `fred_docker_backend_runtime_inventory_total{outcome}`

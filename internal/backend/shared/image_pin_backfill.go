@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	bolt "go.etcd.io/bbolt"
@@ -75,12 +76,26 @@ func (b *ImagePinBackfiller) Sweep(ctx context.Context) (ImagePinBackfillReport,
 	return report, err
 }
 
-// SweepLease enriches one lease's active generation, as Sweep does for every
-// lease: only from positive physical evidence of its running cohort.
-func (b *ImagePinBackfiller) SweepLease(ctx context.Context, lease string) (ImagePinBackfillReport, error) {
-	var report ImagePinBackfillReport
+// ImagePinVerification matches one lease's pins against the images its running
+// cohort executes.
+type ImagePinVerification struct {
+	// Verified reports that every image of the active generation is pinned to
+	// exactly the content its running cohort executes.
+	Verified bool
+	// Diverged lists, sorted, the references whose existing pin names other
+	// content than the cohort executes. A pin is never replaced, so a
+	// divergence does not heal.
+	Diverged []string
+}
+
+// VerifyLease matches one lease's active generation against positive physical
+// evidence of its running cohort. A missing pin is minted from that evidence,
+// as Sweep does; an existing pin that names other content is reported, never
+// replaced. Unavailable evidence verifies nothing.
+func (b *ImagePinBackfiller) VerifyLease(ctx context.Context, lease string) (ImagePinVerification, error) {
+	var verification ImagePinVerification
 	if ctx == nil || b == nil || b.journal == nil || !b.journal.valid() || !retentionStoreIsOpen(b.journal.retentions) {
-		return report, errors.New("image pin backfill requires live ownership")
+		return verification, errors.New("image pin verification requires live ownership")
 	}
 	err := b.journal.withLockedPins(func(pins *lockedImagePins) error {
 		unlock, err := b.journal.lockLeaseContext(ctx, lease)
@@ -88,20 +103,16 @@ func (b *ImagePinBackfiller) SweepLease(ctx context.Context, lease string) (Imag
 			return err
 		}
 		defer unlock()
-		added, unresolved, err := pins.sweepLease(ctx, lease, b.observer)
+		result, err := pins.reconcileLease(ctx, lease, b.observer, true)
 		var unavailable *unavailableImagePinEvidence
 		var capacity *imagePinCapacityRefusal
 		if errors.As(err, &unavailable) || errors.As(err, &capacity) {
-			report.UnresolvedLeases = 1
 			return nil
 		}
-		report.PinsAdded = added
-		if unresolved {
-			report.UnresolvedLeases = 1
-		}
+		verification = ImagePinVerification{Verified: result.verified, Diverged: result.diverged}
 		return err
 	})
-	return report, err
+	return verification, err
 }
 
 func (pins *lockedImagePins) sweep(ctx context.Context, observer ImagePinBackfillObserver) (ImagePinBackfillReport, error) {
@@ -151,10 +162,29 @@ func imagePinBackfillSettled(tx *bolt.Tx, lease string) (bool, error) {
 }
 
 func (locked *lockedImagePins) sweepLease(ctx context.Context, lease string, observer ImagePinBackfillObserver) (int, bool, error) {
+	result, err := locked.reconcileLease(ctx, lease, observer, false)
+	return result.added, result.unresolved, err
+}
+
+// leasePinReconciliation is one lease's pins matched against its observed
+// cohort: pins added, whether a missing one stays unresolved, and, when
+// verifying, the existing pins that name other content.
+type leasePinReconciliation struct {
+	added      int
+	unresolved bool
+	diverged   []string
+	verified   bool
+}
+
+// reconcileLease mints the lease's missing pins from positive physical
+// evidence. When verify is set it also observes a fully pinned lease and
+// matches every existing pin against what the cohort executes.
+func (locked *lockedImagePins) reconcileLease(ctx context.Context, lease string, observer ImagePinBackfillObserver, verify bool) (leasePinReconciliation, error) {
+	var result leasePinReconciliation
 	j := locked.journal
 	release, err := j.releases.LatestActive(lease)
 	if err != nil || release == nil {
-		return 0, false, err
+		return result, err
 	}
 	var settled bool
 	err = j.callbacks.view(func(tx *bolt.Tx) error {
@@ -163,78 +193,98 @@ func (locked *lockedImagePins) sweepLease(ctx context.Context, lease string, obs
 		return err
 	})
 	if err != nil || !settled {
-		return 0, !settled, err
+		result.unresolved = !settled
+		return result, err
 	}
 	stack, err := manifest.ParseStoredPayload(release.Manifest)
 	if err != nil {
-		return 0, false, err
+		return result, err
 	}
 	hash, err := imagePinManifestHash(release.Manifest)
 	if err != nil {
-		return 0, false, err
+		return result, err
 	}
+	existing := make(map[string]ImagePin)
 	missing := make(map[string]bool)
 	for _, service := range stack.Services {
 		pin, err := j.Lookup(lease, release.Manifest, service.Image)
 		if err != nil {
-			return 0, false, err
+			return result, err
 		}
 		if pin == nil {
 			missing[service.Image] = true
+		} else {
+			existing[service.Image] = *pin
 		}
 	}
-	if len(missing) == 0 {
-		return 0, false, nil
+	if len(missing) == 0 && !verify {
+		return result, nil
 	}
 	subject := ImagePinBackfillSubject{issuer: j, lease: lease, release: cloneRelease(*release)}
 	observations, err := observer.ObserveImagePins(ctx, subject)
 	if ctx.Err() != nil {
-		return 0, false, ctx.Err()
+		return result, ctx.Err()
 	}
 	if err != nil {
-		return 0, false, &unavailableImagePinEvidence{err}
+		return result, &unavailableImagePinEvidence{err}
 	}
 	pins := make(map[string]ImagePin)
+	matched := make(map[string]bool)
 	for _, observation := range observations {
+		if pin, found := existing[observation.Reference]; found {
+			if pin.ImageID == observation.ImageID {
+				matched[observation.Reference] = true
+			} else if !slices.Contains(result.diverged, observation.Reference) {
+				result.diverged = append(result.diverged, observation.Reference)
+			}
+			continue
+		}
 		if !missing[observation.Reference] {
 			continue
 		}
 		pin := ImagePin{LeaseUUID: lease, ManifestHash: hash, Reference: observation.Reference, ImageID: observation.ImageID, PullDigest: observation.PullDigest, Platform: observation.Platform}
 		data, err := json.Marshal(pin)
 		if err != nil {
-			return 0, false, &unavailableImagePinEvidence{err}
+			return result, &unavailableImagePinEvidence{err}
 		}
 		// Decode the canonical bytes into owned storage. In particular, platform
 		// features must not retain mutable slices supplied by the observer.
 		pin, err = decodeImagePin(data)
 		if err != nil {
-			return 0, false, &unavailableImagePinEvidence{err}
+			return result, &unavailableImagePinEvidence{err}
 		}
 		if previous, found := pins[pin.Reference]; found && !reflect.DeepEqual(previous, pin) {
-			return 0, true, nil
+			result.unresolved = true
+			return result, nil
 		}
 		pins[pin.Reference] = pin
 	}
-	if len(pins) == 0 {
-		return 0, true, nil
+	slices.Sort(result.diverged)
+	if len(missing) > 0 && len(pins) == 0 {
+		result.unresolved = true
+		return result, nil
 	}
-	added := 0
-	err = locked.updatePins(func(writer *imagePinTransaction) error {
-		authority, err := writer.forBackfill(subject)
-		if err != nil {
-			return err
-		}
-		for _, pin := range pins {
-			bucket := writer.tx.Bucket(imagePinsBucketName)
-			if bucket != nil && bucket.Get(imagePinKey(lease, hash, pin.Reference)) != nil {
-				continue
-			}
-			if err := writer.put(authority, pin); err != nil {
+	if len(pins) > 0 {
+		err = locked.updatePins(func(writer *imagePinTransaction) error {
+			authority, err := writer.forBackfill(subject)
+			if err != nil {
 				return err
 			}
-			added++
-		}
-		return nil
-	})
-	return added, len(pins) != len(missing), err
+			for _, pin := range pins {
+				bucket := writer.tx.Bucket(imagePinsBucketName)
+				if bucket != nil && bucket.Get(imagePinKey(lease, hash, pin.Reference)) != nil {
+					continue
+				}
+				if err := writer.put(authority, pin); err != nil {
+					return err
+				}
+				result.added++
+			}
+			return nil
+		})
+	}
+	result.unresolved = len(pins) != len(missing)
+	result.verified = verify && err == nil && !result.unresolved && len(result.diverged) == 0 &&
+		len(matched) == len(existing)
+	return result, err
 }

@@ -16,7 +16,6 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/maintenanceid"
 	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
@@ -593,8 +592,13 @@ func (b *Backend) refreshLeaseRuntime(ctx context.Context, lease string) (outcom
 		return outcome
 	}
 	if errors.Is(routeErr, errRuntimeRefreshUnpinned) {
-		logger.Warn("runtime refresh skipped: the source's exact images are not pinned", "error", routeErr)
+		logger.Warn("runtime refresh skipped: the source's exact images are not proved", "error", routeErr)
 		return outcome
+	}
+	if errors.Is(routeErr, errRuntimeRefreshSourceImageDiverged) {
+		logger.Error("runtime refresh refused: the source runs other images than its pins record, so a refresh would change the workload",
+			"error", routeErr)
+		return runtimeRefreshRunOutcome{row: runtimeRefreshUnsettledFailureRow(lease, "")}
 	}
 	// Whatever the route returned, only the durable settlement of this
 	// maintenance decides: an admitted refresh continues even when its
@@ -653,52 +657,37 @@ func (b *Backend) requireRuntimeRefreshStale(ctx context.Context, leaseUUID stri
 	return fmt.Errorf("%w: lease already runs under the current runtime contract", backend.ErrInvalidState)
 }
 
-// errRuntimeRefreshUnpinned is a pre-admission refusal: an image of the
-// lease's active release has no exact pin, even after observing the running
-// containers. Nothing was journaled, and a later pass retries it.
+// errRuntimeRefreshUnpinned is a pre-admission refusal: the images the lease's
+// running containers execute could not be matched to its pins, even after
+// observing them. Nothing was journaled, and a later pass retries it.
 var errRuntimeRefreshUnpinned = errors.New("runtime refresh cannot prove the source's exact images")
 
-// requireRuntimeRefreshSourcePins proves every image of the lease's active
-// release has an exact pin, so the refresh recreates the images the source
-// runs and never what a tag names now. Missing pins are first established from
-// the running containers, by the same observer as the startup backfill; a
-// mutable tag never mints one.
-func (b *Backend) requireRuntimeRefreshSourcePins(ctx context.Context, leaseUUID string, active shared.Release) error {
+// errRuntimeRefreshSourceImageDiverged is a definitive pre-admission refusal:
+// an image of the lease's active release is pinned to other content than its
+// running containers execute, as after a failed restart that pinned what a
+// moved tag named. A pin is never replaced, so a refresh could only launch
+// that other content; it refuses rather than change the workload. Nothing was
+// journaled.
+var errRuntimeRefreshSourceImageDiverged = errors.New("runtime refresh source runs other images than its pins record")
+
+// requireRuntimeRefreshSourceImages proves every image of the lease's active
+// release is pinned to exactly the image its running containers execute, as
+// the same observer as the startup backfill reads them; a missing pin is
+// minted from that observation, never from a mutable tag. Execution then
+// admits only those images.
+func (b *Backend) requireRuntimeRefreshSourceImages(ctx context.Context, leaseUUID string) error {
 	capacity := b.imageCapacity
-	if capacity == nil || capacity.pins == nil {
+	if capacity == nil || capacity.backfiller == nil {
 		return fmt.Errorf("%w: no image pin journal", errRuntimeRefreshUnpinned)
 	}
-	stack, err := manifest.ParseStoredPayload(active.Manifest)
-	if err != nil {
+	verification, err := capacity.backfiller.VerifyLease(ctx, leaseUUID)
+	switch {
+	case err != nil:
 		return fmt.Errorf("%w: %w", errRuntimeRefreshUnpinned, err)
-	}
-	missing := func() ([]string, error) {
-		var refs []string
-		for _, name := range slices.Sorted(maps.Keys(stack.Services)) {
-			ref := stack.Services[name].Image
-			pin, err := capacity.pins.Lookup(leaseUUID, active.Manifest, ref)
-			if err != nil {
-				return nil, err
-			}
-			if pin == nil {
-				refs = append(refs, ref)
-			}
-		}
-		return refs, nil
-	}
-	refs, err := missing()
-	if err == nil && len(refs) > 0 && capacity.backfiller != nil {
-		if _, sweepErr := capacity.backfiller.SweepLease(ctx, leaseUUID); sweepErr != nil {
-			err = sweepErr
-		} else {
-			refs, err = missing()
-		}
-	}
-	if err != nil {
-		return fmt.Errorf("%w: %w", errRuntimeRefreshUnpinned, err)
-	}
-	if len(refs) > 0 {
-		return fmt.Errorf("%w: no pin for %v", errRuntimeRefreshUnpinned, refs)
+	case len(verification.Diverged) > 0:
+		return fmt.Errorf("%w: %v", errRuntimeRefreshSourceImageDiverged, verification.Diverged)
+	case !verification.Verified:
+		return fmt.Errorf("%w: the running images could not be observed", errRuntimeRefreshUnpinned)
 	}
 	return nil
 }

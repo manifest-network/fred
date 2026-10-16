@@ -388,6 +388,87 @@ func TestMaintenanceRecoveryKeepsAReadySourceOnTheReceiptAfterACrash(t *testing.
 	require.Equal(t, h.source.Version, source.Version)
 }
 
+// A source the compensation restored can die after its target failed and
+// before the callback settled. Recovery replays the failure of the exact
+// already-failed target with the fresh evidence; the first transition's
+// compensation guard does not refuse it, so recovery never wedges startup.
+// The receipt records what the settlement proves: no ready source.
+func TestMaintenanceRecoverySettlesAFailedTargetWhoseRestoredSourceDied(t *testing.T) {
+	h := newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate)
+	h.appendTarget(true)
+	mock := h.b.docker.(*mockDockerClient)
+	imageID := fixtureImageID("restored source later lost")
+	sources := h.containersFor(h.source, 2, "running", "")
+	for index := range sources {
+		sources[index].execution = frozenCompensationFixture(sources[index], imageID)
+	}
+	h.inventory.containers = slices.Clone(sources)
+	mock.InspectImageFn = func(context.Context, string) (*ImageInfo, error) { return &ImageInfo{ID: imageID}, nil }
+	mock.PullImageFn = func(context.Context, string, time.Duration) error { return nil }
+	mock.ContainerLogsFn = func(context.Context, string, int) (string, error) { return "failed target", nil }
+	mock.RemoveContainerFn = func(ctx context.Context, id string) error { return h.inventory.remove(ctx, id) }
+	targets := h.containersFor(h.targetRelease, 2, "exited", "")
+	h.b.compose = &mockComposeExecutor{
+		LaunchFn: func(context.Context, *composetypes.Project, composeUpOpts) daemonLaunchOutcome {
+			h.inventory.containers = slices.Clone(targets)
+			return daemonLaunchOutcome{settled: true}
+		},
+		PSFn: func(context.Context, string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{{ID: targets[0].ContainerID, Service: "web-0", State: "exited"}, {ID: targets[1].ContainerID, Service: "web-1", State: "exited"}}, nil
+		},
+	}
+	mock.CreateCompensationContainerFn = func(_ context.Context, image imageexec.Image, snapshot compensationContainer) (string, error) {
+		index, err := strconv.Atoi(snapshot.Config.Labels[LabelInstanceIndex])
+		require.NoError(t, err)
+		info := sources[index]
+		info.ContainerID = fmt.Sprintf("restored-source-%d", index)
+		info.Status = "created"
+		info.CreatedAt = time.Now()
+		info.execution = frozenCompensationFixture(info, image.ID())
+		h.inventory.containers = append(h.inventory.containers, info)
+		return info.ContainerID, nil
+	}
+	mock.StartContainerFn = func(_ context.Context, id string, _ time.Duration) error {
+		for index := range h.inventory.containers {
+			if h.inventory.containers[index].ContainerID == id {
+				h.inventory.containers[index].Status = "running"
+				return nil
+			}
+		}
+		return errors.New("start of unknown source")
+	}
+	ops, err := storageMutationOperationsForTest(h.b)
+	require.NoError(t, err)
+	require.NoError(t, bindDockerMaintenanceCompensation(h.b, ops))
+	execution, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+	require.NoError(t, err)
+	outcome := h.b.maintenanceSettlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
+	failed, ok := outcome.(shared.MaintenanceExecutionFailure)
+	require.True(t, ok, "%T: %v", outcome, outcome)
+	require.True(t, failed.SourceRecovered(), "the compensation restored the source")
+	proof, err := h.b.maintenanceSettlement.FailMaintenance(failed, backend.ReasonInternal, "target failed; source restored")
+	require.NoError(t, err)
+	maintenanceID := proof.MaintenanceID()
+
+	// The process stops before the callback settles, then the restored source
+	// dies.
+	h.reopen()
+	for index := range h.inventory.containers {
+		h.inventory.containers[index].Status = "exited"
+	}
+	ops, err = storageMutationOperationsForTest(h.b)
+	require.NoError(t, err)
+	require.NoError(t, bindDockerMaintenanceCompensation(h.b, ops))
+	require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
+	h.assertSettled(backend.CallbackStatusFailed)
+
+	settled, found, err := h.b.maintenanceSettlement.SettledMaintenanceByID(h.leaseUUID, maintenanceID)
+	require.NoError(t, err)
+	require.True(t, found)
+	_, ready := settled.SourceReady()
+	require.False(t, ready, "a source that is not ready when the failure settles is not attested as restored")
+}
+
 func TestMaintenanceCompensationSettledIncompleteSourceFailsWithoutReplay(t *testing.T) {
 	for _, surviving := range []int{0, 1, 2} {
 		t.Run(strconv.Itoa(surviving), func(t *testing.T) {

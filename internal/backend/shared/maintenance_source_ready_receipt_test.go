@@ -73,20 +73,44 @@ func TestFailedMaintenanceReceiptRecordsAnUndisplacedReadySource(t *testing.T) {
 	requireSettledSourceReady(t, f.settlement, proof, true)
 }
 
-// A failure settled without the classifier's proof, as after a restart, still
-// records a recreated source from the compensation journal's source-ready
-// phase, read in the settling transaction.
-func TestFailedMaintenanceReceiptReadsSourceReadyFromTheCompensationJournal(t *testing.T) {
+// Only the settlement's own proof attests a ready source. A compensation
+// journal that reached source-ready earlier does not: the source can be lost
+// before the failure settles, so a settlement without that proof records none.
+func TestFailedMaintenanceReceiptIgnoresAnEarlierSourceReadyJournal(t *testing.T) {
 	state := new(compensationTestState)
 	f, proof := settleCompensatedFailure(t, "receipt-source-journal", state)
 	claim := proof.intent
 	unlock := f.settlement.lockLease(claim.LeaseUUID())
-	entry, err := prepareMaintenanceIntentCompletion(claim, backend.CallbackStatusFailed, "settled after restart")
+	pending, err := f.settlement.CompensationStarted(claim)
 	require.NoError(t, err)
-	_, err = f.settlement.callbacks.resolveMaintenanceIntentEntriesLocked(claim, []CallbackEntry{entry}, false)
+	require.True(t, pending, "the journal reached source-ready")
+	entry, err := prepareMaintenanceIntentCompletion(claim, backend.CallbackStatusFailed, "settled without proof")
+	require.NoError(t, err)
+	_, err = f.settlement.callbacks.resolveMaintenanceIntentEntriesLocked(claim, []CallbackEntry{entry}, MaintenanceSourceReady{})
 	unlock()
 	require.NoError(t, err)
-	requireSettledSourceReady(t, f.settlement, proof, true)
+	requireSettledSourceReady(t, f.settlement, proof, false)
+}
+
+// Replaying the failure of an already-failed target re-proves it with the
+// replay's own evidence. The first transition's compensation guard, which
+// refuses an unproven source while the journal says source-ready, does not
+// apply: the transition it governed already happened.
+func TestFailMaintenanceReplayReprovesWithItsOwnEvidence(t *testing.T) {
+	state := new(compensationTestState)
+	f, proof := settleCompensatedFailure(t, "replay-own-evidence", state)
+	_, ready := proof.SourceReady()
+	require.True(t, ready)
+
+	unproven := MaintenanceExecutionFailure{settlement: f.settlement, authority: proof.target, refused: true}
+	require.True(t, unproven.Valid())
+	replayed, err := f.settlement.FailMaintenance(unproven, backend.ReasonInternal, "replayed")
+	require.NoError(t, err, "a replay does not repeat the first transition's compensation guard")
+	_, ready = replayed.SourceReady()
+	require.False(t, ready, "the replay carries its own evidence, not the original proof's")
+	_, err = resolveMaintenanceFailureForTest(f.settlement, replayed, "settled from the replay")
+	require.NoError(t, err)
+	requireSettledSourceReady(t, f.settlement, replayed, false)
 }
 
 // A compensation whose source never became ready attests nothing.

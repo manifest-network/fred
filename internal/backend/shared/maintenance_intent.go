@@ -1091,7 +1091,7 @@ func (s *MaintenanceSettlement) resolveSuccessLocked(
 	if err != nil {
 		return CallbackEntry{}, err
 	}
-	return s.callbacks.resolveMaintenanceIntentLocked(claim, entry, false)
+	return s.callbacks.resolveMaintenanceIntentLocked(claim, entry, MaintenanceSourceReady{})
 }
 
 func (s *MaintenanceSettlement) resolveFailureLocked(
@@ -1113,8 +1113,8 @@ func (s *MaintenanceSettlement) resolveFailureLocked(
 	}
 	// Only the bound classifier mints SourceReady, for the exact source cohort
 	// of this failed generation.
-	_, sourceReady := failed.SourceReady()
-	return s.callbacks.resolveMaintenanceIntentLocked(claim, entry, sourceReady)
+	ready, _ := failed.SourceReady()
+	return s.callbacks.resolveMaintenanceIntentLocked(claim, entry, ready)
 }
 
 func prepareDivergedMaintenanceCompletions(
@@ -1181,21 +1181,22 @@ func prepareMaintenanceIntentCompletion(
 func (s *CallbackStore) resolveMaintenanceIntentLocked(
 	claim MaintenanceIntentClaim,
 	entry CallbackEntry,
-	sourceReady bool,
+	ready MaintenanceSourceReady,
 ) (CallbackEntry, error) {
-	entries, err := s.resolveMaintenanceIntentEntriesLocked(claim, []CallbackEntry{entry}, sourceReady)
+	entries, err := s.resolveMaintenanceIntentEntriesLocked(claim, []CallbackEntry{entry}, ready)
 	if err != nil {
 		return CallbackEntry{}, err
 	}
 	return entries[0], nil
 }
 
-// resolveMaintenanceIntentEntriesLocked settles claim with entries. sourceReady
-// is a failed settlement's typed proof that its source is the ready cohort.
+// resolveMaintenanceIntentEntriesLocked settles claim with entries. ready is a
+// failed settlement's classifier-minted proof that its source is the ready
+// cohort; the zero value proves nothing.
 func (s *CallbackStore) resolveMaintenanceIntentEntriesLocked(
 	claim MaintenanceIntentClaim,
 	entries []CallbackEntry,
-	sourceReady bool,
+	ready MaintenanceSourceReady,
 ) ([]CallbackEntry, error) {
 	if len(entries) == 0 {
 		return nil, errors.New("maintenance settlement requires at least one callback")
@@ -1213,15 +1214,11 @@ func (s *CallbackStore) resolveMaintenanceIntentEntriesLocked(
 			}
 		}
 		// The receipt keeps the positive fact that the source is the ready
-		// cohort: the caller's typed proof, or the compensation journal's
-		// source-ready phase, read before this transaction deletes that journal
-		// (a failure reconstructed after a restart carries no proof).
-		compensation, err := readCompensationTx(tx, claim)
-		if err != nil {
-			return err
-		}
-		sourceReady = entries[0].Status == backend.CallbackStatusFailed && (sourceReady ||
-			(compensation != nil && compensation.Phase == compensationSourceReady))
+		// cohort only from the settlement's own proof of it. A compensation
+		// journal's earlier source-ready phase is not that proof: the source
+		// can be lost before the failure settles.
+		sourceReady := entries[0].Status == backend.CallbackStatusFailed && ready.Valid() &&
+			ready.LeaseUUID() == claim.LeaseUUID() && ready.MaintenanceID() == claim.MaintenanceID()
 		receipt := maintenanceCompletionRecordFor(
 			claim, entries[0].Status, entries[0].Error, entries[0].CreatedAt,
 			entries[0].Sequence, sourceReady,

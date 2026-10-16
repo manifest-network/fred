@@ -344,6 +344,29 @@ func (s *MaintenanceSettlement) CompensationPending(intent MaintenanceIntentClai
 	return found, err
 }
 
+// CapturedMaintenanceSource returns the source execution plan that subject's
+// execution captured before any target effect, while its target is still the
+// one executing. A runtime refresh binds its target images to it: the refresh
+// recreates exactly what the source ran.
+func (s *MaintenanceSettlement) CapturedMaintenanceSource(subject MaintenancePhysicalSubject) ([]byte, error) {
+	if s == nil || !subject.validFor(s) || subject.state.mode != maintenancePhysicalExecution {
+		return nil, errors.New("a captured source requires this settlement's executing target")
+	}
+	var plan []byte
+	err := s.callbacks.view(func(tx *bolt.Tx) error {
+		record, err := readCompensationTx(tx, subject.Intent())
+		if err != nil {
+			return err
+		}
+		if record == nil || (record.Phase != compensationPrepared && record.Phase != compensationTargetDispatching) {
+			return errors.New("the executing target captured no source execution plan")
+		}
+		plan = slices.Clone(record.Plan)
+		return nil
+	})
+	return plan, err
+}
+
 // CompensationStarted is a read-only routing observation. Once restoration
 // starts, a late ready target is never eligible for activation.
 func (s *MaintenanceSettlement) CompensationStarted(intent MaintenanceIntentClaim) (bool, error) {

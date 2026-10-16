@@ -1383,11 +1383,13 @@ Never before `backends`: the endpoint ships with the new release.
    - `refreshed` names the `maintenance_id` the lease's new containers carry
      in `fred.maintenance_id`.
    - `failed` with `restored` means the lease runs its pre-refresh release
-     again, Ready: either a rollback recreated it (copies with new container
-     IDs) or the target failed before displacing it (unchanged containers).
-     The lease stays stale and stays on its old network.
-   - `failed` without `restored` was not proved back on its release; check
-     the lease before anything else.
+     again, Ready when the failure settled: either a rollback recreated it
+     (copies with new container IDs) or the target failed before displacing
+     it (unchanged containers). The lease stays stale and stays on its old
+     network.
+   - `failed` without `restored` was not proved back on its release when the
+     failure settled, or the refresh was refused before it started; check the
+     lease before anything else.
 4. Read `shared_network_leases`: the leases still sharing a Docker network
    with another lease, read from Docker now. A restored lease that is alone on
    its old network exposes no other lease; two or more leases on one network
@@ -1408,11 +1410,17 @@ failure budget.
   running cohort` and the lease's `/releases`, fix the cause, and POST again
   in a later window; a new run retries it.
 - `failed` without `restored`: the lease was not proved back on its release.
-  Check its status and `/releases` before retrying.
+  Check its status and `/releases` before retrying. A lease whose log reads
+  `runtime refresh refused: the source runs other images than its pins
+  record` was not touched: its containers run other content than the image
+  pinned for its release, for example after a restart that pinned what a
+  moved tag named and then failed before replacing them. A refresh would
+  change its workload, so Fred refuses it on every run; it moves under the
+  current contract with its own next restart or update.
 - `skipped`: the lease was busy with other lifecycle work, was not Ready, was
-  already under the current contract, or its images could not be pinned,
-  whenever the run tried it. POST again once it is idle. An unpinned lease logs
-  `runtime refresh skipped: the source's exact images are not pinned`: the
+  already under the current contract, or its images could not be proved,
+  whenever the run tried it. POST again once it is idle. Such a lease logs
+  `runtime refresh skipped: the source's exact images are not proved`: the
   refresh never recreates a lease from a tag that may name other content.
 - A stale lease that is not Ready (for example Failed) is not counted and not
   refreshed; it is recreated under the current contract by its own recovery.
