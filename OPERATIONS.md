@@ -211,7 +211,7 @@ when later probes or recovery passes succeed.
 | `fred_docker_backend_lease_terminal_event_dropped_total` rising under clean shutdown | Real data loss pattern | The release store / provision struct may be out of sync with Docker — reconciler will re-detect on next cycle, but root-cause the wedged actor |
 | `fred_provisioner_reconciler_panics_total > 0` | Bug — a reconciler worker panicked. A `stage="placement_cleanup"` panic preserves that exact durable candidate while the bounded healthy lanes continue | File an issue with the stack trace. The next sweep retries preserved work; do not delete placement evidence |
 | `fred_chain_health_probe_panics_total > 0` | The chain client panicked during a providerd health probe; that probe is reported unhealthy | Correlate `chain health probe panicked` in providerd logs, verify subsequent chain probes recover, and file an issue. A healthy later response does not erase the panic counter |
-| `fred_background_cleanup_panics_total > 0` | Bug in a cleanup loop. **Emitted by every fred binary**, so read `job` alongside `component`: `token` is providerd; `callback`, `diagnostics` and `releases` are a backend; `retention`, `docker_reconciliation`, `docker_network_reclamation`, `docker_projid_audit`, `docker_seccomp_census`, `docker_volume_delete_hold` and `docker_runtime_refresh` are docker-backend components | Inspect the recovered panic stack, verify the next iteration makes progress, and file an issue. Go to the journal of the host the `job`/`server` labels name, not to providerd by default |
+| `fred_background_cleanup_panics_total > 0` | Bug in a cleanup loop. **Emitted by every fred binary**, so read `job` alongside `component`: `token` is providerd; `callback`, `diagnostics` and `releases` are a backend; `retention`, `docker_reconciliation`, `docker_network_reclamation`, `docker_projid_audit`, `docker_seccomp_census`, `docker_runtime_inventory`, `docker_volume_delete_hold` and `docker_runtime_refresh` are docker-backend components | Inspect the recovered panic stack, verify the next iteration makes progress, and file an issue. Go to the journal of the host the `job`/`server` labels name, not to providerd by default |
 | `fred_background_goroutine_panics_total{component="callback_replay"} > 0` | A bundled backend recovered a panic while replaying one lease's durable callback FIFO. That lease remains queued for a later pass; the bounded worker pool continues with unrelated leases | Check the backend log for `panic while replaying callback outbox` and its lease UUID/stack, then file an issue. Do not delete `callbacks.db`; replay is the recovery owner |
 | `fred_background_goroutine_panics_total{component!~"callback_replay\|timeout_checker_(sweep\|candidate)"} > 0` | Bug — another long-lived goroutine recovered a panic: providerd's `payload_writer`, `ack_batcher` or `withdraw_scheduler`, or docker-backend's `container_death_overflow_reporter` | Find the stack in the journal of the host the `job`/`server` labels name and file an issue. For `ack_batcher`, also see the lane-restart row above |
 | `fred_background_goroutine_panics_total{component=~"timeout_checker_(sweep\|candidate)"} > 0` | The timeout checker recovered a bug at its periodic boundary. Exact operation/placement evidence remains durable; candidate isolation lets unrelated timeout settlements continue, and the next cadence retries preserved work | Check the providerd stack trace and file an issue. Do not repair the placement DB merely to clear the alert |
@@ -1376,11 +1376,22 @@ Never before `backends`: the endpoint ships with the new release.
    `202` starts a run, `409` means one is already active, `403` means
    `runtime_refresh_max_concurrency: 0`, `503` means the inventory or storage
    identity could not be verified and nothing started.
-2. Poll `GET /runtime_refresh` until `stale == 0 && in_flight == 0 && !active`.
-   A `503` is not "zero stale"; retry it.
-3. Each `leases` row with `outcome: refreshed` names the `maintenance_id` the
-   lease's new containers carry in `fred.maintenance_id`; only a durably
-   active release is reported that way.
+2. Poll `GET /runtime_refresh` until `!active && in_flight == 0`. A `503` is
+   not "zero stale"; retry it.
+3. Read each lease's row. Rows come from the lease's durable receipt, so they
+   survive a backend restart and later runs.
+   - `refreshed` names the `maintenance_id` the lease's new containers carry
+     in `fred.maintenance_id`.
+   - `failed` with `restored` means the lease runs its pre-refresh release
+     again, Ready: either a rollback recreated it (copies with new container
+     IDs) or the target failed before displacing it (unchanged containers).
+     The lease stays stale and stays on its old network.
+   - `failed` without `restored` was not proved back on its release; check
+     the lease before anything else.
+4. Read `shared_network_leases`: the leases still sharing a Docker network
+   with another lease, read from Docker now. A restored lease that is alone on
+   its old network exposes no other lease; two or more leases on one network
+   can still reach each other.
 
 **What tenants see:** each lease is recreated once, at most
 `runtime_refresh_max_concurrency` (default 4) at a time: `restarting`, then
@@ -1391,10 +1402,13 @@ failure budget.
 
 **When a run ends with `stale > 0`:**
 
-- `failed`: the refresh did not become active. A rollback leaves the lease
-  Ready on its old containers, so it stays counted as stale. Check the
-  backend log line `runtime refresh did not become active` and the lease's
-  `/releases`, fix the cause, and POST again; a new run retries it.
+- `failed` with `restored`: the refresh did not become active and the lease is
+  Ready on its pre-refresh release, so it stays counted as stale. Check the
+  backend log line `runtime refresh failed; the pre-refresh release is the
+  running cohort` and the lease's `/releases`, fix the cause, and POST again
+  in a later window; a new run retries it.
+- `failed` without `restored`: the lease was not proved back on its release.
+  Check its status and `/releases` before retrying.
 - `skipped`: the lease was busy with other lifecycle work, or was not Ready,
   whenever the run tried it. POST again once it is idle.
 - A stale lease that is not Ready (for example Failed) is not counted and not
@@ -1402,7 +1416,9 @@ failure budget.
 
 | Metric | Meaning | Action |
 |---|---|---|
-| `fred_docker_backend_runtime_stale_leases` | Ready leases with a container under an older runtime contract, from the last read | After an upgrade that bumps the contract, expect a nonzero value until a refresh (or the leases' own restarts) recreates them |
+| `fred_docker_backend_runtime_stale_leases` | Ready leases with a container under an older runtime contract, read every `reconcile_interval` and on every refresh request | After an upgrade that bumps the contract, expect a nonzero value until a refresh (or the leases' own restarts) recreates them; a value that holds after the cutover names leases whose refresh failed or was skipped |
+| `fred_docker_backend_runtime_shared_network_leases` | Leases with a container on a Docker network shared with another lease's container, from the same reads | Nonzero after a refresh: those leases can still reach each other. Refresh them in a later window |
+| `fred_docker_backend_runtime_inventory_total{outcome}` | Periodic inventory passes behind the two gauges | `error` keeps the gauges at their last completed values; check Docker |
 | `fred_docker_backend_runtime_refresh_total{outcome}` | Final outcome of each lease in each run: `refreshed`, `failed`, `skipped` | Investigate any `failed`; see above |
 
 ### Docker Engine upgrades and the profile

@@ -16,12 +16,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `runtime_refresh_max_concurrency` (default 4; 0 disables) at a time, through
   a journaled `runtime_refresh` maintenance that never counts as a failure.
   `GET /runtime_refresh` reports the stale count, whether a run is `active`,
-  and one attestation per lease (`refreshed`, `failed` or `skipped`, with the
-  maintenance ID its new containers carry); `refreshed` is reported only once
-  the target release is durably active. Nothing starts a refresh
-  automatically. New metrics: `fred_docker_backend_runtime_stale_leases` and
-  `fred_docker_backend_runtime_refresh_total{outcome}`. See OPERATIONS.md,
-  Runtime refresh.
+  the leases still sharing a Docker network with another lease, and one
+  attestation per lease: `refreshed` (with the maintenance ID its new
+  containers carry), `failed`, or `skipped`. A `failed` refresh that settled
+  with the lease's pre-refresh release as its running, ready cohort carries
+  `restored` with that release's version and digest. Attestations are read
+  from each lease's maintenance receipt, so they survive a backend restart
+  and later runs; the receipt now records that fact when a failed
+  maintenance settles. Nothing starts a refresh automatically. New metrics:
+  `fred_docker_backend_runtime_stale_leases` and
+  `fred_docker_backend_runtime_shared_network_leases`, read every
+  `reconcile_interval`, `fred_docker_backend_runtime_inventory_total{outcome}`
+  and `fred_docker_backend_runtime_refresh_total{outcome}`. See
+  OPERATIONS.md, Runtime refresh.
 - `billing_only_skus` lists SKUs the provider bills for but delivers outside
   Fred. Fred acknowledges a lease whose items all use these SKUs as soon as it
   sees it, so billing starts at once, and the reconciler retries the

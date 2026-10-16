@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -17,6 +18,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/maintenanceid"
 	"github.com/manifest-network/fred/internal/metrics/background"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // A runtime refresh recreates every healthy lease whose containers were
@@ -54,8 +56,10 @@ const (
 	// active. Its new containers carry the attested maintenance ID in
 	// fred.maintenance_id.
 	RuntimeRefreshRefreshed RuntimeRefreshOutcome = "refreshed"
-	// RuntimeRefreshFailed: the refresh ran and did not become the active
-	// release. A rolled-back refresh leaves the lease on its old containers.
+	// RuntimeRefreshFailed: the refresh did not become the active release.
+	// When its settlement proved the pre-refresh release the running, ready
+	// cohort, the row carries Restored: a compensation recreated it (copies with
+	// new container IDs) or the target failed before displacing it.
 	RuntimeRefreshFailed RuntimeRefreshOutcome = "failed"
 	// RuntimeRefreshSkipped: the lease was not refreshed. It was busy with
 	// other lifecycle work, or stopped being eligible, when last attempted.
@@ -67,32 +71,76 @@ var runtimeRefreshOutcomes = []RuntimeRefreshOutcome{
 }
 
 // RuntimeRefreshLease attests one lease's outcome. MaintenanceID is the
-// runtime_refresh maintenance whose containers carry it in fred.maintenance_id;
-// it is empty when no refresh was admitted.
+// runtime_refresh maintenance; a refreshed lease's containers carry it in
+// fred.maintenance_id. It is empty when no refresh was admitted. Rows are
+// built only by runtimeRefreshSettledRow, from a lease's durable receipt, and
+// by the unsettled-row constructors, so refreshed and Restored rows always
+// name their maintenance and Restored appears only on a failed row.
 type RuntimeRefreshLease struct {
-	LeaseUUID     string                `json:"lease_uuid"`
-	MaintenanceID string                `json:"maintenance_id,omitempty"`
-	Outcome       RuntimeRefreshOutcome `json:"outcome"`
+	LeaseUUID     string                  `json:"lease_uuid"`
+	MaintenanceID string                  `json:"maintenance_id,omitempty"`
+	Outcome       RuntimeRefreshOutcome   `json:"outcome"`
+	Restored      *RuntimeRefreshRestored `json:"restored,omitempty"`
 }
 
-// RuntimeRefreshStatus is the GET /runtime_refresh response. Stale counts the
-// Ready leases with a container under an older contract, read from Docker for
-// each response; a lease whose refresh failed and rolled back stays counted.
-// Active is true from the POST that starts a run until that run has finished
-// every lease. The remaining fields describe the current run, or the most
-// recent one when none is active. Leases holds one row per lease the run
-// attested, sorted and unique by lease_uuid, so its size is bounded by the
-// backend's tracked leases, and its per-outcome row counts always equal
-// Refreshed, Failed and Skipped.
+// RuntimeRefreshRestored names the release a failed refresh settled back onto
+// as the lease's running, ready cohort.
+type RuntimeRefreshRestored struct {
+	ReleaseVersion int    `json:"release_version"`
+	ReleaseDigest  string `json:"release_digest"`
+}
+
+// runtimeRefreshSettledRow attests a lease from its settled refresh receipt.
+func runtimeRefreshSettledRow(settled shared.SettledMaintenance) RuntimeRefreshLease {
+	row := RuntimeRefreshLease{
+		LeaseUUID: settled.LeaseUUID(), MaintenanceID: settled.MaintenanceID().String(), Outcome: RuntimeRefreshFailed,
+	}
+	if settled.Succeeded() {
+		row.Outcome = RuntimeRefreshRefreshed
+	} else if source, ready := settled.SourceReady(); ready {
+		row.Restored = &RuntimeRefreshRestored{ReleaseVersion: source.Version, ReleaseDigest: source.Digest}
+	}
+	return row
+}
+
+// runtimeRefreshSkippedRow attests a lease this run did not refresh.
+func runtimeRefreshSkippedRow(lease string) RuntimeRefreshLease {
+	return RuntimeRefreshLease{LeaseUUID: lease, Outcome: RuntimeRefreshSkipped}
+}
+
+// runtimeRefreshUnsettledFailureRow attests a refresh that failed without a
+// settled receipt: it was refused, or its settlement is unknown. id is the
+// maintenance it may have admitted, or empty.
+func runtimeRefreshUnsettledFailureRow(lease, id string) RuntimeRefreshLease {
+	return RuntimeRefreshLease{LeaseUUID: lease, MaintenanceID: id, Outcome: RuntimeRefreshFailed}
+}
+
+// RuntimeRefreshStatus is the GET /runtime_refresh response.
+//
+// Stale and SharedNetworkLeases are read from Docker for each response. Stale
+// counts the Ready leases with a container under an older contract; a lease
+// whose refresh failed and was restored stays counted. SharedNetworkLeases
+// lists, sorted, the leases with a container on a Docker network that a
+// container of another lease is also on, in any state.
+//
+// Leases holds one row per lease, sorted and unique by lease_uuid. A lease's
+// refreshed or failed row comes from its latest retained runtime_refresh
+// receipt, so it survives a backend restart and later runs; a skipped row, or
+// a failure with no receipt, comes from the current or most recent run in this
+// process. Active and InFlight describe that run. The per-outcome row counts
+// always equal Refreshed, Failed and Skipped, and Restored counts the failed
+// rows that carry Restored.
 type RuntimeRefreshStatus struct {
-	Contract  uint32                `json:"contract"`
-	Active    bool                  `json:"active"`
-	Stale     int                   `json:"stale"`
-	InFlight  int                   `json:"in_flight"`
-	Refreshed int                   `json:"refreshed"`
-	Failed    int                   `json:"failed"`
-	Skipped   int                   `json:"skipped"`
-	Leases    []RuntimeRefreshLease `json:"leases"`
+	Contract            uint32                `json:"contract"`
+	Active              bool                  `json:"active"`
+	Stale               int                   `json:"stale"`
+	InFlight            int                   `json:"in_flight"`
+	Refreshed           int                   `json:"refreshed"`
+	Failed              int                   `json:"failed"`
+	Restored            int                   `json:"restored"`
+	Skipped             int                   `json:"skipped"`
+	SharedNetworkLeases []string              `json:"shared_network_leases"`
+	Leases              []RuntimeRefreshLease `json:"leases"`
 }
 
 // runtimeRefreshController owns at most one run at a time. The zero value is
@@ -126,8 +174,13 @@ func (b *Backend) StartRuntimeRefresh(ctx context.Context) (RuntimeRefreshStatus
 	if b.stopCtx.Err() != nil {
 		return RuntimeRefreshStatus{}, fmt.Errorf("%w: backend is stopping", backend.ErrInvalidState)
 	}
-	// Read the inventory first: a run starts only with a stale count to report.
-	candidates, err := b.runtimeRefreshCandidates(ctx)
+	// Read the inventory and the durable outcomes first: a run starts only
+	// with a status to report.
+	inventory, err := b.readRuntimeRefreshInventory(ctx)
+	if err != nil {
+		return RuntimeRefreshStatus{}, err
+	}
+	settled, err := b.settledRuntimeRefreshes()
 	if err != nil {
 		return RuntimeRefreshStatus{}, err
 	}
@@ -142,46 +195,91 @@ func (b *Backend) StartRuntimeRefresh(ctx context.Context) (RuntimeRefreshStatus
 	controller.inFlight = make(map[string]struct{})
 	b.wg.Go(b.runRuntimeRefresh)
 	controller.mu.Unlock()
-	status := controller.snapshot()
-	status.Stale = len(candidates)
-	return status, nil
+	return controller.snapshot(inventory, settled), nil
 }
 
-// RuntimeRefreshStatus reports the stale leases Docker shows now and the
-// current or most recent run. A Docker inventory error is returned, never
-// reported as zero stale leases.
+// RuntimeRefreshStatus reports what Docker shows now, every lease's durable
+// refresh outcome, and the current or most recent run. A Docker inventory or
+// receipt read error is returned, never reported as zero.
 func (b *Backend) RuntimeRefreshStatus(ctx context.Context) (RuntimeRefreshStatus, error) {
-	candidates, err := b.runtimeRefreshCandidates(ctx)
+	inventory, err := b.readRuntimeRefreshInventory(ctx)
 	if err != nil {
 		return RuntimeRefreshStatus{}, err
 	}
-	status := b.runtimeRefresh.snapshot()
-	status.Stale = len(candidates)
-	return status, nil
+	settled, err := b.settledRuntimeRefreshes()
+	if err != nil {
+		return RuntimeRefreshStatus{}, err
+	}
+	return b.runtimeRefresh.snapshot(inventory, settled), nil
 }
 
-func (c *runtimeRefreshController) snapshot() RuntimeRefreshStatus {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	status := RuntimeRefreshStatus{
-		Contract: uint32(currentRuntimeContract),
-		Active:   c.active,
-		InFlight: len(c.inFlight),
-		Leases:   make([]RuntimeRefreshLease, 0, len(c.leases)),
+// settledRuntimeRefreshes returns each live lease's latest retained
+// runtime_refresh receipt.
+func (b *Backend) settledRuntimeRefreshes() ([]shared.SettledMaintenance, error) {
+	if b.maintenanceSettlement == nil {
+		return nil, errors.New("runtime refresh requires the maintenance settlement")
 	}
-	for _, lease := range slices.Sorted(maps.Keys(c.leases)) {
-		attestation := c.leases[lease]
-		status.Leases = append(status.Leases, attestation)
-		switch attestation.Outcome {
+	settled, err := b.maintenanceSettlement.LatestSettledMaintenance(shared.MaintenanceIntentRuntimeRefresh)
+	if err != nil {
+		return nil, fmt.Errorf("read runtime refresh receipts: %w", err)
+	}
+	return settled, nil
+}
+
+// snapshot assembles the status. A lease's durable receipt row wins, except
+// over a row of this run that names a different maintenance, which is newer:
+// its settlement is unknown, or not yet retained.
+func (c *runtimeRefreshController) snapshot(inventory runtimeRefreshInventory, settled []shared.SettledMaintenance) RuntimeRefreshStatus {
+	rows := make(map[string]RuntimeRefreshLease, len(settled))
+	for _, receipt := range settled {
+		rows[receipt.LeaseUUID()] = runtimeRefreshSettledRow(receipt)
+	}
+	c.mu.Lock()
+	status := RuntimeRefreshStatus{
+		Contract:            uint32(currentRuntimeContract),
+		Active:              c.active,
+		InFlight:            len(c.inFlight),
+		Stale:               len(inventory.stale),
+		SharedNetworkLeases: slices.Clone(inventory.sharedNetwork),
+	}
+	for lease, row := range c.leases {
+		durable, ok := rows[lease]
+		if !ok || (row.MaintenanceID != "" && row.MaintenanceID != durable.MaintenanceID) {
+			rows[lease] = row
+		}
+	}
+	c.mu.Unlock()
+	status.Leases = make([]RuntimeRefreshLease, 0, len(rows))
+	for _, lease := range slices.Sorted(maps.Keys(rows)) {
+		row := rows[lease]
+		status.Leases = append(status.Leases, row)
+		switch row.Outcome {
 		case RuntimeRefreshRefreshed:
 			status.Refreshed++
 		case RuntimeRefreshFailed:
 			status.Failed++
+			if row.Restored != nil {
+				status.Restored++
+			}
 		case RuntimeRefreshSkipped:
 			status.Skipped++
 		}
 	}
 	return status
+}
+
+// MarshalJSON writes nil lists as empty arrays: the cutover reads both as
+// lists, so the wire never carries null for either.
+func (s RuntimeRefreshStatus) MarshalJSON() ([]byte, error) {
+	type wire RuntimeRefreshStatus
+	w := wire(s)
+	if w.SharedNetworkLeases == nil {
+		w.SharedNetworkLeases = []string{}
+	}
+	if w.Leases == nil {
+		w.Leases = []RuntimeRefreshLease{}
+	}
+	return json.Marshal(w)
 }
 
 func (c *runtimeRefreshController) begin(lease string) {
@@ -217,12 +315,18 @@ func (c *runtimeRefreshController) finish() {
 	}
 }
 
-// runtimeRefreshCandidates reads Docker and returns the leases eligible for a
-// refresh now; see selectRuntimeRefreshCandidates.
-func (b *Backend) runtimeRefreshCandidates(ctx context.Context) ([]string, error) {
+// runtimeRefreshInventory is one read of Docker: the leases eligible for a
+// refresh, and the leases sharing a network with another lease.
+type runtimeRefreshInventory struct {
+	stale         []string
+	sharedNetwork []string
+}
+
+// readRuntimeRefreshInventory reads Docker once and publishes both gauges.
+func (b *Backend) readRuntimeRefreshInventory(ctx context.Context) (runtimeRefreshInventory, error) {
 	containers, err := b.listManagedContainersStrictForRecovery(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list containers for runtime refresh: %w", err)
+		return runtimeRefreshInventory{}, fmt.Errorf("list containers for runtime refresh: %w", err)
 	}
 	b.provisionsMu.RLock()
 	ready := make(map[string]struct{}, len(b.provisions))
@@ -232,9 +336,89 @@ func (b *Backend) runtimeRefreshCandidates(ctx context.Context) ([]string, error
 		}
 	}
 	b.provisionsMu.RUnlock()
-	candidates := selectRuntimeRefreshCandidates(ready, containers)
-	runtimeStaleLeases.Set(float64(len(candidates)))
-	return candidates, nil
+	inventory := runtimeRefreshInventory{
+		stale:         selectRuntimeRefreshCandidates(ready, containers),
+		sharedNetwork: selectSharedNetworkLeases(containers),
+	}
+	runtimeStaleLeases.Set(float64(len(inventory.stale)))
+	runtimeSharedNetworkLeases.Set(float64(len(inventory.sharedNetwork)))
+	return inventory, nil
+}
+
+// runtimeInventoryTimeout bounds one periodic inventory pass.
+const runtimeInventoryTimeout = 30 * time.Second
+
+// runtimeInventoryLoop keeps the stale and shared-network gauges current every
+// reconcile_interval, so an alert on them holds after a restart and between
+// operator requests. The first pass waits one interval, so it never competes
+// with startup recovery. It only reads Docker.
+func (b *Backend) runtimeInventoryLoop() {
+	ticker := time.NewTicker(b.cfg.ReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-b.stopCtx.Done():
+			return
+		case <-ticker.C:
+		}
+		util.RunCleanupIteration(func() error {
+			b.runRuntimeInventoryPass()
+			return nil
+		}, "docker_runtime_inventory", func(any) {
+			runtimeInventoryTotal.WithLabelValues("error").Inc()
+			background.CleanupPanicsTotal.WithLabelValues("docker_runtime_inventory").Inc()
+		})
+	}
+}
+
+// runRuntimeInventoryPass reads the inventory once. A failed pass is counted
+// and leaves both gauges at their last completed value.
+func (b *Backend) runRuntimeInventoryPass() {
+	ctx, cancel := context.WithTimeout(b.stopCtx, runtimeInventoryTimeout)
+	defer cancel()
+	if _, err := b.readRuntimeRefreshInventory(ctx); err != nil {
+		if b.stopCtx.Err() != nil {
+			return
+		}
+		runtimeInventoryTotal.WithLabelValues("error").Inc()
+		b.logger.Warn("runtime inventory failed; keeping the last completed counts", "error", err)
+		return
+	}
+	runtimeInventoryTotal.WithLabelValues("ok").Inc()
+}
+
+// runtimeRefreshCandidates reads Docker and returns the leases eligible for a
+// refresh now; see selectRuntimeRefreshCandidates.
+func (b *Backend) runtimeRefreshCandidates(ctx context.Context) ([]string, error) {
+	inventory, err := b.readRuntimeRefreshInventory(ctx)
+	return inventory.stale, err
+}
+
+// selectSharedNetworkLeases returns, sorted, the leases with a container on a
+// network that a container of another lease is also on. Membership is what
+// the daemon reports for each container, whatever its state: a stopped
+// container rejoins its networks when it restarts. A lease's own network holds
+// only that lease, so it never counts; "none" is no network.
+func selectSharedNetworkLeases(containers []ContainerInfo) []string {
+	members := make(map[string]map[string]struct{})
+	for _, container := range containers {
+		for _, network := range container.Networks {
+			if network == "none" || container.LeaseUUID == "" {
+				continue
+			}
+			if members[network] == nil {
+				members[network] = make(map[string]struct{})
+			}
+			members[network][container.LeaseUUID] = struct{}{}
+		}
+	}
+	shared := make(map[string]struct{})
+	for _, leases := range members {
+		if len(leases) > 1 {
+			maps.Copy(shared, leases)
+		}
+	}
+	return slices.Sorted(maps.Keys(shared))
 }
 
 // selectRuntimeRefreshCandidates returns, sorted, the leases of ready with at
@@ -301,22 +485,39 @@ func (b *Backend) runRuntimeRefresh() {
 			break
 		}
 	}
-	status := controller.snapshot()
-	b.logger.Info("runtime refresh finished", "refreshed", status.Refreshed,
-		"failed", status.Failed, "skipped", status.Skipped)
+	refreshed, failed, skipped := controller.runCounts()
+	b.logger.Info("runtime refresh finished", "refreshed", refreshed, "failed", failed, "skipped", skipped)
+}
+
+// runCounts counts this run's own rows.
+func (c *runtimeRefreshController) runCounts() (refreshed, failed, skipped int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, row := range c.leases {
+		switch row.Outcome {
+		case RuntimeRefreshRefreshed:
+			refreshed++
+		case RuntimeRefreshFailed:
+			failed++
+		case RuntimeRefreshSkipped:
+			skipped++
+		}
+	}
+	return refreshed, failed, skipped
 }
 
 // refreshLeaseRuntime refreshes one lease and attests its outcome. A panic in
 // one lease fails only that lease.
 func (b *Backend) refreshLeaseRuntime(ctx context.Context, lease string) (attestation RuntimeRefreshLease) {
-	attestation = RuntimeRefreshLease{LeaseUUID: lease, Outcome: RuntimeRefreshSkipped}
+	attestation = runtimeRefreshSkippedRow(lease)
+	var admitted string
 	b.runtimeRefresh.begin(lease)
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			background.CleanupPanicsTotal.WithLabelValues("docker_runtime_refresh").Inc()
 			b.logger.Error("runtime refresh panicked", "lease_uuid", lease,
 				"panic", recovered, "stack", string(debug.Stack()))
-			attestation.Outcome = RuntimeRefreshFailed
+			attestation = runtimeRefreshUnsettledFailureRow(lease, admitted)
 		}
 	}()
 	logger := b.logger.With("lease_uuid", lease)
@@ -337,23 +538,21 @@ func (b *Backend) refreshLeaseRuntime(ctx context.Context, lease string) (attest
 	_, lifecycleCallbackURL, err := resolveMaintenanceCallbackURLs(callbackURL, lifecycleCallbackURL, "")
 	if err != nil {
 		logger.Warn("runtime refresh has no usable lifecycle route", "error", err)
-		attestation.Outcome = RuntimeRefreshFailed
-		return attestation
+		return runtimeRefreshUnsettledFailureRow(lease, "")
 	}
 	id, err := maintenanceid.New()
 	if err != nil {
 		logger.Warn("allocate runtime refresh maintenance identity", "error", err)
-		attestation.Outcome = RuntimeRefreshFailed
-		return attestation
+		return runtimeRefreshUnsettledFailureRow(lease, "")
 	}
 	request, err := b.maintenanceSettlement.NewMaintenanceRequestAuthority(
 		id, shared.MaintenanceIntentRuntimeRefresh, lease, lifecycleCallbackURL, nil,
 	)
 	if err != nil {
 		logger.Warn("construct runtime refresh authority", "error", err)
-		attestation.Outcome = RuntimeRefreshFailed
-		return attestation
+		return runtimeRefreshUnsettledFailureRow(lease, "")
 	}
+	admitted = id.String()
 	routeErr := b.routeReplaceRestart(ctx, request, runtimeRefreshRoute())
 	if errors.Is(routeErr, errLeaseCommandBusy) || shared.IsLifecyclePending(routeErr) {
 		return attestation
@@ -361,45 +560,43 @@ func (b *Backend) refreshLeaseRuntime(ctx context.Context, lease string) (attest
 	// Whatever the route returned, only the durable settlement of this
 	// maintenance decides: an admitted refresh continues even when its
 	// acknowledgment was lost.
-	outcome, err := b.awaitRuntimeRefresh(ctx, lease, id)
+	settlement, err := b.awaitRuntimeRefresh(ctx, lease, id)
 	switch {
 	case err != nil:
 		logger.Warn("runtime refresh settlement unknown; not attested", "maintenance_id", id, "error", err)
-		attestation.Outcome = RuntimeRefreshFailed
-		attestation.MaintenanceID = id.String()
-	case outcome == runtimeRefreshNotAdmitted:
+		return runtimeRefreshUnsettledFailureRow(lease, admitted)
+	case !settlement.admitted:
 		switch {
 		case routeErr == nil:
 			logger.Warn("runtime refresh accepted but never admitted", "maintenance_id", id)
-			attestation.Outcome = RuntimeRefreshFailed
+			return runtimeRefreshUnsettledFailureRow(lease, "")
 		case errors.Is(routeErr, backend.ErrInvalidState) || errors.Is(routeErr, backend.ErrNotProvisioned):
 			// The lease stopped being a healthy, tracked lease before admission.
-			attestation.Outcome = RuntimeRefreshSkipped
+			return attestation
 		default:
 			logger.Warn("runtime refresh refused", "error", routeErr)
-			attestation.Outcome = RuntimeRefreshFailed
+			return runtimeRefreshUnsettledFailureRow(lease, "")
 		}
-	case outcome == runtimeRefreshActive:
-		attestation.Outcome = RuntimeRefreshRefreshed
-		attestation.MaintenanceID = id.String()
-		logger.Info("runtime refreshed", "maintenance_id", id)
-	default:
-		attestation.Outcome = RuntimeRefreshFailed
-		attestation.MaintenanceID = id.String()
-		logger.Warn("runtime refresh did not become active", "maintenance_id", id, "route_error", routeErr)
 	}
-	return attestation
+	row := runtimeRefreshSettledRow(settlement.receipt)
+	switch {
+	case row.Outcome == RuntimeRefreshRefreshed:
+		logger.Info("runtime refreshed", "maintenance_id", id)
+	case row.Restored != nil:
+		logger.Warn("runtime refresh failed; the pre-refresh release is the running cohort",
+			"maintenance_id", id, "release_version", row.Restored.ReleaseVersion, "route_error", routeErr)
+	default:
+		logger.Warn("runtime refresh failed", "maintenance_id", id, "route_error", routeErr)
+	}
+	return row
 }
 
-// runtimeRefreshSettlement is the durable state of one refresh maintenance.
-type runtimeRefreshSettlement uint8
-
-const (
-	runtimeRefreshPending runtimeRefreshSettlement = iota
-	runtimeRefreshNotAdmitted
-	runtimeRefreshActive
-	runtimeRefreshInactive
-)
+// runtimeRefreshSettlement is the durable state of one refresh maintenance:
+// not admitted, or settled with its receipt.
+type runtimeRefreshSettlement struct {
+	admitted bool
+	receipt  shared.SettledMaintenance
+}
 
 // awaitRuntimeRefresh waits for the durable settlement of maintenance id, at
 // most one provision timeout past its admission.
@@ -407,46 +604,43 @@ func (b *Backend) awaitRuntimeRefresh(ctx context.Context, lease string, id shar
 	waitCtx, cancel := context.WithTimeout(ctx, b.provisionOperationTimeout()+time.Minute)
 	defer cancel()
 	for {
-		settlement, err := b.readRuntimeRefreshSettlement(lease, id)
-		if err != nil || settlement != runtimeRefreshPending {
+		settlement, pending, err := b.readRuntimeRefreshSettlement(lease, id)
+		if err != nil || !pending {
 			return settlement, err
 		}
 		if !sleepContext(waitCtx, runtimeRefreshPollInterval) {
-			return runtimeRefreshPending, fmt.Errorf("runtime refresh of lease %q did not settle: %w", lease, context.Cause(waitCtx))
+			return runtimeRefreshSettlement{}, fmt.Errorf("runtime refresh of lease %q did not settle: %w", lease, context.Cause(waitCtx))
 		}
 	}
 }
 
-// readRuntimeRefreshSettlement reads the durable state of maintenance id.
-// Only a target release that is the lease's active release attests success:
-// its containers are the running cohort and carry the maintenance ID.
-func (b *Backend) readRuntimeRefreshSettlement(lease string, id shared.MaintenanceID) (runtimeRefreshSettlement, error) {
-	releases, err := b.releaseStore.List(lease)
+// readRuntimeRefreshSettlement reads the durable state of maintenance id. Its
+// completion receipt is the only settlement: it is written in the transaction
+// that consumes the intent, so an intent that is gone without a receipt was
+// never admitted (or was canceled before any effect).
+func (b *Backend) readRuntimeRefreshSettlement(lease string, id shared.MaintenanceID) (settlement runtimeRefreshSettlement, pending bool, err error) {
+	receipt, found, err := b.maintenanceSettlement.SettledMaintenanceByID(lease, id)
 	if err != nil {
-		return runtimeRefreshPending, fmt.Errorf("read release history: %w", err)
+		return runtimeRefreshSettlement{}, true, fmt.Errorf("read runtime refresh receipt: %w", err)
 	}
-	for _, release := range releases {
-		if release.MaintenanceID != id {
-			continue
-		}
-		switch release.Status {
-		case "deploying":
-			return runtimeRefreshPending, nil
-		case "active":
-			return runtimeRefreshActive, nil
-		default:
-			// failed, or superseded without having been observed active.
-			return runtimeRefreshInactive, nil
-		}
+	if found {
+		return runtimeRefreshSettlement{admitted: true, receipt: receipt}, false, nil
 	}
 	intent, found, err := b.maintenanceSettlement.GetMaintenanceIntent(lease)
 	if err != nil {
-		return runtimeRefreshPending, fmt.Errorf("read maintenance intent: %w", err)
+		return runtimeRefreshSettlement{}, true, fmt.Errorf("read maintenance intent: %w", err)
 	}
 	if found && intent.MaintenanceID() == id {
-		return runtimeRefreshPending, nil
+		return runtimeRefreshSettlement{}, true, nil
 	}
-	return runtimeRefreshNotAdmitted, nil
+	// A settlement can commit between the two reads, consuming the intent and
+	// writing the receipt together; read the receipt once more so that is not
+	// mistaken for no admission.
+	receipt, found, err = b.maintenanceSettlement.SettledMaintenanceByID(lease, id)
+	if err != nil {
+		return runtimeRefreshSettlement{}, true, fmt.Errorf("read runtime refresh receipt: %w", err)
+	}
+	return runtimeRefreshSettlement{admitted: found, receipt: receipt}, false, nil
 }
 
 // sleepContext waits d, reporting false when ctx ended first.

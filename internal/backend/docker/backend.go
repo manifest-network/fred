@@ -2920,6 +2920,9 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Report containers that do not run under the current tenant seccomp
 	// profile. The first pass runs now, in the background, after recovery.
 	b.wg.Go(b.tenantSeccompCensusLoop)
+	// Keep the runtime stale and shared-network gauges current, from one
+	// reconcile_interval after startup.
+	b.wg.Go(b.runtimeInventoryLoop)
 	// Audit managed XFS volumes for project-ID drift, detect only. The first
 	// pass waits projidAuditFirstDelay so it never competes with startup.
 	b.wg.Go(b.projidAuditLoop)

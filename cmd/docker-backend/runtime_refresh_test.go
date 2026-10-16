@@ -27,6 +27,7 @@ func signedRuntimeRefreshRequest(method, uri string, body []byte) *http.Request 
 func runtimeRefreshTestStatus() docker.RuntimeRefreshStatus {
 	return docker.RuntimeRefreshStatus{
 		Contract: 1, Active: true, Stale: 3, InFlight: 1, Refreshed: 1, Failed: 1, Skipped: 0,
+		SharedNetworkLeases: []string{},
 		Leases: []docker.RuntimeRefreshLease{
 			{LeaseUUID: handlerTestLeaseUUID, MaintenanceID: handlerTestMaintenanceID, Outcome: docker.RuntimeRefreshRefreshed},
 			{LeaseUUID: "650e8400-e29b-41d4-a716-446655440000", MaintenanceID: handlerTestMaintenanceID, Outcome: docker.RuntimeRefreshFailed},
@@ -110,11 +111,12 @@ func TestGetRuntimeRefreshStatus(t *testing.T) {
 	// Pin every field name and JSON type the cutover reads.
 	var fields map[string]any
 	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &fields))
-	assert.Len(t, fields, 8)
-	for _, name := range []string{"contract", "stale", "in_flight", "refreshed", "failed", "skipped"} {
+	assert.Len(t, fields, 10)
+	for _, name := range []string{"contract", "stale", "in_flight", "refreshed", "failed", "restored", "skipped"} {
 		assert.IsType(t, float64(0), fields[name], name)
 	}
 	assert.IsType(t, true, fields["active"])
+	assert.Equal(t, []any{}, fields["shared_network_leases"], "an empty list, never null")
 	leases, ok := fields["leases"].([]any)
 	require.True(t, ok)
 	require.Len(t, leases, 2)

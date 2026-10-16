@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -193,6 +194,16 @@ func testFrozenDockerCompensation(t *testing.T, h *maintenanceRecoveryHarness, c
 	require.NoError(t, err)
 	require.NoError(t, h.b.convergeMaintenanceFailure(t.Context(), proof.Intent(), h.source, h.inventory.containers, true, failureInfo))
 	require.NoError(t, h.b.resolveMaintenanceFailure(proof, "target startup failed"))
+	// The receipt keeps the proven fact that the source is the ready cohort,
+	// and a refresh attestation reads it back as a restored failure.
+	settled, found, err := h.b.maintenanceSettlement.SettledMaintenanceByID(h.leaseUUID, proof.MaintenanceID())
+	require.NoError(t, err)
+	require.True(t, found)
+	sourceDigest := h.sourceClaim.Digest()
+	require.Equal(t, RuntimeRefreshLease{
+		LeaseUUID: h.leaseUUID, MaintenanceID: proof.MaintenanceID().String(), Outcome: RuntimeRefreshFailed,
+		Restored: &RuntimeRefreshRestored{ReleaseVersion: h.source.Version, ReleaseDigest: hex.EncodeToString(sourceDigest[:])},
+	}, runtimeRefreshSettledRow(settled))
 	mock.ContainerLogsFn = func(_ context.Context, id string, _ int) (string, error) {
 		if strings.HasPrefix(id, "restored-source-") {
 			return "source live log", nil

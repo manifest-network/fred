@@ -1284,7 +1284,9 @@ these phases do not measure the full wall time of a failed replacement.
 - `fred_docker_backend_maintenance_readiness_pending_total{branch}` — readiness deferrals, including retries, for `committed_target`, `deploying_target`, `cleanup_source`, or `source_only`. The matching warning is emitted once per exact pending intent and branch in a backend lifetime. A committed target can remain pending indefinitely while its healthcheck is starting; inspect that workload rather than treating the metric as permission to roll it back.
 - `fred_docker_backend_maintenance_recovery_deferred_total` — explicitly lease-local observation conflicts deferred with their exact intent and reservation retained. Sibling recovery continues; storage/journal authority failures and global transport/cancellation errors still fail the recovery boundary.
 - `fred_docker_backend_operation_recovery_deferred_total` — provision and restore recoveries whose container evidence could not be classified (partial or mixed callback identities, an identity or topology mismatch, an inspection error). The Pending journal row and its lease fence stay; each pass counts the lease again. The same failures as above still fail the recovery boundary.
-- `fred_docker_backend_runtime_stale_leases` — Ready leases with a container created under an older runtime contract, from the last `GET /runtime_refresh` or run pass.
+- `fred_docker_backend_runtime_stale_leases` — Ready leases with a container created under an older runtime contract, from the last read: every `reconcile_interval` and every runtime refresh request
+- `fred_docker_backend_runtime_shared_network_leases` — leases with a container on a Docker network shared with another lease's container, from the same reads
+- `fred_docker_backend_runtime_inventory_total{outcome}` — periodic inventory passes behind those two gauges, `ok` or `error`; a failed pass keeps the last completed values pass.
 - `fred_docker_backend_runtime_refresh_total{outcome}` — final per-lease outcome of each runtime refresh run: `refreshed`, `failed`, or `skipped`.
 - `fred_docker_backend_network_reclamation_total{outcome}` — network candidates classified as `removed`, `absent`, `in_use`, `lease_active`, `lease_busy`, or `tenant_active`, plus candidate `error`, pass `list_error`, and pass `budget_exhausted` outcomes. Only `removed` counts a successful Docker removal. A bounded pass can leave a backlog for later passes without failing state or operation recovery; shutdown cancellation does not count as an operational error.
 
@@ -1964,8 +1966,11 @@ Each lease is refreshed through the same journaled, restart-shaped maintenance
 a custom-domain change uses, under its own `runtime_refresh` maintenance kind
 and receipt window. Every container is recreated (force-recreate) from the
 local image; nothing is pulled. The refresh is FailCount-neutral: a failure
-that rolls back leaves the lease Ready on its old containers, with no error
-and no failure-budget effect, and is reported as `failed`. The tenant sees
+that rolls back leaves the lease Ready on its pre-refresh release, with no
+error and no failure-budget effect, and is reported as `failed` with
+`restored`. A rollback that recreated the release runs copies of its
+containers with new container IDs; a target that failed before displacing the
+release leaves its containers unchanged. The tenant sees
 `restarting`, then `ready`, a maintenance callback, and one new `/releases`
 entry with the same manifest. A lease whose lifecycle command fence is busy
 (another command in progress) or that stops being Ready is retried on a later
@@ -1975,23 +1980,37 @@ is left to attempt, and gives up after one hour; a new POST starts a new run.
 
 ### `GET /runtime_refresh` (authenticated)
 
-Returns the stale count, read from Docker for each response, and the current
-or most recent run. `503` means the inventory could not be read: an unreadable
-inventory is never reported as zero stale leases.
+Returns what Docker shows now (the stale count and the leases sharing a
+network), every lease's durable refresh outcome, and the current or most
+recent run. `503` means the inventory or the receipts could not be read: an
+unreadable inventory is never reported as zero.
+
+A lease's `refreshed` or `failed` row is read from its latest retained
+`runtime_refresh` completion receipt, so it survives a backend restart and
+later runs; receipts are deleted when a lease closes. A `skipped` row, or a
+failure with no receipt (refused before admission, or a settlement this run
+could not read), comes from the current or most recent run in this process.
 
 ```json
 {
   "contract": 1,
   "active": false,
-  "stale": 0,
+  "stale": 1,
   "in_flight": 0,
   "refreshed": 1,
-  "failed": 0,
+  "failed": 1,
+  "restored": 1,
   "skipped": 0,
+  "shared_network_leases": [],
   "leases": [
     {"lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
      "maintenance_id": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
-     "outcome": "refreshed"}
+     "outcome": "refreshed"},
+    {"lease_uuid": "650e8400-e29b-41d4-a716-446655440000",
+     "maintenance_id": "7ba7b811-9dad-41d1-80b4-00c04fd430c8",
+     "outcome": "failed",
+     "restored": {"release_version": 3,
+                  "release_digest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}}
   ]
 }
 ```
@@ -2000,13 +2019,16 @@ inventory is never reported as zero stale leases.
 |---|---|---|
 | `contract` | integer ≥ 1 | The runtime contract this release creates containers under |
 | `active` | boolean | True from the POST that starts a run until that run has finished every lease, including while it waits between leases and passes |
-| `stale` | integer | Ready leases with at least one container created under an older contract. A lease whose refresh failed and rolled back stays counted |
+| `stale` | integer | Ready leases with at least one container created under an older contract. A lease whose refresh failed and was restored stays counted |
 | `in_flight` | integer | Leases the run is refreshing now |
-| `refreshed`, `failed`, `skipped` | integer | Leases of the run by outcome; always equal to the per-outcome row counts of `leases` |
-| `leases` | array | One row per lease the run attested, sorted and unique by `lease_uuid`; bounded by the backend's tracked leases. `[]` before any run |
+| `refreshed`, `failed`, `skipped` | integer | Rows by outcome; always equal to the per-outcome row counts of `leases` |
+| `restored` | integer | `failed` rows that carry `restored` |
+| `shared_network_leases` | array of strings | Sorted lease UUIDs with a container, in any state, on a Docker network that a container of another lease is also on, read from Docker for this response. A lease on its own network never appears. Never `null` |
+| `leases` | array | One row per lease, sorted and unique by `lease_uuid`; bounded by the backend's live leases. Never `null` |
 | `leases[].lease_uuid` | string | The lease |
-| `leases[].maintenance_id` | string, omitted when no refresh was admitted | The `runtime_refresh` maintenance. For `refreshed`, its target release is durably the lease's active release and the lease's new containers carry it in `fred.maintenance_id` |
-| `leases[].outcome` | `refreshed` \| `failed` \| `skipped` | `refreshed` only after the target release is durably active; `failed` when it ran and did not become active; `skipped` when it was not attempted to completion |
+| `leases[].maintenance_id` | string | The `runtime_refresh` maintenance. Always present on `refreshed` rows and on rows with `restored`; omitted when no refresh was admitted. A `refreshed` lease's containers carry it in `fred.maintenance_id` |
+| `leases[].outcome` | `refreshed` \| `failed` \| `skipped` | `refreshed`: the receipt records that the target became the active release. `failed`: it did not. `skipped`: this run did not attempt it to completion |
+| `leases[].restored` | object, only on `failed` rows | The failed refresh settled with the lease's pre-refresh release as its running, ready cohort, proved by the settlement and recorded on the receipt: `release_version` (integer ≥ 1) and `release_digest` (64 lowercase hex). Absent when that was not proved, for example when the restore itself failed |
 
 A cutover waits until `stale == 0 && in_flight == 0 && !active` (see
 OPERATIONS.md, Runtime refresh).

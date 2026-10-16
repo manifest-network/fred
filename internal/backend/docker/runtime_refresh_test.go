@@ -79,26 +79,34 @@ func TestRuntimeRefreshStatusReportsInventoryErrors(t *testing.T) {
 
 func TestRuntimeRefreshStatusJSONContract(t *testing.T) {
 	status := RuntimeRefreshStatus{
-		Contract: 1, Active: true, Stale: 2, InFlight: 1, Refreshed: 1, Failed: 1, Skipped: 1,
+		Contract: 1, Active: true, Stale: 2, InFlight: 1, Refreshed: 1, Failed: 2, Restored: 1, Skipped: 1,
+		SharedNetworkLeases: []string{"c", "d"},
 		Leases: []RuntimeRefreshLease{
 			{LeaseUUID: "a", MaintenanceID: "m-1", Outcome: RuntimeRefreshRefreshed},
 			{LeaseUUID: "b", Outcome: RuntimeRefreshSkipped},
+			{LeaseUUID: "c", MaintenanceID: "m-3", Outcome: RuntimeRefreshFailed,
+				Restored: &RuntimeRefreshRestored{ReleaseVersion: 2, ReleaseDigest: "ab"}},
+			{LeaseUUID: "d", Outcome: RuntimeRefreshFailed},
 		},
 	}
 	encoded, err := json.Marshal(status)
 	require.NoError(t, err)
 	assert.JSONEq(t, `{
 		"contract": 1, "active": true, "stale": 2, "in_flight": 1,
-		"refreshed": 1, "failed": 1, "skipped": 1,
+		"refreshed": 1, "failed": 2, "restored": 1, "skipped": 1,
+		"shared_network_leases": ["c", "d"],
 		"leases": [
 			{"lease_uuid": "a", "maintenance_id": "m-1", "outcome": "refreshed"},
-			{"lease_uuid": "b", "outcome": "skipped"}
+			{"lease_uuid": "b", "outcome": "skipped"},
+			{"lease_uuid": "c", "maintenance_id": "m-3", "outcome": "failed",
+			 "restored": {"release_version": 2, "release_digest": "ab"}},
+			{"lease_uuid": "d", "outcome": "failed"}
 		]
 	}`, string(encoded))
-	empty, err := json.Marshal(RuntimeRefreshStatus{Leases: []RuntimeRefreshLease{}})
+	empty, err := json.Marshal(RuntimeRefreshStatus{})
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"contract":0,"active":false,"stale":0,"in_flight":0,"refreshed":0,"failed":0,"skipped":0,"leases":[]}`,
-		string(empty))
+	assert.JSONEq(t, `{"contract":0,"active":false,"stale":0,"in_flight":0,"refreshed":0,"failed":0,"restored":0,"skipped":0,
+		"shared_network_leases":[],"leases":[]}`, string(empty), "lists are never null on the wire")
 }
 
 // runtimeRefreshHarness is a Ready stack lease whose only container predates
@@ -264,11 +272,12 @@ func TestRuntimeRefreshRecreatesAStaleLeaseAndAttestsTheActiveRelease(t *testing
 	assert.Equal(t, 2, provision.FailCount, "a refresh is not a failure")
 	assert.Equal(t, refreshedBefore+1, testutil.ToFloat64(runtimeRefreshTotal.WithLabelValues(string(RuntimeRefreshRefreshed))))
 
-	// A second run finds nothing stale and attests nothing.
+	// A second run finds nothing stale and refreshes nothing, but the first
+	// run's outcome is durable: it is read back from the lease's receipt.
 	_, err = h.b.StartRuntimeRefresh(t.Context())
 	require.NoError(t, err)
 	second := h.waitForRunToFinish(t)
-	assert.Empty(t, second.Leases)
+	assert.Equal(t, status.Leases, second.Leases, "the refreshed row outlives the run that produced it")
 	h.mu.Lock()
 	assert.Len(t, h.upOpts, 1, "a lease under the current contract is never recreated")
 	h.mu.Unlock()
@@ -357,4 +366,120 @@ func TestRuntimeRefreshRunStaysActiveWhileALeaseIsBusy(t *testing.T) {
 	h.mu.Lock()
 	assert.Empty(t, h.upOpts, "a busy lease is never recreated")
 	h.mu.Unlock()
+}
+
+func TestSelectSharedNetworkLeases(t *testing.T) {
+	on := func(lease, status string, networks ...string) ContainerInfo {
+		return ContainerInfo{LeaseUUID: lease, Status: status, Networks: networks}
+	}
+	for name, tc := range map[string]struct {
+		containers []ContainerInfo
+		want       []string
+	}{
+		"each lease on its own network": {
+			containers: []ContainerInfo{on("a", "running", "fred-a"), on("b", "running", "fred-b")},
+			want:       []string{},
+		},
+		"one lease's services share its network": {
+			containers: []ContainerInfo{on("a", "running", "fred-a"), on("a", "running", "fred-a")},
+			want:       []string{},
+		},
+		"two leases on a tenant network": {
+			containers: []ContainerInfo{on("b", "running", "fred-tenant-x"), on("a", "running", "fred-tenant-x"), on("c", "running", "fred-c")},
+			want:       []string{"a", "b"},
+		},
+		"a stopped container still counts": {
+			containers: []ContainerInfo{on("a", "running", "fred-tenant-x"), on("b", "exited", "fred-tenant-x")},
+			want:       []string{"a", "b"},
+		},
+		"network mode none is no network": {
+			containers: []ContainerInfo{on("a", "running", "none"), on("b", "running", "none")},
+			want:       []string{},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := selectSharedNetworkLeases(tc.containers)
+			if len(tc.want) == 0 {
+				assert.Empty(t, got)
+				return
+			}
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// A lease's durable receipt row wins over this run's memory, except over a row
+// naming a newer maintenance whose settlement is not retained.
+func TestRuntimeRefreshStatusPrefersDurableReceiptRows(t *testing.T) {
+	h := newRuntimeRefreshHarness(t, backend.ProvisionStatusReady)
+	_, err := h.b.StartRuntimeRefresh(t.Context())
+	require.NoError(t, err)
+	first := h.waitForRunToFinish(t)
+	require.Len(t, first.Leases, 1)
+	durable := first.Leases[0]
+	require.Equal(t, RuntimeRefreshRefreshed, durable.Outcome)
+
+	controller := &h.b.runtimeRefresh
+	for name, tc := range map[string]struct {
+		memory RuntimeRefreshLease
+		want   RuntimeRefreshLease
+	}{
+		"skipped in this run":          {memory: runtimeRefreshSkippedRow(h.leaseUUID), want: durable},
+		"refused before admission":     {memory: runtimeRefreshUnsettledFailureRow(h.leaseUUID, ""), want: durable},
+		"the same settled maintenance": {memory: durable, want: durable},
+		"a newer, unsettled refresh": {
+			memory: runtimeRefreshUnsettledFailureRow(h.leaseUUID, "6ba7b812-9dad-41d1-80b4-00c04fd430c8"),
+			want:   runtimeRefreshUnsettledFailureRow(h.leaseUUID, "6ba7b812-9dad-41d1-80b4-00c04fd430c8"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			controller.mu.Lock()
+			controller.leases = map[string]RuntimeRefreshLease{h.leaseUUID: tc.memory}
+			controller.mu.Unlock()
+			status, err := h.b.RuntimeRefreshStatus(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, []RuntimeRefreshLease{tc.want}, status.Leases)
+		})
+	}
+
+	// A restart loses the run; the receipt does not.
+	controller.mu.Lock()
+	controller.leases = nil
+	controller.mu.Unlock()
+	status, err := h.b.RuntimeRefreshStatus(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, []RuntimeRefreshLease{durable}, status.Leases)
+	assert.Equal(t, 1, status.Refreshed)
+}
+
+// The periodic pass publishes both gauges from one Docker read; a failed pass
+// is counted and keeps the last completed values.
+func TestRuntimeInventoryPassPublishesGaugesAndKeepsThemOnError(t *testing.T) {
+	var listErr error
+	containers := []ContainerInfo{
+		{LeaseUUID: "a", Networks: []string{"fred-tenant-x"}},
+		{LeaseUUID: "b", Networks: []string{"fred-tenant-x"}},
+		{LeaseUUID: "c", Networks: []string{"fred-c"}, RuntimeContract: currentRuntimeContract},
+	}
+	b := newBackendForTest(&mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return containers, listErr
+		},
+	}, nil)
+	defer b.stopCancel()
+	b.provisions["a"] = &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "a", Status: backend.ProvisionStatusReady,
+		StackManifest: &manifest.StackManifest{}}}
+	ok := testutil.ToFloat64(runtimeInventoryTotal.WithLabelValues("ok"))
+	failed := testutil.ToFloat64(runtimeInventoryTotal.WithLabelValues("error"))
+
+	b.runRuntimeInventoryPass()
+	assert.Equal(t, 1.0, testutil.ToFloat64(runtimeStaleLeases), "only the Ready lease a, on an older contract")
+	assert.Equal(t, 2.0, testutil.ToFloat64(runtimeSharedNetworkLeases), "a and b share a network")
+	assert.Equal(t, ok+1, testutil.ToFloat64(runtimeInventoryTotal.WithLabelValues("ok")))
+
+	listErr = errors.New("docker unavailable")
+	b.runRuntimeInventoryPass()
+	assert.Equal(t, 1.0, testutil.ToFloat64(runtimeStaleLeases), "a failed read keeps the last completed value")
+	assert.Equal(t, 2.0, testutil.ToFloat64(runtimeSharedNetworkLeases))
+	assert.Equal(t, failed+1, testutil.ToFloat64(runtimeInventoryTotal.WithLabelValues("error")))
 }
