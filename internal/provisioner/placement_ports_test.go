@@ -174,7 +174,7 @@ func TestReconcilerConfigCannotSpliceStoreOrRegistry(t *testing.T) {
 }
 
 func TestManagerConfigCannotSpliceCallbackOrigin(t *testing.T) {
-	config := reflect.TypeOf(ManagerConfig{})
+	config := reflect.TypeOf(ManagerConfig{BillingPolicy: placement.NoBillingOnlySKUs()})
 	_, exposed := config.FieldByName("CallbackBaseURL")
 	assert.False(t, exposed,
 		"callback routes must come only from the factory bound to PlacementStore")

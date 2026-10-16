@@ -172,9 +172,10 @@ type Config struct {
 	// Defaults to "0.0.0.0" (all interfaces).
 	HostBindIP string `yaml:"host_bind_ip"`
 
-	// NetworkIsolation enables per-tenant Docker network isolation.
-	// When true, each tenant's containers are placed in a separate bridge network.
-	// Provides inter-tenant isolation. The network is created with Internal:false
+	// NetworkIsolation enables per-lease Docker network isolation.
+	// When true, each lease's containers are placed in the lease's own bridge
+	// network, isolated from every other lease, including leases of the same
+	// tenant. The network is created with Internal:false
 	// — required for port publishing (moby#36174) — so containers retain outbound
 	// internet access as a side effect. Defaults to true.
 	NetworkIsolation *bool `yaml:"network_isolation"`
@@ -182,6 +183,11 @@ type Config struct {
 	// ContainerReadonlyRootfs sets the container's root filesystem to read-only.
 	// When true, /tmp and /run are mounted as tmpfs. Defaults to true.
 	ContainerReadonlyRootfs *bool `yaml:"container_readonly_rootfs"`
+
+	// RuntimeRefreshMaxConcurrency bounds how many leases one operator-started
+	// runtime refresh recreates at once (POST /runtime_refresh). Unset uses
+	// the default of 4; 0 disables the endpoint.
+	RuntimeRefreshMaxConcurrency *int `yaml:"runtime_refresh_max_concurrency"`
 
 	// ContainerPidsLimit limits the number of PIDs in each container.
 	// Defaults to 256.
@@ -333,7 +339,7 @@ type Config struct {
 
 	// Ingress configures optional reverse proxy integration.
 	// When enabled, containers with routable TCP ports get proxy labels
-	// pointing Traefik at the per-tenant network for HTTPS auto-discovery.
+	// pointing Traefik at the lease's own network for HTTPS auto-discovery.
 	// Requires network_isolation to be enabled.
 	Ingress IngressConfig `yaml:"ingress"`
 }
@@ -366,6 +372,22 @@ const (
 func ptrBool(b bool) *bool    { return &b }
 func ptrInt64(i int64) *int64 { return &i }
 
+// defaultRuntimeRefreshMaxConcurrency is runtime_refresh_max_concurrency when
+// unset; maxRuntimeRefreshConcurrency is its upper bound.
+const (
+	defaultRuntimeRefreshMaxConcurrency = 4
+	maxRuntimeRefreshConcurrency        = 64
+)
+
+// GetRuntimeRefreshMaxConcurrency returns how many leases a runtime refresh
+// recreates at once; 0 means the endpoint is disabled.
+func (c *Config) GetRuntimeRefreshMaxConcurrency() int {
+	if c.RuntimeRefreshMaxConcurrency != nil {
+		return *c.RuntimeRefreshMaxConcurrency
+	}
+	return defaultRuntimeRefreshMaxConcurrency
+}
+
 // GetHostBindIP returns the configured bind IP, defaulting to "0.0.0.0".
 func (c *Config) GetHostBindIP() string {
 	if c.HostBindIP != "" {
@@ -374,7 +396,7 @@ func (c *Config) GetHostBindIP() string {
 	return "0.0.0.0"
 }
 
-// IsNetworkIsolation returns whether per-tenant network isolation is enabled.
+// IsNetworkIsolation returns whether per-lease network isolation is enabled.
 // Defaults to true (secure by default).
 func (c *Config) IsNetworkIsolation() bool {
 	if c.NetworkIsolation != nil {
@@ -667,6 +689,10 @@ func (c *Config) Validate() error {
 
 	if c.ContainerPidsLimit != nil && *c.ContainerPidsLimit < 1 {
 		return fmt.Errorf("container_pids_limit must be >= 1")
+	}
+
+	if n := c.RuntimeRefreshMaxConcurrency; n != nil && (*n < 0 || *n > maxRuntimeRefreshConcurrency) {
+		return fmt.Errorf("runtime_refresh_max_concurrency must be between 0 (disabled) and %d", maxRuntimeRefreshConcurrency)
 	}
 
 	if c.ContainerTmpfsSizeMB < 0 {

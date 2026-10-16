@@ -271,7 +271,7 @@ func rawSubstrateMethod(name string) bool {
 	switch name {
 	case "PullImage", "AdmitImage", "ResolveImageUser", "CreateContainer", "StartContainer",
 		"createCompensationContainer", "startCompensationContainer", "launch",
-		"StopContainer", "RenameContainer", "RemoveContainer", "EnsureTenantNetwork",
+		"StopContainer", "RenameContainer", "RemoveContainer", "CreateLeaseNetwork", "RemoveLeaseNetworkIfEmpty",
 		"RemoveTenantNetworkIfEmpty", "DetectVolumeOwner", "DetectWritablePaths",
 		"ExtractImageContent", "EnsureQuota", "RenameVolume", "Up", "Down":
 		return true
@@ -285,7 +285,10 @@ func rawSubstrateMethod(name string) bool {
 // volume-owner, and writable-path probes create temporary containers and may
 // leave anonymous volumes when Docker returns ambiguously; they are tenant
 // Steps even though their intended result is observational.
-func TestRunnerPrepareAllowlistContainsOnlyImagePreparation(t *testing.T) {
+// Prepare brackets actions that cannot change tenant substrate. The allowlist
+// is guarded image preparation and the read-only inspection of a lease's
+// network, whose refusal must settle as Refused rather than Ambiguous.
+func TestRunnerPrepareAllowlistContainsOnlyNonMutatingPreparation(t *testing.T) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "storage_mutation_guard.go", nil, 0)
 	if err != nil {
@@ -309,7 +312,7 @@ func TestRunnerPrepareAllowlistContainsOnlyImagePreparation(t *testing.T) {
 			return true
 		})
 	}
-	if !reflect.DeepEqual(prepares, []string{"pullImage", "admitImage"}) {
-		t.Fatalf("Runner.Prepare call sites = %v, want only guarded image preparation", prepares)
+	if !reflect.DeepEqual(prepares, []string{"pullImage", "admitImage", "ensureLeaseNetwork"}) {
+		t.Fatalf("Runner.Prepare call sites = %v, want only guarded image preparation and lease network inspection", prepares)
 	}
 }

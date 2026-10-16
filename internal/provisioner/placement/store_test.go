@@ -19,6 +19,8 @@ import (
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
 
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/provisioner/inventory"
@@ -1711,18 +1713,30 @@ func TestBackendRequestSnapshotIsValidatedDetachedAndComparable(t *testing.T) {
 
 func TestStoreMintsBackendRequestSnapshotFromItsProviderAuthority(t *testing.T) {
 	store := newTestStore(t)
-	items := []backend.LeaseItem{{SKU: "sku-a", Quantity: 1, ServiceName: "app"}}
+	lease := billingtypes.Lease{
+		Uuid: "lease-a", Tenant: "tenant-a",
+		Items: []billingtypes.LeaseItem{{SkuUuid: "sku-a", Quantity: 1, ServiceName: "app"}},
+	}
+	deployable, ok := NoBillingOnlySKUs().Classify(&lease).Deployable()
+	require.True(t, ok)
 
-	snapshot, err := store.MintBackendRequestSnapshot("tenant-a", items)
+	snapshot, err := store.MintBackendRequestSnapshot(deployable)
 	require.NoError(t, err)
 	require.True(t, snapshot.Valid())
 	assert.Equal(t, freshTestProviderUUID, snapshot.ProviderUUID())
 	assert.Equal(t, "tenant-a", snapshot.Tenant())
+	assert.Equal(t, []backend.LeaseItem{{SKU: "sku-a", Quantity: 1, ServiceName: "app"}}, snapshot.Items())
 
 	var zero *Store
-	invalid, err := zero.MintBackendRequestSnapshot("tenant-a", items)
+	invalid, err := zero.MintBackendRequestSnapshot(deployable)
 	require.Error(t, err)
 	assert.False(t, invalid.Valid())
+
+	// Only BillingPolicy.Classify issues a DeployableLease; the zero value
+	// mints no request.
+	unclassified, err := store.MintBackendRequestSnapshot(DeployableLease{})
+	require.ErrorContains(t, err, "classified as deployable")
+	assert.False(t, unclassified.Valid())
 }
 
 func TestStoreLoadRejectsPersistedCrossProviderBackendRequest(t *testing.T) {

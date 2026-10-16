@@ -31,10 +31,13 @@ type composeProjectParams struct {
 	Items                []backend.LeaseItem
 	Profiles             map[string]SKUProfile
 	ImageSetups          map[string]*imageSetup
-	NetworkName          string                             // pre-created tenant network name (empty if isolation disabled)
-	VolBinds             map[string]map[int]serviceVolBinds // svc → instance → binds
-	Cfg                  *Config
-	Ingress              IngressConfig
+	// Network is the verified authority over the lease's own network. It is
+	// required when network isolation is enabled and the project attaches by
+	// its ID; with isolation disabled it must be the zero value.
+	Network  leaseNetworkAuthority
+	VolBinds map[string]map[int]serviceVolBinds // svc → instance → binds
+	Cfg      *Config
+	Ingress  IngressConfig
 }
 
 // serviceVolBinds holds volume binds for a single service instance.
@@ -43,12 +46,42 @@ type serviceVolBinds struct {
 	WritableBinds map[string]string // hostPath → containerPath
 }
 
+// leaseNetworkKey is the project and service key of the lease network. It is
+// not Compose's implicit "default": Compose hashes each service's network map,
+// so the key change makes the first Up after an upgrade recreate every service
+// of a lease that still runs on its tenant network, including a stopped one
+// that a network-attachment check alone would restart in place.
+const leaseNetworkKey = "lease"
+
+// projectNetwork resolves the network a lease's project attaches to. With
+// isolation enabled the authority must be this lease's and this backend's; the
+// project then names the network by its verified ID as an external network,
+// so Compose neither creates nor removes it and Docker attaches to that exact
+// network. The returned name is the network's human-readable name, which
+// Traefik matches against a container's attached networks.
+func projectNetwork(params composeProjectParams) (id, name string, err error) {
+	if params.Cfg == nil || !params.Cfg.IsNetworkIsolation() {
+		if params.Network.established() {
+			return "", "", fmt.Errorf("%w: network isolation is disabled", errLeaseNetworkOwnership)
+		}
+		return "", "", nil
+	}
+	if err := params.Network.authorizes(params.LeaseUUID, params.BackendName); err != nil {
+		return "", "", err
+	}
+	return params.Network.networkID, leaseNetworkName(params.LeaseUUID), nil
+}
+
 // buildPlannedComposeProject generates a compose-go Project from the parameters
 // and the exact ingress decision that owns emitted item metadata.
 // The project is fully in-memory — no YAML files or project directories.
-func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIngressPlan) *composetypes.Project {
+func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIngressPlan) (*composetypes.Project, error) {
 	projectName := composeProjectName(params.LeaseUUID)
 	services := make(composetypes.Services)
+	networkID, networkName, err := projectNetwork(params)
+	if err != nil {
+		return nil, err
+	}
 
 	for _, item := range ingress.items {
 		svcName := item.ServiceName
@@ -74,7 +107,7 @@ func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIn
 				Manifest:             svc,
 				Profile:              profile,
 				ImgSetup:             imgSetup,
-				NetworkName:          params.NetworkName,
+				NetworkName:          networkName,
 				Cfg:                  params.Cfg,
 				Ingress:              ingress.routes[svcName],
 				Quantity:             item.Quantity,
@@ -131,9 +164,11 @@ func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIn
 			svcConfig.ContainerName = fmt.Sprintf("fred-%s-%s-%d", params.LeaseUUID, svcName, i)
 
 			// Set network alias so all instances of the same service share the base name.
-			if params.NetworkName != "" {
+			// The alias lives on the lease's own network, so it resolves only to
+			// this lease's containers.
+			if networkName != "" {
 				svcConfig.Networks = map[string]*composetypes.ServiceNetworkConfig{
-					"default": {
+					leaseNetworkKey: {
 						Aliases: []string{svcName},
 					},
 				}
@@ -151,17 +186,18 @@ func buildPlannedComposeProject(params composeProjectParams, ingress effectiveIn
 		Services: services,
 	}
 
-	// External network configuration.
-	if params.NetworkName != "" {
+	// The lease's own bridge network, named by its verified ID. External: Fred
+	// created or verified it, and Compose must neither create nor remove it.
+	if networkID != "" {
 		project.Networks = composetypes.Networks{
-			"default": composetypes.NetworkConfig{
-				Name:     params.NetworkName,
+			leaseNetworkKey: composetypes.NetworkConfig{
+				Name:     networkID,
 				External: true,
 			},
 		}
 	}
 
-	return project
+	return project, nil
 }
 
 // applyDependsOn maps manifest-level depends_on to Compose DependsOnConfig.
@@ -389,6 +425,7 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 		LabelCallbackURL:          p.CallbackURL,
 		LabelLifecycleCallbackURL: p.LifecycleCallbackURL,
 		LabelMaintenanceID:        p.MaintenanceID.String(),
+		LabelRuntimeContract:      currentRuntimeContract.label(),
 		LabelBackendName:          p.BackendName,
 		LabelServiceName:          p.ServiceName,
 	}

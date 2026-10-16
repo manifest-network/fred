@@ -567,6 +567,8 @@ type backendService interface {
 	ListRetentions(ctx context.Context) ([]backend.RetainedLease, error)
 	ListRetentionsPage(ctx context.Context, after string, limit int) ([]backend.RetainedLease, string, error)
 	ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []backend.LeaseItem) error
+	StartRuntimeRefresh(ctx context.Context) (docker.RuntimeRefreshStatus, error)
+	RuntimeRefreshStatus(ctx context.Context) (docker.RuntimeRefreshStatus, error)
 	GetReleases(ctx context.Context, leaseUUID string) ([]backend.ReleaseInfo, error)
 	Health(ctx context.Context) error
 	Stats() shared.ResourceStats
@@ -656,6 +658,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /retentions", protected(http.HandlerFunc(s.handleListRetentions)))
 	mux.Handle("POST /reconcile_custom_domain", protected(http.HandlerFunc(s.handleReconcileCustomDomain)))
 	mux.Handle("GET /releases/{lease_uuid}", protected(http.HandlerFunc(s.handleGetReleases)))
+	mux.Handle("POST /runtime_refresh", protected(http.HandlerFunc(s.handleStartRuntimeRefresh)))
+	mux.Handle("GET /runtime_refresh", protected(http.HandlerFunc(s.handleGetRuntimeRefresh)))
 
 	// Operational endpoints — no auth required (monitoring, health checks).
 	if s.storageIdentity.Valid() {
@@ -684,6 +688,7 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("POST "+prefix+"/update", bind(http.HandlerFunc(s.handleUpdate)))
 		mux.Handle("POST "+prefix+"/restore", bind(http.HandlerFunc(s.handleRestore)))
 		mux.Handle("POST "+prefix+"/reconcile_custom_domain", bind(http.HandlerFunc(s.handleReconcileCustomDomain)))
+		mux.Handle("POST "+prefix+"/runtime_refresh", bind(http.HandlerFunc(s.handleStartRuntimeRefresh)))
 		identityHandler, err := backendidentity.ResponseMiddleware(s.storageIdentity, mux)
 		if err == nil {
 			return identityHandler
@@ -1029,6 +1034,56 @@ func (s *Server) handleListRetentions(w http.ResponseWriter, r *http.Request) {
 		Retentions: page,
 		Continue:   next,
 	})
+}
+
+// handleStartRuntimeRefresh starts an operator runtime refresh run: 202 with
+// the run's status, 409 while a run is already active, 403 when the endpoint
+// is disabled by configuration, 503 when the inventory cannot be read. The
+// request carries no parameters: concurrency is configuration, so the body
+// must be empty or {}.
+func (s *Server) handleStartRuntimeRefresh(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if len(bytes.TrimSpace(body)) != 0 {
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+		var empty struct{}
+		if err := decoder.Decode(&empty); err != nil || decoder.More() {
+			s.errorResponse(w, http.StatusBadRequest, "runtime_refresh takes no parameters")
+			return
+		}
+	}
+	status, err := s.backend.StartRuntimeRefresh(r.Context())
+	if err != nil {
+		if errors.Is(err, docker.ErrRuntimeRefreshActive) {
+			s.errorResponse(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, docker.ErrRuntimeRefreshDisabled) {
+			s.errorResponse(w, http.StatusForbidden, err.Error())
+			return
+		}
+		s.logger.Error("start runtime refresh failed", "error", err)
+		s.errorResponse(w, http.StatusServiceUnavailable, "runtime refresh unavailable")
+		return
+	}
+	s.writeJSON(w, http.StatusAccepted, status)
+}
+
+// handleGetRuntimeRefresh reports stale leases and the current or most recent
+// run. A Docker inventory failure is a 503, never a report of zero stale
+// leases.
+func (s *Server) handleGetRuntimeRefresh(w http.ResponseWriter, r *http.Request) {
+	status, err := s.backend.RuntimeRefreshStatus(r.Context())
+	if err != nil {
+		s.logger.Error("read runtime refresh status failed", "error", err)
+		s.errorResponse(w, http.StatusServiceUnavailable, "runtime refresh status unavailable")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, status)
 }
 
 func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Request) {

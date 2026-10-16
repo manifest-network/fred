@@ -19,6 +19,7 @@ import (
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 // newLeaseEventMsg creates a Watermill message from a LeaseEvent.
@@ -77,7 +78,8 @@ func TestHandleLeaseCreated_WithMetaHash(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -108,7 +110,8 @@ func TestHandleLeaseCreated_LeaseNotFound(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -141,7 +144,8 @@ func TestHandleLeaseCreated_ChainError(t *testing.T) {
 	}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -176,7 +180,8 @@ func TestHandleLeaseClosed_NoPlacement_SweepsAllBackends(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -217,7 +222,8 @@ func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -258,7 +264,8 @@ func TestHandleLeaseClosed_AllBackendsFail(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -287,8 +294,9 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 
@@ -342,8 +350,9 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 	defer payloadStore.Close()
 
 	manager, err := newTestManager(t, ManagerConfig{
-		ProviderUUID: "provider-1",
-		PayloadStore: payloadStore,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  "provider-1",
+		PayloadStore:  payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err, "NewManager()")
 

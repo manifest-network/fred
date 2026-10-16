@@ -523,15 +523,17 @@ Declares startup ordering between services in a stack.
 
 ### Inter-Service DNS
 
-When network isolation is enabled, all services in a stack share the same tenant network. Each service's containers are created with the service name as a network alias, allowing services to reach each other by name (e.g., the `web` service can connect to `db:5432`).
+When network isolation is enabled, all services in a stack share the lease's own network. Each service's containers are created with the service name as a network alias, allowing services to reach each other by name (e.g., the `web` service can connect to `db:5432`). A service name resolves only within its lease: other leases, including your own, cannot be reached by name or address over this network.
 
 ### Cycle Detection
 
-Fred performs DFS-based cycle detection on the `depends_on` graph with a maximum depth of **10**. This catches:
+Fred rejects a `depends_on` graph that contains a cycle or a chain longer than **10** links. This catches:
 
 - Direct cycles: A → B → A
 - Transitive cycles: A → B → C → A
-- Acyclic chains longer than 10 links (12 or more services in a row), but only when the search starts at the head of the chain; it visits services in an unspecified order and skips those already explored, so such a chain can also be accepted. Keep chains to 10 links or fewer.
+- Chains longer than 10 links (12 or more services in a row). The longest chain decides, wherever it starts, so the same manifest always gets the same answer.
+
+The chain limit applies when a manifest is submitted. Manifests already stored for a lease are not re-checked against it.
 
 Diamond dependencies (A → B, A → C, B → D, C → D) are valid and not considered cycles.
 
@@ -750,4 +752,4 @@ Requires a stateful SKU with `disk_mb > 0`. The backend auto-detects the volume 
 | Empty health check test | `test is required` | Provide at least the type prefix |
 | Negative retries | `retries cannot be negative` | Use 0 or a positive integer |
 | Cycle in depends_on | `cycle detected involving service ...` | Remove circular dependency |
-| Dependency chain too deep | `dependency chain exceeds maximum depth of 10` | Flatten your dependency graph |
+| Dependency chain too deep | `dependency chain exceeds maximum depth of 10 (service "..." starts a chain of N links)` | Flatten your dependency graph |

@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
-## [0.14.0] - 2026-10-08
+## [0.14.0] - 2026-10-16
 
 **Upgrading from v0.13.0.** This release cannot be installed in place. Follow
 [Upgrading from v0.13.0](DEPLOYMENT.md#upgrading-from-v0130) before replacing
@@ -483,6 +483,59 @@ any binary:
   exposes a recovered panic in a bundled backend's durable callback replay
   worker. The affected lease remains queued and other lease workers continue;
   any increase is still a bug requiring investigation. (ENG-632)
+
+- docker-backend: an operator-started runtime refresh. Every container now
+  records the runtime contract it was created under in `fred.runtime_contract`
+  (contract 1: the lease's own network). `POST /runtime_refresh` recreates
+  every Ready lease with a container created under an older contract, with
+  the same release, volumes and lease, at most
+  `runtime_refresh_max_concurrency` (default 4; 0 disables) at a time, through
+  a journaled `runtime_refresh` maintenance that never counts as a failure.
+  `GET /runtime_refresh` reports the stale leases, whether a run is `active`,
+  the leases still sharing a Docker network with another lease, and one
+  attestation per lease: `refreshed` (with the maintenance ID its new
+  containers carry), `failed`, or `skipped`. A `failed` refresh that settled
+  with the lease's pre-refresh release as its running, ready cohort carries
+  `restored` with that release's version and digest. A refresh's target is
+  the lease's active release itself, derived from the sealed source, and each
+  image is admitted only as the image its running containers execute: matched
+  against its pin before anything is journaled, and against the refresh's own
+  source capture before any substrate effect. A lease whose pins name other
+  content is refused as `failed`; one whose images cannot be proved is
+  skipped. Attestations are read from each lease's maintenance receipt, so
+  they survive a backend restart and later runs; the receipt now records, from
+  the settlement's own proof, that a failed maintenance left its source as the
+  ready cohort. Nothing starts a refresh automatically. New metrics:
+  `fred_docker_backend_runtime_stale_leases` and
+  `fred_docker_backend_runtime_shared_network_leases`, read every
+  `reconcile_interval`, `fred_docker_backend_runtime_inventory_total{outcome}`
+  and `fred_docker_backend_runtime_refresh_total{outcome}`. See
+  OPERATIONS.md, Runtime refresh.
+
+- `billing_only_skus` lists SKUs the provider bills for but delivers outside
+  Fred. Fred acknowledges a lease whose items all use these SKUs as soon as it
+  sees it, so billing starts at once, and the reconciler retries the
+  acknowledgment on its next sweep. The acknowledgment reads only the chain,
+  so no backend answer, or anything a backend still reports, holds it back.
+  Fred never provisions such a lease, never rejects it, and never closes it
+  for a provisioning reason, including as lost after a backend retirement. Before
+  this, an unattached SKU fell through to the default backend, whose
+  unknown-SKU refusal got the lease rejected on chain within seconds. Payload
+  uploads for a billing-only lease are refused with `400` and counted as
+  `fred_payload_uploads_total{outcome="billing_only"}`, and so are restores
+  into one. Withdrawals and the credit check apply as before. A lease that
+  mixes billing-only and deployable SKUs keeps the normal path. Each entry must
+  be a lowercase canonical UUID that no backend serves;
+  `PROVIDER_BILLING_ONLY_SKUS` sets the list from the environment
+  (comma-separated). The policy is bound into the placement backend runtime,
+  and a provision or restore request can be minted only from a lease it
+  classified as deployable, and is checked again when it is sent. A SKU can
+  be made billing-only while leases already use it: a deployment still in
+  flight is never retried, the lease is still acknowledged, and no failure
+  callback, timeout or lost backend ends it, because every chain rejection and
+  close the placement layer issues needs the policy's consent. Whatever the
+  earlier deployment left on a backend is torn down when the lease ends.
+  (ENG-1453)
 
 ### Changed
 
@@ -1191,6 +1244,11 @@ any binary:
   inventory establishes that durable baseline. Existing stack-form containers
   are not restarted or moved. Service-name-less pre-stack cohorts are unsupported
   and rejected before mutation. (ENG-632)
+
+- `fred_docker_backend_network_reclamation_total{outcome}` gains
+  `lease_active` and `lease_busy` for per-lease networks; `tenant_busy` is no
+  longer emitted, because nothing creates tenant networks any more. Size
+  Docker's address pools for active leases rather than active tenants.
 
 ### Deprecated
 
@@ -2216,6 +2274,23 @@ any binary:
   of nodes that answered both inventories after durable topology bootstrap.
   (ENG-632)
 
+- docker-backend: a custom-domain redeploy that fails, or that a crash
+  interrupts, settles again. Its failure details were refused for any
+  maintenance kind but restart and update, so a definitive failure became an
+  ambiguous outcome and recovery of the interrupted maintenance could never
+  converge, leaving the lease's maintenance head unsettled.
+
+- A stack whose `depends_on` chain is longer than 10 links is now always
+  rejected at submission. The check used to measure the chain from whichever
+  service it happened to visit first, so the same manifest was accepted or
+  rejected at random (about one time in five for 12 services in a row, three
+  in five for 20). Stored manifests are no longer re-checked against the
+  limit. The docker backend re-parses them when it opens its release and
+  retention stores, on every `/health`, and during recovery, close and
+  maintenance, so one tenant's long chain could make backend startup and
+  `/health` fail at random. Cycles are still rejected in stored manifests.
+  (ENG-1515)
+
 ### Security
 
 - deps: build with Go 1.26.9 (from 1.26.8) and bump `golang.org/x/net` to
@@ -2418,6 +2493,31 @@ any binary:
   logging. Both are indirect dependencies, and both versions were already
   selected at v0.13.0. The bump clears the release's govulncheck gate without
   widening its allowlist. (ENG-1119, ENG-1120)
+
+- docker-backend: every lease now runs on its own Docker network, `fred-<lease_uuid>`,
+  instead of one network shared by all leases of a tenant. On the shared
+  network each service name resolved to that service in every lease of the
+  tenant, so two leases running the same stack answered each other's `db`, and
+  any lease could reach another by address or container name. A tenant that
+  hosts several customers under one address therefore exposed those customers
+  to each other. Service names now resolve only within the lease, and leases
+  cannot reach each other, including leases of the same tenant. Fred creates
+  the lease's network itself and attaches containers only to that network's
+  verified ID: an existing network of that name is used only when it carries
+  this lease's and backend's ownership labels, and any other, foreign or
+  unlabeled, fails the launch as a backend error without being attached to,
+  adopted, relabeled or removed. Before each container create and start, Fred
+  confirms that the verified ID still resolves to that network, since Docker
+  falls back to a network named with the ID once the original is gone. Compose
+  never creates, removes or reconnects a network. The network stays through re-deploys and is reclaimed by the
+  network worker after the lease is gone, only once the backend tracks no
+  provision for the lease and no command holds its fence, and only by its
+  verified ID. The worker likewise removes a legacy per-tenant network only
+  when it carries that tenant's and this backend's labels, by its verified
+  ID. Fred no longer creates per-tenant networks. A running lease
+  stays on its tenant network until its containers are next recreated
+  (restart, update, custom-domain change, restore or re-provision); that
+  recreate moves every service of the lease, including stopped ones.
 
 ## [0.13.0] - 2026-08-20
 

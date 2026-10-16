@@ -641,9 +641,21 @@ func bindTestBackendRuntime(
 	router BackendRouter,
 ) *placement.ExecutionCoordinator {
 	t.Helper()
+	return bindTestBackendRuntimeWithPolicy(t, coordinator, router, placement.NoBillingOnlySKUs())
+}
+
+// bindTestBackendRuntimeWithPolicy binds the runtime with an explicit billing
+// policy, for tests that exercise billing-only leases.
+func bindTestBackendRuntimeWithPolicy(
+	t testing.TB,
+	coordinator *placement.OperationCoordinator,
+	router BackendRouter,
+	policy *placement.BillingPolicy,
+) *placement.ExecutionCoordinator {
+	t.Helper()
 	fixture := newTestInventoryRouter(router)
 	control := &testProviderControlPlane{}
-	execution, err := coordinator.BindBackendRuntime(fixture, control)
+	execution, err := coordinator.BindBackendRuntime(fixture, control, policy)
 	require.NoError(t, err)
 	testExecutionInventoryRouters.Store(execution, fixture)
 	testExecutionProviderControls.Store(execution, control)
@@ -1134,12 +1146,30 @@ func testBackendRequestSnapshot(
 	store *placement.Store,
 ) placement.BackendRequestSnapshot {
 	t.Helper()
-	snapshot, err := store.MintBackendRequestSnapshot(
-		"tenant-test",
+	snapshot, err := store.MintBackendRequestSnapshot(testDeployableLease(
+		t, "snapshot-lease", "tenant-test",
 		[]backend.LeaseItem{{SKU: "sku-test", Quantity: 1, ServiceName: "app"}},
-	)
+	))
 	require.NoError(t, err)
 	return snapshot
+}
+
+// testDeployableLease classifies a lease built from backend items under the
+// explicit empty policy, as every backend request mint requires.
+func testDeployableLease(
+	t testing.TB, leaseUUID, tenant string, items []backend.LeaseItem,
+) placement.DeployableLease {
+	t.Helper()
+	lease := billingtypes.Lease{Uuid: leaseUUID, Tenant: tenant}
+	for _, item := range items {
+		lease.Items = append(lease.Items, billingtypes.LeaseItem{
+			SkuUuid: item.SKU, Quantity: uint64(item.Quantity),
+			ServiceName: item.ServiceName, CustomDomain: item.CustomDomain,
+		})
+	}
+	deployable, ok := placement.NoBillingOnlySKUs().Classify(&lease).Deployable()
+	require.True(t, ok)
+	return deployable
 }
 
 func beginTestNewPlacementAttempt(
@@ -1579,9 +1609,21 @@ func testReconcilerPlacement(
 	coordinator *placement.OperationCoordinator,
 ) (ReconcilerPlacement, *placement.OperationCoordinator, *placement.ExecutionCoordinator) {
 	t.Helper()
+	return testReconcilerPlacementWithPolicy(t, store, router, registry, coordinator, placement.NoBillingOnlySKUs())
+}
+
+func testReconcilerPlacementWithPolicy(
+	t testing.TB,
+	store any,
+	router BackendRouter,
+	registry *testOperationRegistry,
+	coordinator *placement.OperationCoordinator,
+	policy *placement.BillingPolicy,
+) (ReconcilerPlacement, *placement.OperationCoordinator, *placement.ExecutionCoordinator) {
+	t.Helper()
 	bindExecution := func(coordinator *placement.OperationCoordinator) *placement.ExecutionCoordinator {
 		t.Helper()
-		return bindTestBackendRuntime(t, coordinator, router)
+		return bindTestBackendRuntimeWithPolicy(t, coordinator, router, policy)
 	}
 	if store == nil {
 		authority := newTestPlacementAuthority(t)

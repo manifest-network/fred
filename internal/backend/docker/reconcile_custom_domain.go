@@ -102,6 +102,10 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 	if err != nil {
 		return fmt.Errorf("resolve custom-domain lifecycle authority: %w", err)
 	}
+	route, err := customDomainRoute(overrides)
+	if err != nil {
+		return err
+	}
 	payload, err := json.Marshal(overrides)
 	if err != nil {
 		return fmt.Errorf("encode custom-domain maintenance request: %w", err)
@@ -117,7 +121,7 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 	if err != nil {
 		return fmt.Errorf("construct custom-domain maintenance authority: %w", err)
 	}
-	return b.routeReplaceRestart(ctx, request, overrides)
+	return b.routeReplaceRestart(ctx, request, route)
 }
 
 // matchedDomain pairs a chain item's desired custom_domain with the matched

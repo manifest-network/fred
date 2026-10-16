@@ -27,6 +27,7 @@ import (
 	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/inventory"
+	"github.com/manifest-network/fred/internal/provisioner/leaseitems"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/storeauthority"
@@ -421,16 +422,21 @@ func newBackendRequestSnapshot(
 	}, nil
 }
 
-// MintBackendRequestSnapshot binds tenant and items to this Store's exact
-// durable provider authority. The provider UUID is deliberately not an input,
-// making a cross-provider backend request unconstructable at production call
-// sites. The zero Store and withdrawn runtime authority fail closed.
-func (s *Store) MintBackendRequestSnapshot(
-	tenant string,
-	items []backend.LeaseItem,
-) (BackendRequestSnapshot, error) {
+// MintBackendRequestSnapshot binds a deployable lease's tenant and items to
+// this Store's exact durable provider authority. The provider UUID is
+// deliberately not an input, making a cross-provider backend request
+// unconstructable at production call sites. The lease must be a
+// DeployableLease, which only BillingPolicy.Classify issues: every provision
+// and restore request, fresh or redelivered from a durable attempt, is
+// rebuilt from a snapshot minted here, so a billing-only lease can never
+// reach a backend. The zero Store, the zero DeployableLease and withdrawn
+// runtime authority fail closed.
+func (s *Store) MintBackendRequestSnapshot(lease DeployableLease) (BackendRequestSnapshot, error) {
 	if s == nil {
 		return BackendRequestSnapshot{}, errors.New("placement store is required")
+	}
+	if !lease.valid() {
+		return BackendRequestSnapshot{}, errors.New("backend request needs a lease classified as deployable")
 	}
 	if err := s.reattestRuntimeAuthority(); err != nil {
 		return BackendRequestSnapshot{}, err
@@ -438,7 +444,7 @@ func (s *Store) MintBackendRequestSnapshot(
 	s.mu.RLock()
 	providerUUID := s.providerUUID
 	s.mu.RUnlock()
-	return newBackendRequestSnapshot(tenant, providerUUID, items)
+	return newBackendRequestSnapshot(lease.lease.Tenant, providerUUID, leaseitems.FromLease(&lease.lease))
 }
 
 // Valid reports whether the snapshot contains one complete exact request.

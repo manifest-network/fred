@@ -361,6 +361,7 @@ func newFixture(t *testing.T, inventoryReady bool) *fixture {
 	result.runtime = result.coordinator.RuntimeController()
 	result.execution, err = result.coordinator.BindBackendRuntime(result.backends,
 		restoreReconciliationChain{targetReader: result.targets},
+		placement.NoBillingOnlySKUs(),
 	)
 	require.NoError(t, err)
 	result.reconciliation, err = result.execution.ReconciliationCoordinator(nil, nil)
@@ -570,6 +571,7 @@ func TestNewServiceNormalizesNilCapabilities(t *testing.T) {
 		testBackend: &fakeBackend{name: testBackend},
 	},
 		restoreReconciliationChain{targetReader: targets},
+		placement.NoBillingOnlySKUs(),
 	)
 	require.NoError(t, err)
 	restoreCoordinator, err := execution.RestoreCoordinator(nil)
@@ -623,7 +625,7 @@ func TestRestoreCoordinatorRejectsProviderAndChainSplices(t *testing.T) {
 		"typed-nil control plane": typedNilControl,
 	} {
 		t.Run(name, func(t *testing.T) {
-			execution, bindErr := base.BindBackendRuntime(backendLookup{}, control)
+			execution, bindErr := base.BindBackendRuntime(backendLookup{}, control, placement.NoBillingOnlySKUs())
 			assert.Error(t, bindErr)
 			assert.Nil(t, execution)
 			assert.Nil(t, base.RuntimeController().PendingLeaseUUIDs())

@@ -43,6 +43,9 @@ type composeMutationSink interface {
 // composeUpOpts configures a Compose Up operation.
 type composeUpOpts struct {
 	ForceRecreate bool // force recreate even if config unchanged (for restart)
+	// network is the wire policy of this launch, set only by launchCompose
+	// from the project's own verified network authority.
+	network launchNetworkPolicy
 }
 
 // composeContainerSummary holds container info from a Compose PS operation.
@@ -123,7 +126,7 @@ func newComposeService(dockerHost string, images *imageexec.Admitter, profiles i
 			defer transport.CloseIdleConnections()
 			// This client belongs exclusively to this invocation. Even Compose
 			// work which detaches its context still crosses the same closed scope.
-			httpClient := &http.Client{Transport: daemonLaunchTransport{next: transport, scope: scope, profiles: profiles}, CheckRedirect: mobyclient.CheckRedirect}
+			httpClient := &http.Client{Transport: daemonLaunchTransport{next: transport, scope: scope, profiles: profiles, network: opts.network}, CheckRedirect: mobyclient.CheckRedirect}
 			engine, err := newComposeEngine(dockerHost, httpClient)
 			if err != nil {
 				return scope.finish(err)
@@ -138,7 +141,10 @@ func newComposeService(dockerHost string, images *imageexec.Admitter, profiles i
 }
 
 // newComposeReadHTTPClient is the HTTP client of the retained Compose engine,
-// which only lists and tears down projects.
+// which only lists and tears down projects. It never creates a container and
+// never creates, removes or reconnects a network: Compose's teardown rebuilds a
+// project's networks from Compose labels alone, which do not prove that Fred
+// owns a network.
 func newComposeReadHTTPClient(next http.RoundTripper) *http.Client {
 	return &http.Client{Transport: daemonNoCreateTransport{next: next}, CheckRedirect: mobyclient.CheckRedirect}
 }
@@ -157,6 +163,9 @@ type daemonNoCreateTransport struct {
 func (t daemonNoCreateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if daemonContainerCreateRequest(req) {
 		return refuseCreate(req, errComposeReadEngineCreate)
+	}
+	if daemonNetworkMutationRequest(req) {
+		return refuseCreate(req, errComposeNetworkMutationRefused)
 	}
 	return t.next.RoundTrip(req)
 }
@@ -215,7 +224,7 @@ func (s *composeService) launch(ctx context.Context, project imageexec.PreparedP
 }
 
 func (s *composeService) Down(ctx context.Context, projectName string, timeout time.Duration) error {
-	return s.down(ctx, projectName, composeapi.DownOptions{
+	err := s.down(ctx, projectName, composeapi.DownOptions{
 		Timeout:       &timeout,
 		RemoveOrphans: true,
 		// Reap anonymous volumes attached to the project's containers (ENG-372).
@@ -226,6 +235,16 @@ func (s *composeService) Down(ctx context.Context, projectName string, timeout t
 		// this, every close leaks one anonymous volume per such container.
 		Volumes: true,
 	})
+	// Compose removes every container before it touches a network, and it
+	// rebuilds the networks it removes from Compose labels alone. The read
+	// engine refuses those removals, so a refusal here means the containers
+	// are gone and a network Compose matched by label was left in place. Fred
+	// creates lease networks without Compose labels and reclaims them through
+	// its own ownership-checked sweep.
+	if errors.Is(err, errComposeNetworkMutationRefused) {
+		return nil
+	}
+	return err
 }
 
 func (s *composeService) PS(ctx context.Context, projectName string) ([]composeContainerSummary, error) {

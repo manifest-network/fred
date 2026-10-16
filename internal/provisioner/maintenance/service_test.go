@@ -136,7 +136,7 @@ func maintenanceCoordinatorWithRuntimeForTest(
 	require.NoError(t, err)
 	inventoryRuntime := newMaintenanceInventoryRuntime(backends)
 	control := maintenanceReconciliationChain{MaintenanceLeaseReader: leases}
-	execution, err := coordinator.BindBackendRuntime(inventoryRuntime, control)
+	execution, err := coordinator.BindBackendRuntime(inventoryRuntime, control, placement.NoBillingOnlySKUs())
 	require.NoError(t, err)
 	verifier, consumer := hmacauth.NewCallbackProofBoundary()
 	callbacks, err := execution.AuthenticatedCallbackCoordinator(consumer)
@@ -851,6 +851,7 @@ func TestConstructionRejectsRuntimeWhoseNamesDifferFromDurableTopology(t *testin
 	resolved := &fakeBackend{name: "backend-b"}
 	execution, err := coordinator.BindBackendRuntime(fakeRouter{backend: resolved},
 		maintenanceReconciliationChain{MaintenanceLeaseReader: testChain(testLeaseA)},
+		placement.NoBillingOnlySKUs(),
 	)
 	require.ErrorIs(t, err, placement.ErrInvalidBackendTopology)
 	assert.Nil(t, execution, "atomic binding cannot publish a partially authorized runtime")

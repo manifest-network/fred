@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
@@ -49,7 +50,8 @@ func newLogAdmissionAPIWithChain(t *testing.T, timeout time.Duration, tenantRate
 	})
 	require.NoError(t, err)
 	server, err := NewServer(ServerConfig{
-		ProviderUUID: testutil.ValidUUID2, Bech32Prefix: "manifest", RequestTimeout: timeout,
+		BillingPolicy: placement.NoBillingOnlySKUs(),
+		ProviderUUID:  testutil.ValidUUID2, Bech32Prefix: "manifest", RequestTimeout: timeout,
 		WriteTimeout: 7 * time.Second,
 		RateLimitRPS: 100, RateLimitBurst: 100, TenantRateLimitRPS: tenantRate, TenantRateLimitBurst: 100,
 	}, ServerDeps{

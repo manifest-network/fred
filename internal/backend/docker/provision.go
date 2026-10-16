@@ -1038,24 +1038,26 @@ func (b *Backend) doProvisionPhysical(
 		pulledImages[svc.Image] = true
 	}
 
+	// The lease's own network, created or verified as this lease's on this
+	// backend, before any image-setup Step: a same-named network Fred does not
+	// own then refuses the provision as a definite backend failure, with no
+	// substrate effect to recover.
+	var leaseNetwork leaseNetworkAuthority
+	if b.cfg.IsNetworkIsolation() {
+		var netErr error
+		if leaseNetwork, netErr = mutations.ensureLeaseNetwork(ctx); netErr != nil {
+			logger.Error("lease network setup failed", "error", netErr)
+			failure = &physicalOperationError{callback: "lease network setup failed", reason: backend.ReasonInternal, cause: netErr}
+			return
+		}
+	}
+
 	// Per-service image setup (inspect, user resolution, writable paths).
 	imageSetups, setupErr := b.inspectImagesForSetup(mutations, ctx, stack, req.Items)
 	if setupErr != nil {
 		logger.Error("image setup failed", "error", setupErr)
 		failure = &physicalOperationError{callback: "image inspect failed", reason: backend.ReasonInternal, cause: setupErr}
 		return
-	}
-
-	// Resolve tenant network name (not Docker network ID — Compose needs the name).
-	var networkName string
-	if b.cfg.IsNetworkIsolation() {
-		netErr := b.ensureTenantNetworkWith(mutations, ctx, req.Tenant)
-		if netErr != nil {
-			logger.Error("failed to create tenant network", "error", netErr)
-			failure = &physicalOperationError{callback: "tenant network setup failed", reason: backend.ReasonInternal, cause: netErr}
-			return
-		}
-		networkName = TenantNetworkName(req.Tenant)
 	}
 
 	// Pre-create volumes and build volume binds per service/instance.
@@ -1079,7 +1081,7 @@ func (b *Backend) doProvisionPhysical(
 		Items:                req.Items,
 		Profiles:             profiles,
 		ImageSetups:          imageSetups,
-		NetworkName:          networkName,
+		Network:              leaseNetwork,
 		Cfg:                  &b.cfg,
 		Ingress:              b.cfg.Ingress,
 	}

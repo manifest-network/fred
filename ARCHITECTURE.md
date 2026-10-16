@@ -2173,7 +2173,7 @@ database acquisition and filesystem waits remain synchronous. See
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `fred_payload_uploads_total` | counter | `outcome` | Uploads (`success`, `invalid_auth`, `hash_mismatch`, `conflict`, `error`) |
+| `fred_payload_uploads_total` | counter | `outcome` | Uploads (`success`, `invalid_auth`, `billing_only`, `hash_mismatch`, `conflict`, `error`) |
 | `fred_payload_stored_count` | gauge | — | Payloads currently stored |
 | `fred_payload_size_bytes` | histogram | — | Upload size distribution |
 | `fred_payload_leases_awaiting` | gauge | — | Leases waiting for payload upload |
@@ -2202,7 +2202,7 @@ database acquisition and filesystem waits remain synchronous. See
 | Metric | Emitted by | `component` values |
 |---|---|---|
 | `fred_background_cleanup_panics_total` | providerd | `token` |
-| | docker-backend | `callback`, `diagnostics`, `releases`, `retention`, `docker_reconciliation`, `docker_network_reclamation`, `docker_projid_audit`, `docker_seccomp_census`, `docker_volume_delete_hold` |
+| | docker-backend | `callback`, `diagnostics`, `releases`, `retention`, `docker_reconciliation`, `docker_network_reclamation`, `docker_projid_audit`, `docker_seccomp_census`, `docker_runtime_inventory`, `docker_volume_delete_hold`, `docker_runtime_refresh` |
 | | k3s-backend | `callback`, `diagnostics`, `releases` (no retention store — retention is docker-only, ENG-325) |
 | `fred_background_goroutine_panics_total` | providerd | `payload_writer`, `ack_batcher`, `withdraw_scheduler`, `timeout_checker_sweep`, `timeout_checker_candidate` |
 | | docker-backend | `callback_replay`, `container_death_overflow_reporter` |
@@ -2232,7 +2232,7 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_maintenance_receipts_unverifiable_total` | counter | — | Per recovery pass, failed maintenance receipts whose target release is missing or divergent (for example after release-history compaction). Each grants no cleanup authority, so a late container for that generation is kept; recovery for every other lease continues |
 | `fred_docker_backend_maintenance_recovery_deferred_total` | counter | — | Lease-local maintenance observation conflicts deferred while sibling recovery continues; preserves the exact intent and reservation |
 | `fred_docker_backend_operation_recovery_deferred_total` | counter | — | Provision and restore recoveries deferred because the lease's container evidence could not be classified; the journal row keeps the lease fenced and the next pass retries it |
-| `fred_docker_backend_network_reclamation_total` | counter | `outcome` | Independent bounded network reclamation: `removed`, `absent`, `in_use`, `tenant_active`, `tenant_busy`, `error`, `list_error`, `budget_exhausted`. Only `removed` represents deletion |
+| `fred_docker_backend_network_reclamation_total` | counter | `outcome` | Independent bounded network reclamation: `removed`, `absent`, `in_use`, `lease_active`, `lease_busy`, `tenant_active`, `error`, `list_error`, `budget_exhausted`. Only `removed` represents deletion |
 | `fred_docker_backend_terminal_substrate_pending_containers` | gauge | receipt | Last late-container count for permanent `closed`/`failed_operation` receipts; nonzero withholds this backend’s pool capacity/readiness until strict absence |
 | `fred_docker_backend_terminal_substrate_cleanup_retries_total` | counter | receipt | Transient late-container cleanup retries; daemon stays alive and exact terminal receipts remain |
 | `fred_docker_backend_image_helpers_unsettled` | gauge | reason | Image-inspection helper receipts left after the latest recovery pass and owned by no live inspection: `unknown_create` (the Create response was never durably recorded, so the receipt is kept in case the container appears late) and `cleanup_pending` (removal failed or was not reached; retried every pass). On the containerd image store, nonzero blocks image ingestion and image GC on this backend. Kept unchanged while the journal cannot be read |
@@ -2274,6 +2274,10 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_volume_bind_symlink_rejected_total` | counter | — | Stateful-volume binds refused because the leaf of a declared image VOLUME inside the managed volume is a symlink, which fails that launch (ENG-795). Only a tenant that planted the link in its own volume can cause one. It counts attempts, not wedged volumes: an image that does not declare that path still launches on the volume and can remove the link |
 | `fred_docker_backend_seccomp_profile_refusals_total` | counter | `sink` | Launches refused because the tenant seccomp profile could not be applied, by creation sink: `provision`, `restore`, `restart`, `update`, `custom_domain`, `compensation`, `inspection`. Pre-initialized; any increase is a provider fault (ENG-1118) |
 | `fred_docker_backend_tenant_seccomp_profile_ready` | gauge | — | 1 when the last request for the tenant seccomp profile, from any sink, found it usable and the Docker daemon last reported seccomp support; 0 otherwise |
+| `fred_docker_backend_runtime_stale_leases` | gauge | — | Ready leases with a container created under an older runtime contract, from the last read (every `reconcile_interval` and every runtime refresh request) |
+| `fred_docker_backend_runtime_shared_network_leases` | gauge | — | Leases with a container on a Docker network shared with another lease's container, from the same reads |
+| `fred_docker_backend_runtime_inventory_total` | counter | `outcome` | Periodic runtime inventory passes: `ok` or `error` |
+| `fred_docker_backend_runtime_refresh_total` | counter | `outcome` | Per-lease final outcome of each operator-started runtime refresh run: `refreshed`, `failed` or `skipped` |
 | `fred_docker_backend_tenant_containers_without_current_seccomp` | gauge | — | Running, restarting or paused managed containers whose effective seccomp profile is not the current tenant profile, from the last completed census (one at startup, then every 10 minutes). A failed census keeps the previous value. Restarting or updating a lease recreates its containers with the current profile |
 | `fred_docker_backend_seccomp_census_total` | counter | `outcome` | Tenant seccomp census passes: `ok` (published a count) or `error` (kept the previous one; a recovered panic also counts as `error`). Pre-initialized |
 

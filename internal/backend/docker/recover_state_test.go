@@ -241,8 +241,10 @@ type mockDockerClient struct {
 	CreateCompensationOutcomeFn   func(context.Context, imageexec.Image, compensationContainer) (string, daemonLaunchOutcome)
 	StartCompensationOutcomeFn    func(context.Context, string, time.Duration) daemonLaunchOutcome
 	ReadmitCompensationImageFn    func(context.Context, compensationContainerRecord) (imageexec.Image, error)
-	EnsureTenantNetworkFn         func(ctx context.Context, tenant string) (string, error)
-	RemoveTenantNetworkIfEmptyFn  func(ctx context.Context, tenant string) (tenantNetworkRemoval, error)
+	RemoveTenantNetworkIfEmptyFn  func(ctx context.Context, tenant string) (networkRemoval, error)
+	InspectLeaseNetworkFn         func(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, bool, error)
+	CreateLeaseNetworkFn          func(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, error)
+	RemoveLeaseNetworkIfEmptyFn   func(ctx context.Context, authority leaseNetworkAuthority) (networkRemoval, error)
 	ListIdleManagedNetworksFn     func(ctx context.Context) ([]networktypes.Inspect, error)
 	ResolveImageUserFn            func(ctx context.Context, imageName string, userOverride string) (int, int, error)
 	DetectVolumeOwnerFn           func(ctx context.Context, imageName string, volumePaths []string) (int, int, error)
@@ -383,14 +385,28 @@ func (m *mockDockerClient) ListManagedContainersStrict(ctx context.Context) ([]C
 	panic("unexpected call to ListManagedContainersStrict")
 }
 
-func (m *mockDockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (string, error) {
-	if m.EnsureTenantNetworkFn != nil {
-		return m.EnsureTenantNetworkFn(ctx, tenant)
+func (m *mockDockerClient) InspectLeaseNetwork(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, bool, error) {
+	if m.InspectLeaseNetworkFn != nil {
+		return m.InspectLeaseNetworkFn(ctx, leaseUUID)
 	}
-	panic("unexpected call to EnsureTenantNetwork")
+	panic("unexpected call to InspectLeaseNetwork")
 }
 
-func (m *mockDockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
+func (m *mockDockerClient) CreateLeaseNetwork(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, error) {
+	if m.CreateLeaseNetworkFn != nil {
+		return m.CreateLeaseNetworkFn(ctx, leaseUUID)
+	}
+	panic("unexpected call to CreateLeaseNetwork")
+}
+
+func (m *mockDockerClient) RemoveLeaseNetworkIfEmpty(ctx context.Context, authority leaseNetworkAuthority) (networkRemoval, error) {
+	if m.RemoveLeaseNetworkIfEmptyFn != nil {
+		return m.RemoveLeaseNetworkIfEmptyFn(ctx, authority)
+	}
+	panic("unexpected call to RemoveLeaseNetworkIfEmpty")
+}
+
+func (m *mockDockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (networkRemoval, error) {
 	if m.RemoveTenantNetworkIfEmptyFn != nil {
 		return m.RemoveTenantNetworkIfEmptyFn(ctx, tenant)
 	}
@@ -733,10 +749,10 @@ func TestNetworkCleanup_UsesOneAggregateBudget(t *testing.T) {
 				{Name: "fred-tenant-b", Labels: map[string]string{LabelTenant: "tenant-b"}},
 			}, nil
 		},
-		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, _ string) (tenantNetworkRemoval, error) {
+		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, _ string) (networkRemoval, error) {
 			removals.Add(1)
 			<-ctx.Done()
-			return tenantNetworkRemovalUnknown, ctx.Err()
+			return networkRemovalUnknown, ctx.Err()
 		},
 	}
 	b := newBackendForTest(mock, nil)

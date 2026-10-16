@@ -15,7 +15,7 @@ import (
 
 // IngressConfig holds configuration for reverse proxy integration.
 // When Enabled, containers with routable TCP ports get proxy labels
-// pointing Traefik at the per-tenant network for auto-discovery.
+// pointing Traefik at the lease's own network for auto-discovery.
 // Requires network_isolation to be enabled (validated at config load time).
 // Currently generates Traefik-specific labels; the config layer is
 // proxy-agnostic so a future backend swap only changes label generation.
@@ -203,7 +203,7 @@ func SelectIngressPort(ports map[string]manifest.PortConfig) (int, bool) {
 
 // TraefikLabels generates the Docker labels that Traefik uses for
 // auto-discovery and routing configuration. networkName is the
-// per-tenant Docker network that Traefik should use to reach the
+// lease's Docker network that Traefik should use to reach the
 // container (set via traefik.docker.network). This is the only
 // Traefik-specific function; everything else is proxy-agnostic.
 //

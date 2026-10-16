@@ -3,6 +3,8 @@ package docker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2448,12 +2450,6 @@ type fakeDocker struct {
 	containers []ContainerInfo             // returned by ListManagedContainers
 	mounts     map[string][]ContainerMount // containerID → mounts (test-only)
 
-	// EnsureTenantNetwork hook. Default is a silent-success no-op so tests
-	// that flip cfg.NetworkIsolation on (e.g. the migration-network test)
-	// don't have to wire the mock directly. Tests that need to *capture*
-	// the call can override this with a closure.
-	ensureTenantNetwork func(ctx context.Context, tenant string) (string, error)
-
 	// RemoveContainer hook. Default (nil) is silent success. Tests that need
 	// to *capture* removals (e.g. the -prev grace-cleanup test) override this.
 	removeContainer func(ctx context.Context, name string) error
@@ -2723,19 +2719,13 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 			}
 			return nil
 		},
-		EnsureTenantNetworkFn: func(ctx context.Context, tenant string) (string, error) {
-			if state.ensureTenantNetwork != nil {
-				return state.ensureTenantNetwork(ctx, tenant)
-			}
-			// Default: silent success. Mirrors production's idempotency:
-			// a network create on an existing network returns the existing
-			// ID without error.
-			return "net-id-" + tenant, nil
-		},
 		// The independent network sweep runs when isolation is enabled.
 		// Default to a clean network list so migration tests
 		// that enable isolation don't crash; tests that need a non-empty
 		// list can override on the mock directly.
+		InspectLeaseNetworkFn: func(_ context.Context, leaseUUID string) (leaseNetworkAuthority, bool, error) {
+			return testLeaseNetworkAuthority(leaseUUID, "docker"), true, nil
+		},
 		ListIdleManagedNetworksFn: func(_ context.Context) ([]networktypes.Inspect, error) {
 			return nil, nil
 		},
@@ -3004,4 +2994,17 @@ func requireAccepted(t testing.TB, enqueue func() bool, msgAndArgs ...any) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// testLeaseNetworkID is the deterministic full network ID a test lease network
+// gets: a full 64-hex ID, so it is a valid authority target.
+func testLeaseNetworkID(leaseUUID string) string {
+	sum := sha256.Sum256([]byte("lease-network/" + leaseUUID))
+	return hex.EncodeToString(sum[:])
+}
+
+// testLeaseNetworkAuthority is authority over the test lease network, as
+// DockerClient would mint it after verifying the network.
+func testLeaseNetworkAuthority(leaseUUID, backendName string) leaseNetworkAuthority {
+	return leaseNetworkAuthority{leaseUUID: leaseUUID, backendName: backendName, networkID: testLeaseNetworkID(leaseUUID)}
 }

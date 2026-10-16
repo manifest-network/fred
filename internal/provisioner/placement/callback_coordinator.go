@@ -135,9 +135,18 @@ func (authority *TimeoutCoordinator) Settle(
 	}()
 
 	result.metadata = claim.Metadata()
-	rejected, txHashes, err := authority.controlPlane.rejectLease(
-		ctx, result.metadata.LeaseUUID(), "callback timeout",
+	var (
+		rejected uint64
+		txHashes []string
 	)
+	// A lease the current policy classifies as billing-only is never
+	// rejected. The refusal takes the same exact reread as a failed
+	// rejection: it retries while the lease is PENDING and settles once the
+	// lease is no longer pending.
+	endable, err := authority.controlPlane.mayEndOperation(result.metadata)
+	if err == nil {
+		rejected, txHashes, err = authority.controlPlane.rejectLease(ctx, endable, "callback timeout")
+	}
 	result.rejected = rejected
 	result.txHashes = slices.Clone(txHashes)
 	terminal := false

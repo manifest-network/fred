@@ -540,6 +540,8 @@ func (b *Backend) handoffMaintenanceAdmission(
 		command, reply, err = leasesm.NewUpdateCommand(lifetime, target)
 	case shared.MaintenanceIntentCustomDomain:
 		command, reply, err = leasesm.NewCustomDomainCommand(lifetime, target)
+	case shared.MaintenanceIntentRuntimeRefresh:
+		command, reply, err = leasesm.NewRuntimeRefreshCommand(lifetime, target)
 	default:
 		err = fmt.Errorf("unsupported durable maintenance kind %q", target.Intent().Kind())
 	}

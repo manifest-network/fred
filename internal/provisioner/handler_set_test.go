@@ -1068,7 +1068,7 @@ func requireProvisionCallbackOperation(
 	require.NotNil(t, store)
 	coordinator := tracker.coordinator
 	require.NotNil(t, coordinator)
-	snapshot, err := store.MintBackendRequestSnapshot(tenant, items)
+	snapshot, err := store.MintBackendRequestSnapshot(testDeployableLease(t, leaseUUID, tenant, items))
 	require.NoError(t, err)
 	id := beginTestNewPlacementAttemptWithSnapshot(
 		t, store, callbackProvisionCoordinator(t, store, coordinator, backendName),

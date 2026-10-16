@@ -181,6 +181,7 @@ type ManagerConfig struct {
 	AckLaneCount          int                            // Number of parallel ack lanes (default: 1)
 	AckFlushTimeout       time.Duration                  // Complete chain query/broadcast/fallback budget per ack flush
 	CallbackProofConsumer hmacauth.CallbackProofConsumer // Exact API verifier boundary accepted for settlement.
+	BillingPolicy         *placement.BillingPolicy       // Required: classifies each lease before any deployment or acknowledgment
 }
 
 // NewManager creates a new provision manager with Watermill routing.
@@ -196,6 +197,9 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ManagerCh
 	}
 	if cfg.PlacementStore == nil {
 		return nil, ErrPlacementStoreUnavailable
+	}
+	if cfg.BillingPolicy == nil {
+		return nil, errors.New("billing policy is required")
 	}
 	if err := cfg.PlacementStore.VerifyProviderUUID(cfg.ProviderUUID); err != nil {
 		return nil, fmt.Errorf("verify placement provider authority: %w", err)
@@ -275,7 +279,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ManagerCh
 	if err != nil {
 		return nil, fmt.Errorf("bind operation settlement coordinator: %w", err)
 	}
-	executionCoordinator, err := operationCoordinator.BindBackendRuntime(router, providerControlPlane)
+	executionCoordinator, err := operationCoordinator.BindBackendRuntime(router, providerControlPlane, cfg.BillingPolicy)
 	if err != nil {
 		return nil, fmt.Errorf("bind backend execution coordinator: %w", err)
 	}

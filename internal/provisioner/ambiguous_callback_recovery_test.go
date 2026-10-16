@@ -107,6 +107,7 @@ func TestManager_RecoversAmbiguousProvisionCallbackAcrossRegistryAndStoreRestart
 			require.NoError(t, err)
 			configureTestPlacementTopology(t, store1, []string{backendName})
 			manager1, err := NewManager(ManagerConfig{
+				BillingPolicy:         placement.NoBillingOnlySKUs(),
 				ProviderUUID:          providerUUID,
 				PlacementStore:        store1,
 				CallbackProofConsumer: callbackTestProofConsumer,
@@ -157,6 +158,7 @@ func TestManager_RecoversAmbiguousProvisionCallbackAcrossRegistryAndStoreRestart
 			)
 			require.NoError(t, err)
 			manager2, err := NewManager(ManagerConfig{
+				BillingPolicy:         placement.NoBillingOnlySKUs(),
 				ProviderUUID:          providerUUID,
 				PlacementStore:        store2,
 				AckBatchInterval:      time.Millisecond,

@@ -417,8 +417,9 @@ host_address: ""
 # These settings control multi-tenant security hardening for containers.
 # All defaults are secure-by-default.
 
-# Enable per-tenant Docker network isolation. Each tenant's containers
-# are placed in a separate bridge network. Cross-tenant isolation is
+# Enable per-lease Docker network isolation. Each lease's containers are
+# placed in the lease's own bridge network, so leases cannot reach each other,
+# even leases of the same tenant. Isolation between bridge networks is
 # provided by Docker's DOCKER-ISOLATION iptables chains. Default: true.
 # network_isolation: true
 
@@ -429,6 +430,14 @@ host_address: ""
 # Maximum number of PIDs allowed in each container. Prevents fork bombs.
 # Default: 256.
 # container_pids_limit: 256
+
+# Most leases one operator-started runtime refresh (POST /runtime_refresh)
+# recreates at once. A refresh recreates every healthy lease whose containers
+# were created under an older runtime contract, with the same release and
+# data, so it runs under the current one (for example, on its own network).
+# Nothing starts a refresh automatically. 0 disables the endpoint. Default: 4;
+# maximum 64.
+# runtime_refresh_max_concurrency: 4
 
 # Size in MB for tmpfs mounts (/tmp, /run, image VOLUME overrides and tenant
 # tmpfs) and, separately, the quota/pool scratch allowance pinned for every
@@ -534,10 +543,10 @@ reconcile_interval: 5m
 # =============================================================================
 # Reverse proxy integration via Traefik. When enabled, containers with routable
 # TCP ports automatically get Traefik discovery labels. Traefik routes to
-# containers via the per-tenant network (traefik.docker.network), so no shared
+# containers via each lease's own network (traefik.docker.network), so no shared
 # ingress network is needed. Requires network_isolation: true (the default).
 # Note: Traefik must run with host networking (or equivalent access) to reach
-# containers on per-tenant bridge networks.
+# containers on per-lease bridge networks.
 #
 # Routers are emitted with tls=true but no certresolver. The wildcard
 # certificate for wildcard_domain must be provisioned at the Traefik level

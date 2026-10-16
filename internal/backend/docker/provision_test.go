@@ -1197,22 +1197,19 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	}))
 	defer callbackServer.Close()
 
-	networkCreated := false
+	// The launch creates or verifies the lease's own network through the
+	// guarded client, then attaches to it by its verified ID.
+	ensured := 0
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
 		},
-		EnsureTenantNetworkFn: func(ctx context.Context, tenant string) (string, error) {
-			networkCreated = true
-			assert.Equal(t, "tenant-a", tenant)
-			return "net-123", nil
+		InspectLeaseNetworkFn: func(context.Context, string) (leaseNetworkAuthority, bool, error) {
+			return leaseNetworkAuthority{}, false, nil
 		},
-		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
-			assert.NotNil(t, params.NetworkConfig, "network config should be set")
-			return "container-1", nil
-		},
-		StartContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
-			return nil
+		CreateLeaseNetworkFn: func(_ context.Context, leaseUUID string) (leaseNetworkAuthority, error) {
+			ensured++
+			return testLeaseNetworkAuthority(leaseUUID, "docker"), nil
 		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
@@ -1229,6 +1226,13 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	b.provisions[durableCallbackTestLeaseUUID].CallbackURL = callbackServer.URL
 	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	compose := b.compose.(*mockComposeExecutor)
+	nominalUp := compose.UpFn
+	var launched *composetypes.Project
+	compose.UpFn = func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+		launched = project
+		return nominalUp(ctx, project, opts)
+	}
 
 	manifest, _ := manifest.ParseManifest(validManifestJSON("nginx:latest"))
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
@@ -1237,7 +1241,15 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	req.CallbackURL = testOperationCallbackURL(callbackServer.URL)
 	b.doProvisionAndFire(t, context.Background(), req, manifest, profiles, b.logger)
 
-	assert.True(t, networkCreated)
+	require.NotNil(t, launched)
+	require.Equal(t, 1, ensured)
+	require.Contains(t, launched.Networks, leaseNetworkKey)
+	assert.Equal(t, testLeaseNetworkID(durableCallbackTestLeaseUUID), launched.Networks[leaseNetworkKey].Name,
+		"the project names the lease network by its verified ID")
+	assert.True(t, bool(launched.Networks[leaseNetworkKey].External), "Compose must neither create nor remove it")
+	for name, svc := range launched.Services {
+		require.Contains(t, svc.Networks, leaseNetworkKey, name)
+	}
 
 	b.provisionsMu.RLock()
 	prov := b.provisions[durableCallbackTestLeaseUUID]
@@ -1490,22 +1502,22 @@ func TestDeprovision_Idempotent(t *testing.T) {
 }
 
 func TestDeprovision_WithNetworkIsolation(t *testing.T) {
+	// Close leaves the lease network in place; the independent,
+	// ownership-checked network sweep reclaims it once the lease is gone.
 	networkCleanupCalled := false
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
 			return nil
 		},
-		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
+		RemoveLeaseNetworkIfEmptyFn: func(ctx context.Context, authority leaseNetworkAuthority) (networkRemoval, error) {
 			networkCleanupCalled = true
-			assert.Equal(t, "tenant-a", tenant)
-			return tenantNetworkRemoved, nil
+			assert.Equal(t, testLeaseNetworkAuthority(durableCallbackTestLeaseUUID, "docker"), authority)
+			return networkRemoved, nil
 		},
 		ListIdleManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
-			return []networktypes.Inspect{{
-				Name:       TenantNetworkName("tenant-a"),
-				Labels:     map[string]string{LabelTenant: "tenant-a"},
-				Containers: map[string]networktypes.EndpointResource{},
-			}}, nil
+			network := testListedLeaseNetwork(durableCallbackTestLeaseUUID)
+			network.Containers = map[string]networktypes.EndpointResource{}
+			return []networktypes.Inspect{network}, nil
 		},
 	}
 

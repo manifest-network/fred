@@ -37,6 +37,9 @@ const (
 	// RestoreApplicationSourceLost: the source's data lived on a backend an
 	// operator retired as irrecoverably lost.
 	RestoreApplicationSourceLost
+	// RestoreApplicationTargetBillingOnly: the target lease is billed but never
+	// deployed, so nothing may be restored into it.
+	RestoreApplicationTargetBillingOnly
 )
 
 // RestoreApplicationRequest carries only authenticated identities. It cannot
@@ -261,6 +264,19 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 	if targetLease.State != billingtypes.LEASE_STATE_PENDING {
 		return RestoreApplicationResult{disposition: RestoreApplicationTargetNotPending}
 	}
+	// A restore deploys a workload into the target exactly as a provision
+	// does, so it needs the same classifier-issued capability.
+	targetClass := authority.coordinator.classify(targetLease)
+	if targetClass.BillingOnly() {
+		return RestoreApplicationResult{disposition: RestoreApplicationTargetBillingOnly}
+	}
+	deployableTarget, isDeployable := targetClass.Deployable()
+	if !isDeployable {
+		return RestoreApplicationResult{
+			disposition: RestoreApplicationServiceUnavailable,
+			err:         fmt.Errorf("restore target lease %s cannot be classified for deployment", request.targetLeaseUUID),
+		}
+	}
 	items := leaseitems.FromLease(targetLease)
 	restoreInitiation, err := operation.NewRestoreInitiation(
 		request.targetLeaseUUID, request.tenant, items,
@@ -293,9 +309,7 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 			disposition: RestoreApplicationServiceUnavailable, err: cause,
 		}
 	}
-	requestSnapshot, err := authority.coordinator.store.MintBackendRequestSnapshot(
-		targetLease.Tenant, items,
-	)
+	requestSnapshot, err := authority.coordinator.store.MintBackendRequestSnapshot(deployableTarget)
 	if err != nil {
 		return abortBeforePlacement(fmt.Errorf("bind exact restore backend request: %w", err))
 	}
@@ -383,14 +397,6 @@ func (authority *RestoreCoordinator) execute(
 	if err != nil {
 		return authority.abortInvalidRestore(dispatch, err)
 	}
-	bound, boundOK := authority.coordinator.bindRestoreBackend(dispatch)
-	if !boundOK {
-		return authority.abortInvalidRestore(dispatch, errors.New("restore dispatch did not bind its backend"))
-	}
-	call, calling := authority.coordinator.beginRestoreCall(bound)
-	if !calling {
-		return authority.abortInvalidRestore(dispatch, errors.New("restore dispatch did not enter calling phase"))
-	}
 	requestSnapshot := claim.requestSnapshot
 	request := backend.RestoreRequest{
 		LeaseUUID: claim.targetLeaseUUID, FromLeaseUUID: claim.sourceLeaseUUID,
@@ -399,8 +405,22 @@ func (authority *RestoreCoordinator) execute(
 		CallbackURL:          claim.callbackPair.OperationURL(),
 		LifecycleCallbackURL: claim.callbackPair.LifecycleURL(),
 	}
+	// Attest before the calling phase, so a refusal aborts the dispatch as
+	// never sent.
+	delivery, err := authority.coordinator.attestRestore(request)
+	if err != nil {
+		return authority.abortInvalidRestore(dispatch, err)
+	}
+	bound, boundOK := authority.coordinator.bindRestoreBackend(dispatch)
+	if !boundOK {
+		return authority.abortInvalidRestore(dispatch, errors.New("restore dispatch did not bind its backend"))
+	}
+	call, calling := authority.coordinator.beginRestoreCall(bound)
+	if !calling {
+		return authority.abortInvalidRestore(dispatch, errors.New("restore dispatch did not enter calling phase"))
+	}
 	observeRestoreStart(authority.observe, claim.targetLeaseUUID, claim.backendName)
-	return authority.coordinator.completeRestore(call, invokeRestore(ctx, backendClient, request))
+	return authority.coordinator.completeRestore(call, invokeRestore(ctx, backendClient, delivery))
 }
 
 func (authority *RestoreCoordinator) abortInvalidRestore(

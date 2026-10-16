@@ -385,7 +385,7 @@ func testReconcilerSetupWithRuntime(
 	execution, err := coordinator.BindBackendRuntime(router, integrationProviderControlPlane{
 		ReconcilerChainClient: chainClient,
 		CallbackAcknowledger:  integrationAck,
-	})
+	}, placement.NoBillingOnlySKUs())
 	require.NoError(t, err)
 	callbackVerifier, callbackConsumer := hmacauth.NewCallbackProofBoundary()
 	callbackCoordinator, err := execution.AuthenticatedCallbackCoordinator(callbackConsumer)
@@ -452,7 +452,7 @@ func newIntegrationExecutionAfterProviderRestart(
 	execution, err := coordinator.BindBackendRuntime(router, integrationProviderControlPlane{
 		ReconcilerChainClient: env.chainClient,
 		CallbackAcknowledger:  &integrationAcknowledger{chainClient: env.chainClient},
-	})
+	}, placement.NoBillingOnlySKUs())
 	require.NoError(t, err)
 	return execution
 }
@@ -1175,7 +1175,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	execution, err := coordinator.BindBackendRuntime(router, integrationProviderControlPlane{
 		ReconcilerChainClient: mockChain,
 		CallbackAcknowledger:  integrationAck2,
-	})
+	}, placement.NoBillingOnlySKUs())
 	require.NoError(t, err)
 	callbackVerifier, callbackConsumer := hmacauth.NewCallbackProofBoundary()
 	callbackCoordinator, err := execution.AuthenticatedCallbackCoordinator(callbackConsumer)
@@ -1589,6 +1589,7 @@ func testManagerSetup(t *testing.T, mockChain *chaintest.MockClient, extraCfg ..
 	configureBackendTopologyForTest(t, placementStore, b)
 	_, callbackProofConsumer := hmacauth.NewCallbackProofBoundary()
 	mgr, err := provisioner.NewManager(provisioner.ManagerConfig{
+		BillingPolicy:         placement.NoBillingOnlySKUs(),
 		ProviderUUID:          testProviderUUID,
 		PlacementStore:        placementStore,
 		CallbackProofConsumer: callbackProofConsumer,

@@ -1242,9 +1242,12 @@ func validateLeaseMutationTransition(
 		if err := validateMaintenanceCompletionRecord(typed.receipt, typed.previous.LeaseUUID()); err != nil {
 			return nil, err
 		}
+		// The source-ready fact itself is proved by the settling transaction;
+		// here it may only add the intent's own source release identity.
 		want := maintenanceCompletionRecordFor(
 			typed.previous, typed.receipt.Status, typed.receipt.Error,
 			typed.receipt.SettledAt, typed.receipt.CompletionSequence,
+			typed.receipt.SourceReady,
 		)
 		if typed.receipt != want {
 			return nil, errors.New("maintenance resolution carries a divergent receipt")
@@ -1319,7 +1322,7 @@ func validateLeaseMutationTransition(
 		}
 		want := maintenanceCompletionRecordFor(
 			typed.previous, typed.receipt.Status, typed.receipt.Error,
-			typed.receipt.SettledAt, typed.receipt.CompletionSequence,
+			typed.receipt.SettledAt, typed.receipt.CompletionSequence, false,
 		)
 		if typed.receipt != want {
 			return nil, errors.New("close replacement carries a divergent maintenance receipt")

@@ -12,6 +12,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 const (
@@ -233,6 +234,7 @@ func TestCallbackKeyringAuthenticatorConstructionIsClosed(t *testing.T) {
 func TestNewServerRejectsAmbiguousCallbackAuthenticationModes(t *testing.T) {
 	t.Parallel()
 	server, err := NewServer(ServerConfig{
+		BillingPolicy:  placement.NoBillingOnlySKUs(),
 		CallbackSecret: testCallbackSecret,
 		CallbackKeys: callbackKeysForTest(t, map[backendidentity.ID]string{
 			callbackKeyringID(t, callbackKeyringStorageA): callbackKeyringSecretA,
@@ -243,7 +245,7 @@ func TestNewServerRejectsAmbiguousCallbackAuthenticationModes(t *testing.T) {
 }
 
 func TestNewServerRejectsCallbackAuthenticationWithoutProofVerifier(t *testing.T) {
-	server, err := NewServer(ServerConfig{CallbackSecret: testCallbackSecret}, ServerDeps{})
+	server, err := NewServer(ServerConfig{BillingPolicy: placement.NoBillingOnlySKUs(), CallbackSecret: testCallbackSecret}, ServerDeps{})
 	assert.Nil(t, server)
 	require.ErrorContains(t, err, "proof verifier is required")
 }
@@ -252,6 +254,7 @@ func TestNewServerConstructsStorageIdentityKeyring(t *testing.T) {
 	t.Parallel()
 	verifier, _ := hmacauth.NewCallbackProofBoundary()
 	server, err := NewServer(ServerConfig{
+		BillingPolicy: placement.NoBillingOnlySKUs(),
 		CallbackKeys: callbackKeysForTest(t, map[backendidentity.ID]string{
 			callbackKeyringID(t, callbackKeyringStorageA): callbackKeyringSecretA,
 			callbackKeyringID(t, callbackKeyringStorageB): callbackKeyringSecretB,

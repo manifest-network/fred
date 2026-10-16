@@ -200,11 +200,11 @@ func (b *Backend) operationAbsenceObservationIsTerminal(
 // one retained->canonical rename therefore stays ambiguous until recovery
 // rolls the adoption back or completes it.
 //
-// Tenant networks are intentionally outside this operation-owned absence
-// proof. They are shared, idempotent infrastructure for every lease of the
-// tenant, carry no operation generation, and are removed only by the separate
-// remove-if-empty lifecycle path. Creating one is nevertheless a Step: an
-// uncertain Docker result still makes the current execution ambiguous.
+// Networks are intentionally outside this operation-owned absence proof. A
+// lease network holds no data and carries no operation generation: Fred
+// creates it once for the lease and keeps it through every re-deploy, and the
+// separate ownership-checked remove-if-empty path reclaims it after the lease
+// is gone. Legacy tenant networks are likewise removed only by that path.
 func (b *Backend) operationStorageExactlyAbsent(
 	ctx context.Context,
 	subject shared.OperationPhysicalSubject,
@@ -741,12 +741,37 @@ func (b *Backend) doMaintenancePhysical(
 			pulled[spec.Image] = struct{}{}
 		}
 	}
+	if intent.Kind() == shared.MaintenanceIntentRuntimeRefresh {
+		// Admit every image as exactly what the source ran before any
+		// substrate effect: a refresh that cannot prove one is refused with
+		// nothing changed, not left ambiguous behind its network Step.
+		for service, spec := range stack.Services {
+			if _, err := mutations.admitImage(ctx, spec.Image); err != nil {
+				return fmt.Errorf("admit source image for service %q: %w", service, err)
+			}
+		}
+	}
 	return b.doReplacePhysical(ctx, mutations, replaceContainersOp{
 		LeaseUUID: subject.LeaseUUID(), Stack: stack, Items: target.Items,
 		ResourceProfiles: target.ResourceProfiles, Operation: operation,
 		TargetMaintenanceID: subject.MaintenanceID(),
+		ForceRecreate:       maintenanceForcesRecreate(intent.Kind()),
 		Logger:              physicalLogger(b, subject.LeaseUUID()),
 	})
+}
+
+// maintenanceForcesRecreate reports whether a maintenance kind recreates every
+// container even when Compose sees no configuration change. A restart exists
+// to recreate them, and a runtime refresh exists to put them under the current
+// runtime contract. An update or custom-domain redeploy recreates only what
+// changed.
+func maintenanceForcesRecreate(kind shared.MaintenanceIntentKind) bool {
+	switch kind {
+	case shared.MaintenanceIntentRestart, shared.MaintenanceIntentRuntimeRefresh:
+		return true
+	default:
+		return false
+	}
 }
 
 // doReplacePhysical contains only substrate work. It cannot activate/fail a
@@ -764,6 +789,17 @@ func (b *Backend) doReplacePhysical(
 	if err != nil {
 		return fmt.Errorf("validate %s resource profiles: %w", op.Operation, err)
 	}
+	// The lease's own network, created or verified as this lease's on this
+	// backend, before any image-setup Step, so a same-named network Fred does
+	// not own refuses the replacement with no substrate effect. A lease still
+	// on its legacy tenant network moves to it when this Up recreates its
+	// containers.
+	var leaseNetwork leaseNetworkAuthority
+	if b.cfg.IsNetworkIsolation() {
+		if leaseNetwork, err = mutations.ensureLeaseNetwork(ctx); err != nil {
+			return fmt.Errorf("ensure %s lease network: %w", op.Operation, err)
+		}
+	}
 	imageSetupStartedAt := time.Now()
 	imageSetups, err := b.inspectImagesForSetup(mutations, ctx, op.Stack, op.Items)
 	if err != nil {
@@ -771,13 +807,6 @@ func (b *Backend) doReplacePhysical(
 	}
 	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseImageSetup).
 		Observe(time.Since(imageSetupStartedAt).Seconds())
-	var networkName string
-	if b.cfg.IsNetworkIsolation() {
-		if err := b.ensureTenantNetworkWith(mutations, ctx, mutations.tenant); err != nil {
-			return fmt.Errorf("ensure %s tenant network: %w", op.Operation, err)
-		}
-		networkName = TenantNetworkName(mutations.tenant)
-	}
 	b.provisionsMu.RLock()
 	failCount := 0
 	if provision := b.provisions[op.LeaseUUID]; provision != nil {
@@ -789,9 +818,9 @@ func (b *Backend) doReplacePhysical(
 		CallbackURL: mutations.callbackURL, LifecycleCallbackURL: mutations.lifecycleURL,
 		MaintenanceID: op.TargetMaintenanceID, BackendName: b.cfg.Name, FailCount: failCount,
 		Stack: op.Stack, Items: op.Items, Profiles: profiles, ImageSetups: imageSetups,
-		NetworkName: networkName, Cfg: &b.cfg, Ingress: b.cfg.Ingress,
+		Network: leaseNetwork, Cfg: &b.cfg, Ingress: b.cfg.Ingress,
 	}
-	_, composeUpErr := b.launchCompose(ctx, mutations, params, op.ResourceProfiles, composeUpOpts{ForceRecreate: op.Operation == "restart"})
+	_, composeUpErr := b.launchCompose(ctx, mutations, params, op.ResourceProfiles, composeUpOpts{ForceRecreate: op.ForceRecreate})
 	if composeUpErr != nil {
 		return fmt.Errorf("compose up for %s: %w", op.Operation, composeUpErr)
 	}

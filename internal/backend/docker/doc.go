@@ -14,9 +14,8 @@
 // live in internal/backend/shared/leasesm; this package supplies the
 // Docker-specific seams via the closure-builder factory in
 // lease_actor_factory.go. Some work is serialized differently: recoverState
-// holds the recovery mutexes across its Docker inventory read, tenant
-// networks and managed volumes are created under per-tenant and per-volume
-// stripe locks, and operation-intent and maintenance recovery replace lease
+// holds the recovery mutexes across its Docker inventory read, managed
+// volumes are created under per-volume stripe locks, and operation-intent and maintenance recovery replace lease
 // projections directly instead of through an actor.
 //
 // The actor model is what gives the backend its key properties:
@@ -65,6 +64,6 @@
 // Every container is created with: dropped capabilities, no-new-privileges,
 // fred's tenant seccomp profile (derived from Docker's default), read-only
 // rootfs, tmpfs for /tmp and /run, PID limits, no swap, restart policy
-// disabled (for crash detection), and per-tenant network isolation.
+// disabled (for crash detection), and per-lease network isolation.
 // See the README for the full list and operator-facing knobs.
 package docker

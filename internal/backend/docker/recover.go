@@ -2393,15 +2393,17 @@ func (b *Backend) networkCleanupLoop() {
 	}
 }
 
-// cleanupOrphanedNetworksUsing removes managed networks whose tenant has no
-// active provisions. The inventory only selects candidates: each tenant is
-// revalidated under its network stripe immediately before the guarded remove,
-// so a concurrent provision cannot lose the network it is about to use.
+// cleanupOrphanedNetworksUsing removes idle managed networks nothing owns: a
+// legacy tenant network whose tenant has no provisions, and a lease network
+// whose lease has none. The inventory only selects candidates: each owner is
+// revalidated immediately before the guarded remove, so in-flight lifecycle
+// work cannot lose the network it is about to use.
 func (b *Backend) cleanupOrphanedNetworksUsing(
 	ctx context.Context,
-	removeNetwork backgroundTenantNetworkRemove,
+	removeTenantNetwork backgroundTenantNetworkRemove,
+	removeLeaseNetwork backgroundLeaseNetworkRemove,
 ) {
-	if removeNetwork == nil || ctx.Err() != nil {
+	if removeTenantNetwork == nil || removeLeaseNetwork == nil || ctx.Err() != nil {
 		return
 	}
 	// The caller owns this pass's budget; never borrow the recovery tick's
@@ -2426,34 +2428,50 @@ func (b *Backend) cleanupOrphanedNetworksUsing(
 			b.observeNetworkCleanupInterruption(ctx)
 			return
 		}
-		tenant := n.Labels[LabelTenant]
-		if tenant != "" && len(n.Containers) == 0 {
-			outcome, err := b.removeOrphanedTenantNetworkUsing(ctx, tenant, removeNetwork)
-			if err != nil {
-				if ctx.Err() != nil {
-					b.observeNetworkCleanupInterruption(ctx)
-					return
-				}
-				networkReclamationTotal.WithLabelValues("error").Inc()
-				b.logger.Warn("failed to remove orphaned network", "network", n.Name, "error", err)
-				continue
+		if len(n.Containers) != 0 {
+			continue
+		}
+		var (
+			outcome networkRemoval
+			err     error
+			scope   string
+		)
+		if n.Labels[LabelNetworkScope] == networkScopeLease {
+			scope = "lease"
+			var authority leaseNetworkAuthority
+			if authority, err = leaseNetworkCandidate(n, b.cfg.Name); err == nil {
+				outcome, err = b.removeOrphanedLeaseNetworkUsing(ctx, authority, removeLeaseNetwork)
 			}
-			switch outcome {
-			case tenantNetworkRemoved:
-				networkReclamationTotal.WithLabelValues("removed").Inc()
-				b.logger.Info("removed orphaned tenant network", "network", n.Name, "tenant", tenant)
-			case tenantNetworkAbsent:
-				networkReclamationTotal.WithLabelValues("absent").Inc()
-			case tenantNetworkInUse:
-				networkReclamationTotal.WithLabelValues("in_use").Inc()
-			case tenantNetworkOwned:
-				networkReclamationTotal.WithLabelValues("tenant_active").Inc()
-			case tenantNetworkBusy:
-				networkReclamationTotal.WithLabelValues("tenant_busy").Inc()
-			default:
-				networkReclamationTotal.WithLabelValues("error").Inc()
-				b.logger.Warn("unknown tenant network removal outcome", "network", n.Name)
+		} else if tenant := n.Labels[LabelTenant]; tenant != "" {
+			scope = "tenant"
+			outcome, err = b.removeOrphanedTenantNetworkUsing(ctx, tenant, removeTenantNetwork)
+		} else {
+			continue
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				b.observeNetworkCleanupInterruption(ctx)
+				return
 			}
+			networkReclamationTotal.WithLabelValues("error").Inc()
+			b.logger.Warn("failed to remove orphaned network", "network", n.Name, "error", err)
+			continue
+		}
+		switch outcome {
+		case networkRemoved:
+			networkReclamationTotal.WithLabelValues("removed").Inc()
+			b.logger.Info("removed orphaned network", "network", n.Name, "scope", scope)
+		case networkAbsent:
+			networkReclamationTotal.WithLabelValues("absent").Inc()
+		case networkInUse:
+			networkReclamationTotal.WithLabelValues("in_use").Inc()
+		case networkOwned:
+			networkReclamationTotal.WithLabelValues(scope + "_active").Inc()
+		case networkBusy:
+			networkReclamationTotal.WithLabelValues(scope + "_busy").Inc()
+		default:
+			networkReclamationTotal.WithLabelValues("error").Inc()
+			b.logger.Warn("unknown network removal outcome", "network", n.Name)
 		}
 	}
 }

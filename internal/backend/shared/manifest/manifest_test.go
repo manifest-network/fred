@@ -471,6 +471,121 @@ func TestStackManifest_DependsOn_DiamondNoCycle(t *testing.T) {
 	assert.NoError(t, sm.Validate())
 }
 
+// dependsOnChain returns a stack of n services where s0 depends on s1, s1 on
+// s2, and so on: a single chain of n-1 links.
+func dependsOnChain(n int) StackManifest {
+	sm := StackManifest{Services: make(map[string]*Manifest, n)}
+	for i := range n {
+		svc := &Manifest{Image: "nginx"}
+		if i+1 < n {
+			svc.DependsOn = map[string]DependsOnCondition{
+				fmt.Sprintf("s%d", i+1): {Condition: "service_started"},
+			}
+		}
+		sm.Services[fmt.Sprintf("s%d", i)] = svc
+	}
+	return sm
+}
+
+func TestStackManifest_DependsOn_DepthLimitIsDeterministic(t *testing.T) {
+	// The verdict used to depend on which service map iteration visited first,
+	// so a 12-service chain was rejected only about a fifth of the time
+	// (ENG-1515). Repeat each verdict enough times to expose that again.
+	const repeats = 200
+	atLimit := dependsOnChain(dependsOnMaxDepth + 1)
+	overLimit := dependsOnChain(dependsOnMaxDepth + 2)
+	for range repeats {
+		require.NoError(t, atLimit.Validate(), "a chain of exactly %d links is accepted", dependsOnMaxDepth)
+		err := overLimit.Validate()
+		require.Error(t, err, "a chain of %d links is always rejected", dependsOnMaxDepth+1)
+		assert.Contains(t, err.Error(), "dependency chain exceeds maximum depth of 10")
+		assert.Contains(t, err.Error(), `service "s0" starts a chain of 11 links`)
+	}
+}
+
+func TestStackManifest_DependsOn_DepthCountsLongestBranch(t *testing.T) {
+	// "a" has a one-link branch and a long branch. Only the long branch decides,
+	// whichever branch a traversal happens to explore first.
+	sm := dependsOnChain(dependsOnMaxDepth + 1) // s0..s10: 10 links
+	sm.Services["leaf"] = &Manifest{Image: "nginx"}
+	sm.Services["a"] = &Manifest{
+		Image: "nginx",
+		DependsOn: map[string]DependsOnCondition{
+			"leaf": {Condition: "service_started"},
+			"s0":   {Condition: "service_started"},
+		},
+	}
+	for range 100 {
+		err := sm.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `service "a" starts a chain of 11 links`)
+	}
+
+	// Many services sharing one deep dependency stay within the limit.
+	wide := dependsOnChain(dependsOnMaxDepth + 1)
+	for i := range 8 {
+		wide.Services[fmt.Sprintf("w%d", i)] = &Manifest{
+			Image: "nginx",
+			DependsOn: map[string]DependsOnCondition{
+				"s1": {Condition: "service_started"},
+			},
+		}
+	}
+	for range 100 {
+		require.NoError(t, wide.Validate())
+	}
+}
+
+func TestStackManifest_DependsOn_CycleErrorIsDeterministic(t *testing.T) {
+	sm := StackManifest{
+		Services: map[string]*Manifest{
+			"a": {Image: "nginx", DependsOn: map[string]DependsOnCondition{"b": {Condition: "service_started"}}},
+			"b": {Image: "nginx", DependsOn: map[string]DependsOnCondition{"c": {Condition: "service_started"}}},
+			"c": {Image: "nginx", DependsOn: map[string]DependsOnCondition{"a": {Condition: "service_started"}}},
+		},
+	}
+	want := sm.Validate()
+	require.Error(t, want)
+	for range 100 {
+		require.EqualError(t, sm.Validate(), want.Error())
+	}
+}
+
+func TestDependsOnAnalysis_RejectsCycleWithoutUsableResult(t *testing.T) {
+	sm := StackManifest{
+		Services: map[string]*Manifest{
+			"a": {Image: "nginx", DependsOn: map[string]DependsOnCondition{"b": {Condition: "service_started"}}},
+			"b": {Image: "nginx", DependsOn: map[string]DependsOnCondition{"a": {Condition: "service_started"}}},
+		},
+	}
+	analysis, err := sm.analyzeDependsOn()
+	require.ErrorContains(t, err, "cycle detected")
+	require.Error(t, analysis.requireAdmissionChainLimit(),
+		"a failed analysis must not authorize admission")
+}
+
+func TestDependsOnAnalysis_ZeroValueAuthorizesNothing(t *testing.T) {
+	var analysis dependsOnAnalysis
+	require.ErrorContains(t, analysis.requireAdmissionChainLimit(), "requires a completed dependency analysis")
+}
+
+func TestDependsOnAnalysis_IsDetachedFromLaterMutation(t *testing.T) {
+	sm := dependsOnChain(dependsOnMaxDepth + 1) // 10 links: within the limit
+	analysis, err := sm.analyzeDependsOn()
+	require.NoError(t, err)
+	require.NoError(t, analysis.requireAdmissionChainLimit())
+
+	// Lengthen the chain after the analysis completed. The analysis keeps the
+	// lengths it computed; only a new analysis sees the change.
+	sm.Services["head"] = &Manifest{
+		Image:     "nginx",
+		DependsOn: map[string]DependsOnCondition{"s0": {Condition: "service_started"}},
+	}
+	require.NoError(t, analysis.requireAdmissionChainLimit())
+	assert.NotContains(t, analysis.links, "head")
+	require.Error(t, sm.Validate())
+}
+
 func TestManifest_DependsOn_RejectedOutsideStack(t *testing.T) {
 	m := &Manifest{
 		Image: "nginx",

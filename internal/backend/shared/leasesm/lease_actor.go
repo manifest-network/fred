@@ -759,6 +759,13 @@ func NewCustomDomainCommand(lifetime shared.MaintenanceWorkerHandoff, target sha
 	return newRestartCommand(shared.MaintenanceIntentCustomDomain, lifetime, target)
 }
 
+// NewRuntimeRefreshCommand preserves the restart-shaped actor transition while
+// requiring a target minted from runtime-refresh maintenance authority, for
+// the same reason NewCustomDomainCommand is distinct.
+func NewRuntimeRefreshCommand(lifetime shared.MaintenanceWorkerHandoff, target shared.MaintenanceReleaseClaim) (ActorCommand, ActorReply, error) {
+	return newRestartCommand(shared.MaintenanceIntentRuntimeRefresh, lifetime, target)
+}
+
 func NewUpdateCommand(lifetime shared.MaintenanceWorkerHandoff, target shared.MaintenanceReleaseClaim) (ActorCommand, ActorReply, error) {
 	lifetime, target, maintenance, ack, receiver, err := newMaintenanceCommand(shared.MaintenanceIntentUpdate, lifetime, target)
 	if err != nil {

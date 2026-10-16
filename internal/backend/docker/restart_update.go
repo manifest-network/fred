@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"time"
 
@@ -26,7 +27,7 @@ func replaceOpReason(op string) backend.Reason {
 		return backend.ReasonUpdateFailed
 	case "restore":
 		return backend.ReasonRestoreFailed
-	case "restart", "custom_domain":
+	case "restart", "custom_domain", "runtime_refresh":
 		return backend.ReasonRestartFailed
 	default:
 		return backend.ReasonInternal
@@ -87,8 +88,66 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	if err != nil {
 		return fmt.Errorf("%w: invalid restart request authority: %w", backend.ErrValidation, err)
 	}
-	return countExpiredMaintenance(b.routeReplaceRestart(ctx, request, nil))
+	return countExpiredMaintenance(b.routeReplaceRestart(ctx, request, tenantRestartRoute()))
 }
+
+// replaceRestartRoute is one restart-shaped maintenance route. It binds the
+// intent kind it admits to that route's restore-ownership rule, admissible
+// source statuses, command-fence behavior and item overrides, so a route is
+// chosen by name and never inferred from the shape of its arguments. The zero
+// value admits nothing.
+type replaceRestartRoute struct {
+	kind      shared.MaintenanceIntentKind
+	overrides map[string]string
+}
+
+// tenantRestartRoute is the provider's restart of a tenant's lease.
+func tenantRestartRoute() replaceRestartRoute {
+	return replaceRestartRoute{kind: shared.MaintenanceIntentRestart}
+}
+
+// customDomainRoute redeploys a lease to apply chain custom-domain changes.
+func customDomainRoute(overrides map[string]string) (replaceRestartRoute, error) {
+	if len(overrides) == 0 {
+		return replaceRestartRoute{}, errors.New("a custom-domain redeploy requires at least one domain change")
+	}
+	return replaceRestartRoute{kind: shared.MaintenanceIntentCustomDomain, overrides: maps.Clone(overrides)}, nil
+}
+
+// runtimeRefreshRoute recreates a healthy lease unchanged under the current
+// container runtime contract.
+func runtimeRefreshRoute() replaceRestartRoute {
+	return replaceRestartRoute{kind: shared.MaintenanceIntentRuntimeRefresh}
+}
+
+func (r replaceRestartRoute) valid() bool {
+	switch r.kind {
+	case shared.MaintenanceIntentRestart, shared.MaintenanceIntentRuntimeRefresh:
+		return len(r.overrides) == 0
+	case shared.MaintenanceIntentCustomDomain:
+		return len(r.overrides) != 0
+	default:
+		return false
+	}
+}
+
+// waitsForLeaseCommands reports whether the route queues behind a lifecycle
+// command already holding the lease's fence. A runtime refresh is the
+// provider's background work: it yields to tenant commands and is retried.
+func (r replaceRestartRoute) waitsForLeaseCommands() bool {
+	return r.kind != shared.MaintenanceIntentRuntimeRefresh
+}
+
+// admitsFailedSource reports whether the route may replace a Failed lease. A
+// runtime refresh recreates only a healthy lease, unchanged; a Failed lease is
+// recreated under the current contract by its own recovery.
+func (r replaceRestartRoute) admitsFailedSource() bool {
+	return r.kind != shared.MaintenanceIntentRuntimeRefresh
+}
+
+// errLeaseCommandBusy is a pre-admission refusal: a route that does not wait
+// for lease commands found the lease's fence held. Nothing was journaled.
+var errLeaseCommandBusy = errors.New("lease has a lifecycle command in progress")
 
 // countExpiredMaintenance counts a provider command refused because it is
 // older than its lease's retained maintenance history.
@@ -110,9 +169,9 @@ func resolveMaintenanceCallbackURLs(
 	)
 }
 
-// routeReplaceRestart is the shared restart routing used by the public Restart
-// (overrides == nil) and by ReconcileCustomDomain (overrides carries the
-// per-ServiceName custom_domain changes). The SEAM-CLOSED (ENG-230) prelude is
+// routeReplaceRestart is the shared restart routing used by the public Restart,
+// by ReconcileCustomDomain (whose route carries the per-ServiceName
+// custom_domain changes) and by the runtime refresh. The SEAM-CLOSED (ENG-230) prelude is
 // unchanged: read-only fast-fail under provisionsMu, field snapshot, no
 // prov.Status write — the actor's onEnterRestarting is the sole writer, firing
 // BEFORE the ack, so "returns => Status==Restarting" holds for HTTP-handler
@@ -125,27 +184,32 @@ func resolveMaintenanceCallbackURLs(
 func (b *Backend) routeReplaceRestart(
 	ctx context.Context,
 	request shared.MaintenanceRequestAuthority,
-	overrides map[string]string,
+	route replaceRestartRoute,
 ) error {
 	if !request.Valid() {
 		return fmt.Errorf("%w: restart requires exact maintenance request authority", backend.ErrValidation)
 	}
-	expectedKind := shared.MaintenanceIntentRestart
-	if len(overrides) != 0 {
-		expectedKind = shared.MaintenanceIntentCustomDomain
-	}
-	if request.Kind() != expectedKind {
+	if !route.valid() || request.Kind() != route.kind {
 		return fmt.Errorf("%w: restart maintenance kind does not match route", backend.ErrValidation)
 	}
+	overrides := route.overrides
 	leaseUUID := request.LeaseUUID()
 	callbackURL := request.CallbackURL()
-	if err := b.requireMutationAdmission(ctx, "restart"); err != nil {
+	if err := b.requireMutationAdmission(ctx, string(route.kind)); err != nil {
 		return fmt.Errorf("backend storage identity verification failed: %w", err)
 	}
 	// Serialize creation of the durable maintenance head and its handoff. If
 	// the bounded response wait loses the acknowledgment, the exact journal
 	// head continues to exclude successors after this response fence opens.
-	unlockCommand := b.commandFence.Lock(leaseUUID)
+	var unlockCommand func()
+	if route.waitsForLeaseCommands() {
+		unlockCommand = b.commandFence.Lock(leaseUUID)
+	} else {
+		var acquired bool
+		if unlockCommand, acquired = b.commandFence.TryLock(leaseUUID); !acquired {
+			return errLeaseCommandBusy
+		}
+	}
 	defer unlockCommand()
 	if b.callbackStore != nil && b.releaseStore != nil {
 		disposition, err := b.maintenanceSettlement.ProbeMaintenanceIntent(request)
@@ -165,7 +229,7 @@ func (b *Backend) routeReplaceRestart(
 	if err := b.settleCommittedOperationBeforeMaintenance(leaseUUID); err != nil {
 		return err
 	}
-	if len(overrides) == 0 {
+	if route.kind == shared.MaintenanceIntentRestart {
 		if err := b.ensureRestoreDestinationRestartAvailable(leaseUUID); err != nil {
 			return err
 		}
@@ -179,10 +243,11 @@ func (b *Backend) routeReplaceRestart(
 		b.provisionsMu.Unlock()
 		return backend.ErrNotProvisioned
 	}
-	if prov.Status != backend.ProvisionStatusReady && prov.Status != backend.ProvisionStatusFailed {
+	if prov.Status != backend.ProvisionStatusReady &&
+		(prov.Status != backend.ProvisionStatusFailed || !route.admitsFailedSource()) {
 		status := prov.Status
 		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: cannot restart from status %s", backend.ErrInvalidState, status)
+		return fmt.Errorf("%w: cannot %s from status %s", backend.ErrInvalidState, route.kind, status)
 	}
 	if prov.StackManifest == nil {
 		b.provisionsMu.Unlock()
@@ -210,6 +275,13 @@ func (b *Backend) routeReplaceRestart(
 	if err := validateComposeServiceNames(items); err != nil {
 		return fmt.Errorf("%w: stored topology cannot form an injective Compose project: %w", backend.ErrInvalidState, err)
 	}
+	if route.kind == shared.MaintenanceIntentRuntimeRefresh {
+		// Under the fence: a tenant restart or update may have recreated the
+		// lease under the current contract while it waited for a slot.
+		if err := b.requireRuntimeRefreshStale(ctx, leaseUUID); err != nil {
+			return err
+		}
+	}
 	if len(resourceProfiles) == 0 {
 		var profileErr error
 		resourceProfiles, profileErr = b.activeResourceProfiles(ctx, leaseUUID, authorityItems)
@@ -231,6 +303,21 @@ func (b *Backend) routeReplaceRestart(
 	sourceErr := validateReplaceSourceRelease(active)
 	if sourceErr != nil {
 		return fmt.Errorf("construct restart source authority: %w", sourceErr)
+	}
+	if route.kind == shared.MaintenanceIntentRuntimeRefresh {
+		// The target is the sealed source release itself; its pins must record
+		// exactly the images the source runs before anything is journaled.
+		if err := b.requireRuntimeRefreshSourceImages(ctx, leaseUUID); err != nil {
+			return err
+		}
+		admission, admitErr := b.admitRuntimeRefresh(request, sourceClaim)
+		if admitErr != nil {
+			return admitErr
+		}
+		if !admission.created() {
+			return nil
+		}
+		return b.handoffMaintenanceResult(ctx, admission.target)
 	}
 	runtimeAuthority, legacyRuntimeAuthority, authorityErr := releaseRuntimeAuthoritiesForMaintenance(
 		active, tenant, providerUUID, callbackURL, lifecycleCallbackURL,
@@ -339,9 +426,12 @@ type replaceContainersOp struct {
 	Stack               *manifest.StackManifest
 	Items               []backend.LeaseItem
 	ResourceProfiles    []shared.SKUResourceSnapshot
-	Operation           string // "restart", "update", or "restore"
+	Operation           string // "restart", "update", "custom_domain", "runtime_refresh", or "restore"
 	TargetMaintenanceID shared.MaintenanceID
-	Logger              *slog.Logger
+	// ForceRecreate recreates every container even when Compose sees no
+	// configuration change; see maintenanceForcesRecreate.
+	ForceRecreate bool
+	Logger        *slog.Logger
 }
 
 func exactServiceContainerCohort(

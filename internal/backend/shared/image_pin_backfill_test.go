@@ -131,3 +131,48 @@ func TestImagePinBackfillDoesNotObserveUnresolvedMutation(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, ImagePinBackfillReport{UnresolvedLeases: 1}, report)
 }
+
+// VerifyLease matches every pin of the active generation against what the
+// running cohort executes, observing it even when nothing is missing: a
+// missing pin is minted from that evidence, a matching one verifies, and one
+// that names other content is reported and never replaced.
+func TestImagePinVerifyLeaseMatchesPinsAgainstTheRunningCohort(t *testing.T) {
+	_, journal, lease, release := imagePinBackfillFixture(t)
+	const reference = "example.invalid/app:1"
+	running, other := inspectionJournalTestImage, "sha256:"+strings.Repeat("c", 64)
+	calls, unavailable := 0, false
+	owner, err := NewImagePinBackfiller(journal, imagePinObserverFunc(func(context.Context, ImagePinBackfillSubject) ([]ImagePinBackfillObservation, error) {
+		calls++
+		if unavailable {
+			return nil, errors.New("container absent")
+		}
+		return []ImagePinBackfillObservation{{Reference: reference, ImageID: running, Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}}}, nil
+	}))
+	require.NoError(t, err)
+
+	verification, err := owner.VerifyLease(t.Context(), lease)
+	require.NoError(t, err)
+	require.Equal(t, ImagePinVerification{Verified: true}, verification, "a missing pin is minted from the running cohort")
+	pin, err := journal.Lookup(lease, release.Manifest, reference)
+	require.NoError(t, err)
+	require.Equal(t, running, pin.ImageID)
+
+	verification, err = owner.VerifyLease(t.Context(), lease)
+	require.NoError(t, err)
+	require.Equal(t, ImagePinVerification{Verified: true}, verification)
+	require.Equal(t, 2, calls, "a fully pinned lease is still observed")
+
+	running = other
+	verification, err = owner.VerifyLease(t.Context(), lease)
+	require.NoError(t, err)
+	require.Equal(t, ImagePinVerification{Diverged: []string{reference}}, verification,
+		"a pin naming other content than the cohort runs is reported")
+	pin, err = journal.Lookup(lease, release.Manifest, reference)
+	require.NoError(t, err)
+	require.Equal(t, inspectionJournalTestImage, pin.ImageID, "and never replaced")
+
+	unavailable = true
+	verification, err = owner.VerifyLease(t.Context(), lease)
+	require.NoError(t, err)
+	require.Equal(t, ImagePinVerification{}, verification, "unavailable evidence verifies nothing")
+}

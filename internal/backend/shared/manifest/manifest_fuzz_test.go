@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"fmt"
 	"path"
 	"strings"
 	"testing"
@@ -25,6 +26,8 @@ func FuzzParsePayload(f *testing.F) {
 		`{"services":{"web":{"image":"nginx"}}}`,
 		`{"services":{"web":{"image":"nginx"},"db":{"image":"postgres"}}}`,
 		`{"services":{"web":{"image":"nginx","depends_on":{"db":{"condition":"service_started"}}},"db":{"image":"postgres"}}}`,
+		chainSeed(dependsOnMaxDepth + 1),
+		chainSeed(dependsOnMaxDepth + 2),
 		// Shapes that MUST be rejected — they exercise the reject paths and give
 		// the mutator adversarial starting points aimed at the invariants.
 		`{"image":"nginx","labels":{"traefik.enable":"true"}}`,
@@ -59,6 +62,20 @@ func FuzzParsePayload(f *testing.F) {
 		// Invariant 1: at least one service.
 		if len(stack.Services) == 0 {
 			t.Fatal("accepted stack has zero services")
+		}
+
+		// Invariant 1a: stored history never rejects what admission accepted.
+		// Recovery, close and /health re-parse stored manifests, so a stricter
+		// or nondeterministic stored check fails them (ENG-1515).
+		for range 3 {
+			if _, err := ParseStoredPayload(data); err != nil {
+				t.Fatalf("admission accepted a payload stored validation rejects: %v", err)
+			}
+		}
+
+		// Invariant 1b: no accepted depends_on chain exceeds the limit.
+		if n := longestDependsOnChain(stack); n > dependsOnMaxDepth {
+			t.Fatalf("accepted stack has a depends_on chain of %d links, exceeding %d", n, dependsOnMaxDepth)
 		}
 
 		for name, svc := range stack.Services {
@@ -115,4 +132,49 @@ func FuzzParsePayload(f *testing.F) {
 			}
 		}
 	})
+}
+
+// chainSeed returns a stack payload whose services form one depends_on chain of
+// n-1 links.
+func chainSeed(n int) string {
+	var b strings.Builder
+	b.WriteString(`{"services":{`)
+	for i := range n {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `"s%d":{"image":"nginx"`, i)
+		if i+1 < n {
+			fmt.Fprintf(&b, `,"depends_on":{"s%d":{"condition":"service_started"}}`, i+1)
+		}
+		b.WriteString("}")
+	}
+	b.WriteString("}}")
+	return b.String()
+}
+
+// longestDependsOnChain is the fuzz oracle for the chain-length limit, derived
+// independently of the validator: the longest path, in links, through an
+// accepted (and therefore acyclic) depends_on graph.
+func longestDependsOnChain(stack *StackManifest) int {
+	memo := make(map[string]int, len(stack.Services))
+	var walk func(string) int
+	walk = func(name string) int {
+		if n, ok := memo[name]; ok {
+			return n
+		}
+		n := 0
+		if svc := stack.Services[name]; svc != nil {
+			for dep := range svc.DependsOn {
+				n = max(n, walk(dep)+1)
+			}
+		}
+		memo[name] = n
+		return n
+	}
+	longest := 0
+	for name := range stack.Services {
+		longest = max(longest, walk(name))
+	}
+	return longest
 }

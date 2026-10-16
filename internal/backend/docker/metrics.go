@@ -312,7 +312,45 @@ var (
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "network_reclamation_total",
-		Help:      "Tenant-network reclamation outcomes: removed, absent, in_use, tenant_active, tenant_busy, error, list_error, or budget_exhausted",
+		Help:      "Network reclamation outcomes: removed, absent, in_use, lease_active, lease_busy, tenant_active, error, list_error, or budget_exhausted",
+	}, []string{"outcome"})
+
+	// runtimeStaleLeases is the number of Ready leases, at the last read, with
+	// a container created under an older runtime contract. A runtime refresh
+	// recreates them. Every reconcile_interval and every runtime refresh
+	// request reads it, so after a restart it is current within one interval.
+	runtimeStaleLeases = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "runtime_stale_leases",
+		Help:      "Ready leases with a container created under an older runtime contract, from the last read",
+	})
+	// runtimeSharedNetworkLeases is the number of leases, at the last read,
+	// with a container on a Docker network that another lease's container is
+	// also on: leases still able to reach each other. Every
+	// reconcile_interval and every runtime refresh request reads it.
+	runtimeSharedNetworkLeases = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "runtime_shared_network_leases",
+		Help:      "Leases with a container on a Docker network shared with another lease's container, from the last read",
+	})
+	// runtimeInventoryTotal counts the periodic runtime inventory passes that
+	// refresh the two gauges above, by outcome: ok or error. A failed pass
+	// leaves both gauges at their last completed value.
+	runtimeInventoryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "runtime_inventory_total",
+		Help:      "Periodic runtime inventory passes by outcome (ok or error)",
+	}, []string{"outcome"})
+	// runtimeRefreshTotal counts each lease's final outcome in a runtime
+	// refresh run: refreshed, failed, or skipped.
+	runtimeRefreshTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "runtime_refresh_total",
+		Help:      "Runtime refresh outcomes per lease and run: refreshed, failed, or skipped",
 	}, []string{"outcome"})
 
 	// operationIntentRecoveryTimeoutExhaustionsTotal distinguishes a bounded cold-
@@ -1330,6 +1368,9 @@ func init() {
 	}
 	for _, sink := range tenantSeccompSinks {
 		tenantSeccompProfileRefusalsTotal.WithLabelValues(sink.label()).Add(0)
+	}
+	for _, outcome := range runtimeRefreshOutcomes {
+		runtimeRefreshTotal.WithLabelValues(string(outcome)).Add(0)
 	}
 	for _, outcome := range tenantSeccompCensusOutcomes {
 		tenantSeccompCensusTotal.WithLabelValues(outcome).Add(0)

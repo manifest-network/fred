@@ -197,11 +197,21 @@ func (m *testStorageMutationAdapter) removeContainer(ctx context.Context, id str
 	})
 }
 
-func (m *testStorageMutationAdapter) removeTenantNetwork(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
-	var outcome tenantNetworkRemoval
+func (m *testStorageMutationAdapter) removeTenantNetwork(ctx context.Context, tenant string) (networkRemoval, error) {
+	var outcome networkRemoval
 	err := m.perform(ctx, "test remove tenant network", func(ctx context.Context) error {
 		var err error
 		outcome, err = m.ops.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
+		return err
+	})
+	return outcome, err
+}
+
+func (m *testStorageMutationAdapter) removeLeaseNetwork(ctx context.Context, authority leaseNetworkAuthority) (networkRemoval, error) {
+	var outcome networkRemoval
+	err := m.perform(ctx, "test remove lease network", func(ctx context.Context) error {
+		var err error
+		outcome, err = m.ops.docker.RemoveLeaseNetworkIfEmpty(ctx, authority)
 		return err
 	})
 	return outcome, err
@@ -296,6 +306,12 @@ func (b *Backend) releaseTenantNetwork(ctx context.Context, tenant string) error
 	return err
 }
 
+func (b *Backend) releaseLeaseNetwork(ctx context.Context, authority leaseNetworkAuthority) (networkRemoval, error) {
+	return b.removeOrphanedLeaseNetworkUsing(
+		ctx, authority, backgroundLeaseNetworkRemove(b.mutationAdapter().removeLeaseNetwork),
+	)
+}
+
 type testDockerMutationProxy struct{ backend *Backend }
 
 func (p testDockerMutationProxy) sink() (dockerMutationSink, error) {
@@ -354,18 +370,34 @@ func (p testDockerMutationProxy) RemoveContainer(ctx context.Context, id string)
 	return sink.RemoveContainer(ctx, id)
 }
 
-func (p testDockerMutationProxy) EnsureTenantNetwork(ctx context.Context, tenant string) (string, error) {
+func (p testDockerMutationProxy) InspectLeaseNetwork(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, bool, error) {
 	sink, err := p.sink()
 	if err != nil {
-		return "", err
+		return leaseNetworkAuthority{}, false, err
 	}
-	return sink.EnsureTenantNetwork(ctx, tenant)
+	return sink.InspectLeaseNetwork(ctx, leaseUUID)
 }
 
-func (p testDockerMutationProxy) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
+func (p testDockerMutationProxy) CreateLeaseNetwork(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, error) {
 	sink, err := p.sink()
 	if err != nil {
-		return tenantNetworkRemovalUnknown, err
+		return leaseNetworkAuthority{}, err
+	}
+	return sink.CreateLeaseNetwork(ctx, leaseUUID)
+}
+
+func (p testDockerMutationProxy) RemoveLeaseNetworkIfEmpty(ctx context.Context, authority leaseNetworkAuthority) (networkRemoval, error) {
+	sink, err := p.sink()
+	if err != nil {
+		return networkRemovalUnknown, err
+	}
+	return sink.RemoveLeaseNetworkIfEmpty(ctx, authority)
+}
+
+func (p testDockerMutationProxy) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (networkRemoval, error) {
+	sink, err := p.sink()
+	if err != nil {
+		return networkRemovalUnknown, err
 	}
 	return sink.RemoveTenantNetworkIfEmpty(ctx, tenant)
 }

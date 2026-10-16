@@ -23,6 +23,7 @@ import (
 	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/callbackwire"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 const (
@@ -119,6 +120,10 @@ type ServerConfig struct {
 	// MaintenanceLegacyIdempotencyTenants may omit Idempotency-Key on
 	// restart/update; see HandlersConfig.
 	MaintenanceLegacyIdempotencyTenants []string
+	// BillingPolicy is required: payload uploads are refused for a lease it
+	// classifies as billing-only, which Fred never deploys. It is the same
+	// policy the provision manager binds into placement.
+	BillingPolicy *placement.BillingPolicy
 }
 
 // ServerDeps holds the runtime dependencies for the API server.
@@ -140,6 +145,9 @@ type ServerDeps struct {
 // NewServer creates a new API server.
 // Returns an error if token tracker initialization fails.
 func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
+	if cfg.BillingPolicy == nil {
+		return nil, errors.New("billing policy is required")
+	}
 	callbackApplicationTimeout, err := resolveCallbackApplicationTimeout(cfg.CallbackApplicationTimeout)
 	if err != nil {
 		return nil, err
@@ -241,7 +249,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	// Create payload handler if publisher is provided
 	var payloadHandler *PayloadHandler
 	if payloadPublisher != nil {
-		payloadHandler = NewPayloadHandler(client, payloadPublisher, cfg.ProviderUUID, cfg.Bech32Prefix)
+		payloadHandler = NewPayloadHandler(client, payloadPublisher, cfg.ProviderUUID, cfg.Bech32Prefix, cfg.BillingPolicy)
 	}
 
 	s := &Server{

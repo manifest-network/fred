@@ -58,8 +58,10 @@ type dockerMutationSink interface {
 	StartContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	StopContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	RemoveContainer(ctx context.Context, containerID string) error
-	EnsureTenantNetwork(ctx context.Context, tenant string) (string, error)
-	RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (tenantNetworkRemoval, error)
+	RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (networkRemoval, error)
+	InspectLeaseNetwork(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, bool, error)
+	CreateLeaseNetwork(ctx context.Context, leaseUUID string) (leaseNetworkAuthority, error)
+	RemoveLeaseNetworkIfEmpty(ctx context.Context, authority leaseNetworkAuthority) (networkRemoval, error)
 	DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string, origin shared.ImageInspectionOrigin) (uid, gid int, err error)
 	DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string, origin shared.ImageInspectionOrigin) ([]string, error)
 	ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64, origin shared.ImageInspectionOrigin) map[string]error
@@ -206,25 +208,6 @@ type Backend struct {
 	provisions   map[string]*provision
 	provisionsMu sync.RWMutex
 
-	// tenantNetworkStripes serializes EnsureTenantNetwork and
-	// RemoveTenantNetworkIfEmpty per tenant. Tenant networks are shared
-	// across every lease for that tenant, so provisioning and background
-	// reclamation can otherwise race: removal lands between the provision's
-	// ensure and ContainerCreate, causing "network not found". Per-tenant
-	// serialization plus scanning b.provisions before removing keeps the
-	// decision and Docker call atomic per tenant.
-	//
-	// Striped lock (fixed-size array, tenant → hash-modulo slot) rather
-	// than a map[tenant]*Mutex to keep memory bounded — tenants are
-	// Cosmos addresses that can be created by anyone with gas, and a
-	// map would grow without bound. With tenantNetworkStripeCount slots,
-	// two tenants share a stripe with probability 1/N; the only effect
-	// of a collision is minor serialization between unrelated tenants'
-	// network ops during provisioning and background network reclamation.
-	//
-	// Lock ordering: stripe mutex -> provisionsMu (RLock).
-	tenantNetworkStripes [tenantNetworkStripeCount]sync.Mutex
-
 	// volumeNameStripes serializes the two operations that can act on the
 	// same managed volume name at the same time: the create-or-reuse in
 	// setupVolBinds and the destroy in volumeOp.destroy. Without it the
@@ -234,16 +217,18 @@ type Backend struct {
 	// volumeOp.destroy re-reads the live claim under this lock, which is what
 	// makes the decision and the delete one atomic step per name.
 	//
-	// Striped for the same reason tenantNetworkStripes is: volume names embed
-	// lease UUIDs, and a map[name]*Mutex would grow with every lease the node
-	// has ever seen. Two unrelated volumes sharing a stripe just serialize a
+	// Striped rather than a map[name]*Mutex: volume names embed lease UUIDs,
+	// and a map would grow with every lease the node has ever seen. Two unrelated volumes sharing a stripe just serialize a
 	// create against a destroy, which are both infrequent per volume.
 	//
 	// Lock ordering: volume-name stripe -> provisionsMu (RLock), matching the
 	// tenant-network rule above. Neither holder takes provisionsMu on entry,
 	// and a volume stripe is never held across a tenant-network acquisition.
 	volumeNameStripes [volumeNameStripeCount]sync.Mutex
-	volumeAccess      volumeAccessCoordinator
+
+	// runtimeRefresh owns the operator-started runtime refresh run.
+	runtimeRefresh runtimeRefreshController
+	volumeAccess   volumeAccessCoordinator
 
 	// recoverMu serializes recoverState calls. The reconcile loop and
 	// external RefreshState (called by Fred's reconciler) both invoke
@@ -2539,8 +2524,6 @@ func newBackend(
 		terminalStorageAuthorityFailure: terminalStorageAuthorityFailure,
 		stopCtx:                         stopCtx,
 		stopCancel:                      stopCancel,
-		// tenantNetworkStripes is a fixed-size array embedded in Backend;
-		// the zero value is ready to use (N unlocked sync.Mutexes).
 	}
 
 	// Once every resource exists, constructor failure has a single cleanup
@@ -2937,6 +2920,9 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Report containers that do not run under the current tenant seccomp
 	// profile. The first pass runs now, in the background, after recovery.
 	b.wg.Go(b.tenantSeccompCensusLoop)
+	// Keep the runtime stale and shared-network gauges current, from one
+	// reconcile_interval after startup.
+	b.wg.Go(b.runtimeInventoryLoop)
 	// Audit managed XFS volumes for project-ID drift, detect only. The first
 	// pass waits projidAuditFirstDelay so it never competes with startup.
 	b.wg.Go(b.projidAuditLoop)

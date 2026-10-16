@@ -8,15 +8,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -58,8 +58,15 @@ const (
 	LabelServiceName          = "fred.service_name"
 	LabelFQDN                 = "fred.fqdn"
 	LabelCustomDomain         = "fred.custom_domain"
-	LabelImageReference       = imageexec.LabelImageReference
-	LabelImageID              = imageexec.LabelImageID
+	// LabelNetworkScope marks a network Fred owns per lease. Legacy per-tenant
+	// networks carry LabelTenant instead.
+	LabelNetworkScope = "fred.network_scope"
+	// LabelRuntimeContract records the runtime contract a container was created
+	// under (see currentRuntimeContract). A container without it predates the
+	// contract.
+	LabelRuntimeContract = "fred.runtime_contract"
+	LabelImageReference  = imageexec.LabelImageReference
+	LabelImageID         = imageexec.LabelImageID
 )
 
 // DaemonSecurityInfo contains Docker daemon capabilities relevant to
@@ -88,15 +95,21 @@ type ContainerInfo struct {
 	CallbackURL          string
 	LifecycleCallbackURL string
 	MaintenanceID        shared.MaintenanceID
-	Image                string
-	Status               string
-	Health               HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
-	ExitCode             int          // Process exit code (meaningful when Status is "exited"/"dead")
-	OOMKilled            bool         // True if container was killed by the OOM killer
-	CreatedAt            time.Time
-	Ports                map[string]PortBinding
-	FQDN                 string
-	CustomDomain         string // Tenant-supplied custom FQDN (empty when not set)
+	// RuntimeContract is the runtime contract recorded at creation; zero when
+	// the container predates the contract.
+	RuntimeContract runtimeContract
+	// Networks names the Docker networks the container is attached to, sorted,
+	// as the daemon reports them.
+	Networks     []string
+	Image        string
+	Status       string
+	Health       HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
+	ExitCode     int          // Process exit code (meaningful when Status is "exited"/"dead")
+	OOMKilled    bool         // True if container was killed by the OOM killer
+	CreatedAt    time.Time
+	Ports        map[string]PortBinding
+	FQDN         string
+	CustomDomain string // Tenant-supplied custom FQDN (empty when not set)
 
 	// Name is the human-readable container name (without the leading "/"
 	// the Docker API prepends). Populated by both InspectContainer and
@@ -1008,7 +1021,7 @@ type CreateContainerParams struct {
 	// NetworkName must be non-empty when Ingress is enabled (enforced by
 	// Config.Validate requiring network_isolation).
 	Ingress     IngressConfig
-	NetworkName string // Per-tenant network name for traefik.docker.network label
+	NetworkName string // Network name for the traefik.docker.network label
 	Quantity    int    // Total quantity for this service (used in subdomain computation)
 
 	// CustomDomain is the optional tenant-supplied FQDN for this LeaseItem.
@@ -1685,6 +1698,8 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		CallbackURL:          resp.Config.Labels[LabelCallbackURL],
 		LifecycleCallbackURL: resp.Config.Labels[LabelLifecycleCallbackURL],
 		MaintenanceID:        maintenanceID,
+		RuntimeContract:      parseRuntimeContract(resp.Config.Labels),
+		Networks:             attachedNetworkNames(resp.NetworkSettings),
 		Image:                imageReference,
 		Status:               resp.State.Status,
 		Health:               health,
@@ -1729,6 +1744,24 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 // When backendName is set, only containers belonging to this backend are returned.
 func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerInfo, error) {
 	return d.listManagedContainers(ctx, false)
+}
+
+// attachedNetworkNames lists, sorted, the networks an inspected container is
+// attached to.
+func attachedNetworkNames(settings *container.NetworkSettings) []string {
+	if settings == nil {
+		return nil
+	}
+	return slices.Sorted(maps.Keys(settings.Networks))
+}
+
+// summaryNetworkNames lists, sorted, the networks a listed container is
+// attached to.
+func summaryNetworkNames(settings *container.NetworkSettingsSummary) []string {
+	if settings == nil {
+		return nil
+	}
+	return slices.Sorted(maps.Keys(settings.Networks))
 }
 
 // ListManagedContainersStrict is the identity-initialization variant. It
@@ -1816,6 +1849,8 @@ func (d *DockerClient) listManagedContainers(
 			CallbackURL:          c.Labels[LabelCallbackURL],
 			LifecycleCallbackURL: c.Labels[LabelLifecycleCallbackURL],
 			MaintenanceID:        maintenanceID,
+			RuntimeContract:      parseRuntimeContract(c.Labels),
+			Networks:             summaryNetworkNames(c.NetworkSettings),
 			Image:                imageReference,
 			Status:               c.State,
 			InstanceIndex:        meta.InstanceIndex,
@@ -1919,116 +1954,31 @@ func parseContainerMaintenanceID(raw string) (shared.MaintenanceID, error) {
 	return maintenanceid.Parse(raw)
 }
 
-// TenantNetworkName returns a deterministic network name for a tenant address.
+// TenantNetworkName returns the deterministic name of the per-tenant network
+// that releases before per-lease networks attached every lease of a tenant to.
+// Fred no longer creates it; the network reclamation worker removes it once
+// the tenant has no provisions on this backend.
 func TenantNetworkName(tenant string) string {
 	h := sha256.Sum256([]byte(tenant))
 	return "fred-tenant-" + hex.EncodeToString(h[:8])
 }
 
-// EnsureTenantNetwork creates or returns the existing network for a tenant.
-// The network is a per-tenant bridge that provides inter-tenant isolation.
-// Note: Internal must be false because Docker internal networks do not
-// support port publishing (moby/moby#36174). Outbound internet access
-// from containers is a side effect.
-func (d *DockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (string, error) {
-	name := TenantNetworkName(tenant)
-
-	// Check if network already exists. The backend_name filter is safe here:
-	// every network Fred creates has this label set (see netLabels below),
-	// so there are no pre-existing networks without it to miss.
-	nf := filters.NewArgs(
-		filters.Arg("name", name),
-		filters.Arg("label", LabelManaged+"=true"),
-	)
-	if d.backendName != "" {
-		nf.Add("label", LabelBackendName+"="+d.backendName)
-	}
-	networks, err := d.client.NetworkList(ctx, networktypes.ListOptions{
-		Filters: nf,
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to list networks: %w", err)
-	}
-	if len(networks) > 0 {
-		return networks[0].ID, nil
-	}
-
-	// Create the network. If a concurrent caller already created it, the
-	// Docker API returns a conflict error. Handle this by re-listing.
-	netLabels := map[string]string{
-		LabelManaged: "true",
-		LabelTenant:  tenant,
-	}
-	if d.backendName != "" {
-		netLabels[LabelBackendName] = d.backendName
-	}
-	resp, err := d.client.NetworkCreate(ctx, name, networktypes.CreateOptions{
-		Driver:   "bridge",
-		Internal: false, // Must be false: Internal:true prevents port publishing (moby#36174)
-		Labels:   netLabels,
-	})
-	if err != nil {
-		if errdefs.IsConflict(err) {
-			// Another goroutine created the network between our list and create.
-			networks, listErr := d.client.NetworkList(ctx, networktypes.ListOptions{
-				Filters: nf,
-			})
-			if listErr != nil {
-				return "", fmt.Errorf("failed to list networks after conflict: %w", listErr)
-			}
-			if len(networks) > 0 {
-				return networks[0].ID, nil
-			}
-			return "", fmt.Errorf("network conflict but not found on retry: %w", err)
-		}
-		return "", fmt.Errorf("failed to create tenant network: %w", err)
-	}
-	return resp.ID, nil
-}
-
-// tenantNetworkRemoval is a diagnostic result, never mutation authority.
-type tenantNetworkRemoval uint8
+// networkRemoval is a diagnostic result, never mutation authority.
+type networkRemoval uint8
 
 const (
-	tenantNetworkRemovalUnknown tenantNetworkRemoval = iota
-	tenantNetworkRemoved
-	tenantNetworkAbsent
-	tenantNetworkInUse
-	tenantNetworkOwned
-	tenantNetworkBusy
+	networkRemovalUnknown networkRemoval = iota
+	networkRemoved
+	networkAbsent
+	networkInUse
+	networkOwned
+	networkBusy
 )
 
-// RemoveTenantNetworkIfEmpty removes the tenant's network if no containers are
-// connected, distinguishing an actual deletion from idempotent absence or use.
-func (d *DockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) (tenantNetworkRemoval, error) {
-	name := TenantNetworkName(tenant)
-
-	// Inspect to check connected containers
-	resp, err := d.client.NetworkInspect(ctx, name, networktypes.InspectOptions{})
-	if err != nil {
-		if client.IsErrNotFound(err) {
-			return tenantNetworkAbsent, nil
-		}
-		return tenantNetworkRemovalUnknown, fmt.Errorf("failed to inspect network: %w", err)
-	}
-
-	if len(resp.Containers) > 0 {
-		return tenantNetworkInUse, nil
-	}
-
-	if err := d.client.NetworkRemove(ctx, resp.ID); err != nil {
-		if client.IsErrNotFound(err) {
-			return tenantNetworkAbsent, nil
-		}
-		return tenantNetworkRemovalUnknown, fmt.Errorf("failed to remove network: %w", err)
-	}
-	return tenantNetworkRemoved, nil
-}
-
 // ListIdleManagedNetworks selects managed network cleanup candidates in one
-// daemon query. A list result never grants removal authority: the tenant stripe,
-// current provision ownership and exact network inspect are rechecked by
-// RemoveTenantNetworkIfEmpty immediately before removal.
+// daemon query. A list result never grants removal authority: current
+// provision ownership and an exact network inspect are rechecked immediately
+// before removal.
 func (d *DockerClient) ListIdleManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error) {
 	f := filters.NewArgs(
 		filters.Arg("label", LabelManaged+"=true"),
@@ -2047,66 +1997,71 @@ func (d *DockerClient) ListIdleManagedNetworks(ctx context.Context) ([]networkty
 	return summaries, nil
 }
 
-// tenantNetworkStripeCount is the number of per-tenant stripe mutexes.
-// Tenants hash into this fixed-size array; two tenants share a stripe
-// with probability 1/tenantNetworkStripeCount. Chosen to keep collision
-// probability negligible for realistic tenant counts while keeping
-// memory bounded (256 * ~24 bytes = ~6 KB, constant).
-const tenantNetworkStripeCount = 256
-
-// tenantNetworkMu returns the stripe mutex that serializes
-// EnsureTenantNetwork and RemoveTenantNetworkIfEmpty for a given
-// tenant. FNV-1a hash → modulo gives an even distribution; two
-// unrelated tenants colliding just serialize their (infrequent)
-// network ops with each other, which is benign.
-func (b *Backend) tenantNetworkMu(tenant string) *sync.Mutex {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(tenant))
-	return &b.tenantNetworkStripes[h.Sum32()%tenantNetworkStripeCount]
-}
-
-func (b *Backend) ensureTenantNetworkWith(mutations *storageMutations, ctx context.Context, tenant string) error {
-	mu := b.tenantNetworkMu(tenant)
-	mu.Lock()
-	defer mu.Unlock()
-	_, err := mutations.ensureTenantNetwork(ctx, tenant)
-	return err
-}
-
 // removeOrphanedTenantNetworkUsing consumes a tenant selected by the fixed
-// managed-network sweep and revalidates it under the same stripe used by
-// EnsureTenantNetwork. No caller-retained service can invoke removeNetwork or
-// select an arbitrary tenant.
+// managed-network sweep. Nothing creates tenant networks any more, so the only
+// reason to keep one is a lease of that tenant still running on it: any
+// provision of the tenant keeps the network.
 func (b *Backend) removeOrphanedTenantNetworkUsing(
 	ctx context.Context,
 	tenant string,
 	removeNetwork backgroundTenantNetworkRemove,
-) (tenantNetworkRemoval, error) {
+) (networkRemoval, error) {
 	if removeNetwork == nil {
-		return tenantNetworkRemovalUnknown, errBackgroundMaintenanceUnavailable
+		return networkRemovalUnknown, errBackgroundMaintenanceUnavailable
 	}
 	if err := ctx.Err(); err != nil {
-		return tenantNetworkRemovalUnknown, err
+		return networkRemovalUnknown, err
 	}
-	mu := b.tenantNetworkMu(tenant)
-	// Reclamation is best-effort. Never wait behind foreground network work:
-	// a contended stripe is retried by the next bounded network pass, keeping
-	// shutdown responsive even while another tenant sharing the stripe is busy.
-	if !mu.TryLock() {
-		return tenantNetworkBusy, nil
-	}
-	defer mu.Unlock()
 
 	b.provisionsMu.RLock()
 	for _, p := range b.provisions {
 		if p.Tenant == tenant {
 			b.provisionsMu.RUnlock()
-			return tenantNetworkOwned, nil
+			return networkOwned, nil
 		}
 	}
 	b.provisionsMu.RUnlock()
 
 	return removeNetwork(ctx, tenant)
+}
+
+// removeOrphanedLeaseNetworkUsing consumes a lease network the sweep found
+// idle, as authority minted from the inventory's verified labels and ID. Fred
+// creates a lease network on the lease's first launch and leaves it in place
+// through every later re-deploy, so this reclaims it once the lease is gone.
+// It removes the network only on a positive fact: this backend tracks no
+// provision for the lease, and no command holds the lease's fence. The fence
+// is held across the removal, so an admission for the same lease waits for it.
+// A busy fence is retried by the next pass instead of waited on. The removal
+// itself re-verifies the exact network ID before deleting it.
+func (b *Backend) removeOrphanedLeaseNetworkUsing(
+	ctx context.Context,
+	authority leaseNetworkAuthority,
+	removeNetwork backgroundLeaseNetworkRemove,
+) (networkRemoval, error) {
+	if removeNetwork == nil {
+		return networkRemovalUnknown, errBackgroundMaintenanceUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return networkRemovalUnknown, err
+	}
+	if err := authority.authorizes(authority.leaseUUID, b.cfg.Name); err != nil {
+		return networkRemovalUnknown, err
+	}
+	unlock, acquired := b.commandFence.TryLock(authority.leaseUUID)
+	if !acquired {
+		return networkBusy, nil
+	}
+	defer unlock()
+
+	b.provisionsMu.RLock()
+	_, tracked := b.provisions[authority.leaseUUID]
+	b.provisionsMu.RUnlock()
+	if tracked {
+		return networkOwned, nil
+	}
+
+	return removeNetwork(ctx, authority)
 }
 
 // HealthStatus represents the health check status of a Docker container.

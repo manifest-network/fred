@@ -24,7 +24,9 @@ func buildTestComposeProject(t testing.TB, params composeProjectParams) *compose
 	t.Helper()
 	plan, err := newEffectiveIngressPlan(params.Ingress, params.Stack, params.Items)
 	require.NoError(t, err)
-	return buildPlannedComposeProject(params, plan)
+	project, err := buildPlannedComposeProject(params, plan)
+	require.NoError(t, err)
+	return project
 }
 
 type testIngressLabelParams struct {
@@ -73,7 +75,8 @@ func TestEffectiveIngressPlanMatchesRealLabelWriter(t *testing.T) {
 			require.Equal(t, test.wantDNS, dnsCalls)
 			require.Equal(t, test.domain, desired[0].CustomDomain, "desired chain metadata must remain intact")
 			require.Equal(t, test.wantDomain, plan.effectiveItems()[0].CustomDomain)
-			project := buildPlannedComposeProject(params, plan)
+			project, err := buildPlannedComposeProject(params, plan)
+			require.NoError(t, err)
 			labels := project.Services["web"].Labels
 			require.Equal(t, plan.effectiveItems()[0].CustomDomain, labels[LabelCustomDomain])
 			if test.wantDomain != "" {
@@ -85,7 +88,9 @@ func TestEffectiveIngressPlanMatchesRealLabelWriter(t *testing.T) {
 			}
 			restored, err := restoreIngressPlan(params.Ingress, params.Stack, plan.effectiveItems())
 			require.NoError(t, err)
-			assert.Equal(t, labels, buildPlannedComposeProject(params, restored).Services["web"].Labels)
+			restoredProject, err := buildPlannedComposeProject(params, restored)
+			require.NoError(t, err)
+			assert.Equal(t, labels, restoredProject.Services["web"].Labels)
 			detached := plan.effectiveItems()
 			detached[0].CustomDomain = "foreign.example"
 			assert.Equal(t, test.wantDomain, plan.effectiveItems()[0].CustomDomain)
