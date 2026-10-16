@@ -8,57 +8,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- docker-backend: an operator-started runtime refresh. Every container now
-  records the runtime contract it was created under in `fred.runtime_contract`
-  (contract 1: the lease's own network). `POST /runtime_refresh` recreates
-  every Ready lease with a container created under an older contract, with
-  the same release, volumes and lease, at most
-  `runtime_refresh_max_concurrency` (default 4; 0 disables) at a time, through
-  a journaled `runtime_refresh` maintenance that never counts as a failure.
-  `GET /runtime_refresh` reports the stale leases, whether a run is `active`,
-  the leases still sharing a Docker network with another lease, and one
-  attestation per lease: `refreshed` (with the maintenance ID its new
-  containers carry), `failed`, or `skipped`. A `failed` refresh that settled
-  with the lease's pre-refresh release as its running, ready cohort carries
-  `restored` with that release's version and digest. A refresh's target is
-  the lease's active release itself, derived from the sealed source, and each
-  image is admitted only as the image its running containers execute: matched
-  against its pin before anything is journaled, and against the refresh's own
-  source capture before any substrate effect. A lease whose pins name other
-  content is refused as `failed`; one whose images cannot be proved is
-  skipped. Attestations are read from each lease's maintenance receipt, so
-  they survive a backend restart and later runs; the receipt now records, from
-  the settlement's own proof, that a failed maintenance left its source as the
-  ready cohort. Nothing starts a refresh automatically. New metrics:
-  `fred_docker_backend_runtime_stale_leases` and
-  `fred_docker_backend_runtime_shared_network_leases`, read every
-  `reconcile_interval`, `fred_docker_backend_runtime_inventory_total{outcome}`
-  and `fred_docker_backend_runtime_refresh_total{outcome}`. See
-  OPERATIONS.md, Runtime refresh.
-- `billing_only_skus` lists SKUs the provider bills for but delivers outside
-  Fred. Fred acknowledges a lease whose items all use these SKUs as soon as it
-  sees it, so billing starts at once, and the reconciler retries the
-  acknowledgment on its next sweep. The acknowledgment reads only the chain,
-  so no backend answer, or anything a backend still reports, holds it back.
-  Fred never provisions such a lease, never rejects it, and never closes it
-  for a provisioning reason, including as lost after a backend retirement. Before
-  this, an unattached SKU fell through to the default backend, whose
-  unknown-SKU refusal got the lease rejected on chain within seconds. Payload
-  uploads for a billing-only lease are refused with `400` and counted as
-  `fred_payload_uploads_total{outcome="billing_only"}`, and so are restores
-  into one. Withdrawals and the credit check apply as before. A lease that
-  mixes billing-only and deployable SKUs keeps the normal path. Each entry must
-  be a lowercase canonical UUID that no backend serves;
-  `PROVIDER_BILLING_ONLY_SKUS` sets the list from the environment
-  (comma-separated). The policy is bound into the placement backend runtime,
-  and a provision or restore request can be minted only from a lease it
-  classified as deployable, and is checked again when it is sent. A SKU can
-  be made billing-only while leases already use it: a deployment still in
-  flight is never retried, the lease is still acknowledged, and no failure
-  callback, timeout or lost backend ends it, because every chain rejection and
-  close the placement layer issues needs the policy's consent. Whatever the
-  earlier deployment left on a backend is torn down when the lease ends.
-  (ENG-1453)
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.14.0] - 2026-10-16
+
+**Upgrading from v0.13.0.** This release cannot be installed in place. Follow
+[Upgrading from v0.13.0](DEPLOYMENT.md#upgrading-from-v0130) before replacing
+any binary:
+
+- **Stopped cutover.** Quiesce the fleet, drain every v0.13 callback outbox,
+  and stop providerd and every backend. providerd starts again only after the
+  offline `placement-preflight -prepare` step reports `PREPARED_FOR_CUTOVER:`.
+  Upgraded startup refuses an unprepared placement database instead of
+  migrating it, and the online migration path and its `migration_grace_period`
+  and `migration_ready_timeout` keys are removed.
+- **One key per backend in production.** Each `backends[]` entry needs its own
+  `hmac_secret` of at least 32 bytes, matching only that backend's
+  `callback_secret`. The provider's top-level `callback_secret` is accepted
+  only outside production mode.
+- **Strict configuration.** Provider, Docker and K3s loaders reject unknown
+  keys and extra YAML documents, so a v0.13 file that still carries a removed
+  or never-consumed key fails to load. Validate the rendered files with this
+  release's loaders first.
+- **One-way.** `-prepare` writes the new placement schema. Going back to v0.13
+  means restoring the pre-upgrade backup, which is safe only if no chain or
+  backend lifecycle state changed after it was taken; otherwise fix forward.
+
+### Added
 
 - Metric `fred_docker_backend_operation_recovery_deferred_total`: a provision
   or restore whose recovery evidence could not be classified, so the lease
@@ -474,11 +458,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `fred_provisioner_callback_settlement_claim_wait_timeouts_total` exposes
   callbacks that exhaust the bounded wait for another terminal settlement actor,
   making stuck or unusually slow claim holders actionable. (ENG-632)
-- `fred_provisioner_callback_placement_semantic_conflicts_total` exposes
-  authenticated success-callback settlement attempts that encounter a permanent
-  semantic placement verdict and continue toward chain acknowledgement while
-  preserving the durable record for operator repair. Retries may increment the
-  counter more than once. (ENG-632)
 - `fred_provisioner_callback_deprovision_owned_success_total` exposes successful
   provision callbacks that overlap close/deprovision ownership of the same
   operation ID. Fred consumes these without acknowledging the closing
@@ -505,12 +484,61 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   worker. The affected lease remains queued and other lease workers continue;
   any increase is still a bug requiring investigation. (ENG-632)
 
+- docker-backend: an operator-started runtime refresh. Every container now
+  records the runtime contract it was created under in `fred.runtime_contract`
+  (contract 1: the lease's own network). `POST /runtime_refresh` recreates
+  every Ready lease with a container created under an older contract, with
+  the same release, volumes and lease, at most
+  `runtime_refresh_max_concurrency` (default 4; 0 disables) at a time, through
+  a journaled `runtime_refresh` maintenance that never counts as a failure.
+  `GET /runtime_refresh` reports the stale leases, whether a run is `active`,
+  the leases still sharing a Docker network with another lease, and one
+  attestation per lease: `refreshed` (with the maintenance ID its new
+  containers carry), `failed`, or `skipped`. A `failed` refresh that settled
+  with the lease's pre-refresh release as its running, ready cohort carries
+  `restored` with that release's version and digest. A refresh's target is
+  the lease's active release itself, derived from the sealed source, and each
+  image is admitted only as the image its running containers execute: matched
+  against its pin before anything is journaled, and against the refresh's own
+  source capture before any substrate effect. A lease whose pins name other
+  content is refused as `failed`; one whose images cannot be proved is
+  skipped. Attestations are read from each lease's maintenance receipt, so
+  they survive a backend restart and later runs; the receipt now records, from
+  the settlement's own proof, that a failed maintenance left its source as the
+  ready cohort. Nothing starts a refresh automatically. New metrics:
+  `fred_docker_backend_runtime_stale_leases` and
+  `fred_docker_backend_runtime_shared_network_leases`, read every
+  `reconcile_interval`, `fred_docker_backend_runtime_inventory_total{outcome}`
+  and `fred_docker_backend_runtime_refresh_total{outcome}`. See
+  OPERATIONS.md, Runtime refresh.
+
+- `billing_only_skus` lists SKUs the provider bills for but delivers outside
+  Fred. Fred acknowledges a lease whose items all use these SKUs as soon as it
+  sees it, so billing starts at once, and the reconciler retries the
+  acknowledgment on its next sweep. The acknowledgment reads only the chain,
+  so no backend answer, or anything a backend still reports, holds it back.
+  Fred never provisions such a lease, never rejects it, and never closes it
+  for a provisioning reason, including as lost after a backend retirement. Before
+  this, an unattached SKU fell through to the default backend, whose
+  unknown-SKU refusal got the lease rejected on chain within seconds. Payload
+  uploads for a billing-only lease are refused with `400` and counted as
+  `fred_payload_uploads_total{outcome="billing_only"}`, and so are restores
+  into one. Withdrawals and the credit check apply as before. A lease that
+  mixes billing-only and deployable SKUs keeps the normal path. Each entry must
+  be a lowercase canonical UUID that no backend serves;
+  `PROVIDER_BILLING_ONLY_SKUS` sets the list from the environment
+  (comma-separated). The policy is bound into the placement backend runtime,
+  and a provision or restore request can be minted only from a lease it
+  classified as deployable, and is checked again when it is sent. A SKU can
+  be made billing-only while leases already use it: a deployment still in
+  flight is never retried, the lease is still acknowledged, and no failure
+  callback, timeout or lost backend ends it, because every chain rejection and
+  close the placement layer issues needs the policy's consent. Whatever the
+  earlier deployment left on a backend is torn down when the lease ends.
+  (ENG-1453)
+
 ### Changed
 
-- `fred_docker_backend_network_reclamation_total{outcome}` gains
-  `lease_active` and `lease_busy` for per-lease networks; `tenant_busy` is no
-  longer emitted, because nothing creates tenant networks any more. Size
-  Docker's address pools for active leases rather than active tenants.
 - The tenant-visible failure reasons of a provision changed (ENG-1125). Two
   reasons are new, and neither ever counts toward the terminal failure
   budget: `HealthCheckFailed`, a container's health check never passed during
@@ -679,11 +707,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   budget while preserving results already committed by earlier sub-batches.
   (ENG-632)
 - Release publication requires the tagged commit to be in `main` history and
-  reruns CI and integration for that tag. Pull requests validate release
-  configuration and build a non-publishing snapshot. CI reports statement
+  reruns CI, integration and the gitleaks secret scan for that tag. Pull
+  requests validate release configuration and build a non-publishing snapshot
+  with the same pinned GoReleaser version the release uses. CI reports statement
   coverage and enforces a 76% regression floor. Repository release-tag and
   publication permissions remain a separate administrative requirement.
-  (ENG-951)
+  (ENG-951, ENG-516)
 - Deployment documentation now identifies native systemd with XFS project quotas
   as the supported stateful production setup; the local Docker backend image is
   documented for stateless development only.
@@ -1216,14 +1245,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   are not restarted or moved. Service-name-less pre-stack cohorts are unsupported
   and rejected before mutation. (ENG-632)
 
+- `fred_docker_backend_network_reclamation_total{outcome}` gains
+  `lease_active` and `lease_busy` for per-lease networks; `tenant_busy` is no
+  longer emitted, because nothing creates tenant networks any more. Size
+  Docker's address pools for active leases rather than active tenants.
+
 ### Deprecated
 
 ### Removed
 
-- Removed the metrics `fred_provisioner_callback_placement_semantic_conflicts_total`
-  and `fred_payload_persist_failures_total`. Nothing has incremented either since
-  ENG-632 replaced the code paths they counted, so alerts on them could never
-  fire. Remove any alert or dashboard panel that still reads them.
+- Removed the metric `fred_payload_persist_failures_total`. It counted updates
+  applied to a backend but not saved to the payload store. An update is now
+  journaled with its payload and accepted only after the payload store commits
+  it. Remove any alert or dashboard panel that reads it. (ENG-632)
 - Removed the internal `ReconcilerConfig.MaxReprovisionAttempts` and
   `DefaultMaxReprovisionAttempts`; they were never a configuration key.
   (ENG-799)
@@ -1234,21 +1268,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- docker-backend: a custom-domain redeploy that fails, or that a crash
-  interrupts, settles again. Its failure details were refused for any
-  maintenance kind but restart and update, so a definitive failure became an
-  ambiguous outcome and recovery of the interrupted maintenance could never
-  converge, leaving the lease's maintenance head unsettled.
-- A stack whose `depends_on` chain is longer than 10 links is now always
-  rejected at submission. The check used to measure the chain from whichever
-  service it happened to visit first, so the same manifest was accepted or
-  rejected at random (about one time in five for 12 services in a row, three
-  in five for 20). Stored manifests are no longer re-checked against the
-  limit. The docker backend re-parses them when it opens its release and
-  retention stores, on every `/health`, and during recovery, close and
-  maintenance, so one tenant's long chain could make backend startup and
-  `/health` fail at random. Cycles are still rejected in stored manifests.
-  (ENG-1515)
 - A lease created by `POST /v1/leases/{uuid}/restore` now recovers on its own
   after losing its container (host reboot, crash, kill). providerd held no
   payload for it, because the backend re-deployed the retained manifest, so it
@@ -1288,6 +1307,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   The architecture, backend-guide and package docs for placement, callbacks,
   receipts and journals were corrected to match the code.
+- providerd exports `fred_reconciler_actions_total` for all five actions at
+  zero from startup. Each series used to appear only with its first action, so
+  a quiet providerd showed no series at all, and an `increase()` alert could
+  not see the first `lease_error` after a restart. (ENG-1116)
 - A lease adopted from v0.13 is re-provisioned after its container dies, even
   if it was restarted, updated or given a custom domain before. Any of these,
   failed or successful, adds a maintenance release to the lease's history, and
@@ -2251,32 +2274,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   of nodes that answered both inventories after durable topology bootstrap.
   (ENG-632)
 
+- docker-backend: a custom-domain redeploy that fails, or that a crash
+  interrupts, settles again. Its failure details were refused for any
+  maintenance kind but restart and update, so a definitive failure became an
+  ambiguous outcome and recovery of the interrupted maintenance could never
+  converge, leaving the lease's maintenance head unsettled.
+
+- A stack whose `depends_on` chain is longer than 10 links is now always
+  rejected at submission. The check used to measure the chain from whichever
+  service it happened to visit first, so the same manifest was accepted or
+  rejected at random (about one time in five for 12 services in a row, three
+  in five for 20). Stored manifests are no longer re-checked against the
+  limit. The docker backend re-parses them when it opens its release and
+  retention stores, on every `/health`, and during recovery, close and
+  maintenance, so one tenant's long chain could make backend startup and
+  `/health` fail at random. Cycles are still rejected in stored manifests.
+  (ENG-1515)
+
 ### Security
 
-- docker-backend: every lease now runs on its own Docker network, `fred-<lease_uuid>`,
-  instead of one network shared by all leases of a tenant. On the shared
-  network each service name resolved to that service in every lease of the
-  tenant, so two leases running the same stack answered each other's `db`, and
-  any lease could reach another by address or container name. A tenant that
-  hosts several customers under one address therefore exposed those customers
-  to each other. Service names now resolve only within the lease, and leases
-  cannot reach each other, including leases of the same tenant. Fred creates
-  the lease's network itself and attaches containers only to that network's
-  verified ID: an existing network of that name is used only when it carries
-  this lease's and backend's ownership labels, and any other, foreign or
-  unlabeled, fails the launch as a backend error without being attached to,
-  adopted, relabeled or removed. Before each container create and start, Fred
-  confirms that the verified ID still resolves to that network, since Docker
-  falls back to a network named with the ID once the original is gone. Compose
-  never creates, removes or reconnects a network. The network stays through re-deploys and is reclaimed by the
-  network worker after the lease is gone, only once the backend tracks no
-  provision for the lease and no command holds its fence, and only by its
-  verified ID. The worker likewise removes a legacy per-tenant network only
-  when it carries that tenant's and this backend's labels, by its verified
-  ID. Fred no longer creates per-tenant networks. A running lease
-  stays on its tenant network until its containers are next recreated
-  (restart, update, custom-domain change, restore or re-provision); that
-  recreate moves every service of the lease, including stopped ones.
 - deps: build with Go 1.26.9 (from 1.26.8) and bump `golang.org/x/net` to
   v0.60.0 (from v0.58.0). This resolves twelve advisories that Fred's code
   reaches:
@@ -2478,6 +2494,87 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   selected at v0.13.0. The bump clears the release's govulncheck gate without
   widening its allowlist. (ENG-1119, ENG-1120)
 
+- docker-backend: every lease now runs on its own Docker network, `fred-<lease_uuid>`,
+  instead of one network shared by all leases of a tenant. On the shared
+  network each service name resolved to that service in every lease of the
+  tenant, so two leases running the same stack answered each other's `db`, and
+  any lease could reach another by address or container name. A tenant that
+  hosts several customers under one address therefore exposed those customers
+  to each other. Service names now resolve only within the lease, and leases
+  cannot reach each other, including leases of the same tenant. Fred creates
+  the lease's network itself and attaches containers only to that network's
+  verified ID: an existing network of that name is used only when it carries
+  this lease's and backend's ownership labels, and any other, foreign or
+  unlabeled, fails the launch as a backend error without being attached to,
+  adopted, relabeled or removed. Before each container create and start, Fred
+  confirms that the verified ID still resolves to that network, since Docker
+  falls back to a network named with the ID once the original is gone. Compose
+  never creates, removes or reconnects a network. The network stays through re-deploys and is reclaimed by the
+  network worker after the lease is gone, only once the backend tracks no
+  provision for the lease and no command holds its fence, and only by its
+  verified ID. The worker likewise removes a legacy per-tenant network only
+  when it carries that tenant's and this backend's labels, by its verified
+  ID. Fred no longer creates per-tenant networks. A running lease
+  stays on its tenant network until its containers are next recreated
+  (restart, update, custom-domain change, restore or re-provision); that
+  recreate moves every service of the lease, including stopped ones.
+
+## [0.13.1] - 2026-10-15
+
+### Added
+
+- `billing_only_skus` lists SKUs the provider bills for but delivers outside
+  Fred. Fred acknowledges a lease whose items all use these SKUs as soon as it
+  sees it, so billing starts at once, and the reconciler retries the
+  acknowledgment on its next sweep, even when no backend answers. Fred never
+  provisions such a lease, never rejects it, and never closes it for a
+  provisioning reason. Before this, an unattached SKU fell through to the
+  default backend, whose unknown-SKU refusal got the lease rejected on chain
+  within seconds; an ACTIVE lease acknowledged by hand was closed on the next
+  sweep. Payload uploads for a billing-only lease are refused with `400` and
+  counted as `fred_payload_uploads_total{outcome="billing_only"}`, and so are
+  restores into one. Withdrawals and the credit check apply as before. A lease
+  that mixes billing-only and deployable SKUs keeps the normal path. Each entry
+  must be a lowercase canonical UUID that no backend serves;
+  `PROVIDER_BILLING_ONLY_SKUS` sets the list from the environment
+  (comma-separated). (ENG-1453)
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+- deps: build with Go 1.26.9 (from 1.26.6) and move the affected modules to the
+  versions main already ships: `golang.org/x/net` v0.60.0 (from v0.57.0),
+  `google.golang.org/grpc` v1.83.2 (from v1.82.1),
+  `github.com/containerd/containerd/v2` v2.3.6 (from v2.3.3) and OpenTelemetry
+  v1.45.0 (from v1.44.0), with their required transitive updates. This resolves
+  sixteen advisories that Fred's code reaches:
+  - HTTP/2 server crash, memory exhaustion and CPU exhaustion (GO-2026-6617,
+    GO-2026-6612, GO-2026-6611, GO-2026-6603);
+  - HTTP/1 and HTTP/2 connection desynchronization and malformed framing
+    (GO-2026-6613, GO-2026-6605, GO-2026-6610);
+  - a MIME header memory-limit bypass (GO-2026-6608);
+  - malformed ECH extensions accepted by `crypto/tls` (GO-2026-6607);
+  - `html/template` escaping (GO-2026-6599, GO-2026-6600);
+  - a Windows-only `os.Root` escape (GO-2026-6604);
+  - gRPC heap exhaustion from fragmented HTTP/2 DATA frames, reachable through
+    the chain client (GO-2026-6348);
+  - containerd image-pull amplification and a CRI ExecSync goroutine leak
+    (GO-2026-6597, GO-2026-6444);
+  - OpenTelemetry exporter configuration logging that can leak endpoint URLs
+    (GO-2026-6505).
+
+  The `go` directive and the Dockerfile builder image move to 1.26.9, so
+  building Fred from source now needs Go 1.26.9 or later. govulncheck now
+  reports only the three allowlisted advisories, so the vulncheck gate passes
+  without widening the allowlist.
+
 ## [0.13.0] - 2026-08-20
 
 ### Added
@@ -2667,14 +2764,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   ownership-checked primitive** (ENG-658). Six call sites each derived their own set
   of volumes to destroy — three from a name prefix, which does not prove ownership:
   while a restore is in flight, the original lease's data physically wears the new
-  lease's canonical name, so a close, a cap-refusal, or a reaping
+  lease's canonical name, so a close, a cap-refusal, an orphan sweep or a reaping
   tombstone could all reach data belonging to another lease. Each site carried (or
   forgot) its own guard, and the recurring result was a data-loss ticket per site
   (ENG-505, ENG-501, ENG-523, ENG-647, ENG-659). Ownership is now resolved once, from
   the live provision map plus the retention store, and a volume is destroyed only when
-  the lease asking owns the bytes. Unattributed managed volumes have no such exact
-  authority and are preserved for operator attribution rather than garbage-collected
-  from inventory inference. The two hand-written derivations of
+  the lease asking owns the bytes; the orphan sweep is the same rule asked with no
+  lease ("destroy only what nothing claims"). The two hand-written derivations of
   "which volumes a restore has claimed" are gone, and `Destroy` has been removed from
   the internal volume-manager interface so reaching it any other way does not compile.
   No configuration or API change; a refusal is visible as
@@ -2822,12 +2918,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   `/health` is now a liveness contract: **it returns 200 whenever the process can
   answer, and never 503s because a dependency is impaired.** No probe here justifies
-  de-registration — there is no peer to shed load onto. Exact callback application
-  may itself need the chain or placement store; keeping the route reachable lets
-  providerd return a deliberate retryable 503 so the backend preserves its durable
-  FIFO head, whereas load-balancer removal severs that recovery protocol entirely.
-  The reconciler's behaviour is unchanged; it was already correct throughout both
-  incidents.
+  de-registration — there is no peer to shed load onto, and accepting a callback
+  touches neither the chain, nor a backend, nor any store, so a 503 severs a working
+  path in order to report a broken one. The reconciler's behaviour is unchanged; it
+  was already correct throughout both incidents.
 
   Two things had to change for "never 503" to be literally true rather than merely
   true of the verdict. Both endpoints are wrapped in `requestTimeoutMiddleware`, which
@@ -2866,9 +2960,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   every consumer reads that as "nothing here". The consequence was not cosmetic: the orphan
   reconcile treats an absent volume as evidence its retention record is orphaned, so an
   empty enumeration made *every* active record look orphaned, pruned them after the
-  confirmation streak, and left their volumes with no record naming them. The
-  destructive risk is now removed at both boundaries: uncertain inventory preserves
-  the record, and there is no automatic unattributed-volume garbage collector.
+  confirmation streak, and left their volumes with no record naming them — so the next
+  boot's orphan sweep destroyed retained tenant data.
 
   Two guards, both in the enumeration primitive so every caller inherits them. At startup
   the configured `volume_filesystem` is now verified against the filesystem actually at
@@ -2900,8 +2993,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   of there being nothing to recount from. The change is "uncounted permanently" →
   "uncounted until the store is repaired"; both halves are pinned by tests.
   The finalizer re-derives the volumes to reclaim on every sweep from the lease's
-  namespace on disk intersected with the ownership table, under the exact reaping
-  tombstone's lease-scoped authority. A reaping record with an empty volume list is therefore normal
+  namespace on disk intersected with the ownership table, which is the same
+  "destroy only what nothing claims" rule the startup orphan sweep already applies,
+  scoped to one lease. A reaping record with an empty volume list is therefore normal
   and not corruption. This also removes the last way a tombstone written by an older
   build could name another lease's adopted data: those stored names are no longer read
   by anything.
@@ -2929,12 +3023,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   No configuration, API or metric change: a refusal from the re-check is counted as the
   same `fred_docker_backend_volume_destroy_refused_total{reason="claimed"}` as any other,
   and reaches the finalizer's existing `retention_reap_skips_total{reason="owner_claimed"}`.
-  The WARN names the live provision hold and explicitly says not to reclaim it by hand.
+  The WARN a kept reaping record emits now names *which* hold it is — a restore's, which
+  clears on that restore's rollback, or a live provision's, which does not and must not be
+  reclaimed by hand. It previously told operators to wait for a rollback in both cases.
 
 - **A reaping tombstone can no longer destroy a re-provisioned lease's live data**
-  (ENG-658). ENG-659 makes a tombstone/restore-destination collision unrepresentable at
-  admission, but a different collision remains possible for historical rows: a
-  deprovision give-up writes a
+  (ENG-658). ENG-659 stopped the retention finalizer from executing a tombstone that
+  named a volume an in-flight *restore* had adopted, but it asked a question scoped to
+  restores only. A second collision was left open: a deprovision give-up writes a
   tombstone naming `fred-{lease}-*` and deletes the provision, while the lease is still
   ACTIVE on chain — so the reconciler re-provisions it, a fresh volume appears under
   exactly the name the tombstone carries, and the next sweep reaped the running lease's
@@ -2944,7 +3040,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   reached through the finalizer rather than the orphan reaper.
 
   **Operators:** this hold is counted as a new
-  `fred_docker_backend_retention_reap_skips_total{reason="owner_claimed"}`. It clears only
+  `fred_docker_backend_retention_reap_skips_total{reason="owner_claimed"}`, kept
+  distinct from `restore_claimed` because the two resolve differently — a
+  restore-held name clears when that restore rolls back, whereas this one clears only
   when the owning lease is next closed cleanly, so the record can legitimately sit
   `reaping` for as long as that lease lives. On a provider carrying such a tombstone
   from an older build, expect `BackendRetentionVolumeStuckReaping` to start firing
@@ -2985,17 +3083,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   but which fred never populated, leaving third-party backends unable to verify
   a payload the contract said was verifiable.
 
-- **A reaping tombstone and an in-flight restore destination are mutually
-  exclusive by construction** (ENG-659). Both transitions consume the same
-  per-lease mutation head: a pending restore prevents close admission, while the
-  permanent close boundary behind every current retention row prevents a later
-  restore operation from targeting that lease. Rejection happens before the
-  source retention can move to `restoring`, eliminating the dangerous state
-  instead of detecting it in each cleanup branch. The finalizer still refuses
-  destruction when live ownership is present and fails closed when ownership is
-  unreadable. `fred_docker_backend_retention_reap_skips_total{reason}` therefore
-  exposes only the reachable `owner_claimed` and `claim_unreadable` cases; see the
-  updated "Reclaiming retained-data / stuck-reaping volumes" runbook.
+- **A reaping tombstone can no longer destroy an in-flight restore's data**
+  (ENG-659). The retention finalizer destroyed every volume name a `reaping`
+  record carried, with no ownership check — the only volume-destroy path in the
+  docker backend without one. ENG-647 stopped a deprovision give-up from
+  *writing* an adopted volume's name into such a record, but tombstones are
+  persisted and outlive the binary: a provider upgrading from an older build
+  still carries records written before that guard existed, and the next sweep
+  executed them, permanently destroying the data a restoring lease had adopted.
+  The finalizer now re-checks ownership at destroy time — a name an in-flight
+  restore claims is skipped and logged, and an unreadable retention store means
+  nothing is destroyed that pass, mirroring the orphan reaper's fail-safe. A
+  skipped name leaves the record `reaping`, so its footprint stays counted and
+  the next sweep retries once that restore's rollback re-quarantines the volume
+  (the only resolution reachable for a tombstoned lease, which has already lost
+  its provision); it is deliberately **not** counted as a leak. New
+  `fred_docker_backend_retention_reap_skips_total{reason}` counts both cases
+  (`restore_claimed`, `claim_unreadable`); see the updated
+  "Reclaiming leaked / stuck-reaping orphan volumes" runbook, since a
+  deliberately-held tombstone must **not** be reclaimed by hand.
 
 - **A failed container teardown is no longer treated as a completed one**
   (ENG-647). When `compose down` failed, the docker backend logged the error and
@@ -3960,11 +4066,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   reaches `doDeprovision` for a lease with no live container / in-flight op (the
   idempotent no-provision short-circuit), it now still deletes the lease's `releases.db`
   history before returning, instead of short-circuiting before the terminal
-  release retirement. This stops a `lease_closed` event delivered after the container
+  `releaseStore.Delete`. This stops a `lease_closed` event delivered after the container
   was already gone from stranding a stale `status=active` record (an `audit-lease-status`
-  false positive) until the 90-day `RemoveOlderThan` TTL. Release retirement now occurs
-  only through the exact `CloseSettlement` claim, in the same terminal transaction as
-  close completion; sibling packages cannot delete release authority directly. (ENG-410)
+  false positive) until the 90-day `RemoveOlderThan` TTL. Best-effort and chain-driven;
+  the three release-history deletes in `doDeprovision` are consolidated behind one helper.
+  Purely cosmetic (no pool/admission/routing impact). (ENG-410)
 
 ### Security
 
@@ -4080,8 +4186,8 @@ restored into a fresh lease, instead of being destroyed on close.
   disables reaping), `retention_reap_interval` (reaper cadence, default `1h`),
   and `max_retained_leases_per_tenant` (per-tenant cap, default `0` = unlimited).
   (ENG-325, #114)
-- **Queryable retention status.** `GET /v1/leases/{uuid}/status` now reports
-  `provision_status: retained` for soft-deleted leases, with
+- **Queryable retention status.** `GET /v1/leases/{uuid}` and the status
+  endpoint now report `provision_status: retained` for soft-deleted leases, with
   `retained_until` (RFC3339 grace deadline), `items` (the restore shape: service
   name / SKU / quantity), and a `restore_hint`. The status is served from the
   durable retention record even after the chain prunes the closed lease, under
