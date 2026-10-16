@@ -1409,8 +1409,11 @@ failure budget.
   in a later window; a new run retries it.
 - `failed` without `restored`: the lease was not proved back on its release.
   Check its status and `/releases` before retrying.
-- `skipped`: the lease was busy with other lifecycle work, or was not Ready,
-  whenever the run tried it. POST again once it is idle.
+- `skipped`: the lease was busy with other lifecycle work, was not Ready, was
+  already under the current contract, or its images could not be pinned,
+  whenever the run tried it. POST again once it is idle. An unpinned lease logs
+  `runtime refresh skipped: the source's exact images are not pinned`: the
+  refresh never recreates a lease from a tag that may name other content.
 - A stale lease that is not Ready (for example Failed) is not counted and not
   refreshed; it is recreated under the current contract by its own recovery.
 

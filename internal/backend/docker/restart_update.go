@@ -275,6 +275,13 @@ func (b *Backend) routeReplaceRestart(
 	if err := validateComposeServiceNames(items); err != nil {
 		return fmt.Errorf("%w: stored topology cannot form an injective Compose project: %w", backend.ErrInvalidState, err)
 	}
+	if route.kind == shared.MaintenanceIntentRuntimeRefresh {
+		// Under the fence: a tenant restart or update may have recreated the
+		// lease under the current contract while it waited for a slot.
+		if err := b.requireRuntimeRefreshStale(ctx, leaseUUID); err != nil {
+			return err
+		}
+	}
 	if len(resourceProfiles) == 0 {
 		var profileErr error
 		resourceProfiles, profileErr = b.activeResourceProfiles(ctx, leaseUUID, authorityItems)
@@ -296,6 +303,21 @@ func (b *Backend) routeReplaceRestart(
 	sourceErr := validateReplaceSourceRelease(active)
 	if sourceErr != nil {
 		return fmt.Errorf("construct restart source authority: %w", sourceErr)
+	}
+	if route.kind == shared.MaintenanceIntentRuntimeRefresh {
+		// The target is the sealed source release itself; its images must be
+		// the exact ones the source runs, pinned before anything is journaled.
+		if err := b.requireRuntimeRefreshSourcePins(ctx, leaseUUID, active); err != nil {
+			return err
+		}
+		admission, admitErr := b.admitRuntimeRefresh(request, sourceClaim)
+		if admitErr != nil {
+			return admitErr
+		}
+		if !admission.created() {
+			return nil
+		}
+		return b.handoffMaintenanceResult(ctx, admission.target)
 	}
 	runtimeAuthority, legacyRuntimeAuthority, authorityErr := releaseRuntimeAuthoritiesForMaintenance(
 		active, tenant, providerUUID, callbackURL, lifecycleCallbackURL,

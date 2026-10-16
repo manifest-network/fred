@@ -343,6 +343,51 @@ func TestMaintenanceCompensationCaptureFailurePreservesObservedHealthySource(t *
 	require.Equal(t, wantServices, services)
 }
 
+// A source the classifier proved ready survives a crash between the terminal
+// failure and its callback settlement: recovery re-establishes the evidence
+// and settles through the same proof, so the receipt still records it.
+func TestMaintenanceRecoveryKeepsAReadySourceOnTheReceiptAfterACrash(t *testing.T) {
+	h := newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate)
+	h.appendTarget(true)
+	mock := h.b.docker.(*mockDockerClient)
+	sourceID := fixtureImageID("source capture unavailable after crash")
+	sources := h.containersFor(h.source, 2, "running", "")
+	for index := range sources {
+		sources[index].execution = frozenCompensationFixture(sources[index], sourceID)
+	}
+	h.inventory.containers = sources
+	mock.InspectImageFn = func(context.Context, string) (*ImageInfo, error) {
+		return nil, errors.New("daemon source image metadata unavailable")
+	}
+	ops, err := storageMutationOperationsForTest(h.b)
+	require.NoError(t, err)
+	require.NoError(t, bindDockerMaintenanceCompensation(h.b, ops))
+	execution, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+	require.NoError(t, err)
+	outcome := h.b.maintenanceSettlement.ExecuteMaintenance(testMaintenanceLifetime(t, t.Context()), execution)
+	failed, ok := outcome.(shared.MaintenanceExecutionFailure)
+	require.True(t, ok, "%T: %v", outcome, outcome)
+	require.True(t, failed.SourceRecovered())
+	proof, err := h.b.maintenanceSettlement.FailMaintenance(failed, backend.ReasonInternal, "source capture failed")
+	require.NoError(t, err)
+	maintenanceID := proof.MaintenanceID()
+
+	// The process stops before the callback settles: the proof is lost.
+	h.reopen()
+	ops, err = storageMutationOperationsForTest(h.b)
+	require.NoError(t, err)
+	require.NoError(t, bindDockerMaintenanceCompensation(h.b, ops))
+	require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
+	h.assertSettled(backend.CallbackStatusFailed)
+
+	settled, found, err := h.b.maintenanceSettlement.SettledMaintenanceByID(h.leaseUUID, maintenanceID)
+	require.NoError(t, err)
+	require.True(t, found)
+	source, ready := settled.SourceReady()
+	require.True(t, ready, "recovery keeps the proven ready source on the receipt")
+	require.Equal(t, h.source.Version, source.Version)
+}
+
 func TestMaintenanceCompensationSettledIncompleteSourceFailsWithoutReplay(t *testing.T) {
 	for _, surviving := range []int{0, 1, 2} {
 		t.Run(strconv.Itoa(surviving), func(t *testing.T) {

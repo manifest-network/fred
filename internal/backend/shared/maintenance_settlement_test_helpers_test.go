@@ -82,7 +82,9 @@ func (s *CallbackStore) NewMaintenanceIntentCandidate(
 		return MaintenanceIntentCandidate{}, errors.New("maintenance source has no issuing release journal")
 	}
 	settlement := maintenancePairForTest(nil, s, source.issuer)
-	return settlement.NewMaintenanceIntentCandidate(
+	// Journal-mechanics fixtures choose any target, a runtime refresh's too;
+	// only the production constructors derive one.
+	return settlement.newMaintenanceIntentCandidate(
 		request,
 		MaintenanceSourceClaim{settlement: settlement, releases: source.issuer, claim: source},
 		target,

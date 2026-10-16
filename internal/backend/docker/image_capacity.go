@@ -286,7 +286,22 @@ func (m *imageCapacityManager) selectedPin(mutations *storageMutations, ref stri
 	return m.pins.Lookup(lease, payload, ref)
 }
 
+// errUnpinnedSourceImage refuses an image a runtime refresh would resolve
+// without an exact pin: a refresh recreates the running workload unchanged, so
+// it may never resolve a mutable tag that may since name other content.
+var errUnpinnedSourceImage = errors.New("a runtime refresh requires the source's pinned image identity")
+
 func (m *imageCapacityManager) prepare(ctx context.Context, mutations *storageMutations, ref string, pull bool) (imageexec.Image, error) {
+	return m.prepareImage(ctx, mutations, ref, pull, false)
+}
+
+// preparePinned admits ref only through its existing pin: the exact image the
+// pin records, never what the tag names now. It never pulls.
+func (m *imageCapacityManager) preparePinned(ctx context.Context, mutations *storageMutations, ref string) (imageexec.Image, error) {
+	return m.prepareImage(ctx, mutations, ref, false, true)
+}
+
+func (m *imageCapacityManager) prepareImage(ctx context.Context, mutations *storageMutations, ref string, pull, requirePin bool) (imageexec.Image, error) {
 	tenantPreparation, err := m.beginTenantPreparation(ctx, mutations)
 	if err != nil {
 		return imageexec.Image{}, err
@@ -298,6 +313,9 @@ func (m *imageCapacityManager) prepare(ctx context.Context, mutations *storageMu
 	}
 	defer admission.close()
 	pin := admission.state.pin
+	if requirePin && pin == nil {
+		return imageexec.Image{}, fmt.Errorf("%w: %s", errUnpinnedSourceImage, ref)
+	}
 	info, err := m.daemon.Info(ctx)
 	if err != nil {
 		return imageexec.Image{}, err

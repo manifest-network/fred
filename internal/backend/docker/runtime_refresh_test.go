@@ -5,11 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/system"
+	"github.com/docker/docker/api/types/volume"
+	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -122,6 +130,83 @@ type runtimeRefreshHarness struct {
 	callbacks []backend.CallbackPayload
 	// leaseNetwork is the lease's own network once a refresh created it.
 	leaseNetwork leaseNetworkAuthority
+	// imageCapacity resolves images only through pins the backfill observes.
+	imageCapacity *imageCapacityManager
+}
+
+// observedImagePins reports one running image identity for ref, standing in for
+// the Docker backfill observer that inspects the lease's running containers.
+type observedImagePins struct {
+	ref, id     string
+	unavailable bool
+}
+
+func (o *observedImagePins) ObserveImagePins(context.Context, shared.ImagePinBackfillSubject) ([]shared.ImagePinBackfillObservation, error) {
+	if o.unavailable {
+		return nil, errors.New("running container cannot be inspected")
+	}
+	return []shared.ImagePinBackfillObservation{{
+		Reference: o.ref, ImageID: o.id, Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"},
+	}}, nil
+}
+
+// attachObservedImageCapacity gives b the production image admission, bound to
+// b's journals, with pins established only by the backfill from observer, and
+// a daemon that holds exactly image id.
+func attachObservedImageCapacity(t *testing.T, b *Backend, ref, id string) *imageCapacityManager {
+	t.Helper()
+	pins, err := shared.NewImagePinJournal(b.callbackStore, b.releaseStore, b.retentionStore)
+	require.NoError(t, err)
+	cfg := DefaultConfig()
+	cfg.ImageMaxSizeMB = 10
+	cfg.ImageDiskMinFreeMB = 2
+	stageRoot := t.TempDir()
+	fs := imageCapacityFS{
+		"/images":                           {total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB)},
+		filepath.Dir(cfg.CallbackDBPath):    {total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB)},
+		filepath.Dir(cfg.ReleasesDBPath):    {total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB)},
+		filepath.Dir(cfg.RetentionDBPath):   {total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB)},
+		filepath.Dir(cfg.DiagnosticsDBPath): {total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB)},
+		stageRoot:                           {total: 100 * uint64(imageMiB), available: 50 * uint64(imageMiB)},
+	}
+	daemon := &dockerSDKView{
+		info: func(context.Context) (system.Info, error) {
+			return system.Info{DockerRootDir: "/images", Driver: "overlay2", OSType: "linux", Architecture: "amd64"}, nil
+		},
+		containerList: func(context.Context, container.ListOptions) ([]container.Summary, error) { return nil, nil },
+		imageList:     func(context.Context, image.ListOptions) ([]image.Summary, error) { return nil, nil },
+		imageInspect: func(_ context.Context, inspected string, _ ...client.ImageInspectOption) (image.InspectResponse, error) {
+			if inspected != id {
+				return image.InspectResponse{}, errdefs.NotFound(errors.New("only the pinned image is cached"))
+			}
+			return image.InspectResponse{ID: id, Size: imageMiB}, nil
+		},
+	}
+	marker := volume.Volume{Name: imageCacheOwnerVolume, Driver: "local", Labels: map[string]string{
+		imageCacheOwnerStorageLabel: b.storageIdentity.String(), imageCacheOwnerBackendLabel: b.cfg.Name, imageCacheOwnerModeLabel: "exclusive",
+	}}
+	daemon.volumeInspect = func(context.Context, string) (volume.Volume, error) { return marker, nil }
+	owner, err := claimImageCacheOwnership(t.Context(), daemon, b.storageAuthority)
+	require.NoError(t, err)
+	m := &imageCapacityManager{lifetime: t.Context(), daemon: daemon, pins: pins, fs: fs, cfg: cfg, stageRoot: stageRoot,
+		gate: make(chan struct{}, 1), probeGate: make(chan struct{}, 1), owner: owner, access: owner}
+	// The backend's own admitter, as in production, where the tag has since
+	// moved to other content: only the pin can name the running image.
+	mock := b.docker.(*mockDockerClient)
+	mock.InspectImageFn = func(_ context.Context, inspected string) (*ImageInfo, error) {
+		switch inspected {
+		case id:
+			return &ImageInfo{ID: id}, nil
+		case ref:
+			return &ImageInfo{ID: fixtureImageID("content the tag names now")}, nil
+		}
+		return nil, errdefs.NotFound(errors.New("image not cached"))
+	}
+	m.runtime = mock.imageAdmitter()
+	m.backfiller, err = shared.NewImagePinBackfiller(pins, &observedImagePins{ref: ref, id: id})
+	require.NoError(t, err)
+	b.imageCapacity = m
+	return m
 }
 
 func newRuntimeRefreshHarness(t *testing.T, status backend.ProvisionStatus) *runtimeRefreshHarness {
@@ -213,6 +298,7 @@ func newRuntimeRefreshHarness(t *testing.T, status backend.ProvisionStatus) *run
 		t, h.b, h.leaseUUID, stack, items, operationID, operationURL, lifecycleURL, callbackServer.Client(),
 	)
 	h.b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	h.imageCapacity = attachObservedImageCapacity(t, h.b, "nginx:latest", fixtureImageID("refresh source image"))
 	h.b.cfg.NetworkIsolation = ptrBool(true)
 	return h
 }
@@ -252,6 +338,8 @@ func TestRuntimeRefreshRecreatesAStaleLeaseAndAttestsTheActiveRelease(t *testing
 	assert.True(t, upOpts[0].ForceRecreate, "a refresh recreates every container")
 	require.NotNil(t, project)
 	assert.Equal(t, currentRuntimeContract.label(), project.Services["app"].Labels[LabelRuntimeContract])
+	assert.Equal(t, fixtureImageID("refresh source image"), project.Services["app"].Image,
+		"the refresh runs the pinned image the source runs, not what the tag names now")
 	require.Contains(t, project.Networks, leaseNetworkKey, "the refreshed lease runs on its own network")
 	assert.Equal(t, testLeaseNetworkID(h.leaseUUID), project.Networks[leaseNetworkKey].Name, "attached by the verified ID")
 
@@ -290,8 +378,8 @@ func TestRuntimeRefreshSkipsALeaseWithACommandInProgress(t *testing.T) {
 	unlock := h.b.commandFence.Lock(h.leaseUUID)
 	defer unlock()
 	h.b.runtimeRefresh.inFlight = map[string]struct{}{}
-	attestation := h.b.refreshLeaseRuntime(t.Context(), h.leaseUUID)
-	assert.Equal(t, RuntimeRefreshLease{LeaseUUID: h.leaseUUID, Outcome: RuntimeRefreshSkipped}, attestation)
+	outcome := h.b.refreshLeaseRuntime(t.Context(), h.leaseUUID)
+	assert.Equal(t, runtimeRefreshRunOutcome{row: RuntimeRefreshLease{LeaseUUID: h.leaseUUID, Outcome: RuntimeRefreshSkipped}}, outcome)
 	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
 	require.NoError(t, err)
 	assert.Empty(t, intents, "a busy lease journals nothing")
@@ -410,8 +498,9 @@ func TestSelectSharedNetworkLeases(t *testing.T) {
 	}
 }
 
-// A lease's durable receipt row wins over this run's memory, except over a row
-// naming a newer maintenance whose settlement is not retained.
+// A lease's durable receipt row wins over this run's memory, except over an
+// unsettled row naming a newer maintenance. Memory never republishes a settled
+// outcome, and never a row for a lease no longer tracked.
 func TestRuntimeRefreshStatusPrefersDurableReceiptRows(t *testing.T) {
 	h := newRuntimeRefreshHarness(t, backend.ProvisionStatusReady)
 	_, err := h.b.StartRuntimeRefresh(t.Context())
@@ -421,26 +510,47 @@ func TestRuntimeRefreshStatusPrefersDurableReceiptRows(t *testing.T) {
 	durable := first.Leases[0]
 	require.Equal(t, RuntimeRefreshRefreshed, durable.Outcome)
 
+	const closed = "550e8400-e29b-41d4-a716-446655440099"
+	newer := runtimeRefreshUnsettledFailureRow(h.leaseUUID, "6ba7b812-9dad-41d1-80b4-00c04fd430c8")
 	controller := &h.b.runtimeRefresh
 	for name, tc := range map[string]struct {
-		memory RuntimeRefreshLease
-		want   RuntimeRefreshLease
+		memory map[string]runtimeRefreshRunOutcome
+		want   []RuntimeRefreshLease
 	}{
-		"skipped in this run":          {memory: runtimeRefreshSkippedRow(h.leaseUUID), want: durable},
-		"refused before admission":     {memory: runtimeRefreshUnsettledFailureRow(h.leaseUUID, ""), want: durable},
-		"the same settled maintenance": {memory: durable, want: durable},
+		"skipped in this run": {
+			memory: map[string]runtimeRefreshRunOutcome{h.leaseUUID: {row: runtimeRefreshSkippedRow(h.leaseUUID)}},
+			want:   []RuntimeRefreshLease{durable},
+		},
+		"refused before admission": {
+			memory: map[string]runtimeRefreshRunOutcome{h.leaseUUID: {row: runtimeRefreshUnsettledFailureRow(h.leaseUUID, "")}},
+			want:   []RuntimeRefreshLease{durable},
+		},
+		"the same settled maintenance": {
+			memory: map[string]runtimeRefreshRunOutcome{h.leaseUUID: {row: durable, settled: true}},
+			want:   []RuntimeRefreshLease{durable},
+		},
 		"a newer, unsettled refresh": {
-			memory: runtimeRefreshUnsettledFailureRow(h.leaseUUID, "6ba7b812-9dad-41d1-80b4-00c04fd430c8"),
-			want:   runtimeRefreshUnsettledFailureRow(h.leaseUUID, "6ba7b812-9dad-41d1-80b4-00c04fd430c8"),
+			memory: map[string]runtimeRefreshRunOutcome{h.leaseUUID: {row: newer}},
+			want:   []RuntimeRefreshLease{newer},
+		},
+		"a settled outcome whose receipt is gone": {
+			memory: map[string]runtimeRefreshRunOutcome{
+				closed: {row: RuntimeRefreshLease{LeaseUUID: closed, MaintenanceID: "6ba7b813-9dad-41d1-80b4-00c04fd430c8", Outcome: RuntimeRefreshRefreshed}, settled: true},
+			},
+			want: []RuntimeRefreshLease{durable},
+		},
+		"an unsettled outcome of a lease no longer tracked": {
+			memory: map[string]runtimeRefreshRunOutcome{closed: {row: runtimeRefreshSkippedRow(closed)}},
+			want:   []RuntimeRefreshLease{durable},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			controller.mu.Lock()
-			controller.leases = map[string]RuntimeRefreshLease{h.leaseUUID: tc.memory}
+			controller.leases = tc.memory
 			controller.mu.Unlock()
 			status, err := h.b.RuntimeRefreshStatus(t.Context())
 			require.NoError(t, err)
-			assert.Equal(t, []RuntimeRefreshLease{tc.want}, status.Leases)
+			assert.Equal(t, tc.want, status.Leases)
 		})
 	}
 
@@ -484,4 +594,68 @@ func TestRuntimeInventoryPassPublishesGaugesAndKeepsThemOnError(t *testing.T) {
 	assert.Equal(t, 1.0, testutil.ToFloat64(runtimeStaleLeases), "a failed read keeps the last completed value")
 	assert.Equal(t, 2.0, testutil.ToFloat64(runtimeSharedNetworkLeases))
 	assert.Equal(t, failed+1, testutil.ToFloat64(runtimeInventoryTotal.WithLabelValues("error")))
+}
+
+// A lease brought under the current contract while it waited for a slot (a
+// tenant restart, say) is refused under the fence, journals nothing, and is
+// reported as skipped; an unreadable inventory is retried, never a failure.
+func TestRuntimeRefreshRechecksStalenessUnderTheFence(t *testing.T) {
+	h := newRuntimeRefreshHarness(t, backend.ProvisionStatusReady)
+	h.b.runtimeRefresh.inFlight = map[string]struct{}{}
+	h.mu.Lock()
+	h.substrate.RuntimeContract = currentRuntimeContract
+	h.mu.Unlock()
+	outcome := refreshWithin(t, h.b, h.leaseUUID)
+	assert.Equal(t, runtimeRefreshRunOutcome{row: runtimeRefreshSkippedRow(h.leaseUUID)}, outcome)
+	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
+	require.NoError(t, err)
+	assert.Empty(t, intents, "an already-current lease journals nothing")
+	h.mu.Lock()
+	assert.Empty(t, h.upOpts, "an already-current lease is never recreated")
+	h.mu.Unlock()
+
+	mock := h.b.docker.(*mockDockerClient)
+	mock.ListManagedContainersFn = func(context.Context) ([]ContainerInfo, error) {
+		return nil, errors.New("docker unavailable")
+	}
+	outcome = refreshWithin(t, h.b, h.leaseUUID)
+	assert.Equal(t, runtimeRefreshRunOutcome{row: runtimeRefreshSkippedRow(h.leaseUUID)}, outcome,
+		"an unreadable inventory is retried by a later pass")
+}
+
+// Without a pin for the source's image, and with no way to observe the running
+// image, a refresh is never admitted: it would resolve a tag that may name
+// other content. The lease is skipped and retried; nothing is journaled.
+func TestRuntimeRefreshRequiresTheSourcesPinnedImages(t *testing.T) {
+	h := newRuntimeRefreshHarness(t, backend.ProvisionStatusReady)
+	h.b.runtimeRefresh.inFlight = map[string]struct{}{}
+	pins, err := shared.NewImagePinJournal(h.b.callbackStore, h.b.releaseStore, h.b.retentionStore)
+	require.NoError(t, err)
+	h.imageCapacity.backfiller, err = shared.NewImagePinBackfiller(pins, &observedImagePins{unavailable: true})
+	require.NoError(t, err)
+
+	outcome := h.b.refreshLeaseRuntime(t.Context(), h.leaseUUID)
+	assert.Equal(t, runtimeRefreshRunOutcome{row: runtimeRefreshSkippedRow(h.leaseUUID)}, outcome)
+	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
+	require.NoError(t, err)
+	assert.Empty(t, intents, "an unpinned source journals nothing")
+	h.mu.Lock()
+	assert.Empty(t, h.upOpts)
+	h.mu.Unlock()
+}
+
+// refreshWithin refreshes lease and fails, rather than hangs, when an admitted
+// refresh never settles.
+func refreshWithin(t *testing.T, b *Backend, lease string) runtimeRefreshRunOutcome {
+	t.Helper()
+	done := make(chan runtimeRefreshRunOutcome, 1)
+	go func() { done <- b.refreshLeaseRuntime(t.Context(), lease) }()
+	select {
+	case outcome := <-done:
+		return outcome
+	case <-time.After(30 * time.Second):
+		b.stopCancel()
+		t.Fatal("the refresh was admitted and never settled")
+		return runtimeRefreshRunOutcome{}
+	}
 }

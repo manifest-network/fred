@@ -20,7 +20,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   attestation per lease: `refreshed` (with the maintenance ID its new
   containers carry), `failed`, or `skipped`. A `failed` refresh that settled
   with the lease's pre-refresh release as its running, ready cohort carries
-  `restored` with that release's version and digest. Attestations are read
+  `restored` with that release's version and digest. A refresh's target is
+  the lease's active release itself, derived from the sealed source, and its
+  images are admitted only through their pins, so it recreates exactly what
+  runs; a lease whose images cannot be pinned is skipped. Attestations are read
   from each lease's maintenance receipt, so they survive a backend restart
   and later runs; the receipt now records that fact when a failed
   maintenance settles. Nothing starts a refresh automatically. New metrics:

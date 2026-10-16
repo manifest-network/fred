@@ -75,6 +75,35 @@ func (b *ImagePinBackfiller) Sweep(ctx context.Context) (ImagePinBackfillReport,
 	return report, err
 }
 
+// SweepLease enriches one lease's active generation, as Sweep does for every
+// lease: only from positive physical evidence of its running cohort.
+func (b *ImagePinBackfiller) SweepLease(ctx context.Context, lease string) (ImagePinBackfillReport, error) {
+	var report ImagePinBackfillReport
+	if ctx == nil || b == nil || b.journal == nil || !b.journal.valid() || !retentionStoreIsOpen(b.journal.retentions) {
+		return report, errors.New("image pin backfill requires live ownership")
+	}
+	err := b.journal.withLockedPins(func(pins *lockedImagePins) error {
+		unlock, err := b.journal.lockLeaseContext(ctx, lease)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		added, unresolved, err := pins.sweepLease(ctx, lease, b.observer)
+		var unavailable *unavailableImagePinEvidence
+		var capacity *imagePinCapacityRefusal
+		if errors.As(err, &unavailable) || errors.As(err, &capacity) {
+			report.UnresolvedLeases = 1
+			return nil
+		}
+		report.PinsAdded = added
+		if unresolved {
+			report.UnresolvedLeases = 1
+		}
+		return err
+	})
+	return report, err
+}
+
 func (pins *lockedImagePins) sweep(ctx context.Context, observer ImagePinBackfillObserver) (ImagePinBackfillReport, error) {
 	var report ImagePinBackfillReport
 	j := pins.journal

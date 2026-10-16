@@ -1964,19 +1964,31 @@ response header); the storage-bound form is
 
 Each lease is refreshed through the same journaled, restart-shaped maintenance
 a custom-domain change uses, under its own `runtime_refresh` maintenance kind
-and receipt window. Every container is recreated (force-recreate) from the
-local image; nothing is pulled. The refresh is FailCount-neutral: a failure
+and receipt window. Its target is derived from the lease's active release
+itself, unchanged: the settlement constructs it from the sealed source, and no
+caller supplies any part of it. Every container is recreated (force-recreate)
+from the exact image the source runs: the refresh admits images only through
+their pins, never through a tag that may since name other content, and nothing
+is pulled. A missing pin is first established from the running containers, as
+the startup backfill does; a lease whose images still cannot be pinned is not
+refreshed. The refresh is FailCount-neutral: a failure
 that rolls back leaves the lease Ready on its pre-refresh release, with no
 error and no failure-budget effect, and is reported as `failed` with
 `restored`. A rollback that recreated the release runs copies of its
 containers with new container IDs; a target that failed before displacing the
 release leaves its containers unchanged. The tenant sees
 `restarting`, then `ready`, a maintenance callback, and one new `/releases`
-entry with the same manifest. A lease whose lifecycle command fence is busy
-(another command in progress) or that stops being Ready is retried on a later
-pass and, if never refreshed, reported as `skipped`. A run retries busy leases
-every 10 seconds, never retries a lease that failed, ends when no stale lease
-is left to attempt, and gives up after one hour; a new POST starts a new run.
+entry with the same manifest. Under the lease's command fence, just before
+anything is journaled, the refresh checks again that the lease still has a
+container under an older contract. A lease whose fence is busy (another command
+in progress), that stops being Ready, that a tenant restart or update already
+brought under the current contract, whose containers could not be read, or
+whose images could not be pinned is retried on a later pass and, if never
+refreshed, reported as `skipped`. A lease holds its slot until its admitted
+maintenance settles, however long a rollback takes: only the receipt completes
+it. A run retries skipped leases every 10 seconds, never retries a lease that
+failed, stops starting leases after one hour, ends once every admitted lease
+has settled, and a new POST starts a new run.
 
 ### `GET /runtime_refresh` (authenticated)
 

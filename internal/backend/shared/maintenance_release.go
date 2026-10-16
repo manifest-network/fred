@@ -268,6 +268,24 @@ type MaintenanceSourceClaim struct {
 	settlement *MaintenanceSettlement
 	releases   *ReleaseStore
 	claim      ReleaseClaim
+	// release is the exact active release the claim seals.
+	release Release
+}
+
+// sealedRelease returns the exact release this claim seals, verified against
+// the claim's digest.
+func (source MaintenanceSourceClaim) sealedRelease() (Release, error) {
+	if !source.Valid() {
+		return Release{}, errors.New("maintenance source release was not claimed")
+	}
+	encoded, err := json.Marshal(source.release)
+	if err != nil {
+		return Release{}, fmt.Errorf("marshal sealed source release: %w", err)
+	}
+	if source.release.Version != source.claim.Version() || sha256.Sum256(encoded) != source.claim.Digest() {
+		return Release{}, errors.New("maintenance source claim does not seal its release")
+	}
+	return cloneRelease(source.release), nil
 }
 
 func (source MaintenanceSourceClaim) Valid() bool {
@@ -566,7 +584,7 @@ func (s *MaintenanceSettlement) ClaimLatestActive(
 	if err != nil {
 		return Release{}, MaintenanceSourceClaim{}, err
 	}
-	return release, MaintenanceSourceClaim{settlement: s, releases: s.releases, claim: claim}, nil
+	return release, MaintenanceSourceClaim{settlement: s, releases: s.releases, claim: claim, release: cloneRelease(release)}, nil
 }
 
 // CheckAppendMaintenanceCapacity proves that the exact source is still active

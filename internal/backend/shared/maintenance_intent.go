@@ -84,6 +84,49 @@ func (s *MaintenanceSettlement) NewMaintenanceIntentCandidate(
 	source MaintenanceSourceClaim,
 	targetRelease Release,
 ) (MaintenanceIntentCandidate, error) {
+	if request.Kind() == MaintenanceIntentRuntimeRefresh {
+		return MaintenanceIntentCandidate{}, errors.New(
+			"a runtime refresh target is derived from its source; use NewRuntimeRefreshIntentCandidate",
+		)
+	}
+	return s.newMaintenanceIntentCandidate(request, source, targetRelease)
+}
+
+// NewRuntimeRefreshIntentCandidate is the only constructor of a runtime_refresh
+// candidate. A refresh recreates the source's exact workload, so its target is
+// derived from the sealed source release itself: the same payload, and so the
+// same image pins, the same items, resource profiles, lineage and runtime
+// authority. Only the version-zero deploying shape and its creation time are
+// new; no caller supplies any part of the target.
+func (s *MaintenanceSettlement) NewRuntimeRefreshIntentCandidate(
+	request MaintenanceRequestAuthority,
+	source MaintenanceSourceClaim,
+) (MaintenanceIntentCandidate, error) {
+	if request.Kind() != MaintenanceIntentRuntimeRefresh {
+		return MaintenanceIntentCandidate{}, fmt.Errorf("a %q request is not a runtime refresh", request.Kind())
+	}
+	if source.settlement != s {
+		return MaintenanceIntentCandidate{}, errors.New(
+			"maintenance source release was not claimed by this journal pair",
+		)
+	}
+	target, err := source.sealedRelease()
+	if err != nil {
+		return MaintenanceIntentCandidate{}, err
+	}
+	target.Version = 0
+	target.MaintenanceID = MaintenanceID{}
+	target.Status = "deploying"
+	target.Error, target.Reason, target.Message = "", "", ""
+	target.CreatedAt = time.Now()
+	return s.newMaintenanceIntentCandidate(request, source, target)
+}
+
+func (s *MaintenanceSettlement) newMaintenanceIntentCandidate(
+	request MaintenanceRequestAuthority,
+	source MaintenanceSourceClaim,
+	targetRelease Release,
+) (MaintenanceIntentCandidate, error) {
 	if s == nil || s.callbacks == nil || s.releases == nil || request.issuer != s.callbacks ||
 		(request.settlement != nil && request.settlement != s) {
 		return MaintenanceIntentCandidate{}, errors.New(

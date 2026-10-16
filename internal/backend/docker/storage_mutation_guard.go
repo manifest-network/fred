@@ -368,8 +368,27 @@ func (m *storageMutations) requireLease(leaseUUID, operation string) error {
 	return nil
 }
 
+// recreatesRunningWorkload reports a runtime refresh, which recreates the
+// source's exact workload: its images may come only from existing pins.
+func (m *storageMutations) recreatesRunningWorkload() bool {
+	return m.maintenanceSubject.Valid() && m.maintenanceSubject.Intent().Kind() == shared.MaintenanceIntentRuntimeRefresh
+}
+
+// admitPinnedImage admits reference only through its existing pin.
+func (m *storageMutations) admitPinnedImage(ctx context.Context, reference string) (imageexec.Image, error) {
+	capacity := m.ops.backend.imageCapacity
+	if capacity == nil {
+		return imageexec.Image{}, fmt.Errorf("%w: no image pin journal", errUnpinnedSourceImage)
+	}
+	return capacity.preparePinned(ctx, m, reference)
+}
+
 func (m *storageMutations) pullImage(ctx context.Context, image string, timeout time.Duration) error {
 	return m.runner.Prepare(ctx, "pull image", func(ctx context.Context) error {
+		if m.recreatesRunningWorkload() {
+			_, err := m.admitPinnedImage(ctx, image)
+			return err
+		}
 		if capacity := m.ops.backend.imageCapacity; capacity != nil {
 			ctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
@@ -384,6 +403,10 @@ func (m *storageMutations) admitImage(ctx context.Context, reference string) (ad
 	err = m.runner.Prepare(ctx, "admit image", func(ctx context.Context) error {
 		ctx, cancel := context.WithTimeout(ctx, m.ops.backend.cfg.ImagePullTimeout)
 		defer cancel()
+		if m.recreatesRunningWorkload() {
+			admitted, err = m.admitPinnedImage(ctx, reference)
+			return err
+		}
 		if capacity := m.ops.backend.imageCapacity; capacity != nil {
 			admitted, err = capacity.prepare(ctx, m, reference, false)
 			return err

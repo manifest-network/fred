@@ -70,6 +70,31 @@ func (b *Backend) admitMaintenance(
 		return maintenanceAdmission{},
 			fmt.Errorf("construct %s maintenance authority: %w", request.Kind(), err)
 	}
+	return b.admitMaintenanceCandidate(request, candidate)
+}
+
+// admitRuntimeRefresh admits a runtime refresh whose target the settlement
+// derives from the sealed source release; the caller supplies no target.
+func (b *Backend) admitRuntimeRefresh(
+	request shared.MaintenanceRequestAuthority,
+	source shared.MaintenanceSourceClaim,
+) (maintenanceAdmission, error) {
+	if b.callbackStore == nil || b.releaseStore == nil {
+		return maintenanceAdmission{},
+			errors.New("durable callback and release stores are required for maintenance")
+	}
+	candidate, err := b.maintenanceSettlement.NewRuntimeRefreshIntentCandidate(request, source)
+	if err != nil {
+		return maintenanceAdmission{},
+			fmt.Errorf("construct %s maintenance authority: %w", request.Kind(), err)
+	}
+	return b.admitMaintenanceCandidate(request, candidate)
+}
+
+func (b *Backend) admitMaintenanceCandidate(
+	request shared.MaintenanceRequestAuthority,
+	candidate shared.MaintenanceIntentCandidate,
+) (maintenanceAdmission, error) {
 	admission, err := b.maintenanceSettlement.BeginMaintenanceIntent(candidate)
 	if err != nil {
 		if errors.Is(err, shared.ErrMaintenanceIntentConflict) {
@@ -453,16 +478,15 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 						}
 						return fmt.Errorf("maintenance cleanup lacks definitive failure evidence (%T)", physical)
 					}
-					if targetRelease.Status == "deploying" {
-						if _, failErr := b.maintenanceSettlement.FailMaintenance(
-							failure, maintenanceFailureReason(intent.Kind()), string(intent.Kind())+" interrupted",
-						); failErr != nil {
-							return fmt.Errorf("fail interrupted maintenance target: %w", failErr)
-						}
-					}
-					failed, proofErr := b.maintenanceSettlement.ProveMaintenanceFailure(intent)
-					if proofErr != nil {
-						return fmt.Errorf("prove failed maintenance target: %w", proofErr)
+					// FailMaintenance is idempotent for a target already failed before
+					// a crash, and its proof carries the physical evidence this cleanup
+					// just re-established: a source the classifier proved ready
+					// reaches the receipt even when the original proof was lost.
+					failed, failErr := b.maintenanceSettlement.FailMaintenance(
+						failure, maintenanceFailureReason(intent.Kind()), string(intent.Kind())+" interrupted",
+					)
+					if failErr != nil {
+						return fmt.Errorf("fail interrupted maintenance target: %w", failErr)
 					}
 					after, listErr := b.listManagedContainersStrictForRecovery(ctx)
 					if listErr != nil {

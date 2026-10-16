@@ -2,6 +2,7 @@ package shared
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -73,4 +74,54 @@ func TestRuntimeRefreshChurnNeverEvictsOtherReceipts(t *testing.T) {
 	assert.False(t, lineage.ProviderEvicted)
 	assert.True(t, lineage.HighWaterAdmittedAt.IsZero(), "a backend-minted command never moves the mark")
 	require.NoError(t, callbacks.Healthy())
+}
+
+// A runtime refresh can only be constructed from its source: the general
+// constructor refuses any caller-supplied target for it, and the dedicated one
+// derives the unchanged workload from the sealed source release.
+func TestRuntimeRefreshCandidateIsDerivedFromItsSource(t *testing.T) {
+	stores := openOperationHandoffStores(t, "docker-a")
+	settlement, err := NewMaintenanceSettlement(stores.callbacks, stores.releases)
+	require.NoError(t, err)
+	leaseUUID := testLeaseUUID("runtime-refresh-candidate")
+	require.NoError(t, stores.releases.appendActive(leaseUUID, validRuntimeAuthorityRelease()))
+	active, source, err := settlement.ClaimLatestActive(leaseUUID)
+	require.NoError(t, err)
+	authority, ok := active.RuntimeIdentity()
+	require.True(t, ok)
+	request, err := settlement.NewMaintenanceRequestAuthority(
+		newTestMaintenanceID(t), MaintenanceIntentRuntimeRefresh, leaseUUID, authority.LifecycleCallbackURL(), nil,
+	)
+	require.NoError(t, err)
+
+	foreign := cloneRelease(active)
+	foreign.Version, foreign.Status, foreign.CreatedAt = 0, "deploying", time.Now()
+	foreign.Manifest = []byte(`{"services":{"app":{"image":"redis:7"}}}`)
+	_, err = settlement.NewMaintenanceIntentCandidate(request, source, foreign)
+	require.Error(t, err, "no caller-supplied target can become a runtime refresh")
+
+	candidate, err := settlement.NewRuntimeRefreshIntentCandidate(request, source)
+	require.NoError(t, err)
+	target := candidate.targetRelease
+	assert.Equal(t, active.Manifest, target.Manifest)
+	assert.Equal(t, active.Items, target.Items)
+	assert.Equal(t, active.ResourceProfiles, target.ResourceProfiles)
+	assert.Equal(t, active.OperationID, target.OperationID)
+	assert.Equal(t, active.RuntimeAuthority, target.RuntimeAuthority)
+	assert.Equal(t, active.LegacyRuntimeAuthority, target.LegacyRuntimeAuthority)
+	assert.Zero(t, target.Version)
+	assert.Equal(t, "deploying", target.Status)
+	assert.True(t, target.MaintenanceID.IsZero())
+
+	restart, err := settlement.NewMaintenanceRequestAuthority(
+		newTestMaintenanceID(t), MaintenanceIntentRestart, leaseUUID, authority.LifecycleCallbackURL(), nil,
+	)
+	require.NoError(t, err)
+	_, err = settlement.NewRuntimeRefreshIntentCandidate(restart, source)
+	require.Error(t, err, "only a runtime refresh request derives its target")
+
+	unsealed := source
+	unsealed.release.Manifest = foreign.Manifest
+	_, err = settlement.NewRuntimeRefreshIntentCandidate(request, unsealed)
+	require.Error(t, err, "a claim that does not seal its release is refused")
 }
