@@ -144,10 +144,23 @@ func decodeReleaseHistory(value []byte) ([]Release, error) {
 	return envelope.Releases, nil
 }
 
-func decodeLegacyReleaseHistory(value []byte) ([]Release, error) {
+// v013ReleaseHistory is a release history decoded from the bare array v0.13
+// wrote. decodeLegacyReleaseHistory is its only constructor, and
+// legacyReleaseJSON has no field for post-v0.13 authority (maintenance or
+// operation IDs, items, resource profiles, runtime authority), so every row is
+// v0.13 wire form by construction rather than by inspection. The
+// duplicate-active and deploying-tail recognizers accept only this type, and
+// only adoptV013ReleaseHistory calls them, so their tolerance can never reach a
+// current envelope history. TestStoppedReleaseHistoryTypesStayAtTheirChokePoints
+// pins who mints it and who reads its rows.
+type v013ReleaseHistory struct {
+	v013Rows []Release
+}
+
+func decodeLegacyReleaseHistory(value []byte) (v013ReleaseHistory, error) {
 	var legacy []legacyReleaseJSON
 	if err := decodeStrictAuthoritativeArray(value, maxAuthoritativeRecordBytes, &legacy); err != nil {
-		return nil, err
+		return v013ReleaseHistory{}, err
 	}
 	releases := make([]Release, len(legacy))
 	for index, old := range legacy {
@@ -162,7 +175,7 @@ func decodeLegacyReleaseHistory(value []byte) ([]Release, error) {
 			Message:   old.Message,
 		}
 	}
-	return releases, nil
+	return v013ReleaseHistory{v013Rows: releases}, nil
 }
 
 var versionlessCurrentReleaseFields = map[string]struct{}{
@@ -604,8 +617,8 @@ type ReleaseStoreInspection struct {
 	capacity map[string]releaseHistoryCapacitySnapshot
 	// RequiresLegacyNormalization reports a wire-recognizable v0.13 history
 	// whose redundant authority rows must be normalized atomically with identity
-	// binding (duplicate RecordMigration active or semantically identical
-	// post-active deploying retries).
+	// binding (older active rows left by RecordMigration or Provision, or
+	// semantically identical post-active deploying retries).
 	RequiresLegacyNormalization bool
 }
 
@@ -831,7 +844,10 @@ func checkReleaseHistoryCapacitySnapshot(
 // InspectReleaseStoreReadOnly validates every durable history without
 // creating a database, bucket, binding, or cleanup goroutine.
 func InspectReleaseStoreReadOnly(dbPath string) (ReleaseStoreInspection, error) {
-	return inspectReleaseStoreReadOnlyFile(pathnameAuthoritativeStoreFile(dbPath), false)
+	return inspectReleaseStoreReadOnlyFile(
+		pathnameAuthoritativeStoreFile(dbPath),
+		parseStrictStoredReleaseHistory,
+	)
 }
 
 // InspectBoundReleaseStoreReadOnly is the descriptor-relative form used by a
@@ -843,17 +859,17 @@ func InspectBoundReleaseStoreReadOnly(
 	if err != nil {
 		return ReleaseStoreInspection{}, err
 	}
-	return inspectReleaseStoreReadOnlyFile(file, false)
+	return inspectReleaseStoreReadOnlyFile(file, parseStrictStoredReleaseHistory)
 }
 
 // InspectBoundLegacyReleaseStoreReadOnly is the stopped-v0.13 adoption
-// inspector. In addition to current histories, it accepts the one
-// wire-recognizable multi-active history produced by v0.13 RecordMigration:
-// an older flat-manifest active row followed by its semantically identical
-// stack-wrapped active row. The later row was already v0.13 LatestActive
-// authority. It also recognizes post-active v0.13 Update/Restart deploying
-// rows only when every complete parsed manifest is semantically identical to
-// LatestActive. The identity-binding transaction normalizes redundant older
+// inspector. In addition to current histories, it accepts the wire-recognizable
+// multi-active histories that v0.13 RecordMigration and Provision (including a
+// re-provision of a failed lease) wrote by appending an active row without
+// superseding the older one. The newest active row was already v0.13
+// LatestActive authority. It also recognizes post-active v0.13 Update/Restart
+// deploying rows only when every complete parsed manifest is semantically
+// identical to LatestActive. The identity-binding transaction normalizes older
 // actives and equivalent deploying retries to superseded before a current store
 // can open the journal; a distinct deploying manifest remains ambiguous and is
 // rejected without mutation.
@@ -864,12 +880,12 @@ func InspectBoundLegacyReleaseStoreReadOnly(
 	if err != nil {
 		return ReleaseStoreInspection{}, err
 	}
-	return inspectReleaseStoreReadOnlyFile(file, true)
+	return inspectReleaseStoreReadOnlyFile(file, parseStoppedV013ReleaseHistory)
 }
 
 func inspectReleaseStoreReadOnlyFile(
 	file authoritativeStoreFile,
-	allowLegacyMultipleActive bool,
+	parseHistory func([]byte) (strictReleaseHistory, error),
 ) (ReleaseStoreInspection, error) {
 	if _, err := file.Lstat(); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -890,12 +906,14 @@ func inspectReleaseStoreReadOnlyFile(
 	}
 	err = db.View(func(tx *bolt.Tx) error {
 		inspection.IdentityBound = tx.Bucket(storeIdentityBucketName) != nil
-		requiresNormalization, inspectErr := inspectReleaseBucketForAdoption(
+		budget := newStoppedAuthoritativeInspectionBudget()
+		requiresNormalization, inspectErr := inspectReleaseBucketWithObserver(
 			tx,
 			inspection.ActiveLeaseUUIDs,
 			inspection.ActiveReleases,
 			inspection.capacity,
-			allowLegacyMultipleActive,
+			budget.observe,
+			parseHistory,
 		)
 		inspection.RequiresLegacyNormalization = requiresNormalization
 		return inspectErr
@@ -912,38 +930,12 @@ func inspectReleaseBucket(tx *bolt.Tx) error {
 		nil,
 		nil,
 		nil,
-		false,
 		func(key, value []byte) error {
 			return validateAuthoritativeRecord(key, value, maxAuthoritativeRecordBytes)
 		},
-		decodeReleaseHistory,
+		parseCurrentReleaseHistory,
 	)
 	return err
-}
-
-func inspectReleaseBucketForAdoption(
-	tx *bolt.Tx,
-	active map[string]struct{},
-	activeReleases map[string]Release,
-	capacity map[string]releaseHistoryCapacitySnapshot,
-	allowLegacyMultipleActive bool,
-) (bool, error) {
-	budget := newStoppedAuthoritativeInspectionBudget()
-	return inspectReleaseBucketWithObserver(
-		tx,
-		active,
-		activeReleases,
-		capacity,
-		allowLegacyMultipleActive,
-		budget.observe,
-		func(value []byte) ([]Release, error) {
-			trimmed := bytes.TrimSpace(value)
-			if len(trimmed) > 0 && trimmed[0] == '{' {
-				return decodeReleaseHistory(value)
-			}
-			return decodeLegacyReleaseHistory(value)
-		},
-	)
 }
 
 func inspectReleaseBucketWithObserver(
@@ -951,9 +943,8 @@ func inspectReleaseBucketWithObserver(
 	active map[string]struct{},
 	activeReleases map[string]Release,
 	capacity map[string]releaseHistoryCapacitySnapshot,
-	allowLegacyMultipleActive bool,
 	observe func(key, value []byte) error,
-	decodeHistory func([]byte) ([]Release, error),
+	parseHistory func([]byte) (strictReleaseHistory, error),
 ) (bool, error) {
 	bucket := tx.Bucket(releasesBucketName)
 	if bucket == nil {
@@ -962,8 +953,8 @@ func inspectReleaseBucketWithObserver(
 	if observe == nil {
 		return false, errors.New("release record observer is required")
 	}
-	if decodeHistory == nil {
-		return false, errors.New("release history decoder is required")
+	if parseHistory == nil {
+		return false, errors.New("release history parser is required")
 	}
 	requiresNormalization := false
 	err := bucket.ForEach(func(key, value []byte) error {
@@ -976,25 +967,14 @@ func inspectReleaseBucketWithObserver(
 		if !backend.IsCanonicalLeaseUUID(string(key)) {
 			return fmt.Errorf("release history key with length %d is not a canonical lease UUID", len(key))
 		}
-		releases, err := decodeHistory(value)
+		history, err := parseHistory(value)
 		if err != nil {
-			return fmt.Errorf("decode release history for lease %q: %w", string(key), err)
+			return fmt.Errorf("release history for lease %q: %w", string(key), err)
 		}
-		legacyMultipleActive, err := validateReleaseHistoryForAdoption(
-			releases,
-			allowLegacyMultipleActive,
-		)
-		if err != nil {
-			return fmt.Errorf("validate release history for lease %q: %w", string(key), err)
-		}
-		requiresNormalization = requiresNormalization || legacyMultipleActive
-		capacityHistory := releases
-		if legacyMultipleActive {
-			capacityHistory, err = normalizeLegacyReleaseHistoryForAdoption(releases)
-			if err != nil {
-				return fmt.Errorf("normalize release history for lease %q for capacity proof: %w", string(key), err)
-			}
-		}
+		requiresNormalization = requiresNormalization || history.normalizedFromV013
+		// Capacity, presence, and LatestActive all read the strict history the
+		// store will hold after binding, never the stored multi-active rows.
+		releases := history.strictRows
 		activeIndex := latestActiveReleaseIndex(releases)
 		if activeIndex >= 0 {
 			if active != nil {
@@ -1005,7 +985,7 @@ func inspectReleaseBucketWithObserver(
 			}
 		}
 		if capacity != nil {
-			snapshot, snapshotErr := newReleaseHistoryCapacitySnapshot(capacityHistory)
+			snapshot, snapshotErr := newReleaseHistoryCapacitySnapshot(releases)
 			if snapshotErr != nil {
 				return fmt.Errorf("snapshot release history for lease %q: %w", string(key), snapshotErr)
 			}
@@ -1229,31 +1209,38 @@ func validateStoredReleaseManifest(release Release) error {
 }
 
 func validateReleaseHistory(releases []Release) error {
-	_, err := validateReleaseHistoryForAdoption(releases, false)
-	return err
+	activeIndexes, err := validateReleaseHistoryRows(releases)
+	if err != nil {
+		return err
+	}
+	if len(activeIndexes) > 1 {
+		return fmt.Errorf("release history has %d active records", len(activeIndexes))
+	}
+	return nil
 }
 
-func validateReleaseHistoryForAdoption(
-	releases []Release,
-	allowLegacyMultipleActive bool,
-) (bool, error) {
+// validateReleaseHistoryRows checks every invariant except the single-active
+// rule and returns the active row indexes in history order. Its two callers
+// decide what more than one active row means: validateReleaseHistory refuses
+// it, and adoptV013ReleaseHistory asks the v0.13 recognizers.
+func validateReleaseHistoryRows(releases []Release) ([]int, error) {
 	if len(releases) == 0 {
-		return false, errors.New("release history is empty")
+		return nil, errors.New("release history is empty")
 	}
 	previousVersion := 0
 	activeIndexes := make([]int, 0, 2)
 	maintenanceIDs := make(map[MaintenanceID]int)
 	for index := range releases {
 		if err := validateStoredRelease(releases[index]); err != nil {
-			return false, fmt.Errorf("release %d: %w", releases[index].Version, err)
+			return nil, fmt.Errorf("release %d: %w", releases[index].Version, err)
 		}
 		if releases[index].Version <= previousVersion {
-			return false, fmt.Errorf("release history has non-increasing version %d", releases[index].Version)
+			return nil, fmt.Errorf("release history has non-increasing version %d", releases[index].Version)
 		}
 		previousVersion = releases[index].Version
 		if maintenanceID := releases[index].MaintenanceID; !maintenanceID.IsZero() {
 			if previous, exists := maintenanceIDs[maintenanceID]; exists {
-				return false, fmt.Errorf(
+				return nil, fmt.Errorf(
 					"release %d duplicates maintenance ID from release %d",
 					releases[index].Version, previous,
 				)
@@ -1263,34 +1250,118 @@ func validateReleaseHistoryForAdoption(
 		switch releases[index].Status {
 		case "deploying", "active", "failed", "superseded":
 		default:
-			return false, fmt.Errorf("release %d has unsupported status", releases[index].Version)
+			return nil, fmt.Errorf("release %d has unsupported status", releases[index].Version)
 		}
 		if releases[index].Status == "active" {
 			activeIndexes = append(activeIndexes, index)
 		}
 	}
-	requiresNormalization := false
-	if allowLegacyMultipleActive {
-		deployingTails, err := validateV013StoppedDeployingTails(releases, activeIndexes)
-		if err != nil {
-			return false, err
+	return activeIndexes, nil
+}
+
+// strictReleaseHistory is a history that passed strict validation, so it holds
+// at most one active row. newStrictReleaseHistory and adoptV013ReleaseHistory
+// are its only constructors. Every read-only inspection reports from it, and
+// the stopped-adoption binding transaction compacts and writes it, so the
+// readiness report, the capacity proof, and the bound store cannot disagree
+// about which rows change.
+type strictReleaseHistory struct {
+	strictRows []Release
+	// normalizedFromV013 reports that adoption superseded rows a v0.13
+	// recognizer vouched for, so strictRows differs from the stored rows.
+	normalizedFromV013 bool
+}
+
+func newStrictReleaseHistory(releases []Release) (strictReleaseHistory, error) {
+	if err := validateReleaseHistory(releases); err != nil {
+		return strictReleaseHistory{}, fmt.Errorf("validate release history: %w", err)
+	}
+	return strictReleaseHistory{strictRows: releases}, nil
+}
+
+func parseCurrentReleaseHistory(value []byte) (strictReleaseHistory, error) {
+	releases, err := decodeReleaseHistory(value)
+	if err != nil {
+		return strictReleaseHistory{}, fmt.Errorf("decode release history: %w", err)
+	}
+	return newStrictReleaseHistory(releases)
+}
+
+// parseStrictStoredReleaseHistory reads either stored wire form without any
+// v0.13 tolerance, so a v0.13 array with duplicate actives is refused.
+func parseStrictStoredReleaseHistory(value []byte) (strictReleaseHistory, error) {
+	if isReleaseHistoryEnvelope(value) {
+		return parseCurrentReleaseHistory(value)
+	}
+	legacy, err := decodeLegacyReleaseHistory(value)
+	if err != nil {
+		return strictReleaseHistory{}, fmt.Errorf("decode release history: %w", err)
+	}
+	return newStrictReleaseHistory(legacy.v013Rows)
+}
+
+// parseStoppedV013ReleaseHistory is the stopped-adoption reader. A current
+// envelope gets strict validation; only a v0.13 array reaches the recognizers.
+func parseStoppedV013ReleaseHistory(value []byte) (strictReleaseHistory, error) {
+	if isReleaseHistoryEnvelope(value) {
+		return parseCurrentReleaseHistory(value)
+	}
+	legacy, err := decodeLegacyReleaseHistory(value)
+	if err != nil {
+		return strictReleaseHistory{}, fmt.Errorf("decode release history: %w", err)
+	}
+	return adoptV013ReleaseHistory(legacy)
+}
+
+func isReleaseHistoryEnvelope(value []byte) bool {
+	trimmed := bytes.TrimSpace(value)
+	return len(trimmed) > 0 && trimmed[0] == '{'
+}
+
+// adoptV013ReleaseHistory parses a stopped v0.13 history into the strict
+// history that identity binding writes. It supersedes exactly the rows its
+// recognizers vouched for: the older active rows that
+// validateV013DuplicateActiveHistory explains, and the post-active deploying
+// retries that validateV013StoppedDeployingTails proves equivalent to
+// LatestActive. Every other row is copied unchanged, LatestActive stays the
+// authority, and the result exists only after it passes strict validation.
+func adoptV013ReleaseHistory(history v013ReleaseHistory) (strictReleaseHistory, error) {
+	activeIndexes, err := validateReleaseHistoryRows(history.v013Rows)
+	if err != nil {
+		return strictReleaseHistory{}, fmt.Errorf("validate release history: %w", err)
+	}
+	deployingTails, err := validateV013StoppedDeployingTails(history, activeIndexes)
+	if err != nil {
+		return strictReleaseHistory{}, fmt.Errorf("validate release history: %w", err)
+	}
+	var olderActives []int
+	if len(activeIndexes) > 1 {
+		if err := validateV013DuplicateActiveHistory(history, activeIndexes); err != nil {
+			return strictReleaseHistory{}, fmt.Errorf(
+				"validate release history: %d active records are not a recognizable v0.13 history: %w",
+				len(activeIndexes),
+				err,
+			)
 		}
-		requiresNormalization = len(deployingTails) > 0
+		olderActives = activeIndexes[:len(activeIndexes)-1]
 	}
-	if len(activeIndexes) <= 1 {
-		return requiresNormalization, nil
+	normalized := slices.Clone(history.v013Rows)
+	for _, index := range olderActives {
+		normalized[index].Status = "superseded"
 	}
-	if !allowLegacyMultipleActive {
-		return false, fmt.Errorf("release history has %d active records", len(activeIndexes))
+	for _, index := range deployingTails {
+		normalized[index].Status = "superseded"
+		normalized[index].Reason = ""
+		normalized[index].Message = ""
+		normalized[index].Error = ""
 	}
-	if err := validateV013RecordMigrationHistory(releases, activeIndexes); err != nil {
-		return false, fmt.Errorf(
-			"release history has %d active records and is not a recognizable v0.13 migration: %w",
-			len(activeIndexes),
-			err,
-		)
+	if err := validateReleaseHistory(normalized); err != nil {
+		return strictReleaseHistory{}, fmt.Errorf("validate normalized v0.13 release history: %w", err)
 	}
-	return true, nil
+	return strictReleaseHistory{
+		strictRows:         normalized,
+		normalizedFromV013: len(olderActives) > 0 || len(deployingTails) > 0,
+	}, nil
 }
 
 // validateV013StoppedDeployingTails closes the v0.13 Update/Restart
@@ -1303,11 +1374,13 @@ func validateReleaseHistoryForAdoption(
 // number of such stopped retry rows carry no distinct workload authority and
 // can be marked superseded while binding the lineage. Every post-active
 // deploying row is checked independently so an older ambiguous attempt cannot
-// hide behind a later failed or equivalent attempt.
+// hide behind a later failed or equivalent attempt. The v013ReleaseHistory
+// parameter makes every row v0.13 wire form by construction.
 func validateV013StoppedDeployingTails(
-	releases []Release,
+	history v013ReleaseHistory,
 	activeIndexes []int,
 ) ([]int, error) {
+	releases := history.v013Rows
 	if len(activeIndexes) == 0 {
 		if slices.ContainsFunc(releases, func(release Release) bool {
 			return release.Status == "deploying"
@@ -1329,18 +1402,14 @@ func validateV013StoppedDeployingTails(
 		return nil, nil
 	}
 	active := releases[latestActive]
-	if !active.OperationID.IsZero() || len(active.Items) != 0 ||
-		len(active.ResourceProfiles) != 0 ||
-		len(active.Manifest) == 0 {
+	if len(active.Manifest) == 0 {
 		return nil, errors.New(
-			"stopped release history has post-active deploying rows whose LatestActive is not wire-recognizable v0.13 authority",
+			"stopped release history has post-active deploying rows whose LatestActive has no manifest",
 		)
 	}
 	for _, index := range deployingIndexes {
 		candidate := releases[index]
-		if !candidate.OperationID.IsZero() || len(candidate.Items) != 0 ||
-			len(candidate.ResourceProfiles) != 0 ||
-			candidate.Image != "stack" || len(candidate.Manifest) == 0 {
+		if candidate.Image != "stack" || len(candidate.Manifest) == 0 {
 			return nil, fmt.Errorf(
 				"stopped release %d is an unresolved deploying row that is not a wire-recognizable v0.13 Update/Restart row",
 				candidate.Version,
@@ -1364,64 +1433,64 @@ func validateV013StoppedDeployingTails(
 	return deployingIndexes, nil
 }
 
-// validateV013RecordMigrationHistory recognizes only the duplicate-active
-// shape v0.13 itself could write. The old implementation appended one active
-// stack-wrapped migration row without superseding its one older active flat
-// row. It no-opped when the latest active manifest was already byte-equal, so
-// an actually appended pair must be byte-different; more than two actives,
-// equal raw manifests, or current authority fields are not explained by that
-// writer and remain corrupt. Later non-active rows are permitted: a failed
-// update appended after migration legitimately leaves LatestActive pointing at
-// the migrated row while that failed row is the history tail.
-func validateV013RecordMigrationHistory(releases []Release, activeIndexes []int) error {
-	if len(activeIndexes) != 2 {
-		return errors.New("v0.13 migration must have exactly two active records")
+// validateV013DuplicateActiveHistory recognizes the duplicate-active histories
+// that v0.13 and its predecessors wrote. Only Restart/Update superseded older
+// active rows (ActivateLatest). Two other writers appended an active row and
+// left the previous one active. RecordMigration wrapped a flat active manifest
+// in its stack form. Every successful Provision did the same, including the
+// re-provision that replaces a lease whose containers died at runtime or across
+// a host reboot. That re-provision leaves a byte-equal or re-encoded duplicate.
+// After a failed asynchronous Update it deploys the payload /update had already
+// persisted, so its manifest differs from the older active row. Each writer
+// appended its row only after it had replaced the previous containers, and
+// v0.13 recovery rehydrated LatestActive. LatestActive is therefore the running
+// generation, and normalization supersedes every older active row exactly as
+// ActivateLatest would have.
+//
+// Anything those writers could not produce stays corrupt. The
+// v013ReleaseHistory parameter rules out post-v0.13 authority fields by
+// construction. This function refuses an active row without a manifest, a
+// LatestActive whose image is not the stack sentinel (v0.13 wrote every active
+// row that way, and adoption requires a stack-form cohort), and an older active
+// whose image matches neither the sentinel nor the service of its own pre-stack
+// flat manifest. Later non-active rows are permitted. A failed update after
+// LatestActive legitimately leaves that row as the history tail, and
+// validateV013StoppedDeployingTails checks the deploying rows separately.
+func validateV013DuplicateActiveHistory(history v013ReleaseHistory, activeIndexes []int) error {
+	if len(activeIndexes) < 2 {
+		return errors.New("v0.13 duplicate-active history must have at least two active records")
 	}
-	oldIndex, migratedIndex := activeIndexes[0], activeIndexes[1]
-	for index := range releases {
-		release := releases[index]
-		if !release.OperationID.IsZero() || len(release.Items) != 0 ||
-			len(release.ResourceProfiles) != 0 {
-			return fmt.Errorf("release %d contains post-v0.13 authority fields", release.Version)
+	releases := history.v013Rows
+	latestActive := releases[activeIndexes[len(activeIndexes)-1]]
+	if latestActive.Image != "stack" || len(latestActive.Manifest) == 0 {
+		return fmt.Errorf(
+			"latest active release %d is not a v0.13 stack image row with a manifest",
+			latestActive.Version,
+		)
+	}
+	for _, index := range activeIndexes[:len(activeIndexes)-1] {
+		older := releases[index]
+		if len(older.Manifest) == 0 {
+			return fmt.Errorf("older active release %d has no manifest", older.Version)
 		}
-	}
-	oldRelease := releases[oldIndex]
-	migratedRelease := releases[migratedIndex]
-	if migratedRelease.Image != "stack" ||
-		len(oldRelease.Manifest) == 0 || len(migratedRelease.Manifest) == 0 {
-		return errors.New("v0.13 migration pair must end in a stack image manifest")
-	}
-	if bytes.Equal(oldRelease.Manifest, migratedRelease.Manifest) {
-		return errors.New("v0.13 RecordMigration could not have appended a byte-equal manifest")
-	}
-	oldWasStack, err := releasePayloadUsesStackEnvelope(oldRelease.Manifest)
-	if err != nil {
-		return fmt.Errorf("inspect older active manifest envelope: %w", err)
-	}
-	migratedWasStack, err := releasePayloadUsesStackEnvelope(migratedRelease.Manifest)
-	if err != nil {
-		return fmt.Errorf("inspect migrated active manifest envelope: %w", err)
-	}
-	if oldWasStack || !migratedWasStack {
-		return errors.New("v0.13 migration pair is not flat-manifest then stack-manifest")
-	}
-	oldStack, err := manifest.ParseStoredPayload(oldRelease.Manifest)
-	if err != nil {
-		return fmt.Errorf("parse older active manifest: %w", err)
-	}
-	semanticallyEqual, err := semanticallyEqualReleaseManifests(
-		oldRelease.Manifest,
-		migratedRelease.Manifest,
-	)
-	if err != nil {
-		return fmt.Errorf("compare v0.13 migration manifests: %w", err)
-	}
-	if !semanticallyEqual {
-		return errors.New("v0.13 migration manifests are not semantically identical")
-	}
-	oldService := oldStack.Services[manifest.DefaultServiceName]
-	if oldService == nil || (oldRelease.Image != "stack" && oldRelease.Image != oldService.Image) {
-		return errors.New("older active image is not explained by its legacy flat manifest")
+		if older.Image == "stack" {
+			continue
+		}
+		wasStack, err := releasePayloadUsesStackEnvelope(older.Manifest)
+		if err != nil {
+			return fmt.Errorf("inspect older active release %d manifest envelope: %w", older.Version, err)
+		}
+		stack, err := manifest.ParseStoredPayload(older.Manifest)
+		if err != nil {
+			return fmt.Errorf("parse older active release %d manifest: %w", older.Version, err)
+		}
+		service := stack.Services[manifest.DefaultServiceName]
+		if wasStack || service == nil || older.Image != service.Image {
+			return fmt.Errorf(
+				"older active release %d image is not explained by its pre-stack flat manifest",
+				older.Version,
+			)
+		}
 	}
 	return nil
 }
@@ -1650,37 +1719,6 @@ func newReleaseHistoryCapacitySnapshot(
 	return snapshot, nil
 }
 
-func normalizeLegacyReleaseHistoryForAdoption(releases []Release) ([]Release, error) {
-	normalized := slices.Clone(releases)
-	requiresNormalization, err := validateReleaseHistoryForAdoption(normalized, true)
-	if err != nil {
-		return nil, err
-	}
-	if !requiresNormalization {
-		return normalized, nil
-	}
-	latest := latestActiveReleaseIndex(normalized)
-	for index := range normalized {
-		if index != latest && normalized[index].Status == "active" {
-			normalized[index].Status = "superseded"
-		}
-	}
-	deployingTails, err := validateV013StoppedDeployingTails(normalized, []int{latest})
-	if err != nil {
-		return nil, fmt.Errorf("validate normalizable v0.13 deploying rows: %w", err)
-	}
-	for _, deployingTail := range deployingTails {
-		normalized[deployingTail].Status = "superseded"
-		normalized[deployingTail].Reason = ""
-		normalized[deployingTail].Message = ""
-		normalized[deployingTail].Error = ""
-	}
-	if err := validateReleaseHistory(normalized); err != nil {
-		return nil, fmt.Errorf("validate normalized release history: %w", err)
-	}
-	return normalized, nil
-}
-
 func normalizeLegacyReleaseBucketForAdoption(tx *bolt.Tx) error {
 	bucket := tx.Bucket(releasesBucketName)
 	if bucket == nil {
@@ -1702,22 +1740,16 @@ func normalizeLegacyReleaseBucketForAdoption(tx *bolt.Tx) error {
 		if !backend.IsCanonicalLeaseUUID(string(key)) {
 			return fmt.Errorf("release history key with length %d is not a canonical lease UUID", len(key))
 		}
-		releases, err := decodeLegacyReleaseHistory(value)
+		legacy, err := decodeLegacyReleaseHistory(value)
 		if err != nil {
 			return fmt.Errorf("decode release history for lease %q: %w", string(key), err)
 		}
-		requiresNormalization, err := validateReleaseHistoryForAdoption(releases, true)
+		adopted, err := adoptV013ReleaseHistory(legacy)
 		if err != nil {
-			return fmt.Errorf("validate release history for lease %q: %w", string(key), err)
-		}
-		if requiresNormalization {
-			releases, err = normalizeLegacyReleaseHistoryForAdoption(releases)
-			if err != nil {
-				return fmt.Errorf("normalize release history for lease %q: %w", string(key), err)
-			}
+			return fmt.Errorf("release history for lease %q: %w", string(key), err)
 		}
 		encoded, err := compactAndEncodeReleaseHistory(
-			releases,
+			adopted.strictRows,
 			time.Time{},
 			backend.MaxStoredReleaseHistoryBytes,
 		)

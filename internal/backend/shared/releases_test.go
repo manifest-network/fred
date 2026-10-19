@@ -391,7 +391,7 @@ func TestReleaseStore_RuntimeInspectionStreamsPastOfflineAggregateLimits(t *test
 				maxTotalBytes:  1 << 20,
 			})
 			_, inspectErr := inspectReleaseBucketWithObserver(
-				tx, nil, nil, nil, false, budget.observe, decodeReleaseHistory,
+				tx, nil, nil, nil, budget.observe, parseCurrentReleaseHistory,
 			)
 			return inspectErr
 		})
@@ -407,7 +407,7 @@ func TestReleaseStore_RuntimeInspectionStreamsPastOfflineAggregateLimits(t *test
 				maxTotalBytes:  1,
 			})
 			_, inspectErr := inspectReleaseBucketWithObserver(
-				tx, nil, nil, nil, false, budget.observe, decodeReleaseHistory,
+				tx, nil, nil, nil, budget.observe, parseCurrentReleaseHistory,
 			)
 			return inspectErr
 		})
