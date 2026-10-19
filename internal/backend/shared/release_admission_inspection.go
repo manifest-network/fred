@@ -1,7 +1,6 @@
 package shared
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 
@@ -13,6 +12,8 @@ import (
 
 // ReleaseAdmissionFinding identifies a stored row accepted under an older
 // manifest policy. This is advisory evidence, not a corrupt-history verdict.
+// Status is the row's status as stopped adoption binds it: adoption may
+// supersede an older v0.13 active row but never changes a version or manifest.
 type ReleaseAdmissionFinding struct {
 	LeaseUUID   string `json:"lease_uuid"`
 	Version     int    `json:"version"`
@@ -57,21 +58,12 @@ func InspectReleaseAdmissionReadOnly(dbPath string) (ReleaseAdmissionInspection,
 			if value == nil {
 				return fmt.Errorf("release history for lease %q is a nested bucket", key)
 			}
-			var releases []Release
-			var decodeErr error
-			if trimmed := bytes.TrimSpace(value); len(trimmed) > 0 && trimmed[0] == '{' {
-				releases, decodeErr = decodeReleaseHistory(value)
-			} else {
-				releases, decodeErr = decodeLegacyReleaseHistory(value)
-			}
-			if decodeErr != nil {
-				return fmt.Errorf("decode release history for lease %q: %w", key, decodeErr)
-			}
-			if _, err := validateReleaseHistoryForAdoption(releases, true); err != nil {
-				return fmt.Errorf("validate release history for lease %q: %w", key, err)
+			history, err := parseStoppedV013ReleaseHistory(value)
+			if err != nil {
+				return fmt.Errorf("release history for lease %q: %w", key, err)
 			}
 			report.Histories++
-			for _, release := range releases {
+			for _, release := range history.strictReleases() {
 				report.Releases++
 				if len(release.Manifest) == 0 {
 					continue // Legacy status-only rows contain no admitted manifest.

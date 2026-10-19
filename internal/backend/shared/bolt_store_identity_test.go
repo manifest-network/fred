@@ -629,33 +629,6 @@ func TestReleaseBindingNormalizesWireFaithfulV013RecordMigrationHistory(t *testi
 	assert.Equal(t, "failed", releases[2].Status)
 }
 
-func TestReleaseBindingRejectsUnrecognizedDuplicateActiveHistoryWithoutMutation(t *testing.T) {
-	const leaseUUID = "11111111-1111-4111-8111-111111111111"
-	dbPath := filepath.Join(t.TempDir(), "releases.db")
-	createdAt := time.Now().UTC()
-	writeRawReleaseHistory(t, dbPath, leaseUUID, []Release{
-		{
-			Version:  1,
-			Manifest: []byte(`{"services":{"app":{"image":"nginx:1"}}}`),
-			Image:    "stack", Status: "active", CreatedAt: createdAt,
-		},
-		{
-			Version:  2,
-			Manifest: []byte(`{"services":{"app":{"image":"nginx:1"}}}`),
-			Image:    "stack", Status: "active", CreatedAt: createdAt.Add(time.Minute),
-		},
-	})
-	before, err := os.ReadFile(dbPath)
-	require.NoError(t, err)
-
-	err = prepareExistingBoundStoreForTest(t, dbPath, PrepareBoundReleaseStoreStorage)
-	require.ErrorContains(t, err, "not a recognizable v0.13 migration")
-	after, readErr := os.ReadFile(dbPath)
-	require.NoError(t, readErr)
-	assert.Equal(t, before, after,
-		"a rejected adoption must roll back both normalization and identity binding")
-}
-
 func TestReleaseBindingNormalizesSemanticallyIdenticalV013DeployingTail(t *testing.T) {
 	const leaseUUID = "11111111-1111-4111-8111-111111111111"
 	dbPath := filepath.Join(t.TempDir(), "releases.db")

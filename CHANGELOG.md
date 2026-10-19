@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
-## [0.14.0] - 2026-10-16
+## [0.14.0] - 2026-10-19
 
 **Upgrading from v0.13.0.** This release cannot be installed in place. Follow
 [Upgrading from v0.13.0](DEPLOYMENT.md#upgrading-from-v0130) before replacing
@@ -2132,9 +2132,9 @@ any binary:
   (ENG-632)
 - Release-history cleanup now fails closed on corrupt or empty durable values
   instead of deleting them as expired. Stopped v0.13 adoption narrowly
-  recognizes and normalizes the duplicate-active history written by
-  `RecordMigration`, plus semantically identical deploying tails; divergent or
-  otherwise unexplained generations remain fail-closed.
+  recognizes and normalizes the duplicate-active histories v0.13 wrote (see
+  ENG-1639 below), plus semantically identical deploying tails; divergent
+  deploying tails and otherwise unexplained generations remain fail-closed.
   Deprovision release retirement is required, fenced to the exact generation
   captured by its close intent, and occurs before the close journal may resolve;
   a release-store error therefore leaves a durable retry owner rather than an
@@ -2290,6 +2290,21 @@ any binary:
   maintenance, so one tenant's long chain could make backend startup and
   `/health` fail at random. Cycles are still rejected in stored manifests.
   (ENG-1515)
+
+- docker-backend: adopting a stopped v0.13 backend no longer refuses a lease
+  whose release history has more than one `active` row because v0.13
+  re-provisioned it. Every successful v0.13 provision appended an `active` row
+  without superseding the previous one. That includes the re-provision after a
+  tenant container dies or the host reboots, and the re-provision after a failed
+  update, which deploys the payload the update had already stored. One reboot
+  inside the cutover therefore left every lease on that host with two `active`
+  rows. `placement-preflight -inspect-releases` refused the host, and no
+  supported command could repair it. Adoption now keeps the newest `active` row
+  as the release v0.13 was running and marks the older ones `superseded`,
+  whether or not their manifests match. It still refuses rows v0.13 could not
+  have written. The rule applies only to histories in v0.13's own format; a
+  current-format history with more than one `active` row is now refused even
+  when its rows look like v0.13 rows. (ENG-1639)
 
 ### Security
 
