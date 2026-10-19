@@ -1298,12 +1298,20 @@ tenant/provider, item shape, manifest topology, resource profiles, and source
 generation and CAS-deletes that row. Failure returns before teardown; success
 leaves the close intent as the sole durable cleanup and identity owner.
 
-Historical v0.13 release histories can contain the duplicate-Active shape
-written by `RecordMigration`. Only the stopped adoption path accepts it: the
-binding transaction rewrites the redundant active rows, and equivalent
-deploying retries after the latest active row, to `superseded` before a current
-store opens the history. The runtime decoder rejects any history with more than
-one active row. This release does not write a
+Historical v0.13 release histories can contain more than one Active row.
+`RecordMigration` and every successful provision appended an active row without
+superseding the older one. That includes the re-provision of a lease whose
+containers died at runtime or across a reboot. v0.13 appended each row only
+after replacing the previous containers, so its LatestActive is the running
+generation. Only the stopped adoption path accepts these histories, and only
+from the bare v0.13 array: the `v013ReleaseHistory` type is minted solely by
+that decoder, and the v0.13 recognizers accept nothing else. One parser,
+`adoptV013ReleaseHistory`, produces the strict history that readiness
+inspection, the capacity proof and the binding transaction all consume. Binding
+rewrites the older active rows, and equivalent deploying retries after the
+latest active row, to `superseded` before a current store opens the history.
+The runtime decoder rejects any history with more than one active row. This
+release does not write a
 migration marker or attempt a live single-container-to-Compose conversion.
 Only an already stack-form v0.13 cohort can be adopted: strict inventory and
 the active manifest must prove its complete dense topology before exact items,
