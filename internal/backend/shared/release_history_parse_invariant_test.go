@@ -15,11 +15,13 @@ import (
 
 // Go cannot stop a package's own code from building a struct literal or writing
 // an unexported field, so this guard enforces what the release-history parse
-// types document. Only the v0.13 array decoder mints a v013ReleaseHistory. Only
-// newStrictReleaseHistory and adoptV013ReleaseHistory mint a populated
-// strictReleaseHistory. No code assigns their fields after construction. Only
-// the parsers and recognizers read raw v0.13 rows, so no writer can bind them
-// without passing strict validation.
+// types document. Only the v0.13 array decoder mints a v013ReleaseHistory, and
+// only newStrictReleaseHistory and adoptV013ReleaseHistory mint a populated
+// strictReleaseHistory. A row field may appear only as the direct argument of
+// cloneReleaseHistory, so no code can write, index into, or alias a history's
+// rows after construction; readers get a deep copy from the accessor methods.
+// Only the parsers and recognizers read raw v0.13 rows, so no writer can bind
+// them without passing strict validation.
 var releaseHistoryMinters = map[string]map[string]struct{}{
 	"v013ReleaseHistory": {"decodeLegacyReleaseHistory": {}},
 	"strictReleaseHistory": {
@@ -28,17 +30,16 @@ var releaseHistoryMinters = map[string]map[string]struct{}{
 	},
 }
 
+var releaseHistoryRowFields = map[string]struct{}{
+	"v013Rows":   {},
+	"strictRows": {},
+}
+
 var rawV013RowReaders = map[string]struct{}{
 	"adoptV013ReleaseHistory":            {},
 	"parseStrictStoredReleaseHistory":    {},
 	"validateV013StoppedDeployingTails":  {},
 	"validateV013DuplicateActiveHistory": {},
-}
-
-var releaseHistoryParseFields = map[string]struct{}{
-	"v013Rows":           {},
-	"strictRows":         {},
-	"normalizedFromV013": {},
 }
 
 func TestStoppedReleaseHistoryTypesStayAtTheirChokePoints(t *testing.T) {
@@ -69,25 +70,48 @@ func TestReleaseHistoryChokePointGuardFires(t *testing.T) {
 	t.Parallel()
 
 	const source = `package shared
-func bypass(history v013ReleaseHistory) strictReleaseHistory {
+func bypass(history v013ReleaseHistory, strict strictReleaseHistory) strictReleaseHistory {
 	_ = v013ReleaseHistory{v013Rows: nil}
-	_ = []strictReleaseHistory{{strictRows: history.v013Rows}}
+	_ = []strictReleaseHistory{{strictRows: history.v013Releases()}}
 	result := strictReleaseHistory{}
 	result.normalizedFromV013 = true
+	strict.strictRows[0].Status = "active"
+	rows := history.v013Rows
+	rows[0] = Release{}
+	_ = cloneReleaseHistory(strict.strictRows)
+	for range strict.strictRows {
+	}
 	return result
 }`
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "bypass.go", source, 0)
 	require.NoError(t, err)
 	violations := releaseHistoryChokePointViolations(fset, file, make(map[string]bool))
-	joined := strings.Join(violations, "\n")
-	assert.Contains(t, joined, "bypass.go:3:")
-	assert.Contains(t, joined, "v013ReleaseHistory literal outside")
-	assert.Contains(t, joined, "strictReleaseHistory literal outside")
-	assert.Contains(t, joined, "reads raw v0.13 rows")
-	assert.Contains(t, joined, "assigns normalizedFromV013")
-	assert.NotContains(t, joined, "bypass.go:5:",
-		"the zero value carries no rows and is the error-path return")
+	byLine := make(map[int][]string)
+	for _, violation := range violations {
+		var line, column int
+		_, scanErr := fmt.Sscanf(violation, "bypass.go:%d:%d:", &line, &column)
+		require.NoError(t, scanErr, violation)
+		byLine[line] = append(byLine[line], violation)
+	}
+	for line, want := range map[int][]string{
+		3:  {"v013ReleaseHistory literal outside"},
+		4:  {"strictReleaseHistory literal outside", "reads raw v0.13 rows"},
+		6:  {"assigns normalizedFromV013"},
+		7:  {"strictRows used other than as the argument of cloneReleaseHistory"},
+		8:  {"v013Rows used other than as the argument of cloneReleaseHistory"},
+		11: {"strictRows used other than as the argument of cloneReleaseHistory"},
+	} {
+		joined := strings.Join(byLine[line], "\n")
+		for _, fragment := range want {
+			assert.Contains(t, joined, fragment, "line %d", line)
+		}
+	}
+	// Line 5 is the zero value and line 10 the permitted clone. Line 9 writes
+	// through an alias the guard already refused where it was taken (line 8).
+	for _, line := range []int{5, 9, 10} {
+		assert.Empty(t, byLine[line], "line %d", line)
+	}
 }
 
 func releaseHistoryChokePointViolations(
@@ -111,6 +135,22 @@ func releaseHistoryChokePointViolations(
 		}
 		minted[typeName] = true
 	}
+	// A row field read is permitted only when it is cloned on the spot.
+	cloned := make(map[*ast.SelectorExpr]bool)
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if function, ok := call.Fun.(*ast.Ident); ok && function.Name == "cloneReleaseHistory" {
+			for _, argument := range call.Args {
+				if selector, ok := argument.(*ast.SelectorExpr); ok {
+					cloned[selector] = true
+				}
+			}
+		}
+		return true
+	})
 	for _, declaration := range file.Decls {
 		enclosing := ""
 		if function, ok := declaration.(*ast.FuncDecl); ok {
@@ -134,20 +174,20 @@ func releaseHistoryChokePointViolations(
 				}
 			case *ast.AssignStmt:
 				for _, target := range node.Lhs {
-					selector, ok := target.(*ast.SelectorExpr)
-					if !ok {
-						continue
-					}
-					if _, guarded := releaseHistoryParseFields[selector.Sel.Name]; guarded {
-						report(selector, "assigns %s after construction", selector.Sel.Name)
+					if selector, ok := target.(*ast.SelectorExpr); ok &&
+						selector.Sel.Name == "normalizedFromV013" {
+						report(selector, "assigns normalizedFromV013 after construction")
 					}
 				}
 			case *ast.SelectorExpr:
-				if node.Sel.Name != "v013Rows" {
-					break
+				if _, guarded := releaseHistoryRowFields[node.Sel.Name]; guarded && !cloned[node] {
+					report(node, "%s used other than as the argument of cloneReleaseHistory in %q",
+						node.Sel.Name, enclosing)
 				}
-				if _, ok := rawV013RowReaders[enclosing]; !ok {
-					report(node, "reads raw v0.13 rows outside the parsers in %q", enclosing)
+				if node.Sel.Name == "v013Releases" {
+					if _, ok := rawV013RowReaders[enclosing]; !ok {
+						report(node, "reads raw v0.13 rows outside the parsers in %q", enclosing)
+					}
 				}
 			}
 			return true

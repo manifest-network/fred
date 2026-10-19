@@ -63,7 +63,7 @@ func InspectReleaseAdmissionReadOnly(dbPath string) (ReleaseAdmissionInspection,
 				return fmt.Errorf("release history for lease %q: %w", key, err)
 			}
 			report.Histories++
-			for _, release := range history.strictRows {
+			for _, release := range history.strictReleases() {
 				report.Releases++
 				if len(release.Manifest) == 0 {
 					continue // Legacy status-only rows contain no admitted manifest.

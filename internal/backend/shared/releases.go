@@ -157,6 +157,12 @@ type v013ReleaseHistory struct {
 	v013Rows []Release
 }
 
+// v013Releases returns a deep copy, so no reader can alias or mutate the
+// decoded rows.
+func (h v013ReleaseHistory) v013Releases() []Release {
+	return cloneReleaseHistory(h.v013Rows)
+}
+
 func decodeLegacyReleaseHistory(value []byte) (v013ReleaseHistory, error) {
 	var legacy []legacyReleaseJSON
 	if err := decodeStrictAuthoritativeArray(value, maxAuthoritativeRecordBytes, &legacy); err != nil {
@@ -974,7 +980,7 @@ func inspectReleaseBucketWithObserver(
 		requiresNormalization = requiresNormalization || history.normalizedFromV013
 		// Capacity, presence, and LatestActive all read the strict history the
 		// store will hold after binding, never the stored multi-active rows.
-		releases := history.strictRows
+		releases := history.strictReleases()
 		activeIndex := latestActiveReleaseIndex(releases)
 		if activeIndex >= 0 {
 			if active != nil {
@@ -1261,10 +1267,11 @@ func validateReleaseHistoryRows(releases []Release) ([]int, error) {
 
 // strictReleaseHistory is a history that passed strict validation, so it holds
 // at most one active row. newStrictReleaseHistory and adoptV013ReleaseHistory
-// are its only constructors. Every read-only inspection reports from it, and
-// the stopped-adoption binding transaction compacts and writes it, so the
-// readiness report, the capacity proof, and the bound store cannot disagree
-// about which rows change.
+// are its only constructors, and each owns a deep copy of its rows, so neither
+// the caller's slice nor a reader's copy can change a validated history. Every
+// read-only inspection reports from it, and the stopped-adoption binding
+// transaction compacts and writes it, so the readiness report, the capacity
+// proof, and the bound store cannot disagree about which rows change.
 type strictReleaseHistory struct {
 	strictRows []Release
 	// normalizedFromV013 reports that adoption superseded rows a v0.13
@@ -1272,11 +1279,28 @@ type strictReleaseHistory struct {
 	normalizedFromV013 bool
 }
 
+// strictReleases returns a deep copy of the validated rows.
+func (h strictReleaseHistory) strictReleases() []Release {
+	return cloneReleaseHistory(h.strictRows)
+}
+
 func newStrictReleaseHistory(releases []Release) (strictReleaseHistory, error) {
-	if err := validateReleaseHistory(releases); err != nil {
+	owned := cloneReleaseHistory(releases)
+	if err := validateReleaseHistory(owned); err != nil {
 		return strictReleaseHistory{}, fmt.Errorf("validate release history: %w", err)
 	}
-	return strictReleaseHistory{strictRows: releases}, nil
+	return strictReleaseHistory{strictRows: owned}, nil
+}
+
+func cloneReleaseHistory(releases []Release) []Release {
+	if releases == nil {
+		return nil
+	}
+	cloned := make([]Release, len(releases))
+	for index := range releases {
+		cloned[index] = cloneRelease(releases[index])
+	}
+	return cloned
 }
 
 func parseCurrentReleaseHistory(value []byte) (strictReleaseHistory, error) {
@@ -1297,7 +1321,7 @@ func parseStrictStoredReleaseHistory(value []byte) (strictReleaseHistory, error)
 	if err != nil {
 		return strictReleaseHistory{}, fmt.Errorf("decode release history: %w", err)
 	}
-	return newStrictReleaseHistory(legacy.v013Rows)
+	return newStrictReleaseHistory(legacy.v013Releases())
 }
 
 // parseStoppedV013ReleaseHistory is the stopped-adoption reader. A current
@@ -1325,8 +1349,10 @@ func isReleaseHistoryEnvelope(value []byte) bool {
 // retries that validateV013StoppedDeployingTails proves equivalent to
 // LatestActive. Every other row is copied unchanged, LatestActive stays the
 // authority, and the result exists only after it passes strict validation.
+// normalized is a deep copy that only this function holds.
 func adoptV013ReleaseHistory(history v013ReleaseHistory) (strictReleaseHistory, error) {
-	activeIndexes, err := validateReleaseHistoryRows(history.v013Rows)
+	normalized := history.v013Releases()
+	activeIndexes, err := validateReleaseHistoryRows(normalized)
 	if err != nil {
 		return strictReleaseHistory{}, fmt.Errorf("validate release history: %w", err)
 	}
@@ -1345,7 +1371,6 @@ func adoptV013ReleaseHistory(history v013ReleaseHistory) (strictReleaseHistory, 
 		}
 		olderActives = activeIndexes[:len(activeIndexes)-1]
 	}
-	normalized := slices.Clone(history.v013Rows)
 	for _, index := range olderActives {
 		normalized[index].Status = "superseded"
 	}
@@ -1380,7 +1405,7 @@ func validateV013StoppedDeployingTails(
 	history v013ReleaseHistory,
 	activeIndexes []int,
 ) ([]int, error) {
-	releases := history.v013Rows
+	releases := history.v013Releases()
 	if len(activeIndexes) == 0 {
 		if slices.ContainsFunc(releases, func(release Release) bool {
 			return release.Status == "deploying"
@@ -1460,7 +1485,7 @@ func validateV013DuplicateActiveHistory(history v013ReleaseHistory, activeIndexe
 	if len(activeIndexes) < 2 {
 		return errors.New("v0.13 duplicate-active history must have at least two active records")
 	}
-	releases := history.v013Rows
+	releases := history.v013Releases()
 	latestActive := releases[activeIndexes[len(activeIndexes)-1]]
 	if latestActive.Image != "stack" || len(latestActive.Manifest) == 0 {
 		return fmt.Errorf(
@@ -1749,7 +1774,7 @@ func normalizeLegacyReleaseBucketForAdoption(tx *bolt.Tx) error {
 			return fmt.Errorf("release history for lease %q: %w", string(key), err)
 		}
 		encoded, err := compactAndEncodeReleaseHistory(
-			adopted.strictRows,
+			adopted.strictReleases(),
 			time.Time{},
 			backend.MaxStoredReleaseHistoryBytes,
 		)

@@ -294,6 +294,44 @@ func TestStoppedAdoptionNeverExtendsV013ToleranceToCurrentEnvelopes(t *testing.T
 	require.ErrorContains(t, err, "release history has 2 active records")
 }
 
+// The constructors own deep copies and the accessors hand out deep copies, so
+// neither the caller's input nor a reader's result can change a parsed history.
+func TestParsedReleaseHistoriesOwnTheirRows(t *testing.T) {
+	assertDetached := func(t *testing.T, rows []Release, read func() []Release) {
+		t.Helper()
+		want := cloneReleaseHistory(read())
+		rows[len(rows)-1].Status = "failed"
+		rows[len(rows)-1].Manifest[0] = 'X'
+		got := read()
+		got[len(got)-1].Status = "deploying"
+		got[len(got)-1].Manifest[0] = 'Y'
+		assert.Equal(t, want, read())
+	}
+
+	t.Run("strict constructor copies its input", func(t *testing.T) {
+		input := []Release{{Version: 1, Manifest: []byte(v013StackA), Image: "stack", Status: "active"}}
+		history, err := newStrictReleaseHistory(input)
+		require.NoError(t, err)
+		assertDetached(t, input, history.strictReleases)
+	})
+
+	t.Run("adoption owns its normalized rows", func(t *testing.T) {
+		encoded, err := json.Marshal([]v013ReleaseWire{
+			v013Row(1, "active", "stack", v013StackA),
+			v013Row(2, "active", "stack", v013StackA),
+		})
+		require.NoError(t, err)
+		legacy, err := decodeLegacyReleaseHistory(encoded)
+		require.NoError(t, err)
+		adopted, err := adoptV013ReleaseHistory(legacy)
+		require.NoError(t, err)
+		require.True(t, adopted.normalizedFromV013)
+		// Mutate each history's internal rows, which only a test can reach.
+		assertDetached(t, legacy.v013Rows, adopted.strictReleases)
+		assertDetached(t, adopted.strictRows, legacy.v013Releases)
+	})
+}
+
 func requireStoppedAdoptionRefusedWithoutMutation(t *testing.T, dbPath, want string) {
 	t.Helper()
 	before, err := os.ReadFile(dbPath)
