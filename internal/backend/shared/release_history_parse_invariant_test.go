@@ -17,11 +17,11 @@ import (
 // an unexported field, so this guard enforces what the release-history parse
 // types document. Only the v0.13 array decoder mints a v013ReleaseHistory, and
 // only newStrictReleaseHistory and adoptV013ReleaseHistory mint a populated
-// strictReleaseHistory. A row field may appear only as the direct argument of
-// cloneReleaseHistory, so no code can write, index into, or alias a history's
-// rows after construction; readers get a deep copy from the accessor methods.
-// Only the parsers and recognizers read raw v0.13 rows, so no writer can bind
-// them without passing strict validation.
+// strictReleaseHistory. A row field may appear only in its accessor method, as
+// the direct argument of cloneReleaseHistory, so no code can write, index into,
+// alias, or copy a history's rows except through that accessor. Only the
+// parsers and recognizers call the raw v0.13 accessor, so no writer can bind
+// v0.13 rows without passing strict validation.
 var releaseHistoryMinters = map[string]map[string]struct{}{
 	"v013ReleaseHistory": {"decodeLegacyReleaseHistory": {}},
 	"strictReleaseHistory": {
@@ -30,9 +30,12 @@ var releaseHistoryMinters = map[string]map[string]struct{}{
 	},
 }
 
-var releaseHistoryRowFields = map[string]struct{}{
-	"v013Rows":   {},
-	"strictRows": {},
+// releaseHistoryRowFields maps each row field to the one accessor that may
+// read it. Cloning alone is not enough: a clone of raw v0.13 rows elsewhere
+// would bypass the rawV013RowReaders allowlist on the accessor.
+var releaseHistoryRowFields = map[string]string{
+	"v013Rows":   "v013ReleaseHistory.v013Releases",
+	"strictRows": "strictReleaseHistory.strictReleases",
 }
 
 var rawV013RowReaders = map[string]struct{}{
@@ -78,11 +81,14 @@ func bypass(history v013ReleaseHistory, strict strictReleaseHistory) strictRelea
 	strict.strictRows[0].Status = "active"
 	rows := history.v013Rows
 	rows[0] = Release{}
-	_ = cloneReleaseHistory(strict.strictRows)
+	_ = cloneReleaseHistory(history.v013Rows)
 	for range strict.strictRows {
 	}
 	return result
-}`
+}
+func (h v013ReleaseHistory) v013Releases() []Release { return cloneReleaseHistory(h.v013Rows) }
+func (h strictReleaseHistory) strictReleases() []Release { return cloneReleaseHistory(h.strictRows) }
+func (h strictReleaseHistory) v013Releases() []Release { return cloneReleaseHistory(h.strictRows) }`
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "bypass.go", source, 0)
 	require.NoError(t, err)
@@ -95,21 +101,26 @@ func bypass(history v013ReleaseHistory, strict strictReleaseHistory) strictRelea
 		byLine[line] = append(byLine[line], violation)
 	}
 	for line, want := range map[int][]string{
-		3:  {"v013ReleaseHistory literal outside"},
-		4:  {"strictReleaseHistory literal outside", "reads raw v0.13 rows"},
-		6:  {"assigns normalizedFromV013"},
-		7:  {"strictRows used other than as the argument of cloneReleaseHistory"},
-		8:  {"v013Rows used other than as the argument of cloneReleaseHistory"},
-		11: {"strictRows used other than as the argument of cloneReleaseHistory"},
+		3: {"v013ReleaseHistory literal outside"},
+		4: {"strictReleaseHistory literal outside", "reads raw v0.13 rows"},
+		6: {"assigns normalizedFromV013"},
+		7: {"strictRows read other than by strictReleaseHistory.strictReleases"},
+		8: {"v013Rows read other than by v013ReleaseHistory.v013Releases"},
+		// A deep copy outside the accessor still bypasses the reader allowlist.
+		10: {"v013Rows read other than by v013ReleaseHistory.v013Releases"},
+		11: {"strictRows read other than by strictReleaseHistory.strictReleases"},
+		// A same-named method on the wrong receiver gets no allowance.
+		17: {"strictRows read other than by strictReleaseHistory.strictReleases"},
 	} {
 		joined := strings.Join(byLine[line], "\n")
 		for _, fragment := range want {
 			assert.Contains(t, joined, fragment, "line %d", line)
 		}
 	}
-	// Line 5 is the zero value and line 10 the permitted clone. Line 9 writes
-	// through an alias the guard already refused where it was taken (line 8).
-	for _, line := range []int{5, 9, 10} {
+	// Line 5 is the zero value, and lines 15 and 16 are the two accessors. Line 9
+	// writes through an alias the guard already refused where it was taken
+	// (line 8).
+	for _, line := range []int{5, 9, 15, 16} {
 		assert.Empty(t, byLine[line], "line %d", line)
 	}
 }
@@ -155,6 +166,11 @@ func releaseHistoryChokePointViolations(
 		enclosing := ""
 		if function, ok := declaration.(*ast.FuncDecl); ok {
 			enclosing = function.Name.Name
+			if function.Recv != nil && len(function.Recv.List) == 1 {
+				if receiver, ok := function.Recv.List[0].Type.(*ast.Ident); ok {
+					enclosing = receiver.Name + "." + enclosing
+				}
+			}
 		}
 		ast.Inspect(declaration, func(node ast.Node) bool {
 			switch node := node.(type) {
@@ -180,9 +196,10 @@ func releaseHistoryChokePointViolations(
 					}
 				}
 			case *ast.SelectorExpr:
-				if _, guarded := releaseHistoryRowFields[node.Sel.Name]; guarded && !cloned[node] {
-					report(node, "%s used other than as the argument of cloneReleaseHistory in %q",
-						node.Sel.Name, enclosing)
+				if accessor, guarded := releaseHistoryRowFields[node.Sel.Name]; guarded &&
+					(enclosing != accessor || !cloned[node]) {
+					report(node, "%s read other than by %s cloning it, in %q",
+						node.Sel.Name, accessor, enclosing)
 				}
 				if node.Sel.Name == "v013Releases" {
 					if _, ok := rawV013RowReaders[enclosing]; !ok {

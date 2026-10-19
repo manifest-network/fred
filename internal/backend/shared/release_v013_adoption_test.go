@@ -297,15 +297,23 @@ func TestStoppedAdoptionNeverExtendsV013ToleranceToCurrentEnvelopes(t *testing.T
 // The constructors own deep copies and the accessors hand out deep copies, so
 // neither the caller's input nor a reader's result can change a parsed history.
 func TestParsedReleaseHistoriesOwnTheirRows(t *testing.T) {
+	// The expectation is serialized before any mutation, so it shares no
+	// memory with the rows and stays independent of cloneReleaseHistory.
+	snapshot := func(t *testing.T, releases []Release) string {
+		t.Helper()
+		encoded, err := json.Marshal(releases)
+		require.NoError(t, err)
+		return string(encoded)
+	}
 	assertDetached := func(t *testing.T, rows []Release, read func() []Release) {
 		t.Helper()
-		want := cloneReleaseHistory(read())
+		want := snapshot(t, read())
 		rows[len(rows)-1].Status = "failed"
 		rows[len(rows)-1].Manifest[0] = 'X'
 		got := read()
 		got[len(got)-1].Status = "deploying"
 		got[len(got)-1].Manifest[0] = 'Y'
-		assert.Equal(t, want, read())
+		assert.Equal(t, want, snapshot(t, read()))
 	}
 
 	t.Run("strict constructor copies its input", func(t *testing.T) {
