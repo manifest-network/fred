@@ -113,7 +113,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	if class.BillingOnly() {
 		slog.Warn("payload upload refused for a billing-only lease", "lease_uuid", leaseUUID)
 		metrics.PayloadUploadsTotal.WithLabelValues("billing_only").Inc()
-		writeError(w, "lease is billing-only and does not accept a payload", http.StatusBadRequest)
+		writeBillingOnly(w, "lease is billing-only and does not accept a payload")
 		return
 	}
 	if _, deployable := class.Deployable(); !deployable {

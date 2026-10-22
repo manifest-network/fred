@@ -121,7 +121,8 @@ type ServerConfig struct {
 	// restart/update; see HandlersConfig.
 	MaintenanceLegacyIdempotencyTenants []string
 	// BillingPolicy is required: payload uploads are refused for a lease it
-	// classifies as billing-only, which Fred never deploys. It is the same
+	// classifies as billing-only, which Fred never deploys, /status marks such
+	// a lease, and GET /v1/billing-only-skus publishes its SKUs. It is the same
 	// policy the provision manager binds into placement.
 	BillingPolicy *placement.BillingPolicy
 }
@@ -191,6 +192,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		RestoreService:     deps.RestoreService,
 		PayloadStoreHealth: deps.PayloadStoreHealth,
 		EventBroker:        eventBroker,
+		BillingPolicy:      cfg.BillingPolicy,
 		ProviderUUID:       cfg.ProviderUUID,
 		Bech32Prefix:       cfg.Bech32Prefix,
 
@@ -286,6 +288,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	mux.Handle("GET /readyz", withTimeout(http.HandlerFunc(handlers.Readyz)))
 	mux.Handle("GET /metrics", withTimeout(promhttp.Handler()))
 	mux.Handle("GET /workloads", withTimeout(http.HandlerFunc(handlers.GetWorkloads)))
+	mux.Handle("GET /v1/billing-only-skus", withTimeout(http.HandlerFunc(handlers.GetBillingOnlySKUs)))
 	mux.Handle("POST /callbacks/provision", withCallbackTimeout(s.callbackPreauthBudget(http.HandlerFunc(s.handleProvisionCallback))))
 
 	// Authenticated routes validate tokens before downstream admission regardless

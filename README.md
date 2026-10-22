@@ -440,6 +440,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080 # only if the con
 | `POST` | `/v1/leases/{uuid}/update` | ADR-036 + `Idempotency-Key` | Yes | Active | Durable, lease-scoped idempotent maintenance command |
 | `POST` | `/v1/leases/{uuid}/restore` | ADR-036 | Yes | Pending | Restore a soft-deleted lease's data into this fresh lease |
 | `GET` | `/v1/leases/{uuid}/events` | ADR-036 | No | Any | WebSocket stream of lease status events |
+| `GET` | `/v1/billing-only-skus` | None | No | — | SKUs the provider bills for but never deploys; check before creating a lease |
 
 #### Operational
 
@@ -567,6 +568,43 @@ that it passed. `placement_store` and `placement_inventory` are mandatory in
 `stats.in_flight_provisions` is the number of provision and restore operations
 this process is currently tracking.
 
+### List Billing-Only SKUs
+
+```
+GET /v1/billing-only-skus
+```
+
+Lists the SKUs this provider bills for but never deploys (`billing_only_skus`).
+No token is needed, so a client can check a SKU before it creates a lease. A
+lease whose items all use these SKUs is acknowledged and billed but never
+deployed, and a lease that mixes one with deployable SKUs is rejected; see
+[Billing-only leases](#billing-only-leases). A client that wants a workload
+deployed should not create a lease with any item listed here.
+
+**Response:**
+```json
+{
+  "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+  "billing_only_skus": ["01a126cc-7edd-700d-9ac6-02ed34fa4bff"]
+}
+```
+
+**Fields:**
+- `provider_uuid` - The provider this Fred serves. Check that it is the provider
+  you are about to lease from
+- `billing_only_skus` - SKU UUIDs in ascending order; `[]` when the provider has
+  none
+
+The list is read from providerd's configuration, so it changes only when
+providerd restarts.
+
+**Response Codes:**
+- `200 OK` - List returned
+- `404 Not Found` - Fred predates this endpoint and cannot say which SKUs are
+  billing-only
+- `503 Service Unavailable` - No billing policy is configured, so the list is
+  unknown rather than empty
+
 ### Get Lease Connection
 
 ```
@@ -680,6 +718,7 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 - `meta_hash_hex` - Expected payload hash in hex (omitted if no meta_hash)
 - `payload_received` - True if Fred holds a payload for the lease: uploaded, stored by a confirmed update, or rebuilt from the backend's active release (see [Restore Lease](#restore-lease))
 - `provisioning_started` - True if provisioning is in progress
+- `billing_only` - True when every item uses a [billing-only](#billing-only-leases) SKU: the provider bills the lease but never deploys it, so no `provision_status` arrives for it. Omitted otherwise, and in an answer from the retained record
 - `provision_status` - Backend provision status (omitted if not provisioned). May be `retained` for a closed/expired lease whose data was soft-deleted and is restorable (see [retention](internal/backend/docker/README.md#soft-delete--restore))
 - `fail_count` - Lifetime count of recorded failures, whoever caused them (omitted if zero). A diagnostic only: it never decides whether the lease is closed
 - `terminal_budget` - The backend's consecutive-failure budget (omitted when the backend reports none): `consecutive_failures` is the recorded count of consecutive failures of your own workload, and `verdict` is `exhausted` when the provider will close the lease for repeated failure, otherwise `retry`. It is exhausted only by a third or later consecutive failure that comes at least 30 minutes after the first failure of the streak, so a quick burst of failures (an outage) never closes the lease by itself. Restarts, updates and platform failures never count, and a restart or update you request resets the count. Once the lease has stayed ready for ten minutes, its next failure, restart or update starts a fresh streak. The count and verdict shown are the recorded ones and do not change with time, so a lease that has been healthy for a long time can still show its old count until then. See [Repeated failures](#state-matrix)
@@ -875,8 +914,8 @@ Upload deployment configuration for a lease that was created with a `meta_hash`.
 
 **Response Codes:**
 - `202 Accepted` - Payload received, provisioning started
-- `400 Bad Request` - Invalid lease UUID, the lease is [billing-only](#billing-only-leases),
-  the lease has no `meta_hash`, the body could not be read (including a body
+- `400 Bad Request` - Invalid lease UUID, the lease is [billing-only](#billing-only-leases)
+  (with `reason: billing_only`), the lease has no `meta_hash`, the body could not be read (including a body
   over `max_request_body_size`), the body is empty, or its SHA-256 does not
   match `meta_hash`
 - `401 Unauthorized` - Invalid signature or token, or the token's lease UUID or
@@ -1167,7 +1206,7 @@ off to a complete durable close intent before teardown.
 
 **Response Codes:**
 - `202 Accepted` - Restore initiated (the lease then transitions through `restarting` to `ready`/`failed`)
-- `400 Bad Request` - Missing/invalid `from_lease_uuid`, source and target UUIDs are equal, items don't match the retained set, or the target lease is [billing-only](#billing-only-leases)
+- `400 Bad Request` - Missing/invalid `from_lease_uuid`, source and target UUIDs are equal, items don't match the retained set, or the target lease is [billing-only](#billing-only-leases) (with `reason: billing_only`)
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - The source has no placement record, is not `CLOSED` or `EXPIRED`, belongs to another tenant/provider, or its configured backend reports no retained data (including retention that has expired)
@@ -2165,7 +2204,11 @@ all use them is billing-only:
 - Fred never provisions it, never rejects it, and never closes it for a
   provisioning reason, including as lost after a backend retirement.
   `POST /v1/leases/{lease_uuid}/data` refuses its payload with `400`, and
-  `POST /v1/leases/{lease_uuid}/restore` refuses to restore into it with `400`.
+  `POST /v1/leases/{lease_uuid}/restore` refuses to restore into it with `400`;
+  both carry `reason: billing_only`. `GET /v1/leases/{lease_uuid}/status`
+  reports it with `billing_only: true`.
+- Clients can read the list before they create a lease from
+  [`GET /v1/billing-only-skus`](#list-billing-only-skus).
 - A SKU can be made billing-only while leases already use it. Fred never
   retries a deployment still in flight for such a lease, and no failure
   callback, timeout or lost backend ends the lease. Whatever the earlier

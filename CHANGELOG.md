@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Clients can tell a billing-only SKU apart before they create a lease.
+  `GET /v1/billing-only-skus` lists `billing_only_skus` with the
+  `provider_uuid`, without a token. The two refusals to deploy into a
+  billing-only lease, a payload upload and a restore, keep their `400` and
+  message and now carry `reason: billing_only`.
+  `GET /v1/leases/{uuid}/status` reports such a lease with
+  `billing_only: true`, so a client waiting for a `provision_status` that will
+  never arrive can stop. (ENG-1825)
 - docker-backend: an operator-started runtime refresh. Every container now
   records the runtime contract it was created under in `fred.runtime_contract`
   (contract 1: the lease's own network). `POST /runtime_refresh` recreates

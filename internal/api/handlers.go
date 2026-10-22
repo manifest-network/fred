@@ -133,6 +133,7 @@ type Handlers struct {
 	wsUpgrader         websocket.Upgrader
 	wsMaxMessageSize   int64         // max bytes the server will read from a client message on /events
 	wsMaxConnLifetime  time.Duration // max lifetime of an /events subscription before forced reconnect
+	billingPolicy      *placement.BillingPolicy
 	providerUUID       string
 	bech32Prefix       string
 	// legacyIdempotencyTenants may omit Idempotency-Key on restart/update.
@@ -150,8 +151,12 @@ type HandlersConfig struct {
 	MaintenanceService MaintenanceService    // required by restart/update; owns durable idempotent dispatch
 	PayloadStoreHealth PayloadStoreHealth    // optional — health probe for the payload store's bbolt DB
 	EventBroker        *EventBroker          // optional — if nil, the events endpoint will return 501
-	ProviderUUID       string
-	Bech32Prefix       string
+	// BillingPolicy is published by GET /v1/billing-only-skus and marks a
+	// billing-only lease on /status. Without one, the list is refused with
+	// 503 and no lease is marked.
+	BillingPolicy *placement.BillingPolicy
+	ProviderUUID  string
+	Bech32Prefix  string
 	// MaintenanceLegacyIdempotencyTenants lists tenants whose restart/update
 	// requests may omit Idempotency-Key; each such request is keyed by its
 	// single-use signed token. Empty keeps the header mandatory.
@@ -192,6 +197,7 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		},
 		wsMaxMessageSize:  wsDefaultMaxMessageSize,
 		wsMaxConnLifetime: wsDefaultMaxConnLifetime,
+		billingPolicy:     cfg.BillingPolicy,
 		providerUUID:      cfg.ProviderUUID,
 		bech32Prefix:      cfg.Bech32Prefix,
 		legacyIdempotencyTenants: func() map[string]struct{} {
@@ -710,7 +716,10 @@ type LeaseStatusResponse struct {
 	MetaHashHex         string `json:"meta_hash_hex,omitempty"` // For debugging - shows the expected payload hash
 	PayloadReceived     bool   `json:"payload_received"`
 	ProvisioningStarted bool   `json:"provisioning_started"`
-	ProvisionStatus     string `json:"provision_status,omitempty"`
+	// BillingOnly marks a lease whose SKUs are all billing-only: it is billed
+	// but never deployed, so no provision_status will ever arrive for it.
+	BillingOnly     bool   `json:"billing_only,omitempty"`
+	ProvisionStatus string `json:"provision_status,omitempty"`
 	// FailCount is a lifetime diagnostic of every recorded failure, whoever
 	// caused it. It never decides whether the lease is closed; TerminalBudget
 	// does (ENG-799).
@@ -785,6 +794,7 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 		ProviderUUID:    h.providerUUID,
 		State:           lease.State.String(),
 		RequiresPayload: hasMetaHash,
+		BillingOnly:     h.billingPolicy.Classify(lease).BillingOnly(),
 	}
 	if hasMetaHash {
 		response.MetaHashHex = hex.EncodeToString(lease.MetaHash)
@@ -1230,7 +1240,7 @@ func (h *Handlers) writeRestoreResult(
 	case restoreapp.OutcomeTargetNotPending:
 		writeRestoreConflict(w, "lease is not pending; only a fresh lease can be restored into", "target_not_pending")
 	case restoreapp.OutcomeTargetBillingOnly:
-		writeError(w, "lease is billing-only and cannot be restored into", http.StatusBadRequest)
+		writeBillingOnly(w, "lease is billing-only and cannot be restored into")
 	case restoreapp.OutcomeSourceNotFound, restoreapp.OutcomeNotRetained:
 		writeError(w, "no retained data found for that lease", http.StatusNotFound)
 	case restoreapp.OutcomeSourceUnavailable:
@@ -1831,6 +1841,32 @@ func (h *Handlers) Readyz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, response, httpStatus)
+}
+
+// BillingOnlySKUsResponse lists the SKUs this provider bills for but never
+// deploys. It is served unauthenticated so a client can check, before it
+// creates a lease, that no item uses one of them.
+type BillingOnlySKUsResponse struct {
+	ProviderUUID    string   `json:"provider_uuid"`
+	BillingOnlySKUs []string `json:"billing_only_skus"`
+}
+
+// GetBillingOnlySKUs handles GET /v1/billing-only-skus. A lease whose items
+// are all billing-only is acknowledged and billed but never deployed; one that
+// mixes them with deployable SKUs takes the normal path, where the backend
+// refuses the SKU it cannot serve. Without a billing policy it answers 503
+// rather than an empty list, which would claim every SKU is deployable.
+func (h *Handlers) GetBillingOnlySKUs(w http.ResponseWriter, r *http.Request) {
+	skus, ok := h.billingPolicy.SKUs()
+	if !ok {
+		slog.Error("billing-only SKU list requested without a billing policy")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, BillingOnlySKUsResponse{
+		ProviderUUID:    h.providerUUID,
+		BillingOnlySKUs: skus,
+	}, http.StatusOK)
 }
 
 // WorkloadLookupResponse is the response from the GET /workloads endpoint.
@@ -2452,6 +2488,21 @@ func extractBearerToken(r *http.Request) (string, error) {
 		return "", errInvalidAuthFormat
 	}
 	return parts[1], nil
+}
+
+// reasonBillingOnly marks a refusal to deploy into a billing-only lease, which
+// Fred bills but never deploys. Clients branch on it rather than on the
+// message text.
+const reasonBillingOnly = "billing_only"
+
+// writeBillingOnly refuses a request that would deploy into a billing-only
+// lease.
+func writeBillingOnly(w http.ResponseWriter, message string) {
+	writeJSON(w, ErrorResponse{
+		Error:  message,
+		Code:   http.StatusBadRequest,
+		Reason: reasonBillingOnly,
+	}, http.StatusBadRequest)
 }
 
 // writeBackendStorageLost is the one terminal answer for a lease whose

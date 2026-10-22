@@ -115,6 +115,32 @@ func TestDeployableLease_IsDetachedFromTheCallersLease(t *testing.T) {
 	assert.Equal(t, "sku-test", deployable.Lease().Items[0].SkuUuid, "the accessor returns a copy")
 }
 
+func TestBillingPolicy_SKUs(t *testing.T) {
+	const otherSKU = "00f4c1de-1b2a-4c3d-8e9f-0a1b2c3d4e5f"
+	policy, err := NewBillingPolicy([]string{testBillingOnlySKU, otherSKU})
+	require.NoError(t, err)
+
+	skus, ok := policy.SKUs()
+	require.True(t, ok)
+	assert.Equal(t, []string{otherSKU, testBillingOnlySKU}, skus, "listed in ascending order")
+	skus[0] = "edited"
+	again, _ := policy.SKUs()
+	assert.Equal(t, []string{otherSKU, testBillingOnlySKU}, again, "each call returns a fresh copy")
+
+	none, ok := NoBillingOnlySKUs().SKUs()
+	require.True(t, ok)
+	assert.NotNil(t, none, "the explicit empty policy lists no SKUs, not an absent list")
+	assert.Empty(t, none)
+
+	for name, invalid := range map[string]*BillingPolicy{"nil": nil, "zero value": {}} {
+		t.Run(name+" policy has no list", func(t *testing.T) {
+			skus, ok := invalid.SKUs()
+			assert.False(t, ok)
+			assert.Nil(t, skus)
+		})
+	}
+}
+
 func TestBindBackendRuntime_RequiresBillingPolicy(t *testing.T) {
 	store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
 	require.NoError(t, store.ConfigureBackendTopologyWithStorageIdentities(
