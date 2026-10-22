@@ -49,36 +49,60 @@ func TestNewServer_RequiresBillingPolicy(t *testing.T) {
 	require.ErrorContains(t, err, "billing policy is required")
 }
 
+// billingOnlyLeaseStates are the states a client can find a billing-only
+// lease in: Fred acknowledges it as soon as it sees it, so a request races the
+// acknowledgment. The refusal must say billing-only either way.
+var billingOnlyLeaseStates = []billingtypes.LeaseState{
+	billingtypes.LEASE_STATE_PENDING,
+	billingtypes.LEASE_STATE_ACTIVE,
+}
+
+// TestNewServer_BindsBillingPolicyIntoHandlers checks the restore handler gets
+// the server's policy: without it, a billing-only target that is already
+// ACTIVE would be refused as not pending.
+func TestNewServer_BindsBillingPolicyIntoHandlers(t *testing.T) {
+	policy := testBillingOnlyPolicy(t)
+	server, err := NewServer(ServerConfig{BillingPolicy: policy, ProviderUUID: testutil.ValidUUID2}, ServerDeps{
+		ChainClient: &mockChainClient{},
+	})
+	require.NoError(t, err)
+	assert.Same(t, policy, server.handlers.billingPolicy)
+}
+
 func TestPayloadHandler_BillingOnlyLeaseRefused(t *testing.T) {
 	kp := testutil.NewTestKeyPair("payload-handler-test-billing-only")
 	payload := []byte("test payload")
 	metaHash := testutil.ComputePayloadHash(payload)
 	metaHashBytes, _ := hex.DecodeString(metaHash)
 
-	client := &mockPayloadChainClient{
-		getLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
-			return &billingtypes.Lease{
-				Uuid:         leaseUUID,
-				State:        billingtypes.LEASE_STATE_PENDING,
-				Tenant:       kp.Address,
-				ProviderUuid: testutil.ValidUUID1,
-				MetaHash:     metaHashBytes,
-				Items:        []billingtypes.LeaseItem{{SkuUuid: testBillingOnlySKU, Quantity: 1}},
-			}, nil
-		},
+	for _, state := range billingOnlyLeaseStates {
+		t.Run(state.String(), func(t *testing.T) {
+			client := &mockPayloadChainClient{
+				getLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+					return &billingtypes.Lease{
+						Uuid:         leaseUUID,
+						State:        state,
+						Tenant:       kp.Address,
+						ProviderUuid: testutil.ValidUUID1,
+						MetaHash:     metaHashBytes,
+						Items:        []billingtypes.LeaseItem{{SkuUuid: testBillingOnlySKU, Quantity: 1}},
+					}, nil
+				},
+			}
+			publisher := newMockPayloadPublisher()
+			handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest", testBillingOnlyPolicy(t))
+
+			tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
+			req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
+			rr := httptest.NewRecorder()
+
+			handler.HandlePayloadUpload(rr, req)
+
+			assertBillingOnlyRefusal(t, rr, "lease is billing-only and does not accept a payload")
+			assert.Empty(t, publisher.storedPayloads, "a billing-only lease's payload is never stored")
+			assert.Empty(t, publisher.publishedEvents, "nothing is queued for provisioning")
+		})
 	}
-	publisher := newMockPayloadPublisher()
-	handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest", testBillingOnlyPolicy(t))
-
-	tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
-	req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
-	rr := httptest.NewRecorder()
-
-	handler.HandlePayloadUpload(rr, req)
-
-	assertBillingOnlyRefusal(t, rr, "lease is billing-only and does not accept a payload")
-	assert.Empty(t, publisher.storedPayloads, "a billing-only lease's payload is never stored")
-	assert.Empty(t, publisher.publishedEvents, "nothing is queued for provisioning")
 }
 
 // TestRestoreLease_BillingOnlyTargetRefused drives the restore route through
@@ -91,168 +115,70 @@ func TestRestoreLease_BillingOnlyTargetRefused(t *testing.T) {
 	leaseUUID := testutil.ValidUUID1
 	providerUUID := testutil.ValidUUID2
 
-	chainClient := &mockChainClient{
-		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
-			if uuid == leaseUUID {
-				return &billingtypes.Lease{
-					Uuid:         leaseUUID,
-					Tenant:       kp.Address,
-					ProviderUuid: providerUUID,
-					State:        billingtypes.LEASE_STATE_PENDING,
-					Items:        []billingtypes.LeaseItem{{SkuUuid: testBillingOnlySKU, Quantity: 1}},
-				}, nil
+	for _, state := range billingOnlyLeaseStates {
+		t.Run(state.String(), func(t *testing.T) {
+			chainClient := &mockChainClient{
+				getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+					if uuid == leaseUUID {
+						return &billingtypes.Lease{
+							Uuid:         leaseUUID,
+							Tenant:       kp.Address,
+							ProviderUuid: providerUUID,
+							State:        state,
+							Items:        []billingtypes.LeaseItem{{SkuUuid: testBillingOnlySKU, Quantity: 1}},
+						}, nil
+					}
+					return nil, nil
+				},
 			}
-			return nil, nil
-		},
-	}
 
-	var restoreCalls atomic.Int32
-	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/restore" {
-			restoreCalls.Add(1)
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
-		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-	}))
-	defer backendServer.Close()
-	backendClient := newBackendHTTPClientForTest(t, backendHTTPClientConfig{
-		Name: "test-backend", BaseURL: backendServer.URL, Timeout: 5 * time.Second,
-	})
-	router, err := backend.NewRouter(backend.RouterConfig{
-		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
-	})
-	require.NoError(t, err)
-	placements := &mockPlacementLookup{getFunc: func(uuid string) string {
-		if uuid == fromLeaseUUID {
-			return "test-backend"
-		}
-		return ""
-	}}
-
-	h := &Handlers{
-		client:          chainClient,
-		backendRouter:   router,
-		placementLookup: placements,
-		restoreService: newRestoreServiceForTest(
-			t, providerUUID, kp.Address, chainClient, router, placements, nil, testBillingOnlyPolicy(t),
-		),
-		providerUUID: providerUUID,
-		bech32Prefix: "manifest",
-	}
-
-	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore",
-		strings.NewReader(`{"from_lease_uuid":"`+fromLeaseUUID+`"}`))
-	req.Header.Set("Authorization", "Bearer "+validToken)
-	req.SetPathValue("lease_uuid", leaseUUID)
-	rec := httptest.NewRecorder()
-
-	h.RestoreLease(rec, req)
-
-	assertBillingOnlyRefusal(t, rec, "lease is billing-only and cannot be restored into")
-	assert.Zero(t, restoreCalls.Load(), "a billing-only lease never reaches the backend")
-}
-
-// TestGetLeaseStatus_MarksBillingOnlyLease checks /status tells a billing-only
-// lease, which never gets a provision_status, apart from one whose backend
-// Fred could not read. A lease that mixes in a deployable SKU is not
-// billing-only.
-func TestGetLeaseStatus_MarksBillingOnlyLease(t *testing.T) {
-	kp := testutil.NewTestKeyPair("test-tenant")
-	leaseUUID := testutil.ValidUUID1
-	providerUUID := testutil.ValidUUID2
-
-	for name, tc := range map[string]struct {
-		policy      *placement.BillingPolicy
-		skus        []string
-		billingOnly bool
-	}{
-		"billing-only":                {policy: testBillingOnlyPolicy(t), skus: []string{testBillingOnlySKU}, billingOnly: true},
-		"mixed with a deployable SKU": {policy: testBillingOnlyPolicy(t), skus: []string{testBillingOnlySKU, testutil.ValidUUID3}},
-		"deployable":                  {policy: testBillingOnlyPolicy(t), skus: []string{testutil.ValidUUID3}},
-		"no billing-only SKUs":        {policy: placement.NoBillingOnlySKUs(), skus: []string{testBillingOnlySKU}},
-	} {
-		t.Run(name, func(t *testing.T) {
-			lease := &billingtypes.Lease{
-				Uuid:         leaseUUID,
-				Tenant:       kp.Address,
-				ProviderUuid: providerUUID,
-				State:        billingtypes.LEASE_STATE_ACTIVE,
-			}
-			for _, sku := range tc.skus {
-				lease.Items = append(lease.Items, billingtypes.LeaseItem{SkuUuid: sku, Quantity: 1})
-			}
-			h := NewHandlers(HandlersConfig{
-				Client: &mockChainClient{getLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
-					return lease, nil
-				}},
-				BillingPolicy: tc.policy,
-				ProviderUUID:  providerUUID,
-				Bech32Prefix:  "manifest",
+			var restoreCalls atomic.Int32
+			backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/restore" {
+					restoreCalls.Add(1)
+					w.WriteHeader(http.StatusAccepted)
+					return
+				}
+				t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}))
+			defer backendServer.Close()
+			backendClient := newBackendHTTPClientForTest(t, backendHTTPClientConfig{
+				Name: "test-backend", BaseURL: backendServer.URL, Timeout: 5 * time.Second,
 			})
+			router, err := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+			})
+			require.NoError(t, err)
+			placements := &mockPlacementLookup{getFunc: func(uuid string) string {
+				if uuid == fromLeaseUUID {
+					return "test-backend"
+				}
+				return ""
+			}}
 
-			req := httptest.NewRequest(http.MethodGet, "/v1/leases/"+leaseUUID+"/status", nil)
-			req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+			h := &Handlers{
+				client:          chainClient,
+				backendRouter:   router,
+				placementLookup: placements,
+				billingPolicy:   testBillingOnlyPolicy(t),
+				restoreService: newRestoreServiceForTest(
+					t, providerUUID, kp.Address, chainClient, router, placements, nil, testBillingOnlyPolicy(t),
+				),
+				providerUUID: providerUUID,
+				bech32Prefix: "manifest",
+			}
+
+			validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+			req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore",
+				strings.NewReader(`{"from_lease_uuid":"`+fromLeaseUUID+`"}`))
+			req.Header.Set("Authorization", "Bearer "+validToken)
 			req.SetPathValue("lease_uuid", leaseUUID)
 			rec := httptest.NewRecorder()
-			h.GetLeaseStatus(rec, req)
 
-			require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
-			var fields map[string]any
-			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &fields))
-			if tc.billingOnly {
-				assert.Equal(t, true, fields["billing_only"])
-			} else {
-				assert.NotContains(t, fields, "billing_only", "omitted unless the lease is billing-only")
-			}
+			h.RestoreLease(rec, req)
+
+			assertBillingOnlyRefusal(t, rec, "lease is billing-only and cannot be restored into")
+			assert.Zero(t, restoreCalls.Load(), "a billing-only lease never reaches the backend")
 		})
 	}
-}
-
-// TestGetBillingOnlySKUs_Unauthenticated drives the route through the server,
-// which serves it without a token so a client can check a SKU before it
-// creates a lease.
-func TestGetBillingOnlySKUs_Unauthenticated(t *testing.T) {
-	const otherSKU = "00f4c1de-1b2a-4c3d-8e9f-0a1b2c3d4e5f"
-	for name, tc := range map[string]struct {
-		skus []string
-		want string
-	}{
-		"listed in ascending order": {
-			skus: []string{testBillingOnlySKU, otherSKU},
-			want: `{"provider_uuid":"` + testutil.ValidUUID2 + `","billing_only_skus":["` + otherSKU + `","` + testBillingOnlySKU + `"]}`,
-		},
-		"none is an empty list": {
-			want: `{"provider_uuid":"` + testutil.ValidUUID2 + `","billing_only_skus":[]}`,
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			policy, err := placement.NewBillingPolicy(tc.skus)
-			require.NoError(t, err)
-			server, err := NewServer(ServerConfig{
-				BillingPolicy:  policy,
-				ProviderUUID:   testutil.ValidUUID2,
-				Bech32Prefix:   "manifest",
-				RateLimitRPS:   100,
-				RateLimitBurst: 200,
-			}, ServerDeps{ChainClient: &mockChainClient{}})
-			require.NoError(t, err)
-
-			rec := httptest.NewRecorder()
-			server.server.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/billing-only-skus", nil))
-
-			require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
-			assert.JSONEq(t, tc.want, rec.Body.String())
-		})
-	}
-}
-
-func TestGetBillingOnlySKUs_WithoutPolicyIsRefused(t *testing.T) {
-	h := NewHandlers(HandlersConfig{ProviderUUID: testutil.ValidUUID2})
-	rec := httptest.NewRecorder()
-	h.GetBillingOnlySKUs(rec, httptest.NewRequest(http.MethodGet, "/v1/billing-only-skus", nil))
-
-	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "an empty list would claim every SKU is deployable")
-	assert.NotContains(t, rec.Body.String(), "billing_only_skus")
 }

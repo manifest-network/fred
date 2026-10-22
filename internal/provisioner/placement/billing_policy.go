@@ -2,7 +2,6 @@ package placement
 
 import (
 	"fmt"
-	"slices"
 
 	"github.com/google/uuid"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
@@ -48,21 +47,6 @@ func NoBillingOnlySKUs() *BillingPolicy {
 }
 
 func (p *BillingPolicy) valid() bool { return p != nil && p.billingOnly != nil }
-
-// SKUs returns a fresh copy of the billing-only SKU UUIDs in ascending order.
-// It reports false for an invalid policy, which has no list to publish: an
-// empty list would tell a client that every SKU is deployable.
-func (p *BillingPolicy) SKUs() ([]string, bool) {
-	if !p.valid() {
-		return nil, false
-	}
-	skus := make([]string, 0, len(p.billingOnly))
-	for sku := range p.billingOnly {
-		skus = append(skus, sku)
-	}
-	slices.Sort(skus)
-	return skus, true
-}
 
 // leaseKind is the outcome of classifying one lease. The zero value is
 // invalid: it authorizes neither a deployment nor an acknowledgment.

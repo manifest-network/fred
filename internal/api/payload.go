@@ -96,19 +96,12 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Verify lease is PENDING
-	if lease.State != billingtypes.LEASE_STATE_PENDING {
-		slog.Warn("lease not pending",
-			"lease_uuid", leaseUUID,
-			"state", lease.State.String(),
-		)
-		writeError(w, "lease not pending", http.StatusNotFound)
-		return
-	}
-
 	// A billing-only lease is never deployed, so a payload has nothing to
 	// configure. A lease the policy cannot classify is refused as well: only a
-	// deployable lease is ever provisioned from a payload.
+	// deployable lease is ever provisioned from a payload. This runs before the
+	// state check: Fred acknowledges a billing-only lease as soon as it sees
+	// it, so an upload can find the lease already ACTIVE, and the client must
+	// still learn why it was refused.
 	class := h.policy.Classify(lease)
 	if class.BillingOnly() {
 		slog.Warn("payload upload refused for a billing-only lease", "lease_uuid", leaseUUID)
@@ -120,6 +113,16 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		slog.Error("payload upload refused: lease cannot be classified for deployment", "lease_uuid", leaseUUID)
 		metrics.PayloadUploadsTotal.WithLabelValues("error").Inc()
 		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+
+	// Verify lease is PENDING
+	if lease.State != billingtypes.LEASE_STATE_PENDING {
+		slog.Warn("lease not pending",
+			"lease_uuid", leaseUUID,
+			"state", lease.State.String(),
+		)
+		writeError(w, "lease not pending", http.StatusNotFound)
 		return
 	}
 

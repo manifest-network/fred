@@ -261,14 +261,17 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 			err:         ErrInvalidRestoreCoordinator,
 		}
 	}
-	if targetLease.State != billingtypes.LEASE_STATE_PENDING {
-		return RestoreApplicationResult{disposition: RestoreApplicationTargetNotPending}
-	}
 	// A restore deploys a workload into the target exactly as a provision
-	// does, so it needs the same classifier-issued capability.
+	// does, so it needs the same classifier-issued capability. Billing-only is
+	// decided before the state: Fred acknowledges such a lease as soon as it
+	// sees it, so the target can already be ACTIVE, and the refusal must still
+	// say why.
 	targetClass := authority.coordinator.classify(targetLease)
 	if targetClass.BillingOnly() {
 		return RestoreApplicationResult{disposition: RestoreApplicationTargetBillingOnly}
+	}
+	if targetLease.State != billingtypes.LEASE_STATE_PENDING {
+		return RestoreApplicationResult{disposition: RestoreApplicationTargetNotPending}
 	}
 	deployableTarget, isDeployable := targetClass.Deployable()
 	if !isDeployable {
