@@ -315,44 +315,54 @@ func TestExecuteCurrentLease_MixedLeaseIsProvisioned(t *testing.T) {
 	assert.Empty(t, control.acknowledged(), "a mixed lease is acknowledged only after it is provisioned")
 }
 
+// TestRestoreApplication_RefusesBillingOnlyTarget refuses a billing-only target
+// as billing-only whatever its state: Fred acknowledges such a lease as soon as
+// it sees it, so a restore can find it already ACTIVE.
 func TestRestoreApplication_RefusesBillingOnlyTarget(t *testing.T) {
 	const sourceLease = "71638ef8-1401-4f14-a355-1ae02afeb35b"
 	const targetLease = "81638ef8-1401-4f14-a355-1ae02afeb35b"
-	store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
-	requireAdmissionBaseline(t, store, "backend-a")
-	projectInventoryForTest(t, store, InventoryProjection{
-		Placements: map[string]string{sourceLease: "backend-a"},
-	})
-	base, err := newOperationCoordinator(store, operation.NewRegistry())
-	require.NoError(t, err)
-	var calls atomic.Int32
-	// The backend would accept the restore: the billing-only refusal is
-	// Fred's own, never left to the backend.
-	client := &executionTestBackend{name: "backend-a", restore: func(context.Context, backend.RestoreRequest) error {
-		calls.Add(1)
-		return nil
-	}}
-	execution := bindExecutionWithPolicyForTest(t, base, newExecutionTestRuntime(client), testBillingOnlyPolicy(t))
-	setProviderControlPlaneForTest(t, execution, executionLeaseReaderFunc(func(_ context.Context, leaseUUID string) (*billingtypes.Lease, error) {
-		state := billingtypes.LEASE_STATE_PENDING
-		if leaseUUID == sourceLease {
-			state = billingtypes.LEASE_STATE_CLOSED
-		}
-		return &billingtypes.Lease{
-			Uuid: leaseUUID, Tenant: "tenant-test", ProviderUuid: freshTestProviderUUID, State: state,
-			Items: []billingtypes.LeaseItem{{SkuUuid: testBillingOnlySKU, Quantity: 1}},
-		}, nil
-	}))
-	authority, err := execution.RestoreCoordinator(nil)
-	require.NoError(t, err)
-	request, err := NewRestoreApplicationRequest(targetLease, "tenant-test", sourceLease)
-	require.NoError(t, err)
+	for _, targetState := range []billingtypes.LeaseState{
+		billingtypes.LEASE_STATE_PENDING,
+		billingtypes.LEASE_STATE_ACTIVE,
+	} {
+		t.Run(targetState.String(), func(t *testing.T) {
+			store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
+			requireAdmissionBaseline(t, store, "backend-a")
+			projectInventoryForTest(t, store, InventoryProjection{
+				Placements: map[string]string{sourceLease: "backend-a"},
+			})
+			base, err := newOperationCoordinator(store, operation.NewRegistry())
+			require.NoError(t, err)
+			var calls atomic.Int32
+			// The backend would accept the restore: the billing-only refusal is
+			// Fred's own, never left to the backend.
+			client := &executionTestBackend{name: "backend-a", restore: func(context.Context, backend.RestoreRequest) error {
+				calls.Add(1)
+				return nil
+			}}
+			execution := bindExecutionWithPolicyForTest(t, base, newExecutionTestRuntime(client), testBillingOnlyPolicy(t))
+			setProviderControlPlaneForTest(t, execution, executionLeaseReaderFunc(func(_ context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+				state := targetState
+				if leaseUUID == sourceLease {
+					state = billingtypes.LEASE_STATE_CLOSED
+				}
+				return &billingtypes.Lease{
+					Uuid: leaseUUID, Tenant: "tenant-test", ProviderUuid: freshTestProviderUUID, State: state,
+					Items: []billingtypes.LeaseItem{{SkuUuid: testBillingOnlySKU, Quantity: 1}},
+				}, nil
+			}))
+			authority, err := execution.RestoreCoordinator(nil)
+			require.NoError(t, err)
+			request, err := NewRestoreApplicationRequest(targetLease, "tenant-test", sourceLease)
+			require.NoError(t, err)
 
-	result := authority.ExecuteApplication(t.Context(), request)
+			result := authority.ExecuteApplication(t.Context(), request)
 
-	assert.Equal(t, RestoreApplicationTargetBillingOnly, result.Disposition(), result.Err())
-	assert.Zero(t, calls.Load(), "a billing-only lease never reaches the backend")
-	assert.Equal(t, StateAbsent, store.Lookup(targetLease).State(), "nothing is admitted for the target")
+			assert.Equal(t, RestoreApplicationTargetBillingOnly, result.Disposition(), result.Err())
+			assert.Zero(t, calls.Load(), "a billing-only lease never reaches the backend")
+			assert.Equal(t, StateAbsent, store.Lookup(targetLease).State(), "nothing is admitted for the target")
+		})
+	}
 }
 
 func TestBillingPolicy_PermitsRequestItems(t *testing.T) {

@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- The two refusals to deploy into a billing-only lease, a payload upload and a
+  restore, now carry `reason: billing_only`, so clients can branch on a code
+  instead of the message, which is unchanged. (ENG-1825)
 - docker-backend: an operator-started runtime refresh. Every container now
   records the runtime contract it was created under in `fred.runtime_contract`
   (contract 1: the lease's own network). `POST /runtime_refresh` recreates
@@ -1234,6 +1237,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A payload upload or restore into a billing-only lease is refused as
+  billing-only in any lease state. Fred acknowledges such a lease as soon as
+  it sees it, so a request that lost that race found it ACTIVE and got the
+  generic `404 lease not pending` or `409 target_not_pending` instead.
+  (ENG-1825)
 - docker-backend: adopting a stopped v0.13 backend no longer refuses a lease
   whose release history has more than one `active` row because v0.13
   re-provisioned it. Every successful v0.13 provision appended an `active` row
