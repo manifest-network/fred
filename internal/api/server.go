@@ -120,9 +120,9 @@ type ServerConfig struct {
 	// MaintenanceLegacyIdempotencyTenants may omit Idempotency-Key on
 	// restart/update; see HandlersConfig.
 	MaintenanceLegacyIdempotencyTenants []string
-	// BillingPolicy is required: payload uploads are refused for a lease it
-	// classifies as billing-only, which Fred never deploys. It is the same
-	// policy the provision manager binds into placement.
+	// BillingPolicy is required: payload uploads and restores are refused for
+	// a lease it classifies as billing-only, which Fred never deploys. It is
+	// the same policy the provision manager binds into placement.
 	BillingPolicy *placement.BillingPolicy
 }
 
@@ -191,6 +191,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		RestoreService:     deps.RestoreService,
 		PayloadStoreHealth: deps.PayloadStoreHealth,
 		EventBroker:        eventBroker,
+		BillingPolicy:      cfg.BillingPolicy,
 		ProviderUUID:       cfg.ProviderUUID,
 		Bech32Prefix:       cfg.Bech32Prefix,
 
