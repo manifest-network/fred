@@ -2286,6 +2286,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- deps: build with Go 1.26.10 (from 1.26.9). `crypto/x509` now refuses to
+  verify a chain through the intermediate certificates that are no longer
+  trusted (GO-2026-6809), a check Fred's TLS connections reach through
+  `Certificate.Verify`. The `go` directive and the Dockerfile builder image
+  move to 1.26.10, so building Fred from source now needs Go 1.26.10 or later.
+
 - docker-backend: every lease now runs on its own Docker network, `fred-<lease_uuid>`,
   instead of one network shared by all leases of a tenant. On the shared
   network each service name resolved to that service in every lease of the
