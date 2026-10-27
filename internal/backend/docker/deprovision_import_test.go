@@ -197,6 +197,7 @@ func TestDeprovisionDuringOwnedImageImportReturnsPendingBeforeHTTPDeadline(t *te
 
 	// Released, the worker leaves the flight and drains. Close then completes
 	// while the import is still outstanding: only this test can complete it.
+	closing := b.actorFor(request.LeaseUUID)
 	require.NoError(t, deprovisionAfterWorkerDrain(t, t.Context(), b, request.LeaseUUID),
 		"close must complete once its own worker drains, without waiting for the flight's import")
 	require.NoError(t, work.Err(), "close cannot cancel the flight's dispatched daemon exchange")
@@ -234,6 +235,14 @@ func TestDeprovisionDuringOwnedImageImportReturnsPendingBeforeHTTPDeadline(t *te
 	replayed, err := b.callbackStore.ListPending()
 	require.NoError(t, err)
 	require.Equal(t, callbacks, replayed, "the late import completion cannot publish a settlement")
+	// The completed close retires its actor asynchronously. Until that actor
+	// leaves the registry, a repeated close reaches it and is told to retry, so
+	// repeat the close against a fresh actor, as providerd's next attempt would.
+	select {
+	case <-closing.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the closed lease's actor did not exit")
+	}
 	require.NoError(t, b.Deprovision(t.Context(), request.LeaseUUID))
 	replayed, err = b.callbackStore.ListPending()
 	require.NoError(t, err)
