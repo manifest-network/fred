@@ -503,14 +503,14 @@ func TestDeprovision_AmbiguousVolume_RetainedConservatively(t *testing.T) {
 func TestBuildStatefulVolumeBinds_RejectsReservedWritablePathName(t *testing.T) {
 	host := t.TempDir()
 
-	_, err := buildStatefulVolumeBinds(host, []string{"/" + writablePathSubdir}, 0, 0)
+	_, err := buildStatefulVolumeBinds(host, []string{"/" + writablePathSubdir}, os.Getuid(), os.Getgid())
 	require.Error(t, err, "a VOLUME that sanitizes to the reserved _wp name must be rejected")
 
-	_, err = buildStatefulVolumeBinds(host, []string{"/" + writablePathSubdir + "/data"}, 0, 0)
+	_, err = buildStatefulVolumeBinds(host, []string{"/" + writablePathSubdir + "/data"}, os.Getuid(), os.Getgid())
 	require.Error(t, err, "a VOLUME nested under the reserved _wp dir must also be rejected")
 
 	// A normal declared VOLUME is unaffected.
-	binds, err := buildStatefulVolumeBinds(host, []string{"/data"}, 0, 0)
+	binds, err := buildStatefulVolumeBinds(host, []string{"/data"}, os.Getuid(), os.Getgid())
 	require.NoError(t, err)
 	require.Len(t, binds, 1)
 }
