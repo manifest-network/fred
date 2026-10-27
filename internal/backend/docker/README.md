@@ -70,6 +70,9 @@ With `production_mode: true`, `docker_host` must be a canonical absolute local
 Unix socket URL, such as `unix:///var/run/docker.sock` or a rootless daemon's
 `unix:///run/user/1000/docker.sock`. Remote TCP/HTTP Docker endpoints are limited
 to development mode; the backend does not supply a remote Docker TLS policy.
+A rootless or `userns-remap` daemon cannot serve stateful volumes yet: the
+backend chowns each volume subdirectory in host IDs, without the daemon's ID
+mapping (see [DEPLOYMENT.md](../../../DEPLOYMENT.md)).
 
 ## Configuration Reference
 
@@ -591,7 +594,7 @@ is best-effort and skipped, while the conservative pool reservation remains.
 
 > **Production support:** **`xfs` is the only filesystem validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. The **`btrfs`** and **`zfs`** backends have automated coverage but are **not production-validated and not used in any deployment** — treat them as experimental. In particular, the inode-exhaustion backstops that XFS enforces via kernel project quotas have no equivalent production evidence on btrfs/zfs. Use `xfs` for any production deployment.
 
-> **Capability requirement (xfs/btrfs):** setting a volume's block-quota limit is a privileged operation, so the docker-backend must hold `CAP_SYS_ADMIN` on an xfs or btrfs backend. The daemon **fails fast at startup** if it lacks it (`internal/backend/docker/capability.go`) rather than provisioning with silently-unenforced disk caps. Repairing a pre-existing tenant-owned volume root additionally needs `CAP_FOWNER`. Grant them ambiently — `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` on the systemd unit; a plain `setcap cap_sys_admin+ep` on the binary does **not** propagate to the exec'd `xfs_quota`/`btrfs` child processes. `zfs` is exempt (`zfs allow` delegation) and `noop` is unaffected. See [DEPLOYMENT.md](../../../DEPLOYMENT.md#xfs-good-for-large-fleets) and its [systemd section](../../../DEPLOYMENT.md#process-management-systemd) for the full setup.
+> **Capability requirement (xfs/btrfs):** setting a volume's block-quota limit is a privileged operation, so the docker-backend must hold `CAP_SYS_ADMIN` on an xfs or btrfs backend. The daemon **fails fast at startup** if it lacks it (`internal/backend/docker/capability.go`) rather than provisioning with silently-unenforced disk caps. Repairing a pre-existing tenant-owned volume root additionally needs `CAP_FOWNER`. Giving each volume subdirectory to the container's user, root included, needs `CAP_CHOWN`, and managing the resulting tenant-owned trees needs `CAP_DAC_OVERRIDE`. Grant them ambiently — `AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN CAP_FOWNER` on the systemd unit; a plain `setcap cap_sys_admin+ep` on the binary does **not** propagate to the exec'd `xfs_quota`/`btrfs` child processes. `zfs` is exempt from `CAP_SYS_ADMIN` (`zfs allow` delegation) and `noop` is unaffected. See [DEPLOYMENT.md](../../../DEPLOYMENT.md#xfs-good-for-large-fleets) and its [systemd section](../../../DEPLOYMENT.md#process-management-systemd) for the full setup.
 
 XFS startup and reuse inspect only the descriptor-bound root project ID and
 inheritance flag, repair that already-open inode with XFS ioctls when necessary,

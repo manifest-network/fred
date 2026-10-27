@@ -689,7 +689,7 @@ touches that root only, never tenant-owned descendants. The preliminary probe
 checks `CAP_SYS_ADMIN`; quota reconciliation attempts all expected present live
 and retained volumes and refuses readiness on inventory, durable-authority, or
 enforcement errors. See [DEPLOYMENT.md](DEPLOYMENT.md) for the systemd
-`AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` grant procedure.
+`AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN CAP_FOWNER` grant procedure.
 
 ## Error Handling
 

@@ -2487,6 +2487,7 @@ func TestRestore_HonorsNewSKU_Promote(t *testing.T) {
 		InspectImageFn: func(_ context.Context, _ string) (*ImageInfo, error) {
 			return &ImageInfo{ID: fixtureImageID("img-1"), Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
+		DetectVolumeOwnerFn: ownedByTestProcess,
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
@@ -3879,6 +3880,7 @@ func TestRestore_MultiVolumePromoteThatFits_Admitted(t *testing.T) {
 		InspectImageFn: func(_ context.Context, _ string) (*ImageInfo, error) {
 			return &ImageInfo{ID: fixtureImageID("img-1"), Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
+		DetectVolumeOwnerFn: ownedByTestProcess,
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
