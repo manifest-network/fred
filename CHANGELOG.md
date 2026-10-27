@@ -16,6 +16,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+### Security
+
+## [0.13.2] - 2026-10-27
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
 - docker-backend: a container that runs as root can now write its stateful
   `VOLUME`. Such a container is an image with `USER root`, or with no `USER`
   and a root-owned `VOLUME` directory. The backend chowned each volume
