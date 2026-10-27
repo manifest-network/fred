@@ -3,11 +3,13 @@ package docker
 import (
 	"context"
 	"hash/crc32"
+	"io/fs"
 	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -77,14 +79,14 @@ func TestSanitizeVolumePath(t *testing.T) {
 func TestBuildStatefulVolumeBinds(t *testing.T) {
 	t.Run("empty volumes returns empty map", func(t *testing.T) {
 		dir := t.TempDir()
-		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, nil, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, nil, os.Getuid(), os.Getgid())
 		require.NoError(t, err)
 		assert.Empty(t, binds)
 	})
 
 	t.Run("single volume path", func(t *testing.T) {
 		dir := t.TempDir()
-		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, os.Getuid(), os.Getgid())
 		require.NoError(t, err)
 		require.Len(t, binds, 1)
 		expected := filepath.Join(dir, "data")
@@ -95,7 +97,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 
 	t.Run("multiple volume paths", func(t *testing.T) {
 		dir := t.TempDir()
-		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data", "/var/lib/postgresql/data"}, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data", "/var/lib/postgresql/data"}, os.Getuid(), os.Getgid())
 		require.NoError(t, err)
 		assert.Len(t, binds, 2)
 		assert.Equal(t, "/data", binds[filepath.Join(dir, "data")])
@@ -107,7 +109,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 
 	t.Run("unsupported volume path returns error", func(t *testing.T) {
 		dir := t.TempDir()
-		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{".."}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{".."}, os.Getuid(), os.Getgid())
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported VOLUME path")
 		assert.Contains(t, err.Error(), "..")
@@ -116,18 +118,34 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 	t.Run("unsupported path among valid paths returns error and stops", func(t *testing.T) {
 		dir := t.TempDir()
 		// "/" sanitizes to "" which is unsupported
-		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data", "/"}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data", "/"}, os.Getuid(), os.Getgid())
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported VOLUME path")
 	})
 
-	t.Run("uid gid zero skips chown", func(t *testing.T) {
+	t.Run("bind source is owned by the requested identity", func(t *testing.T) {
+		dir := t.TempDir()
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, os.Getuid(), os.Getgid())
+		require.NoError(t, err)
+		require.Len(t, binds, 1)
+		assertBindSourcesOwnedBy(t, binds, os.Getuid(), os.Getgid())
+	})
+
+	// ENG-2091: a root container is chowned to like any other. Production runs
+	// the backend as a non-root service account, so a leaf left as MkdirAll
+	// created it belongs to the backend, and a root container with every
+	// capability dropped cannot write its own 0700 VOLUME. A process that
+	// cannot chown to root must fail instead of handing out that bind.
+	t.Run("root target is chowned, never left owned by the backend", func(t *testing.T) {
 		dir := t.TempDir()
 		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, 0, 0)
+		if os.Geteuid() != 0 {
+			require.ErrorIs(t, err, fs.ErrPermission, "an unprivileged backend cannot hand a root container a bind it owns itself")
+			assert.Empty(t, binds)
+			return
+		}
 		require.NoError(t, err)
-		assert.Len(t, binds, 1)
-		// Just verify it succeeds without chown — no permission error
-		assertNoSymlinkBindSources(t, binds)
+		assertBindSourcesOwnedBy(t, binds, 0, 0)
 	})
 
 	t.Run("mkdir on read-only parent fails", func(t *testing.T) {
@@ -137,14 +155,14 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.NoError(t, os.Chmod(roDir, 0o500))
 		t.Cleanup(func() { os.Chmod(roDir, 0o700) })
 
-		_, err := buildStatefulVolumeBindsContext(context.Background(), roDir, []string{"/data"}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), roDir, []string{"/data"}, os.Getuid(), os.Getgid())
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "volume subdir")
 	})
 
 	t.Run("subdirectory permissions are 0700", func(t *testing.T) {
 		dir := t.TempDir()
-		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, os.Getuid(), os.Getgid())
 		require.NoError(t, err)
 
 		info, err := os.Stat(filepath.Join(dir, "data"))
@@ -169,7 +187,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.NoError(t, os.Symlink(outside, filepath.Join(dir, "data")))
 
 		// Deploy 2 declares VOLUME /data.
-		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, os.Getuid(), os.Getgid())
 		require.Error(t, err, "must refuse to resolve a VOLUME path through a symlink that escapes the volume root")
 	})
 
@@ -180,7 +198,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.NoError(t, os.Symlink(outside, filepath.Join(dir, "esc")))
 
 		// Deploy 2 declares VOLUME /esc/pwned, which would traverse the symlink.
-		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/esc/pwned"}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/esc/pwned"}, os.Getuid(), os.Getgid())
 		require.Error(t, err, "must refuse to create a VOLUME subdir through an escaping symlink")
 		// The escape target must not be written to.
 		assert.NoDirExists(t, filepath.Join(outside, "pwned"), "MkdirAll must not have followed the symlink out of the volume root")
@@ -211,7 +229,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		// Deploy 2 declares VOLUME /data/x. Nothing upstream stops it: sanitizeVolumePath
 		// sees no ".." in the *string*, and update preflight never inspects the image's
 		// VOLUME set or on-disk state.
-		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data/x"}, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data/x"}, os.Getuid(), os.Getgid())
 		require.Error(t, err, "a leaf symlink that stays INSIDE the volume root must be rejected")
 		assert.Empty(t, binds, "no bind may be emitted once the leaf is refused")
 	})
@@ -221,7 +239,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.NoError(t, os.MkdirAll(filepath.Join(dir, "data", "y"), 0o700))
 		require.NoError(t, os.Symlink("y", filepath.Join(dir, "data", "x")))
 
-		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data/x"}, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data/x"}, os.Getuid(), os.Getgid())
 		require.Error(t, err, "a leaf symlink is unsafe as a bind Source wherever it points")
 		assert.Empty(t, binds, "no bind may be emitted once the leaf is refused")
 	})
@@ -240,13 +258,13 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.NoError(t, os.Symlink("..", filepath.Join(dir, "data", "x")))
 
 		// The image that declares the poisoned leaf is refused...
-		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data/x"}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data/x"}, os.Getuid(), os.Getgid())
 		require.Error(t, err)
 
 		// ...but the same volume still serves an image declaring only /data. That is the
 		// tenant's own way out: /data comes back mounted read-write, so its container can
 		// delete the link without an operator.
-		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, os.Getuid(), os.Getgid())
 		require.NoError(t, err, "a planted leaf must not wedge the rest of the volume")
 		assert.Equal(t, "/data", binds[filepath.Join(dir, "data")])
 		assertNoSymlinkBindSources(t, binds)
@@ -269,6 +287,21 @@ func assertNoSymlinkBindSources(t *testing.T, binds map[string]string) {
 		info, err := os.Lstat(source)
 		require.NoError(t, err, "emitted bind source %q must exist on disk", source)
 		assert.Zero(t, info.Mode()&os.ModeSymlink, "emitted bind source %q must not be a symlink", source)
+	}
+}
+
+// assertBindSourcesOwnedBy checks that every emitted bind Source belongs to the
+// identity the container runs as, the only owner it can write through without
+// capabilities.
+func assertBindSourcesOwnedBy(t *testing.T, binds map[string]string, uid, gid int) {
+	t.Helper()
+	for source := range binds {
+		info, err := os.Lstat(source)
+		require.NoError(t, err, "emitted bind source %q must exist on disk", source)
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		require.True(t, ok, "emitted bind source %q has no Unix ownership", source)
+		assert.Equal(t, uint32(uid), stat.Uid, "emitted bind source %q uid", source)
+		assert.Equal(t, uint32(gid), stat.Gid, "emitted bind source %q gid", source)
 	}
 }
 

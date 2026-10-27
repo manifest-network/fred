@@ -374,6 +374,7 @@ func TestStackProvision_VolumeIDsAreServiceAware(t *testing.T) {
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
+		DetectVolumeOwnerFn: ownedByTestProcess,
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
 		},

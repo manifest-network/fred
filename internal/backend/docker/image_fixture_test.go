@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/docker/docker/api/types"
@@ -24,6 +25,14 @@ type ImageInfo struct {
 	ID      string
 	User    string
 	Volumes map[string]struct{}
+}
+
+// ownedByTestProcess is a DetectVolumeOwnerFn for an image whose VOLUME
+// directories belong to the user running the test. The backend chowns each
+// stateful bind to the container's identity, and this is the one identity an
+// unprivileged test process can chown to (ENG-2091).
+func ownedByTestProcess(context.Context, string, []string) (int, int, error) {
+	return os.Getuid(), os.Getgid(), nil
 }
 
 type mockImageSource struct{ mock *mockDockerClient }

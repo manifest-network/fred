@@ -1237,6 +1237,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- docker-backend: a container that runs as root can now write its stateful
+  `VOLUME`. Such a container is an image with `USER root`, or with no `USER`
+  and a root-owned `VOLUME` directory. The backend chowned each volume
+  subdirectory to the container's user but skipped the chown for root, so
+  the subdirectory stayed owned by the account the backend runs as, mode
+  0700. Under the documented non-root deployment, the container, which runs
+  with every capability dropped, got `permission denied` on its own volume.
+  The next deploy, restart, update or restore of an affected lease re-owns
+  the subdirectory. (ENG-2091)
 - A payload upload or restore into a billing-only lease is refused as
   billing-only in any lease state. Fred acknowledges such a lease as soon as
   it sees it, so a request that lost that race found it ACTIVE and got the
