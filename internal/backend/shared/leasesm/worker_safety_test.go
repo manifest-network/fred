@@ -90,6 +90,18 @@ func TestWorkerPendingRequiresActorIssuedObservation(t *testing.T) {
 	}
 }
 
+// A drained barrier proves the drain even once the deadline has passed. Go
+// picks uniformly among ready select cases, so an actor that was descheduled
+// past its deadline must not report a timeout for workers that already left.
+func TestWaitForWorkersDrainedBarrierWinsOverExpiredDeadline(t *testing.T) {
+	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+		ProvisionStore: newMockProvisionStore(), WorkerDrainTimeout: time.Nanosecond,
+	})
+	for range 1000 {
+		require.NoError(t, actor.waitForWorkers())
+	}
+}
+
 func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) {
 	for _, kind := range []shared.MaintenanceIntentKind{shared.MaintenanceIntentRestart, shared.MaintenanceIntentUpdate} {
 		t.Run(string(kind), func(t *testing.T) {
