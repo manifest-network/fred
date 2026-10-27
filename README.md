@@ -875,14 +875,15 @@ Upload deployment configuration for a lease that was created with a `meta_hash`.
 
 **Response Codes:**
 - `202 Accepted` - Payload received, provisioning started
-- `400 Bad Request` - Invalid lease UUID, the lease is [billing-only](#billing-only-leases),
-  the lease has no `meta_hash`, the body could not be read (including a body
-  over `max_request_body_size`), the body is empty, or its SHA-256 does not
-  match `meta_hash`
+- `400 Bad Request` - Invalid lease UUID, the lease is [billing-only](#billing-only-leases)
+  (with `reason: billing_only`, whatever its state), the lease has no
+  `meta_hash`, the body could not be read (including a body over
+  `max_request_body_size`), the body is empty, or its SHA-256 does not match
+  `meta_hash`
 - `401 Unauthorized` - Invalid signature or token, or the token's lease UUID or
   `meta_hash` does not match the lease
 - `403 Forbidden` - Lease does not belong to this tenant or provider
-- `404 Not Found` - Lease not found or not PENDING
+- `404 Not Found` - Lease not found, or not PENDING and not billing-only
 - `409 Conflict` - The payload was not stored: a payload is already stored for
   this lease, or the payload store is not configured, is closed, or failed the
   write. A store failure is therefore also reported as `409`
@@ -1167,11 +1168,11 @@ off to a complete durable close intent before teardown.
 
 **Response Codes:**
 - `202 Accepted` - Restore initiated (the lease then transitions through `restarting` to `ready`/`failed`)
-- `400 Bad Request` - Missing/invalid `from_lease_uuid`, source and target UUIDs are equal, items don't match the retained set, or the target lease is [billing-only](#billing-only-leases)
+- `400 Bad Request` - Missing/invalid `from_lease_uuid`, source and target UUIDs are equal, items don't match the retained set, or the target lease is [billing-only](#billing-only-leases) (with `reason: billing_only`, whatever its state)
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - The source has no placement record, is not `CLOSED` or `EXPIRED`, belongs to another tenant/provider, or its configured backend reports no retained data (including retention that has expired)
-- `409 Conflict` - Source or target lifecycle work is already in progress, or the target is not `PENDING`, has an unresolved durable provision/restore attempt, or is not in a restorable state
+- `409 Conflict` - Source or target lifecycle work is already in progress, or the target is not `PENDING` (a billing-only target gets `400` instead), has an unresolved durable provision/restore attempt, or is not in a restorable state
 - `410 Gone` with `reason: backend_storage_lost` - The source's backend was retired because its storage was lost; its data cannot be restored
 - `422 Unprocessable Entity` - The retained data exceeds a requested smaller tier's `disk_mb` cap; the response relays the backend's bounded, recognized refusal detail
 - `500 Internal Server Error` - The restore returned an unexpected or ambiguous backend result, such as a transport error, timeout, generic 5xx, coded already-provisioned response, or unknown refusal code; the durable target attempt is retained until positive evidence confirms it or an operator safely repairs it
@@ -2165,7 +2166,9 @@ all use them is billing-only:
 - Fred never provisions it, never rejects it, and never closes it for a
   provisioning reason, including as lost after a backend retirement.
   `POST /v1/leases/{lease_uuid}/data` refuses its payload with `400`, and
-  `POST /v1/leases/{lease_uuid}/restore` refuses to restore into it with `400`.
+  `POST /v1/leases/{lease_uuid}/restore` refuses to restore into it with `400`;
+  both carry `reason: billing_only`, in any lease state, because the request
+  races the acknowledgment.
 - A SKU can be made billing-only while leases already use it. Fred never
   retries a deployment still in flight for such a lease, and no failure
   callback, timeout or lost backend ends the lease. Whatever the earlier
@@ -2333,7 +2336,7 @@ See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks, stress test result
 
 ## Dependencies
 
-- Go 1.26.9+ (per the `go 1.26.9` directive in `go.mod`; also uses `sync.WaitGroup.Go()`, `testing.B.Loop()`, `range` over integers)
+- Go 1.26.10+ (per the `go 1.26.10` directive in `go.mod`; also uses `sync.WaitGroup.Go()`, `testing.B.Loop()`, `range` over integers)
 - Watermill (event routing)
 - Cosmos SDK v0.50.14
 - CometBFT v0.38.x

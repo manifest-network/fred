@@ -19,7 +19,7 @@ func TestLaunchVolumeRejectsZeroAndReleasedCopies(t *testing.T) {
 		require.Error(t, volume.removeWritablePaths(t.Context()))
 		_, err = volume.extractImageContent(t.Context(), imageexec.Image{}, []string{"/cache"}, 1024, 16)
 		require.Error(t, err)
-		_, err = volume.prepareStatefulVolumeBinds(t.Context(), []string{"/data"}, 0, 0)
+		_, err = volume.prepareStatefulVolumeBinds(t.Context(), []string{"/data"}, os.Getuid(), os.Getgid())
 		require.Error(t, err)
 	}
 	assertUnavailable(launchVolume{})
@@ -86,7 +86,7 @@ func TestLaunchVolumeCanPrepareOnlyItsReservedDirectory(t *testing.T) {
 		require.NoError(t, volume.removeWritablePaths(t.Context()))
 		_, err = volume.extractImageContent(t.Context(), admittedFixtureImage(t, "nginx"), []string{"/cache"}, 1024, 16)
 		require.NoError(t, err)
-		binds, err := volume.prepareStatefulVolumeBinds(t.Context(), []string{"/data"}, 0, 0)
+		binds, err := volume.prepareStatefulVolumeBinds(t.Context(), []string{"/data"}, os.Getuid(), os.Getgid())
 		require.NoError(t, err)
 		require.Equal(t, map[string]string{filepath.Join(pathA, "data"): "/data"}, binds)
 		return true

@@ -1177,6 +1177,13 @@ func (a *LeaseActor) waitForWorkers() error {
 	case <-a.workers.Zero():
 		return nil
 	case <-timer.C:
+		// select picks at random when both cases are ready, so re-check the
+		// barrier: workers that drained by the deadline are not a timeout.
+		select {
+		case <-a.workers.Zero():
+			return nil
+		default:
+		}
 		a.cfg.Logger.Warn("actor waitForWorkers: worker did not exit within timeout",
 			"lease_uuid", a.leaseUUID,
 			"timeout", timeout,

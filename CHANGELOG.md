@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
-## [0.14.0] - 2026-10-19
+## [0.14.0] - 2026-10-27
 
 **Upgrading from v0.13.0.** This release cannot be installed in place. Follow
 [Upgrading from v0.13.0](DEPLOYMENT.md#upgrading-from-v0130) before replacing
@@ -44,6 +44,9 @@ any binary:
 
 ### Added
 
+- The two refusals to deploy into a billing-only lease, a payload upload and a
+  restore, now carry `reason: billing_only`, so clients can branch on a code
+  instead of the message, which is unchanged. (ENG-1825)
 - Metric `fred_docker_backend_operation_recovery_deferred_total`: a provision
   or restore whose recovery evidence could not be classified, so the lease
   stays fenced and the next pass retries it. Before, a warning log was the
@@ -1268,6 +1271,22 @@ any binary:
 
 ### Fixed
 
+- docker-backend: a container that runs as root can now write its stateful
+  `VOLUME`. Such a container is an image with `USER root`, or with no `USER`
+  and a root-owned `VOLUME` directory. The backend chowned each volume
+  subdirectory to the container's user but skipped the chown for root, so
+  the subdirectory stayed owned by the account the backend runs as, mode
+  0700. Under the documented non-root deployment, the container, which runs
+  with every capability dropped, got `permission denied` on its own volume.
+  The next deploy, restart, update or restore of an affected lease re-owns
+  the subdirectory. Ownership is assigned in host IDs, so a rootless or
+  `userns-remap` Docker daemon cannot serve stateful volumes; this already
+  held for every non-root image and now holds for root ones too. (ENG-2091)
+- A payload upload or restore into a billing-only lease is refused as
+  billing-only in any lease state. Fred acknowledges such a lease as soon as
+  it sees it, so a request that lost that race found it ACTIVE and got the
+  generic `404 lease not pending` or `409 target_not_pending` instead.
+  (ENG-1825)
 - A lease created by `POST /v1/leases/{uuid}/restore` now recovers on its own
   after losing its container (host reboot, crash, kill). providerd held no
   payload for it, because the backend re-deployed the retained manifest, so it
@@ -2308,6 +2327,11 @@ any binary:
 
 ### Security
 
+- deps: build with Go 1.26.10 (from 1.26.9). `crypto/x509` now refuses to
+  verify a chain through the intermediate certificates that are no longer
+  trusted (GO-2026-6809), a check Fred's TLS connections reach through
+  `Certificate.Verify`. The `go` directive and the Dockerfile builder image
+  move to 1.26.10, so building Fred from source now needs Go 1.26.10 or later.
 - deps: build with Go 1.26.9 (from 1.26.8) and bump `golang.org/x/net` to
   v0.60.0 (from v0.58.0). This resolves twelve advisories that Fred's code
   reaches:
@@ -2533,6 +2557,38 @@ any binary:
   stays on its tenant network until its containers are next recreated
   (restart, update, custom-domain change, restore or re-provision); that
   recreate moves every service of the lease, including stopped ones.
+
+## [0.13.2] - 2026-10-27
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- docker-backend: a container that runs as root can now write its stateful
+  `VOLUME`. Such a container is an image with `USER root`, or with no `USER`
+  and a root-owned `VOLUME` directory. The backend chowned each volume
+  subdirectory to the container's user but skipped the chown for root, so
+  the subdirectory stayed owned by the account the backend runs as, mode
+  0700. Under the documented non-root deployment, the container, which runs
+  with every capability dropped, got `permission denied` on its own volume.
+  The next deploy, restart, update or restore of an affected lease re-owns
+  the subdirectory. Ownership is assigned in host IDs, so a rootless or
+  `userns-remap` Docker daemon cannot serve stateful volumes; this already
+  held for every non-root image and now holds for root ones too. (ENG-2091)
+
+### Security
+
+- deps: build with Go 1.26.10 (from 1.26.9). `crypto/x509` now refuses to
+  verify a chain through the intermediate certificates that are no longer
+  trusted (GO-2026-6809), a check Fred's TLS connections reach through
+  `Certificate.Verify`. The `go` directive and the Dockerfile builder image
+  move to 1.26.10, so building Fred from source now needs Go 1.26.10 or later.
 
 ## [0.13.1] - 2026-10-15
 

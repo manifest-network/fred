@@ -607,8 +607,9 @@ func filterSubpaths(candidates, parents []string) []string {
 }
 
 // buildStatefulVolumeBinds creates subdirectories for each image VOLUME path
-// under hostPath and returns bind mount mappings. Returns an error if any
-// VOLUME path cannot be sanitized (unsupported path format).
+// under hostPath, owned by uid:gid (the identity the container runs as), and
+// returns bind mount mappings. Returns an error if any VOLUME path cannot be
+// sanitized (unsupported path format) or chowned.
 func buildStatefulVolumeBindsContext(ctx context.Context, hostPath string, imageVolumes []string, uid, gid int) (map[string]string, error) {
 	binds := make(map[string]string, len(imageVolumes))
 	if len(imageVolumes) == 0 {
@@ -684,13 +685,16 @@ func buildStatefulVolumeBindsContext(ctx context.Context, hostPath string, image
 			volumeBindSymlinkRejectedTotal.Inc()
 			return nil, fmt.Errorf("volume subdir %q resolves through a symlink", filepath.Join(hostPath, sanitized))
 		}
-		if uid != 0 || gid != 0 {
-			// Lchown, never Chown: the guard above has established the leaf is a real
-			// directory, and Lchown never follows a symlink even if one were raced in
-			// (CVE-2026-32282).
-			if err := root.Lchown(sanitized, uid, gid); err != nil {
-				return nil, fmt.Errorf("chown volume subdir %q: %w", filepath.Join(hostPath, sanitized), err)
-			}
+		// Always chown, root included. MkdirAll created the leaf as this process,
+		// and production runs the backend as a non-root service account, so
+		// skipping the chown for uid 0 left a root container (all capabilities
+		// dropped) unable to write its own 0700 VOLUME (ENG-2091).
+		//
+		// Lchown, never Chown: the guard above has established the leaf is a real
+		// directory, and Lchown never follows a symlink even if one were raced in
+		// (CVE-2026-32282).
+		if err := root.Lchown(sanitized, uid, gid); err != nil {
+			return nil, fmt.Errorf("chown volume subdir %q: %w", filepath.Join(hostPath, sanitized), err)
 		}
 		binds[filepath.Join(hostPath, sanitized)] = volPath
 	}

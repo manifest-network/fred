@@ -133,6 +133,7 @@ type Handlers struct {
 	wsUpgrader         websocket.Upgrader
 	wsMaxMessageSize   int64         // max bytes the server will read from a client message on /events
 	wsMaxConnLifetime  time.Duration // max lifetime of an /events subscription before forced reconnect
+	billingPolicy      *placement.BillingPolicy
 	providerUUID       string
 	bech32Prefix       string
 	// legacyIdempotencyTenants may omit Idempotency-Key on restart/update.
@@ -150,8 +151,12 @@ type HandlersConfig struct {
 	MaintenanceService MaintenanceService    // required by restart/update; owns durable idempotent dispatch
 	PayloadStoreHealth PayloadStoreHealth    // optional — health probe for the payload store's bbolt DB
 	EventBroker        *EventBroker          // optional — if nil, the events endpoint will return 501
-	ProviderUUID       string
-	Bech32Prefix       string
+	// BillingPolicy lets /restore refuse a billing-only target before its
+	// state check. Without one no target is billing-only here; the restore
+	// service still refuses it.
+	BillingPolicy *placement.BillingPolicy
+	ProviderUUID  string
+	Bech32Prefix  string
 	// MaintenanceLegacyIdempotencyTenants lists tenants whose restart/update
 	// requests may omit Idempotency-Key; each such request is keyed by its
 	// single-use signed token. Empty keeps the header mandatory.
@@ -192,6 +197,7 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		},
 		wsMaxMessageSize:  wsDefaultMaxMessageSize,
 		wsMaxConnLifetime: wsDefaultMaxConnLifetime,
+		billingPolicy:     cfg.BillingPolicy,
 		providerUUID:      cfg.ProviderUUID,
 		bech32Prefix:      cfg.Bech32Prefix,
 		legacyIdempotencyTenants: func() map[string]struct{} {
@@ -1177,7 +1183,13 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 
 	// Preserve the request-boundary ordering and error contract: an invalid target
 	// state is rejected before the body is considered. The service repeats this
-	// invariant so non-HTTP callers cannot bypass it.
+	// invariant so non-HTTP callers cannot bypass it. A billing-only target is
+	// refused first: Fred acknowledges it as soon as it sees it, so it can
+	// already be ACTIVE, and the client must still learn why.
+	if h.billingPolicy.Classify(auth.Lease).BillingOnly() {
+		writeBillingOnly(w, "lease is billing-only and cannot be restored into")
+		return
+	}
 	if auth.Lease.State != billingtypes.LEASE_STATE_PENDING {
 		writeRestoreConflict(w, "lease is not pending; only a fresh lease can be restored into", "target_not_pending")
 		return
@@ -1230,7 +1242,7 @@ func (h *Handlers) writeRestoreResult(
 	case restoreapp.OutcomeTargetNotPending:
 		writeRestoreConflict(w, "lease is not pending; only a fresh lease can be restored into", "target_not_pending")
 	case restoreapp.OutcomeTargetBillingOnly:
-		writeError(w, "lease is billing-only and cannot be restored into", http.StatusBadRequest)
+		writeBillingOnly(w, "lease is billing-only and cannot be restored into")
 	case restoreapp.OutcomeSourceNotFound, restoreapp.OutcomeNotRetained:
 		writeError(w, "no retained data found for that lease", http.StatusNotFound)
 	case restoreapp.OutcomeSourceUnavailable:
@@ -2452,6 +2464,21 @@ func extractBearerToken(r *http.Request) (string, error) {
 		return "", errInvalidAuthFormat
 	}
 	return parts[1], nil
+}
+
+// reasonBillingOnly marks a refusal to deploy into a billing-only lease, which
+// Fred bills but never deploys. Clients branch on it rather than on the
+// message text.
+const reasonBillingOnly = "billing_only"
+
+// writeBillingOnly refuses a request that would deploy into a billing-only
+// lease.
+func writeBillingOnly(w http.ResponseWriter, message string) {
+	writeJSON(w, ErrorResponse{
+		Error:  message,
+		Code:   http.StatusBadRequest,
+		Reason: reasonBillingOnly,
+	}, http.StatusBadRequest)
 }
 
 // writeBackendStorageLost is the one terminal answer for a lease whose

@@ -1425,6 +1425,7 @@ func TestProvision_ReProvisionKeepsVolumes(t *testing.T) {
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
+		DetectVolumeOwnerFn: ownedByTestProcess,
 		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {
 			return "new-container", nil
 		},
@@ -3561,22 +3562,37 @@ func TestIntegration_DoProvision_StatefulSKUChownsVolumeSubdirs(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
 }
 
-func TestDoProvision_StatefulSKURootUserNoChown(t *testing.T) {
+func TestIntegration_DoProvision_StatefulSKURootUserChownsVolumeSubdirs(t *testing.T) {
 	const leaseUUID = durableCallbackTestLeaseUUID3
-	// Verify that doProvision does NOT chown when ResolveImageUser returns root (0, 0).
+	// ENG-2091: doProvision chowns volume subdirectories to root when
+	// ResolveImageUser returns root (0, 0). Production runs the backend as a
+	// non-root service account, so its MkdirAll leaves the subdir owned by that
+	// account; pre-creating it as nobody reproduces that here, where the test
+	// itself runs as root.
+	if os.Getuid() != 0 {
+		t.Skip("chown requires root")
+	}
+	const backendUID, backendGID = 65534, 65534
+
 	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer callbackServer.Close()
 
 	volDir := t.TempDir()
+	var createdVolumePath string
 	vm := &mockVolumeManager{
 		defaultDir: volDir,
 		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
 			path := filepath.Join(volDir, id)
-			if err := os.MkdirAll(path, 0o755); err != nil {
+			subdir := filepath.Join(path, "data")
+			if err := os.MkdirAll(subdir, 0o700); err != nil {
 				return "", false, err
 			}
+			if err := os.Chown(subdir, backendUID, backendGID); err != nil {
+				return "", false, err
+			}
+			createdVolumePath = path
 			return path, true, nil
 		},
 	}
@@ -3621,8 +3637,14 @@ func TestDoProvision_StatefulSKURootUserNoChown(t *testing.T) {
 	req.CallbackURL = testOperationCallbackURL(callbackServer.URL)
 	b.doProvisionAndFire(t, context.Background(), req, manifest, profiles, b.logger)
 
-	// Verify provision succeeded — ownership stays as created by MkdirAll
-	// (no chown call since UID/GID are 0).
+	// The root container (all capabilities dropped) can write only a subdir
+	// root owns.
+	info, err := os.Stat(filepath.Join(createdVolumePath, "data"))
+	require.NoError(t, err)
+	stat := info.Sys().(*syscall.Stat_t)
+	assert.Equal(t, uint32(0), stat.Uid, "volume subdir must be re-owned from the backend's account to root")
+	assert.Equal(t, uint32(0), stat.Gid, "volume subdir must be re-owned from the backend's account to root")
+
 	b.provisionsMu.RLock()
 	prov := b.provisions[leaseUUID]
 	b.provisionsMu.RUnlock()

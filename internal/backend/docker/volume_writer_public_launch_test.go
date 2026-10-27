@@ -181,6 +181,7 @@ func newVolumeWriterLaunchFixture(t *testing.T, inventory func(context.Context) 
 		InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
 			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
+		DetectVolumeOwnerFn: ownedByTestProcess,
 		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
 		},
