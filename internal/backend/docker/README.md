@@ -70,6 +70,9 @@ With `production_mode: true`, `docker_host` must be a canonical absolute local
 Unix socket URL, such as `unix:///var/run/docker.sock` or a rootless daemon's
 `unix:///run/user/1000/docker.sock`. Remote TCP/HTTP Docker endpoints are limited
 to development mode; the backend does not supply a remote Docker TLS policy.
+A rootless or `userns-remap` daemon cannot serve stateful volumes yet: the
+backend chowns each volume subdirectory in host IDs, without the daemon's ID
+mapping (see [DEPLOYMENT.md](../../../DEPLOYMENT.md)).
 
 ## Configuration Reference
 
