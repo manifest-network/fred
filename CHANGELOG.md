@@ -24,7 +24,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   0700. Under the documented non-root deployment, the container, which runs
   with every capability dropped, got `permission denied` on its own volume.
   The next deploy, restart, update or restore of an affected lease re-owns
-  the subdirectory. (ENG-2091)
+  the subdirectory. Ownership is assigned in host IDs, so a rootless or
+  `userns-remap` Docker daemon cannot serve stateful volumes; this already
+  held for every non-root image and now holds for root ones too. (ENG-2091)
 
 ### Security
 
