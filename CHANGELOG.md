@@ -16,6 +16,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- docker-backend: a container that runs as root can now write its stateful
+  `VOLUME`. Such a container is an image with `USER root`, or with no `USER`
+  and a root-owned `VOLUME` directory. The backend chowned each volume
+  subdirectory to the container's user but skipped the chown for root, so
+  the subdirectory stayed owned by the account the backend runs as, mode
+  0700. Under the documented non-root deployment, the container, which runs
+  with every capability dropped, got `permission denied` on its own volume.
+  The next deploy, restart, update or restore of an affected lease re-owns
+  the subdirectory. Ownership is assigned in host IDs, so a rootless or
+  `userns-remap` Docker daemon cannot serve stateful volumes; this already
+  held for every non-root image and now holds for root ones too. (ENG-2091)
+
 ### Security
 
 - deps: build with Go 1.26.10 (from 1.26.9). `crypto/x509` now refuses to

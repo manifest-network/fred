@@ -180,9 +180,12 @@ to start so per-volume disk_mb limits are enforced, not silently skipped
 ```
 
 This is deliberate: a missing capability would otherwise silently drop every
-`disk_mb` cap. Grant `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` on the
-docker-backend systemd unit — `CAP_SYS_ADMIN` to set the block limit, and
-`CAP_FOWNER` so the startup backfill can re-tag pre-existing tenant-owned volumes.
+`disk_mb` cap. Set both `AmbientCapabilities=` and `CapabilityBoundingSet=` to
+`CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN CAP_FOWNER` on the docker-backend
+systemd unit, as the manifest-deploy unit does: `CAP_CHOWN` to set volume
+ownership for launches, `CAP_DAC_OVERRIDE` to manage restrictive tenant-owned
+trees, `CAP_SYS_ADMIN` to set the block limit, and `CAP_FOWNER` so the startup
+backfill can re-tag pre-existing tenant-owned volumes.
 A plain `setcap …+ep` on the binary does **not** work — the grant must reach the
 exec'd `xfs_quota`/`btrfs` children. Full setup is in the xfs section and the
 systemd note of [DEPLOYMENT.md](DEPLOYMENT.md#xfs-good-for-large-fleets). The `zfs`
