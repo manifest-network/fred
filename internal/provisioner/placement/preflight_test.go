@@ -613,6 +613,59 @@ func TestLegacyUpgradePreparer_PublishesExactBackupAndSealsIdentityBoundSchema(
 		"opening the prepared provider-bound authority on restart must not rewrite bytes")
 }
 
+// v0.13.1 acknowledges a billing-only lease without deploying it, so the lease
+// is ACTIVE on chain but has no placement row and no backend owner. The stopped
+// cutover must carry it across as chain membership only: preparation neither
+// refuses it nor manufactures a placement row the typed reconciler would act on.
+func TestLegacyUpgradePreparer_CarriesUndeployedBillingOnlyLeaseAsMembershipOnly(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "placements.db")
+	backupPath := filepath.Join(tempDir, "placements.v013.bak")
+	writeRawRecords(t, dbPath, map[string][]byte{
+		preflightLeaseA: []byte(`{"backend":"backend-a","set_at":"2026-08-25T15:00:00Z"}`),
+	})
+	inventories := withPreflightTestStorageIDs(map[string]BackendInventory{
+		"backend-a": {Provisions: []string{preflightLeaseA}},
+	})
+	chainProof, err := NewLegacyUpgradeChainProof(preflightChainSnapshot{
+		providerUUID: preflightProviderUUID,
+		leaseUUIDs:   []string{preflightLeaseA, preflightLeaseB},
+		leaseItems: map[string][]backend.LeaseItem{
+			preflightLeaseA: {{SKU: "sku-test", Quantity: 1, ServiceName: legacyDefaultServiceName}},
+			preflightLeaseB: {{SKU: "sku-billing-only", Quantity: 1}},
+		},
+	})
+	require.NoError(t, err)
+
+	preparer, err := OpenLegacyUpgradePreparer(dbPath)
+	require.NoError(t, err)
+	ctx := legacyPreparationTestContext(t)
+	capability, err := preparer.AuthorizePreparation(
+		ctx, preflightProviderUUID, []string{"backend-a"}, inventories,
+		chainProof, boundExactBackupTarget(t, backupPath), LegacyPreparationDrainAttestation,
+	)
+	require.NoError(t, err, "an undeployed chain lease must not block the cutover")
+	summary, err := preparer.PrepareContext(
+		ctx, preflightProviderUUID, []string{"backend-a"}, inventories,
+		chainProof, capability,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, LegacyUpgradePreflightSummary{
+		ConfiguredBackends: 1,
+		PlacementRows:      1,
+		InventoryLeases:    1,
+	}, summary)
+	require.NoError(t, preparer.Close())
+
+	store, err := OpenStore(dbPath, preflightProviderUUID)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, store.Close()) }()
+	assert.Equal(t, StateConfirmed, store.Lookup(preflightLeaseA).State())
+	assert.Equal(t, StateAbsent, store.Lookup(preflightLeaseB).State(),
+		"preparation must not manufacture a placement for a lease no backend deployed")
+	assert.Equal(t, []string{preflightLeaseA}, slices.Sorted(maps.Keys(store.List())))
+}
+
 func TestLegacyUpgradePreparer_RejectsInPlaceBackupMutationBeforeCommit(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "placements.db")
