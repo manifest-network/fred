@@ -18,18 +18,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
-## [0.14.0] - 2026-10-27
+## [0.14.0] - 2026-10-28
 
-**Upgrading from v0.13.0.** This release cannot be installed in place. Follow
-[Upgrading from v0.13.0](DEPLOYMENT.md#upgrading-from-v0130) before replacing
-any binary:
+**Upgrading from v0.13.x.** This release cannot be installed in place. Follow
+[Upgrading from v0.13.x](DEPLOYMENT.md#upgrading-from-v013x) before replacing
+any binary. The procedure is the same from v0.13.0, v0.13.1 and v0.13.2:
 
 - **Stopped cutover.** Quiesce the fleet, drain every v0.13 callback outbox,
-  and stop providerd and every backend. providerd starts again only after the
-  offline `placement-preflight -prepare` step reports `PREPARED_FOR_CUTOVER:`.
-  Upgraded startup refuses an unprepared placement database instead of
-  migrating it, and the online migration path and its `migration_grace_period`
-  and `migration_ready_timeout` keys are removed.
+  and stop providerd and every backend. Each Docker backend is sealed once,
+  one-way, with `-initialize-storage-identity adopt` after its read-only
+  `-preflight-storage-identity-adoption` proof passes. providerd starts again
+  only after the offline `placement-preflight -prepare` step reports
+  `PREPARED_FOR_CUTOVER:`. Upgraded startup refuses an unprepared placement
+  database instead of migrating it, and the online migration path and its
+  `migration_grace_period` and `migration_ready_timeout` keys are removed.
+- **Runtime refresh before reopening.** Carried-over leases keep their shared
+  tenant network and the earlier seccomp profile until their containers are
+  recreated. Once providerd is up, run a runtime refresh on every backend
+  (OPERATIONS.md, Runtime refresh) before tenant ingress reopens.
 - **One key per backend in production.** Each `backends[]` entry needs its own
   `hmac_secret` of at least 32 bytes, matching only that backend's
   `callback_secret`. The provider's top-level `callback_secret` is accepted
@@ -539,6 +545,32 @@ any binary:
   close the placement layer issues needs the policy's consent. Whatever the
   earlier deployment left on a backend is torn down when the lease ends.
   (ENG-1453)
+- docker-backend config keys `image_gc_high_percent` and
+  `image_gc_low_percent` (default 85/75: collect unused, unpinned images above
+  the high disk watermark down to the low one), `image_disk_min_free_mb`
+  (default 2048: the sampled free-space floor that image staging and launches
+  require) and `volume_mount_path`, which is **required** whenever
+  `volume_data_path` is set and must name the active mount that contains it.
+- Metrics, described in ARCHITECTURE.md and OPERATIONS.md:
+  - providerd maintenance budget: `fred_maintenance_pending`,
+    `fred_maintenance_pending_bytes`,
+    `fred_maintenance_pending_oldest_age_seconds` and
+    `fred_maintenance_admission_refusals_total`;
+  - docker-backend images: `fred_docker_backend_image_gc_total`,
+    `fred_docker_backend_image_import_pending_bytes`,
+    `fred_docker_backend_image_allocation_pressure_total` and
+    `fred_docker_backend_image_preparation_refusals_total`;
+  - docker-backend recovery and cleanup:
+    `fred_docker_backend_maintenance_readiness_pending_total`,
+    `fred_docker_backend_maintenance_recovery_deferred_total`,
+    `fred_docker_backend_operation_intent_recovery_cleanup_retries_total`,
+    `fred_docker_backend_terminal_substrate_cleanup_retries_total`,
+    `fred_docker_backend_terminal_substrate_pending_containers`,
+    `fred_docker_backend_unaccounted_managed_volumes` and
+    `fred_docker_backend_unaccounted_managed_volume_observation_failures_total`;
+  - docker-backend callback receipts:
+    `fred_docker_backend_callback_receipt_reservations` and
+    `fred_docker_backend_callback_receipt_reservation_limit`.
 
 ### Changed
 
@@ -2555,8 +2587,9 @@ any binary:
   when it carries that tenant's and this backend's labels, by its verified
   ID. Fred no longer creates per-tenant networks. A running lease
   stays on its tenant network until its containers are next recreated
-  (restart, update, custom-domain change, restore or re-provision); that
-  recreate moves every service of the lease, including stopped ones.
+  (restart, update, custom-domain change, restore, re-provision or an
+  operator's runtime refresh); that recreate moves every service of the lease,
+  including stopped ones.
 
 ## [0.13.2] - 2026-10-27
 

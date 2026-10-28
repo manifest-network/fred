@@ -2052,8 +2052,9 @@ could not read), comes from the current or most recent run in this process.
 | `leases[].outcome` | `refreshed` \| `failed` \| `skipped` | `refreshed`: the receipt records that the target became the active release. `failed`: it did not. `skipped`: this run did not attempt it to completion |
 | `leases[].restored` | object, only on `failed` rows | The failed refresh settled with the lease's pre-refresh release as its running, ready cohort, proved by the settlement and recorded on the receipt: `release_version` (integer ≥ 1) and `release_digest` (64 lowercase hex). Absent when that was not proved, for example when the restore itself failed |
 
-A cutover waits until `stale == 0 && in_flight == 0 && !active` (see
-OPERATIONS.md, Runtime refresh).
+A cutover waits until `!active && in_flight == 0`, then classifies every
+`failed` row (see OPERATIONS.md, Runtime refresh). `stale == 0` is not the
+condition: a lease whose refresh failed and was restored stays listed.
 
 ### `GET /health` (unauthenticated)
 

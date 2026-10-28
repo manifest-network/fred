@@ -70,7 +70,7 @@ image.
 | Requirement | Recommendation |
 |---|---|
 | OS | Linux **5.8+**: tenant directory cleanup needs the mount IDs `statx` reports, and refuses to touch a tree without them; with a volume data path configured, docker-backend refuses to start on an older kernel and says so. cgroup v2 strongly recommended — under cgroup v2, tmpfs memory is counted against the container's memory limit; under v1 it is not, which makes the per-container memory budget less precise |
-| Docker | Engine **28.1+ (API 1.49+)** is the image-admission compatibility floor for binding inspected metadata to a single immutable platform image. Production also requires a currently security-patched Engine (see below). iptables must be enabled (the default). `--iptables=false` disables cross-tenant network isolation; the docker-backend logs a daemon-warning at startup if it detects this |
+| Docker | Engine **28.1+ (API 1.49+)** is the image-admission compatibility floor for binding inspected metadata to a single immutable platform image. Production also requires a currently security-patched Engine (see below). iptables must be enabled (the default). `--iptables=false` disables network isolation between leases; the docker-backend logs a daemon-warning at startup if it detects this. Every lease gets its own bridge network, so size the daemon's `default-address-pools` for at least as many networks as the host will run leases: Docker's built-in pools hold about 31 networks (for example, `{"base": "10.0.0.0/8", "size": 24}` gives 65,536) |
 | CPU / RAM | Sized for the SKU pool you advertise; budget 10–20% overhead for the daemon |
 | Disk | Image cache + per-tenant volumes (see [Stateful workloads](#stateful-workloads-disk_mb--0-skus)) |
 | Network | Reachable from `providerd`; HTTPS registry access from the `docker-backend` process using system CA trust and process proxy settings |
@@ -686,7 +686,7 @@ When `ingress.enabled: true` in `docker-backend.yaml`, the backend emits Traefik
 - Generates a unique subdomain per container under `wildcard_domain` (e.g. `<lease-prefix>.apps.example.com`)
 - Emits `tls=true` routers that use Traefik's default certificate or a `tls.stores` default
 - **Does not drive ACME challenges** — the wildcard cert for `wildcard_domain` must be provisioned at the Traefik level (typically via a DNS-01 ACME resolver with `domains` set in Traefik's static config)
-- Requires `network_isolation: true` (the default), since Traefik routes via the per-tenant Docker network
+- Requires `network_isolation: true` (the default), since Traefik routes via each lease's own Docker network (`traefik.docker.network`); Traefik must therefore run with host networking, or equivalent access, to reach every per-lease bridge
 
 A minimal Traefik setup is outside this doc's scope; the `manifest-deploy` repo has a working Ansible role.
 
@@ -1471,7 +1471,14 @@ startup sequence (chain reconnect, inventory projection, reconciliation) usually
 takes seconds; keep the callback path available again as soon as the new process
 starts.
 
-### Upgrading from v0.13.0
+<a id="upgrading-from-v0130"></a>
+
+### Upgrading from v0.13.x
+
+This procedure applies to every v0.13 release: v0.13.0, v0.13.1 and v0.13.2.
+The patch releases changed no placement, payload, release or callback store
+format and no providerd↔backend wire shape, so "v0.13.0" below names the state
+all three write. v0.13.1's `billing_only_skus` key is accepted unchanged.
 
 **Regenerate and validate configuration before installing the new binaries.**
 The provider and backend loaders now reject unknown keys and additional YAML
@@ -1484,7 +1491,7 @@ the removed port-range keys never constrained Docker's host-port allocation.
 Removing those keys does not complete the authentication migration. In
 `manifest-deploy`, select `fred_config_profile: typed-authority` and provision
 the complete per-backend key map as described under
-[configuration profiles](https://github.com/manifest-network/manifest-deploy/blob/b4cd4819beca094578422333ac0a59cd77c26411/docs/fred-stopped-cutover.md#configuration-profiles).
+[configuration profiles](https://github.com/manifest-network/manifest-deploy/blob/main/docs/fred-stopped-cutover.md#configuration-profiles).
 The `legacy-v0.13` profile still emits the provider's fleet-wide
 `callback_secret`, which upgraded production validation rejects. The target
 provider must instead use a unique `backends[].hmac_secret` for each backend,
@@ -1497,7 +1504,7 @@ mandatory `placement-preflight` steps below refuse plaintext or unverified
 chain gRPC. `grpc_tls_enabled` defaults to false and `production_mode: true`
 does not require it, so confirm the chain endpoint serves verifiable TLS
 before the fence.
-[The deployment compatibility gate](https://github.com/manifest-network/manifest-deploy/pull/185)
+[The deployment compatibility gate](https://github.com/manifest-network/manifest-deploy/blob/main/ci/check_fred_compatibility.py)
 provides validation of the exact rendered files without starting services.
 Complete this check while the old fleet remains available, then use the stopped
 cutover below. Do not deploy the stricter binaries with the old rendered files
@@ -2187,6 +2194,12 @@ the same new process:
 2. The response reports `checks.placement_inventory.status=healthy`, plus
    healthy chain and configured-backend checks.
 3. `fred_reconciler_sweep_complete == 1` after that health sample.
+4. Every backend has finished a runtime refresh
+   ([OPERATIONS.md, Runtime refresh](OPERATIONS.md#runtime-refresh)). Until a
+   carried-over lease's containers are recreated, it keeps its shared tenant
+   network and the earlier seccomp profile. After `POST /runtime_refresh`, poll
+   `GET /runtime_refresh` until `!active && in_flight == 0`, classify every
+   `failed` row, and confirm that `shared_network_leases` is empty.
 
 Update every tenant client/library that calls restart or update before reopening
 that ingress. Both endpoints now require exactly one canonical UUIDv4

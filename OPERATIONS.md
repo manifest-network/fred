@@ -2289,7 +2289,7 @@ Recovery procedure:
    manufacture this evidence; an empty or partial inventory is insufficient.
 3. Otherwise, restore only a verified coherent stopped snapshot containing the
    entire matching backend lineage and substrate, following the
-   [backup and rollback requirements](DEPLOYMENT.md#upgrading-from-v0130).
+   [backup and rollback requirements](DEPLOYMENT.md#upgrading-from-v013x).
    Check accepted callbacks, provider placement, and chain lifecycle changes
    since that snapshot before choosing it. In particular, restoring the
    pre-upgrade files after later accepted operations is not a safe general
