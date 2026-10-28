@@ -72,3 +72,8 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Release exactly the tag that triggered this run. Unset, GoReleaser
+          # takes the highest tag on HEAD, and an rc tagged on the same commit
+          # sorts above the final (vX.Y.Z-rc.1 > vX.Y.Z), so the final push
+          # would republish the rc.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
