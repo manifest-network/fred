@@ -81,8 +81,8 @@ Engine **29.3.1** fixes the AuthZ plugin bypass
 ([GHSA-x744-4wpc-v9h2](https://github.com/moby/moby/security/advisories/GHSA-x744-4wpc-v9h2))
 and plugin privilege-validation flaw
 ([GHSA-pxq6-2prw-chj9](https://github.com/moby/moby/security/advisories/GHSA-pxq6-2prw-chj9));
-continue applying subsequent security updates. As of 2026-09-16, the committed
-[manifest-deploy package policy](https://github.com/manifest-network/manifest-deploy/blob/eaedbf62d9e139e4d849043c34b4948c7c6f3d63/inventory/base/group_vars/all/main.yml#L240)
+continue applying subsequent security updates. As of 2026-10-28, the committed
+[manifest-deploy package policy](https://github.com/manifest-network/manifest-deploy/blob/b9978512755b77032fe040f08f040fd58ec2d9e5/inventory/base/group_vars/all/main.yml#L246)
 pins Engine **29.7.2**. Verify the running daemon's version during deployment;
 Fred's dependency vulnerability scan does not check the host installation.
 The tenant seccomp profile is derived from this Engine's default profile
@@ -1491,7 +1491,7 @@ the removed port-range keys never constrained Docker's host-port allocation.
 Removing those keys does not complete the authentication migration. In
 `manifest-deploy`, select `fred_config_profile: typed-authority` and provision
 the complete per-backend key map as described under
-[configuration profiles](https://github.com/manifest-network/manifest-deploy/blob/main/docs/fred-stopped-cutover.md#configuration-profiles).
+[configuration profiles](https://github.com/manifest-network/manifest-deploy/blob/b9978512755b77032fe040f08f040fd58ec2d9e5/docs/fred-stopped-cutover.md#configuration-profiles).
 The `legacy-v0.13` profile still emits the provider's fleet-wide
 `callback_secret`, which upgraded production validation rejects. The target
 provider must instead use a unique `backends[].hmac_secret` for each backend,
@@ -1504,7 +1504,7 @@ mandatory `placement-preflight` steps below refuse plaintext or unverified
 chain gRPC. `grpc_tls_enabled` defaults to false and `production_mode: true`
 does not require it, so confirm the chain endpoint serves verifiable TLS
 before the fence.
-[The deployment compatibility gate](https://github.com/manifest-network/manifest-deploy/blob/main/ci/check_fred_compatibility.py)
+[The deployment compatibility gate](https://github.com/manifest-network/manifest-deploy/blob/b9978512755b77032fe040f08f040fd58ec2d9e5/ci/check_fred_compatibility.py)
 provides validation of the exact rendered files without starting services.
 Complete this check while the old fleet remains available, then use the stopped
 cutover below. Do not deploy the stricter binaries with the old rendered files

@@ -19,6 +19,10 @@ jobs:
         run: |
           git fetch --no-tags origin main:refs/remotes/origin/main
           bash scripts/check-release-source.sh
+      - name: Require the tag to release the newest CHANGELOG section
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash scripts/check-release-changelog.sh "$TAG"
 
   # Reuse the complete gates on the exact tagged commit. A prior main/PR run
   # does not establish that this tag passed integration, race, vulnerability

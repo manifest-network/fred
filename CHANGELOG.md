@@ -1303,6 +1303,11 @@ any binary. The procedure is the same from v0.13.0, v0.13.1 and v0.13.2:
 
 ### Fixed
 
+- docker-backend: a lease transition no longer fails with a worker-drain
+  timeout when the lease's workers had already exited. If the 75 s drain
+  deadline expired at the moment the last worker finished, the actor could pick
+  the deadline and refuse the transition. It now re-checks its workers when the
+  deadline fires. (#282)
 - docker-backend: a container that runs as root can now write its stateful
   `VOLUME`. Such a container is an image with `USER root`, or with no `USER`
   and a root-owned `VOLUME` directory. The backend chowned each volume

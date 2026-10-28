@@ -297,7 +297,7 @@ PRs go through code review. Expect comments on test coverage, error handling, an
 
 A release is cut from `main` by a pull request that stamps `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) with the version and date and opens a fresh empty `## [Unreleased]` above it. After it merges, a maintainer tags the merge commit. The tag runs `.github/workflows/release.yml`:
 
-1. `provenance` refuses a tag whose commit is not in `main` history (`scripts/check-release-source.sh`). A branch that merely descends from `main` does not pass.
+1. `provenance` refuses a tag whose commit is not in `main` history (`scripts/check-release-source.sh`). A branch that merely descends from `main` does not pass. It also refuses a tag that does not release the newest dated CHANGELOG section (`scripts/check-release-changelog.sh`): `vX.Y.Z` and `vX.Y.Z-rc.N` both require `## [X.Y.Z] - <date>` to be the first released section.
 2. `verify`, `integration` and `secret-scan` rerun the full CI workflow (race, lint and govulncheck included), the privileged integration suites and gitleaks on the tagged commit. A green run of the same commit on `main` does not count.
 3. `release` runs only after all three pass. GoReleaser builds the archives and the `ghcr.io/manifest-network/fred` image, generates SBOMs and signs with cosign.
 
