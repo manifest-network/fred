@@ -326,7 +326,7 @@ their first normal start. For a genuinely new empty Docker backend, run
 the k3s scaffold uses the corresponding `k3s-backend` command. Normal startup is
 verification-only and will not create or repair markers or authoritative
 journals. Existing v0.13 Docker storage instead uses the stopped-and-drained
-`adopt` cutover in [Deployment](DEPLOYMENT.md#upgrading-from-v0130).
+`adopt` cutover in [Deployment](DEPLOYMENT.md#upgrading-from-v013x).
 
 Bundled Docker and k3s backends require a positive `callback_max_age` (default
 `24h`). The age applies to typed lifecycle observations;
@@ -1419,7 +1419,7 @@ Only complete stack-form v0.13 cohorts are supported. A service-name-less
 pre-stack container, `-prev` remnant, authorityless migration generation, or
 partial topology is rejected before mutation; the upgraded backend has no
 in-place converter for those shapes.
-See [Deployment](DEPLOYMENT.md#upgrading-from-v0130) for the complete cutover,
+See [Deployment](DEPLOYMENT.md#upgrading-from-v013x) for the complete cutover,
 repair, and rollback procedure.
 
 **Idempotency:**

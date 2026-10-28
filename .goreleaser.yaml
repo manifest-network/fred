@@ -1,5 +1,10 @@
 version: 2
 
+# An rc and its final share a commit (CONTRIBUTING.md#releases). Sort
+# vX.Y.Z-rc.N below vX.Y.Z wherever GoReleaser picks among tags on one commit.
+git:
+  prerelease_suffix: "-"
+
 builds:
   - id: providerd
     main: ./cmd/providerd

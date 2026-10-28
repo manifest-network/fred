@@ -2548,7 +2548,7 @@ capturing such a request.
   capabilities, sets `no-new-privileges` and runs under fred's tenant seccomp
   profile, which the Docker transport enforces by refusing any container
   create that does not request it (`refuseUnconfinedCreate`). A read-only root
-  filesystem, a PID limit of 256 and a separate bridge network per tenant
+  filesystem, a PID limit of 256 and a separate bridge network per lease
   (`network_isolation`) are the defaults
 - Generic error messages to clients
 - Security headers on every response except a CORS preflight, which rs/cors

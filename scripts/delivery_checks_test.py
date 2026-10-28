@@ -65,5 +65,27 @@ class ReleaseSourceTests(unittest.TestCase):
             self.assertTrue(allowed(), "older merged releases remain possible")
 
 
+class ReleaseChangelogTests(unittest.TestCase):
+    def test_tag_must_release_the_newest_dated_section(self):
+        with tempfile.TemporaryDirectory() as directory:
+            def allowed(tag):
+                return subprocess.run(["bash", str(SCRIPTS / "check-release-changelog.sh"), tag],
+                                      cwd=directory, capture_output=True).returncode == 0
+
+            changelog = Path(directory) / "CHANGELOG.md"
+            changelog.write_text("# Changelog\n\n## [Unreleased]\n\n### Added\n\n"
+                                 "## [0.14.0] - 2026-10-28\n\n### Fixed\n\n"
+                                 "## [0.13.2] - 2026-10-27\n")
+            self.assertTrue(allowed("v0.14.0"))
+            self.assertTrue(allowed("v0.14.0-rc.1"), "a candidate releases its final's section")
+            self.assertFalse(allowed("v0.13.2"), "an older section is not the release")
+            self.assertFalse(allowed("v0.15.0"), "the cut must stamp the section first")
+            self.assertFalse(allowed("v0.14"))
+            changelog.write_text("# Changelog\n\n## [Unreleased]\n\n## [0.14.0]\n")
+            self.assertFalse(allowed("v0.14.0"), "an undated section is not released")
+            changelog.write_text("# Changelog\n")
+            self.assertFalse(allowed("v0.14.0"))
+
+
 if __name__ == "__main__":
     unittest.main()

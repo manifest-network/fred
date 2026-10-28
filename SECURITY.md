@@ -168,7 +168,7 @@ need to correlate one operation across components.
 
 ### Backend Authentication (HMAC-SHA256)
 
-Fred authenticates requests to backends using the same HMAC-SHA256 scheme. The docker-backend verifies these signatures via auth middleware on all contract endpoints: the storage-identity-bound mutation routes `POST /_fred/storage/{storage-id}/{provision|deprovision|restart|update|restore|reconcile_custom_domain}`, which are the only mutation paths providerd calls; their unbound v0.13 compatibility forms (`POST /provision` and so on); and `GET /info/{lease_uuid}`, `GET /logs/{lease_uuid}`, `GET /provisions`, `GET /provisions/{lease_uuid}`, `GET /retentions`, `GET /releases/{lease_uuid}`. The monitoring endpoints `GET /health`, `GET /stats`, and `GET /metrics` are unauthenticated: providerd signs its `/health` and `/stats` requests, but the backend does not verify them.
+Fred authenticates requests to backends using the same HMAC-SHA256 scheme. The docker-backend verifies these signatures via auth middleware on all contract endpoints: the storage-identity-bound mutation routes `POST /_fred/storage/{storage-id}/{provision|deprovision|restart|update|restore|reconcile_custom_domain}`, which are the only mutation paths providerd calls; their unbound v0.13 compatibility forms (`POST /provision` and so on); the operator's runtime refresh, `POST /_fred/storage/{storage-id}/runtime_refresh`, `POST /runtime_refresh` and `GET /runtime_refresh`; and `GET /info/{lease_uuid}`, `GET /logs/{lease_uuid}`, `GET /provisions`, `GET /provisions/{lease_uuid}`, `GET /retentions`, `GET /releases/{lease_uuid}`. The monitoring endpoints `GET /health`, `GET /stats`, and `GET /metrics` are unauthenticated: providerd signs its `/health` and `/stats` requests, but the backend does not verify them.
 
 **Implementation:** `cmd/docker-backend/main.go` (auth middleware), `internal/hmacauth/`
 
@@ -677,7 +677,7 @@ Every container created by the Docker backend runs with these security measures:
 | Restart policy disabled | `RestartPolicyDisabled` | Failed containers stay dead for crash detection |
 | Network isolation | Per-lease bridge network; leases of the same tenant cannot reach each other | Configurable via `network_isolation` |
 
-Network isolation places each tenant's containers in a dedicated Docker bridge network. Docker's `DOCKER-ISOLATION` iptables chains drop forwarded traffic between different bridge networks, preventing cross-tenant communication.
+Network isolation places each lease's containers in a dedicated Docker bridge network. Docker's `DOCKER-ISOLATION` iptables chains drop forwarded traffic between different bridge networks, so leases cannot reach each other, even leases of the same tenant. Containers created before v0.14 stay on their tenant network until they are recreated (see OPERATIONS.md, Runtime refresh).
 
 **Daemon capabilities vs. container privileges.** Tenant containers run with
 `CapDrop: ["ALL"]`. The docker-backend daemon needs `CAP_SYS_ADMIN` for XFS/btrfs
