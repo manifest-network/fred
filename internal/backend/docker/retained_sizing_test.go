@@ -65,22 +65,30 @@ func v013RetentionEntry(sku string) shared.RetentionEntry {
 	}
 }
 
-func startableBackendWithV013Retention(t *testing.T, sku string) (*Backend, map[string]int64) {
+// startableBackendOverJournals builds a backend bound to the journals in dir,
+// with profiles as its SKU configuration and the v0.13 row's retained volume
+// on disk. seed, when set, writes the v0.13 row before the backend captures
+// its inventory. It returns the quota each Start applies, by volume name.
+func startableBackendOverJournals(
+	t *testing.T,
+	dir string,
+	profiles map[string]SKUProfile,
+	seed *shared.RetentionEntry,
+) (*Backend, map[string]int64) {
 	t.Helper()
 	b, _ := newBackendWithRetention(t)
 	mock, ok := b.docker.(*mockDockerClient)
 	require.True(t, ok)
 	mock.PingFn = func(context.Context) error { return nil }
-	bindTestStorageIdentity(t, b, mock)
+	mock.CloseFn = func() error { return nil }
+	bindTestStorageIdentityAt(t, b, mock, dir)
 	attachRetentionStore(t, b)
 	t.Cleanup(b.stopCancel)
-	reopenRetentionStoreWithV013Row(t, b, v013RetentionEntry(sku))
-
-	b.cfg.SKUProfiles = maps.Clone(b.cfg.SKUProfiles)
-	if b.cfg.SKUProfiles == nil {
-		b.cfg.SKUProfiles = map[string]SKUProfile{}
+	if seed != nil {
+		reopenRetentionStoreWithV013Row(t, b, *seed)
 	}
-	b.cfg.SKUProfiles["stateful"] = SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 100}
+
+	b.cfg.SKUProfiles = maps.Clone(profiles)
 	b.cfg.VolumeDataPath = "/data/fred/volumes"
 	volumeName := retainedName(canonicalVolumeName(v013RetainedLease, "app", 0))
 	quotas := map[string]int64{}
@@ -95,32 +103,44 @@ func startableBackendWithV013Retention(t *testing.T, sku string) (*Backend, map[
 	return b, quotas
 }
 
-// After the first start freezes a v0.13 row's sizing, removing its SKU
-// profile can no longer fail the work every later start repeats: quota
-// reconciliation and the retained-disk projection (ENG-1517 F-1).
-func TestStartFreezesV013RetentionSizingSoProfileRemovalCannotBlockRestart(t *testing.T) {
-	b, quotas := startableBackendWithV013Retention(t, "stateful")
-	volumeName := retainedName(canonicalVolumeName(v013RetainedLease, "app", 0))
-	require.NoError(t, b.Start(context.Background()))
-	assert.Equal(t, int64(100), quotas[volumeName])
+var v013RetentionProfiles = map[string]SKUProfile{
+	"stateful": {CPUCores: 1, MemoryMB: 512, DiskMB: 100},
+}
 
-	delete(b.cfg.SKUProfiles, "stateful")
-	clear(quotas)
-	require.NoError(t, b.reconcileVolumeQuotas(context.Background()),
-		"a restart after the profile is removed must still reconcile the retained quota")
-	assert.Equal(t, int64(100), quotas[volumeName], "the retained quota keeps its frozen size")
-	require.NoError(t, b.refreshRetentionAccountingChecked(),
-		"a restart after the profile is removed must still size the retained projection")
-	retainedMB, count, _, err := b.computeRetainedDiskMB()
+func startableBackendWithV013Retention(t *testing.T, sku string) (*Backend, map[string]int64) {
+	t.Helper()
+	seed := v013RetentionEntry(sku)
+	return startableBackendOverJournals(t, t.TempDir(), v013RetentionProfiles, &seed)
+}
+
+// The first start freezes a v0.13 row's sizing. A full restart over the same
+// journals, with the row's SKU profile removed, must then start and enforce
+// the frozen size (ENG-1517 F-1).
+func TestRestartAfterSKUProfileRemovalStartsOnFrozenV013RetentionSizing(t *testing.T) {
+	ctx := context.Background()
+	volumeName := retainedName(canonicalVolumeName(v013RetainedLease, "app", 0))
+	journals := t.TempDir()
+	seed := v013RetentionEntry("stateful")
+	first, firstQuotas := startableBackendOverJournals(t, journals, v013RetentionProfiles, &seed)
+	require.NoError(t, first.Start(ctx))
+	assert.Equal(t, int64(100), firstQuotas[volumeName])
+	require.NoError(t, first.Stop())
+
+	second, secondQuotas := startableBackendOverJournals(t, journals, map[string]SKUProfile{}, nil)
+	_, profileErr := second.cfg.GetSKUProfile("stateful")
+	require.Error(t, profileErr, "the restarted backend no longer configures the row's SKU")
+	require.NoError(t, second.Start(ctx), "a restart after the profile is removed must start")
+	assert.Equal(t, int64(100), secondQuotas[volumeName], "the retained quota keeps its frozen size")
+	retainedMB, count, _, err := second.computeRetainedDiskMB()
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 	assert.Equal(t, int64(100), retainedMB)
 
-	stored, err := b.retentionStore.Get(v013RetainedLease)
+	stored, err := second.retentionStore.Get(v013RetainedLease)
 	require.NoError(t, err)
 	assert.Equal(t, []shared.SKUResourceSnapshot{{SKU: "stateful", CPUCores: 1, MemoryMB: 512, DiskMB: 100}},
 		stored.ResourceProfiles, "the first start froze the row's sizing")
-	frozen, err := b.freezeRetentionSizing()
+	frozen, err := second.freezeRetentionSizing()
 	require.NoError(t, err)
 	assert.Zero(t, frozen, "a frozen row is never resolved again")
 }
