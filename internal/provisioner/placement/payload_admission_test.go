@@ -153,6 +153,34 @@ func TestPayloadAdmission_SiblingAuthoritiesShareOnePayloadStore(t *testing.T) {
 	assert.True(t, fixture.storedPayload(t))
 }
 
+// TestOperationCoordinatorCopyCannotBindASecondExecution pins the second
+// review reproduction on #285. A copy of the operation coordinator taken
+// before its runtime is bound shares the marker but has its own binding
+// state; if it stayed valid it could bind a second execution, and through it a
+// second payload store, over the same Store and Registry. The copy is built
+// field by field, the shape `*original` yields before any binding, so the
+// test itself does not copy a lock.
+func TestOperationCoordinatorCopyCannotBindASecondExecution(t *testing.T) {
+	store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
+	requireAdmissionBaseline(t, store, "backend-a")
+	original, err := store.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	copied := &OperationCoordinator{
+		store: original.store, operations: original.operations, marker: original.marker,
+	}
+
+	assert.False(t, copied.Valid(), "a copy is not the coordinator the store retained")
+	_, err = copied.BindBackendRuntime(executionRuntime("backend-a"), &testProviderControlPlane{
+		provider: store.providerUUID,
+	}, NoBillingOnlySKUs())
+	require.Error(t, err)
+
+	assert.True(t, original.Valid())
+	execution := bindExecutionForTest(t, original, executionRuntime("backend-a"))
+	_, err = execution.ProvisionCoordinatorWithPayloads(nil, nil)
+	require.NoError(t, err, "the canonical coordinator still binds its one execution")
+}
+
 // TestExecutionCoordinatorBindsNoPayloadStoreOnce pins that an execution bound
 // without a payload store never gains one: a restore minted there found no
 // store, so an admitter that stores payloads must not join it.
