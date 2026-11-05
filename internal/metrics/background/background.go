@@ -7,9 +7,10 @@
 // docker_volume_delete_hold workers, the k3s backend
 // for callback, diagnostics and releases (it has no retention store — retention
 // is docker-only, ENG-325). GoroutinePanicsTotal is written by providerd for its
-// payload-writer, ack-batcher, withdraw-scheduler and timeout-checker
-// goroutines, by both bundled backends for the shared callback-replay workers,
-// and by the docker backend for its container-death overflow reporter.
+// payload-writer, ack-batcher, withdraw-scheduler, timeout-checker and
+// maintenance-recovery goroutines, by both bundled backends for the shared
+// callback-replay workers, and by the docker backend for its container-death
+// overflow reporter.
 //
 // It exists as a package of its own because its parent, internal/metrics, is
 // providerd's. Those collectors are registered on the default registerer at
@@ -32,8 +33,8 @@
 // Being written by more than one binary is the reason to put a collector here,
 // not a requirement of membership. Both collectors now cross the process
 // boundary; their label-bearing shape still means a healthy process exports no
-// child series, except the docker_volume_delete_hold series the docker backend
-// pre-initializes at 0.
+// child series, except two pre-initialized at 0: the docker backend's
+// docker_volume_delete_hold and providerd's maintenance_recovery.
 //
 // What does NOT belong here: a providerd-only collector unrelated to this family
 // (internal/metrics), and one only a single backend writes (that backend's

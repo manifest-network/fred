@@ -327,6 +327,7 @@ func TestCounterVecLabels(t *testing.T) {
 		ReconcilerPanicsTotal.WithLabelValues("fetch_provisions")
 		ReconcilerPanicsTotal.WithLabelValues("fetch_retentions")
 		ReconcilerPanicsTotal.WithLabelValues("fetch_releases")
+		ReconcilerPanicsTotal.WithLabelValues("fetch_chain_leases")
 		ReconcilerPanicsTotal.WithLabelValues("check_placement_marker")
 	})
 	assert.NotPanics(t, func() {

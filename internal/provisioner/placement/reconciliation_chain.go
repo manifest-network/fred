@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
@@ -26,7 +25,9 @@ type ReconciliationChain interface {
 // CollectChainInventory returns one all-or-nothing PENDING/ACTIVE inventory.
 // The provider identity is derived from the Store and both list operations get
 // independent budgets, so one slow endpoint cannot consume the other's chance
-// to answer.
+// to answer. Each read runs behind a worker boundary: a panic in the chain
+// client fails this inventory like any read error, and no partial inventory
+// becomes reconciliation authority.
 func (authority *ReconciliationCoordinator) CollectChainInventory(
 	ctx context.Context,
 	budget time.Duration,
@@ -36,34 +37,29 @@ func (authority *ReconciliationCoordinator) CollectChainInventory(
 	}
 	pendingCtx, cancelPending := context.WithTimeout(ctx, budget)
 	activeCtx, cancelActive := context.WithTimeout(ctx, budget)
-	var pendingErr, activeErr error
-	var reads sync.WaitGroup
-	reads.Go(func() {
+	pendingRead := startWorker(workerChainInventory, func() ([]billingtypes.Lease, error) {
 		defer cancelPending()
-		pending, pendingErr = authority.controlPlane.inventoryLeases(
-			pendingCtx, billingtypes.LEASE_STATE_PENDING,
-		)
+		return authority.controlPlane.inventoryLeases(pendingCtx, billingtypes.LEASE_STATE_PENDING)
 	})
-	reads.Go(func() {
+	activeRead := startWorker(workerChainInventory, func() ([]billingtypes.Lease, error) {
 		defer cancelActive()
-		active, activeErr = authority.controlPlane.inventoryLeases(
-			activeCtx, billingtypes.LEASE_STATE_ACTIVE,
-		)
+		return authority.controlPlane.inventoryLeases(activeCtx, billingtypes.LEASE_STATE_ACTIVE)
 	})
-	reads.Wait()
+	pendingResult, activeResult := <-pendingRead, <-activeRead
 
 	var inventoryErrors []error
-	if pendingErr != nil {
+	if pendingResult.err != nil {
 		inventoryErrors = append(inventoryErrors,
-			fmt.Errorf("failed to get pending leases: %w", pendingErr))
+			fmt.Errorf("failed to get pending leases: %w", pendingResult.err))
 	}
-	if activeErr != nil {
+	if activeResult.err != nil {
 		inventoryErrors = append(inventoryErrors,
-			fmt.Errorf("failed to get active leases: %w", activeErr))
+			fmt.Errorf("failed to get active leases: %w", activeResult.err))
 	}
 	if len(inventoryErrors) > 0 {
 		return nil, nil, errors.Join(inventoryErrors...)
 	}
+	pending, active = pendingResult.value, activeResult.value
 	pendingIDs := make(map[string]struct{}, len(pending))
 	for _, lease := range pending {
 		pendingIDs[lease.Uuid] = struct{}{}
