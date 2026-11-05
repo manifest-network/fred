@@ -10,17 +10,22 @@ import (
 )
 
 // components supervises providerd's long-lived goroutines (ENG-1053 M1). A
-// component runs until shutdown begins, which is when its work context is
-// done. Returning before that for any reason, a nil error included, failing
-// with an error other than cancellation, or panicking is a failure. The first
-// failure cancels the work context, so it also starts shutdown. Err reports
-// every recorded failure, and run returns it: providerd cannot exit 0 after a
-// component failed, so a supervisor's Restart=on-failure restarts it.
+// component runs until shutdown begins, which is when the work context the
+// supervisor owns is done. Returning before that for any reason, a nil error
+// included, failing with an error other than cancellation, or panicking is a
+// failure. The first failure cancels the work context, so it also starts
+// shutdown. Err reports every recorded failure, and run returns it:
+// providerd cannot exit 0 after a component failed, so a supervisor's
+// Restart=on-failure restarts it.
 //
-// The supervisor owns the groups shutdown joins, so run holds no WaitGroup a
-// component could be started on unsupervised.
-// TestProviderdGoroutinesStartThroughComponents keeps every other long-lived
-// goroutine in this package out.
+// The supervisor derives the work context itself, so failure-triggered
+// shutdown cannot be wired to an unrelated context. It also owns the groups
+// shutdown joins, so run holds no WaitGroup a component could be started on
+// unsupervised. TestProviderdGoroutinesStartThroughComponents rejects every go
+// statement and every call to a method named Go in this package outside its
+// reviewed functions; the supervisor deliberately has no Go method. That test
+// reads syntax, so it cannot see a goroutine started inside a library call
+// such as context.AfterFunc or an HTTP server.
 type components struct {
 	stopping <-chan struct{}
 	stop     context.CancelFunc
@@ -34,18 +39,28 @@ type components struct {
 	failures []error
 }
 
-func newComponents(work context.Context, cancelWork context.CancelFunc) *components {
-	return &components{stopping: work.Done(), stop: cancelWork}
+// newComponents returns a supervisor and the work context it owns. The
+// context ends when parent ends, at BeginShutdown, or on the first component
+// failure.
+func newComponents(parent context.Context) (*components, context.Context) {
+	work, stop := context.WithCancel(parent)
+	return &components{stopping: work.Done(), stop: stop}, work
 }
 
-// Go starts fn as the named component.
-func (c *components) Go(name string, fn func() error) {
+// BeginShutdown ends the work context. Components stopping after it are not
+// failures.
+func (c *components) BeginShutdown() {
+	c.stop()
+}
+
+// Start starts fn as the named component.
+func (c *components) Start(name string, fn func() error) {
 	c.supervise(&c.runtime, name, fn)
 }
 
-// GoStoreReader starts fn as a named component that reads the live stores.
+// StartStoreReader starts fn as a named component that reads the live stores.
 // WaitStoreReaders joins it before they close.
-func (c *components) GoStoreReader(name string, fn func() error) {
+func (c *components) StartStoreReader(name string, fn func() error) {
 	c.supervise(&c.storeReaders, name, fn)
 }
 

@@ -552,10 +552,13 @@ A component runs until shutdown begins. Each of these is a recorded failure:
 
 The first failure cancels the work context, so it starts shutdown, and `run`
 returns every recorded failure. providerd therefore exits non-zero after a
-component failure, and `Restart=on-failure` restarts it. The supervisor owns
-the groups shutdown joins (runtime components, and the store readers joined
-before the stores close), and a package test keeps every other long-lived
-goroutine in `cmd/providerd` out. Component-owned child loops use the same
+component failure, and `Restart=on-failure` restarts it. The supervisor derives
+the work context itself, so failure-triggered shutdown cannot be wired to an
+unrelated context, and it owns the groups shutdown joins (runtime components,
+and the store readers joined before the stores close). A package test rejects
+every `go` statement and every call to a method named `Go` in `cmd/providerd`
+outside its reviewed functions, whatever the receiver; it reads syntax, so it
+cannot see a goroutine started inside a library call. Component-owned child loops use the same
 recover shape locally and are joined by their owner before its stores close.
 Not every goroutine is panic-contained: the chain event subscriber's WebSocket
 read goroutine has no `recover()`, so a panic while handling a chain message

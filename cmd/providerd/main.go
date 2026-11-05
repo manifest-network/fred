@@ -160,8 +160,12 @@ func run(cmd *cobra.Command, args []string) error {
 	// Cancel this context only after callback ingress has drained.
 	ctx, cancel := context.WithCancel(context.WithoutCancel(cmd.Context()))
 	defer cancel()
-	workCtx, cancelWork := context.WithCancel(startupCtx)
-	defer cancelWork()
+	// Ordinary work runs on the supervisor's context, which ends when shutdown
+	// begins: on a signal, at BeginShutdown, or on the first component
+	// failure. A component that fails, panics or stops before shutdown starts
+	// shutdown, and run returns its failure, so providerd exits non-zero.
+	comps, workCtx := newComponents(startupCtx)
+	defer comps.BeginShutdown()
 
 	// Validate the local placement authority and exact backend storage topology
 	// before signer construction can derive keys or any startup path can query or
@@ -560,11 +564,6 @@ func run(cmd *cobra.Command, args []string) error {
 	// to auto-close our leases for that tenant
 	leaseWatcher.SetWithdrawTrigger(withdrawScheduler.TriggerWithdraw)
 
-	// Every long-lived component runs under the supervisor. A component that
-	// fails, panics or stops before shutdown starts shutdown, and run returns
-	// its failure, so providerd exits non-zero.
-	comps := newComponents(workCtx, cancelWork)
-
 	// Start API server FIRST and wait for it to be listening.
 	// This is critical because startup reconciliation may trigger backend callbacks
 	// that need to reach our callback endpoint.
@@ -575,14 +574,14 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Forward API server errors to the main error channel.
 	// Channel sends at most one error then closes; receive returns nil if closed without error.
-	comps.Go("api server", func() error {
+	comps.Start("api server", func() error {
 		return <-apiErrChan
 	})
 
 	// Start provisioner BEFORE reconciliation so its callback admission gate,
 	// acknowledgment lanes, and Watermill chain/payload handlers are live before
 	// reconciliation can trigger backend work.
-	comps.Go("provision manager", func() error {
+	comps.Start("provision manager", func() error {
 		return provisionMgr.Start(ctx)
 	})
 
@@ -602,7 +601,7 @@ func run(cmd *cobra.Command, args []string) error {
 		// Durable maintenance claims were rehydrated during construction, before
 		// any public or reconciliation work became reachable. Resume their backend
 		// commands in the background so a down pinned node delays only its own lease.
-		comps.Go("maintenance recovery", func() error {
+		comps.Start("maintenance recovery", func() error {
 			return maintenanceService.Start(workCtx, cfg.ReconciliationInterval)
 		})
 
@@ -613,34 +612,34 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 
 		// Start event subscriber (single reader, multiple consumers via Subscribe())
-		comps.Go("event subscriber", func() error {
+		comps.Start("event subscriber", func() error {
 			return eventSub.Start(workCtx)
 		})
 
 		// Start event bridge (subscribes to eventSub, forwards to Watermill)
-		comps.Go("event bridge", func() error {
+		comps.Start("event bridge", func() error {
 			return eventBridge.Start(workCtx)
 		})
 
 		// Start watcher for cross-provider events (subscribes to eventSub)
-		comps.Go("watcher", func() error {
+		comps.Start("watcher", func() error {
 			return leaseWatcher.Start(workCtx)
 		})
 
 		// Start withdrawal scheduler
-		comps.Go("scheduler", func() error {
+		comps.Start("scheduler", func() error {
 			return withdrawScheduler.Start(workCtx)
 		})
 
 		// Start periodic reconciliation
-		comps.Go("reconciler", func() error {
+		comps.Start("reconciler", func() error {
 			return reconciler.Start(workCtx)
 		})
 
 		// Start online placement snapshots after the startup reconcile, so the
 		// first one captures reconciled state.
 		if placementSnapshots != nil {
-			comps.GoStoreReader("placement snapshots", func() error {
+			comps.StartStoreReader("placement snapshots", func() error {
 				return placementSnapshots.Run(workCtx)
 			})
 		}
@@ -653,7 +652,7 @@ func run(cmd *cobra.Command, args []string) error {
 		// providerd (ENG-688).
 		if signerPool.HasSubSigners() {
 			bankQ := banktypes.NewQueryClient(chainClient.Conn())
-			comps.Go("sub-signer maintenance", func() error {
+			comps.Start("sub-signer maintenance", func() error {
 				ticker := time.NewTicker(cfg.SubSignerFundCheckInterval)
 				defer ticker.Stop()
 				for {
@@ -703,7 +702,7 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 		return nil
 	}()
-	cancelWork()
+	comps.BeginShutdown()
 	if startupErr != nil && !errors.Is(startupErr, context.Canceled) {
 		slog.Error("provider startup failed", "error", startupErr)
 	}

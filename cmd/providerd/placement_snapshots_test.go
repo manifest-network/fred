@@ -92,7 +92,7 @@ func TestShutdownJoinsPlacementSnapshotsBeforeTheStoresClose(t *testing.T) {
 			return true
 		}
 		switch {
-		case owner.Name == "comps" && function.Sel.Name == "GoStoreReader":
+		case owner.Name == "comps" && function.Sel.Name == "StartStoreReader":
 			name, ok := call.Args[0].(*ast.BasicLit)
 			if ok && name.Value == `"placement snapshots"` {
 				started = append(started, call.Pos())
