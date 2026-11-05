@@ -2057,8 +2057,10 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
-			OriginalLeaseUUID:   origLease,
-			Items:               []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			OriginalLeaseUUID: origLease,
+			Items:             []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			ResourceProfiles: frozenRetainedProfilesForTest(t, b,
+				[]backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}}),
 			RetainedVolumeNames: []string{retained},
 		}
 		err = b.checkDemoteFit(ctx, rec,
@@ -2102,8 +2104,10 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
-			OriginalLeaseUUID:   origLease,
-			Items:               []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			OriginalLeaseUUID: origLease,
+			Items:             []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			ResourceProfiles: frozenRetainedProfilesForTest(t, b,
+				[]backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}}),
 			RetainedVolumeNames: []string{retained},
 		}
 		err = b.checkDemoteFit(ctx, rec,
@@ -2181,8 +2185,10 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
-			OriginalLeaseUUID:   origLease,
-			Items:               []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			OriginalLeaseUUID: origLease,
+			Items:             []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			ResourceProfiles: frozenRetainedProfilesForTest(t, b,
+				[]backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}}),
 			RetainedVolumeNames: []string{retained},
 		}
 		err = b.checkDemoteFit(ctx, rec,
@@ -2223,8 +2229,10 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
-			OriginalLeaseUUID:   origLease,
-			Items:               []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			OriginalLeaseUUID: origLease,
+			Items:             []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			ResourceProfiles: frozenRetainedProfilesForTest(t, b,
+				[]backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}}),
 			RetainedVolumeNames: []string{retained},
 		}
 		err = b.checkDemoteFit(ctx, rec,
@@ -2307,8 +2315,10 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
-			OriginalLeaseUUID:   origLease,
-			Items:               []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			OriginalLeaseUUID: origLease,
+			Items:             []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			ResourceProfiles: frozenRetainedProfilesForTest(t, b,
+				[]backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}}),
 			RetainedVolumeNames: []string{retained},
 		}
 		err = b.checkDemoteFit(ctx, rec,
@@ -2399,8 +2409,10 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
-			OriginalLeaseUUID:   origLease,
-			Items:               []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			OriginalLeaseUUID: origLease,
+			Items:             []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
+			ResourceProfiles: frozenRetainedProfilesForTest(t, b,
+				[]backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}}),
 			RetainedVolumeNames: []string{retained},
 		}
 		err = b.checkDemoteFit(ctx, rec,

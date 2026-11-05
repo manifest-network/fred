@@ -52,6 +52,15 @@ func reopenRetentionStoreWithV013Row(t *testing.T, b *Backend, entry shared.Rete
 	return reopened
 }
 
+// frozenRetainedProfilesForTest returns the sizing Start freezes onto a
+// retained record of items under b's configuration.
+func frozenRetainedProfilesForTest(t *testing.T, b *Backend, items []backend.LeaseItem) []shared.SKUResourceSnapshot {
+	t.Helper()
+	profiles, err := b.resolveResourceProfiles(items)
+	require.NoError(t, err)
+	return profiles
+}
+
 func v013RetentionEntry(sku string) shared.RetentionEntry {
 	return shared.RetentionEntry{
 		OriginalLeaseUUID:   v013RetainedLease,
