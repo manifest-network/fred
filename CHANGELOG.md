@@ -16,6 +16,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+### Security
+
+## [0.14.1] - 2026-11-05
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
 - A payload upload and a restore no longer both take the same lease. A restore
   redeploys the source lease's retained manifest and never reads a payload, but
   `POST /v1/leases/{uuid}/data` on a lease being restored answered `202`, and the
