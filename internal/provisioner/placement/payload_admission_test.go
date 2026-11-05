@@ -27,6 +27,7 @@ var admissionPayload = []byte(`{"image":"nginx"}`)
 type payloadAdmissionFixture struct {
 	store        *Store
 	coordinator  *OperationCoordinator
+	execution    *ExecutionCoordinator
 	payloads     *payload.Store
 	admitter     PayloadAdmitter
 	restore      *RestoreCoordinator
@@ -71,7 +72,7 @@ func newPayloadAdmissionFixture(t *testing.T, restoreErr error) payloadAdmission
 	restore, err := provisions.RestoreCoordinator(nil)
 	require.NoError(t, err)
 	return payloadAdmissionFixture{
-		store: store, coordinator: base, payloads: payloads,
+		store: store, coordinator: base, execution: execution, payloads: payloads,
 		admitter: provisions.PayloadAdmitter(), restore: restore, restoreCalls: &calls,
 	}
 }
@@ -118,6 +119,60 @@ func TestPayloadAdmission_RestoreAndUploadExcludeEachOther(t *testing.T) {
 			fixture.admitter.Admit(t.Context(), admissionTargetLease, admissionPayload))
 		assert.False(t, fixture.storedPayload(t))
 	})
+}
+
+// TestPayloadAdmission_SiblingAuthoritiesShareOnePayloadStore pins the review
+// reproduction on #285: exclusion holds only while both admissions consult one
+// store, so a second provision authority minted from the same execution cannot
+// bring its own, nil included, and a sibling bound to the same store still
+// refuses the restore.
+func TestPayloadAdmission_SiblingAuthoritiesShareOnePayloadStore(t *testing.T) {
+	fixture := newPayloadAdmissionFixture(t, nil)
+	require.Equal(t, PayloadAdmitted,
+		fixture.admitter.Admit(t.Context(), admissionTargetLease, admissionPayload))
+	other, err := payload.NewStore(payload.StoreConfig{DBPath: filepath.Join(t.TempDir(), "other.db")})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = other.Close() })
+
+	for name, payloads := range map[string]*payload.Store{"nil store": nil, "other store": other} {
+		_, err := fixture.execution.ProvisionCoordinatorWithPayloads(nil, payloads)
+		require.ErrorIs(t, err, ErrPayloadStoreRebound, name)
+	}
+
+	sibling, err := fixture.execution.ProvisionCoordinatorWithPayloads(nil, fixture.payloads)
+	require.NoError(t, err, "the bound store is accepted again")
+	restore, err := sibling.RestoreCoordinator(nil)
+	require.NoError(t, err)
+	request, err := NewRestoreApplicationRequest(admissionTargetLease, "tenant-test", admissionSourceLease)
+	require.NoError(t, err)
+
+	result := restore.ExecuteApplication(t.Context(), request)
+
+	assert.Equal(t, RestoreApplicationTargetHasPayload, result.Disposition(), result.Err())
+	assert.Zero(t, fixture.restoreCalls.Load())
+	assert.True(t, fixture.storedPayload(t))
+}
+
+// TestExecutionCoordinatorBindsNoPayloadStoreOnce pins that an execution bound
+// without a payload store never gains one: a restore minted there found no
+// store, so an admitter that stores payloads must not join it.
+func TestExecutionCoordinatorBindsNoPayloadStoreOnce(t *testing.T) {
+	store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
+	requireAdmissionBaseline(t, store, "backend-a")
+	base, err := newOperationCoordinator(store, operation.NewRegistry())
+	require.NoError(t, err)
+	execution := bindExecutionForTest(t, base, executionRuntime("backend-a"))
+	_, err = execution.ProvisionCoordinatorWithPayloads(nil, nil)
+	require.NoError(t, err)
+	_, err = execution.ProvisionCoordinatorWithPayloads(nil, nil)
+	require.NoError(t, err, "the absent store is accepted again")
+	payloads, err := payload.NewStore(payload.StoreConfig{DBPath: filepath.Join(t.TempDir(), "payloads.db")})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = payloads.Close() })
+
+	_, err = execution.ProvisionCoordinatorWithPayloads(nil, payloads)
+
+	require.ErrorIs(t, err, ErrPayloadStoreRebound)
 }
 
 // TestPayloadAdmitter_DecidesFromPlacementUnderClaim covers every placement

@@ -113,11 +113,12 @@ type RestoreCoordinator struct {
 	payloads     *payload.Store
 }
 
-// RestoreCoordinator is minted from the provision authority so that restore
-// admission reads exactly the payload store its PayloadAdmitter inserts into:
-// a target holding a payload is refused under the same lease claim, and the
-// two cannot be bound to different stores. A nil payload store holds no
-// payloads, because its admitter stores none.
+// RestoreCoordinator is minted from a provision authority, whose payload store
+// is the one its execution coordinator bound first (ErrPayloadStoreRebound
+// refuses any other). Restore admission therefore reads exactly the store
+// every PayloadAdmitter of that execution inserts into, and a target holding a
+// payload is refused under the same lease claim. A nil payload store holds no
+// payloads, because its admitters store none.
 func (authority *ProvisionCoordinator) RestoreCoordinator(
 	observe RestoreStartObserver,
 ) (*RestoreCoordinator, error) {

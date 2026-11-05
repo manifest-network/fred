@@ -308,6 +308,7 @@ type fixture struct {
 	coordinator    *placement.OperationCoordinator
 	execution      *placement.ExecutionCoordinator
 	reconciliation *placement.ReconciliationCoordinator
+	provisions     *placement.ProvisionCoordinator
 	restore        *placement.RestoreCoordinator
 	events         *eventSink
 }
@@ -334,6 +335,13 @@ func sourceLease(uuid string) *billingtypes.Lease {
 }
 
 func newFixture(t *testing.T, inventoryReady bool) *fixture {
+	t.Helper()
+	return newFixtureWithPayloads(t, inventoryReady, nil)
+}
+
+// newFixtureWithPayloads binds payloads as the execution's one payload store,
+// shared by the fixture's restore coordinator and its payload admitter.
+func newFixtureWithPayloads(t *testing.T, inventoryReady bool, payloads *payload.Store) *fixture {
 	t.Helper()
 	store, err := placementstore.NewStoreForProvider(
 		filepath.Join(t.TempDir(), "placements.db"), testProvider,
@@ -375,7 +383,9 @@ func newFixture(t *testing.T, inventoryReady bool) *fixture {
 	if inventoryReady {
 		require.True(t, store.CurrentAdmissionBaseline().Valid())
 	}
-	result.restore, err = restoreAuthorityForTest(result.execution,
+	result.provisions, err = result.execution.ProvisionCoordinatorWithPayloads(nil, payloads)
+	require.NoError(t, err)
+	result.restore, err = result.provisions.RestoreCoordinator(
 		func(leaseUUID, _ string) {
 			result.events.Publish(backend.LeaseStatusEvent{
 				LeaseUUID: leaseUUID, Status: backend.ProvisionStatusRestarting,
@@ -690,20 +700,14 @@ func TestServiceRereadsAndValidatesTargetUnderBothClaims(t *testing.T) {
 // target that already received a tenant payload is provisioned from it, so a
 // restore into it is refused before anything is admitted or sent.
 func TestServiceRefusesTargetHoldingPayload(t *testing.T) {
-	fixture := newFixture(t, true)
 	payloads, err := payload.NewStore(payload.StoreConfig{DBPath: filepath.Join(t.TempDir(), "payloads.db")})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = payloads.Close() })
-	provisions, err := fixture.execution.ProvisionCoordinatorWithPayloads(nil, payloads)
-	require.NoError(t, err)
+	fixture := newFixtureWithPayloads(t, true, payloads)
 	require.Equal(t, placement.PayloadAdmitted,
-		provisions.PayloadAdmitter().Admit(t.Context(), testTarget, []byte(`{"image":"nginx"}`)))
-	restore, err := provisions.RestoreCoordinator(nil)
-	require.NoError(t, err)
-	service, err := NewService(Config{Coordinator: restore})
-	require.NoError(t, err)
+		fixture.provisions.PayloadAdmitter().Admit(t.Context(), testTarget, []byte(`{"image":"nginx"}`)))
 
-	result := service.Execute(t.Context(), validCommand())
+	result := fixture.service.Execute(t.Context(), validCommand())
 
 	assert.Equal(t, OutcomeTargetHasPayload, result.Outcome)
 	assert.Zero(t, fixture.backend.callCount())

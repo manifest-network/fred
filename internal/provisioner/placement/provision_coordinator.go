@@ -177,7 +177,9 @@ func (observer DeprovisionCompletionObserver) ObserveCallbackDeprovisioned(
 
 // ProvisionCoordinatorWithPayloads binds payload cleanup to the same authority
 // that owns the chain decision and the lifecycle claim. A message handler
-// cannot replace the store or manufacture deletion permission.
+// cannot replace the store or manufacture deletion permission. The store is
+// bound to the execution coordinator on the first call; a later call that
+// names another store, nil included, is refused with ErrPayloadStoreRebound.
 func (execution *ExecutionCoordinator) ProvisionCoordinatorWithPayloads(
 	observe ProvisionStartObserver,
 	payloads *payload.Store,
@@ -185,6 +187,9 @@ func (execution *ExecutionCoordinator) ProvisionCoordinatorWithPayloads(
 	controlPlane, err := execution.providerControlPlane()
 	if err != nil {
 		return nil, errors.New("valid backend execution coordinator and provider control plane are required")
+	}
+	if err := execution.bindPayloads(payloads); err != nil {
+		return nil, err
 	}
 	return &ProvisionCoordinator{
 		coordinator: execution.coordinator, issuer: execution.issuer,

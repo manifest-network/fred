@@ -132,8 +132,7 @@ func requireManagerProvisionCallbackOperation(
 		}
 		return nil, nil
 	}
-	coordinator, err := manager.executionCoordinator.ProvisionCoordinatorWithPayloads(nil, nil)
-	require.NoError(t, err)
+	coordinator := manager.provisionCoordinator
 	event, err := placement.NewProvisionEventRequest(leaseUUID, tenant)
 	require.NoError(t, err)
 	result := coordinator.ExecuteCurrentLease(t.Context(), event)
