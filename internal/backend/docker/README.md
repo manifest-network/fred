@@ -362,7 +362,9 @@ returns before any other check, and one that would change the row is refused
 while the history holds any maintenance row, because re-encoding the history
 can compact one away (ENG-1313). Keep the deployed v0.13 SKU
 mapping, numeric profiles, and `container_tmpfs_size_mb` unchanged through the
-first successful upgraded startup. Because v0.13 did not persist desired
+first successful upgraded startup. That startup also freezes the sizing of every
+v0.13 retention row onto the row, so after it a SKU profile change can neither
+reprice a retained footprint nor block a restart. Because v0.13 did not persist desired
 quantity in its release row, the mandatory provider-side placement preflight in
 `DEPLOYMENT.md` must still compare the exposed frozen `Items` with the
 height-pinned chain workload before providerd starts.

@@ -51,13 +51,7 @@ func (b *Backend) reconcileVolumeQuotasUsing(
 	// Active leases. Snapshot under RLock; do NOT hold it across quota subprocesses.
 	b.provisionsMu.RLock()
 	for leaseUUID, prov := range b.provisions {
-		resourceProfiles := prov.ResourceProfiles
-		var resolveErr error
-		if len(resourceProfiles) == 0 {
-			// Explicit v0.13 compatibility only. Normal startup recovery freezes
-			// this value into the active Release before quota reconciliation.
-			resourceProfiles, resolveErr = b.resolveResourceProfiles(prov.Items)
-		}
+		resourceProfiles, resolveErr := b.liveProvisionResourceProfiles(prov.Items, prov.ResourceProfiles)
 		resourcesBySKU, profileErr := resourceSnapshotMap(prov.Items, resourceProfiles)
 		if resolveErr != nil || profileErr != nil {
 			authorityErr := errors.Join(resolveErr, profileErr)
@@ -112,14 +106,12 @@ func (b *Backend) reconcileVolumeQuotasUsing(
 				if e.Status != shared.RetentionStatusActive {
 					continue
 				}
-				resourceProfiles := e.ResourceProfiles
-				var resolveErr error
-				if len(resourceProfiles) == 0 {
-					resourceProfiles, resolveErr = b.resolveResourceProfiles(e.Items)
+				resourceProfiles, authorityErr := retainedResourceProfiles(e)
+				var resourcesBySKU map[string]shared.SKUResourceSnapshot
+				if authorityErr == nil {
+					resourcesBySKU, authorityErr = resourceSnapshotMap(e.Items, resourceProfiles)
 				}
-				resourcesBySKU, profileErr := resourceSnapshotMap(e.Items, resourceProfiles)
-				if resolveErr != nil || profileErr != nil {
-					authorityErr := errors.Join(resolveErr, profileErr)
+				if authorityErr != nil {
 					b.logger.Error("quota reconciliation: retention has invalid resource authority",
 						"lease_uuid", e.OriginalLeaseUUID, "error", authorityErr)
 					reconcileErrs = append(reconcileErrs, fmt.Errorf(

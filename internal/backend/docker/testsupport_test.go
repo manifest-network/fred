@@ -2107,8 +2107,16 @@ func (j durableTestOperationIntentJournal) ListOperationIntents() ([]shared.Oper
 // explicit lineage precondition first.
 func bindTestStorageIdentity(t *testing.T, b *Backend, dockerClient *mockDockerClient) {
 	t.Helper()
+	bindTestStorageIdentityAt(t, b, dockerClient, t.TempDir())
+}
+
+// bindTestStorageIdentityAt binds b to the journals and storage-identity
+// markers in dir, creating them on first use. A second backend bound to the
+// same dir after the first has stopped reopens the same journals, as a
+// restart does.
+func bindTestStorageIdentityAt(t *testing.T, b *Backend, dockerClient *mockDockerClient, dir string) {
+	t.Helper()
 	const daemonID = "test-daemon"
-	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "callbacks.db")
 	b.cfg.CallbackDBPath = dbPath
 	b.cfg.ReleasesDBPath = filepath.Join(dir, "releases.db")

@@ -2787,6 +2787,19 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Check daemon capabilities for hardening configuration
 	b.checkDaemonCapabilities(initialCtx)
 
+	// Freeze sizing onto retention records written before records carried a
+	// resource snapshot, before anything below sizes a retained footprint. From
+	// here on a retained record is sized only by its own row, so a later SKU
+	// profile removal or resize cannot reprice it or block a restart.
+	frozenRetentions, err := b.freezeRetentionSizing()
+	if err != nil {
+		return fmt.Errorf("freeze retained resource sizing: %w", err)
+	}
+	if frozenRetentions > 0 {
+		b.logger.Info("froze resource sizing onto retention records written before v0.14",
+			"records", frozenRetentions)
+	}
+
 	// Recover state under a generous but finite backend-lifecycle budget rather
 	// than the caller's short readiness context. main cancels that context as
 	// soon as Start returns, while a bounded fleet rebuild may legitimately take
