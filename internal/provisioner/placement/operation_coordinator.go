@@ -96,9 +96,14 @@ func newOperationCoordinator(
 	return coordinator, nil
 }
 
+// Valid requires the exact coordinator the Store retained, not only its
+// marker. A by-value copy shares the marker but carries its own binding state,
+// so it could bind a second backend runtime, and with it a second payload
+// store, over the same Store and Registry (ENG-2117).
 func (coordinator *OperationCoordinator) Valid() bool {
 	return coordinator != nil && coordinator.store != nil && coordinator.marker != nil &&
-		coordinator.store.operationCoordinator == coordinator.marker
+		coordinator.store.operationCoordinator == coordinator.marker &&
+		coordinator.store.boundOperationCoordinator == coordinator
 }
 
 func (coordinator *OperationCoordinator) RuntimeController() operation.RuntimeController {

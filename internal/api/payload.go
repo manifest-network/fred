@@ -19,12 +19,26 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
-// PayloadPublisher publishes payload events to the provisioner.
+// PayloadPublisher publishes payload events to the provisioner. It offers no
+// raw store: an upload enters the store only through AdmitPayload, which
+// excludes a restore of the same lease (ENG-2117).
 type PayloadPublisher interface {
 	PublishPayload(event payload.Event) error
-	StorePayload(leaseUUID string, payload []byte) bool
+	AdmitPayload(ctx context.Context, leaseUUID string, payload []byte) placement.PayloadAdmission
 	DeletePayload(leaseUUID string) // Used for rollback on publish failure
 }
+
+// reasonRestoreInProgress marks a payload refused because a restore owns the
+// lease.
+const reasonRestoreInProgress = "restore_in_progress"
+
+const (
+	errMsgPayloadAlreadyReceived = "payload already received"
+	errMsgRestoreInProgress      = "lease is being restored: a restore redeploys the retained manifest of the source lease and takes no payload; " +
+		"to change the manifest, POST /v1/leases/{lease_uuid}/update after the restore finishes"
+	errMsgLeaseDeployed = "lease already has a deployment; " +
+		"to change its manifest, POST /v1/leases/{lease_uuid}/update once the lease is active"
+)
 
 // PayloadHandler handles payload upload requests.
 type PayloadHandler struct {
@@ -189,11 +203,10 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Store the payload (also serves as idempotency check)
-	if !h.publisher.StorePayload(leaseUUID, body) {
-		slog.Warn("payload already received", "lease_uuid", leaseUUID)
-		metrics.PayloadUploadsTotal.WithLabelValues("conflict").Inc()
-		writeError(w, "payload already received", http.StatusConflict)
+	// A restore target stays PENDING until the restore is acknowledged, so the
+	// checks above accept it; admission refuses it. Admission is also the
+	// idempotency check.
+	if !h.payloadAdmitted(w, leaseUUID, h.publisher.AdmitPayload(r.Context(), leaseUUID, body)) {
 		return
 	}
 
@@ -224,6 +237,50 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	)
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// payloadAdmitted answers every refused admission and reports whether the
+// payload was admitted. An outcome it does not know is refused as an internal
+// error, never treated as admitted.
+func (h *PayloadHandler) payloadAdmitted(
+	w http.ResponseWriter,
+	leaseUUID string,
+	admission placement.PayloadAdmission,
+) bool {
+	switch admission {
+	case placement.PayloadAdmitted:
+		return true
+	case placement.PayloadRestoreOwned:
+		slog.Warn("payload upload refused: a restore owns the lease", "lease_uuid", leaseUUID)
+		metrics.PayloadUploadsTotal.WithLabelValues("restore_in_progress").Inc()
+		writeJSON(w, ErrorResponse{
+			Error: errMsgRestoreInProgress, Code: http.StatusConflict, Reason: reasonRestoreInProgress,
+		}, http.StatusConflict)
+	case placement.PayloadAlreadyStored:
+		slog.Warn("payload already received", "lease_uuid", leaseUUID)
+		metrics.PayloadUploadsTotal.WithLabelValues("conflict").Inc()
+		writeError(w, errMsgPayloadAlreadyReceived, http.StatusConflict)
+	case placement.PayloadNotStored:
+		// The documented contract reports a store failure as the conflict.
+		slog.Warn("payload not stored: payload store unavailable or failed the write", "lease_uuid", leaseUUID)
+		metrics.PayloadUploadsTotal.WithLabelValues("conflict").Inc()
+		writeError(w, errMsgPayloadAlreadyReceived, http.StatusConflict)
+	case placement.PayloadLeaseDeployed:
+		slog.Warn("payload upload refused: lease already has a deployment", "lease_uuid", leaseUUID)
+		metrics.PayloadUploadsTotal.WithLabelValues("conflict").Inc()
+		writeError(w, errMsgLeaseDeployed, http.StatusConflict)
+	case placement.PayloadPlacementUnusable, placement.PayloadLeaseUnavailable:
+		slog.Warn("payload upload refused: lease lifecycle unavailable",
+			"lease_uuid", leaseUUID, "admission", admission)
+		metrics.PayloadUploadsTotal.WithLabelValues("error").Inc()
+		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+	default:
+		slog.Error("payload admission returned an unknown outcome",
+			"lease_uuid", leaseUUID, "admission", admission)
+		metrics.PayloadUploadsTotal.WithLabelValues("error").Inc()
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+	}
+	return false
 }
 
 // extractPayloadToken extracts and parses the bearer token for payload upload.

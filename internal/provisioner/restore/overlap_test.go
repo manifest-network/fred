@@ -128,7 +128,7 @@ func newOverlapRestoreFixture(t *testing.T, sourceUUID, targetUUID string) *fixt
 	require.NoError(t, err)
 	result.reconciliation, err = result.execution.ReconciliationCoordinator(nil, nil)
 	require.NoError(t, err)
-	result.restore, err = result.execution.RestoreCoordinator(nil)
+	result.restore, err = restoreAuthorityForTest(result.execution, nil)
 	require.NoError(t, err)
 	result.service, err = NewService(Config{Coordinator: result.restore, Events: result.events})
 	require.NoError(t, err)

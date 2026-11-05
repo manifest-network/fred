@@ -1940,7 +1940,7 @@ func TestCallbackService_RegistryBackedRestoreFencesRecoveredCallback(t *testing
 	seedTestConfirmedPlacements(t, store, []string{"backend-a"}, map[string]string{
 		sourceLease: "backend-a",
 	})
-	restoreAuthority, err := execution.RestoreCoordinator(nil)
+	restoreAuthority, err := restoreAuthorityForTest(execution, nil)
 	require.NoError(t, err)
 	request, err := placement.NewRestoreApplicationRequest(
 		targetLease, "tenant-test", sourceLease,

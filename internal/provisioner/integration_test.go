@@ -374,8 +374,8 @@ func TestIntegration_PayloadFlow(t *testing.T) {
 	mockBackend.mu.Unlock()
 
 	// Step 2: Store payload and publish PayloadReceived event.
-	stored := manager.StorePayload(leaseUUID, payloadData)
-	assert.True(t, stored)
+	stored := manager.AdmitPayload(context.Background(), leaseUUID, payloadData)
+	assert.Equal(t, placement.PayloadAdmitted, stored)
 
 	err = manager.PublishPayload(payload.Event{
 		LeaseUUID:   leaseUUID,

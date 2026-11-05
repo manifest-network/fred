@@ -884,15 +884,22 @@ Upload deployment configuration for a lease that was created with a `meta_hash`.
   `meta_hash` does not match the lease
 - `403 Forbidden` - Lease does not belong to this tenant or provider
 - `404 Not Found` - Lease not found, or not PENDING and not billing-only
+- `409 Conflict` with `reason: restore_in_progress` - A
+  [restore](#restore-lease) owns the lease. A restore redeploys the retained
+  manifest of its source lease and takes no payload; the upload is not stored.
+  To change the manifest, call [`POST /update`](#update-lease) after the
+  restore finishes
 - `409 Conflict` - The payload was not stored: a payload is already stored for
-  this lease, or the payload store is not configured, is closed, or failed the
-  write. A store failure is therefore also reported as `409`
+  this lease, the lease already has a confirmed deployment, or the payload
+  store is not configured, is closed, or failed the write. A store failure is
+  therefore also reported as `409`
 - `500 Internal Server Error` - The chain query failed, or publishing the
   payload event failed; the stored payload is removed so the upload can be
   retried
 - `503 Service Unavailable` (rarely `504 Gateway Timeout`) - The request,
   including the body upload, did not complete within the provider's request
-  timeout
+  timeout; other lifecycle work held the lease until then; the provider is
+  shutting down; or the lease's placement awaits operator repair
 
 ### Restart Lease
 
@@ -1102,6 +1109,23 @@ onto the same data (ENG-1442). Create the new lease with a `meta_hash`, as
 restore clients do by reusing the source lease's: Fred provisions a lease
 without one, with no payload, as soon as it is created.
 
+A restore target takes no payload, and a lease with a payload takes no restore
+(ENG-2117). A restore redeploys the source lease's retained manifest and never
+reads a payload, so the two would otherwise leave an upload answered `202` that
+never runs, and that a later re-provision would deploy in place of the restored
+manifest. Fred admits each only while holding the lease's lifecycle claim, so
+whichever comes first wins:
+
+- Once a restore is admitted, `POST /data` on the new lease is refused with
+  `409` and `reason: restore_in_progress`, and the upload is not stored. This
+  holds across a providerd restart, through the restore's durable placement.
+- Once a payload is stored, `POST /restore` into the lease is refused with
+  `409` and `reason: target_has_payload`: Fred provisions the uploaded
+  manifest onto fresh volumes instead.
+
+To run a different manifest on the restored data, wait until the lease is
+`ready` and send it with [`POST /update`](#update-lease).
+
 Admission is safe by construction. Fred acquires ordered lifecycle claims for the
 source and target, then obtains a store-issued reservation of the exact confirmed
 source before re-reading and authorizing the target. That reservation fences even
@@ -1172,7 +1196,7 @@ off to a complete durable close intent before teardown.
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - The source has no placement record, is not `CLOSED` or `EXPIRED`, belongs to another tenant/provider, or its configured backend reports no retained data (including retention that has expired)
-- `409 Conflict` - Source or target lifecycle work is already in progress, or the target is not `PENDING` (a billing-only target gets `400` instead), has an unresolved durable provision/restore attempt, or is not in a restorable state
+- `409 Conflict` - Source or target lifecycle work is already in progress, or the target is not `PENDING` (a billing-only target gets `400` instead), has an unresolved durable provision/restore attempt, already holds a payload uploaded with `POST /data`, or is not in a restorable state
 - `410 Gone` with `reason: backend_storage_lost` - The source's backend was retired because its storage was lost; its data cannot be restored
 - `422 Unprocessable Entity` - The retained data exceeds a requested smaller tier's `disk_mb` cap; the response relays the backend's bounded, recognized refusal detail
 - `500 Internal Server Error` - The restore returned an unexpected or ambiguous backend result, such as a transport error, timeout, generic 5xx, coded already-provisioned response, or unknown refusal code; the durable target attempt is retained until positive evidence confirms it or an operator safely repairs it
@@ -1191,6 +1215,7 @@ API's numeric HTTP-status `code` and human-readable `error`:
 | `source_busy` | The source is owned by lifecycle work, such as close, or another restore dispatch | Keep the target lease and retry later with a fresh bearer token |
 | `target_busy` | The target has lifecycle work, a tracked operation, or existing durable placement/attempt evidence | Preserve the target and inspect its status; pending recovery may need to finish before another restore can be admitted |
 | `target_not_pending` | An authoritative target chain read found a state other than `PENDING` | Do not retry restore into this target; restore requires a fresh `PENDING` lease |
+| `target_has_payload` | The target already received a payload through `POST /data`, so Fred provisions it from that manifest | Do not retry restore into this target; restore into a fresh `PENDING` lease that receives no upload |
 
 A generic backend `409` still omits `reason`: its refusal does not identify
 whether the source or target state caused the conflict. Missing or unrecognized

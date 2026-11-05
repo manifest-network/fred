@@ -8,11 +8,13 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"slices"
+	"sync"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -47,6 +49,11 @@ type AttemptPayloadReader interface {
 // the Store+Registry aggregate. Purpose facets derive their resolver from this
 // value; accepting a runtime again at each constructor would allow same-name
 // facets to execute against different machines.
+//
+// The payload store is bound the same way, once: payload admission and
+// restore admission exclude each other only while they consult one store
+// (ENG-2117), so every provision coordinator minted here, and every admitter
+// and restore coordinator minted from one, shares the first binding.
 type ExecutionCoordinator struct {
 	coordinator  *OperationCoordinator
 	backends     backendRuntime
@@ -55,6 +62,31 @@ type ExecutionCoordinator struct {
 	deprovision  *deprovisionCoordinator
 	issuer       *operationCoordinatorMarker
 	policy       *BillingPolicy
+
+	payloadMu     sync.Mutex
+	payloadsBound bool
+	payloads      *payload.Store
+}
+
+// ErrPayloadStoreRebound refuses a provision coordinator bound to a payload
+// store other than the one its execution coordinator is already bound to.
+var ErrPayloadStoreRebound = errors.New("execution coordinator is bound to a different payload store")
+
+// bindPayloads binds payloads on first use and afterwards accepts only the
+// identical store. A nil store is a binding too: an execution without a
+// payload store never gains one, so a restore that found no store cannot be
+// joined by an admitter that stores payloads.
+func (execution *ExecutionCoordinator) bindPayloads(payloads *payload.Store) error {
+	execution.payloadMu.Lock()
+	defer execution.payloadMu.Unlock()
+	if !execution.payloadsBound {
+		execution.payloads, execution.payloadsBound = payloads, true
+		return nil
+	}
+	if execution.payloads != payloads {
+		return ErrPayloadStoreRebound
+	}
+	return nil
 }
 
 // BindBackendRuntime binds the physical backend runtime, the provider control

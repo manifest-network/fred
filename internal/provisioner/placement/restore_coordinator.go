@@ -12,6 +12,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/provisioner/leaseitems"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -40,6 +41,9 @@ const (
 	// RestoreApplicationTargetBillingOnly: the target lease is billed but never
 	// deployed, so nothing may be restored into it.
 	RestoreApplicationTargetBillingOnly
+	// RestoreApplicationTargetHasPayload: the target already holds a tenant
+	// payload, so it is provisioned from that manifest instead (ENG-2117).
+	RestoreApplicationTargetHasPayload
 )
 
 // RestoreApplicationRequest carries only authenticated identities. It cannot
@@ -106,20 +110,27 @@ type RestoreCoordinator struct {
 	controlPlane *boundProviderControlPlane
 	callbacks    *CallbackRouteFactory
 	observe      RestoreStartObserver
+	payloads     *payload.Store
 }
 
-func (execution *ExecutionCoordinator) RestoreCoordinator(
+// RestoreCoordinator is minted from a provision authority, whose payload store
+// is the one its execution coordinator bound first (ErrPayloadStoreRebound
+// refuses any other). Restore admission therefore reads exactly the store
+// every PayloadAdmitter of that execution inserts into, and a target holding a
+// payload is refused under the same lease claim. A nil payload store holds no
+// payloads, because its admitters store none.
+func (authority *ProvisionCoordinator) RestoreCoordinator(
 	observe RestoreStartObserver,
 ) (*RestoreCoordinator, error) {
-	controlPlane, err := execution.providerControlPlane()
-	if err != nil {
+	if !authority.Valid() {
 		return nil, ErrInvalidRestoreCoordinator
 	}
 	return &RestoreCoordinator{
-		coordinator: execution.coordinator, issuer: execution.issuer,
-		backends:     execution.backends,
-		providerUUID: execution.coordinator.store.providerUUID,
-		controlPlane: controlPlane, callbacks: execution.callbacks, observe: observe,
+		coordinator: authority.coordinator, issuer: authority.issuer,
+		backends:     authority.backends,
+		providerUUID: authority.providerUUID,
+		controlPlane: authority.controlPlane, callbacks: authority.callbacks,
+		observe: observe, payloads: authority.payloads,
 	}, nil
 }
 
@@ -278,6 +289,21 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 		return RestoreApplicationResult{
 			disposition: RestoreApplicationServiceUnavailable,
 			err:         fmt.Errorf("restore target lease %s cannot be classified for deployment", request.targetLeaseUUID),
+		}
+	}
+	// Every payload insert holds this lease claim, so the answer holds until
+	// the claim is released, and once the restore below is admitted,
+	// PayloadAdmitter refuses every later upload (ENG-2117).
+	if authority.payloads != nil {
+		hasPayload, err := authority.payloads.Has(request.targetLeaseUUID)
+		if err != nil {
+			return RestoreApplicationResult{
+				disposition: RestoreApplicationServiceUnavailable,
+				err:         fmt.Errorf("read restore target payload: %w", err),
+			}
+		}
+		if hasPayload {
+			return RestoreApplicationResult{disposition: RestoreApplicationTargetHasPayload}
 		}
 	}
 	items := leaseitems.FromLease(targetLease)

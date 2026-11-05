@@ -154,6 +154,18 @@ linters:
         #     build one.
         - pattern: '^endableLease$'
           msg: "[lease-end] build an endableLease only through mayEnd or mayEndOperation in internal/provisioner/placement/provider_control_plane.go (ENG-1453)"
+        # A restore deploys the source's retained manifest and never reads a
+        # payload, so a payload stored for a lease a restore owns is never
+        # deployed until a re-provision deploys it in place of the restored
+        # manifest. Payload admission and restore admission therefore exclude
+        # each other under the lease's Registry claim (ENG-2117):
+        #   - [payload-insert]: payload.Store.Store is called only by
+        #     PayloadAdmitter (placement/payload_admission.go) and by the
+        #     reconciler's rebuild of an ACTIVE lease's payload from its owner's
+        #     active release (reconciler.go, ENG-1442), which holds the same
+        #     claim. The API offers tenant ingress no raw store at all.
+        - pattern: '(payloads|payloadStore)\.Store$'
+          msg: "[payload-insert] store a tenant payload through placement.PayloadAdmitter.Admit, which excludes a restore of the same lease (ENG-2117)"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -237,6 +249,12 @@ linters:
         linters:
           - forbidigo
         text: '\[lease-end\]'
+      # [payload-insert] (ENG-2117): payload admission, and the reconciler's
+      # rebuild of an ACTIVE lease's payload.
+      - path: ^internal/provisioner/(placement/payload_admission|reconciler)\.go$
+        linters:
+          - forbidigo
+        text: '\[payload-insert\]'
       # Exclude test files from strict linters
       - path: _test\.go
         linters:

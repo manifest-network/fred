@@ -29,6 +29,8 @@ func TestRestoreLeaseSemanticConflictReasonsPreserveNumericCode(t *testing.T) {
 			body: `{"error":"lease is already being provisioned or restored","code":409,"reason":"target_busy"}`},
 		{name: "target not pending", outcome: restoreapp.OutcomeTargetNotPending, status: http.StatusConflict,
 			body: `{"error":"lease is not pending; only a fresh lease can be restored into","code":409,"reason":"target_not_pending"}`},
+		{name: "target has payload", outcome: restoreapp.OutcomeTargetHasPayload, status: http.StatusConflict,
+			body: `{"error":"lease already received a payload and is provisioned from it; restore into a fresh lease that receives no upload","code":409,"reason":"target_has_payload"}`},
 		{name: "backend conflict has no inferred lease reason", outcome: restoreapp.OutcomeBackendInvalidState, status: http.StatusConflict,
 			body: `{"error":"lease not in a restorable state","code":409}`},
 		{name: "tier refusal keeps existing numeric code", outcome: restoreapp.OutcomeTierTooSmall, status: http.StatusUnprocessableEntity,

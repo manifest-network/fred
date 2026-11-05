@@ -92,11 +92,20 @@ func TestOperationCoordinatorDoesNotExposeCallerSelectedDispatchOutcomes(t *test
 	_, exposesLegacyProvisionAlias := execution.MethodByName("ProvisionCoordinator")
 	assert.False(t, exposesLegacyProvisionAlias, "execution coordinator exposes a test-only provision alias")
 	for _, method := range []string{
-		"ProvisionCoordinatorWithPayloads", "RestoreCoordinator", "ReconciliationCoordinator",
-		"MaintenanceCoordinator",
+		"ProvisionCoordinatorWithPayloads", "ReconciliationCoordinator", "MaintenanceCoordinator",
 	} {
 		_, exposed := execution.MethodByName(method)
 		assert.True(t, exposed, "execution coordinator does not mint purpose facet %s", method)
+	}
+	// A restore and a payload upload must read and write one payload store
+	// (ENG-2117), so both are minted only from the provision authority.
+	_, executionMintsRestore := execution.MethodByName("RestoreCoordinator")
+	assert.False(t, executionMintsRestore,
+		"execution coordinator mints a restore authority unpaired with payload admission")
+	provision := reflect.TypeOf((*placement.ProvisionCoordinator)(nil))
+	for _, method := range []string{"RestoreCoordinator", "PayloadAdmitter"} {
+		_, exposed := provision.MethodByName(method)
+		assert.True(t, exposed, "provision coordinator does not mint paired facet %s", method)
 	}
 	for _, method := range []string{
 		"AuthenticatedCallbackCoordinator", "TimeoutCoordinator",

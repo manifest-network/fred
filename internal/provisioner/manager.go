@@ -80,6 +80,8 @@ type Manager struct {
 
 	operationRuntime     operation.RuntimeController
 	executionCoordinator *placement.ExecutionCoordinator
+	provisionCoordinator *placement.ProvisionCoordinator
+	payloadAdmitter      placement.PayloadAdmitter
 	handlers             *HandlerSet
 	deferredCloses       *deferredCloseScheduler
 
@@ -364,6 +366,8 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ManagerCh
 		ackBatcher:           ackBatcher,
 		operationRuntime:     operationCoordinator.RuntimeController(),
 		executionCoordinator: executionCoordinator,
+		provisionCoordinator: provisionCoordinator,
+		payloadAdmitter:      provisionCoordinator.PayloadAdmitter(),
 		handlers:             handlers,
 		deferredCloses:       deferredCloses,
 		timeoutChecker:       timeoutChecker,
@@ -729,17 +733,6 @@ func (m *Manager) PublishPayload(event payload.Event) error {
 
 	msg := message.NewMessage(watermill.NewUUID(), data)
 	return m.publisher.Publish(TopicPayloadReceived, msg)
-}
-
-// StorePayload stores a payload in the payload store.
-// Returns false if a payload already exists for this lease (conflict),
-// or if the payload store is not configured.
-func (m *Manager) StorePayload(leaseUUID string, payload []byte) bool {
-	if m.payloadStore == nil {
-		slog.Warn("payload store not configured, cannot store payload", "lease_uuid", leaseUUID)
-		return false
-	}
-	return m.payloadStore.Store(leaseUUID, payload)
 }
 
 // OverwritePayload replaces the stored payload for a lease, recording the new

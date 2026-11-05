@@ -53,11 +53,11 @@ type fixturePublisher struct {
 	callbacks []hmacauth.VerifiedRequest
 }
 
-func (f *fixturePublisher) StorePayload(_ string, data []byte) bool {
+func (f *fixturePublisher) AdmitPayload(_ context.Context, _ string, data []byte) placement.PayloadAdmission {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.data = bytes.Clone(data)
-	return true
+	return placement.PayloadAdmitted
 }
 func (f *fixturePublisher) DeletePayload(string) {}
 func (f *fixturePublisher) PublishPayload(event payload.Event) error {

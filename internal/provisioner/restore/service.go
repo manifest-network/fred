@@ -45,6 +45,9 @@ const (
 	// OutcomeTargetBillingOnly: the target lease is billed but never deployed,
 	// so nothing may be restored into it.
 	OutcomeTargetBillingOnly
+	// OutcomeTargetHasPayload: the target already received a tenant payload
+	// and is provisioned from that manifest instead.
+	OutcomeTargetHasPayload
 )
 
 // Result is the typed result contract returned by Service. Detail contains
@@ -152,6 +155,8 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 		result.Outcome = OutcomeTargetNotPending
 	case placement.RestoreApplicationTargetBillingOnly:
 		result.Outcome = OutcomeTargetBillingOnly
+	case placement.RestoreApplicationTargetHasPayload:
+		result.Outcome = OutcomeTargetHasPayload
 	case placement.RestoreApplicationSourceNotFound:
 		result.Outcome = OutcomeSourceNotFound
 	case placement.RestoreApplicationSourceUnavailable:

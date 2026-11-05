@@ -1486,7 +1486,7 @@ func TestIncompleteRetentionPreservesConfirmedRestoreAffinity(t *testing.T) {
 				"retention evidence cannot rewrite lifecycle authority")
 			require.NoError(t, store.leaseSideEffectError(fencedAvailabilityOwner))
 
-			restore, err := execution.RestoreCoordinator(nil)
+			restore, err := restoreAuthorityForTest(execution, nil)
 			require.NoError(t, err)
 			request, err := NewRestoreApplicationRequest(
 				fencedAvailabilitySibling, "tenant-test", fencedAvailabilityOwner,

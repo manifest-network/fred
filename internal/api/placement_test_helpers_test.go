@@ -373,3 +373,16 @@ func projectAPIInventoryWithExplicitLifetime(
 	require.NoError(t, err)
 	return result, sweep
 }
+
+// restoreAuthorityForTest mints a restore coordinator the way providerd does,
+// from a provision authority, here one without a payload store.
+func restoreAuthorityForTest(
+	execution *placement.ExecutionCoordinator,
+	observe placement.RestoreStartObserver,
+) (*placement.RestoreCoordinator, error) {
+	provisions, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return provisions.RestoreCoordinator(observe)
+}

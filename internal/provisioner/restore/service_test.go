@@ -24,6 +24,7 @@ import (
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/testsupport/placementstore"
 )
@@ -307,6 +308,7 @@ type fixture struct {
 	coordinator    *placement.OperationCoordinator
 	execution      *placement.ExecutionCoordinator
 	reconciliation *placement.ReconciliationCoordinator
+	provisions     *placement.ProvisionCoordinator
 	restore        *placement.RestoreCoordinator
 	events         *eventSink
 }
@@ -333,6 +335,13 @@ func sourceLease(uuid string) *billingtypes.Lease {
 }
 
 func newFixture(t *testing.T, inventoryReady bool) *fixture {
+	t.Helper()
+	return newFixtureWithPayloads(t, inventoryReady, nil)
+}
+
+// newFixtureWithPayloads binds payloads as the execution's one payload store,
+// shared by the fixture's restore coordinator and its payload admitter.
+func newFixtureWithPayloads(t *testing.T, inventoryReady bool, payloads *payload.Store) *fixture {
 	t.Helper()
 	store, err := placementstore.NewStoreForProvider(
 		filepath.Join(t.TempDir(), "placements.db"), testProvider,
@@ -374,7 +383,9 @@ func newFixture(t *testing.T, inventoryReady bool) *fixture {
 	if inventoryReady {
 		require.True(t, store.CurrentAdmissionBaseline().Valid())
 	}
-	result.restore, err = result.execution.RestoreCoordinator(
+	result.provisions, err = result.execution.ProvisionCoordinatorWithPayloads(nil, payloads)
+	require.NoError(t, err)
+	result.restore, err = result.provisions.RestoreCoordinator(
 		func(leaseUUID, _ string) {
 			result.events.Publish(backend.LeaseStatusEvent{
 				LeaseUUID: leaseUUID, Status: backend.ProvisionStatusRestarting,
@@ -574,7 +585,7 @@ func TestNewServiceNormalizesNilCapabilities(t *testing.T) {
 		placement.NoBillingOnlySKUs(),
 	)
 	require.NoError(t, err)
-	restoreCoordinator, err := execution.RestoreCoordinator(nil)
+	restoreCoordinator, err := restoreAuthorityForTest(execution, nil)
 	require.NoError(t, err)
 	valid := Config{
 		Coordinator: restoreCoordinator,
@@ -683,6 +694,25 @@ func TestServiceRereadsAndValidatesTargetUnderBothClaims(t *testing.T) {
 		result := fixture.service.Execute(t.Context(), validCommand())
 		require.Equal(t, OutcomeAccepted, result.Outcome)
 	})
+}
+
+// TestServiceRefusesTargetHoldingPayload pins ENG-2117 through the service: a
+// target that already received a tenant payload is provisioned from it, so a
+// restore into it is refused before anything is admitted or sent.
+func TestServiceRefusesTargetHoldingPayload(t *testing.T) {
+	payloads, err := payload.NewStore(payload.StoreConfig{DBPath: filepath.Join(t.TempDir(), "payloads.db")})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = payloads.Close() })
+	fixture := newFixtureWithPayloads(t, true, payloads)
+	require.Equal(t, placement.PayloadAdmitted,
+		fixture.provisions.PayloadAdmitter().Admit(t.Context(), testTarget, []byte(`{"image":"nginx"}`)))
+
+	result := fixture.service.Execute(t.Context(), validCommand())
+
+	assert.Equal(t, OutcomeTargetHasPayload, result.Outcome)
+	assert.Zero(t, fixture.backend.callCount())
+	assert.Equal(t, placement.StateAbsent, fixture.store.Lookup(testTarget).State())
+	requireLeaseClaimsReleased(t, fixture.runtime, testSource, testTarget)
 }
 
 func TestServiceAuthorizesSourceBeforeTakingLeaseClaims(t *testing.T) {
@@ -1286,4 +1316,17 @@ func TestServiceBackendPanicReleasesClaimsAndRetainsAttempt(t *testing.T) {
 	assert.False(t, fixture.runtime.Contains(testTarget))
 	requireLeaseClaimsReleased(t, fixture.runtime, testSource, testTarget)
 	requireSourceReusable(t, fixture, "probe-after-panic")
+}
+
+// restoreAuthorityForTest mints a restore coordinator the way providerd does,
+// from a provision authority, here one without a payload store.
+func restoreAuthorityForTest(
+	execution *placement.ExecutionCoordinator,
+	observe placement.RestoreStartObserver,
+) (*placement.RestoreCoordinator, error) {
+	provisions, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return provisions.RestoreCoordinator(observe)
 }

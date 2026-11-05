@@ -1243,6 +1243,8 @@ func (h *Handlers) writeRestoreResult(
 		writeRestoreConflict(w, "lease is not pending; only a fresh lease can be restored into", "target_not_pending")
 	case restoreapp.OutcomeTargetBillingOnly:
 		writeBillingOnly(w, "lease is billing-only and cannot be restored into")
+	case restoreapp.OutcomeTargetHasPayload:
+		writeRestoreConflict(w, "lease already received a payload and is provisioned from it; restore into a fresh lease that receives no upload", "target_has_payload")
 	case restoreapp.OutcomeSourceNotFound, restoreapp.OutcomeNotRetained:
 		writeError(w, "no retained data found for that lease", http.StatusNotFound)
 	case restoreapp.OutcomeSourceUnavailable:
