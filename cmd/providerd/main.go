@@ -34,24 +34,6 @@ import (
 	"github.com/manifest-network/fred/internal/watcher"
 )
 
-// safeGo runs a function in a goroutine with panic recovery.
-// If the function panics, the panic is converted to an error and sent to errChan.
-// The component name is included in the error for debugging.
-//
-// Uses sync.WaitGroup.Go (Go 1.25+) for cleaner goroutine management.
-func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func() error) {
-	wg.Go(func() {
-		defer func() {
-			if r := recover(); r != nil {
-				errChan <- fmt.Errorf("%s panic: %v", component, r)
-			}
-		}()
-		if err := fn(); err != nil && !errors.Is(err, context.Canceled) {
-			errChan <- fmt.Errorf("%s error: %w", component, err)
-		}
-	})
-}
-
 // demoteOnGrantSetupError reports whether a failed startup grant setup justifies
 // falling back to single-signer for the rest of the process.
 //
@@ -77,6 +59,10 @@ var (
 		Short: "Manifest Provider Daemon",
 		Long:  `A daemon that watches for lease events, auto-acknowledges them, serves tenant authentication API, and periodically withdraws funds.`,
 		RunE:  run,
+		// main reports the error once. A component failure is not a usage
+		// error, so it must not print the usage text.
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
 )
 
@@ -574,19 +560,10 @@ func run(cmd *cobra.Command, args []string) error {
 	// to auto-close our leases for that tenant
 	leaseWatcher.SetWithdrawTrigger(withdrawScheduler.TriggerWithdraw)
 
-	// Start background components with WaitGroup for graceful shutdown.
-	// Each component is wrapped with panic recovery via safeGo() to prevent
-	// silent crashes and convert panics to errors.
-	var wg sync.WaitGroup
-	// The snapshot loop reads both live stores, so shutdown joins it on its own
-	// before they close, whatever the shutdown timeout did to wg.
-	var snapshotWG sync.WaitGroup
-	// Every long-lived component can report at most one terminal error. Keep
-	// room for all ten (including optional sub-signer maintenance and
-	// placement snapshots) because the first error starts shutdown and no
-	// goroutine may block its WaitGroup.Done while trying to report another
-	// concurrent failure.
-	errChan := make(chan error, 10)
+	// Every long-lived component runs under the supervisor. A component that
+	// fails, panics or stops before shutdown starts shutdown, and run returns
+	// its failure, so providerd exits non-zero.
+	comps := newComponents(workCtx, cancelWork)
 
 	// Start API server FIRST and wait for it to be listening.
 	// This is critical because startup reconciliation may trigger backend callbacks
@@ -598,14 +575,14 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Forward API server errors to the main error channel.
 	// Channel sends at most one error then closes; receive returns nil if closed without error.
-	safeGo(&wg, errChan, "api server", func() error {
+	comps.Go("api server", func() error {
 		return <-apiErrChan
 	})
 
 	// Start provisioner BEFORE reconciliation so its callback admission gate,
 	// acknowledgment lanes, and Watermill chain/payload handlers are live before
 	// reconciliation can trigger backend work.
-	safeGo(&wg, errChan, "provision manager", func() error {
+	comps.Go("provision manager", func() error {
 		return provisionMgr.Start(ctx)
 	})
 
@@ -625,7 +602,7 @@ func run(cmd *cobra.Command, args []string) error {
 		// Durable maintenance claims were rehydrated during construction, before
 		// any public or reconciliation work became reachable. Resume their backend
 		// commands in the background so a down pinned node delays only its own lease.
-		safeGo(&wg, errChan, "maintenance recovery", func() error {
+		comps.Go("maintenance recovery", func() error {
 			return maintenanceService.Start(workCtx, cfg.ReconciliationInterval)
 		})
 
@@ -636,34 +613,34 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 
 		// Start event subscriber (single reader, multiple consumers via Subscribe())
-		safeGo(&wg, errChan, "event subscriber", func() error {
+		comps.Go("event subscriber", func() error {
 			return eventSub.Start(workCtx)
 		})
 
 		// Start event bridge (subscribes to eventSub, forwards to Watermill)
-		safeGo(&wg, errChan, "event bridge", func() error {
+		comps.Go("event bridge", func() error {
 			return eventBridge.Start(workCtx)
 		})
 
 		// Start watcher for cross-provider events (subscribes to eventSub)
-		safeGo(&wg, errChan, "watcher", func() error {
+		comps.Go("watcher", func() error {
 			return leaseWatcher.Start(workCtx)
 		})
 
 		// Start withdrawal scheduler
-		safeGo(&wg, errChan, "scheduler", func() error {
+		comps.Go("scheduler", func() error {
 			return withdrawScheduler.Start(workCtx)
 		})
 
 		// Start periodic reconciliation
-		safeGo(&wg, errChan, "reconciler", func() error {
+		comps.Go("reconciler", func() error {
 			return reconciler.Start(workCtx)
 		})
 
 		// Start online placement snapshots after the startup reconcile, so the
 		// first one captures reconciled state.
 		if placementSnapshots != nil {
-			safeGo(&snapshotWG, errChan, "placement snapshots", func() error {
+			comps.GoStoreReader("placement snapshots", func() error {
 				return placementSnapshots.Run(workCtx)
 			})
 		}
@@ -676,7 +653,7 @@ func run(cmd *cobra.Command, args []string) error {
 		// providerd (ENG-688).
 		if signerPool.HasSubSigners() {
 			bankQ := banktypes.NewQueryClient(chainClient.Conn())
-			safeGo(&wg, errChan, "sub-signer maintenance", func() error {
+			comps.Go("sub-signer maintenance", func() error {
 				ticker := time.NewTicker(cfg.SubSignerFundCheckInterval)
 				defer ticker.Stop()
 				for {
@@ -718,14 +695,12 @@ func run(cmd *cobra.Command, args []string) error {
 			"backends", len(cfg.Backends),
 		)
 
-		// Wait for shutdown signal or error
-		select {
-		case <-workCtx.Done():
+		// A shutdown signal and a component failure both end the work context.
+		// The supervisor logs a failure when it records it.
+		<-workCtx.Done()
+		if comps.Err() == nil {
 			slog.Info("received shutdown signal")
-		case err := <-errChan:
-			slog.Error("component error", "error", err)
 		}
-
 		return nil
 	}()
 	cancelWork()
@@ -776,21 +751,13 @@ func run(cmd *cobra.Command, args []string) error {
 	// Components check ctx.Done() first, so they'll exit cleanly.
 	eventSub.Close()
 
-	// Wait for all goroutines to finish with timeout.
+	// Wait for all components to finish with timeout.
 	// This includes provisionMgr.Start() which runs the Watermill router.
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	timedOut := false
-	select {
-	case <-done:
-		slog.Info("all components stopped gracefully")
-	case <-shutdownCtx.Done():
-		timedOut = true
+	timedOut := !comps.Wait(shutdownCtx)
+	if timedOut {
 		slog.Warn("shutdown timed out, some components may not have stopped cleanly")
+	} else {
+		slog.Info("all components stopped gracefully")
 	}
 
 	// Join the snapshot loop before the stores it reads close. Once workCtx is
@@ -799,7 +766,7 @@ func run(cmd *cobra.Command, args []string) error {
 	// the stores is still safe: bbolt's Close waits for every open read
 	// transaction, and a captured cut's transactions end within the copy
 	// deadline.
-	if !joinWithin(shutdownCtx, &snapshotWG) {
+	if !comps.WaitStoreReaders(shutdownCtx) {
 		slog.Warn("placement snapshot loop still running at shutdown; closing the stores anyway")
 	}
 
@@ -815,19 +782,22 @@ func run(cmd *cobra.Command, args []string) error {
 	if timedOut {
 		gracePeriod := 2 * time.Second
 		slog.Info("waiting additional grace period for lingering components", "duration", gracePeriod)
-		select {
-		case <-done:
+		graceCtx, cancelGrace := context.WithTimeout(context.Background(), gracePeriod)
+		if comps.Wait(graceCtx) {
 			slog.Info("all components stopped after grace period")
-		case <-time.After(gracePeriod):
+		} else {
 			slog.Warn("some components did not stop within grace period")
 		}
+		cancelGrace()
 	}
 
 	slog.Info("providerd stopped")
 	if errors.Is(startupErr, context.Canceled) {
-		return nil
+		startupErr = nil
 	}
-	return startupErr
+	// The single exit after the API started: a recorded component failure
+	// always reaches the exit status.
+	return errors.Join(startupErr, comps.Err())
 }
 
 // runInitialProviderWork owns the finite startup sequence. Transient errors are

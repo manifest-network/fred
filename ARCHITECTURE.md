@@ -542,28 +542,24 @@ Retention records carry an optional cooperative `partition` — a sub-tenant gro
 
 ### Goroutine Management
 
-Long-running goroutines are tracked and cancelable. Top-level daemon
-components use `safeGo()`, which turns a panic into a component error;
-component-owned child loops use the same shape locally and are joined by their
-owner before its stores close. Not every goroutine is panic-contained: the chain
-event subscriber's WebSocket read goroutine has no `recover()`, so a panic while
-handling a chain message ends the process.
+Long-running goroutines are tracked and cancelable. Top-level providerd
+components run under the `components` supervisor (`cmd/providerd/components.go`).
+A component runs until shutdown begins. Each of these is a recorded failure:
 
-```go
-// Uses sync.WaitGroup.Go (Go 1.25+) for cleaner goroutine management.
-func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func() error) {
-    wg.Go(func() {
-        defer func() {
-            if r := recover(); r != nil {
-                errChan <- fmt.Errorf("%s panic: %v", component, r)
-            }
-        }()
-        if err := fn(); err != nil && !errors.Is(err, context.Canceled) {
-            errChan <- fmt.Errorf("%s error: %w", component, err)
-        }
-    })
-}
-```
+- an error other than cancellation;
+- a panic, logged with its stack;
+- returning before shutdown for any reason, a nil error included.
+
+The first failure cancels the work context, so it starts shutdown, and `run`
+returns every recorded failure. providerd therefore exits non-zero after a
+component failure, and `Restart=on-failure` restarts it. The supervisor owns
+the groups shutdown joins (runtime components, and the store readers joined
+before the stores close), and a package test keeps every other long-lived
+goroutine in `cmd/providerd` out. Component-owned child loops use the same
+recover shape locally and are joined by their owner before its stores close.
+Not every goroutine is panic-contained: the chain event subscriber's WebSocket
+read goroutine has no `recover()`, so a panic while handling a chain message
+ends the process.
 
 ### Startup Sequence
 
@@ -667,7 +663,7 @@ stopped and rerun the same mode against unchanged input.
 ### Graceful Shutdown
 
 ```
-1. Receive SIGINT/SIGTERM (or a component error)
+1. Receive SIGINT/SIGTERM, or record a component failure
    └─ the work context is canceled at once, stopping the event subscriber,
       event bridge, lease watcher, withdrawal scheduler, periodic reconciler,
       maintenance recovery, placement snapshots and sub-signer maintenance.
@@ -699,6 +695,8 @@ stopped and rerun the same mode against unchanged input.
 ```
 
 That sequence and the configurable `shutdown_timeout` belong to `providerd`.
+providerd exits 0 after a signal when no component failed. A component failure
+exits 1, including one recorded while shutting down.
 Docker-backend shuts down on SIGINT/SIGTERM, a serving-listener failure, or a
 terminal runtime storage-authority withdrawal, which publishes its first cause
 to the main loop. Every trigger closes the listener and shares one 75-second

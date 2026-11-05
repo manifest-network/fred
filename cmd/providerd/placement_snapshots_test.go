@@ -63,9 +63,9 @@ func TestPlacementSnapshotsBindTheConfiguredDirectory(t *testing.T) {
 }
 
 // TestShutdownJoinsPlacementSnapshotsBeforeTheStoresClose pins the composition
-// root: the snapshot loop runs on its own WaitGroup, and shutdown joins it
-// within the shutdown budget before the provision manager closes the payload
-// store.
+// root: the snapshot loop runs as the supervisor's store reader, and shutdown
+// joins the store readers within the shutdown budget before the provision
+// manager closes the payload store.
 func TestShutdownJoinsPlacementSnapshotsBeforeTheStoresClose(t *testing.T) {
 	fset := token.NewFileSet()
 	source, err := parser.ParseFile(fset, "main.go", nil, 0)
@@ -83,34 +83,28 @@ func TestShutdownJoinsPlacementSnapshotsBeforeTheStoresClose(t *testing.T) {
 		if !ok {
 			return true
 		}
-		groupArgument := func(index int) bool {
-			if len(call.Args) <= index {
-				return false
-			}
-			group, ok := call.Args[index].(*ast.UnaryExpr)
-			if !ok {
-				return false
-			}
-			name, ok := group.X.(*ast.Ident)
-			return ok && name.Name == "snapshotWG"
+		function, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
 		}
-		switch function := call.Fun.(type) {
-		case *ast.Ident:
-			switch {
-			case function.Name == "safeGo" && groupArgument(0):
+		owner, ok := function.X.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		switch {
+		case owner.Name == "comps" && function.Sel.Name == "GoStoreReader":
+			name, ok := call.Args[0].(*ast.BasicLit)
+			if ok && name.Value == `"placement snapshots"` {
 				started = append(started, call.Pos())
-			case function.Name == "joinWithin" && groupArgument(1):
-				joined = append(joined, call.Pos())
 			}
-		case *ast.SelectorExpr:
-			owner, ok := function.X.(*ast.Ident)
-			if ok && owner.Name == "provisionMgr" && function.Sel.Name == "Close" {
-				closed = append(closed, call.Pos())
-			}
+		case owner.Name == "comps" && function.Sel.Name == "WaitStoreReaders":
+			joined = append(joined, call.Pos())
+		case owner.Name == "provisionMgr" && function.Sel.Name == "Close":
+			closed = append(closed, call.Pos())
 		}
 		return true
 	})
-	require.Len(t, started, 1, "the snapshot loop starts on snapshotWG")
+	require.Len(t, started, 1, "the snapshot loop starts as a store reader")
 	require.Len(t, joined, 1)
 	require.Len(t, closed, 1)
 	assert.Less(t, started[0], joined[0])
