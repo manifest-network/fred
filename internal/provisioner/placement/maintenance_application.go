@@ -120,6 +120,20 @@ type maintenanceHeld struct {
 	dispatchMu   sync.Mutex
 }
 
+// tryDispatch runs dispatch only if it takes held's dispatch lane without
+// waiting; a live request that owns the lane keeps it, and dispatch is
+// skipped. The lane is released however dispatch ends, a panic included, and
+// released then runs once the lane is free, so no failure inside dispatch can
+// leave the claim's lane held.
+func (held *maintenanceHeld) tryDispatch(dispatch func() error, released func()) error {
+	if !held.dispatchMu.TryLock() {
+		return nil
+	}
+	defer released()
+	defer held.dispatchMu.Unlock()
+	return dispatch()
+}
+
 func (authority *MaintenanceCoordinator) Application(
 	events MaintenanceOrderedEvents,
 	recoveryTimeout time.Duration,
@@ -561,31 +575,47 @@ func (application *MaintenanceApplication) releaseSettled(pending map[string]mai
 		}
 		// A live request owns its own settlement and release. Waiting here would
 		// hold every backend's recovery behind that request's independent context.
-		if !held.dispatchMu.TryLock() {
-			continue
-		}
-		command := held.journalClaim.Command()
-		id := held.id
-		if command.Valid() {
-			id = command.ID()
-		}
-		record, found, err := application.coordinator.lookupMaintenanceCommand(leaseUUID, id)
-		switch {
-		case err != nil:
+		err := held.tryDispatch(func() error {
+			command := held.journalClaim.Command()
+			id := held.id
+			if command.Valid() {
+				id = command.ID()
+			}
+			record, found, err := application.coordinator.lookupMaintenanceCommand(leaseUUID, id)
+			switch {
+			case err != nil:
+				return err
+			case !found && command.Valid():
+				return errors.New("retained maintenance claim has no durable command")
+			case !found || record.Outcome() != MaintenanceOutcomePending:
+				application.release(leaseUUID, held)
+			}
+			return nil
+		}, func() {})
+		if err != nil {
 			errs = append(errs, err)
-		case !found && command.Valid():
-			errs = append(errs, errors.New("retained maintenance claim has no durable command"))
-		case !found || record.Outcome() != MaintenanceOutcomePending:
-			application.release(leaseUUID, held)
 		}
-		held.dispatchMu.Unlock()
 	}
 	return errors.Join(errs...)
 }
 
 // RecoverPending owns recovery selection, exact reauthorization, backend
 // invocation, and settlement. Callers cannot choose a claim or outcome.
+//
+// Recovery runs at every start and then on every interval, so a panic that
+// escaped it would repeat on every restart. The pass, each backend lane and
+// each recovered command therefore run behind worker boundaries. A panic fails
+// only the unit it occurred in and is recovered instead of ending the process.
+// The boundary settles and releases nothing, so a command whose receipt is
+// still pending is retried by a later pass.
 func (application *MaintenanceApplication) RecoverPending(ctx context.Context) error {
+	_, err := runBounded(workerMaintenanceRecovery, func() (struct{}, error) {
+		return struct{}{}, application.recoverPending(ctx)
+	})
+	return err
+}
+
+func (application *MaintenanceApplication) recoverPending(ctx context.Context) error {
 	if !application.Valid() {
 		return ErrInvalidMaintenanceCoordinator
 	}
@@ -624,55 +654,72 @@ func (application *MaintenanceApplication) RecoverPending(ctx context.Context) e
 		byBackend[candidate.backend] = append(byBackend[candidate.backend], maintenanceRecoveryEntry{candidate: candidate, held: held})
 	}
 	application.recovery.retain(byBackend)
-	results := make(chan []error, len(byBackend))
-	var group sync.WaitGroup
+	passes := make([]*maintenanceRecoveryPass, 0, len(byBackend))
 	for backendName, entries := range byBackend {
-		pass := application.recovery.begin(backendName, entries)
-		group.Go(func() {
-			var laneErrors []error
-			laneCtx, cancel := context.WithTimeout(ctx, application.recoveryTimeout)
-			defer cancel()
-			for {
-				entry, selected := pass.next(laneCtx)
-				if !selected {
-					break
-				}
-				// A live request may own the command after selection. Its dispatch
-				// remains exclusive; a later recovery batch can revisit it.
-				completionChanged := application.coordinator.coordinator.store.completionCheckpoint()
-				if !entry.held.dispatchMu.TryLock() {
-					continue
-				}
-				candidate := entry.candidate
-				claim, pending, recoverErr := application.coordinator.coordinator.store.pendingMaintenanceClaim(candidate.lease, candidate.id)
-				switch {
-				case recoverErr != nil:
-				case !pending:
-					application.release(candidate.lease, entry.held)
-				default:
-					entry.held.journalClaim = claim
-					applied := application.reauthorizeAndDispatch(laneCtx, entry.held)
-					if applied.outcome != MaintenanceApplicationAccepted &&
-						applied.outcome != MaintenanceApplicationNotFound &&
-						applied.outcome != MaintenanceApplicationBackendInvalidState &&
-						applied.outcome != MaintenanceApplicationBackendValidation {
-						recoverErr = applied.err
-					}
-				}
-				entry.held.dispatchMu.Unlock()
-				completionChanged()
-				if recoverErr != nil {
-					laneErrors = append(laneErrors, fmt.Errorf("recover maintenance %s for lease %s: %w", candidate.id, candidate.lease, recoverErr))
-				}
-			}
-			results <- laneErrors
-		})
+		passes = append(passes, application.recovery.begin(backendName, entries))
 	}
-	group.Wait()
-	close(results)
+	// Every pass is built before the first lane starts, so nothing that can
+	// fail sits between starting a lane and joining it. A pass owns its backend
+	// lane until joined, and recoveryMu is held until every lane is.
+	lanes := make([]<-chan workerResult[struct{}], 0, len(passes))
+	for _, pass := range passes {
+		lanes = append(lanes, startWorker(workerMaintenanceRecovery, func() (struct{}, error) {
+			return struct{}{}, application.recoverLane(ctx, pass)
+		}))
+	}
 	var errs []error
-	for laneErrors := range results {
-		errs = append(errs, laneErrors...)
+	for _, lane := range lanes {
+		if result := <-lane; result.err != nil {
+			errs = append(errs, result.err)
+		}
 	}
 	return errors.Join(errs...)
+}
+
+// recoverLane drives one backend's recovery pass. Each command is recovered
+// behind its own boundary, so one lease's panic is that command's error and
+// the lane continues with the backend's other commands.
+func (application *MaintenanceApplication) recoverLane(ctx context.Context, pass *maintenanceRecoveryPass) error {
+	laneCtx, cancel := context.WithTimeout(ctx, application.recoveryTimeout)
+	defer cancel()
+	var laneErrors []error
+	for {
+		entry, selected := pass.next(laneCtx)
+		if !selected {
+			return errors.Join(laneErrors...)
+		}
+		_, err := runBounded(workerMaintenanceRecovery, func() (struct{}, error) {
+			return struct{}{}, application.recoverCommand(laneCtx, entry)
+		})
+		if err != nil {
+			candidate := entry.candidate
+			laneErrors = append(laneErrors, fmt.Errorf("recover maintenance %s for lease %s: %w", candidate.id, candidate.lease, err))
+		}
+	}
+}
+
+// recoverCommand recovers one selected command. A live request may own the
+// command after selection; its dispatch remains exclusive, and a later
+// recovery batch can revisit it.
+func (application *MaintenanceApplication) recoverCommand(ctx context.Context, entry maintenanceRecoveryEntry) error {
+	store := application.coordinator.coordinator.store
+	return entry.held.tryDispatch(func() error {
+		candidate := entry.candidate
+		claim, pending, err := store.pendingMaintenanceClaim(candidate.lease, candidate.id)
+		switch {
+		case err != nil:
+			return err
+		case !pending:
+			application.release(candidate.lease, entry.held)
+			return nil
+		}
+		entry.held.journalClaim = claim
+		applied := application.reauthorizeAndDispatch(ctx, entry.held)
+		switch applied.outcome {
+		case MaintenanceApplicationAccepted, MaintenanceApplicationNotFound,
+			MaintenanceApplicationBackendInvalidState, MaintenanceApplicationBackendValidation:
+			return nil
+		}
+		return applied.err
+	}, store.completionCheckpoint())
 }

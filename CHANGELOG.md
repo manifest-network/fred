@@ -16,6 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- providerd no longer exits when pending maintenance recovery or a chain lease-inventory read panics. Recovery runs at every start, so such a panic used to crash-loop providerd. Now a panic fails only the unit it hit: one recovered command stays pending for the next pass while that backend's other commands continue, and a failed inventory read gives that reconciliation sweep no inventory, so it takes no action. Each panic is logged with its stack and counted in `fred_background_goroutine_panics_total{component="maintenance_recovery"}` or `fred_provisioner_reconciler_panics_total{stage="fetch_chain_leases"}`. Both series are exported at 0 from startup.
+
 ### Security
 
 ## [0.14.1] - 2026-11-05

@@ -205,7 +205,8 @@ var (
 	// from crashing the fred process. Any non-zero value is a latent bug
 	// to fix at its source — not business-as-usual. Label values:
 	// "process_lease", "process_orphan", "fetch_provisions", "fetch_retentions",
-	// "fetch_releases", "check_placement_marker", "placement_cleanup".
+	// "fetch_releases", "fetch_chain_leases", "check_placement_marker",
+	// "placement_cleanup".
 	ReconcilerPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
