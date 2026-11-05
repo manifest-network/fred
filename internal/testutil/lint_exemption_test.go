@@ -1,7 +1,7 @@
 package testutil
 
 // This file pins the per-file forbidigo exemptions of .golangci.yml
-// (ENG-1117, ENG-799, ENG-1125, ENG-1453). An exemption names the rules it lifts by a bracketed tag that
+// (ENG-1117, ENG-799, ENG-1125, ENG-1453, ENG-2117). An exemption names the rules it lifts by a bracketed tag that
 // starts their messages, and golangci-lint matches an exclusion's text against
 // the whole issue text. Keyed on prose instead, a new rule that reused the
 // phrase would silently be exempt too; keyed on the wrong tag, or widened to
@@ -112,6 +112,14 @@ var forbidigoExemptions = map[string]struct {
 	"[lease-end]": {
 		patterns: []string{`^endableLease$`},
 		files:    []string{"internal/provisioner/placement/provider_control_plane.go"},
+	},
+	// Payload admission excludes a restore of the same lease (ENG-2117).
+	"[payload-insert]": {
+		patterns: []string{`(payloads|payloadStore)\.Store$`},
+		files: []string{
+			"internal/provisioner/placement/payload_admission.go",
+			"internal/provisioner/reconciler.go",
+		},
 	},
 }
 

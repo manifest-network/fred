@@ -354,7 +354,7 @@ func persistAmbiguousRestoreAttempt(
 		redeliverySource: source,
 	})
 	setTestProviderControlPlane(t, execution, chain, nil)
-	restore, err := execution.RestoreCoordinator(nil)
+	restore, err := restoreAuthorityForTest(execution, nil)
 	require.NoError(t, err)
 	request, err := placement.NewRestoreApplicationRequest(
 		target.Uuid, target.Tenant, redeliverySource,

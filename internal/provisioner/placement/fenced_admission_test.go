@@ -69,7 +69,7 @@ func TestRestoreFromAFencedBackendIsRefusedBeforeAdmission(t *testing.T) {
 				State: state, Items: []billingtypes.LeaseItem{{SkuUuid: "sku-test", Quantity: 1}},
 			}, nil
 		}))
-	authority, err := execution.RestoreCoordinator(nil)
+	authority, err := restoreAuthorityForTest(execution, nil)
 	require.NoError(t, err)
 	request, err := NewRestoreApplicationRequest(targetLease, "tenant-test", sourceLease)
 	require.NoError(t, err)

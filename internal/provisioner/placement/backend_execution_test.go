@@ -386,7 +386,7 @@ func TestRestoreApplicationInvokesBackendOnceAcrossConcurrentCopies(t *testing.T
 		}, nil
 	})
 	setProviderControlPlaneForTest(t, execution, reader)
-	authority, err := execution.RestoreCoordinator(nil)
+	authority, err := restoreAuthorityForTest(execution, nil)
 	require.NoError(t, err)
 	request, err := NewRestoreApplicationRequest(targetLease, "tenant-test", sourceLease)
 	require.NoError(t, err)

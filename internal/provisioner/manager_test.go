@@ -2765,7 +2765,7 @@ func TestManager_OverwritePayload_ReplacesStoredPayload(t *testing.T) {
 
 	original := []byte("original manifest")
 	updated := []byte("updated manifest")
-	require.True(t, manager.StorePayload(handlerTestLeaseOne, original))
+	require.Equal(t, placement.PayloadAdmitted, manager.AdmitPayload(t.Context(), handlerTestLeaseOne, original))
 
 	require.NoError(t, manager.OverwritePayload(handlerTestLeaseOne, updated))
 

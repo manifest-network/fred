@@ -402,3 +402,16 @@ func bindExecutionWithPolicyForTest(
 	require.NoError(t, err)
 	return execution
 }
+
+// restoreAuthorityForTest mints a restore coordinator the way providerd does,
+// from a provision authority, here one without a payload store.
+func restoreAuthorityForTest(
+	execution *ExecutionCoordinator,
+	observe RestoreStartObserver,
+) (*RestoreCoordinator, error) {
+	provisions, err := execution.ProvisionCoordinatorWithPayloads(nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return provisions.RestoreCoordinator(observe)
+}

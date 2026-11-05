@@ -5317,7 +5317,7 @@ func newRestoreServiceForTest(
 	_, execution := newRestoreAuthorityForTest(
 		t, providerUUID, sourcePlacements, router, registry, leases, policies...,
 	)
-	restoreCoordinator, err := execution.RestoreCoordinator(nil)
+	restoreCoordinator, err := restoreAuthorityForTest(execution, nil)
 	require.NoError(t, err)
 	service, err := restoreapp.NewService(restoreapp.Config{
 		Coordinator: restoreCoordinator,

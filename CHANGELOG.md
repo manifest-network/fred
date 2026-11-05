@@ -16,6 +16,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A payload upload and a restore no longer both take the same lease. A restore
+  redeploys the source lease's retained manifest and never reads a payload, but
+  `POST /v1/leases/{uuid}/data` on a lease being restored answered `202`, and the
+  stored upload was then deployed by the next re-provision in place of the
+  restored manifest. Fred now admits each only under the lease's lifecycle
+  claim: an upload into a lease a restore owns is refused with `409` and
+  `reason: restore_in_progress`, and a restore into a lease that already holds a
+  payload is refused with `409` and `reason: target_has_payload`. An upload into
+  a lease that already has a confirmed deployment is refused with `409`, and one
+  into a lease whose placement awaits operator repair with `503`. Change a
+  restored lease's manifest with `POST /update` once the restore finishes.
+  (ENG-2117)
+
 ### Security
 
 ## [0.14.0] - 2026-10-28

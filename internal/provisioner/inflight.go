@@ -8,10 +8,21 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
+// RestoreCoordinator is minted from the same provision authority as
+// AdmitPayload, so a restore and a payload upload exclude each other.
 func (m *Manager) RestoreCoordinator(
 	observe placement.RestoreStartObserver,
 ) (*placement.RestoreCoordinator, error) {
-	return m.executionCoordinator.RestoreCoordinator(observe)
+	return m.provisionCoordinator.RestoreCoordinator(observe)
+}
+
+// AdmitPayload is the only tenant path that inserts a lease's payload; an
+// update of an ACTIVE lease overwrites it through the maintenance persister.
+// It refuses a lease a restore owns (ENG-2117).
+func (m *Manager) AdmitPayload(
+	ctx context.Context, leaseUUID string, payload []byte,
+) placement.PayloadAdmission {
+	return m.payloadAdmitter.Admit(ctx, leaseUUID, payload)
 }
 
 func (m *Manager) MaintenanceCoordinator(

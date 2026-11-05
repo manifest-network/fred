@@ -80,7 +80,7 @@ func TestFleet_DuplicateResponseCannotAuthorizeUninstalledLifecycleGeneration(t 
 		)
 
 		setTestProviderControlPlane(t, f.execution, f.chain, nil)
-		restoreCoordinator, err := f.execution.RestoreCoordinator(nil)
+		restoreCoordinator, err := restoreAuthorityForTest(f.execution, nil)
 		require.NoError(t, err)
 		service, err := restoreapp.NewService(restoreapp.Config{
 			Coordinator: restoreCoordinator,

@@ -88,7 +88,7 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 	})
 
 	setTestProviderControlPlane(t, f.execution, f.chain, nil)
-	restoreCoordinator, err := f.execution.RestoreCoordinator(
+	restoreCoordinator, err := restoreAuthorityForTest(f.execution,
 		placement.RestoreStartObserver(func(leaseUUID, backendName string) {
 			events.Publish(backend.LeaseStatusEvent{
 				LeaseUUID: leaseUUID,

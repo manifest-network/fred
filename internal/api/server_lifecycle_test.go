@@ -188,8 +188,8 @@ func (m *testPayloadPublisher) PublishPayload(event payload.Event) error {
 	return nil
 }
 
-func (m *testPayloadPublisher) StorePayload(leaseUUID string, payload []byte) bool {
-	return true
+func (m *testPayloadPublisher) AdmitPayload(context.Context, string, []byte) placement.PayloadAdmission {
+	return placement.PayloadAdmitted
 }
 
 func (m *testPayloadPublisher) DeletePayload(leaseUUID string) {}

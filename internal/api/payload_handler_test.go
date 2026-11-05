@@ -5,16 +5,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/testutil"
@@ -23,8 +26,9 @@ import (
 // mockPayloadPublisher implements PayloadPublisher for testing.
 type mockPayloadPublisher struct {
 	publishPayloadFunc func(event payload.Event) error
-	storePayloadFunc   func(leaseUUID string, payload []byte) bool
 	deletePayloadFunc  func(leaseUUID string)
+	// refusal, when set, is returned by AdmitPayload instead of storing.
+	refusal placement.PayloadAdmission
 
 	publishedEvents []payload.Event
 	storedPayloads  map[string][]byte
@@ -45,15 +49,17 @@ func (m *mockPayloadPublisher) PublishPayload(event payload.Event) error {
 	return nil
 }
 
-func (m *mockPayloadPublisher) StorePayload(leaseUUID string, payload []byte) bool {
-	if m.storePayloadFunc != nil {
-		return m.storePayloadFunc(leaseUUID, payload)
+func (m *mockPayloadPublisher) AdmitPayload(
+	_ context.Context, leaseUUID string, payload []byte,
+) placement.PayloadAdmission {
+	if m.refusal != placement.PayloadAdmissionInvalid {
+		return m.refusal
 	}
 	if _, exists := m.storedPayloads[leaseUUID]; exists {
-		return false
+		return placement.PayloadAlreadyStored
 	}
 	m.storedPayloads[leaseUUID] = payload
-	return true
+	return placement.PayloadAdmitted
 }
 
 func (m *mockPayloadPublisher) DeletePayload(leaseUUID string) {
@@ -447,6 +453,103 @@ func TestPayloadHandler_Success(t *testing.T) {
 	assert.Equal(t, testutil.ValidUUID1, event.LeaseUUID)
 	assert.Equal(t, kp.Address, event.Tenant)
 	assert.Equal(t, metaHash, event.MetaHashHex)
+}
+
+// TestPayloadHandler_RefusedAdmission pins every refused admission outcome to
+// its response, and that none of them stores or announces the payload. A
+// restore target is still PENDING with a matching meta_hash, so every earlier
+// check accepts its upload (ENG-2117). An outcome the handler does not know is
+// an internal error, never an admission.
+func TestPayloadHandler_RefusedAdmission(t *testing.T) {
+	tests := []struct {
+		admission  placement.PayloadAdmission
+		wantStatus int
+		wantBody   ErrorResponse
+		wantMetric string
+	}{
+		{
+			admission:  placement.PayloadRestoreOwned,
+			wantStatus: http.StatusConflict,
+			wantBody: ErrorResponse{
+				Error: errMsgRestoreInProgress, Code: http.StatusConflict, Reason: "restore_in_progress",
+			},
+			wantMetric: "restore_in_progress",
+		},
+		{
+			admission:  placement.PayloadAlreadyStored,
+			wantStatus: http.StatusConflict,
+			wantBody:   ErrorResponse{Error: "payload already received", Code: http.StatusConflict},
+			wantMetric: "conflict",
+		},
+		{
+			admission:  placement.PayloadNotStored,
+			wantStatus: http.StatusConflict,
+			wantBody:   ErrorResponse{Error: "payload already received", Code: http.StatusConflict},
+			wantMetric: "conflict",
+		},
+		{
+			admission:  placement.PayloadLeaseDeployed,
+			wantStatus: http.StatusConflict,
+			wantBody:   ErrorResponse{Error: errMsgLeaseDeployed, Code: http.StatusConflict},
+			wantMetric: "conflict",
+		},
+		{
+			admission:  placement.PayloadPlacementUnusable,
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   ErrorResponse{Error: errMsgServiceUnavailable, Code: http.StatusServiceUnavailable},
+			wantMetric: "error",
+		},
+		{
+			admission:  placement.PayloadLeaseUnavailable,
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   ErrorResponse{Error: errMsgServiceUnavailable, Code: http.StatusServiceUnavailable},
+			wantMetric: "error",
+		},
+		{
+			admission:  placement.PayloadAdmission(255),
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   ErrorResponse{Error: errMsgInternalServerError, Code: http.StatusInternalServerError},
+			wantMetric: "error",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.admission.String(), func(t *testing.T) {
+			kp := testutil.NewTestKeyPair("payload-handler-test-refused")
+			payload := []byte("test payload")
+			metaHash := testutil.ComputePayloadHash(payload)
+			metaHashBytes, _ := hex.DecodeString(metaHash)
+			client := &mockPayloadChainClient{
+				getLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+					return &billingtypes.Lease{
+						Uuid:         leaseUUID,
+						State:        billingtypes.LEASE_STATE_PENDING,
+						Tenant:       kp.Address,
+						ProviderUuid: testutil.ValidUUID1,
+						MetaHash:     metaHashBytes,
+					}, nil
+				},
+			}
+			publisher := newMockPayloadPublisher()
+			publisher.refusal = tt.admission
+			handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest", placement.NoBillingOnlySKUs())
+			counter := metrics.PayloadUploadsTotal.WithLabelValues(tt.wantMetric)
+			before := promtestutil.ToFloat64(counter)
+
+			tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())
+			req := createPayloadRequest(t, "POST", "/v1/leases/"+testutil.ValidUUID1+"/data", testutil.ValidUUID1, payload, "Bearer "+tokenStr)
+			rr := httptest.NewRecorder()
+			handler.HandlePayloadUpload(rr, req)
+
+			require.Equal(t, tt.wantStatus, rr.Code)
+			var body ErrorResponse
+			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+			assert.Equal(t, tt.wantBody, body)
+			assert.Empty(t, publisher.storedPayloads)
+			assert.Empty(t, publisher.publishedEvents, "a refused upload must not trigger provisioning")
+			assert.Empty(t, publisher.deletedUUIDs, "a refused upload stored nothing to roll back")
+			assert.Equal(t, before+1, promtestutil.ToFloat64(counter))
+		})
+	}
 }
 
 func TestPayloadHandler_PublishFailureRollback(t *testing.T) {
