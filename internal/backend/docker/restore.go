@@ -1586,23 +1586,13 @@ func (b *Backend) checkDemoteFitWithResourceProfiles(
 		return fmt.Errorf("%w: invalid restore resource authority: %w", backend.ErrValidation, err)
 	}
 
-	var oldResourceProfiles []shared.SKUResourceSnapshot
-	if len(rec.ResourceProfiles) > 0 {
-		oldResourceProfiles = rec.ResourceProfiles
-	} else {
-		// True v0.13 rows have no immutable authority. Resolve once for this
-		// read-only gate. A failed restore's rollback freezes the same source
-		// authority before handing the retention row back; a successful restore
-		// deletes the source finalizer. An unavailable old SKU remains unknown and
-		// therefore takes the conservative measurement/refusal path below.
-		oldResourceProfiles, _ = b.resolveResourceProfiles(rec.Items)
+	oldResourceProfiles, err := retainedResourceProfiles(*rec)
+	if err != nil {
+		return fmt.Errorf("%w: retained resource authority: %w", backend.ErrInvalidState, err)
 	}
-	oldResources := make(map[string]shared.SKUResourceSnapshot)
-	if len(oldResourceProfiles) > 0 {
-		oldResources, err = resourceSnapshotMap(rec.Items, oldResourceProfiles)
-		if err != nil {
-			return fmt.Errorf("%w: invalid retained resource authority: %w", backend.ErrInvalidState, err)
-		}
+	oldResources, err := resourceSnapshotMap(rec.Items, oldResourceProfiles)
+	if err != nil {
+		return fmt.Errorf("%w: invalid retained resource authority: %w", backend.ErrInvalidState, err)
 	}
 	oldSKU := make(map[string]string, len(rec.Items))
 	for _, it := range rec.Items {
@@ -1620,9 +1610,8 @@ func (b *Backend) checkDemoteFitWithResourceProfiles(
 				backend.ErrValidation, it.SKU, diskErr)
 		}
 		// Promote/same-tier optimization: compare against the immutable profile
-		// captured when the source became retained. Legacy records without a
-		// snapshot fall back to the current configuration; an unresolved legacy
-		// SKU conservatively takes the measurement path.
+		// frozen onto the retained record. A destination service with no source
+		// row conservatively takes the measurement path.
 		oldResourcesForSKU, oldProfileOK := oldResources[oldSKU[it.ServiceName]]
 		oldDiskMB := int64(0)
 		if oldProfileOK {
@@ -1955,21 +1944,14 @@ func (b *Backend) Restore(ctx context.Context, request backend.RestoreRequest) e
 	// cannot under-gate against the reservation). A fitting multi-volume promote is
 	// admitted and the pool cannot be over-committed (ENG-545).
 	//
-	// We pass only the OLD retained footprint. New records carry an immutable
-	// profile snapshot, so a later SKU removal/resize cannot reprice already-held
-	// bytes. Legacy records fall back to the current config; an unresolved legacy
-	// SKU contributes zero, making the promote delta larger (over-deny, never
-	// over-admit).
-	oldDiskMB, oldUnresolved, oldDiskErr := b.retentionEntryDiskMB(*rec)
+	// We pass only the OLD retained footprint, sized from the record's frozen
+	// snapshot, so a later SKU removal/resize cannot reprice already-held bytes.
+	oldDiskMB, oldDiskErr := retentionEntryDiskMB(*rec)
 	if oldDiskErr != nil {
 		b.removeProvision(req.LeaseUUID)
 		return b.refuseOperationIntent(intent, fmt.Errorf(
 			"%w: retained resource footprint is invalid: %w", backend.ErrInvalidState, oldDiskErr,
 		))
-	}
-	if len(oldUnresolved) > 0 {
-		logger.Warn("restore disk gate: retained record references unresolved SKU profile(s); retained footprint undercounted, admission is more conservative",
-			"retained_unresolved_skus", oldUnresolved)
 	}
 	adoptInstances := make([]shared.ResolvedAdoptInstance, 0, restoreQuantity)
 	for _, item := range req.Items {
@@ -2349,22 +2331,13 @@ func (b *Backend) restoreRetainedVolumeQuotasUsing(
 		return nil, fmt.Errorf("validate restore source quantities: %w", err)
 	}
 
-	// New records already carry immutable authority. For a pre-snapshot row,
-	// resolve the currently configured source SKUs once and return that canonical
-	// snapshot to the caller. The caller applies these exact caps and commits this
-	// same value in its generation CAS; a crash before the CAS leaves Restoring
-	// and live-counted, while a successful CAS makes physical and durable truth
-	// observable atomically. An unavailable legacy SKU fails closed.
-	resourceProfiles := shared.CloneSKUResourceSnapshot(rec.ResourceProfiles)
-	if len(resourceProfiles) == 0 {
-		var err error
-		resourceProfiles, err = b.resolveResourceProfiles(rec.Items)
-		if err != nil {
-			return nil, fmt.Errorf("resolve legacy restore source resource profiles: %w", err)
-		}
-	}
-	if err := validateDockerResourceProfiles(rec.Items, resourceProfiles); err != nil {
-		return nil, fmt.Errorf("validate restore source resource profiles: %w", err)
+	// The source row carries its frozen snapshot. The caller applies these exact
+	// caps and commits this same value in its generation CAS; a crash before the
+	// CAS leaves Restoring and live-counted, while a successful CAS makes physical
+	// and durable truth observable atomically.
+	resourceProfiles, err := retainedResourceProfiles(*rec)
+	if err != nil {
+		return nil, fmt.Errorf("restore source resource profiles: %w", err)
 	}
 	if len(rec.RetainedVolumeNames) == 0 {
 		return resourceProfiles, nil
@@ -2494,12 +2467,9 @@ func (b *Backend) revertRestoreSourceWithAccounting(
 	}
 	exact := *rec
 	exact.ResourceProfiles = shared.CloneSKUResourceSnapshot(resourceProfiles)
-	handoffMB, unresolved, err := b.retentionEntryDiskMB(exact)
+	handoffMB, err := retentionEntryDiskMB(exact)
 	if err != nil {
 		return false, fmt.Errorf("size restore rollback accounting handoff: %w", err)
-	}
-	if len(unresolved) > 0 {
-		return false, fmt.Errorf("restore rollback accounting has unresolved SKUs: %v", unresolved)
 	}
 
 	b.retentionAccountingMu.Lock()
@@ -2627,18 +2597,10 @@ func (b *Backend) rollbackUnacceptedRestoreAdoption(
 	// Rolling back by touching Docker here would manufacture a substrate effect
 	// outside the Started protocol. Reconstruct only the immutable accounting
 	// snapshot needed for the durable source handback.
-	resourceProfiles := shared.CloneSKUResourceSnapshot(rec.ResourceProfiles)
-	if len(resourceProfiles) == 0 {
-		var resolveErr error
-		resourceProfiles, resolveErr = b.resolveResourceProfiles(rec.Items)
-		if resolveErr != nil {
-			b.removeProvision(leaseUUID)
-			return fmt.Errorf("restore failed; resolve source accounting for refusal: %w", resolveErr)
-		}
-	}
-	if err := validateDockerResourceProfiles(rec.Items, resourceProfiles); err != nil {
+	resourceProfiles, err := retainedResourceProfiles(*rec)
+	if err != nil {
 		b.removeProvision(leaseUUID)
-		return fmt.Errorf("restore failed; validate source accounting for refusal: %w", err)
+		return fmt.Errorf("restore failed; source accounting for refusal: %w", err)
 	}
 	// Physical cleanup above is bridged by the Restoring row. From exact
 	// operation settlement through source-authority handback, pool release, and

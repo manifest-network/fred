@@ -119,10 +119,28 @@ func resourceSnapshotMap(
 	return resources, nil
 }
 
+// resolveResourceProfiles sizes items from the live configuration. It is for
+// live leases and for freezing v0.13 authority only: a retained footprint is
+// sized solely by its frozen snapshot (retainedResourceProfiles), which the
+// [live-sizing] lint rule enforces.
 func (b *Backend) resolveResourceProfiles(
 	items []backend.LeaseItem,
 ) ([]shared.SKUResourceSnapshot, error) {
 	return resolveResourceProfilesForConfig(b.cfg, items)
+}
+
+// liveProvisionResourceProfiles returns a live provision's pinned resource
+// authority. Normal startup recovery freezes it into the active release before
+// quota reconciliation; resolving the live configuration here is explicit
+// v0.13 compatibility only.
+func (b *Backend) liveProvisionResourceProfiles(
+	items []backend.LeaseItem,
+	pinned []shared.SKUResourceSnapshot,
+) ([]shared.SKUResourceSnapshot, error) {
+	if len(pinned) > 0 {
+		return pinned, nil
+	}
+	return b.resolveResourceProfiles(items)
 }
 
 // activeResourceProfiles returns the resource authority pinned to the active

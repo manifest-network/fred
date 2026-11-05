@@ -221,13 +221,11 @@ func TestRetentionCap_RetainedScratchCountsPhysicallyButNotTowardPolicyCaps(t *t
 		CreatedAt: time.Now(),
 	}
 
-	physicalMB, unresolved, err := b.retentionEntryDiskMB(entry)
+	physicalMB, err := retentionEntryDiskMB(entry)
 	require.NoError(t, err)
-	require.Empty(t, unresolved)
 	require.Equal(t, int64(73), physicalMB)
-	capMB, unresolved, err := b.retentionEntryCapDiskMB(entry)
+	capMB, err := retentionEntryCapDiskMB(entry)
 	require.NoError(t, err)
-	require.Empty(t, unresolved)
 	require.Zero(t, capMB, "scratch is not durable retention entitlement")
 
 	require.NoError(t, putRetentionForTest(t, store, entry))

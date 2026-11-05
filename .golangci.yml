@@ -166,6 +166,16 @@ linters:
         #     claim. The API offers tenant ingress no raw store at all.
         - pattern: '(payloads|payloadStore)\.Store$'
           msg: "[payload-insert] store a tenant payload through placement.PayloadAdmitter.Admit, which excludes a restore of the same lease (ENG-2117)"
+        # A retained footprint is sized only by the snapshot frozen onto its
+        # retention row, so removing or resizing a SKU profile can neither
+        # reprice retained bytes nor stop a restart (ENG-1517 F-1):
+        #   - [live-sizing]: the live SKU configuration is resolved only for
+        #     live leases (resource_profiles.go), to adopt v0.13 release
+        #     authority (recover.go and the storage-identity adoption audit in
+        #     backend.go), and once per v0.13 retention row to freeze its
+        #     sizing at startup (retained_sizing.go).
+        - pattern: 'resolveResourceProfiles(ForConfig)?$'
+          msg: "[live-sizing] size a retained footprint with retainedResourceProfiles, from its frozen snapshot; live SKU profiles are resolved only for live leases and to freeze v0.13 authority (ENG-1517 F-1)"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -255,6 +265,12 @@ linters:
         linters:
           - forbidigo
         text: '\[payload-insert\]'
+      # [live-sizing] (ENG-1517 F-1): live-lease sizing, v0.13 adoption and the
+      # startup freeze of v0.13 retention sizing.
+      - path: ^internal/backend/docker/(resource_profiles|recover|backend|retained_sizing)\.go$
+        linters:
+          - forbidigo
+        text: '\[live-sizing\]'
       # Exclude test files from strict linters
       - path: _test\.go
         linters:

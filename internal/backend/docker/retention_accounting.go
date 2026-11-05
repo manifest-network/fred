@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"sort"
 	"syscall"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -162,50 +161,37 @@ type retentionDiskFootprint struct {
 	retentionCapMB       int64
 }
 
-func (b *Backend) retentionEntryDiskFootprint(
-	entry shared.RetentionEntry,
-) (footprint retentionDiskFootprint, unresolved []string, err error) {
-	if len(entry.ResourceProfiles) == 0 {
-		// Explicit v0.13 compatibility: resolve once for this projection. New
-		// records always persist profiles, so mutable configuration can affect
-		// only rows that never carried immutable authority.
-		profiles, resolveErr := b.resolveResourceProfiles(entry.Items)
-		if resolveErr != nil {
-			mb, unresolved, sumErr := b.leaseDiskMB(entry.Items)
-			return retentionDiskFootprint{
-				physicalProjectionMB: mb,
-				retentionCapMB:       mb,
-			}, unresolved, sumErr
-		}
-		return retentionEntryDiskFootprintFromSnapshot(entry, profiles)
+// retentionEntryDiskFootprint sizes entry from its own frozen snapshot only.
+// Like the two projections below, it takes no Backend, so it cannot fall back
+// to the live configuration.
+func retentionEntryDiskFootprint(entry shared.RetentionEntry) (retentionDiskFootprint, error) {
+	resourceProfiles, err := retainedResourceProfiles(entry)
+	if err != nil {
+		return retentionDiskFootprint{}, err
 	}
-	return retentionEntryDiskFootprintFromSnapshot(entry, entry.ResourceProfiles)
+	return retentionEntryDiskFootprintFromSnapshot(entry, resourceProfiles)
 }
 
-func (b *Backend) retentionEntryDiskMB(
-	entry shared.RetentionEntry,
-) (mb int64, unresolved []string, err error) {
-	footprint, unresolved, err := b.retentionEntryDiskFootprint(entry)
-	return footprint.physicalProjectionMB, unresolved, err
+func retentionEntryDiskMB(entry shared.RetentionEntry) (int64, error) {
+	footprint, err := retentionEntryDiskFootprint(entry)
+	return footprint.physicalProjectionMB, err
 }
 
-func (b *Backend) retentionEntryCapDiskMB(
-	entry shared.RetentionEntry,
-) (mb int64, unresolved []string, err error) {
-	footprint, unresolved, err := b.retentionEntryDiskFootprint(entry)
-	return footprint.retentionCapMB, unresolved, err
+func retentionEntryCapDiskMB(entry shared.RetentionEntry) (int64, error) {
+	footprint, err := retentionEntryDiskFootprint(entry)
+	return footprint.retentionCapMB, err
 }
 
 func retentionEntryDiskFootprintFromSnapshot(
 	entry shared.RetentionEntry,
 	resourceProfiles []shared.SKUResourceSnapshot,
-) (retentionDiskFootprint, []string, error) {
+) (retentionDiskFootprint, error) {
 	if err := validateDockerResourceProfiles(entry.Items, resourceProfiles); err != nil {
-		return retentionDiskFootprint{}, nil, fmt.Errorf("invalid retained resource snapshot: %w", err)
+		return retentionDiskFootprint{}, fmt.Errorf("invalid retained resource snapshot: %w", err)
 	}
 	retentionCapMB, err := shared.SumSKUResourceSnapshotDiskMB(entry.Items, resourceProfiles)
 	if err != nil {
-		return retentionDiskFootprint{}, nil, fmt.Errorf("invalid retained resource snapshot: %w", err)
+		return retentionDiskFootprint{}, fmt.Errorf("invalid retained resource snapshot: %w", err)
 	}
 	physicalProjectionMB := retentionCapMB
 
@@ -229,14 +215,14 @@ func retentionEntryDiskFootprintFromSnapshot(
 			}
 			physicalProjectionMB, err = addLeaseDiskMB(physicalProjectionMB, row.ScratchDiskMB, 1)
 			if err != nil {
-				return retentionDiskFootprint{}, nil, fmt.Errorf("sum retained scratch footprint for %q: %w", name, err)
+				return retentionDiskFootprint{}, fmt.Errorf("sum retained scratch footprint for %q: %w", name, err)
 			}
 		}
 	}
 	return retentionDiskFootprint{
 		physicalProjectionMB: physicalProjectionMB,
 		retentionCapMB:       retentionCapMB,
-	}, nil, nil
+	}, nil
 }
 
 // closeFootprintDiskMB sizes the subset of a closing lease that still has
@@ -293,24 +279,6 @@ func addLeaseDiskMB(current, perInstance int64, quantity int) (int64, error) {
 	return current + term, nil
 }
 
-// warnUnknownSKUs logs (once, sorted) the SKU names that failed to resolve while
-// summing a retention projection. An unresolved SKU contributes 0 to the sum, so
-// the projection UNDERCOUNTS — the over-admission/ENOSPC direction — until the
-// profile is restored or the affected records are reconciled. context names the
-// projection for the operator (e.g. "retained", "reaping"). No-op on an empty set.
-func warnUnknownSKUs(logger *slog.Logger, unknown map[string]struct{}, context string) {
-	if len(unknown) == 0 {
-		return
-	}
-	skus := make([]string, 0, len(unknown))
-	for s := range unknown {
-		skus = append(skus, s)
-	}
-	sort.Strings(skus)
-	logger.Warn("retention record references unknown SKU profile(s); disk accounting UNDERCOUNTS (risk of over-admission/ENOSPC) until the profile is restored or the records are reconciled",
-		"context", context, "unknown_skus", skus)
-}
-
 // tenantPartition is the composite key identifying a distinct retention bucket
 // across tenants. A struct key (vs a separator-joined string) avoids a per-entry
 // concatenation allocation and needs no assumption about a separator byte never
@@ -318,25 +286,17 @@ func warnUnknownSKUs(logger *slog.Logger, unknown map[string]struct{}, context s
 type tenantPartition struct{ tenant, partition string }
 
 // computeRetainedDiskMB derives the retained-disk projection from the retention
-// store: the sum of leaseDiskMB over ACTIVE records. Returns the total MB, the
-// active-record count (for the retained_leases gauge), and the number of distinct
-// non-empty (tenant, partition) buckets across ACTIVE+RESTORING records (for the
-// retention_partitions gauge — same scope as the enforced write-time bound). This
-// is the single source of truth (bbolt) — never an independently-mutated counter.
-// Restoring records are excluded from the mb/count sums (their bytes move to the
-// live pool via the restored lease's TryAllocate) but included in the partition
-// count so the gauge tracks buckets that still hold reserved space.
+// store: the sum of each ACTIVE record's frozen footprint. Returns the total MB,
+// the active-record count (for the retained_leases gauge), and the number of
+// distinct non-empty (tenant, partition) buckets across ACTIVE+RESTORING records
+// (for the retention_partitions gauge — same scope as the enforced write-time
+// bound). This is the single source of truth (bbolt) — never an
+// independently-mutated counter. Restoring records are excluded from the
+// mb/count sums (their bytes move to the live pool via the restored lease's
+// TryAllocate) but included in the partition count so the gauge tracks buckets
+// that still hold reserved space. A record without frozen sizing is an error,
+// never a zero: a zero would undercount bytes already on disk.
 func (b *Backend) computeRetainedDiskMB() (mb int64, count int, partitions int, err error) {
-	return b.computeRetainedDiskMBMode(false)
-}
-
-func (b *Backend) computeRetainedDiskMBChecked() (mb int64, count int, partitions int, err error) {
-	return b.computeRetainedDiskMBMode(true)
-}
-
-func (b *Backend) computeRetainedDiskMBMode(
-	failOnUnknownSKU bool,
-) (mb int64, count int, partitions int, err error) {
 	if b.retentionStore == nil {
 		return 0, 0, 0, nil
 	}
@@ -344,7 +304,6 @@ func (b *Backend) computeRetainedDiskMBMode(
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	unknown := make(map[string]struct{})
 	distinct := make(map[tenantPartition]struct{})
 	for _, e := range entries {
 		if e.Partition != "" && (e.Status == shared.RetentionStatusActive || e.Status == shared.RetentionStatusRestoring) {
@@ -354,7 +313,7 @@ func (b *Backend) computeRetainedDiskMBMode(
 			continue
 		}
 		count++
-		emb, eunres, sumErr := b.retentionEntryDiskMB(e)
+		emb, sumErr := retentionEntryDiskMB(e)
 		if sumErr != nil {
 			return 0, 0, 0, fmt.Errorf("retained lease %q footprint: %w", e.OriginalLeaseUUID, sumErr)
 		}
@@ -362,32 +321,18 @@ func (b *Backend) computeRetainedDiskMBMode(
 		if sumErr != nil {
 			return 0, 0, 0, fmt.Errorf("retained projection overflow at lease %q: %w", e.OriginalLeaseUUID, sumErr)
 		}
-		for _, s := range eunres {
-			unknown[s] = struct{}{}
-		}
-	}
-	warnUnknownSKUs(b.logger, unknown, "retained")
-	if failOnUnknownSKU && len(unknown) > 0 {
-		return mb, count, len(distinct), unknownRetentionSKUError("retained", unknown)
 	}
 	return mb, count, len(distinct), nil
 }
 
 // computeReapingDiskMB derives the reaping (pending-destroy) footprint from the
-// retention store: the sum of leaseDiskMB over REAPING records, plus their count.
-// These bytes are still physically on disk, so they count toward the admission
-// projection (refreshRetentionAccounting adds them to SetRetainedDisk) — but NOT
-// toward breachRetentionCaps, whose true result DESTROYS data (over-counting a
-// destroy gate is the dangerous direction). (ENG-376)
+// retention store: the sum of each REAPING record's frozen footprint, plus their
+// count. These bytes are still physically on disk, so they count toward the
+// admission projection (refreshRetentionAccounting adds them to
+// SetRetainedDisk) — but NOT toward breachRetentionCaps, whose true result
+// DESTROYS data (over-counting a destroy gate is the dangerous direction).
+// (ENG-376)
 func (b *Backend) computeReapingDiskMB() (mb int64, count int, err error) {
-	return b.computeReapingDiskMBMode(false)
-}
-
-func (b *Backend) computeReapingDiskMBChecked() (mb int64, count int, err error) {
-	return b.computeReapingDiskMBMode(true)
-}
-
-func (b *Backend) computeReapingDiskMBMode(failOnUnknownSKU bool) (mb int64, count int, err error) {
 	if b.retentionStore == nil {
 		return 0, 0, nil
 	}
@@ -395,10 +340,9 @@ func (b *Backend) computeReapingDiskMBMode(failOnUnknownSKU bool) (mb int64, cou
 	if err != nil {
 		return 0, 0, err
 	}
-	unknown := make(map[string]struct{})
 	for _, e := range entries {
 		count++
-		emb, eunres, sumErr := b.retentionEntryDiskMB(e)
+		emb, sumErr := retentionEntryDiskMB(e)
 		if sumErr != nil {
 			return 0, 0, fmt.Errorf("reaping lease %q footprint: %w", e.OriginalLeaseUUID, sumErr)
 		}
@@ -406,29 +350,8 @@ func (b *Backend) computeReapingDiskMBMode(failOnUnknownSKU bool) (mb int64, cou
 		if sumErr != nil {
 			return 0, 0, fmt.Errorf("reaping projection overflow at lease %q: %w", e.OriginalLeaseUUID, sumErr)
 		}
-		for _, s := range eunres {
-			unknown[s] = struct{}{}
-		}
-	}
-	// Same hazard as computeRetainedDiskMB: an unresolved SKU contributes 0, so a
-	// reaping record on a removed/renamed profile UNDERCOUNTS the admission pool
-	// (reaping is added to SetRetainedDisk) → over-admission/ENOSPC risk. The
-	// reaping footprint is transient, so this is rarer than the active case but the
-	// direction is identically dangerous.
-	warnUnknownSKUs(b.logger, unknown, "reaping")
-	if failOnUnknownSKU && len(unknown) > 0 {
-		return mb, count, unknownRetentionSKUError("reaping", unknown)
 	}
 	return mb, count, nil
-}
-
-func unknownRetentionSKUError(context string, unknown map[string]struct{}) error {
-	skus := make([]string, 0, len(unknown))
-	for sku := range unknown {
-		skus = append(skus, sku)
-	}
-	sort.Strings(skus)
-	return fmt.Errorf("%s retention accounting has unresolved SKU profiles: %v", context, skus)
 }
 
 // refreshRetentionAccounting recomputes the retained-disk projection and pushes
@@ -469,13 +392,13 @@ func (b *Backend) refreshRetentionAccountingChecked() error {
 // handoff with every projection refresh. The caller MUST hold
 // retentionAccountingMu.
 func (b *Backend) refreshRetentionAccountingCheckedLocked() error {
-	activeMB, activeCount, partitionCount, err := b.computeRetainedDiskMBChecked()
+	activeMB, activeCount, partitionCount, err := b.computeRetainedDiskMB()
 	if err != nil {
 		retentionAccountingRefreshFailedTotal.Inc()
 		b.logger.Warn("failed to recompute retained disk accounting; keeping last value", "error", err)
 		return fmt.Errorf("recompute active retained disk accounting: %w", err)
 	}
-	reapingMB, reapingCount, err := b.computeReapingDiskMBChecked()
+	reapingMB, reapingCount, err := b.computeReapingDiskMB()
 	if err != nil {
 		retentionAccountingRefreshFailedTotal.Inc()
 		b.logger.Warn("failed to recompute reaping disk accounting; keeping last value", "error", err)
@@ -600,13 +523,12 @@ func (b *Backend) logRetentionBudgetSanity() {
 		}
 		var count int
 		var mb int64
-		unresolved := make(map[string]struct{})
 		for _, e := range mine {
 			if e.Status != shared.RetentionStatusActive {
 				continue
 			}
 			count++
-			emb, eunres, sumErr := b.retentionEntryCapDiskMB(e)
+			emb, sumErr := retentionEntryCapDiskMB(e)
 			if sumErr != nil {
 				b.logger.Warn("retention budget sanity: invalid durable resource footprint",
 					"tenant", tenant, "lease_uuid", e.OriginalLeaseUUID, "error", sumErr)
@@ -619,28 +541,12 @@ func (b *Backend) logRetentionBudgetSanity() {
 				mb = math.MaxInt64
 				break
 			}
-			for _, s := range eunres {
-				unresolved[s] = struct{}{}
-			}
 		}
 		overCount := count > bud.MaxRetainedLeases
 		overDisk := mb > bud.MaxRetainedDiskMB
-		// An unresolved SKU contributes 0 to active_mb, so the disk comparison is an
-		// UNDERCOUNT: name the offending SKU(s) on the line itself so a "within
-		// budget" reading is not silently wrong. (The store-wide UNDERCOUNT warning
-		// already fired in refreshRetentionAccounting one call earlier at boot, so
-		// this is per-tenant attribution, not a duplicate global alarm.)
 		line := []any{
 			"tenant", tenant, "active_count", count, "budget_count", bud.MaxRetainedLeases,
 			"active_mb", mb, "budget_mb", bud.MaxRetainedDiskMB,
-		}
-		if len(unresolved) > 0 {
-			skus := make([]string, 0, len(unresolved))
-			for s := range unresolved {
-				skus = append(skus, s)
-			}
-			sort.Strings(skus)
-			line = append(line, "unresolved_skus", skus)
 		}
 		if overCount || overDisk {
 			// Name the breached dimension(s): a count breach evicts (batch-railed),
@@ -786,20 +692,16 @@ func (b *Backend) breachRetentionCapsWithResourceProfiles(
 		return "", false
 	}
 	var globalMB, tenantMB, partMB int64
-	unknown := make(map[string]struct{})
 	for _, e := range entries {
 		if e.Status != shared.RetentionStatusActive {
 			continue
 		}
-		emb, eunres, sumErr := b.retentionEntryCapDiskMB(e)
+		emb, sumErr := retentionEntryCapDiskMB(e)
 		if sumErr != nil {
 			b.logger.Warn("retention cap check: durable footprint is invalid; not refusing (data-safe)",
 				"lease_uuid", e.OriginalLeaseUUID, "error", sumErr)
 			retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach).Inc()
 			return "", false
-		}
-		for _, s := range eunres {
-			unknown[s] = struct{}{}
 		}
 		globalMB, sumErr = addLeaseDiskMB(globalMB, emb, 1)
 		if sumErr != nil {
@@ -827,14 +729,6 @@ func (b *Backend) breachRetentionCapsWithResourceProfiles(
 				}
 			}
 		}
-	}
-	warnUnknownSKUs(b.logger, unknown, "retained")
-	if len(unknown) > 0 {
-		// Refuse-to-retain destroys the incoming lease. A partial sum remains a
-		// useful lower bound for observability, but unresolved durable authority
-		// is not permission to make that irreversible policy decision.
-		retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach).Inc()
-		return "", false
 	}
 	globalWithIncoming, globalErr := addLeaseDiskMB(globalMB, incoming, 1)
 	tenantWithIncoming, tenantErr := addLeaseDiskMB(tenantMB, incoming, 1)

@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - providerd no longer exits when pending maintenance recovery or a chain lease-inventory read panics. Recovery runs at every start, so such a panic used to crash-loop providerd. Now a panic fails only the unit it hit: one recovered command stays pending for the next pass while that backend's other commands continue, and a failed inventory read gives that reconciliation sweep no inventory, so it takes no action. Each panic is logged with its stack and counted in `fred_background_goroutine_panics_total{component="maintenance_recovery"}` or `fred_provisioner_reconciler_panics_total{stage="fetch_chain_leases"}`. Both series are exported at 0 from startup.
+- docker-backend now freezes the resource sizing of retention records written by v0.13 onto each record at startup, and sizes every retained footprint only from its record. Before, every start re-resolved those records' SKUs against the current `sku_profiles`, so removing a profile that a retained lease still referenced stopped the backend from starting until the record expired (90 days by default). If a v0.13 record's SKU no longer resolves when it is frozen, startup fails with `freeze retained resource sizing`, naming the lease and SKU: restore the profile for one start, then remove it.
 
 ### Security
 
