@@ -273,17 +273,13 @@ func run(cmd *cobra.Command, args []string) error {
 
 	authzQ := authz.NewQueryClient(chainClient.Conn())
 
-	// grantChecks is bound only for a pool with sub-signers, so a provider
-	// without them exports no grant-check series. The pool only ever shrinks, so
-	// the maintenance loop below, gated on the same condition, always finds it
-	// bound.
-	var grantChecks metrics.SignerGrantCheckCounters
+	// startupGrantCheck is the startup grant sweep's result. The maintenance
+	// worker counts it as its first sweep if the pool keeps its sub-signers.
+	var startupGrantCheck error
 	if signerPool.HasSubSigners() {
-		grantChecks = metrics.BindSignerGrantCheck()
 		setupCtx, setupCancel := context.WithTimeout(workCtx, 60*time.Second)
 		if err := chain.EnsureGrantsWithRetry(setupCtx, authzQ, chainClient, signerPool); err != nil {
-			// The startup check is a sweep like the loop's, counted the same way.
-			grantChecks.Error.Inc()
+			startupGrantCheck = err
 			if demoteOnGrantSetupError(err) {
 				// The queries succeeded and told us grants are missing, and we
 				// could not create them. That is a positive fact: the
@@ -303,8 +299,6 @@ func run(cmd *cobra.Command, args []string) error {
 					"recheck_interval", cfg.SubSignerFundCheckInterval,
 				)
 			}
-		} else {
-			grantChecks.Success.Inc()
 		}
 		setupCancel()
 	}
@@ -660,7 +654,7 @@ func run(cmd *cobra.Command, args []string) error {
 		// pass having succeeded. That is what makes a boot whose grant queries timed
 		// out recover on its own instead of staying degraded until someone restarts
 		// providerd (ENG-688).
-		if signerPool.HasSubSigners() {
+		if grantChecks, ok := newGrantCheckSweeps(signerPool, startupGrantCheck); ok {
 			bankQ := banktypes.NewQueryClient(chainClient.Conn())
 			comps.Start("sub-signer maintenance", func() error {
 				ticker := time.NewTicker(cfg.SubSignerFundCheckInterval)
@@ -675,12 +669,11 @@ func run(cmd *cobra.Command, args []string) error {
 						// would starve the top-ups.
 						grantCtx, grantCancel := context.WithTimeout(workCtx, 60*time.Second)
 						// Plain EnsureGrants, not the retry wrapper: the loop is the retry.
-						if err := chain.EnsureGrants(grantCtx, authzQ, chainClient, signerPool); err != nil {
+						err := chain.EnsureGrants(grantCtx, authzQ, chainClient, signerPool)
+						if err != nil {
 							slog.Warn("sub-signer grant check failed", "error", err)
-							grantChecks.Error.Inc()
-						} else {
-							grantChecks.Success.Inc()
 						}
+						grantChecks.record(err)
 						grantCancel()
 
 						fundCtx, fundCancel := context.WithTimeout(workCtx, 60*time.Second)

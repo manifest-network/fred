@@ -33,6 +33,7 @@ func TestCallbackKeyringRefusesAFencedBackendsOwnCallback(t *testing.T) {
 	keyring := fencedCallbackKeyring(t)
 	fenced := metrics.CallbackAuthFailures.Fenced
 	mismatch := metrics.CallbackAuthFailures.Mismatch
+	metrics.BindBackends("fenced-b")
 	verified := metrics.ForBackend("fenced-b").CallbackSignatureKey.Current
 	fencedBefore, mismatchBefore, verifiedBefore :=
 		promtestutil.ToFloat64(fenced), promtestutil.ToFloat64(mismatch), promtestutil.ToFloat64(verified)

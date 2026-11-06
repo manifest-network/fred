@@ -193,9 +193,10 @@ func preparePlacementBackends(
 	return store, entries, nil
 }
 
-// bindBackendRequestCounters hands the backend client providerd's request
-// series for one backend operation.
-func bindBackendRequestCounters(backendName, operation string) backend.RequestCounters {
+// newBackendRequestCounters hands the backend client providerd's request
+// series for one backend operation; the client calls it once per operation
+// when it is built.
+func newBackendRequestCounters(backendName, operation string) backend.RequestCounters {
 	counters := metrics.BindBackendRequest(backendName, operation)
 	return backend.RequestCounters{
 		Success: counters.Success, Fenced: counters.Fenced,
@@ -218,7 +219,7 @@ func newProductionBackendClient(
 	metrics.BindBackends(backendName)
 	client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{
 		RequestDuration:     metrics.BackendRequestDuration,
-		RequestCounters:     bindBackendRequestCounters,
+		RequestCounters:     newBackendRequestCounters,
 		CircuitBreakerState: metrics.BackendCircuitBreakerState,
 		Fenced:              metrics.BackendFenced,
 	}, resolver)

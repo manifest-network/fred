@@ -14,6 +14,7 @@ import (
 
 func inventorySeries(t testing.TB, backendName, outcome string) prometheus.Counter {
 	t.Helper()
+	metrics.BindBackends(backendName)
 	counters := metrics.ForBackend(backendName).Inventory
 	series, ok := map[string]prometheus.Counter{
 		metrics.InventoryOutcomeAuthoritative:  counters.Authoritative,
@@ -48,6 +49,7 @@ func cleanupSkipSeries(t testing.TB, pass metrics.CleanupSkipReasonCounters, rea
 
 func capacityVerdictSeries(t testing.TB, backendName, verdict string) prometheus.Counter {
 	t.Helper()
+	metrics.BindBackends(backendName)
 	verdicts := metrics.ForBackend(backendName).InsufficientResources
 	series, ok := map[string]prometheus.Counter{
 		metrics.CapacityVerdictCodedRefusal: verdicts.CodedRefusal,

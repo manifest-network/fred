@@ -25,8 +25,9 @@ import (
 //     returns every series of the family at once, called where that thing is
 //     constructed;
 //   - a label known only from configuration (a backend name, an ack lane, a
-//     signer address) is bound the same way, once per configured value, before
-//     the component that writes it starts;
+//     signer address) is bound the same way, once per configured value, where
+//     the component that writes it is constructed. A recording path only looks
+//     series up: ForBackend never creates one;
 //   - a label set that is open by nature (an HTTP status code) is written
 //     through a Count function and documented as created on first event. Those
 //     families are not alerted with increase() or rate().
@@ -576,31 +577,38 @@ type BackendSeries struct {
 }
 
 var backendSeries = struct {
-	sync.Mutex
+	sync.RWMutex
 	byName map[string]BackendSeries
 }{byName: make(map[string]BackendSeries)}
 
-// ForBackend returns the counters of one backend, creating every one of its
-// series the first time the backend is named. providerd names every
-// configured backend at startup (BindBackends), so their series exist at 0
-// before the first event; a name outside the configuration is bound when
-// first used.
-func ForBackend(name string) BackendSeries {
+// unconfiguredBackend holds the series an event counts under when it names a
+// backend nothing bound, so a lookup never creates a series.
+var unconfiguredBackend = bindBackend("unconfigured")
+
+// BindBackends creates every backend-labeled series of each named backend.
+// providerd binds a backend when it builds that backend's client, before
+// anything can record an event for it. Call it only where a component is
+// constructed (internal/testutil's counter series guard).
+func BindBackends(names ...string) {
 	backendSeries.Lock()
 	defer backendSeries.Unlock()
+	for _, name := range names {
+		if _, ok := backendSeries.byName[name]; !ok {
+			backendSeries.byName[name] = bindBackend(name)
+		}
+	}
+}
+
+// ForBackend returns the series BindBackends created for a backend. It never
+// creates one: an event naming a backend nothing bound counts under
+// backend="unconfigured", whose series exist from startup.
+func ForBackend(name string) BackendSeries {
+	backendSeries.RLock()
+	defer backendSeries.RUnlock()
 	if series, ok := backendSeries.byName[name]; ok {
 		return series
 	}
-	series := bindBackend(name)
-	backendSeries.byName[name] = series
-	return series
-}
-
-// BindBackends creates the series of every named backend.
-func BindBackends(names ...string) {
-	for _, name := range names {
-		ForBackend(name)
-	}
+	return unconfiguredBackend
 }
 
 func bindBackend(name string) BackendSeries {

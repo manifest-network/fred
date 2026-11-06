@@ -68,6 +68,16 @@ func TestBindersCreateTheirWholeFamilyAtOnce(t *testing.T) {
 	}
 	assert.Equal(t, ForBackend(backend), ForBackend(backend), "a backend's series are bound once")
 
+	ForBackend("never-bound").ReconcileFetch.Error.Inc()
+	for _, vec := range []*prometheus.CounterVec{
+		provisioningTotal, reconcilerBackendFetchTotal, reconcilerBackendInventoryTotal,
+		backendInsufficientResourcesTotal, apiCallbackSignatureKeyTotal, nonInFlightCallbacksTotal,
+	} {
+		assert.Zero(t, seriesOfBackend(t, vec, "never-bound"), "a lookup never creates a series")
+	}
+	assert.Equal(t, 1.0, testutil.ToFloat64(unconfiguredBackend.ReconcileFetch.Error),
+		"an event naming an unbound backend counts under backend=\"unconfigured\"")
+
 	BindBackendRequest(backend, "provision")
 	assert.Equal(t, 4, seriesOfBackend(t, backendRequestsTotal, backend), "every request status")
 	assert.Equal(t, 1, seriesOfBackend(t, backendMalformedErrorBodyTotal, backend))

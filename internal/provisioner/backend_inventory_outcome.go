@@ -110,11 +110,9 @@ func recordBackendInventoryOutcomes(outcomes map[string]backendInventoryOutcome)
 	}
 }
 
-// initializeBackendInventoryMetrics creates every configured backend's series
-// at zero, so increase() sees the first sweep's increments and a readiness
-// gate refuses until a sweep has heard the backend.
-func initializeBackendInventoryMetrics(backendNames []string) {
-	metrics.BindBackends(backendNames...)
+// initializeBackendInventoryAnswered sets every configured backend's answered
+// gauge to 0, so a readiness gate refuses until a sweep has heard the backend.
+func initializeBackendInventoryAnswered(backendNames []string) {
 	for _, backendName := range backendNames {
 		metrics.ReconcilerBackendInventoryAnswered.WithLabelValues(backendName).Set(0)
 	}

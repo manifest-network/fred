@@ -202,7 +202,10 @@ func NewReconciler(
 	)
 	reconciler.placementSweepSeen.Store(reconciliation.AdmissionReady())
 	if backendNames, err := reconciliation.BackendNames(); err == nil {
-		initializeBackendInventoryMetrics(backendNames)
+		// Every configured backend's series exist at 0 before the first sweep,
+		// so increase() sees its first increments.
+		metrics.BindBackends(backendNames...)
+		initializeBackendInventoryAnswered(backendNames)
 	}
 	return reconciler, nil
 }

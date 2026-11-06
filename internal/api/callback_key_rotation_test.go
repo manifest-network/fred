@@ -44,6 +44,7 @@ func callbackBodyFor(storage string) []byte {
 // Not parallel: these read process-global counters.
 func TestCallbackKeyringAcceptsAPreviousKeyAndCountsItsSlot(t *testing.T) {
 	keyring := rotatingCallbackKeyring(t)
+	metrics.BindBackends("rotation-b")
 	current := metrics.ForBackend("rotation-b").CallbackSignatureKey.Current
 	previous := metrics.ForBackend("rotation-b").CallbackSignatureKey.Previous
 	currentBefore, previousBefore := promtestutil.ToFloat64(current), promtestutil.ToFloat64(previous)

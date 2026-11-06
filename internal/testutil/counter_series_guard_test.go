@@ -16,8 +16,16 @@ package testutil
 //   - a background component's panic counter (background.CleanupPanics or
 //     GoroutinePanics) is declared by a package-level variable of the package
 //     that runs the component, so each binary exports exactly its own;
-//   - a binder's result (metrics.Bind*) is kept, never used inline, since an
-//     inline bind creates its series at the first event.
+//   - a binder (metrics.Bind*) runs only at package initialization or in a
+//     constructor (a function or method named New… or new…), never in a
+//     function literal that runs later. Recording paths only look series up:
+//     metrics.ForBackend cannot create one.
+//
+// A constructor is recognized by its name, which approximates "runs while the
+// component is built"; a constructor that binds and then records in the same
+// call would still pass. The unexported vecs and the lookup-only ForBackend
+// carry the guarantee for recording paths; this rule keeps the binders where
+// review expects them.
 //
 // Counter vecs are recognized by name: package variables built by
 // NewCounterVec and fields or parameters of type *prometheus.CounterVec. The
@@ -135,24 +143,20 @@ func counterSeriesFindings(fset *token.FileSet, files map[string]*ast.File) []st
 		backgroundNames := importNamesOf(file, backgroundImportPath)
 		vocabulary := slices.Contains(counterVocabularyFiles, rel)
 		pending := slices.Contains(counterSeriesPendingDirs, dir)
-		walkCounterScopes(file, func(node ast.Node, scope counterScope) {
+		walkCounterScopes(file, func(node ast.Node, scope counterScope, function string) {
 			call, ok := node.(*ast.CallExpr)
 			if !ok {
-				if selector, ok := node.(*ast.SelectorExpr); ok {
-					if inner, ok := selector.X.(*ast.CallExpr); ok {
-						if qualifier, name := qualifiedCall(inner); slices.Contains(metricsNames, qualifier) &&
-							strings.HasPrefix(name, "Bind") {
-							report(inner, "%s.%s's result is used inline; keep it so its series exist before the first event",
-								qualifier, name)
-						}
-					}
-				}
 				return
 			}
 			qualifier, name := qualifiedCall(call)
 			if slices.Contains(backgroundNames, qualifier) && slices.Contains(backgroundComponentConstructors, name) &&
 				scope != scopePackageInitializer {
 				report(call, "background.%s outside a package-level variable declaration", name)
+			}
+			if slices.Contains(metricsNames, qualifier) && strings.HasPrefix(name, "Bind") &&
+				scope == scopeLater && !isConstructorName(function) {
+				report(call, "metrics.%s outside a constructor or package initialization; bind where the component is built and keep the handles",
+					name)
 			}
 			if vocabulary || pending || scope != scopeLater {
 				return
@@ -183,33 +187,36 @@ const (
 	scopeLater
 )
 
-// walkCounterScopes visits every node of file with the scope it runs in.
-func walkCounterScopes(file *ast.File, visit func(ast.Node, counterScope)) {
-	var walk func(node ast.Node, scope counterScope)
-	walk = func(node ast.Node, scope counterScope) {
+// walkCounterScopes visits every node of file with the scope it runs in and
+// the declared function it runs as part of. A function literal that does not
+// run at initialization runs as part of no declared function.
+func walkCounterScopes(file *ast.File, visit func(ast.Node, counterScope, string)) {
+	var walk func(node ast.Node, scope counterScope, function string)
+	walk = func(node ast.Node, scope counterScope, function string) {
 		ast.Inspect(node, func(n ast.Node) bool {
-			if n == nil || n == node {
-				if n != nil {
-					visit(n, scope)
-				}
+			if n == nil {
+				return true
+			}
+			if n == node {
+				visit(n, scope, function)
 				return true
 			}
 			switch typed := n.(type) {
 			case *ast.CallExpr:
-				visit(typed, scope)
+				visit(typed, scope, function)
 				if literal, ok := typed.Fun.(*ast.FuncLit); ok && scope != scopeLater {
-					walk(literal.Body, scopeInit)
+					walk(literal.Body, scopeInit, function)
 					for _, argument := range typed.Args {
-						walk(argument, scope)
+						walk(argument, scope, function)
 					}
 					return false
 				}
 				return true
 			case *ast.FuncLit:
-				walk(typed.Body, scopeLater)
+				walk(typed.Body, scopeLater, "")
 				return false
 			default:
-				visit(n, scope)
+				visit(n, scope, function)
 				return true
 			}
 		})
@@ -218,7 +225,7 @@ func walkCounterScopes(file *ast.File, visit func(ast.Node, counterScope)) {
 		switch typed := decl.(type) {
 		case *ast.GenDecl:
 			if typed.Tok == token.VAR {
-				walk(typed, scopePackageInitializer)
+				walk(typed, scopePackageInitializer, "")
 			}
 		case *ast.FuncDecl:
 			if typed.Body == nil {
@@ -228,9 +235,13 @@ func walkCounterScopes(file *ast.File, visit func(ast.Node, counterScope)) {
 			if typed.Recv == nil && typed.Name.Name == "init" {
 				scope = scopeInit
 			}
-			walk(typed.Body, scope)
+			walk(typed.Body, scope, typed.Name.Name)
 		}
 	}
+}
+
+func isConstructorName(function string) bool {
+	return strings.HasPrefix(function, "New") || strings.HasPrefix(function, "new")
 }
 
 // counterVecNames is every name a counter vec goes by in the repository.
@@ -353,6 +364,11 @@ func (c *client) record() {
 	lane.Restarts.Inc()
 }
 func init() { _ = bg.CleanupPanics("in init") }
+func newClient() client {
+	_ = metrics.BindAckBatchLane("2")
+	go func() { _ = metrics.BindAckBatchLane("3") }()
+	return client{}
+}
 `
 	fset := token.NewFileSet()
 	files := map[string]*ast.File{}
@@ -374,11 +390,13 @@ func init() { _ = bg.CleanupPanics("in init") }
 		"internal/writer/writer.go:13:2: requests.WithLabelValues creates a counter series when it first runs",
 		"internal/writer/writer.go:14:2: hiddenTotal.With creates a counter series when it first runs",
 		"internal/writer/writer.go:15:2: background.GoroutinePanics outside a package-level variable declaration",
-		"internal/writer/writer.go:16:2: metrics.BindAckBatchLane's result is used inline",
+		"internal/writer/writer.go:16:2: metrics.BindAckBatchLane outside a constructor or package initialization",
+		"internal/writer/writer.go:17:10: metrics.BindAckBatchLane outside a constructor or package initialization",
 		"internal/writer/writer.go:20:19: background.CleanupPanics outside a package-level variable declaration",
+		"internal/writer/writer.go:23:18: metrics.BindAckBatchLane outside a constructor or package initialization",
 		// A pending directory is exempt from the creation rule only.
 		"internal/backend/docker/pending.go:15:2: background.GoroutinePanics outside a package-level variable declaration",
-		"internal/backend/docker/pending.go:16:2: metrics.BindAckBatchLane's result is used inline",
+		"internal/backend/docker/pending.go:16:2: metrics.BindAckBatchLane outside a constructor or package initialization",
 	} {
 		if !strings.Contains(findings, want) {
 			t.Errorf("guard did not report %q; findings:\n%s", want, findings)
@@ -386,6 +404,7 @@ func init() { _ = bg.CleanupPanics("in init") }
 	}
 	for _, allowed := range []string{
 		"metrics.go:4:", "writer.go:7:", "writer.go:9:", "writer.go:10:", "writer.go:11:", "writer.go:18:",
+		"writer.go:22:",
 		"pending.go:8:", "pending.go:13:",
 	} {
 		if strings.Contains(findings, allowed) {

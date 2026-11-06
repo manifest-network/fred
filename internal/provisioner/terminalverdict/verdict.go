@@ -20,6 +20,8 @@ const (
 	kindUnknown
 	kindRetry
 	kindExhausted
+	// kindSentinel bounds the closed set. It is never a valid verdict.
+	kindSentinel
 )
 
 // FromProvision reads one ProvisionInfo from complete inventory. It is the only
@@ -68,16 +70,25 @@ func (v Verdict) Label() string {
 // keyed by verdict has a series for each one.
 func Pick[T any](v Verdict, absent, unknown, retry, exhausted T) T {
 	switch v.kind {
+	case kindAbsent:
+		return absent
+	case kindUnknown:
+		return unknown
 	case kindRetry:
 		return retry
 	case kindExhausted:
 		return exhausted
-	case kindUnknown:
-		return unknown
 	default:
+		// Only FromProvision builds a Verdict, and it never leaves the set.
 		return absent
 	}
 }
+
+// pickedVerdicts is the number of verdicts Pick takes a value for. A verdict
+// added to the closed set does not compile until Pick takes its value too.
+const pickedVerdicts = 4
+
+var _ = [1]struct{}{}[int(kindSentinel)-pickedVerdicts]
 
 // ConsecutiveFailures is the backend's recorded count, for logs only. It never
 // decides a close.

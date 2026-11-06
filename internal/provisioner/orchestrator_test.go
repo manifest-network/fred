@@ -222,6 +222,7 @@ func TestHandlerEventCoordinatorProvisionsAndDeprovisionsThroughBoundApplication
 }
 
 func TestCapacityVerdict(t *testing.T) {
+	metrics.BindBackends("capacity-verdict-test")
 	verdicts := metrics.ForBackend("capacity-verdict-test").InsufficientResources
 	assert.Equal(t, verdicts.CodedRefusal, capacityVerdict(verdicts, backend.ProvisionRefusalCapacity))
 	assert.Equal(t, verdicts.Ambiguous, capacityVerdict(verdicts, backend.ProvisionRefusalNone))

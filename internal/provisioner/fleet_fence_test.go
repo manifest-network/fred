@@ -93,6 +93,7 @@ func TestFleet_FencedBackendIsNeverAskedAndItsLeasesWait(t *testing.T) {
 	f.restartFenced(fencedServer.name)
 	fencedOutcome := inventorySeries(t, fencedServer.name, metrics.InventoryOutcomeFenced)
 	unanswered := inventorySeries(t, fencedServer.name, metrics.InventoryOutcomeUnanswered)
+	metrics.BindBackends(fencedServer.name)
 	fencedFetch := metrics.ForBackend(fencedServer.name).ReconcileFetch.Fenced
 	fencedBefore, unansweredBefore, fetchBefore :=
 		promtestutil.ToFloat64(fencedOutcome), promtestutil.ToFloat64(unanswered), promtestutil.ToFloat64(fencedFetch)

@@ -3,38 +3,43 @@ package backend
 import "github.com/prometheus/client_golang/prometheus"
 
 // requestOperation is the closed operation label of the client's request
-// metrics. Its field is unexported, so only the values below exist and a
-// string literal cannot stand in for one.
+// metrics. Its field is unexported, so a string literal cannot stand in for
+// one, and declareRequestOperation is the only place one is built
+// (TestRequestOperationsAreDeclaredOnce).
 type requestOperation struct{ name string }
 
 // String is the operation's metric label.
 func (operation requestOperation) String() string { return operation.name }
 
-var (
-	requestGetInfo               = requestOperation{"get_info"}
-	requestProvision             = requestOperation{"provision"}
-	requestDeprovision           = requestOperation{"deprovision"}
-	requestListProvisions        = requestOperation{"list_provisions"}
-	requestGetProvision          = requestOperation{"get_provision"}
-	requestLookupProvisions      = requestOperation{"lookup_provisions"}
-	requestGetLogs               = requestOperation{"get_logs"}
-	requestRestart               = requestOperation{"restart"}
-	requestUpdate                = requestOperation{"update"}
-	requestRestore               = requestOperation{"restore"}
-	requestGetReleases           = requestOperation{"get_releases"}
-	requestReconcileCustomDomain = requestOperation{"reconcile_custom_domain"}
-	requestGetLoadStats          = requestOperation{"get_load_stats"}
-	requestListRetentions        = requestOperation{"list_retentions"}
-)
+// requestOperations is every operation the client sends, in declaration
+// order. declareRequestOperation appends each one as it is declared, so the
+// list cannot miss an operation the client can record.
+var requestOperations []requestOperation
 
-// requestOperations is every operation the client sends. A client binds the
-// counters of each one when it is built.
-var requestOperations = [...]requestOperation{
-	requestGetInfo, requestProvision, requestDeprovision, requestListProvisions,
-	requestGetProvision, requestLookupProvisions, requestGetLogs, requestRestart,
-	requestUpdate, requestRestore, requestGetReleases, requestReconcileCustomDomain,
-	requestGetLoadStats, requestListRetentions,
+// declareRequestOperation declares one operation and adds it to
+// requestOperations.
+func declareRequestOperation(name string) requestOperation {
+	operation := requestOperation{name: name}
+	requestOperations = append(requestOperations, operation)
+	return operation
 }
+
+var (
+	requestGetInfo               = declareRequestOperation("get_info")
+	requestProvision             = declareRequestOperation("provision")
+	requestDeprovision           = declareRequestOperation("deprovision")
+	requestListProvisions        = declareRequestOperation("list_provisions")
+	requestGetProvision          = declareRequestOperation("get_provision")
+	requestLookupProvisions      = declareRequestOperation("lookup_provisions")
+	requestGetLogs               = declareRequestOperation("get_logs")
+	requestRestart               = declareRequestOperation("restart")
+	requestUpdate                = declareRequestOperation("update")
+	requestRestore               = declareRequestOperation("restore")
+	requestGetReleases           = declareRequestOperation("get_releases")
+	requestReconcileCustomDomain = declareRequestOperation("reconcile_custom_domain")
+	requestGetLoadStats          = declareRequestOperation("get_load_stats")
+	requestListRetentions        = declareRequestOperation("list_retentions")
+)
 
 // RequestCounters are the counters of one backend operation: requests by
 // status, and client-error responses whose body was not the declared JSON

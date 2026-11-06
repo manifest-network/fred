@@ -2629,6 +2629,7 @@ func TestHandlerSet_HandleBackendCallback_ExactNonInFlightIsIgnoredByBoundAuthor
 // does NOT publish a lease event (the lease is torn down, no transition to
 // re-surface).
 func TestHandleBackendCallback_DeprovisionedOperationIsRejected(t *testing.T) {
+	metrics.BindBackends("docker")
 	labeled := metrics.ForBackend("docker").NonInFlightCallbacks.Deprovisioned
 	before := promtestutil.ToFloat64(labeled)
 
@@ -2682,6 +2683,7 @@ func TestHandleBackendCallback_SanitizesLabels(t *testing.T) {
 		},
 	}
 
+	metrics.BindBackends("docker")
 	tests := []struct {
 		name        string
 		payloadBE   string

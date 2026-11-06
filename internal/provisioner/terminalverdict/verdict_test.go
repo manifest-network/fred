@@ -79,6 +79,7 @@ func TestZeroValuesNeverClose(t *testing.T) {
 
 func TestPickCoversTheClosedSet(t *testing.T) {
 	want := map[kind]string{kindAbsent: "absent", kindUnknown: "unknown", kindRetry: "retry", kindExhausted: "exhausted"}
+	require.Len(t, want, int(kindSentinel), "every verdict has an expected value")
 	for raw := range 256 {
 		verdict := Verdict{kind: kind(raw)}
 		picked := Pick(verdict, "absent", "unknown", "retry", "exhausted")

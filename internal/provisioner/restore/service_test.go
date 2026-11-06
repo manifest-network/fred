@@ -1249,6 +1249,7 @@ func TestServiceSynchronousSettlementModes(t *testing.T) {
 			var capacityCounter prometheus.Counter
 			var capacityBefore float64
 			if test.verdict != "" {
+				metrics.BindBackends(testBackend)
 				verdicts := metrics.ForBackend(testBackend).InsufficientResources
 				capacityCounter = map[string]prometheus.Counter{
 					metrics.CapacityVerdictCodedRefusal: verdicts.CodedRefusal,

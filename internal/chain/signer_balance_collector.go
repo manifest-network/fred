@@ -71,14 +71,14 @@ func NewSignerBalanceCollector(bankQ bankQuerier, pool *SignerPool, denom string
 			[]string{"role", "address", "index", "denom"},
 			nil,
 		),
-		failures: bindBalanceQueryFailures(pool, denom),
+		failures: newBalanceQueryFailures(pool, denom),
 	}
 }
 
-// bindBalanceQueryFailures binds the failure series of every address the pool
+// newBalanceQueryFailures binds the failure series of every address the pool
 // holds now. The pool only ever shrinks (DemoteToSingleSigner), so every
 // address a later scrape queries is among them.
-func bindBalanceQueryFailures(pool *SignerPool, denom string) map[string]prometheus.Counter {
+func newBalanceQueryFailures(pool *SignerPool, denom string) map[string]prometheus.Counter {
 	failures := map[string]prometheus.Counter{
 		pool.ProviderAddress(): metrics.BindSignerBalanceQueryFailure(signerRoleProvider, pool.ProviderAddress(), denom),
 	}

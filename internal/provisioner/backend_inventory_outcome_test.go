@@ -39,6 +39,7 @@ func TestClassifyBackendInventoryCoversEveryEvidenceShape(t *testing.T) {
 }
 
 func TestBackendInventoryOutcomeSeriesAreClosedAndOnlyKeptEvidenceAnswers(t *testing.T) {
+	metrics.BindBackends("inventory-outcome-test")
 	counters := metrics.ForBackend("inventory-outcome-test").Inventory
 	_, ok := backendInventoryOutcomeInvalid.counter(counters)
 	assert.False(t, ok, "the zero value is never exported")
