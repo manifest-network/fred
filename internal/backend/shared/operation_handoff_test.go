@@ -679,7 +679,7 @@ func TestOperationSuccessWithoutCommittedReleaseIsUnrepresentableAcrossRestart(t
 	require.NoError(t, err)
 	probe, err := reopenedSettlement.NewOperationIntentProbe(spec.LeaseUUID, spec.CallbackURL)
 	require.NoError(t, err)
-	state, err := reopenedSettlement.LookupOperationRecovery(probe)
+	state, err := reopenedSettlement.LookupOperationRecovery(t.Context(), probe)
 	require.NoError(t, err)
 	recovered, ok := state.(OperationIntentClaim)
 	require.True(t, ok)

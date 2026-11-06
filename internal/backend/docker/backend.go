@@ -116,7 +116,7 @@ type operationSettlementService interface {
 	ListOperationIntents() ([]shared.OperationIntentClaim, error)
 	ListOperationRecoveryStates() ([]shared.OperationRecoveryState, error)
 	ListFailedOperationReceipts() ([]shared.FailedOperationReceipt, error)
-	LookupOperationRecovery(shared.OperationIntentProbe) (shared.OperationRecoveryState, error)
+	LookupOperationRecovery(context.Context, shared.OperationIntentProbe) (shared.OperationRecoveryState, error)
 	PrepareOperationRelease(shared.OperationIntentClaim) (shared.OperationReleaseCandidate, error)
 	ReserveProvisionResources(*shared.ResourcePool, shared.OperationIntentClaim) (shared.ProvisionAdmission, error)
 	CheckOperationReleaseCapacity(shared.OperationReleaseCandidate) error
@@ -128,7 +128,7 @@ type operationSettlementService interface {
 	CleanupFailedOperationReceipt(context.Context, shared.LeaseRecoveryScope, shared.FailedOperationReceipt) error
 	CommitOperationSuccess(shared.OperationExecutionSuccess) (shared.OperationReleaseCommitted, error)
 	CommitOperationFailure(shared.OperationExecutionFailure) (shared.OperationReleaseUncommitted, error)
-	ProveCommittedOperation(shared.OperationIntentClaim) (shared.OperationReleaseCommitted, error)
+	ProveCommittedOperation(context.Context, shared.OperationIntentClaim) (shared.OperationReleaseCommitted, error)
 }
 
 // releaseBackfillService is the pair-bound authority for enriching an active
@@ -178,7 +178,7 @@ type Backend struct {
 	storageIdentity  backendidentity.ID
 	storageAuthority backendidentity.VerifiedStorage
 	storageVerifier  dockerStorageIdentityVerifier
-	identityVerifyMu sync.Mutex
+	identityVerifyMu identityVerifyLock
 	identityDriftErr error
 	// storeAuthorityGate is the backend-wide terminal cause and the commit
 	// linearization point shared by every identity-bound journal. Its lock is
@@ -3246,9 +3246,12 @@ func (b *Backend) verifyStorageIdentity(
 		return err
 	}
 	lockStarted := time.Now()
-	b.identityVerifyMu.Lock()
+	lockErr := b.identityVerifyMu.lockContext(ctx)
 	observeStorageIdentityStage(identityStageLock, lockStarted)
-	defer b.identityVerifyMu.Unlock()
+	if lockErr != nil {
+		return fmt.Errorf("wait for storage identity verification: %w", lockErr)
+	}
+	defer b.identityVerifyMu.unlock()
 	if err := b.terminalStorageAuthorityError(); err != nil {
 		return err
 	}

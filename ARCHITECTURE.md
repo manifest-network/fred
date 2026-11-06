@@ -2127,7 +2127,7 @@ All metrics fred defines use the `fred_` namespace and are exposed at `/metrics`
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `fred_backend_requests_total` | counter | `backend, operation, status` | Backend request count; `status` is `success`, `error`, or `fenced` (refused locally, nothing sent) |
+| `fred_backend_requests_total` | counter | `backend, operation, status` | Backend request count; `status` is `success`, `error`, `fenced` (refused locally, nothing sent), or `pending` (the backend answered `503` `lifecycle_pending`: the work is still running) |
 | `fred_backend_fenced` | gauge | `backend` | 1 while the operator has fenced the backend (`backends[].fenced`), 0 otherwise. Set once when its client is built. Gate the backend's availability alerts on it |
 | `fred_placement_unprojected_fenced_reporter` | gauge | `backend` | 1 while the placement database records the backend as a fenced reporter whose positives an interrupted sweep never projected, 0 otherwise. While any backend is 1, no lease without a placement row is admitted and `/readyz` reports `placement inventory waits on a fenced backend`. Published at open and after every projection; clears when the backend answers both inventories again or is retired |
 | `fred_backend_request_duration_seconds` | histogram | `backend, operation, status` | Backend request latency |

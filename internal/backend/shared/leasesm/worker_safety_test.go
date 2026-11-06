@@ -47,7 +47,9 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	actor.workers.Add()
 
 	reply := make(chan error, 1)
-	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
+	})
 	select {
 	case err := <-reply:
 		require.True(t, IsLifecyclePending(err), "the exact live worker must issue a pending observation: %v", err)
@@ -67,7 +69,9 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	// immediate observation cannot strand the actor in Deprovisioning.
 	actor.workers.Done()
 	retryReply := make(chan error, 1)
-	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: retryReply}) })
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(deprovisionMsg{Reply: retryReply, fence: actorCloseFence(actor)})
+	})
 	select {
 	case err := <-retryReply:
 		require.NoError(t, err)
@@ -126,10 +130,7 @@ func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) 
 			// leaves. The failed OnExit preserves Failing, which normally permits
 			// restart/update; close ownership must independently fence admission.
 			actor.beginWorkerActivity()
-			ctx, cancel := context.WithCancel(t.Context())
-			command, reply, err := NewDeprovisionCommand(ctx)
-			require.NoError(t, err)
-			cancel()
+			command, reply := newTestDeprovisionCommand(t, actor)
 			actor.handle(command.envelope.message)
 			require.ErrorIs(t, <-reply.Result(), ErrWorkerDrainTimeout)
 			require.Equal(t, backend.ProvisionStatusFailing, actor.State())
@@ -137,7 +138,7 @@ func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) 
 			require.Nil(t, actor.TryClaimQuiescence(), "a drained worker does not let recovery retire the requested close owner")
 			claim := newTestMaintenanceClaim(t, testActorLeaseUUID, kind)
 			target := testMaintenanceTarget(t, claim)
-			command, reply, err = NewRestartCommand(testMaintenanceHandoff(t, t.Context()), target)
+			command, reply, err := NewRestartCommand(testMaintenanceHandoff(t, t.Context()), target)
 			if kind == shared.MaintenanceIntentUpdate {
 				command, reply, err = NewUpdateCommand(testMaintenanceHandoff(t, t.Context()), target)
 			}
@@ -147,8 +148,7 @@ func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) 
 			actor.cfg.WG.Wait()
 			require.Zero(t, workers.Load(), "close-owned actor cannot acknowledge a mutation whose terminal result it would suppress")
 			require.Zero(t, teardown.Load())
-			command, reply, err = NewDeprovisionCommand(t.Context())
-			require.NoError(t, err)
+			command, reply = newTestDeprovisionCommand(t, actor)
 			actor.handle(command.envelope.message)
 			require.NoError(t, <-reply.Result())
 			require.EqualValues(t, 1, teardown.Load(), "the close continuation remains admissible")
@@ -173,7 +173,9 @@ func TestDeprovisionAbsentProjectionStillRunsSubstrateFinalizer(t *testing.T) {
 	})
 
 	reply := make(chan error, 1)
-	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
+	})
 	select {
 	case err := <-reply:
 		require.NoError(t, err)

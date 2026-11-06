@@ -1359,7 +1359,7 @@ func (b *Backend) ensureRecoveredOperationSuccess(
 		// zero-survivor projection keeps its non-expiring identity in the same
 		// atomic row, so settling the operation intent cannot erase restart
 		// authority.
-		committed, proveErr := b.operationSettlement.ProveCommittedOperation(claim)
+		committed, proveErr := b.operationSettlement.ProveCommittedOperation(ctx, claim)
 		if proveErr != nil {
 			return shared.OperationReleaseCommitted{}, proveErr
 		}

@@ -85,7 +85,7 @@ func TestSettleCommittedOperationBeforeCloseRequiresExactOperationLineage(t *tes
 				require.Equal(t, spec.SourceGeneration, claimedProof.Entry().Generation)
 			}
 
-			require.NoError(t, b.settleCommittedOperationBeforeClose(spec.LeaseUUID))
+			require.NoError(t, b.settleCommittedOperationBeforeClose(t.Context(), spec.LeaseUUID))
 			intents, err := stores.operations.ListOperationIntents()
 			require.NoError(t, err)
 			require.Len(t, intents, 1,
@@ -98,7 +98,7 @@ func TestSettleCommittedOperationBeforeCloseRequiresExactOperationLineage(t *tes
 			// The exact causal release proves that this operation crossed its commit
 			// boundary before Close reached the actor drain point.
 			commitOperationSuccessForTest(t, stores.operations, operationClaim)
-			require.NoError(t, b.settleCommittedOperationBeforeClose(spec.LeaseUUID))
+			require.NoError(t, b.settleCommittedOperationBeforeClose(t.Context(), spec.LeaseUUID))
 			intents, err = stores.operations.ListOperationIntents()
 			require.NoError(t, err)
 			assert.Empty(t, intents)
@@ -121,7 +121,7 @@ func TestSettleCommittedOperationBeforeMaintenanceFencesUnresolvedLineage(t *tes
 	require.Equal(t, shared.OperationIntentAdmissionCreated, admission.Disposition())
 	operationClaim := createdDockerOperationClaim(t, admission)
 
-	err := b.settleCommittedOperationBeforeMaintenance(spec.LeaseUUID)
+	err := b.settleCommittedOperationBeforeMaintenance(t.Context(), spec.LeaseUUID)
 	require.ErrorIs(t, err, backend.ErrInvalidState)
 	intents, err := stores.operations.ListOperationIntents()
 	require.NoError(t, err)
@@ -132,7 +132,7 @@ func TestSettleCommittedOperationBeforeMaintenanceFencesUnresolvedLineage(t *tes
 
 	commitOperationSuccessForTest(t, stores.operations, operationClaim)
 
-	require.NoError(t, b.settleCommittedOperationBeforeMaintenance(spec.LeaseUUID))
+	require.NoError(t, b.settleCommittedOperationBeforeMaintenance(t.Context(), spec.LeaseUUID))
 	intents, err = stores.operations.ListOperationIntents()
 	require.NoError(t, err)
 	assert.Empty(t, intents)

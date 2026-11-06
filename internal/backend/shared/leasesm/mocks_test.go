@@ -286,6 +286,24 @@ func bindLeaseSMOperationExecutor(
 
 const testActorLeaseUUID = "11111111-1111-4111-8111-111111111111"
 
+// actorCloseFence holds actor's lease on actor's own command fence, as a
+// substrate does before it hands a close to the actor.
+func actorCloseFence(actor *LeaseActor) shared.CommandFenceHold {
+	return actor.cfg.CommandFence.Lock(actor.leaseUUID)
+}
+
+// newTestDeprovisionCommand builds a close command for actor that owns its
+// lease's command fence.
+func newTestDeprovisionCommand(t *testing.T, actor *LeaseActor) (ActorCommand, ActorReply) {
+	t.Helper()
+	command, reply, err := NewDeprovisionCommand(actorCloseFence(actor))
+	require.NoError(t, err)
+	return command, reply
+}
+
+// testActorCloseTimeout bounds a test actor's close attempts.
+const testActorCloseTimeout = 30 * time.Second
+
 func newMockProvisionStore() *mockProvisionStore {
 	return &mockProvisionStore{states: make(map[string]*ProvisionState)}
 }
@@ -466,6 +484,8 @@ type testActorOpts struct {
 	StopCtx                   context.Context
 	WG                        *sync.WaitGroup
 	WorkerDrainTimeout        time.Duration
+	CloseTimeout              time.Duration
+	CommandFence              *shared.CommandFence
 	Inspector                 InstanceInspector
 	Diag                      DiagnosticsGatherer
 	ProvisionStore            LeaseProvisionStore
@@ -527,6 +547,12 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 	}
 	if opts.StopCtx == nil {
 		opts.StopCtx = context.Background()
+	}
+	if opts.CloseTimeout == 0 {
+		opts.CloseTimeout = testActorCloseTimeout
+	}
+	if opts.CommandFence == nil {
+		opts.CommandFence = &shared.CommandFence{}
 	}
 	if opts.WG == nil {
 		opts.WG = &sync.WaitGroup{}
@@ -594,6 +620,8 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 		StopCtx:              opts.StopCtx,
 		WG:                   opts.WG,
 		WorkerDrainTimeout:   opts.WorkerDrainTimeout,
+		CloseTimeout:         opts.CloseTimeout,
+		CommandFence:         opts.CommandFence,
 		Inspector:            opts.Inspector,
 		Diag:                 opts.Diag,
 		ProvisionStore:       opts.ProvisionStore,
@@ -657,6 +685,12 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 	}
 	if opts.StopCtx == nil {
 		opts.StopCtx = context.Background()
+	}
+	if opts.CloseTimeout == 0 {
+		opts.CloseTimeout = testActorCloseTimeout
+	}
+	if opts.CommandFence == nil {
+		opts.CommandFence = &shared.CommandFence{}
 	}
 	if opts.WG == nil {
 		opts.WG = &sync.WaitGroup{}
@@ -729,6 +763,8 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 		StopCtx:              opts.StopCtx,
 		WG:                   opts.WG,
 		WorkerDrainTimeout:   opts.WorkerDrainTimeout,
+		CloseTimeout:         opts.CloseTimeout,
+		CommandFence:         opts.CommandFence,
 		Inspector:            opts.Inspector,
 		Diag:                 opts.Diag,
 		ProvisionStore:       opts.ProvisionStore,

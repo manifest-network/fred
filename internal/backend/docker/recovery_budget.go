@@ -3,7 +3,10 @@ package docker
 import (
 	"cmp"
 	"context"
+	"slices"
 	"time"
+
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // defaultRecoveryDockerReadTimeout prevents a wedged Docker List/Inspect from
@@ -41,6 +44,21 @@ const (
 	// deadlines are capped by this parent instead of multiplying by object count.
 	defaultStartupPhaseTimeout = 2 * time.Minute
 )
+
+// closeWorkAllowance is what one close attempt allows beyond stopping
+// containers: removing them, settling volumes and retention, and committing the
+// close journal.
+const closeWorkAllowance = 5 * time.Minute
+
+// closeAttemptTimeout bounds one close attempt, which runs on the backend's
+// lifetime rather than its caller's. Compose stops a stack one dependency level
+// at a time and gives every level the full stop grace, so stopping alone can
+// take one grace per level.
+func (b *Backend) closeAttemptTimeout() time.Duration {
+	stop := cmp.Or(b.cfg.ContainerStopTimeout, defaultContainerStopTimeout)
+	levels := slices.Repeat([]time.Duration{stop}, manifest.MaxDependencyLevels)
+	return saturatingDurationSum(append(levels, closeWorkAllowance)...)
+}
 
 func (b *Backend) recoveryDockerReadContext(parent context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parent, b.recoveryDockerReadBudget())

@@ -893,7 +893,7 @@ func recordRestoreOperationOutcome(
 		entry.NewLeaseUUID, entry.DestinationCallbackURL,
 	)
 	require.NoError(t, err)
-	state, err := settlement.LookupOperationRecovery(probe)
+	state, err := settlement.LookupOperationRecovery(t.Context(), probe)
 	require.NoError(t, err)
 	return state
 }

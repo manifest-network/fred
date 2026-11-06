@@ -835,6 +835,10 @@ func (s *StackManifest) validateStoredTopology() (dependsOnAnalysis, error) {
 // tenant admission accepts.
 const dependsOnMaxDepth = 10
 
+// MaxDependencyLevels is the most dependency levels of a stack that admission
+// accepts: a chain of dependsOnMaxDepth links spans one more service.
+const MaxDependencyLevels = dependsOnMaxDepth + 1
+
 // dependsOnAnalysis is the result of a depends_on graph that passed every
 // structural check. Only analyzeDependsOn constructs a usable one, so holding
 // it is evidence that the graph is acyclic and every reference resolves. It

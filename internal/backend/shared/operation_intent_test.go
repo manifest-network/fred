@@ -243,7 +243,7 @@ func TestOperationOutcomeSurvivesCallbackDeliveryAndRestart(t *testing.T) {
 	require.Len(t, pending, 1)
 	assert.Equal(t, spec.CallbackURL, pending[0].CallbackURL)
 	assert.Equal(t, backend.CallbackStatusSuccess, pending[0].Status)
-	state, err := store.LookupOperationRecovery(testOperationIntentProbe(t, store, spec))
+	state, err := store.LookupOperationRecovery(t.Context(), testOperationIntentProbe(t, store, spec))
 	require.NoError(t, err)
 	succeeded, ok := state.(OperationSucceeded)
 	require.True(t, ok)
@@ -253,7 +253,7 @@ func TestOperationOutcomeSurvivesCallbackDeliveryAndRestart(t *testing.T) {
 	require.NoError(t, store.Close())
 	store, err = newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
-	state, err = store.LookupOperationRecovery(testOperationIntentProbe(t, store, spec))
+	state, err = store.LookupOperationRecovery(t.Context(), testOperationIntentProbe(t, store, spec))
 	require.NoError(t, err)
 	_, ok = state.(OperationSucceeded)
 	assert.True(t, ok, "terminal success must outlive outbox delivery and process restart")
@@ -331,7 +331,7 @@ func TestOperationIntentCapabilitiesRejectZeroAndCrossStoreUse(t *testing.T) {
 	require.ErrorContains(t, err, "was not minted")
 	_, err = storeA.ProbeOperationIntent(OperationIntentProbe{})
 	require.ErrorContains(t, err, "was not minted")
-	_, err = storeA.LookupOperationRecovery(OperationIntentProbe{})
+	_, err = storeA.LookupOperationRecovery(t.Context(), OperationIntentProbe{})
 	require.ErrorContains(t, err, "was not minted")
 
 	spec := testOperationIntentSpec(t, "candidate-cross-store")
@@ -343,7 +343,7 @@ func TestOperationIntentCapabilitiesRejectZeroAndCrossStoreUse(t *testing.T) {
 	require.NoError(t, err)
 	_, err = storeB.ProbeOperationIntent(probe)
 	require.ErrorContains(t, err, "was not minted by this callback journal")
-	_, err = storeB.LookupOperationRecovery(probe)
+	_, err = storeB.LookupOperationRecovery(t.Context(), probe)
 	require.ErrorContains(t, err, "was not minted by this callback journal")
 
 	intents, err := storeA.ListOperationIntents()
@@ -376,7 +376,7 @@ func TestOperationIntentCapabilitiesDoNotSurviveStoreReopen(t *testing.T) {
 	require.ErrorContains(t, err, "was not minted by this callback journal")
 	_, err = reopened.ProbeOperationIntent(probe)
 	require.ErrorContains(t, err, "was not minted by this callback journal")
-	_, err = reopened.LookupOperationRecovery(probe)
+	_, err = reopened.LookupOperationRecovery(t.Context(), probe)
 	require.ErrorContains(t, err, "was not minted by this callback journal")
 }
 
@@ -421,7 +421,7 @@ func TestFailedOperationOutcomeIsTypedAndDurable(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	state, err := store.LookupOperationRecovery(testOperationIntentProbe(t, store, spec))
+	state, err := store.LookupOperationRecovery(t.Context(), testOperationIntentProbe(t, store, spec))
 	require.NoError(t, err)
 	failed, ok := state.(OperationFailed)
 	require.True(t, ok)

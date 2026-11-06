@@ -203,12 +203,13 @@ func (b *Backend) routeReplaceRestart(
 	// head continues to exclude successors after this response fence opens.
 	var unlockCommand func()
 	if route.waitsForLeaseCommands() {
-		unlockCommand = b.commandFence.Lock(leaseUUID)
+		unlockCommand = b.commandFence.Lock(leaseUUID).Release
 	} else {
-		var acquired bool
-		if unlockCommand, acquired = b.commandFence.TryLock(leaseUUID); !acquired {
+		fence, acquired := b.commandFence.TryLock(leaseUUID)
+		if !acquired {
 			return errLeaseCommandBusy
 		}
+		unlockCommand = fence.Release
 	}
 	defer unlockCommand()
 	if b.callbackStore != nil && b.releaseStore != nil {
@@ -226,11 +227,11 @@ func (b *Backend) routeReplaceRestart(
 			return replayErr
 		}
 	}
-	if err := b.settleCommittedOperationBeforeMaintenance(leaseUUID); err != nil {
+	if err := b.settleCommittedOperationBeforeMaintenance(ctx, leaseUUID); err != nil {
 		return err
 	}
 	if route.kind == shared.MaintenanceIntentRestart {
-		if err := b.ensureRestoreDestinationRestartAvailable(leaseUUID); err != nil {
+		if err := b.ensureRestoreDestinationRestartAvailable(ctx, leaseUUID); err != nil {
 			return err
 		}
 	} else if err := b.ensureRestoreDestinationUnowned(leaseUUID); err != nil {
@@ -495,7 +496,7 @@ func (b *Backend) update(
 	// See routeReplaceRestart: the release Append and the actor's authoritative
 	// Updating transition are one admission critical section. A losing caller
 	// observes Updating before it can append a second, unowned release row.
-	unlockCommand := b.commandFence.Lock(req.LeaseUUID)
+	unlockCommand := b.commandFence.Lock(req.LeaseUUID).Release
 	defer unlockCommand()
 	if b.callbackStore != nil && b.releaseStore != nil {
 		disposition, err := b.maintenanceSettlement.ProbeMaintenanceIntent(request)
@@ -513,7 +514,7 @@ func (b *Backend) update(
 		}
 	}
 	logger := b.logger.With("lease_uuid", req.LeaseUUID)
-	if err := b.settleCommittedOperationBeforeMaintenance(req.LeaseUUID); err != nil {
+	if err := b.settleCommittedOperationBeforeMaintenance(ctx, req.LeaseUUID); err != nil {
 		return err
 	}
 	if err := b.ensureRestoreDestinationUnowned(req.LeaseUUID); err != nil {

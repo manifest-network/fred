@@ -1,6 +1,8 @@
 package leasesm
 
 import (
+	"errors"
+	"fmt"
 	"sync/atomic"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -15,11 +17,12 @@ type ActorCloseScope struct{ state *actorCloseScopeState }
 type actorCloseScopeState struct {
 	actor   *LeaseActor
 	lineage shared.RecoveryLineage
+	fence   shared.CommandFenceHold
 	active  atomic.Bool
 }
 
-func newActorCloseScope(actor *LeaseActor) ActorCloseScope {
-	state := &actorCloseScopeState{actor: actor, lineage: actor.cfg.RecoveryLineage}
+func newActorCloseScope(actor *LeaseActor, fence shared.CommandFenceHold) ActorCloseScope {
+	state := &actorCloseScopeState{actor: actor, lineage: actor.cfg.RecoveryLineage, fence: fence}
 	state.active.Store(true)
 	actor.activeClose.Store(state)
 	return ActorCloseScope{state: state}
@@ -52,6 +55,24 @@ func (a *LeaseActor) CloseOwnsObservation(observation ActorObservation) bool {
 	generation := a.cfg.ProvisionStore.ClassifyReadyRuntime(death.Runtime)
 	return (generation == ObservationGenerationCurrent || generation == ObservationGenerationAdvanced) &&
 		scope.Matches(a, a.cfg.RecoveryLineage)
+}
+
+// CloseAdmitted gives back the command fence the close's caller handed over,
+// on evidence that the close's durable head is committed in this actor's own
+// journal: the actor's recovery lineage must prove head (ProvesCloseHead).
+// That head refuses every other mutation of the lease, so teardown runs
+// without the fence. The actor releases the fence anyway when the close
+// attempt ends, so a close that never reaches its head never leaks it.
+func (scope ActorCloseScope) CloseAdmitted(head shared.CloseIntentClaim) error {
+	leaseUUID := scope.LeaseUUID()
+	if leaseUUID == "" {
+		return errors.New("close admission needs an active actor close")
+	}
+	if err := scope.state.lineage.ProvesCloseHead(head, leaseUUID); err != nil {
+		return fmt.Errorf("close admission needs this lease's durable close head: %w", err)
+	}
+	scope.state.fence.Release()
+	return nil
 }
 
 func (scope ActorCloseScope) LeaseUUID() string {

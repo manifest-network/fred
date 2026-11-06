@@ -1233,12 +1233,12 @@ func (b *Backend) latchIdentityVerificationFailureLocked(cause error) error {
 func (b *Backend) latchAmbiguousOperationOutcome(operation string, cause error) error {
 	ambiguousErr := fmt.Errorf("%w: %s: %w",
 		backendidentity.ErrMutationOutcomeAmbiguous, operation, cause)
-	b.identityVerifyMu.Lock()
+	b.identityVerifyMu.lock()
 	if !errors.Is(b.identityDriftErr, backendidentity.ErrMutationOutcomeAmbiguous) {
 		b.identityDriftErr = ambiguousErr
 	}
 	identityErr := b.identityDriftErr
-	b.identityVerifyMu.Unlock()
+	b.identityVerifyMu.unlock()
 
 	// A post-mutation verification first reports its lower-level drift through
 	// VerifyStorageIdentity and is then classified here as outcome-ambiguous.

@@ -363,8 +363,8 @@ func testStartOverallBudgetCapsOperationRecoveryInventory(t *testing.T) {
 		// Only operation recovery owns this exact pending lease's command
 		// fence. Preflight and ordinary state publication remain free to add
 		// their own inventory reads without changing this causal barrier.
-		if unlock, available := b.commandFence.TryLock(spec.LeaseUUID); available {
-			unlock()
+		if fence, available := b.commandFence.TryLock(spec.LeaseUUID); available {
+			fence.Release()
 			return nil, nil
 		}
 		observedDeadline, _ = ctx.Deadline()

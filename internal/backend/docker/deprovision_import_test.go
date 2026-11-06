@@ -72,11 +72,13 @@ func observeImageFlightAccounting(t *testing.T, m *imageCapacityManager) imageFl
 
 // closeBesideHeldFlightRegistry makes one bounded close attempt while the caller
 // holds m.flights.mu, and release gives that lock back. The close path must
-// never take the flight registry. A sync.Mutex ignores the attempt's deadline,
-// so the attempt runs on its own goroutine: if it has not returned well past its
-// deadline, it is blocked behind the held registry. The helper then releases
-// the registry so the attempt and the backend can unwind, and fails with that
-// cause rather than hanging until the test binary's timeout.
+// never take the flight registry. A close blocked behind it in the actor
+// outlasts the attempt, which then answers closePending at its deadline. A
+// sync.Mutex ignores that deadline, so the attempt runs on its own goroutine:
+// if it has not returned well past its deadline, the attempt itself is blocked
+// behind the held registry. The helper then releases the registry so the
+// attempt and the backend can unwind, and fails with that cause rather than
+// hanging until the test binary's timeout.
 func closeBesideHeldFlightRegistry(t *testing.T, b *Backend, lease string, release func()) error {
 	t.Helper()
 	const deadline, watchdog = time.Second, 5 * time.Second
@@ -86,8 +88,10 @@ func closeBesideHeldFlightRegistry(t *testing.T, b *Backend, lease string, relea
 	go func() { result <- b.Deprovision(ctx, lease) }()
 	select {
 	case err := <-result:
-		require.NotErrorIs(t, err, context.DeadlineExceeded,
-			"close waited out its deadline while the test held the image flight registry: the close path must not wait on m.flights.mu")
+		if outlasted := (closePending{}); errors.As(err, &outlasted) {
+			release()
+			t.Fatal("close outlasted its caller's deadline while the test held the image flight registry: the close path must not wait on m.flights.mu")
+		}
 		return err
 	case <-time.After(watchdog):
 	}
@@ -197,7 +201,6 @@ func TestDeprovisionDuringOwnedImageImportReturnsPendingBeforeHTTPDeadline(t *te
 
 	// Released, the worker leaves the flight and drains. Close then completes
 	// while the import is still outstanding: only this test can complete it.
-	closing := b.actorFor(request.LeaseUUID)
 	require.NoError(t, deprovisionAfterWorkerDrain(t, t.Context(), b, request.LeaseUUID),
 		"close must complete once its own worker drains, without waiting for the flight's import")
 	require.NoError(t, work.Err(), "close cannot cancel the flight's dispatched daemon exchange")
@@ -235,14 +238,9 @@ func TestDeprovisionDuringOwnedImageImportReturnsPendingBeforeHTTPDeadline(t *te
 	replayed, err := b.callbackStore.ListPending()
 	require.NoError(t, err)
 	require.Equal(t, callbacks, replayed, "the late import completion cannot publish a settlement")
-	// The completed close retires its actor asynchronously. Until that actor
-	// leaves the registry, a repeated close reaches it and is told to retry, so
-	// repeat the close against a fresh actor, as providerd's next attempt would.
-	select {
-	case <-closing.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("the closed lease's actor did not exit")
-	}
+	// The completed close retires its actor asynchronously. A repeated close
+	// that reaches it before it leaves the registry is routed to its
+	// replacement, so the repeat needs no wait.
 	require.NoError(t, b.Deprovision(t.Context(), request.LeaseUUID))
 	replayed, err = b.callbackStore.ListPending()
 	require.NoError(t, err)

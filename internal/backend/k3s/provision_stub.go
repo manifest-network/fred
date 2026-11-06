@@ -52,7 +52,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		provisionsTotal.WithLabelValues("rejected").Inc()
 		return fmt.Errorf("%w: lease_uuid is required", backend.ErrValidation)
 	}
-	unlockCommand := b.commandFence.Lock(req.LeaseUUID)
+	unlockCommand := b.commandFence.Lock(req.LeaseUUID).Release
 	defer unlockCommand()
 	if req.CallbackURL == "" {
 		provisionsTotal.WithLabelValues("rejected").Inc()
@@ -325,7 +325,7 @@ func (b *Backend) sendStubFailureCallback(f stubFailure) {
 	// Teardown must either cancel this worker before it starts publication or
 	// observe the completed journal transition; it cannot consume the same
 	// unresolved operation between these two durable checks.
-	unlockCommand := b.commandFence.Lock(f.leaseUUID)
+	unlockCommand := b.commandFence.Lock(f.leaseUUID).Release
 	defer unlockCommand()
 	if err := f.leaseCtx.Err(); err != nil {
 		b.logger.Debug("suppressing callback send for canceled provision",
@@ -376,7 +376,7 @@ func (b *Backend) sendStubFailureCallback(f stubFailure) {
 // teardown cannot manufacture a duplicate.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	_ = ctx
-	unlockCommand := b.commandFence.Lock(leaseUUID)
+	unlockCommand := b.commandFence.Lock(leaseUUID).Release
 	defer unlockCommand()
 	b.provisionsMu.Lock()
 	if existing, ok := b.provisions[leaseUUID]; ok {

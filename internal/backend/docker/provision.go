@@ -88,7 +88,7 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 	if err := b.requireMutationAdmission(ctx, "provision"); err != nil {
 		return fmt.Errorf("backend storage identity verification failed: %w", err)
 	}
-	unlockCommand := b.commandFence.Lock(req.LeaseUUID)
+	unlockCommand := b.commandFence.Lock(req.LeaseUUID).Release
 	defer unlockCommand()
 	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(
 		req.CallbackURL, req.LifecycleCallbackURL,

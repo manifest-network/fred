@@ -28,7 +28,7 @@ func TestOperationSettlementAdmissionRejectsZeroAndCrossPairCapabilities(t *test
 	require.ErrorContains(t, err, "invalid")
 	_, err = zero.ListFailedOperationReceipts()
 	require.ErrorContains(t, err, "invalid")
-	_, err = zero.LookupOperationRecovery(OperationIntentProbe{})
+	_, err = zero.LookupOperationRecovery(t.Context(), OperationIntentProbe{})
 	require.ErrorContains(t, err, "invalid")
 
 	storesA := openOperationHandoffStores(t, "docker-operation-a")
@@ -48,13 +48,13 @@ func TestOperationSettlementAdmissionRejectsZeroAndCrossPairCapabilities(t *test
 	require.NoError(t, err)
 	_, err = storesB.settlement.ProbeOperationIntent(probe)
 	require.ErrorContains(t, err, "another journal pair")
-	_, err = storesB.settlement.LookupOperationRecovery(probe)
+	_, err = storesB.settlement.LookupOperationRecovery(t.Context(), probe)
 	require.ErrorContains(t, err, "another journal pair")
 
 	disposition, err := storesA.settlement.ProbeOperationIntent(probe)
 	require.NoError(t, err)
 	assert.Equal(t, OperationIntentAdmissionExisting, disposition)
-	recovered, err := storesA.settlement.LookupOperationRecovery(probe)
+	recovered, err := storesA.settlement.LookupOperationRecovery(t.Context(), probe)
 	require.NoError(t, err)
 	assert.Equal(t, claim.OperationID(), recovered.OperationID())
 }
@@ -87,7 +87,7 @@ func TestOperationSettlementCapabilitiesBindSameCallbackStoreToExactReleaseStore
 	require.NoError(t, err)
 	_, err = alternate.ProbeOperationIntent(probe)
 	require.ErrorContains(t, err, "another journal pair")
-	_, err = alternate.LookupOperationRecovery(probe)
+	_, err = alternate.LookupOperationRecovery(t.Context(), probe)
 	require.ErrorContains(t, err, "another journal pair")
 
 	// Recovery through the alternate pair must explicitly remint a claim from

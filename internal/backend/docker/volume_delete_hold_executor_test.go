@@ -547,7 +547,7 @@ func TestVolumeDeleteHoldExecutorRetriesACloseResumeItFoundBusy(t *testing.T) {
 	require.NoError(t, err)
 
 	held.Store(false) // the hold executor finished the deletion
-	unlock := b.commandFence.Lock(closeDeprovisionLeaseUUID)
+	unlock := b.commandFence.Lock(closeDeprovisionLeaseUUID).Release
 	b.resumeClosesAfterHeldDeletes([]managedVolumeName{parsed})
 	unlock()
 	_, found, err := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)

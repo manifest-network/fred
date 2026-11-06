@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- `fred_backend_requests_total` and `fred_backend_request_duration_seconds` count a `503` `lifecycle_pending` answer under `status="pending"` instead of `status="error"`. The answer means the backend's work is still running, which the circuit breaker already did not count as a failure.
+
 ### Deprecated
 
 ### Removed
@@ -18,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - providerd no longer exits when pending maintenance recovery or a chain lease-inventory read panics. Recovery runs at every start, so such a panic used to crash-loop providerd. Now a panic fails only the unit it hit: one recovered command stays pending for the next pass while that backend's other commands continue, and a failed inventory read gives that reconciliation sweep no inventory, so it takes no action. Each panic is logged with its stack and counted in `fred_background_goroutine_panics_total{component="maintenance_recovery"}` or `fred_provisioner_reconciler_panics_total{stage="fetch_chain_leases"}`. Both series are exported at 0 from startup.
 - docker-backend now freezes the resource sizing of retention records written by v0.13 onto each record at startup, and sizes every retained footprint only from its record. Before, every start re-resolved those records' SKUs against the current `sku_profiles`, so removing a profile that a retained lease still referenced stopped the backend from starting until the record expired (90 days by default). If a v0.13 record's SKU no longer resolves when it is frozen, startup fails with `freeze retained resource sizing`, naming the lease and SKU: restore the profile for one start, then remove it.
+- docker-backend no longer cancels a close when the request for it ends. Teardown used to run on the HTTP request's context, which providerd's 30-second request timeout canceled: a container that used its full 30-second stop grace failed the close and counted a circuit-breaker failure against the backend each time. The close now runs on the backend's lifetime. One attempt may take `container_stop_timeout` for each of a stack's up to 11 dependency levels plus 5 minutes, 10.5 minutes at the default. `/deprovision` answers within 20 seconds, counting its authentication and storage identity checks; a close still running then answers `503` `lifecycle_pending`, which providerd retries without counting a breaker failure. providerd gives every `/deprovision` request at least 30 seconds, whatever the backend's `timeout` setting. A retry that reached the lease's actor just as the previous close retired it used to fail with `500` and the internal text "lease actor terminated"; it is now answered by the next actor.
 - providerd now exits with status 1 when one of its components fails. Before, a component that returned an error or panicked shut providerd down with status 0, so a systemd unit with `Restart=on-failure` left the provider down. A component that stops on its own before shutdown now counts as a failure too, instead of leaving providerd running without it. The error is printed once, without the usage text.
 
 ### Security

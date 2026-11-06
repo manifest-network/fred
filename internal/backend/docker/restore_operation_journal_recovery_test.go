@@ -38,7 +38,7 @@ func TestRestoreRecoveryRejectsCorruptOperationJournal(t *testing.T) {
 				}
 				require.NoError(t, b.callbackStore.Close())
 				require.NoError(t, reopenRestoreOperationJournalForTest(t, b))
-				state, err := b.currentRestoreOperation(source)
+				state, err := b.currentRestoreOperation(t.Context(), source)
 				require.NoError(t, err, "reopening must preserve valid recovery authority")
 				if terminal {
 					_, failed := state.(shared.OperationFailed)
@@ -81,7 +81,7 @@ func TestRestoreRecoveryRejectsCorruptOperationJournal(t *testing.T) {
 						require.Len(t, claims, 1)
 						require.NoError(t, b.resolvePreEffectOperationRefusal(claims[0], "interrupted restore"))
 					}
-					state, err := b.currentRestoreOperation(source)
+					state, err := b.currentRestoreOperation(t.Context(), source)
 					require.NoError(t, err, "the uncorrupted operation must reach the exact recovery probe")
 					if terminal {
 						_, failed := state.(shared.OperationFailed)

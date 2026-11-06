@@ -66,12 +66,75 @@ type actorObservationMessage interface {
 // successful actor admission can consume the envelope. A refused enqueue
 // releases the claim so bounded routing retries remain possible.
 type messageEnvelope struct {
-	message  leaseMessage
-	accepted atomic.Bool
+	message   leaseMessage
+	admission atomic.Uint32
 }
+
+// envelopeAdmission is the closed set of an envelope's admission states. An
+// enqueue claims admission tentatively, then either an actor accepts the
+// message or the claim rolls back to idle. Abandoning an idle envelope
+// settles it at once; abandoning one mid-enqueue is recorded, and that
+// enqueue settles it if no actor accepts, so the request is never lost.
+type envelopeAdmission uint32
+
+const (
+	envelopeIdle envelopeAdmission = iota
+	envelopeEnqueueing
+	envelopeEnqueueingAbandoned
+	envelopeAccepted
+	envelopeAbandoned
+)
 
 func newMessageEnvelope(message leaseMessage) *messageEnvelope {
 	return &messageEnvelope{message: message}
+}
+
+func (e *messageEnvelope) state() envelopeAdmission {
+	return envelopeAdmission(e.admission.Load())
+}
+
+func (e *messageEnvelope) move(from, to envelopeAdmission) bool {
+	return e.admission.CompareAndSwap(uint32(from), uint32(to))
+}
+
+// beginEnqueue claims admission for one enqueue attempt.
+func (e *messageEnvelope) beginEnqueue() bool {
+	return e.move(envelopeIdle, envelopeEnqueueing)
+}
+
+// finishEnqueue records whether an actor accepted the message. A refused
+// attempt rolls back to idle, unless the envelope was abandoned meanwhile;
+// then this attempt settles the abandonment.
+func (e *messageEnvelope) finishEnqueue(enqueued bool) {
+	switch {
+	case enqueued:
+		// An abandonment requested meanwhile is moot: an actor owns it now.
+		e.admission.Store(uint32(envelopeAccepted))
+	case e.move(envelopeEnqueueing, envelopeIdle):
+	default:
+		e.admission.Store(uint32(envelopeAbandoned))
+		e.message.onPanic(errCommandAbandoned)
+	}
+}
+
+// abandon settles an envelope no actor has accepted, or asks the enqueue in
+// flight to settle it if that enqueue is refused.
+func (e *messageEnvelope) abandon() {
+	for {
+		switch e.state() {
+		case envelopeIdle:
+			if e.move(envelopeIdle, envelopeAbandoned) {
+				e.message.onPanic(errCommandAbandoned)
+				return
+			}
+		case envelopeEnqueueing:
+			if e.move(envelopeEnqueueing, envelopeEnqueueingAbandoned) {
+				return
+			}
+		case envelopeEnqueueingAbandoned, envelopeAccepted, envelopeAbandoned:
+			return
+		}
+	}
 }
 
 // ActorCommand is the opaque, one-shot capability for caller-authored work.
@@ -80,6 +143,20 @@ type ActorCommand struct{ envelope *messageEnvelope }
 
 func newActorCommand(message actorCommandMessage) ActorCommand {
 	return ActorCommand{envelope: newMessageEnvelope(message)}
+}
+
+// errCommandAbandoned answers a command its caller abandoned before any actor
+// accepted it.
+var errCommandAbandoned = errors.New("actor command abandoned before an actor accepted it")
+
+// Abandon settles a command that no actor accepted, giving back what it owns,
+// such as a close's command fence, and makes it unusable. It does nothing to a
+// command an actor accepted. Abandoning during an enqueue is never lost: if
+// that enqueue is refused, it settles the abandonment.
+func (c ActorCommand) Abandon() {
+	if c.envelope != nil {
+		c.envelope.abandon()
+	}
 }
 
 // ActorObservation is an opaque, one-shot substrate observation bound to an
@@ -306,14 +383,20 @@ func newContainerDiedObservation(
 
 // deprovisionMsg requests that the actor run the deprovision flow. Callers can
 // obtain one only through NewDeprovisionCommand, which owns the reply channel.
+// It carries no context: the actor runs the close on its own lifetime, so a
+// caller that stops waiting cannot cancel the close. It carries the lease's
+// command fence instead, which the close owns until its durable head commits.
 type deprovisionMsg struct {
-	Ctx   context.Context
 	Reply chan error
+	fence shared.CommandFenceHold
 }
 
 func (deprovisionMsg) isleaseMessage()        {}
 func (deprovisionMsg) isactorCommandMessage() {}
 func (m deprovisionMsg) onPanic(err error) {
+	// A close rejected or interrupted here never commits its head, so the
+	// fence it owns goes back before its caller hears about it.
+	m.fence.Release()
 	// Non-blocking send: Reply is buffered-1, caller receives at most
 	// once. On recover, make sure the caller gets something.
 	select {
@@ -322,12 +405,31 @@ func (m deprovisionMsg) onPanic(err error) {
 	}
 }
 
-func NewDeprovisionCommand(ctx context.Context) (ActorCommand, ActorReply, error) {
-	if ctx == nil {
-		return ActorCommand{}, ActorReply{}, errors.New("deprovision context is required")
+// NewDeprovisionCommand asks the actor to close its lease. The reply only
+// reports the outcome: the close runs on the actor's lifetime, bounded by
+// LeaseActorConfig.CloseTimeout, whether or not anyone still waits for it.
+//
+// The command takes ownership of fence, the lease's command fence that its
+// caller acquired before checking that the close may begin: every copy the
+// caller kept stops owning it. The close keeps the fence until its durable head
+// commits (ActorCloseScope.CloseAdmitted) or its attempt ends, so no other
+// command can slip between that check and the head. A command that no actor
+// accepts gives the fence back through Abandon.
+func NewDeprovisionCommand(fence shared.CommandFenceHold) (ActorCommand, ActorReply, error) {
+	owned, err := fence.Transfer()
+	if err != nil {
+		return ActorCommand{}, ActorReply{}, fmt.Errorf("deprovision requires the lease's command fence: %w", err)
 	}
 	reply, receiver := newActorReply()
-	return newActorCommand(deprovisionMsg{Ctx: ctx, Reply: reply}), receiver, nil
+	return newActorCommand(deprovisionMsg{Reply: reply, fence: owned}), receiver, nil
+}
+
+// IsRejectedByRetiringActor reports that a command reached an actor that was
+// already retiring, which rejected it without handling it. Nothing ran, so
+// routing the same request again reaches the actor that replaces it. Only the
+// reply value itself carries this: a wrapped error does not.
+func IsRejectedByRetiringActor(err error) bool {
+	return err == errActorTerminated //nolint:errorlint // Only the direct reply proves the command was never handled.
 }
 
 // cohortDivergedMsg reports that recovery observed a running instance cohort
@@ -1082,6 +1184,10 @@ func validateLeaseActorConfig(cfg LeaseActorConfig) error {
 		return errors.New("lease actor requires actor-owned close authority")
 	case cfg.WorkerDrainTimeout < 0:
 		return errors.New("lease actor worker drain timeout cannot be negative")
+	case cfg.CloseTimeout <= 0:
+		return errors.New("lease actor requires a positive close timeout")
+	case cfg.CommandFence == nil:
+		return errors.New("lease actor requires its substrate's command fence")
 	default:
 		return nil
 	}
@@ -1303,7 +1409,7 @@ func (a *LeaseActor) handle(msg leaseMessage) {
 	case containerDiedMsg:
 		a.handleContainerDied(m.ContainerID, m.Runtime, m.provenance)
 	case deprovisionMsg:
-		m.Reply <- a.handleDeprovision(m.Ctx)
+		m.Reply <- a.handleDeprovision(m.fence)
 	case cohortDivergedMsg:
 		m.Reply <- a.handleCohortDiverged(m.Ctx, m.Runtime)
 	case maintenanceRecoveredMsg:
@@ -2223,14 +2329,12 @@ func (a *LeaseActor) TryEnqueueRecovery(command RecoveryCommand) bool {
 }
 
 func (a *LeaseActor) tryEnqueueEnvelope(envelope *messageEnvelope, message leaseMessage) bool {
-	if envelope == nil || message == nil || !envelope.accepted.CompareAndSwap(false, true) {
+	if envelope == nil || message == nil || !envelope.beginEnqueue() {
 		return false
 	}
-	if a.tryEnqueue(message) {
-		return true
-	}
-	envelope.accepted.Store(false)
-	return false
+	enqueued := a.tryEnqueue(message)
+	envelope.finishEnqueue(enqueued)
+	return enqueued
 }
 
 // tryEnqueue does a non-blocking enqueue of an internal message into the actor's inbox.
@@ -2286,9 +2390,15 @@ func (a *LeaseActor) tryEnqueue(msg leaseMessage) bool {
 //   - deprovision dispatch via cfg.DoDeprovisionFn (was b.doDeprovision)
 //   - logger via cfg.Logger
 //
-// The ctx threaded in is the actor-owned ctx from the inbound
-// deprovision command (which carries the caller's ctx from Backend.Deprovision).
-func (a *LeaseActor) handleDeprovision(ctx context.Context) error {
+// The close runs on the actor's lifetime, bounded by CloseTimeout. The caller
+// that requested it only waits for the reply, so a caller that gives up does
+// not cancel a teardown that is still stopping containers. The close owns the
+// lease's command fence until its durable head commits or this attempt ends.
+func (a *LeaseActor) handleDeprovision(fence shared.CommandFenceHold) error {
+	defer fence.Release()
+	if !fence.Owns(a.cfg.CommandFence, a.leaseUUID) {
+		return errors.New("deprovision does not own this lease's command fence")
+	}
 	if a.closeSettlement == nil {
 		a.closeSettlement = newActorCloseSettlement(a)
 	}
@@ -2311,6 +2421,8 @@ func (a *LeaseActor) handleDeprovision(ctx context.Context) error {
 			return workerDrainPending{leaseUUID: a.leaseUUID}
 		}
 	}
+	ctx, cancel := context.WithTimeout(a.cfg.StopCtx, a.cfg.CloseTimeout)
+	defer cancel()
 	// Attempt the SM transition. If it's not permitted, check whether the
 	// provision is already gone or we're in an unexpected state. Absence from
 	// this volatile projection is not terminal authority: a substrate finalizer
@@ -2340,7 +2452,7 @@ func (a *LeaseActor) handleDeprovision(ctx context.Context) error {
 			p.LifecycleCallbackURL = a.pendingReplaceLifecycleCallbackURL
 		})
 	}
-	closeScope := newActorCloseScope(a)
+	closeScope := newActorCloseScope(a, fence)
 	defer closeScope.revoke()
 	err := a.cfg.DoDeprovisionFn(ctx, closeScope)
 	// If the provision entry was fully removed (success path), signal the

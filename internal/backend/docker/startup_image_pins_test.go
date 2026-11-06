@@ -109,8 +109,8 @@ func TestStart_ImagePinUpgradeFollowsFatalRecoveryChecks(t *testing.T) {
 				mock.ListManagedContainersFn = func(ctx context.Context) ([]ContainerInfo, error) {
 					// Only interrupted-operation recovery owns this lease's
 					// command fence. Fail its real substrate observation.
-					if unlock, available := b.commandFence.TryLock(spec.LeaseUUID); available {
-						unlock()
+					if fence, available := b.commandFence.TryLock(spec.LeaseUUID); available {
+						fence.Release()
 						return inventory(ctx)
 					}
 					return nil, phaseErr

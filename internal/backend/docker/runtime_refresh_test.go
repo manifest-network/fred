@@ -382,7 +382,7 @@ func TestRuntimeRefreshRecreatesAStaleLeaseAndAttestsTheActiveRelease(t *testing
 
 func TestRuntimeRefreshSkipsALeaseWithACommandInProgress(t *testing.T) {
 	h := newRuntimeRefreshHarness(t, backend.ProvisionStatusReady)
-	unlock := h.b.commandFence.Lock(h.leaseUUID)
+	unlock := h.b.commandFence.Lock(h.leaseUUID).Release
 	defer unlock()
 	h.b.runtimeRefresh.inFlight = map[string]struct{}{}
 	outcome := h.b.refreshLeaseRuntime(t.Context(), h.leaseUUID)
@@ -440,7 +440,7 @@ func TestReplaceRestartRoutes(t *testing.T) {
 // rows always agree with its counters.
 func TestRuntimeRefreshRunStaysActiveWhileALeaseIsBusy(t *testing.T) {
 	h := newRuntimeRefreshHarness(t, backend.ProvisionStatusReady)
-	unlock := h.b.commandFence.Lock(h.leaseUUID)
+	unlock := h.b.commandFence.Lock(h.leaseUUID).Release
 	defer unlock()
 
 	started, err := h.b.StartRuntimeRefresh(t.Context())

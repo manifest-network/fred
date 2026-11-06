@@ -22,23 +22,139 @@ import (
 // Routing forces a Ready/Failing/Failed → Deprovisioning SM transition whose
 // Failing.OnExit cancels the in-flight diag goroutine — the structural
 // suppression of stale Failed callbacks.
+//
+// The actor runs the close on its own lifetime, so ctx bounds only this call's
+// wait. When ctx ends first, Deprovision returns a closePending observation
+// and the close goes on. The lease's command fence, taken before the
+// restore-destination check, moves into the close and stays held until the
+// close's durable head commits, so no other command can act between that
+// check and the head, however soon this call stops waiting.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
+	for {
+		fence, err := b.prepareClose(ctx, leaseUUID)
+		if err != nil {
+			if ctx.Err() != nil {
+				// The caller's budget ran out before the close could be
+				// admitted. Nothing was decided; a retry admits it.
+				return closePending{leaseUUID: leaseUUID}
+			}
+			return err
+		}
+		err = b.closeThroughActor(ctx, fence)
+		if !leasesm.IsRejectedByRetiringActor(err) {
+			return err
+		}
+		// The previous actor retired without running this close and gave the
+		// fence back. Prepare again under a new fence, then route the close to
+		// the actor that replaces it.
+	}
+}
+
+// prepareClose does, under the caller's ctx, what must precede handing a
+// close to the lease's actor: verify the storage identity, take the lease's
+// command fence, and settle a committed restore into the lease. It returns the
+// fence it took, still held.
+func (b *Backend) prepareClose(ctx context.Context, leaseUUID string) (shared.CommandFenceHold, error) {
 	if err := b.requireMutationAdmission(ctx, "deprovision"); err != nil {
-		return fmt.Errorf("backend storage identity verification failed: %w", err)
+		return shared.CommandFenceHold{}, fmt.Errorf("backend storage identity verification failed: %w", err)
 	}
-	unlockCommand := b.commandFence.Lock(leaseUUID)
-	defer unlockCommand()
-	if err := b.ensureCommittedRestoreDestinationForClose(leaseUUID); err != nil {
-		return err
-	}
-	command, reply, err := leasesm.NewDeprovisionCommand(ctx)
+	fence, err := b.commandFence.LockContext(ctx, leaseUUID)
 	if err != nil {
+		return shared.CommandFenceHold{}, fmt.Errorf("wait for the lease's command fence: %w", err)
+	}
+	if err := b.ensureCommittedRestoreDestinationForClose(ctx, leaseUUID); err != nil {
+		fence.Release()
+		return shared.CommandFenceHold{}, err
+	}
+	return fence, nil
+}
+
+// closeThroughActor hands one close, with the lease's command fence, to the
+// lease's actor and waits for its answer. The close command takes ownership of
+// fence and keeps it until its durable head commits or its attempt ends; if
+// no actor accepts the command, abandoning it gives the fence back. When ctx
+// ends before the answer, the close keeps running on the actor's lifetime and
+// the result is closePending.
+func (b *Backend) closeThroughActor(ctx context.Context, fence shared.CommandFenceHold) error {
+	leaseUUID := fence.LeaseUUID()
+	command, reply, err := leasesm.NewDeprovisionCommand(fence)
+	if err != nil {
+		fence.Release()
 		return err
 	}
 	if err := b.routeToLeaseBlocking(ctx, leaseUUID, command); err != nil {
+		command.Abandon()
+		if ctx.Err() != nil {
+			return closePending{leaseUUID: leaseUUID}
+		}
 		return err
 	}
-	return b.waitForReply(ctx, reply.Result())
+	wait, err := b.awaitCloseReply(ctx, reply)
+	switch wait {
+	case closeWaitAnswered:
+		return err
+	case closeWaitAbandoned:
+		return closePending{leaseUUID: leaseUUID}
+	default:
+		return errors.New("backend shutting down")
+	}
+}
+
+// closeWait is how a wait for a close's answer ended. The zero value is none
+// of them.
+type closeWait uint8
+
+const (
+	// closeWaitAnswered: the actor answered; the error is its answer.
+	closeWaitAnswered closeWait = iota + 1
+	// closeWaitAbandoned: the caller's context ended first.
+	closeWaitAbandoned
+	// closeWaitStopping: the backend began stopping first.
+	closeWaitStopping
+)
+
+// awaitCloseReply waits for the actor's answer until ctx or the backend ends.
+// An answer that is already there wins over either ending.
+func (b *Backend) awaitCloseReply(ctx context.Context, reply leasesm.ActorReply) (closeWait, error) {
+	select {
+	case err := <-reply.Result():
+		return closeWaitAnswered, err
+	case <-ctx.Done():
+	case <-b.stopCtx.Done():
+	}
+	// A select picks at random among ready cases, so look for the answer on
+	// its own before reading which ending came.
+	select {
+	case err := <-reply.Result():
+		return closeWaitAnswered, err
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return closeWaitAbandoned, nil
+	default:
+		return closeWaitStopping, nil
+	}
+}
+
+// closePending reports that a caller stopped waiting before a close settled:
+// identity verification or other lifecycle work held up its admission, or the
+// actor had not answered yet. A close the actor admitted keeps running on the actor's
+// lifetime. Only Deprovision and closeThroughActor mint it.
+type closePending struct{ leaseUUID string }
+
+func (pending closePending) Error() string {
+	return fmt.Sprintf("close of lease %q is still pending", pending.leaseUUID)
+}
+
+// IsLifecyclePending recognizes every observation of this backend that a
+// lifecycle request is still pending: journal contention, an actor worker still
+// draining, or a close whose caller stopped waiting before it settled. Each
+// grants a later retry, never a refusal or completion.
+func IsLifecyclePending(err error) bool {
+	var pending closePending
+	return shared.IsLifecyclePending(err) || leasesm.IsLifecyclePending(err) ||
+		(errors.As(err, &pending) && pending.leaseUUID != "")
 }
 
 // handoffCommittedRestoreToClose consumes a lingering restore finalizer only
@@ -114,7 +230,7 @@ func (b *Backend) handoffCommittedRestoreToClose(
 // two incompatible durable owners. Once this succeeds, a crash after close
 // admission is safe because the exact active Release already owns destination
 // bytes and the close claim can take over the finalizer on recovery.
-func (b *Backend) ensureCommittedRestoreDestinationForClose(leaseUUID string) error {
+func (b *Backend) ensureCommittedRestoreDestinationForClose(ctx context.Context, leaseUUID string) error {
 	if b.retentionStore == nil {
 		return nil
 	}
@@ -132,7 +248,7 @@ func (b *Backend) ensureCommittedRestoreDestinationForClose(leaseUUID string) er
 			backend.ErrInvalidState, leaseUUID,
 		)
 	}
-	operation, err := b.currentRestoreOperation(*source)
+	operation, err := b.currentRestoreOperation(ctx, *source)
 	if err != nil && !errors.Is(err, shared.ErrOperationIntentMissing) {
 		return fmt.Errorf(
 			"%w: restore destination %q has conflicting operation authority: %w",
@@ -141,14 +257,16 @@ func (b *Backend) ensureCommittedRestoreDestinationForClose(leaseUUID string) er
 	}
 	switch state := operation.(type) {
 	case shared.OperationIntentClaim:
-		proof, proofErr := b.operationSettlement.ProveCommittedOperation(state)
+		proof, proofErr := b.operationSettlement.ProveCommittedOperation(ctx, state)
 		if proofErr != nil {
 			return fmt.Errorf("prove committed restore before close admission: %w", proofErr)
 		}
 		if b.callbackPublisher == nil {
 			return errors.New("callback publisher is required")
 		}
-		if err := b.callbackPublisher.PublishOperationSuccessContext(b.stopCtx, proof); err != nil {
+		// The caller's ctx bounds this settlement: cancellation leaves the
+		// durable operation head for the next attempt or recovery.
+		if err := b.callbackPublisher.PublishOperationSuccessContext(ctx, proof); err != nil {
 			return fmt.Errorf("settle committed restore before close admission: %w", err)
 		}
 	case shared.OperationFailed:
@@ -212,14 +330,18 @@ func (b *Backend) doDeprovision(ctx context.Context, actorScope leasesm.ActorClo
 	return b.recoveryCoordinator.WithActorClose(
 		actorScope,
 		func(recoveryScope shared.LeaseRecoveryScope) error {
-			return b.doDeprovisionScoped(ctx, recoveryScope, leaseUUID)
+			return b.doDeprovisionScoped(ctx, recoveryScope, actorScope.CloseAdmitted, leaseUUID)
 		},
 	)
 }
 
+// doDeprovisionScoped runs one close attempt. Once the close's durable head is
+// committed and consistent, it passes that head to admitted, which gives back
+// the lease's command fence before teardown starts.
 func (b *Backend) doDeprovisionScoped(
 	ctx context.Context,
 	recoveryScope shared.LeaseRecoveryScope,
+	admitted func(shared.CloseIntentClaim) error,
 	leaseUUID string,
 ) error {
 	logger := b.logger.With("lease_uuid", leaseUUID)
@@ -229,7 +351,7 @@ func (b *Backend) doDeprovisionScoped(
 	b.provisionsMu.RLock()
 	_, projectionExists := b.provisions[leaseUUID]
 	b.provisionsMu.RUnlock()
-	if err := b.settleCommittedOperationBeforeClose(leaseUUID); err != nil {
+	if err := b.settleCommittedOperationBeforeClose(ctx, leaseUUID); err != nil {
 		return err
 	}
 	if err := b.settleMaintenanceBeforeClose(leaseUUID); err != nil {
@@ -253,6 +375,9 @@ func (b *Backend) doDeprovisionScoped(
 	}
 	if err := b.handoffCommittedRestoreToClose(leaseUUID, claim, true); err != nil {
 		return err
+	}
+	if err := admitted(claim); err != nil {
+		return fmt.Errorf("release close admission fence: %w", err)
 	}
 
 	var outcome shared.CloseExecutionOutcome

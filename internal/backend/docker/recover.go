@@ -344,54 +344,56 @@ func (b *Backend) resumeRecoveredClose(
 	// the lease, then re-read durable authority before routing: otherwise a new
 	// provision can win after that settlement and this stale worker can tear down
 	// the replacement generation.
-	unlockCommand := b.commandFence.Lock(claim.LeaseUUID())
-	defer unlockCommand()
-	return b.resumeRecoveredCloseFenced(ctx, claim.LeaseUUID())
+	return b.resumeRecoveredCloseFenced(ctx, b.commandFence.Lock(claim.LeaseUUID()))
 }
 
 // tryResumeRecoveredClose is resumeRecoveredClose for background work that
 // must not wait on a busy lease: it reports resumed=false when the command
 // fence is held, whose holder observes the same durable state.
 func (b *Backend) tryResumeRecoveredClose(ctx context.Context, leaseUUID string) (resumed bool, err error) {
-	unlock, acquired := b.commandFence.TryLock(leaseUUID)
+	fence, acquired := b.commandFence.TryLock(leaseUUID)
 	if !acquired {
 		return false, nil
 	}
-	defer unlock()
-	return true, b.resumeRecoveredCloseFenced(ctx, leaseUUID)
+	return true, b.resumeRecoveredCloseFenced(ctx, fence)
 }
 
-// resumeRecoveredCloseFenced re-reads the lease's durable close authority and,
-// when a close is still pending, routes it through the lease actor. The caller
-// holds the lease's command fence.
-func (b *Backend) resumeRecoveredCloseFenced(ctx context.Context, leaseUUID string) error {
+// resumeRecoveredCloseFenced re-reads the lease's durable close authority under
+// fence and, when a close is still pending, routes it through the lease actor.
+// It takes over fence: the routed close owns it from then on, and every other
+// path gives it back.
+func (b *Backend) resumeRecoveredCloseFenced(ctx context.Context, fence shared.CommandFenceHold) error {
+	pending, err := b.recoveredCloseStillPending(fence.LeaseUUID())
+	if err != nil || !pending {
+		fence.Release()
+		return err
+	}
+	if err := b.closeThroughActor(ctx, fence); err != nil {
+		return fmt.Errorf("apply recovered close through lease actor: %w", err)
+	}
+	return nil
+}
+
+// recoveredCloseStillPending reports whether leaseUUID still has a close
+// intent of this backend's storage to resume.
+func (b *Backend) recoveredCloseStillPending(leaseUUID string) (bool, error) {
 	if b.callbackStore == nil {
-		return errors.New("resume recovered close requires a callback store")
+		return false, errors.New("resume recovered close requires a callback store")
 	}
 	current, found, err := b.closeSettlement.GetCloseIntent(leaseUUID)
 	if err != nil {
-		return fmt.Errorf("re-read recovered close intent: %w", err)
+		return false, fmt.Errorf("re-read recovered close intent: %w", err)
 	}
 	if !found {
-		return nil
+		return false, nil
 	}
 	if current.Backend() != b.Name() || current.BackendStorageID() != b.storageIdentity {
-		return fmt.Errorf(
+		return false, fmt.Errorf(
 			"recovered close intent for lease %q belongs to backend %q storage %s, not backend %q storage %s",
 			current.LeaseUUID(), current.Backend(), current.BackendStorageID(), b.Name(), b.storageIdentity,
 		)
 	}
-	command, reply, commandErr := leasesm.NewDeprovisionCommand(ctx)
-	if commandErr != nil {
-		return fmt.Errorf("construct recovered close actor command: %w", commandErr)
-	}
-	if err := b.routeToLeaseBlocking(ctx, current.LeaseUUID(), command); err != nil {
-		return fmt.Errorf("route recovered close through lease actor: %w", err)
-	}
-	if err := b.waitForReply(ctx, reply.Result()); err != nil {
-		return fmt.Errorf("apply recovered close through lease actor: %w", err)
-	}
-	return nil
+	return true, nil
 }
 
 // listRecoveryPendingIntents returns the exact operation/maintenance leases
