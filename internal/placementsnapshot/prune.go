@@ -1,12 +1,16 @@
 package placementsnapshot
 
 import (
+	"github.com/prometheus/client_golang/prometheus"
+
 	"errors"
 	"io"
 	"os"
 	"slices"
 	"syscall"
 	"time"
+
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // maxDirectoryEntries bounds one directory listing. Classification checks each
@@ -38,22 +42,23 @@ var pruneFailures = [...]pruneFailure{
 	pruneFailureSync,
 }
 
-func (failure pruneFailure) label() string {
+// counter is the failure's series; the invalid zero value has none.
+func (failure pruneFailure) counter(series metrics.PlacementSnapshotPruneFailureCounters) (prometheus.Counter, bool) {
 	switch failure {
 	case pruneFailureList:
-		return "list"
+		return series.List, true
 	case pruneFailureInspect:
-		return "inspect"
+		return series.Inspect, true
 	case pruneFailureNotOwned:
-		return "not_owned"
+		return series.NotOwned, true
 	case pruneFailureLiveDatabase:
-		return "live_database"
+		return series.LiveDatabase, true
 	case pruneFailureRemove:
-		return "remove"
+		return series.Remove, true
 	case pruneFailureSync:
-		return "sync"
+		return series.Sync, true
 	default:
-		return ""
+		return nil, false
 	}
 }
 

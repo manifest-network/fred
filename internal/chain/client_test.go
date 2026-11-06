@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/manifest-network/fred/internal/metrics"
+
 	"cosmossdk.io/math"
 	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
@@ -1228,7 +1230,7 @@ func TestClient_WaitForTx(t *testing.T) {
 func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 	t.Run("empty input", func(t *testing.T) {
 		c := newMockClient()
-		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), nil, "test", "tested",
+		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), nil, "test", metrics.ChainTx.Acknowledge, "tested",
 			func(batch []string) sdktypes.Msg { return nil })
 		assert.Equal(t, uint64(0), n)
 		assert.Nil(t, hashes)
@@ -1243,7 +1245,7 @@ func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 			uuids[i] = fmt.Sprintf("l-%d", i)
 		}
 
-		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), uuids, "acknowledge", "acknowledged",
+		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), uuids, "acknowledge", metrics.ChainTx.Acknowledge, "acknowledged",
 			func(batch []string) sdktypes.Msg {
 				return &billingtypes.MsgAcknowledgeLease{
 					Sender:     c.providerAddress,
@@ -1264,7 +1266,7 @@ func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 			uuids[i] = fmt.Sprintf("l-%d", i)
 		}
 
-		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), uuids, "acknowledge", "acknowledged",
+		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), uuids, "acknowledge", metrics.ChainTx.Acknowledge, "acknowledged",
 			func(batch []string) sdktypes.Msg {
 				return &billingtypes.MsgAcknowledgeLease{
 					Sender:     c.providerAddress,
@@ -1311,7 +1313,7 @@ func TestClient_BroadcastBatchedMsgs(t *testing.T) {
 			uuids[i] = fmt.Sprintf("l-%d", i)
 		}
 
-		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), uuids, "acknowledge", "acknowledged",
+		n, hashes, err := c.broadcastBatchedMsgs(t.Context(), uuids, "acknowledge", metrics.ChainTx.Acknowledge, "acknowledged",
 			func(batch []string) sdktypes.Msg {
 				return &billingtypes.MsgAcknowledgeLease{Sender: s.Address(), LeaseUuids: batch}
 			})

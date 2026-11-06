@@ -65,15 +65,30 @@ func (v Verdict) Label() string {
 	}
 }
 
-// Labels returns every verdict label in a fixed order, so a metric can be
-// pre-initialized with exactly the closed set.
-func Labels() []string {
-	labels := make([]string, 0, int(kindSentinel))
-	for k := kindAbsent; k < kindSentinel; k++ {
-		labels = append(labels, Verdict{kind: k}.Label())
+// Pick returns the value of v's verdict among one value per verdict. Taking
+// every verdict's value makes a caller handle the whole closed set, so a metric
+// keyed by verdict has a series for each one.
+func Pick[T any](v Verdict, absent, unknown, retry, exhausted T) T {
+	switch v.kind {
+	case kindAbsent:
+		return absent
+	case kindUnknown:
+		return unknown
+	case kindRetry:
+		return retry
+	case kindExhausted:
+		return exhausted
+	default:
+		// Only FromProvision builds a Verdict, and it never leaves the set.
+		return absent
 	}
-	return labels
 }
+
+// pickedVerdicts is the number of verdicts Pick takes a value for. A verdict
+// added to the closed set does not compile until Pick takes its value too.
+const pickedVerdicts = 4
+
+var _ = [1]struct{}{}[int(kindSentinel)-pickedVerdicts]
 
 // ConsecutiveFailures is the backend's recorded count, for logs only. It never
 // decides a close.

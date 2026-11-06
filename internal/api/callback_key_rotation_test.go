@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -42,8 +44,9 @@ func callbackBodyFor(storage string) []byte {
 // Not parallel: these read process-global counters.
 func TestCallbackKeyringAcceptsAPreviousKeyAndCountsItsSlot(t *testing.T) {
 	keyring := rotatingCallbackKeyring(t)
-	current := metrics.APICallbackSignatureKeyTotal.WithLabelValues("rotation-b", metrics.CallbackKeySlotCurrent)
-	previous := metrics.APICallbackSignatureKeyTotal.WithLabelValues("rotation-b", metrics.CallbackKeySlotPrevious)
+	metrics.BindBackends("rotation-b")
+	current := metrics.ForBackend("rotation-b").CallbackSignatureKey.Current
+	previous := metrics.ForBackend("rotation-b").CallbackSignatureKey.Previous
 	currentBefore, previousBefore := promtestutil.ToFloat64(current), promtestutil.ToFloat64(previous)
 
 	body := callbackBodyFor(callbackKeyringStorageB)
@@ -74,14 +77,19 @@ func TestCallbackKeyringCountsEachRefusalByReason(t *testing.T) {
 	malformed := httptest.NewRequest(http.MethodPost, "https://fred.example.test/callbacks/provision", bytes.NewReader(bodyB))
 	malformed.Header.Set(hmacauth.SignatureHeader, "not-a-signature")
 
-	for reason, request := range map[string]*http.Request{
-		metrics.CallbackAuthFailureMissing:        missing,
-		metrics.CallbackAuthFailureFormat:         malformed,
-		metrics.CallbackAuthFailureExpired:        expired,
-		metrics.CallbackAuthFailureMismatch:       signedKeyringCallbackRequest(bodyB, callbackKeyringSecretA),
-		metrics.CallbackAuthFailureUnknownStorage: signedKeyringCallbackRequest(unknownStorage, callbackKeyringSecretA),
+	failures := metrics.CallbackAuthFailures
+	for _, test := range []struct {
+		reason  string
+		counter prometheus.Counter
+		request *http.Request
+	}{
+		{metrics.CallbackAuthFailureMissing, failures.Missing, missing},
+		{metrics.CallbackAuthFailureFormat, failures.Format, malformed},
+		{metrics.CallbackAuthFailureExpired, failures.Expired, expired},
+		{metrics.CallbackAuthFailureMismatch, failures.Mismatch, signedKeyringCallbackRequest(bodyB, callbackKeyringSecretA)},
+		{metrics.CallbackAuthFailureUnknownStorage, failures.UnknownStorage, signedKeyringCallbackRequest(unknownStorage, callbackKeyringSecretA)},
 	} {
-		counter := metrics.APICallbackAuthFailuresTotal.WithLabelValues(reason)
+		reason, counter, request := test.reason, test.counter, test.request
 		before := promtestutil.ToFloat64(counter)
 		_, err := keyring.VerifyCallbackEvidence(request)
 		require.Error(t, err, reason)

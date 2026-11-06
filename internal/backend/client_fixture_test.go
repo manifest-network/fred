@@ -66,9 +66,34 @@ func (cfg HTTPClientConfig) options() HTTPClientOptions {
 		ProvisionsPageLimit:      cfg.ProvisionsPageLimit,
 		RetentionsPageLimit:      cfg.RetentionsPageLimit,
 		RequestDuration:          cfg.RequestDuration,
-		RequestsTotal:            cfg.RequestsTotal,
+		RequestCounters:          vecRequestCounters(cfg.RequestsTotal, cfg.MalformedErrorBodyTotal),
 		CircuitBreakerState:      cfg.CircuitBreakerState,
-		MalformedErrorBodyTotal:  cfg.MalformedErrorBodyTotal,
+	}
+}
+
+// vecRequestCounters binds a client's request counters from test-owned vecs.
+// Either may be nil; with both nil the client records nothing.
+func vecRequestCounters(requests, malformed *prometheus.CounterVec) RequestCounterBinder {
+	if requests == nil && malformed == nil {
+		return nil
+	}
+	discard := prometheus.NewCounter(prometheus.CounterOpts{Name: "discarded"})
+	return func(backend, operation string) RequestCounters {
+		status := func(status string) prometheus.Counter {
+			if requests == nil {
+				return discard
+			}
+			return requests.WithLabelValues(backend, operation, status)
+		}
+		counters := RequestCounters{
+			Success: status("success"), Fenced: status("fenced"),
+			Pending: status("pending"), Error: status("error"),
+			MalformedErrorBody: discard,
+		}
+		if malformed != nil {
+			counters.MalformedErrorBody = malformed.WithLabelValues(backend, operation)
+		}
+		return counters
 	}
 }
 

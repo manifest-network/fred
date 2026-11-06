@@ -15,7 +15,6 @@ import (
 
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/metrics"
-	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 // mockAckChainClient implements ChainClient for ack batcher tests
@@ -227,7 +226,7 @@ func TestAckBatcher_InsufficientFeeDoesNotIndividualize(t *testing.T) {
 	batcher.Start(ctx)
 	defer batcher.Stop()
 
-	before := promtestutil.ToFloat64(metrics.AckBatchFeeGasErrorsTotal.WithLabelValues("0"))
+	before := promtestutil.ToFloat64(metrics.BindAckBatchLane("0").FeeGasErrors)
 
 	var wg sync.WaitGroup
 	errs := make([]error, 3)
@@ -253,7 +252,7 @@ func TestAckBatcher_InsufficientFeeDoesNotIndividualize(t *testing.T) {
 	assert.Equal(t, int32(1), totalCalls.Load(),
 		"fee error must not trigger individualized retries; saw %d total chain calls", totalCalls.Load())
 
-	after := promtestutil.ToFloat64(metrics.AckBatchFeeGasErrorsTotal.WithLabelValues("0"))
+	after := promtestutil.ToFloat64(metrics.BindAckBatchLane("0").FeeGasErrors)
 	assert.Equal(t, 1.0, after-before, "AckBatchFeeGasErrorsTotal should increment by 1")
 }
 
@@ -338,7 +337,7 @@ func TestAckBatcher_GenericErrorStillIndividualizes(t *testing.T) {
 	batcher.Start(ctx)
 	defer batcher.Stop()
 
-	before := promtestutil.ToFloat64(metrics.AckBatchIndividualFallbacksTotal.WithLabelValues("0"))
+	before := promtestutil.ToFloat64(metrics.BindAckBatchLane("0").IndividualFallbacks)
 
 	var wg sync.WaitGroup
 	errs := make([]error, 3)
@@ -363,7 +362,7 @@ func TestAckBatcher_GenericErrorStillIndividualizes(t *testing.T) {
 	defer mu.Unlock()
 	assert.Len(t, individualCalls, 3, "all three leases must have been retried individually")
 
-	after := promtestutil.ToFloat64(metrics.AckBatchIndividualFallbacksTotal.WithLabelValues("0"))
+	after := promtestutil.ToFloat64(metrics.BindAckBatchLane("0").IndividualFallbacks)
 	assert.Equal(t, 1.0, after-before, "AckBatchIndividualFallbacksTotal should increment by 1")
 }
 
@@ -1044,7 +1043,7 @@ func TestAckBatcher_PanicInFlushDoesNotCrashFred(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	before := promtestutil.ToFloat64(background.GoroutinePanicsTotal.WithLabelValues("ack_batcher"))
+	before := promtestutil.ToFloat64(ackBatcherPanics)
 
 	batcher.Start(ctx)
 	defer batcher.Stop()
@@ -1067,7 +1066,7 @@ func TestAckBatcher_PanicInFlushDoesNotCrashFred(t *testing.T) {
 	assert.Error(t, ackErr,
 		"caller must receive an error from the panicked flush, not success")
 
-	after := promtestutil.ToFloat64(background.GoroutinePanicsTotal.WithLabelValues("ack_batcher"))
+	after := promtestutil.ToFloat64(ackBatcherPanics)
 	assert.Equal(t, before+1, after,
 		"GoroutinePanicsTotal{ack_batcher} must increment by 1")
 }

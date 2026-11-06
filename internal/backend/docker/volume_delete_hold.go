@@ -13,7 +13,6 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -627,7 +626,7 @@ func (b *Backend) attemptHeldVolumeDelete(
 		attempt = classifyHeldDeleteAttempt(hold, after, stillHeld, time.Now())
 		return nil
 	}, volumeDeleteHoldComponent, func(any) {
-		background.CleanupPanicsTotal.WithLabelValues(volumeDeleteHoldComponent).Inc()
+		volumeDeleteHoldCleanupPanics.Inc()
 	})
 	return attempt
 }
@@ -693,7 +692,7 @@ func (b *Backend) runVolumeDeleteHoldIteration() (progressed bool) {
 		progressed = report.progressed
 		return nil
 	}, volumeDeleteHoldComponent, func(any) {
-		background.CleanupPanicsTotal.WithLabelValues(volumeDeleteHoldComponent).Inc()
+		volumeDeleteHoldCleanupPanics.Inc()
 	})
 	return progressed
 }

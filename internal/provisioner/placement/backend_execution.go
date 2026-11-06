@@ -161,7 +161,7 @@ func backendNames(runtime backendRuntime) (names []string, err error) {
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.BackendInvocationPanicsTotal.WithLabelValues(metrics.OperationProvision).Inc()
+			metrics.BackendInvocationPanics.Provision.Inc()
 			names = nil
 			err = fmt.Errorf("enumerate backend runtime panicked (%T)", recovered)
 		}
@@ -189,7 +189,7 @@ func exactBackend(runtime backendRuntime, backendName string) (client backend.Ba
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.BackendInvocationPanicsTotal.WithLabelValues(metrics.OperationRestore).Inc()
+			metrics.BackendInvocationPanics.Restore.Inc()
 			client = nil
 			err = fmt.Errorf("resolve backend %q panicked (%T)", backendName, recovered)
 		}
@@ -317,7 +317,7 @@ func invokeProvision(
 	request := delivery.request
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.BackendInvocationPanicsTotal.WithLabelValues(metrics.OperationProvision).Inc()
+			metrics.BackendInvocationPanics.Provision.Inc()
 			slog.Error("backend Provision panicked",
 				"lease_uuid", request.LeaseUUID,
 				"backend", requestBackendName(client),
@@ -345,7 +345,7 @@ func invokeRestore(
 	request := delivery.request
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.BackendInvocationPanicsTotal.WithLabelValues(metrics.OperationRestore).Inc()
+			metrics.BackendInvocationPanics.Restore.Inc()
 			slog.Error("backend Restore panicked",
 				"lease_uuid", request.LeaseUUID,
 				"backend", requestBackendName(client),
@@ -372,7 +372,7 @@ func invokeDeprovision(
 ) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.BackendInvocationPanicsTotal.WithLabelValues(metrics.OperationDeprovision).Inc()
+			metrics.BackendInvocationPanics.Deprovision.Inc()
 			slog.Error("backend Deprovision panicked",
 				"lease_uuid", leaseUUID,
 				"backend", requestBackendName(client),
@@ -391,11 +391,11 @@ func invokeMaintenance(
 ) (outcome backend.MaintenanceCallOutcome) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			operation := metrics.OperationRestart
+			panics := metrics.BackendInvocationPanics.Restart
 			if command.Kind() == MaintenanceCommandUpdate {
-				operation = metrics.OperationUpdate
+				panics = metrics.BackendInvocationPanics.Update
 			}
-			metrics.BackendInvocationPanicsTotal.WithLabelValues(operation).Inc()
+			panics.Inc()
 			slog.Error("backend maintenance call panicked",
 				"lease_uuid", command.LeaseUUID(),
 				"backend", command.BackendName(),
@@ -448,9 +448,7 @@ func observeProvisionStart(observer ProvisionStartObserver, leaseUUID, backendNa
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
-				metrics.LifecycleEventProvisionStarting,
-			).Inc()
+			metrics.LifecycleEventSinkPanics.ProvisionStarting.Inc()
 			slog.Error("provision start observer panicked; continuing exact backend dispatch",
 				"lease_uuid", leaseUUID,
 				"backend", backendName,
@@ -468,9 +466,7 @@ func observeRestoreStart(observer RestoreStartObserver, leaseUUID, backendName s
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
-				metrics.LifecycleEventRestoreRestarting,
-			).Inc()
+			metrics.LifecycleEventSinkPanics.RestoreRestarting.Inc()
 			slog.Error("restore start observer panicked; continuing exact backend dispatch",
 				"lease_uuid", leaseUUID,
 				"backend", backendName,

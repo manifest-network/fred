@@ -73,9 +73,9 @@ func newCallbackServiceForTest(cfg callbackServiceTestConfig) (*CallbackService,
 // carrying a production method whose only callers are tests. Production HTTP
 // ingress already has a decoded DTO and calls HandleBackendCallbackPayload.
 func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
-	defer func() { recordWatermillMetrics(TopicBackendCallback, err) }()
+	defer func() { recordWatermillMetrics(backendCallbackTopic, err) }()
 
-	callback, ok := unmarshalMessagePayload[backend.CallbackPayload](msg, TopicBackendCallback)
+	callback, ok := unmarshalMessagePayload[backend.CallbackPayload](msg, backendCallbackTopic)
 	if !ok {
 		return nil
 	}

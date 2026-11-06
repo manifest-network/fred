@@ -264,8 +264,8 @@ func TestDeferredCloseUnknownFailureIsObservableAndNotSuccess(t *testing.T) {
 	project()
 	synctest.Test(t, func(t *testing.T) {
 		scheduler := newDeferredCloseScheduler()
-		failed := metrics.DeferredClosesTotal.WithLabelValues("failed", string(proofs[0].Reason()))
-		dispatched := metrics.DeferredClosesTotal.WithLabelValues("dispatched", string(proofs[0].Reason()))
+		failed := deferredCloses(proofs[0].Reason()).Failed
+		dispatched := deferredCloses(proofs[0].Reason()).Dispatched
 		beforeFailed, beforeDispatched := promtestutil.ToFloat64(failed), promtestutil.ToFloat64(dispatched)
 		require.ErrorIs(t, scheduler.enqueue(proofs[0]), errDeferredCloseUnavailable)
 		require.Error(t, scheduler.enqueue(placement.DeferredDeprovision{}))
@@ -285,7 +285,7 @@ func TestDeferredCloseOverdueReportsOnceWithoutRelinquishingRetryOwnership(t *te
 	manager, proofs, _ := newDeferredCloseFixture(t, 1, func(context.Context, string) error { return nil })
 	scheduler := manager.deferredCloses
 	proof := proofs[0]
-	before := promtestutil.ToFloat64(metrics.DeferredClosesTotal.WithLabelValues("overdue", string(proof.Reason())))
+	before := promtestutil.ToFloat64(deferredCloses(proof.Reason()).Overdue)
 	logPath := filepath.Join(t.TempDir(), "overdue.log")
 	logs, err := os.Create(logPath)
 	require.NoError(t, err)
@@ -299,7 +299,7 @@ func TestDeferredCloseOverdueReportsOnceWithoutRelinquishingRetryOwnership(t *te
 	admitted := time.Now()
 	entry.admittedAt = admitted
 	scheduler.updateOldestAgeLocked(admitted.Add(deferredCloseOverdueAfter - time.Nanosecond))
-	require.Equal(t, before, promtestutil.ToFloat64(metrics.DeferredClosesTotal.WithLabelValues("overdue", string(proof.Reason()))))
+	require.Equal(t, before, promtestutil.ToFloat64(deferredCloses(proof.Reason()).Overdue))
 	scheduler.updateOldestAgeLocked(admitted.Add(deferredCloseOverdueAfter))
 	scheduler.mu.Unlock()
 	require.NoError(t, scheduler.enqueue(proof), "coalescing must retain the same overdue reporting owner")
@@ -308,7 +308,7 @@ func TestDeferredCloseOverdueReportsOnceWithoutRelinquishingRetryOwnership(t *te
 	require.Same(t, entry, scheduler.entries[proof.LeaseUUID()])
 	require.True(t, entry.hint.proof.Valid(), "overdue reporting must not revoke the close capability")
 	scheduler.mu.Unlock()
-	require.Equal(t, before+1, promtestutil.ToFloat64(metrics.DeferredClosesTotal.WithLabelValues("overdue", string(proof.Reason()))))
+	require.Equal(t, before+1, promtestutil.ToFloat64(deferredCloses(proof.Reason()).Overdue))
 	logBytes, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	require.Contains(t, string(logBytes), "level=ERROR")

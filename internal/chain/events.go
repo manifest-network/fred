@@ -13,6 +13,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/manifest-network/fred/internal/metrics"
 )
@@ -28,6 +29,27 @@ const (
 	LeaseExpired      LeaseEventType = "lease_expired"
 	LeaseAutoClosed   LeaseEventType = "lease_auto_closed" // Credit exhaustion (any provider)
 )
+
+// droppedEvents is the fred_events_dropped_total series of an event type. An
+// event of any other type is never published, so it has none.
+func droppedEvents(eventType LeaseEventType) (prometheus.Counter, bool) {
+	switch eventType {
+	case LeaseCreated:
+		return metrics.EventsDropped.Created, true
+	case LeaseAcknowledged:
+		return metrics.EventsDropped.Acknowledged, true
+	case LeaseRejected:
+		return metrics.EventsDropped.Rejected, true
+	case LeaseClosed:
+		return metrics.EventsDropped.Closed, true
+	case LeaseExpired:
+		return metrics.EventsDropped.Expired, true
+	case LeaseAutoClosed:
+		return metrics.EventsDropped.AutoClosed, true
+	default:
+		return nil, false
+	}
+}
 
 const (
 	// DefaultEventChannelCapacity is the default buffer size for subscriber channels.
@@ -189,7 +211,9 @@ func (s *EventSubscriber) broadcast(event LeaseEvent) {
 	}
 	s.subscribersMu.RUnlock()
 	if dropped != 0 {
-		metrics.EventsDroppedTotal.WithLabelValues(string(event.Type)).Add(float64(dropped))
+		if counter, ok := droppedEvents(event.Type); ok {
+			counter.Add(float64(dropped))
+		}
 		slog.Warn("subscriber channels full, dropping event",
 			"event_type", event.Type, "lease_uuid", event.LeaseUUID, "subscribers", dropped)
 	}

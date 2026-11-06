@@ -101,11 +101,11 @@ var (
 		Help:      "Number of provisions currently in progress",
 	})
 
-	// ProvisioningTotal tracks the total number of provisioning operations by
+	// provisioningTotal tracks the total number of provisioning operations by
 	// outcome and operation (provision|restore). A restore is a kind of
 	// provisioning operation; the operation label keeps it separable from fresh
 	// provisions (ENG-357/ENG-358) while sum()-ing across it stays meaningful.
-	ProvisioningTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	provisioningTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "provisioning_total",
@@ -123,35 +123,35 @@ var (
 		Buckets:   prometheus.ExponentialBuckets(0.1, 2, 12), // 0.1s to ~7min
 	}, []string{"backend", "operation"})
 
-	// AckBatchFeeGasErrorsTotal counts ack-batch failures classified as
+	// ackBatchFeeGasErrorsTotal counts ack-batch failures classified as
 	// insufficient-fee or out-of-gas that are surfaced to callers without
 	// being individualized. Sustained non-zero values indicate that the
 	// per-signer broadcast-retry loop is exhausting its gas budget (e.g.
 	// maxGasLimit too tight) or that the configured fee is insufficient.
-	AckBatchFeeGasErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	ackBatchFeeGasErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "ack_batch_fee_gas_errors_total",
 		Help:      "Total ack-batch failures due to insufficient fee or out-of-gas, surfaced without individualization",
 	}, []string{"lane"})
 
-	// AckBatchIndividualFallbacksTotal counts ack-batch failures that fall
+	// ackBatchIndividualFallbacksTotal counts ack-batch failures that fall
 	// through to per-lease retries (i.e. non-fee/gas errors).
-	AckBatchIndividualFallbacksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	ackBatchIndividualFallbacksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "ack_batch_individual_fallbacks_total",
 		Help:      "Total ack-batch failures that fell back to individual per-lease retries",
 	}, []string{"lane"})
 
-	// AckBatcherLaneRestartsTotal counts ack-batcher lanes respawned after a
+	// ackBatcherLaneRestartsTotal counts ack-batcher lanes respawned after a
 	// panic (ENG-589). A lane whose flush panics is recovered and restarted so
 	// acknowledgment does not stall permanently (at the default single lane a
 	// dead lane would disable ALL acking and cause the timeout checker to
 	// wrongly reject healthy leases). Sustained non-zero values mean a lane is
 	// crash-looping — pair with goroutine_panics_total{component="ack_batcher"}
 	// and alert.
-	AckBatcherLaneRestartsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	ackBatcherLaneRestartsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "ack_batcher_lane_restarts_total",
@@ -188,18 +188,18 @@ var (
 		Help:      "Total leases reconciliation deferred because ownership or lifecycle evidence was unsafe or changed during the sweep",
 	})
 
-	// ReconcilerLostLeasesTotal counts reconciliation of leases whose data
+	// reconcilerLostLeasesTotal counts reconciliation of leases whose data
 	// lived on a backend an operator retired as lost, and of ACTIVE leases with
 	// no placement row that an unproven retirement closes. outcome: closed,
 	// rejected, deferred, error.
-	ReconcilerLostLeasesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	reconcilerLostLeasesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "reconciler_lost_leases_total",
 		Help:      "Leases whose data lived on a retired backend's lost storage, by reconciliation outcome",
 	}, []string{"outcome"})
 
-	// ReconcilerPanicsTotal counts panics recovered inside reconciler
+	// reconcilerPanicsTotal counts panics recovered inside reconciler
 	// per-unit goroutines (per-lease, per-orphan, per-backend-fetch). The
 	// recover exists specifically to prevent one bad lease/orphan/backend
 	// from crashing the fred process. Any non-zero value is a latent bug
@@ -207,31 +207,31 @@ var (
 	// "process_lease", "process_orphan", "fetch_provisions", "fetch_retentions",
 	// "fetch_releases", "fetch_chain_leases", "check_placement_marker",
 	// "placement_cleanup".
-	ReconcilerPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	reconcilerPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "reconciler_panics_total",
 		Help:      "Panics recovered in reconciler per-unit goroutines, by stage",
 	}, []string{"stage"})
 
-	// LifecycleEventSinkPanicsTotal counts panics recovered from best-effort
+	// lifecycleEventSinkPanicsTotal counts panics recovered from best-effort
 	// lifecycle event sinks. Event delivery is observational and must never
 	// prevent backend dispatch or make an already-settled durable callback look
 	// retryable to its sender. The event label is selected exclusively from the
 	// constants below, keeping cardinality bounded.
-	LifecycleEventSinkPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	lifecycleEventSinkPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "lifecycle_event_sink_panics_total",
 		Help:      "Panics recovered from best-effort lifecycle event sinks, by event",
 	}, []string{"event"})
 
-	// BackendInvocationPanicsTotal counts panics recovered at providerd's
+	// backendInvocationPanicsTotal counts panics recovered at providerd's
 	// construction-bound backend execution boundary. Operation is selected from
 	// the constants below; backend and lease identifiers remain in logs to keep
 	// cardinality bounded. A mutation panic is classified as ambiguous because
 	// the side effect may already have crossed the process boundary.
-	BackendInvocationPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	backendInvocationPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "backend_invocation_panics_total",
@@ -243,20 +243,20 @@ var (
 	// binary, and importing this package to reach them is what made every
 	// docker-backend export providerd's metric set at 0 (ENG-712).
 
-	// SignerOOGRetriesTotal counts out-of-gas retry decisions at the
+	// signerOOGRetriesTotal counts out-of-gas retry decisions at the
 	// transaction broadcast layer. Label values: "retried" = gas was
 	// increased and the tx will be retried; "exhausted" = already at the
 	// cap, retry is futile and the error is surfaced to the caller.
-	SignerOOGRetriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	signerOOGRetriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "chain",
 		Name:      "signer_oog_retries_total",
 		Help:      "Total out-of-gas retry decisions by outcome (retried, exhausted)",
 	}, []string{"result"})
 
-	// GasSimulationTotal counts per-tx gas-simulation outcomes.
+	// gasSimulationTotal counts per-tx gas-simulation outcomes.
 	// result ∈ {simulated, fallback, refused}.
-	GasSimulationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	gasSimulationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "chain",
 		Name:      "gas_simulation_total",
@@ -277,8 +277,8 @@ var (
 
 // Reconciliation metrics
 var (
-	// ReconciliationTotal tracks the total number of reconciliation runs.
-	ReconciliationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	// reconciliationTotal tracks the total number of reconciliation runs.
+	reconciliationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "reconciler",
 		Name:      "runs_total",
@@ -302,17 +302,17 @@ var (
 		Help:      "Unix timestamp of the last successful reconciliation run",
 	})
 
-	// ReconciliationActions tracks actions taken during reconciliation. Its
+	// reconciliationActions tracks actions taken during reconciliation. Its
 	// action label is the closed set of Action constants, each exported at zero
 	// from package init.
-	ReconciliationActions = promauto.NewCounterVec(prometheus.CounterOpts{
+	reconciliationActions = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "reconciler",
 		Name:      "actions_total",
 		Help:      "Total number of actions taken during reconciliation",
 	}, []string{"action"})
 
-	// ReconcilerBackendFetchTotal counts per-backend provision-list attempts by
+	// reconcilerBackendFetchTotal counts per-backend provision-list attempts by
 	// outcome. This is the signal that replaces the loud symptom ENG-356
 	// removed: a backend that cannot be reached used to break reconciliation for
 	// the whole fleet, which was impossible to miss; afterwards it degrades only
@@ -323,14 +323,14 @@ var (
 	// "circuit_open". circuit_open is separated because it means fred
 	// short-circuited without dialing, which in an incident reads very
 	// differently from a backend that was actually contacted and failed.
-	ReconcilerBackendFetchTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	reconcilerBackendFetchTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "reconciler",
 		Name:      "backend_fetch_total",
 		Help:      "Per-backend provision-list attempts during reconciliation, by outcome",
 	}, []string{"backend", "outcome"})
 
-	// ReconcilerTerminalVerdictsTotal counts, once per ACTIVE lease whose
+	// reconcilerTerminalVerdictsTotal counts, once per ACTIVE lease whose
 	// provision is Failed per sweep, the backend's consecutive-failure verdict
 	// (ENG-799): exhausted (the lease is closed on-chain), retry (it is
 	// re-provisioned), absent (the backend reports no budget, so the lease is
@@ -339,7 +339,7 @@ var (
 	// Alert on a sustained absent or unknown rate: crash-looping leases on that
 	// backend keep being re-provisioned and billed. The label set is
 	// terminalverdict.Labels, pre-initialized by the provisioner package.
-	ReconcilerTerminalVerdictsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	reconcilerTerminalVerdictsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "reconciler",
 		Name:      "terminal_verdicts_total",
@@ -362,7 +362,7 @@ var (
 		Help:      "1 only while a complete full-fleet inventory is durably projected and no newer sweep has invalidated authority; 0 during startup, an in-progress sweep, or any incomplete or failed read or projection",
 	})
 
-	// ReconcilerBackendInventoryTotal counts, once per configured backend per
+	// reconcilerBackendInventoryTotal counts, once per configured backend per
 	// sealed sweep, how that backend's paired inventory evidence was disposed.
 	// "authoritative" and "partial" answered both inventories with the pinned
 	// storage identity ("partial" kept some of its leases conservative);
@@ -371,7 +371,7 @@ var (
 	// "unanswered" answered neither. Unlike backend_fetch_total, which counts
 	// provision-list attempts, this covers both endpoints and identity. Alert on
 	// a backend sustaining anything other than authoritative.
-	ReconcilerBackendInventoryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	reconcilerBackendInventoryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "reconciler",
 		Name:      "backend_inventory_total",
@@ -403,30 +403,30 @@ var (
 		Help:      "1 once the current sweep's placement projection committed durably, even with unanswered backends; 0 from the start of every sweep until then",
 	})
 
-	// PlacementSnapshotsTotal counts online snapshot attempts of placements.db
+	// placementSnapshotsTotal counts online snapshot attempts of placements.db
 	// and payloads.db, exactly once per attempt. Its series exist only while
 	// snapshots are configured, so `increase(...{outcome="success"}[2h]) == 0`
 	// is a heartbeat that cannot fire on a provider that never enabled them.
 	// Deliberately not paired with a last-success timestamp gauge.
-	PlacementSnapshotsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	placementSnapshotsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "placement",
 		Name:      "snapshots_total",
 		Help:      "Online snapshot attempts of placements.db and payloads.db by outcome (success, error, insufficient_space)",
 	}, []string{"outcome"})
 
-	// PlacementSnapshotPruneFailuresTotal counts snapshot files pruning kept
+	// placementSnapshotPruneFailuresTotal counts snapshot files pruning kept
 	// because it could not prove they were safe to delete, or failed to delete.
-	// Separate from PlacementSnapshotsTotal so a pruning problem never reads as
+	// Separate from placementSnapshotsTotal so a pruning problem never reads as
 	// a missing snapshot.
-	PlacementSnapshotPruneFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	placementSnapshotPruneFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "placement",
 		Name:      "snapshot_prune_failures_total",
 		Help:      "Snapshot files pruning kept or failed to delete, by reason",
 	}, []string{"reason"})
 
-	// ReconcilerCleanupSkipsTotal counts destructive cleanup actions the
+	// reconcilerCleanupSkipsTotal counts destructive cleanup actions the
 	// reconciler declined to take because it lacked positive evidence (ENG-654).
 	//
 	// Every reason is a deliberate fail-open: cleanup deletes durable state, so
@@ -454,7 +454,7 @@ var (
 	// A separate metric rather than new label values on actions_total, for the
 	// same reason deferred_leases_total is separate: adding a value there would
 	// silently change every existing `sum by (action)` panel and alert.
-	ReconcilerCleanupSkipsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	reconcilerCleanupSkipsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "reconciler",
 		Name:      "cleanup_skips_total",
@@ -464,8 +464,8 @@ var (
 
 // Payload metrics
 var (
-	// PayloadUploadsTotal tracks the total number of payload uploads.
-	PayloadUploadsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	// payloadUploadsTotal tracks the total number of payload uploads.
+	payloadUploadsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "payload",
 		Name:      "uploads_total",
@@ -509,29 +509,41 @@ var (
 		Buckets:   prometheus.DefBuckets,
 	}, []string{"backend", "operation", "status"}) // operation: provision, deprovision, get_info, list_provisions
 
-	// BackendRequestsTotal tracks total backend requests.
-	BackendRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	// backendRequestsTotal tracks total backend requests.
+	backendRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "backend",
 		Name:      "requests_total",
 		Help:      "Total number of backend requests",
 	}, []string{"backend", "operation", "status"})
 
-	// BackendInsufficientResourcesTotal tracks backend capacity responses by
+	// backendInsufficientResourcesTotal tracks backend capacity responses by
 	// whether the response satisfied the coded-refusal contract. The verdict set
 	// is closed below so producer drift cannot create unbounded cardinality.
-	BackendInsufficientResourcesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	backendInsufficientResourcesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "backend",
 		Name:      "insufficient_resources_total",
 		Help:      "Total number of backend provision or restore capacity responses by contract verdict",
 	}, []string{"backend", "verdict"})
 
-	// BackendMalformedErrorBodyTotal counts client-error responses whose body was
+	// unboundBackendEventsTotal counts events recorded for a backend name that
+	// nothing bound. ForBackend never creates a series, so such an event is
+	// counted here instead of under a backend label it could share with a real
+	// backend. Any increase is a bug: a component recorded for a backend before,
+	// or without, binding it.
+	unboundBackendEventsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "backend",
+		Name:      "unbound_events_total",
+		Help:      "Events recorded for a backend name providerd never bound; any increase is a bug",
+	})
+
+	// backendMalformedErrorBodyTotal counts client-error responses whose body was
 	// not the declared JSON error envelope, so fred answered the tenant with a
 	// generic message instead of the backend's diagnostic. A non-zero rate means
 	// a backend is off-contract (BACKEND_GUIDE.md) — ENG-620.
-	BackendMalformedErrorBodyTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	backendMalformedErrorBodyTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "backend",
 		Name:      "malformed_error_body_total",
@@ -599,10 +611,10 @@ var (
 
 // Rate limit metrics
 var (
-	// RateLimitRejectionsTotal distinguishes the tenant/observability IP bucket,
+	// rateLimitRejectionsTotal distinguishes the tenant/observability IP bucket,
 	// authenticated tenant buckets, callback ingress IPs, and verified callback
 	// storage identities. Labels never contain an IP, tenant, or backend UUID.
-	RateLimitRejectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	rateLimitRejectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "api",
 		Name:      "rate_limit_rejections_total",
@@ -622,23 +634,23 @@ var (
 		Help:      "Restart/update requests accepted without Idempotency-Key, each keyed by its single-use signed token",
 	})
 
-	// APICallbackSignatureKeyTotal counts callbacks verified, by the backend
+	// apiCallbackSignatureKeyTotal counts callbacks verified, by the backend
 	// whose key verified them and the key slot: "current" (the key providerd
 	// also signs with) or "previous" (hmac_secret_previous during a rotation).
 	// The backend label is the configured name bound to the verifying key,
 	// never a value taken from the callback. Before dropping a previous key,
 	// confirm "previous" stopped increasing while "current" still does.
-	APICallbackSignatureKeyTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	apiCallbackSignatureKeyTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "api",
 		Name:      "callback_signature_key_total",
 		Help:      "Backend callbacks verified, by backend and by key slot (current or previous)",
 	}, []string{"backend", "slot"})
 
-	// APICallbackAuthFailuresTotal counts callbacks refused at signature
+	// apiCallbackAuthFailuresTotal counts callbacks refused at signature
 	// verification, by closed reason. It carries no backend label: before
 	// verification the backend is only an unauthenticated claim.
-	APICallbackAuthFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	apiCallbackAuthFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "api",
 		Name:      "callback_auth_failures_total",
@@ -664,8 +676,8 @@ var (
 		Buckets:   prometheus.DefBuckets,
 	}, []string{"method", "path", "status"})
 
-	// APIRequestsTotal tracks total API requests.
-	APIRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	// apiRequestsTotal tracks total API requests.
+	apiRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "api",
 		Name:      "requests_total",
@@ -717,8 +729,8 @@ var (
 
 // Chain metrics
 var (
-	// ChainTxTotal tracks chain transactions by type and outcome.
-	ChainTxTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	// chainTxTotal tracks chain transactions by type and outcome.
+	chainTxTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "chain",
 		Name:      "transactions_total",
@@ -799,15 +811,15 @@ var (
 		Namespace: namespace, Subsystem: "provisioner", Name: "deferred_closes_oldest_age_seconds",
 		Help: "Age since first enqueue of the oldest queued or executing close hint; zero when empty, refreshed each second.",
 	})
-	// DeferredClosesTotal distinguishes scheduled admission waits, overdue
+	// deferredClosesTotal distinguishes scheduled admission waits, overdue
 	// retained work requiring operator attention, and failures.
-	DeferredClosesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	deferredClosesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: "provisioner", Name: "deferred_closes_total",
 		Help: "Close retry scheduling outcomes; dispatched is not proof of physical teardown.",
 	}, []string{"outcome", "reason"})
 
-	// WatermillMessagesTotal tracks Watermill message processing.
-	WatermillMessagesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	// watermillMessagesTotal tracks Watermill message processing.
+	watermillMessagesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "watermill",
 		Name:      "messages_total",
@@ -825,8 +837,8 @@ var (
 
 // Event subscriber metrics
 var (
-	// EventsDroppedTotal tracks events dropped due to full subscriber channels.
-	EventsDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	// eventsDroppedTotal tracks events dropped due to full subscriber channels.
+	eventsDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "events",
 		Name:      "dropped_total",
@@ -836,8 +848,8 @@ var (
 
 // Message processing metrics
 var (
-	// MalformedMessagesTotal tracks malformed messages that couldn't be processed.
-	MalformedMessagesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	// malformedMessagesTotal tracks malformed messages that couldn't be processed.
+	malformedMessagesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "messages",
 		Name:      "malformed_total",
@@ -884,26 +896,26 @@ var (
 		Help:      "Total provision-success callbacks observed while deprovision owned the exact in-flight generation",
 	})
 
-	// LifecycleCallbackOutcomesTotal classifies every authenticated callback
+	// lifecycleCallbackOutcomesTotal classifies every authenticated callback
 	// routed to lifecycle policy exactly once. Summing all outcomes is the
 	// lifecycle-specific received count; outcome separates an applied observation
 	// from an acknowledged stale/retired drop and a retryable application failure.
 	// Verdict and status use closed vocabularies
 	// declared below, so malformed or future values cannot create unbounded
 	// series.
-	LifecycleCallbackOutcomesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	lifecycleCallbackOutcomesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "lifecycle_callback_outcomes_total",
 		Help:      "Authenticated lifecycle callbacks by terminal application outcome, authorization verdict, and bounded callback status",
 	}, []string{"outcome", "verdict", "status"})
 
-	// NonInFlightCallbacksTotal retains its original received-at-ingress
+	// nonInFlightCallbacksTotal retains its original received-at-ingress
 	// semantics for compatibility with existing dashboards. It increments before
 	// lifecycle authorization, including when the callback is then dropped as
-	// stale or retired. LifecycleCallbackOutcomesTotal is the separate policy
+	// stale or retired. lifecycleCallbackOutcomesTotal is the separate policy
 	// result; do not reinterpret this counter as "applied".
-	NonInFlightCallbacksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	nonInFlightCallbacksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "api",
 		Name:      "non_in_flight_callbacks_total",
@@ -929,7 +941,7 @@ var (
 		Help:      "Number of active batcher lanes for parallel signing",
 	})
 
-	// SignerBalanceQueryFailures counts per-address bank balance query failures
+	// signerBalanceQueryFailures counts per-address bank balance query failures
 	// observed by the SignerBalanceCollector during a /metrics scrape. The
 	// matching `fred_signer_balance` gauge series is dropped for the failing
 	// address on that scrape. Labeled by role ("provider" or "sub_signer"),
@@ -937,14 +949,14 @@ var (
 	// gauge-only label that would inflate counter cardinality without adding
 	// signal; denom is included so an operator scraping a deployment with a
 	// non-umfx fee denom can still correlate the counter to the gauge).
-	SignerBalanceQueryFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+	signerBalanceQueryFailures = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "signer",
 		Name:      "balance_query_failures_total",
 		Help:      "Total per-address signer balance query failures during /metrics scrapes",
 	}, []string{"role", "address", "denom"})
 
-	// SignerGrantCheckTotal counts sub-signer authz grant sweeps, incremented
+	// signerGrantCheckTotal counts sub-signer authz grant sweeps, incremented
 	// exactly once per pass of the sub-signer maintenance loop. That makes
 	// `sum without (outcome) (increase(...))` a true loop-liveness heartbeat and
 	// {outcome="error"} the failure signal.
@@ -954,7 +966,7 @@ var (
 	// fred_signer_pool_lane_count stays put and nothing else moves. Deliberately
 	// NOT paired with a *_last_success_timestamp gauge — see the rationale on
 	// retentionSweepTotal in internal/backend/docker/metrics.go.
-	SignerGrantCheckTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	signerGrantCheckTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "signer",
 		Name:      "grant_check_total",
@@ -1056,7 +1068,7 @@ const (
 )
 
 // Capacity verdict constants are the complete bounded vocabulary for the
-// verdict label on BackendInsufficientResourcesTotal. CodedRefusal means the
+// verdict label on backendInsufficientResourcesTotal. CodedRefusal means the
 // configured endpoint returned the declared envelope and machine code; it does
 // not mean the response was cryptographically authenticated. Ambiguous covers
 // legacy/code-less and unknown-code 503 responses.
@@ -1066,7 +1078,7 @@ const (
 )
 
 // Lifecycle event constants are the complete bounded label vocabulary for
-// LifecycleEventSinkPanicsTotal.
+// lifecycleEventSinkPanicsTotal.
 const (
 	LifecycleEventProvisionStarting = "provision_starting"
 	LifecycleEventRestoreRestarting = "restore_restarting"
@@ -1075,7 +1087,7 @@ const (
 )
 
 // Lifecycle callback constants are the complete bounded vocabularies for
-// LifecycleCallbackOutcomesTotal. Retryable means Fred returned a non-2xx and
+// lifecycleCallbackOutcomesTotal. Retryable means Fred returned a non-2xx and
 // the backend must retain the durable FIFO head; Dropped is a terminal 2xx
 // no-op for stale or otherwise unauthorized observational input.
 const (
@@ -1102,13 +1114,3 @@ const (
 	ActionAnomaly       = "anomaly"
 	ActionLeaseError    = "lease_error"
 )
-
-// Export every reconciliation action at zero before the first sweep. A missing
-// series cannot tell a quiet sweep from missing instrumentation, and increase()
-// never sees the increment that creates a series, so an alert would miss the
-// first lease_error after each restart (ENG-1116).
-func init() {
-	for _, action := range []string{ActionProvisioned, ActionAcknowledged, ActionDeprovisioned, ActionAnomaly, ActionLeaseError} {
-		ReconciliationActions.WithLabelValues(action)
-	}
-}

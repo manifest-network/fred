@@ -19,7 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/metrics"
-	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 // mockChainClient implements ChainClient interface for testing.
@@ -1559,14 +1558,14 @@ func TestTriggerWithdraw_PanicDoesNotCrashFred(t *testing.T) {
 		<-startDone
 	})
 
-	before := promtestutil.ToFloat64(background.GoroutinePanicsTotal.WithLabelValues("withdraw_scheduler"))
+	before := promtestutil.ToFloat64(withdrawSchedulerPanics)
 
 	// First trigger — will panic inside WithdrawByProvider. Must not
 	// crash fred. The spawned goroutine recovers, logs, bumps metric.
 	scheduler.TriggerWithdraw()
 
 	require.Eventually(t, func() bool {
-		return promtestutil.ToFloat64(background.GoroutinePanicsTotal.WithLabelValues("withdraw_scheduler")) == before+1
+		return promtestutil.ToFloat64(withdrawSchedulerPanics) == before+1
 	}, 2*time.Second, 10*time.Millisecond,
 		"GoroutinePanicsTotal{withdraw_scheduler} must increment after panic recovery")
 

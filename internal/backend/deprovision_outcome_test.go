@@ -94,7 +94,7 @@ func TestLifecyclePendingAnswerIsCountedAsPending(t *testing.T) {
 	}, []string{"backend", "operation", "status"})
 	policy, err := NewConnectionPolicy(ConnectionConfig{Name: "close-owner", BaseURL: "https://backend.example", Secret: testIdentityClientKey})
 	require.NoError(t, err)
-	client, err := NewIdentityBoundHTTPClient(policy, HTTPClientOptions{RequestsTotal: requests, CBFailureThresh: 1},
+	client, err := NewIdentityBoundHTTPClient(policy, HTTPClientOptions{RequestCounters: vecRequestCounters(requests, nil), CBFailureThresh: 1},
 		&testStorageIdentityResolver{id: mustBackendStorageID(t, testBackendStorageIDA), bound: true})
 	require.NoError(t, err)
 	client.wire.httpClient.Transport = causalOutcomeRoundTripper(func(*http.Request) (*http.Response, error) {

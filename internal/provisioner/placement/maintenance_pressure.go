@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/maintenanceid"
@@ -34,6 +35,14 @@ const (
 	maintenanceCountReserved maintenanceReservation = iota + 1
 	maintenanceBytesReserved
 )
+
+// refusals is the admission-refusal series of the reservation.
+func (reservation maintenanceReservation) refusals() prometheus.Counter {
+	if reservation == maintenanceCountReserved {
+		return metrics.MaintenanceAdmissionRefusals.ReservedCount
+	}
+	return metrics.MaintenanceAdmissionRefusals.ReservedBytes
+}
 
 func (reservation maintenanceReservation) reason() string {
 	if reservation == maintenanceCountReserved {
@@ -160,16 +169,16 @@ func loadMaintenanceAccounting(tx *bolt.Tx) (*maintenancePendingAccounting, erro
 // Fresh work reserves framing for later phase changes. Exact replay and
 // settlement retain their authority even when legacy work exceeds a limit.
 func (journal *maintenanceJournalTransaction) admit(command MaintenanceCommand, newBytes int) error {
-	refuse := func(reason string) error {
-		metrics.MaintenanceAdmissionRefusalsTotal.WithLabelValues(reason).Inc()
+	refuse := func(reason string, refusals prometheus.Counter) error {
+		refusals.Inc()
 		return fmt.Errorf("%w: %s", ErrMaintenancePendingFull, reason)
 	}
 	charge := int64(newBytes) + pendingMaintenanceTransitionBytes
 	if journal.total.count >= maxPendingMaintenanceCommands {
-		return refuse("count")
+		return refuse("count", metrics.MaintenanceAdmissionRefusals.Count)
 	}
 	if charge > maxPendingMaintenanceBytes-journal.total.bytes {
-		return refuse("bytes")
+		return refuse("bytes", metrics.MaintenanceAdmissionRefusals.Bytes)
 	}
 	if journal.tenantUsage(command.tenant).count > 0 {
 		var reservation maintenanceReservation
@@ -180,7 +189,7 @@ func (journal *maintenanceJournalTransaction) admit(command MaintenanceCommand, 
 			reservation = maintenanceBytesReserved
 		}
 		if reservation != 0 {
-			metrics.MaintenanceAdmissionRefusalsTotal.WithLabelValues(reservation.reason()).Inc()
+			reservation.refusals().Inc()
 			return maintenanceReservationRefusal{reservation: reservation}
 		}
 	}

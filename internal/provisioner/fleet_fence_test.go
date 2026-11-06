@@ -91,12 +91,10 @@ func TestFleet_FencedBackendIsNeverAskedAndItsLeasesWait(t *testing.T) {
 	f.assertPlacementPinned("lease-fenced", fencedServer.name)
 
 	f.restartFenced(fencedServer.name)
-	fencedOutcome := metrics.ReconcilerBackendInventoryTotal.WithLabelValues(
-		fencedServer.name, metrics.InventoryOutcomeFenced)
-	unanswered := metrics.ReconcilerBackendInventoryTotal.WithLabelValues(
-		fencedServer.name, metrics.InventoryOutcomeUnanswered)
-	fencedFetch := metrics.ReconcilerBackendFetchTotal.WithLabelValues(
-		fencedServer.name, metrics.FetchOutcomeFenced)
+	fencedOutcome := inventorySeries(t, fencedServer.name, metrics.InventoryOutcomeFenced)
+	unanswered := inventorySeries(t, fencedServer.name, metrics.InventoryOutcomeUnanswered)
+	metrics.BindBackends(fencedServer.name)
+	fencedFetch := metrics.ForBackend(fencedServer.name).ReconcileFetch.Fenced
 	fencedBefore, unansweredBefore, fetchBefore :=
 		promtestutil.ToFloat64(fencedOutcome), promtestutil.ToFloat64(unanswered), promtestutil.ToFloat64(fencedFetch)
 	fencedServer.mu.Lock()
@@ -150,7 +148,7 @@ func TestFleet_CloseOnAFencedBackendIsParked(t *testing.T) {
 	scheduler := newDeferredCloseScheduler()
 	scheduler.start(t.Context())
 	t.Cleanup(func() { scheduler.stop(); scheduler.wg.Wait() })
-	parked := metrics.DeferredClosesTotal.WithLabelValues("parked", string(placement.DeprovisionDeferredBackendFenced))
+	parked := metrics.DeferredCloses.BackendFenced.Parked
 	before := promtestutil.ToFloat64(parked)
 	require.NoError(t, scheduler.enqueue(result.Deferred()))
 	assert.Equal(t, before+1, promtestutil.ToFloat64(parked))
@@ -190,7 +188,7 @@ func TestFleet_QueuedCloseParksOnceOnlyTheFenceRemains(t *testing.T) {
 	scheduler := newDeferredCloseScheduler()
 	scheduler.start(t.Context())
 	t.Cleanup(func() { scheduler.stop(); scheduler.wg.Wait() })
-	parked := metrics.DeferredClosesTotal.WithLabelValues("parked", string(placement.DeprovisionDeferredBackendFenced))
+	parked := metrics.DeferredCloses.BackendFenced.Parked
 	before := promtestutil.ToFloat64(parked)
 	require.NoError(t, scheduler.enqueue(result.Deferred()))
 
@@ -233,7 +231,7 @@ func TestFleet_AttemptOnAFencedBackendWaitsQuietly(t *testing.T) {
 	require.NoError(t, f.sweep())
 	induceFleetAmbiguousProvision(t, f, "lease-attempt", "sku-attempt", 2)
 	f.restartFenced(f.backendAt(2).name)
-	leaseErrors := metrics.ReconciliationActions.WithLabelValues(metrics.ActionLeaseError)
+	leaseErrors := metrics.ReconcilerActions.LeaseError
 	before := promtestutil.ToFloat64(leaseErrors)
 
 	require.NoError(t, f.sweep())
@@ -271,7 +269,7 @@ func TestFleet_FencedReporterLostPositiveIsNotAdmittedElsewhere(t *testing.T) {
 	f.interruptSweepAfterProvisions(f.backendAt(3))
 	f.restartFenced(fencedServer.name)
 	require.Equal(t, placement.InventoryRecoveryPending, f.placement.InventoryReadiness())
-	leaseErrors := metrics.ReconciliationActions.WithLabelValues(metrics.ActionLeaseError)
+	leaseErrors := metrics.ReconcilerActions.LeaseError
 	errorsBefore := promtestutil.ToFloat64(leaseErrors)
 
 	require.NoError(t, f.sweepN(2))

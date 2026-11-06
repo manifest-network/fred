@@ -8,6 +8,8 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/metrics"
@@ -122,17 +124,17 @@ func (service *CallbackService) HandleCallback(
 func (service *CallbackService) observeResult(result placement.CallbackResult) {
 	callback := result.Observation()
 	if result.NonInFlight() {
-		backendLabel := sanitizeCallbackBackend(service.backends, callback.BackendName())
-		metrics.NonInFlightCallbacksTotal.WithLabelValues(
-			backendLabel, string(callback.Status()),
-		).Inc()
+		statuses := nonInFlightCallbacks(service.backends, callback.BackendName())
+		if counter, ok := callbackStatusCounter(statuses, callback.Status()); ok {
+			counter.Inc()
+		}
 	}
 	if result.LifecycleOutcome() != placement.CallbackLifecycleNone {
-		metrics.LifecycleCallbackOutcomesTotal.WithLabelValues(
-			callbackLifecycleOutcomeLabel(result.LifecycleOutcome()),
-			lifecycleCallbackVerdictLabel(result.LifecycleVerdict()),
-			string(callback.Status()),
-		).Inc()
+		verdicts := callbackLifecycleOutcomeCounters(result.LifecycleOutcome())
+		statuses := lifecycleCallbackVerdictCounters(verdicts, result.LifecycleVerdict())
+		if counter, ok := callbackStatusCounter(statuses, callback.Status()); ok {
+			counter.Inc()
+		}
 	}
 	if result.OperationOutcome() != placement.CallbackOperationNone {
 		backendName := result.AuthoritativeBackend()
@@ -142,11 +144,12 @@ func (service *CallbackService) observeResult(result placement.CallbackResult) {
 				backendName, operationLabel,
 			).Observe(time.Since(result.OperationStartedAt()).Seconds())
 		}
-		outcome := metrics.OutcomeFailed
+		outcomes := provisioningOutcomes(metrics.ForBackend(backendName).Provisioning, result.OperationKind())
+		outcome := outcomes.Failed
 		if result.OperationOutcome() == placement.CallbackOperationSucceeded {
-			outcome = metrics.OutcomeSuccess
+			outcome = outcomes.Success
 		}
-		metrics.ProvisioningTotal.WithLabelValues(outcome, backendName, operationLabel).Inc()
+		outcome.Inc()
 	}
 	if result.DeletePayload() && service.payloads != nil {
 		service.payloads.Delete(callback.LeaseUUID())
@@ -176,9 +179,7 @@ func (service *CallbackService) publish(
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
-				metrics.LifecycleEventCallback,
-			).Inc()
+			metrics.LifecycleEventSinkPanics.Callback.Inc()
 			slog.Error("callback lifecycle event sink panicked; preserving terminal callback settlement",
 				"lease_uuid", leaseUUID, "status", status,
 				"event", metrics.LifecycleEventCallback, "panic", recovered,
@@ -189,38 +190,66 @@ func (service *CallbackService) publish(
 	service.events.PublishCallbackLeaseEvent(leaseUUID, status, errMsg)
 }
 
-func callbackLifecycleOutcomeLabel(outcome placement.CallbackLifecycleOutcome) string {
+func callbackLifecycleOutcomeCounters(outcome placement.CallbackLifecycleOutcome) metrics.LifecycleCallbackVerdictCounters {
 	switch outcome {
 	case placement.CallbackLifecycleApplied:
-		return metrics.LifecycleCallbackOutcomeApplied
+		return metrics.LifecycleCallbackOutcomes.Applied
 	case placement.CallbackLifecycleDropped:
-		return metrics.LifecycleCallbackOutcomeDropped
+		return metrics.LifecycleCallbackOutcomes.Dropped
 	default:
-		return metrics.LifecycleCallbackOutcomeRetryable
+		return metrics.LifecycleCallbackOutcomes.Retryable
 	}
 }
 
-func lifecycleCallbackVerdictLabel(verdict placement.LifecycleVerdict) string {
+func lifecycleCallbackVerdictCounters(
+	verdicts metrics.LifecycleCallbackVerdictCounters, verdict placement.LifecycleVerdict,
+) metrics.CallbackStatusCounters {
 	switch verdict {
 	case placement.LifecycleVerdictAuthorized:
-		return metrics.LifecycleCallbackVerdictAuthorized
+		return verdicts.Authorized
 	case placement.LifecycleVerdictLegacy:
-		return metrics.LifecycleCallbackVerdictLegacy
+		return verdicts.Legacy
 	case placement.LifecycleVerdictTeardownOnly:
-		return metrics.LifecycleCallbackVerdictTeardownOnly
+		return verdicts.TeardownOnly
 	case placement.LifecycleVerdictRetired:
-		return metrics.LifecycleCallbackVerdictRetired
+		return verdicts.Retired
 	case placement.LifecycleVerdictInvalid:
-		return metrics.LifecycleCallbackVerdictInvalid
+		return verdicts.Invalid
 	case placement.LifecycleVerdictMissing:
-		return metrics.LifecycleCallbackVerdictMissing
+		return verdicts.Missing
 	case placement.LifecycleVerdictStale:
-		return metrics.LifecycleCallbackVerdictStale
+		return verdicts.Stale
 	case placement.LifecycleVerdictUnusable:
-		return metrics.LifecycleCallbackVerdictUnusable
+		return verdicts.Unusable
 	default:
-		return metrics.LifecycleCallbackVerdictUnknown
+		return verdicts.Unknown
 	}
+}
+
+// callbackStatusCounter is the series of a callback status. The callback wire
+// admits only these three statuses, so every observation has one.
+func callbackStatusCounter(
+	statuses metrics.CallbackStatusCounters, status backend.CallbackStatus,
+) (prometheus.Counter, bool) {
+	switch status {
+	case backend.CallbackStatusSuccess:
+		return statuses.Success, true
+	case backend.CallbackStatusFailed:
+		return statuses.Failed, true
+	case backend.CallbackStatusDeprovisioned:
+		return statuses.Deprovisioned, true
+	default:
+		return nil, false
+	}
+}
+
+func provisioningOutcomes(
+	operations metrics.ProvisioningCounters, kind operation.Kind,
+) metrics.ProvisioningOutcomeCounters {
+	if kind == operation.KindRestore {
+		return operations.Restore
+	}
+	return operations.Provision
 }
 
 func callbackOperationLabel(kind operation.Kind) string {
@@ -230,14 +259,17 @@ func callbackOperationLabel(kind operation.Kind) string {
 	return metrics.OperationProvision
 }
 
-func sanitizeCallbackBackend(catalog CallbackBackendCatalog, name string) string {
+// nonInFlightCallbacks is the reporting backend's series, or the shared
+// unknown or invalid ones when the claimed name is empty or not configured,
+// so a callback cannot mint a series.
+func nonInFlightCallbacks(catalog CallbackBackendCatalog, name string) metrics.CallbackStatusCounters {
 	if name == "" {
-		return labelBackendUnknown
+		return metrics.NonInFlightCallbacksUnknownBackend
 	}
 	if catalog == nil || !catalog.HasBackend(name) {
-		return labelBackendInvalid
+		return metrics.NonInFlightCallbacksInvalidBackend
 	}
-	return name
+	return metrics.ForBackend(name).NonInFlightCallbacks
 }
 
 var _ CallbackApplication = (*CallbackService)(nil)

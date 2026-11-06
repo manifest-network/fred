@@ -23,6 +23,7 @@ var unlabelledMetricNames = []string{
 	"fred_backend_health_probe_panics_total",
 	"fred_chain_health_probe_panics_total",
 	"fred_backend_routing_fallback_total",
+	"fred_backend_unbound_events_total",
 	"fred_chain_gas_simulated",
 	"fred_payload_leases_awaiting",
 	"fred_payload_size_bytes",
@@ -104,6 +105,7 @@ var labelledMetricNames = []string{
 	"fred_reconciler_backend_inventory_answered",
 	"fred_placement_snapshots_total",
 	"fred_placement_snapshot_prune_failures_total",
+	"fred_placement_unprojected_fenced_reporter",
 	"fred_reconciler_cleanup_skips_total",
 	"fred_reconciler_runs_total",
 	"fred_signer_balance_query_failures_total",
@@ -117,64 +119,64 @@ var labelledMetricNames = []string{
 // three.
 func allCollectors() []prometheus.Collector {
 	return []prometheus.Collector{
-		MaintenancePending, MaintenancePendingBytes, MaintenancePendingOldestAge, MaintenanceAdmissionRefusalsTotal,
+		MaintenancePending, MaintenancePendingBytes, MaintenancePendingOldestAge, maintenanceAdmissionRefusalsTotal,
 		// Provisioning
-		PlacementWriteFailuresTotal, PlacementInventoryRecoveryPending, APIMaintenanceLegacyKeyTotal,
-		APICallbackSignatureKeyTotal, APICallbackAuthFailuresTotal, APICallbackPreviousKeyConfigured,
-		PlacementSnapshotsTotal, PlacementSnapshotPruneFailuresTotal,
+		PlacementWriteFailuresTotal, PlacementInventoryRecoveryPending, APIMaintenanceLegacyKeyTotal, unboundBackendEventsTotal,
+		apiCallbackSignatureKeyTotal, apiCallbackAuthFailuresTotal, APICallbackPreviousKeyConfigured,
+		placementSnapshotsTotal, placementSnapshotPruneFailuresTotal, PlacementUnprojectedFencedReporter,
 		InFlightProvisions,
-		ProvisioningTotal,
+		provisioningTotal,
 		ProvisioningDuration,
-		AckBatchFeeGasErrorsTotal,
-		AckBatchIndividualFallbacksTotal,
-		AckBatcherLaneRestartsTotal,
+		ackBatchFeeGasErrorsTotal,
+		ackBatchIndividualFallbacksTotal,
+		ackBatcherLaneRestartsTotal,
 		ReconcilerInflightSkipsTotal,
-		ReconcilerDeferredLeasesTotal, ReconcilerLostLeasesTotal, MaintenanceReceiptsEvictedTotal,
-		ReconcilerPanicsTotal,
-		LifecycleEventSinkPanicsTotal,
-		BackendInvocationPanicsTotal,
+		ReconcilerDeferredLeasesTotal, reconcilerLostLeasesTotal, MaintenanceReceiptsEvictedTotal,
+		reconcilerPanicsTotal,
+		lifecycleEventSinkPanicsTotal,
+		backendInvocationPanicsTotal,
 		DeferredClosesPending,
 		DeferredClosesOldestAge,
-		DeferredClosesTotal,
-		SignerOOGRetriesTotal,
-		GasSimulationTotal,
+		deferredClosesTotal,
+		signerOOGRetriesTotal,
+		gasSimulationTotal,
 		GasSimulated,
 		// Reconciliation
-		ReconciliationTotal,
+		reconciliationTotal,
 		ReconciliationDuration,
 		ReconcilerLastSuccessTimestamp,
-		ReconciliationActions,
-		ReconcilerBackendFetchTotal,
-		ReconcilerTerminalVerdictsTotal,
-		ReconcilerBackendInventoryTotal,
+		reconciliationActions,
+		reconcilerBackendFetchTotal,
+		reconcilerTerminalVerdictsTotal,
+		reconcilerBackendInventoryTotal,
 		ReconcilerBackendInventoryAnswered,
 		ReconcilerSweepComplete,
 		ReconcilerSweepProjectionCommitted,
-		ReconcilerCleanupSkipsTotal,
+		reconcilerCleanupSkipsTotal,
 		// Payload
-		PayloadUploadsTotal,
+		payloadUploadsTotal,
 		PayloadStoredCount,
 		PayloadSizeBytes,
 		LeasesAwaitingPayload,
 		// Backend
 		BackendRequestDuration,
-		BackendRequestsTotal,
-		BackendInsufficientResourcesTotal,
-		BackendMalformedErrorBodyTotal,
+		backendRequestsTotal,
+		backendInsufficientResourcesTotal,
+		backendMalformedErrorBodyTotal,
 		BackendHealthy,
 		BackendCircuitBreakerState,
 		BackendAllocatedCPURatio,
 		RoutingFallbackTotal,
 		BackendHealthProbePanicsTotal,
 		// Rate limit / API / health
-		RateLimitRejectionsTotal,
+		rateLimitRejectionsTotal,
 		APIRequestDuration,
-		APIRequestsTotal,
+		apiRequestsTotal,
 		HealthCheckHealthy,
 		ChainHealthProbePanicsTotal,
 		HealthCheckDuration,
 		// Chain
-		ChainTxTotal,
+		chainTxTotal,
 		ChainQueryDuration,
 		// Withdraw
 		WithdrawIncompleteCyclesTotal,
@@ -182,22 +184,22 @@ func allCollectors() []prometheus.Collector {
 		CreditCheckZeroDeferredTotal,
 		WithdrawGuardActive,
 		// Watermill / events / messages
-		WatermillMessagesTotal,
+		watermillMessagesTotal,
 		PoisonedMessagesTotal,
-		EventsDroppedTotal,
-		MalformedMessagesTotal,
+		eventsDroppedTotal,
+		malformedMessagesTotal,
 		ReconciliationConflictsTotal,
 		// Callback
 		CallbackDeprovisionOwnedSuccessTotal,
 		CallbackSettlementClaimWaitTimeoutsTotal,
 		CallbackTimeoutsTotal,
-		LifecycleCallbackOutcomesTotal,
-		NonInFlightCallbacksTotal,
+		lifecycleCallbackOutcomesTotal,
+		nonInFlightCallbacksTotal,
 		// Signer pool
 		SignerPoolSize,
 		SignerPoolLaneCount,
-		SignerBalanceQueryFailures,
-		SignerGrantCheckTotal,
+		signerBalanceQueryFailures,
+		signerGrantCheckTotal,
 	}
 }
 
@@ -306,115 +308,24 @@ func TestReconciliationActionsExportedAtInit(t *testing.T) {
 		actions)
 }
 
-func TestCounterVecLabels(t *testing.T) {
-	// Verify each Vec metric accepts its documented labels without panic.
-	assert.NotPanics(t, func() {
-		ProvisioningTotal.WithLabelValues("success", "docker", "provision")
-		ProvisioningTotal.WithLabelValues("success", "docker", "restore")
-	})
+func TestVecLabels(t *testing.T) {
+	// Verify each gauge and histogram Vec accepts its documented labels without
+	// panic. Every counter Vec binds its whole vocabulary at package
+	// initialization (series.go), so a label-arity mistake there fails every
+	// test in this package.
 	assert.NotPanics(t, func() {
 		ProvisioningDuration.WithLabelValues("docker", "provision")
 		ProvisioningDuration.WithLabelValues("docker", "restore")
 	})
 	assert.NotPanics(t, func() {
-		AckBatchFeeGasErrorsTotal.WithLabelValues("0")
-		AckBatchIndividualFallbacksTotal.WithLabelValues("0")
-		AckBatcherLaneRestartsTotal.WithLabelValues("0")
-	})
-	assert.NotPanics(t, func() {
-		ReconcilerPanicsTotal.WithLabelValues("process_lease")
-		ReconcilerPanicsTotal.WithLabelValues("process_orphan")
-		ReconcilerPanicsTotal.WithLabelValues("fetch_provisions")
-		ReconcilerPanicsTotal.WithLabelValues("fetch_retentions")
-		ReconcilerPanicsTotal.WithLabelValues("fetch_releases")
-		ReconcilerPanicsTotal.WithLabelValues("fetch_chain_leases")
-		ReconcilerPanicsTotal.WithLabelValues("check_placement_marker")
-	})
-	assert.NotPanics(t, func() {
-		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventProvisionStarting)
-		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventRestoreRestarting)
-		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventRestoreRefused)
-	})
-	assert.NotPanics(t, func() {
-		BackendInvocationPanicsTotal.WithLabelValues(OperationProvision)
-		BackendInvocationPanicsTotal.WithLabelValues(OperationRestore)
-		BackendInvocationPanicsTotal.WithLabelValues(OperationDeprovision)
-		BackendInvocationPanicsTotal.WithLabelValues(OperationRestart)
-		BackendInvocationPanicsTotal.WithLabelValues(OperationUpdate)
-		BackendInvocationPanicsTotal.WithLabelValues(OperationGetProvision)
-		BackendInvocationPanicsTotal.WithLabelValues(OperationReconcileCustomDomain)
-	})
-	assert.NotPanics(t, func() {
-		SignerOOGRetriesTotal.WithLabelValues("retried")
-		SignerOOGRetriesTotal.WithLabelValues("exhausted")
-	})
-	assert.NotPanics(t, func() {
-		GasSimulationTotal.WithLabelValues("simulated")
-		GasSimulationTotal.WithLabelValues("fallback")
-		GasSimulationTotal.WithLabelValues("refused")
-	})
-	assert.NotPanics(t, func() {
-		ReconciliationTotal.WithLabelValues(OutcomeSuccess)
-		ReconciliationTotal.WithLabelValues(OutcomePartial)
-		ReconciliationTotal.WithLabelValues(OutcomeDegraded)
-		ReconciliationTotal.WithLabelValues(OutcomeError)
-	})
-	assert.NotPanics(t, func() {
-		ReconciliationActions.WithLabelValues("provisioned")
-	})
-	assert.NotPanics(t, func() {
-		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeOK)
-		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeError)
-		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeCircuitOpen)
-	})
-	assert.NotPanics(t, func() {
-		for _, verdict := range []string{"exhausted", "retry", "absent", "unknown"} {
-			ReconcilerTerminalVerdictsTotal.WithLabelValues(verdict)
-		}
-	})
-	assert.NotPanics(t, func() {
-		for _, outcome := range []string{
-			InventoryOutcomeAuthoritative, InventoryOutcomePartial, InventoryOutcomeUntrusted,
-			InventoryOutcomeProvisionsOnly, InventoryOutcomeRetentionsOnly, InventoryOutcomeUnanswered,
-			InventoryOutcomeFenced,
-		} {
-			ReconcilerBackendInventoryTotal.WithLabelValues("docker", outcome)
-		}
 		ReconcilerBackendInventoryAnswered.WithLabelValues("docker")
 	})
 	assert.NotPanics(t, func() {
-		for _, slot := range []string{CallbackKeySlotCurrent, CallbackKeySlotPrevious} {
-			APICallbackSignatureKeyTotal.WithLabelValues("docker", slot)
-		}
-		for _, reason := range []string{
-			CallbackAuthFailureMissing, CallbackAuthFailureFormat, CallbackAuthFailureExpired,
-			CallbackAuthFailureFuture, CallbackAuthFailureMismatch, CallbackAuthFailureUnknownStorage,
-			CallbackAuthFailureFenced,
-		} {
-			APICallbackAuthFailuresTotal.WithLabelValues(reason)
-		}
 		APICallbackPreviousKeyConfigured.WithLabelValues("docker")
 		PlacementUnprojectedFencedReporter.WithLabelValues("docker")
 	})
 	assert.NotPanics(t, func() {
-		// Both label sets are closed; every combination the reconciler can emit.
-		for _, pass := range []string{CleanupPassOrphan, CleanupPassPayload, CleanupPassPlacement} {
-			for _, reason := range []string{
-				CleanupSkipChainLive, CleanupSkipChainUnknown, CleanupSkipChainUnknownState,
-				CleanupSkipChainError, CleanupSkipBackendSilent, CleanupSkipAttemptPending,
-			} {
-				ReconcilerCleanupSkipsTotal.WithLabelValues(pass, reason)
-			}
-		}
-	})
-	assert.NotPanics(t, func() {
-		PayloadUploadsTotal.WithLabelValues("success")
-	})
-	assert.NotPanics(t, func() {
 		BackendRequestDuration.WithLabelValues("docker", "provision", "200")
-	})
-	assert.NotPanics(t, func() {
-		BackendRequestsTotal.WithLabelValues("docker", "provision", "200")
 	})
 	assert.NotPanics(t, func() {
 		BackendCircuitBreakerState.WithLabelValues("docker")
@@ -426,9 +337,6 @@ func TestCounterVecLabels(t *testing.T) {
 		APIRequestDuration.WithLabelValues("GET", "/health", "200")
 	})
 	assert.NotPanics(t, func() {
-		APIRequestsTotal.WithLabelValues("GET", "/health", "200")
-	})
-	assert.NotPanics(t, func() {
 		for _, check := range []string{
 			"chain", "token_tracker", "placement_store", "placement_inventory", "payload_store",
 		} {
@@ -436,44 +344,10 @@ func TestCounterVecLabels(t *testing.T) {
 		}
 	})
 	assert.NotPanics(t, func() {
-		ChainTxTotal.WithLabelValues("acknowledge", "success")
-	})
-	assert.NotPanics(t, func() {
 		ChainQueryDuration.WithLabelValues("get_pending_leases")
 	})
 	assert.NotPanics(t, func() {
-		WatermillMessagesTotal.WithLabelValues("provision", "success")
-	})
-	assert.NotPanics(t, func() {
-		EventsDroppedTotal.WithLabelValues("lease_created")
-	})
-	assert.NotPanics(t, func() {
-		MalformedMessagesTotal.WithLabelValues("provision")
-	})
-	assert.NotPanics(t, func() {
-		RateLimitRejectionsTotal.WithLabelValues("global")
-	})
-	assert.NotPanics(t, func() {
-		BackendInsufficientResourcesTotal.WithLabelValues("docker", CapacityVerdictCodedRefusal)
-		BackendInsufficientResourcesTotal.WithLabelValues("docker", CapacityVerdictAmbiguous)
-		BackendMalformedErrorBodyTotal.WithLabelValues("docker", "restore")
-	})
-	assert.NotPanics(t, func() {
 		BackendHealthy.WithLabelValues("docker")
-	})
-	assert.NotPanics(t, func() {
-		LifecycleCallbackOutcomesTotal.WithLabelValues(
-			LifecycleCallbackOutcomeApplied,
-			LifecycleCallbackVerdictAuthorized,
-			"success",
-		)
-		NonInFlightCallbacksTotal.WithLabelValues("docker", "success")
-	})
-	assert.NotPanics(t, func() {
-		SignerBalanceQueryFailures.WithLabelValues("provider", "manifest1abc", "umfx")
-	})
-	assert.NotPanics(t, func() {
-		SignerBalanceQueryFailures.WithLabelValues("sub_signer", "manifest1xyz", "umfx")
 	})
 }
 

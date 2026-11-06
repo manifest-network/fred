@@ -1,16 +1,16 @@
 // Package background holds the Prometheus collectors for background-goroutine
-// health — the whole `fred_background_*` family. CleanupPanicsTotal is written
-// by every fred binary: providerd for its token-tracker cleanup loop, the docker
-// backend for its callback, diagnostics, releases and retention loops and its
-// docker_reconciliation, docker_network_reclamation, docker_projid_audit,
-// docker_seccomp_census, docker_runtime_inventory, docker_runtime_refresh and
-// docker_volume_delete_hold workers, the k3s backend
-// for callback, diagnostics and releases (it has no retention store — retention
-// is docker-only, ENG-325). GoroutinePanicsTotal is written by providerd for its
-// payload-writer, ack-batcher, withdraw-scheduler, timeout-checker and
-// maintenance-recovery goroutines, by both bundled backends for the shared
-// callback-replay workers, and by the docker backend for its container-death
-// overflow reporter.
+// health — the whole `fred_background_*` family. The cleanup-panic counter is
+// written by every fred binary: providerd for its token-tracker cleanup loop,
+// the docker backend for its callback, diagnostics, releases and retention
+// loops and its docker_reconciliation, docker_network_reclamation,
+// docker_projid_audit, docker_seccomp_census, docker_runtime_inventory,
+// docker_runtime_refresh and docker_volume_delete_hold workers, the k3s
+// backend for callback, diagnostics and releases (it has no retention store —
+// retention is docker-only, ENG-325). The goroutine-panic counter is written by
+// providerd for its payload-writer, ack-batcher, withdraw-scheduler,
+// timeout-checker and maintenance-recovery goroutines, by both bundled backends
+// for the shared callback-replay workers, and by the docker backend for its
+// container-death overflow reporter.
 //
 // It exists as a package of its own because its parent, internal/metrics, is
 // providerd's. Those collectors are registered on the default registerer at
@@ -31,10 +31,14 @@
 // three binaries at once — ENG-712 with a wider blast radius than the original.
 //
 // Being written by more than one binary is the reason to put a collector here,
-// not a requirement of membership. Both collectors now cross the process
-// boundary; their label-bearing shape still means a healthy process exports no
-// child series, except two pre-initialized at 0: the docker backend's
-// docker_volume_delete_hold and providerd's maintenance_recovery.
+// not a requirement of membership.
+//
+// Both vecs are unexported. A component's counter comes from CleanupPanics or
+// GoroutinePanics, called in a package-level variable declaration of the
+// package that runs the component (internal/testutil's counter series guard
+// enforces that). So every binary exports a 0 for exactly the components of
+// the packages it links, and the first panic after a restart is an increase()
+// from 0 instead of a series that appears already at 1.
 //
 // What does NOT belong here: a providerd-only collector unrelated to this family
 // (internal/metrics), and one only a single backend writes (that backend's
@@ -51,24 +55,37 @@ import (
 const namespace = "fred"
 
 var (
-	// CleanupPanicsTotal counts panics recovered inside background
+	// cleanupPanicsTotal counts panics recovered inside background
 	// cleanup loops (token tracker, callback store, diagnostics store,
 	// etc.) driven by util.StartCleanupLoop. Any non-zero value is a
 	// latent bug in the cleanup function. Labeled by component.
-	CleanupPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	cleanupPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "background",
 		Name:      "cleanup_panics_total",
 		Help:      "Panics recovered in background cleanup loops, by component",
 	}, []string{"component"})
 
-	// GoroutinePanicsTotal is the catch-all for long-lived background
+	// goroutinePanicsTotal is the catch-all for long-lived background
 	// goroutines that add their own recover() (payload store writer,
 	// ack batcher lanes, etc.). Labeled by component for correlation.
-	GoroutinePanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	goroutinePanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "background",
 		Name:      "goroutine_panics_total",
 		Help:      "Panics recovered in long-lived background goroutines, by component",
 	}, []string{"component"})
 )
+
+// CleanupPanics returns the cleanup-panic counter of one component, creating
+// its series at 0. Call it only in a package-level variable declaration.
+func CleanupPanics(component string) prometheus.Counter {
+	return cleanupPanicsTotal.WithLabelValues(component)
+}
+
+// GoroutinePanics returns the goroutine-panic counter of one component,
+// creating its series at 0. Call it only in a package-level variable
+// declaration.
+func GoroutinePanics(component string) prometheus.Counter {
+	return goroutinePanicsTotal.WithLabelValues(component)
+}

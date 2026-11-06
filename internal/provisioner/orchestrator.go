@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
@@ -15,11 +17,11 @@ type ProvisionOpts struct {
 	PayloadHash string // Optional hex-encoded SHA-256 hash of payload
 }
 
-func capacityVerdictLabel(refusal backend.ProvisionRefusal) string {
+func capacityVerdict(verdicts metrics.CapacityVerdictCounters, refusal backend.ProvisionRefusal) prometheus.Counter {
 	if refusal == backend.ProvisionRefusalCapacity {
-		return metrics.CapacityVerdictCodedRefusal
+		return verdicts.CodedRefusal
 	}
-	return metrics.CapacityVerdictAmbiguous
+	return verdicts.Ambiguous
 }
 
 // ProvisionOrchestrator is a narrow adapter around the construction-bound

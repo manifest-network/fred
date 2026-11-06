@@ -163,7 +163,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		limiter := rl.getVisitor(ip)
 		if !limiter.Allow() {
 			slog.Warn("rate limit exceeded", "ip", ip, "path", r.URL.Path)
-			metrics.RateLimitRejectionsTotal.WithLabelValues("global").Inc()
+			metrics.RateLimitRejections.Global.Inc()
 			w.Header().Set("Retry-After", rl.retryAfterSeconds())
 			writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
@@ -323,7 +323,7 @@ func authTokenMiddleware(bech32Prefix string, limiter *TenantRateLimiter) func(h
 					"tenant", token.Tenant,
 					"path", r.URL.Path,
 				)
-				metrics.RateLimitRejectionsTotal.WithLabelValues("tenant").Inc()
+				metrics.RateLimitRejections.Tenant.Inc()
 				w.Header().Set("Retry-After", limiter.retryAfterSeconds())
 				writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return
@@ -345,20 +345,20 @@ func (tl *TenantRateLimiter) PayloadAuthMiddleware() func(http.Handler) http.Han
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tokenStr, err := extractBearerToken(r)
 			if err != nil {
-				metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
+				metrics.PayloadUploads.InvalidAuth.Inc()
 				writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 				return
 			}
 
 			token, err := ParsePayloadAuthToken(tokenStr)
 			if err != nil {
-				metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
+				metrics.PayloadUploads.InvalidAuth.Inc()
 				writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 				return
 			}
 
 			if err := token.Validate(tl.bech32Prefix); err != nil {
-				metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
+				metrics.PayloadUploads.InvalidAuth.Inc()
 				writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 				return
 			}
@@ -368,7 +368,7 @@ func (tl *TenantRateLimiter) PayloadAuthMiddleware() func(http.Handler) http.Han
 					"tenant", token.Tenant,
 					"path", r.URL.Path,
 				)
-				metrics.RateLimitRejectionsTotal.WithLabelValues("tenant").Inc()
+				metrics.RateLimitRejections.Tenant.Inc()
 				w.Header().Set("Retry-After", tl.retryAfterSeconds())
 				writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return

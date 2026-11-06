@@ -58,10 +58,10 @@ func TestBackendRefusalRequiresCompleteExactEnvelope(t *testing.T) {
 
 func TestBackendErrorEnvelopeOnlyZeroBytesIsBare(t *testing.T) {
 	client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "bare", BaseURL: "http://backend.invalid"})
-	_, _, err := client.parseErrorCode(nil, "restore")
+	_, _, err := client.parseErrorCode(nil, requestRestore)
 	require.NoError(t, err)
 	for _, body := range []string{" ", "\n\t", strings.Repeat(" ", 4097)} {
-		_, _, err := client.parseErrorCode([]byte(body), "restore")
+		_, _, err := client.parseErrorCode([]byte(body), requestRestore)
 		require.ErrorIs(t, err, ErrMalformedErrorBody)
 	}
 }

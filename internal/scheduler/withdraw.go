@@ -178,7 +178,7 @@ func (s *WithdrawScheduler) TriggerWithdraw() {
 					"panic", r,
 					"stack", string(debug.Stack()),
 				)
-				background.GoroutinePanicsTotal.WithLabelValues("withdraw_scheduler").Inc()
+				withdrawSchedulerPanics.Inc()
 			}
 		}()
 		s.withdrawAndCheckCredits(ctx, true)
@@ -803,3 +803,6 @@ func (s *WithdrawScheduler) estimateDepletionTime(prevBalance, currBalance sdkty
 
 	return earliestDepletion
 }
+
+// withdrawSchedulerPanics counts panics recovered in the withdraw scheduler.
+var withdrawSchedulerPanics = background.GoroutinePanics("withdraw_scheduler")

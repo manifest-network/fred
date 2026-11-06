@@ -22,11 +22,11 @@ import (
 // the exhausted kind.
 var (
 	verdictLiteralMinters = map[string][]string{
-		"Verdict":    {"FromProvision", "Labels"},
+		"Verdict":    {"FromProvision"},
 		"Exhaustion": {"Verdict.Exhausted"},
 	}
 	verdictFieldWriters    = []string{"FromProvision"}
-	exhaustedKindReferents = []string{"FromProvision", "Verdict.Label", "Verdict.Exhausted", "TenantView"}
+	exhaustedKindReferents = []string{"FromProvision", "Verdict.Label", "Pick", "Verdict.Exhausted", "TenantView"}
 	verdictFields          = []string{"kind", "leaseUUID", "consecutiveFailures"}
 )
 

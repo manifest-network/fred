@@ -30,7 +30,7 @@ func isLifecyclePendingResponse(err error) bool {
 
 // parseMaintenanceAvailability shares the strict capacity-envelope decoder,
 // but recognizes the observation only for lifecycle mutation endpoints.
-func (c *HTTPClient) parseMaintenanceAvailability(body []byte, operation string) error {
+func (c *HTTPClient) parseMaintenanceAvailability(body []byte, operation requestOperation) error {
 	code, msg, err := c.parseErrorCode(body, operation)
 	if err != nil {
 		return err

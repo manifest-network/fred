@@ -1041,13 +1041,13 @@ func TestFleet_DegradedSweep_EmitsDegradedOutcomeAndWithholdsSuccess(t *testing.
 	require.NotZero(t, lastSuccessAfterClean, "a clean sweep should record success")
 
 	degradedBefore := promtestutil.ToFloat64(
-		metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeDegraded))
+		metrics.ReconcilerRuns.Degraded)
 
 	f.backendAt(2).setFault(faultConnReset)
 	require.NoError(t, f.sweep())
 
 	degradedAfter := promtestutil.ToFloat64(
-		metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeDegraded))
+		metrics.ReconcilerRuns.Degraded)
 	assert.Equal(t, degradedBefore+1, degradedAfter,
 		"a sweep that could not see the whole fleet must be counted as degraded exactly once")
 
@@ -1077,10 +1077,8 @@ func TestFleet_DegradedSweep_ReportsWhichBackendsAnsweredAndThatTheProjectionCom
 	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.ReconcilerSweepProjectionCommitted))
 	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.ReconcilerSweepComplete))
 
-	unanswered := metrics.ReconcilerBackendInventoryTotal.WithLabelValues(
-		"backend-2", metrics.InventoryOutcomeUnanswered)
-	authoritative := metrics.ReconcilerBackendInventoryTotal.WithLabelValues(
-		"backend-1", metrics.InventoryOutcomeAuthoritative)
+	unanswered := inventorySeries(t, "backend-2", metrics.InventoryOutcomeUnanswered)
+	authoritative := inventorySeries(t, "backend-1", metrics.InventoryOutcomeAuthoritative)
 	unansweredBefore := promtestutil.ToFloat64(unanswered)
 	authoritativeBefore := promtestutil.ToFloat64(authoritative)
 
@@ -1111,8 +1109,7 @@ func TestFleet_CanceledSweepRecordsNoBackendOutcome(t *testing.T) {
 	require.NoError(t, f.sweep())
 	require.Equal(t, 1.0, promtestutil.ToFloat64(metrics.ReconcilerSweepProjectionCommitted))
 
-	unanswered := metrics.ReconcilerBackendInventoryTotal.WithLabelValues(
-		"backend-2", metrics.InventoryOutcomeUnanswered)
+	unanswered := inventorySeries(t, "backend-2", metrics.InventoryOutcomeUnanswered)
 	before := promtestutil.ToFloat64(unanswered)
 	f.backendAt(2).setFault(faultHang)
 	ctx, cancel := context.WithCancel(f.t.Context())

@@ -16,6 +16,10 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/manifest-network/fred/internal/testutil"
+
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
@@ -2599,7 +2603,7 @@ func TestPublishLeaseEvent_PublishError(t *testing.T) {
 func TestHandlerSet_HandleBackendCallback_ExactNonInFlightIsIgnoredByBoundAuthority(t *testing.T) {
 	// Counter is labeled {backend, status}; the payload below lacks a Backend
 	// field so sanitizeBackendName collapses it to "unknown".
-	labeled := metrics.NonInFlightCallbacksTotal.WithLabelValues("unknown", "success")
+	labeled := metrics.NonInFlightCallbacksUnknownBackend.Success
 	before := promtestutil.ToFloat64(labeled)
 
 	hs := composeTestHandlerSet(t, testHandlerDeps{
@@ -2625,7 +2629,8 @@ func TestHandlerSet_HandleBackendCallback_ExactNonInFlightIsIgnoredByBoundAuthor
 // does NOT publish a lease event (the lease is torn down, no transition to
 // re-surface).
 func TestHandleBackendCallback_DeprovisionedOperationIsRejected(t *testing.T) {
-	labeled := metrics.NonInFlightCallbacksTotal.WithLabelValues("docker", "deprovisioned")
+	metrics.BindBackends("docker")
+	labeled := metrics.ForBackend("docker").NonInFlightCallbacks.Deprovisioned
 	before := promtestutil.ToFloat64(labeled)
 
 	knownBackend := &mockManagerBackend{name: "docker"}
@@ -2678,21 +2683,21 @@ func TestHandleBackendCallback_SanitizesLabels(t *testing.T) {
 		},
 	}
 
+	metrics.BindBackends("docker")
 	tests := []struct {
 		name        string
 		payloadBE   string
 		payloadStat backend.CallbackStatus
-		wantBackend string
-		wantStatus  string
+		want        prometheus.Counter
 	}{
-		{"empty backend routes to unknown", "", backend.CallbackStatusSuccess, "unknown", "success"},
-		{"unrecognized backend routes to invalid", "not-configured", backend.CallbackStatusSuccess, "invalid", "success"},
-		{"regex-valid but unknown backend routes to invalid", "docker-prod-02", backend.CallbackStatusSuccess, "invalid", "success"},
-		{"known backend preserved", "docker", backend.CallbackStatusSuccess, "docker", "success"},
+		{"empty backend routes to unknown", "", backend.CallbackStatusSuccess, metrics.NonInFlightCallbacksUnknownBackend.Success},
+		{"unrecognized backend routes to invalid", "not-configured", backend.CallbackStatusSuccess, metrics.NonInFlightCallbacksInvalidBackend.Success},
+		{"regex-valid but unknown backend routes to invalid", "docker-prod-02", backend.CallbackStatusSuccess, metrics.NonInFlightCallbacksInvalidBackend.Success},
+		{"known backend preserved", "docker", backend.CallbackStatusSuccess, metrics.ForBackend("docker").NonInFlightCallbacks.Success},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			labeled := metrics.NonInFlightCallbacksTotal.WithLabelValues(tc.wantBackend, tc.wantStatus)
+			labeled := tc.want
 			before := promtestutil.ToFloat64(labeled)
 
 			hs := composeTestHandlerSet(t, testHandlerDeps{
@@ -2710,6 +2715,11 @@ func TestHandleBackendCallback_SanitizesLabels(t *testing.T) {
 			require.NoError(t, hs.HandleBackendCallback(msg))
 
 			assert.Equal(t, 1.0, promtestutil.ToFloat64(labeled)-before)
+			if tc.payloadBE != "" && tc.payloadBE != "docker" {
+				_, minted := testutil.CounterValue(t, "fred_api_non_in_flight_callbacks_total",
+					map[string]string{"backend": tc.payloadBE, "status": string(tc.payloadStat)})
+				assert.False(t, minted, "a callback's claimed backend name never becomes a label")
+			}
 		})
 	}
 }

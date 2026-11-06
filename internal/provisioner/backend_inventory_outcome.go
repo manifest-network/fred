@@ -1,6 +1,8 @@
 package provisioner
 
 import (
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
@@ -60,25 +62,26 @@ func classifyBackendInventory(
 	}
 }
 
-// label is the outcome's metric label; the invalid zero value has none.
-func (outcome backendInventoryOutcome) label() string {
+// counter is the outcome's series among a backend's inventory counters; the
+// invalid zero value has none.
+func (outcome backendInventoryOutcome) counter(counters metrics.BackendInventoryCounters) (prometheus.Counter, bool) {
 	switch outcome {
 	case backendInventoryOutcomeAuthoritative:
-		return metrics.InventoryOutcomeAuthoritative
+		return counters.Authoritative, true
 	case backendInventoryOutcomePartial:
-		return metrics.InventoryOutcomePartial
+		return counters.Partial, true
 	case backendInventoryOutcomeUntrusted:
-		return metrics.InventoryOutcomeUntrusted
+		return counters.Untrusted, true
 	case backendInventoryOutcomeProvisionsOnly:
-		return metrics.InventoryOutcomeProvisionsOnly
+		return counters.ProvisionsOnly, true
 	case backendInventoryOutcomeRetentionsOnly:
-		return metrics.InventoryOutcomeRetentionsOnly
+		return counters.RetentionsOnly, true
 	case backendInventoryOutcomeUnanswered:
-		return metrics.InventoryOutcomeUnanswered
+		return counters.Unanswered, true
 	case backendInventoryOutcomeFenced:
-		return metrics.InventoryOutcomeFenced
+		return counters.Fenced, true
 	default:
-		return ""
+		return nil, false
 	}
 }
 
@@ -94,11 +97,11 @@ func (outcome backendInventoryOutcome) answered() bool {
 // increment and one answered-gauge write per configured backend.
 func recordBackendInventoryOutcomes(outcomes map[string]backendInventoryOutcome) {
 	for backendName, outcome := range outcomes {
-		label := outcome.label()
-		if label == "" {
+		counter, ok := outcome.counter(metrics.ForBackend(backendName).Inventory)
+		if !ok {
 			continue
 		}
-		metrics.ReconcilerBackendInventoryTotal.WithLabelValues(backendName, label).Inc()
+		counter.Inc()
 		answered := 0.0
 		if outcome.answered() {
 			answered = 1
@@ -107,14 +110,10 @@ func recordBackendInventoryOutcomes(outcomes map[string]backendInventoryOutcome)
 	}
 }
 
-// initializeBackendInventoryMetrics creates every configured backend's series
-// at zero, so increase() sees the first sweep's increments and a readiness
-// gate refuses until a sweep has heard the backend.
-func initializeBackendInventoryMetrics(backendNames []string) {
+// initializeBackendInventoryAnswered sets every configured backend's answered
+// gauge to 0, so a readiness gate refuses until a sweep has heard the backend.
+func initializeBackendInventoryAnswered(backendNames []string) {
 	for _, backendName := range backendNames {
-		for _, outcome := range backendInventoryOutcomes {
-			metrics.ReconcilerBackendInventoryTotal.WithLabelValues(backendName, outcome.label())
-		}
 		metrics.ReconcilerBackendInventoryAnswered.WithLabelValues(backendName).Set(0)
 	}
 }

@@ -78,7 +78,7 @@ func TestDeferredCloseRetainsHintAfterExecutionBeforeAccounting(t *testing.T) {
 			return len(scheduler.entries)
 		}
 		pendingBefore := promtestutil.ToFloat64(metrics.DeferredClosesPending)
-		dispatched := metrics.DeferredClosesTotal.WithLabelValues("dispatched", string(proofs[0].Reason()))
+		dispatched := deferredCloses(proofs[0].Reason()).Dispatched
 		dispatchedBefore := promtestutil.ToFloat64(dispatched)
 		require.NoError(t, scheduler.enqueue(proofs[0]))
 		// Drive the production dispatch/execution/accounting phases in order.

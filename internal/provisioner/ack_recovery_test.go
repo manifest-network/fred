@@ -248,7 +248,7 @@ func TestReconcilerAckRaceRequiresExactActiveProof(t *testing.T) {
 			t.Cleanup(func() { require.NoError(t, store.Close()) })
 			reconciler, err := newTestReconciler(t, ReconcilerConfig{}, client, batcher, router, nil, store)
 			require.NoError(t, err)
-			errorsMetric := metrics.ReconciliationActions.WithLabelValues(metrics.ActionLeaseError)
+			errorsMetric := metrics.ReconcilerActions.LeaseError
 			before := promtestutil.ToFloat64(errorsMetric)
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()

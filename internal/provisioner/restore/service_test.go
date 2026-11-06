@@ -1171,9 +1171,7 @@ func TestServiceEventSinkPanicDoesNotPreventRestoreDispatch(t *testing.T) {
 	fixture.events.hook = func(backend.LeaseStatusEvent) {
 		panic("event sink fault")
 	}
-	panics := metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
-		metrics.LifecycleEventRestoreRestarting,
-	)
+	panics := metrics.LifecycleEventSinkPanics.RestoreRestarting
 	before := promtestutil.ToFloat64(panics)
 
 	result := fixture.service.Execute(t.Context(), validCommand())
@@ -1200,9 +1198,7 @@ func TestServiceRefusalEventSinkPanicDoesNotUndoDefinitiveSettlement(t *testing.
 			panic("refusal event sink fault")
 		}
 	}
-	panics := metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
-		metrics.LifecycleEventRestoreRefused,
-	)
+	panics := metrics.LifecycleEventSinkPanics.RestoreRefused
 	before := promtestutil.ToFloat64(panics)
 
 	result := fixture.service.Execute(t.Context(), validCommand())
@@ -1253,9 +1249,12 @@ func TestServiceSynchronousSettlementModes(t *testing.T) {
 			var capacityCounter prometheus.Counter
 			var capacityBefore float64
 			if test.verdict != "" {
-				capacityCounter = metrics.BackendInsufficientResourcesTotal.WithLabelValues(
-					testBackend, test.verdict,
-				)
+				metrics.BindBackends(testBackend)
+				verdicts := metrics.ForBackend(testBackend).InsufficientResources
+				capacityCounter = map[string]prometheus.Counter{
+					metrics.CapacityVerdictCodedRefusal: verdicts.CodedRefusal,
+					metrics.CapacityVerdictAmbiguous:    verdicts.Ambiguous,
+				}[test.verdict]
 				capacityBefore = promtestutil.ToFloat64(capacityCounter)
 			}
 			result := fixture.service.Execute(t.Context(), validCommand())

@@ -17,7 +17,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
-	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -2385,7 +2384,7 @@ func (b *Backend) networkCleanupLoop() {
 			b.cleanupOrphanedNetworks(ctx)
 			return nil
 		}, "docker_network_reclamation", func(any) {
-			background.CleanupPanicsTotal.WithLabelValues("docker_network_reclamation").Inc()
+			networkReclamationCleanupPanics.Inc()
 		})
 		select {
 		case <-b.stopCtx.Done():
@@ -2507,7 +2506,7 @@ func (b *Backend) reconcileLoop() {
 		return nil
 	}, "docker_reconciliation", func(any) {
 		reconciliationTotal.WithLabelValues("error").Inc()
-		background.CleanupPanicsTotal.WithLabelValues("docker_reconciliation").Inc()
+		reconciliationCleanupPanics.Inc()
 	})
 }
 

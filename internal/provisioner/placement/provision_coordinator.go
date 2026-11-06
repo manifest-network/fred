@@ -469,13 +469,12 @@ func (authority *ProvisionCoordinator) executeObservedCurrentLease(
 		dispatch, payloadBytes,
 	)
 	if errors.Is(settlement.CallErr(), backend.ErrInsufficientResources) {
-		verdict := metrics.CapacityVerdictAmbiguous
+		verdicts := metrics.ForBackend(route.backend()).InsufficientResources
+		verdict := verdicts.Ambiguous
 		if settlement.ProvisionRefusal() == backend.ProvisionRefusalCapacity {
-			verdict = metrics.CapacityVerdictCodedRefusal
+			verdict = verdicts.CodedRefusal
 		}
-		metrics.BackendInsufficientResourcesTotal.WithLabelValues(
-			route.backend(), verdict,
-		).Inc()
+		verdict.Inc()
 	}
 	if settlement.Superseded() || settlement.CallAccepted() {
 		if settlement.Err() != nil {

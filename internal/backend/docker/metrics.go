@@ -1466,7 +1466,6 @@ func init() {
 	for _, phase := range volumeDeleteHoldPhases {
 		volumeDeleteHolds.WithLabelValues(phase).Set(0)
 	}
-	background.CleanupPanicsTotal.WithLabelValues(volumeDeleteHoldComponent).Add(0)
 	// Pre-init the two unlabeled partition counters to 0 so a stamp/eviction-rate
 	// query reads 0, not no-data, before the first event. Their increments are
 	// wired at the close path (stamped) and the L2 eviction pass (evicted) in the
@@ -1509,3 +1508,22 @@ func updateResourceMetrics(stats shared.ResourceStats) {
 		resourceDiskAllocatedRatio.Set(float64(stats.AllocatedDiskMB) / float64(stats.TotalDiskMB))
 	}
 }
+
+// The docker backend's background components. Each is declared here, at
+// package level, so docker-backend exports its panic series at 0 from start
+// and the first panic after a restart is an increase().
+var (
+	callbackCleanupPanics           = background.CleanupPanics("callback")
+	diagnosticsCleanupPanics        = background.CleanupPanics("diagnostics")
+	releasesCleanupPanics           = background.CleanupPanics("releases")
+	retentionCleanupPanics          = background.CleanupPanics("retention")
+	reconciliationCleanupPanics     = background.CleanupPanics("docker_reconciliation")
+	networkReclamationCleanupPanics = background.CleanupPanics("docker_network_reclamation")
+	projidAuditCleanupPanics        = background.CleanupPanics("docker_projid_audit")
+	seccompCensusCleanupPanics      = background.CleanupPanics("docker_seccomp_census")
+	runtimeInventoryCleanupPanics   = background.CleanupPanics("docker_runtime_inventory")
+	runtimeRefreshCleanupPanics     = background.CleanupPanics("docker_runtime_refresh")
+	volumeDeleteHoldCleanupPanics   = background.CleanupPanics(volumeDeleteHoldComponent)
+	callbackReplayPanics            = background.GoroutinePanics("callback_replay")
+	containerDeathOverflowPanics    = background.GoroutinePanics(containerDeathOverflowReporter)
+)

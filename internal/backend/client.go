@@ -1300,9 +1300,10 @@ type HTTPClient struct {
 	retentionsPageLimit      int
 
 	// Optional Prometheus metrics (nil = skip recording)
-	requestDuration         *prometheus.HistogramVec
-	requestsTotal           *prometheus.CounterVec
-	malformedErrorBodyTotal *prometheus.CounterVec
+	requestDuration *prometheus.HistogramVec
+	// requests holds every operation's counters, bound at construction;
+	// nil records nothing.
+	requests map[requestOperation]RequestCounters
 }
 
 // httpWire holds a live backend's address, request key, and HTTP client.
@@ -1426,18 +1427,19 @@ type HTTPClientOptions struct {
 	// Optional Prometheus metrics. When nil, metric recording is skipped.
 	// This prevents binaries that don't use these metrics (e.g., docker-backend)
 	// from registering phantom fred-level metrics via transitive imports.
-	RequestDuration     *prometheus.HistogramVec // labels: backend, operation, status
-	RequestsTotal       *prometheus.CounterVec   // labels: backend, operation, status
-	CircuitBreakerState *prometheus.GaugeVec     // labels: backend
+	RequestDuration *prometheus.HistogramVec // labels: backend, operation, status
+	// RequestCounters binds fred_backend_requests_total (by status) and
+	// fred_backend_malformed_error_body_total for one operation. The client
+	// binds every operation it sends when it is built, so each series exists
+	// at 0 before the first request; a backend contributing to the malformed
+	// counter is off-contract (BACKEND_GUIDE.md) and its tenants are getting a
+	// generic message in place of a real diagnostic.
+	RequestCounters     RequestCounterBinder
+	CircuitBreakerState *prometheus.GaugeVec // labels: backend
 	// Fenced is set once at construction: 1 for a fenced backend's client,
 	// 0 otherwise. It is the operator's signal to silence that backend's
 	// availability alerts, and it cannot disagree with the client itself.
 	Fenced *prometheus.GaugeVec // labels: backend
-	// MalformedErrorBodyTotal counts client-error responses whose body was not
-	// the declared JSON error envelope. A backend contributing to this is
-	// off-contract (BACKEND_GUIDE.md) and its tenants are getting a generic
-	// message in place of a real diagnostic.
-	MalformedErrorBodyTotal *prometheus.CounterVec // labels: backend, operation
 }
 
 // positiveOr returns v if v > 0, otherwise returns fallback.
@@ -1570,8 +1572,7 @@ func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
 		provisionsPageLimit:      pageLimit,
 		retentionsPageLimit:      retentionsPageLimit,
 		requestDuration:          cfg.RequestDuration,
-		requestsTotal:            cfg.RequestsTotal,
-		malformedErrorBodyTotal:  cfg.MalformedErrorBodyTotal,
+		requests:                 bindRequestCounters(cfg.RequestCounters, connection.name),
 	}
 }
 
@@ -1838,8 +1839,8 @@ func (c *HTTPClient) Name() string {
 
 // recordMetrics records request duration and count for a backend operation.
 // No-op when metrics are not configured.
-func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error) {
-	if c.requestDuration == nil && c.requestsTotal == nil {
+func (c *HTTPClient) recordMetrics(operation requestOperation, start time.Time, err error) {
+	if c.requestDuration == nil && c.requests == nil {
 		return
 	}
 	status := "success"
@@ -1852,10 +1853,10 @@ func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error)
 		status = "error"
 	}
 	if c.requestDuration != nil {
-		c.requestDuration.WithLabelValues(c.name, operation, status).Observe(time.Since(start).Seconds())
+		c.requestDuration.WithLabelValues(c.name, operation.name, status).Observe(time.Since(start).Seconds())
 	}
-	if c.requestsTotal != nil {
-		c.requestsTotal.WithLabelValues(c.name, operation, status).Inc()
+	if counters, ok := c.requests[operation]; ok {
+		counters.statusCounter(status).Inc()
 	}
 }
 
@@ -1917,7 +1918,7 @@ func decodeJSONMeasured(r io.ReadCloser, limit int64, dst any) (int64, error) {
 // crosses only because BACKEND_GUIDE.md places a curation duty on whoever
 // wrote it, and bytes fred could not parse carry no such duty. The unparsed
 // body is recorded on the operator channel by noteMalformedErrorBody.
-func (c *HTTPClient) parseValidationError(body []byte, operation string) error {
+func (c *HTTPClient) parseValidationError(body []byte, operation requestOperation) error {
 	resp, err := c.decodeErrorEnvelope(body, operation)
 	if err != nil {
 		return err
@@ -1974,7 +1975,7 @@ func (c *HTTPClient) parseValidationError(body []byte, operation string) error {
 //
 // msg is returned only when it came out of the envelope's declared "error"
 // field; the raw bytes never leave this function.
-func (c *HTTPClient) parseErrorCode(body []byte, operation string) (code, msg string, err error) {
+func (c *HTTPClient) parseErrorCode(body []byte, operation requestOperation) (code, msg string, err error) {
 	resp, err := c.decodeErrorEnvelope(body, operation)
 	if err != nil {
 		return "", "", err
@@ -2003,7 +2004,7 @@ func maintenanceExpiredEnvelope(body []byte) (string, bool) {
 		envelope.ValidationCode == ""
 }
 
-func (c *HTTPClient) decodeErrorEnvelope(body []byte, operation string) (backendErrorEnvelope, error) {
+func (c *HTTPClient) decodeErrorEnvelope(body []byte, operation requestOperation) (backendErrorEnvelope, error) {
 	if len(body) == 0 {
 		return backendErrorEnvelope{}, nil
 	}
@@ -2022,7 +2023,7 @@ func (c *HTTPClient) decodeErrorEnvelope(body []byte, operation string) (backend
 // the configured transport's trust boundary; it is not response authentication.
 // Empty, malformed, legacy, and unknown-code responses retain their conservative
 // classifications.
-func (c *HTTPClient) parseCapacityError(body []byte, operation string) error {
+func (c *HTTPClient) parseCapacityError(body []byte, operation requestOperation) error {
 	code, msg, err := c.parseErrorCode(body, operation)
 	if err != nil {
 		return err
@@ -2030,7 +2031,7 @@ func (c *HTTPClient) parseCapacityError(body []byte, operation string) error {
 	return c.capacityError(code, msg, operation)
 }
 
-func (c *HTTPClient) capacityError(code, msg, operation string) error {
+func (c *HTTPClient) capacityError(code, msg string, operation requestOperation) error {
 	if code == CodeInsufficientResources {
 		return detailOr(ErrCapacityRefused, msg)
 	}
@@ -2056,10 +2057,10 @@ func detailOr(sentinel error, detail string) error {
 // the declared envelope" and its runbook entry sends the operator to fix the
 // envelope or hunt an intermediary. Neither is the remedy here, which is to
 // upgrade providerd or fix a producer emitting a code valid for another status.
-func (c *HTTPClient) noteUnrecognizedErrorCode(operation string, status int, code string) {
+func (c *HTTPClient) noteUnrecognizedErrorCode(operation requestOperation, status int, code string) {
 	slog.Warn("backend error envelope carried an unrecognized code for this status",
 		"backend", c.name,
-		"operation", operation,
+		"operation", operation.name,
 		"status", status,
 		"code", code,
 	)
@@ -2069,13 +2070,13 @@ func (c *HTTPClient) noteUnrecognizedErrorCode(operation string, status int, cod
 // channel — log plus counter — and returns the sentinel fred surfaces instead.
 // This is the CWE-209 split the ENG-508 fix established for the async path:
 // the detail is relocated to where operators can read it, not deleted.
-func (c *HTTPClient) noteMalformedErrorBody(body []byte, operation, why string) error {
-	if c.malformedErrorBodyTotal != nil {
-		c.malformedErrorBodyTotal.WithLabelValues(c.name, operation).Inc()
+func (c *HTTPClient) noteMalformedErrorBody(body []byte, operation requestOperation, why string) error {
+	if counters, ok := c.requests[operation]; ok {
+		counters.MalformedErrorBody.Inc()
 	}
 	slog.Warn("backend returned a malformed error body; withholding it from the tenant",
 		"backend", c.name,
-		"operation", operation,
+		"operation", operation.name,
 		"why", why,
 		"body", string(body),
 	)
@@ -2096,7 +2097,7 @@ func signRequest(wire *httpWire, req *http.Request, body []byte) {
 // doGet executes a GET request through the circuit breaker, decoding the
 // JSON response as T. It handles 404→ErrNotProvisioned and enforces a
 // response size limit.
-func doGet[T any](c *HTTPClient, ctx context.Context, metric, path string, maxBytes int64) (_ *T, err error) {
+func doGet[T any](c *HTTPClient, ctx context.Context, metric requestOperation, path string, maxBytes int64) (_ *T, err error) {
 	return doGetDecoded(c, ctx, metric, path, maxBytes, func(r io.ReadCloser, limit int64) (*T, error) {
 		var v T
 		if err := decodeJSONLimited(r, limit, &v); err != nil {
@@ -2106,7 +2107,7 @@ func doGet[T any](c *HTTPClient, ctx context.Context, metric, path string, maxBy
 	})
 }
 
-func doGetDecoded[T any](c *HTTPClient, ctx context.Context, metric, path string, maxBytes int64, decode func(io.ReadCloser, int64) (*T, error)) (_ *T, err error) {
+func doGetDecoded[T any](c *HTTPClient, ctx context.Context, metric requestOperation, path string, maxBytes int64, decode func(io.ReadCloser, int64) (*T, error)) (_ *T, err error) {
 	start := time.Now()
 	defer func() { c.recordMetrics(metric, start, err) }()
 
@@ -2180,7 +2181,7 @@ func (c *HTTPClient) provisionCall(
 	req ProvisionRequest,
 ) (outcome ProvisionCallOutcome) {
 	start := time.Now()
-	defer func() { c.recordMetrics("provision", start, outcome.Err()) }()
+	defer func() { c.recordMetrics(requestProvision, start, outcome.Err()) }()
 
 	wire, err := c.connection()
 	if err != nil {
@@ -2223,7 +2224,7 @@ func (c *HTTPClient) provisionCall(
 			switch resp.StatusCode {
 			case http.StatusBadRequest:
 				// 400: validation error — permanent, won't succeed on retry.
-				callErr := c.parseValidationError(readErrorBodyBytes(resp), "provision")
+				callErr := c.parseValidationError(readErrorBodyBytes(resp), requestProvision)
 				if errors.Is(callErr, ErrValidation) {
 					observed = refusedProvisionCall(callErr, ProvisionRefusalValidation)
 				} else {
@@ -2233,7 +2234,7 @@ func (c *HTTPClient) provisionCall(
 			case http.StatusConflict:
 				// 409: the backend reports a conflict. Callers must validate it
 				// against authoritative inventory before treating it as ownership.
-				code, msg, parseErr := c.parseErrorCode(readErrorBodyBytes(resp), "provision")
+				code, msg, parseErr := c.parseErrorCode(readErrorBodyBytes(resp), requestProvision)
 				if parseErr != nil {
 					observed = ambiguousProvisionCall(parseErr)
 					return nil, parseErr
@@ -2249,7 +2250,7 @@ func (c *HTTPClient) provisionCall(
 			case http.StatusServiceUnavailable:
 				// Only the contract envelope and shared code authorize refusal
 				// settlement. A bare/proxy 503 remains ambiguous.
-				callErr := c.parseCapacityError(readErrorBodyBytes(resp), "provision")
+				callErr := c.parseCapacityError(readErrorBodyBytes(resp), requestProvision)
 				if errors.Is(callErr, ErrCapacityRefused) {
 					observed = refusedProvisionCall(callErr, ProvisionRefusalCapacity)
 				} else {
@@ -2281,13 +2282,13 @@ func (c *HTTPClient) provisionCall(
 
 // GetInfo retrieves lease information including connection details.
 func (c *HTTPClient) GetInfo(ctx context.Context, leaseUUID string) (*LeaseInfo, error) {
-	return doGet[LeaseInfo](c, ctx, "get_info", "/info/"+leaseUUID, c.maxInfoBytes)
+	return doGet[LeaseInfo](c, ctx, requestGetInfo, "/info/"+leaseUUID, c.maxInfoBytes)
 }
 
 // Deprovision releases resources for a lease.
 func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err error) {
 	start := time.Now()
-	defer func() { c.recordMetrics("deprovision", start, err) }()
+	defer func() { c.recordMetrics(requestDeprovision, start, err) }()
 
 	wire, err := c.connection()
 	if err != nil {
@@ -2317,7 +2318,7 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode == http.StatusServiceUnavailable {
-			code, _, err := c.parseErrorCode(readErrorBodyBytes(resp), "deprovision")
+			code, _, err := c.parseErrorCode(readErrorBodyBytes(resp), requestDeprovision)
 			if err != nil {
 				return nil, err
 			}
@@ -2327,7 +2328,7 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 			return nil, fmt.Errorf("deprovision returned unknown unavailable code %q", code)
 		}
 		if resp.StatusCode == http.StatusConflict {
-			code, msg, err := c.parseErrorCode(readErrorBodyBytes(resp), "deprovision")
+			code, msg, err := c.parseErrorCode(readErrorBodyBytes(resp), requestDeprovision)
 			if err != nil {
 				return nil, err
 			}
@@ -2455,7 +2456,7 @@ func (c *HTTPClient) listProvisionsWithIdentity(
 	requireIdentity bool,
 ) (_ []ProvisionInfo, observed backendidentity.ID, err error) {
 	start := time.Now()
-	defer func() { c.recordMetrics("list_provisions", start, err) }()
+	defer func() { c.recordMetrics(requestListProvisions, start, err) }()
 
 	wire, err := c.connection()
 	if err != nil {
@@ -2531,7 +2532,7 @@ func (c *HTTPClient) fetchProvisionsPage(
 
 // GetProvision retrieves status information for a single provision.
 func (c *HTTPClient) GetProvision(ctx context.Context, leaseUUID string) (*ProvisionInfo, error) {
-	return doGet[ProvisionInfo](c, ctx, "get_provision", "/provisions/"+leaseUUID, c.maxProvisionBytes)
+	return doGet[ProvisionInfo](c, ctx, requestGetProvision, "/provisions/"+leaseUUID, c.maxProvisionBytes)
 }
 
 // LookupProvisions returns provision info for the requested lease UUIDs.
@@ -2552,7 +2553,7 @@ func (c *HTTPClient) LookupProvisions(ctx context.Context, uuids []string) ([]Pr
 	sort.Strings(sortedUUIDs)
 
 	q := url.Values{"lease_uuid": sortedUUIDs}
-	resp, err := doGet[ListProvisionsResponse](c, ctx, "lookup_provisions", "/provisions?"+q.Encode(), c.maxLookupProvisionsBytes)
+	resp, err := doGet[ListProvisionsResponse](c, ctx, requestLookupProvisions, "/provisions?"+q.Encode(), c.maxLookupProvisionsBytes)
 	if errors.Is(err, ErrNotProvisioned) {
 		// doGet maps 404 to ErrNotProvisioned. The filtered /provisions handler
 		// always returns 200 with a possibly-empty Provisions list, so this branch
@@ -2569,7 +2570,7 @@ func (c *HTTPClient) LookupProvisions(ctx context.Context, uuids []string) ([]Pr
 
 // GetLogs retrieves container logs for a provisioned lease.
 func (c *HTTPClient) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[string]string, error) {
-	result, err := doGetDecoded(c, ctx, "get_logs", fmt.Sprintf("/logs/%s?tail=%d", leaseUUID, tail), c.maxLogsBytes, decodeLogResponse)
+	result, err := doGetDecoded(c, ctx, requestGetLogs, fmt.Sprintf("/logs/%s?tail=%d", leaseUUID, tail), c.maxLogsBytes, decodeLogResponse)
 	if err != nil {
 		return nil, err
 	}
@@ -2586,7 +2587,7 @@ func (c *HTTPClient) restartCall(
 	ctx context.Context,
 	req RestartRequest,
 ) MaintenanceCallOutcome {
-	return executeHTTPMaintenanceCall(c, ctx, "restart", req)
+	return executeHTTPMaintenanceCall(c, ctx, requestRestart, req)
 }
 
 // Update preserves the legacy Backend surface. Placement consumes InvokeUpdate.
@@ -2598,13 +2599,13 @@ func (c *HTTPClient) updateCall(
 	ctx context.Context,
 	req UpdateRequest,
 ) MaintenanceCallOutcome {
-	return executeHTTPMaintenanceCall(c, ctx, "update", req)
+	return executeHTTPMaintenanceCall(c, ctx, requestUpdate, req)
 }
 
 func executeHTTPMaintenanceCall[T RestartRequest | UpdateRequest](
 	c *HTTPClient,
 	ctx context.Context,
-	operation string,
+	operation requestOperation,
 	req T,
 ) (outcome MaintenanceCallOutcome) {
 	start := time.Now()
@@ -2621,7 +2622,7 @@ func executeHTTPMaintenanceCall[T RestartRequest | UpdateRequest](
 	var observed MaintenanceCallOutcome
 	_, cbErr := c.execute(ctx, func() (any, error) {
 		httpReq, err := http.NewRequestWithContext(
-			ctx, http.MethodPost, wire.baseURL+"/"+operation, bytes.NewReader(body),
+			ctx, http.MethodPost, wire.baseURL+"/"+operation.name, bytes.NewReader(body),
 		)
 		if err != nil {
 			callErr := fmt.Errorf("create request: %w", err)
@@ -2711,7 +2712,7 @@ func (c *HTTPClient) restoreCall(
 	req RestoreRequest,
 ) (outcome RestoreCallOutcome) {
 	start := time.Now()
-	defer func() { c.recordMetrics("restore", start, outcome.Err()) }()
+	defer func() { c.recordMetrics(requestRestore, start, outcome.Err()) }()
 
 	wire, err := c.connection()
 	if err != nil {
@@ -2755,7 +2756,7 @@ func (c *HTTPClient) restoreCall(
 		case http.StatusUnprocessableEntity:
 			// 422 is overloaded: bare 422 = ErrNotRetained; 422 with
 			// code="demote_exceeds_tier" = ErrDemoteDataExceedsTier.
-			code, msg, perr := c.parseErrorCode(readErrorBodyBytes(resp), "restore")
+			code, msg, perr := c.parseErrorCode(readErrorBodyBytes(resp), requestRestore)
 			if perr != nil {
 				observed = ambiguousRestoreCall(perr)
 				return nil, perr
@@ -2779,7 +2780,7 @@ func (c *HTTPClient) restoreCall(
 				// Preserve the declared detail for operator diagnostics, but keep the
 				// outcome ambiguous: an unknown protocol verdict cannot authorize
 				// durable settlement or a tenant-facing lease-state claim.
-				c.noteUnrecognizedErrorCode("restore", resp.StatusCode, code)
+				c.noteUnrecognizedErrorCode(requestRestore, resp.StatusCode, code)
 				callErr := detailOr(ErrRestoreRefused, msg)
 				observed = ambiguousRestoreCall(callErr)
 				return nil, callErr
@@ -2790,7 +2791,7 @@ func (c *HTTPClient) restoreCall(
 			// reconstruct ErrAlreadyProvisioned (otherwise a duplicate restore would
 			// surface the wrong ErrInvalidState message). A bare 409 (no code) is
 			// ErrInvalidState (wrong lease state for restore).
-			code, msg, perr := c.parseErrorCode(readErrorBodyBytes(resp), "restore")
+			code, msg, perr := c.parseErrorCode(readErrorBodyBytes(resp), requestRestore)
 			if perr != nil {
 				observed = ambiguousRestoreCall(perr)
 				return nil, perr
@@ -2809,7 +2810,7 @@ func (c *HTTPClient) restoreCall(
 			// diagnostic. Its causal outcome remains ambiguous, so higher layers
 			// cannot turn this public sentinel into a tenant-facing state claim.
 			if code != "" {
-				c.noteUnrecognizedErrorCode("restore", resp.StatusCode, code)
+				c.noteUnrecognizedErrorCode(requestRestore, resp.StatusCode, code)
 				callErr := detailOr(ErrInvalidState, msg)
 				observed = ambiguousRestoreCall(callErr)
 				return nil, callErr
@@ -2819,7 +2820,7 @@ func (c *HTTPClient) restoreCall(
 			return nil, callErr
 		case http.StatusServiceUnavailable:
 			// Match Provision: only a contract-conforming coded refusal may settle.
-			callErr := c.parseCapacityError(readErrorBodyBytes(resp), "restore")
+			callErr := c.parseCapacityError(readErrorBodyBytes(resp), requestRestore)
 			if errors.Is(callErr, ErrCapacityRefused) {
 				observed = refusedRestoreCall(callErr, RestoreRefusalCapacity)
 			} else {
@@ -2832,7 +2833,7 @@ func (c *HTTPClient) restoreCall(
 			// prelude returns ErrUnknownSKU/ErrInvalidManifest/ErrImageNotAllowed
 			// via GetSKUProfile/ValidateImage; the returned error still wraps
 			// ErrValidation so the breaker allowlist and 400 mapping hold.
-			callErr := c.parseValidationError(readErrorBodyBytes(resp), "restore")
+			callErr := c.parseValidationError(readErrorBodyBytes(resp), requestRestore)
 			if errors.Is(callErr, ErrValidation) {
 				observed = refusedRestoreCall(callErr, RestoreRefusalValidation)
 			} else {
@@ -2860,7 +2861,7 @@ func (c *HTTPClient) restoreCall(
 
 // GetReleases retrieves release history for a lease.
 func (c *HTTPClient) GetReleases(ctx context.Context, leaseUUID string) ([]ReleaseInfo, error) {
-	result, err := doGet[[]ReleaseInfo](c, ctx, "get_releases", "/releases/"+leaseUUID, c.maxReleasesBytes)
+	result, err := doGet[[]ReleaseInfo](c, ctx, requestGetReleases, "/releases/"+leaseUUID, c.maxReleasesBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -2883,7 +2884,7 @@ type ReconcileCustomDomainRequest struct {
 // remote side decides whether any action is needed (idempotent on no-change).
 func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string, items []LeaseItem) (err error) {
 	start := time.Now()
-	defer func() { c.recordMetrics("reconcile_custom_domain", start, err) }()
+	defer func() { c.recordMetrics(requestReconcileCustomDomain, start, err) }()
 
 	wire, err := c.connection()
 	if err != nil {
@@ -2916,7 +2917,7 @@ func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string
 		case http.StatusNotFound:
 			return nil, ErrNotProvisioned
 		case http.StatusServiceUnavailable:
-			return nil, c.parseMaintenanceAvailability(readErrorBodyBytes(resp), "reconcile_custom_domain")
+			return nil, c.parseMaintenanceAvailability(readErrorBodyBytes(resp), requestReconcileCustomDomain)
 		case http.StatusConflict:
 			return nil, ErrInvalidState
 		default:
@@ -2933,7 +2934,7 @@ func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string
 // GetLoadStats retrieves the backend's current resource-load snapshot from
 // GET /stats. Used by the router for least-loaded provision placement.
 func (c *HTTPClient) GetLoadStats(ctx context.Context) (*LoadStats, error) {
-	return doGet[LoadStats](c, ctx, "get_load_stats", "/stats", c.maxStatsBytes)
+	return doGet[LoadStats](c, ctx, requestGetLoadStats, "/stats", c.maxStatsBytes)
 }
 
 // ListRetentions retrieves the leases whose data this backend currently retains
@@ -2959,7 +2960,7 @@ func (c *HTTPClient) listRetentionsWithIdentity(
 	requireIdentity bool,
 ) (_ []RetainedLease, observed backendidentity.ID, err error) {
 	start := time.Now()
-	defer func() { c.recordMetrics("list_retentions", start, err) }()
+	defer func() { c.recordMetrics(requestListRetentions, start, err) }()
 
 	wire, err := c.connection()
 	if err != nil {

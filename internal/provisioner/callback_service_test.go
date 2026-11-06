@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/manifest-network/fred/internal/testutil"
+
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -590,9 +592,7 @@ func TestCallbackService_EventSinkPanicDoesNotRetryOrWedgeLaterCallback(t *testi
 	})
 	require.NoError(t, err)
 
-	before := promtestutil.ToFloat64(metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
-		metrics.LifecycleEventCallback,
-	))
+	before := promtestutil.ToFloat64(metrics.LifecycleEventSinkPanics.Callback)
 	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
 		backend.CallbackPayload{
 			LeaseUUID:   leaseUUID,
@@ -604,7 +604,7 @@ func TestCallbackService_EventSinkPanicDoesNotRetryOrWedgeLaterCallback(t *testi
 		"an observational sink panic must not turn completed settlement into a retry")
 	assert.Equal(t, placement.StateConfirmed, store.Lookup(leaseUUID).State())
 	assert.Equal(t, before+1, promtestutil.ToFloat64(
-		metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(metrics.LifecycleEventCallback),
+		metrics.LifecycleEventSinkPanics.Callback,
 	))
 
 	lifecycleID, err := lifecycle.FromOperationID(token.ID())
@@ -1222,9 +1222,10 @@ func TestCallbackService_LifecycleMetricsClassifyEveryReceivedCallback(t *testin
 
 	metric := func(outcome, verdict, status string) float64 {
 		t.Helper()
-		return promtestutil.ToFloat64(
-			metrics.LifecycleCallbackOutcomesTotal.WithLabelValues(outcome, verdict, status),
-		)
+		value, ok := testutil.CounterValue(t, "fred_provisioner_lifecycle_callback_outcomes_total",
+			map[string]string{"outcome": outcome, "verdict": verdict, "status": status})
+		require.True(t, ok, "every outcome, verdict and status series exists from startup")
+		return value
 	}
 	metricTotal := func(status string) float64 {
 		t.Helper()
@@ -1252,9 +1253,10 @@ func TestCallbackService_LifecycleMetricsClassifyEveryReceivedCallback(t *testin
 	}
 	received := func(status string) float64 {
 		t.Helper()
-		return promtestutil.ToFloat64(
-			metrics.NonInFlightCallbacksTotal.WithLabelValues(labelBackendUnknown, status),
-		)
+		value, ok := testutil.CounterValue(t, "fred_api_non_in_flight_callbacks_total",
+			map[string]string{"backend": labelBackendUnknown, "status": status})
+		require.True(t, ok, "the unknown-backend series exist from startup")
+		return value
 	}
 
 	appliedSuccessBefore := metric(

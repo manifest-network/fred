@@ -47,7 +47,7 @@ func (s *Server) callbackPreauthBudget(next http.Handler) http.Handler {
 				return
 			}
 		}
-		metrics.RateLimitRejectionsTotal.WithLabelValues("callback_ingress").Inc()
+		metrics.RateLimitRejections.CallbackIngress.Inc()
 		w.Header().Set("Retry-After", limiter.retryAfterSeconds())
 		writeError(w, "callback rate limit exceeded", http.StatusTooManyRequests)
 	})

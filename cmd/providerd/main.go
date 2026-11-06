@@ -273,9 +273,13 @@ func run(cmd *cobra.Command, args []string) error {
 
 	authzQ := authz.NewQueryClient(chainClient.Conn())
 
+	// startupGrantCheck is the startup grant sweep's result. The maintenance
+	// worker counts it as its first sweep if the pool keeps its sub-signers.
+	var startupGrantCheck error
 	if signerPool.HasSubSigners() {
 		setupCtx, setupCancel := context.WithTimeout(workCtx, 60*time.Second)
 		if err := chain.EnsureGrantsWithRetry(setupCtx, authzQ, chainClient, signerPool); err != nil {
+			startupGrantCheck = err
 			if demoteOnGrantSetupError(err) {
 				// The queries succeeded and told us grants are missing, and we
 				// could not create them. That is a positive fact: the
@@ -650,7 +654,7 @@ func run(cmd *cobra.Command, args []string) error {
 		// pass having succeeded. That is what makes a boot whose grant queries timed
 		// out recover on its own instead of staying degraded until someone restarts
 		// providerd (ENG-688).
-		if signerPool.HasSubSigners() {
+		if grantChecks, ok := newGrantCheckSweeps(signerPool, startupGrantCheck); ok {
 			bankQ := banktypes.NewQueryClient(chainClient.Conn())
 			comps.Start("sub-signer maintenance", func() error {
 				ticker := time.NewTicker(cfg.SubSignerFundCheckInterval)
@@ -665,12 +669,11 @@ func run(cmd *cobra.Command, args []string) error {
 						// would starve the top-ups.
 						grantCtx, grantCancel := context.WithTimeout(workCtx, 60*time.Second)
 						// Plain EnsureGrants, not the retry wrapper: the loop is the retry.
-						outcome := metrics.OutcomeSuccess
-						if err := chain.EnsureGrants(grantCtx, authzQ, chainClient, signerPool); err != nil {
+						err := chain.EnsureGrants(grantCtx, authzQ, chainClient, signerPool)
+						if err != nil {
 							slog.Warn("sub-signer grant check failed", "error", err)
-							outcome = metrics.OutcomeError
 						}
-						metrics.SignerGrantCheckTotal.WithLabelValues(outcome).Inc()
+						grantChecks.record(err)
 						grantCancel()
 
 						fundCtx, fundCancel := context.WithTimeout(workCtx, 60*time.Second)

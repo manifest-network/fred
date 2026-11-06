@@ -157,7 +157,7 @@ func (authority *ReconciliationCoordinator) collectProvisionInventory(
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_provisions").Inc()
+			metrics.ReconcilerPanics.FetchProvisions.Inc()
 			result = BackendProvisionInventory{}
 			err = fmt.Errorf("collect provision inventory from %q panicked: %v\n%s",
 				backendName, recovered, debug.Stack())
@@ -213,7 +213,7 @@ func (authority *ReconciliationCoordinator) collectRetentionInventory(
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_retentions").Inc()
+			metrics.ReconcilerPanics.FetchRetentions.Inc()
 			result = BackendRetentionInventory{}
 			err = fmt.Errorf("collect retention inventory from %q panicked: %v\n%s",
 				backendName, recovered, debug.Stack())
@@ -245,9 +245,7 @@ func (authority *ReconciliationCoordinator) reconcileCustomDomain(
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.BackendInvocationPanicsTotal.WithLabelValues(
-				metrics.OperationReconcileCustomDomain,
-			).Inc()
+			metrics.BackendInvocationPanics.ReconcileCustomDomain.Inc()
 			err = fmt.Errorf("backend ReconcileCustomDomain panicked: %v", recovered)
 		}
 	}()
@@ -275,7 +273,7 @@ func (authority *ReconciliationCoordinator) activeReleaseManifest(
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_releases").Inc()
+			metrics.ReconcilerPanics.FetchReleases.Inc()
 			manifest, version = nil, 0
 			err = fmt.Errorf("read releases from %q panicked: %v\n%s",
 				backendName, recovered, debug.Stack())

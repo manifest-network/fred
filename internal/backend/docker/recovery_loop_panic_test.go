@@ -9,11 +9,11 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
-
-	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 func TestStartOwnsNetworkReclamationWorker(t *testing.T) {
@@ -47,7 +47,10 @@ func TestRecoveryLoopsContainPanicsAndRetryNextCadence(t *testing.T) {
 				b.cfg.ReconcileInterval = time.Minute
 				defer func() { b.stopCancel(); b.wg.Wait() }()
 				var calls atomic.Int32
-				panics := background.CleanupPanicsTotal.WithLabelValues(kind)
+				panics := map[string]prometheus.Counter{
+					"docker_reconciliation":      reconciliationCleanupPanics,
+					"docker_network_reclamation": networkReclamationCleanupPanics,
+				}[kind]
 				before := testutil.ToFloat64(panics)
 				work := func(context.Context) error {
 					if calls.Add(1) == 1 {

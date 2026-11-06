@@ -2532,8 +2532,8 @@ func TestRecordMetrics_NilCollectors(t *testing.T) {
 	t.Run("both nil — no panic", func(t *testing.T) {
 		client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "test", BaseURL: "http://localhost"})
 		assert.NotPanics(t, func() {
-			client.recordMetrics("provision", time.Now(), nil)
-			client.recordMetrics("deprovision", time.Now(), assert.AnError)
+			client.recordMetrics(requestProvision, time.Now(), nil)
+			client.recordMetrics(requestDeprovision, time.Now(), assert.AnError)
 		})
 	})
 
@@ -2549,7 +2549,7 @@ func TestRecordMetrics_NilCollectors(t *testing.T) {
 			RequestDuration: hist,
 		})
 		assert.NotPanics(t, func() {
-			client.recordMetrics("provision", time.Now(), nil)
+			client.recordMetrics(requestProvision, time.Now(), nil)
 		})
 		// Histogram was observed (1 sample); use testutil.CollectAndCount to verify.
 		assert.Equal(t, 1, promtestutil.CollectAndCount(hist))
@@ -2567,7 +2567,7 @@ func TestRecordMetrics_NilCollectors(t *testing.T) {
 			RequestsTotal: counter,
 		})
 		assert.NotPanics(t, func() {
-			client.recordMetrics("provision", time.Now(), nil)
+			client.recordMetrics(requestProvision, time.Now(), nil)
 		})
 		assert.Equal(t, 1.0, promtestutil.ToFloat64(counter.WithLabelValues("test", "provision", "success")))
 	})
@@ -2588,8 +2588,8 @@ func TestRecordMetrics_NilCollectors(t *testing.T) {
 			RequestDuration: hist,
 			RequestsTotal:   counter,
 		})
-		client.recordMetrics("get_info", time.Now(), nil)
-		client.recordMetrics("get_info", time.Now(), assert.AnError)
+		client.recordMetrics(requestGetInfo, time.Now(), nil)
+		client.recordMetrics(requestGetInfo, time.Now(), assert.AnError)
 
 		assert.Equal(t, 1.0, promtestutil.ToFloat64(counter.WithLabelValues("test", "get_info", "success")))
 		assert.Equal(t, 1.0, promtestutil.ToFloat64(counter.WithLabelValues("test", "get_info", "error")))

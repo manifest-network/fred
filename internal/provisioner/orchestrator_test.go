@@ -221,11 +221,10 @@ func TestHandlerEventCoordinatorProvisionsAndDeprovisionsThroughBoundApplication
 	assert.False(t, runtime.Contains(leaseUUID))
 }
 
-func TestCapacityVerdictLabel(t *testing.T) {
-	assert.Equal(t, metrics.CapacityVerdictCodedRefusal,
-		capacityVerdictLabel(backend.ProvisionRefusalCapacity))
-	assert.Equal(t, metrics.CapacityVerdictAmbiguous,
-		capacityVerdictLabel(backend.ProvisionRefusalNone))
-	assert.Equal(t, metrics.CapacityVerdictAmbiguous,
-		capacityVerdictLabel(backend.ProvisionRefusalValidation))
+func TestCapacityVerdict(t *testing.T) {
+	metrics.BindBackends("capacity-verdict-test")
+	verdicts := metrics.ForBackend("capacity-verdict-test").InsufficientResources
+	assert.Equal(t, verdicts.CodedRefusal, capacityVerdict(verdicts, backend.ProvisionRefusalCapacity))
+	assert.Equal(t, verdicts.Ambiguous, capacityVerdict(verdicts, backend.ProvisionRefusalNone))
+	assert.Equal(t, verdicts.Ambiguous, capacityVerdict(verdicts, backend.ProvisionRefusalValidation))
 }

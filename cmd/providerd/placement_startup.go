@@ -193,6 +193,18 @@ func preparePlacementBackends(
 	return store, entries, nil
 }
 
+// newBackendRequestCounters hands the backend client providerd's request
+// series for one backend operation; the client calls it once per operation
+// when it is built.
+func newBackendRequestCounters(backendName, operation string) backend.RequestCounters {
+	counters := metrics.BindBackendRequest(backendName, operation)
+	return backend.RequestCounters{
+		Success: counters.Success, Fenced: counters.Fenced,
+		Pending: counters.Pending, Error: counters.Error,
+		MalformedErrorBody: counters.MalformedErrorBody,
+	}
+}
+
 func newProductionBackendClient(
 	backendName string,
 	cfg *config.Config,
@@ -202,12 +214,14 @@ func newProductionBackendClient(
 	if err != nil {
 		return nil, fmt.Errorf("backend %q: compose connection policy: %w", backendName, err)
 	}
+	// Every backend-labeled series of a configured backend exists from the
+	// moment its client is built, before its first event.
+	metrics.BindBackends(backendName)
 	client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{
-		RequestDuration:         metrics.BackendRequestDuration,
-		RequestsTotal:           metrics.BackendRequestsTotal,
-		CircuitBreakerState:     metrics.BackendCircuitBreakerState,
-		Fenced:                  metrics.BackendFenced,
-		MalformedErrorBodyTotal: metrics.BackendMalformedErrorBodyTotal,
+		RequestDuration:     metrics.BackendRequestDuration,
+		RequestCounters:     newBackendRequestCounters,
+		CircuitBreakerState: metrics.BackendCircuitBreakerState,
+		Fenced:              metrics.BackendFenced,
 	}, resolver)
 	if err != nil {
 		return nil, fmt.Errorf("backend %q: create identity-bound client: %w", backendName, err)

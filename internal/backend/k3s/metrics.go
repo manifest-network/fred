@@ -3,6 +3,8 @@ package k3s
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 // k3s-backend Prometheus metrics. The names mirror docker-backend's
@@ -54,4 +56,13 @@ var (
 			Help: "Total failures accessing durable callback evidence in the k3s backend, including interrupted-operation recovery.",
 		},
 	)
+)
+
+// The k3s backend's background components, declared at package level so their
+// panic series exist at 0 from start.
+var (
+	callbackCleanupPanics    = background.CleanupPanics("callback")
+	diagnosticsCleanupPanics = background.CleanupPanics("diagnostics")
+	releasesCleanupPanics    = background.CleanupPanics("releases")
+	callbackReplayPanics     = background.GoroutinePanics("callback_replay")
 )

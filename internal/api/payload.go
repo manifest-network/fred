@@ -81,13 +81,13 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		token, err = h.extractPayloadToken(r)
 		if err != nil {
 			slog.Warn("invalid authorization", "error", err)
-			metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
+			metrics.PayloadUploads.InvalidAuth.Inc()
 			writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 			return
 		}
 		if err := token.Validate(h.bech32Prefix); err != nil {
 			slog.Warn("token validation failed", "error", err)
-			metrics.PayloadUploadsTotal.WithLabelValues("invalid_auth").Inc()
+			metrics.PayloadUploads.InvalidAuth.Inc()
 			writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 			return
 		}
@@ -119,13 +119,13 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 	class := h.policy.Classify(lease)
 	if class.BillingOnly() {
 		slog.Warn("payload upload refused for a billing-only lease", "lease_uuid", leaseUUID)
-		metrics.PayloadUploadsTotal.WithLabelValues("billing_only").Inc()
+		metrics.PayloadUploads.BillingOnly.Inc()
 		writeBillingOnly(w, "lease is billing-only and does not accept a payload")
 		return
 	}
 	if _, deployable := class.Deployable(); !deployable {
 		slog.Error("payload upload refused: lease cannot be classified for deployment", "lease_uuid", leaseUUID)
-		metrics.PayloadUploadsTotal.WithLabelValues("error").Inc()
+		metrics.PayloadUploads.Error.Inc()
 		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
 		return
 	}
@@ -198,7 +198,7 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 			"expected_hash", hex.EncodeToString(lease.MetaHash),
 			"lease_uuid", leaseUUID,
 		)
-		metrics.PayloadUploadsTotal.WithLabelValues("hash_mismatch").Inc()
+		metrics.PayloadUploads.HashMismatch.Inc()
 		writeError(w, "payload hash does not match meta_hash", http.StatusBadRequest)
 		return
 	}
@@ -221,13 +221,13 @@ func (h *PayloadHandler) HandlePayloadUpload(w http.ResponseWriter, r *http.Requ
 		// Rollback: remove stored payload on publish failure to allow retry
 		h.publisher.DeletePayload(leaseUUID)
 		slog.Error("failed to publish payload event", "error", err, "lease_uuid", leaseUUID)
-		metrics.PayloadUploadsTotal.WithLabelValues("error").Inc()
+		metrics.PayloadUploads.Error.Inc()
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
 	}
 
 	// Record success metrics
-	metrics.PayloadUploadsTotal.WithLabelValues("success").Inc()
+	metrics.PayloadUploads.Success.Inc()
 	metrics.PayloadSizeBytes.Observe(float64(len(body)))
 
 	slog.Info("payload received and validated",
@@ -252,32 +252,32 @@ func (h *PayloadHandler) payloadAdmitted(
 		return true
 	case placement.PayloadRestoreOwned:
 		slog.Warn("payload upload refused: a restore owns the lease", "lease_uuid", leaseUUID)
-		metrics.PayloadUploadsTotal.WithLabelValues("restore_in_progress").Inc()
+		metrics.PayloadUploads.RestoreInProgress.Inc()
 		writeJSON(w, ErrorResponse{
 			Error: errMsgRestoreInProgress, Code: http.StatusConflict, Reason: reasonRestoreInProgress,
 		}, http.StatusConflict)
 	case placement.PayloadAlreadyStored:
 		slog.Warn("payload already received", "lease_uuid", leaseUUID)
-		metrics.PayloadUploadsTotal.WithLabelValues("conflict").Inc()
+		metrics.PayloadUploads.Conflict.Inc()
 		writeError(w, errMsgPayloadAlreadyReceived, http.StatusConflict)
 	case placement.PayloadNotStored:
 		// The documented contract reports a store failure as the conflict.
 		slog.Warn("payload not stored: payload store unavailable or failed the write", "lease_uuid", leaseUUID)
-		metrics.PayloadUploadsTotal.WithLabelValues("conflict").Inc()
+		metrics.PayloadUploads.Conflict.Inc()
 		writeError(w, errMsgPayloadAlreadyReceived, http.StatusConflict)
 	case placement.PayloadLeaseDeployed:
 		slog.Warn("payload upload refused: lease already has a deployment", "lease_uuid", leaseUUID)
-		metrics.PayloadUploadsTotal.WithLabelValues("conflict").Inc()
+		metrics.PayloadUploads.Conflict.Inc()
 		writeError(w, errMsgLeaseDeployed, http.StatusConflict)
 	case placement.PayloadPlacementUnusable, placement.PayloadLeaseUnavailable:
 		slog.Warn("payload upload refused: lease lifecycle unavailable",
 			"lease_uuid", leaseUUID, "admission", admission)
-		metrics.PayloadUploadsTotal.WithLabelValues("error").Inc()
+		metrics.PayloadUploads.Error.Inc()
 		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
 	default:
 		slog.Error("payload admission returned an unknown outcome",
 			"lease_uuid", leaseUUID, "admission", admission)
-		metrics.PayloadUploadsTotal.WithLabelValues("error").Inc()
+		metrics.PayloadUploads.Error.Inc()
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 	}
 	return false

@@ -47,7 +47,7 @@ func TestUnmarshalMessagePayload_Valid(t *testing.T) {
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	result, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, TopicLeaseCreated)
+	result, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, leaseCreatedTopic)
 	require.True(t, ok, "unmarshalMessagePayload() ok = false, want true")
 	assert.Equal(t, "lease-1", result.LeaseUUID, "LeaseUUID")
 	assert.Equal(t, "tenant-1", result.Tenant, "Tenant")
@@ -56,7 +56,7 @@ func TestUnmarshalMessagePayload_Valid(t *testing.T) {
 func TestUnmarshalMessagePayload_Invalid(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), []byte("not json"))
 
-	_, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, TopicLeaseCreated)
+	_, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, leaseCreatedTopic)
 	assert.False(t, ok, "unmarshalMessagePayload() ok = true for invalid JSON, want false")
 }
 
