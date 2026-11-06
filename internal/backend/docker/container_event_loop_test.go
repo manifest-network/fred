@@ -24,7 +24,7 @@ func eventStreamCount(outcome string) float64 {
 }
 
 func eventLoopDrops() float64 {
-	return testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues(dieEventSourceEventLoop))
+	return testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues("event_loop"))
 }
 
 // flakyStorageVerifier fails the next failures verifications with a
@@ -470,10 +470,4 @@ func TestContainerEventLoop_StalledLogSinkNeverStallsTheReader(t *testing.T) {
 	require.Eventually(t, func() bool { return len(sink.overflowReports()) == 1 },
 		5*time.Second, time.Millisecond, "the held report completes once the sink drains")
 	assert.Equal(t, []uint64{1}, sink.overflowReports())
-}
-
-func TestContainerEventStreamOutcomesArePreinitialized(t *testing.T) {
-	assert.Equal(t, len(containerEventStreamOutcomes), testutil.CollectAndCount(containerEventStreamTotal),
-		"exactly the closed outcome set is exported, before any stream event")
-	assert.ElementsMatch(t, []string{"connected", "reconnect", "exited"}, containerEventStreamOutcomes)
 }

@@ -50,7 +50,10 @@ func TestClassifyTreeRemovalIsTotal(t *testing.T) {
 			t.Parallel()
 			class := classifyTreeRemoval(tc.err)
 			assert.Equal(t, tc.class, class)
-			assert.Equal(t, tc.outcome, class.metricOutcome())
+			for _, site := range []treeRemovalSite{treeRemovalSiteDeleteStage, treeRemovalSiteWritablePath} {
+				assert.Equal(t, treeRemovalsTotal.WithLabelValues(site.String(), tc.outcome), class.counter(site.outcomes),
+					"the class selects its outcome's series at %s", site)
+			}
 		})
 	}
 }
@@ -83,9 +86,9 @@ func TestRequireTreeRemovalSupport(t *testing.T) {
 func TestTreeRemovalMetricsArePreinitialized(t *testing.T) {
 	t.Parallel()
 
-	assert.Equal(t, len(treeRemovalSites)*len(treeRemovalOutcomes), testutil.CollectAndCount(treeRemovalsTotal),
+	assert.Equal(t, 2*7, testutil.CollectAndCount(treeRemovalsTotal),
 		"every site/outcome pair must export a series before the first removal")
-	assert.Equal(t, len(treeRemovalSites), testutil.CollectAndCount(treeRemovalCutsTotal))
+	assert.Equal(t, 2, testutil.CollectAndCount(treeRemovalCutsTotal))
 }
 
 func TestRemoveManagedVolumeSubtreeCountsRemovals(t *testing.T) {
@@ -97,7 +100,7 @@ func TestRemoveManagedVolumeSubtreeCountsRemovals(t *testing.T) {
 	wpPath := filepath.Join(volumeName.hostPath(volumeRoot), writablePathSubdir)
 	require.NoError(t, os.MkdirAll(filepath.Join(wpPath, "a", "b"), 0o700))
 
-	removed := treeRemovalsTotal.WithLabelValues(treeRemovalSiteWritablePath, treeRemovalOutcomeRemoved)
+	removed := treeRemovalsTotal.WithLabelValues(treeRemovalSiteWritablePath.String(), treeRemovalOutcomeRemoved)
 	before := testutil.ToFloat64(removed)
 	require.NoError(t, removeManagedVolumeSubtree(t.Context(), volumeRoot, volumeName, wpName))
 	assert.NoDirExists(t, wpPath)

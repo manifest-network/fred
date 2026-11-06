@@ -77,6 +77,6 @@ func newUnboundRetentionStoreForTest(cfg RetentionStoreConfig) (*RetentionStore,
 		return nil, fmt.Errorf("failed to build retention index: %w", err)
 	}
 	store.byTenant, store.byStatus = byTenant, byStatus
-	store.fireReindex(count, time.Since(start), "open")
+	store.fireReindex(count, time.Since(start), RetentionReindexOpen)
 	return store, nil
 }

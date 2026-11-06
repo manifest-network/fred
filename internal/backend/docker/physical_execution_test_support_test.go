@@ -644,7 +644,7 @@ func destroyVolumesForTest(
 	b *Backend,
 	owner string,
 	ctx context.Context,
-	site string,
+	site destroySite,
 	names ...string,
 ) destroyReport {
 	installTestStorageMutationAdapters(b)

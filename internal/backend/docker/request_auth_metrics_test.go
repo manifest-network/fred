@@ -32,12 +32,15 @@ func TestConfig_ValidateCallbackSecretNext(t *testing.T) {
 }
 
 // Not parallel: these read process-global counters.
-func TestRecordRequestSignatureCountsSlotsAndReasons(t *testing.T) {
+func TestRequestSignatureMetricsCountSlotsAndReasons(t *testing.T) {
+	rotating, err := hmacauth.NewVerifyKeys(string(validConfig().CallbackSecret), nextRequestKey)
+	require.NoError(t, err)
+	signatures := BindRequestSignatureMetrics(rotating)
 	current := requestSignatureKeyTotal.WithLabelValues(requestKeySlotCurrent)
 	next := requestSignatureKeyTotal.WithLabelValues(requestKeySlotNext)
 	currentBefore, nextBefore := promtestutil.ToFloat64(current), promtestutil.ToFloat64(next)
-	RecordRequestSignatureChecked(hmacauth.KeySlotCurrent, nil)
-	RecordRequestSignatureChecked(hmacauth.KeySlotRotation, nil)
+	signatures.Checked(hmacauth.KeySlotCurrent, nil)
+	signatures.Checked(hmacauth.KeySlotRotation, nil)
 	assert.Equal(t, currentBefore+1, promtestutil.ToFloat64(current))
 	assert.Equal(t, nextBefore+1, promtestutil.ToFloat64(next))
 
@@ -63,28 +66,29 @@ func TestRecordRequestSignatureCountsSlotsAndReasons(t *testing.T) {
 	for reason, refuse := range refusals {
 		counter := requestAuthFailuresTotal.WithLabelValues(reason)
 		before := promtestutil.ToFloat64(counter)
-		RecordRequestSignatureChecked(0, refuse())
+		signatures.Checked(0, refuse())
 		assert.Equal(t, before+1, promtestutil.ToFloat64(counter), reason)
 	}
 	missing := requestAuthFailuresTotal.WithLabelValues("missing")
 	missingBefore := promtestutil.ToFloat64(missing)
-	RecordRequestSignatureMissing()
+	signatures.Missing()
 	assert.Equal(t, missingBefore+1, promtestutil.ToFloat64(missing))
 
 	otherBefore := promtestutil.ToFloat64(requestAuthFailuresTotal.WithLabelValues("mismatch"))
-	RecordRequestSignatureChecked(0, errors.New("not a verification failure"))
+	signatures.Checked(0, errors.New("not a verification failure"))
 	assert.Equal(t, otherBefore, promtestutil.ToFloat64(requestAuthFailuresTotal.WithLabelValues("mismatch")),
 		"an error that is not a signature verdict is not counted")
 }
 
-func TestInitRequestKeyMetricsReportsAConfiguredNextKey(t *testing.T) {
+func TestBindRequestSignatureMetricsReportsAConfiguredNextKey(t *testing.T) {
 	current := validConfig().CallbackSecret
 	rotating, err := hmacauth.NewVerifyKeys(string(current), nextRequestKey)
 	require.NoError(t, err)
-	InitRequestKeyMetrics(rotating)
+	BindRequestSignatureMetrics(rotating)
 	assert.Equal(t, 1.0, promtestutil.ToFloat64(requestNextKeyConfigured))
 	single, err := hmacauth.NewVerifyKeys(string(current), "")
 	require.NoError(t, err)
-	InitRequestKeyMetrics(single)
+	unrotated := BindRequestSignatureMetrics(single)
 	assert.Equal(t, 0.0, promtestutil.ToFloat64(requestNextKeyConfigured))
+	assert.Nil(t, unrotated.next, "without a next key the next slot has no series to count")
 }

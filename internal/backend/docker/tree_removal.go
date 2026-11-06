@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/manifest-network/fred/internal/fstree"
 )
 
@@ -29,13 +31,7 @@ func requireTreeRemovalSupport(dataPath string) error {
 // Tenant directory trees are removed in two places, both through fstree
 // (ENG-1117): the XFS deletion of a condemned volume (delete_stage) and the
 // writable-path wipe of a live volume before it is reseeded (writable_path).
-const (
-	treeRemovalSiteDeleteStage  = "delete_stage"
-	treeRemovalSiteWritablePath = "writable_path"
-)
-
-// treeRemovalSites is the closed site set, pre-initialized in metrics.go.
-var treeRemovalSites = []string{treeRemovalSiteDeleteStage, treeRemovalSiteWritablePath}
+// Each is a treeRemovalSite, declared with its series in series.go.
 
 // treeRemovalClass is the closed classification of one fstree removal result.
 // classifyTreeRemoval is total over errors, and every consumer (the metric
@@ -81,7 +77,7 @@ func classifyTreeRemoval(err error) treeRemovalClass {
 	}
 }
 
-// Outcome labels for treeRemovalsTotal.
+// Outcome labels for treeRemovalsTotal, bound per site in series.go.
 const (
 	treeRemovalOutcomeRemoved     = "removed"
 	treeRemovalOutcomeCutRefused  = "cut_refused"
@@ -92,38 +88,32 @@ const (
 	treeRemovalOutcomeError       = "error"
 )
 
-// treeRemovalOutcomes is the closed outcome set, pre-initialized in metrics.go.
-var treeRemovalOutcomes = []string{
-	treeRemovalOutcomeRemoved, treeRemovalOutcomeCutRefused, treeRemovalOutcomeTreeChanged,
-	treeRemovalOutcomeCrossDevice, treeRemovalOutcomeUndeletable, treeRemovalOutcomeCanceled,
-	treeRemovalOutcomeError,
-}
-
-// metricOutcome is the treeRemovalsTotal outcome label of a class.
-func (c treeRemovalClass) metricOutcome() string {
+// counter is a class's series among one site's outcomes. Every class has
+// one: an unrecognized class counts as error.
+func (c treeRemovalClass) counter(outcomes treeRemovalOutcomeCounters) prometheus.Counter {
 	switch c {
 	case treeRemovalRemoved:
-		return treeRemovalOutcomeRemoved
+		return outcomes.removed
 	case treeRemovalDeadline, treeRemovalCanceled:
-		return treeRemovalOutcomeCanceled
+		return outcomes.canceled
 	case treeRemovalCrossDevice:
-		return treeRemovalOutcomeCrossDevice
+		return outcomes.crossDevice
 	case treeRemovalCutRefused:
-		return treeRemovalOutcomeCutRefused
+		return outcomes.cutRefused
 	case treeRemovalTreeChanged:
-		return treeRemovalOutcomeTreeChanged
+		return outcomes.treeChanged
 	case treeRemovalUndeletable:
-		return treeRemovalOutcomeUndeletable
+		return outcomes.undeletable
 	default:
-		return treeRemovalOutcomeError
+		return outcomes.error
 	}
 }
 
 // observeTreeRemoval counts one removal at site: its outcome, and any cuts it
 // made. A cut means the tree was deeper than fstree's ancestry bound.
-func observeTreeRemoval(site string, report fstree.RemoveReport, err error) {
-	treeRemovalsTotal.WithLabelValues(site, classifyTreeRemoval(err).metricOutcome()).Inc()
+func observeTreeRemoval(site treeRemovalSite, report fstree.RemoveReport, err error) {
+	classifyTreeRemoval(err).counter(site.outcomes).Inc()
 	if report.Cuts > 0 {
-		treeRemovalCutsTotal.WithLabelValues(site).Add(float64(report.Cuts))
+		site.cuts.Add(float64(report.Cuts))
 	}
 }

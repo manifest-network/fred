@@ -164,7 +164,7 @@ func fixtureRepository(t *testing.T, f *registryFixture) name.Repository {
 
 func tagResolutionCounts() map[string]float64 {
 	counts := make(map[string]float64)
-	for _, source := range []string{tagFromCache, tagFromRegistry, tagFallbackUnsupported, tagFallbackIncomplete} {
+	for _, source := range []string{"cache", "registry", "fallback_unsupported", "fallback_incomplete"} {
 		counts[source] = testutil.ToFloat64(imageTagResolutions.WithLabelValues(source))
 	}
 	return counts
@@ -213,7 +213,7 @@ func TestTagResolutionUsesHeadAndVerifiedManifestCache(t *testing.T) {
 			require.Zero(t, registry.count("GET tag"), "an announced digest is read by digest, never by its mutable tag")
 			require.Equal(t, gets, registry.count("GET digest"), "an unchanged tag costs no further manifest GET")
 			require.Equal(t, 1, registry.count("GET blob"), "config remains served from the verified config cache")
-			require.Equal(t, map[string]float64{tagFromCache: 5, tagFromRegistry: 1}, tagResolutionDelta(resolutions))
+			require.Equal(t, map[string]float64{"cache": 5, "registry": 1}, tagResolutionDelta(resolutions))
 			require.Equal(t, heads+6, registryRequestCount("manifest", http.MethodHead, "ok"))
 			require.Equal(t, manifestGets+float64(gets), registryRequestCount("manifest", http.MethodGet, "ok"))
 			require.Empty(t, loader.manifests.claims, "no claim outlives its resolution")
@@ -227,24 +227,24 @@ func TestTagResolutionFallsBackToTagGetOnlyWithoutUsableHead(t *testing.T) {
 		source string
 		head   func(*http.Response) *http.Response
 	}{
-		{"missing digest", tagFallbackIncomplete, func(r *http.Response) *http.Response { r.Header.Del("Docker-Content-Digest"); return r }},
-		{"malformed digest", tagFallbackIncomplete, func(r *http.Response) *http.Response {
+		{"missing digest", "fallback_incomplete", func(r *http.Response) *http.Response { r.Header.Del("Docker-Content-Digest"); return r }},
+		{"malformed digest", "fallback_incomplete", func(r *http.Response) *http.Response {
 			r.Header.Set("Docker-Content-Digest", "sha256:not-a-digest")
 			return r
 		}},
-		{"non-sha256 digest", tagFallbackIncomplete, func(r *http.Response) *http.Response {
+		{"non-sha256 digest", "fallback_incomplete", func(r *http.Response) *http.Response {
 			r.Header.Set("Docker-Content-Digest", "sha512:"+strings.Repeat("ab", 64))
 			return r
 		}},
-		{"missing content type", tagFallbackIncomplete, func(r *http.Response) *http.Response { r.Header.Del("Content-Type"); return r }},
-		{"missing content length", tagFallbackIncomplete, func(r *http.Response) *http.Response {
+		{"missing content type", "fallback_incomplete", func(r *http.Response) *http.Response { r.Header.Del("Content-Type"); return r }},
+		{"missing content length", "fallback_incomplete", func(r *http.Response) *http.Response {
 			r.Header.Del("Content-Length")
 			r.ContentLength = -1
 			return r
 		}},
-		{"non-200 success", tagFallbackIncomplete, func(r *http.Response) *http.Response { return withStatus(r, http.StatusNoContent) }},
-		{"method not allowed", tagFallbackUnsupported, func(r *http.Response) *http.Response { return withStatus(r, http.StatusMethodNotAllowed) }},
-		{"not implemented", tagFallbackUnsupported, func(r *http.Response) *http.Response { return withStatus(r, http.StatusNotImplemented) }},
+		{"non-200 success", "fallback_incomplete", func(r *http.Response) *http.Response { return withStatus(r, http.StatusNoContent) }},
+		{"method not allowed", "fallback_unsupported", func(r *http.Response) *http.Response { return withStatus(r, http.StatusMethodNotAllowed) }},
+		{"not implemented", "fallback_unsupported", func(r *http.Response) *http.Response { return withStatus(r, http.StatusNotImplemented) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := newRegistry(t, encodedTar(t))
@@ -602,7 +602,7 @@ func TestHeadDigestContradictedByContentIsKeyedByContent(t *testing.T) {
 	_, err = loader.Resolve(t.Context(), f.ref(), testPlatform)
 	require.NoError(t, err)
 	require.Equal(t, 2, registry.count("GET digest"), "a contradicted header cannot select cached bytes")
-	require.Equal(t, map[string]float64{tagFromRegistry: 2}, tagResolutionDelta(before))
+	require.Equal(t, map[string]float64{"registry": 2}, tagResolutionDelta(before))
 	exchanges := registry.total()
 	_, err = loader.Resolve(t.Context(), resolved.SourceReference(), testPlatform)
 	require.NoError(t, err)
@@ -1103,7 +1103,7 @@ func TestRegistryCountersInitializedBeforeFirstExchange(t *testing.T) {
 	}
 	expected := make(map[string]float64)
 	for _, endpoint := range []string{"manifest", "blob", "ping", "other"} {
-		for _, method := range []string{"GET", "HEAD"} {
+		for _, method := range []string{"GET", "HEAD", "other"} {
 			for _, status := range []string{"ok", "4xx", "429", "5xx", "error"} {
 				expected[endpoint+"/"+method+"/"+status] = 0
 			}

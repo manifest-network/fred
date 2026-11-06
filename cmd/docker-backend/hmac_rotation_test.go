@@ -37,7 +37,7 @@ func (b backendRotationConfig) requestHandler(t *testing.T) http.Handler {
 	cfg := docker.Config{CallbackSecret: config.Secret(b.current), CallbackSecretNext: config.RotationSecret(b.next)}
 	keys, err := cfg.RequestKeys()
 	require.NoError(t, err)
-	return hmacAuthMiddleware(keys, slog.Default(), docker.DefaultMaxRequestBodySize)(
+	return newHMACAuthMiddleware(keys, slog.Default(), docker.DefaultMaxRequestBodySize)(
 		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }),
 	)
 }

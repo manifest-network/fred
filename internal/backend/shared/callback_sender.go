@@ -160,7 +160,7 @@ type CallbackSender struct {
 	deliveryTimeout time.Duration
 	replayInterval  time.Duration
 	attestor        *CallbackStorageAttestor
-	onDelivery      func(outcome string) // nil-safe; injected by the caller for metrics
+	onDelivery      func(delivered bool) // nil-safe; injected by the caller for metrics
 	onStoreError    func()               // nil-safe; called when bbolt persistence fails
 	onReplayPanic   func(any)            // nil-safe; called when one lease replay panics
 	storageIdentity backendidentity.ID
@@ -201,7 +201,7 @@ type CallbackSenderConfig struct {
 	HTTPClient      *http.Client
 	Secret          string
 	Logger          *slog.Logger
-	OnDelivery      func(outcome string)                // optional metrics callback
+	OnDelivery      func(delivered bool)                // optional metrics callback: one call per delivery outcome
 	OnStoreError    func()                              // optional; called when bbolt persistence fails
 	OnReplayPanic   func(any)                           // optional; called after recovering a lease replay panic
 	Backoff         *[CallbackMaxAttempts]time.Duration // retry delays; nil uses default {0, 1s, 5s}
@@ -366,7 +366,7 @@ func (s *CallbackSender) deliverCallback(leaseUUID, callbackURL string, body []b
 					"attempt", attempt+1,
 					"error", deliveryCtx.Err(),
 				)
-				s.reportDelivery("failure")
+				s.reportDelivery(false)
 				return false
 			case <-timer.C:
 			}
@@ -376,16 +376,16 @@ func (s *CallbackSender) deliverCallback(leaseUUID, callbackURL string, body []b
 				"error", err,
 				"lease_uuid", leaseUUID,
 			)
-			s.reportDelivery("failure")
+			s.reportDelivery(false)
 			return false
 		}
 
 		switch s.trySendCallback(deliveryCtx, leaseUUID, callbackURL, body) {
 		case callbackAttemptDelivered:
-			s.reportDelivery("success")
+			s.reportDelivery(true)
 			return true
 		case callbackAttemptDeferReplay:
-			s.reportDelivery("failure")
+			s.reportDelivery(false)
 			s.logger.Warn("callback delivery deferred to durable replay after request context ended",
 				"lease_uuid", leaseUUID,
 				"attempt", attempt+1,
@@ -398,7 +398,7 @@ func (s *CallbackSender) deliverCallback(leaseUUID, callbackURL string, body []b
 		}
 	}
 
-	s.reportDelivery("failure")
+	s.reportDelivery(false)
 	s.logger.Error("callback delivery failed after retries",
 		"lease_uuid", leaseUUID,
 		"attempts", CallbackMaxAttempts,
@@ -1139,8 +1139,9 @@ func (s *CallbackSender) reportReplayPanic(recovered any) {
 	s.onReplayPanic(recovered)
 }
 
-// reportDelivery calls the onDelivery hook if configured.
-func (s *CallbackSender) reportDelivery(outcome string) {
+// reportDelivery calls the onDelivery hook if configured: delivered once
+// any attempt succeeds, not delivered once the retry loop gives up.
+func (s *CallbackSender) reportDelivery(delivered bool) {
 	if s.onDelivery == nil {
 		return
 	}
@@ -1151,5 +1152,5 @@ func (s *CallbackSender) reportDelivery(outcome string) {
 			s.logger.Error("panic in callback delivery hook", "panic", recovered)
 		}
 	}()
-	s.onDelivery(outcome)
+	s.onDelivery(delivered)
 }

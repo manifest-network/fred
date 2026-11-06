@@ -182,7 +182,7 @@ func TestDestroyReapingVolumes_RefusesANameClaimedAfterTheSnapshot(t *testing.T)
 	}
 
 	ownerBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipOwnerClaimed))
-	refusedBefore := testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteReaping, destroyRefusedClaimed))
+	refusedBefore := testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteReaping.String(), destroyRefusedClaimed))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -211,7 +211,7 @@ func TestDestroyReapingVolumes_RefusesANameClaimedAfterTheSnapshot(t *testing.T)
 	assert.False(t, reaped, "a refused name means the record is kept for retry")
 	assert.Equal(t, ownerBefore+1, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipOwnerClaimed)),
 		"a live provision holds it — the label the stuck-reaping runbook triages on")
-	assert.Equal(t, refusedBefore+1, testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteReaping, destroyRefusedClaimed)),
+	assert.Equal(t, refusedBefore+1, testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteReaping.String(), destroyRefusedClaimed)),
 		"the re-check refusal is counted like any other, per volume")
 
 	tomb, err := rs.Get(lease)
@@ -291,7 +291,7 @@ func TestCreateManagedVolume_SerializesAgainstAnInFlightDestroy(t *testing.T) {
 		defer close(destroyDone)
 		// Exact operation authority serializes destruction with recreation of the
 		// same lease-owned name.
-		destroyVolumesForTest(b, lease, ctx, destroySiteProvisionCleanup, name)
+		destroyVolumesForTest(b, lease, ctx, destroySiteProvisionCleanup(), name)
 	}()
 	<-bar.reached
 

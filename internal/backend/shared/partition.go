@@ -44,21 +44,24 @@ const (
 	maxPartitionSourceKeyLen = 128
 )
 
-// Collapse reasons — the CLOSED label set of the partition-collapse metric.
+// PartitionCollapseReason is why a partition declaration collapsed to the
+// default bucket — the CLOSED label set of the partition-collapse metric.
 // Declared here (not in the docker package) so extraction and the write-time
 // bound share one vocabulary. "" means "did not collapse" (either a valid
 // partition or the silent not-declared default).
+type PartitionCollapseReason string
+
 const (
-	PartitionReasonNoInput    = "no_input"    // manifest nil/empty after hydration
-	PartitionReasonDivergent  = "divergent"   // carrying services disagree
-	PartitionReasonInvalid    = "invalid"     // value fails NormalizePartition
-	PartitionReasonOverLimit  = "over_limit"  // produced by the write-time bound (next phase)
-	PartitionReasonStoreError = "store_error" // produced by the write-time bound (next phase)
+	PartitionReasonNoInput    PartitionCollapseReason = "no_input"    // manifest nil/empty after hydration
+	PartitionReasonDivergent  PartitionCollapseReason = "divergent"   // carrying services disagree
+	PartitionReasonInvalid    PartitionCollapseReason = "invalid"     // value fails NormalizePartition
+	PartitionReasonOverLimit  PartitionCollapseReason = "over_limit"  // produced by the write-time bound (next phase)
+	PartitionReasonStoreError PartitionCollapseReason = "store_error" // produced by the write-time bound (next phase)
 )
 
-// PartitionCollapseReasons is the full closed set, exported for metric
-// pre-initialization.
-var PartitionCollapseReasons = []string{
+// PartitionCollapseReasons is the full closed set, so a metric can create
+// each reason's series at startup.
+var PartitionCollapseReasons = []PartitionCollapseReason{
 	PartitionReasonNoInput, PartitionReasonDivergent, PartitionReasonInvalid,
 	PartitionReasonOverLimit, PartitionReasonStoreError,
 }
@@ -151,7 +154,7 @@ func TruncatePartitionRaw(raw string) string {
 //
 // It CANNOT fail: there is no error return, which structurally enforces the
 // never-fail-a-close invariant.
-func ExtractPartition(src PartitionSource, in PartitionInputs) (partition, reason, rawDetail string) {
+func ExtractPartition(src PartitionSource, in PartitionInputs) (partition string, reason PartitionCollapseReason, rawDetail string) {
 	if src.Kind == PartitionSourceNone {
 		return "", "", ""
 	}

@@ -551,11 +551,11 @@ func (b *Backend) handbackFailedRestore(
 		}
 		return nil
 	}()
-	cleanupOutcome := teardownOutcomeRecovered
+	cleanupOutcome := teardownOpRestoreReconcile.recovered
 	if cleanupErr != nil {
-		cleanupOutcome = teardownOutcomeFailed
+		cleanupOutcome = teardownOpRestoreReconcile.failed
 	}
-	teardownFallbackTotal.WithLabelValues(teardownOpRestoreReconcile, cleanupOutcome).Inc()
+	cleanupOutcome.Inc()
 	if cleanupErr != nil {
 		return cleanupErr
 	}
@@ -1063,12 +1063,12 @@ func (b *Backend) destroyReapingVolumesUsing(
 		// and the record stays; once residual and counted, the name is durably
 		// gone, the record may go, and the project's remaining footprint is
 		// counted in admission as heldResidualMB.
-		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
+		reapSkips.claimUnreadable.Inc()
 		logger.Error("reaping: backend storage recovery is pending; keeping the record", "error", authorityErr)
 		return false
 	}
 	if !reapingProof.Valid() || orig == "" {
-		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
+		reapSkips.claimUnreadable.Inc()
 		logger.Error("reaping: exact tombstone authority is unavailable; keeping the record")
 		return false
 	}
@@ -1085,7 +1085,7 @@ func (b *Backend) destroyReapingVolumesUsing(
 		// are indistinguishable — and one of those two readings deletes the record that is
 		// both the retry vehicle and the accounting for bytes still on disk. Same reason
 		// and same reason-label as an unreadable claim table below.
-		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
+		reapSkips.claimUnreadable.Inc()
 		logger.Error("reaping: cannot enumerate volumes; destroyed nothing this pass (record stays reaping for retry)",
 			"error", derr)
 		return false
@@ -1108,7 +1108,7 @@ func (b *Backend) destroyReapingVolumesUsing(
 	rep := op.destroy(destroyVolumes, ctx, destroySiteReaping, names...)
 
 	if len(rep.Unproven) > 0 {
-		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
+		reapSkips.claimUnreadable.Inc()
 		b.logger.Error("reaping: ownership unprovable; destroyed nothing this pass (record stays reaping for retry)",
 			"lease_uuid", orig, "error", rep.err())
 		return false
@@ -1118,7 +1118,7 @@ func (b *Backend) destroyReapingVolumesUsing(
 	// exclusive by construction. The only reachable positive claim is a live lease that
 	// the reconciler re-provisioned after this tombstone was written.
 	if len(rep.Claimed) > 0 {
-		retentionReapSkipsTotal.WithLabelValues(reapSkipOwnerClaimed).Inc()
+		reapSkips.ownerClaimed.Inc()
 	}
 	skipped := len(rep.Claimed)
 	if len(rep.Errs) > 0 {
@@ -1158,12 +1158,12 @@ func (b *Backend) destroyReapingVolumesUsing(
 	confirm := b.newManagedVolumeIndex()
 	switch remaining, verr := confirm.footprint(ctx, orig); {
 	case verr != nil:
-		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
+		reapSkips.claimUnreadable.Inc()
 		logger.Error("reaping: destroys reported success but the footprint could not be re-confirmed; "+
 			"keeping the record (is the volume root still mounted?)", "error", verr)
 		return false
 	case len(remaining) > 0:
-		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
+		reapSkips.claimUnreadable.Inc()
 		logger.Error("reaping: destroys reported success but volumes are still present; keeping the record",
 			"remaining", len(remaining))
 		return false
@@ -1274,14 +1274,14 @@ func (b *Backend) reconcileOrphanedRetentionsUsing(ctx context.Context) (int, er
 	result, err := b.orphanPruner.Sweep(ctx)
 	switch result.SkipReason {
 	case shared.RetentionOrphanSkipDisabled:
-		retentionOrphanSkipsTotal.WithLabelValues(orphanSkipDisabled).Inc()
+		orphanSkips.disabled.Inc()
 	case shared.RetentionOrphanSkipInventoryError:
-		retentionOrphanSkipsTotal.WithLabelValues(orphanSkipListError).Inc()
+		orphanSkips.listError.Inc()
 	case shared.RetentionOrphanSkipStoreError:
-		retentionOrphanSkipsTotal.WithLabelValues(orphanSkipStoreError).Inc()
+		orphanSkips.storeError.Inc()
 	}
 	if result.Raced > 0 {
-		retentionOrphanSkipsTotal.WithLabelValues(orphanSkipRaced).Add(float64(result.Raced))
+		orphanSkips.raced.Add(float64(result.Raced))
 	}
 	if result.Pruned > 0 {
 		retentionOrphansPrunedTotal.Add(float64(result.Pruned))
@@ -1433,10 +1433,10 @@ func (b *Backend) runRetentionSweepUsing(
 	// every failing stage named; the counter is what an alert can actually key on.
 	err := errors.Join(errs...)
 	if err != nil {
-		retentionSweepTotal.WithLabelValues(sweepOutcomeError).Inc()
+		retentionSweeps.error.Inc()
 		return err
 	}
-	retentionSweepTotal.WithLabelValues(sweepOutcomeSuccess).Inc()
+	retentionSweeps.ok.Inc()
 	return nil
 }
 
@@ -1597,7 +1597,6 @@ func (b *Backend) checkDemoteFitWithResourceProfiles(
 	for _, it := range rec.Items {
 		oldSKU[it.ServiceName] = it.SKU
 	}
-	backendKind := b.volumes.Kind()
 	for _, it := range newItems {
 		newResourcesForSKU, ok := newResources[it.SKU]
 		if !ok {
@@ -1638,17 +1637,17 @@ func (b *Backend) checkDemoteFitWithResourceProfiles(
 			destinationIsScratch := newResourcesForSKU.DiskMB == 0
 			sourceMayBeDurable := !oldProfileOK || oldResourcesForSKU.DiskMB > 0
 			if newDiskMB <= 0 || (destinationIsScratch && sourceMayBeDurable) {
-				restoreDemoteRefusedTotal.WithLabelValues(backendKind, "ephemeral_tier").Inc()
+				b.restoreDemoteRefusals.ephemeralTier.Inc()
 				return fmt.Errorf("%w: service %q: cannot restore stateful data into an ephemeral (disk_mb=0) tier",
 					backend.ErrDemoteDataExceedsTier, it.ServiceName)
 			}
 			usage, uerr := b.volumes.Usage(ctx, name)
 			if uerr != nil {
-				reason := "unmeasurable_read_error"
+				reason, refused := "unmeasurable_read_error", b.restoreDemoteRefusals.unmeasurableReadError
 				if errors.Is(uerr, errors.ErrUnsupported) {
-					reason = "unmeasurable_backend"
+					reason, refused = "unmeasurable_backend", b.restoreDemoteRefusals.unmeasurableBackend
 				}
-				restoreDemoteRefusedTotal.WithLabelValues(backendKind, reason).Inc()
+				refused.Inc()
 				// uerr can embed host paths and raw command output (e.g. btrfs
 				// qgroup show against b.dataPath); log it for operators but keep
 				// it OUT of the returned error, which docker-backend/fred-api
@@ -1664,7 +1663,7 @@ func (b *Backend) checkDemoteFitWithResourceProfiles(
 			}
 			capBytes := newDiskMB * bytesPerMiB
 			if usage > capBytes {
-				restoreDemoteRefusedTotal.WithLabelValues(backendKind, "measured_exceeds").Inc()
+				b.restoreDemoteRefusals.measuredExceeds.Inc()
 				logger.Warn("restore demote refused: retained data exceeds smaller tier",
 					"service", it.ServiceName, "volume", name, "used_bytes", usage, "tier_disk_mb", newDiskMB, "cap_bytes", capBytes)
 				return fmt.Errorf("%w: service %q: %d bytes used exceeds disk_mb=%d cap (%d bytes)",

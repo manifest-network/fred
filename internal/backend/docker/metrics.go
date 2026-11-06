@@ -5,7 +5,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
 	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
@@ -27,8 +26,7 @@ const (
 	phaseVerifyStartup = "verify_startup" // health-wait / fixed startup verification
 )
 
-// Skip reasons for retentionOrphanSkipsTotal (ENG-370). Kept as
-// constants so the reconcile, the pre-init, and the tests cannot drift on a typo.
+// Skip reasons for retentionOrphanSkipsTotal (ENG-370), bound in series.go.
 const (
 	orphanSkipListError  = "list_error"  // complete ListForProof failed, including uncertain root identity (fail-safe skip)
 	orphanSkipRaced      = "raced"       // record no longer ACTIVE-and-present at delete time: concurrently restore-claimed (active→restoring) OR already removed (e.g. cap-eviction) — benign, another path owns it
@@ -36,13 +34,8 @@ const (
 	orphanSkipStoreError = "store_error" // retentionStore.List() failed (fail-safe skip)
 )
 
-// orphanSkipReasons is the closed reason set, used to pre-initialize the
-// CounterVec series to 0 so absence/ratio alert queries return 0, not no-data.
-var orphanSkipReasons = []string{orphanSkipListError, orphanSkipRaced, orphanSkipDisabled, orphanSkipStoreError}
-
 // Skip reasons for retentionReapSkipsTotal (ENG-659) — the reaping finalizer's
-// destroy-time ownership re-check. Kept as constants so the reap path, the pre-init,
-// and the tests cannot drift on a typo.
+// destroy-time ownership re-check, bound in series.go.
 const (
 	reapSkipClaimUnreadable = "claim_unreadable" // retentionStore.List() failed → ownership unprovable → destroy nothing this pass (fail-safe)
 	// reapSkipOwnerClaimed means a tombstoned namespace belongs to a live provision
@@ -50,10 +43,6 @@ const (
 	// restore to unblock.
 	reapSkipOwnerClaimed = "owner_claimed"
 )
-
-// reapSkipReasons is the closed reason set, pre-initialized to 0 so a healthy
-// provider — which should never skip — exports 0 rather than no-data.
-var reapSkipReasons = []string{reapSkipClaimUnreadable, reapSkipOwnerClaimed}
 
 // Outcomes for retentionSweepTotal (ENG-680). Exactly one of these is recorded per
 // periodic sweep pass, which is what makes the sum across them a liveness heartbeat.
@@ -67,84 +56,20 @@ const (
 	sweepOutcomeError = "error"
 )
 
-// sweepOutcomes is the closed outcome set. Pre-initializing BOTH matters more here than
-// elsewhere: the liveness query reads the sum, and an absent series is indistinguishable
-// from a stalled sweep.
-var sweepOutcomes = []string{sweepOutcomeSuccess, sweepOutcomeError}
-
-// Site labels for volumeDestroyRefusedTotal — which exact-authority destroy path the
-// ownership choke point turned away (ENG-658). One constant per caller of volumeOp.destroy.
-// The set is closed by convention, not by the compiler (destroy takes a string), but
-// destroySites below is what pre-initializes the series: a new site that skips these
-// constants exports no zero series, so its absence reads as no-data rather than as
-// "never refused" — which is the failure mode the pre-init exists to prevent.
-const (
-	destroySiteDeprovisionDestroy = "deprovision_destroy" // doDeprovision's non-retain arm
-	destroySiteDeprovisionReclaim = "deprovision_reclaim" // doDeprovision's writable-path-only reclaim (ENG-406)
-	destroySiteRetentionRefused   = "retention_refused"   // destroyOnRefuseToRetain, a breached retained-disk cap
-	destroySiteReaping            = "reaping"             // destroyReapingVolumes, the retention finalizer
-	destroySiteStartupRollback    = "startup_rollback"    // rollbackStartupFailure, a definite startup failure's own volumes (ENG-1125)
-)
-
-// Reasons a destroy was refused. Both mean "the bytes are still on disk", but they
-// differ in who is expected to clear them: claimed is another lease's live claim and
-// resolves itself when that lease's restore commits or rolls back, whereas
-// claims_unreadable is the fail-safe — ownership could not be established at all, so
-// nothing was destroyed. no_destroyer cannot happen with any volumeManager in this
-// repo (all four implement Destroy, and New fails fast if the configured one
-// does not); it exists because the capability is obtained by assertion, so a future
-// decorator around b.volumes would silently drop it, and a refusal is the safe reading.
+// Reasons a destroy was refused; see destroySite.
 const (
 	destroyRefusedClaimed     = "claimed"
 	destroyRefusedUnreadable  = "claims_unreadable"
 	destroyRefusedNoDestroyer = "no_destroyer"
 )
 
-// The closed label sets, pre-initialized to 0 so a provider that never refuses a
-// destroy — which is every healthy provider — exports 0 rather than no-data.
-var (
-	destroySites = []string{
-		destroySiteDeprovisionDestroy, destroySiteDeprovisionReclaim, destroySiteRetentionRefused,
-		destroySiteReaping, destroySiteStartupRollback,
-	}
-	destroyRefusedReasons = []string{destroyRefusedClaimed, destroyRefusedUnreadable, destroyRefusedNoDestroyer}
-)
-
-// Operation and outcome labels for teardownFallbackTotal identify per-container
-// teardown recovery, including exact failed-restore cleanup, and whether absence
-// was proved (ENG-647). Kept as constants so call sites, pre-init, and tests cannot
-// drift on a typo.
-//
-// All current paths retain exact authority and accounting on failed cleanup.
-// Ordinary durable recovery retries in-process. An ambiguous live provision
-// worker can still fail-stop; its next process resumes from the retained intent.
+// Outcome labels for teardownFallbackTotal; see teardownOperation. All current
+// paths retain exact authority and accounting on failed cleanup. Ordinary
+// durable recovery retries in-process. An ambiguous live provision worker can
+// still fail-stop; its next process resumes from the retained intent.
 const (
-	// Blocking.
-	teardownOpRestoreReconcile = "restore_reconcile" // reconcileRestoring's orphaned arm (boot + retention sweep)
-	teardownOpDeprovision      = "deprovision"       // doDeprovision's close-path teardown
-	teardownOpProvisionCleanup = "provision_cleanup" // failed provision retains its WAL and accounting for recovery
-
 	teardownOutcomeRecovered = "recovered" // recovery proved destination containers absent
 	teardownOutcomeFailed    = "failed"    // a container may still be running (removal or discovery failed)
-)
-
-// teardownOperations / teardownOutcomes are the closed label sets, pre-initialized to
-// 0 so a "compensation is failing" alert reads 0 rather than no-data before the first
-// teardown recovery attempt — which, on a healthy provider, may be never.
-var (
-	teardownOperations = []string{
-		teardownOpRestoreReconcile, teardownOpDeprovision, teardownOpProvisionCleanup,
-	}
-	teardownOutcomes = []string{teardownOutcomeRecovered, teardownOutcomeFailed}
-)
-
-// Scope labels for retentionRefusedByScopeTotal — the cap level that tripped a
-// close-time refuse-to-retain. Kept as constants so the disk gate, the pre-init,
-// and the tests cannot drift on a typo.
-const (
-	refuseScopeGlobal    = "global"    // L0 max_retained_disk_mb
-	refuseScopeTenant    = "tenant"    // L1 per-tenant aggregate disk
-	refuseScopePartition = "partition" // L2 per-partition disk sub-cap
 )
 
 // Check labels for retentionCapCheckFailedTotal — the retention cap check that
@@ -160,11 +85,6 @@ const (
 	capCheckRefuseGet = "refuse_get" // the existing-record Get read error (shouldRefuseRetention)
 )
 
-// refuseScopes / capChecks are the closed label sets, used to pre-initialize the
-// CounterVec series to 0 so absence/ratio alert queries return 0, not no-data.
-var refuseScopes = []string{refuseScopeGlobal, refuseScopeTenant, refuseScopePartition}
-var capChecks = []string{capCheckEvict, capCheckBreach, capCheckBound, capCheckRefuseGet}
-
 // Outcome labels for volumeDeleteOutcomesTotal, one per XFS delete-stage
 // cleanup attempt (ENG-1117).
 const (
@@ -174,20 +94,6 @@ const (
 	volumeDeleteOutcomeHeldResidual = "held_residual"
 	volumeDeleteOutcomeLatched      = "latched"
 )
-
-// volumeDeleteOutcomes is the closed outcome set, pre-initialized in init.
-var volumeDeleteOutcomes = []string{
-	volumeDeleteOutcomeCompleted, volumeDeleteOutcomeHeldRemoval, volumeDeleteOutcomeHeldUnsized,
-	volumeDeleteOutcomeHeldResidual, volumeDeleteOutcomeLatched,
-}
-
-const (
-	operationRecoveryTimeoutProvision = "provision_timeout"
-)
-
-var operationRecoveryTimeoutReasons = []string{
-	operationRecoveryTimeoutProvision,
-}
 
 var (
 	imageGCTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -823,7 +729,7 @@ var (
 	// — one per record). Filter by reason rather than summing across (the units
 	// differ); the name says "skips", not "sweeps", deliberately. Without it, a sweep
 	// that skips forever (e.g. a mis-mounted volume root) is indistinguishable from a
-	// healthy "0 pruned" on the success counter alone. reason ∈ orphanSkipReasons.
+	// healthy "0 pruned" on the success counter alone. Its reasons are orphanSkips in series.go.
 	retentionOrphanSkipsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
@@ -963,8 +869,7 @@ var (
 	// keeps reconnecting, or stops, leaves crash loops unclosable: deaths in a
 	// gap, and the first death of a run that predates the stream, are
 	// attributed unknown. A counter, not a last-success gauge, per the deploy
-	// rules. The label set is containerEventStreamOutcomes, pre-initialized in
-	// init.
+	// rules. Its series are bound in series.go.
 	containerEventStreamTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
@@ -994,7 +899,7 @@ var (
 	// on-chain; disruption (an observed API signal, or a vanished, removing or
 	// dead container), platform, maintenance (restart, update or restore
 	// outcomes) and unknown never do. The label set is failurecause.Labels, a
-	// closed enum, pre-initialized in init.
+	// closed enum, bound in series.go.
 	leaseFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
@@ -1233,7 +1138,7 @@ var (
 	// pool. owner_claimed is a live-lease hold; claim_unreadable is the ticketing signal,
 	// exactly as retention_orphan_skips_total{reason="store_error"} is for the orphan
 	// pruner.
-	// reason ∈ reapSkipReasons.
+	// Its reasons are reapSkips in series.go.
 	retentionReapSkipsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
@@ -1261,7 +1166,7 @@ var (
 	// so ownership was unprovable and nothing was destroyed. Bytes stay on disk and
 	// stay counted; the caller keeps the lease Failed and retries.
 	//
-	// site ∈ destroySites, reason ∈ destroyRefusedReasons.
+	// Its sites and reasons are the destroySite values in series.go.
 	volumeDestroyRefusedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
@@ -1329,149 +1234,25 @@ var (
 	}, []string{"trigger"})
 )
 
-// reindexTriggers is the closed trigger set, used to pre-initialize the
-// retentionIndexReindexTotal series to 0 so absence/ratio alert queries return 0,
-// not no-data, before the first (re)build.
-var reindexTriggers = []string{"open", "manual"}
-
-// restoreOutcomes is the closed outcome set for restoresTotal, pre-initialized to 0
-// so a restore success-rate / failure-ratio query returns 0, not no-data, before the
-// first restore completes (ENG-408). Values mirror provisionsTotal.
-var restoreOutcomes = []string{"success", "failure"}
-
 // quotaBackfillDeletePending counts a wanted volume skipped because its
 // deletion is pending: its delete authority owns its limits (ENG-1117).
 const quotaBackfillDeletePending = "delete_pending"
 
-// quotaBackfillOutcomes is the closed outcome set for volumeQuotaBackfillTotal,
-// pre-initialized to 0 so a backfill failure-ratio query returns 0, not no-data,
-// before the first startup reconcile (ENG-454).
-var quotaBackfillOutcomes = []string{"applied", "failed", quotaBackfillDeletePending}
-
 func init() {
-	// Pre-init every failure attribution (ENG-799) so an alert on a non-counted
-	// attribution reads 0, not no-data, before the first failure.
-	for _, attribution := range failurecause.Labels() {
-		leaseFailuresTotal.WithLabelValues(attribution).Add(0)
-	}
-	for _, outcome := range containerEventStreamOutcomes {
-		containerEventStreamTotal.WithLabelValues(outcome).Add(0)
-	}
+	// Gauges by a closed label set start at 0 so a comparison against them
+	// reads 0, not no-data. Every labeled counter is bound in series.go.
 	for _, kind := range []string{"active", "retained"} {
 		imageUnpinnedGenerations.WithLabelValues(kind).Set(0)
 	}
 	for _, reason := range []string{imageHelperUnsettledUnknownCreate, imageHelperUnsettledCleanupPending} {
 		imageHelpersUnsettled.WithLabelValues(reason).Set(0)
 	}
-	for _, failure := range requestAuthFailures {
-		requestAuthFailuresTotal.WithLabelValues(failure.label())
-	}
-	for _, sink := range tenantSeccompSinks {
-		tenantSeccompProfileRefusalsTotal.WithLabelValues(sink.label()).Add(0)
-	}
-	for _, outcome := range runtimeRefreshOutcomes {
-		runtimeRefreshTotal.WithLabelValues(string(outcome)).Add(0)
-	}
-	for _, outcome := range tenantSeccompCensusOutcomes {
-		tenantSeccompCensusTotal.WithLabelValues(outcome).Add(0)
-	}
-	for _, outcome := range projidAuditOutcomes {
-		volumeProjidAuditTotal.WithLabelValues(outcome.label()).Add(0)
-	}
-	for _, outcome := range []string{"busy", "inhibited", "shared", "below_threshold", "removed", "error", "panic"} {
-		imageGCTotal.WithLabelValues(outcome).Add(0)
-	}
-	for _, branch := range []string{"committed_target", "deploying_target", "cleanup_source", "source_only"} {
-		maintenanceReadinessPendingTotal.WithLabelValues(branch).Add(0)
-	}
-	for _, outcome := range []string{"removed", "absent", "in_use", "tenant_active", "tenant_busy", "error", "list_error", "budget_exhausted"} {
-		networkReclamationTotal.WithLabelValues(outcome).Add(0)
-	}
-	for _, receipt := range []terminalReceiptKind{terminalReceiptClosed, terminalReceiptFailed} {
+	for _, receipt := range terminalReceiptKinds {
 		terminalSubstratePendingContainers.WithLabelValues(string(receipt)).Set(0)
-		terminalSubstrateCleanupRetriesTotal.WithLabelValues(string(receipt)).Add(0)
-	}
-	for _, kind := range []shared.OperationIntentKind{shared.OperationIntentProvision, shared.OperationIntentRestore} {
-		operationIntentRecoveryCleanupRetriesTotal.WithLabelValues(string(kind)).Add(0)
-	}
-	for _, reason := range operationRecoveryTimeoutReasons {
-		operationIntentRecoveryTimeoutExhaustionsTotal.WithLabelValues(reason).Add(0)
-	}
-	// Pre-init both reindex-trigger series to 0, mirroring the orphan-skip pre-init.
-	for _, tr := range reindexTriggers {
-		retentionIndexReindexTotal.WithLabelValues(tr).Add(0)
-	}
-	// Pre-init both restore-outcome series to 0 (ENG-408) so the docker-backend restore
-	// success rate reads 0, not no-data, before the first restore.
-	for _, oc := range restoreOutcomes {
-		restoresTotal.WithLabelValues(oc).Add(0)
-	}
-	// Pre-init the quota-backfill outcomes to 0 (ENG-454).
-	for _, oc := range quotaBackfillOutcomes {
-		volumeQuotaBackfillTotal.WithLabelValues(oc).Add(0)
-	}
-	// Pre-init the reap-skip reasons to 0 (ENG-659). A provider that never skips would
-	// otherwise export nothing, and "no-data" is indistinguishable from "healthy" in the
-	// alert that watches the fail-safe reason.
-	for _, r := range reapSkipReasons {
-		retentionReapSkipsTotal.WithLabelValues(r).Add(0)
-	}
-	// Pre-init both sweep outcomes to 0 (ENG-680). The liveness alert reads the SUM across
-	// outcomes, so a provider between process start and its first sweep tick (up to
-	// retention_reap_interval, an hour by default) would otherwise export no series at all
-	// — and increase() over an absent series is no-data, not zero.
-	for _, oc := range sweepOutcomes {
-		retentionSweepTotal.WithLabelValues(oc).Add(0)
-	}
-	// Pre-init the accounting-refresh failure counter (ENG-680) so "never failed" reads as
-	// 0 rather than no-data — the same reason the reap-skip reasons above are pre-inited.
-	retentionAccountingRefreshFailedTotal.Add(0)
-	// Pre-init every destroy-refusal series to 0 (ENG-658). A refusal is rare by
-	// design, so without this the alert that watches the fail-safe reason cannot tell
-	// "never refused" from "not reporting".
-	for _, s := range destroySites {
-		for _, r := range destroyRefusedReasons {
-			volumeDestroyRefusedTotal.WithLabelValues(s, r).Add(0)
-		}
-	}
-	// Pre-init every teardown-fallback series to 0 (ENG-647). A provider whose compose
-	// Down never fails would otherwise export nothing, and "no-data" is indistinguishable
-	// from "healthy" in the alert that watches outcome="failed".
-	for _, op := range teardownOperations {
-		for _, oc := range teardownOutcomes {
-			teardownFallbackTotal.WithLabelValues(op, oc).Add(0)
-		}
-	}
-	// Pre-init the partition-collapse reasons, refuse scopes, and cap-check series
-	// to 0 so absence/ratio alert queries return 0, not no-data, before the first
-	// close.
-	for _, r := range shared.PartitionCollapseReasons {
-		retentionPartitionCollapsedTotal.WithLabelValues(r).Add(0)
-	}
-	for _, s := range refuseScopes {
-		retentionRefusedByScopeTotal.WithLabelValues(s).Add(0)
-	}
-	for _, c := range capChecks {
-		retentionCapCheckFailedTotal.WithLabelValues(c).Add(0)
-	}
-	for _, site := range treeRemovalSites {
-		treeRemovalCutsTotal.WithLabelValues(site).Add(0)
-		for _, outcome := range treeRemovalOutcomes {
-			treeRemovalsTotal.WithLabelValues(site, outcome).Add(0)
-		}
-	}
-	for _, outcome := range volumeDeleteOutcomes {
-		volumeDeleteOutcomesTotal.WithLabelValues(outcome).Add(0)
 	}
 	for _, phase := range volumeDeleteHoldPhases {
 		volumeDeleteHolds.WithLabelValues(phase).Set(0)
 	}
-	// Pre-init the two unlabeled partition counters to 0 so a stamp/eviction-rate
-	// query reads 0, not no-data, before the first event. Their increments are
-	// wired at the close path (stamped) and the L2 eviction pass (evicted) in the
-	// close-path restructure that follows this commit.
-	retentionPartitionStampedTotal.Add(0)
-	retentionPartitionEvictedTotal.Add(0)
 }
 
 const bytesPerMiB = 1 << 20

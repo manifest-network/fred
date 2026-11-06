@@ -289,7 +289,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 			)
 		}
 
-		readinessBranch := "source_only"
+		readinessBranch := readinessSourceOnly
 		_, recoveryErr := b.recoveryCoordinator.WithLease(
 			ctx, snapshot.LeaseUUID(),
 			func(recoveryScope shared.LeaseRecoveryScope) error {
@@ -321,7 +321,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 
 				switch {
 				case targetFound && targetRelease.Status == "active":
-					readinessBranch = "committed_target"
+					readinessBranch = readinessCommittedTarget
 					active, proofErr := b.maintenanceSettlement.ProveMaintenanceActive(intent)
 					if proofErr != nil {
 						return fmt.Errorf("prove committed maintenance target: %w", proofErr)
@@ -375,7 +375,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 					return nil
 
 				case targetFound && (targetRelease.Status == "deploying" || targetRelease.Status == "failed"):
-					readinessBranch = "deploying_target"
+					readinessBranch = readinessDeployingTarget
 					if verifyErr := b.verifyMaintenanceSourceActive(intent); verifyErr != nil {
 						return verifyErr
 					}
@@ -460,7 +460,7 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 						return nil
 					}
 
-					readinessBranch = "cleanup_source"
+					readinessBranch = readinessCleanupSource
 					var physical shared.MaintenanceExecutionOutcome
 					var cleanupErr error
 					if compensationPending && targetRelease.Status == "deploying" {

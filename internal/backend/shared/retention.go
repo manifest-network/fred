@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"slices"
 	"strings"
@@ -444,10 +445,35 @@ func validateRetentionSourceAuthorityForBinding(entry *RetentionEntry) error {
 type RetentionStoreConfig struct {
 	DBPath string
 	// OnReindex (nil-safe) fires after each index build with record count, duration, and
-	// trigger ("open"|"manual"). A callback (not a metrics import) so this package stays
+	// trigger. A callback (not a metrics import) so this package stays
 	// free of internal/metrics — mirrors boltStore.startCleanup's onPanic seam.
-	OnReindex func(count int, dur time.Duration, trigger string)
+	OnReindex func(count int, dur time.Duration, trigger RetentionReindexTrigger)
 }
+
+// RetentionReindexTrigger is why the retention index was (re)built.
+type RetentionReindexTrigger uint8
+
+const (
+	// RetentionReindexOpen is the build every store open runs.
+	RetentionReindexOpen RetentionReindexTrigger = iota + 1
+	// RetentionReindexManual is an explicit ReIndex self-heal.
+	RetentionReindexManual
+)
+
+// String is the trigger's metric label.
+func (t RetentionReindexTrigger) String() string {
+	switch t {
+	case RetentionReindexOpen:
+		return "open"
+	case RetentionReindexManual:
+		return "manual"
+	default:
+		return ""
+	}
+}
+
+// LogValue logs the trigger by its label.
+func (t RetentionReindexTrigger) LogValue() slog.Value { return slog.StringValue(t.String()) }
 
 // RetentionStore persists soft-deleted lease data in bbolt. The `retention` bucket is
 // the single source of truth; byTenant/byStatus are a DERIVED in-memory index rebuilt
@@ -460,7 +486,7 @@ type RetentionStore struct {
 	mu        sync.RWMutex
 	byTenant  map[string]map[string]struct{} // tenant -> set of bbolt bucket keys (the authoritative lease UUID; see scanIndex/indexApply)
 	byStatus  map[string]map[string]struct{} // status -> set of bbolt bucket keys (the authoritative lease UUID; see scanIndex/indexApply)
-	onReindex func(count int, dur time.Duration, trigger string)
+	onReindex func(count int, dur time.Duration, trigger RetentionReindexTrigger)
 }
 
 // OpenIdentityBoundRetentionStore opens an initialized authoritative
@@ -517,7 +543,7 @@ func newRetentionStore(
 		return nil, fmt.Errorf("failed to build retention index: %w", err)
 	}
 	s.byTenant, s.byStatus = byTenant, byStatus
-	s.fireReindex(count, time.Since(start), "open")
+	s.fireReindex(count, time.Since(start), RetentionReindexOpen)
 	return s, nil
 }
 
@@ -874,7 +900,7 @@ func VerifyRetentionStoreStorage(dbPath string, storage backendidentity.Verified
 	)
 }
 
-func (s *RetentionStore) fireReindex(count int, dur time.Duration, trigger string) {
+func (s *RetentionStore) fireReindex(count int, dur time.Duration, trigger RetentionReindexTrigger) {
 	if s.onReindex != nil {
 		s.onReindex(count, dur, trigger)
 	}
@@ -897,7 +923,7 @@ func (s *RetentionStore) ReIndex() error {
 	}
 	s.byTenant, s.byStatus = byTenant, byStatus
 	s.mu.Unlock()
-	s.fireReindex(count, time.Since(start), "manual")
+	s.fireReindex(count, time.Since(start), RetentionReindexManual)
 	return nil
 }
 

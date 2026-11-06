@@ -144,7 +144,7 @@ func TestRefreshRetentionAccounting_StoreError_KeepsLastValueAndCounts(t *testin
 // first sweep tick (an hour at the default cadence) would otherwise be indistinguishable
 // from one whose sweep has stalled. That ambiguity is ENG-680 in miniature.
 func TestRetentionSweepMetrics_PreInitialized(t *testing.T) {
-	assert.Equal(t, len(sweepOutcomes), testutil.CollectAndCount(retentionSweepTotal),
+	assert.Equal(t, 2, testutil.CollectAndCount(retentionSweepTotal),
 		"every sweep outcome must export a series before the first sweep runs")
 	assert.Equal(t, 1, testutil.CollectAndCount(retentionAccountingRefreshFailedTotal))
 }

@@ -1286,7 +1286,7 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 			if adoptErr != nil {
 				return "", adoptErr
 			}
-			idempotentOpsTotal.WithLabelValues("create", "already_exists").Inc()
+			idempotentOps.createAlreadyExists.Inc()
 			return id, nil
 		}
 
@@ -1564,7 +1564,7 @@ func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) 
 	})
 	if err != nil {
 		if client.IsErrNotFound(err) {
-			idempotentOpsTotal.WithLabelValues("remove", "not_found").Inc()
+			idempotentOps.removeNotFound.Inc()
 			return nil
 		}
 		if isRemovalInProgress(err) {
@@ -1575,7 +1575,7 @@ func (d *DockerClient) RemoveContainer(ctx context.Context, containerID string) 
 				containerRemovalWaitFailuresTotal.Inc()
 				return fmt.Errorf("failed to remove container: wait after in-progress conflict failed: %w", waitErr)
 			}
-			idempotentOpsTotal.WithLabelValues("remove", "in_progress").Inc()
+			idempotentOps.removeInProgress.Inc()
 			return nil
 		}
 		return fmt.Errorf("failed to remove container: %w", err)

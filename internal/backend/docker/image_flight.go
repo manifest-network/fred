@@ -220,7 +220,7 @@ func (l *imageFlightLeader) run(work func(context.Context) imageFlightOutcome) {
 	outcome := imageFlightOutcome(imageFlightFailure{err: errors.New("image preparation ended without completion")})
 	defer func() {
 		if value := recover(); value != nil {
-			leaseWorkerPanicsTotal.WithLabelValues("image_flight").Inc()
+			imageFlightPanics.Inc()
 			slog.Error("image preparation worker panicked", "backend", l.state.manager.cfg.Name, "panic", value)
 			outcome = imageFlightFailure{err: fmt.Errorf("image preparation panicked: %v", value)}
 		}

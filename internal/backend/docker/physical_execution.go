@@ -874,7 +874,7 @@ func (b *Backend) executeRestorePhysicalOutcome(
 		if err != nil {
 			return mustRestoreAmbiguous(err, claim)
 		}
-		restoresTotal.WithLabelValues("success").Inc()
+		restoreOutcomes.success.Inc()
 		restoreDurationSeconds.Observe(time.Since(startedAt).Seconds())
 		return result
 	case shared.OperationExecutionFailure:
@@ -901,7 +901,7 @@ func (b *Backend) executeRestorePhysicalOutcome(
 		if err != nil {
 			return mustRestoreAmbiguous(err, claim)
 		}
-		restoresTotal.WithLabelValues("failure").Inc()
+		restoreOutcomes.failure.Inc()
 		return wrapped
 	case shared.OperationExecutionAmbiguous:
 		return mustRestoreAmbiguous(outcome.Cause(), claim)

@@ -30,9 +30,11 @@ func assertDemoteRefused(t *testing.T, backendKind, reason string, fn func()) {
 // gateBackend builds a Backend whose volumes mock returns a fixed usage.
 func gateBackend(usage int64, usageErr error) *Backend {
 	b := newBackendForTest(&mockDockerClient{}, nil) // cfg.SKUProfiles = defaultTestSKUProfiles()
-	b.volumes = &mockVolumeManager{
+	volumes := &mockVolumeManager{
 		UsageFn: func(context.Context, string) (int64, error) { return usage, usageErr },
 	}
+	b.volumes = volumes
+	b.restoreDemoteRefusals = bindRestoreDemoteRefusals(volumes.Kind())
 	return b
 }
 

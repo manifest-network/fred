@@ -1190,7 +1190,7 @@ stateDiagram-v2
     Deprovisioning --> [*]
 ```
 
-The edges above are the complete `Permit` set except twelve recovery-only edges on the `MaintenanceRecovered*` events (two each from `Ready` and `Failed`, four each from `Restarting` and `Updating`). Only the `NewMaintenanceRecovered*Msg` constructors can fire those, and no production code calls them: maintenance recovery instead rewrites the projection without an actor (see [State Recovery](#state-recovery)). `Deprovisioning` has no outgoing transition; the actor exits once teardown completes. Any other event against a source state is either ignored (see below) or rejected as an invalid trigger. The authoritative source is `internal/backend/shared/leasesm/lease_sm.go`.
+The edges above are the complete `Permit` set except twelve recovery-only edges on the `MaintenanceRecovered*` events (two each from `Ready` and `Failed`, four each from `Restarting` and `Updating`). Only the `NewMaintenanceRecovered*Msg` constructors can fire those, and no production code calls them: maintenance recovery instead rewrites the projection without an actor (see [State Recovery](#state-recovery)). `Deprovisioning` has no outgoing transition; the actor exits once teardown completes. Any other event against a source state is either ignored (see below) or rejected as an invalid trigger. The authoritative edge list is `leaseTransitions` in `internal/backend/shared/leasesm/transitions.go`, which configures the machine; entry and exit actions and ignored events are in `lease_sm.go`.
 
 ### Key behaviors
 
@@ -1239,7 +1239,7 @@ and bind preparation/chown. `compose_up` covers protected container create/start
 and launch-receipt settlement. Source compensation is outside this histogram;
 these phases do not measure the full wall time of a failed replacement.
 
-- `fred_docker_backend_lease_sm_transitions_total{from,to,event}` — every transition.
+- `fred_docker_backend_lease_sm_transitions_total{from,to,event}` — every transition. Each legal edge, declared once in `leasesm`'s `leaseTransitions`, has its series from startup.
 - `fred_docker_backend_lease_actors_created_total` — cumulative actor count; should track distinct leases (recycled UUIDs after Deprovision produce a fresh actor, so this counter grows faster than the live-actor count).
 - `fred_docker_backend_lease_actor_stuck_seconds` — age of the oldest in-flight actor handler. Alert threshold should exceed the longest legitimate operation (Deprovision can hold an actor for minutes during container/volume cleanup).
 - `fred_docker_backend_lease_actor_inbox_depth` — histogram of per-actor inbox depth; p99 near 0 is healthy.
@@ -1293,7 +1293,7 @@ these phases do not measure the full wall time of a failed replacement.
 - `fred_docker_backend_runtime_shared_network_leases` — leases with a container on a Docker network shared with another lease's container, from the same reads
 - `fred_docker_backend_runtime_inventory_total{outcome}` — periodic inventory passes behind those two gauges, `ok` or `error`; a failed pass keeps the last completed values pass.
 - `fred_docker_backend_runtime_refresh_total{outcome}` — final per-lease outcome of each runtime refresh run: `refreshed`, `failed`, or `skipped`.
-- `fred_docker_backend_network_reclamation_total{outcome}` — network candidates classified as `removed`, `absent`, `in_use`, `lease_active`, `lease_busy`, or `tenant_active`, plus candidate `error`, pass `list_error`, and pass `budget_exhausted` outcomes. Only `removed` counts a successful Docker removal. A bounded pass can leave a backlog for later passes without failing state or operation recovery; shutdown cancellation does not count as an operational error.
+- `fred_docker_backend_network_reclamation_total{outcome}` — network candidates classified as `removed`, `absent`, `in_use`, `lease_active`, `lease_busy`, `tenant_active`, or `tenant_busy`, plus candidate `error`, pass `list_error`, and pass `budget_exhausted` outcomes. Only `removed` counts a successful Docker removal. A bounded pass can leave a backlog for later passes without failing state or operation recovery; shutdown cancellation does not count as an operational error.
 
 ## State Recovery
 

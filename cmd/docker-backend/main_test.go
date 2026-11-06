@@ -1892,7 +1892,7 @@ func TestHMACMiddleware_RejectsCrossPathReplay(t *testing.T) {
 // check. Wrapping the middleware around a permissive next-handler
 // proves the property the test cares about.
 func TestHMACMiddleware_RejectsCrossMethodReplay(t *testing.T) {
-	mw := hmacAuthMiddleware(testRequestKeys, slog.Default(), docker.DefaultMaxRequestBodySize)
+	mw := newHMACAuthMiddleware(testRequestKeys, slog.Default(), docker.DefaultMaxRequestBodySize)
 	authed := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))

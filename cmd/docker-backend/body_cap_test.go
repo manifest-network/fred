@@ -24,7 +24,7 @@ import (
 func TestHMACMiddleware_EnforcesConfiguredBodyCap(t *testing.T) {
 	send := func(t *testing.T, capBytes, bodyLen int64) int {
 		t.Helper()
-		mw := hmacAuthMiddleware(testRequestKeys, slog.Default(), capBytes)
+		mw := newHMACAuthMiddleware(testRequestKeys, slog.Default(), capBytes)
 		h := mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
 		req := httptest.NewRequest(http.MethodPost, "/provision", bytes.NewReader(make([]byte, bodyLen)))
 		req.Header.Set(hmacauth.SignatureHeader, "present-but-invalid") // non-empty → reaches the body read

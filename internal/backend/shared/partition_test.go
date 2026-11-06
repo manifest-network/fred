@@ -85,7 +85,7 @@ func TestExtractPartition(t *testing.T) {
 		src        PartitionSource
 		in         PartitionInputs
 		wantPart   string
-		wantReason string
+		wantReason PartitionCollapseReason
 	}{
 		{name: "source none", src: PartitionSource{Kind: PartitionSourceNone},
 			in: PartitionInputs{Manifest: stackWith(map[string]map[string]string{"app": {"com.example.customer": "c1"}})}},

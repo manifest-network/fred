@@ -13,6 +13,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
@@ -696,19 +698,19 @@ func (o deleteStageOutcome) heldResidual() bool {
 	return o.kind == deleteStageHeld && o.phase.residual()
 }
 
-// outcomeLabel is the volume_delete_outcomes_total label of the outcome.
-func (o deleteStageOutcome) outcomeLabel() string {
+// counter is the outcome's volume_delete_outcomes_total series.
+func (o deleteStageOutcome) counter() prometheus.Counter {
 	switch {
 	case o.kind == deleteStageCompleted:
-		return volumeDeleteOutcomeCompleted
+		return volumeDeleteOutcomes.completed
 	case o.kind == deleteStageHeld && o.phase.kind == holdPhaseResidual:
-		return volumeDeleteOutcomeHeldResidual
+		return volumeDeleteOutcomes.heldResidual
 	case o.kind == deleteStageHeld && o.phase.kind == holdPhaseUnsized:
-		return volumeDeleteOutcomeHeldUnsized
+		return volumeDeleteOutcomes.heldUnsized
 	case o.kind == deleteStageHeld:
-		return volumeDeleteOutcomeHeldRemoval
+		return volumeDeleteOutcomes.heldRemoval
 	default:
-		return volumeDeleteOutcomeLatched
+		return volumeDeleteOutcomes.latched
 	}
 }
 
@@ -784,7 +786,7 @@ func (x *xfsVolumeManager) recordXFSDeleteStageOutcome(
 	x.mu.Unlock()
 
 	if attempted {
-		volumeDeleteOutcomesTotal.WithLabelValues(outcome.outcomeLabel()).Inc()
+		outcome.counter().Inc()
 	}
 	switch outcome.kind {
 	case deleteStageCompleted:

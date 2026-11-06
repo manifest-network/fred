@@ -163,7 +163,10 @@ type Backend struct {
 	compose composeReader
 	pool    *shared.ResourcePool
 	volumes volumeReader
-	logger  *slog.Logger
+	// restoreDemoteRefusals is restore_demote_refused_total for the
+	// configured volume backend, bound by New (ENG-438).
+	restoreDemoteRefusals restoreDemoteRefusalCounters
+	logger                *slog.Logger
 	// backgroundMaintenance exposes only complete convergence workflows. Raw
 	// Docker, Compose, and volume writers are captured by its constructor and
 	// cannot be recovered from Backend or targeted by request handlers.
@@ -2429,8 +2432,10 @@ func newBackend(
 
 	retentionStore, err := shared.OpenIdentityBoundRetentionStore(shared.RetentionStoreConfig{
 		DBPath: cfg.RetentionDBPath,
-		OnReindex: func(count int, dur time.Duration, trigger string) {
-			retentionIndexReindexTotal.WithLabelValues(trigger).Inc()
+		OnReindex: func(count int, dur time.Duration, trigger shared.RetentionReindexTrigger) {
+			if counter, ok := retentionReindexes.of(trigger); ok {
+				counter.Inc()
+			}
 			logger.Info("retention index rebuilt", "records", count, "duration", dur, "trigger", trigger)
 		},
 	}, storage, storeAuthorityGate)
@@ -2503,6 +2508,7 @@ func newBackend(
 		compose:                         projectComposeRead(composeSvc),
 		pool:                            pool,
 		volumes:                         projectVolumeRead(volumes),
+		restoreDemoteRefusals:           bindRestoreDemoteRefusals(volumes.Kind()),
 		logger:                          logger.With("backend", cfg.Name),
 		partitionSource:                 partitionSource,
 		provisions:                      make(map[string]*provision),
@@ -2537,13 +2543,6 @@ func newBackend(
 			_ = docker.Close()
 		}
 	}()
-
-	// Pre-initialize the orphan-skip counter series to 0 (ENG-370): the reason
-	// set is closed and known, so alert queries see 0 instead of no-data before
-	// the first skip event.
-	for _, r := range orphanSkipReasons {
-		retentionOrphanSkipsTotal.WithLabelValues(r).Add(0)
-	}
 
 	b.storageVerifier = productionDockerStorageIdentityVerifier{backend: b, authority: storage}
 	b.failureDiagnostics, err = shared.NewFailureDiagnostics(diagStore, operationSettlement, maintenanceSettlement)
@@ -2633,9 +2632,7 @@ func newBackend(
 		Secret:          string(cfg.CallbackSecret),
 		Logger:          b.logger,
 
-		OnDelivery: func(outcome string) {
-			callbackDeliveryTotal.WithLabelValues(outcome).Inc()
-		},
+		OnDelivery: callbackDeliveries.record,
 		OnStoreError: func() {
 			callbackStoreErrorsTotal.Inc()
 		},

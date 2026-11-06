@@ -92,18 +92,6 @@ const (
 	containerEventStreamExited    = "exited"
 )
 
-var containerEventStreamOutcomes = []string{
-	containerEventStreamConnected, containerEventStreamReconnect, containerEventStreamExited,
-}
-
-// dieEventSourceEventLoop labels the event loop's deaths in
-// fred_docker_backend_die_event_dropped_total.
-const dieEventSourceEventLoop = "event_loop"
-
-// eventLoopDeathsDropped is the event loop's series of that counter, resolved
-// once so that counting a drop is one atomic add, with no label lookup.
-var eventLoopDeathsDropped = dieEventDroppedTotal.WithLabelValues(dieEventSourceEventLoop)
-
 // containerEventLoop subscribes to the Docker container events that matter to
 // leases and dispatches every death to its lease actor; see the file comment.
 func (b *Backend) containerEventLoop() {
@@ -134,7 +122,7 @@ func (b *Backend) runContainerEventLoop(retryInitial, retryMax time.Duration) {
 		stopReporting()
 		reporter.Wait()
 		containerDeathQueueDepth.Set(0)
-		containerEventStreamTotal.WithLabelValues(containerEventStreamExited).Inc()
+		containerEventStreams.exited.Inc()
 	}()
 
 	retry := retryInitial
@@ -146,7 +134,7 @@ func (b *Backend) runContainerEventLoop(retryInitial, retryMax time.Duration) {
 			b.logger.Warn("container event stream not connected: backend storage identity unverified; retrying",
 				"error", err, "retry_in", retry)
 		} else {
-			containerEventStreamTotal.WithLabelValues(containerEventStreamConnected).Inc()
+			containerEventStreams.connected.Inc()
 			delivered, err := b.consumeContainerEventSubscription(subscriptions, overflow)
 			if delivered {
 				retry = retryInitial
@@ -159,7 +147,7 @@ func (b *Backend) runContainerEventLoop(retryInitial, retryMax time.Duration) {
 				break
 			}
 		}
-		containerEventStreamTotal.WithLabelValues(containerEventStreamReconnect).Inc()
+		containerEventStreams.reconnect.Inc()
 		select {
 		case <-b.stopCtx.Done():
 		case <-time.After(retry):
@@ -301,7 +289,7 @@ func (b *Backend) dispatchLiveContainerDeath(death failurecause.Provenance) {
 		return
 	}
 	if err := b.verifyContainerEventAuthority(); err != nil {
-		eventLoopDeathsDropped.Inc()
+		deathSourceEventLoop.dropped.Inc()
 		b.logger.Error("container death dropped: backend storage identity unverified; the reconcile sweep will find it, unattributed",
 			"container_id", leasesm.ShortID(containerID), "error", err)
 		return
@@ -333,7 +321,7 @@ func (b *Backend) dispatchLiveContainerDeath(death failurecause.Provenance) {
 		b.logger.Error("invalid container event ignored", "error", err)
 		return
 	}
-	b.dispatchContainerDeathObservation(observation, containerID, dieEventSourceEventLoop)
+	b.dispatchContainerDeathObservation(observation, containerID, deathSourceEventLoop)
 }
 
 // redispatchStartupDeaths hands the recorded live deaths of a new Ready
