@@ -248,7 +248,7 @@ func bindLifecycleCallbackVerdicts(outcome string) LifecycleCallbackVerdictCount
 
 // bindCallbackStatuses binds the one remaining status label of a curried vec.
 func bindCallbackStatuses(vec *prometheus.CounterVec) CallbackStatusCounters {
-	return CallbackStatusCounters{
+	return CallbackStatusCounters{ //exhaustruct:enforce
 		Success:       vec.WithLabelValues(callbackStatusSuccess),
 		Failed:        vec.WithLabelValues(callbackStatusFailed),
 		Deprovisioned: vec.WithLabelValues(callbackStatusDeprovisioned),
@@ -581,9 +581,39 @@ var backendSeries = struct {
 	byName map[string]BackendSeries
 }{byName: make(map[string]BackendSeries)}
 
-// unconfiguredBackend holds the series an event counts under when it names a
-// backend nothing bound, so a lookup never creates a series.
-var unconfiguredBackend = bindBackend("unconfigured")
+// unboundBackend is what ForBackend returns for a name nothing bound: every
+// counter is fred_backend_unbound_events_total, so a lookup never creates a
+// series and never attributes an event to a backend label a real backend
+// could have.
+var unboundBackend = backendSeriesOf(unboundBackendEventsTotal)
+
+// backendSeriesOf is a BackendSeries whose every counter is counter.
+func backendSeriesOf(counter prometheus.Counter) BackendSeries {
+	outcomes := ProvisioningOutcomeCounters{ //exhaustruct:enforce
+		Success: counter, Failed: counter, Error: counter,
+	}
+	return BackendSeries{ //exhaustruct:enforce
+		Provisioning: ProvisioningCounters{ //exhaustruct:enforce
+			Provision: outcomes, Restore: outcomes,
+		},
+		ReconcileFetch: BackendFetchCounters{ //exhaustruct:enforce
+			OK: counter, Error: counter, CircuitOpen: counter, Fenced: counter,
+		},
+		Inventory: BackendInventoryCounters{ //exhaustruct:enforce
+			Authoritative: counter, Partial: counter, Untrusted: counter, ProvisionsOnly: counter,
+			RetentionsOnly: counter, Unanswered: counter, Fenced: counter,
+		},
+		InsufficientResources: CapacityVerdictCounters{ //exhaustruct:enforce
+			CodedRefusal: counter, Ambiguous: counter,
+		},
+		CallbackSignatureKey: CallbackKeySlotCounters{ //exhaustruct:enforce
+			Current: counter, Previous: counter,
+		},
+		NonInFlightCallbacks: CallbackStatusCounters{ //exhaustruct:enforce
+			Success: counter, Failed: counter, Deprovisioned: counter,
+		},
+	}
+}
 
 // BindBackends creates every backend-labeled series of each named backend.
 // providerd binds a backend when it builds that backend's client, before
@@ -600,20 +630,20 @@ func BindBackends(names ...string) {
 }
 
 // ForBackend returns the series BindBackends created for a backend. It never
-// creates one: an event naming a backend nothing bound counts under
-// backend="unconfigured", whose series exist from startup.
+// creates one: an event naming a backend nothing bound counts in
+// fred_backend_unbound_events_total, which exists from startup.
 func ForBackend(name string) BackendSeries {
 	backendSeries.RLock()
 	defer backendSeries.RUnlock()
 	if series, ok := backendSeries.byName[name]; ok {
 		return series
 	}
-	return unconfiguredBackend
+	return unboundBackend
 }
 
 func bindBackend(name string) BackendSeries {
 	provisioning := func(operation string) ProvisioningOutcomeCounters {
-		return ProvisioningOutcomeCounters{
+		return ProvisioningOutcomeCounters{ //exhaustruct:enforce
 			Success: provisioningTotal.WithLabelValues(OutcomeSuccess, name, operation),
 			Failed:  provisioningTotal.WithLabelValues(OutcomeFailed, name, operation),
 			Error:   provisioningTotal.WithLabelValues(OutcomeError, name, operation),
@@ -625,16 +655,16 @@ func bindBackend(name string) BackendSeries {
 	inventory := func(outcome string) prometheus.Counter {
 		return reconcilerBackendInventoryTotal.WithLabelValues(name, outcome)
 	}
-	return BackendSeries{
-		Provisioning: ProvisioningCounters{
+	return BackendSeries{ //exhaustruct:enforce
+		Provisioning: ProvisioningCounters{ //exhaustruct:enforce
 			Provision: provisioning(OperationProvision),
 			Restore:   provisioning(OperationRestore),
 		},
-		ReconcileFetch: BackendFetchCounters{
+		ReconcileFetch: BackendFetchCounters{ //exhaustruct:enforce
 			OK: fetch(FetchOutcomeOK), Error: fetch(FetchOutcomeError),
 			CircuitOpen: fetch(FetchOutcomeCircuitOpen), Fenced: fetch(FetchOutcomeFenced),
 		},
-		Inventory: BackendInventoryCounters{
+		Inventory: BackendInventoryCounters{ //exhaustruct:enforce
 			Authoritative:  inventory(InventoryOutcomeAuthoritative),
 			Partial:        inventory(InventoryOutcomePartial),
 			Untrusted:      inventory(InventoryOutcomeUntrusted),
@@ -643,11 +673,11 @@ func bindBackend(name string) BackendSeries {
 			Unanswered:     inventory(InventoryOutcomeUnanswered),
 			Fenced:         inventory(InventoryOutcomeFenced),
 		},
-		InsufficientResources: CapacityVerdictCounters{
+		InsufficientResources: CapacityVerdictCounters{ //exhaustruct:enforce
 			CodedRefusal: backendInsufficientResourcesTotal.WithLabelValues(name, CapacityVerdictCodedRefusal),
 			Ambiguous:    backendInsufficientResourcesTotal.WithLabelValues(name, CapacityVerdictAmbiguous),
 		},
-		CallbackSignatureKey: CallbackKeySlotCounters{
+		CallbackSignatureKey: CallbackKeySlotCounters{ //exhaustruct:enforce
 			Current:  apiCallbackSignatureKeyTotal.WithLabelValues(name, CallbackKeySlotCurrent),
 			Previous: apiCallbackSignatureKeyTotal.WithLabelValues(name, CallbackKeySlotPrevious),
 		},

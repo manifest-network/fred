@@ -527,6 +527,18 @@ var (
 		Help:      "Total number of backend provision or restore capacity responses by contract verdict",
 	}, []string{"backend", "verdict"})
 
+	// unboundBackendEventsTotal counts events recorded for a backend name that
+	// nothing bound. ForBackend never creates a series, so such an event is
+	// counted here instead of under a backend label it could share with a real
+	// backend. Any increase is a bug: a component recorded for a backend before,
+	// or without, binding it.
+	unboundBackendEventsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "backend",
+		Name:      "unbound_events_total",
+		Help:      "Events recorded for a backend name providerd never bound; any increase is a bug",
+	})
+
 	// backendMalformedErrorBodyTotal counts client-error responses whose body was
 	// not the declared JSON error envelope, so fred answered the tenant with a
 	// generic message instead of the backend's diagnostic. A non-zero rate means

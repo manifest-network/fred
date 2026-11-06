@@ -1,12 +1,18 @@
 package background
 
 import (
+	"os"
+	"os/exec"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// collectorsFreshProcess marks the child process that runs
+// TestCollectorsAreLazyAndKeepTheirNames's assertions.
+const collectorsFreshProcess = "FRED_TEST_BACKGROUND_FRESH_PROCESS"
 
 // collectors is every collector this package declares. The point of the package
 // is that this list stays small and stays labelled, so it is spelled out rather
@@ -32,7 +38,18 @@ func collectors() []prometheus.Collector {
 // The names are the contract. Both are consumed by name in OPERATIONS.md and in
 // manifest-deploy alert rules, and both are emitted by more than one binary, so
 // a rename here breaks two repos silently.
+// Writing cannot be undone within a process, so the assertions run in a fresh
+// test process each time.
 func TestCollectorsAreLazyAndKeepTheirNames(t *testing.T) {
+	if os.Getenv(collectorsFreshProcess) == "" {
+		command := exec.CommandContext(t.Context(), os.Args[0],
+			"-test.run=^TestCollectorsAreLazyAndKeepTheirNames$", "-test.count=1")
+		command.Env = append(os.Environ(), collectorsFreshProcess+"=1")
+		output, err := command.CombinedOutput()
+		require.NoError(t, err, "fresh process:\n%s", output)
+		return
+	}
+
 	reg := prometheus.NewPedanticRegistry()
 	for _, c := range collectors() {
 		require.NoError(t, reg.Register(c))
