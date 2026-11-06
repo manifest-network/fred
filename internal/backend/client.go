@@ -1068,6 +1068,13 @@ func isOperationCompletionPendingResponse(err error) bool {
 // one after the backend accepted the request.
 const CodeInsufficientResources = "insufficient_resources"
 
+// defaultRequestTimeout bounds a backend request when none is configured.
+const defaultRequestTimeout = 30 * time.Second
+
+// The default must leave a backend room to answer /deprovision: converting a
+// negative difference to uint64 does not compile.
+const _ = uint64(defaultRequestTimeout - DeprovisionResponseBudget - time.Nanosecond)
+
 // CodeCloseDeferred reports retryable lifecycle contention, never completed cleanup.
 const CodeCloseDeferred = "close_deferred"
 
@@ -1574,7 +1581,7 @@ func newHTTPWire(live *liveConnection, cfg HTTPClientOptions) *httpWire {
 		baseURL: live.baseURL,
 		secret:  live.secret,
 		httpClient: &http.Client{
-			Timeout:   cmp.Or(live.timeout, 30*time.Second),
+			Timeout:   cmp.Or(live.timeout, defaultRequestTimeout),
 			Transport: transport,
 			// HMAC and storage authority are bound to the original RequestURI.
 			// Following a redirect could replay a POST body onto an unsigned legacy
@@ -1816,6 +1823,8 @@ func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error)
 	switch {
 	case errors.Is(err, ErrBackendFenced):
 		status = "fenced"
+	case isLifecyclePendingResponse(err):
+		status = "pending"
 	case err != nil:
 		status = "error"
 	}

@@ -2,6 +2,7 @@ package leasesm
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -23,6 +24,7 @@ func validConstructionTestActorConfig(ctx context.Context, store LeaseProvisionS
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		StopCtx:        ctx,
 		WG:             &sync.WaitGroup{},
+		CloseTimeout:   testActorCloseTimeout,
 		Inspector:      &mockInstanceInspector{},
 		Diag:           &mockDiagnosticsGatherer{},
 		ProvisionStore: store,
@@ -91,6 +93,56 @@ func TestNewLeaseActorRejectsTypedNilCapabilityBeforeInstallation(t *testing.T) 
 	assert.False(t, installed, "invalid composition must not reach registry installation")
 }
 
+func TestNewLeaseActorRequiresACloseTimeout(t *testing.T) {
+	store := newMockProvisionStore()
+	cfg := validConstructionTestActorConfig(context.Background(), store)
+	cfg.CloseTimeout = 0
+	actor, err := NewLeaseActor(cfg, func(*LeaseActor) { t.Fatal("invalid composition reached registry installation") })
+	require.ErrorContains(t, err, "close timeout")
+	assert.Nil(t, actor)
+}
+
+// A close runs on the actor's lifetime, bounded by CloseTimeout. The command
+// carries no context, so no caller can cancel a teardown midway; only the
+// backend stopping does.
+func TestCloseRunsOnTheActorLifetime(t *testing.T) {
+	stop, stopBackend := context.WithCancel(t.Context())
+	defer stopBackend()
+	store := newMockProvisionStore()
+	store.put(testActorLeaseUUID, &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusReady})
+	const closeTimeout = time.Hour
+	teardown := make(chan context.Context, 1)
+	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+		StopCtx: stop, CloseTimeout: closeTimeout, ProvisionStore: store,
+		DoDeprovisionFn: func(ctx context.Context, _ ActorCloseScope) error {
+			teardown <- ctx
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+	command, reply := NewDeprovisionCommand()
+	started := time.Now()
+	go actor.handle(command.envelope.message)
+	var closeCtx context.Context
+	select {
+	case closeCtx = <-teardown:
+	case <-time.After(5 * time.Second):
+		t.Fatal("close did not reach teardown")
+	}
+	deadline, bounded := closeCtx.Deadline()
+	require.True(t, bounded, "a close attempt must be bounded")
+	assert.WithinDuration(t, started.Add(closeTimeout), deadline, time.Minute)
+	require.NoError(t, closeCtx.Err())
+
+	stopBackend()
+	select {
+	case err := <-reply.Result():
+		require.ErrorIs(t, err, context.Canceled, "the close ends with the backend's lifetime")
+	case <-time.After(5 * time.Second):
+		t.Fatal("close did not end with the backend's lifetime")
+	}
+}
+
 func TestActorCloseScopeIsExactAndCallbackLifetime(t *testing.T) {
 	_, _, releases := newTestOperationSuccess(t, testActorLeaseUUID, shared.OperationIntentProvision)
 	runtime, err := releases.ProveRuntimeGeneration(testActorLeaseUUID)
@@ -129,7 +181,7 @@ func TestActorCloseScopeIsExactAndCallbackLifetime(t *testing.T) {
 		},
 	})
 
-	require.NoError(t, actor.handleDeprovision(context.Background()))
+	require.NoError(t, actor.handleDeprovision())
 	assert.Nil(t, actor.activeClose.Load(), "completed close must clear its observational scope")
 	assert.False(t, actor.CloseOwnsObservation(observation))
 	assert.Empty(t, escaped.LeaseUUID())
@@ -156,7 +208,7 @@ func TestActorCloseScopeIsRevokedWhenCallbackPanics(t *testing.T) {
 
 	func() {
 		defer func() { require.Equal(t, "boom", recover()) }()
-		_ = actor.handleDeprovision(context.Background())
+		_ = actor.handleDeprovision()
 	}()
 	assert.Nil(t, actor.activeClose.Load(), "panicking close must clear its observational scope")
 	assert.Empty(t, escaped.LeaseUUID())
@@ -222,7 +274,6 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 	firstReply := make(chan error, 1)
 	requireAccepted(t, func() bool {
 		return actor.tryEnqueue(deprovisionMsg{
-			Ctx:   context.Background(),
 			Reply: firstReply,
 		})
 	})
@@ -241,7 +292,6 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 	})
 	requireAccepted(t, func() bool {
 		return actor.tryEnqueue(deprovisionMsg{
-			Ctx:   context.Background(),
 			Reply: queuedDeprovisionReply,
 		})
 	})
@@ -267,7 +317,11 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 	}
 
 	require.ErrorIs(t, <-queuedProvisionAck, errActorTerminated)
-	require.ErrorIs(t, <-queuedDeprovisionReply, errActorTerminated)
+	rejectedClose := <-queuedDeprovisionReply
+	require.True(t, IsRejectedByRetiringActor(rejectedClose),
+		"a close the retiring actor never handled can be routed to its replacement")
+	require.False(t, IsRejectedByRetiringActor(fmt.Errorf("wrapped: %w", rejectedClose)),
+		"only the reply itself proves the close never ran")
 	assert.False(t, queuedWorkRan.Load(),
 		"retirement must not execute queued caller work after the worker barrier")
 	assert.Equal(t, int32(1), finalizerCalls.Load(),

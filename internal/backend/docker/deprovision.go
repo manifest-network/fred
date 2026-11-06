@@ -22,23 +22,111 @@ import (
 // Routing forces a Ready/Failing/Failed → Deprovisioning SM transition whose
 // Failing.OnExit cancels the in-flight diag goroutine — the structural
 // suppression of stale Failed callbacks.
+//
+// The actor runs the close on its own lifetime, so ctx bounds only this call's
+// wait. When ctx ends first, Deprovision returns a closePending observation
+// and the close goes on. The command fence covers admission and routing only:
+// once the actor admits the close, the lease's durable close head refuses every
+// other mutation, so the fence need not outlive this wait.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	if err := b.requireMutationAdmission(ctx, "deprovision"); err != nil {
 		return fmt.Errorf("backend storage identity verification failed: %w", err)
 	}
-	unlockCommand := b.commandFence.Lock(leaseUUID)
+	unlockCommand, err := b.commandFence.LockContext(ctx, leaseUUID)
+	if err != nil {
+		return closePending{leaseUUID: leaseUUID}
+	}
 	defer unlockCommand()
 	if err := b.ensureCommittedRestoreDestinationForClose(leaseUUID); err != nil {
 		return err
 	}
-	command, reply, err := leasesm.NewDeprovisionCommand(ctx)
-	if err != nil {
-		return err
+	return b.closeThroughActor(ctx, leaseUUID)
+}
+
+// closeThroughActor routes one close to the lease's actor and waits for its
+// outcome. The caller holds the lease's command fence. A close rejected by a
+// retiring actor never ran, so it is routed again to the actor that replaces
+// it. When ctx ends before the outcome, the close keeps running on the actor's
+// lifetime and the result is closePending.
+func (b *Backend) closeThroughActor(ctx context.Context, leaseUUID string) error {
+	for {
+		command, reply := leasesm.NewDeprovisionCommand()
+		if err := b.routeToLeaseBlocking(ctx, leaseUUID, command); err != nil {
+			if ctx.Err() != nil {
+				return closePending{leaseUUID: leaseUUID}
+			}
+			return err
+		}
+		wait, err := b.awaitCloseReply(ctx, reply)
+		switch wait {
+		case closeWaitAnswered:
+			if leasesm.IsRejectedByRetiringActor(err) {
+				continue
+			}
+			return err
+		case closeWaitAbandoned:
+			return closePending{leaseUUID: leaseUUID}
+		default:
+			return errors.New("backend shutting down")
+		}
 	}
-	if err := b.routeToLeaseBlocking(ctx, leaseUUID, command); err != nil {
-		return err
+}
+
+// closeWait is how a wait for a close's answer ended. The zero value is none
+// of them.
+type closeWait uint8
+
+const (
+	// closeWaitAnswered: the actor answered; the error is its answer.
+	closeWaitAnswered closeWait = iota + 1
+	// closeWaitAbandoned: the caller's context ended first.
+	closeWaitAbandoned
+	// closeWaitStopping: the backend began stopping first.
+	closeWaitStopping
+)
+
+// awaitCloseReply waits for the actor's answer until ctx or the backend ends.
+// An answer that is already there wins over either ending.
+func (b *Backend) awaitCloseReply(ctx context.Context, reply leasesm.ActorReply) (closeWait, error) {
+	select {
+	case err := <-reply.Result():
+		return closeWaitAnswered, err
+	case <-ctx.Done():
+	case <-b.stopCtx.Done():
 	}
-	return b.waitForReply(ctx, reply.Result())
+	// A select picks at random among ready cases, so look for the answer on
+	// its own before reading which ending came.
+	select {
+	case err := <-reply.Result():
+		return closeWaitAnswered, err
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return closeWaitAbandoned, nil
+	default:
+		return closeWaitStopping, nil
+	}
+}
+
+// closePending reports that a caller stopped waiting before a close settled:
+// other lifecycle work still held the lease's command fence, or the actor had
+// not answered yet. A close the actor admitted keeps running on the actor's
+// lifetime. Only Deprovision and closeThroughActor mint it.
+type closePending struct{ leaseUUID string }
+
+func (pending closePending) Error() string {
+	return fmt.Sprintf("close of lease %q is still pending", pending.leaseUUID)
+}
+
+// IsLifecyclePending recognizes every observation of this backend that a
+// lifecycle request is still pending: journal contention, an actor worker still
+// draining, or a close whose caller stopped waiting before it settled. Each
+// grants a later retry, never a refusal or completion.
+func IsLifecyclePending(err error) bool {
+	var pending closePending
+	return shared.IsLifecyclePending(err) || leasesm.IsLifecyclePending(err) ||
+		(errors.As(err, &pending) && pending.leaseUUID != "")
 }
 
 // handoffCommittedRestoreToClose consumes a lingering restore finalizer only

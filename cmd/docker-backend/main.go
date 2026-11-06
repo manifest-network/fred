@@ -206,7 +206,7 @@ func main() {
 	httpServer := &http.Server{
 		Addr:         cfg.ListenAddr,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: serverWriteTimeout,
 		IdleTimeout:  120 * time.Second,
 		TLSConfig:    tlsServerConfig, // nil => plaintext HTTP
 	}
@@ -844,6 +844,13 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// serverWriteTimeout bounds every response. /deprovision answers within
+// backend.DeprovisionResponseBudget, which must leave room to write the
+// answer: converting a negative difference to uint64 does not compile.
+const serverWriteTimeout = 30 * time.Second
+
+const _ = uint64(serverWriteTimeout - backend.DeprovisionResponseBudget - time.Nanosecond)
+
 // DeprovisionRequest is the request body for /deprovision.
 type DeprovisionRequest struct {
 	LeaseUUID string `json:"lease_uuid"`
@@ -860,7 +867,11 @@ func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.backend.Deprovision(r.Context(), req.LeaseUUID); err != nil {
+	// The close runs on the backend's lifetime. This request only waits for it,
+	// and answers lifecycle_pending when the close outlasts the budget.
+	ctx, cancel := context.WithTimeout(r.Context(), backend.DeprovisionResponseBudget)
+	defer cancel()
+	if err := s.backend.Deprovision(ctx, req.LeaseUUID); err != nil {
 		if s.lifecyclePendingResponse(w, err) {
 			return
 		}

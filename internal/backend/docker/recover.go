@@ -381,14 +381,7 @@ func (b *Backend) resumeRecoveredCloseFenced(ctx context.Context, leaseUUID stri
 			current.LeaseUUID(), current.Backend(), current.BackendStorageID(), b.Name(), b.storageIdentity,
 		)
 	}
-	command, reply, commandErr := leasesm.NewDeprovisionCommand(ctx)
-	if commandErr != nil {
-		return fmt.Errorf("construct recovered close actor command: %w", commandErr)
-	}
-	if err := b.routeToLeaseBlocking(ctx, current.LeaseUUID(), command); err != nil {
-		return fmt.Errorf("route recovered close through lease actor: %w", err)
-	}
-	if err := b.waitForReply(ctx, reply.Result()); err != nil {
+	if err := b.closeThroughActor(ctx, current.LeaseUUID()); err != nil {
 		return fmt.Errorf("apply recovered close through lease actor: %w", err)
 	}
 	return nil

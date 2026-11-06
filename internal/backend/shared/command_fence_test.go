@@ -1,6 +1,8 @@
 package shared
 
 import (
+	"context"
+	"errors"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -99,6 +101,33 @@ func TestCommandFenceTryLockDefersBusyKeyWithoutLeakingReference(t *testing.T) {
 	tryUnlock()
 	if refs, entries := commandFenceRefs(&fence, "lease-a"); refs != 0 || entries != 0 {
 		t.Fatalf("TryLock unlock leaked state: refs=%d entries=%d", refs, entries)
+	}
+}
+
+func TestCommandFenceLockContextStopsWaitingWithoutLeakingReference(t *testing.T) {
+	var fence CommandFence
+	unlock := fence.Lock("lease-a")
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := fence.LockContext(ctx, "lease-a"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("LockContext on a held key returned %v, want the context's deadline", err)
+	}
+	if refs, entries := commandFenceRefs(&fence, "lease-a"); refs != 1 || entries != 1 {
+		t.Fatalf("abandoned LockContext leaked a reference: refs=%d entries=%d", refs, entries)
+	}
+	unlock()
+
+	contextUnlock, err := fence.LockContext(t.Context(), "lease-a")
+	if err != nil {
+		t.Fatalf("LockContext did not acquire an idle key: %v", err)
+	}
+	if _, acquired := fence.TryLock("lease-a"); acquired {
+		t.Fatal("LockContext did not exclude other holders")
+	}
+	contextUnlock()
+	contextUnlock()
+	if refs, entries := commandFenceRefs(&fence, "lease-a"); refs != 0 || entries != 0 {
+		t.Fatalf("LockContext unlock leaked state: refs=%d entries=%d", refs, entries)
 	}
 }
 

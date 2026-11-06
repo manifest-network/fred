@@ -59,8 +59,6 @@ func TestActorCommandConstructorsRejectMissingOrWrongCapabilities(t *testing.T) 
 	require.Error(t, err)
 	_, _, err = NewRestoreCommand(context.Background(), shared.OperationIntentClaim{})
 	require.Error(t, err)
-	_, _, err = NewDeprovisionCommand(nil) //nolint:staticcheck // Deliberately verify nil-context rejection.
-	require.Error(t, err)
 	_, err = NewContainerDiedObservation("", shared.RuntimeGenerationProof{})
 	require.Error(t, err)
 	_, _, err = NewCohortDivergedObservation(nil, shared.RuntimeGenerationProof{}) //nolint:staticcheck // Deliberately verify nil-context rejection.
@@ -273,8 +271,7 @@ func TestLifecycleObservationCarriesExactActiveOperationGeneration(t *testing.T)
 func TestOpaqueMessageCapabilitiesAreCopySafeAndAcceptedOnce(t *testing.T) {
 	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{})
 
-	command, _, err := NewDeprovisionCommand(t.Context())
-	require.NoError(t, err)
+	command, _ := NewDeprovisionCommand()
 	copyOfCommand := command
 	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
 	assert.False(t, actor.TryEnqueueCommand(copyOfCommand), "a copied command must share one-shot admission")

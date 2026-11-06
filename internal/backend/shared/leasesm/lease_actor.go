@@ -306,8 +306,9 @@ func newContainerDiedObservation(
 
 // deprovisionMsg requests that the actor run the deprovision flow. Callers can
 // obtain one only through NewDeprovisionCommand, which owns the reply channel.
+// It carries no context: the actor runs the close on its own lifetime, so a
+// caller that stops waiting cannot cancel the close.
 type deprovisionMsg struct {
-	Ctx   context.Context
 	Reply chan error
 }
 
@@ -322,12 +323,20 @@ func (m deprovisionMsg) onPanic(err error) {
 	}
 }
 
-func NewDeprovisionCommand(ctx context.Context) (ActorCommand, ActorReply, error) {
-	if ctx == nil {
-		return ActorCommand{}, ActorReply{}, errors.New("deprovision context is required")
-	}
+// NewDeprovisionCommand asks the actor to close its lease. The reply only
+// reports the outcome: the close runs on the actor's lifetime, bounded by
+// LeaseActorConfig.CloseTimeout, whether or not anyone still waits for it.
+func NewDeprovisionCommand() (ActorCommand, ActorReply) {
 	reply, receiver := newActorReply()
-	return newActorCommand(deprovisionMsg{Ctx: ctx, Reply: reply}), receiver, nil
+	return newActorCommand(deprovisionMsg{Reply: reply}), receiver
+}
+
+// IsRejectedByRetiringActor reports that a command reached an actor that was
+// already retiring, which rejected it without handling it. Nothing ran, so
+// routing the same request again reaches the actor that replaces it. Only the
+// reply value itself carries this: a wrapped error does not.
+func IsRejectedByRetiringActor(err error) bool {
+	return err == errActorTerminated //nolint:errorlint // Only the direct reply proves the command was never handled.
 }
 
 // cohortDivergedMsg reports that recovery observed a running instance cohort
@@ -1082,6 +1091,8 @@ func validateLeaseActorConfig(cfg LeaseActorConfig) error {
 		return errors.New("lease actor requires actor-owned close authority")
 	case cfg.WorkerDrainTimeout < 0:
 		return errors.New("lease actor worker drain timeout cannot be negative")
+	case cfg.CloseTimeout <= 0:
+		return errors.New("lease actor requires a positive close timeout")
 	default:
 		return nil
 	}
@@ -1303,7 +1314,7 @@ func (a *LeaseActor) handle(msg leaseMessage) {
 	case containerDiedMsg:
 		a.handleContainerDied(m.ContainerID, m.Runtime, m.provenance)
 	case deprovisionMsg:
-		m.Reply <- a.handleDeprovision(m.Ctx)
+		m.Reply <- a.handleDeprovision()
 	case cohortDivergedMsg:
 		m.Reply <- a.handleCohortDiverged(m.Ctx, m.Runtime)
 	case maintenanceRecoveredMsg:
@@ -2286,9 +2297,10 @@ func (a *LeaseActor) tryEnqueue(msg leaseMessage) bool {
 //   - deprovision dispatch via cfg.DoDeprovisionFn (was b.doDeprovision)
 //   - logger via cfg.Logger
 //
-// The ctx threaded in is the actor-owned ctx from the inbound
-// deprovision command (which carries the caller's ctx from Backend.Deprovision).
-func (a *LeaseActor) handleDeprovision(ctx context.Context) error {
+// The close runs on the actor's lifetime, bounded by CloseTimeout. The caller
+// that requested it only waits for the reply, so a caller that gives up does
+// not cancel a teardown that is still stopping containers.
+func (a *LeaseActor) handleDeprovision() error {
 	if a.closeSettlement == nil {
 		a.closeSettlement = newActorCloseSettlement(a)
 	}
@@ -2311,6 +2323,8 @@ func (a *LeaseActor) handleDeprovision(ctx context.Context) error {
 			return workerDrainPending{leaseUUID: a.leaseUUID}
 		}
 	}
+	ctx, cancel := context.WithTimeout(a.cfg.StopCtx, a.cfg.CloseTimeout)
+	defer cancel()
 	// Attempt the SM transition. If it's not permitted, check whether the
 	// provision is already gone or we're in an unexpected state. Absence from
 	// this volatile projection is not terminal authority: a substrate finalizer

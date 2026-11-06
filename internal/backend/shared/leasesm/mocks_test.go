@@ -286,6 +286,9 @@ func bindLeaseSMOperationExecutor(
 
 const testActorLeaseUUID = "11111111-1111-4111-8111-111111111111"
 
+// testActorCloseTimeout bounds a test actor's close attempts.
+const testActorCloseTimeout = 30 * time.Second
+
 func newMockProvisionStore() *mockProvisionStore {
 	return &mockProvisionStore{states: make(map[string]*ProvisionState)}
 }
@@ -466,6 +469,7 @@ type testActorOpts struct {
 	StopCtx                   context.Context
 	WG                        *sync.WaitGroup
 	WorkerDrainTimeout        time.Duration
+	CloseTimeout              time.Duration
 	Inspector                 InstanceInspector
 	Diag                      DiagnosticsGatherer
 	ProvisionStore            LeaseProvisionStore
@@ -527,6 +531,9 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 	}
 	if opts.StopCtx == nil {
 		opts.StopCtx = context.Background()
+	}
+	if opts.CloseTimeout == 0 {
+		opts.CloseTimeout = testActorCloseTimeout
 	}
 	if opts.WG == nil {
 		opts.WG = &sync.WaitGroup{}
@@ -594,6 +601,7 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 		StopCtx:              opts.StopCtx,
 		WG:                   opts.WG,
 		WorkerDrainTimeout:   opts.WorkerDrainTimeout,
+		CloseTimeout:         opts.CloseTimeout,
 		Inspector:            opts.Inspector,
 		Diag:                 opts.Diag,
 		ProvisionStore:       opts.ProvisionStore,
@@ -657,6 +665,9 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 	}
 	if opts.StopCtx == nil {
 		opts.StopCtx = context.Background()
+	}
+	if opts.CloseTimeout == 0 {
+		opts.CloseTimeout = testActorCloseTimeout
 	}
 	if opts.WG == nil {
 		opts.WG = &sync.WaitGroup{}
@@ -729,6 +740,7 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 		StopCtx:              opts.StopCtx,
 		WG:                   opts.WG,
 		WorkerDrainTimeout:   opts.WorkerDrainTimeout,
+		CloseTimeout:         opts.CloseTimeout,
 		Inspector:            opts.Inspector,
 		Diag:                 opts.Diag,
 		ProvisionStore:       opts.ProvisionStore,

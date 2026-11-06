@@ -1738,6 +1738,18 @@ nonexistent lease with no projection, release, or substrate authority returns
 success; an absent projection with a fenced release enters cleanup-only recovery
 instead of treating container absence as proof that cleanup finished.
 
+The lease's actor runs the close on the backend's lifetime; no request context
+reaches the teardown. One close attempt may take `container_stop_timeout` for
+each of a stack's up to 11 dependency levels, which Compose stops one at a
+time, plus 5 minutes for the rest of the close: 10.5 minutes at the default
+30-second grace. The request only waits, for at most 20 seconds. A close still
+running then, such as one waiting out a container's stop grace, keeps running
+and the request answers `503` `lifecycle_pending`, so Fred retries instead of
+timing out. The same answer comes when other lifecycle work holds the lease
+for that long. A retry that reaches the lease's actor just as the running
+close retires it is handed to the next actor, which answers it from the
+durable close journal.
+
 **Request:**
 
 ```json

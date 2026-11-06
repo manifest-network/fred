@@ -317,7 +317,7 @@ backends:
     # signs with it. Set at step 2 of the rolling rotation, removed at step 4
     # (DEPLOYMENT.md, "Rotating a backend's HMAC key").
     # hmac_secret_previous: ""
-    timeout: 30s                     # Request timeout for backend API calls
+    timeout: 30s                     # Request timeout for backend API calls; must exceed 20s, the longest a backend takes to answer /deprovision
     default: true                    # Optional fallback marker (at most one)
     # Contain a backend you no longer trust without removing it: providerd
     # sends it nothing (its TLS files are not even loaded), refuses its

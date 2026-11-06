@@ -370,6 +370,11 @@ type LeaseActorConfig struct {
 	ProvisionStore     LeaseProvisionStore
 	OnTerminated       func(leaseUUID string, actor *LeaseActor)
 	Metrics            SMMetrics
+	// CloseTimeout bounds one close attempt. The actor derives the attempt's
+	// context from StopCtx and this bound, never from the caller that asked for
+	// the close: callers only wait for the outcome. An attempt that runs out
+	// leaves the durable close journal for the next attempt.
+	CloseTimeout time.Duration
 
 	// Mutation handlers are fixed once, at actor construction. Commands carry
 	// only their exact journal-issued authority; they cannot splice authority
@@ -426,11 +431,9 @@ type LeaseActorConfig struct {
 	// callback-lifetime authority minted by the exact actor only after its
 	// deprovision transition has drained mutation workers.
 	//
-	// The ctx threaded in MUST be the actor-owned ctx delivered with
-	// the inbound deprovision command (which itself carries the caller's
-	// ctx from Backend.Deprovision). Substrate implementers MUST NOT
-	// substitute a caller-imported ctx or a fresh ctx here — the
-	// actor's serial processing of inbound messages depends on each
-	// handler honoring the inbound ctx for cancellation semantics.
+	// ctx is the close attempt's actor-owned context: StopCtx bounded by
+	// CloseTimeout. No caller context reaches it, so a caller that stops
+	// waiting cannot cancel a teardown midway. Substrates must use it for
+	// the whole teardown and not substitute another context.
 	DoDeprovisionFn func(ctx context.Context, scope ActorCloseScope) error
 }

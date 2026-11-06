@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -64,7 +65,7 @@ func actorLifecyclePendingError(t *testing.T) error {
 		capabilities := pendingWorkerCapabilities{}
 		actor, err := leasesm.NewLeaseActor(leasesm.LeaseActorConfig{
 			LeaseUUID: handlerTestLeaseUUID, StopCtx: ctx, WG: &workers, Logger: slog.Default(),
-			Inspector: capabilities, Diag: capabilities, Metrics: capabilities,
+			Inspector: capabilities, Diag: capabilities, Metrics: capabilities, CloseTimeout: time.Minute,
 			ProvisionStore:  &pendingWorkerStore{state: leasesm.ProvisionState{LeaseUUID: handlerTestLeaseUUID, Status: backend.ProvisionStatusProvisioning}},
 			RecoveryLineage: recovery.Lineage(),
 			OnTerminated:    func(string, *leasesm.LeaseActor) {},
@@ -96,8 +97,7 @@ func actorLifecyclePendingError(t *testing.T) error {
 		require.True(t, actor.TryEnqueueCommand(command))
 		require.NoError(t, <-reply.Result())
 		<-started
-		command, reply, err = leasesm.NewDeprovisionCommand(t.Context())
-		require.NoError(t, err)
+		command, reply = leasesm.NewDeprovisionCommand()
 		require.True(t, actor.TryEnqueueCommand(command))
 		pending := <-reply.Result()
 		require.True(t, leasesm.IsLifecyclePending(pending), pending)

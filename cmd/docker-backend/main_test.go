@@ -1057,6 +1057,28 @@ func TestHandleDeprovision(t *testing.T) {
 
 		assert.Equal(t, http.StatusInternalServerError, w.Code)
 	})
+
+	// The close runs on the backend's lifetime; the request only waits for it,
+	// and must answer before providerd's request timeout.
+	t.Run("waits at most the deprovision response budget", func(t *testing.T) {
+		var deadline time.Time
+		var bounded bool
+		mb := &mockBackend{
+			DeprovisionFunc: func(ctx context.Context, _ string) error {
+				deadline, bounded = ctx.Deadline()
+				return nil
+			},
+		}
+		started := time.Now()
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/deprovision", validBody))
+		finished := time.Now()
+
+		require.Equal(t, http.StatusOK, w.Code)
+		require.True(t, bounded, "the backend's wait must be bounded")
+		assert.WithinRange(t, deadline,
+			started.Add(backend.DeprovisionResponseBudget), finished.Add(backend.DeprovisionResponseBudget))
+	})
 }
 
 func TestHandleGetInfo(t *testing.T) {

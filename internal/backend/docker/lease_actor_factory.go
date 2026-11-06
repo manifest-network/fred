@@ -23,10 +23,9 @@ import (
 //
 // DoDeprovisionFn was added at checkpoint A of PR5b-2 specifically so
 // the handleDeprovision body, post-lift, can dispatch substrate-specific
-// teardown without reaching into *Backend. The ctx threaded through
-// MUST be the actor-owned ctx delivered with the inbound DeprovisionMsg
-// (which carries the caller's ctx); the docker substrate honors this
-// per the LeaseActorConfig.DoDeprovisionFn contract.
+// teardown without reaching into *Backend. Its ctx is the actor-owned
+// close context (StopCtx bounded by CloseTimeout); the docker substrate
+// honors this per the LeaseActorConfig.DoDeprovisionFn contract.
 func newLeaseActor(b *Backend, leaseUUID string) *leasesm.LeaseActor {
 	if b.recoveryCoordinator == nil {
 		// Lightweight unit fixtures may construct actors before installing durable
@@ -48,6 +47,7 @@ func newLeaseActor(b *Backend, leaseUUID string) *leasesm.LeaseActor {
 		Diag:              b.gatherer,
 		ProvisionStore:    b.provisionStore,
 		Metrics:           dockerSMMetrics{},
+		CloseTimeout:      b.closeAttemptTimeout(),
 		ProvisionWorkFn:   b.executeProvisionWork,
 		RestoreWorkFn:     b.executeRestoreWork,
 		MaintenanceWorkFn: b.executeMaintenanceWork,

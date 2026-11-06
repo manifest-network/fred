@@ -523,6 +523,11 @@ Release resources for a lease. **Must be idempotent** - calling multiple times s
 - Stop/delete the resource
 - Clean up any associated state
 - Return 200 even if the resource doesn't exist (idempotent)
+- Answer within 20 seconds (`backend.DeprovisionResponseBudget`). A teardown
+  that takes longer, for example while a container uses its stop grace, must
+  keep running and answer `503` `lifecycle_pending`; Fred retries the close.
+  Never tie the teardown to the request: Fred's request timeout cancels it.
+  Fred refuses to start with a backend `timeout` of 20 seconds or less.
 
 **Error Responses:**
 - `400 Bad Request` - Invalid request body or lease UUID

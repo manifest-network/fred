@@ -459,7 +459,7 @@ func TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains(t *testing
 	// actor cancels the worker and answers pending. Only a later request may
 	// transition and run DoDeprovisionFn once the worker actually exits.
 	reply := make(chan error, 1)
-	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Reply: reply}) })
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
 		"OnExit must call workCancel before waiting for the worker (Restart path)")
@@ -475,7 +475,7 @@ func TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains(t *testing
 	require.True(t, IsLifecyclePending(<-reply), "the caller must receive pending before the worker is released")
 	close(workerRelease)
 	<-actor.workers.Zero()
-	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Reply: reply}) })
 
 	select {
 	case err := <-reply:
@@ -541,7 +541,7 @@ func TestLeaseActor_RestoreDeprovisionDefersUntilTerminalDeferDrains(t *testing.
 	deprovisionReply := make(chan error, 1)
 	requireAccepted(t, func() bool {
 		return actor.tryEnqueue(deprovisionMsg{
-			Ctx: context.Background(), Reply: deprovisionReply,
+			Reply: deprovisionReply,
 		})
 	})
 	close(restoreWorkMayReturn)
@@ -560,7 +560,7 @@ func TestLeaseActor_RestoreDeprovisionDefersUntilTerminalDeferDrains(t *testing.
 	close(allowTerminalDefer)
 	<-actor.workers.Zero()
 	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: deprovisionReply})
+		return actor.tryEnqueue(deprovisionMsg{Reply: deprovisionReply})
 	})
 	select {
 	case err := <-deprovisionReply:
@@ -764,8 +764,7 @@ func TestSpawnProvisionWorker_PanicRecovery(t *testing.T) {
 		"WorkerPanic metric must increment by 1 after provision worker panic")
 
 	// Actor is still alive and responsive — a caller command is acknowledged.
-	command, reply, err := NewDeprovisionCommand(context.Background())
-	require.NoError(t, err)
+	command, reply := NewDeprovisionCommand()
 	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
 	require.NoError(t, reply.Wait(context.Background()))
 }
@@ -808,8 +807,7 @@ func TestSpawnReplaceWorker_PanicRecovery(t *testing.T) {
 	assert.Equal(t, panicsBefore+1, panicsAfter,
 		"WorkerPanic metric must increment by 1 after replace worker panic")
 
-	command, reply, err := NewDeprovisionCommand(context.Background())
-	require.NoError(t, err)
+	command, reply := NewDeprovisionCommand()
 	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
 	require.NoError(t, reply.Wait(context.Background()))
 }
@@ -1177,7 +1175,7 @@ func TestProvision_DeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 	// Route Deprovision through the actor. Its pending response keeps teardown
 	// fenced until a retry independently observes the drained barrier.
 	reply := make(chan error, 1)
-	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Reply: reply}) })
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
 		"OnExit must call workCancel before waitForWorkers")
@@ -1193,7 +1191,7 @@ func TestProvision_DeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 	require.True(t, IsLifecyclePending(<-reply), "the caller must receive pending before the worker is released")
 	close(workerRelease)
 	<-actor.workers.Zero()
-	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Reply: reply}) })
 
 	select {
 	case err := <-reply:
@@ -1459,7 +1457,7 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 	// Deprovision preempts the in-flight worker (whose workCancel must still
 	// be request #1's), returning pending while it drains.
 	reply := make(chan error, 1)
-	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Reply: reply}) })
 
 	require.Eventually(t, firstCancelObserved.Load, 1*time.Second, 5*time.Millisecond,
 		"onExitProvisioning must cancel the FIRST (in-flight) %s worker", op)
@@ -1470,7 +1468,7 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 	require.True(t, IsLifecyclePending(<-reply))
 	close(worker1Release)
 	<-actor.workers.Zero()
-	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}) })
+	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Reply: reply}) })
 	select {
 	case err := <-reply:
 		require.NoError(t, err)
@@ -1514,7 +1512,7 @@ func runReplaceLosesToDeprovisionTest(t *testing.T, op string) {
 		},
 	})
 
-	require.NoError(t, actor.handleDeprovision(context.Background()))
+	require.NoError(t, actor.handleDeprovision())
 	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.State(),
 		"test precondition: SM must be Deprovisioning")
 
@@ -1887,7 +1885,7 @@ func TestRestoreRequested_RejectedFromBadState(t *testing.T) {
 		},
 	})
 
-	require.NoError(t, actor.handleDeprovision(context.Background()))
+	require.NoError(t, actor.handleDeprovision())
 	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.State(),
 		"test precondition: SM must be Deprovisioning")
 
