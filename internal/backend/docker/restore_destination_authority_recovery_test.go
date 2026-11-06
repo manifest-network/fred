@@ -1217,7 +1217,7 @@ func TestCommittedRestoreClose_KeepsFinalizerRouteUntilMovedCloseJournalHandoff(
 	))
 	acknowledgePendingCallbacksForTest(t, fixture.callbacks)
 
-	unlock := fixture.backend.commandFence.Lock(fixture.destinationLease)
+	unlock := fixture.backend.commandFence.Lock(fixture.destinationLease).Release
 	require.NoError(t, fixture.backend.ensureCommittedRestoreDestinationForClose(fixture.destinationLease))
 	stored, err := fixture.retentions.Get(fixture.sourceLease)
 	require.NoError(t, err)

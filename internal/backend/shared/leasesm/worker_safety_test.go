@@ -47,7 +47,9 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	actor.workers.Add()
 
 	reply := make(chan error, 1)
-	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Reply: reply}) })
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: testCloseFence(t, actor.leaseUUID)})
+	})
 	select {
 	case err := <-reply:
 		require.True(t, IsLifecyclePending(err), "the exact live worker must issue a pending observation: %v", err)
@@ -67,7 +69,9 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	// immediate observation cannot strand the actor in Deprovisioning.
 	actor.workers.Done()
 	retryReply := make(chan error, 1)
-	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Reply: retryReply}) })
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(deprovisionMsg{Reply: retryReply, fence: testCloseFence(t, actor.leaseUUID)})
+	})
 	select {
 	case err := <-retryReply:
 		require.NoError(t, err)
@@ -126,7 +130,7 @@ func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) 
 			// leaves. The failed OnExit preserves Failing, which normally permits
 			// restart/update; close ownership must independently fence admission.
 			actor.beginWorkerActivity()
-			command, reply := NewDeprovisionCommand()
+			command, reply := newTestDeprovisionCommand(t, testActorLeaseUUID)
 			actor.handle(command.envelope.message)
 			require.ErrorIs(t, <-reply.Result(), ErrWorkerDrainTimeout)
 			require.Equal(t, backend.ProvisionStatusFailing, actor.State())
@@ -144,7 +148,7 @@ func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) 
 			actor.cfg.WG.Wait()
 			require.Zero(t, workers.Load(), "close-owned actor cannot acknowledge a mutation whose terminal result it would suppress")
 			require.Zero(t, teardown.Load())
-			command, reply = NewDeprovisionCommand()
+			command, reply = newTestDeprovisionCommand(t, testActorLeaseUUID)
 			actor.handle(command.envelope.message)
 			require.NoError(t, <-reply.Result())
 			require.EqualValues(t, 1, teardown.Load(), "the close continuation remains admissible")
@@ -169,7 +173,9 @@ func TestDeprovisionAbsentProjectionStillRunsSubstrateFinalizer(t *testing.T) {
 	})
 
 	reply := make(chan error, 1)
-	requireAccepted(t, func() bool { return actor.tryEnqueue(deprovisionMsg{Reply: reply}) })
+	requireAccepted(t, func() bool {
+		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: testCloseFence(t, actor.leaseUUID)})
+	})
 	select {
 	case err := <-reply:
 		require.NoError(t, err)

@@ -2048,11 +2048,11 @@ func (b *Backend) removeOrphanedLeaseNetworkUsing(
 	if err := authority.authorizes(authority.leaseUUID, b.cfg.Name); err != nil {
 		return networkRemovalUnknown, err
 	}
-	unlock, acquired := b.commandFence.TryLock(authority.leaseUUID)
+	fence, acquired := b.commandFence.TryLock(authority.leaseUUID)
 	if !acquired {
 		return networkBusy, nil
 	}
-	defer unlock()
+	defer fence.Release()
 
 	b.provisionsMu.RLock()
 	_, tracked := b.provisions[authority.leaseUUID]

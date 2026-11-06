@@ -61,8 +61,8 @@ func TestReconcileRestoring_FailedRollbackExcludesRestartAdmission(t *testing.T)
 	case <-time.After(3 * time.Second):
 		t.Fatal("restoring rollback did not enter captured exact-container removal")
 	}
-	if unlock, available := b.commandFence.TryLock(destinationLease); available {
-		unlock()
+	if fence, available := b.commandFence.TryLock(destinationLease); available {
+		fence.Release()
 		t.Fatal("exact removal did not retain the destination command fence")
 	}
 

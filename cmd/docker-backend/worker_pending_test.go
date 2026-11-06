@@ -97,7 +97,9 @@ func actorLifecyclePendingError(t *testing.T) error {
 		require.True(t, actor.TryEnqueueCommand(command))
 		require.NoError(t, <-reply.Result())
 		<-started
-		command, reply = leasesm.NewDeprovisionCommand()
+		var fence shared.CommandFence
+		command, reply, err = leasesm.NewDeprovisionCommand(fence.Lock(handlerTestLeaseUUID))
+		require.NoError(t, err)
 		require.True(t, actor.TryEnqueueCommand(command))
 		pending := <-reply.Result()
 		require.True(t, leasesm.IsLifecyclePending(pending), pending)

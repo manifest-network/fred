@@ -178,7 +178,7 @@ type Backend struct {
 	storageIdentity  backendidentity.ID
 	storageAuthority backendidentity.VerifiedStorage
 	storageVerifier  dockerStorageIdentityVerifier
-	identityVerifyMu sync.Mutex
+	identityVerifyMu identityVerifyLock
 	identityDriftErr error
 	// storeAuthorityGate is the backend-wide terminal cause and the commit
 	// linearization point shared by every identity-bound journal. Its lock is
@@ -3246,9 +3246,12 @@ func (b *Backend) verifyStorageIdentity(
 		return err
 	}
 	lockStarted := time.Now()
-	b.identityVerifyMu.Lock()
+	lockErr := b.identityVerifyMu.lockContext(ctx)
 	observeStorageIdentityStage(identityStageLock, lockStarted)
-	defer b.identityVerifyMu.Unlock()
+	if lockErr != nil {
+		return fmt.Errorf("wait for storage identity verification: %w", lockErr)
+	}
+	defer b.identityVerifyMu.unlock()
 	if err := b.terminalStorageAuthorityError(); err != nil {
 		return err
 	}

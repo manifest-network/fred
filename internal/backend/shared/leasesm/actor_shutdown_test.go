@@ -2,6 +2,7 @@ package leasesm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -93,6 +94,75 @@ func TestNewLeaseActorRejectsTypedNilCapabilityBeforeInstallation(t *testing.T) 
 	assert.False(t, installed, "invalid composition must not reach registry installation")
 }
 
+// A close owns the command fence its caller handed over until the substrate
+// reports the close's durable head, then teardown runs without it. A close
+// that never gets that far keeps the fence until its attempt ends.
+func TestCloseOwnsItsCommandFenceUntilAdmitted(t *testing.T) {
+	for _, admits := range []bool{true, false} {
+		t.Run(fmt.Sprintf("admits=%t", admits), func(t *testing.T) {
+			store := newMockProvisionStore()
+			store.put(testActorLeaseUUID, &ProvisionState{LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusReady})
+			var fence shared.CommandFence
+			tearingDown, finishTeardown := make(chan struct{}), make(chan struct{})
+			actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+				ProvisionStore: store,
+				DoDeprovisionFn: func(_ context.Context, scope ActorCloseScope) error {
+					if admits {
+						scope.CloseAdmitted()
+					}
+					close(tearingDown)
+					<-finishTeardown
+					if !admits {
+						return errors.New("close head was not committed")
+					}
+					store.remove(testActorLeaseUUID)
+					return nil
+				},
+			})
+			command, reply, err := NewDeprovisionCommand(fence.Lock(testActorLeaseUUID))
+			require.NoError(t, err)
+			go actor.handle(command.envelope.message)
+			<-tearingDown
+			hold, free := fence.TryLock(testActorLeaseUUID)
+			require.Equal(t, admits, free, "only a committed close head gives the fence back before the attempt ends")
+			hold.Release()
+			close(finishTeardown)
+			if admits {
+				require.NoError(t, <-reply.Result())
+			} else {
+				require.Error(t, <-reply.Result())
+			}
+			hold, free = fence.TryLock(testActorLeaseUUID)
+			require.True(t, free, "the attempt's end gives the fence back")
+			hold.Release()
+		})
+	}
+}
+
+func TestCloseRequiresItsOwnLeasesCommandFence(t *testing.T) {
+	_, _, err := NewDeprovisionCommand(shared.CommandFenceHold{})
+	require.Error(t, err, "a close needs the fence its caller checked under")
+
+	var teardown atomic.Int32
+	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+		ProvisionStore: newMockProvisionStore(),
+		DoDeprovisionFn: func(context.Context, ActorCloseScope) error {
+			teardown.Add(1)
+			return nil
+		},
+	})
+	var fence shared.CommandFence
+	const otherLease = "33333333-3333-4333-8333-333333333333"
+	command, reply, err := NewDeprovisionCommand(fence.Lock(otherLease))
+	require.NoError(t, err)
+	actor.handle(command.envelope.message)
+	require.ErrorContains(t, <-reply.Result(), "another lease's command fence")
+	require.Zero(t, teardown.Load())
+	hold, free := fence.TryLock(otherLease)
+	require.True(t, free, "a refused close gives the fence back")
+	hold.Release()
+}
+
 func TestNewLeaseActorRequiresACloseTimeout(t *testing.T) {
 	store := newMockProvisionStore()
 	cfg := validConstructionTestActorConfig(context.Background(), store)
@@ -120,7 +190,7 @@ func TestCloseRunsOnTheActorLifetime(t *testing.T) {
 			return ctx.Err()
 		},
 	})
-	command, reply := NewDeprovisionCommand()
+	command, reply := newTestDeprovisionCommand(t, testActorLeaseUUID)
 	started := time.Now()
 	go actor.handle(command.envelope.message)
 	var closeCtx context.Context
@@ -181,7 +251,7 @@ func TestActorCloseScopeIsExactAndCallbackLifetime(t *testing.T) {
 		},
 	})
 
-	require.NoError(t, actor.handleDeprovision())
+	require.NoError(t, actor.handleDeprovision(testCloseFence(t, actor.leaseUUID)))
 	assert.Nil(t, actor.activeClose.Load(), "completed close must clear its observational scope")
 	assert.False(t, actor.CloseOwnsObservation(observation))
 	assert.Empty(t, escaped.LeaseUUID())
@@ -208,7 +278,7 @@ func TestActorCloseScopeIsRevokedWhenCallbackPanics(t *testing.T) {
 
 	func() {
 		defer func() { require.Equal(t, "boom", recover()) }()
-		_ = actor.handleDeprovision()
+		_ = actor.handleDeprovision(testCloseFence(t, actor.leaseUUID))
 	}()
 	assert.Nil(t, actor.activeClose.Load(), "panicking close must clear its observational scope")
 	assert.Empty(t, escaped.LeaseUUID())
@@ -240,6 +310,7 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 
 	queuedProvisionAck := make(chan error, 1)
 	queuedDeprovisionReply := make(chan error, 1)
+	var queuedCloseFence shared.CommandFence
 	unregisterEntered := make(chan struct{})
 	releaseUnregister := make(chan struct{})
 	var releaseUnregisterOnce sync.Once
@@ -275,6 +346,7 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 	requireAccepted(t, func() bool {
 		return actor.tryEnqueue(deprovisionMsg{
 			Reply: firstReply,
+			fence: testCloseFence(t, actor.leaseUUID),
 		})
 	})
 	select {
@@ -293,6 +365,7 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 	requireAccepted(t, func() bool {
 		return actor.tryEnqueue(deprovisionMsg{
 			Reply: queuedDeprovisionReply,
+			fence: queuedCloseFence.Lock(actor.leaseUUID),
 		})
 	})
 
@@ -322,6 +395,9 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 		"a close the retiring actor never handled can be routed to its replacement")
 	require.False(t, IsRejectedByRetiringActor(fmt.Errorf("wrapped: %w", rejectedClose)),
 		"only the reply itself proves the close never ran")
+	fence, free := queuedCloseFence.TryLock(actor.leaseUUID)
+	require.True(t, free, "a rejected close gives its command fence back")
+	fence.Release()
 	assert.False(t, queuedWorkRan.Load(),
 		"retirement must not execute queued caller work after the worker barrier")
 	assert.Equal(t, int32(1), finalizerCalls.Load(),

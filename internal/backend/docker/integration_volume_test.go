@@ -424,7 +424,7 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	// This is specifically a cold-recovery test. Hold the production per-lease
 	// command fence so the live periodic lane cannot consume the durable intent
 	// after the worker becomes quiescent but before the backend is stopped.
-	unlockRecovery := b.commandFence.Lock(leaseUUID)
+	unlockRecovery := b.commandFence.Lock(leaseUUID).Release
 	defer unlockRecovery()
 
 	// The symlink refusal happens after the operation crossed its durable

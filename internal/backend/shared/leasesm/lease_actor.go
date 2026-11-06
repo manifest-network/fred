@@ -307,14 +307,19 @@ func newContainerDiedObservation(
 // deprovisionMsg requests that the actor run the deprovision flow. Callers can
 // obtain one only through NewDeprovisionCommand, which owns the reply channel.
 // It carries no context: the actor runs the close on its own lifetime, so a
-// caller that stops waiting cannot cancel the close.
+// caller that stops waiting cannot cancel the close. It carries the lease's
+// command fence instead, which the close owns until its durable head commits.
 type deprovisionMsg struct {
 	Reply chan error
+	fence shared.CommandFenceHold
 }
 
 func (deprovisionMsg) isleaseMessage()        {}
 func (deprovisionMsg) isactorCommandMessage() {}
 func (m deprovisionMsg) onPanic(err error) {
+	// A close rejected or interrupted here never commits its head, so the
+	// fence it owns goes back before its caller hears about it.
+	m.fence.Release()
 	// Non-blocking send: Reply is buffered-1, caller receives at most
 	// once. On recover, make sure the caller gets something.
 	select {
@@ -326,9 +331,19 @@ func (m deprovisionMsg) onPanic(err error) {
 // NewDeprovisionCommand asks the actor to close its lease. The reply only
 // reports the outcome: the close runs on the actor's lifetime, bounded by
 // LeaseActorConfig.CloseTimeout, whether or not anyone still waits for it.
-func NewDeprovisionCommand() (ActorCommand, ActorReply) {
+//
+// The command takes over fence, the lease's command fence that its caller
+// acquired before checking that the close may begin. The close keeps it until
+// its durable head commits (ActorCloseScope.CloseAdmitted) or the attempt ends,
+// so no other command can slip between that check and the head. Once the
+// command is enqueued the caller must not release fence; if enqueuing fails,
+// the caller still owns it.
+func NewDeprovisionCommand(fence shared.CommandFenceHold) (ActorCommand, ActorReply, error) {
+	if fence.LeaseUUID() == "" {
+		return ActorCommand{}, ActorReply{}, errors.New("deprovision requires the lease's command fence")
+	}
 	reply, receiver := newActorReply()
-	return newActorCommand(deprovisionMsg{Reply: reply}), receiver
+	return newActorCommand(deprovisionMsg{Reply: reply, fence: fence}), receiver, nil
 }
 
 // IsRejectedByRetiringActor reports that a command reached an actor that was
@@ -1314,7 +1329,7 @@ func (a *LeaseActor) handle(msg leaseMessage) {
 	case containerDiedMsg:
 		a.handleContainerDied(m.ContainerID, m.Runtime, m.provenance)
 	case deprovisionMsg:
-		m.Reply <- a.handleDeprovision()
+		m.Reply <- a.handleDeprovision(m.fence)
 	case cohortDivergedMsg:
 		m.Reply <- a.handleCohortDiverged(m.Ctx, m.Runtime)
 	case maintenanceRecoveredMsg:
@@ -2299,8 +2314,13 @@ func (a *LeaseActor) tryEnqueue(msg leaseMessage) bool {
 //
 // The close runs on the actor's lifetime, bounded by CloseTimeout. The caller
 // that requested it only waits for the reply, so a caller that gives up does
-// not cancel a teardown that is still stopping containers.
-func (a *LeaseActor) handleDeprovision() error {
+// not cancel a teardown that is still stopping containers. The close owns the
+// lease's command fence until its durable head commits or this attempt ends.
+func (a *LeaseActor) handleDeprovision(fence shared.CommandFenceHold) error {
+	defer fence.Release()
+	if fence.LeaseUUID() != a.leaseUUID {
+		return errors.New("deprovision carries another lease's command fence")
+	}
 	if a.closeSettlement == nil {
 		a.closeSettlement = newActorCloseSettlement(a)
 	}
@@ -2354,7 +2374,7 @@ func (a *LeaseActor) handleDeprovision() error {
 			p.LifecycleCallbackURL = a.pendingReplaceLifecycleCallbackURL
 		})
 	}
-	closeScope := newActorCloseScope(a)
+	closeScope := newActorCloseScope(a, fence)
 	defer closeScope.revoke()
 	err := a.cfg.DoDeprovisionFn(ctx, closeScope)
 	// If the provision entry was fully removed (success path), signal the

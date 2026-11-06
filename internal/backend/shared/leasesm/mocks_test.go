@@ -286,6 +286,22 @@ func bindLeaseSMOperationExecutor(
 
 const testActorLeaseUUID = "11111111-1111-4111-8111-111111111111"
 
+// testCloseFence holds leaseUUID's command fence, as a substrate does before
+// it hands a close to the lease's actor.
+func testCloseFence(t *testing.T, leaseUUID string) shared.CommandFenceHold {
+	t.Helper()
+	var fence shared.CommandFence
+	return fence.Lock(leaseUUID)
+}
+
+// newTestDeprovisionCommand builds a close command that owns its lease's fence.
+func newTestDeprovisionCommand(t *testing.T, leaseUUID string) (ActorCommand, ActorReply) {
+	t.Helper()
+	command, reply, err := NewDeprovisionCommand(testCloseFence(t, leaseUUID))
+	require.NoError(t, err)
+	return command, reply
+}
+
 // testActorCloseTimeout bounds a test actor's close attempts.
 const testActorCloseTimeout = 30 * time.Second
 

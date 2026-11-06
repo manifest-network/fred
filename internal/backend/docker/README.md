@@ -1742,13 +1742,21 @@ The lease's actor runs the close on the backend's lifetime; no request context
 reaches the teardown. One close attempt may take `container_stop_timeout` for
 each of a stack's up to 11 dependency levels, which Compose stops one at a
 time, plus 5 minutes for the rest of the close: 10.5 minutes at the default
-30-second grace. The request only waits, for at most 20 seconds. A close still
-running then, such as one waiting out a container's stop grace, keeps running
-and the request answers `503` `lifecycle_pending`, so Fred retries instead of
-timing out. The same answer comes when other lifecycle work holds the lease
-for that long. A retry that reaches the lease's actor just as the running
-close retires it is handed to the next actor, which answers it from the
-durable close journal.
+30-second grace. The request only waits, for at most 20 seconds counted from
+before authentication and the storage identity check. A close still running
+then, such as one waiting out a container's stop grace, keeps running and the
+request answers `503` `lifecycle_pending`, so Fred retries instead of timing
+out. The same answer comes when other lifecycle work, or another storage
+identity verification, holds the close up that long; a request that cannot
+verify the storage identity at all answers that failure instead.
+
+The lease's command fence, taken before the restore-destination check, moves
+into the close and stays held until the close's durable head commits, however
+soon the request stops waiting: no restore or other command can be admitted
+between that check and the head. Teardown runs without the fence, since the
+head refuses every other mutation. A retry that reaches the lease's actor just
+as the running close retires it is handed to the next actor, which answers it
+from the durable close journal.
 
 **Request:**
 

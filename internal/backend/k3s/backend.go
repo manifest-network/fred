@@ -692,11 +692,11 @@ func newBackend(
 			if err := ctx.Err(); err != nil {
 				return false, err
 			}
-			unlock, acquired := b.commandFence.TryLock(leaseUUID)
+			fence, acquired := b.commandFence.TryLock(leaseUUID)
 			if !acquired {
 				return false, nil
 			}
-			defer unlock()
+			defer fence.Release()
 			return true, run()
 		},
 	})

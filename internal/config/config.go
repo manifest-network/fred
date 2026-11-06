@@ -17,7 +17,6 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/spf13/viper"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendname"
 	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/hmacauth"
@@ -588,8 +587,8 @@ func (c *Config) Validate() error {
 		if b.URL == "" {
 			return fmt.Errorf("backends[%d].url is required", i)
 		}
-		if err := backend.ValidateRequestTimeout(b.Timeout); err != nil {
-			return fmt.Errorf("backends[%d].timeout %w", i, err)
+		if b.Timeout < 0 {
+			return fmt.Errorf("backends[%d].timeout must not be negative", i)
 		}
 		backendURL, err := httpurl.NormalizeOrigin(b.URL)
 		if err != nil {

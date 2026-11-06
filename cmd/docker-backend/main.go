@@ -647,7 +647,7 @@ func (s *Server) Handler() http.Handler {
 		return authMw(s.verifyStorageIdentity(handler))
 	}
 	mux.Handle("POST /provision", protected(http.HandlerFunc(s.handleProvision)))
-	mux.Handle("POST /deprovision", protected(http.HandlerFunc(s.handleDeprovision)))
+	mux.Handle("POST /deprovision", s.deprovisionEndpoint(protected))
 	mux.Handle("GET /info/{lease_uuid}", protected(http.HandlerFunc(s.handleGetInfo)))
 	mux.Handle("GET /logs/{lease_uuid}", protected(backend.NewLogsHandler(http.HandlerFunc(s.handleGetLogs), 30*time.Second, 30*time.Second)))
 	mux.Handle("GET /provisions/{lease_uuid}", protected(http.HandlerFunc(s.handleGetProvision)))
@@ -683,7 +683,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		prefix := backendidentity.BoundPathPrefix + "{storage_id}"
 		mux.Handle("POST "+prefix+"/provision", bind(http.HandlerFunc(s.handleProvision)))
-		mux.Handle("POST "+prefix+"/deprovision", bind(http.HandlerFunc(s.handleDeprovision)))
+		mux.Handle("POST "+prefix+"/deprovision", s.deprovisionEndpoint(bind))
 		mux.Handle("POST "+prefix+"/restart", bind(http.HandlerFunc(s.handleRestart)))
 		mux.Handle("POST "+prefix+"/update", bind(http.HandlerFunc(s.handleUpdate)))
 		mux.Handle("POST "+prefix+"/restore", bind(http.HandlerFunc(s.handleRestore)))
@@ -851,6 +851,19 @@ const serverWriteTimeout = 30 * time.Second
 
 const _ = uint64(serverWriteTimeout - backend.DeprovisionResponseBudget - time.Nanosecond)
 
+// deprovisionEndpoint serves /deprovision behind guard, its authentication and
+// storage-identity checks. The response budget starts before guard, so a
+// request waiting behind a slow identity verification still answers within
+// backend.DeprovisionResponseBudget.
+func (s *Server) deprovisionEndpoint(guard func(http.Handler) http.Handler) http.Handler {
+	guarded := guard(http.HandlerFunc(s.handleDeprovision))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), backend.DeprovisionResponseBudget)
+		defer cancel()
+		guarded.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 // DeprovisionRequest is the request body for /deprovision.
 type DeprovisionRequest struct {
 	LeaseUUID string `json:"lease_uuid"`
@@ -868,10 +881,9 @@ func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The close runs on the backend's lifetime. This request only waits for it,
-	// and answers lifecycle_pending when the close outlasts the budget.
-	ctx, cancel := context.WithTimeout(r.Context(), backend.DeprovisionResponseBudget)
-	defer cancel()
-	if err := s.backend.Deprovision(ctx, req.LeaseUUID); err != nil {
+	// within the budget deprovisionEndpoint set, and answers lifecycle_pending
+	// when the close outlasts it.
+	if err := s.backend.Deprovision(r.Context(), req.LeaseUUID); err != nil {
 		if s.lifecyclePendingResponse(w, err) {
 			return
 		}

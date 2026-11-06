@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
@@ -107,13 +108,26 @@ func TestLifecyclePendingAnswerIsCountedAsPending(t *testing.T) {
 	require.InDelta(t, 0.0, promtestutil.ToFloat64(requests.WithLabelValues("close-owner", "deprovision", "error")), 0)
 }
 
-func TestValidateRequestTimeoutLeavesRoomForTheDeprovisionBudget(t *testing.T) {
-	require.NoError(t, ValidateRequestTimeout(0), "zero selects the default")
-	require.NoError(t, ValidateRequestTimeout(defaultRequestTimeout))
-	require.NoError(t, ValidateRequestTimeout(DeprovisionResponseBudget+time.Nanosecond))
-	require.ErrorContains(t, ValidateRequestTimeout(DeprovisionResponseBudget), "must exceed")
-	require.ErrorContains(t, ValidateRequestTimeout(time.Second), "must exceed")
-	require.ErrorContains(t, ValidateRequestTimeout(-time.Second), "must not be negative")
+// /deprovision always outlasts the backend's answer budget, whatever timeout
+// the connection was configured with, so a close still running gets its
+// lifecycle_pending answer delivered instead of a client timeout.
+func TestDeprovisionRequestTimeoutCoversTheBackendsAnswerBudget(t *testing.T) {
+	for _, configured := range []time.Duration{0, time.Second, DeprovisionResponseBudget, time.Hour} {
+		policy, err := NewConnectionPolicy(ConnectionConfig{
+			Name: "close-owner", BaseURL: "https://backend.example", Secret: testIdentityClientKey, Timeout: configured,
+		})
+		require.NoError(t, err)
+		client, err := NewIdentityBoundHTTPClient(policy, HTTPClientOptions{},
+			&testStorageIdentityResolver{id: mustBackendStorageID(t, testBackendStorageIDA), bound: true})
+		require.NoError(t, err)
+		deprovision := client.wire.deprovisionClient()
+		want := max(cmp.Or(configured, defaultRequestTimeout), minDeprovisionRequestTimeout)
+		require.Equal(t, want, deprovision.Timeout, "configured %s", configured)
+		require.Greater(t, deprovision.Timeout, DeprovisionResponseBudget)
+		require.Equal(t, cmp.Or(configured, defaultRequestTimeout), client.wire.httpClient.Timeout,
+			"other requests keep the configured timeout")
+		require.Same(t, client.wire.httpClient.Transport, deprovision.Transport)
+	}
 }
 
 func TestDeprovisionTransportCannotForgeLocalCircuitRefusal(t *testing.T) {

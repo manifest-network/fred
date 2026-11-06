@@ -15,11 +15,12 @@ type ActorCloseScope struct{ state *actorCloseScopeState }
 type actorCloseScopeState struct {
 	actor   *LeaseActor
 	lineage shared.RecoveryLineage
+	fence   shared.CommandFenceHold
 	active  atomic.Bool
 }
 
-func newActorCloseScope(actor *LeaseActor) ActorCloseScope {
-	state := &actorCloseScopeState{actor: actor, lineage: actor.cfg.RecoveryLineage}
+func newActorCloseScope(actor *LeaseActor, fence shared.CommandFenceHold) ActorCloseScope {
+	state := &actorCloseScopeState{actor: actor, lineage: actor.cfg.RecoveryLineage, fence: fence}
 	state.active.Store(true)
 	actor.activeClose.Store(state)
 	return ActorCloseScope{state: state}
@@ -52,6 +53,17 @@ func (a *LeaseActor) CloseOwnsObservation(observation ActorObservation) bool {
 	generation := a.cfg.ProvisionStore.ClassifyReadyRuntime(death.Runtime)
 	return (generation == ObservationGenerationCurrent || generation == ObservationGenerationAdvanced) &&
 		scope.Matches(a, a.cfg.RecoveryLineage)
+}
+
+// CloseAdmitted reports that the substrate has committed the close's durable
+// head. That head refuses every other mutation of the lease, so the command
+// fence the close's caller handed over can go: teardown runs without it. The
+// actor releases the fence anyway when the close attempt ends, so a close that
+// never reaches its head never leaks it.
+func (scope ActorCloseScope) CloseAdmitted() {
+	if scope.state != nil && scope.state.active.Load() {
+		scope.state.fence.Release()
+	}
 }
 
 func (scope ActorCloseScope) LeaseUUID() string {

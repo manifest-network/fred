@@ -1079,6 +1079,35 @@ func TestHandleDeprovision(t *testing.T) {
 		assert.WithinRange(t, deadline,
 			started.Add(backend.DeprovisionResponseBudget), finished.Add(backend.DeprovisionResponseBudget))
 	})
+
+	// The budget starts before the storage identity check, so a request queued
+	// behind a slow verification still answers in time, on either route.
+	t.Run("budget covers the storage identity check", func(t *testing.T) {
+		identity, err := backendidentity.Parse("a8ff9194-0f55-4a31-854e-5f63b236ef3b")
+		require.NoError(t, err)
+		for _, path := range []string{"/deprovision", backendidentity.BoundPathPrefix + identity.String() + "/deprovision"} {
+			var deadline time.Time
+			var bounded bool
+			mb := &mockBackend{
+				VerifyStorageIdentityFunc: func(ctx context.Context) error {
+					deadline, bounded = ctx.Deadline()
+					return nil
+				},
+				DeprovisionFunc: func(context.Context, string) error { return nil },
+			}
+			server, err := NewIdentityBoundServer(mb, testRequestKeys, slog.Default(), docker.DefaultMaxRequestBodySize, identity)
+			require.NoError(t, err)
+			started := time.Now()
+			w := httptest.NewRecorder()
+			server.Handler().ServeHTTP(w, signedPostRequest(path, validBody))
+			finished := time.Now()
+
+			require.Equal(t, http.StatusOK, w.Code, path)
+			require.True(t, bounded, "%s: the identity check must run under the response budget", path)
+			assert.WithinRange(t, deadline,
+				started.Add(backend.DeprovisionResponseBudget), finished.Add(backend.DeprovisionResponseBudget), path)
+		}
+	})
 }
 
 func TestHandleGetInfo(t *testing.T) {

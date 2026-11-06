@@ -1071,9 +1071,14 @@ const CodeInsufficientResources = "insufficient_resources"
 // defaultRequestTimeout bounds a backend request when none is configured.
 const defaultRequestTimeout = 30 * time.Second
 
-// The default must leave a backend room to answer /deprovision: converting a
-// negative difference to uint64 does not compile.
-const _ = uint64(defaultRequestTimeout - DeprovisionResponseBudget - time.Nanosecond)
+// minDeprovisionRequestTimeout is the least time a /deprovision request gets,
+// whatever timeout the connection was configured with: the backend's response
+// budget, plus deprovisionResponseAllowance to write and deliver the answer.
+// A shorter timeout would cut off the answer of a close that is still running.
+const (
+	deprovisionResponseAllowance = 10 * time.Second
+	minDeprovisionRequestTimeout = DeprovisionResponseBudget + deprovisionResponseAllowance
+)
 
 // CodeCloseDeferred reports retryable lifecycle contention, never completed cleanup.
 const CodeCloseDeferred = "close_deferred"
@@ -1305,6 +1310,14 @@ type httpWire struct {
 	baseURL    string
 	secret     string
 	httpClient *http.Client
+}
+
+// deprovisionClient is httpClient with a timeout of at least
+// minDeprovisionRequestTimeout. It shares httpClient's transport.
+func (wire *httpWire) deprovisionClient() *http.Client {
+	client := *wire.httpClient
+	client.Timeout = max(client.Timeout, minDeprovisionRequestTimeout)
+	return &client
 }
 
 // connection returns the wire, or the fenced refusal before any request
@@ -1731,7 +1744,17 @@ func (c *HTTPClient) prepareRequest(
 }
 
 func (c *HTTPClient) do(wire *httpWire, req *http.Request) (*http.Response, error) {
-	resp, err := wire.httpClient.Do(req)
+	return c.send(wire.httpClient, req)
+}
+
+// doDeprovision is do for /deprovision, whose timeout is never shorter than
+// the backend's answer budget plus delivery.
+func (c *HTTPClient) doDeprovision(wire *httpWire, req *http.Request) (*http.Response, error) {
+	return c.send(wire.deprovisionClient(), req)
+}
+
+func (c *HTTPClient) send(client *http.Client, req *http.Request) (*http.Response, error) {
+	resp, err := client.Do(req)
 	if err != nil || c.identity == nil {
 		return resp, err
 	}
@@ -2287,7 +2310,7 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 			return nil, err
 		}
 
-		resp, err := c.do(wire, httpReq)
+		resp, err := c.doDeprovision(wire, httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("deprovision request failed: %w", err)
 		}

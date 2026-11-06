@@ -289,7 +289,7 @@ func TestNetworkCleanupBusyLeaseDoesNotBlockShutdownAndRetries(t *testing.T) {
 		defer func() { b.stopCancel(); b.wg.Wait() }()
 		// A lifecycle command holds the lease's fence, for example an admission
 		// that has not yet published its provision.
-		unlock := b.commandFence.Lock(lease)
+		unlock := b.commandFence.Lock(lease).Release
 		locked := true
 		defer func() {
 			if locked {
@@ -306,7 +306,7 @@ func TestNetworkCleanupBusyLeaseDoesNotBlockShutdownAndRetries(t *testing.T) {
 		time.Sleep(time.Minute)
 		synctest.Wait()
 		require.Equal(t, int32(1), removals.Load(), "a previously busy lease remains eligible on the next pass")
-		unlock = b.commandFence.Lock(lease)
+		unlock = b.commandFence.Lock(lease).Release
 		locked = true
 		time.Sleep(time.Minute)
 		synctest.Wait()

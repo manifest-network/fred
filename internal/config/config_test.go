@@ -1265,14 +1265,6 @@ func TestConfig_Validate_BackendURLs(t *testing.T) {
 			wantErr: "backends[0].timeout must not be negative",
 		},
 		{
-			name: "backend timeout within the deprovision response budget",
-			modify: func(c *Config) {
-				c.Backends = []BackendConfig{{Name: "mock", URL: "https://backend.example.com", Timeout: 20 * time.Second, IsDefault: true}}
-				c.CallbackBaseURL = "https://fred.example.com"
-			},
-			wantErr: "backends[0].timeout must exceed 20s",
-		},
-		{
 			name: "backend URL with empty query marker",
 			modify: func(c *Config) {
 				c.Backends = []BackendConfig{{Name: "mock", URL: "https://backend.example.com?", IsDefault: true}}

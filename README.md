@@ -236,7 +236,7 @@ placement_store_db_path: "/var/lib/fred/placements.db"
 | `hmac_secret_previous` | Verify-only key accepted on this backend's callbacks during a key rotation; providerd never signs with it. Requires `hmac_secret` on the same backend and at least 32 bytes, and must not duplicate any other configured key. See [Rotating a backend's HMAC key](DEPLOYMENT.md#rotating-a-backends-hmac-key) | `""` |
 | `skus` | Exact list of on-chain SKU UUIDs this backend serves | `[]` |
 | `default` | Fallback for SKUs no backend lists. At most one backend may set it; without one, the first configured backend is the fallback | `false` |
-| `timeout` | HTTP request timeout for calls to this backend; must exceed `20s`, the longest a backend takes to answer `/deprovision` | `30s` |
+| `timeout` | HTTP request timeout for calls to this backend | `30s` |
 | `tls_ca_file` | PEM CA that signed the backend's server certificate; empty uses the system roots. Requires an `https://` `url` | `""` |
 | `tls_skip_verify` | Skip backend certificate verification (development only; rejected when `production_mode: true`). Requires an `https://` `url` | `false` |
 | `tls_client_cert_file`, `tls_client_key_file` | Client certificate and key for mTLS to the backend; set both or neither. Require an `https://` `url` | `""` |

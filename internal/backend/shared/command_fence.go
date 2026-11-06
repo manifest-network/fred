@@ -24,41 +24,73 @@ type CommandFence struct {
 	entries map[string]*commandFenceEntry
 }
 
-// Lock acquires the mutex for leaseUUID and returns an idempotent unlock
-// function. Refcounts include both the current holder and queued waiters, which
-// prevents an entry from being removed while another goroutine can still acquire
-// its mutex.
-func (f *CommandFence) Lock(leaseUUID string) func() {
+// CommandFenceHold is exclusive ownership of one lease's command fence. Only a
+// CommandFence mints one. Its copies share that ownership, so it can move
+// into a command that releases it later: the first Release gives the fence
+// back, and later ones, through any copy, do nothing. The zero value holds
+// nothing.
+type CommandFenceHold struct{ held *commandFenceHeld }
+
+type commandFenceHeld struct {
+	fence     *CommandFence
+	leaseUUID string
+	entry     *commandFenceEntry
+	once      sync.Once
+}
+
+// LeaseUUID names the lease whose fence this is, or "" for the zero value.
+func (hold CommandFenceHold) LeaseUUID() string {
+	if hold.held == nil {
+		return ""
+	}
+	return hold.held.leaseUUID
+}
+
+// Release gives the fence back the first time any copy calls it.
+func (hold CommandFenceHold) Release() {
+	if hold.held == nil {
+		return
+	}
+	hold.held.once.Do(func() {
+		<-hold.held.entry.held
+		hold.held.fence.release(hold.held.leaseUUID, hold.held.entry)
+	})
+}
+
+// Lock acquires the fence for leaseUUID. Refcounts include both the current
+// holder and queued waiters, which prevents an entry from being removed while
+// another goroutine can still acquire it.
+func (f *CommandFence) Lock(leaseUUID string) CommandFenceHold {
 	entry := f.reference(leaseUUID)
 	entry.held <- struct{}{}
-	return f.unlockFunc(leaseUUID, entry)
+	return f.hold(leaseUUID, entry)
 }
 
 // LockContext is Lock for a caller whose wait is bounded. When ctx ends first
 // it holds nothing and returns ctx's error.
-func (f *CommandFence) LockContext(ctx context.Context, leaseUUID string) (func(), error) {
+func (f *CommandFence) LockContext(ctx context.Context, leaseUUID string) (CommandFenceHold, error) {
 	entry := f.reference(leaseUUID)
 	select {
 	case entry.held <- struct{}{}:
-		return f.unlockFunc(leaseUUID, entry), nil
+		return f.hold(leaseUUID, entry), nil
 	case <-ctx.Done():
 		f.release(leaseUUID, entry)
-		return nil, ctx.Err()
+		return CommandFenceHold{}, ctx.Err()
 	}
 }
 
 // TryLock acquires leaseUUID only when doing so cannot wait. It is intended for
 // level-triggered background convergence: a live caller already owning the
 // command is authoritative, so recovery should defer that lease without
-// stalling unrelated work. The returned unlock function is idempotent.
-func (f *CommandFence) TryLock(leaseUUID string) (func(), bool) {
+// stalling unrelated work.
+func (f *CommandFence) TryLock(leaseUUID string) (CommandFenceHold, bool) {
 	entry := f.reference(leaseUUID)
 	select {
 	case entry.held <- struct{}{}:
-		return f.unlockFunc(leaseUUID, entry), true
+		return f.hold(leaseUUID, entry), true
 	default:
 		f.release(leaseUUID, entry)
-		return nil, false
+		return CommandFenceHold{}, false
 	}
 }
 
@@ -88,12 +120,6 @@ func (f *CommandFence) release(leaseUUID string, entry *commandFenceEntry) {
 	}
 }
 
-func (f *CommandFence) unlockFunc(leaseUUID string, entry *commandFenceEntry) func() {
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			<-entry.held
-			f.release(leaseUUID, entry)
-		})
-	}
+func (f *CommandFence) hold(leaseUUID string, entry *commandFenceEntry) CommandFenceHold {
+	return CommandFenceHold{held: &commandFenceHeld{fence: f, leaseUUID: leaseUUID, entry: entry}}
 }

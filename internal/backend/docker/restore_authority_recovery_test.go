@@ -183,7 +183,7 @@ func TestRestoreAuthorityValidationDistinguishesBusyDeferralFromExecutedValidati
 	})
 	before := restoreAuthorityJournalBytes(t, b)
 	entered := observeRestoreRecoveryEntryForTest(t, b)
-	unlock := b.commandFence.Lock(restoreAuthorityDestination)
+	unlock := b.commandFence.Lock(restoreAuthorityDestination).Release
 	t.Cleanup(unlock)
 	require.NoError(t, b.reconcileRetentions(t.Context()), "busy live work is a normal deferral")
 	assert.False(t, entered(), "a deferred sweep has not validated the mismatched authority")

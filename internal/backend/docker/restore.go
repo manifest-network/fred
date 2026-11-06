@@ -1709,7 +1709,7 @@ func (b *Backend) Restore(ctx context.Context, request backend.RestoreRequest) e
 	if err := b.requireMutationAdmission(ctx, "restore"); err != nil {
 		return fmt.Errorf("backend storage identity verification failed: %w", err)
 	}
-	unlockCommand := b.commandFence.Lock(req.LeaseUUID)
+	unlockCommand := b.commandFence.Lock(req.LeaseUUID).Release
 	defer unlockCommand()
 	logger := b.logger.With("lease_uuid", req.LeaseUUID, "from_lease", req.FromLeaseUUID, "tenant", req.Tenant)
 	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(

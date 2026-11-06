@@ -73,13 +73,70 @@ func TestCloseOutlivesItsCallerAndAnswersTheRetryQueuedBehindIt(t *testing.T) {
 	closeCloseRecoveryBackend(t, b, stores)
 }
 
+// A close takes over the lease's command fence from the caller that checked it
+// may begin, and keeps it until its durable head commits, whatever its caller
+// does. Releasing it when the caller stopped waiting would let a restore admit
+// the lease between that check and the head. Teardown then runs without the
+// fence, and a queued close that never runs gives it back.
+func TestCloseKeepsTheCommandFenceUntilItsHeadCommits(t *testing.T) {
+	b, stores := openCloseRecoveryBackend(t, t.TempDir(), &mockDockerClient{}, nil)
+	seedCloseDeprovisionLease(t, b, stores)
+	tearingDown := make(chan struct{}, 1)
+	finishTeardown := make(chan struct{})
+	b.compose = &mockComposeExecutor{DownFn: func(ctx context.Context, _ string, _ time.Duration) error {
+		tearingDown <- struct{}{}
+		<-finishTeardown
+		return ctx.Err()
+	}}
+	fenceFree := func() bool {
+		fence, free := b.commandFence.TryLock(closeDeprovisionLeaseUUID)
+		fence.Release()
+		return free
+	}
+
+	first, stopFirst := context.WithCancel(t.Context())
+	defer stopFirst()
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- b.Deprovision(first, closeDeprovisionLeaseUUID) }()
+	select {
+	case <-tearingDown:
+	case <-time.After(5 * time.Second):
+		t.Fatal("close did not reach teardown")
+	}
+	require.True(t, fenceFree(), "a committed close head gives the fence back before teardown")
+	_, found, err := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	closing := b.actorFor(closeDeprovisionLeaseUUID)
+	second, stopSecond := context.WithCancel(t.Context())
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- b.Deprovision(second, closeDeprovisionLeaseUUID) }()
+	require.Eventually(t, func() bool { return closing.InboxDepth() == 1 },
+		5*time.Second, time.Millisecond, "the second close must queue behind the running one")
+	stopSecond()
+	select {
+	case err := <-secondDone:
+		require.True(t, IsLifecyclePending(err), "%v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second close kept its caller waiting")
+	}
+	require.False(t, fenceFree(), "a queued close keeps the fence after its caller stops waiting")
+
+	close(finishTeardown)
+	require.NoError(t, <-firstDone)
+	require.Eventually(t, fenceFree, 5*time.Second, time.Millisecond,
+		"the retiring actor gives back the fence of the close it never ran")
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
 // While other lifecycle work holds the lease's command fence, a close caller
 // stops waiting at its deadline with a pending answer instead of outlasting it.
 func TestCloseCallerStopsWaitingForAHeldCommandFence(t *testing.T) {
 	b, stores := openCloseRecoveryBackend(t, t.TempDir(), &mockDockerClient{}, nil)
 	seedCloseDeprovisionLease(t, b, stores)
 	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error { return nil }}
-	unlock := b.commandFence.Lock(closeDeprovisionLeaseUUID)
+	unlock := b.commandFence.Lock(closeDeprovisionLeaseUUID).Release
 
 	waiting, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
@@ -90,6 +147,30 @@ func TestCloseCallerStopsWaitingForAHeldCommandFence(t *testing.T) {
 	require.False(t, found, "nothing ran while the fence was held")
 
 	unlock()
+	require.NoError(t, b.Deprovision(t.Context(), closeDeprovisionLeaseUUID))
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
+// A close caller waiting behind another storage identity verification stops at
+// its own deadline instead of outlasting it.
+func TestCloseCallerStopsWaitingForIdentityVerification(t *testing.T) {
+	b, stores := openCloseRecoveryBackend(t, t.TempDir(), &mockDockerClient{}, nil)
+	seedCloseDeprovisionLease(t, b, stores)
+	fixtureVerifier := b.storageVerifier
+	b.storageVerifier = productionDockerStorageIdentityVerifier{backend: b, authority: b.storageAuthority}
+	b.identityVerifyMu.lock()
+	waiting, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := b.Deprovision(waiting, closeDeprovisionLeaseUUID)
+	require.Less(t, time.Since(started), 5*time.Second, "the caller outlasted its deadline")
+	require.True(t, IsLifecyclePending(err), "%v", err)
+	b.identityVerifyMu.unlock()
+	b.storageVerifier = fixtureVerifier
+	require.NoError(t, b.terminalStorageAuthorityError(), "a caller giving up is not an identity failure")
+	_, found, readErr := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
+	require.NoError(t, readErr)
+	require.False(t, found, "nothing ran before identity was verified")
 	require.NoError(t, b.Deprovision(t.Context(), closeDeprovisionLeaseUUID))
 	closeCloseRecoveryBackend(t, b, stores)
 }

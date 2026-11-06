@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
 func bindBackendRecoveryCoordinatorForTest(t *testing.T, b *Backend) {
@@ -40,7 +41,7 @@ func (b *Backend) doDeprovisionForTest(
 	acquired, err := b.recoveryCoordinator.WithLease(
 		ctx, leaseUUID,
 		func(scope shared.LeaseRecoveryScope) error {
-			return b.doDeprovisionScoped(ctx, scope, leaseUUID)
+			return b.doDeprovisionScoped(ctx, scope, leasesm.ActorCloseScope{}, leaseUUID)
 		},
 	)
 	if err != nil {

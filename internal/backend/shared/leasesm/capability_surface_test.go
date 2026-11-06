@@ -271,7 +271,7 @@ func TestLifecycleObservationCarriesExactActiveOperationGeneration(t *testing.T)
 func TestOpaqueMessageCapabilitiesAreCopySafeAndAcceptedOnce(t *testing.T) {
 	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{})
 
-	command, _ := NewDeprovisionCommand()
+	command, _ := newTestDeprovisionCommand(t, testActorLeaseUUID)
 	copyOfCommand := command
 	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
 	assert.False(t, actor.TryEnqueueCommand(copyOfCommand), "a copied command must share one-shot admission")

@@ -895,7 +895,7 @@ func TestRecoverLiveOperationIntent_DefersLeaseWithActiveCommand(t *testing.T) {
 	}}
 
 	forbidOperationRecoveryTeardown(t, b)
-	unlock := b.commandFence.Lock(spec.LeaseUUID)
+	unlock := b.commandFence.Lock(spec.LeaseUUID).Release
 	started := time.Now()
 	require.NoError(t, b.recoverLiveOperationIntents(context.Background()))
 	assert.Less(t, time.Since(started), time.Second,
