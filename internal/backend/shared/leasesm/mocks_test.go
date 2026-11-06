@@ -451,11 +451,11 @@ func (m *mockProvisionStore) Delete(uuid string) bool {
 // field stub pattern shown below (see mockInstanceInspector).
 type mockSMMetrics struct{}
 
-func (mockSMMetrics) SMTransition(_, _, _ string)   {}
-func (mockSMMetrics) ActorCreated()                 {}
-func (mockSMMetrics) WorkerPanic(_ string)          {}
-func (mockSMMetrics) ActorPanic()                   {}
-func (mockSMMetrics) TerminalEventDropped(_ string) {}
+func (mockSMMetrics) SMTransition(Transition)            {}
+func (mockSMMetrics) ActorCreated()                      {}
+func (mockSMMetrics) WorkerPanic(Worker)                 {}
+func (mockSMMetrics) ActorPanic()                        {}
+func (mockSMMetrics) TerminalEventDropped(TerminalEvent) {}
 
 func (mockSMMetrics) LeaseFailureRecorded(failurecause.Cause) {}
 func (mockSMMetrics) PendingOperationUnstamped()              {}

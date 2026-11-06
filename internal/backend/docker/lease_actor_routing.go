@@ -128,12 +128,12 @@ func (b *Backend) routeActorObservationDisposition(
 }
 
 func (b *Backend) dispatchContainerDeathObservation(
-	observation leasesm.ActorObservation, containerID, source string,
+	observation leasesm.ActorObservation, containerID string, source deathSource,
 ) {
 	if b.routeActorObservationDisposition(observation) != observationRefused {
 		return
 	}
-	dieEventDroppedTotal.WithLabelValues(source).Inc()
+	source.dropped.Inc()
 	// The sweep re-detects a current death, but without live provenance: it is
 	// attributed unknown and never counts toward the terminal budget (ENG-799).
 	b.logger.Warn("die event dropped at dispatch; the reconcile sweep will re-detect it, unattributed",

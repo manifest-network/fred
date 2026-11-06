@@ -153,10 +153,10 @@ func TestContainerDeathDispatchKeepsRefusalSignal(t *testing.T) {
 				b.provisions[eventCloseLeaseUUID].Status = backend.ProvisionStatusDeprovisioning
 				b.actorFor(eventCloseLeaseUUID)
 			}
-			for _, source := range []string{"event_loop", "reconcile"} {
-				before := testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues(source))
+			for _, source := range []deathSource{deathSourceEventLoop, deathSourceReconcile} {
+				before := testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues(source.String()))
 				b.dispatchContainerDeathObservation(observation, "close-container", source)
-				assert.Equal(t, before+1, testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues(source)))
+				assert.Equal(t, before+1, testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues(source.String())))
 			}
 			b.stopCancel()
 			b.wg.Wait()
@@ -187,7 +187,7 @@ func TestContainerDeathDispatchCountsFullInbox(t *testing.T) {
 		requireAccepted(t, func() bool { return b.routeToLease(eventCloseLeaseUUID, actorBackpressureCommand(t, claim)) })
 	}
 	before := testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues("event_loop"))
-	b.dispatchContainerDeathObservation(mustContainerDiedObservation(t, "close-container", proof), "close-container", "event_loop")
+	b.dispatchContainerDeathObservation(mustContainerDiedObservation(t, "close-container", proof), "close-container", deathSourceEventLoop)
 	assert.Equal(t, before+1, testutil.ToFloat64(dieEventDroppedTotal.WithLabelValues("event_loop")))
 	b.stopCancel()
 	b.wg.Wait()

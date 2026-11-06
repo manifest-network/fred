@@ -42,8 +42,8 @@ type pendingWorkerCapabilities struct {
 	leasesm.SMMetrics
 }
 
-func (pendingWorkerCapabilities) SMTransition(string, string, string) {}
-func (pendingWorkerCapabilities) ActorCreated()                       {}
+func (pendingWorkerCapabilities) SMTransition(leasesm.Transition) {}
+func (pendingWorkerCapabilities) ActorCreated()                   {}
 
 func actorLifecyclePendingError(t *testing.T) error {
 	t.Helper()

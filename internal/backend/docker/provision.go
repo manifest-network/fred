@@ -979,12 +979,12 @@ func (b *Backend) doProvisionPhysical(
 			// Rolled back exactly; the classifier decides whether it is definite.
 			logger.Error("stack provision failed during startup and was rolled back",
 				"lease_uuid", req.LeaseUUID, "container_id", leasesm.ShortID(settled.state.container.id))
-			provisionsTotal.WithLabelValues("failure").Inc()
+			provisionOutcomes.failure.Inc()
 			updateResourceMetrics(b.pool.Stats())
 			return
 		}
 		if failure == nil {
-			provisionsTotal.WithLabelValues("success").Inc()
+			provisionOutcomes.success.Inc()
 			if b.diagnosticsStore != nil {
 				if delErr := b.diagnosticsStore.Delete(req.LeaseUUID); delErr != nil {
 					b.logger.Warn("failed to remove stale diagnostic entry", "lease", req.LeaseUUID, "error", delErr)
@@ -994,7 +994,7 @@ func (b *Backend) doProvisionPhysical(
 			return
 		}
 		logger.Error("stack provision failed", "lease_uuid", req.LeaseUUID, "error", failure)
-		provisionsTotal.WithLabelValues("failure").Inc()
+		provisionOutcomes.failure.Inc()
 		errRet = errors.Join(failure, errRet)
 		if mutations.effectEntered() && !launch.boundTo(mutations) {
 			// Once any tenant Step was entered, a same-turn cleanup cannot prove a

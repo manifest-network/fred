@@ -132,9 +132,9 @@ func TestClosePartitionMatrix(t *testing.T) {
 			}
 
 			stampedBefore := testutil.ToFloat64(retentionPartitionStampedTotal)
-			divBefore := testutil.ToFloat64(retentionPartitionCollapsedTotal.WithLabelValues(shared.PartitionReasonDivergent))
-			invBefore := testutil.ToFloat64(retentionPartitionCollapsedTotal.WithLabelValues(shared.PartitionReasonInvalid))
-			overBefore := testutil.ToFloat64(retentionPartitionCollapsedTotal.WithLabelValues(shared.PartitionReasonOverLimit))
+			divBefore := testutil.ToFloat64(retentionPartitionCollapsedTotal.WithLabelValues(string(shared.PartitionReasonDivergent)))
+			invBefore := testutil.ToFloat64(retentionPartitionCollapsedTotal.WithLabelValues(string(shared.PartitionReasonInvalid)))
+			overBefore := testutil.ToFloat64(retentionPartitionCollapsedTotal.WithLabelValues(string(shared.PartitionReasonOverLimit)))
 
 			require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
 
@@ -147,9 +147,9 @@ func TestClosePartitionMatrix(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, tc.wantPartition, rec.Partition)
 			require.Equal(t, tc.want.stamped, testutil.ToFloat64(retentionPartitionStampedTotal)-stampedBefore)
-			require.Equal(t, tc.want.collapsedDivergent, testutil.ToFloat64(retentionPartitionCollapsedTotal.WithLabelValues(shared.PartitionReasonDivergent))-divBefore)
-			require.Equal(t, tc.want.collapsedInvalid, testutil.ToFloat64(retentionPartitionCollapsedTotal.WithLabelValues(shared.PartitionReasonInvalid))-invBefore)
-			require.Equal(t, tc.want.collapsedOverLimit, testutil.ToFloat64(retentionPartitionCollapsedTotal.WithLabelValues(shared.PartitionReasonOverLimit))-overBefore)
+			require.Equal(t, tc.want.collapsedDivergent, testutil.ToFloat64(retentionPartitionCollapsedTotal.WithLabelValues(string(shared.PartitionReasonDivergent)))-divBefore)
+			require.Equal(t, tc.want.collapsedInvalid, testutil.ToFloat64(retentionPartitionCollapsedTotal.WithLabelValues(string(shared.PartitionReasonInvalid)))-invBefore)
+			require.Equal(t, tc.want.collapsedOverLimit, testutil.ToFloat64(retentionPartitionCollapsedTotal.WithLabelValues(string(shared.PartitionReasonOverLimit)))-overBefore)
 		})
 	}
 }
@@ -188,13 +188,13 @@ func TestClose_GlobalCapStillRefusesBudgetedTenant(t *testing.T) {
 	putActivePart(t, rs, "other-tenant-rec", "other", "", time.Now().Add(-time.Hour)) // fills L0
 
 	bareBefore := testutil.ToFloat64(retentionRefusedTotal)
-	scopedBefore := testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopeGlobal))
+	scopedBefore := testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopeGlobal.String()))
 
 	require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
 
 	require.Eventually(t, func() bool {
 		return testutil.ToFloat64(retentionRefusedTotal) == bareBefore+1 &&
-			testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopeGlobal)) == scopedBefore+1
+			testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopeGlobal.String())) == scopedBefore+1
 	}, 5*time.Second, 50*time.Millisecond)
 	require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "other-tenant-rec"))
 }
@@ -219,10 +219,10 @@ func TestClose_ScopedRefusals(t *testing.T) {
 			putActivePart(t, rs, fmt.Sprintf("t-%d", i), "tenant-a", "", time.Now().Add(-time.Hour))
 		}
 		bareBefore := testutil.ToFloat64(retentionRefusedTotal)
-		scopedBefore := testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopeTenant))
+		scopedBefore := testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopeTenant.String()))
 		require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
 		require.Eventually(t, func() bool {
-			return testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopeTenant)) == scopedBefore+1
+			return testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopeTenant.String())) == scopedBefore+1
 		}, 5*time.Second, 50*time.Millisecond)
 		require.Equal(t, bareBefore, testutil.ToFloat64(retentionRefusedTotal),
 			"bare counter keeps its deployed L0-only meaning")
@@ -248,10 +248,10 @@ func TestClose_ScopedRefusals(t *testing.T) {
 		for i := 0; i < 4; i++ { // cust-a already holds 4×512 = its full disk sub-cap
 			putActivePart(t, rs, fmt.Sprintf("p-%d", i), "tenant-a", "cust-a", time.Now().Add(-time.Hour))
 		}
-		scopedBefore := testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopePartition))
+		scopedBefore := testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopePartition.String()))
 		require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
 		require.Eventually(t, func() bool {
-			return testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopePartition)) == scopedBefore+1
+			return testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopePartition.String())) == scopedBefore+1
 		}, 5*time.Second, 50*time.Millisecond)
 		for i := 0; i < 4; i++ {
 			require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, fmt.Sprintf("p-%d", i)),

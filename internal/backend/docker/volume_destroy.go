@@ -31,6 +31,8 @@ import (
 	"log/slog"
 	"slices"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
@@ -377,7 +379,7 @@ func (o *volumeOp) partition(candidates []string) (mine, foreign []string, err e
 func (o *volumeOp) destroy(
 	mutations volumeDestroyMutationCapability,
 	ctx context.Context,
-	site string,
+	site destroySite,
 	names ...string,
 ) destroyReport {
 	var rep destroyReport
@@ -389,7 +391,7 @@ func (o *volumeOp) destroy(
 		// Unreachable with any manager in this repo; see volumeDestroyer's doc. Refuse
 		// rather than panic — the safe reading of "I cannot destroy" is "I did not".
 		rep.Unproven = names
-		o.countRefusals(site, destroyRefusedNoDestroyer, names)
+		o.countRefusals(site.noDestroyer, names)
 		o.logger.Error("volume manager cannot destroy volumes; destroying nothing",
 			"site", site, "volumes", names)
 		return rep
@@ -409,7 +411,7 @@ func (o *volumeOp) destroy(
 			// Fail-safe, matching every other uncertainty in this backend: we cannot tell
 			// our volumes from another lease's, so we must not destroy either.
 			rep.Unproven = names
-			o.countRefusals(site, destroyRefusedUnreadable, names)
+			o.countRefusals(site.unreadable, names)
 			o.logger.Error("cannot read ownership records; destroying nothing this pass",
 				"site", site, "asking_lease_uuid", o.owner, "volumes", names, "error", err)
 			return rep
@@ -475,9 +477,9 @@ func (o *volumeOp) destroyOne(
 // destroy-time re-check's — the outcome and the metric are identical (a refusal is a
 // refusal), but only the second means the two actually raced, which is the one thing an
 // operator reading the log cannot reconstruct afterwards.
-func (o *volumeOp) refuse(rep *destroyReport, site, name string, claim volumeClaim, why string) {
+func (o *volumeOp) refuse(rep *destroyReport, site destroySite, name string, claim volumeClaim, why string) {
 	rep.Claimed = append(rep.Claimed, name)
-	volumeDestroyRefusedTotal.WithLabelValues(site, destroyRefusedClaimed).Inc()
+	site.claimed.Inc()
 	o.logger.Warn(why,
 		"site", site, "volume_id", name, "asking_lease_uuid", o.owner,
 		"owner_lease_uuid", claim.owner, "claim", claim.kind.String())
@@ -495,11 +497,9 @@ func allRetainedNames(names []string) bool {
 	return true
 }
 
-// countRefusals bumps the refusal counter once per name for a whole-batch refusal.
-func (o *volumeOp) countRefusals(site, reason string, names []string) {
-	for range names {
-		volumeDestroyRefusedTotal.WithLabelValues(site, reason).Inc()
-	}
+// countRefusals bumps a refusal series once per name for a whole-batch refusal.
+func (o *volumeOp) countRefusals(refused prometheus.Counter, names []string) {
+	refused.Add(float64(len(names)))
 }
 
 // assertVolumeDestroyer checks at construction that the configured volume manager can

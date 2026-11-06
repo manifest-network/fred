@@ -51,7 +51,7 @@ import (
 // direction is to keep the lease tracked and retry (cleanup gates fail open toward
 // "keep", counted in a metric).
 func (b *Backend) teardownLeaseContainersWith(mutations *storageMutations, ctx context.Context, leaseUUID string, recordedIDs []string,
-	stopTimeout time.Duration, operation string, logger *slog.Logger) ([]string, error) {
+	stopTimeout time.Duration, operation teardownOperation, logger *slog.Logger) ([]string, error) {
 	if mutations == nil {
 		return recordedIDs, errors.New("teardown mutation capability is unavailable")
 	}
@@ -66,7 +66,7 @@ func (b *Backend) teardownLeaseContainersWith(mutations *storageMutations, ctx c
 	// Started intent. The adapter is lexical to this exact Started subject; it
 	// cannot select another lease, project, or container authority.
 	var remaining []string
-	err := mutations.runner.Step(ctx, operation+" convergent container teardown", func(mutationCtx context.Context) error {
+	err := mutations.runner.Step(ctx, operation.String()+" convergent container teardown", func(mutationCtx context.Context) error {
 		var teardownErr error
 		remaining, teardownErr = b.teardownLeaseContainersUsing(
 			exactOperationTeardown{mutations: mutations}, mutationCtx, leaseUUID,
@@ -83,7 +83,7 @@ type teardownMutationCapability interface {
 }
 
 func (b *Backend) teardownLeaseContainersUsing(mutations teardownMutationCapability, ctx context.Context, leaseUUID string, recordedIDs []string,
-	stopTimeout time.Duration, operation string, logger *slog.Logger) ([]string, error) {
+	stopTimeout time.Duration, operation teardownOperation, logger *slog.Logger) ([]string, error) {
 	if mutations == nil {
 		return recordedIDs, errors.New("teardown mutation capability is unavailable")
 	}
@@ -101,7 +101,7 @@ func (b *Backend) teardownLeaseContainersUsing(mutations teardownMutationCapabil
 	if errors.Is(downErr, context.Canceled) || errors.Is(downErr, context.DeadlineExceeded) ||
 		errors.Is(downErr, backendidentity.ErrIdentityDrift) ||
 		errors.Is(downErr, backendidentity.ErrMutationOutcomeAmbiguous) {
-		teardownFallbackTotal.WithLabelValues(operation, teardownOutcomeFailed).Inc()
+		operation.failed.Inc()
 		return recordedIDs, downErr
 	}
 	// No lease_uuid field here: most callers hand in a logger that already binds it,
@@ -114,7 +114,7 @@ func (b *Backend) teardownLeaseContainersUsing(mutations teardownMutationCapabil
 		// Cannot enumerate, so cannot prove the host is clean. Report every id we do
 		// know of as still-possibly-present rather than an empty list, which a caller
 		// would read as "nothing left".
-		teardownFallbackTotal.WithLabelValues(operation, teardownOutcomeFailed).Inc()
+		operation.failed.Inc()
 		return recordedIDs, fmt.Errorf("compose down failed (%w) and container discovery failed: %w", downErr, derr)
 	}
 
@@ -132,10 +132,10 @@ func (b *Backend) teardownLeaseContainersUsing(mutations teardownMutationCapabil
 		logger.Info("container removed", "container_id", leasesm.ShortID(id))
 	}
 	if len(errs) > 0 {
-		teardownFallbackTotal.WithLabelValues(operation, teardownOutcomeFailed).Inc()
+		operation.failed.Inc()
 		return remaining, errors.Join(errs...)
 	}
-	teardownFallbackTotal.WithLabelValues(operation, teardownOutcomeRecovered).Inc()
+	operation.recovered.Inc()
 	return nil, nil
 }
 

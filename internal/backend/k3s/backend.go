@@ -724,9 +724,7 @@ func newBackend(
 		Secret:          string(cfg.CallbackSecret),
 		Logger:          b.logger,
 
-		OnDelivery: func(outcome string) {
-			callbackDeliveryTotal.WithLabelValues(outcome).Inc()
-		},
+		OnDelivery: callbackDeliveries.record,
 		OnStoreError: func() {
 			callbackStoreErrorsTotal.Inc()
 		},

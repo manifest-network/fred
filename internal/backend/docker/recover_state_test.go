@@ -496,19 +496,21 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 	}
 
 	b := &Backend{
-		cfg:                 cfg,
-		docker:              mock,
-		compose:             &mockComposeExecutor{},
-		pool:                pool,
-		volumes:             &noopVolumeManager{},
-		logger:              slog.Default(),
-		provisions:          provs,
-		operationSettlement: noopOperationIntentJournal{},
-		actors:              make(map[string]*leasesm.LeaseActor),
-		stopCtx:             stopCtx,
-		stopCancel:          stopCancel,
-		storageIdentity:     storageID,
-		storeAuthorityGate:  storeAuthorityGate,
+		cfg:     cfg,
+		docker:  mock,
+		compose: &mockComposeExecutor{},
+		pool:    pool,
+		volumes: &noopVolumeManager{},
+		// New binds the configured volume backend's demote-refusal series.
+		restoreDemoteRefusals: bindRestoreDemoteRefusals((&noopVolumeManager{}).Kind()),
+		logger:                slog.Default(),
+		provisions:            provs,
+		operationSettlement:   noopOperationIntentJournal{},
+		actors:                make(map[string]*leasesm.LeaseActor),
+		stopCtx:               stopCtx,
+		stopCancel:            stopCancel,
+		storageIdentity:       storageID,
+		storeAuthorityGate:    storeAuthorityGate,
 	}
 	b.storageVerifier = testDockerRuntimeStorageVerifier{identity: func() backendidentity.ID {
 		return b.storageIdentity

@@ -1670,7 +1670,7 @@ func (a *LeaseActor) spawnProvisionWorker(
 		// wedged SM if a panic occurs before the normal path sets the
 		// message.
 		var terminalMsg workerTerminalMessage
-		var event string
+		var event TerminalEvent
 		defer a.endWorkerActivity()
 		defer admission.DeferRecovery()
 		defer func() {
@@ -1682,7 +1682,7 @@ func (a *LeaseActor) spawnProvisionWorker(
 					kind: string(operation.Kind()), operationID: operation.OperationID(),
 					err: errors.New("provision worker exited without a typed outcome"),
 				}
-				event = "provision_no_result"
+				event = terminalProvisionNoResult
 			}
 			if !a.sendTerminal(terminalMsg) {
 				a.cfg.Metrics.TerminalEventDropped(event)
@@ -1699,14 +1699,14 @@ func (a *LeaseActor) spawnProvisionWorker(
 					"panic", r,
 					"stack", string(debug.Stack()),
 				)
-				a.cfg.Metrics.WorkerPanic("provision")
+				a.cfg.Metrics.WorkerPanic(workerProvision)
 				// Override any terminalMsg set by the normal path —
 				// the panic means the post-set work did not complete.
 				terminalMsg = operationAmbiguousMsg{
 					kind: string(operation.Kind()), operationID: operation.OperationID(),
 					err: fmt.Errorf("provision worker panic: %v", r),
 				}
-				event = "provision_panic"
+				event = terminalProvisionPanic
 			}
 		}()
 		outcome := a.cfg.ProvisionWorkFn(ctx, admission)
@@ -1714,7 +1714,7 @@ func (a *LeaseActor) spawnProvisionWorker(
 			terminalMsg = operationAmbiguousMsg{
 				kind: string(operation.Kind()), operationID: operation.OperationID(), err: err,
 			}
-			event = "provision_invalid_outcome"
+			event = terminalProvisionInvalidOutcome
 			return
 		}
 		switch typed := outcome.(type) {
@@ -1726,7 +1726,7 @@ func (a *LeaseActor) spawnProvisionWorker(
 				p.ContainerIDs = typed.result.containerIDs
 			})
 			terminalMsg = provisionCompletedMsg(typed)
-			event = "provision_completed"
+			event = terminalProvisionCompleted
 		case provisionWorkFailure:
 			terminalMsg = provisionErroredMsg{
 				callbackErr:      typed.callbackErr,
@@ -1736,12 +1736,12 @@ func (a *LeaseActor) spawnProvisionWorker(
 				startup:          typed.startup,
 				runtime:          typed.runtime,
 			}
-			event = "provision_errored"
+			event = terminalProvisionErrored
 		case provisionWorkAmbiguous:
 			terminalMsg = operationAmbiguousMsg{
 				kind: string(operation.Kind()), operationID: operation.OperationID(), err: typed.err,
 			}
-			event = "provision_ambiguous"
+			event = terminalProvisionAmbiguous
 		}
 	})
 }
@@ -1933,7 +1933,7 @@ func (a *LeaseActor) spawnReplaceWorker(
 		// the middle defer; normal path and panic recover both write
 		// to terminalMsg.
 		var terminalMsg workerTerminalMessage
-		var event string
+		var event TerminalEvent
 		defer a.endWorkerActivity()
 		if lifetime.Valid() {
 			defer lifetime.Cancel()
@@ -1951,7 +1951,7 @@ func (a *LeaseActor) spawnReplaceWorker(
 					kind: kind, operationID: operationID, maintenanceID: maintenanceID,
 					err: errors.New("replace worker exited without a typed outcome"),
 				}
-				event = "replace_no_result"
+				event = terminalReplaceNoResult
 			}
 			if !a.sendTerminal(terminalMsg) {
 				a.clearMaintenanceWorker(maintenanceID)
@@ -1969,7 +1969,7 @@ func (a *LeaseActor) spawnReplaceWorker(
 					"panic", r,
 					"stack", string(debug.Stack()),
 				)
-				a.cfg.Metrics.WorkerPanic("replace")
+				a.cfg.Metrics.WorkerPanic(workerReplace)
 				kind := string(shared.OperationIntentRestore)
 				operationID := shared.OperationID{}
 				if hasMaintenanceAuthority {
@@ -1981,7 +1981,7 @@ func (a *LeaseActor) spawnReplaceWorker(
 					kind: kind, operationID: operationID, maintenanceID: maintenanceID,
 					err: fmt.Errorf("replace worker panic: %v", r),
 				}
-				event = "replace_panic"
+				event = terminalReplacePanic
 			}
 		}()
 		var outcome ReplaceWorkOutcome
@@ -2001,7 +2001,7 @@ func (a *LeaseActor) spawnReplaceWorker(
 			terminalMsg = operationAmbiguousMsg{
 				kind: kind, operationID: operationID, maintenanceID: maintenanceID, err: err,
 			}
-			event = "replace_invalid_outcome"
+			event = terminalReplaceInvalidOutcome
 			return
 		}
 		if ambiguous, ok := outcome.(replaceWorkAmbiguous); ok {
@@ -2015,7 +2015,7 @@ func (a *LeaseActor) spawnReplaceWorker(
 			terminalMsg = operationAmbiguousMsg{
 				kind: kind, operationID: operationID, maintenanceID: maintenanceID, err: ambiguous.err,
 			}
-			event = "replace_ambiguous"
+			event = terminalReplaceAmbiguous
 			return
 		}
 		result := outcome.(replaceWorkTerminal).result
@@ -2030,13 +2030,13 @@ func (a *LeaseActor) spawnReplaceWorker(
 		switch {
 		case result.err == nil:
 			terminalMsg = replaceCompletedMsg{result: result.success, maintenanceID: maintenanceID}
-			event = "replace_completed"
+			event = terminalReplaceCompleted
 		case result.Restored():
 			terminalMsg = replaceRecoveredMsg{info: result.failure, maintenanceID: maintenanceID}
-			event = "replace_recovered"
+			event = terminalReplaceRecovered
 		default:
 			terminalMsg = replaceFailedMsg{info: result.failure, maintenanceID: maintenanceID}
-			event = "replace_failed"
+			event = terminalReplaceFailed
 		}
 	})
 }

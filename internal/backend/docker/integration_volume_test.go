@@ -1630,7 +1630,7 @@ func TestIntegration_XFS_DestroyCutsChainDeeperThanMaxDepth(t *testing.T) {
 	require.NoError(t, err)
 	buildDirectoryChain(t, volumePath, writablePathSubdir, 70_000)
 
-	cuts := treeRemovalCutsTotal.WithLabelValues(treeRemovalSiteDeleteStage)
+	cuts := treeRemovalCutsTotal.WithLabelValues(treeRemovalSiteDeleteStage.String())
 	before := testutil.ToFloat64(cuts)
 	// A chain this deep can outlast the inline budget; the executor's retries
 	// then finish it, exactly as in production.

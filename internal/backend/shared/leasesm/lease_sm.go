@@ -130,18 +130,21 @@ type reservedState uint8
 
 const leaseReserved reservedState = 1
 
+// String names the state in transition labels and logs.
+func (reservedState) String() string { return "reserved" }
+
 func newLeaseSM(actor *LeaseActor) *leaseSM {
 	initial := readProvisionStatus(actor)
 	sm := stateless.NewStateMachine(initial)
 
 	// Count every transition for operator visibility. Runs inside Fire
 	// in the actor's goroutine, so no additional synchronization needed.
+	// Every transition is an edge of leaseTransitions, the only edges
+	// permitted below, so the substrate already holds its series.
 	sm.OnTransitioned(func(_ context.Context, tr stateless.Transition) {
-		actor.cfg.Metrics.SMTransition(
-			fmt.Sprintf("%v", tr.Source),
-			fmt.Sprintf("%v", tr.Destination),
-			fmt.Sprintf("%v", tr.Trigger),
-		)
+		if transition, ok := transitionOf(tr); ok {
+			actor.cfg.Metrics.SMTransition(transition)
+		}
 	})
 
 	lsm := &leaseSM{actor: actor, sm: sm}
@@ -171,16 +174,9 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	sm.SetTriggerParameters(evMaintenanceRecoveredFailureFailed, reflect.TypeFor[maintenanceRecoveryFailureArgs]())
 	sm.SetTriggerParameters(evMaintenanceRecoveredSuccessRuntimeFailed, reflect.TypeFor[maintenanceRecoveryFailureArgs]())
 
-	// Reserved is an actor-control state, not a tenant-visible status. Both a
-	// fresh provision and restore publish Provisioning while awaiting actor
-	// admission, but each command is accepted exactly once from this state.
-	sm.Configure(leaseReserved).
-		Permit(evProvisionRequested, backend.ProvisionStatusProvisioning).
-		Permit(evRestoreRequested, backend.ProvisionStatusRestarting).
-		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning)
-
 	// Configure all existing states so Fire never hits an unconfigured state.
-	for _, s := range []backend.ProvisionStatus{
+	for _, s := range []stateless.State{
+		leaseReserved,
 		backend.ProvisionStatusProvisioning,
 		backend.ProvisionStatusReady,
 		backend.ProvisionStatusFailing,
@@ -193,16 +189,8 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 		sm.Configure(s)
 	}
 
-	// Ready: a container died (guard confirms); a deprovision arrived;
-	// or the operator initiated a Restart or Update.
-	sm.Configure(backend.ProvisionStatusReady).
-		Permit(evContainerDied, backend.ProvisionStatusFailing, lsm.guardContainerActuallyDied).
-		Permit(evCohortDiverged, backend.ProvisionStatusFailed).
-		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
-		Permit(evRestartRequested, backend.ProvisionStatusRestarting).
-		Permit(evUpdateRequested, backend.ProvisionStatusUpdating).
-		Permit(evMaintenanceRecoveredFailureFailed, backend.ProvisionStatusFailed).
-		Permit(evMaintenanceRecoveredSuccessRuntimeFailed, backend.ProvisionStatusFailed)
+	// Every permitted transition is declared in leaseTransitions.
+	permitLeaseTransitions(sm, lsm)
 
 	// Failing: transitional. The async diag goroutine is running. Either
 	// DiagGathered arrives (→ Failed, emit terminal callback) or a
@@ -216,30 +204,15 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	sm.Configure(backend.ProvisionStatusFailing).
 		OnEntryFrom(evContainerDied, lsm.onEnterFailing).
 		OnExit(lsm.onExitFailing).
-		Permit(evDiagGathered, backend.ProvisionStatusFailed).
-		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
-		// Accept retry events from Failing the same way Failed does. If a
-		// diag goroutine is wedged and never fires DiagGathered, a
-		// subsequent Provision/Restart/Update retry would otherwise hit an
-		// unhandled trigger. Allowing the retry from Failing removes the
-		// wedge; Failing.OnExit cancels the stale diag goroutine on the
-		// way out via diagCancel + waitForWorkers.
-		Permit(evProvisionRequested, backend.ProvisionStatusProvisioning).
-		Permit(evRestartRequested, backend.ProvisionStatusRestarting).
-		Permit(evUpdateRequested, backend.ProvisionStatusUpdating).
 		Ignore(evContainerDied)
 
 	// Failed: terminal callback already emitted on entry from DiagGathered.
-	// Deprovision can still be requested; later ContainerDied/DiagGathered
-	// are ignored.
+	// Later ContainerDied/DiagGathered are ignored.
 	sm.Configure(backend.ProvisionStatusFailed).
 		OnEntryFrom(evDiagGathered, lsm.onEnterFailedFromDiag).
-		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		Ignore(evContainerDied).
 		Ignore(evCohortDiverged).
-		Ignore(evDiagGathered).
-		Permit(evMaintenanceRecoveredSuccess, backend.ProvisionStatusReady).
-		Permit(evMaintenanceRecoveredFailureReady, backend.ProvisionStatusReady)
+		Ignore(evDiagGathered)
 
 	// Deprovisioning: work runs in actor.handleDeprovision after Fire returns.
 	// Ignore die events and any stale DiagGathered from a canceled-too-late
@@ -251,11 +224,6 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 		// Deprovisioning. This idempotent self-event authorizes only another run of
 		// the same teardown; it cannot transition back to a mutable workload state.
 		Ignore(evDeprovisionRequested)
-
-	// Unknown is fail-closed for creation/replacement, but close remains safe:
-	// teardown is idempotent and is the only transition out of this state.
-	sm.Configure(backend.ProvisionStatusUnknown).
-		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning)
 
 	// Provisioning: async goroutine is running. Exits by ProvisionCompleted
 	// (→ Ready, emit Success), ProvisionErrored (→ Failed, emit Failed), or
@@ -270,9 +238,6 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	// Ready entry re-dispatches a death that raced the Ready transition.
 	sm.Configure(backend.ProvisionStatusProvisioning).
 		OnEntryFrom(evProvisionRequested, lsm.onEnterProvisioning).
-		Permit(evProvisionCompleted, backend.ProvisionStatusReady).
-		Permit(evProvisionErrored, backend.ProvisionStatusFailed).
-		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
 		Ignore(evContainerDied)
 
@@ -315,26 +280,10 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 		// callback URL pair. The provision store derives readiness accounting
 		// directly from the resulting status transitions.
 		OnEntryFrom(evRestoreRequested, lsm.onEnterRestarting).
-		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
-		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
-		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
-		Permit(evMaintenanceRecoveredSuccess, backend.ProvisionStatusReady).
-		Permit(evMaintenanceRecoveredFailureReady, backend.ProvisionStatusReady).
-		Permit(evMaintenanceRecoveredFailureFailed, backend.ProvisionStatusFailed).
-		Permit(evMaintenanceRecoveredSuccessRuntimeFailed, backend.ProvisionStatusFailed).
-		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
 		Ignore(evContainerDied)
 	sm.Configure(backend.ProvisionStatusUpdating).
 		OnEntryFrom(evUpdateRequested, lsm.onEnterUpdating).
-		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
-		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
-		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
-		Permit(evMaintenanceRecoveredSuccess, backend.ProvisionStatusReady).
-		Permit(evMaintenanceRecoveredFailureReady, backend.ProvisionStatusReady).
-		Permit(evMaintenanceRecoveredFailureFailed, backend.ProvisionStatusFailed).
-		Permit(evMaintenanceRecoveredSuccessRuntimeFailed, backend.ProvisionStatusFailed).
-		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
 		Ignore(evContainerDied)
 
@@ -350,14 +299,13 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 		OnEntryFrom(evMaintenanceRecoveredFailureReady, lsm.onEnterReadyFromMaintenanceRecoveryFailure)
 
 	// Failed entry actions: emit Failed from a Provision error or Replace
-	// failure. Permit(ProvisionRequested) for re-provision retries.
+	// failure.
 	sm.Configure(backend.ProvisionStatusFailed).
 		OnEntryFrom(evProvisionErrored, lsm.onEnterFailedFromProvision).
 		OnEntryFrom(evCohortDiverged, lsm.onEnterFailedFromCohortDivergence).
 		OnEntryFrom(evReplaceFailed, lsm.onEnterFailedFromReplace).
 		OnEntryFrom(evMaintenanceRecoveredFailureFailed, lsm.onEnterFailedFromMaintenanceRecoveryFailure).
-		OnEntryFrom(evMaintenanceRecoveredSuccessRuntimeFailed, lsm.onEnterFailedFromMaintenanceRuntimeFailure).
-		Permit(evProvisionRequested, backend.ProvisionStatusProvisioning)
+		OnEntryFrom(evMaintenanceRecoveredSuccessRuntimeFailed, lsm.onEnterFailedFromMaintenanceRuntimeFailure)
 
 	// Deprovisioning ignores stale provision/replace-completion events that
 	// might fire from an async goroutine that already started but hadn't
@@ -369,12 +317,6 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 		Ignore(evReplaceCompleted).
 		Ignore(evReplaceRecovered).
 		Ignore(evReplaceFailed)
-
-	// Failed: can accept restart/update retry requests in addition to
-	// re-provision.
-	sm.Configure(backend.ProvisionStatusFailed).
-		Permit(evRestartRequested, backend.ProvisionStatusRestarting).
-		Permit(evUpdateRequested, backend.ProvisionStatusUpdating)
 
 	return lsm
 }
@@ -1901,7 +1843,7 @@ func (a *LeaseActor) gatherDiagAsync(
 	// sets it on completion. ctx-cancel is special: we suppress the
 	// send entirely (the Deprovisioning.Ignore path handles that case).
 	var terminalMsg workerTerminalMessage
-	var event = "diag_gathered"
+	var event = terminalDiagGathered
 	var suppress bool
 	defer func() {
 		if suppress {
@@ -1911,7 +1853,7 @@ func (a *LeaseActor) gatherDiagAsync(
 			terminalMsg = diagGatheredMsg{
 				result: diagResult{containerID: containerID, info: info, diag: "", runtime: runtime},
 			}
-			event = "diag_no_result"
+			event = terminalDiagNoResult
 		}
 		if !a.sendTerminal(terminalMsg) {
 			a.cfg.Metrics.TerminalEventDropped(event)
@@ -1928,14 +1870,14 @@ func (a *LeaseActor) gatherDiagAsync(
 				"panic", r,
 				"stack", string(debug.Stack()),
 			)
-			a.cfg.Metrics.WorkerPanic("diag")
+			a.cfg.Metrics.WorkerPanic(workerDiag)
 			// Drive Failing→Failed via an empty diagGatheredMsg —
 			// Deprovisioning.Ignore still covers the case where the
 			// SM has already moved past Failing.
 			terminalMsg = diagGatheredMsg{
 				result: diagResult{containerID: containerID, info: info, diag: "", runtime: runtime},
 			}
-			event = "diag_panic"
+			event = terminalDiagPanic
 			suppress = false
 		}
 	}()

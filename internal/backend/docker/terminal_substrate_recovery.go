@@ -16,6 +16,9 @@ const (
 	terminalReceiptFailed terminalReceiptKind = "failed_operation"
 )
 
+// terminalReceiptKinds is every terminalReceiptKind.
+var terminalReceiptKinds = []terminalReceiptKind{terminalReceiptClosed, terminalReceiptFailed}
+
 // observeClosedSubstrate publishes exclusion and accounting together. A
 // compact terminal receipt cannot size a late container: its release may have
 // been deleted or superseded. Withhold capacity instead of reconstructing a
@@ -103,7 +106,7 @@ func (b *Backend) deferTerminalSubstrateCleanup(kind terminalReceiptKind, cause 
 	if err := b.terminalStorageAuthorityError(); err != nil {
 		return err
 	}
-	terminalSubstrateCleanupRetriesTotal.WithLabelValues(string(kind)).Inc()
+	terminalSubstrateCleanupRetries.inc(kind)
 	b.logger.Warn("terminal substrate cleanup remains pending",
 		"receipt", kind, "error", cause)
 	return nil

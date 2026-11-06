@@ -2007,12 +2007,12 @@ type countingMetrics struct {
 	failures   []string
 }
 
-func (m *countingMetrics) SMTransition(_, _, _ string)   { m.smTransition.Add(1) }
-func (m *countingMetrics) ActorCreated()                 { m.actorCreated.Add(1) }
-func (m *countingMetrics) WorkerPanic(_ string)          { m.workerPanic.Add(1) }
-func (m *countingMetrics) ActorPanic()                   { m.actorPanic.Add(1) }
-func (m *countingMetrics) TerminalEventDropped(_ string) { m.terminalEventDropped.Add(1) }
-func (m *countingMetrics) PendingOperationUnstamped()    { m.unstamped.Add(1) }
+func (m *countingMetrics) SMTransition(Transition)            { m.smTransition.Add(1) }
+func (m *countingMetrics) ActorCreated()                      { m.actorCreated.Add(1) }
+func (m *countingMetrics) WorkerPanic(Worker)                 { m.workerPanic.Add(1) }
+func (m *countingMetrics) ActorPanic()                        { m.actorPanic.Add(1) }
+func (m *countingMetrics) TerminalEventDropped(TerminalEvent) { m.terminalEventDropped.Add(1) }
+func (m *countingMetrics) PendingOperationUnstamped()         { m.unstamped.Add(1) }
 func (m *countingMetrics) LeaseFailureRecorded(cause failurecause.Cause) {
 	m.failuresMu.Lock()
 	defer m.failuresMu.Unlock()

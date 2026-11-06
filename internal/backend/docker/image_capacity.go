@@ -825,7 +825,7 @@ func (m *imageCapacityManager) collect(ctx context.Context) error {
 	// Admission calls cannot collect physical images while another preparation
 	// owns them. Keep this path cheap; periodic collection prunes independently.
 	if m.active != 0 {
-		imageGCTotal.WithLabelValues("busy").Inc()
+		imageGCDecisions.busy.Inc()
 		return nil
 	}
 	protected, err := m.pruneImagePins(ctx)
@@ -838,7 +838,7 @@ func (m *imageCapacityManager) collect(ctx context.Context) error {
 func (m *imageCapacityManager) pruneImagePins(ctx context.Context) (shared.ImagePinInventory, error) {
 	protected, err := m.pins.Collect(ctx)
 	if err != nil {
-		imageGCTotal.WithLabelValues("inhibited").Inc()
+		imageGCDecisions.inhibited.Inc()
 		return protected, err
 	}
 	imageUnpinnedGenerations.WithLabelValues("active").Set(float64(protected.UnpinnedActiveGenerations()))
@@ -848,7 +848,7 @@ func (m *imageCapacityManager) pruneImagePins(ctx context.Context) (shared.Image
 
 func (m *imageCapacityManager) collectProtected(ctx context.Context, protected shared.ImagePinInventory) error {
 	if m.active != 0 {
-		imageGCTotal.WithLabelValues("busy").Inc()
+		imageGCDecisions.busy.Inc()
 		return nil
 	}
 	info, err := m.daemon.Info(ctx)
@@ -857,11 +857,11 @@ func (m *imageCapacityManager) collectProtected(ctx context.Context, protected s
 	}
 	changed, err := m.inspectionAdmissionChange(ctx, info)
 	if err != nil {
-		imageGCTotal.WithLabelValues("inhibited").Inc()
+		imageGCDecisions.inhibited.Inc()
 		return err
 	}
 	if changed != nil {
-		imageGCTotal.WithLabelValues("busy").Inc()
+		imageGCDecisions.busy.Inc()
 		return nil
 	}
 	if m.loader != nil {
@@ -875,11 +875,11 @@ func (m *imageCapacityManager) collectProtected(ctx context.Context, protected s
 		return err
 	}
 	if !protected.Complete() {
-		imageGCTotal.WithLabelValues("inhibited").Inc()
+		imageGCDecisions.inhibited.Inc()
 		return nil
 	}
 	if m.owner == nil {
-		imageGCTotal.WithLabelValues("shared").Inc()
+		imageGCDecisions.shared.Inc()
 		return nil // Development daemons can be shared with independent backends.
 	}
 	if err := m.owner.verify(ctx); err != nil {
@@ -899,7 +899,7 @@ func (m *imageCapacityManager) collectProtected(ctx context.Context, protected s
 		}
 	}
 	if capacity.usage() < m.cfg.ImageGCHighPercent && m.headroom(ctx, true) == nil {
-		imageGCTotal.WithLabelValues("below_threshold").Inc()
+		imageGCDecisions.belowThreshold.Inc()
 		return nil
 	}
 	containers, err := m.daemon.ContainerList(ctx, container.ListOptions{All: true})
@@ -934,7 +934,7 @@ func (m *imageCapacityManager) collectProtected(ctx context.Context, protected s
 			}
 			return fmt.Errorf("remove unused image: %w", err)
 		}
-		imageGCTotal.WithLabelValues("removed").Inc()
+		imageGCDecisions.removed.Inc()
 		capacity, err = m.fs.capacity(paths[0])
 		if err != nil {
 			return err
@@ -969,11 +969,11 @@ func (b *Backend) imageGCLoop() {
 func (b *Backend) collectImagesSafely(ctx context.Context) (err error) {
 	defer func() {
 		if value := recover(); value != nil {
-			imageGCTotal.WithLabelValues("panic").Inc()
+			imageGCDecisions.panic.Inc()
 			err = fmt.Errorf("image collection panicked: %v", value)
 		}
 		if err != nil {
-			imageGCTotal.WithLabelValues("error").Inc()
+			imageGCDecisions.error.Inc()
 		}
 	}()
 	return b.collectImages(ctx)

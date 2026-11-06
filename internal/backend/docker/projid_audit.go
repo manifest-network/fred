@@ -335,9 +335,7 @@ func (a *projidAuditor) record(name managedVolumeName, outcome projidAuditOutcom
 	}
 	_, driftRecorded := a.drifted[name.value()]
 	a.mu.Unlock()
-	if label := outcome.label(); label != "" {
-		volumeProjidAuditTotal.WithLabelValues(label).Inc()
-	}
+	projidAudits.inc(outcome)
 	switch outcome {
 	case projidAuditDrift:
 		a.logger.Warn("managed volume has inodes outside its project; investigate, fred does not repair them",

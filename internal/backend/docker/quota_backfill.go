@@ -172,7 +172,7 @@ func (b *Backend) reconcileVolumeQuotasUsing(
 		switch {
 		case cerr != nil:
 			failed++
-			volumeQuotaBackfillTotal.WithLabelValues("failed").Inc()
+			quotaBackfills.failed.Inc()
 			b.logger.Warn("quota backfill: failed to re-apply quota",
 				"volume", name, "size_mb", sizeMB, "error", cerr)
 			reconcileErrs = append(reconcileErrs, fmt.Errorf(
@@ -180,15 +180,15 @@ func (b *Backend) reconcileVolumeQuotasUsing(
 			))
 		case outcome == volumeQuotaApplied:
 			applied++
-			volumeQuotaBackfillTotal.WithLabelValues("applied").Inc()
+			quotaBackfills.applied.Inc()
 		case outcome == volumeQuotaDeletePending:
 			deletePending++
-			volumeQuotaBackfillTotal.WithLabelValues(quotaBackfillDeletePending).Inc()
+			quotaBackfills.deletePending.Inc()
 		case outcome == volumeQuotaAbsent:
 			absent++ // listed a moment ago, gone now (e.g. a concurrent deprovision)
 		default:
 			failed++
-			volumeQuotaBackfillTotal.WithLabelValues("failed").Inc()
+			quotaBackfills.failed.Inc()
 			reconcileErrs = append(reconcileErrs, fmt.Errorf(
 				"enforce %s quota for managed volume %q: no quota outcome", b.volumes.Kind(), name,
 			))
