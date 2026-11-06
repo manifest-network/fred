@@ -148,12 +148,12 @@ func TestCloseCommandTakesOwnershipOfItsLeasesFence(t *testing.T) {
 		return free
 	}
 
-	released := actorCloseFence(actor)
+	released := actorCloseFence(t, actor)
 	released.Release()
 	_, _, err = NewDeprovisionCommand(released)
 	require.Error(t, err, "a released hold is no authority")
 
-	kept := actorCloseFence(actor)
+	kept := actorCloseFence(t, actor)
 	command, reply, err := NewDeprovisionCommand(kept)
 	require.NoError(t, err)
 	kept.Release()
@@ -319,7 +319,7 @@ func TestActorCloseScopeIsExactAndCallbackLifetime(t *testing.T) {
 		},
 	})
 
-	require.NoError(t, actor.handleDeprovision(actorCloseFence(actor)))
+	require.NoError(t, actor.handleDeprovision(actorCloseFence(t, actor)))
 	assert.Nil(t, actor.activeClose.Load(), "completed close must clear its observational scope")
 	assert.False(t, actor.CloseOwnsObservation(observation))
 	assert.Empty(t, escaped.LeaseUUID())
@@ -346,7 +346,7 @@ func TestActorCloseScopeIsRevokedWhenCallbackPanics(t *testing.T) {
 
 	func() {
 		defer func() { require.Equal(t, "boom", recover()) }()
-		_ = actor.handleDeprovision(actorCloseFence(actor))
+		_ = actor.handleDeprovision(actorCloseFence(t, actor))
 	}()
 	assert.Nil(t, actor.activeClose.Load(), "panicking close must clear its observational scope")
 	assert.Empty(t, escaped.LeaseUUID())
@@ -413,12 +413,7 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 	})
 
 	firstReply := make(chan error, 1)
-	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{
-			Reply: firstReply,
-			fence: actorCloseFence(actor),
-		})
-	})
+	requireCloseAccepted(t, actor, firstReply)
 	select {
 	case <-finalizerEntered:
 	case <-time.After(2 * time.Second):

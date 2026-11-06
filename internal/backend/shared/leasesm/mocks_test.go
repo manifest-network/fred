@@ -287,16 +287,30 @@ func bindLeaseSMOperationExecutor(
 const testActorLeaseUUID = "11111111-1111-4111-8111-111111111111"
 
 // actorCloseFence holds actor's lease on actor's own command fence, as a
-// substrate does before it hands a close to the actor.
-func actorCloseFence(actor *LeaseActor) shared.CommandFenceHold {
-	return actor.cfg.CommandFence.Lock(actor.leaseUUID)
+// substrate does before it hands a close to the actor. It never waits: a held
+// fence fails the test at once, because waiting would block until the package
+// timeout. A close that retries its enqueue takes the fence once, before the
+// retry (requireCloseAccepted): a refused attempt keeps its hold.
+func actorCloseFence(t testing.TB, actor *LeaseActor) shared.CommandFenceHold {
+	t.Helper()
+	hold, ok := actor.cfg.CommandFence.TryLock(actor.leaseUUID)
+	require.True(t, ok, "the lease's command fence is already held; take it once, outside any enqueue retry")
+	return hold
+}
+
+// requireCloseAccepted takes actor's close fence once and retries the close's
+// enqueue until the actor accepts it.
+func requireCloseAccepted(t testing.TB, actor *LeaseActor, reply chan error) {
+	t.Helper()
+	message := deprovisionMsg{Reply: reply, fence: actorCloseFence(t, actor)}
+	requireAccepted(t, func() bool { return actor.tryEnqueue(message) })
 }
 
 // newTestDeprovisionCommand builds a close command for actor that owns its
 // lease's command fence.
 func newTestDeprovisionCommand(t *testing.T, actor *LeaseActor) (ActorCommand, ActorReply) {
 	t.Helper()
-	command, reply, err := NewDeprovisionCommand(actorCloseFence(actor))
+	command, reply, err := NewDeprovisionCommand(actorCloseFence(t, actor))
 	require.NoError(t, err)
 	return command, reply
 }
