@@ -678,7 +678,7 @@ func TestDoDeprovision_BlocksUncommittedRestoreBeforeRetainMutation(t *testing.T
 		},
 	}
 
-	err := b.ensureCommittedRestoreDestinationForClose(lease)
+	err := b.ensureCommittedRestoreDestinationForClose(t.Context(), lease)
 	require.ErrorContains(t, err, "has not durably committed ownership")
 	assert.Empty(t, renames, "an uncommitted restore must be rejected before any volume mutation")
 
@@ -717,7 +717,7 @@ func TestDoDeprovision_BlocksUncommittedRestoreBeforeDestroyMutation(t *testing.
 		},
 	}
 
-	err := b.ensureCommittedRestoreDestinationForClose(lease)
+	err := b.ensureCommittedRestoreDestinationForClose(t.Context(), lease)
 	require.ErrorContains(t, err, "has not durably committed ownership")
 	assert.Empty(t, destroyed, "an uncommitted restore must be rejected before any destroy")
 	assert.NotContains(t, destroyed, claimedVol)
@@ -811,7 +811,7 @@ func TestDoDeprovision_NonRetainPath_KeepsAllocationReservedForClaimedVolume(t *
 		return nil
 	}}
 
-	require.ErrorContains(t, b.ensureCommittedRestoreDestinationForClose(claimedRestoreDestinationLease), "has not durably committed ownership")
+	require.ErrorContains(t, b.ensureCommittedRestoreDestinationForClose(t.Context(), claimedRestoreDestinationLease), "has not durably committed ownership")
 
 	assert.NotContains(t, destroyed, claimedVol, "the claimed volume must survive the close")
 	assert.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB,
@@ -832,7 +832,7 @@ func TestDoDeprovision_RetainPath_KeepsAllocationReservedForClaimedVolume(t *tes
 		},
 	}
 
-	require.ErrorContains(t, b.ensureCommittedRestoreDestinationForClose(claimedRestoreDestinationLease), "has not durably committed ownership")
+	require.ErrorContains(t, b.ensureCommittedRestoreDestinationForClose(t.Context(), claimedRestoreDestinationLease), "has not durably committed ownership")
 
 	assert.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB,
 		"same on the retain arm: the claimed volume is excluded from THIS lease's retained record, "+
@@ -988,7 +988,7 @@ func TestDoDeprovision_ClaimedVolumeAllocation_ReleasedByRestoreRollback(t *test
 		RenameVolumeFn: func(_, _ string) error { return nil },
 		UsageFn:        func(context.Context, string) (int64, error) { return 0, nil },
 	}
-	require.ErrorContains(t, b.ensureCommittedRestoreDestinationForClose(claimedRestoreDestinationLease), "has not durably committed ownership")
+	require.ErrorContains(t, b.ensureCommittedRestoreDestinationForClose(t.Context(), claimedRestoreDestinationLease), "has not durably committed ownership")
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "close holds the reservation")
 	assert.NotContains(t, destroyed, claimedVol,
 		"an uncommitted destination close must preserve bytes owned by its source finalizer")
@@ -1076,7 +1076,7 @@ func TestDeprovision_UncommittedRestoreCannotEnterClose(t *testing.T) {
 		},
 	}
 
-	err := b.ensureCommittedRestoreDestinationForClose(lease)
+	err := b.ensureCommittedRestoreDestinationForClose(t.Context(), lease)
 	require.ErrorContains(t, err, "has not durably committed ownership")
 
 	tomb, err := rs.Get(lease)
@@ -1106,7 +1106,7 @@ func TestDoDeprovision_ClaimedVolume_AccountingAcrossRecoveryAndSweep(t *testing
 
 	// (1) The close: the reservation is held, because the bytes are still on disk and
 	// a restoring record is counted by neither projection.
-	require.ErrorContains(t, b.ensureCommittedRestoreDestinationForClose(claimedRestoreDestinationLease), "has not durably committed ownership")
+	require.ErrorContains(t, b.ensureCommittedRestoreDestinationForClose(t.Context(), claimedRestoreDestinationLease), "has not durably committed ownership")
 	assert.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "close holds the reservation")
 	assert.Zero(t, b.pool.Stats().RetainedDiskMB)
 

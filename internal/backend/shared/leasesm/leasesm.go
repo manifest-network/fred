@@ -375,6 +375,10 @@ type LeaseActorConfig struct {
 	// the close: callers only wait for the outcome. An attempt that runs out
 	// leaves the durable close journal for the next attempt.
 	CloseTimeout time.Duration
+	// CommandFence is the substrate's per-lease command fence. A close must
+	// own this fence's hold for the actor's lease; a hold from any other fence
+	// is refused.
+	CommandFence *shared.CommandFence
 
 	// Mutation handlers are fixed once, at actor construction. Commands carry
 	// only their exact journal-issued authority; they cannot splice authority

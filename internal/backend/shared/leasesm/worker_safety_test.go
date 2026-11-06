@@ -48,7 +48,7 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 
 	reply := make(chan error, 1)
 	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: testCloseFence(t, actor.leaseUUID)})
+		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
 	})
 	select {
 	case err := <-reply:
@@ -70,7 +70,7 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	actor.workers.Done()
 	retryReply := make(chan error, 1)
 	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: retryReply, fence: testCloseFence(t, actor.leaseUUID)})
+		return actor.tryEnqueue(deprovisionMsg{Reply: retryReply, fence: actorCloseFence(actor)})
 	})
 	select {
 	case err := <-retryReply:
@@ -130,7 +130,7 @@ func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) 
 			// leaves. The failed OnExit preserves Failing, which normally permits
 			// restart/update; close ownership must independently fence admission.
 			actor.beginWorkerActivity()
-			command, reply := newTestDeprovisionCommand(t, testActorLeaseUUID)
+			command, reply := newTestDeprovisionCommand(t, actor)
 			actor.handle(command.envelope.message)
 			require.ErrorIs(t, <-reply.Result(), ErrWorkerDrainTimeout)
 			require.Equal(t, backend.ProvisionStatusFailing, actor.State())
@@ -148,7 +148,7 @@ func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) 
 			actor.cfg.WG.Wait()
 			require.Zero(t, workers.Load(), "close-owned actor cannot acknowledge a mutation whose terminal result it would suppress")
 			require.Zero(t, teardown.Load())
-			command, reply = newTestDeprovisionCommand(t, testActorLeaseUUID)
+			command, reply = newTestDeprovisionCommand(t, actor)
 			actor.handle(command.envelope.message)
 			require.NoError(t, <-reply.Result())
 			require.EqualValues(t, 1, teardown.Load(), "the close continuation remains admissible")
@@ -174,7 +174,7 @@ func TestDeprovisionAbsentProjectionStillRunsSubstrateFinalizer(t *testing.T) {
 
 	reply := make(chan error, 1)
 	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: testCloseFence(t, actor.leaseUUID)})
+		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
 	})
 	select {
 	case err := <-reply:

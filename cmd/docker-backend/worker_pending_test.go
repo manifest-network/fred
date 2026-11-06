@@ -63,9 +63,11 @@ func actorLifecyclePendingError(t *testing.T) error {
 		var workers sync.WaitGroup
 		started, complete := make(chan struct{}), make(chan struct{})
 		capabilities := pendingWorkerCapabilities{}
+		var fence shared.CommandFence
 		actor, err := leasesm.NewLeaseActor(leasesm.LeaseActorConfig{
 			LeaseUUID: handlerTestLeaseUUID, StopCtx: ctx, WG: &workers, Logger: slog.Default(),
 			Inspector: capabilities, Diag: capabilities, Metrics: capabilities, CloseTimeout: time.Minute,
+			CommandFence:    &fence,
 			ProvisionStore:  &pendingWorkerStore{state: leasesm.ProvisionState{LeaseUUID: handlerTestLeaseUUID, Status: backend.ProvisionStatusProvisioning}},
 			RecoveryLineage: recovery.Lineage(),
 			OnTerminated:    func(string, *leasesm.LeaseActor) {},
@@ -97,7 +99,6 @@ func actorLifecyclePendingError(t *testing.T) error {
 		require.True(t, actor.TryEnqueueCommand(command))
 		require.NoError(t, <-reply.Result())
 		<-started
-		var fence shared.CommandFence
 		command, reply, err = leasesm.NewDeprovisionCommand(fence.Lock(handlerTestLeaseUUID))
 		require.NoError(t, err)
 		require.True(t, actor.TryEnqueueCommand(command))

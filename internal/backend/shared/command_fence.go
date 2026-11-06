@@ -2,7 +2,9 @@ package shared
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 )
 
 type commandFenceEntry struct {
@@ -25,36 +27,60 @@ type CommandFence struct {
 }
 
 // CommandFenceHold is exclusive ownership of one lease's command fence. Only a
-// CommandFence mints one. Its copies share that ownership, so it can move
-// into a command that releases it later: the first Release gives the fence
-// back, and later ones, through any copy, do nothing. The zero value holds
-// nothing.
-type CommandFenceHold struct{ held *commandFenceHeld }
+// CommandFence mints one, and only Transfer moves it on. A hold's copies share
+// one ownership, so Release through any of them gives the fence back once and
+// later calls do nothing. Transfer moves ownership into a new hold and leaves
+// every copy of the old one powerless: none can release the fence the new hold
+// owns, and none can transfer it again. The zero value owns nothing.
+type CommandFenceHold struct{ owner *commandFenceOwner }
 
-type commandFenceHeld struct {
+// commandFenceOwner is one ownership of a fence. At most one owner of an entry
+// is held at a time: Transfer retires the old owner before minting the next.
+type commandFenceOwner struct {
 	fence     *CommandFence
 	leaseUUID string
 	entry     *commandFenceEntry
-	once      sync.Once
+	state     atomic.Uint32
 }
+
+const (
+	commandFenceOwned uint32 = iota
+	commandFenceMoved
+	commandFenceReleased
+)
 
 // LeaseUUID names the lease whose fence this is, or "" for the zero value.
 func (hold CommandFenceHold) LeaseUUID() string {
-	if hold.held == nil {
+	if hold.owner == nil {
 		return ""
 	}
-	return hold.held.leaseUUID
+	return hold.owner.leaseUUID
 }
 
-// Release gives the fence back the first time any copy calls it.
+// Owns reports whether hold still owns fence's fence for leaseUUID: it was
+// minted by fence for that lease, and has been neither released nor moved.
+func (hold CommandFenceHold) Owns(fence *CommandFence, leaseUUID string) bool {
+	return hold.owner != nil && fence != nil && hold.owner.fence == fence &&
+		leaseUUID != "" && hold.owner.leaseUUID == leaseUUID &&
+		hold.owner.state.Load() == commandFenceOwned
+}
+
+// Transfer moves the ownership into a new hold, which the caller passes on
+// without keeping. It fails when hold no longer owns its fence.
+func (hold CommandFenceHold) Transfer() (CommandFenceHold, error) {
+	if hold.owner == nil || !hold.owner.state.CompareAndSwap(commandFenceOwned, commandFenceMoved) {
+		return CommandFenceHold{}, errors.New("command fence hold does not own its fence")
+	}
+	return hold.owner.fence.hold(hold.owner.leaseUUID, hold.owner.entry), nil
+}
+
+// Release gives the fence back if hold still owns it.
 func (hold CommandFenceHold) Release() {
-	if hold.held == nil {
+	if hold.owner == nil || !hold.owner.state.CompareAndSwap(commandFenceOwned, commandFenceReleased) {
 		return
 	}
-	hold.held.once.Do(func() {
-		<-hold.held.entry.held
-		hold.held.fence.release(hold.held.leaseUUID, hold.held.entry)
-	})
+	<-hold.owner.entry.held
+	hold.owner.fence.release(hold.owner.leaseUUID, hold.owner.entry)
 }
 
 // Lock acquires the fence for leaseUUID. Refcounts include both the current
@@ -121,5 +147,5 @@ func (f *CommandFence) release(leaseUUID string, entry *commandFenceEntry) {
 }
 
 func (f *CommandFence) hold(leaseUUID string, entry *commandFenceEntry) CommandFenceHold {
-	return CommandFenceHold{held: &commandFenceHeld{fence: f, leaseUUID: leaseUUID, entry: entry}}
+	return CommandFenceHold{owner: &commandFenceOwner{fence: f, leaseUUID: leaseUUID, entry: entry}}
 }

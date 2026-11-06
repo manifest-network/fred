@@ -529,6 +529,8 @@ Release resources for a lease. **Must be idempotent** - calling multiple times s
   answer `503` `lifecycle_pending`; Fred retries the close. Never tie the
   teardown to the request: Fred's request timeout cancels it. Fred gives every
   `/deprovision` request at least 30 seconds, whatever its `timeout` setting.
+  A request whose storage identity check fails, or cannot finish within the
+  budget, gets the identity failure, never `lifecycle_pending`.
 
 **Error Responses:**
 - `400 Bad Request` - Invalid request body or lease UUID

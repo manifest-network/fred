@@ -48,6 +48,7 @@ func newLeaseActor(b *Backend, leaseUUID string) *leasesm.LeaseActor {
 		ProvisionStore:    b.provisionStore,
 		Metrics:           dockerSMMetrics{},
 		CloseTimeout:      b.closeAttemptTimeout(),
+		CommandFence:      &b.commandFence,
 		ProvisionWorkFn:   b.executeProvisionWork,
 		RestoreWorkFn:     b.executeRestoreWork,
 		MaintenanceWorkFn: b.executeMaintenanceWork,

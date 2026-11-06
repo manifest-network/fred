@@ -30,21 +30,14 @@ import (
 // close's durable head commits, so no other command can act between that
 // check and the head, however soon this call stops waiting.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
-	if err := b.requireMutationAdmission(ctx, "deprovision"); err != nil {
-		if ctx.Err() != nil {
-			// The caller stopped waiting before the backend could admit the
-			// close, typically behind a slow identity verification.
-			return closePending{leaseUUID: leaseUUID}
-		}
-		return fmt.Errorf("backend storage identity verification failed: %w", err)
-	}
 	for {
-		fence, err := b.commandFence.LockContext(ctx, leaseUUID)
+		fence, err := b.prepareClose(ctx, leaseUUID)
 		if err != nil {
-			return closePending{leaseUUID: leaseUUID}
-		}
-		if err := b.ensureCommittedRestoreDestinationForClose(leaseUUID); err != nil {
-			fence.Release()
+			if ctx.Err() != nil {
+				// The caller's budget ran out before the close could be
+				// admitted. Nothing was decided; a retry admits it.
+				return closePending{leaseUUID: leaseUUID}
+			}
 			return err
 		}
 		err = b.closeThroughActor(ctx, fence)
@@ -52,16 +45,36 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 			return err
 		}
 		// The previous actor retired without running this close and gave the
-		// fence back. Check again under a new fence, then route the close to
+		// fence back. Prepare again under a new fence, then route the close to
 		// the actor that replaces it.
 	}
 }
 
+// prepareClose does, under the caller's ctx, what must precede handing a
+// close to the lease's actor: verify the storage identity, take the lease's
+// command fence, and settle a committed restore into the lease. It returns the
+// fence it took, still held.
+func (b *Backend) prepareClose(ctx context.Context, leaseUUID string) (shared.CommandFenceHold, error) {
+	if err := b.requireMutationAdmission(ctx, "deprovision"); err != nil {
+		return shared.CommandFenceHold{}, fmt.Errorf("backend storage identity verification failed: %w", err)
+	}
+	fence, err := b.commandFence.LockContext(ctx, leaseUUID)
+	if err != nil {
+		return shared.CommandFenceHold{}, fmt.Errorf("wait for the lease's command fence: %w", err)
+	}
+	if err := b.ensureCommittedRestoreDestinationForClose(ctx, leaseUUID); err != nil {
+		fence.Release()
+		return shared.CommandFenceHold{}, err
+	}
+	return fence, nil
+}
+
 // closeThroughActor hands one close, with the lease's command fence, to the
-// lease's actor and waits for its answer. It takes over fence: the close keeps
-// it until its durable head commits or the attempt ends, so the caller must
-// not release it. When ctx ends before the answer, the close keeps running on
-// the actor's lifetime and the result is closePending.
+// lease's actor and waits for its answer. The close command takes ownership of
+// fence and keeps it until its durable head commits or its attempt ends; if
+// no actor accepts the command, abandoning it gives the fence back. When ctx
+// ends before the answer, the close keeps running on the actor's lifetime and
+// the result is closePending.
 func (b *Backend) closeThroughActor(ctx context.Context, fence shared.CommandFenceHold) error {
 	leaseUUID := fence.LeaseUUID()
 	command, reply, err := leasesm.NewDeprovisionCommand(fence)
@@ -70,8 +83,7 @@ func (b *Backend) closeThroughActor(ctx context.Context, fence shared.CommandFen
 		return err
 	}
 	if err := b.routeToLeaseBlocking(ctx, leaseUUID, command); err != nil {
-		// Never enqueued, so the fence is still ours to give back.
-		fence.Release()
+		command.Abandon()
 		if ctx.Err() != nil {
 			return closePending{leaseUUID: leaseUUID}
 		}
@@ -218,7 +230,7 @@ func (b *Backend) handoffCommittedRestoreToClose(
 // two incompatible durable owners. Once this succeeds, a crash after close
 // admission is safe because the exact active Release already owns destination
 // bytes and the close claim can take over the finalizer on recovery.
-func (b *Backend) ensureCommittedRestoreDestinationForClose(leaseUUID string) error {
+func (b *Backend) ensureCommittedRestoreDestinationForClose(ctx context.Context, leaseUUID string) error {
 	if b.retentionStore == nil {
 		return nil
 	}
@@ -252,7 +264,9 @@ func (b *Backend) ensureCommittedRestoreDestinationForClose(leaseUUID string) er
 		if b.callbackPublisher == nil {
 			return errors.New("callback publisher is required")
 		}
-		if err := b.callbackPublisher.PublishOperationSuccessContext(b.stopCtx, proof); err != nil {
+		// The caller's ctx bounds this settlement: cancellation leaves the
+		// durable operation head for the next attempt or recovery.
+		if err := b.callbackPublisher.PublishOperationSuccessContext(ctx, proof); err != nil {
 			return fmt.Errorf("settle committed restore before close admission: %w", err)
 		}
 	case shared.OperationFailed:
@@ -316,18 +330,18 @@ func (b *Backend) doDeprovision(ctx context.Context, actorScope leasesm.ActorClo
 	return b.recoveryCoordinator.WithActorClose(
 		actorScope,
 		func(recoveryScope shared.LeaseRecoveryScope) error {
-			return b.doDeprovisionScoped(ctx, recoveryScope, actorScope, leaseUUID)
+			return b.doDeprovisionScoped(ctx, recoveryScope, actorScope.CloseAdmitted, leaseUUID)
 		},
 	)
 }
 
-// doDeprovisionScoped runs one close attempt. It reports CloseAdmitted to
-// actorScope once the close's durable head is committed and consistent, which
-// gives back the lease's command fence before teardown starts.
+// doDeprovisionScoped runs one close attempt. Once the close's durable head is
+// committed and consistent, it passes that head to admitted, which gives back
+// the lease's command fence before teardown starts.
 func (b *Backend) doDeprovisionScoped(
 	ctx context.Context,
 	recoveryScope shared.LeaseRecoveryScope,
-	actorScope leasesm.ActorCloseScope,
+	admitted func(shared.CloseIntentClaim) error,
 	leaseUUID string,
 ) error {
 	logger := b.logger.With("lease_uuid", leaseUUID)
@@ -362,7 +376,9 @@ func (b *Backend) doDeprovisionScoped(
 	if err := b.handoffCommittedRestoreToClose(leaseUUID, claim, true); err != nil {
 		return err
 	}
-	actorScope.CloseAdmitted()
+	if err := admitted(claim); err != nil {
+		return fmt.Errorf("release close admission fence: %w", err)
+	}
 
 	var outcome shared.CloseExecutionOutcome
 	if claim.ExecutionGeneration().Valid() {

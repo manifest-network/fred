@@ -154,6 +154,42 @@ func TestCommandFenceHoldCopiesShareOneRelease(t *testing.T) {
 	}
 }
 
+// Transfer moves ownership: every copy of the old hold loses it at once, and
+// only the new hold owns, releases or transfers the fence. Owns binds a hold
+// to the exact fence and lease that minted it.
+func TestCommandFenceTransferMovesOwnership(t *testing.T) {
+	var fence, other CommandFence
+	original := fence.Lock("lease-a")
+	alias := original
+	require.True(t, original.Owns(&fence, "lease-a"))
+	require.False(t, original.Owns(&other, "lease-a"), "a hold belongs to the fence that minted it")
+	require.False(t, original.Owns(&fence, "lease-b"), "a hold belongs to its lease")
+	require.False(t, original.Owns(nil, "lease-a"))
+
+	moved, err := original.Transfer()
+	require.NoError(t, err)
+	require.True(t, moved.Owns(&fence, "lease-a"))
+	require.False(t, alias.Owns(&fence, "lease-a"), "every copy of the moved hold loses ownership")
+	alias.Release()
+	_, free := fence.TryLock("lease-a")
+	require.False(t, free, "a moved hold's copy cannot release the new owner's fence")
+	_, err = alias.Transfer()
+	require.Error(t, err, "a moved hold cannot be transferred again")
+
+	moved.Release()
+	require.False(t, moved.Owns(&fence, "lease-a"))
+	_, err = moved.Transfer()
+	require.Error(t, err, "a released hold cannot be transferred")
+	_, err = CommandFenceHold{}.Transfer()
+	require.Error(t, err)
+	retaken, free := fence.TryLock("lease-a")
+	require.True(t, free)
+	retaken.Release()
+	if refs, entries := commandFenceRefs(&fence, "lease-a"); refs != 0 || entries != 0 {
+		t.Fatalf("transferred holds leaked state: refs=%d entries=%d", refs, entries)
+	}
+}
+
 func TestCommandFenceUnlockIsIdempotent(t *testing.T) {
 	var fence CommandFence
 	unlock := fence.Lock("lease-a").Release

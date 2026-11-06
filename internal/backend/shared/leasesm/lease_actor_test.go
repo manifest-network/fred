@@ -460,7 +460,7 @@ func TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains(t *testing
 	// transition and run DoDeprovisionFn once the worker actually exits.
 	reply := make(chan error, 1)
 	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: testCloseFence(t, actor.leaseUUID)})
+		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
 	})
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
@@ -478,7 +478,7 @@ func TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains(t *testing
 	close(workerRelease)
 	<-actor.workers.Zero()
 	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: testCloseFence(t, actor.leaseUUID)})
+		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
 	})
 
 	select {
@@ -546,7 +546,7 @@ func TestLeaseActor_RestoreDeprovisionDefersUntilTerminalDeferDrains(t *testing.
 	requireAccepted(t, func() bool {
 		return actor.tryEnqueue(deprovisionMsg{
 			Reply: deprovisionReply,
-			fence: testCloseFence(t, actor.leaseUUID),
+			fence: actorCloseFence(actor),
 		})
 	})
 	close(restoreWorkMayReturn)
@@ -565,7 +565,7 @@ func TestLeaseActor_RestoreDeprovisionDefersUntilTerminalDeferDrains(t *testing.
 	close(allowTerminalDefer)
 	<-actor.workers.Zero()
 	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: deprovisionReply, fence: testCloseFence(t, actor.leaseUUID)})
+		return actor.tryEnqueue(deprovisionMsg{Reply: deprovisionReply, fence: actorCloseFence(actor)})
 	})
 	select {
 	case err := <-deprovisionReply:
@@ -769,7 +769,7 @@ func TestSpawnProvisionWorker_PanicRecovery(t *testing.T) {
 		"WorkerPanic metric must increment by 1 after provision worker panic")
 
 	// Actor is still alive and responsive — a caller command is acknowledged.
-	command, reply := newTestDeprovisionCommand(t, testActorLeaseUUID)
+	command, reply := newTestDeprovisionCommand(t, actor)
 	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
 	require.NoError(t, reply.Wait(context.Background()))
 }
@@ -812,7 +812,7 @@ func TestSpawnReplaceWorker_PanicRecovery(t *testing.T) {
 	assert.Equal(t, panicsBefore+1, panicsAfter,
 		"WorkerPanic metric must increment by 1 after replace worker panic")
 
-	command, reply := newTestDeprovisionCommand(t, testActorLeaseUUID)
+	command, reply := newTestDeprovisionCommand(t, actor)
 	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
 	require.NoError(t, reply.Wait(context.Background()))
 }
@@ -1181,7 +1181,7 @@ func TestProvision_DeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 	// fenced until a retry independently observes the drained barrier.
 	reply := make(chan error, 1)
 	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: testCloseFence(t, actor.leaseUUID)})
+		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
 	})
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
@@ -1199,7 +1199,7 @@ func TestProvision_DeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 	close(workerRelease)
 	<-actor.workers.Zero()
 	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: testCloseFence(t, actor.leaseUUID)})
+		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
 	})
 
 	select {
@@ -1467,7 +1467,7 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 	// be request #1's), returning pending while it drains.
 	reply := make(chan error, 1)
 	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: testCloseFence(t, actor.leaseUUID)})
+		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
 	})
 
 	require.Eventually(t, firstCancelObserved.Load, 1*time.Second, 5*time.Millisecond,
@@ -1480,7 +1480,7 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 	close(worker1Release)
 	<-actor.workers.Zero()
 	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: testCloseFence(t, actor.leaseUUID)})
+		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
 	})
 	select {
 	case err := <-reply:
@@ -1525,7 +1525,7 @@ func runReplaceLosesToDeprovisionTest(t *testing.T, op string) {
 		},
 	})
 
-	require.NoError(t, actor.handleDeprovision(testCloseFence(t, actor.leaseUUID)))
+	require.NoError(t, actor.handleDeprovision(actorCloseFence(actor)))
 	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.State(),
 		"test precondition: SM must be Deprovisioning")
 
@@ -1898,7 +1898,7 @@ func TestRestoreRequested_RejectedFromBadState(t *testing.T) {
 		},
 	})
 
-	require.NoError(t, actor.handleDeprovision(testCloseFence(t, actor.leaseUUID)))
+	require.NoError(t, actor.handleDeprovision(actorCloseFence(actor)))
 	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.State(),
 		"test precondition: SM must be Deprovisioning")
 

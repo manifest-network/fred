@@ -82,6 +82,21 @@ func newActorCommand(message actorCommandMessage) ActorCommand {
 	return ActorCommand{envelope: newMessageEnvelope(message)}
 }
 
+// errCommandAbandoned answers a command its caller abandoned before any actor
+// accepted it.
+var errCommandAbandoned = errors.New("actor command abandoned before an actor accepted it")
+
+// Abandon settles a command that no actor accepted, giving back what it owns,
+// such as a close's command fence, and makes it unusable. It claims the same
+// one-shot admission that enqueueing claims, so it does nothing to a command
+// an actor accepted.
+func (c ActorCommand) Abandon() {
+	if c.envelope == nil || !c.envelope.accepted.CompareAndSwap(false, true) {
+		return
+	}
+	c.envelope.message.onPanic(errCommandAbandoned)
+}
+
 // ActorObservation is an opaque, one-shot substrate observation bound to an
 // exact durable runtime generation. Its constructors require a store-issued
 // RuntimeGenerationProof; admission and handling re-attest that proof through
@@ -332,18 +347,19 @@ func (m deprovisionMsg) onPanic(err error) {
 // reports the outcome: the close runs on the actor's lifetime, bounded by
 // LeaseActorConfig.CloseTimeout, whether or not anyone still waits for it.
 //
-// The command takes over fence, the lease's command fence that its caller
-// acquired before checking that the close may begin. The close keeps it until
-// its durable head commits (ActorCloseScope.CloseAdmitted) or the attempt ends,
-// so no other command can slip between that check and the head. Once the
-// command is enqueued the caller must not release fence; if enqueuing fails,
-// the caller still owns it.
+// The command takes ownership of fence, the lease's command fence that its
+// caller acquired before checking that the close may begin: every copy the
+// caller kept stops owning it. The close keeps the fence until its durable head
+// commits (ActorCloseScope.CloseAdmitted) or its attempt ends, so no other
+// command can slip between that check and the head. A command that no actor
+// accepts gives the fence back through Abandon.
 func NewDeprovisionCommand(fence shared.CommandFenceHold) (ActorCommand, ActorReply, error) {
-	if fence.LeaseUUID() == "" {
-		return ActorCommand{}, ActorReply{}, errors.New("deprovision requires the lease's command fence")
+	owned, err := fence.Transfer()
+	if err != nil {
+		return ActorCommand{}, ActorReply{}, fmt.Errorf("deprovision requires the lease's command fence: %w", err)
 	}
 	reply, receiver := newActorReply()
-	return newActorCommand(deprovisionMsg{Reply: reply, fence: fence}), receiver, nil
+	return newActorCommand(deprovisionMsg{Reply: reply, fence: owned}), receiver, nil
 }
 
 // IsRejectedByRetiringActor reports that a command reached an actor that was
@@ -1108,6 +1124,8 @@ func validateLeaseActorConfig(cfg LeaseActorConfig) error {
 		return errors.New("lease actor worker drain timeout cannot be negative")
 	case cfg.CloseTimeout <= 0:
 		return errors.New("lease actor requires a positive close timeout")
+	case cfg.CommandFence == nil:
+		return errors.New("lease actor requires its substrate's command fence")
 	default:
 		return nil
 	}
@@ -2318,8 +2336,8 @@ func (a *LeaseActor) tryEnqueue(msg leaseMessage) bool {
 // lease's command fence until its durable head commits or this attempt ends.
 func (a *LeaseActor) handleDeprovision(fence shared.CommandFenceHold) error {
 	defer fence.Release()
-	if fence.LeaseUUID() != a.leaseUUID {
-		return errors.New("deprovision carries another lease's command fence")
+	if !fence.Owns(a.cfg.CommandFence, a.leaseUUID) {
+		return errors.New("deprovision does not own this lease's command fence")
 	}
 	if a.closeSettlement == nil {
 		a.closeSettlement = newActorCloseSettlement(a)

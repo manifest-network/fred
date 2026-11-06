@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1067,6 +1068,7 @@ func restoreDestinationAuthority(t *testing.T) (shared.OperationID, string, stri
 }
 
 type committedRestoreCallbackFixture struct {
+	docker               *mockDockerClient
 	backend              *Backend
 	retentions           *shared.RetentionStore
 	releases             *shared.ReleaseStore
@@ -1083,6 +1085,14 @@ type committedRestoreCallbackFixture struct {
 }
 
 func newCommittedRestoreCallbackFixture(t *testing.T) committedRestoreCallbackFixture {
+	t.Helper()
+	return newCommittedRestoreFixture(t, true)
+}
+
+// newCommittedRestoreFixture commits a restore into its destination lease. When
+// published is false, the restore's success callback is still unpublished, so
+// a close of the destination settles it first.
+func newCommittedRestoreFixture(t *testing.T, published bool) committedRestoreCallbackFixture {
 	t.Helper()
 	const (
 		sourceLease      = "0192f1a0-1111-7abc-8def-000000000501"
@@ -1126,10 +1136,13 @@ func newCommittedRestoreCallbackFixture(t *testing.T) committedRestoreCallbackFi
 	)
 	require.NoError(t, err)
 	committed := commitPendingOperationReleaseForTest(t, b.operationSettlement, destinationLease)
-	require.NoError(t, b.callbackPublisher.PublishOperationSuccessContext(context.Background(), committed))
-	acknowledgePendingCallbacksForTest(t, callbacks)
+	if published {
+		require.NoError(t, b.callbackPublisher.PublishOperationSuccessContext(context.Background(), committed))
+		acknowledgePendingCallbacksForTest(t, callbacks)
+	}
 
 	return committedRestoreCallbackFixture{
+		docker:               dockerClient,
 		backend:              b,
 		retentions:           retentions,
 		releases:             releases,
@@ -1218,7 +1231,7 @@ func TestCommittedRestoreClose_KeepsFinalizerRouteUntilMovedCloseJournalHandoff(
 	acknowledgePendingCallbacksForTest(t, fixture.callbacks)
 
 	unlock := fixture.backend.commandFence.Lock(fixture.destinationLease).Release
-	require.NoError(t, fixture.backend.ensureCommittedRestoreDestinationForClose(fixture.destinationLease))
+	require.NoError(t, fixture.backend.ensureCommittedRestoreDestinationForClose(t.Context(), fixture.destinationLease))
 	stored, err := fixture.retentions.Get(fixture.sourceLease)
 	require.NoError(t, err)
 	require.NotNil(t, stored)
@@ -1242,6 +1255,45 @@ func TestCommittedRestoreClose_KeepsFinalizerRouteUntilMovedCloseJournalHandoff(
 	stored, err = fixture.retentions.Get(fixture.sourceLease)
 	require.NoError(t, err)
 	assert.Nil(t, stored, "the close journal now owns the exact restored destination")
+}
+
+// Settling a committed restore before its destination's close runs under the
+// close caller's deadline: a slow identity attestation for that settlement
+// cannot keep the caller past it, and nothing is admitted.
+func TestCommittedRestoreSettlementBeforeCloseStopsAtTheCallersDeadline(t *testing.T) {
+	fixture := newCommittedRestoreFixture(t, false)
+	fixture.projectDestination(fixture.callbackURL, fixture.lifecycleCallbackURL)
+	// Attest publication through the Docker-backed storage verifier, as
+	// production does.
+	rebuildCallbackSender(fixture.backend, testCallbackClient)
+	var calls atomic.Int32
+	reached := make(chan struct{})
+	daemonInfo := fixture.docker.DaemonInfoFn
+	fixture.docker.DaemonInfoFn = func(ctx context.Context) (DaemonSecurityInfo, error) {
+		if calls.Add(1) == 1 {
+			return daemonInfo(ctx) // the close's own identity check
+		}
+		close(reached)
+		<-ctx.Done()
+		return DaemonSecurityInfo{}, ctx.Err()
+	}
+	waiting, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := fixture.backend.Deprovision(waiting, fixture.destinationLease)
+	require.Less(t, time.Since(started), 5*time.Second, "the caller outlasted its deadline")
+	select {
+	case <-reached:
+	default:
+		t.Fatal("the close never reached the restore settlement")
+	}
+	require.True(t, IsLifecyclePending(err), "%v", err)
+	_, found, readErr := fixture.callbacks.GetCloseIntent(fixture.destinationLease)
+	require.NoError(t, readErr)
+	assert.False(t, found, "nothing is admitted before the restore settles")
+	fence, free := fixture.backend.commandFence.TryLock(fixture.destinationLease)
+	require.True(t, free, "an abandoned preparation gives the fence back")
+	fence.Release()
 }
 
 func TestCommittedRestoreClose_RejectsDifferentLifecycleIDBeforeCloseJournal(t *testing.T) {
